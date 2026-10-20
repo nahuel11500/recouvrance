@@ -421,6 +421,7 @@ impl AppView {
                 }
                 if let Some(ns) = table.update(cx, |t, _| t.delegate_mut().pending_namespace.take()) {
                     this.ns_picker.update(cx, |p, cx| {
+                        crate::settings::visit_namespaces(&p.context, std::slice::from_ref(&ns));
                         p.selected = [ns.clone()].into();
                         cx.notify();
                     });

@@ -80,8 +80,12 @@ pub struct Settings {
     pub usage_range: i64,
     /// Contexts connected recently, newest first.
     pub recent_contexts: Vec<String>,
-    /// Namespaces chosen recently per context, newest first.
+    /// Older settings: namespaces chosen recently per context, newest first.
+    /// Read once and turned into `namespace_visits`.
+    #[serde(skip_serializing_if = "std::collections::HashMap::is_empty")]
     pub recent_namespaces: std::collections::HashMap<String, Vec<String>>,
+    /// Namespaces visited per context, to offer the frequent ones first.
+    pub namespace_visits: std::collections::HashMap<String, Vec<NamespaceVisit>>,
     /// Port-forwards that were running, to restore.
     pub saved_forwards: Vec<SavedForward>,
     /// Model used by the in-app assistant.
@@ -106,6 +110,14 @@ pub struct Settings {
     pub open_browser_on_forward: bool,
     /// Port-forwards started recently, newest first (offered again in the sidebar).
     pub recent_forwards: Vec<SavedForward>,
+}
+
+/// A namespace chosen on a context: how often, and when last (unix seconds).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct NamespaceVisit {
+    pub name: String,
+    pub count: u32,
+    pub last: i64,
 }
 
 /// Settings for one cluster (context).
@@ -174,6 +186,7 @@ impl Default for Settings {
             usage_range: 60,
             recent_contexts: Vec::new(),
             recent_namespaces: Default::default(),
+            namespace_visits: Default::default(),
             saved_forwards: Vec::new(),
             assistant_model: crate::assistant::DEFAULT_MODEL.into(),
             assistant_backend: "auto".into(),
@@ -346,9 +359,142 @@ pub fn push_recent(list: &mut Vec<String>, items: &[String], max: usize) {
     list.truncate(max);
 }
 
+/// A visit counts half as much after a week without one.
+const VISIT_HALF_LIFE: f64 = 7.0 * 24.0 * 3600.0;
+/// Namespaces remembered per context.
+const VISITS_KEPT: usize = 30;
+
+/// Frecency: the number of visits, halved for every week since the last one.
+pub fn visit_score(v: &NamespaceVisit, now: i64) -> f64 {
+    let age = (now - v.last).max(0) as f64;
+    f64::from(v.count) * 0.5f64.powf(age / VISIT_HALF_LIFE)
+}
+
+/// Best score first; ties go to the latest visit.
+fn rank(list: &mut [NamespaceVisit], now: i64) {
+    list.sort_by(|a, b| visit_score(b, now).total_cmp(&visit_score(a, now)).then(b.last.cmp(&a.last)));
+}
+
+/// Count one visit to each of `names`, keeping the best `VISITS_KEPT`.
+pub fn record_visits(list: &mut Vec<NamespaceVisit>, names: &[String], now: i64) {
+    for name in names {
+        match list.iter_mut().find(|v| &v.name == name) {
+            Some(v) => {
+                v.count = v.count.saturating_add(1);
+                v.last = now;
+            }
+            None => list.push(NamespaceVisit { name: name.clone(), count: 1, last: now }),
+        }
+    }
+    rank(list, now);
+    list.truncate(VISITS_KEPT);
+}
+
+/// Namespaces visited on `context`, most frequent first.
+pub fn frequent_namespaces(context: &str) -> Vec<String> {
+    migrate_recent_namespaces();
+    let now = unix_now();
+    let mut list = with(|s| s.namespace_visits.get(context).cloned().unwrap_or_default());
+    rank(&mut list, now);
+    list.into_iter().map(|v| v.name).collect()
+}
+
+/// Remember that `names` were chosen on `context`.
+pub fn visit_namespaces(context: &str, names: &[String]) {
+    if context.is_empty() || names.is_empty() {
+        return;
+    }
+    migrate_recent_namespaces();
+    let now = unix_now();
+    update(|s| record_visits(s.namespace_visits.entry(context.to_string()).or_default(), names, now));
+}
+
+/// Turn the old recent lists into visits, once.
+fn migrate_recent_namespaces() {
+    if with(|s| s.recent_namespaces.is_empty()) {
+        return;
+    }
+    let now = unix_now();
+    update(|s| {
+        for (ctx, recent) in std::mem::take(&mut s.recent_namespaces) {
+            let visits = s.namespace_visits.entry(ctx).or_default();
+            if visits.is_empty() {
+                *visits = recent_as_visits(&recent, now);
+            }
+        }
+    });
+}
+
+/// One visit each, a second apart, so the newest still ranks first.
+fn recent_as_visits(recent: &[String], now: i64) -> Vec<NamespaceVisit> {
+    recent.iter().enumerate().map(|(i, n)| NamespaceVisit { name: n.clone(), count: 1, last: now - i as i64 }).collect()
+}
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Settings, load_json, migrate_list, write_atomic};
+    use super::{
+        NamespaceVisit, Settings, load_json, migrate_list, recent_as_visits, record_visits, visit_score, write_atomic,
+    };
+
+    const DAY: i64 = 24 * 3600;
+
+    fn visit(name: &str, count: u32, last: i64) -> NamespaceVisit {
+        NamespaceVisit { name: name.into(), count, last }
+    }
+
+    #[test]
+    fn score_halves_every_week() {
+        let now = 100 * DAY;
+        assert_eq!(visit_score(&visit("a", 8, now), now), 8.0);
+        assert!((visit_score(&visit("a", 8, now - 7 * DAY), now) - 4.0).abs() < 1e-9);
+        assert!((visit_score(&visit("a", 8, now - 21 * DAY), now) - 1.0).abs() < 1e-9);
+        // A clock that went backwards does not inflate the score.
+        assert_eq!(visit_score(&visit("a", 8, now + DAY), now), 8.0);
+    }
+
+    #[test]
+    fn frequent_and_recent_beat_old_habits() {
+        let now = 100 * DAY;
+        let mut list = vec![visit("legacy", 20, now - 60 * DAY), visit("monitoring", 3, now - DAY)];
+        let names = |l: &[NamespaceVisit]| l.iter().map(|v| v.name.clone()).collect::<Vec<_>>();
+        record_visits(&mut list, &["kube-system".into()], now);
+        // 20 visits two months ago weigh less than one today.
+        assert_eq!(names(&list), ["monitoring", "kube-system", "legacy"]);
+        for _ in 0..3 {
+            record_visits(&mut list, &["kube-system".into()], now);
+        }
+        assert_eq!(names(&list), ["kube-system", "monitoring", "legacy"]);
+        assert_eq!(list[0].count, 4);
+        assert_eq!(list[0].last, now);
+    }
+
+    #[test]
+    fn visits_are_capped() {
+        let mut list = Vec::new();
+        for i in 0..40 {
+            record_visits(&mut list, &[format!("ns-{i}")], i);
+        }
+        assert_eq!(list.len(), 30);
+        // The oldest single visits go first.
+        assert_eq!(list[0].name, "ns-39");
+        assert!(!list.iter().any(|v| v.name == "ns-9"));
+    }
+
+    #[test]
+    fn old_recent_namespaces_still_load() {
+        let s: Settings = serde_json::from_str(r#"{"recent_namespaces": {"kind-dev": ["b", "a"]}}"#).unwrap();
+        assert_eq!(s.recent_namespaces["kind-dev"], ["b", "a"]);
+        assert!(s.namespace_visits.is_empty());
+        let visits = recent_as_visits(&s.recent_namespaces["kind-dev"], 1000);
+        assert_eq!(visits, [visit("b", 1, 1000), visit("a", 1, 999)]);
+        // Once migrated, the old key is not written back.
+        let s = Settings { recent_namespaces: Default::default(), ..s };
+        assert!(!serde_json::to_string(&s).unwrap().contains("recent_namespaces"));
+    }
 
     #[test]
     fn old_protection_lists_still_load() {
