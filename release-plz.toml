@@ -1,0 +1,49 @@
+# release-plz keeps a "Release vX.Y.Z" pull request open on main: version bumped from the
+# conventional commits since the last release, changelog written from them. Merging it publishes
+# the crate, tags vX.Y.Z and opens a draft GitHub release; the tag starts dist's release workflow,
+# which builds the binaries and installers, uploads them and publishes the release.
+
+[workspace]
+git_release_draft = true
+pr_labels = ["release"]
+# While on 0.x, features bump the minor version and fixes the patch.
+features_always_increment_minor = true
+# Only conventional commits that change something for users bump the version.
+release_commits = "^(feat|fix|perf|refactor)[(!:]"
+
+[changelog]
+header = """# Changelog
+
+All notable changes are listed here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and versions follow [Semantic Versioning](https://semver.org/).
+
+## [Unreleased]
+
+"""
+body = """
+## [{{ version }}]{%- if release_link -%}({{ release_link }}){% endif %} - {{ timestamp | date(format="%Y-%m-%d") }}
+{% for group, commits in commits | group_by(attribute="group") %}
+### {{ group | upper_first }}
+
+{% for commit in commits -%}
+- {% if commit.scope %}*({{ commit.scope }})* {% endif %}{% if commit.breaking %}[**breaking**] {% endif %}{{ commit.message | upper_first }}
+{% endfor -%}
+{% endfor %}
+"""
+commit_parsers = [
+  { message = "^feat", group = "added" },
+  { message = "^fix", group = "fixed" },
+  { message = "^perf", group = "performance" },
+  { message = "^refactor", group = "changed" },
+  { message = "^docs", group = "documentation" },
+  { message = "^revert", group = "reverted" },
+  { message = "^(chore|ci|build|test|style)", skip = true },
+]
+
+# Test releases (0.0.x) go to GitHub only. A crates.io version can never be deleted, so publishing
+# waits for the first real release: then remove this section.
+[[package]]
+name = "recouvrance"
+publish = false
+# Versions come from the v* git tags while nothing is on crates.io.
+git_only = true

@@ -1,0 +1,95 @@
+[package]
+name = "recouvrance"
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.98"
+description = "A fast native Kubernetes desktop client, with an MCP server for your agents"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/nahuel11500/recouvrance"
+homepage = "https://github.com/nahuel11500/recouvrance"
+readme = "README.md"
+keywords = ["kubernetes", "k8s", "desktop", "gui", "mcp"]
+categories = ["gui", "development-tools"]
+include = ["src/**/*", "assets/*", "/README.md", "/CHANGELOG.md", "/LICENSE-MIT", "/LICENSE-APACHE"]
+
+[package.metadata.deb]
+section = "devel"
+maintainer = "Nahuel Canavy <134035119+nahuel11500@users.noreply.github.com>"
+copyright = "Recouvrance contributors"
+extended-description = "A fast native Kubernetes desktop client, with a local MCP server for your agents."
+assets = [
+  ["target/release/recouvrance", "usr/bin/", "755"],
+  ["assets/recouvrance.desktop", "usr/share/applications/", "644"],
+  ["assets/recouvrance.svg", "usr/share/icons/hicolor/scalable/apps/", "644"],
+  ["README.md", "usr/share/doc/recouvrance/", "644"],
+]
+
+[dependencies]
+gpui-pre = { version = "=0.3.9", features = ["test-support"], optional = true }
+gpui-pre-platform = { version = "=0.3.9", features = ["test-support"], optional = true }
+image = { version = "0.25", default-features = false, features = ["png"], optional = true }
+anyhow = "1.0.104"
+futures = "0.3.34"
+gpui-kit = { version = "0.7", features = ["tree-sitter-yaml"] }
+http = "1.5.0"
+jiff = "0.2.38"
+k8s-openapi = { version = "0.28", features = ["v1_33"] }
+kube = { version = "4.2", default-features = false, features = ["client", "rustls-tls", "ring", "ws", "http-proxy", "socks5", "gzip"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = { version = "1.0.154", features = ["raw_value"] }
+serde_yaml_ng = "0.10"
+tokio = { version = "1.53.3", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "process"] }
+rmcp = { version = "3.5", features = ["server", "macros", "transport-streamable-http-server"] }
+axum = "0.8"
+schemars = "1"
+sha2 = "0.11"
+uuid = { version = "1", features = ["v4"] }
+tokio-util = "0.7.20"
+vt100 = "0.18"
+base64 = "0.23"
+flate2 = "1"
+similar = "3"
+portable-pty = "0.9"
+regex = "1"
+x509-cert = { version = "0.3", default-features = false }
+pem = { version = "4", default-features = false, features = ["std"] }
+mimalloc = { version = "0.1", default-features = false }
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "native-tokio", "ring"] }
+http-body-util = "0.1"
+bytes = "1"
+
+[features]
+# Off-screen rendering of the real UI to a PNG, for development.
+dev = ["dep:image", "dep:gpui-pre", "dep:gpui-pre-platform"]
+
+[lints.rust]
+unsafe_code = "forbid"
+unused_qualifications = "warn"
+
+[lints.clippy]
+dbg_macro = "warn"
+todo = "warn"
+
+# Debug builds stay responsive: dependencies (the UI toolkit above all) are optimized,
+# our own code keeps fast incremental builds and full debug info.
+[profile.dev.package."*"]
+opt-level = 2
+
+# CI builds: no debug info and unoptimized dependencies, to compile as fast as possible.
+[profile.ci]
+inherits = "dev"
+debug = 0
+
+[profile.ci.package."*"]
+opt-level = 0
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+
+# The release binaries built by dist (`cargo build --profile dist`): the release profile.
+[profile.dist]
+inherits = "release"

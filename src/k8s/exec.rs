@@ -1,0 +1,654 @@
+//! Exec, attach, file copy and local commands (shell, kubectl, helm) with a context's kubeconfig.
+
+#[allow(unused_imports)]
+use super::*;
+
+pub enum ExecInput {
+    Bytes(Vec<u8>),
+    Resize { cols: u16, rows: u16 },
+}
+
+pub enum ExecOutput {
+    Data(Vec<u8>),
+    Exit(String),
+}
+
+/// Open an interactive shell (bash if present, else sh) in a container.
+pub fn exec_shell(
+    client: Client,
+    ns: String,
+    pod: String,
+    container: Option<String>,
+) -> (TaskGuard, mpsc::UnboundedSender<ExecInput>, mpsc::UnboundedReceiver<ExecOutput>) {
+    use kube::api::{AttachParams, TerminalSize};
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    let (in_tx, mut in_rx) = mpsc::unbounded::<ExecInput>();
+    let (out_tx, out_rx) = mpsc::unbounded();
+    let guard = spawn_guarded(async move {
+        let api: Api<Pod> = Api::namespaced(client, &ns);
+        let mut ap = AttachParams::interactive_tty();
+        if let Some(c) = container {
+            ap = ap.container(c);
+        }
+        let shell = ["sh", "-c", "command -v bash >/dev/null 2>&1 && exec bash || exec sh"];
+        let mut proc = match api.exec(&pod, shell, &ap).await {
+            Ok(p) => p,
+            Err(e) => {
+                let _ = out_tx.unbounded_send(ExecOutput::Exit(format!("exec failed: {e}")));
+                return;
+            }
+        };
+        let (Some(mut stdin), Some(mut stdout), Some(mut resize)) = (proc.stdin(), proc.stdout(), proc.terminal_size())
+        else {
+            let _ = out_tx.unbounded_send(ExecOutput::Exit("no tty streams".into()));
+            return;
+        };
+        let status = proc.take_status();
+        let reader = {
+            let out_tx = out_tx.clone();
+            async move {
+                let mut buf = vec![0u8; 16 * 1024];
+                loop {
+                    match stdout.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            if out_tx.unbounded_send(ExecOutput::Data(buf[..n].to_vec())).is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        };
+        let writer = async move {
+            while let Some(input) = in_rx.next().await {
+                match input {
+                    ExecInput::Bytes(b) => {
+                        if stdin.write_all(&b).await.is_err() {
+                            break;
+                        }
+                        let _ = stdin.flush().await;
+                    }
+                    ExecInput::Resize { cols, rows } => {
+                        use futures::SinkExt as _;
+                        let _ = resize.send(TerminalSize { width: cols, height: rows }).await;
+                    }
+                }
+            }
+        };
+        tokio::select! {
+            _ = reader => {}
+            _ = writer => {}
+        }
+        let reason = match status {
+            Some(s) => match s.await {
+                Some(st) if st.status.as_deref() == Some("Success") => "Session ended".to_string(),
+                Some(st) => format!("Session ended: {}", st.message.unwrap_or_default()),
+                None => "Session ended".to_string(),
+            },
+            None => "Session ended".to_string(),
+        };
+        let _ = out_tx.unbounded_send(ExecOutput::Exit(reason));
+    });
+    (guard, in_tx, out_rx)
+}
+
+/// A session handle that does nothing, for off-screen rendering checks.
+#[cfg(feature = "dev")]
+pub fn exec_shell_disabled() -> (TaskGuard, mpsc::UnboundedSender<ExecInput>, mpsc::UnboundedReceiver<ExecOutput>) {
+    let (in_tx, _) = mpsc::unbounded();
+    let (_, out_rx) = mpsc::unbounded();
+    (spawn_guarded(async {}), in_tx, out_rx)
+}
+
+/// The most a container download may write to disk (a bigger file or folder is refused).
+pub const MAX_DOWNLOAD_BYTES: u64 = 2 << 30;
+/// The most kept in memory from a command whose output is only a short answer.
+const MAX_EXEC_OUTPUT: u64 = 16 << 20;
+/// The most of stderr kept for an error message.
+const MAX_STDERR: usize = 64 * 1024;
+
+/// Read `r` to its end, keeping at most `max` bytes (the rest is read and dropped, so the
+/// stream never stalls). Returns the bytes kept and whether some were dropped.
+pub(super) async fn read_capped<R: tokio::io::AsyncRead + Unpin>(mut r: R, max: usize) -> (Vec<u8>, bool) {
+    use tokio::io::AsyncReadExt as _;
+    let (mut kept, mut dropped) = (Vec::new(), false);
+    let mut buf = vec![0u8; 16 * 1024];
+    loop {
+        match r.read(&mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                let room = max.saturating_sub(kept.len());
+                kept.extend_from_slice(&buf[..n.min(room)]);
+                dropped |= n > room;
+            }
+        }
+    }
+    (kept, dropped)
+}
+
+/// Hand `r` to `sink` chunk by chunk, failing once more than `max` bytes came, before
+/// passing them on. Returns the bytes copied.
+pub(super) async fn copy_capped<R: tokio::io::AsyncRead + Unpin>(
+    mut r: R,
+    sink: &mut impl FnMut(&[u8]) -> std::io::Result<()>,
+    max: u64,
+) -> Result<u64> {
+    use tokio::io::AsyncReadExt as _;
+    let (mut total, mut buf) = (0u64, vec![0u8; 64 * 1024]);
+    loop {
+        let n = r.read(&mut buf).await?;
+        if n == 0 {
+            return Ok(total);
+        }
+        total += n as u64;
+        anyhow::ensure!(total <= max, "larger than {}", format_bytes(max as f64));
+        sink(&buf[..n])?;
+    }
+}
+
+/// Run a command with optional stdin and return its stdout (at most 16 MiB).
+pub(super) async fn exec_bytes(
+    client: Client,
+    ns: String,
+    pod: String,
+    container: Option<String>,
+    command: Vec<String>,
+    stdin: Option<Vec<u8>>,
+) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut sink = |b: &[u8]| {
+        out.extend_from_slice(b);
+        Ok(())
+    };
+    exec_to(client, ns, pod, container, command, stdin, &mut sink, MAX_EXEC_OUTPUT).await?;
+    Ok(out)
+}
+
+/// Run a command with optional stdin, streaming its stdout into `sink` (at most `max`
+/// bytes, more is an error). Returns the bytes written.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn exec_to(
+    client: Client,
+    ns: String,
+    pod: String,
+    container: Option<String>,
+    command: Vec<String>,
+    stdin: Option<Vec<u8>>,
+    sink: &mut impl FnMut(&[u8]) -> std::io::Result<()>,
+    max: u64,
+) -> Result<u64> {
+    use kube::api::AttachParams;
+    use tokio::io::AsyncWriteExt as _;
+    let api: Api<Pod> = Api::namespaced(client, &ns);
+    let mut ap = AttachParams::default().stdout(true).stderr(true).stdin(stdin.is_some());
+    if let Some(c) = container {
+        ap = ap.container(c);
+    }
+    let mut proc = api.exec(&pod, command, &ap).await?;
+    let stdout = proc.stdout().context("no stdout")?;
+    let stderr = proc.stderr().context("no stderr")?;
+    let writer = async {
+        if let (Some(data), Some(mut w)) = (stdin, proc.stdin()) {
+            w.write_all(&data).await?;
+            w.shutdown().await?;
+        }
+        anyhow::Ok(())
+    };
+    // try_join: past the cap, stop at once (the command may still be writing).
+    let stderr = async { anyhow::Ok(read_capped(stderr, MAX_STDERR).await.0) };
+    let (_, copied, err) = tokio::try_join!(writer, copy_capped(stdout, sink, max), stderr)?;
+    let status = match proc.take_status() {
+        Some(s) => s.await,
+        None => None,
+    };
+    if status.as_ref().is_some_and(|s| s.status.as_deref() != Some("Success")) {
+        let msg = String::from_utf8_lossy(&err).trim().to_string();
+        anyhow::bail!(
+            "{}",
+            if msg.is_empty() { status.and_then(|s| s.message).unwrap_or_else(|| "failed".into()) } else { msg }
+        );
+    }
+    Ok(copied)
+}
+
+pub(crate) fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// Copy a file or directory out of a container into ~/Downloads (a directory
+/// comes as a .tar), like `kubectl cp pod:path .`. Returns where it was saved.
+pub async fn download_from_container(
+    client: Client,
+    ns: String,
+    pod: String,
+    container: Option<String>,
+    path: String,
+) -> Result<std::path::PathBuf> {
+    use std::io::Write as _;
+    run(async move {
+        let base =
+            path.trim_end_matches('/').rsplit('/').next().filter(|b| !b.is_empty()).unwrap_or("root").to_string();
+        let is_dir = exec_bytes(
+            client.clone(),
+            ns.clone(),
+            pod.clone(),
+            container.clone(),
+            vec!["sh".into(), "-c".into(), format!("test -d {} && echo dir", shell_quote(&path))],
+            None,
+        )
+        .await
+        .map(|o| String::from_utf8_lossy(&o).contains("dir"))
+        .unwrap_or(false);
+        let (cmd, name) = if is_dir {
+            let parent = path
+                .trim_end_matches('/')
+                .rsplit_once('/')
+                .map(|(p, _)| if p.is_empty() { "/" } else { p })
+                .unwrap_or(".");
+            (
+                vec!["tar".into(), "cf".into(), "-".into(), "-C".into(), parent.to_string(), "--".into(), base.clone()],
+                format!("{pod}-{base}.tar"),
+            )
+        } else {
+            (vec!["cat".into(), "--".into(), path.clone()], format!("{pod}-{base}"))
+        };
+        // Streamed to a new private file (it may hold secrets), never over an earlier one.
+        let (file, dest) = crate::private_files::create_new_in(&crate::private_files::downloads_dir(), &name)?;
+        // Through a buffer, and off the async workers while the disk is written.
+        let mut file = std::io::BufWriter::with_capacity(1 << 20, file);
+        let mut sink = |b: &[u8]| tokio::task::block_in_place(|| file.write_all(b));
+        let copied = exec_to(client, ns, pod, container, cmd, None, &mut sink, MAX_DOWNLOAD_BYTES).await;
+        let copied = copied.and_then(|_| Ok(tokio::task::block_in_place(|| file.flush())?));
+        drop(file);
+        if let Err(e) = copied {
+            let _ = std::fs::remove_file(&dest);
+            return Err(e);
+        }
+        Ok(dest)
+    })
+    .await
+}
+
+/// Copy a local file into a container directory, like `kubectl cp file pod:dir/`.
+pub async fn upload_to_container(
+    client: Client,
+    ns: String,
+    pod: String,
+    container: Option<String>,
+    local: std::path::PathBuf,
+    dir: String,
+) -> Result<String> {
+    run(async move {
+        let data = std::fs::read(&local)?;
+        let name = local.file_name().and_then(|n| n.to_str()).context("bad file name")?.to_string();
+        let dest = format!("{}/{name}", dir.trim_end_matches('/'));
+        exec_bytes(
+            client,
+            ns,
+            pod,
+            container,
+            vec!["sh".into(), "-c".into(), format!("cat > {}", shell_quote(&dest))],
+            Some(data),
+        )
+        .await?;
+        Ok(dest)
+    })
+    .await
+}
+
+/// Run a command (no tty) and capture its output, like `kubectl exec -- cmd`.
+pub async fn exec_capture(
+    client: Client,
+    ns: String,
+    pod: String,
+    container: Option<String>,
+    command: Vec<String>,
+    timeout_secs: u64,
+    max_bytes: usize,
+) -> Result<String> {
+    use kube::api::AttachParams;
+    run(async move {
+        let api: Api<Pod> = Api::namespaced(client, &ns);
+        let mut ap = AttachParams::default().stdout(true).stderr(true).stdin(false);
+        if let Some(c) = container {
+            ap = ap.container(c);
+        }
+        let mut proc = api.exec(&pod, command, &ap).await?;
+        let stdout = proc.stdout().context("no stdout")?;
+        let stderr = proc.stderr().context("no stderr")?;
+        let status = proc.take_status();
+        let work = async {
+            // Capped while reading: a chatty command cannot fill memory before the timeout.
+            let (out, err) = tokio::join!(read_capped(stdout, max_bytes), read_capped(stderr, max_bytes));
+            let status = match status {
+                Some(s) => s.await,
+                None => None,
+            };
+            (out, err, status)
+        };
+        let (out, err, status) = tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), work)
+            .await
+            .map_err(|_| anyhow!("command timed out after {timeout_secs}s"))?;
+        let clip = |(b, dropped): (Vec<u8>, bool)| {
+            let s = String::from_utf8_lossy(&b).to_string();
+            if dropped { format!("{s}\n… [truncated]") } else { s }
+        };
+        let code = match &status {
+            Some(s) if s.status.as_deref() == Some("Success") => "exit 0".to_string(),
+            Some(s) => s.message.clone().unwrap_or_else(|| "failed".into()),
+            None => "unknown status".into(),
+        };
+        Ok(format!("[{code}]\n--- stdout ---\n{}\n--- stderr ---\n{}", clip(out), clip(err)))
+    })
+    .await
+}
+
+/// Kills the shell when the session is dropped.
+pub(super) struct KillOnDrop(Box<dyn portable_pty::Child + Send + Sync>);
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+    }
+}
+
+/// Run a plugin command in the background with KUBECONFIG set to `context`, and `env` set.
+pub async fn run_command(
+    context: String,
+    namespace: Option<String>,
+    command: String,
+    env: Vec<(String, String)>,
+) -> Result<String> {
+    run(async move {
+        let kubeconfig = private_kubeconfig(&context, namespace.as_deref(), "plugin")?;
+        let out = tokio::process::Command::new("sh")
+            .args(["-c", &command])
+            .envs(env)
+            .env("KUBECONFIG", kubeconfig.path())
+            .output()
+            .await;
+        drop(kubeconfig);
+        let out = out?;
+        let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr))
+            .trim()
+            .to_string();
+        if !out.status.success() {
+            anyhow::bail!("{}", text.lines().last().unwrap_or("failed"));
+        }
+        Ok(text)
+    })
+    .await
+}
+
+/// Run the `helm` CLI against a context and return its output.
+pub async fn helm(context: String, args: Vec<String>) -> Result<String> {
+    run(async move {
+        let kubeconfig = private_kubeconfig(&context, None, "helm")?;
+        let out = tokio::process::Command::new("helm").args(&args).env("KUBECONFIG", kubeconfig.path()).output().await;
+        drop(kubeconfig);
+        let out = out.context("running helm (is it installed?)")?;
+        let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr))
+            .trim()
+            .to_string();
+        if !out.status.success() {
+            anyhow::bail!("{text}");
+        }
+        Ok(text)
+    })
+    .await
+}
+
+/// A shell on this machine, in a pty, whose kubectl points at `context`
+/// (and `namespace`), via a private copy of the kubeconfig. `env` is added to its environment.
+pub fn local_shell(
+    context: String,
+    namespace: Option<String>,
+    command: Option<String>,
+    env: Vec<(String, String)>,
+) -> (TaskGuard, mpsc::UnboundedSender<ExecInput>, mpsc::UnboundedReceiver<ExecOutput>) {
+    use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+    use std::io::{Read as _, Write as _};
+
+    let (in_tx, mut in_rx) = mpsc::unbounded::<ExecInput>();
+    let (out_tx, out_rx) = mpsc::unbounded();
+    let guard = spawn_guarded(async move {
+        let fail = |e: String| {
+            let _ = out_tx.unbounded_send(ExecOutput::Exit(e));
+        };
+        // Private kubeconfig with this context selected; the user's file is untouched.
+        // Removed when this task ends or is aborted (tab closed), after the shell is killed.
+        let kubeconfig = match private_kubeconfig(&context, namespace.as_deref(), "shell") {
+            Ok(p) => p,
+            Err(e) => return fail(format!("kubeconfig: {e:#}")),
+        };
+        let pty = native_pty_system();
+        let pair = match pty.openpty(PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 }) {
+            Ok(p) => p,
+            Err(e) => return fail(format!("pty: {e}")),
+        };
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
+        // A plugin runs its command, then waits so its output stays readable.
+        let mut cmd = match &command {
+            Some(c) => {
+                let mut b = CommandBuilder::new("sh");
+                b.args([
+                    "-c",
+                    &format!("{c}\nstatus=$?\nprintf '\\n[exited with %s — press Enter to close]' \"$status\"\nread _"),
+                ]);
+                b
+            }
+            None => CommandBuilder::new(shell),
+        };
+        for (k, v) in &env {
+            cmd.env(k, v);
+        }
+        cmd.env("KUBECONFIG", kubeconfig.path());
+        cmd.env("RECOUVRANCE_CONTEXT", &context);
+        cmd.env("TERM", "xterm-256color");
+        if let Some(home) = std::env::var_os("HOME") {
+            cmd.cwd(home);
+        }
+        let child = match pair.slave.spawn_command(cmd) {
+            Ok(c) => KillOnDrop(c),
+            Err(e) => return fail(format!("shell: {e}")),
+        };
+        drop(pair.slave);
+        let mut reader = match pair.master.try_clone_reader() {
+            Ok(r) => r,
+            Err(e) => return fail(format!("pty: {e}")),
+        };
+        let mut writer = match pair.master.take_writer() {
+            Ok(w) => w,
+            Err(e) => return fail(format!("pty: {e}")),
+        };
+        let out = out_tx.clone();
+        let reading = tokio::task::spawn_blocking(move || {
+            let mut buf = vec![0u8; 16 * 1024];
+            loop {
+                match reader.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if out.unbounded_send(ExecOutput::Data(buf[..n].to_vec())).is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+        // Writes block while the shell is not reading (a big paste): they get their own thread,
+        // never a worker of the shared kube runtime. It ends when `keys` is dropped below.
+        let (keys, typed) = std::sync::mpsc::channel::<Vec<u8>>();
+        let spawned = std::thread::Builder::new().name("pty-writer".into()).spawn(move || {
+            for b in typed {
+                if writer.write_all(&b).is_err() {
+                    break;
+                }
+                let _ = writer.flush();
+            }
+        });
+        if let Err(e) = spawned {
+            return fail(format!("pty: {e}"));
+        }
+        let master = std::sync::Mutex::new(pair.master);
+        let writing = async {
+            while let Some(input) = in_rx.next().await {
+                match input {
+                    ExecInput::Bytes(b) => {
+                        if keys.send(b).is_err() {
+                            break;
+                        }
+                    }
+                    ExecInput::Resize { cols, rows } => {
+                        let _ = master.lock().unwrap().resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 });
+                    }
+                }
+            }
+        };
+        tokio::select! {
+            _ = reading => {}
+            _ = writing => {}
+        }
+        drop(child);
+        drop(keys);
+        drop(kubeconfig);
+        let _ = out_tx.unbounded_send(ExecOutput::Exit("Shell exited".into()));
+    });
+    (guard, in_tx, out_rx)
+}
+
+/// `kubectl attach`: the container's own process output (and stdin/tty when the
+/// container was started with them), instead of a new shell.
+pub fn attach_container(
+    client: Client,
+    ns: String,
+    pod: String,
+    container: Option<String>,
+) -> (TaskGuard, mpsc::UnboundedSender<ExecInput>, mpsc::UnboundedReceiver<ExecOutput>) {
+    use kube::api::{AttachParams, TerminalSize};
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    let (in_tx, mut in_rx) = mpsc::unbounded::<ExecInput>();
+    let (out_tx, out_rx) = mpsc::unbounded();
+    let guard = spawn_guarded(async move {
+        let api: Api<Pod> = Api::namespaced(client, &ns);
+        // Attach with what the container offers: stdin and a tty only if its spec has them.
+        let spec = api.get(&pod).await.ok().and_then(|p| p.spec);
+        let c = spec.as_ref().and_then(|s| match &container {
+            Some(name) => s.containers.iter().find(|c| &c.name == name).cloned(),
+            None => s.containers.first().cloned(),
+        });
+        let (stdin, tty) =
+            c.as_ref().map(|c| (c.stdin.unwrap_or(false), c.tty.unwrap_or(false))).unwrap_or((false, false));
+        let mut ap = AttachParams::default().stdin(stdin).stdout(true).stderr(!tty).tty(tty);
+        if let Some(name) = c.map(|c| c.name) {
+            ap = ap.container(name);
+        }
+        let mut proc = match api.attach(&pod, &ap).await {
+            Ok(p) => p,
+            Err(e) => {
+                let _ = out_tx.unbounded_send(ExecOutput::Exit(format!("attach failed: {e}")));
+                return;
+            }
+        };
+        let note = format!(
+            "\x1b[2mAttached to the container's main process{}. Closing detaches; it keeps running.\x1b[0m\r\n",
+            if stdin { "" } else { " (output only: it was not started with stdin)" }
+        );
+        let _ = out_tx.unbounded_send(ExecOutput::Data(note.into_bytes()));
+        let pump = |mut r: Box<dyn tokio::io::AsyncRead + Unpin + Send>, out_tx: mpsc::UnboundedSender<ExecOutput>| async move {
+            let mut buf = vec![0u8; 16 * 1024];
+            loop {
+                match r.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        // Without a tty, output uses bare newlines.
+                        let bytes = if tty {
+                            buf[..n].to_vec()
+                        } else {
+                            String::from_utf8_lossy(&buf[..n]).replace('\n', "\r\n").into_bytes()
+                        };
+                        if out_tx.unbounded_send(ExecOutput::Data(bytes)).is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        };
+        let stdout = proc.stdout().map(|s| pump(Box::new(s), out_tx.clone()));
+        let stderr = proc.stderr().map(|s| pump(Box::new(s), out_tx.clone()));
+        let mut stdin_w = proc.stdin();
+        let mut resize = proc.terminal_size();
+        let writer = async move {
+            while let Some(input) = in_rx.next().await {
+                match input {
+                    ExecInput::Bytes(b) => {
+                        if let Some(w) = stdin_w.as_mut() {
+                            if w.write_all(&b).await.is_err() {
+                                break;
+                            }
+                            let _ = w.flush().await;
+                        }
+                    }
+                    ExecInput::Resize { cols, rows } => {
+                        if let Some(r) = resize.as_mut() {
+                            use futures::SinkExt as _;
+                            let _ = r.send(TerminalSize { width: cols, height: rows }).await;
+                        }
+                    }
+                }
+            }
+            futures::future::pending::<()>().await;
+        };
+        let readers = async move {
+            match (stdout, stderr) {
+                (Some(a), Some(b)) => {
+                    futures::join!(a, b);
+                }
+                (Some(a), None) | (None, Some(a)) => a.await,
+                (None, None) => {}
+            }
+        };
+        tokio::select! {
+            _ = readers => {}
+            _ = writer => {}
+        }
+        let _ = out_tx.unbounded_send(ExecOutput::Exit("Detached: the process ended or closed its output".into()));
+    });
+    (guard, in_tx, out_rx)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{copy_capped, read_capped};
+
+    #[tokio::test]
+    async fn reads_are_capped_but_drained() {
+        let data = vec![7u8; 100_000];
+        let (kept, dropped) = read_capped(&data[..], 1000).await;
+        assert_eq!((kept.len(), dropped), (1000, true));
+        let (kept, dropped) = read_capped(&data[..10], 1000).await;
+        assert_eq!((kept.len(), dropped), (10, false));
+    }
+
+    #[tokio::test]
+    async fn copies_fail_past_the_cap() {
+        let data = vec![1u8; 4096];
+        let mut out = Vec::new();
+        let mut sink = |b: &[u8]| {
+            out.extend_from_slice(b);
+            Ok(())
+        };
+        assert_eq!(copy_capped(&data[..], &mut sink, 4096).await.unwrap(), 4096);
+        assert_eq!(out.len(), 4096);
+        let mut out = Vec::new();
+        let mut sink = |b: &[u8]| {
+            out.extend_from_slice(b);
+            Ok(())
+        };
+        assert!(copy_capped(&data[..], &mut sink, 4095).await.is_err());
+        // Nothing past the cap is passed on.
+        assert!(out.len() <= 4095);
+    }
+}

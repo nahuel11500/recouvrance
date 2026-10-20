@@ -1,0 +1,7 @@
+[files]
+extend-exclude = ["Cargo.lock", "LICENSE-*", "*.svg"]
+
+[default.extend-words]
+# Deliberate misspellings in tests (a field typo the YAML checker must catch, a near-miss token).
+contianers = "contianers"
+abd = "abd"

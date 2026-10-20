@@ -1,0 +1,116 @@
+mod agents;
+mod app;
+mod assistant;
+mod certs;
+mod details;
+#[cfg(feature = "dev")]
+mod dev;
+mod diagnose;
+mod favorites;
+mod forwards;
+mod k8s;
+mod mcp;
+mod overview;
+mod plugins;
+mod private_files;
+mod problems;
+mod prom;
+mod rbac;
+mod schema;
+mod settings;
+mod status;
+mod table;
+mod templates;
+mod ui;
+
+// Many threads allocate large, short-lived lists (huge clusters); mimalloc
+// gives that memory back where glibc malloc keeps it fragmented.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+fn main() {
+    #[cfg(feature = "dev")]
+    if let Ok(ctx) = std::env::var("RECOUVRANCE_SMOKE") {
+        return dev::smoke::run(ctx);
+    }
+    let args: Vec<String> = std::env::args().collect();
+    match args.get(1).map(String::as_str) {
+        // Headless MCP server, without the window.
+        Some("serve") => return serve(),
+        // `Recouvrance agent-create <name> [context...]` prints the agent's token once.
+        Some("agent-create") => return agent_create(&args[2..]),
+        _ => {}
+    }
+    #[cfg(feature = "dev")]
+    {
+        let args: Vec<String> = std::env::args().collect();
+        if let Some(i) = args.iter().position(|a| a == "--snapshot") {
+            let path = args.get(i + 1).map(String::as_str).unwrap_or("snapshot.png");
+            let secs = args.get(i + 2).and_then(|s| s.parse().ok()).unwrap_or(6);
+            dev::snapshot::run(path, std::time::Duration::from_secs(secs)).expect("snapshot");
+            return;
+        }
+    }
+    gpui_kit::application().with_assets(gpui_kit::assets::AllAssets).run(|cx| {
+        gpui_kit::init(cx);
+        app::bind_keys(cx);
+        plugins::reload(cx);
+        app::load_zoom(cx);
+        let mode = app::initial_theme(cx);
+        app::set_theme(mode, None, cx);
+        app::open_main_window(cx);
+        cx.activate(true);
+    });
+}
+
+fn serve() {
+    let hub = mcp::Hub::load();
+    // No window to approve in: Ask rules refuse at once instead of waiting two minutes.
+    hub.set_headless(true);
+    if let Err(e) = hub.apply_rules_file() {
+        eprintln!("rules.yaml: {e:#}");
+    }
+    hub.watch_rules_file();
+    let mut events = hub.subscribe();
+    let _server = mcp::server::start(hub.clone());
+    eprintln!("Recouvrance MCP on http://127.0.0.1:{}/mcp", hub.port());
+    futures::executor::block_on(async {
+        use futures::StreamExt as _;
+        while let Some(ev) = events.next().await {
+            match &*ev {
+                mcp::HubEvent::Audit(e) => {
+                    eprintln!("{} {:?} {} {} {}ms {}", e.agent, e.decision, e.tool, e.args, e.duration_ms, e.detail)
+                }
+                mcp::HubEvent::ServerStatus(Err(e)) => {
+                    eprintln!("server error: {e}");
+                    return;
+                }
+                _ => {}
+            }
+        }
+    });
+}
+
+fn agent_create(args: &[String]) {
+    let hub = mcp::Hub::load();
+    let (name, contexts) = agent_create_args(args);
+    let (agent, token) = hub.create_agent(name).expect("create agent");
+    hub.update_agent(&agent.id, |a| a.policy.rules[0].contexts = contexts).expect("save");
+    println!("{token}");
+}
+
+/// `<name> [context...]`; both optional.
+fn agent_create_args(args: &[String]) -> (String, Vec<String>) {
+    let name = args.first().cloned().unwrap_or_else(|| "agent".into());
+    (name, args.get(1..).unwrap_or_default().to_vec())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn agent_create_args_may_be_missing() {
+        assert_eq!(super::agent_create_args(&[]), ("agent".to_string(), vec![]));
+        let args = ["bot".to_string(), "c1".to_string(), "c2".to_string()];
+        assert_eq!(super::agent_create_args(&args), ("bot".to_string(), vec!["c1".to_string(), "c2".to_string()]));
+    }
+}

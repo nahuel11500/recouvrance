@@ -1,0 +1,5 @@
+target/
+# Screenshots from the dev renderer; only the ones in docs/images are kept.
+*.png
+!docs/images/*.png
+.claude/

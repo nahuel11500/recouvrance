@@ -1,0 +1,42 @@
+name: Bug report
+description: Something does not work as expected
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what happened instead. Screenshots help.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Connect to a cluster with …
+        2. Open …
+        3. …
+  - type: input
+    id: version
+    attributes:
+      label: Recouvrance version or commit
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: Platform
+      placeholder: Ubuntu 26.04 (Wayland), macOS 16 (Apple Silicon)…
+    validations:
+      required: true
+  - type: input
+    id: kubernetes
+    attributes:
+      label: Kubernetes version and distribution
+      placeholder: 1.33, EKS / GKE / kind / k3s…
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs or error messages
+      render: text

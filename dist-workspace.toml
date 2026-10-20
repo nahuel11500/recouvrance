@@ -1,0 +1,44 @@
+[workspace]
+members = ["cargo:."]
+
+# Config for 'dist'
+[dist]
+cargo-dist-version = "0.33.0"
+ci = "github"
+installers = ["shell"]
+targets = ["aarch64-apple-darwin", "x86_64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-unknown-linux-gnu"]
+install-path = "CARGO_HOME"
+install-updater = true
+# release-plz creates the tag and the GitHub release notes; dist builds and uploads the binaries.
+create-release = false
+# The .deb and AppImage, built next to the tarballs and uploaded with them.
+local-artifacts-jobs = ["./linux-packages"]
+include = ["assets/recouvrance.svg", "assets/recouvrance.desktop"]
+pr-run-mode = "skip"
+# Build provenance attestations for the archives (linux-packages.yml attests the .deb and the
+# AppImage); verify with `gh attestation verify <file> --repo nahuel11500/recouvrance`.
+github-attestations = true
+# release.yml calls linux-packages.yml with `secrets: inherit` (hard-coded by dist). That passes
+# repository secrets only: the release secrets live in the `release` environment, which no job of
+# the release workflow enters, so the packages job cannot read them. Keep it that way.
+
+# The packages job attests what it builds.
+[dist.github-custom-job-permissions]
+"linux-packages" = { contents = "read", id-token = "write", attestations = "write" }
+
+[dist.dependencies.apt]
+pkg-config = "*"
+clang = "*"
+cmake = "*"
+libfontconfig-dev = "*"
+libfreetype-dev = "*"
+libxkbcommon-dev = "*"
+libxkbcommon-x11-dev = "*"
+libwayland-dev = "*"
+libvulkan-dev = "*"
+libx11-xcb-dev = "*"
+libxcb1-dev = "*"
+
+[dist.github-custom-runners]
+aarch64-unknown-linux-gnu = "ubuntu-24.04-arm"
+x86_64-apple-darwin = "macos-15-intel"

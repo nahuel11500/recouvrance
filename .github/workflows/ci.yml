@@ -1,0 +1,206 @@
+name: CI
+
+# Pull requests get the quick checks (a few minutes). Pushes to main, release tags and
+# manual runs get everything: macOS, the minimum Rust version, docs, an end-to-end run on
+# a kind cluster and release builds.
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_RETRY: 10
+  RUST_BACKTRACE: short
+  # Libraries gpui needs to build and run on Linux.
+  LINUX_DEPS: >-
+    pkg-config clang cmake libfontconfig-dev libfreetype-dev libxkbcommon-dev libxkbcommon-x11-dev
+    libwayland-dev libvulkan-dev libx11-xcb-dev libxcb1-dev
+  FULL: ${{ github.event_name != 'pull_request' }}
+
+jobs:
+  # ---- Quick checks (every pull request and push) ----
+
+  fmt:
+    name: Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  typos:
+    name: Spelling
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: crate-ci/typos@v1
+
+  check:
+    name: Clippy and tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: System libraries
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends $LINUX_DEPS
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci
+          cache-on-failure: true
+      - name: Clippy
+        run: cargo clippy --locked --profile ci --all-targets --features dev -- -D warnings
+      - name: Clippy without developer tools
+        run: cargo clippy --locked --profile ci --all-targets -- -D warnings
+      - name: Tests
+        run: cargo test --locked --profile ci --features dev
+
+  deny:
+    name: Licenses and advisories
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: EmbarkStudios/cargo-deny-action@v2
+
+  # ---- Full run (main, tags, manual) ----
+
+  test-macos:
+    name: Tests (macOS)
+    if: github.event_name != 'pull_request'
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci
+      - run: cargo test --locked --profile ci --features dev
+
+  msrv:
+    name: Minimum Rust version
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends $LINUX_DEPS
+      - name: Read rust-version from Cargo.toml
+        id: msrv
+        run: echo "version=$(grep -m1 '^rust-version' Cargo.toml | cut -d'"' -f2)" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: msrv
+      - run: cargo check --locked --profile ci
+
+  docs:
+    name: Docs
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends $LINUX_DEPS
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci
+      - run: cargo doc --locked --profile ci --no-deps --document-private-items
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  e2e:
+    name: End to end (kind)
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends $LINUX_DEPS mesa-vulkan-drivers
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci
+      - uses: helm/kind-action@v1
+        with:
+          cluster_name: recouvrance
+      - name: Load test objects
+        run: |
+          kubectl create deployment web --image=busybox:1.37 -- sh -c 'while true; do echo hello ERROR $(date); sleep 2; done'
+          kubectl rollout status deployment/web --timeout=120s
+      - run: cargo build --locked --profile ci --features dev
+      - name: Smoke checks (discovery, table watch, list timing)
+        run: |
+          RECOUVRANCE_SMOKE=kind-recouvrance target/ci/recouvrance | tee smoke.txt
+          grep -q "^kinds=" smoke.txt
+          grep -q "^rows=" smoke.txt
+          RECOUVRANCE_SMOKE=kind-recouvrance RECOUVRANCE_LISTTIME=1 target/ci/recouvrance
+      - name: Render the UI off-screen
+        env:
+          XDG_CONFIG_HOME: ${{ runner.temp }}/config
+          XDG_DATA_HOME: ${{ runner.temp }}/data
+          RECOUVRANCE_CONTEXT: kind-recouvrance
+          RECOUVRANCE_KIND: pods
+          RECOUVRANCE_NS: default
+          RECOUVRANCE_SELECT: "0"
+          RECOUVRANCE_TAB: logs
+        run: timeout 300 target/ci/recouvrance --snapshot snapshot.png 10 && test -s snapshot.png
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: snapshot
+          path: snapshot.png
+          if-no-files-found: ignore
+
+  build:
+    name: Release build (${{ matrix.target }})
+    if: github.event_name != 'pull_request'
+    needs: [fmt, check]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-latest
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends $LINUX_DEPS
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - run: cargo build --locked --release --target ${{ matrix.target }}
+      - uses: actions/upload-artifact@v7
+        with:
+          name: recouvrance-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/recouvrance
+
+  # One required check for branch protection, whatever ran.
+  ci-ok:
+    name: CI result
+    if: always()
+    needs: [fmt, typos, check, deny, test-macos, msrv, docs, e2e, build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: All required jobs passed or were skipped
+        run: |
+          echo '${{ toJSON(needs) }}' | jq -e 'to_entries | all(.value.result == "success" or .value.result == "skipped")'

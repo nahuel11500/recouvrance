@@ -1,0 +1,4 @@
+* text=auto eol=lf
+*.png binary
+*.svg text
+Cargo.lock linguist-generated=true -diff

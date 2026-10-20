@@ -1,0 +1,673 @@
+//! Cluster overview: capacity, usage, node health and top namespaces, per cluster.
+
+use std::collections::HashMap;
+
+use gpui_kit::assets::IconName as Lucide;
+use gpui_kit::component::{ActiveTheme as _, Icon, h_flex, v_flex};
+use gpui_kit::prelude::FluentBuilder as _;
+use gpui_kit::*;
+use k8s_openapi::api::core::v1 as core;
+use kube::Client;
+use serde::Deserialize;
+use serde_json::Value;
+
+use crate::details::OpenObject;
+use crate::k8s;
+
+#[derive(Default)]
+struct Summary {
+    context: String,
+    version: String,
+    nodes: usize,
+    nodes_ready: usize,
+    kubelet_versions: Vec<(String, usize)>,
+    pods_running: usize,
+    pods_total: usize,
+    namespaces: usize,
+    /// (allocatable, requested, used) in millicores / bytes.
+    cpu: (f64, f64, f64),
+    mem: (f64, f64, f64),
+    /// Node name and the problems it reports.
+    node_issues: Vec<(String, Vec<String>)>,
+    /// namespace -> (cpu used, mem used)
+    top_ns: Vec<(String, f64, f64)>,
+    /// CPU (millicores) and memory over the chosen range, from Prometheus.
+    history: Option<(crate::prom::Series, crate::prom::Series)>,
+    /// GPUs: (allocatable, requested) over every GPU resource (nvidia.com/gpu, amd.com/gpu…).
+    gpus: (f64, f64),
+    /// GPU utilization and memory, from the DCGM exporter.
+    gpu: Option<crate::prom::GpuUsage>,
+    error: Option<String>,
+}
+
+pub struct ClusterOverview {
+    summaries: Option<Vec<Summary>>,
+    _task: Task<()>,
+}
+
+impl EventEmitter<OpenObject> for ClusterOverview {}
+
+impl ClusterOverview {
+    pub fn new(clusters: Vec<(String, Client)>, cx: &mut Context<Self>) -> Self {
+        let task = cx.spawn(async move |this, cx| {
+            loop {
+                let exec = cx.background_executor().clone();
+                if !crate::app::wait_visible(&this, cx, &exec).await {
+                    break;
+                }
+                let started = std::time::Instant::now();
+                let loads = clusters.iter().map(|(ctx, c)| load(ctx.clone(), c.clone()));
+                let summaries = futures::future::join_all(loads).await;
+                let took = started.elapsed();
+                if this
+                    .update(cx, |this, cx| {
+                        this.summaries = Some(summaries);
+                        cx.notify();
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+                // Big clusters take long to list; don't hammer their API servers.
+                let wait = (took * 2).max(crate::settings::secs(crate::settings::get().overview_refresh));
+                cx.background_executor().timer(wait).await;
+            }
+        });
+        Self { summaries: None, _task: task }
+    }
+}
+
+/// GPUs in a resource list: every extended resource whose name ends in `/gpu`.
+fn gpu_count(resources: &HashMap<String, String>) -> f64 {
+    resources.iter().filter(|(k, _)| k.ends_with("/gpu")).filter_map(|(_, v)| v.parse::<f64>().ok()).sum()
+}
+
+fn st<'a>(v: &'a Value, p: &str) -> &'a str {
+    v.pointer(p).and_then(Value::as_str).unwrap_or_default()
+}
+
+// Only the fields the overview reads: big clusters' pods and nodes are never held as JSON.
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct Named {
+    name: String,
+    namespace: String,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default, rename_all = "camelCase")]
+struct NodeLite {
+    metadata: Named,
+    spec: NodeSpecLite,
+    status: NodeStatusLite,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct NodeSpecLite {
+    unschedulable: bool,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default, rename_all = "camelCase")]
+struct NodeStatusLite {
+    conditions: Vec<CondLite>,
+    node_info: NodeInfoLite,
+    allocatable: HashMap<String, String>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default, rename_all = "camelCase")]
+struct NodeInfoLite {
+    kubelet_version: String,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct CondLite {
+    #[serde(rename = "type")]
+    type_: String,
+    status: String,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct PodLite {
+    spec: PodSpecLite,
+    status: PodStatusLite,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct PodSpecLite {
+    containers: Vec<ContainerLite>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct ContainerLite {
+    resources: ResourcesLite,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct ResourcesLite {
+    requests: HashMap<String, String>,
+    limits: HashMap<String, String>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct PodStatusLite {
+    phase: String,
+}
+
+/// metrics.k8s.io lists: usage per node, or per pod container.
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct MetricsList {
+    items: Vec<MetricsItem>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct MetricsItem {
+    metadata: Named,
+    usage: HashMap<String, String>,
+    containers: Vec<MetricsContainer>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct MetricsContainer {
+    usage: HashMap<String, String>,
+}
+
+fn quantity<'a>(m: &'a HashMap<String, String>, key: &str) -> &'a str {
+    m.get(key).map(String::as_str).unwrap_or_default()
+}
+
+/// Nodes into the summary: readiness, problems, kubelet versions and allocatable.
+fn add_nodes(s: &mut Summary, nodes: &[NodeLite]) {
+    s.nodes = nodes.len();
+    let mut versions: HashMap<String, usize> = HashMap::new();
+    for n in nodes {
+        let conds = &n.status.conditions;
+        let ready = conds.iter().any(|c| c.type_ == "Ready" && c.status == "True");
+        if ready {
+            s.nodes_ready += 1;
+        }
+        let mut issues: Vec<String> =
+            conds.iter().filter(|c| c.type_ != "Ready" && c.status == "True").map(|c| c.type_.clone()).collect();
+        if !ready {
+            issues.insert(0, "NotReady".into());
+        }
+        if n.spec.unschedulable {
+            issues.push("Cordoned".into());
+        }
+        if !issues.is_empty() {
+            s.node_issues.push((n.metadata.name.clone(), issues));
+        }
+        *versions.entry(n.status.node_info.kubelet_version.clone()).or_default() += 1;
+        s.cpu.0 += k8s::parse_cpu(quantity(&n.status.allocatable, "cpu"));
+        s.mem.0 += k8s::parse_bytes(quantity(&n.status.allocatable, "memory"));
+        s.gpus.0 += gpu_count(&n.status.allocatable);
+    }
+    let mut versions: Vec<(String, usize)> = versions.into_iter().collect();
+    versions.sort();
+    s.kubelet_versions = versions;
+}
+
+/// Pods into the summary: how many run, and what running or pending ones request.
+fn add_pods(s: &mut Summary, pods: &[PodLite]) {
+    s.pods_total = pods.len();
+    for p in pods {
+        let phase = p.status.phase.as_str();
+        if phase == "Running" {
+            s.pods_running += 1;
+        }
+        if phase == "Running" || phase == "Pending" {
+            for c in &p.spec.containers {
+                let (requests, limits) = (&c.resources.requests, &c.resources.limits);
+                s.cpu.1 += requests.get("cpu").map(|q| k8s::parse_cpu(q)).unwrap_or(0.0);
+                s.mem.1 += requests.get("memory").map(|q| k8s::parse_bytes(q)).unwrap_or(0.0);
+                s.gpus.1 += gpu_count(limits);
+            }
+        }
+    }
+}
+
+/// A metrics.k8s.io list, or nothing when metrics-server is missing.
+async fn metrics(client: Client, path: &'static str) -> MetricsList {
+    k8s::run(async move { Ok(client.request(http::Request::get(path).body(Vec::new())?).await?) })
+        .await
+        .unwrap_or_default()
+}
+
+async fn load(context: String, client: Client) -> Summary {
+    let mut s = Summary { context, ..Default::default() };
+    let minutes = crate::settings::get().usage_range;
+    if let Ok(Some(target)) = crate::prom::target(&s.context, client.clone()).await {
+        if let Ok((cpu, mem)) = crate::prom::cluster_usage(client.clone(), target.clone(), minutes).await {
+            s.history = Some((cpu.into_iter().map(|(t, v)| (t, v * 1000.0)).collect(), mem));
+        }
+        s.gpu = crate::prom::gpu_usage(client.clone(), target, crate::prom::GpuScope::Cluster, minutes).await;
+    }
+    let result: Result<()> = async {
+        let c = client.clone();
+        let version: Value =
+            k8s::run(async move { Ok(c.request(http::Request::get("/version").body(Vec::new())?).await?) }).await?;
+        s.version = st(&version, "/gitVersion").to_string();
+
+        let nodes: Vec<NodeLite> = k8s::lists::list_lean(client.clone(), k8s::ar_of::<core::Node>(), None).await?;
+        add_nodes(&mut s, &nodes);
+        drop(nodes);
+        let pods: Vec<PodLite> = k8s::lists::list_lean(client.clone(), k8s::ar_of::<core::Pod>(), None).await?;
+        add_pods(&mut s, &pods);
+        drop(pods);
+        s.namespaces = k8s::namespaces(client.clone()).await.map(|n| n.len()).unwrap_or(0);
+
+        // Usage: nodes for the totals, pods for the per-namespace ranking.
+        for n in metrics(client.clone(), "/apis/metrics.k8s.io/v1beta1/nodes").await.items {
+            s.cpu.2 += k8s::parse_cpu(quantity(&n.usage, "cpu"));
+            s.mem.2 += k8s::parse_bytes(quantity(&n.usage, "memory"));
+        }
+        let mut by_ns: HashMap<String, (f64, f64)> = HashMap::new();
+        for p in metrics(client.clone(), "/apis/metrics.k8s.io/v1beta1/pods").await.items {
+            let e = by_ns.entry(p.metadata.namespace).or_default();
+            for c in &p.containers {
+                e.0 += k8s::parse_cpu(quantity(&c.usage, "cpu"));
+                e.1 += k8s::parse_bytes(quantity(&c.usage, "memory"));
+            }
+        }
+        let mut top: Vec<(String, f64, f64)> = by_ns.into_iter().map(|(ns, (c, m))| (ns, c, m)).collect();
+        top.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+        top.truncate(10);
+        s.top_ns = top;
+        Ok(())
+    }
+    .await;
+    if let Err(e) = result {
+        s.error = Some(format!("{e:#}"));
+    }
+    s
+}
+
+impl ClusterOverview {
+    fn tile(label: &str, value: String, sub: String, cx: &App) -> Div {
+        v_flex()
+            .w(px(180.))
+            .p_3()
+            .gap_0p5()
+            .rounded_md()
+            .border_1()
+            .border_color(cx.theme().border)
+            .child(div().text_xs().text_color(cx.theme().muted_foreground).child(label.to_string()))
+            .child(div().text_2xl().font_weight(FontWeight::SEMIBOLD).child(value))
+            .child(div().text_xs().text_color(cx.theme().muted_foreground).child(sub))
+    }
+
+    /// One bar with usage (solid) and requests (outlined marker) against allocatable.
+    fn capacity(
+        label: &str,
+        icon: Lucide,
+        (alloc, req, used): (f64, f64, f64),
+        fmt: fn(f64) -> String,
+        color: Hsla,
+        cx: &App,
+    ) -> Div {
+        let t = cx.theme();
+        let pct = |v: f64| if alloc > 0.0 { (v / alloc).clamp(0.0, 1.0) } else { 0.0 };
+        let req_color = if req > alloc * 0.9 { t.warning } else { t.foreground };
+        v_flex()
+            .flex_1()
+            .min_w(px(320.))
+            .gap_1()
+            .child(
+                h_flex().gap_1().text_sm().child(Icon::new(icon).size_4().text_color(color)).child(label.to_string()),
+            )
+            .child(
+                div()
+                    .relative()
+                    .h(px(14.))
+                    .w_full()
+                    .rounded_md()
+                    .bg(t.secondary)
+                    .child(
+                        div().absolute().left_0().top_0().h_full().rounded_md().bg(color).w(relative(pct(used) as f32)),
+                    )
+                    .child(
+                        div()
+                            .absolute()
+                            .top(px(-3.))
+                            .h(px(20.))
+                            .w(px(2.))
+                            .bg(req_color)
+                            .left(relative(pct(req) as f32)),
+                    ),
+            )
+            .child(
+                h_flex()
+                    .gap_4()
+                    .text_xs()
+                    .text_color(t.muted_foreground)
+                    .child(format!("Used {} ({:.0}%)", fmt(used), pct(used) * 100.0))
+                    .child(format!("Requested {} ({:.0}%)", fmt(req), pct(req) * 100.0))
+                    .child(format!("Allocatable {}", fmt(alloc))),
+            )
+    }
+}
+
+impl Render for ClusterOverview {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme().clone();
+        let Some(summaries) = &self.summaries else {
+            return div()
+                .p_4()
+                .text_color(theme.muted_foreground)
+                .child("Loading cluster overview…")
+                .into_any_element();
+        };
+        let sections = summaries.iter().enumerate().map(|(si, s)| {
+            if let Some(e) = &s.error {
+                return v_flex()
+                    .gap_1()
+                    .child(div().text_lg().font_weight(FontWeight::SEMIBOLD).child(s.context.clone()))
+                    .child(div().text_sm().text_color(theme.danger).child(e.clone()))
+                    .into_any_element();
+            }
+            let versions = s.kubelet_versions.iter().map(|(v, n)| format!("{v} ×{n}")).collect::<Vec<_>>().join(", ");
+            let max_mem = s.top_ns.iter().map(|t| t.2).fold(1.0, f64::max);
+            v_flex()
+                .gap_4()
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .items_baseline()
+                        .child(div().text_lg().font_weight(FontWeight::SEMIBOLD).child(s.context.clone()))
+                        .child(
+                            div()
+                                .text_sm()
+                                .text_color(theme.muted_foreground)
+                                .child(format!("Kubernetes {}", s.version)),
+                        ),
+                )
+                .child(
+                    h_flex()
+                        .flex_wrap()
+                        .gap_3()
+                        .child(Self::tile(
+                            "Nodes",
+                            format!("{}/{}", s.nodes_ready, s.nodes),
+                            if s.nodes_ready == s.nodes {
+                                "all ready".into()
+                            } else {
+                                format!("{} not ready", s.nodes - s.nodes_ready)
+                            },
+                            cx,
+                        ))
+                        .child(Self::tile(
+                            "Pods",
+                            s.pods_running.to_string(),
+                            format!("running of {}", s.pods_total),
+                            cx,
+                        ))
+                        .child(Self::tile("Namespaces", s.namespaces.to_string(), String::new(), cx))
+                        .child(Self::tile("Kubelet", s.kubelet_versions.len().to_string(), versions, cx)),
+                )
+                .child(
+                    h_flex()
+                        .flex_wrap()
+                        .gap_6()
+                        .child(Self::capacity("CPU", Lucide::Cpu, s.cpu, k8s::format_cores, theme.blue, cx))
+                        .child(Self::capacity(
+                            "Memory",
+                            Lucide::MemoryStick,
+                            s.mem,
+                            k8s::format_bytes,
+                            theme.success,
+                            cx,
+                        )),
+                )
+                .when_some(s.history.as_ref(), |d, (cpu, mem)| {
+                    use crate::overview::{ChartSpec, usage_chart};
+                    let minutes = crate::settings::get().usage_range;
+                    let spec = |title, req, lim, color, fmt, id| ChartSpec {
+                        title,
+                        req: Some(req),
+                        req_word: "requested",
+                        lim: Some(lim),
+                        lim_word: "allocatable",
+                        pin_lim: false,
+                        color,
+                        fmt,
+                        id,
+                        minutes,
+                    };
+                    let avg = |v: &crate::prom::Series| {
+                        if v.is_empty() { 0.0 } else { v.iter().map(|p| p.1).sum::<f64>() / v.len() as f64 }
+                    };
+                    let ratio = |used: f64, req: f64| if req > 0.0 { used / req * 100.0 } else { 0.0 };
+                    let (cpu_eff, mem_eff) = (ratio(avg(cpu), s.cpu.1), ratio(avg(mem), s.mem.1));
+                    let tone = |p: f64| if p < 30.0 { theme.warning } else { theme.muted_foreground };
+                    d.child(
+                        h_flex()
+                            .gap_1()
+                            .text_sm()
+                            .text_color(theme.muted_foreground)
+                            .child("Over this range, workloads used on average")
+                            .child(
+                                div()
+                                    .text_color(tone(cpu_eff))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .child(format!("{cpu_eff:.0}% of the CPU")),
+                            )
+                            .child("and")
+                            .child(
+                                div()
+                                    .text_color(tone(mem_eff))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .child(format!("{mem_eff:.0}% of the memory")),
+                            )
+                            .child("they request."),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_3()
+                            .child(usage_chart(
+                                cpu,
+                                spec(
+                                    "CPU used",
+                                    s.cpu.1,
+                                    s.cpu.0,
+                                    theme.blue,
+                                    k8s::format_cores as fn(f64) -> String,
+                                    "cl-cpu",
+                                ),
+                                cx,
+                            ))
+                            .child(usage_chart(
+                                mem,
+                                spec(
+                                    "Memory used",
+                                    s.mem.1,
+                                    s.mem.0,
+                                    theme.success,
+                                    k8s::format_bytes as fn(f64) -> String,
+                                    "cl-mem",
+                                ),
+                                cx,
+                            )),
+                    )
+                })
+                .when(s.gpus.0 > 0.0 || s.gpu.is_some(), |d| {
+                    use crate::overview::{ChartSpec, usage_chart};
+                    let minutes = crate::settings::get().usage_range;
+                    let pct = |v: f64| format!("{v:.0}%");
+                    let mut row = h_flex().gap_3();
+                    if let Some(g) = &s.gpu {
+                        row = row
+                            .child(usage_chart(
+                                &g.util,
+                                ChartSpec {
+                                    title: "GPU utilization (average)",
+                                    req: None,
+                                    req_word: "",
+                                    lim: Some(100.0),
+                                    lim_word: "max",
+                                    pin_lim: true,
+                                    color: theme.warning,
+                                    fmt: pct,
+                                    id: "cl-gpu",
+                                    minutes,
+                                },
+                                cx,
+                            ))
+                            .child(usage_chart(
+                                &g.mem,
+                                ChartSpec {
+                                    title: "GPU memory used",
+                                    req: None,
+                                    req_word: "",
+                                    lim: g.mem_total,
+                                    lim_word: "total",
+                                    pin_lim: true,
+                                    color: theme.danger,
+                                    fmt: k8s::format_bytes,
+                                    id: "cl-gpu-mem",
+                                    minutes,
+                                },
+                                cx,
+                            ));
+                    }
+                    d.child(div().text_sm().text_color(theme.muted_foreground).child(format!(
+                        "GPUs: {:.0} requested of {:.0} allocatable{}",
+                        s.gpus.1,
+                        s.gpus.0,
+                        if s.gpu.is_none() { " · install NVIDIA's DCGM exporter for GPU usage" } else { "" }
+                    )))
+                    .child(row)
+                })
+                .child(
+                    h_flex()
+                        .items_start()
+                        .gap_6()
+                        .child(
+                            v_flex()
+                                .w(px(420.))
+                                .gap_1()
+                                .child(div().text_base().child("Nodes with issues"))
+                                .when(s.node_issues.is_empty(), |d| {
+                                    d.child(
+                                        div()
+                                            .text_sm()
+                                            .text_color(theme.muted_foreground)
+                                            .child("None — every node is Ready and healthy."),
+                                    )
+                                })
+                                .children(s.node_issues.iter().enumerate().map(|(i, (node, issues))| {
+                                    let node_name = node.clone();
+                                    let ctx_name = s.context.clone();
+                                    h_flex()
+                                        .gap_2()
+                                        .text_sm()
+                                        .child(
+                                            div()
+                                                .id(("node-issue", si * 1000 + i))
+                                                .text_color(theme.blue)
+                                                .cursor_pointer()
+                                                .on_click(cx.listener(move |_, _, _, cx| {
+                                                    cx.emit(OpenObject {
+                                                        kind: "nodes".into(),
+                                                        name: node_name.clone(),
+                                                        namespace: None,
+                                                        context: Some(ctx_name.clone()),
+                                                    })
+                                                }))
+                                                .child(node.clone()),
+                                        )
+                                        .child(div().text_color(theme.warning).child(issues.join(", ")))
+                                })),
+                        )
+                        .child(
+                            v_flex()
+                                .flex_1()
+                                .gap_1()
+                                .child(div().text_base().child("Top namespaces by memory"))
+                                .children(s.top_ns.iter().map(|(ns, cpu, mem)| {
+                                    h_flex()
+                                        .gap_3()
+                                        .text_sm()
+                                        .child(
+                                            div()
+                                                .w(px(220.))
+                                                .overflow_hidden()
+                                                .text_ellipsis()
+                                                .whitespace_nowrap()
+                                                .child(ns.clone()),
+                                        )
+                                        .child(div().w(px(70.)).child(k8s::format_cpu(*cpu)))
+                                        .child(div().w(px(80.)).child(k8s::format_bytes(*mem)))
+                                        .child(
+                                            div().flex_1().h(px(6.)).rounded_full().bg(theme.secondary).child(
+                                                div()
+                                                    .h_full()
+                                                    .rounded_full()
+                                                    .bg(theme.success)
+                                                    .w(relative((*mem / max_mem) as f32)),
+                                            ),
+                                        )
+                                })),
+                        ),
+                )
+                .into_any_element()
+        });
+        v_flex()
+            .id("cluster-overview")
+            .size_full()
+            .overflow_y_scroll()
+            .p_4()
+            .gap_10()
+            .children(sections)
+            .into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{NodeLite, PodLite, Summary, add_nodes, add_pods};
+
+    #[test]
+    fn summarizes_lean_nodes_and_pods() {
+        let nodes: Vec<NodeLite> = serde_json::from_value(serde_json::json!([
+            {"metadata": {"name": "n1"}, "spec": {}, "status": {
+                "conditions": [{"type": "Ready", "status": "True"}, {"type": "DiskPressure", "status": "True"}],
+                "nodeInfo": {"kubeletVersion": "v1.33.1"},
+                "allocatable": {"cpu": "4", "memory": "8Gi", "nvidia.com/gpu": "2"}}},
+            {"metadata": {"name": "n2"}, "spec": {"unschedulable": true}, "status": {
+                "conditions": [{"type": "Ready", "status": "False"}],
+                "nodeInfo": {"kubeletVersion": "v1.33.1"},
+                "allocatable": {"cpu": "2", "memory": "4Gi"}}}
+        ]))
+        .unwrap();
+        let pods: Vec<PodLite> = serde_json::from_value(serde_json::json!([
+            {"spec": {"containers": [{"resources": {"requests": {"cpu": "500m", "memory": "1Gi"},
+                "limits": {"nvidia.com/gpu": "1"}}}]}, "status": {"phase": "Running"}},
+            {"spec": {"containers": [{"resources": {"requests": {"cpu": "1"}}}]}, "status": {"phase": "Succeeded"}},
+            {"spec": {"containers": [{}]}, "status": {"phase": "Pending"}}
+        ]))
+        .unwrap();
+        let mut s = Summary::default();
+        add_nodes(&mut s, &nodes);
+        add_pods(&mut s, &pods);
+        assert_eq!((s.nodes, s.nodes_ready), (2, 1));
+        assert_eq!(s.kubelet_versions, [("v1.33.1".to_string(), 2)]);
+        assert_eq!(s.node_issues[0], ("n1".to_string(), vec!["DiskPressure".to_string()]));
+        assert_eq!(s.node_issues[1], ("n2".to_string(), vec!["NotReady".to_string(), "Cordoned".to_string()]));
+        assert_eq!((s.cpu.0, s.cpu.1), (6000.0, 500.0));
+        assert_eq!(s.mem.1, 1024.0 * 1024.0 * 1024.0);
+        assert_eq!(s.gpus, (2.0, 1.0));
+        assert_eq!((s.pods_total, s.pods_running), (3, 1));
+    }
+}

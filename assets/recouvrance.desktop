@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Recouvrance
+Comment=Kubernetes desktop client with a local MCP server for agents
+Exec=recouvrance
+Icon=recouvrance
+Terminal=false
+Categories=Development;
+StartupWMClass=recouvrance
