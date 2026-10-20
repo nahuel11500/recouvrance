@@ -59,7 +59,8 @@ to any of these files are picked up within a few seconds. When two files define 
 | `open_browser_on_forward` | true | Open the browser after a one-click port-forward on a web port |
 | `assistant_backend` | `"auto"` | In-app assistant: `claude-code` (your Claude Code login), `api` (an Anthropic API key) or `auto` (Claude Code when installed, else the API key) |
 | `assistant_model` | `"claude-sonnet-5-5"` | Model the assistant uses |
-| `last_contexts`, `recent_contexts`, `recent_namespaces` | | Remembered by the app |
+| `namespace_visits` | | Remembered by the app: namespaces chosen per context, with a visit count and the last visit time. The namespace picker shows the five most frequent first (visits weigh half as much after a week without one); 30 kept per context. Older files' `recent_namespaces` are turned into visits once |
+| `last_contexts`, `recent_contexts` | | Remembered by the app |
 
 ### Metrics endpoint
 

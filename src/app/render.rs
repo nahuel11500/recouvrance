@@ -64,19 +64,22 @@ impl Render for AppView {
         };
         let ns_trigger = {
             let selected: Vec<String> = self.namespaces.clone();
+            // Names in full while they fit; the rest as a count.
             let label = match selected.len() {
                 0 => "All namespaces".to_string(),
-                1 => selected[0].clone(),
-                n => format!("{n} namespaces"),
+                1 | 2 => selected.join(", "),
+                n => format!("{}, {} +{}", selected[0], selected[1], n - 2),
             };
-            Button::new("ns-trigger").outline().child(
+            Button::new("ns-trigger").outline().tooltip(selected.join("\n")).child(
                 h_flex()
                     .gap_2()
+                    .min_w(px(180.))
                     .child(Icon::new(Lucide::Layers).size_4().text_color(theme.muted_foreground))
                     .child(
                         div()
+                            .flex_1()
                             .text_sm()
-                            .max_w(px(220.))
+                            .max_w(px(360.))
                             .overflow_hidden()
                             .text_ellipsis()
                             .whitespace_nowrap()
@@ -126,6 +129,7 @@ impl Render for AppView {
                             });
                         })
                         .trigger(ns_trigger)
+                        .track_focus(&self.ns_picker.read(cx).focus_handle(cx))
                         .child(self.ns_picker.clone()),
                 )
             })

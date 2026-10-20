@@ -163,6 +163,11 @@ impl AppView {
                 let ns = other[7..].to_string();
                 self.ns_picker.update(cx, |p, cx| p.add_namespace(ns, cx));
             }
+            "ns-open" => self.demo_popover("ns", cx),
+            other if other.starts_with("ns-search:") => {
+                let text = other["ns-search:".len()..].to_string();
+                self.ns_picker.update(cx, |p, cx| p.demo_search(&text, window, cx));
+            }
             "newtab" => self.new_tab(None, window, cx),
             other if other.starts_with("page:") => self.qa_page(&other[5..], window, cx),
             other if other.starts_with("kubeconfig-paste:") => {
