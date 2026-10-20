@@ -28,6 +28,7 @@ pub(crate) mod lists;
 mod metrics;
 pub(crate) mod names;
 mod pods;
+mod sources;
 mod table;
 mod writes;
 #[allow(unused_imports)]
@@ -44,6 +45,8 @@ pub(crate) use forward::*;
 pub(crate) use metrics::*;
 #[allow(unused_imports)]
 pub(crate) use pods::*;
+#[allow(unused_imports)]
+pub(crate) use sources::*;
 #[allow(unused_imports)]
 pub(crate) use table::*;
 #[allow(unused_imports)]

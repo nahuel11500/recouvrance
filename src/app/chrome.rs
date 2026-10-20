@@ -352,17 +352,31 @@ impl AppView {
                         )
                 })))
                 .child(
-                    h_flex().justify_center().pt_4().child(
-                        Button::new("connect")
-                            .primary()
-                            .label(match self.picked.len() {
-                                0 => "Connect".to_string(),
-                                1 => "Connect →".to_string(),
-                                n => format!("Connect to {n} contexts →"),
-                            })
-                            .disabled(self.picked.is_empty())
-                            .on_click(cx.listener(|this, _, window, cx| this.connect_picked(window, cx))),
-                    ),
+                    h_flex()
+                        .justify_center()
+                        .gap_2()
+                        .pt_4()
+                        .child(
+                            Button::new("add-kubeconfig")
+                                .ghost()
+                                .icon(Lucide::Plus)
+                                .label("Add a kubeconfig")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.settings_view.update(cx, |s, cx| s.show_kubeconfig(cx));
+                                    this.navigate(Route::Settings, cx);
+                                })),
+                        )
+                        .child(
+                            Button::new("connect")
+                                .primary()
+                                .label(match self.picked.len() {
+                                    0 => "Connect".to_string(),
+                                    1 => "Connect →".to_string(),
+                                    n => format!("Connect to {n} contexts →"),
+                                })
+                                .disabled(self.picked.is_empty())
+                                .on_click(cx.listener(|this, _, window, cx| this.connect_picked(window, cx))),
+                        ),
                 ),
         )
     }

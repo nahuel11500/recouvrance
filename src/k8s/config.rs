@@ -12,7 +12,8 @@ pub struct Contexts {
 }
 
 /// Every kubeconfig file in use: KUBECONFIG (or ~/.kube/config), the extra files
-/// from settings, and each file in the watched folders. Existing files only, no duplicates.
+/// from settings, each file in the watched folders and the kubeconfigs pasted in
+/// Settings. Existing files only, no duplicates.
 pub fn kubeconfig_files() -> Vec<std::path::PathBuf> {
     let mut files: Vec<std::path::PathBuf> = match std::env::var_os("KUBECONFIG").filter(|v| !v.is_empty()) {
         Some(v) => std::env::split_paths(&v).collect(),
@@ -23,20 +24,10 @@ pub fn kubeconfig_files() -> Vec<std::path::PathBuf> {
     let st = crate::settings::get();
     files.extend(st.kubeconfigs.iter().map(|p| crate::settings::expand(p)));
     for dir in &st.kubeconfig_folders {
-        let mut found: Vec<std::path::PathBuf> = std::fs::read_dir(crate::settings::expand(dir))
-            .into_iter()
-            .flatten()
-            .flatten()
-            .map(|e| e.path())
-            .filter(|p| p.is_file() && !p.file_name().is_some_and(|n| n.to_string_lossy().starts_with('.')))
-            .filter(|p| {
-                p.extension()
-                    .is_none_or(|x| matches!(x.to_str(), Some("yaml" | "yml" | "conf" | "config" | "kubeconfig")))
-            })
-            .collect();
-        found.sort();
-        files.extend(found);
+        files.extend(folder_files(&crate::settings::expand(dir)));
     }
+    // Kubeconfigs pasted in Settings.
+    files.extend(folder_files(&added_dir()));
     let mut seen = std::collections::HashSet::new();
     files.retain(|p| p.is_file() && seen.insert(p.canonicalize().unwrap_or_else(|_| p.clone())));
     files
@@ -116,7 +107,9 @@ pub fn kubeconfig() -> Result<Kubeconfig> {
     match (kc, last_err) {
         (Some(k), _) => Ok(k),
         (None, Some(e)) => Err(e).context("reading kubeconfig"),
-        (None, None) => anyhow::bail!("no kubeconfig found (KUBECONFIG or ~/.kube/config)"),
+        (None, None) => anyhow::bail!(
+            "no kubeconfig found (KUBECONFIG or ~/.kube/config): add or paste one in Settings → Kubeconfig"
+        ),
     }
 }
 
