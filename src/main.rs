@@ -28,6 +28,23 @@ mod ui;
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+const HELP: &str = concat!(
+    "Recouvrance ",
+    env!("CARGO_PKG_VERSION"),
+    ": a native Kubernetes desktop client with a local MCP server for agents.
+
+Usage:
+  recouvrance                              Open the app
+  recouvrance serve                        Run the MCP server without a window
+  recouvrance agent-create NAME [CONTEXT…] Create an agent and print its token once
+  recouvrance --version                    Print the version
+  recouvrance --help                       Print this help
+
+Settings live in ~/.config/recouvrance; see
+https://github.com/nahuel11500/recouvrance/blob/main/docs/configuration.md
+"
+);
+
 fn main() {
     #[cfg(feature = "dev")]
     if let Ok(ctx) = std::env::var("RECOUVRANCE_SMOKE") {
@@ -39,6 +56,8 @@ fn main() {
         Some("serve") => return serve(),
         // `Recouvrance agent-create <name> [context...]` prints the agent's token once.
         Some("agent-create") => return agent_create(&args[2..]),
+        Some("--version" | "-V") => return println!("recouvrance {}", env!("CARGO_PKG_VERSION")),
+        Some("--help" | "-h") => return print!("{HELP}"),
         _ => {}
     }
     #[cfg(feature = "dev")]

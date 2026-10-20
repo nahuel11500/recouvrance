@@ -215,6 +215,17 @@ impl Render for AppView {
                         let mode = if cx.theme().is_dark() { ThemeMode::Light } else { ThemeMode::Dark };
                         set_theme(mode, Some(window), cx);
                     }),
+            )
+            .child(
+                Button::new("version")
+                    .ghost()
+                    .xsmall()
+                    .label(concat!("v", env!("CARGO_PKG_VERSION")))
+                    .tooltip("About Recouvrance")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.settings_view.update(cx, |s, cx| s.show_about(cx));
+                        this.navigate(Route::Settings, cx);
+                    })),
             );
 
         let view_bar = h_flex()
