@@ -5,6 +5,13 @@ and versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.0](https://github.com/nahuel11500/recouvrance/compare/v0.0.1...v0.1.0) - 2026-10-20
+
+### Added
+
+- *(namespaces)* Larger picker and frequently visited namespaces ([#4](https://github.com/nahuel11500/recouvrance/pull/4))
+- Show the version, add --version and --help, cross-build Intel Macs ([#3](https://github.com/nahuel11500/recouvrance/pull/3))
+
 ## [0.0.1]
 
 ### Added
