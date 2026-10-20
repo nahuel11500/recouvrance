@@ -164,6 +164,11 @@ impl AppView {
                 self.ns_picker.update(cx, |p, cx| p.add_namespace(ns, cx));
             }
             "newtab" => self.new_tab(None, window, cx),
+            other if other.starts_with("page:") => self.qa_page(&other[5..], window, cx),
+            other if other.starts_with("kubeconfig-paste:") => {
+                let text = std::fs::read_to_string(&other["kubeconfig-paste:".len()..]).unwrap_or_default();
+                self.settings_view.update(cx, |s, cx| s.demo_paste_kubeconfig(&text, window, cx));
+            }
             other if other.starts_with("tab:") => self.switch_tab(other[4..].parse().unwrap_or(0), window, cx),
             other if other.starts_with("closetab:") => self.close_tab(other[9..].parse().unwrap_or(0), window, cx),
             other if other.starts_with("opentab:") => {

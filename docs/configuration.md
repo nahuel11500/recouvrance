@@ -12,6 +12,7 @@ Recouvrance reads your kubeconfig like `kubectl` does and keeps its own settings
 | `~/.config/recouvrance/agents.json` | Agents, token hashes, rules (mode 0600) |
 | `~/.config/recouvrance/rules.yaml` | Agent rules as code (optional; wins over `agents.json` when present) |
 | `~/.config/recouvrance/plugins.yaml` | Your commands on resources |
+| `~/.config/recouvrance/kubeconfigs/*.yaml` | Kubeconfigs pasted in Settings (mode 0600) |
 | `~/.config/recouvrance/templates/*.yaml` | Your templates for **Create / apply** |
 | `~/.config/recouvrance/favorites.json`, `columns.json`, `custom-columns.json`, `column-widths.json` | Favorites, saved views, column choices and widths |
 | `~/.config/recouvrance/theme`, `zoom` | Light or dark choice (absent: follow the desktop), UI zoom (0.7 to 2.0) |
@@ -24,10 +25,15 @@ Recouvrance reads your kubeconfig like `kubectl` does and keeps its own settings
 The contexts come from, merged in this order:
 
 1. `KUBECONFIG` (several paths separated by `:`), or `~/.kube/config`;
-2. **Settings → Kubeconfig → Extra kubeconfig files** (`kubeconfigs`);
-3. every file in **Watched folders** (`kubeconfig_folders`).
+2. files added in **Settings → Kubeconfig** (**Add files** or **Enter path**; `kubeconfigs`);
+3. every file in a watched folder (**Watch folder**; `kubeconfig_folders`);
+4. kubeconfigs pasted in **Settings → Kubeconfig → Paste kubeconfig**, saved as they are in
+   `~/.config/recouvrance/kubeconfigs/` (mode 0600). Before saving, Recouvrance lists the
+   contexts and warns about commands run to log in (`exec`), files the kubeconfig reads and
+   clusters that skip TLS verification. Removing one there deletes its file.
 
-Changes to any of these files are picked up within a few seconds. When two files define a context
+The page shows each source with its file and context counts, or why it can't be read. Changes
+to any of these files are picked up within a few seconds. When two files define a context
 (or cluster, or user) with the same name, the later one is renamed `name@file` so both stay usable.
 
 ## settings.json
