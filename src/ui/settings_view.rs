@@ -183,6 +183,12 @@ impl SettingsView {
         }
     }
 
+    /// Open on the About section.
+    pub fn show_about(&mut self, cx: &mut Context<Self>) {
+        self.section = Section::About;
+        cx.notify();
+    }
+
     /// Open on the Kubeconfig section.
     pub fn show_kubeconfig(&mut self, cx: &mut Context<Self>) {
         self.section = Section::Kubeconfig;
@@ -574,6 +580,9 @@ impl SettingsView {
                     .child(h_flex().gap_2().child(Icon::new(Lucide::Ship).size_8().text_color(theme.blue)).child(div().text_2xl().font_weight(FontWeight::BOLD).child("Recouvrance")))
                     .child(div().text_sm().text_color(muted).child(format!("Version {}", env!("CARGO_PKG_VERSION"))))
                     .child(div().text_sm().child("A native Kubernetes client in Rust (gpui), with a local MCP server for AI agents."))
+                    .child(div().text_sm().text_color(muted).child(
+                        "Installed with the install script: update with recouvrance-update. Releases: github.com/nahuel11500/recouvrance/releases",
+                    ))
                     .child(div().pt_3().text_xs().text_color(muted).child("Settings: ~/.config/recouvrance/ · Agent activity: ~/.local/share/recouvrance/audit.jsonl"))
                     .into_any_element()
             }

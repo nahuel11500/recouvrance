@@ -41,4 +41,5 @@ libxcb1-dev = "*"
 
 [dist.github-custom-runners]
 aarch64-unknown-linux-gnu = "ubuntu-24.04-arm"
-x86_64-apple-darwin = "macos-15-intel"
+# Intel Macs are cross-built on Apple Silicon: the Intel runners take three times as long.
+x86_64-apple-darwin = { runner = "macos-15", host = "aarch64-apple-darwin" }
