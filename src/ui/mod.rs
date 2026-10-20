@@ -11,6 +11,7 @@ pub mod data_edit;
 pub mod field_docs;
 pub mod helm;
 pub mod helm_install;
+pub mod kubeconfig_sources;
 pub mod ns_picker;
 pub mod palette;
 pub mod problems_view;

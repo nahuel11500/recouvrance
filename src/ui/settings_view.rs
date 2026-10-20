@@ -47,8 +47,7 @@ pub struct SettingsView {
     detail: Entity<InputState>,
     overview: Entity<InputState>,
     tail: Entity<InputState>,
-    kubeconfigs: Entity<InputState>,
-    kubeconfig_folders: Entity<InputState>,
+    kubeconfig: Entity<crate::ui::kubeconfig_sources::KubeconfigSources>,
     mcp_port: Entity<InputState>,
     /// Prometheus override per context (`namespace/service:port`).
     prometheus: Vec<(String, Entity<InputState>)>,
@@ -72,9 +71,8 @@ impl SettingsView {
         let detail = field(s.detail_refresh.to_string(), "5", window, cx);
         let overview = field(s.overview_refresh.to_string(), "30", window, cx);
         let tail = field(s.log_tail_lines.to_string(), "1000", window, cx);
-        let kubeconfigs = field(s.kubeconfigs.join(", "), "~/.kube/other-config, ~/clusters/team.yaml", window, cx);
         let mcp_port = field(hub.port().to_string(), "47070", window, cx);
-        let kubeconfig_folders = field(s.kubeconfig_folders.join(", "), "~/.kube/configs, ~/clusters", window, cx);
+        let kubeconfig = cx.new(|cx| crate::ui::kubeconfig_sources::KubeconfigSources::new(window, cx));
 
         let mut subs = Vec::new();
         let number = |input: &Entity<InputState>,
@@ -94,34 +92,6 @@ impl SettingsView {
         number(&detail, |s, n| s.detail_refresh = n, &mut subs, cx);
         number(&overview, |s, n| s.overview_refresh = n, &mut subs, cx);
         number(&tail, |s, n| s.log_tail_lines = n as i64, &mut subs, cx);
-        subs.push(cx.subscribe(&kubeconfigs, |_, state, ev: &InputEvent, cx| {
-            if let InputEvent::Change = ev {
-                let list: Vec<String> = state
-                    .read(cx)
-                    .value()
-                    .split(',')
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(String::from)
-                    .collect();
-                settings::update(|s| s.kubeconfigs = list);
-                cx.notify();
-            }
-        }));
-        subs.push(cx.subscribe(&kubeconfig_folders, |_, state, ev: &InputEvent, cx| {
-            if let InputEvent::Change = ev {
-                let list: Vec<String> = state
-                    .read(cx)
-                    .value()
-                    .split(',')
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(String::from)
-                    .collect();
-                settings::update(|s| s.kubeconfig_folders = list);
-                cx.notify();
-            }
-        }));
         let hub2 = hub.clone();
         subs.push(cx.subscribe(&mcp_port, move |_, state, ev: &InputEvent, cx| {
             if let InputEvent::Change = ev
@@ -204,14 +174,25 @@ impl SettingsView {
             detail,
             overview,
             tail,
-            kubeconfigs,
-            kubeconfig_folders,
+            kubeconfig,
             mcp_port,
             prometheus,
             cluster_inputs,
             hub,
             _subs: subs,
         }
+    }
+
+    /// Open on the Kubeconfig section.
+    pub fn show_kubeconfig(&mut self, cx: &mut Context<Self>) {
+        self.section = Section::Kubeconfig;
+        cx.notify();
+    }
+
+    #[cfg(feature = "dev")]
+    pub fn demo_paste_kubeconfig(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.section = Section::Kubeconfig;
+        self.kubeconfig.update(cx, |k, cx| k.demo_paste(text, window, cx));
     }
 
     fn row(label: &str, hint: &str, control: impl IntoElement, cx: &App) -> Div {
@@ -489,40 +470,7 @@ impl SettingsView {
                     cx,
                 ))
                 .into_any_element(),
-            Section::Kubeconfig => {
-                let default = std::env::var("KUBECONFIG").unwrap_or_else(|_| "~/.kube/config".into());
-                let found: Vec<(String, bool)> = s.kubeconfigs.iter().map(|p| (p.clone(), settings::expand(p).is_file())).collect();
-                v_flex()
-                    .child(Self::row("Default", "From KUBECONFIG, or ~/.kube/config.", div().text_sm().font_family(theme.mono_font_family.clone()).child(default), cx))
-                    .child(
-                        v_flex()
-                            .gap_1()
-                            .py_3()
-                            .child(div().text_sm().font_weight(FontWeight::MEDIUM).child("Extra kubeconfig files"))
-                            .child(div().text_xs().text_color(muted).child("Comma-separated; merged with the default. Changes to any kubeconfig file are picked up within seconds."))
-                            .child(Input::new(&self.kubeconfigs).small())
-                            .children(found.into_iter().map(|(p, ok)| {
-                                h_flex()
-                                    .gap_1()
-                                    .text_xs()
-                                    .child(Icon::new(if ok { Lucide::Check } else { Lucide::X }).size_3().text_color(if ok { theme.success } else { theme.danger }))
-                                    .child(div().text_color(if ok { muted } else { theme.danger }).child(if ok { p } else { format!("{p} (not found)") }))
-                            })),
-                    )
-                    .child(
-                        v_flex()
-                            .gap_1()
-                            .py_3()
-                            .child(div().text_sm().font_weight(FontWeight::MEDIUM).child("Watched folders"))
-                            .child(div().text_xs().text_color(muted).child(
-                                "Every file in these folders is merged (one kubeconfig per cluster works well). Contexts with the same name in two files \
-                                 are kept apart as name@file.",
-                            ))
-                            .child(Input::new(&self.kubeconfig_folders).small())
-                            .child(div().text_xs().text_color(muted).child(format!("{} kubeconfig files in use", crate::k8s::kubeconfig_files().len()))),
-                    )
-                    .into_any_element()
-            }
+            Section::Kubeconfig => self.kubeconfig.clone().into_any_element(),
             Section::Agents => v_flex()
                 .child(Self::row(
                     "MCP server",
