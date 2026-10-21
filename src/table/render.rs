@@ -7,7 +7,7 @@ use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::menu::PopupMenu;
 use gpui_kit::component::table::{Column, TableDelegate, TableState};
-use gpui_kit::component::{ActiveTheme as _, h_flex};
+use gpui_kit::component::{ActiveTheme as _, Icon, h_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 
 use crate::status::{Tone, tone};
@@ -39,14 +39,39 @@ impl TableDelegate for ResourceTable {
             (_, "Age" | "Ready" | "Restarts" | "Status" | "CPU" | "Memory") => 90.,
             _ => 150.,
         };
-        let sort = match self.sort {
-            Some((c, s)) if c == col => s,
-            _ => ColumnSort::Default,
-        };
-        Column::new(format!("c{col_ix}"), name)
-            .width(px(width * crate::app::zoom(cx)))
-            .sort(sort)
-            .movable(!self.is_fixed(col))
+        // Not `.sort()`: the table's own control shows a two-way arrow on every column.
+        // `render_th` sorts on a click and shows one arrow, on the sorted column only.
+        Column::new(format!("c{col_ix}"), name).width(px(width * crate::app::zoom(cx))).movable(!self.is_fixed(col))
+    }
+
+    /// The header: a click sorts ascending, then descending, then back to the list order.
+    fn render_th(&mut self, col_ix: usize, _: &mut Window, cx: &mut Context<TableState<Self>>) -> impl IntoElement {
+        let col = self.cols[col_ix];
+        if col == Col::Check {
+            return div().into_any_element();
+        }
+        let sort = self.sort.filter(|(c, _)| *c == col).map(|(_, s)| s);
+        h_flex()
+            .id(("th", col_ix))
+            .size_full()
+            .gap_1()
+            .justify_between()
+            .child(div().overflow_hidden().text_ellipsis().child(self.header(col).to_string()))
+            .when_some(sort, |this, s| {
+                let icon = if s == ColumnSort::Ascending { Lucide::SortAscending } else { Lucide::SortDescending };
+                this.child(Icon::new(icon).size_3().flex_none().text_color(cx.theme().secondary_foreground))
+            })
+            .on_click(cx.listener(move |t, _, _, cx| {
+                let d = t.delegate_mut();
+                d.sort = match sort {
+                    None => Some((col, ColumnSort::Ascending)),
+                    Some(ColumnSort::Ascending) => Some((col, ColumnSort::Descending)),
+                    _ => None,
+                };
+                d.recompute();
+                cx.notify();
+            }))
+            .into_any_element()
     }
 
     /// A press on the row itself (checkboxes, links and namespaces stop it first).
@@ -62,14 +87,6 @@ impl TableDelegate for ResourceTable {
             let c = self.cols.remove(col_ix);
             self.cols.insert(to_ix, c);
         }
-    }
-
-    fn perform_sort(&mut self, col_ix: usize, sort: ColumnSort, _: &mut Window, _: &mut Context<TableState<Self>>) {
-        self.sort = match sort {
-            ColumnSort::Default => None,
-            s => Some((self.cols[col_ix], s)),
-        };
-        self.recompute();
     }
 
     fn render_td(
