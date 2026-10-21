@@ -1,4 +1,7 @@
-# Recouvrance
+<h1 align="center">
+  <img src="assets/recouvrance.svg" width="112" alt=""><br>
+  Recouvrance
+</h1>
 
 [![CI](https://github.com/nahuel11500/recouvrance/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/nahuel11500/recouvrance/actions/workflows/ci.yml)
 [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/nahuel11500/recouvrance/badge)](https://scorecard.dev/viewer/?uri=github.com/nahuel11500/recouvrance)
