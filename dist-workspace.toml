@@ -15,9 +15,13 @@ create-release = false
 local-artifacts-jobs = ["./linux-packages"]
 include = ["assets/recouvrance.svg", "assets/recouvrance-small.svg", "assets/recouvrance.desktop"]
 pr-run-mode = "skip"
+# release.yml is edited by hand (see its header): dist must not insist it matches its template.
+allow-dirty = ["ci"]
 # Build provenance attestations for the archives (linux-packages.yml attests the .deb and the
 # AppImage); verify with `gh attestation verify <file> --repo nahuel11500/recouvrance`.
 github-attestations = true
+# A CycloneDX SBOM of the dependencies with each release.
+cargo-cyclonedx = true
 # release.yml calls linux-packages.yml with `secrets: inherit` (hard-coded by dist). That passes
 # repository secrets only: the release secrets live in the `release` environment, which no job of
 # the release workflow enters, so the packages job cannot read them. Keep it that way.

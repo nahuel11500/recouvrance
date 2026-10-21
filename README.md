@@ -115,14 +115,18 @@ what you can check for yourself:
   `~/.local/share/recouvrance/audit.jsonl`, and a kill switch cuts them all off.
 - **Verifiable releases.** Every release archive, `.deb` and AppImage has a build provenance
   attestation: `gh attestation verify <file> --repo nahuel11500/recouvrance` proves it was built
-  by this repository's release workflow from the tagged commit.
+  by this repository's release workflow from the tagged commit. The attestations are also attached
+  to each release (`*.sigstore.json`), with a CycloneDX SBOM of the dependencies
+  (`recouvrance.cdx.xml`).
+- **No unsafe code.** The crate forbids `unsafe` (`unsafe_code = "forbid"` in `Cargo.toml`).
 - **Checked dependencies.** [cargo-deny](https://github.com/EmbarkStudios/cargo-deny) checks every
   change, and again every week, against the RustSec advisory database and the allowed licenses. Dependabot
   proposes updates only after a three-day cooldown, so a compromised release is usually caught first
   (security updates come right away).
-- **Hardened CI.** Every GitHub Action is pinned to a commit. Workflow tokens are read-only or
-  empty, except the release workflow's, which uploads the binaries, and the release secrets live in
-  a protected environment. The
+- **Hardened CI.** Every GitHub Action is pinned to a commit, and tools the release downloads are
+  checked against their published hashes. Workflow tokens are read-only, with write access only for
+  the jobs that publish, and the release secrets live in a protected environment. CodeQL scans the
+  code and the workflows on every change. The
   [OpenSSF Scorecard](https://scorecard.dev/viewer/?uri=github.com/nahuel11500/recouvrance) above
   scores these practices weekly.
 - **Tested changes.** `main` only changes through pull requests that pass CI: format, clippy,
