@@ -296,7 +296,7 @@ impl AppView {
                 .child(
                     h_flex()
                         .gap_2()
-                        .child(Icon::new(Lucide::Ship).size_8().text_color(theme.blue))
+                        .child(crate::ui::logo(px(40.)))
                         .child(div().text_2xl().font_weight(FontWeight::BOLD).child("Recouvrance")),
                 )
                 .child(

@@ -1,22 +1,41 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128">
-  <defs>
-    <linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0" stop-color="#3b82f6"/>
-      <stop offset="1" stop-color="#1d4ed8"/>
-    </linearGradient>
-  </defs>
-  <rect x="8" y="8" width="112" height="112" rx="26" fill="url(#g)"/>
-  <!-- helm wheel -->
-  <g fill="none" stroke="#fff" stroke-width="7" stroke-linecap="round">
-    <circle cx="64" cy="64" r="22"/>
-    <line x1="64" y1="26" x2="64" y2="42"/>
-    <line x1="64" y1="86" x2="64" y2="102"/>
-    <line x1="26" y1="64" x2="42" y2="64"/>
-    <line x1="86" y1="64" x2="102" y2="64"/>
-    <line x1="37" y1="37" x2="48.5" y2="48.5"/>
-    <line x1="79.5" y1="79.5" x2="91" y2="91"/>
-    <line x1="91" y1="37" x2="79.5" y2="48.5"/>
-    <line x1="48.5" y1="79.5" x2="37" y2="91"/>
+  <rect x="4" y="4" width="120" height="120" rx="28" fill="#14213d"/>
+  <!-- sea -->
+  <path d="M10 104 Q64 112 118 104" fill="none" stroke="#2c4a7c" stroke-width="4" stroke-linecap="round"/>
+  <!-- spars -->
+  <g stroke="#c8913e" stroke-linecap="round">
+    <path d="M47 89 L40 18" stroke-width="2.6"/>
+    <path d="M77 88 L71 13" stroke-width="2.6"/>
+    <path d="M98 86 L121 77" stroke-width="2.2"/>
+    <path d="M12 85 L47 87" stroke-width="2"/>
   </g>
-  <circle cx="64" cy="64" r="7" fill="#fff"/>
+  <!-- sails -->
+  <g fill="#f1e6cf">
+    <path d="M43 44 L19 34 L13 84 L46 86 Z"/>
+    <path d="M41 21 L44 42 L59 40 Z" fill="#e3d6bb"/>
+    <path d="M74 50 L52 41 L50 85 L76 86 Z" fill="#e3d6bb"/>
+    <path d="M59 31 L86 28 L89 48 L57 51 Z"/>
+    <path d="M62 20 L82 18 L85 27 L60 30 Z"/>
+    <path d="M78 31 L119 77 L95 80 Z"/>
+    <path d="M77 48 L100 85 L83 85 Z" fill="#e3d6bb"/>
+  </g>
+  <!-- flag at the main gaff peak -->
+  <path d="M19 34 L17 30" stroke="#c8913e" stroke-width="1.5"/>
+  <g transform="rotate(-8 17 33)">
+    <rect x="5" y="29" width="4" height="8" fill="#e0453a"/>
+    <rect x="9" y="29" width="4" height="8" fill="#ffffff"/>
+    <rect x="13" y="29" width="4" height="8" fill="#2f5bd3"/>
+  </g>
+  <!-- hull: black with the white band and its black ports -->
+  <path d="M22 87 L106 85 L99 97 Q62 101 29 98 Z" fill="#05070b" stroke="#05070b" stroke-width="1"/>
+  <path d="M23.5 89 L104.5 87 L102.6 92.2 L25.5 94 Z" fill="#f1e6cf"/>
+  <g fill="#05070b">
+    <rect x="31" y="88.8" width="3.4" height="5.4"/>
+    <rect x="41" y="88.6" width="3.4" height="5.4"/>
+    <rect x="51" y="88.4" width="3.4" height="5.4"/>
+    <rect x="61" y="88.2" width="3.4" height="5.4"/>
+    <rect x="71" y="87.9" width="3.4" height="5.4"/>
+    <rect x="81" y="87.7" width="3.4" height="5.4"/>
+    <rect x="91" y="87.5" width="3.4" height="5.4"/>
+  </g>
 </svg>
