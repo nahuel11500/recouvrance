@@ -374,7 +374,8 @@ impl AppView {
                 .placeholder("Filter: text · !text · app=web · ns:team-* · status:Running · restarts>3 · /regex/")
         });
         let kind_filter = cx.new(|cx| InputState::new(window, cx).placeholder("Filter resources…"));
-        let table = cx.new(|cx| TableState::new(ResourceTable::new(), window, cx));
+        // A header click sorts (see `render_th`); it no longer highlights the column too.
+        let table = cx.new(|cx| TableState::new(ResourceTable::new(), window, cx).col_selectable(false));
 
         let subs = vec![
             cx.subscribe(&ns_picker, |this, _, ev: &NamespacesChanged, cx| {
