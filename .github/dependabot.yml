@@ -6,9 +6,10 @@ updates:
     directory: /
     schedule:
       interval: weekly
-    # New versions wait two weeks, so a compromised release is usually caught before it lands here.
+    # New versions wait three days, so a compromised release is usually caught before it lands here
+    # (security updates do not wait).
     cooldown:
-      default-days: 14
+      default-days: 3
     commit-message:
       prefix: build
       include: scope
@@ -20,9 +21,10 @@ updates:
     directory: /
     schedule:
       interval: weekly
-    # New versions wait two weeks, so a compromised release is usually caught before it lands here.
+    # New versions wait three days, so a compromised release is usually caught before it lands here
+    # (security updates do not wait).
     cooldown:
-      default-days: 14
+      default-days: 3
     commit-message:
       prefix: build
       include: scope

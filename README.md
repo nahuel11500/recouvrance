@@ -118,7 +118,8 @@ what you can check for yourself:
   by this repository's release workflow from the tagged commit.
 - **Checked dependencies.** [cargo-deny](https://github.com/EmbarkStudios/cargo-deny) checks every
   change, and again every week, against the RustSec advisory database and the allowed licenses. Dependabot
-  proposes updates only after a two-week cooldown, so a compromised release is usually caught first.
+  proposes updates only after a three-day cooldown, so a compromised release is usually caught first
+  (security updates come right away).
 - **Hardened CI.** Every GitHub Action is pinned to a commit. Workflow tokens are read-only or
   empty, except the release workflow's, which uploads the binaries, and the release secrets live in
   a protected environment. The
