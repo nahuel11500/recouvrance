@@ -214,7 +214,7 @@ pub(super) fn comparable_yaml(v: &serde_json::Value, mask: bool) -> String {
         }
     }
     drop_nulls(&mut v);
-    serde_yaml_ng::to_string(&v).unwrap_or_default()
+    crate::yaml::to_string(&v).unwrap_or_default()
 }
 
 #[cfg(test)]

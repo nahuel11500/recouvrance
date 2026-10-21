@@ -125,11 +125,11 @@ pub async fn get_object_opts(client: Client, obj: ObjectRef, keep_managed: bool)
 /// YAML for display, with Secret values masked unless revealed.
 pub fn to_yaml(value: &serde_json::Value, is_secret: bool, reveal_secrets: bool) -> Result<String> {
     if !is_secret || reveal_secrets {
-        return Ok(serde_yaml_ng::to_string(value)?);
+        return Ok(crate::yaml::to_string(value)?);
     }
     let mut value = value.clone();
     mask_secret_values(&mut value);
-    Ok(serde_yaml_ng::to_string(&value)?)
+    Ok(crate::yaml::to_string(&value)?)
 }
 
 const MASK: &str = "••••••";
