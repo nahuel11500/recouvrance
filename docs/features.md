@@ -20,11 +20,16 @@
 - **Problems**: one list of what is broken across clusters (crash loops, pending pods, unavailable workloads, NotReady nodes, failed jobs, pending volumes).
 - **Overviews**: cluster capacity and health, workloads status, Helm releases (values masked; install from your repos, roll back and uninstall through your `helm` CLI).
 - **Favorites** and **saved views** (type + namespaces + filter, bookmark button), back/forward history, light and dark themes.
-- **Bulk actions**: check rows, then restart, scale, delete or copy names. Scaling or deleting
-  needs the number of objects typed (the replica count is never suggested), and each protected
-  context among them its name typed; rows from several contexts show which one they are on.
+- **Bulk actions**: check rows, then restart, scale, delete or copy names. Scaling needs the number
+  of objects typed (the replica count is never suggested), deleting asks as set for the kind (see
+  below), and each protected context among them needs its name typed; rows from several contexts
+  show which one they are on.
+- **Delete confirmation per kind** (Settings → General → Deleting): delete right away, ask, or
+  type the name (the count, for several). By default pods and most kinds are deleted right away,
+  while Nodes and StatefulSets need the name typed. A protected context always asks for its name,
+  and an object stuck terminating always shows the dialog, to remove its finalizers.
 - **Write mode** (off by default): click the `read-only` badge to enable scale, restart, delete
-  (typed confirmation), YAML edits (validated by a server dry run first), cordon/uncordon nodes,
+  (confirmed as set per kind), YAML edits (validated by a server dry run first), cordon/uncordon nodes,
   debug pods with an ephemeral container (falls back to a Pod Security "restricted" profile), run a CronJob now, suspend/resume (CronJobs, Flux, Argo CronWorkflows), drain nodes, force delete
   or remove finalizers (only once the delete leaves it stuck terminating), Flux *Reconcile*, Argo CD
   *Refresh*/*Sync*, create/apply YAML (a server dry run first, then a confirmation listing each

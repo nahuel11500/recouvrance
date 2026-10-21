@@ -26,8 +26,9 @@ A fast Kubernetes desktop client (Rust + [gpui](https://github.com/zed-industrie
   Helm, Flux and Argo CD actions, several clusters at once, tabs and windows.
 - **Tells you what is wrong**: a Problems page across clusters, a diagnosis on every broken pod or
   workload, usage history from Prometheus or VictoriaMetrics, certificate expiry.
-- **Safe by default**: read-only until you enable writes; every write is confirmed with its
-  `kubectl` equivalent and checked with a server dry run; protected contexts; actions follow your
+- **Safe by default**: read-only until you enable writes; writes are confirmed with their
+  `kubectl` equivalent (deletes ask as you set per kind), and YAML edits and applies are checked
+  with a server dry run first; protected contexts; actions follow your
   RBAC; roll back any Deployment, StatefulSet or DaemonSet.
 - **Access made clear**: Role, binding and ServiceAccount pages, a *who can* inspector, and
   short-lived kubeconfigs for ServiceAccounts.
@@ -107,9 +108,10 @@ what you can check for yourself:
 
 - **No telemetry.** The app talks to your clusters, to the Prometheus or VictoriaMetrics you point
   it at, and to the Anthropic API only if you use the assistant. Nothing else, and no analytics.
-- **Safe by default.** Read-only until you turn writes on; every write shows its `kubectl`
-  equivalent, runs as a server dry run first, and asks for confirmation (and for the context's name
-  on protected contexts). Agents get only what their rules allow, every call is logged to
+- **Safe by default.** Read-only until you turn writes on. Writes show their `kubectl`
+  equivalent and ask for confirmation, YAML edits and applies run as a server dry run first, and
+  deletes ask as you set per kind (by default, Nodes and StatefulSets need their name typed). A
+  protected context always asks for its name. Agents get only what their rules allow, every call is logged to
   `~/.local/share/recouvrance/audit.jsonl`, and a kill switch cuts them all off.
 - **Verifiable releases.** Every release archive, `.deb` and AppImage has a build provenance
   attestation: `gh attestation verify <file> --repo nahuel11500/recouvrance` proves it was built

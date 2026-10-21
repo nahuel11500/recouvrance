@@ -10,7 +10,7 @@ use gpui_kit::component::{ActiveTheme as _, Icon, Selectable as _, Sizable as _,
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use crate::settings::{self, InitialView, Startup};
+use crate::settings::{self, DeleteConfirm, InitialView, Startup};
 
 #[derive(Clone, Copy, PartialEq)]
 enum Section {
@@ -53,6 +53,8 @@ pub struct SettingsView {
     prometheus: Vec<(String, Entity<InputState>)>,
     /// Per context: node shell image and accessible namespaces.
     cluster_inputs: Vec<(String, Entity<InputState>, Entity<InputState>)>,
+    /// A kind to give its own delete confirmation (Enter adds it).
+    delete_kind: Entity<InputState>,
     hub: std::sync::Arc<crate::mcp::Hub>,
     _subs: Vec<Subscription>,
 }
@@ -124,6 +126,19 @@ impl SettingsView {
             }));
             prometheus.push((ctx, input));
         }
+        let delete_kind = cx.new(|cx| InputState::new(window, cx).placeholder("Add a kind, e.g. Namespace"));
+        subs.push(cx.subscribe_in(&delete_kind, window, |_, state, ev: &InputEvent, window, cx| {
+            if let InputEvent::PressEnter { .. } = ev {
+                let kind = state.read(cx).value().trim().to_string();
+                if !kind.is_empty() {
+                    settings::update(|s| {
+                        s.delete_confirm_kinds.entry(kind).or_insert(DeleteConfirm::Type);
+                    });
+                    state.update(cx, |s, cx| s.set_value("", window, cx));
+                    cx.notify();
+                }
+            }
+        }));
         let mut cluster_inputs = Vec::new();
         for ctx in crate::k8s::load_contexts().map(|c| c.names).unwrap_or_default() {
             let cs = settings::cluster(&ctx);
@@ -178,6 +193,7 @@ impl SettingsView {
             mcp_port,
             prometheus,
             cluster_inputs,
+            delete_kind,
             hub,
             _subs: subs,
         }
@@ -215,6 +231,63 @@ impl SettingsView {
                     .child(div().text_xs().text_color(cx.theme().muted_foreground).child(hint.to_string())),
             )
             .child(div().flex_shrink_0().child(control))
+    }
+
+    /// Kinds with their own delete confirmation, and a field to add one.
+    fn render_delete_kinds(&self, s: &settings::Settings, cx: &mut Context<Self>) -> Div {
+        let levels = [
+            (DeleteConfirm::Off, "Delete right away"),
+            (DeleteConfirm::Ask, "Ask"),
+            (DeleteConfirm::Type, "Type the name"),
+        ];
+        v_flex()
+            .gap_1()
+            .py_2()
+            .pl_4()
+            .border_b_1()
+            .border_color(cx.theme().border)
+            .children(s.delete_confirm_kinds.iter().enumerate().map(|(i, (kind, level))| {
+                let level = *level;
+                h_flex()
+                    .gap_3()
+                    .child(div().w(px(180.)).text_sm().child(kind.clone()))
+                    .child(h_flex().gap_1().children(levels.iter().enumerate().map(|(j, (v, label))| {
+                        let (v, kind) = (*v, kind.clone());
+                        Button::new(SharedString::from(format!("del-{i}-{j}")))
+                            .small()
+                            .label(*label)
+                            .when(v == level, |b| b.primary())
+                            .when(v != level, |b| b.outline())
+                            .on_click(move |_, _, cx| {
+                                settings::update(|s| {
+                                    s.delete_confirm_kinds.insert(kind.clone(), v);
+                                });
+                                cx.refresh_windows();
+                            })
+                    })))
+                    .child({
+                        let kind = kind.clone();
+                        Button::new(SharedString::from(format!("del-rm-{i}")))
+                            .small()
+                            .ghost()
+                            .icon(Lucide::X)
+                            .tooltip("Use the default for this kind")
+                            .on_click(move |_, _, cx| {
+                                settings::update(|s| {
+                                    s.delete_confirm_kinds.remove(&kind);
+                                });
+                                cx.refresh_windows();
+                            })
+                    })
+            }))
+            .child(
+                h_flex().gap_3().child(div().w(px(180.)).child(Input::new(&self.delete_kind).small())).child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child("The kind as Kubernetes names it: Pod, Deployment, PersistentVolumeClaim…"),
+                ),
+            )
     }
 
     fn choice<T: Copy + PartialEq + 'static>(
@@ -290,7 +363,7 @@ impl SettingsView {
                 ))
                 .child(Self::row(
                     "Write actions",
-                    "Off by default. When on, detail pages can scale, restart, run, drain, delete and edit (each asks for confirmation).",
+                    "Off by default. When on, detail pages can scale, restart, run, drain, delete and edit. Each asks first, except deletes set to Delete right away below.",
                     {
                         let on = crate::details::writes_enabled(cx);
                         Checkbox::new("writes").label(if on { "Enabled" } else { "Disabled" }).checked(on).on_click(|v: &bool, _, cx| {
@@ -300,6 +373,21 @@ impl SettingsView {
                     },
                     cx,
                 ))
+                .child(Self::row(
+                    "Deleting",
+                    "What a delete asks first, for kinds not listed below. A protected context always asks for its name.",
+                    Self::choice(
+                        "del-default",
+                        s.delete_confirm,
+                        &[(DeleteConfirm::Off, "Delete right away"), (DeleteConfirm::Ask, "Ask"), (DeleteConfirm::Type, "Type the name")],
+                        |v, _, cx| {
+                            settings::update(|s| s.delete_confirm = v);
+                            cx.refresh_windows();
+                        },
+                    ),
+                    cx,
+                ))
+                .child(self.render_delete_kinds(&s, cx))
                 .into_any_element(),
             Section::Contexts => {
                 let names = crate::k8s::load_contexts().map(|c| c.names).unwrap_or_default();

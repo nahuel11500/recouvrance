@@ -6,6 +6,18 @@ use std::sync::{LazyLock, RwLock};
 
 use serde::{Deserialize, Serialize};
 
+/// What deleting asks before it runs (per kind, see `delete_confirm`).
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+#[serde(rename_all = "kebab-case")]
+pub enum DeleteConfirm {
+    /// Delete right away (a protected context still asks for its name).
+    Off,
+    /// A dialog with the `kubectl` equivalent and a Delete button.
+    Ask,
+    /// The same dialog, where the name (or the count, for several) must be typed.
+    Type,
+}
+
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Debug)]
 #[serde(rename_all = "kebab-case")]
 pub enum Startup {
@@ -110,6 +122,15 @@ pub struct Settings {
     pub open_browser_on_forward: bool,
     /// Port-forwards started recently, newest first (offered again in the sidebar).
     pub recent_forwards: Vec<SavedForward>,
+    /// What deleting asks for kinds not in `delete_confirm_kinds`.
+    pub delete_confirm: DeleteConfirm,
+    /// What deleting asks, by kind (`Node`, `StatefulSet`…).
+    pub delete_confirm_kinds: std::collections::BTreeMap<String, DeleteConfirm>,
+}
+
+/// What deleting an object of this kind (`Pod`, `Node`…) asks first.
+pub fn delete_confirm(kind: &str) -> DeleteConfirm {
+    with(|s| s.delete_confirm_kinds.get(kind).copied().unwrap_or(s.delete_confirm))
 }
 
 /// A namespace chosen on a context: how often, and when last (unix seconds).
@@ -199,6 +220,12 @@ impl Default for Settings {
             kubeconfig_folders: Vec::new(),
             open_browser_on_forward: true,
             recent_forwards: Vec::new(),
+            // A node or a StatefulSet (and its pods' identity) is hard to get back: type to delete.
+            delete_confirm: DeleteConfirm::Off,
+            delete_confirm_kinds: [("Node", DeleteConfirm::Type), ("StatefulSet", DeleteConfirm::Type)]
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v))
+                .collect(),
         }
     }
 }
@@ -437,7 +464,8 @@ fn unix_now() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        NamespaceVisit, Settings, load_json, migrate_list, recent_as_visits, record_visits, visit_score, write_atomic,
+        DeleteConfirm, NamespaceVisit, Settings, load_json, migrate_list, recent_as_visits, record_visits, visit_score,
+        write_atomic,
     };
 
     const DAY: i64 = 24 * 3600;
@@ -507,6 +535,21 @@ mod tests {
         assert!(!json.contains("protected_contexts"));
         let s: Settings = serde_json::from_str(r#"{"protection": {"kind-dev": false}}"#).unwrap();
         assert_eq!(s.protection.get("kind-dev"), Some(&false));
+    }
+
+    #[test]
+    fn deletes_ask_only_for_nodes_and_statefulsets_by_default() {
+        // Older settings files have neither key and get the defaults.
+        let s: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(s.delete_confirm, DeleteConfirm::Off);
+        assert_eq!(s.delete_confirm_kinds.get("Node"), Some(&DeleteConfirm::Type));
+        assert_eq!(s.delete_confirm_kinds.get("StatefulSet"), Some(&DeleteConfirm::Type));
+        assert_eq!(s.delete_confirm_kinds.get("Pod"), None);
+        let s: Settings =
+            serde_json::from_str(r#"{"delete_confirm": "ask", "delete_confirm_kinds": {"Namespace": "type"}}"#)
+                .unwrap();
+        assert_eq!(s.delete_confirm, DeleteConfirm::Ask);
+        assert_eq!(s.delete_confirm_kinds.len(), 1);
     }
 
     #[test]

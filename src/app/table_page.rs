@@ -334,9 +334,17 @@ impl AppView {
             .map(|(ctx, _, r)| bulk_row_label(several.then_some(ctx.as_str()), r.namespace.as_deref(), &r.name))
             .chain((n > 8).then(|| format!("…and {} more", n - 8)))
             .collect();
-        // Deleting or scaling several objects needs the count typed (a protected context too).
-        let typed = (action == "Delete" || action == "Scale" || !protected.is_empty())
-            .then(|| cx.new(|cx| InputState::new(window, cx).placeholder(n.to_string())));
+        // What deleting this kind asks (Settings → General); scaling, or a protected
+        // context, always needs the count typed.
+        let level = crate::settings::delete_confirm(&kind.ar.kind);
+        if action == "Delete" && level == crate::settings::DeleteConfirm::Off && protected.is_empty() {
+            self.run_bulk(action, kind, targets, 0, window, cx);
+            return;
+        }
+        let typed = ((action == "Delete" && level == crate::settings::DeleteConfirm::Type)
+            || action == "Scale"
+            || !protected.is_empty())
+        .then(|| cx.new(|cx| InputState::new(window, cx).placeholder(n.to_string())));
         // No count is suggested: it has to be typed.
         let replicas = (action == "Scale").then(|| cx.new(|cx| InputState::new(window, cx).placeholder("replicas")));
         // Each protected context's name typed, like for a single write there.
@@ -415,53 +423,64 @@ impl AppView {
                         },
                         None => 0,
                     };
-                    let targets = targets.clone();
-                    let kind = kind.clone();
-                    let _ = this.update(cx, |this, cx| {
-                        this.table.update(cx, |t, cx| {
-                            t.delegate_mut().marked.clear();
-                            cx.notify();
-                        });
-                        cx.spawn_in(window, async move |_, cx| {
-                            let jobs = targets.into_iter().map(|(_, client, r)| {
-                                let (kind, ns, name) = (kind.clone(), r.namespace.clone(), r.name.clone());
-                                async move {
-                                    match action {
-                                        "Delete" => k8s::delete(client, kind, ns, name.clone(), false).await,
-                                        "Scale" => k8s::scale(client, kind, ns, name.clone(), count, false).await,
-                                        _ => k8s::rollout_restart(client, kind, ns, name.clone(), false).await,
-                                    }
-                                    .map_err(|e| format!("{name}: {e:#}"))
-                                }
-                            });
-                            let results = futures::future::join_all(jobs).await;
-                            let errors: Vec<String> = results.into_iter().filter_map(Result::err).collect();
-                            let ok = n - errors.len();
-                            let _ = cx.update(|window, cx| {
-                                let past = match action {
-                                    "Delete" => "deleted",
-                                    "Scale" => "scaled",
-                                    _ => "restarted",
-                                };
-                                if errors.is_empty() {
-                                    window.push_notification(Notification::success(format!("{ok} {past}")), cx);
-                                } else {
-                                    window.push_notification(
-                                        Notification::error(format!(
-                                            "{ok} {past}, {} failed. {}",
-                                            errors.len(),
-                                            errors.first().cloned().unwrap_or_default()
-                                        )),
-                                        cx,
-                                    );
-                                }
-                            });
-                        })
-                        .detach();
-                    });
+                    let (targets, kind) = (targets.clone(), kind.clone());
+                    let _ = this.update(cx, |this, cx| this.run_bulk(action, kind, targets, count, window, cx));
                     true
                 })
         });
+    }
+
+    /// Delete, scale or restart the checked rows, and say how it went.
+    fn run_bulk(
+        &mut self,
+        action: &'static str,
+        kind: Kind,
+        targets: Vec<(String, Client, Arc<k8s::Row>)>,
+        count: i32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let n = targets.len();
+        self.table.update(cx, |t, cx| {
+            t.delegate_mut().marked.clear();
+            cx.notify();
+        });
+        cx.spawn_in(window, async move |_, cx| {
+            let jobs = targets.into_iter().map(|(_, client, r)| {
+                let (kind, ns, name) = (kind.clone(), r.namespace.clone(), r.name.clone());
+                async move {
+                    match action {
+                        "Delete" => k8s::delete(client, kind, ns, name.clone(), false).await,
+                        "Scale" => k8s::scale(client, kind, ns, name.clone(), count, false).await,
+                        _ => k8s::rollout_restart(client, kind, ns, name.clone(), false).await,
+                    }
+                    .map_err(|e| format!("{name}: {e:#}"))
+                }
+            });
+            let results = futures::future::join_all(jobs).await;
+            let errors: Vec<String> = results.into_iter().filter_map(Result::err).collect();
+            let ok = n - errors.len();
+            let _ = cx.update(|window, cx| {
+                let past = match action {
+                    "Delete" => "deleted",
+                    "Scale" => "scaled",
+                    _ => "restarted",
+                };
+                if errors.is_empty() {
+                    window.push_notification(Notification::success(format!("{ok} {past}")), cx);
+                } else {
+                    window.push_notification(
+                        Notification::error(format!(
+                            "{ok} {past}, {} failed. {}",
+                            errors.len(),
+                            errors.first().cloned().unwrap_or_default()
+                        )),
+                        cx,
+                    );
+                }
+            });
+        })
+        .detach();
     }
 
     /// Open a saved view: its kind, namespaces and filter.
