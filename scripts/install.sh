@@ -12,6 +12,10 @@ mkdir -p "$bin_dir" "$data_dir/applications" "$data_dir/icons/hicolor/scalable/a
 
 install -m 755 target/release/recouvrance "$bin_dir/recouvrance"
 install -m 644 assets/recouvrance.svg "$data_dir/icons/hicolor/scalable/apps/recouvrance.svg"
+# A simpler drawing for menus and panels, where the full ship is too detailed.
+for size in 16x16 24x24; do
+  install -Dm644 assets/recouvrance-small.svg "$data_dir/icons/hicolor/$size/apps/recouvrance.svg"
+done
 
 # The repository's desktop entry, with Exec pointing at the installed binary (an absolute path,
 # since ~/.local/bin is not always on the desktop session's PATH). The Desktop Entry spec wants it

@@ -13,7 +13,7 @@ install-updater = true
 create-release = false
 # The .deb and AppImage, built next to the tarballs and uploaded with them.
 local-artifacts-jobs = ["./linux-packages"]
-include = ["assets/recouvrance.svg", "assets/recouvrance.desktop"]
+include = ["assets/recouvrance.svg", "assets/recouvrance-small.svg", "assets/recouvrance.desktop"]
 pr-run-mode = "skip"
 # Build provenance attestations for the archives (linux-packages.yml attests the .deb and the
 # AppImage); verify with `gh attestation verify <file> --repo nahuel11500/recouvrance`.
