@@ -12,7 +12,6 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use kube::Client;
-use serde::Deserialize as _;
 
 use crate::k8s::{self, Kind};
 use crate::ui::data_edit::{DataEditor, DataSaved};
@@ -608,10 +607,7 @@ fn split_docs(text: &str) -> Vec<(u32, String)> {
 fn parse_docs(text: &str) -> Result<Vec<Doc>, Problem> {
     let mut docs = Vec::new();
     for (start, body) in split_docs(text) {
-        let parsed = serde_yaml_ng::Deserializer::from_str(&body)
-            .map(serde_json::Value::deserialize)
-            .collect::<Result<Vec<_>, _>>();
-        match parsed {
+        match crate::yaml::documents(&body) {
             Ok(values) => {
                 for value in values.into_iter().filter(|v| !v.is_null()) {
                     docs.push(Doc { start, body: body.clone(), value });
@@ -620,8 +616,7 @@ fn parse_docs(text: &str) -> Result<Vec<Doc>, Problem> {
             Err(e) => {
                 let line = e.location().map(|l| l.line().saturating_sub(1) as u32 + start);
                 let col = e.location().map(|l| l.column()).unwrap_or(0);
-                let msg = e.to_string();
-                let msg = msg.split(" at line ").next().unwrap_or(&msg).to_string();
+                let msg = crate::yaml::message(&e);
                 let text = match line {
                     Some(l) => format!("Invalid YAML at line {}, column {col}: {msg}", l + 1),
                     None => format!("Invalid YAML: {msg}"),

@@ -11,7 +11,6 @@ use gpui_kit::component::{ActiveTheme as _, Disableable as _, Sizable as _, h_fl
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use kube::Client;
-use serde::Deserialize as _;
 use serde_json::Value;
 
 use crate::schema::{Field, Schema};
@@ -61,7 +60,7 @@ fn identity(doc: &Value) -> (Option<&str>, Option<&str>, Option<&str>) {
 }
 
 fn parse_first(body: &str) -> Value {
-    serde_yaml_ng::Deserializer::from_str(body).next().and_then(|d| Value::deserialize(d).ok()).unwrap_or(Value::Null)
+    crate::yaml::documents(body).ok().and_then(|d| d.into_iter().next()).unwrap_or(Value::Null)
 }
 
 /// The one document of `text` with the same identity as `doc`: its index and value.
@@ -393,7 +392,7 @@ impl SchemaForm {
         let ranges = doc_ranges(&text);
         let Some(&(a, b)) = ranges.get(self.doc_ix) else { return };
         let lines: Vec<&str> = text.lines().collect();
-        let yaml = serde_yaml_ng::to_string(&self.doc).unwrap_or_default();
+        let yaml = crate::yaml::to_string(&self.doc).unwrap_or_default();
         let mut out: Vec<String> = lines[..a].iter().map(|s| s.to_string()).collect();
         out.extend(yaml.trim_end().lines().map(String::from));
         out.extend(lines[b..].iter().map(|s| s.to_string()));

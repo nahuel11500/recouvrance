@@ -84,14 +84,10 @@ impl KubeMcp {
             Ok(c) => c,
             Err(e) => return call.finish(Err(e)),
         };
-        let mut docs = Vec::new();
-        for doc in serde_yaml_ng::Deserializer::from_str(&p.manifest) {
-            match serde_json::Value::deserialize(doc) {
-                Ok(v) if !v.is_null() => docs.push(v),
-                Ok(_) => {}
-                Err(e) => return call.finish(Err(anyhow::anyhow!("invalid YAML: {e}"))),
-            }
-        }
+        let docs: Vec<serde_json::Value> = match crate::yaml::documents(&p.manifest) {
+            Ok(d) => d.into_iter().filter(|v| !v.is_null()).collect(),
+            Err(e) => return call.finish(Err(anyhow::anyhow!("invalid YAML: {e}"))),
+        };
         if docs.is_empty() {
             return call.finish(Err(anyhow::anyhow!("no objects in manifest")));
         }

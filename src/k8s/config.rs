@@ -256,7 +256,7 @@ pub fn private_kubeconfig(context: &str, namespace: Option<&str>, purpose: &str)
     // create_new: never follow or reuse a file someone else put there.
     let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&path)?;
     let guard = PrivateKubeconfig(path);
-    f.write_all(serde_yaml_ng::to_string(&kc)?.as_bytes())?;
+    f.write_all(crate::yaml::to_string(&kc)?.as_bytes())?;
     Ok(guard)
 }
 
@@ -348,14 +348,14 @@ pub async fn service_account_kubeconfig(
     let dir = std::path::PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join("Downloads");
     std::fs::create_dir_all(&dir)?;
     let stem = format!("kubeconfig-{}", safe_file_part(&name));
-    create_private_file(&dir, &stem, "yaml", serde_yaml_ng::to_string(&config)?.as_bytes())
+    create_private_file(&dir, &stem, "yaml", crate::yaml::to_string(&config)?.as_bytes())
 }
 
 #[cfg(test)]
 mod kubeconfig_tests {
     #[test]
     fn guesses_production_and_admin() {
-        let kc: kube::config::Kubeconfig = serde_yaml_ng::from_str(
+        let kc: kube::config::Kubeconfig = crate::yaml::from_str(
             "clusters:\n\
              - {name: c1, cluster: {server: 'https://api.prd.example.com'}}\n\
              - {name: c2, cluster: {server: 'https://10.0.0.1'}}\n\
@@ -395,8 +395,8 @@ mod kubeconfig_tests {
 
     #[test]
     fn same_names_stay_apart() {
-        let a: kube::config::Kubeconfig = serde_yaml_ng::from_str("clusters: [{name: prod, cluster: {server: https://a}}]\nusers: [{name: me, user: {token: a}}]\ncontexts: [{name: prod, context: {cluster: prod, user: me}}]\ncurrent-context: prod\n").unwrap();
-        let b: kube::config::Kubeconfig = serde_yaml_ng::from_str("clusters: [{name: prod, cluster: {server: https://b}}]\nusers: [{name: me, user: {token: b}}]\ncontexts: [{name: prod, context: {cluster: prod, user: me}}]\n").unwrap();
+        let a: kube::config::Kubeconfig = crate::yaml::from_str("clusters: [{name: prod, cluster: {server: https://a}}]\nusers: [{name: me, user: {token: a}}]\ncontexts: [{name: prod, context: {cluster: prod, user: me}}]\ncurrent-context: prod\n").unwrap();
+        let b: kube::config::Kubeconfig = crate::yaml::from_str("clusters: [{name: prod, cluster: {server: https://b}}]\nusers: [{name: me, user: {token: b}}]\ncontexts: [{name: prod, context: {cluster: prod, user: me}}]\n").unwrap();
         let mut kc = a;
         super::merge_unique(&mut kc, b, "team-b");
         let names: Vec<&str> = kc.contexts.iter().map(|c| c.name.as_str()).collect();

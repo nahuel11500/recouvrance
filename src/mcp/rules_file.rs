@@ -233,7 +233,7 @@ pub fn load() -> Result<Option<RulesFile>> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         r => r?,
     };
-    let file: RulesFile = serde_yaml_ng::from_str(&text).context("rules.yaml")?;
+    let file: RulesFile = crate::yaml::from_str(&text).context("rules.yaml")?;
     // Validate every rule before anything is applied.
     for (name, rules) in &file.agents {
         apply(rules, &mut Policy::default()).with_context(|| format!("agent `{name}`"))?;
@@ -253,7 +253,7 @@ pub fn render(agents: &[super::Agent]) -> Result<String> {
         .iter()
         .map(|a| Ok((a.name.clone(), from_policy(&a.policy).with_context(|| format!("agent `{}`", a.name))?)))
         .collect::<Result<_>>()?;
-    Ok(format!("{HEADER}\n{}", serde_yaml_ng::to_string(&RulesFile { agents })?))
+    Ok(format!("{HEADER}\n{}", crate::yaml::to_string(&RulesFile { agents })?))
 }
 
 /// Write the file from the current agents (starting point for rules as code).
@@ -344,7 +344,7 @@ mod tests {
     #[test]
     fn applies_file() {
         let text = "agents:\n  Claude:\n    allow: [\"get,list *\"]\n    deny: [\"* secrets\"]\n    limits: { calls_per_minute: 30 }\n";
-        let f: RulesFile = serde_yaml_ng::from_str(text).unwrap();
+        let f: RulesFile = crate::yaml::from_str(text).unwrap();
         let mut p = Policy::default();
         apply(&f.agents["Claude"], &mut p).unwrap();
         assert_eq!(p.rules.len(), 2);
