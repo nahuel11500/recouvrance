@@ -508,6 +508,7 @@ impl DetailPanel {
         let input = cx.new(|cx| InputState::new(window, cx).placeholder(self.obj.name.clone()));
         let panel = cx.entity().downgrade();
         let (name, kind, context) = (self.obj.name.clone(), self.obj.kind.ar.kind.clone(), self.context.clone());
+        let label = self.obj.kind.label.clone();
         let opts = cx.new(|_| (false, false));
         let base = self.kubectl_for("Delete");
         let unfinalize = self.kubectl_for("Unfinalize");
@@ -567,6 +568,7 @@ impl DetailPanel {
                         }),
                 )
                 .child(confirm_extras(&cmd, guard.as_ref(), cx))
+                .child(delete_settings_link(&kind, &label, cx))
                 .show_cancel(true)
                 .ok_text("Delete")
                 .ok_variant(component::button::ButtonVariant::Danger)
@@ -745,6 +747,31 @@ pub fn confirm_extras(cmd: &str, guard: Option<&(Entity<InputState>, String)>, c
             )
             .child(Input::new(input))
         })
+        .into_any_element()
+}
+
+/// "Change what deleting asks…": a link under delete dialogs to their setting.
+pub fn delete_settings_link(kind: &str, label: &str, cx: &App) -> AnyElement {
+    let text = match crate::settings::delete_confirm(kind) {
+        crate::settings::DeleteConfirm::Off => format!("{label} are deleted without asking."),
+        crate::settings::DeleteConfirm::Ask => format!("Deleting {label} asks first."),
+        crate::settings::DeleteConfirm::Type => format!("Deleting {label} asks for the name."),
+    };
+    h_flex()
+        .pt_1()
+        .gap_1()
+        .text_xs()
+        .text_color(cx.theme().muted_foreground)
+        .child(text)
+        .child(
+            div()
+                .id("delete-settings")
+                .text_color(cx.theme().blue)
+                .cursor_pointer()
+                .hover(|s| s.underline())
+                .child("Change in Settings")
+                .on_click(|_, window, cx| crate::app::open_delete_settings(window, cx)),
+        )
         .into_any_element()
 }
 

@@ -128,6 +128,25 @@ pub struct Settings {
     pub delete_confirm_kinds: std::collections::BTreeMap<String, DeleteConfirm>,
 }
 
+/// Kinds that come back on their own are deleted right away; kinds whose loss takes data,
+/// a machine or a whole namespace with it need the name typed. Others (custom resources
+/// too, which can stand for a database) ask.
+fn default_delete_confirm() -> std::collections::BTreeMap<String, DeleteConfirm> {
+    use DeleteConfirm::{Off, Type};
+    let off = ["Pod", "Job", "ReplicaSet", "Event", "EndpointSlice", "Endpoints", "Lease"];
+    let typed = [
+        "Node",
+        "Namespace",
+        "StatefulSet",
+        "Deployment",
+        "DaemonSet",
+        "PersistentVolume",
+        "PersistentVolumeClaim",
+        "CustomResourceDefinition",
+    ];
+    off.iter().map(|k| (k.to_string(), Off)).chain(typed.iter().map(|k| (k.to_string(), Type))).collect()
+}
+
 /// What deleting an object of this kind (`Pod`, `Node`…) asks first.
 pub fn delete_confirm(kind: &str) -> DeleteConfirm {
     with(|s| s.delete_confirm_kinds.get(kind).copied().unwrap_or(s.delete_confirm))
@@ -220,12 +239,8 @@ impl Default for Settings {
             kubeconfig_folders: Vec::new(),
             open_browser_on_forward: true,
             recent_forwards: Vec::new(),
-            // A node or a StatefulSet (and its pods' identity) is hard to get back: type to delete.
-            delete_confirm: DeleteConfirm::Off,
-            delete_confirm_kinds: [("Node", DeleteConfirm::Type), ("StatefulSet", DeleteConfirm::Type)]
-                .into_iter()
-                .map(|(k, v)| (k.to_string(), v))
-                .collect(),
+            delete_confirm: DeleteConfirm::Ask,
+            delete_confirm_kinds: default_delete_confirm(),
         }
     }
 }
@@ -538,13 +553,15 @@ mod tests {
     }
 
     #[test]
-    fn deletes_ask_only_for_nodes_and_statefulsets_by_default() {
+    fn deletes_follow_how_much_a_kind_matters_by_default() {
         // Older settings files have neither key and get the defaults.
         let s: Settings = serde_json::from_str("{}").unwrap();
-        assert_eq!(s.delete_confirm, DeleteConfirm::Off);
-        assert_eq!(s.delete_confirm_kinds.get("Node"), Some(&DeleteConfirm::Type));
-        assert_eq!(s.delete_confirm_kinds.get("StatefulSet"), Some(&DeleteConfirm::Type));
-        assert_eq!(s.delete_confirm_kinds.get("Pod"), None);
+        assert_eq!(s.delete_confirm, DeleteConfirm::Ask);
+        for k in ["Node", "Namespace", "StatefulSet", "Deployment", "PersistentVolumeClaim"] {
+            assert_eq!(s.delete_confirm_kinds.get(k), Some(&DeleteConfirm::Type), "{k}");
+        }
+        assert_eq!(s.delete_confirm_kinds.get("Pod"), Some(&DeleteConfirm::Off));
+        assert_eq!(s.delete_confirm_kinds.get("Service"), None, "a Service asks, like the default");
         let s: Settings =
             serde_json::from_str(r#"{"delete_confirm": "ask", "delete_confirm_kinds": {"Namespace": "type"}}"#)
                 .unwrap();

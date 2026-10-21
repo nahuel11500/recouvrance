@@ -110,7 +110,7 @@ what you can check for yourself:
   it at, and to the Anthropic API only if you use the assistant. Nothing else, and no analytics.
 - **Safe by default.** Read-only until you turn writes on. Writes show their `kubectl`
   equivalent and ask for confirmation, YAML edits and applies run as a server dry run first, and
-  deletes ask as you set per kind (by default, Nodes and StatefulSets need their name typed). A
+  deletes ask as you set per kind (by default, Nodes, Namespaces, StatefulSets, Deployments and volumes need their name typed). A
   protected context always asks for its name. Agents get only what their rules allow, every call is logged to
   `~/.local/share/recouvrance/audit.jsonl`, and a kill switch cuts them all off.
 - **Verifiable releases.** Every release archive, `.deb` and AppImage has a build provenance

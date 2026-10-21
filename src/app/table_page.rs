@@ -406,6 +406,7 @@ impl AppView {
                 .when_some(typed.clone(), |a, input| {
                     a.child(div().pt_1().text_sm().child(format!("Type {n} to confirm:"))).child(Input::new(&input))
                 })
+                .when(action == "Delete", |a| a.child(crate::details::delete_settings_link(&kind.ar.kind, &label, cx)))
                 .show_cancel(true)
                 .ok_text(action)
                 .when(action == "Delete", |a| a.ok_variant(component::button::ButtonVariant::Danger))

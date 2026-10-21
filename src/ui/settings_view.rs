@@ -126,7 +126,7 @@ impl SettingsView {
             }));
             prometheus.push((ctx, input));
         }
-        let delete_kind = cx.new(|cx| InputState::new(window, cx).placeholder("Add a kind, e.g. Namespace"));
+        let delete_kind = cx.new(|cx| InputState::new(window, cx).placeholder("Add a kind, e.g. Service"));
         subs.push(cx.subscribe_in(&delete_kind, window, |_, state, ev: &InputEvent, window, cx| {
             if let InputEvent::PressEnter { .. } = ev {
                 let kind = state.read(cx).value().trim().to_string();
@@ -197,6 +197,12 @@ impl SettingsView {
             hub,
             _subs: subs,
         }
+    }
+
+    /// Open on the General section (where deletes are configured).
+    pub fn show_general(&mut self, cx: &mut Context<Self>) {
+        self.section = Section::General;
+        cx.notify();
     }
 
     /// Open on the About section.
