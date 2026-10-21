@@ -342,30 +342,7 @@ fn best<'a>(matching: impl Iterator<Item = (usize, &'a Rule)>) -> Verdict {
     verdict
 }
 
-/// `*` matches any run of characters; everything else is literal.
-pub fn glob(pattern: &str, text: &str) -> bool {
-    let parts: Vec<&str> = pattern.split('*').collect();
-    if parts.len() == 1 {
-        return pattern == text;
-    }
-    let mut rest = text;
-    for (i, part) in parts.iter().enumerate() {
-        if i == 0 {
-            match rest.strip_prefix(part) {
-                Some(r) => rest = r,
-                None => return false,
-            }
-        } else if i == parts.len() - 1 {
-            return rest.ends_with(part);
-        } else {
-            match rest.find(part) {
-                Some(pos) => rest = &rest[pos + part.len()..],
-                None => return false,
-            }
-        }
-    }
-    true
-}
+pub use crate::glob::glob;
 
 // MARK: Agents and config
 
