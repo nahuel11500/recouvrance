@@ -83,7 +83,6 @@ impl DetailPanel {
                             .on_click(cx.listener(move |this, _, w, cx| this.upload_pick(n2.clone(), w, cx))),
                     ),
             )
-            .child(self.render_ports(value, &name, cx))
             .child(div().flex_1().min_h_0().child(crate::overview::container(&self.ctx(value, cx), &name, cx)))
             .into_any_element()
     }
@@ -180,70 +179,32 @@ impl DetailPanel {
             .into_any_element()
     }
 
-    /// A container's ports with a one-click port-forward each.
-    pub(super) fn render_ports(
-        &self,
-        value: &serde_json::Value,
-        container: &str,
+    /// Forward a port of this pod: right away, or after the options dialog.
+    pub fn forward_port(
+        &mut self,
+        port: u16,
+        name: Option<&str>,
+        options: bool,
+        window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let ports: Vec<(u16, String)> = value
-            .pointer("/spec/containers")
-            .and_then(|c| c.as_array())
-            .into_iter()
-            .flatten()
-            .filter(|c| c["name"].as_str() == Some(container))
-            .flat_map(|c| c["ports"].as_array().cloned().unwrap_or_default())
-            .filter_map(|p| {
-                let port = p["containerPort"].as_u64()? as u16;
-                let name = p["name"].as_str().map(|n| format!("{n}:{port}")).unwrap_or_else(|| port.to_string());
-                Some((port, name))
-            })
-            .collect();
-        if ports.is_empty() {
-            return div().into_any_element();
+    ) {
+        let saved = crate::settings::SavedForward {
+            context: self.context.clone(),
+            namespace: self.obj.namespace.clone().unwrap_or_default(),
+            service: None,
+            pod: self.obj.name.clone(),
+            remote: port,
+            local: None,
+            address: None,
+            https: port == 443 || port == 8443,
+            open_browser: crate::forwards::opens_browser(port, name),
+        };
+        if options {
+            self.pf_options_dialog(saved, window, cx);
+        } else {
+            let client = self.client.clone();
+            self.forwards.update(cx, |f, cx| f.start(client, saved, cx));
         }
-        let ns = self.obj.namespace.clone().unwrap_or_default();
-        h_flex()
-            .px_2()
-            .gap_2()
-            .flex_wrap()
-            .child(div().text_xs().text_color(cx.theme().muted_foreground).child("Port forward"))
-            .children(ports.into_iter().map(|(port, label)| {
-                let (client, forwards) = (self.client.clone(), self.forwards.clone());
-                let saved = crate::settings::SavedForward {
-                    context: self.context.clone(),
-                    namespace: ns.clone(),
-                    service: None,
-                    pod: self.obj.name.clone(),
-                    remote: port,
-                    local: None,
-                    address: None,
-                    https: port == 443 || port == 8443,
-                    open_browser: crate::forwards::opens_browser(port, Some(&label)),
-                };
-                let opts = saved.clone();
-                h_flex()
-                    .child(
-                        Button::new(("pf", port as usize))
-                            .xsmall()
-                            .outline()
-                            .icon(Lucide::ArrowRightLeft)
-                            .label(label)
-                            .on_click(move |_, _, cx| {
-                                forwards.update(cx, |f, cx| f.start(client.clone(), saved.clone(), cx));
-                            }),
-                    )
-                    .child(
-                        Button::new(("pf-opt", port as usize))
-                            .xsmall()
-                            .ghost()
-                            .icon(Lucide::Settings2)
-                            .tooltip("Forward with options: local port, address, https, open in browser")
-                            .on_click(cx.listener(move |this, _, w, cx| this.pf_options_dialog(opts.clone(), w, cx))),
-                    )
-            }))
-            .into_any_element()
     }
 
     /// Show Secret values or managedFields (or not). The YAML editor is reloaded
