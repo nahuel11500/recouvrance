@@ -709,3 +709,14 @@ fn notify_desktop(title: &str, body: &str) {
             .stderr(std::process::Stdio::null()),
     );
 }
+
+/// Close the open dialog and show Settings → General, where what deleting asks is set.
+pub fn open_delete_settings(window: &mut Window, cx: &mut App) {
+    window.close_dialog(cx);
+    let Some(Some(root)) = window.root::<base::Root>() else { return };
+    let Ok(app) = root.read(cx).view().clone().downcast::<AppView>() else { return };
+    app.update(cx, |this, cx| {
+        this.settings_view.update(cx, |s, cx| s.show_general(cx));
+        this.navigate(Route::Settings, cx);
+    });
+}

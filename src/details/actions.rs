@@ -488,19 +488,30 @@ impl DetailPanel {
         self.keep_task(task);
     }
 
-    /// Deleting requires typing the object's name.
+    /// Delete, asking first as set for this kind (Settings → General): not at all, with a
+    /// dialog, or with the name typed. A protected context always asks for its name, and an
+    /// object stuck terminating always shows the dialog (to remove its finalizers).
     pub(super) fn confirm_delete(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.ensure_writes(window, cx) {
             return;
         }
+        let level = crate::settings::delete_confirm(&self.obj.kind.ar.kind);
+        let guard = self.protection(window, cx);
+        let terminating = self.object.as_ref().is_some_and(|o| o.pointer("/metadata/deletionTimestamp").is_some());
+        if level == crate::settings::DeleteConfirm::Off && guard.is_none() && !terminating {
+            let (c, k, ns, n) =
+                (self.client.clone(), self.obj.kind.clone(), self.obj.namespace.clone(), self.obj.name.clone());
+            self.run_write("Delete", k8s::delete_with(c, k, ns, n, false, false), window, cx);
+            return;
+        }
+        let typed = level == crate::settings::DeleteConfirm::Type;
         let input = cx.new(|cx| InputState::new(window, cx).placeholder(self.obj.name.clone()));
         let panel = cx.entity().downgrade();
         let (name, kind, context) = (self.obj.name.clone(), self.obj.kind.ar.kind.clone(), self.context.clone());
+        let label = self.obj.kind.label.clone();
         let opts = cx.new(|_| (false, false));
         let base = self.kubectl_for("Delete");
         let unfinalize = self.kubectl_for("Unfinalize");
-        let guard = self.protection(window, cx);
-        let terminating = self.object.as_ref().is_some_and(|o| o.pointer("/metadata/deletionTimestamp").is_some());
         window.open_alert_dialog(cx, move |alert, _, cx| {
             let (input, panel, name, guard) = (input.clone(), panel.clone(), name.clone(), guard.clone());
             let (force, strip) = *opts.read(cx);
@@ -512,8 +523,12 @@ impl DetailPanel {
             let (o1, o2) = (opts.clone(), opts.clone());
             alert
                 .title(format!("Delete {kind} {name}?"))
-                .description(format!("This deletes it from {context}. Type the name to confirm."))
-                .child(Input::new(&input))
+                .description(if typed {
+                    format!("This deletes it from {context}. Type the name to confirm.")
+                } else {
+                    format!("This deletes it from {context}.")
+                })
+                .when(typed, |a| a.child(Input::new(&input)))
                 .child(
                     v_flex()
                         .gap_1()
@@ -553,11 +568,12 @@ impl DetailPanel {
                         }),
                 )
                 .child(confirm_extras(&cmd, guard.as_ref(), cx))
+                .child(delete_settings_link(&kind, &label, cx))
                 .show_cancel(true)
                 .ok_text("Delete")
                 .ok_variant(component::button::ButtonVariant::Danger)
                 .on_ok(move |_, window, cx| {
-                    if input.read(cx).value().trim() != name || !guard_ok(guard.as_ref(), cx) {
+                    if (typed && input.read(cx).value().trim() != name) || !guard_ok(guard.as_ref(), cx) {
                         return false;
                     }
                     let _ = panel.update(cx, |this, cx| {
@@ -731,6 +747,31 @@ pub fn confirm_extras(cmd: &str, guard: Option<&(Entity<InputState>, String)>, c
             )
             .child(Input::new(input))
         })
+        .into_any_element()
+}
+
+/// "Change what deleting asks…": a link under delete dialogs to their setting.
+pub fn delete_settings_link(kind: &str, label: &str, cx: &App) -> AnyElement {
+    let text = match crate::settings::delete_confirm(kind) {
+        crate::settings::DeleteConfirm::Off => format!("{label} are deleted without asking."),
+        crate::settings::DeleteConfirm::Ask => format!("Deleting {label} asks first."),
+        crate::settings::DeleteConfirm::Type => format!("Deleting {label} asks for the name."),
+    };
+    h_flex()
+        .pt_1()
+        .gap_1()
+        .text_xs()
+        .text_color(cx.theme().muted_foreground)
+        .child(text)
+        .child(
+            div()
+                .id("delete-settings")
+                .text_color(cx.theme().blue)
+                .cursor_pointer()
+                .hover(|s| s.underline())
+                .child("Change in Settings")
+                .on_click(|_, window, cx| crate::app::open_delete_settings(window, cx)),
+        )
         .into_any_element()
 }
 
