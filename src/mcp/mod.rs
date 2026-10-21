@@ -474,6 +474,15 @@ pub struct AuditEntry {
     pub session: Option<String>,
 }
 
+/// See [`Hub::audit_stats`].
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct AuditStats {
+    pub matching: usize,
+    pub oldest: Option<jiff::Timestamp>,
+    pub newest: Option<jiff::Timestamp>,
+    pub full: bool,
+}
+
 // MARK: Hub
 
 pub struct Approval {
@@ -832,6 +841,26 @@ impl Hub {
         lock(&self.audit).iter().rev().filter(|e| keep(e)).take(limit).cloned().collect()
     }
 
+    /// How many entries in memory match, the time of the oldest one in memory, whether
+    /// memory is full (older entries are then only on disk), and the newest entry's time.
+    pub fn audit_stats(&self, keep: impl Fn(&AuditEntry) -> bool) -> AuditStats {
+        let audit = lock(&self.audit);
+        AuditStats {
+            matching: audit.iter().filter(|e| keep(e)).count(),
+            oldest: audit.front().map(|e| e.time),
+            newest: audit.back().map(|e| e.time),
+            full: audit.len() >= MAX_AUDIT_IN_MEMORY,
+        }
+    }
+
+    /// Every entry still on disk (the log and its rotated copy), oldest first.
+    /// Reads up to 20 MB: call it off the UI thread.
+    pub fn audit_on_disk() -> Vec<AuditEntry> {
+        let path = audit_path();
+        let rotated = path.with_extension("jsonl.1");
+        [rotated, path].iter().flat_map(|p| read_audit(p)).collect()
+    }
+
     pub fn record(&self, entry: AuditEntry) {
         {
             // One writer at a time, so rotation and appends never interleave.
@@ -971,6 +1000,12 @@ fn append_audit(path: &std::path::Path, line: &str) -> std::io::Result<()> {
 }
 
 /// The last entries of the log, reading only its end.
+/// All the entries of one log file, skipping lines that don't parse.
+fn read_audit(path: &std::path::Path) -> Vec<AuditEntry> {
+    let text = std::fs::read(path).unwrap_or_default();
+    String::from_utf8_lossy(&text).lines().filter_map(|l| serde_json::from_str(l).ok()).collect()
+}
+
 fn load_audit_tail(path: &std::path::Path) -> VecDeque<AuditEntry> {
     use std::io::{Read as _, Seek as _, SeekFrom};
     // Far more than MAX_AUDIT_IN_MEMORY entries of a few hundred bytes.

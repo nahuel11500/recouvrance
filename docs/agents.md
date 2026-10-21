@@ -55,10 +55,16 @@ Tools: `my_permissions`, `list_contexts`, `list_resource_types`, `list_resources
 Prompts (slash commands in Claude Code: `/mcp__recouvrance__troubleshoot` …): `troubleshoot`, `rightsize`,
 `cert-audit`, `cluster-health`. They chain the tools above into a read-only workflow.
 
-Every call is logged with its decision and rule, grouped by agent session, and appended to
+Every call is logged with its decision and rule, and appended to
 `~/.local/share/recouvrance/audit.jsonl` (the folder is 0700, the file 0600). At 10 MiB the log moves to
 `audit.jsonl.1`, replacing the older one. If the log cannot be written, the Activity page says so. A
 kill switch cuts all agent access at once.
+
+The Activity page groups calls by task: one agent session, split where the agent paused for more than
+10 minutes. Each group says what it touched (contexts, namespaces, objects); repeated calls of a tool on
+the same target fold into one line, and any line opens to its full arguments and result. Filter by
+writes, denied or failed calls, context, agent or text. It shows the latest 300 calls; "Show older"
+goes further back, and then reads the log on disk.
 
 > These rules govern what agents do *through Recouvrance*. An agent with shell access can still run
 > `kubectl` with your kubeconfig, so block `kubectl`/`helm` in its own permissions if Recouvrance

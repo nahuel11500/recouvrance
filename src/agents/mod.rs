@@ -32,6 +32,7 @@ pub(crate) use rules::*;
 pub struct AgentsView {
     /// Show every agent's activity instead of one agent's settings.
     all_activity: bool,
+    activity: Activity,
     hub: Arc<Hub>,
     contexts: Vec<String>,
     risky: Vec<String>,
@@ -150,7 +151,14 @@ impl AgentsView {
         } else {
             crate::assistant::main_agent(&hub).ok().map(|(id, _)| id)
         };
+        let activity = Activity::new(window, cx);
+        subs.push(cx.subscribe(&activity.search, |_, _, ev: &InputEvent, cx| {
+            if let InputEvent::Change = ev {
+                cx.notify();
+            }
+        }));
         let mut this = Self {
+            activity,
             advanced,
             claude_connected: None,
             code: None,
@@ -539,18 +547,7 @@ impl Render for AgentsView {
                     .when(self.advanced, |d| d.child(self.render_list(cx)))
                     .child(match agent {
                         _ if self.code.is_some() => self.render_code(cx),
-                        _ if self.all_activity => v_flex()
-                            .id("all-activity-detail")
-                            .flex_1()
-                            .min_w_0()
-                            .h_full()
-                            .overflow_y_scroll()
-                            .p_4()
-                            .gap_2()
-                            .child(div().text_lg().font_weight(FontWeight::BOLD).child("All agent activity"))
-                            .child(div().text_sm().text_color(muted).child("Every call by every agent, newest first. Also saved to ~/.local/share/recouvrance/audit.jsonl."))
-                            .child(self.render_activity(None, cx))
-                            .into_any_element(),
+                        _ if self.all_activity => self.render_activity_page(cx),
                         Some(a) => self.render_detail(&a, cx).into_any_element(),
                         None => {
                             let theme = cx.theme();
@@ -574,7 +571,7 @@ impl Render for AgentsView {
                                 .child(step("1", "Create an agent", "Name it on the left (e.g. claude-code). It starts read-only on the contexts you pick, never Secrets."))
                                 .child(step("2", "Connect your tool", "Copy the `claude mcp add …` command shown once with its token (or the URL and token for any MCP client)."))
                                 .child(step("3", "Tune its rules", "Allow, ask me, or deny per verb, resource, namespace, context and name. Approvals pop up here, with \"allow for 1h\" or \"always\"."))
-                                .child(step("4", "Watch what it does", "Activity shows every call, its decision and the rule that decided, grouped by session."))
+                                .child(step("4", "Watch what it does", "Activity shows every call, its decision and the rule that decided, grouped by task."))
                                 .into_any_element()
                         }
                     }),
