@@ -1,5 +1,7 @@
 //! YAML in and out, through serde-saphyr (safe Rust, maintained; kube uses it too).
 //! One place for the parser options, so every caller reads YAML the same way.
+//!
+//! The fuzz targets in `fuzz/` build this file on its own: keep it to std, regex and serde.
 
 use serde::Serialize;
 use serde::de::DeserializeOwned;
