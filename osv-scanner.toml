@@ -1,0 +1,45 @@
+# Advisories OSV-Scanner (and so OpenSSF Scorecard) should not count, with why. All of them are
+# "unmaintained" notices, not vulnerabilities, for crates we do not depend on directly and cannot
+# replace ourselves; deny.toml tracks the same list. Each expires, so it gets looked at again: on
+# that date it counts again unless renewed with a reason. A real vulnerability in one of these
+# crates has its own advisory ID, which this file does not hide.
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2024-0384"
+ignoreUntil = 2027-04-21
+reason = "instant is unmaintained (not a vulnerability); pulled in by gpui-base (the UI toolkit), waiting on upstream"
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2024-0436"
+ignoreUntil = 2027-04-21
+reason = "paste is unmaintained (not a vulnerability); a build-time macro pulled in by gpui-component and the image decoders, waiting on upstream"
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2025-0134"
+ignoreUntil = 2027-04-21
+reason = "rustls-pemfile is unmaintained (not a vulnerability); only in the UI toolkit's WebAssembly build, never compiled into the desktop app"
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0206"
+ignoreUntil = 2027-04-21
+reason = "rustybuzz is unmaintained (not a vulnerability); text shaping inside the UI toolkit, which is moving to harfrust"
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0192"
+ignoreUntil = 2027-04-21
+reason = "ttf-parser is unmaintained (not a vulnerability); font parsing inside the UI toolkit's font stack, which is moving to skrifa"
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0371"
+ignoreUntil = 2027-04-21
+reason = "zbus_names is unmaintained (not a vulnerability); Linux D-Bus support behind the UI toolkit's accessibility, portals and keyring"
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0370"
+ignoreUntil = 2027-04-21
+reason = "zvariant is unmaintained (not a vulnerability); Linux D-Bus support behind the UI toolkit's accessibility, portals and keyring"
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0372"
+ignoreUntil = 2027-04-21
+reason = "zvariant_derive is unmaintained (not a vulnerability); Linux D-Bus support behind the UI toolkit's accessibility, portals and keyring"

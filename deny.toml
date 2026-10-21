@@ -7,8 +7,9 @@ all-features = true
 [advisories]
 version = 2
 yanked = "deny"
-# Unmaintained crates deep in the dependency tree (GUI and YAML stacks) are not actionable here;
+# Unmaintained crates deep in the dependency tree (the GUI stack) are not actionable here;
 # direct dependencies are still checked. Known and tracked (see them with unmaintained = "all"):
+# Also listed, with reasons and an expiry, in osv-scanner.toml (for OSV-Scanner and Scorecard):
 # - instant, paste, rustls-pemfile, rustybuzz, ttf-parser, zbus_names, zvariant,
 #   zvariant_derive: deep in the GUI toolkit and platform stacks, waiting on upstream.
 unmaintained = "workspace"
