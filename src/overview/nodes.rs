@@ -100,47 +100,60 @@ pub(super) fn node_allocation(ctx: &Ctx, cx: &App) -> Div {
         _ => q.parse::<f64>().unwrap_or_else(|_| k8s::parse_bytes(q)),
     };
     let pct = |v: f64, of: f64| if of > 0.0 { format!(" ({:.0}%)", v / of * 100.0) } else { String::new() };
-    let header = h_flex()
-        .gap_3()
-        .py_1()
-        .text_xs()
-        .text_color(muted)
-        .border_b_1()
-        .border_color(theme.border)
-        .child(div().w(px(200.)).child("Resource"))
-        .child(div().w(px(220.)).child("Requests"))
-        .child(div().w(px(180.)).child("Limits"))
-        .child(div().w(px(110.)).child("Allocatable"))
-        .child(div().w(px(110.)).child("Capacity"));
-    let rows =
-        names.into_iter().filter(|n| alloc.contains_key(n)).map(|name| {
-            let a = alloc.get(&name).and_then(Value::as_str).map(|q| parse(&name, q)).unwrap_or(0.0);
-            let c = capacity.get(&name).and_then(Value::as_str).unwrap_or("-").to_string();
-            let (req, lim) = if name == "pods" { (running, 0.0) } else { k8s::pods_allocated(pods, &name) };
+    let cards = names.into_iter().filter(|n| alloc.contains_key(n)).map(|name| {
+        let a = alloc.get(&name).and_then(Value::as_str).map(|q| parse(&name, q)).unwrap_or(0.0);
+        let c = capacity.get(&name).and_then(Value::as_str).map(|q| parse(&name, q)).unwrap_or(a);
+        let (req, lim) = if name == "pods" { (running, 0.0) } else { k8s::pods_allocated(pods, &name) };
+        let share = if a > 0.0 { req / a } else { 0.0 };
+        let color = match share {
+            s if s >= 0.95 => theme.danger,
+            s if s >= 0.8 => theme.warning,
+            _ => theme.blue,
+        };
+        let limits = (name != "pods").then(|| {
             let over = lim > a && a > 0.0;
-            h_flex()
-                .gap_3()
-                .py_1()
-                .text_sm()
-                .border_b_1()
-                .border_color(theme.border)
-                .child(div().w(px(200.)).child(name.clone()))
-                .child(
-                    v_flex()
-                        .w(px(220.))
-                        .gap_0p5()
-                        .child(format!("{}{}", fmt(&name, req), pct(req, a)))
-                        .child(usage_bar(Some(req), None, Some(a), theme.blue, cx)),
-                )
-                .child(div().w(px(180.)).when(over, |d| d.text_color(theme.warning)).child(if name == "pods" {
-                    "-".to_string()
-                } else {
-                    format!("{}{}", fmt(&name, lim), pct(lim, a))
-                }))
-                .child(div().w(px(110.)).child(fmt(&name, a)))
-                .child(div().w(px(110.)).text_color(muted).child(c))
+            div().when(over, |d| d.text_color(theme.warning)).child(format!(
+                "limits {}{}{}",
+                fmt(&name, lim),
+                pct(lim, a),
+                if over { " · overcommitted" } else { "" }
+            ))
         });
-    let mut out = v_flex().child(heading("Allocation")).child(header).children(rows);
+        card(cx)
+            .w(px(300.))
+            .p_3()
+            .gap_2()
+            .child(
+                h_flex()
+                    .justify_between()
+                    .items_baseline()
+                    .child(div().text_sm().font_weight(FontWeight::MEDIUM).child(name.clone()))
+                    .child(
+                        div()
+                            .text_xl()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(color)
+                            .child(format!("{:.0}%", share * 100.0)),
+                    ),
+            )
+            .child(allocation_bar(req, lim, a, color, cx))
+            .child(
+                v_flex()
+                    .text_xs()
+                    .text_color(muted)
+                    .child(div().text_color(theme.foreground).child(format!(
+                        "{} of {} {}",
+                        fmt(&name, req),
+                        fmt(&name, a),
+                        if name == "pods" { "running" } else { "requested" }
+                    )))
+                    .children(limits)
+                    // Capacity is worth a line only when the node reserves part of it.
+                    .when(fmt(&name, c) != fmt(&name, a), |d| d.child(format!("capacity {}", fmt(&name, c)))),
+            )
+    });
+    let mut out =
+        v_flex().child(heading("Allocation")).child(h_flex().flex_wrap().items_stretch().gap_3().children(cards));
     // Filesystems, from the kubelet (needs nodes/proxy).
     if let Some(st) = &ctx.related.node_stats {
         let fs = |path: &str, label: &str| {
@@ -169,6 +182,25 @@ pub(super) fn node_allocation(ctx: &Ctx, cx: &App) -> Div {
         );
     }
     out
+}
+
+/// Requests as a solid fill and limits as a lighter one behind it, against what the
+/// node can allocate. Limits past it fill the bar and end in a warning edge.
+fn allocation_bar(req: f64, lim: f64, alloc: f64, color: Hsla, cx: &App) -> Div {
+    let theme = cx.theme();
+    let at = |v: f64| if alloc > 0.0 { (v / alloc).clamp(0.0, 1.0) as f32 } else { 0.0 };
+    let fill = |w: f32, bg: Hsla| div().absolute().left_0().top_0().h_full().rounded_full().bg(bg).w(relative(w));
+    div()
+        .relative()
+        .h(px(10.))
+        .w_full()
+        .rounded_full()
+        .bg(theme.secondary)
+        .child(fill(at(lim), color.opacity(0.25)))
+        .child(fill(at(req), color))
+        .when(lim > alloc && alloc > 0.0, |d| {
+            d.child(div().absolute().right_0().top_0().h_full().w(px(3.)).rounded_r_full().bg(theme.warning))
+        })
 }
 
 /// DRA devices the node publishes (ResourceSlices), by driver and pool.
