@@ -148,7 +148,7 @@ fn values_yaml(values: &Value, reveal: bool) -> String {
     if !reveal {
         mask_secrets(&mut v);
     }
-    serde_yaml_ng::to_string(&v).unwrap_or_default()
+    crate::yaml::to_string(&v).unwrap_or_default()
 }
 
 fn mask_secrets(v: &mut Value) {
@@ -199,10 +199,10 @@ fn mask_manifest_doc(doc: &str) -> String {
     }
     let comments: String =
         doc.lines().take_while(|l| l.trim_start().starts_with('#')).map(|l| format!("{l}\n")).collect();
-    match serde_yaml_ng::from_str::<Value>(doc) {
+    match crate::yaml::from_str::<Value>(doc) {
         Ok(mut v) if v["kind"] == "Secret" => {
             k8s::mask_secret_values(&mut v);
-            comments + &serde_yaml_ng::to_string(&v).unwrap_or_default()
+            comments + &crate::yaml::to_string(&v).unwrap_or_default()
         }
         Ok(_) => doc.to_string(),
         // Unreadable, but it may be a Secret: hide it rather than show its values.

@@ -122,7 +122,7 @@ pub fn run(ctx: String) {
             };
             let value = k8s::get_object(client.clone(), obj).await.unwrap();
             let yaml = k8s::to_yaml(&value, false, false).unwrap();
-            let back: serde_json::Value = serde_yaml_ng::from_str(&yaml).unwrap();
+            let back: serde_json::Value = crate::yaml::from_str(&yaml).unwrap();
             println!("{:?}", k8s::replace(client.clone(), kind, Some(ns.into()), back, true).await);
             return;
         }

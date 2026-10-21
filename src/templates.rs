@@ -127,10 +127,9 @@ pub fn ensure_folder() -> std::io::Result<PathBuf> {
 mod tests {
     #[test]
     fn builtins_parse() {
-        use serde::Deserialize as _;
         for t in super::all("team-a").into_iter().filter(|t| !t.user) {
-            for doc in serde_yaml_ng::Deserializer::from_str(&t.body) {
-                let v = serde_json::Value::deserialize(doc).unwrap_or_else(|e| panic!("{}: {e}", t.name));
+            let docs = crate::yaml::documents(&t.body).unwrap_or_else(|e| panic!("{}: {e}", t.name));
+            for v in docs.into_iter().filter(|v| !v.is_null()) {
                 assert!(v["kind"].is_string(), "{}", t.name);
                 if v["kind"] != "Namespace" {
                     assert_eq!(v.pointer("/metadata/namespace").and_then(|n| n.as_str()), Some("team-a"), "{}", t.name);

@@ -596,10 +596,12 @@ impl DetailPanel {
             return;
         }
         let text = self.yaml.read(cx).value().to_string();
-        let obj: serde_json::Value = match serde_yaml_ng::from_str(&text) {
+        let obj: serde_json::Value = match crate::yaml::from_str(&text) {
             Ok(v) => v,
             Err(e) => {
-                window.push_notification(Notification::error(format!("Invalid YAML: {e}")), cx);
+                let at = e.location().map(|l| format!(" at line {}", l.line())).unwrap_or_default();
+                let msg = format!("Invalid YAML{at}: {}", crate::yaml::message(&e));
+                window.push_notification(Notification::error(msg), cx);
                 return;
             }
         };

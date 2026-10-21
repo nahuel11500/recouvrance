@@ -673,7 +673,7 @@ impl Hub {
 
     /// Save new rules.yaml text from the app: validated first, then written and applied.
     pub fn save_rules_text(&self, text: &str) -> Result<()> {
-        let parsed: rules_file::RulesFile = serde_yaml_ng::from_str(text).context("YAML")?;
+        let parsed: rules_file::RulesFile = crate::yaml::from_str(text).context("YAML")?;
         for (name, rules) in &parsed.agents {
             rules_file::apply(rules, &mut Policy::default()).with_context(|| format!("agent `{name}`"))?;
         }

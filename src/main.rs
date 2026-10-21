@@ -22,6 +22,7 @@ mod status;
 mod table;
 mod templates;
 mod ui;
+mod yaml;
 
 // Many threads allocate large, short-lived lists (huge clusters); mimalloc
 // gives that memory back where glibc malloc keeps it fragmented.

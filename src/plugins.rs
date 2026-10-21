@@ -74,7 +74,10 @@ pub fn load() -> Result<Vec<Plugin>, String> {
     match std::fs::read_to_string(path()) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
         Err(e) => Err(e.to_string()),
-        Ok(text) => serde_yaml_ng::from_str::<File>(&text).map(|f| f.plugins).map_err(|e| e.to_string()),
+        Ok(text) => crate::yaml::from_str::<File>(&text).map(|f| f.plugins).map_err(|e| {
+            let at = e.location().map(|l| format!("line {}: ", l.line())).unwrap_or_default();
+            format!("{at}{}", crate::yaml::message(&e))
+        }),
     }
 }
 
@@ -188,12 +191,12 @@ mod tests {
         );
         assert!(p.applies("deployments.apps", "deployments"));
         assert!(!p.applies("pods", "pods"));
-        let f: File = serde_yaml_ng::from_str(EXAMPLE).unwrap();
+        let f: File = crate::yaml::from_str(EXAMPLE).unwrap();
         assert_eq!(f.plugins.len(), 2);
         assert!(f.plugins[1].applies("pods", "pods"));
         assert!(f.plugins[0].read_only);
         // Older files have no read_only: their plugins count as writes.
-        let f: File = serde_yaml_ng::from_str("plugins: [{name: a, command: x}]").unwrap();
+        let f: File = crate::yaml::from_str("plugins: [{name: a, command: x}]").unwrap();
         assert!(!f.plugins[0].read_only);
     }
 
