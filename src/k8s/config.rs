@@ -178,13 +178,36 @@ fn looks_risky(texts: &[&str]) -> bool {
 
 pub async fn connect(context: String) -> Result<Client> {
     run(async move {
+        let kc = kubeconfig()?;
+        // Building the client runs the context's exec plugin. With an expired token,
+        // `kubelogin` and the like open a browser login on each run: let one run log in
+        // and cache the token, the others then find it.
+        let _login = match exec_command(&kc, &context) {
+            Some(cmd) => Some(exec_lock(cmd).lock_owned().await),
+            None => None,
+        };
         let opts = KubeConfigOptions { context: Some(context.clone()), ..Default::default() };
-        let config = Config::from_custom_kubeconfig(kubeconfig()?, &opts)
-            .await
-            .with_context(|| format!("loading context {context}"))?;
+        let config =
+            Config::from_custom_kubeconfig(kc, &opts).await.with_context(|| format!("loading context {context}"))?;
         Ok(Client::try_from(config)?)
     })
     .await
+}
+
+/// The exec plugin command line of a context's user, if it uses one.
+fn exec_command(kc: &Kubeconfig, context: &str) -> Option<String> {
+    let user = kc.contexts.iter().find(|c| c.name == context)?.context.as_ref()?.user.as_ref()?;
+    let exec = kc.auth_infos.iter().find(|a| &a.name == user)?.auth_info.as_ref()?.exec.as_ref()?;
+    let mut line = vec![exec.command.clone()?];
+    line.extend(exec.args.iter().flatten().cloned());
+    Some(line.join(" "))
+}
+
+/// One lock per exec plugin command line, so contexts that share a login wait for each other.
+fn exec_lock(cmd: String) -> Arc<tokio::sync::Mutex<()>> {
+    static LOCKS: LazyLock<std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> =
+        LazyLock::new(Default::default);
+    LOCKS.lock().unwrap_or_else(|e| e.into_inner()).entry(cmd).or_default().clone()
 }
 
 /// A private kubeconfig file, removed when this is dropped: keep it alive as long
@@ -389,5 +412,34 @@ mod kubeconfig_tests {
             .and_then(|c| c.server.clone());
         assert_eq!(server.as_deref(), Some("https://b"));
         assert_eq!(kc.current_context.as_deref(), Some("prod"));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::exec_command;
+    use kube::config::Kubeconfig;
+
+    #[test]
+    fn exec_command_of_a_context() {
+        let kc = Kubeconfig::from_yaml(
+            "
+contexts:
+- name: oidc
+  context: {cluster: c, user: me}
+- name: token
+  context: {cluster: c, user: tok}
+users:
+- name: me
+  user:
+    exec: {apiVersion: client.authentication.k8s.io/v1beta1, command: kubelogin, args: [get-token, --x=1]}
+- name: tok
+  user: {token: abc}
+",
+        )
+        .unwrap();
+        assert_eq!(exec_command(&kc, "oidc").as_deref(), Some("kubelogin get-token --x=1"));
+        assert_eq!(exec_command(&kc, "token"), None);
+        assert_eq!(exec_command(&kc, "missing"), None);
     }
 }
