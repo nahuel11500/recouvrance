@@ -577,7 +577,7 @@ impl SettingsView {
                 let _ = window;
                 v_flex()
                     .gap_2()
-                    .child(h_flex().gap_2().child(Icon::new(Lucide::Ship).size_8().text_color(theme.blue)).child(div().text_2xl().font_weight(FontWeight::BOLD).child("Recouvrance")))
+                    .child(h_flex().gap_2().child(super::logo(px(40.))).child(div().text_2xl().font_weight(FontWeight::BOLD).child("Recouvrance")))
                     .child(div().text_sm().text_color(muted).child(format!("Version {}", env!("CARGO_PKG_VERSION"))))
                     .child(div().text_sm().child("A native Kubernetes client in Rust (gpui), with a local MCP server for AI agents."))
                     .child(div().text_sm().text_color(muted).child(

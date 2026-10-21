@@ -464,7 +464,7 @@ impl AppView {
                     .gap_2()
                     .px_3()
                     .pt_3()
-                    .child(Icon::new(Lucide::Ship).size_5().text_color(cx.theme().sidebar_primary))
+                    .child(crate::ui::logo(px(22.)))
                     .child(
                         div()
                             .id("sidebar-context")
