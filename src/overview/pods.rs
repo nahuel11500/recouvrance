@@ -177,19 +177,46 @@ pub fn container(ctx: &Ctx, name: &str, cx: &App) -> AnyElement {
             .filter_map(|svc| s(svc, "/metadata/name").map(String::from))
             .collect();
         root = root.child(heading("Ports")).child(h_flex().flex_wrap().gap_3().children(ports.iter().map(|p| {
+            let port = p["containerPort"].as_u64().and_then(|n| u16::try_from(n).ok()).unwrap_or(0);
+            let protocol = p["protocol"].as_str().unwrap_or("TCP");
+            let name = p["name"].as_str().map(String::from);
+            // Port-forward is TCP only.
+            let forward = (port > 0 && protocol == "TCP").then(|| {
+                let forward = |options: bool| {
+                    let (panel, name) = (ctx.panel.clone(), name.clone());
+                    move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
+                        let _ = panel.update(cx, |p, cx| p.forward_port(port, name.as_deref(), options, window, cx));
+                    }
+                };
+                h_flex()
+                    .gap_1()
+                    .child(
+                        Button::new(("pf", port as usize))
+                            .xsmall()
+                            .outline()
+                            .icon(Lucide::ArrowRightLeft)
+                            .label("Forward")
+                            .tooltip(format!("Port-forward {port} to this machine"))
+                            .on_click(forward(false)),
+                    )
+                    .child(
+                        Button::new(("pf-opt", port as usize))
+                            .xsmall()
+                            .ghost()
+                            .icon(Lucide::Settings2)
+                            .tooltip("Forward with options: local port, address, https, open in browser")
+                            .on_click(forward(true)),
+                    )
+            });
             card(cx)
                 .w(px(260.))
                 .child(
                     div()
                         .text_xs()
                         .text_color(cx.theme().muted_foreground)
-                        .child(p["name"].as_str().unwrap_or("-").to_string()),
+                        .child(name.clone().unwrap_or_else(|| "-".into())),
                 )
-                .child(div().child(format!(
-                    "{}/{}",
-                    p["containerPort"].as_i64().unwrap_or(0),
-                    p["protocol"].as_str().unwrap_or("TCP")
-                )))
+                .child(h_flex().justify_between().child(div().child(format!("{port}/{protocol}"))).children(forward))
                 .when(!services.is_empty(), |d| {
                     d.child(div().pt_1().text_xs().text_color(cx.theme().muted_foreground).child("Services"))
                         .children(services.iter().map(|svc| ctx.link(svc.clone(), "services", svc, cx)))

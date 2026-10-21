@@ -157,7 +157,7 @@ pub fn run(path: &str, wait: Duration) -> Result<()> {
         cx.update_window(window.into(), |_, window, cx| app_view.update(cx, |a, cx| a.demo_act(act, window, cx)))?;
         pump(&mut cx, Duration::from_secs(2));
     }
-    // RECOUVRANCE_INPUT="click:x,y;key:down;key:enter;wait" drives real input events.
+    // RECOUVRANCE_INPUT="click:x,y;scroll:x,y,dy;key:down;key:enter;wait" drives real input events.
     if let Ok(script) = std::env::var("RECOUVRANCE_INPUT") {
         for step in script.split(';') {
             let input = match step.split_once(':') {
@@ -178,6 +178,19 @@ pub fn run(path: &str, wait: Duration) -> Result<()> {
                         click_count: 1,
                     });
                     vec![down, up]
+                }
+                Some(("scroll", at)) => {
+                    let n: Vec<f32> = at.split(',').map(|v| v.parse().unwrap_or(0.)).collect();
+                    let (x, y, dy) = (
+                        n.first().copied().unwrap_or(0.),
+                        n.get(1).copied().unwrap_or(0.),
+                        n.get(2).copied().unwrap_or(0.),
+                    );
+                    vec![PlatformInput::ScrollWheel(ScrollWheelEvent {
+                        position: point(px(x), px(y)),
+                        delta: ScrollDelta::Pixels(point(px(0.), px(-dy))),
+                        ..Default::default()
+                    })]
                 }
                 Some(("wait", secs)) => {
                     pump(&mut cx, Duration::from_secs(secs.parse().unwrap_or(1)));
