@@ -48,6 +48,11 @@ settings untouched.
 pods; add `RECOUVRANCE_LISTTIME=1`, `RECOUVRANCE_PROBLEMS=1`, or dry runs such as
 `RECOUVRANCE_NODESHELLDRY=<node>` (see `src/dev/smoke.rs`).
 
+**README screenshots** live on the `media` branch, so `main` stays small. Take them on a throwaway
+kind cluster with demo workloads, never a real one (names of clusters, namespaces and objects show).
+Use a scratch `XDG_CONFIG_HOME` and `XDG_DATA_HOME` too, so your settings and agent activity stay out
+of the picture.
+
 ## Testing writes
 
 Use a throwaway cluster, never a shared one:
