@@ -1,0 +1,42 @@
+[package]
+name = "recouvrance-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+# The targets build the app's parsers from their own source files (the #[path] modules), so
+# only their few dependencies are built here, not the whole app.
+[dependencies]
+libfuzzer-sys = "0.4.13"
+regex = "1"
+serde = "1"
+serde_json = "1"
+serde-saphyr = "2"
+
+# Its own workspace: the fuzz targets are not part of the app's build.
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "filter"
+path = "fuzz_targets/filter.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "quantity"
+path = "fuzz_targets/quantity.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "yaml"
+path = "fuzz_targets/yaml.rs"
+test = false
+doc = false
+bench = false

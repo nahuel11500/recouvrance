@@ -53,6 +53,21 @@ kind cluster with demo workloads, never a real one (names of clusters, namespace
 Use a scratch `XDG_CONFIG_HOME` and `XDG_DATA_HOME` too, so your settings and agent activity stay out
 of the picture.
 
+## Fuzzing
+
+`fuzz/` holds [cargo-fuzz](https://github.com/rust-fuzz/cargo-fuzz) targets for the code that reads
+untrusted text: the table filter (`filter`), Kubernetes quantities (`quantity`) and YAML (`yaml`,
+which also checks that what the YAML view writes reads back as the same value). They build the
+app's own `src/filter_syntax.rs`, `src/quantity.rs`, `src/glob.rs` and `src/yaml.rs` through
+`#[path]`, so those files may only use std, regex and serde. ClusterFuzzLite runs them
+(`.clusterfuzzlite/`, `.github/workflows/fuzz.yml`): 5 minutes on a PR that touches the code, 30
+every week. Locally, with a nightly toolchain:
+
+```sh
+cargo install cargo-fuzz
+cargo +nightly fuzz run filter -- -max_total_time=60
+```
+
 ## Testing writes
 
 Use a throwaway cluster, never a shared one:
