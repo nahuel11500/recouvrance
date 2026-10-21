@@ -56,6 +56,9 @@ jobs:
           install -Dm644 assets/recouvrance.desktop "$app/recouvrance.desktop"
           install -Dm644 assets/recouvrance.svg "$app/recouvrance.svg"
           install -Dm644 assets/recouvrance.svg "$app/usr/share/icons/hicolor/scalable/apps/recouvrance.svg"
+          for size in 16x16 24x24; do
+            install -Dm644 assets/recouvrance-small.svg "$app/usr/share/icons/hicolor/$size/apps/recouvrance.svg"
+          done
           ln -s usr/bin/recouvrance "$app/AppRun"
           curl -fsSL -o appimagetool "$APPIMAGETOOL_URL"
           curl -fsSL -o appimage-runtime "$APPIMAGE_RUNTIME_URL"
