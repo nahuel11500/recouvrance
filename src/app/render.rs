@@ -10,10 +10,13 @@ impl Render for AppView {
         // itself so Esc, Ctrl+K and the rest keep working.
         // A handle can stay focused after its element stopped being drawn, so
         // check that focus is really inside this view (or a popup over it).
+        // Dialogs and sheets draw outside this view: leave focus alone while one is
+        // open, or their inputs lose it on every frame and can't be typed in.
         let focused = window.focused(cx);
         let lost = focused.is_none()
             || (!self.focus.contains_focused(window, cx) && self.palette.is_none() && !self.ctx_open && !self.ns_open);
-        if lost || focused.as_ref() == Some(&self.focus) {
+        let overlay = window.has_active_dialog(cx) || window.has_active_sheet(cx);
+        if !overlay && (lost || focused.as_ref() == Some(&self.focus)) {
             if matches!(self.route(), Route::Resources(_)) && !self.clusters.is_empty() {
                 let table_focus = self.table.read(cx).focus_handle(cx);
                 window.focus(&table_focus, cx);
