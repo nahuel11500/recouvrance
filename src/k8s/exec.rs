@@ -627,8 +627,7 @@ fn attach_target(
         });
     };
     let streams = spec.and_then(|s| {
-        let regular = s.containers.iter().chain(s.init_containers.iter().flatten());
-        regular
+        (s.containers.iter().chain(s.init_containers.iter().flatten()))
             .find(|c| c.name == name)
             .map(|c| (c.stdin, c.tty))
             .or_else(|| s.ephemeral_containers.iter().flatten().find(|c| c.name == name).map(|c| (c.stdin, c.tty)))
