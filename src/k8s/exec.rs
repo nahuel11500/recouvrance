@@ -564,11 +564,7 @@ pub fn attach_container(
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
                         // Without a tty, output uses bare newlines.
-                        let bytes = if tty {
-                            buf[..n].to_vec()
-                        } else {
-                            String::from_utf8_lossy(&buf[..n]).replace('\n', "\r\n").into_bytes()
-                        };
+                        let bytes = if tty { buf[..n].to_vec() } else { crlf(&buf[..n]) };
                         if out_tx.unbounded_send(ExecOutput::Data(bytes)).is_err() {
                             break;
                         }
@@ -619,9 +615,29 @@ pub fn attach_container(
     (guard, in_tx, out_rx)
 }
 
+/// Bare newlines as CR LF, on the bytes: a character split across two reads stays whole.
+fn crlf(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len() + bytes.len() / 16);
+    for &b in bytes {
+        if b == b'\n' {
+            out.push(b'\r');
+        }
+        out.push(b);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{copy_capped, read_capped};
+    use super::{copy_capped, crlf, read_capped};
+
+    #[test]
+    fn newlines_keep_split_characters() {
+        let text = "é\nok\n".as_bytes();
+        // "é" is two bytes; each half goes through on its own.
+        let joined = [crlf(&text[..1]), crlf(&text[1..])].concat();
+        assert_eq!(String::from_utf8(joined).unwrap(), "é\r\nok\r\n");
+    }
 
     #[tokio::test]
     async fn reads_are_capped_but_drained() {
