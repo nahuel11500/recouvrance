@@ -257,6 +257,11 @@ impl ResourceTable {
 
     /// Columns from the server. A relist sends the same ones again: keep the
     /// order, sort and usage columns the table has then.
+    /// The columns the server sent for this kind.
+    pub fn defs(&self) -> Arc<Vec<ColumnDef>> {
+        self.defs.clone()
+    }
+
     pub fn update_columns(&mut self, defs: Arc<Vec<ColumnDef>>) {
         if !self.cols.is_empty() && same_names(&self.defs, &defs) {
             self.set_defs(defs);
