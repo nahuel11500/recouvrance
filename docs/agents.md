@@ -29,7 +29,8 @@ Each agent has rules, like Kubernetes RBAC with an effect:
 | Contexts | `eu-*`, `staging` |
 | Names | `web-*`, `*` |
 
-**Deny wins, then Ask me, then Allow; anything no rule matches is denied.** Presets get you
+**Deny wins, then Ask me, then Allow; anything no rule matches is denied.** A Deny limited to some
+names hides those objects from lists rather than refusing the whole list. Presets get you
 started, rules can expire (e.g. "Allow for 1h" on an approval), a per-agent rate limit caps calls
 per minute, *Test access* shows the verdict for any request and which rule decided, and approval
 banners show the request with its key arguments (command, the whole patch, replicas, action, dry
