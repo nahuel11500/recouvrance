@@ -25,6 +25,7 @@ mod discovery;
 mod exec;
 mod forward;
 pub(crate) mod lists;
+pub(crate) mod meter;
 mod metrics;
 pub(crate) mod names;
 mod pods;

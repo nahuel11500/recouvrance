@@ -19,6 +19,9 @@
   matrix for the namespace.
 - **Problems**: one list of what is broken across clusters (crash loops, pending pods, unavailable workloads, NotReady nodes, failed jobs, pending volumes).
 - **Overviews**: cluster capacity and health, workloads status, Helm releases (values masked; install from your repos, roll back and uninstall through your `helm` CLI).
+- **API requests** (Settings → API requests): per cluster, how many requests of each kind
+  (discovery, lists, watches, metrics, logs, shells, writes) were made, how many failed, and how
+  long the API server took to start answering: average, slowest, last.
 - **Favorites** and **saved views** (type + namespaces + filter, bookmark button), back/forward history, light and dark themes.
 - **Bulk actions**: check rows, then restart, scale, delete or copy names. Scaling needs the number
   of objects typed (the replica count is never suggested), deleting asks as set for the kind (see
