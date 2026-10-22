@@ -346,6 +346,8 @@ pub struct AppView {
     kind_clusters: HashMap<String, Vec<usize>>,
     /// Clusters whose initial list is still arriving.
     listing: HashSet<usize>,
+    /// Clusters that refused to list the kind (403).
+    refused: HashSet<usize>,
     /// Latest rows per cluster, merged into the table.
     rows_by_ctx: Vec<Vec<Arc<k8s::Row>>>,
     /// Lists shown recently, shown again at once when you come back to them.
@@ -567,6 +569,7 @@ impl AppView {
             views: Default::default(),
             view_key: None,
             listing: HashSet::new(),
+            refused: HashSet::new(),
             kinds: Vec::new(),
             kind: None,
             namespace: None,

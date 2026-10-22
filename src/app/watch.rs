@@ -69,6 +69,7 @@ impl AppView {
         // Wait only for the clusters that serve this kind: the others never report.
         let serving = self.kind_clusters.get(&kind.key()).cloned();
         self.listing = (0..self.clusters.len()).filter(|ix| serving.as_ref().is_none_or(|s| s.contains(ix))).collect();
+        self.refused.clear();
         let loading = !self.listing.is_empty();
         self.table.update(cx, |t, _| {
             let d = t.delegate_mut();
@@ -282,11 +283,14 @@ impl AppView {
                 let name = self.clusters.get(ctx).map(|c| c.0.clone()).unwrap_or_default();
                 self.status = Some(format!("{name}: your access does not allow listing this type ({e})").into());
                 self.listing.remove(&ctx);
+                self.refused.insert(ctx);
                 if self.listing.is_empty() {
+                    // Forbidden only when every cluster watched refused, whichever answers last.
+                    let all = self.refused.len() >= self.watch.as_ref().map_or(0, Vec::len);
                     self.table.update(cx, |t, _| {
                         let d = t.delegate_mut();
                         d.loading = false;
-                        d.forbidden = true;
+                        d.forbidden = all;
                     });
                 }
             }
