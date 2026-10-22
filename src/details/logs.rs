@@ -253,15 +253,23 @@ impl LogsView {
 
     /// New lines from pod `ix`: only they are filtered and searched.
     fn add_lines(&mut self, ix: usize, lines: Vec<String>, cx: &mut Context<Self>) {
-        // Where the reader is, to keep it on the same lines after a drop.
-        let view = (self.wrap_list.logical_scroll_top(), self.buf.hits().get(self.find_cur).copied());
+        // Where the reader is, to keep it on the same lines when rows move: the top row
+        // of each list and the current hit's row.
+        let top = self.wrap_list.logical_scroll_top();
+        let uniform_top = self.uniform_top();
+        let hit = self.buf.hits().get(self.find_cur).copied();
+        let mut rows = [Some(top.item_ix), uniform_top, hit];
         let before = self.buf.shown_len();
-        let pushed = self.buf.push(ix, lines);
+        let pushed = self.buf.push_keeping(ix, lines, &mut rows);
         let count = self.buf.shown_len();
         if pushed.dropped_rows > 0 || pushed.merged {
             // Rows moved: their measured heights no longer apply; put the view back.
             self.wrap_list.reset(count);
-            self.shift_rows(pushed.dropped_rows, view);
+            let [wrap_row, uniform_row, hit_row] = rows;
+            if hit.is_some() {
+                self.find_cur = hit_at(self.buf.hits(), hit_row.unwrap_or(0));
+            }
+            self.keep_view(top, wrap_row, uniform_top.map(|before| (before, uniform_row.unwrap_or(0))));
         } else {
             // Appended (or rows after `first_row` refiltered): measured rows above stay.
             let from = pushed.first_row.min(before);
@@ -270,26 +278,29 @@ impl LogsView {
         self.after_rows_changed(cx);
     }
 
-    /// After `shifted` shown rows were dropped from the front (or the wrapped list was
-    /// remeasured): keep the view on the same lines and the current find match on the
-    /// same line. `view` is the wrapped list's scroll top and the current hit's row,
-    /// both from before.
-    pub(super) fn shift_rows(&mut self, shifted: usize, view: (ListOffset, Option<usize>)) {
-        let (top, cur_row) = view;
-        if let Some(row) = cur_row {
-            self.find_cur = shifted_hit(self.buf.hits(), row, shifted);
-        }
+    /// The row at the top of the (unwrapped) list, from its scroll offset.
+    fn uniform_top(&self) -> Option<usize> {
+        let h = self.scroll.0.borrow().last_item_size.map(|s| s.item.height)?;
+        let offset = self.scroll.0.borrow().base_handle.offset();
+        (h > px(0.)).then(|| (-offset.y / h).max(0.) as usize)
+    }
+
+    /// After rows moved (lines merged in or dropped): keep the view on the same lines.
+    /// `top` is the wrapped list's scroll top from before and `wrap_row` its row now
+    /// (None when that line went away); `uniform` the unwrapped list's top row before
+    /// and now.
+    pub(super) fn keep_view(&mut self, top: ListOffset, wrap_row: Option<usize>, uniform: Option<(usize, usize)>) {
         if self.follow {
             return;
         }
         let height = self.scroll.0.borrow().last_item_size.map(|s| s.item.height);
-        if let Some(h) = height {
+        if let (Some(h), Some((before, now))) = (height, uniform) {
             let base = self.scroll.0.borrow().base_handle.clone();
             let mut offset = base.offset();
-            offset.y = (offset.y + h * shifted as f32).min(px(0.));
+            offset.y = (offset.y - h * (now as f32 - before as f32)).min(px(0.));
             base.set_offset(offset);
         }
-        let (item_ix, offset_in_item) = match top.item_ix.checked_sub(shifted) {
+        let (item_ix, offset_in_item) = match wrap_row {
             Some(ix) => (ix, top.offset_in_item),
             None => (0, px(0.)),
         };
