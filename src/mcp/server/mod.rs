@@ -240,6 +240,22 @@ fn manifest_summary(planned: &[(Kind, Option<String>, String, serde_json::Value)
     out
 }
 
+/// What the activity log keeps of a manifest: each object, with a hash of its content
+/// as the banner shows it (a Secret's values masked).
+fn manifest_objects(planned: &[(Kind, Option<String>, String, serde_json::Value)]) -> Vec<String> {
+    use sha2::Digest as _;
+    planned
+        .iter()
+        .map(|(kind, ns, name, doc)| {
+            let secret = kind.is("", "Secret") || is_secret_object(doc);
+            let yaml = k8s::to_yaml(doc, secret, false).unwrap_or_default();
+            let hash: String = sha2::Sha256::digest(yaml.as_bytes())[..6].iter().map(|b| format!("{b:02x}")).collect();
+            let ns = ns.as_ref().map(|n| format!("{n}/")).unwrap_or_default();
+            format!("{} {ns}{name} sha256:{hash}", kind.ar.kind)
+        })
+        .collect()
+}
+
 /// Namespaces, sorted, of the pods a drain would evict (`k8s::drain` leaves DaemonSet,
 /// static, finished and unmanaged pods alone) for which `denied(namespace, name)` holds.
 fn denied_namespaces(pods: &[serde_json::Value], denied: impl Fn(&str, &str) -> bool) -> Vec<String> {
@@ -309,13 +325,21 @@ impl KubeMcp {
     /// Agent access is on and this agent still enabled: checked when a call starts,
     /// after waiting for approval, and before each change.
     fn ensure_active(&self, call: &Call) -> Result<(), String> {
+        match self.inactive(call) {
+            Some(reason) => Err(call.deny(reason)),
+            None => Ok(()),
+        }
+    }
+
+    /// Why calls are refused now, if they are.
+    fn inactive(&self, call: &Call) -> Option<&'static str> {
         if !self.hub.agents_enabled() {
-            return Err(call.deny("agent access is switched off in Recouvrance"));
+            return Some("agent access is switched off in Recouvrance");
         }
         if !self.hub.agent(&call.agent.id).is_some_and(|a| a.enabled) {
-            return Err(call.deny("this agent is disabled"));
+            return Some("this agent is disabled");
         }
-        Ok(())
+        None
     }
 
     /// Evaluate one access request; Ask waits for the user.
@@ -888,6 +912,16 @@ mod tests {
         assert!(s.contains("ConfigMap app/cfg") && s.contains("Secret app/db"), "{s}");
         assert!(s.contains("mode: debug"), "{s}");
         assert!(s.contains("config:") && !s.contains("example-value"), "{s}");
+        // The log keeps each object and a hash of its masked content.
+        let objects = manifest_objects(&planned);
+        assert_eq!(objects.len(), 2);
+        assert!(objects[0].starts_with("ConfigMap app/cfg sha256:") && objects[1].starts_with("Secret app/db sha256:"));
+        let mut changed = planned.clone();
+        changed[0].3["data"]["mode"] = json!("info");
+        assert_ne!(manifest_objects(&changed)[0], objects[0]);
+        // A Secret's values are masked before hashing: they leave no trace.
+        changed[1].3["stringData"]["config"] = json!("other-value");
+        assert_eq!(manifest_objects(&changed)[1], objects[1]);
     }
 
     #[test]
