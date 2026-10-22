@@ -868,10 +868,18 @@ pub async fn list_labels(
     .await
 }
 
-/// Names (and namespaces) of every object of a kind, from metadata only.
-pub async fn list_names(client: Client, ar: ApiResource) -> Result<Vec<(Option<String>, String)>> {
+/// Names (and namespaces) of every object of a kind, in `namespace` or everywhere,
+/// from metadata only.
+pub async fn list_names(
+    client: Client,
+    ar: ApiResource,
+    namespace: Option<String>,
+) -> Result<Vec<(Option<String>, String)>> {
     run(async move {
-        let api: Api<DynamicObject> = Api::all_with(client, &ar);
+        let api: Api<DynamicObject> = match &namespace {
+            Some(ns) => Api::namespaced_with(client, ns, &ar),
+            None => Api::all_with(client, &ar),
+        };
         let list = api.list_metadata(&ListParams::default()).await?;
         Ok(list.items.into_iter().filter_map(|o| Some((o.metadata.namespace, o.metadata.name?))).collect())
     })

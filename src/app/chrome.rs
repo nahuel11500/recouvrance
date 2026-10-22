@@ -119,7 +119,7 @@ impl AppView {
                     let Some(kind) = k8s::find_kind(&self.kinds, kind_name).cloned() else { continue };
                     let (client, palette, done) = (client.clone(), palette.downgrade(), done.clone());
                     self._index_tasks.push(cx.spawn(async move |this, cx| {
-                        let names = k8s::list_names(client, kind.ar.clone()).await.unwrap_or_default();
+                        let names = k8s::list_names(client, kind.ar.clone(), None).await.unwrap_or_default();
                         let entries: Vec<IndexEntry> = names
                             .into_iter()
                             .map(|(namespace, name)| IndexEntry {

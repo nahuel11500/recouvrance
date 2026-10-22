@@ -441,7 +441,7 @@ impl KubeMcp {
             {
                 continue;
             }
-            for (ns, obj) in k8s::list_names(client.clone(), kind.ar.clone()).await.unwrap_or_default() {
+            for (ns, obj) in k8s::list_names(client.clone(), kind.ar.clone(), None).await.unwrap_or_default() {
                 if !obj.to_lowercase().contains(&q) {
                     continue;
                 }
