@@ -27,6 +27,8 @@ pub struct AssistantView {
     entries: Vec<Entry>,
     input: Entity<InputState>,
     key_input: Entity<InputState>,
+    /// Why the API key could not be saved, shown under the field.
+    setup_error: Option<String>,
     busy: bool,
     started: Option<std::time::Instant>,
     /// Tool results expanded in the transcript, by (entry, step).
@@ -63,6 +65,7 @@ impl AssistantView {
             entries: Vec::new(),
             input,
             key_input,
+            setup_error: None,
             busy: false,
             started: None,
             open: Default::default(),
@@ -160,12 +163,12 @@ impl AssistantView {
                     .child(div().flex_1().child(Input::new(&self.key_input)))
                     .child(Button::new("save-key").primary().label("Save").on_click(cx.listener(|this, _, _, cx| {
                         let key = this.key_input.read(cx).value().to_string();
-                        if let Err(e) = assistant::save_api_key(&key) {
-                            this.entries.push(Entry::Error(e.to_string()));
-                        }
+                        this.setup_error =
+                            assistant::save_api_key(&key).err().map(|e| format!("Could not save the key: {e}"));
                         cx.notify();
                     }))),
             )
+            .children(self.setup_error.clone().map(|e| div().text_sm().text_color(theme.danger).child(e)))
             .child(div().text_xs().text_color(muted).child("Stored in ~/.config/recouvrance/anthropic-key (readable only by you). ANTHROPIC_API_KEY works too."))
             .into_any_element()
     }
