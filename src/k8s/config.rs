@@ -197,7 +197,9 @@ pub async fn connect(context: String) -> Result<Client> {
         // NAT), a request would wait forever. This bounds the wait for the response headers;
         // watches, logs and shells stream after that and are not cut.
         let timeout = tower::timeout::TimeoutLayer::new(REQUEST_TIMEOUT);
-        Ok(kube::client::ClientBuilder::try_from(config)?.with_layer(&timeout).build())
+        // Outside the timeout, so a request it cuts is counted as failed.
+        let meter = meter::MeterLayer { context: context.clone() };
+        Ok(kube::client::ClientBuilder::try_from(config)?.with_layer(&timeout).with_layer(&meter).build())
     })
     .await
 }

@@ -19,6 +19,9 @@
   matrix for the namespace.
 - **Problems**: one list of what is broken across clusters (crash loops, pending pods, unavailable workloads, NotReady nodes, failed jobs, pending volumes).
 - **Overviews**: cluster capacity and health, workloads status, Helm releases (values masked; install from your repos, roll back and uninstall through your `helm` CLI).
+- **API requests** (Settings → API requests): per cluster, how many requests of each kind
+  (discovery, lists, watches, metrics, logs, shells, writes) were made, how many failed, and how
+  long the API server took to start answering: average, slowest, last.
 - **Favorites** and **saved views** (type + namespaces + filter, bookmark button), back/forward history, light and dark themes.
 - **Instant back**: the last 8 lists (up to 10,000 rows in all) are kept, so going back to one
   shows it at once, marked "Updating…", while a fresh list loads and replaces it in one go.
