@@ -52,15 +52,18 @@ pub fn save_api_key(key: &str) -> std::io::Result<()> {
 /// The main agent (created read-only, never Secrets, the first time) and its token.
 /// It is the agent named "Claude" only: another agent's token is never rotated for it.
 pub fn main_agent(hub: &Hub) -> Result<(String, String)> {
-    let existing = hub.config().agents.iter().find(|a| a.name == AGENT_NAME).map(|a| a.id.clone());
+    let existing = main_agent_id(hub);
     let saved =
         read_secret("main-agent").and_then(|s| s.split_once(' ').map(|(id, t)| (id.to_string(), t.to_string())));
     match (existing, saved) {
-        (Some(id), Some((sid, token))) if id == sid => Ok((id, token)),
+        // The saved token is used only while it is still this agent's ("New token" replaces it).
+        (Some(id), Some((sid, token))) if id == sid && hub.agent_by_token(&token).is_some_and(|a| a.id == id) => {
+            Ok((id, token))
+        }
         (Some(id), _) => {
             // The token is only stored hashed: issue a new one (Connect Claude Code updates it there).
             let token = hub.rotate_token(&id)?;
-            write_secret("main-agent", &format!("{id} {token}"))?;
+            save_main_token(&id, &token)?;
             Ok((id, token))
         }
         (None, _) => {
@@ -69,10 +72,26 @@ pub fn main_agent(hub: &Hub) -> Result<(String, String)> {
                 a.policy.rules[0].contexts = vec!["*".into()];
                 a.policy.rules[0].note = "Read everything (allow more below)".into();
             })?;
-            write_secret("main-agent", &format!("{} {token}", agent.id))?;
+            save_main_token(&agent.id, &token)?;
             Ok((agent.id, token))
         }
     }
+}
+
+fn main_agent_id(hub: &Hub) -> Option<String> {
+    hub.config().agents.iter().find(|a| a.name == AGENT_NAME).map(|a| a.id.clone())
+}
+
+/// After "New token" on the Agents page: the main agent's new token is the one the assistant uses.
+pub fn token_rotated(hub: &Hub, id: &str, token: &str) -> std::io::Result<()> {
+    if main_agent_id(hub).as_deref() != Some(id) {
+        return Ok(());
+    }
+    save_main_token(id, token)
+}
+
+fn save_main_token(id: &str, token: &str) -> std::io::Result<()> {
+    write_secret("main-agent", &format!("{id} {token}"))
 }
 
 pub fn agent_token(hub: &Hub) -> Result<String> {
