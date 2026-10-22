@@ -2,7 +2,7 @@
 //! cursor: scalar fields become inputs, objects and lists open as sub-forms.
 //! "Write to YAML" puts the values changed in the form back into the document (found
 //! again by apiVersion, kind and name; comments in it are lost). Lists of strings or
-//! integers are edited one item per line.
+//! integers are edited one item per line; strings with line breaks get several lines.
 
 use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -33,6 +33,8 @@ impl ValueInput {
 enum Row {
     /// A value, and its text as loaded: only rows whose text changed are written.
     Scalar(Field, ValueInput, String),
+    /// A list whose items have line breaks: one item per line would split them.
+    Fixed(Field),
     /// An object or map: opened as its own form.
     Object(Field),
     /// A list of objects: its items open as forms.
@@ -127,6 +129,8 @@ fn typed(type_name: &str, text: &str) -> Option<Value> {
         return None;
     }
     Some(match type_name {
+        // A multi-line string (a script, a query) is kept exactly, final line break included.
+        "string" if t.contains('\n') => text.into(),
         "integer" => t.parse::<i64>().map(Value::from).unwrap_or_else(|_| t.into()),
         "number" => t.parse::<f64>().map(Value::from).unwrap_or_else(|_| t.into()),
         // Anything else is kept as typed, for the server to refuse.
@@ -147,6 +151,11 @@ fn typed(type_name: &str, text: &str) -> Option<Value> {
         ),
         _ => t.into(),
     })
+}
+
+/// Whether a list can be edited one item per line: none of its items has a line break.
+fn one_item_per_line(v: Option<&Value>) -> bool {
+    v.and_then(Value::as_array).is_none_or(|a| a.iter().all(|x| !x.as_str().is_some_and(|s| s.contains('\n'))))
 }
 
 fn is_scalar(type_name: &str) -> bool {
@@ -238,11 +247,13 @@ impl SchemaForm {
         let here = self.doc.pointer(&pointer(&self.path)).cloned().unwrap_or(Value::Null);
         for f in x.children {
             let value = here.get(&f.name);
-            if is_scalar(&f.type_name) {
+            if f.type_name.starts_with("[]") && is_scalar(&f.type_name) && !one_item_per_line(value) {
+                self.rows.push(Row::Fixed(f));
+            } else if is_scalar(&f.type_name) {
                 let text = scalar_text(value);
                 let hint = if f.enum_values.is_empty() { f.type_name.clone() } else { f.enum_values.join(" | ") };
-                let input = if f.type_name.starts_with("[]") {
-                    let hint = format!("{hint}, one item per line");
+                let input = if f.type_name.starts_with("[]") || text.contains('\n') {
+                    let hint = if f.type_name.starts_with("[]") { format!("{hint}, one item per line") } else { hint };
                     ValueInput::Lines(cx.new(|cx| {
                         let mut s = TextareaState::new(window, cx).auto_grow(1, 8).placeholder(hint);
                         s.set_value(text.clone(), window, cx);
@@ -453,6 +464,11 @@ impl Render for SchemaForm {
                                 ValueInput::Lines(i) => Textarea::new(i).small().into_any_element(),
                             }))
                             .into_any_element(),
+                        Row::Fixed(f) => h_flex()
+                            .gap_2()
+                            .child(label(f))
+                            .child(div().text_sm().text_color(muted).child("Items with line breaks: edit in the YAML"))
+                            .into_any_element(),
                         Row::Object(f) => {
                             let mut path = self.path.clone();
                             path.push(f.name.clone());
@@ -563,6 +579,17 @@ mod tests {
         assert_eq!(typed("boolean", "FALSE"), Some(serde_json::json!(false)));
         assert_eq!(typed("string", " "), None);
         assert_eq!(typed("int-or-string", "http"), Some(serde_json::json!("http")));
+    }
+
+    #[test]
+    fn multi_line_strings_are_kept() {
+        use super::{one_item_per_line, scalar_text, typed};
+        let expr = serde_json::json!("sum(rate(x[5m]))\n  > 0\n");
+        assert_eq!(typed("string", &scalar_text(Some(&expr))), Some(expr.clone()));
+        assert_eq!(typed("string", " one line "), Some(serde_json::json!("one line")));
+        assert!(one_item_per_line(Some(&serde_json::json!(["a", "b"]))));
+        assert!(one_item_per_line(None));
+        assert!(!one_item_per_line(Some(&serde_json::json!(["set -e\necho hi\n"]))));
     }
 
     #[test]
