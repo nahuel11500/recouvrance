@@ -345,10 +345,28 @@ pub(super) fn route(ctx: &Ctx, cx: &App) -> Div {
         .children(rules)
 }
 
+/// A label selector's terms: `matchLabels` as "key: value", then `matchExpressions`
+/// as kubectl writes them ("tier in (db, cache)", "!canary"). Empty selects everything.
+fn selector_terms(v: &Value, path: &str) -> Vec<String> {
+    let mut out = pairs(v, &format!("{path}/matchLabels"));
+    for e in arr(v, &format!("{path}/matchExpressions")) {
+        let key = e["key"].as_str().unwrap_or_default();
+        let values: Vec<&str> = arr(e, "/values").iter().filter_map(Value::as_str).collect();
+        out.push(match e["operator"].as_str().unwrap_or_default() {
+            "In" => format!("{key} in ({})", values.join(", ")),
+            "NotIn" => format!("{key} notin ({})", values.join(", ")),
+            "Exists" => key.to_string(),
+            "DoesNotExist" => format!("!{key}"),
+            op => format!("{key} {op} ({})", values.join(", ")),
+        });
+    }
+    out
+}
+
 pub(super) fn netpol(ctx: &Ctx, cx: &App) -> Div {
     let obj = ctx.obj;
     let muted = cx.theme().muted_foreground;
-    let selector = pairs(obj, "/spec/podSelector/matchLabels");
+    let selector = selector_terms(obj, "/spec/podSelector");
     let types: Vec<&str> = arr(obj, "/spec/policyTypes").iter().filter_map(Value::as_str).collect();
     let peer = |p: &Value| -> String {
         if let Some(c) = p.pointer("/ipBlock/cidr").and_then(Value::as_str) {
@@ -363,12 +381,12 @@ pub(super) fn netpol(ctx: &Ctx, cx: &App) -> Div {
                 format!("CIDR {c} except {}", except.join(", "))
             };
         }
-        let ns = pairs(p, "/namespaceSelector/matchLabels");
-        let pods = pairs(p, "/podSelector/matchLabels");
+        let ns = selector_terms(p, "/namespaceSelector");
+        let pods = selector_terms(p, "/podSelector");
         match (p.get("namespaceSelector").is_some(), p.get("podSelector").is_some()) {
             (true, true) => format!(
                 "pods [{}] in namespaces [{}]",
-                pods.join(", "),
+                if pods.is_empty() { "all".into() } else { pods.join(", ") },
                 if ns.is_empty() { "all".into() } else { ns.join(", ") }
             ),
             (true, false) => format!("namespaces [{}]", if ns.is_empty() { "all".into() } else { ns.join(", ") }),
@@ -435,4 +453,20 @@ pub(super) fn netpol(ctx: &Ctx, cx: &App) -> Div {
         )
         .child(section("Ingress", "ingress", "from", "All incoming traffic is denied."))
         .child(section("Egress", "egress", "to", "All outgoing traffic is denied."))
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    #[test]
+    fn selector_terms_include_expressions() {
+        let p = json!({"podSelector": {"matchLabels": {"app": "web"}, "matchExpressions": [
+            {"key": "tier", "operator": "In", "values": ["db", "cache"]},
+            {"key": "canary", "operator": "DoesNotExist"}]}});
+        assert_eq!(super::selector_terms(&p, "/podSelector"), ["app: web", "tier in (db, cache)", "!canary"]);
+        let only = json!({"podSelector": {"matchExpressions": [{"key": "tier", "operator": "Exists"}]}});
+        assert_eq!(super::selector_terms(&only, "/podSelector"), ["tier"]);
+        assert!(super::selector_terms(&json!({"podSelector": {}}), "/podSelector").is_empty());
+    }
 }
