@@ -584,6 +584,11 @@ fn upgrade_text(reveal: bool, edited: &str, values: &Value) -> Option<String> {
     (reveal && !placeholder).then(|| edited.to_string())
 }
 
+/// The newest revision in `history`, when it is newer than `current`.
+fn newer_revision(current: i64, history: &[Release]) -> Option<&Release> {
+    history.iter().max_by_key(|r| r.revision).filter(|r| r.revision > current)
+}
+
 /// The chart references (`repo/chart`) from `helm search repo -o json` naming exactly `chart`.
 fn chart_refs(search_json: &str, chart: &str) -> Vec<String> {
     let suffix = format!("/{chart}");
@@ -642,11 +647,17 @@ impl HelmRelease {
         }
     }
 
-    fn reload_history(&mut self, cx: &mut Context<Self>) {
+    /// After a write: the history again, and the page on the newest revision (an upgrade
+    /// or rollback makes one), so its values are what the next upgrade starts from.
+    fn reload_history(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let (client, ns, name) = (self.client.clone(), self.release.namespace.clone(), self.release.name.clone());
-        self._task = cx.spawn(async move |this, cx| {
+        self._task = cx.spawn_in(window, async move |this, cx| {
             let result = history(client, ns, name).await;
-            let _ = this.update(cx, |this, cx| {
+            let _ = this.update_in(cx, |this, window, cx| {
+                if let Some(newest) = result.as_ref().ok().and_then(|h| newer_revision(this.release.revision, h)) {
+                    this.release = Release { context: this.release.context.clone(), ..newest.clone() };
+                    this.set_reveal(this.reveal, window, cx);
+                }
                 this.history = Some(result.map_err(|e| format!("{e:#}").into()));
                 cx.notify();
             });
@@ -826,7 +837,7 @@ impl HelmRelease {
                 }
                 Ok(_) => {
                     window.push_notification(Notification::success("Upgraded"), cx);
-                    this.reload_history(cx);
+                    this.reload_history(window, cx);
                 }
                 Err(e) => window.push_notification(Notification::error(format!("helm upgrade failed: {e:#}")), cx),
             });
@@ -880,7 +891,7 @@ impl HelmRelease {
                                         window.push_notification(Notification::error(format!("helm failed: {e:#}")), cx)
                                     }
                                 }
-                                this.reload_history(cx);
+                                this.reload_history(window, cx);
                             });
                         })
                         .detach();
@@ -1127,8 +1138,8 @@ impl Render for HelmRelease {
 mod tests {
     // Not `super::*`: gpui's own `test` attribute would shadow the standard one.
     use super::{
-        Secret, Value, chart_refs, decode, latest_revisions, mask_manifest, mask_secrets, stub, upgrade_text,
-        values_yaml,
+        Secret, Value, chart_refs, decode, latest_revisions, mask_manifest, mask_secrets, newer_revision, stub,
+        upgrade_text, values_yaml,
     };
     use base64::Engine as _;
     use std::io::Write as _;
@@ -1260,6 +1271,23 @@ mod tests {
         assert!(upgrade_text(true, &masked, &values).is_none());
         let revealed = values_yaml(&values, true);
         assert_eq!(upgrade_text(true, &revealed, &values).as_deref(), Some(revealed.as_str()));
+    }
+
+    #[test]
+    fn moves_to_the_newest_revision() {
+        let rev = |v| {
+            decode(&helm_secret(
+                (&format!("sh.helm.release.v1.web.v{v}"), "ns", "web"),
+                &payload("web", "ns", v),
+                false,
+            ))
+            .unwrap()
+        };
+        // Rolled back from 5 to 3: Helm writes revision 6.
+        let history = vec![rev(3), rev(6), rev(5)];
+        assert_eq!(newer_revision(5, &history).map(|r| r.revision), Some(6));
+        assert!(newer_revision(6, &history).is_none());
+        assert!(newer_revision(5, &[]).is_none());
     }
 
     #[test]
