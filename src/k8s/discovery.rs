@@ -352,12 +352,14 @@ pub fn find_kind<'a>(kinds: &'a [Kind], query: &str) -> Option<&'a Kind> {
         Some((n, g)) => (n, Some(g)),
         None => (q, None),
     };
-    // Prefer core and well-known kinds when a name is ambiguous.
-    kinds.iter().find(|k| {
+    let matches = |k: &&Kind| {
         let names_match =
             k.ar.plural.to_lowercase() == name || k.ar.kind.to_lowercase() == name || k.label.to_lowercase() == name;
         names_match && group.is_none_or(|g| k.ar.group.to_lowercase() == g)
-    })
+    };
+    // Prefer core and well-known kinds when a name is ambiguous (`svc` is the Service, not
+    // Knative's): sidebar order alone puts a custom resource first when its section is earlier.
+    kinds.iter().filter(|k| !is_custom(k)).find(matches).or_else(|| kinds.iter().find(matches))
 }
 
 #[cfg(test)]
