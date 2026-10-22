@@ -319,11 +319,18 @@ impl Tbl {
 }
 
 /// kubectl's table for a kind, or why it could not be listed ("forbidden", "failed: …").
-async fn table(client: Client, ar: kube::discovery::ApiResource, ns: Option<String>) -> Result<Tbl, String> {
+/// A kind's rows for its counts; `with_namespaces` when each row needs its namespace too.
+async fn table(
+    client: Client,
+    ar: kube::discovery::ApiResource,
+    ns: Option<String>,
+    with_namespaces: bool,
+) -> Result<Tbl, String> {
     #[cfg(feature = "dev")]
     let (started, plural) = (std::time::Instant::now(), ar.plural.clone());
     let kind = k8s::Kind { ar, namespaced: true, section: "", label: String::new() };
-    let result = k8s::list_table(client, kind, ns, None, None).await;
+    // Counts and restarts need only the cells: big lists come without their objects.
+    let result = k8s::list_light(client, kind, ns, with_namespaces).await;
     #[cfg(feature = "dev")]
     if std::env::var("RECOUVRANCE_DEBUG").is_ok() {
         eprintln!("table {plural}: {:?} rows={:?}", started.elapsed(), result.as_ref().map(|r| r.1.len()));
@@ -478,7 +485,7 @@ async fn load(client: Client, ns: Option<String>, context: String, tx: futures::
     let slot = |kind: &str| SLOTS.iter().position(|(_, k)| *k == kind).unwrap_or(0);
 
     let pods = async {
-        let t = match table(c(), k8s::ar_of::<core::Pod>(), ns.clone()).await {
+        let t = match table(c(), k8s::ar_of::<core::Pod>(), ns.clone(), true).await {
             Ok(t) => t,
             Err(e) => {
                 send(Piece::Kind(slot("pods"), Err(e.clone())));
@@ -506,7 +513,7 @@ async fn load(client: Client, ns: Option<String>, context: String, tx: futures::
         let client = c();
         let ns = ns.clone();
         async move {
-            let t = table(client, ar, ns).await;
+            let t = table(client, ar, ns, false).await;
             send(Piece::Kind(
                 slot(kind),
                 t.map(|t| {
@@ -522,7 +529,7 @@ async fn load(client: Client, ns: Option<String>, context: String, tx: futures::
         let client = c();
         let ns = ns.clone();
         async move {
-            let t = table(client, ar, ns).await;
+            let t = table(client, ar, ns, false).await;
             send(Piece::Kind(
                 slot(kind),
                 t.map(|t| {
@@ -542,7 +549,7 @@ async fn load(client: Client, ns: Option<String>, context: String, tx: futures::
         send(Piece::Kind(slot("secrets"), releases.map(|r| helm_counts(&r))));
     };
     let cronjobs = async {
-        let t = table(c(), k8s::ar_of::<batch::CronJob>(), ns.clone()).await;
+        let t = table(c(), k8s::ar_of::<batch::CronJob>(), ns.clone(), false).await;
         send(Piece::Kind(
             slot("cronjobs"),
             t.map(|t| {
@@ -557,7 +564,7 @@ async fn load(client: Client, ns: Option<String>, context: String, tx: futures::
         ));
     };
     let jobs = async {
-        let t = table(c(), k8s::ar_of::<batch::Job>(), ns.clone()).await;
+        let t = table(c(), k8s::ar_of::<batch::Job>(), ns.clone(), false).await;
         send(Piece::Kind(
             slot("jobs"),
             t.map(|t| {
@@ -596,7 +603,7 @@ async fn load(client: Client, ns: Option<String>, context: String, tx: futures::
         ));
     };
     let pvcs = async {
-        let t = table(c(), k8s::ar_of::<core::PersistentVolumeClaim>(), ns.clone()).await;
+        let t = table(c(), k8s::ar_of::<core::PersistentVolumeClaim>(), ns.clone(), false).await;
         send(Piece::Kind(
             slot("persistentvolumeclaims"),
             t.map(|t| {

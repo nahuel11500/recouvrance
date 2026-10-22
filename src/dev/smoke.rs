@@ -86,6 +86,15 @@ pub fn run(ctx: String) {
             println!("{:?}", k8s::trigger_cronjob_opts(client.clone(), ns.into(), name.into(), true).await);
             return;
         }
+        if std::env::var("RECOUVRANCE_EXPERIMENTS").is_ok() {
+            let c = client.clone();
+            let _ = k8s::run(async move {
+                k8s::experiments::run(c).await;
+                Ok(())
+            })
+            .await;
+            return;
+        }
         if std::env::var("RECOUVRANCE_LISTTIME").is_ok() {
             let kinds = k8s::discover(client.clone()).await.unwrap();
             let pod = k8s::find_kind(&kinds, "pods").unwrap().clone();
@@ -101,6 +110,12 @@ pub fn run(ctx: String) {
                 .unwrap()
                 .len();
             println!("plain list: {n} pods in {:?}", t.elapsed());
+            return;
+        }
+        if std::env::var("RECOUVRANCE_CLUSTERLOAD").is_ok() {
+            let t = std::time::Instant::now();
+            let running = crate::ui::cluster::debug_load(ctx.clone(), client.clone()).await;
+            println!("cluster overview load: {:?} running={running}", t.elapsed());
             return;
         }
         if std::env::var("RECOUVRANCE_DASH").is_ok() {

@@ -412,6 +412,8 @@ impl ResourceTable {
     }
 
     fn recompute(&mut self) {
+        #[cfg(feature = "dev")]
+        let _t = crate::dev::timing::span("table filter+sort");
         let filter = &self.parsed;
         // Column names as typed in filters: "restarts", "nominatednode", "cpu", "age".
         let named: Vec<(String, Col)> = if filter.has_columns() {

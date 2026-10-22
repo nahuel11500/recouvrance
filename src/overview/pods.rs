@@ -500,17 +500,69 @@ pub(super) fn probe_card(title: &str, p: &Value, cx: &App) -> Div {
         .child(body)
 }
 
+/// One line of a pods table, worked out once when the pods are loaded: a node can hold a
+/// thousand pods, and their rows are drawn again on every frame while the page scrolls.
+pub struct PodRow {
+    pub name: String,
+    pub namespace: Option<String>,
+    pub ready: usize,
+    pub total: usize,
+    pub restarts: i64,
+    pub phase: String,
+    /// Usage, requests and limits: CPU in millicores, memory in bytes.
+    pub cpu: [Option<f64>; 3],
+    pub mem: [Option<f64>; 3],
+    pub node: String,
+    pub created: Option<jiff::Timestamp>,
+}
+
+pub fn pod_rows(pods: &[Value], usage: &ContainerUsage) -> Vec<PodRow> {
+    pods.iter()
+        .map(|p| {
+            let name = s(p, "/metadata/name").unwrap_or_default().to_string();
+            let statuses = arr(p, "/status/containerStatuses");
+            let containers = arr(p, "/spec/containers");
+            let usage = usage.get(&name);
+            let sum = |f: fn(&(f64, f64)) -> f64| usage.map(|u| u.values().map(f).sum::<f64>());
+            let spec_sum = |what: &str, parse: fn(&str) -> f64| -> Option<f64> {
+                let vals: Vec<f64> =
+                    containers.iter().filter_map(|c| c.pointer(what).and_then(Value::as_str).map(parse)).collect();
+                (!vals.is_empty()).then(|| vals.iter().sum())
+            };
+            PodRow {
+                namespace: s(p, "/metadata/namespace").map(String::from),
+                ready: statuses.iter().filter(|c| c["ready"].as_bool() == Some(true)).count(),
+                total: containers.len(),
+                restarts: statuses.iter().filter_map(|c| c["restartCount"].as_i64()).sum(),
+                phase: s(p, "/status/phase").unwrap_or("Unknown").to_string(),
+                cpu: [
+                    sum(|u| u.0),
+                    spec_sum("/resources/requests/cpu", k8s::parse_cpu),
+                    spec_sum("/resources/limits/cpu", k8s::parse_cpu),
+                ],
+                mem: [
+                    sum(|u| u.1),
+                    spec_sum("/resources/requests/memory", k8s::parse_bytes),
+                    spec_sum("/resources/limits/memory", k8s::parse_bytes),
+                ],
+                node: s(p, "/spec/nodeName").unwrap_or("-").to_string(),
+                created: s(p, "/metadata/creationTimestamp").and_then(|t| t.parse().ok()),
+                name,
+            }
+        })
+        .collect()
+}
+
+/// The header of a pods table; its rows are items of the page's list (`pod_row`).
 pub(super) fn pods_table(ctx: &Ctx, cx: &App) -> AnyElement {
-    let pods = &ctx.related.pods;
-    if pods.is_empty() {
+    if ctx.related.pod_rows.is_empty() {
         return div().text_sm().text_color(cx.theme().muted_foreground).child("No pods.").into_any_element();
     }
-    let muted = cx.theme().muted_foreground;
-    let header = h_flex()
+    h_flex()
         .gap_3()
         .py_1()
         .text_xs()
-        .text_color(muted)
+        .text_color(cx.theme().muted_foreground)
         .border_b_1()
         .border_color(cx.theme().border)
         .child(div().w(px(320.)).child("Name"))
@@ -520,83 +572,44 @@ pub(super) fn pods_table(ctx: &Ctx, cx: &App) -> AnyElement {
         .child(div().w(px(150.)).child("Memory"))
         .child(div().w(px(60.)).child("Restarts"))
         .child(div().w(px(220.)).child("Node"))
-        .child(div().w(px(60.)).child("Age"));
-    let rows = pods.iter().map(|p| {
-        let name = s(p, "/metadata/name").unwrap_or_default();
-        let statuses = arr(p, "/status/containerStatuses");
-        let total = arr(p, "/spec/containers").len();
-        let ready = statuses.iter().filter(|c| c["ready"].as_bool() == Some(true)).count();
-        let restarts: i64 = statuses.iter().filter_map(|c| c["restartCount"].as_i64()).sum();
-        let phase = s(p, "/status/phase").unwrap_or("Unknown").to_string();
-        let usage = ctx.related.usage.get(name);
-        let sum = |f: fn(&(f64, f64)) -> f64| usage.map(|u| u.values().map(f).sum::<f64>());
-        let spec_sum = |what: &str, parse: fn(&str) -> f64| -> Option<f64> {
-            let vals: Vec<f64> = arr(p, "/spec/containers")
-                .iter()
-                .filter_map(|c| c.pointer(what).and_then(Value::as_str).map(parse))
-                .collect();
-            (!vals.is_empty()).then(|| vals.iter().sum())
-        };
-        let cpu = sum(|u| u.0);
-        let mem = sum(|u| u.1);
-        let node = s(p, "/spec/nodeName").unwrap_or("-").to_string();
+        .child(div().w(px(60.)).child("Age"))
+        .into_any_element()
+}
+
+pub(super) fn pod_row(ctx: &Ctx, p: &PodRow, cx: &App) -> AnyElement {
+    let theme = cx.theme();
+    let usage = |[value, request, limit]: [Option<f64>; 3], format: fn(f64) -> String, color: Hsla| {
         h_flex()
-            .gap_3()
-            .py_1()
-            .text_sm()
-            .border_b_1()
-            .border_color(cx.theme().border)
-            .child(div().w(px(320.)).child({
-                // Pods are opened in their own namespace (a node lists pods from every namespace).
-                let pod_ns = s(p, "/metadata/namespace").map(String::from);
-                let label = match (&pod_ns, ctx.ns()) {
-                    (Some(ns), None) => format!("{ns} / {name}"),
-                    _ => name.to_string(),
-                };
-                ctx.link_in(label, "pods", name, pod_ns, cx)
-            }))
-            .child(
-                div()
-                    .w(px(50.))
-                    .text_color(if ready == total { cx.theme().success } else { cx.theme().warning })
-                    .child(format!("{ready}/{total}")),
-            )
-            .child(div().w(px(110.)).text_color(state_color(&phase, cx)).child(phase))
-            .child(
-                h_flex()
-                    .w(px(150.))
-                    .gap_2()
-                    .child(div().w(px(48.)).child(cpu.map(k8s::format_cpu).unwrap_or_default()))
-                    .child(div().flex_1().child(usage_bar(
-                        cpu,
-                        spec_sum("/resources/requests/cpu", k8s::parse_cpu),
-                        spec_sum("/resources/limits/cpu", k8s::parse_cpu),
-                        cx.theme().blue,
-                        cx,
-                    ))),
-            )
-            .child(
-                h_flex()
-                    .w(px(150.))
-                    .gap_2()
-                    .child(div().w(px(48.)).child(mem.map(k8s::format_bytes).unwrap_or_default()))
-                    .child(div().flex_1().child(usage_bar(
-                        mem,
-                        spec_sum("/resources/requests/memory", k8s::parse_bytes),
-                        spec_sum("/resources/limits/memory", k8s::parse_bytes),
-                        cx.theme().success,
-                        cx,
-                    ))),
-            )
-            .child(
-                div().w(px(60.)).when(restarts > 0, |d| d.text_color(cx.theme().warning)).child(restarts.to_string()),
-            )
-            .child(div().w(px(220.)).child(ctx.link(node.clone(), "nodes", &node, cx)))
-            .child(
-                div().w(px(60.)).text_color(muted).child(age_of(p, "/metadata/creationTimestamp").unwrap_or_default()),
-            )
-    });
-    v_flex().child(header).children(rows).into_any_element()
+            .w(px(150.))
+            .gap_2()
+            .child(div().w(px(48.)).child(value.map(format).unwrap_or_default()))
+            .child(div().flex_1().child(usage_bar(value, request, limit, color, cx)))
+    };
+    // Pods are opened in their own namespace (a node lists pods from every namespace).
+    let label = match (&p.namespace, ctx.ns()) {
+        (Some(ns), None) => format!("{ns} / {}", p.name),
+        _ => p.name.clone(),
+    };
+    h_flex()
+        .gap_3()
+        .py_1()
+        .text_sm()
+        .border_b_1()
+        .border_color(theme.border)
+        .child(div().w(px(320.)).child(ctx.link_in(label, "pods", &p.name, p.namespace.clone(), cx)))
+        .child(
+            div()
+                .w(px(50.))
+                .text_color(if p.ready == p.total { theme.success } else { theme.warning })
+                .child(format!("{}/{}", p.ready, p.total)),
+        )
+        .child(div().w(px(110.)).text_color(state_color(&p.phase, cx)).child(p.phase.clone()))
+        .child(usage(p.cpu, k8s::format_cpu, theme.blue))
+        .child(usage(p.mem, k8s::format_bytes, theme.success))
+        .child(div().w(px(60.)).when(p.restarts > 0, |d| d.text_color(theme.warning)).child(p.restarts.to_string()))
+        .child(div().w(px(220.)).child(ctx.link(p.node.clone(), "nodes", &p.node, cx)))
+        .child(div().w(px(60.)).text_color(theme.muted_foreground).child(p.created.map(k8s::age).unwrap_or_default()))
+        .into_any_element()
 }
 
 /// A pod's ephemeral storage use (from the kubelet), against its limit if any.

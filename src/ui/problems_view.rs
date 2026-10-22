@@ -74,12 +74,104 @@ impl ProblemsView {
             }
         }));
     }
+
+    /// Indices in `found` of the problems shown (minor ones only when asked).
+    fn shown(&self) -> Vec<usize> {
+        let found = self.found.as_deref().unwrap_or_default();
+        (0..found.len()).filter(|&i| self.show_info || found[i].1.severity != Severity::Info).collect()
+    }
+
+    fn row(&self, i: usize, ix: usize, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme().clone();
+        let multi = self.clusters.len() > 1;
+        let (ctx, p) = &self.found.as_deref().unwrap_or_default()[ix];
+        let color = match p.severity {
+            Severity::Critical => theme.danger,
+            Severity::Warning => theme.warning,
+            Severity::Info => theme.muted_foreground,
+        };
+        let ev = OpenObject {
+            kind: p.kind.clone(),
+            name: p.name.clone(),
+            namespace: p.namespace.clone(),
+            context: Some(ctx.clone()),
+        };
+        h_flex()
+            .id(("problem", i))
+            .w_full()
+            .gap_3()
+            .px_2()
+            .py_1p5()
+            .border_b_1()
+            .border_color(theme.border)
+            .cursor_pointer()
+            .hover(|s| s.bg(theme.list_hover))
+            .on_click(cx.listener(move |_, _, _, cx| cx.emit(ev.clone())))
+            .child(div().size(px(8.)).flex_shrink_0().rounded_full().bg(color))
+            .when(multi, |d| {
+                d.child(
+                    div()
+                        .w(px(150.))
+                        .flex_shrink_0()
+                        .text_sm()
+                        .text_color(theme.muted_foreground)
+                        .overflow_hidden()
+                        .text_ellipsis()
+                        .whitespace_nowrap()
+                        .child(ctx.clone()),
+                )
+            })
+            .child(
+                div().w(px(110.)).flex_shrink_0().text_xs().text_color(theme.muted_foreground).child(p.label.clone()),
+            )
+            .child(
+                div()
+                    .w(px(180.))
+                    .flex_shrink_0()
+                    .text_sm()
+                    .text_color(theme.muted_foreground)
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .whitespace_nowrap()
+                    .child(p.namespace.clone().unwrap_or_default()),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .text_sm()
+                    .text_color(theme.blue)
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .whitespace_nowrap()
+                    .child(p.name.clone()),
+            )
+            .child(
+                div()
+                    .w(px(300.))
+                    .flex_shrink_0()
+                    .text_sm()
+                    .text_color(color)
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .whitespace_nowrap()
+                    .child(p.reason.clone()),
+            )
+            .child(
+                div()
+                    .w(px(50.))
+                    .flex_shrink_0()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child(p.age.map(k8s::age).unwrap_or_default()),
+            )
+            .into_any_element()
+    }
 }
 
 impl Render for ProblemsView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
-        let multi = self.clusters.len() > 1;
         let header = h_flex()
             .gap_3()
             .child(Icon::new(Lucide::TriangleAlert).size_5().text_color(theme.warning))
@@ -123,94 +215,7 @@ impl Render for ProblemsView {
                 .child(div().font_weight(FontWeight::BOLD).text_color(color).child(n.to_string()))
                 .child(div().text_sm().child(label.to_string()))
         };
-        let shown: Vec<(usize, &(String, Problem))> =
-            found.iter().filter(|(_, p)| self.show_info || p.severity != Severity::Info).enumerate().collect();
-        let rows = shown.into_iter().take(1000).map(|(i, (ctx, p))| {
-            let color = match p.severity {
-                Severity::Critical => theme.danger,
-                Severity::Warning => theme.warning,
-                Severity::Info => theme.muted_foreground,
-            };
-            let ev = OpenObject {
-                kind: p.kind.clone(),
-                name: p.name.clone(),
-                namespace: p.namespace.clone(),
-                context: Some(ctx.clone()),
-            };
-            h_flex()
-                .id(("problem", i))
-                .gap_3()
-                .px_2()
-                .py_1p5()
-                .border_b_1()
-                .border_color(theme.border)
-                .cursor_pointer()
-                .hover(|s| s.bg(theme.list_hover))
-                .on_click(cx.listener(move |_, _, _, cx| cx.emit(ev.clone())))
-                .child(div().size(px(8.)).flex_shrink_0().rounded_full().bg(color))
-                .when(multi, |d| {
-                    d.child(
-                        div()
-                            .w(px(150.))
-                            .flex_shrink_0()
-                            .text_sm()
-                            .text_color(theme.muted_foreground)
-                            .overflow_hidden()
-                            .text_ellipsis()
-                            .whitespace_nowrap()
-                            .child(ctx.clone()),
-                    )
-                })
-                .child(
-                    div()
-                        .w(px(110.))
-                        .flex_shrink_0()
-                        .text_xs()
-                        .text_color(theme.muted_foreground)
-                        .child(p.label.clone()),
-                )
-                .child(
-                    div()
-                        .w(px(180.))
-                        .flex_shrink_0()
-                        .text_sm()
-                        .text_color(theme.muted_foreground)
-                        .overflow_hidden()
-                        .text_ellipsis()
-                        .whitespace_nowrap()
-                        .child(p.namespace.clone().unwrap_or_default()),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .text_sm()
-                        .text_color(theme.blue)
-                        .overflow_hidden()
-                        .text_ellipsis()
-                        .whitespace_nowrap()
-                        .child(p.name.clone()),
-                )
-                .child(
-                    div()
-                        .w(px(300.))
-                        .flex_shrink_0()
-                        .text_sm()
-                        .text_color(color)
-                        .overflow_hidden()
-                        .text_ellipsis()
-                        .whitespace_nowrap()
-                        .child(p.reason.clone()),
-                )
-                .child(
-                    div()
-                        .w(px(50.))
-                        .flex_shrink_0()
-                        .text_xs()
-                        .text_color(theme.muted_foreground)
-                        .child(p.age.map(k8s::age).unwrap_or_default()),
-                )
-        });
+        let shown = self.shown().len();
         v_flex()
             .size_full()
             .p_4()
@@ -233,6 +238,18 @@ impl Render for ProblemsView {
                         .child("Nothing broken right now."),
                 )
             })
-            .child(v_flex().id("problems-list").flex_1().min_h_0().overflow_y_scroll().children(rows))
+            .child(
+                // Only the rows on screen are laid out: hundreds of problems made the page stutter.
+                uniform_list(
+                    "problems-list",
+                    shown,
+                    cx.processor(|this, range: std::ops::Range<usize>, _, cx| {
+                        let shown = this.shown();
+                        range.filter_map(|i| shown.get(i).map(|&ix| this.row(i, ix, cx))).collect()
+                    }),
+                )
+                .flex_1()
+                .min_h_0(),
+            )
     }
 }

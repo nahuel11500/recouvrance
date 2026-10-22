@@ -120,6 +120,8 @@ pub(super) struct LeanMeta {
 
 #[derive(Debug)]
 pub struct Row {
+    /// The object's uid; `namespace/name` for a row listed without its object (see
+    /// `is_partial`).
     pub uid: String,
     pub name: String,
     pub namespace: Option<String>,
@@ -134,6 +136,12 @@ pub struct Row {
 }
 
 impl Row {
+    /// Listed from its cells alone: no uid, labels or deletion time, and a creation time
+    /// read from its Age cell. Real uids never contain a `/`.
+    pub fn is_partial(&self) -> bool {
+        self.uid.contains('/')
+    }
+
     pub fn label(&self, key: &str) -> Option<&str> {
         self.labels.lines().find_map(|l| l.split_once('=').filter(|(k, _)| *k == key).map(|(_, v)| v))
     }
@@ -180,6 +188,11 @@ pub(super) fn to_row(row: ServerRow, extras: &Extras) -> Option<Arc<Row>> {
     {
         cells.extend(extras.iter().map(|(_, path)| json_path(&obj, path)));
     }
+    row_from(cells, meta)
+}
+
+/// A row from its cells and its object's metadata (None without a uid).
+fn row_from(cells: Vec<String>, meta: LeanMeta) -> Option<Arc<Row>> {
     Some(Arc::new(Row {
         uid: meta.uid?,
         name: meta.name.unwrap_or_default(),
@@ -206,6 +219,8 @@ pub(super) fn cell_text(v: &serde_json::Value) -> String {
 }
 
 pub(super) fn snapshot(rows: &HashMap<String, Arc<Row>>) -> Vec<Arc<Row>> {
+    #[cfg(feature = "dev")]
+    let _t = crate::dev::timing::span("watch snapshot (bg)");
     let mut out: Vec<Arc<Row>> = rows.values().cloned().collect();
     out.sort_by(|a, b| (&a.namespace, &a.name).cmp(&(&b.namespace, &b.name)));
     out
@@ -223,16 +238,17 @@ pub(super) async fn list_paged(
     url: &str,
     lp: ListParams,
 ) -> Result<(Vec<ColumnDef>, Vec<Arc<Row>>, String)> {
-    list_paged_with(client, url, lp, &Extras::default(), |_, _| {}).await
+    list_paged_with(client, url, lp, &Extras::default(), |_, _, _| {}).await
 }
 
-/// Like `list_paged`, calling `on_page` with the rows so far after each page.
+/// Like `list_paged`, calling `on_page` with the rows so far after each page, and whether
+/// more pages follow.
 pub(super) async fn list_paged_with(
     client: &Client,
     url: &str,
     mut lp: ListParams,
     extras: &Extras,
-    mut on_page: impl FnMut(&[ColumnDef], &[Arc<Row>]),
+    mut on_page: impl FnMut(&[ColumnDef], &[Arc<Row>], bool),
 ) -> Result<(Vec<ColumnDef>, Vec<Arc<Row>>, String)> {
     lp.limit = Some(PAGE_SIZE);
     let full = needs_full(extras);
@@ -245,14 +261,234 @@ pub(super) async fn list_paged_with(
         }
         rows.extend(page.rows.into_iter().filter_map(|r| to_row(r, extras)));
         version = page.metadata.resource_version.unwrap_or(version);
-        on_page(&defs, &rows);
-        match page.metadata.continue_.filter(|c| !c.is_empty()) {
+        let next = page.metadata.continue_.filter(|c| !c.is_empty());
+        on_page(&defs, &rows, next.is_some());
+        match next {
             Some(token) => lp.continue_token = Some(token),
             None => break,
         }
     }
     Ok((defs, rows, version))
 }
+
+/// Namespaces listed at once by `cells_by_namespace`, across all its callers (lists,
+/// problem scan, overviews), to stay gentle with the API server.
+const FAST_PARALLEL: usize = 32;
+static FAST_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(FAST_PARALLEL);
+
+/// A big list's rows without their objects, one namespace at a time, many at once, from the
+/// API server's cache. The objects' metadata (managedFields above all) is most of a list's
+/// bytes: on a cluster with 23k pods, 160 MB against 6 MB, so this shows the whole list in
+/// about 2 s where the full one takes 8 to 10 s over a laptop's link. Rows have no uid,
+/// labels or creation time (they come with the full list, which replaces them).
+async fn cells_by_namespace(client: &Client, url: &str) -> Result<Vec<Arc<Row>>> {
+    let (prefix, resource) = url.rsplit_once('/').ok_or_else(|| anyhow!("unexpected path {url}"))?;
+    let mut req = http::Request::get("/api/v1/namespaces?includeObject=None").body(Vec::new())?;
+    req.headers_mut().insert(http::header::ACCEPT, http::HeaderValue::from_static(TABLE_ACCEPT));
+    let namespaces: ServerTable = client.request(req).await?;
+    let names: Vec<String> =
+        namespaces.rows.iter().filter_map(|r| r.cells.first()?.as_str().map(String::from)).collect();
+    let jobs = names.into_iter().map(|ns| {
+        let client = client.clone();
+        let path = format!(
+            "{prefix}/namespaces/{ns}/{resource}?includeObject=None&resourceVersion=0&resourceVersionMatch=NotOlderThan"
+        );
+        async move {
+            let _slot = FAST_SLOTS.acquire().await?;
+            let mut req = http::Request::get(&path).body(Vec::new())?;
+            req.headers_mut().insert(http::header::ACCEPT, http::HeaderValue::from_static(TABLE_ACCEPT));
+            let page: ServerTable = client.request(req).await?;
+            let age = page.column_definitions.iter().position(|d| d.name == "Age");
+            Ok::<_, anyhow::Error>(
+                page.rows.into_iter().filter_map(|r| cells_row(r, Some(&ns), age)).collect::<Vec<_>>(),
+            )
+        }
+    });
+    let pages: Vec<Result<Vec<Arc<Row>>>> = futures::stream::iter(jobs).buffer_unordered(FAST_PARALLEL).collect().await;
+    let mut rows = Vec::new();
+    for page in pages {
+        rows.extend(page?);
+    }
+    rows.sort_by(|a, b| (&a.namespace, &a.name).cmp(&(&b.namespace, &b.name)));
+    Ok(rows)
+}
+
+/// The first list of a namespaced kind in every namespace, shown as soon as it can be: its
+/// first page (2000 rows) at once; when more follow, every namespace's rows without their
+/// objects (`cells_by_namespace`: about 2 s for 23k pods over a laptop's link); then the
+/// whole list with its objects' metadata in one response from the API server's cache,
+/// parsed as it streams in (about half the time of paging through it).
+async fn list_fast(
+    client: &Client,
+    url: &str,
+    tx: &mpsc::UnboundedSender<TableMsg>,
+    pause: &Pause,
+) -> Result<(Vec<ColumnDef>, Vec<Arc<Row>>, String)> {
+    let lp = ListParams::default().limit(PAGE_SIZE);
+    let page: ServerTable = client.request(with_table_format(Request::new(url).list(&lp)?, false)?).await?;
+    let defs = page.column_definitions.clone();
+    let _ = tx.unbounded_send(TableMsg::Columns(Arc::new(defs.clone())));
+    let more = page.metadata.continue_.as_ref().is_some_and(|c| !c.is_empty());
+    let version = page.metadata.resource_version.clone().unwrap_or_default();
+    let mut rows: Vec<Arc<Row>> = page.rows.into_iter().filter_map(|r| to_row(r, &Extras::default())).collect();
+    rows.sort_by(|a, b| (&a.namespace, &a.name).cmp(&(&b.namespace, &b.name)));
+    if !more {
+        return Ok((defs, rows, version));
+    }
+    if !pause.is_paused() {
+        let _ = tx.unbounded_send(TableMsg::Rows(rows));
+    }
+    // A failure here only means waiting for the whole list.
+    if let Ok(cells) = cells_by_namespace(client, url).await
+        && !pause.is_paused()
+    {
+        let _ = tx.unbounded_send(TableMsg::Rows(cells));
+    }
+    match list_whole(client, url).await {
+        Ok(listed) => Ok(listed),
+        // An API server that can't serve it from its cache: page through it as before.
+        Err(_) => list_paged(client, url, ListParams::default()).await,
+    }
+}
+
+/// A Table whose rows' objects are parsed lean while reading (managedFields and the rest
+/// skipped, never held).
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LeanTable {
+    #[serde(default, deserialize_with = "null_default")]
+    column_definitions: Vec<ColumnDef>,
+    #[serde(default, deserialize_with = "null_default")]
+    rows: Vec<LeanRow>,
+    #[serde(default, deserialize_with = "null_default")]
+    metadata: ListMeta,
+}
+
+#[derive(Deserialize)]
+struct LeanRow {
+    cells: Vec<serde_json::Value>,
+    #[serde(default)]
+    object: Option<PartialObject>,
+}
+
+/// The whole list in one response from the API server's cache (`resourceVersion=0`), parsed
+/// as it arrives on a blocking thread: memory stays at the rows, not the 160 MB of JSON a
+/// big cluster sends.
+async fn list_whole(client: &Client, url: &str) -> Result<(Vec<ColumnDef>, Vec<Arc<Row>>, String)> {
+    use tokio_util::compat::FuturesAsyncReadCompatExt as _;
+    let path = format!("{url}?includeObject=Metadata&resourceVersion=0&resourceVersionMatch=NotOlderThan");
+    let mut req = http::Request::get(&path).body(Vec::new())?;
+    req.headers_mut().insert(http::header::ACCEPT, http::HeaderValue::from_static(TABLE_ACCEPT));
+    let body = client.request_stream(req).await?;
+    let reader = tokio_util::io::SyncIoBridge::new(body.compat());
+    let table: LeanTable = tokio::task::spawn_blocking(move || {
+        serde_json::from_reader(std::io::BufReader::with_capacity(256 * 1024, reader))
+    })
+    .await??;
+    // A server that pages it anyway: the rows would be partial.
+    if table.metadata.continue_.as_ref().is_some_and(|c| !c.is_empty()) {
+        return Err(anyhow!("the API server paged a cached list"));
+    }
+    let mut rows: Vec<Arc<Row>> = table
+        .rows
+        .into_iter()
+        .filter_map(|r| row_from(r.cells.iter().map(cell_text).collect(), r.object?.metadata))
+        .collect();
+    rows.sort_by(|a, b| (&a.namespace, &a.name).cmp(&(&b.namespace, &b.name)));
+    Ok((table.column_definitions, rows, table.metadata.resource_version.unwrap_or_default()))
+}
+
+/// Every row of `url` from its cells alone, in one request from the API server's cache;
+/// `namespace` is the one `url` is in, if any.
+async fn cells_list(client: &Client, url: &str, namespace: Option<&str>) -> Result<Vec<Arc<Row>>> {
+    let path = format!("{url}?includeObject=None&resourceVersion=0&resourceVersionMatch=NotOlderThan");
+    let mut req = http::Request::get(&path).body(Vec::new())?;
+    req.headers_mut().insert(http::header::ACCEPT, http::HeaderValue::from_static(TABLE_ACCEPT));
+    let page: ServerTable = client.request(req).await?;
+    let age = page.column_definitions.iter().position(|d| d.name == "Age");
+    Ok(page.rows.into_iter().filter_map(|r| cells_row(r, namespace, age)).collect())
+}
+
+/// A row from its cells alone (`includeObject=None`): the name is the first cell, and
+/// namespace/name stands in for the uid until the full list brings it.
+fn cells_row(row: ServerRow, namespace: Option<&str>, age: Option<usize>) -> Option<Arc<Row>> {
+    let name = row.cells.first()?.as_str()?.to_string();
+    let created = age
+        .and_then(|i| row.cells.get(i)?.as_str().and_then(age_seconds))
+        .and_then(|s| jiff::Timestamp::now().checked_sub(jiff::SignedDuration::from_secs(s)).ok());
+    Some(Arc::new(Row {
+        uid: format!("{}/{name}", namespace.unwrap_or_default()),
+        name,
+        namespace: namespace.map(String::from),
+        created,
+        cells: row.cells.iter().map(cell_text).collect(),
+        deleting: false,
+        deleted_at: None,
+        labels: "".into(),
+    }))
+}
+
+/// kubectl's age ("45s", "2m3s", "5h", "3d4h", "2y") in seconds.
+pub(super) fn age_seconds(age: &str) -> Option<i64> {
+    let (mut total, mut num) = (0i64, 0i64);
+    let mut digits = false;
+    for c in age.chars() {
+        if let Some(d) = c.to_digit(10) {
+            num = num.checked_mul(10)?.checked_add(i64::from(d))?;
+            digits = true;
+            continue;
+        }
+        let unit = match c {
+            's' => 1,
+            'm' => 60,
+            'h' => 3600,
+            'd' => 86_400,
+            'y' => 31_536_000,
+            _ => return None,
+        };
+        if !digits {
+            return None;
+        }
+        total += num * unit;
+        (num, digits) = (0, false);
+    }
+    (!digits && total > 0 || age == "0s").then_some(total)
+}
+
+/// Rows of a kind for counts and checks (problems, overviews). A small list comes with its
+/// objects' metadata as usual. A big one comes from cells alone: on a cluster with 23k pods,
+/// 6 MB instead of 160 MB. Those rows are `is_partial`. `with_namespaces`: each row needs its
+/// namespace (`cells_by_namespace`, one request per namespace); without, one request does,
+/// and rows of every namespace have none (enough for counts).
+pub async fn list_light(
+    client: Client,
+    kind: Kind,
+    namespace: Option<String>,
+    with_namespaces: bool,
+) -> Result<(Vec<ColumnDef>, Vec<Arc<Row>>)> {
+    run(async move {
+        let ns = if kind.namespaced { namespace } else { None };
+        let url = DynamicObject::url_path(&kind.ar, ns.as_deref());
+        let lp = ListParams::default().limit(LIGHT_PROBE);
+        let page: ServerTable = client.request(with_table_format(Request::new(&url).list(&lp)?, false)?).await?;
+        let defs = page.column_definitions.clone();
+        if page.metadata.continue_.as_ref().is_none_or(|c| c.is_empty()) {
+            let rows = page.rows.into_iter().filter_map(|r| to_row(r, &Extras::default())).collect();
+            return Ok((defs, rows));
+        }
+        let rows = match (&ns, kind.namespaced) {
+            (None, true) if with_namespaces => cells_by_namespace(&client, &url).await?,
+            (None, true) => cells_list(&client, &url, None).await?,
+            // One namespace, or a cluster-scoped kind: it pages with its metadata as usual.
+            _ => list_paged(&client, &url, ListParams::default()).await?.1,
+        };
+        Ok((defs, rows))
+    })
+    .await
+}
+
+/// `list_light` lists a kind with its objects' metadata when it has at most this many.
+const LIGHT_PROBE: u32 = 1000;
 
 /// Holds back a watch's snapshots while its list is hidden: events still apply (the
 /// watch stays current), and the rows are sent once it is shown again.
@@ -339,7 +575,9 @@ pub fn watch_table_paused(
     let guard = spawn_guarded(async move {
         let ns = if kind.namespaced { namespace.as_deref() } else { None };
         let url = DynamicObject::url_path(&kind.ar, ns);
-        let mut first = if pages { FirstList::Pages } else { FirstList::Whole };
+        // In every namespace of a namespaced kind, a big list can show early by namespace.
+        let by_namespace = kind.namespaced && ns.is_none();
+        let mut first = if pages { FirstList::Pages { by_namespace } } else { FirstList::Whole };
         let mut backoff = Backoff::default();
         loop {
             // Whether this round listed or got events: only then does the wait start over.
@@ -389,8 +627,9 @@ impl Backoff {
 /// Where a watch is with its first list.
 #[derive(Clone, Copy, PartialEq)]
 pub(super) enum FirstList {
-    /// Not listed yet: show pages as they arrive.
-    Pages,
+    /// Not listed yet: show pages as they arrive (and, `by_namespace`, a big list's rows
+    /// without objects as soon as they are in: see `cells_by_namespace`).
+    Pages { by_namespace: bool },
     /// Not listed yet, rows from before on screen: send the list whole.
     Whole,
     /// Listed (`Listed` sent): a relist keeps the rows until it is complete.
@@ -411,28 +650,37 @@ pub(super) async fn watch_once(
 ) -> Result<()> {
     let request = Request::new(url);
     let full = needs_full(extras);
-    // Show rows as pages arrive; big clusters take tens of seconds to list.
-    let mut sent_columns = false;
-    let progressive = *first == FirstList::Pages;
-    let (defs, list_rows, version) = list_paged_with(client, url, ListParams::default(), extras, |defs, rows| {
-        if !progressive {
-            return;
+    let (_, list_rows, version) = match *first {
+        // A namespaced kind in every namespace, no custom columns: the fast way (see
+        // `list_fast`) when the list turns out big.
+        FirstList::Pages { by_namespace: true } if extras.is_empty() => list_fast(client, url, tx, pause).await?,
+        FirstList::Pages { .. } => {
+            // Show rows as pages arrive; big clusters take tens of seconds to list.
+            let mut sent_columns = false;
+            let listed = list_paged_with(client, url, ListParams::default(), extras, |defs, rows, _| {
+                if !sent_columns {
+                    let _ = tx.unbounded_send(TableMsg::Columns(Arc::new(defs.to_vec())));
+                    sent_columns = true;
+                }
+                if pause.is_paused() {
+                    return;
+                }
+                let mut partial = rows.to_vec();
+                partial.sort_by(|a, b| (&a.namespace, &a.name).cmp(&(&b.namespace, &b.name)));
+                let _ = tx.unbounded_send(TableMsg::Rows(partial));
+            })
+            .await?;
+            if !sent_columns {
+                let _ = tx.unbounded_send(TableMsg::Columns(Arc::new(listed.0.clone())));
+            }
+            listed
         }
-        if !sent_columns {
-            let _ = tx.unbounded_send(TableMsg::Columns(Arc::new(defs.to_vec())));
-            sent_columns = true;
+        _ => {
+            let listed = list_paged_with(client, url, ListParams::default(), extras, |_, _, _| {}).await?;
+            let _ = tx.unbounded_send(TableMsg::Columns(Arc::new(listed.0.clone())));
+            listed
         }
-        if pause.is_paused() {
-            return;
-        }
-        let mut partial = rows.to_vec();
-        partial.sort_by(|a, b| (&a.namespace, &a.name).cmp(&(&b.namespace, &b.name)));
-        let _ = tx.unbounded_send(TableMsg::Rows(partial));
-    })
-    .await?;
-    if !sent_columns {
-        let _ = tx.unbounded_send(TableMsg::Columns(Arc::new(defs)));
-    }
+    };
     let mut rows: HashMap<String, Arc<Row>> = list_rows.into_iter().map(|r| (r.uid.clone(), r)).collect();
     let mut snaps = Snapshots { dirty: true, sent: None };
     snaps.flush(&rows, tx, pause)?;
@@ -505,6 +753,8 @@ pub(super) fn apply_event(
     version: &mut String,
     extras: &Extras,
 ) -> Result<Applied> {
+    #[cfg(feature = "dev")]
+    let _t = crate::dev::timing::span("watch event parse (bg)");
     if line.trim().is_empty() {
         return Ok(Applied::Unchanged);
     }
@@ -688,6 +938,24 @@ mod watch_tests {
         // A bookmark without a version keeps ours.
         apply_event(r#"{"type":"BOOKMARK","object":{}}"#, &mut rows, &mut version, &extras).unwrap();
         assert_eq!(version, "42");
+    }
+}
+
+#[cfg(test)]
+mod age_tests {
+    #[test]
+    fn kubectl_ages_read_as_seconds() {
+        let a = super::age_seconds;
+        assert_eq!(a("45s"), Some(45));
+        assert_eq!(a("2m3s"), Some(123));
+        assert_eq!(a("5h"), Some(18_000));
+        assert_eq!(a("3d4h"), Some(3 * 86_400 + 4 * 3600));
+        assert_eq!(a("2y"), Some(63_072_000));
+        assert_eq!(a("0s"), Some(0));
+        assert_eq!(a("<invalid>"), None);
+        assert_eq!(a(""), None);
+        assert_eq!(a("5"), None);
+        assert_eq!(a("h5"), None);
     }
 }
 

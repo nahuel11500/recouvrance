@@ -3,3 +3,4 @@
 
 pub mod smoke;
 pub mod snapshot;
+pub mod timing;

@@ -136,6 +136,11 @@ pub struct DetailPanel {
     /// Node shell pod started from this page; deleted when the page goes away.
     node_shell: Option<String>,
     env_expanded: bool,
+    /// The overview of a page with a pods table, drawn as a list: a node can hold a
+    /// thousand pods, and laying them all out on every frame made scrolling stutter.
+    overview_list: ListState,
+    /// A CRD's spec fields, worked out when it is loaded rather than on every frame.
+    schema_rows: Vec<crate::overview::SchemaRow>,
     /// Inline editor of a ConfigMap's or Secret's values.
     data_editor: Option<Entity<crate::ui::data_edit::DataEditor>>,
     /// Show metadata.managedFields in the YAML (hidden by default).
@@ -217,6 +222,8 @@ impl DetailPanel {
             denied: Default::default(),
             node_shell: None,
             env_expanded: false,
+            overview_list: ListState::new(0, ListAlignment::Top, px(600.)),
+            schema_rows: Vec::new(),
             data_editor: None,
             show_managed: false,
             field_docs: None,
@@ -442,7 +449,7 @@ impl DetailPanel {
             let _ = this.update_in(cx, |this, window, cx| {
                 match result {
                     Ok(value) => {
-                        this.object = Some(value);
+                        this.set_object(value);
                         if reset_yaml || this.yaml.read(cx).value().as_ref() == this.yaml_text {
                             this.refresh_yaml(window, cx);
                         }
@@ -544,7 +551,7 @@ impl DetailPanel {
                     if !changed {
                         return;
                     }
-                    this.object = Some(value);
+                    this.set_object(value);
                     // Don't overwrite what the user is editing.
                     if this.yaml.read(cx).value().as_ref() == this.yaml_text {
                         this.refresh_yaml(window, cx);
@@ -583,7 +590,15 @@ impl DetailPanel {
                 let Ok(Some(obj)) = this.update(cx, |this, _| this.object.clone().filter(|_| !this.deleted)) else {
                     break;
                 };
-                let mut related = fetch_related(client.clone(), &kind, ns.clone(), &obj).await;
+                let related = fetch_related(client.clone(), &kind, ns.clone(), &obj).await;
+                let indexed = obj.clone();
+                let mut related = exec
+                    .spawn(async move {
+                        let mut related = related;
+                        related.index(&indexed);
+                        related
+                    })
+                    .await;
                 // Prometheus can be slow: show the rest first, keeping the previous charts.
                 let pods_for_history = if wants_history { related.pods.clone() } else { Vec::new() };
                 related.history = this.update(cx, |this, _| this.related.history.take()).ok().flatten();
@@ -608,7 +623,9 @@ impl DetailPanel {
                             Some(logs) => logs.update(cx, |l, cx| l.set_pods(names, cx)),
                         }
                     }
-                    this.related = related;
+                    // A thousand pods take a while to free: not on the UI thread.
+                    let old = std::mem::replace(&mut this.related, related);
+                    cx.background_executor().spawn(async move { drop(old) }).detach();
                     #[cfg(feature = "dev")]
                     if std::env::var("RECOUVRANCE_COMPARE").is_ok() && this.compare_rev.is_none() {
                         let mut revs: Vec<(i64, String)> = this
@@ -713,17 +730,29 @@ impl DetailPanel {
 
     // MARK: Compare
 
+    fn set_object(&mut self, value: serde_json::Value) {
+        if self.obj.kind.is("apiextensions.k8s.io", "CustomResourceDefinition") {
+            self.schema_rows = crate::overview::crd_rows(&value);
+        }
+        self.object = Some(value);
+    }
+
     fn ctx<'a>(&'a self, value: &'a serde_json::Value, cx: &Context<Self>) -> Ctx<'a> {
+        self.ctx_for(value, cx.entity().downgrade())
+    }
+
+    fn ctx_for<'a>(&'a self, value: &'a serde_json::Value, panel: WeakEntity<Self>) -> Ctx<'a> {
         Ctx {
             compare: self.compare_rev.as_deref(),
             obj: value,
             kind: &self.obj.kind,
             related: &self.related,
-            panel: cx.entity().downgrade(),
+            panel,
             reveal: self.reveal_secrets,
             revealed_keys: &self.revealed_keys,
             history_minutes: self.history_minutes,
             env_expanded: self.env_expanded,
+            schema_rows: &self.schema_rows,
         }
     }
 

@@ -245,6 +245,12 @@ async fn metrics(client: Client, path: &'static str) -> MetricsList {
         .unwrap_or_default()
 }
 
+/// The cluster overview's load, for the dev smoke run's timings.
+#[cfg(feature = "dev")]
+pub async fn debug_load(context: String, client: Client) -> usize {
+    load(context, client).await.pods_running
+}
+
 async fn load(context: String, client: Client) -> Summary {
     let mut s = Summary { context, ..Default::default() };
     let minutes = crate::settings::get().usage_range;

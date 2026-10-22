@@ -75,9 +75,35 @@ pub struct Related {
     /// Lists that could not be loaded, by field ("pods", "services"…): "forbidden" or
     /// "failed: …", so an empty section does not read as "there are none".
     pub errors: BTreeMap<&'static str, String>,
+    /// Pods' (requests, limits) per resource, summed once when they are loaded: a node's
+    /// page reads them on every frame, and a node can hold a thousand pods.
+    pub allocated: std::collections::HashMap<String, (f64, f64)>,
+    /// The pods table's rows, worked out once from `pods` and `usage`.
+    pub pod_rows: Vec<PodRow>,
 }
 
 impl Related {
+    /// The pods' (requests, limits) of a resource, from the sums made at load time.
+    pub fn allocated(&self, resource: &str) -> (f64, f64) {
+        match self.allocated.get(resource) {
+            Some(sums) => *sums,
+            None => k8s::pods_allocated(&self.pods, resource),
+        }
+    }
+
+    /// Work out once what the page draws from the pods: the table's rows and, for a node,
+    /// the pods' requests and limits of each resource it offers. Slow for a thousand pods,
+    /// so run it off the UI thread.
+    pub fn index(&mut self, obj: &Value) {
+        self.pod_rows = pod_rows(&self.pods, &self.usage);
+        let resources = obj.pointer("/status/allocatable").and_then(Value::as_object);
+        self.allocated = resources
+            .into_iter()
+            .flat_map(|a| a.keys())
+            .map(|r| (r.clone(), k8s::pods_allocated(&self.pods, r)))
+            .collect();
+    }
+
     /// Keep a list's items, or note why it failed under `section` (and keep nothing).
     pub fn noted<T: Default>(&mut self, section: &'static str, result: Result<T>) -> T {
         result.unwrap_or_else(|e| {
@@ -121,6 +147,8 @@ pub struct Ctx<'a> {
     pub history_minutes: i64,
     /// Long environment lists are shown in full.
     pub env_expanded: bool,
+    /// A CRD's spec fields, worked out once from its schema.
+    pub schema_rows: &'a [SchemaRow],
 }
 
 impl Ctx<'_> {
@@ -234,7 +262,64 @@ fn clipped_list(items: Vec<String>, max: usize, cx: &App) -> Div {
         })
 }
 
+/// Pages with a pods table: their rows are items of the page's list.
+fn lists_pods(kind: &Kind) -> bool {
+    kind.is("", "Node")
+        || kind.is("networking.k8s.io", "NetworkPolicy")
+        || kind.is("", "PersistentVolumeClaim")
+        || kind.is("", "Service")
+        || kind.is("", "ServiceAccount")
+        || kind.is("policy", "PodDisruptionBudget")
+        || ((kind.ar.group == "apps" || kind.is("batch", "Job")) && !kind.is("batch", "CronJob"))
+}
+
+/// Pages that can hold hundreds of rows (a node's pods, a ConfigMap's keys, a CRD's fields)
+/// are drawn as a list, so only the items on screen are laid out: the sections above, one
+/// item per row, then the conditions. The number of rows, or None for other pages.
+pub fn list_rows(ctx: &Ctx) -> Option<usize> {
+    let kind = ctx.kind;
+    if lists_pods(kind) {
+        Some(ctx.related.pod_rows.len())
+    } else if kind.is("", "ConfigMap") || kind.is("", "Secret") {
+        Some(ctx.obj.get("data").and_then(Value::as_object).map_or(0, |d| d.len()))
+    } else if kind.is("apiextensions.k8s.io", "CustomResourceDefinition") {
+        Some(ctx.schema_rows.len())
+    } else {
+        None
+    }
+}
+
+pub fn item(ctx: &Ctx, ix: usize, cx: &App) -> AnyElement {
+    let rows = list_rows(ctx).unwrap_or(0);
+    let body = match ix {
+        0 => top(ctx, cx).into_any_element(),
+        ix if ix <= rows => list_row(ctx, ix - 1, cx),
+        _ => conditions(ctx.obj, cx),
+    };
+    div().px_2().when(ix > rows, |d| d.pb_8()).child(body).into_any_element()
+}
+
+fn list_row(ctx: &Ctx, i: usize, cx: &App) -> AnyElement {
+    let kind = ctx.kind;
+    if kind.is("", "ConfigMap") {
+        config_entry(ctx.obj, i, cx)
+    } else if kind.is("", "Secret") {
+        secret_entry(ctx, i, cx)
+    } else if kind.is("apiextensions.k8s.io", "CustomResourceDefinition") {
+        ctx.schema_rows.get(i).map(|r| schema_row(r, cx)).unwrap_or_else(|| div().into_any_element())
+    } else {
+        ctx.related.pod_rows.get(i).map(|r| pod_row(ctx, r, cx)).unwrap_or_else(|| div().into_any_element())
+    }
+}
+
+/// The whole page in one scroll, for where it is not a list (next to the data editor).
 pub fn render(ctx: &Ctx, cx: &App) -> AnyElement {
+    let rows = (0..list_rows(ctx).unwrap_or(0)).map(|i| list_row(ctx, i, cx));
+    scroll(top(ctx, cx).children(rows).child(conditions(ctx.obj, cx)), "overview")
+}
+
+/// Everything above the conditions.
+fn top(ctx: &Ctx, cx: &App) -> Div {
     let kind = ctx.kind;
     let mut root = v_flex().gap_1().child(references_card(ctx, cx));
     if kind.is("", "Pod") || kind.ar.group == "apps" || kind.is("batch", "Job") || kind.is("", "Node") {
@@ -303,8 +388,7 @@ pub fn render(ctx: &Ctx, cx: &App) -> AnyElement {
             cx,
         ));
     }
-    root = root.child(conditions(ctx.obj, cx));
-    scroll(root, "overview")
+    root
 }
 
 fn scroll(content: Div, id: &'static str) -> AnyElement {

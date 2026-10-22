@@ -5,6 +5,8 @@ use super::*;
 
 impl Render for AppView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        #[cfg(feature = "dev")]
+        let _t = crate::dev::timing::span("app render");
         // Keep keyboard focus somewhere useful: when the focused element went away
         // (e.g. the table after opening a row), the list gets it back, or the app
         // itself so Esc, Ctrl+K and the rest keep working.
