@@ -35,7 +35,7 @@ pub(super) fn history(ctx: &Ctx, cx: &App) -> Option<Div> {
     // Nodes: requests of their pods, and what the node can give (allocatable) as the ceiling.
     let [cpu_req, cpu_lim, mem_req, mem_lim] = if is_node {
         // Like the scheduler: running pods only, sidecars and init containers counted.
-        let req = |resource: &str| Some(k8s::pods_allocated(&ctx.related.pods, resource).0).filter(|v| *v > 0.0);
+        let req = |resource: &str| Some(ctx.related.allocated(resource).0).filter(|v| *v > 0.0);
         [
             req("cpu"),
             s(ctx.obj, "/status/allocatable/cpu").map(k8s::parse_cpu),

@@ -65,6 +65,7 @@ pub(super) fn certificates(data: &serde_json::Map<String, Value>, base64: bool, 
     )))
 }
 
+/// A Secret's type and certificates; its keys are items of the page's list (`secret_entry`).
 pub(super) fn secret(ctx: &Ctx, cx: &App) -> Div {
     let obj = ctx.obj;
     let data = obj.get("data").and_then(Value::as_object).cloned().unwrap_or_default();
@@ -74,68 +75,77 @@ pub(super) fn secret(ctx: &Ctx, cx: &App) -> Div {
         .children(certificates(&data, true, cx))
         .child(heading(&format!("Data ({} keys)", data.len())))
         .child(div().pb_1().text_xs().text_color(muted).child("Click a value to show or hide it."))
-        .children(data.iter().enumerate().map(|(i, (k, v))| {
-            use base64::Engine as _;
-            let decoded = v
-                .as_str()
-                .and_then(|b| base64::engine::general_purpose::STANDARD.decode(b).ok())
-                .map(|b| String::from_utf8_lossy(&b).to_string())
-                .unwrap_or_default();
-            let shown = ctx.reveal || ctx.revealed_keys.contains(k);
-            let value = if shown { decoded.clone() } else { "••••••••••••".to_string() };
-            let (panel, key) = (ctx.panel.clone(), k.clone());
-            h_flex()
-                .py_1()
-                .px_2()
-                .mb_1()
-                .gap_2()
-                .items_start()
-                .rounded_md()
-                .bg(cx.theme().secondary.opacity(0.5))
-                .child(
-                    v_flex()
-                        .id(("secret-key", i))
-                        .flex_1()
-                        .min_w_0()
-                        .cursor_pointer()
-                        .on_click(move |_, _, cx| {
-                            let _ = panel.update(cx, |p, cx| p.toggle_secret_key(&key, cx));
-                        })
-                        .child(div().text_xs().text_color(muted).child(k.clone()))
-                        .child(mono(value, cx)),
-                )
-                .child(
-                    Button::new(("copy-secret", i))
-                        .xsmall()
-                        .ghost()
-                        .icon(Lucide::Copy)
-                        .tooltip("Copy the value")
-                        .on_click(move |_, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(decoded.clone()))),
-                )
-        }))
 }
 
+pub(super) fn secret_entry(ctx: &Ctx, i: usize, cx: &App) -> AnyElement {
+    let muted = cx.theme().muted_foreground;
+    let Some((k, v)) = ctx.obj.get("data").and_then(Value::as_object).and_then(|d| d.iter().nth(i)) else {
+        return div().into_any_element();
+    };
+    use base64::Engine as _;
+    let decoded = v
+        .as_str()
+        .and_then(|b| base64::engine::general_purpose::STANDARD.decode(b).ok())
+        .map(|b| String::from_utf8_lossy(&b).to_string())
+        .unwrap_or_default();
+    let shown = ctx.reveal || ctx.revealed_keys.contains(k);
+    let value = if shown { decoded.clone() } else { "••••••••••••".to_string() };
+    let (panel, key) = (ctx.panel.clone(), k.clone());
+    h_flex()
+        .py_1()
+        .px_2()
+        .mb_1()
+        .gap_2()
+        .items_start()
+        .rounded_md()
+        .bg(cx.theme().secondary.opacity(0.5))
+        .child(
+            v_flex()
+                .id(("secret-key", i))
+                .flex_1()
+                .min_w_0()
+                .cursor_pointer()
+                .on_click(move |_, _, cx| {
+                    let _ = panel.update(cx, |p, cx| p.toggle_secret_key(&key, cx));
+                })
+                .child(div().text_xs().text_color(muted).child(k.clone()))
+                .child(mono(value, cx)),
+        )
+        .child(
+            Button::new(("copy-secret", i))
+                .xsmall()
+                .ghost()
+                .icon(Lucide::Copy)
+                .tooltip("Copy the value")
+                .on_click(move |_, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(decoded.clone()))),
+        )
+        .into_any_element()
+}
+
+/// A ConfigMap's certificates; its keys are items of the page's list (`config_entry`).
 pub(super) fn config_map(obj: &Value, cx: &App) -> Div {
     let data = obj.get("data").and_then(Value::as_object).cloned().unwrap_or_default();
+    v_flex().children(certificates(&data, false, cx)).child(heading(&format!("Data ({} keys)", data.len())))
+}
+
+pub(super) fn config_entry(obj: &Value, i: usize, cx: &App) -> AnyElement {
+    let Some((k, v)) = obj.get("data").and_then(Value::as_object).and_then(|d| d.iter().nth(i)) else {
+        return div().into_any_element();
+    };
     let muted = cx.theme().muted_foreground;
-    v_flex().children(certificates(&data, false, cx)).child(heading(&format!("Data ({} keys)", data.len()))).children(
-        data.iter().map(|(k, v)| {
-            let text = v.as_str().unwrap_or_default();
-            let lines: Vec<&str> = text.lines().take(40).collect();
-            let more = text.lines().count().saturating_sub(40);
-            v_flex()
-                .py_1()
-                .px_2()
-                .mb_1()
-                .rounded_md()
-                .bg(cx.theme().secondary.opacity(0.5))
-                .child(div().text_xs().text_color(muted).child(k.clone()))
-                .children(lines.into_iter().map(|l| mono(l.to_string(), cx)))
-                .when(more > 0, |d| {
-                    d.child(div().text_xs().text_color(muted).child(format!("… {more} more lines (see YAML)")))
-                })
-        }),
-    )
+    let text = v.as_str().unwrap_or_default();
+    let lines: Vec<&str> = text.lines().take(40).collect();
+    let more = text.lines().count().saturating_sub(40);
+    v_flex()
+        .py_1()
+        .px_2()
+        .mb_1()
+        .rounded_md()
+        .bg(cx.theme().secondary.opacity(0.5))
+        .child(div().text_xs().text_color(muted).child(k.clone()))
+        .children(lines.into_iter().map(|l| mono(l.to_string(), cx)))
+        .when(more > 0, |d| d.child(div().text_xs().text_color(muted).child(format!("… {more} more lines (see YAML)"))))
+        .into_any_element()
 }
 
 /// `string`, `[]object`, `map[string]string`… from an OpenAPI schema node.
@@ -152,16 +162,27 @@ pub(super) fn schema_type(v: &Value) -> String {
     }
 }
 
+/// A field of a CRD's spec: depth, name, type, required, first line of its description.
+pub type SchemaRow = (usize, String, String, bool, String);
+
+/// The spec fields of a CRD's stored version, worked out once when it is loaded.
+pub fn crd_rows(obj: &Value) -> Vec<SchemaRow> {
+    let versions = arr(obj, "/spec/versions");
+    let Some(storage) = versions.iter().find(|v| v["storage"] == true).or(versions.first()) else {
+        return Vec::new();
+    };
+    let mut rows = Vec::new();
+    schema_rows(&storage["schema"]["openAPIV3Schema"]["properties"]["spec"], 0, &mut rows);
+    rows
+}
+
 /// The fields of a schema node (objects, or arrays of objects), two levels deep.
-pub(super) fn schema_rows(node: &Value, depth: usize, out: &mut Vec<(usize, String, String, bool, String)>) {
+fn schema_rows(node: &Value, depth: usize, out: &mut Vec<SchemaRow>) {
     let node = if node["type"] == "array" { &node["items"] } else { node };
     let required: Vec<&str> =
         node["required"].as_array().map(|r| r.iter().filter_map(Value::as_str).collect()).unwrap_or_default();
     let Some(props) = node["properties"].as_object() else { return };
     for (name, p) in props {
-        if out.len() >= 300 {
-            return;
-        }
         let desc = p["description"].as_str().unwrap_or_default().lines().next().unwrap_or_default().to_string();
         out.push((depth, name.clone(), schema_type(p), required.contains(&name.as_str()), desc));
         if depth < 1 {
@@ -181,9 +202,8 @@ pub(super) fn crd(ctx: &Ctx, cx: &App) -> Div {
         .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
         .unwrap_or_default();
     let versions = arr(obj, "/spec/versions");
-    let storage = versions.iter().find(|v| v["storage"] == true).or(versions.first()).cloned().unwrap_or_default();
-    let mut rows = Vec::new();
-    schema_rows(&storage["schema"]["openAPIV3Schema"]["properties"]["spec"], 0, &mut rows);
+    let storage = versions.iter().find(|v| v["storage"] == true).or(versions.first());
+    let storage = storage.and_then(|v| v["name"].as_str()).unwrap_or_default();
     let instances = ctx.link(format!("Open the {plural} list"), &format!("{plural}.{group}"), "", cx);
     v_flex()
         .child(
@@ -218,52 +238,57 @@ pub(super) fn crd(ctx: &Ctx, cx: &App) -> Div {
                     )
                 })
         }))
-        .child(heading(&format!("spec fields ({})", storage["name"].as_str().unwrap_or_default())))
-        .children(rows.into_iter().map(|(depth, name, ty, required, desc)| {
-            h_flex()
-                .gap_3()
-                .py_0p5()
-                .text_sm()
-                .border_b_1()
-                .border_color(theme.border.opacity(0.5))
-                .child(
-                    div()
-                        .w(px(260.))
-                        .flex_shrink_0()
-                        .pl(px(depth as f32 * 18.))
-                        .font_family(theme.mono_font_family.clone())
-                        .text_color(if depth == 0 { theme.foreground } else { theme.muted_foreground })
-                        .child(name),
-                )
-                .child(
-                    div()
-                        .w(px(170.))
-                        .flex_shrink_0()
-                        .font_family(theme.mono_font_family.clone())
-                        .text_xs()
-                        .text_color(theme.blue)
-                        .child(ty),
-                )
-                .child(
-                    div()
-                        .w(px(70.))
-                        .flex_shrink_0()
-                        .text_xs()
-                        .text_color(theme.warning)
-                        .when(required, |d| d.child("required")),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .text_xs()
-                        .text_color(theme.muted_foreground)
-                        .overflow_hidden()
-                        .text_ellipsis()
-                        .whitespace_nowrap()
-                        .child(desc),
-                )
-        }))
+        .child(heading(&format!("spec fields ({storage})")))
+}
+
+/// One spec field of a CRD, an item of the page's list.
+pub(super) fn schema_row((depth, name, ty, required, desc): &SchemaRow, cx: &App) -> AnyElement {
+    let theme = cx.theme();
+    let depth = *depth;
+    h_flex()
+        .gap_3()
+        .py_0p5()
+        .text_sm()
+        .border_b_1()
+        .border_color(theme.border.opacity(0.5))
+        .child(
+            div()
+                .w(px(260.))
+                .flex_shrink_0()
+                .pl(px(depth as f32 * 18.))
+                .font_family(theme.mono_font_family.clone())
+                .text_color(if depth == 0 { theme.foreground } else { theme.muted_foreground })
+                .child(name.clone()),
+        )
+        .child(
+            div()
+                .w(px(170.))
+                .flex_shrink_0()
+                .font_family(theme.mono_font_family.clone())
+                .text_xs()
+                .text_color(theme.blue)
+                .child(ty.clone()),
+        )
+        .child(
+            div()
+                .w(px(70.))
+                .flex_shrink_0()
+                .text_xs()
+                .text_color(theme.warning)
+                .when(*required, |d| d.child("required")),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .text_xs()
+                .text_color(theme.muted_foreground)
+                .overflow_hidden()
+                .text_ellipsis()
+                .whitespace_nowrap()
+                .child(desc.clone()),
+        )
+        .into_any_element()
 }
 
 pub(super) fn pvc(ctx: &Ctx, cx: &App) -> Div {

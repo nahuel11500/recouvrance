@@ -46,7 +46,7 @@ axum = "0.8"
 schemars = "1"
 sha2 = "0.11"
 uuid = { version = "1", features = ["v4"] }
-tokio-util = "0.7.20"
+tokio-util = { version = "0.7.20", features = ["io-util", "compat"] }
 vt100 = "0.18"
 base64 = "0.23"
 flate2 = "1"

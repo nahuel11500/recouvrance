@@ -96,6 +96,8 @@ impl TableDelegate for ResourceTable {
         _: &mut Window,
         cx: &mut Context<TableState<Self>>,
     ) -> impl IntoElement {
+        #[cfg(feature = "dev")]
+        let _t = crate::dev::timing::span("table cell");
         let (Some(row), Some(ctx)) = (self.row(row_ix), self.row_context(row_ix)) else {
             return div().into_any_element();
         };

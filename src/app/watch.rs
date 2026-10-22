@@ -213,6 +213,8 @@ impl AppView {
     /// Messages that piled up from one cluster's watch: every one in order, except
     /// rows that newer rows replace (each costs a filter and a sort of the whole list).
     pub(super) fn on_table_msgs(&mut self, ctx: usize, batch: Vec<TableMsg>, cx: &mut Context<Self>) {
+        #[cfg(feature = "dev")]
+        let _t = crate::dev::timing::span("watch batch (UI)");
         for msg in coalesce(batch) {
             self.on_table_msg(ctx, msg, cx);
         }

@@ -112,6 +112,16 @@ pub fn run(path: &str, wait: Duration) -> Result<()> {
         }
         eprintln!("QA done: {problems} problem(s)");
     }
+    // RECOUVRANCE_KIND=<kind>: list that resource type first.
+    if let Ok(kind) = std::env::var("RECOUVRANCE_KIND") {
+        cx.update(|cx| app_view.update(cx, |a, cx| a.qa_select(&kind, cx)));
+        pump(&mut cx, Duration::from_secs(15));
+    }
+    // RECOUVRANCE_PAGE=<page>: open a page (problems, cluster, helm…) first.
+    if let Ok(page) = std::env::var("RECOUVRANCE_PAGE") {
+        cx.update_window(window.into(), |_, window, cx| app_view.update(cx, |a, cx| a.qa_page(&page, window, cx)))?;
+        pump(&mut cx, Duration::from_secs(25));
+    }
     // RECOUVRANCE_FRAMES=<n>: time n full redraws of the window (render + layout + paint).
     if let Some(n) = std::env::var("RECOUVRANCE_FRAMES").ok().and_then(|n| n.parse::<u32>().ok()) {
         let start = Instant::now();
@@ -301,5 +311,25 @@ drwxr-xr-x 1 root root 4096 Oct 15 \x1b[1;34m.\x1b[0m\r\n\
     }
 
     cx.capture_screenshot(window.into())?.save(path)?;
+    // RECOUVRANCE_FRAMES_END=<n>: time n full redraws of what is on screen at the end.
+    if let Some(n) = std::env::var("RECOUVRANCE_FRAMES_END").ok().and_then(|n| n.parse::<u32>().ok()) {
+        let mut times: Vec<Duration> = (0..n)
+            .map(|_| {
+                let start = Instant::now();
+                let _ = cx.update_window(win.into(), |_, window, cx| {
+                    window.refresh();
+                    window.draw(cx).clear(cx);
+                });
+                start.elapsed()
+            })
+            .collect();
+        times.sort();
+        let ms = |d: Duration| d.as_secs_f64() * 1000.0;
+        eprintln!(
+            "frames at the end: median {:.2} ms, p90 {:.2} ms over {n} frames",
+            ms(times[times.len() / 2]),
+            ms(times[times.len() * 9 / 10])
+        );
+    }
     Ok(())
 }

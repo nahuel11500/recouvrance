@@ -23,6 +23,8 @@ mod access;
 mod config;
 mod discovery;
 mod exec;
+#[cfg(feature = "dev")]
+pub(crate) mod experiments;
 mod forward;
 pub(crate) mod lists;
 pub(crate) mod meter;

@@ -103,7 +103,7 @@ pub(super) fn node_allocation(ctx: &Ctx, cx: &App) -> Div {
     let cards = names.into_iter().filter(|n| alloc.contains_key(n)).map(|name| {
         let a = alloc.get(&name).and_then(Value::as_str).map(|q| parse(&name, q)).unwrap_or(0.0);
         let c = capacity.get(&name).and_then(Value::as_str).map(|q| parse(&name, q)).unwrap_or(a);
-        let (req, lim) = if name == "pods" { (running, 0.0) } else { k8s::pods_allocated(pods, &name) };
+        let (req, lim) = if name == "pods" { (running, 0.0) } else { ctx.related.allocated(&name) };
         let share = if a > 0.0 { req / a } else { 0.0 };
         let color = match share {
             s if s >= 0.95 => theme.danger,

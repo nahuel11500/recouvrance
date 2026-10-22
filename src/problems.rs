@@ -84,7 +84,7 @@ pub fn judge(kind: &Kind, defs: &[ColumnDef], row: &Row) -> Option<(Severity, St
                 }
                 // From the deletion (its grace period's end), not the creation.
                 "Terminating" if since(row.deleted_at.or(row.created), 600) => {
-                    Some((Severity::Warning, "stuck terminating".into()))
+                    Some((Severity::Warning, STUCK_TERMINATING.into()))
                 }
                 "Running" => match ratio(c("Ready")) {
                     Some((r, t)) if r < t && older_than(row, 300) => {
@@ -172,6 +172,24 @@ impl Scan {
     }
 }
 
+const STUCK_TERMINATING: &str = "stuck terminating";
+
+/// Whether a row listed without its object has been terminating for more than 10 minutes,
+/// from its object's deletion time (one small request; true when it can't be read).
+async fn stuck_terminating(client: &Client, kind: &Kind, row: &Row) -> bool {
+    let api: kube::Api<kube::api::DynamicObject> = match &row.namespace {
+        Some(ns) => kube::Api::namespaced_with(client.clone(), ns, &kind.ar),
+        None => kube::Api::all_with(client.clone(), &kind.ar),
+    };
+    let name = row.name.clone();
+    let deleted = k8s::run(async move { Ok(api.get_metadata(&name).await?.metadata.deletion_timestamp) }).await;
+    match deleted {
+        Ok(Some(t)) => since(jiff::Timestamp::from_second(t.0.as_second()).ok(), 600),
+        Ok(None) => false,
+        Err(_) => true,
+    }
+}
+
 /// Problems in a cluster (or one namespace), worst first. Fails when any kind could
 /// not be read; `scan_partial` keeps what it could read.
 pub async fn scan(client: Client, kinds: &[Kind], namespace: Option<String>) -> Result<Vec<Problem>> {
@@ -188,25 +206,30 @@ pub async fn scan_partial(client: Client, kinds: &[Kind], namespace: Option<Stri
     let jobs = CHECKED.iter().filter_map(|(g, k)| kinds.iter().find(|x| x.is(g, k)).cloned()).map(|kind| {
         let (client, ns) = (client.clone(), namespace.clone());
         async move {
-            let (defs, rows) = match k8s::list_table(client, kind.clone(), ns, None, None).await {
+            // Big lists come from their cells alone: a small part of the bytes.
+            let (defs, rows) = match k8s::list_light(client.clone(), kind.clone(), ns, true).await {
                 Ok(t) => t,
                 Err(e) => return Err((kind.label.clone(), e)),
             };
-            Ok(rows
-                .iter()
-                .filter_map(|r| {
-                    let (severity, reason) = judge(&kind, &defs, r)?;
-                    Some(Problem {
-                        severity,
-                        kind: kind.kubectl_name(),
-                        label: kind.ar.kind.clone(),
-                        namespace: r.namespace.clone(),
-                        name: r.name.clone(),
-                        reason,
-                        age: r.created,
-                    })
-                })
-                .collect::<Vec<_>>())
+            let mut found = Vec::new();
+            for r in &rows {
+                let Some((severity, reason)) = judge(&kind, &defs, r) else { continue };
+                // Without its object, a terminating row has no deletion time: ask for it,
+                // so a pod in its normal grace period is not called stuck.
+                if r.is_partial() && reason == STUCK_TERMINATING && !stuck_terminating(&client, &kind, r).await {
+                    continue;
+                }
+                found.push(Problem {
+                    severity,
+                    kind: kind.kubectl_name(),
+                    label: kind.ar.kind.clone(),
+                    namespace: r.namespace.clone(),
+                    name: r.name.clone(),
+                    reason,
+                    age: r.created,
+                });
+            }
+            Ok(found)
         }
     });
     let mut out = Scan::default();

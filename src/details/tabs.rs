@@ -10,7 +10,7 @@ impl DetailPanel {
                 .size_full()
                 .gap_3()
                 .child(self.render_service_ports(value, cx))
-                .child(div().flex_1().min_h_0().child(crate::overview::render(&self.ctx(value, cx), cx)))
+                .child(div().flex_1().min_h_0().child(self.overview_body(value, cx)))
                 .into_any_element(),
             (Some(value), _) if self.data_editor.is_some() => v_flex()
                 .id("data-editor")
@@ -21,7 +21,7 @@ impl DetailPanel {
                 .child(crate::overview::render(&self.ctx(value, cx), cx))
                 .into_any_element(),
             (Some(value), _) => {
-                let body = crate::overview::render(&self.ctx(value, cx), cx);
+                let body = self.overview_body(value, cx);
                 if !self.obj.kind.is("", "Secret") {
                     return body;
                 }
@@ -46,6 +46,34 @@ impl DetailPanel {
             (None, Some(err)) => error_box(err.clone(), cx).into_any_element(),
             (None, None) => div().text_color(cx.theme().muted_foreground).child("Loading…").into_any_element(),
         }
+    }
+
+    /// The overview, as a list on pages with a pods table: only the rows on screen are laid out.
+    fn overview_body(&self, value: &serde_json::Value, cx: &mut Context<Self>) -> AnyElement {
+        let ctx = self.ctx(value, cx);
+        let Some(rows) = crate::overview::list_rows(&ctx) else {
+            return crate::overview::render(&ctx, cx);
+        };
+        let state = &self.overview_list;
+        let (old, new) = (state.item_count(), rows + 2);
+        if old < 2 {
+            state.reset(new);
+        } else if new > old {
+            // Rows come and go: add or drop them at the end of the table, so the page
+            // does not jump back to the top.
+            state.splice(old - 1..old - 1, new - old);
+        } else if new < old {
+            state.splice(new - 1..old - 1, 0);
+        }
+        let panel = cx.entity().downgrade();
+        list(self.overview_list.clone(), move |ix, _, cx| {
+            let Some(entity) = panel.upgrade() else { return div().into_any_element() };
+            let this = entity.read(cx);
+            let Some(value) = &this.object else { return div().into_any_element() };
+            crate::overview::item(&this.ctx_for(value, panel.clone()), ix, cx)
+        })
+        .size_full()
+        .into_any_element()
     }
 
     pub(super) fn render_container(&self, ix: usize, cx: &mut Context<Self>) -> AnyElement {
