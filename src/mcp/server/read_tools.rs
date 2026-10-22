@@ -43,12 +43,12 @@ impl KubeMcp {
     #[tool(description = "List the Kubernetes contexts (clusters) you may access.", annotations(read_only_hint = true))]
     pub(super) async fn list_contexts(&self, Extension(parts): Extension<Parts>) -> Result<String, String> {
         let call = self.begin(&parts, "list_contexts", json!({}))?;
-        let patterns = call.policy().context_patterns();
+        // The contexts a call may use: the same check as when one connects.
         let names: Vec<String> = k8s::load_contexts()
             .map(|c| c.names)
             .unwrap_or_default()
             .into_iter()
-            .filter(|c| patterns.iter().any(|p| glob(p, c)))
+            .filter(|c| call.policy().context_allowed(c))
             .collect();
         call.finish(Ok(if names.is_empty() {
             "No contexts are allowed for this agent. Ask the user to add rules in Recouvrance.".into()

@@ -14,7 +14,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use crate::k8s;
-use crate::mcp::{Access, Agent, AuditEntry, Decision, Hub, Mode, Policy, Rule, VERBS, glob, is_write};
+use crate::mcp::{Access, Agent, AuditEntry, Decision, Hub, Mode, Policy, Rule, VERBS, any_glob, is_write};
 
 mod activity;
 mod code;
@@ -318,7 +318,7 @@ impl AgentsView {
 
     /// Contexts in kubeconfig matched by a rule's patterns.
     fn matched_contexts(&self, patterns: &[String]) -> Vec<String> {
-        self.contexts.iter().filter(|c| patterns.iter().any(|p| glob(p, c))).cloned().collect()
+        self.contexts.iter().filter(|c| any_glob(patterns, c)).cloned().collect()
     }
 
     // MARK: Rendering
