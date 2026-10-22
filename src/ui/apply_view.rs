@@ -590,7 +590,7 @@ fn url_allowed(url: &str) -> bool {
 /// Split on `---` lines into (0-based line the piece starts on, its text); line `k` of a
 /// piece is line `start + k` of the whole text. Empty documents stay in the list, so
 /// positions never drift.
-fn split_docs(text: &str) -> Vec<(u32, String)> {
+pub(crate) fn split_docs(text: &str) -> Vec<(u32, String)> {
     let mut out: Vec<(u32, Vec<&str>)> = vec![(0, Vec::new())];
     for (i, l) in text.lines().enumerate() {
         match l.strip_prefix("---").filter(|rest| rest.is_empty() || rest.starts_with([' ', '\t'])) {
