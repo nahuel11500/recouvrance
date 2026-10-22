@@ -3,8 +3,14 @@
 #[allow(unused_imports)]
 use super::*;
 
-/// Apply a theme mode with the app's typography on top.
+/// Apply a theme mode and remember it as the user's choice (no longer following the desktop).
 pub fn set_theme(mode: ThemeMode, window: Option<&mut Window>, cx: &mut App) {
+    apply_theme(mode, window, cx);
+    save_theme_choice(mode);
+}
+
+/// Apply a theme mode with the app's typography on top, without saving it.
+pub fn apply_theme(mode: ThemeMode, window: Option<&mut Window>, cx: &mut App) {
     Theme::change(mode, window, cx);
     let z = zoom(cx);
     let theme = Theme::global_mut(cx);
@@ -106,19 +112,7 @@ pub fn set_theme(mode: ThemeMode, window: Option<&mut Window>, cx: &mut App) {
     theme.tokens = component::theme::ThemeTokens::from(&theme.colors);
     theme.radius = px(7.);
     theme.radius_lg = px(10.);
-    if !SNAPSHOT_MODE.load(std::sync::atomic::Ordering::Relaxed) {
-        save_theme_choice(mode);
-    }
     cx.refresh_windows();
-}
-
-pub(super) static SNAPSHOT_MODE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-/// For off-screen renders: same palette, without saving the choice.
-#[cfg(feature = "dev")]
-pub fn apply_palette_only(mode: ThemeMode, cx: &mut App) {
-    SNAPSHOT_MODE.store(true, std::sync::atomic::Ordering::Relaxed);
-    set_theme(mode, None, cx);
 }
 
 /// UI zoom factor (1.0 = 13px base text).
@@ -151,7 +145,7 @@ pub fn set_zoom(z: f32, window: &mut Window, cx: &mut App) {
     cx.set_global(Zoom(z));
     let _ = std::fs::write(zoom_path(), z.to_string());
     let mode = cx.theme().mode;
-    set_theme(mode, Some(window), cx);
+    apply_theme(mode, Some(window), cx);
     window.push_notification(Notification::info(format!("Zoom {:.0}%", z * 100.)), cx);
 }
 

@@ -521,8 +521,7 @@ impl SettingsView {
                             .child(Button::new("th-system").small().outline().label("System").on_click(|_, w, cx| {
                                 crate::app::forget_theme_choice();
                                 let mode = crate::app::initial_theme(cx);
-                                crate::app::set_theme(mode, Some(w), cx);
-                                crate::app::forget_theme_choice();
+                                crate::app::apply_theme(mode, Some(w), cx);
                             })),
                         cx,
                     ))
@@ -548,7 +547,7 @@ impl SettingsView {
                                     let n = n.clone();
                                     settings::update(|s| s.accent = n);
                                     let mode = cx.theme().mode;
-                                    crate::app::set_theme(mode, Some(w), cx);
+                                    crate::app::apply_theme(mode, Some(w), cx);
                                 })
                         })),
                         cx,
