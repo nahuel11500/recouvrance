@@ -37,6 +37,8 @@ pub struct TerminalView {
     focus: FocusHandle,
     status: Option<SharedString>,
     size: (u16, u16),
+    /// Scrolled part of a line not applied yet (trackpads scroll a few pixels at a time).
+    scroll_rest: f32,
     bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
     session: Option<(TaskGuard, Task<()>)>,
     /// Exec and attach need write mode, and this context's name typed when it is protected.
@@ -74,6 +76,7 @@ impl TerminalView {
             focus: cx.focus_handle(),
             status: None,
             size: (80, 24),
+            scroll_rest: 0.,
             bounds: Rc::default(),
             session: None,
             guard: None,
@@ -267,10 +270,11 @@ impl TerminalView {
     }
 
     fn on_scroll(&mut self, ev: &ScrollWheelEvent, _: &mut Window, cx: &mut Context<Self>) {
-        let lines = match ev.delta {
-            ScrollDelta::Lines(d) => d.y.round() as i32,
-            ScrollDelta::Pixels(d) => (f32::from(d.y) / 18.).round() as i32,
+        let delta = match ev.delta {
+            ScrollDelta::Lines(d) => d.y,
+            ScrollDelta::Pixels(d) => f32::from(d.y) / 18.,
         };
+        let lines = whole_lines(&mut self.scroll_rest, delta);
         let current = self.parser.screen().scrollback() as i32;
         let next = (current + lines).clamp(0, SCROLLBACK as i32) as usize;
         self.parser.screen_mut().set_scrollback(next);
@@ -552,6 +556,13 @@ fn key_bytes(ks: &Keystroke, app_cursor: bool) -> Option<Vec<u8>> {
     Some(bytes)
 }
 
+/// The whole lines in `delta` plus what was left over before; the rest is kept for the next event.
+fn whole_lines(rest: &mut f32, delta: f32) -> i32 {
+    let total = *rest + delta;
+    *rest = total.fract();
+    total.trunc() as i32
+}
+
 /// A terminal dimension (vt100 wants at least one row and column).
 fn nz(v: u16) -> std::num::NonZeroU16 {
     std::num::NonZeroU16::new(v).unwrap_or(std::num::NonZeroU16::MIN)
@@ -621,7 +632,17 @@ fn vt_color(color: vt100::Color, default: Hsla, dark: bool) -> Hsla {
 
 #[cfg(test)]
 mod tests {
-    use super::paste_bytes;
+    use super::{paste_bytes, whole_lines};
+
+    #[test]
+    fn small_scrolls_add_up() {
+        let mut rest = 0.;
+        let lines: i32 = (0..10).map(|_| whole_lines(&mut rest, 4. / 18.)).sum();
+        assert_eq!(lines, 2);
+        // Back the other way.
+        assert_eq!(whole_lines(&mut rest, -1.), 0);
+        assert_eq!(whole_lines(&mut rest, -2.5), -3);
+    }
 
     #[test]
     fn bracketed_paste() {
