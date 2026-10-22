@@ -24,6 +24,10 @@ impl AppView {
         self.kinds.clear();
         self.watch = None;
         self.metrics = None;
+        // The problem badge counted the old clusters.
+        self._problem_watch = None;
+        self.problem_counts = None;
+        self.problem_gaps = None;
         // Details belong to the old clusters, in every tab: the other tabs go
         // back to their resource list (kinds and namespaces checked once connected).
         self.history = vec![Route::Resources(self.kind.clone())];
