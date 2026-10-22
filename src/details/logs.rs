@@ -29,8 +29,9 @@ pub struct LogsView {
     pub(super) since: Option<i64>,
     pub(super) client: Client,
     pub(super) ns: String,
-    /// One pod (container selectable) or all pods of a workload.
+    /// One pod or all pods of a workload.
     pub(super) pods: Vec<String>,
+    /// The first pod's containers; the chosen one is read from every pod.
     pub(super) containers: Option<Entity<SelectState<SearchableVec<SharedString>>>>,
     pub(super) container: Option<String>,
     pub(super) previous: bool,
@@ -123,9 +124,7 @@ impl LogsView {
             _load: None,
         };
         // Streams start when the Logs tab is first shown (`resume`).
-        if this.pods.len() == 1 {
-            this.load_containers(window, cx);
-        }
+        this.load_containers(window, cx);
         this
     }
 
@@ -211,13 +210,13 @@ impl LogsView {
         self.pod_states = vec![StreamState::Connecting; self.pods.len()];
         self.streams.clear();
         let mut receivers = Vec::new();
+        // A workload's pods share their containers: the chosen one is read from each.
         for (ix, pod) in self.pods.iter().enumerate() {
-            let container = if self.pods.len() == 1 { self.container.clone() } else { None };
             let (guard, rx) = k8s::stream_logs(
                 self.client.clone(),
                 self.ns.clone(),
                 pod.clone(),
-                container,
+                self.container.clone(),
                 self.previous,
                 self.since,
             );
