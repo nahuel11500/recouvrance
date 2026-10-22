@@ -61,6 +61,7 @@ hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
 hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "native-tokio", "ring"] }
 http-body-util = "0.1"
 bytes = "1"
+tower = { version = "0.5.3", default-features = false, features = ["timeout"] }
 
 [features]
 # Off-screen rendering of the real UI to a PNG, for development.

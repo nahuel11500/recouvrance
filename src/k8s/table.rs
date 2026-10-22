@@ -213,6 +213,9 @@ pub(super) fn snapshot(rows: &HashMap<String, Arc<Row>>) -> Vec<Arc<Row>> {
 
 pub(super) const PAGE_SIZE: u32 = 2000;
 
+/// A watch that hears nothing (not even a bookmark) for this long is reconnected.
+const WATCH_IDLE: std::time::Duration = std::time::Duration::from_secs(120);
+
 /// List in Table form, a page at a time: the server never builds one giant
 /// response and we never hold one in memory.
 pub(super) async fn list_paged(
@@ -334,26 +337,50 @@ pub fn watch_table_paused(
         let ns = if kind.namespaced { namespace.as_deref() } else { None };
         let url = DynamicObject::url_path(&kind.ar, ns);
         let mut first = true;
+        let mut backoff = Backoff::default();
         loop {
-            match watch_once(&client, &url, &tx, &extras, &mut first, &pause).await {
-                Ok(()) => {}
-                Err(e) => {
-                    if api_status(&e) == Some(403) {
-                        let _ = tx.unbounded_send(TableMsg::Forbidden(short_error(&e)));
-                        return;
-                    }
-                    if tx.unbounded_send(TableMsg::Error(short_error(&e))).is_err() {
-                        return;
-                    }
-                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            // Whether this round listed or got events: only then does the wait start over.
+            let mut progress = false;
+            let result = watch_once(&client, &url, &tx, &extras, &mut first, &pause, &mut progress).await;
+            if let Err(e) = &result {
+                if api_status(e) == Some(403) {
+                    let _ = tx.unbounded_send(TableMsg::Forbidden(short_error(e)));
+                    return;
+                }
+                if tx.unbounded_send(TableMsg::Error(short_error(e))).is_err() {
+                    return;
                 }
             }
             if tx.is_closed() {
                 return;
             }
+            if progress {
+                backoff = Backoff::default();
+            }
+            // A relist right after progress (410 Gone) goes at once; a failing server is
+            // retried less and less often, not every few seconds by every open list.
+            if result.is_err() || !progress {
+                tokio::time::sleep(backoff.next()).await;
+            }
         }
     });
     (guard, rx)
+}
+
+/// Waits between failed attempts: 0.8s doubling up to 30s, each with up to 25% added at
+/// random so lists of many users don't retry in step (the same curve as client-go).
+#[derive(Default)]
+struct Backoff {
+    attempts: u32,
+}
+
+impl Backoff {
+    fn next(&mut self) -> std::time::Duration {
+        let base = (800u64 << self.attempts.min(6)).min(30_000);
+        self.attempts += 1;
+        let jitter = (uuid::Uuid::new_v4().as_u128() % 1000) as u64 * base / 4000;
+        std::time::Duration::from_millis(base + jitter)
+    }
 }
 
 /// One list then watch. Until a first list completes (`first`), pages are shown
@@ -366,6 +393,7 @@ pub(super) async fn watch_once(
     extras: &Extras,
     first: &mut bool,
     pause: &Pause,
+    progress: &mut bool,
 ) -> Result<()> {
     let request = Request::new(url);
     let full = needs_full(extras);
@@ -394,6 +422,7 @@ pub(super) async fn watch_once(
     let mut rows: HashMap<String, Arc<Row>> = list_rows.into_iter().map(|r| (r.uid.clone(), r)).collect();
     let mut snaps = Snapshots { dirty: true, sent: None };
     snaps.flush(&rows, tx, pause)?;
+    *progress = true;
     if *first {
         tx.unbounded_send(TableMsg::Listed)?;
         *first = false;
@@ -405,19 +434,29 @@ pub(super) async fn watch_once(
         let req = with_table_format(request.watch(&wp, &version)?, full)?;
         let reader = client.request_stream(req).await?;
         let mut chunks = std::pin::pin!(reader.lines().ready_chunks(256));
+        let mut heard = tokio::time::Instant::now();
         loop {
             // Wake up for a pending snapshot even when no event comes.
-            let next = match snaps.wait(pause) {
-                Some(wait) => tokio::select! {
-                    lines = chunks.next() => Some(lines),
-                    () = tokio::time::sleep(wait) => None,
-                },
-                None => Some(chunks.next().await),
+            let flush = snaps.wait(pause);
+            let next = tokio::select! {
+                lines = chunks.next() => Some(lines),
+                () = async {
+                    match flush {
+                        Some(wait) => tokio::time::sleep(wait).await,
+                        None => std::future::pending().await,
+                    }
+                } => None,
+                // A healthy watch gets a bookmark about once a minute even when nothing
+                // changes; silence this long is a connection that died without closing
+                // (sleep, VPN, NAT). Watch again from `version`, without a relist.
+                () = tokio::time::sleep_until(heard + WATCH_IDLE) => break,
             };
             match next {
                 // The server ended the watch (timeout): watch again from `version`.
                 Some(None) => break,
                 Some(Some(lines)) => {
+                    heard = tokio::time::Instant::now();
+                    *progress = true;
                     for line in lines {
                         let line = line?;
                         match apply_event(&line, &mut rows, &mut version, extras)? {
@@ -635,6 +674,21 @@ mod watch_tests {
         // A bookmark without a version keeps ours.
         apply_event(r#"{"type":"BOOKMARK","object":{}}"#, &mut rows, &mut version, &extras).unwrap();
         assert_eq!(version, "42");
+    }
+}
+
+#[cfg(test)]
+mod backoff_tests {
+    #[test]
+    fn retries_slow_down_to_thirty_seconds() {
+        let mut b = super::Backoff::default();
+        let waits: Vec<u128> = (0..10).map(|_| b.next().as_millis()).collect();
+        // 0.8s, 1.6s, 3.2s … each with up to 25% more, then 30s (up to 37.5s) from the 6th on.
+        for (i, w) in waits.iter().enumerate() {
+            let base = (800u128 << i.min(6)).min(30_000);
+            assert!((base..=base + base / 4).contains(w), "attempt {i}: {w}ms");
+        }
+        assert!(super::Backoff::default().next().as_millis() < 1_000, "a new backoff starts short");
     }
 }
 

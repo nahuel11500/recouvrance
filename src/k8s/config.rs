@@ -176,6 +176,10 @@ fn looks_risky(texts: &[&str]) -> bool {
     })
 }
 
+/// The longest wait for a response to start (headers). It also covers a token refresh by an
+/// exec plugin, which can be a browser login (kubelogin): long enough for a person to log in.
+const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
+
 pub async fn connect(context: String) -> Result<Client> {
     run(async move {
         let kc = kubeconfig()?;
@@ -189,7 +193,11 @@ pub async fn connect(context: String) -> Result<Client> {
         let opts = KubeConfigOptions { context: Some(context.clone()), ..Default::default() };
         let config =
             Config::from_custom_kubeconfig(kc, &opts).await.with_context(|| format!("loading context {context}"))?;
-        Ok(Client::try_from(config)?)
+        // kube sets no read timeout: on a connection that died without a word (sleep, VPN,
+        // NAT), a request would wait forever. This bounds the wait for the response headers;
+        // watches, logs and shells stream after that and are not cut.
+        let timeout = tower::timeout::TimeoutLayer::new(REQUEST_TIMEOUT);
+        Ok(kube::client::ClientBuilder::try_from(config)?.with_layer(&timeout).build())
     })
     .await
 }

@@ -360,7 +360,36 @@ fn pod_counts(pods: &Tbl) -> Vec<(String, usize, Tone)> {
     }))
 }
 
-/// Restarts in the last hour and containers near their limits, from full pod specs.
+/// The parts of a pod `pod_details` reads: managed fields, volumes and the rest are skipped
+/// while parsing, which matters at thousands of pods.
+#[derive(serde::Deserialize, Default)]
+#[serde(default)]
+struct PodDetail {
+    metadata: PodMeta,
+    spec: PodSpecLite,
+    status: PodStatusLite,
+}
+
+#[derive(serde::Deserialize, Default)]
+#[serde(default)]
+struct PodMeta {
+    name: String,
+    namespace: String,
+}
+
+#[derive(serde::Deserialize, Default)]
+#[serde(default)]
+struct PodSpecLite {
+    containers: Vec<Value>,
+}
+
+#[derive(serde::Deserialize, Default)]
+#[serde(default, rename_all = "camelCase")]
+struct PodStatusLite {
+    container_statuses: Vec<Value>,
+}
+
+/// Restarts in the last hour and containers near their limits, from pod specs.
 async fn pod_details(client: &Client, ns: &Option<String>, context: &str) -> Result<(Vec<Restart>, Vec<Hot>), String> {
     let usage = async {
         match ns {
@@ -368,15 +397,18 @@ async fn pod_details(client: &Client, ns: &Option<String>, context: &str) -> Res
             None => all_usage(client).await,
         }
     };
-    let (pods, usage): (Result<Vec<Value>, String>, ContainerUsage) =
-        futures::join!(list(client, k8s::ar_of::<core::Pod>(), ns), usage);
+    let pods = async {
+        k8s::lists::list_lean::<PodDetail>(client.clone(), k8s::ar_of::<core::Pod>(), ns.clone())
+            .await
+            .map_err(|e| k8s::lists::load_error(&e))
+    };
+    let (pods, usage): (Result<Vec<PodDetail>, String>, ContainerUsage) = futures::join!(pods, usage);
     let pods = pods?;
     let hour_ago = jiff::Timestamp::now() - jiff::SignedDuration::from_secs(3600);
     let (mut restarts, mut hot) = (Vec::new(), Vec::new());
     for p in &pods {
-        let namespace = st(p, "/metadata/namespace").to_string();
-        let pod = st(p, "/metadata/name").to_string();
-        for c in p.pointer("/status/containerStatuses").and_then(Value::as_array).into_iter().flatten() {
+        let (namespace, pod) = (p.metadata.namespace.clone(), p.metadata.name.clone());
+        for c in &p.status.container_statuses {
             if let Some(when) = ts(c, "/lastState/terminated/finishedAt").filter(|t| *t >= hour_ago) {
                 restarts.push(Restart {
                     context: context.to_string(),
@@ -389,7 +421,7 @@ async fn pod_details(client: &Client, ns: &Option<String>, context: &str) -> Res
                 });
             }
         }
-        for c in p.pointer("/spec/containers").and_then(Value::as_array).into_iter().flatten() {
+        for c in &p.spec.containers {
             let name = st(c, "/name");
             let Some(&(cpu, mem)) = usage.get(&pod).and_then(|u| u.get(name)) else { continue };
             let cpu_limit = c.pointer("/resources/limits/cpu").and_then(Value::as_str).map(k8s::parse_cpu);
