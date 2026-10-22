@@ -45,6 +45,7 @@ impl AppView {
     pub(super) fn restart_watch(&mut self, cx: &mut Context<Self>) {
         self.watch = None;
         self.metrics = None;
+        self.keep_view(cx);
         let Some(kind) = self.kind.clone() else { return };
         // Not connected: open the cluster switcher instead of doing nothing.
         if self.clusters.is_empty() {
@@ -56,6 +57,15 @@ impl AppView {
         let ns_filter = (self.namespaces.len() > 1).then(|| self.namespaces.iter().cloned().collect());
         let names: Vec<String> = self.clusters.iter().map(|(c, _)| c.clone()).collect();
         self.rows_by_ctx = vec![Vec::new(); self.clusters.len()];
+        let key = format!(
+            "{}|{}|{:?}|{:?}",
+            names.join(","),
+            kind.key(),
+            self.namespace,
+            self.column_prefs.custom(&kind.kubectl_name())
+        );
+        let cached = self.views.get(&key).filter(|v| v.rows.len() == self.clusters.len()).cloned();
+        self.view_key = Some(key);
         // Wait only for the clusters that serve this kind: the others never report.
         let serving = self.kind_clusters.get(&kind.key()).cloned();
         self.listing = (0..self.clusters.len()).filter(|ix| serving.as_ref().is_none_or(|s| s.contains(ix))).collect();
@@ -96,6 +106,24 @@ impl AppView {
             t.refresh(cx);
         });
         self.status = loading.then(|| "Loading…".into());
+        // Seen recently: show it as it was while the new list loads (whole, not by pages).
+        let progressive = cached.is_none();
+        if let Some(view) = cached {
+            self.rows_by_ctx = view.rows;
+            let merged = self.merged_rows();
+            self.table.update(cx, |t, cx| {
+                t.delegate_mut().loading = false;
+                t.delegate_mut().update_columns(view.columns);
+                t.delegate_mut().set_rows(merged);
+                t.refresh(cx);
+            });
+            if loading {
+                let ago = k8s::age(
+                    jiff::Timestamp::now() - jiff::SignedDuration::try_from(view.at.elapsed()).unwrap_or_default(),
+                );
+                self.status = Some(format!("Updating… (showing the list from {ago} ago)").into());
+            }
+        }
         let mut watches = Vec::new();
         let mut metrics = Vec::new();
         // Set while the list is hidden: watches hold their snapshots back, metrics stop polling.
@@ -110,6 +138,7 @@ impl AppView {
                 self.namespace.clone(),
                 Arc::new(self.column_prefs.custom(&kind.kubectl_name())),
                 pause.clone(),
+                progressive,
             );
             let shown = pause.clone();
             let task = cx.spawn(async move |this, cx| {
@@ -164,6 +193,23 @@ impl AppView {
         cx.notify();
     }
 
+    /// Keep the list on screen in `views` (if it was complete), before another replaces it.
+    fn keep_view(&mut self, cx: &mut Context<Self>) {
+        let Some(key) = self.view_key.take() else { return };
+        let forbidden = self.table.read(cx).delegate().forbidden;
+        if !self.listing.is_empty() || forbidden || self.rows_by_ctx.iter().all(Vec::is_empty) {
+            return;
+        }
+        let columns = self.table.read(cx).delegate().defs();
+        let view = view_cache::CachedView { columns, rows: self.rows_by_ctx.clone(), at: std::time::Instant::now() };
+        self.views.put(key, view);
+    }
+
+    /// Every cluster's rows, each with its cluster's index.
+    fn merged_rows(&self) -> Vec<(usize, Arc<k8s::Row>)> {
+        self.rows_by_ctx.iter().enumerate().flat_map(|(i, rows)| rows.iter().map(move |r| (i, r.clone()))).collect()
+    }
+
     /// Messages that piled up from one cluster's watch: every one in order, except
     /// rows that newer rows replace (each costs a filter and a sort of the whole list).
     pub(super) fn on_table_msgs(&mut self, ctx: usize, batch: Vec<TableMsg>, cx: &mut Context<Self>) {
@@ -187,12 +233,7 @@ impl AppView {
                 if let Some(slot) = self.rows_by_ctx.get_mut(ctx) {
                     *slot = rows;
                 }
-                let merged: Vec<(usize, Arc<k8s::Row>)> = self
-                    .rows_by_ctx
-                    .iter()
-                    .enumerate()
-                    .flat_map(|(i, rows)| rows.iter().map(move |r| (i, r.clone())))
-                    .collect();
+                let merged = self.merged_rows();
                 let moved = self.table.update(cx, |t, cx| {
                     let menu_open = t.right_clicked_row().is_some();
                     t.delegate_mut().set_rows(merged);

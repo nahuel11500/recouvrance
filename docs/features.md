@@ -23,6 +23,8 @@
   (discovery, lists, watches, metrics, logs, shells, writes) were made, how many failed, and how
   long the API server took to start answering: average, slowest, last.
 - **Favorites** and **saved views** (type + namespaces + filter, bookmark button), back/forward history, light and dark themes.
+- **Instant back**: the last 8 lists (up to 10,000 rows in all) are kept, so going back to one
+  shows it at once, marked "Updating…", while a fresh list loads and replaces it in one go.
 - **Bulk actions**: check rows, then restart, scale, delete or copy names. Scaling needs the number
   of objects typed (the replica count is never suggested), deleting asks as set for the kind (see
   below), and each protected context among them needs its name typed; rows from several contexts
