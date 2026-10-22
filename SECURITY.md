@@ -5,12 +5,18 @@ reports are taken seriously.
 
 ## Reporting a vulnerability
 
-Please **do not open a public issue**. Use GitHub's private vulnerability reporting: the
-**Security** tab of the repository → **Report a vulnerability**. Include what you found, how to
-reproduce it, and its impact.
+Please **do not open a public issue**. Report it privately with GitHub's vulnerability reporting
+form: <https://github.com/nahuel11500/recouvrance/security/advisories/new> (the **Security** tab of
+the repository → **Report a vulnerability**). Include what you found, how to reproduce it, and its
+impact.
 
-You will get an answer within a few days. Once a fix is released, you are credited in the release
-notes unless you prefer otherwise.
+What happens next:
+
+- you get a first answer within 7 days;
+- the fix goes into a new release as soon as it is ready;
+- the advisory is published (disclosure) once the fix is released, and at the latest 90 days after
+  your report, unless we agree on another date together;
+- you are credited in the advisory and the release notes, unless you prefer otherwise.
 
 ## Scope
 
