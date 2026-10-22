@@ -5,6 +5,23 @@ and versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/nahuel11500/recouvrance/compare/v0.1.0...v0.2.0) - 2026-10-22
+
+### Added
+
+- Delete confirmation per kind, with defaults by how much a kind matters ([#16](https://github.com/nahuel11500/recouvrance/pull/16))
+- A simpler app icon for 16 and 24 px ([#15](https://github.com/nahuel11500/recouvrance/pull/15))
+- New app icon, with a README trust section, screenshots and tour, pinned actions and Scorecard ([#14](https://github.com/nahuel11500/recouvrance/pull/14))
+- *(agents)* Activity grouped by task, with filters and older calls ([#13](https://github.com/nahuel11500/recouvrance/pull/13))
+- *(pods)* Port-forward from the Ports cards ([#10](https://github.com/nahuel11500/recouvrance/pull/10))
+- *(nodes)* Allocation as cards with requests and limits bars ([#9](https://github.com/nahuel11500/recouvrance/pull/9))
+
+### Fixed
+
+- Run each exec-plugin login once at a time ([#11](https://github.com/nahuel11500/recouvrance/pull/11))
+- Let dialog inputs keep focus ([#8](https://github.com/nahuel11500/recouvrance/pull/8))
+- *(table)* One sort arrow, on the sorted column only ([#6](https://github.com/nahuel11500/recouvrance/pull/6))
+
 ## [0.1.0](https://github.com/nahuel11500/recouvrance/compare/v0.0.1...v0.1.0) - 2026-10-20
 
 ### Added
