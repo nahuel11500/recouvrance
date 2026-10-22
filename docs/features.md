@@ -39,7 +39,8 @@
 - **Write mode** (off by default): click the `read-only` badge to enable scale, restart, delete
   (confirmed as set per kind), YAML edits (validated by a server dry run first), cordon/uncordon nodes,
   debug pods with an ephemeral container (falls back to a Pod Security "restricted" profile), run a CronJob now, suspend/resume (CronJobs, Flux, Argo CronWorkflows), drain nodes, force delete
-  or remove finalizers (only once the delete leaves it stuck terminating), Flux *Reconcile*, Argo CD
+  or remove finalizers (only once the delete leaves it stuck terminating: it already was, or still is
+  after 10 seconds), Flux *Reconcile*, Argo CD
   *Refresh*/*Sync*, create/apply YAML (a server dry run first, then a confirmation listing each
   object's kind, namespace and name). YAML edits on a detail page save only that object: a changed
   kind, API group, namespace or name is refused, and so are masked Secret values. Every
