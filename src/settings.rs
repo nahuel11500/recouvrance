@@ -2,7 +2,8 @@
 //! any thread (the Kubernetes side reads refresh rates and kubeconfig paths).
 
 use std::path::{Path, PathBuf};
-use std::sync::{LazyLock, RwLock};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{LazyLock, Mutex, RwLock};
 
 use serde::{Deserialize, Serialize};
 
@@ -246,6 +247,10 @@ impl Default for Settings {
 }
 
 static SETTINGS: LazyLock<RwLock<Settings>> = LazyLock::new(|| RwLock::new(load()));
+/// Numbers each change, in the order they were made.
+static CHANGES: AtomicU64 = AtomicU64::new(0);
+/// The newest change on disk.
+static SAVED: Mutex<u64> = Mutex::new(0);
 
 fn path() -> PathBuf {
     let base = std::env::var_os("XDG_CONFIG_HOME")
@@ -313,16 +318,25 @@ pub fn with<T>(f: impl FnOnce(&Settings) -> T) -> T {
 
 /// Change and save settings.
 pub fn update(f: impl FnOnce(&mut Settings)) {
-    let json = {
+    let (change, json) = {
         let mut s = SETTINGS.write().unwrap();
         f(&mut s);
-        serde_json::to_vec_pretty(&*s)
+        (CHANGES.fetch_add(1, Ordering::Relaxed) + 1, serde_json::to_vec_pretty(&*s))
     };
     if let Ok(json) = json {
-        let p = path();
-        if let Err(e) = write_atomic(&p, &json) {
-            eprintln!("{}: {e}", p.display());
-        }
+        save_newest(&SAVED, change, || {
+            let p = path();
+            write_atomic(&p, &json).map_err(|e| eprintln!("{}: {e}", p.display())).is_ok()
+        });
+    }
+}
+
+/// Run `write` for `change` unless a newer change is already saved: two saves at once
+/// never leave the older one on disk. `write` says whether it saved.
+fn save_newest(saved: &Mutex<u64>, change: u64, write: impl FnOnce() -> bool) {
+    let mut newest = saved.lock().unwrap();
+    if change > *newest && write() {
+        *newest = change;
     }
 }
 
@@ -479,8 +493,8 @@ fn unix_now() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        DeleteConfirm, NamespaceVisit, Settings, load_json, migrate_list, recent_as_visits, record_visits, visit_score,
-        write_atomic,
+        DeleteConfirm, NamespaceVisit, Settings, load_json, migrate_list, recent_as_visits, record_visits, save_newest,
+        visit_score, write_atomic,
     };
 
     const DAY: i64 = 24 * 3600;
@@ -616,5 +630,26 @@ mod tests {
         let v: Vec<String> = load_json(&d.join("missing.json"));
         assert!(v.is_empty());
         std::fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn an_older_save_never_overwrites_a_newer_one() {
+        let saved = std::sync::Mutex::new(0);
+        let mut written = Vec::new();
+        save_newest(&saved, 2, || {
+            written.push(2);
+            true
+        });
+        save_newest(&saved, 1, || {
+            written.push(1);
+            true
+        });
+        // A failed save leaves room for the next one.
+        save_newest(&saved, 3, || false);
+        save_newest(&saved, 4, || {
+            written.push(4);
+            true
+        });
+        assert_eq!(written, [2, 4]);
     }
 }
