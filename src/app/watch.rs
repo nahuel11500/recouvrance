@@ -70,11 +70,6 @@ impl AppView {
         let serving = self.kind_clusters.get(&kind.key()).cloned();
         self.listing = (0..self.clusters.len()).filter(|ix| serving.as_ref().is_none_or(|s| s.contains(ix))).collect();
         let loading = !self.listing.is_empty();
-        self.table.update(cx, |t, _| {
-            let d = t.delegate_mut();
-            d.loading = loading;
-            d.forbidden = false;
-        });
         let is_pod = kind.is("", "Pod");
         let mut actions = Vec::new();
         if kind.is("batch", "CronJob") {
@@ -101,6 +96,8 @@ impl AppView {
                 self.column_prefs.get(&kind.kubectl_name()),
                 self.column_prefs.widths(&kind.kubectl_name()),
             );
+            // After the reset, which starts the table over (not loading, not forbidden).
+            t.delegate_mut().loading = loading;
             t.delegate_mut().set_namespace_filter(ns_filter);
             t.delegate_mut().set_filter(filter_text);
             t.refresh(cx);
