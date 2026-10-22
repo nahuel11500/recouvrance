@@ -228,8 +228,10 @@ impl AppView {
     /// restarting the watch.
     pub(super) fn choose_namespaces(&mut self, mut namespaces: Vec<String>, cx: &mut Context<Self>) {
         let accessible = self.accessible_namespaces();
-        if namespaces.len() != 1 && !accessible.is_empty() {
-            namespaces = vec![namespaces.last().cloned().unwrap_or_else(|| accessible[0].clone())];
+        if namespaces.len() != 1
+            && let Some(one) = one_namespace(&namespaces, &self.namespaces, &accessible)
+        {
+            namespaces = vec![one];
             let sel = namespaces.clone();
             self.ns_picker.update(cx, |p, cx| {
                 p.selected = sel.into_iter().collect();
@@ -238,5 +240,30 @@ impl AppView {
         }
         self.namespaces = namespaces;
         self.namespace = (self.namespaces.len() == 1).then(|| self.namespaces[0].clone());
+    }
+}
+
+/// The one namespace to show when only some are accessible: the one just ticked,
+/// else the last one asked for, else the first accessible one.
+fn one_namespace(wanted: &[String], previous: &[String], accessible: &[String]) -> Option<String> {
+    wanted.iter().find(|ns| !previous.contains(ns)).or(wanted.last()).or(accessible.first()).cloned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::one_namespace;
+
+    fn v(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn the_namespace_just_ticked_wins() {
+        let accessible = v(&["a", "b", "c"]);
+        assert_eq!(one_namespace(&v(&["a", "c"]), &v(&["c"]), &accessible).as_deref(), Some("a"));
+        assert_eq!(one_namespace(&v(&["a", "c"]), &v(&["a"]), &accessible).as_deref(), Some("c"));
+        assert_eq!(one_namespace(&v(&["a", "c"]), &v(&["a", "c"]), &accessible).as_deref(), Some("c"));
+        assert_eq!(one_namespace(&[], &v(&["c"]), &accessible).as_deref(), Some("a"));
+        assert_eq!(one_namespace(&[], &[], &[]), None);
     }
 }
