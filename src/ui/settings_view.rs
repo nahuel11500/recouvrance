@@ -24,10 +24,11 @@ enum Section {
     Agents,
     Plugins,
     Shortcuts,
+    Requests,
     About,
 }
 
-const SECTIONS: [(Section, &str, Lucide); 11] = [
+const SECTIONS: [(Section, &str, Lucide); 12] = [
     (Section::General, "General", Lucide::Settings),
     (Section::Contexts, "Contexts", Lucide::Ship),
     (Section::Clusters, "Per cluster", Lucide::Server),
@@ -38,6 +39,7 @@ const SECTIONS: [(Section, &str, Lucide); 11] = [
     (Section::Agents, "Agents (MCP)", Lucide::Bot),
     (Section::Plugins, "Plugins", Lucide::Puzzle),
     (Section::Shortcuts, "Shortcuts", Lucide::Keyboard),
+    (Section::Requests, "API requests", Lucide::Activity),
     (Section::About, "About", Lucide::Info),
 ];
 
@@ -57,6 +59,8 @@ pub struct SettingsView {
     delete_kind: Entity<InputState>,
     hub: std::sync::Arc<crate::mcp::Hub>,
     _subs: Vec<Subscription>,
+    /// Redraws API requests every 2 s while it is shown.
+    _ticker: Task<()>,
 }
 
 impl SettingsView {
@@ -196,6 +200,19 @@ impl SettingsView {
             delete_kind,
             hub,
             _subs: subs,
+            _ticker: cx.spawn(async move |this, cx| {
+                loop {
+                    cx.background_executor().timer(std::time::Duration::from_secs(2)).await;
+                    let shown = this.update(cx, |this, cx| {
+                        if this.section == Section::Requests {
+                            cx.notify();
+                        }
+                    });
+                    if shown.is_err() {
+                        break;
+                    }
+                }
+            }),
         }
     }
 
@@ -665,6 +682,54 @@ impl SettingsView {
                             .child(div().w(px(220.)).child(div().px_2().py_0p5().rounded_md().bg(theme.secondary).text_xs().font_family(theme.mono_font_family.clone()).child(k)))
                             .child(div().text_sm().child(what))
                     }))
+                    .into_any_element()
+            }
+            Section::Requests => {
+                use crate::k8s::meter;
+                let ms = |d: std::time::Duration| format!("{} ms", d.as_millis());
+                let rows = meter::snapshot();
+                let cell = |w: f32, text: String| div().w(px(w)).flex_shrink_0().child(text);
+                let header = h_flex()
+                    .gap_3()
+                    .py_1()
+                    .text_xs()
+                    .text_color(muted)
+                    .border_b_1()
+                    .border_color(theme.border)
+                    .child(cell(170., "Cluster".into()))
+                    .child(cell(160., "Requests to".into()))
+                    .child(cell(80., "Count".into()))
+                    .child(cell(70., "Failed".into()))
+                    .child(cell(90., "Average".into()))
+                    .child(cell(90., "Slowest".into()))
+                    .child(cell(90., "Last".into()));
+                v_flex()
+                    .child(div().pb_2().text_sm().text_color(muted).child(
+                        "How long the API servers take to start answering, since Recouvrance started (watches and log streams count until they open). Failed: an error status, a timeout or no connection.",
+                    ))
+                    .child(header)
+                    .children(rows.iter().map(|(ctx, class, s)| {
+                        h_flex()
+                            .gap_3()
+                            .py_1()
+                            .text_sm()
+                            .border_b_1()
+                            .border_color(theme.border)
+                            .child(cell(170., ctx.clone()).overflow_hidden().text_ellipsis().whitespace_nowrap())
+                            .child(cell(160., class.label().into()))
+                            .child(cell(80., s.count.to_string()))
+                            .child(cell(70., s.errors.to_string()).when(s.errors > 0, |d| d.text_color(theme.warning)))
+                            .child(cell(90., ms(s.average())))
+                            .child(cell(90., ms(s.slowest)))
+                            .child(cell(90., ms(s.last)))
+                    }))
+                    .when(rows.is_empty(), |d| d.child(div().py_2().text_sm().text_color(muted).child("No requests yet.")))
+                    .child(h_flex().pt_3().child(Button::new("meter-reset").small().outline().label("Reset").on_click(
+                        cx.listener(|_, _, _, cx| {
+                            meter::reset();
+                            cx.notify();
+                        }),
+                    )))
                     .into_any_element()
             }
             Section::About => {
