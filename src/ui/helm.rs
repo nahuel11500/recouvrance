@@ -321,6 +321,24 @@ fn status_color(status: &str, cx: &App) -> Hsla {
 
 // MARK: List
 
+/// The releases of every cluster that answered, and "context: error" for the others; an
+/// error alone when no cluster answered.
+fn merge_clusters(results: Vec<(String, Result<Vec<Release>>)>) -> (Result<Vec<Release>, String>, Vec<String>) {
+    let single = results.len() == 1;
+    let (mut releases, mut errors, mut answered) = (Vec::new(), Vec::new(), false);
+    for (ctx, r) in results {
+        match r {
+            Ok(rels) => {
+                answered = true;
+                releases.extend(rels);
+            }
+            Err(e) if single => errors.push(format!("{e:#}")),
+            Err(e) => errors.push(format!("{ctx}: {e:#}")),
+        }
+    }
+    if answered || errors.is_empty() { (Ok(releases), errors) } else { (Err(errors.join("\n")), Vec::new()) }
+}
+
 pub struct OpenRelease(pub Release);
 
 /// The "Install a chart" button was clicked.
@@ -331,6 +349,8 @@ pub struct HelmList {
     releases: Option<Result<Vec<Release>, SharedString>>,
     /// Indices in `releases` the filter keeps, worked out on each render.
     shown: Vec<usize>,
+    /// Clusters that could not be read while others could: "context: error".
+    errors: Vec<SharedString>,
     filter: Entity<InputState>,
     _task: Task<()>,
     _subs: Vec<Subscription>,
@@ -358,20 +378,18 @@ impl HelmList {
             let loads = clusters.iter().map(|(ctx, client)| {
                 let (ctx, client, ns) = (ctx.clone(), client.clone(), namespace.clone());
                 async move {
-                    let mut rels = list_releases(client, ns).await?;
-                    rels.iter_mut().for_each(|r| r.context = ctx.clone());
-                    anyhow::Ok(rels)
+                    let rels = list_releases(client, ns).await.map(|mut rels| {
+                        rels.iter_mut().for_each(|r| r.context = ctx.clone());
+                        rels
+                    });
+                    (ctx, rels)
                 }
             });
-            let result = futures::future::join_all(loads)
-                .await
-                .into_iter()
-                .collect::<anyhow::Result<Vec<_>>>()
-                .map(|v| v.into_iter().flatten().collect())
-                .map_err(|e| SharedString::from(format!("{e:#}")));
+            let (result, errors) = merge_clusters(futures::future::join_all(loads).await);
             let listed = result.is_ok();
             let _ = this.update(cx, |this, cx| {
-                this.releases = Some(result);
+                this.releases = Some(result.map_err(SharedString::from));
+                this.errors = errors.into_iter().map(SharedString::from).collect();
                 cx.notify();
             });
             if !listed {
@@ -396,7 +414,7 @@ impl HelmList {
             });
             futures::future::join_all(fills).await;
         });
-        Self { multi, releases: None, shown: Vec::new(), filter, _task: task, _subs: subs }
+        Self { multi, releases: None, shown: Vec::new(), errors: Vec::new(), filter, _task: task, _subs: subs }
     }
 
     /// Put read releases in place of their label-only rows.
@@ -509,6 +527,16 @@ impl Render for HelmList {
                             .child(div().size_2().rounded_full().bg(theme.success))
                             .child(format!("{count} Helm releases")),
                     )
+                    .when(!self.errors.is_empty(), |d| {
+                        d.child(
+                            v_flex()
+                                .px_2()
+                                .pb_2()
+                                .text_xs()
+                                .text_color(theme.danger)
+                                .children(self.errors.iter().map(|e| div().child(e.clone()))),
+                        )
+                    })
                     .child(header)
                     .child(
                         // Only the rows on screen are laid out: clusters hold thousands of releases.
@@ -1138,8 +1166,8 @@ impl Render for HelmRelease {
 mod tests {
     // Not `super::*`: gpui's own `test` attribute would shadow the standard one.
     use super::{
-        Secret, Value, chart_refs, decode, latest_revisions, mask_manifest, mask_secrets, newer_revision, stub,
-        upgrade_text, values_yaml,
+        Secret, Value, chart_refs, decode, latest_revisions, mask_manifest, mask_secrets, merge_clusters,
+        newer_revision, stub, upgrade_text, values_yaml,
     };
     use base64::Engine as _;
     use std::io::Write as _;
@@ -1288,6 +1316,19 @@ mod tests {
         assert_eq!(newer_revision(5, &history).map(|r| r.revision), Some(6));
         assert!(newer_revision(6, &history).is_none());
         assert!(newer_revision(5, &[]).is_none());
+    }
+
+    #[test]
+    fn one_cluster_failing_keeps_the_others() {
+        let web =
+            decode(&helm_secret(("sh.helm.release.v1.web.v1", "ns", "web"), &payload("web", "ns", 1), false)).unwrap();
+        let (ok, errors) =
+            merge_clusters(vec![("a".into(), Ok(vec![web])), ("b".into(), Err(anyhow::anyhow!("forbidden")))]);
+        assert_eq!(ok.unwrap().len(), 1);
+        assert_eq!(errors, ["b: forbidden"]);
+        let (all_failed, errors) = merge_clusters(vec![("b".into(), Err(anyhow::anyhow!("forbidden")))]);
+        assert_eq!(all_failed.err().as_deref(), Some("forbidden"));
+        assert!(errors.is_empty());
     }
 
     #[test]
