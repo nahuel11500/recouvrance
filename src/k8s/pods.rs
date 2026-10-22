@@ -46,14 +46,14 @@ pub struct EventLine {
 }
 
 pub async fn events_for(client: Client, obj: ObjectRef) -> Result<Vec<EventLine>> {
-    let uid = obj.uid.clone();
+    let fields = events_selector(&obj.kind.ar.kind, &obj.name, &obj.uid)?;
     let ns = obj.namespace.clone();
     run(async move {
         let api: Api<Event> = match &ns {
             Some(ns) => Api::namespaced(client, ns),
             None => Api::all(client),
         };
-        let lp = ListParams::default().fields(&format!("involvedObject.uid={uid}"));
+        let lp = ListParams::default().fields(&fields);
         let mut items = api.list(&lp).await?.items;
         let when = |e: &Event| {
             e.last_timestamp
@@ -75,6 +75,17 @@ pub async fn events_for(client: Client, obj: ObjectRef) -> Result<Vec<EventLine>
             .collect())
     })
     .await
+}
+
+/// The field selector for an object's events: by uid when it is known, else by kind
+/// and name (pages opened by name have no uid, rows of a fast first load a stand-in).
+fn events_selector(kind: &str, name: &str, uid: &str) -> Result<String> {
+    if !uid.is_empty() && !uid.contains('/') {
+        return Ok(format!("involvedObject.uid={uid}"));
+    }
+    names::validate_kind_name(kind).map_err(anyhow::Error::msg)?;
+    names::validate_name(name).map_err(anyhow::Error::msg)?;
+    Ok(format!("involvedObject.kind={kind},involvedObject.name={name}"))
 }
 
 /// The pod's containers, its default one (`kubectl.kubernetes.io/default-container`) first.
@@ -320,6 +331,19 @@ mod tests {
         assert_eq!(super::default_first(names(), Some("app")), ["app", "linkerd-proxy"]);
         assert_eq!(super::default_first(names(), None), ["linkerd-proxy", "app"]);
         assert_eq!(super::default_first(names(), Some("gone")), ["linkerd-proxy", "app"]);
+    }
+
+    #[test]
+    fn events_by_uid_else_by_name() {
+        let uid = "0b6f3c1e-8f7a-4c2e-9d1b-2a3c4d5e6f70";
+        assert_eq!(super::events_selector("Pod", "web-1", uid).unwrap(), format!("involvedObject.uid={uid}"));
+        for stand_in in ["", "default/web-1", "/node-1"] {
+            assert_eq!(
+                super::events_selector("Pod", "web-1", stand_in).unwrap(),
+                "involvedObject.kind=Pod,involvedObject.name=web-1"
+            );
+        }
+        assert!(super::events_selector("Pod", "x,involvedObject.namespace=y", "").is_err());
     }
 
     #[test]
