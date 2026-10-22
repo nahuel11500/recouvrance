@@ -170,9 +170,10 @@ pub fn run(ctx: String) {
                 }
                 Some(Some(k8s::TableMsg::Rows(r))) => {
                     let first = r.first().map(|r| (&r.namespace, &r.name, &r.cells));
-                    println!("{:>4}s rows={} first={first:?}", start.elapsed().as_secs(), r.len())
+                    // CI greps for lines starting with "rows=": the time goes at the end.
+                    println!("rows={} first={first:?} at={}s", r.len(), start.elapsed().as_secs())
                 }
-                Some(Some(k8s::TableMsg::Error(e))) => println!("{:>4}s ERROR {e}", start.elapsed().as_secs()),
+                Some(Some(k8s::TableMsg::Error(e))) => println!("ERROR {e} at={}s", start.elapsed().as_secs()),
                 Some(Some(k8s::TableMsg::Forbidden(e))) => println!("FORBIDDEN {e}"),
                 Some(Some(k8s::TableMsg::Listed)) => println!("listed"),
                 Some(None) => break,
