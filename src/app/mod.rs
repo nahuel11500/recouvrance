@@ -85,6 +85,8 @@ mod table_page;
 
 mod theme;
 
+mod view_cache;
+
 #[allow(unused_imports)]
 pub(crate) use chrome::*;
 
@@ -346,6 +348,11 @@ pub struct AppView {
     listing: HashSet<usize>,
     /// Latest rows per cluster, merged into the table.
     rows_by_ctx: Vec<Vec<Arc<k8s::Row>>>,
+    /// Lists shown recently, shown again at once when you come back to them.
+    views: view_cache::ViewCache,
+    /// What the list on screen is (clusters, kind, namespace, custom columns), to keep it
+    /// in `views` when another list replaces it.
+    view_key: Option<String>,
     kinds: Vec<Kind>,
     kind: Option<Kind>,
     namespace: Option<String>,
@@ -557,6 +564,8 @@ impl AppView {
             clusters: Vec::new(),
             kind_clusters: HashMap::new(),
             rows_by_ctx: Vec::new(),
+            views: Default::default(),
+            view_key: None,
             listing: HashSet::new(),
             kinds: Vec::new(),
             kind: None,

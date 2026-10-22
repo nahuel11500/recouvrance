@@ -321,22 +321,25 @@ pub fn watch_table(
     namespace: Option<String>,
     extras: Extras,
 ) -> (TaskGuard, mpsc::UnboundedReceiver<TableMsg>) {
-    watch_table_paused(client, kind, namespace, extras, Pause::default())
+    watch_table_paused(client, kind, namespace, extras, Pause::default(), true)
 }
 
-/// Like `watch_table`, holding snapshots back while `pause` is set.
+/// Like `watch_table`, holding snapshots back while `pause` is set. `pages`: show the first
+/// list page by page as it arrives (false when rows from before are on screen: the list
+/// then comes whole, replacing them in one go).
 pub fn watch_table_paused(
     client: Client,
     kind: Kind,
     namespace: Option<String>,
     extras: Extras,
     pause: Pause,
+    pages: bool,
 ) -> (TaskGuard, mpsc::UnboundedReceiver<TableMsg>) {
     let (tx, rx) = mpsc::unbounded();
     let guard = spawn_guarded(async move {
         let ns = if kind.namespaced { namespace.as_deref() } else { None };
         let url = DynamicObject::url_path(&kind.ar, ns);
-        let mut first = true;
+        let mut first = if pages { FirstList::Pages } else { FirstList::Whole };
         let mut backoff = Backoff::default();
         loop {
             // Whether this round listed or got events: only then does the wait start over.
@@ -383,15 +386,26 @@ impl Backoff {
     }
 }
 
-/// One list then watch. Until a first list completes (`first`), pages are shown
-/// as they arrive and `Listed` ends them (then `first` turns false); on a relist
-/// the table keeps its rows until the new list is complete, then gets it whole.
+/// Where a watch is with its first list.
+#[derive(Clone, Copy, PartialEq)]
+pub(super) enum FirstList {
+    /// Not listed yet: show pages as they arrive.
+    Pages,
+    /// Not listed yet, rows from before on screen: send the list whole.
+    Whole,
+    /// Listed (`Listed` sent): a relist keeps the rows until it is complete.
+    Done,
+}
+
+/// One list then watch. Until a first list completes, pages are shown as they arrive
+/// (`FirstList::Pages`) and `Listed` ends them; on a relist the table keeps its rows
+/// until the new list is complete, then gets it whole.
 pub(super) async fn watch_once(
     client: &Client,
     url: &str,
     tx: &mpsc::UnboundedSender<TableMsg>,
     extras: &Extras,
-    first: &mut bool,
+    first: &mut FirstList,
     pause: &Pause,
     progress: &mut bool,
 ) -> Result<()> {
@@ -399,7 +413,7 @@ pub(super) async fn watch_once(
     let full = needs_full(extras);
     // Show rows as pages arrive; big clusters take tens of seconds to list.
     let mut sent_columns = false;
-    let progressive = *first;
+    let progressive = *first == FirstList::Pages;
     let (defs, list_rows, version) = list_paged_with(client, url, ListParams::default(), extras, |defs, rows| {
         if !progressive {
             return;
@@ -423,9 +437,9 @@ pub(super) async fn watch_once(
     let mut snaps = Snapshots { dirty: true, sent: None };
     snaps.flush(&rows, tx, pause)?;
     *progress = true;
-    if *first {
+    if *first != FirstList::Done {
         tx.unbounded_send(TableMsg::Listed)?;
-        *first = false;
+        *first = FirstList::Done;
     }
     let mut version = version;
 
