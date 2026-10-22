@@ -122,11 +122,17 @@ pub fn sources() -> Vec<Source> {
     out
 }
 
+/// How a path is kept in settings: absolute (a typed `team.yaml` is relative to where
+/// Recouvrance was started, which changes), then with `~/`.
+fn settings_path(p: &std::path::Path) -> String {
+    tilde(&std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf()))
+}
+
 /// Add files or folders picked or typed in Settings. Returns what was not added and why.
 pub fn add_paths(paths: &[std::path::PathBuf]) -> Vec<String> {
     let mut problems = Vec::new();
     for p in paths {
-        let shown = tilde(p);
+        let shown = settings_path(p);
         if p.is_dir() {
             crate::settings::update(|s| {
                 if !s.kubeconfig_folders.contains(&shown) {
@@ -274,5 +280,14 @@ mod tests {
         let home = std::path::PathBuf::from(std::env::var_os("HOME").unwrap());
         assert_eq!(super::tilde(&home.join(".kube/a")), "~/.kube/a");
         assert_eq!(super::tilde(std::path::Path::new("/etc/k")), "/etc/k");
+    }
+
+    #[test]
+    fn typed_paths_are_kept_absolute() {
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(super::settings_path(std::path::Path::new("team.yaml")), super::tilde(&cwd.join("team.yaml")));
+        assert_eq!(super::settings_path(std::path::Path::new("/etc/k")), "/etc/k");
+        let home = std::path::PathBuf::from(std::env::var_os("HOME").unwrap());
+        assert_eq!(super::settings_path(&home.join(".kube/a")), "~/.kube/a");
     }
 }
