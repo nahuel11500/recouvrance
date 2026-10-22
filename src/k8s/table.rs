@@ -429,7 +429,7 @@ fn cells_row(row: ServerRow, namespace: Option<&str>, age: Option<usize>) -> Opt
 }
 
 /// kubectl's age ("45s", "2m3s", "5h", "3d4h", "2y") in seconds.
-pub(super) fn age_seconds(age: &str) -> Option<i64> {
+pub(crate) fn age_seconds(age: &str) -> Option<i64> {
     let (mut total, mut num) = (0i64, 0i64);
     let mut digits = false;
     for c in age.chars() {
