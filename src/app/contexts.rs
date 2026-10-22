@@ -41,6 +41,7 @@ impl AppView {
         self.index_built = None;
         self._index_tasks.clear();
         self.status = Some(format!("Connecting to {}…", contexts.join(", ")).into());
+        self.connect_errors = None;
         self.table.update(cx, |t, cx| {
             t.delegate_mut().reset(false, Vec::new(), None, Default::default());
             t.refresh(cx);
@@ -102,7 +103,7 @@ impl AppView {
                 match result {
                     Ok((client, kinds, kind_clusters, namespaces)) => {
                         this.kind_clusters = kind_clusters;
-                        this.status = (!errors.is_empty()).then(|| errors.join("; ").into());
+                        this.connect_errors = (!errors.is_empty()).then(|| errors.join("; ").into());
                         this.client = Some(client);
                         this.clusters = clusters;
                         let keep = this.kind.as_ref().map(|k| k.key());

@@ -252,11 +252,13 @@ impl Render for AppView {
                     .rounded_full()
                     .bg(cx.theme().secondary)
                     .text_xs()
-                    .child(div().size(px(7.)).rounded_full().bg(if self.watch.is_some() && self.status.is_none() {
-                        cx.theme().success
-                    } else {
-                        cx.theme().muted_foreground
-                    }))
+                    .child(div().size(px(7.)).rounded_full().bg(
+                        if self.watch.is_some() && self.status_line().is_none() {
+                            cx.theme().success
+                        } else {
+                            cx.theme().muted_foreground
+                        },
+                    ))
                     .child(if shown == total { format!("{total}") } else { format!("{shown} of {total}") })
                     .when(!self.listing.is_empty() && total > 0, |d| {
                         d.child(div().text_color(cx.theme().muted_foreground).child("loading…"))
@@ -298,7 +300,7 @@ impl Render for AppView {
         let main = v_flex()
             .size_full()
             .child(view_bar)
-            .when_some(self.status.clone(), |d, s| {
+            .when_some(self.status_line(), |d, s| {
                 d.child(div().px_3().py_1().text_sm().text_color(cx.theme().muted_foreground).child(s))
             })
             .children(self.render_selection_bar(cx))
