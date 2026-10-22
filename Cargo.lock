@@ -5873,6 +5873,7 @@ dependencies = [
  "similar 3.2.0",
  "tokio",
  "tokio-util",
+ "tower",
  "uuid",
  "vt100",
  "x509-cert",

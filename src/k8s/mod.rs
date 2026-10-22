@@ -161,7 +161,14 @@ pub fn short_error(e: &anyhow::Error) -> String {
             return status.message.clone();
         }
     }
-    format!("{e:#}")
+    let text = format!("{e:#}");
+    // A timeout from the connect or request deadline, said plainly instead of
+    // "ServiceError: client error (Connect): client error (Connect): deadline has elapsed".
+    if text.contains("deadline has elapsed") || text.contains("request timed out") {
+        let step = if text.contains("Connect") { "connecting to the API server" } else { "waiting for the API server" };
+        return format!("The cluster did not answer (timed out {step})");
+    }
+    text
 }
 
 /// The HTTP status of an API error (403 forbidden, 404 not found…), if it is one.
@@ -305,6 +312,15 @@ mod selector_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn timeouts_are_said_plainly() {
+        let connect = anyhow!("ServiceError: client error (Connect): client error (Connect): deadline has elapsed");
+        assert_eq!(short_error(&connect), "The cluster did not answer (timed out connecting to the API server)");
+        let request = anyhow!("ServiceError: request timed out");
+        assert_eq!(short_error(&request), "The cluster did not answer (timed out waiting for the API server)");
+        assert_eq!(short_error(&anyhow!("other")), "other");
+    }
 
     #[test]
     fn secrets_are_masked_everywhere() {

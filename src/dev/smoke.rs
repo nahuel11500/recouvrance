@@ -159,16 +159,20 @@ pub fn run(ctx: String) {
         );
         let pod = kinds.iter().find(|k| k.is("", "Pod")).unwrap().clone();
         let (_g, mut rx) = k8s::watch_table(client.clone(), pod, None, Default::default());
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        // RECOUVRANCE_WATCHSECS: watch longer (and timestamp each message), to check recovery.
+        let secs = std::env::var("RECOUVRANCE_WATCHSECS").ok().and_then(|s| s.parse().ok()).unwrap_or(20);
+        let start = std::time::Instant::now();
+        let deadline = start + std::time::Duration::from_secs(secs);
         while std::time::Instant::now() < deadline {
             match futures::FutureExt::now_or_never(rx.next()) {
                 Some(Some(k8s::TableMsg::Columns(c))) => {
                     println!("columns: {:?}", c.iter().map(|c| (&c.name, c.priority)).collect::<Vec<_>>())
                 }
                 Some(Some(k8s::TableMsg::Rows(r))) => {
-                    println!("rows={} first={:?}", r.len(), r.first().map(|r| (&r.namespace, &r.name, &r.cells)))
+                    let first = r.first().map(|r| (&r.namespace, &r.name, &r.cells));
+                    println!("{:>4}s rows={} first={first:?}", start.elapsed().as_secs(), r.len())
                 }
-                Some(Some(k8s::TableMsg::Error(e))) => println!("ERROR {e}"),
+                Some(Some(k8s::TableMsg::Error(e))) => println!("{:>4}s ERROR {e}", start.elapsed().as_secs()),
                 Some(Some(k8s::TableMsg::Forbidden(e))) => println!("FORBIDDEN {e}"),
                 Some(Some(k8s::TableMsg::Listed)) => println!("listed"),
                 Some(None) => break,

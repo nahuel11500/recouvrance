@@ -120,19 +120,35 @@ pub async fn container_usage(
 /// Node usage and allocatable: name -> ((millicores, bytes) used, (millicores, bytes) allocatable).
 pub type NodeUsage = HashMap<String, ((f64, f64), (f64, f64))>;
 
+/// A node's name and allocatable resources: all the metrics poll needs (a full Node also
+/// carries managed fields and the image list, read and dropped every poll otherwise).
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct NodeAllocatable {
+    metadata: ObjectMeta,
+    status: NodeAllocatableStatus,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct NodeAllocatableStatus {
+    allocatable: HashMap<String, String>,
+}
+
 /// Poll node metrics and allocatable every 15s, retrying (backing off) on errors;
 /// nothing while `pause` is set.
 pub fn watch_node_metrics(client: Client, pause: Pause) -> (TaskGuard, mpsc::UnboundedReceiver<NodeUsage>) {
     let (tx, rx) = mpsc::unbounded();
     let guard = spawn_guarded(async move {
-        let nodes: Api<k8s_openapi::api::core::v1::Node> = Api::all(client.clone());
+        let nodes = ar_of::<k8s_openapi::api::core::v1::Node>();
         let mut failures = 0;
         loop {
             wait_unpaused(&pause).await;
             let Ok(req) = http::Request::get("/apis/metrics.k8s.io/v1beta1/nodes").body(Vec::new()) else { return };
-            let (Ok(metrics), Ok(list)) =
-                (client.request::<serde_json::Value>(req).await, nodes.list(&ListParams::default()).await)
-            else {
+            let (Ok(metrics), Ok(list)) = (
+                client.request::<serde_json::Value>(req).await,
+                lists::list_lean::<NodeAllocatable>(client.clone(), nodes.clone(), None).await,
+            ) else {
                 if tx.is_closed() {
                     return;
                 }
@@ -141,11 +157,11 @@ pub fn watch_node_metrics(client: Client, pause: Pause) -> (TaskGuard, mpsc::Unb
             };
             failures = 0;
             let mut out = NodeUsage::new();
-            for n in list.items {
-                let name = n.metadata.name.clone().unwrap_or_default();
-                let alloc = n.status.and_then(|s| s.allocatable).unwrap_or_default();
-                let cpu = alloc.get("cpu").map(|q| parse_cpu(&q.0)).unwrap_or(0.0);
-                let mem = alloc.get("memory").map(|q| parse_bytes(&q.0)).unwrap_or(0.0);
+            for n in list {
+                let name = n.metadata.name.unwrap_or_default();
+                let alloc = n.status.allocatable;
+                let cpu = alloc.get("cpu").map(|q| parse_cpu(q)).unwrap_or(0.0);
+                let mem = alloc.get("memory").map(|q| parse_bytes(q)).unwrap_or(0.0);
                 out.insert(name, ((0.0, 0.0), (cpu, mem)));
             }
             for item in metrics["items"].as_array().into_iter().flatten() {
