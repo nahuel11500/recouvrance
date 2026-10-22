@@ -48,7 +48,9 @@ pub struct LogsView {
     pub(super) buf: LogBuffer,
     /// Where each pod's stream is (connecting, reconnecting, ended…).
     pub(super) pod_states: Vec<StreamState>,
+    /// Why the container list could not be read; it is read again when streams restart.
     pub(super) status: Option<SharedString>,
+    pub(super) reload_containers: bool,
     pub(super) scroll: UniformListScrollHandle,
     /// Wrap long lines (variable-height list).
     pub(super) wrap: bool,
@@ -112,6 +114,7 @@ impl LogsView {
             find_cur: 0,
             buf,
             status: None,
+            reload_containers: false,
             scroll: UniformListScrollHandle::new(),
             wrap: cfg!(feature = "dev") && std::env::var("RECOUVRANCE_LOG_WRAP").is_ok(),
             wrap_list: ListState::new(0, ListAlignment::Top, px(400.)),
@@ -173,6 +176,7 @@ impl LogsView {
             let result = fut.await;
             let _ = this.update_in(cx, |this, window, cx| match result {
                 Ok(names) => {
+                    this.status = None;
                     this.container = names.first().cloned();
                     if names.len() > 1 {
                         let items: Vec<SharedString> = names.into_iter().map(Into::into).collect();
@@ -195,7 +199,7 @@ impl LogsView {
                     }
                 }
                 Err(e) => {
-                    this.status = Some(format!("{e:#}").into());
+                    this.status = Some(format!("Containers not listed: {}", k8s::short_error(&e)).into());
                     cx.notify();
                 }
             });
@@ -207,7 +211,8 @@ impl LogsView {
         self.buf.clear();
         // Rows start over: remeasure the wrapped list.
         self.wrap_list.reset(0);
-        self.status = None;
+        // The next render reads the container list again (it needs the window).
+        self.reload_containers = self.status.is_some();
         self.pod_states = vec![StreamState::Connecting; self.pods.len()];
         self.streams.clear();
         let mut receivers = Vec::new();
@@ -529,14 +534,20 @@ impl LogsView {
             .into_any_element()
     }
 
-    /// The status line: the streams' state, else a message (container list errors).
+    /// The status line: the streams' state and a container list error.
     fn status_text(&self) -> Option<SharedString> {
-        stream_status(&self.pods, &self.pod_states).map(Into::into).or_else(|| self.status.clone())
+        match (stream_status(&self.pods, &self.pod_states), &self.status) {
+            (Some(streams), Some(e)) => Some(format!("{streams} · {e}").into()),
+            (streams, e) => streams.map(Into::into).or_else(|| e.clone()),
+        }
     }
 }
 
 impl Render for LogsView {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if std::mem::take(&mut self.reload_containers) {
+            self.load_containers(window, cx);
+        }
         let count = self.buf.shown_len();
         let mono = cx.theme().mono_font_family.clone();
         let muted = cx.theme().muted_foreground;
