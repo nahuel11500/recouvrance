@@ -114,6 +114,7 @@ fn rule_with(
         names: vec!["*".into()],
         note: note.into(),
         expires: None,
+        approved: false,
     }
 }
 
@@ -301,7 +302,12 @@ impl AgentsView {
         self.update(
             |a| {
                 if let Some(r) = a.policy.rules.get_mut(ix) {
+                    let before = r.clone();
                     f(r);
+                    // An approval covers one exact request: once edited it is an ordinary rule.
+                    if !r.same_request(&before) {
+                        r.approved = false;
+                    }
                 }
             },
             cx,

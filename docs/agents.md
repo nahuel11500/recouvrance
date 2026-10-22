@@ -33,7 +33,8 @@ Each agent has rules, like Kubernetes RBAC with an effect:
 started, rules can expire (e.g. "Allow for 1h" on an approval), a per-agent rate limit caps calls
 per minute, *Test access* shows the verdict for any request and which rule decided, and approval
 banners show the request with its key arguments (command, the whole patch, replicas, action, dry
-run) and offer **Always allow this** to add a narrow rule. For `apply_manifest` the banner lists
+run) and offer **Always allow this** to add a narrow rule; it wins over the Ask rule that asked, so
+the same request is not asked again (until you edit the rule). For `apply_manifest` the banner lists
 every object (kind, namespace/name) and the YAML that will be applied, a Secret's values masked.
 The *Always allow this* and *Allow for 1h* offers are left out where no rule can be that narrow:
 exec (a rule cannot pin the command), GitOps actions, `apply_manifest` (a rule cannot pin the

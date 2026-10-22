@@ -99,6 +99,10 @@ pub struct Rule {
     pub note: String,
     /// The rule stops applying after this time (temporary grants).
     pub expires: Option<jiff::Timestamp>,
+    /// Made by approving a request ("Always allow this", "Allow for 1h"): an Allow that
+    /// wins over the Ask rule that asked, so the same request is not asked again.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub approved: bool,
 }
 
 impl Default for Rule {
@@ -112,6 +116,7 @@ impl Default for Rule {
             names: vec!["*".into()],
             note: String::new(),
             expires: None,
+            approved: false,
         }
     }
 }
@@ -158,6 +163,16 @@ impl Rule {
             None => !self.names.is_empty(),
         };
         verb && resource && namespace && any_glob(&self.contexts, &a.context) && name
+    }
+
+    /// Whether both rules cover the same requests, the same way (notes and expiry aside).
+    pub fn same_request(&self, other: &Rule) -> bool {
+        self.effect == other.effect
+            && self.verbs == other.verbs
+            && self.resources == other.resources
+            && self.namespaces == other.namespaces
+            && self.contexts == other.contexts
+            && self.names == other.names
     }
 
     /// For list filtering: a Deny that blocks the whole request regardless of namespace.
@@ -230,7 +245,7 @@ pub struct Verdict {
 }
 
 impl Policy {
-    /// Deny wins over Ask, Ask over Allow; nothing matching means Deny.
+    /// Deny wins over Ask, Ask over Allow (except an approved request); nothing matching means Deny.
     pub fn decide(&self, a: &Access) -> Verdict {
         self.decide_inner(a, false)
     }
@@ -330,7 +345,8 @@ fn best<'a>(matching: impl Iterator<Item = (usize, &'a Rule)>) -> Verdict {
     let mut rank = 0;
     for (i, r) in matching {
         let r_rank = match r.effect {
-            Mode::Deny => 3,
+            Mode::Deny => 4,
+            Mode::Allow if r.approved => 3,
             Mode::Ask => 2,
             Mode::Allow => 1,
         };
@@ -499,6 +515,7 @@ impl Approval {
             names: vec![a.name.clone().unwrap_or_else(|| "*".into())],
             note: format!("Always allowed from approval ({})", jiff::Timestamp::now().strftime("%Y-%m-%d")),
             expires: None,
+            approved: true,
         })
     }
 
@@ -1043,6 +1060,7 @@ mod tests {
             names: vec!["*".into()],
             note: String::new(),
             expires: None,
+            approved: false,
         }
     }
 
@@ -1096,6 +1114,27 @@ mod tests {
             access: access("c1", "scale", "deployments.apps", Some("team"), Some("web")),
             dry_run: false,
         };
+        // It wins over the Ask rule that asked, for exactly this request.
+        let ask = rule(Mode::Ask, &["scale"], &["*"], &["*"], &["*"]);
+        let p = Policy { rules: vec![ask, approval.as_rule().unwrap()], ..Policy::default() };
+        assert_eq!(p.decide(&access("c1", "scale", "deployments.apps", Some("team"), Some("web"))).mode, Mode::Allow);
+        assert_eq!(p.decide(&access("c1", "scale", "deployments.apps", Some("team"), Some("api"))).mode, Mode::Ask);
+        let hour =
+            Policy { rules: vec![p.rules[0].clone(), approval.as_rule_for_an_hour().unwrap()], ..Policy::default() };
+        assert_eq!(
+            hour.decide(&access("c1", "scale", "deployments.apps", Some("team"), Some("web"))).mode,
+            Mode::Allow
+        );
+        // A Deny still wins, and a plain Allow still loses to the Ask.
+        let deny = rule(Mode::Deny, &["*"], &["*"], &["team"], &["*"]);
+        let denied = Policy { rules: vec![deny, approval.as_rule().unwrap()], ..Policy::default() };
+        assert_eq!(
+            denied.decide(&access("c1", "scale", "deployments.apps", Some("team"), Some("web"))).mode,
+            Mode::Deny
+        );
+        let plain = Rule { approved: false, ..approval.as_rule().unwrap() };
+        let asks = Policy { rules: vec![p.rules[0].clone(), plain], ..Policy::default() };
+        assert_eq!(asks.decide(&access("c1", "scale", "deployments.apps", Some("team"), Some("web"))).mode, Mode::Ask);
         let p = Policy { rules: vec![approval.as_rule().unwrap()], ..Policy::default() };
         assert_eq!(p.decide(&access("c1", "scale", "deployments.apps", Some("team"), Some("web"))).mode, Mode::Allow);
         assert_eq!(p.decide(&access("c1", "scale", "deployments.apps", Some("team"), Some("api"))).mode, Mode::Deny);
