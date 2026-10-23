@@ -531,6 +531,22 @@ impl SettingsView {
                         "Color a context to recognise it at a glance. Protected contexts ask you to type their name before any write. \
                          Metrics, node shell and namespaces per cluster are under Per cluster.",
                     ))
+                    .when(s.protect_unset, |d| {
+                        d.child(
+                            h_flex()
+                                .gap_3()
+                                .pb_2()
+                                .child(div().flex_1().text_sm().text_color(theme.danger).child(
+                                    "The protection choices could not be read, so every context not set below is protected.",
+                                ))
+                                .child(Button::new("guess-protection").small().outline().label("Guess them again").on_click(
+                                    |_, _, cx| {
+                                        settings::update(|s| s.protect_unset = false);
+                                        cx.refresh_windows();
+                                    },
+                                )),
+                        )
+                    })
                     .children(names.into_iter().enumerate().map(|(i, ctx)| {
                         let protected = settings::is_protected(&ctx);
                         let current = s.context_colors.get(&ctx).cloned().unwrap_or_default();

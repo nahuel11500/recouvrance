@@ -2,7 +2,7 @@
 //! any thread (the Kubernetes side reads refresh rates and kubeconfig paths).
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex, OnceLock, RwLock};
 
 use serde::{Deserialize, Deserializer, Serialize};
@@ -12,6 +12,11 @@ use serde::{Deserialize, Deserializer, Serialize};
 fn protection_entries<'de, D: Deserializer<'de>>(d: D) -> Result<std::collections::BTreeMap<String, bool>, D::Error> {
     let raw = std::collections::BTreeMap::<String, serde_json::Value>::deserialize(d)?;
     Ok(raw.into_iter().map(|(k, v)| (k, v.as_bool().unwrap_or(true))).collect())
+}
+
+/// A flag where anything but `false` (a hand edit) counts as `true`.
+fn false_or_true<'de, D: Deserializer<'de>>(d: D) -> Result<bool, D::Error> {
+    Ok(serde_json::Value::deserialize(d)?.as_bool().unwrap_or(true))
 }
 
 /// A map of strings entry by entry: an entry that isn't a string is dropped alone.
@@ -110,6 +115,10 @@ pub struct Settings {
     /// are guessed from their names, user, cluster and server ("prod", "admin", …).
     #[serde(deserialize_with = "protection_entries")]
     pub protection: std::collections::BTreeMap<String, bool>,
+    /// The protection choices could not be read once: contexts without a choice are
+    /// protected instead of guessed, until this is turned off in Settings → Contexts.
+    #[serde(skip_serializing_if = "std::ops::Not::not", deserialize_with = "false_or_true")]
+    pub protect_unset: bool,
     /// Prometheus per context as `namespace/service:port` (found automatically when unset).
     pub prometheus: std::collections::HashMap<String, String>,
     /// Range of usage charts, in minutes (last choice).
@@ -284,6 +293,7 @@ impl Default for Settings {
             context_colors: Default::default(),
             protected_contexts: None,
             protection: Default::default(),
+            protect_unset: false,
             prometheus: Default::default(),
             usage_range: 60,
             recent_contexts: Vec::new(),
@@ -325,10 +335,6 @@ fn path() -> PathBuf {
     base.join("recouvrance").join("settings.json")
 }
 
-/// Set when settings.json existed but its `protection` could not be read at all (not JSON,
-/// or not an object): every context without a choice made since is then protected.
-static PROTECTION_LOST: AtomicBool = AtomicBool::new(false);
-
 /// The settings file. A field that does not read (a hand edit, or a value from a newer
 /// version) gets its default and the others, such as `protection`, are kept; the file
 /// is kept aside as `load_json` does.
@@ -349,13 +355,14 @@ fn load_from(p: &Path) -> (Settings, Option<String>) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (Settings::default(), None),
         Err(e) => return (Settings::default(), Some(format!("{}: {e}", p.display()))),
     };
-    let (settings, error, lost) = from_bytes(&bytes);
+    let (mut settings, error, lost) = from_bytes(&bytes);
     if let Some(e) = error {
         eprintln!("{}: {e}; fields that don't read use their defaults ({})", p.display(), keep_aside(p));
     }
     if lost {
         eprintln!("{}: the protection choices could not be read: every context is protected", p.display());
-        PROTECTION_LOST.store(true, Ordering::Relaxed);
+        // Saved with the settings, so the next launch doesn't guess them again.
+        settings.protect_unset = true;
     }
     (settings, None)
 }
@@ -523,8 +530,8 @@ pub fn is_protected(context: &str) -> bool {
 }
 
 /// Whether the protection choices could not be read: every context not set is protected.
-fn protection_lost() -> bool {
-    load_error().is_some() || PROTECTION_LOST.load(Ordering::Relaxed)
+pub fn protection_lost() -> bool {
+    load_error().is_some() || with(|s| s.protect_unset)
 }
 
 /// The contexts of a kubeconfig that are protected (see [`is_protected`]), from one read of it.
@@ -919,6 +926,26 @@ mod tests {
         let v: Vec<String> = load_json(&other);
         assert!(v.is_empty());
         assert!(!other.exists());
+        std::fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn lost_protection_choices_stay_lost_after_a_save() {
+        let d = scratch();
+        let p = d.join("settings.json");
+        std::fs::write(&p, br#"{"protection": "not a map", "metrics_refresh": 7}"#).unwrap();
+        let (s, error) = load_from(&p);
+        assert_eq!(error, None);
+        assert!(s.protect_unset);
+        // The next save keeps it, so the next launch doesn't guess the contexts again.
+        let saved = serde_json::to_vec(&s).unwrap();
+        let (again, _, lost) = from_bytes(&saved);
+        assert!(!lost);
+        assert!(again.protect_unset);
+        // A file without it guesses; a value that isn't false (a hand edit) doesn't.
+        assert!(!from_bytes(b"{}").0.protect_unset);
+        assert!(from_bytes(br#"{"protect_unset": "x"}"#).0.protect_unset);
+        assert!(!serde_json::to_string(&Settings::default()).unwrap().contains("protect_unset"));
         std::fs::remove_dir_all(d).unwrap();
     }
 
