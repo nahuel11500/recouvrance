@@ -22,6 +22,8 @@ impl AppView {
             tb.delegate_mut().set_filter(t.filter);
             cx.notify();
         });
+        // `set_value` sends no change event: move the highlight here.
+        self.follow_selection(cx);
         if t.namespaces != self.namespaces {
             let sel = t.namespaces.clone();
             self.ns_picker.update(cx, |p, cx| {
