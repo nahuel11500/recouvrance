@@ -602,7 +602,7 @@ fn url_allowed(url: &str) -> bool {
 pub(crate) fn split_docs(text: &str) -> Vec<(u32, String)> {
     let mut out: Vec<(u32, Vec<&str>)> = vec![(0, Vec::new())];
     for (i, l) in text.lines().enumerate() {
-        match l.strip_prefix("---").filter(|rest| rest.is_empty() || rest.starts_with([' ', '\t'])) {
+        match crate::yaml::doc_start(l) {
             // Text after `--- ` on the same line belongs to the new document.
             Some(rest) => out.push((i as u32, vec![rest])),
             None => out.last_mut().expect("never empty").1.push(l),
