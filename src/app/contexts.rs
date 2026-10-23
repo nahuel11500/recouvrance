@@ -107,6 +107,8 @@ impl AppView {
                         this.kind = wanted
                             .or_else(|| keep.and_then(|key| kinds.iter().find(|k| k.key() == key).cloned()))
                             .or_else(|| kinds.iter().find(|k| k.is("", "Pod")).cloned());
+                        // Back must not return to a list the new clusters don't have.
+                        served_lists(&mut this.history, &kinds, this.kind.as_ref());
                         // Other tabs keep a kind and namespaces only where the new clusters have them.
                         let active = this.active_tab;
                         let fallback = this.kind.clone();
@@ -182,8 +184,9 @@ impl AppView {
                 if now == seen {
                     continue;
                 }
+                // Not the cached list, which may predate the change; on a failed read, try again.
+                let Ok(contexts) = k8s::reload_contexts() else { continue };
                 seen = now;
-                let Ok(contexts) = k8s::load_contexts() else { continue };
                 let alive = this.update_in(cx, |this, window, cx| this.contexts_reloaded(contexts.names, window, cx));
                 if alive.is_err() {
                     break;
@@ -195,11 +198,9 @@ impl AppView {
     pub fn contexts_reloaded(&mut self, names: Vec<String>, window: &mut Window, cx: &mut Context<Self>) {
         let added = names.iter().filter(|n| !self.all_contexts.contains(n)).count();
         let removed = self.all_contexts.iter().filter(|n| !names.contains(n)).count();
+        self.picked.retain(|c| names.contains(c));
         self.all_contexts = names.clone();
-        self.ctx_picker.update(cx, |p, cx| {
-            p.all = names;
-            cx.notify();
-        });
+        self.ctx_picker.update(cx, |p, cx| p.set_all(names, cx));
         self.settings_view.update(cx, |s, cx| s.sync_clusters(window, cx));
         let msg = match (added, removed) {
             (0, 0) => "Kubeconfig reloaded".to_string(),
@@ -269,6 +270,17 @@ fn merge_kinds(
     (kinds, kind_clusters)
 }
 
+/// Lists in a history that name a kind none of the clusters serve show `fallback` instead.
+fn served_lists(history: &mut [Route], kinds: &[Kind], fallback: Option<&Kind>) {
+    for route in history {
+        if let Route::Resources(Some(k)) = route
+            && !kinds.iter().any(|x| x.key() == k.key())
+        {
+            *route = Route::Resources(fallback.cloned());
+        }
+    }
+}
+
 /// The one namespace to show when only some are accessible: the one just ticked,
 /// else the last one asked for, else the first accessible one. None when all are.
 fn one_namespace(wanted: &[String], previous: &[String], accessible: &[String]) -> Option<String> {
@@ -280,7 +292,7 @@ fn one_namespace(wanted: &[String], previous: &[String], accessible: &[String]) 
 
 #[cfg(test)]
 mod tests {
-    use super::{Kind, merge_kinds, one_namespace};
+    use super::{Kind, Route, merge_kinds, one_namespace, served_lists};
 
     fn kind(k: &str) -> Kind {
         Kind {
@@ -305,6 +317,21 @@ mod tests {
         assert_eq!(kinds.len(), 1);
         assert_eq!(where_[&kinds[0].key()], [0]);
         assert_eq!(errors, ["c: no such context", "b: connection refused"]);
+    }
+
+    #[test]
+    fn back_goes_to_a_list_the_clusters_serve() {
+        let (pods, certs) = (kind("Pod"), kind("Certificate"));
+        let mut history = vec![Route::Resources(Some(certs)), Route::Resources(None), Route::Contexts];
+        served_lists(&mut history, std::slice::from_ref(&pods), Some(&pods));
+        let lists: Vec<Option<String>> = history
+            .iter()
+            .map(|r| match r {
+                Route::Resources(k) => k.as_ref().map(|k| k.label.clone()),
+                _ => Some("other".into()),
+            })
+            .collect();
+        assert_eq!(lists, [Some("Pod".into()), None, Some("other".into())]);
     }
 
     fn v(list: &[&str]) -> Vec<String> {
