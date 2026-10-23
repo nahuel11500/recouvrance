@@ -124,6 +124,10 @@ then allow; anything no rule matches is denied. `approved` lists the requests yo
 deny rule does. The file is reloaded when it changes, and edits on the Agents page are written back
 to it (its comments are not kept).
 
+Each section is for the agent with that name, so agent names are unique: creating a second agent
+with a taken name is refused, and if two agents already share a name the file is neither loaded nor
+written until you delete one and save the file again.
+
 ## plugins.yaml
 
 ```yaml

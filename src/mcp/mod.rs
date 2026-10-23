@@ -725,6 +725,14 @@ impl Hub {
         };
         {
             let mut cfg = write(&self.config);
+            // A section could not say which of two agents with its name it is for.
+            if let Some(name) = rules_file::shared_name(&cfg.agents) {
+                let e = anyhow::anyhow!("two agents are named `{name}`: delete one");
+                *lock(&self.rules_error) = Some(format!("{e:#}"));
+                drop(cfg);
+                self.emit(HubEvent::AgentSeen);
+                return Err(e);
+            }
             for (name, rules) in &file.agents {
                 if !cfg.agents.iter().any(|a| a.name == *name) {
                     // A new agent from the file; its token is issued in the app ("New token").
@@ -826,7 +834,8 @@ impl Hub {
         self.save()
     }
 
-    /// Creates an agent and returns it with its one-time token.
+    /// Creates an agent and returns it with its one-time token. Names are unique: rules.yaml
+    /// finds an agent by its name.
     pub fn create_agent(&self, name: String) -> Result<(Agent, String)> {
         let token = new_token();
         let agent = Agent {
@@ -836,7 +845,13 @@ impl Hub {
             enabled: true,
             policy: Policy::default(),
         };
-        write(&self.config).agents.push(agent.clone());
+        {
+            let mut cfg = write(&self.config);
+            if cfg.agents.iter().any(|a| a.name == agent.name) {
+                anyhow::bail!("an agent named `{}` already exists", agent.name);
+            }
+            cfg.agents.push(agent.clone());
+        }
         self.save()?;
         Ok((agent, token))
     }

@@ -123,9 +123,17 @@ fn agent_create(args: &[String]) {
     }
     let hub = mcp::Hub::load();
     let (name, contexts) = agent_create_args(args);
-    let (agent, token) = hub.create_agent(name).expect("create agent");
-    hub.update_agent(&agent.id, |a| a.policy.rules[0].contexts = contexts).expect("save");
-    println!("{token}");
+    let created = hub.create_agent(name).and_then(|(agent, token)| {
+        hub.update_agent(&agent.id, |a| a.policy.rules[0].contexts = contexts)?;
+        Ok(token)
+    });
+    match created {
+        Ok(token) => println!("{token}"),
+        Err(e) => {
+            eprintln!("agent-create: {e:#}");
+            std::process::exit(1);
+        }
+    }
 }
 
 /// `<name> [context...]`; both optional.

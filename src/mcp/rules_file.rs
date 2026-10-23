@@ -266,8 +266,18 @@ pub const HEADER: &str = "# Recouvrance agent rules. Deny wins, then ask, then a
 # Verbs: get list logs reveal exec scale restart patch apply delete drain (or *).\n\
 # Recouvrance reloads this file when you save it; edits on the Agents page rewrite it, without comments.\n";
 
-/// The file's text for these agents (refused when a rule cannot be written exactly).
+/// A name two agents share: the file keys agents by name, so it could not tell them apart.
+pub fn shared_name(agents: &[super::Agent]) -> Option<&str> {
+    let mut seen = std::collections::HashSet::new();
+    agents.iter().map(|a| a.name.as_str()).find(|name| !seen.insert(*name))
+}
+
+/// The file's text for these agents (refused when a rule cannot be written exactly, or
+/// when two agents share a name).
 pub fn render(agents: &[super::Agent]) -> Result<String> {
+    if let Some(name) = shared_name(agents) {
+        bail!("two agents are named `{name}`: delete one");
+    }
     let agents = agents
         .iter()
         .map(|a| Ok((a.name.clone(), from_policy(&a.policy).with_context(|| format!("agent `{}`", a.name))?)))
@@ -371,6 +381,22 @@ mod tests {
         assert!(from_policy(&Policy { rules: vec![r], ..Policy::default() }).is_err());
         let r = Rule { contexts: vec!["*".into()], expires: Some(jiff::Timestamp::now()), ..Rule::default() };
         assert!(from_policy(&Policy { rules: vec![r], ..Policy::default() }).is_ok());
+    }
+
+    #[test]
+    fn refuses_agents_sharing_a_name() {
+        let agent = |id: &str, name: &str| super::super::Agent {
+            id: id.into(),
+            name: name.into(),
+            token_sha256: String::new(),
+            enabled: true,
+            policy: Policy::default(),
+        };
+        let agents = [agent("a", "ci"), agent("b", "other"), agent("c", "ci")];
+        assert_eq!(shared_name(&agents), Some("ci"));
+        assert!(render(&agents).is_err());
+        assert_eq!(shared_name(&agents[..2]), None);
+        assert!(render(&agents[..2]).is_ok());
     }
 
     #[test]
