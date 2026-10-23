@@ -48,6 +48,9 @@ pub struct AgentRules {
     pub ask: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub deny: Vec<String>,
+    /// Requests you approved in the app ("Always allow this"): allowed even where an ask rule matches.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub approved: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limits: Option<Limits>,
 }
@@ -108,6 +111,7 @@ pub fn parse_rule(effect: Mode, text: &str) -> Result<Rule> {
         names,
         note: String::new(),
         expires: None,
+        approved: false,
     };
     while let Some(w) = words.next() {
         let value = || words.clone().next().map(String::from).with_context(|| format!("`{w}` needs a value"));
@@ -187,11 +191,18 @@ fn format_exact(r: &Rule) -> Result<String> {
 
 /// The agent's rules and limits as they would appear in the file.
 pub fn from_policy(p: &Policy) -> Result<AgentRules> {
-    let pick = |m: Mode| p.rules.iter().filter(|r| r.effect == m).map(format_exact).collect::<Result<Vec<_>>>();
+    let pick = |m: Mode, approved: bool| {
+        p.rules
+            .iter()
+            .filter(|r| r.effect == m && (r.effect == Mode::Allow && r.approved) == approved)
+            .map(format_exact)
+            .collect::<Result<Vec<_>>>()
+    };
     Ok(AgentRules {
-        allow: pick(Mode::Allow)?,
-        ask: pick(Mode::Ask)?,
-        deny: pick(Mode::Deny)?,
+        allow: pick(Mode::Allow, false)?,
+        ask: pick(Mode::Ask, false)?,
+        deny: pick(Mode::Deny, false)?,
+        approved: pick(Mode::Allow, true)?,
         limits: Some(Limits {
             calls_per_minute: Some(p.max_calls_per_minute),
             max_log_lines: Some(p.max_log_lines),
@@ -204,9 +215,16 @@ pub fn from_policy(p: &Policy) -> Result<AgentRules> {
 /// Apply an agent's section to its policy (rules replaced, limits set when given).
 pub fn apply(rules: &AgentRules, p: &mut Policy) -> Result<()> {
     let mut out = Vec::new();
-    for (mode, items) in [(Mode::Deny, &rules.deny), (Mode::Ask, &rules.ask), (Mode::Allow, &rules.allow)] {
+    let sections = [
+        (Mode::Deny, false, &rules.deny),
+        (Mode::Ask, false, &rules.ask),
+        (Mode::Allow, false, &rules.allow),
+        (Mode::Allow, true, &rules.approved),
+    ];
+    for (mode, approved, items) in sections {
         for text in items {
-            out.push(parse_rule(mode, text).with_context(|| format!("{mode:?} rule `{text}`"))?);
+            let rule = parse_rule(mode, text).with_context(|| format!("{mode:?} rule `{text}`"))?;
+            out.push(Rule { approved, ..rule });
         }
     }
     p.rules = out;
@@ -242,6 +260,7 @@ pub fn load() -> Result<Option<RulesFile>> {
 }
 
 pub const HEADER: &str = "# Recouvrance agent rules. Deny wins, then ask, then allow; anything no rule matches is denied.\n\
+# `approved` holds requests you approved in the app: they win over ask, not over deny.\n\
 # A rule: VERBS RESOURCES[/NAMES] [-n NAMESPACES] [--context CONTEXTS] [until 2026-11-01]\n\
 # Lists are comma-separated and * globs work everywhere; an omitted part means *, and - means none.\n\
 # Verbs: get list logs reveal exec scale restart patch apply delete drain (or *).\n\
@@ -327,6 +346,19 @@ mod tests {
             name: Some("y".into()),
         };
         assert_eq!(back.decide(&a).mode, Mode::Deny);
+    }
+
+    #[test]
+    fn approvals_keep_their_section() {
+        let mut approved = parse_rule(Mode::Allow, "scale deployments.apps/web -n team --context c1").unwrap();
+        approved.approved = true;
+        let p = Policy { rules: vec![approved.clone()], ..Policy::default() };
+        let file = from_policy(&p).unwrap();
+        assert!(file.allow.is_empty());
+        assert_eq!(file.approved, ["scale deployments.apps/web -n team --context c1"]);
+        let mut back = Policy::default();
+        apply(&file, &mut back).unwrap();
+        assert_eq!(back.rules, [approved]);
     }
 
     #[test]
