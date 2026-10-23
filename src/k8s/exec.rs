@@ -189,16 +189,22 @@ pub(super) async fn exec_to(
     let mut proc = api.exec(&pod, command, &ap).await?;
     let stdout = proc.stdout().context("no stdout")?;
     let stderr = proc.stderr().context("no stderr")?;
+    // A write error is kept for later: a command that fails at once closes its stdin
+    // ("broken pipe"), and what it said on stderr is the better message.
     let writer = async {
+        let mut written = Ok(());
         if let (Some(data), Some(mut w)) = (stdin, proc.stdin()) {
-            w.write_all(&data).await?;
-            w.shutdown().await?;
+            written = async {
+                w.write_all(&data).await?;
+                w.shutdown().await
+            }
+            .await;
         }
-        anyhow::Ok(())
+        anyhow::Ok(written)
     };
     // try_join: past the cap, stop at once (the command may still be writing).
     let stderr = async { anyhow::Ok(read_capped(stderr, MAX_STDERR).await.0) };
-    let (_, copied, err) = tokio::try_join!(writer, copy_capped(stdout, sink, max), stderr)?;
+    let (written, copied, err) = tokio::try_join!(writer, copy_capped(stdout, sink, max), stderr)?;
     let status = match proc.take_status() {
         Some(s) => s.await,
         None => None,
@@ -210,6 +216,7 @@ pub(super) async fn exec_to(
             if msg.is_empty() { status.and_then(|s| s.message).unwrap_or_else(|| "failed".into()) } else { msg }
         );
     }
+    written?;
     Ok(copied)
 }
 
