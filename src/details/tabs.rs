@@ -416,6 +416,9 @@ impl Render for DetailPanel {
         if self.terminal.is_some() {
             tabs.push(DetailTab::Shell);
         }
+        if self.debug_terminal.is_some() {
+            tabs.push(DetailTab::Debug);
+        }
         if !tabs.contains(&self.tab) {
             self.tab = DetailTab::Overview;
         }
@@ -439,6 +442,9 @@ impl Render for DetailPanel {
             }
             DetailTab::Shell => {
                 self.terminal.clone().map(|t| t.into_any_element()).unwrap_or_else(|| div().into_any_element())
+            }
+            DetailTab::Debug => {
+                self.debug_terminal.clone().map(|t| t.into_any_element()).unwrap_or_else(|| div().into_any_element())
             }
         };
         let created = self
@@ -551,6 +557,7 @@ impl Render for DetailPanel {
                                 DetailTab::Events => "Events",
                                 DetailTab::Logs => "Logs",
                                 DetailTab::Shell => "Shell",
+                                DetailTab::Debug => "Debug",
                                 DetailTab::Container(_) => "",
                             }),
                         }

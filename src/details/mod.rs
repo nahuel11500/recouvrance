@@ -67,6 +67,8 @@ enum DetailTab {
     Yaml,
     Events,
     Shell,
+    /// The shell in a debug container, next to the pod's own.
+    Debug,
 }
 
 /// Whether the user turned on write actions (off by default).
@@ -172,6 +174,8 @@ pub struct DetailPanel {
     events: Option<Result<Vec<EventLine>, SharedString>>,
     logs: Option<Entity<LogsView>>,
     terminal: Option<Entity<TerminalView>>,
+    /// The shell in the last debug container started (the pod's own one stays).
+    debug_terminal: Option<Entity<TerminalView>>,
     forwards: Entity<Forwards>,
     favorites: Entity<Favorites>,
     /// Every connected cluster (for Compare).
@@ -256,6 +260,7 @@ impl DetailPanel {
             events: None,
             logs,
             terminal,
+            debug_terminal: None,
             forwards,
             favorites,
             clusters: Vec::new(),
@@ -447,17 +452,7 @@ impl DetailPanel {
     }
 
     pub fn select_tab_named(&mut self, name: &str, cx: &mut Context<Self>) {
-        self.tab = match name {
-            "yaml" => DetailTab::Yaml,
-            "events" => DetailTab::Events,
-            "logs" => DetailTab::Logs,
-            "revisions" => DetailTab::Revisions,
-            "map" => DetailTab::Map,
-            "compare" => DetailTab::Compare,
-            "container" => DetailTab::Container(0),
-            "shell" => DetailTab::Shell,
-            _ => DetailTab::Overview,
-        };
+        self.tab = tab_named(name);
         self.resume_logs_if_shown(cx);
         cx.notify();
     }
@@ -835,10 +830,37 @@ impl DetailPanel {
     }
 }
 
+fn tab_named(name: &str) -> DetailTab {
+    match name {
+        "yaml" => DetailTab::Yaml,
+        "events" => DetailTab::Events,
+        "logs" => DetailTab::Logs,
+        "revisions" => DetailTab::Revisions,
+        "map" => DetailTab::Map,
+        "compare" => DetailTab::Compare,
+        "container" => DetailTab::Container(0),
+        "shell" => DetailTab::Shell,
+        "debug" => DetailTab::Debug,
+        _ => DetailTab::Overview,
+    }
+}
+
 impl Drop for DetailPanel {
     fn drop(&mut self) {
         if let Some(pod) = self.node_shell.take() {
             k8s::delete_node_shell(self.client.clone(), pod);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DetailTab, tab_named};
+
+    #[test]
+    fn a_debug_shell_has_its_own_tab() {
+        assert!(tab_named("debug") == DetailTab::Debug);
+        assert!(tab_named("shell") == DetailTab::Shell);
+        assert!(tab_named("debug") != tab_named("shell"));
     }
 }
