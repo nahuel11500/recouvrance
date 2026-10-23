@@ -292,8 +292,8 @@ impl Shown {
     }
 
     /// How many times each line shown comes again after a reconnect.
-    fn repeats(&self) -> std::collections::HashMap<u64, usize> {
-        let mut out = std::collections::HashMap::new();
+    fn repeats(&self) -> HashMap<u64, usize> {
+        let mut out = HashMap::new();
         for (_, h) in &self.lines {
             *out.entry(*h).or_insert(0) += 1;
         }
@@ -312,7 +312,7 @@ fn line_hash(line: &str) -> u64 {
 /// `lines` without the ones already shown before a reconnect. Lines are matched whole
 /// (time included), so lines sharing a time, or out of time order (stdout and stderr),
 /// are neither lost nor shown twice.
-fn drop_repeats(lines: Vec<String>, repeats: &mut std::collections::HashMap<u64, usize>) -> Vec<String> {
+fn drop_repeats(lines: Vec<String>, repeats: &mut HashMap<u64, usize>) -> Vec<String> {
     if repeats.is_empty() {
         return lines;
     }
