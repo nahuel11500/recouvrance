@@ -157,8 +157,10 @@ pub struct DetailPanel {
     /// Every connected cluster (for Compare).
     pub(crate) clusters: Vec<(String, Client)>,
     compare: CompareState,
-    /// The live refresh and related polling loops run (started once).
+    /// The related polling and RBAC check run (started on the first read that worked).
     loops_started: bool,
+    /// The live refresh runs (started once; it also retries a first read that failed).
+    live_started: bool,
     /// A row-menu action waiting for the object's first load (its dialog reads it).
     pending_action: Option<String>,
     /// The object is gone from the cluster (a read answered 404): polling stopped.
@@ -237,6 +239,7 @@ impl DetailPanel {
             clusters: Vec::new(),
             compare: CompareState::default(),
             loops_started: false,
+            live_started: false,
             pending_action: None,
             deleted: false,
             _tasks: Vec::new(),
@@ -437,7 +440,8 @@ impl DetailPanel {
         cx.notify();
     }
 
-    /// Read the object once; the first success also starts the page's polling loops.
+    /// Read the object once; the first success also starts the page's polling loops, a
+    /// failure the live refresh (which retries).
     fn load_object(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.refresh_object(false, window, cx);
     }
@@ -455,12 +459,7 @@ impl DetailPanel {
                         if reset_yaml || this.yaml.read(cx).value().as_ref() == this.yaml_text {
                             this.refresh_yaml(window, cx);
                         }
-                        if !this.loops_started {
-                            this.loops_started = true;
-                            this.load_related(window, cx);
-                            this.check_access(cx);
-                            this.start_live(window, cx);
-                        }
+                        this.start_loops(window, cx);
                         if let Some(action) = this.pending_action.take() {
                             this.quick_action(&action, window, cx);
                         }
@@ -468,6 +467,9 @@ impl DetailPanel {
                     Err(e) => {
                         if k8s::is_not_found(&e) {
                             this.deleted = true;
+                        } else {
+                            // A timeout or a 5xx: keep trying, the page starts when a read works.
+                            this.start_live(window, cx);
                         }
                         if let Some(action) = this.pending_action.take() {
                             window.push_notification(
@@ -497,8 +499,22 @@ impl DetailPanel {
         self._tasks.push(task);
     }
 
-    /// Re-read the object every 5s so status, conditions and YAML stay current.
+    /// Once the object has been read: the related polling, the RBAC check and the live refresh.
+    fn start_loops(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.loops_started {
+            self.loops_started = true;
+            self.load_related(window, cx);
+            self.check_access(cx);
+        }
+        self.start_live(window, cx);
+    }
+
+    /// Re-read the object every 5s so status, conditions and YAML stay current (once).
     fn start_live(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.live_started {
+            return;
+        }
+        self.live_started = true;
         let (client, obj) = (self.client.clone(), self.obj.clone());
         let task = cx.spawn_in(window, async move |this, cx| {
             loop {
@@ -558,6 +574,8 @@ impl DetailPanel {
                     if this.yaml.read(cx).value().as_ref() == this.yaml_text {
                         this.refresh_yaml(window, cx);
                     }
+                    // The first read failed: this one starts the page.
+                    this.start_loops(window, cx);
                     cx.notify();
                 });
                 if alive.is_err() {
