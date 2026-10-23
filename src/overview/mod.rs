@@ -515,6 +515,23 @@ fn diagnosis(ctx: &Ctx, cx: &App) -> Option<Div> {
     )
 }
 
+/// Condition types where "True" is the bad state.
+fn true_is_bad(ty: &str) -> bool {
+    matches!(
+        ty,
+        "ScalingLimited"
+            | "MemoryPressure"
+            | "DiskPressure"
+            | "PIDPressure"
+            | "NetworkUnavailable"
+            | "Failed"
+            | "FailureTarget"
+            | "ReplicaFailure"
+            | "DisruptionTarget"
+            | "Stalled"
+    )
+}
+
 fn conditions(obj: &Value, cx: &App) -> AnyElement {
     let conds = arr(obj, "/status/conditions");
     if conds.is_empty() {
@@ -525,17 +542,7 @@ fn conditions(obj: &Value, cx: &App) -> AnyElement {
         .child(heading("Conditions"))
         .children(conds.iter().map(|c| {
             let status = c["status"].as_str().unwrap_or_default().to_string();
-            // For these, "True" is the bad state.
-            let inverted = matches!(
-                c["type"].as_str().unwrap_or_default(),
-                "ScalingLimited"
-                    | "MemoryPressure"
-                    | "DiskPressure"
-                    | "PIDPressure"
-                    | "NetworkUnavailable"
-                    | "Failed"
-                    | "Stalled"
-            );
+            let inverted = true_is_bad(c["type"].as_str().unwrap_or_default());
             let color = match (status.as_str(), inverted) {
                 ("True", true) => cx.theme().warning,
                 ("False", true) => cx.theme().success,
@@ -635,5 +642,18 @@ fn capitalize(s: &str) -> String {
     match c.next() {
         Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
         None => String::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn failure_conditions_are_bad_when_true() {
+        for ty in ["ReplicaFailure", "FailureTarget", "DisruptionTarget", "MemoryPressure", "Failed"] {
+            assert!(super::true_is_bad(ty), "{ty}");
+        }
+        for ty in ["Ready", "Available", "Progressing", "Complete"] {
+            assert!(!super::true_is_bad(ty), "{ty}");
+        }
     }
 }
