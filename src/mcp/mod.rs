@@ -310,7 +310,10 @@ impl Policy {
     }
 
     fn decide_inner(&self, a: &Access, any_ns: bool) -> Verdict {
-        best(self.rules.iter().enumerate().filter(|(_, r)| r.matches(a, any_ns)))
+        let inside = namespace_contents(a);
+        best(self.rules.iter().enumerate().filter(|(_, r)| {
+            r.matches(a, any_ns) || inside.as_ref().is_some_and(|i| r.effect != Mode::Allow && r.matches(i, false))
+        }))
     }
 
     /// The context patterns of the non-expired Allow and Ask rules.
@@ -386,6 +389,15 @@ impl Policy {
         self.read = None;
         self.logs = None;
     }
+}
+
+/// A write to a Namespace object changes (or deletes) everything in it, so it also meets
+/// the Deny and Ask rules of that namespace: the same request, inside it.
+fn namespace_contents(a: &Access) -> Option<Access> {
+    if !is_write(&a.verb) || a.resource != "namespaces" || a.namespace.is_some() {
+        return None;
+    }
+    Some(Access { namespace: Some(a.name.clone()?), ..a.clone() })
 }
 
 fn best<'a>(matching: impl Iterator<Item = (usize, &'a Rule)>) -> Verdict {
@@ -1172,6 +1184,33 @@ mod tests {
         // Somewhere-checks see the namespaced allow, but a global deny blocks.
         assert_eq!(p.decide_any_namespace(&access("staging-eu", "list", "pods", None, None)).mode, Mode::Allow);
         assert_eq!(p.decide_any_namespace(&access("staging-eu", "list", "secrets", None, None)).mode, Mode::Deny);
+    }
+
+    #[test]
+    fn namespace_rules_cover_writes_to_the_namespace_itself() {
+        let p = Policy {
+            rules: vec![
+                rule(Mode::Allow, &["*"], &["*"], &["*"], &["*"]),
+                rule(Mode::Deny, &["*"], &["*"], &["prod"], &["*"]),
+                rule(Mode::Ask, &["*"], &["*"], &["team-a"], &["*"]),
+                rule(Mode::Allow, &["delete"], &["*"], &["dev"], &["*"]),
+            ],
+            ..Policy::default()
+        };
+        let d = |verb: &str, name: &str| p.decide(&access("c", verb, "namespaces", None, Some(name))).mode;
+        assert_eq!(d("delete", "prod"), Mode::Deny);
+        assert_eq!(d("patch", "prod"), Mode::Deny);
+        assert_eq!(d("apply", "prod"), Mode::Deny);
+        assert_eq!(d("delete", "team-a"), Mode::Ask);
+        assert_eq!(d("delete", "other"), Mode::Allow);
+        // Reading it is not a change to what it holds.
+        assert_eq!(d("get", "prod"), Mode::Allow);
+        // An Allow inside a namespace does not allow deleting the namespace.
+        let only_dev = Policy { rules: vec![p.rules[3].clone()], ..Policy::default() };
+        assert_eq!(only_dev.decide(&access("c", "delete", "namespaces", None, Some("dev"))).mode, Mode::Deny);
+        // Another kind named namespaces is not the Namespace.
+        let crd = access("c", "delete", "namespaces.example.io", None, Some("prod"));
+        assert_eq!(p.decide(&crd).mode, Mode::Allow);
     }
 
     #[test]
