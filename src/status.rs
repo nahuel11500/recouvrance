@@ -10,7 +10,7 @@ pub(crate) enum Tone {
 }
 
 /// Words that mean something is wrong wherever they appear ("SecretSyncedError").
-const BAD: [&str; 24] = [
+const BAD: [&str; 23] = [
     "notready",
     "unhealthy",
     "invalid",
@@ -35,8 +35,6 @@ const BAD: [&str; 24] = [
     "broken",
     // A container whose state was lost (often an evicted pod's): it will not come back.
     "containerstatusunknown",
-    // Refused by the kubelet for want of a resource: OutOfcpu, OutOfmemory, OutOfpods…
-    "outof",
 ];
 
 /// Finished: neither good nor bad any more.
@@ -104,7 +102,10 @@ pub(crate) fn tone(status: &str) -> Option<Tone> {
     let words = words(status);
     // "Installed" holds "stalled".
     let bad_text = s.replace("install", "");
-    if BAD.iter().any(|w| bad_text.contains(w)) || words.iter().any(|w| w == "false") || negated(&words) {
+    // Refused by the kubelet for want of a resource: OutOfcpu, OutOfmemory, OutOfpods… A
+    // prefix only: "Rollout of" holds "outof".
+    let out_of = s.starts_with("outof");
+    if BAD.iter().any(|w| bad_text.contains(w)) || out_of || words.iter().any(|w| w == "false") || negated(&words) {
         return Some(Tone::Bad);
     }
     if DONE.contains(&s.as_str()) {
@@ -291,6 +292,7 @@ mod tests {
             ("OutOfmemory", Some(Tone::Bad)),
             ("OutOfpods", Some(Tone::Bad)),
             ("UnexpectedAdmissionError", Some(Tone::Bad)),
+            ("Rollout of v2", None),
             // Unknown words stay neutral.
             ("Lorem", None),
             ("Setup", None),
