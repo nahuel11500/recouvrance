@@ -12,6 +12,8 @@ use kube::Client;
 use crate::k8s;
 
 type Rules = Vec<(Vec<String>, Vec<String>, Vec<String>)>;
+/// "Who can": the grants found, and which lists could not be read.
+type WhoAnswer = (Vec<crate::rbac::Grant>, Option<String>);
 
 const VERBS: [&str; 7] = ["get", "list", "watch", "create", "update", "patch", "delete"];
 const RESOURCES: [&str; 16] = [
@@ -78,8 +80,7 @@ pub struct AccessView {
     who_verb: Entity<InputState>,
     who_resource: Entity<InputState>,
     who_ns: Entity<InputState>,
-    /// The grants found, and which lists could not be read.
-    who: Option<Result<(Vec<crate::rbac::Grant>, Option<String>), String>>,
+    who: Option<Result<WhoAnswer, String>>,
     who_busy: bool,
     _who_task: Option<Task<()>>,
     _subs: Vec<Subscription>,
