@@ -48,7 +48,8 @@ exec (a rule cannot pin the command), GitOps actions, `apply_manifest` (a rule c
 content), writes with no object name, and dry runs (the rule would allow the real write too).
 
 Before any rule is checked, a call's context must be named by one of the agent's Allow or Ask rules
-(other contexts are never contacted), and the names it passes are validated: a namespace or
+and not covered by a Deny of everything (`*` verbs, resources, namespaces and names): other contexts
+are never contacted, nor listed to the agent. The names a call passes are validated: a namespace or
 container must be a DNS label, an object name may hold only letters, digits and `- . _ : @ +` (no
 `/`, `?`, `%`, `..` or spaces). An invalid name fails the call with a message saying why. What the
 API server returns must be the object asked for, and a Secret's values are masked whatever kind

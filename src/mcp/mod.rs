@@ -318,9 +318,20 @@ impl Policy {
         self.rules.iter().filter(|r| r.effect != Mode::Deny && !r.expired()).flat_map(|r| r.contexts.clone()).collect()
     }
 
-    /// Whether some non-expired Allow or Ask rule names this context: checked before connecting.
+    /// Whether some non-expired Allow or Ask rule names this context, and no Deny of
+    /// everything covers it: checked before connecting.
     pub fn context_allowed(&self, context: &str) -> bool {
-        self.rules.iter().any(|r| r.effect != Mode::Deny && !r.expired() && any_glob(&r.contexts, context))
+        let all = |patterns: &[String]| patterns.iter().any(|p| p.trim() == "*");
+        let denied = self.rules.iter().any(|r| {
+            r.effect == Mode::Deny
+                && !r.expired()
+                && all(&r.verbs)
+                && all(&r.resources)
+                && all(&r.namespaces)
+                && all(&r.names)
+                && any_glob(&r.contexts, context)
+        });
+        !denied && self.rules.iter().any(|r| r.effect != Mode::Deny && !r.expired() && any_glob(&r.contexts, context))
     }
 
     /// Turn pre-rules settings into rules, once.
@@ -1364,14 +1375,26 @@ mod tests {
     fn contexts_are_checked_before_connecting() {
         let p = Policy {
             rules: vec![
-                rule(Mode::Allow, &["get"], &["*"], &["*"], &["staging-*"]),
-                rule(Mode::Deny, &["*"], &["*"], &["*"], &["*"]),
+                rule(Mode::Allow, &["get"], &["*"], &["*"], &["staging-*", "prod-*"]),
+                rule(Mode::Deny, &["*"], &["secrets"], &["*"], &["*"]),
+                rule(Mode::Deny, &["*"], &["*"], &["kube-*"], &["*"]),
+                rule(Mode::Deny, &["*"], &["*"], &["*"], &["*prod*"]),
             ],
             ..Policy::default()
         };
         assert!(p.context_allowed("staging-eu"));
         assert!(p.context_allowed("Staging-EU"));
+        assert!(!p.context_allowed("dev"));
+        // A Deny of everything there: never contacted.
         assert!(!p.context_allowed("prod-eu"));
+        let mut expired_deny = p.rules[3].clone();
+        expired_deny.expires = Some(jiff::Timestamp::now() - jiff::SignedDuration::from_secs(1));
+        let lifted = Policy { rules: vec![p.rules[0].clone(), expired_deny], ..Policy::default() };
+        assert!(lifted.context_allowed("prod-eu"));
+        // A Deny of some names only leaves the context usable.
+        let mut some_names = p.rules[3].clone();
+        some_names.names = vec!["debug-*".into()];
+        assert!(Policy { rules: vec![p.rules[0].clone(), some_names], ..Policy::default() }.context_allowed("prod-eu"));
         let mut expired = rule(Mode::Allow, &["get"], &["*"], &["*"], &["prod-*"]);
         expired.expires = Some(jiff::Timestamp::now() - jiff::SignedDuration::from_secs(1));
         assert!(!Policy { rules: vec![expired], ..Policy::default() }.context_allowed("prod-eu"));
