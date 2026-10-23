@@ -393,8 +393,10 @@ impl ResourceTable {
             wanted.iter().filter_map(|u| u.split_once('/').map(|k| (k, u.as_str()))).collect();
         // Stand-in uid -> (context, real uid) of each row it names.
         let mut real: HashMap<&str, Vec<(usize, String)>> = HashMap::new();
+        let mut partial = false;
         for (r, &ctx) in self.rows.iter().zip(&self.row_ctx) {
             if r.is_partial() {
+                partial = true;
                 continue;
             }
             if let Some(stand_in) = keys.get(&(r.namespace.as_deref().unwrap_or_default(), r.name.as_str())) {
@@ -414,6 +416,13 @@ impl ResourceTable {
             {
                 *uid = real.clone();
             }
+        }
+        // Every row is full: a stand-in left names an object gone meanwhile. Dropped, so
+        // later updates don't look for it again.
+        if !partial {
+            self.marked.retain(|u| !u.contains('/'));
+            self.selected_uid.take_if(|u| u.contains('/'));
+            self.menu_row.take_if(|(_, u)| u.contains('/'));
         }
     }
 
@@ -561,5 +570,9 @@ mod uid_tests {
         assert_eq!(t.selected_uid.as_deref(), Some("u2"));
         assert_eq!(t.menu_row, Some((0, "u3".into())));
         assert_eq!(t.marked_rows().len(), 2);
+        // Checked, then deleted before the full rows came: forgotten.
+        t.marked.insert("team-a/gone".into());
+        t.set_rows(vec![row("u1", "web-1")]);
+        assert!(!t.marked.contains("team-a/gone"));
     }
 }
