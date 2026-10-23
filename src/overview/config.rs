@@ -31,7 +31,7 @@ pub(super) fn certificates(data: &serde_json::Map<String, Value>, base64: bool, 
             };
             let (state, color) = match c.not_after.map(|t| days_left(t, now)) {
                 _ if c.not_yet_valid(now) => (format!("not valid until {}", date(c.not_before)), theme.danger),
-                Some(d) if d < 0 => (format!("expired {} ago", days(-d)), theme.danger),
+                Some(d) if d < 0 => (expired(c.not_after, now), theme.danger),
                 Some(d) if d < 14 => (format!("expires in {}", days(d)), theme.danger),
                 Some(d) if d < 30 => (format!("expires in {}", days(d)), theme.warning),
                 Some(d) => (format!("valid, {} left", days(d)), theme.success),
@@ -72,6 +72,14 @@ fn days_left(t: jiff::Timestamp, now: jiff::Timestamp) -> i64 {
 
 fn days(n: i64) -> String {
     if n == 1 { "1 day".into() } else { format!("{n} days") }
+}
+
+/// "expired 2 days ago", from the whole days since it passed.
+fn expired(not_after: Option<jiff::Timestamp>, now: jiff::Timestamp) -> String {
+    match not_after.map(|t| crate::certs::days_ago(t, now)) {
+        Some(n) if n > 0 => format!("expired {} ago", days(n)),
+        _ => "expired less than a day ago".into(),
+    }
 }
 
 /// A Secret's type and certificates; its keys are items of the page's list (`secret_entry`).
@@ -404,8 +412,15 @@ mod tests {
     fn expired_certificates_count_as_past() {
         let now: jiff::Timestamp = "2026-01-10T12:00:00Z".parse().unwrap();
         let at = |t: &str| super::days_left(t.parse().unwrap(), now);
+        // Days left, rounded down: negative as soon as it has passed...
         assert_eq!(at("2026-01-10T09:00:00Z"), -1);
         assert_eq!(at("2026-01-08T13:00:00Z"), -2);
+        // ...but how long ago is told in the days that went by.
+        let ago = |t: &str| super::expired(Some(t.parse().unwrap()), now);
+        assert_eq!(ago("2026-01-10T09:00:00Z"), "expired less than a day ago");
+        assert_eq!(ago("2026-01-09T11:00:00Z"), "expired 1 day ago");
+        assert_eq!(ago("2026-01-08T13:00:00Z"), "expired 1 day ago");
+        assert_eq!(ago("2026-01-07T12:00:00Z"), "expired 3 days ago");
         assert_eq!(at("2026-01-10T15:00:00Z"), 0);
         assert_eq!(at("2026-01-12T12:00:00Z"), 2);
         assert_eq!(super::days(1), "1 day");

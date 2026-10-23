@@ -33,8 +33,14 @@
   form and the Apply view): search for the pattern before calling it done.
 - Check the default case doesn't regress: one cluster, all namespaces accessible, no agent
   rules. A fix for the narrow case has broken the common one before.
-- Merges are squash merges once `CI result` passes. Never merge your own PR before it is
-  reviewed.
+- Fix the cause, not the reported case: about 10 of the 56 bugs of the fourth audit round
+  were regressions or incomplete fixes from the round before, each tested only on the
+  reported case. Write the test for the rule the code must keep (a `proptest!` when it is
+  "for every input"), then make it pass.
+- Review the change, not the codebase: each PR's diff is reviewed as it lands, fixes
+  included. Whole-codebase audits are not repeated; bug reports from users set the
+  priorities for the long tail.
+- Merges are squash merges once `CI result` passes and the diff has been reviewed.
 - `gh pr edit` fails on this repository (Projects classic); change a PR's title or body with
   `gh api -X PATCH repos/nahuel11500/recouvrance/pulls/<n> -f body=...`.
 
@@ -72,14 +78,22 @@ copy; if one doesn't fit, extend it.
 
 ## Tests
 
-- A `fix:` PR adds a test that fails without the fix. CI checks for one ("Fix has a test");
-  the label `no test needed` skips it, for docs and CI changes.
+- When a fix's logic can be tested without a cluster, add a test that fails without the fix.
 - View behaviour over time (late results, reloads) can be tested with `#[gpui_kit::test]` and
   a `TestAppContext` (see `src/latest.rs`). Those tests need the `dev` feature:
   `#[cfg(all(test, feature = "dev"))]`.
-- Rules that must hold for every input get a `proptest!`. The agent rule engine has them
-  (`mcp::properties`), and so does the kubeconfig merge's context names
-  (`k8s::config::name_properties`). Extend them when you change those.
+- The write guards are tested against a real cluster in `src/e2e.rs` (write mode, an agent's
+  rules through the MCP server, the kill switch during a drain); CI's kind job runs them on
+  every PR. Extend them when you add a write path. Locally, against a kind cluster:
+  `RECOUVRANCE_E2E_CONTEXT=kind-x XDG_CONFIG_HOME=$(mktemp -d) cargo test --features dev -- --ignored --test-threads 1 e2e::`.
+- Rules that must hold for every input get a `proptest!`. The subsystems that broke again and
+  again have them; extend them when you change those, and add a case before fixing a bug there:
+  - the agent rule engine (`mcp::properties`) and rules.yaml (`mcp::rules_file::properties`:
+    round trips, unknown keys, missing sections, edits on disk during an edit in the app);
+  - the kubeconfig merge (`k8s::config::name_properties`, `merge_properties`: files reordered,
+    shrinking, empty, corrupt or deleted between reads);
+  - settings.json loading (`settings::properties`: bad values, bad protection entries, a broken
+    file).
 
 ## Bugs that keep coming back
 

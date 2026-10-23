@@ -5,10 +5,32 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex, RwLock};
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
-/// What deleting asks before it runs (per kind, see `delete_confirm`).
-#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+/// `protection` entry by entry: a value that isn't `true` or `false` (a hand edit) protects
+/// its context, and never costs the other entries theirs.
+fn protection_entries<'de, D: Deserializer<'de>>(d: D) -> Result<std::collections::BTreeMap<String, bool>, D::Error> {
+    let raw = std::collections::BTreeMap::<String, serde_json::Value>::deserialize(d)?;
+    Ok(raw.into_iter().map(|(k, v)| (k, v.as_bool().unwrap_or(true))).collect())
+}
+
+/// A map of strings entry by entry: an entry that isn't a string is dropped alone.
+fn string_entries<'de, D: Deserializer<'de>>(d: D) -> Result<std::collections::BTreeMap<String, String>, D::Error> {
+    let raw = std::collections::BTreeMap::<String, serde_json::Value>::deserialize(d)?;
+    Ok(raw.into_iter().filter_map(|(k, v)| Some((k, v.as_str()?.to_string()))).collect())
+}
+
+/// `delete_confirm_kinds` entry by entry: a value that doesn't read (a hand edit, or one
+/// from a newer version) asks for the name, and never costs the other kinds theirs.
+fn delete_confirm_entries<'de, D: Deserializer<'de>>(
+    d: D,
+) -> Result<std::collections::BTreeMap<String, DeleteConfirm>, D::Error> {
+    let raw = std::collections::BTreeMap::<String, serde_json::Value>::deserialize(d)?;
+    Ok(raw.into_iter().map(|(k, v)| (k, serde_json::from_value(v).unwrap_or(DeleteConfirm::Type))).collect())
+}
+
+/// What deleting asks before it runs (per kind, see `delete_confirm`), from least to most.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 #[serde(rename_all = "kebab-case")]
 pub enum DeleteConfirm {
     /// Delete right away (a protected context still asks for its name).
@@ -86,6 +108,7 @@ pub struct Settings {
     pub protected_contexts: Option<Vec<String>>,
     /// Your choices per context (true: protected, false: not). Contexts without one
     /// are guessed from their names, user, cluster and server ("prod", "admin", …).
+    #[serde(deserialize_with = "protection_entries")]
     pub protection: std::collections::BTreeMap<String, bool>,
     /// Prometheus per context as `namespace/service:port` (found automatically when unset).
     pub prometheus: std::collections::HashMap<String, String>,
@@ -105,6 +128,10 @@ pub struct Settings {
     pub assistant_model: String,
     /// auto (Claude Code if installed, else API key), claude-code or api.
     pub assistant_backend: String,
+    /// The team's notes given to the assistant: where things run, dashboards, runbooks, repos.
+    pub assistant_notes: String,
+    /// Folders of the team's code the assistant may read (Claude Code only).
+    pub assistant_repos: Vec<String>,
     /// Read metrics-server and Prometheus (off: no usage columns or charts).
     pub metrics_enabled: bool,
     /// Accent color name (see `ACCENTS`).
@@ -121,6 +148,7 @@ pub struct Settings {
     pub kubeconfig_folders: Vec<String>,
     /// Which kubeconfig file keeps a context name that several files have: the first one
     /// seen. The others' contexts are `name@file`, whatever order the files are read in.
+    #[serde(deserialize_with = "string_entries")]
     pub context_files: std::collections::BTreeMap<String, String>,
     /// Open the browser after a one-click port-forward on a web port.
     pub open_browser_on_forward: bool,
@@ -128,7 +156,9 @@ pub struct Settings {
     pub recent_forwards: Vec<SavedForward>,
     /// What deleting asks for kinds not in `delete_confirm_kinds`.
     pub delete_confirm: DeleteConfirm,
-    /// What deleting asks, by kind (`Node`, `StatefulSet`…).
+    /// What deleting asks, by kind: `Node`, `StatefulSet`… for built-in kinds, with the group
+    /// for custom resources (`Cluster.postgresql.cnpg.io`), see `delete_kind_key`.
+    #[serde(deserialize_with = "delete_confirm_entries")]
     pub delete_confirm_kinds: std::collections::BTreeMap<String, DeleteConfirm>,
 }
 
@@ -151,18 +181,37 @@ fn default_delete_confirm() -> std::collections::BTreeMap<String, DeleteConfirm>
     off.iter().map(|k| (k.to_string(), Off)).chain(typed.iter().map(|k| (k.to_string(), Type))).collect()
 }
 
-/// What deleting an object of this kind (`Pod`, `Node`…) asks first.
-pub fn delete_confirm(kind: &str) -> DeleteConfirm {
-    with(|s| delete_confirm_in(s, kind))
+/// The key a kind's delete choice is saved under: the kind alone when built in (`Job`), with
+/// its group for a custom resource (`Job.batch.volcano.sh`), as several groups can name one.
+pub fn delete_kind_key(group: &str, kind: &str) -> String {
+    if crate::k8s::is_builtin_group(group) { kind.to_string() } else { format!("{kind}.{group}") }
+}
+
+/// What deleting an object of this kind (`apps`, `Deployment`) asks first.
+pub fn delete_confirm(group: &str, kind: &str) -> DeleteConfirm {
+    with(|s| delete_confirm_in(s, group, kind))
 }
 
 /// The kind's own choice, else the default. Case is ignored: older versions saved kinds as typed.
-fn delete_confirm_in(s: &Settings, kind: &str) -> DeleteConfirm {
-    let own = s
-        .delete_confirm_kinds
-        .get(kind)
-        .or_else(|| s.delete_confirm_kinds.iter().find(|(k, _)| k.eq_ignore_ascii_case(kind)).map(|(_, level)| level));
-    own.copied().unwrap_or(s.delete_confirm)
+fn delete_confirm_in(s: &Settings, group: &str, kind: &str) -> DeleteConfirm {
+    let choice = |key: &str| {
+        let level = s
+            .delete_confirm_kinds
+            .get(key)
+            .or_else(|| s.delete_confirm_kinds.iter().find(|(k, _)| k.eq_ignore_ascii_case(key)).map(|(_, l)| l));
+        level.copied()
+    };
+    let key = delete_kind_key(group, kind);
+    if let Some(own) = choice(&key) {
+        return own;
+    }
+    // A custom resource without a choice of its own. The kind alone names a built-in kind (the
+    // defaults say `Job`), or was saved by an older version without the group: it can only make
+    // deleting ask more than the default, never less.
+    match choice(kind) {
+        Some(bare) if key != kind => bare.max(s.delete_confirm),
+        _ => s.delete_confirm,
+    }
 }
 
 /// A namespace chosen on a context: how often, and when last (unix seconds).
@@ -243,6 +292,8 @@ impl Default for Settings {
             saved_forwards: Vec::new(),
             assistant_model: crate::assistant::DEFAULT_MODEL.into(),
             assistant_backend: "auto".into(),
+            assistant_notes: String::new(),
+            assistant_repos: Vec::new(),
             metrics_enabled: true,
             accent: "brass".into(),
             filter_history: Vec::new(),
@@ -264,8 +315,6 @@ static SETTINGS: LazyLock<RwLock<Settings>> = LazyLock::new(|| RwLock::new(load(
 static CHANGES: AtomicU64 = AtomicU64::new(0);
 /// The newest change on disk.
 static SAVED: Mutex<u64> = Mutex::new(0);
-/// The protection choices could not all be read: every context not set is protected.
-static PROTECTION_UNKNOWN: AtomicBool = AtomicBool::new(false);
 
 fn path() -> PathBuf {
     let base = std::env::var_os("XDG_CONFIG_HOME")
@@ -274,91 +323,70 @@ fn path() -> PathBuf {
     base.join("recouvrance").join("settings.json")
 }
 
+/// Set when settings.json existed but its `protection` could not be read at all (not JSON,
+/// or not an object): every context without a choice made since is then protected.
+static PROTECTION_LOST: AtomicBool = AtomicBool::new(false);
+
 /// The settings file. A field that does not read (a hand edit, or a value from a newer
-/// version) gets its default and the others, such as `protection`, are kept; in a map,
-/// only the entries that don't read are left out (see `fail_closed`). The file is kept
-/// aside as `load_json` does.
+/// version) gets its default and the others, such as `protection`, are kept; the file
+/// is kept aside as `load_json` does.
 fn load() -> Settings {
     let p = path();
-    let Ok(bytes) = std::fs::read(&p) else { return Settings::default() };
-    match serde_json::from_slice(&bytes) {
-        Ok(v) => v,
+    let bytes = match std::fs::read(&p) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Settings::default(),
         Err(e) => {
-            eprintln!("{}: {e}; fields that don't read use their defaults ({})", p.display(), keep_aside(&p));
-            let (mut s, left_out) =
-                by_field(&bytes).unwrap_or_else(|| (Settings::default(), vec![("protection".into(), None)]));
-            if fail_closed(&mut s, &left_out) {
-                PROTECTION_UNKNOWN.store(true, Ordering::Relaxed);
-            }
-            s
+            eprintln!("{}: {e}; every context is protected until it can be read", p.display());
+            PROTECTION_LOST.store(true, Ordering::Relaxed);
+            return Settings::default();
         }
+    };
+    let (settings, error, lost) = from_bytes(&bytes);
+    if let Some(e) = error {
+        eprintln!("{}: {e}; fields that don't read use their defaults ({})", p.display(), keep_aside(&p));
     }
+    if lost {
+        eprintln!("{}: the protection choices could not be read: every context is protected", p.display());
+        PROTECTION_LOST.store(true, Ordering::Relaxed);
+    }
+    settings
 }
 
-/// Fields left out of a JSON object, or a field and one of its entries.
-type LeftOut = Vec<(String, Option<String>)>;
-
-/// What was left out of the settings errs on the safe side: a protection choice that
-/// doesn't read protects its context, a delete setting that doesn't read asks for the
-/// name. True when the protection choices are lost as a whole: then every context not
-/// set must count as protected.
-fn fail_closed(s: &mut Settings, left_out: &[(String, Option<String>)]) -> bool {
-    let mut unknown = false;
-    for (field, entry) in left_out {
-        match (field.as_str(), entry) {
-            ("protection", Some(context)) => {
-                s.protection.insert(context.clone(), true);
-            }
-            ("delete_confirm_kinds", Some(kind)) => {
-                s.delete_confirm_kinds.insert(kind.clone(), DeleteConfirm::Type);
-            }
-            ("protection" | "protected_contexts", _) => unknown = true,
-            _ => {}
+/// Settings from the file's bytes: what reads, why the rest didn't, and whether the
+/// protection choices were lost with it.
+fn from_bytes(bytes: &[u8]) -> (Settings, Option<serde_json::Error>, bool) {
+    match serde_json::from_slice(bytes) {
+        Ok(v) => (v, None, false),
+        Err(e) => {
+            let lost = match serde_json::from_slice::<serde_json::Value>(bytes) {
+                Ok(serde_json::Value::Object(fields)) => {
+                    fields.get("protection").is_some_and(|p| !p.is_object())
+                        || fields
+                            .get("protected_contexts")
+                            .is_some_and(|p| serde_json::from_value::<Option<Vec<String>>>(p.clone()).is_err())
+                }
+                _ => true,
+            };
+            (by_field(bytes).unwrap_or_default(), Some(e), lost)
         }
     }
-    unknown
 }
 
 /// `T` from a JSON object, one field at a time: a field that does not read gets its
-/// default, and in a map (such as `protection`) only the entries that don't read are
-/// left out. Also gives what was left out: a field, or a field and an entry. None when
-/// the text is not a JSON object.
-fn by_field<T: Serialize + serde::de::DeserializeOwned + Default>(bytes: &[u8]) -> Option<(T, LeftOut)> {
+/// default. None when the text is not a JSON object.
+fn by_field<T: Serialize + serde::de::DeserializeOwned + Default>(bytes: &[u8]) -> Option<T> {
     let serde_json::Value::Object(fields) = serde_json::from_slice::<serde_json::Value>(bytes).ok()? else {
         return None;
     };
-    let reads = |v: &serde_json::Value| serde_json::from_value::<T>(v.clone()).is_ok();
     let mut merged = serde_json::to_value(T::default()).ok()?;
-    let mut left_out = Vec::new();
     for (key, value) in fields {
         let mut candidate = merged.clone();
-        candidate.as_object_mut()?.insert(key.clone(), value.clone());
-        if reads(&candidate) {
+        candidate.as_object_mut()?.insert(key, value);
+        if serde_json::from_value::<T>(candidate.clone()).is_ok() {
             merged = candidate;
-            continue;
         }
-        // A map: start empty and keep each entry that reads.
-        let serde_json::Value::Object(entries) = value else {
-            left_out.push((key, None));
-            continue;
-        };
-        candidate.as_object_mut()?.insert(key.clone(), serde_json::Value::Object(Default::default()));
-        if !reads(&candidate) {
-            left_out.push((key, None));
-            continue;
-        }
-        for (name, v) in entries {
-            let mut next = candidate.clone();
-            next[key.as_str()][name.as_str()] = v;
-            if reads(&next) {
-                candidate = next;
-            } else {
-                left_out.push((key.clone(), Some(name)));
-            }
-        }
-        merged = candidate;
     }
-    Some((serde_json::from_value(merged).ok()?, left_out))
+    serde_json::from_value(merged).ok()
 }
 
 /// Read a JSON file; missing means the defaults. A file that does not parse is kept
@@ -457,17 +485,34 @@ pub fn expand(p: &str) -> PathBuf {
 /// Whether writes on this context need an extra typed confirmation. A context never set
 /// is guessed from the kubeconfig; one the kubeconfig does not have now (or a kubeconfig
 /// that can't be read, say while a tool rewrites it) can't be guessed, so it is protected.
-/// So is every context not set when the settings file's choices could not be read.
 pub fn is_protected(context: &str) -> bool {
     migrate_protection();
     match with(|s| s.protection.get(context).copied()) {
         Some(chosen) => chosen,
-        None if PROTECTION_UNKNOWN.load(Ordering::Relaxed) => true,
+        None if PROTECTION_LOST.load(Ordering::Relaxed) => true,
         None => match crate::k8s::load_contexts() {
             Ok(c) => guess_protected(&c.names, &c.risky, context),
             Err(_) => true,
         },
     }
+}
+
+/// The contexts of a kubeconfig that are protected (see [`is_protected`]), from one read of it.
+pub fn protected_contexts(contexts: &crate::k8s::Contexts) -> Vec<String> {
+    migrate_protection();
+    with(|s| protected_among(&s.protection, &contexts.names, &contexts.risky))
+}
+
+fn protected_among(
+    chosen: &std::collections::BTreeMap<String, bool>,
+    names: &[String],
+    risky: &[String],
+) -> Vec<String> {
+    names
+        .iter()
+        .filter(|n| chosen.get(*n).copied().unwrap_or_else(|| guess_protected(names, risky, n)))
+        .cloned()
+        .collect()
 }
 
 fn guess_protected(names: &[String], risky: &[String], context: &str) -> bool {
@@ -606,8 +651,8 @@ fn unix_now() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        DeleteConfirm, NamespaceVisit, Settings, by_field, delete_confirm_in, fail_closed, guess_protected, load_json,
-        migrate_list, recent_as_visits, record_visits, save_newest, visit_score, write_atomic,
+        DeleteConfirm, NamespaceVisit, Settings, by_field, delete_confirm_in, guess_protected, load_json, migrate_list,
+        protected_among, recent_as_visits, record_visits, save_newest, visit_score, write_atomic,
     };
 
     #[test]
@@ -615,32 +660,28 @@ mod tests {
         let text =
             br#"{"protection": {"shop": true}, "delete_confirm": "from-a-newer-version", "metrics_refresh": 42}"#;
         assert!(serde_json::from_slice::<Settings>(text).is_err());
-        let (s, left_out) = by_field::<Settings>(text).unwrap();
+        let s: Settings = by_field(text).unwrap();
         assert_eq!(s.protection.get("shop"), Some(&true));
         assert_eq!(s.metrics_refresh, 42);
         assert_eq!(s.delete_confirm, Settings::default().delete_confirm);
-        assert_eq!(left_out, [("delete_confirm".to_string(), None)]);
         assert!(by_field::<Settings>(b"{ not json").is_none());
     }
 
     #[test]
-    fn a_bad_entry_keeps_the_others_and_errs_on_the_safe_side() {
-        let text = br#"{"protection": {"shop": false, "lab": "no", "prod": true},
-            "delete_confirm_kinds": {"Pod": "off", "Node": "maybe"},
-            "context_files": {"prod": "~/.kube/a", "dev": 3}}"#;
-        let (mut s, left_out) = by_field::<Settings>(text).unwrap();
-        assert_eq!(s.protection.get("shop"), Some(&false));
-        assert_eq!(s.protection.get("prod"), Some(&true));
-        assert_eq!(s.protection.get("lab"), None);
+    fn a_bad_delete_kind_asks_for_the_name_and_keeps_the_others() {
+        let text = br#"{"delete_confirm_kinds": {"Pod": "off", "Node": "maybe"}, "metrics_refresh": 42}"#;
+        let s: Settings = serde_json::from_slice(text).unwrap();
         assert_eq!(s.delete_confirm_kinds.get("Pod"), Some(&DeleteConfirm::Off));
-        assert_eq!(s.context_files.get("prod").map(String::as_str), Some("~/.kube/a"));
-        assert_eq!(s.context_files.get("dev"), None);
-        assert!(!fail_closed(&mut s, &left_out));
-        assert_eq!(s.protection.get("lab"), Some(&true));
         assert_eq!(s.delete_confirm_kinds.get("Node"), Some(&DeleteConfirm::Type));
-        // Protection that isn't a map at all: every context not set is protected.
-        let (mut s, left_out) = by_field::<Settings>(br#"{"protection": ["shop"]}"#).unwrap();
-        assert!(fail_closed(&mut s, &left_out));
+        assert_eq!(s.metrics_refresh, 42);
+    }
+
+    #[test]
+    fn an_old_protected_list_that_does_not_read_protects_everything() {
+        let (_, _, lost) = super::from_bytes(br#"{"protected_contexts": "prod"}"#);
+        assert!(lost);
+        let (_, _, lost) = super::from_bytes(br#"{"protected_contexts": ["prod"], "metrics_refresh": "x"}"#);
+        assert!(!lost);
     }
 
     #[test]
@@ -650,6 +691,15 @@ mod tests {
         assert!(!guess_protected(&names, &risky, "dev"));
         assert!(guess_protected(&names, &risky, "prod"));
         assert!(guess_protected(&names, &risky, "shop"));
+    }
+
+    #[test]
+    fn protection_set_by_hand_wins_over_the_guess() {
+        let names = ["dev".to_string(), "prod".to_string(), "lab".to_string()];
+        let risky = ["prod".to_string()];
+        let chosen = [("prod".to_string(), false), ("dev".to_string(), true)].into_iter().collect();
+        assert_eq!(protected_among(&chosen, &names, &risky), ["dev"]);
+        assert_eq!(protected_among(&Default::default(), &names, &risky), ["prod"]);
     }
 
     const DAY: i64 = 24 * 3600;
@@ -743,8 +793,27 @@ mod tests {
         let s: Settings =
             serde_json::from_str(r#"{"delete_confirm": "off", "delete_confirm_kinds": {"deployment": "type"}}"#)
                 .unwrap();
-        assert_eq!(delete_confirm_in(&s, "Deployment"), DeleteConfirm::Type);
-        assert_eq!(delete_confirm_in(&s, "Service"), DeleteConfirm::Off);
+        assert_eq!(delete_confirm_in(&s, "apps", "Deployment"), DeleteConfirm::Type);
+        assert_eq!(delete_confirm_in(&s, "", "Service"), DeleteConfirm::Off);
+    }
+
+    #[test]
+    fn a_custom_resource_is_not_a_built_in_kind_of_the_same_name() {
+        // The default deletes a Job right away; a Volcano Job asks, like any custom resource.
+        let s: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(delete_confirm_in(&s, "batch", "Job"), DeleteConfirm::Off);
+        assert_eq!(delete_confirm_in(&s, "batch.volcano.sh", "Job"), DeleteConfirm::Ask);
+        // A choice for one group's Cluster leaves another's alone.
+        let s: Settings = serde_json::from_str(
+            r#"{"delete_confirm": "ask", "delete_confirm_kinds": {"Cluster.cluster.x-k8s.io": "off"}}"#,
+        )
+        .unwrap();
+        assert_eq!(delete_confirm_in(&s, "cluster.x-k8s.io", "Cluster"), DeleteConfirm::Off);
+        assert_eq!(delete_confirm_in(&s, "postgresql.cnpg.io", "Cluster"), DeleteConfirm::Ask);
+        // Saved without its group by an older version: still applies when it asks more.
+        let s: Settings =
+            serde_json::from_str(r#"{"delete_confirm": "off", "delete_confirm_kinds": {"Cluster": "type"}}"#).unwrap();
+        assert_eq!(delete_confirm_in(&s, "postgresql.cnpg.io", "Cluster"), DeleteConfirm::Type);
     }
 
     #[test]
@@ -815,5 +884,86 @@ mod tests {
             true
         });
         assert_eq!(written, [2, 4]);
+    }
+}
+
+/// settings.json over many generated files with hand edits gone wrong: a bad value costs
+/// only itself, and protection choices are never lost in a way that unprotects a context.
+#[cfg(test)]
+mod properties {
+    use super::{Settings, from_bytes};
+    use proptest::prelude::*;
+    use serde_json::{Value, json};
+
+    /// Values no setting reads (each field fails on at least one).
+    fn bad() -> impl Strategy<Value = Value> {
+        prop_oneof![
+            Just(json!("from-a-newer-version")),
+            Just(json!(-1)),
+            Just(json!([[1]])),
+            Just(json!({"x": [null]}))
+        ]
+    }
+
+    fn protection() -> impl Strategy<Value = std::collections::BTreeMap<String, bool>> {
+        prop::collection::btree_map("[a-z]{1,6}", any::<bool>(), 0..5)
+    }
+
+    proptest! {
+        /// Spoiling some fields keeps every other one as it was, protection included.
+        #[test]
+        fn a_bad_field_costs_only_itself(
+            protection in protection(),
+            refresh in 1..1000u64,
+            spoiled in prop::collection::btree_map(0..40usize, bad(), 0..4),
+        ) {
+            let good = Settings { protection: protection.clone(), metrics_refresh: refresh, ..Settings::default() };
+            let mut fields = match serde_json::to_value(&good).unwrap() {
+                Value::Object(f) => f,
+                _ => unreachable!(),
+            };
+            let keys: Vec<String> = fields.keys().filter(|k| *k != "protection").cloned().collect();
+            let mut hit = std::collections::HashSet::new();
+            for (i, v) in &spoiled {
+                let key = &keys[i % keys.len()];
+                hit.insert(key.clone());
+                fields.insert(key.clone(), v.clone());
+            }
+            let (read, _, lost) = from_bytes(&serde_json::to_vec(&fields).unwrap());
+            prop_assert!(!lost);
+            prop_assert_eq!(&read.protection, &protection);
+            let read = serde_json::to_value(&read).unwrap();
+            let want = serde_json::to_value(&good).unwrap();
+            for key in &keys {
+                if !hit.contains(key) {
+                    prop_assert_eq!(&read[key], &want[key], "{} changed", key);
+                }
+            }
+        }
+
+        /// A protection entry that isn't true or false protects its context and keeps the others.
+        #[test]
+        fn a_bad_protection_entry_protects(protection in protection(), name in "[A-Z]{1,6}", value in bad()) {
+            let mut text = json!({"protection": protection.clone()});
+            text["protection"][&name] = value;
+            let (read, _, lost) = from_bytes(&serde_json::to_vec(&text).unwrap());
+            prop_assert!(!lost);
+            prop_assert_eq!(read.protection.get(&name), Some(&true));
+            for (k, v) in &protection {
+                prop_assert_eq!(read.protection.get(k), Some(v));
+            }
+        }
+
+        /// A file that doesn't read as an object, or whose protection isn't one, says the
+        /// choices are lost (so every context is protected), never that there are none.
+        #[test]
+        fn lost_choices_are_reported(cut in 1..200usize, protection in protection(), bad in bad()) {
+            prop_assume!(!protection.is_empty());
+            let text = serde_json::to_vec(&json!({"protection": protection, "metrics_refresh": 5})).unwrap();
+            let truncated = &text[..cut.min(text.len() - 1)];
+            prop_assert!(from_bytes(truncated).2);
+            let replaced = serde_json::to_vec(&json!({"protection": bad.clone()})).unwrap();
+            prop_assert_eq!(from_bytes(&replaced).2, !bad.is_object());
+        }
     }
 }

@@ -6,6 +6,8 @@ mod details;
 #[cfg(feature = "dev")]
 mod dev;
 mod diagnose;
+#[cfg(all(test, feature = "dev"))]
+mod e2e;
 mod favorites;
 mod filter_syntax;
 mod forwards;

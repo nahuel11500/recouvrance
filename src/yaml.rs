@@ -10,8 +10,9 @@ pub use serde_saphyr::Error;
 
 /// Only `true`/`false` are booleans: `yes`, `no`, `on`, `off` stay strings, as they did
 /// with serde_yaml_ng (YAML 1.2), so a ConfigMap value `"yes"` survives an edit.
+/// A number with a leading zero is octal, as kubectl reads it: `defaultMode: 0400` is 256.
 fn options() -> serde_saphyr::Options {
-    serde_saphyr::options! { strict_booleans: true }
+    serde_saphyr::options! { strict_booleans: true, legacy_octal_numbers: true }
 }
 
 pub fn from_str<T: DeserializeOwned>(text: &str) -> Result<T, Error> {
@@ -82,5 +83,14 @@ mod tests {
         let e = super::documents("kind: X\nspec:\n  bad: [\n").unwrap_err();
         assert_eq!(super::message(&e), "unclosed bracket '['");
         assert_eq!(e.location().map(|l| (l.line(), l.column())), Some((3, 8)));
+    }
+
+    /// kubectl reads `0400` as octal; read as decimal it would be mode 0620.
+    #[test]
+    fn leading_zero_numbers_are_octal() {
+        let v: Value = super::from_str("a: 0400\nb: 0644\nc: 0\nd: 10\ne: \"0400\"\nf: 0o17\n").unwrap();
+        assert_eq!(v, json!({"a": 256, "b": 420, "c": 0, "d": 10, "e": "0400", "f": 15}));
+        let docs = super::documents("defaultMode: 0440\n").unwrap();
+        assert_eq!(docs, vec![json!({"defaultMode": 288})]);
     }
 }
