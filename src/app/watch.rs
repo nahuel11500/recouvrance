@@ -103,6 +103,8 @@ impl AppView {
             );
             t.delegate_mut().set_namespace_filter(ns_filter);
             t.delegate_mut().set_filter(filter_text);
+            // A new list: the row highlighted in the old one (and Enter) points at nothing.
+            t.clear_selection(cx);
             t.refresh(cx);
         });
         self.status = loading.then(|| "Loading…".into());
@@ -246,6 +248,11 @@ impl AppView {
                         Some(ix) if t.selected_row() != Some(ix) => {
                             t.set_selected_row(ix, cx);
                             Some(ix)
+                        }
+                        // Its row is gone or filtered out: no other row takes the highlight.
+                        None if t.selected_row().is_some() => {
+                            t.clear_selection(cx);
+                            None
                         }
                         _ => None,
                     };
