@@ -135,7 +135,8 @@ pub struct Access {
     pub name: Option<String>,
 }
 
-fn any_glob(patterns: &[String], text: &str) -> bool {
+/// Whether a pattern matches, the way rules match: trimmed, ignoring case.
+pub fn any_glob(patterns: &[String], text: &str) -> bool {
     patterns.iter().any(|p| glob(&p.trim().to_lowercase(), &text.to_lowercase()))
 }
 
@@ -277,8 +278,9 @@ impl Policy {
         best(self.rules.iter().enumerate().filter(|(_, r)| r.matches(a, any_ns)))
     }
 
+    /// The context patterns of the non-expired Allow and Ask rules.
     pub fn context_patterns(&self) -> Vec<String> {
-        self.rules.iter().filter(|r| r.effect != Mode::Deny).flat_map(|r| r.contexts.clone()).collect()
+        self.rules.iter().filter(|r| r.effect != Mode::Deny && !r.expired()).flat_map(|r| r.contexts.clone()).collect()
     }
 
     /// Whether some non-expired Allow or Ask rule names this context: checked before connecting.
@@ -1112,6 +1114,20 @@ mod tests {
         assert_eq!(p.decide(&a).mode, Mode::Allow);
         a.name = Some("api".into());
         assert_eq!(p.decide(&a).mode, Mode::Deny);
+    }
+
+    #[test]
+    fn context_lists_follow_the_rules() {
+        let mut expired = rule(Mode::Allow, &["*"], &["*"], &["*"], &["prod"]);
+        expired.expires = Some(jiff::Timestamp::now() - jiff::SignedDuration::from_hours(1));
+        let p = Policy {
+            rules: vec![rule(Mode::Allow, &["get"], &["*"], &["*"], &[" Staging-*"]), expired],
+            ..Policy::default()
+        };
+        assert!(p.context_allowed("staging-eu"));
+        assert!(!p.context_allowed("prod"));
+        assert_eq!(p.context_patterns(), [" Staging-*"]);
+        assert!(any_glob(&p.context_patterns(), "staging-eu"));
     }
 
     #[test]

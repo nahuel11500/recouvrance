@@ -21,7 +21,7 @@ use rmcp::{ServerHandler, prompt, prompt_handler, prompt_router, schemars, tool,
 use serde::Deserialize;
 use serde_json::json;
 
-use super::{Access, Agent, AuditEntry, Decision, Hub, HubEvent, Mode, Policy, glob, is_write};
+use super::{Access, Agent, AuditEntry, Decision, Hub, HubEvent, Mode, Policy, is_write};
 use crate::k8s::{self, Kind, ObjectRef, TaskGuard};
 
 mod read_tools;
