@@ -162,7 +162,7 @@ pub(super) async fn fetch_related(
         return related;
     }
     if kind.is("policy", "PodDisruptionBudget") {
-        let sel = obj.pointer("/spec/selector").and_then(k8s::selector_string);
+        let Some(sel) = pdb_selector(obj) else { return related };
         let pods = k8s::list_values(client, k8s::ar_of::<core::Pod>(), Some(ns), sel).await;
         related.pods = related.noted("pods", pods);
         return related;
@@ -361,6 +361,12 @@ pub(super) async fn fetch_related(
     related
 }
 
+/// The pod selector of a PodDisruptionBudget, or `None` when it covers no pods: in
+/// policy/v1 a missing or null selector selects none, and only `{}` selects all.
+fn pdb_selector(obj: &serde_json::Value) -> Option<Option<String>> {
+    obj.pointer("/spec/selector").filter(|s| !s.is_null()).map(k8s::selector_string)
+}
+
 /// Does a pod spec use this Secret/ConfigMap (volumes, env, envFrom, pull secrets)?
 pub(super) fn references(spec: &serde_json::Value, name: &str, secret: bool) -> bool {
     let is = |v: Option<&serde_json::Value>| v.and_then(|v| v.as_str()) == Some(name);
@@ -387,4 +393,21 @@ pub(super) fn references(spec: &serde_json::Value, name: &str, secret: bool) -> 
     });
     let in_pull = secret && spec["imagePullSecrets"].as_array().into_iter().flatten().any(|p| is(p.get("name")));
     in_volumes || in_env || in_pull
+}
+
+#[cfg(test)]
+mod tests {
+    use super::pdb_selector;
+    use serde_json::json;
+
+    #[test]
+    fn pdb_without_selector_covers_no_pods() {
+        assert_eq!(pdb_selector(&json!({"spec": {"minAvailable": 1}})), None);
+        assert_eq!(pdb_selector(&json!({"spec": {"selector": null}})), None);
+        assert_eq!(pdb_selector(&json!({"spec": {"selector": {}}})), Some(None));
+        assert_eq!(
+            pdb_selector(&json!({"spec": {"selector": {"matchLabels": {"app": "web"}}}})),
+            Some(Some("app=web".into()))
+        );
+    }
 }
