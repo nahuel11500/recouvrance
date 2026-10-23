@@ -36,6 +36,9 @@ The contexts come from, merged in this order:
 The page shows each source with its file and context counts, or why it can't be read. Changes
 to any of these files are picked up within a few seconds. When two files define a context
 (or cluster, or user) with the same name, the later one is renamed `name@file` so both stay usable.
+A context name stays with the file that had it first (kept in `context_files`), even when files
+are saved again, reordered, or one is briefly unreadable: protection and per-cluster settings
+never move to another cluster. The name is freed when its file is deleted or no longer has it.
 
 ## settings.json
 
@@ -46,6 +49,7 @@ to any of these files are picked up within a few seconds. When two files define 
 | `metrics_refresh`, `detail_refresh`, `overview_refresh` | 15, 5, 30 | Seconds between refreshes |
 | `log_tail_lines`, `log_timestamps` | 1000, true | Log viewer |
 | `kubeconfigs`, `kubeconfig_folders` | | Extra kubeconfig files and watched folders (see above) |
+| `context_files` | | `{ "prod": "~/.kube/team-a.yaml" }`: the file each context name belongs to, so a name several files share stays with the first one (see above); filled in on its own |
 | `context_colors` | | `{ "prod-eu": "#ef4444" }`: a colored strip per context |
 | `protection` | guessed | `{ "prod-eu": true, "kind-dev": false }`: contexts where writes, shells and plugins need the context name typed. Contexts not listed are guessed from the context, user and cluster names and the server URL (`prod`, `prd`, `production`, `live`, `admin`, `root`). An older `protected_contexts` list is read once: its contexts become `true` |
 | `prometheus` | found automatically | `{ "ctx": "monitoring/prometheus:9090" }` (see below) |
