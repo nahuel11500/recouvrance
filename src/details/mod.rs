@@ -795,11 +795,13 @@ impl DetailPanel {
             self.schema_rows = crate::overview::crd_rows(&value);
         }
         // Re-created under the same name (a StatefulSet's pod, say), or opened by name:
-        // the events and logs shown are this object's.
+        // the events and logs shown are this object's. Logs follow the pod by name, so they
+        // restart only for a re-created one, not on a page's first read.
         if let Some(uid) = new_uid(&self.obj.uid, &value) {
+            let recreated = !self.obj.uid.is_empty() && !self.obj.uid.contains('/');
             self.obj.uid = uid;
             self.load_events(cx);
-            if let Some(logs) = &self.logs {
+            if let Some(logs) = self.logs.as_ref().filter(|_| recreated) {
                 logs.update(cx, |l, cx| {
                     if !l.paused {
                         l.restart(cx);
