@@ -182,16 +182,8 @@ impl AppView {
 
     /// What the assistant is told the user is looking at.
     fn assistant_scope(&self) -> String {
-        if self.clusters.is_empty() {
-            "no cluster open in Recouvrance (every kubeconfig context is available: start with list_contexts)"
-                .to_string()
-        } else {
-            format!(
-                "contexts {}{}",
-                self.clusters.iter().map(|c| c.0.clone()).collect::<Vec<_>>().join(", "),
-                self.namespace.as_ref().map(|n| format!(", namespace {n}")).unwrap_or_default()
-            )
-        }
+        let (contexts, namespace) = self.page_scope();
+        scope_text(&contexts, namespace.as_deref())
     }
 
     /// Tell open assistant chats, in every tab, about a new namespace selection.
@@ -304,5 +296,28 @@ impl AppView {
             this.open_helm_install(window, cx)
         })
         .detach();
+    }
+}
+
+/// What the assistant is told about `contexts` and the namespace picked.
+fn scope_text(contexts: &[String], namespace: Option<&str>) -> String {
+    if contexts.is_empty() {
+        return "no cluster open in Recouvrance (every kubeconfig context is available: start with list_contexts)"
+            .to_string();
+    }
+    let namespace = namespace.map(|n| format!(", namespace {n}")).unwrap_or_default();
+    format!("contexts {}{namespace}", contexts.join(", "))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::scope_text;
+
+    #[test]
+    fn the_assistant_scope_names_the_namespace_picked_now() {
+        let contexts = ["a".to_string(), "b".to_string()];
+        assert_eq!(scope_text(&contexts, Some("y")), "contexts a, b, namespace y");
+        assert_eq!(scope_text(&contexts, None), "contexts a, b");
+        assert!(scope_text(&[], Some("y")).starts_with("no cluster open"));
     }
 }
