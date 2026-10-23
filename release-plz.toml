@@ -1,7 +1,8 @@
 # release-plz keeps a "Release vX.Y.Z" pull request open on main: version bumped from the
 # conventional commits since the last release, changelog written from them. Merging it tags
-# vX.Y.Z and opens a draft GitHub release (nothing goes to crates.io, see below); the tag starts dist's release workflow,
-# which builds the binaries and installers, uploads them and publishes the release.
+# vX.Y.Z and opens a draft GitHub release (nothing goes to crates.io, see below); the tag starts
+# dist's release workflow, which builds the binaries and installers, uploads them and publishes
+# the release.
 
 [workspace]
 git_release_draft = true
@@ -42,7 +43,7 @@ commit_parsers = [
 
 # Releases go to GitHub only: the crate is not published to crates.io. To start publishing, store a
 # CARGO_REGISTRY_TOKEN in the `release` environment first, then remove this section (without the
-# token the publish job fails, and with it the tag and the binaries); see docs/development.md.
+# token the publish job fails, so no tag and no binaries); see docs/development.md.
 [[package]]
 name = "recouvrance"
 publish = false

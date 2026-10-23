@@ -124,7 +124,7 @@ that release-plz keeps open. Behind it:
   1. Create a crates.io token scoped to `recouvrance` with **publish-new** and publish-update,
      store it as `CARGO_REGISTRY_TOKEN` in the `release` environment (or run `cargo publish` by
      hand once), then remove the `[[package]]` section of `release-plz.toml` in the release pull
-     request. Without the token the publish job fails, and with it the tag and the binaries.
+     request. Without the token the publish job fails, so no tag and no binaries.
   2. Once the crate is on crates.io, add a trusted publisher in its settings: owner `nahuel11500`,
      repository `recouvrance`, workflow `release-plz.yml`, environment `release`.
   3. Delete the `CARGO_REGISTRY_TOKEN` secret and revoke the token on crates.io. Without it, the
