@@ -48,18 +48,9 @@ impl ProblemsView {
                 }
                 let scans = clusters.iter().map(|(ctx, c)| {
                     let (ctx, c, kinds, ns) = (ctx.clone(), c.clone(), kinds.clone(), ns.clone());
-                    async move { (ctx, problems::scan(c, &kinds, ns).await) }
+                    async move { (ctx, problems::scan_partial(c, &kinds, ns).await) }
                 });
-                let results = futures::future::join_all(scans).await;
-                let mut found = Vec::new();
-                let mut errors = Vec::new();
-                for (ctx, r) in results {
-                    match r {
-                        Ok(list) => found.extend(list.into_iter().map(|p| (ctx.clone(), p))),
-                        Err(e) => errors.push(format!("{ctx}: {e:#}")),
-                    }
-                }
-                found.sort_by_key(|a| a.1.severity);
+                let (found, errors) = merge(futures::future::join_all(scans).await);
                 if this
                     .update(cx, |this, cx| {
                         this.found = Some(found);
@@ -169,6 +160,21 @@ impl ProblemsView {
     }
 }
 
+/// Every cluster's problems, worst first, and a line for each cluster with kinds it could
+/// not read: a kind refused is noted, and the others are still shown.
+fn merge(results: Vec<(String, problems::Scan)>) -> (Vec<(String, Problem)>, Vec<String>) {
+    let mut found = Vec::new();
+    let mut errors = Vec::new();
+    for (ctx, scan) in results {
+        if let Some(skipped) = scan.skipped_text() {
+            errors.push(format!("{ctx}: could not read {skipped}"));
+        }
+        found.extend(scan.problems.into_iter().map(|p| (ctx.clone(), p)));
+    }
+    found.sort_by_key(|a| a.1.severity);
+    (found, errors)
+}
+
 impl Render for ProblemsView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
@@ -251,5 +257,35 @@ impl Render for ProblemsView {
                 .flex_1()
                 .min_h_0(),
             )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::problems::{Problem, Scan, Severity};
+
+    #[test]
+    fn a_kind_refused_keeps_the_others() {
+        let problem = |severity, name: &str| Problem {
+            severity,
+            kind: "pods".into(),
+            label: "Pod".into(),
+            namespace: Some("a".into()),
+            name: name.into(),
+            reason: "CrashLoopBackOff".into(),
+            age: None,
+        };
+        let forbidden: anyhow::Error =
+            kube::Error::Api(kube::core::Status::failure("forbidden", "Forbidden").with_code(403).boxed()).into();
+        let (found, errors) = super::merge(vec![
+            (
+                "one".into(),
+                Scan { problems: vec![problem(Severity::Warning, "w")], skipped: vec![("Nodes".into(), forbidden)] },
+            ),
+            ("two".into(), Scan { problems: vec![problem(Severity::Critical, "c")], skipped: Vec::new() }),
+        ]);
+        let names: Vec<(&str, &str)> = found.iter().map(|(ctx, p)| (ctx.as_str(), p.name.as_str())).collect();
+        assert_eq!(names, [("two", "c"), ("one", "w")]);
+        assert_eq!(errors, ["one: could not read Nodes (forbidden)"]);
     }
 }
