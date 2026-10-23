@@ -670,29 +670,30 @@ impl AppView {
         }
         // Same place in history, fresh data (links keep working: subscribe like the openers do).
         match &route {
-            Route::Cluster(p) => cx.subscribe_in(p, window, |this, _, ev: &OpenObject, window, cx| {
-                let ctx = ev.context.as_ref().and_then(|c| this.clusters.iter().position(|(n, _)| n == c)).unwrap_or(0);
-                this.open_object_in(ctx, &ev.kind, ev.name.clone(), ev.namespace.clone(), window, cx);
-            }),
-            Route::Workloads(p) => cx.subscribe_in(p, window, |this, _, ev: &OpenObject, window, cx| {
-                let ctx = ev.context.as_ref().and_then(|c| this.clusters.iter().position(|(n, _)| n == c)).unwrap_or(0);
-                this.open_object_in(ctx, &ev.kind, ev.name.clone(), ev.namespace.clone(), window, cx);
-            }),
-            Route::Problems(p) => cx.subscribe_in(p, window, |this, _, ev: &OpenObject, window, cx| {
-                let ctx = ev.context.as_ref().and_then(|c| this.clusters.iter().position(|(n, _)| n == c)).unwrap_or(0);
-                this.open_object_in(ctx, &ev.kind, ev.name.clone(), ev.namespace.clone(), window, cx);
-            }),
-            Route::Helm(p) => cx.subscribe_in(p, window, |this, _, ev: &OpenRelease, window, cx| {
-                let release = ev.0.clone();
-                let Some((context, client)) = this.clusters.iter().find(|(c, _)| *c == release.context).cloned() else {
-                    return;
-                };
-                let page = cx.new(|cx| HelmRelease::new(client, context, release, window, cx));
-                this.navigate(Route::HelmRelease(page), cx);
-            }),
+            Route::Cluster(p) => cx
+                .subscribe_in(p, window, |this, _, ev: &OpenObject, window, cx| {
+                    let ctx =
+                        ev.context.as_ref().and_then(|c| this.clusters.iter().position(|(n, _)| n == c)).unwrap_or(0);
+                    this.open_object_in(ctx, &ev.kind, ev.name.clone(), ev.namespace.clone(), window, cx);
+                })
+                .detach(),
+            Route::Workloads(p) => cx
+                .subscribe_in(p, window, |this, _, ev: &OpenObject, window, cx| {
+                    let ctx =
+                        ev.context.as_ref().and_then(|c| this.clusters.iter().position(|(n, _)| n == c)).unwrap_or(0);
+                    this.open_object_in(ctx, &ev.kind, ev.name.clone(), ev.namespace.clone(), window, cx);
+                })
+                .detach(),
+            Route::Problems(p) => cx
+                .subscribe_in(p, window, |this, _, ev: &OpenObject, window, cx| {
+                    let ctx =
+                        ev.context.as_ref().and_then(|c| this.clusters.iter().position(|(n, _)| n == c)).unwrap_or(0);
+                    this.open_object_in(ctx, &ev.kind, ev.name.clone(), ev.namespace.clone(), window, cx);
+                })
+                .detach(),
+            Route::Helm(p) => self.subscribe_helm(p, window, cx),
             _ => return,
         }
-        .detach();
         if let Some(slot) = self.history.get_mut(self.pos) {
             *slot = route;
         }
