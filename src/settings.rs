@@ -7,8 +7,8 @@ use std::sync::{LazyLock, Mutex, RwLock};
 
 use serde::{Deserialize, Serialize};
 
-/// What deleting asks before it runs (per kind, see `delete_confirm`).
-#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+/// What deleting asks before it runs (per kind, see `delete_confirm`), from least to most.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 #[serde(rename_all = "kebab-case")]
 pub enum DeleteConfirm {
     /// Delete right away (a protected context still asks for its name).
@@ -128,7 +128,8 @@ pub struct Settings {
     pub recent_forwards: Vec<SavedForward>,
     /// What deleting asks for kinds not in `delete_confirm_kinds`.
     pub delete_confirm: DeleteConfirm,
-    /// What deleting asks, by kind (`Node`, `StatefulSet`…).
+    /// What deleting asks, by kind: `Node`, `StatefulSet`… for built-in kinds, with the group
+    /// for custom resources (`Cluster.postgresql.cnpg.io`), see `delete_kind_key`.
     pub delete_confirm_kinds: std::collections::BTreeMap<String, DeleteConfirm>,
 }
 
@@ -151,18 +152,37 @@ fn default_delete_confirm() -> std::collections::BTreeMap<String, DeleteConfirm>
     off.iter().map(|k| (k.to_string(), Off)).chain(typed.iter().map(|k| (k.to_string(), Type))).collect()
 }
 
-/// What deleting an object of this kind (`Pod`, `Node`…) asks first.
-pub fn delete_confirm(kind: &str) -> DeleteConfirm {
-    with(|s| delete_confirm_in(s, kind))
+/// The key a kind's delete choice is saved under: the kind alone when built in (`Job`), with
+/// its group for a custom resource (`Job.batch.volcano.sh`), as several groups can name one.
+pub fn delete_kind_key(group: &str, kind: &str) -> String {
+    if crate::k8s::is_builtin_group(group) { kind.to_string() } else { format!("{kind}.{group}") }
+}
+
+/// What deleting an object of this kind (`apps`, `Deployment`) asks first.
+pub fn delete_confirm(group: &str, kind: &str) -> DeleteConfirm {
+    with(|s| delete_confirm_in(s, group, kind))
 }
 
 /// The kind's own choice, else the default. Case is ignored: older versions saved kinds as typed.
-fn delete_confirm_in(s: &Settings, kind: &str) -> DeleteConfirm {
-    let own = s
-        .delete_confirm_kinds
-        .get(kind)
-        .or_else(|| s.delete_confirm_kinds.iter().find(|(k, _)| k.eq_ignore_ascii_case(kind)).map(|(_, level)| level));
-    own.copied().unwrap_or(s.delete_confirm)
+fn delete_confirm_in(s: &Settings, group: &str, kind: &str) -> DeleteConfirm {
+    let choice = |key: &str| {
+        let level = s
+            .delete_confirm_kinds
+            .get(key)
+            .or_else(|| s.delete_confirm_kinds.iter().find(|(k, _)| k.eq_ignore_ascii_case(key)).map(|(_, l)| l));
+        level.copied()
+    };
+    let key = delete_kind_key(group, kind);
+    if let Some(own) = choice(&key) {
+        return own;
+    }
+    // A custom resource without a choice of its own. The kind alone names a built-in kind (the
+    // defaults say `Job`), or was saved by an older version without the group: it can only make
+    // deleting ask more than the default, never less.
+    match choice(kind) {
+        Some(bare) if key != kind => bare.max(s.delete_confirm),
+        _ => s.delete_confirm,
+    }
 }
 
 /// A namespace chosen on a context: how often, and when last (unix seconds).
@@ -663,8 +683,27 @@ mod tests {
         let s: Settings =
             serde_json::from_str(r#"{"delete_confirm": "off", "delete_confirm_kinds": {"deployment": "type"}}"#)
                 .unwrap();
-        assert_eq!(delete_confirm_in(&s, "Deployment"), DeleteConfirm::Type);
-        assert_eq!(delete_confirm_in(&s, "Service"), DeleteConfirm::Off);
+        assert_eq!(delete_confirm_in(&s, "apps", "Deployment"), DeleteConfirm::Type);
+        assert_eq!(delete_confirm_in(&s, "", "Service"), DeleteConfirm::Off);
+    }
+
+    #[test]
+    fn a_custom_resource_is_not_a_built_in_kind_of_the_same_name() {
+        // The default deletes a Job right away; a Volcano Job asks, like any custom resource.
+        let s: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(delete_confirm_in(&s, "batch", "Job"), DeleteConfirm::Off);
+        assert_eq!(delete_confirm_in(&s, "batch.volcano.sh", "Job"), DeleteConfirm::Ask);
+        // A choice for one group's Cluster leaves another's alone.
+        let s: Settings = serde_json::from_str(
+            r#"{"delete_confirm": "ask", "delete_confirm_kinds": {"Cluster.cluster.x-k8s.io": "off"}}"#,
+        )
+        .unwrap();
+        assert_eq!(delete_confirm_in(&s, "cluster.x-k8s.io", "Cluster"), DeleteConfirm::Off);
+        assert_eq!(delete_confirm_in(&s, "postgresql.cnpg.io", "Cluster"), DeleteConfirm::Ask);
+        // Saved without its group by an older version: still applies when it asks more.
+        let s: Settings =
+            serde_json::from_str(r#"{"delete_confirm": "off", "delete_confirm_kinds": {"Cluster": "type"}}"#).unwrap();
+        assert_eq!(delete_confirm_in(&s, "postgresql.cnpg.io", "Cluster"), DeleteConfirm::Type);
     }
 
     #[test]
