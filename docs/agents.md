@@ -45,7 +45,8 @@ activity log keeps each object with a hash of that YAML, and the objects already
 is cut off.
 The *Always allow this* and *Allow for 1h* offers are left out where no rule can be that narrow:
 exec (a rule cannot pin the command), GitOps actions, `apply_manifest` (a rule cannot pin the
-content), writes with no object name, and dry runs (the rule would allow the real write too).
+content), requests other than lists with no object name (e.g. `check_certificates`: the rule would
+cover every name), and dry runs (the rule would allow the real write too).
 
 Before any rule is checked, a call's context must be named by one of the agent's Allow or Ask rules
 (other contexts are never contacted), and the names it passes are validated: a namespace or
