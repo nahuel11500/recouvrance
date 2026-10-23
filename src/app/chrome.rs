@@ -396,7 +396,7 @@ impl AppView {
     }
 }
 
-/// " · <context>" for an object on cluster `ctx`, when several are connected.
+/// `" · <context>"` for an object on cluster `ctx`, when several are connected.
 fn on_cluster(names: &[String], ctx: usize) -> String {
     match names.get(ctx) {
         Some(name) if names.len() > 1 => format!(" · {name}"),
