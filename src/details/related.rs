@@ -11,6 +11,15 @@ pub(super) fn container_names(value: &serde_json::Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Names of the workload pods the charts measure (see `prom::chart_pods`).
+fn chart_pod_names(pods: &[serde_json::Value]) -> Vec<String> {
+    crate::prom::chart_pods(pods)
+        .0
+        .into_iter()
+        .filter_map(|p| p.pointer("/metadata/name").and_then(|v| v.as_str()).map(String::from))
+        .collect()
+}
+
 /// Everything the overview links to or measures for one object.
 /// CPU (millicores) and memory (bytes) of a pod, workload (its pods) or node from Prometheus.
 pub(super) async fn history_for(
@@ -27,14 +36,7 @@ pub(super) async fn history_for(
     let (cpu, mem) = if kind.is("", "Node") {
         crate::prom::node_usage(client, target, name, minutes).await.ok()?
     } else {
-        let names: Vec<String> = if kind.is("", "Pod") {
-            vec![name.to_string()]
-        } else {
-            pods.iter()
-                .take(crate::prom::MAX_CHART_PODS)
-                .filter_map(|p| p.pointer("/metadata/name").and_then(|v| v.as_str()).map(String::from))
-                .collect()
-        };
+        let names: Vec<String> = if kind.is("", "Pod") { vec![name.to_string()] } else { chart_pod_names(pods) };
         if names.is_empty() {
             return None;
         }
@@ -78,14 +80,7 @@ pub(super) async fn gpu_history_for(
     if kind.is("", "Node") {
         return crate::prom::gpu_usage(client, target, crate::prom::GpuScope::Node(name), minutes).await;
     }
-    let names: Vec<String> = if kind.is("", "Pod") {
-        vec![name.to_string()]
-    } else {
-        pods.iter()
-            .take(crate::prom::MAX_CHART_PODS)
-            .filter_map(|p| p.pointer("/metadata/name").and_then(|v| v.as_str()).map(String::from))
-            .collect()
-    };
+    let names: Vec<String> = if kind.is("", "Pod") { vec![name.to_string()] } else { chart_pod_names(pods) };
     if names.is_empty() {
         return None;
     }
