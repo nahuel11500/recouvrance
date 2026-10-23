@@ -115,6 +115,8 @@ impl AppView {
                         this.kind = wanted
                             .or_else(|| keep.and_then(|key| kinds.iter().find(|k| k.key() == key).cloned()))
                             .or_else(|| kinds.iter().find(|k| k.is("", "Pod")).cloned());
+                        // Back must not return to a list the new clusters don't have.
+                        served_lists(&mut this.history, &kinds, this.kind.as_ref());
                         // Other tabs keep a kind and namespaces only where the new clusters have them.
                         let active = this.active_tab;
                         let fallback = this.kind.clone();
@@ -249,6 +251,17 @@ impl AppView {
     }
 }
 
+/// Lists in a history that name a kind none of the clusters serve show `fallback` instead.
+fn served_lists(history: &mut [Route], kinds: &[Kind], fallback: Option<&Kind>) {
+    for route in history {
+        if let Route::Resources(Some(k)) = route
+            && !kinds.iter().any(|x| x.key() == k.key())
+        {
+            *route = Route::Resources(fallback.cloned());
+        }
+    }
+}
+
 /// The one namespace to show when only some are accessible: the one just ticked,
 /// else the last one asked for, else the first accessible one. None when all are.
 fn one_namespace(wanted: &[String], previous: &[String], accessible: &[String]) -> Option<String> {
@@ -260,7 +273,37 @@ fn one_namespace(wanted: &[String], previous: &[String], accessible: &[String]) 
 
 #[cfg(test)]
 mod tests {
-    use super::one_namespace;
+    use super::{Kind, Route, one_namespace, served_lists};
+
+    fn kind(k: &str) -> Kind {
+        Kind {
+            ar: kube::discovery::ApiResource {
+                group: "".into(),
+                version: "v1".into(),
+                api_version: "v1".into(),
+                kind: k.into(),
+                plural: format!("{}s", k.to_lowercase()),
+            },
+            namespaced: true,
+            section: "",
+            label: k.into(),
+        }
+    }
+
+    #[test]
+    fn back_goes_to_a_list_the_clusters_serve() {
+        let (pods, certs) = (kind("Pod"), kind("Certificate"));
+        let mut history = vec![Route::Resources(Some(certs)), Route::Resources(None), Route::Contexts];
+        served_lists(&mut history, std::slice::from_ref(&pods), Some(&pods));
+        let lists: Vec<Option<String>> = history
+            .iter()
+            .map(|r| match r {
+                Route::Resources(k) => k.as_ref().map(|k| k.label.clone()),
+                _ => Some("other".into()),
+            })
+            .collect();
+        assert_eq!(lists, [Some("Pod".into()), None, Some("other".into())]);
+    }
 
     fn v(list: &[&str]) -> Vec<String> {
         list.iter().map(|s| s.to_string()).collect()
