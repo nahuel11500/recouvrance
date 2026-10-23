@@ -560,17 +560,21 @@ pub async fn rollback(
 }
 
 /// A StatefulSet's or DaemonSet's ControllerRevisions, shaped like ReplicaSets
-/// (revision annotation, spec.template) so the Revisions tab treats them alike.
-pub async fn controller_revisions(client: Client, ns: String, owner_uid: String) -> Vec<serde_json::Value> {
+/// (revision annotation, spec.template) so the Revisions tab treats them alike. A list
+/// that fails is an error, not "no revisions".
+pub async fn controller_revisions(client: Client, ns: String, owner_uid: String) -> Result<Vec<serde_json::Value>> {
     let ar = ar_of::<k8s_openapi::api::apps::v1::ControllerRevision>();
-    list_values(client, ar, Some(ns), None)
-        .await
-        .unwrap_or_default()
+    Ok(owned_revisions(list_values(client, ar, Some(ns), None).await?, &owner_uid))
+}
+
+/// The revisions `owner_uid` owns, shaped like ReplicaSets.
+fn owned_revisions(items: Vec<serde_json::Value>, owner_uid: &str) -> Vec<serde_json::Value> {
+    items
         .into_iter()
         .filter(|r| {
             r.pointer("/metadata/ownerReferences")
                 .and_then(|o| o.as_array())
-                .is_some_and(|o| o.iter().any(|x| x["uid"].as_str() == Some(owner_uid.as_str())))
+                .is_some_and(|o| o.iter().any(|x| x["uid"].as_str() == Some(owner_uid)))
         })
         .map(|r| {
             serde_json::json!({
@@ -608,6 +612,21 @@ pub async fn create(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn controller_revisions_keep_the_owners_shaped_like_replicasets() {
+        let rev = |name: &str, owner: &str, n: i64| {
+            serde_json::json!({
+                "metadata": {"name": name, "ownerReferences": [{"uid": owner}]},
+                "revision": n,
+                "data": {"spec": {"template": {"spec": {"containers": []}}}},
+            })
+        };
+        let shaped = owned_revisions(vec![rev("db-1", "a", 1), rev("other-1", "b", 1), rev("db-2", "a", 2)], "a");
+        assert_eq!(shaped.len(), 2);
+        assert_eq!(shaped[1].pointer("/metadata/annotations/deployment.kubernetes.io~1revision"), Some(&"2".into()));
+        assert!(shaped[1].pointer("/spec/template/spec").is_some());
+    }
 
     #[test]
     fn deletes_are_pinned_to_the_object_picked() {
