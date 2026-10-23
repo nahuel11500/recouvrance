@@ -254,7 +254,8 @@ pub(super) async fn list_paged_with(
     let full = needs_full(extras);
     let (mut defs, mut rows, mut version) = (Vec::new(), Vec::new(), String::new());
     loop {
-        let page: ServerTable = client.request(with_table_format(Request::new(url).list(&lp)?, full)?).await?;
+        let page: ServerTable =
+            lists::request_idle(client, with_table_format(Request::new(url).list(&lp)?, full)?).await?;
         if defs.is_empty() {
             defs = page.column_definitions;
             defs.extend(extras.iter().map(|(name, _)| ColumnDef { name: name.clone(), priority: 0 }));
@@ -285,7 +286,7 @@ async fn cells_by_namespace(client: &Client, url: &str) -> Result<Vec<Arc<Row>>>
     let (prefix, resource) = url.rsplit_once('/').ok_or_else(|| anyhow!("unexpected path {url}"))?;
     let mut req = http::Request::get("/api/v1/namespaces?includeObject=None").body(Vec::new())?;
     req.headers_mut().insert(http::header::ACCEPT, http::HeaderValue::from_static(TABLE_ACCEPT));
-    let namespaces: ServerTable = client.request(req).await?;
+    let namespaces: ServerTable = lists::request_idle(client, req).await?;
     let names: Vec<String> =
         namespaces.rows.iter().filter_map(|r| r.cells.first()?.as_str().map(String::from)).collect();
     let jobs = names.into_iter().map(|ns| {
@@ -297,7 +298,7 @@ async fn cells_by_namespace(client: &Client, url: &str) -> Result<Vec<Arc<Row>>>
             let _slot = FAST_SLOTS.acquire().await?;
             let mut req = http::Request::get(&path).body(Vec::new())?;
             req.headers_mut().insert(http::header::ACCEPT, http::HeaderValue::from_static(TABLE_ACCEPT));
-            let page: ServerTable = client.request(req).await?;
+            let page: ServerTable = lists::request_idle(&client, req).await?;
             let age = page.column_definitions.iter().position(|d| d.name == "Age");
             Ok::<_, anyhow::Error>(
                 page.rows.into_iter().filter_map(|r| cells_row(r, Some(&ns), age)).collect::<Vec<_>>(),
@@ -325,7 +326,8 @@ async fn list_fast(
     pause: &Pause,
 ) -> Result<(Vec<ColumnDef>, Vec<Arc<Row>>, String)> {
     let lp = ListParams::default().limit(PAGE_SIZE);
-    let page: ServerTable = client.request(with_table_format(Request::new(url).list(&lp)?, false)?).await?;
+    let page: ServerTable =
+        lists::request_idle(client, with_table_format(Request::new(url).list(&lp)?, false)?).await?;
     let defs = page.column_definitions.clone();
     let _ = tx.unbounded_send(TableMsg::Columns(Arc::new(defs.clone())));
     let more = page.metadata.continue_.as_ref().is_some_and(|c| !c.is_empty());
@@ -380,7 +382,7 @@ async fn list_whole(client: &Client, url: &str) -> Result<(Vec<ColumnDef>, Vec<A
     let mut req = http::Request::get(&path).body(Vec::new())?;
     req.headers_mut().insert(http::header::ACCEPT, http::HeaderValue::from_static(TABLE_ACCEPT));
     let body = client.request_stream(req).await?;
-    let table: LeanTable = lists::parse_streamed(body.compat()).await?;
+    let table: LeanTable = lists::parse_streamed(lists::Idle::new(body.compat(), lists::LIST_IDLE)).await?;
     // A server that pages it anyway: the rows would be partial.
     if table.metadata.continue_.as_ref().is_some_and(|c| !c.is_empty()) {
         return Err(anyhow!("the API server paged a cached list"));
@@ -400,7 +402,7 @@ async fn cells_list(client: &Client, url: &str, namespace: Option<&str>) -> Resu
     let path = format!("{url}?includeObject=None&resourceVersion=0&resourceVersionMatch=NotOlderThan");
     let mut req = http::Request::get(&path).body(Vec::new())?;
     req.headers_mut().insert(http::header::ACCEPT, http::HeaderValue::from_static(TABLE_ACCEPT));
-    let page: ServerTable = client.request(req).await?;
+    let page: ServerTable = lists::request_idle(client, req).await?;
     let age = page.column_definitions.iter().position(|d| d.name == "Age");
     Ok(page.rows.into_iter().filter_map(|r| cells_row(r, namespace, age)).collect())
 }
@@ -466,7 +468,8 @@ pub async fn list_light(
         let ns = if kind.namespaced { namespace } else { None };
         let url = DynamicObject::url_path(&kind.ar, ns.as_deref());
         let lp = ListParams::default().limit(LIGHT_PROBE);
-        let page: ServerTable = client.request(with_table_format(Request::new(&url).list(&lp)?, false)?).await?;
+        let page: ServerTable =
+            lists::request_idle(&client, with_table_format(Request::new(&url).list(&lp)?, false)?).await?;
         let defs = page.column_definitions.clone();
         if page.metadata.continue_.as_ref().is_none_or(|c| c.is_empty()) {
             let rows = page.rows.into_iter().filter_map(|r| to_row(r, &Extras::default())).collect();

@@ -247,19 +247,27 @@ fn values_yaml(values: &Value, reveal: bool) -> String {
     crate::yaml::to_string(&v).unwrap_or_default()
 }
 
+/// Mask the values under secret-looking keys: a string or number, or each one in a list of
+/// them (`passwords: [p1, p2]`).
 fn mask_secrets(v: &mut Value) {
     const HINTS: [&str; 9] =
         ["password", "passwd", "secret", "token", "apikey", "api_key", "credential", "privatekey", "private_key"];
+    let scalar = |v: &Value| v.is_string() || v.is_number();
+    let mask = || Value::String("••••••".into());
     match v {
         Value::Object(map) => {
             for (k, val) in map.iter_mut() {
                 let key = k.to_lowercase().replace('-', "_");
                 let secretish =
                     HINTS.iter().any(|h| key.contains(h)) || key.ends_with("key") && !key.ends_with("publickey");
-                if secretish && (val.is_string() || val.is_number()) {
-                    *val = Value::String("••••••".into());
-                } else {
-                    mask_secrets(val);
+                match val {
+                    val if secretish && scalar(val) => *val = mask(),
+                    Value::Array(items) if secretish => {
+                        for item in items {
+                            if scalar(item) { *item = mask() } else { mask_secrets(item) }
+                        }
+                    }
+                    val => mask_secrets(val),
                 }
             }
         }
@@ -1368,8 +1376,15 @@ mod tests {
             "db": {"password": "example", "host": "pg", "port": 5432},
             "auth": {"apiKey": "abc", "publicKey": "pub"},
             "list": [{"token": "t"}],
+            "mongodb": {"auth": {"passwords": ["p1", "p2"], "usernames": ["u1"]}},
+            "sasl": {"client": {"passwords": ["p1", {"secret": "s", "name": "n"}]}},
         });
         mask_secrets(&mut v);
+        assert_eq!(v["mongodb"]["auth"]["passwords"], serde_json::json!(["••••••", "••••••"]));
+        assert_eq!(v["mongodb"]["auth"]["usernames"][0], "u1");
+        assert_eq!(v["sasl"]["client"]["passwords"][0], "••••••");
+        assert_eq!(v["sasl"]["client"]["passwords"][1]["secret"], "••••••");
+        assert_eq!(v["sasl"]["client"]["passwords"][1]["name"], "n");
         assert_eq!(v["db"]["password"], "••••••");
         assert_eq!(v["db"]["host"], "pg");
         assert_eq!(v["db"]["port"], 5432);

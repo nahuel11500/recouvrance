@@ -506,14 +506,52 @@ pub async fn ask(
     }
 }
 
-fn system_prompt(scope: &str) -> String {
-    format!(
+fn system_prompt(scope: &str, repos: &[PathBuf]) -> String {
+    let mut prompt = format!(
         "You are the assistant inside Recouvrance, a Kubernetes desktop app. Answer from the live clusters using the Recouvrance tools. \
          The user is looking at: {scope}. Start with my_permissions if unsure what you may do. \
          Prefer find_problems, describe_resource, get_events and get_logs to investigate. \
          Never change anything unless the user explicitly asks; writes may need the user's approval in the app. \
          Be concise: short paragraphs, kubectl-style names, and quote the evidence (event or log line)."
+    );
+    if !repos.is_empty() {
+        let list: Vec<String> = repos.iter().map(|r| r.display().to_string()).collect();
+        prompt.push_str(&format!(
+            "\n\nThe source code of the team's services can be read with Read, Grep and Glob (read-only) in: {}. \
+             Look there for the code behind an error, its configuration and its Helm chart.",
+            list.join(", ")
+        ));
+    }
+    let notes = crate::settings::get().assistant_notes;
+    if !notes.trim().is_empty() {
+        prompt.push_str(&format!(
+            "\n\nThe team's notes for investigations (where things run, dashboards, runbooks, repositories). \
+             Follow them where they apply:\n{}",
+            notes.trim()
+        ));
+    }
+    prompt
+}
+
+/// The question the Diagnosis card's "Investigate" asks: find the cause of what the
+/// diagnosis found, read-only, from the object's own evidence.
+pub fn investigation(context: &str, kind: &str, namespace: Option<&str>, name: &str, findings: &str) -> String {
+    let target = match namespace {
+        Some(ns) => format!("{kind} {name} in namespace {ns}"),
+        None => format!("{kind} {name}"),
+    };
+    format!(
+        "Investigate why {target} (context {context}) is failing. Recouvrance's diagnosis:\n{findings}\n\n\
+         Find the root cause from the evidence: describe_resource on it and on the workload that owns it, get_events, \
+         get_logs (with previous=true after a restart or OOMKilled), its usage_history against requests and limits, \
+         and what changed recently (rollout revisions, Helm release, GitOps). Use the team's notes and code where they apply. \
+         Change nothing. Answer with: the cause, the evidence (quote the lines), and the fix (the command or manifest change)."
     )
+}
+
+/// The team's code folders the assistant may read (Claude Code only): those that exist.
+fn code_dirs() -> Vec<PathBuf> {
+    crate::settings::get().assistant_repos.iter().map(|r| crate::settings::expand(r)).filter(|p| p.is_dir()).collect()
 }
 
 /// The `claude -p` arguments. The question comes last, after `--`, so one starting with `-`
@@ -524,24 +562,28 @@ fn claude_args(
     scope: &str,
     model: &str,
     session: Option<&str>,
+    repos: &[PathBuf],
 ) -> Vec<std::ffi::OsString> {
-    let mut args: Vec<std::ffi::OsString> = [
-        "-p",
-        "--output-format",
-        "stream-json",
-        "--verbose",
-        "--tools",
-        "",
-        "--strict-mcp-config",
-        "--allowedTools",
-        "mcp__recouvrance",
-        "--mcp-config",
-    ]
-    .into_iter()
-    .map(Into::into)
-    .collect();
-    args.push(mcp_config.into());
-    args.extend(["--append-system-prompt".into(), system_prompt(scope).into()]);
+    let mut args: Vec<std::ffi::OsString> =
+        ["-p", "--output-format", "stream-json", "--verbose", "--strict-mcp-config"]
+            .into_iter()
+            .map(Into::into)
+            .collect();
+    if repos.is_empty() {
+        args.extend(["--tools".into(), "".into(), "--allowedTools".into(), "mcp__recouvrance".into()]);
+    } else {
+        // Only the file readers, and `--restricted` keeps them inside the working
+        // directories: the code folders and the private one (no kubeconfig, no keys).
+        args.extend(
+            ["--restricted", "--tools", "Read,Grep,Glob", "--allowedTools", "mcp__recouvrance,Read,Grep,Glob"]
+                .map(Into::into),
+        );
+        for r in repos {
+            args.extend(["--add-dir".into(), r.into()]);
+        }
+    }
+    args.extend(["--mcp-config".into(), mcp_config.into()]);
+    args.extend(["--append-system-prompt".into(), system_prompt(scope, repos).into()]);
     if model != DEFAULT_MODEL && !model.is_empty() {
         args.extend(["--model".into(), model.into()]);
     }
@@ -576,7 +618,7 @@ async fn ask_claude_code(
         let cfg_file = TempFile::create(work.0.join(format!("mcp-{}.json", uuid::Uuid::new_v4().simple())), cfg.to_string().as_bytes())?;
         let mut cmd = tokio::process::Command::new(&bin);
         cmd.current_dir(&work.0)
-            .args(claude_args(&question, &cfg_file.0, &scope, &model, conv.session.as_deref()))
+            .args(claude_args(&question, &cfg_file.0, &scope, &model, conv.session.as_deref(), &code_dirs()))
             // `claude -p` reads a stdin that is not a terminal: give it none.
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
@@ -659,7 +701,7 @@ async fn ask_api(
     scope: String,
     mut on_step: impl FnMut(Step) + Send + 'static,
 ) -> Result<Vec<Value>> {
-    let key = api_key().context("no Anthropic API key (Settings → Assistant)")?;
+    let key = api_key().context("no Anthropic API key (add one on the Assistant page)")?;
     let token = agent_token(&hub)?;
     let port = hub.port();
     run_abortable(async move {
@@ -670,7 +712,7 @@ async fn ask_api(
             .into_iter()
             .map(|t| json!({"name": t["name"], "description": t["description"], "input_schema": t["inputSchema"]}))
             .collect();
-        let system = system_prompt(&scope);
+        let system = system_prompt(&scope, &[]);
         let mut messages = history;
         messages.push(json!({"role": "user", "content": question}));
         let headers = [("x-api-key", key.as_str()), ("anthropic-version", "2023-06-01")];
@@ -727,6 +769,7 @@ fn reply_content(resp: &Value) -> Vec<Value> {
 #[cfg(test)]
 mod tests {
     use serde_json::json;
+    use std::path::PathBuf;
 
     #[test]
     fn cut_off_tool_calls_are_dropped() {
@@ -740,12 +783,36 @@ mod tests {
 
     #[test]
     fn question_is_never_an_option() {
-        let args = super::claude_args("--model x -n kube-system", "/tmp/mcp.json".as_ref(), "pods", "", Some("s1"));
+        let args =
+            super::claude_args("--model x -n kube-system", "/tmp/mcp.json".as_ref(), "pods", "", Some("s1"), &[]);
         let n = args.len();
         assert_eq!(args[n - 2], "--");
         assert_eq!(args[n - 1], "--model x -n kube-system");
         assert_eq!(args.iter().filter(|a| *a == "--model").count(), 0);
         assert!(args.windows(2).any(|w| w[0] == "--resume" && w[1] == "s1"));
+    }
+
+    #[test]
+    fn investigation_names_the_object_and_its_findings() {
+        let q = super::investigation("kind-demo", "Pod", Some("shop"), "api-1", "- CrashLoopBackOff");
+        assert!(q.contains("Pod api-1 in namespace shop (context kind-demo)"));
+        assert!(q.contains("- CrashLoopBackOff"));
+        assert!(q.contains("Change nothing"));
+        assert!(super::investigation("c", "Node", None, "n1", "").contains("Node n1 (context c)"));
+    }
+
+    #[test]
+    fn code_folders_are_read_only_and_confined() {
+        let none = super::claude_args("q", "/tmp/mcp.json".as_ref(), "pods", "", None, &[]);
+        assert!(none.windows(2).any(|w| w[0] == "--tools" && w[1].is_empty()));
+        assert!(!none.iter().any(|a| a == "--restricted" || a == "--add-dir"));
+        let repos = [PathBuf::from("/src/a"), PathBuf::from("/src/b")];
+        let args = super::claude_args("q", "/tmp/mcp.json".as_ref(), "pods", "", None, &repos);
+        assert!(args.iter().any(|a| a == "--restricted"));
+        assert!(args.windows(2).any(|w| w[0] == "--tools" && w[1] == "Read,Grep,Glob"));
+        let dirs: Vec<_> = args.windows(2).filter(|w| w[0] == "--add-dir").map(|w| w[1].clone()).collect();
+        assert_eq!(dirs, ["/src/a", "/src/b"]);
+        assert!(!args.iter().any(|a| a.to_string_lossy().contains("Bash")));
     }
 
     #[test]

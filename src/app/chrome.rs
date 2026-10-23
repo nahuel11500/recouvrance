@@ -122,18 +122,25 @@ impl AppView {
         let stale = self.index_built.is_none_or(|t| t.elapsed().as_secs() > 300);
         if stale && !self.clusters.is_empty() {
             self.search_index.clear();
+            self.index_failed.clear();
             self.index_built = Some(std::time::Instant::now());
             self._index_tasks.clear();
-            let total = self.clusters.len() * SEARCH_KINDS.len();
+            let kinds: Vec<Kind> =
+                SEARCH_KINDS.iter().filter_map(|k| k8s::find_kind(&self.kinds, k).cloned()).collect();
+            let total = self.clusters.len() * kinds.len();
             palette.update(cx, |p, cx| p.set_status(Some(format!("indexing… 0/{total}")), cx));
             let done = std::rc::Rc::new(std::cell::Cell::new(0usize));
-            for (ctx, (_, client)) in self.clusters.clone().into_iter().enumerate() {
-                for kind_name in SEARCH_KINDS {
-                    let Some(kind) = k8s::find_kind(&self.kinds, kind_name).cloned() else { continue };
+            for (ctx, (cluster, client)) in self.clusters.clone().into_iter().enumerate() {
+                for kind in kinds.clone() {
                     let (client, palette, done) = (client.clone(), palette.downgrade(), done.clone());
                     let index_items = index_items.clone();
+                    let cluster = cluster.clone();
                     self._index_tasks.push(cx.spawn(async move |this, cx| {
-                        let names = k8s::list_names(client, kind.ar.clone(), None).await.unwrap_or_default();
+                        // A list that fails is said, not taken for an empty one.
+                        let (names, failed) = match k8s::list_names(client, kind.ar.clone(), None).await {
+                            Ok(names) => (names, None),
+                            Err(_) => (Vec::new(), Some(format!("{} on {cluster}", kind.kubectl_name()))),
+                        };
                         let entries: Vec<IndexEntry> = names
                             .into_iter()
                             .map(|(namespace, name)| IndexEntry {
@@ -147,15 +154,26 @@ impl AppView {
                             .collect();
                         let new_items = index_items(&entries);
                         done.set(done.get() + 1);
-                        let status = (done.get() < total).then(|| format!("indexing… {}/{total}", done.get()));
+                        let Ok(status) = this.update(cx, |this, _| {
+                            this.search_index.extend(entries);
+                            this.index_failed.extend(failed);
+                            if done.get() < total {
+                                Some(format!("indexing… {}/{total}", done.get()))
+                            } else {
+                                index_status(&this.index_failed)
+                            }
+                        }) else {
+                            return;
+                        };
                         let _ = palette.update(cx, |p, cx| {
                             p.add_items(new_items, cx);
                             p.set_status(status, cx);
                         });
-                        let _ = this.update(cx, |this, _| this.search_index.extend(entries));
                     }));
                 }
             }
+        } else if let Some(status) = index_status(&self.index_failed) {
+            palette.update(cx, |p, cx| p.set_status(Some(status), cx));
         }
         // Objects in the palette point at clusters by their place in the connected list: a
         // reconnect in between would open them on another cluster.
@@ -412,5 +430,27 @@ fn on_cluster(names: &[String], ctx: usize) -> String {
     match names.get(ctx) {
         Some(name) if names.len() > 1 => format!(" · {name}"),
         _ => String::new(),
+    }
+}
+
+/// The palette's line for the lists the object index couldn't load.
+fn index_status(failed: &[String]) -> Option<String> {
+    match failed {
+        [] => None,
+        [one] => Some(format!("Couldn't list {one}")),
+        [first, rest @ ..] => Some(format!("Couldn't list {first} and {} more", rest.len())),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::index_status;
+
+    #[test]
+    fn failed_index_lists_are_said() {
+        assert_eq!(index_status(&[]), None);
+        assert_eq!(index_status(&["nodes on prod".into()]).as_deref(), Some("Couldn't list nodes on prod"));
+        let two = ["nodes on prod".to_string(), "pods on prod".to_string()];
+        assert_eq!(index_status(&two).as_deref(), Some("Couldn't list nodes on prod and 1 more"));
     }
 }
