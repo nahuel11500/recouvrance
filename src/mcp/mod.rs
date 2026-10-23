@@ -83,12 +83,11 @@ pub fn is_write(verb: &str) -> bool {
 }
 
 /// One access rule, like a Kubernetes RBAC rule with an effect.
-/// Every field is a list of `*` patterns; an empty list matches nothing.
+/// Every field is a list of `*` patterns; an empty list matches nothing. A field missing
+/// when read never grants (see `RuleFields`).
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
-#[serde(default)]
+#[serde(from = "RuleFields")]
 pub struct Rule {
-    /// A rule written without one (by hand, pasted) denies: a missing field never grants.
-    #[serde(default = "deny")]
     pub effect: Mode,
     pub verbs: Vec<String>,
     /// kubectl names: `pods`, `deployments`, `certificates.cert-manager.io`, `*`.
@@ -127,6 +126,47 @@ fn deny() -> Mode {
     Mode::Deny
 }
 
+/// A rule as read (agents.json, pasted rules), where any field may be missing.
+#[derive(Deserialize)]
+struct RuleFields {
+    /// A rule written without one (by hand, pasted) denies.
+    #[serde(default = "deny")]
+    effect: Mode,
+    verbs: Option<Vec<String>>,
+    resources: Option<Vec<String>>,
+    namespaces: Option<Vec<String>>,
+    contexts: Option<Vec<String>>,
+    names: Option<Vec<String>>,
+    #[serde(default)]
+    note: String,
+    #[serde(default)]
+    expires: Option<jiff::Timestamp>,
+    #[serde(default)]
+    approved: bool,
+}
+
+impl From<RuleFields> for Rule {
+    /// A missing list matches nothing in an Allow, and everything in a Deny or an Ask, so a
+    /// rule missing a field never grants more than it says.
+    fn from(f: RuleFields) -> Self {
+        let effect = f.effect;
+        let list = |v: Option<Vec<String>>| {
+            v.unwrap_or_else(|| if effect == Mode::Allow { Vec::new() } else { vec!["*".into()] })
+        };
+        Self {
+            effect,
+            verbs: list(f.verbs),
+            resources: list(f.resources),
+            namespaces: list(f.namespaces),
+            contexts: list(f.contexts),
+            names: list(f.names),
+            note: f.note,
+            expires: f.expires,
+            approved: f.approved,
+        }
+    }
+}
+
 /// What an agent is trying to do.
 #[derive(Clone, Debug, Default)]
 pub struct Access {
@@ -159,23 +199,33 @@ impl Rule {
         if self.expired() {
             return false;
         }
+        // A rule made by approving a request covers that request only: its resource as named
+        // (not another group's kind with the same plural), names and contexts case included.
+        let exact = self.approved && self.effect == Mode::Allow;
+        let matches_any = |patterns: &[String], text: &str| {
+            if exact { patterns.iter().any(|p| glob(p.trim(), text)) } else { any_glob(patterns, text) }
+        };
         let verb = self.verbs.iter().any(|v| v == "*" || v.eq_ignore_ascii_case(&a.verb));
-        let resource = std::iter::once(&a.resource).chain(&a.resource_aliases).any(|r| any_glob(&self.resources, r));
+        let resource = if exact {
+            matches_any(&self.resources, &a.resource)
+        } else {
+            std::iter::once(&a.resource).chain(&a.resource_aliases).any(|r| matches_any(&self.resources, r))
+        };
         let namespace = match &a.namespace {
-            Some(ns) => any_glob(&self.namespaces, ns),
+            Some(ns) => matches_any(&self.namespaces, ns),
             // Cluster-scoped objects and "somewhere" checks.
             None if any_namespace => !self.namespaces.is_empty(),
             None => self.namespaces.iter().any(|n| n.trim() == "*"),
         };
         let name = match &a.name {
-            Some(n) => any_glob(&self.names, n),
+            Some(n) => matches_any(&self.names, n),
             // Name-less checks (lists): a Deny of some names only leaves the rest, whose rows
             // are then filtered by name. An Allow of some names passes too, so whatever a
             // name-less check lets through must be filtered by name before it is shown.
             None if self.effect == Mode::Deny => self.names.iter().any(|n| n.trim() == "*"),
             None => !self.names.is_empty(),
         };
-        verb && resource && namespace && any_glob(&self.contexts, &a.context) && name
+        verb && resource && namespace && matches_any(&self.contexts, &a.context) && name
     }
 
     /// Whether both rules cover the same requests, the same way (notes and expiry aside).
@@ -581,6 +631,28 @@ pub struct AuditStats {
 
 // MARK: Hub
 
+/// How a request for approval ended.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Answer {
+    Approved,
+    Rejected,
+    TimedOut,
+    /// The kill switch was turned on while it waited.
+    SwitchedOff,
+}
+
+impl Answer {
+    /// Why the call didn't go ahead, for the agent and the activity log.
+    pub fn reason(self) -> &'static str {
+        match self {
+            Answer::Approved => "approved",
+            Answer::Rejected => "the user did not approve this request",
+            Answer::TimedOut => "the user did not answer within 2 minutes",
+            Answer::SwitchedOff => "agent access was switched off while the request waited",
+        }
+    }
+}
+
 pub struct Approval {
     pub id: u64,
     pub agent_id: String,
@@ -665,7 +737,7 @@ pub struct Hub {
     /// The last failure writing audit.jsonl, shown on the Agents page.
     audit_error: Mutex<Option<String>>,
     last_seen: Mutex<HashMap<String, jiff::Timestamp>>,
-    approvals: Mutex<HashMap<u64, oneshot::Sender<bool>>>,
+    approvals: Mutex<HashMap<u64, oneshot::Sender<Answer>>>,
     next_approval: AtomicU64,
     subscribers: Mutex<Vec<mpsc::UnboundedSender<Arc<HubEvent>>>>,
     clients: Mutex<HashMap<String, Arc<Cluster>>>,
@@ -917,7 +989,7 @@ impl Hub {
         if !enabled {
             // Refuse anything still waiting for approval.
             for (_, tx) in lock(&self.approvals).drain() {
-                let _ = tx.send(false);
+                let _ = tx.send(Answer::SwitchedOff);
             }
         }
         self.save()
@@ -1080,8 +1152,8 @@ impl Hub {
 
     // Approvals
 
-    /// Ask the user in the UI. Resolves to false on deny, timeout, kill switch, or
-    /// at once when there is no window to ask in.
+    /// Ask the user in the UI. Anything but [`Answer::Approved`] refuses the call; with
+    /// no window to ask in, the request is refused at once.
     pub async fn request_approval(
         &self,
         agent: &Agent,
@@ -1089,9 +1161,9 @@ impl Hub {
         summary: String,
         access: Access,
         dry_run: bool,
-    ) -> bool {
+    ) -> Answer {
         if self.headless() {
-            return false;
+            return Answer::Rejected;
         }
         let id = self.next_approval.fetch_add(1, Ordering::SeqCst);
         let (tx, rx) = oneshot::channel();
@@ -1108,12 +1180,16 @@ impl Hub {
         let result = tokio::time::timeout(Duration::from_secs(120), rx).await;
         lock(&self.approvals).remove(&id);
         self.emit(HubEvent::ApprovalResolved(id));
-        matches!(result, Ok(Ok(true)))
+        match result {
+            Ok(Ok(answer)) => answer,
+            Ok(Err(_)) => Answer::Rejected,
+            Err(_) => Answer::TimedOut,
+        }
     }
 
     pub fn resolve_approval(&self, id: u64, approved: bool) {
         if let Some(tx) = lock(&self.approvals).remove(&id) {
-            let _ = tx.send(approved);
+            let _ = tx.send(if approved { Answer::Approved } else { Answer::Rejected });
         }
     }
 
@@ -1263,6 +1339,14 @@ mod tests {
     }
 
     #[test]
+    fn only_a_refusal_says_the_user_refused() {
+        assert!(Answer::Rejected.reason().contains("did not approve"));
+        for a in [Answer::TimedOut, Answer::SwitchedOff] {
+            assert!(!a.reason().contains("did not approve"), "{a:?}");
+        }
+    }
+
+    #[test]
     fn glob_matches() {
         assert!(glob("*", "anything"));
         assert!(glob("kube-*", "kube-system"));
@@ -1376,6 +1460,34 @@ mod tests {
         assert_eq!(p.decide(&a).mode, Mode::Allow);
         a.name = Some("api".into());
         assert_eq!(p.decide(&a).mode, Mode::Deny);
+    }
+
+    #[test]
+    fn an_approved_rule_covers_only_the_kind_and_case_approved() {
+        let mut pods = access("Prod", "list", "pods", Some("team-b"), None);
+        pods.resource_aliases = vec!["pods".into(), "pod".into()];
+        let approval = Approval {
+            id: 1,
+            agent_id: "a".into(),
+            agent: "a".into(),
+            tool: "list_resources".into(),
+            summary: String::new(),
+            access: pods.clone(),
+            dry_run: false,
+        };
+        let p = Policy { rules: vec![approval.as_rule().unwrap()], ..Policy::default() };
+        assert_eq!(p.decide(&pods).mode, Mode::Allow);
+        // Another group's kind with the same plural.
+        let mut metrics = access("Prod", "list", "pods.metrics.k8s.io", Some("team-b"), None);
+        metrics.resource_aliases = vec!["pods".into(), "podmetrics".into()];
+        assert_eq!(p.decide(&metrics).mode, Mode::Deny);
+        // Another context, named the same but for case.
+        assert_eq!(p.decide(&access("prod", "list", "pods", Some("team-b"), None)).mode, Mode::Deny);
+        // A rule you write still matches aliases and ignores case.
+        let mut r = p.rules[0].clone();
+        r.approved = false;
+        let p = Policy { rules: vec![r], ..Policy::default() };
+        assert_eq!(p.decide(&metrics).mode, Mode::Allow);
     }
 
     #[test]
@@ -1788,7 +1900,16 @@ pub(crate) mod properties {
     }
 
     pub(crate) fn value() -> impl Strategy<Value = String> {
-        prop_oneof![Just("a"), Just("b"), Just("ab"), Just("team-a"), Just("team-b")].prop_map(String::from)
+        prop_oneof![Just("a"), Just("b"), Just("ab"), Just("team-a"), Just("team-b"), Just("A"), Just("Team-a")]
+            .prop_map(String::from)
+    }
+
+    /// A resource and its aliases: another group's kind may share the plural.
+    fn resource() -> impl Strategy<Value = (String, Vec<String>)> {
+        prop_oneof![value(), Just("a.other.io".to_string()), Just("team-a.other.io".to_string())].prop_map(|r| {
+            let plural = r.split('.').next().unwrap_or_default().to_string();
+            (r, vec![plural])
+        })
     }
 
     pub(crate) fn verb() -> impl Strategy<Value = String> {
@@ -1818,12 +1939,12 @@ pub(crate) mod properties {
     }
 
     pub(crate) fn access() -> impl Strategy<Value = Access> {
-        (verb(), value(), prop::option::of(value()), value(), prop::option::of(value())).prop_map(
-            |(verb, resource, namespace, context, name)| Access {
+        (verb(), resource(), prop::option::of(value()), value(), prop::option::of(value())).prop_map(
+            |(verb, (resource, resource_aliases), namespace, context, name)| Access {
                 context,
                 verb,
                 resource,
-                resource_aliases: Vec::new(),
+                resource_aliases,
                 namespace,
                 name,
                 cluster_scoped: false,
@@ -1903,5 +2024,35 @@ mod fail_closed {
     fn a_rule_without_an_effect_denies() {
         let r: Rule = serde_json::from_str(r#"{"verbs": ["*"], "resources": ["secrets"], "contexts": ["*"]}"#).unwrap();
         assert_eq!(r.effect, Mode::Deny);
+    }
+
+    #[test]
+    fn a_missing_list_never_grants() {
+        // A Deny without contexts or verbs denies them all.
+        let r: Rule = serde_json::from_str(r#"{"effect": "deny", "resources": ["secrets"]}"#).unwrap();
+        for list in [&r.verbs, &r.namespaces, &r.contexts, &r.names] {
+            assert_eq!(list, &["*"]);
+        }
+        let all = Rule { verbs: vec!["*".into()], contexts: vec!["*".into()], ..Rule::default() };
+        let p = super::Policy { rules: vec![all, r], ..super::Policy::default() };
+        let a = super::Access {
+            context: "prod".into(),
+            verb: "delete".into(),
+            resource: "secrets".into(),
+            namespace: Some("app".into()),
+            name: Some("db".into()),
+            ..super::Access::default()
+        };
+        assert_eq!(p.decide(&a).mode, Mode::Deny);
+        // An Ask too.
+        let r: Rule = serde_json::from_str(r#"{"effect": "ask", "verbs": ["delete"]}"#).unwrap();
+        assert_eq!(r.resources, ["*"]);
+        // An Allow without contexts or names allows none.
+        let r: Rule = serde_json::from_str(r#"{"effect": "allow", "verbs": ["get"], "resources": ["pods"]}"#).unwrap();
+        assert!(r.contexts.is_empty() && r.names.is_empty() && r.namespaces.is_empty());
+        // A full rule reads back as written.
+        let full = Rule { contexts: vec!["eu".into()], ..Rule::default() };
+        let back: Rule = serde_json::from_str(&serde_json::to_string(&full).unwrap()).unwrap();
+        assert_eq!(back, full);
     }
 }

@@ -360,6 +360,9 @@ pub struct AppView {
     refused: HashSet<usize>,
     /// Latest rows per cluster, merged into the table.
     rows_by_ctx: Vec<Vec<Arc<k8s::Row>>>,
+    /// The columns each cluster's rows are laid out in: two clusters can serve a CRD
+    /// from different operator releases, with other printer columns.
+    defs_by_ctx: Vec<Arc<Vec<k8s::ColumnDef>>>,
     /// Lists shown recently, shown again at once when you come back to them.
     views: view_cache::ViewCache,
     /// What the list on screen is (clusters, kind, namespace, custom columns), to keep it
@@ -594,6 +597,7 @@ impl AppView {
             clusters: Vec::new(),
             kind_clusters: HashMap::new(),
             rows_by_ctx: Vec::new(),
+            defs_by_ctx: Vec::new(),
             views: Default::default(),
             view_key: None,
             listing: HashSet::new(),

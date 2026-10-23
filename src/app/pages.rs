@@ -194,24 +194,41 @@ impl AppView {
 
     /// One assistant chat per window, kept across navigation.
     pub(super) fn open_assistant(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let scope = self.assistant_scope();
         let page = match self.assistant_page() {
-            Some(p) => p,
+            Some(p) => {
+                p.update(cx, |p, cx| p.set_scope(scope, cx));
+                p
+            }
             None => {
-                let scope = if self.clusters.is_empty() {
-                    "no cluster open in Recouvrance (every kubeconfig context is available: start with list_contexts)"
-                        .to_string()
-                } else {
-                    format!(
-                        "contexts {}{}",
-                        self.clusters.iter().map(|c| c.0.clone()).collect::<Vec<_>>().join(", "),
-                        self.namespace.as_ref().map(|n| format!(", namespace {n}")).unwrap_or_default()
-                    )
-                };
                 let hub = self.hub.clone();
                 cx.new(|cx| crate::ui::assistant_view::AssistantView::new(hub, scope, window, cx))
             }
         };
         self.navigate(Route::Assistant(page), cx);
+    }
+
+    /// What the assistant is told the user is looking at.
+    fn assistant_scope(&self) -> String {
+        let (contexts, namespace) = self.page_scope();
+        scope_text(&contexts, namespace.as_deref())
+    }
+
+    /// Tell open assistant chats, in every tab, about a new namespace selection.
+    pub(super) fn update_assistant_scope(&self, cx: &mut Context<Self>) {
+        let pages: Vec<_> = self
+            .history
+            .iter()
+            .chain(self.tabs.iter().flat_map(|t| t.history.iter()))
+            .filter_map(|r| match r {
+                Route::Assistant(e) => Some(e.clone()),
+                _ => None,
+            })
+            .collect();
+        let scope = self.assistant_scope();
+        for page in pages {
+            page.update(cx, |p, cx| p.set_scope(scope.clone(), cx));
+        }
     }
 
     pub(super) fn open_helm_install(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -307,5 +324,28 @@ impl AppView {
             this.open_helm_install(window, cx)
         })
         .detach();
+    }
+}
+
+/// What the assistant is told about `contexts` and the namespace picked.
+fn scope_text(contexts: &[String], namespace: Option<&str>) -> String {
+    if contexts.is_empty() {
+        return "no cluster open in Recouvrance (every kubeconfig context is available: start with list_contexts)"
+            .to_string();
+    }
+    let namespace = namespace.map(|n| format!(", namespace {n}")).unwrap_or_default();
+    format!("contexts {}{namespace}", contexts.join(", "))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::scope_text;
+
+    #[test]
+    fn the_assistant_scope_names_the_namespace_picked_now() {
+        let contexts = ["a".to_string(), "b".to_string()];
+        assert_eq!(scope_text(&contexts, Some("y")), "contexts a, b, namespace y");
+        assert_eq!(scope_text(&contexts, None), "contexts a, b");
+        assert!(scope_text(&[], Some("y")).starts_with("no cluster open"));
     }
 }
