@@ -266,12 +266,22 @@ impl Policy {
         best(candidates)
     }
 
-    /// For an all-namespaces request that asks: an Allow rule covering some namespace, so the
-    /// request can still go ahead unapproved, showing only the allowed rows.
+    /// For an all-namespaces request that asks: the Allow rule that decides some rows, so the
+    /// request can still go ahead unapproved, showing only the allowed rows. An Allow that an
+    /// Ask or a Deny covers everywhere gives nothing.
     pub fn allow_somewhere(&self, a: &Access) -> Option<usize> {
         let mut probe = a.clone();
         probe.namespace = None;
-        self.rules.iter().position(|r| r.effect == Mode::Allow && r.matches(&probe, true))
+        // An Allow rule's own patterns, taken as a namespace and a name (`*` then literal),
+        // are matched by the rules that cover them; no namespace for cluster-scoped rows.
+        let rows = self.rules.iter().filter(|r| r.effect == Mode::Allow && r.matches(&probe, true)).flat_map(|r| {
+            let namespaces = r.namespaces.iter().map(|n| Some(n.trim().to_string())).chain([None]);
+            namespaces.flat_map(|ns| r.names.iter().map(move |n| (ns.clone(), n.trim().to_string())))
+        });
+        rows.into_iter().find_map(|(namespace, name)| {
+            let v = self.decide(&Access { namespace, name: Some(name), ..probe.clone() });
+            if v.mode == Mode::Allow { v.rule } else { None }
+        })
     }
 
     fn decide_inner(&self, a: &Access, any_ns: bool) -> Verdict {
@@ -1148,6 +1158,20 @@ mod tests {
         let only_ask = Policy { rules: vec![p.rules[1].clone()], ..Policy::default() };
         assert_eq!(only_ask.allow_somewhere(&all), None);
         assert_eq!(p.allow_somewhere(&access("c", "list", "secrets", None, None)), None);
+        // An Allow that an Ask covers everywhere decides no row: nothing to fall back to.
+        let shadowed = Policy {
+            rules: vec![p.rules[0].clone(), rule(Mode::Ask, &["list"], &["pods"], &["*"], &["*"])],
+            ..Policy::default()
+        };
+        assert_eq!(shadowed.decide_any_namespace(&all).mode, Mode::Ask);
+        assert_eq!(shadowed.allow_somewhere(&all), None);
+        // An Ask of some names only leaves the other rows allowed.
+        let mut debug = rule(Mode::Ask, &["list"], &["pods"], &["*"], &["*"]);
+        debug.names = vec!["debug-*".into()];
+        let names =
+            Policy { rules: vec![rule(Mode::Allow, &["list"], &["pods"], &["*"], &["*"]), debug], ..Policy::default() };
+        assert_eq!(names.decide_any_namespace(&all).mode, Mode::Ask);
+        assert_eq!(names.allow_somewhere(&all), Some(0));
     }
 
     #[test]
