@@ -210,12 +210,13 @@ impl KubeMcp {
             )));
         }
         self.recheck(&mut call, &access)?;
+        let stop = self.still_allowed(&call, &access);
         // The reply names only the pods the agent may list.
         let shown = |ns: &str, name: &str| {
             let a = access_for(&pods_kind, &p.context, "list", Some(ns.into()), Some(name.into()));
             call.policy().decide(&a).mode == Mode::Allow
         };
-        call.finish(k8s::drain_report(client, p.node).await.map(|d| d.summary(shown)))
+        call.finish(k8s::drain_report(client, p.node, stop).await.map(|d| d.summary(shown)))
     }
 
     #[tool(
