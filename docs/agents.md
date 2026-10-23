@@ -30,7 +30,7 @@ Each agent has rules, like Kubernetes RBAC with an effect:
 | Field | Example |
 |---|---|
 | Effect | Allow · Ask me · Deny |
-| Verbs | get, list, logs, reveal (Secret values), exec, scale, restart, patch, apply, delete, * |
+| Verbs | get, list, logs, reveal (Secret values), exec, scale, restart, patch, apply, delete, drain, * |
 | Resources | `pods`, `deployments`, `*.cert-manager.io`, `*` |
 | Namespaces | `team-a`, `team-*`, `*` (also covers cluster-scoped objects) |
 | Contexts | `eu-*`, `staging` |
@@ -75,7 +75,8 @@ names only those an Allow rule lets the agent list.
 Tools: `my_permissions`, `list_contexts`, `list_resource_types`, `list_resources`, `get_resource`,
 `describe_resource`, `top_pods`, `search`, `get_events`, `find_problems`, `check_certificates`, `usage_history`, `drain_node`, `gitops`,
 `get_logs`, `exec_command`, `scale`, `rollout_restart`, `patch_resource`, `apply_manifest`,
-`delete_resource` — writes support `dry_run`.
+`delete_resource`. `scale`, `rollout_restart`, `patch_resource`, `apply_manifest` and
+`delete_resource` support `dry_run`; `exec_command`, `drain_node` and `gitops` don't.
 
 Prompts (slash commands in Claude Code: `/mcp__recouvrance__troubleshoot` …): `troubleshoot`, `rightsize`,
 `cert-audit`, `cluster-health`. They chain the tools above into a read-only workflow.

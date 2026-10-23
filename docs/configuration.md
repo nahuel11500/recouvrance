@@ -38,7 +38,9 @@ The contexts come from, merged in this order:
 
 1. `KUBECONFIG` (several paths separated by `:`), or `~/.kube/config`;
 2. files added in **Settings → Kubeconfig** (**Add files** or **Enter path**; `kubeconfigs`);
-3. every file in a watched folder (**Watch folder**; `kubeconfig_folders`), oldest first;
+3. the files in a watched folder (**Watch folder**; `kubeconfig_folders`), oldest first: those
+   without an extension or ending in `.yaml`, `.yml`, `.conf`, `.config` or `.kubeconfig`, hidden
+   files (`.name`) left out;
 4. kubeconfigs pasted in **Settings → Kubeconfig → Paste kubeconfig**, saved as they are in
    `~/.config/recouvrance/kubeconfigs/` (mode 0600). Before saving, Recouvrance lists the
    contexts and warns about commands run to log in (`exec`), files the kubeconfig reads and
@@ -77,6 +79,10 @@ never move to another cluster. The name is freed when its file is deleted or no 
 | `open_browser_on_forward` | true | Open the browser after a one-click port-forward on a web port |
 | `assistant_backend` | `"auto"` | In-app assistant: `claude-code` (your Claude Code login), `api` (an Anthropic API key) or `auto` (Claude Code when installed, else the API key) |
 | `assistant_model` | `"claude-sonnet-5-5"` | Model the assistant uses |
+| `assistant_notes` | | The team's notes given to the assistant: where things run, dashboards, runbooks |
+| `assistant_repos` | | Folders of the team's code the assistant may read (Claude Code only) |
+| `delete_confirm` | `"ask"` | What deleting asks for kinds not in `delete_confirm_kinds`: `off` (delete right away), `ask` (a dialog) or `type` (the name typed) |
+| `delete_confirm_kinds` | by kind | `{ "Pod": "off", "Cluster.postgresql.cnpg.io": "type" }`: what deleting asks per kind, a custom resource with its group (see [features](features.md)). A value that doesn't read asks for the name |
 | `namespace_visits` | | Remembered by the app: namespaces chosen per context, with a visit count and the last visit time. The namespace picker shows the five most frequent first (visits weigh half as much after a week without one); 30 kept per context. Older files' `recent_namespaces` are turned into visits once |
 | `last_contexts`, `recent_contexts` | | Remembered by the app |
 
@@ -158,6 +164,7 @@ plugins:
     read_only: true
   - name: Open in Grafana
     kinds: [pods]
+    # xdg-open on Linux; on macOS, open
     command: xdg-open "https://grafana.example/d/pods?var-pod=$RECOUVRANCE_NAME"
     mode: background
     read_only: true

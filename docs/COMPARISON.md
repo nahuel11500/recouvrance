@@ -22,7 +22,7 @@ open an issue or a pull request.
 | Shell into containers | ✓ | ✓ | ✓ | ✓ plus local shell with kubectl on the context |
 | Ephemeral debug containers | – | – | – | ✓ with a Pod Security "restricted" fallback |
 | Node shell | – | ✓ | – | ✓ (privileged pod, confirmed, cleaned up) |
-| Port-forward | ✓ (remembered) | ✓ (listen address, SOCKS5) | ✓ | ✓ remembered and restorable, follows replacement pods; listen address, https, open in browser; SOCKS5/HTTP proxy |
+| Port-forward | ✓ (remembered) | ✓ (listen address, SOCKS5) | ✓ | ✓ remembered and restorable, follows replacement pods; listen address, https, open in browser; through the kubeconfig's `proxy-url` (SOCKS5 or HTTP) |
 | Edit YAML | ✓ | ✓ | ✓ | ✓ validated by a server dry run first; errors on their line; field docs and forms from the cluster's schema |
 | Edit ConfigMap/Secret values | – | ✓ | – | ✓ as key/value rows; Secret forms (Opaque, registry, TLS, basic auth) |
 | Create / apply YAML | ✓ | ✓ | ✓ | ✓ multi-document, dry run; templates, files, URLs, `$EDITOR` |
