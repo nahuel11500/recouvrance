@@ -180,7 +180,11 @@ impl DetailPanel {
                                 title,
                                 "Cordons the node, then evicts its pods (DaemonSet and static pods stay). PodDisruptionBudgets are respected; refused evictions are reported.",
                                 "Drain",
-                                |p| Box::pin(k8s::drain(p.client.clone(), p.obj.name.clone(), |_, _| k8s::Eviction::Evict)),
+                                |p| {
+                                    // The gate refuses each eviction once write mode is off; stop at the first.
+                                    let off = || (!k8s::gate::ui_writes()).then(|| k8s::gate::WRITES_OFF.to_string());
+                                    Box::pin(k8s::drain(p.client.clone(), p.obj.name.clone(), off))
+                                },
                                 w,
                                 cx,
                             )

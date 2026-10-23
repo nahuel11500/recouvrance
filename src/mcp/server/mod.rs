@@ -21,7 +21,7 @@ use rmcp::{ServerHandler, prompt, prompt_handler, prompt_router, schemars, tool,
 use serde::Deserialize;
 use serde_json::json;
 
-use super::{Access, Agent, AuditEntry, Decision, Hub, HubEvent, Mode, Policy, is_write};
+use super::{Access, Agent, Answer, AuditEntry, Decision, Hub, HubEvent, Mode, Policy, is_write};
 use crate::k8s::{self, Kind, ObjectRef, TaskGuard};
 
 mod read_tools;
@@ -51,8 +51,9 @@ struct Call {
     /// The Ask rules the approval covered: every Ask rule the request meets, in its
     /// namespace or, across all namespaces, in any of them.
     approved_rules: Vec<usize>,
-    /// The rule that allowed the call, for the activity log.
-    rule: Option<usize>,
+    /// The rule that allowed the call, named when it was decided, for the activity log
+    /// (the rules may be read again, and renumbered, before the call ends).
+    rule: Option<String>,
     session: Option<String>,
     /// More for the approval banner than the arguments show (a manifest's objects).
     approval_detail: Option<String>,
@@ -71,6 +72,11 @@ impl Call {
             }
             None => "no matching rule".into(),
         }
+    }
+
+    /// Remember the rule that allowed the call.
+    fn allowed_by(&mut self, rule: Option<usize>) {
+        self.rule = rule.map(|i| self.rule_label(Some(i)));
     }
 
     fn record(&self, decision: Decision, detail: String, result_bytes: usize) {
@@ -104,12 +110,12 @@ impl Call {
     /// Whether one row of a list result may be shown: allowed by a rule, or gated by
     /// an Ask rule the user approved for this call.
     fn may_see(&self, a: &Access) -> bool {
-        let v = self.policy().decide(a);
-        match v.mode {
-            Mode::Allow => true,
-            Mode::Ask => self.approved && v.rule.is_some_and(|r| self.approved_rules.contains(&r)),
-            Mode::Deny => false,
-        }
+        visible(self.policy(), self.approved_rules(), a)
+    }
+
+    /// The Ask rules the user approved for this call (none when not approved).
+    fn approved_rules(&self) -> &[usize] {
+        if self.approved { &self.approved_rules } else { &[] }
     }
 
     fn finish(&self, result: anyhow::Result<String>) -> Result<String, String> {
@@ -117,7 +123,7 @@ impl Call {
             Ok(text) => {
                 let decision = if self.approved { Decision::Approved } else { Decision::Allowed };
                 // Calls that aren't rule-checked (list_contexts) have no rule to show.
-                let detail = if self.rule.is_some() { self.rule_label(self.rule) } else { String::new() };
+                let detail = self.rule.clone().unwrap_or_default();
                 self.record(decision, detail, text.len());
                 Ok(text)
             }
@@ -128,6 +134,22 @@ impl Call {
             }
         }
     }
+}
+
+/// Whether a row may be shown: allowed by a rule, or gated by one of the `approved` Ask rules.
+fn visible(policy: &Policy, approved: &[usize], a: &Access) -> bool {
+    let v = policy.decide(a);
+    match v.mode {
+        Mode::Allow => true,
+        Mode::Ask => v.rule.is_some_and(|r| approved.contains(&r)),
+        Mode::Deny => false,
+    }
+}
+
+/// Whether a `find_problems` finding may be shown. The approval named pods: findings of
+/// other kinds need an Allow rule.
+fn problem_visible(policy: &Policy, approved: &[usize], pod: bool, a: &Access) -> bool {
+    visible(policy, if pod { approved } else { &[] }, a)
 }
 
 fn describe(a: &Access) -> String {
@@ -259,40 +281,11 @@ fn manifest_objects(planned: &[(Kind, Option<String>, String, serde_json::Value)
         .collect()
 }
 
-/// Why the agent's calls are refused now, if they are.
-fn inactive(hub: &Hub, agent_id: &str) -> Option<&'static str> {
-    if !hub.agents_enabled() {
-        return Some("agent access is switched off in Recouvrance");
-    }
-    if !hub.agent(agent_id).is_some_and(|a| a.enabled) {
-        return Some("this agent is disabled");
-    }
-    None
-}
-
 /// Whether the rules keep a drain from evicting a pod: an explicit Deny rule on deleting
 /// it, not merely the absence of a delete rule.
 fn denies_eviction(policy: &Policy, pod: &Access) -> bool {
     let v = policy.decide(pod);
     v.mode == Mode::Deny && v.rule.is_some()
-}
-
-/// What a running drain does with one pod under the agent's rules as they are now: it
-/// stops once the drain itself is no longer allowed (an Ask counts when the user approved
-/// this call), and leaves a pod whose deletion the rules deny.
-fn eviction(policy: &Policy, drain: &Access, approved: bool, pod: &Access) -> k8s::Eviction {
-    let allowed = match policy.decide(drain).mode {
-        Mode::Allow => true,
-        Mode::Ask => approved,
-        Mode::Deny => false,
-    };
-    if !allowed {
-        return k8s::Eviction::Stop(format!("{} — the rules changed while it ran", describe(drain)));
-    }
-    if denies_eviction(policy, pod) {
-        return k8s::Eviction::Keep("your rules deny deleting it".into());
-    }
-    k8s::Eviction::Evict
 }
 
 /// Namespaces, sorted, of the pods a drain would evict (`k8s::drain` leaves DaemonSet,
@@ -403,7 +396,7 @@ impl KubeMcp {
         let verdict = decide(call);
         match verdict.mode {
             Mode::Allow => {
-                call.rule = verdict.rule;
+                call.allowed_by(verdict.rule);
                 Ok(())
             }
             Mode::Deny => Err(call.deny(format!("{} — {}", describe(access), call.rule_label(verdict.rule)))),
@@ -412,7 +405,7 @@ impl KubeMcp {
                 let fallback = |call: &Call| if list { call.policy().allow_somewhere(access) } else { None };
                 if self.hub.headless() {
                     if let Some(rule) = fallback(call) {
-                        call.rule = Some(rule);
+                        call.allowed_by(Some(rule));
                         return Ok(());
                     }
                     return Err(call.deny(format!(
@@ -428,31 +421,32 @@ impl KubeMcp {
                     summary.push_str(detail);
                 }
                 let dry_run = call.args.get("dry_run").and_then(|v| v.as_bool()).unwrap_or(false);
-                let approved =
-                    self.hub.request_approval(&call.agent, call.tool, summary, access.clone(), dry_run).await;
+                let answer = self.hub.request_approval(&call.agent, call.tool, summary, access.clone(), dry_run).await;
                 // Access may have been switched off, or the rules changed, while the request waited.
                 self.reload_rules(call);
-                if approved {
+                if answer == Answer::Approved {
                     self.ensure_active(call)?;
                     let now = decide(call);
                     if now.mode == Mode::Deny {
                         return Err(call.deny(format!("{} — {}", describe(access), call.rule_label(now.rule))));
                     }
                     call.approved = true;
-                    call.rule = now.rule;
+                    call.allowed_by(now.rule);
                     call.approved_rules = if any_namespace {
                         call.policy().asks_any_namespace(access)
                     } else {
                         call.policy().asks(access)
                     };
                     Ok(())
-                } else if let Some(rule) = fallback(call) {
-                    call.record(Decision::Rejected, "not approved; showing the allowed rows only".into(), 0);
-                    call.rule = Some(rule);
+                } else if answer != Answer::SwitchedOff
+                    && let Some(rule) = fallback(call)
+                {
+                    call.record(Decision::Rejected, format!("{}; showing the allowed rows only", answer.reason()), 0);
+                    call.allowed_by(Some(rule));
                     self.ensure_active(call)
                 } else {
-                    call.record(Decision::Rejected, "not approved".into(), 0);
-                    Err("Rejected: the user did not approve this request".into())
+                    call.record(Decision::Rejected, answer.reason().into(), 0);
+                    Err(format!("Rejected: {}", answer.reason()))
                 }
             }
         }
@@ -483,16 +477,15 @@ impl KubeMcp {
         if let Some(reason) = self.inactive(call) {
             return Some(reason.to_string());
         }
-        let verdict = call.policy().decide(access);
-        match verdict.mode {
-            Mode::Allow => None,
-            Mode::Ask if call.approved => None,
-            _ => Some(format!(
-                "{} — the rules changed while the call waited ({})",
-                describe(access),
-                call.rule_label(verdict.rule)
-            )),
-        }
+        let rule = stopped_by(call.policy(), access, call.approved)?;
+        Some(format!("{} — the rules changed while the call waited ({})", describe(access), call.rule_label(rule)))
+    }
+
+    /// [`stale_reason`](Self::stale_reason) for a change made of many requests (a drain),
+    /// asked again before each one: agent access or the agent turned off, or its rules
+    /// changed, stop the rest.
+    fn still_allowed(&self, call: &Call, access: &Access) -> impl Fn() -> Option<String> + Send + 'static {
+        stop_check(self.hub.clone(), call.agent.id.clone(), call.approved, access.clone())
     }
 
     async fn kind(&self, call: &Call, context: &str, query: &str) -> Result<(kube::Client, Kind), String> {
@@ -511,7 +504,25 @@ impl KubeMcp {
     }
 }
 
-fn access_for(kind: &Kind, context: &str, verb: &str, namespace: Option<String>, name: Option<String>) -> Access {
+/// What stops a change authorized earlier under the rules as they are now (the rule that
+/// decided, if one did): anything but an Allow, or an Ask the user approved for this very
+/// change (`approved`).
+fn stopped_by(policy: &Policy, access: &Access, approved: bool) -> Option<Option<usize>> {
+    let verdict = policy.decide(access);
+    match verdict.mode {
+        Mode::Allow => None,
+        Mode::Ask if approved => None,
+        _ => Some(verdict.rule),
+    }
+}
+
+pub(crate) fn access_for(
+    kind: &Kind,
+    context: &str,
+    verb: &str,
+    namespace: Option<String>,
+    name: Option<String>,
+) -> Access {
     Access {
         context: context.to_string(),
         verb: verb.to_string(),
@@ -897,6 +908,37 @@ async fn auth(State(hub): State<Arc<Hub>>, mut req: Request, next: Next) -> Resu
 }
 
 /// Serve MCP on 127.0.0.1 until the guard is dropped.
+/// Why an agent's calls are refused now, if they are.
+fn inactive(hub: &Hub, agent_id: &str) -> Option<&'static str> {
+    if !hub.agents_enabled() {
+        return Some("agent access is switched off in Recouvrance");
+    }
+    if !hub.agent(agent_id).is_some_and(|a| a.enabled) {
+        return Some("this agent is disabled");
+    }
+    None
+}
+
+/// Why an agent's change, authorized at first, must stop now (see `still_allowed`).
+pub(crate) fn stop_check(
+    hub: Arc<Hub>,
+    agent_id: String,
+    approved: bool,
+    access: Access,
+) -> impl Fn() -> Option<String> + Send + 'static {
+    move || {
+        if let Some(reason) = inactive(&hub, &agent_id) {
+            return Some(reason.to_string());
+        }
+        let mode = hub.agent(&agent_id).map_or(Mode::Deny, |a| a.policy.decide(&access).mode);
+        match mode {
+            Mode::Allow => None,
+            Mode::Ask if approved => None,
+            _ => Some(format!("{} — the rules changed while it ran", describe(&access))),
+        }
+    }
+}
+
 pub fn start(hub: Arc<Hub>) -> TaskGuard {
     k8s::spawn_guarded(async move {
         let port = hub.port();
@@ -933,6 +975,34 @@ pub fn start(hub: Arc<Hub>) -> TaskGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn approving_find_problems_shows_only_pod_findings() {
+        let ask = super::super::Rule {
+            effect: Mode::Ask,
+            verbs: vec!["list".into()],
+            resources: vec!["*".into()],
+            namespaces: vec!["team-b".into()],
+            contexts: vec!["*".into()],
+            names: vec!["*".into()],
+            ..Default::default()
+        };
+        let policy = Policy { rules: vec![ask], ..Default::default() };
+        let access = |resource: &str| Access {
+            context: "c".into(),
+            verb: "list".into(),
+            resource: resource.into(),
+            resource_aliases: vec![],
+            namespace: Some("team-b".into()),
+            name: Some("web".into()),
+            cluster_scoped: false,
+        };
+        let approved = policy.asks(&access("pods"));
+        assert!(!approved.is_empty());
+        assert!(problem_visible(&policy, &approved, true, &access("pods")));
+        assert!(!problem_visible(&policy, &approved, false, &access("deployments")));
+        assert!(!problem_visible(&policy, &[], true, &access("pods")));
+    }
 
     #[test]
     fn logged_patches_hide_secret_values() {
@@ -1001,6 +1071,31 @@ mod tests {
             section: "",
             label: kind.into(),
         }
+    }
+
+    #[test]
+    fn a_change_turned_ask_needs_its_own_approval() {
+        let rule = |effect: Mode, name: &str| crate::mcp::Rule {
+            effect,
+            verbs: vec!["apply".into()],
+            names: vec![name.into()],
+            contexts: vec!["*".into()],
+            ..crate::mcp::Rule::default()
+        };
+        let cms = kind("", "v1", "ConfigMap", "configmaps", true);
+        let a = access_for(&cms, "c", "apply", Some("app".into()), Some("a".into()));
+        let b = access_for(&cms, "c", "apply", Some("app".into()), Some("b".into()));
+        // B's rule turned into Ask while A was applied: approving A does not cover B.
+        let p = Policy { rules: vec![rule(Mode::Allow, "a"), rule(Mode::Ask, "b")], ..Policy::default() };
+        assert_eq!(stopped_by(&p, &a, false), None);
+        assert_eq!(stopped_by(&p, &b, false), Some(Some(1)));
+        assert_eq!(stopped_by(&p, &b, true), None);
+        // A Deny stops it, approved or not.
+        let p = Policy { rules: vec![rule(Mode::Allow, "*"), rule(Mode::Deny, "b")], ..Policy::default() };
+        assert_eq!(stopped_by(&p, &b, true), Some(Some(1)));
+        // So does a removed Allow.
+        let p = Policy { rules: vec![], ..Policy::default() };
+        assert_eq!(stopped_by(&p, &a, false), Some(None));
     }
 
     #[test]
@@ -1087,7 +1182,7 @@ mod tests {
     }
 
     #[test]
-    fn a_running_drain_follows_the_rules_as_they_change() {
+    fn a_new_deny_keeps_its_pods_in_a_running_drain() {
         let rule = |effect: Mode, verb: &str, ns: &str| crate::mcp::Rule {
             effect,
             verbs: vec![verb.into()],
@@ -1095,22 +1190,15 @@ mod tests {
             contexts: vec!["*".into()],
             ..crate::mcp::Rule::default()
         };
-        let nodes = kind("", "v1", "Node", "nodes", false);
         let pods = kind("", "v1", "Pod", "pods", true);
-        let drain = access_for(&nodes, "c", "drain", None, Some("node-1".into()));
         let pod = |ns: &str| access_for(&pods, "c", "delete", Some(ns.into()), Some("web".into()));
+        // No delete rule at all: the drain rule is what lets it evict.
         let allowed = Policy { rules: vec![rule(Mode::Allow, "drain", "*")], ..Policy::default() };
-        assert_eq!(eviction(&allowed, &drain, false, &pod("app")), k8s::Eviction::Evict);
-        // A Deny on deleting pods added while it runs keeps that namespace's pods.
+        assert!(!denies_eviction(&allowed, &pod("app")));
+        // A Deny on deleting pods added while it runs keeps that namespace's pods only.
         let mut denied = allowed.clone();
         denied.rules.push(rule(Mode::Deny, "delete", "app"));
-        assert!(matches!(eviction(&denied, &drain, false, &pod("app")), k8s::Eviction::Keep(_)));
-        assert_eq!(eviction(&denied, &drain, false, &pod("other")), k8s::Eviction::Evict);
-        // The drain rule removed, or turned into an Ask nobody approved: no more evictions.
-        let none = Policy { rules: vec![], ..Policy::default() };
-        assert!(matches!(eviction(&none, &drain, false, &pod("app")), k8s::Eviction::Stop(_)));
-        let ask = Policy { rules: vec![rule(Mode::Ask, "drain", "*")], ..Policy::default() };
-        assert!(matches!(eviction(&ask, &drain, false, &pod("app")), k8s::Eviction::Stop(_)));
-        assert_eq!(eviction(&ask, &drain, true, &pod("app")), k8s::Eviction::Evict);
+        assert!(denies_eviction(&denied, &pod("app")));
+        assert!(!denies_eviction(&denied, &pod("other")));
     }
 }

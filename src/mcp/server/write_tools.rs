@@ -132,25 +132,24 @@ impl KubeMcp {
         if let Some(args) = call.args.as_object_mut() {
             args.insert("objects".into(), json!(manifest_objects(&planned)));
         }
+        // Each object is approved on its own: approving one does not cover another.
+        let mut approved = Vec::new();
         for (kind, ns, name, _) in &planned {
             let access = access_for(kind, &p.context, "apply", ns.clone(), Some(name.clone()));
+            call.approved = false;
             self.authorize(&mut call, &access).await?;
+            approved.push(call.approved);
         }
+        let any_approved = approved.contains(&true);
         let dry = p.dry_run.unwrap_or(false);
         let mut out = Vec::new();
-        for (kind, ns, name, doc) in planned {
-            // Approvals for later objects can take minutes: access may be off, or the rules
-            // changed, by now.
-            self.reload_rules(&mut call);
+        for ((kind, ns, name, doc), approved) in planned.into_iter().zip(approved) {
+            // Approvals for later objects, and applying earlier ones, can take minutes:
+            // access may be off, or the rules changed, by now.
             let access = access_for(&kind, &p.context, "apply", ns.clone(), Some(name));
-            let verdict = call.policy().decide(&access);
-            let refused = match self.inactive(&call) {
-                Some(reason) => Some(reason.to_string()),
-                None if verdict.mode == Mode::Deny => {
-                    Some(format!("{} — {}", describe(&access), call.rule_label(verdict.rule)))
-                }
-                None => None,
-            };
+            call.approved = approved;
+            let refused = self.stale_reason(&mut call, &access);
+            call.approved = any_approved;
             if let Some(reason) = refused {
                 // The log says what was applied before.
                 let detail =
@@ -210,20 +209,25 @@ impl KubeMcp {
             )));
         }
         self.recheck(&mut call, &access)?;
-        // Evictions take minutes on a big node, and the drain lists the pods again: each is
-        // checked on the rules, and agent access, as they are when its turn comes.
-        let (hub, agent_id, approved, context) = (self.hub.clone(), call.agent.id.clone(), call.approved, p.context);
-        let check = move |ns: &str, name: &str| {
-            if let Some(reason) = inactive(&hub, &agent_id) {
-                return k8s::Eviction::Stop(reason.into());
+        let stop = self.still_allowed(&call, &access);
+        // The drain lists the pods again and takes minutes on a big node: a Deny on deleting
+        // a pod, added while it runs, keeps that pod in place.
+        let (hub, agent_id, context, kind) =
+            (self.hub.clone(), call.agent.id.clone(), p.context.clone(), pods_kind.clone());
+        let keep = move |ns: &str, name: &str| {
+            let a = access_for(&kind, &context, "delete", Some(ns.into()), Some(name.into()));
+            match hub.agent(&agent_id) {
+                Some(agent) if !denies_eviction(&agent.policy, &a) => None,
+                Some(_) => Some("your rules deny deleting it".to_string()),
+                None => Some("this agent is disabled".to_string()),
             }
-            let Some(agent) = hub.agent(&agent_id) else {
-                return k8s::Eviction::Stop("this agent is disabled".into());
-            };
-            let pod = access_for(&pods_kind, &context, "delete", Some(ns.into()), Some(name.into()));
-            eviction(&agent.policy, &access, approved, &pod)
         };
-        call.finish(k8s::drain(client, p.node, check).await)
+        // The reply names only the pods the agent may list.
+        let shown = |ns: &str, name: &str| {
+            let a = access_for(&pods_kind, &p.context, "list", Some(ns.into()), Some(name.into()));
+            call.policy().decide(&a).mode == Mode::Allow
+        };
+        call.finish(k8s::drain_report(client, p.node, stop, keep).await.map(|d| d.summary(shown)))
     }
 
     #[tool(
