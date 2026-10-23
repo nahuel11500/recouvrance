@@ -55,6 +55,8 @@ pub struct ResourceTable {
     sort: Option<(Col, ColumnSort)>,
     pub selected_uid: Option<String>,
     usage: Option<HashMap<usize, UsageIndex>>,
+    /// Pods' requests and limits by context, namespace and name, for their usage bars.
+    resources: HashMap<usize, HashMap<String, HashMap<String, k8s::PodResources>>>,
     /// When several namespaces are selected, rows outside them are hidden.
     ns_filter: Option<std::collections::HashSet<String>>,
     /// Allocatable per context and node, for usage bars.
@@ -102,6 +104,7 @@ impl ResourceTable {
             sort: None,
             selected_uid: None,
             usage: None,
+            resources: HashMap::new(),
             ns_filter: None,
             capacity: None,
             visible_cols: None,
@@ -360,6 +363,20 @@ impl ResourceTable {
         if cpu {
             self.cols.insert(at, Col::Cpu);
         }
+    }
+
+    /// Pods' requests and limits, for the usage bars.
+    pub fn set_resources(&mut self, ctx: usize, resources: k8s::PodResourcesMap) {
+        let mut index: HashMap<String, HashMap<String, k8s::PodResources>> = HashMap::new();
+        for ((ns, name), r) in resources {
+            index.entry(ns).or_default().insert(name, r);
+        }
+        self.resources.insert(ctx, index);
+    }
+
+    fn resources_of(&self, ctx: usize, row: &Row) -> Option<k8s::PodResources> {
+        let ns = row.namespace.as_deref().unwrap_or_default();
+        self.resources.get(&ctx)?.get(ns)?.get(row.name.as_str()).copied()
     }
 
     fn usage_of(&self, ctx: usize, row: &Row) -> Option<(f64, f64)> {

@@ -35,10 +35,13 @@ impl TableDelegate for ResourceTable {
             (_, "Object") => 320.,
             (_, "Last Seen" | "Type") => 90.,
             (Col::Namespace | Col::Context, _) => 170.,
-            (Col::Cpu | Col::Memory, _) if self.capacity.is_some() => 190.,
+            (Col::Cpu | Col::Memory, _) if self.capacity.is_some() || self.pods => 190.,
             (_, "Age" | "Ready" | "Restarts" | "Status" | "CPU" | "Memory") => 90.,
             _ => 150.,
         };
+        // Room for the usage bars: widths saved before they existed were 90.
+        let bars = matches!(col, Col::Cpu | Col::Memory) && (self.capacity.is_some() || self.pods);
+        let width = if bars { width.max(170.) } else { width };
         // Not `.sort()`: the table's own control shows a two-way arrow on every column.
         // `render_th` sorts on a click and shows one arrow, on the sorted column only.
         Column::new(format!("c{col_ix}"), name).width(px(width * crate::app::zoom(cx))).movable(!self.is_fixed(col))
@@ -153,6 +156,12 @@ impl TableDelegate for ResourceTable {
                         ),
                 )
                 .into_any_element();
+        }
+        if let (Col::Cpu | Col::Memory, true) = (col, self.pods)
+            && let Some(used) = self.usage_of(ctx, row)
+        {
+            let res = self.resources_of(ctx, row);
+            return usage_bar(&row.uid, col, used, res, cx);
         }
         let cell = self.cell(ctx, row, col);
         let theme = cx.theme();
@@ -410,6 +419,70 @@ pub(super) fn link_kind_of(header: &str) -> Option<&'static str> {
 pub(super) fn linkable(value: &str) -> bool {
     let v = value.trim();
     !(v.is_empty() || v == "<none>" || v == "-" || v.contains([',', ' ', '/']))
+}
+
+/// A pod's CPU or memory: its usage as the bar, a dark tick at its request and a red one
+/// at its limit. Orange above the request, red near the limit; exact figures on hover.
+fn usage_bar(
+    uid: &str,
+    col: Col,
+    used: (f64, f64),
+    res: Option<k8s::PodResources>,
+    cx: &mut Context<TableState<ResourceTable>>,
+) -> AnyElement {
+    let theme = cx.theme();
+    let cpu = col == Col::Cpu;
+    let format: fn(f64) -> String = if cpu { k8s::format_cpu } else { k8s::format_bytes };
+    let (value, color) = if cpu { (used.0, theme.blue) } else { (used.1, theme.success) };
+    let (request, limit) = res.map(|r| if cpu { r.cpu } else { r.mem }).unwrap_or_default();
+    let figure = div().w(px(52.)).flex_shrink_0().text_right().child(format(value));
+    if request.is_none() && limit.is_none() {
+        // Nothing to measure it against: a bar would only show the scale.
+        let note = if res.is_some() { "no request" } else { "" };
+        return h_flex()
+            .size_full()
+            .gap_2()
+            .child(figure)
+            .child(div().text_xs().text_color(theme.muted_foreground).whitespace_nowrap().child(note))
+            .into_any_element();
+    }
+    // The scale leaves room past the furthest mark, so none sits on the edge.
+    let max = [Some(value), request, limit].into_iter().flatten().fold(0.0, f64::max).max(1e-9) * 1.15;
+    let at = |v: f64| relative((v / max).clamp(0.0, 1.0) as f32);
+    let fill = match (request, limit) {
+        (_, Some(l)) if value >= l * 0.9 => theme.danger,
+        (Some(r), _) if value > r => theme.warning,
+        _ => color,
+    };
+    let tip = [
+        Some(format!("using {}", format(value))),
+        request.map(|r| format!("request {}", format(r))),
+        Some(limit.map_or("no limit".to_string(), |l| format!("limit {}", format(l)))),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join(" · ");
+    let tick =
+        |v: f64, color: Hsla| div().absolute().top(px(-3.)).h(px(12.)).w(px(2.)).rounded_sm().bg(color).left(at(v));
+    h_flex()
+        .id(SharedString::from(format!("{}-{uid}", if cpu { "cpu" } else { "mem" })))
+        .size_full()
+        .gap_2()
+        .tooltip(move |w, cx| component::tooltip::Tooltip::new(tip.clone()).build(w, cx))
+        .child(figure)
+        .child(
+            div()
+                .relative()
+                .flex_1()
+                .h(px(6.))
+                .rounded_full()
+                .bg(theme.secondary)
+                .child(div().absolute().left_0().top_0().h_full().rounded_full().bg(fill).w(at(value)))
+                .when_some(request, |d, r| d.child(tick(r, theme.foreground.opacity(0.7))))
+                .when_some(limit, |d, l| d.child(tick(l, theme.danger))),
+        )
+        .into_any_element()
 }
 
 #[cfg(test)]

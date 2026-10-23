@@ -137,6 +137,100 @@ struct NodeAllocatableStatus {
 
 /// Poll node metrics and allocatable every 15s, retrying (backing off) on errors;
 /// nothing while `pause` is set.
+/// A pod's CPU (millicores) and memory (bytes) requests and limits, summed over its
+/// containers. No limit when a container has none: the pod can then use what the node has.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct PodResources {
+    pub cpu: (Option<f64>, Option<f64>),
+    pub mem: (Option<f64>, Option<f64>),
+}
+
+/// (namespace, pod) -> its requests and limits.
+pub type PodResourcesMap = HashMap<(String, String), PodResources>;
+
+#[derive(serde::Deserialize, Default)]
+#[serde(default)]
+struct LeanPod {
+    metadata: LeanPodMeta,
+    spec: LeanPodSpec,
+}
+
+#[derive(serde::Deserialize, Default)]
+#[serde(default)]
+struct LeanPodMeta {
+    name: String,
+    namespace: String,
+}
+
+#[derive(serde::Deserialize, Default)]
+#[serde(default)]
+struct LeanPodSpec {
+    containers: Vec<LeanContainer>,
+}
+
+#[derive(serde::Deserialize, Default)]
+#[serde(default)]
+struct LeanContainer {
+    resources: LeanResources,
+}
+
+#[derive(serde::Deserialize, Default)]
+#[serde(default)]
+struct LeanResources {
+    requests: HashMap<String, String>,
+    limits: HashMap<String, String>,
+}
+
+fn pod_resources(containers: &[LeanContainer]) -> PodResources {
+    let sum = |key: &str, of: fn(&LeanResources) -> &HashMap<String, String>, parse: fn(&str) -> f64, all: bool| {
+        let vals: Vec<Option<f64>> = containers.iter().map(|c| of(&c.resources).get(key).map(|q| parse(q))).collect();
+        if vals.iter().all(Option::is_none) || all && vals.iter().any(Option::is_none) {
+            return None;
+        }
+        Some(vals.into_iter().flatten().sum())
+    };
+    PodResources {
+        cpu: (sum("cpu", |r| &r.requests, parse_cpu, false), sum("cpu", |r| &r.limits, parse_cpu, true)),
+        mem: (sum("memory", |r| &r.requests, parse_bytes, false), sum("memory", |r| &r.limits, parse_bytes, true)),
+    }
+}
+
+/// The pods' requests and limits, for the usage bars of the pods list: one light list
+/// (only those fields are parsed), again every minute or ten times as long as it took,
+/// for pods that came since. Nothing while `pause` is set.
+pub fn watch_pod_resources(
+    client: Client,
+    namespace: Option<String>,
+    pause: Pause,
+) -> (TaskGuard, mpsc::UnboundedReceiver<PodResourcesMap>) {
+    let (tx, rx) = mpsc::unbounded();
+    let guard = spawn_guarded(async move {
+        let mut failures = 0;
+        loop {
+            wait_unpaused(&pause).await;
+            let started = std::time::Instant::now();
+            let list = lists::list_lean_cached::<LeanPod>(client.clone(), ar_of::<Pod>(), namespace.clone()).await;
+            let Ok(pods) = list else {
+                if tx.is_closed() {
+                    return;
+                }
+                retry_wait(&mut failures).await;
+                continue;
+            };
+            failures = 0;
+            let map: PodResourcesMap = pods
+                .into_iter()
+                .map(|p| ((p.metadata.namespace, p.metadata.name), pod_resources(&p.spec.containers)))
+                .collect();
+            if tx.unbounded_send(map).is_err() {
+                return;
+            }
+            tokio::time::sleep((started.elapsed() * 10).max(std::time::Duration::from_secs(60))).await;
+        }
+    });
+    (guard, rx)
+}
+
 pub fn watch_node_metrics(client: Client, pause: Pause) -> (TaskGuard, mpsc::UnboundedReceiver<NodeUsage>) {
     let (tx, rx) = mpsc::unbounded();
     let guard = spawn_guarded(async move {
@@ -302,5 +396,27 @@ mod quantity_tests {
         assert_eq!(parse_bytes("500M"), 5e8);
         assert_eq!(parse_bytes("1k"), 1000.0);
         assert_eq!(parse_bytes("1500m"), 1.5);
+    }
+}
+
+#[cfg(test)]
+mod resources_tests {
+    use super::*;
+
+    fn container(requests: &[(&str, &str)], limits: &[(&str, &str)]) -> LeanContainer {
+        let map = |kv: &[(&str, &str)]| kv.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        LeanContainer { resources: LeanResources { requests: map(requests), limits: map(limits) } }
+    }
+
+    #[test]
+    fn sums_requests_and_limits() {
+        let r = pod_resources(&[
+            container(&[("cpu", "250m"), ("memory", "256Mi")], &[("cpu", "1"), ("memory", "512Mi")]),
+            container(&[("cpu", "250m")], &[("cpu", "500m")]),
+        ]);
+        assert_eq!(r.cpu, (Some(500.0), Some(1500.0)));
+        // A container without a memory limit: the pod has none.
+        assert_eq!(r.mem, (Some(256.0 * 1024.0 * 1024.0), None));
+        assert_eq!(pod_resources(&[container(&[], &[])]), PodResources::default());
     }
 }
