@@ -565,13 +565,16 @@ impl LogsView {
     }
 
     pub(super) fn save_to_downloads(&self) -> std::io::Result<std::path::PathBuf> {
-        let home = std::path::PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
-        let dir = if home.join("Downloads").is_dir() { home.join("Downloads") } else { home };
+        use std::io::Write as _;
         let stamp = jiff::Timestamp::now().strftime("%Y%m%d-%H%M%S");
         let name =
             if self.pods.len() == 1 { self.pods[0].clone() } else { format!("{}-{}pods", self.ns, self.pods.len()) };
-        let path = dir.join(format!("{name}-{stamp}.log"));
-        std::fs::write(&path, self.shown_text())?;
+        // Private (logs often hold tokens) and never over an earlier save.
+        let (mut f, path) = crate::private_files::create_new_in(
+            &crate::private_files::downloads_dir(),
+            &format!("{name}-{stamp}.log"),
+        )?;
+        f.write_all(self.shown_text().as_bytes())?;
         Ok(path)
     }
 

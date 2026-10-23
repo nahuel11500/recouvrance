@@ -344,6 +344,7 @@ mod tests {
             resource_aliases: vec![],
             namespace: Some("x".into()),
             name: Some("y".into()),
+            cluster_scoped: false,
         };
         assert_eq!(back.decide(&a).mode, Mode::Deny);
     }
@@ -389,6 +390,7 @@ mod tests {
             resource_aliases: vec![],
             namespace: Some("x".into()),
             name: Some("y".into()),
+            cluster_scoped: false,
         };
         assert_eq!(p.decide(&a).mode, Mode::Deny);
     }

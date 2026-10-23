@@ -133,6 +133,8 @@ pub struct Access {
     /// None for cluster-scoped objects, or for "any namespace" checks.
     pub namespace: Option<String>,
     pub name: Option<String>,
+    /// The kind is cluster-scoped, so a None namespace is not "every namespace".
+    pub cluster_scoped: bool,
 }
 
 /// Whether a pattern matches, the way rules match: trimmed, ignoring case.
@@ -311,7 +313,24 @@ impl Policy {
     }
 
     fn decide_inner(&self, a: &Access, any_ns: bool) -> Verdict {
-        best(self.rules.iter().enumerate().filter(|(_, r)| r.matches(a, any_ns)))
+        let inside = namespace_contents(a);
+        best(self.rules.iter().enumerate().filter(|(_, r)| {
+            r.matches(a, any_ns) || inside.as_ref().is_some_and(|i| r.effect != Mode::Allow && r.matches(i, false))
+        }))
+    }
+
+    /// Rules pasted as JSON ("Copy rules" on another agent), None when there are none.
+    /// No pasted rule counts as approved: it would win over every Ask rule while looking
+    /// like any other Allow.
+    pub fn pasted(text: &str) -> Option<Policy> {
+        let mut p: Policy = serde_json::from_str(text).ok()?;
+        if p.rules.is_empty() {
+            return None;
+        }
+        for r in &mut p.rules {
+            r.approved = false;
+        }
+        Some(p)
     }
 
     /// The context patterns of the non-expired Allow and Ask rules.
@@ -387,6 +406,15 @@ impl Policy {
         self.read = None;
         self.logs = None;
     }
+}
+
+/// A write to a Namespace object changes (or deletes) everything in it, so it also meets
+/// the Deny and Ask rules of that namespace: the same request, inside it.
+fn namespace_contents(a: &Access) -> Option<Access> {
+    if !is_write(&a.verb) || a.resource != "namespaces" || a.namespace.is_some() {
+        return None;
+    }
+    Some(Access { namespace: Some(a.name.clone()?), ..a.clone() })
 }
 
 fn best<'a>(matching: impl Iterator<Item = (usize, &'a Rule)>) -> Verdict {
@@ -541,17 +569,20 @@ pub struct Approval {
 
 impl Approval {
     /// A narrow Allow rule for exactly this request, when a rule can be that narrow.
-    /// None for exec (a rule cannot pin the command), GitOps actions (the rule would
-    /// allow any patch), apply (the rule could not pin the content), a write with no
-    /// object name (the rule would cover every name) and dry runs (a rule cannot be
-    /// limited to dry runs, so it would allow the real write).
+    /// None for exec (a rule cannot pin the command), patches and GitOps actions (the rule
+    /// would allow any patch), scale (it would allow any replica count, 0 too), apply (the
+    /// rule could not pin the content), a request other than a list with no object name
+    /// (the rule would cover every name), a request across all namespaces (the rule would
+    /// also cover namespaces no rule allows) and dry runs (a rule cannot be limited to dry
+    /// runs, so it would allow the real write).
     pub fn as_rule(&self) -> Option<Rule> {
         let a = &self.access;
-        if a.verb == "exec"
+        if matches!(a.verb.as_str(), "exec" | "patch" | "scale")
             || self.tool == "gitops"
             || self.tool == "apply_manifest"
             || self.dry_run
-            || (is_write(&a.verb) && a.name.is_none())
+            || (a.verb != "list" && a.name.is_none())
+            || (a.namespace.is_none() && !a.cluster_scoped)
         {
             return None;
         }
@@ -1131,6 +1162,7 @@ mod tests {
             resource_aliases: vec![],
             namespace: ns.map(String::from),
             name: name.map(String::from),
+            cluster_scoped: false,
         }
     }
 
@@ -1184,6 +1216,33 @@ mod tests {
         assert_eq!(p.decide(&access("c", "list", "events", Some("ns"), None)).mode, Mode::Allow);
         assert_eq!(p.decide(&access("c", "list", "events", Some("ns"), Some("web-1.17f2"))).mode, Mode::Allow);
         assert_eq!(p.decide(&access("c", "list", "events", Some("ns"), Some("db-0.17f2"))).mode, Mode::Deny);
+    }
+
+    #[test]
+    fn namespace_rules_cover_writes_to_the_namespace_itself() {
+        let p = Policy {
+            rules: vec![
+                rule(Mode::Allow, &["*"], &["*"], &["*"], &["*"]),
+                rule(Mode::Deny, &["*"], &["*"], &["prod"], &["*"]),
+                rule(Mode::Ask, &["*"], &["*"], &["team-a"], &["*"]),
+                rule(Mode::Allow, &["delete"], &["*"], &["dev"], &["*"]),
+            ],
+            ..Policy::default()
+        };
+        let d = |verb: &str, name: &str| p.decide(&access("c", verb, "namespaces", None, Some(name))).mode;
+        assert_eq!(d("delete", "prod"), Mode::Deny);
+        assert_eq!(d("patch", "prod"), Mode::Deny);
+        assert_eq!(d("apply", "prod"), Mode::Deny);
+        assert_eq!(d("delete", "team-a"), Mode::Ask);
+        assert_eq!(d("delete", "other"), Mode::Allow);
+        // Reading it is not a change to what it holds.
+        assert_eq!(d("get", "prod"), Mode::Allow);
+        // An Allow inside a namespace does not allow deleting the namespace.
+        let only_dev = Policy { rules: vec![p.rules[3].clone()], ..Policy::default() };
+        assert_eq!(only_dev.decide(&access("c", "delete", "namespaces", None, Some("dev"))).mode, Mode::Deny);
+        // Another kind named namespaces is not the Namespace.
+        let crd = access("c", "delete", "namespaces.example.io", None, Some("prod"));
+        assert_eq!(p.decide(&crd).mode, Mode::Allow);
     }
 
     #[test]
@@ -1315,37 +1374,50 @@ mod tests {
             id: 1,
             agent_id: "a".into(),
             agent: "a".into(),
-            tool: "scale".into(),
+            tool: "rollout_restart".into(),
             summary: String::new(),
-            access: access("c1", "scale", "deployments.apps", Some("team"), Some("web")),
+            access: access("c1", "restart", "deployments.apps", Some("team"), Some("web")),
             dry_run: false,
         };
         // It wins over the Ask rule that asked, for exactly this request.
-        let ask = rule(Mode::Ask, &["scale"], &["*"], &["*"], &["*"]);
+        let ask = rule(Mode::Ask, &["restart"], &["*"], &["*"], &["*"]);
         let p = Policy { rules: vec![ask, approval.as_rule().unwrap()], ..Policy::default() };
-        assert_eq!(p.decide(&access("c1", "scale", "deployments.apps", Some("team"), Some("web"))).mode, Mode::Allow);
-        assert_eq!(p.decide(&access("c1", "scale", "deployments.apps", Some("team"), Some("api"))).mode, Mode::Ask);
+        assert_eq!(p.decide(&access("c1", "restart", "deployments.apps", Some("team"), Some("web"))).mode, Mode::Allow);
+        assert_eq!(p.decide(&access("c1", "restart", "deployments.apps", Some("team"), Some("api"))).mode, Mode::Ask);
         let hour =
             Policy { rules: vec![p.rules[0].clone(), approval.as_rule_for_an_hour().unwrap()], ..Policy::default() };
         assert_eq!(
-            hour.decide(&access("c1", "scale", "deployments.apps", Some("team"), Some("web"))).mode,
+            hour.decide(&access("c1", "restart", "deployments.apps", Some("team"), Some("web"))).mode,
             Mode::Allow
         );
         // A Deny still wins, and a plain Allow still loses to the Ask.
         let deny = rule(Mode::Deny, &["*"], &["*"], &["team"], &["*"]);
         let denied = Policy { rules: vec![deny, approval.as_rule().unwrap()], ..Policy::default() };
         assert_eq!(
-            denied.decide(&access("c1", "scale", "deployments.apps", Some("team"), Some("web"))).mode,
+            denied.decide(&access("c1", "restart", "deployments.apps", Some("team"), Some("web"))).mode,
             Mode::Deny
         );
         let plain = Rule { approved: false, ..approval.as_rule().unwrap() };
         let asks = Policy { rules: vec![p.rules[0].clone(), plain], ..Policy::default() };
-        assert_eq!(asks.decide(&access("c1", "scale", "deployments.apps", Some("team"), Some("web"))).mode, Mode::Ask);
+        assert_eq!(
+            asks.decide(&access("c1", "restart", "deployments.apps", Some("team"), Some("web"))).mode,
+            Mode::Ask
+        );
         let p = Policy { rules: vec![approval.as_rule().unwrap()], ..Policy::default() };
-        assert_eq!(p.decide(&access("c1", "scale", "deployments.apps", Some("team"), Some("web"))).mode, Mode::Allow);
-        assert_eq!(p.decide(&access("c1", "scale", "deployments.apps", Some("team"), Some("api"))).mode, Mode::Deny);
+        assert_eq!(p.decide(&access("c1", "restart", "deployments.apps", Some("team"), Some("web"))).mode, Mode::Allow);
+        assert_eq!(p.decide(&access("c1", "restart", "deployments.apps", Some("team"), Some("api"))).mode, Mode::Deny);
         assert_eq!(p.decide(&access("c1", "delete", "deployments.apps", Some("team"), Some("web"))).mode, Mode::Deny);
-        assert_eq!(p.decide(&access("c2", "scale", "deployments.apps", Some("team"), Some("web"))).mode, Mode::Deny);
+        assert_eq!(p.decide(&access("c2", "restart", "deployments.apps", Some("team"), Some("web"))).mode, Mode::Deny);
+    }
+
+    #[test]
+    fn pasted_rules_are_not_approved() {
+        let approved = Rule { approved: true, ..rule(Mode::Allow, &["get"], &["*"], &["*"], &["*"]) };
+        let text = serde_json::to_string(&Policy { rules: vec![approved], ..Policy::default() }).unwrap();
+        assert!(text.contains("\"approved\":true"));
+        let p = Policy::pasted(&text).unwrap();
+        assert!(!p.rules[0].approved);
+        assert!(Policy::pasted(r#"{"rules": []}"#).is_none() && Policy::pasted("not json").is_none());
     }
 
     #[test]
@@ -1362,11 +1434,23 @@ mod tests {
         assert!(approval("exec_command", "exec", Some("web-1")).as_rule().is_none());
         assert!(approval("exec_command", "exec", Some("web-1")).as_rule_for_an_hour().is_none());
         assert!(approval("gitops", "patch", Some("app")).as_rule().is_none());
+        // A rule could not pin the patch body or the replica count.
+        assert!(approval("patch_resource", "patch", Some("web")).as_rule().is_none());
+        assert!(approval("scale", "scale", Some("web")).as_rule_for_an_hour().is_none());
         assert!(approval("apply_manifest", "apply", None).as_rule().is_none());
         // A rule could not pin the manifest's content.
         assert!(approval("apply_manifest", "apply", Some("web")).as_rule().is_none());
         assert!(approval("list_resources", "list", None).as_rule().is_some());
+        // A certificate scan reads every Secret: a rule would allow getting any of them.
+        assert!(approval("check_certificates", "get", None).as_rule().is_none());
         assert!(approval("delete_resource", "delete", Some("web")).as_rule().is_some());
+        // Across all namespaces, a rule would also cover namespaces no rule allows.
+        let everywhere = |cluster_scoped| Approval {
+            access: Access { cluster_scoped, ..access("c1", "list", "pods", None, None) },
+            ..approval("list_resources", "list", None)
+        };
+        assert!(everywhere(false).as_rule().is_none() && everywhere(false).as_rule_for_an_hour().is_none());
+        assert!(everywhere(true).as_rule().is_some());
         // Approving a dry run must not allow the real write.
         let dry = Approval { dry_run: true, ..approval("delete_resource", "delete", Some("web")) };
         assert!(dry.as_rule().is_none() && dry.as_rule_for_an_hour().is_none());

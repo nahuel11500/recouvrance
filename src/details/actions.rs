@@ -229,6 +229,10 @@ impl DetailPanel {
         let task = cx.spawn_in(window, async move |_, cx| {
             let check = dry.await;
             let _ = cx.update(|window, cx| {
+                // Write mode may have been turned off during the dry run.
+                if check.is_ok() && !writes_still_on(window, cx) {
+                    return;
+                }
                 window.open_alert_dialog(cx, move |alert, _, cx| {
                     let (panel, guard, template) = (panel.clone(), guard.clone(), template.clone());
                     let summary = match &check {
@@ -248,6 +252,9 @@ impl DetailPanel {
                         .on_ok(move |_, window, cx| {
                             if !guard_ok(guard.as_ref(), cx) {
                                 return false;
+                            }
+                            if !writes_still_on(window, cx) {
+                                return true;
                             }
                             let template = template.clone();
                             let _ = panel.update(cx, |this, cx| {
@@ -335,8 +342,13 @@ impl DetailPanel {
                     if let Some(old) = this.node_shell.replace(pod.clone()) {
                         k8s::delete_node_shell(client.clone(), old);
                     }
-                    let terminal =
-                        cx.new(|cx| TerminalView::new(client.clone(), k8s::NODE_SHELL_NS.into(), pod, None, true, cx));
+                    // Write mode still applies to every connect; the context name was typed already.
+                    let ctx = this.context.clone();
+                    let terminal = cx.new(|cx| {
+                        TerminalView::new(client.clone(), k8s::NODE_SHELL_NS.into(), pod, None, true, cx)
+                            .guarded(ctx)
+                            .preauthorized()
+                    });
                     // The privileged pod lives only as long as its shell.
                     let sub = cx.subscribe(&terminal, |this, _, _: &crate::ui::terminal::SessionEnded, cx| {
                         this.end_node_shell(cx);
@@ -473,8 +485,13 @@ impl DetailPanel {
             let _ = this.update_in(cx, |this, window, cx| match result {
                 Ok(container) => {
                     let risky = crate::settings::is_protected(&this.context);
-                    this.terminal =
-                        Some(cx.new(|cx| TerminalView::new(client, ns, pod, Some(container.clone()), risky, cx)));
+                    // Write mode still applies to every connect; the context name was typed already.
+                    let ctx = this.context.clone();
+                    this.terminal = Some(cx.new(|cx| {
+                        TerminalView::new(client, ns, pod, Some(container.clone()), risky, cx)
+                            .guarded(ctx)
+                            .preauthorized()
+                    }));
                     this.tab = DetailTab::Shell;
                     window
                         .push_notification(Notification::success(format!("Shell in debug container {container}")), cx);
@@ -631,6 +648,7 @@ impl DetailPanel {
                 Err(e) => {
                     window.push_notification(Notification::error(format!("The server rejected the change: {e:#}")), cx)
                 }
+                Ok(_) if !writes_still_on(window, cx) => {}
                 Ok(_) => window.open_alert_dialog(cx, move |alert, _, cx| {
                     let (panel, obj, guard) = (panel.clone(), obj.clone(), guard.clone());
                     alert
@@ -642,6 +660,9 @@ impl DetailPanel {
                         .on_ok(move |_, window, cx| {
                             if !guard_ok(guard.as_ref(), cx) {
                                 return false;
+                            }
+                            if !writes_still_on(window, cx) {
+                                return true;
                             }
                             let obj = obj.clone();
                             let _ = panel.update(cx, |this, cx| {

@@ -364,21 +364,26 @@ impl KubeMcp {
         any_namespace: bool,
         list: bool,
     ) -> Result<(), String> {
-        let verdict =
-            if any_namespace { call.policy().decide_any_namespace(access) } else { call.policy().decide(access) };
+        // The rules may have changed since the call started (or since its last check).
+        self.reload_rules(call);
+        self.ensure_active(call)?;
+        let decide = |call: &Call| {
+            if any_namespace { call.policy().decide_any_namespace(access) } else { call.policy().decide(access) }
+        };
+        let verdict = decide(call);
         match verdict.mode {
             Mode::Allow => {
                 call.rule = verdict.rule;
-                self.ensure_active(call)
+                Ok(())
             }
             Mode::Deny => Err(call.deny(format!("{} — {}", describe(access), call.rule_label(verdict.rule)))),
             Mode::Ask => {
                 // A list can show its allowed rows without approval (Ask rows hidden).
-                let fallback = if list { call.policy().allow_somewhere(access) } else { None };
+                let fallback = |call: &Call| if list { call.policy().allow_somewhere(access) } else { None };
                 if self.hub.headless() {
-                    if fallback.is_some() {
-                        call.rule = fallback;
-                        return self.ensure_active(call);
+                    if let Some(rule) = fallback(call) {
+                        call.rule = Some(rule);
+                        return Ok(());
                     }
                     return Err(call.deny(format!(
                         "{} needs approval in the Recouvrance window ({}); run the app, or add an Allow rule",
@@ -393,26 +398,41 @@ impl KubeMcp {
                     summary.push_str(detail);
                 }
                 let dry_run = call.args.get("dry_run").and_then(|v| v.as_bool()).unwrap_or(false);
-                if self.hub.request_approval(&call.agent, call.tool, summary, access.clone(), dry_run).await {
-                    // Access may have been switched off while the request waited.
+                let approved =
+                    self.hub.request_approval(&call.agent, call.tool, summary, access.clone(), dry_run).await;
+                // Access may have been switched off, or the rules changed, while the request waited.
+                self.reload_rules(call);
+                if approved {
                     self.ensure_active(call)?;
+                    let now = decide(call);
+                    if now.mode == Mode::Deny {
+                        return Err(call.deny(format!("{} — {}", describe(access), call.rule_label(now.rule))));
+                    }
                     call.approved = true;
-                    call.rule = verdict.rule;
+                    call.rule = now.rule;
                     call.approved_rules = if any_namespace {
                         call.policy().asks_any_namespace(access)
                     } else {
                         call.policy().asks(access)
                     };
                     Ok(())
-                } else if fallback.is_some() {
+                } else if let Some(rule) = fallback(call) {
                     call.record(Decision::Rejected, "not approved; showing the allowed rows only".into(), 0);
-                    call.rule = fallback;
+                    call.rule = Some(rule);
                     self.ensure_active(call)
                 } else {
                     call.record(Decision::Rejected, "not approved".into(), 0);
                     Err("Rejected: the user did not approve this request".into())
                 }
             }
+        }
+    }
+
+    /// Read the agent's rules again. A removed agent keeps its old rules, and
+    /// [`Self::ensure_active`] then refuses the call.
+    fn reload_rules(&self, call: &mut Call) {
+        if let Some(agent) = self.hub.agent(&call.agent.id) {
+            call.agent = agent;
         }
     }
 
@@ -440,6 +460,7 @@ fn access_for(kind: &Kind, context: &str, verb: &str, namespace: Option<String>,
         resource_aliases: vec![kind.ar.plural.clone(), kind.ar.kind.to_lowercase()],
         namespace: if kind.namespaced { namespace } else { None },
         name,
+        cluster_scoped: !kind.namespaced,
     }
 }
 

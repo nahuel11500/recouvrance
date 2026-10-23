@@ -128,8 +128,8 @@ impl AgentsView {
                             .tooltip("Replace this agent's rules and limits with JSON from the clipboard")
                             .on_click(cx.listener(|this, _, window, cx| {
                                 let text = cx.read_from_clipboard().and_then(|c| c.text()).unwrap_or_default();
-                                match serde_json::from_str::<Policy>(&text) {
-                                    Ok(p) if !p.rules.is_empty() => {
+                                match Policy::pasted(&text) {
+                                    Some(p) => {
                                         this.update(|a| a.policy = p, cx);
                                         if let Some(agent) = this.selected.as_ref().and_then(|id| this.hub.agent(id)) {
                                             this.rebuild_editor(&agent, window, cx);

@@ -157,7 +157,7 @@ impl AppView {
                 }
             }
         }
-        self._subs.push(cx.subscribe_in(&palette, window, |this, _, ev: &PaletteEvent, window, cx| {
+        self._palette_sub = Some(cx.subscribe_in(&palette, window, |this, _, ev: &PaletteEvent, window, cx| {
             this.palette = None;
             window.focus(&this.focus, cx);
             if let PaletteEvent::Pick(target) = ev {
