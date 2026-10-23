@@ -76,7 +76,8 @@ Prompts (slash commands in Claude Code: `/mcp__recouvrance__troubleshoot` …): 
 Every call is logged with its decision and rule, and appended to
 `~/.local/share/recouvrance/audit.jsonl` (the folder is 0700, the file 0600). At 10 MiB the log moves to
 `audit.jsonl.1`, replacing the older one. If the log cannot be written, the Activity page says so. A
-kill switch cuts all agent access at once.
+kill switch cuts all agent access at once. A request nobody answers within 2 minutes is refused; the log
+says whether it was refused, left unanswered or cut off by the kill switch.
 
 The Activity page groups calls by task: one agent session, split where the agent paused for more than
 10 minutes. Each group says what it touched (contexts, namespaces, objects); repeated calls of a tool on
