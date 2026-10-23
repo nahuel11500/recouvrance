@@ -82,17 +82,24 @@ impl AppView {
                 }
                 // Built-in sections first, then custom resources by group.
                 k8s::sort_for_sidebar(&mut kinds);
-                // Namespace listing may be forbidden; that is not fatal.
-                let mut namespaces = Vec::new();
-                for (name, c) in &clusters {
-                    // Accessible namespaces set for this cluster replace the listing.
-                    let accessible = crate::settings::cluster(name).namespaces;
-                    if accessible.is_empty() {
-                        namespaces.extend(k8s::namespaces(c.clone()).await.unwrap_or_default());
-                    } else {
-                        namespaces.extend(accessible);
-                    }
-                }
+                // Namespace listing may be forbidden; that is not fatal. All clusters at once,
+                // skipping those whose discovery failed: they would only wait out the timeout again.
+                let reached: HashSet<usize> = kind_clusters.values().flatten().copied().collect();
+                let listed =
+                    clusters.iter().enumerate().filter(|(ix, _)| reached.contains(ix)).map(|(_, (name, c))| {
+                        // Accessible namespaces set for this cluster replace the listing.
+                        let accessible = crate::settings::cluster(name).namespaces;
+                        let c = c.clone();
+                        async move {
+                            if accessible.is_empty() {
+                                k8s::namespaces(c).await.unwrap_or_default()
+                            } else {
+                                accessible
+                            }
+                        }
+                    });
+                let mut namespaces: Vec<String> =
+                    futures::future::join_all(listed).await.into_iter().flatten().collect();
                 namespaces.sort();
                 namespaces.dedup();
                 anyhow::Ok((client, kinds, kind_clusters, namespaces))
@@ -129,6 +136,7 @@ impl AppView {
                                 .or_else(|| fallback.clone());
                             tab.namespaces.retain(|ns| namespaces.contains(ns));
                         }
+                        this.settings_view.update(cx, |s, _| s.set_kinds(kinds.clone()));
                         this.kinds = kinds;
                         this.start_problem_watch(cx);
                         this.set_namespaces(namespaces, window, cx);

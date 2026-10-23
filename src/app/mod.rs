@@ -234,7 +234,11 @@ gpui_kit::actions!(
 );
 
 pub fn bind_keys(cx: &mut App) {
-    cx.bind_keys([
+    cx.bind_keys(key_bindings());
+}
+
+fn key_bindings() -> Vec<KeyBinding> {
+    vec![
         KeyBinding::new("ctrl-k", OpenPalette, None),
         KeyBinding::new("ctrl-shift-n", NewWindow, None),
         KeyBinding::new("ctrl-t", NewTab, None),
@@ -259,7 +263,9 @@ pub fn bind_keys(cx: &mut App) {
         // Only while the table has focus, so typing "/" elsewhere is untouched.
         KeyBinding::new("/", FocusFilter, Some("DataTable")),
         KeyBinding::new("enter", OpenSelected, Some("DataTable")),
-    ]);
+        // F5 goes to the program running in a terminal, like the other function keys.
+        KeyBinding::new("f5", NoAction, Some("Terminal")),
+    ]
 }
 
 /// Names of common objects across connected clusters, for the palette.
@@ -496,11 +502,19 @@ impl AppView {
                 }
                 _ => {}
             }),
+            // "System" follows the desktop switching between light and dark while the app runs.
+            cx.observe_window_appearance(window, |_, window, cx| {
+                let mode = system_theme(window.appearance());
+                if follows_system(cx) && mode.is_dark() != cx.theme().mode.is_dark() {
+                    apply_theme(mode, Some(window), cx);
+                }
+            }),
         ];
 
         // One agent hub and MCP server for the whole app, shared by its windows.
         if !cx.has_global::<SharedHub>() {
             let hub = Hub::load();
+            hub.claim_config();
             let _ = hub.apply_rules_file();
             hub.watch_rules_file();
             let server = mcp::server::start(hub.clone());
@@ -670,29 +684,30 @@ impl AppView {
         }
         // Same place in history, fresh data (links keep working: subscribe like the openers do).
         match &route {
-            Route::Cluster(p) => cx.subscribe_in(p, window, |this, _, ev: &OpenObject, window, cx| {
-                let ctx = ev.context.as_ref().and_then(|c| this.clusters.iter().position(|(n, _)| n == c)).unwrap_or(0);
-                this.open_object_in(ctx, &ev.kind, ev.name.clone(), ev.namespace.clone(), window, cx);
-            }),
-            Route::Workloads(p) => cx.subscribe_in(p, window, |this, _, ev: &OpenObject, window, cx| {
-                let ctx = ev.context.as_ref().and_then(|c| this.clusters.iter().position(|(n, _)| n == c)).unwrap_or(0);
-                this.open_object_in(ctx, &ev.kind, ev.name.clone(), ev.namespace.clone(), window, cx);
-            }),
-            Route::Problems(p) => cx.subscribe_in(p, window, |this, _, ev: &OpenObject, window, cx| {
-                let ctx = ev.context.as_ref().and_then(|c| this.clusters.iter().position(|(n, _)| n == c)).unwrap_or(0);
-                this.open_object_in(ctx, &ev.kind, ev.name.clone(), ev.namespace.clone(), window, cx);
-            }),
-            Route::Helm(p) => cx.subscribe_in(p, window, |this, _, ev: &OpenRelease, window, cx| {
-                let release = ev.0.clone();
-                let Some((context, client)) = this.clusters.iter().find(|(c, _)| *c == release.context).cloned() else {
-                    return;
-                };
-                let page = cx.new(|cx| HelmRelease::new(client, context, release, window, cx));
-                this.navigate(Route::HelmRelease(page), cx);
-            }),
+            Route::Cluster(p) => cx
+                .subscribe_in(p, window, |this, _, ev: &OpenObject, window, cx| {
+                    let ctx =
+                        ev.context.as_ref().and_then(|c| this.clusters.iter().position(|(n, _)| n == c)).unwrap_or(0);
+                    this.open_object_in(ctx, &ev.kind, ev.name.clone(), ev.namespace.clone(), window, cx);
+                })
+                .detach(),
+            Route::Workloads(p) => cx
+                .subscribe_in(p, window, |this, _, ev: &OpenObject, window, cx| {
+                    let ctx =
+                        ev.context.as_ref().and_then(|c| this.clusters.iter().position(|(n, _)| n == c)).unwrap_or(0);
+                    this.open_object_in(ctx, &ev.kind, ev.name.clone(), ev.namespace.clone(), window, cx);
+                })
+                .detach(),
+            Route::Problems(p) => cx
+                .subscribe_in(p, window, |this, _, ev: &OpenObject, window, cx| {
+                    let ctx =
+                        ev.context.as_ref().and_then(|c| this.clusters.iter().position(|(n, _)| n == c)).unwrap_or(0);
+                    this.open_object_in(ctx, &ev.kind, ev.name.clone(), ev.namespace.clone(), window, cx);
+                })
+                .detach(),
+            Route::Helm(p) => self.subscribe_helm(p, window, cx),
             _ => return,
         }
-        .detach();
         if let Some(slot) = self.history.get_mut(self.pos) {
             *slot = route;
         }
@@ -739,4 +754,20 @@ pub fn open_delete_settings(window: &mut Window, cx: &mut App) {
         this.settings_view.update(cx, |s, cx| s.show_general(cx));
         this.navigate(Route::Settings, cx);
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use gpui_kit::{KeyContext, Keymap, Keystroke};
+
+    #[test]
+    fn f5_reaches_the_terminal() {
+        let keymap = Keymap::new(super::key_bindings());
+        let f5 = [Keystroke::parse("f5").unwrap()];
+        let app = KeyContext::parse("App").unwrap();
+        let (bindings, _) = keymap.bindings_for_input(&f5, std::slice::from_ref(&app));
+        assert_eq!(bindings.len(), 1);
+        let (bindings, _) = keymap.bindings_for_input(&f5, &[app, KeyContext::parse("Terminal").unwrap()]);
+        assert!(bindings.is_empty());
+    }
 }

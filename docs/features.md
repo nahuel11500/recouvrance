@@ -9,14 +9,15 @@
   and a generic spec/status view for anything else.
 - **GPU usage**: utilization and memory per pod, workload, node and cluster, from NVIDIA's DCGM
   exporter (shown when its metrics are in Prometheus or VictoriaMetrics).
-- **Usage history** (last hour of CPU and memory against requests and limits) for pods and workloads, from the cluster's Prometheus, found automatically and read through the API server proxy. A workload's charts cover up to 300 of its pods, and its request and limit lines the same pods.
+- **Usage history** (last hour of CPU and memory against requests and limits) for pods and workloads, from the cluster's Prometheus, found automatically and read through the API server proxy. A workload's charts cover up to 300 of its running or pending pods, and its request and limit lines the same pods; once all its pods have finished (a completed Job), the charts show them without request and limit lines, as they may not have run together.
 - **Logs** across all pods of a workload (up to 50, running and newest first), level filter, time range, timeline histogram.
 - **Shell** (exec with a real terminal), **node shell** (privileged pod, deleted when its shell
   ends or its page goes away) and **port-forward** for pods and services; forwards are remembered
   and restored with one click. Shells and attach need write mode (they run commands in the
   cluster), and the context name typed on a protected context.
 - **RBAC-aware**: actions your Kubernetes RBAC forbids are disabled; *My access* shows a can-i
-  matrix for the namespace.
+  matrix for the namespace, and says when the cluster (webhook or cloud IAM authorizer) may allow
+  more than it lists.
 - **Problems**: one list of what is broken across clusters (crash loops, pending pods, unavailable workloads, NotReady nodes, failed jobs, pending volumes).
 - **Overviews**: cluster capacity and health, workloads status, Helm releases (values masked; install from your repos, roll back and uninstall through your `helm` CLI).
 - **API requests** (Settings → API requests): per cluster, how many requests of each kind
@@ -33,7 +34,8 @@
   type the name (the count, for several). By default, what comes back on its own (Pods, Jobs,
   ReplicaSets, Events…) is deleted right away; what takes data, machines or everything inside with
   it (Nodes, Namespaces, StatefulSets, Deployments, DaemonSets, PersistentVolumes and their claims,
-  CRDs) needs the name typed; anything else, custom resources included, asks. Every delete dialog
+  CRDs) needs the name typed; anything else, custom resources included, asks. A kind is added by
+  its name, plural or short name (`deploy`), checked against the connected clusters. Every delete dialog
   links to the setting. A protected context always asks for its name, and an object stuck
   terminating always shows the dialog, to remove its finalizers.
 - **Write mode** (off by default): click the `read-only` badge to enable scale, restart, delete
@@ -86,7 +88,7 @@
 | Ctrl+K | Command palette: resources, pages, contexts, objects |
 | Ctrl+Shift+N | New window |
 | Ctrl+T / Ctrl+W / Ctrl+Tab | New tab / close tab / next tab |
-| Ctrl+B / F5 | Hide the sidebar / refresh |
+| Ctrl+B / F5 | Hide the sidebar / refresh (in a terminal, F5 goes to the program) |
 | Alt+← / Alt+→ | Back / forward (Esc also goes back from a detail page) |
 | Ctrl+F or / | Filter the current table: `web` · `!Running` · `app=web` · `tier!=db` · `l:app` · `ns:team-*` · `/^api-\d+/` · `status:Running` · `restarts>3` · `cpu>200m` (all terms must match) |
 | Right-click a row | Open, logs, shell, YAML, events, copy name, favorite |

@@ -11,6 +11,15 @@ pub(super) fn container_names(value: &serde_json::Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Names of the workload pods the charts measure (see `prom::chart_pods`).
+fn chart_pod_names(pods: &[serde_json::Value]) -> Vec<String> {
+    crate::prom::chart_pods(pods)
+        .0
+        .into_iter()
+        .filter_map(|p| p.pointer("/metadata/name").and_then(|v| v.as_str()).map(String::from))
+        .collect()
+}
+
 /// Everything the overview links to or measures for one object.
 /// CPU (millicores) and memory (bytes) of a pod, workload (its pods) or node from Prometheus.
 pub(super) async fn history_for(
@@ -27,14 +36,7 @@ pub(super) async fn history_for(
     let (cpu, mem) = if kind.is("", "Node") {
         crate::prom::node_usage(client, target, name, minutes).await.ok()?
     } else {
-        let names: Vec<String> = if kind.is("", "Pod") {
-            vec![name.to_string()]
-        } else {
-            pods.iter()
-                .take(crate::prom::MAX_CHART_PODS)
-                .filter_map(|p| p.pointer("/metadata/name").and_then(|v| v.as_str()).map(String::from))
-                .collect()
-        };
+        let names: Vec<String> = if kind.is("", "Pod") { vec![name.to_string()] } else { chart_pod_names(pods) };
         if names.is_empty() {
             return None;
         }
@@ -78,14 +80,7 @@ pub(super) async fn gpu_history_for(
     if kind.is("", "Node") {
         return crate::prom::gpu_usage(client, target, crate::prom::GpuScope::Node(name), minutes).await;
     }
-    let names: Vec<String> = if kind.is("", "Pod") {
-        vec![name.to_string()]
-    } else {
-        pods.iter()
-            .take(crate::prom::MAX_CHART_PODS)
-            .filter_map(|p| p.pointer("/metadata/name").and_then(|v| v.as_str()).map(String::from))
-            .collect()
-    };
+    let names: Vec<String> = if kind.is("", "Pod") { vec![name.to_string()] } else { chart_pod_names(pods) };
     if names.is_empty() {
         return None;
     }
@@ -94,6 +89,7 @@ pub(super) async fn gpu_history_for(
 
 pub(super) async fn fetch_related(
     client: Client,
+    context: &str,
     kind: &k8s::Kind,
     ns: Option<String>,
     obj: &serde_json::Value,
@@ -162,7 +158,7 @@ pub(super) async fn fetch_related(
         return related;
     }
     if kind.is("policy", "PodDisruptionBudget") {
-        let sel = obj.pointer("/spec/selector").and_then(k8s::selector_string);
+        let Some(sel) = pdb_selector(obj) else { return related };
         let pods = k8s::list_values(client, k8s::ar_of::<core::Pod>(), Some(ns), sel).await;
         related.pods = related.noted("pods", pods);
         return related;
@@ -207,7 +203,7 @@ pub(super) async fn fetch_related(
     if kind.is("", "Pod") {
         let selector = None;
         // Metrics are optional (no metrics-server): no usage is not an error to show.
-        if crate::settings::get().metrics_enabled {
+        if crate::settings::metrics_on(context) {
             related.usage = k8s::container_usage(client.clone(), ns.clone(), selector).await.unwrap_or_default();
         }
         // ConfigMaps and Secrets the environment reads, to show resolved values.
@@ -298,7 +294,7 @@ pub(super) async fn fetch_related(
             let services =
                 k8s::list_values(client.clone(), k8s::ar_of::<core::Service>(), Some(ns.clone()), None).await;
             related.services = related.noted("services", services);
-            if crate::settings::get().metrics_enabled {
+            if crate::settings::metrics_on(context) {
                 related.usage =
                     k8s::container_usage(client.clone(), ns.clone(), Some(sel.clone())).await.unwrap_or_default();
             }
@@ -361,6 +357,12 @@ pub(super) async fn fetch_related(
     related
 }
 
+/// The pod selector of a PodDisruptionBudget, or `None` when it covers no pods: in
+/// policy/v1 a missing or null selector selects none, and only `{}` selects all.
+fn pdb_selector(obj: &serde_json::Value) -> Option<Option<String>> {
+    obj.pointer("/spec/selector").filter(|s| !s.is_null()).map(k8s::selector_string)
+}
+
 /// Does a pod spec use this Secret/ConfigMap (volumes, env, envFrom, pull secrets)?
 pub(super) fn references(spec: &serde_json::Value, name: &str, secret: bool) -> bool {
     let is = |v: Option<&serde_json::Value>| v.and_then(|v| v.as_str()) == Some(name);
@@ -387,4 +389,21 @@ pub(super) fn references(spec: &serde_json::Value, name: &str, secret: bool) -> 
     });
     let in_pull = secret && spec["imagePullSecrets"].as_array().into_iter().flatten().any(|p| is(p.get("name")));
     in_volumes || in_env || in_pull
+}
+
+#[cfg(test)]
+mod tests {
+    use super::pdb_selector;
+    use serde_json::json;
+
+    #[test]
+    fn pdb_without_selector_covers_no_pods() {
+        assert_eq!(pdb_selector(&json!({"spec": {"minAvailable": 1}})), None);
+        assert_eq!(pdb_selector(&json!({"spec": {"selector": null}})), None);
+        assert_eq!(pdb_selector(&json!({"spec": {"selector": {}}})), Some(None));
+        assert_eq!(
+            pdb_selector(&json!({"spec": {"selector": {"matchLabels": {"app": "web"}}}})),
+            Some(Some("app=web".into()))
+        );
+    }
 }

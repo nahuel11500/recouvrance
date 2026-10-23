@@ -57,6 +57,8 @@ pub struct SettingsView {
     cluster_inputs: Vec<(String, Entity<InputState>, Entity<InputState>)>,
     /// A kind to give its own delete confirmation (Enter adds it).
     delete_kind: Entity<InputState>,
+    /// The connected clusters' kinds, to check a kind typed in `delete_kind`.
+    kinds: Vec<crate::k8s::Kind>,
     hub: std::sync::Arc<crate::mcp::Hub>,
     _subs: Vec<Subscription>,
     /// Redraws API requests every 2 s while it is shown.
@@ -102,16 +104,24 @@ impl SettingsView {
             }
         }));
         let delete_kind = cx.new(|cx| InputState::new(window, cx).placeholder("Add a kind, e.g. Service"));
-        subs.push(cx.subscribe_in(&delete_kind, window, |_, state, ev: &InputEvent, window, cx| {
+        subs.push(cx.subscribe_in(&delete_kind, window, |this, state, ev: &InputEvent, window, cx| {
             if let InputEvent::PressEnter { .. } = ev {
-                let kind = state.read(cx).value().trim().to_string();
-                if !kind.is_empty() {
-                    settings::update(|s| {
-                        s.delete_confirm_kinds.entry(kind).or_insert(DeleteConfirm::Type);
-                    });
-                    state.update(cx, |s, cx| s.set_value("", window, cx));
-                    cx.notify();
+                let typed = state.read(cx).value().trim().to_string();
+                if typed.is_empty() {
+                    return;
                 }
+                // Saved as deletes look it up: `deploy` or `deployments` is `Deployment`.
+                let Some(kind) = crate::k8s::find_kind(&this.kinds, &typed).map(|k| k.ar.kind.clone()) else {
+                    use gpui_kit::component::{WindowExt as _, notification::Notification};
+                    let msg = format!("No kind \"{typed}\" on the connected clusters");
+                    window.push_notification(Notification::error(msg), cx);
+                    return;
+                };
+                settings::update(|s| {
+                    s.delete_confirm_kinds.entry(kind).or_insert(DeleteConfirm::Type);
+                });
+                state.update(cx, |s, cx| s.set_value("", window, cx));
+                cx.notify();
             }
         }));
         let section = match crate::app::dev_var("RECOUVRANCE_SECTION").as_deref() {
@@ -134,6 +144,7 @@ impl SettingsView {
             prometheus: Vec::new(),
             cluster_inputs: Vec::new(),
             delete_kind,
+            kinds: Vec::new(),
             hub,
             _subs: subs,
             _ticker: cx.spawn(async move |this, cx| {
@@ -263,6 +274,10 @@ impl SettingsView {
                 input.update(cx, |state, cx| state.set_value(saved, window, cx));
             }
         }
+    }
+
+    pub fn set_kinds(&mut self, kinds: Vec<crate::k8s::Kind>) {
+        self.kinds = kinds;
     }
 
     /// Open on the General section (where deletes are configured).
@@ -559,15 +574,17 @@ impl SettingsView {
             }
             Section::Appearance => {
                 let mode = theme.mode;
+                let system = crate::app::follows_system(cx);
+                let (light, dark) = (!system && !mode.is_dark(), !system && mode.is_dark());
                 v_flex()
                     .child(Self::row(
                         "Theme",
                         "Saved between runs. \"System\" follows your desktop.",
                         h_flex()
                             .gap_1()
-                            .child(Button::new("th-light").small().label("Light").selected(!mode.is_dark()).when(!mode.is_dark(), |b| b.primary()).when(mode.is_dark(), |b| b.outline()).on_click(|_, w, cx| crate::app::set_theme(ThemeMode::Light, Some(w), cx)))
-                            .child(Button::new("th-dark").small().label("Dark").selected(mode.is_dark()).when(mode.is_dark(), |b| b.primary()).when(!mode.is_dark(), |b| b.outline()).on_click(|_, w, cx| crate::app::set_theme(ThemeMode::Dark, Some(w), cx)))
-                            .child(Button::new("th-system").small().outline().label("System").on_click(|_, w, cx| {
+                            .child(Button::new("th-light").small().label("Light").selected(light).when(light, |b| b.primary()).when(!light, |b| b.outline()).on_click(|_, w, cx| crate::app::set_theme(ThemeMode::Light, Some(w), cx)))
+                            .child(Button::new("th-dark").small().label("Dark").selected(dark).when(dark, |b| b.primary()).when(!dark, |b| b.outline()).on_click(|_, w, cx| crate::app::set_theme(ThemeMode::Dark, Some(w), cx)))
+                            .child(Button::new("th-system").small().label("System").selected(system).when(system, |b| b.primary()).when(!system, |b| b.outline()).on_click(|_, w, cx| {
                                 crate::app::forget_theme_choice();
                                 let mode = crate::app::initial_theme(cx);
                                 crate::app::apply_theme(mode, Some(w), cx);

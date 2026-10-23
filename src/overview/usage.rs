@@ -36,11 +36,8 @@ pub(super) fn history(ctx: &Ctx, cx: &App) -> Option<Div> {
         return None;
     }
     // Requests and limits of the pods the charts measure.
-    let pods: Vec<&Value> = if ctx.kind.is("", "Pod") {
-        vec![ctx.obj]
-    } else {
-        ctx.related.pods.iter().take(crate::prom::MAX_CHART_PODS).collect()
-    };
+    let (pods, total): (Vec<&Value>, usize) =
+        if ctx.kind.is("", "Pod") { (vec![ctx.obj], 1) } else { crate::prom::chart_pods(&ctx.related.pods) };
     let is_node = ctx.kind.is("", "Node");
     // Nodes: requests of their pods, and what the node can give (allocatable) as the ceiling.
     let [cpu_req, cpu_lim, mem_req, mem_lim] = if is_node {
@@ -52,12 +49,15 @@ pub(super) fn history(ctx: &Ctx, cx: &App) -> Option<Div> {
             req("memory"),
             s(ctx.obj, "/status/allocatable/memory").map(k8s::parse_bytes),
         ]
+    } else if pods.len() > 1 && pods.iter().all(|p| crate::prom::finished(p)) {
+        // A finished workload's pods may have run one after the other: their sum is no line.
+        [None; 4]
     } else {
         totals(&pods)
     };
     let lim_word = if is_node { "allocatable" } else { "limit" };
     // A node's charts measure the node, not its pods.
-    let title = if is_node { "Usage".into() } else { usage_title(pods.len(), ctx.related.pods.len()) };
+    let title = if is_node { "Usage".into() } else { usage_title(pods.len(), total) };
     let theme = cx.theme();
     let minutes = ctx.history_minutes;
     let chart = |title: &str,

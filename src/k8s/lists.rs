@@ -17,11 +17,12 @@ struct LeanList<T> {
 
 /// Every object of a kind, parsed into `T`: a struct with only the fields wanted
 /// (everything else is skipped while parsing, never held as JSON), listed in pages.
+/// Dropping the future stops the paging.
 pub async fn list_lean<T>(client: Client, ar: ApiResource, namespace: Option<String>) -> Result<Vec<T>>
 where
     T: serde::de::DeserializeOwned + Send + 'static,
 {
-    run(async move {
+    run_abortable(async move {
         let url = DynamicObject::url_path(&ar, namespace.as_deref());
         let mut lp = ListParams::default().limit(LEAN_PAGE);
         let mut out = Vec::new();

@@ -9,9 +9,10 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use kube::Client;
 
-use crate::k8s;
+use crate::k8s::{self, Rules};
 
-type Rules = Vec<(Vec<String>, Vec<String>, Vec<String>)>;
+/// "Who can": the grants found, and which lists could not be read.
+type WhoAnswer = (Vec<crate::rbac::Grant>, Option<String>);
 
 const VERBS: [&str; 7] = ["get", "list", "watch", "create", "update", "patch", "delete"];
 const RESOURCES: [&str; 16] = [
@@ -69,16 +70,28 @@ pub fn allows(rules: &Rules, verb: &str, resource: &str) -> bool {
     })
 }
 
+/// The namespace whose RoleBindings count for `group`/`resource`: none for a cluster-scoped
+/// kind (nodes, namespaces), which only ClusterRoleBindings grant.
+fn binding_namespace<'a>(kinds: &[k8s::Kind], group: &str, resource: &str, ns: Option<&'a str>) -> Option<&'a str> {
+    let base = resource.split('/').next().unwrap_or(resource);
+    let cluster_scoped = kinds.iter().any(|k| !k.namespaced && k.ar.group == group && k.ar.plural == base);
+    if cluster_scoped { None } else { ns }
+}
+
 pub struct AccessView {
     context: String,
     client: Client,
+    /// Discovered kinds, to tell cluster-scoped resources apart in "Who can".
+    kinds: Vec<k8s::Kind>,
     namespace: String,
     rules: Option<Result<Rules, String>>,
+    /// Set when the server says the rules may be incomplete (webhook or cloud IAM authorizer).
+    incomplete: Option<String>,
     /// "Who can": verb, resource, namespace inputs and the answer.
     who_verb: Entity<InputState>,
     who_resource: Entity<InputState>,
     who_ns: Entity<InputState>,
-    who: Option<Result<Vec<crate::rbac::Grant>, String>>,
+    who: Option<Result<WhoAnswer, String>>,
     who_busy: bool,
     _who_task: Option<Task<()>>,
     _subs: Vec<Subscription>,
@@ -89,6 +102,7 @@ impl AccessView {
     pub fn new(
         context: String,
         client: Client,
+        kinds: Vec<k8s::Kind>,
         namespace: Option<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -118,8 +132,12 @@ impl AccessView {
             .collect();
         let client2 = client.clone();
         let task = cx.spawn(async move |this, cx| {
-            let rules = k8s::my_rules(client2, ns).await.map_err(|e| format!("{e:#}"));
+            let (rules, incomplete) = match k8s::my_rules(client2, ns).await {
+                Ok((rules, note)) => (Ok(rules), note),
+                Err(e) => (Err(format!("{e:#}")), None),
+            };
             let _ = this.update(cx, |this, cx| {
+                this.incomplete = incomplete;
                 this.rules = Some(rules.map(|mut r| {
                     for (v, res, n) in r.iter_mut() {
                         v.sort();
@@ -138,8 +156,10 @@ impl AccessView {
         Self {
             context,
             client,
+            kinds,
             namespace,
             rules: None,
+            incomplete: None,
             who_verb,
             who_resource,
             who_ns,
@@ -156,15 +176,16 @@ impl AccessView {
         let verb = self.who_verb.read(cx).value().trim().to_string();
         let (group, resource) = crate::rbac::split_resource(self.who_resource.read(cx).value().as_ref());
         let ns = Some(self.who_ns.read(cx).value().trim().to_string()).filter(|n| !n.is_empty());
+        let rules_ns = binding_namespace(&self.kinds, &group, &resource, ns.as_deref()).map(String::from);
         let client = self.client.clone();
         self.who_busy = true;
         cx.notify();
         self._who_task = Some(cx.spawn(async move |this, cx| {
             let snap = k8s::rbac_snapshot(client, ns.clone()).await;
-            let result = if snap.cluster_role_bindings.is_empty() && snap.cluster_roles.is_empty() {
-                Err("Could not list roles and bindings (your RBAC may not allow it).".to_string())
+            let result = if snap.no_bindings() {
+                Err(snap.load_note().unwrap_or_default())
             } else {
-                Ok(crate::rbac::who_can(&snap, &verb, &group, &resource, ns.as_deref()))
+                Ok((crate::rbac::who_can(&snap, &verb, &group, &resource, rules_ns.as_deref()), snap.load_note()))
             };
             let _ = this.update(cx, |this, cx| {
                 this.who = Some(result);
@@ -205,15 +226,22 @@ impl AccessView {
                             .on_click(cx.listener(|this, _, _, cx| this.ask_who(cx))),
                     ),
             )
+            .children(
+                self.who
+                    .as_ref()
+                    .and_then(|r| r.as_ref().ok())
+                    .and_then(|(_, note)| note.clone())
+                    .map(|note| div().text_xs().text_color(theme.warning).child(note)),
+            )
             .children(self.who.as_ref().map(|r| {
                 match r {
                     Err(e) => div().text_sm().text_color(theme.danger).child(e.clone()).into_any_element(),
-                    Ok(g) if g.is_empty() => div()
+                    Ok((g, _)) if g.is_empty() => div()
                         .text_sm()
                         .text_color(muted)
                         .child("Nobody, through RBAC bindings (cluster admins via system:masters are not listed).")
                         .into_any_element(),
-                    Ok(grants) => v_flex()
+                    Ok((grants, _)) => v_flex()
                         .id("who-results")
                         .max_h(px(320.))
                         .overflow_y_scroll()
@@ -377,13 +405,38 @@ impl Render for AccessView {
             .when(matches!(&self.rules, Some(Ok(r)) if full_access(r)), |d| {
                 d.child(div().text_sm().text_color(theme.warning).child("You have full access (* on *) here: Recouvrance's write mode and protected contexts are your safety net."))
             })
+            .children(self.incomplete.clone().map(|note| div().text_sm().text_color(theme.warning).child(note)))
             .child(body)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{allows, full_access};
+    use super::{allows, binding_namespace, full_access};
+    use crate::k8s::Kind;
+    use kube::discovery::ApiResource;
+
+    #[test]
+    fn cluster_scoped_kinds_ignore_role_bindings() {
+        let kind = |group: &str, plural: &str, namespaced: bool| Kind {
+            ar: ApiResource {
+                group: group.into(),
+                version: "v1".into(),
+                api_version: "v1".into(),
+                kind: plural.into(),
+                plural: plural.into(),
+            },
+            namespaced,
+            section: "Cluster",
+            label: plural.into(),
+        };
+        let kinds = vec![kind("", "nodes", false), kind("", "pods", true)];
+        assert_eq!(binding_namespace(&kinds, "", "nodes", Some("default")), None);
+        assert_eq!(binding_namespace(&kinds, "", "nodes/proxy", Some("default")), None);
+        assert_eq!(binding_namespace(&kinds, "", "pods", Some("default")), Some("default"));
+        // A kind discovery doesn't know keeps the namespace.
+        assert_eq!(binding_namespace(&kinds, "example.com", "nodes", Some("default")), Some("default"));
+    }
 
     #[test]
     fn core_wildcard_is_core_only() {

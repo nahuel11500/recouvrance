@@ -98,7 +98,7 @@ impl KubeMcp {
         let mut call = self.begin(&parts, "list_resources", args)?;
         let (client, kind) = self.kind(&call, &p.context, &p.kind).await?;
         let access = access_for(&kind, &p.context, "list", p.namespace.clone(), None);
-        self.authorize(&mut call, &access, p.namespace.is_none()).await?;
+        self.authorize_list(&mut call, &access, p.namespace.is_none()).await?;
         let (defs, rows) = match k8s::list_table(
             client,
             kind.clone(),
@@ -177,7 +177,7 @@ impl KubeMcp {
         let (client, kind) = self.kind(&call, &p.context, &p.kind).await?;
         require_ns(&call, &kind, &p.namespace)?;
         let access = access_for(&kind, &p.context, "get", p.namespace.clone(), Some(p.name.clone()));
-        self.authorize(&mut call, &access, false).await?;
+        self.authorize(&mut call, &access).await?;
         let reveal = kind.is("", "Secret") && {
             let a = access_for(&kind, &p.context, "reveal", p.namespace.clone(), Some(p.name.clone()));
             call.policy().decide(&a).mode == Mode::Allow
@@ -210,7 +210,7 @@ impl KubeMcp {
         let mut call = self.begin(&parts, "get_events", args)?;
         let (client, kind) = self.kind(&call, &p.context, "events").await?;
         let access = access_for(&kind, &p.context, "list", p.namespace.clone(), None);
-        self.authorize(&mut call, &access, p.namespace.is_none()).await?;
+        self.authorize_list(&mut call, &access, p.namespace.is_none()).await?;
         let mut fields = Vec::new();
         if let Some(n) = &p.name {
             fields.push(format!("involvedObject.name={n}"));
@@ -261,7 +261,7 @@ impl KubeMcp {
         let (client, kind) = self.kind(&call, &p.context, &p.kind).await?;
         require_ns(&call, &kind, &p.namespace)?;
         let access = access_for(&kind, &p.context, "get", p.namespace.clone(), Some(p.name.clone()));
-        self.authorize(&mut call, &access, false).await?;
+        self.authorize(&mut call, &access).await?;
         let ns = if kind.namespaced { p.namespace.clone() } else { None };
         let obj = ObjectRef { kind: kind.clone(), name: p.name.clone(), namespace: ns.clone(), uid: String::new() };
         let value = match k8s::get_object(client.clone(), obj.clone()).await {
@@ -382,7 +382,7 @@ impl KubeMcp {
         let mut call = self.begin(&parts, "top_pods", args)?;
         let (client, kind) = self.kind(&call, &p.context, "pods").await?;
         let access = access_for(&kind, &p.context, "list", p.namespace.clone(), None);
-        self.authorize(&mut call, &access, p.namespace.is_none()).await?;
+        self.authorize_list(&mut call, &access, p.namespace.is_none()).await?;
         let usage = match &p.namespace {
             Some(ns) => k8s::container_usage(client, ns.clone(), None)
                 .await
@@ -480,7 +480,7 @@ impl KubeMcp {
         let mut call = self.begin(&parts, "get_logs", args)?;
         let (client, kind) = self.kind(&call, &p.context, "pods").await?;
         let access = access_for(&kind, &p.context, "logs", Some(p.namespace.clone()), Some(p.pod.clone()));
-        self.authorize(&mut call, &access, false).await?;
+        self.authorize(&mut call, &access).await?;
         let lp = kube::api::LogParams {
             container: p.container,
             tail_lines: Some(p.tail_lines.unwrap_or(200).min(call.policy().max_log_lines) as i64),
@@ -506,7 +506,7 @@ impl KubeMcp {
     }
 
     #[tool(
-        description = "TLS certificates in kubernetes.io/tls Secrets with their names (SANs), issuer and expiry, soonest first. Needs `get` on secrets; private keys are never returned.",
+        description = "TLS certificates in kubernetes.io/tls Secrets with their names (SANs), issuer and expiry, soonest first (ones not valid yet before all). Needs `get` on secrets; private keys are never returned.",
         annotations(read_only_hint = true)
     )]
     async fn check_certificates(
@@ -518,7 +518,7 @@ impl KubeMcp {
         let mut call = self.begin(&parts, "check_certificates", args)?;
         let (client, kind) = self.kind(&call, &p.context, "secrets").await?;
         let access = access_for(&kind, &p.context, "get", p.namespace.clone(), None);
-        self.authorize(&mut call, &access, p.namespace.is_none()).await?;
+        self.authorize_list(&mut call, &access, p.namespace.is_none()).await?;
         let secrets = match k8s::list_values_fields(
             client,
             kind.ar.clone(),
@@ -531,7 +531,7 @@ impl KubeMcp {
             Ok(v) => v,
             Err(e) => return call.finish(Err(e)),
         };
-        let now = jiff::Timestamp::now().as_second();
+        let now = jiff::Timestamp::now();
         let mut rows: Vec<(i64, Vec<String>)> = Vec::new();
         for sec in &secrets {
             let ns = sec.pointer("/metadata/namespace").and_then(|v| v.as_str()).unwrap_or_default().to_string();
@@ -550,8 +550,10 @@ impl KubeMcp {
             // The leaf certificate is first in the chain.
             let Some(c) = crate::certs::parse_pem(&pem).into_iter().next() else { continue };
             // Rounded down: negative as soon as the date has passed.
-            let days = c.not_after.map(|t| (t.as_second() - now).div_euclid(86400)).unwrap_or(i64::MAX);
-            if p.within_days.is_some_and(|w| days > w) {
+            let days = c.not_after.map(|t| (t.as_second() - now.as_second()).div_euclid(86400)).unwrap_or(i64::MAX);
+            // Not valid yet: clients reject it now, so it is listed first whatever the window.
+            let early = c.not_yet_valid(now);
+            if !early && p.within_days.is_some_and(|w| days > w) {
                 continue;
             }
             let mut names = c.sans.clone();
@@ -561,14 +563,21 @@ impl KubeMcp {
                 names.push(format!("+{more}"));
             }
             rows.push((
-                days,
+                if early { i64::MIN } else { days },
                 vec![
                     ns,
                     name,
                     names.join(","),
                     c.issuer.clone(),
                     c.not_after.map(|t| t.strftime("%Y-%m-%d").to_string()).unwrap_or_default(),
-                    if days < 0 { format!("EXPIRED {}d ago", -days) } else { days.to_string() },
+                    if early {
+                        let from = c.not_before.map(|t| t.strftime("%Y-%m-%d").to_string()).unwrap_or_default();
+                        format!("NOT VALID UNTIL {from}")
+                    } else if days < 0 {
+                        format!("EXPIRED {}d ago", -days)
+                    } else {
+                        days.to_string()
+                    },
                 ],
             ));
         }
@@ -590,7 +599,7 @@ impl KubeMcp {
         let mut call = self.begin(&parts, "find_problems", args)?;
         let (client, pods) = self.kind(&call, &p.context, "pods").await?;
         let access = access_for(&pods, &p.context, "list", p.namespace.clone(), None);
-        self.authorize(&mut call, &access, p.namespace.is_none()).await?;
+        self.authorize_list(&mut call, &access, p.namespace.is_none()).await?;
         let kinds = match self.hub.client(&p.context).await {
             Ok((_, kinds)) => kinds,
             Err(e) => return call.finish(Err(e)),
@@ -640,7 +649,7 @@ impl KubeMcp {
         let mut call = self.begin(&parts, "usage_history", args)?;
         let (client, kind) = self.kind(&call, &p.context, &p.kind).await?;
         let access = access_for(&kind, &p.context, "get", Some(p.namespace.clone()), Some(p.name.clone()));
-        self.authorize(&mut call, &access, false).await?;
+        self.authorize(&mut call, &access).await?;
         let obj = ObjectRef {
             kind: kind.clone(),
             name: p.name.clone(),
@@ -673,6 +682,10 @@ impl KubeMcp {
                 Err(e) => return call.finish(Err(e)),
             }
         };
+        // Like the charts: pods not finished, at most as many as fit in the query.
+        let (pods, total) = crate::prom::chart_pods(&pods);
+        // A finished workload's pods may have run one after the other: no sum of requests.
+        let sum_specs = pods.len() <= 1 || !pods.iter().all(|p| crate::prom::finished(p));
         let names: Vec<String> = pods
             .iter()
             .filter_map(|p| p.pointer("/metadata/name").and_then(|v| v.as_str()).map(String::from))
@@ -700,7 +713,7 @@ impl KubeMcp {
                 .flat_map(|p| p.pointer("/spec/containers").and_then(|c| c.as_array()).cloned().unwrap_or_default())
                 .filter_map(|c| c.pointer(path).and_then(|v| v.as_str()).map(parse))
                 .collect();
-            (!vals.is_empty()).then(|| vals.iter().sum())
+            (sum_specs && !vals.is_empty()).then(|| vals.iter().sum())
         };
         let stats = |s: &crate::prom::Series, scale: f64, fmt: fn(f64) -> String| -> Vec<String> {
             let mut v: Vec<f64> = s.iter().map(|p| p.1 * scale).collect();
@@ -722,7 +735,8 @@ impl KubeMcp {
         mem_row.extend(stats(&mem, 1.0, k8s::format_bytes));
         mem_row.push(opt(sum("/resources/requests/memory", k8s::parse_bytes), k8s::format_bytes));
         mem_row.push(opt(sum("/resources/limits/memory", k8s::parse_bytes), k8s::format_bytes));
-        let header = format!("{} pod(s), last {minutes} minutes, summed over pods\n", names.len());
+        let of = if names.len() < total { format!(" of {total}") } else { String::new() };
+        let header = format!("{}{of} pod(s), last {minutes} minutes, summed over pods\n", names.len());
         call.finish(Ok(header
             + &format_table(&["", "MIN", "AVG", "P95", "MAX", "LAST", "REQUESTS", "LIMITS"], &[cpu_row, mem_row])))
     }

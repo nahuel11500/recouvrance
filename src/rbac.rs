@@ -10,6 +10,22 @@ pub struct Snapshot {
     pub cluster_roles: Vec<Value>,
     pub role_bindings: Vec<Value>,
     pub cluster_role_bindings: Vec<Value>,
+    /// Lists that could not be loaded: ("ClusterRoleBindings", "forbidden"), so a missing
+    /// list does not read as "nobody".
+    pub errors: Vec<(&'static str, String)>,
+}
+
+impl Snapshot {
+    /// "Could not list ClusterRoleBindings (forbidden), …", or None when every list loaded.
+    pub fn load_note(&self) -> Option<String> {
+        let failed: Vec<String> = self.errors.iter().map(|(list, e)| format!("{list} ({e})")).collect();
+        (!failed.is_empty()).then(|| format!("Could not list {}: this may be incomplete.", failed.join(", ")))
+    }
+
+    /// Whether neither RoleBindings nor ClusterRoleBindings could be listed.
+    pub fn no_bindings(&self) -> bool {
+        ["RoleBindings", "ClusterRoleBindings"].iter().all(|l| self.errors.iter().any(|(list, _)| list == l))
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -215,7 +231,24 @@ mod tests {
             cluster_role_bindings: vec![
                 json!({"metadata": {"name": "ops"}, "roleRef": {"kind": "ClusterRole", "name": "admin-ish"}, "subjects": [{"kind": "Group", "name": "ops"}]}),
             ],
+            errors: Vec::new(),
         }
+    }
+
+    #[test]
+    fn failed_lists_are_said() {
+        let mut s = snap();
+        assert_eq!(s.load_note(), None);
+        assert!(!s.no_bindings());
+        // A namespace admin: cluster-wide lists are forbidden, the namespace's still answer.
+        s.errors = vec![("ClusterRoles", "forbidden".into()), ("ClusterRoleBindings", "forbidden".into())];
+        assert!(!s.no_bindings());
+        assert_eq!(
+            s.load_note().as_deref(),
+            Some("Could not list ClusterRoles (forbidden), ClusterRoleBindings (forbidden): this may be incomplete.")
+        );
+        s.errors.push(("RoleBindings", "forbidden".into()));
+        assert!(s.no_bindings());
     }
 
     #[test]

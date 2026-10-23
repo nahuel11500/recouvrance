@@ -275,17 +275,33 @@ impl Policy {
             .collect()
     }
 
-    /// For an all-namespaces request that asks: the Allow rule that decides some rows, so the
-    /// request can still go ahead unapproved, showing only the allowed rows. An Allow that an
-    /// Ask or a Deny covers everywhere gives nothing.
+    /// The Ask rules a request in one namespace (or on one object) meets: what approving it
+    /// covers.
+    pub fn asks(&self, a: &Access) -> Vec<usize> {
+        (0..self.rules.len())
+            .filter(|&i| self.rules[i].effect == Mode::Ask && self.rules[i].matches(a, false))
+            .collect()
+    }
+
+    /// For a list request that asks, in one namespace or across all of them: the Allow rule
+    /// that decides some rows, so the request can still go ahead unapproved, showing only the
+    /// allowed rows. An Allow that an Ask or a Deny covers everywhere gives nothing.
     pub fn allow_somewhere(&self, a: &Access) -> Option<usize> {
         let mut probe = a.clone();
         probe.namespace = None;
+        let one_namespace = a.namespace.clone();
+        let covers = |r: &Rule| match &one_namespace {
+            Some(_) => r.matches(a, false),
+            None => r.matches(&probe, true),
+        };
         // An Allow rule's own patterns, taken as a namespace and a name (`*` then literal),
         // are matched by the rules that cover them; no namespace for cluster-scoped rows.
-        let rows = self.rules.iter().filter(|r| r.effect == Mode::Allow && r.matches(&probe, true)).flat_map(|r| {
-            let namespaces = r.namespaces.iter().map(|n| Some(n.trim().to_string())).chain([None]);
-            namespaces.flat_map(|ns| r.names.iter().map(move |n| (ns.clone(), n.trim().to_string())))
+        let rows = self.rules.iter().filter(|r| r.effect == Mode::Allow && covers(r)).flat_map(|r| {
+            let namespaces: Vec<Option<String>> = match &one_namespace {
+                Some(ns) => vec![Some(ns.clone())],
+                None => r.namespaces.iter().map(|n| Some(n.trim().to_string())).chain([None]).collect(),
+            };
+            namespaces.into_iter().flat_map(|ns| r.names.iter().map(move |n| (ns.clone(), n.trim().to_string())))
         });
         rows.into_iter().find_map(|(namespace, name)| {
             let v = self.decide(&Access { namespace, name: Some(name), ..probe.clone() });
@@ -602,9 +618,41 @@ pub struct Hub {
     /// rules.yaml: its last load error, and the modification time already applied.
     rules_error: Mutex<Option<String>>,
     rules_mtime: Mutex<Option<std::time::SystemTime>>,
+    /// The lock on agents.lock while the app or `serve` runs (see [`Hub::claim_config`]).
+    config_lock: Mutex<Option<std::fs::File>>,
+}
+
+fn config_lock_path() -> PathBuf {
+    config_dir().join("agents.lock")
+}
+
+/// Whether the app or `serve` is running: it keeps agents.json in memory and saves it
+/// whole, so a change written by another process would be lost.
+pub fn config_in_use() -> bool {
+    locked(&config_lock_path())
+}
+
+/// Whether another open file holds the lock on `path`.
+fn locked(path: &std::path::Path) -> bool {
+    let Ok(file) = std::fs::File::open(path) else { return false };
+    matches!(file.try_lock(), Err(std::fs::TryLockError::WouldBlock))
+}
+
+/// Lock `path` (created if missing) for as long as the returned file is open.
+fn take_lock(path: &std::path::Path) -> Option<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let file = std::fs::OpenOptions::new().create(true).truncate(false).write(true).mode(0o600).open(path).ok()?;
+    file.try_lock().ok()?;
+    Some(file)
 }
 
 impl Hub {
+    /// Mark agents.json as in use by this process until it exits (see [`config_in_use`]).
+    pub fn claim_config(&self) {
+        let _ = create_private_dir(&config_dir());
+        *lock(&self.config_lock) = take_lock(&config_lock_path());
+    }
+
     pub fn load() -> Arc<Self> {
         let mut config: Config = std::fs::read(config_dir().join("agents.json"))
             .ok()
@@ -630,6 +678,7 @@ impl Hub {
             recent_calls: Mutex::default(),
             rules_error: Mutex::default(),
             rules_mtime: Mutex::default(),
+            config_lock: Mutex::default(),
         })
     }
 
@@ -803,19 +852,22 @@ impl Hub {
         Ok(token)
     }
 
+    /// Change an agent. With rules.yaml in use, the change is written there first: if it
+    /// can't be (a rule the file can't hold), nothing changes.
     pub fn update_agent(&self, id: &str, f: impl FnOnce(&mut Agent)) -> Result<()> {
         {
             let mut cfg = write(&self.config);
-            let agent = cfg.agents.iter_mut().find(|a| a.id == id).context("unknown agent")?;
+            let mut agents = cfg.agents.clone();
+            let agent = agents.iter_mut().find(|a| a.id == id).context("unknown agent")?;
             f(agent);
+            // Visual edits keep rules.yaml in step when you use it.
+            if self.rules_file_active() && self.rules_error().is_none() {
+                rules_file::export(&agents).context("rules.yaml not updated")?;
+                *lock(&self.rules_mtime) = std::fs::metadata(rules_file::path()).and_then(|m| m.modified()).ok();
+            }
+            cfg.agents = agents;
         }
-        self.save()?;
-        // Visual edits keep rules.yaml in step when you use it.
-        if self.rules_file_active() && self.rules_error().is_none() {
-            rules_file::export(&self.config().agents)?;
-            *lock(&self.rules_mtime) = std::fs::metadata(rules_file::path()).and_then(|m| m.modified()).ok();
-        }
-        Ok(())
+        self.save()
     }
 
     pub fn delete_agent(&self, id: &str) -> Result<()> {
@@ -1201,6 +1253,32 @@ mod tests {
     }
 
     #[test]
+    fn approving_one_namespace_covers_every_ask_rule_there() {
+        let mut debug = rule(Mode::Ask, &["list"], &["pods"], &["*"], &["*"]);
+        debug.names = vec!["debug-*".into()];
+        let p = Policy {
+            rules: vec![
+                rule(Mode::Allow, &["list"], &["pods"], &["*"], &["*"]),
+                debug,
+                rule(Mode::Ask, &["list"], &["pods"], &["team-b"], &["*"]),
+            ],
+            ..Policy::default()
+        };
+        let team_b = access("c", "list", "pods", Some("team-b"), None);
+        assert_eq!(p.decide(&team_b), Verdict { mode: Mode::Ask, rule: Some(1) });
+        // Approved: debug pods and the other team-b pods alike.
+        assert_eq!(p.asks(&team_b), [1, 2]);
+        // Unapproved: every team-b row asks, nothing to fall back to...
+        assert_eq!(p.allow_somewhere(&team_b), None);
+        // ...but in team-a only the debug pods ask; the others can be shown.
+        let team_a = access("c", "list", "pods", Some("team-a"), None);
+        assert_eq!(p.decide(&team_a).mode, Mode::Ask);
+        assert_eq!(p.asks(&team_a), [1]);
+        assert_eq!(p.allow_somewhere(&team_a), Some(0));
+        assert_eq!(p.decide(&access("c", "list", "pods", Some("team-a"), Some("web"))).mode, Mode::Allow);
+    }
+
+    #[test]
     fn denied_names_leave_the_rest_of_a_list() {
         let mut deny = rule(Mode::Deny, &["*"], &["pods"], &["*"], &["*"]);
         deny.names = vec!["debug-*".into()];
@@ -1303,6 +1381,19 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("recouvrance-test-{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn a_running_hub_is_seen() {
+        let path = temp_dir().join("agents.lock");
+        assert!(!locked(&path));
+        let held = take_lock(&path).unwrap();
+        assert!(locked(&path));
+        // A second process (or hub) can't take it while it is held.
+        assert!(take_lock(&path).is_none());
+        drop(held);
+        assert!(!locked(&path));
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     fn entry(tool: &str) -> AuditEntry {

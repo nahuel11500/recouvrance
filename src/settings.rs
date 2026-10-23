@@ -119,6 +119,9 @@ pub struct Settings {
     pub clusters: std::collections::HashMap<String, ClusterSettings>,
     /// Folders whose kubeconfig files are all merged (watched for changes).
     pub kubeconfig_folders: Vec<String>,
+    /// Which kubeconfig file keeps a context name that several files have: the first one
+    /// seen. The others' contexts are `name@file`, whatever order the files are read in.
+    pub context_files: std::collections::BTreeMap<String, String>,
     /// Open the browser after a one-click port-forward on a web port.
     pub open_browser_on_forward: bool,
     /// Port-forwards started recently, newest first (offered again in the sidebar).
@@ -150,7 +153,16 @@ fn default_delete_confirm() -> std::collections::BTreeMap<String, DeleteConfirm>
 
 /// What deleting an object of this kind (`Pod`, `Node`…) asks first.
 pub fn delete_confirm(kind: &str) -> DeleteConfirm {
-    with(|s| s.delete_confirm_kinds.get(kind).copied().unwrap_or(s.delete_confirm))
+    with(|s| delete_confirm_in(s, kind))
+}
+
+/// The kind's own choice, else the default. Case is ignored: older versions saved kinds as typed.
+fn delete_confirm_in(s: &Settings, kind: &str) -> DeleteConfirm {
+    let own = s
+        .delete_confirm_kinds
+        .get(kind)
+        .or_else(|| s.delete_confirm_kinds.iter().find(|(k, _)| k.eq_ignore_ascii_case(kind)).map(|(_, level)| level));
+    own.copied().unwrap_or(s.delete_confirm)
 }
 
 /// A namespace chosen on a context: how often, and when last (unix seconds).
@@ -238,6 +250,7 @@ impl Default for Settings {
             extra_namespaces: Default::default(),
             clusters: Default::default(),
             kubeconfig_folders: Vec::new(),
+            context_files: Default::default(),
             open_browser_on_forward: true,
             recent_forwards: Vec::new(),
             delete_confirm: DeleteConfirm::Ask,
@@ -493,8 +506,8 @@ fn unix_now() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        DeleteConfirm, NamespaceVisit, Settings, load_json, migrate_list, recent_as_visits, record_visits, save_newest,
-        visit_score, write_atomic,
+        DeleteConfirm, NamespaceVisit, Settings, delete_confirm_in, load_json, migrate_list, recent_as_visits,
+        record_visits, save_newest, visit_score, write_atomic,
     };
 
     const DAY: i64 = 24 * 3600;
@@ -581,6 +594,15 @@ mod tests {
                 .unwrap();
         assert_eq!(s.delete_confirm, DeleteConfirm::Ask);
         assert_eq!(s.delete_confirm_kinds.len(), 1);
+    }
+
+    #[test]
+    fn a_kind_saved_in_lowercase_still_applies() {
+        let s: Settings =
+            serde_json::from_str(r#"{"delete_confirm": "off", "delete_confirm_kinds": {"deployment": "type"}}"#)
+                .unwrap();
+        assert_eq!(delete_confirm_in(&s, "Deployment"), DeleteConfirm::Type);
+        assert_eq!(delete_confirm_in(&s, "Service"), DeleteConfirm::Off);
     }
 
     #[test]
