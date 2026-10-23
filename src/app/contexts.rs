@@ -189,6 +189,7 @@ impl AppView {
         self.ns_picker.update(cx, |p, _| p.selected = kept.iter().cloned().collect());
         self.namespaces = kept;
         self.namespace = (self.namespaces.len() == 1).then(|| self.namespaces[0].clone());
+        self.update_assistant_scope(cx);
     }
 
     /// Reload the contexts when a kubeconfig file (or a watched folder) changes.
@@ -259,6 +260,7 @@ impl AppView {
         }
         self.namespaces = namespaces;
         self.namespace = (self.namespaces.len() == 1).then(|| self.namespaces[0].clone());
+        self.update_assistant_scope(cx);
     }
 }
 
