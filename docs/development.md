@@ -60,8 +60,8 @@ untrusted text: the table filter (`filter`), Kubernetes quantities (`quantity`) 
 which also checks that what the YAML view writes reads back as the same value). They build the
 app's own `src/filter_syntax.rs`, `src/quantity.rs`, `src/glob.rs` and `src/yaml.rs` through
 `#[path]`, so those files may only use std, regex and serde. ClusterFuzzLite runs them
-(`.clusterfuzzlite/`, `.github/workflows/fuzz.yml`): 5 minutes on a PR that touches the code, 30
-every week. Locally, with a nightly toolchain:
+(`.clusterfuzzlite/`, `.github/workflows/fuzz.yml`): 5 minutes after each push to `main` that
+touches the code, 30 every week. Locally, with a nightly toolchain:
 
 ```sh
 cargo install cargo-fuzz
