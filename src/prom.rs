@@ -222,6 +222,9 @@ fn form_urlencoded(pairs: &[(&str, &str)]) -> String {
     pairs.iter().map(|(k, v)| format!("{}={}", enc(k), enc(v))).collect::<Vec<_>>().join("&")
 }
 
+/// Pods a workload's usage charts cover at most: each name goes in the query URL.
+pub const MAX_CHART_PODS: usize = 300;
+
 /// A regex matching exactly these pod names, escaped for a PromQL string (`pod=~"…"`).
 pub fn pods_regex(pods: &[String]) -> String {
     pods.iter().map(|p| regex::escape(p).replace('\\', "\\\\")).collect::<Vec<_>>().join("|")

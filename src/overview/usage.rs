@@ -23,6 +23,11 @@ pub(super) fn totals(pods: &[&Value]) -> [Option<f64>; 4] {
     t
 }
 
+/// The usage heading; says so when the charts cover only some of the pods.
+fn usage_title(charted: usize, total: usize) -> String {
+    if charted < total { format!("Usage ({charted} of {total} pods)") } else { "Usage".into() }
+}
+
 pub(super) fn history(ctx: &Ctx, cx: &App) -> Option<Div> {
     let empty = (Vec::new(), Vec::new());
     let (cpu, mem) = ctx.related.history.as_ref().unwrap_or(&empty);
@@ -30,7 +35,12 @@ pub(super) fn history(ctx: &Ctx, cx: &App) -> Option<Div> {
     if !has_cpu_mem && ctx.related.gpu.is_none() {
         return None;
     }
-    let pods: Vec<&Value> = if ctx.kind.is("", "Pod") { vec![ctx.obj] } else { ctx.related.pods.iter().collect() };
+    // Requests and limits of the pods the charts measure.
+    let pods: Vec<&Value> = if ctx.kind.is("", "Pod") {
+        vec![ctx.obj]
+    } else {
+        ctx.related.pods.iter().take(crate::prom::MAX_CHART_PODS).collect()
+    };
     let is_node = ctx.kind.is("", "Node");
     // Nodes: requests of their pods, and what the node can give (allocatable) as the ceiling.
     let [cpu_req, cpu_lim, mem_req, mem_lim] = if is_node {
@@ -46,6 +56,8 @@ pub(super) fn history(ctx: &Ctx, cx: &App) -> Option<Div> {
         totals(&pods)
     };
     let lim_word = if is_node { "allocatable" } else { "limit" };
+    // A node's charts measure the node, not its pods.
+    let title = if is_node { "Usage".into() } else { usage_title(pods.len(), ctx.related.pods.len()) };
     let theme = cx.theme();
     let minutes = ctx.history_minutes;
     let chart = |title: &str,
@@ -74,7 +86,7 @@ pub(super) fn history(ctx: &Ctx, cx: &App) -> Option<Div> {
     );
     Some(
         v_flex()
-            .child(h_flex().items_end().child(heading("Usage")).child(div().flex_1()).child(div().pb_1().child(ranges)))
+            .child(h_flex().items_end().child(heading(&title)).child(div().flex_1()).child(div().pb_1().child(ranges)))
             .when(has_cpu_mem, |d| {
                 d.child(
                     h_flex()
@@ -265,4 +277,14 @@ pub(super) fn usage_card(
                 .child(div().text_xs().child(format!("Requests: {}", show(request))))
                 .child(div().text_xs().child(format!("Limits: {}", show(limit)))),
         )
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn usage_title_says_when_some_pods_are_left_out() {
+        assert_eq!(super::usage_title(1, 1), "Usage");
+        assert_eq!(super::usage_title(1, 0), "Usage");
+        assert_eq!(super::usage_title(300, 500), "Usage (300 of 500 pods)");
+    }
 }
