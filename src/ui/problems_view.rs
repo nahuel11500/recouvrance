@@ -160,6 +160,16 @@ impl ProblemsView {
     }
 }
 
+/// What the page says when nothing is found, and whether it is an all-clear: only when
+/// every cluster and kind could be read.
+fn nothing_found(errors: &[String]) -> (bool, &'static str) {
+    if errors.is_empty() {
+        (true, "Nothing broken right now.")
+    } else {
+        (false, "Nothing broken in what could be read.")
+    }
+}
+
 /// Every cluster's problems, worst first, and a line for each cluster with kinds it could
 /// not read: a kind refused is noted, and the others are still shown.
 fn merge(results: Vec<(String, problems::Scan)>) -> (Vec<(String, Problem)>, Vec<String>) {
@@ -236,13 +246,14 @@ impl Render for ProblemsView {
             )
             .children(self.errors.iter().map(|e| div().text_sm().text_color(theme.danger).child(e.clone())))
             .when(crit + warn + if self.show_info { info } else { 0 } == 0, |d| {
-                d.child(
-                    h_flex()
-                        .gap_2()
-                        .text_color(theme.success)
-                        .child(Icon::new(Lucide::CircleCheck))
-                        .child("Nothing broken right now."),
-                )
+                let (all_clear, text) = nothing_found(&self.errors);
+                if all_clear {
+                    d.child(
+                        h_flex().gap_2().text_color(theme.success).child(Icon::new(Lucide::CircleCheck)).child(text),
+                    )
+                } else {
+                    d.child(div().text_sm().text_color(theme.muted_foreground).child(text))
+                }
             })
             .child(
                 // Only the rows on screen are laid out: hundreds of problems made the page stutter.
@@ -263,6 +274,13 @@ impl Render for ProblemsView {
 #[cfg(test)]
 mod tests {
     use crate::problems::{Problem, Scan, Severity};
+
+    #[test]
+    fn no_all_clear_when_a_scan_failed() {
+        assert_eq!(super::nothing_found(&[]), (true, "Nothing broken right now."));
+        let errors = ["prod: connection refused".to_string()];
+        assert_eq!(super::nothing_found(&errors), (false, "Nothing broken in what could be read."));
+    }
 
     #[test]
     fn a_kind_refused_keeps_the_others() {

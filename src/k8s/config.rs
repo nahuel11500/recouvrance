@@ -935,7 +935,7 @@ mod merge_properties {
                     })
                     .collect();
                 let exists = |f: &str| listed.iter().any(|(p, _)| p == f);
-                let owners = name_owners(&mut kept, &listed, exists);
+                let owners = name_owners(&mut kept, &listed, exists, |_| true);
                 let read: Vec<(String, String, Kubeconfig)> = order
                     .iter()
                     .filter_map(|&i| match &states[i] {
