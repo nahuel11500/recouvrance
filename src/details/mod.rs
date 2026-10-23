@@ -155,6 +155,8 @@ pub struct DetailPanel {
     yaml: Entity<EditorState>,
     yaml_error: Option<SharedString>,
     object: Option<serde_json::Value>,
+    /// When the read of the object shown started.
+    object_started: Option<std::time::Instant>,
     /// YAML last put in the editor, to tell user edits from stale content.
     yaml_text: String,
     related: Related,
@@ -253,6 +255,7 @@ impl DetailPanel {
             yaml,
             yaml_error: None,
             object: None,
+            object_started: None,
             yaml_text: String::new(),
             related: Related::default(),
             compare_rev: None,
@@ -482,11 +485,12 @@ impl DetailPanel {
     /// editor's text even when it differs from what was last loaded (after saving it).
     pub(super) fn refresh_object(&mut self, reset_yaml: bool, window: &mut Window, cx: &mut Context<Self>) {
         let fut = k8s::get_object_opts(self.client.clone(), self.obj.clone(), true);
+        let started = std::time::Instant::now();
         // A newer one-shot read replaces this one.
         self.object_read.spawn_in(window, cx, fut, move |this, result, window, cx| {
             match result {
                 Ok(value) => {
-                    let taken = this.set_object(value, cx);
+                    let taken = this.set_object(value, started, cx);
                     if taken {
                         this.pod_logs_containers(window, cx);
                     }
@@ -584,6 +588,7 @@ impl DetailPanel {
                     }
                     Ok(false) => {}
                 }
+                let started = std::time::Instant::now();
                 let value = match k8s::get_object_opts(client.clone(), obj.clone(), true).await {
                     Ok(v) => v,
                     // Deleted: say so and stop asking.
@@ -599,7 +604,7 @@ impl DetailPanel {
                 let alive = this.update_in(cx, |this, window, cx| {
                     this.deleted = false;
                     let changed = this.object.as_ref() != Some(&value);
-                    if !changed || !this.set_object(value, cx) {
+                    if !changed || !this.set_object(value, started, cx) {
                         return;
                     }
                     this.pod_logs_containers(window, cx);
@@ -801,10 +806,13 @@ impl DetailPanel {
     /// Show this read of the object, unless it is older than the one shown: a periodic read
     /// that started before a write can arrive after the read made once it was done.
     /// Returns whether it was taken.
-    fn set_object(&mut self, value: serde_json::Value, cx: &mut Context<Self>) -> bool {
-        if self.object.as_ref().is_some_and(|shown| k8s::older_version(&value, shown)) {
+    fn set_object(&mut self, value: serde_json::Value, started: std::time::Instant, cx: &mut Context<Self>) -> bool {
+        if let (Some(shown), Some(shown_started)) = (&self.object, self.object_started)
+            && stale_read(&value, started, shown, shown_started)
+        {
             return false;
         }
+        self.object_started = Some(self.object_started.map_or(started, |s| s.max(started)));
         if self.obj.kind.is("apiextensions.k8s.io", "CustomResourceDefinition") {
             self.schema_rows = crate::overview::crd_rows(&value);
         }
@@ -895,6 +903,19 @@ fn own_pod_logs(name: &str, pod: &serde_json::Value) -> Vec<(String, Vec<String>
     vec![(name.to_string(), k8s::pod_containers(pod))]
 }
 
+/// Whether a read of the object is older than the one shown. The same object is compared
+/// by version; a different one (deleted and re-created under its name) by when each read
+/// started, so a slow read of the deleted object doesn't bring it back.
+fn stale_read(
+    read: &serde_json::Value,
+    started: std::time::Instant,
+    shown: &serde_json::Value,
+    shown_started: std::time::Instant,
+) -> bool {
+    let other = read.pointer("/metadata/uid") != shown.pointer("/metadata/uid");
+    k8s::older_version(read, shown) || (other && started < shown_started)
+}
+
 /// The uid of a read of the object when it isn't the one the page knows (which is empty
 /// for a page opened by name).
 fn new_uid(known: &str, read: &serde_json::Value) -> Option<String> {
@@ -912,7 +933,7 @@ impl Drop for DetailPanel {
 
 #[cfg(test)]
 mod tests {
-    use super::{DetailTab, new_uid, own_pod_logs, tab_named};
+    use super::{DetailTab, new_uid, own_pod_logs, stale_read, tab_named};
     use serde_json::json;
 
     #[test]
@@ -936,5 +957,22 @@ mod tests {
         assert_eq!(new_uid("", &read).as_deref(), Some("b"));
         assert_eq!(new_uid("b", &read), None);
         assert_eq!(new_uid("a", &json!({"metadata": {"name": "db-0"}})), None);
+    }
+
+    #[test]
+    fn a_slow_read_of_a_deleted_object_does_not_come_back() {
+        let early = std::time::Instant::now();
+        let late = early + std::time::Duration::from_secs(1);
+        let old = json!({"metadata": {"uid": "a", "resourceVersion": "5"}});
+        let new = json!({"metadata": {"uid": "b", "resourceVersion": "9"}});
+        // The re-created object is shown; the read of the old one started before it.
+        assert!(stale_read(&old, early, &new, late));
+        // A read that started later is the newer word on which object is there.
+        assert!(!stale_read(&old, late, &new, early));
+        assert!(!stale_read(&new, late, &old, early));
+        // The same object goes by version, whenever its read started.
+        let newer = json!({"metadata": {"uid": "a", "resourceVersion": "7"}});
+        assert!(!stale_read(&newer, early, &old, late));
+        assert!(stale_read(&old, late, &newer, early));
     }
 }
