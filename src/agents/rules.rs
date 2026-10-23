@@ -78,6 +78,18 @@ impl AgentsView {
                     .child(div().w(px(4.)).h(px(22.)).rounded_sm().bg(effect_color))
                     .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).child(format!("#{}", ix + 1)))
                     .child(effects)
+                    // Made by approving a request: unlike a plain Allow, it wins over Ask rules.
+                    .when(rule.approved && rule.effect == Mode::Allow, |d| {
+                        d.child(
+                            div()
+                                .px_1()
+                                .rounded_sm()
+                                .text_xs()
+                                .bg(theme.success.opacity(0.14))
+                                .text_color(theme.success)
+                                .child("approved: wins over Ask"),
+                        )
+                    })
                     .child(div().flex_1().child(Input::new(&inputs.note).small()))
                     .child(match rule.expires {
                         Some(t) if rule.expired() => div()

@@ -315,6 +315,20 @@ impl Policy {
         best(self.rules.iter().enumerate().filter(|(_, r)| r.matches(a, any_ns)))
     }
 
+    /// Rules pasted as JSON ("Copy rules" on another agent), None when there are none.
+    /// No pasted rule counts as approved: it would win over every Ask rule while looking
+    /// like any other Allow.
+    pub fn pasted(text: &str) -> Option<Policy> {
+        let mut p: Policy = serde_json::from_str(text).ok()?;
+        if p.rules.is_empty() {
+            return None;
+        }
+        for r in &mut p.rules {
+            r.approved = false;
+        }
+        Some(p)
+    }
+
     /// The context patterns of the non-expired Allow and Ask rules.
     pub fn context_patterns(&self) -> Vec<String> {
         self.rules.iter().filter(|r| r.effect != Mode::Deny && !r.expired()).flat_map(|r| r.contexts.clone()).collect()
@@ -1343,6 +1357,16 @@ mod tests {
         assert_eq!(p.decide(&access("c1", "restart", "deployments.apps", Some("team"), Some("api"))).mode, Mode::Deny);
         assert_eq!(p.decide(&access("c1", "delete", "deployments.apps", Some("team"), Some("web"))).mode, Mode::Deny);
         assert_eq!(p.decide(&access("c2", "restart", "deployments.apps", Some("team"), Some("web"))).mode, Mode::Deny);
+    }
+
+    #[test]
+    fn pasted_rules_are_not_approved() {
+        let approved = Rule { approved: true, ..rule(Mode::Allow, &["get"], &["*"], &["*"], &["*"]) };
+        let text = serde_json::to_string(&Policy { rules: vec![approved], ..Policy::default() }).unwrap();
+        assert!(text.contains("\"approved\":true"));
+        let p = Policy::pasted(&text).unwrap();
+        assert!(!p.rules[0].approved);
+        assert!(Policy::pasted(r#"{"rules": []}"#).is_none() && Policy::pasted("not json").is_none());
     }
 
     #[test]
