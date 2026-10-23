@@ -543,64 +543,81 @@ fn paste_bytes(text: &str, bracketed: bool) -> Vec<u8> {
     b
 }
 
-/// Bytes a terminal sends for a key press.
+/// Bytes a terminal sends for a key press, as xterm does: named keys carry the modifiers as a
+/// parameter (`ESC[1;5D` is Ctrl+Left), and Alt puts ESC before a key (Alt+Backspace).
 fn key_bytes(ks: &Keystroke, app_cursor: bool) -> Option<Vec<u8>> {
     let m = &ks.modifiers;
-    let arrow = |c: char| if app_cursor { format!("\x1bO{c}") } else { format!("\x1b[{c}") }.into_bytes();
+    // 1, plus 1 for Shift, 2 for Alt and 4 for Ctrl.
+    let p = 1 + u8::from(m.shift) + 2 * u8::from(m.alt) + 4 * u8::from(m.control);
+    // Arrows, Home, End and F1-F4; `ss3` is the unmodified form `ESC O x`.
+    let letter = |c: char, ss3: bool| {
+        let seq = if p > 1 {
+            format!("\x1b[1;{p}{c}")
+        } else if ss3 {
+            format!("\x1bO{c}")
+        } else {
+            format!("\x1b[{c}")
+        };
+        seq.into_bytes()
+    };
+    let tilde = |n: u8| if p > 1 { format!("\x1b[{n};{p}~") } else { format!("\x1b[{n}~") }.into_bytes();
+    let alt = |b: &[u8]| [if m.alt { &b"\x1b"[..] } else { &[] }, b].concat();
     let bytes = match ks.key.as_str() {
-        "enter" => b"\r".to_vec(),
-        "backspace" => b"\x7f".to_vec(),
+        "enter" => alt(b"\r"),
+        "backspace" if m.control => alt(b"\x08"),
+        "backspace" => alt(b"\x7f"),
         "tab" if m.shift => b"\x1b[Z".to_vec(),
-        "tab" => b"\t".to_vec(),
-        "escape" => b"\x1b".to_vec(),
-        "up" => arrow('A'),
-        "down" => arrow('B'),
-        "right" => arrow('C'),
-        "left" => arrow('D'),
-        "home" => arrow('H'),
-        "end" => arrow('F'),
-        "delete" => b"\x1b[3~".to_vec(),
-        "pageup" => b"\x1b[5~".to_vec(),
-        "pagedown" => b"\x1b[6~".to_vec(),
-        "insert" => b"\x1b[2~".to_vec(),
-        "f1" => b"\x1bOP".to_vec(),
-        "f2" => b"\x1bOQ".to_vec(),
-        "f3" => b"\x1bOR".to_vec(),
-        "f4" => b"\x1bOS".to_vec(),
-        "f5" => b"\x1b[15~".to_vec(),
-        "f6" => b"\x1b[17~".to_vec(),
-        "f7" => b"\x1b[18~".to_vec(),
-        "f8" => b"\x1b[19~".to_vec(),
-        "f9" => b"\x1b[20~".to_vec(),
-        "f10" => b"\x1b[21~".to_vec(),
-        "f11" => b"\x1b[23~".to_vec(),
-        "f12" => b"\x1b[24~".to_vec(),
-        "space" if m.control && !m.alt => vec![0],
+        "tab" => alt(b"\t"),
+        "escape" => alt(b"\x1b"),
+        "up" => letter('A', app_cursor),
+        "down" => letter('B', app_cursor),
+        "right" => letter('C', app_cursor),
+        "left" => letter('D', app_cursor),
+        "home" => letter('H', app_cursor),
+        "end" => letter('F', app_cursor),
+        "delete" => tilde(3),
+        "pageup" => tilde(5),
+        "pagedown" => tilde(6),
+        "insert" => tilde(2),
+        "f1" => letter('P', true),
+        "f2" => letter('Q', true),
+        "f3" => letter('R', true),
+        "f4" => letter('S', true),
+        "f5" => tilde(15),
+        "f6" => tilde(17),
+        "f7" => tilde(18),
+        "f8" => tilde(19),
+        "f9" => tilde(20),
+        "f10" => tilde(21),
+        "f11" => tilde(23),
+        "f12" => tilde(24),
+        "space" if m.control => alt(&[0]),
         // Copy in most Linux terminals: never an interrupt (there is no selection to copy).
         "c" if m.control && m.shift => return None,
-        key if m.control && !m.alt && key.len() == 1 => {
-            let c = key.as_bytes()[0].to_ascii_lowercase();
-            match c {
-                b'a'..=b'z' => vec![c - b'a' + 1],
-                b'[' => vec![0x1b],
-                b'\\' => vec![0x1c],
-                b']' => vec![0x1d],
-                b' ' | b'@' => vec![0],
-                _ => return None,
-            }
-        }
-        "space" => b" ".to_vec(),
+        key if m.control && key.len() == 1 => alt(&[ctrl_byte(key.as_bytes()[0])?]),
+        "space" => alt(b" "),
         _ => {
             let text = ks.key_char.clone()?;
-            let mut b = Vec::new();
-            if m.alt {
-                b.push(0x1b);
-            }
-            b.extend(text.into_bytes());
-            b
+            alt(text.as_bytes())
         }
     };
     Some(bytes)
+}
+
+/// What Ctrl with this key sends: a letter's control code, and xterm's codes for punctuation
+/// and digits (Ctrl+/ is 0x1f, Ctrl+2 is NUL, Ctrl+8 is DEL).
+fn ctrl_byte(key: u8) -> Option<u8> {
+    Some(match key.to_ascii_lowercase() {
+        c @ b'a'..=b'z' => c - b'a' + 1,
+        b' ' | b'@' | b'2' => 0,
+        b'[' | b'3' => 0x1b,
+        b'\\' | b'4' => 0x1c,
+        b']' | b'5' => 0x1d,
+        b'^' | b'6' => 0x1e,
+        b'/' | b'_' | b'-' | b'7' => 0x1f,
+        b'?' | b'8' => 0x7f,
+        _ => return None,
+    })
 }
 
 /// The whole lines in `delta` plus what was left over before; the rest is kept for the next event.
@@ -686,6 +703,33 @@ mod tests {
         let bytes = |k: &str| key_bytes(&Keystroke::parse(k).unwrap(), false);
         assert_eq!(bytes("ctrl-c"), Some(vec![3]));
         assert_eq!(bytes("ctrl-shift-c"), None);
+    }
+
+    #[test]
+    fn modifiers_reach_the_shell() {
+        let bytes = |k: &str| key_bytes(&Keystroke::parse(k).unwrap(), true).unwrap();
+        // Word moves and deletes in bash and zsh.
+        assert_eq!(bytes("ctrl-left"), b"\x1b[1;5D");
+        assert_eq!(bytes("ctrl-right"), b"\x1b[1;5C");
+        assert_eq!(bytes("alt-left"), b"\x1b[1;3D");
+        assert_eq!(bytes("alt-backspace"), b"\x1b\x7f");
+        assert_eq!(bytes("ctrl-backspace"), b"\x08");
+        assert_eq!(bytes("shift-home"), b"\x1b[1;2H");
+        assert_eq!(bytes("ctrl-shift-end"), b"\x1b[1;6F");
+        assert_eq!(bytes("ctrl-delete"), b"\x1b[3;5~");
+        assert_eq!(bytes("shift-pageup"), b"\x1b[5;2~");
+        assert_eq!(bytes("shift-f1"), b"\x1b[1;2P");
+        assert_eq!(bytes("ctrl-f5"), b"\x1b[15;5~");
+        assert_eq!(bytes("shift-tab"), b"\x1b[Z");
+        assert_eq!(bytes("ctrl-/"), [0x1f]);
+        assert_eq!(bytes("ctrl-2"), [0]);
+        assert_eq!(bytes("ctrl-6"), [0x1e]);
+        assert_eq!(bytes("ctrl-8"), [0x7f]);
+        assert_eq!(bytes("ctrl-alt-b"), b"\x1b\x02");
+        // Without modifiers, unchanged (application cursor mode here).
+        assert_eq!(bytes("left"), b"\x1bOD");
+        assert_eq!(bytes("backspace"), b"\x7f");
+        assert_eq!(bytes("delete"), b"\x1b[3~");
     }
 
     #[test]
