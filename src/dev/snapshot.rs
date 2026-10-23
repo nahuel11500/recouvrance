@@ -26,7 +26,7 @@ pub fn run(path: &str, wait: Duration) -> Result<()> {
         }
         let dark = std::env::var("RECOUVRANCE_DARK").is_ok();
         let mode = if dark { ThemeMode::Dark } else { ThemeMode::Light };
-        crate::app::apply_palette_only(mode, cx);
+        crate::app::apply_theme(mode, None, cx);
     });
     let mut app_view = None;
     let window = cx.open_window(size(px(1500.), px(920.)), |window, cx| {
@@ -312,7 +312,8 @@ drwxr-xr-x 1 root root 4096 Oct 15 \x1b[1;34m.\x1b[0m\r\n\
 
     cx.capture_screenshot(window.into())?.save(path)?;
     // RECOUVRANCE_FRAMES_END=<n>: time n full redraws of what is on screen at the end.
-    if let Some(n) = std::env::var("RECOUVRANCE_FRAMES_END").ok().and_then(|n| n.parse::<u32>().ok()) {
+    let frames = std::env::var("RECOUVRANCE_FRAMES_END").ok().and_then(|n| n.parse::<u32>().ok());
+    if let Some(n) = frames.filter(|&n| n > 0) {
         let mut times: Vec<Duration> = (0..n)
             .map(|_| {
                 let start = Instant::now();

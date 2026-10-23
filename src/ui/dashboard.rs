@@ -1,7 +1,7 @@
 //! Workloads overview: status bars per kind, recent warnings and restarts,
 //! and containers close to their limits.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use gpui_kit::component::{ActiveTheme as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
@@ -13,7 +13,7 @@ use kube::Client;
 use serde_json::Value;
 
 use crate::details::OpenObject;
-use crate::k8s::{self, ContainerUsage};
+use crate::k8s;
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 enum Tone {
@@ -400,7 +400,12 @@ struct PodStatusLite {
 async fn pod_details(client: &Client, ns: &Option<String>, context: &str) -> Result<(Vec<Restart>, Vec<Hot>), String> {
     let usage = async {
         match ns {
-            Some(ns) => k8s::container_usage(client.clone(), ns.clone(), None).await.unwrap_or_default(),
+            Some(ns) => k8s::container_usage(client.clone(), ns.clone(), None)
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(pod, u)| ((ns.clone(), pod), u))
+                .collect(),
             None => all_usage(client).await,
         }
     };
@@ -409,12 +414,14 @@ async fn pod_details(client: &Client, ns: &Option<String>, context: &str) -> Res
             .await
             .map_err(|e| k8s::lists::load_error(&e))
     };
-    let (pods, usage): (Result<Vec<PodDetail>, String>, ContainerUsage) = futures::join!(pods, usage);
+    let (pods, usage): (Result<Vec<PodDetail>, String>, PodUsage) = futures::join!(pods, usage);
     let pods = pods?;
     let hour_ago = jiff::Timestamp::now() - jiff::SignedDuration::from_secs(3600);
     let (mut restarts, mut hot) = (Vec::new(), Vec::new());
     for p in &pods {
-        let (namespace, pod) = (p.metadata.namespace.clone(), p.metadata.name.clone());
+        let key = (p.metadata.namespace.clone(), p.metadata.name.clone());
+        let usage = usage.get(&key);
+        let (namespace, pod) = key;
         for c in &p.status.container_statuses {
             if let Some(when) = ts(c, "/lastState/terminated/finishedAt").filter(|t| *t >= hour_ago) {
                 restarts.push(Restart {
@@ -430,7 +437,7 @@ async fn pod_details(client: &Client, ns: &Option<String>, context: &str) -> Res
         }
         for c in &p.spec.containers {
             let name = st(c, "/name");
-            let Some(&(cpu, mem)) = usage.get(&pod).and_then(|u| u.get(name)) else { continue };
+            let Some(&(cpu, mem)) = usage.and_then(|u| u.get(name)) else { continue };
             let cpu_limit = c.pointer("/resources/limits/cpu").and_then(Value::as_str).map(k8s::parse_cpu);
             let mem_limit = c.pointer("/resources/limits/memory").and_then(Value::as_str).map(k8s::parse_bytes);
             let near = |v: f64, l: Option<f64>| l.is_some_and(|l| l > 0.0 && v >= 0.95 * l);
@@ -716,26 +723,34 @@ fn section_error(errors: &[String], color: Hsla) -> Option<Div> {
     (!errors.is_empty()).then(|| div().text_xs().text_color(color).child(errors.join(", ")))
 }
 
+/// Container usage by (namespace, pod): the same pod name can be in several namespaces.
+type PodUsage = HashMap<(String, String), HashMap<String, (f64, f64)>>;
+
 /// Usage for every namespace in one call.
-async fn all_usage(client: &Client) -> ContainerUsage {
+async fn all_usage(client: &Client) -> PodUsage {
     let client = client.clone();
     k8s::run(async move {
         let list: Value =
             client.request(http::Request::get("/apis/metrics.k8s.io/v1beta1/pods").body(Vec::new())?).await?;
-        let mut out = ContainerUsage::new();
-        for item in list["items"].as_array().into_iter().flatten() {
-            let pod = st(item, "/metadata/name").to_string();
-            let entry = out.entry(pod).or_default();
-            for c in item["containers"].as_array().into_iter().flatten() {
-                let cpu = c.pointer("/usage/cpu").and_then(Value::as_str).map(k8s::parse_cpu).unwrap_or(0.0);
-                let mem = c.pointer("/usage/memory").and_then(Value::as_str).map(k8s::parse_bytes).unwrap_or(0.0);
-                entry.insert(st(c, "/name").to_string(), (cpu, mem));
-            }
-        }
-        Ok(out)
+        Ok(pod_usage(&list))
     })
     .await
     .unwrap_or_default()
+}
+
+/// A metrics.k8s.io pod list, by (namespace, pod) then container.
+fn pod_usage(list: &Value) -> PodUsage {
+    let mut out = PodUsage::new();
+    for item in list["items"].as_array().into_iter().flatten() {
+        let key = (st(item, "/metadata/namespace").to_string(), st(item, "/metadata/name").to_string());
+        let entry = out.entry(key).or_default();
+        for c in item["containers"].as_array().into_iter().flatten() {
+            let cpu = c.pointer("/usage/cpu").and_then(Value::as_str).map(k8s::parse_cpu).unwrap_or(0.0);
+            let mem = c.pointer("/usage/memory").and_then(Value::as_str).map(k8s::parse_bytes).unwrap_or(0.0);
+            entry.insert(st(c, "/name").to_string(), (cpu, mem));
+        }
+    }
+    out
 }
 
 impl Dashboard {
@@ -1018,7 +1033,7 @@ pub async fn debug_load(client: Client) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{Tbl, Tone, pod_counts, restart_ago};
+    use super::{Tbl, Tone, pod_counts, pod_usage, restart_ago};
     use crate::k8s;
 
     #[test]
@@ -1059,5 +1074,18 @@ mod tests {
         assert_eq!(restart_ago("3 (12m ago)").unwrap().as_secs(), 720);
         assert_eq!(restart_ago("1 (2d4h ago)").unwrap().as_secs(), 2 * 86400 + 4 * 3600);
         assert!(restart_ago("0").is_none());
+    }
+
+    #[test]
+    fn usage_keeps_namespaces_apart() {
+        let list = serde_json::json!({"items": [
+            {"metadata": {"name": "redis-0", "namespace": "a"},
+             "containers": [{"name": "redis", "usage": {"cpu": "100m", "memory": "1Mi"}}]},
+            {"metadata": {"name": "redis-0", "namespace": "b"},
+             "containers": [{"name": "redis", "usage": {"cpu": "900m", "memory": "2Mi"}}]},
+        ]});
+        let u = pod_usage(&list);
+        let cpu = |ns: &str| u[&(ns.to_string(), "redis-0".to_string())]["redis"].0;
+        assert_eq!((cpu("a"), cpu("b")), (100.0, 900.0));
     }
 }

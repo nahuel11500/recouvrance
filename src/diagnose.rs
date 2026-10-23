@@ -112,6 +112,19 @@ pub fn pod(pod: &Value, events: &[Ev], crash_logs: Option<&(String, String)>) ->
         let last = c.pointer("/lastState/terminated");
         let last_reason = last.map(|t| s(t, "/reason")).unwrap_or("");
         let last_code = last.and_then(|t| t["exitCode"].as_i64());
+        // Stopped with a failure now (a Job pod that does not restart, a failed init container).
+        let ended = c.pointer("/state/terminated");
+        let end_code = ended.and_then(|t| t["exitCode"].as_i64()).unwrap_or(0);
+        let end_reason = ended.map(|t| s(t, "/reason")).unwrap_or("");
+        let failed =
+            ended.is_some() && (end_code != 0 || !matches!(end_reason, "" | "Completed")) && phase != "Succeeded";
+        let memory_limit = || {
+            pod.pointer(if init { "/spec/initContainers" } else { "/spec/containers" })
+                .and_then(Value::as_array)
+                .and_then(|cs| cs.iter().find(|x| x["name"] == name))
+                .map(|x| s(x, "/resources/limits/memory").to_string())
+                .unwrap_or_default()
+        };
         match waiting {
             "ImagePullBackOff" | "ErrImagePull" | "InvalidImageName" => {
                 let image = s(c, "/image");
@@ -170,13 +183,8 @@ pub fn pod(pod: &Value, events: &[Ev], crash_logs: Option<&(String, String)>) ->
                 });
             }
             _ => {
-                if last_reason == "OOMKilled" && restarts > 0 {
-                    let limit = pod
-                        .pointer("/spec/containers")
-                        .and_then(Value::as_array)
-                        .and_then(|cs| cs.iter().find(|x| x["name"] == name))
-                        .map(|x| s(x, "/resources/limits/memory").to_string())
-                        .unwrap_or_default();
+                if last_reason == "OOMKilled" && restarts > 0 && !failed {
+                    let limit = memory_limit();
                     out.push(Finding {
                         level: Level::Warning,
                         title: format!("{} was killed for using too much memory", capital(&label)),
@@ -189,19 +197,38 @@ pub fn pod(pod: &Value, events: &[Ev], crash_logs: Option<&(String, String)>) ->
                 }
             }
         }
-        if s(c, "/state/terminated/reason") == "Error" && !init && phase != "Succeeded" {
-            let code = c.pointer("/state/terminated/exitCode").and_then(Value::as_i64).unwrap_or(0);
+        if failed {
+            let mut detail = format!("Exit code {end_code}");
+            if !matches!(end_reason, "" | "Error") {
+                detail.push_str(&format!(" ({end_reason})"));
+            }
+            match exit_meaning(end_code) {
+                "" => {}
+                m => detail.push_str(&format!(": {m}")),
+            }
+            detail.push('.');
+            let message = c.pointer("/state/terminated/message").and_then(Value::as_str).unwrap_or("").trim();
+            if !message.is_empty() {
+                detail.push_str(&format!(" {message}"));
+            }
+            let (title, hint) = match end_reason {
+                "OOMKilled" => {
+                    let limit = memory_limit();
+                    if !limit.is_empty() {
+                        detail.push_str(&format!(" Memory limit {limit}."));
+                    }
+                    ("was killed for using too much memory", "It ran out of memory: raise its memory limit.")
+                }
+                "ContainerCannotRun" | "StartError" => {
+                    ("could not start", "Check the command and args against what the image contains.")
+                }
+                _ => ("exited with an error", "Read its logs."),
+            };
             out.push(Finding {
                 level: Level::Critical,
-                title: format!("{} exited with an error", capital(&label)),
-                detail: format!(
-                    "Exit code {code}{}",
-                    match exit_meaning(code) {
-                        "" => String::new(),
-                        m => format!(": {m}"),
-                    }
-                ),
-                hint: "Read its logs.".into(),
+                title: format!("{} {title}", capital(&label)),
+                detail,
+                hint: hint.into(),
             });
         }
         // Running but not ready: probes.
@@ -391,5 +418,33 @@ mod tests {
         // Only the pod being deleted has a problem: nothing from it.
         let f = workload(&d, &[deleting, unready]);
         assert!(f[0].title.starts_with("Pod slow: "), "{f:?}");
+    }
+
+    #[test]
+    fn failed_containers_that_do_not_restart() {
+        // A Job pod OOM-killed once, never restarted.
+        let p = json!({"spec": {"nodeName": "n", "containers": [
+            {"name": "job", "resources": {"limits": {"memory": "64Mi"}}}]},
+            "status": {"phase": "Failed", "containerStatuses": [{
+            "name": "job", "restartCount": 0, "ready": false,
+            "state": {"terminated": {"exitCode": 137, "reason": "OOMKilled"}}}]}});
+        let f = pod(&p, &[], None);
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert_eq!(f[0].title, "Container job was killed for using too much memory");
+        assert!(f[0].detail.contains("64Mi"));
+        // A failed init container, and one that could not start.
+        let p = json!({"spec": {"nodeName": "n"}, "status": {"phase": "Failed",
+            "initContainerStatuses": [{"name": "migrate", "restartCount": 0,
+                "state": {"terminated": {"exitCode": 1, "reason": "Error"}}}],
+            "containerStatuses": [{"name": "app", "restartCount": 0,
+                "state": {"terminated": {"exitCode": 128, "reason": "ContainerCannotRun", "message": "exec: no such file"}}}]}});
+        let f = pod(&p, &[], None);
+        let titles: Vec<&str> = f.iter().map(|x| x.title.as_str()).collect();
+        assert_eq!(titles, ["Init container migrate exited with an error", "Container app could not start"]);
+        assert!(f[1].detail.contains("no such file"));
+        // Finished normally: nothing.
+        let p = json!({"spec": {"nodeName": "n"}, "status": {"phase": "Succeeded", "containerStatuses": [{
+            "name": "job", "restartCount": 0, "state": {"terminated": {"exitCode": 0, "reason": "Completed"}}}]}});
+        assert!(pod(&p, &[], None).is_empty());
     }
 }

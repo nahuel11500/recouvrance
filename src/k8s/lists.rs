@@ -38,6 +38,35 @@ where
     .await
 }
 
+/// Like `list_lean`, in one response from the API server's cache (`resourceVersion=0`):
+/// twice as fast as paging a big list, which the server reads again for each page. Parsed
+/// as it arrives on a blocking thread, so only the wanted fields are ever held. Pages
+/// instead when the server will not answer that way.
+pub async fn list_lean_cached<T>(client: Client, ar: ApiResource, namespace: Option<String>) -> Result<Vec<T>>
+where
+    T: serde::de::DeserializeOwned + Send + 'static,
+{
+    let (c, ar2, ns) = (client.clone(), ar.clone(), namespace.clone());
+    let whole = run(async move {
+        use tokio_util::compat::FuturesAsyncReadCompatExt as _;
+        let url = DynamicObject::url_path(&ar2, ns.as_deref());
+        let path = format!("{url}?resourceVersion=0&resourceVersionMatch=NotOlderThan");
+        let body = c.request_stream(http::Request::get(&path).body(Vec::new())?).await?;
+        let reader = tokio_util::io::SyncIoBridge::new(body.compat());
+        let list: LeanList<T> = tokio::task::spawn_blocking(move || {
+            serde_json::from_reader(std::io::BufReader::with_capacity(256 * 1024, reader))
+        })
+        .await??;
+        anyhow::ensure!(list.metadata.continue_.as_ref().is_none_or(|c| c.is_empty()), "the API server paged it");
+        Ok(list.items)
+    })
+    .await;
+    match whole {
+        Ok(items) => Ok(items),
+        Err(_) => list_lean(client, ar, namespace).await,
+    }
+}
+
 /// Why something could not be loaded, as a section header says it: "forbidden"
 /// (the user may not read it) or "failed: <the server's message>".
 pub fn load_error(e: &anyhow::Error) -> String {
