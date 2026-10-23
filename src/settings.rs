@@ -3,7 +3,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{LazyLock, Mutex, RwLock};
+use std::sync::{LazyLock, Mutex, OnceLock, RwLock};
 
 use serde::{Deserialize, Serialize};
 
@@ -264,6 +264,8 @@ static SETTINGS: LazyLock<RwLock<Settings>> = LazyLock::new(|| RwLock::new(load(
 static CHANGES: AtomicU64 = AtomicU64::new(0);
 /// The newest change on disk.
 static SAVED: Mutex<u64> = Mutex::new(0);
+/// Why the settings file, which exists, could not be read: nothing is saved over it.
+static LOAD_ERROR: OnceLock<String> = OnceLock::new();
 
 fn path() -> PathBuf {
     let base = std::env::var_os("XDG_CONFIG_HOME")
@@ -276,15 +278,36 @@ fn path() -> PathBuf {
 /// version) gets its default and the others, such as `protection`, are kept; the file
 /// is kept aside as `load_json` does.
 fn load() -> Settings {
-    let p = path();
-    let Ok(bytes) = std::fs::read(&p) else { return Settings::default() };
-    match serde_json::from_slice(&bytes) {
+    let (settings, error) = load_from(&path());
+    if let Some(e) = error {
+        eprintln!("{e}; using defaults, every context not set is protected, and nothing is saved");
+        let _ = LOAD_ERROR.set(e);
+    }
+    settings
+}
+
+/// The settings at `p`, or the defaults and why when the file exists but can't be read
+/// (permissions, a folder): then the file is left as it is.
+fn load_from(p: &Path) -> (Settings, Option<String>) {
+    let bytes = match std::fs::read(p) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (Settings::default(), None),
+        Err(e) => return (Settings::default(), Some(format!("{}: {e}", p.display()))),
+    };
+    let settings = match serde_json::from_slice(&bytes) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("{}: {e}; fields that don't read use their defaults ({})", p.display(), keep_aside(&p));
             by_field(&bytes).unwrap_or_default()
         }
-    }
+    };
+    (settings, None)
+}
+
+/// Why the settings file could not be read, if so: then this session saves nothing and
+/// every context not set counts as protected.
+pub fn load_error() -> Option<&'static str> {
+    LOAD_ERROR.get().map(String::as_str)
 }
 
 /// `T` from a JSON object, one field at a time: a field that does not read gets its
@@ -304,11 +327,18 @@ fn by_field<T: Serialize + serde::de::DeserializeOwned + Default>(bytes: &[u8]) 
     serde_json::from_value(merged).ok()
 }
 
-/// Read a JSON file; missing means the defaults. A file that does not parse is kept
-/// aside as `<name>.bad-<unix time>` (so it is not overwritten by the next save) and
-/// the defaults are used.
+/// Read a JSON file; missing means the defaults. A file that can't be read or does not
+/// parse is kept aside as `<name>.bad-<unix time>` (so it is not overwritten by the next
+/// save) and the defaults are used.
 pub fn load_json<T: serde::de::DeserializeOwned + Default>(path: &Path) -> T {
-    let Ok(bytes) = std::fs::read(path) else { return T::default() };
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return T::default(),
+        Err(e) => {
+            eprintln!("{}: {e}; using defaults ({})", path.display(), keep_aside(path));
+            return T::default();
+        }
+    };
     match serde_json::from_slice(&bytes) {
         Ok(v) => v,
         Err(e) => {
@@ -361,14 +391,17 @@ pub fn with<T>(f: impl FnOnce(&Settings) -> T) -> T {
     f(&SETTINGS.read().unwrap())
 }
 
-/// Change and save settings.
+/// Change and save settings (only kept for this session when the file could not be read,
+/// see `load_error`).
 pub fn update(f: impl FnOnce(&mut Settings)) {
     let (change, json) = {
         let mut s = SETTINGS.write().unwrap();
         f(&mut s);
         (CHANGES.fetch_add(1, Ordering::Relaxed) + 1, serde_json::to_vec_pretty(&*s))
     };
-    if let Ok(json) = json {
+    if let Ok(json) = json
+        && load_error().is_none()
+    {
         save_newest(&SAVED, change, || {
             let p = path();
             write_atomic(&p, &json).map_err(|e| eprintln!("{}: {e}", p.display())).is_ok()
@@ -400,10 +433,12 @@ pub fn expand(p: &str) -> PathBuf {
 /// Whether writes on this context need an extra typed confirmation. A context never set
 /// is guessed from the kubeconfig; one the kubeconfig does not have now (or a kubeconfig
 /// that can't be read, say while a tool rewrites it) can't be guessed, so it is protected.
+/// So is every context not set when the settings file can't be read.
 pub fn is_protected(context: &str) -> bool {
     migrate_protection();
     match with(|s| s.protection.get(context).copied()) {
         Some(chosen) => chosen,
+        None if load_error().is_some() => true,
         None => match crate::k8s::load_contexts() {
             Ok(c) => guess_protected(&c.names, &c.risky, context),
             Err(_) => true,
@@ -547,8 +582,8 @@ fn unix_now() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        DeleteConfirm, NamespaceVisit, Settings, by_field, delete_confirm_in, guess_protected, load_json, migrate_list,
-        recent_as_visits, record_visits, save_newest, visit_score, write_atomic,
+        DeleteConfirm, NamespaceVisit, Settings, by_field, delete_confirm_in, guess_protected, load_from, load_json,
+        migrate_list, recent_as_visits, record_visits, save_newest, visit_score, write_atomic,
     };
 
     #[test]
@@ -713,6 +748,28 @@ mod tests {
         // Missing: defaults, nothing created.
         let v: Vec<String> = load_json(&d.join("missing.json"));
         assert!(v.is_empty());
+        std::fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn a_settings_file_that_cant_be_read_is_left_alone() {
+        let d = scratch();
+        // A folder where the file should be: it exists, but can't be read.
+        let p = d.join("settings.json");
+        std::fs::create_dir_all(&p).unwrap();
+        let (s, error) = load_from(&p);
+        assert!(s.protection.is_empty());
+        assert!(error.is_some_and(|e| e.contains("settings.json")));
+        assert!(p.is_dir());
+        // Missing: the defaults, without an error.
+        let (_, error) = load_from(&d.join("missing.json"));
+        assert_eq!(error, None);
+        // Other files are kept aside, like one that does not parse.
+        let other = d.join("favorites.json");
+        std::fs::create_dir_all(&other).unwrap();
+        let v: Vec<String> = load_json(&other);
+        assert!(v.is_empty());
+        assert!(!other.exists());
         std::fs::remove_dir_all(d).unwrap();
     }
 

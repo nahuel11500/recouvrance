@@ -857,15 +857,16 @@ impl Render for SettingsView {
                     })),
             )
             .child(
-                v_flex()
-                    .id("settings-body")
-                    .flex_1()
-                    .min_w_0()
-                    .h_full()
-                    .overflow_y_scroll()
-                    .px_8()
-                    .py_6()
-                    .child(div().max_w(px(820.)).child(body)),
+                v_flex().id("settings-body").flex_1().min_w_0().h_full().overflow_y_scroll().px_8().py_6().child(
+                    div()
+                        .max_w(px(820.))
+                        .when_some(settings::load_error(), |d, e| {
+                            d.child(div().pb_4().text_sm().text_color(theme.danger).child(format!(
+                                "{e}. Using the defaults, with every context protected; changes are not saved."
+                            )))
+                        })
+                        .child(body),
+                ),
             )
     }
 }

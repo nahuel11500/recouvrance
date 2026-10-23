@@ -23,7 +23,10 @@ Recouvrance reads your kubeconfig like `kubectl` does and keeps its own settings
 
 A JSON file that can't be read is kept aside as `<name>.bad-<time>` so the next save doesn't
 overwrite it. In `settings.json`, only the keys that don't read get their default; the others,
-such as `protection`, are kept. When `agents.json` can't be read, the app starts with no agents and
+such as `protection`, are kept. A `settings.json` that exists but can't be read (say, owned by
+root after a run with `sudo`) is left alone: the app starts with the defaults, counts every context
+not set as protected, saves nothing until it is restarted with a readable file, and Settings says
+why. When `agents.json` can't be read, the app starts with no agents and
 agent access off, and the Agents page says why.
 
 ## Kubeconfig
