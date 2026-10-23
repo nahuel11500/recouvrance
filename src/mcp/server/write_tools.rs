@@ -123,8 +123,11 @@ impl KubeMcp {
             k8s::names::validate_name(&name).map_err(|e| call.fail(e))?;
             planned.push((kind, ns, name, doc));
         }
-        // What the user approves is the content, not only the names.
+        // What the user approves is the content, not only the names; the log keeps what each object was.
         call.approval_detail = Some(manifest_summary(&planned));
+        if let Some(args) = call.args.as_object_mut() {
+            args.insert("objects".into(), json!(manifest_objects(&planned)));
+        }
         for (kind, ns, name, _) in &planned {
             let access = access_for(kind, &p.context, "apply", ns.clone(), Some(name.clone()));
             self.authorize(&mut call, &access, false).await?;
@@ -133,8 +136,14 @@ impl KubeMcp {
         let mut out = Vec::new();
         for (kind, ns, _, doc) in planned {
             // Approvals for later objects can take minutes: access may be off by now.
-            if let Err(e) = self.ensure_active(&call) {
-                out.push(e);
+            if let Some(reason) = self.inactive(&call) {
+                // The log says what was applied before.
+                let detail = if out.is_empty() {
+                    reason.to_string()
+                } else {
+                    format!("{reason}; applied before: {}", out.join("; "))
+                };
+                out.push(call.deny(detail));
                 return Err(out.join("\n"));
             }
             match k8s::apply(client.clone(), kind, ns, doc, dry).await {

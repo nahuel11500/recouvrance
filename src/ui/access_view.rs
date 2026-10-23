@@ -40,6 +40,11 @@ fn split_rule(r: &str) -> (&str, &str) {
     r.split_once('.').unwrap_or((r, ""))
 }
 
+/// Whether a rule allows every verb on every resource in every group.
+fn full_access(rules: &Rules) -> bool {
+    rules.iter().any(|(v, res, _)| v.iter().any(|x| x == "*") && res.iter().any(|x| x == "*.*"))
+}
+
 /// Whether any rule (with no name restriction) allows `verb` on `resource` ("pods", "deployments.apps", "pods/log").
 pub fn allows(rules: &Rules, verb: &str, resource: &str) -> bool {
     let (res, group) = match resource.split_once('/') {
@@ -56,10 +61,6 @@ pub fn allows(rules: &Rules, verb: &str, resource: &str) -> bool {
     rules.iter().filter(|(_, _, names)| names.is_empty()).any(|(verbs, resources, _)| {
         verbs.iter().any(|v| v == "*" || v == verb)
             && resources.iter().any(|r| {
-                // A bare `*` stands for every resource in every group.
-                if r == "*" {
-                    return true;
-                }
                 let (rres, rgroup) = split_rule(r);
                 let res_ok = rres == "*" || rres == res || rres.strip_prefix("*/").is_some_and(|s| Some(s) == sub);
                 let group_ok = rgroup == "*" || rgroup == group;
@@ -373,7 +374,7 @@ impl Render for AccessView {
             .gap_4()
             .child(header)
             .child(self.render_who(cx))
-            .when(matches!(&self.rules, Some(Ok(r)) if r.iter().any(|(v, res, _)| v.iter().any(|x| x == "*") && res.iter().any(|x| x == "*"))), |d| {
+            .when(matches!(&self.rules, Some(Ok(r)) if full_access(r)), |d| {
                 d.child(div().text_sm().text_color(theme.warning).child("You have full access (* on *) here: Recouvrance's write mode and protected contexts are your safety net."))
             })
             .child(body)
@@ -382,7 +383,23 @@ impl Render for AccessView {
 
 #[cfg(test)]
 mod tests {
-    use super::allows;
+    use super::{allows, full_access};
+
+    #[test]
+    fn core_wildcard_is_core_only() {
+        // apiGroups [""] with resources ["*"]: every core resource, nothing in other groups.
+        let core = vec![(vec!["*".into()], vec!["*".into()], vec![])];
+        assert!(allows(&core, "delete", "pods"));
+        assert!(allows(&core, "get", "secrets"));
+        assert!(!allows(&core, "get", "deployments.apps"));
+        assert!(!allows(&core, "get", "roles.rbac.authorization.k8s.io"));
+        assert!(!full_access(&core));
+        // apiGroups ["*"] with resources ["*"].
+        let all = vec![(vec!["*".into()], vec!["*.*".into()], vec![])];
+        assert!(allows(&all, "delete", "pods"));
+        assert!(allows(&all, "delete", "deployments.apps"));
+        assert!(full_access(&all));
+    }
 
     #[test]
     fn matrix_from_rules() {

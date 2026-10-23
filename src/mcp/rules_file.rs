@@ -19,8 +19,8 @@
 //! A rule is `VERBS RESOURCES[/NAMES] [-n NAMESPACES] [--context CONTEXTS] [until TIME]`;
 //! lists are comma-separated, `*` globs work everywhere, an omitted part means `*`, and `-`
 //! is an empty list (the rule matches nothing until you fill it in).
-//! When the file exists it is the source of truth: the Agents page shows it read-only
-//! and Recouvrance reloads it when it changes.
+//! When the file exists it is the source of truth: Recouvrance reloads it when it changes,
+//! and edits on the Agents page are written back to it (its comments are not kept).
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -264,7 +264,7 @@ pub const HEADER: &str = "# Recouvrance agent rules. Deny wins, then ask, then a
 # A rule: VERBS RESOURCES[/NAMES] [-n NAMESPACES] [--context CONTEXTS] [until 2026-11-01]\n\
 # Lists are comma-separated and * globs work everywhere; an omitted part means *, and - means none.\n\
 # Verbs: get list logs reveal exec scale restart patch apply delete drain (or *).\n\
-# Recouvrance reloads this file when you save it; while it exists, the Agents page is read-only.\n";
+# Recouvrance reloads this file when you save it; edits on the Agents page rewrite it, without comments.\n";
 
 /// The file's text for these agents (refused when a rule cannot be written exactly).
 pub fn render(agents: &[super::Agent]) -> Result<String> {

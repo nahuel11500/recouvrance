@@ -26,12 +26,11 @@ pub(super) fn certificates(data: &serde_json::Map<String, Value>, base64: bool, 
     let now = jiff::Timestamp::now();
     Some(v_flex().child(heading(&format!("Certificates ({})", certs.len()))).children(certs.into_iter().map(
         |(key, c)| {
-            let days_left = c.not_after.map(|t| (t.as_second() - now.as_second()) / 86400);
-            let (state, color) = match days_left {
-                Some(d) if d < 0 => (format!("expired {} days ago", -d), theme.danger),
-                Some(d) if d < 14 => (format!("expires in {d} days"), theme.danger),
-                Some(d) if d < 30 => (format!("expires in {d} days"), theme.warning),
-                Some(d) => (format!("valid, {d} days left"), theme.success),
+            let (state, color) = match c.not_after.map(|t| days_left(t, now)) {
+                Some(d) if d < 0 => (format!("expired {} ago", days(-d)), theme.danger),
+                Some(d) if d < 14 => (format!("expires in {}", days(d)), theme.danger),
+                Some(d) if d < 30 => (format!("expires in {}", days(d)), theme.warning),
+                Some(d) => (format!("valid, {} left", days(d)), theme.success),
                 None => ("unknown validity".into(), theme.muted_foreground),
             };
             let date = |t: Option<jiff::Timestamp>| {
@@ -63,6 +62,15 @@ pub(super) fn certificates(data: &serde_json::Map<String, Value>, base64: bool, 
                 )
         },
     )))
+}
+
+/// Whole days until `t`, rounded down: negative as soon as it has passed.
+fn days_left(t: jiff::Timestamp, now: jiff::Timestamp) -> i64 {
+    (t.as_second() - now.as_second()).div_euclid(86400)
+}
+
+fn days(n: i64) -> String {
+    if n == 1 { "1 day".into() } else { format!("{n} days") }
 }
 
 /// A Secret's type and certificates; its keys are items of the page's list (`secret_entry`).
@@ -387,4 +395,19 @@ pub(super) fn namespace(ctx: &Ctx, cx: &App) -> Div {
         } else {
             quotas.into_any_element()
         })
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn expired_certificates_count_as_past() {
+        let now: jiff::Timestamp = "2026-01-10T12:00:00Z".parse().unwrap();
+        let at = |t: &str| super::days_left(t.parse().unwrap(), now);
+        assert_eq!(at("2026-01-10T09:00:00Z"), -1);
+        assert_eq!(at("2026-01-08T13:00:00Z"), -2);
+        assert_eq!(at("2026-01-10T15:00:00Z"), 0);
+        assert_eq!(at("2026-01-12T12:00:00Z"), 2);
+        assert_eq!(super::days(1), "1 day");
+        assert_eq!(super::days(0), "0 days");
+    }
 }

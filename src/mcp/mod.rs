@@ -266,6 +266,14 @@ impl Policy {
         best(candidates)
     }
 
+    /// For an all-namespaces request that asks: an Allow rule covering some namespace, so the
+    /// request can still go ahead unapproved, showing only the allowed rows.
+    pub fn allow_somewhere(&self, a: &Access) -> Option<usize> {
+        let mut probe = a.clone();
+        probe.namespace = None;
+        self.rules.iter().position(|r| r.effect == Mode::Allow && r.matches(&probe, true))
+    }
+
     fn decide_inner(&self, a: &Access, any_ns: bool) -> Verdict {
         best(self.rules.iter().enumerate().filter(|(_, r)| r.matches(a, any_ns)))
     }
@@ -1120,6 +1128,26 @@ mod tests {
         assert!(!p.context_allowed("prod"));
         assert_eq!(p.context_patterns(), [" Staging-*"]);
         assert!(any_glob(&p.context_patterns(), "staging-eu"));
+    }
+
+    #[test]
+    fn all_namespaces_fall_back_to_the_allowed_ones() {
+        let p = Policy {
+            rules: vec![
+                rule(Mode::Allow, &["list"], &["pods"], &["team-a"], &["*"]),
+                rule(Mode::Ask, &["list"], &["pods"], &["team-b"], &["*"]),
+            ],
+            ..Policy::default()
+        };
+        let all = access("c", "list", "pods", None, None);
+        assert_eq!(p.decide_any_namespace(&all).mode, Mode::Ask);
+        assert_eq!(p.allow_somewhere(&all), Some(0));
+        // Unapproved, rows are filtered: team-b asks, so it is hidden.
+        assert_eq!(p.decide(&access("c", "list", "pods", Some("team-a"), Some("x"))).mode, Mode::Allow);
+        assert_eq!(p.decide(&access("c", "list", "pods", Some("team-b"), Some("x"))).mode, Mode::Ask);
+        let only_ask = Policy { rules: vec![p.rules[1].clone()], ..Policy::default() };
+        assert_eq!(only_ask.allow_somewhere(&all), None);
+        assert_eq!(p.allow_somewhere(&access("c", "list", "secrets", None, None)), None);
     }
 
     #[test]
