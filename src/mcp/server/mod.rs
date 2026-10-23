@@ -440,6 +440,7 @@ fn access_for(kind: &Kind, context: &str, verb: &str, namespace: Option<String>,
         resource_aliases: vec![kind.ar.plural.clone(), kind.ar.kind.to_lowercase()],
         namespace: if kind.namespaced { namespace } else { None },
         name,
+        cluster_scoped: !kind.namespaced,
     }
 }
 
