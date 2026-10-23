@@ -55,26 +55,36 @@ pub async fn events_for(client: Client, obj: ObjectRef) -> Result<Vec<EventLine>
         };
         let lp = ListParams::default().fields(&fields);
         let mut items = api.list(&lp).await?.items;
-        let when = |e: &Event| {
-            e.last_timestamp
-                .as_ref()
-                .map(|t| t.0.to_string())
-                .or_else(|| e.event_time.as_ref().map(|t| t.0.to_string()))
-                .unwrap_or_default()
-        };
-        items.sort_by_key(|e| std::cmp::Reverse(when(e)));
+        items.sort_by_key(|e| std::cmp::Reverse(event_last(e)));
         Ok(items
             .iter()
             .map(|e| EventLine {
-                age: when(e).parse::<jiff::Timestamp>().map(age).unwrap_or_default(),
+                age: event_last(e).map(age).unwrap_or_default(),
                 kind: e.type_.clone().unwrap_or_default(),
                 reason: e.reason.clone().unwrap_or_default(),
                 message: e.message.clone().unwrap_or_default(),
-                count: e.count.unwrap_or(1),
+                count: event_count(e),
             })
             .collect())
     })
     .await
+}
+
+/// When an event last happened. Events recorded through events.k8s.io (kube-scheduler,
+/// for example) keep their repeats in `series`.
+fn event_last(e: &Event) -> Option<jiff::Timestamp> {
+    e.series
+        .as_ref()
+        .and_then(|s| s.last_observed_time.as_ref())
+        .map(|t| t.0)
+        .or_else(|| e.last_timestamp.as_ref().map(|t| t.0))
+        .or_else(|| e.event_time.as_ref().map(|t| t.0))
+        .or_else(|| e.metadata.creation_timestamp.as_ref().map(|t| t.0))
+}
+
+/// How many times an event happened, its `series` included.
+fn event_count(e: &Event) -> i32 {
+    e.series.as_ref().and_then(|s| s.count).unwrap_or(0).max(e.count.unwrap_or(0)).max(1)
 }
 
 /// The field selector for an object's events: by uid when it is known, else by kind
@@ -349,6 +359,28 @@ mod tests {
         });
         assert_eq!(super::pod_containers(&pod), ["app", "linkerd-proxy"]);
         assert!(super::pod_containers(&serde_json::json!({})).is_empty());
+    }
+
+    #[test]
+    fn event_series_count_and_time() {
+        let event = |v: serde_json::Value| serde_json::from_value::<k8s_openapi::api::core::v1::Event>(v).unwrap();
+        let e = event(serde_json::json!({
+            "metadata": {"name": "web.1", "creationTimestamp": "2024-01-01T00:00:00Z"},
+            "involvedObject": {},
+            "eventTime": "2024-01-01T00:00:00.000000Z",
+            "series": {"count": 300, "lastObservedTime": "2024-01-01T02:00:00.000000Z"},
+        }));
+        assert_eq!(super::event_count(&e), 300);
+        assert_eq!(super::event_last(&e), "2024-01-01T02:00:00Z".parse().ok());
+        let e = event(serde_json::json!({
+            "metadata": {"name": "web.2"},
+            "involvedObject": {},
+            "count": 4,
+            "lastTimestamp": "2024-01-01T01:00:00Z",
+        }));
+        assert_eq!(super::event_count(&e), 4);
+        assert_eq!(super::event_last(&e), "2024-01-01T01:00:00Z".parse().ok());
+        assert_eq!(super::event_count(&event(serde_json::json!({"metadata": {}, "involvedObject": {}}))), 1);
     }
 
     #[test]
