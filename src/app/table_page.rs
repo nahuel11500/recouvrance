@@ -582,7 +582,7 @@ impl AppView {
         cx: &mut Context<Self>,
     ) -> bool {
         let Some(kind) = self.kind.clone() else { return false };
-        self.table.update(cx, |t, _| t.delegate_mut().selected_uid = Some(row.uid.clone()));
+        self.table.update(cx, |t, _| t.delegate_mut().selected = Some((ctx, row.uid.clone())));
         if follow_event && kind.is("", "Event") {
             let target = self.table.read(cx).delegate().cells_text(&row, "Object").map(String::from);
             if let Some((k, name)) = target.as_deref().and_then(|o| o.split_once('/')) {

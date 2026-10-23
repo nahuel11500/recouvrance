@@ -107,22 +107,19 @@ impl TableDelegate for ResourceTable {
         let col = self.cols[col_ix];
         if col == Col::Check {
             let uid = row.uid.clone();
-            let checked = self.marked.contains(&uid);
+            let checked = self.is_marked(ctx, &uid);
             return div()
-                .id(SharedString::from(format!("mark-{uid}")))
+                .id(SharedString::from(format!("mark-{ctx}-{uid}")))
                 .size_full()
                 .flex()
                 .items_center()
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .on_click(cx.listener(move |t, _, _, cx| {
-                    let marked = &mut t.delegate_mut().marked;
-                    if !marked.remove(&uid) {
-                        marked.insert(uid.clone());
-                    }
+                    t.delegate_mut().toggle_mark(ctx, &uid);
                     cx.stop_propagation();
                     cx.notify();
                 }))
-                .child(Checkbox::new(SharedString::from(format!("cb-{}", row.uid))).checked(checked))
+                .child(Checkbox::new(SharedString::from(format!("cb-{ctx}-{}", row.uid))).checked(checked))
                 .into_any_element();
         }
         if let (Col::Cpu | Col::Memory, Some(cap)) = (col, self.capacity_of(ctx, row))

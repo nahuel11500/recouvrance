@@ -53,7 +53,8 @@ pub struct ResourceTable {
     /// `filter`, parsed once (not on every update of the rows).
     parsed: RowFilter,
     sort: Option<(Col, ColumnSort)>,
-    pub selected_uid: Option<String>,
+    /// The selected row: (context index, uid).
+    pub selected: Option<(usize, String)>,
     usage: Option<HashMap<usize, UsageIndex>>,
     /// Pods' requests and limits by context, namespace and name, for their usage bars.
     resources: HashMap<usize, HashMap<String, HashMap<String, k8s::PodResources>>>,
@@ -68,8 +69,9 @@ pub struct ResourceTable {
     pub pods: bool,
     /// Which write actions the row menu offers for this kind.
     pub row_actions: Vec<&'static str>,
-    /// Rows checked for bulk actions, by uid.
-    pub marked: std::collections::HashSet<String>,
+    /// Rows checked for bulk actions: uids by context index (a fast first load's
+    /// stand-in uids are the same on every cluster).
+    pub marked: HashMap<usize, std::collections::HashSet<String>>,
     /// Saved column widths by header (at zoom 1).
     pub widths: HashMap<String, f32>,
     /// The first full list has not arrived yet.
@@ -102,7 +104,7 @@ impl ResourceTable {
             filter: String::new(),
             parsed: RowFilter::parse(""),
             sort: None,
-            selected_uid: None,
+            selected: None,
             usage: None,
             resources: HashMap::new(),
             ns_filter: None,
@@ -167,11 +169,24 @@ impl ResourceTable {
         matches!(c, Col::Check | Col::Context | Col::Namespace | Col::Cell(0))
     }
 
+    /// Whether the row of this context and uid is checked.
+    pub fn is_marked(&self, ctx: usize, uid: &str) -> bool {
+        self.marked.get(&ctx).is_some_and(|m| m.contains(uid))
+    }
+
+    /// Check or uncheck a row.
+    pub fn toggle_mark(&mut self, ctx: usize, uid: &str) {
+        let m = self.marked.entry(ctx).or_default();
+        if !m.remove(uid) {
+            m.insert(uid.to_string());
+        }
+    }
+
     /// Checked rows that pass the filter, with their context index.
     pub fn marked_visible_rows(&self) -> Vec<(usize, Arc<Row>)> {
         self.visible
             .iter()
-            .filter(|&&i| self.marked.contains(&self.rows[i].uid))
+            .filter(|&&i| self.is_marked(self.row_ctx[i], &self.rows[i].uid))
             .map(|&i| (self.row_ctx[i], self.rows[i].clone()))
             .collect()
     }
@@ -186,7 +201,7 @@ impl ResourceTable {
         self.rows
             .iter()
             .zip(&self.row_ctx)
-            .filter(|(r, _)| self.marked.contains(&r.uid))
+            .filter(|(r, c)| self.is_marked(**c, &r.uid))
             .map(|(r, c)| (*c, r.clone()))
             .collect()
     }
@@ -209,11 +224,14 @@ impl ResourceTable {
 
     /// Check every row that passes the filter, or uncheck all if they all are.
     pub fn toggle_all_visible(&mut self) {
-        let all = !self.visible.is_empty() && self.visible.iter().all(|&i| self.marked.contains(&self.rows[i].uid));
+        let all = !self.visible.is_empty()
+            && self.visible.iter().all(|&i| self.is_marked(self.row_ctx[i], &self.rows[i].uid));
         if all {
             self.marked.clear();
         } else {
-            self.marked.extend(self.visible.iter().map(|&i| self.rows[i].uid.clone()));
+            for &i in &self.visible {
+                self.marked.entry(self.row_ctx[i]).or_default().insert(self.rows[i].uid.clone());
+            }
         }
     }
 
@@ -398,47 +416,48 @@ impl ResourceTable {
 
     /// Rows of a big list's fast first load stand in namespace/name for the uid
     /// (`Row::is_partial`): once the full rows bring the real uids, checks, the
-    /// selection and the row menu move to them.
+    /// selection and the row menu move to them, each on its own cluster's row.
     fn follow_real_uids(&mut self) {
-        let menu = self.menu_row.as_ref().map(|(_, uid)| uid);
-        let wanted: Vec<String> =
-            self.marked.iter().chain(&self.selected_uid).chain(menu).filter(|u| u.contains('/')).cloned().collect();
+        let checked = self.marked.iter().flat_map(|(c, m)| m.iter().map(move |u| (*c, u)));
+        let picked = self.selected.iter().chain(&self.menu_row).map(|(c, u)| (*c, u));
+        let wanted: Vec<(usize, String)> =
+            checked.chain(picked).filter(|(_, u)| u.contains('/')).map(|(c, u)| (c, u.clone())).collect();
         if wanted.is_empty() {
             return;
         }
-        let keys: HashMap<(&str, &str), &str> =
-            wanted.iter().filter_map(|u| u.split_once('/').map(|k| (k, u.as_str()))).collect();
-        // Stand-in uid -> (context, real uid) of each row it names.
-        let mut real: HashMap<&str, Vec<(usize, String)>> = HashMap::new();
+        let keys: HashMap<(usize, &str, &str), &str> = wanted
+            .iter()
+            .filter_map(|(c, u)| u.split_once('/').map(|(ns, name)| ((*c, ns, name), u.as_str())))
+            .collect();
+        // (context, stand-in uid) -> the real uid of the row it names there.
+        let mut real: HashMap<(usize, &str), String> = HashMap::new();
         let mut partial = false;
         for (r, &ctx) in self.rows.iter().zip(&self.row_ctx) {
             if r.is_partial() {
                 partial = true;
                 continue;
             }
-            if let Some(stand_in) = keys.get(&(r.namespace.as_deref().unwrap_or_default(), r.name.as_str())) {
-                real.entry(stand_in).or_default().push((ctx, r.uid.clone()));
+            if let Some(stand_in) = keys.get(&(ctx, r.namespace.as_deref().unwrap_or_default(), r.name.as_str())) {
+                real.insert((ctx, stand_in), r.uid.clone());
             }
         }
-        for (stand_in, found) in real {
-            if self.marked.remove(stand_in) {
-                self.marked.extend(found.iter().map(|(_, uid)| uid.clone()));
-            }
-            if self.selected_uid.as_deref() == Some(stand_in) {
-                self.selected_uid = found.first().map(|(_, uid)| uid.clone());
-            }
-            if let Some((ctx, uid)) = &mut self.menu_row
-                && uid == stand_in
-                && let Some((_, real)) = found.iter().find(|(c, _)| c == ctx)
+        for ((ctx, stand_in), uid) in real {
+            if let Some(m) = self.marked.get_mut(&ctx)
+                && m.remove(stand_in)
             {
-                *uid = real.clone();
+                m.insert(uid.clone());
+            }
+            for picked in [&mut self.selected, &mut self.menu_row].into_iter().flatten() {
+                if picked.0 == ctx && picked.1 == stand_in {
+                    picked.1 = uid.clone();
+                }
             }
         }
         // Every row is full: a stand-in left names an object gone meanwhile. Dropped, so
         // later updates don't look for it again.
         if !partial {
-            self.marked.retain(|u| !u.contains('/'));
-            self.selected_uid.take_if(|u| u.contains('/'));
+            self.marked.values_mut().for_each(|m| m.retain(|u| !u.contains('/')));
+            self.selected.take_if(|(_, u)| u.contains('/'));
             self.menu_row.take_if(|(_, u)| u.contains('/'));
         }
     }
@@ -464,8 +483,9 @@ impl ResourceTable {
         self.visible.get(visible_ix).map(|&i| &self.rows[i])
     }
 
-    pub fn visible_index_of(&self, uid: &str) -> Option<usize> {
-        self.visible.iter().position(|&i| self.rows[i].uid == uid)
+    /// Where the row of this context and uid is shown, if it is.
+    pub fn visible_index_of(&self, ctx: usize, uid: &str) -> Option<usize> {
+        self.visible.iter().position(|&i| self.row_ctx[i] == ctx && self.rows[i].uid == uid)
     }
 
     pub fn total(&self) -> usize {
@@ -582,23 +602,39 @@ mod uid_tests {
     fn stand_in_uids_follow_the_full_rows() {
         let mut t = ResourceTable::new();
         t.set_rows(vec![row("team-a/web-1", "web-1"), row("team-a/web-2", "web-2"), row("team-a/web-3", "web-3")]);
-        t.marked.extend(["team-a/web-1".to_string(), "team-a/web-2".to_string()]);
-        t.selected_uid = Some("team-a/web-2".into());
+        t.toggle_mark(0, "team-a/web-1");
+        t.toggle_mark(0, "team-a/web-2");
+        t.selected = Some((0, "team-a/web-2".into()));
         t.menu_row = Some((0, "team-a/web-3".into()));
         // Still the fast rows (a later page): nothing moves.
         t.set_rows(vec![row("team-a/web-1", "web-1"), row("team-a/web-2", "web-2"), row("team-a/web-3", "web-3")]);
-        assert!(t.marked.contains("team-a/web-1"));
+        assert!(t.is_marked(0, "team-a/web-1"));
         t.set_rows(vec![row("u1", "web-1"), row("u2", "web-2"), row("u3", "web-3")]);
-        let mut marked: Vec<&str> = t.marked.iter().map(String::as_str).collect();
+        let mut marked: Vec<&str> = t.marked[&0].iter().map(String::as_str).collect();
         marked.sort();
         assert_eq!(marked, ["u1", "u2"]);
-        assert_eq!(t.selected_uid.as_deref(), Some("u2"));
+        assert_eq!(t.selected, Some((0, "u2".into())));
         assert_eq!(t.menu_row, Some((0, "u3".into())));
         assert_eq!(t.marked_rows().len(), 2);
         // Checked, then deleted before the full rows came: forgotten.
-        t.marked.insert("team-a/gone".into());
+        t.toggle_mark(0, "team-a/gone");
         t.set_rows(vec![row("u1", "web-1")]);
-        assert!(!t.marked.contains("team-a/gone"));
+        assert!(!t.is_marked(0, "team-a/gone"));
+    }
+
+    #[test]
+    fn stand_in_uids_stay_on_their_cluster() {
+        let on = |ctx: usize, (_, r): (usize, Arc<Row>)| (ctx, r);
+        let mut t = ResourceTable::new();
+        t.set_rows(vec![on(0, row("team-a/web-1", "web-1")), on(1, row("team-a/web-1", "web-1"))]);
+        // Checked and selected on the second cluster only.
+        t.toggle_mark(1, "team-a/web-1");
+        t.selected = Some((1, "team-a/web-1".into()));
+        assert!(!t.is_marked(0, "team-a/web-1"));
+        assert_eq!(t.visible_index_of(1, "team-a/web-1"), Some(1));
+        t.set_rows(vec![on(0, row("prod-uid", "web-1")), on(1, row("staging-uid", "web-1"))]);
+        assert_eq!(t.marked_rows().iter().map(|(c, r)| (*c, r.uid.as_str())).collect::<Vec<_>>(), [(1, "staging-uid")]);
+        assert_eq!(t.selected, Some((1, "staging-uid".into())));
     }
 }
 

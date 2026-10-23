@@ -263,8 +263,8 @@ impl AppView {
                     t.delegate_mut().set_rows(merged);
                     // Keep the selection on the same object as rows move. The table
                     // reports it as a selection: the app skips that one (not a click).
-                    let uid = t.delegate().selected_uid.clone();
-                    let moved = match uid.and_then(|uid| t.delegate().visible_index_of(&uid)) {
+                    let selected = t.delegate().selected.clone();
+                    let moved = match selected.and_then(|(c, uid)| t.delegate().visible_index_of(c, &uid)) {
                         Some(ix) if t.selected_row() != Some(ix) => {
                             // Without scrolling to it (which selecting does): the user may
                             // have scrolled away, and rows moving must not pull the list back.
@@ -282,7 +282,8 @@ impl AppView {
                     };
                     // The row menu's highlight follows its row too (selecting clears it).
                     if menu_open {
-                        let ix = t.delegate().menu_row.as_ref().and_then(|(_, uid)| t.delegate().visible_index_of(uid));
+                        let ix =
+                            t.delegate().menu_row.as_ref().and_then(|(c, uid)| t.delegate().visible_index_of(*c, uid));
                         t.set_right_clicked_row(ix, cx);
                     }
                     cx.notify();
