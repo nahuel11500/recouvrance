@@ -26,11 +26,12 @@ The contexts come from, merged in this order:
 
 1. `KUBECONFIG` (several paths separated by `:`), or `~/.kube/config`;
 2. files added in **Settings → Kubeconfig** (**Add files** or **Enter path**; `kubeconfigs`);
-3. every file in a watched folder (**Watch folder**; `kubeconfig_folders`);
+3. every file in a watched folder (**Watch folder**; `kubeconfig_folders`), oldest first;
 4. kubeconfigs pasted in **Settings → Kubeconfig → Paste kubeconfig**, saved as they are in
    `~/.config/recouvrance/kubeconfigs/` (mode 0600). Before saving, Recouvrance lists the
    contexts and warns about commands run to log in (`exec`), files the kubeconfig reads and
-   clusters that skip TLS verification. Removing one there deletes its file.
+   clusters that skip TLS verification. Removing one there deletes its file. Oldest first, so a
+   new paste never takes a name an existing context has.
 
 The page shows each source with its file and context counts, or why it can't be read. Changes
 to any of these files are picked up within a few seconds. When two files define a context

@@ -23,6 +23,11 @@ pub fn documents(text: &str) -> Result<Vec<serde_json::Value>, Error> {
     serde_saphyr::from_multiple_with_options(text, options())
 }
 
+/// The text after `---` when `line` starts a new document (`---`, `--- # web`), else None.
+pub fn doc_start(line: &str) -> Option<&str> {
+    line.strip_prefix("---").filter(|rest| rest.is_empty() || rest.starts_with([' ', '\t']))
+}
+
 /// The error in one line, without its position or the source excerpt (for the UI, which
 /// shows the position itself): "unclosed bracket '['".
 pub fn message(e: &Error) -> String {

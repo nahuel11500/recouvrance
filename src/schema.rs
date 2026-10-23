@@ -200,9 +200,9 @@ pub fn doc_kind_at(text: &str, line: usize) -> Option<(String, String)> {
     }
     let start = (0..=line.min(lines.len().saturating_sub(1)))
         .rev()
-        .find(|&i| lines[i].trim_end() == "---")
+        .find(|&i| crate::yaml::doc_start(lines[i]).is_some())
         .map_or(0, |i| i + 1);
-    let end = (line..lines.len()).find(|&i| lines[i].trim_end() == "---").unwrap_or(lines.len());
+    let end = (line..lines.len()).find(|&i| crate::yaml::doc_start(lines[i]).is_some()).unwrap_or(lines.len());
     let top = |key: &str| {
         lines[start..end.max(start)]
             .iter()
@@ -238,7 +238,7 @@ pub fn yaml_path_at(text: &str, line: usize) -> Vec<String> {
         path.push(k.to_string());
     }
     for l in lines[..line].iter().rev() {
-        if l.trim_end() == "---" {
+        if crate::yaml::doc_start(l).is_some() {
             break;
         }
         let b = l.trim_start();
@@ -285,6 +285,11 @@ mod tests {
         let two = "apiVersion: v1\nkind: Service\n---\napiVersion: v1\nkind: ConfigMap\ndata:\n  a: b\n";
         assert_eq!(doc_kind_at(two, 6), Some(("v1".into(), "ConfigMap".into())));
         assert_eq!(yaml_path_at(two, 6), ["data", "a"]);
+        // A separator with a comment, as Apply splits it.
+        let commented = "apiVersion: v1\nkind: ConfigMap\ndata:\n  replicas: x\n--- # web\napiVersion: apps/v1\nkind: Deployment\nspec:\n  replicas: 2\n";
+        assert_eq!(doc_kind_at(commented, 8), Some(("apps/v1".into(), "Deployment".into())));
+        assert_eq!(yaml_path_at(commented, 8), ["spec", "replicas"]);
+        assert_eq!(doc_kind_at(commented, 3), Some(("v1".into(), "ConfigMap".into())));
     }
 
     #[test]

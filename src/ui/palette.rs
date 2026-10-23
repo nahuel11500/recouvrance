@@ -74,14 +74,17 @@ impl Item {
     }
 }
 
-/// Add the items not already listed.
+/// Add the items not already listed, each once.
 fn add_new(items: &mut Vec<Item>, more: Vec<Item>) {
-    let seen: std::collections::HashSet<String> = items.iter().map(Item::key).collect();
-    items.extend(more.into_iter().filter(|i| !seen.contains(&i.key())));
+    let mut seen: std::collections::HashSet<String> = items.iter().map(Item::key).collect();
+    items.extend(more.into_iter().filter(|i| seen.insert(i.key())));
 }
 
 impl Palette {
-    pub fn new(items: Vec<Item>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(more: Vec<Item>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        // The current table and the search index can list the same object.
+        let mut items = Vec::new();
+        add_new(&mut items, more);
         let input =
             cx.new(|cx| InputState::new(window, cx).placeholder("Jump to a resource, page, context or object…"));
         let subs = vec![cx.subscribe_in(&input, window, |this, _, ev: &InputEvent, _, cx| match ev {
@@ -258,6 +261,13 @@ mod tests {
         add_new(&mut items, vec![object(0, "Deployments · prod · a"), object(1, "Deployments · prod · b")]);
         assert_eq!(items.len(), 2);
         assert!(matches!(items[1].target, Target::Object { ctx: 1, .. }));
+    }
+
+    #[test]
+    fn same_object_twice_in_one_batch_is_listed_once() {
+        let mut items = Vec::new();
+        add_new(&mut items, vec![object(0, "Deployments · prod"), object(0, "Deployments · prod · a")]);
+        assert_eq!(items.len(), 1);
     }
 
     #[test]

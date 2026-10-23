@@ -529,6 +529,55 @@ fn true_is_bad(ty: &str) -> bool {
             | "ReplicaFailure"
             | "DisruptionTarget"
             | "Stalled"
+            // node-problem-detector
+            | "KernelDeadlock"
+            | "ReadonlyFilesystem"
+            | "FrequentKubeletRestart"
+            | "FrequentDockerRestart"
+            | "FrequentContainerdRestart"
+            | "FrequentUnregisterNetDevice"
+            | "CorruptDockerOverlay2"
+            | "KubeletUnhealthy"
+            | "ContainerRuntimeUnhealthy"
+            // namespace deletion
+            | "NamespaceDeletionDiscoveryFailure"
+            | "NamespaceDeletionGroupVersionParsingFailure"
+            | "NamespaceDeletionContentFailure"
+            | "NamespaceContentRemaining"
+            | "NamespaceFinalizersRemaining"
+            // CRDs and VPAs
+            | "NonStructuralSchema"
+            | "Terminating"
+            | "LowConfidence"
+            | "NoPodsMatched"
+            | "ConfigUnsupported"
+            | "ConfigDeprecated"
+    )
+}
+
+/// Condition types where "True" is the good state, so "False" is bad.
+fn true_is_good(ty: &str) -> bool {
+    matches!(
+        ty,
+        "Ready"
+            | "Available"
+            | "Progressing"
+            | "Complete"
+            | "SuccessCriteriaMet"
+            | "Initialized"
+            | "ContainersReady"
+            | "PodScheduled"
+            | "PodReadyToStartContainers"
+            | "Established"
+            | "NamesAccepted"
+            | "ScalingActive"
+            | "AbleToScale"
+            | "RecommendationProvided"
+            | "Accepted"
+            | "Programmed"
+            | "ResolvedRefs"
+            | "Synced"
+            | "Healthy"
     )
 }
 
@@ -542,10 +591,12 @@ fn conditions(obj: &Value, cx: &App) -> AnyElement {
         .child(heading("Conditions"))
         .children(conds.iter().map(|c| {
             let status = c["status"].as_str().unwrap_or_default().to_string();
-            let inverted = true_is_bad(c["type"].as_str().unwrap_or_default());
-            let color = match (status.as_str(), inverted) {
+            let ty = c["type"].as_str().unwrap_or_default();
+            let color = match (status.as_str(), true_is_bad(ty)) {
                 ("True", true) => cx.theme().warning,
                 ("False", true) => cx.theme().success,
+                // Not known to be bad, so not drawn red either.
+                ("False", false) if !true_is_good(ty) => muted,
                 _ => state_color(&status, cx),
             };
             h_flex()
@@ -654,6 +705,23 @@ mod tests {
         }
         for ty in ["Ready", "Available", "Progressing", "Complete"] {
             assert!(!super::true_is_bad(ty), "{ty}");
+        }
+    }
+
+    #[test]
+    fn health_conditions_are_bad_when_true() {
+        for ty in [
+            "KernelDeadlock",
+            "ReadonlyFilesystem",
+            "NamespaceContentRemaining",
+            "NonStructuralSchema",
+            "NoPodsMatched",
+        ] {
+            assert!(super::true_is_bad(ty), "{ty}");
+            assert!(!super::true_is_good(ty), "{ty}");
+        }
+        for ty in ["Ready", "Established", "RecommendationProvided"] {
+            assert!(super::true_is_good(ty), "{ty}");
         }
     }
 }

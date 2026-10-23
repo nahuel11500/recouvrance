@@ -45,6 +45,13 @@ impl ContextPicker {
         cx.notify();
     }
 
+    /// A new context list (kubeconfig reloaded): ticks on contexts that are gone are dropped.
+    pub fn set_all(&mut self, all: Vec<String>, cx: &mut Context<Self>) {
+        self.picked.retain(|c| all.contains(c));
+        self.all = all;
+        cx.notify();
+    }
+
     fn row(&self, i: usize, name: &str, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme();
         let color: Hsla =
