@@ -77,13 +77,26 @@ pub async fn events_for(client: Client, obj: ObjectRef) -> Result<Vec<EventLine>
     .await
 }
 
+/// The pod's containers, its default one (`kubectl.kubernetes.io/default-container`) first.
 pub async fn containers(client: Client, ns: String, pod: String) -> Result<Vec<String>> {
     run(async move {
         let api: Api<Pod> = Api::namespaced(client, &ns);
         let pod = api.get(&pod).await?;
-        Ok(pod.spec.map(|s| s.containers.into_iter().map(|c| c.name).collect()).unwrap_or_default())
+        let default = pod.metadata.annotations.as_ref().and_then(|a| a.get("kubectl.kubernetes.io/default-container"));
+        let names =
+            pod.spec.as_ref().map(|s| s.containers.iter().map(|c| c.name.clone()).collect()).unwrap_or_default();
+        Ok(default_first(names, default.map(String::as_str)))
     })
     .await
+}
+
+/// `names` with `default` moved to the front, when it is one of them.
+fn default_first(mut names: Vec<String>, default: Option<&str>) -> Vec<String> {
+    if let Some(i) = default.and_then(|d| names.iter().position(|n| n == d)) {
+        let name = names.remove(i);
+        names.insert(0, name);
+    }
+    names
 }
 
 pub enum LogMsg {
@@ -299,6 +312,14 @@ mod tests {
 
     fn lines(data: &[u8], max: usize) -> Vec<String> {
         futures::executor::block_on(super::lossy_lines(data, max).map(|l| l.unwrap()).collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn default_container_first() {
+        let names = || vec!["linkerd-proxy".to_string(), "app".to_string()];
+        assert_eq!(super::default_first(names(), Some("app")), ["app", "linkerd-proxy"]);
+        assert_eq!(super::default_first(names(), None), ["linkerd-proxy", "app"]);
+        assert_eq!(super::default_first(names(), Some("gone")), ["linkerd-proxy", "app"]);
     }
 
     #[test]
