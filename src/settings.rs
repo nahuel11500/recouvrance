@@ -693,8 +693,9 @@ fn unix_now() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        DeleteConfirm, NamespaceVisit, Settings, by_field, delete_confirm_in, guess_protected, load_from, load_json,
-        migrate_list, protected_among, recent_as_visits, record_visits, save_newest, visit_score, write_atomic,
+        DeleteConfirm, NamespaceVisit, Settings, by_field, delete_confirm_in, from_bytes, guess_protected, load_from,
+        load_json, migrate_list, protected_among, recent_as_visits, record_visits, save_newest, visit_score,
+        write_atomic,
     };
 
     #[test]
