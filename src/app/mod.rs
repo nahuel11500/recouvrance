@@ -416,6 +416,7 @@ impl AppView {
                         t.delegate_mut().set_filter(text);
                         cx.notify();
                     });
+                    this.follow_selection(cx);
                 }
                 // A filter that was used (Enter, or leaving the field) goes into the history.
                 InputEvent::PressEnter { .. } | InputEvent::Blur => {

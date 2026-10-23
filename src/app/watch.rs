@@ -157,12 +157,11 @@ impl AppView {
                 }
             });
             watches.push((guard, task));
-            let table = self.table.clone();
             let metrics_on = crate::settings::metrics_on(&ctx_name);
             if metrics_on && kind.is("", "Pod") {
                 // Requests and limits, for the usage bars.
                 let (guard, mut rx) = k8s::watch_pod_resources(client.clone(), self.namespace.clone(), pause.clone());
-                let t = table.clone();
+                let t = self.table.clone();
                 let task = cx.spawn(async move |_, cx| {
                     while let Some(resources) = rx.next().await {
                         let resources = latest(&mut rx, resources);
@@ -174,29 +173,41 @@ impl AppView {
                 });
                 metrics.push((guard, task));
                 let (guard, mut rx) = k8s::watch_pod_metrics(client, self.namespace.clone(), pause.clone());
-                let task = cx.spawn(async move |_, cx| {
+                let task = cx.spawn(async move |this, cx| {
                     while let Some(usage) = rx.next().await {
                         let usage = latest(&mut rx, usage);
-                        table.update(cx, |t, cx| {
-                            if t.delegate_mut().set_usage(ix, usage) {
-                                t.refresh(cx);
-                            }
-                            cx.notify();
+                        let alive = this.update(cx, |this, cx| {
+                            this.table.update(cx, |t, cx| {
+                                if t.delegate_mut().set_usage(ix, usage) {
+                                    t.refresh(cx);
+                                }
+                                cx.notify();
+                            });
+                            this.follow_selection(cx);
                         });
+                        if alive.is_err() {
+                            break;
+                        }
                     }
                 });
                 metrics.push((guard, task));
             } else if metrics_on && kind.is("", "Node") {
                 let (guard, mut rx) = k8s::watch_node_metrics(client, pause.clone());
-                let task = cx.spawn(async move |_, cx| {
+                let task = cx.spawn(async move |this, cx| {
                     while let Some(usage) = rx.next().await {
                         let usage = latest(&mut rx, usage);
-                        table.update(cx, |t, cx| {
-                            if t.delegate_mut().set_node_usage(ix, usage) {
-                                t.refresh(cx);
-                            }
-                            cx.notify();
+                        let alive = this.update(cx, |this, cx| {
+                            this.table.update(cx, |t, cx| {
+                                if t.delegate_mut().set_node_usage(ix, usage) {
+                                    t.refresh(cx);
+                                }
+                                cx.notify();
+                            });
+                            this.follow_selection(cx);
                         });
+                        if alive.is_err() {
+                            break;
+                        }
                     }
                 });
                 metrics.push((guard, task));
@@ -205,6 +216,15 @@ impl AppView {
         self.watch = Some(watches);
         self.metrics = Some(metrics);
         cx.notify();
+    }
+
+    /// Keep the highlight on the selected object once the rows moved: updates, a
+    /// filter, a sort (also by usage, which every metrics poll changes).
+    pub(super) fn follow_selection(&mut self, cx: &mut Context<Self>) {
+        let moved = self.table.update(cx, crate::table::follow_selection);
+        if moved.is_some() {
+            self.skip_select = moved;
+        }
     }
 
     /// What the bar above the list says: what failed (contexts, watches), else progress.
@@ -258,40 +278,11 @@ impl AppView {
                     *slot = rows;
                 }
                 let merged = self.merged_rows();
-                let moved = self.table.update(cx, |t, cx| {
-                    let menu_open = t.right_clicked_row().is_some();
+                self.table.update(cx, |t, cx| {
                     t.delegate_mut().set_rows(merged);
-                    // Keep the selection on the same object as rows move. The table
-                    // reports it as a selection: the app skips that one (not a click).
-                    let selected = t.delegate().selected.clone();
-                    let moved = match selected.and_then(|(c, uid)| t.delegate().visible_index_of(c, &uid)) {
-                        Some(ix) if t.selected_row() != Some(ix) => {
-                            // Without scrolling to it (which selecting does): the user may
-                            // have scrolled away, and rows moving must not pull the list back.
-                            let pending = t.vertical_scroll_handle.0.borrow_mut().deferred_scroll_to_item.take();
-                            t.set_selected_row(ix, cx);
-                            t.vertical_scroll_handle.0.borrow_mut().deferred_scroll_to_item = pending;
-                            Some(ix)
-                        }
-                        // Its row is gone or filtered out: no other row takes the highlight.
-                        None if t.selected_row().is_some() => {
-                            t.clear_selection(cx);
-                            None
-                        }
-                        _ => None,
-                    };
-                    // The row menu's highlight follows its row too (selecting clears it).
-                    if menu_open {
-                        let ix =
-                            t.delegate().menu_row.as_ref().and_then(|(c, uid)| t.delegate().visible_index_of(*c, uid));
-                        t.set_right_clicked_row(ix, cx);
-                    }
                     cx.notify();
-                    moved
                 });
-                if moved.is_some() {
-                    self.skip_select = moved;
-                }
+                self.follow_selection(cx);
             }
             TableMsg::Listed => {
                 self.listing.remove(&ctx);
