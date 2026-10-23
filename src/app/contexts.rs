@@ -115,6 +115,13 @@ impl AppView {
                     Ok((client, kinds, kind_clusters, namespaces)) => {
                         this.kind_clusters = kind_clusters;
                         this.connect_errors = (!errors.is_empty()).then(|| errors.join("; ").into());
+                        // The first context may have failed: namespace visits and the ones added
+                        // by hand belong to the cluster that is first now.
+                        if let Some((first, _)) = clusters.first() {
+                            let first = first.clone();
+                            this.context = Some(first.clone());
+                            this.ns_picker.update(cx, |p, _| p.context = first);
+                        }
                         this.client = Some(client);
                         this.clusters = clusters;
                         let keep = this.kind.as_ref().map(|k| k.key());
