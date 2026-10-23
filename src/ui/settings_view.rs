@@ -964,7 +964,7 @@ fn repo_lines(text: &str) -> Vec<String> {
 }
 
 /// Why a typed MCP port is not saved, or None once `save` saved it.
-fn port_error(typed: &str, save: impl FnOnce(u16) -> anyhow::Result<()>) -> Option<SharedString> {
+fn port_error(typed: &str, save: impl FnOnce(u16) -> Result<()>) -> Option<SharedString> {
     match typed.trim().parse::<u16>() {
         Ok(p) if p >= 1024 => save(p).err().map(|e| format!("Not saved: {e:#}").into()),
         Ok(_) => Some("Ports below 1024 need root: use 1024 to 65535".into()),
