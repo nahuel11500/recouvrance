@@ -111,6 +111,8 @@ impl AppView {
         let progressive = cached.is_none();
         if let Some(view) = cached {
             self.rows_by_ctx = view.rows;
+            // A cluster that no longer serves the kind is not watched: nothing would replace its rows.
+            keep_watched(&mut self.rows_by_ctx, &self.listing);
             let merged = self.merged_rows();
             self.table.update(cx, |t, cx| {
                 t.delegate_mut().loading = false;
@@ -326,6 +328,15 @@ fn coalesce(batch: Vec<TableMsg>) -> Vec<TableMsg> {
         .collect()
 }
 
+/// Empty the rows of the clusters not in `watched`.
+fn keep_watched<T>(rows: &mut [Vec<T>], watched: &HashSet<usize>) {
+    for (ix, slot) in rows.iter_mut().enumerate() {
+        if !watched.contains(&ix) {
+            slot.clear();
+        }
+    }
+}
+
 /// The newest value already waiting in a channel (older ones are stale).
 fn latest<T>(rx: &mut futures::channel::mpsc::UnboundedReceiver<T>, mut value: T) -> T {
     while let Ok(newer) = rx.try_recv() {
@@ -354,7 +365,14 @@ async fn wait_list_shown(this: &WeakEntity<AppView>, pause: &k8s::Pause, cx: &mu
 
 #[cfg(test)]
 mod tests {
-    use super::{TableMsg, coalesce};
+    use super::{TableMsg, coalesce, keep_watched};
+
+    #[test]
+    fn rows_of_clusters_not_watched_are_dropped() {
+        let mut rows = vec![vec!["prod-pod"], vec!["staging-pod"], vec!["dev-pod"]];
+        keep_watched(&mut rows, &[0, 2].into_iter().collect());
+        assert_eq!(rows, [vec!["prod-pod"], vec![], vec!["dev-pod"]]);
+    }
 
     fn row() -> crate::k8s::Row {
         crate::k8s::Row {
