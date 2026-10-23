@@ -9,7 +9,7 @@
   and a generic spec/status view for anything else.
 - **GPU usage**: utilization and memory per pod, workload, node and cluster, from NVIDIA's DCGM
   exporter (shown when its metrics are in Prometheus or VictoriaMetrics).
-- **Usage history** (last hour of CPU and memory against requests and limits) for pods and workloads, from the cluster's Prometheus, found automatically and read through the API server proxy.
+- **Usage history** (last hour of CPU and memory against requests and limits) for pods and workloads, from the cluster's Prometheus, found automatically and read through the API server proxy. A workload's charts cover up to 300 of its pods, and its request and limit lines the same pods.
 - **Logs** across all pods of a workload (up to 50, running and newest first), level filter, time range, timeline histogram.
 - **Shell** (exec with a real terminal), **node shell** (privileged pod, deleted when its shell
   ends or its page goes away) and **port-forward** for pods and services; forwards are remembered

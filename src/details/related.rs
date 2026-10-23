@@ -31,8 +31,8 @@ pub(super) async fn history_for(
             vec![name.to_string()]
         } else {
             pods.iter()
+                .take(crate::prom::MAX_CHART_PODS)
                 .filter_map(|p| p.pointer("/metadata/name").and_then(|v| v.as_str()).map(String::from))
-                .take(300)
                 .collect()
         };
         if names.is_empty() {
@@ -82,8 +82,8 @@ pub(super) async fn gpu_history_for(
         vec![name.to_string()]
     } else {
         pods.iter()
+            .take(crate::prom::MAX_CHART_PODS)
             .filter_map(|p| p.pointer("/metadata/name").and_then(|v| v.as_str()).map(String::from))
-            .take(300)
             .collect()
     };
     if names.is_empty() {
