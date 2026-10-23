@@ -132,6 +132,13 @@ impl DetailPanel {
     }
 
     /// On a protected context, an input where the context name must be typed.
+    /// The uid of the object on screen: a delete hits that object, not one re-created under
+    /// its name since.
+    fn shown_uid(&self) -> Option<String> {
+        let uid = self.object.as_ref()?.pointer("/metadata/uid")?.as_str()?;
+        Some(uid.to_string())
+    }
+
     pub(super) fn protection(
         &self,
         window: &mut Window,
@@ -518,7 +525,8 @@ impl DetailPanel {
         if level == crate::settings::DeleteConfirm::Off && guard.is_none() && !terminating {
             let (c, k, ns, n) =
                 (self.client.clone(), self.obj.kind.clone(), self.obj.namespace.clone(), self.obj.name.clone());
-            self.run_write("Delete", k8s::delete_with(c, k, ns, n, false, false), window, cx);
+            let uid = self.shown_uid();
+            self.run_write("Delete", k8s::delete_with(c, k, ns, n, uid, false, false), window, cx);
             return;
         }
         let typed = level == crate::settings::DeleteConfirm::Type;
@@ -600,7 +608,8 @@ impl DetailPanel {
                             this.obj.namespace.clone(),
                             this.obj.name.clone(),
                         );
-                        this.run_write("Delete", k8s::delete_with(c, k, ns, n, force, strip), window, cx);
+                        let uid = this.shown_uid();
+                        this.run_write("Delete", k8s::delete_with(c, k, ns, n, uid, force, strip), window, cx);
                     });
                     true
                 })

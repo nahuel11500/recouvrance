@@ -265,6 +265,6 @@ impl KubeMcp {
         let access = access_for(&kind, &p.context, "delete", p.namespace.clone(), Some(p.name.clone()));
         self.authorize(&mut call, &access).await?;
         self.recheck(&mut call, &access)?;
-        call.finish(k8s::delete(client, kind, p.namespace, p.name, p.dry_run.unwrap_or(false)).await)
+        call.finish(k8s::delete(client, kind, p.namespace, p.name, None, p.dry_run.unwrap_or(false)).await)
     }
 }

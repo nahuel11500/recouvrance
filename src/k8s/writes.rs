@@ -93,14 +93,31 @@ pub async fn apply(
     .await
 }
 
-pub async fn delete(client: Client, kind: Kind, ns: Option<String>, name: String, dry_run: bool) -> Result<String> {
+/// Delete one object. With `uid`, only that object: one re-created under the same name since
+/// the user picked it (a pod replaced by its ReplicaSet, a list that was out of date) is left
+/// alone, the server refusing with a conflict.
+pub async fn delete(
+    client: Client,
+    kind: Kind,
+    ns: Option<String>,
+    name: String,
+    uid: Option<String>,
+    dry_run: bool,
+) -> Result<String> {
     run(async move {
         let api = dyn_api(client, &kind, ns.as_deref());
-        let dp = kube::api::DeleteParams { dry_run, ..Default::default() };
+        let dp = kube::api::DeleteParams { dry_run, preconditions: preconditions(uid), ..Default::default() };
         api.delete(&name, &dp).await?;
         Ok(format!("{}{} {name} deleted", if dry_run { "[dry run] " } else { "" }, kind.ar.kind))
     })
     .await
+}
+
+/// "Only if it is still this object", when its real uid is known (rows of a fast first load
+/// have a stand-in: namespace/name).
+fn preconditions(uid: Option<String>) -> Option<kube::api::Preconditions> {
+    let uid = uid.filter(|u| !u.is_empty() && !u.contains('/'))?;
+    Some(kube::api::Preconditions { uid: Some(uid), resource_version: None })
 }
 
 /// Whether an error is the API server's 404 (the object does not exist).
@@ -120,20 +137,22 @@ pub async fn delete_with(
     kind: Kind,
     ns: Option<String>,
     name: String,
+    uid: Option<String>,
     force: bool,
     strip_finalizers: bool,
 ) -> Result<String> {
     run(async move {
         let api = dyn_api(client, &kind, ns.as_deref());
-        let dp = if force {
+        let mut dp = if force {
             kube::api::DeleteParams {
                 grace_period_seconds: Some(0),
                 propagation_policy: Some(kube::api::PropagationPolicy::Background),
                 ..Default::default()
             }
         } else {
-            Default::default()
+            kube::api::DeleteParams::default()
         };
+        dp.preconditions = preconditions(uid);
         let was_stuck = strip_finalizers && stuck_terminating(api.get_opt(&name).await?.as_ref());
         api.delete(&name, &dp).await?;
         let mut stripped = false;
@@ -589,6 +608,15 @@ pub async fn create(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deletes_are_pinned_to_the_object_picked() {
+        assert_eq!(preconditions(Some("0b3c-uid".into())).and_then(|p| p.uid).as_deref(), Some("0b3c-uid"));
+        // A stand-in uid (namespace/name) or none: nothing to pin to.
+        assert!(preconditions(Some("shop/web-1".into())).is_none());
+        assert!(preconditions(Some(String::new())).is_none());
+        assert!(preconditions(None).is_none());
+    }
 
     #[test]
     fn stuck_only_when_finalizers_hold_a_deleted_object() {

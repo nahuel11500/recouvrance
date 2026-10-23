@@ -157,7 +157,10 @@ impl AppView {
                 }
             }
         }
-        self._palette_sub = Some(cx.subscribe_in(&palette, window, |this, _, ev: &PaletteEvent, window, cx| {
+        // Objects in the palette point at clusters by their place in the connected list: a
+        // reconnect in between would open them on another cluster.
+        let opened_on: Vec<String> = self.clusters.iter().map(|(c, _)| c.clone()).collect();
+        self._palette_sub = Some(cx.subscribe_in(&palette, window, move |this, _, ev: &PaletteEvent, window, cx| {
             this.palette = None;
             window.focus(&this.focus, cx);
             if let PaletteEvent::Pick(target) = ev {
@@ -184,6 +187,14 @@ impl AppView {
                     Target::Page("agents") => this.navigate(Route::Agents, cx),
                     Target::Page(_) => this.navigate(Route::Contexts, cx),
                     Target::Context(c) => this.connect_many(vec![c], window, cx),
+                    Target::Object { .. } if this.clusters.iter().map(|(c, _)| c).ne(opened_on.iter()) => {
+                        window.push_notification(
+                            Notification::warning(
+                                "The connected clusters changed since the palette opened: search again",
+                            ),
+                            cx,
+                        );
+                    }
                     Target::Object { ctx, kind, name, namespace } => {
                         this.open_object_in(ctx, &kind, name, namespace, window, cx)
                     }

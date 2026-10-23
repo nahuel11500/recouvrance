@@ -730,3 +730,49 @@ users:
         assert_eq!(fp(&base, "missing"), None);
     }
 }
+
+/// Which file a context name belongs to must not move while that file still has it: the
+/// name carries the context's protection, color and settings, and moving it pointed them at
+/// another cluster (three audit rounds in a row).
+#[cfg(test)]
+mod name_properties {
+    use super::name_owners;
+    use proptest::prelude::*;
+
+    type Files = Vec<(String, Option<Vec<String>>)>;
+
+    fn files() -> impl Strategy<Value = Files> {
+        let names = prop::sample::subsequence(vec!["prod", "dev", "kind"], 0..=3)
+            .prop_map(|v| v.into_iter().map(String::from).collect::<Vec<_>>());
+        // Some files fail to read (None): they keep what they had.
+        let file = prop::option::weighted(0.85, names);
+        prop::collection::vec(file, 1..5)
+            .prop_map(|v| v.into_iter().enumerate().map(|(i, n)| (format!("/kube/f{i}"), n)).collect())
+    }
+
+    proptest! {
+        #[test]
+        fn a_name_stays_with_its_file(
+            first in files(),
+            order in any::<prop::sample::Index>(),
+            extra in prop::option::of(prop::sample::subsequence(vec!["prod", "dev", "kind"], 0..=3)),
+        ) {
+            let mut kept = Default::default();
+            let before = name_owners(&mut kept, &first, |_| true);
+            // The same files read again in another order, maybe with a new one.
+            let mut again = first.clone();
+            let i = order.index(again.len());
+            again.rotate_left(i);
+            if let Some(names) = extra {
+                again.push(("/kube/new".into(), Some(names.into_iter().map(String::from).collect())));
+            }
+            let after = name_owners(&mut kept, &again, |_| true);
+            for (name, owner) in &before {
+                let still_has = first.iter().any(|(f, n)| f == owner && n.as_ref().is_none_or(|n| n.contains(name)));
+                if still_has {
+                    prop_assert_eq!(after.get(name), Some(owner), "{} moved", name);
+                }
+            }
+        }
+    }
+}
