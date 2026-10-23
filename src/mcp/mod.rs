@@ -164,7 +164,8 @@ impl Rule {
         let name = match &a.name {
             Some(n) => any_glob(&self.names, n),
             // Name-less checks (lists): a Deny of some names only leaves the rest, whose rows
-            // are then filtered by name.
+            // are then filtered by name. An Allow of some names passes too, so whatever a
+            // name-less check lets through must be filtered by name before it is shown.
             None if self.effect == Mode::Deny => self.names.iter().any(|n| n.trim() == "*"),
             None => !self.names.is_empty(),
         };
@@ -1204,6 +1205,17 @@ mod tests {
         // Somewhere-checks see the namespaced allow, but a global deny blocks.
         assert_eq!(p.decide_any_namespace(&access("staging-eu", "list", "pods", None, None)).mode, Mode::Allow);
         assert_eq!(p.decide_any_namespace(&access("staging-eu", "list", "secrets", None, None)).mode, Mode::Deny);
+    }
+
+    #[test]
+    fn allowed_names_pass_a_name_less_check_but_not_other_rows() {
+        let mut web = rule(Mode::Allow, &["list"], &["events"], &["*"], &["*"]);
+        web.names = vec!["web-*".into()];
+        let p = Policy { rules: vec![web], ..Policy::default() };
+        // The check before listing passes; each row must then be checked by name.
+        assert_eq!(p.decide(&access("c", "list", "events", Some("ns"), None)).mode, Mode::Allow);
+        assert_eq!(p.decide(&access("c", "list", "events", Some("ns"), Some("web-1.17f2"))).mode, Mode::Allow);
+        assert_eq!(p.decide(&access("c", "list", "events", Some("ns"), Some("db-0.17f2"))).mode, Mode::Deny);
     }
 
     #[test]

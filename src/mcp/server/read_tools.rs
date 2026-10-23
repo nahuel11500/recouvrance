@@ -359,8 +359,13 @@ impl KubeMcp {
         };
         let events_kind = self.kind(&call, &p.context, "events").await?.1;
         if call.policy().decide(&access_for(&events_kind, &p.context, "list", ns.clone(), None)).mode == Mode::Allow
-            && let Ok(events) = k8s::events_for(client, obj).await
+            && let Ok(mut events) = k8s::events_for(client, obj).await
         {
+            // The check above has no name: an Allow of some event names passes it.
+            events.retain(|e| {
+                let a = access_for(&events_kind, &p.context, "list", e.namespace.clone(), Some(e.name.clone()));
+                call.policy().decide(&a).mode == Mode::Allow
+            });
             out.push_str(&format!("Events ({}):\n", events.len()));
             for e in events.iter().take(20) {
                 out.push_str(&format!("  {} ago  {}  {}  x{}  {}\n", e.age, e.kind, e.reason, e.count, e.message));
