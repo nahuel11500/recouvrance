@@ -336,20 +336,24 @@ impl KubeMcp {
             let pods_kind = self.kind(&call, &p.context, "pods").await?.1;
             if call.policy().decide(&access_for(&pods_kind, &p.context, "list", Some(ns.clone()), None)).mode
                 == Mode::Allow
-                && let Ok((defs, mut rows)) =
-                    k8s::list_table(client.clone(), pods_kind.clone(), Some(ns.clone()), sel, None).await
             {
-                rows.retain(|r| {
-                    let a = access_for(&pods_kind, &p.context, "list", Some(ns.clone()), Some(r.name.clone()));
-                    call.policy().decide(&a).mode == Mode::Allow
-                });
-                let cols: Vec<usize> =
-                    (0..defs.len()).filter(|&i| defs[i].priority == 0 || defs[i].name == "Node").collect();
-                out.push_str(&format!("Pods ({}):\n", rows.len()));
-                for r in rows.iter().take(30) {
-                    let cells: Vec<String> =
-                        cols.iter().map(|&i| r.cells.get(i).cloned().unwrap_or_default()).collect();
-                    out.push_str(&format!("  {}\n", cells.join("  ")));
+                // A list that fails is said, so it doesn't read as no pods.
+                match k8s::list_table(client.clone(), pods_kind.clone(), Some(ns.clone()), sel, None).await {
+                    Ok((defs, mut rows)) => {
+                        rows.retain(|r| {
+                            let a = access_for(&pods_kind, &p.context, "list", Some(ns.clone()), Some(r.name.clone()));
+                            call.policy().decide(&a).mode == Mode::Allow
+                        });
+                        let cols: Vec<usize> =
+                            (0..defs.len()).filter(|&i| defs[i].priority == 0 || defs[i].name == "Node").collect();
+                        out.push_str(&format!("Pods ({}):\n", rows.len()));
+                        for r in rows.iter().take(30) {
+                            let cells: Vec<String> =
+                                cols.iter().map(|&i| r.cells.get(i).cloned().unwrap_or_default()).collect();
+                            out.push_str(&format!("  {}\n", cells.join("  ")));
+                        }
+                    }
+                    Err(e) => out.push_str(&format!("Pods: could not be listed: {e:#}\n")),
                 }
             }
         }
@@ -358,17 +362,23 @@ impl KubeMcp {
             ..obj
         };
         let events_kind = self.kind(&call, &p.context, "events").await?.1;
-        if call.policy().decide(&access_for(&events_kind, &p.context, "list", ns.clone(), None)).mode == Mode::Allow
-            && let Ok(mut events) = k8s::events_for(client, obj).await
-        {
-            // The check above has no name: an Allow of some event names passes it.
-            events.retain(|e| {
-                let a = access_for(&events_kind, &p.context, "list", e.namespace.clone(), Some(e.name.clone()));
-                call.policy().decide(&a).mode == Mode::Allow
-            });
-            out.push_str(&format!("Events ({}):\n", events.len()));
-            for e in events.iter().take(20) {
-                out.push_str(&format!("  {} ago  {}  {}  x{}  {}\n", e.age, e.kind, e.reason, e.count, e.message));
+        if call.policy().decide(&access_for(&events_kind, &p.context, "list", ns.clone(), None)).mode == Mode::Allow {
+            match k8s::events_for(client, obj).await {
+                Ok(mut events) => {
+                    // The check above has no name: an Allow of some event names passes it.
+                    events.retain(|e| {
+                        let a = access_for(&events_kind, &p.context, "list", e.namespace.clone(), Some(e.name.clone()));
+                        call.policy().decide(&a).mode == Mode::Allow
+                    });
+                    out.push_str(&format!("Events ({}):\n", events.len()));
+                    for e in events.iter().take(20) {
+                        out.push_str(&format!(
+                            "  {} ago  {}  {}  x{}  {}\n",
+                            e.age, e.kind, e.reason, e.count, e.message
+                        ));
+                    }
+                }
+                Err(e) => out.push_str(&format!("Events: could not be listed: {e:#}\n")),
             }
         }
         call.finish(Ok(out))
