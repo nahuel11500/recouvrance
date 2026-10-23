@@ -218,9 +218,11 @@ impl AppView {
         cx.notify();
     }
 
-    /// Namespaces configured as accessible for the connected clusters (empty: all).
+    /// Namespaces configured as accessible, when every connected cluster has some: then
+    /// none may list cluster-wide and the picker keeps one at a time (empty: all). Among
+    /// clusters that may, one with a list watches one of its own (see `cluster_namespace`).
     pub(super) fn accessible_namespaces(&self) -> Vec<String> {
-        self.clusters.iter().flat_map(|(c, _)| crate::settings::cluster(c).namespaces).collect()
+        all_restricted(self.clusters.iter().map(|(c, _)| crate::settings::cluster(c).namespaces))
     }
 
     /// One namespace is watched directly; several are watched cluster-wide and filtered here.
@@ -287,6 +289,35 @@ fn served_lists(history: &mut [Route], kinds: &[Kind], fallback: Option<&Kind>) 
     }
 }
 
+/// Every list joined, or nothing when one of them is empty (that cluster may list all).
+fn all_restricted(lists: impl IntoIterator<Item = Vec<String>>) -> Vec<String> {
+    let mut joined = Vec::new();
+    for list in lists {
+        if list.is_empty() {
+            return Vec::new();
+        }
+        joined.extend(list);
+    }
+    joined
+}
+
+/// The namespace a cluster's list watches, given the namespaces chosen (several or none:
+/// all) and the ones accessible on that cluster: a cluster that may not list cluster-wide
+/// watches one of its own. `Some(None)` watches all; `None` leaves the cluster out, as none
+/// of the namespaces chosen is accessible there.
+pub(super) fn cluster_namespace(chosen: &[String], accessible: &[String]) -> Option<Option<String>> {
+    if let [one] = chosen {
+        return Some(Some(one.clone()));
+    }
+    if accessible.is_empty() {
+        return Some(None);
+    }
+    if chosen.is_empty() {
+        return Some(accessible.first().cloned());
+    }
+    accessible.iter().find(|ns| chosen.contains(ns)).map(|ns| Some(ns.clone()))
+}
+
 /// The one namespace to show when only some are accessible: the one just ticked,
 /// else the last one asked for, else the first accessible one. None when all are.
 fn one_namespace(wanted: &[String], previous: &[String], accessible: &[String]) -> Option<String> {
@@ -298,7 +329,7 @@ fn one_namespace(wanted: &[String], previous: &[String], accessible: &[String]) 
 
 #[cfg(test)]
 mod tests {
-    use super::{Kind, Route, merge_kinds, one_namespace, served_lists};
+    use super::{Kind, Route, all_restricted, cluster_namespace, merge_kinds, one_namespace, served_lists};
 
     fn kind(k: &str) -> Kind {
         Kind {
@@ -357,5 +388,26 @@ mod tests {
     fn several_namespaces_stay_when_all_are_accessible() {
         assert_eq!(one_namespace(&v(&["a", "c"]), &v(&["c"]), &[]), None);
         assert_eq!(one_namespace(&[], &v(&["c"]), &[]), None);
+    }
+
+    #[test]
+    fn one_namespace_at_a_time_only_when_every_cluster_has_a_list() {
+        assert_eq!(all_restricted([v(&["team-a"]), v(&[])]), Vec::<String>::new());
+        assert_eq!(all_restricted([v(&["team-a"]), v(&["team-b"])]), v(&["team-a", "team-b"]));
+        assert_eq!(all_restricted([v(&[])]), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_cluster_with_a_list_watches_one_of_its_namespaces() {
+        let team = v(&["team-a", "team-b"]);
+        // A cluster that may list everything watches all, or the one namespace chosen.
+        assert_eq!(cluster_namespace(&[], &[]), Some(None));
+        assert_eq!(cluster_namespace(&v(&["x", "y"]), &[]), Some(None));
+        assert_eq!(cluster_namespace(&v(&["x"]), &[]), Some(Some("x".into())));
+        // One with a list never watches cluster-wide.
+        assert_eq!(cluster_namespace(&[], &team), Some(Some("team-a".into())));
+        assert_eq!(cluster_namespace(&v(&["x", "team-b"]), &team), Some(Some("team-b".into())));
+        assert_eq!(cluster_namespace(&v(&["x", "y"]), &team), None);
+        assert_eq!(cluster_namespace(&v(&["x"]), &team), Some(Some("x".into())));
     }
 }

@@ -3,6 +3,8 @@
 #[allow(unused_imports)]
 use super::*;
 
+use super::contexts::cluster_namespace;
+
 impl AppView {
     /// Count problems in the background for the sidebar badge. Big clusters are
     /// scanned less often (the interval grows with how long a scan takes).
@@ -58,18 +60,31 @@ impl AppView {
         let ns_filter = (self.namespaces.len() > 1).then(|| self.namespaces.iter().cloned().collect());
         let names: Vec<String> = self.clusters.iter().map(|(c, _)| c.clone()).collect();
         self.rows_by_ctx = vec![Vec::new(); self.clusters.len()];
+        // What each cluster watches: nothing when it doesn't serve the kind, one of its
+        // accessible namespaces when it may not list cluster-wide.
+        let serving = self.kind_clusters.get(&kind.key()).cloned();
+        let watched: Vec<Option<Option<String>>> = (self.clusters.iter().enumerate())
+            .map(|(ix, (ctx_name, _))| {
+                if serving.as_ref().is_some_and(|s| !s.contains(&ix)) {
+                    None
+                } else if !kind.namespaced {
+                    Some(None)
+                } else {
+                    cluster_namespace(&self.namespaces, &crate::settings::cluster(ctx_name).namespaces)
+                }
+            })
+            .collect();
         let key = format!(
             "{}|{}|{:?}|{:?}",
             names.join(","),
             kind.key(),
-            self.namespace,
+            watched,
             self.column_prefs.custom(&kind.kubectl_name())
         );
         let cached = self.views.get(&key).filter(|v| v.rows.len() == self.clusters.len()).cloned();
         self.view_key = Some(key);
-        // Wait only for the clusters that serve this kind: the others never report.
-        let serving = self.kind_clusters.get(&kind.key()).cloned();
-        self.listing = (0..self.clusters.len()).filter(|ix| serving.as_ref().is_none_or(|s| s.contains(ix))).collect();
+        // Wait only for the clusters watched: the others never report.
+        self.listing = (0..self.clusters.len()).filter(|&ix| watched[ix].is_some()).collect();
         self.refused.clear();
         let loading = !self.listing.is_empty();
         let is_pod = kind.is("", "Pod");
@@ -129,14 +144,12 @@ impl AppView {
         let mut metrics = Vec::new();
         // Set while the list is hidden: watches hold their snapshots back, metrics stop polling.
         let pause = k8s::Pause::default();
-        for (ix, (ctx_name, client)) in self.clusters.clone().into_iter().enumerate() {
-            if serving.as_ref().is_some_and(|s| !s.contains(&ix)) {
-                continue; // this cluster doesn't have the kind
-            }
+        for (ix, ((ctx_name, client), ns)) in self.clusters.clone().into_iter().zip(watched).enumerate() {
+            let Some(ns) = ns else { continue };
             let (guard, mut rx) = k8s::watch_table_paused(
                 client.clone(),
                 kind.clone(),
-                self.namespace.clone(),
+                ns.clone(),
                 Arc::new(self.column_prefs.custom(&kind.kubectl_name())),
                 pause.clone(),
                 progressive,
@@ -160,7 +173,7 @@ impl AppView {
             let metrics_on = crate::settings::metrics_on(&ctx_name);
             if metrics_on && kind.is("", "Pod") {
                 // Requests and limits, for the usage bars.
-                let (guard, mut rx) = k8s::watch_pod_resources(client.clone(), self.namespace.clone(), pause.clone());
+                let (guard, mut rx) = k8s::watch_pod_resources(client.clone(), ns.clone(), pause.clone());
                 let t = self.table.clone();
                 let task = cx.spawn(async move |_, cx| {
                     while let Some(resources) = rx.next().await {
@@ -172,7 +185,7 @@ impl AppView {
                     }
                 });
                 metrics.push((guard, task));
-                let (guard, mut rx) = k8s::watch_pod_metrics(client, self.namespace.clone(), pause.clone());
+                let (guard, mut rx) = k8s::watch_pod_metrics(client, ns, pause.clone());
                 let task = cx.spawn(async move |this, cx| {
                     while let Some(usage) = rx.next().await {
                         let usage = latest(&mut rx, usage);
