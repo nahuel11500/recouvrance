@@ -230,7 +230,7 @@ impl Render for ProblemsView {
             )
             .children(self.errors.iter().map(|e| div().text_sm().text_color(theme.danger).child(e.clone())))
             .when(crit + warn + if self.show_info { info } else { 0 } == 0, |d| {
-                // An all-clear only when every scan answered.
+                // An all-clear only when every cluster and kind could be read.
                 if self.errors.is_empty() {
                     d.child(
                         h_flex()
@@ -244,7 +244,7 @@ impl Render for ProblemsView {
                         div()
                             .text_sm()
                             .text_color(theme.muted_foreground)
-                            .child("Nothing broken on the clusters that answered."),
+                            .child("Nothing broken in what could be read."),
                     )
                 }
             })
