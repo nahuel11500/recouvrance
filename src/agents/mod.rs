@@ -160,6 +160,7 @@ impl AgentsView {
                 cx.notify();
             }
         }));
+        let error = hub.config_error().map(SharedString::from);
         let mut this = Self {
             activity,
             advanced,
@@ -176,7 +177,7 @@ impl AgentsView {
             editor: None,
             tester,
             server_status,
-            error: None,
+            error,
             _subs: subs,
         };
         if let Some(id) = selected {

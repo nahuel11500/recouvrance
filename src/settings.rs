@@ -272,8 +272,34 @@ fn path() -> PathBuf {
     base.join("recouvrance").join("settings.json")
 }
 
+/// The settings file. A field that does not read (a hand edit, or a value from a newer
+/// version) gets its default and the others, such as `protection`, are kept; the file
+/// is kept aside as `load_json` does.
 fn load() -> Settings {
-    load_json(&path())
+    let p = path();
+    let Ok(bytes) = std::fs::read(&p) else { return Settings::default() };
+    match serde_json::from_slice(&bytes) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("{}: {e}; fields that don't read use their defaults ({})", p.display(), keep_aside(&p));
+            by_field(&bytes).unwrap_or_default()
+        }
+    }
+}
+
+/// `T` from a JSON object, one field at a time: a field that does not read gets its
+/// default. None when the text is not a JSON object.
+fn by_field<T: Serialize + serde::de::DeserializeOwned + Default>(bytes: &[u8]) -> Option<T> {
+    let serde_json::Value::Object(fields) = serde_json::from_slice(bytes).ok()? else { return None };
+    let mut merged = serde_json::to_value(T::default()).ok()?;
+    for (key, value) in fields {
+        let mut candidate = merged.clone();
+        candidate.as_object_mut()?.insert(key, value);
+        if serde_json::from_value::<T>(candidate.clone()).is_ok() {
+            merged = candidate;
+        }
+    }
+    serde_json::from_value(merged).ok()
 }
 
 /// Read a JSON file; missing means the defaults. A file that does not parse is kept
@@ -284,17 +310,21 @@ pub fn load_json<T: serde::de::DeserializeOwned + Default>(path: &Path) -> T {
     match serde_json::from_slice(&bytes) {
         Ok(v) => v,
         Err(e) => {
-            let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
-            let mut bad = path.as_os_str().to_owned();
-            bad.push(format!(".bad-{secs}"));
-            let kept = std::fs::rename(path, &bad).map(|_| format!("kept as {}", Path::new(&bad).display()));
-            eprintln!(
-                "{}: {e}; using defaults ({})",
-                path.display(),
-                kept.unwrap_or_else(|e| format!("could not keep it: {e}"))
-            );
+            eprintln!("{}: {e}; using defaults ({})", path.display(), keep_aside(path));
             T::default()
         }
+    }
+}
+
+/// Move a file that does not read to `<name>.bad-<unix time>`, so the next save does
+/// not overwrite it. Says where it went, or why it could not be moved.
+pub fn keep_aside(path: &Path) -> String {
+    let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    let mut bad = path.as_os_str().to_owned();
+    bad.push(format!(".bad-{secs}"));
+    match std::fs::rename(path, &bad) {
+        Ok(()) => format!("kept as {}", Path::new(&bad).display()),
+        Err(e) => format!("could not keep it: {e}"),
     }
 }
 
@@ -365,13 +395,22 @@ pub fn expand(p: &str) -> PathBuf {
     }
 }
 
-/// Whether writes on this context need an extra typed confirmation.
+/// Whether writes on this context need an extra typed confirmation. A context never set
+/// is guessed from the kubeconfig; one the kubeconfig does not have now (or a kubeconfig
+/// that can't be read, say while a tool rewrites it) can't be guessed, so it is protected.
 pub fn is_protected(context: &str) -> bool {
     migrate_protection();
     match with(|s| s.protection.get(context).copied()) {
         Some(chosen) => chosen,
-        None => crate::k8s::load_contexts().is_ok_and(|c| c.risky.iter().any(|r| r == context)),
+        None => match crate::k8s::load_contexts() {
+            Ok(c) => guess_protected(&c.names, &c.risky, context),
+            Err(_) => true,
+        },
     }
+}
+
+fn guess_protected(names: &[String], risky: &[String], context: &str) -> bool {
+    !names.iter().any(|n| n == context) || risky.iter().any(|r| r == context)
 }
 
 /// Protect a context or not; contexts never set keep being guessed.
@@ -506,9 +545,30 @@ fn unix_now() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        DeleteConfirm, NamespaceVisit, Settings, delete_confirm_in, load_json, migrate_list, recent_as_visits,
-        record_visits, save_newest, visit_score, write_atomic,
+        DeleteConfirm, NamespaceVisit, Settings, by_field, delete_confirm_in, guess_protected, load_json, migrate_list,
+        recent_as_visits, record_visits, save_newest, visit_score, write_atomic,
     };
+
+    #[test]
+    fn a_bad_field_keeps_the_others() {
+        let text =
+            br#"{"protection": {"shop": true}, "delete_confirm": "from-a-newer-version", "metrics_refresh": 42}"#;
+        assert!(serde_json::from_slice::<Settings>(text).is_err());
+        let s: Settings = by_field(text).unwrap();
+        assert_eq!(s.protection.get("shop"), Some(&true));
+        assert_eq!(s.metrics_refresh, 42);
+        assert_eq!(s.delete_confirm, Settings::default().delete_confirm);
+        assert!(by_field::<Settings>(b"{ not json").is_none());
+    }
+
+    #[test]
+    fn a_context_missing_from_the_kubeconfig_is_protected() {
+        let names = ["dev".to_string(), "prod".to_string()];
+        let risky = ["prod".to_string()];
+        assert!(!guess_protected(&names, &risky, "dev"));
+        assert!(guess_protected(&names, &risky, "prod"));
+        assert!(guess_protected(&names, &risky, "shop"));
+    }
 
     const DAY: i64 = 24 * 3600;
 
