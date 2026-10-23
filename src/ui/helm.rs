@@ -235,6 +235,35 @@ pub async fn history(client: Client, namespace: String, name: String) -> Result<
     .await
 }
 
+/// The newest revision of a release, from its Secrets' labels (no payload read).
+async fn newest_revision(client: Client, namespace: String, name: String) -> Result<Option<i64>> {
+    anyhow::ensure!(valid_release_name(&name), "invalid release name {name:?}");
+    k8s::run(async move {
+        let api: Api<Secret> = Api::namespaced(client, &namespace);
+        let lp = ListParams::default().labels(&format!("owner=helm,name={name}"));
+        let items = api.list_metadata(&lp).await?.items;
+        Ok(items
+            .iter()
+            .filter_map(|m| stub(&m.metadata))
+            .filter(|r| r.name == name && r.namespace == namespace)
+            .map(|r| r.revision)
+            .max())
+    })
+    .await
+}
+
+/// Why an upgrade built from revision `shown` must not run, given the release's newest
+/// revision now: it would send that revision's chart version and values over newer ones.
+fn stale_upgrade(name: &str, shown: i64, newest: Option<i64>) -> Option<String> {
+    match newest {
+        Some(n) if n == shown => None,
+        Some(n) => Some(format!(
+            "{name} changed since this page was read (revision {shown}, now {n}): open it again to upgrade from there"
+        )),
+        None => Some(format!("{name} has no revision any more: it may have been uninstalled")),
+    }
+}
+
 /// Values as YAML; secret-looking keys are masked unless revealed.
 fn values_yaml(values: &Value, reveal: bool) -> String {
     if values.is_null() {
@@ -247,19 +276,27 @@ fn values_yaml(values: &Value, reveal: bool) -> String {
     crate::yaml::to_string(&v).unwrap_or_default()
 }
 
+/// Mask the values under secret-looking keys: a string or number, or each one in a list of
+/// them (`passwords: [p1, p2]`).
 fn mask_secrets(v: &mut Value) {
     const HINTS: [&str; 9] =
         ["password", "passwd", "secret", "token", "apikey", "api_key", "credential", "privatekey", "private_key"];
+    let scalar = |v: &Value| v.is_string() || v.is_number();
+    let mask = || Value::String("••••••".into());
     match v {
         Value::Object(map) => {
             for (k, val) in map.iter_mut() {
                 let key = k.to_lowercase().replace('-', "_");
                 let secretish =
                     HINTS.iter().any(|h| key.contains(h)) || key.ends_with("key") && !key.ends_with("publickey");
-                if secretish && (val.is_string() || val.is_number()) {
-                    *val = Value::String("••••••".into());
-                } else {
-                    mask_secrets(val);
+                match val {
+                    val if secretish && scalar(val) => *val = mask(),
+                    Value::Array(items) if secretish => {
+                        for item in items {
+                            if scalar(item) { *item = mask() } else { mask_secrets(item) }
+                        }
+                    }
+                    val => mask_secrets(val),
                 }
             }
         }
@@ -836,6 +873,7 @@ impl HelmRelease {
             self.release.namespace.clone(),
             self.release.chart_version.clone(),
         );
+        let (client, shown) = (self.client.clone(), self.release.revision);
         // A fresh private directory: the values may hold secrets.
         let written =
             crate::private_files::PrivateDir::create().and_then(|d| Ok((d.write("values.yaml", &values)?, d)));
@@ -848,6 +886,19 @@ impl HelmRelease {
         };
         window.push_notification(Notification::info(if dry_run { "Dry run upgrade…" } else { "Upgrading…" }), cx);
         cx.spawn_in(window, async move |this, cx| {
+            // The page may be out of date (CI upgraded meanwhile): its chart version and values
+            // would undo the newer revision. Refused when that can't be checked either.
+            let stale = match newest_revision(client, ns.clone(), name.clone()).await {
+                Ok(newest) => stale_upgrade(&name, shown, newest),
+                Err(e) => Some(format!("could not read {name}'s newest revision: {e:#}")),
+            };
+            if let Some(why) = stale {
+                drop(dir);
+                let _ = this.update_in(cx, |_, window, cx| {
+                    window.push_notification(Notification::error(format!("helm upgrade refused: {why}")), cx)
+                });
+                return;
+            }
             let mut args = vec![
                 "upgrade".into(),
                 "--version".into(),
@@ -1176,7 +1227,7 @@ mod tests {
     // Not `super::*`: gpui's own `test` attribute would shadow the standard one.
     use super::{
         Secret, Value, chart_refs, decode, latest_revisions, mask_manifest, mask_secrets, merge_clusters,
-        newer_revision, opened_revision, stub, upgrade_text, values_yaml,
+        newer_revision, opened_revision, stale_upgrade, stub, upgrade_text, values_yaml,
     };
     use base64::Engine as _;
     use std::io::Write as _;
@@ -1322,6 +1373,14 @@ mod tests {
     }
 
     #[test]
+    fn upgrades_only_from_the_newest_revision() {
+        assert!(stale_upgrade("web", 5, Some(5)).is_none());
+        // CI upgraded to 6 after the page read 5: 5's chart version and values would undo it.
+        assert!(stale_upgrade("web", 5, Some(6)).is_some_and(|e| e.contains("now 6")));
+        assert!(stale_upgrade("web", 5, None).is_some());
+    }
+
+    #[test]
     fn moves_to_the_newest_revision() {
         let rev = |v| {
             decode(&helm_secret(
@@ -1368,8 +1427,15 @@ mod tests {
             "db": {"password": "example", "host": "pg", "port": 5432},
             "auth": {"apiKey": "abc", "publicKey": "pub"},
             "list": [{"token": "t"}],
+            "mongodb": {"auth": {"passwords": ["p1", "p2"], "usernames": ["u1"]}},
+            "sasl": {"client": {"passwords": ["p1", {"secret": "s", "name": "n"}]}},
         });
         mask_secrets(&mut v);
+        assert_eq!(v["mongodb"]["auth"]["passwords"], serde_json::json!(["••••••", "••••••"]));
+        assert_eq!(v["mongodb"]["auth"]["usernames"][0], "u1");
+        assert_eq!(v["sasl"]["client"]["passwords"][0], "••••••");
+        assert_eq!(v["sasl"]["client"]["passwords"][1]["secret"], "••••••");
+        assert_eq!(v["sasl"]["client"]["passwords"][1]["name"], "n");
         assert_eq!(v["db"]["password"], "••••••");
         assert_eq!(v["db"]["host"], "pg");
         assert_eq!(v["db"]["port"], 5432);

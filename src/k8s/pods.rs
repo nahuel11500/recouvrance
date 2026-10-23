@@ -199,19 +199,57 @@ fn retryable(e: &anyhow::Error) -> bool {
     }
 }
 
-/// After a followed stream ends: whether the pod still runs (its logs may go on).
-async fn still_running(api: &Api<Pod>, pod: &str) -> bool {
+/// After a followed stream ends: whether the container may still log (its logs may go on).
+async fn still_running(api: &Api<Pod>, pod: &str, container: Option<&str>) -> bool {
     match api.get_opt(pod).await {
-        Ok(Some(p)) => !matches!(p.status.and_then(|s| s.phase).as_deref(), Some("Succeeded" | "Failed")),
+        Ok(Some(p)) => may_log_more(&p, container),
         Ok(None) => false,
         // Can't tell (network): try the stream again.
         Err(_) => true,
     }
 }
 
+/// Whether a container may write to its log again: its pod is not finished, and it has not
+/// ended for good (an init container that succeeded, an ephemeral container, one its restart
+/// policy won't start again). When that can't be told, it may.
+fn may_log_more(pod: &Pod, container: Option<&str>) -> bool {
+    let status = pod.status.as_ref();
+    if matches!(status.and_then(|s| s.phase.as_deref()), Some("Succeeded" | "Failed")) {
+        return false;
+    }
+    let (Some(name), Some(status)) = (container, status) else { return true };
+    // 0: an app container, 1: an init container, 2: an ephemeral one.
+    let lists = [&status.container_statuses, &status.init_container_statuses, &status.ephemeral_container_statuses];
+    let Some((kind, ended)) = lists.iter().enumerate().find_map(|(kind, list)| {
+        let found = list.as_ref()?.iter().find(|c| c.name == name)?;
+        Some((kind, found.state.as_ref()?.terminated.as_ref()?))
+    }) else {
+        return true;
+    };
+    let spec = pod.spec.as_ref();
+    let own = spec
+        .and_then(|s| match kind {
+            0 => s.containers.iter().find(|c| c.name == name),
+            1 => s.init_containers.as_ref()?.iter().find(|c| c.name == name),
+            _ => None,
+        })
+        .and_then(|c| c.restart_policy.as_deref());
+    let pod_policy = spec.and_then(|s| s.restart_policy.as_deref()).unwrap_or("Always");
+    match kind {
+        0 => match own.unwrap_or(pod_policy) {
+            "Always" => true,
+            "OnFailure" => ended.exit_code != 0,
+            _ => false,
+        },
+        // A sidecar starts again; another init container only after it failed.
+        1 => own == Some("Always") || (ended.exit_code != 0 && pod_policy != "Never"),
+        _ => false,
+    }
+}
+
 /// Stream a container's log. When following, a cut stream (API server restart, a
 /// connection timeout, a container restarting) reconnects with backoff from the last
-/// line seen, until the pod is gone or finished.
+/// line seen, until the pod is gone or finished or the container has ended for good.
 pub fn stream_logs(
     client: Client,
     ns: String,
@@ -277,7 +315,7 @@ pub fn stream_logs(
                 // The container may just be quiet, or the connection died without closing
                 // (sleep, VPN, a load balancer's idle timeout): ask again from the last line.
                 Ok(true) => continue,
-                Ok(false) if previous || !still_running(&api, &pod).await => {
+                Ok(false) if previous || !still_running(&api, &pod, container.as_deref()).await => {
                     let _ = tx.unbounded_send(LogMsg::End);
                     return;
                 }
@@ -421,6 +459,51 @@ async fn read_line_capped<R: futures::AsyncBufRead + Unpin>(
 #[cfg(test)]
 mod tests {
     use futures::StreamExt as _;
+
+    #[test]
+    fn a_container_that_ended_for_good_logs_no_more() {
+        let pod = |policy: &str, statuses: serde_json::Value| -> super::Pod {
+            let mut pod = serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "metadata": {"name": "web-1"},
+                "spec": {
+                    "restartPolicy": policy,
+                    "initContainers": [{"name": "migrate"}, {"name": "proxy", "restartPolicy": "Always"}],
+                    "containers": [{"name": "app"}],
+                },
+                "status": {"phase": "Running"},
+            });
+            pod["status"].as_object_mut().unwrap().extend(statuses.as_object().unwrap().clone());
+            serde_json::from_value(pod).unwrap()
+        };
+        let ended = |name: &str, code: i32| serde_json::json!({"name": name, "image": "", "imageID": "", "ready": false, "restartCount": 0, "state": {"terminated": {"exitCode": code}}});
+        let running = |name: &str| serde_json::json!({"name": name, "image": "", "imageID": "", "ready": true, "restartCount": 0, "state": {"running": {}}});
+        let init = |s| serde_json::json!({"initContainerStatuses": [s]});
+        let app = |s| serde_json::json!({"containerStatuses": [s]});
+        // An init container that succeeded is done; one that failed runs again unless Never.
+        assert!(!super::may_log_more(&pod("Always", init(ended("migrate", 0))), Some("migrate")));
+        assert!(super::may_log_more(&pod("Always", init(ended("migrate", 1))), Some("migrate")));
+        assert!(!super::may_log_more(&pod("Never", init(ended("migrate", 1))), Some("migrate")));
+        // A sidecar starts again.
+        assert!(super::may_log_more(&pod("Never", init(ended("proxy", 0))), Some("proxy")));
+        // App containers follow the pod's restart policy.
+        assert!(super::may_log_more(&pod("Always", app(ended("app", 0))), Some("app")));
+        assert!(!super::may_log_more(&pod("OnFailure", app(ended("app", 0))), Some("app")));
+        assert!(super::may_log_more(&pod("OnFailure", app(ended("app", 2))), Some("app")));
+        assert!(!super::may_log_more(&pod("Never", app(ended("app", 2))), Some("app")));
+        // An ephemeral container never starts again.
+        let debug = serde_json::json!({"ephemeralContainerStatuses": [ended("debugger-x", 0)]});
+        assert!(!super::may_log_more(&pod("Always", debug), Some("debugger-x")));
+        // Running, unknown or not chosen: it may.
+        assert!(super::may_log_more(&pod("Never", app(running("app"))), Some("app")));
+        assert!(super::may_log_more(&pod("Never", app(running("app"))), Some("other")));
+        assert!(super::may_log_more(&pod("Never", app(ended("app", 0))), None));
+        // A finished pod logs no more.
+        let mut done = pod("Always", app(running("app")));
+        done.status.as_mut().unwrap().phase = Some("Succeeded".into());
+        assert!(!super::may_log_more(&done, Some("app")));
+    }
 
     fn lines(data: &[u8], max: usize) -> Vec<String> {
         futures::executor::block_on(super::lossy_lines(data, max).map(|l| l.unwrap()).collect::<Vec<_>>())

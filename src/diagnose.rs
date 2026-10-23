@@ -76,8 +76,21 @@ pub fn pod(pod: &Value, events: &[Ev], crash_logs: Option<&(String, String)>) ->
             hint: "The node ran short of a resource (often memory or disk). Check the node's pressure conditions and the pod's requests.".into(),
         });
     }
-    // Unscheduled.
-    if phase == "Pending" && s(pod, "/spec/nodeName").is_empty() {
+    // Held back on purpose: the scheduler leaves it alone until its gates are removed.
+    let gates: Vec<&str> = pod
+        .pointer("/spec/schedulingGates")
+        .and_then(Value::as_array)
+        .map(|g| g.iter().filter_map(|g| g["name"].as_str()).collect())
+        .unwrap_or_default();
+    if phase == "Pending" && s(pod, "/spec/nodeName").is_empty() && !gates.is_empty() {
+        out.push(Finding {
+            level: Level::Warning,
+            title: "Waiting on scheduling gates".into(),
+            detail: gates.join(", "),
+            hint: "A controller (such as Kueue) removes the gates when the pod may run. If it waits long, check that controller.".into(),
+        });
+    } else if phase == "Pending" && s(pod, "/spec/nodeName").is_empty() {
+        // Unscheduled.
         let cond = pod
             .pointer("/status/conditions")
             .and_then(Value::as_array)
@@ -386,6 +399,13 @@ mod tests {
         let f = pod(&p, &ev, None);
         assert_eq!(f[0].title, "Not scheduled");
         assert!(f[0].hint.contains("enough free capacity"));
+        // Held by a scheduling gate (Kueue): waiting on purpose, not a scheduling failure.
+        let p = json!({"status": {"phase": "Pending"}, "spec": {"schedulingGates": [{"name": "kueue.x-k8s.io/admission"}]}});
+        let f = pod(&p, &[], None);
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert_eq!(f[0].level, Level::Warning);
+        assert_eq!(f[0].title, "Waiting on scheduling gates");
+        assert_eq!(f[0].detail, "kueue.x-k8s.io/admission");
         let p = json!({"spec": {"nodeName": "n1"}, "status": {"phase": "Pending", "containerStatuses": [{
             "name": "app", "image": "nginx:nope", "restartCount": 0,
             "state": {"waiting": {"reason": "ImagePullBackOff", "message": "manifest unknown"}}

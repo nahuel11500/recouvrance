@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 50174aca0e9529c9e7815ba5865df0940c083707dd1a0a5c663c1c5376f695c8 # shrinks to r = Rule { effect: Allow, verbs: ["*"], resources: ["*"], namespaces: ["*"], contexts: ["team-*"], names: [], note: "", expires: None, approved: false }, odd = [""], field = 3, requests = [Access { context: "team-a", verb: "get", resource: "a", resource_aliases: [], namespace: None, name: None, cluster_scoped: false }]

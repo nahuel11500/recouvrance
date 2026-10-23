@@ -55,6 +55,7 @@ impl AppView {
         let forwards = self.forwards.clone();
         let favorites = self.favorites.clone();
         let clusters = self.clusters.clone();
+        let context_name = context.clone();
         let panel = cx.new(|cx| {
             let mut p = DetailPanel::new(client, context, risky, forwards, favorites, obj, window, cx);
             p.clusters = clusters;
@@ -62,6 +63,20 @@ impl AppView {
         });
         cx.subscribe_in(&panel, window, |this, _, ev: &crate::plugins::RunPlugin, window, cx| {
             this.run_plugin(ev, window, cx)
+        })
+        .detach();
+        cx.subscribe_in(&panel, window, move |this, _, ev: &crate::details::Investigate, window, cx| {
+            let q = crate::assistant::investigation(
+                &context_name,
+                &ev.kind,
+                ev.namespace.as_deref(),
+                &ev.name,
+                &ev.findings,
+            );
+            this.open_assistant(window, cx);
+            if let Some(page) = this.assistant_page() {
+                page.update(cx, |a, cx| a.start_over(q, cx));
+            }
         })
         .detach();
         // Released with the page.
@@ -129,12 +144,21 @@ impl AppView {
     /// A plugin runs in a terminal page, or in the background with a notification.
     pub(super) fn run_plugin(&mut self, ev: &crate::plugins::RunPlugin, window: &mut Window, cx: &mut Context<Self>) {
         let Some(client) = self.clusters.iter().find(|c| c.0 == ev.context).map(|c| c.1.clone()) else { return };
+        // Asked and confirmed with write mode on, but it may have been turned off since.
+        let writes = !ev.plugin.read_only;
+        if writes && !crate::details::writes_still_on(window, cx) {
+            return;
+        }
         match ev.plugin.mode {
             crate::plugins::Mode::Terminal => {
                 let (ctx, ns, cmd, env) =
                     (ev.context.clone(), ev.namespace.clone(), ev.command.clone(), ev.env.clone());
-                let t = cx
-                    .new(|cx| crate::ui::terminal::TerminalView::local_command(client, ctx, ns, cmd, env, window, cx));
+                let t = cx.new(|cx| {
+                    let t = crate::ui::terminal::TerminalView::local_command(client, ctx, ns, cmd, env, window, cx);
+                    // Running a writing plugin again goes through its button: write mode,
+                    // protection and its confirm, not the terminal's Reconnect.
+                    if writes { t.run_once() } else { t }
+                });
                 self.navigate(Route::Terminal(t), cx);
             }
             crate::plugins::Mode::Background => {
@@ -161,29 +185,50 @@ impl AppView {
         }
     }
 
-    /// One assistant chat per window, kept across navigation.
-    pub(super) fn open_assistant(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let page = match self.history.iter().find_map(|r| match r {
+    fn assistant_page(&self) -> Option<Entity<crate::ui::assistant_view::AssistantView>> {
+        self.history.iter().find_map(|r| match r {
             Route::Assistant(e) => Some(e.clone()),
             _ => None,
-        }) {
-            Some(p) => p,
+        })
+    }
+
+    /// One assistant chat per window, kept across navigation.
+    pub(super) fn open_assistant(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let scope = self.assistant_scope();
+        let page = match self.assistant_page() {
+            Some(p) => {
+                p.update(cx, |p, cx| p.set_scope(scope, cx));
+                p
+            }
             None => {
-                let scope = if self.clusters.is_empty() {
-                    "no cluster open in Recouvrance (every kubeconfig context is available: start with list_contexts)"
-                        .to_string()
-                } else {
-                    format!(
-                        "contexts {}{}",
-                        self.clusters.iter().map(|c| c.0.clone()).collect::<Vec<_>>().join(", "),
-                        self.namespace.as_ref().map(|n| format!(", namespace {n}")).unwrap_or_default()
-                    )
-                };
                 let hub = self.hub.clone();
                 cx.new(|cx| crate::ui::assistant_view::AssistantView::new(hub, scope, window, cx))
             }
         };
         self.navigate(Route::Assistant(page), cx);
+    }
+
+    /// What the assistant is told the user is looking at.
+    fn assistant_scope(&self) -> String {
+        let (contexts, namespace) = self.page_scope();
+        scope_text(&contexts, namespace.as_deref())
+    }
+
+    /// Tell open assistant chats, in every tab, about a new namespace selection.
+    pub(super) fn update_assistant_scope(&self, cx: &mut Context<Self>) {
+        let pages: Vec<_> = self
+            .history
+            .iter()
+            .chain(self.tabs.iter().flat_map(|t| t.history.iter()))
+            .filter_map(|r| match r {
+                Route::Assistant(e) => Some(e.clone()),
+                _ => None,
+            })
+            .collect();
+        let scope = self.assistant_scope();
+        for page in pages {
+            page.update(cx, |p, cx| p.set_scope(scope.clone(), cx));
+        }
     }
 
     pub(super) fn open_helm_install(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -279,5 +324,28 @@ impl AppView {
             this.open_helm_install(window, cx)
         })
         .detach();
+    }
+}
+
+/// What the assistant is told about `contexts` and the namespace picked.
+fn scope_text(contexts: &[String], namespace: Option<&str>) -> String {
+    if contexts.is_empty() {
+        return "no cluster open in Recouvrance (every kubeconfig context is available: start with list_contexts)"
+            .to_string();
+    }
+    let namespace = namespace.map(|n| format!(", namespace {n}")).unwrap_or_default();
+    format!("contexts {}{namespace}", contexts.join(", "))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::scope_text;
+
+    #[test]
+    fn the_assistant_scope_names_the_namespace_picked_now() {
+        let contexts = ["a".to_string(), "b".to_string()];
+        assert_eq!(scope_text(&contexts, Some("y")), "contexts a, b, namespace y");
+        assert_eq!(scope_text(&contexts, None), "contexts a, b");
+        assert!(scope_text(&[], Some("y")).starts_with("no cluster open"));
     }
 }

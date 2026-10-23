@@ -23,10 +23,13 @@ Recouvrance reads your kubeconfig like `kubectl` does and keeps its own settings
 
 A JSON file that can't be read is kept aside as `<name>.bad-<time>` so the next save doesn't
 overwrite it. In `settings.json`, only the keys that don't read get their default; the others,
-such as `protection`, are kept. A `settings.json` that exists but can't be read (say, owned by
-root after a run with `sudo`) is left alone: the app starts with the defaults, counts every context
-not set as protected, saves nothing until it is restarted with a readable file, and Settings says
-why. When `agents.json` can't be read, the app starts with no agents and
+such as `protection`, are kept; a `protection` entry that isn't `true` or `false` counts as
+protected, and a `delete_confirm_kinds` entry that doesn't read asks for the name. When
+`settings.json` doesn't read as an object at all, or its protection choices can't be read, every
+context without a choice is protected for that session. A `settings.json` that exists but can't be
+read (say, owned by root after a run with `sudo`) is left alone: the app starts with the defaults,
+counts every context not set as protected, saves nothing until it is restarted with a readable
+file, and Settings says why. When `agents.json` can't be read, the app starts with no agents and
 agent access off, and the Agents page says why.
 
 ## Kubeconfig
@@ -47,7 +50,8 @@ to any of these files are picked up within a few seconds. When two files define 
 (or cluster, or user) with the same name, the later one is renamed `name@file` so both stay usable.
 A context name stays with the file that had it first (kept in `context_files`), even when files
 are saved again, reordered, or one is briefly unreadable: protection and per-cluster settings
-never move to another cluster. The name is freed when its file is deleted or no longer has it.
+never move to another cluster. The name is freed when its file is deleted or no longer has it
+(read twice the same way, so a file caught while `kubectl` rewrites it keeps its names).
 
 ## settings.json
 
@@ -58,7 +62,7 @@ never move to another cluster. The name is freed when its file is deleted or no 
 | `metrics_refresh`, `detail_refresh`, `overview_refresh` | 15, 5, 30 | Seconds between refreshes |
 | `log_tail_lines`, `log_timestamps` | 1000, true | Log viewer |
 | `kubeconfigs`, `kubeconfig_folders` | | Extra kubeconfig files and watched folders (see above) |
-| `context_files` | | `{ "prod": "~/.kube/team-a.yaml" }`: the file each context name belongs to, so a name several files share stays with the first one (see above); filled in on its own |
+| `context_files` | | `{ "prod": "~/.kube/team-a.yaml" }`: the file each context name belongs to, so a name several files share stays with the first one, and the `name@file` names the others get stay with theirs (see above); filled in on its own |
 | `context_colors` | | `{ "prod-eu": "#ef4444" }`: a colored strip per context |
 | `protection` | guessed | `{ "prod-eu": true, "kind-dev": false }`: contexts where writes, shells and plugins need the context name typed. Contexts not listed are guessed from the context, user and cluster names and the server URL (`prod`, `prd`, `production`, `live`, `admin`, `root`); a context the kubeconfig doesn't have now, or any context while the kubeconfig can't be read, counts as protected. An older `protected_contexts` list is read once: its contexts become `true` |
 | `prometheus` | found automatically | `{ "ctx": "monitoring/prometheus:9090" }` (see below) |
@@ -129,8 +133,12 @@ comma-separated, `*` globs work everywhere, an omitted part means `*`, and `-` i
 (the rule matches nothing; an exported rule with nothing chosen yet is written that way). Deny wins, then ask,
 then allow; anything no rule matches is denied. `approved` lists the requests you approved with
 *Always allow this* or *Allow for 1h*: they are allowed even where an ask rule matches, never where a
-deny rule does. The file is reloaded when it changes, and edits on the Agents page are written back
-to it (its comments are not kept).
+deny rule does. An `approved` rule's resource is matched as written (`pods` is not
+`pods.metrics.k8s.io`), and its names and contexts case included. The file is reloaded when it changes, and edits on the Agents page are written back
+to it (its comments are not kept). An edit on the Agents page made after you saved the file, but
+before it was reloaded, is refused so it doesn't overwrite yours. A key the file doesn't know (a
+misspelt `deny:`) fails the load, like a rule that doesn't parse: the rules in force stay as they
+were and the Agents page shows the error.
 
 While the file exists, an agent it doesn't name has no rules, so everything it asks is denied:
 removing an agent's section takes its access away. Deleting an agent on the Agents page removes its
@@ -173,7 +181,8 @@ terminal page, or in the background with the last line of output shown.
 
 A plugin may change the cluster, so it is treated as a write: it needs write mode, and on a
 protected context the context name typed. A plugin that only reads declares `read_only: true` and
-runs in read-only mode too. `confirm: true` always asks before running.
+runs in read-only mode too. `confirm: true` always asks before running. A plugin that writes runs
+again only from its button, with these checks, not from its terminal page.
 
 ## Templates
 

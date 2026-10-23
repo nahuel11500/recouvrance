@@ -435,6 +435,8 @@ impl KubeMcp {
         };
         let q = p.query.to_lowercase();
         let mut rows = Vec::new();
+        // The kinds that couldn't be listed, with why: the agent must not read them as empty.
+        let (mut searched, mut failed) = (0, Vec::new());
         for name in [
             "deployments",
             "statefulsets",
@@ -452,7 +454,15 @@ impl KubeMcp {
             if list_verdict(call.policy(), &kind, &p.context) == Mode::Deny {
                 continue;
             }
-            for (ns, obj) in k8s::list_names(client.clone(), kind.ar.clone(), None).await.unwrap_or_default() {
+            searched += 1;
+            let names = match k8s::list_names(client.clone(), kind.ar.clone(), None).await {
+                Ok(names) => names,
+                Err(e) => {
+                    failed.push(format!("{} ({e:#})", kind.kubectl_name()));
+                    continue;
+                }
+            };
+            for (ns, obj) in names {
                 if !obj.to_lowercase().contains(&q) {
                     continue;
                 }
@@ -464,10 +474,18 @@ impl KubeMcp {
             }
         }
         rows.truncate(call.policy().max_rows as usize);
-        if rows.is_empty() {
-            return call.finish(Ok(format!("Nothing named like {:?}.", p.query)));
+        if searched > 0 && failed.len() == searched {
+            return call.finish(Err(anyhow::anyhow!("couldn't search: {}", failed.join("; "))));
         }
-        call.finish(Ok(format_table(&["KIND", "NAMESPACE", "NAME"], &rows)))
+        let mut out = if rows.is_empty() {
+            format!("Nothing named like {:?}.", p.query)
+        } else {
+            format_table(&["KIND", "NAMESPACE", "NAME"], &rows)
+        };
+        if !failed.is_empty() {
+            out.push_str(&format!("\nNot searched, the list failed: {}", failed.join("; ")));
+        }
+        call.finish(Ok(out))
     }
 
     #[tool(
@@ -578,7 +596,9 @@ impl KubeMcp {
                         let from = c.not_before.map(|t| t.strftime("%Y-%m-%d").to_string()).unwrap_or_default();
                         format!("NOT VALID UNTIL {from}")
                     } else if days < 0 {
-                        format!("EXPIRED {}d ago", -days)
+                        // The days that went by: 3 hours ago is 0, not the -1 days left.
+                        let ago = c.not_after.map(|t| crate::certs::days_ago(t, now)).unwrap_or(0);
+                        format!("EXPIRED {ago}d ago")
                     } else {
                         days.to_string()
                     },
@@ -608,18 +628,19 @@ impl KubeMcp {
             Ok((_, kinds)) => kinds,
             Err(e) => return call.finish(Err(e)),
         };
-        let found = match crate::problems::scan(client, &kinds, p.namespace.clone()).await {
-            Ok(f) => f,
-            Err(e) => return call.finish(Err(e)),
-        };
+        // A kind that can't be listed is named, and doesn't hide what the others found.
+        let scan = crate::problems::scan_partial(client, &kinds, p.namespace.clone()).await;
+        let skipped = scan.skipped_text().map(|s| format!("Not checked, could not read {s}."));
         let minor = p.include_minor.unwrap_or(false);
-        let table: Vec<Vec<String>> = found
+        let table: Vec<Vec<String>> = scan
+            .problems
             .into_iter()
             .filter(|x| minor || x.severity != crate::problems::Severity::Info)
             .filter(|x| {
                 // Only what this agent may see.
                 k8s::find_kind(&kinds, &x.kind).is_some_and(|k| {
-                    call.may_see(&access_for(k, &p.context, "list", x.namespace.clone(), Some(x.name.clone())))
+                    let a = access_for(k, &p.context, "list", x.namespace.clone(), Some(x.name.clone()));
+                    problem_visible(call.policy(), call.approved_rules(), k.is("", "Pod"), &a)
                 })
             })
             .take(200)
@@ -634,10 +655,15 @@ impl KubeMcp {
                 ]
             })
             .collect();
-        if table.is_empty() {
-            return call.finish(Ok("No problems found.".into()));
+        let mut out = if table.is_empty() {
+            "No problems found.".to_string()
+        } else {
+            format_table(&["SEVERITY", "KIND", "NAMESPACE", "NAME", "PROBLEM", "AGE"], &table)
+        };
+        if let Some(note) = skipped {
+            out = format!("{out}\n{note}");
         }
-        call.finish(Ok(format_table(&["SEVERITY", "KIND", "NAMESPACE", "NAME", "PROBLEM", "AGE"], &table)))
+        call.finish(Ok(out))
     }
 
     #[tool(

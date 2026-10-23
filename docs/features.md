@@ -35,7 +35,9 @@
   ReplicaSets, Events…) is deleted right away; what takes data, machines or everything inside with
   it (Nodes, Namespaces, StatefulSets, Deployments, DaemonSets, PersistentVolumes and their claims,
   CRDs) needs the name typed; anything else, custom resources included, asks. A kind is added by
-  its name, plural or short name (`deploy`), checked against the connected clusters. Every delete dialog
+  its name, plural or short name (`deploy`), checked against the connected clusters; a custom
+  resource is saved with its group (`Cluster.postgresql.cnpg.io`), so a choice for a built-in kind
+  never applies to a custom resource of the same name, unless it asks more. Every delete dialog
   links to the setting. A protected context always asks for its name, and an object stuck
   terminating always shows the dialog, to remove its finalizers.
 - **Write mode** (off by default): click the `read-only` badge to enable scale, restart, delete
@@ -59,7 +61,8 @@
 - **Diagnosis** on pods and workloads: why it is broken (crash output and exit code, scheduling,
   image pulls, probes, volumes) and what to try.
 - **Rollback** of Deployments, StatefulSets and DaemonSets to any revision, with the diff and a
-  server dry run first; **attach** to a container's process; **file copy** in and out of containers;
+  server dry run first; **attach** to a container's process; **file copy** in and out of containers
+  (both ways it runs commands in the container, so it needs write mode, like a shell);
   **bulk scale**.
 - **Configuration**: edit ConfigMap/Secret values as key/value rows; create Secrets (Opaque, registry,
   TLS, basic auth) and ConfigMaps from forms.
