@@ -278,7 +278,8 @@ fn mask_manifest(manifest: &str) -> String {
         doc.clear();
     };
     for line in manifest.split_inclusive('\n') {
-        if line.trim_end() == "---" {
+        // `--- # Source: chart/templates/secret.yaml` starts a document too.
+        if crate::yaml::doc_start(line.trim_end()).is_some() {
             flush(&mut doc, &mut out);
             out.push_str(line);
         } else {
@@ -302,7 +303,7 @@ fn mask_manifest_doc(doc: &str) -> String {
         }
         Ok(_) => doc.to_string(),
         // Unreadable, but it may be a Secret: hide it rather than show its values.
-        Err(_) if doc.lines().any(|l| l.trim() == "kind: Secret") => {
+        Err(_) if doc.lines().any(|l| l.trim_start().starts_with("kind:") && l.contains("Secret")) => {
             comments + "# A Secret (its values are hidden; reveal secrets to see it)\n"
         }
         Err(_) => doc.to_string(),
@@ -1296,6 +1297,17 @@ mod tests {
         assert_eq!(mask_manifest("kind: ConfigMap\n"), "kind: ConfigMap\n");
         // Unparsable but a Secret: hidden whole.
         assert!(!mask_manifest("kind: Secret\ndata: [x: {\n  p: example-value\n").contains("example-value"));
+        assert!(!mask_manifest("kind: \"Secret\" # x\ndata: [x: {\n  p: example-value\n").contains("example-value"));
+    }
+
+    /// `--- # Source: …` separates documents like `---`: read as one document with the one
+    /// before, a Secret's values used to be shown.
+    #[test]
+    fn a_separator_with_a_comment_still_splits() {
+        let manifest = "apiVersion: v1\nkind: ConfigMap\ndata:\n  a: visible\n--- # Source: c/templates/secret.yaml\napiVersion: v1\nkind: Secret\nstringData:\n  config: example-value\n";
+        let masked = mask_manifest(manifest);
+        assert!(!masked.contains("example-value"), "{masked}");
+        assert!(masked.contains("a: visible") && masked.contains("--- # Source: c/templates/secret.yaml"));
     }
 
     #[test]

@@ -225,7 +225,11 @@ impl KubeMcp {
         rows.retain(|r| {
             call.may_see(&access_for(&kind, &p.context, "list", r.namespace.clone(), Some(r.name.clone())))
         });
-        rows.sort_by_key(|r| std::cmp::Reverse(r.created));
+        // Newest first by when they last happened (an event that keeps repeating was created
+        // long ago), as the server's Last Seen column says.
+        let last_seen = defs.iter().position(|d| d.name == "Last Seen");
+        let ago = |r: &k8s::Row| last_seen.and_then(|i| r.cells.get(i)).and_then(|c| k8s::age_seconds(c));
+        rows.sort_by_key(|r| (ago(r).unwrap_or(i64::MAX), std::cmp::Reverse(r.created)));
         let max = call.policy().max_rows as usize;
         let cols: Vec<usize> = (0..defs.len()).filter(|&i| defs[i].priority == 0).collect();
         let mut headers = vec!["NAMESPACE".to_string()];
@@ -322,21 +326,18 @@ impl KubeMcp {
                 c["restartCount"]
             ));
         }
-        // Pods behind workloads and services.
-        let selector = value
-            .pointer("/spec/selector/matchLabels")
-            .or_else(|| kind.is("", "Service").then(|| value.pointer("/spec/selector")).flatten())
-            .and_then(|s| s.as_object())
-            .filter(|m| !m.is_empty())
-            .map(|m| {
-                m.iter().map(|(k, v)| format!("{k}={}", v.as_str().unwrap_or_default())).collect::<Vec<_>>().join(",")
-            });
+        // Pods behind workloads, services and budgets, picked as the app's pages pick them.
+        let selects_pods = kind.is("", "Service")
+            || kind.is("policy", "PodDisruptionBudget")
+            || kind.ar.group == "apps"
+            || kind.is("batch", "Job");
+        let selector = selects_pods.then(|| k8s::pod_selection(&kind, &value).list_selector()).flatten();
         if let (Some(sel), Some(ns)) = (selector, ns.clone()) {
             let pods_kind = self.kind(&call, &p.context, "pods").await?.1;
             if call.policy().decide(&access_for(&pods_kind, &p.context, "list", Some(ns.clone()), None)).mode
                 == Mode::Allow
                 && let Ok((defs, mut rows)) =
-                    k8s::list_table(client.clone(), pods_kind.clone(), Some(ns.clone()), Some(sel), None).await
+                    k8s::list_table(client.clone(), pods_kind.clone(), Some(ns.clone()), sel, None).await
             {
                 rows.retain(|r| {
                     let a = access_for(&pods_kind, &p.context, "list", Some(ns.clone()), Some(r.name.clone()));
@@ -673,19 +674,12 @@ impl KubeMcp {
             (vec![value.clone()], 0)
         } else {
             let pods_kind = self.kind(&call, &p.context, "pods").await?.1;
-            let selector: Vec<String> = value
-                .pointer("/spec/selector/matchLabels")
-                .and_then(|m| m.as_object())
-                .map(|m| m.iter().map(|(k, v)| format!("{k}={}", v.as_str().unwrap_or_default())).collect())
-                .unwrap_or_default();
-            if selector.is_empty() {
+            let Some(Some(selector)) = k8s::pod_selection(&kind, &value).list_selector() else {
                 return call.finish(Err(anyhow::anyhow!("{} has no label selector", kind.ar.kind)));
-            }
+            };
             let pod_ar = k8s::ar_of::<k8s_openapi::api::core::v1::Pod>();
             let mut pods =
-                match k8s::list_values(client.clone(), pod_ar, Some(p.namespace.clone()), Some(selector.join(",")))
-                    .await
-                {
+                match k8s::list_values(client.clone(), pod_ar, Some(p.namespace.clone()), Some(selector)).await {
                     Ok(v) => v,
                     Err(e) => return call.finish(Err(e)),
                 };

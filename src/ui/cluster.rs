@@ -207,7 +207,9 @@ fn add_nodes(s: &mut Summary, nodes: &[NodeLite]) {
             s.nodes_ready += 1;
         }
         let mut issues: Vec<String> =
-            conds.iter().filter(|c| c.type_ != "Ready" && c.status == "True").map(|c| c.type_.clone()).collect();
+            // The conditions whose True is bad (pressure, node-problem-detector): a custom
+            // condition that reads True when healthy is no issue.
+            conds.iter().filter(|c| crate::status::true_is_bad(&c.type_) && c.status == "True").map(|c| c.type_.clone()).collect();
         if !ready {
             issues.insert(0, "NotReady".into());
         }

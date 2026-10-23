@@ -263,8 +263,33 @@ fn url_escape(s: &str) -> String {
         .collect()
 }
 
-/// `matchLabels` as a label selector string.
-pub fn selector_string(selector: &serde_json::Value) -> Option<String> {
+/// Which pods an object selects, as a list request would ask for them.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Selection {
+    /// None at all (no selector, an empty Service selector, an operator we can't read).
+    Nothing,
+    /// Every pod of the namespace.
+    Everything,
+    /// The pods matching this label selector.
+    Labels(String),
+}
+
+impl Selection {
+    /// The label selector to list with: `Some(None)` lists every pod, `None` lists none.
+    pub fn list_selector(&self) -> Option<Option<String>> {
+        match self {
+            Selection::Nothing => None,
+            Selection::Everything => Some(None),
+            Selection::Labels(s) => Some(Some(s.clone())),
+        }
+    }
+}
+
+/// A LabelSelector (`matchLabels` and `matchExpressions`) in the API server's selector syntax.
+/// A missing or null selector selects nothing; an empty one everything when `empty_is_all`.
+/// An operator this doesn't know selects nothing, rather than more than it should.
+pub fn label_selection(selector: Option<&serde_json::Value>, empty_is_all: bool) -> Selection {
+    let Some(selector) = selector.filter(|s| !s.is_null()) else { return Selection::Nothing };
     let mut parts: Vec<String> = selector
         .get("matchLabels")
         .and_then(|l| l.as_object())
@@ -272,7 +297,6 @@ pub fn selector_string(selector: &serde_json::Value) -> Option<String> {
         .flatten()
         .map(|(k, v)| format!("{k}={}", v.as_str().unwrap_or_default()))
         .collect();
-    // Set-based requirements, in the API server's selector syntax.
     for e in selector.get("matchExpressions").and_then(|e| e.as_array()).into_iter().flatten() {
         let key = e["key"].as_str().unwrap_or_default();
         let values: Vec<&str> =
@@ -282,10 +306,34 @@ pub fn selector_string(selector: &serde_json::Value) -> Option<String> {
             "NotIn" => format!("{key} notin ({})", values.join(",")),
             "Exists" => key.to_string(),
             "DoesNotExist" => format!("!{key}"),
-            _ => continue,
+            _ => return Selection::Nothing,
         });
     }
-    (!parts.is_empty()).then(|| parts.join(","))
+    match parts.is_empty() {
+        true if empty_is_all => Selection::Everything,
+        true => Selection::Nothing,
+        false => Selection::Labels(parts.join(",")),
+    }
+}
+
+/// The pods an object stands for, the way Kubernetes picks them, in one place for the pages
+/// and the agents' tools:
+/// - a Service: its `spec.selector` labels; none when empty;
+/// - a PodDisruptionBudget: none without a selector, all with `{}` (policy/v1);
+/// - a NetworkPolicy: its `podSelector`, `{}` being every pod;
+/// - a workload (Deployment, StatefulSet, DaemonSet, ReplicaSet, Job): its `spec.selector`.
+pub fn pod_selection(kind: &Kind, obj: &serde_json::Value) -> Selection {
+    if kind.is("", "Service") {
+        let labels = obj.pointer("/spec/selector").cloned().map(|m| serde_json::json!({ "matchLabels": m }));
+        return label_selection(labels.as_ref(), false);
+    }
+    if kind.is("policy", "PodDisruptionBudget") {
+        return label_selection(obj.pointer("/spec/selector"), true);
+    }
+    if kind.is("networking.k8s.io", "NetworkPolicy") {
+        return label_selection(obj.pointer("/spec/podSelector"), true);
+    }
+    label_selection(obj.pointer("/spec/selector"), false)
 }
 
 /// Whether a label selector (matchLabels + matchExpressions) selects these labels.
@@ -325,12 +373,54 @@ mod selector_tests {
     #[test]
     fn selectors() {
         let sel = serde_json::json!({"matchLabels": {"app": "web"}, "matchExpressions": [{"key": "tier", "operator": "In", "values": ["a", "b"]}, {"key": "canary", "operator": "DoesNotExist"}]});
-        assert_eq!(super::selector_string(&sel).unwrap(), "app=web,tier in (a,b),!canary");
+        assert_eq!(
+            super::label_selection(Some(&sel), false),
+            super::Selection::Labels("app=web,tier in (a,b),!canary".into())
+        );
         let labels = |v: serde_json::Value| v.as_object().unwrap().clone();
         assert!(super::selector_matches(&sel, &labels(serde_json::json!({"app": "web", "tier": "a"}))));
         assert!(!super::selector_matches(&sel, &labels(serde_json::json!({"app": "web", "tier": "c"}))));
         assert!(!super::selector_matches(&sel, &labels(serde_json::json!({"app": "web", "tier": "a", "canary": "1"}))));
         assert!(super::selector_matches(&serde_json::json!({}), &labels(serde_json::json!({"x": "y"}))));
+    }
+
+    /// The pods of each kind, as Kubernetes picks them; an operator we don't know selects
+    /// none rather than more.
+    #[test]
+    fn which_pods_an_object_selects() {
+        use super::{Kind, Selection, pod_selection};
+        use serde_json::json;
+        let kind = |group: &str, k: &str| Kind {
+            ar: kube::discovery::ApiResource {
+                group: group.into(),
+                version: "v1".into(),
+                api_version: "v1".into(),
+                kind: k.into(),
+                plural: format!("{}s", k.to_lowercase()),
+            },
+            namespaced: true,
+            section: "",
+            label: String::new(),
+        };
+        let pdb = kind("policy", "PodDisruptionBudget");
+        assert_eq!(pod_selection(&pdb, &json!({"spec": {"minAvailable": 1}})), Selection::Nothing);
+        assert_eq!(pod_selection(&pdb, &json!({"spec": {"selector": null}})), Selection::Nothing);
+        assert_eq!(pod_selection(&pdb, &json!({"spec": {"selector": {}}})), Selection::Everything);
+        let only_expressions =
+            json!({"spec": {"selector": {"matchExpressions": [{"key": "app", "operator": "Exists"}]}}});
+        assert_eq!(pod_selection(&pdb, &only_expressions), Selection::Labels("app".into()));
+        let svc = kind("", "Service");
+        assert_eq!(
+            pod_selection(&svc, &json!({"spec": {"selector": {"app": "web"}}})),
+            Selection::Labels("app=web".into())
+        );
+        assert_eq!(pod_selection(&svc, &json!({"spec": {"selector": {}}})), Selection::Nothing);
+        assert_eq!(pod_selection(&svc, &json!({"spec": {}})), Selection::Nothing);
+        let netpol = kind("networking.k8s.io", "NetworkPolicy");
+        assert_eq!(pod_selection(&netpol, &json!({"spec": {"podSelector": {}}})), Selection::Everything);
+        let deploy = kind("apps", "Deployment");
+        let odd = json!({"spec": {"selector": {"matchLabels": {"app": "web"}, "matchExpressions": [{"key": "x", "operator": "Gt", "values": ["1"]}]}}});
+        assert_eq!(pod_selection(&deploy, &odd), Selection::Nothing);
     }
 }
 
