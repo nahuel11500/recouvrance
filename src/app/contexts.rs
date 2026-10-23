@@ -204,11 +204,9 @@ impl AppView {
     pub fn contexts_reloaded(&mut self, names: Vec<String>, window: &mut Window, cx: &mut Context<Self>) {
         let added = names.iter().filter(|n| !self.all_contexts.contains(n)).count();
         let removed = self.all_contexts.iter().filter(|n| !names.contains(n)).count();
+        self.picked.retain(|c| names.contains(c));
         self.all_contexts = names.clone();
-        self.ctx_picker.update(cx, |p, cx| {
-            p.all = names;
-            cx.notify();
-        });
+        self.ctx_picker.update(cx, |p, cx| p.set_all(names, cx));
         self.settings_view.update(cx, |s, cx| s.sync_clusters(window, cx));
         let msg = match (added, removed) {
             (0, 0) => "Kubeconfig reloaded".to_string(),
