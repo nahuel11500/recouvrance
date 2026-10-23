@@ -637,7 +637,8 @@ impl KubeMcp {
             .filter(|x| {
                 // Only what this agent may see.
                 k8s::find_kind(&kinds, &x.kind).is_some_and(|k| {
-                    call.may_see(&access_for(k, &p.context, "list", x.namespace.clone(), Some(x.name.clone())))
+                    let a = access_for(k, &p.context, "list", x.namespace.clone(), Some(x.name.clone()));
+                    problem_visible(call.policy(), call.approved_rules(), k.is("", "Pod"), &a)
                 })
             })
             .take(200)

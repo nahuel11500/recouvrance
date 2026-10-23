@@ -104,12 +104,12 @@ impl Call {
     /// Whether one row of a list result may be shown: allowed by a rule, or gated by
     /// an Ask rule the user approved for this call.
     fn may_see(&self, a: &Access) -> bool {
-        let v = self.policy().decide(a);
-        match v.mode {
-            Mode::Allow => true,
-            Mode::Ask => self.approved && v.rule.is_some_and(|r| self.approved_rules.contains(&r)),
-            Mode::Deny => false,
-        }
+        visible(self.policy(), self.approved_rules(), a)
+    }
+
+    /// The Ask rules the user approved for this call (none when not approved).
+    fn approved_rules(&self) -> &[usize] {
+        if self.approved { &self.approved_rules } else { &[] }
     }
 
     fn finish(&self, result: anyhow::Result<String>) -> Result<String, String> {
@@ -128,6 +128,22 @@ impl Call {
             }
         }
     }
+}
+
+/// Whether a row may be shown: allowed by a rule, or gated by one of the `approved` Ask rules.
+fn visible(policy: &Policy, approved: &[usize], a: &Access) -> bool {
+    let v = policy.decide(a);
+    match v.mode {
+        Mode::Allow => true,
+        Mode::Ask => v.rule.is_some_and(|r| approved.contains(&r)),
+        Mode::Deny => false,
+    }
+}
+
+/// Whether a `find_problems` finding may be shown. The approval named pods: findings of
+/// other kinds need an Allow rule.
+fn problem_visible(policy: &Policy, approved: &[usize], pod: bool, a: &Access) -> bool {
+    visible(policy, if pod { approved } else { &[] }, a)
 }
 
 fn describe(a: &Access) -> String {
@@ -903,6 +919,34 @@ pub fn start(hub: Arc<Hub>) -> TaskGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn approving_find_problems_shows_only_pod_findings() {
+        let ask = super::super::Rule {
+            effect: Mode::Ask,
+            verbs: vec!["list".into()],
+            resources: vec!["*".into()],
+            namespaces: vec!["team-b".into()],
+            contexts: vec!["*".into()],
+            names: vec!["*".into()],
+            ..Default::default()
+        };
+        let policy = Policy { rules: vec![ask], ..Default::default() };
+        let access = |resource: &str| Access {
+            context: "c".into(),
+            verb: "list".into(),
+            resource: resource.into(),
+            resource_aliases: vec![],
+            namespace: Some("team-b".into()),
+            name: Some("web".into()),
+            cluster_scoped: false,
+        };
+        let approved = policy.asks(&access("pods"));
+        assert!(!approved.is_empty());
+        assert!(problem_visible(&policy, &approved, true, &access("pods")));
+        assert!(!problem_visible(&policy, &approved, false, &access("deployments")));
+        assert!(!problem_visible(&policy, &[], true, &access("pods")));
+    }
 
     #[test]
     fn logged_patches_hide_secret_values() {
