@@ -458,7 +458,7 @@ mod tests {
         for text in [
             "agents:\n  Claude:\n    allow: [\"get *\"]\n    Deny: [\"* secrets\"]\n",
             "agents:\n  Claude:\n    deny_rules: [\"* secrets\"]\n",
-            "agents:\n  Claude:\n    limits: { calls_per_minut: 30 }\n",
+            "agents:\n  Claude:\n    limits: { calls_a_minute: 30 }\n",
             "agent:\n  Claude:\n    allow: [\"get *\"]\n",
         ] {
             assert!(crate::yaml::from_str::<RulesFile>(text).is_err(), "{text}");
