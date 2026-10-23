@@ -597,18 +597,7 @@ async fn load(client: Client, ns: Option<String>, context: String, tx: futures::
     };
     let pdbs = async {
         let pdbs = list(&client, k8s::ar_of::<policy::PodDisruptionBudget>(), &ns).await;
-        send(Piece::Kind(
-            slot("poddisruptionbudgets"),
-            pdbs.map(|pdbs| {
-                tally(pdbs.iter().map(|p| {
-                    if n(p, "/status/disruptionsAllowed") > 0 {
-                        ("DisruptionAllowed", Tone::Good)
-                    } else {
-                        ("InsufficientPods", Tone::Bad)
-                    }
-                }))
-            }),
-        ));
+        send(Piece::Kind(slot("poddisruptionbudgets"), pdbs.map(|pdbs| pdb_counts(&pdbs))));
     };
     let pvcs = async {
         let t = table(c(), k8s::ar_of::<core::PersistentVolumeClaim>(), ns.clone(), false).await;
@@ -718,6 +707,19 @@ fn hpa_counts(hpas: &[Value]) -> Vec<(String, usize, Tone)> {
             ("AtTarget", Tone::Good)
         } else {
             ("Unknown", Tone::Warn)
+        }
+    }))
+}
+
+/// PodDisruptionBudgets by whether they block evictions now. One that covers no pods blocks nothing.
+fn pdb_counts(pdbs: &[Value]) -> Vec<(String, usize, Tone)> {
+    tally(pdbs.iter().map(|p| {
+        if crate::overview::pdb_blocks(p) {
+            ("InsufficientPods", Tone::Bad)
+        } else if n(p, "/status/expectedPods") == 0 {
+            ("NoPods", Tone::Neutral)
+        } else {
+            ("DisruptionAllowed", Tone::Good)
         }
     }))
 }
@@ -1037,8 +1039,23 @@ pub async fn debug_load(client: Client) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{Tbl, Tone, pod_counts, pod_usage, recent_warnings, restart_ago};
+    use super::{Tbl, Tone, pdb_counts, pod_counts, pod_usage, recent_warnings, restart_ago};
     use crate::k8s;
+
+    #[test]
+    fn pdb_without_pods_is_not_bad() {
+        let pdb = |allowed: i64, expected: i64| serde_json::json!({"status": {"disruptionsAllowed": allowed, "expectedPods": expected}});
+        let mut counts = pdb_counts(&[pdb(0, 0), pdb(0, 2), pdb(1, 3)]);
+        counts.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            counts,
+            [
+                ("DisruptionAllowed".to_string(), 1, Tone::Good),
+                ("InsufficientPods".to_string(), 1, Tone::Bad),
+                ("NoPods".to_string(), 1, Tone::Neutral),
+            ]
+        );
+    }
 
     #[test]
     fn pod_counts_follow_status_tones() {
