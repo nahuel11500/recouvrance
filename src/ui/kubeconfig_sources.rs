@@ -280,7 +280,7 @@ impl KubeconfigSources {
                     ),
                 ))
                 .when(!c.taken.is_empty(), |d| {
-                    let file = crate::k8s::safe_file_part(p.name.read(cx).value().trim());
+                    let file = crate::k8s::pasted_stem(&p.name.read(cx).value());
                     let renamed: Vec<String> = c.taken.iter().map(|t| format!("{t} as {t}@{file}")).collect();
                     d.child(
                         div()

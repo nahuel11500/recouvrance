@@ -249,9 +249,26 @@ pub fn save_pasted(text: &str, name: &str) -> Result<std::path::PathBuf> {
     b.recursive(true);
     std::os::unix::fs::DirBuilderExt::mode(&mut b, 0o700);
     b.create(&dir)?;
+    create_private_file(&dir, &pasted_base(name), "yaml", text.as_bytes())
+}
+
+/// The file name (without `.yaml`) a pasted kubeconfig named `name` would be saved
+/// under now, as `save_pasted` picks it: its contexts get `@` and this when renamed.
+pub fn pasted_stem(name: &str) -> String {
+    free_stem(&added_dir(), &pasted_base(name))
+}
+
+fn pasted_base(name: &str) -> String {
     let stem = safe_file_part(name.trim());
-    let stem = if stem.trim_matches(['.', '_']).is_empty() { "kubeconfig".to_string() } else { stem };
-    create_private_file(&dir, &stem, "yaml", text.as_bytes())
+    if stem.trim_matches(['.', '_']).is_empty() { "kubeconfig".to_string() } else { stem }
+}
+
+/// `stem`, or `stem-1`, `stem-2`… when `<stem>.yaml` is taken in `dir` (as `create_private_file`).
+fn free_stem(dir: &std::path::Path, stem: &str) -> String {
+    (0..1000)
+        .map(|i| if i == 0 { stem.to_string() } else { format!("{stem}-{i}") })
+        .find(|s| !dir.join(format!("{s}.yaml")).exists())
+        .unwrap_or_else(|| stem.to_string())
 }
 
 #[cfg(test)]
@@ -273,6 +290,23 @@ mod tests {
         assert!(super::inspect_pasted("").is_err());
         assert!(super::inspect_pasted("kind: Config\ncontexts: []\n").is_err());
         assert!(super::inspect_pasted("{not yaml").is_err());
+    }
+
+    #[test]
+    fn pasted_file_names() {
+        assert_eq!(super::pasted_base(""), "kubeconfig");
+        assert_eq!(super::pasted_base(" .. "), "kubeconfig");
+        assert_eq!(super::pasted_base("arn:aws:eks:x/prod"), "arn_aws_eks_x_prod");
+        let dir = std::env::temp_dir().join(format!("recouvrance-test-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(super::free_stem(&dir, "kubeconfig"), "kubeconfig");
+        let a = super::create_private_file(&dir, "kubeconfig", "yaml", b"a").unwrap();
+        assert_eq!(super::free_stem(&dir, "kubeconfig"), "kubeconfig-1");
+        let b = super::create_private_file(&dir, "kubeconfig", "yaml", b"b").unwrap();
+        assert_eq!(b.file_stem().unwrap(), "kubeconfig-1");
+        assert_eq!(super::free_stem(&dir, "kubeconfig"), "kubeconfig-2");
+        assert_eq!(a.file_stem().unwrap(), "kubeconfig");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
