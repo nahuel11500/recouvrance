@@ -532,11 +532,18 @@ pub struct Config {
     /// Global kill switch: when false every agent call is refused.
     pub enabled: bool,
     pub agents: Vec<Agent>,
+    /// 0 (missing) when saved before 0.3.0, which created agents without a section in
+    /// rules.yaml: see [`Hub::apply_rules_file`].
+    #[serde(default)]
+    pub version: u32,
 }
+
+/// agents.json's current `version`: rules.yaml names every agent.
+const CONFIG_VERSION: u32 = 1;
 
 impl Default for Config {
     fn default() -> Self {
-        Self { port: DEFAULT_PORT, enabled: true, agents: Vec::new() }
+        Self { port: DEFAULT_PORT, enabled: true, agents: Vec::new(), version: CONFIG_VERSION }
     }
 }
 
@@ -881,6 +888,8 @@ impl Hub {
                 Ok(Some(f)) => f,
                 Ok(None) => {
                     *lock(&self.rules_error) = None;
+                    // No file, so no agent missing from it: a file made later is read as it is.
+                    cfg.version = CONFIG_VERSION;
                     return Ok(false);
                 }
                 Err(e) => {
@@ -898,9 +907,26 @@ impl Hub {
                 self.emit(HubEvent::AgentSeen);
                 return Err(e);
             }
+            // agents.json from before 0.3.0: an agent created then had no section until its
+            // rules were edited. It keeps its rules and its section is written, once.
+            let upgrade = cfg.version < CONFIG_VERSION;
             let mut agents = cfg.agents.clone();
-            rules_file::apply_file(&file, &mut agents)?;
+            rules_file::apply_file(&file, &mut agents, upgrade)?;
+            if upgrade && agents.iter().any(|a| !file.agents.contains_key(&a.name)) {
+                let mut seen = lock(&self.rules_text);
+                match rules_file::export_over(&path, &agents, seen.as_deref()) {
+                    Ok(text) => *seen = Some(text),
+                    Err(e) => {
+                        let e = e.context("rules.yaml could not be given the agents it doesn't name");
+                        *lock(&self.rules_error) = Some(format!("{e:#}"));
+                        drop((seen, cfg));
+                        self.emit(HubEvent::AgentSeen);
+                        return Err(e);
+                    }
+                }
+            }
             cfg.agents = agents;
+            cfg.version = CONFIG_VERSION;
         }
         *lock(&self.rules_error) = None;
         self.save()?;
@@ -1758,6 +1784,19 @@ mod tests {
             .filter_map(|e| e.ok())
             .any(|e| e.file_name().to_string_lossy().starts_with("agents.json.bad-"));
         assert!(kept);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn an_agents_file_from_before_0_3_0_is_told_apart() {
+        let dir = temp_dir();
+        let path = dir.join("agents.json");
+        // As 0.2.0 saved it: no version.
+        std::fs::write(&path, br#"{"port": 7323, "enabled": true, "agents": []}"#).unwrap();
+        assert_eq!(load_config(&path).0.version, 0);
+        assert_eq!(Config::default().version, CONFIG_VERSION);
+        std::fs::write(&path, serde_json::to_vec(&Config::default()).unwrap()).unwrap();
+        assert_eq!(load_config(&path).0.version, CONFIG_VERSION);
         let _ = std::fs::remove_dir_all(dir);
     }
 
