@@ -199,6 +199,7 @@ impl LogsView {
         if pods == current {
             return;
         }
+        let before = self.reads();
         let first = self.pod_containers.first().cloned();
         (self.pods, self.pod_containers) = pods.into_iter().unzip();
         // A container listing still running is for the old first pod.
@@ -208,6 +209,11 @@ impl LogsView {
             self.pod_containers.first().filter(|n| !n.is_empty() && Some(*n) != first.as_ref()).cloned()
         {
             self.set_containers(names, window, cx);
+        }
+        // Only the containers were filled in (a pod page's first read): the streams read
+        // the same, and the lines they brought stay.
+        if same_reads(&before, &self.reads(), &self.pod_containers) {
+            return;
         }
         self.buf.set_merge(self.pods.len() > 1);
         self.pod_states = vec![StreamState::Connecting; self.pods.len()];
@@ -228,8 +234,14 @@ impl LogsView {
             let _ = this.update_in(cx, |this, window, cx| match result {
                 Ok(names) => {
                     this.status = None;
+                    let before = this.reads();
+                    // The listing is the first pod's.
+                    let mut known = this.pod_containers.clone();
+                    if let Some(first) = known.first_mut().filter(|k| k.is_empty()) {
+                        *first = names.clone();
+                    }
                     this.set_containers(names, window, cx);
-                    if !this.paused {
+                    if !this.paused && !same_reads(&before, &this.reads(), &known) {
                         this.restart(cx);
                     }
                 }
@@ -239,6 +251,13 @@ impl LogsView {
                 }
             });
         }));
+    }
+
+    /// What each stream reads: its pod and the container named.
+    fn reads(&self) -> Vec<(String, Option<String>)> {
+        let containers = |ix: usize| self.pod_containers.get(ix).map_or(&[][..], Vec::as_slice);
+        let pods = self.pods.iter().enumerate();
+        pods.map(|(ix, pod)| (pod.clone(), container_for(self.container.as_deref(), containers(ix)))).collect()
     }
 
     /// The containers to choose from; the choice stays when the new list has it.
@@ -276,16 +295,9 @@ impl LogsView {
         self.streams.clear();
         let mut receivers = Vec::new();
         // The chosen container from each pod that has it; the others show their default one.
-        for (ix, pod) in self.pods.iter().enumerate() {
-            let containers = self.pod_containers.get(ix).map_or(&[][..], Vec::as_slice);
-            let (guard, rx) = k8s::stream_logs(
-                self.client.clone(),
-                self.ns.clone(),
-                pod.clone(),
-                container_for(self.container.as_deref(), containers),
-                self.previous,
-                self.since,
-            );
+        for (ix, (pod, container)) in self.reads().into_iter().enumerate() {
+            let (guard, rx) =
+                k8s::stream_logs(self.client.clone(), self.ns.clone(), pod, container, self.previous, self.since);
             self.streams.push(guard);
             receivers.push(rx.map(move |m| (ix, m)).boxed());
         }
