@@ -162,6 +162,9 @@ fn line_time(line: &str) -> Option<jiff::Timestamp> {
     line.split_once(' ')?.0.parse().ok()
 }
 
+/// A followed stream that sends nothing for this long is asked again from its last line.
+const LOG_IDLE: std::time::Duration = std::time::Duration::from_secs(120);
+
 /// Wait before reconnecting: 1s, 2s, 4s… up to 30s.
 fn reconnect_delay(failures: u32) -> std::time::Duration {
     std::time::Duration::from_secs((1u64 << failures.saturating_sub(1).min(5)).min(30))
@@ -209,10 +212,22 @@ pub fn stream_logs(
         let mut failures = 0u32;
         loop {
             let lp = stream_params(container.clone(), previous, since_seconds, last_seen);
-            let outcome: Result<()> = async {
-                let reader = api.log_stream(&pod, &lp).await?;
+            // Ok(true): the stream went quiet for `LOG_IDLE`.
+            let outcome: Result<bool> = async {
+                let reader = tokio::time::timeout(LOG_IDLE, api.log_stream(&pod, &lp))
+                    .await
+                    .map_err(|_| anyhow!("no answer from the API server"))??;
                 let mut lines = std::pin::pin!(lossy_lines(reader, MAX_LINE_BYTES).ready_chunks(500));
-                while let Some(chunk) = lines.next().await {
+                loop {
+                    let next = if previous {
+                        lines.next().await
+                    } else {
+                        match tokio::time::timeout(LOG_IDLE, lines.next()).await {
+                            Ok(next) => next,
+                            Err(_) => return Ok(true),
+                        }
+                    };
+                    let Some(chunk) = next else { break };
                     let mut out = Vec::with_capacity(chunk.len());
                     let mut cut = None;
                     for line in chunk {
@@ -237,7 +252,7 @@ pub fn stream_logs(
                         return Err(e.into());
                     }
                 }
-                Ok(())
+                Ok(false)
             }
             .await;
             if tx.is_closed() {
@@ -245,7 +260,10 @@ pub fn stream_logs(
             }
             // `previous` logs are complete; a stream that cannot come back is over.
             let why = match &outcome {
-                Ok(()) if previous || !still_running(&api, &pod).await => {
+                // The container may just be quiet, or the connection died without closing
+                // (sleep, VPN, a load balancer's idle timeout): ask again from the last line.
+                Ok(true) => continue,
+                Ok(false) if previous || !still_running(&api, &pod).await => {
                     let _ = tx.unbounded_send(LogMsg::End);
                     return;
                 }
@@ -253,7 +271,7 @@ pub fn stream_logs(
                     let _ = tx.unbounded_send(LogMsg::Error(short_error(e)));
                     return;
                 }
-                Ok(()) => "stream closed".to_string(),
+                Ok(false) => "stream closed".to_string(),
                 Err(e) => short_error(e),
             };
             failures = failures.saturating_add(1);
