@@ -570,7 +570,8 @@ pub async fn drain_report(
             }
             if let Some(reason) = stop() {
                 anyhow::bail!(
-                    "drain of {node} stopped after {} evictions: {reason}; the node stays cordoned",
+                    "drain of {} stopped after {} evictions: {reason}; the node stays cordoned",
+                    out.node,
                     out.evicted
                 );
             }
