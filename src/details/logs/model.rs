@@ -455,9 +455,10 @@ pub(crate) fn nbsp_tolerant(pattern: &str) -> String {
 }
 
 /// The container to read from a pod: the chosen one when the pod has it (or its
-/// containers are unknown), else the pod's default one.
+/// containers are unknown), else the pod's default one (also when none is chosen: the
+/// API server does not pick one for a pod with several).
 pub(crate) fn container_for(chosen: Option<&str>, containers: &[String]) -> Option<String> {
-    let chosen = chosen?;
+    let Some(chosen) = chosen else { return containers.first().cloned() };
     if containers.is_empty() || containers.iter().any(|c| c == chosen) {
         Some(chosen.to_string())
     } else {
@@ -528,7 +529,9 @@ mod tests {
         assert_eq!(container_for(Some("api"), &pod(&["api", "proxy"])).as_deref(), Some("api"));
         assert_eq!(container_for(Some("api"), &pod(&["worker", "proxy"])).as_deref(), Some("worker"));
         assert_eq!(container_for(Some("api"), &[]).as_deref(), Some("api"));
-        assert_eq!(container_for(None, &pod(&["worker"])), None);
+        // Nothing chosen (the container list could not be read): the pod's default one.
+        assert_eq!(container_for(None, &pod(&["worker", "proxy"])).as_deref(), Some("worker"));
+        assert_eq!(container_for(None, &[]), None);
     }
 
     #[test]
