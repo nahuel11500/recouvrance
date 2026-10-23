@@ -38,6 +38,49 @@
 - `gh pr edit` fails on this repository (Projects classic); change a PR's title or body with
   `gh api -X PATCH repos/nahuel11500/recouvrance/pulls/<n> -f body=...`.
 
+## Use the shared helpers
+
+Each of these replaced several hand-written copies that disagreed. Use them instead of a new
+copy; if one doesn't fit, extend it.
+
+- **Async loads in a view: `crate::latest::Latest`.** One per kind of load. `spawn` /
+  `spawn_in` replaces (and cancels) the running one, so a slow old result never lands over a
+  newer one; `cancel` when the input goes away (a document with no kind, other pods).
+- **Writes from the UI:** every request of the UI's clients passes `k8s::gate::WriteGate`,
+  which refuses writes and shells while write mode is off, at the moment they are sent.
+  `k8s::helm` does the same for install/upgrade/rollback/uninstall. Turn write mode on or off
+  with `details::set_writes`, never by setting the `WriteMode` global alone. The agents' MCP
+  server builds its clients with `connect_for_agents` (no gate: their rules decide).
+- **Agent writes:** call `recheck` (or `stale_reason`) right before the cluster call. It
+  decides again on the agent's current rules, so changes made while the call waited count.
+- **A pod's requests and limits: `k8s::podspec`.** `of_value` / `LeanSpec::effective` with
+  `Count::Scheduled` (what a node reserves: init containers count) or `Count::Running` (to
+  set usage against). `podspec::total` adds them up over pods. It covers sidecars, init
+  containers, overhead and pod-level resources; don't add up `spec.containers` by hand.
+- **Which pods an object selects: `k8s::pod_selection`.** It handles a Service, a PDB (no
+  selector is none, `{}` is all), a NetworkPolicy and workloads. An operator it doesn't know
+  selects nothing.
+- **Condition polarity: `status::true_is_bad` / `true_is_good`.** One list for every page,
+  table and check.
+- **Durations from kubectl columns: `k8s::age_seconds`.**
+- **Deletes are pinned to the object picked:** pass its uid to `k8s::delete` /
+  `delete_with`. A re-created object with the same name is left alone.
+- **Loading config fails closed.** settings.json keeps every field that reads, and a context
+  whose protection is unknown is protected. An unreadable agents.json is kept aside and agent
+  access starts off. A rule without an `effect` denies. New config files should do the same:
+  never let a read error turn into "allowed" or "not protected".
+
+## Tests
+
+- A `fix:` PR adds a test that fails without the fix. CI checks for one ("Fix has a test");
+  the label `no test needed` skips it, for docs and CI changes.
+- View behaviour over time (late results, reloads) can be tested with `#[gpui_kit::test]` and
+  a `TestAppContext` (see `src/latest.rs`). Those tests need the `dev` feature:
+  `#[cfg(all(test, feature = "dev"))]`.
+- Rules that must hold for every input get a `proptest!`. The agent rule engine has them
+  (`mcp::properties`), and so does the kubeconfig merge's context names
+  (`k8s::config::name_properties`). Extend them when you change those.
+
 ## Bugs that keep coming back
 
 Most fixed bugs were one of these. Check for them in new code.
