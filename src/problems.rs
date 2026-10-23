@@ -78,7 +78,7 @@ pub fn judge(kind: &Kind, defs: &[ColumnDef], row: &Row) -> Option<(Severity, St
                 s if s.starts_with("Init:") => {
                     older_than(row, 300).then(|| (Severity::Warning, format!("{s} for more than 5 minutes")))
                 }
-                "Pending" | "ContainerCreating" | "PodInitializing" if older_than(row, 300) => {
+                "Pending" | "SchedulingGated" | "ContainerCreating" | "PodInitializing" if older_than(row, 300) => {
                     Some((Severity::Warning, format!("{status} for more than 5 minutes")))
                 }
                 // From the deletion (its grace period's end), not the creation.
@@ -102,7 +102,7 @@ pub fn judge(kind: &Kind, defs: &[ColumnDef], row: &Row) -> Option<(Severity, St
                     }
                     _ => None,
                 },
-                "Pending" | "ContainerCreating" | "PodInitializing" | "Terminating" => None,
+                "Pending" | "SchedulingGated" | "ContainerCreating" | "PodInitializing" | "Terminating" => None,
                 other => Some((Severity::Warning, other.into())),
             }
         }
@@ -350,6 +350,9 @@ mod tests {
         assert_eq!(sev(&fresh("Init:CrashLoopBackOff")), Some(Severity::Critical));
         assert_eq!(sev(&fresh("Init:Error")), Some(Severity::Critical));
         assert_eq!(sev(&fresh("Init:ImagePullBackOff")), Some(Severity::Critical));
+        // Held by scheduling gates: waiting on purpose at first, like Pending.
+        assert_eq!(sev(&fresh("SchedulingGated")), None);
+        assert_eq!(sev(&old("SchedulingGated")), Some(Severity::Warning));
         // Terminating: from the deletion time when known.
         let mut t = old("Terminating");
         t.deleting = true;

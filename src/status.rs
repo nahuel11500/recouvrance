@@ -40,7 +40,7 @@ const BAD: [&str; 23] = [
 /// Finished: neither good nor bad any more.
 const DONE: [&str; 5] = ["completed", "succeeded", "done", "finished", "terminated"];
 
-const BUSY: [&str; 14] = [
+const BUSY: [&str; 15] = [
     "pending",
     "progressing",
     "creating",
@@ -55,6 +55,8 @@ const BUSY: [&str; 14] = [
     "deleting",
     "suspended",
     "unknown",
+    // Held on purpose until a controller (Kueue…) removes its gates.
+    "schedulinggated",
 ];
 
 /// Good words found anywhere ("NewReplicaSetAvailable"), unless negated ("Unready").
@@ -100,7 +102,10 @@ pub(crate) fn tone(status: &str) -> Option<Tone> {
     let words = words(status);
     // "Installed" holds "stalled".
     let bad_text = s.replace("install", "");
-    if BAD.iter().any(|w| bad_text.contains(w)) || words.iter().any(|w| w == "false") || negated(&words) {
+    // Refused by the kubelet for want of a resource: OutOfcpu, OutOfmemory, OutOfpods… A
+    // prefix only: "Rollout of" holds "outof".
+    let out_of = s.starts_with("outof");
+    if BAD.iter().any(|w| bad_text.contains(w)) || out_of || words.iter().any(|w| w == "false") || negated(&words) {
         return Some(Tone::Bad);
     }
     if DONE.contains(&s.as_str()) {
@@ -278,6 +283,7 @@ mod tests {
             ("ContainerCreating", Some(Tone::Busy)),
             ("Init:0/2", Some(Tone::Busy)),
             ("Unknown", Some(Tone::Busy)),
+            ("SchedulingGated", Some(Tone::Busy)),
             // Negated good words.
             ("Unready", Some(Tone::Bad)),
             ("Inactive", Some(Tone::Bad)),
@@ -304,6 +310,12 @@ mod tests {
             ("NotReady,SchedulingDisabled", Some(Tone::Bad)),
             ("ContainerStatusUnknown", Some(Tone::Bad)),
             ("Init:ContainerStatusUnknown", Some(Tone::Bad)),
+            // Refused by the kubelet.
+            ("OutOfcpu", Some(Tone::Bad)),
+            ("OutOfmemory", Some(Tone::Bad)),
+            ("OutOfpods", Some(Tone::Bad)),
+            ("UnexpectedAdmissionError", Some(Tone::Bad)),
+            ("Rollout of v2", None),
             // Unknown words stay neutral.
             ("Lorem", None),
             ("Setup", None),
