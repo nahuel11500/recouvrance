@@ -215,7 +215,12 @@ pub async fn connect(context: String) -> Result<Client> {
         let timeout = tower::timeout::TimeoutLayer::new(REQUEST_TIMEOUT);
         // Outside the timeout, so a request it cuts is counted as failed.
         let meter = meter::MeterLayer { context: context.clone() };
-        Ok(kube::client::ClientBuilder::try_from(config)?.with_layer(&timeout).with_layer(&meter).build())
+        // The exec plugin runs as a blocking process here (a browser login can take minutes):
+        // off the shared runtime's few threads, so other clusters keep streaming meanwhile.
+        let builder = tokio::task::spawn_blocking(move || kube::client::ClientBuilder::try_from(config))
+            .await
+            .context("building the client")??;
+        Ok(builder.with_layer(&timeout).with_layer(&meter).build())
     })
     .await
 }
