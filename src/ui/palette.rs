@@ -75,6 +75,23 @@ impl Item {
     }
 }
 
+/// The items matching `query`, best first, as many as are shown.
+fn ranked<'a>(items: &'a [Item], query: &str) -> Vec<&'a Item> {
+    let mut scored: Vec<(i64, &Item)> =
+        items.iter().filter_map(|i| score(query, &format!("{} {}", i.label, i.detail)).map(|s| (s, i))).collect();
+    scored.sort_by_key(|(s, _)| std::cmp::Reverse(*s));
+    scored.into_iter().take(60).map(|(_, i)| i).collect()
+}
+
+/// Add `more` and return where the highlighted row is now, so Enter still opens what was
+/// highlighted when better matches arrive above it.
+fn add_keeping_selection(items: &mut Vec<Item>, more: Vec<Item>, query: &str, selected: usize) -> usize {
+    let shown = ranked(items, query);
+    let key = shown.get(selected.min(shown.len().saturating_sub(1))).map(|i| i.key());
+    add_new(items, more);
+    key.and_then(|key| ranked(items, query).iter().position(|i| i.key() == key)).unwrap_or(selected)
+}
+
 /// Add the items not already listed, each once.
 fn add_new(items: &mut Vec<Item>, more: Vec<Item>) {
     let mut seen: std::collections::HashSet<String> = items.iter().map(Item::key).collect();
@@ -109,7 +126,12 @@ impl Palette {
 
     /// Results that arrive later (the cluster-wide search index).
     pub fn add_items(&mut self, items: Vec<Item>, cx: &mut Context<Self>) {
-        add_new(&mut self.items, items);
+        let query = self.input.read(cx).value().to_lowercase();
+        let selected = add_keeping_selection(&mut self.items, items, &query, self.selected);
+        if selected != self.selected {
+            self.selected = selected;
+            self.scroll.scroll_to_item(selected);
+        }
         cx.notify();
     }
 
@@ -119,11 +141,7 @@ impl Palette {
     }
 
     fn matches(&self, cx: &App) -> Vec<&Item> {
-        let q = self.input.read(cx).value().to_lowercase();
-        let mut scored: Vec<(i64, &Item)> =
-            self.items.iter().filter_map(|i| score(&q, &format!("{} {}", i.label, i.detail)).map(|s| (s, i))).collect();
-        scored.sort_by_key(|(s, _)| std::cmp::Reverse(*s));
-        scored.into_iter().take(60).map(|(_, i)| i).collect()
+        ranked(&self.items, &self.input.read(cx).value().to_lowercase())
     }
 
     fn pick(&mut self, cx: &mut Context<Self>) {
@@ -244,7 +262,7 @@ impl Render for Palette {
 
 #[cfg(test)]
 mod tests {
-    use super::{Item, Lucide, Target, add_new, score};
+    use super::{Item, Lucide, Target, add_keeping_selection, add_new, ranked, score};
 
     fn object(ctx: usize, detail: &str) -> Item {
         Item {
@@ -273,6 +291,16 @@ mod tests {
         let mut items = Vec::new();
         add_new(&mut items, vec![object(0, "Deployments · prod"), object(0, "Deployments · prod · a")]);
         assert_eq!(items.len(), 1);
+    }
+
+    #[test]
+    fn highlight_stays_on_its_object_when_better_matches_arrive() {
+        let mut items = vec![object(0, "Deployments · prod · a"), object(1, "Deployments · prod · b")];
+        // The second row (cluster b's web) is highlighted; a closer match then arrives.
+        let selected = add_keeping_selection(&mut items, vec![object(2, "x")], "web", 1);
+        let picked = ranked(&items, "web")[selected];
+        assert!(matches!(picked.target, Target::Object { ctx: 1, .. }));
+        assert_eq!(selected, 2);
     }
 
     #[test]

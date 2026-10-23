@@ -299,7 +299,8 @@ pub(super) async fn fetch_related(
             }
             if kind.is("apps", "StatefulSet") || kind.is("apps", "DaemonSet") {
                 let uid = obj.pointer("/metadata/uid").and_then(|v| v.as_str()).unwrap_or_default().to_string();
-                related.revisions = k8s::controller_revisions(client.clone(), ns.clone(), uid).await;
+                let revisions = k8s::controller_revisions(client.clone(), ns.clone(), uid).await;
+                related.revisions = related.noted("revisions", revisions);
             }
             if kind.is("apps", "Deployment") {
                 let uid = obj.pointer("/metadata/uid").and_then(|v| v.as_str()).unwrap_or_default().to_string();
