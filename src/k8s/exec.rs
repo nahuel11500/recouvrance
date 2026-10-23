@@ -402,11 +402,13 @@ pub async fn run_command(
 }
 
 /// Whether a helm command line changes the cluster: install, upgrade, rollback or
-/// uninstall, unless it is a dry run.
+/// uninstall, unless it is a dry run. Only `--dry-run`, `=client` and `=server` are dry runs
+/// (`--dry-run=false` or `=none` is a real one), and the last one given is what helm uses.
 pub fn helm_writes(args: &[String]) -> bool {
     let first = args.iter().find(|a| !a.starts_with('-')).map(String::as_str);
+    let dry_run = args.iter().rev().find(|a| *a == "--dry-run" || a.starts_with("--dry-run="));
     matches!(first, Some("install" | "upgrade" | "rollback" | "uninstall" | "delete"))
-        && !args.iter().any(|a| a == "--dry-run" || a.starts_with("--dry-run="))
+        && !matches!(dry_run.map(String::as_str), Some("--dry-run" | "--dry-run=client" | "--dry-run=server"))
 }
 
 /// Run the `helm` CLI against a context and return its output. A command that changes the
@@ -677,7 +679,7 @@ fn attach_target(
 
 #[cfg(test)]
 mod tests {
-    use super::{attach_target, copy_capped, crlf, read_capped, tar_source, upload_source};
+    use super::{attach_target, copy_capped, crlf, helm_writes, read_capped, tar_source, upload_source};
     use k8s_openapi::api::core::v1::{Container, EphemeralContainer, PodSpec};
 
     #[tokio::test(flavor = "multi_thread")]
@@ -694,6 +696,19 @@ mod tests {
         assert!(upload_source(&dir).await.is_err());
         assert!(upload_source(&dir.join("missing")).await.is_err());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn only_a_real_dry_run_gets_past_the_write_gate() {
+        let writes = |line: &str| helm_writes(&line.split(' ').map(String::from).collect::<Vec<_>>());
+        assert!(writes("upgrade web ./chart"));
+        assert!(!writes("upgrade web ./chart --dry-run"));
+        assert!(!writes("upgrade web ./chart --dry-run=server"));
+        assert!(!writes("install web ./chart --dry-run=client"));
+        assert!(writes("upgrade web ./chart --dry-run=false"));
+        assert!(writes("upgrade web ./chart --dry-run=none"));
+        assert!(writes("upgrade web ./chart --dry-run --dry-run=false"));
+        assert!(!writes("history web"));
     }
 
     #[test]
