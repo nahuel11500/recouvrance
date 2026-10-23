@@ -375,7 +375,55 @@ impl ResourceTable {
     /// Rows from every selected context, tagged with the context index.
     pub fn set_rows(&mut self, rows: Vec<(usize, Arc<Row>)>) {
         (self.row_ctx, self.rows) = rows.into_iter().unzip();
+        self.follow_real_uids();
         self.recompute();
+    }
+
+    /// Rows of a big list's fast first load stand in namespace/name for the uid
+    /// (`Row::is_partial`): once the full rows bring the real uids, checks, the
+    /// selection and the row menu move to them.
+    fn follow_real_uids(&mut self) {
+        let menu = self.menu_row.as_ref().map(|(_, uid)| uid);
+        let wanted: Vec<String> =
+            self.marked.iter().chain(&self.selected_uid).chain(menu).filter(|u| u.contains('/')).cloned().collect();
+        if wanted.is_empty() {
+            return;
+        }
+        let keys: HashMap<(&str, &str), &str> =
+            wanted.iter().filter_map(|u| u.split_once('/').map(|k| (k, u.as_str()))).collect();
+        // Stand-in uid -> (context, real uid) of each row it names.
+        let mut real: HashMap<&str, Vec<(usize, String)>> = HashMap::new();
+        let mut partial = false;
+        for (r, &ctx) in self.rows.iter().zip(&self.row_ctx) {
+            if r.is_partial() {
+                partial = true;
+                continue;
+            }
+            if let Some(stand_in) = keys.get(&(r.namespace.as_deref().unwrap_or_default(), r.name.as_str())) {
+                real.entry(stand_in).or_default().push((ctx, r.uid.clone()));
+            }
+        }
+        for (stand_in, found) in real {
+            if self.marked.remove(stand_in) {
+                self.marked.extend(found.iter().map(|(_, uid)| uid.clone()));
+            }
+            if self.selected_uid.as_deref() == Some(stand_in) {
+                self.selected_uid = found.first().map(|(_, uid)| uid.clone());
+            }
+            if let Some((ctx, uid)) = &mut self.menu_row
+                && uid == stand_in
+                && let Some((_, real)) = found.iter().find(|(c, _)| c == ctx)
+            {
+                *uid = real.clone();
+            }
+        }
+        // Every row is full: a stand-in left names an object gone meanwhile. Dropped, so
+        // later updates don't look for it again.
+        if !partial {
+            self.marked.retain(|u| !u.contains('/'));
+            self.selected_uid.take_if(|u| u.contains('/'));
+            self.menu_row.take_if(|(_, u)| u.contains('/'));
+        }
     }
 
     pub fn row_context(&self, visible_ix: usize) -> Option<usize> {
@@ -493,6 +541,48 @@ impl ResourceTable {
 
 fn same_names(a: &[ColumnDef], b: &[ColumnDef]) -> bool {
     a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.name == y.name)
+}
+
+#[cfg(test)]
+mod uid_tests {
+    use super::{Arc, ResourceTable, Row};
+
+    fn row(uid: &str, name: &str) -> (usize, Arc<Row>) {
+        let row = Row {
+            uid: uid.into(),
+            name: name.into(),
+            namespace: Some("team-a".into()),
+            created: None,
+            cells: vec![name.into()],
+            labels: "".into(),
+            deleting: false,
+            deleted_at: None,
+        };
+        (0, Arc::new(row))
+    }
+
+    #[test]
+    fn stand_in_uids_follow_the_full_rows() {
+        let mut t = ResourceTable::new();
+        t.set_rows(vec![row("team-a/web-1", "web-1"), row("team-a/web-2", "web-2"), row("team-a/web-3", "web-3")]);
+        t.marked.extend(["team-a/web-1".to_string(), "team-a/web-2".to_string()]);
+        t.selected_uid = Some("team-a/web-2".into());
+        t.menu_row = Some((0, "team-a/web-3".into()));
+        // Still the fast rows (a later page): nothing moves.
+        t.set_rows(vec![row("team-a/web-1", "web-1"), row("team-a/web-2", "web-2"), row("team-a/web-3", "web-3")]);
+        assert!(t.marked.contains("team-a/web-1"));
+        t.set_rows(vec![row("u1", "web-1"), row("u2", "web-2"), row("u3", "web-3")]);
+        let mut marked: Vec<&str> = t.marked.iter().map(String::as_str).collect();
+        marked.sort();
+        assert_eq!(marked, ["u1", "u2"]);
+        assert_eq!(t.selected_uid.as_deref(), Some("u2"));
+        assert_eq!(t.menu_row, Some((0, "u3".into())));
+        assert_eq!(t.marked_rows().len(), 2);
+        // Checked, then deleted before the full rows came: forgotten.
+        t.marked.insert("team-a/gone".into());
+        t.set_rows(vec![row("u1", "web-1")]);
+        assert!(!t.marked.contains("team-a/gone"));
+    }
 }
 
 #[cfg(test)]
