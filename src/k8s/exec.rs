@@ -228,8 +228,7 @@ pub async fn download_from_container(
 ) -> Result<std::path::PathBuf> {
     use std::io::Write as _;
     run(async move {
-        let base =
-            path.trim_end_matches('/').rsplit('/').next().filter(|b| !b.is_empty()).unwrap_or("root").to_string();
+        let (parent, member, base) = tar_source(&path);
         let is_dir = exec_bytes(
             client.clone(),
             ns.clone(),
@@ -242,13 +241,8 @@ pub async fn download_from_container(
         .map(|o| String::from_utf8_lossy(&o).contains("dir"))
         .unwrap_or(false);
         let (cmd, name) = if is_dir {
-            let parent = path
-                .trim_end_matches('/')
-                .rsplit_once('/')
-                .map(|(p, _)| if p.is_empty() { "/" } else { p })
-                .unwrap_or(".");
             (
-                vec!["tar".into(), "cf".into(), "-".into(), "-C".into(), parent.to_string(), "--".into(), base.clone()],
+                vec!["tar".into(), "cf".into(), "-".into(), "-C".into(), parent, "--".into(), member],
                 format!("{pod}-{base}.tar"),
             )
         } else {
@@ -269,6 +263,20 @@ pub async fn download_from_container(
         Ok(dest)
     })
     .await
+}
+
+/// For `tar -C parent -- member`: the folder to run in, the entry to archive and the name to save
+/// it under. `/` is the whole filesystem, saved as `root`.
+fn tar_source(path: &str) -> (String, String, String) {
+    let trimmed = path.trim_end_matches('/');
+    if trimmed.is_empty() {
+        return ("/".into(), ".".into(), "root".into());
+    }
+    let (parent, base) = match trimmed.rsplit_once('/') {
+        Some((p, b)) => (if p.is_empty() { "/" } else { p }, b),
+        None => (".", trimmed),
+    };
+    (parent.into(), base.into(), base.into())
 }
 
 /// Copy a local file into a container directory, like `kubectl cp file pod:dir/`.
@@ -638,7 +646,7 @@ fn attach_target(
 
 #[cfg(test)]
 mod tests {
-    use super::{attach_target, copy_capped, read_capped};
+    use super::{attach_target, copy_capped, read_capped, tar_source};
     use k8s_openapi::api::core::v1::{Container, EphemeralContainer, PodSpec};
 
     #[test]
@@ -658,6 +666,14 @@ mod tests {
         // Unknown or unreadable spec: still ask for that container, output only.
         assert_eq!(attach_target(Some(&spec), Some("sidecar")), (Some("sidecar".into()), false, false));
         assert_eq!(attach_target(None, Some("app")), (Some("app".into()), false, false));
+    }
+
+    #[test]
+    fn tar_sources() {
+        assert_eq!(tar_source("/"), ("/".into(), ".".into(), "root".into()));
+        assert_eq!(tar_source("/var/log/"), ("/var".into(), "log".into(), "log".into()));
+        assert_eq!(tar_source("/etc"), ("/".into(), "etc".into(), "etc".into()));
+        assert_eq!(tar_source("data"), (".".into(), "data".into(), "data".into()));
     }
 
     #[tokio::test]

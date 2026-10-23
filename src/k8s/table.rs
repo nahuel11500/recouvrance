@@ -580,7 +580,8 @@ pub fn watch_table_paused(
         let mut first = if pages { FirstList::Pages { by_namespace } } else { FirstList::Whole };
         let mut backoff = Backoff::default();
         loop {
-            // Whether this round listed or got events: only then does the wait start over.
+            // Whether this round's watch got events: only then does the wait start over. A
+            // list alone doesn't count, or a watch that keeps failing would relist every second.
             let mut progress = false;
             let result = watch_once(&client, &url, &tx, &extras, &mut first, &pause, &mut progress).await;
             if let Err(e) = &result {
@@ -684,7 +685,6 @@ pub(super) async fn watch_once(
     let mut rows: HashMap<String, Arc<Row>> = list_rows.into_iter().map(|r| (r.uid.clone(), r)).collect();
     let mut snaps = Snapshots { dirty: true, sent: None };
     snaps.flush(&rows, tx, pause)?;
-    *progress = true;
     if *first != FirstList::Done {
         tx.unbounded_send(TableMsg::Listed)?;
         *first = FirstList::Done;
@@ -718,7 +718,6 @@ pub(super) async fn watch_once(
                 Some(None) => break,
                 Some(Some(lines)) => {
                     heard = tokio::time::Instant::now();
-                    *progress = true;
                     for line in lines {
                         let line = line?;
                         match apply_event(&line, &mut rows, &mut version, extras)? {
@@ -727,6 +726,7 @@ pub(super) async fn watch_once(
                             // Our resourceVersion is too old: relist (which sends every row).
                             Applied::Relist => return Ok(()),
                         }
+                        *progress = true;
                     }
                 }
                 None => {}
