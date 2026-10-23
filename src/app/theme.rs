@@ -7,6 +7,24 @@ use super::*;
 pub fn set_theme(mode: ThemeMode, window: Option<&mut Window>, cx: &mut App) {
     apply_theme(mode, window, cx);
     save_theme_choice(mode);
+    cx.set_global(FollowSystem(false));
+}
+
+/// Whether the theme follows the desktop: no Light or Dark choice is saved.
+struct FollowSystem(bool);
+
+impl Global for FollowSystem {}
+
+pub fn follows_system(cx: &App) -> bool {
+    cx.try_global::<FollowSystem>().is_some_and(|f| f.0)
+}
+
+/// The theme for a desktop appearance.
+pub fn system_theme(appearance: WindowAppearance) -> ThemeMode {
+    match appearance {
+        WindowAppearance::Dark | WindowAppearance::VibrantDark => ThemeMode::Dark,
+        WindowAppearance::Light | WindowAppearance::VibrantLight => ThemeMode::Light,
+    }
 }
 
 /// Apply a theme mode with the app's typography on top, without saving it.
@@ -169,14 +187,13 @@ pub(super) fn save_theme_choice(mode: ThemeMode) {
     let _ = std::fs::write(path, if mode.is_dark() { "dark" } else { "light" });
 }
 
-/// The saved choice, else the system appearance.
-pub fn initial_theme(cx: &App) -> ThemeMode {
-    match std::fs::read_to_string(ui_prefs_path()).as_deref().map(str::trim) {
-        Ok("dark") => ThemeMode::Dark,
-        Ok("light") => ThemeMode::Light,
-        _ => match cx.window_appearance() {
-            WindowAppearance::Dark | WindowAppearance::VibrantDark => ThemeMode::Dark,
-            _ => ThemeMode::Light,
-        },
-    }
+/// The saved choice, else the system appearance (and then follow it while the app runs).
+pub fn initial_theme(cx: &mut App) -> ThemeMode {
+    let saved = match std::fs::read_to_string(ui_prefs_path()).as_deref().map(str::trim) {
+        Ok("dark") => Some(ThemeMode::Dark),
+        Ok("light") => Some(ThemeMode::Light),
+        _ => None,
+    };
+    cx.set_global(FollowSystem(saved.is_none()));
+    saved.unwrap_or_else(|| system_theme(cx.window_appearance()))
 }
