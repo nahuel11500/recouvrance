@@ -138,7 +138,8 @@ struct NodeAllocatableStatus {
 /// Poll node metrics and allocatable every 15s, retrying (backing off) on errors;
 /// nothing while `pause` is set.
 /// A pod's CPU (millicores) and memory (bytes) requests and limits, summed over its
-/// containers. No limit when a container has none: the pod can then use what the node has.
+/// containers and sidecars, plus overhead; pod-level resources win when set. No limit when a
+/// container has none: the pod can then use what the node has.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct PodResources {
     pub cpu: (Option<f64>, Option<f64>),
@@ -164,14 +165,19 @@ struct LeanPodMeta {
 
 #[derive(serde::Deserialize, Default)]
 #[serde(default)]
+#[serde(rename_all = "camelCase")]
 struct LeanPodSpec {
     containers: Vec<LeanContainer>,
+    init_containers: Vec<LeanContainer>,
+    overhead: HashMap<String, String>,
+    resources: LeanResources,
 }
 
 #[derive(serde::Deserialize, Default)]
-#[serde(default)]
+#[serde(default, rename_all = "camelCase")]
 struct LeanContainer {
     resources: LeanResources,
+    restart_policy: Option<String>,
 }
 
 #[derive(serde::Deserialize, Default)]
@@ -181,13 +187,20 @@ struct LeanResources {
     limits: HashMap<String, String>,
 }
 
-fn pod_resources(containers: &[LeanContainer]) -> PodResources {
+fn pod_resources(spec: &LeanPodSpec) -> PodResources {
+    // Sidecars (init containers that keep running) are in the usage metrics-server reports.
+    let sidecars = spec.init_containers.iter().filter(|c| c.restart_policy.as_deref() == Some("Always"));
+    let containers: Vec<&LeanContainer> = spec.containers.iter().chain(sidecars).collect();
     let sum = |key: &str, of: fn(&LeanResources) -> &HashMap<String, String>, parse: fn(&str) -> f64, all: bool| {
+        let overhead = spec.overhead.get(key).map_or(0.0, |q| parse(q));
+        if let Some(q) = of(&spec.resources).get(key) {
+            return Some(parse(q) + overhead);
+        }
         let vals: Vec<Option<f64>> = containers.iter().map(|c| of(&c.resources).get(key).map(|q| parse(q))).collect();
         if vals.iter().all(Option::is_none) || all && vals.iter().any(Option::is_none) {
             return None;
         }
-        Some(vals.into_iter().flatten().sum())
+        Some(vals.into_iter().flatten().sum::<f64>() + overhead)
     };
     PodResources {
         cpu: (sum("cpu", |r| &r.requests, parse_cpu, false), sum("cpu", |r| &r.limits, parse_cpu, true)),
@@ -218,10 +231,8 @@ pub fn watch_pod_resources(
                 continue;
             };
             failures = 0;
-            let map: PodResourcesMap = pods
-                .into_iter()
-                .map(|p| ((p.metadata.namespace, p.metadata.name), pod_resources(&p.spec.containers)))
-                .collect();
+            let map: PodResourcesMap =
+                pods.into_iter().map(|p| ((p.metadata.namespace, p.metadata.name), pod_resources(&p.spec))).collect();
             if tx.unbounded_send(map).is_err() {
                 return;
             }
@@ -405,18 +416,43 @@ mod resources_tests {
 
     fn container(requests: &[(&str, &str)], limits: &[(&str, &str)]) -> LeanContainer {
         let map = |kv: &[(&str, &str)]| kv.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
-        LeanContainer { resources: LeanResources { requests: map(requests), limits: map(limits) } }
+        LeanContainer {
+            resources: LeanResources { requests: map(requests), limits: map(limits) },
+            restart_policy: None,
+        }
+    }
+
+    fn spec(containers: Vec<LeanContainer>) -> LeanPodSpec {
+        LeanPodSpec { containers, ..Default::default() }
     }
 
     #[test]
     fn sums_requests_and_limits() {
-        let r = pod_resources(&[
+        let r = pod_resources(&spec(vec![
             container(&[("cpu", "250m"), ("memory", "256Mi")], &[("cpu", "1"), ("memory", "512Mi")]),
             container(&[("cpu", "250m")], &[("cpu", "500m")]),
-        ]);
+        ]));
         assert_eq!(r.cpu, (Some(500.0), Some(1500.0)));
         // A container without a memory limit: the pod has none.
         assert_eq!(r.mem, (Some(256.0 * 1024.0 * 1024.0), None));
-        assert_eq!(pod_resources(&[container(&[], &[])]), PodResources::default());
+        assert_eq!(pod_resources(&spec(vec![container(&[], &[])])), PodResources::default());
+    }
+
+    #[test]
+    fn counts_sidecars_and_overhead() {
+        let mut s = spec(vec![container(&[("cpu", "100m")], &[("cpu", "200m")])]);
+        let mut sidecar = container(&[("cpu", "50m")], &[("cpu", "150m")]);
+        sidecar.restart_policy = Some("Always".into());
+        // A regular init container has finished by the time usage is read.
+        s.init_containers = vec![sidecar, container(&[("cpu", "1")], &[("cpu", "2")])];
+        s.overhead = [("cpu".to_string(), "10m".to_string())].into();
+        assert_eq!(pod_resources(&s).cpu, (Some(160.0), Some(360.0)));
+    }
+
+    #[test]
+    fn pod_level_resources_win() {
+        let mut s = spec(vec![container(&[("cpu", "100m")], &[])]);
+        s.resources.limits = [("cpu".to_string(), "1".to_string())].into();
+        assert_eq!(pod_resources(&s).cpu, (Some(100.0), Some(1000.0)));
     }
 }
