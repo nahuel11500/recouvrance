@@ -16,7 +16,8 @@
   and restored with one click. Shells and attach need write mode (they run commands in the
   cluster), and the context name typed on a protected context.
 - **RBAC-aware**: actions your Kubernetes RBAC forbids are disabled; *My access* shows a can-i
-  matrix for the namespace.
+  matrix for the namespace, and says when the cluster (webhook or cloud IAM authorizer) may allow
+  more than it lists.
 - **Problems**: one list of what is broken across clusters (crash loops, pending pods, unavailable workloads, NotReady nodes, failed jobs, pending volumes).
 - **Overviews**: cluster capacity and health, workloads status, Helm releases (values masked; install from your repos, roll back and uninstall through your `helm` CLI).
 - **API requests** (Settings → API requests): per cluster, how many requests of each kind

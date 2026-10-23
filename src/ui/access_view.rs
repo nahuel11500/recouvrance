@@ -9,9 +9,8 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use kube::Client;
 
-use crate::k8s;
+use crate::k8s::{self, Rules};
 
-type Rules = Vec<(Vec<String>, Vec<String>, Vec<String>)>;
 /// "Who can": the grants found, and which lists could not be read.
 type WhoAnswer = (Vec<crate::rbac::Grant>, Option<String>);
 
@@ -86,6 +85,8 @@ pub struct AccessView {
     kinds: Vec<k8s::Kind>,
     namespace: String,
     rules: Option<Result<Rules, String>>,
+    /// Set when the server says the rules may be incomplete (webhook or cloud IAM authorizer).
+    incomplete: Option<String>,
     /// "Who can": verb, resource, namespace inputs and the answer.
     who_verb: Entity<InputState>,
     who_resource: Entity<InputState>,
@@ -131,8 +132,12 @@ impl AccessView {
             .collect();
         let client2 = client.clone();
         let task = cx.spawn(async move |this, cx| {
-            let rules = k8s::my_rules(client2, ns).await.map_err(|e| format!("{e:#}"));
+            let (rules, incomplete) = match k8s::my_rules(client2, ns).await {
+                Ok((rules, note)) => (Ok(rules), note),
+                Err(e) => (Err(format!("{e:#}")), None),
+            };
             let _ = this.update(cx, |this, cx| {
+                this.incomplete = incomplete;
                 this.rules = Some(rules.map(|mut r| {
                     for (v, res, n) in r.iter_mut() {
                         v.sort();
@@ -154,6 +159,7 @@ impl AccessView {
             kinds,
             namespace,
             rules: None,
+            incomplete: None,
             who_verb,
             who_resource,
             who_ns,
@@ -399,6 +405,7 @@ impl Render for AccessView {
             .when(matches!(&self.rules, Some(Ok(r)) if full_access(r)), |d| {
                 d.child(div().text_sm().text_color(theme.warning).child("You have full access (* on *) here: Recouvrance's write mode and protected contexts are your safety net."))
             })
+            .children(self.incomplete.clone().map(|note| div().text_sm().text_color(theme.warning).child(note)))
             .child(body)
     }
 }
