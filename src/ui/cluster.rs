@@ -319,10 +319,10 @@ async fn load(context: String, client: Client) -> Summary {
 
 /// What a cluster answered for its summary, each part on its own.
 struct Answers {
-    version: anyhow::Result<String>,
-    nodes: anyhow::Result<Vec<NodeLite>>,
-    pods: anyhow::Result<Vec<PodLite>>,
-    namespaces: anyhow::Result<Vec<String>>,
+    version: Result<String>,
+    nodes: Result<Vec<NodeLite>>,
+    pods: Result<Vec<PodLite>>,
+    namespaces: Result<Vec<String>>,
     node_metrics: Option<MetricsList>,
     pod_metrics: Option<MetricsList>,
 }
