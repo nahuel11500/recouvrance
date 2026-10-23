@@ -160,6 +160,9 @@ impl Rule {
         };
         let name = match &a.name {
             Some(n) => any_glob(&self.names, n),
+            // Name-less checks (lists): a Deny of some names only leaves the rest, whose rows
+            // are then filtered by name.
+            None if self.effect == Mode::Deny => self.names.iter().any(|n| n.trim() == "*"),
             None => !self.names.is_empty(),
         };
         verb && resource && namespace && any_glob(&self.contexts, &a.context) && name
@@ -1101,6 +1104,25 @@ mod tests {
         assert_eq!(p.decide(&a).mode, Mode::Allow);
         a.name = Some("api".into());
         assert_eq!(p.decide(&a).mode, Mode::Deny);
+    }
+
+    #[test]
+    fn denied_names_leave_the_rest_of_a_list() {
+        let mut deny = rule(Mode::Deny, &["*"], &["pods"], &["*"], &["*"]);
+        deny.names = vec!["debug-*".into()];
+        let p = Policy { rules: vec![rule(Mode::Allow, &["list"], &["*"], &["*"], &["*"]), deny], ..Policy::default() };
+        // The list itself is allowed, in a namespace or across all of them...
+        assert_eq!(p.decide(&access("c", "list", "pods", Some("ns"), None)).mode, Mode::Allow);
+        assert_eq!(p.decide_any_namespace(&access("c", "list", "pods", None, None)).mode, Mode::Allow);
+        // ...and its rows are filtered by name.
+        assert_eq!(p.decide(&access("c", "list", "pods", Some("ns"), Some("debug-1"))).mode, Mode::Deny);
+        assert_eq!(p.decide(&access("c", "list", "pods", Some("ns"), Some("web-1"))).mode, Mode::Allow);
+        // A Deny of every name still denies the whole list.
+        let all = Policy {
+            rules: vec![p.rules[0].clone(), rule(Mode::Deny, &["*"], &["pods"], &["*"], &["*"])],
+            ..Policy::default()
+        };
+        assert_eq!(all.decide_any_namespace(&access("c", "list", "pods", None, None)).mode, Mode::Deny);
     }
 
     #[test]
