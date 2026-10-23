@@ -51,7 +51,8 @@ to any of these files are picked up within a few seconds. When two files define 
 A context name stays with the file that had it first (kept in `context_files`), even when files
 are saved again, reordered, or one is briefly unreadable: protection and per-cluster settings
 never move to another cluster. The name is freed when its file is deleted or no longer has it
-(read twice the same way, so a file caught while `kubectl` rewrites it keeps its names).
+(read twice the same way, so a file caught while `kubectl` rewrites it keeps its names). A
+context already shown as `name@file` keeps that name when `name` is freed.
 
 ## settings.json
 
