@@ -281,6 +281,13 @@ fn manifest_objects(planned: &[(Kind, Option<String>, String, serde_json::Value)
         .collect()
 }
 
+/// Whether the rules keep a drain from evicting a pod: an explicit Deny rule on deleting
+/// it, not merely the absence of a delete rule.
+fn denies_eviction(policy: &Policy, pod: &Access) -> bool {
+    let v = policy.decide(pod);
+    v.mode == Mode::Deny && v.rule.is_some()
+}
+
 /// Namespaces, sorted, of the pods a drain would evict (`k8s::drain` leaves DaemonSet,
 /// static, finished and unmanaged pods alone) for which `denied(namespace, name)` holds.
 fn denied_namespaces(pods: &[serde_json::Value], denied: impl Fn(&str, &str) -> bool) -> Vec<String> {
@@ -1172,5 +1179,26 @@ mod tests {
         let denied = denied_namespaces(&pods, |ns, _| ns.starts_with("kube-"));
         assert_eq!(denied, ["kube-public", "kube-system"]);
         assert!(denied_namespaces(&pods, |_, _| false).is_empty());
+    }
+
+    #[test]
+    fn a_new_deny_keeps_its_pods_in_a_running_drain() {
+        let rule = |effect: Mode, verb: &str, ns: &str| crate::mcp::Rule {
+            effect,
+            verbs: vec![verb.into()],
+            namespaces: vec![ns.into()],
+            contexts: vec!["*".into()],
+            ..crate::mcp::Rule::default()
+        };
+        let pods = kind("", "v1", "Pod", "pods", true);
+        let pod = |ns: &str| access_for(&pods, "c", "delete", Some(ns.into()), Some("web".into()));
+        // No delete rule at all: the drain rule is what lets it evict.
+        let allowed = Policy { rules: vec![rule(Mode::Allow, "drain", "*")], ..Policy::default() };
+        assert!(!denies_eviction(&allowed, &pod("app")));
+        // A Deny on deleting pods added while it runs keeps that namespace's pods only.
+        let mut denied = allowed.clone();
+        denied.rules.push(rule(Mode::Deny, "delete", "app"));
+        assert!(denies_eviction(&denied, &pod("app")));
+        assert!(!denies_eviction(&denied, &pod("other")));
     }
 }

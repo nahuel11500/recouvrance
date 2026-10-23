@@ -195,11 +195,11 @@ impl KubeMcp {
             Ok(v) => v,
             Err(e) => return call.finish(Err(e)),
         };
+        // The rules may have changed while the pods were listed.
+        self.reload_rules(&mut call);
         let denied = denied_namespaces(&on_node, |ns, name| {
             let a = access_for(&pods_kind, &p.context, "delete", Some(ns.into()), Some(name.into()));
-            let v = call.policy().decide(&a);
-            // An explicit Deny rule, not merely the absence of a delete rule.
-            v.mode == Mode::Deny && v.rule.is_some()
+            denies_eviction(call.policy(), &a)
         });
         if !denied.is_empty() {
             return Err(call.deny(format!(
@@ -210,12 +210,24 @@ impl KubeMcp {
         }
         self.recheck(&mut call, &access)?;
         let stop = self.still_allowed(&call, &access);
+        // The drain lists the pods again and takes minutes on a big node: a Deny on deleting
+        // a pod, added while it runs, keeps that pod in place.
+        let (hub, agent_id, context, kind) =
+            (self.hub.clone(), call.agent.id.clone(), p.context.clone(), pods_kind.clone());
+        let keep = move |ns: &str, name: &str| {
+            let a = access_for(&kind, &context, "delete", Some(ns.into()), Some(name.into()));
+            match hub.agent(&agent_id) {
+                Some(agent) if !denies_eviction(&agent.policy, &a) => None,
+                Some(_) => Some("your rules deny deleting it".to_string()),
+                None => Some("this agent is disabled".to_string()),
+            }
+        };
         // The reply names only the pods the agent may list.
         let shown = |ns: &str, name: &str| {
             let a = access_for(&pods_kind, &p.context, "list", Some(ns.into()), Some(name.into()));
             call.policy().decide(&a).mode == Mode::Allow
         };
-        call.finish(k8s::drain_report(client, p.node, stop).await.map(|d| d.summary(shown)))
+        call.finish(k8s::drain_report(client, p.node, stop, keep).await.map(|d| d.summary(shown)))
     }
 
     #[tool(

@@ -496,6 +496,9 @@ pub struct Drained {
     pub refused: Vec<(String, String, String)>,
     /// Pods no controller manages, left in place: namespace and name.
     pub unmanaged: Vec<(String, String)>,
+    /// Pods left in place on request (an agent's rules deny deleting them): namespace,
+    /// name and why.
+    pub kept: Vec<(String, String, String)>,
 }
 
 impl Drained {
@@ -534,6 +537,15 @@ impl Drained {
                 listed(names, ", ")
             ));
         }
+        if !self.kept.is_empty() {
+            let names = self
+                .kept
+                .iter()
+                .filter(|(ns, n, _)| show(ns, n))
+                .map(|(ns, n, why)| format!("{ns}/{n}: {why}"))
+                .collect();
+            msg.push_str(&format!("; {} not evicted{}", self.kept.len(), listed(names, "; ")));
+        }
         msg
     }
 }
@@ -546,14 +558,16 @@ impl Drained {
 /// and ends the drain when it gives a reason (write mode or agent access turned off, or
 /// the agent's rules changed, while the drain ran); the node stays cordoned.
 pub async fn drain(client: Client, node: String, stop: impl Fn() -> Option<String> + Send + 'static) -> Result<String> {
-    Ok(drain_report(client, node, stop).await?.summary(|_, _| true))
+    Ok(drain_report(client, node, stop, |_, _| None).await?.summary(|_, _| true))
 }
 
-/// [`drain`], returning what it did.
+/// [`drain`], returning what it did. `keep(namespace, name)` is asked about each pod right
+/// before its eviction, after `stop`, and leaves it in place when it gives a reason.
 pub async fn drain_report(
     client: Client,
     node: String,
     stop: impl Fn() -> Option<String> + Send + 'static,
+    keep: impl Fn(&str, &str) -> Option<String> + Send + 'static,
 ) -> Result<Drained> {
     run(async move {
         let nodes: Api<k8s_openapi::api::core::v1::Node> = Api::all(client.clone());
@@ -566,7 +580,8 @@ pub async fn drain_report(
             .await?;
         let pods: Api<Pod> = Api::all(client.clone());
         let on_node = pods.list(&ListParams::default().fields(&format!("spec.nodeName={node}"))).await?;
-        let mut out = Drained { node, evicted: 0, skipped: 0, refused: Vec::new(), unmanaged: Vec::new() };
+        let mut out =
+            Drained { node, evicted: 0, skipped: 0, refused: Vec::new(), unmanaged: Vec::new(), kept: Vec::new() };
         for p in on_node.items {
             let owners = p.metadata.owner_references.clone().unwrap_or_default();
             let daemon = owners.iter().any(|o| o.kind == "DaemonSet");
@@ -587,6 +602,10 @@ pub async fn drain_report(
                     out.node,
                     out.evicted
                 );
+            }
+            if let Some(reason) = keep(&ns, &name) {
+                out.kept.push((ns, name, reason));
+                continue;
             }
             let api: Api<Pod> = Api::namespaced(client.clone(), &ns);
             match api.evict(&name, &Default::default()).await {
@@ -701,6 +720,7 @@ mod tests {
             skipped: 1,
             refused: vec![("a".into(), "web-1".into(), "pdb".into()), ("b".into(), "db-0".into(), "pdb".into())],
             unmanaged: vec![("b".into(), "bare".into())],
+            kept: vec![("b".into(), "cache-0".into(), "denied".into())],
         };
         let all = d.summary(|_, _| true);
         assert!(
@@ -711,6 +731,7 @@ mod tests {
         let some = d.summary(|ns, _| ns == "a");
         assert!(some.contains("2 refused") && some.contains("a/web-1") && some.contains("1 not evicted"), "{some}");
         assert!(!some.contains("db-0") && !some.contains("bare") && !some.contains("--force`):"), "{some}");
+        assert!(all.contains("1 not evicted: b/cache-0: denied") && !some.contains("cache-0"), "{all}");
     }
 
     #[test]

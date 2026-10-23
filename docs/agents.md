@@ -66,8 +66,11 @@ container must be a DNS label, an object name may hold only letters, digits and 
 `/`, `?`, `%`, `..` or spaces). An invalid name fails the call with a message saying why. What the
 API server returns must be the object asked for, and a Secret's values are masked whatever kind
 was asked for. `get_logs` returns at most 1 MiB. `drain_node` is refused, without cordoning, when
-the node runs pods it would evict in a namespace a Deny rule covers for `delete` on pods; its reply
-counts every pod it could not evict but names only those an Allow rule lets the agent list.
+the node runs pods it would evict in a namespace a Deny rule covers for `delete` on pods. Once it
+runs, each pod is checked again right before its eviction: a pod such a Deny now covers is left in
+place, and switching agent access off, disabling the agent or taking away its drain rule stops the
+evictions that remain (the node stays cordoned). Its reply counts every pod it could not evict but
+names only those an Allow rule lets the agent list.
 
 Tools: `my_permissions`, `list_contexts`, `list_resource_types`, `list_resources`, `get_resource`,
 `describe_resource`, `top_pods`, `search`, `get_events`, `find_problems`, `check_certificates`, `usage_history`, `drain_node`, `gitops`,
