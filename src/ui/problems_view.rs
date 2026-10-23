@@ -230,13 +230,23 @@ impl Render for ProblemsView {
             )
             .children(self.errors.iter().map(|e| div().text_sm().text_color(theme.danger).child(e.clone())))
             .when(crit + warn + if self.show_info { info } else { 0 } == 0, |d| {
-                d.child(
-                    h_flex()
-                        .gap_2()
-                        .text_color(theme.success)
-                        .child(Icon::new(Lucide::CircleCheck))
-                        .child("Nothing broken right now."),
-                )
+                // An all-clear only when every scan answered.
+                if self.errors.is_empty() {
+                    d.child(
+                        h_flex()
+                            .gap_2()
+                            .text_color(theme.success)
+                            .child(Icon::new(Lucide::CircleCheck))
+                            .child("Nothing broken right now."),
+                    )
+                } else {
+                    d.child(
+                        div()
+                            .text_sm()
+                            .text_color(theme.muted_foreground)
+                            .child("Nothing broken on the clusters that answered."),
+                    )
+                }
             })
             .child(
                 // Only the rows on screen are laid out: hundreds of problems made the page stutter.
