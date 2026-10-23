@@ -329,7 +329,13 @@ impl KubeMcp {
             }
             Mode::Deny => Err(call.deny(format!("{} — {}", describe(access), call.rule_label(verdict.rule)))),
             Mode::Ask => {
+                // Across namespaces, the allowed ones can be shown without approval (Ask rows hidden).
+                let fallback = if any_namespace { call.policy().allow_somewhere(access) } else { None };
                 if self.hub.headless() {
+                    if fallback.is_some() {
+                        call.rule = fallback;
+                        return self.ensure_active(call);
+                    }
                     return Err(call.deny(format!(
                         "{} needs approval in the Recouvrance window ({}); run the app, or add an Allow rule",
                         describe(access),
@@ -349,6 +355,9 @@ impl KubeMcp {
                     call.approved = true;
                     call.rule = verdict.rule;
                     Ok(())
+                } else if fallback.is_some() {
+                    call.rule = fallback;
+                    self.ensure_active(call)
                 } else {
                     call.record(Decision::Rejected, "not approved".into(), 0);
                     Err("Rejected: the user did not approve this request".into())
