@@ -454,6 +454,17 @@ pub(crate) fn nbsp_tolerant(pattern: &str) -> String {
     out
 }
 
+/// The container to read from a pod: the chosen one when the pod has it (or its
+/// containers are unknown), else the pod's default one.
+pub(crate) fn container_for(chosen: Option<&str>, containers: &[String]) -> Option<String> {
+    let chosen = chosen?;
+    if containers.is_empty() || containers.iter().any(|c| c == chosen) {
+        Some(chosen.to_string())
+    } else {
+        containers.first().cloned()
+    }
+}
+
 /// Where one pod's stream is.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum StreamState {
@@ -509,6 +520,15 @@ mod tests {
 
     fn texts(b: &LogBuffer) -> Vec<String> {
         b.shown_lines().map(|l| l.text.to_string()).collect()
+    }
+
+    #[test]
+    fn reads_the_chosen_container_only_from_pods_that_have_it() {
+        let pod = |cs: &[&str]| cs.iter().map(|c| c.to_string()).collect::<Vec<_>>();
+        assert_eq!(container_for(Some("api"), &pod(&["api", "proxy"])).as_deref(), Some("api"));
+        assert_eq!(container_for(Some("api"), &pod(&["worker", "proxy"])).as_deref(), Some("worker"));
+        assert_eq!(container_for(Some("api"), &[]).as_deref(), Some("api"));
+        assert_eq!(container_for(None, &pod(&["worker"])), None);
     }
 
     #[test]

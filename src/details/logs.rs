@@ -8,6 +8,25 @@ use model::*;
 
 pub(super) const MAX_LOG_LINES: usize = 50_000;
 
+/// Pods one page follows at most: each is a connection and its own tail of lines.
+pub(super) const MAX_LOG_PODS: usize = 50;
+
+/// The pods whose logs a page follows: all of them, or past the limit the running ones
+/// first, newest first.
+pub(super) fn followed_pods(pods: &[serde_json::Value]) -> Vec<&serde_json::Value> {
+    let mut pods: Vec<&serde_json::Value> = pods.iter().collect();
+    if pods.len() > MAX_LOG_PODS {
+        let key = |p: &serde_json::Value| {
+            let running = p.pointer("/status/phase").and_then(|v| v.as_str()) == Some("Running");
+            let created = p.pointer("/metadata/creationTimestamp").and_then(|v| v.as_str()).unwrap_or_default();
+            (running, created.to_string())
+        };
+        pods.sort_by_cached_key(|p| std::cmp::Reverse(key(p)));
+        pods.truncate(MAX_LOG_PODS);
+    }
+    pods
+}
+
 /// Distinct colors for pod prefixes in multi-pod logs.
 pub(super) fn pod_color(ix: usize, cx: &App) -> Hsla {
     let t = cx.theme();
@@ -36,8 +55,13 @@ pub struct LogsView {
     pub(super) ns: String,
     /// One pod or all pods of a workload.
     pub(super) pods: Vec<String>,
-    /// The first pod's containers; the chosen one is read from every pod.
+    /// Pods past `MAX_LOG_PODS`, not followed; the status line says so.
+    pub(super) left_out: usize,
+    /// Each pod's containers, default first (empty when not known).
+    pub(super) pod_containers: Vec<Vec<String>>,
+    /// The first pod's containers; the chosen one is read from every pod that has it.
     pub(super) containers: Option<Entity<SelectState<SearchableVec<SharedString>>>>,
+    pub(super) _containers_sub: Option<Subscription>,
     pub(super) container: Option<String>,
     pub(super) previous: bool,
     pub(super) follow: bool,
@@ -77,10 +101,11 @@ impl LogsView {
     pub(super) fn new(
         client: Client,
         ns: String,
-        pods: Vec<String>,
+        pods: Vec<(String, Vec<String>)>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let (pods, pod_containers): (Vec<String>, Vec<Vec<String>>) = pods.into_iter().unzip();
         let search =
             cx.new(|cx| InputState::new(window, cx).placeholder("Find in logs… (several words; !word excludes)"));
         let find = cx.new(|cx| InputState::new(window, cx).placeholder("Find…"));
@@ -109,7 +134,10 @@ impl LogsView {
             ns,
             pod_states: vec![StreamState::Connecting; pods.len()],
             pods,
+            left_out: 0,
+            pod_containers,
             containers: None,
+            _containers_sub: None,
             container: None,
             previous: false,
             follow: true,
@@ -155,16 +183,30 @@ impl LogsView {
         }
     }
 
-    /// Follow another set of pods (a workload's after a rollout or a scale); streams
-    /// restart when they were running. Same pods in another order change nothing.
-    pub(super) fn set_pods(&mut self, mut pods: Vec<String>, cx: &mut Context<Self>) {
+    /// Follow another set of pods (a workload's after a rollout or a scale), each with its
+    /// containers; streams restart when they were running. Same pods in another order
+    /// change nothing.
+    pub(super) fn set_pods(
+        &mut self,
+        mut pods: Vec<(String, Vec<String>)>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         pods.sort();
-        let mut current = self.pods.clone();
+        let mut current: Vec<(String, Vec<String>)> =
+            self.pods.iter().cloned().zip(self.pod_containers.iter().cloned()).collect();
         current.sort();
         if pods == current {
             return;
         }
-        self.pods = pods;
+        let first = self.pod_containers.first().cloned();
+        (self.pods, self.pod_containers) = pods.into_iter().unzip();
+        // A rollout can rename the containers: choose among the new first pod's.
+        if let Some(names) =
+            self.pod_containers.first().filter(|n| !n.is_empty() && Some(*n) != first.as_ref()).cloned()
+        {
+            self.set_containers(names, window, cx);
+        }
         self.buf.set_merge(self.pods.len() > 1);
         self.pod_states = vec![StreamState::Connecting; self.pods.len()];
         // Lines point at pods by index: they belong to the old list.
@@ -184,23 +226,7 @@ impl LogsView {
             let _ = this.update_in(cx, |this, window, cx| match result {
                 Ok(names) => {
                     this.status = None;
-                    this.container = names.first().cloned();
-                    if names.len() > 1 {
-                        let items: Vec<SharedString> = names.into_iter().map(Into::into).collect();
-                        let select = cx.new(|cx| {
-                            SelectState::new(SearchableVec::new(items), Some(IndexPath::default()), window, cx)
-                        });
-                        this._subs.push(cx.subscribe_in(
-                            &select,
-                            window,
-                            |this, _, ev: &SelectEvent<SearchableVec<SharedString>>, _, cx| {
-                                let SelectEvent::Confirm(Some(name)) = ev else { return };
-                                this.container = Some(name.to_string());
-                                this.restart(cx);
-                            },
-                        ));
-                        this.containers = Some(select);
-                    }
+                    this.set_containers(names, window, cx);
                     if !this.paused {
                         this.restart(cx);
                     }
@@ -213,6 +239,30 @@ impl LogsView {
         }));
     }
 
+    /// The containers to choose from; the choice stays when the new list has it.
+    fn set_containers(&mut self, names: Vec<String>, window: &mut Window, cx: &mut Context<Self>) {
+        let ix = self.container.as_ref().and_then(|c| names.iter().position(|n| n == c)).unwrap_or(0);
+        self.container = names.get(ix).cloned();
+        self.containers = None;
+        self._containers_sub = None;
+        if names.len() > 1 {
+            let items: Vec<SharedString> = names.into_iter().map(Into::into).collect();
+            let select = cx
+                .new(|cx| SelectState::new(SearchableVec::new(items), Some(IndexPath::default().row(ix)), window, cx));
+            self._containers_sub = Some(cx.subscribe_in(
+                &select,
+                window,
+                |this, _, ev: &SelectEvent<SearchableVec<SharedString>>, _, cx| {
+                    let SelectEvent::Confirm(Some(name)) = ev else { return };
+                    this.container = Some(name.to_string());
+                    this.restart(cx);
+                },
+            ));
+            self.containers = Some(select);
+        }
+        cx.notify();
+    }
+
     pub(super) fn restart(&mut self, cx: &mut Context<Self>) {
         self.paused = false;
         self.buf.clear();
@@ -223,13 +273,14 @@ impl LogsView {
         self.pod_states = vec![StreamState::Connecting; self.pods.len()];
         self.streams.clear();
         let mut receivers = Vec::new();
-        // A workload's pods share their containers: the chosen one is read from each.
+        // The chosen container from each pod that has it; the others show their default one.
         for (ix, pod) in self.pods.iter().enumerate() {
+            let containers = self.pod_containers.get(ix).map_or(&[][..], Vec::as_slice);
             let (guard, rx) = k8s::stream_logs(
                 self.client.clone(),
                 self.ns.clone(),
                 pod.clone(),
-                self.container.clone(),
+                container_for(self.container.as_deref(), containers),
                 self.previous,
                 self.since,
             );
@@ -557,12 +608,16 @@ impl LogsView {
             .into_any_element()
     }
 
-    /// The status line: the streams' state and a container list error.
+    /// The status line: pods left out, the streams' state and a container list error.
     fn status_text(&self) -> Option<SharedString> {
-        match (stream_status(&self.pods, &self.pod_states), &self.status) {
-            (Some(streams), Some(e)) => Some(format!("{streams} · {e}").into()),
-            (streams, e) => streams.map(Into::into).or_else(|| e.clone()),
-        }
+        let followed = self.pods.len();
+        let capped = (self.left_out > 0).then(|| format!("Following {followed} of {} pods", followed + self.left_out));
+        let parts: Vec<String> =
+            [capped, stream_status(&self.pods, &self.pod_states), self.status.as_ref().map(|s| s.to_string())]
+                .into_iter()
+                .flatten()
+                .collect();
+        (!parts.is_empty()).then(|| parts.join(" · ").into())
     }
 }
 
@@ -792,12 +847,29 @@ impl Render for LogsView {
 
 #[cfg(test)]
 mod tests {
-    use super::{px, row_height};
+    use super::{MAX_LOG_PODS, followed_pods, px, row_height};
 
     #[test]
     fn row_height_is_the_content_over_its_rows() {
         assert_eq!(row_height(px(2000.), 100), Some(px(20.)));
         assert_eq!(row_height(px(0.), 0), None);
         assert_eq!(row_height(px(2000.), 0), None);
+    }
+
+    #[test]
+    fn follows_running_then_newest_pods_past_the_limit() {
+        let pod = |name: String, phase: &str, created: &str| serde_json::json!({"metadata": {"name": name, "creationTimestamp": created}, "status": {"phase": phase}});
+        let name = |p: &serde_json::Value| p["metadata"]["name"].as_str().unwrap_or_default().to_string();
+        let few = vec![pod("a".into(), "Pending", "2026-01-01T00:00:00Z")];
+        assert_eq!(followed_pods(&few).len(), 1);
+
+        let mut many: Vec<_> =
+            (0..MAX_LOG_PODS + 10).map(|i| pod(format!("old-{i}"), "Running", "2026-01-01T00:00:00Z")).collect();
+        many.push(pod("new".into(), "Running", "2026-02-01T00:00:00Z"));
+        many.push(pod("pending".into(), "Pending", "2026-03-01T00:00:00Z"));
+        let followed: Vec<String> = followed_pods(&many).into_iter().map(name).collect();
+        assert_eq!(followed.len(), MAX_LOG_PODS);
+        assert_eq!(followed[0], "new");
+        assert!(!followed.contains(&"pending".to_string()));
     }
 }

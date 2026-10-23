@@ -676,8 +676,11 @@ fn recent_warnings(events: &[Value]) -> Vec<Warning> {
     let hour_ago = jiff::Timestamp::now() - jiff::SignedDuration::from_secs(3600);
     let mut by_reason: BTreeMap<String, Warning> = BTreeMap::new();
     for e in events {
-        let Some(last) =
-            ts(e, "/lastTimestamp").or_else(|| ts(e, "/eventTime")).or_else(|| ts(e, "/metadata/creationTimestamp"))
+        // Events recorded through events.k8s.io keep their repeats in `series`.
+        let Some(last) = ts(e, "/series/lastObservedTime")
+            .or_else(|| ts(e, "/lastTimestamp"))
+            .or_else(|| ts(e, "/eventTime"))
+            .or_else(|| ts(e, "/metadata/creationTimestamp"))
         else {
             continue;
         };
@@ -689,7 +692,7 @@ fn recent_warnings(events: &[Value]) -> Vec<Warning> {
             count: 0,
             last,
         });
-        w.count += n(e, "/count").max(1);
+        w.count += n(e, "/series/count").max(n(e, "/count")).max(1);
         w.last = w.last.max(last);
     }
     let mut warnings: Vec<Warning> = by_reason.into_values().collect();
@@ -1033,7 +1036,7 @@ pub async fn debug_load(client: Client) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{Tbl, Tone, pod_counts, pod_usage, restart_ago};
+    use super::{Tbl, Tone, pod_counts, pod_usage, recent_warnings, restart_ago};
     use crate::k8s;
 
     #[test]
@@ -1067,6 +1070,21 @@ mod tests {
         ];
         let got: Vec<(&str, Tone)> = counts.iter().map(|(l, _, t)| (l.as_str(), *t)).collect();
         assert_eq!(got, want);
+    }
+
+    #[test]
+    fn warnings_count_event_series() {
+        let now = jiff::Timestamp::now();
+        let two_hours_ago = (now - jiff::SignedDuration::from_secs(7200)).to_string();
+        let events = vec![serde_json::json!({
+            "reason": "FailedScheduling",
+            "eventTime": two_hours_ago,
+            "metadata": {"creationTimestamp": two_hours_ago},
+            "series": {"count": 120, "lastObservedTime": now.to_string()},
+        })];
+        let w = recent_warnings(&events);
+        assert_eq!(w.len(), 1);
+        assert_eq!((w[0].reason.as_str(), w[0].count), ("FailedScheduling", 120));
     }
 
     #[test]

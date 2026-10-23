@@ -101,6 +101,18 @@ pub async fn containers(client: Client, ns: String, pod: String) -> Result<Vec<S
     .await
 }
 
+/// A listed pod's containers, its default one first (as `containers` reads them).
+pub fn pod_containers(pod: &serde_json::Value) -> Vec<String> {
+    let names = pod
+        .pointer("/spec/containers")
+        .and_then(|c| c.as_array())
+        .map(|cs| cs.iter().filter_map(|c| c["name"].as_str().map(String::from)).collect())
+        .unwrap_or_default();
+    let default =
+        pod.pointer("/metadata/annotations/kubectl.kubernetes.io~1default-container").and_then(|v| v.as_str());
+    default_first(names, default)
+}
+
 /// `names` with `default` moved to the front, when it is one of them.
 fn default_first(mut names: Vec<String>, default: Option<&str>) -> Vec<String> {
     if let Some(i) = default.and_then(|d| names.iter().position(|n| n == d)) {
@@ -331,6 +343,12 @@ mod tests {
         assert_eq!(super::default_first(names(), Some("app")), ["app", "linkerd-proxy"]);
         assert_eq!(super::default_first(names(), None), ["linkerd-proxy", "app"]);
         assert_eq!(super::default_first(names(), Some("gone")), ["linkerd-proxy", "app"]);
+        let pod = serde_json::json!({
+            "metadata": {"annotations": {"kubectl.kubernetes.io/default-container": "app"}},
+            "spec": {"containers": [{"name": "linkerd-proxy"}, {"name": "app"}]},
+        });
+        assert_eq!(super::pod_containers(&pod), ["app", "linkerd-proxy"]);
+        assert!(super::pod_containers(&serde_json::json!({})).is_empty());
     }
 
     #[test]
