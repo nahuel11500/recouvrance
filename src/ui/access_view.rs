@@ -84,10 +84,22 @@ fn resolve_group(kinds: &[k8s::Kind], group: String, resource: String) -> (Strin
     }
 }
 
-/// The namespace whose RoleBindings count for `group`/`resource`: none for a cluster-scoped
-/// kind (nodes, namespaces), which only ClusterRoleBindings grant.
-fn binding_namespace<'a>(kinds: &[k8s::Kind], group: &str, resource: &str, ns: Option<&'a str>) -> Option<&'a str> {
+/// The namespace whose RoleBindings count for `verb` on `group`/`resource`: none for a
+/// cluster-scoped kind (nodes), which only ClusterRoleBindings grant. A Namespace is the
+/// exception: the API server reads a request on one by name (get, delete,
+/// `namespaces/finalize`) as made in that namespace, so its RoleBindings count; list and
+/// create name none.
+fn binding_namespace<'a>(
+    kinds: &[k8s::Kind],
+    verb: &str,
+    group: &str,
+    resource: &str,
+    ns: Option<&'a str>,
+) -> Option<&'a str> {
     let base = resource.split('/').next().unwrap_or(resource);
+    if group.is_empty() && base == "namespaces" {
+        return ns.filter(|_| !matches!(verb, "list" | "watch" | "create" | "deletecollection"));
+    }
     let cluster_scoped = kinds.iter().any(|k| !k.namespaced && k.ar.group == group && k.ar.plural == base);
     if cluster_scoped { None } else { ns }
 }
@@ -191,7 +203,7 @@ impl AccessView {
         let (group, resource) = crate::rbac::split_resource(self.who_resource.read(cx).value().as_ref());
         let (group, resource) = resolve_group(&self.kinds, group, resource);
         let ns = Some(self.who_ns.read(cx).value().trim().to_string()).filter(|n| !n.is_empty());
-        let rules_ns = binding_namespace(&self.kinds, &group, &resource, ns.as_deref()).map(String::from);
+        let rules_ns = binding_namespace(&self.kinds, &verb, &group, &resource, ns.as_deref()).map(String::from);
         let client = self.client.clone();
         self.who_busy = true;
         cx.notify();
@@ -445,12 +457,18 @@ mod tests {
             section: "Cluster",
             label: plural.into(),
         };
-        let kinds = vec![kind("", "nodes", false), kind("", "pods", true)];
-        assert_eq!(binding_namespace(&kinds, "", "nodes", Some("default")), None);
-        assert_eq!(binding_namespace(&kinds, "", "nodes/proxy", Some("default")), None);
-        assert_eq!(binding_namespace(&kinds, "", "pods", Some("default")), Some("default"));
+        let kinds = vec![kind("", "nodes", false), kind("", "pods", true), kind("", "namespaces", false)];
+        assert_eq!(binding_namespace(&kinds, "get", "", "nodes", Some("default")), None);
+        assert_eq!(binding_namespace(&kinds, "get", "", "nodes/proxy", Some("default")), None);
+        assert_eq!(binding_namespace(&kinds, "get", "", "pods", Some("default")), Some("default"));
         // A kind discovery doesn't know keeps the namespace.
-        assert_eq!(binding_namespace(&kinds, "example.com", "nodes", Some("default")), Some("default"));
+        assert_eq!(binding_namespace(&kinds, "get", "example.com", "nodes", Some("default")), Some("default"));
+        // A request on a Namespace by name is made in that namespace: its RoleBindings count.
+        assert_eq!(binding_namespace(&kinds, "delete", "", "namespaces", Some("team-a")), Some("team-a"));
+        assert_eq!(binding_namespace(&kinds, "update", "", "namespaces/finalize", Some("team-a")), Some("team-a"));
+        assert_eq!(binding_namespace(&kinds, "list", "", "namespaces", Some("team-a")), None);
+        assert_eq!(binding_namespace(&kinds, "create", "", "namespaces", Some("team-a")), None);
+        assert_eq!(binding_namespace(&kinds, "delete", "", "namespaces", None), None);
     }
 
     #[test]
