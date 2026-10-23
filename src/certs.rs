@@ -20,6 +20,12 @@ impl CertInfo {
     }
 }
 
+/// Whole days since `t` passed, rounded down: 0 for a certificate that expired 3 hours
+/// ago, 1 after 25 hours. (Days left, rounded down, are -1 then: not the days elapsed.)
+pub fn days_ago(t: jiff::Timestamp, now: jiff::Timestamp) -> i64 {
+    (now.as_second() - t.as_second()).div_euclid(86400)
+}
+
 /// Every certificate in a PEM bundle; empty when the text holds none.
 pub fn parse_pem(text: &[u8]) -> Vec<CertInfo> {
     let Ok(blocks) = pem::parse_many(text) else { return Vec::new() };
