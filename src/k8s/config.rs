@@ -80,7 +80,12 @@ pub(super) fn merge_unique(kc: &mut Kubeconfig, mut more: Kubeconfig, file: &str
     }
     for c in &mut more.contexts {
         if kc.contexts.iter().any(|k| k.name == c.name) {
-            c.name = free_name(&c.name, file, &mut taken_contexts);
+            let old = c.name.clone();
+            c.name = free_name(&old, file, &mut taken_contexts);
+            // The file's current context follows its rename.
+            if more.current_context.as_deref() == Some(old.as_str()) {
+                more.current_context = Some(c.name.clone());
+            }
         }
     }
     kc.clusters.extend(more.clusters);
@@ -476,6 +481,17 @@ mod kubeconfig_tests {
             .and_then(|c| c.server.clone());
         assert_eq!(server.as_deref(), Some("https://b"));
         assert_eq!(kc.current_context.as_deref(), Some("prod"));
+    }
+
+    #[test]
+    fn current_context_follows_its_rename() {
+        let a: kube::config::Kubeconfig =
+            crate::yaml::from_str("contexts: [{name: prod, context: {cluster: a}}]\n").unwrap();
+        let b: kube::config::Kubeconfig =
+            crate::yaml::from_str("contexts: [{name: prod, context: {cluster: b}}]\ncurrent-context: prod\n").unwrap();
+        let mut kc = a;
+        super::merge_unique(&mut kc, b, "team-b");
+        assert_eq!(kc.current_context.as_deref(), Some("prod@team-b"));
     }
 
     #[test]
