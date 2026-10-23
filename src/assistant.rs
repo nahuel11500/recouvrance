@@ -13,13 +13,15 @@ use bytes::Bytes;
 use http_body_util::{BodyExt as _, Full};
 use serde_json::{Value, json};
 
-use crate::k8s::run;
+use crate::k8s::{run, run_abortable};
 use crate::mcp::Hub;
 
 /// The one agent: your Claude Code over MCP and the in-app assistant share it.
 pub const AGENT_NAME: &str = "Claude";
 pub const DEFAULT_MODEL: &str = "claude-sonnet-5-5";
 const MAX_STEPS: usize = 16;
+/// Longest one HTTP request may take: a tool call can wait for an approval, then run.
+const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
 
 fn dir() -> PathBuf {
     let base = std::env::var_os("XDG_CONFIG_HOME")
@@ -154,6 +156,12 @@ fn anthropic_url() -> String {
 }
 
 async fn post(url: &str, headers: &[(&str, &str)], body: &Value) -> Result<(http::HeaderMap, String)> {
+    tokio::time::timeout(REQUEST_TIMEOUT, post_inner(url, headers, body))
+        .await
+        .map_err(|_| anyhow::anyhow!("no answer after {} minutes", REQUEST_TIMEOUT.as_secs() / 60))?
+}
+
+async fn post_inner(url: &str, headers: &[(&str, &str)], body: &Value) -> Result<(http::HeaderMap, String)> {
     let https = hyper_rustls::HttpsConnectorBuilder::new().with_native_roots()?.https_or_http().enable_http1().build();
     let client: hyper_util::client::legacy::Client<_, Full<Bytes>> =
         hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new()).build(https);
@@ -479,7 +487,8 @@ pub fn backend() -> Option<Backend> {
     }
 }
 
-/// One question → Claude, calling Recouvrance's tools until it answers.
+/// One question → Claude, calling Recouvrance's tools until it answers. Dropping the
+/// future stops it, and Claude Code with it.
 pub async fn ask(
     hub: Arc<Hub>,
     conv: Conversation,
@@ -557,7 +566,7 @@ async fn ask_claude_code(
     let token = agent_token(&hub)?;
     let port = hub.port();
     let model = crate::settings::get().assistant_model;
-    run(async move {
+    run_abortable(async move {
         // A private working dir (no project CLAUDE.md) and an MCP config readable only by you.
         let work = match &conv.work {
             Some(w) => w.clone(),
@@ -568,10 +577,24 @@ async fn ask_claude_code(
         let mut cmd = tokio::process::Command::new(&bin);
         cmd.current_dir(&work.0)
             .args(claude_args(&question, &cfg_file.0, &scope, &model, conv.session.as_deref()))
+            // `claude -p` reads a stdin that is not a terminal: give it none.
+            .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
         let mut child = cmd.spawn().context("starting claude")?;
+        // Read alongside stdout, keeping the last line: a full stderr pipe would block claude.
+        let stderr = child.stderr.take().context("no error output")?;
+        let last_err = tokio::spawn(async move {
+            let mut lines = tokio::io::BufReader::new(stderr).lines();
+            let mut last = String::new();
+            while let Ok(Some(line)) = lines.next_line().await {
+                if !line.trim().is_empty() {
+                    last = line;
+                }
+            }
+            last
+        });
         let mut lines = tokio::io::BufReader::new(child.stdout.take().context("no output")?).lines();
         let mut pending: HashMap<String, (String, String)> = HashMap::new();
         let mut session = conv.session.clone();
@@ -620,12 +643,8 @@ async fn ask_claude_code(
             bail!("{e}");
         }
         if !status.success() {
-            let mut err = String::new();
-            if let Some(mut e) = child.stderr.take() {
-                use tokio::io::AsyncReadExt as _;
-                let _ = e.read_to_string(&mut err).await;
-            }
-            bail!("claude exited with {status}: {}", err.lines().last().unwrap_or("").trim());
+            let err = last_err.await.unwrap_or_default();
+            bail!("claude exited with {status}: {}", err.trim());
         }
         Ok(Conversation { messages: Vec::new(), session, work: Some(work) })
     })
@@ -643,7 +662,7 @@ async fn ask_api(
     let key = api_key().context("no Anthropic API key (Settings → Assistant)")?;
     let token = agent_token(&hub)?;
     let port = hub.port();
-    run(async move {
+    run_abortable(async move {
         let mcp = Mcp::connect(port, token).await?;
         let tools: Vec<Value> = mcp
             .tools()
