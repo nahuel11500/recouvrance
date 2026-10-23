@@ -48,8 +48,8 @@ struct Call {
     args: serde_json::Value,
     start: Instant,
     approved: bool,
-    /// The Ask rules the approval covered: the one that asked, or across all namespaces
-    /// every Ask rule of the request.
+    /// The Ask rules the approval covered: every Ask rule the request meets, in its
+    /// namespace or, across all namespaces, in any of them.
     approved_rules: Vec<usize>,
     /// The rule that allowed the call, for the activity log.
     rule: Option<usize>,
@@ -347,7 +347,23 @@ impl KubeMcp {
     }
 
     /// Evaluate one access request; Ask waits for the user.
-    async fn authorize(&self, call: &mut Call, access: &Access, any_namespace: bool) -> Result<(), String> {
+    async fn authorize(&self, call: &mut Call, access: &Access) -> Result<(), String> {
+        self.authorize_inner(call, access, false, false).await
+    }
+
+    /// Evaluate a list request, whose rows are then filtered with [`Call::may_see`]: in one
+    /// namespace, or across all of them (`any_namespace`).
+    async fn authorize_list(&self, call: &mut Call, access: &Access, any_namespace: bool) -> Result<(), String> {
+        self.authorize_inner(call, access, any_namespace, true).await
+    }
+
+    async fn authorize_inner(
+        &self,
+        call: &mut Call,
+        access: &Access,
+        any_namespace: bool,
+        list: bool,
+    ) -> Result<(), String> {
         let verdict =
             if any_namespace { call.policy().decide_any_namespace(access) } else { call.policy().decide(access) };
         match verdict.mode {
@@ -357,8 +373,8 @@ impl KubeMcp {
             }
             Mode::Deny => Err(call.deny(format!("{} — {}", describe(access), call.rule_label(verdict.rule)))),
             Mode::Ask => {
-                // Across namespaces, the allowed ones can be shown without approval (Ask rows hidden).
-                let fallback = if any_namespace { call.policy().allow_somewhere(access) } else { None };
+                // A list can show its allowed rows without approval (Ask rows hidden).
+                let fallback = if list { call.policy().allow_somewhere(access) } else { None };
                 if self.hub.headless() {
                     if fallback.is_some() {
                         call.rule = fallback;
@@ -385,7 +401,7 @@ impl KubeMcp {
                     call.approved_rules = if any_namespace {
                         call.policy().asks_any_namespace(access)
                     } else {
-                        verdict.rule.into_iter().collect()
+                        call.policy().asks(access)
                     };
                     Ok(())
                 } else if fallback.is_some() {
