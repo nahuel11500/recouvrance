@@ -38,7 +38,9 @@ per minute, *Test access* shows the verdict for any request and which rule decid
 banners show the request with its key arguments (command, the whole patch, replicas, action, dry
 run) and offer **Always allow this** to add a narrow rule; it wins over the Ask rule that asked, so
 the same request is not asked again (until you edit the rule). For `apply_manifest` the banner lists
-every object (kind, namespace/name) and the YAML that will be applied, a Secret's values masked.
+every object (kind, namespace/name) and the YAML that will be applied, a Secret's values masked; the
+activity log keeps each object with a hash of that YAML, and the objects already applied when a call
+is cut off.
 The *Always allow this* and *Allow for 1h* offers are left out where no rule can be that narrow:
 exec (a rule cannot pin the command), GitOps actions, `apply_manifest` (a rule cannot pin the
 content), writes with no object name, and dry runs (the rule would allow the real write too).
