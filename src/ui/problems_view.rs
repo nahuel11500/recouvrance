@@ -48,16 +48,17 @@ impl ProblemsView {
                 }
                 let scans = clusters.iter().map(|(ctx, c)| {
                     let (ctx, c, kinds, ns) = (ctx.clone(), c.clone(), kinds.clone(), ns.clone());
-                    async move { (ctx, problems::scan(c, &kinds, ns).await) }
+                    async move { (ctx, problems::scan_partial(c, &kinds, ns).await) }
                 });
                 let results = futures::future::join_all(scans).await;
                 let mut found = Vec::new();
                 let mut errors = Vec::new();
-                for (ctx, r) in results {
-                    match r {
-                        Ok(list) => found.extend(list.into_iter().map(|p| (ctx.clone(), p))),
-                        Err(e) => errors.push(format!("{ctx}: {e:#}")),
+                // A kind a cluster refused or failed to list is noted; the others are still shown.
+                for (ctx, scan) in results {
+                    if let Some(skipped) = scan.skipped_text() {
+                        errors.push(format!("{ctx}: could not read {skipped}"));
                     }
+                    found.extend(scan.problems.into_iter().map(|p| (ctx.clone(), p)));
                 }
                 found.sort_by_key(|a| a.1.severity);
                 if this

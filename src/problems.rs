@@ -1,7 +1,6 @@
 //! "What is broken?": problems found from kubectl's own tables (cheap even on
 //! very large clusters), for the Problems page and the `find_problems` MCP tool.
 
-use anyhow::Result;
 use kube::Client;
 
 use crate::k8s::{self, ColumnDef, Kind, Row};
@@ -189,16 +188,6 @@ async fn stuck_terminating(client: &Client, kind: &Kind, row: &Row) -> bool {
         Ok(Some(t)) => since(jiff::Timestamp::from_second(t.0.as_second()).ok(), 600),
         Ok(None) => false,
         Err(_) => true,
-    }
-}
-
-/// Problems in a cluster (or one namespace), worst first. Fails when any kind could
-/// not be read; `scan_partial` keeps what it could read.
-pub async fn scan(client: Client, kinds: &[Kind], namespace: Option<String>) -> Result<Vec<Problem>> {
-    let scan = scan_partial(client, kinds, namespace).await;
-    match scan.skipped.into_iter().next() {
-        Some((_, e)) => Err(e),
-        None => Ok(scan.problems),
     }
 }
 

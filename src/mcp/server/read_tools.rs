@@ -608,12 +608,12 @@ impl KubeMcp {
             Ok((_, kinds)) => kinds,
             Err(e) => return call.finish(Err(e)),
         };
-        let found = match crate::problems::scan(client, &kinds, p.namespace.clone()).await {
-            Ok(f) => f,
-            Err(e) => return call.finish(Err(e)),
-        };
+        // A kind that can't be listed is named, and doesn't hide what the others found.
+        let scan = crate::problems::scan_partial(client, &kinds, p.namespace.clone()).await;
+        let skipped = scan.skipped_text().map(|s| format!("Not checked, could not read {s}."));
         let minor = p.include_minor.unwrap_or(false);
-        let table: Vec<Vec<String>> = found
+        let table: Vec<Vec<String>> = scan
+            .problems
             .into_iter()
             .filter(|x| minor || x.severity != crate::problems::Severity::Info)
             .filter(|x| {
@@ -634,10 +634,15 @@ impl KubeMcp {
                 ]
             })
             .collect();
-        if table.is_empty() {
-            return call.finish(Ok("No problems found.".into()));
+        let mut out = if table.is_empty() {
+            "No problems found.".to_string()
+        } else {
+            format_table(&["SEVERITY", "KIND", "NAMESPACE", "NAME", "PROBLEM", "AGE"], &table)
+        };
+        if let Some(note) = skipped {
+            out = format!("{out}\n{note}");
         }
-        call.finish(Ok(format_table(&["SEVERITY", "KIND", "NAMESPACE", "NAME", "PROBLEM", "AGE"], &table)))
+        call.finish(Ok(out))
     }
 
     #[tool(
