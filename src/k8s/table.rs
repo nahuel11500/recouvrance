@@ -380,11 +380,7 @@ async fn list_whole(client: &Client, url: &str) -> Result<(Vec<ColumnDef>, Vec<A
     let mut req = http::Request::get(&path).body(Vec::new())?;
     req.headers_mut().insert(http::header::ACCEPT, http::HeaderValue::from_static(TABLE_ACCEPT));
     let body = client.request_stream(req).await?;
-    let reader = tokio_util::io::SyncIoBridge::new(body.compat());
-    let table: LeanTable = tokio::task::spawn_blocking(move || {
-        serde_json::from_reader(std::io::BufReader::with_capacity(256 * 1024, reader))
-    })
-    .await??;
+    let table: LeanTable = lists::parse_streamed(body.compat()).await?;
     // A server that pages it anyway: the rows would be partial.
     if table.metadata.continue_.as_ref().is_some_and(|c| !c.is_empty()) {
         return Err(anyhow!("the API server paged a cached list"));
