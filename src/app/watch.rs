@@ -254,11 +254,10 @@ impl AppView {
         }
     }
 
-    /// What the bar above the list says: what failed (contexts, watches), else progress.
+    /// What the bar above the list says: what failed (contexts, watches), then progress.
+    /// Both show: a failing cluster's rows may be the old ones the progress notice warns of.
     pub(super) fn status_line(&self) -> Option<SharedString> {
-        let failed: Vec<&str> =
-            self.connect_errors.iter().chain(self.watch_errors.values()).map(|s| s.as_ref()).collect();
-        if failed.is_empty() { self.status.clone() } else { Some(failed.join("; ").into()) }
+        status_text(self.connect_errors.iter().chain(self.watch_errors.values()), self.status.as_ref())
     }
 
     /// Keep the list on screen in `views` (if it was complete), before another replaces it.
@@ -339,7 +338,11 @@ impl AppView {
                 }
             }
             TableMsg::Rows(rows) => {
-                self.status = None;
+                // "Loading…" or "showing the list from 2h ago" holds while another cluster is
+                // still listing: its rows are not there yet, or are the old ones.
+                if !others_listing(&self.listing, ctx) {
+                    self.status = None;
+                }
                 self.watch_errors.remove(&ctx);
                 if let Some(slot) = self.rows_by_ctx.get_mut(ctx) {
                     *slot = rows;
@@ -349,6 +352,7 @@ impl AppView {
             TableMsg::Listed => {
                 self.listing.remove(&ctx);
                 if self.listing.is_empty() {
+                    self.status = None;
                     self.table.update(cx, |t, _| t.delegate_mut().loading = false);
                 }
             }
@@ -370,6 +374,7 @@ impl AppView {
                     self.show_rows(cx);
                 }
                 if self.listing.is_empty() {
+                    self.status = None;
                     // Forbidden only when every cluster watched refused, whichever answers last.
                     let all = self.refused.len() >= self.watch.as_ref().map_or(0, Vec::len);
                     self.table.update(cx, |t, _| {
@@ -382,6 +387,20 @@ impl AppView {
         }
         cx.notify();
     }
+}
+
+/// What failed, then the progress notice, in one line.
+fn status_text<'a>(
+    failed: impl Iterator<Item = &'a SharedString>,
+    status: Option<&'a SharedString>,
+) -> Option<SharedString> {
+    let parts: Vec<&str> = failed.chain(status).map(|s| s.as_ref()).collect();
+    (!parts.is_empty()).then(|| parts.join("; ").into())
+}
+
+/// Whether a cluster other than `ctx` is still listing.
+fn others_listing(listing: &HashSet<usize>, ctx: usize) -> bool {
+    listing.iter().any(|&ix| ix != ctx)
 }
 
 /// Drop rows that newer rows in the same batch replace; everything else keeps its order.
@@ -459,7 +478,22 @@ async fn wait_list_shown(this: &WeakEntity<AppView>, pause: &k8s::Pause, cx: &mu
 
 #[cfg(test)]
 mod tests {
-    use super::{TableMsg, coalesce, keep_watched, relayout};
+    use super::{SharedString, TableMsg, coalesce, keep_watched, others_listing, relayout, status_text};
+
+    #[test]
+    fn the_old_list_notice_stays_while_another_cluster_lists() {
+        let listing = [0, 1].into_iter().collect();
+        assert!(others_listing(&listing, 0));
+        assert!(!others_listing(&[1].into_iter().collect(), 1));
+        assert!(!others_listing(&Default::default(), 0));
+        // A failing cluster's error does not hide the notice: its rows may be the old ones.
+        let (error, notice) = (SharedString::from("b: timeout (retrying)"), SharedString::from("Updating…"));
+        assert_eq!(
+            status_text([&error].into_iter(), Some(&notice)).as_deref(),
+            Some("b: timeout (retrying); Updating…")
+        );
+        assert_eq!(status_text(std::iter::empty(), None), None);
+    }
 
     #[test]
     fn cells_move_under_the_shown_columns() {
