@@ -144,12 +144,21 @@ impl AppView {
     /// A plugin runs in a terminal page, or in the background with a notification.
     pub(super) fn run_plugin(&mut self, ev: &crate::plugins::RunPlugin, window: &mut Window, cx: &mut Context<Self>) {
         let Some(client) = self.clusters.iter().find(|c| c.0 == ev.context).map(|c| c.1.clone()) else { return };
+        // Asked and confirmed with write mode on, but it may have been turned off since.
+        let writes = !ev.plugin.read_only;
+        if writes && !crate::details::writes_still_on(window, cx) {
+            return;
+        }
         match ev.plugin.mode {
             crate::plugins::Mode::Terminal => {
                 let (ctx, ns, cmd, env) =
                     (ev.context.clone(), ev.namespace.clone(), ev.command.clone(), ev.env.clone());
-                let t = cx
-                    .new(|cx| crate::ui::terminal::TerminalView::local_command(client, ctx, ns, cmd, env, window, cx));
+                let t = cx.new(|cx| {
+                    let t = crate::ui::terminal::TerminalView::local_command(client, ctx, ns, cmd, env, window, cx);
+                    // Running a writing plugin again goes through its button: write mode,
+                    // protection and its confirm, not the terminal's Reconnect.
+                    if writes { t.run_once() } else { t }
+                });
                 self.navigate(Route::Terminal(t), cx);
             }
             crate::plugins::Mode::Background => {
