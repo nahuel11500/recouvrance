@@ -529,13 +529,19 @@ impl Drained {
 /// cordon, then evict every pod except DaemonSet and static pods. Evictions
 /// respect PodDisruptionBudgets; refused ones are reported, not forced. Pods no
 /// controller manages would be gone for good, so (like kubectl without
-/// `--force`) they are left in place and reported.
-pub async fn drain(client: Client, node: String) -> Result<String> {
-    Ok(drain_report(client, node).await?.summary(|_, _| true))
+/// `--force`) they are left in place and reported. `stop` is asked before each eviction
+/// and ends the drain when it gives a reason (write mode or agent access turned off, or
+/// the agent's rules changed, while the drain ran); the node stays cordoned.
+pub async fn drain(client: Client, node: String, stop: impl Fn() -> Option<String> + Send + 'static) -> Result<String> {
+    Ok(drain_report(client, node, stop).await?.summary(|_, _| true))
 }
 
 /// [`drain`], returning what it did.
-pub async fn drain_report(client: Client, node: String) -> Result<Drained> {
+pub async fn drain_report(
+    client: Client,
+    node: String,
+    stop: impl Fn() -> Option<String> + Send + 'static,
+) -> Result<Drained> {
     run(async move {
         let nodes: Api<k8s_openapi::api::core::v1::Node> = Api::all(client.clone());
         nodes
@@ -561,6 +567,12 @@ pub async fn drain_report(client: Client, node: String) -> Result<Drained> {
             if !owners.iter().any(|o| o.controller == Some(true)) {
                 out.unmanaged.push((ns, name));
                 continue;
+            }
+            if let Some(reason) = stop() {
+                anyhow::bail!(
+                    "drain of {node} stopped after {} evictions: {reason}; the node stays cordoned",
+                    out.evicted
+                );
             }
             let api: Api<Pod> = Api::namespaced(client.clone(), &ns);
             match api.evict(&name, &Default::default()).await {

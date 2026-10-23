@@ -359,13 +359,7 @@ impl KubeMcp {
 
     /// Why calls are refused now, if they are.
     fn inactive(&self, call: &Call) -> Option<&'static str> {
-        if !self.hub.agents_enabled() {
-            return Some("agent access is switched off in Recouvrance");
-        }
-        if !self.hub.agent(&call.agent.id).is_some_and(|a| a.enabled) {
-            return Some("this agent is disabled");
-        }
-        None
+        inactive(&self.hub, &call.agent.id)
     }
 
     /// Evaluate one access request; Ask waits for the user.
@@ -488,6 +482,13 @@ impl KubeMcp {
         }
     }
 
+    /// [`stale_reason`](Self::stale_reason) for a change made of many requests (a drain),
+    /// asked again before each one: agent access or the agent turned off, or its rules
+    /// changed, stop the rest.
+    fn still_allowed(&self, call: &Call, access: &Access) -> impl Fn() -> Option<String> + Send + 'static {
+        stop_check(self.hub.clone(), call.agent.id.clone(), call.approved, access.clone())
+    }
+
     async fn kind(&self, call: &Call, context: &str, query: &str) -> Result<(kube::Client, Kind), String> {
         let (client, kinds) = match self.hub.client(context).await {
             Ok(c) => c,
@@ -504,7 +505,13 @@ impl KubeMcp {
     }
 }
 
-fn access_for(kind: &Kind, context: &str, verb: &str, namespace: Option<String>, name: Option<String>) -> Access {
+pub(crate) fn access_for(
+    kind: &Kind,
+    context: &str,
+    verb: &str,
+    namespace: Option<String>,
+    name: Option<String>,
+) -> Access {
     Access {
         context: context.to_string(),
         verb: verb.to_string(),
@@ -890,6 +897,37 @@ async fn auth(State(hub): State<Arc<Hub>>, mut req: Request, next: Next) -> Resu
 }
 
 /// Serve MCP on 127.0.0.1 until the guard is dropped.
+/// Why an agent's calls are refused now, if they are.
+fn inactive(hub: &Hub, agent_id: &str) -> Option<&'static str> {
+    if !hub.agents_enabled() {
+        return Some("agent access is switched off in Recouvrance");
+    }
+    if !hub.agent(agent_id).is_some_and(|a| a.enabled) {
+        return Some("this agent is disabled");
+    }
+    None
+}
+
+/// Why an agent's change, authorized at first, must stop now (see `still_allowed`).
+pub(crate) fn stop_check(
+    hub: Arc<Hub>,
+    agent_id: String,
+    approved: bool,
+    access: Access,
+) -> impl Fn() -> Option<String> + Send + 'static {
+    move || {
+        if let Some(reason) = inactive(&hub, &agent_id) {
+            return Some(reason.to_string());
+        }
+        let mode = hub.agent(&agent_id).map_or(Mode::Deny, |a| a.policy.decide(&access).mode);
+        match mode {
+            Mode::Allow => None,
+            Mode::Ask if approved => None,
+            _ => Some(format!("{} — the rules changed while it ran", describe(&access))),
+        }
+    }
+}
+
 pub fn start(hub: Arc<Hub>) -> TaskGuard {
     k8s::spawn_guarded(async move {
         let port = hub.port();

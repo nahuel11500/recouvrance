@@ -1,8 +1,8 @@
 name: CI
 
-# Pull requests get the quick checks (a few minutes). Pushes to main, release tags and
-# manual runs get everything: macOS, the minimum Rust version, docs, an end-to-end run on
-# a kind cluster and release builds.
+# Pull requests get the quick checks and the end-to-end run on a kind cluster (the write
+# guards). Pushes to main, release tags and manual runs get everything: macOS, the minimum
+# Rust version, docs and release builds.
 on:
   pull_request:
   push:
@@ -123,7 +123,6 @@ jobs:
 
   e2e:
     name: End to end (kind)
-    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -148,6 +147,12 @@ jobs:
           grep -q "^kinds=" smoke.txt
           grep -q "^rows=" smoke.txt
           RECOUVRANCE_SMOKE=kind-recouvrance RECOUVRANCE_LISTTIME=1 target/ci/recouvrance
+      - name: Write guards (write mode, agent rules, kill switch during a drain)
+        env:
+          XDG_CONFIG_HOME: ${{ runner.temp }}/guards-config
+          XDG_DATA_HOME: ${{ runner.temp }}/guards-data
+          RECOUVRANCE_E2E_CONTEXT: kind-recouvrance
+        run: cargo test --locked --profile ci --features dev -- --ignored --test-threads 1 e2e::
       - name: Render the UI off-screen
         env:
           XDG_CONFIG_HOME: ${{ runner.temp }}/config
