@@ -302,6 +302,18 @@ impl AppView {
                 self.watch_errors.insert(ctx, text.into());
                 self.listing.remove(&ctx);
                 self.refused.insert(ctx);
+                // The watch ends here: rows listed before (or cached) would look live.
+                if let Some(slot) = self.rows_by_ctx.get_mut(ctx)
+                    && !slot.is_empty()
+                {
+                    slot.clear();
+                    let merged = self.merged_rows();
+                    self.table.update(cx, |t, cx| {
+                        t.delegate_mut().set_rows(merged);
+                        cx.notify();
+                    });
+                    self.follow_selection(cx);
+                }
                 if self.listing.is_empty() {
                     // Forbidden only when every cluster watched refused, whichever answers last.
                     let all = self.refused.len() >= self.watch.as_ref().map_or(0, Vec::len);
