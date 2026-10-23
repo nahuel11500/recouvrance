@@ -601,7 +601,13 @@ pub struct HelmRelease {
     chart_choice: Option<(bool, Vec<String>)>,
     /// The values text captured when the upgrade started (revealed, never the masked view).
     upgrade_text: Option<String>,
-    _task: Task<()>,
+    /// The first read of the release and its history (fills in what the list left out).
+    /// Its own slot: a later reload must not cancel it.
+    _first_load: Task<()>,
+    /// The history again after a write.
+    history_load: crate::latest::Latest,
+    /// The chart lookup of the upgrade started last (a dry run, then a real one, or back).
+    chart_lookup: crate::latest::Latest,
 }
 
 /// The edited values to upgrade with, or None while secrets are masked: the masked view
@@ -677,7 +683,9 @@ impl HelmRelease {
             history: None,
             chart_choice: None,
             upgrade_text: None,
-            _task: task,
+            _first_load: task,
+            history_load: Default::default(),
+            chart_lookup: Default::default(),
         }
     }
 
@@ -685,16 +693,13 @@ impl HelmRelease {
     /// or rollback makes one), so its values are what the next upgrade starts from.
     fn reload_history(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let (client, ns, name) = (self.client.clone(), self.release.namespace.clone(), self.release.name.clone());
-        self._task = cx.spawn_in(window, async move |this, cx| {
-            let result = history(client, ns, name).await;
-            let _ = this.update_in(cx, |this, window, cx| {
-                if let Some(newest) = result.as_ref().ok().and_then(|h| newer_revision(this.release.revision, h)) {
-                    this.release = Release { context: this.release.context.clone(), ..newest.clone() };
-                    this.set_reveal(this.reveal, window, cx);
-                }
-                this.history = Some(result.map_err(|e| format!("{e:#}").into()));
-                cx.notify();
-            });
+        self.history_load.spawn_in(window, cx, history(client, ns, name), |this, result, window, cx| {
+            if let Some(newest) = result.as_ref().ok().and_then(|h| newer_revision(this.release.revision, h)) {
+                this.release = Release { context: this.release.context.clone(), ..newest.clone() };
+                this.set_reveal(this.reveal, window, cx);
+            }
+            this.history = Some(result.map_err(|e| format!("{e:#}").into()));
+            cx.notify();
         });
     }
 
@@ -739,42 +744,32 @@ impl HelmRelease {
         self.chart_choice = None;
         let (context, chart, version) =
             (self.context.clone(), self.release.chart.clone(), self.release.chart_version.clone());
-        cx.spawn_in(window, async move |this, cx| {
-            // Plain search, then an exact name match (helm's -r regex also sees descriptions).
-            let found = k8s::helm(
-                context,
+        // Plain search, then an exact name match (helm's -r regex also sees descriptions).
+        let lookup = {
+            let (chart, version) = (chart.clone(), version.clone());
+            async move {
                 // `--` everywhere: names from the cluster are never read as flags.
-                vec![
-                    "search".into(),
-                    "repo".into(),
-                    "--version".into(),
-                    version.clone(),
-                    "-o".into(),
-                    "json".into(),
-                    "--".into(),
-                    chart.clone(),
-                ],
-            )
-            .await;
-            let refs = found.map(|o| chart_refs(&o, &chart));
-            let _ = this.update_in(cx, |this, window, cx| match refs {
-                Err(e) => window.push_notification(Notification::error(format!("helm search failed: {e:#}")), cx),
-                Ok(refs) => match refs.as_slice() {
-                    [] => window.push_notification(
-                        Notification::error(format!(
-                            "chart {chart} {version} is not in your helm repositories (add it with `helm repo add`)"
-                        )),
-                        cx,
-                    ),
-                    [one] => this.chosen_chart(one.clone(), dry_run, window, cx),
-                    _ => {
-                        this.chart_choice = Some((dry_run, refs));
-                        cx.notify();
-                    }
-                },
-            });
-        })
-        .detach();
+                let args = ["search", "repo", "--version", &version, "-o", "json", "--", &chart];
+                k8s::helm(context, args.iter().map(|a| a.to_string()).collect()).await.map(|o| chart_refs(&o, &chart))
+            }
+        };
+        // A newer upgrade (a dry run then the real one, or back) replaces this lookup.
+        self.chart_lookup.spawn_in(window, cx, lookup, move |this, refs, window, cx| match refs {
+            Err(e) => window.push_notification(Notification::error(format!("helm search failed: {e:#}")), cx),
+            Ok(refs) => match refs.as_slice() {
+                [] => window.push_notification(
+                    Notification::error(format!(
+                        "chart {chart} {version} is not in your helm repositories (add it with `helm repo add`)"
+                    )),
+                    cx,
+                ),
+                [one] => this.chosen_chart(one.clone(), dry_run, window, cx),
+                _ => {
+                    this.chart_choice = Some((dry_run, refs));
+                    cx.notify();
+                }
+            },
+        });
     }
 
     fn chosen_chart(&mut self, chart_ref: String, dry_run: bool, window: &mut Window, cx: &mut Context<Self>) {

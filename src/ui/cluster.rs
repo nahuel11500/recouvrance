@@ -33,6 +33,9 @@ struct Summary {
     top_ns: Vec<(String, f64, f64)>,
     /// CPU (millicores) and memory over the chosen range, from Prometheus.
     history: Option<(crate::prom::Series, crate::prom::Series)>,
+    /// The range the charts cover, in minutes: the one asked for when they were read, which
+    /// the setting may have moved from since.
+    chart_minutes: i64,
     /// GPUs: (allocatable, requested) over every GPU resource (nvidia.com/gpu, amd.com/gpu…).
     gpus: (f64, f64),
     /// GPU utilization and memory, from the DCGM exporter.
@@ -68,6 +71,7 @@ impl ClusterOverview {
                             if new.context == old.context {
                                 new.history = old.history.take();
                                 new.gpu = old.gpu.take();
+                                new.chart_minutes = old.chart_minutes;
                             }
                         }
                         this.summaries = Some(summaries);
@@ -80,9 +84,10 @@ impl ClusterOverview {
                 if shown.is_err()
                     || this
                         .update(cx, |this, cx| {
-                            for (s, (history, gpu)) in this.summaries.iter_mut().flatten().zip(charts) {
+                            for (s, (history, gpu, minutes)) in this.summaries.iter_mut().flatten().zip(charts) {
                                 s.history = history;
                                 s.gpu = gpu;
+                                s.chart_minutes = minutes;
                             }
                             cx.notify();
                         })
@@ -156,31 +161,8 @@ struct CondLite {
 #[derive(Deserialize, Default)]
 #[serde(default)]
 struct PodLite {
-    spec: PodSpecLite,
+    spec: k8s::podspec::LeanSpec,
     status: PodStatusLite,
-}
-
-#[derive(Deserialize, Default)]
-#[serde(default, rename_all = "camelCase")]
-struct PodSpecLite {
-    containers: Vec<ContainerLite>,
-    init_containers: Vec<ContainerLite>,
-    overhead: HashMap<String, String>,
-}
-
-#[derive(Deserialize, Default)]
-#[serde(default, rename_all = "camelCase")]
-struct ContainerLite {
-    resources: ResourcesLite,
-    /// `Always` on an init container: a sidecar.
-    restart_policy: String,
-}
-
-#[derive(Deserialize, Default)]
-#[serde(default)]
-struct ResourcesLite {
-    requests: HashMap<String, String>,
-    limits: HashMap<String, String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -256,19 +238,11 @@ fn add_pods(s: &mut Summary, pods: &[PodLite]) {
         if phase == "Running" || phase == "Pending" {
             let spec = &p.spec;
             // As the scheduler counts: sidecars and init containers too, plus overhead.
-            let pod = |amount: &dyn Fn(&ContainerLite) -> f64| {
-                k8s::pod_amount(
-                    spec.containers.iter().map(amount).sum(),
-                    spec.init_containers.iter().map(|c| (c.restart_policy == "Always", amount(c))),
-                )
-            };
-            let request = |key: &str, parse: fn(&str) -> f64| {
-                pod(&|c| c.resources.requests.get(key).map(|q| parse(q)).unwrap_or(0.0))
-                    + spec.overhead.get(key).map(|q| parse(q)).unwrap_or(0.0)
-            };
-            s.cpu.1 += request("cpu", k8s::parse_cpu);
-            s.mem.1 += request("memory", k8s::parse_bytes);
-            s.gpus.1 += pod(&|c| gpu_count(&c.resources.limits));
+            let scheduled = |r: &str| spec.effective(r, k8s::podspec::Count::Scheduled);
+            s.cpu.1 += scheduled("cpu").request;
+            s.mem.1 += scheduled("memory").request;
+            s.gpus.1 +=
+                spec.resource_names().iter().filter(|r| r.ends_with("/gpu")).map(|r| scheduled(r).limit).sum::<f64>();
         }
     }
 }
@@ -300,16 +274,17 @@ pub async fn debug_load(context: String, client: Client) -> usize {
 }
 
 /// CPU and memory over the chosen range, and GPUs, from Prometheus (when there is one).
-type Usage = (Option<(crate::prom::Series, crate::prom::Series)>, Option<crate::prom::GpuUsage>);
+/// With the range it covers, in minutes.
+type Usage = (Option<(crate::prom::Series, crate::prom::Series)>, Option<crate::prom::GpuUsage>, i64);
 
 async fn usage(context: &str, client: Client) -> Usage {
     let minutes = crate::settings::get().usage_range;
-    let Ok(Some(target)) = crate::prom::target(context, client.clone()).await else { return (None, None) };
+    let Ok(Some(target)) = crate::prom::target(context, client.clone()).await else { return (None, None, minutes) };
     let (history, gpu) = futures::join!(
         crate::prom::cluster_usage(client.clone(), target.clone(), minutes),
         crate::prom::gpu_usage(client, target, crate::prom::GpuScope::Cluster, minutes),
     );
-    (history.ok().map(|(cpu, mem)| (cpu.into_iter().map(|(t, v)| (t, v * 1000.0)).collect(), mem)), gpu)
+    (history.ok().map(|(cpu, mem)| (cpu.into_iter().map(|(t, v)| (t, v * 1000.0)).collect(), mem)), gpu, minutes)
 }
 
 /// Everything but the charts, all at once: one request after the other, a big cluster took
@@ -499,7 +474,7 @@ impl Render for ClusterOverview {
                 )
                 .when_some(s.history.as_ref(), |d, (cpu, mem)| {
                     use crate::overview::{ChartSpec, usage_chart};
-                    let minutes = crate::settings::get().usage_range;
+                    let minutes = s.chart_minutes;
                     let spec = |title, req, lim, color, fmt, id| ChartSpec {
                         title,
                         req: Some(req),
@@ -570,7 +545,7 @@ impl Render for ClusterOverview {
                 })
                 .when(s.gpus.0 > 0.0 || s.gpu.is_some(), |d| {
                     use crate::overview::{ChartSpec, usage_chart};
-                    let minutes = crate::settings::get().usage_range;
+                    let minutes = s.chart_minutes;
                     let pct = |v: f64| format!("{v:.0}%");
                     let mut row = h_flex().gap_3();
                     if let Some(g) = &s.gpu {

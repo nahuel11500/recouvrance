@@ -153,7 +153,7 @@ pub type PodResourcesMap = HashMap<(String, String), PodResources>;
 #[serde(default)]
 struct LeanPod {
     metadata: LeanPodMeta,
-    spec: LeanPodSpec,
+    spec: podspec::LeanSpec,
 }
 
 #[derive(serde::Deserialize, Default)]
@@ -163,49 +163,13 @@ struct LeanPodMeta {
     namespace: String,
 }
 
-#[derive(serde::Deserialize, Default)]
-#[serde(default)]
-#[serde(rename_all = "camelCase")]
-struct LeanPodSpec {
-    containers: Vec<LeanContainer>,
-    init_containers: Vec<LeanContainer>,
-    overhead: HashMap<String, String>,
-    resources: LeanResources,
-}
-
-#[derive(serde::Deserialize, Default)]
-#[serde(default, rename_all = "camelCase")]
-struct LeanContainer {
-    resources: LeanResources,
-    restart_policy: Option<String>,
-}
-
-#[derive(serde::Deserialize, Default)]
-#[serde(default)]
-struct LeanResources {
-    requests: HashMap<String, String>,
-    limits: HashMap<String, String>,
-}
-
-fn pod_resources(spec: &LeanPodSpec) -> PodResources {
-    // Sidecars (init containers that keep running) are in the usage metrics-server reports.
-    let sidecars = spec.init_containers.iter().filter(|c| c.restart_policy.as_deref() == Some("Always"));
-    let containers: Vec<&LeanContainer> = spec.containers.iter().chain(sidecars).collect();
-    let sum = |key: &str, of: fn(&LeanResources) -> &HashMap<String, String>, parse: fn(&str) -> f64, all: bool| {
-        let overhead = spec.overhead.get(key).map_or(0.0, |q| parse(q));
-        if let Some(q) = of(&spec.resources).get(key) {
-            return Some(parse(q) + overhead);
-        }
-        let vals: Vec<Option<f64>> = containers.iter().map(|c| of(&c.resources).get(key).map(|q| parse(q))).collect();
-        if vals.iter().all(Option::is_none) || all && vals.iter().any(Option::is_none) {
-            return None;
-        }
-        Some(vals.into_iter().flatten().sum::<f64>() + overhead)
+/// Set against usage: what the running pod is held to (regular init containers are done).
+fn pod_resources(spec: &podspec::LeanSpec) -> PodResources {
+    let of = |r: &str| {
+        let e = spec.effective(r, podspec::Count::Running);
+        (e.request(), e.limit())
     };
-    PodResources {
-        cpu: (sum("cpu", |r| &r.requests, parse_cpu, false), sum("cpu", |r| &r.limits, parse_cpu, true)),
-        mem: (sum("memory", |r| &r.requests, parse_bytes, false), sum("memory", |r| &r.limits, parse_bytes, true)),
-    }
+    PodResources { cpu: of("cpu"), mem: of("memory") }
 }
 
 /// The pods' requests and limits, for the usage bars of the pods list: one light list
@@ -325,60 +289,19 @@ pub async fn resource_slices(client: Client, node: String) -> Vec<serde_json::Va
     Vec::new()
 }
 
-/// Sum of pod requests and limits for one resource, the way the scheduler counts:
-/// per pod, the larger of its containers' sum and any init container, plus overhead.
-/// Finished pods are left out.
+/// Sum of pod requests and limits for one resource, the way the scheduler counts them
+/// ([`podspec::effective`]); a container without a limit counts 0. Finished pods are left out.
 pub fn pods_allocated(pods: &[serde_json::Value], resource: &str) -> (f64, f64) {
-    let parse = |q: &str| match resource {
-        "cpu" => parse_cpu(q),
-        "memory" | "ephemeral-storage" => parse_bytes(q),
-        _ => q.parse::<f64>().unwrap_or_else(|_| parse_bytes(q)),
-    };
-    let get = |c: &serde_json::Value, which: &str| {
-        c.pointer(&format!("/resources/{which}/{}", resource.replace('/', "~1")))
-            .and_then(|v| v.as_str())
-            .map(parse)
-            .unwrap_or(0.0)
-    };
     let (mut req, mut lim) = (0.0, 0.0);
     for p in pods {
         if matches!(p.pointer("/status/phase").and_then(|v| v.as_str()), Some("Succeeded" | "Failed")) {
             continue;
         }
-        let containers = p.pointer("/spec/containers").and_then(|c| c.as_array()).map(Vec::as_slice).unwrap_or(&[]);
-        let inits = p.pointer("/spec/initContainers").and_then(|c| c.as_array()).map(Vec::as_slice).unwrap_or(&[]);
-        let sidecar = |c: &serde_json::Value| c["restartPolicy"].as_str() == Some("Always");
-        let pod = |which: &str| {
-            pod_amount(
-                containers.iter().map(|c| get(c, which)).sum(),
-                inits.iter().map(|c| (sidecar(c), get(c, which))),
-            )
-        };
-        let overhead = p
-            .pointer(&format!("/spec/overhead/{}", resource.replace('/', "~1")))
-            .and_then(|v| v.as_str())
-            .map(parse)
-            .unwrap_or(0.0);
-        req += pod("requests") + overhead;
-        lim += pod("limits") + overhead;
+        let e = podspec::of_value(p, resource, podspec::Count::Scheduled);
+        req += e.request;
+        lim += e.limit;
     }
     (req, lim)
-}
-
-/// One pod's request or limit as the scheduler counts it, from its containers' sum and its
-/// init containers in order as (is a sidecar, amount): sidecars (init containers that keep
-/// running) add to the sum, and a regular init container runs alongside the sidecars
-/// started before it. Overhead is not included.
-pub fn pod_amount(containers: f64, inits: impl IntoIterator<Item = (bool, f64)>) -> f64 {
-    let (mut sidecars, mut peak) = (0.0, 0.0f64);
-    for (sidecar, amount) in inits {
-        if sidecar {
-            sidecars += amount;
-        } else {
-            peak = peak.max(sidecars + amount);
-        }
-    }
-    (containers + sidecars).max(peak)
 }
 
 #[cfg(test)]
@@ -420,56 +343,43 @@ mod quantity_tests {
 mod resources_tests {
     use super::*;
 
-    fn container(requests: &[(&str, &str)], limits: &[(&str, &str)]) -> LeanContainer {
-        let map = |kv: &[(&str, &str)]| kv.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
-        LeanContainer {
-            resources: LeanResources { requests: map(requests), limits: map(limits) },
-            restart_policy: None,
-        }
-    }
-
-    fn spec(containers: Vec<LeanContainer>) -> LeanPodSpec {
-        LeanPodSpec { containers, ..Default::default() }
+    fn spec(v: serde_json::Value) -> podspec::LeanSpec {
+        serde_json::from_value(v).unwrap()
     }
 
     #[test]
     fn sums_requests_and_limits() {
-        let r = pod_resources(&spec(vec![
-            container(&[("cpu", "250m"), ("memory", "256Mi")], &[("cpu", "1"), ("memory", "512Mi")]),
-            container(&[("cpu", "250m")], &[("cpu", "500m")]),
-        ]));
+        let r = pod_resources(&spec(serde_json::json!({"containers": [
+            {"resources": {"requests": {"cpu": "250m", "memory": "256Mi"}, "limits": {"cpu": "1", "memory": "512Mi"}}},
+            {"resources": {"requests": {"cpu": "250m"}, "limits": {"cpu": "500m"}}},
+        ]})));
         assert_eq!(r.cpu, (Some(500.0), Some(1500.0)));
         // A container without a memory limit: the pod has none.
         assert_eq!(r.mem, (Some(256.0 * 1024.0 * 1024.0), None));
-        assert_eq!(pod_resources(&spec(vec![container(&[], &[])])), PodResources::default());
+        assert_eq!(pod_resources(&spec(serde_json::json!({"containers": [{}]}))), PodResources::default());
     }
 
     #[test]
     fn counts_sidecars_and_overhead() {
-        let mut s = spec(vec![container(&[("cpu", "100m")], &[("cpu", "200m")])]);
-        let mut sidecar = container(&[("cpu", "50m")], &[("cpu", "150m")]);
-        sidecar.restart_policy = Some("Always".into());
-        // A regular init container has finished by the time usage is read.
-        s.init_containers = vec![sidecar, container(&[("cpu", "1")], &[("cpu", "2")])];
-        s.overhead = [("cpu".to_string(), "10m".to_string())].into();
+        let s = spec(serde_json::json!({
+            "initContainers": [
+                {"restartPolicy": "Always", "resources": {"requests": {"cpu": "50m"}, "limits": {"cpu": "150m"}}},
+                // A regular init container has finished by the time usage is read.
+                {"resources": {"requests": {"cpu": "1"}, "limits": {"cpu": "2"}}},
+            ],
+            "containers": [{"resources": {"requests": {"cpu": "100m"}, "limits": {"cpu": "200m"}}}],
+            "overhead": {"cpu": "10m"},
+        }));
         assert_eq!(pod_resources(&s).cpu, (Some(160.0), Some(360.0)));
     }
 
     #[test]
-    fn pod_level_resources_win() {
-        let mut s = spec(vec![container(&[("cpu", "100m")], &[])]);
-        s.resources.limits = [("cpu".to_string(), "1".to_string())].into();
-        assert_eq!(pod_resources(&s).cpu, (Some(100.0), Some(1000.0)));
-    }
-
-    #[test]
-    fn pod_amount_counts_like_the_scheduler() {
-        assert_eq!(pod_amount(500.0, []), 500.0);
-        // Sidecars run with the containers.
-        assert_eq!(pod_amount(500.0, [(true, 100.0)]), 600.0);
-        // An init container runs alone, or next to the sidecars started before it.
-        assert_eq!(pod_amount(500.0, [(false, 2000.0)]), 2000.0);
-        assert_eq!(pod_amount(500.0, [(true, 100.0), (false, 2000.0)]), 2100.0);
-        assert_eq!(pod_amount(500.0, [(false, 2000.0), (true, 100.0)]), 2000.0);
+    fn pods_allocated_counts_like_the_scheduler() {
+        let pod = serde_json::json!({"spec": {
+            "initContainers": [{"resources": {"requests": {"cpu": "2"}}}],
+            "containers": [{"resources": {"requests": {"cpu": "500m"}}}],
+        }});
+        let done = serde_json::json!({"status": {"phase": "Succeeded"}, "spec": {"containers": [{"resources": {"requests": {"cpu": "1"}}}]}});
+        assert_eq!(pods_allocated(&[pod, done], "cpu"), (2000.0, 0.0));
     }
 }

@@ -726,13 +726,11 @@ impl KubeMcp {
             Ok(r) => r,
             Err(e) => return call.finish(Err(e)),
         };
-        let sum = |path: &str, parse: fn(&str) -> f64| -> Option<f64> {
-            let vals: Vec<f64> = pods
-                .iter()
-                .flat_map(|p| p.pointer("/spec/containers").and_then(|c| c.as_array()).cloned().unwrap_or_default())
-                .filter_map(|c| c.pointer(path).and_then(|v| v.as_str()).map(parse))
-                .collect();
-            (sum_specs && !vals.is_empty()).then(|| vals.iter().sum())
+        // Requests and limits as the pods run (sidecars, overhead, pod-level resources).
+        let (cpu_spec, mem_spec) = if sum_specs {
+            (k8s::podspec::total(pods.iter().copied(), "cpu"), k8s::podspec::total(pods.iter().copied(), "memory"))
+        } else {
+            ((None, None), (None, None))
         };
         let stats = |s: &crate::prom::Series, scale: f64, fmt: fn(f64) -> String| -> Vec<String> {
             let mut v: Vec<f64> = s.iter().map(|p| p.1 * scale).collect();
@@ -748,12 +746,12 @@ impl KubeMcp {
         let opt = |v: Option<f64>, fmt: fn(f64) -> String| v.map(fmt).unwrap_or_else(|| "-".into());
         let mut cpu_row = vec!["cpu".to_string()];
         cpu_row.extend(stats(&cpu, 1000.0, k8s::format_cpu));
-        cpu_row.push(opt(sum("/resources/requests/cpu", k8s::parse_cpu), k8s::format_cpu));
-        cpu_row.push(opt(sum("/resources/limits/cpu", k8s::parse_cpu), k8s::format_cpu));
+        cpu_row.push(opt(cpu_spec.0, k8s::format_cpu));
+        cpu_row.push(opt(cpu_spec.1, k8s::format_cpu));
         let mut mem_row = vec!["memory".to_string()];
         mem_row.extend(stats(&mem, 1.0, k8s::format_bytes));
-        mem_row.push(opt(sum("/resources/requests/memory", k8s::parse_bytes), k8s::format_bytes));
-        mem_row.push(opt(sum("/resources/limits/memory", k8s::parse_bytes), k8s::format_bytes));
+        mem_row.push(opt(mem_spec.0, k8s::format_bytes));
+        mem_row.push(opt(mem_spec.1, k8s::format_bytes));
         let of = if names.len() < total { format!(" of {total}") } else { String::new() };
         let left_out = if hidden > 0 { " (pods you may not list are left out)" } else { "" };
         let header = format!("{}{of} pod(s), last {minutes} minutes, summed over pods{left_out}\n", names.len());

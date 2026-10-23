@@ -291,7 +291,19 @@ fn looks_risky(texts: &[&str]) -> bool {
 /// exec plugin, which can be a browser login (kubelogin): long enough for a person to log in.
 const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
 
+/// A client for the UI: its writes and shells need write mode when they are sent
+/// ([`gate::WriteGate`]).
 pub async fn connect(context: String) -> Result<Client> {
+    connect_with(context, true).await
+}
+
+/// A client for the agents' MCP server: their rules decide what it may do, not the UI's
+/// write mode.
+pub async fn connect_for_agents(context: String) -> Result<Client> {
+    connect_with(context, false).await
+}
+
+async fn connect_with(context: String, gated: bool) -> Result<Client> {
     run(async move {
         let kc = kubeconfig()?;
         // Building the client runs the context's exec plugin. With an expired token,
@@ -315,7 +327,8 @@ pub async fn connect(context: String) -> Result<Client> {
         let builder = tokio::task::spawn_blocking(move || kube::client::ClientBuilder::try_from(config))
             .await
             .context("building the client")??;
-        Ok(builder.with_layer(&timeout).with_layer(&meter).build())
+        let builder = builder.with_layer(&timeout).with_layer(&meter);
+        Ok(if gated { builder.with_layer(&gate::WriteGateLayer).build() } else { builder.build() })
     })
     .await
 }

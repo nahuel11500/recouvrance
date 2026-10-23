@@ -26,11 +26,13 @@ mod exec;
 #[cfg(feature = "dev")]
 pub(crate) mod experiments;
 mod forward;
+pub(crate) mod gate;
 pub(crate) mod lists;
 pub(crate) mod meter;
 mod metrics;
 pub(crate) mod names;
 mod pods;
+pub(crate) mod podspec;
 mod sources;
 mod table;
 mod writes;
@@ -237,6 +239,15 @@ pub async fn list_values_fields(
         Ok(list.items.into_iter().filter_map(|o| serde_json::to_value(o).ok()).collect())
     })
     .await
+}
+
+/// Whether `read` is an older version of the object than `shown`, by resourceVersion.
+/// The API calls it opaque, but every server in use numbers it as an increasing integer;
+/// anything else is never called older.
+pub fn older_version(read: &serde_json::Value, shown: &serde_json::Value) -> bool {
+    let version = |v: &serde_json::Value| v.pointer("/metadata/resourceVersion")?.as_str()?.parse::<u64>().ok();
+    let same = |p: &str| read.pointer(p) == shown.pointer(p);
+    same("/metadata/uid") && matches!((version(read), version(shown)), (Some(a), Some(b)) if a < b)
 }
 
 pub fn ar_of<K: kube::Resource<DynamicType = ()>>() -> ApiResource {

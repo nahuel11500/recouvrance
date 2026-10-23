@@ -397,8 +397,20 @@ pub async fn run_command(
     .await
 }
 
-/// Run the `helm` CLI against a context and return its output.
+/// Whether a helm command line changes the cluster: install, upgrade, rollback or
+/// uninstall, unless it is a dry run.
+pub fn helm_writes(args: &[String]) -> bool {
+    let first = args.iter().find(|a| !a.starts_with('-')).map(String::as_str);
+    matches!(first, Some("install" | "upgrade" | "rollback" | "uninstall" | "delete"))
+        && !args.iter().any(|a| a == "--dry-run" || a.starts_with("--dry-run="))
+}
+
+/// Run the `helm` CLI against a context and return its output. A command that changes the
+/// cluster needs write mode when it starts, like the UI's other writes.
 pub async fn helm(context: String, args: Vec<String>) -> Result<String> {
+    if helm_writes(&args) && !gate::ui_writes() {
+        anyhow::bail!(gate::WRITES_OFF);
+    }
     run(async move {
         let kubeconfig = private_kubeconfig(&context, None, "helm")?;
         let out = tokio::process::Command::new("helm").args(&args).env("KUBECONFIG", kubeconfig.path()).output().await;

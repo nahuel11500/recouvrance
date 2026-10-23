@@ -524,27 +524,19 @@ pub fn pod_rows(pods: &[Value], usage: &ContainerUsage) -> Vec<PodRow> {
             let containers = arr(p, "/spec/containers");
             let usage = usage.get(&name);
             let sum = |f: fn(&(f64, f64)) -> f64| usage.map(|u| u.values().map(f).sum::<f64>());
-            let spec_sum = |what: &str, parse: fn(&str) -> f64| -> Option<f64> {
-                let vals: Vec<f64> =
-                    containers.iter().filter_map(|c| c.pointer(what).and_then(Value::as_str).map(parse)).collect();
-                (!vals.is_empty()).then(|| vals.iter().sum())
+            let spec = |r: &str| {
+                let e = k8s::podspec::of_value(p, r, k8s::podspec::Count::Running);
+                (e.request(), e.limit())
             };
+            let (cpu, mem) = (spec("cpu"), spec("memory"));
             PodRow {
                 namespace: s(p, "/metadata/namespace").map(String::from),
                 ready: statuses.iter().filter(|c| c["ready"].as_bool() == Some(true)).count(),
                 total: containers.len(),
                 restarts: statuses.iter().filter_map(|c| c["restartCount"].as_i64()).sum(),
                 phase: s(p, "/status/phase").unwrap_or("Unknown").to_string(),
-                cpu: [
-                    sum(|u| u.0),
-                    spec_sum("/resources/requests/cpu", k8s::parse_cpu),
-                    spec_sum("/resources/limits/cpu", k8s::parse_cpu),
-                ],
-                mem: [
-                    sum(|u| u.1),
-                    spec_sum("/resources/requests/memory", k8s::parse_bytes),
-                    spec_sum("/resources/limits/memory", k8s::parse_bytes),
-                ],
+                cpu: [sum(|u| u.0), cpu.0, cpu.1],
+                mem: [sum(|u| u.1), mem.0, mem.1],
                 node: s(p, "/spec/nodeName").unwrap_or("-").to_string(),
                 created: s(p, "/metadata/creationTimestamp").and_then(|t| t.parse().ok()),
                 name,
@@ -620,7 +612,8 @@ pub(super) fn pod_ephemeral(ctx: &Ctx) -> Option<String> {
         .iter()
         .find(|p| s(p, "/podRef/name") == Some(name) && s(p, "/podRef/namespace") == Some(ns))?;
     let used = pod.pointer("/ephemeral-storage/usedBytes").and_then(Value::as_f64)?;
-    let (_, limit) = k8s::pods_allocated(std::slice::from_ref(ctx.obj), "ephemeral-storage");
+    let limit =
+        k8s::podspec::of_value(ctx.obj, "ephemeral-storage", k8s::podspec::Count::Running).limit().unwrap_or(0.0);
     Some(if limit > 0.0 {
         format!("{} of {} ({:.0}%)", k8s::format_bytes(used), k8s::format_bytes(limit), used / limit * 100.0)
     } else {

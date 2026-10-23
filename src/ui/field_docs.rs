@@ -16,15 +16,24 @@ pub struct FieldDocs {
     kind: Option<(String, String)>,
     schema: Option<Result<Schema, String>>,
     path: Vec<String>,
-    _task: Option<Task<()>>,
+    /// The schema of the kind under the cursor; dropped when it moves to another.
+    schema_load: crate::latest::Latest,
     _sub: Subscription,
 }
 
 impl FieldDocs {
     pub fn new(context: String, client: Client, editor: Entity<EditorState>, cx: &mut Context<Self>) -> Self {
         let sub = cx.observe(&editor, |this, _, cx| this.recompute(cx));
-        let mut this =
-            Self { context, client, editor, kind: None, schema: None, path: Vec::new(), _task: None, _sub: sub };
+        let mut this = Self {
+            context,
+            client,
+            editor,
+            kind: None,
+            schema: None,
+            path: Vec::new(),
+            schema_load: Default::default(),
+            _sub: sub,
+        };
         this.recompute(cx);
         this
     }
@@ -39,21 +48,21 @@ impl FieldDocs {
         if kind != self.kind {
             self.kind = kind.clone();
             self.schema = None;
+            self.schema_load.cancel();
             if let Some((api_version, kind)) = kind {
                 let (ctx, client) = (self.context.clone(), self.client.clone());
-                self._task = Some(cx.spawn(async move |this, cx| {
-                    let r = crate::schema::document(&ctx, client, &api_version)
-                        .await
-                        .map_err(|e| format!("{e:#}"))
-                        .and_then(|doc| {
+                let load = async move {
+                    crate::schema::document(&ctx, client, &api_version).await.map_err(|e| format!("{e:#}")).and_then(
+                        |doc| {
                             Schema::find(doc, &api_version, &kind)
                                 .ok_or_else(|| format!("No schema for {api_version} {kind}"))
-                        });
-                    let _ = this.update(cx, |this, cx| {
-                        this.schema = Some(r);
-                        cx.notify();
-                    });
-                }));
+                        },
+                    )
+                };
+                self.schema_load.spawn(cx, load, |this, r, cx| {
+                    this.schema = Some(r);
+                    cx.notify();
+                });
             }
         }
         if path != self.path {

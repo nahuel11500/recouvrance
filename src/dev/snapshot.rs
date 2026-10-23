@@ -19,7 +19,7 @@ pub fn run(path: &str, wait: Duration) -> Result<()> {
         crate::app::bind_keys(cx);
         crate::plugins::reload(cx);
         if std::env::var("RECOUVRANCE_WRITES").is_ok() {
-            cx.set_global(crate::details::WriteMode(true));
+            crate::details::set_writes(true, cx);
         }
         if let Ok(z) = std::env::var("RECOUVRANCE_ZOOM") {
             crate::app::set_zoom_global(z.parse().unwrap_or(1.0), cx);

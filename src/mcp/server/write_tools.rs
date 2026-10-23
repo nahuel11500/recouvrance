@@ -19,6 +19,7 @@ impl KubeMcp {
         let access = access_for(&kind, &p.context, "exec", Some(p.namespace.clone()), Some(p.pod.clone()));
         self.authorize(&mut call, &access).await?;
         let timeout = call.policy().exec_timeout.max(1) as u64;
+        self.recheck(&mut call, &access)?;
         call.finish(k8s::exec_capture(client, p.namespace, p.pod, p.container, p.command, timeout, 64 * 1024).await)
     }
 
@@ -33,6 +34,7 @@ impl KubeMcp {
         let (client, kind) = self.kind(&call, &p.context, &p.kind).await?;
         let access = access_for(&kind, &p.context, "scale", Some(p.namespace.clone()), Some(p.name.clone()));
         self.authorize(&mut call, &access).await?;
+        self.recheck(&mut call, &access)?;
         call.finish(k8s::scale(client, kind, Some(p.namespace), p.name, p.replicas, p.dry_run.unwrap_or(false)).await)
     }
 
@@ -49,6 +51,7 @@ impl KubeMcp {
         let (client, kind) = self.kind(&call, &p.context, &p.kind).await?;
         let access = access_for(&kind, &p.context, "restart", Some(p.namespace.clone()), Some(p.name.clone()));
         self.authorize(&mut call, &access).await?;
+        self.recheck(&mut call, &access)?;
         call.finish(k8s::rollout_restart(client, kind, Some(p.namespace), p.name, p.dry_run.unwrap_or(false)).await)
     }
 
@@ -66,6 +69,7 @@ impl KubeMcp {
         require_ns(&call, &kind, &p.namespace)?;
         let access = access_for(&kind, &p.context, "patch", p.namespace.clone(), Some(p.name.clone()));
         self.authorize(&mut call, &access).await?;
+        self.recheck(&mut call, &access)?;
         call.finish(k8s::merge_patch(client, kind, p.namespace, p.name, p.patch, p.dry_run.unwrap_or(false)).await)
     }
 
@@ -205,6 +209,7 @@ impl KubeMcp {
                 denied.join(", ")
             )));
         }
+        self.recheck(&mut call, &access)?;
         call.finish(k8s::drain(client, p.node).await)
     }
 
@@ -236,6 +241,7 @@ impl KubeMcp {
         }
         let access = access_for(&kind, &p.context, "patch", Some(p.namespace.clone()), Some(p.name.clone()));
         self.authorize(&mut call, &access).await?;
+        self.recheck(&mut call, &access)?;
         let (ns, name) = (Some(p.namespace), p.name);
         call.finish(match p.action.as_str() {
             "reconcile" => k8s::flux_reconcile(client, kind, ns, name).await,
@@ -258,6 +264,7 @@ impl KubeMcp {
         require_ns(&call, &kind, &p.namespace)?;
         let access = access_for(&kind, &p.context, "delete", p.namespace.clone(), Some(p.name.clone()));
         self.authorize(&mut call, &access).await?;
+        self.recheck(&mut call, &access)?;
         call.finish(k8s::delete(client, kind, p.namespace, p.name, p.dry_run.unwrap_or(false)).await)
     }
 }

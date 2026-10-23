@@ -63,6 +63,9 @@ http-body-util = "0.1"
 bytes = "1"
 tower = { version = "0.5.3", default-features = false, features = ["timeout"] }
 
+[dev-dependencies]
+proptest = "1.12.0"
+
 [features]
 # Off-screen rendering of the real UI to a PNG, for development.
 dev = ["dep:image", "dep:gpui-pre", "dep:gpui-pre-platform"]

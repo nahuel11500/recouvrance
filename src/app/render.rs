@@ -169,7 +169,7 @@ impl Render for AppView {
                     .tooltip(if writes { "Write actions are on — click to go back to read-only" } else { "Click to enable write actions" })
                     .on_click(|_, window, cx| {
                         if crate::details::writes_enabled(cx) {
-                            cx.set_global(crate::details::WriteMode(false));
+                            crate::details::set_writes(false, cx);
                             cx.refresh_windows();
                             return;
                         }
@@ -184,7 +184,7 @@ impl Render for AppView {
                                 .show_cancel(true)
                                 .ok_text("Enable writes")
                                 .on_ok(|_, _, cx| {
-                                    cx.set_global(crate::details::WriteMode(true));
+                                    crate::details::set_writes(true, cx);
                                     cx.refresh_windows();
                                     true
                                 })

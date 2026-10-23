@@ -74,6 +74,13 @@ pub struct WriteMode(pub bool);
 
 impl Global for WriteMode {}
 
+/// Turn write mode on or off, for the UI and for its clients' requests, which check it again
+/// when they are sent.
+pub fn set_writes(on: bool, cx: &mut App) {
+    k8s::gate::set_ui_writes(on);
+    cx.set_global(WriteMode(on));
+}
+
 pub fn writes_enabled(cx: &App) -> bool {
     cx.try_global::<WriteMode>().is_some_and(|w| w.0)
 }
@@ -94,7 +101,7 @@ pub fn ensure_writes(window: &mut Window, cx: &mut App) -> bool {
             .show_cancel(true)
             .ok_text("Enable writes")
             .on_ok(|_, _, cx| {
-                cx.set_global(WriteMode(true));
+                set_writes(true, cx);
                 cx.refresh_windows();
                 true
             })
@@ -149,6 +156,9 @@ pub struct DetailPanel {
     /// The overview of a page with a pods table, drawn as a list: a node can hold a
     /// thousand pods, and laying them all out on every frame made scrolling stutter.
     overview_list: ListState,
+    /// One-shot reads of the object, and of its events: the latest wins.
+    object_read: crate::latest::Latest,
+    events_load: crate::latest::Latest,
     /// A CRD's spec fields, worked out when it is loaded rather than on every frame.
     schema_rows: Vec<crate::overview::SchemaRow>,
     /// Inline editor of a ConfigMap's or Secret's values.
@@ -237,6 +247,8 @@ impl DetailPanel {
             node_shell: None,
             env_expanded: false,
             overview_list: ListState::new(0, ListAlignment::Top, px(600.)),
+            object_read: Default::default(),
+            events_load: Default::default(),
             schema_rows: Vec::new(),
             data_editor: None,
             show_managed: false,
@@ -460,47 +472,45 @@ impl DetailPanel {
     /// editor's text even when it differs from what was last loaded (after saving it).
     pub(super) fn refresh_object(&mut self, reset_yaml: bool, window: &mut Window, cx: &mut Context<Self>) {
         let fut = k8s::get_object_opts(self.client.clone(), self.obj.clone(), true);
-        self.keep_task(cx.spawn_in(window, async move |this, cx| {
-            let result = fut.await;
-            let _ = this.update_in(cx, |this, window, cx| {
-                match result {
-                    Ok(value) => {
-                        this.set_object(value);
-                        if reset_yaml || this.yaml.read(cx).value().as_ref() == this.yaml_text {
-                            this.refresh_yaml(window, cx);
-                        }
-                        this.start_loops(window, cx);
-                        if let Some(action) = this.pending_action.take() {
-                            this.quick_action(&action, window, cx);
-                        }
+        // A newer one-shot read replaces this one.
+        self.object_read.spawn_in(window, cx, fut, move |this, result, window, cx| {
+            match result {
+                Ok(value) => {
+                    let taken = this.set_object(value);
+                    if taken && reset_yaml || this.yaml.read(cx).value().as_ref() == this.yaml_text {
+                        this.refresh_yaml(window, cx);
                     }
-                    Err(e) => {
-                        if k8s::is_not_found(&e) {
-                            this.deleted = true;
-                        } else {
-                            // A timeout or a 5xx: keep trying, the page starts when a read works.
-                            this.start_live(window, cx);
-                        }
-                        if let Some(action) = this.pending_action.take() {
-                            window.push_notification(
-                                Notification::error(format!(
-                                    "Could not read {} {}, so nothing was done ({action}): {}",
-                                    this.obj.kind.ar.kind,
-                                    this.obj.name,
-                                    k8s::short_error(&e)
-                                )),
-                                cx,
-                            );
-                        }
-                        // Keep showing the last state when a later read fails.
-                        if this.object.is_none() {
-                            this.yaml_error = Some(k8s::short_error(&e).into());
-                        }
+                    this.start_loops(window, cx);
+                    if let Some(action) = this.pending_action.take() {
+                        this.quick_action(&action, window, cx);
                     }
                 }
-                cx.notify();
-            });
-        }));
+                Err(e) => {
+                    if k8s::is_not_found(&e) {
+                        this.deleted = true;
+                    } else {
+                        // A timeout or a 5xx: keep trying, the page starts when a read works.
+                        this.start_live(window, cx);
+                    }
+                    if let Some(action) = this.pending_action.take() {
+                        window.push_notification(
+                            Notification::error(format!(
+                                "Could not read {} {}, so nothing was done ({action}): {}",
+                                this.obj.kind.ar.kind,
+                                this.obj.name,
+                                k8s::short_error(&e)
+                            )),
+                            cx,
+                        );
+                    }
+                    // Keep showing the last state when a later read fails.
+                    if this.object.is_none() {
+                        this.yaml_error = Some(k8s::short_error(&e).into());
+                    }
+                }
+            }
+            cx.notify();
+        });
     }
 
     /// Keep a task alive with the page; finished ones are dropped on the way.
@@ -576,10 +586,9 @@ impl DetailPanel {
                 let alive = this.update_in(cx, |this, window, cx| {
                     this.deleted = false;
                     let changed = this.object.as_ref() != Some(&value);
-                    if !changed {
+                    if !changed || !this.set_object(value) {
                         return;
                     }
-                    this.set_object(value);
                     // Don't overwrite what the user is editing.
                     if this.yaml.read(cx).value().as_ref() == this.yaml_text {
                         this.refresh_yaml(window, cx);
@@ -775,11 +784,18 @@ impl DetailPanel {
 
     // MARK: Compare
 
-    fn set_object(&mut self, value: serde_json::Value) {
+    /// Show this read of the object, unless it is older than the one shown: a periodic read
+    /// that started before a write can arrive after the read made once it was done.
+    /// Returns whether it was taken.
+    fn set_object(&mut self, value: serde_json::Value) -> bool {
+        if self.object.as_ref().is_some_and(|shown| k8s::older_version(&value, shown)) {
+            return false;
+        }
         if self.obj.kind.is("apiextensions.k8s.io", "CustomResourceDefinition") {
             self.schema_rows = crate::overview::crd_rows(&value);
         }
         self.object = Some(value);
+        true
     }
 
     fn ctx<'a>(&'a self, value: &'a serde_json::Value, cx: &Context<Self>) -> Ctx<'a> {
@@ -811,13 +827,11 @@ impl DetailPanel {
 
     fn load_events(&mut self, cx: &mut Context<Self>) {
         let fut = k8s::events_for(self.client.clone(), self.obj.clone());
-        self.keep_task(cx.spawn(async move |this, cx| {
-            let result = fut.await.map_err(|e| SharedString::from(k8s::short_error(&e)));
-            let _ = this.update(cx, |this, cx| {
-                this.events = Some(result);
-                cx.notify();
-            });
-        }));
+        // After several writes in a row, only the last list of events is shown.
+        self.events_load.spawn(cx, fut, |this, result, cx| {
+            this.events = Some(result.map_err(|e| SharedString::from(k8s::short_error(&e))));
+            cx.notify();
+        });
     }
 }
 
