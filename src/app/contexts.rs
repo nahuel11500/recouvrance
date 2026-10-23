@@ -65,22 +65,14 @@ impl AppView {
             }
             let result = async {
                 let (_, client) = clusters.first().cloned().ok_or_else(|| anyhow::anyhow!(errors.join("; ")))?;
-                // Union of every cluster's kinds; remember where each one exists.
+                // Connecting does not reach the server: discovery is the first request, and
+                // an unreachable cluster fails there.
                 let discovered =
                     futures::future::join_all(clusters.iter().map(|(_, c)| k8s::discover(c.clone()))).await;
-                let mut kinds: Vec<Kind> = Vec::new();
-                let mut kind_clusters: HashMap<String, Vec<usize>> = HashMap::new();
-                for (ix, found) in discovered.into_iter().enumerate() {
-                    for k in found.unwrap_or_default() {
-                        let entry = kind_clusters.entry(k.key()).or_default();
-                        if entry.is_empty() {
-                            kinds.push(k);
-                        }
-                        entry.push(ix);
-                    }
-                }
+                let names: Vec<&str> = clusters.iter().map(|(n, _)| n.as_str()).collect();
+                let (mut kinds, kind_clusters) = merge_kinds(&names, discovered, &mut errors);
                 if kinds.is_empty() {
-                    anyhow::bail!("discovery failed on every cluster");
+                    anyhow::bail!("discovery failed on every cluster: {}", errors.join("; "));
                 }
                 // Built-in sections first, then custom resources by group.
                 k8s::sort_for_sidebar(&mut kinds);
@@ -249,6 +241,34 @@ impl AppView {
     }
 }
 
+/// Union of every cluster's kinds, with where each one exists. A cluster whose
+/// discovery failed adds `name: error` to `errors`.
+fn merge_kinds(
+    names: &[&str],
+    discovered: Vec<Result<Vec<Kind>>>,
+    errors: &mut Vec<String>,
+) -> (Vec<Kind>, HashMap<String, Vec<usize>>) {
+    let mut kinds: Vec<Kind> = Vec::new();
+    let mut kind_clusters: HashMap<String, Vec<usize>> = HashMap::new();
+    for (ix, (name, found)) in names.iter().zip(discovered).enumerate() {
+        let found = match found {
+            Ok(found) => found,
+            Err(e) => {
+                errors.push(format!("{name}: {e:#}"));
+                continue;
+            }
+        };
+        for k in found {
+            let entry = kind_clusters.entry(k.key()).or_default();
+            if entry.is_empty() {
+                kinds.push(k);
+            }
+            entry.push(ix);
+        }
+    }
+    (kinds, kind_clusters)
+}
+
 /// The one namespace to show when only some are accessible: the one just ticked,
 /// else the last one asked for, else the first accessible one. None when all are.
 fn one_namespace(wanted: &[String], previous: &[String], accessible: &[String]) -> Option<String> {
@@ -260,7 +280,32 @@ fn one_namespace(wanted: &[String], previous: &[String], accessible: &[String]) 
 
 #[cfg(test)]
 mod tests {
-    use super::one_namespace;
+    use super::{Kind, merge_kinds, one_namespace};
+
+    fn kind(k: &str) -> Kind {
+        Kind {
+            ar: kube::discovery::ApiResource {
+                group: "".into(),
+                version: "v1".into(),
+                api_version: "v1".into(),
+                kind: k.into(),
+                plural: format!("{}s", k.to_lowercase()),
+            },
+            namespaced: true,
+            section: "",
+            label: k.into(),
+        }
+    }
+
+    #[test]
+    fn a_cluster_that_fails_discovery_is_reported() {
+        let mut errors = vec!["c: no such context".to_string()];
+        let found = vec![Ok(vec![kind("Pod")]), Err(anyhow::anyhow!("connection refused"))];
+        let (kinds, where_) = merge_kinds(&["a", "b"], found, &mut errors);
+        assert_eq!(kinds.len(), 1);
+        assert_eq!(where_[&kinds[0].key()], [0]);
+        assert_eq!(errors, ["c: no such context", "b: connection refused"]);
+    }
 
     fn v(list: &[&str]) -> Vec<String> {
         list.iter().map(|s| s.to_string()).collect()
