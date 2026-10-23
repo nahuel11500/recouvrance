@@ -468,6 +468,21 @@ mod tests {
     }
 
     #[test]
+    fn refuses_unknown_keys() {
+        for text in [
+            "agents:\n  Claude:\n    allow: [\"get *\"]\n    Deny: [\"* secrets\"]\n",
+            "agents:\n  Claude:\n    deny_rules: [\"* secrets\"]\n",
+            "agents:\n  Claude:\n    limits: { calls_a_minute: 30 }\n",
+            "agent:\n  Claude:\n    allow: [\"get *\"]\n",
+        ] {
+            assert!(crate::yaml::from_str::<RulesFile>(text).is_err(), "{text}");
+        }
+        let text =
+            "agents:\n  Claude:\n    allow: [\"get *\"]\n    deny: [\"* secrets\"]\n    limits: { max_rows: 10 }\n";
+        assert!(crate::yaml::from_str::<RulesFile>(text).is_ok());
+    }
+
+    #[test]
     fn applies_file() {
         let text = "agents:\n  Claude:\n    allow: [\"get,list *\"]\n    deny: [\"* secrets\"]\n    limits: { calls_per_minute: 30 }\n";
         let f: RulesFile = crate::yaml::from_str(text).unwrap();

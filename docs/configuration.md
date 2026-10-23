@@ -46,7 +46,8 @@ to any of these files are picked up within a few seconds. When two files define 
 (or cluster, or user) with the same name, the later one is renamed `name@file` so both stay usable.
 A context name stays with the file that had it first (kept in `context_files`), even when files
 are saved again, reordered, or one is briefly unreadable: protection and per-cluster settings
-never move to another cluster. The name is freed when its file is deleted or no longer has it.
+never move to another cluster. The name is freed when its file is deleted or no longer has it
+(read twice the same way, so a file caught while `kubectl` rewrites it keeps its names).
 
 ## settings.json
 
@@ -128,7 +129,8 @@ comma-separated, `*` globs work everywhere, an omitted part means `*`, and `-` i
 (the rule matches nothing; an exported rule with nothing chosen yet is written that way). Deny wins, then ask,
 then allow; anything no rule matches is denied. `approved` lists the requests you approved with
 *Always allow this* or *Allow for 1h*: they are allowed even where an ask rule matches, never where a
-deny rule does. The file is reloaded when it changes, and edits on the Agents page are written back
+deny rule does. An `approved` rule's resource is matched as written (`pods` is not
+`pods.metrics.k8s.io`), and its names and contexts case included. The file is reloaded when it changes, and edits on the Agents page are written back
 to it (its comments are not kept). An edit on the Agents page made after you saved the file, but
 before it was reloaded, is refused so it doesn't overwrite yours. A key the file doesn't know (a
 misspelt `deny:`) fails the load, like a rule that doesn't parse: the rules in force stay as they

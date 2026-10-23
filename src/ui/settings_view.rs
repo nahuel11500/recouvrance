@@ -53,6 +53,8 @@ pub struct SettingsView {
     tail: Entity<InputState>,
     kubeconfig: Entity<crate::ui::kubeconfig_sources::KubeconfigSources>,
     mcp_port: Entity<InputState>,
+    /// Why the port typed is not saved.
+    mcp_port_error: Option<SharedString>,
     /// The assistant's team notes, and its code folders (one a line).
     notes: Entity<TextareaState>,
     repos: Entity<TextareaState>,
@@ -114,12 +116,10 @@ impl SettingsView {
         number(&overview, |s, n| s.overview_refresh = n, &mut subs, cx);
         number(&tail, |s, n| s.log_tail_lines = n as i64, &mut subs, cx);
         let hub2 = hub.clone();
-        subs.push(cx.subscribe(&mcp_port, move |_, state, ev: &InputEvent, cx| {
-            if let InputEvent::Change = ev
-                && let Ok(p) = state.read(cx).value().trim().parse::<u16>()
-                && p >= 1024
-            {
-                let _ = hub2.set_port(p);
+        subs.push(cx.subscribe(&mcp_port, move |this, state, ev: &InputEvent, cx| {
+            if let InputEvent::Change = ev {
+                this.mcp_port_error = port_error(&state.read(cx).value(), |p| hub2.set_port(p));
+                cx.notify();
             }
         }));
         subs.push(cx.subscribe(&notes, |_, state, ev: &InputEvent, cx| {
@@ -176,6 +176,7 @@ impl SettingsView {
             tail,
             kubeconfig,
             mcp_port,
+            mcp_port_error: None,
             notes,
             repos,
             prometheus: Vec::new(),
@@ -704,7 +705,10 @@ impl SettingsView {
                 .child(Self::row(
                     "MCP server",
                     "Agents connect to http://127.0.0.1:<port>/mcp. Port changes apply after restarting Recouvrance.",
-                    number_input(&self.mcp_port),
+                    v_flex().items_end().gap_1().child(number_input(&self.mcp_port)).when_some(
+                        self.mcp_port_error.clone(),
+                        |d, e| d.child(div().text_xs().text_color(theme.danger).child(e)),
+                    ),
                     cx,
                 ))
                 .child(Self::row(
@@ -957,4 +961,33 @@ impl Render for SettingsView {
 /// The code folders typed one a line.
 fn repo_lines(text: &str) -> Vec<String> {
     text.lines().map(str::trim).filter(|l| !l.is_empty()).map(String::from).collect()
+}
+
+/// Why a typed MCP port is not saved, or None once `save` saved it.
+fn port_error(typed: &str, save: impl FnOnce(u16) -> Result<()>) -> Option<SharedString> {
+    match typed.trim().parse::<u16>() {
+        Ok(p) if p >= 1024 => save(p).err().map(|e| format!("Not saved: {e:#}").into()),
+        Ok(_) => Some("Ports below 1024 need root: use 1024 to 65535".into()),
+        Err(_) => Some("Use a port from 1024 to 65535".into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::port_error;
+
+    #[test]
+    fn a_port_not_saved_says_why() {
+        assert_eq!(port_error("48000", |_| Ok(())), None);
+        let failed = port_error(" 48000 ", |p| anyhow::bail!("agents.json is read-only ({p})"));
+        assert_eq!(failed.as_deref(), Some("Not saved: agents.json is read-only (48000)"));
+        let saved = std::cell::Cell::new(false);
+        let save = |_| {
+            saved.set(true);
+            Ok(())
+        };
+        assert!(port_error("80", save).is_some_and(|e| e.contains("1024")));
+        assert!(port_error("70000", save).is_some());
+        assert!(!saved.get(), "a refused port is not saved");
+    }
 }
