@@ -34,13 +34,16 @@ pub fn path() -> PathBuf {
     super::config_dir().join("rules.yaml")
 }
 
+// Unknown keys are refused: a misspelled `deny:` must not load as no deny rules.
 #[derive(Serialize, Deserialize, Default, Debug)]
+#[serde(deny_unknown_fields)]
 pub struct RulesFile {
     #[serde(default)]
     pub agents: BTreeMap<String, AgentRules>,
 }
 
 #[derive(Serialize, Deserialize, Default, Debug, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct AgentRules {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allow: Vec<String>,
@@ -56,6 +59,7 @@ pub struct AgentRules {
 }
 
 #[derive(Serialize, Deserialize, Default, Debug, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct Limits {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub calls_per_minute: Option<u32>,
@@ -447,6 +451,21 @@ mod tests {
         assert!(render(&agents).is_err());
         assert_eq!(shared_name(&agents[..2]), None);
         assert!(render(&agents[..2]).is_ok());
+    }
+
+    #[test]
+    fn refuses_unknown_keys() {
+        for text in [
+            "agents:\n  Claude:\n    allow: [\"get *\"]\n    Deny: [\"* secrets\"]\n",
+            "agents:\n  Claude:\n    deny_rules: [\"* secrets\"]\n",
+            "agents:\n  Claude:\n    limits: { calls_per_minut: 30 }\n",
+            "agent:\n  Claude:\n    allow: [\"get *\"]\n",
+        ] {
+            assert!(crate::yaml::from_str::<RulesFile>(text).is_err(), "{text}");
+        }
+        let text =
+            "agents:\n  Claude:\n    allow: [\"get *\"]\n    deny: [\"* secrets\"]\n    limits: { max_rows: 10 }\n";
+        assert!(crate::yaml::from_str::<RulesFile>(text).is_ok());
     }
 
     #[test]
