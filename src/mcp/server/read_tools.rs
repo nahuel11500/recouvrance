@@ -506,7 +506,7 @@ impl KubeMcp {
     }
 
     #[tool(
-        description = "TLS certificates in kubernetes.io/tls Secrets with their names (SANs), issuer and expiry, soonest first. Needs `get` on secrets; private keys are never returned.",
+        description = "TLS certificates in kubernetes.io/tls Secrets with their names (SANs), issuer and expiry, soonest first (ones not valid yet before all). Needs `get` on secrets; private keys are never returned.",
         annotations(read_only_hint = true)
     )]
     async fn check_certificates(
@@ -531,7 +531,7 @@ impl KubeMcp {
             Ok(v) => v,
             Err(e) => return call.finish(Err(e)),
         };
-        let now = jiff::Timestamp::now().as_second();
+        let now = jiff::Timestamp::now();
         let mut rows: Vec<(i64, Vec<String>)> = Vec::new();
         for sec in &secrets {
             let ns = sec.pointer("/metadata/namespace").and_then(|v| v.as_str()).unwrap_or_default().to_string();
@@ -550,8 +550,10 @@ impl KubeMcp {
             // The leaf certificate is first in the chain.
             let Some(c) = crate::certs::parse_pem(&pem).into_iter().next() else { continue };
             // Rounded down: negative as soon as the date has passed.
-            let days = c.not_after.map(|t| (t.as_second() - now).div_euclid(86400)).unwrap_or(i64::MAX);
-            if p.within_days.is_some_and(|w| days > w) {
+            let days = c.not_after.map(|t| (t.as_second() - now.as_second()).div_euclid(86400)).unwrap_or(i64::MAX);
+            // Not valid yet: clients reject it now, so it is listed first whatever the window.
+            let early = c.not_yet_valid(now);
+            if !early && p.within_days.is_some_and(|w| days > w) {
                 continue;
             }
             let mut names = c.sans.clone();
@@ -561,14 +563,21 @@ impl KubeMcp {
                 names.push(format!("+{more}"));
             }
             rows.push((
-                days,
+                if early { i64::MIN } else { days },
                 vec![
                     ns,
                     name,
                     names.join(","),
                     c.issuer.clone(),
                     c.not_after.map(|t| t.strftime("%Y-%m-%d").to_string()).unwrap_or_default(),
-                    if days < 0 { format!("EXPIRED {}d ago", -days) } else { days.to_string() },
+                    if early {
+                        let from = c.not_before.map(|t| t.strftime("%Y-%m-%d").to_string()).unwrap_or_default();
+                        format!("NOT VALID UNTIL {from}")
+                    } else if days < 0 {
+                        format!("EXPIRED {}d ago", -days)
+                    } else {
+                        days.to_string()
+                    },
                 ],
             ));
         }
