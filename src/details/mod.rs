@@ -131,6 +131,18 @@ pub struct OpenObject {
 
 impl EventEmitter<OpenObject> for DetailPanel {}
 
+/// Ask the assistant why this object is broken (the Diagnosis card).
+#[derive(Clone)]
+pub struct Investigate {
+    pub kind: String,
+    pub name: String,
+    pub namespace: Option<String>,
+    /// What the diagnosis found, a finding a line.
+    pub findings: String,
+}
+
+impl EventEmitter<Investigate> for DetailPanel {}
+
 impl EventEmitter<crate::plugins::RunPlugin> for DetailPanel {}
 
 pub struct DetailPanel {
@@ -342,9 +354,12 @@ impl DetailPanel {
                 .child(confirm_extras(&command, guard.as_ref(), cx))
                 .show_cancel(true)
                 .ok_text("Run")
-                .on_ok(move |_, _, cx| {
+                .on_ok(move |_, window, cx| {
                     if !guard_ok(guard.as_ref(), cx) {
                         return false;
+                    }
+                    if writes && !writes_still_on(window, cx) {
+                        return true;
                     }
                     if let Some(ev) = ev.borrow_mut().take() {
                         let _ = panel.update(cx, |_, cx| cx.emit(ev));
