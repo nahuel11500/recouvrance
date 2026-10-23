@@ -219,6 +219,7 @@ impl AppView {
         self.all_contexts = names.clone();
         self.ctx_picker.update(cx, |p, cx| p.set_all(names, cx));
         self.settings_view.update(cx, |s, cx| s.sync_clusters(window, cx));
+        self.agents.update(cx, |a, _| a.refresh_contexts());
         let msg = match (added, removed) {
             (0, 0) => "Kubeconfig reloaded".to_string(),
             (a, 0) => format!("Kubeconfig reloaded: {a} new context{}", if a > 1 { "s" } else { "" }),
