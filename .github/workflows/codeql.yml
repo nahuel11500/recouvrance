@@ -19,6 +19,10 @@ jobs:
   analyze:
     name: Analyze (rust)
     runs-on: ubuntu-latest
+    env:
+      # Keep the extractor's cargo output (build scripts, proc macros) in target/, which the
+      # cache below saves, instead of a new scratch directory on every run.
+      CODEQL_EXTRACTOR_RUST_OPTION_CARGO_TARGET_DIR: ${{ github.workspace }}/target
     permissions:
       contents: read
       security-events: write
