@@ -131,6 +131,18 @@ pub struct OpenObject {
 
 impl EventEmitter<OpenObject> for DetailPanel {}
 
+/// Ask the assistant why this object is broken (the Diagnosis card).
+#[derive(Clone)]
+pub struct Investigate {
+    pub kind: String,
+    pub name: String,
+    pub namespace: Option<String>,
+    /// What the diagnosis found, a finding a line.
+    pub findings: String,
+}
+
+impl EventEmitter<Investigate> for DetailPanel {}
+
 impl EventEmitter<crate::plugins::RunPlugin> for DetailPanel {}
 
 pub struct DetailPanel {

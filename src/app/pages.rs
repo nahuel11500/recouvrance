@@ -55,6 +55,7 @@ impl AppView {
         let forwards = self.forwards.clone();
         let favorites = self.favorites.clone();
         let clusters = self.clusters.clone();
+        let context_name = context.clone();
         let panel = cx.new(|cx| {
             let mut p = DetailPanel::new(client, context, risky, forwards, favorites, obj, window, cx);
             p.clusters = clusters;
@@ -62,6 +63,20 @@ impl AppView {
         });
         cx.subscribe_in(&panel, window, |this, _, ev: &crate::plugins::RunPlugin, window, cx| {
             this.run_plugin(ev, window, cx)
+        })
+        .detach();
+        cx.subscribe_in(&panel, window, move |this, _, ev: &crate::details::Investigate, window, cx| {
+            let q = crate::assistant::investigation(
+                &context_name,
+                &ev.kind,
+                ev.namespace.as_deref(),
+                &ev.name,
+                &ev.findings,
+            );
+            this.open_assistant(window, cx);
+            if let Some(page) = this.assistant_page() {
+                page.update(cx, |a, cx| a.start_over(q, cx));
+            }
         })
         .detach();
         // Released with the page.
@@ -161,12 +176,16 @@ impl AppView {
         }
     }
 
-    /// One assistant chat per window, kept across navigation.
-    pub(super) fn open_assistant(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let page = match self.history.iter().find_map(|r| match r {
+    fn assistant_page(&self) -> Option<Entity<crate::ui::assistant_view::AssistantView>> {
+        self.history.iter().find_map(|r| match r {
             Route::Assistant(e) => Some(e.clone()),
             _ => None,
-        }) {
+        })
+    }
+
+    /// One assistant chat per window, kept across navigation.
+    pub(super) fn open_assistant(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let page = match self.assistant_page() {
             Some(p) => p,
             None => {
                 let scope = if self.clusters.is_empty() {
