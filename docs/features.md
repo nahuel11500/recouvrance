@@ -14,7 +14,7 @@
 - **Shell** (exec with a real terminal), **node shell** (privileged pod, deleted when its shell
   ends or its page goes away) and **port-forward** for pods and services; forwards are remembered
   and restored with one click. Shells and attach need write mode (they run commands in the
-  cluster), and the context name typed on a protected context.
+  cluster), checked on every connect, and the context name typed on a protected context.
 - **RBAC-aware**: actions your Kubernetes RBAC forbids are disabled; *My access* shows a can-i
   matrix for the namespace, and says when the cluster (webhook or cloud IAM authorizer) may allow
   more than it lists.
