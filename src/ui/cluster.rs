@@ -161,15 +161,19 @@ struct PodLite {
 }
 
 #[derive(Deserialize, Default)]
-#[serde(default)]
+#[serde(default, rename_all = "camelCase")]
 struct PodSpecLite {
     containers: Vec<ContainerLite>,
+    init_containers: Vec<ContainerLite>,
+    overhead: HashMap<String, String>,
 }
 
 #[derive(Deserialize, Default)]
-#[serde(default)]
+#[serde(default, rename_all = "camelCase")]
 struct ContainerLite {
     resources: ResourcesLite,
+    /// `Always` on an init container: a sidecar.
+    restart_policy: String,
 }
 
 #[derive(Deserialize, Default)]
@@ -250,12 +254,21 @@ fn add_pods(s: &mut Summary, pods: &[PodLite]) {
             s.pods_running += 1;
         }
         if phase == "Running" || phase == "Pending" {
-            for c in &p.spec.containers {
-                let (requests, limits) = (&c.resources.requests, &c.resources.limits);
-                s.cpu.1 += requests.get("cpu").map(|q| k8s::parse_cpu(q)).unwrap_or(0.0);
-                s.mem.1 += requests.get("memory").map(|q| k8s::parse_bytes(q)).unwrap_or(0.0);
-                s.gpus.1 += gpu_count(limits);
-            }
+            let spec = &p.spec;
+            // As the scheduler counts: sidecars and init containers too, plus overhead.
+            let pod = |amount: &dyn Fn(&ContainerLite) -> f64| {
+                k8s::pod_amount(
+                    spec.containers.iter().map(amount).sum(),
+                    spec.init_containers.iter().map(|c| (c.restart_policy == "Always", amount(c))),
+                )
+            };
+            let request = |key: &str, parse: fn(&str) -> f64| {
+                pod(&|c| c.resources.requests.get(key).map(|q| parse(q)).unwrap_or(0.0))
+                    + spec.overhead.get(key).map(|q| parse(q)).unwrap_or(0.0)
+            };
+            s.cpu.1 += request("cpu", k8s::parse_cpu);
+            s.mem.1 += request("memory", k8s::parse_bytes);
+            s.gpus.1 += pod(&|c| gpu_count(&c.resources.limits));
         }
     }
 }
@@ -719,5 +732,27 @@ mod tests {
         assert_eq!(s.mem.1, 1024.0 * 1024.0 * 1024.0);
         assert_eq!(s.gpus, (2.0, 1.0));
         assert_eq!((s.pods_total, s.pods_running), (3, 1));
+    }
+
+    #[test]
+    fn requests_count_sidecars_init_containers_and_overhead() {
+        let pods: Vec<PodLite> = serde_json::from_value(serde_json::json!([
+            // A mesh sidecar adds to the app; overhead adds on top.
+            {"spec": {
+                "initContainers": [{"restartPolicy": "Always", "resources": {"requests": {"cpu": "100m", "memory": "128Mi"}}}],
+                "containers": [{"resources": {"requests": {"cpu": "500m", "memory": "1Gi"}}}],
+                "overhead": {"cpu": "50m"}},
+             "status": {"phase": "Running"}},
+            // A big init container sets the pod's request.
+            {"spec": {
+                "initContainers": [{"resources": {"requests": {"cpu": "2"}}}],
+                "containers": [{"resources": {"requests": {"cpu": "250m"}}}]},
+             "status": {"phase": "Pending"}}
+        ]))
+        .unwrap();
+        let mut s = Summary::default();
+        add_pods(&mut s, &pods);
+        assert_eq!(s.cpu.1, 650.0 + 2000.0);
+        assert_eq!(s.mem.1, (128.0 + 1024.0) * 1024.0 * 1024.0);
     }
 }
