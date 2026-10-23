@@ -337,15 +337,27 @@ fn binding_kind(namespaced: bool) -> k8s::Kind {
     }
 }
 
-/// A binding's name for a role and a subject; a ServiceAccount's namespace is part of it,
-/// so two ServiceAccounts with the same name don't get the same binding.
+/// A binding's name for a role and a subject: a readable part, with characters a name can't
+/// hold (`:`, `/`, `#` in OIDC user names) turned into `-`, and a short hash of the role and
+/// the subject's kind, namespace and name, so two subjects never get the same binding
+/// (ServiceAccount `x` in `team-a` and `a-x` in `team`, User and Group `alice`).
 fn binding_name(role: &str, subject: &serde_json::Value) -> String {
-    let name = subject["name"].as_str().unwrap_or_default();
-    let who = match subject["namespace"].as_str() {
-        Some(ns) => format!("{ns}-{name}"),
-        None => name.to_string(),
-    };
-    format!("{role}-{}", who.replace(':', "-")).chars().take(63).collect()
+    use sha2::{Digest, Sha256};
+    let field = |k: &str| subject[k].as_str().unwrap_or_default();
+    let (kind, ns, name) = (field("kind"), field("namespace"), field("name"));
+    let readable: String = [role, ns, name]
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("-")
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '.' { c.to_ascii_lowercase() } else { '-' })
+        // RBAC names may be 253 characters long; leave room for the hash.
+        .take(240)
+        .collect();
+    let digest = Sha256::digest(format!("{role}\n{kind}\n{ns}\n{name}").as_bytes());
+    let hash: String = digest.iter().take(4).map(|b| format!("{b:02x}")).collect();
+    format!("{readable}-{hash}")
 }
 
 /// The patch that sets a binding's subjects, with the resourceVersion they were read at:
@@ -408,9 +420,28 @@ mod tests {
         assert!(subject_of("Robot", "x", "").is_none());
         assert_eq!(subject_of("ServiceAccount", "ci", "team").unwrap()["namespace"], "team");
         let user = subject_of("User", "system:serviceaccount:a:b", "").unwrap();
-        assert_eq!(binding_name("view", &user), "view-system-serviceaccount-a-b");
+        assert!(binding_name("view", &user).starts_with("view-system-serviceaccount-a-b-"));
         let sa = |ns: &str| binding_name("view", &subject_of("ServiceAccount", "default", ns).unwrap());
-        assert_eq!(sa("a"), "view-a-default");
+        assert!(sa("a").starts_with("view-a-default-"));
         assert_ne!(sa("a"), sa("b"));
+    }
+
+    #[test]
+    fn binding_names_dont_collide() {
+        let name = |kind: &str, name: &str, ns: &str| binding_name("view", &subject_of(kind, name, ns).unwrap());
+        // The same readable part for different subjects.
+        assert_ne!(name("ServiceAccount", "x", "team-a"), name("ServiceAccount", "a-x", "team"));
+        assert_ne!(name("User", "alice", ""), name("Group", "alice", ""));
+        // The same subject always gets the same name.
+        assert_eq!(name("User", "alice", ""), name("User", "alice", ""));
+        // Long names stay apart after the cut, within the 253-character limit.
+        let long = "a".repeat(300);
+        let (one, two) = (name("User", &format!("{long}1"), ""), name("User", &format!("{long}2"), ""));
+        assert_ne!(one, two);
+        assert!(one.len() <= 253);
+        // An OIDC user name: only characters a name may hold.
+        let oidc = name("User", "https://issuer#Sub", "");
+        assert!(oidc.starts_with("view-https---issuer-sub-"));
+        assert!(oidc.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '.'));
     }
 }
