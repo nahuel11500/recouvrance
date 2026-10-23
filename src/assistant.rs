@@ -615,8 +615,11 @@ async fn ask_api(
             let api = anthropic_url();
             let (_, text) = post(&format!("{api}/v1/messages"), &headers, &body).await?;
             let resp: Value = serde_json::from_str(&text)?;
-            let content = resp["content"].as_array().cloned().unwrap_or_default();
-            messages.push(json!({"role": "assistant", "content": content}));
+            let cut_off = resp["stop_reason"] == "max_tokens";
+            let content = reply_content(&resp);
+            if !content.is_empty() {
+                messages.push(json!({"role": "assistant", "content": content}));
+            }
             let mut results = Vec::new();
             for block in &content {
                 match block["type"].as_str() {
@@ -631,7 +634,10 @@ async fn ask_api(
                     _ => {}
                 }
             }
-            if resp["stop_reason"] != "tool_use" || results.is_empty() {
+            if cut_off {
+                on_step(Step::Text("(the reply was cut off)".into()));
+            }
+            if results.is_empty() {
                 return Ok(messages);
             }
             messages.push(json!({"role": "user", "content": results}));
@@ -642,8 +648,31 @@ async fn ask_api(
     .await
 }
 
+/// The blocks of an API reply worth keeping. Tool calls count only when the reply stopped
+/// to run them: one cut off (max_tokens) may be incomplete, and is neither run nor kept
+/// (a kept call with no result would break every later question).
+fn reply_content(resp: &Value) -> Vec<Value> {
+    let mut content = resp["content"].as_array().cloned().unwrap_or_default();
+    if resp["stop_reason"] != "tool_use" {
+        content.retain(|b| b["type"] != "tool_use");
+    }
+    content
+}
+
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
+    #[test]
+    fn cut_off_tool_calls_are_dropped() {
+        let text = json!({"type": "text", "text": "Let me look"});
+        let call = json!({"type": "tool_use", "id": "t1", "name": "list_resources", "input": {}});
+        let reply = |stop: &str| json!({"stop_reason": stop, "content": [text.clone(), call.clone()]});
+        assert_eq!(super::reply_content(&reply("tool_use")), vec![text.clone(), call.clone()]);
+        assert_eq!(super::reply_content(&reply("max_tokens")), vec![text.clone()]);
+        assert!(super::reply_content(&json!({"stop_reason": "max_tokens", "content": [call]})).is_empty());
+    }
+
     #[test]
     fn parses_sse_and_json() {
         let sse = "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[1]}}\n\n";

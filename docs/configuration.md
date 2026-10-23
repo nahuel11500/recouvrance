@@ -113,7 +113,9 @@ an exec command may run, default 30).
 A rule is `VERBS RESOURCES[/NAMES] [-n NAMESPACES] [--context CONTEXTS] [until TIME]`. Lists are
 comma-separated, `*` globs work everywhere, an omitted part means `*`, and `-` is an empty list
 (the rule matches nothing; an exported rule with nothing chosen yet is written that way). Deny wins, then ask,
-then allow; anything no rule matches is denied. The file is reloaded when it changes.
+then allow; anything no rule matches is denied. `approved` lists the requests you approved with
+*Always allow this* or *Allow for 1h*: they are allowed even where an ask rule matches, never where a
+deny rule does. The file is reloaded when it changes.
 
 ## plugins.yaml
 

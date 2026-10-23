@@ -50,11 +50,18 @@ impl AppView {
                 target: Target::Context(c.clone()),
             });
         }
+        // With several clusters, objects say which one they are on.
+        let names: std::rc::Rc<Vec<String>> = std::rc::Rc::new(self.clusters.iter().map(|(c, _)| c.clone()).collect());
         for o in self.favorites.read(cx).objects() {
             if let Some(ctx) = self.clusters.iter().position(|(c, _)| *c == o.context) {
                 items.push(PaletteItem {
                     label: o.name.clone(),
-                    detail: format!("★ {} · {}", o.kind, o.namespace.clone().unwrap_or_default()),
+                    detail: format!(
+                        "★ {} · {}{}",
+                        o.kind,
+                        o.namespace.clone().unwrap_or_default(),
+                        on_cluster(&names, ctx)
+                    ),
                     icon: Lucide::Star,
                     target: Target::Object {
                         ctx,
@@ -72,7 +79,12 @@ impl AppView {
                 let (Some(row), Some(ctx)) = (t.row(ix), t.row_context(ix)) else { continue };
                 items.push(PaletteItem {
                     label: row.name.clone(),
-                    detail: format!("{} · {}", kind.label, row.namespace.clone().unwrap_or_default()),
+                    detail: format!(
+                        "{} · {}{}",
+                        kind.label,
+                        row.namespace.clone().unwrap_or_default(),
+                        on_cluster(&names, ctx)
+                    ),
                     icon: section_icon(kind.section),
                     target: Target::Object {
                         ctx,
@@ -83,15 +95,16 @@ impl AppView {
                 });
             }
         }
-        let index_items = |entries: &[IndexEntry]| -> Vec<PaletteItem> {
+        let index_items = move |entries: &[IndexEntry]| -> Vec<PaletteItem> {
             entries
                 .iter()
                 .map(|e| PaletteItem {
                     label: e.name.clone(),
                     detail: format!(
-                        "{}{}",
+                        "{}{}{}",
                         e.label,
-                        e.namespace.as_ref().map(|n| format!(" · {n}")).unwrap_or_default()
+                        e.namespace.as_ref().map(|n| format!(" · {n}")).unwrap_or_default(),
+                        on_cluster(&names, e.ctx)
                     ),
                     icon: e.icon,
                     target: Target::Object {
@@ -118,6 +131,7 @@ impl AppView {
                 for kind_name in SEARCH_KINDS {
                     let Some(kind) = k8s::find_kind(&self.kinds, kind_name).cloned() else { continue };
                     let (client, palette, done) = (client.clone(), palette.downgrade(), done.clone());
+                    let index_items = index_items.clone();
                     self._index_tasks.push(cx.spawn(async move |this, cx| {
                         let names = k8s::list_names(client, kind.ar.clone()).await.unwrap_or_default();
                         let entries: Vec<IndexEntry> = names
@@ -379,5 +393,13 @@ impl AppView {
                         ),
                 ),
         )
+    }
+}
+
+/// " · <context>" for an object on cluster `ctx`, when several are connected.
+fn on_cluster(names: &[String], ctx: usize) -> String {
+    match names.get(ctx) {
+        Some(name) if names.len() > 1 => format!(" · {name}"),
+        _ => String::new(),
     }
 }
