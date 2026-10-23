@@ -36,13 +36,8 @@ impl AppView {
             self.choose_namespaces(t.namespaces, cx);
             restart = true;
         }
-        // `apply_route` would switch to the route's kind anyway.
-        let kind = match self.route() {
-            Route::Resources(Some(k)) => Some(k.clone()),
-            _ => t.kind,
-        };
-        if kind.is_some() && kind.as_ref().map(|k| k.key()) != self.kind.as_ref().map(|k| k.key()) {
-            self.kind = kind;
+        if let Some(kind) = new_kind(self.route(), t.kind, self.kind.as_ref()) {
+            self.kind = Some(kind);
             restart = true;
         }
         if restart {
@@ -250,5 +245,46 @@ impl AppView {
             self.restart_watch(cx);
         }
         cx.notify();
+    }
+}
+
+/// The kind a tab shows, when it is not `current`: its route's, else the one it kept.
+/// Taken from the route, `apply_route` has nothing left to switch (and restart).
+fn new_kind(route: &Route, kept: Option<Kind>, current: Option<&Kind>) -> Option<Kind> {
+    let kind = match route {
+        Route::Resources(Some(k)) => Some(k.clone()),
+        _ => kept,
+    }?;
+    (Some(kind.key()) != current.map(|k| k.key())).then_some(kind)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Kind, Route, new_kind};
+
+    fn kind(k: &str) -> Kind {
+        Kind {
+            ar: kube::discovery::ApiResource {
+                group: "".into(),
+                version: "v1".into(),
+                api_version: "v1".into(),
+                kind: k.into(),
+                plural: format!("{}s", k.to_lowercase()),
+            },
+            namespaced: true,
+            section: "",
+            label: k.into(),
+        }
+    }
+
+    #[test]
+    fn a_tab_switches_kind_once() {
+        let (pods, deploys) = (kind("Pod"), kind("Deployment"));
+        let list = Route::Resources(Some(pods.clone()));
+        // The route's kind, so showing the route doesn't switch (and restart) again.
+        assert_eq!(new_kind(&list, Some(deploys.clone()), Some(&deploys)).map(|k| k.label), Some("Pod".into()));
+        assert!(new_kind(&list, Some(pods.clone()), Some(&pods)).is_none());
+        assert_eq!(new_kind(&Route::Contexts, Some(pods), Some(&deploys)).map(|k| k.label), Some("Pod".into()));
+        assert!(new_kind(&Route::Contexts, None, Some(&deploys)).is_none());
     }
 }
