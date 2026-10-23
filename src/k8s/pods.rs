@@ -205,10 +205,12 @@ pub fn stream_logs(
     let (tx, rx) = mpsc::unbounded();
     let guard = spawn_guarded(async move {
         let api: Api<Pod> = Api::namespaced(client, &ns);
-        let mut last_seen: Option<jiff::Timestamp> = None;
+        let mut shown = Shown::default();
         let mut failures = 0u32;
         loop {
-            let lp = stream_params(container.clone(), previous, since_seconds, last_seen);
+            let lp = stream_params(container.clone(), previous, since_seconds, shown.newest);
+            // A reconnect asks from the second of the newest line shown: those lines come again.
+            let mut repeats = shown.repeats();
             let outcome: Result<()> = async {
                 let reader = api.log_stream(&pod, &lp).await?;
                 let mut lines = std::pin::pin!(lossy_lines(reader, MAX_LINE_BYTES).ready_chunks(500));
@@ -224,11 +226,8 @@ pub fn stream_logs(
                             }
                         }
                     }
-                    // After a reconnect, lines up to the last one seen come again.
-                    let out = unseen(out, last_seen);
-                    if let Some(t) = out.iter().rev().find_map(|l| line_time(l)) {
-                        last_seen = Some(t);
-                    }
+                    let out = drop_repeats(out, &mut repeats);
+                    shown.note(&out);
                     if !out.is_empty() {
                         failures = 0;
                         tx.unbounded_send(LogMsg::Lines(out))?;
@@ -266,12 +265,69 @@ pub fn stream_logs(
     (guard, rx)
 }
 
-/// Lines newer than `seen` (all of them when nothing was seen; lines without a time stay).
-fn unseen(lines: Vec<String>, seen: Option<jiff::Timestamp>) -> Vec<String> {
-    match seen {
-        None => lines,
-        Some(seen) => lines.into_iter().filter(|l| line_time(l).is_none_or(|t| t > seen)).collect(),
+/// What a followed stream has shown: its newest line's time, and the lines (hashed) since
+/// the start of that second, which a reconnect from that second sends again.
+#[derive(Default)]
+struct Shown {
+    newest: Option<jiff::Timestamp>,
+    lines: Vec<(jiff::Timestamp, u64)>,
+}
+
+impl Shown {
+    /// Note lines just shown.
+    fn note(&mut self, lines: &[String]) {
+        for line in lines {
+            let Some(t) = line_time(line) else { continue };
+            let second = self.newest.map(|n| n.as_second());
+            if self.newest.is_none_or(|n| t > n) {
+                self.newest = Some(t);
+                if second != Some(t.as_second()) {
+                    self.lines.retain(|(l, _)| l.as_second() >= t.as_second());
+                }
+            }
+            if self.newest.is_some_and(|n| t.as_second() >= n.as_second()) {
+                self.lines.push((t, line_hash(line)));
+            }
+        }
     }
+
+    /// How many times each line shown comes again after a reconnect.
+    fn repeats(&self) -> std::collections::HashMap<u64, usize> {
+        let mut out = std::collections::HashMap::new();
+        for (_, h) in &self.lines {
+            *out.entry(*h).or_insert(0) += 1;
+        }
+        out
+    }
+}
+
+/// A line's hash, to recognize it when it comes again.
+fn line_hash(line: &str) -> u64 {
+    use std::hash::{Hash as _, Hasher as _};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    line.hash(&mut h);
+    h.finish()
+}
+
+/// `lines` without the ones already shown before a reconnect. Lines are matched whole
+/// (time included), so lines sharing a time, or out of time order (stdout and stderr),
+/// are neither lost nor shown twice.
+fn drop_repeats(lines: Vec<String>, repeats: &mut std::collections::HashMap<u64, usize>) -> Vec<String> {
+    if repeats.is_empty() {
+        return lines;
+    }
+    lines
+        .into_iter()
+        .filter(|l| {
+            let h = line_hash(l);
+            let Some(n) = repeats.get_mut(&h) else { return true };
+            *n -= 1;
+            if *n == 0 {
+                repeats.remove(&h);
+            }
+            false
+        })
+        .collect()
 }
 
 /// Lines split on `\n`, decoded leniently: a log line with invalid UTF-8 shows
@@ -386,9 +442,18 @@ mod tests {
     fn reconnects_resume_after_the_last_line() {
         let t = |s: i64| jiff::Timestamp::from_second(1_700_000_000 + s).unwrap();
         let line = |s: i64, text: &str| format!("{} {text}", t(s));
-        let got = super::unseen(vec![line(1, "old"), line(2, "seen"), line(3, "new"), "no time".into()], Some(t(2)));
-        assert_eq!(got, [line(3, "new"), "no time".to_string()]);
-        assert_eq!(super::unseen(vec![line(1, "a")], None).len(), 1);
+        // CRI-O stamps a whole read with one time; stderr can be stamped before stdout.
+        let mut shown = super::Shown::default();
+        shown.note(&[line(0, "older second"), line(2, "a"), line(2, "b")]);
+        shown.note(&[line(2, "b"), line(3, "stdout"), line(2, "stderr")]);
+        assert_eq!(shown.newest, Some(t(3)));
+        // The reconnect from second 3 sends that second's lines again, then new ones.
+        let mut repeats = shown.repeats();
+        let got = super::drop_repeats(vec![line(3, "stdout")], &mut repeats);
+        assert!(got.is_empty());
+        let got = super::drop_repeats(vec![line(3, "new"), line(3, "stdout"), "no time".into()], &mut repeats);
+        assert_eq!(got, [line(3, "new"), line(3, "stdout"), "no time".to_string()]);
+        assert_eq!(super::drop_repeats(vec![line(1, "a")], &mut Default::default()).len(), 1);
         // Resuming asks from the whole second of the last line, without a tail.
         let resume: jiff::Timestamp = "2024-01-01T00:00:05.75Z".parse().unwrap();
         let lp = super::stream_params(None, false, Some(60), Some(resume));
