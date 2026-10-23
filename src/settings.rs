@@ -105,6 +105,10 @@ pub struct Settings {
     pub assistant_model: String,
     /// auto (Claude Code if installed, else API key), claude-code or api.
     pub assistant_backend: String,
+    /// The team's notes given to the assistant: where things run, dashboards, runbooks, repos.
+    pub assistant_notes: String,
+    /// Folders of the team's code the assistant may read (Claude Code only).
+    pub assistant_repos: Vec<String>,
     /// Read metrics-server and Prometheus (off: no usage columns or charts).
     pub metrics_enabled: bool,
     /// Accent color name (see `ACCENTS`).
@@ -243,6 +247,8 @@ impl Default for Settings {
             saved_forwards: Vec::new(),
             assistant_model: crate::assistant::DEFAULT_MODEL.into(),
             assistant_backend: "auto".into(),
+            assistant_notes: String::new(),
+            assistant_repos: Vec::new(),
             metrics_enabled: true,
             accent: "brass".into(),
             filter_history: Vec::new(),
