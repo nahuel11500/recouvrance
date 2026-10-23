@@ -297,7 +297,7 @@ fn load_from(p: &Path) -> (Settings, Option<String>) {
     let settings = match serde_json::from_slice(&bytes) {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("{}: {e}; fields that don't read use their defaults ({})", p.display(), keep_aside(&p));
+            eprintln!("{}: {e}; fields that don't read use their defaults ({})", p.display(), keep_aside(p));
             by_field(&bytes).unwrap_or_default()
         }
     };
