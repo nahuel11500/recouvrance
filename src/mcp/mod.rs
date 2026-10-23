@@ -133,6 +133,8 @@ pub struct Access {
     /// None for cluster-scoped objects, or for "any namespace" checks.
     pub namespace: Option<String>,
     pub name: Option<String>,
+    /// The kind is cluster-scoped, so a None namespace is not "every namespace".
+    pub cluster_scoped: bool,
 }
 
 /// Whether a pattern matches, the way rules match: trimmed, ignoring case.
@@ -543,8 +545,9 @@ impl Approval {
     /// None for exec (a rule cannot pin the command), patches and GitOps actions (the rule
     /// would allow any patch), scale (it would allow any replica count, 0 too), apply (the
     /// rule could not pin the content), a write with no object name (the rule would cover
-    /// every name) and dry runs (a rule cannot be limited to dry runs, so it would allow
-    /// the real write).
+    /// every name), a request across all namespaces (the rule would also cover namespaces
+    /// no rule allows) and dry runs (a rule cannot be limited to dry runs, so it would
+    /// allow the real write).
     pub fn as_rule(&self) -> Option<Rule> {
         let a = &self.access;
         if matches!(a.verb.as_str(), "exec" | "patch" | "scale")
@@ -552,6 +555,7 @@ impl Approval {
             || self.tool == "apply_manifest"
             || self.dry_run
             || (is_write(&a.verb) && a.name.is_none())
+            || (a.namespace.is_none() && !a.cluster_scoped)
         {
             return None;
         }
@@ -1131,6 +1135,7 @@ mod tests {
             resource_aliases: vec![],
             namespace: ns.map(String::from),
             name: name.map(String::from),
+            cluster_scoped: false,
         }
     }
 
@@ -1362,6 +1367,13 @@ mod tests {
         assert!(approval("apply_manifest", "apply", Some("web")).as_rule().is_none());
         assert!(approval("list_resources", "list", None).as_rule().is_some());
         assert!(approval("delete_resource", "delete", Some("web")).as_rule().is_some());
+        // Across all namespaces, a rule would also cover namespaces no rule allows.
+        let everywhere = |cluster_scoped| Approval {
+            access: Access { cluster_scoped, ..access("c1", "list", "pods", None, None) },
+            ..approval("list_resources", "list", None)
+        };
+        assert!(everywhere(false).as_rule().is_none() && everywhere(false).as_rule_for_an_hour().is_none());
+        assert!(everywhere(true).as_rule().is_some());
         // Approving a dry run must not allow the real write.
         let dry = Approval { dry_run: true, ..approval("delete_resource", "delete", Some("web")) };
         assert!(dry.as_rule().is_none() && dry.as_rule_for_an_hour().is_none());

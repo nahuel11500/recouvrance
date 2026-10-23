@@ -267,6 +267,7 @@ impl AgentsView {
             resource_aliases: vec![],
             namespace: (!namespace.is_empty()).then_some(namespace),
             name: (!name.is_empty()).then_some(name),
+            cluster_scoped: false,
         };
         let verdict = (!context.is_empty() && !resource.is_empty()).then(|| agent.policy.decide(&access));
         let verbs = h_flex().flex_wrap().gap_1().children(VERBS.iter().filter(|(v, _)| *v != "*").enumerate().map(
