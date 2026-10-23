@@ -45,6 +45,8 @@ pub struct TerminalView {
     guard: Option<String>,
     /// The context name was typed once for this terminal (write mode is checked every time).
     authorized: bool,
+    /// Its command ran once and can't be started again from here (a writing plugin).
+    once: bool,
 }
 
 /// The session ended: the remote side exited or the user closed it.
@@ -81,6 +83,7 @@ impl TerminalView {
             session: None,
             guard: None,
             authorized: false,
+            once: false,
         }
     }
 
@@ -98,6 +101,12 @@ impl TerminalView {
         self
     }
 
+    /// No Reconnect: the command runs once, and again only from where it was asked for.
+    pub fn run_once(mut self) -> Self {
+        self.once = true;
+        self
+    }
+
     /// A session is open and accepts input.
     pub fn connected(&self) -> bool {
         self.input.is_some()
@@ -105,6 +114,9 @@ impl TerminalView {
 
     /// Connect (or attach) from a button, after the guard when there is one.
     fn request(&mut self, attach: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.once {
+            return;
+        }
         let start = move |this: &mut Self, window: &mut Window, cx: &mut Context<Self>| {
             if attach {
                 this.start_attach(window, cx);
@@ -321,6 +333,16 @@ impl Render for TerminalView {
         let cell_w = window.text_system().advance(font_id, font_size, 'm').map(|s| s.width).unwrap_or(px(7.2));
         let cell = size(cell_w, (font_size * 1.35).round());
 
+        if self.session.is_none() && self.once {
+            return v_flex()
+                .size_full()
+                .items_center()
+                .justify_center()
+                .child(
+                    div().text_sm().text_color(theme.muted_foreground).child("Run the plugin again from its button."),
+                )
+                .into_any_element();
+        }
         if self.session.is_none() {
             let (warning, muted) = (theme.warning, theme.muted_foreground);
             let target = match &self.local {
@@ -470,7 +492,7 @@ impl Render for TerminalView {
             )
             .when_some(self.status.clone(), |d, s| {
                 d.child(h_flex().gap_2().text_xs().text_color(cx.theme().muted_foreground).child(s).when(
-                    self.input.is_none(),
+                    self.input.is_none() && !self.once,
                     |d| {
                         d.child(Button::new("reconnect").xsmall().ghost().label("Reconnect").on_click(cx.listener(
                             |this, _, window, cx| {

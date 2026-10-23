@@ -342,9 +342,12 @@ impl DetailPanel {
                 .child(confirm_extras(&command, guard.as_ref(), cx))
                 .show_cancel(true)
                 .ok_text("Run")
-                .on_ok(move |_, _, cx| {
+                .on_ok(move |_, window, cx| {
                     if !guard_ok(guard.as_ref(), cx) {
                         return false;
+                    }
+                    if writes && !writes_still_on(window, cx) {
+                        return true;
                     }
                     if let Some(ev) = ev.borrow_mut().take() {
                         let _ = panel.update(cx, |_, cx| cx.emit(ev));
