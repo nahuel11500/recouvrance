@@ -308,7 +308,14 @@ async fn start_node_shell(client: Client, node: String, image: String, dry_run: 
             },
         }))?;
         let pp = kube::api::PostParams { dry_run, ..Default::default() };
-        api.create(&pp, &pod).await?;
+        if let Err(e) = api.create(&pp, &pod).await {
+            // The server may have stored it before the answer was lost (a timeout, a dropped
+            // connection, a 504 from a load balancer): the name is ours alone, so delete it.
+            if !dry_run && may_have_stored(&e) {
+                remove_node_shell(&api, &name).await;
+            }
+            return Err(e.into());
+        }
         if dry_run {
             return Ok(format!("[dry run] node shell pod {name} accepted on {}", NODE_SHELL_NS));
         }
@@ -320,6 +327,12 @@ async fn start_node_shell(client: Client, node: String, image: String, dry_run: 
         started.map(|()| name)
     })
     .await
+}
+
+/// A create that failed with this error may still have stored the object: only a refusal
+/// (a 4xx other than a conflict) says for sure it did not.
+fn may_have_stored(e: &kube::Error) -> bool {
+    !matches!(e, kube::Error::Api(s) if (400..500).contains(&s.code) && s.code != 409)
 }
 
 /// Wait for a node shell pod to run, or say why it will not.
@@ -608,6 +621,19 @@ pub async fn create(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_node_shell_is_cleaned_up_unless_the_create_was_refused() {
+        let api = |code| kube::Error::Api(kube::core::Status::failure("x", "x").with_code(code).boxed());
+        for refused in [400, 403, 404, 422, 429] {
+            assert!(!may_have_stored(&api(refused)), "{refused}");
+        }
+        for unsure in [409, 500, 504] {
+            assert!(may_have_stored(&api(unsure)), "{unsure}");
+        }
+        // No answer at all (a timeout, a dropped connection).
+        assert!(may_have_stored(&kube::Error::Service("timed out".into())));
+    }
 
     #[test]
     fn deletes_are_pinned_to_the_object_picked() {
