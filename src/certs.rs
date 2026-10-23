@@ -13,6 +13,13 @@ pub struct CertInfo {
     pub is_ca: bool,
 }
 
+impl CertInfo {
+    /// Its validity starts after `now` (a clock skew when it was issued): clients reject it.
+    pub fn not_yet_valid(&self, now: jiff::Timestamp) -> bool {
+        self.not_before.is_some_and(|t| t > now)
+    }
+}
+
 /// Every certificate in a PEM bundle; empty when the text holds none.
 pub fn parse_pem(text: &[u8]) -> Vec<CertInfo> {
     let Ok(blocks) = pem::parse_many(text) else { return Vec::new() };
@@ -69,5 +76,14 @@ mod tests {
         assert!(c.sans.contains(&"10.0.0.1".to_string()));
         assert!(c.not_after.is_some_and(|t| t > c.not_before.unwrap()));
         assert!(super::parse_pem(b"not a cert").is_empty());
+    }
+
+    #[test]
+    fn not_yet_valid_before_not_before() {
+        let c = super::parse_pem(PEM.as_bytes()).remove(0);
+        let start = c.not_before.unwrap();
+        assert!(c.not_yet_valid(start - jiff::SignedDuration::from_hours(1)));
+        assert!(!c.not_yet_valid(start));
+        assert!(!c.not_yet_valid(start + jiff::SignedDuration::from_hours(1)));
     }
 }

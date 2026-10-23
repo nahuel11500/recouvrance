@@ -119,6 +119,9 @@ pub struct Settings {
     pub clusters: std::collections::HashMap<String, ClusterSettings>,
     /// Folders whose kubeconfig files are all merged (watched for changes).
     pub kubeconfig_folders: Vec<String>,
+    /// Which kubeconfig file keeps a context name that several files have: the first one
+    /// seen. The others' contexts are `name@file`, whatever order the files are read in.
+    pub context_files: std::collections::BTreeMap<String, String>,
     /// Open the browser after a one-click port-forward on a web port.
     pub open_browser_on_forward: bool,
     /// Port-forwards started recently, newest first (offered again in the sidebar).
@@ -238,6 +241,7 @@ impl Default for Settings {
             extra_namespaces: Default::default(),
             clusters: Default::default(),
             kubeconfig_folders: Vec::new(),
+            context_files: Default::default(),
             open_browser_on_forward: true,
             recent_forwards: Vec::new(),
             delete_confirm: DeleteConfirm::Ask,

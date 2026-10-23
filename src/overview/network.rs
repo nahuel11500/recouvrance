@@ -111,6 +111,21 @@ pub(super) fn gw_ref(ctx: &Ctx, r: &Value, default_group: &str, default_kind: &s
     }
 }
 
+/// Whether a route's status `parentRef` is this `spec.parentRefs` entry: the same gateway
+/// (group, kind, namespace and name, with their defaults) and the same listener (section, port).
+fn same_parent(spec: &Value, status: &Value, route_ns: Option<&str>) -> bool {
+    let str_or = |r: &Value, key: &str, default: Option<&str>| r[key].as_str().or(default).map(String::from);
+    let group = |r: &Value| str_or(r, "group", Some("gateway.networking.k8s.io"));
+    let kind = |r: &Value| str_or(r, "kind", Some("Gateway"));
+    let ns = |r: &Value| str_or(r, "namespace", route_ns);
+    spec["name"] == status["name"]
+        && group(spec) == group(status)
+        && kind(spec) == kind(status)
+        && ns(spec) == ns(status)
+        && spec["sectionName"] == status["sectionName"]
+        && spec["port"] == status["port"]
+}
+
 pub(super) fn condition_ok(conds: &[Value], ty: &str) -> Option<bool> {
     conds.iter().find(|c| c["type"] == ty).map(|c| c["status"] == "True")
 }
@@ -232,7 +247,7 @@ pub(super) fn route(ctx: &Ctx, cx: &App) -> Div {
         arr(obj, "/spec/hostnames").iter().filter_map(|h| h.as_str().map(String::from)).collect();
     let parents_status = arr(obj, "/status/parents");
     let parents = arr(obj, "/spec/parentRefs").iter().map(|p| {
-        let st = parents_status.iter().find(|s| s.pointer("/parentRef/name") == p.get("name"));
+        let st = parents_status.iter().find(|s| same_parent(p, &s["parentRef"], ctx.ns().as_deref()));
         let conds = st.map(|s| arr(s, "/conditions")).unwrap_or_default();
         let accepted = condition_ok(conds, "Accepted");
         let resolved = condition_ok(conds, "ResolvedRefs");
@@ -397,22 +412,7 @@ pub(super) fn netpol(ctx: &Ctx, cx: &App) -> Div {
         }
     };
     let ports = |r: &Value| -> String {
-        let p: Vec<String> = r["ports"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .map(|p| {
-                format!(
-                    "{}/{}",
-                    p["port"]
-                        .as_i64()
-                        .map(|n| n.to_string())
-                        .or_else(|| p["port"].as_str().map(String::from))
-                        .unwrap_or("*".into()),
-                    p["protocol"].as_str().unwrap_or("TCP")
-                )
-            })
-            .collect();
+        let p: Vec<String> = r["ports"].as_array().into_iter().flatten().map(netpol_port).collect();
         if p.is_empty() { "all ports".into() } else { p.join(", ") }
     };
     let section = |title: &str, key: &str, peers_key: &str, empty: &str| {
@@ -455,6 +455,17 @@ pub(super) fn netpol(ctx: &Ctx, cx: &App) -> Div {
         .child(section("Egress", "egress", "to", "All outgoing traffic is denied."))
 }
 
+/// One NetworkPolicy port: `80/TCP`, `http/TCP`, a range `8000-9000/TCP`, or `*/UDP` for any port.
+fn netpol_port(p: &Value) -> String {
+    let port = p["port"]
+        .as_i64()
+        .map(|n| n.to_string())
+        .or_else(|| p["port"].as_str().map(String::from))
+        .unwrap_or("*".into());
+    let end = p["endPort"].as_i64().map(|n| format!("-{n}")).unwrap_or_default();
+    format!("{port}{end}/{}", p["protocol"].as_str().unwrap_or("TCP"))
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -468,5 +479,28 @@ mod tests {
         let only = json!({"podSelector": {"matchExpressions": [{"key": "tier", "operator": "Exists"}]}});
         assert_eq!(super::selector_terms(&only, "/podSelector"), ["tier"]);
         assert!(super::selector_terms(&json!({"podSelector": {}}), "/podSelector").is_empty());
+    }
+
+    #[test]
+    fn netpol_port_shows_ranges() {
+        assert_eq!(super::netpol_port(&json!({"port": 8000, "endPort": 9000})), "8000-9000/TCP");
+        assert_eq!(super::netpol_port(&json!({"port": 53, "protocol": "UDP"})), "53/UDP");
+        assert_eq!(super::netpol_port(&json!({"port": "http"})), "http/TCP");
+        assert_eq!(super::netpol_port(&json!({"protocol": "SCTP"})), "*/SCTP");
+    }
+
+    #[test]
+    fn route_parent_status_matches_the_listener() {
+        let http = json!({"name": "gw", "sectionName": "http"});
+        let https = json!({"name": "gw", "sectionName": "https"});
+        let status = json!({"group": "gateway.networking.k8s.io", "kind": "Gateway", "namespace": "web",
+            "name": "gw", "sectionName": "https"});
+        assert!(super::same_parent(&https, &status, Some("web")));
+        assert!(!super::same_parent(&http, &status, Some("web")));
+        let other_ns = json!({"name": "gw", "namespace": "infra", "sectionName": "https"});
+        assert!(!super::same_parent(&other_ns, &status, Some("web")));
+        let port = json!({"name": "gw", "port": 443});
+        assert!(super::same_parent(&port, &json!({"name": "gw", "port": 443}), Some("web")));
+        assert!(!super::same_parent(&port, &json!({"name": "gw", "port": 80}), Some("web")));
     }
 }

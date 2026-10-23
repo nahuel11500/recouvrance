@@ -26,15 +26,16 @@ pub(super) fn certificates(data: &serde_json::Map<String, Value>, base64: bool, 
     let now = jiff::Timestamp::now();
     Some(v_flex().child(heading(&format!("Certificates ({})", certs.len()))).children(certs.into_iter().map(
         |(key, c)| {
+            let date = |t: Option<jiff::Timestamp>| {
+                t.map(|t| t.strftime("%Y-%m-%d %H:%M UTC").to_string()).unwrap_or_else(|| "-".into())
+            };
             let (state, color) = match c.not_after.map(|t| days_left(t, now)) {
+                _ if c.not_yet_valid(now) => (format!("not valid until {}", date(c.not_before)), theme.danger),
                 Some(d) if d < 0 => (format!("expired {} ago", days(-d)), theme.danger),
                 Some(d) if d < 14 => (format!("expires in {}", days(d)), theme.danger),
                 Some(d) if d < 30 => (format!("expires in {}", days(d)), theme.warning),
                 Some(d) => (format!("valid, {} left", days(d)), theme.success),
                 None => ("unknown validity".into(), theme.muted_foreground),
-            };
-            let date = |t: Option<jiff::Timestamp>| {
-                t.map(|t| t.strftime("%Y-%m-%d %H:%M UTC").to_string()).unwrap_or_else(|| "-".into())
             };
             v_flex()
                 .p_3()

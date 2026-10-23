@@ -107,12 +107,18 @@ pub async fn rbac_snapshot(client: Client, ns: Option<String>) -> crate::rbac::S
         list_values(client.clone(), ar_of::<rbac::RoleBinding>(), ns, None),
         list_values(client, ar_of::<rbac::ClusterRoleBinding>(), None, None),
     );
-    crate::rbac::Snapshot {
-        roles: roles.unwrap_or_default(),
-        cluster_roles: cluster_roles.unwrap_or_default(),
-        role_bindings: role_bindings.unwrap_or_default(),
-        cluster_role_bindings: cluster_role_bindings.unwrap_or_default(),
-    }
+    let mut errors = Vec::new();
+    let mut keep = |list: &'static str, result: Result<Vec<serde_json::Value>>| {
+        result.unwrap_or_else(|e| {
+            errors.push((list, lists::load_error(&e)));
+            Vec::new()
+        })
+    };
+    let roles = keep("Roles", roles);
+    let cluster_roles = keep("ClusterRoles", cluster_roles);
+    let role_bindings = keep("RoleBindings", role_bindings);
+    let cluster_role_bindings = keep("ClusterRoleBindings", cluster_role_bindings);
+    crate::rbac::Snapshot { roles, cluster_roles, role_bindings, cluster_role_bindings, errors }
 }
 
 #[cfg(test)]
