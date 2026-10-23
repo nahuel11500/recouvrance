@@ -544,17 +544,17 @@ impl Approval {
     /// A narrow Allow rule for exactly this request, when a rule can be that narrow.
     /// None for exec (a rule cannot pin the command), patches and GitOps actions (the rule
     /// would allow any patch), scale (it would allow any replica count, 0 too), apply (the
-    /// rule could not pin the content), a write with no object name (the rule would cover
-    /// every name), a request across all namespaces (the rule would also cover namespaces
-    /// no rule allows) and dry runs (a rule cannot be limited to dry runs, so it would
-    /// allow the real write).
+    /// rule could not pin the content), a request other than a list with no object name
+    /// (the rule would cover every name), a request across all namespaces (the rule would
+    /// also cover namespaces no rule allows) and dry runs (a rule cannot be limited to dry
+    /// runs, so it would allow the real write).
     pub fn as_rule(&self) -> Option<Rule> {
         let a = &self.access;
         if matches!(a.verb.as_str(), "exec" | "patch" | "scale")
             || self.tool == "gitops"
             || self.tool == "apply_manifest"
             || self.dry_run
-            || (is_write(&a.verb) && a.name.is_none())
+            || (a.verb != "list" && a.name.is_none())
             || (a.namespace.is_none() && !a.cluster_scoped)
         {
             return None;
@@ -1366,6 +1366,8 @@ mod tests {
         // A rule could not pin the manifest's content.
         assert!(approval("apply_manifest", "apply", Some("web")).as_rule().is_none());
         assert!(approval("list_resources", "list", None).as_rule().is_some());
+        // A certificate scan reads every Secret: a rule would allow getting any of them.
+        assert!(approval("check_certificates", "get", None).as_rule().is_none());
         assert!(approval("delete_resource", "delete", Some("web")).as_rule().is_some());
         // Across all namespaces, a rule would also cover namespaces no rule allows.
         let everywhere = |cluster_scoped| Approval {
