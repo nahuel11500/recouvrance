@@ -516,6 +516,42 @@ fn system_prompt(scope: &str) -> String {
     )
 }
 
+/// The `claude -p` arguments. The question comes last, after `--`, so one starting with `-`
+/// is never read as an option.
+fn claude_args(
+    question: &str,
+    mcp_config: &std::path::Path,
+    scope: &str,
+    model: &str,
+    session: Option<&str>,
+) -> Vec<std::ffi::OsString> {
+    let mut args: Vec<std::ffi::OsString> = [
+        "-p",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--tools",
+        "",
+        "--strict-mcp-config",
+        "--allowedTools",
+        "mcp__recouvrance",
+        "--mcp-config",
+    ]
+    .into_iter()
+    .map(Into::into)
+    .collect();
+    args.push(mcp_config.into());
+    args.extend(["--append-system-prompt".into(), system_prompt(scope).into()]);
+    if model != DEFAULT_MODEL && !model.is_empty() {
+        args.extend(["--model".into(), model.into()]);
+    }
+    if let Some(s) = session {
+        args.extend(["--resume".into(), s.into()]);
+    }
+    args.extend(["--".into(), question.into()]);
+    args
+}
+
 /// Through the local Claude Code CLI (your login/subscription): only Recouvrance's MCP
 /// server is available to it, its built-in tools are off.
 async fn ask_claude_code(
@@ -540,21 +576,12 @@ async fn ask_claude_code(
         let cfg_file = TempFile::create(work.0.join(format!("mcp-{}.json", uuid::Uuid::new_v4().simple())), cfg.to_string().as_bytes())?;
         let mut cmd = tokio::process::Command::new(&bin);
         cmd.current_dir(&work.0)
-            .args(["-p", &question, "--output-format", "stream-json", "--verbose", "--tools", "", "--strict-mcp-config", "--allowedTools", "mcp__recouvrance"])
-            .arg("--mcp-config")
-            .arg(&cfg_file.0)
-            .args(["--append-system-prompt", &system_prompt(&scope)])
+            .args(claude_args(&question, &cfg_file.0, &scope, &model, conv.session.as_deref()))
             // `claude -p` reads a stdin that is not a terminal: give it none.
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
-        if model != DEFAULT_MODEL && !model.is_empty() {
-            cmd.args(["--model", &model]);
-        }
-        if let Some(s) = &conv.session {
-            cmd.args(["--resume", s]);
-        }
         let mut child = cmd.spawn().context("starting claude")?;
         // Read alongside stdout, keeping the last line: a full stderr pipe would block claude.
         let stderr = child.stderr.take().context("no error output")?;
@@ -709,6 +736,16 @@ mod tests {
         assert_eq!(super::reply_content(&reply("tool_use")), vec![text.clone(), call.clone()]);
         assert_eq!(super::reply_content(&reply("max_tokens")), vec![text.clone()]);
         assert!(super::reply_content(&json!({"stop_reason": "max_tokens", "content": [call]})).is_empty());
+    }
+
+    #[test]
+    fn question_is_never_an_option() {
+        let args = super::claude_args("--model x -n kube-system", "/tmp/mcp.json".as_ref(), "pods", "", Some("s1"));
+        let n = args.len();
+        assert_eq!(args[n - 2], "--");
+        assert_eq!(args[n - 1], "--model x -n kube-system");
+        assert_eq!(args.iter().filter(|a| *a == "--model").count(), 0);
+        assert!(args.windows(2).any(|w| w[0] == "--resume" && w[1] == "s1"));
     }
 
     #[test]

@@ -70,7 +70,7 @@ impl DetailPanel {
                     subjects.push(subject);
                     subjects_patch_cmd(&context, obj_ns.as_deref(), &obj_kind, &obj_name, b, subjects)
                 }
-                (None, Some(_)) => {
+                (None, Some(subject)) => {
                     let scope = obj_ns.clone().or_else(|| scope_input.as_ref().map(typed).filter(|s| !s.is_empty()));
                     let (bkind, role_flag) = match (&scope, role_kind.as_str()) {
                         (Some(_), "Role") => ("rolebinding", "role"),
@@ -87,7 +87,7 @@ impl DetailPanel {
                         scope.as_deref(),
                         &format!(
                             "create {bkind} {} --{role_flag}={} {who}",
-                            shell_word(&binding_name(&obj_name, &sname)),
+                            shell_word(&binding_name(&obj_name, &subject)),
                             shell_word(&obj_name)
                         ),
                     )
@@ -146,7 +146,7 @@ impl DetailPanel {
                                 let scope = this.obj.namespace.clone().or_else(|| (!scope_ns.is_empty()).then(|| scope_ns.clone()));
                                 let bk = binding_kind(scope.is_some());
                                 let bkind = bk.ar.kind.clone();
-                                let bname = binding_name(&role, &name);
+                                let bname = binding_name(&role, &subject);
                                 let mut obj = serde_json::json!({
                                     "apiVersion": "rbac.authorization.k8s.io/v1", "kind": bkind,
                                     "metadata": {"name": bname},
@@ -337,9 +337,15 @@ fn binding_kind(namespaced: bool) -> k8s::Kind {
     }
 }
 
-/// A binding's name for a role and a subject.
-fn binding_name(role: &str, subject: &str) -> String {
-    format!("{role}-{}", subject.replace(':', "-")).chars().take(63).collect()
+/// A binding's name for a role and a subject; a ServiceAccount's namespace is part of it,
+/// so two ServiceAccounts with the same name don't get the same binding.
+fn binding_name(role: &str, subject: &serde_json::Value) -> String {
+    let name = subject["name"].as_str().unwrap_or_default();
+    let who = match subject["namespace"].as_str() {
+        Some(ns) => format!("{ns}-{name}"),
+        None => name.to_string(),
+    };
+    format!("{role}-{}", who.replace(':', "-")).chars().take(63).collect()
 }
 
 /// The patch that sets a binding's subjects, with the resourceVersion they were read at:
@@ -401,6 +407,10 @@ mod tests {
         assert!(subject_of("ServiceAccount", "ci", "").is_none());
         assert!(subject_of("Robot", "x", "").is_none());
         assert_eq!(subject_of("ServiceAccount", "ci", "team").unwrap()["namespace"], "team");
-        assert_eq!(binding_name("view", "system:serviceaccount:a:b"), "view-system-serviceaccount-a-b");
+        let user = subject_of("User", "system:serviceaccount:a:b", "").unwrap();
+        assert_eq!(binding_name("view", &user), "view-system-serviceaccount-a-b");
+        let sa = |ns: &str| binding_name("view", &subject_of("ServiceAccount", "default", ns).unwrap());
+        assert_eq!(sa("a"), "view-a-default");
+        assert_ne!(sa("a"), sa("b"));
     }
 }
