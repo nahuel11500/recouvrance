@@ -665,6 +665,26 @@ pub struct Hub {
     rules_mtime: Mutex<Option<std::time::SystemTime>>,
     /// The lock on agents.lock while the app or `serve` runs (see [`Hub::claim_config`]).
     config_lock: Mutex<Option<std::fs::File>>,
+    /// Why agents.json could not be read at start (see [`load_config`]).
+    config_error: Option<String>,
+}
+
+/// agents.json; missing means the defaults. One that can't be read (corrupt, or from a
+/// newer version) is kept aside so the next save does not destroy its agents and rules,
+/// and agent access starts off, with the reason to show.
+fn load_config(path: &std::path::Path) -> (Config, Option<String>) {
+    let read = match std::fs::read(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (Config::default(), None),
+        r => r.map_err(anyhow::Error::from),
+    };
+    match read.and_then(|bytes| Ok(serde_json::from_slice::<Config>(&bytes)?)) {
+        Ok(config) => (config, None),
+        Err(e) => {
+            let kept = crate::settings::keep_aside(path);
+            let error = format!("agents.json could not be read ({e:#}; {kept}): agent access is off");
+            (Config { enabled: false, ..Config::default() }, Some(error))
+        }
+    }
 }
 
 fn config_lock_path() -> PathBuf {
@@ -699,10 +719,10 @@ impl Hub {
     }
 
     pub fn load() -> Arc<Self> {
-        let mut config: Config = std::fs::read(config_dir().join("agents.json"))
-            .ok()
-            .and_then(|b| serde_json::from_slice(&b).ok())
-            .unwrap_or_default();
+        let (mut config, config_error) = load_config(&config_dir().join("agents.json"));
+        if let Some(e) = &config_error {
+            eprintln!("{e}");
+        }
         for agent in &mut config.agents {
             agent.policy.migrate();
         }
@@ -724,7 +744,13 @@ impl Hub {
             rules_error: Mutex::default(),
             rules_mtime: Mutex::default(),
             config_lock: Mutex::default(),
+            config_error,
         })
+    }
+
+    /// Why agents.json could not be read at start, if it couldn't.
+    pub fn config_error(&self) -> Option<String> {
+        self.config_error.clone()
     }
 
     /// No window to approve in: calls that need approval are refused at once.
@@ -1555,6 +1581,27 @@ mod tests {
         drop(held);
         assert!(!locked(&path));
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn a_bad_agents_file_is_kept_and_turns_agents_off() {
+        let dir = temp_dir();
+        let path = dir.join("agents.json");
+        let (config, error) = load_config(&path);
+        assert!(config.enabled && error.is_none());
+        std::fs::write(&path, br#"{"enabled": true, "agents": [{"id": 1}]}"#).unwrap();
+        let (config, error) = load_config(&path);
+        assert!(!config.enabled);
+        assert!(config.agents.is_empty());
+        assert!(error.is_some());
+        // The file is kept aside, so the next save can't destroy it.
+        assert!(!path.exists());
+        let kept = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| e.file_name().to_string_lossy().starts_with("agents.json.bad-"));
+        assert!(kept);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     fn entry(tool: &str) -> AuditEntry {
