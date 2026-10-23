@@ -324,6 +324,9 @@ impl AppView {
                 });
                 if moved || (shown && self.rows_by_ctx.iter().any(|r| !r.is_empty())) {
                     self.show_rows(cx);
+                } else if shown {
+                    // New columns sort the rows again: the highlight stays on its object.
+                    self.follow_selection(cx);
                 }
             }
             TableMsg::Rows(rows) => {
