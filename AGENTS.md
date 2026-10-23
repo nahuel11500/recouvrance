@@ -2,6 +2,10 @@
 
 ## Building
 
+- **Don't build unless you have to.** CI is free and runs clippy and the tests on every PR, so
+  it is the check: run `cargo fmt --all` (no build), push, and read CI's log if it fails. Read
+  the code instead of compiling to find out. Build locally only when CI's log is not enough,
+  and then run the narrowest command (one test, or clippy alone).
 - **Use at most half the machine's cores.** Set the job count on every cargo command
   that compiles (build, run, test, clippy, check, doc):
 
@@ -13,14 +17,11 @@
   with every core busy the machine becomes unusable for the person working on it.
 - **One build at a time.** Several agents or worktrees may share the machine. Before
   starting a build, check that no other is running (`pgrep -a cargo`) and wait for it to
-  finish: two builds at half the cores each take all of them.
-- Before a PR: `cargo fmt`, `cargo clippy --all-targets --features dev -- -D warnings`,
-  `cargo test --features dev` and `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
-  --document-private-items`, all with the job count above. Only the full run on `main` builds
-  the docs, so a doc comment with a bare `<word>` (read as an HTML tag) breaks `main`, not the
-  PR: put it in backticks.
-- A target directory shared between worktrees can report a stale pass. Check you are on your
-  branch before trusting a green run; CI on the PR is the final word.
+  finish: two builds at half the cores each take all of them. Never get around a busy build
+  with another `--profile`, `--target-dir` or `CARGO_TARGET_DIR`: a new one rebuilds every
+  dependency (gpui, wgpu...) from scratch, in parallel with the others.
+- Only the full run on `main` builds the docs, so a doc comment with a bare `<word>` (read as an
+  HTML tag) breaks `main`, not the PR: put it in backticks.
 
 ## Pull requests
 
