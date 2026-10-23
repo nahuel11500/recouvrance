@@ -502,8 +502,8 @@ fn unix_now() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        DeleteConfirm, NamespaceVisit, Settings, load_json, migrate_list, recent_as_visits, record_visits, save_newest,
-        visit_score, write_atomic,
+        DeleteConfirm, NamespaceVisit, Settings, delete_confirm_in, load_json, migrate_list, recent_as_visits,
+        record_visits, save_newest, visit_score, write_atomic,
     };
 
     const DAY: i64 = 24 * 3600;
