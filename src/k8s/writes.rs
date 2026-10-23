@@ -477,8 +477,13 @@ pub async fn trigger_cronjob_opts(client: Client, ns: String, name: String, dry_
 /// cordon, then evict every pod except DaemonSet and static pods. Evictions
 /// respect PodDisruptionBudgets; refused ones are reported, not forced. Pods no
 /// controller manages would be gone for good, so (like kubectl without
-/// `--force`) they are left in place and reported.
-pub async fn drain(client: Client, node: String) -> Result<String> {
+/// `--force`) they are left in place and reported. `check` is asked about each pod
+/// right before its eviction (an agent's access may change while a drain runs).
+pub async fn drain(
+    client: Client,
+    node: String,
+    check: impl Fn(&str, &str) -> Eviction + Send + 'static,
+) -> Result<String> {
     run(async move {
         let nodes: Api<k8s_openapi::api::core::v1::Node> = Api::all(client.clone());
         nodes
@@ -491,6 +496,7 @@ pub async fn drain(client: Client, node: String) -> Result<String> {
         let pods: Api<Pod> = Api::all(client.clone());
         let on_node = pods.list(&ListParams::default().fields(&format!("spec.nodeName={node}"))).await?;
         let (mut evicted, mut skipped, mut refused, mut unmanaged) = (0, 0, Vec::new(), Vec::new());
+        let (mut kept, mut stopped) = (Vec::new(), None);
         for p in on_node.items {
             let owners = p.metadata.owner_references.clone().unwrap_or_default();
             let daemon = owners.iter().any(|o| o.kind == "DaemonSet");
@@ -504,6 +510,17 @@ pub async fn drain(client: Client, node: String) -> Result<String> {
             if !owners.iter().any(|o| o.controller == Some(true)) {
                 unmanaged.push(format!("{ns}/{name}"));
                 continue;
+            }
+            match check(&ns, &name) {
+                Eviction::Evict => {}
+                Eviction::Keep(reason) => {
+                    kept.push(format!("{ns}/{name}: {reason}"));
+                    continue;
+                }
+                Eviction::Stop(reason) => {
+                    stopped = Some(reason);
+                    break;
+                }
             }
             let api: Api<Pod> = Api::namespaced(client.clone(), &ns);
             match api.evict(&name, &Default::default()).await {
@@ -527,9 +544,29 @@ pub async fn drain(client: Client, node: String) -> Result<String> {
                 unmanaged.iter().take(5).cloned().collect::<Vec<_>>().join(", ")
             ));
         }
-        Ok(msg)
+        if !kept.is_empty() {
+            msg.push_str(&format!(
+                "; {} not evicted: {}",
+                kept.len(),
+                kept.iter().take(5).cloned().collect::<Vec<_>>().join("; ")
+            ));
+        }
+        match stopped {
+            Some(reason) => Err(anyhow::anyhow!("drain stopped, the other pods were not evicted ({reason}). {msg}")),
+            None => Ok(msg),
+        }
     })
     .await
+}
+
+/// What a drain does with one pod, decided right before its eviction.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Eviction {
+    Evict,
+    /// Leave this pod in place; the reason is reported.
+    Keep(String),
+    /// Evict no more pods; the reason is reported with what was done.
+    Stop(String),
 }
 
 /// Roll a Deployment, StatefulSet or DaemonSet back to an older pod template, like

@@ -259,6 +259,42 @@ fn manifest_objects(planned: &[(Kind, Option<String>, String, serde_json::Value)
         .collect()
 }
 
+/// Why the agent's calls are refused now, if they are.
+fn inactive(hub: &Hub, agent_id: &str) -> Option<&'static str> {
+    if !hub.agents_enabled() {
+        return Some("agent access is switched off in Recouvrance");
+    }
+    if !hub.agent(agent_id).is_some_and(|a| a.enabled) {
+        return Some("this agent is disabled");
+    }
+    None
+}
+
+/// Whether the rules keep a drain from evicting a pod: an explicit Deny rule on deleting
+/// it, not merely the absence of a delete rule.
+fn denies_eviction(policy: &Policy, pod: &Access) -> bool {
+    let v = policy.decide(pod);
+    v.mode == Mode::Deny && v.rule.is_some()
+}
+
+/// What a running drain does with one pod under the agent's rules as they are now: it
+/// stops once the drain itself is no longer allowed (an Ask counts when the user approved
+/// this call), and leaves a pod whose deletion the rules deny.
+fn eviction(policy: &Policy, drain: &Access, approved: bool, pod: &Access) -> k8s::Eviction {
+    let allowed = match policy.decide(drain).mode {
+        Mode::Allow => true,
+        Mode::Ask => approved,
+        Mode::Deny => false,
+    };
+    if !allowed {
+        return k8s::Eviction::Stop(format!("{} — the rules changed while it ran", describe(drain)));
+    }
+    if denies_eviction(policy, pod) {
+        return k8s::Eviction::Keep("your rules deny deleting it".into());
+    }
+    k8s::Eviction::Evict
+}
+
 /// Namespaces, sorted, of the pods a drain would evict (`k8s::drain` leaves DaemonSet,
 /// static, finished and unmanaged pods alone) for which `denied(namespace, name)` holds.
 fn denied_namespaces(pods: &[serde_json::Value], denied: impl Fn(&str, &str) -> bool) -> Vec<String> {
@@ -337,13 +373,7 @@ impl KubeMcp {
 
     /// Why calls are refused now, if they are.
     fn inactive(&self, call: &Call) -> Option<&'static str> {
-        if !self.hub.agents_enabled() {
-            return Some("agent access is switched off in Recouvrance");
-        }
-        if !self.hub.agent(&call.agent.id).is_some_and(|a| a.enabled) {
-            return Some("this agent is disabled");
-        }
-        None
+        inactive(&self.hub, &call.agent.id)
     }
 
     /// Evaluate one access request; Ask waits for the user.
@@ -1054,5 +1084,33 @@ mod tests {
         let denied = denied_namespaces(&pods, |ns, _| ns.starts_with("kube-"));
         assert_eq!(denied, ["kube-public", "kube-system"]);
         assert!(denied_namespaces(&pods, |_, _| false).is_empty());
+    }
+
+    #[test]
+    fn a_running_drain_follows_the_rules_as_they_change() {
+        let rule = |effect: Mode, verb: &str, ns: &str| crate::mcp::Rule {
+            effect,
+            verbs: vec![verb.into()],
+            namespaces: vec![ns.into()],
+            contexts: vec!["*".into()],
+            ..crate::mcp::Rule::default()
+        };
+        let nodes = kind("", "v1", "Node", "nodes", false);
+        let pods = kind("", "v1", "Pod", "pods", true);
+        let drain = access_for(&nodes, "c", "drain", None, Some("node-1".into()));
+        let pod = |ns: &str| access_for(&pods, "c", "delete", Some(ns.into()), Some("web".into()));
+        let allowed = Policy { rules: vec![rule(Mode::Allow, "drain", "*")], ..Policy::default() };
+        assert_eq!(eviction(&allowed, &drain, false, &pod("app")), k8s::Eviction::Evict);
+        // A Deny on deleting pods added while it runs keeps that namespace's pods.
+        let mut denied = allowed.clone();
+        denied.rules.push(rule(Mode::Deny, "delete", "app"));
+        assert!(matches!(eviction(&denied, &drain, false, &pod("app")), k8s::Eviction::Keep(_)));
+        assert_eq!(eviction(&denied, &drain, false, &pod("other")), k8s::Eviction::Evict);
+        // The drain rule removed, or turned into an Ask nobody approved: no more evictions.
+        let none = Policy { rules: vec![], ..Policy::default() };
+        assert!(matches!(eviction(&none, &drain, false, &pod("app")), k8s::Eviction::Stop(_)));
+        let ask = Policy { rules: vec![rule(Mode::Ask, "drain", "*")], ..Policy::default() };
+        assert!(matches!(eviction(&ask, &drain, false, &pod("app")), k8s::Eviction::Stop(_)));
+        assert_eq!(eviction(&ask, &drain, true, &pod("app")), k8s::Eviction::Evict);
     }
 }

@@ -180,7 +180,7 @@ impl DetailPanel {
                                 title,
                                 "Cordons the node, then evicts its pods (DaemonSet and static pods stay). PodDisruptionBudgets are respected; refused evictions are reported.",
                                 "Drain",
-                                |p| Box::pin(k8s::drain(p.client.clone(), p.obj.name.clone())),
+                                |p| Box::pin(k8s::drain(p.client.clone(), p.obj.name.clone(), |_, _| k8s::Eviction::Evict)),
                                 w,
                                 cx,
                             )

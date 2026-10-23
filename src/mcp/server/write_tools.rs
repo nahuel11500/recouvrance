@@ -196,11 +196,11 @@ impl KubeMcp {
             Ok(v) => v,
             Err(e) => return call.finish(Err(e)),
         };
+        // The rules may have changed while the pods were listed.
+        self.reload_rules(&mut call);
         let denied = denied_namespaces(&on_node, |ns, name| {
             let a = access_for(&pods_kind, &p.context, "delete", Some(ns.into()), Some(name.into()));
-            let v = call.policy().decide(&a);
-            // An explicit Deny rule, not merely the absence of a delete rule.
-            v.mode == Mode::Deny && v.rule.is_some()
+            denies_eviction(call.policy(), &a)
         });
         if !denied.is_empty() {
             return Err(call.deny(format!(
@@ -210,7 +210,20 @@ impl KubeMcp {
             )));
         }
         self.recheck(&mut call, &access)?;
-        call.finish(k8s::drain(client, p.node).await)
+        // Evictions take minutes on a big node, and the drain lists the pods again: each is
+        // checked on the rules, and agent access, as they are when its turn comes.
+        let (hub, agent_id, approved, context) = (self.hub.clone(), call.agent.id.clone(), call.approved, p.context);
+        let check = move |ns: &str, name: &str| {
+            if let Some(reason) = inactive(&hub, &agent_id) {
+                return k8s::Eviction::Stop(reason.into());
+            }
+            let Some(agent) = hub.agent(&agent_id) else {
+                return k8s::Eviction::Stop("this agent is disabled".into());
+            };
+            let pod = access_for(&pods_kind, &context, "delete", Some(ns.into()), Some(name.into()));
+            eviction(&agent.policy, &access, approved, &pod)
+        };
+        call.finish(k8s::drain(client, p.node, check).await)
     }
 
     #[tool(
