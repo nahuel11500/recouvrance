@@ -852,19 +852,22 @@ impl Hub {
         Ok(token)
     }
 
+    /// Change an agent. With rules.yaml in use, the change is written there first: if it
+    /// can't be (a rule the file can't hold), nothing changes.
     pub fn update_agent(&self, id: &str, f: impl FnOnce(&mut Agent)) -> Result<()> {
         {
             let mut cfg = write(&self.config);
-            let agent = cfg.agents.iter_mut().find(|a| a.id == id).context("unknown agent")?;
+            let mut agents = cfg.agents.clone();
+            let agent = agents.iter_mut().find(|a| a.id == id).context("unknown agent")?;
             f(agent);
+            // Visual edits keep rules.yaml in step when you use it.
+            if self.rules_file_active() && self.rules_error().is_none() {
+                rules_file::export(&agents).context("rules.yaml not updated")?;
+                *lock(&self.rules_mtime) = std::fs::metadata(rules_file::path()).and_then(|m| m.modified()).ok();
+            }
+            cfg.agents = agents;
         }
-        self.save()?;
-        // Visual edits keep rules.yaml in step when you use it.
-        if self.rules_file_active() && self.rules_error().is_none() {
-            rules_file::export(&self.config().agents)?;
-            *lock(&self.rules_mtime) = std::fs::metadata(rules_file::path()).and_then(|m| m.modified()).ok();
-        }
-        Ok(())
+        self.save()
     }
 
     pub fn delete_agent(&self, id: &str) -> Result<()> {
