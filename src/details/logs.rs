@@ -52,8 +52,11 @@ pub struct LogsView {
     pub(super) pods: Vec<String>,
     /// Pods past `MAX_LOG_PODS`, not followed; the status line says so.
     pub(super) left_out: usize,
-    /// The first pod's containers; the chosen one is read from every pod.
+    /// Each pod's containers, default first (empty when not known).
+    pub(super) pod_containers: Vec<Vec<String>>,
+    /// The first pod's containers; the chosen one is read from every pod that has it.
     pub(super) containers: Option<Entity<SelectState<SearchableVec<SharedString>>>>,
+    pub(super) _containers_sub: Option<Subscription>,
     pub(super) container: Option<String>,
     pub(super) previous: bool,
     pub(super) follow: bool,
@@ -91,10 +94,11 @@ impl LogsView {
     pub(super) fn new(
         client: Client,
         ns: String,
-        pods: Vec<String>,
+        pods: Vec<(String, Vec<String>)>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let (pods, pod_containers): (Vec<String>, Vec<Vec<String>>) = pods.into_iter().unzip();
         let search =
             cx.new(|cx| InputState::new(window, cx).placeholder("Find in logs… (several words; !word excludes)"));
         let find = cx.new(|cx| InputState::new(window, cx).placeholder("Find…"));
@@ -124,7 +128,9 @@ impl LogsView {
             pod_states: vec![StreamState::Connecting; pods.len()],
             pods,
             left_out: 0,
+            pod_containers,
             containers: None,
+            _containers_sub: None,
             container: None,
             previous: false,
             follow: true,
@@ -169,16 +175,30 @@ impl LogsView {
         }
     }
 
-    /// Follow another set of pods (a workload's after a rollout or a scale); streams
-    /// restart when they were running. Same pods in another order change nothing.
-    pub(super) fn set_pods(&mut self, mut pods: Vec<String>, cx: &mut Context<Self>) {
+    /// Follow another set of pods (a workload's after a rollout or a scale), each with its
+    /// containers; streams restart when they were running. Same pods in another order
+    /// change nothing.
+    pub(super) fn set_pods(
+        &mut self,
+        mut pods: Vec<(String, Vec<String>)>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         pods.sort();
-        let mut current = self.pods.clone();
+        let mut current: Vec<(String, Vec<String>)> =
+            self.pods.iter().cloned().zip(self.pod_containers.iter().cloned()).collect();
         current.sort();
         if pods == current {
             return;
         }
-        self.pods = pods;
+        let first = self.pod_containers.first().cloned();
+        (self.pods, self.pod_containers) = pods.into_iter().unzip();
+        // A rollout can rename the containers: choose among the new first pod's.
+        if let Some(names) =
+            self.pod_containers.first().filter(|n| !n.is_empty() && Some(*n) != first.as_ref()).cloned()
+        {
+            self.set_containers(names, window, cx);
+        }
         self.buf.set_merge(self.pods.len() > 1);
         self.pod_states = vec![StreamState::Connecting; self.pods.len()];
         // Lines point at pods by index: they belong to the old list.
@@ -198,23 +218,7 @@ impl LogsView {
             let _ = this.update_in(cx, |this, window, cx| match result {
                 Ok(names) => {
                     this.status = None;
-                    this.container = names.first().cloned();
-                    if names.len() > 1 {
-                        let items: Vec<SharedString> = names.into_iter().map(Into::into).collect();
-                        let select = cx.new(|cx| {
-                            SelectState::new(SearchableVec::new(items), Some(IndexPath::default()), window, cx)
-                        });
-                        this._subs.push(cx.subscribe_in(
-                            &select,
-                            window,
-                            |this, _, ev: &SelectEvent<SearchableVec<SharedString>>, _, cx| {
-                                let SelectEvent::Confirm(Some(name)) = ev else { return };
-                                this.container = Some(name.to_string());
-                                this.restart(cx);
-                            },
-                        ));
-                        this.containers = Some(select);
-                    }
+                    this.set_containers(names, window, cx);
                     if !this.paused {
                         this.restart(cx);
                     }
@@ -227,6 +231,30 @@ impl LogsView {
         }));
     }
 
+    /// The containers to choose from; the choice stays when the new list has it.
+    fn set_containers(&mut self, names: Vec<String>, window: &mut Window, cx: &mut Context<Self>) {
+        let ix = self.container.as_ref().and_then(|c| names.iter().position(|n| n == c)).unwrap_or(0);
+        self.container = names.get(ix).cloned();
+        self.containers = None;
+        self._containers_sub = None;
+        if names.len() > 1 {
+            let items: Vec<SharedString> = names.into_iter().map(Into::into).collect();
+            let select = cx
+                .new(|cx| SelectState::new(SearchableVec::new(items), Some(IndexPath::default().row(ix)), window, cx));
+            self._containers_sub = Some(cx.subscribe_in(
+                &select,
+                window,
+                |this, _, ev: &SelectEvent<SearchableVec<SharedString>>, _, cx| {
+                    let SelectEvent::Confirm(Some(name)) = ev else { return };
+                    this.container = Some(name.to_string());
+                    this.restart(cx);
+                },
+            ));
+            self.containers = Some(select);
+        }
+        cx.notify();
+    }
+
     pub(super) fn restart(&mut self, cx: &mut Context<Self>) {
         self.paused = false;
         self.buf.clear();
@@ -237,13 +265,14 @@ impl LogsView {
         self.pod_states = vec![StreamState::Connecting; self.pods.len()];
         self.streams.clear();
         let mut receivers = Vec::new();
-        // A workload's pods share their containers: the chosen one is read from each.
+        // The chosen container from each pod that has it; the others show their default one.
         for (ix, pod) in self.pods.iter().enumerate() {
+            let containers = self.pod_containers.get(ix).map_or(&[][..], Vec::as_slice);
             let (guard, rx) = k8s::stream_logs(
                 self.client.clone(),
                 self.ns.clone(),
                 pod.clone(),
-                self.container.clone(),
+                container_for(self.container.as_deref(), containers),
                 self.previous,
                 self.since,
             );

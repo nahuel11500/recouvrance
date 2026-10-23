@@ -5,7 +5,8 @@
 *Assistant* in the sidebar is a chat with Claude about your clusters. It runs through your local
 Claude Code (your subscription, no API key); an Anthropic API key works too if you prefer. It uses
 the same agent as your Claude Code connection (below), so one set of rules, approvals and activity
-log covers both.
+log covers both. **Stop** ends a question that is still running; with an API key, a request that
+gets no answer for 10 minutes fails.
 
 ## Agents (MCP)
 
@@ -13,7 +14,7 @@ While the app runs, it serves MCP on `http://127.0.0.1:47070/mcp` (`recouvrance 
 without the window; there nobody can approve, so a call an *Ask me* rule covers is refused at once
 with "needs approval in the Recouvrance window": run the app, or add an Allow rule). A list across
 all namespaces where some namespaces ask and others are allowed is not refused: when it is not
-approved (or cannot be), it shows only the allowed rows. In **Agents**, click **Connect Claude Code**: it registers the server in your
+approved (or cannot be), it shows only the allowed rows, and a rejection is still logged. In **Agents**, click **Connect Claude Code**: it registers the server in your
 Claude Code (`claude mcp add --scope user recouvrance …`). There is one agent, "Claude", with its rules;
 *Several agents…* gives other tools their own token and rules if you ever need that. Tokens are
 stored hashed (the assistant's copy is in a 0600 file).

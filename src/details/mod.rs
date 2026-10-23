@@ -200,7 +200,7 @@ impl DetailPanel {
         let ns = obj.namespace.clone().unwrap_or_default();
         let logs = is_pod.then(|| {
             let (client, ns, name) = (client.clone(), ns.clone(), obj.name.clone());
-            cx.new(|cx| LogsView::new(client, ns, vec![name], window, cx))
+            cx.new(|cx| LogsView::new(client, ns, vec![(name, Vec::new())], window, cx))
         });
         let terminal = is_pod.then(|| {
             let (client, ns, name, ctx) = (client.clone(), ns.clone(), obj.name.clone(), context.clone());
@@ -611,9 +611,12 @@ impl DetailPanel {
                     // Workload logs follow its pods (up to a limit), as they come and go.
                     let followed = followed_pods(&related.pods);
                     let left_out = related.pods.len() - followed.len();
-                    let names: Vec<String> = followed
+                    let names: Vec<(String, Vec<String>)> = followed
                         .into_iter()
-                        .filter_map(|p| p.pointer("/metadata/name").and_then(|v| v.as_str()).map(String::from))
+                        .filter_map(|p| {
+                            let name = p.pointer("/metadata/name").and_then(|v| v.as_str())?;
+                            Some((name.to_string(), k8s::pod_containers(p)))
+                        })
                         .collect();
                     if pods_logs && !names.is_empty() {
                         match &this.logs {
@@ -629,7 +632,7 @@ impl DetailPanel {
                             }
                             Some(logs) => logs.update(cx, |l, cx| {
                                 l.left_out = left_out;
-                                l.set_pods(names, cx);
+                                l.set_pods(names, window, cx);
                                 cx.notify();
                             }),
                         }

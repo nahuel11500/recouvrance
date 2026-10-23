@@ -240,7 +240,9 @@ pub fn sort_for_sidebar(kinds: &mut [Kind]) {
 pub async fn discover(client: Client) -> Result<Vec<Kind>> {
     run(async move {
         let resources = match Discovery::new(client.clone()).run_aggregated().await {
-            Ok(d) => d.groups().flat_map(|g| g.recommended_resources()).collect(),
+            // Every version, not only the preferred one: Gateway API prefers v1, but TCPRoute
+            // is only in v1alpha2.
+            Ok(d) => d.groups().flat_map(|g| g.resources_by_stability()).collect(),
             Err(_) => discover_by_group(&client).await?,
         };
         let mut known: Vec<Kind> = Vec::new();
@@ -269,34 +271,79 @@ pub async fn discover(client: Client) -> Result<Vec<Kind>> {
     .await
 }
 
-/// Discovery for clusters without aggregated discovery (before 1.26, or turned off): each
-/// group at its preferred version, side by side. A group that does not answer (an
-/// APIService that is down, like metrics.k8s.io) is left out, as kubectl does, instead
-/// of failing them all.
+/// Discovery for clusters without aggregated discovery (before 1.26, or turned off): every
+/// version of each group, side by side, each kind kept at its most stable version. A group
+/// that does not answer (an APIService that is down, like metrics.k8s.io) is left out, as
+/// kubectl does, instead of failing them all; one with built-in kinds the sidebar lists
+/// (Pods, Deployments…) is asked again, then fails discovery rather than leaving them out
+/// without a word.
 async fn discover_by_group(client: &Client) -> Result<Vec<(ApiResource, ApiCapabilities)>> {
     let mut gvs = vec![kube::core::GroupVersion::gv("", "v1")];
     for g in client.list_api_groups().await?.groups {
-        if let Some(v) = g.preferred_version.or_else(|| g.versions.into_iter().next()) {
-            gvs.push(kube::core::GroupVersion::gv(&g.name, &v.version));
-        }
+        gvs.extend(g.versions.iter().map(|v| kube::core::GroupVersion::gv(&g.name, &v.version)));
     }
-    let jobs = gvs.into_iter().map(|gv| {
-        let client = client.clone();
-        async move { kube::discovery::pinned_group(&client, &gv).await }
-    });
-    let groups: Vec<_> = futures::stream::iter(jobs).buffered(16).collect().await;
     let mut resources = Vec::new();
-    let mut failed = None;
-    for g in groups {
+    let mut failed = Vec::new();
+    for (gv, g) in pinned_groups(client, gvs).await {
         match g {
             Ok(g) => resources.extend(g.recommended_resources()),
-            Err(e) => failed = Some(e),
+            Err(e) => failed.push((gv, e)),
         }
     }
-    match failed {
-        Some(e) if resources.is_empty() => Err(e.into()),
-        _ => Ok(resources),
+    // Once more for the ones that matter (a timeout, too many requests).
+    let (retry, skipped): (Vec<_>, Vec<_>) = failed.into_iter().partition(|(gv, _)| required(&gv.group));
+    let skipped = skipped.into_iter().next().map(|(_, e)| e);
+    for (gv, g) in pinned_groups(client, retry.into_iter().map(|(gv, _)| gv).collect()).await {
+        match g {
+            Ok(g) => resources.extend(g.recommended_resources()),
+            Err(e) => return Err(anyhow::Error::from(e).context(format!("discovery of {} failed", gv.api_version()))),
+        }
     }
+    match skipped {
+        Some(e) if resources.is_empty() => Err(e.into()),
+        _ => Ok(most_stable(resources)),
+    }
+}
+
+/// Each group version's discovery, 16 at a time.
+async fn pinned_groups(
+    client: &Client,
+    gvs: Vec<kube::core::GroupVersion>,
+) -> Vec<(kube::core::GroupVersion, kube::Result<kube::discovery::ApiGroup>)> {
+    let jobs = gvs.into_iter().map(|gv| {
+        let client = client.clone();
+        async move {
+            let g = kube::discovery::pinned_group(&client, &gv).await;
+            (gv, g)
+        }
+    });
+    futures::stream::iter(jobs).buffered(16).collect().await
+}
+
+/// A built-in group with kinds the sidebar lists by name: discovery can't do without it.
+/// Add-on groups stay optional, even listed ones: projectcalico.org is an APIService that
+/// can be down like metrics.k8s.io.
+fn required(group: &str) -> bool {
+    is_builtin_group(group) && KNOWN.iter().any(|(_, g, _, _)| *g == group)
+}
+
+/// Each kind of each group once, at its most stable version (v1 before v1beta1 before
+/// v1alpha2).
+fn most_stable(resources: Vec<(ApiResource, ApiCapabilities)>) -> Vec<(ApiResource, ApiCapabilities)> {
+    let mut by_kind: HashMap<(String, String), (ApiResource, ApiCapabilities)> = HashMap::new();
+    for (ar, caps) in resources {
+        let priority = |ar: &ApiResource| kube::core::Version::parse(&ar.version).priority();
+        match by_kind.entry((ar.group.clone(), ar.kind.clone())) {
+            std::collections::hash_map::Entry::Occupied(mut e) if priority(&ar) > priority(&e.get().0) => {
+                e.insert((ar, caps));
+            }
+            std::collections::hash_map::Entry::Occupied(_) => {}
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert((ar, caps));
+            }
+        }
+    }
+    by_kind.into_values().collect()
 }
 
 pub(super) fn listable(caps: &ApiCapabilities) -> bool {
@@ -360,6 +407,65 @@ pub fn find_kind<'a>(kinds: &'a [Kind], query: &str) -> Option<&'a Kind> {
     // Prefer core and well-known kinds when a name is ambiguous (`svc` is the Service, not
     // Knative's): sidebar order alone puts a custom resource first when its section is earlier.
     kinds.iter().filter(|k| !is_custom(k)).find(matches).or_else(|| kinds.iter().find(matches))
+}
+
+#[cfg(test)]
+mod required_tests {
+    #[test]
+    fn core_and_listed_groups_are_required() {
+        use super::required;
+        assert!(required(""));
+        assert!(required("apps"));
+        assert!(required("batch"));
+        assert!(required("networking.k8s.io"));
+        assert!(!required("metrics.k8s.io"));
+        assert!(!required("custom.metrics.k8s.io"));
+        assert!(!required("cert-manager.io"));
+        assert!(!required("projectcalico.org"));
+    }
+}
+
+#[cfg(test)]
+mod version_tests {
+    use kube::discovery::{ApiCapabilities, ApiResource, Scope};
+
+    fn res(group: &str, version: &str, kind: &str) -> (ApiResource, ApiCapabilities) {
+        let ar = ApiResource {
+            group: group.into(),
+            version: version.into(),
+            api_version: format!("{group}/{version}"),
+            kind: kind.into(),
+            plural: format!("{}s", kind.to_lowercase()),
+        };
+        (ar, ApiCapabilities { scope: Scope::Namespaced, subresources: vec![], operations: vec![] })
+    }
+
+    #[test]
+    fn keeps_kinds_of_every_version_at_the_most_stable() {
+        let gw = "gateway.networking.k8s.io";
+        let mut kept: Vec<String> = super::most_stable(vec![
+            res(gw, "v1", "HTTPRoute"),
+            res(gw, "v1beta1", "HTTPRoute"),
+            res(gw, "v1alpha2", "HTTPRoute"),
+            res(gw, "v1alpha2", "TCPRoute"),
+            res("monitoring.coreos.com", "v1alpha1", "AlertmanagerConfig"),
+            res("monitoring.coreos.com", "v1beta1", "AlertmanagerConfig"),
+            res("other.example.com", "v1alpha1", "HTTPRoute"),
+        ])
+        .into_iter()
+        .map(|(ar, _)| ar.api_version + "/" + &ar.kind)
+        .collect();
+        kept.sort();
+        assert_eq!(
+            kept,
+            [
+                "gateway.networking.k8s.io/v1/HTTPRoute",
+                "gateway.networking.k8s.io/v1alpha2/TCPRoute",
+                "monitoring.coreos.com/v1beta1/AlertmanagerConfig",
+                "other.example.com/v1alpha1/HTTPRoute",
+            ]
+        );
+    }
 }
 
 #[cfg(test)]
