@@ -602,9 +602,41 @@ pub struct Hub {
     /// rules.yaml: its last load error, and the modification time already applied.
     rules_error: Mutex<Option<String>>,
     rules_mtime: Mutex<Option<std::time::SystemTime>>,
+    /// The lock on agents.lock while the app or `serve` runs (see [`Hub::claim_config`]).
+    config_lock: Mutex<Option<std::fs::File>>,
+}
+
+fn config_lock_path() -> PathBuf {
+    config_dir().join("agents.lock")
+}
+
+/// Whether the app or `serve` is running: it keeps agents.json in memory and saves it
+/// whole, so a change written by another process would be lost.
+pub fn config_in_use() -> bool {
+    locked(&config_lock_path())
+}
+
+/// Whether another open file holds the lock on `path`.
+fn locked(path: &std::path::Path) -> bool {
+    let Ok(file) = std::fs::File::open(path) else { return false };
+    matches!(file.try_lock(), Err(std::fs::TryLockError::WouldBlock))
+}
+
+/// Lock `path` (created if missing) for as long as the returned file is open.
+fn take_lock(path: &std::path::Path) -> Option<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let file = std::fs::OpenOptions::new().create(true).truncate(false).write(true).mode(0o600).open(path).ok()?;
+    file.try_lock().ok()?;
+    Some(file)
 }
 
 impl Hub {
+    /// Mark agents.json as in use by this process until it exits (see [`config_in_use`]).
+    pub fn claim_config(&self) {
+        let _ = create_private_dir(&config_dir());
+        *lock(&self.config_lock) = take_lock(&config_lock_path());
+    }
+
     pub fn load() -> Arc<Self> {
         let mut config: Config = std::fs::read(config_dir().join("agents.json"))
             .ok()
@@ -630,6 +662,7 @@ impl Hub {
             recent_calls: Mutex::default(),
             rules_error: Mutex::default(),
             rules_mtime: Mutex::default(),
+            config_lock: Mutex::default(),
         })
     }
 
@@ -1303,6 +1336,19 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("recouvrance-test-{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn a_running_hub_is_seen() {
+        let path = temp_dir().join("agents.lock");
+        assert!(!locked(&path));
+        let held = take_lock(&path).unwrap();
+        assert!(locked(&path));
+        // A second process (or hub) can't take it while it is held.
+        assert!(take_lock(&path).is_none());
+        drop(held);
+        assert!(!locked(&path));
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     fn entry(tool: &str) -> AuditEntry {

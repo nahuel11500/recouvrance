@@ -88,6 +88,7 @@ fn main() {
 
 fn serve() {
     let hub = mcp::Hub::load();
+    hub.claim_config();
     // No window to approve in: Ask rules refuse at once instead of waiting two minutes.
     hub.set_headless(true);
     if let Err(e) = hub.apply_rules_file() {
@@ -115,6 +116,11 @@ fn serve() {
 }
 
 fn agent_create(args: &[String]) {
+    // The running app or `serve` would not see the agent, and would save over it.
+    if mcp::config_in_use() {
+        eprintln!("Recouvrance is running: create the agent on its Agents page, or quit it first.");
+        std::process::exit(1);
+    }
     let hub = mcp::Hub::load();
     let (name, contexts) = agent_create_args(args);
     let (agent, token) = hub.create_agent(name).expect("create agent");
