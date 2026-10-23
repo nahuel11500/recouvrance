@@ -239,6 +239,8 @@ pub fn true_is_good(ty: &str) -> bool {
             | "ResolvedRefs"
             | "Synced"
             | "Healthy"
+            // k3s and RKE2 servers with embedded etcd
+            | "EtcdIsVoter"
     )
 }
 
@@ -297,7 +299,7 @@ mod tests {
             assert!(!node_condition_bad(ty, "Unknown"), "{ty}");
         }
         // Good when True.
-        for ty in ["Ready", "GPUHealthy", "CiliumAgentReady"] {
+        for ty in ["Ready", "GPUHealthy", "CiliumAgentReady", "EtcdIsVoter"] {
             assert!(!node_condition_bad(ty, "True"), "{ty}");
         }
     }
