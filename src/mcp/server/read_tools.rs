@@ -549,7 +549,8 @@ impl KubeMcp {
             };
             // The leaf certificate is first in the chain.
             let Some(c) = crate::certs::parse_pem(&pem).into_iter().next() else { continue };
-            let days = c.not_after.map(|t| (t.as_second() - now) / 86400).unwrap_or(i64::MAX);
+            // Rounded down: negative as soon as the date has passed.
+            let days = c.not_after.map(|t| (t.as_second() - now).div_euclid(86400)).unwrap_or(i64::MAX);
             if p.within_days.is_some_and(|w| days > w) {
                 continue;
             }
