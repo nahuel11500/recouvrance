@@ -129,15 +129,9 @@ impl AppView {
                         let active = this.active_tab;
                         let fallback = this.kind.clone();
                         for (i, tab) in this.tabs.iter_mut().enumerate() {
-                            if i == active {
-                                continue;
+                            if i != active {
+                                served_tab(tab, &kinds, &namespaces, fallback.as_ref());
                             }
-                            tab.kind = tab
-                                .kind
-                                .take()
-                                .and_then(|k| kinds.iter().find(|x| x.key() == k.key()).cloned())
-                                .or_else(|| fallback.clone());
-                            tab.namespaces.retain(|ns| namespaces.contains(ns));
                         }
                         this.settings_view.update(cx, |s, _| s.set_kinds(kinds.clone()));
                         this.kinds = kinds;
@@ -307,6 +301,15 @@ fn served_lists(history: &mut [Route], kinds: &[Kind], fallback: Option<&Kind>) 
     }
 }
 
+/// A tab not shown keeps its kind, lists and namespaces only where the new clusters have
+/// them: a tab switched away from while connecting still names the old clusters' kind.
+fn served_tab(tab: &mut TabState, kinds: &[Kind], namespaces: &[String], fallback: Option<&Kind>) {
+    tab.kind =
+        tab.kind.take().and_then(|k| kinds.iter().find(|x| x.key() == k.key()).cloned()).or_else(|| fallback.cloned());
+    served_lists(&mut tab.history, kinds, tab.kind.as_ref());
+    tab.namespaces.retain(|ns| namespaces.contains(ns));
+}
+
 /// Every list joined, or nothing when one of them is empty (that cluster may list all).
 fn all_restricted(lists: impl IntoIterator<Item = Vec<String>>) -> Vec<String> {
     let mut joined = Vec::new();
@@ -347,7 +350,9 @@ fn one_namespace(wanted: &[String], previous: &[String], accessible: &[String]) 
 
 #[cfg(test)]
 mod tests {
-    use super::{Kind, Route, all_restricted, cluster_namespace, merge_kinds, one_namespace, served_lists};
+    use super::{
+        Kind, Route, TabState, all_restricted, cluster_namespace, merge_kinds, one_namespace, served_lists, served_tab,
+    };
 
     fn kind(k: &str) -> Kind {
         Kind {
@@ -372,6 +377,21 @@ mod tests {
         assert_eq!(kinds.len(), 1);
         assert_eq!(where_[&kinds[0].key()], [0]);
         assert_eq!(errors, ["c: no such context", "b: connection refused"]);
+    }
+
+    #[test]
+    fn a_tab_left_while_connecting_drops_a_kind_the_clusters_dont_serve() {
+        let (pods, certs) = (kind("Pod"), kind("Certificate"));
+        let mut tab = TabState {
+            history: vec![Route::Resources(Some(certs.clone()))],
+            kind: Some(certs),
+            namespaces: vec!["a".into(), "gone".into()],
+            ..Default::default()
+        };
+        served_tab(&mut tab, std::slice::from_ref(&pods), &["a".to_string()], Some(&pods));
+        assert_eq!(tab.kind.as_ref().map(|k| k.label.as_str()), Some("Pod"));
+        assert!(matches!(&tab.history[..], [Route::Resources(Some(k))] if k.label == "Pod"));
+        assert_eq!(tab.namespaces, ["a"]);
     }
 
     #[test]

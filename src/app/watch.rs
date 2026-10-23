@@ -62,11 +62,12 @@ impl AppView {
         self.rows_by_ctx = vec![Vec::new(); self.clusters.len()];
         self.defs_by_ctx = vec![Arc::default(); self.clusters.len()];
         // What each cluster watches: nothing when it doesn't serve the kind, one of its
-        // accessible namespaces when it may not list cluster-wide.
-        let serving = self.kind_clusters.get(&kind.key()).cloned();
+        // accessible namespaces when it may not list cluster-wide. A kind discovery didn't
+        // find is served nowhere.
+        let serving = self.kind_clusters.get(&kind.key()).cloned().unwrap_or_default();
         let watched: Vec<Option<Option<String>>> = (self.clusters.iter().enumerate())
             .map(|(ix, (ctx_name, _))| {
-                if serving.as_ref().is_some_and(|s| !s.contains(&ix)) {
+                if !serving.contains(&ix) {
                     None
                 } else if !kind.namespaced {
                     Some(None)
@@ -123,6 +124,9 @@ impl AppView {
             t.refresh(cx);
         });
         self.status = loading.then(|| "Loading…".into());
+        if serving.is_empty() {
+            self.status = Some(format!("{} is not available on the connected clusters", kind.label).into());
+        }
         // Seen recently: show it as it was while the new list loads (whole, not by pages).
         let progressive = cached.is_none();
         if let Some(view) = cached {
