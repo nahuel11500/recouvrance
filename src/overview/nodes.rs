@@ -52,7 +52,9 @@ pub(super) fn node(obj: &Value, cx: &App) -> Div {
                         let p: Vec<String> = arr(obj, "/status/conditions")
                             .iter()
                             .filter(|c| {
-                                c["type"].as_str().is_some_and(crate::status::true_is_bad) && c["status"] == "True"
+                                c["type"].as_str().is_some_and(|ty| {
+                                    crate::status::node_condition_bad(ty, c["status"].as_str().unwrap_or_default())
+                                })
                             })
                             .filter_map(|c| c["type"].as_str().map(String::from))
                             .collect();
