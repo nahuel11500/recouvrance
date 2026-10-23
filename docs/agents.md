@@ -17,8 +17,8 @@ some rows ask and others are allowed (some namespaces, or some names) is not ref
 approved (or cannot be), it shows only the allowed rows, and a rejection is still logged. Approving
 it shows the rows of every Ask rule the list meets (`find_problems` asks to list pods: approving
 it shows other kinds' findings only where an Allow rule covers them). Rules changed while a call waits for approval
-apply to it: it is checked again once approved, and `apply_manifest` checks each object again
-before applying it. In **Agents**, click **Connect Claude Code**: it registers the server in your
+apply to it: it is checked again once approved, and `apply_manifest` checks each object again before
+applying it (an object whose rule turned into *Ask me* needs its own approval). In **Agents**, click **Connect Claude Code**: it registers the server in your
 Claude Code (`claude mcp add --scope user recouvrance …`). There is one agent, "Claude", with its rules;
 *Several agents…* gives other tools their own token and rules if you ever need that. Tokens are
 stored hashed (the assistant's copy is in a 0600 file).

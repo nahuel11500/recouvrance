@@ -132,25 +132,24 @@ impl KubeMcp {
         if let Some(args) = call.args.as_object_mut() {
             args.insert("objects".into(), json!(manifest_objects(&planned)));
         }
+        // Each object is approved on its own: approving one does not cover another.
+        let mut approved = Vec::new();
         for (kind, ns, name, _) in &planned {
             let access = access_for(kind, &p.context, "apply", ns.clone(), Some(name.clone()));
+            call.approved = false;
             self.authorize(&mut call, &access).await?;
+            approved.push(call.approved);
         }
+        let any_approved = approved.contains(&true);
         let dry = p.dry_run.unwrap_or(false);
         let mut out = Vec::new();
-        for (kind, ns, name, doc) in planned {
-            // Approvals for later objects can take minutes: access may be off, or the rules
-            // changed, by now.
-            self.reload_rules(&mut call);
+        for ((kind, ns, name, doc), approved) in planned.into_iter().zip(approved) {
+            // Approvals for later objects, and applying earlier ones, can take minutes:
+            // access may be off, or the rules changed, by now.
             let access = access_for(&kind, &p.context, "apply", ns.clone(), Some(name));
-            let verdict = call.policy().decide(&access);
-            let refused = match self.inactive(&call) {
-                Some(reason) => Some(reason.to_string()),
-                None if verdict.mode == Mode::Deny => {
-                    Some(format!("{} — {}", describe(&access), call.rule_label(verdict.rule)))
-                }
-                None => None,
-            };
+            call.approved = approved;
+            let refused = self.stale_reason(&mut call, &access);
+            call.approved = any_approved;
             if let Some(reason) = refused {
                 // The log says what was applied before.
                 let detail =
