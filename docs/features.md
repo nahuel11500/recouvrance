@@ -34,7 +34,8 @@
   type the name (the count, for several). By default, what comes back on its own (Pods, Jobs,
   ReplicaSets, Events…) is deleted right away; what takes data, machines or everything inside with
   it (Nodes, Namespaces, StatefulSets, Deployments, DaemonSets, PersistentVolumes and their claims,
-  CRDs) needs the name typed; anything else, custom resources included, asks. Every delete dialog
+  CRDs) needs the name typed; anything else, custom resources included, asks. A kind is added by
+  its name, plural or short name (`deploy`), checked against the connected clusters. Every delete dialog
   links to the setting. A protected context always asks for its name, and an object stuck
   terminating always shows the dialog, to remove its finalizers.
 - **Write mode** (off by default): click the `read-only` badge to enable scale, restart, delete
