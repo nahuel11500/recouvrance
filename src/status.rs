@@ -10,7 +10,7 @@ pub(crate) enum Tone {
 }
 
 /// Words that mean something is wrong wherever they appear ("SecretSyncedError").
-const BAD: [&str; 23] = [
+const BAD: [&str; 24] = [
     "notready",
     "unhealthy",
     "invalid",
@@ -35,12 +35,14 @@ const BAD: [&str; 23] = [
     "broken",
     // A container whose state was lost (often an evicted pod's): it will not come back.
     "containerstatusunknown",
+    // Refused by the kubelet for want of a resource: OutOfcpu, OutOfmemory, OutOfpods…
+    "outof",
 ];
 
 /// Finished: neither good nor bad any more.
 const DONE: [&str; 5] = ["completed", "succeeded", "done", "finished", "terminated"];
 
-const BUSY: [&str; 14] = [
+const BUSY: [&str; 15] = [
     "pending",
     "progressing",
     "creating",
@@ -55,6 +57,8 @@ const BUSY: [&str; 14] = [
     "deleting",
     "suspended",
     "unknown",
+    // Held on purpose until a controller (Kueue…) removes its gates.
+    "schedulinggated",
 ];
 
 /// Good words found anywhere ("NewReplicaSetAvailable"), unless negated ("Unready").
@@ -255,6 +259,7 @@ mod tests {
             ("ContainerCreating", Some(Tone::Busy)),
             ("Init:0/2", Some(Tone::Busy)),
             ("Unknown", Some(Tone::Busy)),
+            ("SchedulingGated", Some(Tone::Busy)),
             // Negated good words.
             ("Unready", Some(Tone::Bad)),
             ("Inactive", Some(Tone::Bad)),
@@ -281,6 +286,11 @@ mod tests {
             ("NotReady,SchedulingDisabled", Some(Tone::Bad)),
             ("ContainerStatusUnknown", Some(Tone::Bad)),
             ("Init:ContainerStatusUnknown", Some(Tone::Bad)),
+            // Refused by the kubelet.
+            ("OutOfcpu", Some(Tone::Bad)),
+            ("OutOfmemory", Some(Tone::Bad)),
+            ("OutOfpods", Some(Tone::Bad)),
+            ("UnexpectedAdmissionError", Some(Tone::Bad)),
             // Unknown words stay neutral.
             ("Lorem", None),
             ("Setup", None),
