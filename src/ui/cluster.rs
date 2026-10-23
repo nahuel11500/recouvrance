@@ -260,8 +260,11 @@ fn add_pods(s: &mut Summary, pods: &[PodLite]) {
     }
 }
 
-/// A metrics.k8s.io list, or nothing when metrics-server is missing.
-async fn metrics(client: Client, path: &'static str) -> MetricsList {
+/// A metrics.k8s.io list, or nothing when metrics-server is missing or metrics are off.
+async fn metrics(on: bool, client: Client, path: &'static str) -> MetricsList {
+    if !on {
+        return MetricsList::default();
+    }
     k8s::run(async move { Ok(client.request(http::Request::get(path).body(Vec::new())?).await?) })
         .await
         .unwrap_or_default()
@@ -299,6 +302,7 @@ async fn usage(context: &str, client: Client) -> Usage {
 /// Everything but the charts, all at once: one request after the other, a big cluster took
 /// over 30 s.
 async fn load(context: String, client: Client) -> Summary {
+    let on = crate::settings::metrics_on(&context);
     let mut s = Summary { context, ..Default::default() };
     let c = client.clone();
     let version = k8s::run(async move {
@@ -310,8 +314,8 @@ async fn load(context: String, client: Client) -> Summary {
         k8s::lists::list_lean::<NodeLite>(client.clone(), k8s::ar_of::<core::Node>(), None),
         k8s::lists::list_lean_cached::<PodLite>(client.clone(), k8s::ar_of::<core::Pod>(), None),
         k8s::namespaces(client.clone()),
-        metrics(client.clone(), "/apis/metrics.k8s.io/v1beta1/nodes"),
-        metrics(client.clone(), "/apis/metrics.k8s.io/v1beta1/pods"),
+        metrics(on, client.clone(), "/apis/metrics.k8s.io/v1beta1/nodes"),
+        metrics(on, client.clone(), "/apis/metrics.k8s.io/v1beta1/pods"),
     );
     let result: Result<()> = (|| {
         s.version = version?;

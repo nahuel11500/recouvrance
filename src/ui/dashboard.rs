@@ -400,6 +400,7 @@ struct PodStatusLite {
 async fn pod_details(client: &Client, ns: &Option<String>, context: &str) -> Result<(Vec<Restart>, Vec<Hot>), String> {
     let usage = async {
         match ns {
+            _ if !crate::settings::metrics_on(context) => PodUsage::new(),
             Some(ns) => k8s::container_usage(client.clone(), ns.clone(), None)
                 .await
                 .unwrap_or_default()
