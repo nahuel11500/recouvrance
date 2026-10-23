@@ -456,6 +456,15 @@ pub use crate::glob::glob;
 
 // MARK: Agents and config
 
+/// Whether two lists of agents give the same rules.yaml, which holds each agent's name
+/// and rules, not whether it is enabled.
+fn same_rules(a: &[Agent], b: &[Agent]) -> bool {
+    let rules = |agents: &[Agent]| {
+        agents.iter().map(|a| Some((a.name.clone(), serde_json::to_value(&a.policy).ok()?))).collect::<Option<Vec<_>>>()
+    };
+    matches!((rules(a), rules(b)), (Some(x), Some(y)) if x == y)
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Agent {
     pub id: String,
@@ -940,8 +949,9 @@ impl Hub {
         Ok(token)
     }
 
-    /// Change an agent. With rules.yaml in use, the change is written there first: if it
-    /// can't be (a rule the file can't hold), nothing changes.
+    /// Change an agent. With rules.yaml in use, a change to what the file holds is written
+    /// there first: if it can't be (a rule the file can't hold, a disk that can't be
+    /// written), nothing changes. Switching an agent on or off doesn't touch the file.
     pub fn update_agent(&self, id: &str, f: impl FnOnce(&mut Agent)) -> Result<()> {
         {
             let mut cfg = write(&self.config);
@@ -949,7 +959,7 @@ impl Hub {
             let agent = agents.iter_mut().find(|a| a.id == id).context("unknown agent")?;
             f(agent);
             // Visual edits keep rules.yaml in step when you use it.
-            if self.rules_file_active() && self.rules_error().is_none() {
+            if self.rules_file_active() && self.rules_error().is_none() && !same_rules(&cfg.agents, &agents) {
                 rules_file::export(&agents).context("rules.yaml not updated")?;
                 *lock(&self.rules_mtime) = std::fs::metadata(rules_file::path()).and_then(|m| m.modified()).ok();
             }
@@ -1226,6 +1236,27 @@ fn load_audit_tail(path: &std::path::Path) -> VecDeque<AuditEntry> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn switching_an_agent_off_leaves_the_rules_file_alone() {
+        let agent = Agent {
+            id: "a1".into(),
+            name: "claude".into(),
+            token_sha256: String::new(),
+            enabled: true,
+            policy: Policy::default(),
+        };
+        let mut off = agent.clone();
+        off.enabled = false;
+        assert!(same_rules(std::slice::from_ref(&agent), &[off]));
+        let mut renamed = agent.clone();
+        renamed.name = "other".into();
+        assert!(!same_rules(std::slice::from_ref(&agent), &[renamed]));
+        let mut ruled = agent.clone();
+        ruled.policy.max_rows += 1;
+        assert!(!same_rules(std::slice::from_ref(&agent), &[ruled]));
+        assert!(!same_rules(std::slice::from_ref(&agent), &[]));
+    }
 
     #[test]
     fn glob_matches() {
