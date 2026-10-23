@@ -73,6 +73,17 @@ where
     RUNTIME.spawn(f).await.map_err(|e| anyhow!("task failed: {e}"))?
 }
 
+/// Like `run`, but dropping the future stops the work too (`run` lets it finish).
+pub async fn run_guarded<F, T>(f: F) -> Result<T>
+where
+    F: Future<Output = Result<T>> + Send + 'static,
+    T: Send + 'static,
+{
+    let task = RUNTIME.spawn(f);
+    let _abort = TaskGuard(task.abort_handle());
+    task.await.map_err(|e| anyhow!("task failed: {e}"))?
+}
+
 /// Aborts the tokio task when dropped, so closing a view stops its stream.
 pub struct TaskGuard(tokio::task::AbortHandle);
 

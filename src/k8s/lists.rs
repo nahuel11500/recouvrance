@@ -47,16 +47,12 @@ where
     T: serde::de::DeserializeOwned + Send + 'static,
 {
     let (c, ar2, ns) = (client.clone(), ar.clone(), namespace.clone());
-    let whole = run(async move {
+    let whole = run_guarded(async move {
         use tokio_util::compat::FuturesAsyncReadCompatExt as _;
         let url = DynamicObject::url_path(&ar2, ns.as_deref());
         let path = format!("{url}?resourceVersion=0&resourceVersionMatch=NotOlderThan");
         let body = c.request_stream(http::Request::get(&path).body(Vec::new())?).await?;
-        let reader = tokio_util::io::SyncIoBridge::new(body.compat());
-        let list: LeanList<T> = tokio::task::spawn_blocking(move || {
-            serde_json::from_reader(std::io::BufReader::with_capacity(256 * 1024, reader))
-        })
-        .await??;
+        let list: LeanList<T> = parse_streamed(body.compat()).await?;
         anyhow::ensure!(list.metadata.continue_.as_ref().is_none_or(|c| c.is_empty()), "the API server paged it");
         Ok(list.items)
     })
@@ -64,6 +60,45 @@ where
     match whole {
         Ok(items) => Ok(items),
         Err(_) => list_lean(client, ar, namespace).await,
+    }
+}
+
+/// Parse a response body as it arrives, on a blocking thread, holding only what `T` keeps.
+/// Dropping the future stops the read and closes the connection, even while it waits for data.
+pub(super) async fn parse_streamed<T, R>(body: R) -> Result<T>
+where
+    T: serde::de::DeserializeOwned + Send + 'static,
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
+    let (_reading, dropped) = tokio::sync::oneshot::channel();
+    let reader = tokio_util::io::SyncIoBridge::new(Cancellable { inner: body, dropped, cancelled: false });
+    let parsed = tokio::task::spawn_blocking(move || {
+        serde_json::from_reader(std::io::BufReader::with_capacity(256 * 1024, reader))
+    })
+    .await??;
+    Ok(parsed)
+}
+
+/// A reader that fails once its `dropped` sender is gone.
+struct Cancellable<R> {
+    inner: R,
+    dropped: tokio::sync::oneshot::Receiver<()>,
+    cancelled: bool,
+}
+
+impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for Cancellable<R> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        if !self.cancelled && std::pin::Pin::new(&mut self.dropped).poll(cx).is_ready() {
+            self.cancelled = true;
+        }
+        if self.cancelled {
+            return std::task::Poll::Ready(Err(std::io::Error::other("cancelled")));
+        }
+        std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
     }
 }
 
@@ -89,6 +124,35 @@ mod tests {
         let list: super::LeanList<Name> = serde_json::from_str(json).unwrap();
         assert_eq!(list.items[0].metadata.name.as_deref(), Some("a"));
         assert_eq!(list.metadata.continue_.as_deref(), Some("abc"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn dropping_a_streamed_read_stops_it() {
+        use tokio::io::AsyncWriteExt as _;
+        let (mut server, client) = tokio::io::duplex(64);
+        // The server sends part of a list, then nothing: the read waits on the connection.
+        server.write_all(br#"{"items":["#).await.unwrap();
+        let read = tokio::spawn(super::parse_streamed::<serde_json::Value, _>(client));
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        read.abort();
+        let mut closed = false;
+        for _ in 0..50 {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            if server.write_all(b" ").await.is_err() {
+                closed = true;
+                break;
+            }
+        }
+        assert!(closed, "the read kept the connection open");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn streamed_reads_parse() {
+        let (mut server, client) = tokio::io::duplex(64);
+        let read = tokio::spawn(super::parse_streamed::<serde_json::Value, _>(client));
+        tokio::io::AsyncWriteExt::write_all(&mut server, br#"{"items":[1,2]}"#).await.unwrap();
+        drop(server);
+        assert_eq!(read.await.unwrap().unwrap()["items"][1], 2);
     }
 
     #[test]
