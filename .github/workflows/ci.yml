@@ -1,8 +1,8 @@
 name: CI
 
-# Pull requests get the quick checks (a few minutes). Pushes to main, release tags and
-# manual runs get everything: macOS, the minimum Rust version, docs, an end-to-end run on
-# a kind cluster and release builds.
+# Pull requests get the quick checks and the end-to-end run on a kind cluster (the write
+# guards). Pushes to main, release tags and manual runs get everything: macOS, the minimum
+# Rust version, docs and release builds.
 on:
   pull_request:
   push:
@@ -27,12 +27,16 @@ env:
     pkg-config clang cmake libfontconfig-dev libfreetype-dev libxkbcommon-dev libxkbcommon-x11-dev
     libwayland-dev libvulkan-dev libx11-xcb-dev libxcb1-dev
   FULL: ${{ github.event_name != 'pull_request' }}
+  # When many jobs start at once the Ubuntu mirror can stall for minutes: time out and retry.
+  APT_GET: sudo apt-get -qq -o Acquire::Retries=5 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20
 
 jobs:
   # ---- Quick checks (every pull request and push) ----
 
-  fmt:
-    name: Format
+  # Format, spelling, licenses and advisories share one runner: on a busy day every job waits
+  # for a free runner, so fewer jobs per PR means less waiting.
+  quick:
+    name: Format, spelling and licenses
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -41,13 +45,8 @@ jobs:
           toolchain: stable
           components: rustfmt
       - run: cargo fmt --all --check
-
-  typos:
-    name: Spelling
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: crate-ci/typos@7f9d0819ca1c008ade73f4b41fa9d258d48f605b # v1.51.1
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
 
   check:
     name: Clippy and tests
@@ -55,7 +54,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: System libraries
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends $LINUX_DEPS
+        run: $APT_GET update && $APT_GET install -y --no-install-recommends $LINUX_DEPS
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: stable
@@ -70,13 +69,6 @@ jobs:
         run: cargo clippy --locked --profile ci --all-targets -- -D warnings
       - name: Tests
         run: cargo test --locked --profile ci --features dev
-
-  deny:
-    name: Licenses and advisories
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
 
   # ---- Full run (main, tags, manual) ----
 
@@ -100,7 +92,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - run: sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends $LINUX_DEPS
+      - run: $APT_GET update && $APT_GET install -y --no-install-recommends $LINUX_DEPS
       - name: Read rust-version from Cargo.toml
         id: msrv
         run: echo "version=$(grep -m1 '^rust-version' Cargo.toml | cut -d'"' -f2)" >> "$GITHUB_OUTPUT"
@@ -118,7 +110,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - run: sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends $LINUX_DEPS
+      - run: $APT_GET update && $APT_GET install -y --no-install-recommends $LINUX_DEPS
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: stable
@@ -131,11 +123,10 @@ jobs:
 
   e2e:
     name: End to end (kind)
-    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - run: sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends $LINUX_DEPS mesa-vulkan-drivers
+      - run: $APT_GET update && $APT_GET install -y --no-install-recommends $LINUX_DEPS mesa-vulkan-drivers
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: stable
@@ -156,6 +147,12 @@ jobs:
           grep -q "^kinds=" smoke.txt
           grep -q "^rows=" smoke.txt
           RECOUVRANCE_SMOKE=kind-recouvrance RECOUVRANCE_LISTTIME=1 target/ci/recouvrance
+      - name: Write guards (write mode, agent rules, kill switch during a drain)
+        env:
+          XDG_CONFIG_HOME: ${{ runner.temp }}/guards-config
+          XDG_DATA_HOME: ${{ runner.temp }}/guards-data
+          RECOUVRANCE_E2E_CONTEXT: kind-recouvrance
+        run: cargo test --locked --profile ci --features dev -- --ignored --test-threads 1 "e2e::"
       - name: Render the UI off-screen
         env:
           XDG_CONFIG_HOME: ${{ runner.temp }}/config
@@ -176,7 +173,7 @@ jobs:
   build:
     name: Release build (${{ matrix.target }})
     if: github.event_name != 'pull_request'
-    needs: [fmt, check]
+    needs: [quick, check]
     strategy:
       fail-fast: false
       matrix:
@@ -192,7 +189,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - if: runner.os == 'Linux'
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends $LINUX_DEPS
+        run: $APT_GET update && $APT_GET install -y --no-install-recommends $LINUX_DEPS
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: stable
@@ -210,7 +207,7 @@ jobs:
   ci-ok:
     name: CI result
     if: always()
-    needs: [fmt, typos, check, deny, test-macos, msrv, docs, e2e, build]
+    needs: [quick, check, test-macos, msrv, docs, e2e, build]
     runs-on: ubuntu-latest
     steps:
       - name: All required jobs passed or were skipped

@@ -48,6 +48,7 @@ impl AppView {
         self.page_scopes.clear();
         // The palette's object index points at the old clusters.
         self.search_index.clear();
+        self.index_failed.clear();
         self.index_built = None;
         self._index_tasks.clear();
         self.status = Some(format!("Connecting to {}…", contexts.join(", ")).into());
@@ -115,6 +116,13 @@ impl AppView {
                     Ok((client, kinds, kind_clusters, namespaces)) => {
                         this.kind_clusters = kind_clusters;
                         this.connect_errors = (!errors.is_empty()).then(|| errors.join("; ").into());
+                        // The first context may have failed: namespace visits and the ones added
+                        // by hand belong to the cluster that is first now.
+                        if let Some((first, _)) = clusters.first() {
+                            let first = first.clone();
+                            this.context = Some(first.clone());
+                            this.ns_picker.update(cx, |p, _| p.context = first);
+                        }
                         this.client = Some(client);
                         this.clusters = clusters;
                         let keep = this.kind.as_ref().map(|k| k.key());
@@ -128,15 +136,9 @@ impl AppView {
                         let active = this.active_tab;
                         let fallback = this.kind.clone();
                         for (i, tab) in this.tabs.iter_mut().enumerate() {
-                            if i == active {
-                                continue;
+                            if i != active {
+                                served_tab(tab, &kinds, &namespaces, fallback.as_ref());
                             }
-                            tab.kind = tab
-                                .kind
-                                .take()
-                                .and_then(|k| kinds.iter().find(|x| x.key() == k.key()).cloned())
-                                .or_else(|| fallback.clone());
-                            tab.namespaces.retain(|ns| namespaces.contains(ns));
                         }
                         this.settings_view.update(cx, |s, _| s.set_kinds(kinds.clone()));
                         this.kinds = kinds;
@@ -188,6 +190,7 @@ impl AppView {
         self.ns_picker.update(cx, |p, _| p.selected = kept.iter().cloned().collect());
         self.namespaces = kept;
         self.namespace = (self.namespaces.len() == 1).then(|| self.namespaces[0].clone());
+        self.update_assistant_scope(cx);
     }
 
     /// Reload the contexts when a kubeconfig file (or a watched folder) changes.
@@ -202,6 +205,10 @@ impl AppView {
                 }
                 // Not the cached list, which may predate the change; on a failed read, try again.
                 let Ok(contexts) = k8s::reload_contexts() else { continue };
+                // A file may be half-written: wait until it reads the same twice.
+                if !contexts.settled {
+                    continue;
+                }
                 seen = now;
                 let alive = this.update_in(cx, |this, window, cx| this.contexts_reloaded(contexts.names, window, cx));
                 if alive.is_err() {
@@ -218,6 +225,7 @@ impl AppView {
         self.all_contexts = names.clone();
         self.ctx_picker.update(cx, |p, cx| p.set_all(names, cx));
         self.settings_view.update(cx, |s, cx| s.sync_clusters(window, cx));
+        self.agents.update(cx, |a, _| a.refresh_contexts());
         let msg = match (added, removed) {
             (0, 0) => "Kubeconfig reloaded".to_string(),
             (a, 0) => format!("Kubeconfig reloaded: {a} new context{}", if a > 1 { "s" } else { "" }),
@@ -257,6 +265,7 @@ impl AppView {
         }
         self.namespaces = namespaces;
         self.namespace = (self.namespaces.len() == 1).then(|| self.namespaces[0].clone());
+        self.update_assistant_scope(cx);
     }
 }
 
@@ -299,6 +308,15 @@ fn served_lists(history: &mut [Route], kinds: &[Kind], fallback: Option<&Kind>) 
     }
 }
 
+/// A tab not shown keeps its kind, lists and namespaces only where the new clusters have
+/// them: a tab switched away from while connecting still names the old clusters' kind.
+fn served_tab(tab: &mut TabState, kinds: &[Kind], namespaces: &[String], fallback: Option<&Kind>) {
+    tab.kind =
+        tab.kind.take().and_then(|k| kinds.iter().find(|x| x.key() == k.key()).cloned()).or_else(|| fallback.cloned());
+    served_lists(&mut tab.history, kinds, tab.kind.as_ref());
+    tab.namespaces.retain(|ns| namespaces.contains(ns));
+}
+
 /// Every list joined, or nothing when one of them is empty (that cluster may list all).
 fn all_restricted(lists: impl IntoIterator<Item = Vec<String>>) -> Vec<String> {
     let mut joined = Vec::new();
@@ -339,7 +357,9 @@ fn one_namespace(wanted: &[String], previous: &[String], accessible: &[String]) 
 
 #[cfg(test)]
 mod tests {
-    use super::{Kind, Route, all_restricted, cluster_namespace, merge_kinds, one_namespace, served_lists};
+    use super::{
+        Kind, Route, TabState, all_restricted, cluster_namespace, merge_kinds, one_namespace, served_lists, served_tab,
+    };
 
     fn kind(k: &str) -> Kind {
         Kind {
@@ -364,6 +384,21 @@ mod tests {
         assert_eq!(kinds.len(), 1);
         assert_eq!(where_[&kinds[0].key()], [0]);
         assert_eq!(errors, ["c: no such context", "b: connection refused"]);
+    }
+
+    #[test]
+    fn a_tab_left_while_connecting_drops_a_kind_the_clusters_dont_serve() {
+        let (pods, certs) = (kind("Pod"), kind("Certificate"));
+        let mut tab = TabState {
+            history: vec![Route::Resources(Some(certs.clone()))],
+            kind: Some(certs),
+            namespaces: vec!["a".into(), "gone".into()],
+            ..Default::default()
+        };
+        served_tab(&mut tab, std::slice::from_ref(&pods), &["a".to_string()], Some(&pods));
+        assert_eq!(tab.kind.as_ref().map(|k| k.label.as_str()), Some("Pod"));
+        assert!(matches!(&tab.history[..], [Route::Resources(Some(k))] if k.label == "Pod"));
+        assert_eq!(tab.namespaces, ["a"]);
     }
 
     #[test]

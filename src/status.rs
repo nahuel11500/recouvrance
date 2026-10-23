@@ -40,7 +40,7 @@ const BAD: [&str; 23] = [
 /// Finished: neither good nor bad any more.
 const DONE: [&str; 5] = ["completed", "succeeded", "done", "finished", "terminated"];
 
-const BUSY: [&str; 14] = [
+const BUSY: [&str; 15] = [
     "pending",
     "progressing",
     "creating",
@@ -55,6 +55,8 @@ const BUSY: [&str; 14] = [
     "deleting",
     "suspended",
     "unknown",
+    // Held on purpose until a controller (Kueue…) removes its gates.
+    "schedulinggated",
 ];
 
 /// Good words found anywhere ("NewReplicaSetAvailable"), unless negated ("Unready").
@@ -100,7 +102,10 @@ pub(crate) fn tone(status: &str) -> Option<Tone> {
     let words = words(status);
     // "Installed" holds "stalled".
     let bad_text = s.replace("install", "");
-    if BAD.iter().any(|w| bad_text.contains(w)) || words.iter().any(|w| w == "false") || negated(&words) {
+    // Refused by the kubelet for want of a resource: OutOfcpu, OutOfmemory, OutOfpods… A
+    // prefix only: "Rollout of" holds "outof".
+    let out_of = s.starts_with("outof");
+    if BAD.iter().any(|w| bad_text.contains(w)) || out_of || words.iter().any(|w| w == "false") || negated(&words) {
         return Some(Tone::Bad);
     }
     if DONE.contains(&s.as_str()) {
@@ -203,6 +208,14 @@ pub fn true_is_bad(ty: &str) -> bool {
     )
 }
 
+/// Whether a node condition reports a problem. On a node every condition but Ready is
+/// True when something is wrong (pressure, node-problem-detector's `KubeletProblem`,
+/// Azure's `VMEventScheduled`…), so one we don't know is flagged too, unless its name says
+/// it is good when True ("GPUHealthy").
+pub fn node_condition_bad(ty: &str, status: &str) -> bool {
+    status == "True" && (true_is_bad(ty) || (!true_is_good(ty) && tone(ty) != Some(Tone::Good)))
+}
+
 /// Condition types where "True" is the good state, so "False" is bad.
 pub fn true_is_good(ty: &str) -> bool {
     matches!(
@@ -247,7 +260,7 @@ pub(crate) fn condition_tone(ty: &str, status: &str) -> Option<Tone> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Tone, condition_tone, tone, words};
+    use super::{Tone, condition_tone, node_condition_bad, tone, words};
 
     #[test]
     fn condition_tones() {
@@ -271,6 +284,21 @@ mod tests {
         ];
         for (ty, status, want) in cases {
             assert_eq!(condition_tone(ty, status), *want, "{ty}={status}");
+        }
+    }
+
+    #[test]
+    fn node_conditions() {
+        // Known and unknown problem conditions, as node-problem-detector and clouds add them.
+        for ty in ["MemoryPressure", "KernelDeadlock", "KubeletProblem", "ContainerRuntimeProblem", "VMEventScheduled"]
+        {
+            assert!(node_condition_bad(ty, "True"), "{ty}");
+            assert!(!node_condition_bad(ty, "False"), "{ty}");
+            assert!(!node_condition_bad(ty, "Unknown"), "{ty}");
+        }
+        // Good when True.
+        for ty in ["Ready", "GPUHealthy", "CiliumAgentReady"] {
+            assert!(!node_condition_bad(ty, "True"), "{ty}");
         }
     }
 
@@ -301,6 +329,7 @@ mod tests {
             ("ContainerCreating", Some(Tone::Busy)),
             ("Init:0/2", Some(Tone::Busy)),
             ("Unknown", Some(Tone::Busy)),
+            ("SchedulingGated", Some(Tone::Busy)),
             // Negated good words.
             ("Unready", Some(Tone::Bad)),
             ("Inactive", Some(Tone::Bad)),
@@ -327,6 +356,12 @@ mod tests {
             ("NotReady,SchedulingDisabled", Some(Tone::Bad)),
             ("ContainerStatusUnknown", Some(Tone::Bad)),
             ("Init:ContainerStatusUnknown", Some(Tone::Bad)),
+            // Refused by the kubelet.
+            ("OutOfcpu", Some(Tone::Bad)),
+            ("OutOfmemory", Some(Tone::Bad)),
+            ("OutOfpods", Some(Tone::Bad)),
+            ("UnexpectedAdmissionError", Some(Tone::Bad)),
+            ("Rollout of v2", None),
             // Unknown words stay neutral.
             ("Lorem", None),
             ("Setup", None),

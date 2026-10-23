@@ -31,11 +31,11 @@ jobs:
             revert
 
   # A fix comes with a test that fails without it: fixes made without one came back in
-  # later audit rounds. The label "no test needed" skips it (docs, CI, a typo).
+  # later audit rounds. The label "no test needed" skips it (docs, CI, a typo). It runs (and
+  # passes) on every pull request, so it can be a required check.
   regression-test:
     name: Fix has a test
     runs-on: ubuntu-latest
-    if: startsWith(github.event.pull_request.title, 'fix')
     steps:
       - name: Look for a new test in the changes
         env:
@@ -43,7 +43,12 @@ jobs:
           REPO: ${{ github.repository }}
           PR: ${{ github.event.pull_request.number }}
           LABELS: ${{ toJson(github.event.pull_request.labels.*.name) }}
+          TITLE: ${{ github.event.pull_request.title }}
         run: |
+          if [[ "$TITLE" != fix* ]]; then
+            echo "Not a fix."
+            exit 0
+          fi
           if jq -e 'index("no test needed")' <<<"$LABELS" >/dev/null; then
             echo "Labelled \"no test needed\"."
             exit 0
@@ -51,7 +56,7 @@ jobs:
           files=$(gh api --paginate "repos/$REPO/pulls/$PR/files")
           code=$(jq -s '[.[][] | select(.filename | test("^(src|fuzz)/.*\\.rs$"))] | length' <<<"$files")
           tests=$(jq -rs '.[][] | select(.filename | test("\\.rs$")) | .patch // ""' <<<"$files" \
-            | grep -cE '^\+.*(#\[(gpui::)?test\]|proptest!)' || true)
+            | grep -cE '^\+.*(#\[([a-z_]+::)?test\]|proptest!)' || true)
           echo "Rust files changed: $code, tests added: $tests"
           if [ "$code" -gt 0 ] && [ "$tests" -eq 0 ]; then
             echo "::error::A fix needs a test that fails without it (or the label \"no test needed\")."
