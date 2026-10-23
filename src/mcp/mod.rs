@@ -572,6 +572,28 @@ pub struct AuditStats {
 
 // MARK: Hub
 
+/// How a request for approval ended.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Answer {
+    Approved,
+    Rejected,
+    TimedOut,
+    /// The kill switch was turned on while it waited.
+    SwitchedOff,
+}
+
+impl Answer {
+    /// Why the call didn't go ahead, for the agent and the activity log.
+    pub fn reason(self) -> &'static str {
+        match self {
+            Answer::Approved => "approved",
+            Answer::Rejected => "the user did not approve this request",
+            Answer::TimedOut => "the user did not answer within 2 minutes",
+            Answer::SwitchedOff => "agent access was switched off while the request waited",
+        }
+    }
+}
+
 pub struct Approval {
     pub id: u64,
     pub agent_id: String,
@@ -656,7 +678,7 @@ pub struct Hub {
     /// The last failure writing audit.jsonl, shown on the Agents page.
     audit_error: Mutex<Option<String>>,
     last_seen: Mutex<HashMap<String, jiff::Timestamp>>,
-    approvals: Mutex<HashMap<u64, oneshot::Sender<bool>>>,
+    approvals: Mutex<HashMap<u64, oneshot::Sender<Answer>>>,
     next_approval: AtomicU64,
     subscribers: Mutex<Vec<mpsc::UnboundedSender<Arc<HubEvent>>>>,
     clients: Mutex<HashMap<String, Arc<Cluster>>>,
@@ -908,7 +930,7 @@ impl Hub {
         if !enabled {
             // Refuse anything still waiting for approval.
             for (_, tx) in lock(&self.approvals).drain() {
-                let _ = tx.send(false);
+                let _ = tx.send(Answer::SwitchedOff);
             }
         }
         self.save()
@@ -1067,8 +1089,8 @@ impl Hub {
 
     // Approvals
 
-    /// Ask the user in the UI. Resolves to false on deny, timeout, kill switch, or
-    /// at once when there is no window to ask in.
+    /// Ask the user in the UI. Anything but [`Answer::Approved`] refuses the call; with
+    /// no window to ask in, the request is refused at once.
     pub async fn request_approval(
         &self,
         agent: &Agent,
@@ -1076,9 +1098,9 @@ impl Hub {
         summary: String,
         access: Access,
         dry_run: bool,
-    ) -> bool {
+    ) -> Answer {
         if self.headless() {
-            return false;
+            return Answer::Rejected;
         }
         let id = self.next_approval.fetch_add(1, Ordering::SeqCst);
         let (tx, rx) = oneshot::channel();
@@ -1095,12 +1117,16 @@ impl Hub {
         let result = tokio::time::timeout(Duration::from_secs(120), rx).await;
         lock(&self.approvals).remove(&id);
         self.emit(HubEvent::ApprovalResolved(id));
-        matches!(result, Ok(Ok(true)))
+        match result {
+            Ok(Ok(answer)) => answer,
+            Ok(Err(_)) => Answer::Rejected,
+            Err(_) => Answer::TimedOut,
+        }
     }
 
     pub fn resolve_approval(&self, id: u64, approved: bool) {
         if let Some(tx) = lock(&self.approvals).remove(&id) {
-            let _ = tx.send(approved);
+            let _ = tx.send(if approved { Answer::Approved } else { Answer::Rejected });
         }
     }
 
@@ -1227,6 +1253,14 @@ fn load_audit_tail(path: &std::path::Path) -> VecDeque<AuditEntry> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_refusal_says_the_user_refused() {
+        assert!(Answer::Rejected.reason().contains("did not approve"));
+        for a in [Answer::TimedOut, Answer::SwitchedOff] {
+            assert!(!a.reason().contains("did not approve"), "{a:?}");
+        }
+    }
 
     #[test]
     fn glob_matches() {
