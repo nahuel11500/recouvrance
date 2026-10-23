@@ -202,6 +202,10 @@ impl AppView {
                 }
                 // Not the cached list, which may predate the change; on a failed read, try again.
                 let Ok(contexts) = k8s::reload_contexts() else { continue };
+                // A file may be half-written: wait until it reads the same twice.
+                if !contexts.settled {
+                    continue;
+                }
                 seen = now;
                 let alive = this.update_in(cx, |this, window, cx| this.contexts_reloaded(contexts.names, window, cx));
                 if alive.is_err() {
