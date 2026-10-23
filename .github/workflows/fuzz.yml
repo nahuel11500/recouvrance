@@ -1,10 +1,12 @@
 # Fuzzing with ClusterFuzzLite (cargo-fuzz targets in fuzz/): the table filter, Kubernetes
-# quantities and YAML. On a PR, the fuzzers its changes reach run for 5 minutes; every week, all
-# of them run for 30. A crash fails the run with the input that caused it.
+# quantities and YAML. After a push to main that touches the code, all of them run for 5 minutes;
+# every week, for 30. Not on PRs, so PR checks don't wait for runners. A crash fails the run with
+# the input that caused it.
 name: Fuzzing
 
 on:
-  pull_request:
+  push:
+    branches: [main]
     paths: ["src/**", "fuzz/**", ".clusterfuzzlite/**", ".github/workflows/fuzz.yml"]
   schedule:
     - cron: "43 4 * * 2"
@@ -14,7 +16,7 @@ permissions: {}
 
 jobs:
   fuzz:
-    name: Fuzz (${{ github.event_name == 'pull_request' && 'changes' || 'all' }})
+    name: Fuzz
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -32,5 +34,5 @@ jobs:
           language: rust
           github-token: ${{ secrets.GITHUB_TOKEN }}
           sanitizer: address
-          mode: ${{ github.event_name == 'pull_request' && 'code-change' || 'batch' }}
-          fuzz-seconds: ${{ github.event_name == 'pull_request' && 300 || 1800 }}
+          mode: batch
+          fuzz-seconds: ${{ github.event_name == 'push' && 300 || 1800 }}
