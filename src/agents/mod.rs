@@ -34,8 +34,11 @@ pub struct AgentsView {
     all_activity: bool,
     activity: Activity,
     hub: Arc<Hub>,
+    /// The kubeconfig's contexts, those of them protected in Settings, and why the
+    /// kubeconfig couldn't be read: for the rule editor's hints.
     contexts: Vec<String>,
-    risky: Vec<String>,
+    protected: Vec<String>,
+    contexts_error: Option<String>,
     selected: Option<String>,
     /// Token shown once after creating or rotating, per agent id.
     fresh_token: Option<(String, String)>,
@@ -123,7 +126,6 @@ fn rule_with(
 impl AgentsView {
     pub fn new(hub: Arc<Hub>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let server_status = hub.server_status().unwrap_or_else(|| Err("starting…".into()));
-        let (contexts, risky) = k8s::load_contexts().map(|c| (c.names, c.risky)).unwrap_or_default();
         let new_name = cx.new(|cx| InputState::new(window, cx).placeholder("Agent name, e.g. claude-code"));
         let input = |placeholder: &'static str, window: &mut Window, cx: &mut Context<Self>| {
             cx.new(|cx| InputState::new(window, cx).placeholder(placeholder))
@@ -169,8 +171,9 @@ impl AgentsView {
             code_message: None,
             all_activity: false,
             hub,
-            contexts,
-            risky,
+            contexts: Vec::new(),
+            protected: Vec::new(),
+            contexts_error: None,
             selected: None,
             fresh_token: None,
             new_name,
@@ -180,6 +183,7 @@ impl AgentsView {
             error,
             _subs: subs,
         };
+        this.refresh_contexts();
         if let Some(id) = selected {
             this.select(id, window, cx);
         }
@@ -334,6 +338,19 @@ impl AgentsView {
         self.update(|a| f(&mut a.policy.rules), cx);
         if let Some(agent) = self.selected.as_ref().and_then(|id| self.hub.agent(id)) {
             self.rebuild_editor(&agent, window, cx);
+        }
+    }
+
+    /// Read the kubeconfig's contexts and their protection again: when the kubeconfig
+    /// changes, and when the page is shown (protection is set in Settings).
+    pub fn refresh_contexts(&mut self) {
+        match k8s::load_contexts() {
+            Ok(c) => {
+                self.protected = c.names.iter().filter(|n| crate::settings::is_protected(n)).cloned().collect();
+                self.contexts = c.names;
+                self.contexts_error = None;
+            }
+            Err(e) => self.contexts_error = Some(format!("{e:#}")),
         }
     }
 
