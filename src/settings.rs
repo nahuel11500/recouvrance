@@ -290,7 +290,9 @@ fn load() -> Settings {
 /// `T` from a JSON object, one field at a time: a field that does not read gets its
 /// default. None when the text is not a JSON object.
 fn by_field<T: Serialize + serde::de::DeserializeOwned + Default>(bytes: &[u8]) -> Option<T> {
-    let serde_json::Value::Object(fields) = serde_json::from_slice(bytes).ok()? else { return None };
+    let serde_json::Value::Object(fields) = serde_json::from_slice::<serde_json::Value>(bytes).ok()? else {
+        return None;
+    };
     let mut merged = serde_json::to_value(T::default()).ok()?;
     for (key, value) in fields {
         let mut candidate = merged.clone();
