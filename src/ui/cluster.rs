@@ -301,7 +301,6 @@ async fn usage(context: &str, client: Client) -> Usage {
 /// over 30 s.
 async fn load(context: String, client: Client) -> Summary {
     let on = crate::settings::metrics_on(&context);
-    let mut s = Summary { context, ..Default::default() };
     let c = client.clone();
     let version = k8s::run(async move {
         let v: Value = c.request(http::Request::get("/version").body(Vec::new())?).await?;
@@ -315,43 +314,59 @@ async fn load(context: String, client: Client) -> Summary {
         metrics(on, client.clone(), "/apis/metrics.k8s.io/v1beta1/nodes"),
         metrics(on, client.clone(), "/apis/metrics.k8s.io/v1beta1/pods"),
     );
-    // Each part on its own: a user who can't list nodes still sees the pods.
+    summarize(context, Answers { version, nodes, pods, namespaces, node_metrics, pod_metrics })
+}
+
+/// What a cluster answered for its summary, each part on its own.
+struct Answers {
+    version: anyhow::Result<String>,
+    nodes: anyhow::Result<Vec<NodeLite>>,
+    pods: anyhow::Result<Vec<PodLite>>,
+    namespaces: anyhow::Result<Vec<String>>,
+    node_metrics: Option<MetricsList>,
+    pod_metrics: Option<MetricsList>,
+}
+
+/// The summary from what was answered: a part that failed is said, not taken as 0, and
+/// doesn't hide the others (a user who can't list nodes still sees the pods).
+fn summarize(context: String, a: Answers) -> Summary {
+    let mut s = Summary { context, ..Default::default() };
     let failed = |what: &str, e: &anyhow::Error| match k8s::api_status(e) {
         Some(403) => format!("{what}: forbidden"),
         _ => format!("{what}: {}", k8s::short_error(e)),
     };
-    match version {
+    match a.version {
         Ok(v) => s.version = Some(v),
         Err(e) => s.errors.push(failed("Version", &e)),
     }
-    match nodes {
+    match a.nodes {
         Ok(nodes) => {
             add_nodes(&mut s, &nodes);
             s.nodes_known = true;
         }
         Err(e) => s.errors.push(failed("Nodes", &e)),
     }
-    match pods {
+    match a.pods {
         Ok(pods) => {
             add_pods(&mut s, &pods);
             s.pods_known = true;
         }
         Err(e) => s.errors.push(failed("Pods", &e)),
     }
-    match namespaces {
+    match a.namespaces {
         Ok(n) => s.namespaces = Some(n.len()),
         Err(e) => s.errors.push(failed("Namespaces", &e)),
     }
 
     // Usage: nodes for the totals, pods for the per-namespace ranking.
-    if let Some(node_metrics) = node_metrics {
+    if let Some(node_metrics) = a.node_metrics {
         for n in node_metrics.items {
             s.cpu.2 += k8s::parse_cpu(quantity(&n.usage, "cpu"));
             s.mem.2 += k8s::parse_bytes(quantity(&n.usage, "memory"));
         }
         s.usage_known = true;
     }
-    if let Some(pod_metrics) = pod_metrics {
+    if let Some(pod_metrics) = a.pod_metrics {
         let mut by_ns: HashMap<String, (f64, f64)> = HashMap::new();
         for p in pod_metrics.items {
             let e = by_ns.entry(p.metadata.namespace).or_default();
@@ -762,7 +777,49 @@ impl Render for ClusterOverview {
 
 #[cfg(test)]
 mod tests {
-    use super::{NodeLite, PodLite, Summary, add_nodes, add_pods};
+    use super::{Answers, MetricsList, NodeLite, PodLite, Summary, add_nodes, add_pods, summarize};
+
+    fn forbidden() -> anyhow::Error {
+        kube::Error::Api(kube::core::Status::failure("nodes is forbidden", "Forbidden").with_code(403).boxed()).into()
+    }
+
+    #[test]
+    fn one_part_failing_keeps_the_others() {
+        // A namespace-scoped user: nodes and namespaces refused, pods listed, no metrics-server.
+        let pods: Vec<PodLite> =
+            serde_json::from_value(serde_json::json!([{"spec": {"containers": [{}]}, "status": {"phase": "Running"}}]))
+                .unwrap();
+        let s = summarize(
+            "c".into(),
+            Answers {
+                version: Ok("v1.33.1".into()),
+                nodes: Err(forbidden()),
+                pods: Ok(pods),
+                namespaces: Err(forbidden()),
+                node_metrics: None,
+                pod_metrics: None,
+            },
+        );
+        assert!(s.error.is_none());
+        assert_eq!(s.version.as_deref(), Some("v1.33.1"));
+        assert_eq!(s.errors, ["Nodes: forbidden", "Namespaces: forbidden"]);
+        assert!(!s.nodes_known && s.pods_known && !s.usage_known);
+        assert_eq!((s.pods_running, s.pods_total), (1, 1));
+        assert_eq!(s.namespaces, None);
+        // Nothing answered: one error for the cluster.
+        let s = summarize(
+            "c".into(),
+            Answers {
+                version: Err(anyhow::anyhow!("connection refused")),
+                nodes: Err(anyhow::anyhow!("connection refused")),
+                pods: Err(anyhow::anyhow!("connection refused")),
+                namespaces: Err(anyhow::anyhow!("connection refused")),
+                node_metrics: None,
+                pod_metrics: Some(MetricsList::default()),
+            },
+        );
+        assert_eq!(s.error.as_deref(), Some("Version: connection refused"));
+    }
 
     #[test]
     fn summarizes_lean_nodes_and_pods() {
