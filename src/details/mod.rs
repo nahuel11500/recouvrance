@@ -200,7 +200,7 @@ impl DetailPanel {
         let ns = obj.namespace.clone().unwrap_or_default();
         let logs = is_pod.then(|| {
             let (client, ns, name) = (client.clone(), ns.clone(), obj.name.clone());
-            cx.new(|cx| LogsView::new(client, ns, vec![name], window, cx))
+            cx.new(|cx| LogsView::new(client, ns, vec![(name, Vec::new())], window, cx))
         });
         let terminal = is_pod.then(|| {
             let (client, ns, name, ctx) = (client.clone(), ns.clone(), obj.name.clone(), context.clone());
@@ -609,10 +609,13 @@ impl DetailPanel {
                     this.update(cx, |this, _| std::mem::take(&mut this.related.container_history)).unwrap_or_default();
                 let ok = this.update_in(cx, |this, window, cx| {
                     // Workload logs follow all of its pods, as they come and go.
-                    let names: Vec<String> = related
+                    let names: Vec<(String, Vec<String>)> = related
                         .pods
                         .iter()
-                        .filter_map(|p| p.pointer("/metadata/name").and_then(|v| v.as_str()).map(String::from))
+                        .filter_map(|p| {
+                            let name = p.pointer("/metadata/name").and_then(|v| v.as_str())?;
+                            Some((name.to_string(), k8s::pod_containers(p)))
+                        })
                         .collect();
                     if pods_logs && !names.is_empty() {
                         match &this.logs {
@@ -622,7 +625,7 @@ impl DetailPanel {
                                 this.logs = Some(cx.new(|cx| LogsView::new(client, ns, names, window, cx)));
                                 this.resume_logs_if_shown(cx);
                             }
-                            Some(logs) => logs.update(cx, |l, cx| l.set_pods(names, cx)),
+                            Some(logs) => logs.update(cx, |l, cx| l.set_pods(names, window, cx)),
                         }
                     }
                     // A thousand pods take a while to free: not on the UI thread.
