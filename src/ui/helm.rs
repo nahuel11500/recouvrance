@@ -252,15 +252,32 @@ async fn newest_revision(client: Client, namespace: String, name: String) -> Res
     .await
 }
 
+/// Why revision `revision` of a release can't be read, when its Secret is there but its payload
+/// doesn't decode (too large, say): the history leaves it out, so no page can show it.
+async fn unreadable_revision(client: Client, namespace: String, name: String, revision: i64) -> Option<String> {
+    k8s::run(async move {
+        let api: Api<Secret> = Api::namespaced(client, &namespace);
+        let secret = api.get(&format!("sh.helm.release.v1.{name}.v{revision}")).await?;
+        Ok(decode(&secret).err().map(|e| format!("{e:#}")))
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
 /// Why an upgrade built from revision `shown` must not run, given the release's newest
 /// revision now: it would send that revision's chart version and values over newer ones.
-fn stale_upgrade(name: &str, shown: i64, newest: Option<i64>) -> Option<String> {
-    match newest {
-        Some(n) if n == shown => None,
-        Some(n) => Some(format!(
+/// `unreadable` is why the newest one can't be read, if it can't.
+fn stale_upgrade(name: &str, shown: i64, newest: Option<i64>, unreadable: Option<&str>) -> Option<String> {
+    match (newest, unreadable) {
+        (Some(n), _) if n == shown => None,
+        (Some(n), Some(e)) => {
+            Some(format!("{name}'s newest revision ({n}) can't be read here ({e}): upgrade it with the helm CLI"))
+        }
+        (Some(n), None) => Some(format!(
             "{name} changed since this page was read (revision {shown}, now {n}): open it again to upgrade from there"
         )),
-        None => Some(format!("{name} has no revision any more: it may have been uninstalled")),
+        (None, _) => Some(format!("{name} has no revision any more: it may have been uninstalled")),
     }
 }
 
@@ -892,8 +909,12 @@ impl HelmRelease {
         cx.spawn_in(window, async move |this, cx| {
             // The page may be out of date (CI upgraded meanwhile): its chart version and values
             // would undo the newer revision. Refused when that can't be checked either.
-            let stale = match newest_revision(client, ns.clone(), name.clone()).await {
-                Ok(newest) => stale_upgrade(&name, shown, newest),
+            let stale = match newest_revision(client.clone(), ns.clone(), name.clone()).await {
+                Ok(Some(n)) if n != shown => {
+                    let unreadable = unreadable_revision(client, ns.clone(), name.clone(), n).await;
+                    stale_upgrade(&name, shown, Some(n), unreadable.as_deref())
+                }
+                Ok(newest) => stale_upgrade(&name, shown, newest, None),
                 Err(e) => Some(format!("could not read {name}'s newest revision: {e:#}")),
             };
             if let Some(why) = stale {
@@ -1378,10 +1399,13 @@ mod tests {
 
     #[test]
     fn upgrades_only_from_the_newest_revision() {
-        assert!(stale_upgrade("web", 5, Some(5)).is_none());
+        assert!(stale_upgrade("web", 5, Some(5), None).is_none());
         // CI upgraded to 6 after the page read 5: 5's chart version and values would undo it.
-        assert!(stale_upgrade("web", 5, Some(6)).is_some_and(|e| e.contains("now 6")));
-        assert!(stale_upgrade("web", 5, None).is_some());
+        assert!(stale_upgrade("web", 5, Some(6), None).is_some_and(|e| e.contains("now 6")));
+        assert!(stale_upgrade("web", 5, None, None).is_some());
+        // 6 is there but can't be decoded: reopening the page won't reach it, so say why.
+        let e = stale_upgrade("web", 5, Some(6), Some("too large")).unwrap_or_default();
+        assert!(e.contains("(6)") && e.contains("too large") && !e.contains("open it again"));
     }
 
     #[test]
