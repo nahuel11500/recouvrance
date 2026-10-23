@@ -45,6 +45,7 @@ impl AppView {
     pub(super) fn restart_watch(&mut self, cx: &mut Context<Self>) {
         self.watch = None;
         self.metrics = None;
+        self.watch_errors.clear();
         self.keep_view(cx);
         let Some(kind) = self.kind.clone() else { return };
         // Not connected: open the cluster switcher instead of doing nothing.
@@ -196,6 +197,13 @@ impl AppView {
         cx.notify();
     }
 
+    /// What the bar above the list says: what failed (contexts, watches), else progress.
+    pub(super) fn status_line(&self) -> Option<SharedString> {
+        let failed: Vec<&str> =
+            self.connect_errors.iter().chain(self.watch_errors.values()).map(|s| s.as_ref()).collect();
+        if failed.is_empty() { self.status.clone() } else { Some(failed.join("; ").into()) }
+    }
+
     /// Keep the list on screen in `views` (if it was complete), before another replaces it.
     fn keep_view(&mut self, cx: &mut Context<Self>) {
         let Some(key) = self.view_key.take() else { return };
@@ -235,6 +243,7 @@ impl AppView {
             }),
             TableMsg::Rows(rows) => {
                 self.status = None;
+                self.watch_errors.remove(&ctx);
                 if let Some(slot) = self.rows_by_ctx.get_mut(ctx) {
                     *slot = rows;
                 }
@@ -281,11 +290,12 @@ impl AppView {
             }
             TableMsg::Error(e) => {
                 let name = self.clusters.get(ctx).map(|c| c.0.clone()).unwrap_or_default();
-                self.status = Some(format!("{name}: {e} (retrying)").into());
+                self.watch_errors.insert(ctx, format!("{name}: {e} (retrying)").into());
             }
             TableMsg::Forbidden(e) => {
                 let name = self.clusters.get(ctx).map(|c| c.0.clone()).unwrap_or_default();
-                self.status = Some(format!("{name}: your access does not allow listing this type ({e})").into());
+                let text = format!("{name}: your access does not allow listing this type ({e})");
+                self.watch_errors.insert(ctx, text.into());
                 self.listing.remove(&ctx);
                 self.refused.insert(ctx);
                 if self.listing.is_empty() {

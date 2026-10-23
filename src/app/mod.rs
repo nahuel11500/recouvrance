@@ -1,6 +1,6 @@
 //! Main window: context and namespace pickers, kind sidebar, live table, details.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use std::sync::Arc;
 
@@ -361,6 +361,10 @@ pub struct AppView {
     expanded_groups: HashSet<String>,
     table: Entity<TableState<ResourceTable>>,
     status: Option<SharedString>,
+    /// Contexts that failed to connect, until the next connect.
+    connect_errors: Option<SharedString>,
+    /// Each cluster's last watch error, until that cluster sends rows again.
+    watch_errors: BTreeMap<usize, SharedString>,
     watch: Option<Vec<(TaskGuard, Task<()>)>>,
     metrics: Option<Vec<(TaskGuard, Task<()>)>>,
     _connect: Option<Task<()>>,
@@ -576,6 +580,8 @@ impl AppView {
             expanded_groups: HashSet::new(),
             table,
             status,
+            connect_errors: None,
+            watch_errors: BTreeMap::new(),
             watch: None,
             metrics: None,
             _connect: None,
