@@ -141,8 +141,11 @@ impl SettingsView {
                 if typed.is_empty() {
                     return;
                 }
-                // Saved as deletes look it up: `deploy` or `deployments` is `Deployment`.
-                let Some(kind) = crate::k8s::find_kind(&this.kinds, &typed).map(|k| k.ar.kind.clone()) else {
+                // Saved as deletes look it up: `deploy` or `deployments` is `Deployment`, and a
+                // custom resource has its group.
+                let Some(kind) = crate::k8s::find_kind(&this.kinds, &typed)
+                    .map(|k| settings::delete_kind_key(&k.ar.group, &k.ar.kind))
+                else {
                     use gpui_kit::component::{WindowExt as _, notification::Notification};
                     let msg = format!("No kind \"{typed}\" on the connected clusters");
                     window.push_notification(Notification::error(msg), cx);
