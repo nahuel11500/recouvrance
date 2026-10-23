@@ -86,7 +86,7 @@
 | Ctrl+K | Command palette: resources, pages, contexts, objects |
 | Ctrl+Shift+N | New window |
 | Ctrl+T / Ctrl+W / Ctrl+Tab | New tab / close tab / next tab |
-| Ctrl+B / F5 | Hide the sidebar / refresh |
+| Ctrl+B / F5 | Hide the sidebar / refresh (in a terminal, F5 goes to the program) |
 | Alt+← / Alt+→ | Back / forward (Esc also goes back from a detail page) |
 | Ctrl+F or / | Filter the current table: `web` · `!Running` · `app=web` · `tier!=db` · `l:app` · `ns:team-*` · `/^api-\d+/` · `status:Running` · `restarts>3` · `cpu>200m` (all terms must match) |
 | Right-click a row | Open, logs, shell, YAML, events, copy name, favorite |

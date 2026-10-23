@@ -524,12 +524,24 @@ fn key_bytes(ks: &Keystroke, app_cursor: bool) -> Option<Vec<u8>> {
         "down" => arrow('B'),
         "right" => arrow('C'),
         "left" => arrow('D'),
-        "home" => b"\x1b[H".to_vec(),
-        "end" => b"\x1b[F".to_vec(),
+        "home" => arrow('H'),
+        "end" => arrow('F'),
         "delete" => b"\x1b[3~".to_vec(),
         "pageup" => b"\x1b[5~".to_vec(),
         "pagedown" => b"\x1b[6~".to_vec(),
         "insert" => b"\x1b[2~".to_vec(),
+        "f1" => b"\x1bOP".to_vec(),
+        "f2" => b"\x1bOQ".to_vec(),
+        "f3" => b"\x1bOR".to_vec(),
+        "f4" => b"\x1bOS".to_vec(),
+        "f5" => b"\x1b[15~".to_vec(),
+        "f6" => b"\x1b[17~".to_vec(),
+        "f7" => b"\x1b[18~".to_vec(),
+        "f8" => b"\x1b[19~".to_vec(),
+        "f9" => b"\x1b[20~".to_vec(),
+        "f10" => b"\x1b[21~".to_vec(),
+        "f11" => b"\x1b[23~".to_vec(),
+        "f12" => b"\x1b[24~".to_vec(),
         "space" if m.control && !m.alt => vec![0],
         // Copy in most Linux terminals: never an interrupt (there is no selection to copy).
         "c" if m.control && m.shift => return None,
@@ -641,6 +653,19 @@ mod tests {
         let bytes = |k: &str| key_bytes(&Keystroke::parse(k).unwrap(), false);
         assert_eq!(bytes("ctrl-c"), Some(vec![3]));
         assert_eq!(bytes("ctrl-shift-c"), None);
+    }
+
+    #[test]
+    fn home_end_and_function_keys() {
+        let bytes = |k: &str, app: bool| key_bytes(&Keystroke::parse(k).unwrap(), app).unwrap();
+        assert_eq!(bytes("home", false), b"\x1b[H");
+        assert_eq!(bytes("end", false), b"\x1b[F");
+        assert_eq!(bytes("home", true), b"\x1bOH");
+        assert_eq!(bytes("end", true), b"\x1bOF");
+        assert_eq!(bytes("f1", false), b"\x1bOP");
+        assert_eq!(bytes("f5", false), b"\x1b[15~");
+        assert_eq!(bytes("f10", false), b"\x1b[21~");
+        assert_eq!(bytes("f12", true), b"\x1b[24~");
     }
 
     #[test]
