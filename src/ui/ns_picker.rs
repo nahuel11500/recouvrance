@@ -209,8 +209,7 @@ impl NamespacePicker {
         let mut all: Vec<String> = self.all.iter().filter(|ns| ns.contains(&query)).cloned().collect();
         all.sort_by_key(|ns| !self.selected.contains(ns));
         // A name not in the list can be added by hand (no permission to list namespaces).
-        let valid = crate::k8s::names::validate_namespace(&typed).is_ok();
-        let add = (valid && !self.all.contains(&typed)).then_some(typed);
+        let add = to_add(typed, &self.all);
         Rows { frequent, all, add }
     }
 
@@ -366,5 +365,25 @@ impl Render for NamespacePicker {
                     .text_color(muted)
                     .child("Click or Enter shows only one · tick or Ctrl+Enter to combine"),
             )
+    }
+}
+
+/// The name typed, when it can be added by hand: a namespace name Kubernetes accepts, not
+/// already listed.
+fn to_add(typed: String, listed: &[String]) -> Option<String> {
+    (crate::k8s::names::validate_namespace(&typed).is_ok() && !listed.contains(&typed)).then_some(typed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::to_add;
+
+    #[test]
+    fn only_names_kubernetes_accepts_can_be_added() {
+        let listed = vec!["default".to_string()];
+        assert_eq!(to_add("team-a".into(), &listed).as_deref(), Some("team-a"));
+        for bad in ["-x", "x-", "", "default", "Team", "a.b"] {
+            assert_eq!(to_add(bad.into(), &listed), None, "{bad:?}");
+        }
     }
 }
