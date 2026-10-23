@@ -266,6 +266,15 @@ impl Policy {
         best(candidates)
     }
 
+    /// The Ask rules an all-namespaces request meets in some namespace: what approving it covers.
+    pub fn asks_any_namespace(&self, a: &Access) -> Vec<usize> {
+        let mut probe = a.clone();
+        probe.namespace = None;
+        (0..self.rules.len())
+            .filter(|&i| self.rules[i].effect == Mode::Ask && self.rules[i].matches(&probe, true))
+            .collect()
+    }
+
     /// For an all-namespaces request that asks: the Allow rule that decides some rows, so the
     /// request can still go ahead unapproved, showing only the allowed rows. An Allow that an
     /// Ask or a Deny covers everywhere gives nothing.
@@ -1155,6 +1164,7 @@ mod tests {
         // Unapproved, rows are filtered: team-b asks, so it is hidden.
         assert_eq!(p.decide(&access("c", "list", "pods", Some("team-a"), Some("x"))).mode, Mode::Allow);
         assert_eq!(p.decide(&access("c", "list", "pods", Some("team-b"), Some("x"))).mode, Mode::Ask);
+        assert_eq!(p.asks_any_namespace(&all), [1]);
         let only_ask = Policy { rules: vec![p.rules[1].clone()], ..Policy::default() };
         assert_eq!(only_ask.allow_somewhere(&all), None);
         assert_eq!(p.allow_somewhere(&access("c", "list", "secrets", None, None)), None);
@@ -1172,6 +1182,22 @@ mod tests {
             Policy { rules: vec![rule(Mode::Allow, &["list"], &["pods"], &["*"], &["*"]), debug], ..Policy::default() };
         assert_eq!(names.decide_any_namespace(&all).mode, Mode::Ask);
         assert_eq!(names.allow_somewhere(&all), Some(0));
+    }
+
+    #[test]
+    fn approving_all_namespaces_covers_every_ask_rule() {
+        let p = Policy {
+            rules: vec![
+                rule(Mode::Ask, &["list"], &["pods"], &["team-b"], &["*"]),
+                rule(Mode::Ask, &["list"], &["pods"], &["team-c"], &["*"]),
+                rule(Mode::Ask, &["list"], &["deployments"], &["*"], &["*"]),
+            ],
+            ..Policy::default()
+        };
+        let all = access("c", "list", "pods", None, None);
+        assert_eq!(p.decide_any_namespace(&all).rule, Some(0));
+        // Both namespaces' rows were approved; deployments were not asked about.
+        assert_eq!(p.asks_any_namespace(&all), [0, 1]);
     }
 
     #[test]

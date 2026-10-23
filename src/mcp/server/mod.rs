@@ -48,6 +48,9 @@ struct Call {
     args: serde_json::Value,
     start: Instant,
     approved: bool,
+    /// The Ask rules the approval covered: the one that asked, or across all namespaces
+    /// every Ask rule of the request.
+    approved_rules: Vec<usize>,
     /// The rule that allowed the call, for the activity log.
     rule: Option<usize>,
     session: Option<String>,
@@ -99,12 +102,12 @@ impl Call {
     }
 
     /// Whether one row of a list result may be shown: allowed by a rule, or gated by
-    /// the very Ask rule the user approved for this call.
+    /// an Ask rule the user approved for this call.
     fn may_see(&self, a: &Access) -> bool {
         let v = self.policy().decide(a);
         match v.mode {
             Mode::Allow => true,
-            Mode::Ask => self.approved && v.rule == self.rule,
+            Mode::Ask => self.approved && v.rule.is_some_and(|r| self.approved_rules.contains(&r)),
             Mode::Deny => false,
         }
     }
@@ -302,6 +305,7 @@ impl KubeMcp {
             args: redact(args),
             start: Instant::now(),
             approved: false,
+            approved_rules: Vec::new(),
             rule: None,
             session,
             approval_detail: None,
@@ -378,6 +382,11 @@ impl KubeMcp {
                     self.ensure_active(call)?;
                     call.approved = true;
                     call.rule = verdict.rule;
+                    call.approved_rules = if any_namespace {
+                        call.policy().asks_any_namespace(access)
+                    } else {
+                        verdict.rule.into_iter().collect()
+                    };
                     Ok(())
                 } else if fallback.is_some() {
                     call.record(Decision::Rejected, "not approved; showing the allowed rows only".into(), 0);
