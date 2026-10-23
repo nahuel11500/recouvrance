@@ -12,7 +12,7 @@ pub struct Contexts {
     /// What each context points to (see `fingerprint`), to notice it changed.
     pub fingerprints: HashMap<String, u64>,
     /// False while a file is read without a context name it had and may be half-written:
-    /// the name stays with it until a second read finds the file unchanged.
+    /// the name stays with it until the file has been seen unchanged for `SETTLE`.
     pub settled: bool,
 }
 
@@ -123,11 +123,37 @@ pub fn kubeconfig() -> Result<Kubeconfig> {
 /// When a file was last written, and its size.
 type Stamp = (Option<std::time::SystemTime>, u64);
 
+/// How long a file must stay unchanged before it gives up a context name: `kubectl config
+/// use-context` truncates the file then writes it, so a read in between finds fewer
+/// contexts, or none.
+const SETTLE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Whether a file read with stamps `before` and `after` is settled: unchanged during the
+/// read, and since `seen` (each file's stamp and when it was first seen) first saw it at
+/// least `SETTLE` ago. A time, not a count of reads: several callers read the files, so
+/// two reads can come during the same rewrite. `seen` is brought up to date.
+fn settle(
+    seen: &mut HashMap<String, (Stamp, std::time::Instant)>,
+    key: &str,
+    before: Option<Stamp>,
+    after: Option<Stamp>,
+    now: std::time::Instant,
+) -> bool {
+    let Some(after) = after else {
+        seen.remove(key);
+        return false;
+    };
+    let first = seen.entry(key.to_string()).or_insert((after, now));
+    if first.0 != after {
+        *first = (after, now);
+    }
+    before == Some(after) && now.saturating_duration_since(first.1) >= SETTLE
+}
+
 /// Like `kubeconfig`, and whether it is settled (see `Contexts::settled`).
 fn read_kubeconfig() -> Result<(Kubeconfig, bool)> {
-    // Each file's stamp at its last read: `kubectl config use-context` truncates the file
-    // then writes it, so a read in between finds fewer contexts, or none.
-    static LAST_READ: LazyLock<std::sync::Mutex<HashMap<String, Stamp>>> = LazyLock::new(Default::default);
+    static SEEN: LazyLock<std::sync::Mutex<HashMap<String, (Stamp, std::time::Instant)>>> =
+        LazyLock::new(Default::default);
     let stamp = |path: &std::path::Path| -> Option<Stamp> {
         let m = std::fs::metadata(path).ok()?;
         Some((m.modified().ok(), m.len()))
@@ -141,16 +167,11 @@ fn read_kubeconfig() -> Result<(Kubeconfig, bool)> {
         let before = stamp(&path);
         let kc = Kubeconfig::read_from(&path);
         let after = stamp(&path);
-        let mut last_read = LAST_READ.lock().unwrap_or_else(|e| e.into_inner());
-        let last = match after {
-            Some(after) => last_read.insert(key.clone(), after),
-            None => last_read.remove(&key),
-        };
-        drop(last_read);
-        // Unchanged during this read and since the last one: not in the middle of a write.
-        if before.is_some() && before == after && last == before {
+        let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        if settle(&mut seen, &key, before, after, std::time::Instant::now()) {
             settled.insert(key.clone());
         }
+        drop(seen);
         match kc {
             Ok(kc) => files.push((stem, key, Some(kc))),
             Err(e) => {
@@ -187,7 +208,7 @@ fn read_kubeconfig() -> Result<(Kubeconfig, bool)> {
 /// The file that has each context name in this merge, given the files read now (by
 /// path, with their context names, or `None` when unreadable) and `kept`, the files
 /// that had each name before. `kept` is brought up to date: a file deleted, or read
-/// without the name while `settled` (unchanged since the last read), gives it up; one
+/// without the name while `settled` (unchanged for a while, see `settle`), gives it up; one
 /// that failed to read, or may be half-written, keeps it; a new name goes to the first
 /// file that has it. A name kept for a file not merged now (another KUBECONFIG) goes to
 /// the first file here that has it, without changing `kept`. `kept` also holds the
@@ -704,6 +725,25 @@ mod kubeconfig_tests {
         let now = super::name_owners(&mut kept, &[read("c", &["prod"])], |_| false, |_| true);
         assert_eq!(now["prod"], "c");
         assert_eq!(kept["prod"], "c");
+    }
+
+    #[test]
+    fn a_file_settles_after_a_while_unchanged() {
+        let mut seen = std::collections::HashMap::new();
+        let t = std::time::Instant::now();
+        let s = |secs| t + std::time::Duration::from_secs(secs);
+        let stamp = |len| Some((None, len));
+        // Truncated, then read again right away by another caller: not settled yet.
+        assert!(!super::settle(&mut seen, "a", stamp(0), stamp(0), s(0)));
+        assert!(!super::settle(&mut seen, "a", stamp(0), stamp(0), s(1)));
+        // Filled in: the time starts again.
+        assert!(!super::settle(&mut seen, "a", stamp(9), stamp(9), s(2)));
+        assert!(!super::settle(&mut seen, "a", stamp(9), stamp(9), s(3)));
+        assert!(super::settle(&mut seen, "a", stamp(9), stamp(9), s(4)));
+        // Changed during the read, or gone.
+        assert!(!super::settle(&mut seen, "a", stamp(5), stamp(9), s(9)));
+        assert!(!super::settle(&mut seen, "a", stamp(9), None, s(9)));
+        assert!(!seen.contains_key("a"));
     }
 
     #[test]
