@@ -23,7 +23,9 @@ Recouvrance reads your kubeconfig like `kubectl` does and keeps its own settings
 
 A JSON file that can't be read is kept aside as `<name>.bad-<time>` so the next save doesn't
 overwrite it. In `settings.json`, only the keys that don't read get their default; the others,
-such as `protection`, are kept. When `agents.json` can't be read, the app starts with no agents and
+such as `protection`, are kept; a `protection` entry that isn't `true` or `false` counts as
+protected. When `settings.json` doesn't read as an object at all, every context without a choice is
+protected for that session. When `agents.json` can't be read, the app starts with no agents and
 agent access off, and the Agents page says why.
 
 ## Kubeconfig
@@ -127,7 +129,10 @@ comma-separated, `*` globs work everywhere, an omitted part means `*`, and `-` i
 then allow; anything no rule matches is denied. `approved` lists the requests you approved with
 *Always allow this* or *Allow for 1h*: they are allowed even where an ask rule matches, never where a
 deny rule does. The file is reloaded when it changes, and edits on the Agents page are written back
-to it (its comments are not kept).
+to it (its comments are not kept). An edit on the Agents page made after you saved the file, but
+before it was reloaded, is refused so it doesn't overwrite yours. A key the file doesn't know (a
+misspelt `deny:`) fails the load, like a rule that doesn't parse: the rules in force stay as they
+were and the Agents page shows the error.
 
 While the file exists, an agent it doesn't name has no rules, so everything it asks is denied:
 removing an agent's section takes its access away. Deleting an agent on the Agents page removes its
