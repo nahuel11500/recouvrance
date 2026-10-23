@@ -543,14 +543,9 @@ pub fn attach_container(
         let api: Api<Pod> = Api::namespaced(client, &ns);
         // Attach with what the container offers: stdin and a tty only if its spec has them.
         let spec = api.get(&pod).await.ok().and_then(|p| p.spec);
-        let c = spec.as_ref().and_then(|s| match &container {
-            Some(name) => s.containers.iter().find(|c| &c.name == name).cloned(),
-            None => s.containers.first().cloned(),
-        });
-        let (stdin, tty) =
-            c.as_ref().map(|c| (c.stdin.unwrap_or(false), c.tty.unwrap_or(false))).unwrap_or((false, false));
+        let (name, stdin, tty) = attach_target(spec.as_ref(), container.as_deref());
         let mut ap = AttachParams::default().stdin(stdin).stdout(true).stderr(!tty).tty(tty);
-        if let Some(name) = c.map(|c| c.name) {
+        if let Some(name) = name {
             ap = ap.container(name);
         }
         let mut proc = match api.attach(&pod, &ap).await {
@@ -627,9 +622,51 @@ pub fn attach_container(
     (guard, in_tx, out_rx)
 }
 
+/// The container to attach to and whether it has stdin and a tty. The requested name is always
+/// kept, so the server attaches to it (an init or ephemeral container too) or says it is not there.
+fn attach_target(
+    spec: Option<&k8s_openapi::api::core::v1::PodSpec>,
+    container: Option<&str>,
+) -> (Option<String>, bool, bool) {
+    let Some(name) = container else {
+        let first = spec.and_then(|s| s.containers.first());
+        return first.map_or((None, false, false), |c| {
+            (Some(c.name.clone()), c.stdin.unwrap_or(false), c.tty.unwrap_or(false))
+        });
+    };
+    let streams = spec.and_then(|s| {
+        (s.containers.iter().chain(s.init_containers.iter().flatten()))
+            .find(|c| c.name == name)
+            .map(|c| (c.stdin, c.tty))
+            .or_else(|| s.ephemeral_containers.iter().flatten().find(|c| c.name == name).map(|c| (c.stdin, c.tty)))
+    });
+    let (stdin, tty) = streams.unwrap_or_default();
+    (Some(name.to_string()), stdin.unwrap_or(false), tty.unwrap_or(false))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{copy_capped, read_capped, tar_source};
+    use super::{attach_target, copy_capped, read_capped, tar_source};
+    use k8s_openapi::api::core::v1::{Container, EphemeralContainer, PodSpec};
+
+    #[test]
+    fn attach_keeps_the_requested_container() {
+        let spec = PodSpec {
+            containers: vec![Container { name: "app".into(), ..Default::default() }],
+            ephemeral_containers: Some(vec![EphemeralContainer {
+                name: "debugger-x".into(),
+                stdin: Some(true),
+                tty: Some(true),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        };
+        assert_eq!(attach_target(Some(&spec), Some("debugger-x")), (Some("debugger-x".into()), true, true));
+        assert_eq!(attach_target(Some(&spec), None), (Some("app".into()), false, false));
+        // Unknown or unreadable spec: still ask for that container, output only.
+        assert_eq!(attach_target(Some(&spec), Some("sidecar")), (Some("sidecar".into()), false, false));
+        assert_eq!(attach_target(None, Some("app")), (Some("app".into()), false, false));
+    }
 
     #[test]
     fn tar_sources() {
