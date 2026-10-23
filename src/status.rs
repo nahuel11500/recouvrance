@@ -200,7 +200,7 @@ pub fn true_is_bad(ty: &str) -> bool {
 
 /// Whether a node condition reports a problem. On a node every condition but Ready is
 /// True when something is wrong (pressure, node-problem-detector's `KubeletProblem`,
-/// AKS's `VMEventScheduled`…), so one we don't know is flagged too, unless its name says
+/// Azure's `VMEventScheduled`…), so one we don't know is flagged too, unless its name says
 /// it is good when True ("GPUHealthy").
 pub fn node_condition_bad(ty: &str, status: &str) -> bool {
     status == "True" && (true_is_bad(ty) || (!true_is_good(ty) && tone(ty) != Some(Tone::Good)))
