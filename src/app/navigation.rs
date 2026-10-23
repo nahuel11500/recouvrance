@@ -24,16 +24,28 @@ impl AppView {
         });
         // `set_value` sends no change event: move the highlight here.
         self.follow_selection(cx);
+        // Set the namespaces and the kind first, then restart the watch once: restarting in
+        // between would start a list of the old kind in the new namespaces, then drop it.
+        let mut restart = false;
         if t.namespaces != self.namespaces {
             let sel = t.namespaces.clone();
             self.ns_picker.update(cx, |p, cx| {
                 p.selected = sel.into_iter().collect();
                 cx.notify();
             });
-            self.set_selected_namespaces(t.namespaces, cx);
+            self.choose_namespaces(t.namespaces, cx);
+            restart = true;
         }
-        if t.kind.is_some() && t.kind.as_ref().map(|k| k.key()) != self.kind.as_ref().map(|k| k.key()) {
-            self.kind = t.kind;
+        // `apply_route` would switch to the route's kind anyway.
+        let kind = match self.route() {
+            Route::Resources(Some(k)) => Some(k.clone()),
+            _ => t.kind,
+        };
+        if kind.is_some() && kind.as_ref().map(|k| k.key()) != self.kind.as_ref().map(|k| k.key()) {
+            self.kind = kind;
+            restart = true;
+        }
+        if restart {
             self.restart_watch(cx);
         }
         self.apply_route(cx);
