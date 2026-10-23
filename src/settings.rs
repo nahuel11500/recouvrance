@@ -693,9 +693,8 @@ fn unix_now() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        DeleteConfirm, NamespaceVisit, Settings, by_field, delete_confirm_in, from_bytes, guess_protected, load_from,
-        load_json, migrate_list, protected_among, recent_as_visits, record_visits, save_newest, visit_score,
-        write_atomic,
+        DeleteConfirm, NamespaceVisit, Settings, by_field, delete_confirm_in, guess_protected, load_from, load_json,
+        migrate_list, protected_among, recent_as_visits, record_visits, save_newest, visit_score, write_atomic,
     };
 
     #[test]
@@ -940,12 +939,12 @@ mod tests {
         assert!(s.protect_unset);
         // The next save keeps it, so the next launch doesn't guess the contexts again.
         let saved = serde_json::to_vec(&s).unwrap();
-        let (again, _, lost) = from_bytes(&saved);
+        let (again, _, lost) = super::from_bytes(&saved);
         assert!(!lost);
         assert!(again.protect_unset);
         // A file without it guesses; a value that isn't false (a hand edit) doesn't.
-        assert!(!from_bytes(b"{}").0.protect_unset);
-        assert!(from_bytes(br#"{"protect_unset": "x"}"#).0.protect_unset);
+        assert!(!super::from_bytes(b"{}").0.protect_unset);
+        assert!(super::from_bytes(br#"{"protect_unset": "x"}"#).0.protect_unset);
         assert!(!serde_json::to_string(&Settings::default()).unwrap().contains("protect_unset"));
         std::fs::remove_dir_all(d).unwrap();
     }
