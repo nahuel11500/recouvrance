@@ -43,7 +43,7 @@ pub struct TerminalView {
     session: Option<(TaskGuard, Task<()>)>,
     /// Exec and attach need write mode, and this context's name typed when it is protected.
     guard: Option<String>,
-    /// The user went through that guard once for this terminal.
+    /// The context name was typed once for this terminal (write mode is checked every time).
     authorized: bool,
 }
 
@@ -91,6 +91,13 @@ impl TerminalView {
         self
     }
 
+    /// The context name was already typed in the dialog that made this terminal (node shell,
+    /// debug container): don't ask for it again. Write mode is still checked on every start.
+    pub fn preauthorized(mut self) -> Self {
+        self.authorized = true;
+        self
+    }
+
     /// A session is open and accepts input.
     pub fn connected(&self) -> bool {
         self.input.is_some()
@@ -105,13 +112,14 @@ impl TerminalView {
                 this.connect(window, cx);
             }
         };
-        let Some(context) = self.guard.clone().filter(|_| !self.authorized) else {
+        let Some(context) = self.guard.clone() else {
             return start(self, window, cx);
         };
+        // Write mode may have been turned off since the last session: check it every time.
         if !crate::details::ensure_writes(window, cx) {
             return;
         }
-        if !crate::settings::is_protected(&context) {
+        if self.authorized || !crate::settings::is_protected(&context) {
             self.authorized = true;
             return start(self, window, cx);
         }
@@ -130,6 +138,9 @@ impl TerminalView {
                 .on_ok(move |_, window, cx| {
                     if !crate::details::guard_ok(guard.as_ref(), cx) {
                         return false;
+                    }
+                    if !crate::details::writes_enabled(cx) {
+                        return true;
                     }
                     let _ = me.update(cx, |this, cx| {
                         this.authorized = true;
