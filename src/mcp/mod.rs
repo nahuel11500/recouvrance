@@ -199,23 +199,33 @@ impl Rule {
         if self.expired() {
             return false;
         }
+        // A rule made by approving a request covers that request only: its resource as named
+        // (not another group's kind with the same plural), names and contexts case included.
+        let exact = self.approved && self.effect == Mode::Allow;
+        let matches_any = |patterns: &[String], text: &str| {
+            if exact { patterns.iter().any(|p| glob(p.trim(), text)) } else { any_glob(patterns, text) }
+        };
         let verb = self.verbs.iter().any(|v| v == "*" || v.eq_ignore_ascii_case(&a.verb));
-        let resource = std::iter::once(&a.resource).chain(&a.resource_aliases).any(|r| any_glob(&self.resources, r));
+        let resource = if exact {
+            matches_any(&self.resources, &a.resource)
+        } else {
+            std::iter::once(&a.resource).chain(&a.resource_aliases).any(|r| matches_any(&self.resources, r))
+        };
         let namespace = match &a.namespace {
-            Some(ns) => any_glob(&self.namespaces, ns),
+            Some(ns) => matches_any(&self.namespaces, ns),
             // Cluster-scoped objects and "somewhere" checks.
             None if any_namespace => !self.namespaces.is_empty(),
             None => self.namespaces.iter().any(|n| n.trim() == "*"),
         };
         let name = match &a.name {
-            Some(n) => any_glob(&self.names, n),
+            Some(n) => matches_any(&self.names, n),
             // Name-less checks (lists): a Deny of some names only leaves the rest, whose rows
             // are then filtered by name. An Allow of some names passes too, so whatever a
             // name-less check lets through must be filtered by name before it is shown.
             None if self.effect == Mode::Deny => self.names.iter().any(|n| n.trim() == "*"),
             None => !self.names.is_empty(),
         };
-        verb && resource && namespace && any_glob(&self.contexts, &a.context) && name
+        verb && resource && namespace && matches_any(&self.contexts, &a.context) && name
     }
 
     /// Whether both rules cover the same requests, the same way (notes and expiry aside).
@@ -1419,6 +1429,34 @@ mod tests {
     }
 
     #[test]
+    fn an_approved_rule_covers_only_the_kind_and_case_approved() {
+        let mut pods = access("Prod", "list", "pods", Some("team-b"), None);
+        pods.resource_aliases = vec!["pods".into(), "pod".into()];
+        let approval = Approval {
+            id: 1,
+            agent_id: "a".into(),
+            agent: "a".into(),
+            tool: "list_resources".into(),
+            summary: String::new(),
+            access: pods.clone(),
+            dry_run: false,
+        };
+        let p = Policy { rules: vec![approval.as_rule().unwrap()], ..Policy::default() };
+        assert_eq!(p.decide(&pods).mode, Mode::Allow);
+        // Another group's kind with the same plural.
+        let mut metrics = access("Prod", "list", "pods.metrics.k8s.io", Some("team-b"), None);
+        metrics.resource_aliases = vec!["pods".into(), "podmetrics".into()];
+        assert_eq!(p.decide(&metrics).mode, Mode::Deny);
+        // Another context, named the same but for case.
+        assert_eq!(p.decide(&access("prod", "list", "pods", Some("team-b"), None)).mode, Mode::Deny);
+        // A rule you write still matches aliases and ignores case.
+        let mut r = p.rules[0].clone();
+        r.approved = false;
+        let p = Policy { rules: vec![r], ..Policy::default() };
+        assert_eq!(p.decide(&metrics).mode, Mode::Allow);
+    }
+
+    #[test]
     fn context_lists_follow_the_rules() {
         let mut expired = rule(Mode::Allow, &["*"], &["*"], &["*"], &["prod"]);
         expired.expires = Some(jiff::Timestamp::now() - jiff::SignedDuration::from_hours(1));
@@ -1828,7 +1866,16 @@ pub(crate) mod properties {
     }
 
     pub(crate) fn value() -> impl Strategy<Value = String> {
-        prop_oneof![Just("a"), Just("b"), Just("ab"), Just("team-a"), Just("team-b")].prop_map(String::from)
+        prop_oneof![Just("a"), Just("b"), Just("ab"), Just("team-a"), Just("team-b"), Just("A"), Just("Team-a")]
+            .prop_map(String::from)
+    }
+
+    /// A resource and its aliases: another group's kind may share the plural.
+    fn resource() -> impl Strategy<Value = (String, Vec<String>)> {
+        prop_oneof![value(), Just("a.other.io".to_string()), Just("team-a.other.io".to_string())].prop_map(|r| {
+            let plural = r.split('.').next().unwrap_or_default().to_string();
+            (r, vec![plural])
+        })
     }
 
     pub(crate) fn verb() -> impl Strategy<Value = String> {
@@ -1858,12 +1905,12 @@ pub(crate) mod properties {
     }
 
     pub(crate) fn access() -> impl Strategy<Value = Access> {
-        (verb(), value(), prop::option::of(value()), value(), prop::option::of(value())).prop_map(
-            |(verb, resource, namespace, context, name)| Access {
+        (verb(), resource(), prop::option::of(value()), value(), prop::option::of(value())).prop_map(
+            |(verb, (resource, resource_aliases), namespace, context, name)| Access {
                 context,
                 verb,
                 resource,
-                resource_aliases: Vec::new(),
+                resource_aliases,
                 namespace,
                 name,
                 cluster_scoped: false,
