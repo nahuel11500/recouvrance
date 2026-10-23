@@ -169,6 +169,16 @@ impl ProblemsView {
     }
 }
 
+/// What the page says when nothing is found, and whether it is an all-clear: only when
+/// every cluster and kind could be read.
+fn nothing_found(errors: &[String]) -> (bool, &'static str) {
+    if errors.is_empty() {
+        (true, "Nothing broken right now.")
+    } else {
+        (false, "Nothing broken in what could be read.")
+    }
+}
+
 impl Render for ProblemsView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
@@ -230,22 +240,13 @@ impl Render for ProblemsView {
             )
             .children(self.errors.iter().map(|e| div().text_sm().text_color(theme.danger).child(e.clone())))
             .when(crit + warn + if self.show_info { info } else { 0 } == 0, |d| {
-                // An all-clear only when every cluster and kind could be read.
-                if self.errors.is_empty() {
+                let (all_clear, text) = nothing_found(&self.errors);
+                if all_clear {
                     d.child(
-                        h_flex()
-                            .gap_2()
-                            .text_color(theme.success)
-                            .child(Icon::new(Lucide::CircleCheck))
-                            .child("Nothing broken right now."),
+                        h_flex().gap_2().text_color(theme.success).child(Icon::new(Lucide::CircleCheck)).child(text),
                     )
                 } else {
-                    d.child(
-                        div()
-                            .text_sm()
-                            .text_color(theme.muted_foreground)
-                            .child("Nothing broken in what could be read."),
-                    )
+                    d.child(div().text_sm().text_color(theme.muted_foreground).child(text))
                 }
             })
             .child(
@@ -261,5 +262,15 @@ impl Render for ProblemsView {
                 .flex_1()
                 .min_h_0(),
             )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn no_all_clear_when_a_scan_failed() {
+        assert_eq!(super::nothing_found(&[]), (true, "Nothing broken right now."));
+        let errors = ["prod: connection refused".to_string()];
+        assert_eq!(super::nothing_found(&errors), (false, "Nothing broken in what could be read."));
     }
 }
