@@ -52,6 +52,7 @@ impl AppView {
         self._index_tasks.clear();
         self.status = Some(format!("Connecting to {}…", contexts.join(", ")).into());
         self.connect_errors = None;
+        self.connecting = true;
         self.table.update(cx, |t, cx| {
             t.delegate_mut().reset(false, Vec::new(), None, Default::default());
             t.refresh(cx);
@@ -109,6 +110,7 @@ impl AppView {
                 if this.context.as_deref() != Some(primary.as_str()) {
                     return; // the user switched again meanwhile
                 }
+                this.connecting = false;
                 match result {
                     Ok((client, kinds, kind_clusters, namespaces)) => {
                         this.kind_clusters = kind_clusters;
