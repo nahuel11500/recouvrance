@@ -235,6 +235,31 @@ pub async fn scan_partial(client: Client, kinds: &[Kind], namespace: Option<Stri
     out
 }
 
+/// Problems in the namespaces a user may read, for a cluster that may not list
+/// cluster-wide; the whole cluster when `namespaces` is empty. Cluster-scoped kinds
+/// (Nodes) are read once, namespaced ones in each namespace.
+pub async fn scan_namespaces(client: Client, kinds: &[Kind], namespaces: &[String]) -> Scan {
+    if namespaces.is_empty() {
+        return scan_partial(client, kinds, None).await;
+    }
+    let (cluster, namespaced): (Vec<Kind>, Vec<Kind>) = kinds.iter().cloned().partition(|k| !k.namespaced);
+    let (whole, per_ns) = futures::join!(
+        scan_partial(client.clone(), &cluster, None),
+        futures::future::join_all(namespaces.iter().map(|ns| {
+            let (client, namespaced) = (client.clone(), &namespaced);
+            async move { (ns, scan_partial(client, namespaced, Some(ns.clone())).await) }
+        })),
+    );
+    let mut out = whole;
+    for (ns, scan) in per_ns {
+        out.problems.extend(scan.problems);
+        out.skipped.extend(scan.skipped.into_iter().map(|(kind, e)| (format!("{kind} in {ns}"), e)));
+    }
+    out.problems
+        .sort_by(|a, b| a.severity.cmp(&b.severity).then(a.namespace.cmp(&b.namespace)).then(a.name.cmp(&b.name)));
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -313,6 +338,69 @@ mod tests {
         let d = defs(&["Name", "Status"]);
         assert_eq!(judge(&node, &d, &row(&["n", "Ready,SchedulingDisabled"])).map(|j| j.0), Some(Severity::Info));
         assert_eq!(judge(&node, &d, &row(&["n", "NotReady"])).map(|j| j.0), Some(Severity::Critical));
+    }
+
+    /// A cluster that may list nodes and the pods of namespace `a` only, and records
+    /// the paths it was asked for.
+    #[derive(Clone, Default)]
+    struct Restricted(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+    impl tower::Service<http::Request<kube::client::Body>> for Restricted {
+        type Response = http::Response<http_body_util::Full<bytes::Bytes>>;
+        type Error = std::convert::Infallible;
+        type Future = std::future::Ready<Result<Self::Response, Self::Error>>;
+
+        fn poll_ready(&mut self, _: &mut std::task::Context<'_>) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, req: http::Request<kube::client::Body>) -> Self::Future {
+            let path = req.uri().path().to_string();
+            self.0.lock().unwrap().push(path.clone());
+            let table = |defs: &[&str], ns: Option<&str>, cells: &[&str]| {
+                serde_json::json!({
+                    "kind": "Table",
+                    "columnDefinitions": defs.iter().map(|d| serde_json::json!({"name": d})).collect::<Vec<_>>(),
+                    "rows": [{"cells": cells, "object": {"metadata": {"name": cells[0], "namespace": ns, "uid": cells[0]}}}],
+                })
+            };
+            let (code, body) = match path.as_str() {
+                "/api/v1/nodes" => (200, table(&["Name", "Status"], None, &["n1", "NotReady"])),
+                "/api/v1/namespaces/a/pods" => (
+                    200,
+                    table(
+                        &["Name", "Ready", "Status", "Restarts", "Age"],
+                        Some("a"),
+                        &["p1", "0/1", "CrashLoopBackOff", "7", "1h"],
+                    ),
+                ),
+                _ => (
+                    403,
+                    serde_json::json!({"kind": "Status", "apiVersion": "v1", "status": "Failure",
+                        "message": "forbidden", "reason": "Forbidden", "code": 403}),
+                ),
+            };
+            let response = http::Response::builder().status(code).body(body.to_string().into_bytes().into()).unwrap();
+            std::future::ready(Ok(response))
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn scans_accessible_namespaces() {
+        let cluster = Restricted::default();
+        let client = Client::new(cluster.clone(), "default");
+        let mut node = kind("", "Node");
+        node.namespaced = false;
+        let kinds = [node, kind("", "Pod")];
+        let scan = scan_namespaces(client, &kinds, &["a".into(), "b".into()]).await;
+        let found: Vec<(&str, Option<&str>)> =
+            scan.problems.iter().map(|p| (p.name.as_str(), p.namespace.as_deref())).collect();
+        assert_eq!(found, [("n1", None), ("p1", Some("a"))]);
+        assert_eq!(scan.skipped_text().unwrap(), "Pod in b (forbidden)");
+        // Nodes once, pods in each namespace, nothing cluster-wide.
+        let mut asked = cluster.0.lock().unwrap().clone();
+        asked.sort();
+        assert_eq!(asked, ["/api/v1/namespaces/a/pods", "/api/v1/namespaces/b/pods", "/api/v1/nodes"]);
     }
 
     #[test]
