@@ -9,9 +9,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use kube::Client;
 
-use crate::k8s;
-
-type Rules = Vec<(Vec<String>, Vec<String>, Vec<String>)>;
+use crate::k8s::{self, Rules};
 
 const VERBS: [&str; 7] = ["get", "list", "watch", "create", "update", "patch", "delete"];
 const RESOURCES: [&str; 16] = [

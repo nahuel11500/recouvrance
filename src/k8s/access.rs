@@ -42,13 +42,12 @@ pub async fn can_i(
     .unwrap_or(true)
 }
 
-/// What the current user may do in a namespace (`kubectl auth can-i --list`):
-/// (verbs, resources, resource names) per rule, and a note when the server says the list
-/// may be incomplete.
-pub async fn my_rules(
-    client: Client,
-    ns: String,
-) -> Result<(Vec<(Vec<String>, Vec<String>, Vec<String>)>, Option<String>)> {
+/// (verbs, resources, resource names) per rule.
+pub type Rules = Vec<(Vec<String>, Vec<String>, Vec<String>)>;
+
+/// What the current user may do in a namespace (`kubectl auth can-i --list`): its rules,
+/// and a note when the server says the list may be incomplete.
+pub async fn my_rules(client: Client, ns: String) -> Result<(Rules, Option<String>)> {
     use k8s_openapi::api::authorization::v1::{SelfSubjectRulesReview, SelfSubjectRulesReviewSpec};
     run(async move {
         let review =
