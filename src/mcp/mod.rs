@@ -87,6 +87,8 @@ pub fn is_write(verb: &str) -> bool {
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(default)]
 pub struct Rule {
+    /// A rule written without one (by hand, pasted) denies: a missing field never grants.
+    #[serde(default = "deny")]
     pub effect: Mode,
     pub verbs: Vec<String>,
     /// kubectl names: `pods`, `deployments`, `certificates.cert-manager.io`, `*`.
@@ -119,6 +121,10 @@ impl Default for Rule {
             approved: false,
         }
     }
+}
+
+fn deny() -> Mode {
+    Mode::Deny
 }
 
 /// What an agent is trying to do.
@@ -1851,5 +1857,16 @@ mod properties {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod fail_closed {
+    use super::{Mode, Rule};
+
+    #[test]
+    fn a_rule_without_an_effect_denies() {
+        let r: Rule = serde_json::from_str(r#"{"verbs": ["*"], "resources": ["secrets"], "contexts": ["*"]}"#).unwrap();
+        assert_eq!(r.effect, Mode::Deny);
     }
 }
