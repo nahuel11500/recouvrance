@@ -20,6 +20,15 @@ fn string_entries<'de, D: Deserializer<'de>>(d: D) -> Result<std::collections::B
     Ok(raw.into_iter().filter_map(|(k, v)| Some((k, v.as_str()?.to_string()))).collect())
 }
 
+/// `delete_confirm_kinds` entry by entry: a value that doesn't read (a hand edit, or one
+/// from a newer version) asks for the name, and never costs the other kinds theirs.
+fn delete_confirm_entries<'de, D: Deserializer<'de>>(
+    d: D,
+) -> Result<std::collections::BTreeMap<String, DeleteConfirm>, D::Error> {
+    let raw = std::collections::BTreeMap::<String, serde_json::Value>::deserialize(d)?;
+    Ok(raw.into_iter().map(|(k, v)| (k, serde_json::from_value(v).unwrap_or(DeleteConfirm::Type))).collect())
+}
+
 /// What deleting asks before it runs (per kind, see `delete_confirm`), from least to most.
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 #[serde(rename_all = "kebab-case")]
@@ -149,6 +158,7 @@ pub struct Settings {
     pub delete_confirm: DeleteConfirm,
     /// What deleting asks, by kind: `Node`, `StatefulSet`… for built-in kinds, with the group
     /// for custom resources (`Cluster.postgresql.cnpg.io`), see `delete_kind_key`.
+    #[serde(deserialize_with = "delete_confirm_entries")]
     pub delete_confirm_kinds: std::collections::BTreeMap<String, DeleteConfirm>,
 }
 
@@ -349,7 +359,12 @@ fn from_bytes(bytes: &[u8]) -> (Settings, Option<serde_json::Error>, bool) {
         Ok(v) => (v, None, false),
         Err(e) => {
             let lost = match serde_json::from_slice::<serde_json::Value>(bytes) {
-                Ok(serde_json::Value::Object(fields)) => fields.get("protection").is_some_and(|p| !p.is_object()),
+                Ok(serde_json::Value::Object(fields)) => {
+                    fields.get("protection").is_some_and(|p| !p.is_object())
+                        || fields
+                            .get("protected_contexts")
+                            .is_some_and(|p| serde_json::from_value::<Option<Vec<String>>>(p.clone()).is_err())
+                }
                 _ => true,
             };
             (by_field(bytes).unwrap_or_default(), Some(e), lost)
@@ -650,6 +665,23 @@ mod tests {
         assert_eq!(s.metrics_refresh, 42);
         assert_eq!(s.delete_confirm, Settings::default().delete_confirm);
         assert!(by_field::<Settings>(b"{ not json").is_none());
+    }
+
+    #[test]
+    fn a_bad_delete_kind_asks_for_the_name_and_keeps_the_others() {
+        let text = br#"{"delete_confirm_kinds": {"Pod": "off", "Node": "maybe"}, "metrics_refresh": 42}"#;
+        let s: Settings = serde_json::from_slice(text).unwrap();
+        assert_eq!(s.delete_confirm_kinds.get("Pod"), Some(&DeleteConfirm::Off));
+        assert_eq!(s.delete_confirm_kinds.get("Node"), Some(&DeleteConfirm::Type));
+        assert_eq!(s.metrics_refresh, 42);
+    }
+
+    #[test]
+    fn an_old_protected_list_that_does_not_read_protects_everything() {
+        let (_, _, lost) = super::from_bytes(br#"{"protected_contexts": "prod"}"#);
+        assert!(lost);
+        let (_, _, lost) = super::from_bytes(br#"{"protected_contexts": ["prod"], "metrics_refresh": "x"}"#);
+        assert!(!lost);
     }
 
     #[test]
