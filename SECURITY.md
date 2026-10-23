@@ -35,3 +35,10 @@ that run `kubectl` directly with your kubeconfig instead of going through Recouv
 Only the latest release is supported: security fixes go into a new release, not into older ones.
 Update with `recouvrance-update` (install script), `cargo install --locked recouvrance`, or the
 new release's `.deb`, AppImage or tarball.
+
+## Security fixes in the release notes
+
+Each release lists its security fixes first, under **Security**: when a release has any, update.
+Issues found by our own reviews and audits are tracked in the open, as issues labelled
+[`security`](https://github.com/nahuel11500/recouvrance/issues?q=label%3Asecurity), and get no
+advisory; a privately reported vulnerability gets an advisory once its fix is released (above).
