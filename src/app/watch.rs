@@ -160,6 +160,19 @@ impl AppView {
             let table = self.table.clone();
             let metrics_on = crate::settings::metrics_on(&ctx_name);
             if metrics_on && kind.is("", "Pod") {
+                // Requests and limits, for the usage bars.
+                let (guard, mut rx) = k8s::watch_pod_resources(client.clone(), self.namespace.clone(), pause.clone());
+                let t = table.clone();
+                let task = cx.spawn(async move |_, cx| {
+                    while let Some(resources) = rx.next().await {
+                        let resources = latest(&mut rx, resources);
+                        t.update(cx, |t, cx| {
+                            t.delegate_mut().set_resources(ix, resources);
+                            cx.notify();
+                        });
+                    }
+                });
+                metrics.push((guard, task));
                 let (guard, mut rx) = k8s::watch_pod_metrics(client, self.namespace.clone(), pause.clone());
                 let task = cx.spawn(async move |_, cx| {
                     while let Some(usage) = rx.next().await {
