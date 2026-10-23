@@ -249,8 +249,11 @@ impl AppView {
 }
 
 /// The one namespace to show when only some are accessible: the one just ticked,
-/// else the last one asked for, else the first accessible one.
+/// else the last one asked for, else the first accessible one. None when all are.
 fn one_namespace(wanted: &[String], previous: &[String], accessible: &[String]) -> Option<String> {
+    if accessible.is_empty() {
+        return None;
+    }
     wanted.iter().find(|ns| !previous.contains(ns)).or(wanted.last()).or(accessible.first()).cloned()
 }
 
@@ -269,6 +272,11 @@ mod tests {
         assert_eq!(one_namespace(&v(&["a", "c"]), &v(&["a"]), &accessible).as_deref(), Some("c"));
         assert_eq!(one_namespace(&v(&["a", "c"]), &v(&["a", "c"]), &accessible).as_deref(), Some("c"));
         assert_eq!(one_namespace(&[], &v(&["c"]), &accessible).as_deref(), Some("a"));
-        assert_eq!(one_namespace(&[], &[], &[]), None);
+    }
+
+    #[test]
+    fn several_namespaces_stay_when_all_are_accessible() {
+        assert_eq!(one_namespace(&v(&["a", "c"]), &v(&["c"]), &[]), None);
+        assert_eq!(one_namespace(&[], &v(&["c"]), &[]), None);
     }
 }
