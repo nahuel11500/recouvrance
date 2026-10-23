@@ -108,9 +108,13 @@ pub fn is_not_found(e: &anyhow::Error) -> bool {
     e.chain().any(|c| matches!(c.downcast_ref::<kube::Error>(), Some(kube::Error::Api(r)) if r.code == 404))
 }
 
+/// How long controllers get to run their finalizers before "Remove finalizers" clears them.
+pub const FINALIZER_GRACE_SECS: u64 = 10;
+
 /// Delete with options: `force` skips the grace period (`--grace-period=0 --force`).
 /// `strip_finalizers` clears finalizers only when the delete leaves the object stuck
-/// terminating, so controllers that can still clean up get the chance to.
+/// terminating (already before, or still after `FINALIZER_GRACE_SECS`), so controllers that
+/// can still clean up get the chance to.
 pub async fn delete_with(
     client: Client,
     kind: Kind,
@@ -130,22 +134,31 @@ pub async fn delete_with(
         } else {
             Default::default()
         };
+        let was_stuck = strip_finalizers && stuck_terminating(api.get_opt(&name).await?.as_ref());
         api.delete(&name, &dp).await?;
         let mut stripped = false;
         if strip_finalizers {
-            match api.get_opt(&name).await? {
-                Some(o) if o.metadata.deletion_timestamp.is_some() && o.metadata.finalizers.is_some() => {
-                    let patch = serde_json::json!({"metadata": {"finalizers": null}});
-                    match api.patch(&name, &patch_params(false), &kube::api::Patch::Merge(&patch)).await {
-                        // Its finalizers completed in between.
-                        Err(kube::Error::Api(e)) if e.code == 404 => {}
-                        r => {
-                            r?;
-                            stripped = true;
-                        }
+            // Give its controllers time to finish, unless it was already stuck before.
+            let (step, mut waited) = (std::time::Duration::from_millis(500), std::time::Duration::ZERO);
+            let mut current = api.get_opt(&name).await?;
+            while !was_stuck
+                && stuck_terminating(current.as_ref())
+                && waited < std::time::Duration::from_secs(FINALIZER_GRACE_SECS)
+            {
+                tokio::time::sleep(step).await;
+                waited += step;
+                current = api.get_opt(&name).await?;
+            }
+            if stuck_terminating(current.as_ref()) {
+                let patch = serde_json::json!({"metadata": {"finalizers": null}});
+                match api.patch(&name, &patch_params(false), &kube::api::Patch::Merge(&patch)).await {
+                    // Its finalizers completed in between.
+                    Err(kube::Error::Api(e)) if e.code == 404 => {}
+                    r => {
+                        r?;
+                        stripped = true;
                     }
                 }
-                _ => {}
             }
         }
         Ok(format!(
@@ -156,6 +169,13 @@ pub async fn delete_with(
         ))
     })
     .await
+}
+
+/// Deleted, but kept by finalizers.
+fn stuck_terminating(o: Option<&DynamicObject>) -> bool {
+    o.is_some_and(|o| {
+        o.metadata.deletion_timestamp.is_some() && o.metadata.finalizers.as_ref().is_some_and(|f| !f.is_empty())
+    })
 }
 
 /// Add an ephemeral debug container to a pod (like `kubectl debug -it --target`)
@@ -538,4 +558,29 @@ pub async fn create(
         Ok(format!("{}{} {name} created", if dry_run { "[dry run] " } else { "" }, kind.ar.kind))
     })
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stuck_only_when_finalizers_hold_a_deleted_object() {
+        let obj = |deleted: bool, finalizers: Option<Vec<String>>| -> DynamicObject {
+            let mut meta = serde_json::json!({"name": "x", "finalizers": finalizers});
+            if deleted {
+                meta["deletionTimestamp"] = "2026-01-01T00:00:00Z".into();
+            }
+            serde_json::from_value(
+                serde_json::json!({"apiVersion": "v1", "kind": "PersistentVolumeClaim", "metadata": meta}),
+            )
+            .unwrap()
+        };
+        let held = Some(vec!["kubernetes.io/pvc-protection".to_string()]);
+        assert!(stuck_terminating(Some(&obj(true, held.clone()))));
+        assert!(!stuck_terminating(Some(&obj(false, held))));
+        assert!(!stuck_terminating(Some(&obj(true, Some(vec![])))));
+        assert!(!stuck_terminating(Some(&obj(true, None))));
+        assert!(!stuck_terminating(None));
+    }
 }

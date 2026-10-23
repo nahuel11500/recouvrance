@@ -43,12 +43,12 @@ impl KubeMcp {
     #[tool(description = "List the Kubernetes contexts (clusters) you may access.", annotations(read_only_hint = true))]
     pub(super) async fn list_contexts(&self, Extension(parts): Extension<Parts>) -> Result<String, String> {
         let call = self.begin(&parts, "list_contexts", json!({}))?;
-        let patterns = call.policy().context_patterns();
+        // The contexts a call may use: the same check as when one connects.
         let names: Vec<String> = k8s::load_contexts()
             .map(|c| c.names)
             .unwrap_or_default()
             .into_iter()
-            .filter(|c| patterns.iter().any(|p| glob(p, c)))
+            .filter(|c| call.policy().context_allowed(c))
             .collect();
         call.finish(Ok(if names.is_empty() {
             "No contexts are allowed for this agent. Ask the user to add rules in Recouvrance.".into()
@@ -223,7 +223,9 @@ impl KubeMcp {
             Ok(r) => r,
             Err(e) => return call.finish(Err(e)),
         };
-        rows.retain(|r| call.may_see(&access_for(&kind, &p.context, "list", r.namespace.clone(), None)));
+        rows.retain(|r| {
+            call.may_see(&access_for(&kind, &p.context, "list", r.namespace.clone(), Some(r.name.clone())))
+        });
         rows.sort_by_key(|r| std::cmp::Reverse(r.created));
         let max = call.policy().max_rows as usize;
         let cols: Vec<usize> = (0..defs.len()).filter(|&i| defs[i].priority == 0).collect();
@@ -334,8 +336,13 @@ impl KubeMcp {
             let pods_kind = self.kind(&call, &p.context, "pods").await?.1;
             if call.policy().decide(&access_for(&pods_kind, &p.context, "list", Some(ns.clone()), None)).mode
                 == Mode::Allow
-                && let Ok((defs, rows)) = k8s::list_table(client.clone(), pods_kind, Some(ns), Some(sel), None).await
+                && let Ok((defs, mut rows)) =
+                    k8s::list_table(client.clone(), pods_kind.clone(), Some(ns.clone()), Some(sel), None).await
             {
+                rows.retain(|r| {
+                    let a = access_for(&pods_kind, &p.context, "list", Some(ns.clone()), Some(r.name.clone()));
+                    call.policy().decide(&a).mode == Mode::Allow
+                });
                 let cols: Vec<usize> =
                     (0..defs.len()).filter(|&i| defs[i].priority == 0 || defs[i].name == "Node").collect();
                 out.push_str(&format!("Pods ({}):\n", rows.len()));
@@ -441,7 +448,7 @@ impl KubeMcp {
             {
                 continue;
             }
-            for (ns, obj) in k8s::list_names(client.clone(), kind.ar.clone()).await.unwrap_or_default() {
+            for (ns, obj) in k8s::list_names(client.clone(), kind.ar.clone(), None).await.unwrap_or_default() {
                 if !obj.to_lowercase().contains(&q) {
                     continue;
                 }

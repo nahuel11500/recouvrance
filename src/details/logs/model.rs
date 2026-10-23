@@ -291,7 +291,24 @@ impl LogBuffer {
 
     /// Add a batch of raw lines from stream `src`. Only the new lines (and, when they
     /// go in among older ones, the lines after them) are filtered and searched.
+    #[cfg(test)]
     pub(crate) fn push(&mut self, src: usize, raw: Vec<String>) -> Pushed {
+        self.push_keeping(src, raw, &mut [])
+    }
+
+    /// The index in `lines` of the line on a shown row.
+    fn line_ix(&self, row: usize) -> Option<usize> {
+        match &self.matches {
+            Some(m) => m.get(row)?.checked_sub(self.offset),
+            None => (row < self.lines.len()).then_some(row),
+        }
+    }
+
+    /// `push`, and `rows` (shown rows from before) become the rows of the same lines
+    /// after it: lines merged in above them move them down, dropped lines up. None
+    /// when the line itself went away.
+    pub(crate) fn push_keeping(&mut self, src: usize, raw: Vec<String>, rows: &mut [Option<usize>]) -> Pushed {
+        let mut kept: Vec<Option<usize>> = rows.iter().map(|r| r.and_then(|r| self.line_ix(r))).collect();
         let mut prev = self.lines.back().and_then(|l| l.key);
         let new: Vec<LogLine> = raw
             .into_iter()
@@ -310,6 +327,8 @@ impl LogBuffer {
         };
         let merged = pos < old_len;
         if merged {
+            // Where each line from `pos` on ends up.
+            let mut moved = Vec::with_capacity(old_len - pos);
             let tail: Vec<LogLine> = self.lines.drain(pos..).collect();
             let (mut old, mut new) = (tail.into_iter().peekable(), new.into_iter().peekable());
             // A stable merge: on equal times, lines already there stay first.
@@ -320,8 +339,16 @@ impl LogBuffer {
                     (Some(_), None) => false,
                     (None, None) => break,
                 };
+                if !take_new {
+                    moved.push(self.lines.len());
+                }
                 let line = if take_new { new.next() } else { old.next() };
                 self.lines.extend(line);
+            }
+            for ix in kept.iter_mut().flatten() {
+                if *ix >= pos {
+                    *ix = moved[*ix - pos];
+                }
             }
         } else {
             self.lines.extend(new);
@@ -353,6 +380,7 @@ impl LogBuffer {
             let drop = self.lines.len() - self.max;
             self.lines.drain(..drop);
             self.offset += drop;
+            kept.iter_mut().for_each(|ix| *ix = ix.and_then(|i| i.checked_sub(drop)));
             dropped_rows = match &mut self.matches {
                 Some(m) => {
                     let gone = m.partition_point(|&i| i < self.offset);
@@ -368,6 +396,12 @@ impl LogBuffer {
         let first_row = first_row.saturating_sub(dropped_rows);
         self.search_hits(first_row);
         self.histogram = None;
+        for (row, ix) in rows.iter_mut().zip(kept) {
+            *row = ix.and_then(|i| match &self.matches {
+                Some(m) => m.binary_search(&(self.offset + i)).ok(),
+                None => Some(i),
+            });
+        }
         Pushed { first_row, dropped_rows, merged }
     }
 
@@ -399,11 +433,9 @@ impl LogBuffer {
     }
 }
 
-/// The current find hit after `shifted` rows left the front: the first hit at or
-/// after the row it was on (the first hit when that row itself went away).
-pub(crate) fn shifted_hit(hits: &[usize], old_row: usize, shifted: usize) -> usize {
-    let target = old_row.saturating_sub(shifted);
-    hits.partition_point(|&h| h < target).min(hits.len().saturating_sub(1))
+/// The find hit to make current: the first one at or after `row`.
+pub(crate) fn hit_at(hits: &[usize], row: usize) -> usize {
+    hits.partition_point(|&h| h < row).min(hits.len().saturating_sub(1))
 }
 
 /// A find pattern where a space also matches the non-breaking spaces that
@@ -512,13 +544,35 @@ mod tests {
     }
 
     #[test]
-    fn find_hit_follows_dropped_rows() {
-        let hits = [3, 10, 20];
-        // Current hit on row 10; 5 rows dropped: it is now row 5, hit index 1.
-        assert_eq!(shifted_hit(&[0, 5, 15], 10, 5), 1);
-        // The current row itself was dropped: first remaining hit.
-        assert_eq!(shifted_hit(&hits, 3, 5), 0);
-        assert_eq!(shifted_hit(&[], 3, 5), 0);
+    fn find_hit_at_a_row() {
+        assert_eq!(hit_at(&[0, 5, 15], 5), 1);
+        assert_eq!(hit_at(&[0, 5, 15], 6), 2);
+        assert_eq!(hit_at(&[0, 5, 15], 99), 2);
+        assert_eq!(hit_at(&[], 3), 0);
+    }
+
+    #[test]
+    fn rows_follow_merged_and_dropped_lines() {
+        let mut b = LogBuffer::new(100);
+        b.set_merge(true);
+        b.push(0, vec![at(1, "a1"), at(3, "a3"), at(5, "a5")]);
+        // A lagging pod's lines go in above "a3" and "a5": they move down.
+        let mut rows = [Some(0), Some(1), Some(2)];
+        b.push_keeping(1, vec![at(2, "b2"), at(4, "b4")], &mut rows);
+        assert_eq!(texts(&b), ["a1", "b2", "a3", "b4", "a5"]);
+        assert_eq!(rows, [Some(0), Some(2), Some(4)]);
+        // Filtered: rows are shown rows.
+        b.set_filter("a", None);
+        let mut rows = [Some(1), Some(2)];
+        b.push_keeping(1, vec![at(0, "a0"), at(4, "b4b")], &mut rows);
+        assert_eq!(texts(&b), ["a0", "a1", "a3", "a5"]);
+        assert_eq!(rows, [Some(2), Some(3)]);
+        // Past the limit: rows move up; a dropped line's row is gone.
+        let mut small = LogBuffer::new(3);
+        small.push(0, vec![at(0, "l0"), at(1, "l1"), at(2, "l2")]);
+        let mut rows = [Some(0), Some(2)];
+        small.push_keeping(0, vec![at(3, "l3")], &mut rows);
+        assert_eq!(rows, [None, Some(1)]);
     }
 
     #[test]

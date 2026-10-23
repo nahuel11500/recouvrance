@@ -228,8 +228,7 @@ pub async fn download_from_container(
 ) -> Result<std::path::PathBuf> {
     use std::io::Write as _;
     run(async move {
-        let base =
-            path.trim_end_matches('/').rsplit('/').next().filter(|b| !b.is_empty()).unwrap_or("root").to_string();
+        let (parent, member, base) = tar_source(&path);
         let is_dir = exec_bytes(
             client.clone(),
             ns.clone(),
@@ -242,13 +241,8 @@ pub async fn download_from_container(
         .map(|o| String::from_utf8_lossy(&o).contains("dir"))
         .unwrap_or(false);
         let (cmd, name) = if is_dir {
-            let parent = path
-                .trim_end_matches('/')
-                .rsplit_once('/')
-                .map(|(p, _)| if p.is_empty() { "/" } else { p })
-                .unwrap_or(".");
             (
-                vec!["tar".into(), "cf".into(), "-".into(), "-C".into(), parent.to_string(), "--".into(), base.clone()],
+                vec!["tar".into(), "cf".into(), "-".into(), "-C".into(), parent, "--".into(), member],
                 format!("{pod}-{base}.tar"),
             )
         } else {
@@ -269,6 +263,20 @@ pub async fn download_from_container(
         Ok(dest)
     })
     .await
+}
+
+/// For `tar -C parent -- member`: the folder to run in, the entry to archive and the name to save
+/// it under. `/` is the whole filesystem, saved as `root`.
+fn tar_source(path: &str) -> (String, String, String) {
+    let trimmed = path.trim_end_matches('/');
+    if trimmed.is_empty() {
+        return ("/".into(), ".".into(), "root".into());
+    }
+    let (parent, base) = match trimmed.rsplit_once('/') {
+        Some((p, b)) => (if p.is_empty() { "/" } else { p }, b),
+        None => (".", trimmed),
+    };
+    (parent.into(), base.into(), base.into())
 }
 
 /// Copy a local file into a container directory, like `kubectl cp file pod:dir/`.
@@ -535,14 +543,9 @@ pub fn attach_container(
         let api: Api<Pod> = Api::namespaced(client, &ns);
         // Attach with what the container offers: stdin and a tty only if its spec has them.
         let spec = api.get(&pod).await.ok().and_then(|p| p.spec);
-        let c = spec.as_ref().and_then(|s| match &container {
-            Some(name) => s.containers.iter().find(|c| &c.name == name).cloned(),
-            None => s.containers.first().cloned(),
-        });
-        let (stdin, tty) =
-            c.as_ref().map(|c| (c.stdin.unwrap_or(false), c.tty.unwrap_or(false))).unwrap_or((false, false));
+        let (name, stdin, tty) = attach_target(spec.as_ref(), container.as_deref());
         let mut ap = AttachParams::default().stdin(stdin).stdout(true).stderr(!tty).tty(tty);
-        if let Some(name) = c.map(|c| c.name) {
+        if let Some(name) = name {
             ap = ap.container(name);
         }
         let mut proc = match api.attach(&pod, &ap).await {
@@ -564,11 +567,7 @@ pub fn attach_container(
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
                         // Without a tty, output uses bare newlines.
-                        let bytes = if tty {
-                            buf[..n].to_vec()
-                        } else {
-                            String::from_utf8_lossy(&buf[..n]).replace('\n', "\r\n").into_bytes()
-                        };
+                        let bytes = if tty { buf[..n].to_vec() } else { crlf(&buf[..n]) };
                         if out_tx.unbounded_send(ExecOutput::Data(bytes)).is_err() {
                             break;
                         }
@@ -619,9 +618,79 @@ pub fn attach_container(
     (guard, in_tx, out_rx)
 }
 
+/// Bare newlines as CR LF, on the bytes: a character split across two reads stays whole.
+fn crlf(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len() + bytes.len() / 16);
+    for &b in bytes {
+        if b == b'\n' {
+            out.push(b'\r');
+        }
+        out.push(b);
+    }
+    out
+}
+
+/// The container to attach to and whether it has stdin and a tty. The requested name is always
+/// kept, so the server attaches to it (an init or ephemeral container too) or says it is not there.
+fn attach_target(
+    spec: Option<&k8s_openapi::api::core::v1::PodSpec>,
+    container: Option<&str>,
+) -> (Option<String>, bool, bool) {
+    let Some(name) = container else {
+        let first = spec.and_then(|s| s.containers.first());
+        return first.map_or((None, false, false), |c| {
+            (Some(c.name.clone()), c.stdin.unwrap_or(false), c.tty.unwrap_or(false))
+        });
+    };
+    let streams = spec.and_then(|s| {
+        (s.containers.iter().chain(s.init_containers.iter().flatten()))
+            .find(|c| c.name == name)
+            .map(|c| (c.stdin, c.tty))
+            .or_else(|| s.ephemeral_containers.iter().flatten().find(|c| c.name == name).map(|c| (c.stdin, c.tty)))
+    });
+    let (stdin, tty) = streams.unwrap_or_default();
+    (Some(name.to_string()), stdin.unwrap_or(false), tty.unwrap_or(false))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{copy_capped, read_capped};
+    use super::{attach_target, copy_capped, crlf, read_capped, tar_source};
+    use k8s_openapi::api::core::v1::{Container, EphemeralContainer, PodSpec};
+
+    #[test]
+    fn attach_keeps_the_requested_container() {
+        let spec = PodSpec {
+            containers: vec![Container { name: "app".into(), ..Default::default() }],
+            ephemeral_containers: Some(vec![EphemeralContainer {
+                name: "debugger-x".into(),
+                stdin: Some(true),
+                tty: Some(true),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        };
+        assert_eq!(attach_target(Some(&spec), Some("debugger-x")), (Some("debugger-x".into()), true, true));
+        assert_eq!(attach_target(Some(&spec), None), (Some("app".into()), false, false));
+        // Unknown or unreadable spec: still ask for that container, output only.
+        assert_eq!(attach_target(Some(&spec), Some("sidecar")), (Some("sidecar".into()), false, false));
+        assert_eq!(attach_target(None, Some("app")), (Some("app".into()), false, false));
+    }
+
+    #[test]
+    fn tar_sources() {
+        assert_eq!(tar_source("/"), ("/".into(), ".".into(), "root".into()));
+        assert_eq!(tar_source("/var/log/"), ("/var".into(), "log".into(), "log".into()));
+        assert_eq!(tar_source("/etc"), ("/".into(), "etc".into(), "etc".into()));
+        assert_eq!(tar_source("data"), (".".into(), "data".into(), "data".into()));
+    }
+
+    #[test]
+    fn newlines_keep_split_characters() {
+        let text = "é\nok\n".as_bytes();
+        // "é" is two bytes; each half goes through on its own.
+        let joined = [crlf(&text[..1]), crlf(&text[1..])].concat();
+        assert_eq!(String::from_utf8(joined).unwrap(), "é\r\nok\r\n");
+    }
 
     #[tokio::test]
     async fn reads_are_capped_but_drained() {

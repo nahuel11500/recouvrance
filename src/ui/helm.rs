@@ -4,6 +4,7 @@ use std::io::Read as _;
 
 use anyhow::{Context as _, Result};
 use base64::Engine as _;
+use futures::StreamExt as _;
 use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Editor, EditorState, Input, InputEvent, InputState};
@@ -13,6 +14,7 @@ use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, WindowExt as _, 
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use k8s_openapi::api::core::v1::Secret;
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use kube::Client;
 use kube::api::{Api, ListParams};
 use serde_json::Value;
@@ -34,6 +36,9 @@ pub struct Release {
     pub notes: String,
     pub values: Value,
     pub manifest: String,
+    /// Notes, values and manifest are read. The list keeps releases without them (a
+    /// thousand manifests weigh hundreds of MB); a release's page reads them again.
+    pub loaded: bool,
 }
 
 /// Helm keeps a release revision in one Secret (at most ~1 MiB); more is not Helm's.
@@ -96,6 +101,49 @@ fn decode(secret: &Secret) -> Result<Release> {
         notes: s("/info/notes"),
         values: r.get("config").cloned().unwrap_or(Value::Null),
         manifest: s("/manifest"),
+        loaded: true,
+    })
+}
+
+/// A release as the list shows it: without notes, values and manifest.
+fn summary(mut r: Release) -> Release {
+    r.notes = String::new();
+    r.values = Value::Null;
+    r.manifest = String::new();
+    r.loaded = false;
+    r
+}
+
+/// A release from its Secret's labels alone, with the same identity checks as `decode`:
+/// what the list shows until the payload is read (chart and app version come from there).
+fn stub(meta: &ObjectMeta) -> Option<Release> {
+    let namespace = meta.namespace.clone()?;
+    let label = |k: &str| meta.labels.as_ref().and_then(|l| l.get(k)).cloned();
+    let name = label("name").filter(|n| valid_release_name(n))?;
+    let revision: i64 = label("version")?.parse().ok()?;
+    if meta.name.as_deref() != Some(format!("sh.helm.release.v1.{name}.v{revision}").as_str()) {
+        return None;
+    }
+    // Helm writes when a revision changed (seconds) next to its status.
+    let updated = label("modifiedAt")
+        .and_then(|t| t.parse().ok())
+        .and_then(|t| jiff::Timestamp::from_second(t).ok())
+        .or_else(|| meta.creation_timestamp.as_ref().map(|t| t.0));
+    Some(Release {
+        context: String::new(),
+        name,
+        namespace,
+        revision,
+        status: label("status").unwrap_or_default(),
+        chart: String::new(),
+        chart_version: String::new(),
+        app_version: String::new(),
+        updated,
+        description: String::new(),
+        notes: String::new(),
+        values: Value::Null,
+        manifest: String::new(),
+        loaded: false,
     })
 }
 
@@ -110,10 +158,51 @@ async fn secrets(client: Client, namespace: Option<String>, labels: String) -> R
     .await
 }
 
-/// The current revision of every release (one Secret each, not the whole history).
+/// Helm's Secrets of current revisions (not the whole history).
+const CURRENT: &str = "owner=helm,status!=superseded";
+/// Releases read per request while the list fills in.
+const FILL_PAGE: u32 = 100;
+
+/// The current revision of every release, from the Secrets' labels: one small list, where
+/// reading the payloads of a thousand releases takes half a minute.
 pub async fn list_releases(client: Client, namespace: Option<String>) -> Result<Vec<Release>> {
-    let items = secrets(client, namespace, "owner=helm,status!=superseded".into()).await?;
-    Ok(latest_revisions(items.iter().filter_map(|s| decode(s).ok()).collect()))
+    k8s::run(async move {
+        let api: Api<Secret> = match &namespace {
+            Some(ns) => Api::namespaced(client, ns),
+            None => Api::all(client),
+        };
+        let items = api.list_metadata(&ListParams::default().labels(CURRENT)).await?.items;
+        Ok(latest_revisions(items.iter().filter_map(|m| stub(&m.metadata)).collect()))
+    })
+    .await
+}
+
+/// The same releases with their chart and app version, page by page as they are read
+/// (sent to `pages`), decoded off the UI thread.
+pub async fn fill_releases(
+    client: Client,
+    namespace: Option<String>,
+    pages: futures::channel::mpsc::UnboundedSender<Vec<Release>>,
+) -> Result<()> {
+    k8s::run(async move {
+        let api: Api<Secret> = match &namespace {
+            Some(ns) => Api::namespaced(client, ns),
+            None => Api::all(client),
+        };
+        let mut lp = ListParams::default().labels(CURRENT).limit(FILL_PAGE);
+        loop {
+            let list = api.list(&lp).await?;
+            let page = list.items.iter().filter_map(|s| decode(s).ok()).map(summary).collect();
+            if pages.unbounded_send(page).is_err() {
+                return Ok(()); // the list was closed
+            }
+            match list.metadata.continue_.filter(|c| !c.is_empty()) {
+                Some(token) => lp.continue_token = Some(token),
+                None => return Ok(()),
+            }
+        }
+    })
+    .await
 }
 
 /// One release per (namespace, name): the newest revision, when an upgrade is in flight.
@@ -133,10 +222,17 @@ pub async fn history(client: Client, namespace: String, name: String) -> Result<
     // The name went through `decode`, but this builds a selector: check it again.
     anyhow::ensure!(valid_release_name(&name), "invalid release name {name:?}");
     let items = secrets(client, Some(namespace.clone()), format!("owner=helm,name={name}")).await?;
-    let mut revs: Vec<Release> =
-        items.iter().filter_map(|s| decode(s).ok()).filter(|r| r.name == name && r.namespace == namespace).collect();
-    revs.sort_by_key(|r| std::cmp::Reverse(r.revision));
-    Ok(revs)
+    // Unzipping and parsing every revision is slow for big charts: not on the UI thread.
+    k8s::run(async move {
+        let mut revs: Vec<Release> = items
+            .iter()
+            .filter_map(|s| decode(s).ok())
+            .filter(|r| r.name == name && r.namespace == namespace)
+            .collect();
+        revs.sort_by_key(|r| std::cmp::Reverse(r.revision));
+        Ok(revs)
+    })
+    .await
 }
 
 /// Values as YAML; secret-looking keys are masked unless revealed.
@@ -225,6 +321,24 @@ fn status_color(status: &str, cx: &App) -> Hsla {
 
 // MARK: List
 
+/// The releases of every cluster that answered, and "context: error" for the others; an
+/// error alone when no cluster answered.
+fn merge_clusters(results: Vec<(String, Result<Vec<Release>>)>) -> (Result<Vec<Release>, String>, Vec<String>) {
+    let single = results.len() == 1;
+    let (mut releases, mut errors, mut answered) = (Vec::new(), Vec::new(), false);
+    for (ctx, r) in results {
+        match r {
+            Ok(rels) => {
+                answered = true;
+                releases.extend(rels);
+            }
+            Err(e) if single => errors.push(format!("{e:#}")),
+            Err(e) => errors.push(format!("{ctx}: {e:#}")),
+        }
+    }
+    if answered || errors.is_empty() { (Ok(releases), errors) } else { (Err(errors.join("\n")), Vec::new()) }
+}
+
 pub struct OpenRelease(pub Release);
 
 /// The "Install a chart" button was clicked.
@@ -233,6 +347,10 @@ pub struct OpenInstall;
 pub struct HelmList {
     multi: bool,
     releases: Option<Result<Vec<Release>, SharedString>>,
+    /// Indices in `releases` the filter keeps, worked out on each render.
+    shown: Vec<usize>,
+    /// Clusters that could not be read while others could: "context: error".
+    errors: Vec<SharedString>,
     filter: Entity<InputState>,
     _task: Task<()>,
     _subs: Vec<Subscription>,
@@ -256,26 +374,111 @@ impl HelmList {
             }
         })];
         let task = cx.spawn(async move |this, cx| {
+            // The releases from their Secrets' labels first: shown at once.
             let loads = clusters.iter().map(|(ctx, client)| {
                 let (ctx, client, ns) = (ctx.clone(), client.clone(), namespace.clone());
                 async move {
-                    let mut rels = list_releases(client, ns).await?;
-                    rels.iter_mut().for_each(|r| r.context = ctx.clone());
-                    anyhow::Ok(rels)
+                    let rels = list_releases(client, ns).await.map(|mut rels| {
+                        rels.iter_mut().for_each(|r| r.context = ctx.clone());
+                        rels
+                    });
+                    (ctx, rels)
                 }
             });
-            let result = futures::future::join_all(loads)
-                .await
-                .into_iter()
-                .collect::<anyhow::Result<Vec<_>>>()
-                .map(|v| v.into_iter().flatten().collect())
-                .map_err(|e| SharedString::from(format!("{e:#}")));
+            let (result, errors) = merge_clusters(futures::future::join_all(loads).await);
+            let listed = result.is_ok();
             let _ = this.update(cx, |this, cx| {
-                this.releases = Some(result);
+                this.releases = Some(result.map_err(SharedString::from));
+                this.errors = errors.into_iter().map(SharedString::from).collect();
                 cx.notify();
             });
+            if !listed {
+                return;
+            }
+            // Then their charts and app versions, as each page of payloads is read.
+            let fills = clusters.into_iter().map(|(ctx, client)| {
+                let (this, mut cx, ns) = (this.clone(), cx.clone(), namespace.clone());
+                async move {
+                    let (tx, mut rx) = futures::channel::mpsc::unbounded();
+                    let apply = async {
+                        while let Some(page) = rx.next().await {
+                            let _ = this.update(&mut cx, |this, cx| {
+                                this.fill(&ctx, page);
+                                cx.notify();
+                            });
+                        }
+                    };
+                    // Without them the list still works: chart columns stay empty.
+                    let _ = futures::join!(fill_releases(client, ns, tx), apply);
+                }
+            });
+            futures::future::join_all(fills).await;
         });
-        Self { multi, releases: None, filter, _task: task, _subs: subs }
+        Self { multi, releases: None, shown: Vec::new(), errors: Vec::new(), filter, _task: task, _subs: subs }
+    }
+
+    /// Put read releases in place of their label-only rows.
+    fn fill(&mut self, context: &str, page: Vec<Release>) {
+        let Some(Ok(list)) = &mut self.releases else { return };
+        for mut r in page {
+            r.context = context.to_string();
+            let same = |l: &&mut Release| l.context == r.context && l.namespace == r.namespace && l.name == r.name;
+            if let Some(slot) = list.iter_mut().find(same)
+                && slot.revision <= r.revision
+            {
+                *slot = r;
+            }
+        }
+    }
+
+    fn row(&self, i: usize, r: &Release, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme();
+        let open = r.clone();
+        h_flex()
+            .id(("release", i))
+            .w_full()
+            .gap_3()
+            .px_2()
+            .py_1()
+            .text_sm()
+            .border_b_1()
+            .border_color(theme.border)
+            .cursor_pointer()
+            .hover(|s| s.bg(theme.list_hover))
+            .on_click(cx.listener(move |_, _, _, cx| cx.emit(OpenRelease(open.clone()))))
+            .when(self.multi, |d| {
+                d.child(
+                    div().w(px(160.)).overflow_hidden().text_ellipsis().whitespace_nowrap().child(r.context.clone()),
+                )
+            })
+            .child(div().w(px(200.)).overflow_hidden().text_ellipsis().whitespace_nowrap().child(r.namespace.clone()))
+            .child(
+                div()
+                    .w(px(280.))
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .whitespace_nowrap()
+                    .text_color(theme.blue)
+                    .child(r.name.clone()),
+            )
+            .child(div().w(px(70.)).child(r.revision.to_string()))
+            .child(
+                div()
+                    .w(px(220.))
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .whitespace_nowrap()
+                    .when(!r.chart.is_empty(), |d| d.child(format!("{}-{}", r.chart, r.chart_version))),
+            )
+            .child(div().w(px(140.)).overflow_hidden().text_ellipsis().whitespace_nowrap().child(r.app_version.clone()))
+            .child(div().w(px(100.)).text_color(status_color(&r.status, cx)).child(r.status.clone()))
+            .child(
+                div()
+                    .w(px(80.))
+                    .text_color(cx.theme().muted_foreground)
+                    .child(r.updated.map(k8s::age).unwrap_or_default()),
+            )
+            .into_any_element()
     }
 }
 
@@ -287,15 +490,14 @@ impl Render for HelmList {
             None => div().p_4().text_color(theme.muted_foreground).child("Loading releases…").into_any_element(),
             Some(Err(e)) => div().p_4().text_color(theme.danger).child(e.clone()).into_any_element(),
             Some(Ok(releases)) => {
-                let rows: Vec<Release> = releases
-                    .iter()
-                    .filter(|r| {
+                self.shown = (0..releases.len())
+                    .filter(|&i| {
+                        let r = &releases[i];
                         query.is_empty()
                             || r.name.to_lowercase().contains(&query)
                             || r.namespace.contains(&query)
                             || r.chart.to_lowercase().contains(&query)
                     })
-                    .cloned()
                     .collect();
                 let header = h_flex()
                     .gap_3()
@@ -313,73 +515,7 @@ impl Render for HelmList {
                     .child(div().w(px(140.)).child("App version"))
                     .child(div().w(px(100.)).child("Status"))
                     .child(div().w(px(80.)).child("Updated"));
-                let count = rows.len();
-                let multi = self.multi;
-                let list = rows.into_iter().enumerate().map(|(i, r)| {
-                    let open = r.clone();
-                    h_flex()
-                        .id(("release", i))
-                        .gap_3()
-                        .px_2()
-                        .py_1()
-                        .text_sm()
-                        .border_b_1()
-                        .border_color(theme.border)
-                        .cursor_pointer()
-                        .hover(|s| s.bg(theme.list_hover))
-                        .on_click(cx.listener(move |_, _, _, cx| cx.emit(OpenRelease(open.clone()))))
-                        .when(multi, |d| {
-                            d.child(
-                                div()
-                                    .w(px(160.))
-                                    .overflow_hidden()
-                                    .text_ellipsis()
-                                    .whitespace_nowrap()
-                                    .child(r.context.clone()),
-                            )
-                        })
-                        .child(
-                            div()
-                                .w(px(200.))
-                                .overflow_hidden()
-                                .text_ellipsis()
-                                .whitespace_nowrap()
-                                .child(r.namespace.clone()),
-                        )
-                        .child(
-                            div()
-                                .w(px(280.))
-                                .overflow_hidden()
-                                .text_ellipsis()
-                                .whitespace_nowrap()
-                                .text_color(theme.blue)
-                                .child(r.name.clone()),
-                        )
-                        .child(div().w(px(70.)).child(r.revision.to_string()))
-                        .child(
-                            div()
-                                .w(px(220.))
-                                .overflow_hidden()
-                                .text_ellipsis()
-                                .whitespace_nowrap()
-                                .child(format!("{}-{}", r.chart, r.chart_version)),
-                        )
-                        .child(
-                            div()
-                                .w(px(140.))
-                                .overflow_hidden()
-                                .text_ellipsis()
-                                .whitespace_nowrap()
-                                .child(r.app_version.clone()),
-                        )
-                        .child(div().w(px(100.)).text_color(status_color(&r.status, cx)).child(r.status.clone()))
-                        .child(
-                            div()
-                                .w(px(80.))
-                                .text_color(theme.muted_foreground)
-                                .child(r.updated.map(k8s::age).unwrap_or_default()),
-                        )
-                });
+                let count = self.shown.len();
                 v_flex()
                     .size_full()
                     .child(
@@ -391,8 +527,32 @@ impl Render for HelmList {
                             .child(div().size_2().rounded_full().bg(theme.success))
                             .child(format!("{count} Helm releases")),
                     )
+                    .when(!self.errors.is_empty(), |d| {
+                        d.child(
+                            v_flex()
+                                .px_2()
+                                .pb_2()
+                                .text_xs()
+                                .text_color(theme.danger)
+                                .children(self.errors.iter().map(|e| div().child(e.clone()))),
+                        )
+                    })
                     .child(header)
-                    .child(v_flex().id("releases").flex_1().min_h_0().overflow_y_scroll().children(list))
+                    .child(
+                        // Only the rows on screen are laid out: clusters hold thousands of releases.
+                        uniform_list(
+                            "releases",
+                            count,
+                            cx.processor(|this, range: std::ops::Range<usize>, _, cx| {
+                                let Some(Ok(releases)) = &this.releases else { return Vec::new() };
+                                range
+                                    .filter_map(|i| this.shown.get(i).map(|&ix| this.row(i, &releases[ix], cx)))
+                                    .collect()
+                            }),
+                        )
+                        .flex_1()
+                        .min_h_0(),
+                    )
                     .into_any_element()
             }
         };
@@ -452,6 +612,11 @@ fn upgrade_text(reveal: bool, edited: &str, values: &Value) -> Option<String> {
     (reveal && !placeholder).then(|| edited.to_string())
 }
 
+/// The newest revision in `history`, when it is newer than `current`.
+fn newer_revision(current: i64, history: &[Release]) -> Option<&Release> {
+    history.iter().max_by_key(|r| r.revision).filter(|r| r.revision > current)
+}
+
 /// The chart references (`repo/chart`) from `helm search repo -o json` naming exactly `chart`.
 fn chart_refs(search_json: &str, chart: &str) -> Vec<String> {
     let suffix = format!("/{chart}");
@@ -476,12 +641,21 @@ impl HelmRelease {
                 s
             })
         };
-        let values = editor(values_yaml(&release.values, false), window, cx);
-        let manifest = editor(mask_manifest(&release.manifest), window, cx);
+        let reading = || "# reading the release…\n".to_string();
+        let values = editor(if release.loaded { values_yaml(&release.values, false) } else { reading() }, window, cx);
+        let manifest = editor(if release.loaded { mask_manifest(&release.manifest) } else { reading() }, window, cx);
         let (ns, name, c2) = (release.namespace.clone(), release.name.clone(), client.clone());
-        let task = cx.spawn(async move |this, cx| {
+        let task = cx.spawn_in(window, async move |this, cx| {
             let result = history(c2, ns, name).await;
-            let _ = this.update(cx, |this, cx| {
+            let _ = this.update_in(cx, |this, window, cx| {
+                // Opened from the list: notes, values and manifest come with the history.
+                if !this.release.loaded
+                    && let Ok(revs) = &result
+                    && let Some(full) = revs.iter().find(|r| r.revision == this.release.revision)
+                {
+                    this.release = Release { context: this.release.context.clone(), ..full.clone() };
+                    this.set_reveal(this.reveal, window, cx);
+                }
                 this.history = Some(result.map_err(|e| format!("{e:#}").into()));
                 cx.notify();
             });
@@ -501,11 +675,17 @@ impl HelmRelease {
         }
     }
 
-    fn reload_history(&mut self, cx: &mut Context<Self>) {
+    /// After a write: the history again, and the page on the newest revision (an upgrade
+    /// or rollback makes one), so its values are what the next upgrade starts from.
+    fn reload_history(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let (client, ns, name) = (self.client.clone(), self.release.namespace.clone(), self.release.name.clone());
-        self._task = cx.spawn(async move |this, cx| {
+        self._task = cx.spawn_in(window, async move |this, cx| {
             let result = history(client, ns, name).await;
-            let _ = this.update(cx, |this, cx| {
+            let _ = this.update_in(cx, |this, window, cx| {
+                if let Some(newest) = result.as_ref().ok().and_then(|h| newer_revision(this.release.revision, h)) {
+                    this.release = Release { context: this.release.context.clone(), ..newest.clone() };
+                    this.set_reveal(this.reveal, window, cx);
+                }
                 this.history = Some(result.map_err(|e| format!("{e:#}").into()));
                 cx.notify();
             });
@@ -536,6 +716,10 @@ impl HelmRelease {
     /// the user picks one; a real upgrade is confirmed showing the chart reference used.
     fn start_upgrade(&mut self, dry_run: bool, window: &mut Window, cx: &mut Context<Self>) {
         if !dry_run && !crate::details::ensure_writes(window, cx) {
+            return;
+        }
+        if !self.release.loaded {
+            window.push_notification(Notification::error("The release is still being read"), cx);
             return;
         }
         // The values are taken now: masking them again while the chart is looked up must
@@ -681,7 +865,7 @@ impl HelmRelease {
                 }
                 Ok(_) => {
                     window.push_notification(Notification::success("Upgraded"), cx);
-                    this.reload_history(cx);
+                    this.reload_history(window, cx);
                 }
                 Err(e) => window.push_notification(Notification::error(format!("helm upgrade failed: {e:#}")), cx),
             });
@@ -735,7 +919,7 @@ impl HelmRelease {
                                         window.push_notification(Notification::error(format!("helm failed: {e:#}")), cx)
                                     }
                                 }
-                                this.reload_history(cx);
+                                this.reload_history(window, cx);
                             });
                         })
                         .detach();
@@ -982,7 +1166,8 @@ impl Render for HelmRelease {
 mod tests {
     // Not `super::*`: gpui's own `test` attribute would shadow the standard one.
     use super::{
-        Secret, Value, chart_refs, decode, latest_revisions, mask_manifest, mask_secrets, upgrade_text, values_yaml,
+        Secret, Value, chart_refs, decode, latest_revisions, mask_manifest, mask_secrets, merge_clusters,
+        newer_revision, stub, upgrade_text, values_yaml,
     };
     use base64::Engine as _;
     use std::io::Write as _;
@@ -1117,6 +1302,36 @@ mod tests {
     }
 
     #[test]
+    fn moves_to_the_newest_revision() {
+        let rev = |v| {
+            decode(&helm_secret(
+                (&format!("sh.helm.release.v1.web.v{v}"), "ns", "web"),
+                &payload("web", "ns", v),
+                false,
+            ))
+            .unwrap()
+        };
+        // Rolled back from 5 to 3: Helm writes revision 6.
+        let history = vec![rev(3), rev(6), rev(5)];
+        assert_eq!(newer_revision(5, &history).map(|r| r.revision), Some(6));
+        assert!(newer_revision(6, &history).is_none());
+        assert!(newer_revision(5, &[]).is_none());
+    }
+
+    #[test]
+    fn one_cluster_failing_keeps_the_others() {
+        let web =
+            decode(&helm_secret(("sh.helm.release.v1.web.v1", "ns", "web"), &payload("web", "ns", 1), false)).unwrap();
+        let (ok, errors) =
+            merge_clusters(vec![("a".into(), Ok(vec![web])), ("b".into(), Err(anyhow::anyhow!("forbidden")))]);
+        assert_eq!(ok.unwrap().len(), 1);
+        assert_eq!(errors, ["b: forbidden"]);
+        let (all_failed, errors) = merge_clusters(vec![("b".into(), Err(anyhow::anyhow!("forbidden")))]);
+        assert_eq!(all_failed.err().as_deref(), Some("forbidden"));
+        assert!(errors.is_empty());
+    }
+
+    #[test]
     fn finds_exact_chart_refs() {
         let json = r#"[{"name":"bitnami/redis"},{"name":"other/redis"},{"name":"bitnami/redis-cluster"},{"name":"bitnami/redis"}]"#;
         assert_eq!(chart_refs(json, "redis"), ["bitnami/redis", "other/redis"]);
@@ -1137,5 +1352,29 @@ mod tests {
         assert_eq!(v["auth"]["apiKey"], "••••••");
         assert_eq!(v["auth"]["publicKey"], "pub");
         assert_eq!(v["list"][0]["token"], "••••••");
+    }
+
+    /// The list's label-only rows take the same identity rules as `decode`.
+    #[test]
+    fn stubs_check_identity() {
+        let meta = |secret: &str, labels: &[(&str, &str)]| k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta {
+            name: Some(secret.into()),
+            namespace: Some("kube-system".into()),
+            labels: Some(labels.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()),
+            ..Default::default()
+        };
+        let ok = meta(
+            "sh.helm.release.v1.cilium.v3",
+            &[("name", "cilium"), ("version", "3"), ("status", "deployed"), ("modifiedAt", "1700000000")],
+        );
+        let r = stub(&ok).unwrap();
+        assert_eq!((r.name.as_str(), r.namespace.as_str(), r.revision), ("cilium", "kube-system", 3));
+        assert_eq!(r.status, "deployed");
+        assert_eq!(r.updated.map(|t| t.as_second()), Some(1_700_000_000));
+        assert!(!r.loaded);
+        // A Secret not named the way Helm names it, a revision that does not match, a bad name.
+        assert!(stub(&meta("cilium", &[("name", "cilium"), ("version", "3")])).is_none());
+        assert!(stub(&meta("sh.helm.release.v1.cilium.v3", &[("name", "cilium"), ("version", "4")])).is_none());
+        assert!(stub(&meta("sh.helm.release.v1.a,b.v1", &[("name", "a,b"), ("version", "1")])).is_none());
     }
 }

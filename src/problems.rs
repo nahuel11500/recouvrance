@@ -92,8 +92,10 @@ pub fn judge(kind: &Kind, defs: &[ColumnDef], row: &Row) -> Option<(Severity, St
                     }
                     _ if restarts >= 5 && c("Restarts").contains("ago") && !c("Restarts").contains('d') => {
                         let last = c("Restarts").split('(').nth(1).unwrap_or("").trim_end_matches(')').to_string();
-                        // Restarted within the hour: still flapping.
-                        let recent = !last.contains('h');
+                        // Restarted within the hour: still flapping. kubectl writes up to
+                        // 3 hours in minutes ("150m ago").
+                        let ago = k8s::age_seconds(last.trim_end_matches(" ago"));
+                        let recent = ago.is_none_or(|s| s <= 3600);
                         Some((
                             if recent { Severity::Warning } else { Severity::Info },
                             format!("{restarts} restarts, last {last}"),
@@ -278,6 +280,18 @@ mod tests {
 
     fn defs(names: &[&str]) -> Vec<ColumnDef> {
         names.iter().map(|n| ColumnDef { name: n.to_string(), priority: 0 }).collect()
+    }
+
+    #[test]
+    fn restarts_flap_only_within_the_hour() {
+        let pod = kind("", "Pod");
+        let d = defs(&["Name", "Ready", "Status", "Restarts", "Age"]);
+        let level = |restarts: &str| judge(&pod, &d, &row(&["x", "1/1", "Running", restarts, "3d"])).map(|j| j.0);
+        // kubectl writes up to 3 hours in minutes.
+        assert_eq!(level("8 (150m ago)"), Some(Severity::Info));
+        assert_eq!(level("8 (61m ago)"), Some(Severity::Info));
+        assert_eq!(level("8 (59m30s ago)"), Some(Severity::Warning));
+        assert_eq!(level("8 (60m ago)"), Some(Severity::Warning));
     }
 
     #[test]

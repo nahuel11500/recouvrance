@@ -46,14 +46,14 @@ pub struct EventLine {
 }
 
 pub async fn events_for(client: Client, obj: ObjectRef) -> Result<Vec<EventLine>> {
-    let uid = obj.uid.clone();
+    let fields = events_selector(&obj.kind.ar.kind, &obj.name, &obj.uid)?;
     let ns = obj.namespace.clone();
     run(async move {
         let api: Api<Event> = match &ns {
             Some(ns) => Api::namespaced(client, ns),
             None => Api::all(client),
         };
-        let lp = ListParams::default().fields(&format!("involvedObject.uid={uid}"));
+        let lp = ListParams::default().fields(&fields);
         let mut items = api.list(&lp).await?.items;
         let when = |e: &Event| {
             e.last_timestamp
@@ -77,13 +77,37 @@ pub async fn events_for(client: Client, obj: ObjectRef) -> Result<Vec<EventLine>
     .await
 }
 
+/// The field selector for an object's events: by uid when it is known, else by kind
+/// and name (pages opened by name have no uid, rows of a fast first load a stand-in).
+fn events_selector(kind: &str, name: &str, uid: &str) -> Result<String> {
+    if !uid.is_empty() && !uid.contains('/') {
+        return Ok(format!("involvedObject.uid={uid}"));
+    }
+    names::validate_kind_name(kind).map_err(anyhow::Error::msg)?;
+    names::validate_name(name).map_err(anyhow::Error::msg)?;
+    Ok(format!("involvedObject.kind={kind},involvedObject.name={name}"))
+}
+
+/// The pod's containers, its default one (`kubectl.kubernetes.io/default-container`) first.
 pub async fn containers(client: Client, ns: String, pod: String) -> Result<Vec<String>> {
     run(async move {
         let api: Api<Pod> = Api::namespaced(client, &ns);
         let pod = api.get(&pod).await?;
-        Ok(pod.spec.map(|s| s.containers.into_iter().map(|c| c.name).collect()).unwrap_or_default())
+        let default = pod.metadata.annotations.as_ref().and_then(|a| a.get("kubectl.kubernetes.io/default-container"));
+        let names =
+            pod.spec.as_ref().map(|s| s.containers.iter().map(|c| c.name.clone()).collect()).unwrap_or_default();
+        Ok(default_first(names, default.map(String::as_str)))
     })
     .await
+}
+
+/// `names` with `default` moved to the front, when it is one of them.
+fn default_first(mut names: Vec<String>, default: Option<&str>) -> Vec<String> {
+    if let Some(i) = default.and_then(|d| names.iter().position(|n| n == d)) {
+        let name = names.remove(i);
+        names.insert(0, name);
+    }
+    names
 }
 
 pub enum LogMsg {
@@ -299,6 +323,27 @@ mod tests {
 
     fn lines(data: &[u8], max: usize) -> Vec<String> {
         futures::executor::block_on(super::lossy_lines(data, max).map(|l| l.unwrap()).collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn default_container_first() {
+        let names = || vec!["linkerd-proxy".to_string(), "app".to_string()];
+        assert_eq!(super::default_first(names(), Some("app")), ["app", "linkerd-proxy"]);
+        assert_eq!(super::default_first(names(), None), ["linkerd-proxy", "app"]);
+        assert_eq!(super::default_first(names(), Some("gone")), ["linkerd-proxy", "app"]);
+    }
+
+    #[test]
+    fn events_by_uid_else_by_name() {
+        let uid = "0b6f3c1e-8f7a-4c2e-9d1b-2a3c4d5e6f70";
+        assert_eq!(super::events_selector("Pod", "web-1", uid).unwrap(), format!("involvedObject.uid={uid}"));
+        for stand_in in ["", "default/web-1", "/node-1"] {
+            assert_eq!(
+                super::events_selector("Pod", "web-1", stand_in).unwrap(),
+                "involvedObject.kind=Pod,involvedObject.name=web-1"
+            );
+        }
+        assert!(super::events_selector("Pod", "x,involvedObject.namespace=y", "").is_err());
     }
 
     #[test]

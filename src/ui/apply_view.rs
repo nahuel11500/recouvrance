@@ -122,6 +122,8 @@ pub struct ApplyView {
     docs: Option<Entity<crate::ui::field_docs::FieldDocs>>,
     schema_form: Option<Entity<crate::ui::schema_form::SchemaForm>>,
     _task: Option<Task<()>>,
+    /// The file picker or URL fetch, kept apart so it never drops a running apply.
+    _load: Option<Task<()>>,
     _watch: Option<Task<()>>,
     _subs: Vec<Subscription>,
 }
@@ -166,6 +168,7 @@ impl ApplyView {
             docs: None,
             schema_form: None,
             _task: None,
+            _load: None,
             _watch: None,
             _subs: subs,
         };
@@ -251,13 +254,16 @@ impl ApplyView {
     }
 
     fn open_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.busy {
+            return;
+        }
         let picked = cx.prompt_for_paths(PathPromptOptions {
             files: true,
             directories: false,
             multiple: false,
             prompt: Some("Open YAML".into()),
         });
-        self._task = Some(cx.spawn_in(window, async move |this, cx| {
+        self._load = Some(cx.spawn_in(window, async move |this, cx| {
             let Ok(Ok(Some(paths))) = picked.await else { return };
             let _ = this.update_in(cx, |this, window, cx| this.load_paths(&paths, window, cx));
         }));
@@ -292,6 +298,9 @@ impl ApplyView {
     }
 
     pub fn load_url(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.busy {
+            return;
+        }
         let url = self.url.read(cx).value().trim().to_string();
         if !url_allowed(&url) {
             // Plain http could be altered on the way, and what it brings gets applied.
@@ -306,7 +315,7 @@ impl ApplyView {
         self.busy = true;
         cx.notify();
         let fetch = k8s::run(crate::assistant::get_url(url.clone()));
-        self._task = Some(cx.spawn_in(window, async move |this, cx| {
+        self._load = Some(cx.spawn_in(window, async move |this, cx| {
             let r = fetch.await;
             let _ = this.update_in(cx, |this, window, cx| {
                 this.busy = false;
@@ -590,7 +599,7 @@ fn url_allowed(url: &str) -> bool {
 /// Split on `---` lines into (0-based line the piece starts on, its text); line `k` of a
 /// piece is line `start + k` of the whole text. Empty documents stay in the list, so
 /// positions never drift.
-fn split_docs(text: &str) -> Vec<(u32, String)> {
+pub(crate) fn split_docs(text: &str) -> Vec<(u32, String)> {
     let mut out: Vec<(u32, Vec<&str>)> = vec![(0, Vec::new())];
     for (i, l) in text.lines().enumerate() {
         match l.strip_prefix("---").filter(|rest| rest.is_empty() || rest.starts_with([' ', '\t'])) {
@@ -849,6 +858,7 @@ impl Render for ApplyView {
                             .outline()
                             .icon(Lucide::FileUp)
                             .label("Open file…")
+                            .disabled(self.busy)
                             .on_click(cx.listener(|this, _, w, cx| this.open_file(w, cx))),
                     )
                     .child(div().w(px(340.)).child(Input::new(&self.url).small()))
@@ -858,6 +868,7 @@ impl Render for ApplyView {
                             .ghost()
                             .icon(Lucide::Globe)
                             .label("Load")
+                            .disabled(self.busy)
                             .on_click(cx.listener(|this, _, w, cx| this.load_url(w, cx))),
                     )
                     .child(

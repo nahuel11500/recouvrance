@@ -69,6 +69,7 @@ impl AppView {
         // Wait only for the clusters that serve this kind: the others never report.
         let serving = self.kind_clusters.get(&kind.key()).cloned();
         self.listing = (0..self.clusters.len()).filter(|ix| serving.as_ref().is_none_or(|s| s.contains(ix))).collect();
+        self.refused.clear();
         let loading = !self.listing.is_empty();
         self.table.update(cx, |t, _| {
             let d = t.delegate_mut();
@@ -103,6 +104,8 @@ impl AppView {
             );
             t.delegate_mut().set_namespace_filter(ns_filter);
             t.delegate_mut().set_filter(filter_text);
+            // A new list: the row highlighted in the old one (and Enter) points at nothing.
+            t.clear_selection(cx);
             t.refresh(cx);
         });
         self.status = loading.then(|| "Loading…".into());
@@ -251,6 +254,11 @@ impl AppView {
                             t.vertical_scroll_handle.0.borrow_mut().deferred_scroll_to_item = pending;
                             Some(ix)
                         }
+                        // Its row is gone or filtered out: no other row takes the highlight.
+                        None if t.selected_row().is_some() => {
+                            t.clear_selection(cx);
+                            None
+                        }
                         _ => None,
                     };
                     // The row menu's highlight follows its row too (selecting clears it).
@@ -279,11 +287,14 @@ impl AppView {
                 let name = self.clusters.get(ctx).map(|c| c.0.clone()).unwrap_or_default();
                 self.status = Some(format!("{name}: your access does not allow listing this type ({e})").into());
                 self.listing.remove(&ctx);
+                self.refused.insert(ctx);
                 if self.listing.is_empty() {
+                    // Forbidden only when every cluster watched refused, whichever answers last.
+                    let all = self.refused.len() >= self.watch.as_ref().map_or(0, Vec::len);
                     self.table.update(cx, |t, _| {
                         let d = t.delegate_mut();
                         d.loading = false;
-                        d.forbidden = true;
+                        d.forbidden = all;
                     });
                 }
             }

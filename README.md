@@ -120,7 +120,7 @@ what you can check for yourself:
   (`recouvrance.cdx.xml`).
 - **No unsafe code.** The crate forbids `unsafe` (`unsafe_code = "forbid"` in `Cargo.toml`).
 - **Fuzzed parsers.** What reads untrusted text (the table filter, quantities from the API, YAML)
-  is fuzzed on every change that touches it and every week, with ClusterFuzzLite.
+  is fuzzed after every change to `main` that touches it and every week, with ClusterFuzzLite.
 - **Checked dependencies.** [cargo-deny](https://github.com/EmbarkStudios/cargo-deny) checks every
   change, and again every week, against the RustSec advisory database and the allowed licenses. Dependabot
   proposes updates only after a three-day cooldown, so a compromised release is usually caught first

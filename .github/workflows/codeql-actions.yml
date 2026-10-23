@@ -1,0 +1,36 @@
+# CodeQL on these workflows: on PRs that change them, on pushes to main and weekly. The Rust
+# code is analyzed in codeql.yml. Findings show in the Security tab.
+name: CodeQL (workflows)
+
+on:
+  pull_request:
+    paths: [".github/workflows/**", ".github/actions/**"]
+  push:
+    branches: [main]
+  schedule:
+    - cron: "31 5 * * 1"
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  analyze:
+    name: Analyze (actions)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: github/codeql-action/init@6f2ac81f5cd81fe351a197ba0b00d91d03cd2aee # v4.39.0
+        with:
+          languages: actions
+          build-mode: none
+      - uses: github/codeql-action/analyze@6f2ac81f5cd81fe351a197ba0b00d91d03cd2aee # v4.39.0
+        with:
+          category: /language:actions

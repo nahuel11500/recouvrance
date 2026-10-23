@@ -99,6 +99,10 @@ pub struct Rule {
     pub note: String,
     /// The rule stops applying after this time (temporary grants).
     pub expires: Option<jiff::Timestamp>,
+    /// Made by approving a request ("Always allow this", "Allow for 1h"): an Allow that
+    /// wins over the Ask rule that asked, so the same request is not asked again.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub approved: bool,
 }
 
 impl Default for Rule {
@@ -112,6 +116,7 @@ impl Default for Rule {
             names: vec!["*".into()],
             note: String::new(),
             expires: None,
+            approved: false,
         }
     }
 }
@@ -130,7 +135,8 @@ pub struct Access {
     pub name: Option<String>,
 }
 
-fn any_glob(patterns: &[String], text: &str) -> bool {
+/// Whether a pattern matches, the way rules match: trimmed, ignoring case.
+pub fn any_glob(patterns: &[String], text: &str) -> bool {
     patterns.iter().any(|p| glob(&p.trim().to_lowercase(), &text.to_lowercase()))
 }
 
@@ -155,9 +161,22 @@ impl Rule {
         };
         let name = match &a.name {
             Some(n) => any_glob(&self.names, n),
+            // Name-less checks (lists): a Deny of some names only leaves the rest, whose rows
+            // are then filtered by name.
+            None if self.effect == Mode::Deny => self.names.iter().any(|n| n.trim() == "*"),
             None => !self.names.is_empty(),
         };
         verb && resource && namespace && any_glob(&self.contexts, &a.context) && name
+    }
+
+    /// Whether both rules cover the same requests, the same way (notes and expiry aside).
+    pub fn same_request(&self, other: &Rule) -> bool {
+        self.effect == other.effect
+            && self.verbs == other.verbs
+            && self.resources == other.resources
+            && self.namespaces == other.namespaces
+            && self.contexts == other.contexts
+            && self.names == other.names
     }
 
     /// For list filtering: a Deny that blocks the whole request regardless of namespace.
@@ -230,7 +249,7 @@ pub struct Verdict {
 }
 
 impl Policy {
-    /// Deny wins over Ask, Ask over Allow; nothing matching means Deny.
+    /// Deny wins over Ask, Ask over Allow (except an approved request); nothing matching means Deny.
     pub fn decide(&self, a: &Access) -> Verdict {
         self.decide_inner(a, false)
     }
@@ -247,12 +266,21 @@ impl Policy {
         best(candidates)
     }
 
+    /// For an all-namespaces request that asks: an Allow rule covering some namespace, so the
+    /// request can still go ahead unapproved, showing only the allowed rows.
+    pub fn allow_somewhere(&self, a: &Access) -> Option<usize> {
+        let mut probe = a.clone();
+        probe.namespace = None;
+        self.rules.iter().position(|r| r.effect == Mode::Allow && r.matches(&probe, true))
+    }
+
     fn decide_inner(&self, a: &Access, any_ns: bool) -> Verdict {
         best(self.rules.iter().enumerate().filter(|(_, r)| r.matches(a, any_ns)))
     }
 
+    /// The context patterns of the non-expired Allow and Ask rules.
     pub fn context_patterns(&self) -> Vec<String> {
-        self.rules.iter().filter(|r| r.effect != Mode::Deny).flat_map(|r| r.contexts.clone()).collect()
+        self.rules.iter().filter(|r| r.effect != Mode::Deny && !r.expired()).flat_map(|r| r.contexts.clone()).collect()
     }
 
     /// Whether some non-expired Allow or Ask rule names this context: checked before connecting.
@@ -330,7 +358,8 @@ fn best<'a>(matching: impl Iterator<Item = (usize, &'a Rule)>) -> Verdict {
     let mut rank = 0;
     for (i, r) in matching {
         let r_rank = match r.effect {
-            Mode::Deny => 3,
+            Mode::Deny => 4,
+            Mode::Allow if r.approved => 3,
             Mode::Ask => 2,
             Mode::Allow => 1,
         };
@@ -499,6 +528,7 @@ impl Approval {
             names: vec![a.name.clone().unwrap_or_else(|| "*".into())],
             note: format!("Always allowed from approval ({})", jiff::Timestamp::now().strftime("%Y-%m-%d")),
             expires: None,
+            approved: true,
         })
     }
 
@@ -1043,6 +1073,7 @@ mod tests {
             names: vec!["*".into()],
             note: String::new(),
             expires: None,
+            approved: false,
         }
     }
 
@@ -1086,6 +1117,59 @@ mod tests {
     }
 
     #[test]
+    fn context_lists_follow_the_rules() {
+        let mut expired = rule(Mode::Allow, &["*"], &["*"], &["*"], &["prod"]);
+        expired.expires = Some(jiff::Timestamp::now() - jiff::SignedDuration::from_hours(1));
+        let p = Policy {
+            rules: vec![rule(Mode::Allow, &["get"], &["*"], &["*"], &[" Staging-*"]), expired],
+            ..Policy::default()
+        };
+        assert!(p.context_allowed("staging-eu"));
+        assert!(!p.context_allowed("prod"));
+        assert_eq!(p.context_patterns(), [" Staging-*"]);
+        assert!(any_glob(&p.context_patterns(), "staging-eu"));
+    }
+
+    #[test]
+    fn all_namespaces_fall_back_to_the_allowed_ones() {
+        let p = Policy {
+            rules: vec![
+                rule(Mode::Allow, &["list"], &["pods"], &["team-a"], &["*"]),
+                rule(Mode::Ask, &["list"], &["pods"], &["team-b"], &["*"]),
+            ],
+            ..Policy::default()
+        };
+        let all = access("c", "list", "pods", None, None);
+        assert_eq!(p.decide_any_namespace(&all).mode, Mode::Ask);
+        assert_eq!(p.allow_somewhere(&all), Some(0));
+        // Unapproved, rows are filtered: team-b asks, so it is hidden.
+        assert_eq!(p.decide(&access("c", "list", "pods", Some("team-a"), Some("x"))).mode, Mode::Allow);
+        assert_eq!(p.decide(&access("c", "list", "pods", Some("team-b"), Some("x"))).mode, Mode::Ask);
+        let only_ask = Policy { rules: vec![p.rules[1].clone()], ..Policy::default() };
+        assert_eq!(only_ask.allow_somewhere(&all), None);
+        assert_eq!(p.allow_somewhere(&access("c", "list", "secrets", None, None)), None);
+    }
+
+    #[test]
+    fn denied_names_leave_the_rest_of_a_list() {
+        let mut deny = rule(Mode::Deny, &["*"], &["pods"], &["*"], &["*"]);
+        deny.names = vec!["debug-*".into()];
+        let p = Policy { rules: vec![rule(Mode::Allow, &["list"], &["*"], &["*"], &["*"]), deny], ..Policy::default() };
+        // The list itself is allowed, in a namespace or across all of them...
+        assert_eq!(p.decide(&access("c", "list", "pods", Some("ns"), None)).mode, Mode::Allow);
+        assert_eq!(p.decide_any_namespace(&access("c", "list", "pods", None, None)).mode, Mode::Allow);
+        // ...and its rows are filtered by name.
+        assert_eq!(p.decide(&access("c", "list", "pods", Some("ns"), Some("debug-1"))).mode, Mode::Deny);
+        assert_eq!(p.decide(&access("c", "list", "pods", Some("ns"), Some("web-1"))).mode, Mode::Allow);
+        // A Deny of every name still denies the whole list.
+        let all = Policy {
+            rules: vec![p.rules[0].clone(), rule(Mode::Deny, &["*"], &["pods"], &["*"], &["*"])],
+            ..Policy::default()
+        };
+        assert_eq!(all.decide_any_namespace(&access("c", "list", "pods", None, None)).mode, Mode::Deny);
+    }
+
+    #[test]
     fn approval_becomes_a_narrow_rule() {
         let approval = Approval {
             id: 1,
@@ -1096,6 +1180,27 @@ mod tests {
             access: access("c1", "scale", "deployments.apps", Some("team"), Some("web")),
             dry_run: false,
         };
+        // It wins over the Ask rule that asked, for exactly this request.
+        let ask = rule(Mode::Ask, &["scale"], &["*"], &["*"], &["*"]);
+        let p = Policy { rules: vec![ask, approval.as_rule().unwrap()], ..Policy::default() };
+        assert_eq!(p.decide(&access("c1", "scale", "deployments.apps", Some("team"), Some("web"))).mode, Mode::Allow);
+        assert_eq!(p.decide(&access("c1", "scale", "deployments.apps", Some("team"), Some("api"))).mode, Mode::Ask);
+        let hour =
+            Policy { rules: vec![p.rules[0].clone(), approval.as_rule_for_an_hour().unwrap()], ..Policy::default() };
+        assert_eq!(
+            hour.decide(&access("c1", "scale", "deployments.apps", Some("team"), Some("web"))).mode,
+            Mode::Allow
+        );
+        // A Deny still wins, and a plain Allow still loses to the Ask.
+        let deny = rule(Mode::Deny, &["*"], &["*"], &["team"], &["*"]);
+        let denied = Policy { rules: vec![deny, approval.as_rule().unwrap()], ..Policy::default() };
+        assert_eq!(
+            denied.decide(&access("c1", "scale", "deployments.apps", Some("team"), Some("web"))).mode,
+            Mode::Deny
+        );
+        let plain = Rule { approved: false, ..approval.as_rule().unwrap() };
+        let asks = Policy { rules: vec![p.rules[0].clone(), plain], ..Policy::default() };
+        assert_eq!(asks.decide(&access("c1", "scale", "deployments.apps", Some("team"), Some("web"))).mode, Mode::Ask);
         let p = Policy { rules: vec![approval.as_rule().unwrap()], ..Policy::default() };
         assert_eq!(p.decide(&access("c1", "scale", "deployments.apps", Some("team"), Some("web"))).mode, Mode::Allow);
         assert_eq!(p.decide(&access("c1", "scale", "deployments.apps", Some("team"), Some("api"))).mode, Mode::Deny);

@@ -239,33 +239,27 @@ pub fn sort_for_sidebar(kinds: &mut [Kind]) {
 
 pub async fn discover(client: Client) -> Result<Vec<Kind>> {
     run(async move {
-        let discovery = match Discovery::new(client.clone()).run_aggregated().await {
-            Ok(d) => d,
-            Err(_) => Discovery::new(client).run().await?,
+        let resources = match Discovery::new(client.clone()).run_aggregated().await {
+            Ok(d) => d.groups().flat_map(|g| g.recommended_resources()).collect(),
+            Err(_) => discover_by_group(&client).await?,
         };
         let mut known: Vec<Kind> = Vec::new();
         let mut custom: Vec<Kind> = Vec::new();
-        for group in discovery.groups() {
-            for (ar, caps) in group.recommended_resources() {
-                if !listable(&caps) || ar.plural.contains('/') {
-                    continue;
+        for (ar, caps) in resources {
+            if !listable(&caps) || ar.plural.contains('/') {
+                continue;
+            }
+            let namespaced = caps.scope == Scope::Namespaced;
+            match KNOWN.iter().find(|(_, g, k, _)| *g == ar.group && *k == ar.kind) {
+                Some((section, _, _, label)) => known.push(Kind { ar, namespaced, section, label: label.to_string() }),
+                // Old events.k8s.io duplicates and metrics are noise in a sidebar.
+                None if is_noise(&ar) => {}
+                // Remaining built-in APIs are cluster plumbing, not custom resources
+                // (some CRD groups end in .k8s.io too: those are mapped above).
+                None if is_builtin_group(&ar.group) && crd_section(&ar.group) == CUSTOM_SECTION => {
+                    known.push(Kind { label: ar.kind.clone(), ar, namespaced, section: "Administration" })
                 }
-                let namespaced = caps.scope == Scope::Namespaced;
-                match KNOWN.iter().find(|(_, g, k, _)| *g == ar.group && *k == ar.kind) {
-                    Some((section, _, _, label)) => {
-                        known.push(Kind { ar, namespaced, section, label: label.to_string() })
-                    }
-                    // Old events.k8s.io duplicates and metrics are noise in a sidebar.
-                    None if is_noise(&ar) => {}
-                    // Remaining built-in APIs are cluster plumbing, not custom resources
-                    // (some CRD groups end in .k8s.io too: those are mapped above).
-                    None if is_builtin_group(&ar.group) && crd_section(&ar.group) == CUSTOM_SECTION => {
-                        known.push(Kind { label: ar.kind.clone(), ar, namespaced, section: "Administration" })
-                    }
-                    None => {
-                        custom.push(Kind { label: ar.kind.clone(), section: crd_section(&ar.group), ar, namespaced })
-                    }
-                }
+                None => custom.push(Kind { label: ar.kind.clone(), section: crd_section(&ar.group), ar, namespaced }),
             }
         }
         known.extend(custom);
@@ -273,6 +267,36 @@ pub async fn discover(client: Client) -> Result<Vec<Kind>> {
         Ok(known)
     })
     .await
+}
+
+/// Discovery for clusters without aggregated discovery (before 1.26, or turned off): each
+/// group at its preferred version, side by side. A group that does not answer (an
+/// APIService that is down, like metrics.k8s.io) is left out, as kubectl does, instead
+/// of failing them all.
+async fn discover_by_group(client: &Client) -> Result<Vec<(ApiResource, ApiCapabilities)>> {
+    let mut gvs = vec![kube::core::GroupVersion::gv("", "v1")];
+    for g in client.list_api_groups().await?.groups {
+        if let Some(v) = g.preferred_version.or_else(|| g.versions.into_iter().next()) {
+            gvs.push(kube::core::GroupVersion::gv(&g.name, &v.version));
+        }
+    }
+    let jobs = gvs.into_iter().map(|gv| {
+        let client = client.clone();
+        async move { kube::discovery::pinned_group(&client, &gv).await }
+    });
+    let groups: Vec<_> = futures::stream::iter(jobs).buffered(16).collect().await;
+    let mut resources = Vec::new();
+    let mut failed = None;
+    for g in groups {
+        match g {
+            Ok(g) => resources.extend(g.recommended_resources()),
+            Err(e) => failed = Some(e),
+        }
+    }
+    match failed {
+        Some(e) if resources.is_empty() => Err(e.into()),
+        _ => Ok(resources),
+    }
 }
 
 pub(super) fn listable(caps: &ApiCapabilities) -> bool {
@@ -328,12 +352,14 @@ pub fn find_kind<'a>(kinds: &'a [Kind], query: &str) -> Option<&'a Kind> {
         Some((n, g)) => (n, Some(g)),
         None => (q, None),
     };
-    // Prefer core and well-known kinds when a name is ambiguous.
-    kinds.iter().find(|k| {
+    let matches = |k: &&Kind| {
         let names_match =
             k.ar.plural.to_lowercase() == name || k.ar.kind.to_lowercase() == name || k.label.to_lowercase() == name;
         names_match && group.is_none_or(|g| k.ar.group.to_lowercase() == g)
-    })
+    };
+    // Prefer core and well-known kinds when a name is ambiguous (`svc` is the Service, not
+    // Knative's): sidebar order alone puts a custom resource first when its section is earlier.
+    kinds.iter().filter(|k| !is_custom(k)).find(matches).or_else(|| kinds.iter().find(matches))
 }
 
 #[cfg(test)]

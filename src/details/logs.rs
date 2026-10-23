@@ -29,8 +29,9 @@ pub struct LogsView {
     pub(super) since: Option<i64>,
     pub(super) client: Client,
     pub(super) ns: String,
-    /// One pod (container selectable) or all pods of a workload.
+    /// One pod or all pods of a workload.
     pub(super) pods: Vec<String>,
+    /// The first pod's containers; the chosen one is read from every pod.
     pub(super) containers: Option<Entity<SelectState<SearchableVec<SharedString>>>>,
     pub(super) container: Option<String>,
     pub(super) previous: bool,
@@ -48,7 +49,9 @@ pub struct LogsView {
     pub(super) buf: LogBuffer,
     /// Where each pod's stream is (connecting, reconnecting, ended…).
     pub(super) pod_states: Vec<StreamState>,
+    /// Why the container list could not be read; it is read again when streams restart.
     pub(super) status: Option<SharedString>,
+    pub(super) reload_containers: bool,
     pub(super) scroll: UniformListScrollHandle,
     /// Wrap long lines (variable-height list).
     pub(super) wrap: bool,
@@ -112,6 +115,7 @@ impl LogsView {
             find_cur: 0,
             buf,
             status: None,
+            reload_containers: false,
             scroll: UniformListScrollHandle::new(),
             wrap: cfg!(feature = "dev") && std::env::var("RECOUVRANCE_LOG_WRAP").is_ok(),
             wrap_list: ListState::new(0, ListAlignment::Top, px(400.)),
@@ -123,9 +127,7 @@ impl LogsView {
             _load: None,
         };
         // Streams start when the Logs tab is first shown (`resume`).
-        if this.pods.len() == 1 {
-            this.load_containers(window, cx);
-        }
+        this.load_containers(window, cx);
         this
     }
 
@@ -173,6 +175,7 @@ impl LogsView {
             let result = fut.await;
             let _ = this.update_in(cx, |this, window, cx| match result {
                 Ok(names) => {
+                    this.status = None;
                     this.container = names.first().cloned();
                     if names.len() > 1 {
                         let items: Vec<SharedString> = names.into_iter().map(Into::into).collect();
@@ -195,7 +198,7 @@ impl LogsView {
                     }
                 }
                 Err(e) => {
-                    this.status = Some(format!("{e:#}").into());
+                    this.status = Some(format!("Containers not listed: {}", k8s::short_error(&e)).into());
                     cx.notify();
                 }
             });
@@ -207,17 +210,18 @@ impl LogsView {
         self.buf.clear();
         // Rows start over: remeasure the wrapped list.
         self.wrap_list.reset(0);
-        self.status = None;
+        // The next render reads the container list again (it needs the window).
+        self.reload_containers = self.status.is_some();
         self.pod_states = vec![StreamState::Connecting; self.pods.len()];
         self.streams.clear();
         let mut receivers = Vec::new();
+        // A workload's pods share their containers: the chosen one is read from each.
         for (ix, pod) in self.pods.iter().enumerate() {
-            let container = if self.pods.len() == 1 { self.container.clone() } else { None };
             let (guard, rx) = k8s::stream_logs(
                 self.client.clone(),
                 self.ns.clone(),
                 pod.clone(),
-                container,
+                self.container.clone(),
                 self.previous,
                 self.since,
             );
@@ -253,15 +257,23 @@ impl LogsView {
 
     /// New lines from pod `ix`: only they are filtered and searched.
     fn add_lines(&mut self, ix: usize, lines: Vec<String>, cx: &mut Context<Self>) {
-        // Where the reader is, to keep it on the same lines after a drop.
-        let view = (self.wrap_list.logical_scroll_top(), self.buf.hits().get(self.find_cur).copied());
+        // Where the reader is, to keep it on the same lines when rows move: the top row
+        // of each list and the current hit's row.
+        let top = self.wrap_list.logical_scroll_top();
+        let uniform_top = self.uniform_top();
+        let hit = self.buf.hits().get(self.find_cur).copied();
+        let mut rows = [Some(top.item_ix), uniform_top, hit];
         let before = self.buf.shown_len();
-        let pushed = self.buf.push(ix, lines);
+        let pushed = self.buf.push_keeping(ix, lines, &mut rows);
         let count = self.buf.shown_len();
         if pushed.dropped_rows > 0 || pushed.merged {
             // Rows moved: their measured heights no longer apply; put the view back.
             self.wrap_list.reset(count);
-            self.shift_rows(pushed.dropped_rows, view);
+            let [wrap_row, uniform_row, hit_row] = rows;
+            if hit.is_some() {
+                self.find_cur = hit_at(self.buf.hits(), hit_row.unwrap_or(0));
+            }
+            self.keep_view(top, wrap_row, uniform_top.map(|before| (before, uniform_row.unwrap_or(0))));
         } else {
             // Appended (or rows after `first_row` refiltered): measured rows above stay.
             let from = pushed.first_row.min(before);
@@ -270,26 +282,29 @@ impl LogsView {
         self.after_rows_changed(cx);
     }
 
-    /// After `shifted` shown rows were dropped from the front (or the wrapped list was
-    /// remeasured): keep the view on the same lines and the current find match on the
-    /// same line. `view` is the wrapped list's scroll top and the current hit's row,
-    /// both from before.
-    pub(super) fn shift_rows(&mut self, shifted: usize, view: (ListOffset, Option<usize>)) {
-        let (top, cur_row) = view;
-        if let Some(row) = cur_row {
-            self.find_cur = shifted_hit(self.buf.hits(), row, shifted);
-        }
+    /// The row at the top of the (unwrapped) list, from its scroll offset.
+    fn uniform_top(&self) -> Option<usize> {
+        let h = self.scroll.0.borrow().last_item_size.map(|s| s.item.height)?;
+        let offset = self.scroll.0.borrow().base_handle.offset();
+        (h > px(0.)).then(|| (-offset.y / h).max(0.) as usize)
+    }
+
+    /// After rows moved (lines merged in or dropped): keep the view on the same lines.
+    /// `top` is the wrapped list's scroll top from before and `wrap_row` its row now
+    /// (None when that line went away); `uniform` the unwrapped list's top row before
+    /// and now.
+    pub(super) fn keep_view(&mut self, top: ListOffset, wrap_row: Option<usize>, uniform: Option<(usize, usize)>) {
         if self.follow {
             return;
         }
         let height = self.scroll.0.borrow().last_item_size.map(|s| s.item.height);
-        if let Some(h) = height {
+        if let (Some(h), Some((before, now))) = (height, uniform) {
             let base = self.scroll.0.borrow().base_handle.clone();
             let mut offset = base.offset();
-            offset.y = (offset.y + h * shifted as f32).min(px(0.));
+            offset.y = (offset.y - h * (now as f32 - before as f32)).min(px(0.));
             base.set_offset(offset);
         }
-        let (item_ix, offset_in_item) = match top.item_ix.checked_sub(shifted) {
+        let (item_ix, offset_in_item) = match wrap_row {
             Some(ix) => (ix, top.offset_in_item),
             None => (0, px(0.)),
         };
@@ -529,14 +544,20 @@ impl LogsView {
             .into_any_element()
     }
 
-    /// The status line: the streams' state, else a message (container list errors).
+    /// The status line: the streams' state and a container list error.
     fn status_text(&self) -> Option<SharedString> {
-        stream_status(&self.pods, &self.pod_states).map(Into::into).or_else(|| self.status.clone())
+        match (stream_status(&self.pods, &self.pod_states), &self.status) {
+            (Some(streams), Some(e)) => Some(format!("{streams} · {e}").into()),
+            (streams, e) => streams.map(Into::into).or_else(|| e.clone()),
+        }
     }
 }
 
 impl Render for LogsView {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if std::mem::take(&mut self.reload_containers) {
+            self.load_containers(window, cx);
+        }
         let count = self.buf.shown_len();
         let mono = cx.theme().mono_font_family.clone();
         let muted = cx.theme().muted_foreground;

@@ -47,13 +47,18 @@ impl DetailPanel {
         let (client, ar, ns, me) =
             (self.client.clone(), self.obj.kind.ar.clone(), self.obj.namespace.clone(), self.obj.name.clone());
         self.compare._candidates = Some(cx.spawn(async move |this, cx| {
-            let names = k8s::list_names(client, ar).await.unwrap_or_default();
-            let mut list: Vec<String> =
-                names.into_iter().filter(|(n, name)| *n == ns && *name != me).map(|(_, name)| name).collect();
-            list.sort();
-            list.truncate(200);
+            let result = k8s::list_names(client, ar, ns).await.map(|names| {
+                let mut list: Vec<String> =
+                    names.into_iter().map(|(_, name)| name).filter(|name| *name != me).collect();
+                list.sort();
+                list.truncate(200);
+                list
+            });
             let _ = this.update(cx, |this, cx| {
-                this.compare.candidates = list;
+                match result {
+                    Ok(list) => this.compare.candidates = list,
+                    Err(e) => this.compare.candidates_error = Some(k8s::short_error(&e)),
+                }
                 cx.notify();
             });
         }));
@@ -96,7 +101,10 @@ impl DetailPanel {
                             .when(self.compare.target_name.as_deref() == Some(n), |b| b.primary())
                             .when(self.compare.target_name.as_deref() != Some(n), |b| b.ghost())
                             .on_click(cx.listener(move |this, _, _, cx| this.compare_with_object(name.clone(), cx)))
-                    })),
+                    }))
+                    .when_some(self.compare.candidates_error.clone(), |d, e| {
+                        d.child(div().text_xs().text_color(theme.danger).child(e))
+                    }),
             );
         let body: AnyElement = match (&self.object, &self.compare.other) {
             (_, None) if self.compare.target_ctx.is_none() && self.compare.target_name.is_none() => {
