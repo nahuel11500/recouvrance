@@ -2,10 +2,23 @@
 //! any thread (the Kubernetes side reads refresh rates and kubeconfig paths).
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex, RwLock};
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
+
+/// `protection` entry by entry: a value that isn't `true` or `false` (a hand edit) protects
+/// its context, and never costs the other entries theirs.
+fn protection_entries<'de, D: Deserializer<'de>>(d: D) -> Result<std::collections::BTreeMap<String, bool>, D::Error> {
+    let raw = std::collections::BTreeMap::<String, serde_json::Value>::deserialize(d)?;
+    Ok(raw.into_iter().map(|(k, v)| (k, v.as_bool().unwrap_or(true))).collect())
+}
+
+/// A map of strings entry by entry: an entry that isn't a string is dropped alone.
+fn string_entries<'de, D: Deserializer<'de>>(d: D) -> Result<std::collections::BTreeMap<String, String>, D::Error> {
+    let raw = std::collections::BTreeMap::<String, serde_json::Value>::deserialize(d)?;
+    Ok(raw.into_iter().filter_map(|(k, v)| Some((k, v.as_str()?.to_string()))).collect())
+}
 
 /// What deleting asks before it runs (per kind, see `delete_confirm`).
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
@@ -86,6 +99,7 @@ pub struct Settings {
     pub protected_contexts: Option<Vec<String>>,
     /// Your choices per context (true: protected, false: not). Contexts without one
     /// are guessed from their names, user, cluster and server ("prod", "admin", …).
+    #[serde(deserialize_with = "protection_entries")]
     pub protection: std::collections::BTreeMap<String, bool>,
     /// Prometheus per context as `namespace/service:port` (found automatically when unset).
     pub prometheus: std::collections::HashMap<String, String>,
@@ -125,6 +139,7 @@ pub struct Settings {
     pub kubeconfig_folders: Vec<String>,
     /// Which kubeconfig file keeps a context name that several files have: the first one
     /// seen. The others' contexts are `name@file`, whatever order the files are read in.
+    #[serde(deserialize_with = "string_entries")]
     pub context_files: std::collections::BTreeMap<String, String>,
     /// Open the browser after a one-click port-forward on a web port.
     pub open_browser_on_forward: bool,
@@ -278,17 +293,46 @@ fn path() -> PathBuf {
     base.join("recouvrance").join("settings.json")
 }
 
+/// Set when settings.json existed but its `protection` could not be read at all (not JSON,
+/// or not an object): every context without a choice made since is then protected.
+static PROTECTION_LOST: AtomicBool = AtomicBool::new(false);
+
 /// The settings file. A field that does not read (a hand edit, or a value from a newer
 /// version) gets its default and the others, such as `protection`, are kept; the file
 /// is kept aside as `load_json` does.
 fn load() -> Settings {
     let p = path();
-    let Ok(bytes) = std::fs::read(&p) else { return Settings::default() };
-    match serde_json::from_slice(&bytes) {
-        Ok(v) => v,
+    let bytes = match std::fs::read(&p) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Settings::default(),
         Err(e) => {
-            eprintln!("{}: {e}; fields that don't read use their defaults ({})", p.display(), keep_aside(&p));
-            by_field(&bytes).unwrap_or_default()
+            eprintln!("{}: {e}; every context is protected until it can be read", p.display());
+            PROTECTION_LOST.store(true, Ordering::Relaxed);
+            return Settings::default();
+        }
+    };
+    let (settings, error, lost) = from_bytes(&bytes);
+    if let Some(e) = error {
+        eprintln!("{}: {e}; fields that don't read use their defaults ({})", p.display(), keep_aside(&p));
+    }
+    if lost {
+        eprintln!("{}: the protection choices could not be read: every context is protected", p.display());
+        PROTECTION_LOST.store(true, Ordering::Relaxed);
+    }
+    settings
+}
+
+/// Settings from the file's bytes: what reads, why the rest didn't, and whether the
+/// protection choices were lost with it.
+fn from_bytes(bytes: &[u8]) -> (Settings, Option<serde_json::Error>, bool) {
+    match serde_json::from_slice(bytes) {
+        Ok(v) => (v, None, false),
+        Err(e) => {
+            let lost = match serde_json::from_slice::<serde_json::Value>(bytes) {
+                Ok(serde_json::Value::Object(fields)) => fields.get("protection").is_some_and(|p| !p.is_object()),
+                _ => true,
+            };
+            (by_field(bytes).unwrap_or_default(), Some(e), lost)
         }
     }
 }
@@ -410,6 +454,7 @@ pub fn is_protected(context: &str) -> bool {
     migrate_protection();
     match with(|s| s.protection.get(context).copied()) {
         Some(chosen) => chosen,
+        None if PROTECTION_LOST.load(Ordering::Relaxed) => true,
         None => match crate::k8s::load_contexts() {
             Ok(c) => guess_protected(&c.names, &c.risky, context),
             Err(_) => true,
@@ -741,5 +786,86 @@ mod tests {
             true
         });
         assert_eq!(written, [2, 4]);
+    }
+}
+
+/// settings.json over many generated files with hand edits gone wrong: a bad value costs
+/// only itself, and protection choices are never lost in a way that unprotects a context.
+#[cfg(test)]
+mod properties {
+    use super::{Settings, from_bytes};
+    use proptest::prelude::*;
+    use serde_json::{Value, json};
+
+    /// Values no setting reads (each field fails on at least one).
+    fn bad() -> impl Strategy<Value = Value> {
+        prop_oneof![
+            Just(json!("from-a-newer-version")),
+            Just(json!(-1)),
+            Just(json!([[1]])),
+            Just(json!({"x": [null]}))
+        ]
+    }
+
+    fn protection() -> impl Strategy<Value = std::collections::BTreeMap<String, bool>> {
+        prop::collection::btree_map("[a-z]{1,6}", any::<bool>(), 0..5)
+    }
+
+    proptest! {
+        /// Spoiling some fields keeps every other one as it was, protection included.
+        #[test]
+        fn a_bad_field_costs_only_itself(
+            protection in protection(),
+            refresh in 1..1000u64,
+            spoiled in prop::collection::btree_map(0..40usize, bad(), 0..4),
+        ) {
+            let good = Settings { protection: protection.clone(), metrics_refresh: refresh, ..Settings::default() };
+            let mut fields = match serde_json::to_value(&good).unwrap() {
+                Value::Object(f) => f,
+                _ => unreachable!(),
+            };
+            let keys: Vec<String> = fields.keys().filter(|k| *k != "protection").cloned().collect();
+            let mut hit = std::collections::HashSet::new();
+            for (i, v) in &spoiled {
+                let key = &keys[i % keys.len()];
+                hit.insert(key.clone());
+                fields.insert(key.clone(), v.clone());
+            }
+            let (read, _, lost) = from_bytes(&serde_json::to_vec(&fields).unwrap());
+            prop_assert!(!lost);
+            prop_assert_eq!(&read.protection, &protection);
+            let read = serde_json::to_value(&read).unwrap();
+            let want = serde_json::to_value(&good).unwrap();
+            for key in &keys {
+                if !hit.contains(key) {
+                    prop_assert_eq!(&read[key], &want[key], "{} changed", key);
+                }
+            }
+        }
+
+        /// A protection entry that isn't true or false protects its context and keeps the others.
+        #[test]
+        fn a_bad_protection_entry_protects(protection in protection(), name in "[A-Z]{1,6}", value in bad()) {
+            let mut text = json!({"protection": protection.clone()});
+            text["protection"][&name] = value;
+            let (read, _, lost) = from_bytes(&serde_json::to_vec(&text).unwrap());
+            prop_assert!(!lost);
+            prop_assert_eq!(read.protection.get(&name), Some(&true));
+            for (k, v) in &protection {
+                prop_assert_eq!(read.protection.get(k), Some(v));
+            }
+        }
+
+        /// A file that doesn't read as an object, or whose protection isn't one, says the
+        /// choices are lost (so every context is protected), never that there are none.
+        #[test]
+        fn lost_choices_are_reported(cut in 1..200usize, protection in protection(), bad in bad()) {
+            prop_assume!(!protection.is_empty());
+            let text = serde_json::to_vec(&json!({"protection": protection, "metrics_refresh": 5})).unwrap();
+            let truncated = &text[..cut.min(text.len() - 1)];
+            prop_assert!(from_bytes(truncated).2);
+            let replaced = serde_json::to_vec(&json!({"protection": bad.clone()})).unwrap();
+            prop_assert_eq!(from_bytes(&replaced).2, !bad.is_object());
+        }
     }
 }
