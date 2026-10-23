@@ -242,11 +242,14 @@ impl AppView {
         }
     }
 
-    /// What the bar above the list says: what failed (contexts, watches), else progress.
+    /// What the bar above the list says: what failed (contexts, watches), then progress.
+    /// Both show: a failing cluster's rows may be the old ones the progress notice warns of.
     pub(super) fn status_line(&self) -> Option<SharedString> {
-        let failed: Vec<&str> =
-            self.connect_errors.iter().chain(self.watch_errors.values()).map(|s| s.as_ref()).collect();
-        if failed.is_empty() { self.status.clone() } else { Some(failed.join("; ").into()) }
+        let parts: Vec<&str> = (self.connect_errors.iter().chain(self.watch_errors.values()))
+            .chain(self.status.iter())
+            .map(|s| s.as_ref())
+            .collect();
+        (!parts.is_empty()).then(|| parts.join("; ").into())
     }
 
     /// Keep the list on screen in `views` (if it was complete), before another replaces it.
@@ -287,7 +290,11 @@ impl AppView {
                 }
             }),
             TableMsg::Rows(rows) => {
-                self.status = None;
+                // "Loading…" or "showing the list from 2h ago" holds while another cluster is
+                // still listing: its rows are not there yet, or are the old ones.
+                if self.listing.iter().all(|&ix| ix == ctx) {
+                    self.status = None;
+                }
                 self.watch_errors.remove(&ctx);
                 if let Some(slot) = self.rows_by_ctx.get_mut(ctx) {
                     *slot = rows;
@@ -302,6 +309,7 @@ impl AppView {
             TableMsg::Listed => {
                 self.listing.remove(&ctx);
                 if self.listing.is_empty() {
+                    self.status = None;
                     self.table.update(cx, |t, _| t.delegate_mut().loading = false);
                 }
             }
@@ -328,6 +336,7 @@ impl AppView {
                     self.follow_selection(cx);
                 }
                 if self.listing.is_empty() {
+                    self.status = None;
                     // Forbidden only when every cluster watched refused, whichever answers last.
                     let all = self.refused.len() >= self.watch.as_ref().map_or(0, Vec::len);
                     self.table.update(cx, |t, _| {
