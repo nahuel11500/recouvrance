@@ -33,6 +33,11 @@ pub(super) fn pod_color(ix: usize, cx: &App) -> Hsla {
     [t.blue, t.success, t.warning, t.danger, hsla(0.78, 0.6, 0.6, 1.), hsla(0.5, 0.6, 0.45, 1.)][ix % 6]
 }
 
+/// One row's height in a uniform list whose content is `rows` rows of `contents` in all.
+fn row_height(contents: Pixels, rows: usize) -> Option<Pixels> {
+    (rows > 0 && contents > px(0.)).then(|| contents * (1. / rows as f32))
+}
+
 pub(super) const SINCE: [(&str, Option<i64>); 6] = [
     ("Tail", None),
     ("5m", Some(300)),
@@ -77,6 +82,8 @@ pub struct LogsView {
     pub(super) status: Option<SharedString>,
     pub(super) reload_containers: bool,
     pub(super) scroll: UniformListScrollHandle,
+    /// Rows in the unwrapped list at its last layout (its content height is this many rows).
+    pub(super) uniform_rows: usize,
     /// Wrap long lines (variable-height list).
     pub(super) wrap: bool,
     pub(super) wrap_list: ListState,
@@ -145,6 +152,7 @@ impl LogsView {
             status: None,
             reload_containers: false,
             scroll: UniformListScrollHandle::new(),
+            uniform_rows: 0,
             wrap: cfg!(feature = "dev") && std::env::var("RECOUVRANCE_LOG_WRAP").is_ok(),
             wrap_list: ListState::new(0, ListAlignment::Top, px(400.)),
             pretty_json: true,
@@ -335,9 +343,15 @@ impl LogsView {
 
     /// The row at the top of the (unwrapped) list, from its scroll offset.
     fn uniform_top(&self) -> Option<usize> {
-        let h = self.scroll.0.borrow().last_item_size.map(|s| s.item.height)?;
+        let h = self.uniform_row_height()?;
         let offset = self.scroll.0.borrow().base_handle.offset();
-        (h > px(0.)).then(|| (-offset.y / h).max(0.) as usize)
+        Some((-offset.y / h).max(0.) as usize)
+    }
+
+    /// One row's height in the unwrapped list, from its last layout.
+    fn uniform_row_height(&self) -> Option<Pixels> {
+        let contents = self.scroll.0.borrow().last_item_size?.contents.height;
+        row_height(contents, self.uniform_rows)
     }
 
     /// After rows moved (lines merged in or dropped): keep the view on the same lines.
@@ -348,8 +362,7 @@ impl LogsView {
         if self.follow {
             return;
         }
-        let height = self.scroll.0.borrow().last_item_size.map(|s| s.item.height);
-        if let (Some(h), Some((before, now))) = (height, uniform) {
+        if let (Some(h), Some((before, now))) = (self.uniform_row_height(), uniform) {
             let base = self.scroll.0.borrow().base_handle.clone();
             let mut offset = base.offset();
             offset.y = (offset.y - h * (now as f32 - before as f32)).min(px(0.));
@@ -614,6 +627,9 @@ impl Render for LogsView {
             self.load_containers(window, cx);
         }
         let count = self.buf.shown_len();
+        if !self.wrap {
+            self.uniform_rows = count;
+        }
         let mono = cx.theme().mono_font_family.clone();
         let muted = cx.theme().muted_foreground;
         let multi = self.pods.len() > 1;
@@ -831,7 +847,14 @@ impl Render for LogsView {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_LOG_PODS, followed_pods};
+    use super::{MAX_LOG_PODS, followed_pods, px, row_height};
+
+    #[test]
+    fn row_height_is_the_content_over_its_rows() {
+        assert_eq!(row_height(px(2000.), 100), Some(px(20.)));
+        assert_eq!(row_height(px(0.), 0), None);
+        assert_eq!(row_height(px(2000.), 0), None);
+    }
 
     #[test]
     fn follows_running_then_newest_pods_past_the_limit() {
