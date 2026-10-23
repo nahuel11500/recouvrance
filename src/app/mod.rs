@@ -478,7 +478,8 @@ impl AppView {
                     // Arrow keys move the selection too: updates keep it on that row.
                     let pressed = table.update(cx, |t, _| {
                         let d = t.delegate_mut();
-                        d.selected_uid = d.row(*ix).map(|r| r.uid.clone()).or(d.selected_uid.take());
+                        let picked = d.row_context(*ix).zip(d.row(*ix).map(|r| r.uid.clone()));
+                        d.selected = picked.or(d.selected.take());
                         d.row_pressed.take()
                     });
                     if pressed.is_some_and(|t| t.elapsed() < std::time::Duration::from_millis(800)) {

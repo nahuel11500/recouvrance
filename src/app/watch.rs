@@ -159,6 +159,19 @@ impl AppView {
             watches.push((guard, task));
             let metrics_on = crate::settings::metrics_on(&ctx_name);
             if metrics_on && kind.is("", "Pod") {
+                // Requests and limits, for the usage bars.
+                let (guard, mut rx) = k8s::watch_pod_resources(client.clone(), self.namespace.clone(), pause.clone());
+                let t = self.table.clone();
+                let task = cx.spawn(async move |_, cx| {
+                    while let Some(resources) = rx.next().await {
+                        let resources = latest(&mut rx, resources);
+                        t.update(cx, |t, cx| {
+                            t.delegate_mut().set_resources(ix, resources);
+                            cx.notify();
+                        });
+                    }
+                });
+                metrics.push((guard, task));
                 let (guard, mut rx) = k8s::watch_pod_metrics(client, self.namespace.clone(), pause.clone());
                 let task = cx.spawn(async move |this, cx| {
                     while let Some(usage) = rx.next().await {
@@ -222,7 +235,7 @@ impl AppView {
     }
 
     /// Keep the list on screen in `views` (if it was complete), before another replaces it.
-    fn keep_view(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn keep_view(&mut self, cx: &mut Context<Self>) {
         let Some(key) = self.view_key.take() else { return };
         let forbidden = self.table.read(cx).delegate().forbidden;
         if !self.listing.is_empty() || forbidden || self.rows_by_ctx.iter().all(Vec::is_empty) {
