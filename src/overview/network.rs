@@ -397,22 +397,7 @@ pub(super) fn netpol(ctx: &Ctx, cx: &App) -> Div {
         }
     };
     let ports = |r: &Value| -> String {
-        let p: Vec<String> = r["ports"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .map(|p| {
-                format!(
-                    "{}/{}",
-                    p["port"]
-                        .as_i64()
-                        .map(|n| n.to_string())
-                        .or_else(|| p["port"].as_str().map(String::from))
-                        .unwrap_or("*".into()),
-                    p["protocol"].as_str().unwrap_or("TCP")
-                )
-            })
-            .collect();
+        let p: Vec<String> = r["ports"].as_array().into_iter().flatten().map(netpol_port).collect();
         if p.is_empty() { "all ports".into() } else { p.join(", ") }
     };
     let section = |title: &str, key: &str, peers_key: &str, empty: &str| {
@@ -455,6 +440,17 @@ pub(super) fn netpol(ctx: &Ctx, cx: &App) -> Div {
         .child(section("Egress", "egress", "to", "All outgoing traffic is denied."))
 }
 
+/// One NetworkPolicy port: `80/TCP`, `http/TCP`, a range `8000-9000/TCP`, or `*/UDP` for any port.
+fn netpol_port(p: &Value) -> String {
+    let port = p["port"]
+        .as_i64()
+        .map(|n| n.to_string())
+        .or_else(|| p["port"].as_str().map(String::from))
+        .unwrap_or("*".into());
+    let end = p["endPort"].as_i64().map(|n| format!("-{n}")).unwrap_or_default();
+    format!("{port}{end}/{}", p["protocol"].as_str().unwrap_or("TCP"))
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -468,5 +464,13 @@ mod tests {
         let only = json!({"podSelector": {"matchExpressions": [{"key": "tier", "operator": "Exists"}]}});
         assert_eq!(super::selector_terms(&only, "/podSelector"), ["tier"]);
         assert!(super::selector_terms(&json!({"podSelector": {}}), "/podSelector").is_empty());
+    }
+
+    #[test]
+    fn netpol_port_shows_ranges() {
+        assert_eq!(super::netpol_port(&json!({"port": 8000, "endPort": 9000})), "8000-9000/TCP");
+        assert_eq!(super::netpol_port(&json!({"port": 53, "protocol": "UDP"})), "53/UDP");
+        assert_eq!(super::netpol_port(&json!({"port": "http"})), "http/TCP");
+        assert_eq!(super::netpol_port(&json!({"protocol": "SCTP"})), "*/SCTP");
     }
 }
