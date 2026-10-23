@@ -296,9 +296,7 @@ async fn start_node_shell(client: Client, node: String, image: String, dry_run: 
         // Delete the pod on every way out but a running shell: it is privileged.
         let started = wait_node_shell(&api, &name).await;
         if started.is_err() {
-            let _ = api
-                .delete(&name, &kube::api::DeleteParams { grace_period_seconds: Some(0), ..Default::default() })
-                .await;
+            remove_node_shell(&api, &name).await;
         }
         started.map(|()| name)
     })
@@ -335,10 +333,22 @@ async fn wait_node_shell(api: &Api<Pod>, name: &str) -> Result<()> {
 /// Delete a node shell pod in the background (when its page goes away).
 pub fn delete_node_shell(client: Client, name: String) {
     spawn_detached(async move {
-        let api: Api<Pod> = Api::namespaced(client, NODE_SHELL_NS);
-        let _ =
-            api.delete(&name, &kube::api::DeleteParams { grace_period_seconds: Some(0), ..Default::default() }).await;
+        remove_node_shell(&Api::namespaced(client, NODE_SHELL_NS), &name).await;
     });
+}
+
+/// Delete a node shell pod now, trying again a few times: the error that made us give up on
+/// it (a 429, a 5xx, a network blip) often fails the first delete too.
+async fn remove_node_shell(api: &Api<Pod>, name: &str) {
+    let dp = kube::api::DeleteParams { grace_period_seconds: Some(0), ..Default::default() };
+    for _ in 0..5 {
+        match api.delete(name, &dp).await {
+            Ok(_) => return,
+            // Gone already, or refused: trying again won't help.
+            Err(kube::Error::Api(e)) if e.code != 429 && e.code < 500 => return,
+            Err(_) => tokio::time::sleep(std::time::Duration::from_secs(2)).await,
+        }
+    }
 }
 
 /// Ask Flux to reconcile now (what `flux reconcile` does).
