@@ -236,17 +236,17 @@ pub async fn download_from_container(
     use std::io::Write as _;
     run(async move {
         let (parent, member, base) = tar_source(&path);
+        // Succeeds for a file too, so a failure (refused, no shell) is said, not read as a file.
         let is_dir = exec_bytes(
             client.clone(),
             ns.clone(),
             pod.clone(),
             container.clone(),
-            vec!["sh".into(), "-c".into(), format!("test -d {} && echo dir", shell_quote(&path))],
+            vec!["sh".into(), "-c".into(), format!("if test -d {}; then echo dir; fi", shell_quote(&path))],
             None,
         )
         .await
-        .map(|o| String::from_utf8_lossy(&o).contains("dir"))
-        .unwrap_or(false);
+        .map(|o| String::from_utf8_lossy(&o).contains("dir"))?;
         let (cmd, name) = if is_dir {
             (
                 vec!["tar".into(), "cf".into(), "-".into(), "-C".into(), parent, "--".into(), member],
