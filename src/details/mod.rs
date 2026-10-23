@@ -133,6 +133,18 @@ pub struct OpenObject {
 
 impl EventEmitter<OpenObject> for DetailPanel {}
 
+/// Ask the assistant why this object is broken (the Diagnosis card).
+#[derive(Clone)]
+pub struct Investigate {
+    pub kind: String,
+    pub name: String,
+    pub namespace: Option<String>,
+    /// What the diagnosis found, a finding a line.
+    pub findings: String,
+}
+
+impl EventEmitter<Investigate> for DetailPanel {}
+
 impl EventEmitter<crate::plugins::RunPlugin> for DetailPanel {}
 
 pub struct DetailPanel {
@@ -347,9 +359,12 @@ impl DetailPanel {
                 .child(confirm_extras(&command, guard.as_ref(), cx))
                 .show_cancel(true)
                 .ok_text("Run")
-                .on_ok(move |_, _, cx| {
+                .on_ok(move |_, window, cx| {
                     if !guard_ok(guard.as_ref(), cx) {
                         return false;
+                    }
+                    if writes && !writes_still_on(window, cx) {
+                        return true;
                     }
                     if let Some(ev) = ev.borrow_mut().take() {
                         let _ = panel.update(cx, |_, cx| cx.emit(ev));
@@ -471,7 +486,7 @@ impl DetailPanel {
         self.object_read.spawn_in(window, cx, fut, move |this, result, window, cx| {
             match result {
                 Ok(value) => {
-                    let taken = this.set_object(value);
+                    let taken = this.set_object(value, cx);
                     if taken && reset_yaml || this.yaml.read(cx).value().as_ref() == this.yaml_text {
                         this.refresh_yaml(window, cx);
                     }
@@ -581,7 +596,7 @@ impl DetailPanel {
                 let alive = this.update_in(cx, |this, window, cx| {
                     this.deleted = false;
                     let changed = this.object.as_ref() != Some(&value);
-                    if !changed || !this.set_object(value) {
+                    if !changed || !this.set_object(value, cx) {
                         return;
                     }
                     // Don't overwrite what the user is editing.
@@ -782,12 +797,27 @@ impl DetailPanel {
     /// Show this read of the object, unless it is older than the one shown: a periodic read
     /// that started before a write can arrive after the read made once it was done.
     /// Returns whether it was taken.
-    fn set_object(&mut self, value: serde_json::Value) -> bool {
+    fn set_object(&mut self, value: serde_json::Value, cx: &mut Context<Self>) -> bool {
         if self.object.as_ref().is_some_and(|shown| k8s::older_version(&value, shown)) {
             return false;
         }
         if self.obj.kind.is("apiextensions.k8s.io", "CustomResourceDefinition") {
             self.schema_rows = crate::overview::crd_rows(&value);
+        }
+        // Re-created under the same name (a StatefulSet's pod, say), or opened by name:
+        // the events and logs shown are this object's. Logs follow the pod by name, so they
+        // restart only for a re-created one, not on a page's first read.
+        if let Some(uid) = new_uid(&self.obj.uid, &value) {
+            let recreated = !self.obj.uid.is_empty() && !self.obj.uid.contains('/');
+            self.obj.uid = uid;
+            self.load_events(cx);
+            if let Some(logs) = self.logs.as_ref().filter(|_| recreated) {
+                logs.update(cx, |l, cx| {
+                    if !l.paused {
+                        l.restart(cx);
+                    }
+                });
+            }
         }
         self.object = Some(value);
         true
@@ -845,6 +875,13 @@ fn tab_named(name: &str) -> DetailTab {
     }
 }
 
+/// The uid of a read of the object when it isn't the one the page knows (which is empty
+/// for a page opened by name).
+fn new_uid(known: &str, read: &serde_json::Value) -> Option<String> {
+    let uid = read.pointer("/metadata/uid")?.as_str()?;
+    (!uid.is_empty() && uid != known).then(|| uid.to_string())
+}
+
 impl Drop for DetailPanel {
     fn drop(&mut self) {
         if let Some(pod) = self.node_shell.take() {
@@ -855,12 +892,22 @@ impl Drop for DetailPanel {
 
 #[cfg(test)]
 mod tests {
-    use super::{DetailTab, tab_named};
+    use super::{DetailTab, new_uid, tab_named};
+    use serde_json::json;
 
     #[test]
     fn a_debug_shell_has_its_own_tab() {
         assert!(tab_named("debug") == DetailTab::Debug);
         assert!(tab_named("shell") == DetailTab::Shell);
         assert!(tab_named("debug") != tab_named("shell"));
+    }
+
+    #[test]
+    fn a_recreated_object_has_a_new_uid() {
+        let read = json!({"metadata": {"name": "db-0", "uid": "b"}});
+        assert_eq!(new_uid("a", &read).as_deref(), Some("b"));
+        assert_eq!(new_uid("", &read).as_deref(), Some("b"));
+        assert_eq!(new_uid("b", &read), None);
+        assert_eq!(new_uid("a", &json!({"metadata": {"name": "db-0"}})), None);
     }
 }

@@ -520,7 +520,7 @@ impl DetailPanel {
         if !self.ensure_writes(window, cx) {
             return;
         }
-        let level = crate::settings::delete_confirm(&self.obj.kind.ar.kind);
+        let level = crate::settings::delete_confirm(&self.obj.kind.ar.group, &self.obj.kind.ar.kind);
         let guard = self.protection(window, cx);
         let terminating = self.object.as_ref().is_some_and(|o| o.pointer("/metadata/deletionTimestamp").is_some());
         if level == crate::settings::DeleteConfirm::Off && guard.is_none() && !terminating {
@@ -533,7 +533,8 @@ impl DetailPanel {
         let typed = level == crate::settings::DeleteConfirm::Type;
         let input = cx.new(|cx| InputState::new(window, cx).placeholder(self.obj.name.clone()));
         let panel = cx.entity().downgrade();
-        let (name, kind, context) = (self.obj.name.clone(), self.obj.kind.ar.kind.clone(), self.context.clone());
+        let (name, context) = (self.obj.name.clone(), self.context.clone());
+        let ar = self.obj.kind.ar.clone();
         let label = self.obj.kind.label.clone();
         let opts = cx.new(|_| (false, false));
         let base = self.kubectl_for("Delete");
@@ -548,7 +549,7 @@ impl DetailPanel {
             }
             let (o1, o2) = (opts.clone(), opts.clone());
             alert
-                .title(format!("Delete {kind} {name}?"))
+                .title(format!("Delete {} {name}?", ar.kind))
                 .description(if typed {
                     format!("This deletes it from {context}. Type the name to confirm.")
                 } else {
@@ -594,7 +595,7 @@ impl DetailPanel {
                         }),
                 )
                 .child(confirm_extras(&cmd, guard.as_ref(), cx))
-                .child(delete_settings_link(&kind, &label, cx))
+                .child(delete_settings_link(&ar.group, &ar.kind, &label, cx))
                 .show_cancel(true)
                 .ok_text("Delete")
                 .ok_variant(component::button::ButtonVariant::Danger)
@@ -784,8 +785,8 @@ pub fn confirm_extras(cmd: &str, guard: Option<&(Entity<InputState>, String)>, c
 }
 
 /// "Change what deleting asks…": a link under delete dialogs to their setting.
-pub fn delete_settings_link(kind: &str, label: &str, cx: &App) -> AnyElement {
-    let text = match crate::settings::delete_confirm(kind) {
+pub fn delete_settings_link(group: &str, kind: &str, label: &str, cx: &App) -> AnyElement {
+    let text = match crate::settings::delete_confirm(group, kind) {
         crate::settings::DeleteConfirm::Off => format!("{label} are deleted without asking."),
         crate::settings::DeleteConfirm::Ask => format!("Deleting {label} asks first."),
         crate::settings::DeleteConfirm::Type => format!("Deleting {label} asks for the name."),

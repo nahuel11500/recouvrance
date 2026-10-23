@@ -21,7 +21,7 @@ use rmcp::{ServerHandler, prompt, prompt_handler, prompt_router, schemars, tool,
 use serde::Deserialize;
 use serde_json::json;
 
-use super::{Access, Agent, AuditEntry, Decision, Hub, HubEvent, Mode, Policy, is_write};
+use super::{Access, Agent, Answer, AuditEntry, Decision, Hub, HubEvent, Mode, Policy, is_write};
 use crate::k8s::{self, Kind, ObjectRef, TaskGuard};
 
 mod read_tools;
@@ -51,8 +51,9 @@ struct Call {
     /// The Ask rules the approval covered: every Ask rule the request meets, in its
     /// namespace or, across all namespaces, in any of them.
     approved_rules: Vec<usize>,
-    /// The rule that allowed the call, for the activity log.
-    rule: Option<usize>,
+    /// The rule that allowed the call, named when it was decided, for the activity log
+    /// (the rules may be read again, and renumbered, before the call ends).
+    rule: Option<String>,
     session: Option<String>,
     /// More for the approval banner than the arguments show (a manifest's objects).
     approval_detail: Option<String>,
@@ -71,6 +72,11 @@ impl Call {
             }
             None => "no matching rule".into(),
         }
+    }
+
+    /// Remember the rule that allowed the call.
+    fn allowed_by(&mut self, rule: Option<usize>) {
+        self.rule = rule.map(|i| self.rule_label(Some(i)));
     }
 
     fn record(&self, decision: Decision, detail: String, result_bytes: usize) {
@@ -104,12 +110,12 @@ impl Call {
     /// Whether one row of a list result may be shown: allowed by a rule, or gated by
     /// an Ask rule the user approved for this call.
     fn may_see(&self, a: &Access) -> bool {
-        let v = self.policy().decide(a);
-        match v.mode {
-            Mode::Allow => true,
-            Mode::Ask => self.approved && v.rule.is_some_and(|r| self.approved_rules.contains(&r)),
-            Mode::Deny => false,
-        }
+        visible(self.policy(), self.approved_rules(), a)
+    }
+
+    /// The Ask rules the user approved for this call (none when not approved).
+    fn approved_rules(&self) -> &[usize] {
+        if self.approved { &self.approved_rules } else { &[] }
     }
 
     fn finish(&self, result: anyhow::Result<String>) -> Result<String, String> {
@@ -117,7 +123,7 @@ impl Call {
             Ok(text) => {
                 let decision = if self.approved { Decision::Approved } else { Decision::Allowed };
                 // Calls that aren't rule-checked (list_contexts) have no rule to show.
-                let detail = if self.rule.is_some() { self.rule_label(self.rule) } else { String::new() };
+                let detail = self.rule.clone().unwrap_or_default();
                 self.record(decision, detail, text.len());
                 Ok(text)
             }
@@ -128,6 +134,22 @@ impl Call {
             }
         }
     }
+}
+
+/// Whether a row may be shown: allowed by a rule, or gated by one of the `approved` Ask rules.
+fn visible(policy: &Policy, approved: &[usize], a: &Access) -> bool {
+    let v = policy.decide(a);
+    match v.mode {
+        Mode::Allow => true,
+        Mode::Ask => v.rule.is_some_and(|r| approved.contains(&r)),
+        Mode::Deny => false,
+    }
+}
+
+/// Whether a `find_problems` finding may be shown. The approval named pods: findings of
+/// other kinds need an Allow rule.
+fn problem_visible(policy: &Policy, approved: &[usize], pod: bool, a: &Access) -> bool {
+    visible(policy, if pod { approved } else { &[] }, a)
 }
 
 fn describe(a: &Access) -> String {
@@ -373,7 +395,7 @@ impl KubeMcp {
         let verdict = decide(call);
         match verdict.mode {
             Mode::Allow => {
-                call.rule = verdict.rule;
+                call.allowed_by(verdict.rule);
                 Ok(())
             }
             Mode::Deny => Err(call.deny(format!("{} — {}", describe(access), call.rule_label(verdict.rule)))),
@@ -382,7 +404,7 @@ impl KubeMcp {
                 let fallback = |call: &Call| if list { call.policy().allow_somewhere(access) } else { None };
                 if self.hub.headless() {
                     if let Some(rule) = fallback(call) {
-                        call.rule = Some(rule);
+                        call.allowed_by(Some(rule));
                         return Ok(());
                     }
                     return Err(call.deny(format!(
@@ -398,31 +420,32 @@ impl KubeMcp {
                     summary.push_str(detail);
                 }
                 let dry_run = call.args.get("dry_run").and_then(|v| v.as_bool()).unwrap_or(false);
-                let approved =
-                    self.hub.request_approval(&call.agent, call.tool, summary, access.clone(), dry_run).await;
+                let answer = self.hub.request_approval(&call.agent, call.tool, summary, access.clone(), dry_run).await;
                 // Access may have been switched off, or the rules changed, while the request waited.
                 self.reload_rules(call);
-                if approved {
+                if answer == Answer::Approved {
                     self.ensure_active(call)?;
                     let now = decide(call);
                     if now.mode == Mode::Deny {
                         return Err(call.deny(format!("{} — {}", describe(access), call.rule_label(now.rule))));
                     }
                     call.approved = true;
-                    call.rule = now.rule;
+                    call.allowed_by(now.rule);
                     call.approved_rules = if any_namespace {
                         call.policy().asks_any_namespace(access)
                     } else {
                         call.policy().asks(access)
                     };
                     Ok(())
-                } else if let Some(rule) = fallback(call) {
-                    call.record(Decision::Rejected, "not approved; showing the allowed rows only".into(), 0);
-                    call.rule = Some(rule);
+                } else if answer != Answer::SwitchedOff
+                    && let Some(rule) = fallback(call)
+                {
+                    call.record(Decision::Rejected, format!("{}; showing the allowed rows only", answer.reason()), 0);
+                    call.allowed_by(Some(rule));
                     self.ensure_active(call)
                 } else {
-                    call.record(Decision::Rejected, "not approved".into(), 0);
-                    Err("Rejected: the user did not approve this request".into())
+                    call.record(Decision::Rejected, answer.reason().into(), 0);
+                    Err(format!("Rejected: {}", answer.reason()))
                 }
             }
         }
@@ -903,6 +926,34 @@ pub fn start(hub: Arc<Hub>) -> TaskGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn approving_find_problems_shows_only_pod_findings() {
+        let ask = super::super::Rule {
+            effect: Mode::Ask,
+            verbs: vec!["list".into()],
+            resources: vec!["*".into()],
+            namespaces: vec!["team-b".into()],
+            contexts: vec!["*".into()],
+            names: vec!["*".into()],
+            ..Default::default()
+        };
+        let policy = Policy { rules: vec![ask], ..Default::default() };
+        let access = |resource: &str| Access {
+            context: "c".into(),
+            verb: "list".into(),
+            resource: resource.into(),
+            resource_aliases: vec![],
+            namespace: Some("team-b".into()),
+            name: Some("web".into()),
+            cluster_scoped: false,
+        };
+        let approved = policy.asks(&access("pods"));
+        assert!(!approved.is_empty());
+        assert!(problem_visible(&policy, &approved, true, &access("pods")));
+        assert!(!problem_visible(&policy, &approved, false, &access("deployments")));
+        assert!(!problem_visible(&policy, &[], true, &access("pods")));
+    }
 
     #[test]
     fn logged_patches_hide_secret_values() {

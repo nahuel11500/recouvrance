@@ -18,7 +18,7 @@ impl AgentsView {
             Mode::Deny => theme.danger,
         };
         let matched = self.matched_contexts(&rule.contexts);
-        let any_risky = matched.iter().any(|c| self.risky.contains(c));
+        let any_protected = matched.iter().any(|c| self.protected.contains(c));
         let label = |text: &'static str| {
             div().w(px(96.)).flex_shrink_0().text_xs().text_color(theme.muted_foreground).child(text)
         };
@@ -157,7 +157,9 @@ impl AgentsView {
                             .gap_1()
                             .text_xs()
                             .text_color(theme.muted_foreground)
-                            .child(if matched.is_empty() {
+                            .child(if let Some(e) = &self.contexts_error {
+                                format!("can't read the kubeconfig: {e}")
+                            } else if matched.is_empty() {
                                 "matches no context".to_string()
                             } else {
                                 format!("matches {}:", matched.len())
@@ -167,11 +169,11 @@ impl AgentsView {
                                     .px_1()
                                     .rounded_sm()
                                     .bg(theme.secondary)
-                                    .when(self.risky.contains(c), |d| d.text_color(theme.warning))
+                                    .when(self.protected.contains(c), |d| d.text_color(theme.warning))
                                     .child(c.clone())
                             }))
-                            .when(any_risky && rule.effect != Mode::Deny, |d| {
-                                d.child(div().text_color(theme.warning).child("· includes production/admin contexts"))
+                            .when(any_protected && rule.effect != Mode::Deny, |d| {
+                                d.child(div().text_color(theme.warning).child("· includes protected contexts"))
                             }),
                     ),
                 ),

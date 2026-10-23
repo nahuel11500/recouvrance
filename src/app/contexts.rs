@@ -48,6 +48,7 @@ impl AppView {
         self.page_scopes.clear();
         // The palette's object index points at the old clusters.
         self.search_index.clear();
+        self.index_failed.clear();
         self.index_built = None;
         self._index_tasks.clear();
         self.status = Some(format!("Connecting to {}…", contexts.join(", ")).into());
@@ -218,6 +219,7 @@ impl AppView {
         self.all_contexts = names.clone();
         self.ctx_picker.update(cx, |p, cx| p.set_all(names, cx));
         self.settings_view.update(cx, |s, cx| s.sync_clusters(window, cx));
+        self.agents.update(cx, |a, _| a.refresh_contexts());
         let msg = match (added, removed) {
             (0, 0) => "Kubeconfig reloaded".to_string(),
             (a, 0) => format!("Kubeconfig reloaded: {a} new context{}", if a > 1 { "s" } else { "" }),

@@ -297,6 +297,8 @@ const SEARCH_KINDS: [&str; 12] = [
 
 pub struct AppView {
     search_index: Vec<IndexEntry>,
+    /// The lists the object index couldn't load: kind and cluster.
+    index_failed: Vec<String>,
     index_built: Option<std::time::Instant>,
     _index_tasks: Vec<Task<()>>,
     focus: FocusHandle,
@@ -551,6 +553,7 @@ impl AppView {
             settings_view,
             terminals: HashMap::new(),
             search_index: Vec::new(),
+            index_failed: Vec::new(),
             index_built: None,
             _index_tasks: Vec::new(),
             focus,
