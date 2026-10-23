@@ -198,6 +198,14 @@ pub fn true_is_bad(ty: &str) -> bool {
     )
 }
 
+/// Whether a node condition reports a problem. On a node every condition but Ready is
+/// True when something is wrong (pressure, node-problem-detector's `KubeletProblem`,
+/// AKS's `VMEventScheduled`…), so one we don't know is flagged too, unless its name says
+/// it is good when True ("GPUHealthy").
+pub fn node_condition_bad(ty: &str, status: &str) -> bool {
+    status == "True" && (true_is_bad(ty) || (!true_is_good(ty) && tone(ty) != Some(Tone::Good)))
+}
+
 /// Condition types where "True" is the good state, so "False" is bad.
 pub fn true_is_good(ty: &str) -> bool {
     matches!(
@@ -226,7 +234,22 @@ pub fn true_is_good(ty: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{Tone, tone, words};
+    use super::{Tone, node_condition_bad, tone, words};
+
+    #[test]
+    fn node_conditions() {
+        // Known and unknown problem conditions, as node-problem-detector and clouds add them.
+        for ty in ["MemoryPressure", "KernelDeadlock", "KubeletProblem", "ContainerRuntimeProblem", "VMEventScheduled"]
+        {
+            assert!(node_condition_bad(ty, "True"), "{ty}");
+            assert!(!node_condition_bad(ty, "False"), "{ty}");
+            assert!(!node_condition_bad(ty, "Unknown"), "{ty}");
+        }
+        // Good when True.
+        for ty in ["Ready", "GPUHealthy", "CiliumAgentReady"] {
+            assert!(!node_condition_bad(ty, "True"), "{ty}");
+        }
+    }
 
     #[test]
     fn tones() {
