@@ -71,6 +71,7 @@ impl ContextPicker {
                             this.picked.remove(&n1);
                         }
                         cx.notify();
+                        cx.stop_propagation();
                     })),
             )
             .child(div().size(px(10.)).flex_shrink_0().rounded_full().bg(color))

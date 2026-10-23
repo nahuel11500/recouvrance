@@ -26,7 +26,7 @@ pub fn run(path: &str, wait: Duration) -> Result<()> {
         }
         let dark = std::env::var("RECOUVRANCE_DARK").is_ok();
         let mode = if dark { ThemeMode::Dark } else { ThemeMode::Light };
-        crate::app::apply_palette_only(mode, cx);
+        crate::app::apply_theme(mode, None, cx);
     });
     let mut app_view = None;
     let window = cx.open_window(size(px(1500.), px(920.)), |window, cx| {
