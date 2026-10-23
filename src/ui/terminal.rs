@@ -527,6 +527,8 @@ fn key_bytes(ks: &Keystroke, app_cursor: bool) -> Option<Vec<u8>> {
         "pagedown" => b"\x1b[6~".to_vec(),
         "insert" => b"\x1b[2~".to_vec(),
         "space" if m.control && !m.alt => vec![0],
+        // Copy in most Linux terminals: never an interrupt (there is no selection to copy).
+        "c" if m.control && m.shift => return None,
         key if m.control && !m.alt && key.len() == 1 => {
             let c = key.as_bytes()[0].to_ascii_lowercase();
             match c {
@@ -621,7 +623,14 @@ fn vt_color(color: vt100::Color, default: Hsla, dark: bool) -> Hsla {
 
 #[cfg(test)]
 mod tests {
-    use super::paste_bytes;
+    use super::{Keystroke, key_bytes, paste_bytes};
+
+    #[test]
+    fn copy_shortcut_is_not_an_interrupt() {
+        let bytes = |k: &str| key_bytes(&Keystroke::parse(k).unwrap(), false);
+        assert_eq!(bytes("ctrl-c"), Some(vec![3]));
+        assert_eq!(bytes("ctrl-shift-c"), None);
+    }
 
     #[test]
     fn bracketed_paste() {
