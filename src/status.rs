@@ -177,6 +177,11 @@ pub fn true_is_bad(ty: &str) -> bool {
             | "ReplicaFailure"
             | "DisruptionTarget"
             | "Stalled"
+            // OpenShift operators
+            | "Degraded"
+            // volume expansion
+            | "ControllerResizeError"
+            | "NodeResizeError"
             // node-problem-detector
             | "KernelDeadlock"
             | "ReadonlyFilesystem"
@@ -237,9 +242,50 @@ pub fn true_is_good(ty: &str) -> bool {
     )
 }
 
+/// The tone of a condition: by its type's polarity when known; for another type that is
+/// True, by what its name says ("Degraded", "ResizeError" bad, "Reconciling" busy,
+/// "Healthy" good), and none when the name says nothing.
+pub(crate) fn condition_tone(ty: &str, status: &str) -> Option<Tone> {
+    match status {
+        "True" if true_is_bad(ty) => Some(Tone::Bad),
+        "False" if true_is_bad(ty) => Some(Tone::Good),
+        "True" if true_is_good(ty) => Some(Tone::Good),
+        "False" if true_is_good(ty) => Some(Tone::Bad),
+        "True" => tone(ty),
+        // False on a type we don't know: not known to be bad, so not drawn red either.
+        "False" => None,
+        _ => tone(status),
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Tone, node_condition_bad, tone, words};
+    use super::{Tone, condition_tone, node_condition_bad, tone, words};
+
+    #[test]
+    fn condition_tones() {
+        let cases: &[(&str, &str, Option<Tone>)] = &[
+            ("Ready", "True", Some(Tone::Good)),
+            ("Ready", "False", Some(Tone::Bad)),
+            ("MemoryPressure", "True", Some(Tone::Bad)),
+            ("MemoryPressure", "False", Some(Tone::Good)),
+            ("Degraded", "True", Some(Tone::Bad)),
+            ("Degraded", "False", Some(Tone::Good)),
+            ("ControllerResizeError", "True", Some(Tone::Bad)),
+            ("NodeResizeError", "True", Some(Tone::Bad)),
+            // Types we don't know, read by their name.
+            ("FileSystemResizePending", "True", Some(Tone::Busy)),
+            ("Reconciling", "True", Some(Tone::Busy)),
+            ("Suspended", "True", Some(Tone::Busy)),
+            ("CertificateHealthy", "True", Some(Tone::Good)),
+            ("Lorem", "True", None),
+            ("Lorem", "False", None),
+            ("Lorem", "Unknown", Some(Tone::Busy)),
+        ];
+        for (ty, status, want) in cases {
+            assert_eq!(condition_tone(ty, status), *want, "{ty}={status}");
+        }
+    }
 
     #[test]
     fn node_conditions() {
