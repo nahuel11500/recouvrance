@@ -502,6 +502,13 @@ impl AppView {
                 }
                 _ => {}
             }),
+            // "System" follows the desktop switching between light and dark while the app runs.
+            cx.observe_window_appearance(window, |_, window, cx| {
+                let mode = system_theme(window.appearance());
+                if follows_system(cx) && mode.is_dark() != cx.theme().mode.is_dark() {
+                    apply_theme(mode, Some(window), cx);
+                }
+            }),
         ];
 
         // One agent hub and MCP server for the whole app, shared by its windows.

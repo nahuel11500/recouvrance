@@ -526,15 +526,17 @@ impl SettingsView {
             }
             Section::Appearance => {
                 let mode = theme.mode;
+                let system = crate::app::follows_system(cx);
+                let (light, dark) = (!system && !mode.is_dark(), !system && mode.is_dark());
                 v_flex()
                     .child(Self::row(
                         "Theme",
                         "Saved between runs. \"System\" follows your desktop.",
                         h_flex()
                             .gap_1()
-                            .child(Button::new("th-light").small().label("Light").selected(!mode.is_dark()).when(!mode.is_dark(), |b| b.primary()).when(mode.is_dark(), |b| b.outline()).on_click(|_, w, cx| crate::app::set_theme(ThemeMode::Light, Some(w), cx)))
-                            .child(Button::new("th-dark").small().label("Dark").selected(mode.is_dark()).when(mode.is_dark(), |b| b.primary()).when(!mode.is_dark(), |b| b.outline()).on_click(|_, w, cx| crate::app::set_theme(ThemeMode::Dark, Some(w), cx)))
-                            .child(Button::new("th-system").small().outline().label("System").on_click(|_, w, cx| {
+                            .child(Button::new("th-light").small().label("Light").selected(light).when(light, |b| b.primary()).when(!light, |b| b.outline()).on_click(|_, w, cx| crate::app::set_theme(ThemeMode::Light, Some(w), cx)))
+                            .child(Button::new("th-dark").small().label("Dark").selected(dark).when(dark, |b| b.primary()).when(!dark, |b| b.outline()).on_click(|_, w, cx| crate::app::set_theme(ThemeMode::Dark, Some(w), cx)))
+                            .child(Button::new("th-system").small().label("System").selected(system).when(system, |b| b.primary()).when(!system, |b| b.outline()).on_click(|_, w, cx| {
                                 crate::app::forget_theme_choice();
                                 let mode = crate::app::initial_theme(cx);
                                 crate::app::apply_theme(mode, Some(w), cx);
