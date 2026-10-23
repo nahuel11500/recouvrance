@@ -208,6 +208,7 @@ impl AppView {
             p.all = names;
             cx.notify();
         });
+        self.settings_view.update(cx, |s, cx| s.sync_clusters(window, cx));
         let msg = match (added, removed) {
             (0, 0) => "Kubeconfig reloaded".to_string(),
             (a, 0) => format!("Kubeconfig reloaded: {a} new context{}", if a > 1 { "s" } else { "" }),

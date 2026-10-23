@@ -168,16 +168,19 @@ impl SettingsView {
     }
 
     /// Per cluster rows for the kubeconfig's current contexts (contexts come and go;
-    /// checked when the section opens).
-    fn sync_clusters(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// checked when the section opens and when the kubeconfig reloads).
+    pub fn sync_clusters(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let names = crate::k8s::load_contexts().map(|c| c.names).unwrap_or_default();
         self.cluster_inputs.retain(|(ctx, ..)| names.contains(ctx));
         self.prometheus.retain(|(ctx, _)| names.contains(ctx));
-        for ctx in names {
-            if !self.cluster_inputs.iter().any(|(c, ..)| *c == ctx) {
-                self.add_cluster(ctx, window, cx);
+        for ctx in &names {
+            if !self.cluster_inputs.iter().any(|(c, ..)| c == ctx) {
+                self.add_cluster(ctx.clone(), window, cx);
             }
         }
+        // New contexts take their place in the kubeconfig's order.
+        self.cluster_inputs.sort_by_key(|(ctx, ..)| names.iter().position(|n| n == ctx));
+        cx.notify();
     }
 
     fn add_cluster(&mut self, ctx: String, window: &mut Window, cx: &mut Context<Self>) {
