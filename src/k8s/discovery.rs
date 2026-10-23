@@ -319,9 +319,11 @@ async fn pinned_groups(
     futures::stream::iter(jobs).buffered(16).collect().await
 }
 
-/// A group with kinds the sidebar lists by name: discovery can't do without it.
+/// A built-in group with kinds the sidebar lists by name: discovery can't do without it.
+/// Add-on groups stay optional, even listed ones: projectcalico.org is an APIService that
+/// can be down like metrics.k8s.io.
 fn required(group: &str) -> bool {
-    KNOWN.iter().any(|(_, g, _, _)| *g == group)
+    is_builtin_group(group) && KNOWN.iter().any(|(_, g, _, _)| *g == group)
 }
 
 pub(super) fn listable(caps: &ApiCapabilities) -> bool {
@@ -399,6 +401,7 @@ mod required_tests {
         assert!(!required("metrics.k8s.io"));
         assert!(!required("custom.metrics.k8s.io"));
         assert!(!required("cert-manager.io"));
+        assert!(!required("projectcalico.org"));
     }
 }
 
