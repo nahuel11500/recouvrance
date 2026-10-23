@@ -266,6 +266,15 @@ impl Policy {
         best(candidates)
     }
 
+    /// The Ask rules an all-namespaces request meets in some namespace: what approving it covers.
+    pub fn asks_any_namespace(&self, a: &Access) -> Vec<usize> {
+        let mut probe = a.clone();
+        probe.namespace = None;
+        (0..self.rules.len())
+            .filter(|&i| self.rules[i].effect == Mode::Ask && self.rules[i].matches(&probe, true))
+            .collect()
+    }
+
     /// For an all-namespaces request that asks: an Allow rule covering some namespace, so the
     /// request can still go ahead unapproved, showing only the allowed rows.
     pub fn allow_somewhere(&self, a: &Access) -> Option<usize> {
@@ -1145,9 +1154,26 @@ mod tests {
         // Unapproved, rows are filtered: team-b asks, so it is hidden.
         assert_eq!(p.decide(&access("c", "list", "pods", Some("team-a"), Some("x"))).mode, Mode::Allow);
         assert_eq!(p.decide(&access("c", "list", "pods", Some("team-b"), Some("x"))).mode, Mode::Ask);
+        assert_eq!(p.asks_any_namespace(&all), [1]);
         let only_ask = Policy { rules: vec![p.rules[1].clone()], ..Policy::default() };
         assert_eq!(only_ask.allow_somewhere(&all), None);
         assert_eq!(p.allow_somewhere(&access("c", "list", "secrets", None, None)), None);
+    }
+
+    #[test]
+    fn approving_all_namespaces_covers_every_ask_rule() {
+        let p = Policy {
+            rules: vec![
+                rule(Mode::Ask, &["list"], &["pods"], &["team-b"], &["*"]),
+                rule(Mode::Ask, &["list"], &["pods"], &["team-c"], &["*"]),
+                rule(Mode::Ask, &["list"], &["deployments"], &["*"], &["*"]),
+            ],
+            ..Policy::default()
+        };
+        let all = access("c", "list", "pods", None, None);
+        assert_eq!(p.decide_any_namespace(&all).rule, Some(0));
+        // Both namespaces' rows were approved; deployments were not asked about.
+        assert_eq!(p.asks_any_namespace(&all), [0, 1]);
     }
 
     #[test]
