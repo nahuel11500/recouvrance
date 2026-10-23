@@ -129,6 +129,7 @@ impl AppView {
                                 .or_else(|| fallback.clone());
                             tab.namespaces.retain(|ns| namespaces.contains(ns));
                         }
+                        this.settings_view.update(cx, |s, _| s.set_kinds(kinds.clone()));
                         this.kinds = kinds;
                         this.start_problem_watch(cx);
                         this.set_namespaces(namespaces, window, cx);
