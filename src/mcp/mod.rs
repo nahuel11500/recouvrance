@@ -83,12 +83,11 @@ pub fn is_write(verb: &str) -> bool {
 }
 
 /// One access rule, like a Kubernetes RBAC rule with an effect.
-/// Every field is a list of `*` patterns; an empty list matches nothing.
+/// Every field is a list of `*` patterns; an empty list matches nothing. A field missing
+/// when read never grants (see `RuleFields`).
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
-#[serde(default)]
+#[serde(from = "RuleFields")]
 pub struct Rule {
-    /// A rule written without one (by hand, pasted) denies: a missing field never grants.
-    #[serde(default = "deny")]
     pub effect: Mode,
     pub verbs: Vec<String>,
     /// kubectl names: `pods`, `deployments`, `certificates.cert-manager.io`, `*`.
@@ -125,6 +124,47 @@ impl Default for Rule {
 
 fn deny() -> Mode {
     Mode::Deny
+}
+
+/// A rule as read (agents.json, pasted rules), where any field may be missing.
+#[derive(Deserialize)]
+struct RuleFields {
+    /// A rule written without one (by hand, pasted) denies.
+    #[serde(default = "deny")]
+    effect: Mode,
+    verbs: Option<Vec<String>>,
+    resources: Option<Vec<String>>,
+    namespaces: Option<Vec<String>>,
+    contexts: Option<Vec<String>>,
+    names: Option<Vec<String>>,
+    #[serde(default)]
+    note: String,
+    #[serde(default)]
+    expires: Option<jiff::Timestamp>,
+    #[serde(default)]
+    approved: bool,
+}
+
+impl From<RuleFields> for Rule {
+    /// A missing list matches nothing in an Allow, and everything in a Deny or an Ask, so a
+    /// rule missing a field never grants more than it says.
+    fn from(f: RuleFields) -> Self {
+        let effect = f.effect;
+        let list = |v: Option<Vec<String>>| {
+            v.unwrap_or_else(|| if effect == Mode::Allow { Vec::new() } else { vec!["*".into()] })
+        };
+        Self {
+            effect,
+            verbs: list(f.verbs),
+            resources: list(f.resources),
+            namespaces: list(f.namespaces),
+            contexts: list(f.contexts),
+            names: list(f.names),
+            note: f.note,
+            expires: f.expires,
+            approved: f.approved,
+        }
+    }
 }
 
 /// What an agent is trying to do.
@@ -582,6 +622,28 @@ pub struct AuditStats {
 
 // MARK: Hub
 
+/// How a request for approval ended.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Answer {
+    Approved,
+    Rejected,
+    TimedOut,
+    /// The kill switch was turned on while it waited.
+    SwitchedOff,
+}
+
+impl Answer {
+    /// Why the call didn't go ahead, for the agent and the activity log.
+    pub fn reason(self) -> &'static str {
+        match self {
+            Answer::Approved => "approved",
+            Answer::Rejected => "the user did not approve this request",
+            Answer::TimedOut => "the user did not answer within 2 minutes",
+            Answer::SwitchedOff => "agent access was switched off while the request waited",
+        }
+    }
+}
+
 pub struct Approval {
     pub id: u64,
     pub agent_id: String,
@@ -666,7 +728,7 @@ pub struct Hub {
     /// The last failure writing audit.jsonl, shown on the Agents page.
     audit_error: Mutex<Option<String>>,
     last_seen: Mutex<HashMap<String, jiff::Timestamp>>,
-    approvals: Mutex<HashMap<u64, oneshot::Sender<bool>>>,
+    approvals: Mutex<HashMap<u64, oneshot::Sender<Answer>>>,
     next_approval: AtomicU64,
     subscribers: Mutex<Vec<mpsc::UnboundedSender<Arc<HubEvent>>>>,
     clients: Mutex<HashMap<String, Arc<Cluster>>>,
@@ -676,9 +738,9 @@ pub struct Hub {
     recent_calls: Mutex<HashMap<String, VecDeque<Instant>>>,
     /// Last MCP server status, for views created after it was reported.
     server_status: Mutex<Option<Result<u16, String>>>,
-    /// rules.yaml: its last load error, and the modification time already applied.
+    /// rules.yaml: its last load error, and the text last loaded or written (None: no file).
     rules_error: Mutex<Option<String>>,
-    rules_mtime: Mutex<Option<std::time::SystemTime>>,
+    rules_text: Mutex<Option<String>>,
     /// The lock on agents.lock while the app or `serve` runs (see [`Hub::claim_config`]).
     config_lock: Mutex<Option<std::fs::File>>,
     /// Why agents.json could not be read at start (see [`load_config`]).
@@ -758,7 +820,7 @@ impl Hub {
             rules_file_present: AtomicBool::new(rules_file::path().exists()),
             recent_calls: Mutex::default(),
             rules_error: Mutex::default(),
-            rules_mtime: Mutex::default(),
+            rules_text: Mutex::default(),
             config_lock: Mutex::default(),
             config_error,
         })
@@ -795,10 +857,13 @@ impl Hub {
     /// Load rules.yaml into the agents (creating agents it names). A broken file
     /// changes nothing: the error is kept for the Agents page.
     pub fn apply_rules_file(&self) -> Result<bool> {
-        let mtime = std::fs::metadata(rules_file::path()).and_then(|m| m.modified()).ok();
-        self.rules_file_present.store(rules_file::path().exists(), Ordering::Relaxed);
-        *lock(&self.rules_mtime) = mtime;
-        let file = match rules_file::load() {
+        let path = rules_file::path();
+        self.rules_file_present.store(path.exists(), Ordering::Relaxed);
+        let loaded = rules_file::read(&path).and_then(|text| {
+            *lock(&self.rules_text) = text.clone();
+            text.map(|t| rules_file::check(&t)).transpose()
+        });
+        let file = match loaded {
             Ok(Some(f)) => f,
             Ok(None) => {
                 *lock(&self.rules_error) = None;
@@ -832,10 +897,7 @@ impl Hub {
 
     /// Save new rules.yaml text from the app: validated first, then written and applied.
     pub fn save_rules_text(&self, text: &str) -> Result<()> {
-        let parsed: rules_file::RulesFile = crate::yaml::from_str(text).context("YAML")?;
-        for (name, rules) in &parsed.agents {
-            rules_file::apply(rules, &mut Policy::default()).with_context(|| format!("agent `{name}`"))?;
-        }
+        rules_file::check(text)?;
         write_private(&rules_file::path(), text.as_bytes())?;
         self.apply_rules_file().map(|_| ())
     }
@@ -847,8 +909,9 @@ impl Hub {
             loop {
                 tokio::time::sleep(Duration::from_secs(2)).await;
                 let Some(hub) = hub.upgrade() else { break };
-                let now = std::fs::metadata(rules_file::path()).and_then(|m| m.modified()).ok();
-                if now != *lock(&hub.rules_mtime) {
+                // By content: an edit within the same second as the last one still counts.
+                let now = rules_file::read(&rules_file::path()).ok().flatten();
+                if now != *lock(&hub.rules_text) {
                     let _ = hub.apply_rules_file();
                 }
             }
@@ -889,6 +952,19 @@ impl Hub {
         self.save()
     }
 
+    /// Visual edits keep rules.yaml in step when you use it (and it loaded fine), unless it
+    /// changed on disk since it was loaded: then your edit there wins and is loaded next.
+    fn export_rules(&self, agents: &[Agent]) -> Result<()> {
+        if !self.rules_file_active() || self.rules_error().is_some() {
+            return Ok(());
+        }
+        let mut seen = lock(&self.rules_text);
+        let text =
+            rules_file::export_over(&rules_file::path(), agents, seen.as_deref()).context("rules.yaml not updated")?;
+        *seen = Some(text);
+        Ok(())
+    }
+
     fn save(&self) -> Result<()> {
         let json = serde_json::to_vec_pretty(&*read(&self.config))?;
         write_private(&config_dir().join("agents.json"), &json).context("saving agents.json")
@@ -904,7 +980,7 @@ impl Hub {
         if !enabled {
             // Refuse anything still waiting for approval.
             for (_, tx) in lock(&self.approvals).drain() {
-                let _ = tx.send(false);
+                let _ = tx.send(Answer::SwitchedOff);
             }
         }
         self.save()
@@ -929,10 +1005,7 @@ impl Hub {
             }
             let mut agents = cfg.agents.clone();
             agents.push(agent.clone());
-            if self.rules_file_active() && self.rules_error().is_none() {
-                rules_file::export(&agents).context("rules.yaml not updated")?;
-                *lock(&self.rules_mtime) = std::fs::metadata(rules_file::path()).and_then(|m| m.modified()).ok();
-            }
+            self.export_rules(&agents)?;
             cfg.agents = agents;
         }
         self.save()?;
@@ -958,11 +1031,7 @@ impl Hub {
             let mut agents = cfg.agents.clone();
             let agent = agents.iter_mut().find(|a| a.id == id).context("unknown agent")?;
             f(agent);
-            // Visual edits keep rules.yaml in step when you use it.
-            if self.rules_file_active() && self.rules_error().is_none() {
-                rules_file::export(&agents).context("rules.yaml not updated")?;
-                *lock(&self.rules_mtime) = std::fs::metadata(rules_file::path()).and_then(|m| m.modified()).ok();
-            }
+            self.export_rules(&agents)?;
             cfg.agents = agents;
         }
         self.save()
@@ -975,13 +1044,7 @@ impl Hub {
         let exported = {
             let mut cfg = write(&self.config);
             cfg.agents.retain(|a| a.id != id);
-            if self.rules_file_active() && self.rules_error().is_none() {
-                let exported = rules_file::export(&cfg.agents).map(|_| ()).context("rules.yaml not updated");
-                *lock(&self.rules_mtime) = std::fs::metadata(rules_file::path()).and_then(|m| m.modified()).ok();
-                exported
-            } else {
-                Ok(())
-            }
+            self.export_rules(&cfg.agents)
         };
         self.save()?;
         exported
@@ -1076,8 +1139,8 @@ impl Hub {
 
     // Approvals
 
-    /// Ask the user in the UI. Resolves to false on deny, timeout, kill switch, or
-    /// at once when there is no window to ask in.
+    /// Ask the user in the UI. Anything but [`Answer::Approved`] refuses the call; with
+    /// no window to ask in, the request is refused at once.
     pub async fn request_approval(
         &self,
         agent: &Agent,
@@ -1085,9 +1148,9 @@ impl Hub {
         summary: String,
         access: Access,
         dry_run: bool,
-    ) -> bool {
+    ) -> Answer {
         if self.headless() {
-            return false;
+            return Answer::Rejected;
         }
         let id = self.next_approval.fetch_add(1, Ordering::SeqCst);
         let (tx, rx) = oneshot::channel();
@@ -1104,12 +1167,16 @@ impl Hub {
         let result = tokio::time::timeout(Duration::from_secs(120), rx).await;
         lock(&self.approvals).remove(&id);
         self.emit(HubEvent::ApprovalResolved(id));
-        matches!(result, Ok(Ok(true)))
+        match result {
+            Ok(Ok(answer)) => answer,
+            Ok(Err(_)) => Answer::Rejected,
+            Err(_) => Answer::TimedOut,
+        }
     }
 
     pub fn resolve_approval(&self, id: u64, approved: bool) {
         if let Some(tx) = lock(&self.approvals).remove(&id) {
-            let _ = tx.send(approved);
+            let _ = tx.send(if approved { Answer::Approved } else { Answer::Rejected });
         }
     }
 
@@ -1236,6 +1303,14 @@ fn load_audit_tail(path: &std::path::Path) -> VecDeque<AuditEntry> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_refusal_says_the_user_refused() {
+        assert!(Answer::Rejected.reason().contains("did not approve"));
+        for a in [Answer::TimedOut, Answer::SwitchedOff] {
+            assert!(!a.reason().contains("did not approve"), "{a:?}");
+        }
+    }
 
     #[test]
     fn glob_matches() {
@@ -1778,19 +1853,19 @@ mod tests {
 /// Properties of the rule engine over many generated policies and requests, rather than
 /// single examples: what a reviewer would otherwise have to check case by case.
 #[cfg(test)]
-mod properties {
+pub(crate) mod properties {
     use super::{Access, Approval, Mode, Policy, Rule};
     use proptest::prelude::*;
 
-    fn pattern() -> impl Strategy<Value = String> {
+    pub(crate) fn pattern() -> impl Strategy<Value = String> {
         prop_oneof![Just("*"), Just("a"), Just("b"), Just("a*"), Just("team-*"), Just("team-a")].prop_map(String::from)
     }
 
-    fn patterns() -> impl Strategy<Value = Vec<String>> {
+    pub(crate) fn patterns() -> impl Strategy<Value = Vec<String>> {
         prop::collection::vec(pattern(), 0..3)
     }
 
-    fn value() -> impl Strategy<Value = String> {
+    pub(crate) fn value() -> impl Strategy<Value = String> {
         prop_oneof![Just("a"), Just("b"), Just("ab"), Just("team-a"), Just("team-b"), Just("A"), Just("Team-a")]
             .prop_map(String::from)
     }
@@ -1803,11 +1878,11 @@ mod properties {
         })
     }
 
-    fn verb() -> impl Strategy<Value = String> {
+    pub(crate) fn verb() -> impl Strategy<Value = String> {
         prop_oneof![Just("get"), Just("list"), Just("delete"), Just("patch"), Just("exec")].prop_map(String::from)
     }
 
-    fn rule() -> impl Strategy<Value = Rule> {
+    pub(crate) fn rule() -> impl Strategy<Value = Rule> {
         (
             prop_oneof![Just(Mode::Allow), Just(Mode::Ask), Just(Mode::Deny)],
             prop::collection::vec(prop_oneof![verb(), Just("*".to_string())], 0..3),
@@ -1829,7 +1904,7 @@ mod properties {
             })
     }
 
-    fn access() -> impl Strategy<Value = Access> {
+    pub(crate) fn access() -> impl Strategy<Value = Access> {
         (verb(), resource(), prop::option::of(value()), value(), prop::option::of(value())).prop_map(
             |(verb, (resource, resource_aliases), namespace, context, name)| Access {
                 context,
@@ -1843,7 +1918,7 @@ mod properties {
         )
     }
 
-    fn policy() -> impl Strategy<Value = Policy> {
+    pub(crate) fn policy() -> impl Strategy<Value = Policy> {
         prop::collection::vec(rule(), 0..6).prop_map(|rules| Policy { rules, ..Policy::default() })
     }
 
@@ -1915,5 +1990,35 @@ mod fail_closed {
     fn a_rule_without_an_effect_denies() {
         let r: Rule = serde_json::from_str(r#"{"verbs": ["*"], "resources": ["secrets"], "contexts": ["*"]}"#).unwrap();
         assert_eq!(r.effect, Mode::Deny);
+    }
+
+    #[test]
+    fn a_missing_list_never_grants() {
+        // A Deny without contexts or verbs denies them all.
+        let r: Rule = serde_json::from_str(r#"{"effect": "deny", "resources": ["secrets"]}"#).unwrap();
+        for list in [&r.verbs, &r.namespaces, &r.contexts, &r.names] {
+            assert_eq!(list, &["*"]);
+        }
+        let all = Rule { verbs: vec!["*".into()], contexts: vec!["*".into()], ..Rule::default() };
+        let p = super::Policy { rules: vec![all, r], ..super::Policy::default() };
+        let a = super::Access {
+            context: "prod".into(),
+            verb: "delete".into(),
+            resource: "secrets".into(),
+            namespace: Some("app".into()),
+            name: Some("db".into()),
+            ..super::Access::default()
+        };
+        assert_eq!(p.decide(&a).mode, Mode::Deny);
+        // An Ask too.
+        let r: Rule = serde_json::from_str(r#"{"effect": "ask", "verbs": ["delete"]}"#).unwrap();
+        assert_eq!(r.resources, ["*"]);
+        // An Allow without contexts or names allows none.
+        let r: Rule = serde_json::from_str(r#"{"effect": "allow", "verbs": ["get"], "resources": ["pods"]}"#).unwrap();
+        assert!(r.contexts.is_empty() && r.names.is_empty() && r.namespaces.is_empty());
+        // A full rule reads back as written.
+        let full = Rule { contexts: vec!["eu".into()], ..Rule::default() };
+        let back: Rule = serde_json::from_str(&serde_json::to_string(&full).unwrap()).unwrap();
+        assert_eq!(back, full);
     }
 }

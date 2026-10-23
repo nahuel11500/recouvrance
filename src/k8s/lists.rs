@@ -27,7 +27,7 @@ where
         let mut lp = ListParams::default().limit(LEAN_PAGE);
         let mut out = Vec::new();
         loop {
-            let page: LeanList<T> = client.request(Request::new(&url).list(&lp)?).await?;
+            let page: LeanList<T> = request_idle(&client, Request::new(&url).list(&lp)?).await?;
             out.extend(page.items);
             match page.metadata.continue_.filter(|c| !c.is_empty()) {
                 Some(token) => lp.continue_token = Some(token),
@@ -53,7 +53,7 @@ where
         let url = DynamicObject::url_path(&ar2, ns.as_deref());
         let path = format!("{url}?resourceVersion=0&resourceVersionMatch=NotOlderThan");
         let body = c.request_stream(http::Request::get(&path).body(Vec::new())?).await?;
-        let list: LeanList<T> = parse_streamed(body.compat()).await?;
+        let list: LeanList<T> = parse_streamed(Idle::new(body.compat(), LIST_IDLE)).await?;
         anyhow::ensure!(list.metadata.continue_.as_ref().is_none_or(|c| c.is_empty()), "the API server paged it");
         Ok(list.items)
     })
@@ -101,6 +101,61 @@ impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for Cancellable<R> {
         }
         std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
     }
+}
+
+/// The longest a list's response may go without a byte. The request timeout covers only
+/// the headers: on a connection that died without a word (sleep, VPN) the body would never
+/// end, and the list would stay "Loading" for good.
+pub(super) const LIST_IDLE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// A response body that fails once no byte has come for `idle`.
+pub(super) struct Idle<R> {
+    inner: R,
+    idle: std::time::Duration,
+    deadline: std::pin::Pin<Box<tokio::time::Sleep>>,
+}
+
+impl<R> Idle<R> {
+    pub(super) fn new(inner: R, idle: std::time::Duration) -> Self {
+        Self { inner, idle, deadline: Box::pin(tokio::time::sleep(idle)) }
+    }
+}
+
+impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for Idle<R> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let (idle, before) = (self.idle, buf.filled().len());
+        let polled = std::pin::Pin::new(&mut self.inner).poll_read(cx, buf);
+        if polled.is_ready() {
+            if buf.filled().len() > before {
+                self.deadline.as_mut().reset(tokio::time::Instant::now() + idle);
+            }
+            return polled;
+        }
+        match self.deadline.as_mut().poll(cx) {
+            std::task::Poll::Ready(()) => std::task::Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("no data for {} s", idle.as_secs()),
+            ))),
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
+    }
+}
+
+/// A request's JSON answer, given up when its body stalls for `LIST_IDLE`.
+pub(super) async fn request_idle<T: serde::de::DeserializeOwned>(
+    client: &Client,
+    req: http::Request<Vec<u8>>,
+) -> Result<T> {
+    use tokio::io::AsyncReadExt as _;
+    use tokio_util::compat::FuturesAsyncReadCompatExt as _;
+    let body = client.request_stream(req).await?;
+    let mut bytes = Vec::new();
+    Idle::new(body.compat(), LIST_IDLE).read_to_end(&mut bytes).await?;
+    Ok(serde_json::from_slice(&bytes)?)
 }
 
 /// Why something could not be loaded, as a section header says it: "forbidden"
@@ -152,6 +207,34 @@ mod tests {
         let (mut server, client) = tokio::io::duplex(64);
         let read = tokio::spawn(super::parse_streamed::<serde_json::Value, _>(client));
         tokio::io::AsyncWriteExt::write_all(&mut server, br#"{"items":[1,2]}"#).await.unwrap();
+        drop(server);
+        assert_eq!(read.await.unwrap().unwrap()["items"][1], 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stalled_list_is_given_up() {
+        use tokio::io::AsyncWriteExt as _;
+        let idle = std::time::Duration::from_millis(100);
+        let (mut server, client) = tokio::io::duplex(64);
+        // Part of a list, then nothing, the connection still open (a laptop gone to sleep).
+        server.write_all(br#"{"items":["#).await.unwrap();
+        let read = super::parse_streamed::<serde_json::Value, _>(super::Idle::new(client, idle));
+        let done = tokio::time::timeout(std::time::Duration::from_secs(10), read).await;
+        assert!(done.expect("the read waited for good").is_err());
+        drop(server);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_slow_list_that_keeps_coming_is_read() {
+        use tokio::io::AsyncWriteExt as _;
+        let idle = std::time::Duration::from_millis(200);
+        let (mut server, client) = tokio::io::duplex(64);
+        let read = tokio::spawn(super::parse_streamed::<serde_json::Value, _>(super::Idle::new(client, idle)));
+        // Longer than `idle` in all, but never that long between two writes.
+        for part in [&br#"{"items":"#[..], b"[1,", b"2]", b"}"] {
+            server.write_all(part).await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        }
         drop(server);
         assert_eq!(read.await.unwrap().unwrap()["items"][1], 2);
     }
