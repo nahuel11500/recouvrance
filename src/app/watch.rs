@@ -60,6 +60,7 @@ impl AppView {
         let ns_filter = (self.namespaces.len() > 1).then(|| self.namespaces.iter().cloned().collect());
         let names: Vec<String> = self.clusters.iter().map(|(c, _)| c.clone()).collect();
         self.rows_by_ctx = vec![Vec::new(); self.clusters.len()];
+        self.defs_by_ctx = vec![Arc::default(); self.clusters.len()];
         // What each cluster watches: nothing when it doesn't serve the kind, one of its
         // accessible namespaces when it may not list cluster-wide.
         let serving = self.kind_clusters.get(&kind.key()).cloned();
@@ -126,9 +127,11 @@ impl AppView {
         let progressive = cached.is_none();
         if let Some(view) = cached {
             self.rows_by_ctx = view.rows;
+            // Kept laid out in the columns of the list shown.
+            self.defs_by_ctx = vec![view.columns.clone(); self.clusters.len()];
             // A cluster that no longer serves the kind is not watched: nothing would replace its rows.
             keep_watched(&mut self.rows_by_ctx, &self.listing);
-            let merged = self.merged_rows();
+            let merged = self.merged_rows(&view.columns);
             self.table.update(cx, |t, cx| {
                 t.delegate_mut().loading = false;
                 t.delegate_mut().update_columns(view.columns);
@@ -257,13 +260,31 @@ impl AppView {
             return;
         }
         let columns = self.table.read(cx).delegate().defs();
-        let view = view_cache::CachedView { columns, rows: self.rows_by_ctx.clone(), at: std::time::Instant::now() };
+        let rows = (self.rows_by_ctx.iter().zip(&self.defs_by_ctx))
+            .map(|(rows, defs)| relayout(rows, defs, &columns))
+            .collect();
+        let view = view_cache::CachedView { columns, rows, at: std::time::Instant::now() };
         self.views.put(key, view);
     }
 
-    /// Every cluster's rows, each with its cluster's index.
-    fn merged_rows(&self) -> Vec<(usize, Arc<k8s::Row>)> {
-        self.rows_by_ctx.iter().enumerate().flat_map(|(i, rows)| rows.iter().map(move |r| (i, r.clone()))).collect()
+    /// Every cluster's rows, each with its cluster's index, laid out in `columns` (the
+    /// table's).
+    fn merged_rows(&self, columns: &[k8s::ColumnDef]) -> Vec<(usize, Arc<k8s::Row>)> {
+        (self.rows_by_ctx.iter().zip(&self.defs_by_ctx))
+            .enumerate()
+            .flat_map(|(i, (rows, defs))| relayout(rows, defs, columns).into_iter().map(move |r| (i, r)))
+            .collect()
+    }
+
+    /// Every cluster's rows into the table, laid out in its columns.
+    fn show_rows(&mut self, cx: &mut Context<Self>) {
+        let columns = self.table.read(cx).delegate().defs();
+        let merged = self.merged_rows(&columns);
+        self.table.update(cx, |t, cx| {
+            t.delegate_mut().set_rows(merged);
+            cx.notify();
+        });
+        self.follow_selection(cx);
     }
 
     /// Messages that piled up from one cluster's watch: every one in order, except
@@ -278,17 +299,35 @@ impl AppView {
 
     pub(super) fn on_table_msg(&mut self, ctx: usize, msg: TableMsg, cx: &mut Context<Self>) {
         match msg {
-            // Every cluster serves the same columns for a kind; take the first we get.
             TableMsg::Columns(cols) => {
-                self.table.update(cx, |t, cx| {
-                    if t.delegate().columns_count(cx) == 0 || ctx == 0 {
-                        // A relist sends them again: keeps the user's sort and column order.
-                        t.delegate_mut().update_columns(cols);
-                        t.refresh(cx);
+                // This cluster's rows from before (a relist after a CRD upgrade) move under
+                // its new columns, so they stay laid out in what `defs_by_ctx` says.
+                let mut moved = false;
+                if let (Some(rows), Some(defs)) = (self.rows_by_ctx.get_mut(ctx), self.defs_by_ctx.get_mut(ctx)) {
+                    moved = !rows.is_empty() && !same_names(defs, &cols);
+                    if moved {
+                        *rows = relayout(rows, defs, &cols);
                     }
+                    *defs = cols.clone();
+                }
+                // The table shows the first cluster's columns (or the first to come); the
+                // other clusters' rows are laid out under them by column name.
+                let shown = self.table.update(cx, |t, cx| {
+                    if t.delegate().columns_count(cx) > 0 && ctx != 0 {
+                        return false;
+                    }
+                    let changed = !same_names(&t.delegate().defs(), &cols);
+                    // A relist sends them again: keeps the user's sort and column order.
+                    t.delegate_mut().update_columns(cols);
+                    t.refresh(cx);
+                    changed
                 });
-                // New columns sort the rows again: the highlight stays on its object.
-                self.follow_selection(cx);
+                if moved || (shown && self.rows_by_ctx.iter().any(|r| !r.is_empty())) {
+                    self.show_rows(cx);
+                } else if shown {
+                    // New columns sort the rows again: the highlight stays on its object.
+                    self.follow_selection(cx);
+                }
             }
             TableMsg::Rows(rows) => {
                 self.status = None;
@@ -296,12 +335,7 @@ impl AppView {
                 if let Some(slot) = self.rows_by_ctx.get_mut(ctx) {
                     *slot = rows;
                 }
-                let merged = self.merged_rows();
-                self.table.update(cx, |t, cx| {
-                    t.delegate_mut().set_rows(merged);
-                    cx.notify();
-                });
-                self.follow_selection(cx);
+                self.show_rows(cx);
             }
             TableMsg::Listed => {
                 self.listing.remove(&ctx);
@@ -324,12 +358,7 @@ impl AppView {
                     && !slot.is_empty()
                 {
                     slot.clear();
-                    let merged = self.merged_rows();
-                    self.table.update(cx, |t, cx| {
-                        t.delegate_mut().set_rows(merged);
-                        cx.notify();
-                    });
-                    self.follow_selection(cx);
+                    self.show_rows(cx);
                 }
                 if self.listing.is_empty() {
                     // Forbidden only when every cluster watched refused, whichever answers last.
@@ -354,6 +383,33 @@ fn coalesce(batch: Vec<TableMsg>) -> Vec<TableMsg> {
         .enumerate()
         .filter(|(i, m)| !matches!(m, TableMsg::Rows(_)) || Some(*i) == last_rows)
         .map(|(_, m)| m)
+        .collect()
+}
+
+fn same_names(a: &[k8s::ColumnDef], b: &[k8s::ColumnDef]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.name == y.name)
+}
+
+/// Rows whose cells are laid out in `from`, moved under `to` by column name: a column
+/// `from` lacks is empty. Rows with no known columns on either side stay as they are.
+fn relayout(rows: &[Arc<k8s::Row>], from: &[k8s::ColumnDef], to: &[k8s::ColumnDef]) -> Vec<Arc<k8s::Row>> {
+    if from.is_empty() || to.is_empty() || same_names(from, to) {
+        return rows.to_vec();
+    }
+    let at: Vec<Option<usize>> = to.iter().map(|d| from.iter().position(|f| f.name == d.name)).collect();
+    rows.iter()
+        .map(|r| {
+            Arc::new(k8s::Row {
+                uid: r.uid.clone(),
+                name: r.name.clone(),
+                namespace: r.namespace.clone(),
+                created: r.created,
+                cells: at.iter().map(|i| i.and_then(|i| r.cells.get(i)).cloned().unwrap_or_default()).collect(),
+                labels: r.labels.clone(),
+                deleting: r.deleting,
+                deleted_at: r.deleted_at,
+            })
+        })
         .collect()
 }
 
@@ -394,7 +450,27 @@ async fn wait_list_shown(this: &WeakEntity<AppView>, pause: &k8s::Pause, cx: &mu
 
 #[cfg(test)]
 mod tests {
-    use super::{TableMsg, coalesce, keep_watched};
+    use super::{TableMsg, coalesce, keep_watched, relayout};
+
+    #[test]
+    fn cells_move_under_the_shown_columns() {
+        let defs = |names: &[&str]| -> Vec<crate::k8s::ColumnDef> {
+            names.iter().map(|n| crate::k8s::ColumnDef { name: n.to_string(), priority: 0 }).collect()
+        };
+        let mut r = row();
+        r.cells = vec!["web".into(), "True".into(), "le".into(), "1d".into()];
+        let rows = vec![std::sync::Arc::new(r)];
+        // Another operator release: Issuer before Ready, and no Status column.
+        let from = defs(&["Name", "Ready", "Issuer", "Age"]);
+        let to = defs(&["Name", "Issuer", "Ready", "Status", "Age"]);
+        let moved = relayout(&rows, &from, &to);
+        assert_eq!(moved[0].cells, ["web", "le", "True", "", "1d"]);
+        assert_eq!(moved[0].uid, "u");
+        // Same columns, or none known: the rows themselves.
+        assert!(std::sync::Arc::ptr_eq(&relayout(&rows, &from, &from)[0], &rows[0]));
+        assert!(std::sync::Arc::ptr_eq(&relayout(&rows, &[], &to)[0], &rows[0]));
+        assert!(std::sync::Arc::ptr_eq(&relayout(&rows, &from, &[])[0], &rows[0]));
+    }
 
     #[test]
     fn rows_of_clusters_not_watched_are_dropped() {

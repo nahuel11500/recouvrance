@@ -89,10 +89,17 @@ pub fn who_can(snap: &Snapshot, verb: &str, group: &str, resource: &str, namespa
             .iter()
             .filter(|b| namespace.is_some() && b.pointer("/metadata/namespace").and_then(Value::as_str) == namespace),
     );
+    // A create (of an object, not a subresource such as `pods/exec`) or a deletecollection
+    // names no object, and the API server never matches a rule with resourceNames to it.
+    let unnamed = verb == "deletecollection" || (verb == "create" && !resource.contains('/'));
     for b in bindings {
         let Some((role, role_label)) = role_rules(snap, b) else { continue };
-        let matching: Vec<&Value> =
-            role["rules"].as_array().into_iter().flatten().filter(|r| rule_allows(r, verb, group, resource)).collect();
+        let matching: Vec<&Value> = role["rules"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|r| rule_allows(r, verb, group, resource) && !(unnamed && !strs(r, "resourceNames").is_empty()))
+            .collect();
         if matching.is_empty() {
             continue;
         }
@@ -263,6 +270,31 @@ mod tests {
         assert_eq!(bindings_of(&s, "Role", "pod-reader", Some("demo")).len(), 1);
         assert_eq!(split_resource("deployments.apps"), ("apps".into(), "deployments".into()));
         assert_eq!(split_resource("pods/log"), ("".into(), "pods/log".into()));
+    }
+
+    /// A rule with resourceNames never matches a create or a deletecollection, which name
+    /// no object; it does match a create on a subresource (`pods/exec` of one pod).
+    #[test]
+    fn resource_names_need_a_named_request() {
+        let mut s = snap();
+        s.roles.push(json!({"metadata": {"name": "one", "namespace": "demo"}, "rules": [
+            {"apiGroups": [""], "resources": ["secrets", "pods/exec"], "verbs": ["create", "deletecollection", "get"], "resourceNames": ["x"]},
+        ]}));
+        s.role_bindings.push(json!({"metadata": {"name": "one", "namespace": "demo"}, "roleRef": {"kind": "Role", "name": "one"}, "subjects": [{"kind": "User", "name": "ann"}]}));
+        let subjects = |verb: &str, resource: &str| {
+            who_can(&s, verb, "", resource, Some("demo")).into_iter().map(|g| (g.subject, g.names)).collect::<Vec<_>>()
+        };
+        // Sorted by subject kind: the Group ops, then the User ann.
+        assert_eq!(subjects("create", "secrets"), [("ops".to_string(), vec![])]);
+        assert_eq!(subjects("deletecollection", "secrets"), [("ops".to_string(), vec![])]);
+        assert_eq!(
+            subjects("get", "secrets"),
+            [("ops".to_string(), vec![]), ("ann".to_string(), vec!["x".to_string()])]
+        );
+        assert_eq!(
+            subjects("create", "pods/exec"),
+            [("ops".to_string(), vec![]), ("ann".to_string(), vec!["x".to_string()])]
+        );
     }
 
     #[test]

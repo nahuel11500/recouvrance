@@ -776,3 +776,154 @@ mod name_properties {
         }
     }
 }
+
+/// The whole merge over a sequence of kubeconfig edits: files reordered, shrinking, emptied,
+/// corrupt or deleted between reads, with clashing cluster and user names. A bare context
+/// name carries its protection, color and settings, so it must point at the file that owns
+/// it, and never move while that file still has it (kubeconfig naming broke in every audit
+/// round).
+#[cfg(test)]
+mod merge_properties {
+    use super::{merge_owned, name_owners};
+    use kube::config::{AuthInfo, Cluster, Context, Kubeconfig, NamedAuthInfo, NamedCluster, NamedContext};
+    use proptest::prelude::*;
+    use std::collections::{BTreeMap, HashMap};
+
+    const NAMES: [&str; 3] = ["prod", "dev", "kind"];
+    const FILES: usize = 3;
+
+    #[derive(Clone, Debug)]
+    enum File {
+        Read(Vec<&'static str>),
+        Corrupt,
+        Deleted,
+    }
+
+    fn file() -> impl Strategy<Value = File> {
+        prop_oneof![
+            6 => prop::sample::subsequence(NAMES.to_vec(), 0..=3).prop_map(File::Read),
+            1 => Just(File::Corrupt),
+            1 => Just(File::Deleted),
+        ]
+    }
+
+    /// Every file's state at one read, and the order the files come in.
+    fn steps() -> impl Strategy<Value = Vec<(Vec<File>, usize)>> {
+        prop::collection::vec((prop::collection::vec(file(), FILES), 0..FILES), 1..6)
+    }
+
+    /// File `i`: each context on a cluster and user of the same names in every file (they
+    /// clash), told apart by the server and the user name.
+    fn kubeconfig(i: usize, names: &[&str]) -> Kubeconfig {
+        Kubeconfig {
+            clusters: names
+                .iter()
+                .map(|n| NamedCluster {
+                    name: n.to_string(),
+                    cluster: Some(Cluster { server: Some(format!("https://f{i}.{n}")), ..Cluster::default() }),
+                    ..NamedCluster::default()
+                })
+                .collect(),
+            auth_infos: vec![NamedAuthInfo {
+                name: "admin".into(),
+                auth_info: Some(AuthInfo { username: Some(format!("f{i}")), ..AuthInfo::default() }),
+                ..NamedAuthInfo::default()
+            }],
+            contexts: names
+                .iter()
+                .map(|n| NamedContext {
+                    name: n.to_string(),
+                    context: Some(Context { cluster: n.to_string(), user: Some("admin".into()), ..Context::default() }),
+                    ..NamedContext::default()
+                })
+                .collect(),
+            current_context: names.first().map(|n| n.to_string()),
+            ..Kubeconfig::default()
+        }
+    }
+
+    /// Where a merged context points: (server, user name).
+    fn target(kc: &Kubeconfig, context: &str) -> Option<(String, String)> {
+        let ctx = kc.contexts.iter().find(|c| c.name == context)?.context.as_ref()?;
+        let server = kc.clusters.iter().find(|c| c.name == ctx.cluster)?.cluster.as_ref()?.server.clone()?;
+        let user =
+            kc.auth_infos.iter().find(|u| Some(&u.name) == ctx.user.as_ref())?.auth_info.as_ref()?.username.clone()?;
+        Some((server, user))
+    }
+
+    proptest! {
+        #[test]
+        fn every_context_keeps_its_cluster_and_a_name_stays_with_its_file(steps in steps()) {
+            let mut kept = BTreeMap::new();
+            // Which file had each bare name at the last read.
+            let mut bare: HashMap<&str, usize> = HashMap::new();
+            for (states, first) in steps {
+                let order: Vec<usize> = (0..FILES).map(|k| (first + k) % FILES).collect();
+                let listed: Vec<(String, Option<Vec<String>>)> = order
+                    .iter()
+                    .filter_map(|&i| match &states[i] {
+                        File::Read(n) => Some((format!("/kube/f{i}"), Some(n.iter().map(|s| s.to_string()).collect()))),
+                        File::Corrupt => Some((format!("/kube/f{i}"), None)),
+                        File::Deleted => None,
+                    })
+                    .collect();
+                let exists = |f: &str| listed.iter().any(|(p, _)| p == f);
+                let owners = name_owners(&mut kept, &listed, exists);
+                let read: Vec<(String, String, Kubeconfig)> = order
+                    .iter()
+                    .filter_map(|&i| match &states[i] {
+                        File::Read(n) => Some((format!("f{i}"), format!("/kube/f{i}"), kubeconfig(i, n))),
+                        _ => None,
+                    })
+                    .collect();
+                let Some(merged) = merge_owned(read, &owners) else {
+                    prop_assert!(states.iter().all(|s| !matches!(s, File::Read(_))));
+                    bare.clear();
+                    continue;
+                };
+                // Names are unique, and the current context is one of them.
+                let mut names: Vec<&str> = merged.contexts.iter().map(|c| c.name.as_str()).collect();
+                names.sort();
+                let before = names.len();
+                names.dedup();
+                prop_assert_eq!(names.len(), before, "duplicate context names: {:?}", merged.contexts);
+                if let Some(current) = &merged.current_context {
+                    prop_assert!(names.contains(&current.as_str()), "current context {} is gone", current);
+                }
+                // Every context of every file read is there once, on its own cluster and user.
+                for (i, state) in states.iter().enumerate() {
+                    let File::Read(own) = state else { continue };
+                    for n in own {
+                        let want = (format!("https://f{i}.{n}"), format!("f{i}"));
+                        let found = merged.contexts.iter().filter(|c| target(&merged, &c.name).as_ref() == Some(&want)).count();
+                        prop_assert_eq!(found, 1, "{} of f{} found {} times", n, i, found);
+                    }
+                }
+                let mut now: HashMap<&str, usize> = HashMap::new();
+                for n in NAMES {
+                    let Some((server, _)) = target(&merged, n) else { continue };
+                    let from = (0..FILES).find(|i| server == format!("https://f{i}.{n}")).unwrap();
+                    // A bare name is its owner's.
+                    prop_assert_eq!(owners.get(n), Some(&format!("/kube/f{from}")));
+                    now.insert(n, from);
+                }
+                // The file that had a bare name keeps it while it still has it, and while it
+                // can't be read nobody else takes it.
+                for (n, &was) in &bare {
+                    match &states[was] {
+                        File::Read(own) if own.contains(n) => prop_assert_eq!(now.get(n), Some(&was), "{} moved", n),
+                        File::Corrupt => prop_assert!(!now.contains_key(n), "{} went to f{:?} while f{} was unreadable", n, now.get(n), was),
+                        _ => {}
+                    }
+                }
+                // A name held by an unreadable file stays held: carry it over.
+                for (n, &was) in &bare {
+                    if matches!(states[was], File::Corrupt) {
+                        now.insert(n, was);
+                    }
+                }
+                bare = now;
+            }
+        }
+    }
+}
