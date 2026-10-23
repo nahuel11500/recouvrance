@@ -15,7 +15,9 @@ without the window; there nobody can approve, so a call an *Ask me* rule covers 
 with "needs approval in the Recouvrance window": run the app, or add an Allow rule). A list where
 some rows ask and others are allowed (some namespaces, or some names) is not refused: when it is not
 approved (or cannot be), it shows only the allowed rows, and a rejection is still logged. Approving
-it shows the rows of every Ask rule the list meets. In **Agents**, click **Connect Claude Code**: it registers the server in your
+it shows the rows of every Ask rule the list meets. Rules changed while a call waits for approval
+apply to it: it is checked again once approved, and `apply_manifest` checks each object again
+before applying it. In **Agents**, click **Connect Claude Code**: it registers the server in your
 Claude Code (`claude mcp add --scope user recouvrance …`). There is one agent, "Claude", with its rules;
 *Several agents…* gives other tools their own token and rules if you ever need that. Tokens are
 stored hashed (the assistant's copy is in a 0600 file).
