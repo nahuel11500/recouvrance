@@ -94,6 +94,7 @@ pub(super) async fn gpu_history_for(
 
 pub(super) async fn fetch_related(
     client: Client,
+    context: &str,
     kind: &k8s::Kind,
     ns: Option<String>,
     obj: &serde_json::Value,
@@ -207,7 +208,7 @@ pub(super) async fn fetch_related(
     if kind.is("", "Pod") {
         let selector = None;
         // Metrics are optional (no metrics-server): no usage is not an error to show.
-        if crate::settings::get().metrics_enabled {
+        if crate::settings::metrics_on(context) {
             related.usage = k8s::container_usage(client.clone(), ns.clone(), selector).await.unwrap_or_default();
         }
         // ConfigMaps and Secrets the environment reads, to show resolved values.
@@ -298,7 +299,7 @@ pub(super) async fn fetch_related(
             let services =
                 k8s::list_values(client.clone(), k8s::ar_of::<core::Service>(), Some(ns.clone()), None).await;
             related.services = related.noted("services", services);
-            if crate::settings::get().metrics_enabled {
+            if crate::settings::metrics_on(context) {
                 related.usage =
                     k8s::container_usage(client.clone(), ns.clone(), Some(sel.clone())).await.unwrap_or_default();
             }
