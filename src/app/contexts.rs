@@ -71,7 +71,11 @@ impl AppView {
                 let mut kinds: Vec<Kind> = Vec::new();
                 let mut kind_clusters: HashMap<String, Vec<usize>> = HashMap::new();
                 for (ix, found) in discovered.into_iter().enumerate() {
-                    for k in found.unwrap_or_default() {
+                    let found = found.unwrap_or_else(|e| {
+                        errors.push(format!("{}: {e:#}", clusters[ix].0));
+                        Vec::new()
+                    });
+                    for k in found {
                         let entry = kind_clusters.entry(k.key()).or_default();
                         if entry.is_empty() {
                             kinds.push(k);
@@ -80,7 +84,7 @@ impl AppView {
                     }
                 }
                 if kinds.is_empty() {
-                    anyhow::bail!("discovery failed on every cluster");
+                    anyhow::bail!("discovery failed on every cluster: {}", errors.join("; "));
                 }
                 // Built-in sections first, then custom resources by group.
                 k8s::sort_for_sidebar(&mut kinds);

@@ -272,7 +272,8 @@ pub async fn discover(client: Client) -> Result<Vec<Kind>> {
 /// Discovery for clusters without aggregated discovery (before 1.26, or turned off): each
 /// group at its preferred version, side by side. A group that does not answer (an
 /// APIService that is down, like metrics.k8s.io) is left out, as kubectl does, instead
-/// of failing them all.
+/// of failing them all; one with built-in kinds the sidebar lists (Pods, Deployments…) is
+/// asked again, then fails discovery rather than leaving them out without a word.
 async fn discover_by_group(client: &Client) -> Result<Vec<(ApiResource, ApiCapabilities)>> {
     let mut gvs = vec![kube::core::GroupVersion::gv("", "v1")];
     for g in client.list_api_groups().await?.groups {
@@ -280,23 +281,47 @@ async fn discover_by_group(client: &Client) -> Result<Vec<(ApiResource, ApiCapab
             gvs.push(kube::core::GroupVersion::gv(&g.name, &v.version));
         }
     }
-    let jobs = gvs.into_iter().map(|gv| {
-        let client = client.clone();
-        async move { kube::discovery::pinned_group(&client, &gv).await }
-    });
-    let groups: Vec<_> = futures::stream::iter(jobs).buffered(16).collect().await;
     let mut resources = Vec::new();
-    let mut failed = None;
-    for g in groups {
+    let mut failed = Vec::new();
+    for (gv, g) in pinned_groups(client, gvs).await {
         match g {
             Ok(g) => resources.extend(g.recommended_resources()),
-            Err(e) => failed = Some(e),
+            Err(e) => failed.push((gv, e)),
         }
     }
-    match failed {
+    // Once more for the ones that matter (a timeout, too many requests).
+    let (retry, skipped): (Vec<_>, Vec<_>) = failed.into_iter().partition(|(gv, _)| required(&gv.group));
+    let skipped = skipped.into_iter().next().map(|(_, e)| e);
+    for (gv, g) in pinned_groups(client, retry.into_iter().map(|(gv, _)| gv).collect()).await {
+        match g {
+            Ok(g) => resources.extend(g.recommended_resources()),
+            Err(e) => return Err(anyhow::Error::from(e).context(format!("discovery of {} failed", gv.api_version()))),
+        }
+    }
+    match skipped {
         Some(e) if resources.is_empty() => Err(e.into()),
         _ => Ok(resources),
     }
+}
+
+/// Each group version's discovery, 16 at a time.
+async fn pinned_groups(
+    client: &Client,
+    gvs: Vec<kube::core::GroupVersion>,
+) -> Vec<(kube::core::GroupVersion, kube::Result<kube::discovery::ApiGroup>)> {
+    let jobs = gvs.into_iter().map(|gv| {
+        let client = client.clone();
+        async move {
+            let g = kube::discovery::pinned_group(&client, &gv).await;
+            (gv, g)
+        }
+    });
+    futures::stream::iter(jobs).buffered(16).collect().await
+}
+
+/// A group with kinds the sidebar lists by name: discovery can't do without it.
+fn required(group: &str) -> bool {
+    KNOWN.iter().any(|(_, g, _, _)| *g == group)
 }
 
 pub(super) fn listable(caps: &ApiCapabilities) -> bool {
@@ -360,6 +385,21 @@ pub fn find_kind<'a>(kinds: &'a [Kind], query: &str) -> Option<&'a Kind> {
     // Prefer core and well-known kinds when a name is ambiguous (`svc` is the Service, not
     // Knative's): sidebar order alone puts a custom resource first when its section is earlier.
     kinds.iter().filter(|k| !is_custom(k)).find(matches).or_else(|| kinds.iter().find(matches))
+}
+
+#[cfg(test)]
+mod required_tests {
+    #[test]
+    fn core_and_listed_groups_are_required() {
+        use super::required;
+        assert!(required(""));
+        assert!(required("apps"));
+        assert!(required("batch"));
+        assert!(required("networking.k8s.io"));
+        assert!(!required("metrics.k8s.io"));
+        assert!(!required("custom.metrics.k8s.io"));
+        assert!(!required("cert-manager.io"));
+    }
 }
 
 #[cfg(test)]
