@@ -246,6 +246,31 @@ pub async fn scan_partial(client: Client, kinds: &[Kind], namespace: Option<Stri
     out
 }
 
+/// Problems in the namespaces a user may read, for a cluster that may not list
+/// cluster-wide; the whole cluster when `namespaces` is empty. Cluster-scoped kinds
+/// (Nodes) are read once, namespaced ones in each namespace.
+pub async fn scan_namespaces(client: Client, kinds: &[Kind], namespaces: &[String]) -> Scan {
+    if namespaces.is_empty() {
+        return scan_partial(client, kinds, None).await;
+    }
+    let (cluster, namespaced): (Vec<Kind>, Vec<Kind>) = kinds.iter().cloned().partition(|k| !k.namespaced);
+    let (whole, per_ns) = futures::join!(
+        scan_partial(client.clone(), &cluster, None),
+        futures::future::join_all(namespaces.iter().map(|ns| {
+            let (client, namespaced) = (client.clone(), &namespaced);
+            async move { (ns, scan_partial(client, namespaced, Some(ns.clone())).await) }
+        })),
+    );
+    let mut out = whole;
+    for (ns, scan) in per_ns {
+        out.problems.extend(scan.problems);
+        out.skipped.extend(scan.skipped.into_iter().map(|(kind, e)| (format!("{kind} in {ns}"), e)));
+    }
+    out.problems
+        .sort_by(|a, b| a.severity.cmp(&b.severity).then(a.namespace.cmp(&b.namespace)).then(a.name.cmp(&b.name)));
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

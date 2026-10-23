@@ -15,7 +15,12 @@ impl AppView {
         self._problem_watch = Some(cx.spawn(async move |this, cx| {
             loop {
                 let started = std::time::Instant::now();
-                let scans = clusters.iter().map(|(_, c)| crate::problems::scan_partial(c.clone(), &kinds, None));
+                // A cluster that may not list cluster-wide is read in its accessible namespaces.
+                let scans = clusters.iter().map(|(name, c)| {
+                    let accessible = crate::settings::cluster(name).namespaces;
+                    let (c, kinds) = (c.clone(), &kinds);
+                    async move { crate::problems::scan_namespaces(c, kinds, &accessible).await }
+                });
                 let results = futures::future::join_all(scans).await;
                 let found = results.iter().flat_map(|s| &s.problems);
                 let crit = found.clone().filter(|p| p.severity == crate::problems::Severity::Critical).count();
