@@ -34,6 +34,7 @@ pub struct Palette {
     status: Option<String>,
     input: Entity<InputState>,
     selected: usize,
+    scroll: ScrollHandle,
     _subs: Vec<Subscription>,
 }
 
@@ -90,13 +91,14 @@ impl Palette {
         let subs = vec![cx.subscribe_in(&input, window, |this, _, ev: &InputEvent, _, cx| match ev {
             InputEvent::Change => {
                 this.selected = 0;
+                this.scroll.scroll_to_item(0);
                 cx.notify();
             }
             InputEvent::PressEnter { .. } => this.pick(cx),
             _ => {}
         })];
         input.update(cx, |s, cx| s.focus(window, cx));
-        Self { items, status: None, input, selected: 0, _subs: subs }
+        Self { items, status: None, input, selected: 0, scroll: ScrollHandle::new(), _subs: subs }
     }
 
     #[cfg(feature = "dev")]
@@ -138,6 +140,8 @@ impl Palette {
             "escape" => cx.emit(PaletteEvent::Dismiss),
             _ => return,
         }
+        // Keep the highlighted row in view (Up on the first row goes to the last).
+        self.scroll.scroll_to_item(self.selected);
         cx.stop_propagation();
         cx.notify();
     }
@@ -185,6 +189,7 @@ impl Render for Palette {
                             .flex_1()
                             .min_h_0()
                             .overflow_y_scroll()
+                            .track_scroll(&self.scroll)
                             .p_1()
                             .when(matches.is_empty(), |d| {
                                 d.child(div().p_3().text_sm().text_color(theme.muted_foreground).child("No matches"))
