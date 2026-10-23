@@ -45,6 +45,8 @@ impl AppView {
             t.delegate_mut().set_visible_columns(Some(visible));
             t.refresh(cx);
         });
+        // Hiding the sorted column puts the rows back in the server's order.
+        self.follow_selection(cx);
         cx.notify();
     }
 
@@ -55,6 +57,7 @@ impl AppView {
             t.delegate_mut().set_visible_columns(None);
             t.refresh(cx);
         });
+        self.follow_selection(cx);
         cx.notify();
     }
 
@@ -79,6 +82,7 @@ impl AppView {
             t.delegate_mut().set_filter(text);
             cx.notify();
         });
+        self.follow_selection(cx);
     }
 
     /// Recent filters, saved searches and the filter syntax.
@@ -582,7 +586,7 @@ impl AppView {
         cx: &mut Context<Self>,
     ) -> bool {
         let Some(kind) = self.kind.clone() else { return false };
-        self.table.update(cx, |t, _| t.delegate_mut().selected_uid = Some(row.uid.clone()));
+        self.table.update(cx, |t, _| t.delegate_mut().selected = Some((ctx, row.uid.clone())));
         if follow_event && kind.is("", "Event") {
             let target = self.table.read(cx).delegate().cells_text(&row, "Object").map(String::from);
             if let Some((k, name)) = target.as_deref().and_then(|o| o.split_once('/')) {

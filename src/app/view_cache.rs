@@ -34,8 +34,12 @@ pub struct ViewCache {
 
 impl ViewCache {
     /// Keep `view` under `key`, dropping the oldest lists past the limits. A list bigger
-    /// than the whole budget is not kept.
+    /// than the whole budget is not kept, nor one without its columns (it would show
+    /// rows with no cells): those leave what is kept under `key` as it was.
     pub fn put(&mut self, key: String, view: CachedView) {
+        if view.columns.is_empty() {
+            return;
+        }
         self.views.retain(|(k, _)| *k != key);
         if view.len() > MAX_ROWS {
             return;
@@ -67,7 +71,8 @@ mod tests {
             deleting: false,
             deleted_at: None,
         });
-        CachedView { columns: Arc::default(), rows: vec![vec![row; rows]], at: std::time::Instant::now() }
+        let columns = Arc::new(vec![crate::k8s::ColumnDef { name: "Name".into(), priority: 0 }]);
+        CachedView { columns, rows: vec![vec![row; rows]], at: std::time::Instant::now() }
     }
 
     #[test]
@@ -86,5 +91,13 @@ mod tests {
         // A list over the whole budget is never kept, and replaces nothing.
         c.put("huge".into(), view(MAX_ROWS + 1));
         assert!(c.get("huge").is_none() && c.get("big").is_some());
+    }
+
+    #[test]
+    fn a_list_without_columns_replaces_nothing() {
+        let mut c = ViewCache::default();
+        c.put("pods".into(), view(10));
+        c.put("pods".into(), CachedView { columns: Arc::default(), ..view(5) });
+        assert_eq!(c.get("pods").map(|v| (v.columns.len(), v.len())), Some((1, 10)));
     }
 }

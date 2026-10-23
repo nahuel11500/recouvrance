@@ -19,11 +19,17 @@ impl AppView {
         let ctx_name = primary.clone();
         self.ns_picker.update(cx, |p, _| p.context = ctx_name);
         self.context = Some(primary.clone());
+        // Keep the list on screen while the table still has its columns (reset below).
+        self.keep_view(cx);
         self.client = None;
         self.clusters.clear();
         self.kinds.clear();
         self.watch = None;
         self.metrics = None;
+        // Watch errors name the old clusters, and would hide "Connecting…" and new failures.
+        self.watch_errors.clear();
+        self.listing.clear();
+        self.refused.clear();
         // The problem badge counted the old clusters.
         self._problem_watch = None;
         self.problem_counts = None;
@@ -65,24 +71,12 @@ impl AppView {
             }
             let result = async {
                 let (_, client) = clusters.first().cloned().ok_or_else(|| anyhow::anyhow!(errors.join("; ")))?;
-                // Union of every cluster's kinds; remember where each one exists.
+                // Connecting does not reach the server: discovery is the first request, and
+                // an unreachable cluster fails there.
                 let discovered =
                     futures::future::join_all(clusters.iter().map(|(_, c)| k8s::discover(c.clone()))).await;
-                let mut kinds: Vec<Kind> = Vec::new();
-                let mut kind_clusters: HashMap<String, Vec<usize>> = HashMap::new();
-                for (ix, found) in discovered.into_iter().enumerate() {
-                    let found = found.unwrap_or_else(|e| {
-                        errors.push(format!("{}: {e:#}", clusters[ix].0));
-                        Vec::new()
-                    });
-                    for k in found {
-                        let entry = kind_clusters.entry(k.key()).or_default();
-                        if entry.is_empty() {
-                            kinds.push(k);
-                        }
-                        entry.push(ix);
-                    }
-                }
+                let names: Vec<&str> = clusters.iter().map(|(n, _)| n.as_str()).collect();
+                let (mut kinds, kind_clusters) = merge_kinds(&names, discovered, &mut errors);
                 if kinds.is_empty() {
                     anyhow::bail!("discovery failed on every cluster: {}", errors.join("; "));
                 }
@@ -119,6 +113,8 @@ impl AppView {
                         this.kind = wanted
                             .or_else(|| keep.and_then(|key| kinds.iter().find(|k| k.key() == key).cloned()))
                             .or_else(|| kinds.iter().find(|k| k.is("", "Pod")).cloned());
+                        // Back must not return to a list the new clusters don't have.
+                        served_lists(&mut this.history, &kinds, this.kind.as_ref());
                         // Other tabs keep a kind and namespaces only where the new clusters have them.
                         let active = this.active_tab;
                         let fallback = this.kind.clone();
@@ -194,8 +190,9 @@ impl AppView {
                 if now == seen {
                     continue;
                 }
+                // Not the cached list, which may predate the change; on a failed read, try again.
+                let Ok(contexts) = k8s::reload_contexts() else { continue };
                 seen = now;
-                let Ok(contexts) = k8s::load_contexts() else { continue };
                 let alive = this.update_in(cx, |this, window, cx| this.contexts_reloaded(contexts.names, window, cx));
                 if alive.is_err() {
                     break;
@@ -207,11 +204,9 @@ impl AppView {
     pub fn contexts_reloaded(&mut self, names: Vec<String>, window: &mut Window, cx: &mut Context<Self>) {
         let added = names.iter().filter(|n| !self.all_contexts.contains(n)).count();
         let removed = self.all_contexts.iter().filter(|n| !names.contains(n)).count();
+        self.picked.retain(|c| names.contains(c));
         self.all_contexts = names.clone();
-        self.ctx_picker.update(cx, |p, cx| {
-            p.all = names;
-            cx.notify();
-        });
+        self.ctx_picker.update(cx, |p, cx| p.set_all(names, cx));
         self.settings_view.update(cx, |s, cx| s.sync_clusters(window, cx));
         let msg = match (added, removed) {
             (0, 0) => "Kubeconfig reloaded".to_string(),
@@ -253,6 +248,45 @@ impl AppView {
     }
 }
 
+/// Union of every cluster's kinds, with where each one exists. A cluster whose
+/// discovery failed adds `name: error` to `errors`.
+fn merge_kinds(
+    names: &[&str],
+    discovered: Vec<Result<Vec<Kind>>>,
+    errors: &mut Vec<String>,
+) -> (Vec<Kind>, HashMap<String, Vec<usize>>) {
+    let mut kinds: Vec<Kind> = Vec::new();
+    let mut kind_clusters: HashMap<String, Vec<usize>> = HashMap::new();
+    for (ix, (name, found)) in names.iter().zip(discovered).enumerate() {
+        let found = match found {
+            Ok(found) => found,
+            Err(e) => {
+                errors.push(format!("{name}: {e:#}"));
+                continue;
+            }
+        };
+        for k in found {
+            let entry = kind_clusters.entry(k.key()).or_default();
+            if entry.is_empty() {
+                kinds.push(k);
+            }
+            entry.push(ix);
+        }
+    }
+    (kinds, kind_clusters)
+}
+
+/// Lists in a history that name a kind none of the clusters serve show `fallback` instead.
+fn served_lists(history: &mut [Route], kinds: &[Kind], fallback: Option<&Kind>) {
+    for route in history {
+        if let Route::Resources(Some(k)) = route
+            && !kinds.iter().any(|x| x.key() == k.key())
+        {
+            *route = Route::Resources(fallback.cloned());
+        }
+    }
+}
+
 /// The one namespace to show when only some are accessible: the one just ticked,
 /// else the last one asked for, else the first accessible one. None when all are.
 fn one_namespace(wanted: &[String], previous: &[String], accessible: &[String]) -> Option<String> {
@@ -264,7 +298,47 @@ fn one_namespace(wanted: &[String], previous: &[String], accessible: &[String]) 
 
 #[cfg(test)]
 mod tests {
-    use super::one_namespace;
+    use super::{Kind, Route, merge_kinds, one_namespace, served_lists};
+
+    fn kind(k: &str) -> Kind {
+        Kind {
+            ar: kube::discovery::ApiResource {
+                group: "".into(),
+                version: "v1".into(),
+                api_version: "v1".into(),
+                kind: k.into(),
+                plural: format!("{}s", k.to_lowercase()),
+            },
+            namespaced: true,
+            section: "",
+            label: k.into(),
+        }
+    }
+
+    #[test]
+    fn a_cluster_that_fails_discovery_is_reported() {
+        let mut errors = vec!["c: no such context".to_string()];
+        let found = vec![Ok(vec![kind("Pod")]), Err(anyhow::anyhow!("connection refused"))];
+        let (kinds, where_) = merge_kinds(&["a", "b"], found, &mut errors);
+        assert_eq!(kinds.len(), 1);
+        assert_eq!(where_[&kinds[0].key()], [0]);
+        assert_eq!(errors, ["c: no such context", "b: connection refused"]);
+    }
+
+    #[test]
+    fn back_goes_to_a_list_the_clusters_serve() {
+        let (pods, certs) = (kind("Pod"), kind("Certificate"));
+        let mut history = vec![Route::Resources(Some(certs)), Route::Resources(None), Route::Contexts];
+        served_lists(&mut history, std::slice::from_ref(&pods), Some(&pods));
+        let lists: Vec<Option<String>> = history
+            .iter()
+            .map(|r| match r {
+                Route::Resources(k) => k.as_ref().map(|k| k.label.clone()),
+                _ => Some("other".into()),
+            })
+            .collect();
+        assert_eq!(lists, [Some("Pod".into()), None, Some("other".into())]);
+    }
 
     fn v(list: &[&str]) -> Vec<String> {
         list.iter().map(|s| s.to_string()).collect()

@@ -66,7 +66,7 @@ impl ResourceTable {
             let r = &rows[i];
             let ctx = self.row_ctx[i];
             match col {
-                Col::Check => SortKey::Num(if self.marked.contains(&r.uid) { 0.0 } else { 1.0 }),
+                Col::Check => SortKey::Num(if self.is_marked(ctx, &r.uid) { 0.0 } else { 1.0 }),
                 Col::Context => SortKey::Text(self.contexts.get(ctx).map(String::as_str).unwrap_or_default()),
                 Col::Namespace => SortKey::Text(r.namespace.as_deref().unwrap_or_default()),
                 Col::Cpu => SortKey::Num(self.usage_of(ctx, r).map_or(-1.0, |u| u.0)),

@@ -24,8 +24,8 @@ impl Forward {
     pub fn url(&self) -> Option<String> {
         let port = self.local?;
         let host = match self.saved.address.as_deref() {
-            None | Some("127.0.0.1") | Some("0.0.0.0") | Some("") => "localhost",
-            Some(a) => a,
+            None | Some("127.0.0.1") | Some("0.0.0.0") | Some("::") | Some("") => "localhost".to_string(),
+            Some(a) => bracketed(a),
         };
         Some(format!("{}://{host}:{port}", if self.saved.https { "https" } else { "http" }))
     }
@@ -35,9 +35,14 @@ impl Forward {
         let port = self.local?;
         Some(match self.saved.address.as_deref() {
             None | Some("127.0.0.1") => format!("localhost:{port}"),
-            Some(a) => format!("{a}:{port}"),
+            Some(a) => format!("{}:{port}", bracketed(a)),
         })
     }
+}
+
+/// An IPv6 address in brackets, so a port can follow it: `[::1]:8080`.
+fn bracketed(host: &str) -> String {
+    if host.contains(':') && !host.starts_with('[') { format!("[{host}]") } else { host.to_string() }
 }
 
 /// Ports and port names that serve web pages (UIs, APIs, dashboards).
@@ -245,5 +250,12 @@ mod tests {
         assert_eq!(super::pod_base("web-7f9d8c4b5-abc12"), "web");
         assert_eq!(super::pod_base("cargo-staging-spv1-keycloak-0"), "cargo-staging-spv1-keycloak-0");
         assert_eq!(super::pod_base("api"), "api");
+    }
+
+    #[test]
+    fn brackets_ipv6_hosts() {
+        assert_eq!(super::bracketed("::1"), "[::1]");
+        assert_eq!(super::bracketed("[::1]"), "[::1]");
+        assert_eq!(super::bracketed("192.168.1.5"), "192.168.1.5");
     }
 }
