@@ -353,21 +353,7 @@ pub async fn service_account_kubeconfig(
     .await?;
     let (token, ns, sa) = token;
     let name = format!("{context}-{ns}-{sa}");
-    let mut c = serde_json::json!({"server": cluster.server});
-    if let Some(ca) = &cluster.certificate_authority_data {
-        c["certificate-authority-data"] = ca.clone().into();
-    } else if let Some(path) = &cluster.certificate_authority
-        && let Ok(pem) = std::fs::read(path)
-    {
-        use base64::Engine as _;
-        c["certificate-authority-data"] = base64::engine::general_purpose::STANDARD.encode(pem).into();
-    }
-    if cluster.insecure_skip_tls_verify == Some(true) {
-        c["insecure-skip-tls-verify"] = true.into();
-    }
-    if let Some(p) = &cluster.proxy_url {
-        c["proxy-url"] = p.clone().into();
-    }
+    let c = standalone_cluster(&cluster);
     let config = serde_json::json!({
         "apiVersion": "v1",
         "kind": "Config",
@@ -380,6 +366,30 @@ pub async fn service_account_kubeconfig(
     std::fs::create_dir_all(&dir)?;
     let stem = format!("kubeconfig-{}", safe_file_part(&name));
     create_private_file(&dir, &stem, "yaml", crate::yaml::to_string(&config)?.as_bytes())
+}
+
+/// A kubeconfig cluster entry that works on its own: the CA inlined, the TLS and proxy
+/// settings kept.
+fn standalone_cluster(cluster: &kube::config::Cluster) -> serde_json::Value {
+    let mut c = serde_json::json!({"server": cluster.server});
+    if let Some(ca) = &cluster.certificate_authority_data {
+        c["certificate-authority-data"] = ca.clone().into();
+    } else if let Some(path) = &cluster.certificate_authority
+        && let Ok(pem) = std::fs::read(path)
+    {
+        use base64::Engine as _;
+        c["certificate-authority-data"] = base64::engine::general_purpose::STANDARD.encode(pem).into();
+    }
+    if cluster.insecure_skip_tls_verify == Some(true) {
+        c["insecure-skip-tls-verify"] = true.into();
+    }
+    if let Some(name) = &cluster.tls_server_name {
+        c["tls-server-name"] = name.clone().into();
+    }
+    if let Some(p) = &cluster.proxy_url {
+        c["proxy-url"] = p.clone().into();
+    }
+    c
 }
 
 #[cfg(test)]
@@ -422,6 +432,20 @@ mod kubeconfig_tests {
         use std::os::unix::fs::PermissionsExt as _;
         assert_eq!(std::fs::metadata(&b).unwrap().permissions().mode() & 0o777, 0o600);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn downloaded_cluster_keeps_tls_settings() {
+        let kc: kube::config::Kubeconfig = crate::yaml::from_str(
+            "clusters: [{name: c, cluster: {server: 'https://10.0.0.1:6443', certificate-authority-data: Q0E=, tls-server-name: api.example.com, proxy-url: 'socks5://localhost:1080'}}]\n",
+        )
+        .unwrap();
+        let c = super::standalone_cluster(kc.clusters[0].cluster.as_ref().unwrap());
+        assert_eq!(c["server"], "https://10.0.0.1:6443");
+        assert_eq!(c["certificate-authority-data"], "Q0E=");
+        assert_eq!(c["tls-server-name"], "api.example.com");
+        assert_eq!(c["proxy-url"], "socks5://localhost:1080");
+        assert!(c.get("insecure-skip-tls-verify").is_none());
     }
 
     #[test]
