@@ -39,6 +39,8 @@ pub struct HelmInstall {
     values: Entity<EditorState>,
     output: Option<(bool, String)>,
     busy: bool,
+    /// Counts runs and picks: a run shows its result only if neither came after it.
+    run_id: u64,
     /// The chart search running; a new search cancels it.
     _search: Option<Task<()>>,
     /// Loading the picked chart's versions and values; a new pick cancels it.
@@ -79,6 +81,7 @@ impl HelmInstall {
             values,
             output: None,
             busy: false,
+            run_id: 0,
             _search: None,
             _pick: None,
             _tasks: Vec::new(),
@@ -115,6 +118,9 @@ impl HelmInstall {
         self.release.update(cx, |s, cx| s.set_value(base, window, cx));
         self.values.update(cx, |s, cx| s.set_value(LOADING_VALUES, window, cx));
         self.output = None;
+        // A run still going is for the chart picked before.
+        self.busy = false;
+        self.run_id += 1;
         self.versions.clear();
         self.chart = Some(chart.clone());
         let context = self.context.clone();
@@ -211,11 +217,25 @@ impl HelmInstall {
         let Some(args) = self.args(cx, dry_run, &file.display().to_string()) else { return };
         self.busy = true;
         self.output = None;
+        self.run_id += 1;
+        let id = self.run_id;
+        let release = self.release.read(cx).value().trim().to_string();
         let context = self.context.clone();
         let task = cx.spawn_in(window, async move |this, cx| {
             let r = k8s::helm(context, args).await;
             drop(dir);
             let _ = this.update_in(cx, |this, window, cx| {
+                if this.run_id != id {
+                    // Another chart is picked: only an install is worth telling about.
+                    if !dry_run {
+                        let note = match r {
+                            Ok(_) => Notification::success(format!("Release {release} installed")),
+                            Err(e) => Notification::error(format!("Release {release} not installed: {e:#}")),
+                        };
+                        window.push_notification(note, cx);
+                    }
+                    return;
+                }
                 this.busy = false;
                 match r {
                     Ok(out) => {
