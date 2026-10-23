@@ -501,6 +501,7 @@ impl AppView {
         // One agent hub and MCP server for the whole app, shared by its windows.
         if !cx.has_global::<SharedHub>() {
             let hub = Hub::load();
+            hub.claim_config();
             let _ = hub.apply_rules_file();
             hub.watch_rules_file();
             let server = mcp::server::start(hub.clone());

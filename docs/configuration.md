@@ -10,6 +10,7 @@ Recouvrance reads your kubeconfig like `kubectl` does and keeps its own settings
 |---|---|
 | `~/.config/recouvrance/settings.json` | Settings (below) |
 | `~/.config/recouvrance/agents.json` | Agents, token hashes, rules (mode 0600) |
+| `~/.config/recouvrance/agents.lock` | Held while the app or `serve` runs; `agent-create` refuses to run then |
 | `~/.config/recouvrance/rules.yaml` | Agent rules as code (optional; wins over `agents.json` when present) |
 | `~/.config/recouvrance/plugins.yaml` | Your commands on resources |
 | `~/.config/recouvrance/kubeconfigs/*.yaml` | Kubeconfigs pasted in Settings (mode 0600) |
