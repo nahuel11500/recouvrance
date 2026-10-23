@@ -98,7 +98,7 @@ impl KubeMcp {
         let mut call = self.begin(&parts, "list_resources", args)?;
         let (client, kind) = self.kind(&call, &p.context, &p.kind).await?;
         let access = access_for(&kind, &p.context, "list", p.namespace.clone(), None);
-        self.authorize(&mut call, &access, p.namespace.is_none()).await?;
+        self.authorize_list(&mut call, &access, p.namespace.is_none()).await?;
         let (defs, rows) = match k8s::list_table(
             client,
             kind.clone(),
@@ -177,7 +177,7 @@ impl KubeMcp {
         let (client, kind) = self.kind(&call, &p.context, &p.kind).await?;
         require_ns(&call, &kind, &p.namespace)?;
         let access = access_for(&kind, &p.context, "get", p.namespace.clone(), Some(p.name.clone()));
-        self.authorize(&mut call, &access, false).await?;
+        self.authorize(&mut call, &access).await?;
         let reveal = kind.is("", "Secret") && {
             let a = access_for(&kind, &p.context, "reveal", p.namespace.clone(), Some(p.name.clone()));
             call.policy().decide(&a).mode == Mode::Allow
@@ -210,7 +210,7 @@ impl KubeMcp {
         let mut call = self.begin(&parts, "get_events", args)?;
         let (client, kind) = self.kind(&call, &p.context, "events").await?;
         let access = access_for(&kind, &p.context, "list", p.namespace.clone(), None);
-        self.authorize(&mut call, &access, p.namespace.is_none()).await?;
+        self.authorize_list(&mut call, &access, p.namespace.is_none()).await?;
         let mut fields = Vec::new();
         if let Some(n) = &p.name {
             fields.push(format!("involvedObject.name={n}"));
@@ -261,7 +261,7 @@ impl KubeMcp {
         let (client, kind) = self.kind(&call, &p.context, &p.kind).await?;
         require_ns(&call, &kind, &p.namespace)?;
         let access = access_for(&kind, &p.context, "get", p.namespace.clone(), Some(p.name.clone()));
-        self.authorize(&mut call, &access, false).await?;
+        self.authorize(&mut call, &access).await?;
         let ns = if kind.namespaced { p.namespace.clone() } else { None };
         let obj = ObjectRef { kind: kind.clone(), name: p.name.clone(), namespace: ns.clone(), uid: String::new() };
         let value = match k8s::get_object(client.clone(), obj.clone()).await {
@@ -382,7 +382,7 @@ impl KubeMcp {
         let mut call = self.begin(&parts, "top_pods", args)?;
         let (client, kind) = self.kind(&call, &p.context, "pods").await?;
         let access = access_for(&kind, &p.context, "list", p.namespace.clone(), None);
-        self.authorize(&mut call, &access, p.namespace.is_none()).await?;
+        self.authorize_list(&mut call, &access, p.namespace.is_none()).await?;
         let usage = match &p.namespace {
             Some(ns) => k8s::container_usage(client, ns.clone(), None)
                 .await
@@ -480,7 +480,7 @@ impl KubeMcp {
         let mut call = self.begin(&parts, "get_logs", args)?;
         let (client, kind) = self.kind(&call, &p.context, "pods").await?;
         let access = access_for(&kind, &p.context, "logs", Some(p.namespace.clone()), Some(p.pod.clone()));
-        self.authorize(&mut call, &access, false).await?;
+        self.authorize(&mut call, &access).await?;
         let lp = kube::api::LogParams {
             container: p.container,
             tail_lines: Some(p.tail_lines.unwrap_or(200).min(call.policy().max_log_lines) as i64),
@@ -518,7 +518,7 @@ impl KubeMcp {
         let mut call = self.begin(&parts, "check_certificates", args)?;
         let (client, kind) = self.kind(&call, &p.context, "secrets").await?;
         let access = access_for(&kind, &p.context, "get", p.namespace.clone(), None);
-        self.authorize(&mut call, &access, p.namespace.is_none()).await?;
+        self.authorize_list(&mut call, &access, p.namespace.is_none()).await?;
         let secrets = match k8s::list_values_fields(
             client,
             kind.ar.clone(),
@@ -590,7 +590,7 @@ impl KubeMcp {
         let mut call = self.begin(&parts, "find_problems", args)?;
         let (client, pods) = self.kind(&call, &p.context, "pods").await?;
         let access = access_for(&pods, &p.context, "list", p.namespace.clone(), None);
-        self.authorize(&mut call, &access, p.namespace.is_none()).await?;
+        self.authorize_list(&mut call, &access, p.namespace.is_none()).await?;
         let kinds = match self.hub.client(&p.context).await {
             Ok((_, kinds)) => kinds,
             Err(e) => return call.finish(Err(e)),
@@ -640,7 +640,7 @@ impl KubeMcp {
         let mut call = self.begin(&parts, "usage_history", args)?;
         let (client, kind) = self.kind(&call, &p.context, &p.kind).await?;
         let access = access_for(&kind, &p.context, "get", Some(p.namespace.clone()), Some(p.name.clone()));
-        self.authorize(&mut call, &access, false).await?;
+        self.authorize(&mut call, &access).await?;
         let obj = ObjectRef {
             kind: kind.clone(),
             name: p.name.clone(),

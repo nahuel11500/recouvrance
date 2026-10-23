@@ -275,17 +275,33 @@ impl Policy {
             .collect()
     }
 
-    /// For an all-namespaces request that asks: the Allow rule that decides some rows, so the
-    /// request can still go ahead unapproved, showing only the allowed rows. An Allow that an
-    /// Ask or a Deny covers everywhere gives nothing.
+    /// The Ask rules a request in one namespace (or on one object) meets: what approving it
+    /// covers.
+    pub fn asks(&self, a: &Access) -> Vec<usize> {
+        (0..self.rules.len())
+            .filter(|&i| self.rules[i].effect == Mode::Ask && self.rules[i].matches(a, false))
+            .collect()
+    }
+
+    /// For a list request that asks, in one namespace or across all of them: the Allow rule
+    /// that decides some rows, so the request can still go ahead unapproved, showing only the
+    /// allowed rows. An Allow that an Ask or a Deny covers everywhere gives nothing.
     pub fn allow_somewhere(&self, a: &Access) -> Option<usize> {
         let mut probe = a.clone();
         probe.namespace = None;
+        let one_namespace = a.namespace.clone();
+        let covers = |r: &Rule| match &one_namespace {
+            Some(_) => r.matches(a, false),
+            None => r.matches(&probe, true),
+        };
         // An Allow rule's own patterns, taken as a namespace and a name (`*` then literal),
         // are matched by the rules that cover them; no namespace for cluster-scoped rows.
-        let rows = self.rules.iter().filter(|r| r.effect == Mode::Allow && r.matches(&probe, true)).flat_map(|r| {
-            let namespaces = r.namespaces.iter().map(|n| Some(n.trim().to_string())).chain([None]);
-            namespaces.flat_map(|ns| r.names.iter().map(move |n| (ns.clone(), n.trim().to_string())))
+        let rows = self.rules.iter().filter(|r| r.effect == Mode::Allow && covers(r)).flat_map(|r| {
+            let namespaces: Vec<Option<String>> = match &one_namespace {
+                Some(ns) => vec![Some(ns.clone())],
+                None => r.namespaces.iter().map(|n| Some(n.trim().to_string())).chain([None]).collect(),
+            };
+            namespaces.into_iter().flat_map(|ns| r.names.iter().map(move |n| (ns.clone(), n.trim().to_string())))
         });
         rows.into_iter().find_map(|(namespace, name)| {
             let v = self.decide(&Access { namespace, name: Some(name), ..probe.clone() });
@@ -1198,6 +1214,32 @@ mod tests {
         assert_eq!(p.decide_any_namespace(&all).rule, Some(0));
         // Both namespaces' rows were approved; deployments were not asked about.
         assert_eq!(p.asks_any_namespace(&all), [0, 1]);
+    }
+
+    #[test]
+    fn approving_one_namespace_covers_every_ask_rule_there() {
+        let mut debug = rule(Mode::Ask, &["list"], &["pods"], &["*"], &["*"]);
+        debug.names = vec!["debug-*".into()];
+        let p = Policy {
+            rules: vec![
+                rule(Mode::Allow, &["list"], &["pods"], &["*"], &["*"]),
+                debug,
+                rule(Mode::Ask, &["list"], &["pods"], &["team-b"], &["*"]),
+            ],
+            ..Policy::default()
+        };
+        let team_b = access("c", "list", "pods", Some("team-b"), None);
+        assert_eq!(p.decide(&team_b), Verdict { mode: Mode::Ask, rule: Some(1) });
+        // Approved: debug pods and the other team-b pods alike.
+        assert_eq!(p.asks(&team_b), [1, 2]);
+        // Unapproved: every team-b row asks, nothing to fall back to...
+        assert_eq!(p.allow_somewhere(&team_b), None);
+        // ...but in team-a only the debug pods ask; the others can be shown.
+        let team_a = access("c", "list", "pods", Some("team-a"), None);
+        assert_eq!(p.decide(&team_a).mode, Mode::Ask);
+        assert_eq!(p.asks(&team_a), [1]);
+        assert_eq!(p.allow_somewhere(&team_a), Some(0));
+        assert_eq!(p.decide(&access("c", "list", "pods", Some("team-a"), Some("web"))).mode, Mode::Allow);
     }
 
     #[test]
