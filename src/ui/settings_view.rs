@@ -150,6 +150,12 @@ impl SettingsView {
                 }
             }),
         };
+        // Another window may have changed a setting meanwhile.
+        this._subs.push(cx.observe_window_activation(window, |this, window, cx| {
+            if window.is_window_active() {
+                this.reload_fields(window, cx);
+            }
+        }));
         this.sync_clusters(window, cx);
         this
     }
@@ -230,6 +236,33 @@ impl SettingsView {
             }
         }));
         self.cluster_inputs.push((ctx, image, namespaces));
+    }
+
+    /// Show the saved values in the fields not being edited: each window has its own fields,
+    /// and another one may have changed a setting since they were filled.
+    fn reload_fields(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let s = settings::get();
+        let mut fields = vec![
+            (self.metrics.clone(), s.metrics_refresh.to_string()),
+            (self.detail.clone(), s.detail_refresh.to_string()),
+            (self.overview.clone(), s.overview_refresh.to_string()),
+            (self.tail.clone(), s.log_tail_lines.to_string()),
+            (self.mcp_port.clone(), self.hub.port().to_string()),
+        ];
+        for (ctx, input) in &self.prometheus {
+            fields.push((input.clone(), s.prometheus.get(ctx).cloned().unwrap_or_default()));
+        }
+        for (ctx, image, namespaces) in &self.cluster_inputs {
+            let cs = s.clusters.get(ctx).cloned().unwrap_or_default();
+            fields.push((image.clone(), cs.node_shell_image.unwrap_or_default()));
+            fields.push((namespaces.clone(), cs.namespaces.join(", ")));
+        }
+        for (input, saved) in fields {
+            let state = input.read(cx);
+            if !state.focus_handle(cx).is_focused(window) && state.value().trim() != saved {
+                input.update(cx, |state, cx| state.set_value(saved, window, cx));
+            }
+        }
     }
 
     /// Open on the General section (where deletes are configured).
@@ -799,6 +832,7 @@ impl Render for SettingsView {
                                 if sec == Section::Clusters {
                                     this.sync_clusters(window, cx);
                                 }
+                                this.reload_fields(window, cx);
                                 cx.notify();
                             }))
                             .child(Icon::new(*icon).size_4().text_color(theme.muted_foreground))
