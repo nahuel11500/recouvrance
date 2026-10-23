@@ -66,13 +66,7 @@ pub struct SettingsView {
 impl SettingsView {
     pub fn new(hub: std::sync::Arc<crate::mcp::Hub>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let s = settings::get();
-        let field = |value: String, placeholder: &'static str, window: &mut Window, cx: &mut Context<Self>| {
-            cx.new(|cx| {
-                let mut st = InputState::new(window, cx).placeholder(placeholder);
-                st.set_value(value, window, cx);
-                st
-            })
-        };
+        let field = Self::field;
         let metrics = field(s.metrics_refresh.to_string(), "15", window, cx);
         let detail = field(s.detail_refresh.to_string(), "5", window, cx);
         let overview = field(s.overview_refresh.to_string(), "30", window, cx);
@@ -107,29 +101,6 @@ impl SettingsView {
                 let _ = hub2.set_port(p);
             }
         }));
-        let mut prometheus = Vec::new();
-        for ctx in crate::k8s::load_contexts().map(|c| c.names).unwrap_or_default() {
-            let input = field(
-                s.prometheus.get(&ctx).cloned().unwrap_or_default(),
-                "Prometheus: found automatically",
-                window,
-                cx,
-            );
-            let c = ctx.clone();
-            subs.push(cx.subscribe(&input, move |_, state, ev: &InputEvent, cx| {
-                if let InputEvent::Change = ev {
-                    let v = state.read(cx).value().trim().to_string();
-                    settings::update(|s| {
-                        if v.is_empty() {
-                            s.prometheus.remove(&c);
-                        } else {
-                            s.prometheus.insert(c.clone(), v);
-                        }
-                    });
-                }
-            }));
-            prometheus.push((ctx, input));
-        }
         let delete_kind = cx.new(|cx| InputState::new(window, cx).placeholder("Add a kind, e.g. Service"));
         subs.push(cx.subscribe_in(&delete_kind, window, |_, state, ev: &InputEvent, window, cx| {
             if let InputEvent::PressEnter { .. } = ev {
@@ -143,41 +114,6 @@ impl SettingsView {
                 }
             }
         }));
-        let mut cluster_inputs = Vec::new();
-        for ctx in crate::k8s::load_contexts().map(|c| c.names).unwrap_or_default() {
-            let cs = settings::cluster(&ctx);
-            let image = field(cs.node_shell_image.clone().unwrap_or_default(), "busybox:1.37", window, cx);
-            let namespaces = field(
-                cs.namespaces.join(", "),
-                "all (or: team-a, team-b when you may not list namespaces)",
-                window,
-                cx,
-            );
-            let c = ctx.clone();
-            subs.push(cx.subscribe(&image, move |_, state, ev: &InputEvent, cx| {
-                if let InputEvent::Change = ev {
-                    let v = state.read(cx).value().trim().to_string();
-                    settings::update(|s| {
-                        s.clusters.entry(c.clone()).or_default().node_shell_image = (!v.is_empty()).then_some(v)
-                    });
-                }
-            }));
-            let c = ctx.clone();
-            subs.push(cx.subscribe(&namespaces, move |_, state, ev: &InputEvent, cx| {
-                if let InputEvent::Change = ev {
-                    let list: Vec<String> = state
-                        .read(cx)
-                        .value()
-                        .split(',')
-                        .map(str::trim)
-                        .filter(|s| !s.is_empty())
-                        .map(String::from)
-                        .collect();
-                    settings::update(|s| s.clusters.entry(c.clone()).or_default().namespaces = list);
-                }
-            }));
-            cluster_inputs.push((ctx, image, namespaces));
-        }
         let section = match crate::app::dev_var("RECOUVRANCE_SECTION").as_deref() {
             Some("contexts") => Section::Contexts,
             Some("clusters") => Section::Clusters,
@@ -187,7 +123,7 @@ impl SettingsView {
             Some("general") => Section::General,
             _ => Section::General,
         };
-        Self {
+        let mut this = Self {
             section,
             metrics,
             detail,
@@ -195,8 +131,8 @@ impl SettingsView {
             tail,
             kubeconfig,
             mcp_port,
-            prometheus,
-            cluster_inputs,
+            prometheus: Vec::new(),
+            cluster_inputs: Vec::new(),
             delete_kind,
             hub,
             _subs: subs,
@@ -213,7 +149,84 @@ impl SettingsView {
                     }
                 }
             }),
+        };
+        this.sync_clusters(window, cx);
+        this
+    }
+
+    fn field(
+        value: String,
+        placeholder: &'static str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<InputState> {
+        cx.new(|cx| {
+            let mut st = InputState::new(window, cx).placeholder(placeholder);
+            st.set_value(value, window, cx);
+            st
+        })
+    }
+
+    /// Per cluster rows for the kubeconfig's current contexts (contexts come and go;
+    /// checked when the section opens).
+    fn sync_clusters(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let names = crate::k8s::load_contexts().map(|c| c.names).unwrap_or_default();
+        self.cluster_inputs.retain(|(ctx, ..)| names.contains(ctx));
+        self.prometheus.retain(|(ctx, _)| names.contains(ctx));
+        for ctx in names {
+            if !self.cluster_inputs.iter().any(|(c, ..)| *c == ctx) {
+                self.add_cluster(ctx, window, cx);
+            }
         }
+    }
+
+    fn add_cluster(&mut self, ctx: String, window: &mut Window, cx: &mut Context<Self>) {
+        let field = Self::field;
+        let s = settings::get();
+        let input =
+            field(s.prometheus.get(&ctx).cloned().unwrap_or_default(), "Prometheus: found automatically", window, cx);
+        let c = ctx.clone();
+        self._subs.push(cx.subscribe(&input, move |_, state, ev: &InputEvent, cx| {
+            if let InputEvent::Change = ev {
+                let v = state.read(cx).value().trim().to_string();
+                settings::update(|s| {
+                    if v.is_empty() {
+                        s.prometheus.remove(&c);
+                    } else {
+                        s.prometheus.insert(c.clone(), v);
+                    }
+                });
+            }
+        }));
+        self.prometheus.push((ctx.clone(), input));
+        let cs = settings::cluster(&ctx);
+        let image = field(cs.node_shell_image.clone().unwrap_or_default(), "busybox:1.37", window, cx);
+        let namespaces =
+            field(cs.namespaces.join(", "), "all (or: team-a, team-b when you may not list namespaces)", window, cx);
+        let c = ctx.clone();
+        self._subs.push(cx.subscribe(&image, move |_, state, ev: &InputEvent, cx| {
+            if let InputEvent::Change = ev {
+                let v = state.read(cx).value().trim().to_string();
+                settings::update(|s| {
+                    s.clusters.entry(c.clone()).or_default().node_shell_image = (!v.is_empty()).then_some(v)
+                });
+            }
+        }));
+        let c = ctx.clone();
+        self._subs.push(cx.subscribe(&namespaces, move |_, state, ev: &InputEvent, cx| {
+            if let InputEvent::Change = ev {
+                let list: Vec<String> = state
+                    .read(cx)
+                    .value()
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(String::from)
+                    .collect();
+                settings::update(|s| s.clusters.entry(c.clone()).or_default().namespaces = list);
+            }
+        }));
+        self.cluster_inputs.push((ctx, image, namespaces));
     }
 
     /// Open on the General section (where deletes are configured).
@@ -778,8 +791,11 @@ impl Render for SettingsView {
                             .cursor_pointer()
                             .when(on, |d| d.bg(theme.list_active))
                             .hover(|s| s.bg(theme.list_hover))
-                            .on_click(cx.listener(move |this, _, _, cx| {
+                            .on_click(cx.listener(move |this, _, window, cx| {
                                 this.section = sec;
+                                if sec == Section::Clusters {
+                                    this.sync_clusters(window, cx);
+                                }
                                 cx.notify();
                             }))
                             .child(Icon::new(*icon).size_4().text_color(theme.muted_foreground))
