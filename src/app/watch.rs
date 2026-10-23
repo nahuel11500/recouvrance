@@ -247,7 +247,11 @@ impl AppView {
                     let uid = t.delegate().selected_uid.clone();
                     let moved = match uid.and_then(|uid| t.delegate().visible_index_of(&uid)) {
                         Some(ix) if t.selected_row() != Some(ix) => {
+                            // Without scrolling to it (which selecting does): the user may
+                            // have scrolled away, and rows moving must not pull the list back.
+                            let pending = t.vertical_scroll_handle.0.borrow_mut().deferred_scroll_to_item.take();
                             t.set_selected_row(ix, cx);
+                            t.vertical_scroll_handle.0.borrow_mut().deferred_scroll_to_item = pending;
                             Some(ix)
                         }
                         // Its row is gone or filtered out: no other row takes the highlight.
