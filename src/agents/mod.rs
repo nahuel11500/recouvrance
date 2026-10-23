@@ -72,6 +72,8 @@ struct Editor {
     rules: Vec<RuleInputs>,
     /// The rules the inputs show, to rebuild them when the rules change elsewhere.
     shown: Vec<Rule>,
+    /// An edit was refused: the inputs show text that isn't in force, so they are rebuilt.
+    stale: bool,
     max_lines: Entity<InputState>,
     max_rows: Entity<InputState>,
     exec_timeout: Entity<InputState>,
@@ -297,6 +299,7 @@ impl AgentsView {
             agent_id: agent.id.clone(),
             rules,
             shown: p.rules.clone(),
+            stale: false,
             max_lines,
             max_rows,
             exec_timeout,
@@ -307,11 +310,12 @@ impl AgentsView {
 
     fn update(&mut self, f: impl FnOnce(&mut Agent), cx: &mut Context<Self>) {
         if let Some(id) = self.selected.clone() {
-            let result = self.hub.update_agent(&id, f);
-            self.report(result);
-            // The inputs already show this edit: no rebuild for it.
+            let saved = self.report(self.hub.update_agent(&id, f)).is_some();
+            // The inputs already show a saved edit: no rebuild for it. A refused one is
+            // taken out of them on the next render.
             if let (Some(e), Some(a)) = (&mut self.editor, self.hub.agent(&id)) {
                 e.shown = a.policy.rules;
+                e.stale |= !saved;
             }
         }
         cx.notify();
@@ -567,7 +571,7 @@ impl Render for AgentsView {
         let agent = self.selected.as_ref().and_then(|id| self.hub.agent(id));
         // Rules can change elsewhere (e.g. "Always allow this", rules.yaml); keep inputs in step.
         if let Some(a) = &agent
-            && self.editor.as_ref().is_some_and(|e| e.agent_id != a.id || e.shown != a.policy.rules)
+            && self.editor.as_ref().is_some_and(|e| e.stale || e.agent_id != a.id || e.shown != a.policy.rules)
         {
             self.rebuild_editor(a, window, cx);
         }
