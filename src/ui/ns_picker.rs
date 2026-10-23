@@ -209,9 +209,7 @@ impl NamespacePicker {
         let mut all: Vec<String> = self.all.iter().filter(|ns| ns.contains(&query)).cloned().collect();
         all.sort_by_key(|ns| !self.selected.contains(ns));
         // A name not in the list can be added by hand (no permission to list namespaces).
-        let valid = !typed.is_empty()
-            && typed.len() <= 63
-            && typed.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
+        let valid = crate::k8s::names::validate_namespace(&typed).is_ok();
         let add = (valid && !self.all.contains(&typed)).then_some(typed);
         Rows { frequent, all, add }
     }
