@@ -75,8 +75,8 @@ fn find_doc(text: &str, doc: &Value) -> Result<(usize, Value), String> {
     let mut hits = doc_ranges(text)
         .into_iter()
         .enumerate()
-        .map(|(i, (a, b))| (i, parse_first(&lines[a..b].join("\n"))))
-        .filter(|(_, v)| identity(v) == want);
+        .map(|(i, (a, b))| (i, a, b, parse_first(&lines[a..b].join("\n"))))
+        .filter(|(_, _, _, v)| identity(v) == want);
     let describe = || {
         format!(
             "{} {}",
@@ -85,23 +85,31 @@ fn find_doc(text: &str, doc: &Value) -> Result<(usize, Value), String> {
         )
     };
     match (hits.next(), hits.next()) {
-        (Some(hit), None) => Ok(hit),
+        (Some((i, a, b, v)), None) => {
+            // Text after `---` that is not a comment, or a second document in the range,
+            // would be lost or mangled when the range is written back.
+            let after_sep = a.checked_sub(1).map_or("", |s| lines[s].get(3..).unwrap_or_default().trim());
+            let several = crate::yaml::documents(&lines[a..b].join("\n")).is_ok_and(|d| d.len() > 1);
+            if !(after_sep.is_empty() || after_sep.starts_with('#')) || several {
+                return Err(format!("{} is not alone between `---` lines; not writing.", describe()));
+            }
+            Ok((i, v))
+        }
         (None, _) => Err(format!("{} is no longer in the YAML (changed since Reload?). Reload the form.", describe())),
         (Some(_), Some(_)) => Err(format!("{} appears more than once in the YAML; not writing.", describe())),
     }
 }
 
+/// Each document's lines (start, end), without the `---` lines between them; split
+/// exactly as Apply splits, so `--- # comment` starts a document here too.
 fn doc_ranges(text: &str) -> Vec<(usize, usize)> {
-    let lines: Vec<&str> = text.lines().collect();
     let mut out = Vec::new();
     let mut start = 0;
-    for (i, l) in lines.iter().enumerate() {
-        if l.trim_end() == "---" {
-            out.push((start, i));
-            start = i + 1;
-        }
+    for (sep, _) in crate::ui::apply_view::split_docs(text).into_iter().skip(1) {
+        out.push((start, sep as usize));
+        start = sep as usize + 1;
     }
-    out.push((start, lines.len()));
+    out.push((start, text.lines().count()));
     out
 }
 
@@ -615,5 +623,17 @@ mod tests {
         assert!(find_doc("apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: c\n", &doc).is_err());
         let twice = format!("{text}---\napiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: b\n");
         assert!(find_doc(&twice, &doc).is_err());
+    }
+
+    #[test]
+    fn splits_as_apply_does() {
+        use super::{doc_ranges, find_doc};
+        let text = "kind: A\n--- # web\napiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: b\n";
+        assert_eq!(doc_ranges(text), vec![(0, 1), (2, 6)]);
+        let doc = serde_json::json!({"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "b"}});
+        assert_eq!(find_doc(text, &doc).unwrap().0, 1);
+        // Content after `---` on the same line would be lost on write.
+        let inline = "--- !!map\napiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: b\n";
+        assert!(find_doc(inline, &doc).is_err());
     }
 }
