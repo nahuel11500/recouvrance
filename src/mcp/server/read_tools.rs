@@ -578,7 +578,9 @@ impl KubeMcp {
                         let from = c.not_before.map(|t| t.strftime("%Y-%m-%d").to_string()).unwrap_or_default();
                         format!("NOT VALID UNTIL {from}")
                     } else if days < 0 {
-                        format!("EXPIRED {}d ago", -days)
+                        // The days that went by: 3 hours ago is 0, not the -1 days left.
+                        let ago = c.not_after.map(|t| crate::certs::days_ago(t, now)).unwrap_or(0);
+                        format!("EXPIRED {ago}d ago")
                     } else {
                         days.to_string()
                     },
