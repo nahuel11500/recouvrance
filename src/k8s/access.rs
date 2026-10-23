@@ -43,25 +43,46 @@ pub async fn can_i(
 }
 
 /// What the current user may do in a namespace (`kubectl auth can-i --list`):
-/// (verbs, resources, resource names) per rule.
-pub async fn my_rules(client: Client, ns: String) -> Result<Vec<(Vec<String>, Vec<String>, Vec<String>)>> {
+/// (verbs, resources, resource names) per rule, and a note when the server says the list
+/// may be incomplete.
+pub async fn my_rules(
+    client: Client,
+    ns: String,
+) -> Result<(Vec<(Vec<String>, Vec<String>, Vec<String>)>, Option<String>)> {
     use k8s_openapi::api::authorization::v1::{SelfSubjectRulesReview, SelfSubjectRulesReviewSpec};
     run(async move {
         let review =
             SelfSubjectRulesReview { spec: SelfSubjectRulesReviewSpec { namespace: Some(ns) }, ..Default::default() };
         let api: Api<SelfSubjectRulesReview> = Api::all(client);
         let r = api.create(&Default::default(), &review).await?;
-        let rules = r.status.map(|s| s.resource_rules).unwrap_or_default();
-        Ok(rules
+        let status = r.status.unwrap_or_default();
+        let note = incomplete_note(status.incomplete, status.evaluation_error.as_deref());
+        let rules = status
+            .resource_rules
             .into_iter()
             .map(|rule| {
                 let groups = rule.api_groups.unwrap_or_default();
                 let resources = rule_resources(&groups, rule.resources.unwrap_or_default());
                 (rule.verbs, resources, rule.resource_names.unwrap_or_default())
             })
-            .collect())
+            .collect();
+        Ok((rules, note))
     })
     .await
+}
+
+/// What to say when the rules review is not the whole answer: with a webhook or cloud IAM
+/// authorizer (EKS access entries, GKE IAM), the server can only list what RBAC grants.
+fn incomplete_note(incomplete: bool, evaluation_error: Option<&str>) -> Option<String> {
+    let error = evaluation_error.filter(|e| !e.trim().is_empty());
+    if !incomplete && error.is_none() {
+        return None;
+    }
+    let note = "This list may be incomplete: the cluster may allow more than RBAC shows here.";
+    Some(match error {
+        Some(e) => format!("{note} ({})", e.trim()),
+        None => note.to_string(),
+    })
 }
 
 /// A rule's resources as `resource[.group]`: `pods` (core), `deployments.apps`,
@@ -97,7 +118,7 @@ pub async fn rbac_snapshot(client: Client, ns: Option<String>) -> crate::rbac::S
 
 #[cfg(test)]
 mod tests {
-    use super::rule_resources;
+    use super::{incomplete_note, rule_resources};
 
     fn strings(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
@@ -109,5 +130,15 @@ mod tests {
         assert_eq!(rule_resources(&strings(&["*"]), strings(&["*"])), ["*.*"]);
         assert_eq!(rule_resources(&strings(&["", "apps"]), strings(&["*"])), ["*", "*.apps"]);
         assert_eq!(rule_resources(&strings(&["*"]), strings(&["pods", "*/scale"])), ["pods.*", "*/scale.*"]);
+    }
+
+    #[test]
+    fn incomplete_rules_are_said() {
+        assert_eq!(incomplete_note(false, None), None);
+        assert_eq!(incomplete_note(false, Some("")), None);
+        let note = incomplete_note(true, None).unwrap();
+        assert!(note.starts_with("This list may be incomplete"));
+        let note = incomplete_note(false, Some("webhook authorizer does not support user rule resolution")).unwrap();
+        assert!(note.ends_with("(webhook authorizer does not support user rule resolution)"));
     }
 }
