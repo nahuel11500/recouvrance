@@ -17,13 +17,19 @@ use crate::k8s;
 #[derive(Default)]
 struct Summary {
     context: String,
-    version: String,
+    /// None when `/version` failed.
+    version: Option<String>,
+    /// Whether nodes, pods and node metrics could be read: the numbers from them are
+    /// shown as unavailable otherwise, not as 0.
+    nodes_known: bool,
+    pods_known: bool,
+    usage_known: bool,
     nodes: usize,
     nodes_ready: usize,
     kubelet_versions: Vec<(String, usize)>,
     pods_running: usize,
     pods_total: usize,
-    namespaces: usize,
+    namespaces: Option<usize>,
     /// (allocatable, requested, used) in millicores / bytes.
     cpu: (f64, f64, f64),
     mem: (f64, f64, f64),
@@ -40,6 +46,9 @@ struct Summary {
     gpus: (f64, f64),
     /// GPU utilization and memory, from the DCGM exporter.
     gpu: Option<crate::prom::GpuUsage>,
+    /// The parts that could not be read, e.g. "Nodes: forbidden".
+    errors: Vec<String>,
+    /// Set when nothing could be read: the cluster is out of reach.
     error: Option<String>,
 }
 
@@ -249,14 +258,13 @@ fn add_pods(s: &mut Summary, pods: &[PodLite]) {
     }
 }
 
-/// A metrics.k8s.io list, or nothing when metrics-server is missing or metrics are off.
-async fn metrics(on: bool, client: Client, path: &'static str) -> MetricsList {
+/// A metrics.k8s.io list, or None when metrics are off or metrics-server didn't answer
+/// (missing, down or refused): usage is then unknown, not zero.
+async fn metrics(on: bool, client: Client, path: &'static str) -> Option<MetricsList> {
     if !on {
-        return MetricsList::default();
+        return None;
     }
-    k8s::run(async move { Ok(client.request(http::Request::get(path).body(Vec::new())?).await?) })
-        .await
-        .unwrap_or_default()
+    k8s::run(async move { Ok(client.request(http::Request::get(path).body(Vec::new())?).await?) }).await.ok()
 }
 
 /// The cluster overview's load, for the dev smoke run's timings.
@@ -307,17 +315,43 @@ async fn load(context: String, client: Client) -> Summary {
         metrics(on, client.clone(), "/apis/metrics.k8s.io/v1beta1/nodes"),
         metrics(on, client.clone(), "/apis/metrics.k8s.io/v1beta1/pods"),
     );
-    let result: Result<()> = (|| {
-        s.version = version?;
-        add_nodes(&mut s, &nodes?);
-        add_pods(&mut s, &pods?);
-        s.namespaces = namespaces.map(|n| n.len()).unwrap_or(0);
+    // Each part on its own: a user who can't list nodes still sees the pods.
+    let failed = |what: &str, e: &anyhow::Error| match k8s::api_status(e) {
+        Some(403) => format!("{what}: forbidden"),
+        _ => format!("{what}: {}", k8s::short_error(e)),
+    };
+    match version {
+        Ok(v) => s.version = Some(v),
+        Err(e) => s.errors.push(failed("Version", &e)),
+    }
+    match nodes {
+        Ok(nodes) => {
+            add_nodes(&mut s, &nodes);
+            s.nodes_known = true;
+        }
+        Err(e) => s.errors.push(failed("Nodes", &e)),
+    }
+    match pods {
+        Ok(pods) => {
+            add_pods(&mut s, &pods);
+            s.pods_known = true;
+        }
+        Err(e) => s.errors.push(failed("Pods", &e)),
+    }
+    match namespaces {
+        Ok(n) => s.namespaces = Some(n.len()),
+        Err(e) => s.errors.push(failed("Namespaces", &e)),
+    }
 
-        // Usage: nodes for the totals, pods for the per-namespace ranking.
+    // Usage: nodes for the totals, pods for the per-namespace ranking.
+    if let Some(node_metrics) = node_metrics {
         for n in node_metrics.items {
             s.cpu.2 += k8s::parse_cpu(quantity(&n.usage, "cpu"));
             s.mem.2 += k8s::parse_bytes(quantity(&n.usage, "memory"));
         }
+        s.usage_known = true;
+    }
+    if let Some(pod_metrics) = pod_metrics {
         let mut by_ns: HashMap<String, (f64, f64)> = HashMap::new();
         for p in pod_metrics.items {
             let e = by_ns.entry(p.metadata.namespace).or_default();
@@ -330,10 +364,10 @@ async fn load(context: String, client: Client) -> Summary {
         top.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
         top.truncate(10);
         s.top_ns = top;
-        Ok(())
-    })();
-    if let Err(e) = result {
-        s.error = Some(format!("{e:#}"));
+    }
+    // Nothing answered: the cluster is out of reach, one line says why.
+    if s.version.is_none() && !s.nodes_known && !s.pods_known {
+        s.error = s.errors.first().cloned();
     }
     s
 }
@@ -352,18 +386,28 @@ impl ClusterOverview {
             .child(div().text_xs().text_color(cx.theme().muted_foreground).child(sub))
     }
 
-    /// One bar with usage (solid) and requests (outlined marker) against allocatable.
+    /// A tile for a number that could not be read.
+    fn unavailable(label: &str, cx: &App) -> Div {
+        Self::tile(label, "—".into(), "unavailable".into(), cx)
+    }
+
+    /// One bar with usage (solid) and requests (outlined marker) against allocatable. A
+    /// part that could not be read (None) is left off and said to be unavailable.
     fn capacity(
         label: &str,
         icon: Lucide,
-        (alloc, req, used): (f64, f64, f64),
+        (alloc, req, used): (f64, Option<f64>, Option<f64>),
         fmt: fn(f64) -> String,
         color: Hsla,
         cx: &App,
     ) -> Div {
         let t = cx.theme();
         let pct = |v: f64| if alloc > 0.0 { (v / alloc).clamp(0.0, 1.0) } else { 0.0 };
-        let req_color = if req > alloc * 0.9 { t.warning } else { t.foreground };
+        let req_color = if req.is_some_and(|r| r > alloc * 0.9) { t.warning } else { t.foreground };
+        let part = |word: &str, v: Option<f64>| match v {
+            Some(v) => format!("{word} {} ({:.0}%)", fmt(v), pct(v) * 100.0),
+            None => format!("{word} unavailable"),
+        };
         v_flex()
             .flex_1()
             .min_w(px(320.))
@@ -378,26 +422,37 @@ impl ClusterOverview {
                     .w_full()
                     .rounded_md()
                     .bg(t.secondary)
-                    .child(
-                        div().absolute().left_0().top_0().h_full().rounded_md().bg(color).w(relative(pct(used) as f32)),
-                    )
-                    .child(
-                        div()
-                            .absolute()
-                            .top(px(-3.))
-                            .h(px(20.))
-                            .w(px(2.))
-                            .bg(req_color)
-                            .left(relative(pct(req) as f32)),
-                    ),
+                    .when_some(used, |d, used| {
+                        d.child(
+                            div()
+                                .absolute()
+                                .left_0()
+                                .top_0()
+                                .h_full()
+                                .rounded_md()
+                                .bg(color)
+                                .w(relative(pct(used) as f32)),
+                        )
+                    })
+                    .when_some(req, |d, req| {
+                        d.child(
+                            div()
+                                .absolute()
+                                .top(px(-3.))
+                                .h(px(20.))
+                                .w(px(2.))
+                                .bg(req_color)
+                                .left(relative(pct(req) as f32)),
+                        )
+                    }),
             )
             .child(
                 h_flex()
                     .gap_4()
                     .text_xs()
                     .text_color(t.muted_foreground)
-                    .child(format!("Used {} ({:.0}%)", fmt(used), pct(used) * 100.0))
-                    .child(format!("Requested {} ({:.0}%)", fmt(req), pct(req) * 100.0))
+                    .child(part("Used", used))
+                    .child(part("Requested", req))
                     .child(format!("Allocatable {}", fmt(alloc))),
             )
     }
@@ -423,6 +478,9 @@ impl Render for ClusterOverview {
             }
             let versions = s.kubelet_versions.iter().map(|(v, n)| format!("{v} ×{n}")).collect::<Vec<_>>().join(", ");
             let max_mem = s.top_ns.iter().map(|t| t.2).fold(1.0, f64::max);
+            let bar = |(alloc, req, used): (f64, f64, f64)| {
+                (alloc, s.pods_known.then_some(req), s.usage_known.then_some(used))
+            };
             v_flex()
                 .gap_4()
                 .child(
@@ -430,58 +488,75 @@ impl Render for ClusterOverview {
                         .gap_2()
                         .items_baseline()
                         .child(div().text_lg().font_weight(FontWeight::SEMIBOLD).child(s.context.clone()))
-                        .child(
-                            div()
-                                .text_sm()
-                                .text_color(theme.muted_foreground)
-                                .child(format!("Kubernetes {}", s.version)),
-                        ),
+                        .when_some(s.version.as_ref(), |d, version| {
+                            d.child(
+                                div()
+                                    .text_sm()
+                                    .text_color(theme.muted_foreground)
+                                    .child(format!("Kubernetes {version}")),
+                            )
+                        }),
                 )
+                .children(s.errors.iter().map(|e| div().text_sm().text_color(theme.danger).child(e.clone())))
                 .child(
                     h_flex()
                         .flex_wrap()
                         .gap_3()
-                        .child(Self::tile(
-                            "Nodes",
-                            format!("{}/{}", s.nodes_ready, s.nodes),
-                            if s.nodes_ready == s.nodes {
-                                "all ready".into()
-                            } else {
-                                format!("{} not ready", s.nodes - s.nodes_ready)
-                            },
-                            cx,
-                        ))
-                        .child(Self::tile(
-                            "Pods",
-                            s.pods_running.to_string(),
-                            format!("running of {}", s.pods_total),
-                            cx,
-                        ))
-                        .child(Self::tile("Namespaces", s.namespaces.to_string(), String::new(), cx))
-                        .child(Self::tile("Kubelet", s.kubelet_versions.len().to_string(), versions, cx)),
+                        .child(if s.nodes_known {
+                            Self::tile(
+                                "Nodes",
+                                format!("{}/{}", s.nodes_ready, s.nodes),
+                                if s.nodes_ready == s.nodes {
+                                    "all ready".into()
+                                } else {
+                                    format!("{} not ready", s.nodes - s.nodes_ready)
+                                },
+                                cx,
+                            )
+                        } else {
+                            Self::unavailable("Nodes", cx)
+                        })
+                        .child(if s.pods_known {
+                            Self::tile("Pods", s.pods_running.to_string(), format!("running of {}", s.pods_total), cx)
+                        } else {
+                            Self::unavailable("Pods", cx)
+                        })
+                        .child(match s.namespaces {
+                            Some(n) => Self::tile("Namespaces", n.to_string(), String::new(), cx),
+                            None => Self::unavailable("Namespaces", cx),
+                        })
+                        .child(if s.nodes_known {
+                            Self::tile("Kubelet", s.kubelet_versions.len().to_string(), versions, cx)
+                        } else {
+                            Self::unavailable("Kubelet", cx)
+                        }),
                 )
-                .child(
-                    h_flex()
-                        .flex_wrap()
-                        .gap_6()
-                        .child(Self::capacity("CPU", Lucide::Cpu, s.cpu, k8s::format_cores, theme.blue, cx))
-                        .child(Self::capacity(
-                            "Memory",
-                            Lucide::MemoryStick,
-                            s.mem,
-                            k8s::format_bytes,
-                            theme.success,
-                            cx,
-                        )),
-                )
+                // Allocatable comes from the nodes: without them there is nothing to measure against.
+                .when(s.nodes_known, |d| {
+                    d.child(
+                        h_flex()
+                            .flex_wrap()
+                            .gap_6()
+                            .child(Self::capacity("CPU", Lucide::Cpu, bar(s.cpu), k8s::format_cores, theme.blue, cx))
+                            .child(Self::capacity(
+                                "Memory",
+                                Lucide::MemoryStick,
+                                bar(s.mem),
+                                k8s::format_bytes,
+                                theme.success,
+                                cx,
+                            )),
+                    )
+                })
                 .when_some(s.history.as_ref(), |d, (cpu, mem)| {
                     use crate::overview::{ChartSpec, usage_chart};
                     let minutes = s.chart_minutes;
+                    let (known_req, known_alloc) = (s.pods_known, s.nodes_known);
                     let spec = |title, req, lim, color, fmt, id| ChartSpec {
                         title,
-                        req: Some(req),
+                        req: known_req.then_some(req),
                         req_word: "requested",
-                        lim: Some(lim),
+                        lim: known_alloc.then_some(lim),
                         lim_word: "allocatable",
                         pin_lim: false,
                         color,
@@ -495,27 +570,30 @@ impl Render for ClusterOverview {
                     let ratio = |used: f64, req: f64| if req > 0.0 { used / req * 100.0 } else { 0.0 };
                     let (cpu_eff, mem_eff) = (ratio(avg(cpu), s.cpu.1), ratio(avg(mem), s.mem.1));
                     let tone = |p: f64| if p < 30.0 { theme.warning } else { theme.muted_foreground };
-                    d.child(
-                        h_flex()
-                            .gap_1()
-                            .text_sm()
-                            .text_color(theme.muted_foreground)
-                            .child("Over this range, workloads used on average")
-                            .child(
-                                div()
-                                    .text_color(tone(cpu_eff))
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .child(format!("{cpu_eff:.0}% of the CPU")),
-                            )
-                            .child("and")
-                            .child(
-                                div()
-                                    .text_color(tone(mem_eff))
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .child(format!("{mem_eff:.0}% of the memory")),
-                            )
-                            .child("they request."),
-                    )
+                    // Requests come from the pods: without them the share is unknown.
+                    d.when(known_req, |d| {
+                        d.child(
+                            h_flex()
+                                .gap_1()
+                                .text_sm()
+                                .text_color(theme.muted_foreground)
+                                .child("Over this range, workloads used on average")
+                                .child(
+                                    div()
+                                        .text_color(tone(cpu_eff))
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .child(format!("{cpu_eff:.0}% of the CPU")),
+                                )
+                                .child("and")
+                                .child(
+                                    div()
+                                        .text_color(tone(mem_eff))
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .child(format!("{mem_eff:.0}% of the memory")),
+                                )
+                                .child("they request."),
+                        )
+                    })
                     .child(
                         h_flex()
                             .gap_3()
@@ -603,12 +681,13 @@ impl Render for ClusterOverview {
                                 .gap_1()
                                 .child(div().text_base().child("Nodes with issues"))
                                 .when(s.node_issues.is_empty(), |d| {
-                                    d.child(
-                                        div()
-                                            .text_sm()
-                                            .text_color(theme.muted_foreground)
-                                            .child("None — every node is Ready and healthy."),
-                                    )
+                                    d.child(div().text_sm().text_color(theme.muted_foreground).child(
+                                        if s.nodes_known {
+                                            "None — every node is Ready and healthy."
+                                        } else {
+                                            "Unavailable."
+                                        },
+                                    ))
                                 })
                                 .children(s.node_issues.iter().enumerate().map(|(i, (node, issues))| {
                                     let node_name = node.clone();
@@ -639,6 +718,9 @@ impl Render for ClusterOverview {
                                 .flex_1()
                                 .gap_1()
                                 .child(div().text_base().child("Top namespaces by memory"))
+                                .when(s.top_ns.is_empty(), |d| {
+                                    d.child(div().text_sm().text_color(theme.muted_foreground).child("Unavailable."))
+                                })
                                 .children(s.top_ns.iter().map(|(ns, cpu, mem)| {
                                     h_flex()
                                         .gap_3()
