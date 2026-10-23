@@ -688,10 +688,13 @@ impl DetailPanel {
                     );
                     if this
                         .update(cx, |this, cx| {
-                            this.related.history = history;
-                            this.related.gpu = gpu;
-                            this.related.container_history = containers;
-                            cx.notify();
+                            // The range changed meanwhile: its own reload fills the charts.
+                            if this.history_minutes == minutes {
+                                this.related.history = history;
+                                this.related.gpu = gpu;
+                                this.related.container_history = containers;
+                                cx.notify();
+                            }
                         })
                         .is_err()
                     {
