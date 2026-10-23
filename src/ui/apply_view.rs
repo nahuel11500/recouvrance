@@ -411,7 +411,7 @@ impl ApplyView {
                 let passed = results.iter().all(|p| p.ok);
                 this.results = results;
                 this.mark(window, cx);
-                if passed {
+                if passed && crate::details::writes_still_on(window, cx) {
                     this.confirm_apply(docs, window, cx);
                 }
             });
@@ -467,6 +467,9 @@ impl ApplyView {
                 .on_ok(move |_, window, cx| {
                     if !crate::details::guard_ok(guard.as_ref(), cx) {
                         return false;
+                    }
+                    if !crate::details::writes_still_on(window, cx) {
+                        return true;
                     }
                     let docs = docs.clone();
                     let _ = me.update(cx, |this, cx| this.send(docs, false, window, cx));
