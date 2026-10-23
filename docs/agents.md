@@ -15,7 +15,9 @@ without the window; there nobody can approve, so a call an *Ask me* rule covers 
 with "needs approval in the Recouvrance window": run the app, or add an Allow rule). A list where
 some rows ask and others are allowed (some namespaces, or some names) is not refused: when it is not
 approved (or cannot be), it shows only the allowed rows, and a rejection is still logged. Approving
-it shows the rows of every Ask rule the list meets. In **Agents**, click **Connect Claude Code**: it registers the server in your
+it shows the rows of every Ask rule the list meets. Rules changed while a call waits for approval
+apply to it: it is checked again once approved, and `apply_manifest` checks each object again
+before applying it. In **Agents**, click **Connect Claude Code**: it registers the server in your
 Claude Code (`claude mcp add --scope user recouvrance …`). There is one agent, "Claude", with its rules;
 *Several agents…* gives other tools their own token and rules if you ever need that. Tokens are
 stored hashed (the assistant's copy is in a 0600 file).
@@ -34,21 +36,29 @@ Each agent has rules, like Kubernetes RBAC with an effect:
 | Names | `web-*`, `*` |
 
 **Deny wins, then Ask me, then Allow; anything no rule matches is denied.** A Deny limited to some
-names hides those objects from lists rather than refusing the whole list. Presets get you
+names hides those objects from lists rather than refusing the whole list. Patching, applying or
+deleting a Namespace also meets the Deny and Ask rules of that namespace. Presets get you
 started, rules can expire (e.g. "Allow for 1h" on an approval), a per-agent rate limit caps calls
 per minute, *Test access* shows the verdict for any request and which rule decided, and approval
 banners show the request with its key arguments (command, the whole patch, replicas, action, dry
 run) and offer **Always allow this** to add a narrow rule; it wins over the Ask rule that asked, so
-the same request is not asked again (until you edit the rule). For `apply_manifest` the banner lists
+the same request is not asked again (until you edit the rule). The rule editor marks such rules
+"approved", and rules pasted with *Paste rules* never count as approved. For `apply_manifest` the banner lists
 every object (kind, namespace/name) and the YAML that will be applied, a Secret's values masked; the
 activity log keeps each object with a hash of that YAML, and the objects already applied when a call
 is cut off.
 The *Always allow this* and *Allow for 1h* offers are left out where no rule can be that narrow:
-exec (a rule cannot pin the command), GitOps actions, `apply_manifest` (a rule cannot pin the
-content), writes with no object name, and dry runs (the rule would allow the real write too).
+exec (a rule cannot pin the command), patches and GitOps actions (nor the patch), scale (nor the
+replica count), `apply_manifest` (nor the content), requests other than lists with no object name
+(e.g. `check_certificates`: the rule would cover every name), requests across all namespaces (the
+rule would also cover namespaces no rule allows), and dry runs (the rule would allow the real write
+too).
 
 Before any rule is checked, a call's context must be named by one of the agent's Allow or Ask rules
-(other contexts are never contacted), and the names it passes are validated: a namespace or
+and not covered by a Deny of everything (`*` verbs, resources, namespaces and names): other contexts
+are never contacted, nor listed to the agent. Calls follow the kubeconfig as it is now: a context
+removed from it is refused, and one pointed at another cluster or user is connected again. The names
+a call passes are validated: a namespace or
 container must be a DNS label, an object name may hold only letters, digits and `- . _ : @ +` (no
 `/`, `?`, `%`, `..` or spaces). An invalid name fails the call with a message saying why. What the
 API server returns must be the object asked for, and a Secret's values are masked whatever kind

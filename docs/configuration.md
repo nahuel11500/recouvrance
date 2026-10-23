@@ -128,6 +128,10 @@ While the file exists, an agent it doesn't name has no rules, so everything it a
 removing an agent's section takes its access away. Deleting an agent on the Agents page removes its
 section too.
 
+Each section is for the agent with that name, so agent names are unique: creating a second agent
+with a taken name is refused, and if two agents already share a name the file is neither loaded nor
+written until you delete one and save the file again.
+
 ## plugins.yaml
 
 ```yaml

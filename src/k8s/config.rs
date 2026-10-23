@@ -9,6 +9,8 @@ pub struct Contexts {
     pub current: Option<String>,
     /// Contexts whose name or user suggests production or admin rights.
     pub risky: Vec<String>,
+    /// What each context points to (see `fingerprint`), to notice it changed.
+    pub fingerprints: HashMap<String, u64>,
 }
 
 /// Every kubeconfig file in use: KUBECONFIG (or ~/.kube/config), the extra files
@@ -236,7 +238,21 @@ fn read_contexts() -> Result<Contexts> {
     let mut names: Vec<String> = kc.contexts.iter().map(|c| c.name.clone()).collect();
     names.sort();
     let risky = risky_contexts(&kc);
-    Ok(Contexts { names, current: kc.current_context, risky })
+    let fingerprints = kc.contexts.iter().filter_map(|c| Some((c.name.clone(), fingerprint(&kc, &c.name)?))).collect();
+    Ok(Contexts { names, current: kc.current_context, risky, fingerprints })
+}
+
+/// A hash of the context's entry with its cluster's and its user's: the same while the
+/// context reaches the same server as the same user. None when it can't be computed.
+pub(super) fn fingerprint(kc: &Kubeconfig, context: &str) -> Option<u64> {
+    use std::hash::{Hash as _, Hasher as _};
+    let ctx = kc.contexts.iter().find(|c| c.name == context)?.context.as_ref();
+    let cluster = ctx.and_then(|c| kc.clusters.iter().find(|k| k.name == c.cluster));
+    let user = ctx.and_then(|c| c.user.as_deref()).and_then(|u| kc.auth_infos.iter().find(|a| a.name == u));
+    let text = serde_json::to_string(&(ctx, cluster, user)).ok()?;
+    let mut hasher = std::hash::DefaultHasher::new();
+    text.hash(&mut hasher);
+    Some(hasher.finish())
 }
 
 /// Contexts that look like production or admin rights, from the context's name, its
@@ -672,5 +688,32 @@ users:
         assert_eq!(exec_command(&kc, "oidc").as_deref(), Some("kubelogin get-token --x=1"));
         assert_eq!(exec_command(&kc, "token"), None);
         assert_eq!(exec_command(&kc, "missing"), None);
+    }
+
+    #[test]
+    fn fingerprint_follows_what_a_context_points_to() {
+        let kc = |server: &str, token: &str| {
+            Kubeconfig::from_yaml(&format!(
+                "
+clusters:
+- {{name: a, cluster: {{server: '{server}'}}}}
+- {{name: b, cluster: {{server: 'https://b'}}}}
+contexts:
+- {{name: staging, context: {{cluster: a, user: me}}}}
+- {{name: other, context: {{cluster: b, user: me}}}}
+users:
+- {{name: me, user: {{token: {token}}}}}
+"
+            ))
+            .unwrap()
+        };
+        let fp = |kc: &Kubeconfig, ctx: &str| super::fingerprint(kc, ctx);
+        let base = kc("https://a", "t1");
+        assert!(fp(&base, "staging").is_some());
+        assert_eq!(fp(&base, "staging"), fp(&kc("https://a", "t1"), "staging"));
+        assert_ne!(fp(&base, "staging"), fp(&base, "other"));
+        assert_ne!(fp(&base, "staging"), fp(&kc("https://b", "t1"), "staging"));
+        assert_ne!(fp(&base, "staging"), fp(&kc("https://a", "t2"), "staging"));
+        assert_eq!(fp(&base, "missing"), None);
     }
 }

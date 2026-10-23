@@ -102,6 +102,16 @@ pub fn ensure_writes(window: &mut Window, cx: &mut App) -> bool {
     false
 }
 
+/// Write mode is still on. Checked again after a dry run or a lookup, and when a write is
+/// confirmed: it may have been turned off since the write was asked for. Says so when off.
+pub fn writes_still_on(window: &mut Window, cx: &mut App) -> bool {
+    if writes_enabled(cx) {
+        return true;
+    }
+    window.push_notification(Notification::error("Write mode is off: nothing was changed."), cx);
+    false
+}
+
 /// Ask the app to open another object (links in the overview).
 #[derive(Clone)]
 pub struct OpenObject {

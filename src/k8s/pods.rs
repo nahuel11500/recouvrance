@@ -38,6 +38,9 @@ const MAX_LINE_BYTES: usize = 64 << 10;
 const CUT_MARK: &str = " …[line cut]";
 
 pub struct EventLine {
+    /// The Event object's own namespace and name.
+    pub namespace: Option<String>,
+    pub name: String,
     pub age: String,
     pub kind: String,
     pub reason: String,
@@ -59,6 +62,8 @@ pub async fn events_for(client: Client, obj: ObjectRef) -> Result<Vec<EventLine>
         Ok(items
             .iter()
             .map(|e| EventLine {
+                namespace: e.metadata.namespace.clone(),
+                name: e.metadata.name.clone().unwrap_or_default(),
                 age: event_last(e).map(age).unwrap_or_default(),
                 kind: e.type_.clone().unwrap_or_default(),
                 reason: e.reason.clone().unwrap_or_default(),

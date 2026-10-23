@@ -446,7 +446,7 @@ impl AppView {
         }
 
         let context = match self.clusters.len() {
-            0 if self._connect.is_some() && self.status.is_none() => {
+            0 if self.connecting => {
                 format!("Connecting to {}…", self.context.clone().unwrap_or_default())
             }
             0 => "Not connected".into(),
