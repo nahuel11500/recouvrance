@@ -117,6 +117,35 @@ fn pointer(path: &[String]) -> String {
     path.iter().map(|p| format!("/{}", p.replace('~', "~0").replace('/', "~1"))).collect()
 }
 
+/// The object at `path` in `doc`, made where it is missing or null. None when something
+/// on the way is not an object.
+fn object_at<'a>(doc: &'a mut Value, path: &[String]) -> Option<&'a mut serde_json::Map<String, Value>> {
+    if !doc.is_object() {
+        *doc = Value::Object(Default::default());
+    }
+    let mut v = doc;
+    for seg in path {
+        let child = v.as_object_mut()?.entry(seg.clone()).or_insert(Value::Null);
+        if child.is_null() {
+            *child = Value::Object(Default::default());
+        }
+        v = child;
+    }
+    v.as_object_mut()
+}
+
+/// Add an empty item to the list `name` of the object at `path`; its index.
+fn add_list_item(doc: &mut Value, path: &[String], name: &str) -> Result<usize, String> {
+    let obj = object_at(doc, path).ok_or("This part of the document is not an object.")?;
+    let list = obj.entry(name.to_string()).or_insert(Value::Null);
+    if list.is_null() {
+        *list = Value::Array(Vec::new());
+    }
+    let Value::Array(items) = list else { return Err(format!("{name} is not a list in the YAML.")) };
+    items.push(Value::Object(Default::default()));
+    Ok(items.len() - 1)
+}
+
 fn scalar_text(v: Option<&Value>) -> String {
     match v {
         None | Some(Value::Null) => String::new(),
@@ -342,22 +371,7 @@ impl SchemaForm {
             return;
         }
         let mut doc = self.doc.clone();
-        // Make sure the objects on the path exist.
-        if !doc.is_object() {
-            doc = Value::Object(Default::default());
-        }
-        for i in 0..self.path.len() {
-            let parent = pointer(&self.path[..i]);
-            let seg = &self.path[i];
-            let Some(p) = doc.pointer_mut(&parent) else { break };
-            if let Some(o) = p.as_object_mut() {
-                let child = o.entry(seg.clone()).or_insert_with(|| Value::Object(Default::default()));
-                if child.is_null() {
-                    *child = Value::Object(Default::default());
-                }
-            }
-        }
-        let Some(obj) = doc.pointer_mut(&pointer(&self.path)).and_then(Value::as_object_mut) else {
+        let Some(obj) = object_at(&mut doc, &self.path) else {
             self.status = Some((false, "This part of the document is not an object.".into()));
             cx.notify();
             return;
@@ -388,18 +402,16 @@ impl SchemaForm {
         if !self.refresh_doc(cx) {
             return;
         }
-        let ptr = pointer(&self.path);
-        if self.doc.pointer(&ptr).is_none_or(|v| !v.is_object()) {
-            return;
-        }
-        let list = self
-            .doc
-            .pointer_mut(&ptr)
-            .and_then(Value::as_object_mut)
-            .map(|o| o.entry(name.clone()).or_insert_with(|| Value::Array(Vec::new())));
-        let Some(Value::Array(items)) = list else { return };
-        items.push(Value::Object(Default::default()));
-        let ix = items.len() - 1;
+        let mut doc = self.doc.clone();
+        let ix = match add_list_item(&mut doc, &self.path, &name) {
+            Ok(ix) => ix,
+            Err(e) => {
+                self.status = Some((false, e));
+                cx.notify();
+                return;
+            }
+        };
+        self.doc = doc;
         self.replace_doc(window, cx);
         let mut path = self.path.clone();
         path.extend([name, ix.to_string()]);
@@ -624,6 +636,25 @@ mod tests {
         assert!(find_doc("apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: c\n", &doc).is_err());
         let twice = format!("{text}---\napiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: b\n");
         assert!(find_doc(&twice, &doc).is_err());
+    }
+
+    #[test]
+    fn adds_to_missing_or_empty_lists() {
+        use super::add_list_item;
+        let path = |p: &[&str]| p.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        // `env:` and `containers: ~` are null lists.
+        let mut doc = serde_json::json!({"spec": {"containers": null, "env": [{"name": "a"}]}});
+        assert_eq!(add_list_item(&mut doc, &path(&["spec"]), "containers"), Ok(0));
+        assert_eq!(doc["spec"]["containers"], serde_json::json!([{}]));
+        assert_eq!(add_list_item(&mut doc, &path(&["spec"]), "env"), Ok(1));
+        // The objects on the path are made when missing or null.
+        let mut doc = serde_json::json!({"spec": null});
+        assert_eq!(add_list_item(&mut doc, &path(&["spec", "template", "spec"]), "volumes"), Ok(0));
+        assert_eq!(doc["spec"]["template"]["spec"]["volumes"], serde_json::json!([{}]));
+        // Not a list, or not an object on the way: said, not ignored.
+        let mut doc = serde_json::json!({"spec": {"ports": "80", "x": 1}});
+        assert!(add_list_item(&mut doc, &path(&["spec"]), "ports").is_err());
+        assert!(add_list_item(&mut doc, &path(&["spec", "x"]), "ports").is_err());
     }
 
     #[test]
