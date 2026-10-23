@@ -43,7 +43,8 @@ per minute, *Test access* shows the verdict for any request and which rule decid
 banners show the request with its key arguments (command, the whole patch, replicas, action, dry
 run) and offer **Always allow this** to add a narrow rule; it wins over the Ask rule that asked, so
 the same request is not asked again (until you edit the rule). The rule editor marks such rules
-"approved", and rules pasted with *Paste rules* never count as approved. For `apply_manifest` the banner lists
+"approved", and rules pasted with *Paste rules* never count as approved. In a pasted rule, a missing
+effect means Deny, and a missing list means `*` in a Deny or Ask, none in an Allow. For `apply_manifest` the banner lists
 every object (kind, namespace/name) and the YAML that will be applied, a Secret's values masked; the
 activity log keeps each object with a hash of that YAML, and the objects already applied when a call
 is cut off.

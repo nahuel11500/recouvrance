@@ -83,12 +83,11 @@ pub fn is_write(verb: &str) -> bool {
 }
 
 /// One access rule, like a Kubernetes RBAC rule with an effect.
-/// Every field is a list of `*` patterns; an empty list matches nothing.
+/// Every field is a list of `*` patterns; an empty list matches nothing. A field missing
+/// when read never grants (see `RuleFields`).
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
-#[serde(default)]
+#[serde(from = "RuleFields")]
 pub struct Rule {
-    /// A rule written without one (by hand, pasted) denies: a missing field never grants.
-    #[serde(default = "deny")]
     pub effect: Mode,
     pub verbs: Vec<String>,
     /// kubectl names: `pods`, `deployments`, `certificates.cert-manager.io`, `*`.
@@ -125,6 +124,47 @@ impl Default for Rule {
 
 fn deny() -> Mode {
     Mode::Deny
+}
+
+/// A rule as read (agents.json, pasted rules), where any field may be missing.
+#[derive(Deserialize)]
+struct RuleFields {
+    /// A rule written without one (by hand, pasted) denies.
+    #[serde(default = "deny")]
+    effect: Mode,
+    verbs: Option<Vec<String>>,
+    resources: Option<Vec<String>>,
+    namespaces: Option<Vec<String>>,
+    contexts: Option<Vec<String>>,
+    names: Option<Vec<String>>,
+    #[serde(default)]
+    note: String,
+    #[serde(default)]
+    expires: Option<jiff::Timestamp>,
+    #[serde(default)]
+    approved: bool,
+}
+
+impl From<RuleFields> for Rule {
+    /// A missing list matches nothing in an Allow, and everything in a Deny or an Ask, so a
+    /// rule missing a field never grants more than it says.
+    fn from(f: RuleFields) -> Self {
+        let effect = f.effect;
+        let list = |v: Option<Vec<String>>| {
+            v.unwrap_or_else(|| if effect == Mode::Allow { Vec::new() } else { vec!["*".into()] })
+        };
+        Self {
+            effect,
+            verbs: list(f.verbs),
+            resources: list(f.resources),
+            namespaces: list(f.namespaces),
+            contexts: list(f.contexts),
+            names: list(f.names),
+            note: f.note,
+            expires: f.expires,
+            approved: f.approved,
+        }
+    }
 }
 
 /// What an agent is trying to do.
@@ -1868,5 +1908,35 @@ mod fail_closed {
     fn a_rule_without_an_effect_denies() {
         let r: Rule = serde_json::from_str(r#"{"verbs": ["*"], "resources": ["secrets"], "contexts": ["*"]}"#).unwrap();
         assert_eq!(r.effect, Mode::Deny);
+    }
+
+    #[test]
+    fn a_missing_list_never_grants() {
+        // A Deny without contexts or verbs denies them all.
+        let r: Rule = serde_json::from_str(r#"{"effect": "deny", "resources": ["secrets"]}"#).unwrap();
+        for list in [&r.verbs, &r.namespaces, &r.contexts, &r.names] {
+            assert_eq!(list, &["*"]);
+        }
+        let all = Rule { verbs: vec!["*".into()], contexts: vec!["*".into()], ..Rule::default() };
+        let p = super::Policy { rules: vec![all, r], ..super::Policy::default() };
+        let a = super::Access {
+            context: "prod".into(),
+            verb: "delete".into(),
+            resource: "secrets".into(),
+            namespace: Some("app".into()),
+            name: Some("db".into()),
+            ..super::Access::default()
+        };
+        assert_eq!(p.decide(&a).mode, Mode::Deny);
+        // An Ask too.
+        let r: Rule = serde_json::from_str(r#"{"effect": "ask", "verbs": ["delete"]}"#).unwrap();
+        assert_eq!(r.resources, ["*"]);
+        // An Allow without contexts or names allows none.
+        let r: Rule = serde_json::from_str(r#"{"effect": "allow", "verbs": ["get"], "resources": ["pods"]}"#).unwrap();
+        assert!(r.contexts.is_empty() && r.names.is_empty() && r.namespaces.is_empty());
+        // A full rule reads back as written.
+        let full = Rule { contexts: vec!["eu".into()], ..Rule::default() };
+        let back: Rule = serde_json::from_str(&serde_json::to_string(&full).unwrap()).unwrap();
+        assert_eq!(back, full);
     }
 }
