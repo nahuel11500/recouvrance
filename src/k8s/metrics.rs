@@ -336,32 +336,38 @@ pub fn pods_allocated(pods: &[serde_json::Value], resource: &str) -> (f64, f64) 
         }
         let containers = p.pointer("/spec/containers").and_then(|c| c.as_array()).map(Vec::as_slice).unwrap_or(&[]);
         let inits = p.pointer("/spec/initContainers").and_then(|c| c.as_array()).map(Vec::as_slice).unwrap_or(&[]);
-        // Sidecars (init containers that keep running) add to the sum; a regular init
-        // container runs alongside the sidecars started before it.
         let sidecar = |c: &serde_json::Value| c["restartPolicy"].as_str() == Some("Always");
-        let sum = |which: &str| {
-            containers.iter().chain(inits.iter().filter(|c| sidecar(c))).map(|c| get(c, which)).sum::<f64>()
-        };
-        let init = |which: &str| {
-            let (mut before, mut peak) = (0.0, 0.0f64);
-            for c in inits {
-                if sidecar(c) {
-                    before += get(c, which);
-                } else {
-                    peak = peak.max(before + get(c, which));
-                }
-            }
-            peak
+        let pod = |which: &str| {
+            pod_amount(
+                containers.iter().map(|c| get(c, which)).sum(),
+                inits.iter().map(|c| (sidecar(c), get(c, which))),
+            )
         };
         let overhead = p
             .pointer(&format!("/spec/overhead/{}", resource.replace('/', "~1")))
             .and_then(|v| v.as_str())
             .map(parse)
             .unwrap_or(0.0);
-        req += sum("requests").max(init("requests")) + overhead;
-        lim += sum("limits").max(init("limits")) + overhead;
+        req += pod("requests") + overhead;
+        lim += pod("limits") + overhead;
     }
     (req, lim)
+}
+
+/// One pod's request or limit as the scheduler counts it, from its containers' sum and its
+/// init containers in order as (is a sidecar, amount): sidecars (init containers that keep
+/// running) add to the sum, and a regular init container runs alongside the sidecars
+/// started before it. Overhead is not included.
+pub fn pod_amount(containers: f64, inits: impl IntoIterator<Item = (bool, f64)>) -> f64 {
+    let (mut sidecars, mut peak) = (0.0, 0.0f64);
+    for (sidecar, amount) in inits {
+        if sidecar {
+            sidecars += amount;
+        } else {
+            peak = peak.max(sidecars + amount);
+        }
+    }
+    (containers + sidecars).max(peak)
 }
 
 #[cfg(test)]
@@ -418,5 +424,16 @@ mod resources_tests {
         // A container without a memory limit: the pod has none.
         assert_eq!(r.mem, (Some(256.0 * 1024.0 * 1024.0), None));
         assert_eq!(pod_resources(&[container(&[], &[])]), PodResources::default());
+    }
+
+    #[test]
+    fn pod_amount_counts_like_the_scheduler() {
+        assert_eq!(pod_amount(500.0, []), 500.0);
+        // Sidecars run with the containers.
+        assert_eq!(pod_amount(500.0, [(true, 100.0)]), 600.0);
+        // An init container runs alone, or next to the sidecars started before it.
+        assert_eq!(pod_amount(500.0, [(false, 2000.0)]), 2000.0);
+        assert_eq!(pod_amount(500.0, [(true, 100.0), (false, 2000.0)]), 2100.0);
+        assert_eq!(pod_amount(500.0, [(false, 2000.0), (true, 100.0)]), 2000.0);
     }
 }

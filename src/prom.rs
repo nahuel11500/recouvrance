@@ -225,6 +225,22 @@ fn form_urlencoded(pairs: &[(&str, &str)]) -> String {
 /// Pods a workload's usage charts cover at most: each name goes in the query URL.
 pub const MAX_CHART_PODS: usize = 300;
 
+/// A pod that has finished: Succeeded, or Failed (evicted pods are). It uses nothing now.
+pub fn finished(pod: &serde_json::Value) -> bool {
+    matches!(pod.pointer("/status/phase").and_then(|v| v.as_str()), Some("Succeeded" | "Failed"))
+}
+
+/// The pods a workload's charts measure, and of how many: those not finished, so a Job's
+/// past runs don't add to its request line. When all have finished (a completed Job), all of
+/// them, so its history still shows.
+pub fn chart_pods(pods: &[serde_json::Value]) -> (Vec<&serde_json::Value>, usize) {
+    let live: Vec<&serde_json::Value> = pods.iter().filter(|p| !finished(p)).collect();
+    let mut chosen = if live.is_empty() { pods.iter().collect() } else { live };
+    let total = chosen.len();
+    chosen.truncate(MAX_CHART_PODS);
+    (chosen, total)
+}
+
 /// A regex matching exactly these pod names, escaped for a PromQL string (`pod=~"…"`).
 pub fn pods_regex(pods: &[String]) -> String {
     pods.iter().map(|p| regex::escape(p).replace('\\', "\\\\")).collect::<Vec<_>>().join("|")
@@ -415,5 +431,24 @@ mod tests {
     fn encodes_queries() {
         assert_eq!(super::form_urlencoded(&[("query", r#"sum(x{a="b"})"#)]), "query=sum%28x%7Ba%3D%22b%22%7D%29");
         assert_eq!(super::pods_regex(&["a.b".into(), "c".into()]), r"a\\.b|c");
+    }
+
+    #[test]
+    fn charts_leave_out_finished_pods() {
+        let pod = |name: &str, phase: &str| serde_json::json!({"metadata": {"name": name}, "status": {"phase": phase}});
+        let names = |pods: &[&serde_json::Value]| -> Vec<String> {
+            pods.iter().map(|p| p["metadata"]["name"].as_str().unwrap_or_default().to_string()).collect()
+        };
+        // A Job on its third run: the two finished runs (one evicted) are not charted.
+        let pods = [pod("a", "Succeeded"), pod("b", "Failed"), pod("c", "Running"), pod("d", "Pending")];
+        let (charted, total) = super::chart_pods(&pods);
+        assert_eq!((names(&charted), total), (vec!["c".to_string(), "d".to_string()], 2));
+        // All finished: their history still shows.
+        let (charted, total) = super::chart_pods(&pods[..2]);
+        assert_eq!((charted.len(), total), (2, 2));
+        // Capped at what fits in the query.
+        let many: Vec<_> = (0..super::MAX_CHART_PODS + 5).map(|i| pod(&format!("p{i}"), "Running")).collect();
+        let (charted, total) = super::chart_pods(&many);
+        assert_eq!((charted.len(), total), (super::MAX_CHART_PODS, super::MAX_CHART_PODS + 5));
     }
 }

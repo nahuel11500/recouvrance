@@ -258,8 +258,14 @@ impl AppView {
             return;
         }
         let list = cx.new(|cx| HelmList::new(self.clusters.clone(), self.namespace.clone(), window, cx));
+        self.subscribe_helm(&list, window, cx);
+        self.navigate(Route::Helm(list), cx);
+    }
+
+    /// Open a release or the install page from the release list (also after F5).
+    pub(super) fn subscribe_helm(&mut self, list: &Entity<HelmList>, window: &mut Window, cx: &mut Context<Self>) {
         // Released with the page.
-        cx.subscribe_in(&list, window, |this, _, ev: &OpenRelease, window, cx| {
+        cx.subscribe_in(list, window, |this, _, ev: &OpenRelease, window, cx| {
             let release = ev.0.clone();
             let Some((context, client)) = this.clusters.iter().find(|(c, _)| *c == release.context).cloned() else {
                 return;
@@ -268,10 +274,9 @@ impl AppView {
             this.navigate(Route::HelmRelease(page), cx);
         })
         .detach();
-        cx.subscribe_in(&list, window, |this, _, _: &crate::ui::helm::OpenInstall, window, cx| {
+        cx.subscribe_in(list, window, |this, _, _: &crate::ui::helm::OpenInstall, window, cx| {
             this.open_helm_install(window, cx)
         })
         .detach();
-        self.navigate(Route::Helm(list), cx);
     }
 }

@@ -592,7 +592,7 @@ impl DetailPanel {
                 let Ok(Some(obj)) = this.update(cx, |this, _| this.object.clone().filter(|_| !this.deleted)) else {
                     break;
                 };
-                let related = fetch_related(client.clone(), &kind, ns.clone(), &obj).await;
+                let related = fetch_related(client.clone(), &context, &kind, ns.clone(), &obj).await;
                 let indexed = obj.clone();
                 let mut related = exec
                     .spawn(async move {
