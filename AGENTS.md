@@ -77,9 +77,14 @@ copy; if one doesn't fit, extend it.
 - View behaviour over time (late results, reloads) can be tested with `#[gpui_kit::test]` and
   a `TestAppContext` (see `src/latest.rs`). Those tests need the `dev` feature:
   `#[cfg(all(test, feature = "dev"))]`.
-- Rules that must hold for every input get a `proptest!`. The agent rule engine has them
-  (`mcp::properties`), and so does the kubeconfig merge's context names
-  (`k8s::config::name_properties`). Extend them when you change those.
+- Rules that must hold for every input get a `proptest!`. The subsystems that broke again and
+  again have them; extend them when you change those, and add a case before fixing a bug there:
+  - the agent rule engine (`mcp::properties`) and rules.yaml (`mcp::rules_file::properties`:
+    round trips, unknown keys, missing sections, edits on disk during an edit in the app);
+  - the kubeconfig merge (`k8s::config::name_properties`, `merge_properties`: files reordered,
+    shrinking, empty, corrupt or deleted between reads);
+  - settings.json loading (`settings::properties`: bad values, bad protection entries, a broken
+    file).
 
 ## Bugs that keep coming back
 

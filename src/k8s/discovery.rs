@@ -350,7 +350,7 @@ pub(super) fn listable(caps: &ApiCapabilities) -> bool {
     caps.supports_operation(verbs::LIST) && caps.supports_operation(verbs::WATCH)
 }
 
-pub(super) fn is_builtin_group(group: &str) -> bool {
+pub(crate) fn is_builtin_group(group: &str) -> bool {
     !group.contains('.') || group.ends_with(".k8s.io")
 }
 

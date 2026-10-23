@@ -23,7 +23,7 @@
 //! and edits on the Agents page are written back to it (its comments are not kept).
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -34,13 +34,16 @@ pub fn path() -> PathBuf {
     super::config_dir().join("rules.yaml")
 }
 
+// Unknown keys are refused: a misspelt `deny:` would otherwise drop its rules in silence.
 #[derive(Serialize, Deserialize, Default, Debug)]
+#[serde(deny_unknown_fields)]
 pub struct RulesFile {
     #[serde(default)]
     pub agents: BTreeMap<String, AgentRules>,
 }
 
 #[derive(Serialize, Deserialize, Default, Debug, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct AgentRules {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allow: Vec<String>,
@@ -56,6 +59,7 @@ pub struct AgentRules {
 }
 
 #[derive(Serialize, Deserialize, Default, Debug, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct Limits {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub calls_per_minute: Option<u32>,
@@ -176,7 +180,10 @@ pub fn format_rule(r: &Rule) -> String {
 fn format_exact(r: &Rule) -> Result<String> {
     let text = format_rule(r);
     let back = parse_rule(r.effect, &text).with_context(|| format!("rule `{text}`"))?;
-    let same = |a: &[String], b: &[String]| (star(a) && star(b)) || patterns(a) == patterns(b);
+    // A blank pattern is not written (it never matches a name, but makes a list non-empty).
+    let same = |a: &[String], b: &[String]| {
+        (star(a) && star(b)) || (a.iter().all(|x| !x.trim().is_empty()) && patterns(a) == patterns(b))
+    };
     let exact = same(&r.verbs, &back.verbs)
         && same(&r.resources, &back.resources)
         && same(&r.namespaces, &back.namespaces)
@@ -184,7 +191,9 @@ fn format_exact(r: &Rule) -> Result<String> {
         && same(&r.names, &back.names)
         && r.expires == back.expires;
     if !exact {
-        bail!("rule `{text}` cannot be written exactly in rules.yaml (a pattern has a space, comma or slash)");
+        bail!(
+            "rule `{text}` cannot be written exactly in rules.yaml (a pattern is blank or has a space, comma or slash)"
+        );
     }
     Ok(text)
 }
@@ -272,18 +281,21 @@ pub fn apply_file(file: &RulesFile, agents: &mut Vec<super::Agent>) -> Result<()
     Ok(())
 }
 
-/// Read and validate the file; None when it does not exist.
-pub fn load() -> Result<Option<RulesFile>> {
-    let text = match std::fs::read_to_string(path()) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        r => r?,
-    };
-    let file: RulesFile = crate::yaml::from_str(&text).context("rules.yaml")?;
-    // Validate every rule before anything is applied.
+/// The file's text; None when it does not exist.
+pub fn read(path: &Path) -> Result<Option<String>> {
+    match std::fs::read_to_string(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        r => Ok(Some(r.with_context(|| format!("reading {}", path.display()))?)),
+    }
+}
+
+/// Parse and validate the file's text: every rule is checked before anything is applied.
+pub fn check(text: &str) -> Result<RulesFile> {
+    let file: RulesFile = crate::yaml::from_str(text).context("rules.yaml")?;
     for (name, rules) in &file.agents {
         apply(rules, &mut Policy::default()).with_context(|| format!("agent `{name}`"))?;
     }
-    Ok(Some(file))
+    Ok(file)
 }
 
 pub const HEADER: &str = "# Recouvrance agent rules. Deny wins, then ask, then allow; anything no rule matches is denied.\n\
@@ -312,10 +324,16 @@ pub fn render(agents: &[super::Agent]) -> Result<String> {
     Ok(format!("{HEADER}\n{}", crate::yaml::to_string(&RulesFile { agents })?))
 }
 
-/// Write the file from the current agents (starting point for rules as code).
-pub fn export(agents: &[super::Agent]) -> Result<PathBuf> {
-    super::write_private(&path(), render(agents)?.as_bytes())?;
-    Ok(path())
+/// Write the file at `path` for these agents, over `seen`: the text last loaded or written.
+/// Refused when the file changed since (an edit of yours not loaded yet would be lost; it
+/// is loaded next). Returns the text written.
+pub fn export_over(path: &Path, agents: &[super::Agent], seen: Option<&str>) -> Result<String> {
+    if read(path)?.as_deref() != seen {
+        bail!("rules.yaml changed on disk since it was loaded: it is being reloaded, make this change again");
+    }
+    let text = render(agents)?;
+    super::write_private(path, text.as_bytes())?;
+    Ok(text)
 }
 
 #[cfg(test)]
@@ -468,5 +486,141 @@ mod tests {
             cluster_scoped: false,
         };
         assert_eq!(p.decide(&a).mode, Mode::Deny);
+    }
+}
+
+/// rules.yaml over many generated agents, rules and edits: the file must never decide a
+/// request differently from the rules it was written from, and a section it can't read
+/// exactly must fail to load rather than lose rules (agent rule loading broke in three
+/// audit rounds).
+#[cfg(test)]
+mod properties {
+    use super::super::properties::{access, policy, rule};
+    use super::super::{Access, Agent};
+    use super::*;
+    use proptest::prelude::*;
+
+    fn agent(name: &str, policy: Policy) -> Agent {
+        Agent { id: format!("id-{name}"), name: name.into(), token_sha256: String::new(), enabled: true, policy }
+    }
+
+    /// Agent names as people type them, YAML's special words and characters included.
+    fn name() -> impl Strategy<Value = String> {
+        prop_oneof![
+            "[ -~]{1,12}",
+            Just("yes".to_string()),
+            Just("null".to_string()),
+            Just("~".to_string()),
+            Just("- x".to_string()),
+            Just("a: b".to_string()),
+            Just("#ci".to_string()),
+            Just("1e3".to_string()),
+        ]
+    }
+
+    fn same_decisions(a: &Policy, b: &Policy, requests: &[Access]) -> Result<(), TestCaseError> {
+        for r in requests {
+            prop_assert_eq!(a.decide(r).mode, b.decide(r).mode, "{:?}", r);
+            prop_assert_eq!(a.decide_any_namespace(r).mode, b.decide_any_namespace(r).mode, "{:?}", r);
+        }
+        Ok(())
+    }
+
+    proptest! {
+        /// Agents written to rules.yaml and loaded back decide every request the same, with
+        /// the same limits, whatever their names.
+        #[test]
+        fn the_file_round_trips(
+            agents in prop::collection::btree_map(name(), policy(), 1..4),
+            limits in (0..1000u32, 0..1000u32, 0..1000u32, 0..1000u32),
+            requests in prop::collection::vec(access(), 1..16),
+        ) {
+            let agents: Vec<Agent> = agents
+                .into_iter()
+                .map(|(n, p)| {
+                    let (calls, lines, rows, exec) = limits;
+                    agent(&n, Policy { max_calls_per_minute: calls, max_log_lines: lines, max_rows: rows, exec_timeout: exec, ..p })
+                })
+                .collect();
+            let text = render(&agents).unwrap();
+            let file = check(&text).map_err(|e| TestCaseError::fail(format!("{e:#}\n{text}")))?;
+            let mut back: Vec<Agent> = agents.iter().map(|a| agent(&a.name, Policy::default())).collect();
+            apply_file(&file, &mut back).unwrap();
+            prop_assert_eq!(back.len(), agents.len(), "{}", text);
+            for (a, b) in agents.iter().zip(&back) {
+                same_decisions(&a.policy, &b.policy, &requests)?;
+                let l = |p: &Policy| (p.max_calls_per_minute, p.max_log_lines, p.max_rows, p.exec_timeout);
+                prop_assert_eq!(l(&a.policy), l(&b.policy));
+            }
+        }
+
+        /// A rule is written only when it reads back as the same rule: blank patterns and
+        /// ones with spaces, commas, slashes or a lone `-` are refused, never widened or narrowed.
+        #[test]
+        fn a_written_rule_never_changes_meaning(
+            r in rule(),
+            odd in prop::collection::vec("[a* ,/-]{0,4}", 0..3),
+            field in 0..4usize,
+            requests in prop::collection::vec(access(), 1..16),
+        ) {
+            let mut r = r;
+            match field {
+                0 => r.resources = odd,
+                1 => r.namespaces = odd,
+                2 => r.contexts = odd,
+                _ => r.names = odd,
+            }
+            if let Ok(text) = format_exact(&r) {
+                let back = Rule { approved: r.approved, ..parse_rule(r.effect, &text).unwrap() };
+                let one = |rule: &Rule| Policy { rules: vec![rule.clone()], ..Policy::default() };
+                same_decisions(&one(&r), &one(&back), &requests)?;
+            }
+        }
+
+        /// A key the file doesn't know, in a section or its limits, fails the load: a typo
+        /// such as `denny:` must not drop the rules under it in silence.
+        #[test]
+        fn an_unknown_key_fails_the_load(key in "[a-z_]{1,10}", in_limits in any::<bool>()) {
+            let known = ["allow", "ask", "deny", "approved", "limits", "calls_per_minute", "max_log_lines", "max_rows", "exec_timeout"];
+            prop_assume!(!known.contains(&key.as_str()));
+            let text = if in_limits {
+                format!("agents:\n  ci:\n    allow: [\"get *\"]\n    limits: {{ {key}: 1 }}\n")
+            } else {
+                format!("agents:\n  ci:\n    allow: [\"get *\"]\n    {key}: [\"* secrets\"]\n")
+            };
+            prop_assert!(check(&text).is_err(), "{}", text);
+        }
+
+        /// A section with nothing in it, or no section at all, lets nothing through.
+        #[test]
+        fn a_missing_rule_list_denies(present in any::<bool>(), before in policy(), a in access()) {
+            let text = if present { "agents:\n  ci: {}\n" } else { "agents: {}\n" };
+            let mut agents = vec![agent("ci", before)];
+            apply_file(&check(text).unwrap(), &mut agents).unwrap();
+            prop_assert_eq!(agents[0].policy.decide(&a).mode, Mode::Deny);
+            prop_assert_eq!(agents[0].policy.decide_any_namespace(&a).mode, Mode::Deny);
+        }
+    }
+
+    /// An edit saved in an editor and not loaded yet is never overwritten by an edit made
+    /// in the app at the same time: the app's is refused, the file's is loaded next.
+    #[test]
+    fn an_edit_on_disk_wins_over_the_app() {
+        let dir = std::env::temp_dir().join(format!("recouvrance-test-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("rules.yaml");
+        let agents = [agent("ci", Policy::default())];
+        let written = export_over(&path, &agents, None).unwrap();
+        let yours = format!("{written}# yours\n");
+        std::fs::write(&path, &yours).unwrap();
+        assert!(export_over(&path, &agents, Some(&written)).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), yours);
+        // Once loaded, the app writes over it again.
+        assert!(export_over(&path, &agents, Some(&yours)).is_ok());
+        // A file deleted meanwhile is not brought back.
+        std::fs::remove_file(&path).unwrap();
+        assert!(export_over(&path, &agents, Some(&yours)).is_err());
+        assert!(!path.exists());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

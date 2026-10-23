@@ -4,7 +4,7 @@
 use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::checkbox::Checkbox;
-use gpui_kit::component::input::{Input, InputEvent, InputState};
+use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
 use gpui_kit::component::switch::Switch;
 use gpui_kit::component::{ActiveTheme as _, Icon, Selectable as _, Sizable as _, ThemeMode, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
@@ -22,13 +22,14 @@ enum Section {
     Logs,
     Kubeconfig,
     Agents,
+    Assistant,
     Plugins,
     Shortcuts,
     Requests,
     About,
 }
 
-const SECTIONS: [(Section, &str, Lucide); 12] = [
+const SECTIONS: [(Section, &str, Lucide); 13] = [
     (Section::General, "General", Lucide::Settings),
     (Section::Contexts, "Contexts", Lucide::Ship),
     (Section::Clusters, "Per cluster", Lucide::Server),
@@ -37,6 +38,7 @@ const SECTIONS: [(Section, &str, Lucide); 12] = [
     (Section::Logs, "Log viewer", Lucide::ScrollText),
     (Section::Kubeconfig, "Kubeconfig", Lucide::FileText),
     (Section::Agents, "Agents (MCP)", Lucide::Bot),
+    (Section::Assistant, "Assistant", Lucide::Sparkles),
     (Section::Plugins, "Plugins", Lucide::Puzzle),
     (Section::Shortcuts, "Shortcuts", Lucide::Keyboard),
     (Section::Requests, "API requests", Lucide::Activity),
@@ -51,6 +53,9 @@ pub struct SettingsView {
     tail: Entity<InputState>,
     kubeconfig: Entity<crate::ui::kubeconfig_sources::KubeconfigSources>,
     mcp_port: Entity<InputState>,
+    /// The assistant's team notes, and its code folders (one a line).
+    notes: Entity<TextareaState>,
+    repos: Entity<TextareaState>,
     /// Prometheus override per context (`namespace/service:port`).
     prometheus: Vec<(String, Entity<InputState>)>,
     /// Per context: node shell image and accessible namespaces.
@@ -75,6 +80,20 @@ impl SettingsView {
         let tail = field(s.log_tail_lines.to_string(), "1000", window, cx);
         let mcp_port = field(hub.port().to_string(), "47070", window, cx);
         let kubeconfig = cx.new(|cx| crate::ui::kubeconfig_sources::KubeconfigSources::new(window, cx));
+        let textarea = |value: String, placeholder: &'static str, window: &mut Window, cx: &mut Context<Self>| {
+            cx.new(|cx| {
+                let mut st = TextareaState::new(window, cx).auto_grow(4, 16).placeholder(placeholder);
+                st.set_value(value, window, cx);
+                st
+            })
+        };
+        let notes = textarea(
+            s.assistant_notes.clone(),
+            "e.g. Grafana: https://grafana.example.com · shop-* namespaces: github.com/acme/shop · on-call runbook: …",
+            window,
+            cx,
+        );
+        let repos = textarea(s.assistant_repos.join("\n"), "~/code/shop", window, cx);
 
         let mut subs = Vec::new();
         let number = |input: &Entity<InputState>,
@@ -103,6 +122,18 @@ impl SettingsView {
                 let _ = hub2.set_port(p);
             }
         }));
+        subs.push(cx.subscribe(&notes, |_, state, ev: &InputEvent, cx| {
+            if let InputEvent::Change = ev {
+                let v = state.read(cx).value().to_string();
+                settings::update(|s| s.assistant_notes = v);
+            }
+        }));
+        subs.push(cx.subscribe(&repos, |_, state, ev: &InputEvent, cx| {
+            if let InputEvent::Change = ev {
+                let v = state.read(cx).value();
+                settings::update(|s| s.assistant_repos = repo_lines(&v));
+            }
+        }));
         let delete_kind = cx.new(|cx| InputState::new(window, cx).placeholder("Add a kind, e.g. Service"));
         subs.push(cx.subscribe_in(&delete_kind, window, |this, state, ev: &InputEvent, window, cx| {
             if let InputEvent::PressEnter { .. } = ev {
@@ -110,8 +141,11 @@ impl SettingsView {
                 if typed.is_empty() {
                     return;
                 }
-                // Saved as deletes look it up: `deploy` or `deployments` is `Deployment`.
-                let Some(kind) = crate::k8s::find_kind(&this.kinds, &typed).map(|k| k.ar.kind.clone()) else {
+                // Saved as deletes look it up: `deploy` or `deployments` is `Deployment`, and a
+                // custom resource has its group.
+                let Some(kind) = crate::k8s::find_kind(&this.kinds, &typed)
+                    .map(|k| settings::delete_kind_key(&k.ar.group, &k.ar.kind))
+                else {
                     use gpui_kit::component::{WindowExt as _, notification::Notification};
                     let msg = format!("No kind \"{typed}\" on the connected clusters");
                     window.push_notification(Notification::error(msg), cx);
@@ -131,6 +165,7 @@ impl SettingsView {
             Some("plugins") => Section::Plugins,
             Some("appearance") => Section::Appearance,
             Some("general") => Section::General,
+            Some("assistant") => Section::Assistant,
             _ => Section::General,
         };
         let mut this = Self {
@@ -141,6 +176,8 @@ impl SettingsView {
             tail,
             kubeconfig,
             mcp_port,
+            notes,
+            repos,
             prometheus: Vec::new(),
             cluster_inputs: Vec::new(),
             delete_kind,
@@ -271,6 +308,16 @@ impl SettingsView {
         for (input, saved) in fields {
             let state = input.read(cx);
             if !state.focus_handle(cx).is_focused(window) && state.value().trim() != saved {
+                input.update(cx, |state, cx| state.set_value(saved, window, cx));
+            }
+        }
+        for (input, saved) in
+            [(self.notes.clone(), s.assistant_notes.clone()), (self.repos.clone(), s.assistant_repos.join("\n"))]
+        {
+            let state = input.read(cx);
+            let current = state.value().to_string();
+            let same = if input == self.repos { repo_lines(&current) == s.assistant_repos } else { current == saved };
+            if !state.focus_handle(cx).is_focused(window) && !same {
                 input.update(cx, |state, cx| state.set_value(saved, window, cx));
             }
         }
@@ -678,6 +725,43 @@ impl SettingsView {
                     cx,
                 ))
                 .into_any_element(),
+            Section::Assistant => {
+                let block = |label: &str, hint: &str, input: &Entity<TextareaState>| {
+                    v_flex()
+                        .gap_1()
+                        .py_3()
+                        .border_b_1()
+                        .border_color(theme.border)
+                        .child(div().text_sm().font_weight(FontWeight::MEDIUM).child(label.to_string()))
+                        .child(div().text_xs().text_color(muted).child(hint.to_string()))
+                        .child(div().pt_1().child(Textarea::new(input).small()))
+                };
+                let missing: Vec<String> = s
+                    .assistant_repos
+                    .iter()
+                    .filter(|r| !settings::expand(r).is_dir())
+                    .cloned()
+                    .collect();
+                v_flex()
+                    .child(div().pb_2().text_sm().text_color(muted).child(
+                        "The assistant reads the clusters with Recouvrance's tools (objects, events, logs, Prometheus usage) under its agent rules. \
+                         Tell it what only your team knows; it reads this with every question, and \"Investigate\" on a broken pod or workload starts from it.",
+                    ))
+                    .child(block(
+                        "Team notes",
+                        "Where things run, dashboards and log search links, runbooks, which repository holds which namespace, conventions. Plain text.",
+                        &self.notes,
+                    ))
+                    .child(block(
+                        "Code folders",
+                        "Local clones of your services and charts, one folder a line. With Claude Code only: it may read and search them (Read, Grep, Glob), nothing outside them, and never writes.",
+                        &self.repos,
+                    ))
+                    .when(!missing.is_empty(), |d| {
+                        d.child(div().pt_1().text_sm().text_color(theme.warning).child(format!("Not a folder, skipped: {}", missing.join(", "))))
+                    })
+                    .into_any_element()
+            }
             Section::Plugins => {
                 let (plugins, error) = cx.try_global::<crate::plugins::Loaded>().map(|l| (l.0.clone(), l.1.clone())).unwrap_or_default();
                 v_flex()
@@ -868,4 +952,9 @@ impl Render for SettingsView {
                     .child(div().max_w(px(820.)).child(body)),
             )
     }
+}
+
+/// The code folders typed one a line.
+fn repo_lines(text: &str) -> Vec<String> {
+    text.lines().map(str::trim).filter(|l| !l.is_empty()).map(String::from).collect()
 }
