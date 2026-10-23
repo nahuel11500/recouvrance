@@ -686,14 +686,31 @@ pub(super) async fn watch_once(
         *first = FirstList::Done;
     }
     let mut version = version;
+    // A cut stream or a failed reopen watches again from `version`, waiting longer each time.
+    let mut backoff = Backoff::default();
+    let mut retrying = false;
 
     loop {
         let wp = WatchParams::default().timeout(290);
         let req = with_table_format(request.watch(&wp, &version)?, full)?;
-        let reader = client.request_stream(req).await?;
+        let reader = match client.request_stream(req).await {
+            Ok(reader) => reader,
+            Err(e) if resumable(&e) => {
+                tx.unbounded_send(TableMsg::Error(short_error(&e.into())))?;
+                retrying = true;
+                tokio::time::sleep(backoff.next()).await;
+                continue;
+            }
+            Err(e) => return Err(e.into()),
+        };
+        if std::mem::take(&mut retrying) {
+            // Send the rows again: they clear the error shown meanwhile.
+            snaps.dirty = true;
+        }
         let mut chunks = std::pin::pin!(reader.lines().ready_chunks(256));
         let mut heard = tokio::time::Instant::now();
-        loop {
+        let mut cut = false;
+        while !cut {
             // Wake up for a pending snapshot even when no event comes.
             let flush = snaps.wait(pause);
             let next = tokio::select! {
@@ -715,7 +732,12 @@ pub(super) async fn watch_once(
                 Some(Some(lines)) => {
                     heard = tokio::time::Instant::now();
                     for line in lines {
-                        let line = line?;
+                        // The connection broke (a load balancer, an API server restart).
+                        let Ok(line) = line else {
+                            cut = true;
+                            break;
+                        };
+                        backoff = Backoff::default();
                         match apply_event(&line, &mut rows, &mut version, extras)? {
                             Applied::Changed => snaps.dirty = true,
                             Applied::Unchanged => {}
@@ -729,6 +751,18 @@ pub(super) async fn watch_once(
             }
             snaps.flush(&rows, tx, pause)?;
         }
+        if cut {
+            tokio::time::sleep(backoff.next()).await;
+        }
+    }
+}
+
+/// Whether a failed watch request can go on from its resourceVersion: the connection or the
+/// server failed. A refusal (410 Gone, 403…) goes back to a list.
+fn resumable(e: &kube::Error) -> bool {
+    match e {
+        kube::Error::Api(status) => status.code == 429 || status.code >= 500,
+        _ => true,
     }
 }
 
@@ -884,7 +918,20 @@ pub async fn list_names(
 
 #[cfg(test)]
 mod watch_tests {
-    use super::{Applied, Arc, Extras, HashMap, Row, apply_event};
+    use super::{Applied, Arc, Extras, HashMap, Row, apply_event, resumable};
+
+    #[test]
+    fn watch_resumes_after_server_and_connection_failures() {
+        let api = |code| kube::Error::Api(kube::core::Status::failure("x", "x").with_code(code).boxed());
+        assert!(resumable(&api(503)));
+        assert!(resumable(&api(500)));
+        assert!(resumable(&api(429)));
+        assert!(resumable(&kube::Error::Service(std::io::Error::other("connection reset").into())));
+        // Too old, refused or gone: back to a list.
+        assert!(!resumable(&api(410)));
+        assert!(!resumable(&api(403)));
+        assert!(!resumable(&api(404)));
+    }
 
     /// A watch frame in Table form for one object.
     fn frame(kind: &str, uid: &str, name: &str, rv: &str, status: &str) -> String {

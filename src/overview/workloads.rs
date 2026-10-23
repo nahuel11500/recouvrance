@@ -697,6 +697,7 @@ pub(super) fn pdb_page(ctx: &Ctx, cx: &App) -> Div {
     let obj = ctx.obj;
     let theme = cx.theme();
     let allowed = n(obj, "/status/disruptionsAllowed").unwrap_or(0);
+    let blocks = pdb_blocks(obj);
     let budget = obj
         .pointer("/spec/minAvailable")
         .map(|v| format!("min available {}", v.as_str().map(String::from).unwrap_or_else(|| v.to_string())))
@@ -713,7 +714,13 @@ pub(super) fn pdb_page(ctx: &Ctx, cx: &App) -> Div {
                 .child(field(
                     "Disruptions allowed now",
                     div()
-                        .text_color(if allowed == 0 { theme.warning } else { theme.success })
+                        .text_color(if blocks {
+                            theme.warning
+                        } else if allowed == 0 {
+                            theme.muted_foreground
+                        } else {
+                            theme.success
+                        })
                         .child(allowed.to_string()),
                     cx,
                 ))
@@ -733,7 +740,7 @@ pub(super) fn pdb_page(ctx: &Ctx, cx: &App) -> Div {
                     cx,
                 )),
         )
-        .when(allowed == 0, |d| {
+        .when(blocks, |d| {
             d.child(
                 div()
                     .pt_2()
@@ -744,6 +751,11 @@ pub(super) fn pdb_page(ctx: &Ctx, cx: &App) -> Div {
         })
         .child(heading_for(&format!("Pods it covers ({})", ctx.related.pods.len()), ctx.related, "pods", cx))
         .child(pods_table(ctx, cx))
+}
+
+/// Whether a PodDisruptionBudget stops evictions now: none allowed, with pods to protect.
+fn pdb_blocks(obj: &Value) -> bool {
+    n(obj, "/status/disruptionsAllowed").unwrap_or(0) == 0 && n(obj, "/status/expectedPods").unwrap_or(0) > 0
 }
 
 /// VerticalPodAutoscaler: recommendations next to the target's current requests.
@@ -871,6 +883,16 @@ mod tests {
         // A metric without a type (or an empty one) must not panic.
         assert_eq!(id(&json!({"type": ""})), Default::default());
         assert_eq!(id(&json!({})), Default::default());
+    }
+
+    #[test]
+    fn pdb_without_pods_blocks_nothing() {
+        let pdb =
+            |allowed: i64, expected: i64| json!({"status": {"disruptionsAllowed": allowed, "expectedPods": expected}});
+        assert!(super::pdb_blocks(&pdb(0, 3)));
+        assert!(!super::pdb_blocks(&pdb(0, 0)));
+        assert!(!super::pdb_blocks(&pdb(1, 3)));
+        assert!(!super::pdb_blocks(&json!({})));
     }
 
     #[test]

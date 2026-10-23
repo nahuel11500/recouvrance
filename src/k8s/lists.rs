@@ -47,7 +47,7 @@ where
     T: serde::de::DeserializeOwned + Send + 'static,
 {
     let (c, ar2, ns) = (client.clone(), ar.clone(), namespace.clone());
-    let whole = run_guarded(async move {
+    let whole = run_abortable(async move {
         use tokio_util::compat::FuturesAsyncReadCompatExt as _;
         let url = DynamicObject::url_path(&ar2, ns.as_deref());
         let path = format!("{url}?resourceVersion=0&resourceVersionMatch=NotOlderThan");

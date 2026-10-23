@@ -73,14 +73,14 @@ where
     RUNTIME.spawn(f).await.map_err(|e| anyhow!("task failed: {e}"))?
 }
 
-/// Like `run`, but dropping the future stops the work too (`run` lets it finish).
-pub async fn run_guarded<F, T>(f: F) -> Result<T>
+/// Like `run`, but dropping the future stops the work (a Stop button, a closed view).
+pub async fn run_abortable<F, T>(f: F) -> Result<T>
 where
     F: Future<Output = Result<T>> + Send + 'static,
     T: Send + 'static,
 {
     let task = RUNTIME.spawn(f);
-    let _abort = TaskGuard(task.abort_handle());
+    let _guard = TaskGuard(task.abort_handle());
     task.await.map_err(|e| anyhow!("task failed: {e}"))?
 }
 
@@ -326,6 +326,21 @@ mod selector_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dropping_an_abortable_run_stops_it() {
+        use futures::FutureExt as _;
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let mut work = Box::pin(run_abortable(async move {
+            let _tx = tx;
+            std::future::pending::<()>().await;
+            Ok(())
+        }));
+        assert!(work.as_mut().now_or_never().is_none());
+        drop(work);
+        // The aborted task drops what it held.
+        assert!(futures::executor::block_on(rx).is_err());
+    }
 
     #[test]
     fn timeouts_are_said_plainly() {

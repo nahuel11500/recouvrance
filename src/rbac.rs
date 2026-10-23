@@ -35,16 +35,11 @@ pub fn rule_allows(rule: &Value, verb: &str, group: &str, resource: &str) -> boo
     let verbs = strs(rule, "verbs");
     let groups = strs(rule, "apiGroups");
     let resources = strs(rule, "resources");
-    let base = resource.split('/').next().unwrap_or(resource);
     let sub = resource.split_once('/').map(|(_, s)| s);
+    // Like the API server: "*", the exact resource, or "*/sub"; "pods/*" matches nothing.
     verbs.iter().any(|v| v == "*" || v == verb)
         && groups.iter().any(|g| g == "*" || g == group)
-        && resources.iter().any(|r| {
-            r == "*"
-                || r == resource
-                || (sub.is_some() && *r == format!("{base}/*"))
-                || (sub.is_some() && *r == format!("*/{}", sub.unwrap_or_default()))
-        })
+        && resources.iter().any(|r| r == "*" || r == resource || sub.is_some_and(|s| *r == format!("*/{s}")))
 }
 
 fn role_rules<'a>(snap: &'a Snapshot, binding: &Value) -> Option<(&'a Value, String)> {
@@ -235,6 +230,16 @@ mod tests {
         assert_eq!(bindings_of(&s, "Role", "pod-reader", Some("demo")).len(), 1);
         assert_eq!(split_resource("deployments.apps"), ("apps".into(), "deployments".into()));
         assert_eq!(split_resource("pods/log"), ("".into(), "pods/log".into()));
+    }
+
+    #[test]
+    fn subresource_wildcards() {
+        let rule = |r: &str| json!({"apiGroups": [""], "resources": [r], "verbs": ["create"]});
+        assert!(rule_allows(&rule("*/exec"), "create", "", "pods/exec"));
+        assert!(rule_allows(&rule("*"), "create", "", "pods/exec"));
+        assert!(!rule_allows(&rule("pods/*"), "create", "", "pods/exec"));
+        assert!(!rule_allows(&rule("pods"), "create", "", "pods/exec"));
+        assert!(!rule_allows(&rule("*/exec"), "create", "", "pods"));
     }
 
     #[test]
