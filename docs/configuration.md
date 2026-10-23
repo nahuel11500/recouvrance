@@ -55,7 +55,7 @@ never move to another cluster. The name is freed when its file is deleted or no 
 | `metrics_refresh`, `detail_refresh`, `overview_refresh` | 15, 5, 30 | Seconds between refreshes |
 | `log_tail_lines`, `log_timestamps` | 1000, true | Log viewer |
 | `kubeconfigs`, `kubeconfig_folders` | | Extra kubeconfig files and watched folders (see above) |
-| `context_files` | | `{ "prod": "~/.kube/team-a.yaml" }`: the file each context name belongs to, so a name several files share stays with the first one (see above); filled in on its own |
+| `context_files` | | `{ "prod": "~/.kube/team-a.yaml" }`: the file each context name belongs to, so a name several files share stays with the first one, and the `name@file` names the others get stay with theirs (see above); filled in on its own |
 | `context_colors` | | `{ "prod-eu": "#ef4444" }`: a colored strip per context |
 | `protection` | guessed | `{ "prod-eu": true, "kind-dev": false }`: contexts where writes, shells and plugins need the context name typed. Contexts not listed are guessed from the context, user and cluster names and the server URL (`prod`, `prd`, `production`, `live`, `admin`, `root`); a context the kubeconfig doesn't have now, or any context while the kubeconfig can't be read, counts as protected. An older `protected_contexts` list is read once: its contexts become `true` |
 | `prometheus` | found automatically | `{ "ctx": "monitoring/prometheus:9090" }` (see below) |
