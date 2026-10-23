@@ -132,11 +132,20 @@ pub fn kubeconfig() -> Result<Kubeconfig> {
 /// Contexts from the kubeconfig files, cached: the files are only read again when
 /// they change (checked at most every two seconds). Safe to call while rendering.
 pub fn load_contexts() -> Result<Contexts> {
+    cached_contexts(std::time::Duration::from_secs(2))
+}
+
+/// Like `load_contexts`, but checks the files now: for the watcher that just saw them change.
+pub fn reload_contexts() -> Result<Contexts> {
+    cached_contexts(std::time::Duration::ZERO)
+}
+
+fn cached_contexts(max_age: std::time::Duration) -> Result<Contexts> {
     type Cached = (std::time::Instant, Vec<(std::path::PathBuf, Option<std::time::SystemTime>, u64)>, Contexts);
     static CACHE: std::sync::Mutex<Option<Cached>> = std::sync::Mutex::new(None);
     let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
     if let Some((checked, _, contexts)) = cache.as_ref()
-        && checked.elapsed() < std::time::Duration::from_secs(2)
+        && checked.elapsed() < max_age
     {
         return Ok(contexts.clone());
     }

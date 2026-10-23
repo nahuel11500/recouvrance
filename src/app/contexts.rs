@@ -190,8 +190,9 @@ impl AppView {
                 if now == seen {
                     continue;
                 }
+                // Not the cached list, which may predate the change; on a failed read, try again.
+                let Ok(contexts) = k8s::reload_contexts() else { continue };
                 seen = now;
-                let Ok(contexts) = k8s::load_contexts() else { continue };
                 let alive = this.update_in(cx, |this, window, cx| this.contexts_reloaded(contexts.names, window, cx));
                 if alive.is_err() {
                     break;
