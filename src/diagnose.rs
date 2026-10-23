@@ -67,7 +67,8 @@ pub fn pod(pod: &Value, events: &[Ev], crash_logs: Option<&(String, String)>) ->
             hint: "If it stays Terminating, the node may be unreachable: Delete → force, or remove finalizers.".into(),
         });
     }
-    if s(pod, "/status/reason") == "Evicted" {
+    let evicted = s(pod, "/status/reason") == "Evicted";
+    if evicted {
         out.push(Finding {
             level: Level::Critical,
             title: "Evicted".into(),
@@ -113,11 +114,14 @@ pub fn pod(pod: &Value, events: &[Ev], crash_logs: Option<&(String, String)>) ->
         let last_reason = last.map(|t| s(t, "/reason")).unwrap_or("");
         let last_code = last.and_then(|t| t["exitCode"].as_i64());
         // Stopped with a failure now (a Job pod that does not restart, a failed init container).
+        // An evicted pod's containers were killed by the eviction: "Evicted" says it all.
         let ended = c.pointer("/state/terminated");
         let end_code = ended.and_then(|t| t["exitCode"].as_i64()).unwrap_or(0);
         let end_reason = ended.map(|t| s(t, "/reason")).unwrap_or("");
-        let failed =
-            ended.is_some() && (end_code != 0 || !matches!(end_reason, "" | "Completed")) && phase != "Succeeded";
+        let failed = ended.is_some()
+            && (end_code != 0 || !matches!(end_reason, "" | "Completed"))
+            && phase != "Succeeded"
+            && !evicted;
         let memory_limit = || {
             pod.pointer(if init { "/spec/initContainers" } else { "/spec/containers" })
                 .and_then(Value::as_array)
@@ -446,5 +450,16 @@ mod tests {
         let p = json!({"spec": {"nodeName": "n"}, "status": {"phase": "Succeeded", "containerStatuses": [{
             "name": "job", "restartCount": 0, "state": {"terminated": {"exitCode": 0, "reason": "Completed"}}}]}});
         assert!(pod(&p, &[], None).is_empty());
+    }
+
+    #[test]
+    fn evicted_pod_is_not_a_failed_container() {
+        let p = json!({"spec": {"nodeName": "n"}, "status": {"phase": "Failed", "reason": "Evicted",
+            "message": "The node was low on resource: memory.",
+            "containerStatuses": [{"name": "app", "restartCount": 0,
+                "state": {"terminated": {"exitCode": 137, "reason": "ContainerStatusUnknown"}}}]}});
+        let f = pod(&p, &[], None);
+        let titles: Vec<&str> = f.iter().map(|x| x.title.as_str()).collect();
+        assert_eq!(titles, ["Evicted"]);
     }
 }
