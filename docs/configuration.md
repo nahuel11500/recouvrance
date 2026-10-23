@@ -124,6 +124,10 @@ then allow; anything no rule matches is denied. `approved` lists the requests yo
 deny rule does. The file is reloaded when it changes, and edits on the Agents page are written back
 to it (its comments are not kept).
 
+While the file exists, an agent it doesn't name has no rules, so everything it asks is denied:
+removing an agent's section takes its access away. Deleting an agent on the Agents page removes its
+section too.
+
 ## plugins.yaml
 
 ```yaml
