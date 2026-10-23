@@ -134,15 +134,23 @@ impl KubeMcp {
         }
         let dry = p.dry_run.unwrap_or(false);
         let mut out = Vec::new();
-        for (kind, ns, _, doc) in planned {
-            // Approvals for later objects can take minutes: access may be off by now.
-            if let Some(reason) = self.inactive(&call) {
+        for (kind, ns, name, doc) in planned {
+            // Approvals for later objects can take minutes: access may be off, or the rules
+            // changed, by now.
+            self.reload_rules(&mut call);
+            let access = access_for(&kind, &p.context, "apply", ns.clone(), Some(name));
+            let verdict = call.policy().decide(&access);
+            let refused = match self.inactive(&call) {
+                Some(reason) => Some(reason.to_string()),
+                None if verdict.mode == Mode::Deny => {
+                    Some(format!("{} — {}", describe(&access), call.rule_label(verdict.rule)))
+                }
+                None => None,
+            };
+            if let Some(reason) = refused {
                 // The log says what was applied before.
-                let detail = if out.is_empty() {
-                    reason.to_string()
-                } else {
-                    format!("{reason}; applied before: {}", out.join("; "))
-                };
+                let detail =
+                    if out.is_empty() { reason } else { format!("{reason}; applied before: {}", out.join("; ")) };
                 out.push(call.deny(detail));
                 return Err(out.join("\n"));
             }
