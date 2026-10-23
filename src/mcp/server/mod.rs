@@ -464,6 +464,13 @@ fn access_for(kind: &Kind, context: &str, verb: &str, namespace: Option<String>,
     }
 }
 
+/// Whether listing a kind could show something: in some namespace, or for a cluster-scoped
+/// kind, outside any (only rules for every namespace cover it).
+fn list_verdict(policy: &Policy, kind: &Kind, context: &str) -> Mode {
+    let access = access_for(kind, context, "list", None, None);
+    if kind.namespaced { policy.decide_any_namespace(&access).mode } else { policy.decide(&access).mode }
+}
+
 /// Namespaced kinds need a namespace for single-object verbs (a refused call is logged).
 fn require_ns(call: &Call, kind: &Kind, ns: &Option<String>) -> Result<(), String> {
     if kind.namespaced && ns.is_none() {
@@ -935,6 +942,28 @@ mod tests {
             section: "",
             label: kind.into(),
         }
+    }
+
+    #[test]
+    fn cluster_scoped_lists_are_not_all_namespace_lists() {
+        let rule = |effect: Mode, ns: &str| crate::mcp::Rule {
+            effect,
+            verbs: vec!["list".into()],
+            namespaces: vec![ns.into()],
+            contexts: vec!["*".into()],
+            ..crate::mcp::Rule::default()
+        };
+        let nodes = kind("", "v1", "Node", "nodes", false);
+        let pods = kind("", "v1", "Pod", "pods", true);
+        let ask = Policy { rules: vec![rule(Mode::Ask, "team-a")], ..Policy::default() };
+        assert_eq!(list_verdict(&ask, &nodes, "c"), Mode::Deny);
+        assert_eq!(list_verdict(&ask, &pods, "c"), Mode::Ask);
+        let allow = Policy { rules: vec![rule(Mode::Allow, "team-a")], ..Policy::default() };
+        assert_eq!(list_verdict(&allow, &nodes, "c"), Mode::Deny);
+        assert_eq!(list_verdict(&allow, &pods, "c"), Mode::Allow);
+        // Rules for every namespace cover cluster-scoped kinds.
+        let all = Policy { rules: vec![rule(Mode::Allow, "*")], ..Policy::default() };
+        assert_eq!(list_verdict(&all, &nodes, "c"), Mode::Allow);
     }
 
     #[test]

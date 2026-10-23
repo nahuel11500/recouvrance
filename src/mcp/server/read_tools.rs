@@ -73,9 +73,7 @@ impl KubeMcp {
         };
         let rows: Vec<Vec<String>> = kinds
             .iter()
-            .filter(|k| {
-                call.policy().decide_any_namespace(&access_for(k, &p.context, "list", None, None)).mode != Mode::Deny
-            })
+            .filter(|k| list_verdict(call.policy(), k, &p.context) != Mode::Deny)
             .map(|k| vec![k.kubectl_name(), k.ar.kind.clone(), k.ar.api_version.clone(), k.namespaced.to_string()])
             .collect();
         if rows.is_empty() {
@@ -98,7 +96,8 @@ impl KubeMcp {
         let mut call = self.begin(&parts, "list_resources", args)?;
         let (client, kind) = self.kind(&call, &p.context, &p.kind).await?;
         let access = access_for(&kind, &p.context, "list", p.namespace.clone(), None);
-        self.authorize_list(&mut call, &access, p.namespace.is_none()).await?;
+        // A cluster-scoped kind is in no namespace, not in all of them.
+        self.authorize_list(&mut call, &access, kind.namespaced && p.namespace.is_none()).await?;
         let (defs, rows) = match k8s::list_table(
             client,
             kind.clone(),
@@ -449,8 +448,7 @@ impl KubeMcp {
             "nodes",
         ] {
             let Some(kind) = k8s::find_kind(&kinds, name).cloned() else { continue };
-            if call.policy().decide_any_namespace(&access_for(&kind, &p.context, "list", None, None)).mode == Mode::Deny
-            {
+            if list_verdict(call.policy(), &kind, &p.context) == Mode::Deny {
                 continue;
             }
             for (ns, obj) in k8s::list_names(client.clone(), kind.ar.clone(), None).await.unwrap_or_default() {
