@@ -75,6 +75,14 @@ impl AssistantView {
         }
     }
 
+    /// The cluster and namespace changed: later questions say so.
+    pub fn set_scope(&mut self, scope: String, cx: &mut Context<Self>) {
+        if self.scope != scope {
+            self.scope = scope;
+            cx.notify();
+        }
+    }
+
     /// A new chat with this question, stopping the one running.
     pub fn start_over(&mut self, question: String, cx: &mut Context<Self>) {
         self._task = None;

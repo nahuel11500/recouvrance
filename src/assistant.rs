@@ -332,14 +332,14 @@ fn rpc_result(text: &str) -> Result<Value> {
 }
 
 /// A session with Recouvrance's MCP server, as the assistant agent.
-struct Mcp {
+pub(crate) struct Mcp {
     url: String,
     token: String,
     session: String,
 }
 
 impl Mcp {
-    async fn connect(port: u16, token: String) -> Result<Self> {
+    pub(crate) async fn connect(port: u16, token: String) -> Result<Self> {
         let url = format!("http://127.0.0.1:{port}/mcp");
         let auth = format!("Bearer {token}");
         let headers = [("authorization", auth.as_str()), ("accept", "application/json, text/event-stream")];
@@ -367,7 +367,7 @@ impl Mcp {
     }
 
     /// Text output of a tool; denials and errors come back as text for the model to read.
-    async fn call(&self, name: &str, args: Value) -> String {
+    pub(crate) async fn call(&self, name: &str, args: Value) -> String {
         let body =
             json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": name, "arguments": args}});
         match self.call_raw(body).await.and_then(|t| rpc_result(&t)) {

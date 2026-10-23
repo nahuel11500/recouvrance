@@ -552,12 +552,14 @@ fn conditions(obj: &Value, cx: &App) -> AnyElement {
         .children(conds.iter().map(|c| {
             let status = c["status"].as_str().unwrap_or_default().to_string();
             let ty = c["type"].as_str().unwrap_or_default();
-            let color = match (status.as_str(), crate::status::true_is_bad(ty)) {
-                ("True", true) => cx.theme().warning,
-                ("False", true) => cx.theme().success,
-                // Not known to be bad, so not drawn red either.
-                ("False", false) if !crate::status::true_is_good(ty) => muted,
-                _ => state_color(&status, cx),
+            use crate::status::Tone;
+            let color = match crate::status::condition_tone(ty, &status) {
+                Some(Tone::Good) => cx.theme().success,
+                // A problem the object reports about itself.
+                Some(Tone::Bad) if status == "True" => cx.theme().warning,
+                Some(Tone::Bad) => cx.theme().danger,
+                Some(Tone::Busy) => cx.theme().warning,
+                Some(Tone::Done) | None => muted,
             };
             h_flex()
                 .gap_3()

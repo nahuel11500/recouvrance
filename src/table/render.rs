@@ -424,7 +424,8 @@ fn ready_color(text: &str, row: &Row, defs: &[ColumnDef], cx: &App) -> Option<Hs
 }
 
 /// The kind a column's values name, from its header ("Secret", "SecretName", "Node",
-/// "Issuer"…); None for plain values.
+/// "ClusterIssuer"…); None for plain values. "Issuer" and "Store" are not links: they may
+/// name the namespaced kind or its cluster-wide twin (a ClusterIssuer, a ClusterSecretStore).
 pub(super) fn link_kind_of(header: &str) -> Option<&'static str> {
     Some(match normalized(header).as_str() {
         "secret" | "secretname" | "secretref" | "targetsecret" | "tlssecret" => "secrets",
@@ -438,9 +439,8 @@ pub(super) fn link_kind_of(header: &str) -> Option<&'static str> {
         "pvc" | "claim" | "persistentvolumeclaim" => "persistentvolumeclaims",
         "volume" | "persistentvolume" => "persistentvolumes",
         "storageclass" => "storageclasses",
-        "issuer" => "issuers",
         "clusterissuer" => "clusterissuers",
-        "secretstore" | "store" => "secretstores",
+        "secretstore" => "secretstores",
         "clustersecretstore" => "clustersecretstores",
         _ => return None,
     })
@@ -525,6 +525,10 @@ mod link_tests {
         assert_eq!(link_kind_of("Secret Name"), Some("secrets"));
         assert_eq!(link_kind_of("NODE"), Some("nodes"));
         assert_eq!(link_kind_of("Status"), None);
+        // An Issuer or a Store may be cluster-wide: no link that could open the wrong kind.
+        assert_eq!(link_kind_of("Issuer"), None);
+        assert_eq!(link_kind_of("Store"), None);
+        assert_eq!(link_kind_of("ClusterIssuer"), Some("clusterissuers"));
         assert!(linkable("db-creds"));
         assert!(!linkable("<none>") && !linkable("a,b") && !linkable(" ") && !linkable("ns/name"));
     }

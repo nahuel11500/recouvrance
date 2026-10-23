@@ -11,6 +11,9 @@ pub struct Contexts {
     pub risky: Vec<String>,
     /// What each context points to (see `fingerprint`), to notice it changed.
     pub fingerprints: HashMap<String, u64>,
+    /// False while a file is read without a context name it had and may be half-written:
+    /// the name stays with it until a second read finds the file unchanged.
+    pub settled: bool,
 }
 
 /// Every kubeconfig file in use: KUBECONFIG (or ~/.kube/config), the extra files
@@ -114,12 +117,41 @@ fn free_name(name: &str, file: &str, taken: &mut std::collections::HashSet<Strin
 /// A context name several files have stays with the file that had it first (kept in
 /// settings), whatever order the files come in: the others get `name@file`.
 pub fn kubeconfig() -> Result<Kubeconfig> {
+    read_kubeconfig().map(|(kc, _)| kc)
+}
+
+/// When a file was last written, and its size.
+type Stamp = (Option<std::time::SystemTime>, u64);
+
+/// Like `kubeconfig`, and whether it is settled (see `Contexts::settled`).
+fn read_kubeconfig() -> Result<(Kubeconfig, bool)> {
+    // Each file's stamp at its last read: `kubectl config use-context` truncates the file
+    // then writes it, so a read in between finds fewer contexts, or none.
+    static LAST_READ: LazyLock<std::sync::Mutex<HashMap<String, Stamp>>> = LazyLock::new(Default::default);
+    let stamp = |path: &std::path::Path| -> Option<Stamp> {
+        let m = std::fs::metadata(path).ok()?;
+        Some((m.modified().ok(), m.len()))
+    };
     let mut files = Vec::new();
+    let mut settled = std::collections::HashSet::new();
     let mut last_err = None;
     for path in kubeconfig_files() {
         let stem = path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "file".into());
         let key = tilde(&path.canonicalize().unwrap_or_else(|_| path.clone()));
-        match Kubeconfig::read_from(&path) {
+        let before = stamp(&path);
+        let kc = Kubeconfig::read_from(&path);
+        let after = stamp(&path);
+        let mut last_read = LAST_READ.lock().unwrap_or_else(|e| e.into_inner());
+        let last = match after {
+            Some(after) => last_read.insert(key.clone(), after),
+            None => last_read.remove(&key),
+        };
+        drop(last_read);
+        // Unchanged during this read and since the last one: not in the middle of a write.
+        if before.is_some() && before == after && last == before {
+            settled.insert(key.clone());
+        }
+        match kc {
             Ok(kc) => files.push((stem, key, Some(kc))),
             Err(e) => {
                 last_err = Some(e);
@@ -133,13 +165,18 @@ pub fn kubeconfig() -> Result<Kubeconfig> {
         .collect();
     let kept = crate::settings::with(|s| s.context_files.clone());
     let mut owners = kept.clone();
-    let now = name_owners(&mut owners, &names, |f| crate::settings::expand(f).exists());
+    let now = name_owners(&mut owners, &names, |f| crate::settings::expand(f).exists(), |f| settled.contains(f));
+    // A name kept for a file read without it: read again to settle it.
+    let settled = !owners
+        .iter()
+        .any(|(name, file)| names.iter().any(|(f, n)| f == file && n.as_ref().is_some_and(|n| !holds(n, name))));
+    let read = files.into_iter().filter_map(|(stem, key, kc)| Some((stem, key, kc?))).collect();
+    let merged = merge_owned(read, &now, &mut owners);
     if owners != kept {
         crate::settings::update(|s| s.context_files = owners);
     }
-    let read = files.into_iter().filter_map(|(stem, key, kc)| Some((stem, key, kc?))).collect();
-    match (merge_owned(read, &now), last_err) {
-        (Some(k), _) => Ok(k),
+    match (merged, last_err) {
+        (Some(k), _) => Ok((k, settled)),
         (None, Some(e)) => Err(e).context("reading kubeconfig"),
         (None, None) => anyhow::bail!(
             "no kubeconfig found (KUBECONFIG or ~/.kube/config): add or paste one in Settings → Kubeconfig"
@@ -150,17 +187,20 @@ pub fn kubeconfig() -> Result<Kubeconfig> {
 /// The file that has each context name in this merge, given the files read now (by
 /// path, with their context names, or `None` when unreadable) and `kept`, the files
 /// that had each name before. `kept` is brought up to date: a file deleted, or read
-/// without the name, gives it up; one that failed to read keeps it; a new name goes to
-/// the first file that has it. A name kept for a file not merged now (another
-/// KUBECONFIG) goes to the first file here that has it, without changing `kept`.
+/// without the name while `settled` (unchanged since the last read), gives it up; one
+/// that failed to read, or may be half-written, keeps it; a new name goes to the first
+/// file that has it. A name kept for a file not merged now (another KUBECONFIG) goes to
+/// the first file here that has it, without changing `kept`. `kept` also holds the
+/// `name@file` names given by `merge_owned`: one stays while its file has `name`.
 fn name_owners(
     kept: &mut std::collections::BTreeMap<String, String>,
     files: &[(String, Option<Vec<String>>)],
     exists: impl Fn(&str) -> bool,
+    settled: impl Fn(&str) -> bool,
 ) -> HashMap<String, String> {
     let read: HashMap<&str, Option<&Vec<String>>> = files.iter().map(|(f, n)| (f.as_str(), n.as_ref())).collect();
     kept.retain(|name, file| match read.get(file.as_str()) {
-        Some(Some(names)) => names.contains(name),
+        Some(Some(names)) => holds(names, name) || !settled(file.as_str()),
         Some(None) => true,
         None => exists(file.as_str()),
     });
@@ -175,17 +215,56 @@ fn name_owners(
     now
 }
 
+/// Whether a file with context `names` holds the kept `name`: one of them, or the
+/// `name@file` given to one (see `merge_owned`).
+fn holds(names: &[String], name: &str) -> bool {
+    names.iter().any(|n| n == name || renamed_from(name, n).is_some())
+}
+
+/// The `file` of `name` when it is `original@file`, a name `merge_owned` may give.
+fn renamed_from<'a>(name: &'a str, original: &str) -> Option<&'a str> {
+    name.strip_prefix(original)?.strip_prefix('@')
+}
+
 /// Merge files (file name, path, contents) in order. A context whose name `owners`
-/// gives to another file is renamed `name@file` first; clusters and users that clash
-/// are renamed as they are merged (see `merge_unique`).
-fn merge_owned(files: Vec<(String, String, Kubeconfig)>, owners: &HashMap<String, String>) -> Option<Kubeconfig> {
+/// gives to another file is renamed `name@file` first, or `name@file-2`… when that is
+/// taken: the name is kept in `kept` (see `name_owners`), so it stays with that file
+/// whatever the other files do. Clusters and users that clash are renamed as they are
+/// merged (see `merge_unique`).
+fn merge_owned(
+    files: Vec<(String, String, Kubeconfig)>,
+    owners: &HashMap<String, String>,
+    kept: &mut std::collections::BTreeMap<String, String>,
+) -> Option<Kubeconfig> {
+    // Every context name read, and every name kept for a file, even one not read now.
     let mut taken: std::collections::HashSet<String> =
         files.iter().flat_map(|(_, _, kc)| kc.contexts.iter().map(|c| c.name.clone())).collect();
+    taken.extend(kept.keys().cloned());
+    let mut given = std::collections::HashSet::new();
     let mut merged: Option<Kubeconfig> = None;
     for (stem, key, mut more) in files {
         for c in &mut more.contexts {
             if owners.get(&c.name).is_some_and(|owner| *owner != key) {
-                let new = free_name(&c.name, &stem, &mut taken);
+                // The name this context had before, else a new one, kept for this file.
+                let before = kept.iter().find(|(name, file)| {
+                    **file == key
+                        && !given.contains(*name)
+                        && renamed_from(name, &c.name).is_some_and(|f| {
+                            f == stem
+                                || f.strip_prefix(stem.as_str())
+                                    .and_then(|n| n.strip_prefix('-'))
+                                    .is_some_and(|i| i.parse::<u32>().is_ok())
+                        })
+                });
+                let new = match before {
+                    Some((name, _)) => name.clone(),
+                    None => {
+                        let new = free_name(&c.name, &stem, &mut taken);
+                        kept.insert(new.clone(), key.clone());
+                        new
+                    }
+                };
+                given.insert(new.clone());
                 let old = std::mem::replace(&mut c.name, new);
                 // The file's current context follows its rename.
                 if more.current_context.as_deref() == Some(old.as_str()) {
@@ -224,6 +303,7 @@ fn cached_contexts(max_age: std::time::Duration) -> Result<Contexts> {
     let signature = kubeconfig_signature();
     if let Some((checked, sig, contexts)) = cache.as_mut()
         && *sig == signature
+        && contexts.settled
     {
         *checked = std::time::Instant::now();
         return Ok(contexts.clone());
@@ -234,12 +314,12 @@ fn cached_contexts(max_age: std::time::Duration) -> Result<Contexts> {
 }
 
 fn read_contexts() -> Result<Contexts> {
-    let kc = kubeconfig()?;
+    let (kc, settled) = read_kubeconfig()?;
     let mut names: Vec<String> = kc.contexts.iter().map(|c| c.name.clone()).collect();
     names.sort();
     let risky = risky_contexts(&kc);
     let fingerprints = kc.contexts.iter().filter_map(|c| Some((c.name.clone(), fingerprint(&kc, &c.name)?))).collect();
-    Ok(Contexts { names, current: kc.current_context, risky, fingerprints })
+    Ok(Contexts { names, current: kc.current_context, risky, fingerprints, settled })
 }
 
 /// A hash of the context's entry with its cluster's and its user's: the same while the
@@ -598,32 +678,47 @@ mod kubeconfig_tests {
         let mut kept = std::collections::BTreeMap::new();
         let on_disk = |_: &str| true;
         // a.yaml was there first.
-        let now = super::name_owners(&mut kept, &[read("a", &["prod"])], on_disk);
+        let now = super::name_owners(&mut kept, &[read("a", &["prod"])], on_disk, |_| true);
         assert_eq!(now["prod"], "a");
         // b.yaml comes, then the files are read in another order (a saved again, new birth time).
-        super::name_owners(&mut kept, &[read("a", &["prod"]), read("b", &["prod"])], on_disk);
-        let now = super::name_owners(&mut kept, &[read("b", &["prod"]), read("a", &["prod"])], on_disk);
+        super::name_owners(&mut kept, &[read("a", &["prod"]), read("b", &["prod"])], on_disk, |_| true);
+        let now = super::name_owners(&mut kept, &[read("b", &["prod"]), read("a", &["prod"])], on_disk, |_| true);
         assert_eq!(now["prod"], "a");
         // a briefly unreadable: b doesn't take the name.
-        let now = super::name_owners(&mut kept, &[(String::from("a"), None), read("b", &["prod"])], on_disk);
+        let now = super::name_owners(&mut kept, &[(String::from("a"), None), read("b", &["prod"])], on_disk, |_| true);
         assert_eq!(now["prod"], "a");
         assert_eq!(kept["prod"], "a");
         // A name added to an earlier file (the default kubeconfig) doesn't take it either.
-        let now = super::name_owners(&mut kept, &[read("c", &["prod"]), read("a", &["prod"])], on_disk);
+        let now = super::name_owners(&mut kept, &[read("c", &["prod"]), read("a", &["prod"])], on_disk, |_| true);
         assert_eq!(now["prod"], "a");
         // Read without the name, a gives it up; the next file that has it keeps it.
-        let now = super::name_owners(&mut kept, &[read("a", &[]), read("b", &["prod"])], on_disk);
+        let now = super::name_owners(&mut kept, &[read("a", &[]), read("b", &["prod"])], on_disk, |_| true);
         assert_eq!(now["prod"], "b");
-        let now = super::name_owners(&mut kept, &[read("a", &["prod"]), read("b", &["prod"])], on_disk);
+        let now = super::name_owners(&mut kept, &[read("a", &["prod"]), read("b", &["prod"])], on_disk, |_| true);
         assert_eq!(now["prod"], "b");
         // A file not read now (another KUBECONFIG) keeps its names for later.
-        let now = super::name_owners(&mut kept, &[read("c", &["prod"])], on_disk);
+        let now = super::name_owners(&mut kept, &[read("c", &["prod"])], on_disk, |_| true);
         assert_eq!(now["prod"], "c");
         assert_eq!(kept["prod"], "b");
         // Deleted, it gives them up.
-        let now = super::name_owners(&mut kept, &[read("c", &["prod"])], |_| false);
+        let now = super::name_owners(&mut kept, &[read("c", &["prod"])], |_| false, |_| true);
         assert_eq!(now["prod"], "c");
         assert_eq!(kept["prod"], "c");
+    }
+
+    #[test]
+    fn a_half_written_file_keeps_its_names() {
+        let mut kept = std::collections::BTreeMap::new();
+        let on_disk = |_: &str| true;
+        super::name_owners(&mut kept, &[read("a", &["prod"]), read("b", &["prod"])], on_disk, |_| true);
+        // `kubectl config use-context` truncated a: read in between, it has no contexts.
+        let now = super::name_owners(&mut kept, &[read("a", &[]), read("b", &["prod"])], on_disk, |f| f != "a");
+        assert_eq!(now["prod"], "a");
+        assert_eq!(kept["prod"], "a");
+        // Read the same way again, a really gave it up.
+        let now = super::name_owners(&mut kept, &[read("a", &[]), read("b", &["prod"])], on_disk, |_| true);
+        assert_eq!(now["prod"], "b");
+        assert_eq!(kept["prod"], "b");
     }
 
     #[test]
@@ -635,7 +730,7 @@ mod kubeconfig_tests {
         let owners = std::collections::HashMap::from([("prod".to_string(), "a".to_string())]);
         let files =
             vec![("b".into(), "b".into(), file("https://b", true)), ("a".into(), "a".into(), file("https://a", false))];
-        let kc = super::merge_owned(files, &owners).unwrap();
+        let kc = super::merge_owned(files, &owners, &mut Default::default()).unwrap();
         let server = |ctx: &str| {
             let cluster = &kc.contexts.iter().find(|c| c.name == ctx).unwrap().context.as_ref().unwrap().cluster;
             kc.clusters
@@ -647,6 +742,57 @@ mod kubeconfig_tests {
         assert_eq!(server("prod").as_deref(), Some("https://a"));
         assert_eq!(server("prod@b").as_deref(), Some("https://b"));
         assert_eq!(kc.current_context.as_deref(), Some("prod@b"));
+    }
+
+    #[test]
+    fn a_renamed_name_stays_with_its_file() {
+        let file = |server: &str| -> kube::config::Kubeconfig {
+            crate::yaml::from_str(&format!("clusters: [{{name: x, cluster: {{server: {server}}}}}]\ncontexts: [{{name: x, context: {{cluster: x}}}}]\n")).unwrap()
+        };
+        // Three kubeadm `admin.conf` files: each read now, or `None` when unreadable.
+        let merge = |kept: &mut std::collections::BTreeMap<String, String>,
+                     files: Vec<(&str, Option<kube::config::Kubeconfig>)>| {
+            let names: Vec<(String, Option<Vec<String>>)> = files
+                .iter()
+                .map(|(f, kc)| {
+                    (f.to_string(), kc.as_ref().map(|k| k.contexts.iter().map(|c| c.name.clone()).collect()))
+                })
+                .collect();
+            // A file not listed is deleted.
+            let now = super::name_owners(kept, &names, |_| false, |_| true);
+            let read =
+                files.into_iter().filter_map(|(f, kc)| Some(("admin".to_string(), f.to_string(), kc?))).collect();
+            let kc = super::merge_owned(read, &now, kept).unwrap();
+            kc.contexts
+                .iter()
+                .map(|c| {
+                    let cluster = &c.context.as_ref().unwrap().cluster;
+                    let k = kc.clusters.iter().find(|k| &k.name == cluster).unwrap();
+                    (c.name.clone(), k.cluster.as_ref().and_then(|k| k.server.clone()).unwrap())
+                })
+                .collect::<std::collections::BTreeMap<_, _>>()
+        };
+        let mut kept = Default::default();
+        let all = |y: Option<_>| vec![("/w", Some(file("https://w"))), ("/y", y), ("/z", Some(file("https://z")))];
+        let names = merge(&mut kept, all(Some(file("https://y"))));
+        assert_eq!(names["x"], "https://w");
+        assert_eq!(names["x@admin"], "https://y");
+        assert_eq!(names["x@admin-2"], "https://z");
+        // y can't be read: z keeps its name.
+        let names = merge(&mut kept, all(None));
+        assert_eq!(names.get("x@admin"), None);
+        assert_eq!(names["x@admin-2"], "https://z");
+        // Read in another order, back again.
+        let mut files = all(Some(file("https://y")));
+        files.reverse();
+        let names = merge(&mut kept, files);
+        assert_eq!(names["x"], "https://w");
+        assert_eq!(names["x@admin"], "https://y");
+        assert_eq!(names["x@admin-2"], "https://z");
+        // y deleted: its name is freed, z still keeps its own.
+        let names = merge(&mut kept, vec![("/w", Some(file("https://w"))), ("/z", Some(file("https://z")))]);
+        assert_eq!(names["x@admin-2"], "https://z");
+        assert!(!kept.contains_key("x@admin"));
     }
 
     #[test]
@@ -756,9 +902,10 @@ mod name_properties {
             first in files(),
             order in any::<prop::sample::Index>(),
             extra in prop::option::of(prop::sample::subsequence(vec!["prod", "dev", "kind"], 0..=3)),
+            shrink in prop::option::of((any::<prop::sample::Index>(), 0..3usize)),
         ) {
             let mut kept = Default::default();
-            let before = name_owners(&mut kept, &first, |_| true);
+            let before = name_owners(&mut kept, &first, |_| true, |_| true);
             // The same files read again in another order, maybe with a new one.
             let mut again = first.clone();
             let i = order.index(again.len());
@@ -766,10 +913,22 @@ mod name_properties {
             if let Some(names) = extra {
                 again.push(("/kube/new".into(), Some(names.into_iter().map(String::from).collect())));
             }
-            let after = name_owners(&mut kept, &again, |_| true);
+            // Maybe one caught half-written, with fewer names or none.
+            let shrunk = shrink.map(|(file, keep)| {
+                let ix = file.index(again.len());
+                if let Some(names) = again[ix].1.as_mut() {
+                    names.truncate(keep);
+                }
+                again[ix].0.clone()
+            });
+            let after = name_owners(&mut kept, &again, |_| true, |f| shrunk.as_deref() != Some(f));
             for (name, owner) in &before {
                 let still_has = first.iter().any(|(f, n)| f == owner && n.as_ref().is_none_or(|n| n.contains(name)));
-                if still_has {
+                if !still_has {
+                    continue;
+                }
+                prop_assert_eq!(kept.get(name), Some(owner), "{} given up", name);
+                if again.iter().any(|(_, n)| n.as_ref().is_some_and(|n| n.contains(name))) {
                     prop_assert_eq!(after.get(name), Some(owner), "{} moved", name);
                 }
             }
@@ -868,7 +1027,7 @@ mod merge_properties {
                     })
                     .collect();
                 let exists = |f: &str| listed.iter().any(|(p, _)| p == f);
-                let owners = name_owners(&mut kept, &listed, exists);
+                let owners = name_owners(&mut kept, &listed, exists, |_| true);
                 let read: Vec<(String, String, Kubeconfig)> = order
                     .iter()
                     .filter_map(|&i| match &states[i] {
@@ -876,7 +1035,7 @@ mod merge_properties {
                         _ => None,
                     })
                     .collect();
-                let Some(merged) = merge_owned(read, &owners) else {
+                let Some(merged) = merge_owned(read, &owners, &mut kept) else {
                     prop_assert!(states.iter().all(|s| !matches!(s, File::Read(_))));
                     bare.clear();
                     continue;
