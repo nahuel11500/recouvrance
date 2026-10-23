@@ -473,6 +473,30 @@ fn diagnosis(ctx: &Ctx, cx: &App) -> Option<Div> {
     if findings.is_empty() {
         return None;
     }
+    let investigate = {
+        let summary: Vec<String> = findings
+            .iter()
+            .map(|f| {
+                let detail: String = f.detail.chars().take(1500).collect();
+                format!("- {}\n{}", f.title, detail).trim_end().to_string()
+            })
+            .collect();
+        let ev = crate::details::Investigate {
+            kind: ctx.kind.ar.kind.clone(),
+            name: s(ctx.obj, "/metadata/name").unwrap_or_default().to_string(),
+            namespace: ctx.ns(),
+            findings: summary.join("\n"),
+        };
+        let panel = ctx.panel.clone();
+        Button::new("investigate")
+            .small()
+            .outline()
+            .icon(Lucide::Sparkles)
+            .label("Investigate with the assistant")
+            .on_click(move |_, _, cx| {
+                let _ = panel.update(cx, |_, cx| cx.emit(ev.clone()));
+            })
+    };
     let theme = cx.theme();
     Some(
         v_flex()
@@ -487,7 +511,9 @@ fn diagnosis(ctx: &Ctx, cx: &App) -> Option<Div> {
                 h_flex()
                     .gap_2()
                     .child(Icon::new(Lucide::Stethoscope).text_color(theme.danger))
-                    .child(div().font_weight(FontWeight::SEMIBOLD).child("Diagnosis")),
+                    .child(div().font_weight(FontWeight::SEMIBOLD).child("Diagnosis"))
+                    .child(div().flex_1())
+                    .child(investigate),
             )
             .children(findings.into_iter().map(|f| {
                 let color = if f.level == crate::diagnose::Level::Critical { theme.danger } else { theme.warning };
@@ -526,12 +552,14 @@ fn conditions(obj: &Value, cx: &App) -> AnyElement {
         .children(conds.iter().map(|c| {
             let status = c["status"].as_str().unwrap_or_default().to_string();
             let ty = c["type"].as_str().unwrap_or_default();
-            let color = match (status.as_str(), crate::status::true_is_bad(ty)) {
-                ("True", true) => cx.theme().warning,
-                ("False", true) => cx.theme().success,
-                // Not known to be bad, so not drawn red either.
-                ("False", false) if !crate::status::true_is_good(ty) => muted,
-                _ => state_color(&status, cx),
+            use crate::status::Tone;
+            let color = match crate::status::condition_tone(ty, &status) {
+                Some(Tone::Good) => cx.theme().success,
+                // A problem the object reports about itself.
+                Some(Tone::Bad) if status == "True" => cx.theme().warning,
+                Some(Tone::Bad) => cx.theme().danger,
+                Some(Tone::Busy) => cx.theme().warning,
+                Some(Tone::Done) | None => muted,
             };
             h_flex()
                 .gap_3()
