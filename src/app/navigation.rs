@@ -231,6 +231,10 @@ impl AppView {
 
     pub(super) fn apply_route(&mut self, cx: &mut Context<Self>) {
         self.mark_visible(cx);
+        // Protection may have changed in Settings since the page was last shown.
+        if self.route().is_agents() {
+            self.agents.update(cx, |a, _| a.refresh_contexts());
+        }
         if let Route::Resources(Some(kind)) = self.route().clone()
             && self.kind.as_ref().map(|k| k.key()) != Some(kind.key())
         {

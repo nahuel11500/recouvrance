@@ -75,6 +75,20 @@ impl AssistantView {
         }
     }
 
+    /// A new chat with this question, stopping the one running.
+    pub fn start_over(&mut self, question: String, cx: &mut Context<Self>) {
+        self._task = None;
+        self.busy = false;
+        self.clear();
+        self.send(question, cx);
+    }
+
+    fn clear(&mut self) {
+        self.conv = Default::default();
+        self.entries.clear();
+        self.open.clear();
+    }
+
     pub fn send(&mut self, question: String, cx: &mut Context<Self>) {
         if self.busy {
             return;
@@ -324,9 +338,7 @@ impl Render for AssistantView {
                             .label("New chat")
                             .disabled(self.busy)
                             .on_click(cx.listener(|this, _, _, cx| {
-                                this.conv = Default::default();
-                                this.entries.clear();
-                                this.open.clear();
+                                this.clear();
                                 cx.notify();
                             })),
                     ),

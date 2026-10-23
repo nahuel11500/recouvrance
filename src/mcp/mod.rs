@@ -675,9 +675,9 @@ pub struct Hub {
     recent_calls: Mutex<HashMap<String, VecDeque<Instant>>>,
     /// Last MCP server status, for views created after it was reported.
     server_status: Mutex<Option<Result<u16, String>>>,
-    /// rules.yaml: its last load error, and the modification time already applied.
+    /// rules.yaml: its last load error, and the text last loaded or written (None: no file).
     rules_error: Mutex<Option<String>>,
-    rules_mtime: Mutex<Option<std::time::SystemTime>>,
+    rules_text: Mutex<Option<String>>,
     /// The lock on agents.lock while the app or `serve` runs (see [`Hub::claim_config`]).
     config_lock: Mutex<Option<std::fs::File>>,
     /// Why agents.json could not be read at start (see [`load_config`]).
@@ -757,7 +757,7 @@ impl Hub {
             rules_file_present: AtomicBool::new(rules_file::path().exists()),
             recent_calls: Mutex::default(),
             rules_error: Mutex::default(),
-            rules_mtime: Mutex::default(),
+            rules_text: Mutex::default(),
             config_lock: Mutex::default(),
             config_error,
         })
@@ -794,10 +794,13 @@ impl Hub {
     /// Load rules.yaml into the agents (creating agents it names). A broken file
     /// changes nothing: the error is kept for the Agents page.
     pub fn apply_rules_file(&self) -> Result<bool> {
-        let mtime = std::fs::metadata(rules_file::path()).and_then(|m| m.modified()).ok();
-        self.rules_file_present.store(rules_file::path().exists(), Ordering::Relaxed);
-        *lock(&self.rules_mtime) = mtime;
-        let file = match rules_file::load() {
+        let path = rules_file::path();
+        self.rules_file_present.store(path.exists(), Ordering::Relaxed);
+        let loaded = rules_file::read(&path).and_then(|text| {
+            *lock(&self.rules_text) = text.clone();
+            text.map(|t| rules_file::check(&t)).transpose()
+        });
+        let file = match loaded {
             Ok(Some(f)) => f,
             Ok(None) => {
                 *lock(&self.rules_error) = None;
@@ -831,10 +834,7 @@ impl Hub {
 
     /// Save new rules.yaml text from the app: validated first, then written and applied.
     pub fn save_rules_text(&self, text: &str) -> Result<()> {
-        let parsed: rules_file::RulesFile = crate::yaml::from_str(text).context("YAML")?;
-        for (name, rules) in &parsed.agents {
-            rules_file::apply(rules, &mut Policy::default()).with_context(|| format!("agent `{name}`"))?;
-        }
+        rules_file::check(text)?;
         write_private(&rules_file::path(), text.as_bytes())?;
         self.apply_rules_file().map(|_| ())
     }
@@ -846,8 +846,9 @@ impl Hub {
             loop {
                 tokio::time::sleep(Duration::from_secs(2)).await;
                 let Some(hub) = hub.upgrade() else { break };
-                let now = std::fs::metadata(rules_file::path()).and_then(|m| m.modified()).ok();
-                if now != *lock(&hub.rules_mtime) {
+                // By content: an edit within the same second as the last one still counts.
+                let now = rules_file::read(&rules_file::path()).ok().flatten();
+                if now != *lock(&hub.rules_text) {
                     let _ = hub.apply_rules_file();
                 }
             }
@@ -886,6 +887,19 @@ impl Hub {
     pub fn set_port(&self, port: u16) -> Result<()> {
         write(&self.config).port = port;
         self.save()
+    }
+
+    /// Visual edits keep rules.yaml in step when you use it (and it loaded fine), unless it
+    /// changed on disk since it was loaded: then your edit there wins and is loaded next.
+    fn export_rules(&self, agents: &[Agent]) -> Result<()> {
+        if !self.rules_file_active() || self.rules_error().is_some() {
+            return Ok(());
+        }
+        let mut seen = lock(&self.rules_text);
+        let text =
+            rules_file::export_over(&rules_file::path(), agents, seen.as_deref()).context("rules.yaml not updated")?;
+        *seen = Some(text);
+        Ok(())
     }
 
     fn save(&self) -> Result<()> {
@@ -928,10 +942,7 @@ impl Hub {
             }
             let mut agents = cfg.agents.clone();
             agents.push(agent.clone());
-            if self.rules_file_active() && self.rules_error().is_none() {
-                rules_file::export(&agents).context("rules.yaml not updated")?;
-                *lock(&self.rules_mtime) = std::fs::metadata(rules_file::path()).and_then(|m| m.modified()).ok();
-            }
+            self.export_rules(&agents)?;
             cfg.agents = agents;
         }
         self.save()?;
@@ -958,10 +969,9 @@ impl Hub {
             let mut agents = cfg.agents.clone();
             let agent = agents.iter_mut().find(|a| a.id == id).context("unknown agent")?;
             f(agent);
-            // Visual edits keep rules.yaml in step when you use it.
-            if self.rules_file_active() && self.rules_error().is_none() && !same_rules(&cfg.agents, &agents) {
-                rules_file::export(&agents).context("rules.yaml not updated")?;
-                *lock(&self.rules_mtime) = std::fs::metadata(rules_file::path()).and_then(|m| m.modified()).ok();
+            // rules.yaml doesn't hold the Enabled switch: only write it when names or rules change.
+            if !same_rules(&cfg.agents, &agents) {
+                self.export_rules(&agents)?;
             }
             cfg.agents = agents;
         }
@@ -975,13 +985,7 @@ impl Hub {
         let exported = {
             let mut cfg = write(&self.config);
             cfg.agents.retain(|a| a.id != id);
-            if self.rules_file_active() && self.rules_error().is_none() {
-                let exported = rules_file::export(&cfg.agents).map(|_| ()).context("rules.yaml not updated");
-                *lock(&self.rules_mtime) = std::fs::metadata(rules_file::path()).and_then(|m| m.modified()).ok();
-                exported
-            } else {
-                Ok(())
-            }
+            self.export_rules(&cfg.agents)
         };
         self.save()?;
         exported
@@ -1771,27 +1775,27 @@ mod tests {
 /// Properties of the rule engine over many generated policies and requests, rather than
 /// single examples: what a reviewer would otherwise have to check case by case.
 #[cfg(test)]
-mod properties {
+pub(crate) mod properties {
     use super::{Access, Approval, Mode, Policy, Rule};
     use proptest::prelude::*;
 
-    fn pattern() -> impl Strategy<Value = String> {
+    pub(crate) fn pattern() -> impl Strategy<Value = String> {
         prop_oneof![Just("*"), Just("a"), Just("b"), Just("a*"), Just("team-*"), Just("team-a")].prop_map(String::from)
     }
 
-    fn patterns() -> impl Strategy<Value = Vec<String>> {
+    pub(crate) fn patterns() -> impl Strategy<Value = Vec<String>> {
         prop::collection::vec(pattern(), 0..3)
     }
 
-    fn value() -> impl Strategy<Value = String> {
+    pub(crate) fn value() -> impl Strategy<Value = String> {
         prop_oneof![Just("a"), Just("b"), Just("ab"), Just("team-a"), Just("team-b")].prop_map(String::from)
     }
 
-    fn verb() -> impl Strategy<Value = String> {
+    pub(crate) fn verb() -> impl Strategy<Value = String> {
         prop_oneof![Just("get"), Just("list"), Just("delete"), Just("patch"), Just("exec")].prop_map(String::from)
     }
 
-    fn rule() -> impl Strategy<Value = Rule> {
+    pub(crate) fn rule() -> impl Strategy<Value = Rule> {
         (
             prop_oneof![Just(Mode::Allow), Just(Mode::Ask), Just(Mode::Deny)],
             prop::collection::vec(prop_oneof![verb(), Just("*".to_string())], 0..3),
@@ -1813,7 +1817,7 @@ mod properties {
             })
     }
 
-    fn access() -> impl Strategy<Value = Access> {
+    pub(crate) fn access() -> impl Strategy<Value = Access> {
         (verb(), value(), prop::option::of(value()), value(), prop::option::of(value())).prop_map(
             |(verb, resource, namespace, context, name)| Access {
                 context,
@@ -1827,7 +1831,7 @@ mod properties {
         )
     }
 
-    fn policy() -> impl Strategy<Value = Policy> {
+    pub(crate) fn policy() -> impl Strategy<Value = Policy> {
         prop::collection::vec(rule(), 0..6).prop_map(|rules| Policy { rules, ..Policy::default() })
     }
 

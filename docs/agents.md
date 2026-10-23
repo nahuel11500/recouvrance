@@ -15,7 +15,8 @@ without the window; there nobody can approve, so a call an *Ask me* rule covers 
 with "needs approval in the Recouvrance window": run the app, or add an Allow rule). A list where
 some rows ask and others are allowed (some namespaces, or some names) is not refused: when it is not
 approved (or cannot be), it shows only the allowed rows, and a rejection is still logged. Approving
-it shows the rows of every Ask rule the list meets. Rules changed while a call waits for approval
+it shows the rows of every Ask rule the list meets (`find_problems` asks to list pods: approving
+it shows other kinds' findings only where an Allow rule covers them). Rules changed while a call waits for approval
 apply to it: it is checked again once approved, and `apply_manifest` checks each object again
 before applying it. In **Agents**, click **Connect Claude Code**: it registers the server in your
 Claude Code (`claude mcp add --scope user recouvrance …`). There is one agent, "Claude", with its rules;
@@ -63,7 +64,8 @@ container must be a DNS label, an object name may hold only letters, digits and 
 `/`, `?`, `%`, `..` or spaces). An invalid name fails the call with a message saying why. What the
 API server returns must be the object asked for, and a Secret's values are masked whatever kind
 was asked for. `get_logs` returns at most 1 MiB. `drain_node` is refused, without cordoning, when
-the node runs pods it would evict in a namespace a Deny rule covers for `delete` on pods.
+the node runs pods it would evict in a namespace a Deny rule covers for `delete` on pods; its reply
+counts every pod it could not evict but names only those an Allow rule lets the agent list.
 
 Tools: `my_permissions`, `list_contexts`, `list_resource_types`, `list_resources`, `get_resource`,
 `describe_resource`, `top_pods`, `search`, `get_events`, `find_problems`, `check_certificates`, `usage_history`, `drain_node`, `gitops`,
