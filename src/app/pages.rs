@@ -39,7 +39,8 @@ impl AppView {
         };
         // No name: open the list of that kind (e.g. a CRD's instances).
         if name.is_empty() {
-            self.filter.update(cx, |f, cx| f.set_value("", window, cx));
+            // The table too: the same kind's list keeps its watch, and its filter with it.
+            self.apply_filter_text(String::new(), window, cx);
             self.select_kind(kind, cx);
             return;
         }
