@@ -117,15 +117,20 @@ fn pointer(path: &[String]) -> String {
     path.iter().map(|p| format!("/{}", p.replace('~', "~0").replace('/', "~1"))).collect()
 }
 
-/// The object at `path` in `doc`, made where it is missing or null. None when something
-/// on the way is not an object.
+/// The object at `path` in `doc`, made where it is missing or null. A list item is reached
+/// by its index (`containers/0`). None when something on the way is not an object or a list,
+/// or an index is past the end of its list.
 fn object_at<'a>(doc: &'a mut Value, path: &[String]) -> Option<&'a mut serde_json::Map<String, Value>> {
-    if !doc.is_object() {
+    if doc.is_null() {
         *doc = Value::Object(Default::default());
     }
     let mut v = doc;
     for seg in path {
-        let child = v.as_object_mut()?.entry(seg.clone()).or_insert(Value::Null);
+        let child = match v {
+            Value::Object(o) => o.entry(seg.clone()).or_insert(Value::Null),
+            Value::Array(items) => items.get_mut(seg.parse::<usize>().ok()?)?,
+            _ => return None,
+        };
         if child.is_null() {
             *child = Value::Object(Default::default());
         }
@@ -651,6 +656,12 @@ mod tests {
         let mut doc = serde_json::json!({"spec": null});
         assert_eq!(add_list_item(&mut doc, &path(&["spec", "template", "spec"]), "volumes"), Ok(0));
         assert_eq!(doc["spec"]["template"]["spec"]["volumes"], serde_json::json!([{}]));
+        // Inside a list item, reached by its index.
+        let mut doc = serde_json::json!({"spec": {"containers": [{"name": "a", "env": null}]}});
+        assert_eq!(add_list_item(&mut doc, &path(&["spec", "containers", "0"]), "env"), Ok(0));
+        assert_eq!(doc["spec"]["containers"][0]["env"], serde_json::json!([{}]));
+        assert!(add_list_item(&mut doc, &path(&["spec", "containers", "1"]), "env").is_err());
+        assert!(add_list_item(&mut serde_json::json!(["a"]), &path(&["spec"]), "env").is_err());
         // Not a list, or not an object on the way: said, not ignored.
         let mut doc = serde_json::json!({"spec": {"ports": "80", "x": 1}});
         assert!(add_list_item(&mut doc, &path(&["spec"]), "ports").is_err());
