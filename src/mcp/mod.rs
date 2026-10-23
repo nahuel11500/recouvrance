@@ -778,20 +778,9 @@ impl Hub {
                 self.emit(HubEvent::AgentSeen);
                 return Err(e);
             }
-            for (name, rules) in &file.agents {
-                if !cfg.agents.iter().any(|a| a.name == *name) {
-                    // A new agent from the file; its token is issued in the app ("New token").
-                    cfg.agents.push(Agent {
-                        id: uuid::Uuid::new_v4().simple().to_string()[..12].to_string(),
-                        name: name.clone(),
-                        token_sha256: String::new(),
-                        enabled: true,
-                        policy: Policy::default(),
-                    });
-                }
-                let agent = cfg.agents.iter_mut().find(|a| a.name == *name).expect("just added");
-                rules_file::apply(rules, &mut agent.policy)?;
-            }
+            let mut agents = cfg.agents.clone();
+            rules_file::apply_file(&file, &mut agents)?;
+            cfg.agents = agents;
         }
         *lock(&self.rules_error) = None;
         self.save()?;
@@ -880,7 +869,8 @@ impl Hub {
     }
 
     /// Creates an agent and returns it with its one-time token. Names are unique: rules.yaml
-    /// finds an agent by its name.
+    /// finds an agent by its name. With the file in use, the agent gets its section there
+    /// first (an agent the file doesn't name has no rules).
     pub fn create_agent(&self, name: String) -> Result<(Agent, String)> {
         let token = new_token();
         let agent = Agent {
@@ -895,7 +885,13 @@ impl Hub {
             if cfg.agents.iter().any(|a| a.name == agent.name) {
                 anyhow::bail!("an agent named `{}` already exists", agent.name);
             }
-            cfg.agents.push(agent.clone());
+            let mut agents = cfg.agents.clone();
+            agents.push(agent.clone());
+            if self.rules_file_active() && self.rules_error().is_none() {
+                rules_file::export(&agents).context("rules.yaml not updated")?;
+                *lock(&self.rules_mtime) = std::fs::metadata(rules_file::path()).and_then(|m| m.modified()).ok();
+            }
+            cfg.agents = agents;
         }
         self.save()?;
         Ok((agent, token))
@@ -930,9 +926,23 @@ impl Hub {
         self.save()
     }
 
+    /// Delete an agent, and its section of rules.yaml when that is in use (the next load of
+    /// the file would bring it back otherwise). The agent is deleted even if the file can't
+    /// be written; the error says so.
     pub fn delete_agent(&self, id: &str) -> Result<()> {
-        write(&self.config).agents.retain(|a| a.id != id);
-        self.save()
+        let exported = {
+            let mut cfg = write(&self.config);
+            cfg.agents.retain(|a| a.id != id);
+            if self.rules_file_active() && self.rules_error().is_none() {
+                let exported = rules_file::export(&cfg.agents).map(|_| ()).context("rules.yaml not updated");
+                *lock(&self.rules_mtime) = std::fs::metadata(rules_file::path()).and_then(|m| m.modified()).ok();
+                exported
+            } else {
+                Ok(())
+            }
+        };
+        self.save()?;
+        exported
     }
 
     pub fn agent_by_token(&self, token: &str) -> Option<Agent> {

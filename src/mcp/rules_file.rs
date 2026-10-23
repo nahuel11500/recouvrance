@@ -245,6 +245,33 @@ pub fn apply(rules: &AgentRules, p: &mut Policy) -> Result<()> {
     Ok(())
 }
 
+/// Apply the whole file to the agents: each section to the agent with its name (created
+/// when missing, with no token yet), and no rules at all for an agent the file doesn't
+/// name, so removing its section takes its access away.
+pub fn apply_file(file: &RulesFile, agents: &mut Vec<super::Agent>) -> Result<()> {
+    for (name, rules) in &file.agents {
+        let agent = match agents.iter().position(|a| a.name == *name) {
+            Some(i) => &mut agents[i],
+            None => {
+                // Its token is issued in the app ("New token").
+                agents.push(super::Agent {
+                    id: uuid::Uuid::new_v4().simple().to_string()[..12].to_string(),
+                    name: name.clone(),
+                    token_sha256: String::new(),
+                    enabled: true,
+                    policy: Policy::default(),
+                });
+                agents.last_mut().context("agent just added")?
+            }
+        };
+        apply(rules, &mut agent.policy).with_context(|| format!("agent `{name}`"))?;
+    }
+    for agent in agents.iter_mut().filter(|a| !file.agents.contains_key(&a.name)) {
+        agent.policy.rules.clear();
+    }
+    Ok(())
+}
+
 /// Read and validate the file; None when it does not exist.
 pub fn load() -> Result<Option<RulesFile>> {
     let text = match std::fs::read_to_string(path()) {
@@ -382,6 +409,28 @@ mod tests {
         assert!(from_policy(&Policy { rules: vec![r], ..Policy::default() }).is_err());
         let r = Rule { contexts: vec!["*".into()], expires: Some(jiff::Timestamp::now()), ..Rule::default() };
         assert!(from_policy(&Policy { rules: vec![r], ..Policy::default() }).is_ok());
+    }
+
+    #[test]
+    fn an_agent_the_file_does_not_name_has_no_rules() {
+        let agent = |id: &str, name: &str| super::super::Agent {
+            id: id.into(),
+            name: name.into(),
+            token_sha256: "hash".into(),
+            enabled: true,
+            policy: Policy { rules: vec![parse_rule(Mode::Allow, "* *").unwrap()], ..Policy::default() },
+        };
+        let mut agents = vec![agent("a", "Claude"), agent("b", "ci-bot")];
+        let f: RulesFile =
+            crate::yaml::from_str("agents:\n  Claude:\n    allow: [\"get pods\"]\n  new:\n    allow: [\"list *\"]\n")
+                .unwrap();
+        apply_file(&f, &mut agents).unwrap();
+        assert_eq!(agents.len(), 3);
+        assert_eq!(agents[0].policy.rules.len(), 1);
+        assert_eq!(agents[0].policy.rules[0].verbs, ["get"]);
+        assert!(agents[1].policy.rules.is_empty());
+        assert_eq!((agents[2].name.as_str(), agents[2].token_sha256.as_str()), ("new", ""));
+        assert_eq!(agents[2].policy.rules[0].verbs, ["list"]);
     }
 
     #[test]
