@@ -21,8 +21,13 @@ impl DetailPanel {
         );
     }
 
-    /// Ask for a path in the container, then copy it to ~/Downloads.
+    /// Ask for a path in the container, then copy it to ~/Downloads. It runs commands in the
+    /// container (`cat`, `tar`), so like a shell it needs write mode and a protected context's name.
     pub(super) fn download_dialog(&mut self, container: String, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.ensure_writes(window, cx) {
+            return;
+        }
+        let guard = self.protection(window, cx);
         let input = cx.new(|cx| {
             let mut s = InputState::new(window, cx).placeholder("/path/in/container");
             s.set_value("/etc/hostname", window, cx);
@@ -32,7 +37,7 @@ impl DetailPanel {
         let (ns, pod, ctx) =
             (self.obj.namespace.clone().unwrap_or_default(), self.obj.name.clone(), self.context.clone());
         window.open_alert_dialog(cx, move |alert, _, cx| {
-            let (input, panel, container) = (input.clone(), panel.clone(), container.clone());
+            let (input, panel, container, guard) = (input.clone(), panel.clone(), container.clone(), guard.clone());
             let path = input.read(cx).value().to_string();
             alert
                 .title(format!("Download from {container}"))
@@ -44,15 +49,18 @@ impl DetailPanel {
                         Some(&ns),
                         &format!("cp {} ./ -c {}", shell_word(&format!("{pod}:{path}")), shell_word(&container)),
                     ),
-                    None,
+                    guard.as_ref(),
                     cx,
                 ))
                 .show_cancel(true)
                 .ok_text("Download")
                 .on_ok(move |_, window, cx| {
                     let path = input.read(cx).value().trim().to_string();
-                    if path.is_empty() {
+                    if path.is_empty() || !guard_ok(guard.as_ref(), cx) {
                         return false;
+                    }
+                    if !writes_still_on(window, cx) {
+                        return true;
                     }
                     let container = container.clone();
                     let _ = panel.update(cx, |this, cx| {

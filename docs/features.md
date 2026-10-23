@@ -61,7 +61,8 @@
 - **Diagnosis** on pods and workloads: why it is broken (crash output and exit code, scheduling,
   image pulls, probes, volumes) and what to try.
 - **Rollback** of Deployments, StatefulSets and DaemonSets to any revision, with the diff and a
-  server dry run first; **attach** to a container's process; **file copy** in and out of containers;
+  server dry run first; **attach** to a container's process; **file copy** in and out of containers
+  (both ways it runs commands in the container, so it needs write mode, like a shell);
   **bulk scale**.
 - **Configuration**: edit ConfigMap/Secret values as key/value rows; create Secrets (Opaque, registry,
   TLS, basic auth) and ConfigMaps from forms.
