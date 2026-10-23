@@ -48,6 +48,7 @@ impl AppView {
         self.page_scopes.clear();
         // The palette's object index points at the old clusters.
         self.search_index.clear();
+        self.index_failed.clear();
         self.index_built = None;
         self._index_tasks.clear();
         self.status = Some(format!("Connecting to {}…", contexts.join(", ")).into());
