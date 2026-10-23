@@ -518,7 +518,7 @@ impl DetailPanel {
             let mut cmd = if force { format!("{base} --grace-period=0 --force") } else { base.clone() };
             // Delete first; finalizers are cleared only when it then stays, stuck terminating.
             if strip {
-                cmd = format!("{cmd} --wait=false && {unfinalize}");
+                cmd = format!("{cmd} --timeout={}s || {unfinalize}", k8s::FINALIZER_GRACE_SECS);
             }
             let (o1, o2) = (opts.clone(), opts.clone());
             alert
