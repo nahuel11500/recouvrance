@@ -2,7 +2,7 @@
 //! any thread (the Kubernetes side reads refresh rates and kubeconfig paths).
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex, RwLock};
 
 use serde::{Deserialize, Serialize};
@@ -264,6 +264,8 @@ static SETTINGS: LazyLock<RwLock<Settings>> = LazyLock::new(|| RwLock::new(load(
 static CHANGES: AtomicU64 = AtomicU64::new(0);
 /// The newest change on disk.
 static SAVED: Mutex<u64> = Mutex::new(0);
+/// The protection choices could not all be read: every context not set is protected.
+static PROTECTION_UNKNOWN: AtomicBool = AtomicBool::new(false);
 
 fn path() -> PathBuf {
     let base = std::env::var_os("XDG_CONFIG_HOME")
@@ -273,8 +275,9 @@ fn path() -> PathBuf {
 }
 
 /// The settings file. A field that does not read (a hand edit, or a value from a newer
-/// version) gets its default and the others, such as `protection`, are kept; the file
-/// is kept aside as `load_json` does.
+/// version) gets its default and the others, such as `protection`, are kept; in a map,
+/// only the entries that don't read are left out (see `fail_closed`). The file is kept
+/// aside as `load_json` does.
 fn load() -> Settings {
     let p = path();
     let Ok(bytes) = std::fs::read(&p) else { return Settings::default() };
@@ -282,26 +285,80 @@ fn load() -> Settings {
         Ok(v) => v,
         Err(e) => {
             eprintln!("{}: {e}; fields that don't read use their defaults ({})", p.display(), keep_aside(&p));
-            by_field(&bytes).unwrap_or_default()
+            let (mut s, left_out) =
+                by_field(&bytes).unwrap_or_else(|| (Settings::default(), vec![("protection".into(), None)]));
+            if fail_closed(&mut s, &left_out) {
+                PROTECTION_UNKNOWN.store(true, Ordering::Relaxed);
+            }
+            s
         }
     }
 }
 
+/// Fields left out of a JSON object, or a field and one of its entries.
+type LeftOut = Vec<(String, Option<String>)>;
+
+/// What was left out of the settings errs on the safe side: a protection choice that
+/// doesn't read protects its context, a delete setting that doesn't read asks for the
+/// name. True when the protection choices are lost as a whole: then every context not
+/// set must count as protected.
+fn fail_closed(s: &mut Settings, left_out: &[(String, Option<String>)]) -> bool {
+    let mut unknown = false;
+    for (field, entry) in left_out {
+        match (field.as_str(), entry) {
+            ("protection", Some(context)) => {
+                s.protection.insert(context.clone(), true);
+            }
+            ("delete_confirm_kinds", Some(kind)) => {
+                s.delete_confirm_kinds.insert(kind.clone(), DeleteConfirm::Type);
+            }
+            ("protection" | "protected_contexts", _) => unknown = true,
+            _ => {}
+        }
+    }
+    unknown
+}
+
 /// `T` from a JSON object, one field at a time: a field that does not read gets its
-/// default. None when the text is not a JSON object.
-fn by_field<T: Serialize + serde::de::DeserializeOwned + Default>(bytes: &[u8]) -> Option<T> {
+/// default, and in a map (such as `protection`) only the entries that don't read are
+/// left out. Also gives what was left out: a field, or a field and an entry. None when
+/// the text is not a JSON object.
+fn by_field<T: Serialize + serde::de::DeserializeOwned + Default>(bytes: &[u8]) -> Option<(T, LeftOut)> {
     let serde_json::Value::Object(fields) = serde_json::from_slice::<serde_json::Value>(bytes).ok()? else {
         return None;
     };
+    let reads = |v: &serde_json::Value| serde_json::from_value::<T>(v.clone()).is_ok();
     let mut merged = serde_json::to_value(T::default()).ok()?;
+    let mut left_out = Vec::new();
     for (key, value) in fields {
         let mut candidate = merged.clone();
-        candidate.as_object_mut()?.insert(key, value);
-        if serde_json::from_value::<T>(candidate.clone()).is_ok() {
+        candidate.as_object_mut()?.insert(key.clone(), value.clone());
+        if reads(&candidate) {
             merged = candidate;
+            continue;
         }
+        // A map: start empty and keep each entry that reads.
+        let serde_json::Value::Object(entries) = value else {
+            left_out.push((key, None));
+            continue;
+        };
+        candidate.as_object_mut()?.insert(key.clone(), serde_json::Value::Object(Default::default()));
+        if !reads(&candidate) {
+            left_out.push((key, None));
+            continue;
+        }
+        for (name, v) in entries {
+            let mut next = candidate.clone();
+            next[key.as_str()][name.as_str()] = v;
+            if reads(&next) {
+                candidate = next;
+            } else {
+                left_out.push((key.clone(), Some(name)));
+            }
+        }
+        merged = candidate;
     }
-    serde_json::from_value(merged).ok()
+    Some((serde_json::from_value(merged).ok()?, left_out))
 }
 
 /// Read a JSON file; missing means the defaults. A file that does not parse is kept
@@ -400,10 +457,12 @@ pub fn expand(p: &str) -> PathBuf {
 /// Whether writes on this context need an extra typed confirmation. A context never set
 /// is guessed from the kubeconfig; one the kubeconfig does not have now (or a kubeconfig
 /// that can't be read, say while a tool rewrites it) can't be guessed, so it is protected.
+/// So is every context not set when the settings file's choices could not be read.
 pub fn is_protected(context: &str) -> bool {
     migrate_protection();
     match with(|s| s.protection.get(context).copied()) {
         Some(chosen) => chosen,
+        None if PROTECTION_UNKNOWN.load(Ordering::Relaxed) => true,
         None => match crate::k8s::load_contexts() {
             Ok(c) => guess_protected(&c.names, &c.risky, context),
             Err(_) => true,
@@ -547,8 +606,8 @@ fn unix_now() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        DeleteConfirm, NamespaceVisit, Settings, by_field, delete_confirm_in, guess_protected, load_json, migrate_list,
-        recent_as_visits, record_visits, save_newest, visit_score, write_atomic,
+        DeleteConfirm, NamespaceVisit, Settings, by_field, delete_confirm_in, fail_closed, guess_protected, load_json,
+        migrate_list, recent_as_visits, record_visits, save_newest, visit_score, write_atomic,
     };
 
     #[test]
@@ -556,11 +615,32 @@ mod tests {
         let text =
             br#"{"protection": {"shop": true}, "delete_confirm": "from-a-newer-version", "metrics_refresh": 42}"#;
         assert!(serde_json::from_slice::<Settings>(text).is_err());
-        let s: Settings = by_field(text).unwrap();
+        let (s, left_out) = by_field::<Settings>(text).unwrap();
         assert_eq!(s.protection.get("shop"), Some(&true));
         assert_eq!(s.metrics_refresh, 42);
         assert_eq!(s.delete_confirm, Settings::default().delete_confirm);
+        assert_eq!(left_out, [("delete_confirm".to_string(), None)]);
         assert!(by_field::<Settings>(b"{ not json").is_none());
+    }
+
+    #[test]
+    fn a_bad_entry_keeps_the_others_and_errs_on_the_safe_side() {
+        let text = br#"{"protection": {"shop": false, "lab": "no", "prod": true},
+            "delete_confirm_kinds": {"Pod": "off", "Node": "maybe"},
+            "context_files": {"prod": "~/.kube/a", "dev": 3}}"#;
+        let (mut s, left_out) = by_field::<Settings>(text).unwrap();
+        assert_eq!(s.protection.get("shop"), Some(&false));
+        assert_eq!(s.protection.get("prod"), Some(&true));
+        assert_eq!(s.protection.get("lab"), None);
+        assert_eq!(s.delete_confirm_kinds.get("Pod"), Some(&DeleteConfirm::Off));
+        assert_eq!(s.context_files.get("prod").map(String::as_str), Some("~/.kube/a"));
+        assert_eq!(s.context_files.get("dev"), None);
+        assert!(!fail_closed(&mut s, &left_out));
+        assert_eq!(s.protection.get("lab"), Some(&true));
+        assert_eq!(s.delete_confirm_kinds.get("Node"), Some(&DeleteConfirm::Type));
+        // Protection that isn't a map at all: every context not set is protected.
+        let (mut s, left_out) = by_field::<Settings>(br#"{"protection": ["shop"]}"#).unwrap();
+        assert!(fail_closed(&mut s, &left_out));
     }
 
     #[test]
