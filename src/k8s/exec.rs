@@ -162,12 +162,13 @@ pub(super) async fn exec_bytes(
         out.extend_from_slice(b);
         Ok(())
     };
+    let stdin = stdin.map(std::io::Cursor::new);
     exec_to(client, ns, pod, container, command, stdin, &mut sink, MAX_EXEC_OUTPUT).await?;
     Ok(out)
 }
 
-/// Run a command with optional stdin, streaming its stdout into `sink` (at most `max`
-/// bytes, more is an error). Returns the bytes written.
+/// Run a command with optional stdin (streamed from a reader), streaming its stdout into
+/// `sink` (at most `max` bytes, more is an error). Returns the bytes written.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn exec_to(
     client: Client,
@@ -175,7 +176,7 @@ pub(super) async fn exec_to(
     pod: String,
     container: Option<String>,
     command: Vec<String>,
-    stdin: Option<Vec<u8>>,
+    stdin: Option<impl tokio::io::AsyncBufRead + Unpin>,
     sink: &mut impl FnMut(&[u8]) -> std::io::Result<()>,
     max: u64,
 ) -> Result<u64> {
@@ -193,9 +194,9 @@ pub(super) async fn exec_to(
     // ("broken pipe"), and what it said on stderr is the better message.
     let writer = async {
         let mut written = Ok(());
-        if let (Some(data), Some(mut w)) = (stdin, proc.stdin()) {
+        if let (Some(mut data), Some(mut w)) = (stdin, proc.stdin()) {
             written = async {
-                w.write_all(&data).await?;
+                tokio::io::copy_buf(&mut data, &mut w).await?;
                 w.shutdown().await
             }
             .await;
@@ -260,7 +261,7 @@ pub async fn download_from_container(
         // Through a buffer, and off the async workers while the disk is written.
         let mut file = std::io::BufWriter::with_capacity(1 << 20, file);
         let mut sink = |b: &[u8]| tokio::task::block_in_place(|| file.write_all(b));
-        let copied = exec_to(client, ns, pod, container, cmd, None, &mut sink, MAX_DOWNLOAD_BYTES).await;
+        let copied = exec_to(client, ns, pod, container, cmd, None::<&[u8]>, &mut sink, MAX_DOWNLOAD_BYTES).await;
         let copied = copied.and_then(|_| Ok(tokio::task::block_in_place(|| file.flush())?));
         drop(file);
         if let Err(e) = copied {
@@ -296,21 +297,24 @@ pub async fn upload_to_container(
     dir: String,
 ) -> Result<String> {
     run(async move {
-        let data = std::fs::read(&local)?;
         let name = local.file_name().and_then(|n| n.to_str()).context("bad file name")?.to_string();
         let dest = format!("{}/{name}", dir.trim_end_matches('/'));
-        exec_bytes(
-            client,
-            ns,
-            pod,
-            container,
-            vec!["sh".into(), "-c".into(), format!("cat > {}", shell_quote(&dest))],
-            Some(data),
-        )
-        .await?;
+        let file = upload_source(&local).await?;
+        let cmd = vec!["sh".into(), "-c".into(), format!("cat > {}", shell_quote(&dest))];
+        let mut sink = |_: &[u8]| Ok(());
+        exec_to(client, ns, pod, container, cmd, Some(file), &mut sink, MAX_EXEC_OUTPUT).await?;
         Ok(dest)
     })
     .await
+}
+
+/// A local file to upload, read a MiB at a time as it is sent: a big one is never held in
+/// memory, and the shared runtime's workers don't wait on the disk.
+async fn upload_source(local: &std::path::Path) -> Result<tokio::io::BufReader<tokio::fs::File>> {
+    let file = tokio::fs::File::open(local).await?;
+    // Caught before the command runs, which would leave an empty file behind.
+    anyhow::ensure!(file.metadata().await?.is_file(), "{} is not a file", local.display());
+    Ok(tokio::io::BufReader::with_capacity(1 << 20, file))
 }
 
 /// Run a command (no tty) and capture its output, like `kubectl exec -- cmd`.
@@ -398,11 +402,13 @@ pub async fn run_command(
 }
 
 /// Whether a helm command line changes the cluster: install, upgrade, rollback or
-/// uninstall, unless it is a dry run.
+/// uninstall, unless it is a dry run. Only `--dry-run`, `=client` and `=server` are dry runs
+/// (`--dry-run=false` or `=none` is a real one), and the last one given is what helm uses.
 pub fn helm_writes(args: &[String]) -> bool {
     let first = args.iter().find(|a| !a.starts_with('-')).map(String::as_str);
+    let dry_run = args.iter().rev().find(|a| *a == "--dry-run" || a.starts_with("--dry-run="));
     matches!(first, Some("install" | "upgrade" | "rollback" | "uninstall" | "delete"))
-        && !args.iter().any(|a| a == "--dry-run" || a.starts_with("--dry-run="))
+        && !matches!(dry_run.map(String::as_str), Some("--dry-run" | "--dry-run=client" | "--dry-run=server"))
 }
 
 /// Run the `helm` CLI against a context and return its output. A command that changes the
@@ -673,8 +679,37 @@ fn attach_target(
 
 #[cfg(test)]
 mod tests {
-    use super::{attach_target, copy_capped, crlf, read_capped, tar_source};
+    use super::{attach_target, copy_capped, crlf, helm_writes, read_capped, tar_source, upload_source};
     use k8s_openapi::api::core::v1::{Container, EphemeralContainer, PodSpec};
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn uploads_stream_a_file_and_refuse_a_folder() {
+        use tokio::io::AsyncReadExt as _;
+        let dir = std::env::temp_dir().join(format!("recouvrance-test-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("data.bin");
+        let data: Vec<u8> = (0..3 << 20).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&file, &data).unwrap();
+        let mut read = Vec::new();
+        upload_source(&file).await.unwrap().read_to_end(&mut read).await.unwrap();
+        assert!(read == data);
+        assert!(upload_source(&dir).await.is_err());
+        assert!(upload_source(&dir.join("missing")).await.is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn only_a_real_dry_run_gets_past_the_write_gate() {
+        let writes = |line: &str| helm_writes(&line.split(' ').map(String::from).collect::<Vec<_>>());
+        assert!(writes("upgrade web ./chart"));
+        assert!(!writes("upgrade web ./chart --dry-run"));
+        assert!(!writes("upgrade web ./chart --dry-run=server"));
+        assert!(!writes("install web ./chart --dry-run=client"));
+        assert!(writes("upgrade web ./chart --dry-run=false"));
+        assert!(writes("upgrade web ./chart --dry-run=none"));
+        assert!(writes("upgrade web ./chart --dry-run --dry-run=false"));
+        assert!(!writes("history web"));
+    }
 
     #[test]
     fn attach_keeps_the_requested_container() {
