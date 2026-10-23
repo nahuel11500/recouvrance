@@ -515,6 +515,7 @@ impl AppView {
             t.delegate_mut().set_filter(filter);
             cx.notify();
         });
+        self.follow_selection(cx);
     }
 
     /// Save the rows shown (filtered, sorted, visible columns) as CSV in ~/Downloads.

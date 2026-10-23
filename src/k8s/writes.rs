@@ -293,36 +293,62 @@ async fn start_node_shell(client: Client, node: String, image: String, dry_run: 
         if dry_run {
             return Ok(format!("[dry run] node shell pod {name} accepted on {}", NODE_SHELL_NS));
         }
-        for _ in 0..120 {
-            let p = api.get(&name).await?;
-            let phase = p.status.as_ref().and_then(|s| s.phase.clone()).unwrap_or_default();
-            if phase == "Running" {
-                return Ok(name);
-            }
-            if phase == "Failed" || phase == "Succeeded" {
-                let _ = api.delete(&name, &Default::default()).await;
-                anyhow::bail!("node shell pod ended ({phase})");
-            }
-            let waiting = p.status.and_then(|s| s.container_statuses).unwrap_or_default().into_iter().find_map(|c| c.state.and_then(|s| s.waiting));
-            if let Some(w) = waiting.filter(|w| matches!(w.reason.as_deref(), Some("ErrImagePull" | "ImagePullBackOff" | "CreateContainerConfigError"))) {
-                let _ = api.delete(&name, &Default::default()).await;
-                anyhow::bail!("{}: {}", w.reason.unwrap_or_default(), w.message.unwrap_or_default());
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        // Delete the pod on every way out but a running shell: it is privileged.
+        let started = wait_node_shell(&api, &name).await;
+        if started.is_err() {
+            remove_node_shell(&api, &name).await;
         }
-        let _ = api.delete(&name, &Default::default()).await;
-        anyhow::bail!("node shell pod did not start within 60s")
+        started.map(|()| name)
     })
     .await
+}
+
+/// Wait for a node shell pod to run, or say why it will not.
+async fn wait_node_shell(api: &Api<Pod>, name: &str) -> Result<()> {
+    for _ in 0..120 {
+        let p = api.get(name).await?;
+        let phase = p.status.as_ref().and_then(|s| s.phase.clone()).unwrap_or_default();
+        if phase == "Running" {
+            return Ok(());
+        }
+        if phase == "Failed" || phase == "Succeeded" {
+            anyhow::bail!("node shell pod ended ({phase})");
+        }
+        let waiting = p
+            .status
+            .and_then(|s| s.container_statuses)
+            .unwrap_or_default()
+            .into_iter()
+            .find_map(|c| c.state.and_then(|s| s.waiting));
+        if let Some(w) = waiting.filter(|w| {
+            matches!(w.reason.as_deref(), Some("ErrImagePull" | "ImagePullBackOff" | "CreateContainerConfigError"))
+        }) {
+            anyhow::bail!("{}: {}", w.reason.unwrap_or_default(), w.message.unwrap_or_default());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    anyhow::bail!("node shell pod did not start within 60s")
 }
 
 /// Delete a node shell pod in the background (when its page goes away).
 pub fn delete_node_shell(client: Client, name: String) {
     spawn_detached(async move {
-        let api: Api<Pod> = Api::namespaced(client, NODE_SHELL_NS);
-        let _ =
-            api.delete(&name, &kube::api::DeleteParams { grace_period_seconds: Some(0), ..Default::default() }).await;
+        remove_node_shell(&Api::namespaced(client, NODE_SHELL_NS), &name).await;
     });
+}
+
+/// Delete a node shell pod now, trying again a few times: the error that made us give up on
+/// it (a 429, a 5xx, a network blip) often fails the first delete too.
+async fn remove_node_shell(api: &Api<Pod>, name: &str) {
+    let dp = kube::api::DeleteParams { grace_period_seconds: Some(0), ..Default::default() };
+    for _ in 0..5 {
+        match api.delete(name, &dp).await {
+            Ok(_) => return,
+            // Gone already, or refused: trying again won't help.
+            Err(kube::Error::Api(e)) if e.code != 429 && e.code < 500 => return,
+            Err(_) => tokio::time::sleep(std::time::Duration::from_secs(2)).await,
+        }
+    }
 }
 
 /// Ask Flux to reconcile now (what `flux reconcile` does).

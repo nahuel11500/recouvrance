@@ -754,7 +754,7 @@ pub(super) fn pdb_page(ctx: &Ctx, cx: &App) -> Div {
 }
 
 /// Whether a PodDisruptionBudget stops evictions now: none allowed, with pods to protect.
-fn pdb_blocks(obj: &Value) -> bool {
+pub(crate) fn pdb_blocks(obj: &Value) -> bool {
     n(obj, "/status/disruptionsAllowed").unwrap_or(0) == 0 && n(obj, "/status/expectedPods").unwrap_or(0) > 0
 }
 

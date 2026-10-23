@@ -39,7 +39,8 @@ impl AppView {
         };
         // No name: open the list of that kind (e.g. a CRD's instances).
         if name.is_empty() {
-            self.filter.update(cx, |f, cx| f.set_value("", window, cx));
+            // The table too: the same kind's list keeps its watch, and its filter with it.
+            self.apply_filter_text(String::new(), window, cx);
             self.select_kind(kind, cx);
             return;
         }
@@ -194,8 +195,8 @@ impl AppView {
 
     pub(super) fn open_access(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some((context, client)) = self.clusters.first().cloned() else { return };
-        let ns = self.namespace.clone();
-        let page = cx.new(|cx| crate::ui::access_view::AccessView::new(context, client, ns, window, cx));
+        let (kinds, ns) = (self.kinds.clone(), self.namespace.clone());
+        let page = cx.new(|cx| crate::ui::access_view::AccessView::new(context, client, kinds, ns, window, cx));
         self.navigate(Route::Access(page), cx);
     }
 
@@ -258,8 +259,14 @@ impl AppView {
             return;
         }
         let list = cx.new(|cx| HelmList::new(self.clusters.clone(), self.namespace.clone(), window, cx));
+        self.subscribe_helm(&list, window, cx);
+        self.navigate(Route::Helm(list), cx);
+    }
+
+    /// Open a release or the install page from the release list (also after F5).
+    pub(super) fn subscribe_helm(&mut self, list: &Entity<HelmList>, window: &mut Window, cx: &mut Context<Self>) {
         // Released with the page.
-        cx.subscribe_in(&list, window, |this, _, ev: &OpenRelease, window, cx| {
+        cx.subscribe_in(list, window, |this, _, ev: &OpenRelease, window, cx| {
             let release = ev.0.clone();
             let Some((context, client)) = this.clusters.iter().find(|(c, _)| *c == release.context).cloned() else {
                 return;
@@ -268,10 +275,9 @@ impl AppView {
             this.navigate(Route::HelmRelease(page), cx);
         })
         .detach();
-        cx.subscribe_in(&list, window, |this, _, _: &crate::ui::helm::OpenInstall, window, cx| {
+        cx.subscribe_in(list, window, |this, _, _: &crate::ui::helm::OpenInstall, window, cx| {
             this.open_helm_install(window, cx)
         })
         .detach();
-        self.navigate(Route::Helm(list), cx);
     }
 }

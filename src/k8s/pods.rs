@@ -55,26 +55,36 @@ pub async fn events_for(client: Client, obj: ObjectRef) -> Result<Vec<EventLine>
         };
         let lp = ListParams::default().fields(&fields);
         let mut items = api.list(&lp).await?.items;
-        let when = |e: &Event| {
-            e.last_timestamp
-                .as_ref()
-                .map(|t| t.0.to_string())
-                .or_else(|| e.event_time.as_ref().map(|t| t.0.to_string()))
-                .unwrap_or_default()
-        };
-        items.sort_by_key(|e| std::cmp::Reverse(when(e)));
+        items.sort_by_key(|e| std::cmp::Reverse(event_last(e)));
         Ok(items
             .iter()
             .map(|e| EventLine {
-                age: when(e).parse::<jiff::Timestamp>().map(age).unwrap_or_default(),
+                age: event_last(e).map(age).unwrap_or_default(),
                 kind: e.type_.clone().unwrap_or_default(),
                 reason: e.reason.clone().unwrap_or_default(),
                 message: e.message.clone().unwrap_or_default(),
-                count: e.count.unwrap_or(1),
+                count: event_count(e),
             })
             .collect())
     })
     .await
+}
+
+/// When an event last happened. Events recorded through events.k8s.io (kube-scheduler,
+/// for example) keep their repeats in `series`.
+fn event_last(e: &Event) -> Option<jiff::Timestamp> {
+    e.series
+        .as_ref()
+        .and_then(|s| s.last_observed_time.as_ref())
+        .map(|t| t.0)
+        .or_else(|| e.last_timestamp.as_ref().map(|t| t.0))
+        .or_else(|| e.event_time.as_ref().map(|t| t.0))
+        .or_else(|| e.metadata.creation_timestamp.as_ref().map(|t| t.0))
+}
+
+/// How many times an event happened, its `series` included.
+fn event_count(e: &Event) -> i32 {
+    e.series.as_ref().and_then(|s| s.count).unwrap_or(0).max(e.count.unwrap_or(0)).max(1)
 }
 
 /// The field selector for an object's events: by uid when it is known, else by kind
@@ -162,6 +172,9 @@ fn line_time(line: &str) -> Option<jiff::Timestamp> {
     line.split_once(' ')?.0.parse().ok()
 }
 
+/// A followed stream that sends nothing for this long is asked again from its last line.
+const LOG_IDLE: std::time::Duration = std::time::Duration::from_secs(120);
+
 /// Wait before reconnecting: 1s, 2s, 4s… up to 30s.
 fn reconnect_delay(failures: u32) -> std::time::Duration {
     std::time::Duration::from_secs((1u64 << failures.saturating_sub(1).min(5)).min(30))
@@ -205,14 +218,28 @@ pub fn stream_logs(
     let (tx, rx) = mpsc::unbounded();
     let guard = spawn_guarded(async move {
         let api: Api<Pod> = Api::namespaced(client, &ns);
-        let mut last_seen: Option<jiff::Timestamp> = None;
+        let mut shown = Shown::default();
         let mut failures = 0u32;
         loop {
-            let lp = stream_params(container.clone(), previous, since_seconds, last_seen);
-            let outcome: Result<()> = async {
-                let reader = api.log_stream(&pod, &lp).await?;
+            let lp = stream_params(container.clone(), previous, since_seconds, shown.newest);
+            // A reconnect asks from the second of the newest line shown: those lines come again.
+            let mut repeats = shown.repeats();
+            // Ok(true): the stream went quiet for `LOG_IDLE`.
+            let outcome: Result<bool> = async {
+                let reader = tokio::time::timeout(LOG_IDLE, api.log_stream(&pod, &lp))
+                    .await
+                    .map_err(|_| anyhow!("no answer from the API server"))??;
                 let mut lines = std::pin::pin!(lossy_lines(reader, MAX_LINE_BYTES).ready_chunks(500));
-                while let Some(chunk) = lines.next().await {
+                loop {
+                    let next = if previous {
+                        lines.next().await
+                    } else {
+                        match tokio::time::timeout(LOG_IDLE, lines.next()).await {
+                            Ok(next) => next,
+                            Err(_) => return Ok(true),
+                        }
+                    };
+                    let Some(chunk) = next else { break };
                     let mut out = Vec::with_capacity(chunk.len());
                     let mut cut = None;
                     for line in chunk {
@@ -224,11 +251,8 @@ pub fn stream_logs(
                             }
                         }
                     }
-                    // After a reconnect, lines up to the last one seen come again.
-                    let out = unseen(out, last_seen);
-                    if let Some(t) = out.iter().rev().find_map(|l| line_time(l)) {
-                        last_seen = Some(t);
-                    }
+                    let out = drop_repeats(out, &mut repeats);
+                    shown.note(&out);
                     if !out.is_empty() {
                         failures = 0;
                         tx.unbounded_send(LogMsg::Lines(out))?;
@@ -237,7 +261,7 @@ pub fn stream_logs(
                         return Err(e.into());
                     }
                 }
-                Ok(())
+                Ok(false)
             }
             .await;
             if tx.is_closed() {
@@ -245,7 +269,10 @@ pub fn stream_logs(
             }
             // `previous` logs are complete; a stream that cannot come back is over.
             let why = match &outcome {
-                Ok(()) if previous || !still_running(&api, &pod).await => {
+                // The container may just be quiet, or the connection died without closing
+                // (sleep, VPN, a load balancer's idle timeout): ask again from the last line.
+                Ok(true) => continue,
+                Ok(false) if previous || !still_running(&api, &pod).await => {
                     let _ = tx.unbounded_send(LogMsg::End);
                     return;
                 }
@@ -253,7 +280,7 @@ pub fn stream_logs(
                     let _ = tx.unbounded_send(LogMsg::Error(short_error(e)));
                     return;
                 }
-                Ok(()) => "stream closed".to_string(),
+                Ok(false) => "stream closed".to_string(),
                 Err(e) => short_error(e),
             };
             failures = failures.saturating_add(1);
@@ -266,12 +293,69 @@ pub fn stream_logs(
     (guard, rx)
 }
 
-/// Lines newer than `seen` (all of them when nothing was seen; lines without a time stay).
-fn unseen(lines: Vec<String>, seen: Option<jiff::Timestamp>) -> Vec<String> {
-    match seen {
-        None => lines,
-        Some(seen) => lines.into_iter().filter(|l| line_time(l).is_none_or(|t| t > seen)).collect(),
+/// What a followed stream has shown: its newest line's time, and the lines (hashed) since
+/// the start of that second, which a reconnect from that second sends again.
+#[derive(Default)]
+struct Shown {
+    newest: Option<jiff::Timestamp>,
+    lines: Vec<(jiff::Timestamp, u64)>,
+}
+
+impl Shown {
+    /// Note lines just shown.
+    fn note(&mut self, lines: &[String]) {
+        for line in lines {
+            let Some(t) = line_time(line) else { continue };
+            let second = self.newest.map(|n| n.as_second());
+            if self.newest.is_none_or(|n| t > n) {
+                self.newest = Some(t);
+                if second != Some(t.as_second()) {
+                    self.lines.retain(|(l, _)| l.as_second() >= t.as_second());
+                }
+            }
+            if self.newest.is_some_and(|n| t.as_second() >= n.as_second()) {
+                self.lines.push((t, line_hash(line)));
+            }
+        }
     }
+
+    /// How many times each line shown comes again after a reconnect.
+    fn repeats(&self) -> HashMap<u64, usize> {
+        let mut out = HashMap::new();
+        for (_, h) in &self.lines {
+            *out.entry(*h).or_insert(0) += 1;
+        }
+        out
+    }
+}
+
+/// A line's hash, to recognize it when it comes again.
+fn line_hash(line: &str) -> u64 {
+    use std::hash::{Hash as _, Hasher as _};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    line.hash(&mut h);
+    h.finish()
+}
+
+/// `lines` without the ones already shown before a reconnect. Lines are matched whole
+/// (time included), so lines sharing a time, or out of time order (stdout and stderr),
+/// are neither lost nor shown twice.
+fn drop_repeats(lines: Vec<String>, repeats: &mut HashMap<u64, usize>) -> Vec<String> {
+    if repeats.is_empty() {
+        return lines;
+    }
+    lines
+        .into_iter()
+        .filter(|l| {
+            let h = line_hash(l);
+            let Some(n) = repeats.get_mut(&h) else { return true };
+            *n -= 1;
+            if *n == 0 {
+                repeats.remove(&h);
+            }
+            false
+        })
+        .collect()
 }
 
 /// Lines split on `\n`, decoded leniently: a log line with invalid UTF-8 shows
@@ -352,6 +436,28 @@ mod tests {
     }
 
     #[test]
+    fn event_series_count_and_time() {
+        let event = |v: serde_json::Value| serde_json::from_value::<k8s_openapi::api::core::v1::Event>(v).unwrap();
+        let e = event(serde_json::json!({
+            "metadata": {"name": "web.1", "creationTimestamp": "2024-01-01T00:00:00Z"},
+            "involvedObject": {},
+            "eventTime": "2024-01-01T00:00:00.000000Z",
+            "series": {"count": 300, "lastObservedTime": "2024-01-01T02:00:00.000000Z"},
+        }));
+        assert_eq!(super::event_count(&e), 300);
+        assert_eq!(super::event_last(&e), "2024-01-01T02:00:00Z".parse().ok());
+        let e = event(serde_json::json!({
+            "metadata": {"name": "web.2"},
+            "involvedObject": {},
+            "count": 4,
+            "lastTimestamp": "2024-01-01T01:00:00Z",
+        }));
+        assert_eq!(super::event_count(&e), 4);
+        assert_eq!(super::event_last(&e), "2024-01-01T01:00:00Z".parse().ok());
+        assert_eq!(super::event_count(&event(serde_json::json!({"metadata": {}, "involvedObject": {}}))), 1);
+    }
+
+    #[test]
     fn events_by_uid_else_by_name() {
         let uid = "0b6f3c1e-8f7a-4c2e-9d1b-2a3c4d5e6f70";
         assert_eq!(super::events_selector("Pod", "web-1", uid).unwrap(), format!("involvedObject.uid={uid}"));
@@ -386,9 +492,18 @@ mod tests {
     fn reconnects_resume_after_the_last_line() {
         let t = |s: i64| jiff::Timestamp::from_second(1_700_000_000 + s).unwrap();
         let line = |s: i64, text: &str| format!("{} {text}", t(s));
-        let got = super::unseen(vec![line(1, "old"), line(2, "seen"), line(3, "new"), "no time".into()], Some(t(2)));
-        assert_eq!(got, [line(3, "new"), "no time".to_string()]);
-        assert_eq!(super::unseen(vec![line(1, "a")], None).len(), 1);
+        // CRI-O stamps a whole read with one time; stderr can be stamped before stdout.
+        let mut shown = super::Shown::default();
+        shown.note(&[line(0, "older second"), line(2, "a"), line(2, "b")]);
+        shown.note(&[line(2, "b"), line(3, "stdout"), line(2, "stderr")]);
+        assert_eq!(shown.newest, Some(t(3)));
+        // The reconnect from second 3 sends that second's lines again, then new ones.
+        let mut repeats = shown.repeats();
+        let got = super::drop_repeats(vec![line(3, "stdout")], &mut repeats);
+        assert!(got.is_empty());
+        let got = super::drop_repeats(vec![line(3, "new"), line(3, "stdout"), "no time".into()], &mut repeats);
+        assert_eq!(got, [line(3, "new"), line(3, "stdout"), "no time".to_string()]);
+        assert_eq!(super::drop_repeats(vec![line(1, "a")], &mut Default::default()).len(), 1);
         // Resuming asks from the whole second of the last line, without a tail.
         let resume: jiff::Timestamp = "2024-01-01T00:00:05.75Z".parse().unwrap();
         let lp = super::stream_params(None, false, Some(60), Some(resume));
