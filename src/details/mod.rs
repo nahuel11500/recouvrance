@@ -492,6 +492,9 @@ impl DetailPanel {
             match result {
                 Ok(value) => {
                     let taken = this.set_object(value, cx);
+                    if taken {
+                        this.pod_logs_containers(window, cx);
+                    }
                     if taken && reset_yaml || this.yaml.read(cx).value().as_ref() == this.yaml_text {
                         this.refresh_yaml(window, cx);
                     }
@@ -604,6 +607,7 @@ impl DetailPanel {
                     if !changed || !this.set_object(value, cx) {
                         return;
                     }
+                    this.pod_logs_containers(window, cx);
                     // Don't overwrite what the user is editing.
                     if this.yaml.read(cx).value().as_ref() == this.yaml_text {
                         this.refresh_yaml(window, cx);
@@ -828,6 +832,17 @@ impl DetailPanel {
         true
     }
 
+    /// A pod page's logs take the containers from the pod as read, so they know which one
+    /// to read without waiting for their own listing (or when it fails).
+    fn pod_logs_containers(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.obj.kind.is("", "Pod") {
+            return;
+        }
+        let (Some(value), Some(logs)) = (&self.object, &self.logs) else { return };
+        let pods = own_pod_logs(&self.obj.name, value);
+        logs.update(cx, |l, cx| l.set_pods(pods, window, cx));
+    }
+
     fn ctx<'a>(&'a self, value: &'a serde_json::Value, cx: &Context<Self>) -> Ctx<'a> {
         self.ctx_for(value, cx.entity().downgrade())
     }
@@ -865,6 +880,11 @@ impl DetailPanel {
     }
 }
 
+/// What a pod page's logs follow: the pod, with its containers (default first).
+fn own_pod_logs(name: &str, pod: &serde_json::Value) -> Vec<(String, Vec<String>)> {
+    vec![(name.to_string(), k8s::pod_containers(pod))]
+}
+
 /// The uid of a read of the object when it isn't the one the page knows (which is empty
 /// for a page opened by name).
 fn new_uid(known: &str, read: &serde_json::Value) -> Option<String> {
@@ -882,8 +902,15 @@ impl Drop for DetailPanel {
 
 #[cfg(test)]
 mod tests {
-    use super::new_uid;
+    use super::{new_uid, own_pod_logs};
     use serde_json::json;
+
+    #[test]
+    fn a_pod_page_logs_know_the_pods_containers() {
+        let pod = json!({"spec": {"containers": [{"name": "app"}, {"name": "proxy"}]}});
+        let names = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(own_pod_logs("web-1", &pod), vec![("web-1".to_string(), names(&["app", "proxy"]))]);
+    }
 
     #[test]
     fn a_recreated_object_has_a_new_uid() {
