@@ -115,7 +115,8 @@ comma-separated, `*` globs work everywhere, an omitted part means `*`, and `-` i
 (the rule matches nothing; an exported rule with nothing chosen yet is written that way). Deny wins, then ask,
 then allow; anything no rule matches is denied. `approved` lists the requests you approved with
 *Always allow this* or *Allow for 1h*: they are allowed even where an ask rule matches, never where a
-deny rule does. The file is reloaded when it changes.
+deny rule does. The file is reloaded when it changes, and edits on the Agents page are written back
+to it (its comments are not kept).
 
 ## plugins.yaml
 

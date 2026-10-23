@@ -67,6 +67,8 @@ struct RuleInputs {
 struct Editor {
     agent_id: String,
     rules: Vec<RuleInputs>,
+    /// The rules the inputs show, to rebuild them when the rules change elsewhere.
+    shown: Vec<Rule>,
     max_lines: Entity<InputState>,
     max_rows: Entity<InputState>,
     exec_timeout: Entity<InputState>,
@@ -286,14 +288,26 @@ impl AgentsView {
         limit(&max_rows, |p, n| p.max_rows = n, &mut subs, window, cx);
         limit(&exec_timeout, |p, n| p.exec_timeout = n, &mut subs, window, cx);
         limit(&rate, |p, n| p.max_calls_per_minute = n, &mut subs, window, cx);
-        self.editor =
-            Some(Editor { agent_id: agent.id.clone(), rules, max_lines, max_rows, exec_timeout, rate, _subs: subs });
+        self.editor = Some(Editor {
+            agent_id: agent.id.clone(),
+            rules,
+            shown: p.rules.clone(),
+            max_lines,
+            max_rows,
+            exec_timeout,
+            rate,
+            _subs: subs,
+        });
     }
 
     fn update(&mut self, f: impl FnOnce(&mut Agent), cx: &mut Context<Self>) {
         if let Some(id) = self.selected.clone() {
             let result = self.hub.update_agent(&id, f);
             self.report(result);
+            // The inputs already show this edit: no rebuild for it.
+            if let (Some(e), Some(a)) = (&mut self.editor, self.hub.agent(&id)) {
+                e.shown = a.policy.rules;
+            }
         }
         cx.notify();
     }
@@ -533,9 +547,9 @@ impl Render for AgentsView {
         // Changes saved to rules.yaml elsewhere show up while the editor is untouched.
         self.refresh_code(window, cx);
         let agent = self.selected.as_ref().and_then(|id| self.hub.agent(id));
-        // Rules can change elsewhere (e.g. "Always allow this"); keep inputs in step.
+        // Rules can change elsewhere (e.g. "Always allow this", rules.yaml); keep inputs in step.
         if let Some(a) = &agent
-            && self.editor.as_ref().is_some_and(|e| e.rules.len() != a.policy.rules.len())
+            && self.editor.as_ref().is_some_and(|e| e.agent_id != a.id || e.shown != a.policy.rules)
         {
             self.rebuild_editor(a, window, cx);
         }
