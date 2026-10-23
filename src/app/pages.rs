@@ -194,8 +194,8 @@ impl AppView {
 
     pub(super) fn open_access(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some((context, client)) = self.clusters.first().cloned() else { return };
-        let ns = self.namespace.clone();
-        let page = cx.new(|cx| crate::ui::access_view::AccessView::new(context, client, ns, window, cx));
+        let (kinds, ns) = (self.kinds.clone(), self.namespace.clone());
+        let page = cx.new(|cx| crate::ui::access_view::AccessView::new(context, client, kinds, ns, window, cx));
         self.navigate(Route::Access(page), cx);
     }
 
