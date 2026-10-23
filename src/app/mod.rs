@@ -301,6 +301,8 @@ pub struct AppView {
     _index_tasks: Vec<Task<()>>,
     focus: FocusHandle,
     palette: Option<Entity<Palette>>,
+    /// The open palette's subscription, replaced on each open.
+    _palette_sub: Option<Subscription>,
     favorites: Entity<Favorites>,
     column_prefs: ColumnPrefs,
     all_contexts: Vec<String>,
@@ -373,6 +375,8 @@ pub struct AppView {
     watch_errors: BTreeMap<usize, SharedString>,
     watch: Option<Vec<(TaskGuard, Task<()>)>>,
     metrics: Option<Vec<(TaskGuard, Task<()>)>>,
+    /// A connect is in flight (`_connect` stays set once it is done).
+    connecting: bool,
     _connect: Option<Task<()>>,
     _kubeconfig_watch: Option<Task<()>>,
     _subs: Vec<Subscription>,
@@ -551,6 +555,7 @@ impl AppView {
             _index_tasks: Vec::new(),
             focus,
             palette: None,
+            _palette_sub: None,
             column_prefs: ColumnPrefs::load(),
             favorites,
             all_contexts: contexts.clone(),
@@ -600,6 +605,7 @@ impl AppView {
             watch_errors: BTreeMap::new(),
             watch: None,
             metrics: None,
+            connecting: false,
             _connect: None,
             _kubeconfig_watch: None,
             tabs: vec![TabState::default()],
