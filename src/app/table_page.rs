@@ -340,7 +340,7 @@ impl AppView {
             .collect();
         // What deleting this kind asks (Settings → General); scaling, or a protected
         // context, always needs the count typed.
-        let level = crate::settings::delete_confirm(&kind.ar.kind);
+        let level = crate::settings::delete_confirm(&kind.ar.group, &kind.ar.kind);
         if action == "Delete" && level == crate::settings::DeleteConfirm::Off && protected.is_empty() {
             self.run_bulk(action, kind, targets, 0, window, cx);
             return;
@@ -410,7 +410,9 @@ impl AppView {
                 .when_some(typed.clone(), |a, input| {
                     a.child(div().pt_1().text_sm().child(format!("Type {n} to confirm:"))).child(Input::new(&input))
                 })
-                .when(action == "Delete", |a| a.child(crate::details::delete_settings_link(&kind.ar.kind, &label, cx)))
+                .when(action == "Delete", |a| {
+                    a.child(crate::details::delete_settings_link(&kind.ar.group, &kind.ar.kind, &label, cx))
+                })
                 .show_cancel(true)
                 .ok_text(action)
                 .when(action == "Delete", |a| a.ok_variant(component::button::ButtonVariant::Danger))

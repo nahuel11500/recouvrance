@@ -15,10 +15,10 @@ without the window; there nobody can approve, so a call an *Ask me* rule covers 
 with "needs approval in the Recouvrance window": run the app, or add an Allow rule). A list where
 some rows ask and others are allowed (some namespaces, or some names) is not refused: when it is not
 approved (or cannot be), it shows only the allowed rows, and a rejection is still logged. Approving
-it shows the rows of every Ask rule the list meets. Rules changed while a call waits for approval
-apply to it: it is checked again once approved, and `apply_manifest` checks each object again (an
-object whose rule turned into *Ask me* needs its own approval)
-before applying it. In **Agents**, click **Connect Claude Code**: it registers the server in your
+it shows the rows of every Ask rule the list meets (`find_problems` asks to list pods: approving
+it shows other kinds' findings only where an Allow rule covers them). Rules changed while a call waits for approval
+apply to it: it is checked again once approved, and `apply_manifest` checks each object again before
+applying it (an object whose rule turned into *Ask me* needs its own approval). In **Agents**, click **Connect Claude Code**: it registers the server in your
 Claude Code (`claude mcp add --scope user recouvrance …`). There is one agent, "Claude", with its rules;
 *Several agents…* gives other tools their own token and rules if you ever need that. Tokens are
 stored hashed (the assistant's copy is in a 0600 file).
@@ -43,8 +43,10 @@ started, rules can expire (e.g. "Allow for 1h" on an approval), a per-agent rate
 per minute, *Test access* shows the verdict for any request and which rule decided, and approval
 banners show the request with its key arguments (command, the whole patch, replicas, action, dry
 run) and offer **Always allow this** to add a narrow rule; it wins over the Ask rule that asked, so
-the same request is not asked again (until you edit the rule). The rule editor marks such rules
-"approved", and rules pasted with *Paste rules* never count as approved. For `apply_manifest` the banner lists
+the same request is not asked again (until you edit the rule). It covers that kind only, not another
+API group's kind with the same plural, and its names and contexts match case included. The rule editor marks such rules
+"approved", and rules pasted with *Paste rules* never count as approved. In a pasted rule, a missing
+effect means Deny, and a missing list means `*` in a Deny or Ask, none in an Allow. For `apply_manifest` the banner lists
 every object (kind, namespace/name) and the YAML that will be applied, a Secret's values masked; the
 activity log keeps each object with a hash of that YAML, and the objects already applied when a call
 is cut off.
@@ -64,7 +66,8 @@ container must be a DNS label, an object name may hold only letters, digits and 
 `/`, `?`, `%`, `..` or spaces). An invalid name fails the call with a message saying why. What the
 API server returns must be the object asked for, and a Secret's values are masked whatever kind
 was asked for. `get_logs` returns at most 1 MiB. `drain_node` is refused, without cordoning, when
-the node runs pods it would evict in a namespace a Deny rule covers for `delete` on pods.
+the node runs pods it would evict in a namespace a Deny rule covers for `delete` on pods; its reply
+counts every pod it could not evict but names only those an Allow rule lets the agent list.
 
 Tools: `my_permissions`, `list_contexts`, `list_resource_types`, `list_resources`, `get_resource`,
 `describe_resource`, `top_pods`, `search`, `get_events`, `find_problems`, `check_certificates`, `usage_history`, `drain_node`, `gitops`,
@@ -77,7 +80,8 @@ Prompts (slash commands in Claude Code: `/mcp__recouvrance__troubleshoot` …): 
 Every call is logged with its decision and rule, and appended to
 `~/.local/share/recouvrance/audit.jsonl` (the folder is 0700, the file 0600). At 10 MiB the log moves to
 `audit.jsonl.1`, replacing the older one. If the log cannot be written, the Activity page says so. A
-kill switch cuts all agent access at once.
+kill switch cuts all agent access at once. A request nobody answers within 2 minutes is refused; the log
+says whether it was refused, left unanswered or cut off by the kill switch.
 
 The Activity page groups calls by task: one agent session, split where the agent paused for more than
 10 minutes. Each group says what it touched (contexts, namespaces, objects); repeated calls of a tool on

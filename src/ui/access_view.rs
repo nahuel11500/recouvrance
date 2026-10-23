@@ -70,10 +70,36 @@ pub fn allows(rules: &Rules, verb: &str, resource: &str) -> bool {
     })
 }
 
-/// The namespace whose RoleBindings count for `group`/`resource`: none for a cluster-scoped
-/// kind (nodes, namespaces), which only ClusterRoleBindings grant.
-fn binding_namespace<'a>(kinds: &[k8s::Kind], group: &str, resource: &str, ns: Option<&'a str>) -> Option<&'a str> {
+/// A resource typed without its group (`deployments`, `deploy`, `ingresses`) as discovery
+/// knows it, so the rules on `apps` match: (group, plural with its subresource). A core
+/// resource, a group given, or a name discovery doesn't know stays as typed.
+fn resolve_group(kinds: &[k8s::Kind], group: String, resource: String) -> (String, String) {
+    let (base, sub) = resource.split_once('/').map_or((resource.as_str(), None), |(b, s)| (b, Some(s)));
+    if !group.is_empty() || kinds.iter().any(|k| k.ar.group.is_empty() && k.ar.plural == base) {
+        return (group, resource);
+    }
+    match k8s::find_kind(kinds, base) {
+        Some(k) => (k.ar.group.clone(), sub.map_or_else(|| k.ar.plural.clone(), |s| format!("{}/{s}", k.ar.plural))),
+        None => (group, resource),
+    }
+}
+
+/// The namespace whose RoleBindings count for `verb` on `group`/`resource`: none for a
+/// cluster-scoped kind (nodes), which only ClusterRoleBindings grant. A Namespace is the
+/// exception: the API server reads a request on one by name (get, delete,
+/// `namespaces/finalize`) as made in that namespace, so its RoleBindings count; list and
+/// create name none.
+fn binding_namespace<'a>(
+    kinds: &[k8s::Kind],
+    verb: &str,
+    group: &str,
+    resource: &str,
+    ns: Option<&'a str>,
+) -> Option<&'a str> {
     let base = resource.split('/').next().unwrap_or(resource);
+    if group.is_empty() && base == "namespaces" {
+        return ns.filter(|_| !matches!(verb, "list" | "watch" | "create" | "deletecollection"));
+    }
     let cluster_scoped = kinds.iter().any(|k| !k.namespaced && k.ar.group == group && k.ar.plural == base);
     if cluster_scoped { None } else { ns }
 }
@@ -175,8 +201,9 @@ impl AccessView {
     pub fn ask_who(&mut self, cx: &mut Context<Self>) {
         let verb = self.who_verb.read(cx).value().trim().to_string();
         let (group, resource) = crate::rbac::split_resource(self.who_resource.read(cx).value().as_ref());
+        let (group, resource) = resolve_group(&self.kinds, group, resource);
         let ns = Some(self.who_ns.read(cx).value().trim().to_string()).filter(|n| !n.is_empty());
-        let rules_ns = binding_namespace(&self.kinds, &group, &resource, ns.as_deref()).map(String::from);
+        let rules_ns = binding_namespace(&self.kinds, &verb, &group, &resource, ns.as_deref()).map(String::from);
         let client = self.client.clone();
         self.who_busy = true;
         cx.notify();
@@ -412,7 +439,7 @@ impl Render for AccessView {
 
 #[cfg(test)]
 mod tests {
-    use super::{allows, binding_namespace, full_access};
+    use super::{allows, binding_namespace, full_access, resolve_group};
     use crate::k8s::Kind;
     use kube::discovery::ApiResource;
 
@@ -430,12 +457,52 @@ mod tests {
             section: "Cluster",
             label: plural.into(),
         };
-        let kinds = vec![kind("", "nodes", false), kind("", "pods", true)];
-        assert_eq!(binding_namespace(&kinds, "", "nodes", Some("default")), None);
-        assert_eq!(binding_namespace(&kinds, "", "nodes/proxy", Some("default")), None);
-        assert_eq!(binding_namespace(&kinds, "", "pods", Some("default")), Some("default"));
+        let kinds = vec![kind("", "nodes", false), kind("", "pods", true), kind("", "namespaces", false)];
+        assert_eq!(binding_namespace(&kinds, "get", "", "nodes", Some("default")), None);
+        assert_eq!(binding_namespace(&kinds, "get", "", "nodes/proxy", Some("default")), None);
+        assert_eq!(binding_namespace(&kinds, "get", "", "pods", Some("default")), Some("default"));
         // A kind discovery doesn't know keeps the namespace.
-        assert_eq!(binding_namespace(&kinds, "example.com", "nodes", Some("default")), Some("default"));
+        assert_eq!(binding_namespace(&kinds, "get", "example.com", "nodes", Some("default")), Some("default"));
+        // A request on a Namespace by name is made in that namespace: its RoleBindings count.
+        assert_eq!(binding_namespace(&kinds, "delete", "", "namespaces", Some("team-a")), Some("team-a"));
+        assert_eq!(binding_namespace(&kinds, "update", "", "namespaces/finalize", Some("team-a")), Some("team-a"));
+        assert_eq!(binding_namespace(&kinds, "list", "", "namespaces", Some("team-a")), None);
+        assert_eq!(binding_namespace(&kinds, "create", "", "namespaces", Some("team-a")), None);
+        assert_eq!(binding_namespace(&kinds, "delete", "", "namespaces", None), None);
+    }
+
+    #[test]
+    fn a_resource_without_its_group_is_resolved() {
+        let kind = |group: &str, plural: &str, kind: &str| Kind {
+            ar: ApiResource {
+                group: group.into(),
+                version: "v1".into(),
+                api_version: "v1".into(),
+                kind: kind.into(),
+                plural: plural.into(),
+            },
+            namespaced: true,
+            section: "Workloads",
+            label: plural.into(),
+        };
+        let kinds = vec![
+            kind("", "pods", "Pod"),
+            kind("apps", "deployments", "Deployment"),
+            kind("events.k8s.io", "events", "Event"),
+            kind("", "events", "Event"),
+        ];
+        let resolve = |group: &str, resource: &str| resolve_group(&kinds, group.into(), resource.into());
+        assert_eq!(resolve("", "deployments"), ("apps".into(), "deployments".into()));
+        assert_eq!(resolve("", "deploy"), ("apps".into(), "deployments".into()));
+        assert_eq!(resolve("", "deploy/scale"), ("apps".into(), "deployments/scale".into()));
+        assert_eq!(resolve("", "po"), ("".into(), "pods".into()));
+        assert_eq!(resolve("", "pods/log"), ("".into(), "pods/log".into()));
+        // The core resource wins over a group with the same plural.
+        assert_eq!(resolve("", "events"), ("".into(), "events".into()));
+        // A group given, or a name discovery doesn't know, stays as typed.
+        assert_eq!(resolve("example.com", "deployments"), ("example.com".into(), "deployments".into()));
+        assert_eq!(resolve("", "widgets"), ("".into(), "widgets".into()));
+        assert_eq!(resolve("", "*"), ("".into(), "*".into()));
     }
 
     #[test]
