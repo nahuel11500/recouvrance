@@ -13,6 +13,9 @@ use serde::Deserialize;
 
 use crate::k8s;
 
+/// The values editor's text while the picked chart's values load.
+const LOADING_VALUES: &str = "# loading chart values…";
+
 #[derive(Deserialize, Clone)]
 struct Chart {
     name: String,
@@ -110,7 +113,7 @@ impl HelmInstall {
         let base = chart.name.rsplit('/').next().unwrap_or(&chart.name).to_string();
         self.version.update(cx, |s, cx| s.set_value(chart.version.clone(), window, cx));
         self.release.update(cx, |s, cx| s.set_value(base, window, cx));
-        self.values.update(cx, |s, cx| s.set_value("# loading chart values…", window, cx));
+        self.values.update(cx, |s, cx| s.set_value(LOADING_VALUES, window, cx));
         self.output = None;
         self.versions.clear();
         self.chart = Some(chart.clone());
@@ -151,8 +154,14 @@ impl HelmInstall {
                     .and_then(|o| serde_json::from_str::<Vec<Chart>>(&o).ok())
                     .map(|v| v.into_iter().filter(|c| c.name == chart.name).map(|c| c.version).take(12).collect())
                     .unwrap_or_default();
-                let text = values.unwrap_or_else(|e| format!("# could not read the chart's values: {e}"));
-                this.values.update(cx, |s, cx| s.set_value(text, window, cx));
+                // Values typed while loading are kept.
+                if this.values.read(cx).value() == LOADING_VALUES {
+                    let text = values.unwrap_or_else(|e| format!("# could not read the chart's values: {e}"));
+                    this.values.update(cx, |s, cx| s.set_value(text, window, cx));
+                } else if let Err(e) = values {
+                    window
+                        .push_notification(Notification::error(format!("Could not read the chart's values: {e}")), cx);
+                }
                 cx.notify();
             });
         });
