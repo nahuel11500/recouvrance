@@ -346,7 +346,7 @@ impl AgentsView {
     pub fn refresh_contexts(&mut self) {
         match k8s::load_contexts() {
             Ok(c) => {
-                self.protected = c.names.iter().filter(|n| crate::settings::is_protected(n)).cloned().collect();
+                self.protected = crate::settings::protected_contexts(&c);
                 self.contexts = c.names;
                 self.contexts_error = None;
             }

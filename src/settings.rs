@@ -411,6 +411,24 @@ pub fn is_protected(context: &str) -> bool {
     }
 }
 
+/// The contexts of a kubeconfig that are protected (see [`is_protected`]), from one read of it.
+pub fn protected_contexts(contexts: &crate::k8s::Contexts) -> Vec<String> {
+    migrate_protection();
+    with(|s| protected_among(&s.protection, &contexts.names, &contexts.risky))
+}
+
+fn protected_among(
+    chosen: &std::collections::BTreeMap<String, bool>,
+    names: &[String],
+    risky: &[String],
+) -> Vec<String> {
+    names
+        .iter()
+        .filter(|n| chosen.get(*n).copied().unwrap_or_else(|| guess_protected(names, risky, n)))
+        .cloned()
+        .collect()
+}
+
 fn guess_protected(names: &[String], risky: &[String], context: &str) -> bool {
     !names.iter().any(|n| n == context) || risky.iter().any(|r| r == context)
 }
@@ -548,7 +566,7 @@ fn unix_now() -> i64 {
 mod tests {
     use super::{
         DeleteConfirm, NamespaceVisit, Settings, by_field, delete_confirm_in, guess_protected, load_json, migrate_list,
-        recent_as_visits, record_visits, save_newest, visit_score, write_atomic,
+        protected_among, recent_as_visits, record_visits, save_newest, visit_score, write_atomic,
     };
 
     #[test]
@@ -570,6 +588,15 @@ mod tests {
         assert!(!guess_protected(&names, &risky, "dev"));
         assert!(guess_protected(&names, &risky, "prod"));
         assert!(guess_protected(&names, &risky, "shop"));
+    }
+
+    #[test]
+    fn protection_set_by_hand_wins_over_the_guess() {
+        let names = ["dev".to_string(), "prod".to_string(), "lab".to_string()];
+        let risky = ["prod".to_string()];
+        let chosen = [("prod".to_string(), false), ("dev".to_string(), true)].into_iter().collect();
+        assert_eq!(protected_among(&chosen, &names, &risky), ["dev"]);
+        assert_eq!(protected_among(&Default::default(), &names, &risky), ["prod"]);
     }
 
     const DAY: i64 = 24 * 3600;
