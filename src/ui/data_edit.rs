@@ -312,6 +312,9 @@ impl DataEditor {
                     this.status = Some((false, format!("The server refused it: {e:#}")));
                     return;
                 }
+                if !crate::details::writes_still_on(window, cx) {
+                    return;
+                }
                 let title = format!("{} {} {name}?", if creating { "Create" } else { "Save" }, this.kind.ar.kind);
                 window.open_alert_dialog(cx, move |alert, _, cx| {
                     let (me, guard, obj, kind, ns, client) =
@@ -325,6 +328,9 @@ impl DataEditor {
                         .on_ok(move |_, window, cx| {
                             if !crate::details::guard_ok(guard.as_ref(), cx) {
                                 return false;
+                            }
+                            if !crate::details::writes_still_on(window, cx) {
+                                return true;
                             }
                             let fut = send(creating, client.clone(), kind.clone(), ns.clone(), obj.clone(), false);
                             let _ = me.update(cx, |this, cx| this.write(fut, window, cx));

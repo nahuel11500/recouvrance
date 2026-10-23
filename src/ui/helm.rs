@@ -788,6 +788,10 @@ impl HelmRelease {
     }
 
     fn confirm_upgrade(&mut self, chart_ref: String, window: &mut Window, cx: &mut Context<Self>) {
+        // The chart lookup (or the choice between repositories) came after write mode was checked.
+        if !crate::details::writes_still_on(window, cx) {
+            return;
+        }
         let (name, ns) = (self.release.name.clone(), self.release.namespace.clone());
         let view = cx.entity().downgrade();
         let context = self.context.clone();
@@ -812,6 +816,9 @@ impl HelmRelease {
                 .on_ok(move |_, window, cx| {
                     if !crate::details::guard_ok(guard.as_ref(), cx) {
                         return false;
+                    }
+                    if !crate::details::writes_still_on(window, cx) {
+                        return true;
                     }
                     let chart_ref = chart_ref.clone();
                     let _ = view.update(cx, |this, cx| this.upgrade(chart_ref, false, window, cx));

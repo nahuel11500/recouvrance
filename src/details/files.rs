@@ -105,6 +105,10 @@ impl DetailPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // The file picker came after write mode was checked.
+        if !writes_still_on(window, cx) {
+            return;
+        }
         let input = cx.new(|cx| {
             let mut s = InputState::new(window, cx).placeholder("/tmp");
             s.set_value("/tmp", window, cx);
@@ -142,6 +146,9 @@ impl DetailPanel {
                 .on_ok(move |_, window, cx| {
                     if !guard_ok(guard.as_ref(), cx) {
                         return false;
+                    }
+                    if !writes_still_on(window, cx) {
+                        return true;
                     }
                     let dir = input.read(cx).value().trim().to_string();
                     let (container, local) = (container.clone(), local.clone());

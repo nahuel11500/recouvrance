@@ -229,6 +229,10 @@ impl DetailPanel {
         let task = cx.spawn_in(window, async move |_, cx| {
             let check = dry.await;
             let _ = cx.update(|window, cx| {
+                // Write mode may have been turned off during the dry run.
+                if check.is_ok() && !writes_still_on(window, cx) {
+                    return;
+                }
                 window.open_alert_dialog(cx, move |alert, _, cx| {
                     let (panel, guard, template) = (panel.clone(), guard.clone(), template.clone());
                     let summary = match &check {
@@ -248,6 +252,9 @@ impl DetailPanel {
                         .on_ok(move |_, window, cx| {
                             if !guard_ok(guard.as_ref(), cx) {
                                 return false;
+                            }
+                            if !writes_still_on(window, cx) {
+                                return true;
                             }
                             let template = template.clone();
                             let _ = panel.update(cx, |this, cx| {
@@ -641,6 +648,7 @@ impl DetailPanel {
                 Err(e) => {
                     window.push_notification(Notification::error(format!("The server rejected the change: {e:#}")), cx)
                 }
+                Ok(_) if !writes_still_on(window, cx) => {}
                 Ok(_) => window.open_alert_dialog(cx, move |alert, _, cx| {
                     let (panel, obj, guard) = (panel.clone(), obj.clone(), guard.clone());
                     alert
@@ -652,6 +660,9 @@ impl DetailPanel {
                         .on_ok(move |_, window, cx| {
                             if !guard_ok(guard.as_ref(), cx) {
                                 return false;
+                            }
+                            if !writes_still_on(window, cx) {
+                                return true;
                             }
                             let obj = obj.clone();
                             let _ = panel.update(cx, |this, cx| {
