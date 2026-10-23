@@ -36,7 +36,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: codeql-target
-          save-if: true # TEMP: measure on the PR
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: github/codeql-action/init@6f2ac81f5cd81fe351a197ba0b00d91d03cd2aee # v4.39.0
         with:
           languages: rust
