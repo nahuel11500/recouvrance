@@ -197,7 +197,7 @@ pub(super) async fn fetch_related(
             .collect();
         return related;
     }
-    if kind.is("", "NetworkPolicy") {
+    if kind.is("networking.k8s.io", "NetworkPolicy") {
         // The pods this policy applies to (an empty podSelector means all pods).
         let sel = obj.pointer("/spec/podSelector").and_then(k8s::selector_string);
         let pods = k8s::list_values(client, k8s::ar_of::<core::Pod>(), Some(ns), sel).await;
