@@ -673,6 +673,10 @@ impl KubeMcp {
                 Err(e) => return call.finish(Err(e)),
             }
         };
+        // Like the charts: pods not finished, at most as many as fit in the query.
+        let (pods, total) = crate::prom::chart_pods(&pods);
+        // A finished workload's pods may have run one after the other: no sum of requests.
+        let sum_specs = pods.len() <= 1 || !pods.iter().all(|p| crate::prom::finished(p));
         let names: Vec<String> = pods
             .iter()
             .filter_map(|p| p.pointer("/metadata/name").and_then(|v| v.as_str()).map(String::from))
@@ -700,7 +704,7 @@ impl KubeMcp {
                 .flat_map(|p| p.pointer("/spec/containers").and_then(|c| c.as_array()).cloned().unwrap_or_default())
                 .filter_map(|c| c.pointer(path).and_then(|v| v.as_str()).map(parse))
                 .collect();
-            (!vals.is_empty()).then(|| vals.iter().sum())
+            (sum_specs && !vals.is_empty()).then(|| vals.iter().sum())
         };
         let stats = |s: &crate::prom::Series, scale: f64, fmt: fn(f64) -> String| -> Vec<String> {
             let mut v: Vec<f64> = s.iter().map(|p| p.1 * scale).collect();
@@ -722,7 +726,8 @@ impl KubeMcp {
         mem_row.extend(stats(&mem, 1.0, k8s::format_bytes));
         mem_row.push(opt(sum("/resources/requests/memory", k8s::parse_bytes), k8s::format_bytes));
         mem_row.push(opt(sum("/resources/limits/memory", k8s::parse_bytes), k8s::format_bytes));
-        let header = format!("{} pod(s), last {minutes} minutes, summed over pods\n", names.len());
+        let of = if names.len() < total { format!(" of {total}") } else { String::new() };
+        let header = format!("{}{of} pod(s), last {minutes} minutes, summed over pods\n", names.len());
         call.finish(Ok(header
             + &format_table(&["", "MIN", "AVG", "P95", "MAX", "LAST", "REQUESTS", "LIMITS"], &[cpu_row, mem_row])))
     }
