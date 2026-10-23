@@ -234,7 +234,11 @@ gpui_kit::actions!(
 );
 
 pub fn bind_keys(cx: &mut App) {
-    cx.bind_keys([
+    cx.bind_keys(key_bindings());
+}
+
+fn key_bindings() -> Vec<KeyBinding> {
+    vec![
         KeyBinding::new("ctrl-k", OpenPalette, None),
         KeyBinding::new("ctrl-shift-n", NewWindow, None),
         KeyBinding::new("ctrl-t", NewTab, None),
@@ -259,7 +263,9 @@ pub fn bind_keys(cx: &mut App) {
         // Only while the table has focus, so typing "/" elsewhere is untouched.
         KeyBinding::new("/", FocusFilter, Some("DataTable")),
         KeyBinding::new("enter", OpenSelected, Some("DataTable")),
-    ]);
+        // F5 goes to the program running in a terminal, like the other function keys.
+        KeyBinding::new("f5", NoAction, Some("Terminal")),
+    ]
 }
 
 /// Names of common objects across connected clusters, for the palette.
@@ -741,4 +747,20 @@ pub fn open_delete_settings(window: &mut Window, cx: &mut App) {
         this.settings_view.update(cx, |s, cx| s.show_general(cx));
         this.navigate(Route::Settings, cx);
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use gpui_kit::{KeyContext, Keymap, Keystroke};
+
+    #[test]
+    fn f5_reaches_the_terminal() {
+        let keymap = Keymap::new(super::key_bindings());
+        let f5 = [Keystroke::parse("f5").unwrap()];
+        let app = KeyContext::parse("App").unwrap();
+        let (bindings, _) = keymap.bindings_for_input(&f5, std::slice::from_ref(&app));
+        assert_eq!(bindings.len(), 1);
+        let (bindings, _) = keymap.bindings_for_input(&f5, &[app, KeyContext::parse("Terminal").unwrap()]);
+        assert!(bindings.is_empty());
+    }
 }
