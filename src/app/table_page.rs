@@ -521,14 +521,16 @@ impl AppView {
     /// Save the rows shown (filtered, sorted, visible columns) as CSV in ~/Downloads.
     pub(super) fn export_csv(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(kind) = self.kind.clone() else { return };
+        use std::io::Write as _;
         let csv = self.table.read(cx).delegate().to_csv();
-        let dir = std::path::PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join("Downloads");
         let stamp = jiff::Zoned::now().strftime("%Y%m%d-%H%M%S").to_string();
-        let path = dir.join(format!("{}-{stamp}.csv", kind.ar.plural));
-        let r = std::fs::create_dir_all(&dir).and_then(|_| std::fs::write(&path, csv));
+        let name = format!("{}-{stamp}.csv", kind.ar.plural);
+        // Private and never over an earlier export.
+        let r = crate::private_files::create_new_in(&crate::private_files::downloads_dir(), &name)
+            .and_then(|(mut f, path)| f.write_all(csv.as_bytes()).map(|_| path));
         window.push_notification(
             match r {
-                Ok(()) => Notification::success(format!("Saved {}", path.display())),
+                Ok(path) => Notification::success(format!("Saved {}", path.display())),
                 Err(e) => Notification::error(format!("Could not save CSV: {e}")),
             },
             cx,
