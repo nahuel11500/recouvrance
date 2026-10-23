@@ -5,7 +5,8 @@
 *Assistant* in the sidebar is a chat with Claude about your clusters. It runs through your local
 Claude Code (your subscription, no API key); an Anthropic API key works too if you prefer. It uses
 the same agent as your Claude Code connection (below), so one set of rules, approvals and activity
-log covers both.
+log covers both. **Stop** ends a question that is still running; with an API key, a request that
+gets no answer for 10 minutes fails.
 
 ## Agents (MCP)
 

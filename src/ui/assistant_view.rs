@@ -360,7 +360,18 @@ impl Render for AssistantView {
                     .p_3()
                     .border_t_1()
                     .border_color(theme.border)
-                    .child(div().flex_1().child(Input::new(&self.input).disabled(self.busy))),
+                    .child(div().flex_1().child(Input::new(&self.input).disabled(self.busy)))
+                    .when(self.busy, |d| {
+                        d.child(Button::new("stop").small().outline().icon(Lucide::Square).label("Stop").on_click(
+                            cx.listener(|this, _, _, cx| {
+                                // Dropping the task stops the question, and Claude Code with it.
+                                this._task = None;
+                                this.busy = false;
+                                this.entries.push(Entry::Error("Stopped.".into()));
+                                cx.notify();
+                            }),
+                        ))
+                    }),
             )
             .into_any_element()
     }
