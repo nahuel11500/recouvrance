@@ -453,16 +453,8 @@ impl KubeMcp {
         if let Some(reason) = self.inactive(call) {
             return Some(reason.to_string());
         }
-        let verdict = call.policy().decide(access);
-        match verdict.mode {
-            Mode::Allow => None,
-            Mode::Ask if call.approved => None,
-            _ => Some(format!(
-                "{} — the rules changed while the call waited ({})",
-                describe(access),
-                call.rule_label(verdict.rule)
-            )),
-        }
+        let rule = stopped_by(call.policy(), access, call.approved)?;
+        Some(format!("{} — the rules changed while the call waited ({})", describe(access), call.rule_label(rule)))
     }
 
     async fn kind(&self, call: &Call, context: &str, query: &str) -> Result<(kube::Client, Kind), String> {
@@ -478,6 +470,18 @@ impl KubeMcp {
             Some(kind) => Ok((client, kind)),
             None => Err(call.finish(Err(anyhow::anyhow!("unknown resource type {query:?}"))).unwrap_err()),
         }
+    }
+}
+
+/// What stops a change authorized earlier under the rules as they are now (the rule that
+/// decided, if one did): anything but an Allow, or an Ask the user approved for this very
+/// change (`approved`).
+fn stopped_by(policy: &Policy, access: &Access, approved: bool) -> Option<Option<usize>> {
+    let verdict = policy.decide(access);
+    match verdict.mode {
+        Mode::Allow => None,
+        Mode::Ask if approved => None,
+        _ => Some(verdict.rule),
     }
 }
 
@@ -971,6 +975,31 @@ mod tests {
             section: "",
             label: kind.into(),
         }
+    }
+
+    #[test]
+    fn a_change_turned_ask_needs_its_own_approval() {
+        let rule = |effect: Mode, name: &str| crate::mcp::Rule {
+            effect,
+            verbs: vec!["apply".into()],
+            names: vec![name.into()],
+            contexts: vec!["*".into()],
+            ..crate::mcp::Rule::default()
+        };
+        let cms = kind("", "v1", "ConfigMap", "configmaps", true);
+        let a = access_for(&cms, "c", "apply", Some("app".into()), Some("a".into()));
+        let b = access_for(&cms, "c", "apply", Some("app".into()), Some("b".into()));
+        // B's rule turned into Ask while A was applied: approving A does not cover B.
+        let p = Policy { rules: vec![rule(Mode::Allow, "a"), rule(Mode::Ask, "b")], ..Policy::default() };
+        assert_eq!(stopped_by(&p, &a, false), None);
+        assert_eq!(stopped_by(&p, &b, false), Some(Some(1)));
+        assert_eq!(stopped_by(&p, &b, true), None);
+        // A Deny stops it, approved or not.
+        let p = Policy { rules: vec![rule(Mode::Allow, "*"), rule(Mode::Deny, "b")], ..Policy::default() };
+        assert_eq!(stopped_by(&p, &b, true), Some(Some(1)));
+        // So does a removed Allow.
+        let p = Policy { rules: vec![], ..Policy::default() };
+        assert_eq!(stopped_by(&p, &a, false), Some(None));
     }
 
     #[test]
