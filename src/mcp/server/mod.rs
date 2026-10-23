@@ -389,6 +389,7 @@ impl KubeMcp {
                     };
                     Ok(())
                 } else if fallback.is_some() {
+                    call.record(Decision::Rejected, "not approved; showing the allowed rows only".into(), 0);
                     call.rule = fallback;
                     self.ensure_active(call)
                 } else {

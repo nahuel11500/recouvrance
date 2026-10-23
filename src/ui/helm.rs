@@ -617,6 +617,12 @@ fn newer_revision(current: i64, history: &[Release]) -> Option<&Release> {
     history.iter().max_by_key(|r| r.revision).filter(|r| r.revision > current)
 }
 
+/// The revision to open from the list: the newest in `history`, when it is `listed` or
+/// newer (the list can be out of date).
+fn opened_revision(listed: i64, history: &[Release]) -> Option<&Release> {
+    history.iter().max_by_key(|r| r.revision).filter(|r| r.revision >= listed)
+}
+
 /// The chart references (`repo/chart`) from `helm search repo -o json` naming exactly `chart`.
 fn chart_refs(search_json: &str, chart: &str) -> Vec<String> {
     let suffix = format!("/{chart}");
@@ -651,7 +657,7 @@ impl HelmRelease {
                 // Opened from the list: notes, values and manifest come with the history.
                 if !this.release.loaded
                     && let Ok(revs) = &result
-                    && let Some(full) = revs.iter().find(|r| r.revision == this.release.revision)
+                    && let Some(full) = opened_revision(this.release.revision, revs)
                 {
                     this.release = Release { context: this.release.context.clone(), ..full.clone() };
                     this.set_reveal(this.reveal, window, cx);
@@ -1167,7 +1173,7 @@ mod tests {
     // Not `super::*`: gpui's own `test` attribute would shadow the standard one.
     use super::{
         Secret, Value, chart_refs, decode, latest_revisions, mask_manifest, mask_secrets, merge_clusters,
-        newer_revision, stub, upgrade_text, values_yaml,
+        newer_revision, opened_revision, stub, upgrade_text, values_yaml,
     };
     use base64::Engine as _;
     use std::io::Write as _;
@@ -1316,6 +1322,10 @@ mod tests {
         assert_eq!(newer_revision(5, &history).map(|r| r.revision), Some(6));
         assert!(newer_revision(6, &history).is_none());
         assert!(newer_revision(5, &[]).is_none());
+        // Opened from a list showing 5 while 6 was written: the page shows 6.
+        assert_eq!(opened_revision(5, &history).map(|r| r.revision), Some(6));
+        assert_eq!(opened_revision(6, &history).map(|r| r.revision), Some(6));
+        assert!(opened_revision(7, &history).is_none());
     }
 
     #[test]

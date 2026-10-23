@@ -138,7 +138,7 @@ fn typed(type_name: &str, text: &str) -> Option<Value> {
     }
     Some(match type_name {
         // A multi-line string (a script, a query) is kept exactly, final line break included.
-        "string" if t.contains('\n') => text.into(),
+        "string" if text.contains('\n') => text.into(),
         "integer" => t.parse::<i64>().map(Value::from).unwrap_or_else(|_| t.into()),
         "number" => t.parse::<f64>().map(Value::from).unwrap_or_else(|_| t.into()),
         // Anything else is kept as typed, for the server to refuse.
@@ -595,6 +595,7 @@ mod tests {
         let expr = serde_json::json!("sum(rate(x[5m]))\n  > 0\n");
         assert_eq!(typed("string", &scalar_text(Some(&expr))), Some(expr.clone()));
         assert_eq!(typed("string", " one line "), Some(serde_json::json!("one line")));
+        assert_eq!(typed("string", "echo bye\n"), Some(serde_json::json!("echo bye\n")));
         assert!(one_item_per_line(Some(&serde_json::json!(["a", "b"]))));
         assert!(one_item_per_line(None));
         assert!(!one_item_per_line(Some(&serde_json::json!(["set -e\necho hi\n"]))));

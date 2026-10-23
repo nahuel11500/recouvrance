@@ -33,6 +33,7 @@ pub fn added_dir() -> std::path::PathBuf {
 }
 
 /// Files of a folder that look like kubeconfigs: no hidden files, YAML-ish or no extension.
+/// Oldest first, so a file added later never takes a context name an older one already has.
 pub(super) fn folder_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
     let mut found: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
         .into_iter()
@@ -44,7 +45,10 @@ pub(super) fn folder_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
             p.extension().is_none_or(|x| matches!(x.to_str(), Some("yaml" | "yml" | "conf" | "config" | "kubeconfig")))
         })
         .collect();
-    found.sort();
+    found.sort_by_cached_key(|p| {
+        let m = std::fs::metadata(p).ok();
+        (m.and_then(|m| m.created().or_else(|_| m.modified()).ok()), p.clone())
+    });
     found
 }
 
@@ -306,6 +310,22 @@ mod tests {
         assert_eq!(b.file_stem().unwrap(), "kubeconfig-1");
         assert_eq!(super::free_stem(&dir, "kubeconfig"), "kubeconfig-2");
         assert_eq!(a.file_stem().unwrap(), "kubeconfig");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn folder_files_oldest_first() {
+        let dir = std::env::temp_dir().join(format!("recouvrance-test-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("zeta.yaml"), "a").unwrap();
+        // File times can be a few milliseconds coarse.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        std::fs::write(dir.join("alpha.yaml"), "b").unwrap();
+        std::fs::write(dir.join(".hidden.yaml"), "c").unwrap();
+        std::fs::write(dir.join("notes.txt"), "d").unwrap();
+        let names: Vec<String> =
+            super::folder_files(&dir).iter().map(|p| p.file_name().unwrap().to_string_lossy().to_string()).collect();
+        assert_eq!(names, ["zeta.yaml", "alpha.yaml"]);
         std::fs::remove_dir_all(dir).unwrap();
     }
 

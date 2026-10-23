@@ -83,8 +83,11 @@ impl AppView {
     pub fn demo_mark(&mut self, n: usize, bulk: Option<&'static str>, window: &mut Window, cx: &mut Context<Self>) {
         self.table.update(cx, |t, cx| {
             let d = t.delegate_mut();
-            let uids: Vec<String> = (0..n).filter_map(|i| d.row(i).map(|r| r.uid.clone())).collect();
-            d.marked.extend(uids);
+            let rows: Vec<(usize, String)> =
+                (0..n).filter_map(|i| d.row_context(i).zip(d.row(i).map(|r| r.uid.clone()))).collect();
+            for (ctx, uid) in rows {
+                d.marked.entry(ctx).or_default().insert(uid);
+            }
             cx.notify();
         });
         if let Some(a) = bulk {
