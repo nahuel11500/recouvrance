@@ -144,7 +144,8 @@ impl DetailPanel {
                                 let role = this.obj.name.clone();
                                 // A Role binds in its namespace; a ClusterRole where asked, or cluster-wide.
                                 let scope = this.obj.namespace.clone().or_else(|| (!scope_ns.is_empty()).then(|| scope_ns.clone()));
-                                let (bkind, plural) = if scope.is_some() { ("RoleBinding", "rolebindings") } else { ("ClusterRoleBinding", "clusterrolebindings") };
+                                let bk = binding_kind(scope.is_some());
+                                let bkind = bk.ar.kind.clone();
                                 let bname = binding_name(&role, &name);
                                 let mut obj = serde_json::json!({
                                     "apiVersion": "rbac.authorization.k8s.io/v1", "kind": bkind,
@@ -155,10 +156,6 @@ impl DetailPanel {
                                 if let Some(s) = &scope {
                                     obj["metadata"]["namespace"] = s.clone().into();
                                 }
-                                let bk = k8s::Kind {
-                                    ar: kube::discovery::ApiResource { group: "rbac.authorization.k8s.io".into(), version: "v1".into(), api_version: "rbac.authorization.k8s.io/v1".into(), kind: bkind.into(), plural: plural.into() },
-                                    ..this.obj.kind.clone()
-                                };
                                 let fut = async move {
                                     k8s::create(client.clone(), bk.clone(), scope.clone(), obj.clone(), true).await?;
                                     k8s::create(client, bk, scope, obj, false).await
@@ -319,6 +316,27 @@ fn subject_of(kind: &str, name: &str, ns: &str) -> Option<serde_json::Value> {
     Some(subject)
 }
 
+/// A RoleBinding (in a namespace) or a ClusterRoleBinding, the kind `k8s::create` posts.
+fn binding_kind(namespaced: bool) -> k8s::Kind {
+    let (kind, plural, label) = if namespaced {
+        ("RoleBinding", "rolebindings", "Role Bindings")
+    } else {
+        ("ClusterRoleBinding", "clusterrolebindings", "Cluster Role Bindings")
+    };
+    k8s::Kind {
+        ar: kube::discovery::ApiResource {
+            group: "rbac.authorization.k8s.io".into(),
+            version: "v1".into(),
+            api_version: "rbac.authorization.k8s.io/v1".into(),
+            kind: kind.into(),
+            plural: plural.into(),
+        },
+        namespaced,
+        section: "Access Control",
+        label: label.into(),
+    }
+}
+
 /// A binding's name for a role and a subject.
 fn binding_name(role: &str, subject: &str) -> String {
     format!("{role}-{}", subject.replace(':', "-")).chars().take(63).collect()
@@ -349,7 +367,18 @@ fn subjects_patch_cmd(
 
 #[cfg(test)]
 mod tests {
-    use super::{binding_name, subject_of, subjects_patch, token_hours};
+    use super::{binding_kind, binding_name, subject_of, subjects_patch, token_hours};
+
+    #[test]
+    fn bindings_take_their_own_scope() {
+        // A ClusterRole granted in a namespace: a namespaced RoleBinding.
+        let rb = binding_kind(true);
+        assert!(rb.namespaced);
+        assert_eq!((rb.ar.kind.as_str(), rb.ar.plural.as_str()), ("RoleBinding", "rolebindings"));
+        let crb = binding_kind(false);
+        assert!(!crb.namespaced);
+        assert_eq!(crb.ar.kind, "ClusterRoleBinding");
+    }
 
     #[test]
     fn token_lifetime_is_short() {
