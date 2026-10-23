@@ -26,7 +26,10 @@ overwrite it. In `settings.json`, only the keys that don't read get their defaul
 such as `protection`, are kept; a `protection` entry that isn't `true` or `false` counts as
 protected, and a `delete_confirm_kinds` entry that doesn't read asks for the name. When
 `settings.json` doesn't read as an object at all, or its protection choices can't be read, every
-context without a choice is protected for that session. When `agents.json` can't be read, the app starts with no agents and
+context without a choice is protected for that session. A `settings.json` that exists but can't be
+read (say, owned by root after a run with `sudo`) is left alone: the app starts with the defaults,
+counts every context not set as protected, saves nothing until it is restarted with a readable
+file, and Settings says why. When `agents.json` can't be read, the app starts with no agents and
 agent access off, and the Agents page says why.
 
 ## Kubeconfig
