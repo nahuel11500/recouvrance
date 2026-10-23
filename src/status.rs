@@ -10,7 +10,7 @@ pub(crate) enum Tone {
 }
 
 /// Words that mean something is wrong wherever they appear ("SecretSyncedError").
-const BAD: [&str; 22] = [
+const BAD: [&str; 23] = [
     "notready",
     "unhealthy",
     "invalid",
@@ -33,6 +33,8 @@ const BAD: [&str; 22] = [
     "outofsync",
     "lost",
     "broken",
+    // A container whose state was lost (often an evicted pod's): it will not come back.
+    "containerstatusunknown",
 ];
 
 /// Finished: neither good nor bad any more.
@@ -210,6 +212,8 @@ mod tests {
             ("OutOfSync", Some(Tone::Bad)),
             ("Lost", Some(Tone::Bad)),
             ("NotReady,SchedulingDisabled", Some(Tone::Bad)),
+            ("ContainerStatusUnknown", Some(Tone::Bad)),
+            ("Init:ContainerStatusUnknown", Some(Tone::Bad)),
             // Unknown words stay neutral.
             ("Lorem", None),
             ("Setup", None),
