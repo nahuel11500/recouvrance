@@ -277,18 +277,22 @@ fn values_yaml(values: &Value, reveal: bool) -> String {
 }
 
 /// Mask the values under secret-looking keys: a string or number, or each one in a list of
-/// them (`passwords: [p1, p2]`).
+/// them (`passwords: [p1, p2]`). An environment variable (`{name: DB_PASSWORD, value: ...}`)
+/// is masked by its name.
 fn mask_secrets(v: &mut Value) {
     const HINTS: [&str; 9] =
         ["password", "passwd", "secret", "token", "apikey", "api_key", "credential", "privatekey", "private_key"];
+    let secret_name = |k: &str| {
+        let key = k.to_lowercase().replace('-', "_");
+        HINTS.iter().any(|h| key.contains(h)) || key.ends_with("key") && !key.ends_with("publickey")
+    };
     let scalar = |v: &Value| v.is_string() || v.is_number();
     let mask = || Value::String("••••••".into());
     match v {
         Value::Object(map) => {
+            let secret_env = map.get("name").and_then(Value::as_str).is_some_and(secret_name);
             for (k, val) in map.iter_mut() {
-                let key = k.to_lowercase().replace('-', "_");
-                let secretish =
-                    HINTS.iter().any(|h| key.contains(h)) || key.ends_with("key") && !key.ends_with("publickey");
+                let secretish = secret_name(k.as_str()) || secret_env && k == "value";
                 match val {
                     val if secretish && scalar(val) => *val = mask(),
                     Value::Array(items) if secretish => {
@@ -1442,6 +1446,24 @@ mod tests {
         assert_eq!(v["auth"]["apiKey"], "••••••");
         assert_eq!(v["auth"]["publicKey"], "pub");
         assert_eq!(v["list"][0]["token"], "••••••");
+    }
+
+    #[test]
+    fn masks_secret_env_values() {
+        let mut v = serde_json::json!({
+            "extraEnv": [
+                {"name": "DB_PASSWORD", "value": "hunter2"},
+                {"name": "api-key", "value": 1234},
+                {"name": "DB_HOST", "value": "pg"},
+                {"name": "DB_TOKEN", "valueFrom": {"secretKeyRef": {"name": "db", "key": "token"}}},
+            ],
+        });
+        mask_secrets(&mut v);
+        assert_eq!(v["extraEnv"][0]["value"], "••••••");
+        assert_eq!(v["extraEnv"][0]["name"], "DB_PASSWORD");
+        assert_eq!(v["extraEnv"][1]["value"], "••••••");
+        assert_eq!(v["extraEnv"][2]["value"], "pg");
+        assert_eq!(v["extraEnv"][3]["valueFrom"]["secretKeyRef"]["name"], "db");
     }
 
     /// The list's label-only rows take the same identity rules as `decode`.
