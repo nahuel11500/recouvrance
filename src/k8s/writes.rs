@@ -473,12 +473,69 @@ pub async fn trigger_cronjob_opts(client: Client, ns: String, name: String, dry_
     .await
 }
 
+/// What a drain did.
+pub struct Drained {
+    pub node: String,
+    pub evicted: usize,
+    /// DaemonSet, static and finished pods.
+    pub skipped: usize,
+    /// Pods whose eviction was refused: namespace, name and the API error.
+    pub refused: Vec<(String, String, String)>,
+    /// Pods no controller manages, left in place: namespace and name.
+    pub unmanaged: Vec<(String, String)>,
+}
+
+impl Drained {
+    /// What to tell the user. Every pod is counted, but only those `show` accepts are named.
+    pub fn summary(&self, show: impl Fn(&str, &str) -> bool) -> String {
+        let listed = |names: Vec<String>, sep: &str| {
+            if names.is_empty() {
+                String::new()
+            } else {
+                format!(": {}", names.into_iter().take(5).collect::<Vec<_>>().join(sep))
+            }
+        };
+        let mut msg = format!(
+            "Node {} cordoned; {} pods evicted, {} skipped (DaemonSet/static/finished)",
+            self.node, self.evicted, self.skipped
+        );
+        if !self.refused.is_empty() {
+            let names = self
+                .refused
+                .iter()
+                .filter(|(ns, n, _)| show(ns, n))
+                .map(|(ns, n, e)| format!("{ns}/{n}: {e}"))
+                .collect();
+            msg.push_str(&format!(
+                "; {} refused (likely a PodDisruptionBudget, retry later){}",
+                self.refused.len(),
+                listed(names, "; ")
+            ));
+        }
+        if !self.unmanaged.is_empty() {
+            let names =
+                self.unmanaged.iter().filter(|(ns, n)| show(ns, n)).map(|(ns, n)| format!("{ns}/{n}")).collect();
+            msg.push_str(&format!(
+                "; {} not evicted, no controller would recreate them (delete them yourself, or `kubectl drain --force`){}",
+                self.unmanaged.len(),
+                listed(names, ", ")
+            ));
+        }
+        msg
+    }
+}
+
 /// What `kubectl drain --ignore-daemonsets --delete-emptydir-data` does:
 /// cordon, then evict every pod except DaemonSet and static pods. Evictions
 /// respect PodDisruptionBudgets; refused ones are reported, not forced. Pods no
 /// controller manages would be gone for good, so (like kubectl without
 /// `--force`) they are left in place and reported.
 pub async fn drain(client: Client, node: String) -> Result<String> {
+    Ok(drain_report(client, node).await?.summary(|_, _| true))
+}
+
+/// [`drain`], returning what it did.
+pub async fn drain_report(client: Client, node: String) -> Result<Drained> {
     run(async move {
         let nodes: Api<k8s_openapi::api::core::v1::Node> = Api::all(client.clone());
         nodes
@@ -490,44 +547,28 @@ pub async fn drain(client: Client, node: String) -> Result<String> {
             .await?;
         let pods: Api<Pod> = Api::all(client.clone());
         let on_node = pods.list(&ListParams::default().fields(&format!("spec.nodeName={node}"))).await?;
-        let (mut evicted, mut skipped, mut refused, mut unmanaged) = (0, 0, Vec::new(), Vec::new());
+        let mut out = Drained { node, evicted: 0, skipped: 0, refused: Vec::new(), unmanaged: Vec::new() };
         for p in on_node.items {
             let owners = p.metadata.owner_references.clone().unwrap_or_default();
             let daemon = owners.iter().any(|o| o.kind == "DaemonSet");
             let mirror = p.metadata.annotations.as_ref().is_some_and(|a| a.contains_key("kubernetes.io/config.mirror"));
             let done = matches!(p.status.as_ref().and_then(|s| s.phase.as_deref()), Some("Succeeded" | "Failed"));
             if daemon || mirror || done {
-                skipped += 1;
+                out.skipped += 1;
                 continue;
             }
             let (Some(ns), Some(name)) = (p.metadata.namespace.clone(), p.metadata.name.clone()) else { continue };
             if !owners.iter().any(|o| o.controller == Some(true)) {
-                unmanaged.push(format!("{ns}/{name}"));
+                out.unmanaged.push((ns, name));
                 continue;
             }
             let api: Api<Pod> = Api::namespaced(client.clone(), &ns);
             match api.evict(&name, &Default::default()).await {
-                Ok(_) => evicted += 1,
-                Err(e) => refused.push(format!("{ns}/{name}: {e}")),
+                Ok(_) => out.evicted += 1,
+                Err(e) => out.refused.push((ns, name, e.to_string())),
             }
         }
-        let mut msg =
-            format!("Node {node} cordoned; {evicted} pods evicted, {skipped} skipped (DaemonSet/static/finished)");
-        if !refused.is_empty() {
-            msg.push_str(&format!(
-                "; {} refused (likely a PodDisruptionBudget, retry later): {}",
-                refused.len(),
-                refused.iter().take(5).cloned().collect::<Vec<_>>().join("; ")
-            ));
-        }
-        if !unmanaged.is_empty() {
-            msg.push_str(&format!(
-                "; {} not evicted, no controller would recreate them (delete them yourself, or `kubectl drain --force`): {}",
-                unmanaged.len(),
-                unmanaged.iter().take(5).cloned().collect::<Vec<_>>().join(", ")
-            ));
-        }
-        Ok(msg)
+        Ok(out)
     })
     .await
 }
@@ -612,6 +653,26 @@ pub async fn create(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn drain_summary_names_only_the_pods_shown() {
+        let d = Drained {
+            node: "n1".into(),
+            evicted: 3,
+            skipped: 1,
+            refused: vec![("a".into(), "web-1".into(), "pdb".into()), ("b".into(), "db-0".into(), "pdb".into())],
+            unmanaged: vec![("b".into(), "bare".into())],
+        };
+        let all = d.summary(|_, _| true);
+        assert!(
+            all.contains("a/web-1: pdb; b/db-0: pdb")
+                && all.contains("them yourself, or `kubectl drain --force`): b/bare"),
+            "{all}"
+        );
+        let some = d.summary(|ns, _| ns == "a");
+        assert!(some.contains("2 refused") && some.contains("a/web-1") && some.contains("1 not evicted"), "{some}");
+        assert!(!some.contains("db-0") && !some.contains("bare") && !some.contains("--force`):"), "{some}");
+    }
 
     #[test]
     fn controller_revisions_keep_the_owners_shaped_like_replicasets() {
