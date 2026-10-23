@@ -608,10 +608,11 @@ impl DetailPanel {
                 related.container_history =
                     this.update(cx, |this, _| std::mem::take(&mut this.related.container_history)).unwrap_or_default();
                 let ok = this.update_in(cx, |this, window, cx| {
-                    // Workload logs follow all of its pods, as they come and go.
-                    let names: Vec<String> = related
-                        .pods
-                        .iter()
+                    // Workload logs follow its pods (up to a limit), as they come and go.
+                    let followed = followed_pods(&related.pods);
+                    let left_out = related.pods.len() - followed.len();
+                    let names: Vec<String> = followed
+                        .into_iter()
                         .filter_map(|p| p.pointer("/metadata/name").and_then(|v| v.as_str()).map(String::from))
                         .collect();
                     if pods_logs && !names.is_empty() {
@@ -619,10 +620,18 @@ impl DetailPanel {
                             None => {
                                 let (client, ns) =
                                     (this.client.clone(), this.obj.namespace.clone().unwrap_or_default());
-                                this.logs = Some(cx.new(|cx| LogsView::new(client, ns, names, window, cx)));
+                                this.logs = Some(cx.new(|cx| {
+                                    let mut logs = LogsView::new(client, ns, names, window, cx);
+                                    logs.left_out = left_out;
+                                    logs
+                                }));
                                 this.resume_logs_if_shown(cx);
                             }
-                            Some(logs) => logs.update(cx, |l, cx| l.set_pods(names, cx)),
+                            Some(logs) => logs.update(cx, |l, cx| {
+                                l.left_out = left_out;
+                                l.set_pods(names, cx);
+                                cx.notify();
+                            }),
                         }
                     }
                     // A thousand pods take a while to free: not on the UI thread.
