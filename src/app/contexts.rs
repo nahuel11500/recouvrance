@@ -19,6 +19,8 @@ impl AppView {
         let ctx_name = primary.clone();
         self.ns_picker.update(cx, |p, _| p.context = ctx_name);
         self.context = Some(primary.clone());
+        // Keep the list on screen while the table still has its columns (reset below).
+        self.keep_view(cx);
         self.client = None;
         self.clusters.clear();
         self.kinds.clear();

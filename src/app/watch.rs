@@ -202,7 +202,7 @@ impl AppView {
     }
 
     /// Keep the list on screen in `views` (if it was complete), before another replaces it.
-    fn keep_view(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn keep_view(&mut self, cx: &mut Context<Self>) {
         let Some(key) = self.view_key.take() else { return };
         let forbidden = self.table.read(cx).delegate().forbidden;
         if !self.listing.is_empty() || forbidden || self.rows_by_ctx.iter().all(Vec::is_empty) {
