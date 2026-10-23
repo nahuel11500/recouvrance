@@ -45,6 +45,8 @@ impl AppView {
             t.delegate_mut().set_visible_columns(Some(visible));
             t.refresh(cx);
         });
+        // Hiding the sorted column puts the rows back in the server's order.
+        self.follow_selection(cx);
         cx.notify();
     }
 
@@ -55,6 +57,7 @@ impl AppView {
             t.delegate_mut().set_visible_columns(None);
             t.refresh(cx);
         });
+        self.follow_selection(cx);
         cx.notify();
     }
 
@@ -79,6 +82,7 @@ impl AppView {
             t.delegate_mut().set_filter(text);
             cx.notify();
         });
+        self.follow_selection(cx);
     }
 
     /// Recent filters, saved searches and the filter syntax.

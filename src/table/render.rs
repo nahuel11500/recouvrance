@@ -12,6 +12,39 @@ use gpui_kit::prelude::FluentBuilder as _;
 
 use crate::status::{Tone, tone};
 
+/// Keep the highlight on the selected object after its rows moved (an update, a filter,
+/// a sort), and the row menu's highlight on its row. The table reports the move as a
+/// selection: returns the row it moved to, for the app to skip (not a click).
+pub fn follow_selection(
+    t: &mut TableState<ResourceTable>,
+    cx: &mut Context<TableState<ResourceTable>>,
+) -> Option<usize> {
+    let menu_open = t.right_clicked_row().is_some();
+    let uid = t.delegate().selected_uid.clone();
+    let moved = match uid.and_then(|uid| t.delegate().visible_index_of(&uid)) {
+        Some(ix) if t.selected_row() != Some(ix) => {
+            // Without scrolling to it (which selecting does): the user may
+            // have scrolled away, and rows moving must not pull the list back.
+            let pending = t.vertical_scroll_handle.0.borrow_mut().deferred_scroll_to_item.take();
+            t.set_selected_row(ix, cx);
+            t.vertical_scroll_handle.0.borrow_mut().deferred_scroll_to_item = pending;
+            Some(ix)
+        }
+        // Its row is gone or filtered out: no other row takes the highlight.
+        None if t.selected_row().is_some() => {
+            t.clear_selection(cx);
+            None
+        }
+        _ => None,
+    };
+    // The row menu's highlight follows its row too (selecting clears it).
+    if menu_open {
+        let ix = t.delegate().menu_row.as_ref().and_then(|(_, uid)| t.delegate().visible_index_of(uid));
+        t.set_right_clicked_row(ix, cx);
+    }
+    moved
+}
+
 impl TableDelegate for ResourceTable {
     fn columns_count(&self, _: &App) -> usize {
         self.cols.len()
@@ -69,6 +102,7 @@ impl TableDelegate for ResourceTable {
                     _ => None,
                 };
                 d.recompute();
+                follow_selection(t, cx);
                 cx.notify();
             }))
             .into_any_element()
