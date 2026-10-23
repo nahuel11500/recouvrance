@@ -416,11 +416,7 @@ impl ResourceTable {
         let _t = crate::dev::timing::span("table filter+sort");
         let filter = &self.parsed;
         // Column names as typed in filters: "restarts", "nominatednode", "cpu", "age".
-        let named: Vec<(String, Col)> = if filter.has_columns() {
-            self.cols.iter().filter(|c| **c != Col::Check).map(|c| (normalized(self.header(*c)), *c)).collect()
-        } else {
-            Vec::new()
-        };
+        let named: Vec<(String, Col)> = if filter.has_columns() { self.filter_columns() } else { Vec::new() };
         self.visible = (0..self.rows.len())
             .filter(|&i| {
                 let r = &self.rows[i];
@@ -439,6 +435,18 @@ impl ResourceTable {
             })
             .collect();
         self.sort_visible();
+    }
+
+    /// Every column a filter can name, shown or hidden (`ip:10.4.2.17` with IP hidden).
+    fn filter_columns(&self) -> Vec<(String, Col)> {
+        let mut cols = vec![Col::Context, Col::Namespace];
+        cols.extend(
+            self.defs.iter().enumerate().map(|(i, d)| if d.name == "Age" { Col::Age(i) } else { Col::Cell(i) }),
+        );
+        if self.usage.is_some() {
+            cols.extend([Col::Cpu, Col::Memory]);
+        }
+        cols.into_iter().map(|c| (normalized(self.header(c)), c)).collect()
     }
 
     /// A cell's text; borrowed from the row when it is stored as shown.
@@ -485,4 +493,46 @@ impl ResourceTable {
 
 fn same_names(a: &[ColumnDef], b: &[ColumnDef]) -> bool {
     a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.name == y.name)
+}
+
+#[cfg(test)]
+mod table_tests {
+    use super::{Arc, ColumnDef, ResourceTable, Row};
+
+    fn def(name: &str, priority: i32) -> ColumnDef {
+        ColumnDef { name: name.into(), priority }
+    }
+
+    fn row(name: &str, cells: &[&str]) -> Arc<Row> {
+        Arc::new(Row {
+            uid: name.into(),
+            name: name.into(),
+            namespace: Some("team-a".into()),
+            created: None,
+            cells: cells.iter().map(|c| c.to_string()).collect(),
+            labels: "".into(),
+            deleting: false,
+            deleted_at: None,
+        })
+    }
+
+    #[test]
+    fn filters_on_hidden_columns() {
+        let mut t = ResourceTable::new();
+        t.set_columns(Arc::new(vec![def("Name", 0), def("Status", 0), def("IP", 1), def("Nominated Node", 1)]));
+        assert!(!t.headers().iter().any(|h| h == "IP"), "IP is hidden by default");
+        t.set_rows(vec![
+            (0, row("web-1", &["web-1", "Running", "10.4.2.17", "worker-3"])),
+            (0, row("web-2", &["web-2", "Running", "10.4.2.18", "<none>"])),
+        ]);
+        let shown = |t: &mut ResourceTable, f: &str| {
+            t.set_filter(f.into());
+            t.rows_count_visible()
+        };
+        assert_eq!(shown(&mut t, "ip:10.4.2.17"), 1);
+        assert_eq!(shown(&mut t, "nominatednode:worker-3"), 1);
+        assert_eq!(shown(&mut t, "status:running"), 2);
+        assert_eq!(shown(&mut t, "namespace:team-a"), 2);
+        assert_eq!(shown(&mut t, "error:timeout"), 0, "not a column: text search");
+    }
 }
