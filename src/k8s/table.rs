@@ -429,7 +429,7 @@ fn cells_row(row: ServerRow, namespace: Option<&str>, age: Option<usize>) -> Opt
 }
 
 /// kubectl's age ("45s", "2m3s", "5h", "3d4h", "2y") in seconds.
-pub(super) fn age_seconds(age: &str) -> Option<i64> {
+pub(crate) fn age_seconds(age: &str) -> Option<i64> {
     let (mut total, mut num) = (0i64, 0i64);
     let mut digits = false;
     for c in age.chars() {
@@ -580,7 +580,8 @@ pub fn watch_table_paused(
         let mut first = if pages { FirstList::Pages { by_namespace } } else { FirstList::Whole };
         let mut backoff = Backoff::default();
         loop {
-            // Whether this round listed or got events: only then does the wait start over.
+            // Whether this round's watch got events: only then does the wait start over. A
+            // list alone doesn't count, or a watch that keeps failing would relist every second.
             let mut progress = false;
             let result = watch_once(&client, &url, &tx, &extras, &mut first, &pause, &mut progress).await;
             if let Err(e) = &result {
@@ -684,7 +685,6 @@ pub(super) async fn watch_once(
     let mut rows: HashMap<String, Arc<Row>> = list_rows.into_iter().map(|r| (r.uid.clone(), r)).collect();
     let mut snaps = Snapshots { dirty: true, sent: None };
     snaps.flush(&rows, tx, pause)?;
-    *progress = true;
     if *first != FirstList::Done {
         tx.unbounded_send(TableMsg::Listed)?;
         *first = FirstList::Done;
@@ -718,7 +718,6 @@ pub(super) async fn watch_once(
                 Some(None) => break,
                 Some(Some(lines)) => {
                     heard = tokio::time::Instant::now();
-                    *progress = true;
                     for line in lines {
                         let line = line?;
                         match apply_event(&line, &mut rows, &mut version, extras)? {
@@ -727,6 +726,7 @@ pub(super) async fn watch_once(
                             // Our resourceVersion is too old: relist (which sends every row).
                             Applied::Relist => return Ok(()),
                         }
+                        *progress = true;
                     }
                 }
                 None => {}
@@ -868,10 +868,18 @@ pub async fn list_labels(
     .await
 }
 
-/// Names (and namespaces) of every object of a kind, from metadata only.
-pub async fn list_names(client: Client, ar: ApiResource) -> Result<Vec<(Option<String>, String)>> {
+/// Names (and namespaces) of every object of a kind, in `namespace` or everywhere,
+/// from metadata only.
+pub async fn list_names(
+    client: Client,
+    ar: ApiResource,
+    namespace: Option<String>,
+) -> Result<Vec<(Option<String>, String)>> {
     run(async move {
-        let api: Api<DynamicObject> = Api::all_with(client, &ar);
+        let api: Api<DynamicObject> = match &namespace {
+            Some(ns) => Api::namespaced_with(client, ns, &ar),
+            None => Api::all_with(client, &ar),
+        };
         let list = api.list_metadata(&ListParams::default()).await?;
         Ok(list.items.into_iter().filter_map(|o| Some((o.metadata.namespace, o.metadata.name?))).collect())
     })

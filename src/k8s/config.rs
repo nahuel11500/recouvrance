@@ -46,16 +46,20 @@ pub fn kubeconfig_signature() -> Vec<(std::path::PathBuf, Option<std::time::Syst
 }
 
 /// Add `more` to `kc`. Names already taken (two files with a context, cluster or
-/// user of the same name) get `@<file name>` so both stay usable.
+/// user of the same name) get `@<file name>` so both stay usable, then `-2`, `-3`…
+/// if that is taken too.
 pub(super) fn merge_unique(kc: &mut Kubeconfig, mut more: Kubeconfig, file: &str) {
-    let rename = |name: &str| format!("{name}@{file}");
-    let taken_clusters: std::collections::HashSet<String> = kc.clusters.iter().map(|c| c.name.clone()).collect();
-    let taken_users: std::collections::HashSet<String> = kc.auth_infos.iter().map(|c| c.name.clone()).collect();
-    let taken_contexts: std::collections::HashSet<String> = kc.contexts.iter().map(|c| c.name.clone()).collect();
+    // Every name in use, from both sides: a new name must not land on any of them.
+    let mut taken_clusters: std::collections::HashSet<String> =
+        kc.clusters.iter().chain(&more.clusters).map(|c| c.name.clone()).collect();
+    let mut taken_users: std::collections::HashSet<String> =
+        kc.auth_infos.iter().chain(&more.auth_infos).map(|c| c.name.clone()).collect();
+    let mut taken_contexts: std::collections::HashSet<String> =
+        kc.contexts.iter().chain(&more.contexts).map(|c| c.name.clone()).collect();
     for c in &mut more.clusters {
-        if taken_clusters.contains(&c.name) {
+        if kc.clusters.iter().any(|k| k.name == c.name) {
             let old = c.name.clone();
-            c.name = rename(&old);
+            c.name = free_name(&old, file, &mut taken_clusters);
             for ctx in more.contexts.iter_mut().filter_map(|x| x.context.as_mut()) {
                 if ctx.cluster == old {
                     ctx.cluster = c.name.clone();
@@ -64,9 +68,9 @@ pub(super) fn merge_unique(kc: &mut Kubeconfig, mut more: Kubeconfig, file: &str
         }
     }
     for u in &mut more.auth_infos {
-        if taken_users.contains(&u.name) {
+        if kc.auth_infos.iter().any(|k| k.name == u.name) {
             let old = u.name.clone();
-            u.name = rename(&old);
+            u.name = free_name(&old, file, &mut taken_users);
             for ctx in more.contexts.iter_mut().filter_map(|x| x.context.as_mut()) {
                 if ctx.user.as_deref() == Some(old.as_str()) {
                     ctx.user = Some(u.name.clone());
@@ -75,8 +79,8 @@ pub(super) fn merge_unique(kc: &mut Kubeconfig, mut more: Kubeconfig, file: &str
         }
     }
     for c in &mut more.contexts {
-        if taken_contexts.contains(&c.name) {
-            c.name = rename(&c.name);
+        if kc.contexts.iter().any(|k| k.name == c.name) {
+            c.name = free_name(&c.name, file, &mut taken_contexts);
         }
     }
     kc.clusters.extend(more.clusters);
@@ -85,6 +89,18 @@ pub(super) fn merge_unique(kc: &mut Kubeconfig, mut more: Kubeconfig, file: &str
     if kc.current_context.is_none() {
         kc.current_context = more.current_context;
     }
+}
+
+/// `name@file`, or `name@file-2`, `-3`… when that is taken; the result is marked taken.
+fn free_name(name: &str, file: &str, taken: &mut std::collections::HashSet<String>) -> String {
+    let mut new = format!("{name}@{file}");
+    let mut i = 2;
+    while taken.contains(&new) {
+        new = format!("{name}@{file}-{i}");
+        i += 1;
+    }
+    taken.insert(new.clone());
+    new
 }
 
 /// All kubeconfig files merged (see `kubeconfig_files`); unreadable files are skipped.
@@ -422,6 +438,31 @@ mod kubeconfig_tests {
             .and_then(|c| c.server.clone());
         assert_eq!(server.as_deref(), Some("https://b"));
         assert_eq!(kc.current_context.as_deref(), Some("prod"));
+    }
+
+    #[test]
+    fn same_file_names_stay_apart() {
+        let file = |server: &str| -> kube::config::Kubeconfig {
+            crate::yaml::from_str(&format!("clusters: [{{name: kind, cluster: {{server: {server}}}}}]\nusers: [{{name: admin, user: {{token: {server}}}}}]\ncontexts: [{{name: kind, context: {{cluster: kind, user: admin}}}}]\n")).unwrap()
+        };
+        // ~/a/config, ~/b/config and ~/c/config: all three have the stem "config".
+        let mut kc = file("https://a");
+        super::merge_unique(&mut kc, file("https://b"), "config");
+        super::merge_unique(&mut kc, file("https://c"), "config");
+        let names: Vec<&str> = kc.contexts.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["kind", "kind@config", "kind@config-2"]);
+        let ctx = kc.contexts[2].context.as_ref().unwrap();
+        assert_eq!(ctx.cluster, "kind@config-2");
+        assert_eq!(ctx.user.as_deref(), Some("admin@config-2"));
+        let server = kc
+            .clusters
+            .iter()
+            .find(|c| c.name == ctx.cluster)
+            .and_then(|c| c.cluster.as_ref())
+            .and_then(|c| c.server.clone());
+        assert_eq!(server.as_deref(), Some("https://c"));
+        assert_eq!(kc.clusters.len(), 3);
+        assert_eq!(kc.auth_infos.len(), 3);
     }
 }
 

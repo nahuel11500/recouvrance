@@ -80,7 +80,7 @@ fn main() {
         plugins::reload(cx);
         app::load_zoom(cx);
         let mode = app::initial_theme(cx);
-        app::set_theme(mode, None, cx);
+        app::apply_theme(mode, None, cx);
         app::open_main_window(cx);
         cx.activate(true);
     });

@@ -174,6 +174,8 @@ struct CompareState {
     target_name: Option<String>,
     other: Option<Result<serde_json::Value, String>>,
     candidates: Vec<String>,
+    /// Why the candidates could not be listed.
+    candidates_error: Option<String>,
     /// Candidates were listed (or are being listed): never list them again.
     candidates_loaded: bool,
     _candidates: Option<Task<()>>,

@@ -645,14 +645,13 @@ pub(super) fn cron_jobs(ctx: &Ctx, cx: &App) -> Div {
         .child(heading_for(&format!("Jobs ({})", jobs.len()), ctx.related, "extra", cx))
         .children(jobs.into_iter().take(20).map(|j| {
             let name = s(j, "/metadata/name").unwrap_or_default().to_string();
-            let (status, color) =
-                if n(j, "/status/failed").unwrap_or(0) > 0 && n(j, "/status/succeeded").unwrap_or(0) == 0 {
-                    ("Failed", theme.danger)
-                } else if n(j, "/status/active").unwrap_or(0) > 0 {
-                    ("Running", theme.success)
-                } else {
-                    ("Complete", theme.muted_foreground)
-                };
+            let status = job_status(j);
+            let color = match status {
+                "Failed" => theme.danger,
+                "Running" => theme.success,
+                "Retrying" | "Suspended" => theme.warning,
+                _ => theme.muted_foreground,
+            };
             h_flex()
                 .gap_3()
                 .py_0p5()
@@ -672,6 +671,25 @@ pub(super) fn cron_jobs(ctx: &Ctx, cx: &App) -> Div {
                         .child(age_of(j, "/metadata/creationTimestamp").unwrap_or_default()),
                 )
         }))
+}
+
+/// A Job's state from its conditions; from its pod counts while it has none (still running).
+fn job_status(j: &Value) -> &'static str {
+    let is = |t: &str| arr(j, "/status/conditions").iter().any(|c| c["type"] == t && c["status"] == "True");
+    let count = |p: &str| n(j, p).unwrap_or(0);
+    if is("Failed") || is("FailureTarget") {
+        "Failed"
+    } else if is("Complete") || is("SuccessCriteriaMet") {
+        "Complete"
+    } else if is("Suspended") {
+        "Suspended"
+    } else if count("/status/active") > 0 {
+        "Running"
+    } else if count("/status/failed") > 0 {
+        "Retrying"
+    } else {
+        "Pending"
+    }
 }
 
 /// PodDisruptionBudget: how many may be disrupted now, and the pods it covers.
@@ -862,5 +880,20 @@ mod tests {
         assert_eq!(super::metric_key(""), "");
         assert_eq!(super::metric_key("?"), "?");
         assert_eq!(super::metric_key("Éx"), "éx");
+    }
+
+    #[test]
+    fn job_status_reads_conditions_first() {
+        let st = super::job_status;
+        let cond = |t: &str| json!({"type": t, "status": "True"});
+        // Retrying after one failure.
+        assert_eq!(st(&json!({"status": {"failed": 1, "active": 1}})), "Running");
+        assert_eq!(st(&json!({"status": {"failed": 1}})), "Retrying");
+        // Some completions, then the backoff limit.
+        assert_eq!(st(&json!({"status": {"succeeded": 2, "failed": 6, "conditions": [cond("Failed")]}})), "Failed");
+        assert_eq!(st(&json!({"status": {"succeeded": 1, "conditions": [cond("Complete")]}})), "Complete");
+        assert_eq!(st(&json!({"status": {"conditions": [cond("Suspended")]}})), "Suspended");
+        assert_eq!(st(&json!({"status": {"conditions": [{"type": "Suspended", "status": "False"}]}})), "Pending");
+        assert_eq!(st(&json!({})), "Pending");
     }
 }

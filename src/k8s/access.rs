@@ -55,27 +55,27 @@ pub async fn my_rules(client: Client, ns: String) -> Result<Vec<(Vec<String>, Ve
         Ok(rules
             .into_iter()
             .map(|rule| {
-                let resources: Vec<String> = rule
-                    .resources
-                    .unwrap_or_default()
-                    .into_iter()
-                    .flat_map(|res| {
-                        let groups = rule.api_groups.clone().unwrap_or_default();
-                        if groups.is_empty() || groups == [""] || groups == ["*"] && res == "*" {
-                            vec![res]
-                        } else {
-                            groups
-                                .into_iter()
-                                .map(|g| if g.is_empty() { res.clone() } else { format!("{res}.{g}") })
-                                .collect()
-                        }
-                    })
-                    .collect();
+                let groups = rule.api_groups.unwrap_or_default();
+                let resources = rule_resources(&groups, rule.resources.unwrap_or_default());
                 (rule.verbs, resources, rule.resource_names.unwrap_or_default())
             })
             .collect())
     })
     .await
+}
+
+/// A rule's resources as `resource[.group]`: `pods` (core), `deployments.apps`,
+/// `*` (every core resource), `*.*` (every resource in every group).
+fn rule_resources(groups: &[String], resources: Vec<String>) -> Vec<String> {
+    resources
+        .into_iter()
+        .flat_map(|res| {
+            if groups.is_empty() {
+                return vec![res];
+            }
+            groups.iter().map(|g| if g.is_empty() { res.clone() } else { format!("{res}.{g}") }).collect()
+        })
+        .collect()
 }
 
 /// Roles and bindings: those of `ns` (all namespaces when None) plus cluster-wide ones.
@@ -92,5 +92,22 @@ pub async fn rbac_snapshot(client: Client, ns: Option<String>) -> crate::rbac::S
         cluster_roles: cluster_roles.unwrap_or_default(),
         role_bindings: role_bindings.unwrap_or_default(),
         cluster_role_bindings: cluster_role_bindings.unwrap_or_default(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::rule_resources;
+
+    fn strings(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn core_and_all_groups_stay_apart() {
+        assert_eq!(rule_resources(&strings(&[""]), strings(&["*"])), ["*"]);
+        assert_eq!(rule_resources(&strings(&["*"]), strings(&["*"])), ["*.*"]);
+        assert_eq!(rule_resources(&strings(&["", "apps"]), strings(&["*"])), ["*", "*.apps"]);
+        assert_eq!(rule_resources(&strings(&["*"]), strings(&["pods", "*/scale"])), ["pods.*", "*/scale.*"]);
     }
 }

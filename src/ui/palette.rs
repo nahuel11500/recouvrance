@@ -62,6 +62,24 @@ fn score(query: &str, text: &str) -> Option<i64> {
     Some(score - text.len() as i64 / 10)
 }
 
+impl Item {
+    /// What the item opens: an object once per cluster, the rest by what it shows.
+    fn key(&self) -> String {
+        match &self.target {
+            Target::Object { ctx, kind, name, namespace } => {
+                format!("{ctx}/{kind}/{}/{name}", namespace.as_deref().unwrap_or_default())
+            }
+            _ => format!("{}\n{}", self.label, self.detail),
+        }
+    }
+}
+
+/// Add the items not already listed.
+fn add_new(items: &mut Vec<Item>, more: Vec<Item>) {
+    let seen: std::collections::HashSet<String> = items.iter().map(Item::key).collect();
+    items.extend(more.into_iter().filter(|i| !seen.contains(&i.key())));
+}
+
 impl Palette {
     pub fn new(items: Vec<Item>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let input =
@@ -86,9 +104,7 @@ impl Palette {
 
     /// Results that arrive later (the cluster-wide search index).
     pub fn add_items(&mut self, items: Vec<Item>, cx: &mut Context<Self>) {
-        let seen: std::collections::HashSet<(String, String)> =
-            self.items.iter().map(|i| (i.label.clone(), i.detail.clone())).collect();
-        self.items.extend(items.into_iter().filter(|i| !seen.contains(&(i.label.clone(), i.detail.clone()))));
+        add_new(&mut self.items, items);
         cx.notify();
     }
 
@@ -220,7 +236,29 @@ impl Render for Palette {
 
 #[cfg(test)]
 mod tests {
-    use super::score;
+    use super::{Item, Lucide, Target, add_new, score};
+
+    fn object(ctx: usize, detail: &str) -> Item {
+        Item {
+            label: "web".into(),
+            detail: detail.into(),
+            icon: Lucide::Box,
+            target: Target::Object {
+                ctx,
+                kind: "deployment".into(),
+                name: "web".into(),
+                namespace: Some("prod".into()),
+            },
+        }
+    }
+
+    #[test]
+    fn same_name_on_other_clusters_is_kept() {
+        let mut items = vec![object(0, "Deployments · prod")];
+        add_new(&mut items, vec![object(0, "Deployments · prod · a"), object(1, "Deployments · prod · b")]);
+        assert_eq!(items.len(), 2);
+        assert!(matches!(items[1].target, Target::Object { ctx: 1, .. }));
+    }
 
     #[test]
     fn scoring_prefers_substrings_and_early_matches() {
