@@ -667,10 +667,12 @@ impl KubeMcp {
         if let Err(e) = check_identity(&kind, ns, &p.name, &value) {
             return call.finish(Err(e));
         }
-        // The pods to sum: the pod itself, or the workload's pods by its selector.
-        let pods: Vec<serde_json::Value> = if kind.is("", "Pod") {
-            vec![value.clone()]
+        // The pods to sum: the pod itself, or the workload's pods by its selector that the
+        // agent may list.
+        let (pods, hidden): (Vec<serde_json::Value>, usize) = if kind.is("", "Pod") {
+            (vec![value.clone()], 0)
         } else {
+            let pods_kind = self.kind(&call, &p.context, "pods").await?.1;
             let selector: Vec<String> = value
                 .pointer("/spec/selector/matchLabels")
                 .and_then(|m| m.as_object())
@@ -680,10 +682,24 @@ impl KubeMcp {
                 return call.finish(Err(anyhow::anyhow!("{} has no label selector", kind.ar.kind)));
             }
             let pod_ar = k8s::ar_of::<k8s_openapi::api::core::v1::Pod>();
-            match k8s::list_values(client.clone(), pod_ar, Some(p.namespace.clone()), Some(selector.join(","))).await {
-                Ok(v) => v,
-                Err(e) => return call.finish(Err(e)),
+            let mut pods =
+                match k8s::list_values(client.clone(), pod_ar, Some(p.namespace.clone()), Some(selector.join(",")))
+                    .await
+                {
+                    Ok(v) => v,
+                    Err(e) => return call.finish(Err(e)),
+                };
+            let listed = pods.len();
+            pods.retain(|pod| {
+                let name = pod.pointer("/metadata/name").and_then(|v| v.as_str()).unwrap_or_default();
+                let a = access_for(&pods_kind, &p.context, "list", Some(p.namespace.clone()), Some(name.into()));
+                call.policy().decide(&a).mode == Mode::Allow
+            });
+            if pods.is_empty() && listed > 0 {
+                return Err(call.deny(format!("{} — you may not list its pods", describe(&access))));
             }
+            let hidden = listed - pods.len();
+            (pods, hidden)
         };
         // Like the charts: pods not finished, at most as many as fit in the query.
         let (pods, total) = crate::prom::chart_pods(&pods);
@@ -739,7 +755,8 @@ impl KubeMcp {
         mem_row.push(opt(sum("/resources/requests/memory", k8s::parse_bytes), k8s::format_bytes));
         mem_row.push(opt(sum("/resources/limits/memory", k8s::parse_bytes), k8s::format_bytes));
         let of = if names.len() < total { format!(" of {total}") } else { String::new() };
-        let header = format!("{}{of} pod(s), last {minutes} minutes, summed over pods\n", names.len());
+        let left_out = if hidden > 0 { " (pods you may not list are left out)" } else { "" };
+        let header = format!("{}{of} pod(s), last {minutes} minutes, summed over pods{left_out}\n", names.len());
         call.finish(Ok(header
             + &format_table(&["", "MIN", "AVG", "P95", "MAX", "LAST", "REQUESTS", "LIMITS"], &[cpu_row, mem_row])))
     }
