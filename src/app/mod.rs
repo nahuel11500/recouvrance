@@ -301,6 +301,8 @@ pub struct AppView {
     _index_tasks: Vec<Task<()>>,
     focus: FocusHandle,
     palette: Option<Entity<Palette>>,
+    /// The open palette's subscription, replaced on each open.
+    _palette_sub: Option<Subscription>,
     favorites: Entity<Favorites>,
     column_prefs: ColumnPrefs,
     all_contexts: Vec<String>,
@@ -551,6 +553,7 @@ impl AppView {
             _index_tasks: Vec::new(),
             focus,
             palette: None,
+            _palette_sub: None,
             column_prefs: ColumnPrefs::load(),
             favorites,
             all_contexts: contexts.clone(),
