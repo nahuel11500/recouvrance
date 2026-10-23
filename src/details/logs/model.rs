@@ -113,7 +113,7 @@ pub(crate) fn readable_json(text: &str) -> Option<(String, usize)> {
     let msg_key = ["msg", "message", "event", "log"].into_iter().find(|k| obj.contains_key(*k));
     let mut line = msg_key
         .and_then(|k| obj.get(k))
-        .map(|m| m.as_str().map(String::from).unwrap_or_else(|| m.to_string()))
+        .map(|m| m.as_str().map(escape_controls).unwrap_or_else(|| m.to_string()))
         .unwrap_or_default();
     let fields_at = line.len();
     // Sorted, so the same fields line up from one line to the next.
@@ -124,13 +124,27 @@ pub(crate) fn readable_json(text: &str) -> Option<(String, usize)> {
             continue;
         }
         let v = match v {
-            serde_json::Value::String(s) => s.replace(' ', "\u{00a0}"),
+            serde_json::Value::String(s) => escape_controls(s).replace(' ', "\u{00a0}"),
             other => other.to_string(),
         };
         line.push(' ');
         line.push_str(&format!("{k}={v}"));
     }
     Some((line, fields_at))
+}
+
+/// `s` with control characters (newlines, tabs…) written as escapes such as `\n`, so a
+/// stack trace in a JSON value stays on one row.
+fn escape_controls(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if c.is_control() {
+            out.extend(c.escape_default());
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// Search words (all must appear; "!word" lines are left out) and a minimum level.
@@ -547,6 +561,11 @@ mod tests {
         assert_eq!(&line[..at], "started server");
         assert!(line.contains("port=80") && line.contains("addr=0.0.0.0") && !line.contains("level="));
         assert!(readable_json("plain text").is_none());
+        // Newlines and tabs in the message or a value stay escaped, on one row.
+        let (line, at) = readable_json(r#"{"msg":"failed\nretrying","stacktrace":"main.go:1\n\tmain()"}"#).unwrap();
+        assert_eq!(&line[..at], r"failed\nretrying");
+        assert!(line.ends_with(r"stacktrace=main.go:1\n\tmain()"));
+        assert!(!line.contains(['\n', '\t']));
         // Cached on the line, as shown.
         let l = LogLine::parse(0, r#"{"msg":"hi","n":1}"#.into());
         assert_eq!(l.display(true), "hi n=1");
