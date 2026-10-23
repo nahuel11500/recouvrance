@@ -89,7 +89,14 @@ pub fn port_forward(
                         }
                     };
                     let mut upstream = pf.take_stream(remote).context("no stream")?;
-                    tokio::io::copy_bidirectional(&mut socket, &mut upstream).await?;
+                    // The pod reports why it cannot connect (nothing listens on the port…) here.
+                    let error = futures::future::OptionFuture::from(pf.take_error(remote));
+                    tokio::select! {
+                        copied = tokio::io::copy_bidirectional(&mut socket, &mut upstream) => {
+                            copied?;
+                        }
+                        Some(Some(msg)) = error => anyhow::bail!("{}", pod_error(&msg, remote)),
+                    }
                     anyhow::Ok(())
                 }
                 .await;
@@ -150,6 +157,15 @@ pub async fn resolve_forward_pod(
             .with_context(|| format!("{pod} is gone and no pod replaced it"))
     })
     .await
+}
+
+/// The pod's port-forward error, short when it is the usual one.
+fn pod_error(msg: &str, port: u16) -> String {
+    if msg.contains("connection refused") {
+        format!("nothing listens on port {port} in the pod")
+    } else {
+        msg.trim().to_string()
+    }
 }
 
 fn running(p: &Pod) -> bool {
@@ -243,6 +259,15 @@ mod tests {
         ];
         assert_eq!(replacement(&pods, &replicasets, &owner).as_deref(), Some("web-6d7e8f9a0-bbbbb"));
         assert_eq!(replacement(&pods[..2], &replicasets, &owner), None);
+    }
+
+    #[test]
+    fn pod_errors_are_short() {
+        let refused = "error forwarding port 8080 to pod 1a2b, uid : failed to execute portforward in network \
+                       namespace \"/var/run/netns/cni-1\": failed to connect to localhost:8080 inside namespace \
+                       \"1a2b\", IPv4: dial tcp4 127.0.0.1:8080: connect: connection refused";
+        assert_eq!(pod_error(refused, 8080), "nothing listens on port 8080 in the pod");
+        assert_eq!(pod_error("pod not found\n", 80), "pod not found");
     }
 
     #[test]

@@ -163,11 +163,32 @@ pub fn bindings_of(snap: &Snapshot, kind: &str, name: &str, ns: Option<&str>) ->
         .collect()
 }
 
-/// "deployments.apps" / "pods/log" / "apps/deployments" → (group, resource).
+/// Subresources: what can follow `resource.group/` (as opposed to `group/resource`).
+const SUBRESOURCES: [&str; 14] = [
+    "status",
+    "scale",
+    "log",
+    "exec",
+    "attach",
+    "portforward",
+    "proxy",
+    "eviction",
+    "binding",
+    "ephemeralcontainers",
+    "resize",
+    "token",
+    "approval",
+    "finalize",
+];
+
+/// "deployments.apps" / "pods/log" / "deployments.apps/scale" / "apps/deployments" →
+/// (group, resource).
 pub fn split_resource(text: &str) -> (String, String) {
     let t = text.trim();
-    // "apps/deployments", "cert-manager.io/certificates": group first.
+    // "apps/deployments", "cert-manager.io/certificates": group first. A subresource
+    // after the slash means `resource.group/sub` ("deployments.apps/scale").
     if let Some((g, r)) = t.split_once('/')
+        && !SUBRESOURCES.contains(&r)
         && (g.contains('.') || matches!(g, "apps" | "batch" | "policy" | "autoscaling"))
     {
         return (g.to_string(), r.to_string());
@@ -214,5 +235,18 @@ mod tests {
         assert_eq!(bindings_of(&s, "Role", "pod-reader", Some("demo")).len(), 1);
         assert_eq!(split_resource("deployments.apps"), ("apps".into(), "deployments".into()));
         assert_eq!(split_resource("pods/log"), ("".into(), "pods/log".into()));
+    }
+
+    #[test]
+    fn resources_with_groups_and_subresources() {
+        assert_eq!(split_resource("deployments.apps/scale"), ("apps".into(), "deployments/scale".into()));
+        assert_eq!(
+            split_resource("certificates.cert-manager.io/status"),
+            ("cert-manager.io".into(), "certificates/status".into())
+        );
+        assert_eq!(split_resource("apps/deployments"), ("apps".into(), "deployments".into()));
+        assert_eq!(split_resource("cert-manager.io/certificates"), ("cert-manager.io".into(), "certificates".into()));
+        assert_eq!(split_resource("networking.k8s.io/ingresses"), ("networking.k8s.io".into(), "ingresses".into()));
+        assert_eq!(split_resource(" pods/exec "), ("".into(), "pods/exec".into()));
     }
 }

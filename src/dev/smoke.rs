@@ -118,6 +118,25 @@ pub fn run(ctx: String) {
             println!("cluster overview load: {:?} running={running}", t.elapsed());
             return;
         }
+        if std::env::var("RECOUVRANCE_HELMLOAD").is_ok() {
+            let t = std::time::Instant::now();
+            let n = crate::ui::helm::list_releases(client.clone(), None).await.map(|r| r.len());
+            println!("helm list: {n:?} releases in {:?}", t.elapsed());
+            let (tx, mut rx) = futures::channel::mpsc::unbounded();
+            let fill = crate::ui::helm::fill_releases(client.clone(), None, tx);
+            let count = async {
+                use futures::StreamExt as _;
+                let (mut n, mut first) = (0, None);
+                while let Some(page) = rx.next().await {
+                    n += page.len();
+                    first.get_or_insert(t.elapsed());
+                }
+                (n, first)
+            };
+            let (r, (n, first)) = futures::join!(fill, count);
+            println!("helm fill: {n} releases ({r:?}), first page at {first:?}, all at {:?}", t.elapsed());
+            return;
+        }
         if std::env::var("RECOUVRANCE_DASH").is_ok() {
             let t = std::time::Instant::now();
             let r = crate::ui::dashboard::debug_load(client.clone()).await;

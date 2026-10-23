@@ -39,7 +39,8 @@
 - **Write mode** (off by default): click the `read-only` badge to enable scale, restart, delete
   (confirmed as set per kind), YAML edits (validated by a server dry run first), cordon/uncordon nodes,
   debug pods with an ephemeral container (falls back to a Pod Security "restricted" profile), run a CronJob now, suspend/resume (CronJobs, Flux, Argo CronWorkflows), drain nodes, force delete
-  or remove finalizers (only once the delete leaves it stuck terminating), Flux *Reconcile*, Argo CD
+  or remove finalizers (only once the delete leaves it stuck terminating: it already was, or still is
+  after 10 seconds), Flux *Reconcile*, Argo CD
   *Refresh*/*Sync*, create/apply YAML (a server dry run first, then a confirmation listing each
   object's kind, namespace and name). YAML edits on a detail page save only that object: a changed
   kind, API group, namespace or name is refused, and so are masked Secret values. Every
@@ -70,9 +71,9 @@
   https URL, edit in `$EDITOR`, errors located on their line, field docs (`kubectl explain`) and forms
   generated from the cluster's schema, managedFields toggle, download as YAML.
 - **Logs**: find (regex, match case, next/previous) on top of the filter (`!word` excludes).
-- **Tables**: column expressions in the filter (`status:Running restarts>3 cpu>200m age<1h`), filter
-  history and saved searches, links from cells to the objects they name, click a namespace to
-  filter, CSV export, tabs.
+- **Tables**: column expressions in the filter (`status:Running restarts>3 cpu>200m age<1h`), hidden
+  columns included (`ip:10.4.2.17`), filter history and saved searches, links from cells to the
+  objects they name, click a namespace to filter, CSV export, tabs.
 - **Port-forwards** with options: local port, listen address, https, open in the browser; they follow
   replacement pods.
 - **Per-cluster settings**: Prometheus or VictoriaMetrics endpoint, node shell image, accessible

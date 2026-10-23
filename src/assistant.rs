@@ -52,15 +52,18 @@ pub fn save_api_key(key: &str) -> std::io::Result<()> {
 /// The main agent (created read-only, never Secrets, the first time) and its token.
 /// It is the agent named "Claude" only: another agent's token is never rotated for it.
 pub fn main_agent(hub: &Hub) -> Result<(String, String)> {
-    let existing = hub.config().agents.iter().find(|a| a.name == AGENT_NAME).map(|a| a.id.clone());
+    let existing = main_agent_id(hub);
     let saved =
         read_secret("main-agent").and_then(|s| s.split_once(' ').map(|(id, t)| (id.to_string(), t.to_string())));
     match (existing, saved) {
-        (Some(id), Some((sid, token))) if id == sid => Ok((id, token)),
+        // The saved token is used only while it is still this agent's ("New token" replaces it).
+        (Some(id), Some((sid, token))) if id == sid && hub.agent_by_token(&token).is_some_and(|a| a.id == id) => {
+            Ok((id, token))
+        }
         (Some(id), _) => {
             // The token is only stored hashed: issue a new one (Connect Claude Code updates it there).
             let token = hub.rotate_token(&id)?;
-            write_secret("main-agent", &format!("{id} {token}"))?;
+            save_main_token(&id, &token)?;
             Ok((id, token))
         }
         (None, _) => {
@@ -69,10 +72,26 @@ pub fn main_agent(hub: &Hub) -> Result<(String, String)> {
                 a.policy.rules[0].contexts = vec!["*".into()];
                 a.policy.rules[0].note = "Read everything (allow more below)".into();
             })?;
-            write_secret("main-agent", &format!("{} {token}", agent.id))?;
+            save_main_token(&agent.id, &token)?;
             Ok((agent.id, token))
         }
     }
+}
+
+fn main_agent_id(hub: &Hub) -> Option<String> {
+    hub.config().agents.iter().find(|a| a.name == AGENT_NAME).map(|a| a.id.clone())
+}
+
+/// After "New token" on the Agents page: the main agent's new token is the one the assistant uses.
+pub fn token_rotated(hub: &Hub, id: &str, token: &str) -> std::io::Result<()> {
+    if main_agent_id(hub).as_deref() != Some(id) {
+        return Ok(());
+    }
+    save_main_token(id, token)
+}
+
+fn save_main_token(id: &str, token: &str) -> std::io::Result<()> {
+    write_secret("main-agent", &format!("{id} {token}"))
 }
 
 pub fn agent_token(hub: &Hub) -> Result<String> {
@@ -615,8 +634,11 @@ async fn ask_api(
             let api = anthropic_url();
             let (_, text) = post(&format!("{api}/v1/messages"), &headers, &body).await?;
             let resp: Value = serde_json::from_str(&text)?;
-            let content = resp["content"].as_array().cloned().unwrap_or_default();
-            messages.push(json!({"role": "assistant", "content": content}));
+            let cut_off = resp["stop_reason"] == "max_tokens";
+            let content = reply_content(&resp);
+            if !content.is_empty() {
+                messages.push(json!({"role": "assistant", "content": content}));
+            }
             let mut results = Vec::new();
             for block in &content {
                 match block["type"].as_str() {
@@ -631,7 +653,10 @@ async fn ask_api(
                     _ => {}
                 }
             }
-            if resp["stop_reason"] != "tool_use" || results.is_empty() {
+            if cut_off {
+                on_step(Step::Text("(the reply was cut off)".into()));
+            }
+            if results.is_empty() {
                 return Ok(messages);
             }
             messages.push(json!({"role": "user", "content": results}));
@@ -642,8 +667,31 @@ async fn ask_api(
     .await
 }
 
+/// The blocks of an API reply worth keeping. Tool calls count only when the reply stopped
+/// to run them: one cut off (max_tokens) may be incomplete, and is neither run nor kept
+/// (a kept call with no result would break every later question).
+fn reply_content(resp: &Value) -> Vec<Value> {
+    let mut content = resp["content"].as_array().cloned().unwrap_or_default();
+    if resp["stop_reason"] != "tool_use" {
+        content.retain(|b| b["type"] != "tool_use");
+    }
+    content
+}
+
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
+    #[test]
+    fn cut_off_tool_calls_are_dropped() {
+        let text = json!({"type": "text", "text": "Let me look"});
+        let call = json!({"type": "tool_use", "id": "t1", "name": "list_resources", "input": {}});
+        let reply = |stop: &str| json!({"stop_reason": stop, "content": [text.clone(), call.clone()]});
+        assert_eq!(super::reply_content(&reply("tool_use")), vec![text.clone(), call.clone()]);
+        assert_eq!(super::reply_content(&reply("max_tokens")), vec![text.clone()]);
+        assert!(super::reply_content(&json!({"stop_reason": "max_tokens", "content": [call]})).is_empty());
+    }
+
     #[test]
     fn parses_sse_and_json() {
         let sse = "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[1]}}\n\n";

@@ -152,6 +152,8 @@ impl AgentsView {
                                 move |this, _, _, cx| {
                                     let result = this.hub.rotate_token(&id);
                                     if let Some(token) = this.report(result) {
+                                        let saved = crate::assistant::token_rotated(&this.hub, &id, &token);
+                                        this.report(saved.map_err(anyhow::Error::from));
                                         this.fresh_token = Some((id.clone(), token));
                                     }
                                     cx.notify();

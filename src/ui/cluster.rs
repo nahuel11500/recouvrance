@@ -56,15 +56,37 @@ impl ClusterOverview {
                     break;
                 }
                 let started = std::time::Instant::now();
-                let loads = clusters.iter().map(|(ctx, c)| load(ctx.clone(), c.clone()));
-                let summaries = futures::future::join_all(loads).await;
-                let took = started.elapsed();
-                if this
-                    .update(cx, |this, cx| {
+                // The numbers as soon as the API servers answer; the charts when Prometheus
+                // does (on a big cluster it takes several times longer).
+                let (this2, mut cx2) = (this.clone(), cx.clone());
+                let numbers = async {
+                    let mut summaries =
+                        futures::future::join_all(clusters.iter().map(|(ctx, c)| load(ctx.clone(), c.clone()))).await;
+                    this2.update(&mut cx2, |this, cx| {
+                        // Keep the charts shown until the new ones come.
+                        for (new, old) in summaries.iter_mut().zip(this.summaries.iter_mut().flatten()) {
+                            if new.context == old.context {
+                                new.history = old.history.take();
+                                new.gpu = old.gpu.take();
+                            }
+                        }
                         this.summaries = Some(summaries);
                         cx.notify();
                     })
-                    .is_err()
+                };
+                let charts = futures::future::join_all(clusters.iter().map(|(ctx, c)| usage(ctx, c.clone())));
+                let (shown, charts) = futures::join!(numbers, charts);
+                let took = started.elapsed();
+                if shown.is_err()
+                    || this
+                        .update(cx, |this, cx| {
+                            for (s, (history, gpu)) in this.summaries.iter_mut().flatten().zip(charts) {
+                                s.history = history;
+                                s.gpu = gpu;
+                            }
+                            cx.notify();
+                        })
+                        .is_err()
                 {
                     break;
                 }
@@ -248,39 +270,62 @@ async fn metrics(client: Client, path: &'static str) -> MetricsList {
 /// The cluster overview's load, for the dev smoke run's timings.
 #[cfg(feature = "dev")]
 pub async fn debug_load(context: String, client: Client) -> usize {
-    load(context, client).await.pods_running
+    let t = std::time::Instant::now();
+    let numbers = async {
+        let s = load(context.clone(), client.clone()).await;
+        println!("cluster overview numbers: {:?}", t.elapsed());
+        s
+    };
+    let charts = async {
+        usage(&context, client.clone()).await;
+        println!("cluster overview charts: {:?}", t.elapsed());
+    };
+    futures::join!(numbers, charts).0.pods_running
 }
 
+/// CPU and memory over the chosen range, and GPUs, from Prometheus (when there is one).
+type Usage = (Option<(crate::prom::Series, crate::prom::Series)>, Option<crate::prom::GpuUsage>);
+
+async fn usage(context: &str, client: Client) -> Usage {
+    let minutes = crate::settings::get().usage_range;
+    let Ok(Some(target)) = crate::prom::target(context, client.clone()).await else { return (None, None) };
+    let (history, gpu) = futures::join!(
+        crate::prom::cluster_usage(client.clone(), target.clone(), minutes),
+        crate::prom::gpu_usage(client, target, crate::prom::GpuScope::Cluster, minutes),
+    );
+    (history.ok().map(|(cpu, mem)| (cpu.into_iter().map(|(t, v)| (t, v * 1000.0)).collect(), mem)), gpu)
+}
+
+/// Everything but the charts, all at once: one request after the other, a big cluster took
+/// over 30 s.
 async fn load(context: String, client: Client) -> Summary {
     let mut s = Summary { context, ..Default::default() };
-    let minutes = crate::settings::get().usage_range;
-    if let Ok(Some(target)) = crate::prom::target(&s.context, client.clone()).await {
-        if let Ok((cpu, mem)) = crate::prom::cluster_usage(client.clone(), target.clone(), minutes).await {
-            s.history = Some((cpu.into_iter().map(|(t, v)| (t, v * 1000.0)).collect(), mem));
-        }
-        s.gpu = crate::prom::gpu_usage(client.clone(), target, crate::prom::GpuScope::Cluster, minutes).await;
-    }
-    let result: Result<()> = async {
-        let c = client.clone();
-        let version: Value =
-            k8s::run(async move { Ok(c.request(http::Request::get("/version").body(Vec::new())?).await?) }).await?;
-        s.version = st(&version, "/gitVersion").to_string();
-
-        let nodes: Vec<NodeLite> = k8s::lists::list_lean(client.clone(), k8s::ar_of::<core::Node>(), None).await?;
-        add_nodes(&mut s, &nodes);
-        drop(nodes);
-        let pods: Vec<PodLite> = k8s::lists::list_lean(client.clone(), k8s::ar_of::<core::Pod>(), None).await?;
-        add_pods(&mut s, &pods);
-        drop(pods);
-        s.namespaces = k8s::namespaces(client.clone()).await.map(|n| n.len()).unwrap_or(0);
+    let c = client.clone();
+    let version = k8s::run(async move {
+        let v: Value = c.request(http::Request::get("/version").body(Vec::new())?).await?;
+        Ok(st(&v, "/gitVersion").to_string())
+    });
+    let (version, nodes, pods, namespaces, node_metrics, pod_metrics) = futures::join!(
+        version,
+        k8s::lists::list_lean::<NodeLite>(client.clone(), k8s::ar_of::<core::Node>(), None),
+        k8s::lists::list_lean_cached::<PodLite>(client.clone(), k8s::ar_of::<core::Pod>(), None),
+        k8s::namespaces(client.clone()),
+        metrics(client.clone(), "/apis/metrics.k8s.io/v1beta1/nodes"),
+        metrics(client.clone(), "/apis/metrics.k8s.io/v1beta1/pods"),
+    );
+    let result: Result<()> = (|| {
+        s.version = version?;
+        add_nodes(&mut s, &nodes?);
+        add_pods(&mut s, &pods?);
+        s.namespaces = namespaces.map(|n| n.len()).unwrap_or(0);
 
         // Usage: nodes for the totals, pods for the per-namespace ranking.
-        for n in metrics(client.clone(), "/apis/metrics.k8s.io/v1beta1/nodes").await.items {
+        for n in node_metrics.items {
             s.cpu.2 += k8s::parse_cpu(quantity(&n.usage, "cpu"));
             s.mem.2 += k8s::parse_bytes(quantity(&n.usage, "memory"));
         }
         let mut by_ns: HashMap<String, (f64, f64)> = HashMap::new();
-        for p in metrics(client.clone(), "/apis/metrics.k8s.io/v1beta1/pods").await.items {
+        for p in pod_metrics.items {
             let e = by_ns.entry(p.metadata.namespace).or_default();
             for c in &p.containers {
                 e.0 += k8s::parse_cpu(quantity(&c.usage, "cpu"));
@@ -292,8 +337,7 @@ async fn load(context: String, client: Client) -> Summary {
         top.truncate(10);
         s.top_ns = top;
         Ok(())
-    }
-    .await;
+    })();
     if let Err(e) = result {
         s.error = Some(format!("{e:#}"));
     }
