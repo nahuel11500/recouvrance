@@ -278,7 +278,8 @@ fn mask_manifest(manifest: &str) -> String {
         doc.clear();
     };
     for line in manifest.split_inclusive('\n') {
-        if line.trim_end() == "---" {
+        // `--- # Source: chart/templates/secret.yaml` starts a document too.
+        if crate::yaml::doc_start(line.trim_end()).is_some() {
             flush(&mut doc, &mut out);
             out.push_str(line);
         } else {
@@ -302,7 +303,7 @@ fn mask_manifest_doc(doc: &str) -> String {
         }
         Ok(_) => doc.to_string(),
         // Unreadable, but it may be a Secret: hide it rather than show its values.
-        Err(_) if doc.lines().any(|l| l.trim() == "kind: Secret") => {
+        Err(_) if doc.lines().any(|l| l.trim_start().starts_with("kind:") && l.contains("Secret")) => {
             comments + "# A Secret (its values are hidden; reveal secrets to see it)\n"
         }
         Err(_) => doc.to_string(),
@@ -601,7 +602,13 @@ pub struct HelmRelease {
     chart_choice: Option<(bool, Vec<String>)>,
     /// The values text captured when the upgrade started (revealed, never the masked view).
     upgrade_text: Option<String>,
-    _task: Task<()>,
+    /// The first read of the release and its history (fills in what the list left out).
+    /// Its own slot: a later reload must not cancel it.
+    _first_load: Task<()>,
+    /// The history again after a write.
+    history_load: crate::latest::Latest,
+    /// The chart lookup of the upgrade started last (a dry run, then a real one, or back).
+    chart_lookup: crate::latest::Latest,
 }
 
 /// The edited values to upgrade with, or None while secrets are masked: the masked view
@@ -677,7 +684,9 @@ impl HelmRelease {
             history: None,
             chart_choice: None,
             upgrade_text: None,
-            _task: task,
+            _first_load: task,
+            history_load: Default::default(),
+            chart_lookup: Default::default(),
         }
     }
 
@@ -685,16 +694,13 @@ impl HelmRelease {
     /// or rollback makes one), so its values are what the next upgrade starts from.
     fn reload_history(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let (client, ns, name) = (self.client.clone(), self.release.namespace.clone(), self.release.name.clone());
-        self._task = cx.spawn_in(window, async move |this, cx| {
-            let result = history(client, ns, name).await;
-            let _ = this.update_in(cx, |this, window, cx| {
-                if let Some(newest) = result.as_ref().ok().and_then(|h| newer_revision(this.release.revision, h)) {
-                    this.release = Release { context: this.release.context.clone(), ..newest.clone() };
-                    this.set_reveal(this.reveal, window, cx);
-                }
-                this.history = Some(result.map_err(|e| format!("{e:#}").into()));
-                cx.notify();
-            });
+        self.history_load.spawn_in(window, cx, history(client, ns, name), |this, result, window, cx| {
+            if let Some(newest) = result.as_ref().ok().and_then(|h| newer_revision(this.release.revision, h)) {
+                this.release = Release { context: this.release.context.clone(), ..newest.clone() };
+                this.set_reveal(this.reveal, window, cx);
+            }
+            this.history = Some(result.map_err(|e| format!("{e:#}").into()));
+            cx.notify();
         });
     }
 
@@ -739,42 +745,32 @@ impl HelmRelease {
         self.chart_choice = None;
         let (context, chart, version) =
             (self.context.clone(), self.release.chart.clone(), self.release.chart_version.clone());
-        cx.spawn_in(window, async move |this, cx| {
-            // Plain search, then an exact name match (helm's -r regex also sees descriptions).
-            let found = k8s::helm(
-                context,
+        // Plain search, then an exact name match (helm's -r regex also sees descriptions).
+        let lookup = {
+            let (chart, version) = (chart.clone(), version.clone());
+            async move {
                 // `--` everywhere: names from the cluster are never read as flags.
-                vec![
-                    "search".into(),
-                    "repo".into(),
-                    "--version".into(),
-                    version.clone(),
-                    "-o".into(),
-                    "json".into(),
-                    "--".into(),
-                    chart.clone(),
-                ],
-            )
-            .await;
-            let refs = found.map(|o| chart_refs(&o, &chart));
-            let _ = this.update_in(cx, |this, window, cx| match refs {
-                Err(e) => window.push_notification(Notification::error(format!("helm search failed: {e:#}")), cx),
-                Ok(refs) => match refs.as_slice() {
-                    [] => window.push_notification(
-                        Notification::error(format!(
-                            "chart {chart} {version} is not in your helm repositories (add it with `helm repo add`)"
-                        )),
-                        cx,
-                    ),
-                    [one] => this.chosen_chart(one.clone(), dry_run, window, cx),
-                    _ => {
-                        this.chart_choice = Some((dry_run, refs));
-                        cx.notify();
-                    }
-                },
-            });
-        })
-        .detach();
+                let args = ["search", "repo", "--version", &version, "-o", "json", "--", &chart];
+                k8s::helm(context, args.iter().map(|a| a.to_string()).collect()).await.map(|o| chart_refs(&o, &chart))
+            }
+        };
+        // A newer upgrade (a dry run then the real one, or back) replaces this lookup.
+        self.chart_lookup.spawn_in(window, cx, lookup, move |this, refs, window, cx| match refs {
+            Err(e) => window.push_notification(Notification::error(format!("helm search failed: {e:#}")), cx),
+            Ok(refs) => match refs.as_slice() {
+                [] => window.push_notification(
+                    Notification::error(format!(
+                        "chart {chart} {version} is not in your helm repositories (add it with `helm repo add`)"
+                    )),
+                    cx,
+                ),
+                [one] => this.chosen_chart(one.clone(), dry_run, window, cx),
+                _ => {
+                    this.chart_choice = Some((dry_run, refs));
+                    cx.notify();
+                }
+            },
+        });
     }
 
     fn chosen_chart(&mut self, chart_ref: String, dry_run: bool, window: &mut Window, cx: &mut Context<Self>) {
@@ -1301,6 +1297,17 @@ mod tests {
         assert_eq!(mask_manifest("kind: ConfigMap\n"), "kind: ConfigMap\n");
         // Unparsable but a Secret: hidden whole.
         assert!(!mask_manifest("kind: Secret\ndata: [x: {\n  p: example-value\n").contains("example-value"));
+        assert!(!mask_manifest("kind: \"Secret\" # x\ndata: [x: {\n  p: example-value\n").contains("example-value"));
+    }
+
+    /// `--- # Source: …` separates documents like `---`: read as one document with the one
+    /// before, a Secret's values used to be shown.
+    #[test]
+    fn a_separator_with_a_comment_still_splits() {
+        let manifest = "apiVersion: v1\nkind: ConfigMap\ndata:\n  a: visible\n--- # Source: c/templates/secret.yaml\napiVersion: v1\nkind: Secret\nstringData:\n  config: example-value\n";
+        let masked = mask_manifest(manifest);
+        assert!(!masked.contains("example-value"), "{masked}");
+        assert!(masked.contains("a: visible") && masked.contains("--- # Source: c/templates/secret.yaml"));
     }
 
     #[test]

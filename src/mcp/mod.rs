@@ -87,6 +87,8 @@ pub fn is_write(verb: &str) -> bool {
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(default)]
 pub struct Rule {
+    /// A rule written without one (by hand, pasted) denies: a missing field never grants.
+    #[serde(default = "deny")]
     pub effect: Mode,
     pub verbs: Vec<String>,
     /// kubectl names: `pods`, `deployments`, `certificates.cert-manager.io`, `*`.
@@ -119,6 +121,10 @@ impl Default for Rule {
             approved: false,
         }
     }
+}
+
+fn deny() -> Mode {
+    Mode::Deny
 }
 
 /// What an agent is trying to do.
@@ -1120,7 +1126,7 @@ impl Hub {
 
     pub async fn client(&self, context: &str) -> Result<(Client, Arc<Vec<Kind>>)> {
         let cluster = self.cluster(context)?;
-        let client = cluster.client.get_or_try_init(|| k8s::connect(context.to_string())).await?.clone();
+        let client = cluster.client.get_or_try_init(|| k8s::connect_for_agents(context.to_string())).await?.clone();
         if let Some((kinds, _)) = &*lock(&cluster.kinds) {
             return Ok((client, kinds.clone()));
         }
@@ -1728,5 +1734,139 @@ mod tests {
         assert_eq!(hash_token("abc"), hash_token("abc"));
         assert_ne!(hash_token("abc"), hash_token("abd"));
         assert_eq!(hash_token("abc").len(), 64);
+    }
+}
+
+/// Properties of the rule engine over many generated policies and requests, rather than
+/// single examples: what a reviewer would otherwise have to check case by case.
+#[cfg(test)]
+mod properties {
+    use super::{Access, Approval, Mode, Policy, Rule};
+    use proptest::prelude::*;
+
+    fn pattern() -> impl Strategy<Value = String> {
+        prop_oneof![Just("*"), Just("a"), Just("b"), Just("a*"), Just("team-*"), Just("team-a")].prop_map(String::from)
+    }
+
+    fn patterns() -> impl Strategy<Value = Vec<String>> {
+        prop::collection::vec(pattern(), 0..3)
+    }
+
+    fn value() -> impl Strategy<Value = String> {
+        prop_oneof![Just("a"), Just("b"), Just("ab"), Just("team-a"), Just("team-b")].prop_map(String::from)
+    }
+
+    fn verb() -> impl Strategy<Value = String> {
+        prop_oneof![Just("get"), Just("list"), Just("delete"), Just("patch"), Just("exec")].prop_map(String::from)
+    }
+
+    fn rule() -> impl Strategy<Value = Rule> {
+        (
+            prop_oneof![Just(Mode::Allow), Just(Mode::Ask), Just(Mode::Deny)],
+            prop::collection::vec(prop_oneof![verb(), Just("*".to_string())], 0..3),
+            patterns(),
+            patterns(),
+            patterns(),
+            patterns(),
+            any::<bool>(),
+        )
+            .prop_map(|(effect, verbs, resources, namespaces, contexts, names, approved)| Rule {
+                effect,
+                verbs,
+                resources,
+                namespaces,
+                contexts,
+                names,
+                approved: approved && effect == Mode::Allow,
+                ..Rule::default()
+            })
+    }
+
+    fn access() -> impl Strategy<Value = Access> {
+        (verb(), value(), prop::option::of(value()), value(), prop::option::of(value())).prop_map(
+            |(verb, resource, namespace, context, name)| Access {
+                context,
+                verb,
+                resource,
+                resource_aliases: Vec::new(),
+                namespace,
+                name,
+                cluster_scoped: false,
+            },
+        )
+    }
+
+    fn policy() -> impl Strategy<Value = Policy> {
+        prop::collection::vec(rule(), 0..6).prop_map(|rules| Policy { rules, ..Policy::default() })
+    }
+
+    proptest! {
+        /// A Deny rule that covers a request always decides it, whatever else allows it.
+        #[test]
+        fn deny_always_wins(policy in policy(), a in access()) {
+            if policy.rules.iter().any(|r| r.effect == Mode::Deny && r.matches(&a, false)) {
+                prop_assert_eq!(policy.decide(&a).mode, Mode::Deny);
+            }
+        }
+
+        /// Adding a rule never lets through what a Deny rule stopped.
+        #[test]
+        fn more_rules_never_undo_a_deny(policy in policy(), extra in rule(), a in access()) {
+            let before = policy.decide(&a);
+            let mut more = policy.clone();
+            more.rules.push(extra);
+            if before.mode == Mode::Deny && before.rule.is_some() {
+                prop_assert_eq!(more.decide(&a).mode, Mode::Deny);
+            }
+        }
+
+        /// Nothing matching means Deny.
+        #[test]
+        fn no_rule_means_deny(a in access()) {
+            let empty = Policy { rules: Vec::new(), ..Policy::default() };
+            prop_assert_eq!(empty.decide(&a).mode, Mode::Deny);
+        }
+
+        /// The rule an approval writes covers only requests inside the one approved:
+        /// same verb, resource and context, same namespace and name unless the approved
+        /// request had none.
+        #[test]
+        fn an_approval_never_grants_more_than_the_request(a in access(), b in access(), dry_run in any::<bool>()) {
+            let approval = Approval {
+                id: 1,
+                agent_id: "agent".into(),
+                agent: "agent".into(),
+                tool: "get_resource".into(),
+                summary: String::new(),
+                access: a.clone(),
+                dry_run,
+            };
+            for rule in [approval.as_rule(), approval.as_rule_for_an_hour()].into_iter().flatten() {
+                if rule.matches(&b, false) {
+                    prop_assert_eq!(&b.verb, &a.verb);
+                    prop_assert_eq!(&b.resource, &a.resource);
+                    prop_assert_eq!(&b.context, &a.context);
+                    if a.namespace.is_some() {
+                        prop_assert_eq!(&b.namespace, &a.namespace);
+                    }
+                    // A name-less check (a list) may pass: its rows are then filtered one by
+                    // one, by name, against the same rules.
+                    if a.name.is_some() && b.name.is_some() {
+                        prop_assert_eq!(&b.name, &a.name);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod fail_closed {
+    use super::{Mode, Rule};
+
+    #[test]
+    fn a_rule_without_an_effect_denies() {
+        let r: Rule = serde_json::from_str(r#"{"verbs": ["*"], "resources": ["secrets"], "contexts": ["*"]}"#).unwrap();
+        assert_eq!(r.effect, Mode::Deny);
     }
 }

@@ -291,7 +291,19 @@ fn looks_risky(texts: &[&str]) -> bool {
 /// exec plugin, which can be a browser login (kubelogin): long enough for a person to log in.
 const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
 
+/// A client for the UI: its writes and shells need write mode when they are sent
+/// ([`gate::WriteGate`]).
 pub async fn connect(context: String) -> Result<Client> {
+    connect_with(context, true).await
+}
+
+/// A client for the agents' MCP server: their rules decide what it may do, not the UI's
+/// write mode.
+pub async fn connect_for_agents(context: String) -> Result<Client> {
+    connect_with(context, false).await
+}
+
+async fn connect_with(context: String, gated: bool) -> Result<Client> {
     run(async move {
         let kc = kubeconfig()?;
         // Building the client runs the context's exec plugin. With an expired token,
@@ -315,7 +327,8 @@ pub async fn connect(context: String) -> Result<Client> {
         let builder = tokio::task::spawn_blocking(move || kube::client::ClientBuilder::try_from(config))
             .await
             .context("building the client")??;
-        Ok(builder.with_layer(&timeout).with_layer(&meter).build())
+        let builder = builder.with_layer(&timeout).with_layer(&meter);
+        Ok(if gated { builder.with_layer(&gate::WriteGateLayer).build() } else { builder.build() })
     })
     .await
 }
@@ -715,5 +728,51 @@ users:
         assert_ne!(fp(&base, "staging"), fp(&kc("https://b", "t1"), "staging"));
         assert_ne!(fp(&base, "staging"), fp(&kc("https://a", "t2"), "staging"));
         assert_eq!(fp(&base, "missing"), None);
+    }
+}
+
+/// Which file a context name belongs to must not move while that file still has it: the
+/// name carries the context's protection, color and settings, and moving it pointed them at
+/// another cluster (three audit rounds in a row).
+#[cfg(test)]
+mod name_properties {
+    use super::name_owners;
+    use proptest::prelude::*;
+
+    type Files = Vec<(String, Option<Vec<String>>)>;
+
+    fn files() -> impl Strategy<Value = Files> {
+        let names = prop::sample::subsequence(vec!["prod", "dev", "kind"], 0..=3)
+            .prop_map(|v| v.into_iter().map(String::from).collect::<Vec<_>>());
+        // Some files fail to read (None): they keep what they had.
+        let file = prop::option::weighted(0.85, names);
+        prop::collection::vec(file, 1..5)
+            .prop_map(|v| v.into_iter().enumerate().map(|(i, n)| (format!("/kube/f{i}"), n)).collect())
+    }
+
+    proptest! {
+        #[test]
+        fn a_name_stays_with_its_file(
+            first in files(),
+            order in any::<prop::sample::Index>(),
+            extra in prop::option::of(prop::sample::subsequence(vec!["prod", "dev", "kind"], 0..=3)),
+        ) {
+            let mut kept = Default::default();
+            let before = name_owners(&mut kept, &first, |_| true);
+            // The same files read again in another order, maybe with a new one.
+            let mut again = first.clone();
+            let i = order.index(again.len());
+            again.rotate_left(i);
+            if let Some(names) = extra {
+                again.push(("/kube/new".into(), Some(names.into_iter().map(String::from).collect())));
+            }
+            let after = name_owners(&mut kept, &again, |_| true);
+            for (name, owner) in &before {
+                let still_has = first.iter().any(|(f, n)| f == owner && n.as_ref().is_none_or(|n| n.contains(name)));
+                if still_has {
+                    prop_assert_eq!(after.get(name), Some(owner), "{} moved", name);
+                }
+            }
+        }
     }
 }

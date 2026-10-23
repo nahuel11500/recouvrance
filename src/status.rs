@@ -157,6 +157,73 @@ fn words(status: &str) -> Vec<String> {
     out
 }
 
+/// Condition types where "True" is the bad state: the one list every page, table and
+/// check colors and counts conditions by.
+pub fn true_is_bad(ty: &str) -> bool {
+    matches!(
+        ty,
+        "ScalingLimited"
+            | "MemoryPressure"
+            | "DiskPressure"
+            | "PIDPressure"
+            | "NetworkUnavailable"
+            | "Failed"
+            | "FailureTarget"
+            | "ReplicaFailure"
+            | "DisruptionTarget"
+            | "Stalled"
+            // node-problem-detector
+            | "KernelDeadlock"
+            | "ReadonlyFilesystem"
+            | "FrequentKubeletRestart"
+            | "FrequentDockerRestart"
+            | "FrequentContainerdRestart"
+            | "FrequentUnregisterNetDevice"
+            | "CorruptDockerOverlay2"
+            | "KubeletUnhealthy"
+            | "ContainerRuntimeUnhealthy"
+            // namespace deletion
+            | "NamespaceDeletionDiscoveryFailure"
+            | "NamespaceDeletionGroupVersionParsingFailure"
+            | "NamespaceDeletionContentFailure"
+            | "NamespaceContentRemaining"
+            | "NamespaceFinalizersRemaining"
+            // CRDs and VPAs
+            | "NonStructuralSchema"
+            | "Terminating"
+            | "LowConfidence"
+            | "NoPodsMatched"
+            | "ConfigUnsupported"
+            | "ConfigDeprecated"
+    )
+}
+
+/// Condition types where "True" is the good state, so "False" is bad.
+pub fn true_is_good(ty: &str) -> bool {
+    matches!(
+        ty,
+        "Ready"
+            | "Available"
+            | "Progressing"
+            | "Complete"
+            | "SuccessCriteriaMet"
+            | "Initialized"
+            | "ContainersReady"
+            | "PodScheduled"
+            | "PodReadyToStartContainers"
+            | "Established"
+            | "NamesAccepted"
+            | "ScalingActive"
+            | "AbleToScale"
+            | "RecommendationProvided"
+            | "Accepted"
+            | "Programmed"
+            | "ResolvedRefs"
+            | "Synced"
+            | "Healthy"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::{Tone, tone, words};

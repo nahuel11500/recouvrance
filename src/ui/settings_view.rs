@@ -454,7 +454,7 @@ impl SettingsView {
                     {
                         let on = crate::details::writes_enabled(cx);
                         Checkbox::new("writes").label(if on { "Enabled" } else { "Disabled" }).checked(on).on_click(|v: &bool, _, cx| {
-                            cx.set_global(crate::details::WriteMode(*v));
+                            crate::details::set_writes(*v, cx);
                             cx.refresh_windows();
                         })
                     },

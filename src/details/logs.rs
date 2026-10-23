@@ -201,6 +201,8 @@ impl LogsView {
         }
         let first = self.pod_containers.first().cloned();
         (self.pods, self.pod_containers) = pods.into_iter().unzip();
+        // A container listing still running is for the old first pod.
+        self._load = None;
         // A rollout can rename the containers: choose among the new first pod's.
         if let Some(names) =
             self.pod_containers.first().filter(|n| !n.is_empty() && Some(*n) != first.as_ref()).cloned()

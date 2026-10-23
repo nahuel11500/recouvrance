@@ -3,24 +3,12 @@
 #[allow(unused_imports)]
 use super::*;
 
-/// Sum of container requests and limits over these pod specs (millicores, bytes).
+/// Requests and limits added up over these pods (millicores, bytes): cpu request, cpu limit,
+/// memory request, memory limit.
 pub(super) fn totals(pods: &[&Value]) -> [Option<f64>; 4] {
-    let mut t = [None::<f64>; 4];
-    for p in pods {
-        for c in arr(p, "/spec/containers") {
-            for (i, path, f) in [
-                (0, "/resources/requests/cpu", k8s::parse_cpu as fn(&str) -> f64),
-                (1, "/resources/limits/cpu", k8s::parse_cpu),
-                (2, "/resources/requests/memory", k8s::parse_bytes),
-                (3, "/resources/limits/memory", k8s::parse_bytes),
-            ] {
-                if let Some(v) = c.pointer(path).and_then(Value::as_str) {
-                    *t[i].get_or_insert(0.0) += f(v);
-                }
-            }
-        }
-    }
-    t
+    let (cpu, mem) =
+        (k8s::podspec::total(pods.iter().copied(), "cpu"), k8s::podspec::total(pods.iter().copied(), "memory"));
+    [cpu.0, cpu.1, mem.0, mem.1]
 }
 
 /// The usage heading; says so when the charts cover only some of the pods.

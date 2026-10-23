@@ -273,25 +273,8 @@ const FULL_POD_LIMIT: usize = 4000;
 /// "3 (12m ago)" -> how long ago, from kubectl's Restarts column.
 fn restart_ago(cell: &str) -> Option<jiff::SignedDuration> {
     let inner = cell.split_once('(')?.1.strip_suffix(" ago)")?;
-    let mut secs = 0i64;
-    let mut num = String::new();
-    for ch in inner.chars() {
-        if ch.is_ascii_digit() {
-            num.push(ch);
-            continue;
-        }
-        let n: i64 = num.parse().ok()?;
-        num.clear();
-        secs += n * match ch {
-            's' => 1,
-            'm' => 60,
-            'h' => 3600,
-            'd' => 86400,
-            'y' => 86400 * 365,
-            _ => return None,
-        };
-    }
-    Some(jiff::SignedDuration::from_secs(secs))
+    // The same reading of a kubectl duration as the table's Age column.
+    k8s::age_seconds(inner).map(jiff::SignedDuration::from_secs)
 }
 
 /// kubectl's table for one kind: light even on very large clusters.

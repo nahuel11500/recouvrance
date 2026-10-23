@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 0fcb1c86ac516f936f4c5dc945cf79246da358e67f2a2694dc7cc62201304ba2 # shrinks to a = Access { context: "a", verb: "list", resource: "ab", resource_aliases: [], namespace: None, name: Some("a") }, b = Access { context: "a", verb: "list", resource: "ab", resource_aliases: [], namespace: None, name: None }, dry_run = false

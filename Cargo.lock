@@ -5863,6 +5863,7 @@ dependencies = [
  "mimalloc",
  "pem 4.0.0",
  "portable-pty",
+ "proptest",
  "regex",
  "rmcp",
  "schemars",

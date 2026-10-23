@@ -436,6 +436,35 @@ impl KubeMcp {
         }
     }
 
+    /// Right before a change reaches the cluster: decide again on the agent's current rules,
+    /// so a Deny added, or an Allow removed, while the call waited (for an approval, a dry
+    /// run, a lookup) still stops it. An approved request stays approved while an Ask rule
+    /// still covers it.
+    fn recheck(&self, call: &mut Call, access: &Access) -> Result<(), String> {
+        match self.stale_reason(call, access) {
+            Some(reason) => Err(call.deny(reason)),
+            None => Ok(()),
+        }
+    }
+
+    /// Why a change authorized earlier must not go ahead now, if it must not.
+    fn stale_reason(&self, call: &mut Call, access: &Access) -> Option<String> {
+        self.reload_rules(call);
+        if let Some(reason) = self.inactive(call) {
+            return Some(reason.to_string());
+        }
+        let verdict = call.policy().decide(access);
+        match verdict.mode {
+            Mode::Allow => None,
+            Mode::Ask if call.approved => None,
+            _ => Some(format!(
+                "{} — the rules changed while the call waited ({})",
+                describe(access),
+                call.rule_label(verdict.rule)
+            )),
+        }
+    }
+
     async fn kind(&self, call: &Call, context: &str, query: &str) -> Result<(kube::Client, Kind), String> {
         let (client, kinds) = match self.hub.client(context).await {
             Ok(c) => c,

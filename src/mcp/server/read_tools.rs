@@ -225,7 +225,11 @@ impl KubeMcp {
         rows.retain(|r| {
             call.may_see(&access_for(&kind, &p.context, "list", r.namespace.clone(), Some(r.name.clone())))
         });
-        rows.sort_by_key(|r| std::cmp::Reverse(r.created));
+        // Newest first by when they last happened (an event that keeps repeating was created
+        // long ago), as the server's Last Seen column says.
+        let last_seen = defs.iter().position(|d| d.name == "Last Seen");
+        let ago = |r: &k8s::Row| last_seen.and_then(|i| r.cells.get(i)).and_then(|c| k8s::age_seconds(c));
+        rows.sort_by_key(|r| (ago(r).unwrap_or(i64::MAX), std::cmp::Reverse(r.created)));
         let max = call.policy().max_rows as usize;
         let cols: Vec<usize> = (0..defs.len()).filter(|&i| defs[i].priority == 0).collect();
         let mut headers = vec!["NAMESPACE".to_string()];
@@ -322,21 +326,18 @@ impl KubeMcp {
                 c["restartCount"]
             ));
         }
-        // Pods behind workloads and services.
-        let selector = value
-            .pointer("/spec/selector/matchLabels")
-            .or_else(|| kind.is("", "Service").then(|| value.pointer("/spec/selector")).flatten())
-            .and_then(|s| s.as_object())
-            .filter(|m| !m.is_empty())
-            .map(|m| {
-                m.iter().map(|(k, v)| format!("{k}={}", v.as_str().unwrap_or_default())).collect::<Vec<_>>().join(",")
-            });
+        // Pods behind workloads, services and budgets, picked as the app's pages pick them.
+        let selects_pods = kind.is("", "Service")
+            || kind.is("policy", "PodDisruptionBudget")
+            || kind.ar.group == "apps"
+            || kind.is("batch", "Job");
+        let selector = selects_pods.then(|| k8s::pod_selection(&kind, &value).list_selector()).flatten();
         if let (Some(sel), Some(ns)) = (selector, ns.clone()) {
             let pods_kind = self.kind(&call, &p.context, "pods").await?.1;
             if call.policy().decide(&access_for(&pods_kind, &p.context, "list", Some(ns.clone()), None)).mode
                 == Mode::Allow
                 && let Ok((defs, mut rows)) =
-                    k8s::list_table(client.clone(), pods_kind.clone(), Some(ns.clone()), Some(sel), None).await
+                    k8s::list_table(client.clone(), pods_kind.clone(), Some(ns.clone()), sel, None).await
             {
                 rows.retain(|r| {
                     let a = access_for(&pods_kind, &p.context, "list", Some(ns.clone()), Some(r.name.clone()));
@@ -673,19 +674,12 @@ impl KubeMcp {
             (vec![value.clone()], 0)
         } else {
             let pods_kind = self.kind(&call, &p.context, "pods").await?.1;
-            let selector: Vec<String> = value
-                .pointer("/spec/selector/matchLabels")
-                .and_then(|m| m.as_object())
-                .map(|m| m.iter().map(|(k, v)| format!("{k}={}", v.as_str().unwrap_or_default())).collect())
-                .unwrap_or_default();
-            if selector.is_empty() {
+            let Some(Some(selector)) = k8s::pod_selection(&kind, &value).list_selector() else {
                 return call.finish(Err(anyhow::anyhow!("{} has no label selector", kind.ar.kind)));
-            }
+            };
             let pod_ar = k8s::ar_of::<k8s_openapi::api::core::v1::Pod>();
             let mut pods =
-                match k8s::list_values(client.clone(), pod_ar, Some(p.namespace.clone()), Some(selector.join(",")))
-                    .await
-                {
+                match k8s::list_values(client.clone(), pod_ar, Some(p.namespace.clone()), Some(selector)).await {
                     Ok(v) => v,
                     Err(e) => return call.finish(Err(e)),
                 };
@@ -726,13 +720,11 @@ impl KubeMcp {
             Ok(r) => r,
             Err(e) => return call.finish(Err(e)),
         };
-        let sum = |path: &str, parse: fn(&str) -> f64| -> Option<f64> {
-            let vals: Vec<f64> = pods
-                .iter()
-                .flat_map(|p| p.pointer("/spec/containers").and_then(|c| c.as_array()).cloned().unwrap_or_default())
-                .filter_map(|c| c.pointer(path).and_then(|v| v.as_str()).map(parse))
-                .collect();
-            (sum_specs && !vals.is_empty()).then(|| vals.iter().sum())
+        // Requests and limits as the pods run (sidecars, overhead, pod-level resources).
+        let (cpu_spec, mem_spec) = if sum_specs {
+            (k8s::podspec::total(pods.iter().copied(), "cpu"), k8s::podspec::total(pods.iter().copied(), "memory"))
+        } else {
+            ((None, None), (None, None))
         };
         let stats = |s: &crate::prom::Series, scale: f64, fmt: fn(f64) -> String| -> Vec<String> {
             let mut v: Vec<f64> = s.iter().map(|p| p.1 * scale).collect();
@@ -748,12 +740,12 @@ impl KubeMcp {
         let opt = |v: Option<f64>, fmt: fn(f64) -> String| v.map(fmt).unwrap_or_else(|| "-".into());
         let mut cpu_row = vec!["cpu".to_string()];
         cpu_row.extend(stats(&cpu, 1000.0, k8s::format_cpu));
-        cpu_row.push(opt(sum("/resources/requests/cpu", k8s::parse_cpu), k8s::format_cpu));
-        cpu_row.push(opt(sum("/resources/limits/cpu", k8s::parse_cpu), k8s::format_cpu));
+        cpu_row.push(opt(cpu_spec.0, k8s::format_cpu));
+        cpu_row.push(opt(cpu_spec.1, k8s::format_cpu));
         let mut mem_row = vec!["memory".to_string()];
         mem_row.extend(stats(&mem, 1.0, k8s::format_bytes));
-        mem_row.push(opt(sum("/resources/requests/memory", k8s::parse_bytes), k8s::format_bytes));
-        mem_row.push(opt(sum("/resources/limits/memory", k8s::parse_bytes), k8s::format_bytes));
+        mem_row.push(opt(mem_spec.0, k8s::format_bytes));
+        mem_row.push(opt(mem_spec.1, k8s::format_bytes));
         let of = if names.len() < total { format!(" of {total}") } else { String::new() };
         let left_out = if hidden > 0 { " (pods you may not list are left out)" } else { "" };
         let header = format!("{}{of} pod(s), last {minutes} minutes, summed over pods{left_out}\n", names.len());

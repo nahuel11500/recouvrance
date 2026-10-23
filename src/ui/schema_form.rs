@@ -53,7 +53,8 @@ pub struct SchemaForm {
     path: Vec<String>,
     rows: Vec<Row>,
     status: Option<(bool, String)>,
-    _task: Option<Task<()>>,
+    /// The schema of the current document's kind; dropped when the cursor moves to another.
+    schema_load: crate::latest::Latest,
 }
 
 /// What finds a document again in the text: apiVersion, kind, metadata.name.
@@ -223,7 +224,7 @@ impl SchemaForm {
             path: Vec::new(),
             rows: Vec::new(),
             status: None,
-            _task: None,
+            schema_load: Default::default(),
         };
         this.reload(window, cx);
         this
@@ -250,21 +251,23 @@ impl SchemaForm {
             self.kind = kind.clone();
             self.schema = None;
             self.path.clear();
+            // A document without a kind has no schema: a load still running for the
+            // previous one must not land on it.
+            self.schema_load.cancel();
             if let Some((api_version, kind)) = kind {
                 let (ctx, client) = (self.context.clone(), self.client.clone());
-                self._task = Some(cx.spawn_in(window, async move |this, cx| {
-                    let r = crate::schema::document(&ctx, client, &api_version)
-                        .await
-                        .map_err(|e| format!("{e:#}"))
-                        .and_then(|doc| {
+                let load = async move {
+                    crate::schema::document(&ctx, client, &api_version).await.map_err(|e| format!("{e:#}")).and_then(
+                        |doc| {
                             Schema::find(doc, &api_version, &kind)
                                 .ok_or_else(|| format!("No schema for {api_version} {kind}"))
-                        });
-                    let _ = this.update_in(cx, |this, window, cx| {
-                        this.schema = Some(r);
-                        this.build_rows(window, cx);
-                    });
-                }));
+                        },
+                    )
+                };
+                self.schema_load.spawn_in(window, cx, load, |this, r, window, cx| {
+                    this.schema = Some(r);
+                    this.build_rows(window, cx);
+                });
             }
         }
         self.build_rows(window, cx);
