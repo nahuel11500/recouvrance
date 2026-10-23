@@ -23,7 +23,8 @@
 //! and edits on the Agents page are written back to it (its comments are not kept).
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use anyhow::{Context as _, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -312,10 +313,20 @@ pub fn render(agents: &[super::Agent]) -> Result<String> {
     Ok(format!("{HEADER}\n{}", crate::yaml::to_string(&RulesFile { agents })?))
 }
 
-/// Write the file from the current agents (starting point for rules as code).
-pub fn export(agents: &[super::Agent]) -> Result<PathBuf> {
-    super::write_private(&path(), render(agents)?.as_bytes())?;
-    Ok(path())
+/// When the file at `path` was last modified; None when it doesn't exist.
+pub fn modified(path: &Path) -> Option<SystemTime> {
+    std::fs::metadata(path).and_then(|m| m.modified()).ok()
+}
+
+/// Write the file at `path` from the current agents, and return its new modification time.
+/// Refused when the file changed since `applied` (when it was last loaded or written): a
+/// version saved in your editor and not loaded yet would be lost, its deny rules with it.
+pub fn export(path: &Path, applied: Option<SystemTime>, agents: &[super::Agent]) -> Result<Option<SystemTime>> {
+    if modified(path) != applied {
+        bail!("it changed on disk since it was loaded");
+    }
+    super::write_private(path, render(agents)?.as_bytes())?;
+    Ok(modified(path))
 }
 
 #[cfg(test)]
@@ -447,6 +458,35 @@ mod tests {
         assert!(render(&agents).is_err());
         assert_eq!(shared_name(&agents[..2]), None);
         assert!(render(&agents[..2]).is_ok());
+    }
+
+    #[test]
+    fn export_keeps_a_version_saved_since_it_was_loaded() {
+        let dir = std::env::temp_dir().join(format!("recouvrance-test-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("rules.yaml");
+        let agents = [super::super::Agent {
+            id: "a".into(),
+            name: "Claude".into(),
+            token_sha256: String::new(),
+            enabled: true,
+            policy: Policy::default(),
+        }];
+        // No file yet, none expected: written, then written again while unchanged.
+        let applied = export(&path, None, &agents).unwrap();
+        assert!(applied.is_some());
+        let applied = export(&path, applied, &agents).unwrap();
+        // Your editor saves a deny rule the app has not loaded yet: not overwritten.
+        let saved = "agents:\n  Claude:\n    deny: [\"delete *\"]\n";
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(&path, saved).unwrap();
+        assert!(export(&path, applied, &agents).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), saved);
+        // Removed since: not written back either.
+        std::fs::remove_file(&path).unwrap();
+        assert!(export(&path, applied, &agents).is_err());
+        assert!(!path.exists());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

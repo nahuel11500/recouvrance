@@ -127,7 +127,8 @@ comma-separated, `*` globs work everywhere, an omitted part means `*`, and `-` i
 then allow; anything no rule matches is denied. `approved` lists the requests you approved with
 *Always allow this* or *Allow for 1h*: they are allowed even where an ask rule matches, never where a
 deny rule does. The file is reloaded when it changes, and edits on the Agents page are written back
-to it (its comments are not kept).
+to it (its comments are not kept). An edit made after you saved the file, before it was reloaded,
+is refused instead of writing over your version: the file is loaded, and you make the edit again.
 
 While the file exists, an agent it doesn't name has no rules, so everything it asks is denied:
 removing an agent's section takes its access away. Deleting an agent on the Agents page removes its

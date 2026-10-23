@@ -912,6 +912,8 @@ impl Hub {
             enabled: true,
             policy: Policy::default(),
         };
+        // A version of the file saved since it was loaded is loaded first, not overwritten.
+        self.catch_up_rules_file();
         {
             let mut cfg = write(&self.config);
             if cfg.agents.iter().any(|a| a.name == agent.name) {
@@ -919,10 +921,7 @@ impl Hub {
             }
             let mut agents = cfg.agents.clone();
             agents.push(agent.clone());
-            if self.rules_file_active() && self.rules_error().is_none() {
-                rules_file::export(&agents).context("rules.yaml not updated")?;
-                *lock(&self.rules_mtime) = std::fs::metadata(rules_file::path()).and_then(|m| m.modified()).ok();
-            }
+            self.export_rules(&agents)?;
             cfg.agents = agents;
         }
         self.save()?;
@@ -941,19 +940,25 @@ impl Hub {
     }
 
     /// Change an agent. With rules.yaml in use, the change is written there first: if it
-    /// can't be (a rule the file can't hold), nothing changes.
+    /// can't be (a rule the file can't hold, or the file changed on disk), nothing changes.
     pub fn update_agent(&self, id: &str, f: impl FnOnce(&mut Agent)) -> Result<()> {
-        {
+        let exported = {
             let mut cfg = write(&self.config);
             let mut agents = cfg.agents.clone();
             let agent = agents.iter_mut().find(|a| a.id == id).context("unknown agent")?;
             f(agent);
             // Visual edits keep rules.yaml in step when you use it.
-            if self.rules_file_active() && self.rules_error().is_none() {
-                rules_file::export(&agents).context("rules.yaml not updated")?;
-                *lock(&self.rules_mtime) = std::fs::metadata(rules_file::path()).and_then(|m| m.modified()).ok();
+            let exported = self.export_rules(&agents);
+            if exported.is_ok() {
+                cfg.agents = agents;
             }
-            cfg.agents = agents;
+            exported
+        };
+        if exported.is_err() {
+            // The edit was made on the rules before the file changed: load the new ones
+            // instead, for the edit to be made again on them.
+            self.catch_up_rules_file();
+            return exported;
         }
         self.save()
     }
@@ -962,19 +967,36 @@ impl Hub {
     /// the file would bring it back otherwise). The agent is deleted even if the file can't
     /// be written; the error says so.
     pub fn delete_agent(&self, id: &str) -> Result<()> {
+        // A version of the file saved since it was loaded is loaded first, not overwritten.
+        self.catch_up_rules_file();
         let exported = {
             let mut cfg = write(&self.config);
             cfg.agents.retain(|a| a.id != id);
-            if self.rules_file_active() && self.rules_error().is_none() {
-                let exported = rules_file::export(&cfg.agents).map(|_| ()).context("rules.yaml not updated");
-                *lock(&self.rules_mtime) = std::fs::metadata(rules_file::path()).and_then(|m| m.modified()).ok();
-                exported
-            } else {
-                Ok(())
-            }
+            self.export_rules(&cfg.agents)
         };
         self.save()?;
         exported
+    }
+
+    /// Write the agents to rules.yaml when it is in use. Refused when the file changed on
+    /// disk since it was loaded (your editor saved it before the watcher saw it): writing
+    /// would lose that version, its deny rules with it.
+    fn export_rules(&self, agents: &[Agent]) -> Result<()> {
+        if !self.rules_file_active() || self.rules_error().is_some() {
+            return Ok(());
+        }
+        let applied = *lock(&self.rules_mtime);
+        let mtime = rules_file::export(&rules_file::path(), applied, agents).context("rules.yaml not updated")?;
+        *lock(&self.rules_mtime) = mtime;
+        Ok(())
+    }
+
+    /// Load rules.yaml now when it changed on disk since it was loaded, without waiting for
+    /// the watcher.
+    fn catch_up_rules_file(&self) {
+        if rules_file::modified(&rules_file::path()) != *lock(&self.rules_mtime) {
+            let _ = self.apply_rules_file();
+        }
     }
 
     pub fn agent_by_token(&self, token: &str) -> Option<Agent> {
