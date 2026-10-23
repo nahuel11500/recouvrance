@@ -26,6 +26,10 @@ impl AppView {
         self.kinds.clear();
         self.watch = None;
         self.metrics = None;
+        // Watch errors name the old clusters, and would hide "Connecting…" and new failures.
+        self.watch_errors.clear();
+        self.listing.clear();
+        self.refused.clear();
         // The problem badge counted the old clusters.
         self._problem_watch = None;
         self.problem_counts = None;
