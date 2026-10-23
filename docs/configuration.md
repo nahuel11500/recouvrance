@@ -170,7 +170,8 @@ terminal page, or in the background with the last line of output shown.
 
 A plugin may change the cluster, so it is treated as a write: it needs write mode, and on a
 protected context the context name typed. A plugin that only reads declares `read_only: true` and
-runs in read-only mode too. `confirm: true` always asks before running.
+runs in read-only mode too. `confirm: true` always asks before running. A plugin that writes runs
+again only from its button, with these checks, not from its terminal page.
 
 ## Templates
 
