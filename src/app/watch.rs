@@ -279,13 +279,17 @@ impl AppView {
     pub(super) fn on_table_msg(&mut self, ctx: usize, msg: TableMsg, cx: &mut Context<Self>) {
         match msg {
             // Every cluster serves the same columns for a kind; take the first we get.
-            TableMsg::Columns(cols) => self.table.update(cx, |t, cx| {
-                if t.delegate().columns_count(cx) == 0 || ctx == 0 {
-                    // A relist sends them again: keeps the user's sort and column order.
-                    t.delegate_mut().update_columns(cols);
-                    t.refresh(cx);
-                }
-            }),
+            TableMsg::Columns(cols) => {
+                self.table.update(cx, |t, cx| {
+                    if t.delegate().columns_count(cx) == 0 || ctx == 0 {
+                        // A relist sends them again: keeps the user's sort and column order.
+                        t.delegate_mut().update_columns(cols);
+                        t.refresh(cx);
+                    }
+                });
+                // New columns sort the rows again: the highlight stays on its object.
+                self.follow_selection(cx);
+            }
             TableMsg::Rows(rows) => {
                 self.status = None;
                 self.watch_errors.remove(&ctx);
