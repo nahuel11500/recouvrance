@@ -567,7 +567,7 @@ impl SettingsView {
                     .child(div().pb_2().text_sm().text_color(muted).child(
                         "Metrics endpoint: found automatically; or namespace/service:port, with a path for VictoriaMetrics \
                          (vmselect: monitoring/vmselect:8481/select/0/prometheus; single: monitoring/victoria-metrics:8428), or a full http(s) URL. \
-                         Accessible namespaces are used when you may not list namespaces: they fill the picker and \"all namespaces\" means them.",
+                         Accessible namespaces are used when you may not list namespaces: they fill the picker, and the list shows one of them at a time.",
                     ))
                     .children(rows)
                     .into_any_element()
