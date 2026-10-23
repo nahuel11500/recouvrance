@@ -632,6 +632,8 @@ pub enum HubEvent {
 /// unreachable cluster only delays calls to that cluster.
 #[derive(Default)]
 struct Cluster {
+    /// What the context pointed to when this was made (`Contexts::fingerprints`).
+    fingerprint: Option<u64>,
     client: tokio::sync::OnceCell<Client>,
     /// Discovered kinds and when; discovery runs one at a time per context.
     kinds: Mutex<Option<(Arc<Vec<Kind>>, Instant)>>,
@@ -1061,12 +1063,27 @@ impl Hub {
 
     // Kubernetes access shared by all agents
 
-    fn cluster(&self, context: &str) -> Arc<Cluster> {
-        lock(&self.clients).entry(context.to_string()).or_default().clone()
+    /// The context's connection, made again when the kubeconfig changed the server or
+    /// user it points to. A context no longer in the kubeconfig is refused.
+    fn cluster(&self, context: &str) -> Result<Arc<Cluster>> {
+        let contexts = k8s::load_contexts()?;
+        if !contexts.names.iter().any(|n| n == context) {
+            anyhow::bail!("context `{context}` is not in the kubeconfig");
+        }
+        let fingerprint = contexts.fingerprints.get(context).copied();
+        let mut clients = lock(&self.clients);
+        match clients.get(context) {
+            Some(cluster) if fingerprint.is_some() && cluster.fingerprint == fingerprint => Ok(cluster.clone()),
+            _ => {
+                let cluster = Arc::new(Cluster { fingerprint, ..Cluster::default() });
+                clients.insert(context.to_string(), cluster.clone());
+                Ok(cluster)
+            }
+        }
     }
 
     pub async fn client(&self, context: &str) -> Result<(Client, Arc<Vec<Kind>>)> {
-        let cluster = self.cluster(context);
+        let cluster = self.cluster(context)?;
         let client = cluster.client.get_or_try_init(|| k8s::connect(context.to_string())).await?.clone();
         if let Some((kinds, _)) = &*lock(&cluster.kinds) {
             return Ok((client, kinds.clone()));
@@ -1084,7 +1101,7 @@ impl Hub {
     /// Discover again (a CRD may have been installed since), at most once a minute per
     /// context. None when it ran too recently or failed.
     pub async fn rediscover(&self, context: &str) -> Option<Arc<Vec<Kind>>> {
-        let cluster = self.cluster(context);
+        let cluster = self.cluster(context).ok()?;
         let client = cluster.client.get()?.clone();
         let _one = cluster.discovering.lock().await;
         let (previous, last) = match &*lock(&cluster.kinds) {

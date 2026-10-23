@@ -56,7 +56,9 @@ too).
 
 Before any rule is checked, a call's context must be named by one of the agent's Allow or Ask rules
 and not covered by a Deny of everything (`*` verbs, resources, namespaces and names): other contexts
-are never contacted, nor listed to the agent. The names a call passes are validated: a namespace or
+are never contacted, nor listed to the agent. Calls follow the kubeconfig as it is now: a context
+removed from it is refused, and one pointed at another cluster or user is connected again. The names
+a call passes are validated: a namespace or
 container must be a DNS label, an object name may hold only letters, digits and `- . _ : @ +` (no
 `/`, `?`, `%`, `..` or spaces). An invalid name fails the call with a message saying why. What the
 API server returns must be the object asked for, and a Secret's values are masked whatever kind
