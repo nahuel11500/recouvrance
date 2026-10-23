@@ -8,6 +8,25 @@ use model::*;
 
 pub(super) const MAX_LOG_LINES: usize = 50_000;
 
+/// Pods one page follows at most: each is a connection and its own tail of lines.
+pub(super) const MAX_LOG_PODS: usize = 50;
+
+/// The pods whose logs a page follows: all of them, or past the limit the running ones
+/// first, newest first.
+pub(super) fn followed_pods(pods: &[serde_json::Value]) -> Vec<&serde_json::Value> {
+    let mut pods: Vec<&serde_json::Value> = pods.iter().collect();
+    if pods.len() > MAX_LOG_PODS {
+        let key = |p: &serde_json::Value| {
+            let running = p.pointer("/status/phase").and_then(|v| v.as_str()) == Some("Running");
+            let created = p.pointer("/metadata/creationTimestamp").and_then(|v| v.as_str()).unwrap_or_default();
+            (running, created.to_string())
+        };
+        pods.sort_by_cached_key(|p| std::cmp::Reverse(key(p)));
+        pods.truncate(MAX_LOG_PODS);
+    }
+    pods
+}
+
 /// Distinct colors for pod prefixes in multi-pod logs.
 pub(super) fn pod_color(ix: usize, cx: &App) -> Hsla {
     let t = cx.theme();
@@ -31,6 +50,8 @@ pub struct LogsView {
     pub(super) ns: String,
     /// One pod or all pods of a workload.
     pub(super) pods: Vec<String>,
+    /// Pods past `MAX_LOG_PODS`, not followed; the status line says so.
+    pub(super) left_out: usize,
     /// Each pod's containers, default first (empty when not known).
     pub(super) pod_containers: Vec<Vec<String>>,
     /// The first pod's containers; the chosen one is read from every pod that has it.
@@ -106,6 +127,7 @@ impl LogsView {
             ns,
             pod_states: vec![StreamState::Connecting; pods.len()],
             pods,
+            left_out: 0,
             pod_containers,
             containers: None,
             _containers_sub: None,
@@ -573,12 +595,16 @@ impl LogsView {
             .into_any_element()
     }
 
-    /// The status line: the streams' state and a container list error.
+    /// The status line: pods left out, the streams' state and a container list error.
     fn status_text(&self) -> Option<SharedString> {
-        match (stream_status(&self.pods, &self.pod_states), &self.status) {
-            (Some(streams), Some(e)) => Some(format!("{streams} · {e}").into()),
-            (streams, e) => streams.map(Into::into).or_else(|| e.clone()),
-        }
+        let followed = self.pods.len();
+        let capped = (self.left_out > 0).then(|| format!("Following {followed} of {} pods", followed + self.left_out));
+        let parts: Vec<String> =
+            [capped, stream_status(&self.pods, &self.pod_states), self.status.as_ref().map(|s| s.to_string())]
+                .into_iter()
+                .flatten()
+                .collect();
+        (!parts.is_empty()).then(|| parts.join(" · ").into())
     }
 }
 
@@ -800,5 +826,27 @@ impl Render for LogsView {
                         }
                     }),
             )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MAX_LOG_PODS, followed_pods};
+
+    #[test]
+    fn follows_running_then_newest_pods_past_the_limit() {
+        let pod = |name: String, phase: &str, created: &str| serde_json::json!({"metadata": {"name": name, "creationTimestamp": created}, "status": {"phase": phase}});
+        let name = |p: &serde_json::Value| p["metadata"]["name"].as_str().unwrap_or_default().to_string();
+        let few = vec![pod("a".into(), "Pending", "2026-01-01T00:00:00Z")];
+        assert_eq!(followed_pods(&few).len(), 1);
+
+        let mut many: Vec<_> =
+            (0..MAX_LOG_PODS + 10).map(|i| pod(format!("old-{i}"), "Running", "2026-01-01T00:00:00Z")).collect();
+        many.push(pod("new".into(), "Running", "2026-02-01T00:00:00Z"));
+        many.push(pod("pending".into(), "Pending", "2026-03-01T00:00:00Z"));
+        let followed: Vec<String> = followed_pods(&many).into_iter().map(name).collect();
+        assert_eq!(followed.len(), MAX_LOG_PODS);
+        assert_eq!(followed[0], "new");
+        assert!(!followed.contains(&"pending".to_string()));
     }
 }
