@@ -387,5 +387,40 @@ mod tests {
         assert_eq!(find_kind(&kinds, "Deployment").unwrap().ar.kind, "Deployment");
         assert_eq!(find_kind(&kinds, "certificates.cert-manager.io").unwrap().ar.kind, "Certificate");
         assert!(find_kind(&kinds, "secrets").is_none());
+
+        // Custom resources named like built-ins, in earlier sidebar sections.
+        let mut kinds = vec![
+            Kind {
+                ar: ar("", "Service", "services"),
+                namespaced: true,
+                section: "Networking",
+                label: "Services".into(),
+            },
+            Kind {
+                ar: ar("rbac.authorization.k8s.io", "Role", "roles"),
+                namespaced: true,
+                section: "Access Control",
+                label: "Roles".into(),
+            },
+            Kind {
+                ar: ar("serving.knative.dev", "Service", "services"),
+                namespaced: true,
+                section: crd_section("serving.knative.dev"),
+                label: "Service".into(),
+            },
+            Kind {
+                ar: ar("iam.services.k8s.aws", "Role", "roles"),
+                namespaced: true,
+                section: crd_section("iam.services.k8s.aws"),
+                label: "Role".into(),
+            },
+        ];
+        sort_for_sidebar(&mut kinds);
+        assert_eq!(kinds[0].ar.group, "serving.knative.dev");
+        assert_eq!(find_kind(&kinds, "svc").unwrap().ar.group, "");
+        assert_eq!(find_kind(&kinds, "Service").unwrap().ar.group, "");
+        assert_eq!(find_kind(&kinds, "roles").unwrap().ar.group, "rbac.authorization.k8s.io");
+        assert_eq!(find_kind(&kinds, "services.serving.knative.dev").unwrap().ar.group, "serving.knative.dev");
+        assert_eq!(find_kind(&kinds, "roles.iam.services.k8s.aws").unwrap().ar.group, "iam.services.k8s.aws");
     }
 }
