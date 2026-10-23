@@ -36,6 +36,8 @@ pub struct HelmInstall {
     values: Entity<EditorState>,
     output: Option<(bool, String)>,
     busy: bool,
+    /// Loading the picked chart's versions and values; a new pick cancels it.
+    _pick: Option<Task<()>>,
     _tasks: Vec<Task<()>>,
     _subs: Vec<Subscription>,
 }
@@ -72,6 +74,7 @@ impl HelmInstall {
             values,
             output: None,
             busy: false,
+            _pick: None,
             _tasks: Vec::new(),
             _subs: subs,
         }
@@ -135,6 +138,10 @@ impl HelmInstall {
             )
             .await;
             let _ = this.update_in(cx, |this, window, cx| {
+                // Only for the chart and version still picked.
+                if this.chart.as_ref().is_none_or(|c| c.name != chart.name || c.version != chart.version) {
+                    return;
+                }
                 this.versions = versions
                     .ok()
                     .and_then(|o| serde_json::from_str::<Vec<Chart>>(&o).ok())
@@ -145,7 +152,7 @@ impl HelmInstall {
                 cx.notify();
             });
         });
-        self._tasks.push(task);
+        self._pick = Some(task);
         cx.notify();
     }
 
