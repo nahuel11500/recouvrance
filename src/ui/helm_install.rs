@@ -36,6 +36,8 @@ pub struct HelmInstall {
     values: Entity<EditorState>,
     output: Option<(bool, String)>,
     busy: bool,
+    /// The chart search running; a new search cancels it.
+    _search: Option<Task<()>>,
     /// Loading the picked chart's versions and values; a new pick cancels it.
     _pick: Option<Task<()>>,
     _tasks: Vec<Task<()>>,
@@ -74,6 +76,7 @@ impl HelmInstall {
             values,
             output: None,
             busy: false,
+            _search: None,
             _pick: None,
             _tasks: Vec::new(),
             _subs: subs,
@@ -99,7 +102,7 @@ impl HelmInstall {
                 cx.notify();
             });
         });
-        self._tasks.push(task);
+        self._search = Some(task);
         cx.notify();
     }
 
@@ -109,6 +112,7 @@ impl HelmInstall {
         self.release.update(cx, |s, cx| s.set_value(base, window, cx));
         self.values.update(cx, |s, cx| s.set_value("# loading chart values…", window, cx));
         self.output = None;
+        self.versions.clear();
         self.chart = Some(chart.clone());
         let context = self.context.clone();
         let task = cx.spawn_in(window, async move |this, cx| {
