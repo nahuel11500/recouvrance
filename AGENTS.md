@@ -72,8 +72,7 @@ copy; if one doesn't fit, extend it.
 
 ## Tests
 
-- A `fix:` PR adds a test that fails without the fix. CI checks for one ("Fix has a test");
-  the label `no test needed` skips it, for docs and CI changes.
+- When a fix's logic can be tested without a cluster, add a test that fails without the fix.
 - View behaviour over time (late results, reloads) can be tested with `#[gpui_kit::test]` and
   a `TestAppContext` (see `src/latest.rs`). Those tests need the `dev` feature:
   `#[cfg(all(test, feature = "dev"))]`.
