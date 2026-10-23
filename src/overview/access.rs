@@ -167,7 +167,14 @@ pub(super) fn role_page(ctx: &Ctx, cx: &App) -> Div {
         .when(ctx.related.rbac.is_none(), |d| {
             d.child(div().text_sm().text_color(cx.theme().muted_foreground).child("Loading…"))
         })
+        .children(rbac_note(ctx, cx))
         .children(bindings.iter().map(|b| binding_row(ctx, b, cx)))
+}
+
+/// Which roles and bindings could not be listed, so an empty section does not read as "none".
+fn rbac_note(ctx: &Ctx, cx: &App) -> Option<Div> {
+    let note = ctx.related.rbac.as_ref()?.load_note()?;
+    Some(div().py_1().text_xs().text_color(cx.theme().warning).child(note))
 }
 
 /// RoleBinding or ClusterRoleBinding: the role it grants and to whom.
@@ -206,6 +213,7 @@ pub(super) fn binding_page(ctx: &Ctx, cx: &App) -> Div {
         .child(heading(&format!("Subjects ({})", subjects.len())))
         .child(subjects_table(ctx, &subjects, true, cx))
         .child(heading("What it allows"))
+        .children(rbac_note(ctx, cx))
         .child(rules_table(&rules, cx))
 }
 
@@ -220,6 +228,7 @@ pub(super) fn service_account_page(ctx: &Ctx, cx: &App) -> Div {
     if ctx.related.rbac.is_none() {
         d = d.child(div().text_sm().text_color(theme.muted_foreground).child("Loading…"));
     }
+    d = d.children(rbac_note(ctx, cx));
     for (binding, role, scope, rules) in grants {
         d = d.child(
             v_flex()

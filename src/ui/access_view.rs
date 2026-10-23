@@ -78,7 +78,8 @@ pub struct AccessView {
     who_verb: Entity<InputState>,
     who_resource: Entity<InputState>,
     who_ns: Entity<InputState>,
-    who: Option<Result<Vec<crate::rbac::Grant>, String>>,
+    /// The grants found, and which lists could not be read.
+    who: Option<Result<(Vec<crate::rbac::Grant>, Option<String>), String>>,
     who_busy: bool,
     _who_task: Option<Task<()>>,
     _subs: Vec<Subscription>,
@@ -161,10 +162,10 @@ impl AccessView {
         cx.notify();
         self._who_task = Some(cx.spawn(async move |this, cx| {
             let snap = k8s::rbac_snapshot(client, ns.clone()).await;
-            let result = if snap.cluster_role_bindings.is_empty() && snap.cluster_roles.is_empty() {
-                Err("Could not list roles and bindings (your RBAC may not allow it).".to_string())
+            let result = if snap.no_bindings() {
+                Err(snap.load_note().unwrap_or_default())
             } else {
-                Ok(crate::rbac::who_can(&snap, &verb, &group, &resource, ns.as_deref()))
+                Ok((crate::rbac::who_can(&snap, &verb, &group, &resource, ns.as_deref()), snap.load_note()))
             };
             let _ = this.update(cx, |this, cx| {
                 this.who = Some(result);
@@ -205,15 +206,22 @@ impl AccessView {
                             .on_click(cx.listener(|this, _, _, cx| this.ask_who(cx))),
                     ),
             )
+            .children(
+                self.who
+                    .as_ref()
+                    .and_then(|r| r.as_ref().ok())
+                    .and_then(|(_, note)| note.clone())
+                    .map(|note| div().text_xs().text_color(theme.warning).child(note)),
+            )
             .children(self.who.as_ref().map(|r| {
                 match r {
                     Err(e) => div().text_sm().text_color(theme.danger).child(e.clone()).into_any_element(),
-                    Ok(g) if g.is_empty() => div()
+                    Ok((g, _)) if g.is_empty() => div()
                         .text_sm()
                         .text_color(muted)
                         .child("Nobody, through RBAC bindings (cluster admins via system:masters are not listed).")
                         .into_any_element(),
-                    Ok(grants) => v_flex()
+                    Ok((grants, _)) => v_flex()
                         .id("who-results")
                         .max_h(px(320.))
                         .overflow_y_scroll()
