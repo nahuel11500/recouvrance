@@ -494,12 +494,13 @@ impl DetailPanel {
                     let risky = crate::settings::is_protected(&this.context);
                     // Write mode still applies to every connect; the context name was typed already.
                     let ctx = this.context.clone();
-                    this.terminal = Some(cx.new(|cx| {
+                    // In a tab of its own: a shell open in the pod's containers stays.
+                    this.debug_terminal = Some(cx.new(|cx| {
                         TerminalView::new(client, ns, pod, Some(container.clone()), risky, cx)
                             .guarded(ctx)
                             .preauthorized()
                     }));
-                    this.tab = DetailTab::Shell;
+                    this.tab = DetailTab::Debug;
                     window
                         .push_notification(Notification::success(format!("Shell in debug container {container}")), cx);
                     cx.notify();
