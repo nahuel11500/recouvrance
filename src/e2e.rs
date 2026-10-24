@@ -201,3 +201,81 @@ fn turning_access_off_stops_a_drain() {
         Ok(())
     });
 }
+
+/// A shell in a container answers what is typed, and says when it ends; an attach shows
+/// the container's own output. (The terminal view only draws what these sessions send.)
+#[test]
+#[ignore]
+fn shells_and_attach_reach_the_container() {
+    use futures::StreamExt as _;
+    use k8s_openapi::api::core::v1::Pod;
+
+    use crate::k8s::{ExecInput, ExecOutput, Session};
+
+    /// What a session prints until `until` shows up (or it ends, or 60 s pass).
+    async fn read_until(session: &mut Session, until: &str) -> String {
+        let mut text = String::new();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+        while !text.contains(until) {
+            match tokio::time::timeout_at(deadline, session.output.next()).await {
+                Ok(Some(ExecOutput::Data(b))) => text.push_str(&String::from_utf8_lossy(&b)),
+                Ok(Some(ExecOutput::Exit(reason))) => {
+                    text.push_str(&format!("[exit: {reason}]"));
+                    break;
+                }
+                Ok(None) | Err(_) => break,
+            }
+        }
+        text
+    }
+
+    run(async {
+        let client = k8s::connect_for_agents(context()).await?;
+        let pods: Api<Pod> = Api::namespaced(client.clone(), NS);
+        let name = "e2e-shell";
+        let _ = pods.delete(name, &DeleteParams::default().grace_period(0)).await;
+        for _ in 0..60 {
+            if pods.get_opt(name).await?.is_none() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+        let pod: Pod = serde_json::from_value(json!({
+            "metadata": {"name": name, "namespace": NS},
+            "spec": {"containers": [{
+                "name": "main", "image": "busybox:1.37",
+                "command": ["sh", "-c", "echo attached-output; while true; do sleep 1; done"],
+            }]},
+        }))?;
+        pods.create(&PostParams::default(), &pod).await?;
+        let running = async {
+            for _ in 0..120 {
+                let phase = pods.get(name).await?.status.and_then(|s| s.phase);
+                if phase.as_deref() == Some("Running") {
+                    return Ok(());
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+            bail!("{name} did not start")
+        };
+        let checked = async {
+            running.await?;
+            let mut shell = k8s::exec_shell(client.clone(), NS.into(), name.into(), None);
+            let _ = shell.input.unbounded_send(ExecInput::Resize { cols: 80, rows: 24 });
+            let _ = shell.input.unbounded_send(ExecInput::Bytes(b"echo $((20+22))-answered\n".to_vec()));
+            let text = read_until(&mut shell, "42-answered").await;
+            assert!(text.contains("42-answered"), "{text}");
+            let _ = shell.input.unbounded_send(ExecInput::Bytes(b"exit\n".to_vec()));
+            let text = read_until(&mut shell, "[exit:").await;
+            assert!(text.contains("[exit: Session ended]"), "{text}");
+
+            let mut attached = k8s::attach_container(client.clone(), NS.into(), name.into(), None);
+            let text = read_until(&mut attached, "output only").await;
+            assert!(text.contains("Attached to the container's main process"), "{text}");
+            Ok(())
+        };
+        let result: Result<()> = checked.await;
+        pods.delete(name, &DeleteParams::default().grace_period(0)).await?;
+        result
+    });
+}

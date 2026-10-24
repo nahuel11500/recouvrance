@@ -124,10 +124,10 @@ pub fn run(ctx: String) {
         }
         if std::env::var("RECOUVRANCE_HELMLOAD").is_ok() {
             let t = std::time::Instant::now();
-            let n = crate::ui::helm::list_releases(client.clone(), None).await.map(|r| r.len());
+            let n = crate::helm::list_releases(client.clone(), None).await.map(|r| r.len());
             println!("helm list: {n:?} releases in {:?}", t.elapsed());
             let (tx, mut rx) = futures::channel::mpsc::unbounded();
-            let fill = crate::ui::helm::fill_releases(client.clone(), None, tx);
+            let fill = crate::helm::fill_releases(client.clone(), None, tx);
             let count = async {
                 use futures::StreamExt as _;
                 let (mut n, mut first) = (0, None);

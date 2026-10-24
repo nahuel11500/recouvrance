@@ -19,21 +19,88 @@ pub enum ExecOutput {
     Exit(String),
 }
 
-/// Open an interactive shell (bash if present, else sh) in a container.
-pub fn exec_shell(
-    client: Client,
-    ns: String,
-    pod: String,
-    container: Option<String>,
-) -> (TaskGuard, mpsc::UnboundedSender<ExecInput>, mpsc::UnboundedReceiver<ExecOutput>) {
-    use kube::api::{AttachParams, TerminalSize};
-    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+/// A terminal session: a shell in a container or on this machine, or an attach. Send it
+/// keys and sizes, read what it prints; dropping `guard` ends it.
+pub struct Session {
+    pub guard: TaskGuard,
+    pub input: mpsc::UnboundedSender<ExecInput>,
+    pub output: mpsc::UnboundedReceiver<ExecOutput>,
+}
 
-    let (in_tx, mut in_rx) = mpsc::unbounded::<ExecInput>();
-    let (out_tx, out_rx) = mpsc::unbounded();
-    let guard = spawn_guarded(async move {
+impl Session {
+    /// A session whose task is `work`, given the keys typed and where to print.
+    fn spawn<F, Fut>(work: F) -> Self
+    where
+        F: FnOnce(mpsc::UnboundedReceiver<ExecInput>, mpsc::UnboundedSender<ExecOutput>) -> Fut,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        let (input, keys) = mpsc::unbounded();
+        let (out, output) = mpsc::unbounded();
+        Self { guard: spawn_guarded(work(keys, out)), input, output }
+    }
+
+    /// A session that does nothing, for off-screen rendering checks.
+    #[cfg(feature = "dev")]
+    pub fn disabled() -> Self {
+        Self::spawn(|_, _| async {})
+    }
+}
+
+/// Copy what a remote process prints to the session, until it ends. Without a tty
+/// (`raw_newlines`), bare newlines become CR LF.
+async fn forward_output(
+    mut from: impl tokio::io::AsyncRead + Unpin,
+    out: mpsc::UnboundedSender<ExecOutput>,
+    raw_newlines: bool,
+) {
+    use tokio::io::AsyncReadExt as _;
+    let mut buf = vec![0u8; 16 * 1024];
+    loop {
+        match from.read(&mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                let bytes = if raw_newlines { crlf(&buf[..n]) } else { buf[..n].to_vec() };
+                if out.unbounded_send(ExecOutput::Data(bytes)).is_err() {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+/// Send the keys typed and the terminal's size to a remote process, until the session's
+/// input closes or the process stops reading.
+async fn forward_input(
+    mut keys: mpsc::UnboundedReceiver<ExecInput>,
+    mut stdin: Option<impl tokio::io::AsyncWrite + Unpin>,
+    mut resize: Option<mpsc::Sender<kube::api::TerminalSize>>,
+) {
+    use futures::SinkExt as _;
+    use tokio::io::AsyncWriteExt as _;
+    while let Some(input) = keys.next().await {
+        match input {
+            ExecInput::Bytes(b) => {
+                if let Some(w) = stdin.as_mut() {
+                    if w.write_all(&b).await.is_err() {
+                        break;
+                    }
+                    let _ = w.flush().await;
+                }
+            }
+            ExecInput::Resize { cols, rows } => {
+                if let Some(r) = resize.as_mut() {
+                    let _ = r.send(kube::api::TerminalSize { width: cols, height: rows }).await;
+                }
+            }
+        }
+    }
+}
+
+/// Open an interactive shell (bash if present, else sh) in a container.
+pub fn exec_shell(client: Client, ns: String, pod: String, container: Option<String>) -> Session {
+    Session::spawn(|keys, out| async move {
         let api: Api<Pod> = Api::namespaced(client, &ns);
-        let mut ap = AttachParams::interactive_tty();
+        let mut ap = kube::api::AttachParams::interactive_tty();
         if let Some(c) = container {
             ap = ap.container(c);
         }
@@ -41,71 +108,30 @@ pub fn exec_shell(
         let mut proc = match api.exec(&pod, shell, &ap).await {
             Ok(p) => p,
             Err(e) => {
-                let _ = out_tx.unbounded_send(ExecOutput::Exit(format!("exec failed: {e}")));
+                let _ = out.unbounded_send(ExecOutput::Exit(format!("exec failed: {e}")));
                 return;
             }
         };
-        let (Some(mut stdin), Some(mut stdout), Some(mut resize)) = (proc.stdin(), proc.stdout(), proc.terminal_size())
-        else {
-            let _ = out_tx.unbounded_send(ExecOutput::Exit("no tty streams".into()));
+        let (Some(stdin), Some(stdout), Some(resize)) = (proc.stdin(), proc.stdout(), proc.terminal_size()) else {
+            let _ = out.unbounded_send(ExecOutput::Exit("no tty streams".into()));
             return;
         };
         let status = proc.take_status();
-        let reader = {
-            let out_tx = out_tx.clone();
-            async move {
-                let mut buf = vec![0u8; 16 * 1024];
-                loop {
-                    match stdout.read(&mut buf).await {
-                        Ok(0) | Err(_) => break,
-                        Ok(n) => {
-                            if out_tx.unbounded_send(ExecOutput::Data(buf[..n].to_vec())).is_err() {
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-        };
-        let writer = async move {
-            while let Some(input) = in_rx.next().await {
-                match input {
-                    ExecInput::Bytes(b) => {
-                        if stdin.write_all(&b).await.is_err() {
-                            break;
-                        }
-                        let _ = stdin.flush().await;
-                    }
-                    ExecInput::Resize { cols, rows } => {
-                        use futures::SinkExt as _;
-                        let _ = resize.send(TerminalSize { width: cols, height: rows }).await;
-                    }
-                }
-            }
-        };
         tokio::select! {
-            () = reader => {}
-            () = writer => {}
+            () = forward_output(stdout, out.clone(), false) => {}
+            () = forward_input(keys, Some(stdin), Some(resize)) => {}
         }
         let reason = match status {
             Some(s) => match s.await {
-                Some(st) if st.status.as_deref() == Some("Success") => "Session ended".to_string(),
-                Some(st) => format!("Session ended: {}", st.message.unwrap_or_default()),
-                None => "Session ended".to_string(),
+                Some(st) if st.status.as_deref() != Some("Success") => {
+                    format!("Session ended: {}", st.message.unwrap_or_default())
+                }
+                _ => "Session ended".to_string(),
             },
             None => "Session ended".to_string(),
         };
-        let _ = out_tx.unbounded_send(ExecOutput::Exit(reason));
-    });
-    (guard, in_tx, out_rx)
-}
-
-/// A session handle that does nothing, for off-screen rendering checks.
-#[cfg(feature = "dev")]
-pub fn exec_shell_disabled() -> (TaskGuard, mpsc::UnboundedSender<ExecInput>, mpsc::UnboundedReceiver<ExecOutput>) {
-    let (in_tx, _) = mpsc::unbounded();
-    let (_, out_rx) = mpsc::unbounded();
-    (spawn_guarded(async {}), in_tx, out_rx)
+        let _ = out.unbounded_send(ExecOutput::Exit(reason));
+    })
 }
 
 /// The most a container download may write to disk (a bigger file or folder is refused).
@@ -446,13 +472,11 @@ pub fn local_shell(
     namespace: Option<String>,
     command: Option<String>,
     env: Vec<(String, String)>,
-) -> (TaskGuard, mpsc::UnboundedSender<ExecInput>, mpsc::UnboundedReceiver<ExecOutput>) {
+) -> Session {
     use portable_pty::{CommandBuilder, PtySize, native_pty_system};
     use std::io::{Read as _, Write as _};
 
-    let (in_tx, mut in_rx) = mpsc::unbounded::<ExecInput>();
-    let (out_tx, out_rx) = mpsc::unbounded();
-    let guard = spawn_guarded(async move {
+    Session::spawn(|mut in_rx, out_tx| async move {
         let fail = |e: String| {
             let _ = out_tx.unbounded_send(ExecOutput::Exit(e));
         };
@@ -553,36 +577,25 @@ pub fn local_shell(
         drop(keys);
         drop(kubeconfig);
         let _ = out_tx.unbounded_send(ExecOutput::Exit("Shell exited".into()));
-    });
-    (guard, in_tx, out_rx)
+    })
 }
 
 /// `kubectl attach`: the container's own process output (and stdin/tty when the
 /// container was started with them), instead of a new shell.
-pub fn attach_container(
-    client: Client,
-    ns: String,
-    pod: String,
-    container: Option<String>,
-) -> (TaskGuard, mpsc::UnboundedSender<ExecInput>, mpsc::UnboundedReceiver<ExecOutput>) {
-    use kube::api::{AttachParams, TerminalSize};
-    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-
-    let (in_tx, mut in_rx) = mpsc::unbounded::<ExecInput>();
-    let (out_tx, out_rx) = mpsc::unbounded();
-    let guard = spawn_guarded(async move {
+pub fn attach_container(client: Client, ns: String, pod: String, container: Option<String>) -> Session {
+    Session::spawn(|keys, out| async move {
         let api: Api<Pod> = Api::namespaced(client, &ns);
         // Attach with what the container offers: stdin and a tty only if its spec has them.
         let spec = api.get(&pod).await.ok().and_then(|p| p.spec);
         let (name, stdin, tty) = attach_target(spec.as_ref(), container.as_deref());
-        let mut ap = AttachParams::default().stdin(stdin).stdout(true).stderr(!tty).tty(tty);
+        let mut ap = kube::api::AttachParams::default().stdin(stdin).stdout(true).stderr(!tty).tty(tty);
         if let Some(name) = name {
             ap = ap.container(name);
         }
         let mut proc = match api.attach(&pod, &ap).await {
             Ok(p) => p,
             Err(e) => {
-                let _ = out_tx.unbounded_send(ExecOutput::Exit(format!("attach failed: {e}")));
+                let _ = out.unbounded_send(ExecOutput::Exit(format!("attach failed: {e}")));
                 return;
             }
         };
@@ -590,63 +603,31 @@ pub fn attach_container(
             "\x1b[2mAttached to the container's main process{}. Closing detaches; it keeps running.\x1b[0m\r\n",
             if stdin { "" } else { " (output only: it was not started with stdin)" }
         );
-        let _ = out_tx.unbounded_send(ExecOutput::Data(note.into_bytes()));
-        let pump = |mut r: Box<dyn tokio::io::AsyncRead + Unpin + Send>, out_tx: mpsc::UnboundedSender<ExecOutput>| async move {
-            let mut buf = vec![0u8; 16 * 1024];
-            loop {
-                match r.read(&mut buf).await {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => {
-                        // Without a tty, output uses bare newlines.
-                        let bytes = if tty { buf[..n].to_vec() } else { crlf(&buf[..n]) };
-                        if out_tx.unbounded_send(ExecOutput::Data(bytes)).is_err() {
-                            break;
-                        }
-                    }
-                }
-            }
-        };
-        let stdout = proc.stdout().map(|s| pump(Box::new(s), out_tx.clone()));
-        let stderr = proc.stderr().map(|s| pump(Box::new(s), out_tx.clone()));
-        let mut stdin_w = proc.stdin();
-        let mut resize = proc.terminal_size();
-        let writer = async move {
-            while let Some(input) = in_rx.next().await {
-                match input {
-                    ExecInput::Bytes(b) => {
-                        if let Some(w) = stdin_w.as_mut() {
-                            if w.write_all(&b).await.is_err() {
-                                break;
-                            }
-                            let _ = w.flush().await;
-                        }
-                    }
-                    ExecInput::Resize { cols, rows } => {
-                        if let Some(r) = resize.as_mut() {
-                            use futures::SinkExt as _;
-                            let _ = r.send(TerminalSize { width: cols, height: rows }).await;
-                        }
-                    }
-                }
-            }
-            futures::future::pending::<()>().await;
-        };
+        let _ = out.unbounded_send(ExecOutput::Data(note.into_bytes()));
+        // Without a tty, output uses bare newlines.
+        let stdout = proc.stdout().map(|s| forward_output(s, out.clone(), !tty));
+        let stderr = proc.stderr().map(|s| forward_output(s, out.clone(), !tty));
         let readers = async move {
             match (stdout, stderr) {
                 (Some(a), Some(b)) => {
                     futures::join!(a, b);
                 }
-                (Some(a), None) | (None, Some(a)) => a.await,
+                (Some(a), None) => a.await,
+                (None, Some(b)) => b.await,
                 (None, None) => {}
             }
+        };
+        // Detaching is the process ending or closing its output, not the input closing.
+        let writer = async {
+            forward_input(keys, proc.stdin(), proc.terminal_size()).await;
+            futures::future::pending::<()>().await;
         };
         tokio::select! {
             () = readers => {}
             () = writer => {}
         }
-        let _ = out_tx.unbounded_send(ExecOutput::Exit("Detached: the process ended or closed its output".into()));
-    });
-    (guard, in_tx, out_rx)
+        let _ = out.unbounded_send(ExecOutput::Exit("Detached: the process ended or closed its output".into()));
+    })
 }
 
 /// Bare newlines as CR LF, on the bytes: a character split across two reads stays whole.

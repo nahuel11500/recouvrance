@@ -222,7 +222,7 @@ impl TerminalView {
     fn connect(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.parser = vt100::Parser::new(nz(self.size.1), nz(self.size.0), SCROLLBACK);
         self.status = Some("Connecting…".into());
-        let (guard, input, mut output) = match &self.local {
+        let k8s::Session { guard, input, mut output } = match &self.local {
             Some((ctx, ns)) => k8s::local_shell(ctx.clone(), ns.clone(), self.command.clone(), self.env.clone()),
             None if self.attach => {
                 k8s::attach_container(self.client.clone(), self.ns.clone(), self.pod.clone(), self.container.clone())
@@ -261,7 +261,7 @@ impl TerminalView {
     #[cfg(feature = "dev")]
     pub fn demo(&mut self, bytes: &[u8], cx: &mut Context<Self>) {
         let task = Task::ready(());
-        let (guard, _, _) = k8s::exec_shell_disabled();
+        let guard = k8s::Session::disabled().guard;
         self.session = Some((guard, task));
         self.parser.process(bytes);
         cx.notify();
