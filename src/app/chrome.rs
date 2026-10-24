@@ -120,13 +120,14 @@ impl AppView {
         let palette = cx.new(|cx| Palette::new(items, window, cx));
         // (Re)build the cluster-wide name index in the background; results stream in.
         let stale = self.index_built.is_none_or(|t| t.elapsed().as_secs() > 300);
-        if stale && !self.clusters.is_empty() {
+        let kinds: Vec<Kind> = SEARCH_KINDS.iter().filter_map(|k| k8s::find_kind(&self.kinds, k).cloned()).collect();
+        // None of the searched kinds served (or not discovered yet): nothing to index, and
+        // no "indexing…" that nothing would clear.
+        if stale && !self.clusters.is_empty() && !kinds.is_empty() {
             self.search_index.clear();
             self.index_failed.clear();
             self.index_built = Some(std::time::Instant::now());
             self._index_tasks.clear();
-            let kinds: Vec<Kind> =
-                SEARCH_KINDS.iter().filter_map(|k| k8s::find_kind(&self.kinds, k).cloned()).collect();
             let total = self.clusters.len() * kinds.len();
             palette.update(cx, |p, cx| p.set_status(Some(format!("indexing… 0/{total}")), cx));
             let done = std::rc::Rc::new(std::cell::Cell::new(0usize));
