@@ -202,7 +202,9 @@ pub struct DetailPanel {
     /// The object is gone from the cluster (a read answered 404): polling stopped.
     deleted: bool,
     _tasks: Vec<Task<()>>,
-    _subs: Vec<Subscription>,
+    /// The node shell's end and the data editor's save: replaced when another opens.
+    _shell_sub: Option<Subscription>,
+    _data_editor_sub: Option<Subscription>,
 }
 
 #[derive(Default)]
@@ -282,7 +284,8 @@ impl DetailPanel {
             pending_action: None,
             deleted: false,
             _tasks: Vec::new(),
-            _subs: Vec::new(),
+            _shell_sub: None,
+            _data_editor_sub: None,
         };
         this.load_object(window, cx);
         this.load_events(cx);
