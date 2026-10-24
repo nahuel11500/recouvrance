@@ -35,7 +35,7 @@ pub struct Config {
     pub enabled: bool,
     pub agents: Vec<Agent>,
     /// 0 (missing) when saved before 0.3.0, which created agents without a section in
-    /// rules.yaml: see [`Hub::apply_rules_file`].
+    /// rules.yaml: see [`Hub::apply_rules_file`](super::Hub::apply_rules_file).
     #[serde(default)]
     pub version: u32,
 }

@@ -148,7 +148,7 @@ pub struct Hub {
 }
 
 impl Hub {
-    /// Mark agents.json as in use by this process until it exits (see [`config_in_use`]).
+    /// Mark agents.json as in use by this process until it exits (see [`config_in_use`](super::config::config_in_use)).
     pub fn claim_config(&self) {
         let _ = crate::private_files::create_dir(&crate::paths::config_dir());
         *lock(&self.config_lock) = take_lock(&config_lock_path());
