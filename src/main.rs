@@ -12,6 +12,7 @@ mod favorites;
 mod filter_syntax;
 mod forwards;
 mod glob;
+mod helm;
 mod k8s;
 mod latest;
 mod mcp;
