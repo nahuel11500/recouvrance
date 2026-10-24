@@ -35,7 +35,7 @@ pub struct AuditEntry {
     pub session: Option<String>,
 }
 
-/// See [`Hub::audit_stats`].
+/// See [`Hub::audit_stats`](super::Hub::audit_stats).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct AuditStats {
     pub matching: usize,
