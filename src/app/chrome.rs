@@ -9,7 +9,8 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use super::{AppView, IndexEntry, Route, SEARCH_KINDS, open_main_window, section_icon, set_theme, set_zoom, zoom};
+use super::search_index::{Entry, SEARCH_KINDS, on_cluster};
+use super::{AppView, Route, open_main_window, section_icon, set_theme, set_zoom, zoom};
 use crate::k8s;
 use crate::k8s::Kind;
 use crate::ui::palette::{Item as PaletteItem, Palette, PaletteEvent, Target};
@@ -106,56 +107,29 @@ impl AppView {
                 });
             }
         }
-        let index_items = move |entries: &[IndexEntry]| -> Vec<PaletteItem> {
-            entries
-                .iter()
-                .map(|e| PaletteItem {
-                    label: e.name.clone(),
-                    detail: format!(
-                        "{}{}{}",
-                        e.label,
-                        e.namespace.as_ref().map(|n| format!(" · {n}")).unwrap_or_default(),
-                        on_cluster(&names, e.ctx)
-                    ),
-                    icon: e.icon,
-                    target: Target::Object {
-                        ctx: e.ctx,
-                        kind: e.kind.clone(),
-                        name: e.name.clone(),
-                        namespace: e.namespace.clone(),
-                    },
-                })
-                .collect()
-        };
-        items.extend(index_items(&self.search_index));
+        items.extend(self.search_index.entries().iter().map(|e| e.item(&names)));
         let palette = cx.new(|cx| Palette::new(items, window, cx));
         // (Re)build the cluster-wide name index in the background; results stream in.
-        let stale = self.index_built.is_none_or(|t| t.elapsed().as_secs() > 300);
         let kinds: Vec<Kind> = SEARCH_KINDS.iter().filter_map(|k| k8s::find_kind(&self.kinds, k).cloned()).collect();
         // None of the searched kinds served (or not discovered yet): nothing to index, and
         // no "indexing…" that nothing would clear.
-        if stale && !self.clusters.is_empty() && !kinds.is_empty() {
-            self.search_index.clear();
-            self.index_failed.clear();
-            self.index_built = Some(std::time::Instant::now());
-            self._index_tasks.clear();
-            let total = self.clusters.len() * kinds.len();
-            palette.update(cx, |p, cx| p.set_status(Some(format!("indexing… 0/{total}")), cx));
-            let done = std::rc::Rc::new(std::cell::Cell::new(0usize));
+        if self.search_index.is_stale() && !self.clusters.is_empty() && !kinds.is_empty() {
+            self.search_index.restart(self.clusters.len() * kinds.len());
+            let status = self.search_index.status();
+            palette.update(cx, |p, cx| p.set_status(status, cx));
             for (ctx, (cluster, client)) in self.clusters.clone().into_iter().enumerate() {
                 for kind in kinds.clone() {
-                    let (client, palette, done) = (client.clone(), palette.downgrade(), done.clone());
-                    let index_items = index_items.clone();
+                    let (client, palette, names) = (client.clone(), palette.downgrade(), names.clone());
                     let cluster = cluster.clone();
-                    self._index_tasks.push(cx.spawn(async move |this, cx| {
+                    let task = cx.spawn(async move |this, cx| {
                         // A list that fails is said, not taken for an empty one.
-                        let (names, failed) = match k8s::list_names(client, kind.ar.clone(), None).await {
-                            Ok(names) => (names, None),
+                        let (found, failed) = match k8s::list_names(client, kind.ar.clone(), None).await {
+                            Ok(found) => (found, None),
                             Err(_) => (Vec::new(), Some(format!("{} on {cluster}", kind.kubectl_name()))),
                         };
-                        let entries: Vec<IndexEntry> = names
+                        let entries: Vec<Entry> = found
                             .into_iter()
-                            .map(|(namespace, name)| IndexEntry {
+                            .map(|(namespace, name)| Entry {
                                 ctx,
                                 kind: kind.kubectl_name(),
                                 label: kind.label.clone(),
@@ -164,27 +138,19 @@ impl AppView {
                                 name,
                             })
                             .collect();
-                        let new_items = index_items(&entries);
-                        done.set(done.get() + 1);
-                        let Ok(status) = this.update(cx, |this, _| {
-                            this.search_index.extend(entries);
-                            this.index_failed.extend(failed);
-                            if done.get() < total {
-                                Some(format!("indexing… {}/{total}", done.get()))
-                            } else {
-                                index_status(&this.index_failed)
-                            }
-                        }) else {
+                        let new_items: Vec<PaletteItem> = entries.iter().map(|e| e.item(&names)).collect();
+                        let Ok(status) = this.update(cx, |this, _| this.search_index.add(entries, failed)) else {
                             return;
                         };
                         let _ = palette.update(cx, |p, cx| {
                             p.add_items(new_items, cx);
                             p.set_status(status, cx);
                         });
-                    }));
+                    });
+                    self.search_index.push_task(task);
                 }
             }
-        } else if let Some(status) = index_status(&self.index_failed) {
+        } else if let Some(status) = self.search_index.status() {
             palette.update(cx, |p, cx| p.set_status(Some(status), cx));
         }
         // Objects in the palette point at clusters by their place in the connected list: a
@@ -435,35 +401,5 @@ impl AppView {
                         ),
                 ),
         )
-    }
-}
-
-/// `" · <context>"` for an object on cluster `ctx`, when several are connected.
-fn on_cluster(names: &[String], ctx: usize) -> String {
-    match names.get(ctx) {
-        Some(name) if names.len() > 1 => format!(" · {name}"),
-        _ => String::new(),
-    }
-}
-
-/// The palette's line for the lists the object index couldn't load.
-fn index_status(failed: &[String]) -> Option<String> {
-    match failed {
-        [] => None,
-        [one] => Some(format!("Couldn't list {one}")),
-        [first, rest @ ..] => Some(format!("Couldn't list {first} and {} more", rest.len())),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::index_status;
-
-    #[test]
-    fn failed_index_lists_are_said() {
-        assert_eq!(index_status(&[]), None);
-        assert_eq!(index_status(&["nodes on prod".into()]).as_deref(), Some("Couldn't list nodes on prod"));
-        let two = ["nodes on prod".to_string(), "pods on prod".to_string()];
-        assert_eq!(index_status(&two).as_deref(), Some("Couldn't list nodes on prod and 1 more"));
     }
 }
