@@ -56,7 +56,7 @@
   run in a terminal page or in the background. A plugin counts as a write (write mode, protected
   context name typed) unless it declares `read_only: true`. See Settings → Plugins for an example.
 - **Contexts** can get a color (a strip at the top of the window) and be marked *protected*: writes
-  there ask you to type the context name. Contexts you have not set are guessed from the context,
+  there ask you to type the context name (agents follow their rules instead). Contexts you have not set are guessed from the context,
   user and cluster names and the server URL (`prod`, `prd`, `production`, `live`, `admin`, `root`),
   so new production contexts are protected too. Set both in Settings → Contexts.
 - **Diagnosis** on pods and workloads: why it is broken (crash output and exit code, scheduling,

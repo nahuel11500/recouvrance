@@ -36,6 +36,11 @@ Each agent has rules, like Kubernetes RBAC with an effect:
 | Contexts | `eu-*`, `staging` |
 | Names | `web-*`, `*` |
 
+Write mode and protected contexts are for you in the window: an agent's calls don't check them,
+only its rules (with the rate limit and the kill switch below). An Allow rule for a write lets the
+agent write while the window shows `read-only`, and on a protected context without its name typed;
+to keep agents off a context or from writing, give them *Ask me* or Deny rules for it (or no Allow).
+
 **Deny wins, then Ask me, then Allow; anything no rule matches is denied.** A Deny limited to some
 names hides those objects from lists rather than refusing the whole list. Patching, applying or
 deleting a Namespace also meets the Deny and Ask rules of that namespace. Presets get you

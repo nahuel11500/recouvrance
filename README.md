@@ -29,7 +29,7 @@ A fast Kubernetes desktop client (Rust + [gpui](https://github.com/zed-industrie
 - **Safe by default**: read-only until you enable writes; writes are confirmed with their
   `kubectl` equivalent (deletes ask as you set per kind), and YAML edits and applies are checked
   with a server dry run first; protected contexts; actions follow your
-  RBAC; roll back any Deployment, StatefulSet or DaemonSet.
+  RBAC; roll back any Deployment, StatefulSet or DaemonSet. Agents follow their own rules instead.
 - **Access made clear**: Role, binding and ServiceAccount pages, a *who can* inspector, and
   short-lived kubeconfigs for ServiceAccounts.
 - **Built for agents**: a local MCP server so Claude Code (or any MCP client) works on your clusters
@@ -113,7 +113,9 @@ what you can check for yourself:
   equivalent and ask for confirmation, YAML edits and applies run as a server dry run first, and
   deletes ask as you set per kind (by default, Nodes, Namespaces, Deployments, StatefulSets,
   DaemonSets, PersistentVolumes and their claims, and CRDs need their name typed). A
-  protected context always asks for its name. Agents get only what their rules allow, every call is logged to
+  protected context always asks for its name. Write mode and protection are for you in the window:
+  agents are not bound by them. Agents get only what their rules allow (an *Ask me* rule asks you
+  first), every call is logged to
   `~/.local/share/recouvrance/audit.jsonl`, and a kill switch cuts them all off.
 - **Verifiable releases.** Every release archive, `.deb` and AppImage has a build provenance
   attestation: `gh attestation verify <file> --repo nahuel11500/recouvrance` proves it was built

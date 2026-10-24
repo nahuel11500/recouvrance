@@ -148,7 +148,8 @@ were and the Agents page shows the error.
 
 While the file exists, an agent it doesn't name has no rules, so everything it asks is denied:
 removing an agent's section takes its access away. Deleting an agent on the Agents page removes its
-section too.
+section too. Before 0.3.0 a new agent got no section until its rules were edited: on the first start
+of 0.3.0 such an agent keeps its rules, and its section is written to the file.
 
 Each section is for the agent with that name, so agent names are unique: creating a second agent
 with a taken name is refused, and if two agents already share a name the file is neither loaded nor
