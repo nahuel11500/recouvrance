@@ -5,7 +5,7 @@ updates:
   - package-ecosystem: cargo
     directory: /
     schedule:
-      interval: weekly
+      interval: daily
     # New versions wait three days, so a compromised release is usually caught before it lands here
     # (security updates do not wait).
     cooldown:
@@ -20,7 +20,7 @@ updates:
   - package-ecosystem: github-actions
     directory: /
     schedule:
-      interval: weekly
+      interval: daily
     # New versions wait three days, so a compromised release is usually caught before it lands here
     # (security updates do not wait).
     cooldown:
