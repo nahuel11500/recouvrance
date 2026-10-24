@@ -15,7 +15,7 @@ impl DetailPanel {
         let ns = self.obj.namespace.as_ref().map(|n| format!("{n}-")).unwrap_or_default();
         let name = format!("{}-{ns}{}.yaml", self.obj.kind.ar.kind.to_lowercase(), self.obj.name);
         // Private (a revealed Secret is in there) and never over an earlier download.
-        let r = crate::private_files::create_new_in(&crate::private_files::downloads_dir(), &name)
+        let r = crate::private_files::create_new_in(&crate::paths::downloads_dir(), &name)
             .and_then(|(mut f, path)| f.write_all(self.yaml_text.as_bytes()).map(|()| path));
         window.push_notification(
             match r {

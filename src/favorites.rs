@@ -36,9 +36,7 @@ pub struct Favorites {
 }
 
 fn path() -> PathBuf {
-    let base = std::env::var_os("XDG_CONFIG_HOME")
-        .map_or_else(|| PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".config"), PathBuf::from);
-    base.join("recouvrance").join("favorites.json")
+    crate::paths::config_dir().join("favorites.json")
 }
 
 impl Favorites {
@@ -116,7 +114,7 @@ pub struct ColumnPrefs {
 fn save_json(path: &std::path::Path, value: &impl Serialize) {
     let written = serde_json::to_vec_pretty(value)
         .map_err(std::io::Error::other)
-        .and_then(|json| crate::settings::write_atomic(path, &json));
+        .and_then(|json| crate::private_files::write_atomic(path, &json));
     if let Err(e) = written {
         eprintln!("{}: {e}", path.display());
     }

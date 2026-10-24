@@ -768,7 +768,7 @@ impl SettingsView {
                 let missing: Vec<String> = s
                     .assistant_repos
                     .iter()
-                    .filter(|r| !settings::expand(r).is_dir())
+                    .filter(|r| !crate::paths::expand(r).is_dir())
                     .cloned()
                     .collect();
                 v_flex()

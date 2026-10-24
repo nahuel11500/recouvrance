@@ -898,8 +898,8 @@ impl HelmRelease {
         );
         let (client, shown) = (self.client.clone(), self.release.revision);
         // A fresh private directory: the values may hold secrets.
-        let written =
-            crate::private_files::PrivateDir::create().and_then(|d| Ok((d.write("values.yaml", &values)?, d)));
+        let written = crate::private_files::PrivateDir::create()
+            .and_then(|d| Ok((d.write("values.yaml", values.as_bytes())?, d)));
         let (file, dir) = match written {
             Ok(w) => w,
             Err(e) => {

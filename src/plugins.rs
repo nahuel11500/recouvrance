@@ -63,9 +63,7 @@ struct File {
 }
 
 pub fn path() -> PathBuf {
-    let base = std::env::var_os("XDG_CONFIG_HOME")
-        .map_or_else(|| PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".config"), PathBuf::from);
-    base.join("recouvrance").join("plugins.yaml")
+    crate::paths::config_dir().join("plugins.yaml")
 }
 
 /// All plugins, or the error that kept the file from loading.

@@ -15,6 +15,7 @@ use serde_json::{Value, json};
 
 use crate::k8s::{run, run_abortable};
 use crate::mcp::Hub;
+use crate::private_files::{PrivateDir, TempFile};
 
 /// The one agent: your Claude Code over MCP and the in-app assistant share it.
 pub const AGENT_NAME: &str = "Claude";
@@ -23,18 +24,15 @@ const MAX_STEPS: usize = 16;
 /// Longest one HTTP request may take: a tool call can wait for an approval, then run.
 const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
 
-fn dir() -> PathBuf {
-    let base = std::env::var_os("XDG_CONFIG_HOME")
-        .map_or_else(|| PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".config"), PathBuf::from);
-    base.join("recouvrance")
-}
-
 fn read_secret(name: &str) -> Option<String> {
-    std::fs::read_to_string(dir().join(name)).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+    std::fs::read_to_string(crate::paths::config_dir().join(name))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 fn write_secret(name: &str, value: &str) -> std::io::Result<()> {
-    crate::mcp::write_private(&dir().join(name), value.as_bytes()).map_err(std::io::Error::other)
+    crate::private_files::write_atomic(&crate::paths::config_dir().join(name), value.as_bytes())
 }
 
 /// The API key: saved in Settings, else `ANTHROPIC_API_KEY`.
@@ -44,7 +42,7 @@ pub fn api_key() -> Option<String> {
 
 pub fn save_api_key(key: &str) -> std::io::Result<()> {
     if key.trim().is_empty() {
-        let _ = std::fs::remove_file(dir().join("anthropic-key"));
+        let _ = std::fs::remove_file(crate::paths::config_dir().join("anthropic-key"));
         return Ok(());
     }
     write_secret("anthropic-key", key.trim())
@@ -408,49 +406,7 @@ pub struct Conversation {
     pub messages: Vec<Value>,
     pub session: Option<String>,
     /// Claude Code's working directory, kept for the chat so `--resume` finds its session.
-    work: Option<Arc<WorkDir>>,
-}
-
-/// A private directory (mode 0700, a fresh random name, never a shared one) for Claude
-/// Code to run in; removed when the last conversation holding it is dropped.
-struct WorkDir(PathBuf);
-
-impl WorkDir {
-    fn create() -> std::io::Result<Self> {
-        use std::os::unix::fs::DirBuilderExt as _;
-        let base = std::env::var_os("XDG_RUNTIME_DIR").map_or_else(std::env::temp_dir, PathBuf::from);
-        let path = base.join(format!("recouvrance-assistant-{}", uuid::Uuid::new_v4().simple()));
-        // `create`, not `create_all`: fails rather than reuse a directory someone else made.
-        std::fs::DirBuilder::new().mode(0o700).create(&path)?;
-        Ok(Self(path))
-    }
-}
-
-impl Drop for WorkDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
-/// A file deleted when it goes out of scope, whatever happens in between.
-struct TempFile(PathBuf);
-
-impl TempFile {
-    /// Created new (never an existing file or link), readable by you only.
-    fn create(path: PathBuf, contents: &[u8]) -> std::io::Result<Self> {
-        use std::io::Write as _;
-        use std::os::unix::fs::OpenOptionsExt as _;
-        let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&path)?;
-        let file = Self(path);
-        f.write_all(contents)?;
-        Ok(file)
-    }
-}
-
-impl Drop for TempFile {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
-    }
+    work: Option<Arc<PrivateDir>>,
 }
 
 /// How the assistant reaches Claude.
@@ -464,7 +420,7 @@ pub enum Backend {
 
 /// The `claude` CLI, also where installers put it when PATH misses it (desktop launchers).
 pub fn claude_code() -> Option<PathBuf> {
-    let home = PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
+    let home = crate::paths::home();
     std::env::var_os("PATH")
         .map(|p| std::env::split_paths(&p).collect::<Vec<_>>())
         .unwrap_or_default()
@@ -550,7 +506,7 @@ pub fn investigation(context: &str, kind: &str, namespace: Option<&str>, name: &
 
 /// The team's code folders the assistant may read (Claude Code only): those that exist.
 fn code_dirs() -> Vec<PathBuf> {
-    crate::settings::get().assistant_repos.iter().map(|r| crate::settings::expand(r)).filter(|p| p.is_dir()).collect()
+    crate::settings::get().assistant_repos.iter().map(|r| crate::paths::expand(r)).filter(|p| p.is_dir()).collect()
 }
 
 /// The `claude -p` arguments. The question comes last, after `--`, so one starting with `-`
@@ -611,13 +567,13 @@ async fn ask_claude_code(
         // A private working dir (no project CLAUDE.md) and an MCP config readable only by you.
         let work = match &conv.work {
             Some(w) => w.clone(),
-            None => Arc::new(WorkDir::create().context("creating the assistant's private directory")?),
+            None => Arc::new(PrivateDir::create().context("creating the assistant's private directory")?),
         };
         let cfg = json!({"mcpServers": {"recouvrance": {"type": "http", "url": format!("http://127.0.0.1:{port}/mcp"), "headers": {"Authorization": format!("Bearer {token}")}}}});
-        let cfg_file = TempFile::create(work.0.join(format!("mcp-{}.json", uuid::Uuid::new_v4().simple())), cfg.to_string().as_bytes())?;
+        let cfg_file = TempFile::create(work.path().join(format!("mcp-{}.json", uuid::Uuid::new_v4().simple())), cfg.to_string().as_bytes())?;
         let mut cmd = tokio::process::Command::new(&bin);
-        cmd.current_dir(&work.0)
-            .args(claude_args(&question, &cfg_file.0, &scope, &model, conv.session.as_deref(), &code_dirs()))
+        cmd.current_dir(work.path())
+            .args(claude_args(&question, cfg_file.path(), &scope, &model, conv.session.as_deref(), &code_dirs()))
             // `claude -p` reads a stdin that is not a terminal: give it none.
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
@@ -820,23 +776,5 @@ mod tests {
         assert_eq!(super::rpc_result(sse).unwrap()["tools"][0], 1);
         assert_eq!(super::rpc_result("{\"result\":{\"x\":2}}").unwrap()["x"], 2);
         assert!(super::rpc_result("{\"error\":{\"message\":\"no\"}}").is_err());
-    }
-
-    #[test]
-    fn private_work_dir_and_config() {
-        use std::os::unix::fs::PermissionsExt as _;
-        let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
-        let (a, b) = (super::WorkDir::create().unwrap(), super::WorkDir::create().unwrap());
-        assert_ne!(a.0, b.0);
-        assert_eq!(mode(&a.0), 0o700);
-        let cfg = super::TempFile::create(a.0.join("mcp.json"), b"{}").unwrap();
-        assert_eq!(mode(&cfg.0), 0o600);
-        // Never written through an existing file.
-        assert!(super::TempFile::create(a.0.join("mcp.json"), b"x").is_err());
-        let (dir, file) = (a.0.clone(), cfg.0.clone());
-        drop(cfg);
-        assert!(!file.exists());
-        drop(a);
-        assert!(!dir.exists());
     }
 }

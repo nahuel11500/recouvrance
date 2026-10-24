@@ -7,7 +7,9 @@ use anyhow::{Context as _, Result};
 use kube::config::{KubeConfigOptions, Kubeconfig};
 use kube::{Client, Config};
 
-use super::{added_dir, folder_files, gate, meter, run, tilde};
+use super::{added_dir, folder_files, gate, meter, run};
+use crate::paths::tilde;
+use crate::private_files::{TempFile, save_new};
 
 #[derive(Clone)]
 pub struct Contexts {
@@ -29,13 +31,13 @@ pub fn kubeconfig_files() -> Vec<std::path::PathBuf> {
     let mut files: Vec<std::path::PathBuf> = match std::env::var_os("KUBECONFIG").filter(|v| !v.is_empty()) {
         Some(v) => std::env::split_paths(&v).collect(),
         None => {
-            vec![std::path::PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".kube").join("config")]
+            vec![crate::paths::default_kubeconfig()]
         }
     };
     let st = crate::settings::get();
-    files.extend(st.kubeconfigs.iter().map(|p| crate::settings::expand(p)));
+    files.extend(st.kubeconfigs.iter().map(|p| crate::paths::expand(p)));
     for dir in &st.kubeconfig_folders {
-        files.extend(folder_files(&crate::settings::expand(dir)));
+        files.extend(folder_files(&crate::paths::expand(dir)));
     }
     // Kubeconfigs pasted in Settings.
     files.extend(folder_files(&added_dir()));
@@ -192,7 +194,7 @@ fn read_kubeconfig() -> Result<(Kubeconfig, bool)> {
         .collect();
     let kept = crate::settings::with(|s| s.context_files.clone());
     let mut owners = kept.clone();
-    let now = name_owners(&mut owners, &names, |f| crate::settings::expand(f).exists(), |f| settled.contains(f));
+    let now = name_owners(&mut owners, &names, |f| crate::paths::expand(f).exists(), |f| settled.contains(f));
     // A name kept for a file read without it: read again to settle it.
     let settled = !owners
         .iter()
@@ -473,28 +475,11 @@ fn exec_lock(cmd: String) -> Arc<tokio::sync::Mutex<()>> {
     LOCKS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).entry(cmd).or_default().clone()
 }
 
-/// A private kubeconfig file, removed when this is dropped: keep it alive as long
-/// as the process using it (dropping the task that owns it removes it too).
-pub struct PrivateKubeconfig(std::path::PathBuf);
-
-impl PrivateKubeconfig {
-    pub fn path(&self) -> &std::path::Path {
-        &self.0
-    }
-}
-
-impl Drop for PrivateKubeconfig {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
-    }
-}
-
 /// A copy of the merged kubeconfig with `context` (and `namespace`) selected,
 /// readable only by the user, for tools run on this machine (shell, helm).
-/// Each call gets its own file, so concurrent uses never share or overwrite one.
-pub fn private_kubeconfig(context: &str, namespace: Option<&str>, purpose: &str) -> Result<PrivateKubeconfig> {
-    use std::io::Write as _;
-    use std::os::unix::fs::OpenOptionsExt as _;
+/// Each call gets its own file, so concurrent uses never share or overwrite one. It is
+/// removed when dropped: keep it alive as long as the process using it.
+pub fn private_kubeconfig(context: &str, namespace: Option<&str>, purpose: &str) -> Result<TempFile> {
     let mut kc = kubeconfig()?;
     kc.current_context = Some(context.to_string());
     // Only this context, its cluster and its user: a plugin or helm never sees other clusters' credentials.
@@ -514,13 +499,7 @@ pub fn private_kubeconfig(context: &str, namespace: Option<&str>, purpose: &str)
             }
         }
     }
-    let dir = std::env::var_os("XDG_RUNTIME_DIR").map_or_else(std::env::temp_dir, std::path::PathBuf::from);
-    let path = dir.join(format!("recouvrance-{}-{purpose}-{}.yaml", std::process::id(), uuid::Uuid::new_v4().simple()));
-    // create_new: never follow or reuse a file someone else put there.
-    let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&path)?;
-    let guard = PrivateKubeconfig(path);
-    f.write_all(crate::yaml::to_string(&kc)?.as_bytes())?;
-    Ok(guard)
+    Ok(TempFile::in_runtime_dir(purpose, "yaml", crate::yaml::to_string(&kc)?.as_bytes())?)
 }
 
 /// Longest ServiceAccount token lifetime handed out, in hours.
@@ -530,26 +509,6 @@ pub const MAX_TOKEN_HOURS: i64 = 24;
 /// (EKS context names hold `:` and `/`; `../` must not leave the folder).
 pub fn safe_file_part(s: &str) -> String {
     s.chars().map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') { c } else { '_' }).collect()
-}
-
-/// Create `<stem>.<ext>` in `dir`, readable only by the user, never overwriting: an
-/// existing name gets `-1`, `-2`, … appended.
-pub fn create_private_file(dir: &std::path::Path, stem: &str, ext: &str, bytes: &[u8]) -> Result<std::path::PathBuf> {
-    use std::io::Write as _;
-    use std::os::unix::fs::OpenOptionsExt as _;
-    for i in 0..1000 {
-        let name = if i == 0 { format!("{stem}.{ext}") } else { format!("{stem}-{i}.{ext}") };
-        let path = dir.join(name);
-        match std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&path) {
-            Ok(mut f) => {
-                f.write_all(bytes)?;
-                return Ok(path);
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(e) => return Err(e.into()),
-        }
-    }
-    anyhow::bail!("too many files named {stem}.{ext} in {}", dir.display())
 }
 
 /// A kubeconfig that authenticates as a ServiceAccount, with a token from the
@@ -594,10 +553,8 @@ pub async fn service_account_kubeconfig(
         "contexts": [{"name": name, "context": {"cluster": name, "user": name, "namespace": ns}}],
         "current-context": name,
     });
-    let dir = std::path::PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join("Downloads");
-    std::fs::create_dir_all(&dir)?;
     let stem = format!("kubeconfig-{}", safe_file_part(&name));
-    create_private_file(&dir, &stem, "yaml", crate::yaml::to_string(&config)?.as_bytes())
+    Ok(save_new(&crate::paths::downloads_dir(), &stem, "yaml", crate::yaml::to_string(&config)?.as_bytes())?)
 }
 
 /// A kubeconfig cluster entry that works on its own: the CA inlined, the TLS and proxy
@@ -654,16 +611,6 @@ mod kubeconfig_tests {
             "arn_aws_eks_eu-west-1_123_cluster_prod"
         );
         assert_eq!(super::safe_file_part("../../.ssh/x"), ".._.._.ssh_x");
-        let dir = std::env::temp_dir().join(format!("recouvrance-test-{}", uuid::Uuid::new_v4().simple()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let a = super::create_private_file(&dir, "k", "yaml", b"a").unwrap();
-        let b = super::create_private_file(&dir, "k", "yaml", b"b").unwrap();
-        assert_eq!(a.file_name().unwrap(), "k.yaml");
-        assert_eq!(b.file_name().unwrap(), "k-1.yaml");
-        assert_eq!(std::fs::read(&a).unwrap(), b"a");
-        use std::os::unix::fs::PermissionsExt as _;
-        assert_eq!(std::fs::metadata(&b).unwrap().permissions().mode() & 0o777, 0o600);
-        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

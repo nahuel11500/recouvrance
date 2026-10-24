@@ -64,7 +64,7 @@ const BUILTIN: &[(&str, &str)] = &[
 ];
 
 pub fn folder() -> PathBuf {
-    crate::mcp::config_dir().join("templates")
+    crate::paths::config_dir().join("templates")
 }
 
 /// Put the namespace into a template: every `${NAMESPACE}`, and (for templates written
