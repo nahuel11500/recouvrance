@@ -117,7 +117,7 @@ mod tests {
     }
 
     #[test]
-    fn badge_shows_criticals_first() {
+    fn badge_shows_critical_problems_first() {
         let badge = |counts| ProblemBadge { counts, ..ProblemBadge::default() };
         assert_eq!(badge(None).shown(), None);
         assert_eq!(badge(Some((0, 0))).shown(), None);
