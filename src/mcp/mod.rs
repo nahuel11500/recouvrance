@@ -875,26 +875,30 @@ impl Hub {
     pub fn apply_rules_file(&self) -> Result<bool> {
         let path = rules_file::path();
         self.rules_file_present.store(path.exists(), Ordering::Relaxed);
-        let loaded = rules_file::read(&path).and_then(|text| {
-            *lock(&self.rules_text) = text.clone();
-            text.map(|t| rules_file::check(&t)).transpose()
-        });
-        let file = match loaded {
-            Ok(Some(f)) => f,
-            Ok(None) => {
-                *lock(&self.rules_error) = None;
-                // No file, so no agent missing from it: a file made later is read as it is.
-                write(&self.config).version = CONFIG_VERSION;
-                return Ok(false);
-            }
-            Err(e) => {
-                *lock(&self.rules_error) = Some(format!("{e:#}"));
-                self.emit(HubEvent::AgentSeen);
-                return Err(e);
-            }
-        };
         {
+            // Read and apply under the config lock: an edit in the app, which writes the file
+            // under it, can't land between the two and leave the file and the rules in force
+            // different.
             let mut cfg = write(&self.config);
+            let loaded = rules_file::read(&path).and_then(|text| {
+                *lock(&self.rules_text) = text.clone();
+                text.map(|t| rules_file::check(&t)).transpose()
+            });
+            let file = match loaded {
+                Ok(Some(f)) => f,
+                Ok(None) => {
+                    *lock(&self.rules_error) = None;
+                    // No file, so no agent missing from it: a file made later is read as it is.
+                    cfg.version = CONFIG_VERSION;
+                    return Ok(false);
+                }
+                Err(e) => {
+                    *lock(&self.rules_error) = Some(format!("{e:#}"));
+                    drop(cfg);
+                    self.emit(HubEvent::AgentSeen);
+                    return Err(e);
+                }
+            };
             // A section could not say which of two agents with its name it is for.
             if let Some(name) = rules_file::shared_name(&cfg.agents) {
                 let e = anyhow::anyhow!("two agents are named `{name}`: delete one");
