@@ -9,7 +9,7 @@ use serde::de::DeserializeOwned;
 pub use serde_saphyr::Error;
 
 /// Only `true`/`false` are booleans: `yes`, `no`, `on`, `off` stay strings, as they did
-/// with serde_yaml_ng (YAML 1.2), so a ConfigMap value `"yes"` survives an edit.
+/// with `serde_yaml_ng` (YAML 1.2), so a ConfigMap value `"yes"` survives an edit.
 /// A number with a leading zero is octal, as kubectl reads it: `defaultMode: 0400` is 256.
 fn options() -> serde_saphyr::Options {
     serde_saphyr::options! { strict_booleans: true, legacy_octal_numbers: true }

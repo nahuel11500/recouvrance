@@ -438,9 +438,7 @@ pub fn revisions(ctx: &Ctx, cx: &App) -> AnyElement {
             .when(selected, |d| d.bg(theme.list_active))
             .child(div().w(px(70.)).child(format!("{}{}", rev(r), if i == 0 { " (current)" } else { "" })))
             .child(div().w(px(380.)).child(ctx.link(name.clone(), rs_kind, &name, cx)))
-            .child(
-                div().w(px(70.)).child(n(r, "/status/replicas").map(|n| n.to_string()).unwrap_or_else(|| "-".into())),
-            )
+            .child(div().w(px(70.)).child(n(r, "/status/replicas").map_or_else(|| "-".into(), |n| n.to_string())))
             .child(
                 div()
                     .w(px(340.))
@@ -506,7 +504,7 @@ pub fn revisions(ctx: &Ctx, cx: &App) -> AnyElement {
                             lines.push(
                                 h_flex()
                                     .px_2()
-                                    .when_some(bg, |d, bg| d.bg(bg))
+                                    .when_some(bg, Styled::bg)
                                     .text_color(fg)
                                     .child(div().w(px(16.)).child(sign))
                                     .child(div().whitespace_nowrap().child(change.value().trim_end().to_string()))
@@ -608,7 +606,7 @@ pub(super) fn hpa(ctx: &Ctx, cx: &App) -> Div {
             .border_color(theme.border)
             .child(div().w(px(120.)).text_color(theme.muted_foreground).child(kind.to_string()))
             .child(div().w(px(260.)).child(name))
-            .child(div().w(px(120.)).child(current.clone()))
+            .child(div().w(px(120.)).child(current))
             .child(div().w(px(120.)).text_color(theme.muted_foreground).child(format!("target {target}")))
     });
     v_flex()
@@ -709,10 +707,10 @@ pub(super) fn pdb_page(ctx: &Ctx, cx: &App) -> Div {
     let blocks = pdb_blocks(obj);
     let budget = obj
         .pointer("/spec/minAvailable")
-        .map(|v| format!("min available {}", v.as_str().map(String::from).unwrap_or_else(|| v.to_string())))
+        .map(|v| format!("min available {}", v.as_str().map_or_else(|| v.to_string(), String::from)))
         .or_else(|| {
             obj.pointer("/spec/maxUnavailable")
-                .map(|v| format!("max unavailable {}", v.as_str().map(String::from).unwrap_or_else(|| v.to_string())))
+                .map(|v| format!("max unavailable {}", v.as_str().map_or_else(|| v.to_string(), String::from)))
         })
         .unwrap_or_else(|| "-".into());
     v_flex()
@@ -836,7 +834,7 @@ pub(super) fn vpa_page(ctx: &Ctx, cx: &App) -> Div {
                 .pt_4()
                 .child(field(
                     "Target",
-                    h_flex().gap_1().child(tkind.clone()).child(ctx.link(tname.clone(), &plural, &tname, cx)),
+                    h_flex().gap_1().child(tkind).child(ctx.link(tname.clone(), &plural, &tname, cx)),
                     cx,
                 ))
                 .child(field("Update mode", s(obj, "/spec/updatePolicy/updateMode").unwrap_or("Auto").to_string(), cx))

@@ -64,7 +64,7 @@ pub fn create_new_in(dir: &Path, name: &str) -> std::io::Result<(std::fs::File, 
         let path = dir.join(numbered(name, n));
         match create_private(&path) {
             Ok(f) => return Ok((f, path)),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(e) => return Err(e),
         }
     }

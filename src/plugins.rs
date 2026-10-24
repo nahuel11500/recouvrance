@@ -26,7 +26,7 @@ use std::path::PathBuf;
 
 use serde::Deserialize;
 
-#[derive(Deserialize, Clone, Debug, Default, PartialEq)]
+#[derive(Deserialize, Clone, Debug, Default, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum Mode {
     /// Run in a terminal page (interactive tools, streaming output).
@@ -64,8 +64,7 @@ struct File {
 
 pub fn path() -> PathBuf {
     let base = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".config"));
+        .map_or_else(|| PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".config"), PathBuf::from);
     base.join("recouvrance").join("plugins.yaml")
 }
 

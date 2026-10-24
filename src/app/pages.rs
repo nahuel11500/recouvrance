@@ -71,7 +71,7 @@ impl AppView {
             p
         });
         cx.subscribe_in(&panel, window, |this, _, ev: &crate::plugins::RunPlugin, window, cx| {
-            this.run_plugin(ev, window, cx)
+            this.run_plugin(ev, window, cx);
         })
         .detach();
         cx.subscribe_in(&panel, window, move |this, _, ev: &crate::details::Investigate, window, cx| {
@@ -204,15 +204,12 @@ impl AppView {
     /// One assistant chat per window, kept across navigation.
     pub(super) fn open_assistant(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let scope = self.assistant_scope();
-        let page = match self.assistant_page() {
-            Some(p) => {
-                p.update(cx, |p, cx| p.set_scope(scope, cx));
-                p
-            }
-            None => {
-                let hub = self.hub.clone();
-                cx.new(|cx| crate::ui::assistant_view::AssistantView::new(hub, scope, window, cx))
-            }
+        let page = if let Some(p) = self.assistant_page() {
+            p.update(cx, |p, cx| p.set_scope(scope, cx));
+            p
+        } else {
+            let hub = self.hub.clone();
+            cx.new(|cx| crate::ui::assistant_view::AssistantView::new(hub, scope, window, cx))
         };
         self.navigate(Route::Assistant(page), cx);
     }
@@ -293,13 +290,12 @@ impl AppView {
     pub(super) fn open_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some((context, client)) = self.clusters.first().cloned() else { return };
         let ns = self.namespace.clone();
-        let term = match self.terminals.get(&context) {
-            Some(t) => t.clone(),
-            None => {
-                let t = cx.new(|cx| crate::ui::terminal::TerminalView::local(client, context.clone(), ns, window, cx));
-                self.terminals.insert(context, t.clone());
-                t
-            }
+        let term = if let Some(t) = self.terminals.get(&context) {
+            t.clone()
+        } else {
+            let t = cx.new(|cx| crate::ui::terminal::TerminalView::local(client, context.clone(), ns, window, cx));
+            self.terminals.insert(context, t.clone());
+            t
         };
         term.update(cx, |t, cx| t.focus(window, cx));
         self.navigate(Route::Terminal(term), cx);
@@ -330,7 +326,7 @@ impl AppView {
         })
         .detach();
         cx.subscribe_in(list, window, |this, _, _: &crate::ui::helm::OpenInstall, window, cx| {
-            this.open_helm_install(window, cx)
+            this.open_helm_install(window, cx);
         })
         .detach();
     }

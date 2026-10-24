@@ -48,15 +48,12 @@ fn full_access(rules: &Rules) -> bool {
 
 /// Whether any rule (with no name restriction) allows `verb` on `resource` ("pods", "deployments.apps", "pods/log").
 pub fn allows(rules: &Rules, verb: &str, resource: &str) -> bool {
-    let (res, group) = match resource.split_once('/') {
-        Some((r, sub)) => {
-            let (base, group) = r.split_once('.').unwrap_or((r, ""));
-            (format!("{base}/{sub}"), group.to_string())
-        }
-        None => {
-            let (base, group) = resource.split_once('.').unwrap_or((resource, ""));
-            (base.to_string(), group.to_string())
-        }
+    let (res, group) = if let Some((r, sub)) = resource.split_once('/') {
+        let (base, group) = r.split_once('.').unwrap_or((r, ""));
+        (format!("{base}/{sub}"), group.to_string())
+    } else {
+        let (base, group) = resource.split_once('.').unwrap_or((resource, ""));
+        (base.to_string(), group.to_string())
     };
     let sub = res.split_once('/').map(|(_, s)| s);
     rules.iter().filter(|(_, _, names)| names.is_empty()).any(|(verbs, resources, _)| {
@@ -165,7 +162,7 @@ impl AccessView {
             let _ = this.update(cx, |this, cx| {
                 this.incomplete = incomplete;
                 this.rules = Some(rules.map(|mut r| {
-                    for (v, res, n) in r.iter_mut() {
+                    for (v, res, n) in &mut r {
                         v.sort();
                         res.sort();
                         n.sort();
@@ -495,14 +492,14 @@ mod tests {
         assert_eq!(resolve("", "deployments"), ("apps".into(), "deployments".into()));
         assert_eq!(resolve("", "deploy"), ("apps".into(), "deployments".into()));
         assert_eq!(resolve("", "deploy/scale"), ("apps".into(), "deployments/scale".into()));
-        assert_eq!(resolve("", "po"), ("".into(), "pods".into()));
-        assert_eq!(resolve("", "pods/log"), ("".into(), "pods/log".into()));
+        assert_eq!(resolve("", "po"), (String::new(), "pods".into()));
+        assert_eq!(resolve("", "pods/log"), (String::new(), "pods/log".into()));
         // The core resource wins over a group with the same plural.
-        assert_eq!(resolve("", "events"), ("".into(), "events".into()));
+        assert_eq!(resolve("", "events"), (String::new(), "events".into()));
         // A group given, or a name discovery doesn't know, stays as typed.
         assert_eq!(resolve("example.com", "deployments"), ("example.com".into(), "deployments".into()));
-        assert_eq!(resolve("", "widgets"), ("".into(), "widgets".into()));
-        assert_eq!(resolve("", "*"), ("".into(), "*".into()));
+        assert_eq!(resolve("", "widgets"), (String::new(), "widgets".into()));
+        assert_eq!(resolve("", "*"), (String::new(), "*".into()));
     }
 
     #[test]

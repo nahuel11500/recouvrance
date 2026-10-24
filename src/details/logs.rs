@@ -2,7 +2,7 @@
 
 use futures::StreamExt as _;
 use gpui_kit::assets::IconName as Lucide;
-use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::notification::Notification;
@@ -124,7 +124,7 @@ impl LogsView {
         let find = cx.new(|cx| InputState::new(window, cx).placeholder("Find…"));
         let subs = vec![
             cx.subscribe_in(&search, window, |this, _, ev: &InputEvent, _, cx| {
-                if let InputEvent::Change = ev {
+                if matches!(ev, InputEvent::Change) {
                     this.recompute_matches(cx);
                 }
             }),
@@ -499,43 +499,38 @@ impl LogsView {
             Some(Level::Warn) => Some(theme.warning),
             _ => None,
         };
-        let text: AnyElement = match self.pretty_json.then(|| l.readable()).flatten() {
-            Some((line, fields_at)) => {
-                let mut highlights = Vec::new();
-                if let Some(c) = base {
-                    highlights.push((0..fields_at, HighlightStyle { color: Some(c), ..Default::default() }));
-                }
-                // Keys in blue.
-                let mut pos = fields_at;
-                for part in line[fields_at..].split(' ') {
-                    if let Some(eq) = part.find('=') {
-                        highlights.push((
-                            pos..pos + eq + 1,
-                            HighlightStyle { color: Some(theme.blue), ..Default::default() },
-                        ));
-                    }
-                    pos += part.len() + 1;
-                }
-                let found = self.find_highlights(line, i, cx);
-                StyledText::new(line.clone()).with_highlights(merge_highlights(highlights, found)).into_any_element()
+        let text: AnyElement = if let Some((line, fields_at)) = self.pretty_json.then(|| l.readable()).flatten() {
+            let mut highlights = Vec::new();
+            if let Some(c) = base {
+                highlights.push((0..fields_at, HighlightStyle { color: Some(c), ..Default::default() }));
             }
-            None => {
-                let found = self.find_highlights(&l.text, i, cx);
-                if found.is_empty() {
-                    div().when_some(base, |d, c| d.text_color(c)).child(l.text.clone()).into_any_element()
-                } else {
-                    div()
-                        .when_some(base, |d, c| d.text_color(c))
-                        .child(StyledText::new(l.text.clone()).with_highlights(found))
-                        .into_any_element()
+            // Keys in blue.
+            let mut pos = fields_at;
+            for part in line[fields_at..].split(' ') {
+                if let Some(eq) = part.find('=') {
+                    highlights
+                        .push((pos..pos + eq + 1, HighlightStyle { color: Some(theme.blue), ..Default::default() }));
                 }
+                pos += part.len() + 1;
+            }
+            let found = self.find_highlights(line, i, cx);
+            StyledText::new(line.clone()).with_highlights(merge_highlights(highlights, found)).into_any_element()
+        } else {
+            let found = self.find_highlights(&l.text, i, cx);
+            if found.is_empty() {
+                div().when_some(base, Styled::text_color).child(l.text.clone()).into_any_element()
+            } else {
+                div()
+                    .when_some(base, Styled::text_color)
+                    .child(StyledText::new(l.text.clone()).with_highlights(found))
+                    .into_any_element()
             }
         };
         h_flex()
             .id(i)
             .gap_2()
             .items_start()
-            .when(!self.wrap, |d| d.whitespace_nowrap())
+            .when(!self.wrap, Styled::whitespace_nowrap)
             .when(crate::settings::get().log_timestamps, |d| {
                 d.child(div().w(px(56.)).flex_shrink_0().text_color(theme.muted_foreground).child(time))
             })
@@ -643,7 +638,7 @@ impl LogsView {
         let followed = self.pods.len();
         let capped = (self.left_out > 0).then(|| format!("Following {followed} of {} pods", followed + self.left_out));
         let parts: Vec<String> =
-            [capped, stream_status(&self.pods, &self.pod_states), self.status.as_ref().map(|s| s.to_string())]
+            [capped, stream_status(&self.pods, &self.pod_states), self.status.as_ref().map(ToString::to_string)]
                 .into_iter()
                 .flatten()
                 .collect();
@@ -756,8 +751,8 @@ impl Render for LogsView {
                             Button::new(("lvl", i))
                                 .xsmall()
                                 .label(label)
-                                .when(self.min_level == lv, |b| b.primary())
-                                .when(self.min_level != lv, |b| b.ghost())
+                                .when(self.min_level == lv, ButtonVariants::primary)
+                                .when(self.min_level != lv, ButtonVariants::ghost)
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.min_level = lv;
                                     this.recompute_matches(cx);
@@ -770,8 +765,8 @@ impl Render for LogsView {
                         Button::new(("since", i))
                             .xsmall()
                             .label(label)
-                            .when(self.since == secs, |b| b.primary())
-                            .when(self.since != secs, |b| b.ghost())
+                            .when(self.since == secs, ButtonVariants::primary)
+                            .when(self.since != secs, ButtonVariants::ghost)
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.since = secs;
                                 this.restart(cx);
@@ -790,8 +785,8 @@ impl Render for LogsView {
                             .xsmall()
                             .label("Aa")
                             .tooltip("Match case")
-                            .when(self.find_case, |b| b.primary())
-                            .when(!self.find_case, |b| b.ghost())
+                            .when(self.find_case, ButtonVariants::primary)
+                            .when(!self.find_case, ButtonVariants::ghost)
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.find_case = !this.find_case;
                                 this.compile_find(cx);
@@ -802,8 +797,8 @@ impl Render for LogsView {
                             .xsmall()
                             .label(".*")
                             .tooltip("Regular expression")
-                            .when(self.find_regex, |b| b.primary())
-                            .when(!self.find_regex, |b| b.ghost())
+                            .when(self.find_regex, ButtonVariants::primary)
+                            .when(!self.find_regex, ButtonVariants::ghost)
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.find_regex = !this.find_regex;
                                 this.compile_find(cx);
@@ -852,8 +847,7 @@ impl Render for LogsView {
                             d.child(
                                 list(self.wrap_list.clone(), move |i, _, cx| {
                                     this.upgrade()
-                                        .map(|t| t.read(cx).render_line(i, cx))
-                                        .unwrap_or_else(|| div().into_any_element())
+                                        .map_or_else(|| div().into_any_element(), |t| t.read(cx).render_line(i, cx))
                                 })
                                 .size_full(),
                             )

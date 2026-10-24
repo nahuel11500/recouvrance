@@ -6,7 +6,7 @@
 use crate::glob::glob;
 use crate::quantity::{parse_bytes, parse_cpu};
 
-#[derive(Clone, Copy, PartialEq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Op {
     Glob,
     Gt,

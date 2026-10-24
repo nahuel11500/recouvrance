@@ -79,11 +79,7 @@ fn find_doc(text: &str, doc: &Value) -> Result<(usize, Value), String> {
         .map(|(i, (a, b))| (i, a, b, parse_first(&lines[a..b].join("\n"))))
         .filter(|(_, _, _, v)| identity(v) == want);
     let describe = || {
-        format!(
-            "{} {}",
-            want.1.unwrap_or_default(),
-            want.2.map(|n| format!("`{n}`")).unwrap_or_else(|| "(no name)".into())
-        )
+        format!("{} {}", want.1.unwrap_or_default(), want.2.map_or_else(|| "(no name)".into(), |n| format!("`{n}`")))
     };
     match (hits.next(), hits.next()) {
         (Some((i, a, b, v)), None) => {
@@ -156,11 +152,9 @@ fn scalar_text(v: Option<&Value>) -> String {
     match v {
         None | Some(Value::Null) => String::new(),
         Some(Value::String(s)) => s.clone(),
-        Some(Value::Array(a)) => a
-            .iter()
-            .map(|x| x.as_str().map(String::from).unwrap_or_else(|| x.to_string()))
-            .collect::<Vec<_>>()
-            .join("\n"),
+        Some(Value::Array(a)) => {
+            a.iter().map(|x| x.as_str().map_or_else(|| x.to_string(), String::from)).collect::<Vec<_>>().join("\n")
+        }
         Some(v) => v.to_string(),
     }
 }
@@ -174,22 +168,22 @@ fn typed(type_name: &str, text: &str) -> Option<Value> {
     Some(match type_name {
         // A multi-line string (a script, a query) is kept exactly, final line break included.
         "string" if text.contains('\n') => text.into(),
-        "integer" => t.parse::<i64>().map(Value::from).unwrap_or_else(|_| t.into()),
-        "number" => t.parse::<f64>().map(Value::from).unwrap_or_else(|_| t.into()),
+        "integer" => t.parse::<i64>().map_or_else(|_| t.into(), Value::from),
+        "number" => t.parse::<f64>().map_or_else(|_| t.into(), Value::from),
         // Anything else is kept as typed, for the server to refuse.
         "boolean" => match t.to_ascii_lowercase().as_str() {
             "true" | "yes" | "on" | "1" => Value::Bool(true),
             "false" | "no" | "off" | "0" => Value::Bool(false),
             _ => t.into(),
         },
-        "int-or-string" => t.parse::<i64>().map(Value::from).unwrap_or_else(|_| t.into()),
+        "int-or-string" => t.parse::<i64>().map_or_else(|_| t.into(), Value::from),
         // One item per line, so items may contain commas.
         "[]string" => Value::Array(t.lines().map(str::trim).filter(|s| !s.is_empty()).map(Value::from).collect()),
         "[]integer" => Value::Array(
             t.lines()
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
-                .map(|s| s.parse::<i64>().map(Value::from).unwrap_or_else(|_| s.into()))
+                .map(|s| s.parse::<i64>().map_or_else(|_| s.into(), Value::from))
                 .collect(),
         ),
         _ => t.into(),
@@ -432,9 +426,9 @@ impl SchemaForm {
         let Some(&(a, b)) = ranges.get(self.doc_ix) else { return };
         let lines: Vec<&str> = text.lines().collect();
         let yaml = crate::yaml::to_string(&self.doc).unwrap_or_default();
-        let mut out: Vec<String> = lines[..a].iter().map(|s| s.to_string()).collect();
+        let mut out: Vec<String> = lines[..a].iter().map(ToString::to_string).collect();
         out.extend(yaml.trim_end().lines().map(String::from));
-        out.extend(lines[b..].iter().map(|s| s.to_string()));
+        out.extend(lines[b..].iter().map(ToString::to_string));
         let joined = out.join("\n") + "\n";
         self.editor.update(cx, |e, cx| e.set_value(joined, window, cx));
     }
@@ -445,7 +439,7 @@ impl Render for SchemaForm {
         let theme = cx.theme().clone();
         let muted = theme.muted_foreground;
         let can_write = matches!(self.schema, Some(Ok(_))) && !self.rows.is_empty();
-        let kind = self.kind.as_ref().map(|k| k.1.clone()).unwrap_or_else(|| "?".into());
+        let kind = self.kind.as_ref().map_or_else(|| "?".into(), |k| k.1.clone());
         let mut crumbs = vec![(kind, Vec::new())];
         for i in 0..self.path.len() {
             crumbs.push((self.path[i].clone(), self.path[..=i].to_vec()));
@@ -529,8 +523,7 @@ impl Render for SchemaForm {
                                         .doc
                                         .pointer(&format!("{}/name", pointer(&path)))
                                         .and_then(Value::as_str)
-                                        .map(String::from)
-                                        .unwrap_or_else(|| format!("#{ix}"));
+                                        .map_or_else(|| format!("#{ix}"), String::from);
                                     div()
                                         .id(SharedString::from(format!("item-{i}-{ix}")))
                                         .text_sm()
@@ -649,7 +642,7 @@ mod tests {
     #[test]
     fn adds_to_missing_or_empty_lists() {
         use super::add_list_item;
-        let path = |p: &[&str]| p.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let path = |p: &[&str]| p.iter().map(ToString::to_string).collect::<Vec<_>>();
         // `env:` and `containers: ~` are null lists.
         let mut doc = serde_json::json!({"spec": {"containers": null, "env": [{"name": "a"}]}});
         assert_eq!(add_list_item(&mut doc, &path(&["spec"]), "containers"), Ok(0));

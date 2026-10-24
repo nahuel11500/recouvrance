@@ -249,7 +249,7 @@ fn url_escape(s: &str) -> String {
 }
 
 /// Which pods an object selects, as a list request would ask for them.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Selection {
     /// None at all (no selector, an empty Service selector, an operator we can't read).
     Nothing,
@@ -263,14 +263,14 @@ impl Selection {
     /// The label selector to list with: `Some(None)` lists every pod, `None` lists none.
     pub fn list_selector(&self) -> Option<Option<String>> {
         match self {
-            Selection::Nothing => None,
-            Selection::Everything => Some(None),
-            Selection::Labels(s) => Some(Some(s.clone())),
+            Self::Nothing => None,
+            Self::Everything => Some(None),
+            Self::Labels(s) => Some(Some(s.clone())),
         }
     }
 }
 
-/// A LabelSelector (`matchLabels` and `matchExpressions`) in the API server's selector syntax.
+/// A `LabelSelector` (`matchLabels` and `matchExpressions`) in the API server's selector syntax.
 /// A missing or null selector selects nothing; an empty one everything when `empty_is_all`.
 /// An operator this doesn't know selects nothing, rather than more than it should.
 pub fn label_selection(selector: Option<&serde_json::Value>, empty_is_all: bool) -> Selection {

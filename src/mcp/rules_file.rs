@@ -260,19 +260,18 @@ pub fn apply(rules: &AgentRules, p: &mut Policy) -> Result<()> {
 /// from before 0.3.0, which created agents without a section) those keep their rules.
 pub fn apply_file(file: &RulesFile, agents: &mut Vec<super::Agent>, keep_unnamed: bool) -> Result<()> {
     for (name, rules) in &file.agents {
-        let agent = match agents.iter().position(|a| a.name == *name) {
-            Some(i) => &mut agents[i],
-            None => {
-                // Its token is issued in the app ("New token").
-                agents.push(super::Agent {
-                    id: uuid::Uuid::new_v4().simple().to_string()[..12].to_string(),
-                    name: name.clone(),
-                    token_sha256: String::new(),
-                    enabled: true,
-                    policy: Policy::default(),
-                });
-                agents.last_mut().context("agent just added")?
-            }
+        let agent = if let Some(i) = agents.iter().position(|a| a.name == *name) {
+            &mut agents[i]
+        } else {
+            // Its token is issued in the app ("New token").
+            agents.push(super::Agent {
+                id: uuid::Uuid::new_v4().simple().to_string()[..12].to_string(),
+                name: name.clone(),
+                token_sha256: String::new(),
+                enabled: true,
+                policy: Policy::default(),
+            });
+            agents.last_mut().context("agent just added")?
         };
         apply(rules, &mut agent.policy).with_context(|| format!("agent `{name}`"))?;
     }
@@ -353,7 +352,7 @@ mod tests {
         assert_eq!(r.contexts, ["staging", "dev"]);
         let r = parse_rule(Mode::Deny, "* secrets").unwrap();
         assert_eq!(
-            (r.namespaces.clone(), r.contexts.clone(), r.names.clone()),
+            (r.namespaces.clone(), r.contexts.clone(), r.names),
             (vec!["*".to_string()], vec!["*".to_string()], vec!["*".to_string()])
         );
         let r = parse_rule(Mode::Deny, "exec pods until 2026-11-01").unwrap();

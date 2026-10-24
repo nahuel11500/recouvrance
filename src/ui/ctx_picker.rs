@@ -32,7 +32,7 @@ impl ContextPicker {
     pub fn new(all: Vec<String>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let search = cx.new(|cx| InputState::new(window, cx).placeholder("Search contexts"));
         let subs = vec![cx.subscribe(&search, |_, _, ev: &InputEvent, cx| {
-            if let InputEvent::Change = ev {
+            if matches!(ev, InputEvent::Change) {
                 cx.notify();
             }
         })];
@@ -55,7 +55,7 @@ impl ContextPicker {
     fn row(&self, i: usize, name: &str, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme();
         let color: Hsla =
-            crate::settings::context_color(name).map(|c| rgb(c).into()).unwrap_or(theme.muted_foreground.opacity(0.4));
+            crate::settings::context_color(name).map_or(theme.muted_foreground.opacity(0.4), |c| rgb(c).into());
         let protected = crate::settings::is_protected(name);
         let connected = self.connected.iter().any(|c| c == name);
         let (n1, n2) = (name.to_string(), name.to_string());

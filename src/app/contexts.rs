@@ -132,7 +132,7 @@ impl AppView {
                         }
                         this.client = Some(client);
                         this.clusters = clusters;
-                        let keep = this.kind.as_ref().map(|k| k.key());
+                        let keep = this.kind.as_ref().map(Kind::key);
                         let wanted = dev_var("RECOUVRANCE_KIND").and_then(|q| k8s::find_kind(&kinds, &q).cloned());
                         this.kind = wanted
                             .or_else(|| keep.and_then(|key| kinds.iter().find(|k| k.key() == key).cloned()))
@@ -371,7 +371,7 @@ mod tests {
     fn kind(k: &str) -> Kind {
         Kind {
             ar: kube::discovery::ApiResource {
-                group: "".into(),
+                group: String::new(),
                 version: "v1".into(),
                 api_version: "v1".into(),
                 kind: k.into(),
@@ -424,7 +424,7 @@ mod tests {
     }
 
     fn v(list: &[&str]) -> Vec<String> {
-        list.iter().map(|s| s.to_string()).collect()
+        list.iter().map(ToString::to_string).collect()
     }
 
     #[test]

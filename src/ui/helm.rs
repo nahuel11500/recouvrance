@@ -428,7 +428,7 @@ impl HelmList {
         let multi = clusters.len() > 1;
         let filter = cx.new(|cx| InputState::new(window, cx).placeholder("Filter releases…"));
         let subs = vec![cx.subscribe(&filter, |_, _, ev: &InputEvent, cx| {
-            if let InputEvent::Change = ev {
+            if matches!(ev, InputEvent::Change) {
                 cx.notify();
             }
         })];
@@ -438,7 +438,9 @@ impl HelmList {
                 let (ctx, client, ns) = (ctx.clone(), client.clone(), namespace.clone());
                 async move {
                     let rels = list_releases(client, ns).await.map(|mut rels| {
-                        rels.iter_mut().for_each(|r| r.context = ctx.clone());
+                        for r in &mut rels {
+                            r.context = ctx.clone();
+                        }
                         rels
                     });
                     (ctx, rels)
@@ -809,7 +811,7 @@ impl HelmRelease {
             async move {
                 // `--` everywhere: names from the cluster are never read as flags.
                 let args = ["search", "repo", "--version", &version, "-o", "json", "--", &chart];
-                k8s::helm(context, args.iter().map(|a| a.to_string()).collect()).await.map(|o| chart_refs(&o, &chart))
+                k8s::helm(context, args.iter().map(ToString::to_string).collect()).await.map(|o| chart_refs(&o, &chart))
             }
         };
         // A newer upgrade (a dry run then the real one, or back) replaces this lookup.
@@ -920,7 +922,7 @@ impl HelmRelease {
             if let Some(why) = stale {
                 drop(dir);
                 let _ = this.update_in(cx, |_, window, cx| {
-                    window.push_notification(Notification::error(format!("helm upgrade refused: {why}")), cx)
+                    window.push_notification(Notification::error(format!("helm upgrade refused: {why}")), cx);
                 });
                 return;
             }
@@ -946,7 +948,7 @@ impl HelmRelease {
                         .find(|l| l.starts_with("STATUS:") || l.starts_with("DESCRIPTION:"))
                         .unwrap_or("ok")
                         .to_string();
-                    window.push_notification(Notification::success(format!("Dry run upgrade: {status}")), cx)
+                    window.push_notification(Notification::success(format!("Dry run upgrade: {status}")), cx);
                 }
                 Ok(_) => {
                     window.push_notification(Notification::success("Upgraded"), cx);
@@ -1004,7 +1006,8 @@ impl HelmRelease {
                                         cx,
                                     ),
                                     Err(e) => {
-                                        window.push_notification(Notification::error(format!("helm failed: {e:#}")), cx)
+                                        window
+                                            .push_notification(Notification::error(format!("helm failed: {e:#}")), cx);
                                     }
                                 }
                                 this.reload_history(window, cx);
@@ -1509,7 +1512,7 @@ mod tests {
         let r = stub(&ok).unwrap();
         assert_eq!((r.name.as_str(), r.namespace.as_str(), r.revision), ("cilium", "kube-system", 3));
         assert_eq!(r.status, "deployed");
-        assert_eq!(r.updated.map(|t| t.as_second()), Some(1_700_000_000));
+        assert_eq!(r.updated.map(jiff::Timestamp::as_second), Some(1_700_000_000));
         assert!(!r.loaded);
         // A Secret not named the way Helm names it, a revision that does not match, a bad name.
         assert!(stub(&meta("cilium", &[("name", "cilium"), ("version", "3")])).is_none());

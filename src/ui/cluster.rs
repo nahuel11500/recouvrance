@@ -720,7 +720,7 @@ impl Render for ClusterOverview {
                                                         name: node_name.clone(),
                                                         namespace: None,
                                                         context: Some(ctx_name.clone()),
-                                                    })
+                                                    });
                                                 }))
                                                 .child(node.clone()),
                                         )

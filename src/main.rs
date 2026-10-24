@@ -71,7 +71,7 @@ fn main() {
     {
         let args: Vec<String> = std::env::args().collect();
         if let Some(i) = args.iter().position(|a| a == "--snapshot") {
-            let path = args.get(i + 1).map(String::as_str).unwrap_or("snapshot.png");
+            let path = args.get(i + 1).map_or("snapshot.png", String::as_str);
             let secs = args.get(i + 2).and_then(|s| s.parse().ok()).unwrap_or(6);
             dev::snapshot::run(path, std::time::Duration::from_secs(secs)).expect("snapshot");
             return;
@@ -106,7 +106,7 @@ fn serve() {
         while let Some(ev) = events.next().await {
             match &*ev {
                 mcp::HubEvent::Audit(e) => {
-                    eprintln!("{} {:?} {} {} {}ms {}", e.agent, e.decision, e.tool, e.args, e.duration_ms, e.detail)
+                    eprintln!("{} {:?} {} {} {}ms {}", e.agent, e.decision, e.tool, e.args, e.duration_ms, e.detail);
                 }
                 mcp::HubEvent::ServerStatus(Err(e)) => {
                     eprintln!("server error: {e}");

@@ -1,7 +1,7 @@
 //! The rule editor: one rule's fields, presets and the access tester.
 
 use gpui_kit::assets::IconName as Lucide;
-use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::{ActiveTheme as _, Selectable as _, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
@@ -36,8 +36,8 @@ impl AgentsView {
                 .xsmall()
                 .label(m.label())
                 .selected(m == rule.effect)
-                .when(m == rule.effect, |b| b.primary())
-                .when(m != rule.effect, |b| b.ghost())
+                .when(m == rule.effect, ButtonVariants::primary)
+                .when(m != rule.effect, ButtonVariants::ghost)
                 .on_click(cx.listener(move |this, _, _, cx| this.update_rule(ix, |r| r.effect = m, cx)))
         }));
 
@@ -69,7 +69,7 @@ impl AgentsView {
                             }
                         },
                         cx,
-                    )
+                    );
                 }))
                 .child(VERBS[vi].0)
         }));
@@ -126,7 +126,7 @@ impl AgentsView {
                                         }
                                     },
                                     cx,
-                                )
+                                );
                             })),
                     )
                     .child(Button::new(("dup-rule", ix)).xsmall().ghost().icon(Lucide::Copy).on_click(cx.listener(
@@ -139,7 +139,7 @@ impl AgentsView {
                                 },
                                 window,
                                 cx,
-                            )
+                            );
                         },
                     )))
                     .child(Button::new(("del-rule", ix)).xsmall().ghost().icon(Lucide::Trash).on_click(cx.listener(
@@ -152,7 +152,7 @@ impl AgentsView {
                                 },
                                 window,
                                 cx,
-                            )
+                            );
                         },
                     ))),
             )
@@ -271,7 +271,7 @@ impl AgentsView {
                 Button::new(("preset", i)).xsmall().outline().label(name).on_click(cx.listener(
                     move |this, _, window, cx| {
                         let rules = rules.clone();
-                        this.edit_rules(|r| *r = rules, window, cx)
+                        this.edit_rules(|r| *r = rules, window, cx);
                     },
                 ))
             }))
@@ -298,8 +298,8 @@ impl AgentsView {
                 Button::new(("test-verb", i))
                     .xsmall()
                     .label(*v)
-                    .when(t.verb == *v, |b| b.primary())
-                    .when(t.verb != *v, |b| b.ghost())
+                    .when(t.verb == *v, ButtonVariants::primary)
+                    .when(t.verb != *v, ButtonVariants::ghost)
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.tester.verb = verb.clone();
                         cx.notify();

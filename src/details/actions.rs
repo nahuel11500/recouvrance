@@ -56,7 +56,8 @@ impl DetailPanel {
             return;
         }
         // Never a made-up count: unknown stays empty and must be typed.
-        let current = self.object.as_ref().and_then(|o| o.pointer("/spec/replicas")).and_then(|v| v.as_i64());
+        let current =
+            self.object.as_ref().and_then(|o| o.pointer("/spec/replicas")).and_then(serde_json::Value::as_i64);
         let input = cx.new(|cx| {
             let mut s = InputState::new(window, cx).placeholder("replicas");
             if let Some(c) = current {
@@ -164,7 +165,7 @@ impl DetailPanel {
         title: String,
         description: &'static str,
         ok: &'static str,
-        action: fn(&DetailPanel) -> WriteFuture,
+        action: fn(&Self) -> WriteFuture,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -209,7 +210,7 @@ impl DetailPanel {
         else {
             return;
         };
-        self.compare_rev = Some(revision.clone());
+        self.compare_rev = Some(revision);
         cx.notify();
         let number = rev
             .pointer("/metadata/annotations/deployment.kubernetes.io~1revision")
@@ -514,7 +515,8 @@ impl DetailPanel {
                     cx.notify();
                 }
                 Err(e) => {
-                    window.push_notification(Notification::error(format!("Debug failed: {}", k8s::short_error(&e))), cx)
+                    window
+                        .push_notification(Notification::error(format!("Debug failed: {}", k8s::short_error(&e))), cx);
                 }
             });
         });
@@ -669,7 +671,7 @@ impl DetailPanel {
             let result = check.await;
             let _ = cx.update(|window, cx| match result {
                 Err(e) => {
-                    window.push_notification(Notification::error(format!("The server rejected the change: {e:#}")), cx)
+                    window.push_notification(Notification::error(format!("The server rejected the change: {e:#}")), cx);
                 }
                 Ok(_) if !writes_still_on(window, cx) => {}
                 Ok(_) => window.open_alert_dialog(cx, move |alert, _, cx| {
@@ -814,7 +816,7 @@ pub fn delete_settings_link(group: &str, kind: &str, label: &str, cx: &App) -> A
                 .id("delete-settings")
                 .text_color(cx.theme().blue)
                 .cursor_pointer()
-                .hover(|s| s.underline())
+                .hover(Styled::underline)
                 .child("Change in Settings")
                 .on_click(|_, window, cx| crate::app::open_delete_settings(window, cx)),
         )

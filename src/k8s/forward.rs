@@ -43,7 +43,7 @@ pub fn port_forward(
                 return;
             }
         };
-        let port = listener.local_addr().map(|a| a.port()).unwrap_or(local);
+        let port = listener.local_addr().map_or(local, |a| a.port());
         let _ = tx.unbounded_send(ForwardMsg::Listening(port));
         let api: Api<Pod> = Api::namespaced(client.clone(), &ns);
         // The pod in use; replaced when it goes away (rollout, crash, eviction).
@@ -63,17 +63,14 @@ pub fn port_forward(
                 // Reap finished tunnels so the set does not grow forever.
                 Some(_) = connections.join_next(), if !connections.is_empty() => continue,
             };
-            let mut socket = match accepted {
-                Ok((socket, _)) => {
-                    backoff = std::time::Duration::from_millis(50);
-                    socket
-                }
-                Err(_) => {
-                    // Out of file descriptors and the like: wait instead of spinning.
-                    tokio::time::sleep(backoff).await;
-                    backoff = (backoff * 2).min(std::time::Duration::from_secs(2));
-                    continue;
-                }
+            let mut socket = if let Ok((socket, _)) = accepted {
+                backoff = std::time::Duration::from_millis(50);
+                socket
+            } else {
+                // Out of file descriptors and the like: wait instead of spinning.
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(std::time::Duration::from_secs(2));
+                continue;
             };
             let (api, tx, current, client, ns, service, owner) =
                 (api.clone(), tx.clone(), current.clone(), client.clone(), ns.clone(), service.clone(), owner.clone());

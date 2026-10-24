@@ -1,4 +1,4 @@
-//! What the current user may do (SelfSubject reviews) and RBAC listings.
+//! What the current user may do (`SelfSubject` reviews) and RBAC listings.
 
 use anyhow::Result;
 use kube::Client;
@@ -39,7 +39,7 @@ pub async fn can_i(
         };
         let api: Api<SelfSubjectAccessReview> = Api::all(client);
         let r = api.create(&Default::default(), &review).await?;
-        Ok(r.status.map(|s| s.allowed).unwrap_or(true))
+        Ok(r.status.is_none_or(|s| s.allowed))
     })
     .await
     .unwrap_or(true)
@@ -129,7 +129,7 @@ mod tests {
     use super::{incomplete_note, rule_resources};
 
     fn strings(v: &[&str]) -> Vec<String> {
-        v.iter().map(|s| s.to_string()).collect()
+        v.iter().map(ToString::to_string).collect()
     }
 
     #[test]

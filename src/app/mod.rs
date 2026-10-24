@@ -66,18 +66,18 @@ enum Route {
 
 impl Route {
     fn is_agents(&self) -> bool {
-        matches!(self, Route::Agents)
+        matches!(self, Self::Agents)
     }
 
     fn is_resources(&self) -> bool {
-        matches!(self, Route::Resources(_) | Route::Detail(_))
+        matches!(self, Self::Resources(_) | Self::Detail(_))
     }
 }
 
 /// The page each window shows. Hidden pages (in back/forward history) stop
 /// polling and streaming until shown again.
 /// A tab: its own back/forward history, filter and namespaces. The active tab's
-/// state lives in the AppView fields; the others are kept here.
+/// state lives in the `AppView` fields; the others are kept here.
 #[derive(Clone, Default)]
 struct TabState {
     history: Vec<Route>,
@@ -370,12 +370,12 @@ impl AppView {
                 }
                 // A filter that was used (Enter, or leaving the field) goes into the history.
                 InputEvent::PressEnter { .. } | InputEvent::Blur => {
-                    crate::settings::remember_filter(state.read(cx).value().as_ref())
+                    crate::settings::remember_filter(state.read(cx).value().as_ref());
                 }
                 _ => {}
             }),
             cx.subscribe_in(&kind_filter, window, |_, _, ev: &InputEvent, _, cx| {
-                if let InputEvent::Change = ev {
+                if matches!(ev, InputEvent::Change) {
                     cx.notify();
                 }
             }),
@@ -395,7 +395,7 @@ impl AppView {
                 cx.notify();
             }),
             cx.subscribe_in(&table, window, |this, table, ev: &TableEvent, _, cx| {
-                let Some(kind) = this.kind.as_ref().map(|k| k.kubectl_name()) else { return };
+                let Some(kind) = this.kind.as_ref().map(Kind::kubectl_name) else { return };
                 match ev {
                     TableEvent::ColumnWidthsChanged(widths) => {
                         let z = zoom(cx);
@@ -699,7 +699,7 @@ pub fn open_delete_settings(window: &mut Window, cx: &mut App) {
     let Some(Some(root)) = window.root::<base::Root>() else { return };
     let Ok(app) = root.read(cx).view().clone().downcast::<AppView>() else { return };
     app.update(cx, |this, cx| {
-        this.settings_view.update(cx, |s, cx| s.show_general(cx));
+        this.settings_view.update(cx, SettingsView::show_general);
         this.navigate(Route::Settings, cx);
     });
 }

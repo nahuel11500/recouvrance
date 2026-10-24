@@ -46,7 +46,7 @@ pub enum DeleteConfirm {
     Type,
 }
 
-#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Debug)]
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
 #[serde(rename_all = "kebab-case")]
 pub enum Startup {
     /// Always show the context picker ("ask").
@@ -57,7 +57,7 @@ pub enum Startup {
     Reconnect,
 }
 
-#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Debug)]
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
 #[serde(rename_all = "kebab-case")]
 pub enum InitialView {
     Pods,
@@ -66,7 +66,7 @@ pub enum InitialView {
 }
 
 /// A port-forward to bring back next time (pods are found again by service or name).
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct SavedForward {
     pub context: String,
     pub namespace: String,
@@ -224,7 +224,7 @@ fn delete_confirm_in(s: &Settings, group: &str, kind: &str) -> DeleteConfirm {
 }
 
 /// A namespace chosen on a context: how often, and when last (unix seconds).
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct NamespaceVisit {
     pub name: String,
     pub count: u32,
@@ -232,7 +232,7 @@ pub struct NamespaceVisit {
 }
 
 /// Settings for one cluster (context).
-#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
 #[serde(default)]
 pub struct ClusterSettings {
     /// Image for node shells (default busybox).
@@ -330,8 +330,7 @@ static LOAD_ERROR: OnceLock<String> = OnceLock::new();
 
 fn path() -> PathBuf {
     let base = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".config"));
+        .map_or_else(|| PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".config"), PathBuf::from);
     base.join("recouvrance").join("settings.json")
 }
 
@@ -455,7 +454,7 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         f.write_all(bytes)?;
         f.sync_all()
     });
-    match written.and_then(|_| std::fs::rename(&tmp, path)) {
+    match written.and_then(|()| std::fs::rename(&tmp, path)) {
         Ok(()) => Ok(()),
         Err(e) => {
             let _ = std::fs::remove_file(&tmp);
@@ -896,7 +895,7 @@ mod tests {
         assert!(!p.exists());
         let backups: Vec<_> = std::fs::read_dir(&d)
             .unwrap()
-            .filter_map(|e| e.ok())
+            .filter_map(Result::ok)
             .filter(|e| e.file_name().to_string_lossy().starts_with("settings.json.bad-"))
             .collect();
         assert_eq!(backups.len(), 1);
@@ -1002,10 +1001,7 @@ mod properties {
             spoiled in prop::collection::btree_map(0..40usize, bad(), 0..4),
         ) {
             let good = Settings { protection: protection.clone(), metrics_refresh: refresh, ..Settings::default() };
-            let mut fields = match serde_json::to_value(&good).unwrap() {
-                Value::Object(f) => f,
-                _ => unreachable!(),
-            };
+            let Value::Object(mut fields) = serde_json::to_value(&good).unwrap() else { unreachable!() };
             let keys: Vec<String> = fields.keys().filter(|k| *k != "protection").cloned().collect();
             let mut hit = std::collections::HashSet::new();
             for (i, v) in &spoiled {
@@ -1028,7 +1024,7 @@ mod properties {
         /// A protection entry that isn't true or false protects its context and keeps the others.
         #[test]
         fn a_bad_protection_entry_protects(protection in protection(), name in "[A-Z]{1,6}", value in bad()) {
-            let mut text = json!({"protection": protection.clone()});
+            let mut text = json!({"protection": protection});
             text["protection"][&name] = value;
             let (read, _, lost) = from_bytes(&serde_json::to_vec(&text).unwrap());
             prop_assert!(!lost);
@@ -1046,7 +1042,7 @@ mod properties {
             let text = serde_json::to_vec(&json!({"protection": protection, "metrics_refresh": 5})).unwrap();
             let truncated = &text[..cut.min(text.len() - 1)];
             prop_assert!(from_bytes(truncated).2);
-            let replaced = serde_json::to_vec(&json!({"protection": bad.clone()})).unwrap();
+            let replaced = serde_json::to_vec(&json!({"protection": bad})).unwrap();
             prop_assert_eq!(from_bytes(&replaced).2, !bad.is_object());
         }
     }

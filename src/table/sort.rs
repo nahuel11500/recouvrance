@@ -72,7 +72,7 @@ impl ResourceTable {
                 Col::Namespace => SortKey::Text(r.namespace.as_deref().unwrap_or_default()),
                 Col::Cpu => SortKey::Num(self.usage_of(ctx, r).map_or(-1.0, |u| u.0)),
                 Col::Memory => SortKey::Num(self.usage_of(ctx, r).map_or(-1.0, |u| u.1)),
-                Col::Age(_) => SortKey::Num(-r.created.map(|t| t.as_second()).unwrap_or(0) as f64),
+                Col::Age(_) => SortKey::Num(-r.created.map_or(0, jiff::Timestamp::as_second) as f64),
                 Col::Cell(c) => sort_key(r.cells.get(c).map(String::as_str).unwrap_or_default(), unit),
             }
         };

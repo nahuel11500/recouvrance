@@ -12,7 +12,7 @@ impl DetailPanel {
             Some(Err(e)) => Some(e.to_string()),
             _ => None,
         };
-        (self.yaml_error.as_ref().map(|e| e.to_string()), events, self.object.is_some())
+        (self.yaml_error.as_ref().map(ToString::to_string), events, self.object.is_some())
     }
 
     pub fn qa_tabs(&self) -> Vec<&'static str> {
@@ -141,10 +141,10 @@ impl DetailPanel {
             other if other.starts_with("bind:") => self.bind_dialog(None, Some(other[5..].to_string()), window, cx),
             other if other.starts_with("add-subject:") => {
                 let b = self.object.clone();
-                self.bind_dialog(b, Some(other[12..].to_string()), window, cx)
+                self.bind_dialog(b, Some(other[12..].to_string()), window, cx);
             }
             other if other.starts_with("remove-subject:") => {
-                self.confirm_remove_subject(other[15..].parse().unwrap_or(0), window, cx)
+                self.confirm_remove_subject(other[15..].parse().unwrap_or(0), window, cx);
             }
             "managed" => {
                 self.show_managed = true;
@@ -200,7 +200,7 @@ impl DetailPanel {
             },
             window,
             cx,
-        )
+        );
     }
 
     #[cfg(feature = "dev")]

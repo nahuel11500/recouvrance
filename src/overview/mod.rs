@@ -161,7 +161,7 @@ impl Ctx<'_> {
             .id(SharedString::from(format!("link-{kind}-{name}")))
             .text_color(cx.theme().blue)
             .cursor_pointer()
-            .hover(|s| s.underline())
+            .hover(Styled::underline)
             .overflow_hidden()
             .text_ellipsis()
             .whitespace_nowrap()
@@ -182,7 +182,7 @@ fn n(v: &Value, path: &str) -> Option<i64> {
 }
 
 fn arr<'a>(v: &'a Value, path: &str) -> &'a [Value] {
-    v.pointer(path).and_then(Value::as_array).map(Vec::as_slice).unwrap_or(&[])
+    v.pointer(path).and_then(Value::as_array).map_or(&[][..], Vec::as_slice)
 }
 
 fn age_of(v: &Value, path: &str) -> Option<String> {
@@ -266,7 +266,7 @@ pub fn list_rows(ctx: &Ctx) -> Option<usize> {
     if lists_pods(kind) {
         Some(ctx.related.pod_rows.len())
     } else if kind.is("", "ConfigMap") || kind.is("", "Secret") {
-        Some(ctx.obj.get("data").and_then(Value::as_object).map_or(0, |d| d.len()))
+        Some(ctx.obj.get("data").and_then(Value::as_object).map_or(0, serde_json::Map::len))
     } else if kind.is("apiextensions.k8s.io", "CustomResourceDefinition") {
         Some(ctx.schema_rows.len())
     } else {
@@ -281,7 +281,7 @@ pub fn item(ctx: &Ctx, ix: usize, cx: &App) -> AnyElement {
         ix if ix <= rows => list_row(ctx, ix - 1, cx),
         _ => conditions(ctx.obj, cx),
     };
-    div().px_2().when(ix > rows, |d| d.pb_8()).child(body).into_any_element()
+    div().px_2().when(ix > rows, Styled::pb_8).child(body).into_any_element()
 }
 
 fn list_row(ctx: &Ctx, i: usize, cx: &App) -> AnyElement {
@@ -291,9 +291,9 @@ fn list_row(ctx: &Ctx, i: usize, cx: &App) -> AnyElement {
     } else if kind.is("", "Secret") {
         secret_entry(ctx, i, cx)
     } else if kind.is("apiextensions.k8s.io", "CustomResourceDefinition") {
-        ctx.schema_rows.get(i).map(|r| schema_row(r, cx)).unwrap_or_else(|| div().into_any_element())
+        ctx.schema_rows.get(i).map_or_else(|| div().into_any_element(), |r| schema_row(r, cx))
     } else {
-        ctx.related.pod_rows.get(i).map(|r| pod_row(ctx, r, cx)).unwrap_or_else(|| div().into_any_element())
+        ctx.related.pod_rows.get(i).map_or_else(|| div().into_any_element(), |r| pod_row(ctx, r, cx))
     }
 }
 

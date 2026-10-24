@@ -1,0 +1,16 @@
+# Words the doc_markdown lint takes as prose, not code: Kubernetes kinds and the names of
+# the tools and formats the docs talk about.
+doc-valid-idents = [
+    "..",
+    "APIService", "ClusterIssuer", "ClusterRole", "ClusterRoleBinding", "ClusterRoleBindings", "ClusterRoles",
+    "ConfigMap", "ConfigMaps", "CronJob", "CronJobs", "CustomResourceDefinition", "DaemonSet", "DaemonSets",
+    "EndpointSlice", "EndpointSlices", "GitOps", "GitHub", "GitLab", "HelmRelease", "HelmReleases",
+    "HorizontalPodAutoscaler", "IngressClass", "JSONPath", "NetworkPolicies", "NetworkPolicy", "OOMKilled",
+    "OpenAPI", "PersistentVolume", "PersistentVolumeClaim", "PersistentVolumeClaims", "PersistentVolumes",
+    "PodDisruptionBudget", "PodDisruptionBudgets", "PolicyRule", "PolicyRules", "PriorityClass", "PromQL",
+    "ReplicaSet", "ReplicaSets", "ResourceSlice", "ResourceSlices", "RoleBinding", "RoleBindings", "RuntimeClass",
+    "SelfSubjectAccessReview", "SelfSubjectRulesReview", "ServiceAccount", "ServiceAccounts", "ServiceMonitor",
+    "StatefulSet", "StatefulSets", "StorageClass", "TLSRoute", "HTTPRoute", "GRPCRoute", "TokenRequest",
+    "VerticalPodAutoscaler", "VictoriaMetrics", "ValidatingWebhookConfiguration", "MutatingWebhookConfiguration",
+    "ControllerRevision", "ControllerRevisions", "ClusterSecretStore", "SecretStore", "macOS", "WebSocket", "OAuth", "JavaScript", "TypeScript", "PostgreSQL", "ClickHouse", "MiB", "GiB", "KiB",
+]

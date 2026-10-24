@@ -182,7 +182,7 @@ impl AppView {
 
     pub(super) fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let query = self.kind_filter.read(cx).value().to_lowercase();
-        let selected = self.kind.as_ref().filter(|_| self.route().is_resources()).map(|k| k.key());
+        let selected = self.kind.as_ref().filter(|_| self.route().is_resources()).map(Kind::key);
         let theme = cx.theme();
         let (muted, active_bg, fg) =
             (theme.sidebar_foreground.opacity(0.62), theme.sidebar_accent, theme.sidebar_foreground);
@@ -216,7 +216,7 @@ impl AppView {
                 .id(id)
                 .group(group.clone())
                 .px_2()
-                .when(indent, |d| d.pl_5())
+                .when(indent, Styled::pl_5)
                 .py(px(3.))
                 .rounded_md()
                 .text_sm()
@@ -340,7 +340,7 @@ impl AppView {
                         .cursor_pointer()
                         .hover(|s| s.bg(active_bg.opacity(0.6)))
                         .on_click(cx.listener(move |this, _, window, cx| {
-                            this.open_object_in(ctx, &o2.kind, o2.name.clone(), o2.namespace.clone(), window, cx)
+                            this.open_object_in(ctx, &o2.kind, o2.name.clone(), o2.namespace.clone(), window, cx);
                         }))
                         .child(
                             v_flex()

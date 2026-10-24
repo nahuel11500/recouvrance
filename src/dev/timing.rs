@@ -18,7 +18,7 @@ pub struct Span(&'static str, Instant);
 impl Drop for Span {
     fn drop(&mut self) {
         let took = self.1.elapsed();
-        let mut s = SPANS.lock().unwrap_or_else(|e| e.into_inner());
+        let mut s = SPANS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let e = s.1.entry(self.0).or_default();
         e.0 += 1;
         e.1 += took;

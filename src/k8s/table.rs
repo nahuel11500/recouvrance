@@ -59,7 +59,7 @@ pub fn json_path(v: &serde_json::Value, path: &str) -> String {
     // Split into segments, keeping ['quoted.keys'] and [n] / [*] as their own steps.
     let mut steps: Vec<String> = Vec::new();
     let mut cur = String::new();
-    let mut chars = p.chars().peekable();
+    let mut chars = p.chars();
     while let Some(c) = chars.next() {
         match c {
             '.' => {
@@ -484,7 +484,7 @@ pub async fn list_light(
         let page: ServerTable =
             lists::request_idle(&client, with_table_format(Request::new(&url).list(&lp)?, false)?).await?;
         let defs = page.column_definitions.clone();
-        if page.metadata.continue_.as_ref().is_none_or(|c| c.is_empty()) {
+        if page.metadata.continue_.as_ref().is_none_or(String::is_empty) {
             let rows = page.rows.into_iter().filter_map(|r| to_row(r, &Extras::default())).collect();
             return Ok((defs, rows));
         }
@@ -855,7 +855,7 @@ pub(super) fn apply_event(
         }
         "ERROR" => {
             let obj: serde_json::Value = serde_json::from_str(event.object.get()).unwrap_or_default();
-            let code = obj.get("code").and_then(|c| c.as_i64());
+            let code = obj.get("code").and_then(serde_json::Value::as_i64);
             if code == Some(410) {
                 return Ok(Applied::Relist);
             }

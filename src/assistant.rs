@@ -25,8 +25,7 @@ const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600)
 
 fn dir() -> PathBuf {
     let base = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".config"));
+        .map_or_else(|| PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".config"), PathBuf::from);
     base.join("recouvrance")
 }
 
@@ -38,7 +37,7 @@ fn write_secret(name: &str, value: &str) -> std::io::Result<()> {
     crate::mcp::write_private(&dir().join(name), value.as_bytes()).map_err(std::io::Error::other)
 }
 
-/// The API key: saved in Settings, else ANTHROPIC_API_KEY.
+/// The API key: saved in Settings, else `ANTHROPIC_API_KEY`.
 pub fn api_key() -> Option<String> {
     read_secret("anthropic-key").or_else(|| std::env::var("ANTHROPIC_API_KEY").ok().filter(|k| !k.is_empty()))
 }
@@ -145,7 +144,7 @@ pub async fn claude_code_connected() -> bool {
 
 // MARK: HTTP
 
-/// Where the API key is sent. RECOUVRANCE_ANTHROPIC_URL (a local stand-in for tests)
+/// Where the API key is sent. `RECOUVRANCE_ANTHROPIC_URL` (a local stand-in for tests)
 /// only exists in test and dev builds, so a release never sends the key elsewhere.
 fn anthropic_url() -> String {
     #[cfg(any(test, feature = "dev"))]
@@ -267,7 +266,7 @@ fn resolve_location(base: &str, location: &str) -> Option<String> {
     let merged = if path.starts_with('/') {
         path.to_string()
     } else {
-        let dir = base_path.rfind('/').map(|i| &base_path[..=i]).unwrap_or("/");
+        let dir = base_path.rfind('/').map_or("/", |i| &base_path[..=i]);
         format!("{dir}{path}")
     };
     // Remove `.` and `..` segments.
@@ -419,7 +418,7 @@ struct WorkDir(PathBuf);
 impl WorkDir {
     fn create() -> std::io::Result<Self> {
         use std::os::unix::fs::DirBuilderExt as _;
-        let base = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
+        let base = std::env::var_os("XDG_RUNTIME_DIR").map_or_else(std::env::temp_dir, PathBuf::from);
         let path = base.join(format!("recouvrance-assistant-{}", uuid::Uuid::new_v4().simple()));
         // `create`, not `create_all`: fails rather than reuse a directory someone else made.
         std::fs::DirBuilder::new().mode(0o700).create(&path)?;
@@ -455,7 +454,7 @@ impl Drop for TempFile {
 }
 
 /// How the assistant reaches Claude.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Backend {
     /// Your local Claude Code (`claude -p`): your subscription, no API key.
     ClaudeCode(PathBuf),
@@ -756,7 +755,7 @@ async fn ask_api(
 }
 
 /// The blocks of an API reply worth keeping. Tool calls count only when the reply stopped
-/// to run them: one cut off (max_tokens) may be incomplete, and is neither run nor kept
+/// to run them: one cut off (`max_tokens`) may be incomplete, and is neither run nor kept
 /// (a kept call with no result would break every later question).
 fn reply_content(resp: &Value) -> Vec<Value> {
     let mut content = resp["content"].as_array().cloned().unwrap_or_default();

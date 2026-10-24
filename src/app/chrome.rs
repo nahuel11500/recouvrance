@@ -16,10 +16,10 @@ use crate::ui::palette::{Item as PaletteItem, Palette, PaletteEvent, Target};
 
 impl AppView {
     pub(super) fn zoom_by(&mut self, delta: Option<f32>, window: &mut Window, cx: &mut Context<Self>) {
-        let z = delta.map(|d| zoom(cx) + d).unwrap_or(1.0);
+        let z = delta.map_or(1.0, |d| zoom(cx) + d);
         set_zoom(z, window, cx);
         // Column widths scale too; they are computed when the table refreshes.
-        self.table.update(cx, |t, cx| t.refresh(cx));
+        self.table.update(cx, component::table::TableState::refresh);
     }
 
     pub(super) fn open_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -226,7 +226,7 @@ impl AppView {
                         );
                     }
                     Target::Object { ctx, kind, name, namespace } => {
-                        this.open_object_in(ctx, &kind, name, namespace, window, cx)
+                        this.open_object_in(ctx, &kind, name, namespace, window, cx);
                     }
                 }
             }
@@ -363,7 +363,7 @@ impl AppView {
                 .child(h_flex().flex_wrap().gap_2().children(self.all_contexts.iter().enumerate().map(|(i, ctx)| {
                     let name = ctx.clone();
                     let risky = crate::settings::is_protected(ctx);
-                    let accent: Hsla = crate::settings::context_color(ctx).map(|c| rgb(c).into()).unwrap_or(theme.blue);
+                    let accent: Hsla = crate::settings::context_color(ctx).map_or(theme.blue, |c| rgb(c).into());
                     let picked = self.picked.contains(ctx);
                     h_flex()
                         .id(("ctx-card", i))
@@ -417,7 +417,8 @@ impl AppView {
                                 .icon(Lucide::Plus)
                                 .label("Add a kubeconfig")
                                 .on_click(cx.listener(|this, _, _, cx| {
-                                    this.settings_view.update(cx, |s, cx| s.show_kubeconfig(cx));
+                                    this.settings_view
+                                        .update(cx, crate::ui::settings_view::SettingsView::show_kubeconfig);
                                     this.navigate(Route::Settings, cx);
                                 })),
                         )

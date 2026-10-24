@@ -222,10 +222,7 @@ pub fn container(ctx: &Ctx, name: &str, cx: &App) -> AnyElement {
             card(cx)
                 .w(px(260.))
                 .child(
-                    div()
-                        .text_xs()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(name.clone().unwrap_or_else(|| "-".into())),
+                    div().text_xs().text_color(cx.theme().muted_foreground).child(name.unwrap_or_else(|| "-".into())),
                 )
                 .child(h_flex().justify_between().child(div().child(format!("{port}/{protocol}"))).children(forward))
                 .when(!services.is_empty(), |d| {
@@ -331,7 +328,7 @@ pub fn container(ctx: &Ctx, name: &str, cx: &App) -> AnyElement {
                 (div().child(v.to_string()).into_any_element(), div().into_any_element())
             } else if let Some(r) = e.pointer("/valueFrom/secretKeyRef") {
                 let (name, k) = (r["name"].as_str().unwrap_or_default(), r["key"].as_str().unwrap_or("?"));
-                let v = secret_value(name, k).map(masked).unwrap_or_else(|| "(not readable)".into());
+                let v = secret_value(name, k).map_or_else(|| "(not readable)".into(), masked);
                 (
                     div().child(v).into_any_element(),
                     h_flex()
@@ -404,7 +401,7 @@ pub fn container(ctx: &Ctx, name: &str, cx: &App) -> AnyElement {
                         .cursor_pointer()
                         .child(if hidden > 0 { format!("Show {hidden} more") } else { "Show less".to_string() })
                         .on_click(move |_, _, cx| {
-                            let _ = panel.update(cx, |p, cx| p.toggle_env(cx));
+                            let _ = panel.update(cx, crate::details::DetailPanel::toggle_env);
                         }),
                 )
             }),

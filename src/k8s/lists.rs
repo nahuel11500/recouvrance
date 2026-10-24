@@ -61,7 +61,7 @@ where
         let path = format!("{url}?resourceVersion=0&resourceVersionMatch=NotOlderThan");
         let body = c.request_stream(http::Request::get(&path).body(Vec::new())?).await?;
         let list: LeanList<T> = parse_streamed(Idle::new(body.compat(), LIST_IDLE)).await?;
-        anyhow::ensure!(list.metadata.continue_.as_ref().is_none_or(|c| c.is_empty()), "the API server paged it");
+        anyhow::ensure!(list.metadata.continue_.as_ref().is_none_or(String::is_empty), "the API server paged it");
         Ok(list.items)
     })
     .await;

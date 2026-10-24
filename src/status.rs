@@ -1,4 +1,4 @@
-//! What a status word means, for pods and for any CRD's status column ("SecretSynced",
+//! What a status word means, for pods and for any CRD's status column ("`SecretSynced`",
 //! "Valid", "Healthy", "Progressing"…): one classifier for tables, overviews and the dashboard.
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -9,7 +9,7 @@ pub(crate) enum Tone {
     Bad,
 }
 
-/// Words that mean something is wrong wherever they appear ("SecretSyncedError").
+/// Words that mean something is wrong wherever they appear ("`SecretSyncedError`").
 const BAD: [&str; 23] = [
     "notready",
     "unhealthy",
@@ -59,7 +59,7 @@ const BUSY: [&str; 15] = [
     "schedulinggated",
 ];
 
-/// Good words found anywhere ("NewReplicaSetAvailable"), unless negated ("Unready").
+/// Good words found anywhere ("`NewReplicaSetAvailable`"), unless negated ("Unready").
 const GOOD: [&str; 23] = [
     "running",
     "ready",
@@ -89,7 +89,7 @@ const GOOD: [&str; 23] = [
 /// Good words too short to look for inside others ("Broken" holds "ok"): whole words only.
 const GOOD_WORDS: [&str; 3] = ["ok", "up", "true"];
 
-/// Prefixes that turn a good word into a bad one: "NotSynced", "Unbound", "Inactive".
+/// Prefixes that turn a good word into a bad one: "`NotSynced`", "Unbound", "Inactive".
 const NEGATIONS: [&str; 3] = ["not", "un", "in"];
 
 /// The tone of a status; None for words we do not know (no color then).
@@ -125,7 +125,7 @@ fn starts_good(rest: &str) -> bool {
     GOOD.iter().any(|g| rest.starts_with(g)) || GOOD_WORDS.contains(&rest)
 }
 
-/// A good word negated: "Unready", "Inactive", "NotSynced", "not ready".
+/// A good word negated: "Unready", "Inactive", "`NotSynced`", "not ready".
 fn negated(words: &[String]) -> bool {
     words.iter().enumerate().any(|(i, w)| {
         let prefixed =
@@ -211,7 +211,7 @@ pub fn true_is_bad(ty: &str) -> bool {
 /// Whether a node condition reports a problem. On a node every condition but Ready is
 /// True when something is wrong (pressure, node-problem-detector's `KubeletProblem`,
 /// Azure's `VMEventScheduled`…), so one we don't know is flagged too, unless its name says
-/// it is good when True ("GPUHealthy").
+/// it is good when True ("`GPUHealthy`").
 pub fn node_condition_bad(ty: &str, status: &str) -> bool {
     status == "True" && (true_is_bad(ty) || (!true_is_good(ty) && tone(ty) != Some(Tone::Good)))
 }
@@ -245,7 +245,7 @@ pub fn true_is_good(ty: &str) -> bool {
 }
 
 /// The tone of a condition: by its type's polarity when known; for another type that is
-/// True, by what its name says ("Degraded", "ResizeError" bad, "Reconciling" busy,
+/// True, by what its name says ("Degraded", "`ResizeError`" bad, "Reconciling" busy,
 /// "Healthy" good), and none when the name says nothing.
 pub(crate) fn condition_tone(ty: &str, status: &str) -> Option<Tone> {
     match status {

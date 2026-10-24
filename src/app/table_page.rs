@@ -48,7 +48,7 @@ impl AppView {
     }
 
     pub(super) fn toggle_column(&mut self, name: String, cx: &mut Context<Self>) {
-        let Some(kind) = self.kind.as_ref().map(|k| k.kubectl_name()) else { return };
+        let Some(kind) = self.kind.as_ref().map(Kind::kubectl_name) else { return };
         let mut visible: Vec<String> = self.table.read(cx).delegate().shown_columns();
         if let Some(i) = visible.iter().position(|n| *n == name) {
             visible.remove(i);
@@ -66,7 +66,7 @@ impl AppView {
     }
 
     pub(super) fn reset_columns(&mut self, cx: &mut Context<Self>) {
-        let Some(kind) = self.kind.as_ref().map(|k| k.kubectl_name()) else { return };
+        let Some(kind) = self.kind.as_ref().map(Kind::kubectl_name) else { return };
         self.column_prefs.set(kind, None);
         self.table.update(cx, |t, cx| {
             t.delegate_mut().set_visible_columns(None);
@@ -78,7 +78,7 @@ impl AppView {
 
     /// Add the custom column typed in the Columns menu, then reload the table.
     pub(super) fn add_custom_column(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(kind) = self.kind.as_ref().map(|k| k.kubectl_name()) else { return };
+        let Some(kind) = self.kind.as_ref().map(Kind::kubectl_name) else { return };
         let header = self.col_header.read(cx).value().trim().to_string();
         let path = self.col_path.read(cx).value().trim().to_string();
         if header.is_empty() || path.is_empty() {
@@ -170,7 +170,7 @@ impl AppView {
 
     pub(super) fn render_columns_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let choices = self.table.read(cx).delegate().column_choices();
-        let kind_name = self.kind.as_ref().map(|k| k.kubectl_name()).unwrap_or_default();
+        let kind_name = self.kind.as_ref().map(Kind::kubectl_name).unwrap_or_default();
         let custom = self.column_prefs.custom(&kind_name);
         Popover::new("columns-popover")
             .anchor(Anchor::TopRight)
@@ -521,7 +521,7 @@ impl AppView {
             cx.notify();
         });
         // Another kind restarts the watch when it is shown; the same kind needs it here.
-        let same_kind = self.kind.as_ref().map(|k| k.key()) == Some(kind.key());
+        let same_kind = self.kind.as_ref().map(Kind::key) == Some(kind.key());
         self.choose_namespaces(namespaces, cx);
         self.select_kind(kind, cx);
         if same_kind {
@@ -545,7 +545,7 @@ impl AppView {
         let name = format!("{}-{stamp}.csv", kind.ar.plural);
         // Private and never over an earlier export.
         let r = crate::private_files::create_new_in(&crate::private_files::downloads_dir(), &name)
-            .and_then(|(mut f, path)| f.write_all(csv.as_bytes()).map(|_| path));
+            .and_then(|(mut f, path)| f.write_all(csv.as_bytes()).map(|()| path));
         window.push_notification(
             match r {
                 Ok(path) => Notification::success(format!("Saved {}", path.display())),
@@ -623,7 +623,7 @@ impl AppView {
 
 /// A row in a bulk confirmation: `ns/name`, after its context when rows span several.
 fn bulk_row_label(context: Option<&str>, ns: Option<&str>, name: &str) -> String {
-    let obj = ns.map(|ns| format!("{ns}/{name}")).unwrap_or_else(|| name.to_string());
+    let obj = ns.map_or_else(|| name.to_string(), |ns| format!("{ns}/{name}"));
     context.map(|c| format!("{c}: {obj}")).unwrap_or(obj)
 }
 

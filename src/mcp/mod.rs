@@ -49,13 +49,13 @@ pub enum Mode {
 }
 
 impl Mode {
-    pub const ALL: [Mode; 3] = [Mode::Allow, Mode::Ask, Mode::Deny];
+    pub const ALL: [Self; 3] = [Self::Allow, Self::Ask, Self::Deny];
 
     pub fn label(self) -> &'static str {
         match self {
-            Mode::Allow => "Allow",
-            Mode::Ask => "Ask me",
-            Mode::Deny => "Deny",
+            Self::Allow => "Allow",
+            Self::Ask => "Ask me",
+            Self::Deny => "Deny",
         }
     }
 }
@@ -85,7 +85,7 @@ pub fn is_write(verb: &str) -> bool {
 /// One access rule, like a Kubernetes RBAC rule with an effect.
 /// Every field is a list of `*` patterns; an empty list matches nothing. A field missing
 /// when read never grants (see `RuleFields`).
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 #[serde(from = "RuleFields")]
 pub struct Rule {
     pub effect: Mode,
@@ -110,7 +110,7 @@ impl Default for Rule {
     fn default() -> Self {
         Self {
             effect: Mode::Allow,
-            verbs: READ_VERBS.iter().map(|v| v.to_string()).collect(),
+            verbs: READ_VERBS.iter().map(ToString::to_string).collect(),
             resources: vec!["*".into()],
             namespaces: vec!["*".into()],
             contexts: Vec::new(),
@@ -229,7 +229,7 @@ impl Rule {
     }
 
     /// Whether both rules cover the same requests, the same way (notes and expiry aside).
-    pub fn same_request(&self, other: &Rule) -> bool {
+    pub fn same_request(&self, other: &Self) -> bool {
         self.effect == other.effect
             && self.verbs == other.verbs
             && self.resources == other.resources
@@ -301,7 +301,7 @@ impl Default for Policy {
 }
 
 /// The outcome of evaluating the rules, with the rule that decided.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Verdict {
     pub mode: Mode,
     pub rule: Option<usize>,
@@ -378,8 +378,8 @@ impl Policy {
     /// Rules pasted as JSON ("Copy rules" on another agent), None when there are none.
     /// No pasted rule counts as approved: it would win over every Ask rule while looking
     /// like any other Allow.
-    pub fn pasted(text: &str) -> Option<Policy> {
-        let mut p: Policy = serde_json::from_str(text).ok()?;
+    pub fn pasted(text: &str) -> Option<Self> {
+        let mut p: Self = serde_json::from_str(text).ok()?;
         if p.rules.is_empty() {
             return None;
         }
@@ -549,15 +549,15 @@ impl Default for Config {
 
 pub(crate) fn config_dir() -> PathBuf {
     let base = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".config"));
+        .map_or_else(|| PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".config"), PathBuf::from);
     base.join("recouvrance")
 }
 
 fn data_dir() -> PathBuf {
-    let base = std::env::var_os("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".local/share"));
+    let base = std::env::var_os("XDG_DATA_HOME").map_or_else(
+        || PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".local/share"),
+        PathBuf::from,
+    );
     base.join("recouvrance")
 }
 
@@ -628,7 +628,7 @@ pub struct AuditEntry {
 }
 
 /// See [`Hub::audit_stats`].
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct AuditStats {
     pub matching: usize,
     pub oldest: Option<jiff::Timestamp>,
@@ -652,10 +652,10 @@ impl Answer {
     /// Why the call didn't go ahead, for the agent and the activity log.
     pub fn reason(self) -> &'static str {
         match self {
-            Answer::Approved => "approved",
-            Answer::Rejected => "the user did not approve this request",
-            Answer::TimedOut => "the user did not answer within 2 minutes",
-            Answer::SwitchedOff => "agent access was switched off while the request waited",
+            Self::Approved => "approved",
+            Self::Rejected => "the user did not approve this request",
+            Self::TimedOut => "the user did not answer within 2 minutes",
+            Self::SwitchedOff => "agent access was switched off while the request waited",
         }
     }
 }
@@ -951,7 +951,7 @@ impl Hub {
                 tokio::time::sleep(Duration::from_secs(2)).await;
                 let Some(hub) = hub.upgrade() else { break };
                 let now = rules_file::read(&rules_file::path()).map_err(|e| format!("{e:#}"));
-                if reload_due(&now, failed.as_deref(), &lock(&hub.rules_text)) {
+                if reload_due(&now, failed.as_deref(), lock(&hub.rules_text).as_deref()) {
                     let _ = hub.apply_rules_file();
                 }
                 failed = now.err();
@@ -1220,7 +1220,8 @@ impl Hub {
     }
 
     pub fn resolve_approval(&self, id: u64, approved: bool) {
-        if let Some(tx) = lock(&self.approvals).remove(&id) {
+        let waiting = lock(&self.approvals).remove(&id);
+        if let Some(tx) = waiting {
             let _ = tx.send(if approved { Answer::Approved } else { Answer::Rejected });
         }
     }
@@ -1275,19 +1276,16 @@ impl Hub {
         if !rediscovery_due(last, Instant::now()) {
             return None;
         }
-        match k8s::discover(client).await {
-            Ok(kinds) => {
-                let kinds = Arc::new(kinds);
-                *lock(&cluster.kinds) = Some((kinds.clone(), Instant::now()));
-                Some(kinds)
+        if let Ok(kinds) = k8s::discover(client).await {
+            let kinds = Arc::new(kinds);
+            *lock(&cluster.kinds) = Some((kinds.clone(), Instant::now()));
+            Some(kinds)
+        } else {
+            // A failure counts too, so a broken API isn't asked again on every call.
+            if let Some(previous) = previous {
+                *lock(&cluster.kinds) = Some((previous, Instant::now()));
             }
-            Err(_) => {
-                // A failure counts too, so a broken API isn't asked again on every call.
-                if let Some(previous) = previous {
-                    *lock(&cluster.kinds) = Some((previous, Instant::now()));
-                }
-                None
-            }
+            None
         }
     }
 }
@@ -1297,9 +1295,9 @@ impl Hub {
 /// By content: an edit within the same second as the last one still counts. A read that
 /// fails again the same way changes nothing; one that works again always reloads, to clear
 /// the error.
-fn reload_due(now: &Result<Option<String>, String>, failed: Option<&str>, seen: &Option<String>) -> bool {
+fn reload_due(now: &Result<Option<String>, String>, failed: Option<&str>, seen: Option<&str>) -> bool {
     match now {
-        Ok(text) => failed.is_some() || text != seen,
+        Ok(text) => failed.is_some() || text.as_deref() != seen,
         Err(e) => failed != Some(e.as_str()),
     }
 }
@@ -1342,7 +1340,7 @@ fn load_audit_tail(path: &std::path::Path) -> VecDeque<AuditEntry> {
     let Ok(mut f) = std::fs::File::open(path) else {
         return VecDeque::new();
     };
-    let start = f.metadata().map(|m| m.len()).unwrap_or(0).saturating_sub(TAIL_BYTES);
+    let start = f.metadata().map_or(0, |m| m.len()).saturating_sub(TAIL_BYTES);
     let mut buf = Vec::new();
     if f.seek(SeekFrom::Start(start)).is_err() || f.read_to_end(&mut buf).is_err() {
         return VecDeque::new();
@@ -1386,14 +1384,14 @@ mod tests {
     fn an_unreadable_rules_file_is_reloaded_once() {
         let seen = Some("old".to_string());
         let denied: Result<Option<String>, String> = Err("permission denied".into());
-        assert!(reload_due(&denied, None, &seen));
+        assert!(reload_due(&denied, None, seen.as_deref()));
         // Still unreadable the same way: nothing to do.
-        assert!(!reload_due(&denied, Some("permission denied"), &seen));
-        assert!(reload_due(&Err("other".into()), Some("permission denied"), &seen));
+        assert!(!reload_due(&denied, Some("permission denied"), seen.as_deref()));
+        assert!(reload_due(&Err("other".into()), Some("permission denied"), seen.as_deref()));
         // Readable again, even with the text last loaded: reloaded to clear the error.
-        assert!(reload_due(&Ok(seen.clone()), Some("permission denied"), &seen));
-        assert!(!reload_due(&Ok(seen.clone()), None, &seen));
-        assert!(reload_due(&Ok(None), None, &seen));
+        assert!(reload_due(&Ok(seen.clone()), Some("permission denied"), seen.as_deref()));
+        assert!(!reload_due(&Ok(seen.clone()), None, seen.as_deref()));
+        assert!(reload_due(&Ok(None), None, seen.as_deref()));
     }
 
     #[test]
@@ -1429,7 +1427,7 @@ mod tests {
     }
 
     fn rule(effect: Mode, verbs: &[&str], res: &[&str], ns: &[&str], ctx: &[&str]) -> Rule {
-        let v = |x: &[&str]| x.iter().map(|s| s.to_string()).collect();
+        let v = |x: &[&str]| x.iter().map(ToString::to_string).collect();
         Rule {
             effect,
             verbs: v(verbs),
@@ -1809,7 +1807,7 @@ mod tests {
         assert!(!path.exists());
         let kept = std::fs::read_dir(&dir)
             .unwrap()
-            .filter_map(|e| e.ok())
+            .filter_map(std::result::Result::ok)
             .any(|e| e.file_name().to_string_lossy().starts_with("agents.json.bad-"));
         assert!(kept);
         let _ = std::fs::remove_dir_all(dir);
@@ -2040,7 +2038,7 @@ pub(crate) mod properties {
         #[test]
         fn more_rules_never_undo_a_deny(policy in policy(), extra in rule(), a in access()) {
             let before = policy.decide(&a);
-            let mut more = policy.clone();
+            let mut more = policy;
             more.rules.push(extra);
             if before.mode == Mode::Deny && before.rule.is_some() {
                 prop_assert_eq!(more.decide(&a).mode, Mode::Deny);

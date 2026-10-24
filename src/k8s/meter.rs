@@ -26,49 +26,49 @@ pub enum Class {
 impl Class {
     pub fn label(self) -> &'static str {
         match self {
-            Class::Discovery => "Discovery",
-            Class::List => "Lists and reads",
-            Class::Watch => "Watches (opening)",
-            Class::Metrics => "Metrics",
-            Class::Logs => "Logs",
-            Class::Stream => "Shells and forwards",
-            Class::Write => "Writes",
+            Self::Discovery => "Discovery",
+            Self::List => "Lists and reads",
+            Self::Watch => "Watches (opening)",
+            Self::Metrics => "Metrics",
+            Self::Logs => "Logs",
+            Self::Stream => "Shells and forwards",
+            Self::Write => "Writes",
         }
     }
 
-    pub fn of(method: &http::Method, path: &str, query: &str) -> Class {
+    pub fn of(method: &http::Method, path: &str, query: &str) -> Self {
         if method != http::Method::GET {
             // Exec and port-forward upgrade with a GET or a POST.
             return if path.ends_with("/exec") || path.ends_with("/attach") || path.ends_with("/portforward") {
-                Class::Stream
+                Self::Stream
             } else {
-                Class::Write
+                Self::Write
             };
         }
         if query.split('&').any(|p| p == "watch=true" || p == "watch=1") {
-            return Class::Watch;
+            return Self::Watch;
         }
         if path.starts_with("/apis/metrics.k8s.io/") {
-            return Class::Metrics;
+            return Self::Metrics;
         }
         if path.ends_with("/log") {
-            return Class::Logs;
+            return Self::Logs;
         }
         if path.ends_with("/exec") || path.ends_with("/attach") || path.ends_with("/portforward") {
-            return Class::Stream;
+            return Self::Stream;
         }
         // "/api", "/api/v1", "/apis", "/apis/apps/v1": what the server offers.
         let parts = path.trim_matches('/').split('/').count();
         match path.split('/').nth(1) {
-            Some("api") if parts <= 2 => Class::Discovery,
-            Some("apis") if parts <= 3 => Class::Discovery,
-            _ => Class::List,
+            Some("api") if parts <= 2 => Self::Discovery,
+            Some("apis") if parts <= 3 => Self::Discovery,
+            _ => Self::List,
         }
     }
 }
 
 /// Requests of one class on one cluster.
-#[derive(Clone, Default, Debug, PartialEq)]
+#[derive(Clone, Default, Debug, PartialEq, Eq)]
 pub struct Stats {
     pub count: u64,
     pub errors: u64,
@@ -95,18 +95,18 @@ static STATS: LazyLock<Mutex<HashMap<(String, Class), Stats>>> = LazyLock::new(D
 
 /// Every cluster's numbers so far, sorted by cluster then class.
 pub fn snapshot() -> Vec<(String, Class, Stats)> {
-    let stats = STATS.lock().unwrap_or_else(|e| e.into_inner());
+    let stats = STATS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut out: Vec<_> = stats.iter().map(|((c, k), s)| (c.clone(), *k, s.clone())).collect();
     out.sort_by(|a, b| (&a.0, a.1).cmp(&(&b.0, b.1)));
     out
 }
 
 pub fn reset() {
-    STATS.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    STATS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clear();
 }
 
 fn record(context: &str, class: Class, took: Duration, failed: bool) {
-    let mut stats = STATS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut stats = STATS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     stats.entry((context.to_string(), class)).or_default().record(took, failed);
 }
 

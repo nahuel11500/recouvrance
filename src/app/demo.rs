@@ -9,7 +9,7 @@ use crate::k8s;
 impl AppView {
     /// QA crawler: every resource type, by kubectl name.
     pub fn qa_kinds(&self) -> Vec<String> {
-        self.kinds.iter().map(|k| k.kubectl_name()).collect()
+        self.kinds.iter().map(k8s::Kind::kubectl_name).collect()
     }
 
     pub fn qa_select(&mut self, name: &str, cx: &mut Context<Self>) {
@@ -196,7 +196,7 @@ impl AppView {
             }
             "who" => {
                 if let Route::Access(page) = self.route().clone() {
-                    page.update(cx, |p, cx| p.ask_who(cx));
+                    page.update(cx, crate::ui::access_view::AccessView::ask_who);
                 }
             }
             other if other.starts_with("apply:") => {
@@ -234,7 +234,7 @@ impl AppView {
                                     path.split('.').filter(|s| !s.is_empty()).map(String::from).collect(),
                                     window,
                                     cx,
-                                )
+                                );
                             });
                         }
                     }

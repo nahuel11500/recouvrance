@@ -6,7 +6,7 @@ use kube::config::Kubeconfig;
 
 use super::{create_private_file, load_contexts, safe_file_part};
 
-#[derive(Clone, Copy, PartialEq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SourceKind {
     /// KUBECONFIG or ~/.kube/config; not removable here.
     Default,
@@ -18,7 +18,7 @@ pub enum SourceKind {
     Added,
 }
 
-#[derive(Clone, PartialEq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Source {
     pub kind: SourceKind,
     /// As entered in settings (`~/` kept), or the full path.
@@ -91,16 +91,13 @@ fn file_source(kind: SourceKind, shown: String, path: &std::path::Path) -> Sourc
 /// Every source, in the order they are merged.
 pub fn sources() -> Vec<Source> {
     let mut out = Vec::new();
-    match std::env::var_os("KUBECONFIG").filter(|v| !v.is_empty()) {
-        Some(v) => {
-            for p in std::env::split_paths(&v) {
-                out.push(file_source(SourceKind::Default, tilde(&p), &p));
-            }
+    if let Some(v) = std::env::var_os("KUBECONFIG").filter(|v| !v.is_empty()) {
+        for p in std::env::split_paths(&v) {
+            out.push(file_source(SourceKind::Default, tilde(&p), &p));
         }
-        None => {
-            let p = std::path::PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".kube").join("config");
-            out.push(file_source(SourceKind::Default, "~/.kube/config".into(), &p));
-        }
+    } else {
+        let p = std::path::PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".kube").join("config");
+        out.push(file_source(SourceKind::Default, "~/.kube/config".into(), &p));
     }
     let st = crate::settings::get();
     for p in &st.kubeconfigs {

@@ -2,7 +2,7 @@
 //! agents and shortcuts.
 
 use gpui_kit::assets::IconName as Lucide;
-use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
 use gpui_kit::component::switch::Switch;
@@ -115,14 +115,14 @@ impl SettingsView {
         subs.push(number(&tail, |s, n| s.log_tail_lines = n as i64, cx));
         let hub2 = hub.clone();
         subs.push(cx.subscribe(&mcp_port, move |this, state, ev: &InputEvent, cx| {
-            if let InputEvent::Change = ev {
+            if matches!(ev, InputEvent::Change) {
                 this.mcp_port_error = port_error(&state.read(cx).value(), |p| hub2.set_port(p));
                 cx.notify();
             }
         }));
         subs.push(Self::save_typed(&notes, textarea_text, cx, |v| settings::update(|s| s.assistant_notes = v)));
         subs.push(Self::save_typed(&repos, textarea_text, cx, |v| {
-            settings::update(|s| s.assistant_repos = repo_lines(&v))
+            settings::update(|s| s.assistant_repos = repo_lines(&v));
         }));
         let delete_kind = cx.new(|cx| InputState::new(window, cx).placeholder("Add a kind, e.g. Service"));
         subs.push(cx.subscribe_in(&delete_kind, window, |this, state, ev: &InputEvent, window, cx| {
@@ -285,7 +285,7 @@ impl SettingsView {
         self._subs.push(Self::save_typed(&image, input_text, cx, move |v| {
             let v = v.trim().to_string();
             settings::update(|s| {
-                s.clusters.entry(c.clone()).or_default().node_shell_image = (!v.is_empty()).then_some(v)
+                s.clusters.entry(c.clone()).or_default().node_shell_image = (!v.is_empty()).then_some(v);
             });
         }));
         let c = ctx.clone();
@@ -400,8 +400,8 @@ impl SettingsView {
                         Button::new(SharedString::from(format!("del-{i}-{j}")))
                             .small()
                             .label(*label)
-                            .when(v == level, |b| b.primary())
-                            .when(v != level, |b| b.outline())
+                            .when(v == level, ButtonVariants::primary)
+                            .when(v != level, Button::outline)
                             .on_click(move |_, _, cx| {
                                 settings::update(|s| {
                                     s.delete_confirm_kinds.insert(kind.clone(), v);
@@ -446,8 +446,8 @@ impl SettingsView {
                 .small()
                 .label(*label)
                 .selected(v == current)
-                .when(v == current, |b| b.primary())
-                .when(v != current, |b| b.outline())
+                .when(v == current, ButtonVariants::primary)
+                .when(v != current, Button::outline)
                 .on_click(move |_, window, cx| on(v, window, cx))
         }))
     }
@@ -593,7 +593,7 @@ impl SettingsView {
                             .py_2()
                             .border_b_1()
                             .border_color(theme.border)
-                            .child(div().flex_1().min_w_0().text_sm().child(ctx.clone()))
+                            .child(div().flex_1().min_w_0().text_sm().child(ctx))
                             .child(swatches)
                             .child(
                                 Checkbox::new(("protect", i)).label("Protected").checked(protected).on_click(move |v: &bool, _, cx| {
@@ -655,9 +655,9 @@ impl SettingsView {
                         "Saved between runs. \"System\" follows your desktop.",
                         h_flex()
                             .gap_1()
-                            .child(Button::new("th-light").small().label("Light").selected(light).when(light, |b| b.primary()).when(!light, |b| b.outline()).on_click(|_, w, cx| crate::app::set_theme(ThemeMode::Light, Some(w), cx)))
-                            .child(Button::new("th-dark").small().label("Dark").selected(dark).when(dark, |b| b.primary()).when(!dark, |b| b.outline()).on_click(|_, w, cx| crate::app::set_theme(ThemeMode::Dark, Some(w), cx)))
-                            .child(Button::new("th-system").small().label("System").selected(system).when(system, |b| b.primary()).when(!system, |b| b.outline()).on_click(|_, w, cx| {
+                            .child(Button::new("th-light").small().label("Light").selected(light).when(light, ButtonVariants::primary).when(!light, Button::outline).on_click(|_, w, cx| crate::app::set_theme(ThemeMode::Light, Some(w), cx)))
+                            .child(Button::new("th-dark").small().label("Dark").selected(dark).when(dark, ButtonVariants::primary).when(!dark, Button::outline).on_click(|_, w, cx| crate::app::set_theme(ThemeMode::Dark, Some(w), cx)))
+                            .child(Button::new("th-system").small().label("System").selected(system).when(system, ButtonVariants::primary).when(!system, Button::outline).on_click(|_, w, cx| {
                                 crate::app::forget_theme_choice();
                                 let mode = crate::app::initial_theme(cx);
                                 crate::app::apply_theme(mode, Some(w), cx);
