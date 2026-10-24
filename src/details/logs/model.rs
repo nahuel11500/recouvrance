@@ -480,6 +480,21 @@ pub(crate) fn container_for(chosen: Option<&str>, containers: &[String]) -> Opti
     }
 }
 
+/// Whether streams reading `before` (each a pod and the container named) already read
+/// what `after` asks for: the same pods in the same order, each the same container. Naming
+/// none reads a pod's only container, so learning that it has just one changes nothing.
+/// `known` is each pod's containers as now known.
+pub(crate) fn same_reads(
+    before: &[(String, Option<String>)],
+    after: &[(String, Option<String>)],
+    known: &[Vec<String>],
+) -> bool {
+    before.len() == after.len()
+        && before.iter().zip(after).enumerate().all(|(ix, ((p0, c0), (p1, c1)))| {
+            p0 == p1 && (c0 == c1 || (c0.is_none() && known.get(ix).is_some_and(|k| k.len() == 1)))
+        })
+}
+
 /// Where one pod's stream is.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum StreamState {
@@ -546,6 +561,20 @@ mod tests {
         // Nothing chosen (the container list could not be read): the pod's default one.
         assert_eq!(container_for(None, &pod(&["worker", "proxy"])).as_deref(), Some("worker"));
         assert_eq!(container_for(None, &[]), None);
+    }
+
+    #[test]
+    fn learning_a_pods_containers_keeps_its_stream_when_it_reads_the_same() {
+        let read = |pod: &str, c: Option<&str>| vec![(pod.to_string(), c.map(String::from))];
+        let known = |cs: &[&str]| vec![cs.iter().map(|c| c.to_string()).collect::<Vec<_>>()];
+        // Already reading the container that is now known.
+        assert!(same_reads(&read("web-1", Some("app")), &read("web-1", Some("app")), &known(&["app", "proxy"])));
+        // None named: the pod's only container, or an error for a pod with several.
+        assert!(same_reads(&read("web-1", None), &read("web-1", Some("app")), &known(&["app"])));
+        assert!(!same_reads(&read("web-1", None), &read("web-1", Some("app")), &known(&["app", "proxy"])));
+        assert!(!same_reads(&read("web-1", Some("proxy")), &read("web-1", Some("app")), &known(&["app"])));
+        assert!(!same_reads(&read("web-1", Some("app")), &read("web-2", Some("app")), &known(&["app"])));
+        assert!(!same_reads(&read("web-1", Some("app")), &[], &[]));
     }
 
     #[test]
