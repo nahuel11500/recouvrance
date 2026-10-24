@@ -6,7 +6,7 @@ use gpui_kit::component::input::Input;
 use gpui_kit::component::popover::Popover;
 use gpui_kit::component::table::DataTable;
 use gpui_kit::component::{
-    ActiveTheme as _, Icon, IconName, Sizable as _, ThemeMode, TitleBar, WindowExt as _, h_flex, h_resizable,
+    ActiveTheme as _, Icon, IconName, Sizable as _, Theme, ThemeMode, TitleBar, WindowExt as _, h_flex, h_resizable,
     resizable_panel, v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
@@ -24,13 +24,41 @@ impl Render for AppView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         #[cfg(feature = "dev")]
         let _t = crate::dev::timing::span("app render");
-        // Keep keyboard focus somewhere useful: when the focused element went away
-        // (e.g. the table after opening a row), the list gets it back, or the app
-        // itself so Esc, Ctrl+K and the rest keep working.
-        // A handle can stay focused after its element stopped being drawn, so
-        // check that focus is really inside this view (or a popup over it).
-        // Dialogs and sheets draw outside this view: leave focus alone while one is
-        // open, or their inputs lose it on every frame and can't be typed in.
+        self.keep_focus(window, cx);
+        let content = v_flex()
+            .size_full()
+            .children(self.render_tabs(cx))
+            .child(div().flex_1().min_h_0().child(self.render_content(cx)))
+            .into_any_element();
+        let body = if self.sidebar_hidden {
+            div().size_full().child(content).into_any_element()
+        } else {
+            h_resizable("body")
+                .child(resizable_panel().size(px(230.)).child(self.render_sidebar(cx)))
+                .child(resizable_panel().child(content))
+                .into_any_element()
+        };
+        let app = v_flex().id("app").relative().size_full().track_focus(&self.focus).key_context("App");
+        self.with_actions(app, cx)
+            .bg(cx.theme().background)
+            .text_color(cx.theme().foreground)
+            .children(self.context_strip())
+            .child(TitleBar::new().child(self.render_toolbar(cx)))
+            .child(self.render_approvals(cx))
+            .child(div().flex_1().min_h_0().child(body))
+            .children(self.palette.clone())
+    }
+}
+
+impl AppView {
+    /// Keep keyboard focus somewhere useful: when the focused element went away
+    /// (e.g. the table after opening a row), the list gets it back, or the app
+    /// itself so Esc, Ctrl+K and the rest keep working.
+    /// A handle can stay focused after its element stopped being drawn, so
+    /// check that focus is really inside this view (or a popup over it).
+    /// Dialogs and sheets draw outside this view: leave focus alone while one is
+    /// open, or their inputs lose it on every frame and can't be typed in.
+    fn keep_focus(&self, window: &mut Window, cx: &mut Context<Self>) {
         let focused = window.focused(cx);
         let lost = focused.is_none()
             || (!self.focus.contains_focused(window, cx) && self.palette.is_none() && !self.ctx_open && !self.ns_open);
@@ -43,74 +71,15 @@ impl Render for AppView {
                 window.focus(&self.focus, cx);
             }
         }
-        let (total, shown) = {
-            let t = self.table.read(cx).delegate();
-            (t.total(), t.rows_count_visible())
-        };
-        let kind_label = self.kind.as_ref().map(|k| k.label.clone()).unwrap_or_default();
-        // Global scope: which clusters and namespaces, then app-wide actions.
+    }
+
+    /// The top bar: which clusters and namespaces, then app-wide actions.
+    fn render_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
-        let ctx_trigger = {
-            let names: Vec<String> = self.clusters.iter().map(|c| c.0.clone()).collect();
-            let dots: Vec<Hsla> =
-                names.iter().map(|n| crate::settings::context_color(n).map_or(theme.blue, |c| rgb(c).into())).collect();
-            let protected = names.iter().any(|n| crate::settings::is_protected(n));
-            let label = match names.len() {
-                0 => "Choose a cluster".to_string(),
-                1 => names[0].clone(),
-                n => format!("{n} clusters"),
-            };
-            Button::new("ctx-trigger").outline().child(
-                h_flex()
-                    .gap_2()
-                    .child(
-                        h_flex()
-                            .gap_0p5()
-                            .children(dots.into_iter().take(4).map(|c| div().size(px(9.)).rounded_full().bg(c))),
-                    )
-                    .child(
-                        div()
-                            .text_sm()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .max_w(px(260.))
-                            .overflow_hidden()
-                            .text_ellipsis()
-                            .whitespace_nowrap()
-                            .child(label),
-                    )
-                    .when(protected, |d| d.child(Icon::new(Lucide::Lock).size_3p5().text_color(theme.warning)))
-                    .child(Icon::new(Lucide::ChevronDown).size_3p5().text_color(theme.muted_foreground)),
-            )
-        };
-        let ns_trigger = {
-            let selected: Vec<String> = self.namespaces.clone();
-            // Names in full while they fit; the rest as a count.
-            let label = match selected.len() {
-                0 => "All namespaces".to_string(),
-                1 | 2 => selected.join(", "),
-                n => format!("{}, {} +{}", selected[0], selected[1], n - 2),
-            };
-            Button::new("ns-trigger").outline().tooltip(selected.join("\n")).child(
-                h_flex()
-                    .gap_2()
-                    .min_w(px(180.))
-                    .child(Icon::new(Lucide::Layers).size_4().text_color(theme.muted_foreground))
-                    .child(
-                        div()
-                            .flex_1()
-                            .text_sm()
-                            .max_w(px(360.))
-                            .overflow_hidden()
-                            .text_ellipsis()
-                            .whitespace_nowrap()
-                            .child(label),
-                    )
-                    .child(Icon::new(Lucide::ChevronDown).size_3p5().text_color(theme.muted_foreground)),
-            )
-        };
-        let view = cx.entity().downgrade();
-        let view2 = view.clone();
-        let toolbar = h_flex()
+        let (view, view2) = (cx.entity().downgrade(), cx.entity().downgrade());
+        let refreshable =
+            matches!(self.route(), Route::Cluster(_) | Route::Workloads(_) | Route::Problems(_) | Route::Helm(_));
+        h_flex()
             .flex_1()
             .min_w_0()
             .gap_2()
@@ -135,7 +104,7 @@ impl Render for AppView {
                             cx.notify();
                         });
                     })
-                    .trigger(ctx_trigger)
+                    .trigger(self.ctx_trigger(&theme))
                     .child(self.ctx_picker.clone()),
             )
             .when(!self.clusters.is_empty(), |d| {
@@ -148,14 +117,21 @@ impl Render for AppView {
                                 cx.notify();
                             });
                         })
-                        .trigger(ns_trigger)
+                        .trigger(self.ns_trigger(&theme))
                         .track_focus(&self.ns_picker.read(cx).focus_handle(cx))
                         .child(self.ns_picker.clone()),
                 )
             })
             .child(div().flex_1())
-            .when(matches!(self.route(), Route::Cluster(_) | Route::Workloads(_) | Route::Problems(_) | Route::Helm(_)), |d| {
-                d.child(Button::new("refresh-page").ghost().small().icon(Lucide::RefreshCw).tooltip("Refresh (F5)").on_click(cx.listener(|this, _, window, cx| this.refresh_page(window, cx))))
+            .when(refreshable, |d| {
+                d.child(
+                    Button::new("refresh-page")
+                        .ghost()
+                        .small()
+                        .icon(Lucide::RefreshCw)
+                        .tooltip("Refresh (F5)")
+                        .on_click(cx.listener(|this, _, window, cx| this.refresh_page(window, cx))),
+                )
             })
             .child(
                 h_flex()
@@ -175,37 +151,7 @@ impl Render for AppView {
                     .child(div().text_xs().px_1().rounded_sm().border_1().border_color(theme.border).child("Ctrl K"))
                     .on_click(cx.listener(|this, _, window, cx| this.open_palette(window, cx))),
             )
-            .child({
-                let writes = crate::details::writes_enabled(cx);
-                Button::new("write-mode")
-                    .xsmall()
-                    .when(!writes, |b| b.ghost().label("read-only"))
-                    .when(writes, |b| b.warning().label("writes on"))
-                    .tooltip(if writes { "Write actions are on — click to go back to read-only" } else { "Click to enable write actions" })
-                    .on_click(|_, window, cx| {
-                        if crate::details::writes_enabled(cx) {
-                            crate::details::set_writes(false, cx);
-                            cx.refresh_windows();
-                            return;
-                        }
-                        window.open_alert_dialog(cx, |alert, _, _| {
-                            alert
-                                .title("Enable write actions?")
-                                .description(
-                                    "Scale, restart, delete, YAML edits, shells and plugins become available, using your own \
-                                     kubeconfig credentials. Every action asks for confirmation. Agents are not affected: their \
-                                     access stays defined by their rules.",
-                                )
-                                .show_cancel(true)
-                                .ok_text("Enable writes")
-                                .on_ok(|_, _, cx| {
-                                    crate::details::set_writes(true, cx);
-                                    cx.refresh_windows();
-                                    true
-                                })
-                        });
-                    })
-            })
+            .child(write_mode_button(cx))
             .child(
                 Button::new("create")
                     .ghost()
@@ -250,8 +196,78 @@ impl Render for AppView {
                         this.settings_view.update(cx, crate::ui::settings_view::SettingsView::show_about);
                         this.navigate(Route::Settings, cx);
                     })),
-            );
+            )
+    }
 
+    /// The cluster picker's button: a dot per cluster, a lock when one is protected.
+    fn ctx_trigger(&self, theme: &Theme) -> Button {
+        let names: Vec<String> = self.clusters.iter().map(|c| c.0.clone()).collect();
+        let dots: Vec<Hsla> =
+            names.iter().map(|n| crate::settings::context_color(n).map_or(theme.blue, |c| rgb(c).into())).collect();
+        let protected = names.iter().any(|n| crate::settings::is_protected(n));
+        let label = match names.len() {
+            0 => "Choose a cluster".to_string(),
+            1 => names[0].clone(),
+            n => format!("{n} clusters"),
+        };
+        Button::new("ctx-trigger").outline().child(
+            h_flex()
+                .gap_2()
+                .child(
+                    h_flex()
+                        .gap_0p5()
+                        .children(dots.into_iter().take(4).map(|c| div().size(px(9.)).rounded_full().bg(c))),
+                )
+                .child(
+                    div()
+                        .text_sm()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .max_w(px(260.))
+                        .overflow_hidden()
+                        .text_ellipsis()
+                        .whitespace_nowrap()
+                        .child(label),
+                )
+                .when(protected, |d| d.child(Icon::new(Lucide::Lock).size_3p5().text_color(theme.warning)))
+                .child(Icon::new(Lucide::ChevronDown).size_3p5().text_color(theme.muted_foreground)),
+        )
+    }
+
+    /// The namespace picker's button.
+    fn ns_trigger(&self, theme: &Theme) -> Button {
+        let selected: Vec<String> = self.namespaces.clone();
+        // Names in full while they fit; the rest as a count.
+        let label = match selected.len() {
+            0 => "All namespaces".to_string(),
+            1 | 2 => selected.join(", "),
+            n => format!("{}, {} +{}", selected[0], selected[1], n - 2),
+        };
+        Button::new("ns-trigger").outline().tooltip(selected.join("\n")).child(
+            h_flex()
+                .gap_2()
+                .min_w(px(180.))
+                .child(Icon::new(Lucide::Layers).size_4().text_color(theme.muted_foreground))
+                .child(
+                    div()
+                        .flex_1()
+                        .text_sm()
+                        .max_w(px(360.))
+                        .overflow_hidden()
+                        .text_ellipsis()
+                        .whitespace_nowrap()
+                        .child(label),
+                )
+                .child(Icon::new(Lucide::ChevronDown).size_3p5().text_color(theme.muted_foreground)),
+        )
+    }
+
+    /// The resource list: its bar (kind, count, filter, actions), status and table.
+    fn render_list(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let (total, shown) = {
+            let t = self.table.read(cx).delegate();
+            (t.total(), t.rows_count_visible())
+        };
+        let kind_label = self.kind.as_ref().map(|k| k.label.clone()).unwrap_or_default();
         let view_bar = h_flex()
             .gap_3()
             .px_3()
@@ -312,7 +328,7 @@ impl Render for AppView {
                     .on_click(cx.listener(|this, _, window, cx| this.save_view_dialog(window, cx))),
             )
             .child(self.render_columns_menu(cx));
-        let main = v_flex()
+        v_flex()
             .size_full()
             .child(view_bar)
             .when_some(self.status_line(), |d, s| {
@@ -320,10 +336,12 @@ impl Render for AppView {
             })
             .children(self.render_selection_bar(cx))
             // Row presses are recorded by the table itself (see `ResourceTable::render_tr`).
-            .child(div().flex_1().min_h_0().child(DataTable::new(&self.table).small().stripe(false).bordered(false)));
+            .child(div().flex_1().min_h_0().child(DataTable::new(&self.table).small().stripe(false).bordered(false)))
+    }
 
-        let content = match self.route() {
-            Route::Resources(_) => main.into_any_element(),
+    fn render_content(&self, cx: &mut Context<Self>) -> AnyElement {
+        match self.route() {
+            Route::Resources(_) => self.render_list(cx).into_any_element(),
             Route::Detail(d) => d.clone().into_any_element(),
             Route::Workloads(d) => d.clone().into_any_element(),
             Route::Cluster(d) => d.clone().into_any_element(),
@@ -338,28 +356,12 @@ impl Render for AppView {
             Route::Apply(a) => a.clone().into_any_element(),
             Route::Terminal(t) => div().size_full().p_2().child(t.clone()).into_any_element(),
             Route::Agents => self.agents.clone().into_any_element(),
-        };
-        let content = v_flex()
-            .size_full()
-            .children(self.render_tabs(cx))
-            .child(div().flex_1().min_h_0().child(content))
-            .into_any_element();
-        let body = if self.sidebar_hidden {
-            div().size_full().child(content).into_any_element()
-        } else {
-            h_resizable("body")
-                .child(resizable_panel().size(px(230.)).child(self.render_sidebar(cx)))
-                .child(resizable_panel().child(content))
-                .into_any_element()
-        };
+        }
+    }
 
-        v_flex()
-            .id("app")
-            .relative()
-            .size_full()
-            .track_focus(&self.focus)
-            .key_context("App")
-            .on_action(cx.listener(|this, _: &OpenPalette, window, cx| this.open_palette(window, cx)))
+    /// The window's keyboard actions.
+    fn with_actions(&self, app: Stateful<Div>, cx: &mut Context<Self>) -> Stateful<Div> {
+        app.on_action(cx.listener(|this, _: &OpenPalette, window, cx| this.open_palette(window, cx)))
             .on_action(|_: &NewWindow, _, cx| open_main_window(cx))
             .on_action(cx.listener(|this, _: &NewTab, window, cx| this.new_tab(None, window, cx)))
             .on_action(cx.listener(|this, _: &CloseTab, window, cx| this.close_tab(this.active_tab, window, cx)))
@@ -433,12 +435,42 @@ impl Render for AppView {
                     }
                 });
             }))
-            .bg(cx.theme().background)
-            .text_color(cx.theme().foreground)
-            .children(self.context_strip())
-            .child(TitleBar::new().child(toolbar))
-            .child(self.render_approvals(cx))
-            .child(div().flex_1().min_h_0().child(body))
-            .children(self.palette.clone())
     }
+}
+
+/// Read-only or writes on; turning writes on asks first.
+fn write_mode_button(cx: &App) -> Button {
+    let writes = crate::details::writes_enabled(cx);
+    Button::new("write-mode")
+        .xsmall()
+        .when(!writes, |b| b.ghost().label("read-only"))
+        .when(writes, |b| b.warning().label("writes on"))
+        .tooltip(if writes {
+            "Write actions are on — click to go back to read-only"
+        } else {
+            "Click to enable write actions"
+        })
+        .on_click(|_, window, cx| {
+            if crate::details::writes_enabled(cx) {
+                crate::details::set_writes(false, cx);
+                cx.refresh_windows();
+                return;
+            }
+            window.open_alert_dialog(cx, |alert, _, _| {
+                alert
+                    .title("Enable write actions?")
+                    .description(
+                        "Scale, restart, delete, YAML edits, shells and plugins become available, using your own \
+                         kubeconfig credentials. Every action asks for confirmation. Agents are not affected: their \
+                         access stays defined by their rules.",
+                    )
+                    .show_cancel(true)
+                    .ok_text("Enable writes")
+                    .on_ok(|_, _, cx| {
+                        crate::details::set_writes(true, cx);
+                        cx.refresh_windows();
+                        true
+                    })
+            });
+        })
 }
