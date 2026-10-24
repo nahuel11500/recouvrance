@@ -532,11 +532,18 @@ pub struct Config {
     /// Global kill switch: when false every agent call is refused.
     pub enabled: bool,
     pub agents: Vec<Agent>,
+    /// 0 (missing) when saved before 0.3.0, which created agents without a section in
+    /// rules.yaml: see [`Hub::apply_rules_file`].
+    #[serde(default)]
+    pub version: u32,
 }
+
+/// agents.json's current `version`: rules.yaml names every agent.
+const CONFIG_VERSION: u32 = 1;
 
 impl Default for Config {
     fn default() -> Self {
-        Self { port: DEFAULT_PORT, enabled: true, agents: Vec::new() }
+        Self { port: DEFAULT_PORT, enabled: true, agents: Vec::new(), version: CONFIG_VERSION }
     }
 }
 
@@ -868,24 +875,30 @@ impl Hub {
     pub fn apply_rules_file(&self) -> Result<bool> {
         let path = rules_file::path();
         self.rules_file_present.store(path.exists(), Ordering::Relaxed);
-        let loaded = rules_file::read(&path).and_then(|text| {
-            *lock(&self.rules_text) = text.clone();
-            text.map(|t| rules_file::check(&t)).transpose()
-        });
-        let file = match loaded {
-            Ok(Some(f)) => f,
-            Ok(None) => {
-                *lock(&self.rules_error) = None;
-                return Ok(false);
-            }
-            Err(e) => {
-                *lock(&self.rules_error) = Some(format!("{e:#}"));
-                self.emit(HubEvent::AgentSeen);
-                return Err(e);
-            }
-        };
         {
+            // Read and apply under the config lock: an edit in the app, which writes the file
+            // under it, can't land between the two and leave the file and the rules in force
+            // different.
             let mut cfg = write(&self.config);
+            let loaded = rules_file::read(&path).and_then(|text| {
+                *lock(&self.rules_text) = text.clone();
+                text.map(|t| rules_file::check(&t)).transpose()
+            });
+            let file = match loaded {
+                Ok(Some(f)) => f,
+                Ok(None) => {
+                    *lock(&self.rules_error) = None;
+                    // No file, so no agent missing from it: a file made later is read as it is.
+                    cfg.version = CONFIG_VERSION;
+                    return Ok(false);
+                }
+                Err(e) => {
+                    *lock(&self.rules_error) = Some(format!("{e:#}"));
+                    drop(cfg);
+                    self.emit(HubEvent::AgentSeen);
+                    return Err(e);
+                }
+            };
             // A section could not say which of two agents with its name it is for.
             if let Some(name) = rules_file::shared_name(&cfg.agents) {
                 let e = anyhow::anyhow!("two agents are named `{name}`: delete one");
@@ -894,9 +907,26 @@ impl Hub {
                 self.emit(HubEvent::AgentSeen);
                 return Err(e);
             }
+            // agents.json from before 0.3.0: an agent created then had no section until its
+            // rules were edited. It keeps its rules and its section is written, once.
+            let upgrade = cfg.version < CONFIG_VERSION;
             let mut agents = cfg.agents.clone();
-            rules_file::apply_file(&file, &mut agents)?;
+            rules_file::apply_file(&file, &mut agents, upgrade)?;
+            if upgrade && agents.iter().any(|a| !file.agents.contains_key(&a.name)) {
+                let mut seen = lock(&self.rules_text);
+                match rules_file::export_over(&path, &agents, seen.as_deref()) {
+                    Ok(text) => *seen = Some(text),
+                    Err(e) => {
+                        let e = e.context("rules.yaml could not be given the agents it doesn't name");
+                        *lock(&self.rules_error) = Some(format!("{e:#}"));
+                        drop((seen, cfg));
+                        self.emit(HubEvent::AgentSeen);
+                        return Err(e);
+                    }
+                }
+            }
             cfg.agents = agents;
+            cfg.version = CONFIG_VERSION;
         }
         *lock(&self.rules_error) = None;
         self.save()?;
@@ -915,14 +945,16 @@ impl Hub {
     pub fn watch_rules_file(self: &Arc<Self>) {
         let hub = Arc::downgrade(self);
         k8s::spawn_detached(async move {
+            // Why the file could not be read last time, so the same error isn't reloaded again.
+            let mut failed: Option<String> = None;
             loop {
                 tokio::time::sleep(Duration::from_secs(2)).await;
                 let Some(hub) = hub.upgrade() else { break };
-                // By content: an edit within the same second as the last one still counts.
-                let now = rules_file::read(&rules_file::path()).ok().flatten();
-                if now != *lock(&hub.rules_text) {
+                let now = rules_file::read(&rules_file::path()).map_err(|e| format!("{e:#}"));
+                if reload_due(&now, failed.as_deref(), &lock(&hub.rules_text)) {
                     let _ = hub.apply_rules_file();
                 }
+                failed = now.err();
             }
         });
     }
@@ -1260,6 +1292,18 @@ impl Hub {
     }
 }
 
+/// Whether rules.yaml must be reloaded, from what reading it gave now (its text, None when
+/// missing, or why it can't be read), why it failed last time and the text last loaded.
+/// By content: an edit within the same second as the last one still counts. A read that
+/// fails again the same way changes nothing; one that works again always reloads, to clear
+/// the error.
+fn reload_due(now: &Result<Option<String>, String>, failed: Option<&str>, seen: &Option<String>) -> bool {
+    match now {
+        Ok(text) => failed.is_some() || text != seen,
+        Err(e) => failed != Some(e.as_str()),
+    }
+}
+
 fn rediscovery_due(last: Option<Instant>, now: Instant) -> bool {
     last.is_none_or(|t| now.duration_since(t) >= REDISCOVER_EVERY)
 }
@@ -1336,6 +1380,20 @@ mod tests {
         ruled.policy.max_rows += 1;
         assert!(!same_rules(std::slice::from_ref(&agent), &[ruled]));
         assert!(!same_rules(std::slice::from_ref(&agent), &[]));
+    }
+
+    #[test]
+    fn an_unreadable_rules_file_is_reloaded_once() {
+        let seen = Some("old".to_string());
+        let denied: Result<Option<String>, String> = Err("permission denied".into());
+        assert!(reload_due(&denied, None, &seen));
+        // Still unreadable the same way: nothing to do.
+        assert!(!reload_due(&denied, Some("permission denied"), &seen));
+        assert!(reload_due(&Err("other".into()), Some("permission denied"), &seen));
+        // Readable again, even with the text last loaded: reloaded to clear the error.
+        assert!(reload_due(&Ok(seen.clone()), Some("permission denied"), &seen));
+        assert!(!reload_due(&Ok(seen.clone()), None, &seen));
+        assert!(reload_due(&Ok(None), None, &seen));
     }
 
     #[test]
@@ -1754,6 +1812,19 @@ mod tests {
             .filter_map(|e| e.ok())
             .any(|e| e.file_name().to_string_lossy().starts_with("agents.json.bad-"));
         assert!(kept);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn an_agents_file_from_before_0_3_0_is_told_apart() {
+        let dir = temp_dir();
+        let path = dir.join("agents.json");
+        // As 0.2.0 saved it: no version.
+        std::fs::write(&path, br#"{"port": 7323, "enabled": true, "agents": []}"#).unwrap();
+        assert_eq!(load_config(&path).0.version, 0);
+        assert_eq!(Config::default().version, CONFIG_VERSION);
+        std::fs::write(&path, serde_json::to_vec(&Config::default()).unwrap()).unwrap();
+        assert_eq!(load_config(&path).0.version, CONFIG_VERSION);
         let _ = std::fs::remove_dir_all(dir);
     }
 

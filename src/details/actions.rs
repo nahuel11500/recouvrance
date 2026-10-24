@@ -131,7 +131,6 @@ impl DetailPanel {
         kubectl(&self.context, self.obj.namespace.as_deref(), &args)
     }
 
-    /// On a protected context, an input where the context name must be typed.
     /// The uid of the object on screen: a delete hits that object, not one re-created under
     /// its name since.
     fn shown_uid(&self) -> Option<String> {
@@ -139,6 +138,7 @@ impl DetailPanel {
         Some(uid.to_string())
     }
 
+    /// On a protected context, an input where the context name must be typed.
     pub(super) fn protection(
         &self,
         window: &mut Window,
@@ -539,8 +539,12 @@ impl DetailPanel {
         let opts = cx.new(|_| (false, false));
         let base = self.kubectl_for("Delete");
         let unfinalize = self.kubectl_for("Unfinalize");
+        // The object shown now: the refresh may swap in one re-created under its name while
+        // the dialog is open, and that one must not be deleted.
+        let uid = self.shown_uid();
         window.open_alert_dialog(cx, move |alert, _, cx| {
-            let (input, panel, name, guard) = (input.clone(), panel.clone(), name.clone(), guard.clone());
+            let (input, panel, name, guard, uid) =
+                (input.clone(), panel.clone(), name.clone(), guard.clone(), uid.clone());
             let (force, strip) = *opts.read(cx);
             let mut cmd = if force { format!("{base} --grace-period=0 --force") } else { base.clone() };
             // Delete first; finalizers are cleared only when it then stays, stuck terminating.
@@ -610,7 +614,7 @@ impl DetailPanel {
                             this.obj.namespace.clone(),
                             this.obj.name.clone(),
                         );
-                        let uid = this.shown_uid();
+                        let uid = uid.clone();
                         this.run_write("Delete", k8s::delete_with(c, k, ns, n, uid, force, strip), window, cx);
                     });
                     true
