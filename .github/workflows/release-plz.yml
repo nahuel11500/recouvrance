@@ -9,9 +9,13 @@
 # See docs/development.md, "Releases".
 name: Release-plz
 
+# The release pull request is opened or brought up to date only when the workflow is run by hand
+# (Actions → Release-plz → Run workflow): updated on every push to `main`, it ran CI and CodeQL
+# again each time. Publishing still runs on pushes to `main`, so merging the pull request releases.
 on:
   push:
     branches: [main]
+  workflow_dispatch:
 
 permissions: {}
 
@@ -24,7 +28,7 @@ env:
 jobs:
   release:
     name: Publish
-    if: vars.RELEASES_ENABLED == 'true'
+    if: vars.RELEASES_ENABLED == 'true' && github.event_name == 'push'
     runs-on: ubuntu-latest
     environment: release
     permissions:
@@ -68,7 +72,7 @@ jobs:
 
   pull-request:
     name: Release pull request
-    if: vars.RELEASES_ENABLED == 'true'
+    if: vars.RELEASES_ENABLED == 'true' && github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     environment: release
     permissions:
