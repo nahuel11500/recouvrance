@@ -26,7 +26,8 @@ overwrite it. In `settings.json`, only the keys that don't read get their defaul
 such as `protection`, are kept; a `protection` entry that isn't `true` or `false` counts as
 protected, and a `delete_confirm_kinds` entry that doesn't read asks for the name. When
 `settings.json` doesn't read as an object at all, or its protection choices can't be read, every
-context without a choice is protected for that session. A `settings.json` that exists but can't be
+context without a choice is protected, also after a restart, until you choose *Guess them again* in
+Settings → Contexts. A `settings.json` that exists but can't be
 read (say, owned by root after a run with `sudo`) is left alone: the app starts with the defaults,
 counts every context not set as protected, saves nothing until it is restarted with a readable
 file, and Settings says why. When `agents.json` can't be read, the app starts with no agents and
@@ -38,7 +39,9 @@ The contexts come from, merged in this order:
 
 1. `KUBECONFIG` (several paths separated by `:`), or `~/.kube/config`;
 2. files added in **Settings → Kubeconfig** (**Add files** or **Enter path**; `kubeconfigs`);
-3. every file in a watched folder (**Watch folder**; `kubeconfig_folders`), oldest first;
+3. the files in a watched folder (**Watch folder**; `kubeconfig_folders`), oldest first: those
+   without an extension or ending in `.yaml`, `.yml`, `.conf`, `.config` or `.kubeconfig`, hidden
+   files (`.name`) left out;
 4. kubeconfigs pasted in **Settings → Kubeconfig → Paste kubeconfig**, saved as they are in
    `~/.config/recouvrance/kubeconfigs/` (mode 0600). Before saving, Recouvrance lists the
    contexts and warns about commands run to log in (`exec`), files the kubeconfig reads and
@@ -66,6 +69,7 @@ context already shown as `name@file` keeps that name when `name` is freed.
 | `context_files` | | `{ "prod": "~/.kube/team-a.yaml" }`: the file each context name belongs to, so a name several files share stays with the first one, and the `name@file` names the others get stay with theirs (see above); filled in on its own |
 | `context_colors` | | `{ "prod-eu": "#ef4444" }`: a colored strip per context |
 | `protection` | guessed | `{ "prod-eu": true, "kind-dev": false }`: contexts where writes, shells and plugins need the context name typed. Contexts not listed are guessed from the context, user and cluster names and the server URL (`prod`, `prd`, `production`, `live`, `admin`, `root`); a context the kubeconfig doesn't have now, or any context while the kubeconfig can't be read, counts as protected. An older `protected_contexts` list is read once: its contexts become `true` |
+| `protect_unset` | `false` | Set when the protection choices could not be read: contexts not listed in `protection` are protected instead of guessed. *Guess them again* in Settings → Contexts turns it off |
 | `prometheus` | found automatically | `{ "ctx": "monitoring/prometheus:9090" }` (see below) |
 | `clusters` | | Per-cluster settings (below) |
 | `extra_namespaces` | | Namespaces added by hand, per context |
@@ -78,6 +82,10 @@ context already shown as `name@file` keeps that name when `name` is freed.
 | `open_browser_on_forward` | true | Open the browser after a one-click port-forward on a web port |
 | `assistant_backend` | `"auto"` | In-app assistant: `claude-code` (your Claude Code login), `api` (an Anthropic API key) or `auto` (Claude Code when installed, else the API key) |
 | `assistant_model` | `"claude-sonnet-5-5"` | Model the assistant uses |
+| `assistant_notes` | | The team's notes given to the assistant: where things run, dashboards, runbooks |
+| `assistant_repos` | | Folders of the team's code the assistant may read (Claude Code only) |
+| `delete_confirm` | `"ask"` | What deleting asks for kinds not in `delete_confirm_kinds`: `off` (delete right away), `ask` (a dialog) or `type` (the name typed) |
+| `delete_confirm_kinds` | by kind | `{ "Pod": "off", "Cluster.postgresql.cnpg.io": "type" }`: what deleting asks per kind, a custom resource with its group (see [features](features.md)). A value that doesn't read asks for the name |
 | `namespace_visits` | | Remembered by the app: namespaces chosen per context, with a visit count and the last visit time. The namespace picker shows the five most frequent first (visits weigh half as much after a week without one); 30 kept per context. Older files' `recent_namespaces` are turned into visits once |
 | `last_contexts`, `recent_contexts` | | Remembered by the app |
 
@@ -143,7 +151,8 @@ were and the Agents page shows the error.
 
 While the file exists, an agent it doesn't name has no rules, so everything it asks is denied:
 removing an agent's section takes its access away. Deleting an agent on the Agents page removes its
-section too.
+section too. Before 0.3.0 a new agent got no section until its rules were edited: on the first start
+of 0.3.0 such an agent keeps its rules, and its section is written to the file.
 
 Each section is for the agent with that name, so agent names are unique: creating a second agent
 with a taken name is refused, and if two agents already share a name the file is neither loaded nor
@@ -159,6 +168,7 @@ plugins:
     read_only: true
   - name: Open in Grafana
     kinds: [pods]
+    # xdg-open on Linux; on macOS, open
     command: xdg-open "https://grafana.example/d/pods?var-pod=$RECOUVRANCE_NAME"
     mode: background
     read_only: true

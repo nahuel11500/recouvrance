@@ -34,7 +34,7 @@ impl KubeMcp {
             ));
         }
         out.push_str(&format!(
-            "\nLimits: {} rows per list, {} log lines per call, exec timeout {}s, {} calls per minute.\nWrite tools accept dry_run=true: prefer it first.",
+            "\nLimits: {} rows per list, {} log lines per call, exec timeout {}s, {} calls per minute.\nscale, rollout_restart, patch_resource, apply_manifest and delete_resource accept dry_run=true: prefer it first.",
             p.max_rows, p.max_log_lines, p.exec_timeout, p.max_calls_per_minute
         ));
         call.finish(Ok(out))
@@ -43,13 +43,13 @@ impl KubeMcp {
     #[tool(description = "List the Kubernetes contexts (clusters) you may access.", annotations(read_only_hint = true))]
     pub(super) async fn list_contexts(&self, Extension(parts): Extension<Parts>) -> Result<String, String> {
         let call = self.begin(&parts, "list_contexts", json!({}))?;
+        // A kubeconfig that can't be read is not "no rules": say what failed.
+        let contexts = match k8s::load_contexts() {
+            Ok(c) => c.names,
+            Err(e) => return call.finish(Err(e.context("reading the kubeconfig"))),
+        };
         // The contexts a call may use: the same check as when one connects.
-        let names: Vec<String> = k8s::load_contexts()
-            .map(|c| c.names)
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|c| call.policy().context_allowed(c))
-            .collect();
+        let names: Vec<String> = contexts.into_iter().filter(|c| call.policy().context_allowed(c)).collect();
         call.finish(Ok(if names.is_empty() {
             "No contexts are allowed for this agent. Ask the user to add rules in Recouvrance.".into()
         } else {
@@ -336,20 +336,24 @@ impl KubeMcp {
             let pods_kind = self.kind(&call, &p.context, "pods").await?.1;
             if call.policy().decide(&access_for(&pods_kind, &p.context, "list", Some(ns.clone()), None)).mode
                 == Mode::Allow
-                && let Ok((defs, mut rows)) =
-                    k8s::list_table(client.clone(), pods_kind.clone(), Some(ns.clone()), sel, None).await
             {
-                rows.retain(|r| {
-                    let a = access_for(&pods_kind, &p.context, "list", Some(ns.clone()), Some(r.name.clone()));
-                    call.policy().decide(&a).mode == Mode::Allow
-                });
-                let cols: Vec<usize> =
-                    (0..defs.len()).filter(|&i| defs[i].priority == 0 || defs[i].name == "Node").collect();
-                out.push_str(&format!("Pods ({}):\n", rows.len()));
-                for r in rows.iter().take(30) {
-                    let cells: Vec<String> =
-                        cols.iter().map(|&i| r.cells.get(i).cloned().unwrap_or_default()).collect();
-                    out.push_str(&format!("  {}\n", cells.join("  ")));
+                // A list that fails is said, so it doesn't read as no pods.
+                match k8s::list_table(client.clone(), pods_kind.clone(), Some(ns.clone()), sel, None).await {
+                    Ok((defs, mut rows)) => {
+                        rows.retain(|r| {
+                            let a = access_for(&pods_kind, &p.context, "list", Some(ns.clone()), Some(r.name.clone()));
+                            call.policy().decide(&a).mode == Mode::Allow
+                        });
+                        let cols: Vec<usize> =
+                            (0..defs.len()).filter(|&i| defs[i].priority == 0 || defs[i].name == "Node").collect();
+                        out.push_str(&format!("Pods ({}):\n", rows.len()));
+                        for r in rows.iter().take(30) {
+                            let cells: Vec<String> =
+                                cols.iter().map(|&i| r.cells.get(i).cloned().unwrap_or_default()).collect();
+                            out.push_str(&format!("  {}\n", cells.join("  ")));
+                        }
+                    }
+                    Err(e) => out.push_str(&format!("Pods: could not be listed: {e:#}\n")),
                 }
             }
         }
@@ -358,17 +362,23 @@ impl KubeMcp {
             ..obj
         };
         let events_kind = self.kind(&call, &p.context, "events").await?.1;
-        if call.policy().decide(&access_for(&events_kind, &p.context, "list", ns.clone(), None)).mode == Mode::Allow
-            && let Ok(mut events) = k8s::events_for(client, obj).await
-        {
-            // The check above has no name: an Allow of some event names passes it.
-            events.retain(|e| {
-                let a = access_for(&events_kind, &p.context, "list", e.namespace.clone(), Some(e.name.clone()));
-                call.policy().decide(&a).mode == Mode::Allow
-            });
-            out.push_str(&format!("Events ({}):\n", events.len()));
-            for e in events.iter().take(20) {
-                out.push_str(&format!("  {} ago  {}  {}  x{}  {}\n", e.age, e.kind, e.reason, e.count, e.message));
+        if call.policy().decide(&access_for(&events_kind, &p.context, "list", ns.clone(), None)).mode == Mode::Allow {
+            match k8s::events_for(client, obj).await {
+                Ok(mut events) => {
+                    // The check above has no name: an Allow of some event names passes it.
+                    events.retain(|e| {
+                        let a = access_for(&events_kind, &p.context, "list", e.namespace.clone(), Some(e.name.clone()));
+                        call.policy().decide(&a).mode == Mode::Allow
+                    });
+                    out.push_str(&format!("Events ({}):\n", events.len()));
+                    for e in events.iter().take(20) {
+                        out.push_str(&format!(
+                            "  {} ago  {}  {}  x{}  {}\n",
+                            e.age, e.kind, e.reason, e.count, e.message
+                        ));
+                    }
+                }
+                Err(e) => out.push_str(&format!("Events: could not be listed: {e:#}\n")),
             }
         }
         call.finish(Ok(out))

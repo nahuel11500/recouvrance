@@ -33,5 +33,6 @@ that run `kubectl` directly with your kubeconfig instead of going through Recouv
 ## Supported versions
 
 Only the latest release is supported: security fixes go into a new release, not into older ones.
-Update with `recouvrance-update` (install script), `cargo install --locked recouvrance`, or the
-new release's `.deb`, AppImage or tarball.
+Update with `recouvrance-update` (install script), the new release's `.deb`, AppImage or tarball,
+or from source with `cargo install --locked --git https://github.com/nahuel11500/recouvrance --tag vX.Y.Z`.
+Recouvrance is not on crates.io: a `recouvrance` crate there is not this project.

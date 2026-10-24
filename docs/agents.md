@@ -30,11 +30,16 @@ Each agent has rules, like Kubernetes RBAC with an effect:
 | Field | Example |
 |---|---|
 | Effect | Allow · Ask me · Deny |
-| Verbs | get, list, logs, reveal (Secret values), exec, scale, restart, patch, apply, delete, * |
+| Verbs | get, list, logs, reveal (Secret values), exec, scale, restart, patch, apply, delete, drain, * |
 | Resources | `pods`, `deployments`, `*.cert-manager.io`, `*` |
 | Namespaces | `team-a`, `team-*`, `*` (also covers cluster-scoped objects) |
 | Contexts | `eu-*`, `staging` |
 | Names | `web-*`, `*` |
+
+Write mode and protected contexts are for you in the window: an agent's calls don't check them,
+only its rules (with the rate limit and the kill switch below). An Allow rule for a write lets the
+agent write while the window shows `read-only`, and on a protected context without its name typed;
+to keep agents off a context or from writing, give them *Ask me* or Deny rules for it (or no Allow).
 
 **Deny wins, then Ask me, then Allow; anything no rule matches is denied.** A Deny limited to some
 names hides those objects from lists rather than refusing the whole list. Patching, applying or
@@ -75,7 +80,8 @@ names only those an Allow rule lets the agent list.
 Tools: `my_permissions`, `list_contexts`, `list_resource_types`, `list_resources`, `get_resource`,
 `describe_resource`, `top_pods`, `search`, `get_events`, `find_problems`, `check_certificates`, `usage_history`, `drain_node`, `gitops`,
 `get_logs`, `exec_command`, `scale`, `rollout_restart`, `patch_resource`, `apply_manifest`,
-`delete_resource` — writes support `dry_run`.
+`delete_resource`. `scale`, `rollout_restart`, `patch_resource`, `apply_manifest` and
+`delete_resource` support `dry_run`; `exec_command`, `drain_node` and `gitops` don't.
 
 Prompts (slash commands in Claude Code: `/mcp__recouvrance__troubleshoot` …): `troubleshoot`, `rightsize`,
 `cert-audit`, `cluster-health`. They chain the tools above into a read-only workflow.
