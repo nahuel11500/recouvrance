@@ -107,10 +107,12 @@ Recouvrance holds your cluster credentials and can let AI agents act on your clu
 what you can check for yourself:
 
 - **No telemetry.** The app talks to your clusters, to the Prometheus or VictoriaMetrics you point
-  it at, and to the Anthropic API only if you use the assistant. Nothing else, and no analytics.
+  it at, to the Anthropic API only if you use the assistant, and to an https URL you load in
+  *Create / apply*. Nothing else, and no analytics.
 - **Safe by default.** Read-only until you turn writes on. Writes show their `kubectl`
   equivalent and ask for confirmation, YAML edits and applies run as a server dry run first, and
-  deletes ask as you set per kind (by default, Nodes, Namespaces, StatefulSets, Deployments and volumes need their name typed). A
+  deletes ask as you set per kind (by default, Nodes, Namespaces, Deployments, StatefulSets,
+  DaemonSets, PersistentVolumes and their claims, and CRDs need their name typed). A
   protected context always asks for its name. Write mode and protection are for you in the window:
   agents are not bound by them. Agents get only what their rules allow (an *Ask me* rule asks you
   first), every call is logged to

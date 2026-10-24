@@ -34,7 +34,7 @@ impl KubeMcp {
             ));
         }
         out.push_str(&format!(
-            "\nLimits: {} rows per list, {} log lines per call, exec timeout {}s, {} calls per minute.\nWrite tools accept dry_run=true: prefer it first.",
+            "\nLimits: {} rows per list, {} log lines per call, exec timeout {}s, {} calls per minute.\nscale, rollout_restart, patch_resource, apply_manifest and delete_resource accept dry_run=true: prefer it first.",
             p.max_rows, p.max_log_lines, p.exec_timeout, p.max_calls_per_minute
         ));
         call.finish(Ok(out))
