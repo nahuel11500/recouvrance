@@ -26,7 +26,8 @@ overwrite it. In `settings.json`, only the keys that don't read get their defaul
 such as `protection`, are kept; a `protection` entry that isn't `true` or `false` counts as
 protected, and a `delete_confirm_kinds` entry that doesn't read asks for the name. When
 `settings.json` doesn't read as an object at all, or its protection choices can't be read, every
-context without a choice is protected for that session. A `settings.json` that exists but can't be
+context without a choice is protected, also after a restart, until you choose *Guess them again* in
+Settings → Contexts. A `settings.json` that exists but can't be
 read (say, owned by root after a run with `sudo`) is left alone: the app starts with the defaults,
 counts every context not set as protected, saves nothing until it is restarted with a readable
 file, and Settings says why. When `agents.json` can't be read, the app starts with no agents and
@@ -67,6 +68,7 @@ never move to another cluster. The name is freed when its file is deleted or no 
 | `context_files` | | `{ "prod": "~/.kube/team-a.yaml" }`: the file each context name belongs to, so a name several files share stays with the first one, and the `name@file` names the others get stay with theirs (see above); filled in on its own |
 | `context_colors` | | `{ "prod-eu": "#ef4444" }`: a colored strip per context |
 | `protection` | guessed | `{ "prod-eu": true, "kind-dev": false }`: contexts where writes, shells and plugins need the context name typed. Contexts not listed are guessed from the context, user and cluster names and the server URL (`prod`, `prd`, `production`, `live`, `admin`, `root`); a context the kubeconfig doesn't have now, or any context while the kubeconfig can't be read, counts as protected. An older `protected_contexts` list is read once: its contexts become `true` |
+| `protect_unset` | `false` | Set when the protection choices could not be read: contexts not listed in `protection` are protected instead of guessed. *Guess them again* in Settings → Contexts turns it off |
 | `prometheus` | found automatically | `{ "ctx": "monitoring/prometheus:9090" }` (see below) |
 | `clusters` | | Per-cluster settings (below) |
 | `extra_namespaces` | | Namespaces added by hand, per context |
