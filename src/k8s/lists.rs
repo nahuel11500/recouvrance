@@ -1,7 +1,14 @@
 //! Lean lists: only the fields a page reads, a page at a time, and errors said plainly.
 
-#[allow(unused_imports)]
-use super::*;
+use anyhow::Result;
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::ListMeta;
+use kube::api::{DynamicObject, ListParams};
+use kube::core::Request;
+use kube::discovery::ApiResource;
+use kube::{Client, Resource as _};
+use serde::Deserialize;
+
+use super::{api_status, run_abortable, short_error};
 
 /// Items per page for `list_lean`: the server never builds one giant response.
 const LEAN_PAGE: u32 = 500;

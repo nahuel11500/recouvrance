@@ -1,8 +1,10 @@
 //! Where kubeconfigs come from, as the Settings page lists them, and kubeconfigs
 //! pasted into Recouvrance (kept in its own folder, private).
 
-#[allow(unused_imports)]
-use super::*;
+use anyhow::{Context as _, Result, anyhow};
+use kube::config::Kubeconfig;
+
+use super::{create_private_file, load_contexts, safe_file_part};
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum SourceKind {

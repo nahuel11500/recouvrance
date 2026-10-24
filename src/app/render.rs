@@ -1,7 +1,24 @@
 //! The window layout and its actions.
 
-#[allow(unused_imports)]
-use super::*;
+use gpui_kit::assets::IconName as Lucide;
+use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::input::Input;
+use gpui_kit::component::popover::Popover;
+use gpui_kit::component::table::DataTable;
+use gpui_kit::component::{
+    ActiveTheme as _, Icon, IconName, Sizable as _, ThemeMode, TitleBar, WindowExt as _, h_flex, h_resizable,
+    resizable_panel, v_flex,
+};
+use gpui_kit::prelude::FluentBuilder as _;
+use gpui_kit::*;
+
+use super::{
+    AppView, CloseTab, EscapeBack, FocusFilter, GoBack, GoForward, NewTab, NewWindow, NextTab, OpenPalette,
+    OpenSelected, PrevTab, RefreshPage, Route, RowCopyName, RowDelete, RowEvents, RowFavorite, RowLogs, RowOpen,
+    RowOpenTab, RowRestart, RowRun, RowScale, RowShell, RowYaml, ToggleSidebar, ZoomIn, ZoomOut, ZoomReset,
+    open_main_window, set_theme,
+};
+use crate::favorites::FavObject;
 
 impl Render for AppView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {

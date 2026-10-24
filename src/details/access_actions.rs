@@ -1,7 +1,12 @@
 //! Access actions: bind a role, add or remove subjects, a ServiceAccount's kubeconfig.
 
-#[allow(unused_imports)]
-use super::*;
+use gpui_kit::component::input::{Input, InputState};
+use gpui_kit::component::{ActiveTheme as _, WindowExt as _, v_flex};
+use gpui_kit::prelude::FluentBuilder as _;
+use gpui_kit::*;
+
+use super::{DetailPanel, confirm_extras, guard_ok, kubectl, shell_word};
+use crate::k8s;
 
 impl DetailPanel {
     /// Grant this role (create a binding), or add a subject to this binding (`binding`).

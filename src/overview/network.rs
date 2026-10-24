@@ -1,7 +1,11 @@
 //! Networking: Services, Ingresses, Gateway API, NetworkPolicies.
 
-#[allow(unused_imports)]
-use super::*;
+use gpui_kit::component::{ActiveTheme as _, h_flex, v_flex};
+use gpui_kit::prelude::FluentBuilder as _;
+use gpui_kit::*;
+use serde_json::Value;
+
+use super::{Ctx, arr, clipped_list, field, heading, mono, pairs, row, s};
 
 pub(super) fn service(ctx: &Ctx, cx: &App) -> Div {
     let obj = ctx.obj;

@@ -1,9 +1,16 @@
 //! Keeping the resource list live: table watches, metrics and the problem count.
 
-#[allow(unused_imports)]
-use super::*;
+use std::collections::HashSet;
+use std::sync::Arc;
+
+use futures::StreamExt as _;
+use gpui_kit::component::table::TableDelegate as _;
+use gpui_kit::*;
 
 use super::contexts::cluster_namespace;
+use super::{AppView, Route, view_cache};
+use crate::k8s;
+use crate::k8s::TableMsg;
 
 impl AppView {
     /// Count problems in the background for the sidebar badge. Big clusters are

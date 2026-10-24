@@ -1,12 +1,14 @@
 //! How long API requests take, by cluster and by kind of request, for Settings → API requests:
 //! every client goes through `MeterLayer`, which times each request until its response starts.
 
-#[allow(unused_imports)]
-use super::*;
-
+use std::collections::HashMap;
+use std::future::Future;
+use std::sync::LazyLock;
 use std::sync::Mutex;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
+
+use anyhow::Result;
 
 /// What a request does, from its method and path.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]

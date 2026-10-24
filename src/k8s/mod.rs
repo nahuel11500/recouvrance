@@ -4,25 +4,19 @@
 //! All network work runs on a dedicated tokio runtime; the UI awaits results
 //! through `JoinHandle`s or channels, which work from any executor.
 
-use std::collections::HashMap;
 use std::future::Future;
-use std::sync::{Arc, LazyLock};
+use std::sync::LazyLock;
 
-use anyhow::{Context as _, Result, anyhow};
-use futures::{AsyncBufReadExt as _, StreamExt as _, channel::mpsc};
-use k8s_openapi::api::core::v1::{Event, Namespace, Pod};
-use k8s_openapi::apimachinery::pkg::apis::meta::v1::{ListMeta, ObjectMeta};
-use kube::api::{Api, DynamicObject, ListParams, LogParams, WatchParams};
-use kube::config::{KubeConfigOptions, Kubeconfig};
-use kube::core::Request;
-use kube::discovery::{ApiCapabilities, ApiResource, Discovery, Scope, verbs};
-use kube::{Client, Config, Resource as _};
-use serde::Deserialize;
+use anyhow::{Result, anyhow};
+use kube::Client;
+use kube::api::{Api, DynamicObject, ListParams};
+use kube::discovery::ApiResource;
 
 mod access;
 mod config;
 mod discovery;
 mod exec;
+#[cfg(feature = "dev")]
 #[cfg(feature = "dev")]
 pub(crate) mod experiments;
 mod forward;
@@ -36,25 +30,16 @@ pub(crate) mod podspec;
 mod sources;
 mod table;
 mod writes;
-#[allow(unused_imports)]
+
 pub(crate) use access::*;
-#[allow(unused_imports)]
 pub(crate) use config::*;
-#[allow(unused_imports)]
 pub(crate) use discovery::*;
-#[allow(unused_imports)]
 pub(crate) use exec::*;
-#[allow(unused_imports)]
 pub(crate) use forward::*;
-#[allow(unused_imports)]
 pub(crate) use metrics::*;
-#[allow(unused_imports)]
 pub(crate) use pods::*;
-#[allow(unused_imports)]
 pub(crate) use sources::*;
-#[allow(unused_imports)]
 pub(crate) use table::*;
-#[allow(unused_imports)]
 pub(crate) use writes::*;
 
 static RUNTIME: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {

@@ -1,7 +1,8 @@
 //! The table filter: words, labels, namespaces, regexes and column expressions.
 
-#[allow(unused_imports)]
-use super::*;
+use std::borrow::Cow;
+
+use crate::k8s::Row;
 
 /// The table filter. Space-separated terms, all must match:
 /// `web` text in any column · `!web` / `-web` not · `app=web`, `app!=web`, `app` label (`l:app`)

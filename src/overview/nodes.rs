@@ -1,7 +1,12 @@
 //! Node page: system info, allocation, devices.
 
-#[allow(unused_imports)]
-use super::*;
+use gpui_kit::component::{ActiveTheme as _, h_flex, v_flex};
+use gpui_kit::prelude::FluentBuilder as _;
+use gpui_kit::*;
+use serde_json::Value;
+
+use super::{Ctx, arr, card, clipped_list, field, heading, mono, row, s, usage_bar};
+use crate::k8s;
 
 pub(super) fn node(obj: &Value, cx: &App) -> Div {
     let info = |k: &str| s(obj, &format!("/status/nodeInfo/{k}")).unwrap_or("-").to_string();

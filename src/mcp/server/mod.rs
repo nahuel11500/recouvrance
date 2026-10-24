@@ -10,26 +10,21 @@ use axum::http::StatusCode;
 use axum::middleware::Next;
 use axum::response::Response;
 use http::request::Parts;
-use rmcp::handler::server::tool::Extension;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{PromptMessage, Role};
 use rmcp::model::{ServerCapabilities, ServerConfig};
+
 use rmcp::transport::streamable_http_server::{
     StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
 };
-use rmcp::{ServerHandler, prompt, prompt_handler, prompt_router, schemars, tool, tool_handler, tool_router};
+use rmcp::{ServerHandler, prompt, prompt_handler, prompt_router, schemars, tool_handler};
 use serde::Deserialize;
-use serde_json::json;
 
 use super::{Access, Agent, Answer, AuditEntry, Decision, Hub, HubEvent, Mode, Policy, is_write};
-use crate::k8s::{self, Kind, ObjectRef, TaskGuard};
+use crate::k8s::{self, Kind, TaskGuard};
 
 mod read_tools;
 mod write_tools;
-#[allow(unused_imports)]
-pub(crate) use read_tools::*;
-#[allow(unused_imports)]
-pub(crate) use write_tools::*;
 
 /// Set by the auth middleware for every authenticated request.
 #[derive(Clone)]
@@ -975,6 +970,7 @@ pub fn start(hub: Arc<Hub>) -> TaskGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn approving_find_problems_shows_only_pod_findings() {

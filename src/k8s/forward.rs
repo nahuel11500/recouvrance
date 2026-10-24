@@ -1,9 +1,17 @@
 //! Port-forwards that follow replacement pods.
 
-#[allow(unused_imports)]
-use super::*;
+use std::sync::Arc;
+
+use anyhow::{Context as _, Result};
+use futures::channel::mpsc;
 use k8s_openapi::api::apps::v1::ReplicaSet;
+use k8s_openapi::api::core::v1::Pod;
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
+use kube::Client;
+use kube::api::{Api, ListParams};
+
+use super::{TaskGuard, run, spawn_guarded};
 
 pub enum ForwardMsg {
     Listening(u16),

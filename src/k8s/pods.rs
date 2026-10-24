@@ -1,7 +1,15 @@
 //! Pod logs, events and containers.
 
-#[allow(unused_imports)]
-use super::*;
+use std::collections::HashMap;
+
+use anyhow::{Result, anyhow};
+use futures::channel::mpsc;
+use futures::{AsyncBufReadExt as _, StreamExt as _};
+use k8s_openapi::api::core::v1::{Event, Pod};
+use kube::Client;
+use kube::api::{Api, ListParams, LogParams};
+
+use super::{ObjectRef, TaskGuard, age, api_status, names, run, short_error, spawn_guarded};
 
 pub async fn logs_text(
     client: Client,

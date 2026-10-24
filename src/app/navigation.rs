@@ -1,7 +1,13 @@
 //! Back/forward history and tabs.
 
-#[allow(unused_imports)]
-use super::*;
+use gpui_kit::assets::IconName as Lucide;
+use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::{ActiveTheme as _, IconName, Sizable as _, h_flex};
+use gpui_kit::prelude::FluentBuilder as _;
+use gpui_kit::*;
+
+use super::{AppView, Route, TabState, VisiblePages};
+use crate::k8s::Kind;
 
 impl AppView {
     pub(super) fn tab_snapshot(&self, cx: &App) -> TabState {

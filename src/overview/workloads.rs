@@ -1,7 +1,16 @@
 //! Workloads: status, scheduling, relations map, revisions, CronJobs, HPA, PDB, VPA.
 
-#[allow(unused_imports)]
-use super::*;
+use gpui_kit::assets::IconName as Lucide;
+use gpui_kit::component::{ActiveTheme as _, Icon, h_flex, v_flex};
+use gpui_kit::prelude::FluentBuilder as _;
+use gpui_kit::*;
+use serde_json::Value;
+
+use super::{
+    Ctx, age_of, arr, card, clipped_list, container_usage_row, field, heading, heading_for, load_notes, mono, n, pairs,
+    pods_table, row, s, scroll, state_color,
+};
+use crate::k8s;
 
 pub(super) fn workload(ctx: &Ctx, cx: &App) -> Div {
     let obj = ctx.obj;

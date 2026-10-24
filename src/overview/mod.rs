@@ -4,10 +4,14 @@
 use std::collections::BTreeMap;
 
 use gpui_kit::assets::IconName as Lucide;
-use gpui_kit::component::Sizable as _;
-use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::chart::AreaChart;
-use gpui_kit::component::{ActiveTheme as _, Icon, h_flex, v_flex};
+use gpui_kit::component::button::Button;
+use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, h_flex, v_flex};
+use gpui_kit::prelude::FluentBuilder as _;
+use gpui_kit::*;
+use serde_json::Value;
+
+use crate::details::{DetailPanel, OpenObject};
+use crate::k8s::{self, ContainerUsage, Kind};
 
 mod access;
 mod config;
@@ -16,33 +20,14 @@ mod nodes;
 mod pods;
 mod usage;
 mod workloads;
-#[allow(unused_imports)]
-pub(crate) use access::*;
-#[allow(unused_imports)]
+
+use access::{binding_page, role_page, service_account_page};
 pub(crate) use config::*;
-#[allow(unused_imports)]
-pub(crate) use network::*;
-#[allow(unused_imports)]
-pub(crate) use nodes::*;
-#[allow(unused_imports)]
+use network::{gateway, ingress, netpol, route, service};
+use nodes::{node, node_allocation, node_devices};
 pub(crate) use pods::*;
-#[allow(unused_imports)]
 pub(crate) use usage::*;
-#[allow(unused_imports)]
 pub(crate) use workloads::*;
-
-#[allow(unused_imports)]
-use gpui_kit::component::Sizable as _;
-
-use gpui_kit::prelude::FluentBuilder as _;
-
-use gpui_kit::*;
-
-use serde_json::Value;
-
-use crate::details::{DetailPanel, OpenObject};
-
-use crate::k8s::{self, ContainerUsage, Kind};
 
 /// Data fetched next to the object, for links and usage.
 #[derive(Default)]

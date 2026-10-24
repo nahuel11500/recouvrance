@@ -1,7 +1,18 @@
 //! MCP tools that change things: exec, scale, restart, patch, apply, drain, GitOps, delete.
 
-#[allow(unused_imports)]
-use super::*;
+use http::request::Parts;
+use rmcp::handler::server::tool::Extension;
+use rmcp::handler::server::wrapper::Parameters;
+use rmcp::{tool, tool_router};
+use serde_json::json;
+
+use super::{
+    ApplyParams, DeleteParams, DrainParams, ExecParams, GitOpsParams, KubeMcp, PatchParams, RestartParams, ScaleParams,
+    access_for, denied_namespaces, denies_eviction, manifest_objects, manifest_summary, require_ns,
+};
+use crate::k8s;
+use crate::k8s::Kind;
+use crate::mcp::Mode;
 
 #[tool_router(router = write_tools, vis = "pub(super)")]
 impl KubeMcp {

@@ -1,7 +1,13 @@
 //! Exec, attach, file copy and local commands (shell, kubectl, helm) with a context's kubeconfig.
 
-#[allow(unused_imports)]
-use super::*;
+use anyhow::{Context as _, Result, anyhow};
+use futures::StreamExt as _;
+use futures::channel::mpsc;
+use k8s_openapi::api::core::v1::Pod;
+use kube::Client;
+use kube::api::Api;
+
+use super::{TaskGuard, format_bytes, gate, private_kubeconfig, run, spawn_guarded};
 
 pub enum ExecInput {
     Bytes(Vec<u8>),

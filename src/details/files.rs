@@ -1,7 +1,12 @@
 //! Files: download and upload through the container, download the YAML.
 
-#[allow(unused_imports)]
-use super::*;
+use gpui_kit::component::WindowExt as _;
+use gpui_kit::component::input::{Input, InputState};
+use gpui_kit::component::notification::Notification;
+use gpui_kit::*;
+
+use super::{DetailPanel, confirm_extras, guard_ok, kubectl, shell_word, writes_still_on};
+use crate::k8s;
 
 impl DetailPanel {
     /// Save the object's YAML (as shown: managedFields dropped, Secrets masked unless revealed).

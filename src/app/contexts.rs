@@ -1,7 +1,14 @@
 //! Connecting to contexts, namespaces, and reloading kubeconfigs.
 
-#[allow(unused_imports)]
-use super::*;
+use std::collections::{HashMap, HashSet};
+
+use gpui_kit::component::WindowExt as _;
+use gpui_kit::component::notification::Notification;
+use gpui_kit::*;
+
+use super::{AppView, Route, TabState, dev_var};
+use crate::k8s;
+use crate::k8s::Kind;
 
 impl AppView {
     /// Connect to one or more contexts; tables merge them with a Context column.

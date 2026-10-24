@@ -1,7 +1,14 @@
 //! Configuration and storage: Secrets (certificates), ConfigMaps, PVCs, namespaces, CRDs.
 
-#[allow(unused_imports)]
-use super::*;
+use gpui_kit::assets::IconName as Lucide;
+use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, h_flex, v_flex};
+use gpui_kit::prelude::FluentBuilder as _;
+use gpui_kit::*;
+use serde_json::Value;
+
+use super::{Ctx, arr, clipped_list, field, heading, mono, row, s, state_color};
+use crate::k8s;
 
 /// Certificates are public, so they are decoded even while values are masked.
 pub(super) fn certificates(data: &serde_json::Map<String, Value>, base64: bool, cx: &App) -> Option<Div> {

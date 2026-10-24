@@ -1,7 +1,9 @@
 //! Hooks for the off-screen snapshot harness (feature `snapshot`).
 
-#[allow(unused_imports)]
-use super::*;
+use gpui_kit::*;
+
+use super::{DetailPanel, DetailTab};
+use crate::k8s;
 
 impl DetailPanel {
     /// QA crawler: errors shown on this page, and the tabs it offers.

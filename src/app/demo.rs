@@ -1,7 +1,10 @@
 //! Hooks for the off-screen snapshot harness (feature `snapshot`).
 
-#[allow(unused_imports)]
-use super::*;
+use gpui_kit::*;
+
+use super::{AppView, Route};
+use crate::details::DetailPanel;
+use crate::k8s;
 
 impl AppView {
     /// QA crawler: every resource type, by kubectl name.

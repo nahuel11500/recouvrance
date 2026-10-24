@@ -1,7 +1,13 @@
 //! Compare tab: the same object in another cluster, or another object here.
 
-#[allow(unused_imports)]
-use super::*;
+use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::{ActiveTheme as _, Sizable as _, h_flex, v_flex};
+use gpui_kit::prelude::FluentBuilder as _;
+use gpui_kit::*;
+
+use super::{DetailPanel, error_box};
+use crate::k8s;
+use crate::k8s::ObjectRef;
 
 impl DetailPanel {
     /// Compare with the same object in another cluster.

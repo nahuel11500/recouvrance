@@ -1,15 +1,17 @@
 //! Drawing the table: columns, cells (status dots, usage bars, links) and the row menu.
 
-#[allow(unused_imports)]
-use super::*;
-
 use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::menu::PopupMenu;
+use gpui_kit::component::table::ColumnSort;
 use gpui_kit::component::table::{Column, TableDelegate, TableState};
 use gpui_kit::component::{ActiveTheme as _, Icon, h_flex};
 use gpui_kit::prelude::FluentBuilder as _;
+use gpui_kit::*;
 
+use super::{Col, ResourceTable, normalized};
+use crate::k8s;
+use crate::k8s::{ColumnDef, Row};
 use crate::status::{Tone, tone};
 
 /// Keep the highlight on the selected object after its rows moved (an update, a filter,

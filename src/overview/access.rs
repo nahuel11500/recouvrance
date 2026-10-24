@@ -1,7 +1,11 @@
 //! RBAC: roles, bindings, ServiceAccounts.
 
-#[allow(unused_imports)]
-use super::*;
+use gpui_kit::component::{ActiveTheme as _, h_flex, v_flex};
+use gpui_kit::prelude::FluentBuilder as _;
+use gpui_kit::*;
+use serde_json::Value;
+
+use super::{Ctx, arr, field, heading, pods_table, row, s};
 
 /// A table of PolicyRules.
 pub(super) fn rules_table(rules: &[Value], cx: &App) -> Div {

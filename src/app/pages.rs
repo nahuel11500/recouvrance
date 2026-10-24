@@ -1,7 +1,16 @@
 //! Opening pages: objects, workloads, cluster, problems, Helm, assistant, terminal, apply, plugins.
 
-#[allow(unused_imports)]
-use super::*;
+use gpui_kit::component::WindowExt as _;
+use gpui_kit::component::notification::Notification;
+use gpui_kit::*;
+
+use super::{AppView, Route};
+use crate::details::{DetailPanel, OpenObject};
+use crate::k8s;
+use crate::k8s::{Kind, ObjectRef};
+use crate::ui::cluster::ClusterOverview;
+use crate::ui::dashboard::Dashboard;
+use crate::ui::helm::{HelmList, HelmRelease, OpenRelease};
 
 impl AppView {
     /// The connected contexts and the namespace a scoped page shows now.

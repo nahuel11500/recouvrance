@@ -1,7 +1,13 @@
 //! Kubeconfig files and contexts: merging, watching, connecting, private copies for tools.
 
-#[allow(unused_imports)]
-use super::*;
+use std::collections::HashMap;
+use std::sync::{Arc, LazyLock};
+
+use anyhow::{Context as _, Result};
+use kube::config::{KubeConfigOptions, Kubeconfig};
+use kube::{Client, Config};
+
+use super::{added_dir, folder_files, gate, meter, run, tilde};
 
 #[derive(Clone)]
 pub struct Contexts {

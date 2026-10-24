@@ -1,7 +1,8 @@
 //! Sort keys: cells compare as quantities of their column ("10 (5m ago)", "2m", "1Gi").
 
-#[allow(unused_imports)]
-use super::*;
+use gpui_kit::component::table::ColumnSort;
+
+use super::{Col, ResourceTable, Unit, quantity, unit_of};
 
 /// Numbers sort before text, numbers by value and text alphabetically. Text borrows
 /// the cell: sorting a big list allocates nothing per row.

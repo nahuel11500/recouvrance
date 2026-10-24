@@ -1,7 +1,10 @@
 //! What a detail page fetches next to the object: pods, revisions, references, usage history.
 
-#[allow(unused_imports)]
-use super::*;
+use kube::Client;
+
+use crate::k8s;
+use crate::k8s::ObjectRef;
+use crate::overview::Related;
 
 pub(super) fn container_names(value: &serde_json::Value) -> Vec<String> {
     value

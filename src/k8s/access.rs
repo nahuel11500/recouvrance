@@ -1,7 +1,10 @@
 //! What the current user may do (SelfSubject reviews) and RBAC listings.
 
-#[allow(unused_imports)]
-use super::*;
+use anyhow::Result;
+use kube::Client;
+use kube::api::Api;
+
+use super::{Kind, ar_of, list_values, lists, run};
 
 /// Whether the current user may do `verb` on this kind (and object), per the API server
 /// (SelfSubjectAccessReview, like `kubectl auth can-i`). Errors count as allowed:
