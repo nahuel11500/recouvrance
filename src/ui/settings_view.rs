@@ -68,6 +68,8 @@ pub struct SettingsView {
     kinds: Vec<crate::k8s::Kind>,
     hub: std::sync::Arc<crate::mcp::Hub>,
     _subs: Vec<Subscription>,
+    /// Per field being typed in, its save once typing pauses (see `save_typed`).
+    _saves: std::collections::HashMap<EntityId, Task<()>>,
     /// Redraws API requests every 2 s while it is shown.
     _ticker: Task<()>,
 }
@@ -98,23 +100,19 @@ impl SettingsView {
         let repos = textarea(s.assistant_repos.join("\n"), "~/code/shop", window, cx);
 
         let mut subs = Vec::new();
-        let number = |input: &Entity<InputState>,
-                      apply: fn(&mut settings::Settings, u64),
-                      subs: &mut Vec<Subscription>,
-                      cx: &mut Context<Self>| {
-            subs.push(cx.subscribe(input, move |_, state, ev: &InputEvent, cx| {
-                if let InputEvent::Change = ev
-                    && let Ok(n) = state.read(cx).value().trim().parse::<u64>()
+        let number = |input: &Entity<InputState>, apply: fn(&mut settings::Settings, u64), cx: &mut Context<Self>| {
+            Self::save_typed(input, input_text, cx, move |v| {
+                if let Ok(n) = v.trim().parse::<u64>()
                     && n > 0
                 {
                     settings::update(|s| apply(s, n));
                 }
-            }));
+            })
         };
-        number(&metrics, |s, n| s.metrics_refresh = n, &mut subs, cx);
-        number(&detail, |s, n| s.detail_refresh = n, &mut subs, cx);
-        number(&overview, |s, n| s.overview_refresh = n, &mut subs, cx);
-        number(&tail, |s, n| s.log_tail_lines = n as i64, &mut subs, cx);
+        subs.push(number(&metrics, |s, n| s.metrics_refresh = n, cx));
+        subs.push(number(&detail, |s, n| s.detail_refresh = n, cx));
+        subs.push(number(&overview, |s, n| s.overview_refresh = n, cx));
+        subs.push(number(&tail, |s, n| s.log_tail_lines = n as i64, cx));
         let hub2 = hub.clone();
         subs.push(cx.subscribe(&mcp_port, move |this, state, ev: &InputEvent, cx| {
             if let InputEvent::Change = ev {
@@ -122,17 +120,9 @@ impl SettingsView {
                 cx.notify();
             }
         }));
-        subs.push(cx.subscribe(&notes, |_, state, ev: &InputEvent, cx| {
-            if let InputEvent::Change = ev {
-                let v = state.read(cx).value().to_string();
-                settings::update(|s| s.assistant_notes = v);
-            }
-        }));
-        subs.push(cx.subscribe(&repos, |_, state, ev: &InputEvent, cx| {
-            if let InputEvent::Change = ev {
-                let v = state.read(cx).value();
-                settings::update(|s| s.assistant_repos = repo_lines(&v));
-            }
+        subs.push(Self::save_typed(&notes, textarea_text, cx, |v| settings::update(|s| s.assistant_notes = v)));
+        subs.push(Self::save_typed(&repos, textarea_text, cx, |v| {
+            settings::update(|s| s.assistant_repos = repo_lines(&v))
         }));
         let delete_kind = cx.new(|cx| InputState::new(window, cx).placeholder("Add a kind, e.g. Service"));
         subs.push(cx.subscribe_in(&delete_kind, window, |this, state, ev: &InputEvent, window, cx| {
@@ -185,6 +175,7 @@ impl SettingsView {
             kinds: Vec::new(),
             hub,
             _subs: subs,
+            _saves: Default::default(),
             _ticker: cx.spawn(async move |this, cx| {
                 loop {
                     cx.background_executor().timer(std::time::Duration::from_secs(2)).await;
@@ -207,6 +198,37 @@ impl SettingsView {
         }));
         this.sync_clusters(window, cx);
         this
+    }
+
+    /// Save what is typed in `input` once typing pauses, or when the field loses focus:
+    /// not on every key, which rewrote settings.json each time and applied half-typed
+    /// values (a refresh of 3 s on the way to 30, part of a path).
+    fn save_typed<T: EventEmitter<InputEvent>>(
+        input: &Entity<T>,
+        text: fn(&T) -> String,
+        cx: &mut Context<Self>,
+        save: impl Fn(String) + 'static,
+    ) -> Subscription {
+        let save = std::rc::Rc::new(save);
+        cx.subscribe(input, move |this, state, ev: &InputEvent, cx| {
+            let id = state.entity_id();
+            match ev {
+                // Each key replaces, and so cancels, the save not run yet.
+                InputEvent::Change => {
+                    let (v, save) = (text(state.read(cx)), save.clone());
+                    this._saves.insert(
+                        id,
+                        cx.spawn(async move |_, cx| {
+                            cx.background_executor().timer(std::time::Duration::from_millis(600)).await;
+                            save(v);
+                        }),
+                    );
+                }
+                // Leaving a field that changed saves it now.
+                InputEvent::Blur if this._saves.remove(&id).is_some() => save(text(state.read(cx))),
+                _ => {}
+            }
+        })
     }
 
     fn field(
@@ -244,17 +266,15 @@ impl SettingsView {
         let input =
             field(s.prometheus.get(&ctx).cloned().unwrap_or_default(), "Prometheus: found automatically", window, cx);
         let c = ctx.clone();
-        self._subs.push(cx.subscribe(&input, move |_, state, ev: &InputEvent, cx| {
-            if let InputEvent::Change = ev {
-                let v = state.read(cx).value().trim().to_string();
-                settings::update(|s| {
-                    if v.is_empty() {
-                        s.prometheus.remove(&c);
-                    } else {
-                        s.prometheus.insert(c.clone(), v);
-                    }
-                });
-            }
+        self._subs.push(Self::save_typed(&input, input_text, cx, move |v| {
+            let v = v.trim().to_string();
+            settings::update(|s| {
+                if v.is_empty() {
+                    s.prometheus.remove(&c);
+                } else {
+                    s.prometheus.insert(c.clone(), v);
+                }
+            });
         }));
         self.prometheus.push((ctx.clone(), input));
         let cs = settings::cluster(&ctx);
@@ -262,27 +282,16 @@ impl SettingsView {
         let namespaces =
             field(cs.namespaces.join(", "), "all (or: team-a, team-b when you may not list namespaces)", window, cx);
         let c = ctx.clone();
-        self._subs.push(cx.subscribe(&image, move |_, state, ev: &InputEvent, cx| {
-            if let InputEvent::Change = ev {
-                let v = state.read(cx).value().trim().to_string();
-                settings::update(|s| {
-                    s.clusters.entry(c.clone()).or_default().node_shell_image = (!v.is_empty()).then_some(v)
-                });
-            }
+        self._subs.push(Self::save_typed(&image, input_text, cx, move |v| {
+            let v = v.trim().to_string();
+            settings::update(|s| {
+                s.clusters.entry(c.clone()).or_default().node_shell_image = (!v.is_empty()).then_some(v)
+            });
         }));
         let c = ctx.clone();
-        self._subs.push(cx.subscribe(&namespaces, move |_, state, ev: &InputEvent, cx| {
-            if let InputEvent::Change = ev {
-                let list: Vec<String> = state
-                    .read(cx)
-                    .value()
-                    .split(',')
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(String::from)
-                    .collect();
-                settings::update(|s| s.clusters.entry(c.clone()).or_default().namespaces = list);
-            }
+        self._subs.push(Self::save_typed(&namespaces, input_text, cx, move |v| {
+            let list: Vec<String> = v.split(',').map(str::trim).filter(|s| !s.is_empty()).map(String::from).collect();
+            settings::update(|s| s.clusters.entry(c.clone()).or_default().namespaces = list);
         }));
         self.cluster_inputs.push((ctx, image, namespaces));
     }
@@ -973,6 +982,14 @@ impl Render for SettingsView {
                 ),
             )
     }
+}
+
+fn input_text(state: &InputState) -> String {
+    state.value().to_string()
+}
+
+fn textarea_text(state: &TextareaState) -> String {
+    state.value().to_string()
 }
 
 /// The code folders typed one a line.
