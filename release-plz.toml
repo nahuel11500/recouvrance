@@ -24,14 +24,26 @@ and versions follow [Semantic Versioning](https://semver.org/).
 body = """
 ## [{{ version }}]{%- if release_link -%}({{ release_link }}){% endif %} - {{ timestamp | date(format="%Y-%m-%d") }}
 {% for group, commits in commits | group_by(attribute="group") %}
-### {{ group | upper_first }}
+### {{ group | striptags | trim | upper_first }}
 
 {% for commit in commits -%}
 - {% if commit.scope %}*({{ commit.scope }})* {% endif %}{% if commit.breaking %}[**breaking**] {% endif %}{{ commit.message | upper_first }}
 {% endfor -%}
 {% endfor %}
 """
+# Messages that read well in the history but not in the release notes.
+commit_preprocessors = [
+  { pattern = '^fix: property tests for rules\.yaml, the kubeconfig merge and settings loading, and what they found \(#465\)', replace = "fix(agents): refuse a rules.yaml with a misspelt key, and don't write over one just saved in an editor (#465)" },
+]
+# The first parser that matches wins. Fixes for issues labelled `security` go under Security, at
+# the top of the release notes (the HTML comment sorts the group first; the body strips it): before
+# merging a release pull request, add the pull request numbers of that release's security fixes.
 commit_parsers = [
+  # 0.3.0
+  { message = '^fix[^\n]*\(#(335|337|339|340|341|342|343|344|345|346|347|348|349|350|351|352|353|354|414|415|416|420|422|424|427|429|436|441|442|444|445|450|455|458|459|464|465|497)\)', group = "<!-- 0 -->security" },
+  # Internal changes.
+  { message = '^fix: shared helpers for the bug classes the audits keep finding \(#355\)', skip = true },
+  { message = '^docs: quote a doc comment so cargo doc builds again \(#155\)', skip = true },
   { message = "^feat", group = "added" },
   { message = "^fix", group = "fixed" },
   { message = "^perf", group = "performance" },

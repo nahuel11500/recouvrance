@@ -36,3 +36,10 @@ Only the latest release is supported: security fixes go into a new release, not 
 Update with `recouvrance-update` (install script), the new release's `.deb`, AppImage or tarball,
 or from source with `cargo install --locked --git https://github.com/nahuel11500/recouvrance --tag vX.Y.Z`.
 Recouvrance is not on crates.io: a `recouvrance` crate there is not this project.
+
+## Security fixes in the release notes
+
+Each release lists its security fixes first, under **Security**: when a release has any, update.
+Issues found by our own reviews and audits are tracked in the open, as issues labelled
+[`security`](https://github.com/nahuel11500/recouvrance/issues?q=label%3Asecurity), and get no
+advisory; a privately reported vulnerability gets an advisory once its fix is released (above).

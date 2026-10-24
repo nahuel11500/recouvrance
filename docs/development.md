@@ -105,6 +105,11 @@ that release-plz keeps open. Behind it:
   script and the updater, calls `linux-packages.yml` for the `.deb` and AppImage, then uploads
   everything and publishes the release. release-plz does nothing until the repository variable
   `RELEASES_ENABLED` is `true`, and without its tags `release.yml` never starts.
+- **Release notes.** Before merging the release pull request, read its changelog: add the pull
+  requests that fixed an issue labelled `security` to the Security parser of `release-plz.toml`
+  (they are listed first, under Security; SECURITY.md promises it), and skip internal lines there.
+  release-plz regenerates the pull request when `main` moves, so a hand edit of its
+  changelog is lost.
 - **The `release` environment** holds the release secrets. Both release-plz jobs run in it, and its
   deployment branch rule (`main` only) keeps every other branch and workflow away from them. Keep
   release secrets out of the repository-level secrets: `release.yml` calls `linux-packages.yml`
