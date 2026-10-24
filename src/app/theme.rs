@@ -169,11 +169,7 @@ pub fn set_zoom(z: f32, window: &mut Window, cx: &mut App) {
 }
 
 pub(super) fn ui_prefs_path() -> std::path::PathBuf {
-    let base = std::env::var_os("XDG_CONFIG_HOME").map_or_else(
-        || std::path::PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".config"),
-        std::path::PathBuf::from,
-    );
-    base.join("recouvrance").join("theme")
+    crate::paths::config_dir().join("theme")
 }
 
 /// Follow the desktop's appearance again.

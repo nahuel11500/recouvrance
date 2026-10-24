@@ -547,49 +547,6 @@ impl Default for Config {
     }
 }
 
-pub(crate) fn config_dir() -> PathBuf {
-    let base = std::env::var_os("XDG_CONFIG_HOME")
-        .map_or_else(|| PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".config"), PathBuf::from);
-    base.join("recouvrance")
-}
-
-fn data_dir() -> PathBuf {
-    let base = std::env::var_os("XDG_DATA_HOME").map_or_else(
-        || PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".local/share"),
-        PathBuf::from,
-    );
-    base.join("recouvrance")
-}
-
-/// Create a directory (and its parents) readable by the user only.
-pub(crate) fn create_private_dir(dir: &std::path::Path) -> std::io::Result<()> {
-    use std::os::unix::fs::DirBuilderExt as _;
-    std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)
-}
-
-/// Write a file only the user can read, atomically: a fresh temporary file (never one
-/// someone else prepared, or left over with looser permissions), then a rename.
-pub(crate) fn write_private(path: &std::path::Path, contents: &[u8]) -> Result<()> {
-    use std::io::Write as _;
-    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
-    let dir = path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(std::path::Path::new("."));
-    create_private_dir(dir)?;
-    let file_name = path.file_name().context("no file name")?.to_string_lossy();
-    let tmp = dir.join(format!(".{file_name}.{}.tmp", uuid::Uuid::new_v4().simple()));
-    let written = (|| -> std::io::Result<()> {
-        let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&tmp)?;
-        // The umask can only remove bits; set them anyway so the result never depends on it.
-        f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-        f.write_all(contents)?;
-        f.sync_all()?;
-        std::fs::rename(&tmp, path)
-    })();
-    if written.is_err() {
-        let _ = std::fs::remove_file(&tmp);
-    }
-    Ok(written?)
-}
-
 pub fn hash_token(token: &str) -> String {
     let digest = Sha256::digest(token.as_bytes());
     digest.iter().map(|b| format!("{b:02x}")).collect()
@@ -782,7 +739,7 @@ fn load_config(path: &std::path::Path) -> (Config, Option<String>) {
 }
 
 fn config_lock_path() -> PathBuf {
-    config_dir().join("agents.lock")
+    crate::paths::config_dir().join("agents.lock")
 }
 
 /// Whether the app or `serve` is running: it keeps agents.json in memory and saves it
@@ -808,12 +765,12 @@ fn take_lock(path: &std::path::Path) -> Option<std::fs::File> {
 impl Hub {
     /// Mark agents.json as in use by this process until it exits (see [`config_in_use`]).
     pub fn claim_config(&self) {
-        let _ = create_private_dir(&config_dir());
+        let _ = crate::private_files::create_dir(&crate::paths::config_dir());
         *lock(&self.config_lock) = take_lock(&config_lock_path());
     }
 
     pub fn load() -> Arc<Self> {
-        let (mut config, config_error) = load_config(&config_dir().join("agents.json"));
+        let (mut config, config_error) = load_config(&crate::paths::config_dir().join("agents.json"));
         if let Some(e) = &config_error {
             eprintln!("{e}");
         }
@@ -937,7 +894,7 @@ impl Hub {
     /// Save new rules.yaml text from the app: validated first, then written and applied.
     pub fn save_rules_text(&self, text: &str) -> Result<()> {
         rules_file::check(text)?;
-        write_private(&rules_file::path(), text.as_bytes())?;
+        crate::private_files::write_atomic(&rules_file::path(), text.as_bytes())?;
         self.apply_rules_file().map(|_| ())
     }
 
@@ -1008,7 +965,8 @@ impl Hub {
 
     fn save(&self) -> Result<()> {
         let json = serde_json::to_vec_pretty(&*read(&self.config))?;
-        write_private(&config_dir().join("agents.json"), &json).context("saving agents.json")
+        crate::private_files::write_atomic(&crate::paths::config_dir().join("agents.json"), &json)
+            .context("saving agents.json")
     }
 
     pub fn agents_enabled(&self) -> bool {
@@ -1307,7 +1265,7 @@ fn rediscovery_due(last: Option<Instant>, now: Instant) -> bool {
 }
 
 fn audit_path() -> PathBuf {
-    data_dir().join("audit.jsonl")
+    crate::paths::data_dir().join("audit.jsonl")
 }
 
 /// Append one line, first moving a full log to `<name>.1` (replacing the older one).
@@ -1315,7 +1273,7 @@ fn append_audit(path: &std::path::Path, line: &str) -> std::io::Result<()> {
     use std::io::Write as _;
     use std::os::unix::fs::OpenOptionsExt as _;
     if let Some(dir) = path.parent() {
-        create_private_dir(dir)?;
+        crate::private_files::create_dir(dir)?;
     }
     if std::fs::metadata(path).is_ok_and(|m| m.len() >= MAX_AUDIT_BYTES) {
         let mut old = path.as_os_str().to_owned();
@@ -1879,7 +1837,7 @@ mod tests {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
         // A leftover from the old fixed temporary name is not reused.
         std::fs::write(dir.join("agents.tmp"), "planted").unwrap();
-        write_private(&path, b"new").unwrap();
+        crate::private_files::write_atomic(&path, b"new").unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "new");
         assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
         let names: Vec<String> =

@@ -592,10 +592,8 @@ impl LogsView {
         let name =
             if self.pods.len() == 1 { self.pods[0].clone() } else { format!("{}-{}pods", self.ns, self.pods.len()) };
         // Private (logs often hold tokens) and never over an earlier save.
-        let (mut f, path) = crate::private_files::create_new_in(
-            &crate::private_files::downloads_dir(),
-            &format!("{name}-{stamp}.log"),
-        )?;
+        let (mut f, path) =
+            crate::private_files::create_new_in(&crate::paths::downloads_dir(), &format!("{name}-{stamp}.log"))?;
         f.write_all(self.shown_text().as_bytes())?;
         Ok(path)
     }

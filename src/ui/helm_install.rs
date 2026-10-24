@@ -206,14 +206,15 @@ impl HelmInstall {
         }
         // A fresh private directory, removed once helm is done: the values may hold secrets.
         let values = self.values.read(cx).value().to_string();
-        let (file, dir) =
-            match crate::private_files::PrivateDir::create().and_then(|d| Ok((d.write("values.yaml", &values)?, d))) {
-                Ok(written) => written,
-                Err(e) => {
-                    window.push_notification(Notification::error(format!("Could not write values: {e}")), cx);
-                    return;
-                }
-            };
+        let (file, dir) = match crate::private_files::PrivateDir::create()
+            .and_then(|d| Ok((d.write("values.yaml", values.as_bytes())?, d)))
+        {
+            Ok(written) => written,
+            Err(e) => {
+                window.push_notification(Notification::error(format!("Could not write values: {e}")), cx);
+                return;
+            }
+        };
         let Some(args) = self.args(cx, dry_run, &file.display().to_string()) else { return };
         self.busy = true;
         self.output = None;

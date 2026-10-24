@@ -329,9 +329,7 @@ static SAVED: Mutex<u64> = Mutex::new(0);
 static LOAD_ERROR: OnceLock<String> = OnceLock::new();
 
 fn path() -> PathBuf {
-    let base = std::env::var_os("XDG_CONFIG_HOME")
-        .map_or_else(|| PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".config"), PathBuf::from);
-    base.join("recouvrance").join("settings.json")
+    crate::paths::config_dir().join("settings.json")
 }
 
 /// The settings file. A field that does not read (a hand edit, or a value from a newer
@@ -442,27 +440,6 @@ pub fn keep_aside(path: &Path) -> String {
     }
 }
 
-/// Write a file atomically: a temporary file in the same directory (created if
-/// needed), flushed, then renamed over the target. A crash never leaves half a file.
-pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    use std::io::Write as _;
-    let dir = path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
-    std::fs::create_dir_all(dir)?;
-    let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-    let tmp = dir.join(format!(".{name}.tmp-{}", uuid::Uuid::new_v4().simple()));
-    let written = std::fs::File::create(&tmp).and_then(|mut f| {
-        f.write_all(bytes)?;
-        f.sync_all()
-    });
-    match written.and_then(|()| std::fs::rename(&tmp, path)) {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            let _ = std::fs::remove_file(&tmp);
-            Err(e)
-        }
-    }
-}
-
 /// A copy of the current settings.
 pub fn get() -> Settings {
     SETTINGS.read().unwrap().clone()
@@ -486,7 +463,7 @@ pub fn update(f: impl FnOnce(&mut Settings)) {
     {
         save_newest(&SAVED, change, || {
             let p = path();
-            write_atomic(&p, &json).map_err(|e| eprintln!("{}: {e}", p.display())).is_ok()
+            crate::private_files::write_atomic(&p, &json).map_err(|e| eprintln!("{}: {e}", p.display())).is_ok()
         });
     }
 }
@@ -502,14 +479,6 @@ fn save_newest(saved: &Mutex<u64>, change: u64, write: impl FnOnce() -> bool) {
 
 pub fn secs(n: u64) -> std::time::Duration {
     std::time::Duration::from_secs(n.max(1))
-}
-
-/// Expand `~/` in a user-entered path.
-pub fn expand(p: &str) -> PathBuf {
-    match p.strip_prefix("~/") {
-        Some(rest) => PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(rest),
-        None => PathBuf::from(p),
-    }
 }
 
 /// Whether writes on this context need an extra typed confirmation. A context never set
@@ -693,7 +662,7 @@ fn unix_now() -> i64 {
 mod tests {
     use super::{
         DeleteConfirm, NamespaceVisit, Settings, by_field, delete_confirm_in, guess_protected, load_from, load_json,
-        migrate_list, protected_among, recent_as_visits, record_visits, save_newest, visit_score, write_atomic,
+        migrate_list, protected_among, recent_as_visits, record_visits, save_newest, visit_score,
     };
 
     #[test]
@@ -871,18 +840,6 @@ mod tests {
         let d = std::env::temp_dir().join(format!("recouvrance-test-{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir_all(&d).unwrap();
         d
-    }
-
-    #[test]
-    fn atomic_write_replaces_and_creates_the_directory() {
-        let d = scratch();
-        let p = d.join("sub").join("x.json");
-        write_atomic(&p, b"{\"a\":1}").unwrap();
-        write_atomic(&p, b"{\"a\":2}").unwrap();
-        assert_eq!(std::fs::read(&p).unwrap(), b"{\"a\":2}");
-        // No temporary file left behind.
-        assert_eq!(std::fs::read_dir(d.join("sub")).unwrap().count(), 1);
-        std::fs::remove_dir_all(d).unwrap();
     }
 
     #[test]

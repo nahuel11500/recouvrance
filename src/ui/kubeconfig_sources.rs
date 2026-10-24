@@ -103,7 +103,7 @@ impl KubeconfigSources {
         if text.is_empty() {
             return;
         }
-        self.add(&[crate::settings::expand(&text)], cx);
+        self.add(&[crate::paths::expand(&text)], cx);
         if self.problems.is_empty() {
             self.path = None;
         }
@@ -155,7 +155,8 @@ impl KubeconfigSources {
         let n = p.checked.as_ref().map_or(0, |c| c.contexts.len());
         match crate::k8s::save_pasted(&text, &name) {
             Ok(path) => {
-                let msg = format!("Saved {} ({n} context{})", crate::k8s::tilde(&path), if n == 1 { "" } else { "s" });
+                let msg =
+                    format!("Saved {} ({n} context{})", crate::paths::tilde(&path), if n == 1 { "" } else { "s" });
                 window.push_notification(Notification::success(msg), cx);
                 self.paste = None;
                 self.changed(cx);
@@ -309,7 +310,7 @@ impl KubeconfigSources {
             .child(div().text_sm().font_weight(FontWeight::MEDIUM).child("Paste a kubeconfig"))
             .child(div().text_xs().text_color(muted).child(format!(
                 "Saved as it is in {}, readable only by you, and merged with the other sources.",
-                crate::k8s::tilde(&crate::k8s::added_dir())
+                crate::paths::tilde(&crate::k8s::added_dir())
             )))
             .child(
                 div()

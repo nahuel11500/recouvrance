@@ -16,6 +16,7 @@ mod k8s;
 mod latest;
 mod mcp;
 mod overview;
+mod paths;
 mod plugins;
 mod private_files;
 mod problems;

@@ -4,7 +4,9 @@
 use anyhow::{Context as _, Result, anyhow};
 use kube::config::Kubeconfig;
 
-use super::{create_private_file, load_contexts, safe_file_part};
+use super::{load_contexts, safe_file_part};
+use crate::paths::tilde;
+use crate::private_files::{dashed, save_new};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SourceKind {
@@ -31,7 +33,7 @@ pub struct Source {
 
 /// The folder for kubeconfigs pasted into Recouvrance.
 pub fn added_dir() -> std::path::PathBuf {
-    crate::mcp::config_dir().join("kubeconfigs")
+    crate::paths::config_dir().join("kubeconfigs")
 }
 
 /// Files of a folder that look like kubeconfigs: no hidden files, YAML-ish or no extension.
@@ -52,15 +54,6 @@ pub(super) fn folder_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
         (m.and_then(|m| m.created().or_else(|_| m.modified()).ok()), p.clone())
     });
     found
-}
-
-/// `/home/me/x` as `~/x`, the way paths are kept in settings.
-pub fn tilde(p: &std::path::Path) -> String {
-    let home = std::env::var_os("HOME").map(std::path::PathBuf::from).unwrap_or_default();
-    match p.strip_prefix(&home) {
-        Ok(rest) if !home.as_os_str().is_empty() => format!("~/{}", rest.display()),
-        _ => p.display().to_string(),
-    }
 }
 
 fn count(files: &[std::path::PathBuf]) -> (usize, Option<String>) {
@@ -96,15 +89,15 @@ pub fn sources() -> Vec<Source> {
             out.push(file_source(SourceKind::Default, tilde(&p), &p));
         }
     } else {
-        let p = std::path::PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".kube").join("config");
-        out.push(file_source(SourceKind::Default, "~/.kube/config".into(), &p));
+        let p = crate::paths::default_kubeconfig();
+        out.push(file_source(SourceKind::Default, tilde(&p), &p));
     }
     let st = crate::settings::get();
     for p in &st.kubeconfigs {
-        out.push(file_source(SourceKind::File, p.clone(), &crate::settings::expand(p)));
+        out.push(file_source(SourceKind::File, p.clone(), &crate::paths::expand(p)));
     }
     for d in &st.kubeconfig_folders {
-        let dir = crate::settings::expand(d);
+        let dir = crate::paths::expand(d);
         if !dir.is_dir() {
             out.push(Source {
                 kind: SourceKind::Folder,
@@ -167,7 +160,7 @@ pub fn remove_source(src: &Source) -> Result<()> {
         SourceKind::File => crate::settings::update(|s| s.kubeconfigs.retain(|p| *p != src.path)),
         SourceKind::Folder => crate::settings::update(|s| s.kubeconfig_folders.retain(|p| *p != src.path)),
         SourceKind::Added => {
-            let path = crate::settings::expand(&src.path);
+            let path = crate::paths::expand(&src.path);
             // Only files in our own folder.
             anyhow::ensure!(path.parent() == Some(added_dir().as_path()), "not a pasted kubeconfig");
             std::fs::remove_file(&path).with_context(|| format!("deleting {}", src.path))?;
@@ -247,12 +240,7 @@ pub fn inspect_pasted(text: &str) -> Result<Pasted> {
 /// replacing a file: a taken name gets `-1`, `-2`…). The text is kept as pasted.
 pub fn save_pasted(text: &str, name: &str) -> Result<std::path::PathBuf> {
     inspect_pasted(text)?;
-    let dir = added_dir();
-    let mut b = std::fs::DirBuilder::new();
-    b.recursive(true);
-    std::os::unix::fs::DirBuilderExt::mode(&mut b, 0o700);
-    b.create(&dir)?;
-    create_private_file(&dir, &pasted_base(name), "yaml", text.as_bytes())
+    Ok(save_new(&added_dir(), &pasted_base(name), "yaml", text.as_bytes())?)
 }
 
 /// The file name (without `.yaml`) a pasted kubeconfig named `name` would be saved
@@ -266,12 +254,11 @@ fn pasted_base(name: &str) -> String {
     if stem.trim_matches(['.', '_']).is_empty() { "kubeconfig".to_string() } else { stem }
 }
 
-/// `stem`, or `stem-1`, `stem-2`… when `<stem>.yaml` is taken in `dir` (as `create_private_file`).
+/// `stem`, or `stem-1`, `stem-2`… when `<stem>.yaml` is taken in `dir` (as `save_new` names it).
 fn free_stem(dir: &std::path::Path, stem: &str) -> String {
     (0..1000)
-        .map(|i| if i == 0 { stem.to_string() } else { format!("{stem}-{i}") })
-        .find(|s| !dir.join(format!("{s}.yaml")).exists())
-        .unwrap_or_else(|| stem.to_string())
+        .find(|&n| !dir.join(dashed(stem, "yaml", n)).exists())
+        .map_or_else(|| stem.to_string(), |n| dashed(stem, "yaml", n).trim_end_matches(".yaml").to_string())
 }
 
 #[cfg(test)]
@@ -303,9 +290,9 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("recouvrance-test-{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir_all(&dir).unwrap();
         assert_eq!(super::free_stem(&dir, "kubeconfig"), "kubeconfig");
-        let a = super::create_private_file(&dir, "kubeconfig", "yaml", b"a").unwrap();
+        let a = crate::private_files::save_new(&dir, "kubeconfig", "yaml", b"a").unwrap();
         assert_eq!(super::free_stem(&dir, "kubeconfig"), "kubeconfig-1");
-        let b = super::create_private_file(&dir, "kubeconfig", "yaml", b"b").unwrap();
+        let b = crate::private_files::save_new(&dir, "kubeconfig", "yaml", b"b").unwrap();
         assert_eq!(b.file_stem().unwrap(), "kubeconfig-1");
         assert_eq!(super::free_stem(&dir, "kubeconfig"), "kubeconfig-2");
         assert_eq!(a.file_stem().unwrap(), "kubeconfig");
@@ -329,16 +316,12 @@ mod tests {
     }
 
     #[test]
-    fn tilde_shortens_home() {
-        let home = std::path::PathBuf::from(std::env::var_os("HOME").unwrap());
-        assert_eq!(super::tilde(&home.join(".kube/a")), "~/.kube/a");
-        assert_eq!(super::tilde(std::path::Path::new("/etc/k")), "/etc/k");
-    }
-
-    #[test]
     fn typed_paths_are_kept_absolute() {
         let cwd = std::env::current_dir().unwrap();
-        assert_eq!(super::settings_path(std::path::Path::new("team.yaml")), super::tilde(&cwd.join("team.yaml")));
+        assert_eq!(
+            super::settings_path(std::path::Path::new("team.yaml")),
+            crate::paths::tilde(&cwd.join("team.yaml"))
+        );
         assert_eq!(super::settings_path(std::path::Path::new("/etc/k")), "/etc/k");
         let home = std::path::PathBuf::from(std::env::var_os("HOME").unwrap());
         assert_eq!(super::settings_path(&home.join(".kube/a")), "~/.kube/a");

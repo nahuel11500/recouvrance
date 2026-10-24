@@ -263,7 +263,7 @@ pub async fn download_from_container(
             (vec!["cat".into(), "--".into(), path.clone()], format!("{pod}-{base}"))
         };
         // Streamed to a new private file (it may hold secrets), never over an earlier one.
-        let (file, dest) = crate::private_files::create_new_in(&crate::private_files::downloads_dir(), &name)?;
+        let (file, dest) = crate::private_files::create_new_in(&crate::paths::downloads_dir(), &name)?;
         // Through a buffer, and off the async workers while the disk is written.
         let mut file = std::io::BufWriter::with_capacity(1 << 20, file);
         let mut sink = |b: &[u8]| tokio::task::block_in_place(|| file.write_all(b));

@@ -63,45 +63,8 @@ impl Settle {
     }
 }
 
-/// A directory only we can read (mode 0700, fresh random name), removed when dropped.
-struct PrivateDir(std::path::PathBuf);
-
-impl PrivateDir {
-    fn create() -> std::io::Result<Self> {
-        let base = std::env::var_os("XDG_RUNTIME_DIR")
-            .map(std::path::PathBuf::from)
-            .filter(|p| p.is_absolute() && p.is_dir())
-            .unwrap_or_else(std::env::temp_dir);
-        let dir = base.join(format!("recouvrance-{}", uuid::Uuid::new_v4().simple()));
-        let mut b = std::fs::DirBuilder::new();
-        #[cfg(unix)]
-        std::os::unix::fs::DirBuilderExt::mode(&mut b, 0o700);
-        // Not recursive: fails if the path already exists, so we never reuse someone else's.
-        b.create(&dir)?;
-        Ok(Self(dir))
-    }
-
-    /// Write a file readable only by us (mode 0600).
-    fn write(&self, name: &str, text: &str) -> std::io::Result<std::path::PathBuf> {
-        use std::io::Write as _;
-        let path = self.0.join(name);
-        let mut o = std::fs::OpenOptions::new();
-        o.write(true).create(true).truncate(true);
-        #[cfg(unix)]
-        std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o600);
-        o.open(&path)?.write_all(text.as_bytes())?;
-        Ok(path)
-    }
-}
-
-impl Drop for PrivateDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
 struct External {
-    dir: PrivateDir,
+    dir: crate::private_files::PrivateDir,
     path: std::path::PathBuf,
     settle: Settle,
 }
@@ -338,9 +301,9 @@ impl ApplyView {
         // Reuse this view's private directory when there is one.
         let dir = match self.external.take() {
             Some(x) => Ok(x.dir),
-            None => PrivateDir::create(),
+            None => crate::private_files::PrivateDir::create(),
         };
-        let written = dir.and_then(|dir| dir.write("apply.yaml", &text).map(|path| (dir, path)));
+        let written = dir.and_then(|dir| dir.overwrite("apply.yaml", text.as_bytes()).map(|path| (dir, path)));
         let (dir, path) = match written {
             Ok(x) => x,
             Err(e) => {

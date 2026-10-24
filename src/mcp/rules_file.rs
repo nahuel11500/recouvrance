@@ -31,7 +31,7 @@ use serde::{Deserialize, Serialize};
 use super::{Mode, Policy, Rule};
 
 pub fn path() -> PathBuf {
-    super::config_dir().join("rules.yaml")
+    crate::paths::config_dir().join("rules.yaml")
 }
 
 // Unknown keys are refused: a misspelt `deny:` would otherwise drop its rules in silence.
@@ -334,7 +334,7 @@ pub fn export_over(path: &Path, agents: &[super::Agent], seen: Option<&str>) -> 
         bail!("rules.yaml changed on disk since it was loaded: it is being reloaded, make this change again");
     }
     let text = render(agents)?;
-    super::write_private(path, text.as_bytes())?;
+    crate::private_files::write_atomic(path, text.as_bytes())?;
     Ok(text)
 }
 

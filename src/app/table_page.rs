@@ -544,7 +544,7 @@ impl AppView {
         let stamp = jiff::Zoned::now().strftime("%Y%m%d-%H%M%S").to_string();
         let name = format!("{}-{stamp}.csv", kind.ar.plural);
         // Private and never over an earlier export.
-        let r = crate::private_files::create_new_in(&crate::private_files::downloads_dir(), &name)
+        let r = crate::private_files::create_new_in(&crate::paths::downloads_dir(), &name)
             .and_then(|(mut f, path)| f.write_all(csv.as_bytes()).map(|()| path));
         window.push_notification(
             match r {
