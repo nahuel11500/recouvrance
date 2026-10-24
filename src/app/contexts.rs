@@ -34,9 +34,7 @@ impl AppView {
         self.watch = None;
         self.metrics = None;
         // Watch errors name the old clusters, and would hide "Connecting…" and new failures.
-        self.watch_errors.clear();
-        self.listing.clear();
-        self.refused.clear();
+        self.list = super::live_list::LiveList::default();
         // The problem badge counted the old clusters.
         self._problem_watch = None;
         self.problem_counts = None;
@@ -58,7 +56,7 @@ impl AppView {
         self.index_failed.clear();
         self.index_built = None;
         self._index_tasks.clear();
-        self.status = Some(format!("Connecting to {}…", contexts.join(", ")).into());
+        self.list.notice = Some(format!("Connecting to {}…", contexts.join(", ")).into());
         self.connect_errors = None;
         self.connecting = true;
         self.table.update(cx, |t, cx| {
@@ -174,7 +172,10 @@ impl AppView {
                             _ => {}
                         }
                     }
-                    Err(e) => this.status = Some(format!("{e:#}").into()),
+                    Err(e) => {
+                        this.list.notice = None;
+                        this.connect_errors = Some(format!("{e:#}").into());
+                    }
                 }
                 cx.notify();
             });

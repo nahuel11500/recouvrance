@@ -1,6 +1,6 @@
 //! Main window: context and namespace pickers, kind sidebar, live table, details.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use futures::StreamExt as _;
@@ -32,6 +32,7 @@ mod chrome;
 mod contexts;
 #[cfg(feature = "dev")]
 mod demo;
+mod live_list;
 mod navigation;
 mod pages;
 mod render;
@@ -289,15 +290,8 @@ pub struct AppView {
     clusters: Vec<(String, Client)>,
     /// Which clusters serve each kind (by `Kind::key`).
     kind_clusters: HashMap<String, Vec<usize>>,
-    /// Clusters whose initial list is still arriving.
-    listing: HashSet<usize>,
-    /// Clusters that refused to list the kind (403).
-    refused: HashSet<usize>,
-    /// Latest rows per cluster, merged into the table.
-    rows_by_ctx: Vec<Vec<Arc<k8s::Row>>>,
-    /// The columns each cluster's rows are laid out in: two clusters can serve a CRD
-    /// from different operator releases, with other printer columns.
-    defs_by_ctx: Vec<Arc<Vec<k8s::ColumnDef>>>,
+    /// The kind on screen, listed across the clusters.
+    list: live_list::LiveList,
     /// Lists shown recently, shown again at once when you come back to them.
     views: view_cache::ViewCache,
     /// What the list on screen is (clusters, kind, namespace, custom columns), to keep it
@@ -308,11 +302,8 @@ pub struct AppView {
     namespace: Option<String>,
     expanded_groups: HashSet<String>,
     table: Entity<TableState<ResourceTable>>,
-    status: Option<SharedString>,
     /// Contexts that failed to connect, until the next connect.
     connect_errors: Option<SharedString>,
-    /// Each cluster's last watch error, until that cluster sends rows again.
-    watch_errors: BTreeMap<usize, SharedString>,
     watch: Option<Vec<(TaskGuard, Task<()>)>>,
     metrics: Option<Vec<(TaskGuard, Task<()>)>>,
     /// A connect is in flight (`_connect` stays set once it is done).
@@ -531,20 +522,16 @@ impl AppView {
             client: None,
             clusters: Vec::new(),
             kind_clusters: HashMap::new(),
-            rows_by_ctx: Vec::new(),
-            defs_by_ctx: Vec::new(),
             views: Default::default(),
+            list: live_list::LiveList::default(),
             view_key: None,
-            listing: HashSet::new(),
-            refused: HashSet::new(),
             kinds: Vec::new(),
             kind: None,
             namespace: None,
             expanded_groups: HashSet::new(),
             table,
-            status,
-            connect_errors: None,
-            watch_errors: BTreeMap::new(),
+            // A kubeconfig that can't be read shows where connect errors do.
+            connect_errors: status,
             watch: None,
             metrics: None,
             connecting: false,

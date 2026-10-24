@@ -21,7 +21,7 @@ impl AppView {
     /// (rows, still listing, status text) of the resource list.
     pub fn qa_list(&self, cx: &App) -> (usize, bool, Option<String>) {
         let rows = self.table.read(cx).delegate().total();
-        (rows, !self.listing.is_empty(), self.status_line().map(|s| s.to_string()))
+        (rows, self.list.is_loading(), self.status_line().map(|s| s.to_string()))
     }
 
     pub fn qa_back(&mut self, cx: &mut Context<Self>) {
