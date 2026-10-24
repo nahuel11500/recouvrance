@@ -360,7 +360,7 @@ impl DetailPanel {
                     let sub = cx.subscribe(&terminal, |this, _, _: &crate::ui::terminal::SessionEnded, cx| {
                         this.end_node_shell(cx);
                     });
-                    this._subs.push(sub);
+                    this._shell_sub = Some(sub);
                     this.terminal = Some(terminal);
                     this.tab = DetailTab::Shell;
                     cx.notify();
@@ -404,7 +404,7 @@ impl DetailPanel {
             this.refresh_object(false, window, cx);
             this.load_events(cx);
         });
-        self._subs.push(sub);
+        self._data_editor_sub = Some(sub);
         self.data_editor = Some(editor);
         self.tab = DetailTab::Overview;
         cx.notify();

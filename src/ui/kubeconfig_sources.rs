@@ -31,7 +31,9 @@ pub struct KubeconfigSources {
     confirm_delete: Option<String>,
     problems: Vec<String>,
     _task: Option<Task<()>>,
-    _subs: Vec<Subscription>,
+    /// Enter in the path field, and changes to the paste: replaced when either opens again.
+    _path_sub: Option<Subscription>,
+    _paste_sub: Option<Subscription>,
 }
 
 impl KubeconfigSources {
@@ -44,7 +46,8 @@ impl KubeconfigSources {
             confirm_delete: None,
             problems: Vec::new(),
             _task: None,
-            _subs: Vec::new(),
+            _path_sub: None,
+            _paste_sub: None,
         }
     }
 
@@ -84,7 +87,7 @@ impl KubeconfigSources {
     fn open_path(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let input =
             cx.new(|cx| InputState::new(window, cx).placeholder("~/clusters/team.yaml or a folder, Enter to add"));
-        self._subs.push(cx.subscribe(&input, |this, _, ev: &InputEvent, cx| {
+        self._path_sub = Some(cx.subscribe(&input, |this, _, ev: &InputEvent, cx| {
             if let InputEvent::PressEnter { .. } = ev {
                 this.add_typed(cx);
             }
@@ -111,7 +114,7 @@ impl KubeconfigSources {
             EditorState::new(window, cx).language("yaml").line_number(true).placeholder("Paste a kubeconfig here")
         });
         let name = cx.new(|cx| InputState::new(window, cx).placeholder("File name"));
-        self._subs.push(cx.subscribe_in(&editor, window, |this, state, ev: &InputEvent, window, cx| {
+        self._paste_sub = Some(cx.subscribe_in(&editor, window, |this, state, ev: &InputEvent, window, cx| {
             if let InputEvent::Change = ev {
                 let text = state.read(cx).value().to_string();
                 this.check_paste(&text, window, cx);

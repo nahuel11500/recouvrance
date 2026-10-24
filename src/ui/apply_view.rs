@@ -126,6 +126,8 @@ pub struct ApplyView {
     _load: Option<Task<()>>,
     _watch: Option<Task<()>>,
     _subs: Vec<Subscription>,
+    /// The open form's save: replaced when another form opens.
+    _form_sub: Option<Subscription>,
 }
 
 impl ApplyView {
@@ -171,6 +173,7 @@ impl ApplyView {
             _load: None,
             _watch: None,
             _subs: subs,
+            _form_sub: None,
         };
         #[cfg(feature = "dev")]
         if std::env::var("RECOUVRANCE_APPLY_DRY").is_ok() {
@@ -239,7 +242,7 @@ impl ApplyView {
         let Some(k) = self.kinds.iter().find(|k| k.is("", kind)).cloned() else { return };
         let (ctx, client, ns) = (self.context.clone(), self.client.clone(), Some(self.ns()));
         let form = cx.new(|cx| DataEditor::new(ctx, client, k, ns, None, window, cx));
-        self._subs.push(cx.subscribe_in(&form, window, |this, _, ev: &DataSaved, _, cx| {
+        self._form_sub = Some(cx.subscribe_in(&form, window, |this, _, ev: &DataSaved, _, cx| {
             this.results = vec![Problem { ok: true, text: ev.0.clone(), line: None }];
             this.form = None;
             cx.notify();
