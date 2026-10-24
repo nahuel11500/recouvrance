@@ -13,7 +13,7 @@ use super::{
 };
 use crate::k8s;
 use crate::k8s::ObjectRef;
-use crate::mcp::Mode;
+use crate::mcp::{Mode, Verb};
 
 #[tool_router(router = read_tools, vis = "pub(super)")]
 impl KubeMcp {
@@ -107,7 +107,7 @@ impl KubeMcp {
             "label_selector": p.label_selector, "field_selector": p.field_selector});
         let mut call = self.begin(&parts, "list_resources", args)?;
         let (client, kind) = self.kind(&call, &p.context, &p.kind).await?;
-        let access = access_for(&kind, &p.context, "list", p.namespace.clone(), None);
+        let access = access_for(&kind, &p.context, Verb::List, p.namespace.clone(), None);
         // A cluster-scoped kind is in no namespace, not in all of them.
         self.authorize_list(&mut call, &access, kind.namespaced && p.namespace.is_none()).await?;
         let (defs, rows) = match k8s::list_table(
@@ -126,7 +126,9 @@ impl KubeMcp {
         let policy = call.policy();
         let visible: Vec<_> = rows
             .iter()
-            .filter(|r| call.may_see(&access_for(&kind, &p.context, "list", r.namespace.clone(), Some(r.name.clone()))))
+            .filter(|r| {
+                call.may_see(&access_for(&kind, &p.context, Verb::List, r.namespace.clone(), Some(r.name.clone())))
+            })
             .collect();
         let hidden = rows.len() - visible.len();
         let wide = p.wide.unwrap_or(false);
@@ -187,10 +189,10 @@ impl KubeMcp {
         let mut call = self.begin(&parts, "get_resource", args)?;
         let (client, kind) = self.kind(&call, &p.context, &p.kind).await?;
         require_ns(&call, &kind, p.namespace.as_deref())?;
-        let access = access_for(&kind, &p.context, "get", p.namespace.clone(), Some(p.name.clone()));
+        let access = access_for(&kind, &p.context, Verb::Get, p.namespace.clone(), Some(p.name.clone()));
         self.authorize(&mut call, &access).await?;
         let reveal = kind.is("", "Secret") && {
-            let a = access_for(&kind, &p.context, "reveal", p.namespace.clone(), Some(p.name.clone()));
+            let a = access_for(&kind, &p.context, Verb::Reveal, p.namespace.clone(), Some(p.name.clone()));
             call.policy().decide(&a).mode == Mode::Allow
         };
         let ns = if kind.namespaced { p.namespace } else { None };
@@ -220,7 +222,7 @@ impl KubeMcp {
             json!({"context": p.context, "namespace": p.namespace, "name": p.name, "object_kind": p.object_kind});
         let mut call = self.begin(&parts, "get_events", args)?;
         let (client, kind) = self.kind(&call, &p.context, "events").await?;
-        let access = access_for(&kind, &p.context, "list", p.namespace.clone(), None);
+        let access = access_for(&kind, &p.context, Verb::List, p.namespace.clone(), None);
         self.authorize_list(&mut call, &access, p.namespace.is_none()).await?;
         let mut fields = Vec::new();
         if let Some(n) = &p.name {
@@ -235,7 +237,7 @@ impl KubeMcp {
             Err(e) => return call.finish(Err(e)),
         };
         rows.retain(|r| {
-            call.may_see(&access_for(&kind, &p.context, "list", r.namespace.clone(), Some(r.name.clone())))
+            call.may_see(&access_for(&kind, &p.context, Verb::List, r.namespace.clone(), Some(r.name.clone())))
         });
         // Newest first by when they last happened (an event that keeps repeating was created
         // long ago), as the server's Last Seen column says.
@@ -275,7 +277,7 @@ impl KubeMcp {
         let mut call = self.begin(&parts, "describe_resource", args)?;
         let (client, kind) = self.kind(&call, &p.context, &p.kind).await?;
         require_ns(&call, &kind, p.namespace.as_deref())?;
-        let access = access_for(&kind, &p.context, "get", p.namespace.clone(), Some(p.name.clone()));
+        let access = access_for(&kind, &p.context, Verb::Get, p.namespace.clone(), Some(p.name.clone()));
         self.authorize(&mut call, &access).await?;
         let ns = if kind.namespaced { p.namespace.clone() } else { None };
         let obj = ObjectRef { kind: kind.clone(), name: p.name.clone(), namespace: ns.clone(), uid: String::new() };
@@ -346,14 +348,15 @@ impl KubeMcp {
         let selector = selects_pods.then(|| k8s::pod_selection(&kind, &value).list_selector()).flatten();
         if let (Some(sel), Some(ns)) = (selector, ns.clone()) {
             let pods_kind = self.kind(&call, &p.context, "pods").await?.1;
-            if call.policy().decide(&access_for(&pods_kind, &p.context, "list", Some(ns.clone()), None)).mode
+            if call.policy().decide(&access_for(&pods_kind, &p.context, Verb::List, Some(ns.clone()), None)).mode
                 == Mode::Allow
             {
                 // A list that fails is said, so it doesn't read as no pods.
                 match k8s::list_table(client.clone(), pods_kind.clone(), Some(ns.clone()), sel, None).await {
                     Ok((defs, mut rows)) => {
                         rows.retain(|r| {
-                            let a = access_for(&pods_kind, &p.context, "list", Some(ns.clone()), Some(r.name.clone()));
+                            let a =
+                                access_for(&pods_kind, &p.context, Verb::List, Some(ns.clone()), Some(r.name.clone()));
                             call.policy().decide(&a).mode == Mode::Allow
                         });
                         let cols: Vec<usize> =
@@ -374,12 +377,14 @@ impl KubeMcp {
             ..obj
         };
         let events_kind = self.kind(&call, &p.context, "events").await?.1;
-        if call.policy().decide(&access_for(&events_kind, &p.context, "list", ns.clone(), None)).mode == Mode::Allow {
+        if call.policy().decide(&access_for(&events_kind, &p.context, Verb::List, ns.clone(), None)).mode == Mode::Allow
+        {
             match k8s::events_for(client, obj).await {
                 Ok(mut events) => {
                     // The check above has no name: an Allow of some event names passes it.
                     events.retain(|e| {
-                        let a = access_for(&events_kind, &p.context, "list", e.namespace.clone(), Some(e.name.clone()));
+                        let a =
+                            access_for(&events_kind, &p.context, Verb::List, e.namespace.clone(), Some(e.name.clone()));
                         call.policy().decide(&a).mode == Mode::Allow
                     });
                     out.push_str(&format!("Events ({}):\n", events.len()));
@@ -408,7 +413,7 @@ impl KubeMcp {
         let args = json!({"context": p.context, "namespace": p.namespace, "sort_by": p.sort_by});
         let mut call = self.begin(&parts, "top_pods", args)?;
         let (client, kind) = self.kind(&call, &p.context, "pods").await?;
-        let access = access_for(&kind, &p.context, "list", p.namespace.clone(), None);
+        let access = access_for(&kind, &p.context, Verb::List, p.namespace.clone(), None);
         self.authorize_list(&mut call, &access, p.namespace.is_none()).await?;
         let usage = match &p.namespace {
             Some(ns) => k8s::container_usage(client, ns.clone(), None)
@@ -423,7 +428,7 @@ impl KubeMcp {
         let mut rows: Vec<(String, String, f64, f64)> = usage
             .into_iter()
             .filter(|((ns, pod), _)| {
-                call.may_see(&access_for(&kind, &p.context, "list", Some(ns.clone()), Some(pod.clone())))
+                call.may_see(&access_for(&kind, &p.context, Verb::List, Some(ns.clone()), Some(pod.clone())))
             })
             .map(|((ns, pod), c)| (ns, pod, c.values().map(|v| v.0).sum(), c.values().map(|v| v.1).sum()))
             .collect();
@@ -489,7 +494,7 @@ impl KubeMcp {
                     continue;
                 }
                 // Search asks nobody: only what a rule allows outright.
-                if !call.may_see(&access_for(&kind, &p.context, "list", ns.clone(), Some(obj.clone()))) {
+                if !call.may_see(&access_for(&kind, &p.context, Verb::List, ns.clone(), Some(obj.clone()))) {
                     continue;
                 }
                 rows.push(vec![kind.kubectl_name(), ns.unwrap_or_default(), obj]);
@@ -523,7 +528,7 @@ impl KubeMcp {
             "tail_lines": p.tail_lines, "since_seconds": p.since_seconds, "previous": p.previous, "grep": p.grep});
         let mut call = self.begin(&parts, "get_logs", args)?;
         let (client, kind) = self.kind(&call, &p.context, "pods").await?;
-        let access = access_for(&kind, &p.context, "logs", Some(p.namespace.clone()), Some(p.pod.clone()));
+        let access = access_for(&kind, &p.context, Verb::Logs, Some(p.namespace.clone()), Some(p.pod.clone()));
         self.authorize(&mut call, &access).await?;
         let lp = kube::api::LogParams {
             container: p.container,
@@ -561,7 +566,7 @@ impl KubeMcp {
         let args = json!({"context": p.context, "namespace": p.namespace, "within_days": p.within_days});
         let mut call = self.begin(&parts, "check_certificates", args)?;
         let (client, kind) = self.kind(&call, &p.context, "secrets").await?;
-        let access = access_for(&kind, &p.context, "get", p.namespace.clone(), None);
+        let access = access_for(&kind, &p.context, Verb::Get, p.namespace.clone(), None);
         self.authorize_list(&mut call, &access, p.namespace.is_none()).await?;
         let secrets = match k8s::list_values_fields(
             client,
@@ -580,7 +585,7 @@ impl KubeMcp {
         for sec in &secrets {
             let ns = sec.pointer("/metadata/namespace").and_then(|v| v.as_str()).unwrap_or_default().to_string();
             let name = sec.pointer("/metadata/name").and_then(|v| v.as_str()).unwrap_or_default().to_string();
-            if !call.may_see(&access_for(&kind, &p.context, "get", Some(ns.clone()), Some(name.clone()))) {
+            if !call.may_see(&access_for(&kind, &p.context, Verb::Get, Some(ns.clone()), Some(name.clone()))) {
                 continue;
             }
             use base64::Engine as _;
@@ -644,7 +649,7 @@ impl KubeMcp {
         let args = json!({"context": p.context, "namespace": p.namespace, "include_minor": p.include_minor});
         let mut call = self.begin(&parts, "find_problems", args)?;
         let (client, pods) = self.kind(&call, &p.context, "pods").await?;
-        let access = access_for(&pods, &p.context, "list", p.namespace.clone(), None);
+        let access = access_for(&pods, &p.context, Verb::List, p.namespace.clone(), None);
         self.authorize_list(&mut call, &access, p.namespace.is_none()).await?;
         let kinds = match self.hub.client(&p.context).await {
             Ok((_, kinds)) => kinds,
@@ -661,7 +666,7 @@ impl KubeMcp {
             .filter(|x| {
                 // Only what this agent may see.
                 k8s::find_kind(&kinds, &x.kind).is_some_and(|k| {
-                    let a = access_for(k, &p.context, "list", x.namespace.clone(), Some(x.name.clone()));
+                    let a = access_for(k, &p.context, Verb::List, x.namespace.clone(), Some(x.name.clone()));
                     problem_visible(call.policy(), call.approved_rules(), k.is("", "Pod"), &a)
                 })
             })
@@ -700,7 +705,7 @@ impl KubeMcp {
         let args = json!({"context": p.context, "kind": p.kind, "namespace": p.namespace, "name": p.name, "minutes": p.minutes});
         let mut call = self.begin(&parts, "usage_history", args)?;
         let (client, kind) = self.kind(&call, &p.context, &p.kind).await?;
-        let access = access_for(&kind, &p.context, "get", Some(p.namespace.clone()), Some(p.name.clone()));
+        let access = access_for(&kind, &p.context, Verb::Get, Some(p.namespace.clone()), Some(p.name.clone()));
         self.authorize(&mut call, &access).await?;
         let obj = ObjectRef {
             kind: kind.clone(),
@@ -734,7 +739,7 @@ impl KubeMcp {
             let listed = pods.len();
             pods.retain(|pod| {
                 let name = pod.pointer("/metadata/name").and_then(|v| v.as_str()).unwrap_or_default();
-                let a = access_for(&pods_kind, &p.context, "list", Some(p.namespace.clone()), Some(name.into()));
+                let a = access_for(&pods_kind, &p.context, Verb::List, Some(p.namespace.clone()), Some(name.into()));
                 call.policy().decide(&a).mode == Mode::Allow
             });
             if pods.is_empty() && listed > 0 {

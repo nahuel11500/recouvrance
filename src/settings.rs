@@ -34,6 +34,17 @@ fn delete_confirm_entries<'de, D: Deserializer<'de>>(
     Ok(raw.into_iter().map(|(k, v)| (k, serde_json::from_value(v).unwrap_or(DeleteConfirm::Type))).collect())
 }
 
+/// Which backend the assistant uses.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum AssistantBackend {
+    /// Claude Code when it is installed, else the API key.
+    #[default]
+    Auto,
+    ClaudeCode,
+    Api,
+}
+
 /// What deleting asks before it runs (per kind, see `delete_confirm`), from least to most.
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 #[serde(rename_all = "kebab-case")]
@@ -136,7 +147,7 @@ pub struct Settings {
     /// Model used by the in-app assistant.
     pub assistant_model: String,
     /// auto (Claude Code if installed, else API key), claude-code or api.
-    pub assistant_backend: String,
+    pub assistant_backend: AssistantBackend,
     /// The team's notes given to the assistant: where things run, dashboards, runbooks, repos.
     pub assistant_notes: String,
     /// Folders of the team's code the assistant may read (Claude Code only).
@@ -301,7 +312,7 @@ impl Default for Settings {
             namespace_visits: Default::default(),
             saved_forwards: Vec::new(),
             assistant_model: crate::assistant::DEFAULT_MODEL.into(),
-            assistant_backend: "auto".into(),
+            assistant_backend: AssistantBackend::Auto,
             assistant_notes: String::new(),
             assistant_repos: Vec::new(),
             metrics_enabled: true,

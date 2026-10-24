@@ -16,7 +16,7 @@ use kube::api::{DeleteParams, Patch, PatchParams, PostParams};
 use serde_json::json;
 
 use crate::k8s::{self, gate};
-use crate::mcp::{self, Mode, rules_file};
+use crate::mcp::{self, Mode, Verb, rules_file};
 
 const NS: &str = "default";
 
@@ -167,7 +167,7 @@ fn turning_access_off_stops_a_drain() {
         let (hub, agent, _token, _server) = agent(&["* *"], &[]).await?;
         let kinds = k8s::discover(agents_client.clone()).await?;
         let node_kind = k8s::find_kind(&kinds, "nodes").context("nodes kind")?.clone();
-        let access = mcp::server::access_for(&node_kind, &ctx, "drain", None, Some(node.clone()));
+        let access = mcp::server::access_for(&node_kind, &ctx, Verb::Drain, None, Some(node.clone()));
         let check = mcp::server::stop_check(hub.clone(), agent.id.clone(), false, access);
         let asked = Arc::new(AtomicUsize::new(0));
         let (hub2, asked2) = (hub.clone(), asked.clone());

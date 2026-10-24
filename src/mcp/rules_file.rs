@@ -28,7 +28,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context as _, Result, bail};
 use serde::{Deserialize, Serialize};
 
-use super::{Mode, Policy, Rule};
+use super::{Mode, Policy, Rule, Verb};
 
 pub fn path() -> PathBuf {
     crate::paths::config_dir().join("rules.yaml")
@@ -137,11 +137,9 @@ pub fn parse_rule(effect: Mode, text: &str) -> Result<Rule> {
         }
     }
     for v in &rule.verbs {
-        if v != "*" && !super::VERBS.iter().any(|(name, _)| name == v) {
-            bail!(
-                "unknown verb `{v}` (known: {})",
-                super::VERBS.iter().map(|(n, _)| *n).collect::<Vec<_>>().join(", ")
-            );
+        if v != "*" && v.parse::<Verb>().is_err() {
+            let known: Vec<&str> = Verb::ALL.iter().map(|v| v.as_str()).collect();
+            bail!("unknown verb `{v}` (known: {}, *)", known.join(", "));
         }
     }
     Ok(rule)
@@ -396,7 +394,7 @@ mod tests {
         assert_eq!(got, want);
         let a = super::super::Access {
             context: "prod".into(),
-            verb: "get".into(),
+            verb: Verb::Get,
             resource: "pods".into(),
             resource_aliases: vec![],
             namespace: Some("x".into()),
@@ -514,7 +512,7 @@ mod tests {
         // The deny rule wins over the allow rule.
         let a = super::super::Access {
             context: "eu".into(),
-            verb: "get".into(),
+            verb: Verb::Get,
             resource: "secrets".into(),
             resource_aliases: vec![],
             namespace: Some("x".into()),

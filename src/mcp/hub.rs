@@ -15,7 +15,7 @@ use super::audit::{
 use super::config::{
     Agent, CONFIG_VERSION, Config, config_lock_path, hash_token, load_config, new_token, same_rules, take_lock,
 };
-use super::policy::{Access, Mode, Policy, Rule};
+use super::policy::{Access, Mode, Policy, Rule, Verb};
 use super::{lock, read, rules_file, write};
 use crate::k8s::{self, Kind};
 
@@ -66,18 +66,18 @@ impl Approval {
     /// runs, so it would allow the real write).
     pub fn as_rule(&self) -> Option<Rule> {
         let a = &self.access;
-        if matches!(a.verb.as_str(), "exec" | "patch" | "scale")
+        if matches!(a.verb, Verb::Exec | Verb::Patch | Verb::Scale)
             || self.tool == "gitops"
             || self.tool == "apply_manifest"
             || self.dry_run
-            || (a.verb != "list" && a.name.is_none())
+            || (a.verb != Verb::List && a.name.is_none())
             || (a.namespace.is_none() && !a.cluster_scoped)
         {
             return None;
         }
         Some(Rule {
             effect: Mode::Allow,
-            verbs: vec![a.verb.clone()],
+            verbs: vec![a.verb.to_string()],
             resources: vec![a.resource.clone()],
             namespaces: vec![a.namespace.clone().unwrap_or_else(|| "*".into())],
             contexts: vec![a.context.clone()],

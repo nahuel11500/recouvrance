@@ -13,7 +13,7 @@ pub mod server;
 pub use audit::{AuditEntry, Decision};
 pub use config::{Agent, config_in_use};
 pub use hub::{Answer, Approval, Hub, HubEvent};
-pub use policy::{Access, Mode, Policy, Rule, VERBS, any_glob, is_write};
+pub use policy::{Access, Mode, Policy, Rule, Verb, any_glob, grants_write};
 
 pub const DEFAULT_PORT: u16 = 47070;
 
