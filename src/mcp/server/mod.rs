@@ -20,7 +20,7 @@ use rmcp::transport::streamable_http_server::{
 use rmcp::{ServerHandler, prompt, prompt_handler, prompt_router, schemars, tool_handler};
 use serde::Deserialize;
 
-use super::{Access, Agent, Answer, AuditEntry, Decision, Hub, HubEvent, Mode, Policy, is_write};
+use super::{Access, Agent, Answer, AuditEntry, Decision, Hub, HubEvent, Mode, Policy, Verb};
 use crate::k8s::{self, Kind, TaskGuard};
 
 mod read_tools;
@@ -514,13 +514,13 @@ fn stopped_by(policy: &Policy, access: &Access, approved: bool) -> Option<Option
 pub(crate) fn access_for(
     kind: &Kind,
     context: &str,
-    verb: &str,
+    verb: Verb,
     namespace: Option<String>,
     name: Option<String>,
 ) -> Access {
     Access {
         context: context.to_string(),
-        verb: verb.to_string(),
+        verb,
         resource: kind.kubectl_name(),
         resource_aliases: vec![kind.ar.plural.clone(), kind.ar.kind.to_lowercase()],
         namespace: if kind.namespaced { namespace } else { None },
@@ -532,7 +532,7 @@ pub(crate) fn access_for(
 /// Whether listing a kind could show something: in some namespace, or for a cluster-scoped
 /// kind, outside any (only rules for every namespace cover it).
 fn list_verdict(policy: &Policy, kind: &Kind, context: &str) -> Mode {
-    let access = access_for(kind, context, "list", None, None);
+    let access = access_for(kind, context, Verb::List, None, None);
     if kind.namespaced { policy.decide_any_namespace(&access).mode } else { policy.decide(&access).mode }
 }
 
@@ -846,17 +846,17 @@ impl ServerHandler for KubeMcp {
 
 /// Whether a tool changes the cluster; used by the UI for labels.
 pub fn tool_writes(tool: &str) -> bool {
-    is_write(match tool {
-        "exec_command" => "exec",
-        "scale" => "scale",
-        "rollout_restart" => "restart",
-        "patch_resource" => "patch",
-        "apply_manifest" => "apply",
-        "delete_resource" => "delete",
-        "drain_node" => "drain",
-        "gitops" => "patch",
-        _ => "",
-    })
+    matches!(
+        tool,
+        "exec_command"
+            | "scale"
+            | "rollout_restart"
+            | "patch_resource"
+            | "apply_manifest"
+            | "delete_resource"
+            | "drain_node"
+            | "gitops"
+    )
 }
 
 fn format_table(headers: &[&str], rows: &[Vec<String>]) -> String {
@@ -986,7 +986,7 @@ mod tests {
         let policy = Policy { rules: vec![ask], ..Default::default() };
         let access = |resource: &str| Access {
             context: "c".into(),
-            verb: "list".into(),
+            verb: Verb::List,
             resource: resource.into(),
             resource_aliases: vec![],
             namespace: Some("team-b".into()),
@@ -1079,8 +1079,8 @@ mod tests {
             ..crate::mcp::Rule::default()
         };
         let cms = kind("", "v1", "ConfigMap", "configmaps", true);
-        let a = access_for(&cms, "c", "apply", Some("app".into()), Some("a".into()));
-        let b = access_for(&cms, "c", "apply", Some("app".into()), Some("b".into()));
+        let a = access_for(&cms, "c", Verb::Apply, Some("app".into()), Some("a".into()));
+        let b = access_for(&cms, "c", Verb::Apply, Some("app".into()), Some("b".into()));
         // B's rule turned into Ask while A was applied: approving A does not cover B.
         let p = Policy { rules: vec![rule(Mode::Allow, "a"), rule(Mode::Ask, "b")], ..Policy::default() };
         assert_eq!(stopped_by(&p, &a, false), None);
@@ -1187,7 +1187,7 @@ mod tests {
             ..crate::mcp::Rule::default()
         };
         let pods = kind("", "v1", "Pod", "pods", true);
-        let pod = |ns: &str| access_for(&pods, "c", "delete", Some(ns.into()), Some("web".into()));
+        let pod = |ns: &str| access_for(&pods, "c", Verb::Delete, Some(ns.into()), Some("web".into()));
         // No delete rule at all: the drain rule is what lets it evict.
         let allowed = Policy { rules: vec![rule(Mode::Allow, "drain", "*")], ..Policy::default() };
         assert!(!denies_eviction(&allowed, &pod("app")));

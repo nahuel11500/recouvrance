@@ -12,7 +12,7 @@ use super::{
 };
 use crate::k8s;
 use crate::k8s::Kind;
-use crate::mcp::Mode;
+use crate::mcp::{Mode, Verb};
 
 #[tool_router(router = write_tools, vis = "pub(super)")]
 impl KubeMcp {
@@ -27,7 +27,7 @@ impl KubeMcp {
         let args = json!({"context": p.context, "namespace": p.namespace, "pod": p.pod, "container": p.container, "command": p.command});
         let mut call = self.begin(&parts, "exec_command", args)?;
         let (client, kind) = self.kind(&call, &p.context, "pods").await?;
-        let access = access_for(&kind, &p.context, "exec", Some(p.namespace.clone()), Some(p.pod.clone()));
+        let access = access_for(&kind, &p.context, Verb::Exec, Some(p.namespace.clone()), Some(p.pod.clone()));
         self.authorize(&mut call, &access).await?;
         let timeout = u64::from(call.policy().exec_timeout.max(1));
         self.recheck(&mut call, &access)?;
@@ -43,7 +43,7 @@ impl KubeMcp {
         let args = json!({"context": p.context, "kind": p.kind, "namespace": p.namespace, "name": p.name, "replicas": p.replicas, "dry_run": p.dry_run});
         let mut call = self.begin(&parts, "scale", args)?;
         let (client, kind) = self.kind(&call, &p.context, &p.kind).await?;
-        let access = access_for(&kind, &p.context, "scale", Some(p.namespace.clone()), Some(p.name.clone()));
+        let access = access_for(&kind, &p.context, Verb::Scale, Some(p.namespace.clone()), Some(p.name.clone()));
         self.authorize(&mut call, &access).await?;
         self.recheck(&mut call, &access)?;
         call.finish(k8s::scale(client, kind, Some(p.namespace), p.name, p.replicas, p.dry_run.unwrap_or(false)).await)
@@ -60,7 +60,7 @@ impl KubeMcp {
         let args = json!({"context": p.context, "kind": p.kind, "namespace": p.namespace, "name": p.name, "dry_run": p.dry_run});
         let mut call = self.begin(&parts, "rollout_restart", args)?;
         let (client, kind) = self.kind(&call, &p.context, &p.kind).await?;
-        let access = access_for(&kind, &p.context, "restart", Some(p.namespace.clone()), Some(p.name.clone()));
+        let access = access_for(&kind, &p.context, Verb::Restart, Some(p.namespace.clone()), Some(p.name.clone()));
         self.authorize(&mut call, &access).await?;
         self.recheck(&mut call, &access)?;
         call.finish(k8s::rollout_restart(client, kind, Some(p.namespace), p.name, p.dry_run.unwrap_or(false)).await)
@@ -78,7 +78,7 @@ impl KubeMcp {
         let mut call = self.begin(&parts, "patch_resource", args)?;
         let (client, kind) = self.kind(&call, &p.context, &p.kind).await?;
         require_ns(&call, &kind, p.namespace.as_deref())?;
-        let access = access_for(&kind, &p.context, "patch", p.namespace.clone(), Some(p.name.clone()));
+        let access = access_for(&kind, &p.context, Verb::Patch, p.namespace.clone(), Some(p.name.clone()));
         self.authorize(&mut call, &access).await?;
         self.recheck(&mut call, &access)?;
         call.finish(k8s::merge_patch(client, kind, p.namespace, p.name, p.patch, p.dry_run.unwrap_or(false)).await)
@@ -146,7 +146,7 @@ impl KubeMcp {
         // Each object is approved on its own: approving one does not cover another.
         let mut approved = Vec::new();
         for (kind, ns, name, _) in &planned {
-            let access = access_for(kind, &p.context, "apply", ns.clone(), Some(name.clone()));
+            let access = access_for(kind, &p.context, Verb::Apply, ns.clone(), Some(name.clone()));
             call.approved = false;
             self.authorize(&mut call, &access).await?;
             approved.push(call.approved);
@@ -157,7 +157,7 @@ impl KubeMcp {
         for ((kind, ns, name, doc), approved) in planned.into_iter().zip(approved) {
             // Approvals for later objects, and applying earlier ones, can take minutes:
             // access may be off, or the rules changed, by now.
-            let access = access_for(&kind, &p.context, "apply", ns.clone(), Some(name));
+            let access = access_for(&kind, &p.context, Verb::Apply, ns.clone(), Some(name));
             call.approved = approved;
             let refused = self.stale_reason(&mut call, &access);
             call.approved = any_approved;
@@ -190,7 +190,7 @@ impl KubeMcp {
         let args = json!({"context": p.context, "node": p.node});
         let mut call = self.begin(&parts, "drain_node", args)?;
         let (client, kind) = self.kind(&call, &p.context, "nodes").await?;
-        let access = access_for(&kind, &p.context, "drain", None, Some(p.node.clone()));
+        let access = access_for(&kind, &p.context, Verb::Drain, None, Some(p.node.clone()));
         self.authorize(&mut call, &access).await?;
         // Evicting is deleting pods: a drain must not reach namespaces the rules keep the agent out of.
         let pods_kind = self.kind(&call, &p.context, "pods").await?.1;
@@ -209,7 +209,7 @@ impl KubeMcp {
         // The rules may have changed while the pods were listed.
         self.reload_rules(&mut call);
         let denied = denied_namespaces(&on_node, |ns, name| {
-            let a = access_for(&pods_kind, &p.context, "delete", Some(ns.into()), Some(name.into()));
+            let a = access_for(&pods_kind, &p.context, Verb::Delete, Some(ns.into()), Some(name.into()));
             denies_eviction(call.policy(), &a)
         });
         if !denied.is_empty() {
@@ -226,7 +226,7 @@ impl KubeMcp {
         let (hub, agent_id, context, kind) =
             (self.hub.clone(), call.agent.id.clone(), p.context.clone(), pods_kind.clone());
         let keep = move |ns: &str, name: &str| {
-            let a = access_for(&kind, &context, "delete", Some(ns.into()), Some(name.into()));
+            let a = access_for(&kind, &context, Verb::Delete, Some(ns.into()), Some(name.into()));
             match hub.agent(&agent_id) {
                 Some(agent) if !denies_eviction(&agent.policy, &a) => None,
                 Some(_) => Some("your rules deny deleting it".to_string()),
@@ -235,7 +235,7 @@ impl KubeMcp {
         };
         // The reply names only the pods the agent may list.
         let shown = |ns: &str, name: &str| {
-            let a = access_for(&pods_kind, &p.context, "list", Some(ns.into()), Some(name.into()));
+            let a = access_for(&pods_kind, &p.context, Verb::List, Some(ns.into()), Some(name.into()));
             call.policy().decide(&a).mode == Mode::Allow
         };
         call.finish(k8s::drain_report(client, p.node, stop, keep).await.map(|d| d.summary(shown)))
@@ -267,7 +267,7 @@ impl KubeMcp {
                 kind.ar.kind
             )));
         }
-        let access = access_for(&kind, &p.context, "patch", Some(p.namespace.clone()), Some(p.name.clone()));
+        let access = access_for(&kind, &p.context, Verb::Patch, Some(p.namespace.clone()), Some(p.name.clone()));
         self.authorize(&mut call, &access).await?;
         self.recheck(&mut call, &access)?;
         let (ns, name) = (Some(p.namespace), p.name);
@@ -290,7 +290,7 @@ impl KubeMcp {
         let mut call = self.begin(&parts, "delete_resource", args)?;
         let (client, kind) = self.kind(&call, &p.context, &p.kind).await?;
         require_ns(&call, &kind, p.namespace.as_deref())?;
-        let access = access_for(&kind, &p.context, "delete", p.namespace.clone(), Some(p.name.clone()));
+        let access = access_for(&kind, &p.context, Verb::Delete, p.namespace.clone(), Some(p.name.clone()));
         self.authorize(&mut call, &access).await?;
         self.recheck(&mut call, &access)?;
         call.finish(k8s::delete(client, kind, p.namespace, p.name, None, p.dry_run.unwrap_or(false)).await)

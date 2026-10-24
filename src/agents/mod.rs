@@ -14,7 +14,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use crate::k8s;
-use crate::mcp::{Agent, Hub, Mode, Policy, Rule, any_glob, is_write};
+use crate::mcp::{Agent, Hub, Mode, Policy, Rule, Verb, any_glob, grants_write};
 
 mod activity;
 mod code;
@@ -81,7 +81,7 @@ struct Tester {
     resource: Entity<InputState>,
     namespace: Entity<InputState>,
     name: Entity<InputState>,
-    verb: String,
+    verb: Verb,
 }
 
 #[derive(Clone, Copy)]
@@ -131,7 +131,7 @@ impl AgentsView {
             resource: input("resource, e.g. deployments", window, cx),
             namespace: input("namespace (empty = cluster)", window, cx),
             name: input("name", window, cx),
-            verb: "get".into(),
+            verb: Verb::Get,
         };
         let mut subs = vec![cx.subscribe_in(&new_name, window, |this, _, ev: &InputEvent, window, cx| {
             if let InputEvent::PressEnter { .. } = ev {
@@ -524,7 +524,7 @@ impl AgentsView {
                             .policy
                             .rules
                             .iter()
-                            .any(|r| r.effect != Mode::Deny && r.verbs.iter().any(|v| v == "*" || is_write(v)));
+                            .any(|r| r.effect != Mode::Deny && r.verbs.iter().any(|v| grants_write(v)));
                         let id = a.id.clone();
                         h_flex()
                             .id(SharedString::from(format!("agent-{}", a.id)))

@@ -24,26 +24,85 @@ impl Mode {
     }
 }
 
-/// Verbs an agent can be granted, kubectl style.
-pub const VERBS: [(&str, &str); 12] = [
-    ("get", "Read one object (YAML)"),
-    ("list", "List objects, events"),
-    ("logs", "Read container logs"),
-    ("reveal", "See Secret values"),
-    ("exec", "Run a command in a container"),
-    ("scale", "Change replicas"),
-    ("restart", "Rollout restart"),
-    ("patch", "Merge-patch an object"),
-    ("apply", "Create or update from YAML"),
-    ("delete", "Delete an object"),
-    ("drain", "Cordon and drain a node"),
-    ("*", "Every verb"),
-];
+/// What an agent asks to do, kubectl style. Rules name verbs as text (`get,list`, `*`),
+/// matched against [`Verb::as_str`].
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Verb {
+    #[default]
+    Get,
+    List,
+    Logs,
+    Reveal,
+    Exec,
+    Scale,
+    Restart,
+    Patch,
+    Apply,
+    Delete,
+    Drain,
+}
 
-pub const READ_VERBS: [&str; 3] = ["get", "list", "logs"];
+impl Verb {
+    pub const ALL: [Self; 11] = [
+        Self::Get,
+        Self::List,
+        Self::Logs,
+        Self::Reveal,
+        Self::Exec,
+        Self::Scale,
+        Self::Restart,
+        Self::Patch,
+        Self::Apply,
+        Self::Delete,
+        Self::Drain,
+    ];
 
-pub fn is_write(verb: &str) -> bool {
-    matches!(verb, "exec" | "scale" | "restart" | "patch" | "apply" | "delete" | "drain")
+    /// The verbs that only read (a default policy grants these).
+    pub const READ: [Self; 3] = [Self::Get, Self::List, Self::Logs];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Get => "get",
+            Self::List => "list",
+            Self::Logs => "logs",
+            Self::Reveal => "reveal",
+            Self::Exec => "exec",
+            Self::Scale => "scale",
+            Self::Restart => "restart",
+            Self::Patch => "patch",
+            Self::Apply => "apply",
+            Self::Delete => "delete",
+            Self::Drain => "drain",
+        }
+    }
+
+    /// Whether it changes the cluster (or runs something in it).
+    pub const fn is_write(self) -> bool {
+        matches!(
+            self,
+            Self::Exec | Self::Scale | Self::Restart | Self::Patch | Self::Apply | Self::Delete | Self::Drain
+        )
+    }
+}
+
+impl std::fmt::Display for Verb {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for Verb {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::ALL.into_iter().find(|v| v.as_str() == s).ok_or_else(|| format!("unknown verb `{s}`"))
+    }
+}
+
+/// Whether a rule's verb pattern (a verb or `*`) grants a write.
+pub fn grants_write(pattern: &str) -> bool {
+    pattern == "*" || pattern.parse::<Verb>().is_ok_and(Verb::is_write)
 }
 
 /// One access rule, like a Kubernetes RBAC rule with an effect.
@@ -74,7 +133,7 @@ impl Default for Rule {
     fn default() -> Self {
         Self {
             effect: Mode::Allow,
-            verbs: READ_VERBS.iter().map(ToString::to_string).collect(),
+            verbs: Verb::READ.iter().map(ToString::to_string).collect(),
             resources: vec!["*".into()],
             namespaces: vec!["*".into()],
             contexts: Vec::new(),
@@ -135,7 +194,7 @@ impl From<RuleFields> for Rule {
 #[derive(Clone, Debug, Default)]
 pub struct Access {
     pub context: String,
-    pub verb: String,
+    pub verb: Verb,
     /// kubectl name of the resource (`deployments`, `certificates.cert-manager.io`).
     pub resource: String,
     /// Also accepted: the bare plural and the Kind (`deployments`, `Deployment`).
@@ -169,7 +228,7 @@ impl Rule {
         let matches_any = |patterns: &[String], text: &str| {
             if exact { patterns.iter().any(|p| glob(p.trim(), text)) } else { any_glob(patterns, text) }
         };
-        let verb = self.verbs.iter().any(|v| v == "*" || v.eq_ignore_ascii_case(&a.verb));
+        let verb = self.verbs.iter().any(|v| v == "*" || v.eq_ignore_ascii_case(a.verb.as_str()));
         let resource = if exact {
             matches_any(&self.resources, &a.resource)
         } else {
@@ -442,7 +501,7 @@ impl Policy {
 /// A write to a Namespace object changes (or deletes) everything in it, so it also meets
 /// the Deny and Ask rules of that namespace: the same request, inside it.
 fn namespace_contents(a: &Access) -> Option<Access> {
-    if !is_write(&a.verb) || a.resource != "namespaces" || a.namespace.is_some() {
+    if !a.verb.is_write() || a.resource != "namespaces" || a.namespace.is_some() {
         return None;
     }
     Some(Access { namespace: Some(a.name.clone()?), ..a.clone() })
@@ -486,7 +545,7 @@ pub(super) mod tests {
     pub(super) fn access(ctx: &str, verb: &str, res: &str, ns: Option<&str>, name: Option<&str>) -> Access {
         Access {
             context: ctx.into(),
-            verb: verb.into(),
+            verb: verb.parse().unwrap(),
             resource: res.into(),
             resource_aliases: vec![],
             namespace: ns.map(String::from),
@@ -882,7 +941,7 @@ pub(super) mod tests {
 /// single examples: what a reviewer would otherwise have to check case by case.
 #[cfg(test)]
 pub(crate) mod properties {
-    use super::{Access, Mode, Policy, Rule};
+    use super::{Access, Mode, Policy, Rule, Verb};
     use crate::mcp::Approval;
     use proptest::prelude::*;
 
@@ -907,14 +966,14 @@ pub(crate) mod properties {
         })
     }
 
-    pub(crate) fn verb() -> impl Strategy<Value = String> {
-        prop_oneof![Just("get"), Just("list"), Just("delete"), Just("patch"), Just("exec")].prop_map(String::from)
+    pub(crate) fn verb() -> impl Strategy<Value = Verb> {
+        prop_oneof![Just(Verb::Get), Just(Verb::List), Just(Verb::Delete), Just(Verb::Patch), Just(Verb::Exec)]
     }
 
     pub(crate) fn rule() -> impl Strategy<Value = Rule> {
         (
             prop_oneof![Just(Mode::Allow), Just(Mode::Ask), Just(Mode::Deny)],
-            prop::collection::vec(prop_oneof![verb(), Just("*".to_string())], 0..3),
+            prop::collection::vec(prop_oneof![verb().prop_map(|v| v.to_string()), Just("*".to_string())], 0..3),
             patterns(),
             patterns(),
             patterns(),
@@ -1013,7 +1072,7 @@ pub(crate) mod properties {
 
 #[cfg(test)]
 mod fail_closed {
-    use super::{Mode, Rule};
+    use super::{Mode, Rule, Verb};
 
     #[test]
     fn a_rule_without_an_effect_denies() {
@@ -1032,7 +1091,7 @@ mod fail_closed {
         let p = super::Policy { rules: vec![all, r], ..super::Policy::default() };
         let a = super::Access {
             context: "prod".into(),
-            verb: "delete".into(),
+            verb: Verb::Delete,
             resource: "secrets".into(),
             namespace: Some("app".into()),
             name: Some("db".into()),

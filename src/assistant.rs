@@ -430,15 +430,15 @@ pub fn claude_code() -> Option<PathBuf> {
         .find(|p| p.is_file())
 }
 
-/// The configured backend (`assistant_backend`: auto, claude-code or api), if usable.
+/// The configured backend (`assistant_backend`), if usable.
 pub fn backend() -> Option<Backend> {
-    let choice = crate::settings::get().assistant_backend;
+    use crate::settings::AssistantBackend;
     let code = || claude_code().map(Backend::ClaudeCode);
     let api = || api_key().map(|_| Backend::Api);
-    match choice.as_str() {
-        "claude-code" => code(),
-        "api" => api(),
-        _ => code().or_else(api),
+    match crate::settings::with(|s| s.assistant_backend) {
+        AssistantBackend::ClaudeCode => code(),
+        AssistantBackend::Api => api(),
+        AssistantBackend::Auto => code().or_else(api),
     }
 }
 

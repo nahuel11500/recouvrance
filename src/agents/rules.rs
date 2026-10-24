@@ -9,7 +9,7 @@ use gpui_kit::*;
 
 use super::{AgentsView, RuleInputs, rule_with};
 use crate::k8s;
-use crate::mcp::{Access, Agent, Mode, Rule, VERBS, is_write};
+use crate::mcp::{Access, Agent, Mode, Rule, Verb};
 
 impl AgentsView {
     pub(super) fn render_rule(
@@ -41,10 +41,10 @@ impl AgentsView {
                 .on_click(cx.listener(move |this, _, _, cx| this.update_rule(ix, |r| r.effect = m, cx)))
         }));
 
-        let verbs = h_flex().flex_wrap().gap_1().children(VERBS.iter().enumerate().map(|(vi, (verb, _))| {
-            let on = rule.verbs.iter().any(|v| v == verb);
-            let sensitive = is_write(verb) || *verb == "reveal" || *verb == "*";
-            let verb = verb.to_string();
+        let choices = Verb::ALL.iter().map(|v| (v.as_str(), v.is_write() || *v == Verb::Reveal)).chain([("*", true)]);
+        let verbs = h_flex().flex_wrap().gap_1().children(choices.enumerate().map(|(vi, (label, sensitive))| {
+            let on = rule.verbs.iter().any(|v| v == label);
+            let verb = label.to_string();
             let accent = if sensitive { theme.warning } else { theme.blue };
             div()
                 .id(("verb", ix * 100 + vi))
@@ -71,7 +71,7 @@ impl AgentsView {
                         cx,
                     );
                 }))
-                .child(VERBS[vi].0)
+                .child(label)
         }));
 
         v_flex()
@@ -284,7 +284,7 @@ impl AgentsView {
         let (context, resource, namespace, name) = (val(&t.context), val(&t.resource), val(&t.namespace), val(&t.name));
         let access = Access {
             context: context.clone(),
-            verb: t.verb.clone(),
+            verb: t.verb,
             resource: resource.clone(),
             resource_aliases: vec![],
             namespace: (!namespace.is_empty()).then_some(namespace),
@@ -292,20 +292,17 @@ impl AgentsView {
             cluster_scoped: false,
         };
         let verdict = (!context.is_empty() && !resource.is_empty()).then(|| agent.policy.decide(&access));
-        let verbs = h_flex().flex_wrap().gap_1().children(VERBS.iter().filter(|(v, _)| *v != "*").enumerate().map(
-            |(i, (v, _))| {
-                let verb = v.to_string();
-                Button::new(("test-verb", i))
-                    .xsmall()
-                    .label(*v)
-                    .when(t.verb == *v, ButtonVariants::primary)
-                    .when(t.verb != *v, ButtonVariants::ghost)
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.tester.verb = verb.clone();
-                        cx.notify();
-                    }))
-            },
-        ));
+        let verbs = h_flex().flex_wrap().gap_1().children(Verb::ALL.into_iter().enumerate().map(|(i, verb)| {
+            Button::new(("test-verb", i))
+                .xsmall()
+                .label(verb.as_str())
+                .when(t.verb == verb, ButtonVariants::primary)
+                .when(t.verb != verb, ButtonVariants::ghost)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.tester.verb = verb;
+                    cx.notify();
+                }))
+        }));
         v_flex()
             .gap_2()
             .p_3()
