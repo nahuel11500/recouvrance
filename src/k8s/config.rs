@@ -206,16 +206,16 @@ fn name_owners(
         Some(None) => true,
         None => exists(file.as_str()),
     });
-    // The files with a `name@file` of their own for a name, by (file, name).
+    // The files with a `name@file` of their own for a name, by (file, name). A context the
+    // file itself calls `name@x` was not given by `merge_owned`: the file can still take `name`.
     let renamed: std::collections::HashSet<(String, String)> = kept
         .iter()
         .flat_map(|(given, file)| {
-            read.get(file.as_str())
-                .copied()
-                .flatten()
-                .into_iter()
-                .flatten()
-                .filter(|n| renamed_from(given, n).is_some())
+            let names = read.get(file.as_str()).copied().flatten().map(Vec::as_slice).unwrap_or_default();
+            let own = names.contains(given);
+            names
+                .iter()
+                .filter(move |n| !own && renamed_from(given, n).is_some())
                 .map(move |n| (file.clone(), n.clone()))
         })
         .collect();
@@ -722,6 +722,17 @@ mod kubeconfig_tests {
         let now = super::name_owners(&mut kept, &[read("c", &["prod"])], |_| false, |_| true);
         assert_eq!(now["prod"], "c");
         assert_eq!(kept["prod"], "c");
+    }
+
+    #[test]
+    fn a_context_named_like_a_rename_does_not_hold_back_its_file() {
+        let mut kept = std::collections::BTreeMap::new();
+        let on_disk = |_: &str| true;
+        super::name_owners(&mut kept, &[read("a", &["prod@eu"])], on_disk, |_| true);
+        // a gets a context `prod` next to its own `prod@eu`: it is shown as `prod`.
+        let now = super::name_owners(&mut kept, &[read("a", &["prod@eu", "prod"])], on_disk, |_| true);
+        assert_eq!(now["prod"], "a");
+        assert_eq!(now["prod@eu"], "a");
     }
 
     #[test]
