@@ -945,14 +945,16 @@ impl Hub {
     pub fn watch_rules_file(self: &Arc<Self>) {
         let hub = Arc::downgrade(self);
         k8s::spawn_detached(async move {
+            // Why the file could not be read last time, so the same error isn't reloaded again.
+            let mut failed: Option<String> = None;
             loop {
                 tokio::time::sleep(Duration::from_secs(2)).await;
                 let Some(hub) = hub.upgrade() else { break };
-                // By content: an edit within the same second as the last one still counts.
-                let now = rules_file::read(&rules_file::path()).ok().flatten();
-                if now != *lock(&hub.rules_text) {
+                let now = rules_file::read(&rules_file::path()).map_err(|e| format!("{e:#}"));
+                if reload_due(&now, failed.as_deref(), &lock(&hub.rules_text)) {
                     let _ = hub.apply_rules_file();
                 }
+                failed = now.err();
             }
         });
     }
@@ -1290,6 +1292,18 @@ impl Hub {
     }
 }
 
+/// Whether rules.yaml must be reloaded, from what reading it gave now (its text, None when
+/// missing, or why it can't be read), why it failed last time and the text last loaded.
+/// By content: an edit within the same second as the last one still counts. A read that
+/// fails again the same way changes nothing; one that works again always reloads, to clear
+/// the error.
+fn reload_due(now: &Result<Option<String>, String>, failed: Option<&str>, seen: &Option<String>) -> bool {
+    match now {
+        Ok(text) => failed.is_some() || text != seen,
+        Err(e) => failed != Some(e.as_str()),
+    }
+}
+
 fn rediscovery_due(last: Option<Instant>, now: Instant) -> bool {
     last.is_none_or(|t| now.duration_since(t) >= REDISCOVER_EVERY)
 }
@@ -1366,6 +1380,20 @@ mod tests {
         ruled.policy.max_rows += 1;
         assert!(!same_rules(std::slice::from_ref(&agent), &[ruled]));
         assert!(!same_rules(std::slice::from_ref(&agent), &[]));
+    }
+
+    #[test]
+    fn an_unreadable_rules_file_is_reloaded_once() {
+        let seen = Some("old".to_string());
+        let denied: Result<Option<String>, String> = Err("permission denied".into());
+        assert!(reload_due(&denied, None, &seen));
+        // Still unreadable the same way: nothing to do.
+        assert!(!reload_due(&denied, Some("permission denied"), &seen));
+        assert!(reload_due(&Err("other".into()), Some("permission denied"), &seen));
+        // Readable again, even with the text last loaded: reloaded to clear the error.
+        assert!(reload_due(&Ok(seen.clone()), Some("permission denied"), &seen));
+        assert!(!reload_due(&Ok(seen.clone()), None, &seen));
+        assert!(reload_due(&Ok(None), None, &seen));
     }
 
     #[test]
