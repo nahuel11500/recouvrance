@@ -531,9 +531,9 @@ mod tests {
 /// audit rounds).
 #[cfg(test)]
 mod properties {
-    use super::super::properties::{access, policy, rule};
     use super::super::{Access, Agent};
     use super::*;
+    use crate::mcp::policy::properties::{access, policy, rule};
     use proptest::prelude::*;
 
     fn agent(name: &str, policy: Policy) -> Agent {
