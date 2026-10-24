@@ -456,8 +456,9 @@ pub(crate) fn age_seconds(age: &str) -> Option<i64> {
 /// Rows of a kind for counts and checks (problems, overviews). A small list comes with its
 /// objects' metadata as usual. A big one comes from cells alone: on a cluster with 23k pods,
 /// 6 MB instead of 160 MB. Those rows are `is_partial`. `with_namespaces`: each row needs its
-/// namespace (`cells_by_namespace`, one request per namespace); without, one request does,
-/// and rows of every namespace have none (enough for counts).
+/// namespace (`cells_by_namespace`, one request per namespace, or the whole list when one of
+/// them fails); without, one request does, and rows of every namespace have none (enough for
+/// counts).
 pub async fn list_light(
     client: Client,
     kind: Kind,
@@ -476,7 +477,15 @@ pub async fn list_light(
             return Ok((defs, rows));
         }
         let rows = match (&ns, kind.namespaced) {
-            (None, true) if with_namespaces => cells_by_namespace(&client, &url).await?,
+            (None, true) if with_namespaces => match cells_by_namespace(&client, &url).await {
+                Ok(rows) => rows,
+                // One namespace refused or stalled doesn't fail the kind: the whole list has
+                // every namespace's rows (with their objects' metadata, so more bytes).
+                Err(_) => match list_whole(&client, &url).await {
+                    Ok(listed) => listed.1,
+                    Err(_) => list_paged(&client, &url, ListParams::default()).await?.1,
+                },
+            },
             (None, true) => cells_list(&client, &url, None).await?,
             // One namespace, or a cluster-scoped kind: it pages with its metadata as usual.
             _ => list_paged(&client, &url, ListParams::default()).await?.1,
