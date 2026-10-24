@@ -136,7 +136,7 @@ pub fn container(ctx: &Ctx, name: &str, cx: &App) -> AnyElement {
         .when(started, |d| d.child("Started"))
         .when(ready, |d| d.child("Ready"));
 
-    let mut root = v_flex()
+    let root = v_flex()
         .pt_2()
         .gap_1()
         .child(row().child(field("Name", name.to_string(), cx)).child(field("Status", status, cx)).child(field(
@@ -173,292 +173,292 @@ pub fn container(ctx: &Ctx, name: &str, cx: &App) -> AnyElement {
         .child(container_usage_row(c, usage, cx))
         .children(container_history(ctx, c, name, cx));
 
-    // Ports, with the Services that select this pod.
-    let ports = c["ports"].as_array().cloned().unwrap_or_default();
-    if !ports.is_empty() {
-        let pod_labels = obj.pointer("/metadata/labels").and_then(Value::as_object);
-        let services: Vec<String> = ctx
-            .related
-            .services
-            .iter()
-            .filter(|svc| {
-                let Some(sel) = svc.pointer("/spec/selector").and_then(Value::as_object) else { return false };
-                !sel.is_empty() && sel.iter().all(|(k, v)| pod_labels.and_then(|l| l.get(k)) == Some(v))
+    let root = root
+        .children(container_ports(ctx, c, cx))
+        .children(container_env(ctx, c, cx))
+        .children(container_mounts(ctx, c, cx));
+    scroll(root, "container")
+}
+
+/// The container's ports, with the Services that select its pod: a heading and the cards,
+/// or nothing when it declares none.
+fn container_ports(ctx: &Ctx, c: &Value, cx: &App) -> Vec<AnyElement> {
+    let Some(ports) = c["ports"].as_array().filter(|p| !p.is_empty()) else { return Vec::new() };
+    let pod_labels = ctx.obj.pointer("/metadata/labels").and_then(Value::as_object);
+    let services: Vec<String> = ctx
+        .related
+        .services
+        .iter()
+        .filter(|svc| {
+            let Some(sel) = svc.pointer("/spec/selector").and_then(Value::as_object) else { return false };
+            !sel.is_empty() && sel.iter().all(|(k, v)| pod_labels.and_then(|l| l.get(k)) == Some(v))
+        })
+        .filter_map(|svc| s(svc, "/metadata/name").map(String::from))
+        .collect();
+    let cards = ports.iter().map(|p| {
+        let port = p["containerPort"].as_u64().and_then(|n| u16::try_from(n).ok()).unwrap_or(0);
+        let protocol = p["protocol"].as_str().unwrap_or("TCP");
+        let name = p["name"].as_str().map(String::from);
+        // Port-forward is TCP only.
+        let forward = (port > 0 && protocol == "TCP").then(|| forward_buttons(ctx, port, name.as_deref()));
+        card(cx)
+            .w(px(260.))
+            .child(div().text_xs().text_color(cx.theme().muted_foreground).child(name.unwrap_or_else(|| "-".into())))
+            .child(h_flex().justify_between().child(div().child(format!("{port}/{protocol}"))).children(forward))
+            .when(!services.is_empty(), |d| {
+                d.child(div().pt_1().text_xs().text_color(cx.theme().muted_foreground).child("Services"))
+                    .children(services.iter().map(|svc| ctx.link(svc.clone(), "services", svc, cx)))
             })
-            .filter_map(|svc| s(svc, "/metadata/name").map(String::from))
-            .collect();
-        root = root.child(heading("Ports")).child(h_flex().flex_wrap().gap_3().children(ports.iter().map(|p| {
-            let port = p["containerPort"].as_u64().and_then(|n| u16::try_from(n).ok()).unwrap_or(0);
-            let protocol = p["protocol"].as_str().unwrap_or("TCP");
-            let name = p["name"].as_str().map(String::from);
-            // Port-forward is TCP only.
-            let forward = (port > 0 && protocol == "TCP").then(|| {
-                let forward = |options: bool| {
-                    let (panel, name) = (ctx.panel.clone(), name.clone());
-                    move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
-                        let _ = panel.update(cx, |p, cx| p.forward_port(port, name.as_deref(), options, window, cx));
-                    }
-                };
-                h_flex()
-                    .gap_1()
-                    .child(
-                        Button::new(("pf", port as usize))
-                            .xsmall()
-                            .outline()
-                            .icon(Lucide::ArrowRightLeft)
-                            .label("Forward")
-                            .tooltip(format!("Port-forward {port} to this machine"))
-                            .on_click(forward(false)),
-                    )
-                    .child(
-                        Button::new(("pf-opt", port as usize))
-                            .xsmall()
-                            .ghost()
-                            .icon(Lucide::Settings2)
-                            .tooltip("Forward with options: local port, address, https, open in browser")
-                            .on_click(forward(true)),
-                    )
-            });
-            card(cx)
-                .w(px(260.))
-                .child(
-                    div().text_xs().text_color(cx.theme().muted_foreground).child(name.unwrap_or_else(|| "-".into())),
-                )
-                .child(h_flex().justify_between().child(div().child(format!("{port}/{protocol}"))).children(forward))
-                .when(!services.is_empty(), |d| {
-                    d.child(div().pt_1().text_xs().text_color(cx.theme().muted_foreground).child("Services"))
-                        .children(services.iter().map(|svc| ctx.link(svc.clone(), "services", svc, cx)))
-                })
-        })));
+    });
+    vec![heading("Ports").into_any_element(), h_flex().flex_wrap().gap_3().children(cards).into_any_element()]
+}
+
+/// "Forward" and "Forward with options" for a container port.
+fn forward_buttons(ctx: &Ctx, port: u16, name: Option<&str>) -> Div {
+    let forward = |options: bool| {
+        let (panel, name) = (ctx.panel.clone(), name.map(String::from));
+        move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
+            let _ = panel.update(cx, |p, cx| p.forward_port(port, name.as_deref(), options, window, cx));
+        }
+    };
+    h_flex()
+        .gap_1()
+        .child(
+            Button::new(("pf", port as usize))
+                .xsmall()
+                .outline()
+                .icon(Lucide::ArrowRightLeft)
+                .label("Forward")
+                .tooltip(format!("Port-forward {port} to this machine"))
+                .on_click(forward(false)),
+        )
+        .child(
+            Button::new(("pf-opt", port as usize))
+                .xsmall()
+                .ghost()
+                .icon(Lucide::Settings2)
+                .tooltip("Forward with options: local port, address, https, open in browser")
+                .on_click(forward(true)),
+        )
+}
+
+/// The ConfigMaps and Secrets a pod's environment reads, by `Kind/name`.
+struct EnvSources<'a> {
+    sources: &'a std::collections::HashMap<String, Value>,
+    reveal: bool,
+}
+
+impl EnvSources<'_> {
+    fn data(&self, kind: &str, name: &str, key: &str) -> Option<&str> {
+        let key = key.replace('~', "~0").replace('/', "~1");
+        self.sources.get(&format!("{kind}/{name}"))?.pointer(&format!("/data/{key}"))?.as_str()
     }
 
-    // Environment variables, with values resolved from ConfigMaps, Secrets and the pod.
-    let env = c["env"].as_array().cloned().unwrap_or_default();
-    let env_from = c["envFrom"].as_array().cloned().unwrap_or_default();
-    if !env.is_empty() || !env_from.is_empty() {
-        let theme = cx.theme();
-        let muted = theme.muted_foreground;
-        let sources = &ctx.related.env_sources;
-        let secret_value = |name: &str, key: &str| -> Option<String> {
-            use base64::Engine as _;
-            let b = sources
-                .get(&format!("Secret/{name}"))?
-                .pointer(&format!("/data/{}", key.replace('~', "~0").replace('/', "~1")))?
-                .as_str()?;
-            Some(String::from_utf8_lossy(&base64::engine::general_purpose::STANDARD.decode(b).ok()?).to_string())
-        };
-        let cm_value = |name: &str, key: &str| -> Option<String> {
-            sources
-                .get(&format!("ConfigMap/{name}"))?
-                .pointer(&format!("/data/{}", key.replace('~', "~0").replace('/', "~1")))?
-                .as_str()
-                .map(String::from)
-        };
-        let masked = |v: String| if ctx.reveal { v } else { "••••••".into() };
-        let row_el = |key: String, value: AnyElement, source: AnyElement| {
-            h_flex()
-                .gap_3()
-                .items_start()
-                .py_0p5()
-                .child(
-                    div()
-                        .w(px(260.))
-                        .flex_shrink_0()
-                        .font_family(theme.mono_font_family.clone())
-                        .text_sm()
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .overflow_hidden()
-                        .text_ellipsis()
-                        .child(key),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .font_family(theme.mono_font_family.clone())
-                        .text_sm()
-                        .overflow_hidden()
-                        .text_ellipsis()
-                        .whitespace_nowrap()
-                        .child(value),
-                )
-                .child(div().flex_shrink_0().text_xs().text_color(muted).child(source))
-                .into_any_element()
-        };
-        let mut rows: Vec<AnyElement> = Vec::new();
-        for from in &env_from {
-            let prefix = from["prefix"].as_str().unwrap_or_default();
-            for (kind, key_ptr, plural) in
-                [("ConfigMap", "/configMapRef/name", "configmaps"), ("Secret", "/secretRef/name", "secrets")]
-            {
-                let Some(name) = from.pointer(key_ptr).and_then(Value::as_str) else { continue };
-                let data = sources
-                    .get(&format!("{kind}/{name}"))
-                    .and_then(|v| v["data"].as_object())
-                    .cloned()
-                    .unwrap_or_default();
-                if data.is_empty() {
-                    rows.push(row_el(
-                        "(all keys)".into(),
-                        div().text_color(muted).child("not readable").into_any_element(),
-                        h_flex()
-                            .gap_1()
-                            .child(format!("from {kind}"))
-                            .child(ctx.link(name.to_string(), plural, name, cx))
-                            .into_any_element(),
-                    ));
-                }
-                for k in data.keys() {
-                    let v = if kind == "Secret" { secret_value(name, k).map(masked) } else { cm_value(name, k) };
-                    rows.push(row_el(
-                        format!("{prefix}{k}"),
-                        div().child(v.unwrap_or_default()).into_any_element(),
-                        h_flex()
-                            .gap_1()
-                            .child(kind.to_string())
-                            .child(ctx.link(name.to_string(), plural, name, cx))
-                            .into_any_element(),
-                    ));
-                }
+    /// A Secret's value, decoded, or dots unless secrets are revealed.
+    fn secret(&self, name: &str, key: &str) -> Option<String> {
+        use base64::Engine as _;
+        let value = base64::engine::general_purpose::STANDARD.decode(self.data("Secret", name, key)?).ok()?;
+        Some(if self.reveal { String::from_utf8_lossy(&value).to_string() } else { "••••••".into() })
+    }
+
+    fn config_map(&self, name: &str, key: &str) -> Option<String> {
+        self.data("ConfigMap", name, key).map(String::from)
+    }
+}
+
+/// The container's environment variables, with values resolved from ConfigMaps, Secrets
+/// and the pod: a heading and the list (long ones folded), or nothing.
+fn container_env(ctx: &Ctx, c: &Value, cx: &App) -> Vec<AnyElement> {
+    let env = c["env"].as_array().map(Vec::as_slice).unwrap_or_default();
+    let env_from = c["envFrom"].as_array().map(Vec::as_slice).unwrap_or_default();
+    if env.is_empty() && env_from.is_empty() {
+        return Vec::new();
+    }
+    let muted = cx.theme().muted_foreground;
+    let sources = EnvSources { sources: &ctx.related.env_sources, reveal: ctx.reveal };
+    let mut rows: Vec<AnyElement> = Vec::new();
+    for from in env_from {
+        let prefix = from["prefix"].as_str().unwrap_or_default();
+        for (kind, key_ptr, plural) in
+            [("ConfigMap", "/configMapRef/name", "configmaps"), ("Secret", "/secretRef/name", "secrets")]
+        {
+            let Some(name) = from.pointer(key_ptr).and_then(Value::as_str) else { continue };
+            let data = ctx.related.env_sources.get(&format!("{kind}/{name}")).and_then(|v| v["data"].as_object());
+            let link = |label: String| {
+                h_flex().gap_1().child(label).child(ctx.link(name.to_string(), plural, name, cx)).into_any_element()
+            };
+            if data.is_none_or(serde_json::Map::is_empty) {
+                rows.push(env_row(
+                    "(all keys)".into(),
+                    div().text_color(muted).child("not readable").into_any_element(),
+                    link(format!("from {kind}")),
+                    cx,
+                ));
+            }
+            for k in data.into_iter().flat_map(serde_json::Map::keys) {
+                let v = if kind == "Secret" { sources.secret(name, k) } else { sources.config_map(name, k) };
+                rows.push(env_row(
+                    format!("{prefix}{k}"),
+                    div().child(v.unwrap_or_default()).into_any_element(),
+                    link(kind.to_string()),
+                    cx,
+                ));
             }
         }
-        for e in &env {
-            let key = e["name"].as_str().unwrap_or_default().to_string();
-            let (value, source): (AnyElement, AnyElement) = if let Some(v) = e["value"].as_str() {
-                (div().child(v.to_string()).into_any_element(), div().into_any_element())
-            } else if let Some(r) = e.pointer("/valueFrom/secretKeyRef") {
-                let (name, k) = (r["name"].as_str().unwrap_or_default(), r["key"].as_str().unwrap_or("?"));
-                let v = secret_value(name, k).map_or_else(|| "(not readable)".into(), masked);
-                (
-                    div().child(v).into_any_element(),
-                    h_flex()
-                        .gap_1()
-                        .child(format!("Secret key {k} of"))
-                        .child(ctx.link(name.to_string(), "secrets", name, cx))
-                        .into_any_element(),
-                )
-            } else if let Some(r) = e.pointer("/valueFrom/configMapKeyRef") {
-                let (name, k) = (r["name"].as_str().unwrap_or_default(), r["key"].as_str().unwrap_or("?"));
-                let v = cm_value(name, k).unwrap_or_else(|| "(missing)".into());
-                (
-                    div().child(v).into_any_element(),
-                    h_flex()
-                        .gap_1()
-                        .child(format!("key {k} of"))
-                        .child(ctx.link(name.to_string(), "configmaps", name, cx))
-                        .into_any_element(),
-                )
-            } else if let Some(p) = e.pointer("/valueFrom/fieldRef/fieldPath").and_then(Value::as_str) {
-                // Resolve the common downward-API fields from the pod itself.
-                let resolved = match p {
-                    "metadata.name" => s(obj, "/metadata/name"),
-                    "metadata.namespace" => s(obj, "/metadata/namespace"),
-                    "metadata.uid" => s(obj, "/metadata/uid"),
-                    "spec.nodeName" => s(obj, "/spec/nodeName"),
-                    "spec.serviceAccountName" => s(obj, "/spec/serviceAccountName"),
-                    "status.podIP" => s(obj, "/status/podIP"),
-                    "status.hostIP" => s(obj, "/status/hostIP"),
-                    _ => p
-                        .strip_prefix("metadata.labels['")
-                        .and_then(|k| k.strip_suffix("']"))
-                        .and_then(|k| obj.pointer("/metadata/labels").and_then(|l| l[k].as_str()))
-                        .or_else(|| {
-                            p.strip_prefix("metadata.annotations['")
-                                .and_then(|k| k.strip_suffix("']"))
-                                .and_then(|k| obj.pointer("/metadata/annotations").and_then(|l| l[k].as_str()))
-                        }),
-                };
-                (
-                    div().child(resolved.unwrap_or("-").to_string()).into_any_element(),
-                    div().child(format!("field {p}")).into_any_element(),
-                )
-            } else if let Some(r) = e.pointer("/valueFrom/resourceFieldRef/resource").and_then(Value::as_str) {
-                let limit = c
-                    .pointer(&format!("/resources/{}", r.replacen('.', "/", 1)))
-                    .and_then(Value::as_str)
-                    .unwrap_or("-");
-                (
-                    div().child(limit.to_string()).into_any_element(),
-                    div().child(format!("resource {r}")).into_any_element(),
-                )
-            } else {
-                (div().child("-").into_any_element(), div().into_any_element())
-            };
-            rows.push(row_el(key, value, source));
-        }
-        const SHOWN: usize = 12;
-        let total = rows.len();
-        let hidden = if ctx.env_expanded { 0 } else { total.saturating_sub(SHOWN) };
-        let panel = ctx.panel.clone();
-        root = root.child(heading(&format!("Environment variables ({total})"))).child(
-            v_flex().children(rows.into_iter().take(total - hidden)).when(total > SHOWN, |d| {
-                d.child(
-                    div()
-                        .id("env-toggle")
-                        .pt_1()
-                        .text_sm()
-                        .text_color(cx.theme().blue)
-                        .cursor_pointer()
-                        .child(if hidden > 0 { format!("Show {hidden} more") } else { "Show less".to_string() })
-                        .on_click(move |_, _, cx| {
-                            let _ = panel.update(cx, crate::details::DetailPanel::toggle_env);
-                        }),
-                )
-            }),
-        );
     }
+    for e in env {
+        let key = e["name"].as_str().unwrap_or_default().to_string();
+        let (value, source) = env_value(ctx, &sources, c, e, cx);
+        rows.push(env_row(key, value, source, cx));
+    }
+    const SHOWN: usize = 12;
+    let total = rows.len();
+    let hidden = if ctx.env_expanded { 0 } else { total.saturating_sub(SHOWN) };
+    let panel = ctx.panel.clone();
+    let list = v_flex().children(rows.into_iter().take(total - hidden)).when(total > SHOWN, |d| {
+        d.child(
+            div()
+                .id("env-toggle")
+                .pt_1()
+                .text_sm()
+                .text_color(cx.theme().blue)
+                .cursor_pointer()
+                .child(if hidden > 0 { format!("Show {hidden} more") } else { "Show less".to_string() })
+                .on_click(move |_, _, cx| {
+                    let _ = panel.update(cx, crate::details::DetailPanel::toggle_env);
+                }),
+        )
+    });
+    vec![heading(&format!("Environment variables ({total})")).into_any_element(), list.into_any_element()]
+}
 
-    // Volume mounts with their source.
-    let mounts = c["volumeMounts"].as_array().cloned().unwrap_or_default();
-    if !mounts.is_empty() {
-        let volumes = arr(obj, "/spec/volumes");
-        root =
-            root.child(heading("Volume mounts")).child(h_flex().flex_wrap().gap_3().children(mounts.iter().map(|m| {
-                let vname = m["name"].as_str().unwrap_or_default();
-                let vol = volumes.iter().find(|v| v["name"].as_str() == Some(vname));
-                let source: AnyElement = match vol {
-                    Some(v) if v.get("configMap").is_some() => {
-                        let n = v.pointer("/configMap/name").and_then(Value::as_str).unwrap_or_default();
-                        ctx.link(format!("ConfigMap: {n}"), "configmaps", n, cx).into_any_element()
-                    }
-                    Some(v) if v.get("secret").is_some() => {
-                        let n = v.pointer("/secret/secretName").and_then(Value::as_str).unwrap_or_default();
-                        ctx.link(format!("Secret: {n}"), "secrets", n, cx).into_any_element()
-                    }
-                    Some(v) if v.get("persistentVolumeClaim").is_some() => {
-                        let n =
-                            v.pointer("/persistentVolumeClaim/claimName").and_then(Value::as_str).unwrap_or_default();
-                        ctx.link(format!("PVC: {n}"), "persistentvolumeclaims", n, cx).into_any_element()
-                    }
-                    Some(v) => {
-                        let t =
-                            v.as_object().and_then(|o| o.keys().find(|k| *k != "name").cloned()).unwrap_or_default();
-                        div()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(format!("({t})"))
-                            .into_any_element()
-                    }
-                    None => div().into_any_element(),
-                };
-                let ro = m["readOnly"].as_bool().unwrap_or(false);
-                card(cx)
-                    .w(px(360.))
-                    .child(div().text_xs().child(vname.to_string()))
-                    .child(source)
-                    .child(div().child(format!(
-                        "{}{}",
-                        m["mountPath"].as_str().unwrap_or_default(),
-                        m["subPath"].as_str().map(|p| format!(" (subPath {p})")).unwrap_or_default()
-                    )))
-                    .child(div().text_xs().text_color(cx.theme().muted_foreground).child(if ro {
-                        "ReadOnly"
-                    } else {
-                        "ReadWrite"
-                    }))
-            })));
+/// One `env` entry's value and where it comes from.
+fn env_value(ctx: &Ctx, sources: &EnvSources, c: &Value, e: &Value, cx: &App) -> (AnyElement, AnyElement) {
+    let text = |t: String| div().child(t).into_any_element();
+    fn key_ref(r: &Value) -> (&str, &str) {
+        (r["name"].as_str().unwrap_or_default(), r["key"].as_str().unwrap_or("?"))
     }
-    scroll(root, "container")
+    if let Some(v) = e["value"].as_str() {
+        (text(v.to_string()), div().into_any_element())
+    } else if let Some(r) = e.pointer("/valueFrom/secretKeyRef") {
+        let (name, k) = key_ref(r);
+        let v = sources.secret(name, k).unwrap_or_else(|| "(not readable)".into());
+        let source =
+            h_flex().gap_1().child(format!("Secret key {k} of")).child(ctx.link(name.to_string(), "secrets", name, cx));
+        (text(v), source.into_any_element())
+    } else if let Some(r) = e.pointer("/valueFrom/configMapKeyRef") {
+        let (name, k) = key_ref(r);
+        let v = sources.config_map(name, k).unwrap_or_else(|| "(missing)".into());
+        let source =
+            h_flex().gap_1().child(format!("key {k} of")).child(ctx.link(name.to_string(), "configmaps", name, cx));
+        (text(v), source.into_any_element())
+    } else if let Some(p) = e.pointer("/valueFrom/fieldRef/fieldPath").and_then(Value::as_str) {
+        (text(field_ref(ctx.obj, p).unwrap_or("-").to_string()), text(format!("field {p}")))
+    } else if let Some(r) = e.pointer("/valueFrom/resourceFieldRef/resource").and_then(Value::as_str) {
+        let limit =
+            c.pointer(&format!("/resources/{}", r.replacen('.', "/", 1))).and_then(Value::as_str).unwrap_or("-");
+        (text(limit.to_string()), text(format!("resource {r}")))
+    } else {
+        (text("-".into()), div().into_any_element())
+    }
+}
+
+/// A downward-API field (`fieldRef.fieldPath`) read from the pod itself: the common
+/// metadata, spec and status fields, and single labels or annotations.
+fn field_ref<'a>(pod: &'a Value, path: &str) -> Option<&'a str> {
+    let item = |prefix: &str, map: &str| {
+        let key = path.strip_prefix(prefix)?.strip_suffix("']")?;
+        pod.pointer(map)?.get(key)?.as_str()
+    };
+    match path {
+        "metadata.name" => s(pod, "/metadata/name"),
+        "metadata.namespace" => s(pod, "/metadata/namespace"),
+        "metadata.uid" => s(pod, "/metadata/uid"),
+        "spec.nodeName" => s(pod, "/spec/nodeName"),
+        "spec.serviceAccountName" => s(pod, "/spec/serviceAccountName"),
+        "status.podIP" => s(pod, "/status/podIP"),
+        "status.hostIP" => s(pod, "/status/hostIP"),
+        _ => item("metadata.labels['", "/metadata/labels")
+            .or_else(|| item("metadata.annotations['", "/metadata/annotations")),
+    }
+}
+
+/// An environment variable's line: name, value, source.
+fn env_row(key: String, value: AnyElement, source: AnyElement, cx: &App) -> AnyElement {
+    let theme = cx.theme();
+    h_flex()
+        .gap_3()
+        .items_start()
+        .py_0p5()
+        .child(
+            div()
+                .w(px(260.))
+                .flex_shrink_0()
+                .font_family(theme.mono_font_family.clone())
+                .text_sm()
+                .font_weight(FontWeight::SEMIBOLD)
+                .overflow_hidden()
+                .text_ellipsis()
+                .child(key),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .font_family(theme.mono_font_family.clone())
+                .text_sm()
+                .overflow_hidden()
+                .text_ellipsis()
+                .whitespace_nowrap()
+                .child(value),
+        )
+        .child(div().flex_shrink_0().text_xs().text_color(theme.muted_foreground).child(source))
+        .into_any_element()
+}
+
+/// The container's volume mounts with their source, or nothing.
+fn container_mounts(ctx: &Ctx, c: &Value, cx: &App) -> Vec<AnyElement> {
+    let Some(mounts) = c["volumeMounts"].as_array().filter(|m| !m.is_empty()) else { return Vec::new() };
+    let volumes = arr(ctx.obj, "/spec/volumes");
+    let cards = mounts.iter().map(|m| {
+        let vname = m["name"].as_str().unwrap_or_default();
+        let vol = volumes.iter().find(|v| v["name"].as_str() == Some(vname));
+        let source: AnyElement = match vol {
+            Some(v) if v.get("configMap").is_some() => {
+                let n = v.pointer("/configMap/name").and_then(Value::as_str).unwrap_or_default();
+                ctx.link(format!("ConfigMap: {n}"), "configmaps", n, cx).into_any_element()
+            }
+            Some(v) if v.get("secret").is_some() => {
+                let n = v.pointer("/secret/secretName").and_then(Value::as_str).unwrap_or_default();
+                ctx.link(format!("Secret: {n}"), "secrets", n, cx).into_any_element()
+            }
+            Some(v) if v.get("persistentVolumeClaim").is_some() => {
+                let n = v.pointer("/persistentVolumeClaim/claimName").and_then(Value::as_str).unwrap_or_default();
+                ctx.link(format!("PVC: {n}"), "persistentvolumeclaims", n, cx).into_any_element()
+            }
+            Some(v) => {
+                let t = v.as_object().and_then(|o| o.keys().find(|k| *k != "name").cloned()).unwrap_or_default();
+                div().text_xs().text_color(cx.theme().muted_foreground).child(format!("({t})")).into_any_element()
+            }
+            None => div().into_any_element(),
+        };
+        let ro = m["readOnly"].as_bool().unwrap_or(false);
+        card(cx)
+            .w(px(360.))
+            .child(div().text_xs().child(vname.to_string()))
+            .child(source)
+            .child(div().child(format!(
+                "{}{}",
+                m["mountPath"].as_str().unwrap_or_default(),
+                m["subPath"].as_str().map(|p| format!(" (subPath {p})")).unwrap_or_default()
+            )))
+            .child(div().text_xs().text_color(cx.theme().muted_foreground).child(if ro {
+                "ReadOnly"
+            } else {
+                "ReadWrite"
+            }))
+    });
+    vec![heading("Volume mounts").into_any_element(), h_flex().flex_wrap().gap_3().children(cards).into_any_element()]
 }
 
 pub(super) fn probe_card(title: &str, p: &Value, cx: &App) -> Div {
@@ -711,4 +711,26 @@ fn container_history(ctx: &Ctx, c: &Value, name: &str, cx: &App) -> Option<Div> 
                 "ctr-mem",
             )),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::field_ref;
+
+    #[test]
+    fn downward_api_fields_come_from_the_pod() {
+        let pod = json!({
+            "metadata": {"name": "web-1", "labels": {"app": "web"}, "annotations": {"team": "core"}},
+            "spec": {"nodeName": "node-a"},
+        });
+        assert_eq!(field_ref(&pod, "metadata.name"), Some("web-1"));
+        assert_eq!(field_ref(&pod, "spec.nodeName"), Some("node-a"));
+        assert_eq!(field_ref(&pod, "metadata.labels['app']"), Some("web"));
+        assert_eq!(field_ref(&pod, "metadata.annotations['team']"), Some("core"));
+        assert_eq!(field_ref(&pod, "metadata.labels['missing']"), None);
+        assert_eq!(field_ref(&pod, "status.podIP"), None);
+        assert_eq!(field_ref(&pod, "metadata.labels"), None);
+    }
 }
