@@ -40,8 +40,8 @@ kube = { version = "4.2", default-features = false, features = ["client", "rustl
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.154", features = ["raw_value"] }
 serde-saphyr = "2.0"
-tokio = { version = "1.53.3", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "process", "fs"] }
-rmcp = { version = "3.5", features = ["server", "macros", "transport-streamable-http-server"] }
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "process", "fs"] }
+rmcp = { version = "3.6", features = ["server", "macros", "transport-streamable-http-server"] }
 axum = "0.8"
 schemars = "1"
 sha2 = "0.11"
