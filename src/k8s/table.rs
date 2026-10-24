@@ -36,7 +36,7 @@ where
     Ok(Option::<T>::deserialize(d)?.unwrap_or_default())
 }
 
-#[derive(Deserialize, Clone, Debug)]
+#[derive(Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct ColumnDef {
     pub name: String,
     #[serde(default)]

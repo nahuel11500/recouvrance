@@ -1,6 +1,5 @@
 //! Keeping the resource list live: table watches, metrics and the problem count.
 
-use std::collections::HashSet;
 use std::sync::Arc;
 
 use futures::StreamExt as _;
@@ -8,7 +7,8 @@ use gpui_kit::component::table::TableDelegate as _;
 use gpui_kit::*;
 
 use super::contexts::cluster_namespace;
-use super::{AppView, Route, view_cache};
+use super::live_list::{LiveList, coalesce};
+use super::{AppView, Route};
 use crate::k8s;
 use crate::k8s::TableMsg;
 
@@ -59,7 +59,6 @@ impl AppView {
     pub(super) fn restart_watch(&mut self, cx: &mut Context<Self>) {
         self.watch = None;
         self.metrics = None;
-        self.watch_errors.clear();
         self.keep_view(cx);
         let Some(kind) = self.kind.clone() else { return };
         // Not connected: open the cluster switcher instead of doing nothing.
@@ -71,8 +70,6 @@ impl AppView {
         let show_ns = kind.namespaced && self.namespace.is_none();
         let ns_filter = (self.namespaces.len() > 1).then(|| self.namespaces.iter().cloned().collect());
         let names: Vec<String> = self.clusters.iter().map(|(c, _)| c.clone()).collect();
-        self.rows_by_ctx = vec![Vec::new(); self.clusters.len()];
-        self.defs_by_ctx = vec![Arc::default(); self.clusters.len()];
         // What each cluster watches: nothing when it doesn't serve the kind, one of its
         // accessible namespaces when it may not list cluster-wide. A kind discovery didn't
         // find is served nowhere.
@@ -98,9 +95,8 @@ impl AppView {
         let cached = self.views.get(&key).filter(|v| v.rows.len() == self.clusters.len()).cloned();
         self.view_key = Some(key);
         // Wait only for the clusters watched: the others never report.
-        self.listing = (0..self.clusters.len()).filter(|&ix| watched[ix].is_some()).collect();
-        self.refused.clear();
-        let loading = !self.listing.is_empty();
+        self.list = LiveList::start(self.clusters.len(), (0..self.clusters.len()).filter(|&ix| watched[ix].is_some()));
+        let loading = self.list.is_loading();
         let is_pod = kind.is("", "Pod");
         let mut actions = Vec::new();
         if kind.is("batch", "CronJob") {
@@ -135,30 +131,25 @@ impl AppView {
             t.clear_selection(cx);
             t.refresh(cx);
         });
-        self.status = loading.then(|| "Loading…".into());
         if serving.is_empty() {
-            self.status = Some(format!("{} is not available on the connected clusters", kind.label).into());
+            self.list.notice = Some(format!("{} is not available on the connected clusters", kind.label).into());
         }
         // Seen recently: show it as it was while the new list loads (whole, not by pages).
         let progressive = cached.is_none();
         if let Some(view) = cached {
-            self.rows_by_ctx = view.rows;
-            // Kept laid out in the columns of the list shown.
-            self.defs_by_ctx = vec![view.columns.clone(); self.clusters.len()];
-            // A cluster that no longer serves the kind is not watched: nothing would replace its rows.
-            keep_watched(&mut self.rows_by_ctx, &self.listing);
-            let merged = self.merged_rows(&view.columns);
+            let (columns, at) = (view.columns.clone(), view.at);
+            self.list.restore(view);
+            let merged = self.list.merged(&columns);
             self.table.update(cx, |t, cx| {
                 t.delegate_mut().loading = false;
-                t.delegate_mut().update_columns(view.columns);
+                t.delegate_mut().update_columns(columns);
                 t.delegate_mut().set_rows(merged);
                 t.refresh(cx);
             });
             if loading {
-                let ago = k8s::age(
-                    jiff::Timestamp::now() - jiff::SignedDuration::try_from(view.at.elapsed()).unwrap_or_default(),
-                );
-                self.status = Some(format!("Updating… (showing the list from {ago} ago)").into());
+                let ago =
+                    k8s::age(jiff::Timestamp::now() - jiff::SignedDuration::try_from(at.elapsed()).unwrap_or_default());
+                self.list.notice = Some(format!("Updating… (showing the list from {ago} ago)").into());
             }
         }
         let mut watches = Vec::new();
@@ -262,39 +253,23 @@ impl AppView {
     }
 
     /// What the bar above the list says: what failed (contexts, watches), then progress.
-    /// Both show: a failing cluster's rows may be the old ones the progress notice warns of.
     pub(super) fn status_line(&self) -> Option<SharedString> {
-        status_text(self.connect_errors.iter().chain(self.watch_errors.values()), self.status.as_ref())
+        self.list.status_line(self.connect_errors.as_ref())
     }
 
     /// Keep the list on screen in `views` (if it was complete), before another replaces it.
     pub(super) fn keep_view(&mut self, cx: &mut Context<Self>) {
         let Some(key) = self.view_key.take() else { return };
-        let forbidden = self.table.read(cx).delegate().forbidden;
-        if !self.listing.is_empty() || forbidden || self.rows_by_ctx.iter().all(Vec::is_empty) {
-            return;
+        let table = self.table.read(cx).delegate();
+        if let Some(view) = self.list.snapshot(table.defs(), table.forbidden) {
+            self.views.put(key, view);
         }
-        let columns = self.table.read(cx).delegate().defs();
-        let rows = (self.rows_by_ctx.iter().zip(&self.defs_by_ctx))
-            .map(|(rows, defs)| relayout(rows, defs, &columns))
-            .collect();
-        let view = view_cache::CachedView { columns, rows, at: std::time::Instant::now() };
-        self.views.put(key, view);
-    }
-
-    /// Every cluster's rows, each with its cluster's index, laid out in `columns` (the
-    /// table's).
-    fn merged_rows(&self, columns: &[k8s::ColumnDef]) -> Vec<(usize, Arc<k8s::Row>)> {
-        (self.rows_by_ctx.iter().zip(&self.defs_by_ctx))
-            .enumerate()
-            .flat_map(|(i, (rows, defs))| relayout(rows, defs, columns).into_iter().map(move |r| (i, r)))
-            .collect()
     }
 
     /// Every cluster's rows into the table, laid out in its columns.
     fn show_rows(&mut self, cx: &mut Context<Self>) {
         let columns = self.table.read(cx).delegate().defs();
-        let merged = self.merged_rows(&columns);
+        let merged = self.list.merged(&columns);
         self.table.update(cx, |t, cx| {
             t.delegate_mut().set_rows(merged);
             cx.notify();
@@ -313,147 +288,33 @@ impl AppView {
     }
 
     pub(super) fn on_table_msg(&mut self, ctx: usize, msg: TableMsg, cx: &mut Context<Self>) {
-        match msg {
-            TableMsg::Columns(cols) => {
-                // This cluster's rows from before (a relist after a CRD upgrade) move under
-                // its new columns, so they stay laid out in what `defs_by_ctx` says.
-                let mut moved = false;
-                if let (Some(rows), Some(defs)) = (self.rows_by_ctx.get_mut(ctx), self.defs_by_ctx.get_mut(ctx)) {
-                    moved = !rows.is_empty() && !same_names(defs, &cols);
-                    if moved {
-                        *rows = relayout(rows, defs, &cols);
-                    }
-                    *defs = cols.clone();
+        let name = self.clusters.get(ctx).map(|c| c.0.clone()).unwrap_or_default();
+        let shown = {
+            let table = self.table.read(cx);
+            if table.delegate().columns_count(cx) > 0 { table.delegate().defs() } else { Arc::default() }
+        };
+        let up = self.list.apply(ctx, &name, msg, &shown);
+        if let Some(columns) = up.columns {
+            self.table.update(cx, |t, cx| {
+                t.delegate_mut().update_columns(columns);
+                t.refresh(cx);
+            });
+        }
+        if up.rows {
+            self.show_rows(cx);
+        } else if up.follow {
+            self.follow_selection(cx);
+        }
+        if up.loaded {
+            self.table.update(cx, |t, _| {
+                let d = t.delegate_mut();
+                d.loading = false;
+                if let Some(forbidden) = up.forbidden {
+                    d.forbidden = forbidden;
                 }
-                // The table shows the first cluster's columns (or the first to come); the
-                // other clusters' rows are laid out under them by column name.
-                let shown = self.table.update(cx, |t, cx| {
-                    if t.delegate().columns_count(cx) > 0 && ctx != 0 {
-                        return false;
-                    }
-                    let changed = !same_names(&t.delegate().defs(), &cols);
-                    // A relist sends them again: keeps the user's sort and column order.
-                    t.delegate_mut().update_columns(cols);
-                    t.refresh(cx);
-                    changed
-                });
-                if moved || (shown && self.rows_by_ctx.iter().any(|r| !r.is_empty())) {
-                    self.show_rows(cx);
-                } else if shown {
-                    // New columns sort the rows again: the highlight stays on its object.
-                    self.follow_selection(cx);
-                }
-            }
-            TableMsg::Rows(rows) => {
-                // "Loading…" or "showing the list from 2h ago" holds while another cluster is
-                // still listing: its rows are not there yet, or are the old ones.
-                if !others_listing(&self.listing, ctx) {
-                    self.status = None;
-                }
-                self.watch_errors.remove(&ctx);
-                if let Some(slot) = self.rows_by_ctx.get_mut(ctx) {
-                    *slot = rows;
-                }
-                self.show_rows(cx);
-            }
-            TableMsg::Listed => {
-                self.listing.remove(&ctx);
-                if self.listing.is_empty() {
-                    self.status = None;
-                    self.table.update(cx, |t, _| t.delegate_mut().loading = false);
-                }
-            }
-            TableMsg::Error(e) => {
-                let name = self.clusters.get(ctx).map(|c| c.0.clone()).unwrap_or_default();
-                self.watch_errors.insert(ctx, format!("{name}: {e} (retrying)").into());
-            }
-            TableMsg::Forbidden(e) => {
-                let name = self.clusters.get(ctx).map(|c| c.0.clone()).unwrap_or_default();
-                let text = format!("{name}: your access does not allow listing this type ({e})");
-                self.watch_errors.insert(ctx, text.into());
-                self.listing.remove(&ctx);
-                self.refused.insert(ctx);
-                // The watch ends here: rows listed before (or cached) would look live.
-                if let Some(slot) = self.rows_by_ctx.get_mut(ctx)
-                    && !slot.is_empty()
-                {
-                    slot.clear();
-                    self.show_rows(cx);
-                }
-                if self.listing.is_empty() {
-                    self.status = None;
-                    // Forbidden only when every cluster watched refused, whichever answers last.
-                    let all = self.refused.len() >= self.watch.as_ref().map_or(0, Vec::len);
-                    self.table.update(cx, |t, _| {
-                        let d = t.delegate_mut();
-                        d.loading = false;
-                        d.forbidden = all;
-                    });
-                }
-            }
+            });
         }
         cx.notify();
-    }
-}
-
-/// What failed, then the progress notice, in one line.
-fn status_text<'a>(
-    failed: impl Iterator<Item = &'a SharedString>,
-    status: Option<&'a SharedString>,
-) -> Option<SharedString> {
-    let parts: Vec<&str> = failed.chain(status).map(AsRef::as_ref).collect();
-    (!parts.is_empty()).then(|| parts.join("; ").into())
-}
-
-/// Whether a cluster other than `ctx` is still listing.
-fn others_listing(listing: &HashSet<usize>, ctx: usize) -> bool {
-    listing.iter().any(|&ix| ix != ctx)
-}
-
-/// Drop rows that newer rows in the same batch replace; everything else keeps its order.
-fn coalesce(batch: Vec<TableMsg>) -> Vec<TableMsg> {
-    let last_rows = batch.iter().rposition(|m| matches!(m, TableMsg::Rows(_)));
-    batch
-        .into_iter()
-        .enumerate()
-        .filter(|(i, m)| !matches!(m, TableMsg::Rows(_)) || Some(*i) == last_rows)
-        .map(|(_, m)| m)
-        .collect()
-}
-
-fn same_names(a: &[k8s::ColumnDef], b: &[k8s::ColumnDef]) -> bool {
-    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.name == y.name)
-}
-
-/// Rows whose cells are laid out in `from`, moved under `to` by column name: a column
-/// `from` lacks is empty. Rows with no known columns on either side stay as they are.
-fn relayout(rows: &[Arc<k8s::Row>], from: &[k8s::ColumnDef], to: &[k8s::ColumnDef]) -> Vec<Arc<k8s::Row>> {
-    if from.is_empty() || to.is_empty() || same_names(from, to) {
-        return rows.to_vec();
-    }
-    let at: Vec<Option<usize>> = to.iter().map(|d| from.iter().position(|f| f.name == d.name)).collect();
-    rows.iter()
-        .map(|r| {
-            Arc::new(k8s::Row {
-                uid: r.uid.clone(),
-                name: r.name.clone(),
-                namespace: r.namespace.clone(),
-                created: r.created,
-                cells: at.iter().map(|i| i.and_then(|i| r.cells.get(i)).cloned().unwrap_or_default()).collect(),
-                labels: r.labels.clone(),
-                deleting: r.deleting,
-                deleted_at: r.deleted_at,
-            })
-        })
-        .collect()
-}
-
-/// Empty the rows of the clusters not in `watched`.
-fn keep_watched<T>(rows: &mut [Vec<T>], watched: &HashSet<usize>) {
-    for (ix, slot) in rows.iter_mut().enumerate() {
-        if !watched.contains(&ix) {
-            slot.clear();
-        }
     }
 }
 
@@ -480,82 +341,5 @@ async fn wait_list_shown(this: &WeakEntity<AppView>, pause: &k8s::Pause, cx: &mu
                 cx.background_executor().timer(std::time::Duration::from_millis(500)).await;
             }
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{SharedString, TableMsg, coalesce, keep_watched, others_listing, relayout, status_text};
-
-    #[test]
-    fn the_old_list_notice_stays_while_another_cluster_lists() {
-        let listing = [0, 1].into_iter().collect();
-        assert!(others_listing(&listing, 0));
-        assert!(!others_listing(&std::iter::once(1).collect(), 1));
-        assert!(!others_listing(&Default::default(), 0));
-        // A failing cluster's error does not hide the notice: its rows may be the old ones.
-        let (error, notice) = (SharedString::from("b: timeout (retrying)"), SharedString::from("Updating…"));
-        assert_eq!(
-            status_text([&error].into_iter(), Some(&notice)).as_deref(),
-            Some("b: timeout (retrying); Updating…")
-        );
-        assert_eq!(status_text(std::iter::empty(), None), None);
-    }
-
-    #[test]
-    fn cells_move_under_the_shown_columns() {
-        let defs = |names: &[&str]| -> Vec<crate::k8s::ColumnDef> {
-            names.iter().map(|n| crate::k8s::ColumnDef { name: n.to_string(), priority: 0 }).collect()
-        };
-        let mut r = row();
-        r.cells = vec!["web".into(), "True".into(), "le".into(), "1d".into()];
-        let rows = vec![std::sync::Arc::new(r)];
-        // Another operator release: Issuer before Ready, and no Status column.
-        let from = defs(&["Name", "Ready", "Issuer", "Age"]);
-        let to = defs(&["Name", "Issuer", "Ready", "Status", "Age"]);
-        let moved = relayout(&rows, &from, &to);
-        assert_eq!(moved[0].cells, ["web", "le", "True", "", "1d"]);
-        assert_eq!(moved[0].uid, "u");
-        // Same columns, or none known: the rows themselves.
-        assert!(std::sync::Arc::ptr_eq(&relayout(&rows, &from, &from)[0], &rows[0]));
-        assert!(std::sync::Arc::ptr_eq(&relayout(&rows, &[], &to)[0], &rows[0]));
-        assert!(std::sync::Arc::ptr_eq(&relayout(&rows, &from, &[])[0], &rows[0]));
-    }
-
-    #[test]
-    fn rows_of_clusters_not_watched_are_dropped() {
-        let mut rows = vec![vec!["prod-pod"], vec!["staging-pod"], vec!["dev-pod"]];
-        keep_watched(&mut rows, &[0, 2].into_iter().collect());
-        assert_eq!(rows, [vec!["prod-pod"], vec![], vec!["dev-pod"]]);
-    }
-
-    fn row() -> crate::k8s::Row {
-        crate::k8s::Row {
-            uid: "u".into(),
-            name: "n".into(),
-            namespace: None,
-            created: None,
-            cells: Vec::new(),
-            labels: "".into(),
-            deleting: false,
-            deleted_at: None,
-        }
-    }
-
-    #[test]
-    fn coalesces_rows() {
-        let rows = |n: usize| TableMsg::Rows((0..n).map(|_| std::sync::Arc::new(row())).collect());
-        let batch = vec![rows(1), TableMsg::Columns(Default::default()), rows(2), TableMsg::Listed, rows(3)];
-        let kept: Vec<String> = coalesce(batch)
-            .iter()
-            .map(|m| match m {
-                TableMsg::Rows(r) => format!("rows{}", r.len()),
-                TableMsg::Columns(_) => "columns".into(),
-                TableMsg::Listed => "listed".into(),
-                _ => "other".into(),
-            })
-            .collect();
-        assert_eq!(kept, ["columns", "listed", "rows3"]);
-        assert_eq!(coalesce(vec![TableMsg::Error("x".into())]).len(), 1);
     }
 }

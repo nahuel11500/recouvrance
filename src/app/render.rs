@@ -275,7 +275,7 @@ impl Render for AppView {
                         },
                     ))
                     .child(if shown == total { format!("{total}") } else { format!("{shown} of {total}") })
-                    .when(!self.listing.is_empty() && total > 0, |d| {
+                    .when(self.list.is_loading() && total > 0, |d| {
                         d.child(div().text_color(cx.theme().muted_foreground).child("loading…"))
                     }),
             )
