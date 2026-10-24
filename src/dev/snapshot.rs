@@ -167,27 +167,32 @@ pub fn run(path: &str, wait: Duration) -> Result<()> {
         cx.update_window(window.into(), |_, window, cx| app_view.update(cx, |a, cx| a.demo_act(act, window, cx)))?;
         pump(&mut cx, Duration::from_secs(2));
     }
-    // RECOUVRANCE_INPUT="click:x,y;scroll:x,y,dy;key:down;key:enter;wait" drives real input events.
+    // RECOUVRANCE_INPUT="click:x,y;dblclick:x,y;scroll:x,y,dy;key:down;key:enter;wait" drives real input events.
     if let Ok(script) = std::env::var("RECOUVRANCE_INPUT") {
         for step in script.split(';') {
             let input = match step.split_once(':') {
-                Some(("click", at)) => {
+                Some((verb @ ("click" | "dblclick"), at)) => {
                     let (x, y) = at.split_once(',').unwrap_or(("0", "0"));
                     let position = point(px(x.parse().unwrap_or(0.)), px(y.parse().unwrap_or(0.)));
-                    let down = PlatformInput::MouseDown(MouseDownEvent {
-                        button: MouseButton::Left,
-                        position,
-                        modifiers: Modifiers::default(),
-                        click_count: 1,
-                        first_mouse: false,
-                    });
-                    let up = PlatformInput::MouseUp(MouseUpEvent {
-                        button: MouseButton::Left,
-                        position,
-                        modifiers: Modifiers::default(),
-                        click_count: 1,
-                    });
-                    vec![down, up]
+                    let clicks = if verb == "dblclick" { 2 } else { 1 };
+                    (1..=clicks)
+                        .flat_map(|click_count| {
+                            let down = PlatformInput::MouseDown(MouseDownEvent {
+                                button: MouseButton::Left,
+                                position,
+                                modifiers: Modifiers::default(),
+                                click_count,
+                                first_mouse: false,
+                            });
+                            let up = PlatformInput::MouseUp(MouseUpEvent {
+                                button: MouseButton::Left,
+                                position,
+                                modifiers: Modifiers::default(),
+                                click_count,
+                            });
+                            [down, up]
+                        })
+                        .collect()
                 }
                 Some(("scroll", at)) => {
                     let n: Vec<f32> = at.split(',').map(|v| v.parse().unwrap_or(0.)).collect();

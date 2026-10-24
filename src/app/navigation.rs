@@ -1,7 +1,9 @@
 //! Back/forward history and tabs.
 
 use gpui_kit::assets::IconName as Lucide;
+use gpui_kit::base::InteractiveElementExt as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::scroll::ScrollableMask;
 use gpui_kit::component::{ActiveTheme as _, IconName, Sizable as _, h_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -137,64 +139,72 @@ impl AppView {
                 }
             })
             .collect();
+        let strip = h_flex()
+            .id("tab-strip")
+            .w_full()
+            .h(px(32.))
+            .px_1()
+            .gap_0p5()
+            .items_end()
+            .overflow_x_scroll()
+            .lock_scroll_axis()
+            .track_scroll(&self.tab_scroll)
+            .bg(theme.secondary.opacity(0.5))
+            .border_b_1()
+            .border_color(theme.border)
+            .children(titles.into_iter().enumerate().map(|(i, title)| {
+                let active = i == self.active_tab;
+                h_flex()
+                    .id(("tab", i))
+                    .flex_shrink_0()
+                    .max_w(px(220.))
+                    .h(px(28.))
+                    .pl_3()
+                    .pr_1()
+                    .gap_1()
+                    .rounded_t_md()
+                    .cursor_pointer()
+                    .when(active, |d| d.bg(theme.background).border_1().border_b_0().border_color(theme.border))
+                    .when(!active, |d| d.hover(|s| s.bg(theme.list_hover)))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_sm()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .whitespace_nowrap()
+                            .when(!active, |d| d.text_color(theme.muted_foreground))
+                            .child(title),
+                    )
+                    .child(
+                        Button::new(("close-tab", i))
+                            .xsmall()
+                            .ghost()
+                            .icon(IconName::Close)
+                            .tooltip("Close tab (Ctrl+W)")
+                            .on_click(cx.listener(move |this, _, w, cx| {
+                                this.close_tab(i, w, cx);
+                                cx.stop_propagation();
+                            })),
+                    )
+                    .on_click(cx.listener(move |this, _, w, cx| this.switch_tab(i, w, cx)))
+            }))
+            .child(
+                Button::new("new-tab")
+                    .xsmall()
+                    .ghost()
+                    .icon(Lucide::Plus)
+                    .tooltip("New tab (Ctrl+T)")
+                    .on_click(cx.listener(|this, _, w, cx| this.new_tab(None, w, cx))),
+            );
+        // A plain mouse wheel scrolls the tabs sideways (it has no other axis).
         Some(
-            h_flex()
-                .id("tab-strip")
+            div()
+                .relative()
                 .w_full()
-                .h(px(32.))
-                .px_1()
-                .gap_0p5()
-                .items_end()
-                .overflow_x_scroll()
-                .bg(theme.secondary.opacity(0.5))
-                .border_b_1()
-                .border_color(theme.border)
-                .children(titles.into_iter().enumerate().map(|(i, title)| {
-                    let active = i == self.active_tab;
-                    h_flex()
-                        .id(("tab", i))
-                        .flex_shrink_0()
-                        .max_w(px(220.))
-                        .h(px(28.))
-                        .pl_3()
-                        .pr_1()
-                        .gap_1()
-                        .rounded_t_md()
-                        .cursor_pointer()
-                        .when(active, |d| d.bg(theme.background).border_1().border_b_0().border_color(theme.border))
-                        .when(!active, |d| d.hover(|s| s.bg(theme.list_hover)))
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .text_sm()
-                                .overflow_hidden()
-                                .text_ellipsis()
-                                .whitespace_nowrap()
-                                .when(!active, |d| d.text_color(theme.muted_foreground))
-                                .child(title),
-                        )
-                        .child(
-                            Button::new(("close-tab", i))
-                                .xsmall()
-                                .ghost()
-                                .icon(IconName::Close)
-                                .tooltip("Close tab (Ctrl+W)")
-                                .on_click(cx.listener(move |this, _, w, cx| {
-                                    this.close_tab(i, w, cx);
-                                    cx.stop_propagation();
-                                })),
-                        )
-                        .on_click(cx.listener(move |this, _, w, cx| this.switch_tab(i, w, cx)))
-                }))
-                .child(
-                    Button::new("new-tab")
-                        .xsmall()
-                        .ghost()
-                        .icon(Lucide::Plus)
-                        .tooltip("New tab (Ctrl+T)")
-                        .on_click(cx.listener(|this, _, w, cx| this.new_tab(None, w, cx))),
-                )
+                .child(strip)
+                .child(ScrollableMask::vertical_wheel(&self.tab_scroll))
                 .into_any_element(),
         )
     }

@@ -128,6 +128,58 @@ impl TableDelegate for ResourceTable {
         }
     }
 
+    /// The width column `col_ix` needs to show its header and every row's cell whole
+    /// (a double-click on its resize handle). Columns drawn as bars fill any width: left
+    /// as they are.
+    fn fit_column(&mut self, col_ix: usize, window: &mut Window, _: &mut Context<TableState<Self>>) -> Option<Pixels> {
+        let col = *self.cols.get(col_ix)?;
+        let bars = matches!(col, Col::Cpu | Col::Memory) && (self.capacity.is_some() || self.pods);
+        if col == Col::Check || bars {
+            return None;
+        }
+        let rem = window.rem_size();
+        let style = window.text_style();
+        let width = |text: &str, size: Rems, weight: FontWeight| {
+            let font = Font { weight, ..style.font() };
+            let run = TextRun { len: text.len(), font, ..style.to_run(text.len()) };
+            window.text_system().shape_line(text.to_string().into(), size.to_pixels(rem), &[run], None).width
+        };
+        let header = self.header(col);
+        let sorted = self.sort.is_some_and(|(c, _)| c == col);
+        // The sort arrow: a 12 px icon after a 4 px gap.
+        let mut widest = width(header, rems(0.875), style.font_weight) + if sorted { px(16.) } else { px(0.) };
+        let weight = if col == Col::Cell(0) && header == "Name" { FontWeight::MEDIUM } else { style.font_weight };
+        let ready_dots = self.pods && header == "Ready";
+        let rows = self.visible.iter().map(|&i| (self.row_ctx[i], &self.rows[i]));
+        // Shaping every row of a big list is slow: the widest text is among the longest.
+        let mut texts: Vec<(usize, String, usize)> = rows
+            .map(|(ctx, row)| {
+                let cell = self.cell(ctx, row, col);
+                let shown = if header == "Restarts" { restart_count(&cell) } else { &cell };
+                let text = shown_text(shown, row.deleting && col == Col::Cell(0));
+                let dots = if ready_dots { ready_total(&cell).map_or(0, |n| n.min(8)) } else { 0 };
+                (text.chars().count(), text, dots)
+            })
+            .collect();
+        texts.sort_unstable_by_key(|t| std::cmp::Reverse(t.0));
+        for (_, text, dots) in texts.into_iter().take(64) {
+            let cell = if ready_dots {
+                // Dots of 8 px, 4 px apart, then the count in small type.
+                px(12. * dots as f32 + 4.) + width(&text, rems(0.75), style.font_weight)
+            } else {
+                width(&text, rems(0.875), weight)
+            };
+            widest = widest.max(cell);
+        }
+        // The dot before a status or a context.
+        let lead = match (col, header) {
+            (Col::Context, _) => px(16.),
+            (_, "Status") => px(13.),
+            _ => px(0.),
+        };
+        Some(widest + lead)
+    }
+
     fn render_td(
         &mut self,
         row_ix: usize,
@@ -306,9 +358,7 @@ impl TableDelegate for ResourceTable {
             (_, "Restarts") => {
                 // Orange only when recent or frequent.
                 let last = cell.split_once('(').map(|(_, r)| r.trim_end_matches(')'));
-                if let Some((n, _)) = cell.split_once(' ') {
-                    shown = n;
-                }
+                shown = restart_count(&cell);
                 let count: i64 = shown.parse().unwrap_or(0);
                 let recent = last.is_some_and(|l| !l.contains('h') && !l.contains('d'));
                 color = Some(if count >= 5 || (count > 0 && recent) {
@@ -322,8 +372,7 @@ impl TableDelegate for ResourceTable {
             _ => {}
         }
         let dot = (header == "Status" && !shown.is_empty()).then_some(color).flatten();
-        // Being deleted: dimmed, and said so next to the name.
-        let text = if row.deleting && col == Col::Cell(0) { format!("{shown}  (deleting)") } else { shown.to_string() };
+        let text = shown_text(shown, row.deleting && col == Col::Cell(0));
         h_flex()
             .gap_1p5()
             .overflow_hidden()
@@ -517,6 +566,21 @@ fn usage_bar(
         .into_any_element()
 }
 
+/// "3 (2d4h ago)" -> "3": the restart count a Restarts cell shows.
+fn restart_count(cell: &str) -> &str {
+    cell.split_once(' ').map_or(cell, |(n, _)| n)
+}
+
+/// A cell's text as drawn: a row being deleted says so next to its name.
+fn shown_text(shown: &str, deleting_name: bool) -> String {
+    if deleting_name { format!("{shown}  (deleting)") } else { shown.to_string() }
+}
+
+/// The container count of a pod's Ready cell ("1/2" -> 2).
+fn ready_total(cell: &str) -> Option<usize> {
+    cell.split_once('/')?.1.parse().ok()
+}
+
 #[cfg(test)]
 mod link_tests {
     use super::{link_kind_of, linkable};
@@ -532,5 +596,15 @@ mod link_tests {
         assert_eq!(link_kind_of("ClusterIssuer"), Some("clusterissuers"));
         assert!(linkable("db-creds"));
         assert!(!linkable("<none>") && !linkable("a,b") && !linkable(" ") && !linkable("ns/name"));
+    }
+
+    #[test]
+    fn cells_as_drawn() {
+        use super::{ready_total, restart_count, shown_text};
+        assert_eq!(restart_count("3 (2d4h ago)"), "3");
+        assert_eq!(restart_count("0"), "0");
+        assert_eq!(ready_total("1/2"), Some(2));
+        assert_eq!(ready_total("Running"), None);
+        assert_eq!(shown_text("web", true), "web  (deleting)");
     }
 }

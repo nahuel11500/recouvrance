@@ -224,6 +224,8 @@ pub struct AppView {
     /// Every tab; the slot at `active_tab` is a placeholder for the live state.
     tabs: Vec<TabState>,
     active_tab: usize,
+    /// The tab strip's sideways scroll.
+    tab_scroll: ScrollHandle,
     agents: Entity<AgentsView>,
     approvals: Vec<Arc<Approval>>,
     forwards: Entity<Forwards>,
@@ -502,6 +504,7 @@ impl AppView {
             _kubeconfig_watch: None,
             tabs: vec![TabState::default()],
             active_tab: 0,
+            tab_scroll: ScrollHandle::new(),
             _subs: subs,
         };
         // Start on the context picker, unless a context is given.

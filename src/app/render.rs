@@ -33,8 +33,9 @@ impl Render for AppView {
         let body = if self.sidebar_hidden {
             div().size_full().child(content).into_any_element()
         } else {
+            // The sidebar keeps its width when the window is resized; the page takes the rest.
             h_resizable("body")
-                .child(resizable_panel().size(px(230.)).child(self.render_sidebar(cx)))
+                .child(resizable_panel().size(px(230.)).fixed().child(self.render_sidebar(cx)))
                 .child(resizable_panel().child(content))
                 .into_any_element()
         };
