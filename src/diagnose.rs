@@ -26,7 +26,7 @@ fn s<'a>(v: &'a Value, p: &str) -> &'a str {
 }
 
 fn statuses(pod: &Value) -> impl Iterator<Item = (&Value, bool)> {
-    let get = |p: &str| pod.pointer(p).and_then(Value::as_array).map(Vec::as_slice).unwrap_or(&[]);
+    let get = |p: &str| pod.pointer(p).and_then(Value::as_array).map_or(&[][..], Vec::as_slice);
     get("/status/initContainerStatuses")
         .iter()
         .map(|c| (c, true))
@@ -124,13 +124,13 @@ pub fn pod(pod: &Value, events: &[Ev], crash_logs: Option<&(String, String)>) ->
         let waiting = s(c, "/state/waiting/reason");
         let wmsg = s(c, "/state/waiting/message");
         let last = c.pointer("/lastState/terminated");
-        let last_reason = last.map(|t| s(t, "/reason")).unwrap_or("");
+        let last_reason = last.map_or("", |t| s(t, "/reason"));
         let last_code = last.and_then(|t| t["exitCode"].as_i64());
         // Stopped with a failure now (a Job pod that does not restart, a failed init container).
         // An evicted pod's containers were killed by the eviction: "Evicted" says it all.
         let ended = c.pointer("/state/terminated");
         let end_code = ended.and_then(|t| t["exitCode"].as_i64()).unwrap_or(0);
-        let end_reason = ended.map(|t| s(t, "/reason")).unwrap_or("");
+        let end_reason = ended.map_or("", |t| s(t, "/reason"));
         let failed = ended.is_some()
             && (end_code != 0 || !matches!(end_reason, "" | "Completed"))
             && phase != "Succeeded"

@@ -54,7 +54,7 @@ impl KubeconfigSources {
     /// Read the sources again when a file or the settings changed (cheap otherwise).
     fn refresh(&mut self) {
         let st = crate::settings::get();
-        let sig = (crate::k8s::kubeconfig_signature(), st.kubeconfigs.clone(), st.kubeconfig_folders.clone());
+        let sig = (crate::k8s::kubeconfig_signature(), st.kubeconfigs.clone(), st.kubeconfig_folders);
         if self.signature.as_ref() != Some(&sig) {
             self.sources = crate::k8s::sources();
             self.signature = Some(sig);
@@ -115,7 +115,7 @@ impl KubeconfigSources {
         });
         let name = cx.new(|cx| InputState::new(window, cx).placeholder("File name"));
         self._paste_sub = Some(cx.subscribe_in(&editor, window, |this, state, ev: &InputEvent, window, cx| {
-            if let InputEvent::Change = ev {
+            if matches!(ev, InputEvent::Change) {
                 let text = state.read(cx).value().to_string();
                 this.check_paste(&text, window, cx);
             }

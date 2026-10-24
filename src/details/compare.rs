@@ -1,6 +1,6 @@
 //! Compare tab: the same object in another cluster, or another object here.
 
-use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::{ActiveTheme as _, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -88,8 +88,8 @@ impl DetailPanel {
                             Button::new(("cmp-ctx", i))
                                 .xsmall()
                                 .label(c.clone())
-                                .when(self.compare.target_ctx.as_deref() == Some(c), |b| b.primary())
-                                .when(self.compare.target_ctx.as_deref() != Some(c), |b| b.outline())
+                                .when(self.compare.target_ctx.as_deref() == Some(c), ButtonVariants::primary)
+                                .when(self.compare.target_ctx.as_deref() != Some(c), Button::outline)
                                 .on_click(cx.listener(move |this, _, _, cx| this.compare_with_cluster(ctx.clone(), cx)))
                         })),
                 )
@@ -104,8 +104,8 @@ impl DetailPanel {
                         Button::new(("cmp-obj", i))
                             .xsmall()
                             .label(n.clone())
-                            .when(self.compare.target_name.as_deref() == Some(n), |b| b.primary())
-                            .when(self.compare.target_name.as_deref() != Some(n), |b| b.ghost())
+                            .when(self.compare.target_name.as_deref() == Some(n), ButtonVariants::primary)
+                            .when(self.compare.target_name.as_deref() != Some(n), ButtonVariants::ghost)
                             .on_click(cx.listener(move |this, _, _, cx| this.compare_with_object(name.clone(), cx)))
                     }))
                     .when_some(self.compare.candidates_error.clone(), |d, e| {
@@ -137,7 +137,7 @@ impl DetailPanel {
                             lines.push(
                                 h_flex()
                                     .px_2()
-                                    .when_some(bg, |d, bg| d.bg(bg))
+                                    .when_some(bg, Styled::bg)
                                     .text_color(fg)
                                     .child(div().w(px(16.)).child(sign))
                                     .child(div().whitespace_nowrap().child(change.value().trim_end().to_string()))

@@ -65,7 +65,7 @@ mod filter_tests {
             name: name.into(),
             namespace: Some(ns.into()),
             created: None,
-            cells: cells.iter().map(|c| c.to_string()).collect(),
+            cells: cells.iter().map(ToString::to_string).collect(),
             labels: labels.into(),
             deleting: false,
             deleted_at: None,

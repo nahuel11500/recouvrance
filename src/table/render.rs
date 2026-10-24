@@ -208,7 +208,7 @@ impl TableDelegate for ResourceTable {
                 .text_ellipsis()
                 .whitespace_nowrap()
                 .cursor_pointer()
-                .hover(|s| s.underline())
+                .hover(Styled::underline)
                 .when(row.deleting, |d| d.opacity(0.5))
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .on_click(cx.listener(move |t, _, _, cx| {
@@ -230,7 +230,7 @@ impl TableDelegate for ResourceTable {
                 .whitespace_nowrap()
                 .text_color(theme.blue)
                 .cursor_pointer()
-                .hover(|s| s.underline())
+                .hover(Styled::underline)
                 .when(row.deleting, |d| d.opacity(0.5))
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .on_click(cx.listener(move |t, _, _, cx| {
@@ -279,9 +279,8 @@ impl TableDelegate for ResourceTable {
                 .into_any_element();
         }
         if col == Col::Context {
-            let dot: Hsla = crate::settings::context_color(&cell)
-                .map(|c| rgb(c).into())
-                .unwrap_or(theme.muted_foreground.opacity(0.4));
+            let dot: Hsla =
+                crate::settings::context_color(&cell).map_or(theme.muted_foreground.opacity(0.4), |c| rgb(c).into());
             return h_flex()
                 .gap_2()
                 .overflow_hidden()
@@ -335,8 +334,8 @@ impl TableDelegate for ResourceTable {
                     .overflow_hidden()
                     .text_ellipsis()
                     .whitespace_nowrap()
-                    .when_some(color, |d, c| d.text_color(c))
-                    .when_some(weight, |d, w| d.font_weight(w))
+                    .when_some(color, Styled::text_color)
+                    .when_some(weight, Styled::font_weight)
                     .child(text),
             )
             .into_any_element()
@@ -373,7 +372,7 @@ impl TableDelegate for ResourceTable {
             .menu_with_icon("Copy name", Lucide::Copy, Box::new(RowCopyName))
             .menu_with_icon("Add to favorites", Lucide::Star, Box::new(RowFavorite));
         let acts = &self.row_actions;
-        menu.when(!acts.is_empty(), |m| m.separator())
+        menu.when(!acts.is_empty(), PopupMenu::separator)
             .when(acts.contains(&"run"), |m| m.menu_with_icon("Run now…", Lucide::Play, Box::new(RowRun)))
             .when(acts.contains(&"scale"), |m| m.menu_with_icon("Scale…", Lucide::ArrowUpDown, Box::new(RowScale)))
             .when(acts.contains(&"restart"), |m| m.menu_with_icon("Restart…", Lucide::RotateCw, Box::new(RowRestart)))
@@ -425,7 +424,7 @@ fn ready_color(text: &str, row: &Row, defs: &[ColumnDef], cx: &App) -> Option<Hs
     })
 }
 
-/// The kind a column's values name, from its header ("Secret", "SecretName", "Node",
+/// The kind a column's values name, from its header ("Secret", "`SecretName`", "Node",
 /// "ClusterIssuer"…); None for plain values. "Issuer" and "Store" are not links: they may
 /// name the namespaced kind or its cluster-wide twin (a ClusterIssuer, a ClusterSecretStore).
 pub(super) fn link_kind_of(header: &str) -> Option<&'static str> {

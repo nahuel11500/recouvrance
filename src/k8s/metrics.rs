@@ -59,8 +59,8 @@ pub fn watch_pod_metrics(
                 let name = item.pointer("/metadata/name").and_then(|v| v.as_str()).unwrap_or_default();
                 let (mut cpu, mut mem) = (0.0, 0.0);
                 for c in item["containers"].as_array().into_iter().flatten() {
-                    cpu += c.pointer("/usage/cpu").and_then(|v| v.as_str()).map(parse_cpu).unwrap_or(0.0);
-                    mem += c.pointer("/usage/memory").and_then(|v| v.as_str()).map(parse_bytes).unwrap_or(0.0);
+                    cpu += c.pointer("/usage/cpu").and_then(|v| v.as_str()).map_or(0.0, parse_cpu);
+                    mem += c.pointer("/usage/memory").and_then(|v| v.as_str()).map_or(0.0, parse_bytes);
                 }
                 usage.insert((ns.to_string(), name.to_string()), (cpu, mem));
             }
@@ -76,7 +76,7 @@ pub fn watch_pod_metrics(
 pub use crate::quantity::{parse_bytes, parse_cpu};
 
 pub fn format_cpu(millicores: f64) -> String {
-    if millicores >= 1000.0 { format!("{:.2}", millicores / 1000.0) } else { format!("{:.0}m", millicores) }
+    if millicores >= 1000.0 { format!("{:.2}", millicores / 1000.0) } else { format!("{millicores:.0}m") }
 }
 
 /// CPU for prose and labels: "250m", "1.5 cores", "188 cores".
@@ -92,7 +92,7 @@ pub fn format_cores(millicores: f64) -> String {
 
 pub fn format_bytes(bytes: f64) -> String {
     let mi = bytes / (1024.0 * 1024.0);
-    if mi >= 1024.0 { format!("{:.2}Gi", mi / 1024.0) } else { format!("{:.0}Mi", mi) }
+    if mi >= 1024.0 { format!("{:.2}Gi", mi / 1024.0) } else { format!("{mi:.0}Mi") }
 }
 
 /// Per-container usage of pods in a namespace: pod -> container -> (millicores, bytes).
@@ -115,8 +115,8 @@ pub async fn container_usage(
             let containers = out.entry(pod).or_default();
             for c in item["containers"].as_array().into_iter().flatten() {
                 let name = c["name"].as_str().unwrap_or_default().to_string();
-                let cpu = c.pointer("/usage/cpu").and_then(|v| v.as_str()).map(parse_cpu).unwrap_or(0.0);
-                let mem = c.pointer("/usage/memory").and_then(|v| v.as_str()).map(parse_bytes).unwrap_or(0.0);
+                let cpu = c.pointer("/usage/cpu").and_then(|v| v.as_str()).map_or(0.0, parse_cpu);
+                let mem = c.pointer("/usage/memory").and_then(|v| v.as_str()).map_or(0.0, parse_bytes);
                 containers.insert(name, (cpu, mem));
             }
         }
@@ -237,14 +237,14 @@ pub fn watch_node_metrics(client: Client, pause: Pause) -> (TaskGuard, mpsc::Unb
             for n in list {
                 let name = n.metadata.name.unwrap_or_default();
                 let alloc = n.status.allocatable;
-                let cpu = alloc.get("cpu").map(|q| parse_cpu(q)).unwrap_or(0.0);
-                let mem = alloc.get("memory").map(|q| parse_bytes(q)).unwrap_or(0.0);
+                let cpu = alloc.get("cpu").map_or(0.0, |q| parse_cpu(q));
+                let mem = alloc.get("memory").map_or(0.0, |q| parse_bytes(q));
                 out.insert(name, ((0.0, 0.0), (cpu, mem)));
             }
             for item in metrics["items"].as_array().into_iter().flatten() {
                 let name = item.pointer("/metadata/name").and_then(|v| v.as_str()).unwrap_or_default();
-                let cpu = item.pointer("/usage/cpu").and_then(|v| v.as_str()).map(parse_cpu).unwrap_or(0.0);
-                let mem = item.pointer("/usage/memory").and_then(|v| v.as_str()).map(parse_bytes).unwrap_or(0.0);
+                let cpu = item.pointer("/usage/cpu").and_then(|v| v.as_str()).map_or(0.0, parse_cpu);
+                let mem = item.pointer("/usage/memory").and_then(|v| v.as_str()).map_or(0.0, parse_bytes);
                 if let Some(e) = out.get_mut(name) {
                     e.0 = (cpu, mem);
                 }
@@ -269,8 +269,8 @@ pub async fn all_container_usage(client: Client) -> Result<Vec<((String, String)
             let pod = item.pointer("/metadata/name").and_then(|v| v.as_str()).unwrap_or_default().to_string();
             let mut c = HashMap::new();
             for cont in item["containers"].as_array().into_iter().flatten() {
-                let cpu = cont.pointer("/usage/cpu").and_then(|v| v.as_str()).map(parse_cpu).unwrap_or(0.0);
-                let mem = cont.pointer("/usage/memory").and_then(|v| v.as_str()).map(parse_bytes).unwrap_or(0.0);
+                let cpu = cont.pointer("/usage/cpu").and_then(|v| v.as_str()).map_or(0.0, parse_cpu);
+                let mem = cont.pointer("/usage/memory").and_then(|v| v.as_str()).map_or(0.0, parse_bytes);
                 c.insert(cont["name"].as_str().unwrap_or_default().to_string(), (cpu, mem));
             }
             out.push(((ns, pod), c));

@@ -322,7 +322,7 @@ async fn start_node_shell(client: Client, node: String, image: String, dry_run: 
             return Err(e.into());
         }
         if dry_run {
-            return Ok(format!("[dry run] node shell pod {name} accepted on {}", NODE_SHELL_NS));
+            return Ok(format!("[dry run] node shell pod {name} accepted on {NODE_SHELL_NS}"));
         }
         // Delete the pod on every way out but a running shell: it is privileged.
         let started = wait_node_shell(&api, &name).await;

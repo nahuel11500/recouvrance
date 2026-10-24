@@ -4,7 +4,7 @@
 
 use base64::Engine as _;
 use gpui_kit::assets::IconName as Lucide;
-use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::input::{Input, InputState, Textarea, TextareaState};
 use gpui_kit::component::{ActiveTheme as _, Disableable as _, Sizable as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
@@ -240,31 +240,28 @@ impl DataEditor {
                 data.insert(k, value.into());
             }
         }
-        match &self.original {
-            Some(o) => {
-                let mut o = o.clone();
-                o["data"] = data.into();
-                if let Some(m) = o.as_object_mut() {
-                    m.remove("stringData");
-                }
-                Ok(o)
+        if let Some(o) = &self.original {
+            let mut o = o.clone();
+            o["data"] = data.into();
+            if let Some(m) = o.as_object_mut() {
+                m.remove("stringData");
             }
-            None => {
-                let name = self.name.read(cx).value().trim().to_string();
-                if name.is_empty() {
-                    return Err("A name is required.".into());
-                }
-                let mut o = serde_json::json!({
-                    "apiVersion": "v1",
-                    "kind": self.kind.ar.kind,
-                    "metadata": { "name": name, "namespace": self.namespace.clone().unwrap_or_else(|| "default".into()) },
-                    "data": data,
-                });
-                if secret {
-                    o["type"] = SECRET_TYPES[self.secret_type].0.into();
-                }
-                Ok(o)
+            Ok(o)
+        } else {
+            let name = self.name.read(cx).value().trim().to_string();
+            if name.is_empty() {
+                return Err("A name is required.".into());
             }
+            let mut o = serde_json::json!({
+                "apiVersion": "v1",
+                "kind": self.kind.ar.kind,
+                "metadata": { "name": name, "namespace": self.namespace.clone().unwrap_or_else(|| "default".into()) },
+                "data": data,
+            });
+            if secret {
+                o["type"] = SECRET_TYPES[self.secret_type].0.into();
+            }
+            Ok(o)
         }
     }
 
@@ -392,8 +389,12 @@ impl Render for DataEditor {
         let secret = self.is_secret();
         let creating = self.original.is_none();
         let docker = self.registry_form();
-        let binary =
-            self.original.as_ref().and_then(|o| o.get("binaryData")).and_then(|d| d.as_object()).map_or(0, |d| d.len());
+        let binary = self
+            .original
+            .as_ref()
+            .and_then(|o| o.get("binaryData"))
+            .and_then(|d| d.as_object())
+            .map_or(0, serde_json::Map::len);
         v_flex()
             .gap_2()
             .p_3()
@@ -434,8 +435,8 @@ impl Render for DataEditor {
                                 .xsmall()
                                 .label(t.trim_start_matches("kubernetes.io/").to_string())
                                 .tooltip(*desc)
-                                .when(i == self.secret_type, |b| b.primary())
-                                .when(i != self.secret_type, |b| b.ghost())
+                                .when(i == self.secret_type, ButtonVariants::primary)
+                                .when(i != self.secret_type, ButtonVariants::ghost)
                                 .on_click(cx.listener(move |this, _, w, cx| this.set_type(i, w, cx)))
                         }),
                     ))
@@ -552,7 +553,7 @@ mod tests {
     fn binary_secret_values_are_kept() {
         // 0xff 0xfe 0x00: not UTF-8.
         let b64 = base64::engine::general_purpose::STANDARD.encode([0xffu8, 0xfe, 0x00]);
-        assert_eq!(decode(&json!(b64), true), Decoded::Kept { b64: b64.clone(), label: "binary, 3 bytes".into() });
+        assert_eq!(decode(&json!(b64), true), Decoded::Kept { b64, label: "binary, 3 bytes".into() });
         assert!(matches!(decode(&json!("@@not base64@@"), true), Decoded::Kept { .. }));
     }
 }

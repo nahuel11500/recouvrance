@@ -29,7 +29,7 @@ impl KubeMcp {
         let (client, kind) = self.kind(&call, &p.context, "pods").await?;
         let access = access_for(&kind, &p.context, "exec", Some(p.namespace.clone()), Some(p.pod.clone()));
         self.authorize(&mut call, &access).await?;
-        let timeout = call.policy().exec_timeout.max(1) as u64;
+        let timeout = u64::from(call.policy().exec_timeout.max(1));
         self.recheck(&mut call, &access)?;
         call.finish(k8s::exec_capture(client, p.namespace, p.pod, p.container, p.command, timeout, 64 * 1024).await)
     }
@@ -77,7 +77,7 @@ impl KubeMcp {
         let args = json!({"context": p.context, "kind": p.kind, "namespace": p.namespace, "name": p.name, "patch": p.patch, "dry_run": p.dry_run});
         let mut call = self.begin(&parts, "patch_resource", args)?;
         let (client, kind) = self.kind(&call, &p.context, &p.kind).await?;
-        require_ns(&call, &kind, &p.namespace)?;
+        require_ns(&call, &kind, p.namespace.as_deref())?;
         let access = access_for(&kind, &p.context, "patch", p.namespace.clone(), Some(p.name.clone()));
         self.authorize(&mut call, &access).await?;
         self.recheck(&mut call, &access)?;
@@ -128,7 +128,7 @@ impl KubeMcp {
             let ns =
                 doc.pointer("/metadata/namespace").and_then(|v| v.as_str()).map(String::from).or(p.namespace.clone());
             let ns = if kind.namespaced { ns } else { None };
-            require_ns(&call, &kind, &ns)?;
+            require_ns(&call, &kind, ns.as_deref())?;
             let Some(name) = doc.pointer("/metadata/name").and_then(|v| v.as_str()).map(String::from) else {
                 return Err(call.fail(format!("a {kind_name} has no metadata.name")));
             };
@@ -289,7 +289,7 @@ impl KubeMcp {
         let args = json!({"context": p.context, "kind": p.kind, "namespace": p.namespace, "name": p.name, "dry_run": p.dry_run});
         let mut call = self.begin(&parts, "delete_resource", args)?;
         let (client, kind) = self.kind(&call, &p.context, &p.kind).await?;
-        require_ns(&call, &kind, &p.namespace)?;
+        require_ns(&call, &kind, p.namespace.as_deref())?;
         let access = access_for(&kind, &p.context, "delete", p.namespace.clone(), Some(p.name.clone()));
         self.authorize(&mut call, &access).await?;
         self.recheck(&mut call, &access)?;

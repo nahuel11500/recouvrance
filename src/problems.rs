@@ -25,7 +25,7 @@ pub struct Problem {
 }
 
 fn cell<'a>(defs: &[ColumnDef], row: &'a Row, name: &str) -> &'a str {
-    defs.iter().position(|d| d.name == name).and_then(|i| row.cells.get(i)).map(String::as_str).unwrap_or("")
+    defs.iter().position(|d| d.name == name).and_then(|i| row.cells.get(i)).map_or("", String::as_str)
 }
 
 /// "2/3" -> (2, 3)
@@ -285,7 +285,7 @@ mod tests {
             name: "x".into(),
             namespace: None,
             created: None,
-            cells: cells.iter().map(|c| c.to_string()).collect(),
+            cells: cells.iter().map(ToString::to_string).collect(),
             labels: "".into(),
             deleting: false,
             deleted_at: None,

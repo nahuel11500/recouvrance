@@ -225,8 +225,7 @@ pub fn crd_section(group: &str) -> &'static str {
         .iter()
         .filter(|(g, _)| group == *g || group.ends_with(&format!(".{g}")))
         .max_by_key(|(g, _)| g.len())
-        .map(|(_, s)| *s)
-        .unwrap_or(CUSTOM_SECTION)
+        .map_or(CUSTOM_SECTION, |(_, s)| *s)
 }
 
 /// A custom resource (not a Kubernetes built-in API).
@@ -250,7 +249,7 @@ pub async fn discover(client: Client) -> Result<Vec<Kind>> {
         let resources = match Discovery::new(client.clone()).run_aggregated().await {
             // Every version, not only the preferred one: Gateway API prefers v1, but TCPRoute
             // is only in v1alpha2.
-            Ok(d) => d.groups().flat_map(|g| g.resources_by_stability()).collect(),
+            Ok(d) => d.groups().flat_map(kube::discovery::ApiGroup::resources_by_stability).collect(),
             Err(_) => discover_by_group(&client).await?,
         };
         let mut known: Vec<Kind> = Vec::new();
@@ -267,7 +266,7 @@ pub async fn discover(client: Client) -> Result<Vec<Kind>> {
                 // Remaining built-in APIs are cluster plumbing, not custom resources
                 // (some CRD groups end in .k8s.io too: those are mapped above).
                 None if is_builtin_group(&ar.group) && crd_section(&ar.group) == CUSTOM_SECTION => {
-                    known.push(Kind { label: ar.kind.clone(), ar, namespaced, section: "Administration" })
+                    known.push(Kind { label: ar.kind.clone(), ar, namespaced, section: "Administration" });
                 }
                 None => custom.push(Kind { label: ar.kind.clone(), section: crd_section(&ar.group), ar, namespaced }),
             }

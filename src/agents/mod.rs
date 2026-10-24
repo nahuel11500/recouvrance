@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::component::Icon;
-use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::input::{EditorState, Input, InputEvent, InputState};
 use gpui_kit::component::switch::Switch;
 use gpui_kit::component::{ActiveTheme as _, Sizable as _, h_flex, v_flex};
@@ -105,7 +105,7 @@ fn rule_with(
     note: &str,
     contexts: &[String],
 ) -> Rule {
-    let v = |x: &[&str]| x.iter().map(|s| s.to_string()).collect();
+    let v = |x: &[&str]| x.iter().map(ToString::to_string).collect();
     Rule {
         effect,
         verbs: v(verbs),
@@ -140,7 +140,7 @@ impl AgentsView {
         })];
         for i in [&tester.context, &tester.resource, &tester.namespace, &tester.name] {
             subs.push(cx.subscribe(i, |_, _, ev: &InputEvent, cx| {
-                if let InputEvent::Change = ev {
+                if matches!(ev, InputEvent::Change) {
                     cx.notify();
                 }
             }));
@@ -154,7 +154,7 @@ impl AgentsView {
         };
         let activity = Activity::new(window, cx);
         subs.push(cx.subscribe(&activity.search, |_, _, ev: &InputEvent, cx| {
-            if let InputEvent::Change = ev {
+            if matches!(ev, InputEvent::Change) {
                 cx.notify();
             }
         }));
@@ -217,7 +217,7 @@ impl AgentsView {
     fn select(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
         let Some(agent) = self.hub.agent(&id) else { return };
         self.all_activity = false;
-        self.selected = Some(id.clone());
+        self.selected = Some(id);
         self.rebuild_editor(&agent, window, cx);
         cx.notify();
     }
@@ -250,7 +250,7 @@ impl AgentsView {
                 (&inputs.names, Field::Names),
             ] {
                 subs.push(cx.subscribe_in(input, window, move |this, state, ev: &InputEvent, _, cx| {
-                    if let InputEvent::Change = ev {
+                    if matches!(ev, InputEvent::Change) {
                         let text = state.read(cx).value().to_string();
                         this.update_rule(
                             ix,
@@ -278,7 +278,7 @@ impl AgentsView {
                      window: &mut Window,
                      cx: &mut Context<Self>| {
             subs.push(cx.subscribe_in(input, window, move |this, state, ev: &InputEvent, _, cx| {
-                if let InputEvent::Change = ev
+                if matches!(ev, InputEvent::Change)
                     && let Ok(n) = state.read(cx).value().trim().parse()
                 {
                     this.update(|a| apply(&mut a.policy, n), cx);
@@ -438,8 +438,8 @@ impl AgentsView {
             .child(
                 Button::new("toggle-code")
                     .xsmall()
-                    .when(self.code.is_some(), |b| b.primary())
-                    .when(self.code.is_none(), |b| b.ghost())
+                    .when(self.code.is_some(), ButtonVariants::primary)
+                    .when(self.code.is_none(), ButtonVariants::ghost)
                     .icon(Lucide::FileCode)
                     .label("Rules as code")
                     .on_click(cx.listener(|this, _, window, cx| this.toggle_code(window, cx))),

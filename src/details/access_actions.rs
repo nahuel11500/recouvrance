@@ -135,38 +135,35 @@ impl DetailPanel {
                     let binding = binding.clone();
                     let _ = panel.update(cx, |this, cx| {
                         let client = this.client.clone();
-                        match binding {
-                            Some(b) => {
-                                let mut subjects = b["subjects"].as_array().cloned().unwrap_or_default();
-                                subjects.push(subject);
-                                // Fails with a conflict if the binding changed since it was read.
-                                let patch = subjects_patch(&b, subjects);
-                                let fut = k8s::merge_patch(client, this.obj.kind.clone(), this.obj.namespace.clone(), this.obj.name.clone(), patch, false);
-                                this.run_write("Add subject", async move { fut.await.map(|_| "Subject added".to_string()) }, window, cx);
+                        if let Some(b) = binding {
+                            let mut subjects = b["subjects"].as_array().cloned().unwrap_or_default();
+                            subjects.push(subject);
+                            // Fails with a conflict if the binding changed since it was read.
+                            let patch = subjects_patch(&b, subjects);
+                            let fut = k8s::merge_patch(client, this.obj.kind.clone(), this.obj.namespace.clone(), this.obj.name.clone(), patch, false);
+                            this.run_write("Add subject", async move { fut.await.map(|_| "Subject added".to_string()) }, window, cx);
+                        } else {
+                            let role_kind = this.obj.kind.ar.kind.clone();
+                            let role = this.obj.name.clone();
+                            // A Role binds in its namespace; a ClusterRole where asked, or cluster-wide.
+                            let scope = this.obj.namespace.clone().or_else(|| (!scope_ns.is_empty()).then(|| scope_ns.clone()));
+                            let bk = binding_kind(scope.is_some());
+                            let bkind = bk.ar.kind.clone();
+                            let bname = binding_name(&role_kind, &role, &subject);
+                            let mut obj = serde_json::json!({
+                                "apiVersion": "rbac.authorization.k8s.io/v1", "kind": bkind,
+                                "metadata": {"name": bname},
+                                "roleRef": {"apiGroup": "rbac.authorization.k8s.io", "kind": role_kind, "name": role},
+                                "subjects": [subject],
+                            });
+                            if let Some(s) = &scope {
+                                obj["metadata"]["namespace"] = s.clone().into();
                             }
-                            None => {
-                                let role_kind = this.obj.kind.ar.kind.clone();
-                                let role = this.obj.name.clone();
-                                // A Role binds in its namespace; a ClusterRole where asked, or cluster-wide.
-                                let scope = this.obj.namespace.clone().or_else(|| (!scope_ns.is_empty()).then(|| scope_ns.clone()));
-                                let bk = binding_kind(scope.is_some());
-                                let bkind = bk.ar.kind.clone();
-                                let bname = binding_name(&role_kind, &role, &subject);
-                                let mut obj = serde_json::json!({
-                                    "apiVersion": "rbac.authorization.k8s.io/v1", "kind": bkind,
-                                    "metadata": {"name": bname},
-                                    "roleRef": {"apiGroup": "rbac.authorization.k8s.io", "kind": role_kind, "name": role},
-                                    "subjects": [subject],
-                                });
-                                if let Some(s) = &scope {
-                                    obj["metadata"]["namespace"] = s.clone().into();
-                                }
-                                let fut = async move {
-                                    k8s::create(client.clone(), bk.clone(), scope.clone(), obj.clone(), true).await?;
-                                    k8s::create(client, bk, scope, obj, false).await
-                                };
-                                this.run_write("Bind", fut, window, cx);
-                            }
+                            let fut = async move {
+                                k8s::create(client.clone(), bk.clone(), scope.clone(), obj.clone(), true).await?;
+                                k8s::create(client, bk, scope, obj, false).await
+                            };
+                            this.run_write("Bind", fut, window, cx);
                         }
                     });
                     true
@@ -252,7 +249,7 @@ impl DetailPanel {
             let cmd = kubectl(
                 &context,
                 Some(&ns),
-                &format!("create token {} --duration={}h", shell_word(&name), parsed.as_ref().map_or("…".to_string(), |h| h.to_string())),
+                &format!("create token {} --duration={}h", shell_word(&name), parsed.as_ref().map_or("…".to_string(), ToString::to_string)),
             );
             alert
                 .title("Kubeconfig for this ServiceAccount")

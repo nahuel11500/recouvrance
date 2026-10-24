@@ -34,7 +34,7 @@ pub(super) fn certificates(data: &serde_json::Map<String, Value>, base64: bool, 
     Some(v_flex().child(heading(&format!("Certificates ({})", certs.len()))).children(certs.into_iter().map(
         |(key, c)| {
             let date = |t: Option<jiff::Timestamp>| {
-                t.map(|t| t.strftime("%Y-%m-%d %H:%M UTC").to_string()).unwrap_or_else(|| "-".into())
+                t.map_or_else(|| "-".into(), |t| t.strftime("%Y-%m-%d %H:%M UTC").to_string())
             };
             let (state, color) = match c.not_after.map(|t| days_left(t, now)) {
                 _ if c.not_yet_valid(now) => (format!("not valid until {}", date(c.not_before)), theme.danger),
@@ -176,7 +176,7 @@ pub(super) fn config_entry(obj: &Value, i: usize, cx: &App) -> AnyElement {
 pub(super) fn schema_type(v: &Value) -> String {
     match v["type"].as_str() {
         Some("array") => format!("[]{}", schema_type(&v["items"])),
-        Some("object") if v.get("additionalProperties").is_some_and(|a| a.is_object()) => {
+        Some("object") if v.get("additionalProperties").is_some_and(Value::is_object) => {
             format!("map[string]{}", schema_type(&v["additionalProperties"]))
         }
         Some(t) => t.to_string(),
@@ -234,7 +234,7 @@ pub(super) fn crd(ctx: &Ctx, cx: &App) -> Div {
             row()
                 .pt_4()
                 .child(field("Kind", names["kind"].as_str().unwrap_or_default().to_string(), cx))
-                .child(field("Group", group.clone(), cx))
+                .child(field("Group", group, cx))
                 .child(field("Scope", s(obj, "/spec/scope").unwrap_or_default().to_string(), cx))
                 .child(field(
                     "kubectl",

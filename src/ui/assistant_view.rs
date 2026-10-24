@@ -145,7 +145,7 @@ impl AssistantView {
                     });
                 }
             };
-            let (result, _) = futures::join!(ask, steps);
+            let (result, ()) = futures::join!(ask, steps);
             let _ = this.update(cx, |this, cx| {
                 this.busy = false;
                 match result {
@@ -226,7 +226,7 @@ impl Render for AssistantView {
                         .into_any_element(),
                 ),
                 Entry::Error(m) => {
-                    rows.push(div().text_sm().text_color(theme.danger).child(m.clone()).into_any_element())
+                    rows.push(div().text_sm().text_color(theme.danger).child(m.clone()).into_any_element());
                 }
                 Entry::Assistant(steps) => {
                     let mut col = v_flex().gap_2().max_w(px(900.));
@@ -314,7 +314,7 @@ impl Render for AssistantView {
                         });
                     }
                     if self.busy && ei + 1 == self.entries.len() {
-                        let secs = self.started.map(|t| t.elapsed().as_secs()).unwrap_or(0);
+                        let secs = self.started.map_or(0, |t| t.elapsed().as_secs());
                         col = col.child(div().text_sm().text_color(muted).child(format!("Thinking… {secs}s")));
                     }
                     rows.push(col.into_any_element());

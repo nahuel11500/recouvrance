@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use gpui_kit::*;
 use serde::{Deserialize, Serialize};
 
-#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
 pub struct FavObject {
     pub context: String,
     /// kubectl-style kind, e.g. `deployments` or `certificates.cert-manager.io`.
@@ -15,7 +15,7 @@ pub struct FavObject {
 }
 
 /// A named table view: kind, namespaces and filter.
-#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
 pub struct SavedView {
     pub name: String,
     pub kind: String,
@@ -37,8 +37,7 @@ pub struct Favorites {
 
 fn path() -> PathBuf {
     let base = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".config"));
+        .map_or_else(|| PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".config"), PathBuf::from);
     base.join("recouvrance").join("favorites.json")
 }
 

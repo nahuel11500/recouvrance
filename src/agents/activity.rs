@@ -5,7 +5,7 @@ use std::collections::{BTreeSet, HashSet};
 use std::rc::Rc;
 
 use gpui_kit::assets::IconName as Lucide;
-use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
@@ -155,7 +155,7 @@ pub(super) fn call_text(e: &AuditEntry, with_context: bool) -> String {
             .args
             .get("command")
             .and_then(|c| c.as_array())
-            .map(|a| a.iter().map(|v| v.as_str().map(String::from).unwrap_or_else(|| v.to_string())).collect())
+            .map(|a| a.iter().map(|v| v.as_str().map_or_else(|| v.to_string(), String::from)).collect())
             .unwrap_or_default();
         let pod = arg(e, "pod").unwrap_or_default();
         let at = match arg(e, "container") {
@@ -315,7 +315,7 @@ fn render_item(item: &Item, ix: usize, view: &WeakEntity<AgentsView>, cx: &App) 
             Decision::Failed => theme.danger,
         };
         let side = if calls.len() > 1 {
-            let oldest = calls.last().map(|c| c.time).unwrap_or(e.time);
+            let oldest = calls.last().map_or(e.time, |c| c.time);
             format!("{} – {}", fmt_time(oldest), fmt_time(e.time))
         } else {
             e.detail.clone()
@@ -326,7 +326,7 @@ fn render_item(item: &Item, ix: usize, view: &WeakEntity<AgentsView>, cx: &App) 
             .gap_3()
             .py_0p5()
             .px_2()
-            .when(nested, |d| d.pl_8())
+            .when(nested, Styled::pl_8)
             .border_b_1()
             .border_color(theme.border)
             .cursor_pointer()
@@ -449,7 +449,7 @@ fn render_item(item: &Item, ix: usize, view: &WeakEntity<AgentsView>, cx: &App) 
                             .outline()
                             .label(if shown < total { "Show older" } else { "Load older calls from disk" })
                             .on_click(move |_, _, cx| {
-                                let _ = view.update(cx, |v, cx| v.show_older(cx));
+                                let _ = view.update(cx, AgentsView::show_older);
                             }),
                     )
                 })
@@ -499,7 +499,8 @@ impl AgentsView {
         let filter = |e: &AuditEntry| keep(e, shown, context.as_deref(), agent.as_deref(), &needle);
         let stats = self.hub.audit_stats(|_| false);
         let mut h = std::collections::hash_map::DefaultHasher::new();
-        (stats.newest.map(|t| t.as_nanosecond()), stats.oldest.map(|t| t.as_nanosecond())).hash(&mut h);
+        (stats.newest.map(jiff::Timestamp::as_nanosecond), stats.oldest.map(jiff::Timestamp::as_nanosecond))
+            .hash(&mut h);
         (shown, &context, &agent, &needle, a.limit, a.loading, a.disk.as_ref().map(|d| d.len())).hash(&mut h);
         let mut open: Vec<&String> = a.open.iter().collect();
         open.sort();
@@ -550,12 +551,15 @@ impl AgentsView {
             .audit_error()
             .map(|e| div().text_sm().text_color(theme.danger).child(format!("The audit log is not being saved: {e}")));
         let chip = |id: SharedString, label: String, on: bool, set: Box<dyn Fn(&mut Activity)>| {
-            Button::new(id).xsmall().when(on, |b| b.primary()).when(!on, |b| b.ghost()).label(label).on_click(
-                cx.listener(move |this, _, _, cx| {
+            Button::new(id)
+                .xsmall()
+                .when(on, ButtonVariants::primary)
+                .when(!on, ButtonVariants::ghost)
+                .label(label)
+                .on_click(cx.listener(move |this, _, _, cx| {
                     set(&mut this.activity);
                     cx.notify();
-                }),
-            )
+                }))
         };
         let shown = a.shown;
         let shown_chips = [(Shown::All, "All calls"), (Shown::Writes, "Writes"), (Shown::Problems, "Denied or failed")]

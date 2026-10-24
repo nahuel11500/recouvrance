@@ -174,7 +174,7 @@ impl AgentsView {
                             .icon(Lucide::Trash)
                             .label("Delete")
                             .on_click(cx.listener({
-                                let id = agent_id.clone();
+                                let id = agent_id;
                                 move |this, _, window, cx| {
                                     let result = this.hub.delete_agent(&id);
                                     this.report(result);
@@ -204,7 +204,7 @@ impl AgentsView {
                         .icon(Lucide::Plus)
                         .label("Add rule")
                         .on_click(cx.listener(|this, _, window, cx| {
-                            this.edit_rules(|rules| rules.push(Rule { note: "New rule".into(), ..Rule::default() }), window, cx)
+                            this.edit_rules(|rules| rules.push(Rule { note: "New rule".into(), ..Rule::default() }), window, cx);
                         })),
                 ),
             )

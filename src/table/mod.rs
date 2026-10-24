@@ -242,7 +242,7 @@ impl ResourceTable {
         widths: HashMap<String, f32>,
     ) {
         let (app_focus, pods, row_actions) = (self.app_focus.take(), self.pods, std::mem::take(&mut self.row_actions));
-        *self = Self { show_namespace, contexts, visible_cols, widths, app_focus, pods, row_actions, ..Self::new() };
+        *self = Self { show_namespace, contexts, visible_cols, app_focus, pods, row_actions, widths, ..Self::new() };
     }
 
     /// Column names the user chose for this kind, or None for the defaults.
@@ -372,8 +372,7 @@ impl ResourceTable {
             .cols
             .iter()
             .position(|c| matches!(c, Col::Cell(i) if self.defs[*i].name == "Status"))
-            .map(|i| i + 1)
-            .unwrap_or(self.cols.len());
+            .map_or(self.cols.len(), |i| i + 1);
         if mem {
             self.cols.insert(at, Col::Memory);
         }
@@ -610,7 +609,7 @@ mod uid_tests {
         assert!(t.is_marked(0, "team-a/web-1"));
         t.set_rows(vec![row("u1", "web-1"), row("u2", "web-2"), row("u3", "web-3")]);
         let mut marked: Vec<&str> = t.marked[&0].iter().map(String::as_str).collect();
-        marked.sort();
+        marked.sort_unstable();
         assert_eq!(marked, ["u1", "u2"]);
         assert_eq!(t.selected, Some((0, "u2".into())));
         assert_eq!(t.menu_row, Some((0, "u3".into())));
@@ -651,7 +650,7 @@ mod table_tests {
             name: name.into(),
             namespace: Some("team-a".into()),
             created: None,
-            cells: cells.iter().map(|c| c.to_string()).collect(),
+            cells: cells.iter().map(ToString::to_string).collect(),
             labels: "".into(),
             deleting: false,
             deleted_at: None,

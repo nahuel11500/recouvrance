@@ -83,7 +83,8 @@ pub async fn target(context: &str, client: Client) -> Result<Option<String>> {
     if let Some(t) = crate::settings::get().prometheus.get(context).filter(|t| !t.is_empty()) {
         return Ok(Some(t.clone()));
     }
-    if let Some(found) = cached(FOUND.lock().unwrap().get(context), Instant::now()) {
+    let hit = cached(FOUND.lock().unwrap().get(context), Instant::now());
+    if let Some(found) = hit {
         return Ok(found);
     }
     let found = run(find(client)).await?;

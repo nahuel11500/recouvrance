@@ -41,7 +41,7 @@ pub struct Schema {
     root: Value,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Field {
     pub name: String,
     pub type_name: String,

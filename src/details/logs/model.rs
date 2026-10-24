@@ -113,7 +113,7 @@ pub(crate) fn readable_json(text: &str) -> Option<(String, usize)> {
     let msg_key = ["msg", "message", "event", "log"].into_iter().find(|k| obj.contains_key(*k));
     let mut line = msg_key
         .and_then(|k| obj.get(k))
-        .map(|m| m.as_str().map(escape_controls).unwrap_or_else(|| m.to_string()))
+        .map(|m| m.as_str().map_or_else(|| m.to_string(), escape_controls))
         .unwrap_or_default();
     let fields_at = line.len();
     // Sorted, so the same fields line up from one line to the next.
@@ -394,7 +394,9 @@ impl LogBuffer {
             let drop = self.lines.len() - self.max;
             self.lines.drain(..drop);
             self.offset += drop;
-            kept.iter_mut().for_each(|ix| *ix = ix.and_then(|i| i.checked_sub(drop)));
+            for ix in &mut kept {
+                *ix = ix.and_then(|i| i.checked_sub(drop));
+            }
             dropped_rows = match &mut self.matches {
                 Some(m) => {
                     let gone = m.partition_point(|&i| i < self.offset);
@@ -554,7 +556,7 @@ mod tests {
 
     #[test]
     fn reads_the_chosen_container_only_from_pods_that_have_it() {
-        let pod = |cs: &[&str]| cs.iter().map(|c| c.to_string()).collect::<Vec<_>>();
+        let pod = |cs: &[&str]| cs.iter().map(ToString::to_string).collect::<Vec<_>>();
         assert_eq!(container_for(Some("api"), &pod(&["api", "proxy"])).as_deref(), Some("api"));
         assert_eq!(container_for(Some("api"), &pod(&["worker", "proxy"])).as_deref(), Some("worker"));
         assert_eq!(container_for(Some("api"), &[]).as_deref(), Some("api"));
@@ -566,7 +568,7 @@ mod tests {
     #[test]
     fn learning_a_pods_containers_keeps_its_stream_when_it_reads_the_same() {
         let read = |pod: &str, c: Option<&str>| vec![(pod.to_string(), c.map(String::from))];
-        let known = |cs: &[&str]| vec![cs.iter().map(|c| c.to_string()).collect::<Vec<_>>()];
+        let known = |cs: &[&str]| vec![cs.iter().map(ToString::to_string).collect::<Vec<_>>()];
         // Already reading the container that is now known.
         assert!(same_reads(&read("web-1", Some("app")), &read("web-1", Some("app")), &known(&["app", "proxy"])));
         // None named: the pod's only container, or an error for a pod with several.
@@ -702,7 +704,7 @@ mod tests {
         for round in 0..30 {
             let src = round % 3;
             // Each pod lags a little: its batch lands among the others' lines.
-            let lines: Vec<String> = (0..(round % 7 + 1))
+            let lines: Vec<String> = (0..=(round % 7))
                 .map(|i| {
                     t += 1;
                     let word = ["error", "info", "warn err", "err skip", "debug err"][(t + i) % 5];

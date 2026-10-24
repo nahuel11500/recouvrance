@@ -330,7 +330,7 @@ impl Render for TerminalView {
         let font_size = px(12.);
         let base_font = font(mono.clone());
         let font_id = window.text_system().resolve_font(&base_font);
-        let cell_w = window.text_system().advance(font_id, font_size, 'm').map(|s| s.width).unwrap_or(px(7.2));
+        let cell_w = window.text_system().advance(font_id, font_size, 'm').map_or(px(7.2), |s| s.width);
         let cell = size(cell_w, (font_size * 1.35).round());
 
         if self.session.is_none() && self.once {
@@ -434,7 +434,7 @@ impl Render for TerminalView {
                 text.push_str(s);
                 match runs.last_mut() {
                     Some(last) if last.color == cfg && last.background_color == cbg && last.font == f => {
-                        last.len += len
+                        last.len += len;
                     }
                     _ => runs.push(TextRun {
                         len,
@@ -497,7 +497,7 @@ impl Render for TerminalView {
                         d.child(Button::new("reconnect").xsmall().ghost().label("Reconnect").on_click(cx.listener(
                             |this, _, window, cx| {
                                 let attach = this.attach;
-                                this.request(attach, window, cx)
+                                this.request(attach, window, cx);
                             },
                         )))
                     },
@@ -523,7 +523,7 @@ impl Render for TerminalView {
                     .font_family(mono)
                     .text_size(font_size)
                     .line_height(cell.height)
-                    .child(canvas(move |b, _, _| bounds.set(Some(b)), |_, _, _, _| {}).absolute().inset_1())
+                    .child(canvas(move |b, _, _| bounds.set(Some(b)), |_, (), _, _| {}).absolute().inset_1())
                     .children(lines),
             )
             .into_any_element()
@@ -634,7 +634,7 @@ fn nz(v: u16) -> std::num::NonZeroU16 {
 
 fn vt_color(color: vt100::Color, default: Hsla, dark: bool) -> Hsla {
     let rgb = |r: u8, g: u8, b: u8| -> Hsla {
-        Rgba { r: r as f32 / 255., g: g as f32 / 255., b: b as f32 / 255., a: 1. }.into()
+        Rgba { r: f32::from(r) / 255., g: f32::from(g) / 255., b: f32::from(b) / 255., a: 1. }.into()
     };
     match color {
         vt100::Color::Default => default,

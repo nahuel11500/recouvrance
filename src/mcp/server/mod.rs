@@ -163,7 +163,7 @@ fn describe(a: &Access) -> String {
 /// Arguments that change what a call does, for the approval banner: what the user
 /// approves is what runs. Values come from the (redacted) logged arguments.
 const KEY_ARGS: [&str; 6] = ["command", "patch", "replicas", "action", "container", "dry_run"];
-/// Most log bytes one get_logs call returns.
+/// Most log bytes one `get_logs` call returns.
 const MAX_LOG_BYTES: i64 = 1024 * 1024;
 /// The banner scrolls; this only bounds pathological inputs.
 const MAX_ARG_CHARS: usize = 20_000;
@@ -415,7 +415,7 @@ impl KubeMcp {
                     summary.push('\n');
                     summary.push_str(detail);
                 }
-                let dry_run = call.args.get("dry_run").and_then(|v| v.as_bool()).unwrap_or(false);
+                let dry_run = call.args.get("dry_run").and_then(serde_json::Value::as_bool).unwrap_or(false);
                 let answer = self.hub.request_approval(&call.agent, call.tool, summary, access.clone(), dry_run).await;
                 // Access may have been switched off, or the rules changed, while the request waited.
                 self.reload_rules(call);
@@ -537,7 +537,7 @@ fn list_verdict(policy: &Policy, kind: &Kind, context: &str) -> Mode {
 }
 
 /// Namespaced kinds need a namespace for single-object verbs (a refused call is logged).
-fn require_ns(call: &Call, kind: &Kind, ns: &Option<String>) -> Result<(), String> {
+fn require_ns(call: &Call, kind: &Kind, ns: Option<&str>) -> Result<(), String> {
     if kind.namespaced && ns.is_none() {
         Err(call.fail(format!("{} is namespaced: pass `namespace`", kind.ar.kind)))
     } else {
@@ -1151,7 +1151,7 @@ mod tests {
         let objects = manifest_objects(&planned);
         assert_eq!(objects.len(), 2);
         assert!(objects[0].starts_with("ConfigMap app/cfg sha256:") && objects[1].starts_with("Secret app/db sha256:"));
-        let mut changed = planned.clone();
+        let mut changed = planned;
         changed[0].3["data"]["mode"] = json!("info");
         assert_ne!(manifest_objects(&changed)[0], objects[0]);
         // A Secret's values are masked before hashing: they leave no trace.
@@ -1192,7 +1192,7 @@ mod tests {
         let allowed = Policy { rules: vec![rule(Mode::Allow, "drain", "*")], ..Policy::default() };
         assert!(!denies_eviction(&allowed, &pod("app")));
         // A Deny on deleting pods added while it runs keeps that namespace's pods only.
-        let mut denied = allowed.clone();
+        let mut denied = allowed;
         denied.rules.push(rule(Mode::Deny, "delete", "app"));
         assert!(denies_eviction(&denied, &pod("app")));
         assert!(!denies_eviction(&denied, &pod("other")));

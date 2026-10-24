@@ -204,12 +204,12 @@ pub fn run(ctx: String) {
         while std::time::Instant::now() < deadline {
             match futures::FutureExt::now_or_never(rx.next()) {
                 Some(Some(k8s::TableMsg::Columns(c))) => {
-                    println!("columns: {:?}", c.iter().map(|c| (&c.name, c.priority)).collect::<Vec<_>>())
+                    println!("columns: {:?}", c.iter().map(|c| (&c.name, c.priority)).collect::<Vec<_>>());
                 }
                 Some(Some(k8s::TableMsg::Rows(r))) => {
                     let first = r.first().map(|r| (&r.namespace, &r.name, &r.cells));
                     // CI greps for lines starting with "rows=": the time goes at the end.
-                    println!("rows={} first={first:?} at={}s", r.len(), start.elapsed().as_secs())
+                    println!("rows={} first={first:?} at={}s", r.len(), start.elapsed().as_secs());
                 }
                 Some(Some(k8s::TableMsg::Error(e))) => println!("ERROR {e} at={}s", start.elapsed().as_secs()),
                 Some(Some(k8s::TableMsg::Forbidden(e))) => println!("FORBIDDEN {e}"),

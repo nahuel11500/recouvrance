@@ -84,8 +84,8 @@ pub fn exec_shell(
             }
         };
         tokio::select! {
-            _ = reader => {}
-            _ = writer => {}
+            () = reader => {}
+            () = writer => {}
         }
         let reason = match status {
             Some(s) => match s.await {
@@ -547,7 +547,7 @@ pub fn local_shell(
         };
         tokio::select! {
             _ = reading => {}
-            _ = writing => {}
+            () = writing => {}
         }
         drop(child);
         drop(keys);
@@ -641,8 +641,8 @@ pub fn attach_container(
             }
         };
         tokio::select! {
-            _ = readers => {}
-            _ = writer => {}
+            () = readers => {}
+            () = writer => {}
         }
         let _ = out_tx.unbounded_send(ExecOutput::Exit("Detached: the process ended or closed its output".into()));
     });

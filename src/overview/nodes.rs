@@ -107,8 +107,8 @@ pub(super) fn node_allocation(ctx: &Ctx, cx: &App) -> Div {
     };
     let pct = |v: f64, of: f64| if of > 0.0 { format!(" ({:.0}%)", v / of * 100.0) } else { String::new() };
     let cards = names.into_iter().filter(|n| alloc.contains_key(n)).map(|name| {
-        let a = alloc.get(&name).and_then(Value::as_str).map(|q| parse(&name, q)).unwrap_or(0.0);
-        let c = capacity.get(&name).and_then(Value::as_str).map(|q| parse(&name, q)).unwrap_or(a);
+        let a = alloc.get(&name).and_then(Value::as_str).map_or(0.0, |q| parse(&name, q));
+        let c = capacity.get(&name).and_then(Value::as_str).map_or(a, |q| parse(&name, q));
         let (req, lim) = if name == "pods" { (running, 0.0) } else { ctx.related.allocated(&name) };
         let share = if a > 0.0 { req / a } else { 0.0 };
         let color = match share {

@@ -158,7 +158,7 @@ impl Dashboard {
                         }
                         took
                     };
-                    let (_, took) = futures::join!(load, pieces);
+                    let ((), took) = futures::join!(load, pieces);
                     // Big clusters take long to list; don't hammer their API servers.
                     let wait = (took * 2).max(crate::settings::secs(crate::settings::get().overview_refresh));
                     cx.background_executor().timer(wait).await;
@@ -243,8 +243,8 @@ impl Dashboard {
 }
 
 /// Objects of a kind, or why they could not be listed ("forbidden", "failed: …").
-async fn list(client: &Client, ar: kube::discovery::ApiResource, ns: &Option<String>) -> Result<Vec<Value>, String> {
-    k8s::list_values(client.clone(), ar, ns.clone(), None).await.map_err(|e| k8s::lists::load_error(&e))
+async fn list(client: &Client, ar: kube::discovery::ApiResource, ns: Option<&str>) -> Result<Vec<Value>, String> {
+    k8s::list_values(client.clone(), ar, ns.map(String::from), None).await.map_err(|e| k8s::lists::load_error(&e))
 }
 
 fn n(v: &Value, p: &str) -> i64 {
@@ -380,21 +380,21 @@ struct PodStatusLite {
 }
 
 /// Restarts in the last hour and containers near their limits, from pod specs.
-async fn pod_details(client: &Client, ns: &Option<String>, context: &str) -> Result<(Vec<Restart>, Vec<Hot>), String> {
+async fn pod_details(client: &Client, ns: Option<&str>, context: &str) -> Result<(Vec<Restart>, Vec<Hot>), String> {
     let usage = async {
         match ns {
             _ if !crate::settings::metrics_on(context) => PodUsage::new(),
-            Some(ns) => k8s::container_usage(client.clone(), ns.clone(), None)
+            Some(ns) => k8s::container_usage(client.clone(), ns.to_string(), None)
                 .await
                 .unwrap_or_default()
                 .into_iter()
-                .map(|(pod, u)| ((ns.clone(), pod), u))
+                .map(|(pod, u)| ((ns.to_string(), pod), u))
                 .collect(),
             None => all_usage(client).await,
         }
     };
     let pods = async {
-        k8s::lists::list_lean::<PodDetail>(client.clone(), k8s::ar_of::<core::Pod>(), ns.clone())
+        k8s::lists::list_lean::<PodDetail>(client.clone(), k8s::ar_of::<core::Pod>(), ns.map(String::from))
             .await
             .map_err(|e| k8s::lists::load_error(&e))
     };
@@ -488,7 +488,7 @@ async fn load(client: Client, ns: Option<String>, context: String, tx: futures::
         };
         send(Piece::Kind(slot("pods"), Ok(pod_counts(&t))));
         if t.rows.len() <= FULL_POD_LIMIT {
-            let details = pod_details(&client, &ns, &context).await;
+            let details = pod_details(&client, ns.as_deref(), &context).await;
             let (restarts, hot) = details.clone().unwrap_or_default();
             send(Piece::Restarts(restarts));
             send(Piece::Hot(hot, false));
@@ -575,11 +575,11 @@ async fn load(client: Client, ns: Option<String>, context: String, tx: futures::
         ));
     };
     let hpas = async {
-        let hpas = list(&client, k8s::ar_of::<autoscaling::HorizontalPodAutoscaler>(), &ns).await;
+        let hpas = list(&client, k8s::ar_of::<autoscaling::HorizontalPodAutoscaler>(), ns.as_deref()).await;
         send(Piece::Kind(slot("horizontalpodautoscalers"), hpas.map(|hpas| hpa_counts(&hpas))));
     };
     let pdbs = async {
-        let pdbs = list(&client, k8s::ar_of::<policy::PodDisruptionBudget>(), &ns).await;
+        let pdbs = list(&client, k8s::ar_of::<policy::PodDisruptionBudget>(), ns.as_deref()).await;
         send(Piece::Kind(slot("poddisruptionbudgets"), pdbs.map(|pdbs| pdb_counts(&pdbs))));
     };
     let pvcs = async {
@@ -734,8 +734,8 @@ fn pod_usage(list: &Value) -> PodUsage {
         let key = (st(item, "/metadata/namespace").to_string(), st(item, "/metadata/name").to_string());
         let entry = out.entry(key).or_default();
         for c in item["containers"].as_array().into_iter().flatten() {
-            let cpu = c.pointer("/usage/cpu").and_then(Value::as_str).map(k8s::parse_cpu).unwrap_or(0.0);
-            let mem = c.pointer("/usage/memory").and_then(Value::as_str).map(k8s::parse_bytes).unwrap_or(0.0);
+            let cpu = c.pointer("/usage/cpu").and_then(Value::as_str).map_or(0.0, k8s::parse_cpu);
+            let mem = c.pointer("/usage/memory").and_then(Value::as_str).map_or(0.0, k8s::parse_bytes);
             entry.insert(st(c, "/name").to_string(), (cpu, mem));
         }
     }
@@ -767,7 +767,7 @@ impl Dashboard {
             .id(SharedString::from(format!("dash-{kind}-{ns}-{name}")))
             .text_color(cx.theme().blue)
             .cursor_pointer()
-            .hover(|s| s.underline())
+            .hover(Styled::underline)
             .overflow_hidden()
             .text_ellipsis()
             .whitespace_nowrap()
@@ -777,7 +777,7 @@ impl Dashboard {
                     name: name.clone(),
                     namespace: Some(ns.clone()),
                     context: Some(context.clone()),
-                })
+                });
             }))
             .child(text)
     }

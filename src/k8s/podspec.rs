@@ -42,7 +42,7 @@ pub struct Part {
     pub limit: Option<f64>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Role {
     Container,
     /// An init container with `restartPolicy: Always`: runs alongside the containers.
@@ -52,7 +52,7 @@ pub enum Role {
 }
 
 /// What a sum is for.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Count {
     /// What the scheduler reserves on a node: init containers count, as they run first.
     Scheduled,
@@ -104,7 +104,7 @@ pub fn of_value(pod: &serde_json::Value, resource: &str, count: Count) -> Effect
     let get = |v: &serde_json::Value, which: &str| {
         v.pointer(&format!("/resources/{which}/{key}")).and_then(|q| q.as_str()).map(parse)
     };
-    let list = |path: &str| pod.pointer(path).and_then(|c| c.as_array()).map(Vec::as_slice).unwrap_or(&[]);
+    let list = |path: &str| pod.pointer(path).and_then(|c| c.as_array()).map_or(&[][..], Vec::as_slice);
     let inits = list("/spec/initContainers").iter().map(|c| {
         let role = if c["restartPolicy"].as_str() == Some("Always") { Role::Sidecar } else { Role::Init };
         Part { role, request: get(c, "requests"), limit: get(c, "limits") }

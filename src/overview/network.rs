@@ -427,10 +427,8 @@ pub(super) fn netpol(ctx: &Ctx, cx: &App) -> Div {
             .when(!applies, |d| d.child(div().text_sm().text_color(muted).child("Not restricted by this policy.")))
             .when(applies && rules.is_empty(), |d| d.child(div().text_sm().child(empty.to_string())))
             .children(rules.iter().map(|r| {
-                let peers: Vec<String> = r[peers_key]
-                    .as_array()
-                    .map(|a| a.iter().map(peer).collect())
-                    .unwrap_or_else(|| vec!["anything".into()]);
+                let peers: Vec<String> =
+                    r[peers_key].as_array().map_or_else(|| vec!["anything".into()], |a| a.iter().map(peer).collect());
                 v_flex()
                     .py_1()
                     .text_sm()

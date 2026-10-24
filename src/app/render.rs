@@ -52,10 +52,8 @@ impl Render for AppView {
         let theme = cx.theme().clone();
         let ctx_trigger = {
             let names: Vec<String> = self.clusters.iter().map(|c| c.0.clone()).collect();
-            let dots: Vec<Hsla> = names
-                .iter()
-                .map(|n| crate::settings::context_color(n).map(|c| rgb(c).into()).unwrap_or(theme.blue))
-                .collect();
+            let dots: Vec<Hsla> =
+                names.iter().map(|n| crate::settings::context_color(n).map_or(theme.blue, |c| rgb(c).into())).collect();
             let protected = names.iter().any(|n| crate::settings::is_protected(n));
             let label = match names.len() {
                 0 => "Choose a cluster".to_string(),
@@ -249,7 +247,7 @@ impl Render for AppView {
                     .label(concat!("v", env!("CARGO_PKG_VERSION")))
                     .tooltip("About Recouvrance")
                     .on_click(cx.listener(|this, _, _, cx| {
-                        this.settings_view.update(cx, |s, cx| s.show_about(cx));
+                        this.settings_view.update(cx, crate::ui::settings_view::SettingsView::show_about);
                         this.navigate(Route::Settings, cx);
                     })),
             );
@@ -260,7 +258,7 @@ impl Render for AppView {
             .py_2()
             .border_b_1()
             .border_color(cx.theme().border)
-            .child(div().text_lg().font_weight(FontWeight::SEMIBOLD).child(kind_label.clone()))
+            .child(div().text_lg().font_weight(FontWeight::SEMIBOLD).child(kind_label))
             .child(
                 h_flex()
                     .gap_1p5()
@@ -367,11 +365,11 @@ impl Render for AppView {
             .on_action(cx.listener(|this, _: &CloseTab, window, cx| this.close_tab(this.active_tab, window, cx)))
             .on_action(cx.listener(|this, _: &NextTab, window, cx| {
                 let n = this.tabs.len();
-                this.switch_tab((this.active_tab + 1) % n, window, cx)
+                this.switch_tab((this.active_tab + 1) % n, window, cx);
             }))
             .on_action(cx.listener(|this, _: &PrevTab, window, cx| {
                 let n = this.tabs.len();
-                this.switch_tab((this.active_tab + n - 1) % n, window, cx)
+                this.switch_tab((this.active_tab + n - 1) % n, window, cx);
             }))
             .on_action(cx.listener(|this, _: &RowOpenTab, window, cx| {
                 // Open the right-clicked row in a new tab; this tab stays on the list.

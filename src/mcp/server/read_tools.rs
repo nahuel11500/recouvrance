@@ -186,7 +186,7 @@ impl KubeMcp {
         let args = json!({"context": p.context, "kind": p.kind, "name": p.name, "namespace": p.namespace});
         let mut call = self.begin(&parts, "get_resource", args)?;
         let (client, kind) = self.kind(&call, &p.context, &p.kind).await?;
-        require_ns(&call, &kind, &p.namespace)?;
+        require_ns(&call, &kind, p.namespace.as_deref())?;
         let access = access_for(&kind, &p.context, "get", p.namespace.clone(), Some(p.name.clone()));
         self.authorize(&mut call, &access).await?;
         let reveal = kind.is("", "Secret") && {
@@ -274,7 +274,7 @@ impl KubeMcp {
         let args = json!({"context": p.context, "kind": p.kind, "name": p.name, "namespace": p.namespace});
         let mut call = self.begin(&parts, "describe_resource", args)?;
         let (client, kind) = self.kind(&call, &p.context, &p.kind).await?;
-        require_ns(&call, &kind, &p.namespace)?;
+        require_ns(&call, &kind, p.namespace.as_deref())?;
         let access = access_for(&kind, &p.context, "get", p.namespace.clone(), Some(p.name.clone()));
         self.authorize(&mut call, &access).await?;
         let ns = if kind.namespaced { p.namespace.clone() } else { None };
@@ -527,7 +527,7 @@ impl KubeMcp {
         self.authorize(&mut call, &access).await?;
         let lp = kube::api::LogParams {
             container: p.container,
-            tail_lines: Some(p.tail_lines.unwrap_or(200).min(call.policy().max_log_lines) as i64),
+            tail_lines: Some(i64::from(p.tail_lines.unwrap_or(200).min(call.policy().max_log_lines))),
             since_seconds: p.since_seconds,
             previous: p.previous.unwrap_or(false),
             // A few very long lines must not pull megabytes through the agent.
@@ -594,7 +594,7 @@ impl KubeMcp {
             // The leaf certificate is first in the chain.
             let Some(c) = crate::certs::parse_pem(&pem).into_iter().next() else { continue };
             // Rounded down: negative as soon as the date has passed.
-            let days = c.not_after.map(|t| (t.as_second() - now.as_second()).div_euclid(86400)).unwrap_or(i64::MAX);
+            let days = c.not_after.map_or(i64::MAX, |t| (t.as_second() - now.as_second()).div_euclid(86400));
             // Not valid yet: clients reject it now, so it is listed first whatever the window.
             let early = c.not_yet_valid(now);
             if !early && p.within_days.is_some_and(|w| days > w) {
@@ -619,7 +619,7 @@ impl KubeMcp {
                         format!("NOT VALID UNTIL {from}")
                     } else if days < 0 {
                         // The days that went by: 3 hours ago is 0, not the -1 days left.
-                        let ago = c.not_after.map(|t| crate::certs::days_ago(t, now)).unwrap_or(0);
+                        let ago = c.not_after.map_or(0, |t| crate::certs::days_ago(t, now));
                         format!("EXPIRED {ago}d ago")
                     } else {
                         days.to_string()
@@ -785,7 +785,7 @@ impl KubeMcp {
             let p95 = v[((v.len() as f64 * 0.95) as usize).min(v.len() - 1)];
             [v[0], avg, p95, v[v.len() - 1], last].into_iter().map(fmt).collect()
         };
-        let opt = |v: Option<f64>, fmt: fn(f64) -> String| v.map(fmt).unwrap_or_else(|| "-".into());
+        let opt = |v: Option<f64>, fmt: fn(f64) -> String| v.map_or_else(|| "-".into(), fmt);
         let mut cpu_row = vec!["cpu".to_string()];
         cpu_row.extend(stats(&cpu, 1000.0, k8s::format_cpu));
         cpu_row.push(opt(cpu_spec.0, k8s::format_cpu));

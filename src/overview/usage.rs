@@ -1,7 +1,7 @@
 //! Usage history charts and request/limit bars.
 
 use gpui_kit::assets::IconName as Lucide;
-use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::chart::AreaChart;
 use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
@@ -73,8 +73,8 @@ pub(super) fn history(ctx: &Ctx, cx: &App) -> Option<Div> {
             Button::new(SharedString::from(format!("range-{m}")))
                 .xsmall()
                 .label(l)
-                .when(m == minutes, |b| b.primary())
-                .when(m != minutes, |b| b.ghost())
+                .when(m == minutes, ButtonVariants::primary)
+                .when(m != minutes, ButtonVariants::ghost)
                 .on_click(move |_, _, cx| {
                     let _ = panel.update(cx, |p, cx| p.set_history_minutes(m, cx));
                 })
@@ -255,7 +255,7 @@ pub(super) fn usage_card(
     cx: &App,
 ) -> Div {
     let muted = cx.theme().muted_foreground;
-    let show = |v: Option<f64>| v.map(fmt).unwrap_or_else(|| "-".into());
+    let show = |v: Option<f64>| v.map_or_else(|| "-".into(), fmt);
     v_flex()
         .w(px(250.))
         .gap_1()

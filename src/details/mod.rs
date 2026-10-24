@@ -293,7 +293,7 @@ impl DetailPanel {
                     },
                     window,
                     cx,
-                )
+                );
             }
             "restart" => self.confirm_restart(window, cx),
             "scale" => self.confirm_scale(window, cx),
@@ -442,7 +442,7 @@ impl DetailPanel {
         if self.tab == DetailTab::Logs
             && let Some(l) = &self.logs
         {
-            l.update(cx, |l, cx| l.resume(cx));
+            l.update(cx, LogsView::resume);
         }
     }
 
@@ -559,7 +559,7 @@ impl DetailPanel {
                             if this.tab == DetailTab::Logs
                                 && let Some(l) = &this.logs
                             {
-                                l.update(cx, |l, cx| l.resume(cx));
+                                l.update(cx, LogsView::resume);
                             }
                         });
                     }
@@ -923,7 +923,7 @@ mod tests {
     #[test]
     fn a_pod_page_logs_know_the_pods_containers() {
         let pod = json!({"spec": {"containers": [{"name": "app"}, {"name": "proxy"}]}});
-        let names = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let names = |v: &[&str]| v.iter().map(ToString::to_string).collect::<Vec<_>>();
         assert_eq!(own_pod_logs("web-1", &pod), vec![("web-1".to_string(), names(&["app", "proxy"]))]);
     }
 

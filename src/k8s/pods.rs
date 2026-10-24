@@ -196,7 +196,7 @@ fn reconnect_delay(failures: u32) -> std::time::Duration {
 /// Errors worth retrying: the network, the server, or a container not started yet.
 fn retryable(e: &anyhow::Error) -> bool {
     match api_status(e) {
-        None | Some(429) | Some(500..) => true,
+        None | Some(429 | 500..) => true,
         Some(400) => {
             let msg = short_error(e);
             ["waiting to start", "ContainerCreating", "PodInitializing", "not available", "try again"]
@@ -357,7 +357,7 @@ impl Shown {
     fn note(&mut self, lines: &[String]) {
         for line in lines {
             let Some(t) = line_time(line) else { continue };
-            let second = self.newest.map(|n| n.as_second());
+            let second = self.newest.map(jiff::Timestamp::as_second);
             if self.newest.is_none_or(|n| t > n) {
                 self.newest = Some(t);
                 if second != Some(t.as_second()) {
@@ -603,7 +603,7 @@ mod tests {
         // Resuming asks from the whole second of the last line, without a tail.
         let resume: jiff::Timestamp = "2024-01-01T00:00:05.75Z".parse().unwrap();
         let lp = super::stream_params(None, false, Some(60), Some(resume));
-        assert_eq!(lp.since_time.map(|t| t.as_second()), Some(resume.as_second()));
+        assert_eq!(lp.since_time.map(jiff::Timestamp::as_second), Some(resume.as_second()));
         assert_eq!((lp.tail_lines, lp.since_seconds, lp.follow), (None, None, true));
         assert_eq!(super::reconnect_delay(1).as_secs(), 1);
         assert_eq!(super::reconnect_delay(3).as_secs(), 4);

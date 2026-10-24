@@ -448,13 +448,13 @@ impl Render for DetailPanel {
             DetailTab::Yaml => self.render_yaml(cx),
             DetailTab::Events => self.render_events(cx),
             DetailTab::Logs => {
-                self.logs.clone().map(|l| l.into_any_element()).unwrap_or_else(|| div().into_any_element())
+                self.logs.clone().map_or_else(|| div().into_any_element(), IntoElement::into_any_element)
             }
             DetailTab::Shell => {
-                self.terminal.clone().map(|t| t.into_any_element()).unwrap_or_else(|| div().into_any_element())
+                self.terminal.clone().map_or_else(|| div().into_any_element(), IntoElement::into_any_element)
             }
             DetailTab::Debug => {
-                self.debug_terminal.clone().map(|t| t.into_any_element()).unwrap_or_else(|| div().into_any_element())
+                self.debug_terminal.clone().map_or_else(|| div().into_any_element(), IntoElement::into_any_element)
             }
         };
         let created = self

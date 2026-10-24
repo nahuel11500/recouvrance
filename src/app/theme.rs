@@ -140,7 +140,7 @@ pub(super) struct Zoom(f32);
 impl Global for Zoom {}
 
 pub fn zoom(cx: &App) -> f32 {
-    cx.try_global::<Zoom>().map(|z| z.0).unwrap_or(1.0)
+    cx.try_global::<Zoom>().map_or(1.0, |z| z.0)
 }
 
 pub(super) fn zoom_path() -> std::path::PathBuf {
@@ -169,9 +169,10 @@ pub fn set_zoom(z: f32, window: &mut Window, cx: &mut App) {
 }
 
 pub(super) fn ui_prefs_path() -> std::path::PathBuf {
-    let base = std::env::var_os("XDG_CONFIG_HOME")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::path::PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".config"));
+    let base = std::env::var_os("XDG_CONFIG_HOME").map_or_else(
+        || std::path::PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".config"),
+        std::path::PathBuf::from,
+    );
     base.join("recouvrance").join("theme")
 }
 

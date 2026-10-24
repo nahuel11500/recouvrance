@@ -269,7 +269,7 @@ pub(super) async fn fetch_related(
             related.noted("events", events).into_iter().map(|e| (e.kind, e.reason, e.message, e.count)).collect();
         // A container that failed: its previous run if it restarted, else its current one.
         let failed = |c: &&serde_json::Value| {
-            let code = |p: &str| c.pointer(p).and_then(|v| v.as_i64()).unwrap_or(0);
+            let code = |p: &str| c.pointer(p).and_then(serde_json::Value::as_i64).unwrap_or(0);
             code("/lastState/terminated/exitCode") != 0 || code("/state/terminated/exitCode") != 0
         };
         let crashing = obj

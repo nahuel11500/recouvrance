@@ -168,12 +168,12 @@ fn read_kubeconfig() -> Result<(Kubeconfig, bool)> {
     let mut settled = std::collections::HashSet::new();
     let mut last_err = None;
     for path in kubeconfig_files() {
-        let stem = path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "file".into());
+        let stem = path.file_stem().map_or_else(|| "file".into(), |s| s.to_string_lossy().to_string());
         let key = tilde(&path.canonicalize().unwrap_or_else(|_| path.clone()));
         let before = stamp(&path);
         let kc = Kubeconfig::read_from(&path);
         let after = stamp(&path);
-        let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        let mut seen = SEEN.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if settle(&mut seen, &key, before, after, std::time::Instant::now()) {
             settled.insert(key.clone());
         }
@@ -301,13 +301,12 @@ fn merge_owned(
                                     .is_some_and(|i| i.parse::<u32>().is_ok())
                         })
                 });
-                let new = match before {
-                    Some((name, _)) => name.clone(),
-                    None => {
-                        let new = free_name(&c.name, &stem, &mut taken);
-                        kept.insert(new.clone(), key.clone());
-                        new
-                    }
+                let new = if let Some((name, _)) = before {
+                    name.clone()
+                } else {
+                    let new = free_name(&c.name, &stem, &mut taken);
+                    kept.insert(new.clone(), key.clone());
+                    new
                 };
                 given.insert(new.clone());
                 let old = std::mem::replace(&mut c.name, new);
@@ -339,7 +338,7 @@ pub fn reload_contexts() -> Result<Contexts> {
 fn cached_contexts(max_age: std::time::Duration) -> Result<Contexts> {
     type Cached = (std::time::Instant, Vec<(std::path::PathBuf, Option<std::time::SystemTime>, u64)>, Contexts);
     static CACHE: std::sync::Mutex<Option<Cached>> = std::sync::Mutex::new(None);
-    let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    let mut cache = CACHE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some((checked, _, contexts)) = cache.as_ref()
         && checked.elapsed() < max_age
     {
@@ -471,7 +470,7 @@ fn exec_command(kc: &Kubeconfig, context: &str) -> Option<String> {
 fn exec_lock(cmd: String) -> Arc<tokio::sync::Mutex<()>> {
     static LOCKS: LazyLock<std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> =
         LazyLock::new(Default::default);
-    LOCKS.lock().unwrap_or_else(|e| e.into_inner()).entry(cmd).or_default().clone()
+    LOCKS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).entry(cmd).or_default().clone()
 }
 
 /// A private kubeconfig file, removed when this is dropped: keep it alive as long
@@ -515,7 +514,7 @@ pub fn private_kubeconfig(context: &str, namespace: Option<&str>, purpose: &str)
             }
         }
     }
-    let dir = std::env::var_os("XDG_RUNTIME_DIR").map(std::path::PathBuf::from).unwrap_or_else(std::env::temp_dir);
+    let dir = std::env::var_os("XDG_RUNTIME_DIR").map_or_else(std::env::temp_dir, std::path::PathBuf::from);
     let path = dir.join(format!("recouvrance-{}-{purpose}-{}.yaml", std::process::id(), uuid::Uuid::new_v4().simple()));
     // create_new: never follow or reuse a file someone else put there.
     let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&path)?;
@@ -546,7 +545,7 @@ pub fn create_private_file(dir: &std::path::Path, stem: &str, ext: &str, bytes: 
                 f.write_all(bytes)?;
                 return Ok(path);
             }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(e) => return Err(e.into()),
         }
     }
@@ -715,7 +714,7 @@ mod kubeconfig_tests {
 
     /// A file read now, with its context names.
     fn read(file: &str, names: &[&str]) -> (String, Option<Vec<String>>) {
-        (file.to_string(), Some(names.iter().map(|s| s.to_string()).collect()))
+        (file.to_string(), Some(names.iter().map(ToString::to_string).collect()))
     }
 
     #[test]
@@ -1080,7 +1079,7 @@ mod merge_properties {
                     ..NamedContext::default()
                 })
                 .collect(),
-            current_context: names.first().map(|n| n.to_string()),
+            current_context: names.first().map(ToString::to_string),
             ..Kubeconfig::default()
         }
     }
@@ -1105,7 +1104,7 @@ mod merge_properties {
                 let listed: Vec<(String, Option<Vec<String>>)> = order
                     .iter()
                     .filter_map(|&i| match &states[i] {
-                        File::Read(n) => Some((format!("/kube/f{i}"), Some(n.iter().map(|s| s.to_string()).collect()))),
+                        File::Read(n) => Some((format!("/kube/f{i}"), Some(n.iter().map(ToString::to_string).collect()))),
                         File::Corrupt => Some((format!("/kube/f{i}"), None)),
                         File::Deleted => None,
                     })
@@ -1126,7 +1125,7 @@ mod merge_properties {
                 };
                 // Names are unique, and the current context is one of them.
                 let mut names: Vec<&str> = merged.contexts.iter().map(|c| c.name.as_str()).collect();
-                names.sort();
+                names.sort_unstable();
                 let before = names.len();
                 names.dedup();
                 prop_assert_eq!(names.len(), before, "duplicate context names: {:?}", merged.contexts);

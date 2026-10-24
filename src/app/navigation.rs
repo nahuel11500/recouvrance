@@ -249,7 +249,7 @@ impl AppView {
             self.agents.update(cx, |a, _| a.refresh_contexts());
         }
         if let Route::Resources(Some(kind)) = self.route().clone()
-            && self.kind.as_ref().map(|k| k.key()) != Some(kind.key())
+            && self.kind.as_ref().map(Kind::key) != Some(kind.key())
         {
             self.kind = Some(kind);
             self.restart_watch(cx);
@@ -265,7 +265,7 @@ fn new_kind(route: &Route, kept: Option<Kind>, current: Option<&Kind>) -> Option
         Route::Resources(Some(k)) => Some(k.clone()),
         _ => kept,
     }?;
-    (Some(kind.key()) != current.map(|k| k.key())).then_some(kind)
+    (Some(kind.key()) != current.map(Kind::key)).then_some(kind)
 }
 
 #[cfg(test)]
@@ -275,7 +275,7 @@ mod tests {
     fn kind(k: &str) -> Kind {
         Kind {
             ar: kube::discovery::ApiResource {
-                group: "".into(),
+                group: String::new(),
                 version: "v1".into(),
                 api_version: "v1".into(),
                 kind: k.into(),

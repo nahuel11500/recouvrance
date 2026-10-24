@@ -24,7 +24,7 @@ impl Forward {
     pub fn url(&self) -> Option<String> {
         let port = self.local?;
         let host = match self.saved.address.as_deref() {
-            None | Some("127.0.0.1") | Some("0.0.0.0") | Some("::") | Some("") => "localhost".to_string(),
+            None | Some("127.0.0.1" | "0.0.0.0" | "::" | "") => "localhost".to_string(),
             Some(a) => bracketed(a),
         };
         Some(format!("{}://{host}:{port}", if self.saved.https { "https" } else { "http" }))

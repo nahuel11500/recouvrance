@@ -28,7 +28,7 @@ impl Snapshot {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Grant {
     pub subject_kind: String,
     pub subject: String,
@@ -98,7 +98,7 @@ pub fn who_can(snap: &Snapshot, verb: &str, group: &str, resource: &str, namespa
             .as_array()
             .into_iter()
             .flatten()
-            .filter(|r| rule_allows(r, verb, group, resource) && !(unnamed && !strs(r, "resourceNames").is_empty()))
+            .filter(|r| rule_allows(r, verb, group, resource) && (!unnamed || strs(r, "resourceNames").is_empty()))
             .collect();
         if matching.is_empty() {
             continue;
@@ -216,7 +216,7 @@ pub fn split_resource(text: &str) -> (String, String) {
         None => (t, None),
     };
     let (base, group) = res.split_once('.').unwrap_or((res, ""));
-    (group.to_string(), sub.map(|s| format!("{base}/{s}")).unwrap_or_else(|| base.to_string()))
+    (group.to_string(), sub.map_or_else(|| base.to_string(), |s| format!("{base}/{s}")))
 }
 
 #[cfg(test)]
@@ -269,7 +269,7 @@ mod tests {
         assert_eq!(service_account_grants(&s, "demo", "deployer").len(), 1);
         assert_eq!(bindings_of(&s, "Role", "pod-reader", Some("demo")).len(), 1);
         assert_eq!(split_resource("deployments.apps"), ("apps".into(), "deployments".into()));
-        assert_eq!(split_resource("pods/log"), ("".into(), "pods/log".into()));
+        assert_eq!(split_resource("pods/log"), (String::new(), "pods/log".into()));
     }
 
     /// A rule with resourceNames never matches a create or a deletecollection, which name
@@ -317,6 +317,6 @@ mod tests {
         assert_eq!(split_resource("apps/deployments"), ("apps".into(), "deployments".into()));
         assert_eq!(split_resource("cert-manager.io/certificates"), ("cert-manager.io".into(), "certificates".into()));
         assert_eq!(split_resource("networking.k8s.io/ingresses"), ("networking.k8s.io".into(), "ingresses".into()));
-        assert_eq!(split_resource(" pods/exec "), ("".into(), "pods/exec".into()));
+        assert_eq!(split_resource(" pods/exec "), (String::new(), "pods/exec".into()));
     }
 }

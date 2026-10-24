@@ -49,10 +49,10 @@ pub(super) fn rules_table(rules: &[Value], cx: &App) -> Div {
                 .border_b_1()
                 .border_color(theme.border)
                 .child(div().w(px(180.)).child(list(r, "apiGroups")))
-                .child(div().w(px(320.)).child(if non_resource != "-" {
-                    format!("URLs: {non_resource}")
-                } else {
+                .child(div().w(px(320.)).child(if non_resource == "-" {
                     list(r, "resources")
+                } else {
+                    format!("URLs: {non_resource}")
                 }))
                 .child(div().w(px(200.)).text_color(theme.muted_foreground).child(
                     match list(r, "resourceNames").as_str() {
@@ -94,7 +94,7 @@ pub(super) fn subjects_table(ctx: &Ctx, subjects: &[Value], removable: bool, cx:
                 .child(div().w(px(380.)).child(if kind == "ServiceAccount" {
                     ctx.link_in(name.clone(), "serviceaccounts", &name, ns.clone(), cx).into_any_element()
                 } else {
-                    div().child(name.clone()).into_any_element()
+                    div().child(name).into_any_element()
                 }))
                 .child(div().w(px(200.)).text_color(theme.muted_foreground).child(ns.unwrap_or_else(|| "-".into())))
                 .when(removable, |d| {
@@ -140,7 +140,7 @@ pub(super) fn binding_row(ctx: &Ctx, b: &Value, cx: &App) -> Div {
             format!("{}{name}", ns.as_ref().map(|n| format!("{n}/")).unwrap_or_default()),
             kind,
             &name,
-            ns.clone(),
+            ns,
             cx,
         )))
         .child(div().flex_1().text_xs().child(subjects.join(", ")))
@@ -244,7 +244,7 @@ pub(super) fn service_account_page(ctx: &Ctx, cx: &App) -> Div {
                 .child(h_flex().gap_2().text_sm().child(div().font_weight(FontWeight::MEDIUM).child(binding)).child(
                     div().text_color(theme.muted_foreground).child(format!(
                         "→ {role} · {}",
-                        scope.map(|s| format!("in {s}")).unwrap_or_else(|| "cluster-wide".into())
+                        scope.map_or_else(|| "cluster-wide".into(), |s| format!("in {s}"))
                     )),
                 ))
                 .child(rules_table(&rules, cx)),

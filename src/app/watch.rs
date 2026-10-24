@@ -401,7 +401,7 @@ fn status_text<'a>(
     failed: impl Iterator<Item = &'a SharedString>,
     status: Option<&'a SharedString>,
 ) -> Option<SharedString> {
-    let parts: Vec<&str> = failed.chain(status).map(|s| s.as_ref()).collect();
+    let parts: Vec<&str> = failed.chain(status).map(AsRef::as_ref).collect();
     (!parts.is_empty()).then(|| parts.join("; ").into())
 }
 
@@ -491,7 +491,7 @@ mod tests {
     fn the_old_list_notice_stays_while_another_cluster_lists() {
         let listing = [0, 1].into_iter().collect();
         assert!(others_listing(&listing, 0));
-        assert!(!others_listing(&[1].into_iter().collect(), 1));
+        assert!(!others_listing(&std::iter::once(1).collect(), 1));
         assert!(!others_listing(&Default::default(), 0));
         // A failing cluster's error does not hide the notice: its rows may be the old ones.
         let (error, notice) = (SharedString::from("b: timeout (retrying)"), SharedString::from("Updating…"));

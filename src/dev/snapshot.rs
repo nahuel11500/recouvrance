@@ -78,7 +78,7 @@ pub fn run(path: &str, wait: Duration) -> Result<()> {
             }
             if rows > 0 {
                 cx.update_window(window.into(), |_, window, cx| {
-                    app_view.update(cx, |a, cx| a.open_detail(0, window, cx))
+                    app_view.update(cx, |a, cx| a.open_detail(0, window, cx));
                 })?;
                 pump(&mut cx, Duration::from_secs(4));
                 if let Some(d) = cx.update(|cx| app_view.read(cx).qa_detail()) {
@@ -101,7 +101,7 @@ pub fn run(path: &str, wait: Duration) -> Result<()> {
                         problems += 1;
                     }
                 }
-                cx.update(|cx| app_view.update(cx, |a, cx| a.qa_back(cx)));
+                cx.update(|cx| app_view.update(cx, crate::app::AppView::qa_back));
             }
             eprintln!("{line}");
         }
@@ -275,7 +275,7 @@ pub fn run(path: &str, wait: Duration) -> Result<()> {
         pump(&mut cx, Duration::from_secs(1));
     }
     if std::env::var("RECOUVRANCE_RESTORE").is_ok() {
-        cx.update(|cx| app_view.update(cx, |a, cx| a.demo_restore_forwards(cx)));
+        cx.update(|cx| app_view.update(cx, crate::app::AppView::demo_restore_forwards));
         pump(&mut cx, Duration::from_secs(4));
     }
     if let Ok(w) = std::env::var("RECOUVRANCE_POPOVER") {

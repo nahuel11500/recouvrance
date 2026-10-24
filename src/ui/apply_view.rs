@@ -199,13 +199,12 @@ impl ApplyView {
     }
 
     pub fn toggle_schema_form(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.schema_form = match self.schema_form.take() {
-            Some(_) => None,
-            None => {
-                self.docs = None;
-                let (ctx, client, editor) = (self.context.clone(), self.client.clone(), self.editor.clone());
-                Some(cx.new(|cx| crate::ui::schema_form::SchemaForm::new(ctx, client, editor, window, cx)))
-            }
+        self.schema_form = if self.schema_form.take().is_some() {
+            None
+        } else {
+            self.docs = None;
+            let (ctx, client, editor) = (self.context.clone(), self.client.clone(), self.editor.clone());
+            Some(cx.new(|cx| crate::ui::schema_form::SchemaForm::new(ctx, client, editor, window, cx)))
         };
         cx.notify();
     }
@@ -217,12 +216,11 @@ impl ApplyView {
 
     pub fn toggle_docs(&mut self, cx: &mut Context<Self>) {
         self.schema_form = None;
-        self.docs = match self.docs.take() {
-            Some(_) => None,
-            None => {
-                let (ctx, client, editor) = (self.context.clone(), self.client.clone(), self.editor.clone());
-                Some(cx.new(|cx| crate::ui::field_docs::FieldDocs::new(ctx, client, editor, cx)))
-            }
+        self.docs = if self.docs.take().is_some() {
+            None
+        } else {
+            let (ctx, client, editor) = (self.context.clone(), self.client.clone(), self.editor.clone());
+            Some(cx.new(|cx| crate::ui::field_docs::FieldDocs::new(ctx, client, editor, cx)))
         };
         cx.notify();
     }
@@ -326,7 +324,7 @@ impl ApplyView {
                     Ok(text) => this.set_text(format!("# {url}\n{text}"), window, cx),
                     Err(e) => {
                         this.results =
-                            vec![Problem { ok: false, text: format!("Could not load {url}: {e:#}"), line: None }]
+                            vec![Problem { ok: false, text: format!("Could not load {url}: {e:#}"), line: None }];
                     }
                 }
                 cx.notify();
@@ -630,7 +628,7 @@ fn parse_docs(text: &str) -> Result<Vec<Doc>, Problem> {
             }
             Err(e) => {
                 let line = e.location().map(|l| l.line().saturating_sub(1) as u32 + start);
-                let col = e.location().map(|l| l.column()).unwrap_or(0);
+                let col = e.location().map_or(0, |l| l.column());
                 let msg = crate::yaml::message(&e);
                 let text = match line {
                     Some(l) => format!("Invalid YAML at line {}, column {col}: {msg}", l + 1),

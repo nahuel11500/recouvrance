@@ -16,7 +16,7 @@ impl DetailPanel {
         let name = format!("{}-{ns}{}.yaml", self.obj.kind.ar.kind.to_lowercase(), self.obj.name);
         // Private (a revealed Secret is in there) and never over an earlier download.
         let r = crate::private_files::create_new_in(&crate::private_files::downloads_dir(), &name)
-            .and_then(|(mut f, path)| f.write_all(self.yaml_text.as_bytes()).map(|_| path));
+            .and_then(|(mut f, path)| f.write_all(self.yaml_text.as_bytes()).map(|()| path));
         window.push_notification(
             match r {
                 Ok(path) => Notification::success(format!("Saved {}", path.display())),
@@ -175,7 +175,7 @@ impl DetailPanel {
                             let r = k8s::upload_to_container(client, ns, pod, Some(container), local, dir).await;
                             let _ = cx.update(|window, cx| match r {
                                 Ok(dest) => {
-                                    window.push_notification(Notification::success(format!("Uploaded to {dest}")), cx)
+                                    window.push_notification(Notification::success(format!("Uploaded to {dest}")), cx);
                                 }
                                 Err(e) => window.push_notification(
                                     Notification::error(format!("Upload failed: {}", k8s::short_error(&e))),
