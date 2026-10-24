@@ -1,7 +1,19 @@
 //! MCP tools that read: contexts, types, resources, events, describe, top, search, logs, certificates, problems, usage history.
 
-#[allow(unused_imports)]
-use super::*;
+use http::request::Parts;
+use rmcp::handler::server::tool::Extension;
+use rmcp::handler::server::wrapper::Parameters;
+use rmcp::{tool, tool_router};
+use serde_json::json;
+
+use super::{
+    CertParams, ContextParam, EventsParams, HistoryParams, KubeMcp, ListParams, LogsParams, MAX_LOG_BYTES,
+    ObjectParams, ProblemsParams, SearchParams, TopParams, access_for, check_identity, describe, format_table,
+    is_secret_object, list_verdict, problem_visible, require_ns,
+};
+use crate::k8s;
+use crate::k8s::ObjectRef;
+use crate::mcp::Mode;
 
 #[tool_router(router = read_tools, vis = "pub(super)")]
 impl KubeMcp {

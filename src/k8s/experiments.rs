@@ -1,10 +1,12 @@
 //! Dev-only measurements of list strategies against a live cluster (read-only):
 //! `RECOUVRANCE_SMOKE=<context> RECOUVRANCE_EXPERIMENTS=1`.
 
-#[allow(unused_imports)]
-use super::*;
+use anyhow::Result;
+use futures::StreamExt as _;
+use kube::Client;
 
 use super::table::{ServerTable, TABLE_ACCEPT};
+use super::{Extras, to_row};
 
 fn table_get(path: &str) -> Result<http::Request<Vec<u8>>> {
     let mut req = http::Request::get(path).body(Vec::new())?;

@@ -1,59 +1,33 @@
 //! Detail page for one object: overview, containers, revisions, logs, YAML, events, shell.
 
-use futures::StreamExt as _;
-use gpui_kit::assets::IconName as Lucide;
-use gpui_kit::component::Disableable as _;
-use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::checkbox::Checkbox;
-use gpui_kit::component::input::{Editor, EditorState, Input, InputEvent, InputState};
+use gpui_kit::component::WindowExt as _;
+use gpui_kit::component::input::EditorState;
 use gpui_kit::component::notification::Notification;
-use gpui_kit::component::searchable_list::SearchableVec;
-use gpui_kit::component::select::{Select, SelectEvent, SelectState};
-use gpui_kit::component::tab::{Tab, TabBar};
-use gpui_kit::component::{ActiveTheme as _, IndexPath, Sizable as _, h_flex, v_flex};
-use gpui_kit::component::{Icon, IconName, WindowExt as _};
-use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use kube::Client;
 
-use crate::favorites::{FavObject, Favorites};
+use crate::favorites::Favorites;
 use crate::forwards::Forwards;
-use crate::k8s::{self, EventLine, ObjectRef, TaskGuard};
+use crate::k8s::{self, EventLine, ObjectRef};
 use crate::overview::{Ctx, Related};
 use crate::ui::terminal::TerminalView;
 
 mod access_actions;
-#[allow(unused_imports)]
-pub(crate) use access_actions::*;
-mod files;
-#[allow(unused_imports)]
-pub(crate) use files::*;
-mod forward_options;
-#[allow(unused_imports)]
-pub(crate) use forward_options::*;
 mod action_bar;
-#[allow(unused_imports)]
-pub(crate) use action_bar::*;
 mod actions;
 mod compare;
 #[cfg(feature = "dev")]
 mod demo;
+mod files;
+mod forward_options;
 mod logs;
 mod related;
 mod tabs;
-#[allow(unused_imports)]
+
 pub(crate) use actions::*;
-#[allow(unused_imports)]
-pub(crate) use compare::*;
-#[cfg(feature = "dev")]
-#[allow(unused_imports)]
-pub(crate) use demo::*;
-#[allow(unused_imports)]
 pub(crate) use logs::*;
-#[allow(unused_imports)]
-pub(crate) use related::*;
-#[allow(unused_imports)]
-pub(crate) use tabs::*;
+use related::{container_history_for, container_names, fetch_related, gpu_history_for, history_for};
+use tabs::error_box;
 
 #[derive(Clone, Copy, PartialEq)]
 enum DetailTab {

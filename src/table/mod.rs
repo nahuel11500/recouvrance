@@ -12,9 +12,8 @@ use crate::k8s::{self, ColumnDef, Row};
 mod filter;
 mod render;
 mod sort;
-#[allow(unused_imports)]
+
 pub(crate) use filter::*;
-#[allow(unused_imports)]
 pub(crate) use render::*;
 use sort::normalized;
 

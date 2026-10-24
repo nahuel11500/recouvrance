@@ -1,7 +1,15 @@
 //! Usage history charts and request/limit bars.
 
-#[allow(unused_imports)]
-use super::*;
+use gpui_kit::assets::IconName as Lucide;
+use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::chart::AreaChart;
+use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, h_flex, v_flex};
+use gpui_kit::prelude::FluentBuilder as _;
+use gpui_kit::*;
+use serde_json::Value;
+
+use super::{Ctx, card, heading, s};
+use crate::k8s;
 
 /// Requests and limits added up over these pods (millicores, bytes): cpu request, cpu limit,
 /// memory request, memory limit.

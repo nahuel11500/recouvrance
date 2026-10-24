@@ -1,7 +1,20 @@
 //! Log viewer: merged streams of one or more pods, filters, find, histogram.
 
-#[allow(unused_imports)]
-use super::*;
+use futures::StreamExt as _;
+use gpui_kit::assets::IconName as Lucide;
+use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::checkbox::Checkbox;
+use gpui_kit::component::input::{Input, InputEvent, InputState};
+use gpui_kit::component::notification::Notification;
+use gpui_kit::component::searchable_list::SearchableVec;
+use gpui_kit::component::select::{Select, SelectEvent, SelectState};
+use gpui_kit::component::{ActiveTheme as _, Icon, IndexPath, Sizable as _, WindowExt as _, h_flex, v_flex};
+use gpui_kit::prelude::FluentBuilder as _;
+use gpui_kit::*;
+use kube::Client;
+
+use crate::k8s;
+use crate::k8s::TaskGuard;
 
 mod model;
 use model::*;

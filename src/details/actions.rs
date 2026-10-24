@@ -1,7 +1,15 @@
 //! Write actions and their confirmations: scale, restart, rollback, delete, debug, node shell, RBAC bindings, files, YAML saves.
 
-#[allow(unused_imports)]
-use super::*;
+use gpui_kit::component::checkbox::Checkbox;
+use gpui_kit::component::input::{Input, InputState};
+use gpui_kit::component::notification::Notification;
+use gpui_kit::component::{ActiveTheme as _, WindowExt as _, h_flex, v_flex};
+use gpui_kit::prelude::FluentBuilder as _;
+use gpui_kit::*;
+
+use super::{DetailPanel, DetailTab, ensure_writes, writes_still_on};
+use crate::k8s;
+use crate::ui::terminal::TerminalView;
 
 impl DetailPanel {
     pub(super) fn run_write(

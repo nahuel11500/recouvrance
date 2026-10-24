@@ -1,7 +1,13 @@
 //! Rules as code: the rules.yaml editor.
 
-#[allow(unused_imports)]
-use super::*;
+use gpui_kit::assets::IconName as Lucide;
+use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::input::{Editor as CodeEditor, EditorState};
+use gpui_kit::component::{ActiveTheme as _, Disableable as _, Sizable as _, h_flex, v_flex};
+use gpui_kit::prelude::FluentBuilder as _;
+use gpui_kit::*;
+
+use super::AgentsView;
 
 impl AgentsView {
     /// The file's text, or what it would contain (from the current agents).

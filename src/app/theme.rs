@@ -1,7 +1,8 @@
 //! Theme, accent color and zoom, saved between runs.
 
-#[allow(unused_imports)]
-use super::*;
+use gpui_kit::component::notification::Notification;
+use gpui_kit::component::{ActiveTheme as _, Theme, ThemeMode, WindowExt as _};
+use gpui_kit::*;
 
 /// Apply a theme mode and remember it as the user's choice (no longer following the desktop).
 pub fn set_theme(mode: ThemeMode, window: Option<&mut Window>, cx: &mut App) {

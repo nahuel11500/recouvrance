@@ -1,7 +1,14 @@
 //! An agent's page: token, connection, rules, limits.
 
-#[allow(unused_imports)]
-use super::*;
+use gpui_kit::assets::IconName as Lucide;
+use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::input::{Input, InputState};
+use gpui_kit::component::switch::Switch;
+use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, h_flex, v_flex};
+use gpui_kit::*;
+
+use super::AgentsView;
+use crate::mcp::{Agent, Policy, Rule};
 
 impl AgentsView {
     pub(super) fn render_token(&self, agent: &Agent, cx: &mut Context<Self>) -> Option<impl IntoElement> {

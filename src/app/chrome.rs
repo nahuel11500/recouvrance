@@ -1,7 +1,18 @@
 //! Window chrome: context picker page, approvals, context strip, command palette, zoom.
 
-#[allow(unused_imports)]
-use super::*;
+use gpui_kit::assets::IconName as Lucide;
+use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::notification::Notification;
+use gpui_kit::component::{
+    ActiveTheme as _, Disableable as _, Icon, Sizable as _, ThemeMode, WindowExt as _, h_flex, v_flex,
+};
+use gpui_kit::prelude::FluentBuilder as _;
+use gpui_kit::*;
+
+use super::{AppView, IndexEntry, Route, SEARCH_KINDS, open_main_window, section_icon, set_theme, set_zoom, zoom};
+use crate::k8s;
+use crate::k8s::Kind;
+use crate::ui::palette::{Item as PaletteItem, Palette, PaletteEvent, Target};
 
 impl AppView {
     pub(super) fn zoom_by(&mut self, delta: Option<f32>, window: &mut Window, cx: &mut Context<Self>) {

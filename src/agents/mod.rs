@@ -5,29 +5,23 @@
 use std::sync::Arc;
 
 use gpui_kit::assets::IconName as Lucide;
-use gpui_kit::component::Disableable as _;
+use gpui_kit::component::Icon;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::input::{Editor as CodeEditor, EditorState, Input, InputEvent, InputState};
+use gpui_kit::component::input::{EditorState, Input, InputEvent, InputState};
 use gpui_kit::component::switch::Switch;
-use gpui_kit::component::{ActiveTheme as _, Icon, Selectable as _, Sizable as _, h_flex, v_flex};
+use gpui_kit::component::{ActiveTheme as _, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use crate::k8s;
-use crate::mcp::{Access, Agent, AuditEntry, Decision, Hub, Mode, Policy, Rule, VERBS, any_glob, is_write};
+use crate::mcp::{Agent, Hub, Mode, Policy, Rule, any_glob, is_write};
 
 mod activity;
 mod code;
 mod detail;
 mod rules;
-#[allow(unused_imports)]
-pub(crate) use activity::*;
-#[allow(unused_imports)]
-pub(crate) use code::*;
-#[allow(unused_imports)]
-pub(crate) use detail::*;
-#[allow(unused_imports)]
-pub(crate) use rules::*;
+
+use activity::Activity;
 
 pub struct AgentsView {
     /// Show every agent's activity instead of one agent's settings.

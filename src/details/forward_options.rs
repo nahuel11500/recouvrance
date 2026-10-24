@@ -1,7 +1,11 @@
 //! Port-forward with options.
 
-#[allow(unused_imports)]
-use super::*;
+use gpui_kit::component::checkbox::Checkbox;
+use gpui_kit::component::input::{Input, InputState};
+use gpui_kit::component::{WindowExt as _, h_flex, v_flex};
+use gpui_kit::*;
+
+use super::DetailPanel;
 
 impl DetailPanel {
     /// Start a port-forward with options: local port, listen address, https, open in browser.

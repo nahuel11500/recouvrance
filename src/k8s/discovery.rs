@@ -1,7 +1,15 @@
 //! API discovery: the resource types a cluster serves and where they go in the sidebar.
 
-#[allow(unused_imports)]
-use super::*;
+use std::collections::HashMap;
+
+use anyhow::Result;
+use futures::StreamExt as _;
+use k8s_openapi::api::core::v1::Namespace;
+use kube::Client;
+use kube::api::{Api, ListParams};
+use kube::discovery::{ApiCapabilities, ApiResource, Discovery, Scope, verbs};
+
+use super::run;
 
 #[derive(Clone, Debug)]
 pub struct Kind {

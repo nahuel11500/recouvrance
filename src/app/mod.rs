@@ -1,112 +1,47 @@
 //! Main window: context and namespace pickers, kind sidebar, live table, details.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-
 use std::sync::Arc;
 
 use futures::StreamExt as _;
-
 use gpui_kit::assets::IconName as Lucide;
-
-use gpui_kit::component::button::{Button, ButtonVariants as _};
-
-use gpui_kit::component::checkbox::Checkbox;
-
-use gpui_kit::component::input::{Input, InputEvent, InputState};
-
+use gpui_kit::component::ActiveTheme as _;
+use gpui_kit::component::input::{InputEvent, InputState};
 use gpui_kit::component::notification::Notification;
-
-use gpui_kit::component::popover::Popover;
-
-use gpui_kit::component::table::{DataTable, TableDelegate as _, TableEvent, TableState};
-
-use gpui_kit::component::{
-    ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, Theme, ThemeMode, h_flex, h_resizable,
-    resizable_panel, v_flex,
-};
-
+use gpui_kit::component::table::{TableEvent, TableState};
 use gpui_kit::component::{TitleBar, WindowExt as _};
-
-use gpui_kit::prelude::FluentBuilder as _;
-
 use gpui_kit::*;
-
 use kube::Client;
 
 use crate::agents::AgentsView;
-
-use crate::ui::cluster::ClusterOverview;
-
-use crate::ui::ctx_picker::{ContextEvent, ContextPicker};
-
-use crate::ui::dashboard::Dashboard;
-
 use crate::details::{DetailPanel, OpenObject};
-
-use crate::favorites::{ColumnPrefs, FavObject, Favorites, SavedView};
-
+use crate::favorites::{ColumnPrefs, Favorites};
 use crate::forwards::Forwards;
-
-use crate::ui::helm::{HelmList, HelmRelease, OpenRelease};
-
-use crate::k8s::{self, Kind, ObjectRef, TableMsg, TaskGuard};
-
+use crate::k8s::{self, Kind, TaskGuard};
 use crate::mcp::{self, Approval, Hub, HubEvent};
-
+use crate::table::ResourceTable;
+use crate::ui::cluster::ClusterOverview;
+use crate::ui::ctx_picker::{ContextEvent, ContextPicker};
+use crate::ui::dashboard::Dashboard;
+use crate::ui::helm::{HelmList, HelmRelease};
 use crate::ui::ns_picker::{NamespacePicked, NamespacePicker, NamespacesChanged};
-
-use crate::ui::palette::{Item as PaletteItem, Palette, PaletteEvent, Target};
-
+use crate::ui::palette::Palette;
 use crate::ui::settings_view::SettingsView;
 
-use crate::table::ResourceTable;
-
-mod pages;
-#[allow(unused_imports)]
-pub(crate) use pages::*;
-mod watch;
-#[allow(unused_imports)]
-pub(crate) use watch::*;
-mod contexts;
-#[allow(unused_imports)]
-pub(crate) use contexts::*;
 mod chrome;
-
+mod contexts;
 #[cfg(feature = "dev")]
 mod demo;
-
 mod navigation;
-
+mod pages;
 mod render;
-
 mod sidebar;
-
 mod table_page;
-
 mod theme;
-
 mod view_cache;
+mod watch;
 
-#[allow(unused_imports)]
-pub(crate) use chrome::*;
-
-#[cfg(feature = "dev")]
-#[allow(unused_imports)]
-pub(crate) use demo::*;
-
-#[allow(unused_imports)]
-pub(crate) use navigation::*;
-
-#[allow(unused_imports)]
-pub(crate) use render::*;
-
-#[allow(unused_imports)]
-pub(crate) use sidebar::*;
-
-#[allow(unused_imports)]
-pub(crate) use table_page::*;
-
-#[allow(unused_imports)]
+use sidebar::section_icon;
 pub(crate) use theme::*;
 
 /// Where the main area is; kept in a history for back/forward.

@@ -1,7 +1,13 @@
 //! The action buttons in a detail page's header.
 
-#[allow(unused_imports)]
-use super::*;
+use gpui_kit::assets::IconName as Lucide;
+use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::{ActiveTheme as _, Disableable as _, Icon, Sizable as _, h_flex};
+use gpui_kit::prelude::FluentBuilder as _;
+use gpui_kit::*;
+
+use super::DetailPanel;
+use crate::k8s;
 
 impl DetailPanel {
     pub(super) fn render_actions(&self, cx: &mut Context<Self>) -> AnyElement {

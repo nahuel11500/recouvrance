@@ -1,11 +1,18 @@
 //! The activity log of agent calls: grouped into tasks, repeats folded, filtered,
 //! with older calls read back from the log on disk.
 
-#[allow(unused_imports)]
-use super::*;
-
 use std::collections::{BTreeSet, HashSet};
 use std::rc::Rc;
+
+use gpui_kit::assets::IconName as Lucide;
+use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::input::{Input, InputState};
+use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, h_flex, v_flex};
+use gpui_kit::prelude::FluentBuilder as _;
+use gpui_kit::*;
+
+use super::AgentsView;
+use crate::mcp::{AuditEntry, Decision, Hub};
 
 /// A pause longer than this starts a new group, even within one session.
 const GAP_SECS: i64 = 10 * 60;

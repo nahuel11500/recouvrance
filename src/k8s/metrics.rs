@@ -1,7 +1,15 @@
 //! Usage from metrics-server and the kubelet; quantities and allocation.
 
-#[allow(unused_imports)]
-use super::*;
+use std::collections::HashMap;
+
+use anyhow::Result;
+use futures::channel::mpsc;
+use k8s_openapi::api::core::v1::Pod;
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
+use kube::Client;
+use serde::Deserialize;
+
+use super::{Pause, TaskGuard, ar_of, get_json, lists, podspec, run, spawn_guarded, url_escape};
 
 /// Pod usage from metrics-server: (namespace, name) -> (millicores, bytes).
 pub type PodUsage = HashMap<(String, String), (f64, f64)>;

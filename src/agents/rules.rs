@@ -1,7 +1,15 @@
 //! The rule editor: one rule's fields, presets and the access tester.
 
-#[allow(unused_imports)]
-use super::*;
+use gpui_kit::assets::IconName as Lucide;
+use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::input::{Input, InputState};
+use gpui_kit::component::{ActiveTheme as _, Selectable as _, Sizable as _, h_flex, v_flex};
+use gpui_kit::prelude::FluentBuilder as _;
+use gpui_kit::*;
+
+use super::{AgentsView, RuleInputs, rule_with};
+use crate::k8s;
+use crate::mcp::{Access, Agent, Mode, Rule, VERBS, is_write};
 
 impl AgentsView {
     pub(super) fn render_rule(

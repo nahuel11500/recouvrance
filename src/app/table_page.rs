@@ -1,7 +1,22 @@
 //! The resource list page: filter menu, columns, selection and bulk actions, views, CSV.
 
-#[allow(unused_imports)]
-use super::*;
+use std::sync::Arc;
+
+use gpui_kit::assets::IconName as Lucide;
+use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::checkbox::Checkbox;
+use gpui_kit::component::input::{Input, InputState};
+use gpui_kit::component::notification::Notification;
+use gpui_kit::component::popover::Popover;
+use gpui_kit::component::{ActiveTheme as _, Icon, IconName, Sizable as _, WindowExt as _, h_flex, v_flex};
+use gpui_kit::prelude::FluentBuilder as _;
+use gpui_kit::*;
+use kube::Client;
+
+use super::AppView;
+use crate::favorites::SavedView;
+use crate::k8s;
+use crate::k8s::{Kind, ObjectRef};
 
 impl AppView {
     /// Row menu: open the right-clicked row, optionally on a tab.

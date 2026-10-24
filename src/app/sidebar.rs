@@ -1,8 +1,17 @@
 //! The sidebar: pages, resource types by section, favorites, port-forwards.
 
-#[allow(unused_imports)]
-use super::*;
+use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::component::button::ButtonCustomVariant;
+use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::input::Input;
+use gpui_kit::component::{ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, h_flex, v_flex};
+use gpui_kit::prelude::FluentBuilder as _;
+use gpui_kit::*;
+
+use super::{AppView, Route};
+use crate::favorites::{FavObject, SavedView};
+use crate::k8s;
+use crate::k8s::Kind;
 
 /// Buttons on the navy sidebar: light text, a slightly lighter hull on hover.
 fn on_hull(cx: &App) -> ButtonCustomVariant {

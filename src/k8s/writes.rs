@@ -1,7 +1,12 @@
 //! Writes: scale, restart, patch, apply, create, replace, delete, rollback, debug, drain, node shell, GitOps actions.
 
-#[allow(unused_imports)]
-use super::*;
+use anyhow::{Context as _, Result};
+use k8s_openapi::api::core::v1::Pod;
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
+use kube::Client;
+use kube::api::{Api, DynamicObject, ListParams};
+
+use super::{Kind, ar_of, list_values, run, spawn_detached};
 
 pub(super) fn dyn_api(client: Client, kind: &Kind, ns: Option<&str>) -> Api<DynamicObject> {
     match (kind.namespaced, ns) {

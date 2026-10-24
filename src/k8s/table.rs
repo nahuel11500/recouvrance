@@ -1,7 +1,19 @@
 //! Server-side tables (kubectl's columns) listed and watched for the resource lists.
 
-#[allow(unused_imports)]
-use super::*;
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use anyhow::{Context as _, Result, anyhow};
+use futures::channel::mpsc;
+use futures::{AsyncBufReadExt as _, StreamExt as _};
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::ListMeta;
+use kube::api::{Api, DynamicObject, ListParams, WatchParams};
+use kube::core::Request;
+use kube::discovery::ApiResource;
+use kube::{Client, Resource as _};
+use serde::Deserialize;
+
+use super::{Kind, TaskGuard, api_status, lists, run, short_error, spawn_guarded};
 
 /// The server-side Table format, the same data `kubectl get` prints.
 #[derive(Deserialize, Debug)]

@@ -1,7 +1,17 @@
 //! Rendering of the detail tabs: overview, containers, ports, YAML, events, and the page itself.
 
-#[allow(unused_imports)]
-use super::*;
+use gpui_kit::assets::IconName as Lucide;
+use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::checkbox::Checkbox;
+use gpui_kit::component::input::Editor;
+use gpui_kit::component::tab::{Tab, TabBar};
+use gpui_kit::component::{ActiveTheme as _, Icon, IconName, Sizable as _, WindowExt as _, h_flex, v_flex};
+use gpui_kit::prelude::FluentBuilder as _;
+use gpui_kit::*;
+
+use super::{DetailPanel, DetailTab, container_names, writes_enabled};
+use crate::favorites::FavObject;
+use crate::k8s;
 
 impl DetailPanel {
     pub(super) fn render_overview(&self, cx: &mut Context<Self>) -> AnyElement {
