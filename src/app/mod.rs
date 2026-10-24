@@ -4,7 +4,6 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use futures::StreamExt as _;
-use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::component::input::{InputEvent, InputState};
 use gpui_kit::component::notification::Notification;
@@ -35,7 +34,9 @@ mod demo;
 mod live_list;
 mod navigation;
 mod pages;
+mod problem_badge;
 mod render;
+mod search_index;
 mod sidebar;
 mod table_page;
 mod theme;
@@ -204,39 +205,9 @@ fn key_bindings() -> Vec<KeyBinding> {
     ]
 }
 
-/// Names of common objects across connected clusters, for the palette.
-#[derive(Clone)]
-struct IndexEntry {
-    ctx: usize,
-    kind: String,
-    label: String,
-    icon: Lucide,
-    namespace: Option<String>,
-    name: String,
-}
-
-/// Kinds the palette searches across whole clusters.
-const SEARCH_KINDS: [&str; 12] = [
-    "deployments",
-    "statefulsets",
-    "daemonsets",
-    "cronjobs",
-    "services",
-    "ingresses",
-    "configmaps",
-    "secrets",
-    "persistentvolumeclaims",
-    "namespaces",
-    "nodes",
-    "pods",
-];
-
 pub struct AppView {
-    search_index: Vec<IndexEntry>,
-    /// The lists the object index couldn't load: kind and cluster.
-    index_failed: Vec<String>,
-    index_built: Option<std::time::Instant>,
-    _index_tasks: Vec<Task<()>>,
+    /// Object names across the clusters, for the palette.
+    search_index: search_index::SearchIndex,
     focus: FocusHandle,
     palette: Option<Entity<Palette>>,
     /// The open palette's subscription, replaced on each open.
@@ -267,11 +238,8 @@ pub struct AppView {
     /// Top bar popovers (controlled, so a pick closes them).
     ctx_open: bool,
     ns_open: bool,
-    /// (critical, warnings) across the connected clusters, refreshed in the background.
-    problem_counts: Option<(usize, usize)>,
-    /// Kinds the problem scan could not read (refused or failed): the counts are partial.
-    problem_gaps: Option<SharedString>,
-    _problem_watch: Option<Task<()>>,
+    /// The sidebar's problem count, refreshed in the background.
+    problems: problem_badge::ProblemBadge,
     /// Sidebar hidden (Ctrl+B).
     sidebar_hidden: bool,
     /// Selection events the app caused itself (keeping the selection on its row
@@ -481,10 +449,7 @@ impl AppView {
         let mut this = Self {
             settings_view,
             terminals: HashMap::new(),
-            search_index: Vec::new(),
-            index_failed: Vec::new(),
-            index_built: None,
-            _index_tasks: Vec::new(),
+            search_index: search_index::SearchIndex::default(),
             focus,
             palette: None,
             _palette_sub: None,
@@ -512,9 +477,7 @@ impl AppView {
             skip_select: None,
             page_scopes: HashMap::new(),
             sidebar_hidden: false,
-            problem_counts: None,
-            problem_gaps: None,
-            _problem_watch: None,
+            problems: problem_badge::ProblemBadge::default(),
             namespaces: Vec::new(),
             filter,
             kind_filter,

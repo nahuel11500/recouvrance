@@ -1,4 +1,4 @@
-//! Keeping the resource list live: table watches, metrics and the problem count.
+//! Keeping the resource list live: table watches and metrics.
 
 use std::sync::Arc;
 
@@ -13,49 +13,6 @@ use crate::k8s;
 use crate::k8s::TableMsg;
 
 impl AppView {
-    /// Count problems in the background for the sidebar badge. Big clusters are
-    /// scanned less often (the interval grows with how long a scan takes).
-    pub(super) fn start_problem_watch(&mut self, cx: &mut Context<Self>) {
-        self.problem_counts = None;
-        self.problem_gaps = None;
-        let (clusters, kinds) = (self.clusters.clone(), self.kinds.clone());
-        self._problem_watch = Some(cx.spawn(async move |this, cx| {
-            loop {
-                let started = std::time::Instant::now();
-                // A cluster that may not list cluster-wide is read in its accessible namespaces.
-                let scans = clusters.iter().map(|(name, c)| {
-                    let accessible = crate::settings::cluster(name).namespaces;
-                    let (c, kinds) = (c.clone(), &kinds);
-                    async move { crate::problems::scan_namespaces(c, kinds, &accessible).await }
-                });
-                let results = futures::future::join_all(scans).await;
-                let found = results.iter().flat_map(|s| &s.problems);
-                let crit = found.clone().filter(|p| p.severity == crate::problems::Severity::Critical).count();
-                let warn = found.filter(|p| p.severity == crate::problems::Severity::Warning).count();
-                // Kinds a cluster refused or failed to list: the counts leave them out.
-                let skipped: Vec<String> = clusters
-                    .iter()
-                    .zip(&results)
-                    .filter_map(|((name, _), s)| Some(format!("{name}: {}", s.skipped_text()?)))
-                    .collect();
-                let gaps = (!skipped.is_empty())
-                    .then(|| format!("Partial count, could not read {}", skipped.join("; ")).into());
-                if this
-                    .update(cx, |this, cx| {
-                        this.problem_counts = Some((crit, warn));
-                        this.problem_gaps = gaps;
-                        cx.notify();
-                    })
-                    .is_err()
-                {
-                    break;
-                }
-                let wait = (started.elapsed() * 8).max(std::time::Duration::from_secs(120));
-                cx.background_executor().timer(wait).await;
-            }
-        }));
-    }
-
     pub(super) fn restart_watch(&mut self, cx: &mut Context<Self>) {
         self.watch = None;
         self.metrics = None;

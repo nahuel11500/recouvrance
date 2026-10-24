@@ -573,21 +573,13 @@ impl AppView {
                     .on_click(cx.listener(|this, _, window, cx| this.open_problems(window, cx)))
                     .child(Icon::new(Lucide::TriangleAlert).size_4())
                     .child(div().flex_1().child("Problems"))
-                    .when_some(self.problem_counts, |d, (crit, warn)| {
-                        let (n, color) = if crit > 0 { (crit, cx.theme().danger) } else { (warn, cx.theme().warning) };
-                        d.when(n > 0, |d| {
-                            d.child(
-                                div()
-                                    .px_1p5()
-                                    .rounded_full()
-                                    .text_xs()
-                                    .bg(color)
-                                    .text_color(white())
-                                    .child(n.to_string()),
-                            )
-                        })
+                    .when_some(self.problems.shown(), |d, (n, critical)| {
+                        let color = if critical { cx.theme().danger } else { cx.theme().warning };
+                        d.child(
+                            div().px_1p5().rounded_full().text_xs().bg(color).text_color(white()).child(n.to_string()),
+                        )
                     })
-                    .when_some(self.problem_gaps.clone(), |d, gaps| {
+                    .when_some(self.problems.gaps(), |d, gaps| {
                         d.tooltip(move |w, cx| component::tooltip::Tooltip::new(gaps.clone()).build(w, cx))
                     })
             })

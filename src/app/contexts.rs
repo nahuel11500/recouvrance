@@ -36,9 +36,7 @@ impl AppView {
         // Watch errors name the old clusters, and would hide "Connecting…" and new failures.
         self.list = super::live_list::LiveList::default();
         // The problem badge counted the old clusters.
-        self._problem_watch = None;
-        self.problem_counts = None;
-        self.problem_gaps = None;
+        self.problems.clear();
         // Details belong to the old clusters, in every tab: the other tabs go
         // back to their resource list (kinds and namespaces checked once connected).
         self.history = vec![Route::Resources(self.kind.clone())];
@@ -53,9 +51,6 @@ impl AppView {
         self.page_scopes.clear();
         // The palette's object index points at the old clusters.
         self.search_index.clear();
-        self.index_failed.clear();
-        self.index_built = None;
-        self._index_tasks.clear();
         self.list.notice = Some(format!("Connecting to {}…", contexts.join(", ")).into());
         self.connect_errors = None;
         self.connecting = true;
@@ -147,7 +142,7 @@ impl AppView {
                         }
                         this.settings_view.update(cx, |s, _| s.set_kinds(kinds.clone()));
                         this.kinds = kinds;
-                        this.start_problem_watch(cx);
+                        this.problems.start(this.clusters.clone(), this.kinds.clone(), cx);
                         this.set_namespaces(namespaces, window, cx);
                         this.restart_watch(cx);
                         if dev_var("RECOUVRANCE_PAGE").is_none() {
