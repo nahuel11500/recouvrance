@@ -42,7 +42,7 @@ the squash commit it writes on `main`.
 ## Releases
 
 [release-plz](https://release-plz.dev) keeps a *Release vX.Y.Z* pull request open with the version
-bump and the changelog. Merging it publishes the crate to crates.io (from the first real release; 0.0.x test releases are GitHub only) and tags `vX.Y.Z`; the tag
+bump and the changelog. Merging it tags `vX.Y.Z` (releases go to GitHub only; the crate is not published to crates.io); the tag
 starts the [dist](https://opensource.axo.dev/cargo-dist) release workflow, which builds the
 binaries (Linux and macOS, x86_64 and arm64), the install script, the updater, a `.deb` and an
 AppImage, and publishes the GitHub release.

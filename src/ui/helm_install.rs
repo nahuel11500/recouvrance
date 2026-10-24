@@ -279,6 +279,9 @@ impl HelmInstall {
                     if !crate::details::guard_ok(guard.as_ref(), cx) {
                         return false;
                     }
+                    if !crate::details::writes_still_on(window, cx) {
+                        return true;
+                    }
                     let _ = view.update(cx, |this, cx| this.run(false, window, cx));
                     true
                 })

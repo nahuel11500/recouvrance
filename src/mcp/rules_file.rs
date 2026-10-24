@@ -256,8 +256,9 @@ pub fn apply(rules: &AgentRules, p: &mut Policy) -> Result<()> {
 
 /// Apply the whole file to the agents: each section to the agent with its name (created
 /// when missing, with no token yet), and no rules at all for an agent the file doesn't
-/// name, so removing its section takes its access away.
-pub fn apply_file(file: &RulesFile, agents: &mut Vec<super::Agent>) -> Result<()> {
+/// name, so removing its section takes its access away. With `keep_unnamed` (agents.json
+/// from before 0.3.0, which created agents without a section) those keep their rules.
+pub fn apply_file(file: &RulesFile, agents: &mut Vec<super::Agent>, keep_unnamed: bool) -> Result<()> {
     for (name, rules) in &file.agents {
         let agent = match agents.iter().position(|a| a.name == *name) {
             Some(i) => &mut agents[i],
@@ -275,8 +276,10 @@ pub fn apply_file(file: &RulesFile, agents: &mut Vec<super::Agent>) -> Result<()
         };
         apply(rules, &mut agent.policy).with_context(|| format!("agent `{name}`"))?;
     }
-    for agent in agents.iter_mut().filter(|a| !file.agents.contains_key(&a.name)) {
-        agent.policy.rules.clear();
+    if !keep_unnamed {
+        for agent in agents.iter_mut().filter(|a| !file.agents.contains_key(&a.name)) {
+            agent.policy.rules.clear();
+        }
     }
     Ok(())
 }
@@ -442,13 +445,32 @@ mod tests {
         let f: RulesFile =
             crate::yaml::from_str("agents:\n  Claude:\n    allow: [\"get pods\"]\n  new:\n    allow: [\"list *\"]\n")
                 .unwrap();
-        apply_file(&f, &mut agents).unwrap();
+        apply_file(&f, &mut agents, false).unwrap();
         assert_eq!(agents.len(), 3);
         assert_eq!(agents[0].policy.rules.len(), 1);
         assert_eq!(agents[0].policy.rules[0].verbs, ["get"]);
         assert!(agents[1].policy.rules.is_empty());
         assert_eq!((agents[2].name.as_str(), agents[2].token_sha256.as_str()), ("new", ""));
         assert_eq!(agents[2].policy.rules[0].verbs, ["list"]);
+    }
+
+    #[test]
+    fn an_agent_from_before_the_file_named_every_agent_keeps_its_rules() {
+        // 0.2.0 created `ci` without writing its section.
+        let agent = |id: &str, name: &str| super::super::Agent {
+            id: id.into(),
+            name: name.into(),
+            token_sha256: "hash".into(),
+            enabled: true,
+            policy: Policy::default(),
+        };
+        let mut agents = vec![agent("a", "Claude"), agent("b", "ci")];
+        let f = check("agents:\n  Claude:\n    allow: [\"get pods\"]\n").unwrap();
+        apply_file(&f, &mut agents, true).unwrap();
+        assert_eq!(agents[0].policy.rules.len(), 1);
+        assert_eq!(agents[1].policy.rules, Policy::default().rules);
+        // Written back, the file names it from now on.
+        assert!(check(&render(&agents).unwrap()).unwrap().agents.contains_key("ci"));
     }
 
     #[test]
@@ -560,7 +582,7 @@ mod properties {
             let text = render(&agents).unwrap();
             let file = check(&text).map_err(|e| TestCaseError::fail(format!("{e:#}\n{text}")))?;
             let mut back: Vec<Agent> = agents.iter().map(|a| agent(&a.name, Policy::default())).collect();
-            apply_file(&file, &mut back).unwrap();
+            apply_file(&file, &mut back, false).unwrap();
             prop_assert_eq!(back.len(), agents.len(), "{}", text);
             for (a, b) in agents.iter().zip(&back) {
                 same_decisions(&a.policy, &b.policy, &requests)?;
@@ -611,7 +633,7 @@ mod properties {
         fn a_missing_rule_list_denies(present in any::<bool>(), before in policy(), a in access()) {
             let text = if present { "agents:\n  ci: {}\n" } else { "agents: {}\n" };
             let mut agents = vec![agent("ci", before)];
-            apply_file(&check(text).unwrap(), &mut agents).unwrap();
+            apply_file(&check(text).unwrap(), &mut agents, false).unwrap();
             prop_assert_eq!(agents[0].policy.decide(&a).mode, Mode::Deny);
             prop_assert_eq!(agents[0].policy.decide_any_namespace(&a).mode, Mode::Deny);
         }

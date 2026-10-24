@@ -42,4 +42,4 @@ thousands of pods) in a few hundred megabytes.
 - **Protected contexts** require typing the context name.
 - Actions your **RBAC** forbids are disabled (`SelfSubjectAccessReview`).
 - **Agents** go through the hub: rules (deny, ask, allow), approvals, a rate limit, an audit log and
-  a kill switch.
+  a kill switch. Write mode and protected contexts don't apply to them: only their rules do.
