@@ -453,477 +453,655 @@ impl SettingsView {
     }
 
     fn render_section(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        match self.section {
+            Section::General => self.general_section(cx),
+            Section::Contexts => self.contexts_section(cx),
+            Section::Clusters => self.clusters_section(cx),
+            Section::Appearance => self.appearance_section(cx),
+            Section::Refresh => self.refresh_section(cx),
+            Section::Logs => self.logs_section(cx),
+            Section::Kubeconfig => self.kubeconfig_section(),
+            Section::Agents => self.agents_section(cx),
+            Section::Assistant => self.assistant_section(cx),
+            Section::Plugins => self.plugins_section(cx),
+            Section::Shortcuts => self.shortcuts_section(cx),
+            Section::Requests => self.requests_section(cx),
+            Section::About => self.about_section(window, cx),
+        }
+    }
+
+    fn general_section(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let s = settings::get();
+        v_flex()
+        .child(Self::row(
+            "Metrics",
+            "Read CPU/memory from metrics-server and history from Prometheus. Turn off on clusters where that is slow or not allowed.",
+            Switch::new("metrics-on").checked(s.metrics_enabled).label(if s.metrics_enabled { "On" } else { "Off" }).on_click(|v: &bool, _, cx| {
+                let v = *v;
+                settings::update(|s| s.metrics_enabled = v);
+                cx.refresh_windows();
+            }),
+            cx,
+        ))
+        .child(Self::row(
+            "Open the browser on port-forward",
+            "After a one-click forward on a web port (HTTP, dashboards, UIs). Databases and gRPC never open it.",
+            Switch::new("pf-browser")
+                .checked(s.open_browser_on_forward)
+                .label(if s.open_browser_on_forward { "On" } else { "Off" })
+                .on_click(|v: &bool, _, cx| {
+                    let v = *v;
+                    settings::update(|s| s.open_browser_on_forward = v);
+                    cx.refresh_windows();
+                }),
+            cx,
+        ))
+        .child(Self::row(
+            "Startup",
+            "What Recouvrance shows when it starts.",
+            Self::choice("startup", s.startup, &[(Startup::Reconnect, "Reconnect previous clusters"), (Startup::Picker, "Always ask")], |v, _, cx| {
+                settings::update(|s| s.startup = v);
+                cx.refresh_windows();
+            }),
+            cx,
+        ))
+        .child(Self::row(
+            "Initial view",
+            "What to show after connecting.",
+            Self::choice(
+                "initial",
+                s.initial_view,
+                &[(InitialView::Pods, "Pods"), (InitialView::Workloads, "Workloads overview"), (InitialView::Cluster, "Cluster overview")],
+                |v, _, cx| {
+                    settings::update(|s| s.initial_view = v);
+                    cx.refresh_windows();
+                },
+            ),
+            cx,
+        ))
+        .child(Self::row(
+            "Write actions",
+            "Off by default. When on, detail pages can scale, restart, run, drain, delete and edit. Each asks first, except deletes set to Delete right away below.",
+            {
+                let on = crate::details::writes_enabled(cx);
+                Checkbox::new("writes").label(if on { "Enabled" } else { "Disabled" }).checked(on).on_click(|v: &bool, _, cx| {
+                    crate::details::set_writes(*v, cx);
+                    cx.refresh_windows();
+                })
+            },
+            cx,
+        ))
+        .child(Self::row(
+            "Deleting",
+            "What a delete asks first, for kinds not listed below. A protected context always asks for its name.",
+            Self::choice(
+                "del-default",
+                s.delete_confirm,
+                &[(DeleteConfirm::Off, "Delete right away"), (DeleteConfirm::Ask, "Ask"), (DeleteConfirm::Type, "Type the name")],
+                |v, _, cx| {
+                    settings::update(|s| s.delete_confirm = v);
+                    cx.refresh_windows();
+                },
+            ),
+            cx,
+        ))
+        .child(self.render_delete_kinds(&s, cx))
+        .into_any_element()
+    }
+
+    fn contexts_section(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let s = settings::get();
         let theme = cx.theme().clone();
         let muted = theme.muted_foreground;
-        let number_input = |e: &Entity<InputState>| div().w(px(110.)).child(Input::new(e).small());
-        match self.section {
-            Section::General => v_flex()
-                .child(Self::row(
-                    "Metrics",
-                    "Read CPU/memory from metrics-server and history from Prometheus. Turn off on clusters where that is slow or not allowed.",
-                    Switch::new("metrics-on").checked(s.metrics_enabled).label(if s.metrics_enabled { "On" } else { "Off" }).on_click(|v: &bool, _, cx| {
-                        let v = *v;
-                        settings::update(|s| s.metrics_enabled = v);
-                        cx.refresh_windows();
-                    }),
-                    cx,
-                ))
-                .child(Self::row(
-                    "Open the browser on port-forward",
-                    "After a one-click forward on a web port (HTTP, dashboards, UIs). Databases and gRPC never open it.",
-                    Switch::new("pf-browser")
-                        .checked(s.open_browser_on_forward)
-                        .label(if s.open_browser_on_forward { "On" } else { "Off" })
-                        .on_click(|v: &bool, _, cx| {
-                            let v = *v;
-                            settings::update(|s| s.open_browser_on_forward = v);
+        let names = crate::k8s::load_contexts().map(|c| c.names).unwrap_or_default();
+        v_flex()
+            .child(div().pb_2().text_sm().text_color(muted).child(
+                "Color a context to recognise it at a glance. Protected contexts ask you to type their name before any write. \
+                 Metrics, node shell and namespaces per cluster are under Per cluster.",
+            ))
+            .when(s.protect_unset, |d| {
+                d.child(
+                    h_flex()
+                        .gap_3()
+                        .pb_2()
+                        .child(div().flex_1().text_sm().text_color(theme.danger).child(
+                            "The protection choices could not be read, so every context not set below is protected.",
+                        ))
+                        .child(Button::new("guess-protection").small().outline().label("Guess them again").on_click(
+                            |_, _, cx| {
+                                settings::update(|s| s.protect_unset = false);
+                                cx.refresh_windows();
+                            },
+                        )),
+                )
+            })
+            .children(names.into_iter().enumerate().map(|(i, ctx)| {
+                let protected = settings::is_protected(&ctx);
+                let current = s.context_colors.get(&ctx).cloned().unwrap_or_default();
+                let swatches = h_flex().gap_1().children(settings::COLORS.iter().enumerate().map(|(j, (name, hex))| {
+                    let (ctx, hex_s) = (ctx.clone(), hex.to_string());
+                    let selected = current == *hex;
+                    let color: Hsla = if hex.is_empty() { theme.secondary } else { rgb(u32::from_str_radix(&hex[1..], 16).unwrap_or(0)).into() };
+                    div()
+                        .id(SharedString::from(format!("sw-{i}-{j}")))
+                        .size(px(18.))
+                        .rounded_full()
+                        .bg(color)
+                        .border_2()
+                        .border_color(if selected { theme.foreground } else { theme.border })
+                        .cursor_pointer()
+                        .tooltip({
+                            let n = name.to_string();
+                            move |w, cx| component::tooltip::Tooltip::new(n.clone()).build(w, cx)
+                        })
+                        .on_click(move |_, _, cx| {
+                            let (ctx, hex) = (ctx.clone(), hex_s.clone());
+                            settings::update(|s| {
+                                if hex.is_empty() {
+                                    s.context_colors.remove(&ctx);
+                                } else {
+                                    s.context_colors.insert(ctx, hex);
+                                }
+                            });
+                            cx.refresh_windows();
+                        })
+                }));
+                let c2 = ctx.clone();
+                h_flex()
+                    .gap_4()
+                    .py_2()
+                    .border_b_1()
+                    .border_color(theme.border)
+                    .child(div().flex_1().min_w_0().text_sm().child(ctx))
+                    .child(swatches)
+                    .child(
+                        Checkbox::new(("protect", i)).label("Protected").checked(protected).on_click(move |v: &bool, _, cx| {
+                            settings::set_protected(&c2, *v);
                             cx.refresh_windows();
                         }),
-                    cx,
-                ))
-                .child(Self::row(
-                    "Startup",
-                    "What Recouvrance shows when it starts.",
-                    Self::choice("startup", s.startup, &[(Startup::Reconnect, "Reconnect previous clusters"), (Startup::Picker, "Always ask")], |v, _, cx| {
-                        settings::update(|s| s.startup = v);
-                        cx.refresh_windows();
-                    }),
-                    cx,
-                ))
-                .child(Self::row(
-                    "Initial view",
-                    "What to show after connecting.",
-                    Self::choice(
-                        "initial",
-                        s.initial_view,
-                        &[(InitialView::Pods, "Pods"), (InitialView::Workloads, "Workloads overview"), (InitialView::Cluster, "Cluster overview")],
-                        |v, _, cx| {
-                            settings::update(|s| s.initial_view = v);
-                            cx.refresh_windows();
-                        },
-                    ),
-                    cx,
-                ))
-                .child(Self::row(
-                    "Write actions",
-                    "Off by default. When on, detail pages can scale, restart, run, drain, delete and edit. Each asks first, except deletes set to Delete right away below.",
-                    {
-                        let on = crate::details::writes_enabled(cx);
-                        Checkbox::new("writes").label(if on { "Enabled" } else { "Disabled" }).checked(on).on_click(|v: &bool, _, cx| {
-                            crate::details::set_writes(*v, cx);
-                            cx.refresh_windows();
-                        })
-                    },
-                    cx,
-                ))
-                .child(Self::row(
-                    "Deleting",
-                    "What a delete asks first, for kinds not listed below. A protected context always asks for its name.",
-                    Self::choice(
-                        "del-default",
-                        s.delete_confirm,
-                        &[(DeleteConfirm::Off, "Delete right away"), (DeleteConfirm::Ask, "Ask"), (DeleteConfirm::Type, "Type the name")],
-                        |v, _, cx| {
-                            settings::update(|s| s.delete_confirm = v);
-                            cx.refresh_windows();
-                        },
-                    ),
-                    cx,
-                ))
-                .child(self.render_delete_kinds(&s, cx))
-                .into_any_element(),
-            Section::Contexts => {
-                let names = crate::k8s::load_contexts().map(|c| c.names).unwrap_or_default();
+                    )
+            }))
+            .into_any_element()
+    }
+
+    fn clusters_section(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme().clone();
+        let muted = theme.muted_foreground;
+        let rows: Vec<AnyElement> = self
+            .cluster_inputs
+            .iter()
+            .enumerate()
+            .map(|(i, (ctx, image, namespaces))| {
+                let prom = self.prometheus.iter().find(|(c, _)| c == ctx).map(|(_, i)| i.clone());
+                let off = settings::cluster(ctx).metrics_disabled;
+                let c = ctx.clone();
+                let label =
+                    |t: &str| div().w(px(170.)).flex_shrink_0().text_sm().text_color(muted).child(t.to_string());
                 v_flex()
-                    .child(div().pb_2().text_sm().text_color(muted).child(
-                        "Color a context to recognise it at a glance. Protected contexts ask you to type their name before any write. \
-                         Metrics, node shell and namespaces per cluster are under Per cluster.",
-                    ))
-                    .when(s.protect_unset, |d| {
-                        d.child(
-                            h_flex()
-                                .gap_3()
-                                .pb_2()
-                                .child(div().flex_1().text_sm().text_color(theme.danger).child(
-                                    "The protection choices could not be read, so every context not set below is protected.",
-                                ))
-                                .child(Button::new("guess-protection").small().outline().label("Guess them again").on_click(
-                                    |_, _, cx| {
-                                        settings::update(|s| s.protect_unset = false);
-                                        cx.refresh_windows();
-                                    },
-                                )),
-                        )
-                    })
-                    .children(names.into_iter().enumerate().map(|(i, ctx)| {
-                        let protected = settings::is_protected(&ctx);
-                        let current = s.context_colors.get(&ctx).cloned().unwrap_or_default();
-                        let swatches = h_flex().gap_1().children(settings::COLORS.iter().enumerate().map(|(j, (name, hex))| {
-                            let (ctx, hex_s) = (ctx.clone(), hex.to_string());
-                            let selected = current == *hex;
-                            let color: Hsla = if hex.is_empty() { theme.secondary } else { rgb(u32::from_str_radix(&hex[1..], 16).unwrap_or(0)).into() };
-                            div()
-                                .id(SharedString::from(format!("sw-{i}-{j}")))
-                                .size(px(18.))
-                                .rounded_full()
-                                .bg(color)
-                                .border_2()
-                                .border_color(if selected { theme.foreground } else { theme.border })
-                                .cursor_pointer()
-                                .tooltip({
-                                    let n = name.to_string();
-                                    move |w, cx| component::tooltip::Tooltip::new(n.clone()).build(w, cx)
-                                })
-                                .on_click(move |_, _, cx| {
-                                    let (ctx, hex) = (ctx.clone(), hex_s.clone());
-                                    settings::update(|s| {
-                                        if hex.is_empty() {
-                                            s.context_colors.remove(&ctx);
-                                        } else {
-                                            s.context_colors.insert(ctx, hex);
-                                        }
-                                    });
-                                    cx.refresh_windows();
-                                })
-                        }));
-                        let c2 = ctx.clone();
+                    .gap_2()
+                    .py_3()
+                    .border_b_1()
+                    .border_color(theme.border)
+                    .child(
                         h_flex()
-                            .gap_4()
-                            .py_2()
-                            .border_b_1()
-                            .border_color(theme.border)
-                            .child(div().flex_1().min_w_0().text_sm().child(ctx))
-                            .child(swatches)
+                            .gap_3()
+                            .child(div().text_sm().font_weight(FontWeight::MEDIUM).child(ctx.clone()))
+                            .child(div().flex_1())
                             .child(
-                                Checkbox::new(("protect", i)).label("Protected").checked(protected).on_click(move |v: &bool, _, cx| {
-                                    settings::set_protected(&c2, *v);
-                                    cx.refresh_windows();
-                                }),
-                            )
-                    }))
-                    .into_any_element()
-            }
-            Section::Clusters => {
-                let rows: Vec<AnyElement> = self
-                    .cluster_inputs
-                    .iter()
-                    .enumerate()
-                    .map(|(i, (ctx, image, namespaces))| {
-                        let prom = self.prometheus.iter().find(|(c, _)| c == ctx).map(|(_, i)| i.clone());
-                        let off = settings::cluster(ctx).metrics_disabled;
-                        let c = ctx.clone();
-                        let label = |t: &str| div().w(px(170.)).flex_shrink_0().text_sm().text_color(muted).child(t.to_string());
-                        v_flex()
-                            .gap_2()
-                            .py_3()
-                            .border_b_1()
-                            .border_color(theme.border)
-                            .child(
-                                h_flex()
-                                    .gap_3()
-                                    .child(div().text_sm().font_weight(FontWeight::MEDIUM).child(ctx.clone()))
-                                    .child(div().flex_1())
-                                    .child(Checkbox::new(("metrics-off", i)).label("Metrics off for this cluster").checked(off).on_click(move |v: &bool, _, cx| {
+                                Checkbox::new(("metrics-off", i))
+                                    .label("Metrics off for this cluster")
+                                    .checked(off)
+                                    .on_click(move |v: &bool, _, cx| {
                                         let v = *v;
-                                        settings::update(|s| s.clusters.entry(c.clone()).or_default().metrics_disabled = v);
+                                        settings::update(|s| {
+                                            s.clusters.entry(c.clone()).or_default().metrics_disabled = v;
+                                        });
                                         cx.refresh_windows();
-                                    })),
-                            )
-                            .children(prom.map(|p| h_flex().gap_2().child(label("Prometheus / VictoriaMetrics")).child(div().flex_1().child(Input::new(&p).small()))))
-                            .child(h_flex().gap_2().child(label("Node shell image")).child(div().flex_1().child(Input::new(image).small())))
-                            .child(h_flex().gap_2().child(label("Accessible namespaces")).child(div().flex_1().child(Input::new(namespaces).small())))
-                            .into_any_element()
-                    })
-                    .collect();
-                v_flex()
-                    .child(div().pb_2().text_sm().text_color(muted).child(
-                        "Metrics endpoint: found automatically; or namespace/service:port, with a path for VictoriaMetrics \
-                         (vmselect: monitoring/vmselect:8481/select/0/prometheus; single: monitoring/victoria-metrics:8428), or a full http(s) URL. \
-                         Accessible namespaces are used when you may not list namespaces: they fill the picker, and the list shows one of them at a time.",
-                    ))
-                    .children(rows)
-                    .into_any_element()
-            }
-            Section::Appearance => {
-                let mode = theme.mode;
-                let system = crate::app::follows_system(cx);
-                let (light, dark) = (!system && !mode.is_dark(), !system && mode.is_dark());
-                v_flex()
-                    .child(Self::row(
-                        "Theme",
-                        "Saved between runs. \"System\" follows your desktop.",
-                        h_flex()
-                            .gap_1()
-                            .child(Button::new("th-light").small().label("Light").selected(light).when(light, ButtonVariants::primary).when(!light, Button::outline).on_click(|_, w, cx| crate::app::set_theme(ThemeMode::Light, Some(w), cx)))
-                            .child(Button::new("th-dark").small().label("Dark").selected(dark).when(dark, ButtonVariants::primary).when(!dark, Button::outline).on_click(|_, w, cx| crate::app::set_theme(ThemeMode::Dark, Some(w), cx)))
-                            .child(Button::new("th-system").small().label("System").selected(system).when(system, ButtonVariants::primary).when(!system, Button::outline).on_click(|_, w, cx| {
-                                crate::app::forget_theme_choice();
-                                let mode = crate::app::initial_theme(cx);
-                                crate::app::apply_theme(mode, Some(w), cx);
-                            })),
-                        cx,
-                    ))
-                    .child(Self::row(
-                        "Accent color",
-                        "Links, highlights and selection.",
-                        h_flex().gap_1().children(settings::ACCENTS.iter().enumerate().map(|(i, (name, dark, light))| {
-                            let n = name.to_string();
-                            let selected = s.accent == *name;
-                            div()
-                                .id(("accent", i))
-                                .size(px(22.))
-                                .rounded_full()
-                                .bg(rgb(if mode.is_dark() { *dark } else { *light }))
-                                .border_2()
-                                .border_color(if selected { theme.foreground } else { theme.border })
-                                .cursor_pointer()
-                                .tooltip({
-                                    let n = n.clone();
-                                    move |w, cx| component::tooltip::Tooltip::new(n.clone()).build(w, cx)
-                                })
-                                .on_click(move |_, w, cx| {
-                                    let n = n.clone();
-                                    settings::update(|s| s.accent = n);
-                                    let mode = cx.theme().mode;
-                                    crate::app::apply_theme(mode, Some(w), cx);
-                                })
-                        })),
-                        cx,
-                    ))
-                    .child(Self::row(
-                        "Zoom",
-                        "Also Ctrl + / Ctrl - / Ctrl 0.",
+                                    }),
+                            ),
+                    )
+                    .children(prom.map(|p| {
                         h_flex()
                             .gap_2()
-                            .child(Button::new("z-out").small().outline().icon(Lucide::ZoomOut).on_click(|_, w, cx| crate::app::set_zoom(crate::app::zoom(cx) - 0.1, w, cx)))
-                            .child(div().w(px(48.)).text_sm().text_center().child(format!("{:.0}%", crate::app::zoom(cx) * 100.)))
-                            .child(Button::new("z-in").small().outline().icon(Lucide::ZoomIn).on_click(|_, w, cx| crate::app::set_zoom(crate::app::zoom(cx) + 0.1, w, cx)))
-                            .child(Button::new("z-reset").small().ghost().label("Reset").on_click(|_, w, cx| crate::app::set_zoom(1.0, w, cx))),
-                        cx,
-                    ))
-                    .into_any_element()
-            }
-            Section::Refresh => v_flex()
-                .child(div().pb_2().text_sm().text_color(muted).child(
-                    "Tables are live (Kubernetes watches) and never poll. These intervals control everything that is polled.",
-                ))
-                .child(Self::row("Metrics", "Seconds between CPU/memory updates (metrics-server).", number_input(&self.metrics), cx))
-                .child(Self::row("Detail pages", "Seconds between refreshes of an open object.", number_input(&self.detail), cx))
-                .child(Self::row("Overviews", "Minimum seconds between overview refreshes; very large clusters wait longer.", number_input(&self.overview), cx))
-                .into_any_element(),
-            Section::Logs => v_flex()
-                .child(Self::row("Initial lines", "How many recent lines to fetch when logs open.", number_input(&self.tail), cx))
-                .child(Self::row(
-                    "Timestamps",
-                    "Show the time column.",
-                    Checkbox::new("log-ts").checked(s.log_timestamps).on_click(|v: &bool, _, cx| {
-                        let v = *v;
-                        settings::update(|s| s.log_timestamps = v);
-                        cx.refresh_windows();
-                    }),
-                    cx,
-                ))
-                .into_any_element(),
-            Section::Kubeconfig => self.kubeconfig.clone().into_any_element(),
-            Section::Agents => v_flex()
-                .child(Self::row(
-                    "MCP server",
-                    "Agents connect to http://127.0.0.1:<port>/mcp. Port changes apply after restarting Recouvrance.",
-                    v_flex().items_end().gap_1().child(number_input(&self.mcp_port)).when_some(
-                        self.mcp_port_error.clone(),
-                        |d, e| d.child(div().text_xs().text_color(theme.danger).child(e)),
-                    ),
-                    cx,
-                ))
-                .child(Self::row(
-                    "Agent access",
-                    "The kill switch; same as on the Agents page.",
-                    {
-                        let on = self.hub.agents_enabled();
-                        let hub = self.hub.clone();
-                        Checkbox::new("agents-on").label(if on { "On" } else { "Off" }).checked(on).on_click(move |v: &bool, window, cx| {
-                            // The switch still applies to this session; say it won't survive a restart.
-                            if let Err(e) = hub.set_agents_enabled(*v) {
-                                use gpui_kit::component::{WindowExt as _, notification::Notification};
-                                window.push_notification(Notification::error(format!("Agent access not saved: {e:#}")), cx);
-                            }
-                            cx.refresh_windows();
-                        })
-                    },
-                    cx,
-                ))
-                .into_any_element(),
-            Section::Assistant => {
-                let block = |label: &str, hint: &str, input: &Entity<TextareaState>| {
-                    v_flex()
-                        .gap_1()
-                        .py_3()
-                        .border_b_1()
-                        .border_color(theme.border)
-                        .child(div().text_sm().font_weight(FontWeight::MEDIUM).child(label.to_string()))
-                        .child(div().text_xs().text_color(muted).child(hint.to_string()))
-                        .child(div().pt_1().child(Textarea::new(input).small()))
-                };
-                let missing: Vec<String> = s
-                    .assistant_repos
-                    .iter()
-                    .filter(|r| !crate::paths::expand(r).is_dir())
-                    .cloned()
-                    .collect();
-                v_flex()
-                    .child(div().pb_2().text_sm().text_color(muted).child(
-                        "The assistant reads the clusters with Recouvrance's tools (objects, events, logs, Prometheus usage) under its agent rules. \
-                         Tell it what only your team knows; it reads this with every question, and \"Investigate\" on a broken pod or workload starts from it.",
-                    ))
-                    .child(block(
-                        "Team notes",
-                        "Where things run, dashboards and log search links, runbooks, which repository holds which namespace, conventions. Plain text.",
-                        &self.notes,
-                    ))
-                    .child(block(
-                        "Code folders",
-                        "Local clones of your services and charts, one folder a line. With Claude Code only: it may read and search them (Read, Grep, Glob), nothing outside them, and never writes.",
-                        &self.repos,
-                    ))
-                    .when(!missing.is_empty(), |d| {
-                        d.child(div().pt_1().text_sm().text_color(theme.warning).child(format!("Not a folder, skipped: {}", missing.join(", "))))
-                    })
-                    .into_any_element()
-            }
-            Section::Plugins => {
-                let (plugins, error) = cx.try_global::<crate::plugins::Loaded>().map(|l| (l.0.clone(), l.1.clone())).unwrap_or_default();
-                v_flex()
-                    .gap_3()
-                    .child(div().text_sm().text_color(muted).child(
-                        "Your own commands as actions on resources. They appear on detail pages of the kinds they name. \
-                         $CONTEXT, $NAMESPACE, $NAME and $KIND are filled in; kubectl already points at the right cluster.",
-                    ))
+                            .child(label("Prometheus / VictoriaMetrics"))
+                            .child(div().flex_1().child(Input::new(&p).small()))
+                    }))
                     .child(
                         h_flex()
                             .gap_2()
-                            .child(div().text_sm().font_family(theme.mono_font_family.clone()).child(crate::plugins::path().display().to_string()))
-                            .child(Button::new("plugins-reload").small().ghost().icon(Lucide::RefreshCw).label("Reload").on_click(|_, _, cx| {
+                            .child(label("Node shell image"))
+                            .child(div().flex_1().child(Input::new(image).small())),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .child(label("Accessible namespaces"))
+                            .child(div().flex_1().child(Input::new(namespaces).small())),
+                    )
+                    .into_any_element()
+            })
+            .collect();
+        v_flex()
+            .child(div().pb_2().text_sm().text_color(muted).child(
+                "Metrics endpoint: found automatically; or namespace/service:port, with a path for VictoriaMetrics \
+                 (vmselect: monitoring/vmselect:8481/select/0/prometheus; single: monitoring/victoria-metrics:8428), or a full http(s) URL. \
+                 Accessible namespaces are used when you may not list namespaces: they fill the picker, and the list shows one of them at a time.",
+            ))
+            .children(rows)
+            .into_any_element()
+    }
+
+    fn appearance_section(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let s = settings::get();
+        let theme = cx.theme().clone();
+        let mode = theme.mode;
+        let system = crate::app::follows_system(cx);
+        let (light, dark) = (!system && !mode.is_dark(), !system && mode.is_dark());
+        v_flex()
+            .child(Self::row(
+                "Theme",
+                "Saved between runs. \"System\" follows your desktop.",
+                h_flex()
+                    .gap_1()
+                    .child(
+                        Button::new("th-light")
+                            .small()
+                            .label("Light")
+                            .selected(light)
+                            .when(light, ButtonVariants::primary)
+                            .when(!light, Button::outline)
+                            .on_click(|_, w, cx| crate::app::set_theme(ThemeMode::Light, Some(w), cx)),
+                    )
+                    .child(
+                        Button::new("th-dark")
+                            .small()
+                            .label("Dark")
+                            .selected(dark)
+                            .when(dark, ButtonVariants::primary)
+                            .when(!dark, Button::outline)
+                            .on_click(|_, w, cx| crate::app::set_theme(ThemeMode::Dark, Some(w), cx)),
+                    )
+                    .child(
+                        Button::new("th-system")
+                            .small()
+                            .label("System")
+                            .selected(system)
+                            .when(system, ButtonVariants::primary)
+                            .when(!system, Button::outline)
+                            .on_click(|_, w, cx| {
+                                crate::app::forget_theme_choice();
+                                let mode = crate::app::initial_theme(cx);
+                                crate::app::apply_theme(mode, Some(w), cx);
+                            }),
+                    ),
+                cx,
+            ))
+            .child(Self::row(
+                "Accent color",
+                "Links, highlights and selection.",
+                h_flex().gap_1().children(settings::ACCENTS.iter().enumerate().map(|(i, (name, dark, light))| {
+                    let n = name.to_string();
+                    let selected = s.accent == *name;
+                    div()
+                        .id(("accent", i))
+                        .size(px(22.))
+                        .rounded_full()
+                        .bg(rgb(if mode.is_dark() { *dark } else { *light }))
+                        .border_2()
+                        .border_color(if selected { theme.foreground } else { theme.border })
+                        .cursor_pointer()
+                        .tooltip({
+                            let n = n.clone();
+                            move |w, cx| component::tooltip::Tooltip::new(n.clone()).build(w, cx)
+                        })
+                        .on_click(move |_, w, cx| {
+                            let n = n.clone();
+                            settings::update(|s| s.accent = n);
+                            let mode = cx.theme().mode;
+                            crate::app::apply_theme(mode, Some(w), cx);
+                        })
+                })),
+                cx,
+            ))
+            .child(Self::row(
+                "Zoom",
+                "Also Ctrl + / Ctrl - / Ctrl 0.",
+                h_flex()
+                    .gap_2()
+                    .child(
+                        Button::new("z-out")
+                            .small()
+                            .outline()
+                            .icon(Lucide::ZoomOut)
+                            .on_click(|_, w, cx| crate::app::set_zoom(crate::app::zoom(cx) - 0.1, w, cx)),
+                    )
+                    .child(
+                        div().w(px(48.)).text_sm().text_center().child(format!("{:.0}%", crate::app::zoom(cx) * 100.)),
+                    )
+                    .child(
+                        Button::new("z-in")
+                            .small()
+                            .outline()
+                            .icon(Lucide::ZoomIn)
+                            .on_click(|_, w, cx| crate::app::set_zoom(crate::app::zoom(cx) + 0.1, w, cx)),
+                    )
+                    .child(
+                        Button::new("z-reset")
+                            .small()
+                            .ghost()
+                            .label("Reset")
+                            .on_click(|_, w, cx| crate::app::set_zoom(1.0, w, cx)),
+                    ),
+                cx,
+            ))
+            .into_any_element()
+    }
+
+    fn refresh_section(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme().clone();
+        let muted = theme.muted_foreground;
+        let number_input = |e: &Entity<InputState>| div().w(px(110.)).child(Input::new(e).small());
+        v_flex()
+        .child(div().pb_2().text_sm().text_color(muted).child(
+            "Tables are live (Kubernetes watches) and never poll. These intervals control everything that is polled.",
+        ))
+        .child(Self::row("Metrics", "Seconds between CPU/memory updates (metrics-server).", number_input(&self.metrics), cx))
+        .child(Self::row("Detail pages", "Seconds between refreshes of an open object.", number_input(&self.detail), cx))
+        .child(Self::row("Overviews", "Minimum seconds between overview refreshes; very large clusters wait longer.", number_input(&self.overview), cx))
+        .into_any_element()
+    }
+
+    fn logs_section(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let s = settings::get();
+        let number_input = |e: &Entity<InputState>| div().w(px(110.)).child(Input::new(e).small());
+        v_flex()
+            .child(Self::row(
+                "Initial lines",
+                "How many recent lines to fetch when logs open.",
+                number_input(&self.tail),
+                cx,
+            ))
+            .child(Self::row(
+                "Timestamps",
+                "Show the time column.",
+                Checkbox::new("log-ts").checked(s.log_timestamps).on_click(|v: &bool, _, cx| {
+                    let v = *v;
+                    settings::update(|s| s.log_timestamps = v);
+                    cx.refresh_windows();
+                }),
+                cx,
+            ))
+            .into_any_element()
+    }
+
+    fn kubeconfig_section(&mut self) -> AnyElement {
+        self.kubeconfig.clone().into_any_element()
+    }
+
+    fn agents_section(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme().clone();
+        let number_input = |e: &Entity<InputState>| div().w(px(110.)).child(Input::new(e).small());
+        v_flex()
+            .child(Self::row(
+                "MCP server",
+                "Agents connect to http://127.0.0.1:<port>/mcp. Port changes apply after restarting Recouvrance.",
+                v_flex()
+                    .items_end()
+                    .gap_1()
+                    .child(number_input(&self.mcp_port))
+                    .when_some(self.mcp_port_error.clone(), |d, e| {
+                        d.child(div().text_xs().text_color(theme.danger).child(e))
+                    }),
+                cx,
+            ))
+            .child(Self::row(
+                "Agent access",
+                "The kill switch; same as on the Agents page.",
+                {
+                    let on = self.hub.agents_enabled();
+                    let hub = self.hub.clone();
+                    Checkbox::new("agents-on").label(if on { "On" } else { "Off" }).checked(on).on_click(
+                        move |v: &bool, window, cx| {
+                            // The switch still applies to this session; say it won't survive a restart.
+                            if let Err(e) = hub.set_agents_enabled(*v) {
+                                use gpui_kit::component::{WindowExt as _, notification::Notification};
+                                window.push_notification(
+                                    Notification::error(format!("Agent access not saved: {e:#}")),
+                                    cx,
+                                );
+                            }
+                            cx.refresh_windows();
+                        },
+                    )
+                },
+                cx,
+            ))
+            .into_any_element()
+    }
+
+    fn assistant_section(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let s = settings::get();
+        let theme = cx.theme().clone();
+        let muted = theme.muted_foreground;
+        let block = |label: &str, hint: &str, input: &Entity<TextareaState>| {
+            v_flex()
+                .gap_1()
+                .py_3()
+                .border_b_1()
+                .border_color(theme.border)
+                .child(div().text_sm().font_weight(FontWeight::MEDIUM).child(label.to_string()))
+                .child(div().text_xs().text_color(muted).child(hint.to_string()))
+                .child(div().pt_1().child(Textarea::new(input).small()))
+        };
+        let missing: Vec<String> =
+            s.assistant_repos.iter().filter(|r| !crate::paths::expand(r).is_dir()).cloned().collect();
+        v_flex()
+            .child(div().pb_2().text_sm().text_color(muted).child(
+                "The assistant reads the clusters with Recouvrance's tools (objects, events, logs, Prometheus usage) under its agent rules. \
+                 Tell it what only your team knows; it reads this with every question, and \"Investigate\" on a broken pod or workload starts from it.",
+            ))
+            .child(block(
+                "Team notes",
+                "Where things run, dashboards and log search links, runbooks, which repository holds which namespace, conventions. Plain text.",
+                &self.notes,
+            ))
+            .child(block(
+                "Code folders",
+                "Local clones of your services and charts, one folder a line. With Claude Code only: it may read and search them (Read, Grep, Glob), nothing outside them, and never writes.",
+                &self.repos,
+            ))
+            .when(!missing.is_empty(), |d| {
+                d.child(div().pt_1().text_sm().text_color(theme.warning).child(format!("Not a folder, skipped: {}", missing.join(", "))))
+            })
+            .into_any_element()
+    }
+
+    fn plugins_section(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme().clone();
+        let muted = theme.muted_foreground;
+        let (plugins, error) =
+            cx.try_global::<crate::plugins::Loaded>().map(|l| (l.0.clone(), l.1.clone())).unwrap_or_default();
+        v_flex()
+            .gap_3()
+            .child(div().text_sm().text_color(muted).child(
+                "Your own commands as actions on resources. They appear on detail pages of the kinds they name. \
+                 $CONTEXT, $NAMESPACE, $NAME and $KIND are filled in; kubectl already points at the right cluster.",
+            ))
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_family(theme.mono_font_family.clone())
+                            .child(crate::plugins::path().display().to_string()),
+                    )
+                    .child(
+                        Button::new("plugins-reload").small().ghost().icon(Lucide::RefreshCw).label("Reload").on_click(
+                            |_, _, cx| {
                                 crate::plugins::reload(cx);
                                 cx.refresh_windows();
-                            })),
-                    )
-                    .when_some(error, |d, e| d.child(div().text_sm().text_color(theme.danger).child(format!("Could not load: {e}"))))
-                    .child(if plugins.is_empty() {
-                        div().text_sm().text_color(muted).child("No plugins yet.").into_any_element()
-                    } else {
-                        v_flex()
-                            .children(plugins.iter().map(|p| {
-                                h_flex()
-                                    .gap_3()
-                                    .py_1p5()
-                                    .border_b_1()
-                                    .border_color(theme.border)
-                                    .child(div().w(px(200.)).text_sm().font_weight(FontWeight::MEDIUM).child(p.name.clone()))
-                                    .child(div().w(px(220.)).text_xs().text_color(muted).child(if p.kinds.is_empty() { "all kinds".to_string() } else { p.kinds.join(", ") }))
-                                    .child(div().flex_1().min_w_0().text_xs().font_family(theme.mono_font_family.clone()).overflow_hidden().text_ellipsis().whitespace_nowrap().child(p.command.clone()))
-                                    .child(div().w(px(90.)).text_xs().text_color(muted).child(match p.mode {
-                                        crate::plugins::Mode::Terminal => "terminal",
-                                        crate::plugins::Mode::Background => "background",
-                                    }))
-                            }))
-                            .into_any_element()
-                    })
-                    .child(div().pt_2().text_sm().font_weight(FontWeight::MEDIUM).child("Example"))
-                    .child(div().p_2().rounded_md().bg(theme.secondary).font_family(theme.mono_font_family.clone()).text_xs().children(crate::plugins::EXAMPLE.lines().map(|l| div().whitespace_nowrap().child(l.to_string()))))
-                    .into_any_element()
-            }
-            Section::Shortcuts => {
-                let keys = [
-                    ("Ctrl K", "Command palette: resources, pages, objects across clusters"),
-                    ("Ctrl F  or  /", "Filter the current table"),
-                    ("Esc", "Back from a detail page"),
-                    ("↑ ↓  then  Enter", "Move in a table, open the row"),
-                    ("Ctrl Shift N", "New window (shares agents and settings)"),
-                    ("Ctrl T / Ctrl W", "New tab / close tab (right-click a row: open in new tab)"),
-                    ("Ctrl Tab / Ctrl Shift Tab", "Next / previous tab"),
-                    ("Ctrl B", "Hide or show the sidebar"),
-                    ("F5  or  Ctrl R", "Refresh the page"),
-                    ("Alt ← / Alt →", "Back / forward"),
-                    ("Ctrl + / Ctrl - / Ctrl 0", "Zoom in / out / reset"),
-                    ("Right-click a row", "Open, logs, shell, YAML, events, run, scale, restart, delete"),
-                    ("Ctrl Shift V", "Paste in a shell"),
-                    ("Double-click a context", "Connect to just that context"),
-                ];
+                            },
+                        ),
+                    ),
+            )
+            .when_some(error, |d, e| {
+                d.child(div().text_sm().text_color(theme.danger).child(format!("Could not load: {e}")))
+            })
+            .child(if plugins.is_empty() {
+                div().text_sm().text_color(muted).child("No plugins yet.").into_any_element()
+            } else {
                 v_flex()
-                    .children(keys.into_iter().map(|(k, what)| {
-                        h_flex()
-                            .gap_4()
-                            .py_2()
-                            .border_b_1()
-                            .border_color(theme.border)
-                            .child(div().w(px(220.)).child(div().px_2().py_0p5().rounded_md().bg(theme.secondary).text_xs().font_family(theme.mono_font_family.clone()).child(k)))
-                            .child(div().text_sm().child(what))
-                    }))
-                    .into_any_element()
-            }
-            Section::Requests => {
-                use crate::k8s::meter;
-                let ms = |d: std::time::Duration| format!("{} ms", d.as_millis());
-                let rows = meter::snapshot();
-                let cell = |w: f32, text: String| div().w(px(w)).flex_shrink_0().child(text);
-                let header = h_flex()
-                    .gap_3()
-                    .py_1()
-                    .text_xs()
-                    .text_color(muted)
-                    .border_b_1()
-                    .border_color(theme.border)
-                    .child(cell(170., "Cluster".into()))
-                    .child(cell(160., "Requests to".into()))
-                    .child(cell(80., "Count".into()))
-                    .child(cell(70., "Failed".into()))
-                    .child(cell(90., "Average".into()))
-                    .child(cell(90., "Slowest".into()))
-                    .child(cell(90., "Last".into()));
-                v_flex()
-                    .child(div().pb_2().text_sm().text_color(muted).child(
-                        "How long the API servers take to start answering, since Recouvrance started (watches and log streams count until they open). Failed: an error status, a timeout or no connection.",
-                    ))
-                    .child(header)
-                    .children(rows.iter().map(|(ctx, class, s)| {
+                    .children(plugins.iter().map(|p| {
                         h_flex()
                             .gap_3()
-                            .py_1()
-                            .text_sm()
+                            .py_1p5()
                             .border_b_1()
                             .border_color(theme.border)
-                            .child(cell(170., ctx.clone()).overflow_hidden().text_ellipsis().whitespace_nowrap())
-                            .child(cell(160., class.label().into()))
-                            .child(cell(80., s.count.to_string()))
-                            .child(cell(70., s.errors.to_string()).when(s.errors > 0, |d| d.text_color(theme.warning)))
-                            .child(cell(90., ms(s.average())))
-                            .child(cell(90., ms(s.slowest)))
-                            .child(cell(90., ms(s.last)))
+                            .child(div().w(px(200.)).text_sm().font_weight(FontWeight::MEDIUM).child(p.name.clone()))
+                            .child(div().w(px(220.)).text_xs().text_color(muted).child(if p.kinds.is_empty() {
+                                "all kinds".to_string()
+                            } else {
+                                p.kinds.join(", ")
+                            }))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .text_xs()
+                                    .font_family(theme.mono_font_family.clone())
+                                    .overflow_hidden()
+                                    .text_ellipsis()
+                                    .whitespace_nowrap()
+                                    .child(p.command.clone()),
+                            )
+                            .child(div().w(px(90.)).text_xs().text_color(muted).child(match p.mode {
+                                crate::plugins::Mode::Terminal => "terminal",
+                                crate::plugins::Mode::Background => "background",
+                            }))
                     }))
-                    .when(rows.is_empty(), |d| d.child(div().py_2().text_sm().text_color(muted).child("No requests yet.")))
-                    .child(h_flex().pt_3().child(Button::new("meter-reset").small().outline().label("Reset").on_click(
-                        cx.listener(|_, _, _, cx| {
-                            meter::reset();
-                            cx.notify();
-                        }),
-                    )))
                     .into_any_element()
-            }
-            Section::About => {
-                let _ = window;
-                v_flex()
-                    .gap_2()
-                    .child(h_flex().gap_2().child(super::logo(px(40.))).child(div().text_2xl().font_weight(FontWeight::BOLD).child("Recouvrance")))
-                    .child(div().text_sm().text_color(muted).child(format!("Version {}", env!("CARGO_PKG_VERSION"))))
-                    .child(div().text_sm().child("A native Kubernetes client in Rust (gpui), with a local MCP server for AI agents."))
-                    .child(div().text_sm().text_color(muted).child(
-                        "Installed with the install script: update with recouvrance-update. Releases: github.com/nahuel11500/recouvrance/releases",
-                    ))
-                    .child(div().pt_3().text_xs().text_color(muted).child("Settings: ~/.config/recouvrance/ · Agent activity: ~/.local/share/recouvrance/audit.jsonl"))
-                    .into_any_element()
-            }
-        }
+            })
+            .child(div().pt_2().text_sm().font_weight(FontWeight::MEDIUM).child("Example"))
+            .child(
+                div()
+                    .p_2()
+                    .rounded_md()
+                    .bg(theme.secondary)
+                    .font_family(theme.mono_font_family.clone())
+                    .text_xs()
+                    .children(crate::plugins::EXAMPLE.lines().map(|l| div().whitespace_nowrap().child(l.to_string()))),
+            )
+            .into_any_element()
+    }
+
+    fn shortcuts_section(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme().clone();
+        let keys = [
+            ("Ctrl K", "Command palette: resources, pages, objects across clusters"),
+            ("Ctrl F  or  /", "Filter the current table"),
+            ("Esc", "Back from a detail page"),
+            ("↑ ↓  then  Enter", "Move in a table, open the row"),
+            ("Ctrl Shift N", "New window (shares agents and settings)"),
+            ("Ctrl T / Ctrl W", "New tab / close tab (right-click a row: open in new tab)"),
+            ("Ctrl Tab / Ctrl Shift Tab", "Next / previous tab"),
+            ("Ctrl B", "Hide or show the sidebar"),
+            ("F5  or  Ctrl R", "Refresh the page"),
+            ("Alt ← / Alt →", "Back / forward"),
+            ("Ctrl + / Ctrl - / Ctrl 0", "Zoom in / out / reset"),
+            ("Right-click a row", "Open, logs, shell, YAML, events, run, scale, restart, delete"),
+            ("Ctrl Shift V", "Paste in a shell"),
+            ("Double-click a context", "Connect to just that context"),
+        ];
+        v_flex()
+            .children(keys.into_iter().map(|(k, what)| {
+                h_flex()
+                    .gap_4()
+                    .py_2()
+                    .border_b_1()
+                    .border_color(theme.border)
+                    .child(
+                        div().w(px(220.)).child(
+                            div()
+                                .px_2()
+                                .py_0p5()
+                                .rounded_md()
+                                .bg(theme.secondary)
+                                .text_xs()
+                                .font_family(theme.mono_font_family.clone())
+                                .child(k),
+                        ),
+                    )
+                    .child(div().text_sm().child(what))
+            }))
+            .into_any_element()
+    }
+
+    fn requests_section(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme().clone();
+        let muted = theme.muted_foreground;
+        use crate::k8s::meter;
+        let ms = |d: std::time::Duration| format!("{} ms", d.as_millis());
+        let rows = meter::snapshot();
+        let cell = |w: f32, text: String| div().w(px(w)).flex_shrink_0().child(text);
+        let header = h_flex()
+            .gap_3()
+            .py_1()
+            .text_xs()
+            .text_color(muted)
+            .border_b_1()
+            .border_color(theme.border)
+            .child(cell(170., "Cluster".into()))
+            .child(cell(160., "Requests to".into()))
+            .child(cell(80., "Count".into()))
+            .child(cell(70., "Failed".into()))
+            .child(cell(90., "Average".into()))
+            .child(cell(90., "Slowest".into()))
+            .child(cell(90., "Last".into()));
+        v_flex()
+            .child(div().pb_2().text_sm().text_color(muted).child(
+                "How long the API servers take to start answering, since Recouvrance started (watches and log streams count until they open). Failed: an error status, a timeout or no connection.",
+            ))
+            .child(header)
+            .children(rows.iter().map(|(ctx, class, s)| {
+                h_flex()
+                    .gap_3()
+                    .py_1()
+                    .text_sm()
+                    .border_b_1()
+                    .border_color(theme.border)
+                    .child(cell(170., ctx.clone()).overflow_hidden().text_ellipsis().whitespace_nowrap())
+                    .child(cell(160., class.label().into()))
+                    .child(cell(80., s.count.to_string()))
+                    .child(cell(70., s.errors.to_string()).when(s.errors > 0, |d| d.text_color(theme.warning)))
+                    .child(cell(90., ms(s.average())))
+                    .child(cell(90., ms(s.slowest)))
+                    .child(cell(90., ms(s.last)))
+            }))
+            .when(rows.is_empty(), |d| d.child(div().py_2().text_sm().text_color(muted).child("No requests yet.")))
+            .child(h_flex().pt_3().child(Button::new("meter-reset").small().outline().label("Reset").on_click(
+                cx.listener(|_, _, _, cx| {
+                    meter::reset();
+                    cx.notify();
+                }),
+            )))
+            .into_any_element()
+    }
+
+    fn about_section(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme().clone();
+        let muted = theme.muted_foreground;
+        let _ = window;
+        v_flex()
+            .gap_2()
+            .child(h_flex().gap_2().child(super::logo(px(40.))).child(div().text_2xl().font_weight(FontWeight::BOLD).child("Recouvrance")))
+            .child(div().text_sm().text_color(muted).child(format!("Version {}", env!("CARGO_PKG_VERSION"))))
+            .child(div().text_sm().child("A native Kubernetes client in Rust (gpui), with a local MCP server for AI agents."))
+            .child(div().text_sm().text_color(muted).child(
+                "Installed with the install script: update with recouvrance-update. Releases: github.com/nahuel11500/recouvrance/releases",
+            ))
+            .child(div().pt_3().text_xs().text_color(muted).child("Settings: ~/.config/recouvrance/ · Agent activity: ~/.local/share/recouvrance/audit.jsonl"))
+            .into_any_element()
     }
 }
 
