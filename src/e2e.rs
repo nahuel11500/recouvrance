@@ -368,50 +368,6 @@ fn an_agent_rolls_back_a_deployment() {
     });
 }
 
-/// Helm releases are read from their Secrets: denied by a Deny on secrets, listed with the
-/// chart otherwise, and their secret-looking values masked unless the agent may reveal.
-#[test]
-#[ignore]
-fn an_agent_reads_helm_releases_by_its_secret_rules() {
-    use k8s_openapi::api::core::v1::Secret;
-
-    run(async {
-        let ctx = context();
-        let secrets: Api<Secret> = Api::namespaced(k8s::connect_for_agents(ctx.clone()).await?, NS);
-        let (release, name) = ("e2e-chart", "sh.helm.release.v1.e2e-chart.v1");
-        let _ = secrets.delete(name, &DeleteParams::default()).await;
-        let mut payload = crate::helm::tests::payload(release, NS, 1);
-        payload["config"] = json!({"db": {"password": "hunter2", "host": "db.local"}});
-        secrets
-            .create(&PostParams::default(), &crate::helm::tests::helm_secret((name, NS, release), &payload, true))
-            .await?;
-        let checked = async {
-            let (hub, agent, token, _server) = agent(&["get,list *"], &["* secrets"]).await?;
-            let mcp = crate::assistant::Mcp::connect(hub.port(), token).await?;
-            let list = json!({"context": ctx, "namespace": NS});
-            let out = mcp.call("list_helm_releases", list.clone()).await;
-            assert!(out.contains("Denied"), "{out}");
-
-            hub.update_agent(&agent.id, |a| a.policy.rules.retain(|r| r.effect != Mode::Deny))?;
-            let out = mcp.call("list_helm_releases", list).await;
-            assert!(out.contains(release) && out.contains("c-1.0.0"), "{out}");
-            let out = mcp.call("helm_history", json!({"context": ctx, "namespace": NS, "name": release})).await;
-            assert!(out.contains("deployed"), "{out}");
-            let values = json!({"context": ctx, "namespace": NS, "name": release});
-            let out = mcp.call("helm_get_values", values.clone()).await;
-            assert!(out.contains("db.local") && !out.contains("hunter2"), "{out}");
-            let reveal = rules_file::parse_rule(Mode::Allow, "reveal secrets -n default")?;
-            hub.update_agent(&agent.id, |a| a.policy.rules.push(reveal))?;
-            let out = mcp.call("helm_get_values", values).await;
-            assert!(out.contains("hunter2"), "{out}");
-            Ok(())
-        };
-        let result: Result<()> = checked.await;
-        secrets.delete(name, &DeleteParams::default()).await?;
-        result
-    });
-}
-
 /// Running a CronJob now needs apply on jobs; a debug container needs exec on the pod, and
 /// the agent then runs commands in it.
 #[test]
@@ -561,6 +517,46 @@ fn an_agent_cordons_a_node_with_its_drain_rule() {
         let result: Result<()> = checked.await;
         let patch = Patch::Merge(json!({"spec": {"unschedulable": false}}));
         nodes.patch(&node, &PatchParams::default(), &patch).await?;
+/// Helm releases are read from their Secrets: denied by a Deny on secrets, listed with the
+/// chart otherwise, and their secret-looking values masked unless the agent may reveal.
+#[test]
+#[ignore]
+fn an_agent_reads_helm_releases_by_its_secret_rules() {
+    use k8s_openapi::api::core::v1::Secret;
+
+    run(async {
+        let ctx = context();
+        let secrets: Api<Secret> = Api::namespaced(k8s::connect_for_agents(ctx.clone()).await?, NS);
+        let (release, name) = ("e2e-chart", "sh.helm.release.v1.e2e-chart.v1");
+        let _ = secrets.delete(name, &DeleteParams::default()).await;
+        let mut payload = crate::helm::tests::payload(release, NS, 1);
+        payload["config"] = json!({"db": {"password": "hunter2", "host": "db.local"}});
+        secrets
+            .create(&PostParams::default(), &crate::helm::tests::helm_secret((name, NS, release), &payload, true))
+            .await?;
+        let checked = async {
+            let (hub, agent, token, _server) = agent(&["get,list *"], &["* secrets"]).await?;
+            let mcp = crate::assistant::Mcp::connect(hub.port(), token).await?;
+            let list = json!({"context": ctx, "namespace": NS});
+            let out = mcp.call("list_helm_releases", list.clone()).await;
+            assert!(out.contains("Denied"), "{out}");
+
+            hub.update_agent(&agent.id, |a| a.policy.rules.retain(|r| r.effect != Mode::Deny))?;
+            let out = mcp.call("list_helm_releases", list).await;
+            assert!(out.contains(release) && out.contains("c-1.0.0"), "{out}");
+            let out = mcp.call("helm_history", json!({"context": ctx, "namespace": NS, "name": release})).await;
+            assert!(out.contains("deployed"), "{out}");
+            let values = json!({"context": ctx, "namespace": NS, "name": release});
+            let out = mcp.call("helm_get_values", values.clone()).await;
+            assert!(out.contains("db.local") && !out.contains("hunter2"), "{out}");
+            let reveal = rules_file::parse_rule(Mode::Allow, "reveal secrets -n default")?;
+            hub.update_agent(&agent.id, |a| a.policy.rules.push(reveal))?;
+            let out = mcp.call("helm_get_values", values).await;
+            assert!(out.contains("hunter2"), "{out}");
+            Ok(())
+        };
+        let result: Result<()> = checked.await;
+        secrets.delete(name, &DeleteParams::default()).await?;
         result
     });
 }
