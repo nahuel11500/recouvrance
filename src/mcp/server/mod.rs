@@ -24,6 +24,7 @@ use super::{Access, Agent, Answer, AuditEntry, Decision, Hub, HubEvent, Mode, Po
 use crate::k8s::{self, Kind, TaskGuard};
 
 mod read_tools;
+mod rollout_tools;
 mod write_tools;
 
 /// Set by the auth middleware for every authenticated request.
@@ -162,7 +163,7 @@ fn describe(a: &Access) -> String {
 
 /// Arguments that change what a call does, for the approval banner: what the user
 /// approves is what runs. Values come from the (redacted) logged arguments.
-const KEY_ARGS: [&str; 6] = ["command", "patch", "replicas", "action", "container", "dry_run"];
+const KEY_ARGS: [&str; 7] = ["command", "patch", "replicas", "action", "container", "to_revision", "dry_run"];
 /// Most log bytes one `get_logs` call returns.
 const MAX_LOG_BYTES: i64 = 1024 * 1024;
 /// The banner scrolls; this only bounds pathological inputs.
@@ -831,7 +832,7 @@ impl KubeMcp {
     }
 }
 
-#[tool_handler(router = (Self::read_tools() + Self::write_tools()))]
+#[tool_handler(router = (Self::read_tools() + Self::write_tools() + Self::rollout_tools()))]
 #[prompt_handler]
 impl ServerHandler for KubeMcp {
     fn get_info(&self) -> ServerConfig {

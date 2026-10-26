@@ -300,23 +300,9 @@ pub(super) async fn fetch_related(
                 related.usage =
                     k8s::container_usage(client.clone(), ns.clone(), Some(sel.clone())).await.unwrap_or_default();
             }
-            if kind.is("apps", "StatefulSet") || kind.is("apps", "DaemonSet") {
-                let uid = obj.pointer("/metadata/uid").and_then(|v| v.as_str()).unwrap_or_default().to_string();
-                let revisions = k8s::controller_revisions(client.clone(), ns.clone(), uid).await;
+            if kind.is("apps", "StatefulSet") || kind.is("apps", "DaemonSet") || kind.is("apps", "Deployment") {
+                let revisions = k8s::rollouts::revisions(client, kind, ns, obj).await;
                 related.revisions = related.noted("revisions", revisions);
-            }
-            if kind.is("apps", "Deployment") {
-                let uid = obj.pointer("/metadata/uid").and_then(|v| v.as_str()).unwrap_or_default().to_string();
-                let sets = k8s::list_values(client, k8s::ar_of::<apps::ReplicaSet>(), Some(ns), Some(sel)).await;
-                related.revisions = related
-                    .noted("revisions", sets)
-                    .into_iter()
-                    .filter(|rs| {
-                        rs.pointer("/metadata/ownerReferences")
-                            .and_then(|o| o.as_array())
-                            .is_some_and(|o| o.iter().any(|r| r["uid"].as_str() == Some(uid.as_str())))
-                    })
-                    .collect();
             }
         }
     } else if kind.is("", "Service") {

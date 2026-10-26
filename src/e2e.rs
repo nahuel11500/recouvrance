@@ -279,3 +279,67 @@ fn shells_and_attach_reach_the_container() {
         result
     });
 }
+
+/// An agent rolls a Deployment back only with a patch rule; the template it goes back to
+/// is the previous revision's, and the rollout status says when it is done.
+#[test]
+#[ignore]
+fn an_agent_rolls_back_a_deployment() {
+    use k8s_openapi::api::apps::v1::Deployment;
+
+    run(async {
+        let ctx = context();
+        let deps: Api<Deployment> = Api::namespaced(k8s::connect_for_agents(ctx.clone()).await?, NS);
+        let name = "e2e-rollout";
+        let _ = deps.delete(name, &DeleteParams::default()).await;
+        for _ in 0..60 {
+            if deps.get_opt(name).await?.is_none() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+        let dep = |cmd: &str| {
+            json!({
+                "metadata": {"name": name, "namespace": NS},
+                "spec": {"replicas": 1, "selector": {"matchLabels": {"app": name}}, "template": {
+                    "metadata": {"labels": {"app": name}},
+                    "spec": {"terminationGracePeriodSeconds": 0, "containers": [{"name": "main", "image": "busybox:1.37", "command": ["sh", "-c", cmd]}]},
+                }},
+            })
+        };
+        deps.create(&PostParams::default(), &serde_json::from_value(dep("sleep 3600"))?).await?;
+        let command = |d: &Deployment| {
+            d.spec.as_ref().and_then(|s| s.template.spec.as_ref()).map(|s| s.containers[0].command.clone())
+        };
+        let checked = async {
+            let (hub, agent, token, _server) = agent(&["get,list *"], &[]).await?;
+            let client = crate::assistant::Mcp::connect(hub.port(), token).await?;
+            let target = json!({"context": ctx, "kind": "deployments", "namespace": NS, "name": name});
+            // Wait for the first rollout, then change the template: revision 2.
+            let mut status = target.clone();
+            status["wait_seconds"] = json!(120);
+            let out = client.call("rollout_status", status.clone()).await;
+            assert!(out.contains("rolled out"), "{out}");
+            deps.patch(name, &PatchParams::default(), &Patch::Merge(dep("sleep 7200"))).await?;
+            let out = client.call("rollout_status", status.clone()).await;
+            assert!(out.contains("rolled out"), "{out}");
+            let out = client.call("rollout_history", target.clone()).await;
+            assert!(out.contains("revision 2 (current)") && out.contains("revision 1"), "{out}");
+
+            let out = client.call("rollout_undo", target.clone()).await;
+            assert!(out.contains("Denied"), "{out}");
+            let allow = rules_file::parse_rule(Mode::Allow, "patch deployments/e2e-* -n default")?;
+            hub.update_agent(&agent.id, |a| a.policy.rules.push(allow))?;
+            let out = client.call("rollout_undo", target).await;
+            assert!(out.contains("to revision 1"), "{out}");
+            let back = command(&deps.get(name).await?);
+            assert_eq!(back, Some(Some(vec!["sh".into(), "-c".into(), "sleep 3600".into()])));
+            let out = client.call("rollout_status", status).await;
+            assert!(out.contains("rolled out"), "{out}");
+            Ok(())
+        };
+        let result: Result<()> = checked.await;
+        deps.delete(name, &DeleteParams::default()).await?;
+        result
+    });
+}
