@@ -165,12 +165,8 @@ fn describe(a: &Access) -> String {
 
 /// Arguments that change what a call does, for the approval banner: what the user
 /// approves is what runs. Values come from the (redacted) logged arguments.
-const KEY_ARGS: [&str; 8] = ["command", "patch", "replicas", "action", "container", "to_revision", "image", "dry_run"];
-const KEY_ARGS: [&str; 7] = ["command", "patch", "replicas", "action", "container", "to_revision", "dry_run"];
-const KEY_ARGS: [&str; 8] = ["command", "patch", "replicas", "action", "container", "port", "minutes", "dry_run"];
-const KEY_ARGS: [&str; 9] = ["command", "patch", "replicas", "action", "container", "to_revision", "port", "minutes", "dry_run"];
-const KEY_ARGS: [&str; 9] =
-    ["command", "patch", "replicas", "action", "container", "to_revision", "port", "minutes", "dry_run"];
+const KEY_ARGS: [&str; 10] =
+    ["command", "patch", "replicas", "action", "container", "to_revision", "image", "port", "minutes", "dry_run"];
 /// Most log bytes one `get_logs` call returns.
 const MAX_LOG_BYTES: i64 = 1024 * 1024;
 /// The banner scrolls; this only bounds pathological inputs.
@@ -839,10 +835,7 @@ impl KubeMcp {
     }
 }
 
-#[tool_handler(router = (Self::read_tools() + Self::write_tools() + Self::rollout_tools() + Self::job_tools()))]
-#[tool_handler(router = (Self::read_tools() + Self::write_tools() + Self::rollout_tools()))]
-#[tool_handler(router = (Self::read_tools() + Self::write_tools() + Self::ops_tools()))]
-#[tool_handler(router = (Self::read_tools() + Self::write_tools() + Self::rollout_tools() + Self::ops_tools()))]
+#[tool_handler(router = (Self::read_tools() + Self::write_tools() + Self::rollout_tools() + Self::job_tools() + Self::ops_tools()))]
 #[prompt_handler]
 impl ServerHandler for KubeMcp {
     fn get_info(&self) -> ServerConfig {
