@@ -341,7 +341,7 @@ fn an_agent_cordons_a_node_with_its_drain_rule() {
     run(async {
         let ctx = context();
         let nodes: Api<Node> = Api::all(k8s::connect_for_agents(ctx.clone()).await?);
-        let node = nodes.list(&Default::default()).await?.items.into_iter().filter_map(|n| n.metadata.name).last();
+        let node = nodes.list(&Default::default()).await?.items.into_iter().rev().find_map(|n| n.metadata.name);
         let node = node.context("no node")?;
         let cordoned = || async {
             let n = nodes.get(&node).await?;
