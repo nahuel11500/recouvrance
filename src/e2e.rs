@@ -257,8 +257,33 @@ fn shells_and_attach_reach_the_container() {
         let client = k8s::connect_for_agents(context()).await?;
         let pods: Api<Pod> = Api::namespaced(client.clone(), NS);
         let name = "e2e-shell";
+        let _ = pods.delete(name, &DeleteParams::default().grace_period(0)).await;
+        for _ in 0..60 {
+            if pods.get_opt(name).await?.is_none() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+        let pod: Pod = serde_json::from_value(json!({
+            "metadata": {"name": name, "namespace": NS},
+            "spec": {"containers": [{
+                "name": "main", "image": "busybox:1.37",
+                "command": ["sh", "-c", "echo attached-output; while true; do sleep 1; done"],
+            }]},
+        }))?;
+        pods.create(&PostParams::default(), &pod).await?;
+        let running = async {
+            for _ in 0..120 {
+                let phase = pods.get(name).await?.status.and_then(|s| s.phase);
+                if phase.as_deref() == Some("Running") {
+                    return Ok(());
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+            bail!("{name} did not start")
+        };
         let checked = async {
-            busybox_pod(&pods, name, "echo attached-output; while true; do sleep 1; done").await?;
+            running.await?;
             let mut shell = k8s::exec_shell(client.clone(), NS.into(), name.into(), None);
             let _ = shell.input.unbounded_send(ExecInput::Resize { cols: 80, rows: 24 });
             let _ = shell.input.unbounded_send(ExecInput::Bytes(b"echo $((20+22))-answered\n".to_vec()));
@@ -339,6 +364,10 @@ fn an_agent_rolls_back_a_deployment() {
         };
         let result: Result<()> = checked.await;
         deps.delete(name, &DeleteParams::default()).await?;
+        result
+    });
+}
+
 /// An agent's port-forward needs a rule for it, reaches the pod, and closes when agent
 /// access is switched off.
 #[test]

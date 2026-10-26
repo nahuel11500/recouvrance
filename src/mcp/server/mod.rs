@@ -169,6 +169,8 @@ const KEY_ARGS: [&str; 8] = ["command", "patch", "replicas", "action", "containe
 const KEY_ARGS: [&str; 7] = ["command", "patch", "replicas", "action", "container", "to_revision", "dry_run"];
 const KEY_ARGS: [&str; 8] = ["command", "patch", "replicas", "action", "container", "port", "minutes", "dry_run"];
 const KEY_ARGS: [&str; 9] = ["command", "patch", "replicas", "action", "container", "to_revision", "port", "minutes", "dry_run"];
+const KEY_ARGS: [&str; 9] =
+    ["command", "patch", "replicas", "action", "container", "to_revision", "port", "minutes", "dry_run"];
 /// Most log bytes one `get_logs` call returns.
 const MAX_LOG_BYTES: i64 = 1024 * 1024;
 /// The banner scrolls; this only bounds pathological inputs.
