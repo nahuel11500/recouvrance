@@ -476,6 +476,10 @@ fn an_agent_s_port_forward_follows_its_rules() {
         };
         let result: Result<()> = checked.await;
         pods.delete(name, &DeleteParams::default().grace_period(0)).await?;
+        result
+    });
+}
+
 /// Cordoning and uncordoning a node need the agent's drain rule; `top_nodes` reads usage.
 #[test]
 #[ignore]
