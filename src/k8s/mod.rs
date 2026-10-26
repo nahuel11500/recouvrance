@@ -27,6 +27,7 @@ mod metrics;
 pub(crate) mod names;
 mod pods;
 pub(crate) mod podspec;
+pub(crate) mod rollouts;
 mod sources;
 mod table;
 mod writes;
