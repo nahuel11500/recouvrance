@@ -25,6 +25,7 @@ use crate::k8s::{self, Kind, TaskGuard};
 
 mod job_tools;
 mod ops_tools;
+mod node_tools;
 mod read_tools;
 mod rollout_tools;
 mod write_tools;
@@ -836,6 +837,9 @@ impl KubeMcp {
 }
 
 #[tool_handler(router = (Self::read_tools() + Self::write_tools() + Self::rollout_tools() + Self::job_tools() + Self::ops_tools()))]
+#[tool_handler(router = (Self::read_tools() + Self::write_tools() + Self::rollout_tools() + Self::job_tools()))]
+#[tool_handler(router = (Self::read_tools() + Self::write_tools() + Self::rollout_tools()))]
+#[tool_handler(router = (Self::read_tools() + Self::write_tools() + Self::node_tools()))]
 #[prompt_handler]
 impl ServerHandler for KubeMcp {
     fn get_info(&self) -> ServerConfig {

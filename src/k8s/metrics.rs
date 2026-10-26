@@ -143,8 +143,6 @@ struct NodeAllocatableStatus {
     allocatable: HashMap<String, String>,
 }
 
-/// Poll node metrics and allocatable every 15s, retrying (backing off) on errors;
-/// nothing while `pause` is set.
 /// A pod's CPU (millicores) and memory (bytes) requests and limits, summed over its
 /// containers and sidecars, plus overhead; pod-level resources win when set. No limit when a
 /// container has none: the pod can then use what the node has.
@@ -214,18 +212,45 @@ pub fn watch_pod_resources(
     (guard, rx)
 }
 
+/// Node usage and allocatable now, from metrics-server and the nodes.
+pub async fn node_usage(client: Client) -> Result<NodeUsage> {
+    run(node_usage_now(client)).await
+}
+
+async fn node_usage_now(client: Client) -> Result<NodeUsage> {
+    let req = http::Request::get("/apis/metrics.k8s.io/v1beta1/nodes").body(Vec::new())?;
+    let (metrics, list) = futures::try_join!(
+        async { Ok::<_, anyhow::Error>(client.request::<serde_json::Value>(req).await?) },
+        lists::list_lean::<NodeAllocatable>(client.clone(), ar_of::<k8s_openapi::api::core::v1::Node>(), None),
+    )?;
+    let mut out = NodeUsage::new();
+    for n in list {
+        let name = n.metadata.name.unwrap_or_default();
+        let alloc = n.status.allocatable;
+        let cpu = alloc.get("cpu").map_or(0.0, |q| parse_cpu(q));
+        let mem = alloc.get("memory").map_or(0.0, |q| parse_bytes(q));
+        out.insert(name, ((0.0, 0.0), (cpu, mem)));
+    }
+    for item in metrics["items"].as_array().into_iter().flatten() {
+        let name = item.pointer("/metadata/name").and_then(|v| v.as_str()).unwrap_or_default();
+        let cpu = item.pointer("/usage/cpu").and_then(|v| v.as_str()).map_or(0.0, parse_cpu);
+        let mem = item.pointer("/usage/memory").and_then(|v| v.as_str()).map_or(0.0, parse_bytes);
+        if let Some(e) = out.get_mut(name) {
+            e.0 = (cpu, mem);
+        }
+    }
+    Ok(out)
+}
+
+/// Poll node metrics and allocatable, retrying (backing off) on errors; nothing while
+/// `pause` is set.
 pub fn watch_node_metrics(client: Client, pause: Pause) -> (TaskGuard, mpsc::UnboundedReceiver<NodeUsage>) {
     let (tx, rx) = mpsc::unbounded();
     let guard = spawn_guarded(async move {
-        let nodes = ar_of::<k8s_openapi::api::core::v1::Node>();
         let mut failures = 0;
         loop {
             wait_unpaused(&pause).await;
-            let Ok(req) = http::Request::get("/apis/metrics.k8s.io/v1beta1/nodes").body(Vec::new()) else { return };
-            let (Ok(metrics), Ok(list)) = (
-                client.request::<serde_json::Value>(req).await,
-                lists::list_lean::<NodeAllocatable>(client.clone(), nodes.clone(), None).await,
-            ) else {
+            let Ok(out) = node_usage_now(client.clone()).await else {
                 if tx.is_closed() {
                     return;
                 }
@@ -233,22 +258,6 @@ pub fn watch_node_metrics(client: Client, pause: Pause) -> (TaskGuard, mpsc::Unb
                 continue;
             };
             failures = 0;
-            let mut out = NodeUsage::new();
-            for n in list {
-                let name = n.metadata.name.unwrap_or_default();
-                let alloc = n.status.allocatable;
-                let cpu = alloc.get("cpu").map_or(0.0, |q| parse_cpu(q));
-                let mem = alloc.get("memory").map_or(0.0, |q| parse_bytes(q));
-                out.insert(name, ((0.0, 0.0), (cpu, mem)));
-            }
-            for item in metrics["items"].as_array().into_iter().flatten() {
-                let name = item.pointer("/metadata/name").and_then(|v| v.as_str()).unwrap_or_default();
-                let cpu = item.pointer("/usage/cpu").and_then(|v| v.as_str()).map_or(0.0, parse_cpu);
-                let mem = item.pointer("/usage/memory").and_then(|v| v.as_str()).map_or(0.0, parse_bytes);
-                if let Some(e) = out.get_mut(name) {
-                    e.0 = (cpu, mem);
-                }
-            }
             if tx.unbounded_send(out).is_err() {
                 return;
             }

@@ -78,12 +78,17 @@ evictions that remain (the node stays cordoned). Its reply counts every pod it c
 names only those an Allow rule lets the agent list. `rollout_undo` needs `patch` on the workload
 (it replaces its pod template with an earlier revision's); `rollout_status` can wait up to 5 minutes
 and stops waiting when the agent's access to the workload ends.
+names only those an Allow rule lets the agent list. `cordon_node` and `uncordon_node` need the
+`drain` verb on the node.
 
 Tools: `my_permissions`, `list_contexts`, `list_resource_types`, `list_resources`, `get_resource`,
 `describe_resource`, `top_pods`, `search`, `get_events`, `find_problems`, `check_certificates`, `usage_history`, `drain_node`, `gitops`,
 `get_logs`, `exec_command`, `scale`, `rollout_restart`, `patch_resource`, `apply_manifest`,
 `delete_resource`, `rollout_history`, `rollout_status`, `rollout_undo`. `scale`, `rollout_restart`,
 `rollout_undo`, `patch_resource`, `apply_manifest` and `delete_resource` support `dry_run`; `exec_command`, `drain_node` and `gitops` don't.
+`delete_resource`, `cordon_node`, `uncordon_node`, `top_nodes`. `scale`, `rollout_restart`,
+`cordon_node`, `uncordon_node`, `patch_resource`, `apply_manifest` and
+`delete_resource` support `dry_run`; `exec_command`, `drain_node` and `gitops` don't.
 
 - **Port-forwards:** `port_forward`, `list_port_forwards`, `stop_port_forward`. `port_forward` needs the
   `forward` verb on the pod or Service (no preset grants it): it is a network path into the cluster.
