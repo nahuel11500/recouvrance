@@ -364,6 +364,10 @@ fn an_agent_rolls_back_a_deployment() {
         };
         let result: Result<()> = checked.await;
         deps.delete(name, &DeleteParams::default()).await?;
+        result
+    });
+}
+
 /// Helm releases are read from their Secrets: denied by a Deny on secrets, listed with the
 /// chart otherwise, and their secret-looking values masked unless the agent may reveal.
 #[test]
