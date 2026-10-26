@@ -30,7 +30,7 @@ Each agent has rules, like Kubernetes RBAC with an effect:
 | Field | Example |
 |---|---|
 | Effect | Allow · Ask me · Deny |
-| Verbs | get, list, logs, reveal (Secret values), exec, scale, restart, patch, apply, delete, drain, forward (port-forwards), * |
+| Verbs | get, list, logs, reveal (Secret values), exec, scale, restart, patch, apply, delete, drain, * |
 | Resources | `pods`, `deployments`, `*.cert-manager.io`, `*` |
 | Namespaces | `team-a`, `team-*`, `*` (also covers cluster-scoped objects) |
 | Contexts | `eu-*`, `staging` |
@@ -79,20 +79,17 @@ names only those an Allow rule lets the agent list. `rollout_undo` needs `patch`
 (it replaces its pod template with an earlier revision's); `rollout_status` can wait up to 5 minutes
 and stops waiting when the agent's access to the workload ends.
 
-`port_forward` needs the `forward` verb on the pod or Service (no preset grants it): it is a network
-path into the cluster, to a database for instance. It listens on 127.0.0.1 only, for `minutes`
-(60 by default, 8 hours at most), and shows in the sidebar's port-forwards with the agent's name,
-where you can stop it. Switching agent access off, or disabling or deleting the agent, stops its
-forwards. A Service's port is forwarded to its `targetPort` on one of its pods, followed when the pod
-is replaced.
-
 Tools: `my_permissions`, `list_contexts`, `list_resource_types`, `list_resources`, `get_resource`,
 `describe_resource`, `top_pods`, `search`, `get_events`, `find_problems`, `check_certificates`, `usage_history`, `drain_node`, `gitops`,
 `get_logs`, `exec_command`, `scale`, `rollout_restart`, `patch_resource`, `apply_manifest`,
 `delete_resource`, `rollout_history`, `rollout_status`, `rollout_undo`. `scale`, `rollout_restart`,
 `rollout_undo`, `patch_resource`, `apply_manifest` and `delete_resource` support `dry_run`; `exec_command`, `drain_node` and `gitops` don't.
-`delete_resource`, `port_forward`, `list_port_forwards`, `stop_port_forward`. `scale`, `rollout_restart`, `patch_resource`, `apply_manifest` and
-`delete_resource` support `dry_run`; `exec_command`, `drain_node` and `gitops` don't.
+
+- **Port-forwards:** `port_forward`, `list_port_forwards`, `stop_port_forward`. `port_forward` needs the
+  `forward` verb on the pod or Service (no preset grants it): it is a network path into the cluster.
+  It listens on 127.0.0.1 only, for `minutes` (60 by default, 8 hours at most), shows in the
+  sidebar's port-forwards with the agent's name, and stops when agent access is switched off or the
+  agent is disabled or deleted. A Service port goes to its `targetPort` on one of its pods.
 
 - **Jobs and debugging:** `trigger_cronjob` needs `get` on the CronJob and `apply` on the Job it
   creates, named `<cronjob>-manual-<number>` (so `jobs/nightly-manual-*` can be allowed). `debug_pod`
