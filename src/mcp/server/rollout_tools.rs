@@ -43,10 +43,89 @@ pub struct StatusParams {
     pub wait_seconds: Option<u32>,
 }
 
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct PauseParams {
+    pub context: String,
+    #[schemars(description = "the Deployment")]
+    pub name: String,
+    pub namespace: String,
+    pub dry_run: Option<bool>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct SetImageParams {
+    pub context: String,
+    #[schemars(description = "deployments, statefulsets, daemonsets, replicasets, jobs, cronjobs or pods")]
+    pub kind: String,
+    pub namespace: String,
+    pub name: String,
+    pub container: String,
+    pub image: String,
+    pub dry_run: Option<bool>,
+}
+
 const ROLLOUT_KINDS: [&str; 3] = ["Deployment", "StatefulSet", "DaemonSet"];
 
 #[tool_router(router = rollout_tools, vis = "pub(super)")]
 impl KubeMcp {
+    #[tool(
+        description = "Pause a Deployment's rollouts, like `kubectl rollout pause`: changes to its template wait until resumed. Needs patch. Supports dry_run."
+    )]
+    async fn rollout_pause(
+        &self,
+        Extension(parts): Extension<Parts>,
+        Parameters(p): Parameters<PauseParams>,
+    ) -> Result<String, String> {
+        self.set_paused(&parts, "rollout_pause", p, true).await
+    }
+
+    #[tool(
+        description = "Resume a paused Deployment's rollouts, like `kubectl rollout resume`. Needs patch. Supports dry_run."
+    )]
+    async fn rollout_resume(
+        &self,
+        Extension(parts): Extension<Parts>,
+        Parameters(p): Parameters<PauseParams>,
+    ) -> Result<String, String> {
+        self.set_paused(&parts, "rollout_resume", p, false).await
+    }
+
+    #[tool(
+        description = "Set one container's image, like `kubectl set image` (a workload starts a rollout). Needs patch. Supports dry_run."
+    )]
+    async fn set_image(
+        &self,
+        Extension(parts): Extension<Parts>,
+        Parameters(p): Parameters<SetImageParams>,
+    ) -> Result<String, String> {
+        let args = json!({"context": p.context, "kind": p.kind, "namespace": p.namespace, "name": p.name, "container": p.container, "image": p.image, "dry_run": p.dry_run});
+        let mut call = self.begin(&parts, "set_image", args)?;
+        let (client, kind) = self.kind(&call, &p.context, &p.kind).await?;
+        let access = access_for(&kind, &p.context, Verb::Patch, Some(p.namespace.clone()), Some(p.name.clone()));
+        self.authorize(&mut call, &access).await?;
+        let obj = ObjectRef {
+            kind: kind.clone(),
+            name: p.name.clone(),
+            namespace: Some(p.namespace.clone()),
+            uid: String::new(),
+        };
+        let value = match k8s::get_object(client.clone(), obj).await {
+            Ok(v) => v,
+            Err(e) => return call.finish(Err(e)),
+        };
+        if let Err(e) = check_identity(&kind, Some(&p.namespace), &p.name, &value) {
+            return call.finish(Err(e));
+        }
+        let patch = match rollouts::image_patch(&kind, &value, &p.container, &p.image) {
+            Ok(patch) => patch,
+            Err(e) => return call.finish(Err(anyhow::anyhow!(e))),
+        };
+        self.recheck(&mut call, &access)?;
+        let done =
+            k8s::strategic_patch(client, kind, Some(p.namespace), p.name, patch, p.dry_run.unwrap_or(false)).await;
+        call.finish(done.map(|text| format!("{text}: {} → {}", p.container, p.image)))
+    }
+
     #[tool(
         description = "A workload's revisions, newest first, with their images and change cause, like `kubectl rollout history`.",
         annotations(read_only_hint = true)
@@ -153,6 +232,25 @@ impl KubeMcp {
 }
 
 impl KubeMcp {
+    async fn set_paused(
+        &self,
+        parts: &Parts,
+        tool: &'static str,
+        p: PauseParams,
+        paused: bool,
+    ) -> Result<String, String> {
+        let args = json!({"context": p.context, "namespace": p.namespace, "name": p.name, "dry_run": p.dry_run});
+        let mut call = self.begin(parts, tool, args)?;
+        let (client, kind) = self.kind(&call, &p.context, "deployments").await?;
+        let access = access_for(&kind, &p.context, Verb::Patch, Some(p.namespace.clone()), Some(p.name.clone()));
+        self.authorize(&mut call, &access).await?;
+        self.recheck(&mut call, &access)?;
+        let patch = json!({"spec": {"paused": paused}});
+        let done =
+            k8s::merge_patch(client, kind, Some(p.namespace), p.name.clone(), patch, p.dry_run.unwrap_or(false)).await;
+        call.finish(done.map(|text| format!("{text}: {}", if paused { "paused" } else { "resumed" })))
+    }
+
     /// The workload asked for, checked to be the one asked for, of a kind that rolls out.
     async fn workload(
         &self,

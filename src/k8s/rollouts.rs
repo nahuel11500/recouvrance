@@ -108,11 +108,41 @@ pub fn status(kind: &Kind, obj: &Value) -> (bool, String) {
     (true, format!("rolled out: {desired} replicas"))
 }
 
+/// The patch that sets `container`'s image in a workload's pod template (a Pod's own spec
+/// for a Pod), like `kubectl set image`: a strategic merge keyed by container name, on the
+/// list (`containers` or `initContainers`) that holds it. Errs when no container has the name.
+pub fn image_patch(kind: &Kind, obj: &Value, container: &str, image: &str) -> Result<Value, String> {
+    let spec = if kind.is("", "Pod") {
+        "/spec"
+    } else if kind.is("batch", "CronJob") {
+        "/spec/jobTemplate/spec/template/spec"
+    } else {
+        "/spec/template/spec"
+    };
+    let has = |list: &str| {
+        obj.pointer(&format!("{spec}/{list}"))
+            .and_then(Value::as_array)
+            .is_some_and(|cs| cs.iter().any(|c| c["name"] == container))
+    };
+    let list = ["containers", "initContainers"].into_iter().find(|l| has(l));
+    let Some(list) = list else {
+        return Err(format!(
+            "no container {container:?} in {}",
+            obj.pointer("/metadata/name").and_then(Value::as_str).unwrap_or("the object")
+        ));
+    };
+    let mut patch = serde_json::json!({ list: [{"name": container, "image": image}] });
+    for key in spec.trim_start_matches('/').split('/').rev() {
+        patch = serde_json::json!({ key: patch });
+    }
+    Ok(patch)
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
 
-    use super::{number, status, undo_target};
+    use super::{image_patch, number, status, undo_target};
     use crate::k8s::Kind;
 
     fn rev(n: i64) -> serde_json::Value {
@@ -148,5 +178,28 @@ mod tests {
         assert!(status(&kind, &dep(3, 3, 3)).0);
         let unseen = json!({"metadata": {"generation": 3}, "status": {"observedGeneration": 2}});
         assert!(!status(&kind, &unseen).0);
+    }
+
+    #[test]
+    fn image_patch_finds_the_container_s_list() {
+        let gvk = kube::api::GroupVersionKind::gvk("apps", "v1", "Deployment");
+        let kind = Kind {
+            ar: kube::discovery::ApiResource::from_gvk_with_plural(&gvk, "deployments"),
+            namespaced: true,
+            section: "",
+            label: "Deployments".into(),
+        };
+        let dep = json!({"spec": {"template": {"spec": {
+            "containers": [{"name": "app", "image": "a:1"}], "initContainers": [{"name": "migrate", "image": "m:1"}],
+        }}}});
+        assert_eq!(
+            image_patch(&kind, &dep, "migrate", "m:2"),
+            Ok(json!({"spec": {"template": {"spec": {"initContainers": [{"name": "migrate", "image": "m:2"}]}}}}))
+        );
+        assert_eq!(
+            image_patch(&kind, &dep, "app", "a:2"),
+            Ok(json!({"spec": {"template": {"spec": {"containers": [{"name": "app", "image": "a:2"}]}}}}))
+        );
+        assert!(image_patch(&kind, &dep, "nope", "x").is_err());
     }
 }

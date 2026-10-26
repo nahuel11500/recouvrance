@@ -106,6 +106,9 @@ Tools: `my_permissions`, `list_contexts`, `list_resource_types`, `list_resources
 - **Workload logs:** `workload_logs` merges the logs of a workload's or Service's pods (the newest 20)
   in time order, each line prefixed with its pod; it needs `get` on the workload, and pods whose logs
   the rules don't allow are left out and counted.
+- **Images and paused rollouts:** `set_image` (one container's image, by name, in `containers` or
+  `initContainers`), `rollout_pause` and `rollout_resume` (Deployments) need `patch` and support
+  `dry_run`.
 
 Prompts (slash commands in Claude Code: `/mcp__recouvrance__troubleshoot` …): `troubleshoot`, `rightsize`,
 `cert-audit`, `cluster-health`. They chain the tools above into a read-only workflow.
