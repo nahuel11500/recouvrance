@@ -78,12 +78,9 @@ evictions that remain (the node stays cordoned). Its reply counts every pod it c
 names only those an Allow rule lets the agent list. `rollout_undo` needs `patch` on the workload
 (it replaces its pod template with an earlier revision's); `rollout_status` can wait up to 5 minutes
 and stops waiting when the agent's access to the workload ends.
-names only those an Allow rule lets the agent list. `explain_resource` and `cluster_version` read
-no objects; `can_i` asks the API server what the kubeconfig user may do (the agent's own rules are
-`my_permissions`); `wait_for` needs `get` on the object and waits up to 5 minutes.
 
 Tools: `my_permissions`, `list_contexts`, `list_resource_types`, `list_resources`, `get_resource`,
-`describe_resource`, `explain_resource`, `can_i`, `cluster_version`, `wait_for`, `top_pods`, `search`, `get_events`, `find_problems`, `check_certificates`, `usage_history`, `drain_node`, `gitops`,
+`describe_resource`, `top_pods`, `search`, `get_events`, `find_problems`, `check_certificates`, `usage_history`, `drain_node`, `gitops`,
 `get_logs`, `exec_command`, `scale`, `rollout_restart`, `patch_resource`, `apply_manifest`,
 `delete_resource`, `rollout_history`, `rollout_status`, `rollout_undo`. `scale`, `rollout_restart`,
 `rollout_undo`, `patch_resource`, `apply_manifest` and `delete_resource` support `dry_run`; `exec_command`, `drain_node` and `gitops` don't.
@@ -116,6 +113,9 @@ Tools: `my_permissions`, `list_contexts`, `list_resource_types`, `list_resources
 - **Images and paused rollouts:** `set_image` (one container's image, by name, in `containers` or
   `initContainers`), `rollout_pause` and `rollout_resume` (Deployments) need `patch` and support
   `dry_run`.
+- **About the cluster:** `explain_resource` (field docs, CRDs included) and `cluster_version` read
+  no objects; `can_i` asks the API server what the kubeconfig user may do (the agent's own rules are
+  `my_permissions`); `wait_for` needs `get` on the object and waits up to 5 minutes.
 
 Prompts (slash commands in Claude Code: `/mcp__recouvrance__troubleshoot` …): `troubleshoot`, `rightsize`,
 `cert-audit`, `cluster-health`. They chain the tools above into a read-only workflow.
