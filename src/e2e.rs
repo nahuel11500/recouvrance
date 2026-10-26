@@ -368,47 +368,6 @@ fn an_agent_rolls_back_a_deployment() {
     });
 }
 
-/// Cordoning and uncordoning a node need the agent's drain rule; `top_nodes` reads usage.
-#[test]
-#[ignore]
-fn an_agent_cordons_a_node_with_its_drain_rule() {
-    run(async {
-        let ctx = context();
-        let nodes: Api<Node> = Api::all(k8s::connect_for_agents(ctx.clone()).await?);
-        let node = nodes.list(&Default::default()).await?.items.into_iter().rev().find_map(|n| n.metadata.name);
-        let node = node.context("no node")?;
-        let cordoned = || async {
-            let n = nodes.get(&node).await?;
-            anyhow::Ok(n.spec.and_then(|s| s.unschedulable).unwrap_or(false))
-        };
-        let checked = async {
-            let (hub, agent, token, _server) = agent(&["get,list *"], &[]).await?;
-            let client = crate::assistant::Mcp::connect(hub.port(), token).await?;
-            let args = json!({"context": ctx, "node": node});
-            let out = client.call("cordon_node", args.clone()).await;
-            assert!(out.contains("Denied"), "{out}");
-            assert!(!cordoned().await?);
-
-            let allow = rules_file::parse_rule(Mode::Allow, &format!("drain nodes/{node}"))?;
-            hub.update_agent(&agent.id, |a| a.policy.rules.push(allow))?;
-            let out = client.call("cordon_node", args.clone()).await;
-            assert!(out.contains("cordoned"), "{out}");
-            assert!(cordoned().await?);
-            let out = client.call("uncordon_node", args).await;
-            assert!(out.contains("uncordoned"), "{out}");
-            assert!(!cordoned().await?);
-
-            let out = client.call("top_nodes", json!({"context": ctx})).await;
-            assert!(out.contains(&node) || out.contains("metrics"), "{out}");
-            Ok(())
-        };
-        let result: Result<()> = checked.await;
-        let patch = Patch::Merge(json!({"spec": {"unschedulable": false}}));
-        nodes.patch(&node, &PatchParams::default(), &patch).await?;
-        result
-    });
-}
-
 /// Running a CronJob now needs apply on jobs; a debug container needs exec on the pod, and
 /// the agent then runs commands in it.
 #[test]
@@ -517,6 +476,43 @@ fn an_agent_s_port_forward_follows_its_rules() {
         };
         let result: Result<()> = checked.await;
         pods.delete(name, &DeleteParams::default().grace_period(0)).await?;
+/// Cordoning and uncordoning a node need the agent's drain rule; `top_nodes` reads usage.
+#[test]
+#[ignore]
+fn an_agent_cordons_a_node_with_its_drain_rule() {
+    run(async {
+        let ctx = context();
+        let nodes: Api<Node> = Api::all(k8s::connect_for_agents(ctx.clone()).await?);
+        let node = nodes.list(&Default::default()).await?.items.into_iter().rev().find_map(|n| n.metadata.name);
+        let node = node.context("no node")?;
+        let cordoned = || async {
+            let n = nodes.get(&node).await?;
+            anyhow::Ok(n.spec.and_then(|s| s.unschedulable).unwrap_or(false))
+        };
+        let checked = async {
+            let (hub, agent, token, _server) = agent(&["get,list *"], &[]).await?;
+            let client = crate::assistant::Mcp::connect(hub.port(), token).await?;
+            let args = json!({"context": ctx, "node": node});
+            let out = client.call("cordon_node", args.clone()).await;
+            assert!(out.contains("Denied"), "{out}");
+            assert!(!cordoned().await?);
+
+            let allow = rules_file::parse_rule(Mode::Allow, &format!("drain nodes/{node}"))?;
+            hub.update_agent(&agent.id, |a| a.policy.rules.push(allow))?;
+            let out = client.call("cordon_node", args.clone()).await;
+            assert!(out.contains("cordoned"), "{out}");
+            assert!(cordoned().await?);
+            let out = client.call("uncordon_node", args).await;
+            assert!(out.contains("uncordoned"), "{out}");
+            assert!(!cordoned().await?);
+
+            let out = client.call("top_nodes", json!({"context": ctx})).await;
+            assert!(out.contains(&node) || out.contains("metrics"), "{out}");
+            Ok(())
+        };
+        let result: Result<()> = checked.await;
+        let patch = Patch::Merge(json!({"spec": {"unschedulable": false}}));
+        nodes.patch(&node, &PatchParams::default(), &patch).await?;
         result
     });
 }
