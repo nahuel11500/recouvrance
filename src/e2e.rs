@@ -423,6 +423,10 @@ fn an_agent_runs_a_cronjob_and_debugs_a_pod() {
         let result: Result<()> = checked.await;
         let _ = pods.delete(pod, &DeleteParams::default().grace_period(0)).await;
         cronjobs.delete(cron, &DeleteParams::foreground()).await?;
+        result
+    });
+}
+
 /// Pausing, resuming and setting an image need the agent's patch rule; the image lands on
 /// the container named, and a paused Deployment says so.
 #[test]
