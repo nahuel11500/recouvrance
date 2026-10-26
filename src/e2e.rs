@@ -364,6 +364,10 @@ fn an_agent_rolls_back_a_deployment() {
         };
         let result: Result<()> = checked.await;
         deps.delete(name, &DeleteParams::default()).await?;
+        result
+    });
+}
+
 /// `diff_manifest` shows what an apply would change, with get rules only, and changes nothing.
 #[test]
 #[ignore]
