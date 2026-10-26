@@ -78,19 +78,17 @@ evictions that remain (the node stays cordoned). Its reply counts every pod it c
 names only those an Allow rule lets the agent list. `rollout_undo` needs `patch` on the workload
 (it replaces its pod template with an earlier revision's); `rollout_status` can wait up to 5 minutes
 and stops waiting when the agent's access to the workload ends.
-names only those an Allow rule lets the agent list. `trigger_cronjob` needs `get` on the CronJob and
-`apply` on the Job it creates (named `<cronjob>-manual-<number>`, so a rule can allow
-`jobs/nightly-manual-*`). `debug_pod` needs `exec` on the pod: it adds an ephemeral container (busybox
-by default) that the agent then runs commands in with `exec_command`.
 
 Tools: `my_permissions`, `list_contexts`, `list_resource_types`, `list_resources`, `get_resource`,
 `describe_resource`, `top_pods`, `search`, `get_events`, `find_problems`, `check_certificates`, `usage_history`, `drain_node`, `gitops`,
 `get_logs`, `exec_command`, `scale`, `rollout_restart`, `patch_resource`, `apply_manifest`,
 `delete_resource`, `rollout_history`, `rollout_status`, `rollout_undo`. `scale`, `rollout_restart`,
 `rollout_undo`, `patch_resource`, `apply_manifest` and `delete_resource` support `dry_run`; `exec_command`, `drain_node` and `gitops` don't.
-`delete_resource`, `trigger_cronjob`, `debug_pod`. `scale`, `rollout_restart`, `trigger_cronjob`,
-`debug_pod`, `patch_resource`, `apply_manifest` and
-`delete_resource` support `dry_run`; `exec_command`, `drain_node` and `gitops` don't.
+
+- **Jobs and debugging:** `trigger_cronjob` needs `get` on the CronJob and `apply` on the Job it
+  creates, named `<cronjob>-manual-<number>` (so `jobs/nightly-manual-*` can be allowed). `debug_pod`
+  needs `exec` on the pod: it adds an ephemeral container (busybox by default) that the agent then
+  runs commands in with `exec_command`. Both support `dry_run`.
 
 Prompts (slash commands in Claude Code: `/mcp__recouvrance__troubleshoot` …): `troubleshoot`, `rightsize`,
 `cert-audit`, `cluster-health`. They chain the tools above into a read-only workflow.
