@@ -170,7 +170,7 @@ async fn post_inner(url: &str, headers: &[(&str, &str)], body: &Value) -> Result
     let resp = client.request(req).await?;
     let (parts, body) = resp.into_parts();
     let bytes = body.collect().await?.to_bytes();
-    let text = String::from_utf8_lossy(&bytes).to_string();
+    let text = String::from_utf8_lossy_owned(bytes.into());
     if !parts.status.is_success() {
         let msg = serde_json::from_str::<Value>(&text)
             .ok()
@@ -225,7 +225,7 @@ pub async fn get_url(url: String) -> Result<String> {
             if !parts.status.is_success() {
                 bail!("HTTP {}", parts.status);
             }
-            return Ok(String::from_utf8_lossy(&bytes).to_string());
+            return Ok(String::from_utf8_lossy_owned(bytes.into()));
         }
         bail!("too many redirects")
     };

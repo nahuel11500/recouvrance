@@ -110,7 +110,7 @@ pub(super) fn secret_entry(ctx: &Ctx, i: usize, cx: &App) -> AnyElement {
     let decoded = v
         .as_str()
         .and_then(|b| base64::engine::general_purpose::STANDARD.decode(b).ok())
-        .map(|b| String::from_utf8_lossy(&b).to_string())
+        .map(String::from_utf8_lossy_owned)
         .unwrap_or_default();
     let shown = ctx.reveal || ctx.revealed_keys.contains(k);
     let value = if shown { decoded.clone() } else { "••••••••••••".to_string() };

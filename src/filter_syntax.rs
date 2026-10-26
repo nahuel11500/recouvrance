@@ -41,7 +41,7 @@ pub fn parse_terms(input: &str) -> Vec<(bool, Term)> {
             }
             let term = if let Some(c) = column_term(t) {
                 c
-            } else if let Some(re) = t.strip_prefix('/').and_then(|r| r.strip_suffix('/')).filter(|r| !r.is_empty()) {
+            } else if let Some(re) = t.strip_circumfix('/', '/').filter(|r| !r.is_empty()) {
                 // A regex still being typed (invalid) is ignored.
                 Term::Regex(regex::RegexBuilder::new(re).case_insensitive(true).build().ok()?)
             } else if let Some(ns) = t.strip_prefix("ns:") {
@@ -176,5 +176,19 @@ pub fn contains_ci(hay: &str, needle: &str) -> bool {
             || needle.is_empty()
     } else {
         hay.to_lowercase().contains(needle)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Term, parse_terms};
+
+    #[test]
+    fn slashes_make_a_regex_only_around_something() {
+        let term = |s: &str| parse_terms(s).pop().map(|(_, t)| t);
+        assert!(matches!(term("/^web-[0-9]/"), Some(Term::Regex(_))));
+        assert!(matches!(term("/"), Some(Term::Text(t)) if t == "/"));
+        assert!(matches!(term("//"), Some(Term::Text(t)) if t == "//"));
+        assert!(term("/[/").is_none(), "an unfinished regex is ignored");
     }
 }

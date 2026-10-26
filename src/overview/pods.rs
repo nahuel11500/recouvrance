@@ -258,7 +258,7 @@ impl EnvSources<'_> {
     fn secret(&self, name: &str, key: &str) -> Option<String> {
         use base64::Engine as _;
         let value = base64::engine::general_purpose::STANDARD.decode(self.data("Secret", name, key)?).ok()?;
-        Some(if self.reveal { String::from_utf8_lossy(&value).to_string() } else { "••••••".into() })
+        Some(if self.reveal { String::from_utf8_lossy_owned(value) } else { "••••••".into() })
     }
 
     fn config_map(&self, name: &str, key: &str) -> Option<String> {
@@ -367,7 +367,7 @@ fn env_value(ctx: &Ctx, sources: &EnvSources, c: &Value, e: &Value, cx: &App) ->
 /// metadata, spec and status fields, and single labels or annotations.
 fn field_ref<'a>(pod: &'a Value, path: &str) -> Option<&'a str> {
     let item = |prefix: &str, map: &str| {
-        let key = path.strip_prefix(prefix)?.strip_suffix("']")?;
+        let key = path.strip_circumfix(prefix, "']")?;
         pod.pointer(map)?.get(key)?.as_str()
     };
     match path {
