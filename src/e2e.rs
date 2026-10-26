@@ -364,6 +364,10 @@ fn an_agent_rolls_back_a_deployment() {
         };
         let result: Result<()> = checked.await;
         deps.delete(name, &DeleteParams::default()).await?;
+        result
+    });
+}
+
 /// Running a CronJob now needs apply on jobs; a debug container needs exec on the pod, and
 /// the agent then runs commands in it.
 #[test]
