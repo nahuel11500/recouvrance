@@ -60,6 +60,7 @@ impl AppView {
         let contexts: Vec<String> = self.clusters.iter().map(|c| c.0.clone()).collect();
         let restorable = self.forwards.read(cx).restorable(&contexts).len();
         let recent = self.forwards.read(cx).recent(&contexts);
+        let agents = self.hub.forwards();
         v_flex()
             .px_2()
             .when(restorable > 1, |d| {
@@ -77,7 +78,7 @@ impl AppView {
                     ),
                 )
             })
-            .when(!items.is_empty() || !recent.is_empty(), |d| {
+            .when(!items.is_empty() || !recent.is_empty() || !agents.is_empty(), |d| {
                 d.child(
                     h_flex()
                         .gap_1p5()
@@ -131,6 +132,48 @@ impl AppView {
                             .custom(on_hull(cx))
                             .icon(Lucide::X)
                             .on_click(move |_, _, cx| forwards.update(cx, |f, cx| f.stop(id, cx))),
+                    )
+            }))
+            // Agents' forwards: who opened them, until when; stopped like the others.
+            .children(agents.into_iter().map(|f| {
+                let (id, hub) = (f.id, self.hub.clone());
+                let until = f.until.to_zoned(jiff::tz::TimeZone::system()).strftime("%H:%M");
+                let detail = f
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| format!("{}/{} · agent {} · until {until}", f.namespace, f.target, f.agent));
+                h_flex()
+                    .gap_1()
+                    .px_2()
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .child(format!("127.0.0.1:{} → {}", f.local, f.remote)),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(if f.error.is_some() { danger } else { muted })
+                                    .overflow_hidden()
+                                    .text_ellipsis()
+                                    .whitespace_nowrap()
+                                    .child(detail),
+                            ),
+                    )
+                    .child(
+                        Button::new(("stop-agent-pf", id as usize))
+                            .xsmall()
+                            .custom(on_hull(cx))
+                            .icon(Lucide::X)
+                            .tooltip("Stop the agent's port-forward")
+                            .on_click(move |_, _, _| {
+                                hub.stop_forwards(|x| x.id == id);
+                            }),
                     )
             }))
             .children(recent.into_iter().take(8).enumerate().map(|(i, saved)| {

@@ -541,7 +541,7 @@ impl AppView {
                     cx.notify();
                 });
             }
-            HubEvent::Audit(_) | HubEvent::AgentSeen => {}
+            HubEvent::Audit(_) | HubEvent::AgentSeen | HubEvent::Forwards => {}
         }
         // The agents screen shows live activity and connection state.
         self.agents.update(cx, |_, cx| cx.notify());

@@ -41,10 +41,12 @@ pub enum Verb {
     Apply,
     Delete,
     Drain,
+    /// Open a port-forward to a pod or Service: a network path into the cluster.
+    Forward,
 }
 
 impl Verb {
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 12] = [
         Self::Get,
         Self::List,
         Self::Logs,
@@ -56,6 +58,7 @@ impl Verb {
         Self::Apply,
         Self::Delete,
         Self::Drain,
+        Self::Forward,
     ];
 
     /// The verbs that only read (a default policy grants these).
@@ -74,7 +77,14 @@ impl Verb {
             Self::Apply => "apply",
             Self::Delete => "delete",
             Self::Drain => "drain",
+            Self::Forward => "forward",
         }
+    }
+
+    /// Whether a rule granting it deserves a second look: it changes the cluster, shows
+    /// Secret values or opens a network path into it.
+    pub const fn is_sensitive(self) -> bool {
+        self.is_write() || matches!(self, Self::Reveal | Self::Forward)
     }
 
     /// Whether it changes the cluster (or runs something in it).

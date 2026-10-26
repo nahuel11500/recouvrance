@@ -257,33 +257,8 @@ fn shells_and_attach_reach_the_container() {
         let client = k8s::connect_for_agents(context()).await?;
         let pods: Api<Pod> = Api::namespaced(client.clone(), NS);
         let name = "e2e-shell";
-        let _ = pods.delete(name, &DeleteParams::default().grace_period(0)).await;
-        for _ in 0..60 {
-            if pods.get_opt(name).await?.is_none() {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-        }
-        let pod: Pod = serde_json::from_value(json!({
-            "metadata": {"name": name, "namespace": NS},
-            "spec": {"containers": [{
-                "name": "main", "image": "busybox:1.37",
-                "command": ["sh", "-c", "echo attached-output; while true; do sleep 1; done"],
-            }]},
-        }))?;
-        pods.create(&PostParams::default(), &pod).await?;
-        let running = async {
-            for _ in 0..120 {
-                let phase = pods.get(name).await?.status.and_then(|s| s.phase);
-                if phase.as_deref() == Some("Running") {
-                    return Ok(());
-                }
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-            }
-            bail!("{name} did not start")
-        };
         let checked = async {
-            running.await?;
+            busybox_pod(&pods, name, "echo attached-output; while true; do sleep 1; done").await?;
             let mut shell = k8s::exec_shell(client.clone(), NS.into(), name.into(), None);
             let _ = shell.input.unbounded_send(ExecInput::Resize { cols: 80, rows: 24 });
             let _ = shell.input.unbounded_send(ExecInput::Bytes(b"echo $((20+22))-answered\n".to_vec()));
@@ -364,6 +339,55 @@ fn an_agent_rolls_back_a_deployment() {
         };
         let result: Result<()> = checked.await;
         deps.delete(name, &DeleteParams::default()).await?;
+/// An agent's port-forward needs a rule for it, reaches the pod, and closes when agent
+/// access is switched off.
+#[test]
+#[ignore]
+fn an_agent_s_port_forward_follows_its_rules() {
+    use k8s_openapi::api::core::v1::Pod;
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    /// What `GET /` on the local port answers.
+    async fn fetch(port: u16) -> Result<String> {
+        let mut socket = tokio::net::TcpStream::connect(("127.0.0.1", port)).await?;
+        socket.write_all(b"GET / HTTP/1.0\r\n\r\n").await?;
+        let mut text = String::new();
+        tokio::time::timeout(std::time::Duration::from_secs(20), socket.read_to_string(&mut text)).await??;
+        Ok(text)
+    }
+
+    run(async {
+        let ctx = context();
+        let pods: Api<Pod> = Api::namespaced(k8s::connect_for_agents(ctx.clone()).await?, NS);
+        let name = "e2e-forward";
+        let checked = async {
+            busybox_pod(
+                &pods,
+                name,
+                "mkdir -p /www && echo forwarded-ok > /www/index.html && httpd -f -p 8080 -h /www",
+            )
+            .await?;
+            let (hub, agent, token, _server) = agent(&["get,list *"], &[]).await?;
+            let client = crate::assistant::Mcp::connect(hub.port(), token).await?;
+            let args = json!({"context": ctx, "namespace": NS, "pod": name, "port": 8080});
+            let out = client.call("port_forward", args.clone()).await;
+            assert!(out.contains("Denied"), "{out}");
+            assert!(hub.forwards().is_empty());
+
+            let allow = rules_file::parse_rule(Mode::Allow, "forward pods/e2e-* -n default")?;
+            hub.update_agent(&agent.id, |a| a.policy.rules.push(allow))?;
+            let out = client.call("port_forward", args).await;
+            let port = hub.forwards().first().map(|f| f.local).with_context(|| format!("no forward: {out}"))?;
+            let page = fetch(port).await?;
+            assert!(page.contains("forwarded-ok"), "{page}");
+
+            hub.set_agents_enabled(false)?;
+            assert!(hub.forwards().is_empty(), "the kill switch stops agents' forwards");
+            assert!(fetch(port).await.is_err(), "the port still answers after the kill switch");
+            Ok(())
+        };
+        let result: Result<()> = checked.await;
+        pods.delete(name, &DeleteParams::default().grace_period(0)).await?;
         result
     });
 }

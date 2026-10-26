@@ -41,7 +41,7 @@ impl AgentsView {
                 .on_click(cx.listener(move |this, _, _, cx| this.update_rule(ix, |r| r.effect = m, cx)))
         }));
 
-        let choices = Verb::ALL.iter().map(|v| (v.as_str(), v.is_write() || *v == Verb::Reveal)).chain([("*", true)]);
+        let choices = Verb::ALL.iter().map(|v| (v.as_str(), v.is_sensitive())).chain([("*", true)]);
         let verbs = h_flex().flex_wrap().gap_1().children(choices.enumerate().map(|(vi, (label, sensitive))| {
             let on = rule.verbs.iter().any(|v| v == label);
             let verb = label.to_string();
