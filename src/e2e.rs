@@ -365,6 +365,28 @@ fn an_agent_rolls_back_a_deployment() {
         let result: Result<()> = checked.await;
         deps.delete(name, &DeleteParams::default()).await?;
         result
+/// The read-only questions about the cluster: explain, can-i, version and wait.
+#[test]
+#[ignore]
+fn an_agent_asks_the_cluster() {
+    run(async {
+        let ctx = context();
+        let (hub, _agent, token, _server) = agent(&["get,list *"], &[]).await?;
+        let mcp = crate::assistant::Mcp::connect(hub.port(), token).await?;
+        let out = mcp
+            .call("explain_resource", json!({"context": ctx, "kind": "deployments", "field": "spec.replicas"}))
+            .await;
+        assert!(out.contains("FIELD: spec.replicas <integer>"), "{out}");
+        let out = mcp.call("can_i", json!({"context": ctx, "verb": "get", "kind": "pods", "namespace": NS})).await;
+        assert!(out.starts_with("yes") || out.contains("yes"), "{out}");
+        let out = mcp.call("cluster_version", json!({"context": ctx})).await;
+        assert!(out.contains("v1."), "{out}");
+        let nodes: Api<Node> = Api::all(k8s::connect_for_agents(ctx.clone()).await?);
+        let node = nodes.list(&Default::default()).await?.items.into_iter().find_map(|n| n.metadata.name);
+        let wait = json!({"context": ctx, "kind": "nodes", "name": node, "condition": "Ready", "timeout_seconds": 30});
+        let out = mcp.call("wait_for", wait).await;
+        assert!(out.contains(": Ready"), "{out}");
+        Ok(())
     });
 }
 
