@@ -146,6 +146,8 @@ pub struct DetailPanel {
     /// The overview of a page with a pods table, drawn as a list: a node can hold a
     /// thousand pods, and laying them all out on every frame made scrolling stutter.
     overview_list: ListState,
+    /// How the overview's pods table is sorted (kept across reloads).
+    pod_order: crate::overview::PodOrder,
     /// One-shot reads of the object, and of its events: the latest wins.
     object_read: crate::latest::Latest,
     events_load: crate::latest::Latest,
@@ -242,6 +244,7 @@ impl DetailPanel {
             node_shell: None,
             env_expanded: false,
             overview_list: ListState::new(0, ListAlignment::Top, px(600.)),
+            pod_order: None,
             object_read: Default::default(),
             events_load: Default::default(),
             schema_rows: Vec::new(),
@@ -670,6 +673,7 @@ impl DetailPanel {
                             }),
                         }
                     }
+                    crate::overview::sort_pod_rows(&mut related.pod_rows, this.pod_order);
                     // A thousand pods take a while to free: not on the UI thread.
                     let old = std::mem::replace(&mut this.related, related);
                     cx.background_executor().spawn(async move { drop(old) }).detach();
@@ -773,6 +777,14 @@ impl DetailPanel {
         format!("{} {}", self.obj.kind.ar.kind, self.obj.name)
     }
 
+    /// A click on a pods table's header: sort on that column, then the other way, then
+    /// back to the order the pods were loaded in.
+    pub fn sort_pods(&mut self, col: crate::overview::PodSort, cx: &mut Context<Self>) {
+        self.pod_order = crate::overview::next_pod_order(self.pod_order, col);
+        crate::overview::sort_pod_rows(&mut self.related.pod_rows, self.pod_order);
+        cx.notify();
+    }
+
     pub fn toggle_env(&mut self, cx: &mut Context<Self>) {
         self.env_expanded = !self.env_expanded;
         cx.notify();
@@ -839,6 +851,7 @@ impl DetailPanel {
             history_minutes: self.history_minutes,
             env_expanded: self.env_expanded,
             schema_rows: &self.schema_rows,
+            pod_order: self.pod_order,
         }
     }
 

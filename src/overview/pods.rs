@@ -511,6 +511,8 @@ pub(super) fn probe_card(title: &str, p: &Value, cx: &App) -> Div {
 /// One line of a pods table, worked out once when the pods are loaded: a node can hold a
 /// thousand pods, and their rows are drawn again on every frame while the page scrolls.
 pub struct PodRow {
+    /// Where the pod came in the list as loaded, to go back to that order.
+    pub order: usize,
     pub name: String,
     pub namespace: Option<String>,
     pub ready: usize,
@@ -526,7 +528,8 @@ pub struct PodRow {
 
 pub fn pod_rows(pods: &[Value], usage: &ContainerUsage) -> Vec<PodRow> {
     pods.iter()
-        .map(|p| {
+        .enumerate()
+        .map(|(order, p)| {
             let name = s(p, "/metadata/name").unwrap_or_default().to_string();
             let statuses = arr(p, "/status/containerStatuses");
             let containers = arr(p, "/spec/containers");
@@ -538,6 +541,7 @@ pub fn pod_rows(pods: &[Value], usage: &ContainerUsage) -> Vec<PodRow> {
             };
             let (cpu, mem) = (spec("cpu"), spec("memory"));
             PodRow {
+                order,
                 namespace: s(p, "/metadata/namespace").map(String::from),
                 ready: statuses.iter().filter(|c| c["ready"].as_bool() == Some(true)).count(),
                 total: containers.len(),
@@ -553,26 +557,135 @@ pub fn pod_rows(pods: &[Value], usage: &ContainerUsage) -> Vec<PodRow> {
         .collect()
 }
 
-/// The header of a pods table; its rows are items of the page's list (`pod_row`).
+/// Usage from the node's kubelet (its stats summary) for the rows metrics-server gave
+/// none: a node's page lists pods from every namespace, and reads them there. Summed over
+/// containers, like metrics-server; matched by namespace and name.
+pub fn fill_usage_from_kubelet(rows: &mut [PodRow], stats: &Value) {
+    let mut usage = std::collections::HashMap::new();
+    for pod in arr(stats, "/pods") {
+        let (Some(ns), Some(name)) = (s(pod, "/podRef/namespace"), s(pod, "/podRef/name")) else { continue };
+        let containers = arr(pod, "/containers");
+        let sum = |ptr: &str| containers.iter().filter_map(|c| c.pointer(ptr)?.as_f64()).sum::<f64>();
+        usage.insert((ns, name), (sum("/cpu/usageNanoCores") / 1e6, sum("/memory/workingSetBytes")));
+    }
+    for row in rows.iter_mut().filter(|r| r.cpu[0].is_none() && r.mem[0].is_none()) {
+        if let Some(&(cpu, mem)) = usage.get(&(row.namespace.as_deref().unwrap_or_default(), row.name.as_str())) {
+            row.cpu[0] = Some(cpu);
+            row.mem[0] = Some(mem);
+        }
+    }
+}
+
+/// A column the pods table sorts on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PodSort {
+    Namespace,
+    Name,
+    Ready,
+    Status,
+    Cpu,
+    Memory,
+    Restarts,
+    Node,
+    Age,
+}
+
+/// The pods table's sort: a column, and whether it is descending.
+pub type PodOrder = Option<(PodSort, bool)>;
+
+/// A header click: ascending, then descending, then the order the pods were loaded in.
+pub fn next_pod_order(current: PodOrder, col: PodSort) -> PodOrder {
+    match current {
+        Some((c, false)) if c == col => Some((col, true)),
+        Some((c, true)) if c == col => None,
+        _ => Some((col, false)),
+    }
+}
+
+/// Sort the rows. CPU and memory sort on usage, pods without a reading last either way;
+/// ascending age is the newest first. Ties keep the load order.
+pub fn sort_pod_rows(rows: &mut [PodRow], order: PodOrder) {
+    let Some((col, desc)) = order else {
+        rows.sort_unstable_by_key(|r| r.order);
+        return;
+    };
+    let usage = |v: Option<f64>| v.map(|v| if desc { -v } else { v });
+    rows.sort_by(|a, b| {
+        let by = match col {
+            PodSort::Namespace => a.namespace.cmp(&b.namespace).then_with(|| a.name.cmp(&b.name)),
+            PodSort::Name => a.name.cmp(&b.name),
+            PodSort::Ready => (a.ready, a.total).cmp(&(b.ready, b.total)),
+            PodSort::Status => a.phase.cmp(&b.phase),
+            PodSort::Restarts => a.restarts.cmp(&b.restarts),
+            PodSort::Node => a.node.cmp(&b.node),
+            PodSort::Age => b.created.cmp(&a.created),
+            PodSort::Cpu | PodSort::Memory => {
+                let pick = |r: &PodRow| usage(if col == PodSort::Cpu { r.cpu[0] } else { r.mem[0] });
+                // Missing readings last, ascending or descending.
+                return match (pick(a), pick(b)) {
+                    (Some(x), Some(y)) => x.total_cmp(&y),
+                    (Some(_), None) => std::cmp::Ordering::Less,
+                    (None, Some(_)) => std::cmp::Ordering::Greater,
+                    (None, None) => std::cmp::Ordering::Equal,
+                }
+                .then(a.order.cmp(&b.order));
+            }
+        };
+        if desc { by.reverse() } else { by }.then(a.order.cmp(&b.order))
+    });
+}
+
+/// The pods table's columns: header, width, sort. Namespace only when the pods come from
+/// several namespaces (a node's page).
+fn pod_columns(ctx: &Ctx) -> Vec<(&'static str, f32, PodSort)> {
+    let mut cols = vec![("Name", 320., PodSort::Name)];
+    if ctx.ns().is_none() {
+        cols.insert(0, ("Namespace", 180., PodSort::Namespace));
+    }
+    cols.extend([
+        ("Ready", 50., PodSort::Ready),
+        ("Status", 110., PodSort::Status),
+        ("CPU", 150., PodSort::Cpu),
+        ("Memory", 150., PodSort::Memory),
+        ("Restarts", 60., PodSort::Restarts),
+        ("Node", 220., PodSort::Node),
+        ("Age", 60., PodSort::Age),
+    ]);
+    cols
+}
+
+/// The header of a pods table; its rows are items of the page's list (`pod_row`). A click
+/// on a column sorts on it.
 pub(super) fn pods_table(ctx: &Ctx, cx: &App) -> AnyElement {
     if ctx.related.pod_rows.is_empty() {
         return div().text_sm().text_color(cx.theme().muted_foreground).child("No pods.").into_any_element();
     }
+    let muted = cx.theme().muted_foreground;
     h_flex()
         .gap_3()
         .py_1()
         .text_xs()
-        .text_color(cx.theme().muted_foreground)
+        .text_color(muted)
         .border_b_1()
         .border_color(cx.theme().border)
-        .child(div().w(px(320.)).child("Name"))
-        .child(div().w(px(50.)).child("Ready"))
-        .child(div().w(px(110.)).child("Status"))
-        .child(div().w(px(150.)).child("CPU"))
-        .child(div().w(px(150.)).child("Memory"))
-        .child(div().w(px(60.)).child("Restarts"))
-        .child(div().w(px(220.)).child("Node"))
-        .child(div().w(px(60.)).child("Age"))
+        .children(pod_columns(ctx).into_iter().map(|(title, width, col)| {
+            let sorted = ctx.pod_order.filter(|(c, _)| *c == col).map(|(_, desc)| desc);
+            let panel = ctx.panel.clone();
+            h_flex()
+                .id(title)
+                .w(px(width))
+                .gap_1()
+                .cursor_pointer()
+                .hover(|s| s.text_color(cx.theme().foreground))
+                .child(title)
+                .when_some(sorted, |d, desc| {
+                    let icon = if desc { Lucide::SortDescending } else { Lucide::SortAscending };
+                    d.child(Icon::new(icon).size_3())
+                })
+                .on_click(move |_, _, cx| {
+                    let _ = panel.update(cx, |p, cx| p.sort_pods(col, cx));
+                })
+        }))
         .into_any_element()
 }
 
@@ -586,17 +699,24 @@ pub(super) fn pod_row(ctx: &Ctx, p: &PodRow, cx: &App) -> AnyElement {
             .child(div().flex_1().child(usage_bar(value, request, limit, color, cx)))
     };
     // Pods are opened in their own namespace (a node lists pods from every namespace).
-    let label = match (&p.namespace, ctx.ns()) {
-        (Some(ns), None) => format!("{ns} / {}", p.name),
-        _ => p.name.clone(),
-    };
     h_flex()
         .gap_3()
         .py_1()
         .text_sm()
         .border_b_1()
         .border_color(theme.border)
-        .child(div().w(px(320.)).child(ctx.link_in(label, "pods", &p.name, p.namespace.clone(), cx)))
+        .when(ctx.ns().is_none(), |d| {
+            d.child(
+                div()
+                    .w(px(180.))
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .whitespace_nowrap()
+                    .text_color(theme.muted_foreground)
+                    .child(p.namespace.clone().unwrap_or_default()),
+            )
+        })
+        .child(div().w(px(320.)).child(ctx.link_in(p.name.clone(), "pods", &p.name, p.namespace.clone(), cx)))
         .child(
             div()
                 .w(px(50.))
@@ -717,7 +837,7 @@ fn container_history(ctx: &Ctx, c: &Value, name: &str, cx: &App) -> Option<Div> 
 mod tests {
     use serde_json::json;
 
-    use super::field_ref;
+    use super::{PodRow, PodSort, field_ref, fill_usage_from_kubelet, next_pod_order, sort_pod_rows};
 
     #[test]
     fn downward_api_fields_come_from_the_pod() {
@@ -732,5 +852,65 @@ mod tests {
         assert_eq!(field_ref(&pod, "metadata.labels['missing']"), None);
         assert_eq!(field_ref(&pod, "status.podIP"), None);
         assert_eq!(field_ref(&pod, "metadata.labels"), None);
+    }
+
+    fn row(order: usize, ns: &str, name: &str, cpu: Option<f64>) -> PodRow {
+        PodRow {
+            order,
+            name: name.into(),
+            namespace: Some(ns.into()),
+            ready: 1,
+            total: 1,
+            restarts: 0,
+            phase: "Running".into(),
+            cpu: [cpu, None, None],
+            mem: [None; 3],
+            node: "n1".into(),
+            created: None,
+        }
+    }
+
+    fn names(rows: &[PodRow]) -> Vec<&str> {
+        rows.iter().map(|r| r.name.as_str()).collect()
+    }
+
+    #[test]
+    fn sorts_by_usage_with_missing_readings_last() {
+        let mut rows = vec![row(0, "b", "small", Some(5.)), row(1, "a", "none", None), row(2, "a", "big", Some(900.))];
+        sort_pod_rows(&mut rows, Some((PodSort::Cpu, true)));
+        assert_eq!(names(&rows), ["big", "small", "none"]);
+        sort_pod_rows(&mut rows, Some((PodSort::Cpu, false)));
+        assert_eq!(names(&rows), ["small", "big", "none"]);
+        sort_pod_rows(&mut rows, Some((PodSort::Namespace, false)));
+        assert_eq!(names(&rows), ["big", "none", "small"]);
+        sort_pod_rows(&mut rows, None);
+        assert_eq!(names(&rows), ["small", "none", "big"], "back to the load order");
+    }
+
+    #[test]
+    fn a_header_click_cycles_up_down_off() {
+        let up = next_pod_order(None, PodSort::Cpu);
+        assert_eq!(up, Some((PodSort::Cpu, false)));
+        let down = next_pod_order(up, PodSort::Cpu);
+        assert_eq!(down, Some((PodSort::Cpu, true)));
+        assert_eq!(next_pod_order(down, PodSort::Cpu), None);
+        assert_eq!(next_pod_order(down, PodSort::Name), Some((PodSort::Name, false)));
+    }
+
+    #[test]
+    fn a_nodes_pods_get_their_usage_from_the_kubelet() {
+        let stats = json!({"pods": [
+            {"podRef": {"namespace": "shop", "name": "cache-0"}, "containers": [
+                {"cpu": {"usageNanoCores": 2_000_000.0}, "memory": {"workingSetBytes": 4096.0}},
+                {"cpu": {"usageNanoCores": 1_000_000.0}, "memory": {"workingSetBytes": 1024.0}},
+            ]},
+            {"podRef": {"namespace": "other", "name": "web"}, "containers": [
+                {"cpu": {"usageNanoCores": 9_000_000.0}, "memory": {"workingSetBytes": 1.0}},
+            ]},
+        ]});
+        let mut rows = vec![row(0, "shop", "cache-0", None), row(1, "shop", "web", None)];
+        fill_usage_from_kubelet(&mut rows, &stats);
+        assert_eq!((rows[0].cpu[0], rows[0].mem[0]), (Some(3.), Some(5120.)));
+        assert_eq!(rows[1].cpu[0], None, "same name in another namespace is another pod");
     }
 }
