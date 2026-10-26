@@ -374,12 +374,6 @@ fn an_agent_rolls_back_a_deployment() {
 #[ignore]
 fn an_agent_runs_a_cronjob_and_debugs_a_pod() {
     use k8s_openapi::api::batch::v1::{CronJob, Job};
-/// A Deployment's logs come from all its pods, merged; pods whose logs the rules deny are
-/// left out and counted.
-#[test]
-#[ignore]
-fn an_agent_reads_a_workload_s_logs() {
-    use k8s_openapi::api::apps::v1::Deployment;
     use k8s_openapi::api::core::v1::Pod;
 
     run(async {
@@ -429,6 +423,21 @@ fn an_agent_reads_a_workload_s_logs() {
         let result: Result<()> = checked.await;
         let _ = pods.delete(pod, &DeleteParams::default().grace_period(0)).await;
         cronjobs.delete(cron, &DeleteParams::foreground()).await?;
+        result
+    });
+}
+
+/// A Deployment's logs come from all its pods, merged; pods whose logs the rules deny are
+/// left out and counted.
+#[test]
+#[ignore]
+fn an_agent_reads_a_workload_s_logs() {
+    use k8s_openapi::api::apps::v1::Deployment;
+    use k8s_openapi::api::core::v1::Pod;
+
+    run(async {
+        let ctx = context();
+        let client = k8s::connect_for_agents(ctx.clone()).await?;
         let deps: Api<Deployment> = Api::namespaced(client.clone(), NS);
         let pods: Api<Pod> = Api::namespaced(client, NS);
         let name = "e2e-logs";
