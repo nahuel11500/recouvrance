@@ -84,16 +84,11 @@ Tools: `my_permissions`, `list_contexts`, `list_resource_types`, `list_resources
 `get_logs`, `exec_command`, `scale`, `rollout_restart`, `patch_resource`, `apply_manifest`,
 `delete_resource`, `rollout_history`, `rollout_status`, `rollout_undo`. `scale`, `rollout_restart`,
 `rollout_undo`, `patch_resource`, `apply_manifest` and `delete_resource` support `dry_run`; `exec_command`, `drain_node` and `gitops` don't.
-names only those an Allow rule lets the agent list. The Helm tools read the Secrets Helm keeps
-releases in, so the rules on `secrets` decide (`list` to list releases and their history, `get` on
-`sh.helm.release.v1.<name>.v<revision>` for values); values under secret-looking keys are masked
-unless `reveal` is allowed on that Secret.
 
-Tools: `my_permissions`, `list_contexts`, `list_resource_types`, `list_resources`, `get_resource`,
-`describe_resource`, `top_pods`, `search`, `get_events`, `find_problems`, `check_certificates`, `usage_history`, `drain_node`, `gitops`,
-`list_helm_releases`, `helm_history`, `helm_get_values`, `get_logs`, `exec_command`, `scale`, `rollout_restart`, `patch_resource`, `apply_manifest`,
-`delete_resource`. `scale`, `rollout_restart`, `patch_resource`, `apply_manifest` and
-`delete_resource` support `dry_run`; `exec_command`, `drain_node` and `gitops` don't.
+- **Helm:** `list_helm_releases`, `helm_history`, `helm_get_values` read the Secrets Helm keeps
+  releases in, so the rules on `secrets` decide: `list` for releases and history, `get` on
+  `sh.helm.release.v1.<name>.v<revision>` for values, whose secret-looking keys are masked unless
+  `reveal` is allowed.
 
 - **Nodes:** `cordon_node`, `uncordon_node` (the `drain` verb on the node, `dry_run`), `top_nodes`
   (`list` on nodes).
