@@ -334,18 +334,6 @@ fn an_agent_rolls_back_a_deployment() {
         deps.create(&PostParams::default(), &serde_json::from_value(dep("sleep 3600"))?).await?;
         let command = |d: &Deployment| {
             d.spec.as_ref().and_then(|s| s.template.spec.as_ref()).map(|s| s.containers[0].command.clone())
-/// Cordoning and uncordoning a node need the agent's drain rule; `top_nodes` reads usage.
-#[test]
-#[ignore]
-fn an_agent_cordons_a_node_with_its_drain_rule() {
-    run(async {
-        let ctx = context();
-        let nodes: Api<Node> = Api::all(k8s::connect_for_agents(ctx.clone()).await?);
-        let node = nodes.list(&Default::default()).await?.items.into_iter().rev().find_map(|n| n.metadata.name);
-        let node = node.context("no node")?;
-        let cordoned = || async {
-            let n = nodes.get(&node).await?;
-            anyhow::Ok(n.spec.and_then(|s| s.unschedulable).unwrap_or(false))
         };
         let checked = async {
             let (hub, agent, token, _server) = agent(&["get,list *"], &[]).await?;
@@ -376,6 +364,26 @@ fn an_agent_cordons_a_node_with_its_drain_rule() {
         };
         let result: Result<()> = checked.await;
         deps.delete(name, &DeleteParams::default()).await?;
+        result
+    });
+}
+
+/// Cordoning and uncordoning a node need the agent's drain rule; `top_nodes` reads usage.
+#[test]
+#[ignore]
+fn an_agent_cordons_a_node_with_its_drain_rule() {
+    run(async {
+        let ctx = context();
+        let nodes: Api<Node> = Api::all(k8s::connect_for_agents(ctx.clone()).await?);
+        let node = nodes.list(&Default::default()).await?.items.into_iter().rev().find_map(|n| n.metadata.name);
+        let node = node.context("no node")?;
+        let cordoned = || async {
+            let n = nodes.get(&node).await?;
+            anyhow::Ok(n.spec.and_then(|s| s.unschedulable).unwrap_or(false))
+        };
+        let checked = async {
+            let (hub, agent, token, _server) = agent(&["get,list *"], &[]).await?;
+            let client = crate::assistant::Mcp::connect(hub.port(), token).await?;
             let args = json!({"context": ctx, "node": node});
             let out = client.call("cordon_node", args.clone()).await;
             assert!(out.contains("Denied"), "{out}");
