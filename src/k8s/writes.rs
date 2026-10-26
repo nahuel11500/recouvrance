@@ -455,14 +455,29 @@ pub fn manual_job_prefix(cronjob: &str) -> String {
     format!("{}-manual-", cronjob.chars().take(40).collect::<String>())
 }
 
+/// A manual Job's name: the prefix and a number from the clock.
+pub fn manual_job_name(cronjob: &str) -> String {
+    format!("{}{}", manual_job_prefix(cronjob), jiff::Timestamp::now().as_second() % 100_000)
+}
+
 pub async fn trigger_cronjob_opts(client: Client, ns: String, name: String, dry_run: bool) -> Result<String> {
+    let job_name = manual_job_name(&name);
+    trigger_cronjob_named(client, ns, name, job_name, dry_run).await
+}
+
+/// [`trigger_cronjob_opts`] with the Job's name chosen by the caller.
+pub async fn trigger_cronjob_named(
+    client: Client,
+    ns: String,
+    name: String,
+    job_name: String,
+    dry_run: bool,
+) -> Result<String> {
     use k8s_openapi::api::batch::v1::{CronJob, Job};
     run(async move {
         let cronjobs: Api<CronJob> = Api::namespaced(client.clone(), &ns);
         let cj = cronjobs.get(&name).await?;
         let template = cj.spec.context("cronjob has no spec")?.job_template;
-        let suffix = jiff::Timestamp::now().as_second() % 100_000;
-        let job_name = format!("{}{suffix}", manual_job_prefix(&name));
         let mut annotations = template.metadata.as_ref().and_then(|m| m.annotations.clone()).unwrap_or_default();
         annotations.insert("cronjob.kubernetes.io/instantiate".into(), "manual".into());
         let job = Job {

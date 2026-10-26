@@ -85,6 +85,11 @@ Tools: `my_permissions`, `list_contexts`, `list_resource_types`, `list_resources
 `delete_resource`, `rollout_history`, `rollout_status`, `rollout_undo`. `scale`, `rollout_restart`,
 `rollout_undo`, `patch_resource`, `apply_manifest` and `delete_resource` support `dry_run`; `exec_command`, `drain_node` and `gitops` don't.
 
+- **Jobs and debugging:** `trigger_cronjob` needs `get` on the CronJob and `apply` on the Job it
+  creates, named `<cronjob>-manual-<number>` (so `jobs/nightly-manual-*` can be allowed). `debug_pod`
+  needs `exec` on the pod: it adds an ephemeral container (busybox by default) that the agent then
+  runs commands in with `exec_command`. Both support `dry_run`.
+
 Prompts (slash commands in Claude Code: `/mcp__recouvrance__troubleshoot` …): `troubleshoot`, `rightsize`,
 `cert-audit`, `cluster-health`. They chain the tools above into a read-only workflow.
 
