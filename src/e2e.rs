@@ -374,6 +374,12 @@ fn an_agent_rolls_back_a_deployment() {
 #[ignore]
 fn an_agent_runs_a_cronjob_and_debugs_a_pod() {
     use k8s_openapi::api::batch::v1::{CronJob, Job};
+/// A Deployment's logs come from all its pods, merged; pods whose logs the rules deny are
+/// left out and counted.
+#[test]
+#[ignore]
+fn an_agent_reads_a_workload_s_logs() {
+    use k8s_openapi::api::apps::v1::Deployment;
     use k8s_openapi::api::core::v1::Pod;
 
     run(async {
@@ -423,6 +429,50 @@ fn an_agent_runs_a_cronjob_and_debugs_a_pod() {
         let result: Result<()> = checked.await;
         let _ = pods.delete(pod, &DeleteParams::default().grace_period(0)).await;
         cronjobs.delete(cron, &DeleteParams::foreground()).await?;
+        let deps: Api<Deployment> = Api::namespaced(client.clone(), NS);
+        let pods: Api<Pod> = Api::namespaced(client, NS);
+        let name = "e2e-logs";
+        let _ = deps.delete(name, &DeleteParams::default()).await;
+        let dep = json!({
+            "metadata": {"name": name, "namespace": NS},
+            "spec": {"replicas": 2, "selector": {"matchLabels": {"app": name}}, "template": {
+                "metadata": {"labels": {"app": name}},
+                "spec": {"terminationGracePeriodSeconds": 0, "containers": [{"name": "main", "image": "busybox:1.37",
+                    "command": ["sh", "-c", "while true; do echo tick-$HOSTNAME; sleep 1; done"]}]},
+            }},
+        });
+        deps.create(&PostParams::default(), &serde_json::from_value(dep)?).await?;
+        let checked = async {
+            let lp = kube::api::ListParams::default().labels(&format!("app={name}"));
+            for _ in 0..120 {
+                let running = pods
+                    .list(&lp)
+                    .await?
+                    .items
+                    .iter()
+                    .filter(|p| p.status.as_ref().and_then(|s| s.phase.as_deref()) == Some("Running"))
+                    .count();
+                if running == 2 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            let (hub, agent, token, _server) = agent(&["get,list,logs *"], &[]).await?;
+            let mcp = crate::assistant::Mcp::connect(hub.port(), token).await?;
+            let args = json!({"context": ctx, "kind": "deployments", "namespace": NS, "name": name, "grep": "tick"});
+            let out = mcp.call("workload_logs", args.clone()).await;
+            let prefixes: std::collections::HashSet<&str> = out.lines().filter_map(|l| l.split(']').next()).collect();
+            assert_eq!(prefixes.len(), 2, "{out}");
+
+            let deny = rules_file::parse_rule(Mode::Deny, "logs pods/e2e-logs-* -n default")?;
+            hub.update_agent(&agent.id, |a| a.policy.rules.push(deny))?;
+            let out = mcp.call("workload_logs", args).await;
+            assert!(out.contains("2 of 2 pods left out"), "{out}");
+            Ok(())
+        };
+        let result: Result<()> = checked.await;
+        deps.delete(name, &DeleteParams::default()).await?;
         result
     });
 }

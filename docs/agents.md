@@ -103,6 +103,9 @@ Tools: `my_permissions`, `list_contexts`, `list_resource_types`, `list_resources
   creates, named `<cronjob>-manual-<number>` (so `jobs/nightly-manual-*` can be allowed). `debug_pod`
   needs `exec` on the pod: it adds an ephemeral container (busybox by default) that the agent then
   runs commands in with `exec_command`. Both support `dry_run`.
+- **Workload logs:** `workload_logs` merges the logs of a workload's or Service's pods (the newest 20)
+  in time order, each line prefixed with its pod; it needs `get` on the workload, and pods whose logs
+  the rules don't allow are left out and counted.
 
 Prompts (slash commands in Claude Code: `/mcp__recouvrance__troubleshoot` …): `troubleshoot`, `rightsize`,
 `cert-audit`, `cluster-health`. They chain the tools above into a read-only workflow.
