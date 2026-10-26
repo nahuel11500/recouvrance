@@ -365,6 +365,9 @@ fn an_agent_rolls_back_a_deployment() {
         let result: Result<()> = checked.await;
         deps.delete(name, &DeleteParams::default()).await?;
         result
+    });
+}
+
 /// The read-only questions about the cluster: explain, can-i, version and wait.
 #[test]
 #[ignore]
