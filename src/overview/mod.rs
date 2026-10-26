@@ -81,6 +81,9 @@ impl Related {
     /// so run it off the UI thread.
     pub fn index(&mut self, obj: &Value) {
         self.pod_rows = pod_rows(&self.pods, &self.usage);
+        if let Some(stats) = &self.node_stats {
+            fill_usage_from_kubelet(&mut self.pod_rows, stats);
+        }
         let resources = obj.pointer("/status/allocatable").and_then(Value::as_object);
         self.allocated = resources
             .into_iter()
@@ -134,6 +137,8 @@ pub struct Ctx<'a> {
     pub env_expanded: bool,
     /// A CRD's spec fields, worked out once from its schema.
     pub schema_rows: &'a [SchemaRow],
+    /// How the pods table is sorted.
+    pub pod_order: PodOrder,
 }
 
 impl Ctx<'_> {
