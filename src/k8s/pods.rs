@@ -425,6 +425,9 @@ fn lossy_lines<R: futures::AsyncBufRead + Unpin>(
                 if buf.last() == Some(&b'\r') {
                     buf.pop();
                 }
+                // A copy, not `from_utf8_lossy_owned`: `buf` is reused for the next line, and
+                // the copy is sized to the line where `buf` keeps the room it grew to (the
+                // log view holds thousands of lines).
                 let mut line = String::from_utf8_lossy(&buf).into_owned();
                 if cut {
                     line.push_str(CUT_MARK);

@@ -383,7 +383,7 @@ pub async fn exec_capture(
             .await
             .map_err(|_| anyhow!("command timed out after {timeout_secs}s"))?;
         let clip = |(b, dropped): (Vec<u8>, bool)| {
-            let s = String::from_utf8_lossy(&b).to_string();
+            let s = String::from_utf8_lossy_owned(b);
             if dropped { format!("{s}\n… [truncated]") } else { s }
         };
         let code = match &status {
