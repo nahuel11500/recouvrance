@@ -16,6 +16,7 @@ pub mod ns_picker;
 pub mod palette;
 pub mod problems_view;
 pub mod schema_form;
+pub mod selectable;
 pub mod settings_view;
 pub mod terminal;
 

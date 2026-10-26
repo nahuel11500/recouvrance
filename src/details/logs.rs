@@ -15,6 +15,7 @@ use kube::Client;
 
 use crate::k8s;
 use crate::k8s::TaskGuard;
+use crate::ui::selectable::SelectableLine;
 
 mod model;
 use model::*;
@@ -514,17 +515,19 @@ impl LogsView {
                 pos += part.len() + 1;
             }
             let found = self.find_highlights(line, i, cx);
-            StyledText::new(line.clone()).with_highlights(merge_highlights(highlights, found)).into_any_element()
+            SelectableLine::new(
+                ElementId::NamedInteger("log-line".into(), l.id),
+                i as u64,
+                line.clone(),
+                merge_highlights(highlights, found),
+            )
+            .into_any_element()
         } else {
+            let colored = base.map(|c| (0..l.text.len(), HighlightStyle { color: Some(c), ..Default::default() }));
             let found = self.find_highlights(&l.text, i, cx);
-            if found.is_empty() {
-                div().when_some(base, Styled::text_color).child(l.text.clone()).into_any_element()
-            } else {
-                div()
-                    .when_some(base, Styled::text_color)
-                    .child(StyledText::new(l.text.clone()).with_highlights(found))
-                    .into_any_element()
-            }
+            let highlights = merge_highlights(colored.into_iter().collect(), found);
+            SelectableLine::new(ElementId::NamedInteger("log-line".into(), l.id), i as u64, l.text.clone(), highlights)
+                .into_any_element()
         };
         h_flex()
             .id(i)
@@ -839,6 +842,17 @@ impl Render for LogsView {
                     .p_1()
                     .font_family(mono)
                     .text_xs()
+                    // Pressing on the lines (to select text) stops following: new lines would
+                    // scroll them away under the pointer.
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            if this.follow {
+                                this.follow = false;
+                                cx.notify();
+                            }
+                        }),
+                    )
                     .map(|d| {
                         if self.wrap {
                             let this = cx.entity().downgrade();
