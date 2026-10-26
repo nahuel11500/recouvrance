@@ -53,6 +53,8 @@ pub(crate) fn level_of(line: &str) -> Option<Level> {
 }
 
 pub(crate) struct LogLine {
+    /// Unique in its buffer, for as long as the line is there (rows move, this doesn't).
+    pub(crate) id: u64,
     pub(crate) src: usize,
     pub(crate) time: Option<jiff::Timestamp>,
     /// Where the line sorts among other pods' lines: its time, or the time of the line
@@ -76,7 +78,16 @@ impl LogLine {
             None => (None, raw),
         };
         let level = level_of(&text);
-        Self { src, time, key: time, text: text.into(), level, lower: OnceCell::new(), readable: OnceCell::new() }
+        Self {
+            id: 0,
+            src,
+            time,
+            key: time,
+            text: text.into(),
+            level,
+            lower: OnceCell::new(),
+            readable: OnceCell::new(),
+        }
     }
 
     /// The text in lowercase, for the search filter.
@@ -203,6 +214,8 @@ pub(crate) struct LogBuffer {
     lines: VecDeque<LogLine>,
     /// Lines dropped from the front so far: `lines[i]` is line number `offset + i`.
     offset: usize,
+    /// The id the next line gets.
+    next_id: u64,
     max: usize,
     /// Several streams: keep their lines in one timeline.
     merge: bool,
@@ -222,6 +235,7 @@ impl LogBuffer {
         Self {
             lines: VecDeque::new(),
             offset: 0,
+            next_id: 0,
             max,
             merge: false,
             filter: LineFilter::default(),
@@ -328,6 +342,8 @@ impl LogBuffer {
             .into_iter()
             .map(|r| {
                 let mut l = LogLine::parse(src, r);
+                l.id = self.next_id;
+                self.next_id += 1;
                 l.key = l.time.or(prev);
                 prev = l.key;
                 l

@@ -167,7 +167,7 @@ pub fn run(path: &str, wait: Duration) -> Result<()> {
         cx.update_window(window.into(), |_, window, cx| app_view.update(cx, |a, cx| a.demo_act(act, window, cx)))?;
         pump(&mut cx, Duration::from_secs(2));
     }
-    // RECOUVRANCE_INPUT="click:x,y;dblclick:x,y;scroll:x,y,dy;key:down;key:enter;wait" drives real input events.
+    // RECOUVRANCE_INPUT="click:x,y;dblclick:x,y;drag:x1,y1,x2,y2;selected:;scroll:x,y,dy;key:down;key:enter;wait" drives real input events.
     if let Ok(script) = std::env::var("RECOUVRANCE_INPUT") {
         for step in script.split(';') {
             let input = match step.split_once(':') {
@@ -206,6 +206,43 @@ pub fn run(path: &str, wait: Duration) -> Result<()> {
                         delta: ScrollDelta::Pixels(point(px(0.), px(-dy))),
                         ..Default::default()
                     })]
+                }
+                Some(("drag", at)) => {
+                    let n: Vec<f32> = at.split(',').map(|v| v.parse().unwrap_or(0.)).collect();
+                    let at =
+                        |i: usize| point(px(n.get(i).copied().unwrap_or(0.)), px(n.get(i + 1).copied().unwrap_or(0.)));
+                    let (from, to) = (at(0), at(2));
+                    vec![
+                        PlatformInput::MouseMove(MouseMoveEvent {
+                            position: from,
+                            pressed_button: None,
+                            modifiers: Modifiers::default(),
+                        }),
+                        PlatformInput::MouseDown(MouseDownEvent {
+                            button: MouseButton::Left,
+                            position: from,
+                            modifiers: Modifiers::default(),
+                            click_count: 1,
+                            first_mouse: false,
+                        }),
+                        PlatformInput::MouseMove(MouseMoveEvent {
+                            position: to,
+                            pressed_button: Some(MouseButton::Left),
+                            modifiers: Modifiers::default(),
+                        }),
+                        PlatformInput::MouseUp(MouseUpEvent {
+                            button: MouseButton::Left,
+                            position: to,
+                            modifiers: Modifiers::default(),
+                            click_count: 1,
+                        }),
+                    ]
+                }
+                Some(("selected", _)) => {
+                    cx.update_window(window.into(), |_, window, cx| {
+                        eprintln!("selected text: {:?}", base::TextSelection::selected_text(window, cx));
+                    })?;
+                    vec![]
                 }
                 Some(("wait", secs)) => {
                     pump(&mut cx, Duration::from_secs(secs.parse().unwrap_or(1)));
