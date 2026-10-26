@@ -33,6 +33,30 @@ fn config_map(name: &str) -> ConfigMap {
     serde_json::from_value(json!({"metadata": {"name": name, "namespace": NS}, "data": {"a": "1"}})).unwrap()
 }
 
+/// A fresh busybox pod `name` in the test namespace running `script`, once it runs.
+async fn busybox_pod(pods: &Api<k8s_openapi::api::core::v1::Pod>, name: &str, script: &str) -> Result<()> {
+    let _ = pods.delete(name, &DeleteParams::default().grace_period(0)).await;
+    for _ in 0..60 {
+        if pods.get_opt(name).await?.is_none() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+    let pod = serde_json::from_value(json!({
+        "metadata": {"name": name, "namespace": NS},
+        "spec": {"containers": [{"name": "main", "image": "busybox:1.37", "command": ["sh", "-c", script]}]},
+    }))?;
+    pods.create(&PostParams::default(), &pod).await?;
+    for _ in 0..120 {
+        let phase = pods.get(name).await?.status.and_then(|s| s.phase);
+        if phase.as_deref() == Some("Running") {
+            return Ok(());
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+    bail!("{name} did not start")
+}
+
 /// An agent of a fresh hub with these rules (`allow`, then `deny` strings), its token, and
 /// the hub's MCP server on a free port.
 async fn agent(allow: &[&str], deny: &[&str]) -> Result<(Arc<mcp::Hub>, mcp::Agent, String, k8s::TaskGuard)> {
@@ -340,6 +364,61 @@ fn an_agent_rolls_back_a_deployment() {
         };
         let result: Result<()> = checked.await;
         deps.delete(name, &DeleteParams::default()).await?;
+/// Running a CronJob now needs apply on jobs; a debug container needs exec on the pod, and
+/// the agent then runs commands in it.
+#[test]
+#[ignore]
+fn an_agent_runs_a_cronjob_and_debugs_a_pod() {
+    use k8s_openapi::api::batch::v1::{CronJob, Job};
+    use k8s_openapi::api::core::v1::Pod;
+
+    run(async {
+        let ctx = context();
+        let client = k8s::connect_for_agents(ctx.clone()).await?;
+        let (cronjobs, jobs): (Api<CronJob>, Api<Job>) =
+            (Api::namespaced(client.clone(), NS), Api::namespaced(client.clone(), NS));
+        let pods: Api<Pod> = Api::namespaced(client, NS);
+        let (cron, pod) = ("e2e-cron", "e2e-debug");
+        let _ = cronjobs.delete(cron, &DeleteParams::default()).await;
+        let cj = json!({
+            "metadata": {"name": cron, "namespace": NS},
+            "spec": {"schedule": "0 0 1 1 *", "jobTemplate": {"spec": {"template": {"spec": {
+                "restartPolicy": "Never",
+                "containers": [{"name": "main", "image": "busybox:1.37", "command": ["echo", "ran"]}],
+            }}}}},
+        });
+        cronjobs.create(&PostParams::default(), &serde_json::from_value(cj)?).await?;
+        let checked = async {
+            busybox_pod(&pods, pod, "while true; do sleep 1; done").await?;
+            let (hub, agent, token, _server) = agent(&["get,list *"], &[]).await?;
+            let mcp = crate::assistant::Mcp::connect(hub.port(), token).await?;
+            let trigger = json!({"context": ctx, "namespace": NS, "name": cron});
+            let out = mcp.call("trigger_cronjob", trigger.clone()).await;
+            assert!(out.contains("Denied"), "{out}");
+            let debug = json!({"context": ctx, "namespace": NS, "pod": pod, "target": "main"});
+            let out = mcp.call("debug_pod", debug.clone()).await;
+            assert!(out.contains("Denied"), "{out}");
+
+            for rule in ["apply jobs/e2e-cron-manual-* -n default", "exec pods/e2e-* -n default"] {
+                let allow = rules_file::parse_rule(Mode::Allow, rule)?;
+                hub.update_agent(&agent.id, |a| a.policy.rules.push(allow))?;
+            }
+            let out = mcp.call("trigger_cronjob", trigger).await;
+            assert!(out.contains("created from CronJob"), "{out}");
+            let made = jobs.list(&Default::default()).await?.items.into_iter().filter_map(|j| j.metadata.name);
+            assert!(made.into_iter().any(|n| n.starts_with("e2e-cron-manual-")), "no manual Job");
+
+            let out = mcp.call("debug_pod", debug).await;
+            let name = out.split_whitespace().nth(2).map(String::from).with_context(|| out.clone())?;
+            assert!(name.starts_with("debugger-"), "{out}");
+            let exec = json!({"context": ctx, "namespace": NS, "pod": pod, "container": name, "command": ["echo", "from-debug"]});
+            let out = mcp.call("exec_command", exec).await;
+            assert!(out.contains("from-debug"), "{out}");
+            Ok(())
+        };
+        let result: Result<()> = checked.await;
+        let _ = pods.delete(pod, &DeleteParams::default().grace_period(0)).await;
+        cronjobs.delete(cron, &DeleteParams::foreground()).await?;
         result
     });
 }
