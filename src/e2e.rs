@@ -364,6 +364,34 @@ fn an_agent_rolls_back_a_deployment() {
         };
         let result: Result<()> = checked.await;
         deps.delete(name, &DeleteParams::default()).await?;
+/// `diff_manifest` shows what an apply would change, with get rules only, and changes nothing.
+#[test]
+#[ignore]
+fn an_agent_diffs_a_manifest_without_changing_anything() {
+    run(async {
+        let ctx = context();
+        let truth: Api<ConfigMap> = Api::namespaced(k8s::connect_for_agents(ctx.clone()).await?, NS);
+        let (name, new) = ("e2e-diff", "e2e-diff-new");
+        for n in [name, new] {
+            let _ = truth.delete(n, &DeleteParams::default()).await;
+        }
+        truth.create(&PostParams::default(), &config_map(name)).await?;
+        let checked = async {
+            let (hub, _agent, token, _server) = agent(&["get,list *"], &[]).await?;
+            let mcp = crate::assistant::Mcp::connect(hub.port(), token).await?;
+            let manifest = format!(
+                "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: {name}\n  namespace: {NS}\ndata:\n  a: \"2\"\n---\napiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: {new}\n  namespace: {NS}\ndata:\n  b: \"1\"\n"
+            );
+            let out = mcp.call("diff_manifest", json!({"context": ctx, "manifest": manifest})).await;
+            assert!(out.contains("-  a: '1'") || out.contains("-  a: \"1\""), "{out}");
+            assert!(out.contains(&format!("ConfigMap {NS}/{new}: created")), "{out}");
+            assert!(truth.get_opt(new).await?.is_none(), "a diff created an object");
+            let a = truth.get(name).await?.data.and_then(|d| d.get("a").cloned());
+            assert_eq!(a.as_deref(), Some("1"), "a diff changed an object");
+            Ok(())
+        };
+        let result: Result<()> = checked.await;
+        truth.delete(name, &DeleteParams::default()).await?;
         result
     });
 }

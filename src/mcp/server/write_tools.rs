@@ -95,49 +95,7 @@ impl KubeMcp {
         let args =
             json!({"context": p.context, "namespace": p.namespace, "dry_run": p.dry_run, "bytes": p.manifest.len()});
         let mut call = self.begin(&parts, "apply_manifest", args)?;
-        let (client, kinds) = match self.hub.client(&p.context).await {
-            Ok(c) => c,
-            Err(e) => return call.finish(Err(e)),
-        };
-        let docs: Vec<serde_json::Value> = match crate::yaml::documents(&p.manifest) {
-            Ok(d) => d.into_iter().filter(|v| !v.is_null()).collect(),
-            Err(e) => return call.finish(Err(anyhow::anyhow!("invalid YAML: {e}"))),
-        };
-        if docs.is_empty() {
-            return call.finish(Err(anyhow::anyhow!("no objects in manifest")));
-        }
-        // Resolve and check every object before asking or changing anything.
-        let mut kinds = kinds;
-        let mut planned = Vec::new();
-        for doc in docs {
-            let api_version = doc["apiVersion"].as_str().unwrap_or_default().to_string();
-            let kind_name = doc["kind"].as_str().unwrap_or_default().to_string();
-            let find = |kinds: &[Kind]| {
-                kinds.iter().find(|k| k.ar.api_version == api_version && k.ar.kind == kind_name).cloned()
-            };
-            let mut kind = find(&kinds);
-            if kind.is_none()
-                && let Some(fresh) = self.hub.rediscover(&p.context).await
-            {
-                kind = find(&fresh);
-                kinds = fresh;
-            }
-            let Some(kind) = kind else {
-                return call.finish(Err(anyhow::anyhow!("unknown type {api_version} {kind_name}")));
-            };
-            let ns =
-                doc.pointer("/metadata/namespace").and_then(|v| v.as_str()).map(String::from).or(p.namespace.clone());
-            let ns = if kind.namespaced { ns } else { None };
-            require_ns(&call, &kind, ns.as_deref())?;
-            let Some(name) = doc.pointer("/metadata/name").and_then(|v| v.as_str()).map(String::from) else {
-                return Err(call.fail(format!("a {kind_name} has no metadata.name")));
-            };
-            if let Some(ns) = &ns {
-                k8s::names::validate_namespace(ns).map_err(|e| call.fail(e))?;
-            }
-            k8s::names::validate_name(&name).map_err(|e| call.fail(e))?;
-            planned.push((kind, ns, name, doc));
-        }
+        let (client, planned) = self.plan_manifest(&call, &p.context, p.namespace.as_ref(), &p.manifest).await?;
         // What the user approves is the content, not only the names; the log keeps what each object was.
         call.approval_detail = Some(manifest_summary(&planned));
         if let Some(args) = call.args.as_object_mut() {
@@ -294,5 +252,63 @@ impl KubeMcp {
         self.authorize(&mut call, &access).await?;
         self.recheck(&mut call, &access)?;
         call.finish(k8s::delete(client, kind, p.namespace, p.name, None, p.dry_run.unwrap_or(false)).await)
+    }
+}
+
+/// One object of a manifest, resolved: its kind, namespace, name and content.
+pub(super) type Planned = (Kind, Option<String>, String, serde_json::Value);
+
+impl KubeMcp {
+    /// Parse a manifest and resolve every object (kind, namespace, a valid name) before
+    /// anything is asked or changed.
+    pub(super) async fn plan_manifest(
+        &self,
+        call: &super::Call,
+        context: &str,
+        namespace: Option<&String>,
+        manifest: &str,
+    ) -> Result<(kube::Client, Vec<Planned>), String> {
+        let (client, mut kinds) = match self.hub.client(context).await {
+            Ok(c) => c,
+            Err(e) => return Err(call.finish(Err(e)).unwrap_err()),
+        };
+        let docs: Vec<serde_json::Value> = match crate::yaml::documents(manifest) {
+            Ok(d) => d.into_iter().filter(|v| !v.is_null()).collect(),
+            Err(e) => return Err(call.finish(Err(anyhow::anyhow!("invalid YAML: {e}"))).unwrap_err()),
+        };
+        if docs.is_empty() {
+            return Err(call.finish(Err(anyhow::anyhow!("no objects in manifest"))).unwrap_err());
+        }
+        let mut planned = Vec::new();
+        for doc in docs {
+            let api_version = doc["apiVersion"].as_str().unwrap_or_default().to_string();
+            let kind_name = doc["kind"].as_str().unwrap_or_default().to_string();
+            let find = |kinds: &[Kind]| {
+                kinds.iter().find(|k| k.ar.api_version == api_version && k.ar.kind == kind_name).cloned()
+            };
+            let mut kind = find(&kinds);
+            if kind.is_none()
+                && let Some(fresh) = self.hub.rediscover(context).await
+            {
+                kind = find(&fresh);
+                kinds = fresh;
+            }
+            let Some(kind) = kind else {
+                return Err(call.finish(Err(anyhow::anyhow!("unknown type {api_version} {kind_name}"))).unwrap_err());
+            };
+            let ns =
+                doc.pointer("/metadata/namespace").and_then(|v| v.as_str()).map(String::from).or(namespace.cloned());
+            let ns = if kind.namespaced { ns } else { None };
+            require_ns(call, &kind, ns.as_deref())?;
+            let Some(name) = doc.pointer("/metadata/name").and_then(|v| v.as_str()).map(String::from) else {
+                return Err(call.fail(format!("a {kind_name} has no metadata.name")));
+            };
+            if let Some(ns) = &ns {
+                k8s::names::validate_namespace(ns).map_err(|e| call.fail(e))?;
+            }
+            k8s::names::validate_name(&name).map_err(|e| call.fail(e))?;
+            planned.push((kind, ns, name, doc));
+        }
+        Ok((client, planned))
     }
 }

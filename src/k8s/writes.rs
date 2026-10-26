@@ -84,16 +84,33 @@ pub async fn apply(
     obj: serde_json::Value,
     dry_run: bool,
 ) -> Result<String> {
+    let label = kind.ar.kind.clone();
+    let name = obj.pointer("/metadata/name").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+    apply_value(client, kind, ns, obj, dry_run, false).await?;
+    Ok(format!("{}{label} {name} applied", if dry_run { "[dry run] " } else { "" }))
+}
+
+/// Server-side apply of one object; returns the object as the server has it after (or
+/// would have it, with `dry_run`). `force` takes over fields another manager owns.
+pub async fn apply_value(
+    client: Client,
+    kind: Kind,
+    ns: Option<String>,
+    obj: serde_json::Value,
+    dry_run: bool,
+    force: bool,
+) -> Result<serde_json::Value> {
     run(async move {
         let name =
             obj.pointer("/metadata/name").and_then(|v| v.as_str()).context("object has no metadata.name")?.to_string();
         let api = dyn_api(client, &kind, ns.as_deref());
         let mut pp = kube::api::PatchParams::apply("recouvrance-agent");
         pp.dry_run = dry_run;
+        pp.force = force;
         // Report misspelled fields instead of silently dropping them.
         pp.field_validation = Some(kube::api::ValidationDirective::Strict);
-        api.patch(&name, &pp, &kube::api::Patch::Apply(obj)).await?;
-        Ok(format!("{}{} {name} applied", if dry_run { "[dry run] " } else { "" }, kind.ar.kind))
+        let applied = api.patch(&name, &pp, &kube::api::Patch::Apply(obj)).await?;
+        Ok(serde_json::to_value(applied)?)
     })
     .await
 }
