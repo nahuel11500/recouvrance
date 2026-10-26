@@ -104,6 +104,8 @@ pub enum HubEvent {
     ApprovalResolved(u64),
     AgentSeen,
     ServerStatus(Result<u16, String>),
+    /// An agent's port-forward started, changed or stopped.
+    Forwards,
 }
 
 /// One context's connection, made once. Each context has its own, so a slow or
@@ -145,6 +147,8 @@ pub struct Hub {
     config_lock: Mutex<Option<std::fs::File>>,
     /// Why agents.json could not be read at start (see [`load_config`]).
     config_error: Option<String>,
+    /// Port-forwards agents opened.
+    forwards: super::forwards::AgentForwards,
 }
 
 impl Hub {
@@ -181,6 +185,7 @@ impl Hub {
             rules_text: Mutex::default(),
             config_lock: Mutex::default(),
             config_error,
+            forwards: super::forwards::AgentForwards::default(),
         })
     }
 
@@ -354,6 +359,29 @@ impl Hub {
             .context("saving agents.json")
     }
 
+    /// The port-forwards agents have open.
+    pub fn forwards(&self) -> Vec<super::forwards::ForwardInfo> {
+        self.forwards.list()
+    }
+
+    pub(super) fn agent_forwards(&self) -> &super::forwards::AgentForwards {
+        &self.forwards
+    }
+
+    /// Stop the agents' forwards `which` picks (the user's stop button, the agent's own
+    /// call, the kill switch, an expiry); returns how many stopped.
+    pub fn stop_forwards(&self, which: impl Fn(&super::forwards::ForwardInfo) -> bool) -> usize {
+        let n = self.forwards.stop(which);
+        if n > 0 {
+            self.emit(HubEvent::Forwards);
+        }
+        n
+    }
+
+    pub(super) fn forwards_changed(&self) {
+        self.emit(HubEvent::Forwards);
+    }
+
     pub fn agents_enabled(&self) -> bool {
         self.kill_switch.load(Ordering::SeqCst)
     }
@@ -366,6 +394,7 @@ impl Hub {
             for (_, tx) in lock(&self.approvals).drain() {
                 let _ = tx.send(Answer::SwitchedOff);
             }
+            self.stop_forwards(|_| true);
         }
         self.save()
     }
@@ -422,6 +451,10 @@ impl Hub {
             }
             cfg.agents = agents;
         }
+        // A disabled agent's forwards stop with its calls.
+        let enabled: Vec<String> =
+            read(&self.config).agents.iter().filter(|a| a.enabled).map(|a| a.id.clone()).collect();
+        self.stop_forwards(|f| !enabled.contains(&f.agent_id));
         self.save()
     }
 
@@ -434,6 +467,7 @@ impl Hub {
             cfg.agents.retain(|a| a.id != id);
             self.export_rules(&cfg.agents)
         };
+        self.stop_forwards(|f| f.agent_id == id);
         self.save()?;
         exported
     }

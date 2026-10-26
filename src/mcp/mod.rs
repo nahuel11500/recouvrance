@@ -5,6 +5,7 @@ use std::sync::{Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard, RwLockW
 
 mod audit;
 mod config;
+pub mod forwards;
 mod hub;
 mod policy;
 pub mod rules_file;

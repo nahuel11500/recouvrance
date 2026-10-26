@@ -426,3 +426,56 @@ fn an_agent_runs_a_cronjob_and_debugs_a_pod() {
         result
     });
 }
+
+/// An agent's port-forward needs a rule for it, reaches the pod, and closes when agent
+/// access is switched off.
+#[test]
+#[ignore]
+fn an_agent_s_port_forward_follows_its_rules() {
+    use k8s_openapi::api::core::v1::Pod;
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    /// What `GET /` on the local port answers.
+    async fn fetch(port: u16) -> Result<String> {
+        let mut socket = tokio::net::TcpStream::connect(("127.0.0.1", port)).await?;
+        socket.write_all(b"GET / HTTP/1.0\r\n\r\n").await?;
+        let mut text = String::new();
+        tokio::time::timeout(std::time::Duration::from_secs(20), socket.read_to_string(&mut text)).await??;
+        Ok(text)
+    }
+
+    run(async {
+        let ctx = context();
+        let pods: Api<Pod> = Api::namespaced(k8s::connect_for_agents(ctx.clone()).await?, NS);
+        let name = "e2e-forward";
+        let checked = async {
+            busybox_pod(
+                &pods,
+                name,
+                "mkdir -p /www && echo forwarded-ok > /www/index.html && httpd -f -p 8080 -h /www",
+            )
+            .await?;
+            let (hub, agent, token, _server) = agent(&["get,list *"], &[]).await?;
+            let client = crate::assistant::Mcp::connect(hub.port(), token).await?;
+            let args = json!({"context": ctx, "namespace": NS, "pod": name, "port": 8080});
+            let out = client.call("port_forward", args.clone()).await;
+            assert!(out.contains("Denied"), "{out}");
+            assert!(hub.forwards().is_empty());
+
+            let allow = rules_file::parse_rule(Mode::Allow, "forward pods/e2e-* -n default")?;
+            hub.update_agent(&agent.id, |a| a.policy.rules.push(allow))?;
+            let out = client.call("port_forward", args).await;
+            let port = hub.forwards().first().map(|f| f.local).with_context(|| format!("no forward: {out}"))?;
+            let page = fetch(port).await?;
+            assert!(page.contains("forwarded-ok"), "{page}");
+
+            hub.set_agents_enabled(false)?;
+            assert!(hub.forwards().is_empty(), "the kill switch stops agents' forwards");
+            assert!(fetch(port).await.is_err(), "the port still answers after the kill switch");
+            Ok(())
+        };
+        let result: Result<()> = checked.await;
+        pods.delete(name, &DeleteParams::default().grace_period(0)).await?;
+        result
+    });
+}

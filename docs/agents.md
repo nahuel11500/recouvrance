@@ -85,6 +85,12 @@ Tools: `my_permissions`, `list_contexts`, `list_resource_types`, `list_resources
 `delete_resource`, `rollout_history`, `rollout_status`, `rollout_undo`. `scale`, `rollout_restart`,
 `rollout_undo`, `patch_resource`, `apply_manifest` and `delete_resource` support `dry_run`; `exec_command`, `drain_node` and `gitops` don't.
 
+- **Port-forwards:** `port_forward`, `list_port_forwards`, `stop_port_forward`. `port_forward` needs the
+  `forward` verb on the pod or Service (no preset grants it): it is a network path into the cluster.
+  It listens on 127.0.0.1 only, for `minutes` (60 by default, 8 hours at most), shows in the
+  sidebar's port-forwards with the agent's name, and stops when agent access is switched off or the
+  agent is disabled or deleted. A Service port goes to its `targetPort` on one of its pods.
+
 - **Jobs and debugging:** `trigger_cronjob` needs `get` on the CronJob and `apply` on the Job it
   creates, named `<cronjob>-manual-<number>` (so `jobs/nightly-manual-*` can be allowed). `debug_pod`
   needs `exec` on the pod: it adds an ephemeral container (busybox by default) that the agent then
