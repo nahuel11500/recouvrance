@@ -75,47 +75,49 @@ the node runs pods it would evict in a namespace a Deny rule covers for `delete`
 runs, each pod is checked again right before its eviction: a pod such a Deny now covers is left in
 place, and switching agent access off, disabling the agent or taking away its drain rule stops the
 evictions that remain (the node stays cordoned). Its reply counts every pod it could not evict but
-names only those an Allow rule lets the agent list. `rollout_undo` needs `patch` on the workload
-(it replaces its pod template with an earlier revision's); `rollout_status` can wait up to 5 minutes
-and stops waiting when the agent's access to the workload ends.
+names only those an Allow rule lets the agent list.
 
-Tools: `my_permissions`, `list_contexts`, `list_resource_types`, `list_resources`, `get_resource`,
-`describe_resource`, `top_pods`, `search`, `get_events`, `find_problems`, `check_certificates`, `usage_history`, `drain_node`, `gitops`,
-`get_logs`, `exec_command`, `scale`, `rollout_restart`, `patch_resource`, `apply_manifest`,
-`delete_resource`, `rollout_history`, `rollout_status`, `rollout_undo`. `scale`, `rollout_restart`,
-`rollout_undo`, `patch_resource`, `apply_manifest` and `delete_resource` support `dry_run`; `exec_command`, `drain_node` and `gitops` don't.
+Tools, by what they do:
 
+- **Read:** `my_permissions`, `list_contexts`, `list_resource_types`, `list_resources`, `get_resource`,
+  `describe_resource`, `search`, `get_events`, `find_problems`, `check_certificates`, `top_pods`,
+  `top_nodes`, `usage_history`, `get_logs`, `workload_logs`, `rollout_history`, `rollout_status`,
+  `list_helm_releases`, `helm_history`, `helm_get_values`, `diff_manifest`, `explain_resource`,
+  `can_i`, `cluster_version`, `wait_for`, `list_port_forwards`.
+- **Change:** `scale`, `rollout_restart`, `rollout_undo`, `rollout_pause`, `rollout_resume`,
+  `set_image`, `patch_resource`, `apply_manifest`, `delete_resource`, `trigger_cronjob`,
+  `cordon_node`, `uncordon_node`, `drain_node`, `gitops`, `exec_command`, `debug_pod`,
+  `port_forward`, `stop_port_forward`.
+
+Every change supports `dry_run` except `exec_command`, `drain_node`, `gitops` and the port-forward
+tools. What some of them need beyond the obvious verb:
+
+- **Logs of a workload:** `workload_logs` merges the logs of a workload's or Service's pods (the
+  newest 20) in time order, each line prefixed with its pod. It needs `get` on the workload; pods
+  whose logs the rules don't allow are left out and counted.
+- **Rollouts:** `rollout_undo`, `rollout_pause`, `rollout_resume` and `set_image` need `patch`.
+  `rollout_status` and `wait_for` need `get` and wait up to 5 minutes, stopping when the agent's
+  access ends.
+- **Nodes:** `cordon_node` and `uncordon_node` need the `drain` verb on the node; `top_nodes`
+  needs `list` on nodes and metrics-server.
+- **Jobs and debugging:** `trigger_cronjob` needs `get` on the CronJob and `apply` on the Job it
+  creates, named `<cronjob>-manual-<number>` (so `jobs/nightly-manual-*` can be allowed).
+  `debug_pod` needs `exec` on the pod: it adds an ephemeral container (busybox by default) that the
+  agent then runs commands in with `exec_command`.
+- **Port-forwards:** `port_forward` needs the `forward` verb on the pod or Service (no preset grants
+  it): it is a network path into the cluster. It listens on 127.0.0.1 only, for `minutes` (60 by
+  default, 8 hours at most), shows in the sidebar's port-forwards with the agent's name, and stops
+  when agent access is switched off or the agent is disabled or deleted. A Service port goes to its
+  `targetPort` on one of its pods.
+- **Helm:** the Helm tools read the Secrets Helm keeps releases in, so the rules on `secrets`
+  decide: `list` for releases and history, `get` on `sh.helm.release.v1.<name>.v<revision>` for
+  values, whose secret-looking keys are masked unless `reveal` is allowed.
 - **Diff:** `diff_manifest` shows what `apply_manifest` would change, object by object, from a
   server-side dry run. It needs `get` on each object, changes nothing, masks Secret values unless
   `reveal` is allowed, and says when the apply would hit a field-manager conflict.
-
-- **Helm:** `list_helm_releases`, `helm_history`, `helm_get_values` read the Secrets Helm keeps
-  releases in, so the rules on `secrets` decide: `list` for releases and history, `get` on
-  `sh.helm.release.v1.<name>.v<revision>` for values, whose secret-looking keys are masked unless
-  `reveal` is allowed.
-
-- **Nodes:** `cordon_node`, `uncordon_node` (the `drain` verb on the node, `dry_run`), `top_nodes`
-  (`list` on nodes).
-
-- **Port-forwards:** `port_forward`, `list_port_forwards`, `stop_port_forward`. `port_forward` needs the
-  `forward` verb on the pod or Service (no preset grants it): it is a network path into the cluster.
-  It listens on 127.0.0.1 only, for `minutes` (60 by default, 8 hours at most), shows in the
-  sidebar's port-forwards with the agent's name, and stops when agent access is switched off or the
-  agent is disabled or deleted. A Service port goes to its `targetPort` on one of its pods.
-
-- **Jobs and debugging:** `trigger_cronjob` needs `get` on the CronJob and `apply` on the Job it
-  creates, named `<cronjob>-manual-<number>` (so `jobs/nightly-manual-*` can be allowed). `debug_pod`
-  needs `exec` on the pod: it adds an ephemeral container (busybox by default) that the agent then
-  runs commands in with `exec_command`. Both support `dry_run`.
-- **Workload logs:** `workload_logs` merges the logs of a workload's or Service's pods (the newest 20)
-  in time order, each line prefixed with its pod; it needs `get` on the workload, and pods whose logs
-  the rules don't allow are left out and counted.
-- **Images and paused rollouts:** `set_image` (one container's image, by name, in `containers` or
-  `initContainers`), `rollout_pause` and `rollout_resume` (Deployments) need `patch` and support
-  `dry_run`.
 - **About the cluster:** `explain_resource` (field docs, CRDs included) and `cluster_version` read
   no objects; `can_i` asks the API server what the kubeconfig user may do (the agent's own rules are
-  `my_permissions`); `wait_for` needs `get` on the object and waits up to 5 minutes.
+  `my_permissions`).
 
 Prompts (slash commands in Claude Code: `/mcp__recouvrance__troubleshoot` …): `troubleshoot`, `rightsize`,
 `cert-audit`, `cluster-health`. They chain the tools above into a read-only workflow.

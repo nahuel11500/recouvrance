@@ -33,7 +33,9 @@ A fast Kubernetes desktop client (Rust + [gpui](https://github.com/zed-industrie
 - **Access made clear**: Role, binding and ServiceAccount pages, a *who can* inspector, and
   short-lived kubeconfigs for ServiceAccounts.
 - **Built for agents**: a local MCP server so Claude Code (or any MCP client) works on your clusters
-  under rules you control (allow, ask, deny), with approvals and an audit log. The in-app assistant
+  under rules you control (allow, ask, deny), with approvals and an audit log. 40+ tools cover what
+  you'd do with kubectl and Helm: logs, diffs, rollouts and rollbacks, port-forwards, debug
+  containers, cordon and drain, `explain` and `can-i`. The in-app assistant
   uses your Claude Code login (no API key needed), or an Anthropic API key without Claude Code.
 
 ## Screenshots
