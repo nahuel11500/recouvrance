@@ -43,69 +43,71 @@ fn since(t: Option<jiff::Timestamp>, secs: i64) -> bool {
     t.is_none_or(|t| jiff::Timestamp::now().as_second() - t.as_second() > secs)
 }
 
+/// [`judge`] for a pod's row: the pods list colors a pod's containers that aren't ready by it.
+pub fn judge_pod(defs: &[ColumnDef], row: &Row) -> Option<(Severity, String)> {
+    let c = |n: &str| cell(defs, row, n);
+    let status = c("Status");
+    let restarts: i64 = c("Restarts").split(' ').next().and_then(|n| n.parse().ok()).unwrap_or(0);
+    // Pods of CronJob runs (`name-<minutes>-xxxxx`) failing is one failed run, not an outage.
+    let job_pod = {
+        let parts: Vec<&str> = row.name.rsplitn(3, '-').collect();
+        parts.len() == 3 && parts[1].len() >= 8 && parts[1].bytes().all(|b| b.is_ascii_digit())
+    };
+    match status {
+        "Completed" | "Succeeded" => None,
+        "Error" | "OOMKilled" if job_pod => Some((Severity::Warning, format!("CronJob run failed ({status})"))),
+        // Exited with an error and not restarting: a failed run, not an outage.
+        "Error" => Some((Severity::Warning, "exited with an error".into())),
+        "CrashLoopBackOff"
+        | "OOMKilled"
+        | "ImagePullBackOff"
+        | "ErrImagePull"
+        | "InvalidImageName"
+        | "CreateContainerConfigError"
+        | "CreateContainerError"
+        | "RunContainerError"
+        | "Evicted"
+        | "ContainerStatusUnknown" => Some((Severity::Critical, status.into())),
+        // Init:N/M is init containers still running: like Pending. Init:<reason>
+        // (CrashLoopBackOff, Error, ImagePullBackOff…) is one failing.
+        s if s.strip_prefix("Init:").is_some_and(|r| ratio(r).is_none()) => Some((Severity::Critical, s.into())),
+        s if s.starts_with("Init:") => {
+            older_than(row, 300).then(|| (Severity::Warning, format!("{s} for more than 5 minutes")))
+        }
+        "Pending" | "SchedulingGated" | "ContainerCreating" | "PodInitializing" if older_than(row, 300) => {
+            Some((Severity::Warning, format!("{status} for more than 5 minutes")))
+        }
+        // From the deletion (its grace period's end), not the creation.
+        "Terminating" if since(row.deleted_at.or(row.created), 600) => {
+            Some((Severity::Warning, STUCK_TERMINATING.into()))
+        }
+        "Running" => match ratio(c("Ready")) {
+            Some((r, t)) if r < t && older_than(row, 300) => {
+                Some((Severity::Warning, format!("running but {r}/{t} containers ready")))
+            }
+            _ if restarts >= 5 && c("Restarts").contains("ago") && !c("Restarts").contains('d') => {
+                let last = c("Restarts").split('(').nth(1).unwrap_or("").trim_end_matches(')').to_string();
+                // Restarted within the hour: still flapping. kubectl writes up to
+                // 3 hours in minutes ("150m ago").
+                let ago = k8s::age_seconds(last.trim_end_matches(" ago"));
+                let recent = ago.is_none_or(|s| s <= 3600);
+                Some((
+                    if recent { Severity::Warning } else { Severity::Info },
+                    format!("{restarts} restarts, last {last}"),
+                ))
+            }
+            _ => None,
+        },
+        "Pending" | "SchedulingGated" | "ContainerCreating" | "PodInitializing" | "Terminating" => None,
+        other => Some((Severity::Warning, other.into())),
+    }
+}
+
 /// Judge one table row of a kind; None when it looks healthy.
 pub fn judge(kind: &Kind, defs: &[ColumnDef], row: &Row) -> Option<(Severity, String)> {
     let c = |n: &str| cell(defs, row, n);
     match (kind.ar.group.as_str(), kind.ar.kind.as_str()) {
-        ("", "Pod") => {
-            let status = c("Status");
-            let restarts: i64 = c("Restarts").split(' ').next().and_then(|n| n.parse().ok()).unwrap_or(0);
-            // Pods of CronJob runs (`name-<minutes>-xxxxx`) failing is one failed run, not an outage.
-            let job_pod = {
-                let parts: Vec<&str> = row.name.rsplitn(3, '-').collect();
-                parts.len() == 3 && parts[1].len() >= 8 && parts[1].bytes().all(|b| b.is_ascii_digit())
-            };
-            match status {
-                "Completed" | "Succeeded" => None,
-                "Error" | "OOMKilled" if job_pod => Some((Severity::Warning, format!("CronJob run failed ({status})"))),
-                // Exited with an error and not restarting: a failed run, not an outage.
-                "Error" => Some((Severity::Warning, "exited with an error".into())),
-                "CrashLoopBackOff"
-                | "OOMKilled"
-                | "ImagePullBackOff"
-                | "ErrImagePull"
-                | "InvalidImageName"
-                | "CreateContainerConfigError"
-                | "CreateContainerError"
-                | "RunContainerError"
-                | "Evicted"
-                | "ContainerStatusUnknown" => Some((Severity::Critical, status.into())),
-                // Init:N/M is init containers still running: like Pending. Init:<reason>
-                // (CrashLoopBackOff, Error, ImagePullBackOff…) is one failing.
-                s if s.strip_prefix("Init:").is_some_and(|r| ratio(r).is_none()) => {
-                    Some((Severity::Critical, s.into()))
-                }
-                s if s.starts_with("Init:") => {
-                    older_than(row, 300).then(|| (Severity::Warning, format!("{s} for more than 5 minutes")))
-                }
-                "Pending" | "SchedulingGated" | "ContainerCreating" | "PodInitializing" if older_than(row, 300) => {
-                    Some((Severity::Warning, format!("{status} for more than 5 minutes")))
-                }
-                // From the deletion (its grace period's end), not the creation.
-                "Terminating" if since(row.deleted_at.or(row.created), 600) => {
-                    Some((Severity::Warning, STUCK_TERMINATING.into()))
-                }
-                "Running" => match ratio(c("Ready")) {
-                    Some((r, t)) if r < t && older_than(row, 300) => {
-                        Some((Severity::Warning, format!("running but {r}/{t} containers ready")))
-                    }
-                    _ if restarts >= 5 && c("Restarts").contains("ago") && !c("Restarts").contains('d') => {
-                        let last = c("Restarts").split('(').nth(1).unwrap_or("").trim_end_matches(')').to_string();
-                        // Restarted within the hour: still flapping. kubectl writes up to
-                        // 3 hours in minutes ("150m ago").
-                        let ago = k8s::age_seconds(last.trim_end_matches(" ago"));
-                        let recent = ago.is_none_or(|s| s <= 3600);
-                        Some((
-                            if recent { Severity::Warning } else { Severity::Info },
-                            format!("{restarts} restarts, last {last}"),
-                        ))
-                    }
-                    _ => None,
-                },
-                "Pending" | "SchedulingGated" | "ContainerCreating" | "PodInitializing" | "Terminating" => None,
-                other => Some((Severity::Warning, other.into())),
-            }
-        }
+        ("", "Pod") => judge_pod(defs, row),
         ("apps", "Deployment" | "StatefulSet") => match ratio(c("Ready")) {
             Some((0, t)) if t > 0 => Some((Severity::Critical, format!("0/{t} ready"))),
             Some((r, t)) if r < t && older_than(row, 300) => Some((Severity::Warning, format!("{r}/{t} ready"))),
@@ -294,6 +296,19 @@ mod tests {
 
     fn defs(names: &[&str]) -> Vec<ColumnDef> {
         names.iter().map(|n| ColumnDef { name: n.to_string(), priority: 0 }).collect()
+    }
+
+    #[test]
+    fn a_running_pod_not_ready_for_5_minutes_is_a_problem() {
+        let d = defs(&["Name", "Ready", "Status", "Restarts"]);
+        let mut pod = row(&["x", "0/1", "Running", "0"]);
+        pod.created = Some(jiff::Timestamp::now() - jiff::SignedDuration::from_mins(10));
+        assert_eq!(judge_pod(&d, &pod).map(|j| j.0), Some(Severity::Warning));
+        // Just started: its readiness probe may not have passed yet.
+        pod.created = Some(jiff::Timestamp::now() - jiff::SignedDuration::from_mins(1));
+        assert_eq!(judge_pod(&d, &pod), None);
+        let ready = row(&["x", "1/1", "Running", "0"]);
+        assert_eq!(judge_pod(&d, &ready), None);
     }
 
     #[test]

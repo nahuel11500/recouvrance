@@ -294,22 +294,18 @@ impl TableDelegate for ResourceTable {
                 .into_any_element();
         }
         let header = self.header(col);
-        // Pods: one dot per container (green ready, red failing, grey not ready).
+        // Pods: one dot per container (green ready, red when the pod has a problem, grey
+        // while it starts). The Problems page's judgment decides, so the two agree: running
+        // but not ready for 5 minutes is red, like a crash loop.
         if self.pods
             && header == "Ready"
             && let Some((ready, total)) =
                 cell.split_once('/').and_then(|(r, t)| Some((r.parse::<usize>().ok()?, t.parse::<usize>().ok()?)))
         {
             let status = self.cells_text(row, "Status").unwrap_or_default();
-            let failing = !matches!(
-                status,
-                "Running"
-                    | "Completed"
-                    | "Succeeded"
-                    | "Pending"
-                    | "ContainerCreating"
-                    | "PodInitializing"
-                    | "Terminating"
+            let failing = matches!(
+                crate::problems::judge_pod(&self.defs, row),
+                Some((crate::problems::Severity::Critical | crate::problems::Severity::Warning, _))
             );
             let done = matches!(status, "Completed" | "Succeeded");
             return h_flex()
