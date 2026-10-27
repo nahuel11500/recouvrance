@@ -561,6 +561,10 @@ fn an_agent_reads_helm_releases_by_its_secret_rules() {
         };
         let result: Result<()> = checked.await;
         secrets.delete(name, &DeleteParams::default()).await?;
+        result
+    });
+}
+
 /// A Deployment's logs come from all its pods, merged; pods whose logs the rules deny are
 /// left out and counted.
 #[test]
