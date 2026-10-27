@@ -517,6 +517,10 @@ fn an_agent_cordons_a_node_with_its_drain_rule() {
         let result: Result<()> = checked.await;
         let patch = Patch::Merge(json!({"spec": {"unschedulable": false}}));
         nodes.patch(&node, &PatchParams::default(), &patch).await?;
+        result
+    });
+}
+
 /// Helm releases are read from their Secrets: denied by a Deny on secrets, listed with the
 /// chart otherwise, and their secret-looking values masked unless the agent may reveal.
 #[test]

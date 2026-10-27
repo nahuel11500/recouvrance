@@ -23,11 +23,10 @@ use serde::Deserialize;
 use super::{Access, Agent, Answer, AuditEntry, Decision, Hub, HubEvent, Mode, Policy, Verb};
 use crate::k8s::{self, Kind, TaskGuard};
 
+mod helm_tools;
 mod job_tools;
 mod node_tools;
 mod ops_tools;
-mod helm_tools;
-mod job_tools;
 mod read_tools;
 mod rollout_tools;
 mod write_tools;
@@ -838,12 +837,7 @@ impl KubeMcp {
     }
 }
 
-#[tool_handler(router = (Self::read_tools() + Self::write_tools() + Self::rollout_tools() + Self::job_tools() + Self::ops_tools() + Self::node_tools()))]
-#[tool_handler(router = (Self::read_tools() + Self::write_tools() + Self::rollout_tools() + Self::job_tools()))]
-#[tool_handler(router = (Self::read_tools() + Self::write_tools() + Self::rollout_tools()))]
-#[tool_handler(router = (Self::read_tools() + Self::write_tools() + Self::helm_tools()))]
-#[tool_handler(router = (Self::read_tools() + Self::write_tools() + Self::rollout_tools() + Self::helm_tools()))]
-#[tool_handler(router = (Self::read_tools() + Self::write_tools() + Self::rollout_tools() + Self::job_tools() + Self::helm_tools()))]
+#[tool_handler(router = (Self::read_tools() + Self::write_tools() + Self::rollout_tools() + Self::job_tools() + Self::ops_tools() + Self::node_tools() + Self::helm_tools()))]
 #[prompt_handler]
 impl ServerHandler for KubeMcp {
     fn get_info(&self) -> ServerConfig {
