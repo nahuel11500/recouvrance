@@ -23,8 +23,8 @@ use serde::Deserialize;
 use super::{Access, Agent, Answer, AuditEntry, Decision, Hub, HubEvent, Mode, Policy, Verb};
 use crate::k8s::{self, Kind, TaskGuard};
 
-mod helm_tools;
 mod diff_tools;
+mod helm_tools;
 mod job_tools;
 mod logs_tools;
 mod node_tools;
@@ -848,6 +848,7 @@ impl KubeMcp {
 #[tool_handler(router = (Self::read_tools() + Self::write_tools() + Self::rollout_tools() + Self::diff_tools()))]
 #[tool_handler(router = (Self::read_tools() + Self::write_tools() + Self::rollout_tools() + Self::job_tools() + Self::diff_tools()))]
 #[tool_handler(router = (Self::read_tools() + Self::write_tools() + Self::rollout_tools() + Self::job_tools() + Self::ops_tools() + Self::node_tools() + Self::diff_tools()))]
+#[tool_handler(router = (Self::read_tools() + Self::write_tools() + Self::rollout_tools() + Self::job_tools() + Self::ops_tools() + Self::node_tools() + Self::helm_tools() + Self::diff_tools()))]
 #[prompt_handler]
 impl ServerHandler for KubeMcp {
     fn get_info(&self) -> ServerConfig {
