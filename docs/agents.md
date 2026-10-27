@@ -85,6 +85,10 @@ Tools: `my_permissions`, `list_contexts`, `list_resource_types`, `list_resources
 `delete_resource`, `rollout_history`, `rollout_status`, `rollout_undo`. `scale`, `rollout_restart`,
 `rollout_undo`, `patch_resource`, `apply_manifest` and `delete_resource` support `dry_run`; `exec_command`, `drain_node` and `gitops` don't.
 
+- **Diff:** `diff_manifest` shows what `apply_manifest` would change, object by object, from a
+  server-side dry run. It needs `get` on each object, changes nothing, masks Secret values unless
+  `reveal` is allowed, and says when the apply would hit a field-manager conflict.
+
 - **Helm:** `list_helm_releases`, `helm_history`, `helm_get_values` read the Secrets Helm keeps
   releases in, so the rules on `secrets` decide: `list` for releases and history, `get` on
   `sh.helm.release.v1.<name>.v<revision>` for values, whose secret-looking keys are masked unless
