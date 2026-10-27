@@ -9,12 +9,16 @@
 # See docs/development.md, "Releases".
 name: Release-plz
 
-# The release pull request is opened or brought up to date only when the workflow is run by hand
-# (Actions → Release-plz → Run workflow): updated on every push to `main`, it ran CI and CodeQL
-# again each time. Publishing still runs on pushes to `main`, so merging the pull request releases.
+# The release pull request is opened or brought up to date every two hours, and when the workflow is
+# run by hand (Actions → Release-plz → Run workflow): updated on every push to `main`, it ran CI and
+# CodeQL again each time. Publishing still runs on pushes to `main`, so merging the pull request
+# releases.
 on:
   push:
     branches: [main]
+  schedule:
+    # Off the hour, when GitHub's scheduler is less busy.
+    - cron: "17 */2 * * *"
   workflow_dispatch:
 
 permissions: {}
@@ -72,7 +76,7 @@ jobs:
 
   pull-request:
     name: Release pull request
-    if: vars.RELEASES_ENABLED == 'true' && github.event_name == 'workflow_dispatch'
+    if: vars.RELEASES_ENABLED == 'true' && (github.event_name == 'workflow_dispatch' || github.event_name == 'schedule')
     runs-on: ubuntu-latest
     environment: release
     permissions:
