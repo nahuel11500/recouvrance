@@ -561,6 +561,10 @@ fn an_agent_reads_helm_releases_by_its_secret_rules() {
         };
         let result: Result<()> = checked.await;
         secrets.delete(name, &DeleteParams::default()).await?;
+        result
+    });
+}
+
 /// Pausing, resuming and setting an image need the agent's patch rule; the image lands on
 /// the container named, and a paused Deployment says so.
 #[test]
