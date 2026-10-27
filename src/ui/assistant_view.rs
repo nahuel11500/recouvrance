@@ -58,11 +58,32 @@ impl AssistantView {
                 }
             }
         })];
+        // RECOUVRANCE_CHAT_FILE=<markdown>: a question and that answer, to look at the rendering.
+        #[cfg(feature = "dev")]
+        let entries = std::env::var("RECOUVRANCE_CHAT_FILE")
+            .ok()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .map(|md| {
+                vec![
+                    Entry::User("Why are five Elasticsearch pods not ready?".into()),
+                    Entry::Assistant(vec![
+                        Step::Tool {
+                            name: "get_events".into(),
+                            args: "{\"namespace\":\"logging\"}".into(),
+                            result: "…".into(),
+                        },
+                        Step::Text(md),
+                    ]),
+                ]
+            })
+            .unwrap_or_default();
+        #[cfg(not(feature = "dev"))]
+        let entries = Vec::new();
         Self {
             hub,
             scope,
             conv: Default::default(),
-            entries: Vec::new(),
+            entries,
             input,
             key_input,
             setup_error: None,
@@ -229,7 +250,7 @@ impl Render for AssistantView {
                     rows.push(div().text_sm().text_color(theme.danger).child(m.clone()).into_any_element());
                 }
                 Entry::Assistant(steps) => {
-                    let mut col = v_flex().gap_2().max_w(px(900.));
+                    let mut col = v_flex().gap_2();
                     for (si, s) in steps.iter().enumerate() {
                         col = col.child(match s {
                             Step::Running { name, args } => h_flex()
@@ -251,6 +272,7 @@ impl Render for AssistantView {
                                         SharedString::from(format!("md-{ei}-{si}")),
                                         t.clone(),
                                     )
+                                    .style(chat_text_style())
                                     .selectable(true)
                                     // Model output is untrusted: only web links open.
                                     .on_link_click(|url, _, _, cx| {
@@ -359,42 +381,59 @@ impl Render for AssistantView {
                         .overflow_y_scroll()
                         .track_scroll(&self.scroll)
                         .p_4()
-                        .gap_4()
-                        .when(self.entries.is_empty(), |d| {
-                            d.child(div().text_sm().text_color(muted).child("Try:")).children(
-                                SUGGESTIONS.iter().enumerate().map(|(i, s)| {
-                                    let q = s.to_string();
-                                    Button::new(("suggest", i))
-                                        .outline()
-                                        .label(q.clone())
-                                        .on_click(cx.listener(move |this, _, _, cx| this.send(q.clone(), cx)))
-                                }),
-                            )
-                        })
-                        .children(rows),
+                        .items_center()
+                        .child(
+                            // One centered column: questions on its right, answers on its left.
+                            v_flex()
+                                .w_full()
+                                .max_w(px(CHAT_WIDTH))
+                                .gap_4()
+                                .when(self.entries.is_empty(), |d| {
+                                    d.child(div().text_sm().text_color(muted).child("Try:")).children(
+                                        SUGGESTIONS.iter().enumerate().map(|(i, s)| {
+                                            let q = s.to_string();
+                                            Button::new(("suggest", i))
+                                                .outline()
+                                                .label(q.clone())
+                                                .on_click(cx.listener(move |this, _, _, cx| this.send(q.clone(), cx)))
+                                        }),
+                                    )
+                                })
+                                .children(rows),
+                        ),
                 ),
             )
             .child(
-                h_flex()
-                    .gap_2()
-                    .p_3()
-                    .border_t_1()
-                    .border_color(theme.border)
-                    .child(div().flex_1().child(Input::new(&self.input).disabled(self.busy)))
-                    .when(self.busy, |d| {
-                        d.child(Button::new("stop").small().outline().icon(Lucide::Square).label("Stop").on_click(
-                            cx.listener(|this, _, _, cx| {
-                                // Dropping the task stops the question, and Claude Code with it.
-                                this._task = None;
-                                this.busy = false;
-                                this.entries.push(Entry::Error("Stopped.".into()));
-                                cx.notify();
-                            }),
-                        ))
-                    }),
+                h_flex().justify_center().p_3().border_t_1().border_color(theme.border).child(
+                    h_flex()
+                        .w_full()
+                        .max_w(px(CHAT_WIDTH))
+                        .gap_2()
+                        .child(div().flex_1().child(Input::new(&self.input).disabled(self.busy)))
+                        .when(self.busy, |d| {
+                            d.child(Button::new("stop").small().outline().icon(Lucide::Square).label("Stop").on_click(
+                                cx.listener(|this, _, _, cx| {
+                                    // Dropping the task stops the question, and Claude Code with it.
+                                    this._task = None;
+                                    this.busy = false;
+                                    this.entries.push(Entry::Error("Stopped.".into()));
+                                    cx.notify();
+                                }),
+                            ))
+                        }),
+                ),
             )
             .into_any_element()
     }
+}
+
+/// How wide the conversation gets: lines stay readable on a wide window.
+const CHAT_WIDTH: f32 = 920.;
+
+/// Answers' Markdown: code blocks in the same small size as the text around them (the theme
+/// draws them larger, which made a reply's commands the biggest thing on screen).
+fn chat_text_style() -> component::text::TextViewStyle {
+    component::text::TextViewStyle::default().code_block(StyleRefinement::default().text_xs())
 }
 
 fn truncate(s: &str, n: usize) -> String {
