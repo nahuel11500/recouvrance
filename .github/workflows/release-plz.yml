@@ -59,7 +59,7 @@ jobs:
       # with publish-new scope is needed.
       - name: Publish (registry token)
         if: env.HAS_CARGO_TOKEN == 'true'
-        uses: release-plz/action@8b5bf233ecb5779f63508db7cd050e948ee77cc2 # v0.5.144
+        uses: release-plz/action@7ef5e4d4b0420630cfcaeb182c01e13651d4c577 # v0.5.145
         with:
           command: release
         env:
@@ -68,7 +68,7 @@ jobs:
       # Every later publish: no token, release-plz uses crates.io trusted publishing.
       - name: Publish (trusted publishing)
         if: env.HAS_CARGO_TOKEN != 'true'
-        uses: release-plz/action@8b5bf233ecb5779f63508db7cd050e948ee77cc2 # v0.5.144
+        uses: release-plz/action@7ef5e4d4b0420630cfcaeb182c01e13651d4c577 # v0.5.145
         with:
           command: release
         env:
@@ -94,7 +94,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master, 2026-10-01
         with:
           toolchain: stable
-      - uses: release-plz/action@8b5bf233ecb5779f63508db7cd050e948ee77cc2 # v0.5.144
+      - uses: release-plz/action@7ef5e4d4b0420630cfcaeb182c01e13651d4c577 # v0.5.145
         with:
           command: release-pr
         env:
