@@ -85,6 +85,9 @@ Tools: `my_permissions`, `list_contexts`, `list_resource_types`, `list_resources
 `delete_resource`, `rollout_history`, `rollout_status`, `rollout_undo`. `scale`, `rollout_restart`,
 `rollout_undo`, `patch_resource`, `apply_manifest` and `delete_resource` support `dry_run`; `exec_command`, `drain_node` and `gitops` don't.
 
+- **Nodes:** `cordon_node`, `uncordon_node` (the `drain` verb on the node, `dry_run`), `top_nodes`
+  (`list` on nodes).
+
 - **Port-forwards:** `port_forward`, `list_port_forwards`, `stop_port_forward`. `port_forward` needs the
   `forward` verb on the pod or Service (no preset grants it): it is a network path into the cluster.
   It listens on 127.0.0.1 only, for `minutes` (60 by default, 8 hours at most), shows in the
