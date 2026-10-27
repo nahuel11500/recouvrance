@@ -517,6 +517,10 @@ fn an_agent_cordons_a_node_with_its_drain_rule() {
         let result: Result<()> = checked.await;
         let patch = Patch::Merge(json!({"spec": {"unschedulable": false}}));
         nodes.patch(&node, &PatchParams::default(), &patch).await?;
+        result
+    });
+}
+
 /// `diff_manifest` shows what an apply would change, with get rules only, and changes nothing.
 #[test]
 #[ignore]
