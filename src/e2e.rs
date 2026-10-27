@@ -621,6 +621,9 @@ fn an_agent_reads_a_workload_s_logs() {
         let result: Result<()> = checked.await;
         deps.delete(name, &DeleteParams::default()).await?;
         result
+    });
+}
+
 /// The read-only questions about the cluster: explain, can-i, version and wait.
 #[test]
 #[ignore]

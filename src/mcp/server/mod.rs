@@ -852,6 +852,7 @@ impl KubeMcp {
 #[tool_handler(router = (Self::read_tools() + Self::write_tools() + Self::rollout_tools() + Self::job_tools() + Self::cluster_tools()))]
 #[tool_handler(router = (Self::read_tools() + Self::write_tools() + Self::rollout_tools() + Self::job_tools() + Self::ops_tools() + Self::node_tools() + Self::cluster_tools()))]
 #[tool_handler(router = (Self::read_tools() + Self::write_tools() + Self::rollout_tools() + Self::job_tools() + Self::ops_tools() + Self::node_tools() + Self::helm_tools() + Self::cluster_tools()))]
+#[tool_handler(router = (Self::read_tools() + Self::write_tools() + Self::rollout_tools() + Self::job_tools() + Self::ops_tools() + Self::node_tools() + Self::helm_tools() + Self::logs_tools() + Self::cluster_tools()))]
 #[prompt_handler]
 impl ServerHandler for KubeMcp {
     fn get_info(&self) -> ServerConfig {
