@@ -98,6 +98,23 @@ pub async fn apply(
     .await
 }
 
+/// A strategic merge patch (lists of containers merge by name), like `kubectl patch`'s default.
+pub async fn strategic_patch(
+    client: Client,
+    kind: Kind,
+    ns: Option<String>,
+    name: String,
+    patch: serde_json::Value,
+    dry_run: bool,
+) -> Result<String> {
+    run(async move {
+        let api = dyn_api(client, &kind, ns.as_deref());
+        api.patch(&name, &patch_params(dry_run), &kube::api::Patch::Strategic(patch)).await?;
+        Ok(format!("{}{} {name} patched", if dry_run { "[dry run] " } else { "" }, kind.ar.kind))
+    })
+    .await
+}
+
 /// Delete one object. With `uid`, only that object: one re-created under the same name since
 /// the user picked it (a pod replaced by its ReplicaSet, a list that was out of date) is left
 /// alone, the server refusing with a conflict.

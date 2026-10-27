@@ -623,3 +623,62 @@ fn an_agent_reads_a_workload_s_logs() {
         result
     });
 }
+
+/// Pausing, resuming and setting an image need the agent's patch rule; the image lands on
+/// the container named, and a paused Deployment says so.
+#[test]
+#[ignore]
+fn an_agent_pauses_and_sets_an_image() {
+    use k8s_openapi::api::apps::v1::Deployment;
+
+    run(async {
+        let ctx = context();
+        let deps: Api<Deployment> = Api::namespaced(k8s::connect_for_agents(ctx.clone()).await?, NS);
+        let name = "e2e-image";
+        let _ = deps.delete(name, &DeleteParams::default()).await;
+        for _ in 0..60 {
+            if deps.get_opt(name).await?.is_none() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+        let dep = json!({
+            "metadata": {"name": name, "namespace": NS},
+            "spec": {"replicas": 1, "selector": {"matchLabels": {"app": name}}, "template": {
+                "metadata": {"labels": {"app": name}},
+                "spec": {"terminationGracePeriodSeconds": 0, "containers": [{"name": "main", "image": "busybox:1.37", "command": ["sleep", "3600"]}]},
+            }},
+        });
+        deps.create(&PostParams::default(), &serde_json::from_value(dep)?).await?;
+        let checked = async {
+            let (hub, agent, token, _server) = agent(&["get,list *"], &[]).await?;
+            let mcp = crate::assistant::Mcp::connect(hub.port(), token).await?;
+            let target = json!({"context": ctx, "namespace": NS, "name": name});
+            let out = mcp.call("rollout_pause", target.clone()).await;
+            assert!(out.contains("Denied"), "{out}");
+            let allow = rules_file::parse_rule(Mode::Allow, "patch deployments/e2e-* -n default")?;
+            hub.update_agent(&agent.id, |a| a.policy.rules.push(allow))?;
+            let out = mcp.call("rollout_pause", target.clone()).await;
+            assert!(out.contains("paused"), "{out}");
+            let paused = deps.get(name).await?.spec.and_then(|s| s.paused);
+            assert_eq!(paused, Some(true));
+            let mut image = target.clone();
+            image["kind"] = json!("deployments");
+            image["container"] = json!("main");
+            image["image"] = json!("busybox:1.36");
+            let out = mcp.call("set_image", image.clone()).await;
+            assert!(out.contains("main → busybox:1.36"), "{out}");
+            let now = deps.get(name).await?.spec.and_then(|s| s.template.spec).map(|s| s.containers[0].image.clone());
+            assert_eq!(now, Some(Some("busybox:1.36".into())));
+            image["container"] = json!("nope");
+            let out = mcp.call("set_image", image).await;
+            assert!(out.contains("no container"), "{out}");
+            let out = mcp.call("rollout_resume", target).await;
+            assert!(out.contains("resumed"), "{out}");
+            Ok(())
+        };
+        let result: Result<()> = checked.await;
+        deps.delete(name, &DeleteParams::default()).await?;
+        result
+    });
+}
