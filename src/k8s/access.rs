@@ -17,6 +17,18 @@ pub async fn can_i(
     name: Option<String>,
     subresource: Option<&str>,
 ) -> bool {
+    can_i_checked(client, kind, verb, ns, name, subresource).await.map_or(true, |(allowed, _)| allowed)
+}
+
+/// [`can_i`], with the review's error kept: whether allowed, and the server's reason.
+pub async fn can_i_checked(
+    client: Client,
+    kind: Kind,
+    verb: &str,
+    ns: Option<String>,
+    name: Option<String>,
+    subresource: Option<&str>,
+) -> Result<(bool, Option<String>)> {
     use k8s_openapi::api::authorization::v1::{
         ResourceAttributes, SelfSubjectAccessReview, SelfSubjectAccessReviewSpec,
     };
@@ -39,10 +51,9 @@ pub async fn can_i(
         };
         let api: Api<SelfSubjectAccessReview> = Api::all(client);
         let r = api.create(&Default::default(), &review).await?;
-        Ok(r.status.is_none_or(|s| s.allowed))
+        Ok(r.status.map_or((true, None), |s| (s.allowed, s.reason.filter(|r| !r.is_empty()))))
     })
     .await
-    .unwrap_or(true)
 }
 
 /// (verbs, resources, resource names) per rule.

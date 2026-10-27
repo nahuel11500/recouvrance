@@ -113,6 +113,9 @@ Tools: `my_permissions`, `list_contexts`, `list_resource_types`, `list_resources
 - **Images and paused rollouts:** `set_image` (one container's image, by name, in `containers` or
   `initContainers`), `rollout_pause` and `rollout_resume` (Deployments) need `patch` and support
   `dry_run`.
+- **About the cluster:** `explain_resource` (field docs, CRDs included) and `cluster_version` read
+  no objects; `can_i` asks the API server what the kubeconfig user may do (the agent's own rules are
+  `my_permissions`); `wait_for` needs `get` on the object and waits up to 5 minutes.
 
 Prompts (slash commands in Claude Code: `/mcp__recouvrance__troubleshoot` …): `troubleshoot`, `rightsize`,
 `cert-audit`, `cluster-health`. They chain the tools above into a read-only workflow.
