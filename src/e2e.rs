@@ -712,6 +712,9 @@ fn an_agent_diffs_a_manifest_without_changing_anything() {
         let result: Result<()> = checked.await;
         truth.delete(name, &DeleteParams::default()).await?;
         result
+    });
+}
+
 /// The read-only questions about the cluster: explain, can-i, version and wait.
 #[test]
 #[ignore]
