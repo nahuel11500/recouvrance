@@ -518,6 +518,9 @@ fn an_agent_cordons_a_node_with_its_drain_rule() {
         let patch = Patch::Merge(json!({"spec": {"unschedulable": false}}));
         nodes.patch(&node, &PatchParams::default(), &patch).await?;
         result
+    });
+}
+
 /// The read-only questions about the cluster: explain, can-i, version and wait.
 #[test]
 #[ignore]
