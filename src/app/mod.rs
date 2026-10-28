@@ -248,7 +248,7 @@ pub struct AppView {
     /// after an update); they must not open the row like a click does.
     skip_select: Option<usize>,
     /// The contexts and namespace each Workloads or Problems page was built for.
-    page_scopes: HashMap<EntityId, (Vec<String>, Option<String>)>,
+    page_scopes: HashMap<EntityId, (Vec<String>, Vec<String>)>,
     /// Selected namespaces; empty means all.
     namespaces: Vec<String>,
     filter: Entity<InputState>,
@@ -570,13 +570,16 @@ impl AppView {
                 return;
             }
             Route::Cluster(_) => Route::Cluster(cx.new(|cx| ClusterOverview::new(clusters, cx))),
-            Route::Workloads(_) => Route::Workloads(cx.new(|cx| Dashboard::new(clusters, self.namespace.clone(), cx))),
+            Route::Workloads(_) => {
+                let scope = self.namespace_scope();
+                Route::Workloads(cx.new(|cx| Dashboard::new(scope, cx)))
+            }
             Route::Problems(_) => {
-                let (kinds, ns) = (self.kinds.clone(), self.namespace.clone());
-                Route::Problems(cx.new(|cx| crate::ui::problems_view::ProblemsView::new(clusters, kinds, ns, cx)))
+                let (scope, kinds, ns) = (self.namespace_scope(), self.kinds.clone(), self.namespaces.clone());
+                Route::Problems(cx.new(|cx| crate::ui::problems_view::ProblemsView::new(scope, kinds, ns, cx)))
             }
             Route::Helm(_) => {
-                let scope = self.helm_scope();
+                let scope = self.namespace_scope();
                 Route::Helm(cx.new(|cx| HelmList::new(scope, window, cx)))
             }
             _ => return,
@@ -584,6 +587,7 @@ impl AppView {
         match &route {
             Route::Workloads(p) => self.remember_scope(p.entity_id()),
             Route::Problems(p) => self.remember_scope(p.entity_id()),
+            Route::Helm(p) => self.remember_scope(p.entity_id()),
             _ => {}
         }
         // Same place in history, fresh data (links keep working: subscribe like the openers do).

@@ -48,23 +48,13 @@ fn status_color(status: &str, cx: &App) -> Hsla {
 
 // MARK: List
 
-fn scope_key(scope: &HelmScope) -> Vec<(String, Vec<Option<String>>)> {
-    scope.iter().map(|(ctx, _, ns)| (ctx.clone(), ns.clone())).collect()
-}
-
 pub struct OpenRelease(pub Release);
 
 /// The "Install a chart" button was clicked.
 pub struct OpenInstall;
 
-/// What the release list reads: each cluster with the namespaces to list there (`None`:
-/// all of them; none: the cluster is left out).
-pub type HelmScope = Vec<(String, Client, Vec<Option<String>>)>;
-
 pub struct HelmList {
     multi: bool,
-    /// Contexts and namespaces of the list on screen, to reload only when they change.
-    scope: Vec<(String, Vec<Option<String>>)>,
     releases: Option<Result<Vec<Release>, SharedString>>,
     /// Indices in `releases` the filter keeps, worked out on each render.
     shown: Vec<usize>,
@@ -79,7 +69,7 @@ impl EventEmitter<OpenRelease> for HelmList {}
 impl EventEmitter<OpenInstall> for HelmList {}
 
 impl HelmList {
-    pub fn new(scope: HelmScope, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(scope: crate::ui::Scope, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let filter = cx.new(|cx| InputState::new(window, cx).placeholder("Filter releases…"));
         let subs = vec![cx.subscribe(&filter, |_, _, ev: &InputEvent, cx| {
             if matches!(ev, InputEvent::Change) {
@@ -88,7 +78,6 @@ impl HelmList {
         })];
         let mut list = Self {
             multi: false,
-            scope: Vec::new(),
             releases: None,
             shown: Vec::new(),
             errors: Vec::new(),
@@ -96,38 +85,17 @@ impl HelmList {
             _task: Task::ready(()),
             _subs: subs,
         };
-        list.load(scope, cx);
+        list.set_scope(scope, cx);
         list
     }
 
     /// List the releases of another selection of clusters or namespaces; the filter stays.
-    pub fn set_scope(&mut self, scope: HelmScope, cx: &mut Context<Self>) {
-        if scope_key(&scope) != self.scope {
-            self.load(scope, cx);
-        }
-    }
-
-    fn load(&mut self, scope: HelmScope, cx: &mut Context<Self>) {
+    pub fn set_scope(&mut self, scope: crate::ui::Scope, cx: &mut Context<Self>) {
         self.multi = scope.len() > 1;
-        self.scope = scope_key(&scope);
         self.releases = None;
         self.errors.clear();
         cx.notify();
-        let multi = self.multi;
-        // One list per cluster and namespace chosen, named by what an error should say.
-        let lists: Vec<(String, String, Client, Option<String>)> = scope
-            .into_iter()
-            .flat_map(|(ctx, client, namespaces)| {
-                namespaces.into_iter().map(move |ns| {
-                    let label = match &ns {
-                        Some(ns) if multi => format!("{ctx}/{ns}"),
-                        Some(ns) => ns.clone(),
-                        None => ctx.clone(),
-                    };
-                    (label, ctx.clone(), client.clone(), ns)
-                })
-            })
-            .collect();
+        let lists = crate::ui::scope_lists(scope);
         // Replacing the task drops the previous load: its results never land over these.
         self._task = cx.spawn(async move |this, cx| {
             // The releases from their Secrets' labels first: shown at once.

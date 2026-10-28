@@ -13,18 +13,40 @@ use crate::ui::dashboard::Dashboard;
 use crate::ui::helm::{HelmList, HelmRelease, OpenRelease};
 
 impl AppView {
-    /// The connected contexts and the namespace a scoped page shows now.
-    fn page_scope(&self) -> (Vec<String>, Option<String>) {
-        (self.clusters.iter().map(|(c, _)| c.clone()).collect(), self.namespace.clone())
+    /// The connected contexts and the namespaces a scoped page shows now.
+    fn page_scope(&self) -> (Vec<String>, Vec<String>) {
+        (self.clusters.iter().map(|(c, _)| c.clone()).collect(), self.namespaces.clone())
     }
 
-    /// Note what a Workloads or Problems page was built for.
+    /// The Workloads, Problems or Helm page on screen lists what the namespaces chosen
+    /// now ask for, when it was built for others.
+    pub(super) fn rescope_page(&mut self, cx: &mut Context<Self>) {
+        let id = match self.route() {
+            Route::Workloads(p) => p.entity_id(),
+            Route::Problems(p) => p.entity_id(),
+            Route::Helm(p) => p.entity_id(),
+            _ => return,
+        };
+        if self.scope_matches(id) {
+            return;
+        }
+        let (scope, namespaces) = (self.namespace_scope(), self.namespaces.clone());
+        match self.route().clone() {
+            Route::Workloads(p) => p.update(cx, |p, cx| p.set_scope(scope, cx)),
+            Route::Problems(p) => p.update(cx, |p, cx| p.set_scope(scope, namespaces, cx)),
+            Route::Helm(p) => p.update(cx, |p, cx| p.set_scope(scope, cx)),
+            _ => return,
+        }
+        self.remember_scope(id);
+    }
+
+    /// Note what a Workloads, Problems or Helm page was built for.
     pub(super) fn remember_scope(&mut self, page: EntityId) {
         let scope = self.page_scope();
         self.page_scopes.insert(page, scope);
     }
 
-    /// Whether a page was built for the contexts and namespace shown now.
+    /// Whether a page was built for the contexts and namespaces shown now.
     fn scope_matches(&self, page: EntityId) -> bool {
         self.page_scopes.get(&page) == Some(&self.page_scope())
     }
@@ -114,7 +136,8 @@ impl AppView {
             self.navigate(Route::Workloads(existing), cx);
             return;
         }
-        let dash = cx.new(|cx| Dashboard::new(self.clusters.clone(), self.namespace.clone(), cx));
+        let scope = self.namespace_scope();
+        let dash = cx.new(|cx| Dashboard::new(scope, cx));
         self.remember_scope(dash.entity_id());
         // Released with the page.
         cx.subscribe_in(&dash, window, |this, _, ev: &OpenObject, window, cx| {
@@ -216,8 +239,8 @@ impl AppView {
 
     /// What the assistant is told the user is looking at.
     fn assistant_scope(&self) -> String {
-        let (contexts, namespace) = self.page_scope();
-        scope_text(&contexts, namespace.as_deref())
+        let (contexts, namespaces) = self.page_scope();
+        scope_text(&contexts, &namespaces)
     }
 
     /// Tell open assistant chats, in every tab, about a new namespace selection.
@@ -267,8 +290,8 @@ impl AppView {
             self.navigate(Route::Problems(existing), cx);
             return;
         }
-        let (clusters, kinds, ns) = (self.clusters.clone(), self.kinds.clone(), self.namespace.clone());
-        let page = cx.new(|cx| crate::ui::problems_view::ProblemsView::new(clusters, kinds, ns, cx));
+        let (scope, kinds, ns) = (self.namespace_scope(), self.kinds.clone(), self.namespaces.clone());
+        let page = cx.new(|cx| crate::ui::problems_view::ProblemsView::new(scope, kinds, ns, cx));
         self.remember_scope(page.entity_id());
         // Released with the page.
         cx.subscribe_in(&page, window, |this, _, ev: &OpenObject, window, cx| {
@@ -308,8 +331,9 @@ impl AppView {
             cx.notify();
             return;
         }
-        let scope = self.helm_scope();
+        let scope = self.namespace_scope();
         let list = cx.new(|cx| HelmList::new(scope, window, cx));
+        self.remember_scope(list.entity_id());
         self.subscribe_helm(&list, window, cx);
         self.navigate(Route::Helm(list), cx);
     }
@@ -334,12 +358,16 @@ impl AppView {
 }
 
 /// What the assistant is told about `contexts` and the namespace picked.
-fn scope_text(contexts: &[String], namespace: Option<&str>) -> String {
+fn scope_text(contexts: &[String], namespaces: &[String]) -> String {
     if contexts.is_empty() {
         return "no cluster open in Recouvrance (every kubeconfig context is available: start with list_contexts)"
             .to_string();
     }
-    let namespace = namespace.map(|n| format!(", namespace {n}")).unwrap_or_default();
+    let namespace = match namespaces {
+        [] => String::new(),
+        [one] => format!(", namespace {one}"),
+        several => format!(", namespaces {}", several.join(", ")),
+    };
     format!("contexts {}{namespace}", contexts.join(", "))
 }
 
@@ -350,8 +378,10 @@ mod tests {
     #[test]
     fn the_assistant_scope_names_the_namespace_picked_now() {
         let contexts = ["a".to_string(), "b".to_string()];
-        assert_eq!(scope_text(&contexts, Some("y")), "contexts a, b, namespace y");
-        assert_eq!(scope_text(&contexts, None), "contexts a, b");
-        assert!(scope_text(&[], Some("y")).starts_with("no cluster open"));
+        let ns = |l: &[&str]| l.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(scope_text(&contexts, &ns(&["y"])), "contexts a, b, namespace y");
+        assert_eq!(scope_text(&contexts, &ns(&["x", "y"])), "contexts a, b, namespaces x, y");
+        assert_eq!(scope_text(&contexts, &[]), "contexts a, b");
+        assert!(scope_text(&[], &ns(&["y"])).starts_with("no cluster open"));
     }
 }
