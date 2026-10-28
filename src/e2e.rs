@@ -226,6 +226,64 @@ fn turning_access_off_stops_a_drain() {
     });
 }
 
+/// A write confirmed to run as another identity is sent as it: here a user with no rights,
+/// so the server refuses what the app's own user may do. Reads still go as the user. Write
+/// mode off, or the identity changed in the settings since, refuses it before it is sent.
+/// An agent allowed everything never runs as it, whatever the settings say.
+#[test]
+#[ignore]
+fn a_write_runs_as_the_identity_chosen_for_it_only() {
+    run(async {
+        let ctx = context();
+        let ui = k8s::connect(ctx.clone()).await?;
+        let truth: Api<ConfigMap> = Api::namespaced(k8s::connect_for_agents(ctx.clone()).await?, NS);
+        let name = "e2e-run-as";
+        let _ = truth.delete(name, &DeleteParams::default()).await;
+        let nobody = k8s::Identity { user: "e2e-nobody".into(), groups: Vec::new() };
+        crate::settings::set_run_as(&ctx, Some(nobody.clone()));
+        gate::set_ui_writes(true);
+        let elevated: Api<ConfigMap> = Api::namespaced(k8s::run_as(&ui, &ctx, nobody.clone()), NS);
+        let error = |e: kube::Error| format!("{:#}", anyhow::Error::from(e));
+
+        let refused = elevated.create(&PostParams::default(), &config_map(name)).await;
+        let err = error(refused.expect_err("e2e-nobody may not create ConfigMaps"));
+        assert!(err.contains("e2e-nobody") && err.contains("forbidden"), "{err}");
+        assert!(truth.get_opt(name).await?.is_none(), "the refused write reached the cluster");
+        // e2e-nobody may not list either: this read went as the user.
+        elevated.list(&Default::default()).await?;
+        // As the user, the same write lands.
+        Api::<ConfigMap>::namespaced(ui.clone(), NS).create(&PostParams::default(), &config_map(name)).await?;
+
+        gate::set_ui_writes(false);
+        let err = error(elevated.delete(name, &DeleteParams::default()).await.expect_err("write mode is off"));
+        assert!(err.contains(k8s::RUN_AS_WRITES_OFF), "{err}");
+        gate::set_ui_writes(true);
+        crate::settings::set_run_as(&ctx, Some(k8s::Identity { user: "e2e-other".into(), groups: Vec::new() }));
+        let err = error(elevated.delete(name, &DeleteParams::default()).await.expect_err("the identity changed"));
+        assert!(err.contains(k8s::RUN_AS_CHANGED), "{err}");
+        assert!(truth.get_opt(name).await?.is_some());
+
+        // An agent allowed everything deletes as the user: had it run as e2e-nobody, the
+        // server would have refused.
+        crate::settings::set_run_as(&ctx, Some(nobody));
+        let (hub, _agent, token, _server) = agent(&["* *"], &[]).await?;
+        let client = crate::assistant::Mcp::connect(hub.port(), token).await?;
+        let out = client
+            .call("delete_resource", json!({"context": ctx, "kind": "configmaps", "namespace": NS, "name": name}))
+            .await;
+        crate::settings::set_run_as(&ctx, None);
+        gate::set_ui_writes(false);
+        assert!(!out.contains("Denied") && !out.contains("e2e-nobody"), "{out}");
+        for _ in 0..50 {
+            if truth.get_opt(name).await?.is_none() {
+                return Ok(());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+        bail!("the agent's delete did not happen: {out}")
+    });
+}
+
 /// A shell in a container answers what is typed, and says when it ends; an attach shows
 /// the container's own output. (The terminal view only draws what these sessions send.)
 #[test]

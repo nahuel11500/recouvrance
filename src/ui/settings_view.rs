@@ -62,6 +62,8 @@ pub struct SettingsView {
     prometheus: Vec<(String, Entity<InputState>)>,
     /// Per context: node shell image and accessible namespaces.
     cluster_inputs: Vec<(String, Entity<InputState>, Entity<InputState>)>,
+    /// Per context: the user and groups writes may run as (`kubectl --as`).
+    run_as_inputs: Vec<(String, Entity<InputState>, Entity<InputState>)>,
     /// A kind to give its own delete confirmation (Enter adds it).
     delete_kind: Entity<InputState>,
     /// The connected clusters' kinds, to check a kind typed in `delete_kind`.
@@ -171,6 +173,7 @@ impl SettingsView {
             repos,
             prometheus: Vec::new(),
             cluster_inputs: Vec::new(),
+            run_as_inputs: Vec::new(),
             delete_kind,
             kinds: Vec::new(),
             hub,
@@ -250,6 +253,7 @@ impl SettingsView {
         let names = crate::k8s::load_contexts().map(|c| c.names).unwrap_or_default();
         self.cluster_inputs.retain(|(ctx, ..)| names.contains(ctx));
         self.prometheus.retain(|(ctx, _)| names.contains(ctx));
+        self.run_as_inputs.retain(|(ctx, ..)| names.contains(ctx));
         for ctx in &names {
             if !self.cluster_inputs.iter().any(|(c, ..)| c == ctx) {
                 self.add_cluster(ctx.clone(), window, cx);
@@ -293,7 +297,24 @@ impl SettingsView {
             let list: Vec<String> = v.split(',').map(str::trim).filter(|s| !s.is_empty()).map(String::from).collect();
             settings::update(|s| s.clusters.entry(c.clone()).or_default().namespaces = list);
         }));
-        self.cluster_inputs.push((ctx, image, namespaces));
+        self.cluster_inputs.push((ctx.clone(), image, namespaces));
+        let saved = cs.run_as.unwrap_or_default();
+        let user = field(saved.user.clone(), "none (a user, e.g. super-admin)", window, cx);
+        let groups = field(saved.groups.join(", "), "groups (optional, comma separated)", window, cx);
+        // What is typed in both, saved together: groups count only with a user.
+        let typed = std::rc::Rc::new(std::cell::RefCell::new(saved));
+        let (c, t) = (ctx.clone(), typed.clone());
+        self._subs.push(Self::save_typed(&user, input_text, cx, move |v| {
+            t.borrow_mut().user = v;
+            settings::set_run_as(&c, Some(t.borrow().clone()));
+        }));
+        let c = ctx.clone();
+        self._subs.push(Self::save_typed(&groups, input_text, cx, move |v| {
+            typed.borrow_mut().groups =
+                v.split(',').map(str::trim).filter(|g| !g.is_empty()).map(String::from).collect();
+            settings::set_run_as(&c, Some(typed.borrow().clone()));
+        }));
+        self.run_as_inputs.push((ctx, user, groups));
     }
 
     /// Show the saved values in the fields not being edited: each window has its own fields,
@@ -314,6 +335,11 @@ impl SettingsView {
             let cs = s.clusters.get(ctx).cloned().unwrap_or_default();
             fields.push((image.clone(), cs.node_shell_image.unwrap_or_default()));
             fields.push((namespaces.clone(), cs.namespaces.join(", ")));
+        }
+        for (ctx, user, groups) in &self.run_as_inputs {
+            let saved = s.clusters.get(ctx).and_then(|c| c.run_as.clone()).unwrap_or_default();
+            fields.push((user.clone(), saved.user));
+            fields.push((groups.clone(), saved.groups.join(", ")));
         }
         for (input, saved) in fields {
             let state = input.read(cx);
@@ -557,7 +583,8 @@ impl SettingsView {
         v_flex()
             .child(div().pb_2().text_sm().text_color(muted).child(
                 "Color a context to recognise it at a glance. Protected contexts ask you to type their name before any write. \
-                 Metrics, node shell and namespaces per cluster are under Per cluster.",
+                 Run as: an identity you may impersonate (`kubectl --as`); write confirmations then offer to run that one \
+                 action as it, off each time. Never for agents. Metrics, node shell and namespaces per cluster are under Per cluster.",
             ))
             .when(s.protect_unset, |d| {
                 d.child(
@@ -607,19 +634,31 @@ impl SettingsView {
                         })
                 }));
                 let c2 = ctx.clone();
-                h_flex()
-                    .gap_4()
+                let run_as = self.run_as_inputs.iter().find(|(c, ..)| *c == ctx).map(|(_, u, g)| (u.clone(), g.clone()));
+                v_flex()
+                    .gap_1()
                     .py_2()
                     .border_b_1()
                     .border_color(theme.border)
-                    .child(div().flex_1().min_w_0().text_sm().child(ctx))
-                    .child(swatches)
                     .child(
-                        Checkbox::new(("protect", i)).label("Protected").checked(protected).on_click(move |v: &bool, _, cx| {
-                            settings::set_protected(&c2, *v);
-                            cx.refresh_windows();
-                        }),
+                        h_flex()
+                            .gap_4()
+                            .child(div().flex_1().min_w_0().text_sm().child(ctx))
+                            .child(swatches)
+                            .child(
+                                Checkbox::new(("protect", i)).label("Protected").checked(protected).on_click(move |v: &bool, _, cx| {
+                                    settings::set_protected(&c2, *v);
+                                    cx.refresh_windows();
+                                }),
+                            ),
                     )
+                    .children(run_as.map(|(user, groups)| {
+                        h_flex()
+                            .gap_2()
+                            .child(div().w(px(70.)).flex_shrink_0().text_xs().text_color(muted).child("Run as"))
+                            .child(div().flex_1().child(Input::new(&user).small()))
+                            .child(div().flex_1().child(Input::new(&groups).small()))
+                    }))
             }))
             .into_any_element()
     }
@@ -1137,7 +1176,7 @@ impl Render for SettingsView {
                             .hover(|s| s.bg(theme.list_hover))
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 this.section = sec;
-                                if sec == Section::Clusters {
+                                if matches!(sec, Section::Clusters | Section::Contexts) {
                                     this.sync_clusters(window, cx);
                                 }
                                 this.reload_fields(window, cx);

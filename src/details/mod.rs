@@ -15,6 +15,7 @@ use crate::ui::terminal::TerminalView;
 mod access_actions;
 mod action_bar;
 mod actions;
+mod argo;
 mod compare;
 #[cfg(feature = "dev")]
 mod demo;
@@ -25,6 +26,7 @@ mod related;
 mod tabs;
 
 pub(crate) use actions::*;
+pub(crate) use argo::OpenOnContext;
 pub(crate) use logs::*;
 use related::{container_history_for, container_names, fetch_related, gpu_history_for, history_for};
 use tabs::error_box;
@@ -151,6 +153,11 @@ pub struct DetailPanel {
     /// One-shot reads of the object, and of its events: the latest wins.
     object_read: crate::latest::Latest,
     events_load: crate::latest::Latest,
+    /// The Argo CD Applications that deploy the object or into the namespace, when the read
+    /// shown started, and a read made at once (after a Sync).
+    argo: k8s::argo::Lookup,
+    argo_started: Option<std::time::Instant>,
+    argo_load: crate::latest::Latest,
     /// A CRD's spec fields, worked out when it is loaded rather than on every frame.
     schema_rows: Vec<crate::overview::SchemaRow>,
     /// Inline editor of a ConfigMap's or Secret's values.
@@ -247,6 +254,9 @@ impl DetailPanel {
             pod_order: None,
             object_read: Default::default(),
             events_load: Default::default(),
+            argo: Default::default(),
+            argo_started: None,
+            argo_load: Default::default(),
             schema_rows: Vec::new(),
             data_editor: None,
             show_managed: false,
@@ -287,9 +297,9 @@ impl DetailPanel {
                     title,
                     "Creates a Job from its template, like `kubectl create job --from=cronjob/…`.",
                     "Run",
-                    |p| {
+                    |p, client| {
                         Box::pin(k8s::trigger_cronjob(
-                            p.client.clone(),
+                            client,
                             p.obj.namespace.clone().unwrap_or_default(),
                             p.obj.name.clone(),
                         ))
@@ -522,6 +532,7 @@ impl DetailPanel {
             self.loops_started = true;
             self.load_related(window, cx);
             self.check_access(cx);
+            self.start_argo(cx);
         }
         self.start_live(window, cx);
     }
@@ -639,6 +650,9 @@ impl DetailPanel {
                     .await;
                 // Prometheus can be slow: show the rest first, keeping the previous charts.
                 let pods_for_history = if wants_history { related.pods.clone() } else { Vec::new() };
+                let focus = crate::alerts::focus(&kind, &obj, &related.pods);
+                related.alerts =
+                    this.update(cx, |this, _| std::mem::take(&mut this.related.alerts)).unwrap_or_default();
                 related.history = this.update(cx, |this, _| this.related.history.take()).ok().flatten();
                 related.gpu = this.update(cx, |this, _| this.related.gpu.take()).ok().flatten();
                 related.container_history =
@@ -708,9 +722,12 @@ impl DetailPanel {
                 if ok.is_err() {
                     break;
                 }
-                if wants_history {
-                    let minutes = this.update(cx, |this, _| this.history_minutes).unwrap_or(60);
-                    let (history, containers, gpu) = futures::join!(
+                let minutes = this.update(cx, |this, _| this.history_minutes).unwrap_or(60);
+                let charts = async {
+                    if !wants_history {
+                        return None;
+                    }
+                    Some(futures::join!(
                         history_for(client.clone(), &context, &kind, ns.as_deref(), &obj, &pods_for_history, minutes),
                         container_history_for(client.clone(), &context, &kind, ns.as_deref(), &obj, minutes),
                         gpu_history_for(
@@ -722,21 +739,32 @@ impl DetailPanel {
                             &pods_for_history,
                             minutes
                         )
-                    );
-                    if this
-                        .update(cx, |this, cx| {
-                            // The range changed meanwhile: its own reload fills the charts.
-                            if this.history_minutes == minutes {
-                                this.related.history = history;
-                                this.related.gpu = gpu;
-                                this.related.container_history = containers;
-                                cx.notify();
-                            }
-                        })
-                        .is_err()
-                    {
-                        break;
-                    }
+                    ))
+                };
+                // Alerts about this object, from the same Prometheus (shared by every page).
+                let alerts = async {
+                    let Some(focus) = &focus else { return None };
+                    Some(crate::alerts::about(&crate::alerts::active(&context, client.clone()).await.list, focus))
+                };
+                let (charts, alerts) = futures::join!(charts, alerts);
+                if this
+                    .update(cx, |this, cx| {
+                        if let Some(alerts) = alerts {
+                            this.related.alerts = alerts;
+                        }
+                        // The range changed meanwhile: its own reload fills the charts.
+                        if let Some((history, containers, gpu)) = charts
+                            && this.history_minutes == minutes
+                        {
+                            this.related.history = history;
+                            this.related.gpu = gpu;
+                            this.related.container_history = containers;
+                        }
+                        cx.notify();
+                    })
+                    .is_err()
+                {
+                    break;
                 }
                 cx.background_executor().timer(crate::settings::secs(crate::settings::get().metrics_refresh)).await;
             }
@@ -852,6 +880,7 @@ impl DetailPanel {
             env_expanded: self.env_expanded,
             schema_rows: &self.schema_rows,
             pod_order: self.pod_order,
+            argo: &self.argo,
         }
     }
 
