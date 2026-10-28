@@ -5,7 +5,7 @@ use gpui_kit::component::{ActiveTheme as _, WindowExt as _, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use super::{DetailPanel, confirm_extras, guard_ok, kubectl, shell_word};
+use super::{DetailPanel, RunAs, confirm_extras, confirm_with, guard_ok, kubectl, shell_word};
 use crate::k8s;
 
 impl DetailPanel {
@@ -54,6 +54,7 @@ impl DetailPanel {
             format!("Bind {} {}", self.obj.kind.ar.kind, self.obj.name)
         };
         let guard = self.protection(window, cx);
+        let run_as = RunAs::offer(&self.context, cx);
         let (context, obj_ns, obj_name, obj_kind, role_kind) = (
             self.context.clone(),
             self.obj.namespace.clone(),
@@ -62,7 +63,7 @@ impl DetailPanel {
             self.obj.kind.ar.kind.clone(),
         );
         window.open_alert_dialog(cx, move |alert, _, cx| {
-            let (panel, guard, binding) = (panel.clone(), guard.clone(), binding.clone());
+            let (panel, guard, binding, run_as) = (panel.clone(), guard.clone(), binding.clone(), run_as.clone());
             let (k, n, ns, scope_in) = (kind_input.clone(), name_input.clone(), ns_input.clone(), scope_input.clone());
             let label = |text: &'static str| div().text_xs().text_color(cx.theme().muted_foreground).child(text);
             // The kubectl equivalent of what is typed so far.
@@ -120,7 +121,7 @@ impl DetailPanel {
                             d.child(label("Grant in namespace (empty = cluster-wide)")).child(Input::new(scope))
                         }),
                 )
-                .child(confirm_extras(&cmd, guard.as_ref(), cx))
+                .child(confirm_with(&cmd, guard.as_ref(), &run_as, cx))
                 .show_cancel(true)
                 .ok_text(if is_binding { "Add" } else { "Bind" })
                 .on_ok(move |_, window, cx| {
@@ -134,7 +135,7 @@ impl DetailPanel {
                     let Some(subject) = subject_of(&kind, &name, &ns) else { return false };
                     let binding = binding.clone();
                     let _ = panel.update(cx, |this, cx| {
-                        let client = this.client.clone();
+                        let client = run_as.client(&this.client, cx);
                         if let Some(b) = binding {
                             let mut subjects = b["subjects"].as_array().cloned().unwrap_or_default();
                             subjects.push(subject);
@@ -184,6 +185,7 @@ impl DetailPanel {
         }
         let panel = cx.entity().downgrade();
         let guard = self.protection(window, cx);
+        let run_as = RunAs::offer(&self.context, cx);
         let title = format!("Remove {label} from {}?", self.obj.name);
         let cmd = subjects_patch_cmd(
             &self.context,
@@ -196,11 +198,11 @@ impl DetailPanel {
         // Fails with a conflict if the binding changed since it was read.
         let patch = subjects_patch(&obj, subjects);
         window.open_alert_dialog(cx, move |alert, _, cx| {
-            let (panel, guard, patch) = (panel.clone(), guard.clone(), patch.clone());
+            let (panel, guard, patch, run_as) = (panel.clone(), guard.clone(), patch.clone(), run_as.clone());
             alert
                 .title(title.clone())
                 .description("It loses what this binding grants.")
-                .child(confirm_extras(&cmd, guard.as_ref(), cx))
+                .child(confirm_with(&cmd, guard.as_ref(), &run_as, cx))
                 .show_cancel(true)
                 .ok_text("Remove")
                 .on_ok(move |_, window, cx| {
@@ -210,7 +212,7 @@ impl DetailPanel {
                     let patch = patch.clone();
                     let _ = panel.update(cx, |this, cx| {
                         let fut = k8s::merge_patch(
-                            this.client.clone(),
+                            run_as.client(&this.client, cx),
                             this.obj.kind.clone(),
                             this.obj.namespace.clone(),
                             this.obj.name.clone(),

@@ -78,7 +78,7 @@ pub fn judge_pod(defs: &[ColumnDef], row: &Row) -> Option<(Severity, String)> {
             Some((Severity::Warning, format!("{status} for more than 5 minutes")))
         }
         // From the deletion (its grace period's end), not the creation.
-        "Terminating" if since(row.deleted_at.or(row.created), 600) => {
+        "Terminating" if since(row.deleted_at.or(row.created), STUCK_AFTER) => {
             Some((Severity::Warning, STUCK_TERMINATING.into()))
         }
         "Running" => match ratio(c("Ready")) {
@@ -140,16 +140,20 @@ pub fn judge(kind: &Kind, defs: &[ColumnDef], row: &Row) -> Option<(Severity, St
     }
 }
 
-/// Kinds checked, in display order. The external-secrets.io ones are judged from their
-/// objects (`external_secrets::problems`), the others from kubectl's columns.
-pub const CHECKED: [(&str, &str); 10] = [
+/// Kinds checked, in display order. Namespaces, PersistentVolumes and Argo CD Applications
+/// only for deletions stuck; a kind the cluster doesn't serve is left out. The
+/// external-secrets.io ones are judged from their objects (`external_secrets::problems`).
+pub const CHECKED: [(&str, &str); 13] = [
     ("", "Node"),
+    ("", "Namespace"),
     ("apps", "Deployment"),
     ("apps", "StatefulSet"),
     ("apps", "DaemonSet"),
     ("", "Pod"),
     ("batch", "Job"),
     ("", "PersistentVolumeClaim"),
+    ("", "PersistentVolume"),
+    ("argoproj.io", "Application"),
     (crate::external_secrets::GROUP, "ClusterSecretStore"),
     (crate::external_secrets::GROUP, "SecretStore"),
     (crate::external_secrets::GROUP, "ExternalSecret"),
@@ -181,55 +185,173 @@ impl Scan {
 
 const STUCK_TERMINATING: &str = "stuck terminating";
 
-/// Whether a row listed without its object has been terminating for more than 10 minutes,
-/// from its object's deletion time (one small request; true when it can't be read).
-async fn stuck_terminating(client: &Client, kind: &Kind, row: &Row) -> bool {
-    let api: kube::Api<kube::api::DynamicObject> = match &row.namespace {
+/// Seconds a deletion may take before it is called stuck, from the deletionTimestamp (for
+/// a pod, the end of its grace period).
+const STUCK_AFTER: i64 = 600;
+
+/// Whether a row is being deleted: from its object, or for a row listed without it, from
+/// kubectl's Status column (Pods and PVCs say Terminating).
+fn deleting(defs: &[ColumnDef], row: &Row) -> bool {
+    row.deleting || row.is_partial() && cell(defs, row, "Status") == "Terminating"
+}
+
+/// "stuck deleting for 2d, held by a, b: why", or None while the deletion is more recent
+/// than `STUCK_AFTER` (an unknown time counts as stuck). `why`: what a Namespace's
+/// conditions say holds it.
+fn stuck_reason(
+    kind: &Kind,
+    deleted: Option<jiff::Timestamp>,
+    finalizers: &[String],
+    why: &[String],
+) -> Option<String> {
+    if !since(deleted, STUCK_AFTER) {
+        return None;
+    }
+    let mut s = format!("stuck {}", if kind.is("", "Pod") { "terminating" } else { "deleting" });
+    if let Some(t) = deleted {
+        s.push_str(&format!(" for {}", k8s::age(t)));
+    }
+    if !finalizers.is_empty() {
+        s.push_str(&format!(", held by {}", finalizers.join(", ")));
+    }
+    if !why.is_empty() {
+        s.push_str(&format!(": {}", why.join("; ")));
+    }
+    Some(s)
+}
+
+/// What a Namespace's deletion waits on, from its conditions (`NamespaceContentRemaining`,
+/// `NamespaceFinalizersRemaining`, `NamespaceDeletion*Failure`): the resources left in it.
+fn namespace_why(status: &serde_json::Value) -> Vec<String> {
+    let conditions = status.get("conditions").and_then(|c| c.as_array()).map(Vec::as_slice).unwrap_or_default();
+    conditions
+        .iter()
+        .filter_map(|c| {
+            let ty = c.get("type")?.as_str()?;
+            let bad = ty.starts_with("Namespace") && crate::status::true_is_bad(ty) && c.get("status")? == "True";
+            bad.then(|| c.get("message").and_then(|m| m.as_str()).unwrap_or(ty).to_string())
+        })
+        .collect()
+}
+
+/// An object being deleted, as read on its own.
+struct Held {
+    created: Option<jiff::Timestamp>,
+    deleted: Option<jiff::Timestamp>,
+    finalizers: Vec<String>,
+    why: Vec<String>,
+}
+
+/// The deletion of one object (lists don't carry finalizers): its metadata alone, or a
+/// Namespace whole for its conditions. One small request; None when it is not being
+/// deleted or is gone.
+async fn held(client: &Client, kind: &Kind, namespace: Option<&str>, name: &str) -> anyhow::Result<Option<Held>> {
+    let api: kube::Api<kube::api::DynamicObject> = match namespace {
         Some(ns) => kube::Api::namespaced_with(client.clone(), ns, &kind.ar),
         None => kube::Api::all_with(client.clone(), &kind.ar),
     };
-    let name = row.name.clone();
-    let deleted = k8s::run(async move { Ok(api.get_metadata(&name).await?.metadata.deletion_timestamp) }).await;
-    match deleted {
-        Ok(Some(t)) => since(jiff::Timestamp::from_second(t.0.as_second()).ok(), 600),
-        Ok(None) => false,
-        Err(_) => true,
+    let (name, whole) = (name.to_string(), kind.is("", "Namespace"));
+    let read = k8s::run(async move {
+        Ok(if whole {
+            api.get_opt(&name).await?.map(|o| (o.metadata, o.data.get("status").map(namespace_why)))
+        } else {
+            api.get_metadata_opt(&name).await?.map(|o| (o.metadata, None))
+        })
+    })
+    .await?;
+    let time =
+        |t: &k8s_openapi::apimachinery::pkg::apis::meta::v1::Time| jiff::Timestamp::from_second(t.0.as_second()).ok();
+    Ok(read.and_then(|(meta, why)| {
+        let deleted = meta.deletion_timestamp.as_ref()?;
+        Some(Held {
+            created: meta.creation_timestamp.as_ref().and_then(time),
+            deleted: time(deleted),
+            finalizers: meta.finalizers.unwrap_or_default(),
+            why: why.unwrap_or_default(),
+        })
+    }))
+}
+
+/// Requests at once to read the objects found deleting.
+const HELD_PARALLEL: usize = 16;
+
+/// Problems of one kind, from its table; `namespace`: the one scanned, if any.
+async fn scan_kind(client: Client, kind: Kind, namespace: Option<String>) -> anyhow::Result<Vec<Problem>> {
+    use futures::StreamExt as _;
+    let problem = |namespace: Option<String>, name: String, severity, reason, age| Problem {
+        severity,
+        kind: kind.kubectl_name(),
+        label: kind.ar.kind.clone(),
+        namespace,
+        name,
+        reason,
+        age,
+    };
+    // One namespace: its own object, not every namespace.
+    if let Some(ns) = namespace.as_deref().filter(|_| kind.is("", "Namespace")) {
+        let held = held(&client, &kind, None, ns).await?;
+        return Ok(held
+            .and_then(|h| {
+                let reason = stuck_reason(&kind, h.deleted, &h.finalizers, &h.why)?;
+                Some(problem(None, ns.to_string(), Severity::Warning, reason, h.created))
+            })
+            .into_iter()
+            .collect());
     }
+    // Big lists come from their cells alone: a small part of the bytes.
+    let (defs, rows) = k8s::list_light(client.clone(), kind.clone(), namespace, true).await?;
+    let mut found = Vec::new();
+    let mut stuck = Vec::new();
+    for r in &rows {
+        if deleting(&defs, r) {
+            // Within its grace period, or deleted a moment ago: nothing to read.
+            if r.is_partial() || since(r.deleted_at, STUCK_AFTER) {
+                stuck.push(r.clone());
+            }
+            continue;
+        }
+        if let Some((severity, reason)) = judge(&kind, &defs, r) {
+            found.push(problem(r.namespace.clone(), r.name.clone(), severity, reason, r.created));
+        }
+    }
+    // Lists don't carry finalizers, and a row listed without its object has no deletion
+    // time: read them for the few rows deleting, so a pod in its grace period isn't stuck.
+    let read: Vec<_> = futures::stream::iter(stuck)
+        .map(|r| {
+            let (client, kind) = (client.clone(), kind.clone());
+            async move {
+                let h = held(&client, &kind, r.namespace.as_deref(), &r.name).await;
+                (r, h)
+            }
+        })
+        .buffer_unordered(HELD_PARALLEL)
+        .collect()
+        .await;
+    for (r, h) in read {
+        let reason = match h {
+            Ok(Some(h)) => stuck_reason(&kind, h.deleted, &h.finalizers, &h.why),
+            // Deleted in between.
+            Ok(None) => None,
+            // Unreadable: what the row says.
+            Err(_) => stuck_reason(&kind, r.deleted_at, &[], &[]),
+        };
+        if let Some(reason) = reason {
+            found.push(problem(r.namespace.clone(), r.name.clone(), Severity::Warning, reason, r.created));
+        }
+    }
+    Ok(found)
 }
 
 /// Problems in a cluster (or one namespace), worst first, from every kind that
 /// could be listed: one kind refused (403) does not hide the others.
 pub async fn scan_partial(client: Client, kinds: &[Kind], namespace: Option<String>) -> Scan {
     let jobs = CHECKED.iter().filter_map(|(g, k)| kinds.iter().find(|x| x.is(g, k)).cloned()).map(|kind| {
-        let (client, ns) = (client.clone(), namespace.clone());
+        let (client, ns, label) = (client.clone(), namespace.clone(), kind.label.clone());
         async move {
             if kind.ar.group == crate::external_secrets::GROUP {
-                return crate::external_secrets::problems(client, &kind, ns).await.map_err(|e| (kind.label.clone(), e));
+                return crate::external_secrets::problems(client, &kind, ns).await.map_err(|e| (label, e));
             }
-            // Big lists come from their cells alone: a small part of the bytes.
-            let (defs, rows) = match k8s::list_light(client.clone(), kind.clone(), ns, true).await {
-                Ok(t) => t,
-                Err(e) => return Err((kind.label.clone(), e)),
-            };
-            let mut found = Vec::new();
-            for r in &rows {
-                let Some((severity, reason)) = judge(&kind, &defs, r) else { continue };
-                // Without its object, a terminating row has no deletion time: ask for it,
-                // so a pod in its normal grace period is not called stuck.
-                if r.is_partial() && reason == STUCK_TERMINATING && !stuck_terminating(&client, &kind, r).await {
-                    continue;
-                }
-                found.push(Problem {
-                    severity,
-                    kind: kind.kubectl_name(),
-                    label: kind.ar.kind.clone(),
-                    namespace: r.namespace.clone(),
-                    name: r.name.clone(),
-                    reason,
-                    age: r.created,
-                });
-            }
-            Ok(found)
+            scan_kind(client, kind, ns).await.map_err(|e| (label, e))
         }
     });
     let mut out = Scan::default();
@@ -246,12 +368,13 @@ pub async fn scan_partial(client: Client, kinds: &[Kind], namespace: Option<Stri
 
 /// Problems in the namespaces a user may read, for a cluster that may not list
 /// cluster-wide; the whole cluster when `namespaces` is empty. Cluster-scoped kinds
-/// (Nodes) are read once, namespaced ones in each namespace.
+/// (Nodes) are read once, namespaced ones in each namespace, and a Namespace in itself.
 pub async fn scan_namespaces(client: Client, kinds: &[Kind], namespaces: &[String]) -> Scan {
     if namespaces.is_empty() {
         return scan_partial(client, kinds, None).await;
     }
-    let (cluster, namespaced): (Vec<Kind>, Vec<Kind>) = kinds.iter().cloned().partition(|k| !k.namespaced);
+    let (cluster, namespaced): (Vec<Kind>, Vec<Kind>) =
+        kinds.iter().cloned().partition(|k| !k.namespaced && !k.is("", "Namespace"));
     let (whole, per_ns) = futures::join!(
         scan_partial(client.clone(), &cluster, None),
         futures::future::join_all(namespaces.iter().map(|ns| {
@@ -272,6 +395,7 @@ pub async fn scan_namespaces(client: Client, kinds: &[Kind], namespaces: &[Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     fn kind(group: &str, k: &str) -> Kind {
         Kind {
@@ -470,5 +594,171 @@ mod tests {
         assert_eq!(sev(&t), None);
         t.deleted_at = Some(now - jiff::SignedDuration::from_mins(20));
         assert_eq!(sev(&t), Some(Severity::Warning));
+    }
+
+    fn ago(secs: i64) -> Option<jiff::Timestamp> {
+        jiff::Timestamp::from_second(jiff::Timestamp::now().as_second() - secs).ok()
+    }
+
+    #[test]
+    fn stuck_deletions_name_what_holds_them() {
+        let app = kind("argoproj.io", "Application");
+        let argo = ["resources-finalizer.argocd.argoproj.io".to_string()];
+        assert_eq!(stuck_reason(&app, ago(60), &argo, &[]), None);
+        assert_eq!(
+            stuck_reason(&app, ago(49 * 3600), &argo, &[]).unwrap(),
+            "stuck deleting for 2d, held by resources-finalizer.argocd.argoproj.io"
+        );
+        let two = ["a".to_string(), "b".to_string()];
+        assert_eq!(stuck_reason(&app, ago(3 * 3600), &two, &[]).unwrap(), "stuck deleting for 3h, held by a, b");
+        // A pod past its grace period, held by nothing (its node is gone).
+        assert_eq!(stuck_reason(&kind("", "Pod"), ago(1200), &[], &[]).unwrap(), "stuck terminating for 20m");
+        // Not known when: stuck, as the row said.
+        assert_eq!(stuck_reason(&kind("", "Pod"), None, &[], &[]).unwrap(), "stuck terminating");
+        let why = ["Some resources are remaining: pods. has 3 resource instances".to_string()];
+        assert_eq!(
+            stuck_reason(&kind("", "Namespace"), ago(3 * 3600), &[], &why).unwrap(),
+            "stuck deleting for 3h: Some resources are remaining: pods. has 3 resource instances"
+        );
+    }
+
+    #[test]
+    fn a_namespace_says_what_holds_it() {
+        let status = serde_json::json!({"phase": "Terminating", "conditions": [
+            {"type": "NamespaceDeletionDiscoveryFailure", "status": "False", "message": "All resources successfully discovered"},
+            {"type": "NamespaceContentRemaining", "status": "True", "message": "Some resources are remaining: widgets.example.com has 1 resource instances"},
+            {"type": "NamespaceFinalizersRemaining", "status": "True", "message": "Some content in the namespace has finalizers remaining: example.com/cleanup in 1 resource instances"},
+        ]});
+        assert_eq!(
+            namespace_why(&status),
+            [
+                "Some resources are remaining: widgets.example.com has 1 resource instances",
+                "Some content in the namespace has finalizers remaining: example.com/cleanup in 1 resource instances",
+            ]
+        );
+        assert!(namespace_why(&serde_json::json!({"phase": "Active"})).is_empty());
+    }
+
+    #[test]
+    fn deleting_rows() {
+        let d = defs(&["Name", "Status"]);
+        let mut full = row(&["x", "Terminating"]);
+        assert!(!deleting(&d, &full), "a row with its object goes by its deletion time");
+        full.deleting = true;
+        assert!(deleting(&d, &full));
+        let mut partial = row(&["x", "Terminating"]);
+        partial.uid = "ns/x".into();
+        assert!(deleting(&d, &partial));
+        partial.cells[1] = "Bound".into();
+        assert!(!deleting(&d, &partial));
+    }
+
+    proptest! {
+        /// Stuck exactly when deleted more than `STUCK_AFTER` ago, naming every finalizer.
+        #[test]
+        fn stuck_after_the_threshold(secs in 0..100_000_000i64, finalizers in prop::collection::vec("[a-z./-]{1,20}", 0..4)) {
+            let app = kind("argoproj.io", "Application");
+            let reason = stuck_reason(&app, ago(secs), &finalizers, &[]);
+            // A second's leeway: the clock moves between `ago` and the check.
+            if secs > STUCK_AFTER + 1 {
+                let reason = reason.unwrap();
+                prop_assert!(reason.starts_with("stuck deleting for "));
+                for f in &finalizers {
+                    prop_assert!(reason.contains(f.as_str()));
+                }
+            } else if secs < STUCK_AFTER {
+                prop_assert_eq!(reason, None);
+            }
+        }
+    }
+
+    /// A cluster with an Argo CD Application stuck deleting, one deleted a moment ago, and
+    /// namespace `argocd` itself terminating; records the paths it was asked for.
+    #[derive(Clone, Default)]
+    struct Deleting(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+    impl tower::Service<http::Request<kube::client::Body>> for Deleting {
+        type Response = http::Response<http_body_util::Full<bytes::Bytes>>;
+        type Error = std::convert::Infallible;
+        type Future = std::future::Ready<Result<Self::Response, Self::Error>>;
+
+        fn poll_ready(&mut self, _: &mut std::task::Context<'_>) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, req: http::Request<kube::client::Body>) -> Self::Future {
+            let path = req.uri().path().to_string();
+            self.0.lock().unwrap().push(path.clone());
+            let time = |secs: i64| ago(secs).unwrap().to_string();
+            let meta = |name: &str, deleted: i64| {
+                serde_json::json!({"name": name, "namespace": "argocd", "uid": name,
+                    "creationTimestamp": time(9 * 86400), "deletionTimestamp": time(deleted),
+                    "finalizers": ["resources-finalizer.argocd.argoproj.io"]})
+            };
+            let body = match path.as_str() {
+                "/apis/argoproj.io/v1alpha1/namespaces/argocd/applications" => serde_json::json!({
+                    "kind": "Table",
+                    "columnDefinitions": [{"name": "Name"}, {"name": "Sync Status"}, {"name": "Health Status"}],
+                    "rows": [
+                        {"cells": ["stuck", "Synced", "Healthy"], "object": {"metadata": meta("stuck", 49 * 3600)}},
+                        {"cells": ["fresh", "Synced", "Healthy"], "object": {"metadata": meta("fresh", 30)}},
+                        {"cells": ["fine", "Synced", "Healthy"], "object": {"metadata": {"name": "fine", "namespace": "argocd", "uid": "fine"}}},
+                    ],
+                }),
+                "/apis/argoproj.io/v1alpha1/namespaces/argocd/applications/stuck" => serde_json::json!({
+                    "apiVersion": "meta.k8s.io/v1", "kind": "PartialObjectMetadata", "metadata": meta("stuck", 49 * 3600),
+                }),
+                "/api/v1/namespaces/argocd" => serde_json::json!({
+                    "apiVersion": "v1", "kind": "Namespace",
+                    "metadata": {"name": "argocd", "uid": "ns", "creationTimestamp": time(9 * 86400), "deletionTimestamp": time(3 * 3600)},
+                    "spec": {"finalizers": ["kubernetes"]},
+                    "status": {"phase": "Terminating", "conditions": [{"type": "NamespaceFinalizersRemaining", "status": "True",
+                        "message": "Some content in the namespace has finalizers remaining: resources-finalizer.argocd.argoproj.io in 1 resource instances"}]},
+                }),
+                _ => {
+                    serde_json::json!({"kind": "Status", "apiVersion": "v1", "status": "Failure", "code": 404, "reason": "NotFound"})
+                }
+            };
+            let code = if body["kind"] == "Status" { 404 } else { 200 };
+            let response = http::Response::builder().status(code).body(body.to_string().into_bytes().into()).unwrap();
+            std::future::ready(Ok(response))
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn finds_stuck_deletions() {
+        let cluster = Deleting::default();
+        let client = Client::new(cluster.clone(), "default");
+        let mut app = kind("argoproj.io", "Application");
+        app.ar.version = "v1alpha1".into();
+        app.ar.api_version = "argoproj.io/v1alpha1".into();
+        let mut ns = kind("", "Namespace");
+        ns.namespaced = false;
+        let scan = scan_namespaces(client, &[ns, app], &["argocd".into()]).await;
+        assert!(scan.skipped.is_empty(), "{:?}", scan.skipped_text());
+        let found: Vec<(&str, &str)> = scan.problems.iter().map(|p| (p.name.as_str(), p.reason.as_str())).collect();
+        assert_eq!(
+            found,
+            [
+                (
+                    "argocd",
+                    "stuck deleting for 3h: Some content in the namespace has finalizers remaining: \
+                     resources-finalizer.argocd.argoproj.io in 1 resource instances"
+                ),
+                ("stuck", "stuck deleting for 2d, held by resources-finalizer.argocd.argoproj.io"),
+            ]
+        );
+        // The namespace scanned is read alone, not every namespace listed; only the
+        // Application stuck is read again.
+        let mut asked = cluster.0.lock().unwrap().clone();
+        asked.sort();
+        assert_eq!(
+            asked,
+            [
+                "/api/v1/namespaces/argocd",
+                "/apis/argoproj.io/v1alpha1/namespaces/argocd/applications",
+                "/apis/argoproj.io/v1alpha1/namespaces/argocd/applications/stuck",
+            ]
+        );
     }
 }

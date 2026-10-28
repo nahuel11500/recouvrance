@@ -55,7 +55,10 @@ impl ProblemsView {
                     // `[None]`: the whole cluster; otherwise each namespace, Nodes once.
                     let ns: Vec<String> = ns.iter().flatten().cloned().collect();
                     let (ctx, c, kinds) = (ctx.clone(), c.clone(), kinds.clone());
-                    async move { (ctx, problems::scan_namespaces(c, &kinds, &ns).await) }
+                    async move {
+                        let scan = crate::alerts::scan(&ctx, c, &kinds, &ns).await;
+                        (ctx, scan)
+                    }
                 });
                 let (found, errors) = merge(futures::future::join_all(scans).await);
                 if this
@@ -102,9 +105,12 @@ impl ProblemsView {
             .py_1p5()
             .border_b_1()
             .border_color(theme.border)
-            .cursor_pointer()
-            .hover(|s| s.bg(theme.list_hover))
-            .on_click(cx.listener(move |_, _, _, cx| cx.emit(ev.clone())))
+            // An alert about no object in particular has nothing to open.
+            .when(!p.kind.is_empty(), |d| {
+                d.cursor_pointer()
+                    .hover(|s| s.bg(theme.list_hover))
+                    .on_click(cx.listener(move |_, _, _, cx| cx.emit(ev.clone())))
+            })
             .child(div().size(px(8.)).flex_shrink_0().rounded_full().bg(color))
             .when(multi, |d| {
                 d.child(
@@ -223,7 +229,9 @@ impl Render for ProblemsView {
             ));
         let Some(found) = &self.found else {
             return v_flex().size_full().p_4().gap_4().child(header).child(
-                div().text_color(theme.muted_foreground).child("Checking nodes, workloads, pods, jobs and volumes…"),
+                div()
+                    .text_color(theme.muted_foreground)
+                    .child("Checking nodes, workloads, pods, jobs, volumes and deletions…"),
             );
         };
         let count = |s: Severity| found.iter().filter(|(_, p)| p.severity == s).count();
