@@ -57,6 +57,8 @@ pub struct Related {
     pub events: Vec<(String, String, String, i32)>,
     /// Last lines of a crash-looping container's previous run: (container, text).
     pub crash_logs: Option<(String, String)>,
+    /// The `ExternalSecret` a Secret comes from, when one owns it.
+    pub external_secret: Option<Value>,
     /// Roles and bindings, for RBAC and ServiceAccount pages.
     pub rbac: Option<crate::rbac::Snapshot>,
     /// Lists that could not be loaded, by field ("pods", "services"…): "forbidden" or
@@ -381,6 +383,9 @@ fn top(ctx: &Ctx, cx: &App) -> Div {
             .child(heading_for("Pods behind this Service", ctx.related, "pods", cx))
             .child(pods_table(ctx, cx));
     } else {
+        if kind.is(crate::external_secrets::GROUP, "ExternalSecret") {
+            root = root.child(external_secret_page(ctx, cx));
+        }
         // Anything else (CRDs especially): spec and status as readable fields.
         root = root.child(generic_section("Spec", ctx.obj.get("spec"), cx)).child(generic_section(
             "Status",

@@ -141,8 +141,9 @@ pub fn judge(kind: &Kind, defs: &[ColumnDef], row: &Row) -> Option<(Severity, St
 }
 
 /// Kinds checked, in display order. Namespaces, PersistentVolumes and Argo CD Applications
-/// only for deletions stuck; a kind the cluster doesn't serve is left out.
-pub const CHECKED: [(&str, &str); 10] = [
+/// only for deletions stuck; a kind the cluster doesn't serve is left out. The
+/// external-secrets.io ones are judged from their objects (`external_secrets::problems`).
+pub const CHECKED: [(&str, &str); 13] = [
     ("", "Node"),
     ("", "Namespace"),
     ("apps", "Deployment"),
@@ -153,6 +154,9 @@ pub const CHECKED: [(&str, &str); 10] = [
     ("", "PersistentVolumeClaim"),
     ("", "PersistentVolume"),
     ("argoproj.io", "Application"),
+    (crate::external_secrets::GROUP, "ClusterSecretStore"),
+    (crate::external_secrets::GROUP, "SecretStore"),
+    (crate::external_secrets::GROUP, "ExternalSecret"),
 ];
 
 /// A scan that went as far as it could: the problems found, and the kinds it could
@@ -343,7 +347,12 @@ async fn scan_kind(client: Client, kind: Kind, namespace: Option<String>) -> any
 pub async fn scan_partial(client: Client, kinds: &[Kind], namespace: Option<String>) -> Scan {
     let jobs = CHECKED.iter().filter_map(|(g, k)| kinds.iter().find(|x| x.is(g, k)).cloned()).map(|kind| {
         let (client, ns, label) = (client.clone(), namespace.clone(), kind.label.clone());
-        async move { scan_kind(client, kind, ns).await.map_err(|e| (label, e)) }
+        async move {
+            if kind.ar.group == crate::external_secrets::GROUP {
+                return crate::external_secrets::problems(client, &kind, ns).await.map_err(|e| (label, e));
+            }
+            scan_kind(client, kind, ns).await.map_err(|e| (label, e))
+        }
     });
     let mut out = Scan::default();
     for r in futures::future::join_all(jobs).await {

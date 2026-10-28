@@ -314,6 +314,9 @@ pub(super) async fn fetch_related(
         // Who mounts or reads this object, by scanning workloads in the namespace.
         let name = obj.pointer("/metadata/name").and_then(|v| v.as_str()).unwrap_or_default().to_string();
         let is_secret = kind.is("", "Secret");
+        if is_secret {
+            related.external_secret = crate::external_secrets::source_of(client.clone(), &ns, obj).await;
+        }
         let sources = [
             ("deployments", k8s::ar_of::<apps::Deployment>(), "/spec/template/spec"),
             ("statefulsets", k8s::ar_of::<apps::StatefulSet>(), "/spec/template/spec"),
