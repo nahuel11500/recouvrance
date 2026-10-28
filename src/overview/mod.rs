@@ -55,7 +55,7 @@ pub struct Related {
     pub events: Vec<(String, String, String, i32)>,
     /// Last lines of a crash-looping container's previous run: (container, text).
     pub crash_logs: Option<(String, String)>,
-    /// The ExternalSecret a Secret comes from, when one owns it.
+    /// The `ExternalSecret` a Secret comes from, when one owns it.
     pub external_secret: Option<Value>,
     /// Roles and bindings, for RBAC and ServiceAccount pages.
     pub rbac: Option<crate::rbac::Snapshot>,

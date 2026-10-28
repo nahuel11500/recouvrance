@@ -102,8 +102,8 @@ pub(super) fn secret(ctx: &Ctx, cx: &App) -> Div {
         .child(div().pb_1().text_xs().text_color(muted).child("Click a value to show or hide it."))
 }
 
-/// "From ExternalSecret": the ExternalSecret that writes this Secret, its store, how often it
-/// syncs and whether the last sync worked. Nothing for a Secret no ExternalSecret owns.
+/// "From `ExternalSecret`": the `ExternalSecret` that writes this Secret, its store, how often it
+/// syncs and whether the last sync worked. Nothing for a Secret no `ExternalSecret` owns.
 fn external_secret_source(ctx: &Ctx, cx: &App) -> Option<Div> {
     let es = ctx.related.external_secret.as_ref()?;
     let name = s(es, "/metadata/name")?;
@@ -127,7 +127,7 @@ fn external_secret_source(ctx: &Ctx, cx: &App) -> Option<Div> {
     Some(v_flex().child(heading("From ExternalSecret")).child(fields))
 }
 
-/// An ExternalSecret's page: the Secret it writes and where its values come from.
+/// An `ExternalSecret`'s page: the Secret it writes and where its values come from.
 pub(super) fn external_secret_page(ctx: &Ctx, cx: &App) -> Div {
     let es = ctx.obj;
     let mut fields = sync_fields(ctx, es, cx);
@@ -137,7 +137,7 @@ pub(super) fn external_secret_page(ctx: &Ctx, cx: &App) -> Div {
     v_flex().child(fields)
 }
 
-/// An ExternalSecret's store (a link), refresh interval and last sync, in a row.
+/// An `ExternalSecret`'s store (a link), refresh interval and last sync, in a row.
 fn sync_fields(ctx: &Ctx, es: &Value, cx: &App) -> Div {
     let mut fields = row().pt_4();
     if let Some((kind, name)) = crate::external_secrets::store_of(es) {

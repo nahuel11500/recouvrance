@@ -1,5 +1,5 @@
-//! The external-secrets.io operator: ExternalSecrets and their stores that fail to sync (for
-//! the Problems scan), and the ExternalSecret a Secret comes from (for its page). A cluster
+//! The external-secrets.io operator: `ExternalSecret`s and their stores that fail to sync (for
+//! the Problems scan), and the `ExternalSecret` a Secret comes from (for its page). A cluster
 //! without the operator's API has none of these kinds, so nothing here runs there.
 
 use kube::Client;
@@ -21,16 +21,16 @@ pub fn ready(obj: &Value) -> Option<(&str, &str, &str)> {
     Some((text("status"), text("reason"), text("message")))
 }
 
-/// Whether an ExternalSecret never synced: the operator sets `status.refreshTime` on each
+/// Whether an `ExternalSecret` never synced: the operator sets `status.refreshTime` on each
 /// sync that worked and never clears it, so without one its Secret was never written.
 pub fn never_synced(es: &Value) -> bool {
     es.pointer("/status/refreshTime").is_none_or(Value::is_null)
 }
 
-/// Judge an ExternalSecret, SecretStore or ClusterSecretStore from its object; None when
-/// it looks healthy. An ExternalSecret not Ready is a warning (its Secret keeps the last
+/// Judge an `ExternalSecret`, `SecretStore` or `ClusterSecretStore` from its object; None when
+/// it looks healthy. An `ExternalSecret` not Ready is a warning (its Secret keeps the last
 /// values), critical when it never synced (its Secret may not exist). A store not Ready is
-/// critical: every ExternalSecret using it fails.
+/// critical: every `ExternalSecret` using it fails.
 pub fn judge(kind: &str, obj: &Value) -> Option<(Severity, String)> {
     let (status, reason, message) = ready(obj)?;
     // Ready is good when True; Unknown is the operator still deciding.
@@ -81,7 +81,7 @@ pub async fn problems(client: Client, kind: &Kind, namespace: Option<String>) ->
         .collect())
 }
 
-/// The ExternalSecret that owns a Secret, as (apiVersion, name), from its ownerReferences.
+/// The `ExternalSecret` that owns a Secret, as (apiVersion, name), from its ownerReferences.
 pub fn owner(secret: &Value) -> Option<(&str, &str)> {
     let owners = secret.pointer("/metadata/ownerReferences")?.as_array()?;
     owners.iter().find_map(|o| {
@@ -93,14 +93,14 @@ pub fn owner(secret: &Value) -> Option<(&str, &str)> {
     })
 }
 
-/// The store an ExternalSecret reads from, as (kind, name). The kind defaults to SecretStore.
+/// The store an `ExternalSecret` reads from, as (kind, name). The kind defaults to `SecretStore`.
 pub fn store_of(es: &Value) -> Option<(&str, &str)> {
     let r = es.pointer("/spec/secretStoreRef")?;
     let name = r["name"].as_str().filter(|n| !n.is_empty())?;
     Some((r["kind"].as_str().filter(|k| !k.is_empty()).unwrap_or("SecretStore"), name))
 }
 
-/// The Secret an ExternalSecret writes: `spec.target.name`, else its own name.
+/// The Secret an `ExternalSecret` writes: `spec.target.name`, else its own name.
 pub fn target_of(es: &Value) -> Option<&str> {
     es.pointer("/spec/target/name")
         .and_then(Value::as_str)
@@ -113,7 +113,7 @@ pub fn kubectl_name(kind: &str) -> String {
     format!("{}s.{GROUP}", kind.to_lowercase())
 }
 
-/// The ExternalSecret a Secret comes from, when one owns it (one request). Read at the
+/// The `ExternalSecret` a Secret comes from, when one owns it (one request). Read at the
 /// version its owner reference names, else at the ones the operator serves today (a
 /// version can stop being served after the reference was written).
 pub async fn source_of(client: Client, namespace: &str, secret: &Value) -> Option<Value> {
