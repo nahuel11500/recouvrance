@@ -302,7 +302,7 @@ async fn scan_kind(client: Client, kind: Kind, namespace: Option<String>) -> any
         if deleting(&defs, r) {
             // Within its grace period, or deleted a moment ago: nothing to read.
             if r.is_partial() || since(r.deleted_at, STUCK_AFTER) {
-                stuck.push(r);
+                stuck.push(r.clone());
             }
             continue;
         }
@@ -312,9 +312,14 @@ async fn scan_kind(client: Client, kind: Kind, namespace: Option<String>) -> any
     }
     // Lists don't carry finalizers, and a row listed without its object has no deletion
     // time: read them for the few rows deleting, so a pod in its grace period isn't stuck.
-    let (client, kind_ref) = (&client, &kind);
     let read: Vec<_> = futures::stream::iter(stuck)
-        .map(|r| async move { (r, held(client, kind_ref, r.namespace.as_deref(), &r.name).await) })
+        .map(|r| {
+            let (client, kind) = (client.clone(), kind.clone());
+            async move {
+                let h = held(&client, &kind, r.namespace.as_deref(), &r.name).await;
+                (r, h)
+            }
+        })
         .buffer_unordered(HELD_PARALLEL)
         .collect()
         .await;
