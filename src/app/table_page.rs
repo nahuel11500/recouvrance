@@ -14,6 +14,7 @@ use gpui_kit::*;
 use kube::Client;
 
 use super::AppView;
+use crate::details::ConfirmButtons as _;
 use crate::favorites::SavedView;
 use crate::k8s;
 use crate::k8s::{Kind, ObjectRef};
@@ -354,23 +355,20 @@ impl AppView {
             .chain((n > 8).then(|| format!("…and {} more", n - 8)))
             .collect();
         // What deleting this kind asks (Settings → General); scaling, or a protected
-        // context, always needs the count typed.
+        // context, always needs the count typed (or a wait, Settings → General).
         let level = crate::settings::delete_confirm(&kind.ar.group, &kind.ar.kind);
         if action == "Delete" && level == crate::settings::DeleteConfirm::Off && protected.is_empty() {
             self.run_bulk(action, kind, targets, 0, window, cx);
             return;
         }
-        let typed = ((action == "Delete" && level == crate::settings::DeleteConfirm::Type)
+        let count_typed = (action == "Delete" && level == crate::settings::DeleteConfirm::Type)
             || action == "Scale"
-            || !protected.is_empty())
-        .then(|| cx.new(|cx| InputState::new(window, cx).placeholder(n.to_string())));
+            || !protected.is_empty();
+        // Each protected context's name typed, like for a single write there; or one wait for all.
+        let (count_typed, guards) = crate::details::confirmation(count_typed, &protected, window, cx);
+        let typed = count_typed.then(|| cx.new(|cx| InputState::new(window, cx).placeholder(n.to_string())));
         // No count is suggested: it has to be typed.
         let replicas = (action == "Scale").then(|| cx.new(|cx| InputState::new(window, cx).placeholder("replicas")));
-        // Each protected context's name typed, like for a single write there.
-        let guards: Vec<(Entity<InputState>, String)> = protected
-            .iter()
-            .map(|c| (cx.new(|cx| InputState::new(window, cx).placeholder(c.clone())), c.clone()))
-            .collect();
         let names: Vec<String> = targets.iter().map(|t| crate::details::shell_word(&t.2.name)).collect();
         let namespaces: std::collections::BTreeSet<Option<&str>> =
             targets.iter().map(|t| t.2.namespace.as_deref()).collect();
@@ -428,11 +426,12 @@ impl AppView {
                 .when(action == "Delete", |a| {
                     a.child(crate::details::delete_settings_link(&kind.ar.group, &kind.ar.kind, &label, cx))
                 })
-                .show_cancel(true)
-                .ok_text(action)
-                .when(action == "Delete", |a| a.ok_variant(component::button::ButtonVariant::Danger))
+                .confirm_buttons(action, action == "Delete", guards.first())
                 .on_ok(move |_, window, cx| {
-                    if typed.as_ref().is_some_and(|i| i.read(cx).value().trim() != n.to_string()) {
+                    if typed
+                        .as_ref()
+                        .is_some_and(|i| !crate::details::typed_matches(&i.read(cx).value(), &n.to_string()))
+                    {
                         return false;
                     }
                     if !guards.iter().all(|g| crate::details::guard_ok(Some(g), cx)) {

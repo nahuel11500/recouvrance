@@ -24,7 +24,9 @@ Recouvrance reads your kubeconfig like `kubectl` does and keeps its own settings
 A JSON file that can't be read is kept aside as `<name>.bad-<time>` so the next save doesn't
 overwrite it. In `settings.json`, only the keys that don't read get their default; the others,
 such as `protection`, are kept; a `protection` entry that isn't `true` or `false` counts as
-protected, and a `delete_confirm_kinds` entry that doesn't read asks for the name. When
+protected, a `delete_confirm_kinds` entry that doesn't read asks for the name, and a
+`confirm_style` that doesn't read asks for names typed (so does every confirmation while
+`settings.json` can't be read). When
 `settings.json` doesn't read as an object at all, or its protection choices can't be read, every
 context without a choice is protected, also after a restart, until you choose *Guess them again* in
 Settings → Contexts. A `settings.json` that exists but can't be
@@ -68,7 +70,7 @@ context already shown as `name@file` keeps that name when `name` is freed.
 | `kubeconfigs`, `kubeconfig_folders` | | Extra kubeconfig files and watched folders (see above) |
 | `context_files` | | `{ "prod": "~/.kube/team-a.yaml" }`: the file each context name belongs to, so a name several files share stays with the first one, and the `name@file` names the others get stay with theirs (see above); filled in on its own |
 | `context_colors` | | `{ "prod-eu": "#ef4444" }`: a colored strip per context |
-| `protection` | guessed | `{ "prod-eu": true, "kind-dev": false }`: contexts where writes, shells and plugins need the context name typed. Contexts not listed are guessed from the context, user and cluster names and the server URL (`prod`, `prd`, `production`, `live`, `admin`, `root`); a context the kubeconfig doesn't have now, or any context while the kubeconfig can't be read, counts as protected. An older `protected_contexts` list is read once: its contexts become `true` |
+| `protection` | guessed | `{ "prod-eu": true, "kind-dev": false }`: contexts where writes, shells and plugins need the context name typed (or a wait, see `confirm_style`). Contexts not listed are guessed from the context, user and cluster names and the server URL (`prod`, `prd`, `production`, `live`, `admin`, `root`); a context the kubeconfig doesn't have now, or any context while the kubeconfig can't be read, counts as protected. An older `protected_contexts` list is read once: its contexts become `true` |
 | `protect_unset` | `false` | Set when the protection choices could not be read: contexts not listed in `protection` are protected instead of guessed. *Guess them again* in Settings → Contexts turns it off |
 | `prometheus` | found automatically | `{ "ctx": "monitoring/prometheus:9090" }` (see below) |
 | `clusters` | | Per-cluster settings (below) |
@@ -85,6 +87,8 @@ context already shown as `name@file` keeps that name when `name` is freed.
 | `assistant_notes` | | The team's notes given to the assistant: where things run, dashboards, runbooks |
 | `assistant_repos` | | Folders of the team's code the assistant may read (Claude Code only) |
 | `delete_confirm` | `"ask"` | What deleting asks for kinds not in `delete_confirm_kinds`: `off` (delete right away), `ask` (a dialog) or `type` (the name typed) |
+| `confirm_style` | `"wait"` | How deletes set to `type` and writes on protected contexts are confirmed: `wait` (the confirm button stays disabled for `confirm_wait_secs`, showing the seconds left, then works; nothing to type, and a dialog that would ask for several names waits once) or `type` (the names typed). A value that doesn't read asks for the names |
+| `confirm_wait_secs` | `3` | Seconds the confirm button waits with `wait`, from 1 to 30; a value outside is brought within, one that isn't a whole number waits 30 |
 | `delete_confirm_kinds` | by kind | `{ "Pod": "off", "Cluster.postgresql.cnpg.io": "type" }`: what deleting asks per kind, a custom resource with its group (see [features](features.md)). A value that doesn't read asks for the name |
 | `namespace_visits` | | Remembered by the app: namespaces chosen per context, with a visit count and the last visit time. The namespace picker shows the five most frequent first (visits weigh half as much after a week without one); 30 kept per context. Older files' `recent_namespaces` are turned into visits once |
 | `last_contexts`, `recent_contexts` | | Remembered by the app |
@@ -197,7 +201,7 @@ to its variable, quoted for where it stands (bare, in double quotes or in single
 terminal page, or in the background with the last line of output shown.
 
 A plugin may change the cluster, so it is treated as a write: it needs write mode, and on a
-protected context the context name typed. A plugin that only reads declares `read_only: true` and
+protected context the context name typed (or a wait, see `confirm_style`). A plugin that only reads declares `read_only: true` and
 runs in read-only mode too. `confirm: true` always asks before running. A plugin that writes runs
 again only from its button, with these checks, not from its terminal page.
 

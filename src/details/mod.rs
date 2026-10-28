@@ -21,12 +21,14 @@ mod compare;
 mod demo;
 mod files;
 mod forward_options;
+mod guard;
 mod logs;
 mod related;
 mod tabs;
 
 pub(crate) use actions::*;
 pub(crate) use argo::OpenOnContext;
+pub(crate) use guard::*;
 pub(crate) use logs::*;
 use related::{container_history_for, container_names, fetch_related, gpu_history_for, history_for};
 use tabs::error_box;
@@ -350,8 +352,7 @@ impl DetailPanel {
             alert
                 .title(format!("Run {}?", plugin.name))
                 .child(confirm_extras(&command, guard.as_ref(), cx))
-                .show_cancel(true)
-                .ok_text("Run")
+                .confirm_buttons("Run", false, guard.as_ref())
                 .on_ok(move |_, window, cx| {
                     if !guard_ok(guard.as_ref(), cx) {
                         return false;

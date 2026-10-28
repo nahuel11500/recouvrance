@@ -4,11 +4,10 @@
 use std::time::Instant;
 
 use gpui_kit::component::WindowExt as _;
-use gpui_kit::component::input::InputState;
 use gpui_kit::component::notification::Notification;
 use gpui_kit::*;
 
-use super::{DetailPanel, WriteFuture, confirm_extras, guard_ok, kubectl, shell_word};
+use super::{ConfirmButtons as _, DetailPanel, Guard, WriteFuture, confirm_extras, guard_ok, kubectl, shell_word};
 use crate::k8s::{self, ObjectRef, argo::Lookup};
 
 /// What Refresh and Sync do, in their confirmations.
@@ -115,10 +114,7 @@ impl DetailPanel {
         let kind = k8s::argo::application_kind();
         let action = if sync { "Sync" } else { "Refresh" };
         let cmd = kubectl(&hub.context, Some(&app.namespace), &argo_args(action, &kind.kubectl_name(), &app.name));
-        let guard = crate::settings::is_protected(&hub.context).then(|| {
-            let ctx = hub.context.clone();
-            (cx.new(|cx| InputState::new(window, cx).placeholder(ctx.clone())), ctx)
-        });
+        let guard = Guard::protected(&hub.context, window, cx);
         let title = format!("{action} Application {}?", app.name);
         let description = if sync { SYNC_NOTE } else { REFRESH_NOTE };
         let panel = cx.entity().downgrade();
@@ -128,8 +124,7 @@ impl DetailPanel {
                 .title(title.clone())
                 .description(description)
                 .child(confirm_extras(&cmd, guard.as_ref(), cx))
-                .show_cancel(true)
-                .ok_text(action)
+                .confirm_buttons(action, false, guard.as_ref())
                 .on_ok(move |_, window, cx| {
                     if !guard_ok(guard.as_ref(), cx) {
                         return false;

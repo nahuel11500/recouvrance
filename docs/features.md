@@ -15,7 +15,7 @@
 - **Shell** (exec with a real terminal), **node shell** (privileged pod, deleted when its shell
   ends or its page goes away) and **port-forward** for pods and services; forwards are remembered
   and restored with one click. Shells and attach need write mode (they run commands in the
-  cluster), checked on every connect, and the context name typed on a protected context.
+  cluster), checked on every connect, and the context name typed (or a wait) on a protected context.
 - **RBAC-aware**: actions your Kubernetes RBAC forbids are disabled; *My access* shows a can-i
   matrix for the namespace, and says when the cluster (webhook or cloud IAM authorizer) may allow
   more than it lists.
@@ -30,7 +30,7 @@
   shows it at once, marked "Updating…", while a fresh list loads and replaces it in one go.
 - **Bulk actions**: check rows, then restart, scale, delete or copy names. Scaling needs the number
   of objects typed (the replica count is never suggested), deleting asks as set for the kind (see
-  below), and each protected context among them needs its name typed; rows from several contexts
+  below), and each protected context among them needs its name typed (or a wait); rows from several contexts
   show which one they are on.
 - **Delete confirmation per kind** (Settings → General → Deleting): delete right away, ask, or
   type the name (the count, for several). By default, what comes back on its own (Pods, Jobs,
@@ -42,6 +42,11 @@
   never applies to a custom resource of the same name, unless it asks more. Every delete dialog
   links to the setting. A protected context always asks for its name, and an object stuck
   terminating always shows the dialog, to remove its finalizers.
+- **Confirming** (Settings → General → Confirming): by default, a confirmation that would ask for
+  names typed (a kind set to *Type the name*, a protected context) waits instead: its button stays
+  disabled for a few seconds (3 by default, 1 to 30), showing the seconds left (`Delete (3)`),
+  then works. A dialog that would ask for several names waits once. Choose *Type the names* to
+  type them as before.
 - **Write mode** (off by default): click the `read-only` badge to enable scale, restart, delete
   (confirmed as set per kind), YAML edits (validated by a server dry run first), cordon/uncordon nodes,
   debug pods with an ephemeral container (falls back to a Pod Security "restricted" profile), run a CronJob now, suspend/resume (CronJobs, Flux, Argo CronWorkflows), drain nodes, force delete
@@ -55,9 +60,10 @@
 - **Plugins**: your own commands on resources (`~/.config/recouvrance/plugins.yaml`):
   `$CONTEXT`, `$NAMESPACE`, `$NAME`, `$KIND` are filled in and kubectl points at the cluster; they
   run in a terminal page or in the background. A plugin counts as a write (write mode, protected
-  context name typed) unless it declares `read_only: true`. See Settings → Plugins for an example.
+  context name typed or a wait) unless it declares `read_only: true`. See Settings → Plugins for an example.
 - **Contexts** can get a color (a strip at the top of the window) and be marked *protected*: writes
-  there ask you to type the context name (agents follow their rules instead). Contexts you have not set are guessed from the context,
+  there ask you to type the context name, or wait a few seconds (see Confirming; agents follow
+  their rules instead). Contexts you have not set are guessed from the context,
   user and cluster names and the server URL (`prod`, `prd`, `production`, `live`, `admin`, `root`),
   so new production contexts are protected too. Set both in Settings → Contexts.
 - **Diagnosis** on pods and workloads: why it is broken (crash output and exit code, scheduling,

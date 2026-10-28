@@ -11,6 +11,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use serde::Deserialize;
 
+use crate::details::ConfirmButtons as _;
 use crate::k8s;
 
 /// The values editor's text while the picked chart's values load.
@@ -263,9 +264,7 @@ impl HelmInstall {
         }
         let Some(args) = self.args(cx, false, "values.yaml") else { return };
         let context = self.context.clone();
-        let protected = crate::settings::is_protected(&context);
-        let guard =
-            protected.then(|| (cx.new(|cx| InputState::new(window, cx).placeholder(context.clone())), context.clone()));
+        let guard = crate::details::Guard::protected(&context, window, cx);
         let cmd = format!("helm --kube-context {context} {}", args.join(" "));
         let view = cx.entity().downgrade();
         window.open_alert_dialog(cx, move |alert, _, cx| {
@@ -274,8 +273,7 @@ impl HelmInstall {
                 .title("Install this chart?")
                 .description("Helm creates every object of the chart in the cluster.")
                 .child(crate::details::confirm_extras(&cmd, guard.as_ref(), cx))
-                .show_cancel(true)
-                .ok_text("Install")
+                .confirm_buttons("Install", false, guard.as_ref())
                 .on_ok(move |_, window, cx| {
                     if !crate::details::guard_ok(guard.as_ref(), cx) {
                         return false;
