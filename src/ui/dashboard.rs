@@ -73,6 +73,7 @@ enum Piece {
 /// What has arrived so far for one cluster.
 #[derive(Default)]
 struct ClusterState {
+    /// What its errors are about: the cluster, or the namespace in it.
     context: String,
     kinds: Vec<Option<Result<Counts, String>>>,
     warnings: Option<Vec<Warning>>,
@@ -125,20 +126,34 @@ struct Data {
 }
 
 pub struct Dashboard {
+    /// One per list: a cluster, or one of the namespaces chosen there.
     clusters: Vec<ClusterState>,
+    /// Several clusters: rows say which one.
     multi: bool,
+    /// Several lists: errors say which one.
+    labelled: bool,
     _tasks: Vec<Task<()>>,
 }
 
 impl EventEmitter<OpenObject> for Dashboard {}
 
 impl Dashboard {
-    pub fn new(clusters: Vec<(String, Client)>, namespace: Option<String>, cx: &mut Context<Self>) -> Self {
-        let multi = clusters.len() > 1;
-        let mut tasks = Vec::new();
-        for (ix, (ctx, client)) in clusters.iter().cloned().enumerate() {
-            let namespace = namespace.clone();
-            tasks.push(cx.spawn(async move |this, cx| {
+    pub fn new(scope: crate::ui::Scope, cx: &mut Context<Self>) -> Self {
+        let mut dash = Self { clusters: Vec::new(), multi: false, labelled: false, _tasks: Vec::new() };
+        dash.set_scope(scope, cx);
+        dash
+    }
+
+    /// Show other clusters or namespaces: each namespace chosen is listed by itself, and
+    /// what they hold added up per cluster.
+    pub fn set_scope(&mut self, scope: crate::ui::Scope, cx: &mut Context<Self>) {
+        self.multi = scope.len() > 1;
+        let lists = crate::ui::scope_lists(scope);
+        self.labelled = lists.len() > 1;
+        // Replacing the tasks stops the old lists: their results never land over these.
+        self._tasks = Vec::new();
+        for (ix, (_, ctx, client, namespace)) in lists.iter().cloned().enumerate() {
+            self._tasks.push(cx.spawn(async move |this, cx| {
                 loop {
                     let exec = cx.background_executor().clone();
                     if !crate::app::wait_visible(&this, cx, &exec).await {
@@ -165,11 +180,11 @@ impl Dashboard {
                 }
             }));
         }
-        let states = clusters
-            .iter()
-            .map(|(ctx, _)| ClusterState { context: ctx.clone(), kinds: vec![None; SLOTS.len()], ..Default::default() })
+        self.clusters = lists
+            .into_iter()
+            .map(|(label, ..)| ClusterState { context: label, kinds: vec![None; SLOTS.len()], ..Default::default() })
             .collect();
-        Self { clusters: states, multi, _tasks: tasks }
+        cx.notify();
     }
 
     fn apply(&mut self, ix: usize, piece: Piece, cx: &mut Context<Self>) {
@@ -194,9 +209,9 @@ impl Dashboard {
             .map(|(title, _)| KindSummary { title, counts: Vec::new(), loading: false, errors: Vec::new() })
             .collect();
         let mut out = Data::default();
-        let multi = self.multi;
-        // Which cluster an error is about, when there are several.
-        let about = |ctx: &str, e: &str| if multi { format!("{ctx}: {e}") } else { e.to_string() };
+        let labelled = self.labelled;
+        // Which cluster or namespace an error is about, when there are several.
+        let about = |ctx: &str, e: &str| if labelled { format!("{ctx}: {e}") } else { e.to_string() };
         for state in &mut self.clusters {
             for (slot, k) in kinds.iter_mut().enumerate() {
                 match &state.kinds[slot] {

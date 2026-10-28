@@ -5,16 +5,17 @@ use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use kube::Client;
 
 use crate::details::OpenObject;
 use crate::k8s::{self, Kind};
 use crate::problems::{self, Problem, Severity};
 
 pub struct ProblemsView {
-    clusters: Vec<(String, Client)>,
+    /// Each cluster with the namespaces scanned there.
+    clusters: crate::ui::Scope,
     kinds: Vec<Kind>,
-    namespace: Option<String>,
+    /// The namespaces chosen, for the header.
+    namespaces: Vec<String>,
     /// (context, problem) once loaded.
     found: Option<Vec<(String, Problem)>>,
     errors: Vec<String>,
@@ -26,29 +27,35 @@ pub struct ProblemsView {
 impl EventEmitter<OpenObject> for ProblemsView {}
 
 impl ProblemsView {
-    pub fn new(
-        clusters: Vec<(String, Client)>,
-        kinds: Vec<Kind>,
-        namespace: Option<String>,
-        cx: &mut Context<Self>,
-    ) -> Self {
+    pub fn new(clusters: crate::ui::Scope, kinds: Vec<Kind>, namespaces: Vec<String>, cx: &mut Context<Self>) -> Self {
         let mut this =
-            Self { clusters, kinds, namespace, found: None, errors: Vec::new(), show_info: false, _task: None };
+            Self { clusters, kinds, namespaces, found: None, errors: Vec::new(), show_info: false, _task: None };
         this.reload(cx);
         this
     }
 
+    /// Scan other clusters or namespaces (`namespaces`: the ones chosen, for the header).
+    pub fn set_scope(&mut self, clusters: crate::ui::Scope, namespaces: Vec<String>, cx: &mut Context<Self>) {
+        (self.clusters, self.namespaces, self.found) = (clusters, namespaces, None);
+        self.errors.clear();
+        self.reload(cx);
+        cx.notify();
+    }
+
     fn reload(&mut self, cx: &mut Context<Self>) {
-        let (clusters, kinds, ns) = (self.clusters.clone(), self.kinds.clone(), self.namespace.clone());
+        let (clusters, kinds) = (self.clusters.clone(), self.kinds.clone());
         self._task = Some(cx.spawn(async move |this, cx| {
             loop {
                 let exec = cx.background_executor().clone();
                 if !crate::app::wait_visible(&this, cx, &exec).await {
                     break;
                 }
-                let scans = clusters.iter().map(|(ctx, c)| {
-                    let (ctx, c, kinds, ns) = (ctx.clone(), c.clone(), kinds.clone(), ns.clone());
-                    async move { (ctx, problems::scan_partial(c, &kinds, ns).await) }
+                // A cluster where none of the namespaces chosen is accessible is left out.
+                let scans = clusters.iter().filter(|(_, _, ns)| !ns.is_empty()).map(|(ctx, c, ns)| {
+                    // `[None]`: the whole cluster; otherwise each namespace, Nodes once.
+                    let ns: Vec<String> = ns.iter().flatten().cloned().collect();
+                    let (ctx, c, kinds) = (ctx.clone(), c.clone(), kinds.clone());
+                    async move { (ctx, problems::scan_namespaces(c, &kinds, &ns).await) }
                 });
                 let (found, errors) = merge(futures::future::join_all(scans).await);
                 if this
@@ -192,9 +199,9 @@ impl Render for ProblemsView {
             .gap_3()
             .child(Icon::new(Lucide::TriangleAlert).size_5().text_color(theme.warning))
             .child(div().text_xl().font_weight(FontWeight::MEDIUM).child("Problems"))
-            .child(div().text_sm().text_color(theme.muted_foreground).child(match &self.namespace {
-                Some(ns) => format!("in {ns}"),
-                None => "all namespaces".into(),
+            .child(div().text_sm().text_color(theme.muted_foreground).child(match self.namespaces.as_slice() {
+                [] => "all namespaces".into(),
+                chosen => format!("in {}", chosen.join(", ")),
             }))
             .child(div().flex_1())
             .child(

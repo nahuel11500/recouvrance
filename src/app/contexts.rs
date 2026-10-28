@@ -269,14 +269,11 @@ impl AppView {
         self.namespaces = namespaces;
         self.namespace = (self.namespaces.len() == 1).then(|| self.namespaces[0].clone());
         self.update_assistant_scope(cx);
-        if let Route::Helm(list) = self.route().clone() {
-            let scope = self.helm_scope();
-            list.update(cx, |l, cx| l.set_scope(scope, cx));
-        }
+        self.rescope_page(cx);
     }
 
-    /// Each connected cluster with the namespaces its Helm releases are listed from.
-    pub(super) fn helm_scope(&self) -> crate::ui::helm::HelmScope {
+    /// Each connected cluster with the namespaces a page lists there.
+    pub(super) fn namespace_scope(&self) -> crate::ui::Scope {
         (self.clusters.iter())
             .map(|(ctx, client)| {
                 let ns = cluster_namespaces(&self.namespaces, &crate::settings::cluster(ctx).namespaces);
