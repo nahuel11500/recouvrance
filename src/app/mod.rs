@@ -575,7 +575,10 @@ impl AppView {
                 let (kinds, ns) = (self.kinds.clone(), self.namespace.clone());
                 Route::Problems(cx.new(|cx| crate::ui::problems_view::ProblemsView::new(clusters, kinds, ns, cx)))
             }
-            Route::Helm(_) => Route::Helm(cx.new(|cx| HelmList::new(clusters, self.namespace.clone(), window, cx))),
+            Route::Helm(_) => {
+                let scope = self.helm_scope();
+                Route::Helm(cx.new(|cx| HelmList::new(scope, window, cx)))
+            }
             _ => return,
         };
         match &route {

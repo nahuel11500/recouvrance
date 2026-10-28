@@ -308,7 +308,8 @@ impl AppView {
             cx.notify();
             return;
         }
-        let list = cx.new(|cx| HelmList::new(self.clusters.clone(), self.namespace.clone(), window, cx));
+        let scope = self.helm_scope();
+        let list = cx.new(|cx| HelmList::new(scope, window, cx));
         self.subscribe_helm(&list, window, cx);
         self.navigate(Route::Helm(list), cx);
     }
