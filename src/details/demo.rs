@@ -191,12 +191,8 @@ impl DetailPanel {
             title,
             "Creates a Job from its template, like `kubectl create job --from=cronjob/…`.",
             "Run",
-            |p| {
-                Box::pin(k8s::trigger_cronjob(
-                    p.client.clone(),
-                    p.obj.namespace.clone().unwrap_or_default(),
-                    p.obj.name.clone(),
-                ))
+            |p, client| {
+                Box::pin(k8s::trigger_cronjob(client, p.obj.namespace.clone().unwrap_or_default(), p.obj.name.clone()))
             },
             window,
             cx,
