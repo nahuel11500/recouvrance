@@ -152,7 +152,7 @@ mod tests {
     use proptest::prelude::*;
 
     fn id(user: &str, groups: &[&str]) -> Identity {
-        Identity { user: user.into(), groups: groups.iter().map(|g| g.to_string()).collect() }
+        Identity { user: user.into(), groups: groups.iter().map(ToString::to_string).collect() }
     }
 
     #[test]
