@@ -69,12 +69,13 @@ impl DetailPanel {
         let title = format!("Scale {} {}", self.obj.kind.ar.kind, self.obj.name);
         let cmd = self.kubectl_for("Scale");
         let guard = self.protection(window, cx);
+        let run_as = RunAs::offer(&self.context, cx);
         let description = match current {
             Some(c) => format!("Currently {c} replica{}. New replica count:", if c == 1 { "" } else { "s" }),
             None => "The current replica count is unknown. New replica count:".to_string(),
         };
         window.open_alert_dialog(cx, move |alert, _, cx| {
-            let (input, panel, guard) = (input.clone(), panel.clone(), guard.clone());
+            let (input, panel, guard, run_as) = (input.clone(), panel.clone(), guard.clone(), run_as.clone());
             let typed = input.read(cx).value().trim().to_string();
             let cmd =
                 cmd.replace("--replicas=…", &format!("--replicas={}", if typed.is_empty() { "…" } else { &typed }));
@@ -82,7 +83,7 @@ impl DetailPanel {
                 .title(title.clone())
                 .description(description.clone())
                 .child(Input::new(&input))
-                .child(confirm_extras(&cmd, guard.as_ref(), cx))
+                .child(confirm_with(&cmd, guard.as_ref(), &run_as, cx))
                 .show_cancel(true)
                 .ok_text("Scale")
                 .on_ok(move |_, window, cx| {
@@ -92,7 +93,7 @@ impl DetailPanel {
                     let Some(n) = parse_replicas(&input.read(cx).value()) else { return false };
                     let _ = panel.update(cx, |this, cx| {
                         let (c, k, ns, name) = (
-                            this.client.clone(),
+                            run_as.client(&this.client, cx),
                             this.obj.kind.clone(),
                             this.obj.namespace.clone(),
                             this.obj.name.clone(),
@@ -127,8 +128,7 @@ impl DetailPanel {
             "Suspend" => patch(serde_json::json!({"spec": {"suspend": true}})),
             "Resume" => patch(serde_json::json!({"spec": {"suspend": false}})),
             "Reconcile" => format!("annotate {kind} {name} --overwrite reconcile.fluxcd.io/requestedAt=$(date +%s)"),
-            "Refresh" => format!("annotate {kind} {name} --overwrite argocd.argoproj.io/refresh=normal"),
-            "Sync" => patch(k8s::argo_sync_patch()),
+            "Refresh" | "Sync" => super::argo::argo_args(action, &kind, &self.obj.name),
             "Restart" => format!("rollout restart {kind}/{name}"),
             "Scale" => format!("scale {kind}/{name} --replicas=…"),
             "Delete" => format!("delete {kind} {name}"),
@@ -165,7 +165,7 @@ impl DetailPanel {
         title: String,
         description: &'static str,
         ok: &'static str,
-        action: fn(&Self) -> WriteFuture,
+        action: fn(&Self, kube::Client) -> WriteFuture,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -175,12 +175,13 @@ impl DetailPanel {
         let panel = cx.entity().downgrade();
         let cmd = self.kubectl_for(ok);
         let guard = self.protection(window, cx);
+        let run_as = RunAs::offer(&self.context, cx);
         window.open_alert_dialog(cx, move |alert, _, cx| {
-            let (panel, guard) = (panel.clone(), guard.clone());
+            let (panel, guard, run_as) = (panel.clone(), guard.clone(), run_as.clone());
             alert
                 .title(title.clone())
                 .description(description)
-                .child(confirm_extras(&cmd, guard.as_ref(), cx))
+                .child(confirm_with(&cmd, guard.as_ref(), &run_as, cx))
                 .show_cancel(true)
                 .ok_text(ok)
                 .on_ok(move |_, window, cx| {
@@ -188,7 +189,7 @@ impl DetailPanel {
                         return false;
                     }
                     let _ = panel.update(cx, |this, cx| {
-                        let fut = action(this);
+                        let fut = action(this, run_as.client(&this.client, cx));
                         this.run_write(ok, fut, window, cx);
                     });
                     true
@@ -232,6 +233,8 @@ impl DetailPanel {
             ),
         );
         let guard = self.protection(window, cx);
+        let run_as = RunAs::offer(&self.context, cx);
+        let context = self.context.clone();
         let title = format!("Roll {} {} back to revision {number}?", self.obj.kind.ar.kind, self.obj.name);
         // Validate with a server dry run first, like YAML edits.
         let dry = k8s::rollback(
@@ -246,13 +249,16 @@ impl DetailPanel {
             let check = dry.await;
             let _ = cx.update(|window, cx| {
                 // Write mode may have been turned off during the dry run.
-                if check.is_ok() && !writes_still_on(window, cx) {
+                let confirmable = check.as_ref().err().is_none_or(|e| refused_but_can_run_as(e, &context));
+                if confirmable && !writes_still_on(window, cx) {
                     return;
                 }
                 window.open_alert_dialog(cx, move |alert, _, cx| {
-                    let (panel, guard, template) = (panel.clone(), guard.clone(), template.clone());
+                    let (panel, guard, template, run_as) = (panel.clone(), guard.clone(), template.clone(), run_as.clone());
+                    let changes = format!("The pod template goes back to revision {number}: {added} lines added, {removed} removed (diff shown in the Revisions tab).");
                     let summary = match &check {
-                        Ok(_) => format!("The pod template goes back to revision {number}: {added} lines added, {removed} removed (diff shown in the Revisions tab). The server dry run passed; a new rollout starts."),
+                        Ok(_) => format!("{changes} The server dry run passed; a new rollout starts."),
+                        Err(e) if confirmable => format!("{changes} The server refused it to you in a dry run ({}): turn on Run as to roll back as that identity.", k8s::short_error(e)),
                         // Nothing to confirm: the real rollback would fail the same way.
                         Err(e) => return alert
                             .title(title.clone())
@@ -262,7 +268,7 @@ impl DetailPanel {
                     alert
                         .title(title.clone())
                         .description(summary)
-                        .child(confirm_extras(&cmd, guard.as_ref(), cx))
+                        .child(confirm_with(&cmd, guard.as_ref(), &run_as, cx))
                         .show_cancel(true)
                         .ok_text("Roll back")
                         .on_ok(move |_, window, cx| {
@@ -274,7 +280,7 @@ impl DetailPanel {
                             }
                             let template = template.clone();
                             let _ = panel.update(cx, |this, cx| {
-                                let fut = k8s::rollback(this.client.clone(), this.obj.kind.clone(), this.obj.namespace.clone(), this.obj.name.clone(), template, false);
+                                let fut = k8s::rollback(run_as.client(&this.client, cx), this.obj.kind.clone(), this.obj.namespace.clone(), this.obj.name.clone(), template, false);
                                 this.run_write("Roll back", fut, window, cx);
                             });
                             true
@@ -290,9 +296,9 @@ impl DetailPanel {
             format!("Restart {} {}?", self.obj.kind.ar.kind, self.obj.name),
             "Pods are replaced one by one, like `kubectl rollout restart`.",
             "Restart",
-            |p| {
+            |p, client| {
                 Box::pin(k8s::rollout_restart(
-                    p.client.clone(),
+                    client,
                     p.obj.kind.clone(),
                     p.obj.namespace.clone(),
                     p.obj.name.clone(),
@@ -533,7 +539,10 @@ impl DetailPanel {
         let level = crate::settings::delete_confirm(&self.obj.kind.ar.group, &self.obj.kind.ar.kind);
         let guard = self.protection(window, cx);
         let terminating = self.object.as_ref().is_some_and(|o| o.pointer("/metadata/deletionTimestamp").is_some());
-        if level == crate::settings::DeleteConfirm::Off && guard.is_none() && !terminating {
+        let run_as = RunAs::offer(&self.context, cx);
+        // Denied to you, with an identity to run as: the dialog offers it.
+        let elevate = self.denied.contains("delete") && run_as.chosen_possible();
+        if level == crate::settings::DeleteConfirm::Off && guard.is_none() && !terminating && !elevate {
             let (c, k, ns, n) =
                 (self.client.clone(), self.obj.kind.clone(), self.obj.namespace.clone(), self.obj.name.clone());
             let uid = self.shown_uid();
@@ -553,8 +562,8 @@ impl DetailPanel {
         // the dialog is open, and that one must not be deleted.
         let uid = self.shown_uid();
         window.open_alert_dialog(cx, move |alert, _, cx| {
-            let (input, panel, name, guard, uid) =
-                (input.clone(), panel.clone(), name.clone(), guard.clone(), uid.clone());
+            let (input, panel, name, guard, uid, run_as) =
+                (input.clone(), panel.clone(), name.clone(), guard.clone(), uid.clone(), run_as.clone());
             let (force, strip) = *opts.read(cx);
             let mut cmd = if force { format!("{base} --grace-period=0 --force") } else { base.clone() };
             // Delete first; finalizers are cleared only when it then stays, stuck terminating.
@@ -608,7 +617,7 @@ impl DetailPanel {
                             ))
                         }),
                 )
-                .child(confirm_extras(&cmd, guard.as_ref(), cx))
+                .child(confirm_with(&cmd, guard.as_ref(), &run_as, cx))
                 .child(delete_settings_link(&ar.group, &ar.kind, &label, cx))
                 .show_cancel(true)
                 .ok_text("Delete")
@@ -619,7 +628,7 @@ impl DetailPanel {
                     }
                     let _ = panel.update(cx, |this, cx| {
                         let (c, k, ns, n) = (
-                            this.client.clone(),
+                            run_as.client(&this.client, cx),
                             this.obj.kind.clone(),
                             this.obj.namespace.clone(),
                             this.obj.name.clone(),
@@ -667,19 +676,28 @@ impl DetailPanel {
         let panel = cx.entity().downgrade();
         let cmd = self.kubectl_for("Save");
         let guard = self.protection(window, cx);
+        let run_as = RunAs::offer(&self.context, cx);
+        let context = self.context.clone();
         let task = cx.spawn_in(window, async move |_, cx| {
             let result = check.await;
             let _ = cx.update(|window, cx| match result {
-                Err(e) => {
+                Err(e) if !refused_but_can_run_as(&e, &context) => {
                     window.push_notification(Notification::error(format!("The server rejected the change: {e:#}")), cx);
                 }
-                Ok(_) if !writes_still_on(window, cx) => {}
-                Ok(_) => window.open_alert_dialog(cx, move |alert, _, cx| {
-                    let (panel, obj, guard) = (panel.clone(), obj.clone(), guard.clone());
+                _ if !writes_still_on(window, cx) => {}
+                result => window.open_alert_dialog(cx, move |alert, _, cx| {
+                    let (panel, obj, guard, run_as) = (panel.clone(), obj.clone(), guard.clone(), run_as.clone());
+                    let description = match &result {
+                        Ok(_) => "The server accepted them in a dry run. Save them now?".to_string(),
+                        Err(e) => format!(
+                            "The server refused them to you in a dry run ({}): turn on Run as to save them as that identity.",
+                            k8s::short_error(e)
+                        ),
+                    };
                     alert
                         .title("Apply YAML changes?")
-                        .description("The server accepted them in a dry run. Save them now?")
-                        .child(confirm_extras(&cmd, guard.as_ref(), cx))
+                        .description(description)
+                        .child(confirm_with(&cmd, guard.as_ref(), &run_as, cx))
                         .show_cancel(true)
                         .ok_text("Save")
                         .on_ok(move |_, window, cx| {
@@ -692,7 +710,7 @@ impl DetailPanel {
                             let obj = obj.clone();
                             let _ = panel.update(cx, |this, cx| {
                                 let (c, k, ns) =
-                                    (this.client.clone(), this.obj.kind.clone(), this.obj.namespace.clone());
+                                    (run_as.client(&this.client, cx), this.obj.kind.clone(), this.obj.namespace.clone());
                                 // Saved: the editor shows the server's version again, which
                                 // the live refresh then keeps current.
                                 this.run_write_then("Save", k8s::replace(c, k, ns, obj, false), true, window, cx);
@@ -767,12 +785,94 @@ pub(crate) fn identity_change(
 /// A write started from a detail page (built from the panel's state).
 pub(super) type WriteFuture = std::pin::Pin<Box<dyn Future<Output = Result<String>>>>;
 
+/// The "Run as" choice of one confirmation (`kubectl --as`): offered when the context has an
+/// identity to run as (Settings → Contexts), off each time a dialog opens, never remembered.
+#[derive(Clone, Default)]
+pub struct RunAs(Option<(Entity<bool>, String, k8s::Identity)>);
+
+impl RunAs {
+    /// The toggle for a dialog about to open on `context`, off; nothing when none is set.
+    pub fn offer(context: &str, cx: &mut App) -> Self {
+        Self(crate::settings::run_as(context).map(|id| (cx.new(|_| false), context.to_string(), id)))
+    }
+
+    /// Whether the toggle is offered (the context has an identity to run as).
+    pub fn chosen_possible(&self) -> bool {
+        self.0.is_some()
+    }
+
+    /// The identity this action runs as, when the toggle is on.
+    pub fn chosen(&self, cx: &App) -> Option<k8s::Identity> {
+        let (on, _, id) = self.0.as_ref()?;
+        on.read(cx).then(|| id.clone())
+    }
+
+    /// The kubectl equivalent, with `--as` when the toggle is on.
+    pub fn command(&self, cmd: &str, cx: &App) -> String {
+        match self.chosen(cx) {
+            Some(id) if !cmd.is_empty() => {
+                cmd.replace("kubectl --context ", &format!("kubectl {} --context ", id.kubectl_flags()))
+            }
+            _ => cmd.to_string(),
+        }
+    }
+
+    /// The client for this action: `client` itself, or one sending its writes as the identity
+    /// chosen. Built when the action is confirmed, dropped with it.
+    pub fn client(&self, client: &kube::Client, cx: &App) -> kube::Client {
+        match (&self.0, self.chosen(cx)) {
+            (Some((_, context, _)), Some(id)) => k8s::run_as(client, context, id),
+            _ => client.clone(),
+        }
+    }
+}
+
+/// Whether a dry run refused to the user may still be confirmed, to run as the identity set
+/// for the context: the server said forbidden, and one is set.
+pub fn refused_but_can_run_as(e: &anyhow::Error, context: &str) -> bool {
+    k8s::api_status(e) == Some(403) && crate::settings::run_as(context).is_some()
+}
+
 /// The kubectl equivalent of a confirmation, plus the protected-context input.
 pub fn confirm_extras(cmd: &str, guard: Option<&(Entity<InputState>, String)>, cx: &App) -> AnyElement {
+    confirm_with(cmd, guard, &RunAs::default(), cx)
+}
+
+/// [`confirm_extras`], with the "Run as" toggle when the context has an identity to run as.
+pub fn confirm_with(cmd: &str, guard: Option<&(Entity<InputState>, String)>, run_as: &RunAs, cx: &App) -> AnyElement {
     let theme = cx.theme();
+    let cmd = run_as.command(cmd, cx);
+    let toggle = run_as.0.as_ref().map(|(on, _, id)| {
+        let (on, checked) = (on.clone(), *on.read(cx));
+        v_flex()
+            .gap_1()
+            .px_2()
+            .py_1()
+            .rounded_sm()
+            .border_1()
+            .border_color(if checked { theme.warning } else { theme.border })
+            .child(Checkbox::new("run-as").label(format!("Run as {}", id.label())).checked(checked).on_click(
+                move |v: &bool, _, cx| {
+                    let v = *v;
+                    on.update(cx, |on, cx| {
+                        *on = v;
+                        cx.notify();
+                    });
+                    cx.refresh_windows();
+                },
+            ))
+            .child(div().text_xs().text_color(if checked { theme.warning } else { theme.muted_foreground }).child(
+                if checked {
+                    "This action's writes are sent as this identity (impersonation). Only this once."
+                } else {
+                    "Off: sent as you. Turn on to elevate for this action only."
+                },
+            ))
+    });
     v_flex()
         .gap_2()
         .pt_1()
+        .children(toggle)
         .when(!cmd.is_empty(), |d| {
             d.child(
                 div()

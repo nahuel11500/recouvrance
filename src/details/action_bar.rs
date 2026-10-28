@@ -49,8 +49,13 @@ impl DetailPanel {
         let plugins = crate::plugins::for_kind(&k.kubectl_name(), &k.ar.plural, cx);
         // Actions your RBAC does not allow are disabled (checked like `kubectl auth can-i`).
         let denied = self.denied.clone();
+        // With an identity to run as (Settings → Contexts), what its confirmation can elevate
+        // stays usable: the check is yours, the server decides for that identity.
+        let run_as = crate::settings::run_as(&self.context);
         let gate = move |b: Button, verb: &'static str| -> Button {
-            if denied.contains(verb) {
+            if let Some(id) = run_as.as_ref().filter(|_| denied.contains(verb) && can_run_as(verb)) {
+                b.tooltip(format!("Your RBAC does not allow this: its confirmation can run it as {}", id.label()))
+            } else if denied.contains(verb) {
                 b.disabled(true).tooltip(match verb {
                     "run" => "Your RBAC does not allow creating Jobs here",
                     "drain" => "Your RBAC does not allow evicting pods",
@@ -102,8 +107,8 @@ impl DetailPanel {
                 d.child(
                     gate(Button::new("act-flux-reconcile"), "patch").small().ghost().icon(Lucide::RefreshCw).label("Reconcile").on_click(cx.listener(|this, _, w, cx| {
                         let title = format!("Reconcile {} {} now?", this.obj.kind.ar.kind, this.obj.name);
-                        this.confirm_action(title, "Asks Flux to reconcile now instead of waiting for its interval, like `flux reconcile`.", "Reconcile", |p| {
-                            Box::pin(k8s::flux_reconcile(p.client.clone(), p.obj.kind.clone(), p.obj.namespace.clone(), p.obj.name.clone()))
+                        this.confirm_action(title, "Asks Flux to reconcile now instead of waiting for its interval, like `flux reconcile`.", "Reconcile", |p, client| {
+                            Box::pin(k8s::flux_reconcile(client, p.obj.kind.clone(), p.obj.namespace.clone(), p.obj.name.clone()))
                         }, w, cx);
                     })),
                 )
@@ -118,8 +123,8 @@ impl DetailPanel {
                         .on_click(cx.listener(move |this, _, w, cx| {
                             let title = format!("{} {} {}?", if suspended { "Resume" } else { "Suspend" }, this.obj.kind.ar.kind, this.obj.name);
                             if suspended {
-                                this.confirm_action(title, "It runs or reconciles again.", "Resume", |p| {
-                                    Box::pin(k8s::merge_patch(p.client.clone(), p.obj.kind.clone(), p.obj.namespace.clone(), p.obj.name.clone(), serde_json::json!({"spec": {"suspend": false}}), false))
+                                this.confirm_action(title, "It runs or reconciles again.", "Resume", |p, client| {
+                                    Box::pin(k8s::merge_patch(client, p.obj.kind.clone(), p.obj.namespace.clone(), p.obj.name.clone(), serde_json::json!({"spec": {"suspend": false}}), false))
                                 }, w, cx);
                             } else {
                                 // Suspending a Job is not a pause: Kubernetes deletes its running pods.
@@ -128,8 +133,8 @@ impl DetailPanel {
                                 } else {
                                     "It stops running or reconciling until resumed; what is deployed stays."
                                 };
-                                this.confirm_action(title, what, "Suspend", |p| {
-                                    Box::pin(k8s::merge_patch(p.client.clone(), p.obj.kind.clone(), p.obj.namespace.clone(), p.obj.name.clone(), serde_json::json!({"spec": {"suspend": true}}), false))
+                                this.confirm_action(title, what, "Suspend", |p, client| {
+                                    Box::pin(k8s::merge_patch(client, p.obj.kind.clone(), p.obj.namespace.clone(), p.obj.name.clone(), serde_json::json!({"spec": {"suspend": true}}), false))
                                 }, w, cx);
                             }
                         })),
@@ -139,15 +144,15 @@ impl DetailPanel {
                 d.child(
                     gate(Button::new("act-argo-refresh"), "patch").small().ghost().icon(Lucide::RefreshCw).label("Refresh").on_click(cx.listener(|this, _, w, cx| {
                         let title = format!("Refresh Application {}?", this.obj.name);
-                        this.confirm_action(title, "Argo CD compares it with git again. Nothing is deployed.", "Refresh", |p| {
-                            Box::pin(k8s::argo_refresh(p.client.clone(), p.obj.kind.clone(), p.obj.namespace.clone(), p.obj.name.clone()))
+                        this.confirm_action(title, super::argo::REFRESH_NOTE, "Refresh", |p, client| {
+                            Box::pin(k8s::argo_refresh(client, p.obj.kind.clone(), p.obj.namespace.clone(), p.obj.name.clone()))
                         }, w, cx);
                     })),
                 )
                 .child(gate(Button::new("act-argo-sync"), "patch").small().ghost().icon(Lucide::GitBranch).label("Sync").on_click(cx.listener(|this, _, w, cx| {
                     let title = format!("Sync Application {}?", this.obj.name);
-                    this.confirm_action(title, "Argo CD deploys its target revision now, with its own sync options.", "Sync", |p| {
-                        Box::pin(k8s::argo_sync(p.client.clone(), p.obj.kind.clone(), p.obj.namespace.clone(), p.obj.name.clone()))
+                    this.confirm_action(title, super::argo::SYNC_NOTE, "Sync", |p, client| {
+                        Box::pin(k8s::argo_sync(client, p.obj.kind.clone(), p.obj.namespace.clone(), p.obj.name.clone()))
                     }, w, cx);
                 })))
             })
@@ -169,12 +174,12 @@ impl DetailPanel {
                         .on_click(cx.listener(move |this, _, w, cx| {
                             let title = format!("{} node {}?", if cordoned { "Uncordon" } else { "Cordon" }, this.obj.name);
                             if cordoned {
-                                this.confirm_action(title, "New pods can be scheduled on it again.", "Uncordon", |p| {
-                                    Box::pin(k8s::merge_patch(p.client.clone(), p.obj.kind.clone(), None, p.obj.name.clone(), serde_json::json!({"spec": {"unschedulable": false}}), false))
+                                this.confirm_action(title, "New pods can be scheduled on it again.", "Uncordon", |p, client| {
+                                    Box::pin(k8s::merge_patch(client, p.obj.kind.clone(), None, p.obj.name.clone(), serde_json::json!({"spec": {"unschedulable": false}}), false))
                                 }, w, cx);
                             } else {
-                                this.confirm_action(title, "No new pods will be scheduled on it; running pods stay.", "Cordon", |p| {
-                                    Box::pin(k8s::merge_patch(p.client.clone(), p.obj.kind.clone(), None, p.obj.name.clone(), serde_json::json!({"spec": {"unschedulable": true}}), false))
+                                this.confirm_action(title, "No new pods will be scheduled on it; running pods stay.", "Cordon", |p, client| {
+                                    Box::pin(k8s::merge_patch(client, p.obj.kind.clone(), None, p.obj.name.clone(), serde_json::json!({"spec": {"unschedulable": true}}), false))
                                 }, w, cx);
                             }
                         })),
@@ -191,10 +196,10 @@ impl DetailPanel {
                                 title,
                                 "Cordons the node, then evicts its pods (DaemonSet and static pods stay). PodDisruptionBudgets are respected; refused evictions are reported.",
                                 "Drain",
-                                |p| {
+                                |p, client| {
                                     // The gate refuses each eviction once write mode is off; stop at the first.
                                     let off = || (!k8s::gate::ui_writes()).then(|| k8s::gate::WRITES_OFF.to_string());
-                                    Box::pin(k8s::drain(p.client.clone(), p.obj.name.clone(), off))
+                                    Box::pin(k8s::drain(client, p.obj.name.clone(), off))
                                 },
                                 w,
                                 cx,
@@ -211,8 +216,8 @@ impl DetailPanel {
                         .label("Run now")
                         .on_click(cx.listener(|this, _, w, cx| {
                             let title = format!("Run CronJob {} now?", this.obj.name);
-                            this.confirm_action(title, "Creates a Job from its template, like `kubectl create job --from=cronjob/…`.", "Run", |p| {
-                                Box::pin(k8s::trigger_cronjob(p.client.clone(), p.obj.namespace.clone().unwrap_or_default(), p.obj.name.clone()))
+                            this.confirm_action(title, "Creates a Job from its template, like `kubectl create job --from=cronjob/…`.", "Run", |p, client| {
+                                Box::pin(k8s::trigger_cronjob(client, p.obj.namespace.clone().unwrap_or_default(), p.obj.name.clone()))
                             }, w, cx);
                         })),
                 )
@@ -225,12 +230,12 @@ impl DetailPanel {
                         .on_click(cx.listener(move |this, _, w, cx| {
                             let title = format!("{} CronJob {}?", if suspended { "Resume" } else { "Suspend" }, this.obj.name);
                             if suspended {
-                                this.confirm_action(title, "It runs on its schedule again.", "Resume", |p| {
-                                    Box::pin(k8s::merge_patch(p.client.clone(), p.obj.kind.clone(), p.obj.namespace.clone(), p.obj.name.clone(), serde_json::json!({"spec": {"suspend": false}}), false))
+                                this.confirm_action(title, "It runs on its schedule again.", "Resume", |p, client| {
+                                    Box::pin(k8s::merge_patch(client, p.obj.kind.clone(), p.obj.namespace.clone(), p.obj.name.clone(), serde_json::json!({"spec": {"suspend": false}}), false))
                                 }, w, cx);
                             } else {
-                                this.confirm_action(title, "No new runs until resumed; running jobs continue.", "Suspend", |p| {
-                                    Box::pin(k8s::merge_patch(p.client.clone(), p.obj.kind.clone(), p.obj.namespace.clone(), p.obj.name.clone(), serde_json::json!({"spec": {"suspend": true}}), false))
+                                this.confirm_action(title, "No new runs until resumed; running jobs continue.", "Suspend", |p, client| {
+                                    Box::pin(k8s::merge_patch(client, p.obj.kind.clone(), p.obj.namespace.clone(), p.obj.name.clone(), serde_json::json!({"spec": {"suspend": true}}), false))
                                 }, w, cx);
                             }
                         })),
@@ -252,4 +257,10 @@ impl DetailPanel {
             )
             .into_any_element()
     }
+}
+
+/// Whether the confirmation of the actions checked with `verb` offers to run as another
+/// identity. Shells (debug, node shell) never do, nor a ServiceAccount's kubeconfig.
+fn can_run_as(verb: &str) -> bool {
+    matches!(verb, "patch" | "delete" | "run" | "drain" | "create")
 }

@@ -459,6 +459,37 @@ async fn connect_with(context: String, gated: bool) -> Result<Client> {
     .await
 }
 
+/// Where a context points: its kubeconfig cluster's name and server URL, and its user's
+/// exec plugin command line (None without one).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ContextTarget {
+    pub name: String,
+    pub cluster: String,
+    pub server: Option<String>,
+    pub exec: Option<String>,
+}
+
+/// What each context of the merged kubeconfig points to.
+pub fn context_targets() -> Result<Vec<ContextTarget>> {
+    Ok(targets_of(&kubeconfig()?))
+}
+
+fn targets_of(kc: &Kubeconfig) -> Vec<ContextTarget> {
+    kc.contexts
+        .iter()
+        .map(|c| {
+            let cluster = c.context.as_ref().map(|x| x.cluster.clone()).unwrap_or_default();
+            let server = kc
+                .clusters
+                .iter()
+                .find(|k| k.name == cluster)
+                .and_then(|k| k.cluster.as_ref())
+                .and_then(|k| k.server.clone());
+            ContextTarget { name: c.name.clone(), cluster, server, exec: exec_command(kc, &c.name) }
+        })
+        .collect()
+}
+
 /// The exec plugin command line of a context's user, if it uses one.
 fn exec_command(kc: &Kubeconfig, context: &str) -> Option<String> {
     let user = kc.contexts.iter().find(|c| c.name == context)?.context.as_ref()?.user.as_ref()?;
@@ -877,6 +908,36 @@ users:
         assert_eq!(exec_command(&kc, "oidc").as_deref(), Some("kubelogin get-token --x=1"));
         assert_eq!(exec_command(&kc, "token"), None);
         assert_eq!(exec_command(&kc, "missing"), None);
+    }
+
+    #[test]
+    fn a_context_points_to_its_clusters_server() {
+        let kc = Kubeconfig::from_yaml(
+            "
+clusters:
+- name: c
+  cluster: {server: 'https://api.example:443'}
+contexts:
+- name: oidc
+  context: {cluster: c, user: me}
+- name: lost
+  context: {cluster: gone, user: tok}
+users:
+- name: me
+  user:
+    exec: {apiVersion: client.authentication.k8s.io/v1beta1, command: kubelogin, args: [get-token]}
+- name: tok
+  user: {token: abc}
+",
+        )
+        .unwrap();
+        let targets = super::targets_of(&kc);
+        assert_eq!(targets[0].server.as_deref(), Some("https://api.example:443"));
+        assert_eq!(targets[0].exec.as_deref(), Some("kubelogin get-token"));
+        assert_eq!(
+            (targets[1].cluster.as_str(), targets[1].server.as_deref(), targets[1].exec.as_deref()),
+            ("gone", None, None)
+        );
     }
 
     #[test]
