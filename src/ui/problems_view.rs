@@ -229,7 +229,9 @@ impl Render for ProblemsView {
             ));
         let Some(found) = &self.found else {
             return v_flex().size_full().p_4().gap_4().child(header).child(
-                div().text_color(theme.muted_foreground).child("Checking nodes, workloads, pods, jobs and volumes…"),
+                div()
+                    .text_color(theme.muted_foreground)
+                    .child("Checking nodes, workloads, pods, jobs, volumes and deletions…"),
             );
         };
         let count = |s: Severity| found.iter().filter(|(_, p)| p.severity == s).count();
