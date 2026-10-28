@@ -114,7 +114,7 @@ impl AppView {
         let favorites = self.favorites.clone();
         let clusters = self.clusters.clone();
         let context_name = context.clone();
-        let client_for_links = client.clone();
+        let (own_context, own_client) = (context.clone(), client.clone());
         let panel = cx.new(|cx| {
             let mut p = DetailPanel::new(client, context, risky, forwards, favorites, obj, window, cx);
             p.clusters = clusters;
@@ -139,7 +139,6 @@ impl AppView {
         })
         .detach();
         // Released with the page.
-        let (own_context, own_client) = (context_name.clone(), client_for_links);
         cx.subscribe_in(&panel, window, move |this, _, ev: &OpenObject, window, cx| {
             let on = ev.context.as_deref().unwrap_or(&own_context);
             if let Some(target) = this.clusters.iter().position(|(n, _)| n == on) {
