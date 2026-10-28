@@ -100,15 +100,17 @@ async fn forward_input(
 pub fn exec_shell(client: Client, ns: String, pod: String, container: Option<String>) -> Session {
     Session::spawn(|keys, out| async move {
         let api: Api<Pod> = Api::namespaced(client, &ns);
+        let container = named_container(&api, &pod, container).await;
         let mut ap = kube::api::AttachParams::interactive_tty();
-        if let Some(c) = container {
+        if let Some(c) = container.clone() {
             ap = ap.container(c);
         }
         let shell = ["sh", "-c", "command -v bash >/dev/null 2>&1 && exec bash || exec sh"];
         let mut proc = match api.exec(&pod, shell, &ap).await {
             Ok(p) => p,
             Err(e) => {
-                let _ = out.unbounded_send(ExecOutput::Exit(format!("exec failed: {e}")));
+                let why = refused(&api, &pod, container.as_deref(), "exec", e).await;
+                let _ = out.unbounded_send(ExecOutput::Exit(format!("exec failed: {why}")));
                 return;
             }
         };
@@ -132,6 +134,77 @@ pub fn exec_shell(client: Client, ns: String, pod: String, container: Option<Str
         };
         let _ = out.unbounded_send(ExecOutput::Exit(reason));
     })
+}
+
+/// The container to exec in: the one named, else the pod's default one as kubectl picks it
+/// (with none named, the API server refuses a pod that has several). `None` when the pod
+/// can't be read: the exec then says why.
+async fn named_container(api: &Api<Pod>, pod: &str, container: Option<String>) -> Option<String> {
+    if container.is_some() {
+        return container;
+    }
+    api.get(pod).await.ok().and_then(|p| super::typed_pod_containers(&p).into_iter().next())
+}
+
+/// `e`, with the likely reason when the API server refused the WebSocket upgrade: kube-rs
+/// keeps only the status ("400 Bad Request"), not the server's message, so the reason is
+/// read from the pod.
+async fn refused(api: &Api<Pod>, pod: &str, container: Option<&str>, verb: &str, e: kube::Error) -> String {
+    let kube::Error::UpgradeConnection(kube::client::UpgradeConnectionError::ProtocolSwitch(status)) = &e else {
+        return e.to_string();
+    };
+    let read = if status.as_u16() == 400 { api.get(pod).await.ok() } else { None };
+    match refusal_reason(status.as_u16(), verb, read.as_ref(), container) {
+        Some(reason) => format!("{e} ({reason})"),
+        None => e.to_string(),
+    }
+}
+
+/// Why an exec or attach upgrade answered `status`, from the pod as read (when it could be).
+fn refusal_reason(status: u16, verb: &str, pod: Option<&Pod>, container: Option<&str>) -> Option<String> {
+    match status {
+        400 => {}
+        401 => return Some("the cluster did not accept your credentials".into()),
+        403 => return Some(format!("your access does not allow it: create on pods/{verb}")),
+        404 => return Some("the pod is gone".into()),
+        _ => return None,
+    }
+    let generic = if verb == "exec" {
+        "the container may need choosing, or the shell isn't in the image".to_string()
+    } else {
+        "the container may need choosing, or it isn't running".to_string()
+    };
+    let Some(pod) = pod else { return Some(generic) };
+    let spec = pod.spec.as_ref();
+    let Some(name) = container else {
+        let names: Vec<&str> = spec.map(|s| s.containers.iter().map(|c| c.name.as_str()).collect()).unwrap_or_default();
+        return Some(if names.len() > 1 {
+            format!("the pod has several containers ({}): choose one", names.join(", "))
+        } else {
+            generic
+        });
+    };
+    let known = spec.is_some_and(|s| {
+        let regular = s.containers.iter().chain(s.init_containers.iter().flatten()).map(|c| &c.name);
+        let ephemeral = s.ephemeral_containers.iter().flatten().map(|c| &c.name);
+        regular.chain(ephemeral).any(|n| n == name)
+    });
+    if !known {
+        return Some(format!("the pod has no container {name}"));
+    }
+    let state = pod.status.as_ref().and_then(|s| {
+        let all = s.container_statuses.iter().flatten().chain(s.init_container_statuses.iter().flatten());
+        all.chain(s.ephemeral_container_statuses.iter().flatten()).find(|c| c.name == name)?.state.clone()
+    });
+    if let Some(state) = state.filter(|s| s.running.is_none()) {
+        let why = match (state.waiting, state.terminated) {
+            (Some(w), _) => w.reason.unwrap_or_else(|| "waiting".into()),
+            (None, Some(t)) => t.reason.unwrap_or_else(|| "terminated".into()),
+            (None, None) => "not started".into(),
+        };
+        return Some(format!("container {name} is not running: {why}"));
+    }
+    Some(generic)
 }
 
 /// The most a container download may write to disk (a bigger file or folder is refused).
@@ -215,11 +288,15 @@ pub(super) async fn exec_to(
     use kube::api::AttachParams;
     use tokio::io::AsyncWriteExt as _;
     let api: Api<Pod> = Api::namespaced(client, &ns);
+    let container = named_container(&api, &pod, container).await;
     let mut ap = AttachParams::default().stdout(true).stderr(true).stdin(stdin.is_some());
-    if let Some(c) = container {
+    if let Some(c) = container.clone() {
         ap = ap.container(c);
     }
-    let mut proc = api.exec(&pod, command, &ap).await?;
+    let mut proc = match api.exec(&pod, command, &ap).await {
+        Ok(p) => p,
+        Err(e) => return Err(anyhow!(refused(&api, &pod, container.as_deref(), "exec", e).await)),
+    };
     let stdout = proc.stdout().context("no stdout")?;
     let stderr = proc.stderr().context("no stderr")?;
     // A write error is kept for later: a command that fails at once closes its stdin
@@ -362,11 +439,15 @@ pub async fn exec_capture(
     use kube::api::AttachParams;
     run(async move {
         let api: Api<Pod> = Api::namespaced(client, &ns);
+        let container = named_container(&api, &pod, container).await;
         let mut ap = AttachParams::default().stdout(true).stderr(true).stdin(false);
-        if let Some(c) = container {
+        if let Some(c) = container.clone() {
             ap = ap.container(c);
         }
-        let mut proc = api.exec(&pod, command, &ap).await?;
+        let mut proc = match api.exec(&pod, command, &ap).await {
+            Ok(p) => p,
+            Err(e) => return Err(anyhow!(refused(&api, &pod, container.as_deref(), "exec", e).await)),
+        };
         let stdout = proc.stdout().context("no stdout")?;
         let stderr = proc.stderr().context("no stderr")?;
         let status = proc.take_status();
@@ -586,16 +667,20 @@ pub fn attach_container(client: Client, ns: String, pod: String, container: Opti
     Session::spawn(|keys, out| async move {
         let api: Api<Pod> = Api::namespaced(client, &ns);
         // Attach with what the container offers: stdin and a tty only if its spec has them.
-        let spec = api.get(&pod).await.ok().and_then(|p| p.spec);
-        let (name, stdin, tty) = attach_target(spec.as_ref(), container.as_deref());
+        let read = api.get(&pod).await.ok();
+        // None named: the default one, as kubectl picks it.
+        let container =
+            container.or_else(|| read.as_ref().and_then(|p| super::typed_pod_containers(p).into_iter().next()));
+        let (name, stdin, tty) = attach_target(read.as_ref().and_then(|p| p.spec.as_ref()), container.as_deref());
         let mut ap = kube::api::AttachParams::default().stdin(stdin).stdout(true).stderr(!tty).tty(tty);
-        if let Some(name) = name {
+        if let Some(name) = name.clone() {
             ap = ap.container(name);
         }
         let mut proc = match api.attach(&pod, &ap).await {
             Ok(p) => p,
             Err(e) => {
-                let _ = out.unbounded_send(ExecOutput::Exit(format!("attach failed: {e}")));
+                let why = refused(&api, &pod, name.as_deref(), "attach", e).await;
+                let _ = out.unbounded_send(ExecOutput::Exit(format!("attach failed: {why}")));
                 return;
             }
         };
@@ -666,8 +751,37 @@ fn attach_target(
 
 #[cfg(test)]
 mod tests {
-    use super::{attach_target, copy_capped, crlf, helm_writes, read_capped, tar_source, upload_source};
+    use super::{
+        attach_target, copy_capped, crlf, helm_writes, read_capped, refusal_reason, tar_source, upload_source,
+    };
     use k8s_openapi::api::core::v1::{Container, EphemeralContainer, PodSpec};
+
+    #[test]
+    fn a_refused_upgrade_says_why() {
+        let pod = |v: serde_json::Value| -> k8s_openapi::api::core::v1::Pod { serde_json::from_value(v).unwrap() };
+        let three = pod(serde_json::json!({
+            "spec": {"containers": [{"name": "nginx"}, {"name": "uwsgi"}, {"name": "uwsgi-exporter"}]},
+            "status": {"containerStatuses": [
+                {"name": "nginx", "image": "", "imageID": "", "ready": true, "restartCount": 0,
+                 "state": {"running": {}}},
+                {"name": "uwsgi", "image": "", "imageID": "", "ready": false, "restartCount": 3,
+                 "state": {"waiting": {"reason": "CrashLoopBackOff"}}},
+            ]},
+        }));
+        let reason = |status, verb, pod, container| refusal_reason(status, verb, pod, container).unwrap();
+        // No container named in a pod with several: the reason the issue hit.
+        assert_eq!(
+            reason(400, "exec", Some(&three), None),
+            "the pod has several containers (nginx, uwsgi, uwsgi-exporter): choose one"
+        );
+        assert!(reason(400, "exec", Some(&three), Some("app")).contains("no container app"));
+        assert!(reason(400, "exec", Some(&three), Some("uwsgi")).contains("not running: CrashLoopBackOff"));
+        // Running, or the pod unreadable: the hint.
+        assert!(reason(400, "exec", Some(&three), Some("nginx")).contains("shell isn't in the image"));
+        assert!(reason(400, "attach", None, None).contains("need choosing"));
+        assert!(reason(403, "attach", None, None).contains("pods/attach"));
+        assert_eq!(refusal_reason(500, "exec", None, None), None);
+    }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn uploads_stream_a_file_and_refuse_a_folder() {
