@@ -10,7 +10,7 @@ use gpui_kit::component::{ActiveTheme as _, Icon, Selectable as _, Sizable as _,
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use crate::settings::{self, DeleteConfirm, InitialView, Startup};
+use crate::settings::{self, ConfirmStyle, DeleteConfirm, InitialView, Startup};
 
 #[derive(Clone, Copy, PartialEq)]
 enum Section {
@@ -559,7 +559,7 @@ impl SettingsView {
         ))
         .child(Self::row(
             "Deleting",
-            "What a delete asks first, for kinds not listed below. A protected context always asks for its name.",
+            "What a delete asks first, for kinds not listed below. A protected context always asks (see Confirming).",
             Self::choice(
                 "del-default",
                 s.delete_confirm,
@@ -572,6 +572,37 @@ impl SettingsView {
             cx,
         ))
         .child(self.render_delete_kinds(&s, cx))
+        .child(Self::row(
+            "Confirming",
+            "How deletes set to Type the name, and every write on a protected context, are confirmed: \
+             the names typed, or the button disabled for a few seconds, showing the seconds left.",
+            Self::choice(
+                "confirm-style",
+                s.confirm_style,
+                &[(ConfirmStyle::Wait, "Wait"), (ConfirmStyle::Type, "Type the names")],
+                |v, _, cx| {
+                    settings::update(|s| s.confirm_style = v);
+                    cx.refresh_windows();
+                },
+            ),
+            cx,
+        ))
+        .when(s.confirm_style == ConfirmStyle::Wait, |d| {
+            d.child(Self::row(
+                "Wait",
+                "Seconds before the confirm button works.",
+                Self::choice(
+                    "confirm-wait",
+                    s.confirm_wait_secs,
+                    &[(1, "1 s"), (2, "2 s"), (3, "3 s"), (5, "5 s"), (10, "10 s")],
+                    |v, _, cx| {
+                        settings::update(|s| s.confirm_wait_secs = v);
+                        cx.refresh_windows();
+                    },
+                ),
+                cx,
+            ))
+        })
         .into_any_element()
     }
 
@@ -582,7 +613,7 @@ impl SettingsView {
         let names = crate::k8s::load_contexts().map(|c| c.names).unwrap_or_default();
         v_flex()
             .child(div().pb_2().text_sm().text_color(muted).child(
-                "Color a context to recognise it at a glance. Protected contexts ask you to type their name before any write. \
+                "Color a context to recognise it at a glance. Protected contexts ask you to type their name (or to wait, see General → Confirming) before any write. \
                  Run as: an identity you may impersonate (`kubectl --as`); write confirmations then offer to run that one \
                  action as it, off each time. Never for agents. Metrics, node shell and namespaces per cluster are under Per cluster.",
             ))

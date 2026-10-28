@@ -5,7 +5,7 @@ use gpui_kit::component::{ActiveTheme as _, WindowExt as _, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use super::{DetailPanel, RunAs, confirm_extras, confirm_with, guard_ok, kubectl, shell_word};
+use super::{ConfirmButtons as _, DetailPanel, RunAs, confirm_extras, confirm_with, guard_ok, kubectl, shell_word};
 use crate::k8s;
 
 impl DetailPanel {
@@ -122,8 +122,7 @@ impl DetailPanel {
                         }),
                 )
                 .child(confirm_with(&cmd, guard.as_ref(), &run_as, cx))
-                .show_cancel(true)
-                .ok_text(if is_binding { "Add" } else { "Bind" })
+                .confirm_buttons(if is_binding { "Add" } else { "Bind" }, false, guard.as_ref())
                 .on_ok(move |_, window, cx| {
                     if !guard_ok(guard.as_ref(), cx) {
                         return false;
@@ -203,8 +202,7 @@ impl DetailPanel {
                 .title(title.clone())
                 .description("It loses what this binding grants.")
                 .child(confirm_with(&cmd, guard.as_ref(), &run_as, cx))
-                .show_cancel(true)
-                .ok_text("Remove")
+                .confirm_buttons("Remove", false, guard.as_ref())
                 .on_ok(move |_, window, cx| {
                     if !guard_ok(guard.as_ref(), cx) {
                         return false;
@@ -264,8 +262,7 @@ impl DetailPanel {
                     a.child(div().text_sm().text_color(cx.theme().danger).child(e.clone()))
                 })
                 .child(confirm_extras(&cmd, guard.as_ref(), cx))
-                .show_cancel(true)
-                .ok_text("Save kubeconfig")
+                .confirm_buttons("Save kubeconfig", false, guard.as_ref())
                 .on_ok(move |_, window, cx| {
                     if !guard_ok(guard.as_ref(), cx) {
                         return false;

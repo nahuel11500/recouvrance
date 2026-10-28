@@ -14,6 +14,7 @@ use gpui_kit::*;
 use kube::Client;
 use serde_json::Value;
 
+use crate::details::ConfirmButtons as _;
 use crate::helm::{
     Release, fill_releases, history, list_releases, mask_manifest, merge_clusters, newest_revision,
     unreadable_revision, values_yaml,
@@ -515,9 +516,7 @@ impl HelmRelease {
         let (name, ns) = (self.release.name.clone(), self.release.namespace.clone());
         let view = cx.entity().downgrade();
         let context = self.context.clone();
-        let protected = crate::settings::is_protected(&context);
-        let guard =
-            protected.then(|| (cx.new(|cx| InputState::new(window, cx).placeholder(context.clone())), context.clone()));
+        let guard = crate::details::Guard::protected(&context, window, cx);
         let cmd = format!(
             "helm --kube-context {context} upgrade --version {} -n {ns} -f values.yaml -- {name} {chart_ref}",
             self.release.chart_version
@@ -531,8 +530,7 @@ impl HelmRelease {
                      If CI or GitOps (helmfile, Flux, Argo CD) deploys this release, its next run will overwrite this change.",
                 )
                 .child(crate::details::confirm_extras(&cmd, guard.as_ref(), cx))
-                .show_cancel(true)
-                .ok_text("Upgrade")
+                .confirm_buttons("Upgrade", false, guard.as_ref())
                 .on_ok(move |_, window, cx| {
                     if !crate::details::guard_ok(guard.as_ref(), cx) {
                         return false;
@@ -638,9 +636,7 @@ impl HelmRelease {
             return;
         }
         let context = self.context.clone();
-        let protected = crate::settings::is_protected(&context);
-        let guard =
-            protected.then(|| (cx.new(|cx| InputState::new(window, cx).placeholder(context.clone())), context.clone()));
+        let guard = crate::details::Guard::protected(&context, window, cx);
         let cmd = format!("helm --kube-context {context} {}", args.join(" "));
         let view = cx.entity().downgrade();
         window.open_alert_dialog(cx, move |alert, _, cx| {
@@ -649,9 +645,7 @@ impl HelmRelease {
                 .title(title.clone())
                 .description(description)
                 .child(crate::details::confirm_extras(&cmd, guard.as_ref(), cx))
-                .show_cancel(true)
-                .ok_text(ok)
-                .when(ok == "Uninstall", |a| a.ok_variant(component::button::ButtonVariant::Danger))
+                .confirm_buttons(ok, ok == "Uninstall", guard.as_ref())
                 .on_ok(move |_, window, cx| {
                     if !crate::details::guard_ok(guard.as_ref(), cx) {
                         return false;

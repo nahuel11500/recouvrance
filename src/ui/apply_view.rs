@@ -13,6 +13,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use kube::Client;
 
+use crate::details::ConfirmButtons as _;
 use crate::k8s::{self, Kind};
 use crate::ui::data_edit::{DataEditor, DataSaved};
 
@@ -406,10 +407,7 @@ impl ApplyView {
         // Objects without a namespace go where the page is, as `-n` would send them.
         let ns_flag = uses_page_ns.then(|| default_ns.unwrap_or("default"));
         let cmd = crate::details::kubectl(&self.context, ns_flag, "apply --server-side -f -");
-        let guard = crate::settings::is_protected(&self.context).then(|| {
-            let ctx = self.context.clone();
-            (cx.new(|cx| InputState::new(window, cx).placeholder(ctx.clone())), ctx)
-        });
+        let guard = crate::details::Guard::protected(&self.context, window, cx);
         let run_as = crate::details::RunAs::offer(&self.context, cx);
         let n = docs.len();
         let title = format!("Apply {n} object{} to {}?", if n == 1 { "" } else { "s" }, self.context);
@@ -435,8 +433,7 @@ impl ApplyView {
                     ),
                 )
                 .child(crate::details::confirm_with(&cmd, guard.as_ref(), &run_as, cx))
-                .show_cancel(true)
-                .ok_text("Apply")
+                .confirm_buttons("Apply", false, guard.as_ref())
                 .on_ok(move |_, window, cx| {
                     if !crate::details::guard_ok(guard.as_ref(), cx) {
                         return false;

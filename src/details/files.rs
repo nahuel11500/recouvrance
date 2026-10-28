@@ -5,7 +5,7 @@ use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::notification::Notification;
 use gpui_kit::*;
 
-use super::{DetailPanel, confirm_extras, guard_ok, kubectl, shell_word, writes_still_on};
+use super::{ConfirmButtons as _, DetailPanel, confirm_extras, guard_ok, kubectl, shell_word, writes_still_on};
 use crate::k8s;
 
 impl DetailPanel {
@@ -57,8 +57,7 @@ impl DetailPanel {
                     guard.as_ref(),
                     cx,
                 ))
-                .show_cancel(true)
-                .ok_text("Download")
+                .confirm_buttons("Download", false, guard.as_ref())
                 .on_ok(move |_, window, cx| {
                     let path = input.read(cx).value().trim().to_string();
                     if path.is_empty() || !guard_ok(guard.as_ref(), cx) {
@@ -154,8 +153,7 @@ impl DetailPanel {
                     guard.as_ref(),
                     cx,
                 ))
-                .show_cancel(true)
-                .ok_text("Upload")
+                .confirm_buttons("Upload", false, guard.as_ref())
                 .on_ok(move |_, window, cx| {
                     if !guard_ok(guard.as_ref(), cx) {
                         return false;

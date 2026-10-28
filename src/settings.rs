@@ -34,6 +34,37 @@ fn delete_confirm_entries<'de, D: Deserializer<'de>>(
     Ok(raw.into_iter().map(|(k, v)| (k, serde_json::from_value(v).unwrap_or(DeleteConfirm::Type))).collect())
 }
 
+/// `confirm_style`: a value that doesn't read (a hand edit, or one from a newer version)
+/// asks for names typed, the stricter of the two.
+fn confirm_style_or_type<'de, D: Deserializer<'de>>(d: D) -> Result<ConfirmStyle, D::Error> {
+    Ok(serde_json::from_value(serde_json::Value::deserialize(d)?).unwrap_or(ConfirmStyle::Type))
+}
+
+/// `confirm_wait_secs`: a whole number kept within `CONFIRM_WAIT_RANGE`; anything else
+/// waits the longest.
+fn wait_secs_or_longest<'de, D: Deserializer<'de>>(d: D) -> Result<u64, D::Error> {
+    let raw = serde_json::Value::deserialize(d)?;
+    Ok(raw.as_u64().map_or(*CONFIRM_WAIT_RANGE.end(), clamp_wait))
+}
+
+/// The seconds a confirmation may wait: at least one, never long enough to be in the way.
+pub const CONFIRM_WAIT_RANGE: std::ops::RangeInclusive<u64> = 1..=30;
+
+fn clamp_wait(secs: u64) -> u64 {
+    secs.clamp(*CONFIRM_WAIT_RANGE.start(), *CONFIRM_WAIT_RANGE.end())
+}
+
+/// How a confirmation that must not be clicked through is made: a delete set to "Type the
+/// name", and every write on a protected context.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+#[serde(rename_all = "kebab-case")]
+pub enum ConfirmStyle {
+    /// The object's name (or the count) and the protected context's name typed.
+    Type,
+    /// The button stays disabled for `confirm_wait_secs`, showing the seconds left.
+    Wait,
+}
+
 /// The identity to run as, or none when it does not read (a hand edit) or names no user:
 /// elevation is then not offered, and never costs the cluster's other settings.
 fn identity_or_none<'de, D: Deserializer<'de>>(d: D) -> Result<Option<crate::k8s::Identity>, D::Error> {
@@ -187,6 +218,12 @@ pub struct Settings {
     /// for custom resources (`Cluster.postgresql.cnpg.io`), see `delete_kind_key`.
     #[serde(deserialize_with = "delete_confirm_entries")]
     pub delete_confirm_kinds: std::collections::BTreeMap<String, DeleteConfirm>,
+    /// How deletes set to `type` and writes on protected contexts are confirmed.
+    #[serde(deserialize_with = "confirm_style_or_type")]
+    pub confirm_style: ConfirmStyle,
+    /// Seconds the confirm button waits with `ConfirmStyle::Wait` (see `CONFIRM_WAIT_RANGE`).
+    #[serde(deserialize_with = "wait_secs_or_longest")]
+    pub confirm_wait_secs: u64,
 }
 
 /// Kinds that come back on their own are deleted right away; kinds whose loss takes data,
@@ -352,6 +389,8 @@ impl Default for Settings {
             recent_forwards: Vec::new(),
             delete_confirm: DeleteConfirm::Ask,
             delete_confirm_kinds: default_delete_confirm(),
+            confirm_style: ConfirmStyle::Wait,
+            confirm_wait_secs: 3,
         }
     }
 }
@@ -517,7 +556,20 @@ pub fn secs(n: u64) -> std::time::Duration {
     std::time::Duration::from_secs(n.max(1))
 }
 
-/// Whether writes on this context need an extra typed confirmation. A context never set
+/// How a confirmation that must not be clicked through is made: the names typed, or a wait
+/// of this many seconds. Names typed when the settings file could not be read.
+pub fn confirm_wait() -> Option<u64> {
+    if load_error().is_some() {
+        return None;
+    }
+    with(confirm_wait_in)
+}
+
+fn confirm_wait_in(s: &Settings) -> Option<u64> {
+    (s.confirm_style == ConfirmStyle::Wait).then(|| clamp_wait(s.confirm_wait_secs))
+}
+
+/// Whether writes on this context need an extra confirmation (a name typed, or a wait). A context never set
 /// is guessed from the kubeconfig; one the kubeconfig does not have now (or a kubeconfig
 /// that can't be read, say while a tool rewrites it) can't be guessed, so it is protected.
 /// So is every context not set when the settings file can't be read.
@@ -697,8 +749,9 @@ fn unix_now() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        DeleteConfirm, NamespaceVisit, Settings, by_field, delete_confirm_in, guess_protected, load_from, load_json,
-        migrate_list, protected_among, recent_as_visits, record_visits, save_newest, visit_score,
+        ConfirmStyle, DeleteConfirm, NamespaceVisit, Settings, by_field, confirm_wait_in, delete_confirm_in,
+        guess_protected, load_from, load_json, migrate_list, protected_among, recent_as_visits, record_visits,
+        save_newest, visit_score,
     };
 
     #[test]
@@ -732,6 +785,33 @@ mod tests {
         assert_eq!(s.metrics_refresh, 42);
         assert_eq!(s.delete_confirm, Settings::default().delete_confirm);
         assert!(by_field::<Settings>(b"{ not json").is_none());
+    }
+
+    #[test]
+    fn confirmations_wait_by_default_and_ask_for_names_when_the_style_does_not_read() {
+        // Older files have neither key: a 3 second wait.
+        let s: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(confirm_wait_in(&s), Some(3));
+        let s: Settings = serde_json::from_str(r#"{"confirm_style": "type", "confirm_wait_secs": 5}"#).unwrap();
+        assert_eq!(confirm_wait_in(&s), None);
+        let s: Settings = serde_json::from_str(r#"{"confirm_style": "wait", "confirm_wait_secs": 5}"#).unwrap();
+        assert_eq!(confirm_wait_in(&s), Some(5));
+        for bad in [r#""maybe""#, "null", "1", r#"{"wait": 3}"#, r#""Wait""#] {
+            let text = format!(r#"{{"confirm_style": {bad}, "metrics_refresh": 42}}"#);
+            let s: Settings = serde_json::from_str(&text).unwrap();
+            assert_eq!(s.confirm_style, ConfirmStyle::Type, "{bad}");
+            assert_eq!(confirm_wait_in(&s), None, "{bad}");
+            assert_eq!(s.metrics_refresh, 42);
+        }
+        // Kept within 1..=30; a value that isn't a whole number waits the longest.
+        for (secs, want) in [("0", 1), ("2", 2), ("1000", 30), ("-1", 30), (r#""3""#, 30), ("2.5", 30), ("null", 30)] {
+            let text = format!(r#"{{"confirm_style": "wait", "confirm_wait_secs": {secs}}}"#);
+            let s: Settings = serde_json::from_str(&text).unwrap();
+            assert_eq!(confirm_wait_in(&s), Some(want), "{secs}");
+        }
+        // A wait set by hand beyond the range is still kept in it when read.
+        let s = Settings { confirm_wait_secs: 0, ..Settings::default() };
+        assert_eq!(confirm_wait_in(&s), Some(1));
     }
 
     #[test]
@@ -1031,6 +1111,23 @@ mod properties {
             for key in &keys {
                 if !hit.contains(key) {
                     prop_assert_eq!(&read[key], &want[key], "{} changed", key);
+                }
+            }
+        }
+
+        /// A confirm style that isn't exactly `wait` asks for names typed, and a wait is
+        /// always within its range, whatever the file says.
+        #[test]
+        fn a_confirmation_never_reads_weaker_than_set(style in prop_oneof![bad(), Just(json!("wait")), Just(json!("type")), any::<i64>().prop_map(|n| json!(n))], secs in prop_oneof![bad(), any::<i64>().prop_map(|n| json!(n)), any::<f64>().prop_map(|n| json!(n))]) {
+            let text = json!({"confirm_style": style, "confirm_wait_secs": secs, "metrics_refresh": 7});
+            let (read, _, lost) = from_bytes(&serde_json::to_vec(&text).unwrap());
+            prop_assert!(!lost);
+            prop_assert_eq!(read.metrics_refresh, 7);
+            match super::confirm_wait_in(&read) {
+                None => prop_assert_ne!(&style, &json!("wait")),
+                Some(w) => {
+                    prop_assert_eq!(&style, &json!("wait"));
+                    prop_assert!(super::CONFIRM_WAIT_RANGE.contains(&w));
                 }
             }
         }

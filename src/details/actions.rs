@@ -7,7 +7,10 @@ use gpui_kit::component::{ActiveTheme as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use super::{DetailPanel, DetailTab, ensure_writes, writes_still_on};
+use super::{
+    ConfirmButtons as _, DetailPanel, DetailTab, Guard, confirmation, ensure_writes, guard_ok, typed_matches,
+    writes_still_on,
+};
 use crate::k8s;
 use crate::ui::terminal::TerminalView;
 
@@ -84,8 +87,7 @@ impl DetailPanel {
                 .description(description.clone())
                 .child(Input::new(&input))
                 .child(confirm_with(&cmd, guard.as_ref(), &run_as, cx))
-                .show_cancel(true)
-                .ok_text("Scale")
+                .confirm_buttons("Scale", false, guard.as_ref())
                 .on_ok(move |_, window, cx| {
                     if !guard_ok(guard.as_ref(), cx) {
                         return false;
@@ -148,16 +150,9 @@ impl DetailPanel {
         Some(uid.to_string())
     }
 
-    /// On a protected context, an input where the context name must be typed.
-    pub(super) fn protection(
-        &self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Option<(Entity<InputState>, String)> {
-        crate::settings::is_protected(&self.context).then(|| {
-            let ctx = self.context.clone();
-            (cx.new(|cx| InputState::new(window, cx).placeholder(ctx.clone())), ctx)
-        })
+    /// On a protected context, what a write asks for: the context name typed, or a wait.
+    pub(super) fn protection(&self, window: &mut Window, cx: &mut Context<Self>) -> Option<Guard> {
+        Guard::protected(&self.context, window, cx)
     }
 
     /// Confirm, then run a write built from this panel's state.
@@ -183,8 +178,7 @@ impl DetailPanel {
                 .title(title.clone())
                 .description(description)
                 .child(confirm_with(&cmd, guard.as_ref(), &run_as, cx))
-                .show_cancel(true)
-                .ok_text(ok)
+                .confirm_buttons(ok, false, guard.as_ref())
                 .on_ok(move |_, window, cx| {
                     if !guard_ok(guard.as_ref(), cx) {
                         return false;
@@ -270,8 +264,7 @@ impl DetailPanel {
                         .title(title.clone())
                         .description(summary)
                         .child(confirm_with(&cmd, guard.as_ref(), &run_as, cx))
-                        .show_cancel(true)
-                        .ok_text("Roll back")
+                        .confirm_buttons("Roll back", false, guard.as_ref())
                         .on_ok(move |_, window, cx| {
                             if !guard_ok(guard.as_ref(), cx) {
                                 return false;
@@ -340,9 +333,7 @@ impl DetailPanel {
                      The pod is deleted when its shell ends or this page closes, and after 4 hours at most.",
                 )
                 .child(confirm_extras(&cmd, guard.as_ref(), cx))
-                .show_cancel(true)
-                .ok_text("Open shell")
-                .ok_variant(component::button::ButtonVariant::Danger)
+                .confirm_buttons("Open shell", true, guard.as_ref())
                 .on_ok(move |_, window, cx| {
                     if !guard_ok(guard.as_ref(), cx) {
                         return false;
@@ -365,7 +356,7 @@ impl DetailPanel {
                     if let Some(old) = this.node_shell.replace(pod.clone()) {
                         k8s::delete_node_shell(client.clone(), old);
                     }
-                    // Write mode still applies to every connect; the context name was typed already.
+                    // Write mode still applies to every connect; the protection was confirmed already.
                     let ctx = this.context.clone();
                     let terminal = cx.new(|cx| {
                         TerminalView::new(client.clone(), k8s::NODE_SHELL_NS.into(), pod, None, true, cx)
@@ -477,8 +468,7 @@ impl DetailPanel {
                         .child(Input::new(&target)),
                 )
                 .child(confirm_extras(&cmd, guard.as_ref(), cx))
-                .show_cancel(true)
-                .ok_text("Debug")
+                .confirm_buttons("Debug", false, guard.as_ref())
                 .on_ok(move |_, window, cx| {
                     if !guard_ok(guard.as_ref(), cx) {
                         return false;
@@ -508,7 +498,7 @@ impl DetailPanel {
             let _ = this.update_in(cx, |this, window, cx| match result {
                 Ok(container) => {
                     let risky = crate::settings::is_protected(&this.context);
-                    // Write mode still applies to every connect; the context name was typed already.
+                    // Write mode still applies to every connect; the protection was confirmed already.
                     let ctx = this.context.clone();
                     // In a tab of its own: a shell open in the pod's containers stays.
                     this.debug_terminal = Some(cx.new(|cx| {
@@ -531,14 +521,19 @@ impl DetailPanel {
     }
 
     /// Delete, asking first as set for this kind (Settings → General): not at all, with a
-    /// dialog, or with the name typed. A protected context always asks for its name, and an
-    /// object stuck terminating always shows the dialog (to remove its finalizers).
+    /// dialog, or with the name typed (or a wait). A protected context always asks for its
+    /// name (or a wait), and an object stuck terminating always shows the dialog (to remove
+    /// its finalizers).
     pub(super) fn confirm_delete(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.ensure_writes(window, cx) {
             return;
         }
         let level = crate::settings::delete_confirm(&self.obj.kind.ar.group, &self.obj.kind.ar.kind);
-        let guard = self.protection(window, cx);
+        let protected: Vec<String> =
+            crate::settings::is_protected(&self.context).then(|| self.context.clone()).into_iter().collect();
+        // The name typed for its kind, and the context's for a protected one: or one wait for both.
+        let (typed, mut guards) = confirmation(level == crate::settings::DeleteConfirm::Type, &protected, window, cx);
+        let guard = guards.pop();
         let terminating = self.object.as_ref().is_some_and(|o| o.pointer("/metadata/deletionTimestamp").is_some());
         let run_as = RunAs::offer(&self.context, cx);
         // Denied to you, with an identity to run as: the dialog offers it.
@@ -550,7 +545,6 @@ impl DetailPanel {
             self.run_write("Delete", k8s::delete_with(c, k, ns, n, uid, false, false), window, cx);
             return;
         }
-        let typed = level == crate::settings::DeleteConfirm::Type;
         let input = cx.new(|cx| InputState::new(window, cx).placeholder(self.obj.name.clone()));
         let panel = cx.entity().downgrade();
         let (name, context) = (self.obj.name.clone(), self.context.clone());
@@ -620,11 +614,9 @@ impl DetailPanel {
                 )
                 .child(confirm_with(&cmd, guard.as_ref(), &run_as, cx))
                 .child(delete_settings_link(&ar.group, &ar.kind, &label, cx))
-                .show_cancel(true)
-                .ok_text("Delete")
-                .ok_variant(component::button::ButtonVariant::Danger)
+                .confirm_buttons("Delete", true, guard.as_ref())
                 .on_ok(move |_, window, cx| {
-                    if (typed && input.read(cx).value().trim() != name) || !guard_ok(guard.as_ref(), cx) {
+                    if (typed && !typed_matches(&input.read(cx).value(), &name)) || !guard_ok(guard.as_ref(), cx) {
                         return false;
                     }
                     let _ = panel.update(cx, |this, cx| {
@@ -699,8 +691,7 @@ impl DetailPanel {
                         .title("Apply YAML changes?")
                         .description(description)
                         .child(confirm_with(&cmd, guard.as_ref(), &run_as, cx))
-                        .show_cancel(true)
-                        .ok_text("Save")
+                        .confirm_buttons("Save", false, guard.as_ref())
                         .on_ok(move |_, window, cx| {
                             if !guard_ok(guard.as_ref(), cx) {
                                 return false;
@@ -834,13 +825,13 @@ pub fn refused_but_can_run_as(e: &anyhow::Error, context: &str) -> bool {
     k8s::api_status(e) == Some(403) && crate::settings::run_as(context).is_some()
 }
 
-/// The kubectl equivalent of a confirmation, plus the protected-context input.
-pub fn confirm_extras(cmd: &str, guard: Option<&(Entity<InputState>, String)>, cx: &App) -> AnyElement {
+/// The kubectl equivalent of a confirmation, plus what its guard shows.
+pub fn confirm_extras(cmd: &str, guard: Option<&Guard>, cx: &App) -> AnyElement {
     confirm_with(cmd, guard, &RunAs::default(), cx)
 }
 
 /// [`confirm_extras`], with the "Run as" toggle when the context has an identity to run as.
-pub fn confirm_with(cmd: &str, guard: Option<&(Entity<InputState>, String)>, run_as: &RunAs, cx: &App) -> AnyElement {
+pub fn confirm_with(cmd: &str, guard: Option<&Guard>, run_as: &RunAs, cx: &App) -> AnyElement {
     let theme = cx.theme();
     let cmd = run_as.command(cmd, cx);
     let toggle = run_as.0.as_ref().map(|(on, _, id)| {
@@ -887,15 +878,7 @@ pub fn confirm_with(cmd: &str, guard: Option<&(Entity<InputState>, String)>, run
                     .child(cmd.to_string()),
             )
         })
-        .when_some(guard, |d, (input, ctx)| {
-            d.child(
-                div()
-                    .text_sm()
-                    .text_color(theme.warning)
-                    .child(format!("{ctx} is protected. Type its name to confirm:")),
-            )
-            .child(Input::new(input))
-        })
+        .when_some(guard, |d, guard| d.child(guard.render(cx)))
         .into_any_element()
 }
 
@@ -904,6 +887,9 @@ pub fn delete_settings_link(group: &str, kind: &str, label: &str, cx: &App) -> A
     let text = match crate::settings::delete_confirm(group, kind) {
         crate::settings::DeleteConfirm::Off => format!("{label} are deleted without asking."),
         crate::settings::DeleteConfirm::Ask => format!("Deleting {label} asks first."),
+        crate::settings::DeleteConfirm::Type if crate::settings::confirm_wait().is_some() => {
+            format!("Deleting {label} waits before it can be confirmed.")
+        }
         crate::settings::DeleteConfirm::Type => format!("Deleting {label} asks for the name."),
     };
     h_flex()
@@ -922,10 +908,6 @@ pub fn delete_settings_link(group: &str, kind: &str, label: &str, cx: &App) -> A
                 .on_click(|_, window, cx| crate::app::open_delete_settings(window, cx)),
         )
         .into_any_element()
-}
-
-pub fn guard_ok(guard: Option<&(Entity<InputState>, String)>, cx: &App) -> bool {
-    guard.is_none_or(|(input, ctx)| input.read(cx).value().trim() == ctx)
 }
 
 #[cfg(test)]

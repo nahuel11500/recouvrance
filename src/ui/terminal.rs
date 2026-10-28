@@ -7,12 +7,12 @@ use futures::StreamExt as _;
 use futures::channel::mpsc::UnboundedSender;
 use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::input::InputState;
 use gpui_kit::component::{ActiveTheme as _, Sizable as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use kube::Client;
 
+use crate::details::ConfirmButtons as _;
 use crate::k8s::{self, ExecInput, ExecOutput, TaskGuard};
 
 const SCROLLBACK: usize = 5000;
@@ -135,8 +135,7 @@ impl TerminalView {
             self.authorized = true;
             return start(self, window, cx);
         }
-        let input = cx.new(|cx| InputState::new(window, cx).placeholder(context.clone()));
-        let guard = Some((input, context));
+        let guard = crate::details::Guard::protected(&context, window, cx);
         let me = cx.entity().downgrade();
         let title = if attach { "Attach to this container?" } else { "Open a shell in this container?" };
         window.open_alert_dialog(cx, move |alert, _, cx| {
@@ -145,8 +144,7 @@ impl TerminalView {
                 .title(title)
                 .description("Commands you type run in the container with its rights.")
                 .child(crate::details::confirm_extras("", guard.as_ref(), cx))
-                .show_cancel(true)
-                .ok_text(if attach { "Attach" } else { "Open shell" })
+                .confirm_buttons(if attach { "Attach" } else { "Open shell" }, false, guard.as_ref())
                 .on_ok(move |_, window, cx| {
                     if !crate::details::guard_ok(guard.as_ref(), cx) {
                         return false;

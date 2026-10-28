@@ -114,8 +114,9 @@ what you can check for yourself:
 - **Safe by default.** Read-only until you turn writes on. Writes show their `kubectl`
   equivalent and ask for confirmation, YAML edits and applies run as a server dry run first, and
   deletes ask as you set per kind (by default, Nodes, Namespaces, Deployments, StatefulSets,
-  DaemonSets, PersistentVolumes and their claims, and CRDs need their name typed). A
-  protected context always asks for its name. Write mode and protection are for you in the window:
+  DaemonSets, PersistentVolumes and their claims, and CRDs get the strict confirmation). A
+  protected context always gets the strict confirmation: a few seconds' wait by default (the
+  confirm button counts down, then works), or the names typed. Write mode and protection are for you in the window:
   agents are not bound by them. Agents get only what their rules allow (an *Ask me* rule asks you
   first), every call is logged to
   `~/.local/share/recouvrance/audit.jsonl`, and a kill switch cuts them all off.

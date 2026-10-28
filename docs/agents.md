@@ -38,7 +38,7 @@ Each agent has rules, like Kubernetes RBAC with an effect:
 
 Write mode and protected contexts are for you in the window: an agent's calls don't check them,
 only its rules (with the rate limit and the kill switch below). An Allow rule for a write lets the
-agent write while the window shows `read-only`, and on a protected context without its name typed;
+agent write while the window shows `read-only`, and on a protected context without its name typed or a wait;
 to keep agents off a context or from writing, give them *Ask me* or Deny rules for it (or no Allow).
 
 **Deny wins, then Ask me, then Allow; anything no rule matches is denied.** A Deny limited to some
