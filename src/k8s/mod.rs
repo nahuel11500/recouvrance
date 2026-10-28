@@ -29,6 +29,7 @@ pub(crate) mod names;
 mod pods;
 pub(crate) mod podspec;
 pub(crate) mod rollouts;
+mod run_as;
 mod sources;
 mod table;
 mod writes;
@@ -40,6 +41,7 @@ pub(crate) use exec::*;
 pub(crate) use forward::*;
 pub(crate) use metrics::*;
 pub(crate) use pods::*;
+pub(crate) use run_as::*;
 pub(crate) use sources::*;
 pub(crate) use table::*;
 pub(crate) use writes::*;
@@ -161,7 +163,7 @@ pub fn mask_secret_values(value: &mut serde_json::Value) {
 pub fn short_error(e: &anyhow::Error) -> String {
     for cause in e.chain() {
         if let Some(kube::Error::Api(status)) = cause.downcast_ref::<kube::Error>() {
-            return status.message.clone();
+            return impersonation_refused(&status.message).unwrap_or_else(|| status.message.clone());
         }
     }
     let text = format!("{e:#}");
