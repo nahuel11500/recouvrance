@@ -295,6 +295,8 @@ impl DataEditor {
             let ctx = self.context.clone();
             (cx.new(|cx| InputState::new(window, cx).placeholder(ctx.clone())), ctx)
         });
+        let run_as = crate::details::RunAs::offer(&self.context, cx);
+        let context = self.context.clone();
         self.busy = true;
         self.status = None;
         cx.notify();
@@ -305,21 +307,36 @@ impl DataEditor {
             let _ = this.update_in(cx, |this, window, cx| {
                 this.busy = false;
                 cx.notify();
-                if let Err(e) = check {
-                    this.status = Some((false, format!("The server refused it: {e:#}")));
-                    return;
-                }
+                // Refused to you, with an identity to run as: the confirmation offers it.
+                let description = match &check {
+                    Ok(_) => "The server dry run passed.".to_string(),
+                    Err(e) if crate::details::refused_but_can_run_as(e, &context) => format!(
+                        "The server refused it to you in a dry run ({}): turn on Run as to save it as that identity.",
+                        k8s::short_error(e)
+                    ),
+                    Err(e) => {
+                        this.status = Some((false, format!("The server refused it: {e:#}")));
+                        return;
+                    }
+                };
                 if !crate::details::writes_still_on(window, cx) {
                     return;
                 }
                 let title = format!("{} {} {name}?", if creating { "Create" } else { "Save" }, this.kind.ar.kind);
                 window.open_alert_dialog(cx, move |alert, _, cx| {
-                    let (me, guard, obj, kind, ns, client) =
-                        (me.clone(), guard.clone(), obj.clone(), kind.clone(), ns.clone(), client.clone());
+                    let (me, guard, obj, kind, ns, client, run_as) = (
+                        me.clone(),
+                        guard.clone(),
+                        obj.clone(),
+                        kind.clone(),
+                        ns.clone(),
+                        client.clone(),
+                        run_as.clone(),
+                    );
                     alert
                         .title(title.clone())
-                        .description("The server dry run passed.")
-                        .child(crate::details::confirm_extras(&cmd, guard.as_ref(), cx))
+                        .description(description.clone())
+                        .child(crate::details::confirm_with(&cmd, guard.as_ref(), &run_as, cx))
                         .show_cancel(true)
                         .ok_text(if creating { "Create" } else { "Save" })
                         .on_ok(move |_, window, cx| {
@@ -329,7 +346,8 @@ impl DataEditor {
                             if !crate::details::writes_still_on(window, cx) {
                                 return true;
                             }
-                            let fut = send(creating, client.clone(), kind.clone(), ns.clone(), obj.clone(), false);
+                            let client = run_as.client(&client, cx);
+                            let fut = send(creating, client, kind.clone(), ns.clone(), obj.clone(), false);
                             let _ = me.update(cx, |this, cx| this.write(fut, window, cx));
                             true
                         })

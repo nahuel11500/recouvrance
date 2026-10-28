@@ -34,6 +34,13 @@ fn delete_confirm_entries<'de, D: Deserializer<'de>>(
     Ok(raw.into_iter().map(|(k, v)| (k, serde_json::from_value(v).unwrap_or(DeleteConfirm::Type))).collect())
 }
 
+/// The identity to run as, or none when it does not read (a hand edit) or names no user:
+/// elevation is then not offered, and never costs the cluster's other settings.
+fn identity_or_none<'de, D: Deserializer<'de>>(d: D) -> Result<Option<crate::k8s::Identity>, D::Error> {
+    let raw = serde_json::Value::deserialize(d)?;
+    Ok(serde_json::from_value::<crate::k8s::Identity>(raw).ok().and_then(crate::k8s::Identity::usable))
+}
+
 /// Which backend the assistant uses.
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
 #[serde(rename_all = "kebab-case")]
@@ -255,6 +262,9 @@ pub struct ClusterSettings {
     /// Metrics off for this cluster only.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub metrics_disabled: bool,
+    /// Who a write may run as when asked in its confirmation (`kubectl --as`); none by default.
+    #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "identity_or_none")]
+    pub run_as: Option<crate::k8s::Identity>,
 }
 
 /// Remember a filter at the top of the history (deduplicated, 20 kept).
@@ -277,6 +287,21 @@ pub fn metrics_on(context: &str) -> bool {
 
 pub fn cluster(context: &str) -> ClusterSettings {
     with(|s| s.clusters.get(context).cloned().unwrap_or_default())
+}
+
+/// The identity writes on this context may run as, when one is set and reads. None when the
+/// settings file could not be read: no elevation is offered then.
+pub fn run_as(context: &str) -> Option<crate::k8s::Identity> {
+    if load_error().is_some() {
+        return None;
+    }
+    with(|s| s.clusters.get(context)?.run_as.clone()).and_then(crate::k8s::Identity::usable)
+}
+
+/// Set (or clear, with no user) the identity writes on this context may run as.
+pub fn set_run_as(context: &str, identity: Option<crate::k8s::Identity>) {
+    let identity = identity.and_then(crate::k8s::Identity::usable);
+    update(|s| s.clusters.entry(context.to_string()).or_default().run_as = identity);
 }
 
 /// Accent colors: (name, dark theme, light theme). Brass is the house color.
@@ -675,6 +700,27 @@ mod tests {
         DeleteConfirm, NamespaceVisit, Settings, by_field, delete_confirm_in, guess_protected, load_from, load_json,
         migrate_list, protected_among, recent_as_visits, record_visits, save_newest, visit_score,
     };
+
+    #[test]
+    fn an_identity_to_run_as_that_does_not_read_is_none() {
+        let text = br#"{"clusters": {
+            "a": {"node_shell_image": "alpine", "run_as": {"user": "super-admin", "groups": "ops"}},
+            "b": {"run_as": {"user": " ", "groups": ["ops"]}},
+            "c": {"run_as": "super-admin"},
+            "d": {"run_as": {"user": "super-admin", "groups": ["ops"]}}
+        }}"#;
+        let s: Settings = serde_json::from_slice(text).unwrap();
+        assert_eq!(s.clusters["a"].node_shell_image.as_deref(), Some("alpine"));
+        assert_eq!(s.clusters["a"].run_as, None);
+        assert_eq!(s.clusters["b"].run_as, None);
+        assert_eq!(s.clusters["c"].run_as, None);
+        let d = s.clusters["d"].run_as.clone().unwrap();
+        assert_eq!((d.user.as_str(), d.groups), ("super-admin", vec!["ops".to_string()]));
+        // None by default, and not written then.
+        let json = serde_json::to_string(&Settings::default()).unwrap();
+        assert!(!json.contains("run_as"));
+        assert!(!serde_json::to_string(&super::ClusterSettings::default()).unwrap().contains("run_as"));
+    }
 
     #[test]
     fn a_bad_field_keeps_the_others() {

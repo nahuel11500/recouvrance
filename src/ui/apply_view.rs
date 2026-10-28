@@ -369,14 +369,17 @@ impl ApplyView {
         self.busy = true;
         self.results.clear();
         self._task = Some(cx.spawn_in(window, async move |this, cx| {
-            let results = apply_docs(client, kinds, default_ns, docs.clone(), true).await;
+            let (results, forbidden) = apply_docs_counted(client, kinds, default_ns, docs.clone(), true).await;
             let _ = this.update_in(cx, |this, window, cx| {
                 this.busy = false;
-                let passed = results.iter().all(|p| p.ok);
+                let failed = results.iter().filter(|p| !p.ok).count();
+                // Refused to you only as forbidden, with an identity to run as: the
+                // confirmation offers it.
+                let refused = failed > 0 && failed == forbidden && crate::settings::run_as(&this.context).is_some();
                 this.results = results;
                 this.mark(window, cx);
-                if passed && crate::details::writes_still_on(window, cx) {
-                    this.confirm_apply(docs, window, cx);
+                if (failed == 0 || refused) && crate::details::writes_still_on(window, cx) {
+                    this.confirm_apply(docs, refused, window, cx);
                 }
             });
         }));
@@ -384,7 +387,8 @@ impl ApplyView {
     }
 
     /// What will be applied, object by object, then the real apply once confirmed.
-    fn confirm_apply(&mut self, docs: Vec<Doc>, window: &mut Window, cx: &mut Context<Self>) {
+    /// `refused`: the dry run was refused to you, and only runs as the context's identity.
+    fn confirm_apply(&mut self, docs: Vec<Doc>, refused: bool, window: &mut Window, cx: &mut Context<Self>) {
         let default_ns = self.namespace.as_deref();
         let mut uses_page_ns = false;
         let objects: Vec<String> = docs
@@ -406,15 +410,20 @@ impl ApplyView {
             let ctx = self.context.clone();
             (cx.new(|cx| InputState::new(window, cx).placeholder(ctx.clone())), ctx)
         });
+        let run_as = crate::details::RunAs::offer(&self.context, cx);
         let n = docs.len();
         let title = format!("Apply {n} object{} to {}?", if n == 1 { "" } else { "s" }, self.context);
         let me = cx.entity().downgrade();
         window.open_alert_dialog(cx, move |alert, _, cx| {
-            let (me, guard, docs) = (me.clone(), guard.clone(), docs.clone());
+            let (me, guard, docs, run_as) = (me.clone(), guard.clone(), docs.clone(), run_as.clone());
             let muted = cx.theme().muted_foreground;
             alert
                 .title(title.clone())
-                .description("The server dry run passed. Server-side apply creates or updates each object:")
+                .description(if refused {
+                    "The server refused them to you in a dry run (see the results): turn on Run as to apply them as that identity. Server-side apply creates or updates each object:"
+                } else {
+                    "The server dry run passed. Server-side apply creates or updates each object:"
+                })
                 .child(
                     v_flex().gap_0p5().max_h(px(220.)).overflow_hidden().children(
                         objects
@@ -425,7 +434,7 @@ impl ApplyView {
                             .map(|o| div().text_sm().font_family("monospace").text_color(muted).child(o)),
                     ),
                 )
-                .child(crate::details::confirm_extras(&cmd, guard.as_ref(), cx))
+                .child(crate::details::confirm_with(&cmd, guard.as_ref(), &run_as, cx))
                 .show_cancel(true)
                 .ok_text("Apply")
                 .on_ok(move |_, window, cx| {
@@ -436,14 +445,28 @@ impl ApplyView {
                         return true;
                     }
                     let docs = docs.clone();
-                    let _ = me.update(cx, |this, cx| this.send(docs, false, window, cx));
+                    let _ = me.update(cx, |this, cx| {
+                        let client = run_as.client(&this.client, cx);
+                        this.send_with(client, docs, false, window, cx);
+                    });
                     true
                 })
         });
     }
 
     fn send(&mut self, docs: Vec<Doc>, dry_run: bool, window: &mut Window, cx: &mut Context<Self>) {
-        let (client, kinds, default_ns) = (self.client.clone(), self.kinds.clone(), self.namespace.clone());
+        self.send_with(self.client.clone(), docs, dry_run, window, cx);
+    }
+
+    fn send_with(
+        &mut self,
+        client: Client,
+        docs: Vec<Doc>,
+        dry_run: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (kinds, default_ns) = (self.kinds.clone(), self.namespace.clone());
         self.busy = true;
         self.results.clear();
         self._task = Some(cx.spawn_in(window, async move |this, cx| {
@@ -523,7 +546,18 @@ async fn apply_docs(
     docs: Vec<Doc>,
     dry_run: bool,
 ) -> Vec<Problem> {
-    let mut results = Vec::new();
+    apply_docs_counted(client, kinds, default_ns, docs, dry_run).await.0
+}
+
+/// [`apply_docs`], with how many objects the server refused as forbidden.
+async fn apply_docs_counted(
+    client: Client,
+    kinds: Vec<Kind>,
+    default_ns: Option<String>,
+    docs: Vec<Doc>,
+    dry_run: bool,
+) -> (Vec<Problem>, usize) {
+    let (mut results, mut forbidden) = (Vec::new(), 0);
     for Doc { start: base, body, value: doc } in docs {
         let kind_name = doc["kind"].as_str().unwrap_or_default().to_string();
         let name = doc.pointer("/metadata/name").and_then(|v| v.as_str()).unwrap_or("?").to_string();
@@ -538,14 +572,16 @@ async fn apply_docs(
         match k8s::apply(client.clone(), kind, ns, doc, dry_run).await {
             Ok(msg) => results.push(Problem { ok: true, text: msg, line: None }),
             Err(e) => {
+                forbidden += usize::from(k8s::api_status(&e) == Some(403));
                 let msg = format!("{e:#}");
                 let line = field_from_error(&msg).and_then(|path| line_of_path(&body, &path)).map(|l| l + base);
                 let at = line.map(|l| format!(" (line {})", l + 1)).unwrap_or_default();
-                results.push(Problem { ok: false, text: format!("{kind_name} {name}{at}: {}", explain(&msg)), line });
+                let why = if msg.contains("cannot impersonate") { k8s::short_error(&e) } else { explain(&msg) };
+                results.push(Problem { ok: false, text: format!("{kind_name} {name}{at}: {why}"), line });
             }
         }
     }
-    results
+    (results, forbidden)
 }
 
 /// YAML is loaded over https only; plain http just from this machine.
