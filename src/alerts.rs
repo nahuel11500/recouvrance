@@ -158,8 +158,11 @@ fn parse_prometheus(text: &str) -> Option<Vec<Alert>> {
     )
 }
 
+/// An alert Alertmanager holds back: its labels, and "silenced" or "inhibited".
+type Held = (BTreeMap<String, String>, &'static str);
+
 /// The alerts Alertmanager's `/api/v2/alerts` holds back: (labels, "silenced" or "inhibited").
-fn parse_alertmanager(text: &str) -> Vec<(BTreeMap<String, String>, &'static str)> {
+fn parse_alertmanager(text: &str) -> Vec<Held> {
     let Ok(Value::Array(alerts)) = serde_json::from_str::<Value>(text) else { return Vec::new() };
     let some = |v: &Value| v.as_array().is_some_and(|a| !a.is_empty());
     alerts
@@ -178,8 +181,8 @@ fn parse_alertmanager(text: &str) -> Vec<(BTreeMap<String, String>, &'static str
 
 /// Mark the alerts Alertmanager holds back. Alertmanager's copy may carry more labels
 /// (Prometheus' external labels), so it matches when it has all of the alert's.
-fn mute(alerts: &mut [Alert], held: &[(BTreeMap<String, String>, &'static str)]) {
-    let mut by_name: HashMap<&str, Vec<&(BTreeMap<String, String>, &'static str)>> = HashMap::new();
+fn mute(alerts: &mut [Alert], held: &[Held]) {
+    let mut by_name: HashMap<&str, Vec<&Held>> = HashMap::new();
     for h in held {
         by_name.entry(h.0.get("alertname").map_or("", String::as_str)).or_default().push(h);
     }
@@ -282,7 +285,7 @@ async fn fetch(context: &str, client: Client) -> Alerts {
     // No Prometheus (or metrics off, or services can't be listed): nothing to say.
     let Ok(Some(target)) = crate::prom::target(context, client.clone()).await else { return Alerts::default() };
     let silences = async {
-        let Some(am) = alertmanager(context, client.clone(), &target).await else { return None };
+        let am = alertmanager(context, client.clone(), &target).await?;
         // Without Alertmanager's answer, alerts show without silence information.
         get(client.clone(), &am, "/api/v2/alerts").await.ok()
     };
@@ -595,7 +598,7 @@ mod tests {
         assert_eq!(
             rows(&[]),
             [
-                ("".into(), "Etcd".into(), None, "firing".into(), Severity::Critical),
+                (String::new(), "Etcd".into(), None, "firing".into(), Severity::Critical),
                 (
                     "pods".into(),
                     "web-1".into(),
@@ -640,25 +643,32 @@ mod tests {
             &[("pod-template-hash", "7d9f")],
             serde_json::json!([{"kind": "ReplicaSet", "name": "web-7d9f"}]),
         );
-        let focus = super::focus(&kind("", "Pod"), &pod, &[]).unwrap();
+        let page = focus(&kind("", "Pod"), &pod, &[]).unwrap();
         let crash = alert(&[("alertname", "Crash"), ("namespace", "shop"), ("pod", "web-7d9f-x2")]);
         let mismatch = alert(&[("alertname", "Mismatch"), ("namespace", "shop"), ("deployment", "web")]);
         let elsewhere = alert(&[("alertname", "Mismatch"), ("namespace", "other"), ("deployment", "web")]);
         let other_pod = alert(&[("alertname", "Crash"), ("namespace", "shop"), ("pod", "db-0")]);
-        let all = [crash.clone(), mismatch.clone(), elsewhere, other_pod.clone()];
-        assert_eq!(about(&all, &focus), [crash.clone(), mismatch.clone()]);
+        let all = [crash, mismatch, elsewhere, other_pod];
+        let names = |page: &Focus| -> Vec<(String, String)> {
+            about(&all, page)
+                .iter()
+                .map(|a| (a.name().to_string(), a.object().map(|o| o.2.to_string()).unwrap_or_default()))
+                .collect()
+        };
+        let own = [("Crash".to_string(), "web-7d9f-x2".to_string()), ("Mismatch".to_string(), "web".to_string())];
+        assert_eq!(names(&page), own);
         // A Deployment's page: its own alerts and its pods'.
         let deploy = named("web", Some("shop"), &[], Value::Null);
-        let focus = super::focus(&kind("apps", "Deployment"), &deploy, std::slice::from_ref(&pod)).unwrap();
-        assert_eq!(about(&all, &focus), [crash.clone(), mismatch.clone()]);
+        let page = focus(&kind("apps", "Deployment"), &deploy, std::slice::from_ref(&pod)).unwrap();
+        assert_eq!(names(&page), own);
         // A namespace's page: everything labeled with it.
         let ns = named("shop", None, &[], Value::Null);
-        let focus = super::focus(&kind("", "Namespace"), &ns, &[]).unwrap();
-        assert_eq!(about(&all, &focus).len(), 3);
+        let page = focus(&kind("", "Namespace"), &ns, &[]).unwrap();
+        assert_eq!(names(&page).len(), 3);
         // Kinds alerts don't name have none.
-        assert!(super::focus(&kind("", "ConfigMap"), &deploy, &[]).is_none());
+        assert!(focus(&kind("", "ConfigMap"), &deploy, &[]).is_none());
         // A Deployment of another API group is not the apps one.
-        assert!(super::focus(&kind("example.com", "Deployment"), &deploy, &[]).is_none());
+        assert!(focus(&kind("example.com", "Deployment"), &deploy, &[]).is_none());
     }
 
     #[test]
