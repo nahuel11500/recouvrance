@@ -1,4 +1,5 @@
 mod agents;
+mod alerts;
 mod app;
 mod assistant;
 mod certs;

@@ -639,6 +639,9 @@ impl DetailPanel {
                     .await;
                 // Prometheus can be slow: show the rest first, keeping the previous charts.
                 let pods_for_history = if wants_history { related.pods.clone() } else { Vec::new() };
+                let focus = crate::alerts::focus(&kind, &obj, &related.pods);
+                related.alerts =
+                    this.update(cx, |this, _| std::mem::take(&mut this.related.alerts)).unwrap_or_default();
                 related.history = this.update(cx, |this, _| this.related.history.take()).ok().flatten();
                 related.gpu = this.update(cx, |this, _| this.related.gpu.take()).ok().flatten();
                 related.container_history =
@@ -708,9 +711,12 @@ impl DetailPanel {
                 if ok.is_err() {
                     break;
                 }
-                if wants_history {
-                    let minutes = this.update(cx, |this, _| this.history_minutes).unwrap_or(60);
-                    let (history, containers, gpu) = futures::join!(
+                let minutes = this.update(cx, |this, _| this.history_minutes).unwrap_or(60);
+                let charts = async {
+                    if !wants_history {
+                        return None;
+                    }
+                    Some(futures::join!(
                         history_for(client.clone(), &context, &kind, ns.as_deref(), &obj, &pods_for_history, minutes),
                         container_history_for(client.clone(), &context, &kind, ns.as_deref(), &obj, minutes),
                         gpu_history_for(
@@ -722,21 +728,32 @@ impl DetailPanel {
                             &pods_for_history,
                             minutes
                         )
-                    );
-                    if this
-                        .update(cx, |this, cx| {
-                            // The range changed meanwhile: its own reload fills the charts.
-                            if this.history_minutes == minutes {
-                                this.related.history = history;
-                                this.related.gpu = gpu;
-                                this.related.container_history = containers;
-                                cx.notify();
-                            }
-                        })
-                        .is_err()
-                    {
-                        break;
-                    }
+                    ))
+                };
+                // Alerts about this object, from the same Prometheus (shared by every page).
+                let alerts = async {
+                    let Some(focus) = &focus else { return None };
+                    Some(crate::alerts::about(&crate::alerts::active(&context, client.clone()).await.list, focus))
+                };
+                let (charts, alerts) = futures::join!(charts, alerts);
+                if this
+                    .update(cx, |this, cx| {
+                        if let Some(alerts) = alerts {
+                            this.related.alerts = alerts;
+                        }
+                        // The range changed meanwhile: its own reload fills the charts.
+                        if let Some((history, containers, gpu)) = charts
+                            && this.history_minutes == minutes
+                        {
+                            this.related.history = history;
+                            this.related.gpu = gpu;
+                            this.related.container_history = containers;
+                        }
+                        cx.notify();
+                    })
+                    .is_err()
+                {
+                    break;
                 }
                 cx.background_executor().timer(crate::settings::secs(crate::settings::get().metrics_refresh)).await;
             }

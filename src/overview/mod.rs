@@ -14,6 +14,7 @@ use crate::details::{DetailPanel, OpenObject};
 use crate::k8s::{self, ContainerUsage, Kind};
 
 mod access;
+mod alerts;
 mod config;
 mod network;
 mod nodes;
@@ -60,6 +61,8 @@ pub struct Related {
     /// Lists that could not be loaded, by field ("pods", "services"…): "forbidden" or
     /// "failed: …", so an empty section does not read as "there are none".
     pub errors: BTreeMap<&'static str, String>,
+    /// Prometheus alerts about the object (a namespace's: all of them), worst first.
+    pub alerts: Vec<crate::alerts::Alert>,
     /// Pods' (requests, limits) per resource, summed once when they are loaded: a node's
     /// page reads them on every frame, and a node can hold a thousand pods.
     pub allocated: std::collections::HashMap<String, (f64, f64)>,
@@ -315,7 +318,7 @@ fn top(ctx: &Ctx, cx: &App) -> Div {
     if kind.is("", "Pod") || kind.ar.group == "apps" || kind.is("batch", "Job") || kind.is("", "Node") {
         root = root.children(history(ctx, cx));
     }
-    root = root.children(diagnosis(ctx, cx));
+    root = root.children(diagnosis(ctx, cx)).children(alerts::alerts(ctx, cx));
     if kind.is("", "Pod") {
         root = root.child(pod(ctx, cx)).children(pod_netpols(ctx, cx));
     } else if kind.is("batch", "CronJob") {
