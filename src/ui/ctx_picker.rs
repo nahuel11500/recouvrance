@@ -199,7 +199,7 @@ impl Render for ContextPicker {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{FLAT_LIST_MAX, RECENT_MAX, order};
     use proptest::prelude::*;
 
     fn names(v: &[u8]) -> Vec<String> {
