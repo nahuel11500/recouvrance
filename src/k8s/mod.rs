@@ -13,6 +13,7 @@ use kube::api::{Api, DynamicObject, ListParams};
 use kube::discovery::ApiResource;
 
 mod access;
+pub(crate) mod argo;
 mod config;
 mod discovery;
 mod exec;
