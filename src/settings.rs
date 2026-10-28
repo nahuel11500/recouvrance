@@ -173,6 +173,9 @@ pub struct Settings {
     pub clusters: std::collections::HashMap<String, ClusterSettings>,
     /// Folders whose kubeconfig files are all merged (watched for changes).
     pub kubeconfig_folders: Vec<String>,
+    /// Contexts Argo CD's Applications are read from. Empty: found on their own, among the
+    /// connected clusters first, then the kubeconfig's other contexts.
+    pub argocd_contexts: Vec<String>,
     /// Which kubeconfig file keeps a context name that several files have: the first one
     /// seen. The others' contexts are `name@file`, whatever order the files are read in.
     #[serde(deserialize_with = "string_entries")]
@@ -347,6 +350,7 @@ impl Default for Settings {
             extra_namespaces: Default::default(),
             clusters: Default::default(),
             kubeconfig_folders: Vec::new(),
+            argocd_contexts: Vec::new(),
             context_files: Default::default(),
             open_browser_on_forward: true,
             recent_forwards: Vec::new(),

@@ -14,6 +14,7 @@ use crate::details::{DetailPanel, OpenObject};
 use crate::k8s::{self, ContainerUsage, Kind};
 
 mod access;
+mod argo;
 mod config;
 mod network;
 mod nodes;
@@ -139,6 +140,8 @@ pub struct Ctx<'a> {
     pub schema_rows: &'a [SchemaRow],
     /// How the pods table is sorted.
     pub pod_order: PodOrder,
+    /// The Argo CD Applications that deploy the object, or into the namespace.
+    pub argo: &'a k8s::argo::Lookup,
 }
 
 impl Ctx<'_> {
@@ -220,9 +223,13 @@ fn row() -> Div {
 }
 
 fn state_color(text: &str, cx: &App) -> Hsla {
+    tone_color(crate::status::tone(text), cx)
+}
+
+fn tone_color(tone: Option<crate::status::Tone>, cx: &App) -> Hsla {
     use crate::status::Tone;
     let t = cx.theme();
-    match crate::status::tone(text) {
+    match tone {
         Some(Tone::Good) => t.success,
         Some(Tone::Busy) => t.warning,
         Some(Tone::Bad) => t.danger,
@@ -315,7 +322,7 @@ fn top(ctx: &Ctx, cx: &App) -> Div {
     if kind.is("", "Pod") || kind.ar.group == "apps" || kind.is("batch", "Job") || kind.is("", "Node") {
         root = root.children(history(ctx, cx));
     }
-    root = root.children(diagnosis(ctx, cx));
+    root = root.children(diagnosis(ctx, cx)).children(argo::section(ctx, cx));
     if kind.is("", "Pod") {
         root = root.child(pod(ctx, cx)).children(pod_netpols(ctx, cx));
     } else if kind.is("batch", "CronJob") {

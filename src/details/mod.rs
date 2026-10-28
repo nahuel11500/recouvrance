@@ -15,6 +15,7 @@ use crate::ui::terminal::TerminalView;
 mod access_actions;
 mod action_bar;
 mod actions;
+mod argo;
 mod compare;
 #[cfg(feature = "dev")]
 mod demo;
@@ -25,6 +26,7 @@ mod related;
 mod tabs;
 
 pub(crate) use actions::*;
+pub(crate) use argo::OpenOnContext;
 pub(crate) use logs::*;
 use related::{container_history_for, container_names, fetch_related, gpu_history_for, history_for};
 use tabs::error_box;
@@ -151,6 +153,11 @@ pub struct DetailPanel {
     /// One-shot reads of the object, and of its events: the latest wins.
     object_read: crate::latest::Latest,
     events_load: crate::latest::Latest,
+    /// The Argo CD Applications that deploy the object or into the namespace, when the read
+    /// shown started, and a read made at once (after a Sync).
+    argo: k8s::argo::Lookup,
+    argo_started: Option<std::time::Instant>,
+    argo_load: crate::latest::Latest,
     /// A CRD's spec fields, worked out when it is loaded rather than on every frame.
     schema_rows: Vec<crate::overview::SchemaRow>,
     /// Inline editor of a ConfigMap's or Secret's values.
@@ -247,6 +254,9 @@ impl DetailPanel {
             pod_order: None,
             object_read: Default::default(),
             events_load: Default::default(),
+            argo: Default::default(),
+            argo_started: None,
+            argo_load: Default::default(),
             schema_rows: Vec::new(),
             data_editor: None,
             show_managed: false,
@@ -522,6 +532,7 @@ impl DetailPanel {
             self.loops_started = true;
             self.load_related(window, cx);
             self.check_access(cx);
+            self.start_argo(cx);
         }
         self.start_live(window, cx);
     }
@@ -852,6 +863,7 @@ impl DetailPanel {
             env_expanded: self.env_expanded,
             schema_rows: &self.schema_rows,
             pod_order: self.pod_order,
+            argo: &self.argo,
         }
     }
 
