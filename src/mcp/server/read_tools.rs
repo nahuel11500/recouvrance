@@ -638,7 +638,7 @@ impl KubeMcp {
     }
 
     #[tool(
-        description = "What is broken: crash-looping or pending pods, unavailable Deployments/StatefulSets/DaemonSets, NotReady nodes, failed Jobs, pending PVCs. Worst first. Start here when asked to troubleshoot.",
+        description = "What is broken: crash-looping or pending pods, unavailable Deployments/StatefulSets/DaemonSets, NotReady nodes, failed Jobs, pending PVCs, ExternalSecrets and secret stores that fail to sync. Worst first. Start here when asked to troubleshoot.",
         annotations(read_only_hint = true)
     )]
     async fn find_problems(

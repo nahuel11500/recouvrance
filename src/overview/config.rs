@@ -7,7 +7,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use serde_json::Value;
 
-use super::{Ctx, arr, clipped_list, field, heading, mono, row, s, state_color};
+use super::{Ctx, age_of, arr, clipped_list, field, heading, mono, row, s, state_color};
 use crate::k8s;
 
 /// Certificates are public, so they are decoded even while values are masked.
@@ -96,9 +96,60 @@ pub(super) fn secret(ctx: &Ctx, cx: &App) -> Div {
     let muted = cx.theme().muted_foreground;
     v_flex()
         .child(row().pt_4().child(field("Type", s(obj, "/type").unwrap_or("Opaque").to_string(), cx)))
+        .children(external_secret_source(ctx, cx))
         .children(certificates(&data, true, cx))
         .child(heading(&format!("Data ({} keys)", data.len())))
         .child(div().pb_1().text_xs().text_color(muted).child("Click a value to show or hide it."))
+}
+
+/// "From ExternalSecret": the ExternalSecret that writes this Secret, its store, how often it
+/// syncs and whether the last sync worked. Nothing for a Secret no ExternalSecret owns.
+fn external_secret_source(ctx: &Ctx, cx: &App) -> Option<Div> {
+    let es = ctx.related.external_secret.as_ref()?;
+    let name = s(es, "/metadata/name")?;
+    let link = ctx.link(name.to_string(), &crate::external_secrets::kubectl_name("ExternalSecret"), name, cx);
+    let mut fields = sync_fields(ctx, es, cx).child(field("ExternalSecret", link, cx));
+    if let Some((status, reason, message)) = crate::external_secrets::ready(es) {
+        use crate::status::Tone;
+        let theme = cx.theme();
+        let color = match crate::status::condition_tone("Ready", status) {
+            Some(Tone::Good) => theme.success,
+            Some(Tone::Bad) => theme.danger,
+            Some(Tone::Busy) => theme.warning,
+            Some(Tone::Done) | None => theme.muted_foreground,
+        };
+        let why = crate::external_secrets::shorten(if message.trim().is_empty() { reason } else { message });
+        let ready = v_flex()
+            .child(div().text_color(color).child(status.to_string()))
+            .when(!why.is_empty(), |d| d.child(div().text_xs().text_color(theme.muted_foreground).child(why)));
+        fields = fields.child(field("Ready", ready, cx).max_w(px(480.)));
+    }
+    Some(v_flex().child(heading("From ExternalSecret")).child(fields))
+}
+
+/// An ExternalSecret's page: the Secret it writes and where its values come from.
+pub(super) fn external_secret_page(ctx: &Ctx, cx: &App) -> Div {
+    let es = ctx.obj;
+    let mut fields = sync_fields(ctx, es, cx);
+    if let Some(target) = crate::external_secrets::target_of(es) {
+        fields = fields.child(field("Target Secret", ctx.link(target.to_string(), "secrets", target, cx), cx));
+    }
+    v_flex().child(fields)
+}
+
+/// An ExternalSecret's store (a link), refresh interval and last sync, in a row.
+fn sync_fields(ctx: &Ctx, es: &Value, cx: &App) -> Div {
+    let mut fields = row().pt_4();
+    if let Some((kind, name)) = crate::external_secrets::store_of(es) {
+        // A ClusterSecretStore has no namespace.
+        let ns = if kind == "ClusterSecretStore" { None } else { s(es, "/metadata/namespace").map(String::from) };
+        let link = ctx.link_in(format!("{kind}: {name}"), &crate::external_secrets::kubectl_name(kind), name, ns, cx);
+        fields = fields.child(field("Store", link, cx));
+    }
+    // The operator's default when unset; 0 syncs once only.
+    let interval = s(es, "/spec/refreshInterval").unwrap_or("1h");
+    let last = age_of(es, "/status/refreshTime").map_or_else(|| "never".to_string(), |a| format!("{a} ago"));
+    fields.child(field("Refresh interval", interval.to_string(), cx)).child(field("Last refresh", last, cx))
 }
 
 pub(super) fn secret_entry(ctx: &Ctx, i: usize, cx: &App) -> AnyElement {

@@ -140,8 +140,9 @@ pub fn judge(kind: &Kind, defs: &[ColumnDef], row: &Row) -> Option<(Severity, St
     }
 }
 
-/// Kinds checked, in display order.
-pub const CHECKED: [(&str, &str); 7] = [
+/// Kinds checked, in display order. The external-secrets.io ones are judged from their
+/// objects (`external_secrets::problems`), the others from kubectl's columns.
+pub const CHECKED: [(&str, &str); 10] = [
     ("", "Node"),
     ("apps", "Deployment"),
     ("apps", "StatefulSet"),
@@ -149,6 +150,9 @@ pub const CHECKED: [(&str, &str); 7] = [
     ("", "Pod"),
     ("batch", "Job"),
     ("", "PersistentVolumeClaim"),
+    (crate::external_secrets::GROUP, "ClusterSecretStore"),
+    (crate::external_secrets::GROUP, "SecretStore"),
+    (crate::external_secrets::GROUP, "ExternalSecret"),
 ];
 
 /// A scan that went as far as it could: the problems found, and the kinds it could
@@ -199,6 +203,9 @@ pub async fn scan_partial(client: Client, kinds: &[Kind], namespace: Option<Stri
     let jobs = CHECKED.iter().filter_map(|(g, k)| kinds.iter().find(|x| x.is(g, k)).cloned()).map(|kind| {
         let (client, ns) = (client.clone(), namespace.clone());
         async move {
+            if kind.ar.group == crate::external_secrets::GROUP {
+                return crate::external_secrets::problems(client, &kind, ns).await.map_err(|e| (kind.label.clone(), e));
+            }
             // Big lists come from their cells alone: a small part of the bytes.
             let (defs, rows) = match k8s::list_light(client.clone(), kind.clone(), ns, true).await {
                 Ok(t) => t,

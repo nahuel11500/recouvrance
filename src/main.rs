@@ -8,6 +8,7 @@ mod dev;
 mod diagnose;
 #[cfg(all(test, feature = "dev"))]
 mod e2e;
+mod external_secrets;
 mod favorites;
 mod filter_syntax;
 mod forwards;
