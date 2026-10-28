@@ -100,12 +100,39 @@ impl ContextPicker {
     }
 }
 
+/// Up to this many contexts, the picker shows one list with no section headers.
+const FLAT_LIST_MAX: usize = 12;
+/// How many recent contexts the "Recent" section shows on a longer list.
+const RECENT_MAX: usize = 5;
+
+/// The picker's order with no search. With `FLAT_LIST_MAX` contexts or fewer: one list
+/// (`None` second), recently used first in recent order, then the rest in their usual order.
+/// With more: up to `RECENT_MAX` recent ones, then the others (`Some`). No context appears
+/// twice, and a recent context that is no longer in `all` is left out.
+fn order(all: &[String], recent: &[String]) -> (Vec<String>, Option<Vec<String>>) {
+    let short = all.len() <= FLAT_LIST_MAX;
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
+    let first: Vec<String> = recent
+        .iter()
+        .filter(|c| all.contains(*c) && seen.insert(c.as_str()))
+        .take(if short { usize::MAX } else { RECENT_MAX })
+        .cloned()
+        .collect();
+    let mut shown: BTreeSet<&str> = first.iter().map(String::as_str).collect();
+    let rest: Vec<String> = all.iter().filter(|c| shown.insert(c.as_str())).cloned().collect();
+    if short {
+        let mut flat = first;
+        flat.extend(rest);
+        (flat, None)
+    } else {
+        (first, Some(rest))
+    }
+}
+
 impl Render for ContextPicker {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let query = self.search.read(cx).value().to_lowercase();
         let muted = cx.theme().muted_foreground;
-        let recent: Vec<String> =
-            crate::settings::get().recent_contexts.into_iter().filter(|c| self.all.contains(c)).take(5).collect();
         let matching: Vec<String> = self.all.iter().filter(|c| c.to_lowercase().contains(&query)).cloned().collect();
         let picked: Vec<String> = self.picked.iter().cloned().collect();
         let changed = picked != {
@@ -114,15 +141,25 @@ impl Render for ContextPicker {
             c
         };
         let mut rows: Vec<AnyElement> = Vec::new();
-        if query.is_empty() && !recent.is_empty() {
-            rows.push(div().px_2().pt_1().text_xs().text_color(muted).child("Recent").into_any_element());
-            for (i, c) in recent.iter().enumerate() {
+        if query.is_empty() {
+            let (first, other) = order(&self.all, &crate::settings::get().recent_contexts);
+            let sections = other.is_some() && !first.is_empty();
+            if sections {
+                rows.push(div().px_2().pt_1().text_xs().text_color(muted).child("Recent").into_any_element());
+            }
+            for (i, c) in first.iter().enumerate() {
                 rows.push(self.row(i, c, cx));
             }
-            rows.push(div().px_2().pt_2().text_xs().text_color(muted).child("All contexts").into_any_element());
-        }
-        for (i, c) in matching.iter().enumerate() {
-            rows.push(self.row(100 + i, c, cx));
+            if sections {
+                rows.push(div().px_2().pt_2().text_xs().text_color(muted).child("Other contexts").into_any_element());
+            }
+            for (i, c) in other.unwrap_or_default().iter().enumerate() {
+                rows.push(self.row(first.len() + i, c, cx));
+            }
+        } else {
+            for (i, c) in matching.iter().enumerate() {
+                rows.push(self.row(i, c, cx));
+            }
         }
         v_flex()
             .w(px(380.))
@@ -157,5 +194,61 @@ impl Render for ContextPicker {
                         )
                     }),
             )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    fn names(v: &[u8]) -> Vec<String> {
+        v.iter().map(|n| format!("c{n}")).collect()
+    }
+
+    #[test]
+    fn short_list_is_flat_recent_first() {
+        let all = names(&[1, 2, 3, 4]);
+        let (list, other) = order(&all, &names(&[3, 9, 1]));
+        assert_eq!(list, names(&[3, 1, 2, 4]));
+        assert!(other.is_none());
+    }
+
+    #[test]
+    fn long_list_has_sections() {
+        let all = names(&(0..20).collect::<Vec<_>>());
+        let (recent, other) = order(&all, &names(&[7, 7, 3, 1, 2, 4, 5]));
+        assert_eq!(recent, names(&[7, 3, 1, 2, 4]));
+        let other = other.unwrap();
+        assert_eq!(other.len(), 15);
+        assert!(!other.iter().any(|c| recent.contains(c)));
+    }
+
+    proptest! {
+        #[test]
+        fn every_context_once(
+            all in proptest::collection::btree_set(0u8..40, 0..30),
+            recent in proptest::collection::vec(0u8..50, 0..12),
+        ) {
+            let all = names(&all.into_iter().collect::<Vec<_>>());
+            let recent = names(&recent);
+            let (first, other) = order(&all, &recent);
+            let short = all.len() <= FLAT_LIST_MAX;
+            prop_assert_eq!(other.is_none(), short);
+            let mut shown = first.clone();
+            shown.extend(other.unwrap_or_default());
+            let mut sorted = shown.clone();
+            sorted.sort();
+            let mut expected = all.clone();
+            expected.sort();
+            prop_assert_eq!(sorted, expected);
+            if short {
+                let n = shown.iter().take_while(|c| recent.contains(c)).count();
+                prop_assert!(shown[n..].iter().all(|c| !recent.contains(c)));
+            } else {
+                prop_assert!(first.len() <= RECENT_MAX);
+                prop_assert!(first.iter().all(|c| recent.contains(c)));
+            }
+        }
     }
 }
