@@ -239,7 +239,7 @@ mod tests {
             shown.extend(other.unwrap_or_default());
             let mut sorted = shown.clone();
             sorted.sort();
-            let mut expected = all.clone();
+            let mut expected = all;
             expected.sort();
             prop_assert_eq!(sorted, expected);
             if short {
