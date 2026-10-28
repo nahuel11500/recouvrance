@@ -30,7 +30,7 @@ impl ProblemBadge {
                 let scans = clusters.iter().map(|(name, c)| {
                     let accessible = crate::settings::cluster(name).namespaces;
                     let (c, kinds) = (c.clone(), &kinds);
-                    async move { crate::problems::scan_namespaces(c, kinds, &accessible).await }
+                    async move { crate::alerts::scan(name, c, kinds, &accessible).await }
                 });
                 let results = futures::future::join_all(scans).await;
                 let (counts, gaps) = summarize(&names, &results);

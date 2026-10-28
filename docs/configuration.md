@@ -103,6 +103,12 @@ so it works wherever `kubectl` does. The service is found automatically; to choo
   `vm/victoria-metrics:8428` (single node);
 - or a URL reachable from your machine: `https://metrics.example.com/select/0/prometheus`.
 
+Alerts are read from the same endpoint (`/api/v1/alerts`, every 30 seconds at most per cluster).
+VictoriaMetrics answers there only when vmselect or vmsingle runs with `-vmalert.proxyURL`. Silences
+come from an Alertmanager service found the same way (a service named `*alertmanager*`, port 9093);
+without one, firing alerts show without silence information. With `metrics_enabled` off, neither
+is read.
+
 ### Per cluster (`clusters`)
 
 ```json

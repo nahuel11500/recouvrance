@@ -638,7 +638,7 @@ impl KubeMcp {
     }
 
     #[tool(
-        description = "What is broken: crash-looping or pending pods, unavailable Deployments/StatefulSets/DaemonSets, NotReady nodes, failed Jobs, pending PVCs. Worst first. Start here when asked to troubleshoot.",
+        description = "What is broken: crash-looping or pending pods, unavailable Deployments/StatefulSets/DaemonSets, NotReady nodes, failed Jobs, pending PVCs, ExternalSecrets and secret stores that fail to sync, objects stuck deleting (Namespaces, PVs, Argo CD Applications too) with the finalizers holding them, and alerts firing in the cluster's Prometheus (not silenced). Worst first. Start here when asked to troubleshoot.",
         annotations(read_only_hint = true)
     )]
     async fn find_problems(
@@ -656,7 +656,12 @@ impl KubeMcp {
             Err(e) => return call.finish(Err(e)),
         };
         // A kind that can't be listed is named, and doesn't hide what the others found.
-        let scan = crate::problems::scan_partial(client, &kinds, p.namespace.clone()).await;
+        let (mut scan, alerts) = futures::join!(
+            crate::problems::scan_partial(client.clone(), &kinds, p.namespace.clone()),
+            crate::alerts::active(&p.context, client)
+        );
+        // Firing alerts too, like the Problems page; each one shown only if its object is.
+        crate::alerts::add(&mut scan, &alerts, p.namespace.as_slice());
         let skipped = scan.skipped_text().map(|s| format!("Not checked, could not read {s}."));
         let minor = p.include_minor.unwrap_or(false);
         let table: Vec<Vec<String>> = scan

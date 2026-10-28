@@ -14,6 +14,8 @@ use crate::details::{DetailPanel, OpenObject};
 use crate::k8s::{self, ContainerUsage, Kind};
 
 mod access;
+mod alerts;
+mod argo;
 mod config;
 mod network;
 mod nodes;
@@ -55,11 +57,15 @@ pub struct Related {
     pub events: Vec<(String, String, String, i32)>,
     /// Last lines of a crash-looping container's previous run: (container, text).
     pub crash_logs: Option<(String, String)>,
+    /// The `ExternalSecret` a Secret comes from, when one owns it.
+    pub external_secret: Option<Value>,
     /// Roles and bindings, for RBAC and ServiceAccount pages.
     pub rbac: Option<crate::rbac::Snapshot>,
     /// Lists that could not be loaded, by field ("pods", "services"…): "forbidden" or
     /// "failed: …", so an empty section does not read as "there are none".
     pub errors: BTreeMap<&'static str, String>,
+    /// Prometheus alerts about the object (a namespace's: all of them), worst first.
+    pub alerts: Vec<crate::alerts::Alert>,
     /// Pods' (requests, limits) per resource, summed once when they are loaded: a node's
     /// page reads them on every frame, and a node can hold a thousand pods.
     pub allocated: std::collections::HashMap<String, (f64, f64)>,
@@ -139,6 +145,8 @@ pub struct Ctx<'a> {
     pub schema_rows: &'a [SchemaRow],
     /// How the pods table is sorted.
     pub pod_order: PodOrder,
+    /// The Argo CD Applications that deploy the object, or into the namespace.
+    pub argo: &'a k8s::argo::Lookup,
 }
 
 impl Ctx<'_> {
@@ -220,9 +228,13 @@ fn row() -> Div {
 }
 
 fn state_color(text: &str, cx: &App) -> Hsla {
+    tone_color(crate::status::tone(text), cx)
+}
+
+fn tone_color(tone: Option<crate::status::Tone>, cx: &App) -> Hsla {
     use crate::status::Tone;
     let t = cx.theme();
-    match crate::status::tone(text) {
+    match tone {
         Some(Tone::Good) => t.success,
         Some(Tone::Busy) => t.warning,
         Some(Tone::Bad) => t.danger,
@@ -315,7 +327,7 @@ fn top(ctx: &Ctx, cx: &App) -> Div {
     if kind.is("", "Pod") || kind.ar.group == "apps" || kind.is("batch", "Job") || kind.is("", "Node") {
         root = root.children(history(ctx, cx));
     }
-    root = root.children(diagnosis(ctx, cx));
+    root = root.children(diagnosis(ctx, cx)).children(alerts::alerts(ctx, cx)).children(argo::section(ctx, cx));
     if kind.is("", "Pod") {
         root = root.child(pod(ctx, cx)).children(pod_netpols(ctx, cx));
     } else if kind.is("batch", "CronJob") {
@@ -371,6 +383,9 @@ fn top(ctx: &Ctx, cx: &App) -> Div {
             .child(heading_for("Pods behind this Service", ctx.related, "pods", cx))
             .child(pods_table(ctx, cx));
     } else {
+        if kind.is(crate::external_secrets::GROUP, "ExternalSecret") {
+            root = root.child(external_secret_page(ctx, cx));
+        }
         // Anything else (CRDs especially): spec and status as readable fields.
         root = root.child(generic_section("Spec", ctx.obj.get("spec"), cx)).child(generic_section(
             "Status",

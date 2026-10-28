@@ -144,14 +144,14 @@ impl DetailPanel {
                 d.child(
                     gate(Button::new("act-argo-refresh"), "patch").small().ghost().icon(Lucide::RefreshCw).label("Refresh").on_click(cx.listener(|this, _, w, cx| {
                         let title = format!("Refresh Application {}?", this.obj.name);
-                        this.confirm_action(title, "Argo CD compares it with git again. Nothing is deployed.", "Refresh", |p, client| {
+                        this.confirm_action(title, super::argo::REFRESH_NOTE, "Refresh", |p, client| {
                             Box::pin(k8s::argo_refresh(client, p.obj.kind.clone(), p.obj.namespace.clone(), p.obj.name.clone()))
                         }, w, cx);
                     })),
                 )
                 .child(gate(Button::new("act-argo-sync"), "patch").small().ghost().icon(Lucide::GitBranch).label("Sync").on_click(cx.listener(|this, _, w, cx| {
                     let title = format!("Sync Application {}?", this.obj.name);
-                    this.confirm_action(title, "Argo CD deploys its target revision now, with its own sync options.", "Sync", |p, client| {
+                    this.confirm_action(title, super::argo::SYNC_NOTE, "Sync", |p, client| {
                         Box::pin(k8s::argo_sync(client, p.obj.kind.clone(), p.obj.namespace.clone(), p.obj.name.clone()))
                     }, w, cx);
                 })))

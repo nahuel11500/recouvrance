@@ -82,11 +82,39 @@ impl AppView {
 
     pub(super) fn show_detail_in(&mut self, ctx: usize, obj: ObjectRef, window: &mut Window, cx: &mut Context<Self>) {
         let Some((context, client)) = self.clusters.get(ctx).cloned() else { return };
+        self.show_detail_with(context, client, obj, window, cx);
+    }
+
+    /// Open an object on a context, connected or not (an Argo CD Application on Argo CD's
+    /// own cluster): a connected one's page uses its client like any other.
+    fn show_detail_on(
+        &mut self,
+        context: String,
+        client: kube::Client,
+        obj: ObjectRef,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match self.clusters.iter().position(|(n, _)| *n == context) {
+            Some(ctx) => self.show_detail_in(ctx, obj, window, cx),
+            None => self.show_detail_with(context, client, obj, window, cx),
+        }
+    }
+
+    fn show_detail_with(
+        &mut self,
+        context: String,
+        client: kube::Client,
+        obj: ObjectRef,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let risky = crate::settings::is_protected(&context);
         let forwards = self.forwards.clone();
         let favorites = self.favorites.clone();
         let clusters = self.clusters.clone();
         let context_name = context.clone();
+        let (own_context, own_client) = (context.clone(), client.clone());
         let panel = cx.new(|cx| {
             let mut p = DetailPanel::new(client, context, risky, forwards, favorites, obj, window, cx);
             p.clusters = clusters;
@@ -112,9 +140,23 @@ impl AppView {
         .detach();
         // Released with the page.
         cx.subscribe_in(&panel, window, move |this, _, ev: &OpenObject, window, cx| {
-            let target =
-                ev.context.as_ref().and_then(|c| this.clusters.iter().position(|(n, _)| n == c)).unwrap_or(ctx);
-            this.open_object_in(target, &ev.kind, ev.name.clone(), ev.namespace.clone(), window, cx);
+            let on = ev.context.as_deref().unwrap_or(&own_context);
+            if let Some(target) = this.clusters.iter().position(|(n, _)| n == on) {
+                this.open_object_in(target, &ev.kind, ev.name.clone(), ev.namespace.clone(), window, cx);
+                return;
+            }
+            // A page on a context that is not connected: its links open on it, with its client
+            // and the kinds every cluster has.
+            let Some(kind) = k8s::find_kind(&this.kinds, &ev.kind).cloned().filter(|_| on == own_context) else {
+                return;
+            };
+            let namespace = if kind.namespaced { ev.namespace.clone() } else { None };
+            let obj = ObjectRef { kind, name: ev.name.clone(), namespace, uid: String::new() };
+            this.show_detail_with(own_context.clone(), own_client.clone(), obj, window, cx);
+        })
+        .detach();
+        cx.subscribe_in(&panel, window, |this, _, ev: &crate::details::OpenOnContext, window, cx| {
+            this.show_detail_on(ev.context.clone(), ev.client.clone(), ev.obj.clone(), window, cx);
         })
         .detach();
         self.navigate(Route::Detail(panel), cx);

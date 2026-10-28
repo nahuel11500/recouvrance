@@ -19,7 +19,8 @@
 - **RBAC-aware**: actions your Kubernetes RBAC forbids are disabled; *My access* shows a can-i
   matrix for the namespace, and says when the cluster (webhook or cloud IAM authorizer) may allow
   more than it lists.
-- **Problems**: one list of what is broken across clusters (crash loops, pending pods, unavailable workloads, NotReady nodes, failed jobs, pending volumes).
+- **Problems**: one list of what is broken across clusters (crash loops, pending pods, unavailable workloads, NotReady nodes, failed jobs, pending volumes, and alerts firing in the cluster's Prometheus that nobody silenced).
+- **Alerts where you look**: a namespace's page lists the alerts labeled with it, and a pod's, workload's, volume's or node's page the alerts about it (a pod's include its workload's, a workload's its pods'), with severity, summary, how long, runbook link, and silenced or inhibited ones muted when an Alertmanager is found.
 - **Overviews**: cluster capacity and health, workloads status, Helm releases (values masked; install from your repos, roll back and uninstall through your `helm` CLI).
 - **API requests** (Settings → API requests): per cluster, how many requests of each kind
   (discovery, lists, watches, metrics, logs, shells, writes) were made, how many failed, and how
