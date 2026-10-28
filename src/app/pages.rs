@@ -378,7 +378,7 @@ mod tests {
     #[test]
     fn the_assistant_scope_names_the_namespace_picked_now() {
         let contexts = ["a".to_string(), "b".to_string()];
-        let ns = |l: &[&str]| l.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let ns = |l: &[&str]| l.iter().map(ToString::to_string).collect::<Vec<_>>();
         assert_eq!(scope_text(&contexts, &ns(&["y"])), "contexts a, b, namespace y");
         assert_eq!(scope_text(&contexts, &ns(&["x", "y"])), "contexts a, b, namespaces x, y");
         assert_eq!(scope_text(&contexts, &[]), "contexts a, b");
