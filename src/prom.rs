@@ -12,7 +12,7 @@ use kube::{Api, Client, api::ListParams};
 use crate::k8s::run;
 
 /// A lookup: the target found (or not), and when.
-type Lookup = (Option<String>, Instant);
+pub(crate) type Lookup = (Option<String>, Instant);
 
 /// `namespace/service:port`, found once per cluster (keyed by context).
 static FOUND: LazyLock<Mutex<HashMap<String, Lookup>>> = LazyLock::new(Default::default);
@@ -21,7 +21,7 @@ static FOUND: LazyLock<Mutex<HashMap<String, Lookup>>> = LazyLock::new(Default::
 const RETRY_MISSING: Duration = Duration::from_secs(300);
 
 /// A cached lookup, unless it found nothing and is old enough to try again.
-fn cached(entry: Option<&Lookup>, now: Instant) -> Option<Option<String>> {
+pub(crate) fn cached(entry: Option<&Lookup>, now: Instant) -> Option<Option<String>> {
     match entry? {
         (None, at) if now.duration_since(*at) >= RETRY_MISSING => None,
         (found, _) => Some(found.clone()),
