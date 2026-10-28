@@ -269,6 +269,20 @@ impl AppView {
         self.namespaces = namespaces;
         self.namespace = (self.namespaces.len() == 1).then(|| self.namespaces[0].clone());
         self.update_assistant_scope(cx);
+        if let Route::Helm(list) = self.route().clone() {
+            let scope = self.helm_scope();
+            list.update(cx, |l, cx| l.set_scope(scope, cx));
+        }
+    }
+
+    /// Each connected cluster with the namespaces its Helm releases are listed from.
+    pub(super) fn helm_scope(&self) -> crate::ui::helm::HelmScope {
+        (self.clusters.iter())
+            .map(|(ctx, client)| {
+                let ns = cluster_namespaces(&self.namespaces, &crate::settings::cluster(ctx).namespaces);
+                (ctx.clone(), client.clone(), ns)
+            })
+            .collect()
     }
 }
 
@@ -349,6 +363,19 @@ pub(super) fn cluster_namespace(chosen: &[String], accessible: &[String]) -> Opt
     accessible.iter().find(|ns| chosen.contains(ns)).map(|ns| Some(ns.clone()))
 }
 
+/// The namespaces a page that lists each one by itself reads on a cluster, given the ones
+/// chosen (none: all) and the ones accessible there (none: all). `None` lists them all at
+/// once; an empty list leaves the cluster out, as none of those chosen is accessible there.
+/// One namespace chosen is read everywhere, as `cluster_namespace` watches it.
+pub(super) fn cluster_namespaces(chosen: &[String], accessible: &[String]) -> Vec<Option<String>> {
+    match (chosen, accessible.is_empty()) {
+        ([], true) => vec![None],
+        ([], false) => accessible.iter().cloned().map(Some).collect(),
+        ([one], _) => vec![Some(one.clone())],
+        _ => (chosen.iter()).filter(|ns| accessible.is_empty() || accessible.contains(ns)).cloned().map(Some).collect(),
+    }
+}
+
 /// The one namespace to show when only some are accessible: the one just ticked,
 /// else the last one asked for, else the first accessible one. None when all are.
 fn one_namespace(wanted: &[String], previous: &[String], accessible: &[String]) -> Option<String> {
@@ -361,7 +388,8 @@ fn one_namespace(wanted: &[String], previous: &[String], accessible: &[String]) 
 #[cfg(test)]
 mod tests {
     use super::{
-        Kind, Route, TabState, all_restricted, cluster_namespace, merge_kinds, one_namespace, served_lists, served_tab,
+        Kind, Route, TabState, all_restricted, cluster_namespace, cluster_namespaces, merge_kinds, one_namespace,
+        served_lists, served_tab,
     };
 
     fn kind(k: &str) -> Kind {
@@ -457,5 +485,44 @@ mod tests {
         assert_eq!(cluster_namespace(&v(&["x", "team-b"]), &team), Some(Some("team-b".into())));
         assert_eq!(cluster_namespace(&v(&["x", "y"]), &team), None);
         assert_eq!(cluster_namespace(&v(&["x"]), &team), Some(Some("x".into())));
+    }
+
+    #[test]
+    fn helm_lists_each_namespace_chosen() {
+        let some = |l: &[&str]| l.iter().map(|s| Some(s.to_string())).collect::<Vec<_>>();
+        let team = v(&["team-a", "team-b"]);
+        assert_eq!(cluster_namespaces(&[], &[]), vec![None]);
+        assert_eq!(cluster_namespaces(&v(&["kube-system", "monitoring"]), &[]), some(&["kube-system", "monitoring"]));
+        assert_eq!(cluster_namespaces(&v(&["x"]), &[]), some(&["x"]));
+        assert_eq!(cluster_namespaces(&[], &team), some(&["team-a", "team-b"]));
+        assert_eq!(cluster_namespaces(&v(&["x", "team-b"]), &team), some(&["team-b"]));
+        assert_eq!(cluster_namespaces(&v(&["x", "y"]), &team), some(&[]));
+        assert_eq!(cluster_namespaces(&v(&["x"]), &team), some(&["x"]));
+    }
+}
+
+/// The namespaces Helm reads on a cluster, for every choice and accessible list.
+#[cfg(test)]
+mod properties {
+    use super::cluster_namespaces;
+    use proptest::prelude::*;
+
+    proptest! {
+        /// Namespaces chosen are never widened to all of them, and a cluster with a list
+        /// of accessible namespaces is never read cluster-wide.
+        #[test]
+        fn helm_never_reads_more_than_chosen(
+            chosen in prop::collection::vec("[a-c]", 0..4),
+            accessible in prop::collection::vec("[a-c]", 0..4),
+        ) {
+            let read = cluster_namespaces(&chosen, &accessible);
+            if !chosen.is_empty() || !accessible.is_empty() {
+                prop_assert!(read.iter().all(Option::is_some));
+            }
+            for ns in read.iter().flatten() {
+                let from = if chosen.is_empty() { &accessible } else { &chosen };
+                prop_assert!(from.contains(ns), "{ns} read, not in {from:?}");
+            }
+        }
     }
 }
