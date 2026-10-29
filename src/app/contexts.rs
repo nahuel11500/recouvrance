@@ -142,7 +142,7 @@ impl AppView {
                         }
                         this.settings_view.update(cx, |s, _| s.set_kinds(kinds.clone()));
                         this.kinds = kinds;
-                        this.problems.start(this.clusters.clone(), this.kinds.clone(), cx);
+                        this.problems.start(this.clusters.clone(), this.cluster_kinds(), cx);
                         this.set_namespaces(namespaces, window, cx);
                         this.restart_watch(cx);
                         if dev_var("RECOUVRANCE_PAGE").is_none() {
@@ -281,6 +281,28 @@ impl AppView {
             })
             .collect()
     }
+
+    /// Each connected cluster's own kinds, by context: a scan given another cluster's
+    /// kinds would ask for a kind this one doesn't serve (Argo CD on the hub only).
+    pub(super) fn cluster_kinds(&self) -> HashMap<String, Vec<Kind>> {
+        let names: Vec<&str> = self.clusters.iter().map(|(n, _)| n.as_str()).collect();
+        kinds_per_cluster(&names, &self.kinds, &self.kind_clusters)
+    }
+}
+
+/// The kinds each of `names` serves, from where each kind exists (`merge_kinds`). A
+/// cluster that serves none (its discovery failed) gets an empty list.
+fn kinds_per_cluster(
+    names: &[&str],
+    kinds: &[Kind],
+    kind_clusters: &HashMap<String, Vec<usize>>,
+) -> HashMap<String, Vec<Kind>> {
+    (names.iter().enumerate())
+        .map(|(ix, name)| {
+            let own = kinds.iter().filter(|k| kind_clusters.get(&k.key()).is_some_and(|c| c.contains(&ix))).cloned();
+            (name.to_string(), own.collect())
+        })
+        .collect()
 }
 
 /// Union of every cluster's kinds, with where each one exists. A cluster whose
@@ -385,8 +407,8 @@ fn one_namespace(wanted: &[String], previous: &[String], accessible: &[String]) 
 #[cfg(test)]
 mod tests {
     use super::{
-        Kind, Route, TabState, all_restricted, cluster_namespace, cluster_namespaces, merge_kinds, one_namespace,
-        served_lists, served_tab,
+        Kind, Route, TabState, all_restricted, cluster_namespace, cluster_namespaces, kinds_per_cluster, merge_kinds,
+        one_namespace, served_lists, served_tab,
     };
 
     fn kind(k: &str) -> Kind {
@@ -412,6 +434,22 @@ mod tests {
         assert_eq!(kinds.len(), 1);
         assert_eq!(where_[&kinds[0].key()], [0]);
         assert_eq!(errors, ["c: no such context", "b: connection refused"]);
+    }
+
+    #[test]
+    fn each_cluster_gets_only_the_kinds_it_serves() {
+        // The hub serves Pods and Applications, the spoke Pods only, the third failed discovery.
+        let (pod, app) = (kind("Pod"), kind("Application"));
+        let found = vec![Ok(vec![pod.clone(), app.clone()]), Ok(vec![pod.clone()]), Err(anyhow::anyhow!("down"))];
+        let (kinds, where_) = merge_kinds(&["hub", "spoke", "down"], found, &mut Vec::new());
+        let own = kinds_per_cluster(&["hub", "spoke", "down"], &kinds, &where_);
+        let keys = |c: &str| own[c].iter().map(Kind::key).collect::<Vec<_>>();
+        assert_eq!(keys("hub"), [pod.key(), app.key()]);
+        assert_eq!(keys("spoke"), [pod.key()]);
+        assert!(own["down"].is_empty());
+        // One cluster: every kind is its own.
+        let (kinds, where_) = merge_kinds(&["a"], vec![Ok(vec![pod, app])], &mut Vec::new());
+        assert_eq!(kinds_per_cluster(&["a"], &kinds, &where_)["a"].len(), 2);
     }
 
     #[test]
