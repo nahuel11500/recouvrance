@@ -41,7 +41,7 @@
   included. Whole-codebase audits are not repeated; bug reports from users set the
   priorities for the long tail.
 - Merge without asking: once the diff has been reviewed, squash merge it as soon as
-  `CI result` passes (`gh pr merge <n> --squash --auto` merges it when CI is done). A failing
+  `CI result` passes (`gh pr checks <n> --watch`, then `gh pr merge <n> --squash`). A failing
   CI is fixed on the branch, never merged around. Dependabot's PRs merge the same way once
   their CI passes on the current `main`.
 - Nothing is tried in the running app before merging; the test before a release is (see
