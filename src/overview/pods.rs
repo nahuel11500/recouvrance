@@ -518,7 +518,7 @@ pub struct PodRow {
     pub ready: usize,
     pub total: usize,
     pub restarts: i64,
-    /// kubectl's Status column (CrashLoopBackOff, Completed…), not the phase.
+    /// kubectl's Status column (`CrashLoopBackOff`, Completed…), not the phase.
     pub phase: String,
     /// Usage, requests and limits: CPU in millicores, memory in bytes.
     pub cpu: [Option<f64>; 3],
@@ -691,7 +691,7 @@ pub(super) fn pods_table(ctx: &Ctx, cx: &App) -> AnyElement {
 }
 
 /// A pod's status as kubectl's Status column says it (its `printPod`): the reason of the
-/// first container waiting or terminated over the phase, Init:… while init containers run,
+/// first container waiting or terminated over the phase, `Init:…` while init containers run,
 /// Terminating once deleted. The pods list shows this column, colored by `status::tone`.
 pub(super) fn pod_status(p: &Value) -> String {
     let mut reason = s(p, "/status/reason").or(s(p, "/status/phase")).unwrap_or("Unknown").to_string();
