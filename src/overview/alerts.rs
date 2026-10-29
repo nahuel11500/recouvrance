@@ -22,7 +22,8 @@ pub(super) fn alerts(ctx: &Ctx, cx: &App) -> Option<Div> {
         format!("Alerts ({firing} firing, {} in all)", alerts.len())
     };
     let rows = alerts.iter().enumerate().map(|(i, a)| alert_row(ctx, i, a, cx));
-    Some(v_flex().child(heading(&title)).child(card(cx).p_3().gap_3().children(rows)))
+    let note = ctx.related.alerts_note.clone().map(|n| div().text_xs().text_color(cx.theme().warning).child(n));
+    Some(v_flex().child(heading(&title)).child(card(cx).p_3().gap_3().children(note).children(rows)))
 }
 
 fn alert_row(ctx: &Ctx, i: usize, a: &Alert, cx: &App) -> Div {

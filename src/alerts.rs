@@ -91,6 +91,9 @@ pub struct Alerts {
     pub list: Vec<Alert>,
     /// (HTTP status, message).
     error: Option<(Option<u16>, String)>,
+    /// Why Alertmanager could not say which alerts are silenced, when it was found but did
+    /// not answer and no recent answer was kept: silenced alerts then show as firing.
+    pub silences_error: Option<String>,
 }
 
 impl Alerts {
@@ -101,6 +104,12 @@ impl Alerts {
             Some(code) => kube::Error::Api(kube::core::Status::failure(message, "").with_code(*code).boxed()).into(),
             None => anyhow::anyhow!("{message}"),
         })
+    }
+
+    /// What a page says when silences are unknown.
+    pub fn silences_note(&self) -> Option<String> {
+        let e = self.silences_error.as_ref()?;
+        Some(format!("Could not read silences from Alertmanager ({e}): silenced alerts may show as firing."))
     }
 }
 
@@ -161,11 +170,16 @@ fn parse_prometheus(text: &str) -> Option<Vec<Alert>> {
 /// An alert Alertmanager holds back: its labels, and "silenced" or "inhibited".
 type Held = (BTreeMap<String, String>, &'static str);
 
+/// Alertmanager's alerts, only those it holds back (silenced or inhibited): a big cluster's
+/// full list is several MB and takes seconds, the held ones are a fraction of it.
+const HELD_PATH: &str = "/api/v2/alerts?active=false&unprocessed=false&silenced=true&inhibited=true";
+
 /// The alerts Alertmanager's `/api/v2/alerts` holds back: (labels, "silenced" or "inhibited").
-fn parse_alertmanager(text: &str) -> Vec<Held> {
-    let Ok(Value::Array(alerts)) = serde_json::from_str::<Value>(text) else { return Vec::new() };
+/// None when the answer is not that list.
+fn parse_alertmanager(text: &str) -> Option<Vec<Held>> {
+    let Ok(Value::Array(alerts)) = serde_json::from_str::<Value>(text) else { return None };
     let some = |v: &Value| v.as_array().is_some_and(|a| !a.is_empty());
-    alerts
+    let held = alerts
         .iter()
         .filter(|a| a.pointer("/status/state").and_then(Value::as_str) == Some("suppressed"))
         .map(|a| {
@@ -176,7 +190,8 @@ fn parse_alertmanager(text: &str) -> Vec<Held> {
             };
             (labels_of(&a["labels"]), why)
         })
-        .collect()
+        .collect();
+    Some(held)
 }
 
 /// Mark the alerts Alertmanager holds back. Alertmanager's copy may carry more labels
@@ -205,14 +220,47 @@ fn unsupported(e: &anyhow::Error) -> bool {
     ["HTTP 400", "HTTP 404", "HTTP 405", "HTTP 501"].iter().any(|s| text.contains(s))
 }
 
+/// A request the reader stopped waiting for, by (context, target, path): when it started,
+/// and its task, which goes on until `LIMIT`.
+type InFlight = HashMap<(String, String, String), (Instant, tokio::task::JoinHandle<Result<String>>)>;
+
+static IN_FLIGHT: LazyLock<Mutex<InFlight>> = LazyLock::new(Default::default);
+
 /// GET `path` from a `namespace/service:port[/prefix]` target through the API server, or
-/// from an http(s) URL.
-async fn get(client: Client, target: &str, path: &str) -> Result<String> {
-    let (target, path) = (target.to_string(), path.to_string());
+/// from an http(s) URL. Waits `WAIT` at most, but the request goes on until `LIMIT`: a slow
+/// answer (a big cluster, an API server busy with the first lists) is then taken by the
+/// next read instead of a new request.
+async fn get(context: &str, client: Client, target: &str, path: &str) -> Result<String> {
+    let key = (context.to_string(), target.to_string(), path.to_string());
     k8s::run(async move {
-        tokio::time::timeout(TIMEOUT, get_now(client, target, path)).await.map_err(|_| anyhow::anyhow!("timed out"))?
+        let running = IN_FLIGHT.lock().unwrap().remove(&key);
+        let (started, mut task) = match running.filter(|(started, _)| reuse(started.elapsed())) {
+            Some(running) => running,
+            None => {
+                let (_, target, path) = key.clone();
+                let task = tokio::spawn(async move {
+                    tokio::time::timeout(LIMIT, get_now(client, target, path))
+                        .await
+                        .map_err(|_| anyhow::anyhow!("timed out"))?
+                });
+                (Instant::now(), task)
+            }
+        };
+        match tokio::time::timeout(WAIT, &mut task).await {
+            Ok(done) => done.map_err(|e| anyhow::anyhow!("task failed: {e}"))?,
+            Err(_) => {
+                IN_FLIGHT.lock().unwrap().insert(key, (started, task));
+                Err(anyhow::anyhow!("timed out"))
+            }
+        }
     })
     .await
+}
+
+/// Whether a request sent this long ago may still answer a read: it is running (it stops
+/// at `LIMIT`) or its answer is recent enough to show.
+fn reuse(age: Duration) -> bool {
+    age < LIMIT + FRESH
 }
 
 async fn get_now(client: Client, target: String, path: String) -> Result<String> {
@@ -225,8 +273,11 @@ async fn get_now(client: Client, target: String, path: String) -> Result<String>
     }
 }
 
-/// How long one request may take: the Problems page waits for it.
-const TIMEOUT: Duration = Duration::from_secs(5);
+/// How long a read waits for an answer: the Problems page waits for it.
+const WAIT: Duration = Duration::from_secs(5);
+
+/// How long a request may run, for the next read when the first stopped waiting.
+const LIMIT: Duration = Duration::from_secs(30);
 
 /// Alertmanager found per cluster (keyed by context), like `prom::target`.
 static ALERTMANAGER: LazyLock<Mutex<HashMap<String, crate::prom::Lookup>>> = LazyLock::new(Default::default);
@@ -281,29 +332,91 @@ async fn find_alertmanager(client: Client, near: Option<String>) -> Result<Optio
     Ok(Some(format!("{ns}/{name}:{port}")))
 }
 
+/// What Alertmanager said about silences.
+enum Silences {
+    /// No Alertmanager, or not one that answers this API: nothing is held back.
+    None,
+    Held(Vec<Held>),
+    /// It was found but did not answer.
+    Failed(String),
+}
+
+/// The last silences each cluster's Alertmanager gave (keyed by context), and when.
+static LAST_HELD: LazyLock<Mutex<HashMap<String, (Instant, Arc<Vec<Held>>)>>> = LazyLock::new(Default::default);
+
+/// How long a cluster's last silences stand in when Alertmanager does not answer: silences
+/// last hours, and a few slow reads in a row should not flip silenced alerts to firing.
+const HELD_KEPT: Duration = Duration::from_secs(5 * 60);
+
+/// The silences to apply: this answer's, or, when it failed, the last ones read if recent
+/// (`last`: how long ago, and what). Why they are unknown otherwise.
+fn silences_to_use(read: Silences, last: Option<(Duration, Arc<Vec<Held>>)>) -> Result<Arc<Vec<Held>>, String> {
+    match read {
+        Silences::None => Ok(Arc::default()),
+        Silences::Held(held) => Ok(Arc::new(held)),
+        Silences::Failed(e) => match last {
+            Some((age, held)) if age < HELD_KEPT => Ok(held),
+            _ => Err(e),
+        },
+    }
+}
+
+async fn read_silences(context: &str, client: Client, prometheus: &str) -> Silences {
+    let Some(am) = alertmanager(context, client.clone(), prometheus).await else { return Silences::None };
+    match get(context, client, &am, HELD_PATH).await {
+        // Something else on that service (a webhook, a sign-in page): no silences to read.
+        Err(e) if unsupported(&e) => Silences::None,
+        Err(e) => Silences::Failed(k8s::short_error(&e)),
+        Ok(text) => parse_alertmanager(&text).map_or(Silences::None, Silences::Held),
+    }
+}
+
 async fn fetch(context: &str, client: Client) -> Alerts {
     // No Prometheus (or metrics off, or services can't be listed): nothing to say.
     let Ok(Some(target)) = crate::prom::target(context, client.clone()).await else { return Alerts::default() };
-    let silences = async {
-        let am = alertmanager(context, client.clone(), &target).await?;
-        // Without Alertmanager's answer, alerts show without silence information.
-        get(client.clone(), &am, "/api/v2/alerts").await.ok()
-    };
-    let (alerts, silences) = futures::join!(get(client.clone(), &target, "/api/v1/alerts"), silences);
+    let (alerts, silences) = futures::join!(
+        get(context, client.clone(), &target, "/api/v1/alerts"),
+        read_silences(context, client.clone(), &target)
+    );
     let text = match alerts {
         Ok(text) => text,
         Err(e) if unsupported(&e) => return Alerts::default(),
-        Err(e) => return Alerts { list: Vec::new(), error: Some((k8s::api_status(&e), k8s::short_error(&e))) },
+        Err(e) => {
+            return Alerts {
+                list: Vec::new(),
+                error: Some((k8s::api_status(&e), k8s::short_error(&e))),
+                silences_error: None,
+            };
+        }
     };
     let mut list = parse_prometheus(&text).unwrap_or_default();
-    if let Some(text) = silences {
-        mute(&mut list, &parse_alertmanager(&text));
-    }
-    Alerts { list, error: None }
+    let fresh = matches!(silences, Silences::Held(_));
+    let last = LAST_HELD.lock().unwrap().get(context).map(|(at, held)| (at.elapsed(), held.clone()));
+    let silences_error = match silences_to_use(silences, last) {
+        Ok(held) => {
+            if fresh {
+                LAST_HELD.lock().unwrap().insert(context.to_string(), (Instant::now(), held.clone()));
+            }
+            mute(&mut list, &held);
+            None
+        }
+        // Shown unmuted, and the page says why.
+        Err(e) => Some(e),
+    };
+    Alerts { list, error: None, silences_error }
 }
 
 /// Alerts are read again after this long; pages asking meanwhile share the last answer.
 const FRESH: Duration = Duration::from_secs(30);
+
+/// After a failed or incomplete read, the next one tries again this soon, and so can take
+/// the answer of a request that was still running.
+const RETRY: Duration = Duration::from_secs(5);
+
+/// How long an answer is shared before it is read again.
+fn kept_for(alerts: &Alerts) -> Duration {
+    if alerts.error.is_some() || alerts.silences_error.is_some() { RETRY } else { FRESH }
+}
 
 type Slot = Arc<tokio::sync::Mutex<Option<(Instant, Arc<Alerts>)>>>;
 
@@ -318,7 +431,7 @@ pub async fn active(context: &str, client: Client) -> Arc<Alerts> {
     let slot = CACHE.lock().unwrap().entry(context.to_string()).or_default().clone();
     let mut held = slot.lock().await;
     if let Some((at, alerts)) = held.as_ref()
-        && at.elapsed() < FRESH
+        && at.elapsed() < kept_for(alerts)
     {
         return alerts.clone();
     }
@@ -394,6 +507,9 @@ pub fn add(scan: &mut Scan, alerts: &Alerts, namespaces: &[String]) {
     scan.problems.extend(problems(&alerts.list, namespaces));
     if let Some(e) = alerts.error() {
         scan.skipped.push(("Alerts".into(), e));
+    }
+    if let Some(e) = &alerts.silences_error {
+        scan.skipped.push(("Alertmanager silences".into(), anyhow::anyhow!("{e}")));
     }
     scan.problems
         .sort_by(|a, b| a.severity.cmp(&b.severity).then(a.namespace.cmp(&b.namespace)).then(a.name.cmp(&b.name)));
@@ -538,7 +654,7 @@ mod tests {
             {"labels":{"alertname":"B","pod":"p"},"status":{"state":"suppressed","silencedBy":[],"inhibitedBy":["x"]}},
             {"labels":{"alertname":"C","pod":"p"},"status":{"state":"active","silencedBy":[],"inhibitedBy":[]}}
         ]"#;
-        let held = parse_alertmanager(text);
+        let held = parse_alertmanager(text).unwrap();
         assert_eq!(held.len(), 2);
         let mut alerts = vec![
             alert(&[("alertname", "A"), ("pod", "p")]),
@@ -550,7 +666,8 @@ mod tests {
         let muted: Vec<Option<&str>> = alerts.iter().map(|a| a.muted).collect();
         // Alertmanager's copy has Prometheus' external labels too.
         assert_eq!(muted, [Some("silenced"), None, Some("inhibited"), None]);
-        assert!(parse_alertmanager("not json").is_empty());
+        assert!(parse_alertmanager("not json").is_none());
+        assert_eq!(parse_alertmanager("[]"), Some(Vec::new()));
     }
 
     #[test]
@@ -563,8 +680,54 @@ mod tests {
         assert!(unsupported(&anyhow::anyhow!("HTTP 404 Not Found")));
         assert!(!unsupported(&status(403)));
         assert!(!unsupported(&status(503)));
-        let alerts = Alerts { list: Vec::new(), error: Some((Some(403), "forbidden".into())) };
+        let alerts = Alerts { list: Vec::new(), error: Some((Some(403), "forbidden".into())), silences_error: None };
         assert_eq!(k8s::lists::load_error(&alerts.error().unwrap()), "forbidden");
+    }
+
+    #[test]
+    fn asks_alertmanager_only_for_held_alerts() {
+        // Alertmanager's filters default to true: active and unprocessed are turned off.
+        assert!(HELD_PATH.starts_with("/api/v2/alerts?"));
+        for param in ["active=false", "unprocessed=false", "silenced=true", "inhibited=true"] {
+            assert!(HELD_PATH.contains(param), "{param}");
+        }
+    }
+
+    #[test]
+    fn a_failed_silence_read_keeps_recent_silences_or_says_so() {
+        let held: Arc<Vec<Held>> = Arc::new(vec![(BTreeMap::from([("alertname".into(), "A".into())]), "silenced")]);
+        let failed = || Silences::Failed("timed out".into());
+        let recent = Some((Duration::from_secs(60), held.clone()));
+        let old = Some((HELD_KEPT, held.clone()));
+        // A new answer wins over the last one, even when it holds nothing back.
+        assert_eq!(*silences_to_use(Silences::Held(Vec::new()), recent.clone()).unwrap(), Vec::new());
+        assert_eq!(silences_to_use(Silences::None, recent.clone()).unwrap().len(), 0);
+        // A failure: the recent silences stand in, too old ones don't, nothing known is unknown.
+        assert_eq!(silences_to_use(failed(), recent).unwrap(), held);
+        assert_eq!(silences_to_use(failed(), old).unwrap_err(), "timed out");
+        assert_eq!(silences_to_use(failed(), None).unwrap_err(), "timed out");
+    }
+
+    #[test]
+    fn unknown_silences_are_named_and_retried_soon() {
+        let list = vec![alert(&[("alertname", "A"), ("namespace", "shop"), ("severity", "warning")])];
+        let alerts = Alerts { list, error: None, silences_error: Some("timed out".into()) };
+        let mut scan = Scan::default();
+        add(&mut scan, &alerts, &[]);
+        // Still counted (as before), but the page says the silences are unknown.
+        assert_eq!(scan.problems.len(), 1);
+        assert_eq!(scan.skipped_text().unwrap(), "Alertmanager silences (failed: timed out)");
+        assert!(alerts.silences_note().unwrap().contains("timed out"));
+        assert_eq!(kept_for(&alerts), RETRY);
+        assert_eq!(kept_for(&Alerts::default()), FRESH);
+        assert!(Alerts::default().silences_note().is_none());
+    }
+
+    #[test]
+    fn late_answers_are_taken_while_recent() {
+        assert!(reuse(Duration::ZERO));
+        assert!(reuse(LIMIT));
+        assert!(!reuse(LIMIT + FRESH));
     }
 
     #[test]
