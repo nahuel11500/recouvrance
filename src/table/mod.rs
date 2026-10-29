@@ -244,8 +244,19 @@ impl ResourceTable {
         visible_cols: Option<Vec<String>>,
         widths: HashMap<String, f32>,
     ) {
-        let (app_focus, pods, row_actions) = (self.app_focus.take(), self.pods, std::mem::take(&mut self.row_actions));
-        *self = Self { show_namespace, contexts, visible_cols, app_focus, pods, row_actions, widths, ..Self::new() };
+        let (app_focus, pods, ingresses, row_actions) =
+            (self.app_focus.take(), self.pods, self.ingresses, std::mem::take(&mut self.row_actions));
+        *self = Self {
+            show_namespace,
+            contexts,
+            visible_cols,
+            app_focus,
+            pods,
+            ingresses,
+            row_actions,
+            widths,
+            ..Self::new()
+        };
     }
 
     /// Column names the user chose for this kind, or None for the defaults.
