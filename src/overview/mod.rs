@@ -66,6 +66,8 @@ pub struct Related {
     pub errors: BTreeMap<&'static str, String>,
     /// Prometheus alerts about the object (a namespace's: all of them), worst first.
     pub alerts: Vec<crate::alerts::Alert>,
+    /// Said under the alerts when Alertmanager's silences could not be read.
+    pub alerts_note: Option<String>,
     /// Pods' (requests, limits) per resource, summed once when they are loaded: a node's
     /// page reads them on every frame, and a node can hold a thousand pods.
     pub allocated: std::collections::HashMap<String, (f64, f64)>,

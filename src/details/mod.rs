@@ -654,6 +654,7 @@ impl DetailPanel {
                 let focus = crate::alerts::focus(&kind, &obj, &related.pods);
                 related.alerts =
                     this.update(cx, |this, _| std::mem::take(&mut this.related.alerts)).unwrap_or_default();
+                related.alerts_note = this.update(cx, |this, _| this.related.alerts_note.take()).ok().flatten();
                 related.history = this.update(cx, |this, _| this.related.history.take()).ok().flatten();
                 related.gpu = this.update(cx, |this, _| this.related.gpu.take()).ok().flatten();
                 related.container_history =
@@ -745,13 +746,15 @@ impl DetailPanel {
                 // Alerts about this object, from the same Prometheus (shared by every page).
                 let alerts = async {
                     let Some(focus) = &focus else { return None };
-                    Some(crate::alerts::about(&crate::alerts::active(&context, client.clone()).await.list, focus))
+                    let alerts = crate::alerts::active(&context, client.clone()).await;
+                    Some((crate::alerts::about(&alerts.list, focus), alerts.silences_note()))
                 };
                 let (charts, alerts) = futures::join!(charts, alerts);
                 if this
                     .update(cx, |this, cx| {
-                        if let Some(alerts) = alerts {
+                        if let Some((alerts, note)) = alerts {
                             this.related.alerts = alerts;
+                            this.related.alerts_note = note;
                         }
                         // The range changed meanwhile: its own reload fills the charts.
                         if let Some((history, containers, gpu)) = charts
