@@ -25,7 +25,8 @@ A fast Kubernetes desktop client (Rust + [gpui](https://github.com/zed-industrie
   find and filters, shell, attach, file copy, port-forwards, YAML with field docs and schema forms,
   Helm, Flux and Argo CD actions, several clusters at once, tabs and windows.
 - **Tells you what is wrong**: a Problems page across clusters, a diagnosis on every broken pod or
-  workload, usage history from Prometheus or VictoriaMetrics, certificate expiry.
+  workload, firing alerts, stuck deletions, ExternalSecrets that fail to sync, usage history from
+  Prometheus or VictoriaMetrics, certificate expiry, and the Argo CD Application behind an object.
 - **Safe by default**: read-only until you enable writes; writes are confirmed with their
   `kubectl` equivalent (deletes ask as you set per kind), and YAML edits and applies are checked
   with a server dry run first; protected contexts; actions follow your
