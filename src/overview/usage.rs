@@ -212,13 +212,19 @@ pub(super) fn quantity_mem(v: Option<&str>) -> Option<f64> {
     v.map(k8s::parse_bytes)
 }
 
-/// A bar of usage against limit (or request), with a tick at the request.
+/// What a bar's full width stands for: the limit, else twice the request (or the usage
+/// when above). None without a request or a limit: nothing to measure usage against.
+fn bar_max(value: f64, request: Option<f64>, limit: Option<f64>) -> Option<f64> {
+    limit.or(request.map(|r| (r * 2.0).max(value))).map(|m| m.max(1e-9))
+}
+
+/// A bar of usage against limit (or request), with a tick at the request. An empty
+/// track without a request or a limit (the figure next to it says the usage).
 pub(super) fn usage_bar(value: Option<f64>, request: Option<f64>, limit: Option<f64>, color: Hsla, cx: &App) -> Div {
     let track = cx.theme().secondary;
-    let Some(value) = value else {
+    let (Some(value), Some(max)) = (value, value.and_then(|v| bar_max(v, request, limit))) else {
         return div().h(px(6.)).w_full().rounded_full().bg(track);
     };
-    let max = limit.or(request.map(|r| (r * 2.0).max(value))).unwrap_or(value * 1.25).max(1e-9);
     let fill = (value / max).clamp(0.0, 1.0) as f32;
     let over = limit.is_some_and(|l| value >= l * 0.95);
     div()
@@ -277,6 +283,18 @@ pub(super) fn usage_card(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn bar_without_request_or_limit_has_no_scale() {
+        use super::bar_max;
+        // No request, no limit: no bar, whatever the usage (was always 80% full).
+        for v in [0.0, 0.002, 1.0, 1e9] {
+            assert_eq!(bar_max(v, None, None), None);
+        }
+        assert_eq!(bar_max(0.5, Some(1.0), Some(4.0)), Some(4.0));
+        assert_eq!(bar_max(0.5, Some(1.0), None), Some(2.0));
+        assert_eq!(bar_max(3.0, Some(1.0), None), Some(3.0));
+    }
+
     #[test]
     fn usage_title_says_when_some_pods_are_left_out() {
         assert_eq!(super::usage_title(1, 1), "Usage");
