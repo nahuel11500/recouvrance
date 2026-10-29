@@ -16,7 +16,7 @@ use crate::k8s::ContainerUsage;
 
 pub(super) fn pod(ctx: &Ctx, cx: &App) -> Div {
     let obj = ctx.obj;
-    let phase = s(obj, "/status/phase").unwrap_or("Unknown").to_string();
+    let phase = pod_status(obj);
     let statuses = arr(obj, "/status/containerStatuses");
     let containers = arr(obj, "/spec/containers");
     let ready = statuses.iter().filter(|c| c["ready"].as_bool() == Some(true)).count();
@@ -518,6 +518,7 @@ pub struct PodRow {
     pub ready: usize,
     pub total: usize,
     pub restarts: i64,
+    /// kubectl's Status column (CrashLoopBackOff, Completed…), not the phase.
     pub phase: String,
     /// Usage, requests and limits: CPU in millicores, memory in bytes.
     pub cpu: [Option<f64>; 3],
@@ -546,7 +547,7 @@ pub fn pod_rows(pods: &[Value], usage: &ContainerUsage) -> Vec<PodRow> {
                 ready: statuses.iter().filter(|c| c["ready"].as_bool() == Some(true)).count(),
                 total: containers.len(),
                 restarts: statuses.iter().filter_map(|c| c["restartCount"].as_i64()).sum(),
-                phase: s(p, "/status/phase").unwrap_or("Unknown").to_string(),
+                phase: pod_status(p),
                 cpu: [sum(|u| u.0), cpu.0, cpu.1],
                 mem: [sum(|u| u.1), mem.0, mem.1],
                 node: s(p, "/spec/nodeName").unwrap_or("-").to_string(),
@@ -687,6 +688,69 @@ pub(super) fn pods_table(ctx: &Ctx, cx: &App) -> AnyElement {
                 })
         }))
         .into_any_element()
+}
+
+/// A pod's status as kubectl's Status column says it (its `printPod`): the reason of the
+/// first container waiting or terminated over the phase, Init:… while init containers run,
+/// Terminating once deleted. The pods list shows this column, colored by `status::tone`.
+pub(super) fn pod_status(p: &Value) -> String {
+    let mut reason = s(p, "/status/reason").or(s(p, "/status/phase")).unwrap_or("Unknown").to_string();
+    let inits = arr(p, "/status/initContainerStatuses");
+    let init_total = arr(p, "/spec/initContainers").len().max(inits.len());
+    let mut initializing = false;
+    for (i, c) in inits.iter().enumerate() {
+        let code = c.pointer("/state/terminated/exitCode").and_then(Value::as_i64);
+        if code == Some(0) {
+            continue;
+        }
+        // A sidecar (restartPolicy Always) that is running counts as done.
+        if c["started"].as_bool() == Some(true) && c.pointer("/state/running").is_some() {
+            continue;
+        }
+        reason = if let Some(t) = c.pointer("/state/terminated") {
+            match t["reason"].as_str() {
+                Some(r) if !r.is_empty() => format!("Init:{r}"),
+                _ => match t["signal"].as_i64().filter(|&s| s != 0) {
+                    Some(sig) => format!("Init:Signal:{sig}"),
+                    None => format!("Init:ExitCode:{}", code.unwrap_or(0)),
+                },
+            }
+        } else if let Some(r) = s(c, "/state/waiting/reason").filter(|r| !r.is_empty() && *r != "PodInitializing") {
+            format!("Init:{r}")
+        } else {
+            format!("Init:{i}/{init_total}")
+        };
+        initializing = true;
+        break;
+    }
+    if !initializing {
+        let mut has_running = false;
+        for c in arr(p, "/status/containerStatuses").iter().rev() {
+            if let Some(r) = s(c, "/state/waiting/reason").filter(|r| !r.is_empty()) {
+                reason = r.to_string();
+            } else if let Some(t) = c.pointer("/state/terminated") {
+                reason = match t["reason"].as_str() {
+                    Some(r) if !r.is_empty() => r.to_string(),
+                    _ => match t["signal"].as_i64().filter(|&s| s != 0) {
+                        Some(sig) => format!("Signal:{sig}"),
+                        None => format!("ExitCode:{}", t["exitCode"].as_i64().unwrap_or(0)),
+                    },
+                };
+            } else if c.pointer("/state/running").is_some() && c["ready"].as_bool() == Some(true) {
+                has_running = true;
+            }
+        }
+        if reason == "Completed" && has_running {
+            let ready = arr(p, "/status/conditions")
+                .iter()
+                .any(|c| c["type"].as_str() == Some("Ready") && c["status"].as_str() == Some("True"));
+            reason = if ready { "Running" } else { "NotReady" }.into();
+        }
+    }
+    if s(p, "/metadata/deletionTimestamp").is_some() {
+        reason = if s(p, "/status/reason") == Some("NodeLost") { "Unknown" } else { "Terminating" }.into();
+    }
+    reason
 }
 
 pub(super) fn pod_row(ctx: &Ctx, p: &PodRow, cx: &App) -> AnyElement {
@@ -835,6 +899,37 @@ fn container_history(ctx: &Ctx, c: &Value, name: &str, cx: &App) -> Option<Div> 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn pod_status_as_kubectl() {
+        use super::pod_status;
+        use serde_json::json;
+        let crash = json!({"status": {"phase": "Running", "containerStatuses": [
+            {"ready": false, "state": {"waiting": {"reason": "CrashLoopBackOff"}}}]}});
+        assert_eq!(pod_status(&crash), "CrashLoopBackOff");
+        let error = json!({"status": {"phase": "Running", "containerStatuses": [
+            {"state": {"terminated": {"reason": "Error", "exitCode": 1}}}]}});
+        assert_eq!(pod_status(&error), "Error");
+        let done = json!({"status": {"phase": "Succeeded", "containerStatuses": [
+            {"state": {"terminated": {"reason": "Completed", "exitCode": 0}}}]}});
+        assert_eq!(pod_status(&done), "Completed");
+        let running = json!({"status": {"phase": "Running", "containerStatuses": [
+            {"ready": true, "state": {"running": {}}}]}});
+        assert_eq!(pod_status(&running), "Running");
+        let init = json!({"spec": {"initContainers": [{}, {}]}, "status": {"phase": "Pending",
+            "initContainerStatuses": [{"state": {"terminated": {"exitCode": 0}}}, {"state": {"running": {}}}]}});
+        assert_eq!(pod_status(&init), "Init:1/2");
+        let init_crash = json!({"status": {"phase": "Pending", "initContainerStatuses": [
+            {"state": {"waiting": {"reason": "CrashLoopBackOff"}}}]}});
+        assert_eq!(pod_status(&init_crash), "Init:CrashLoopBackOff");
+        let evicted = json!({"status": {"phase": "Failed", "reason": "Evicted"}});
+        assert_eq!(pod_status(&evicted), "Evicted");
+        let deleting =
+            json!({"metadata": {"deletionTimestamp": "2026-01-01T00:00:00Z"}, "status": {"phase": "Running"}});
+        assert_eq!(pod_status(&deleting), "Terminating");
+        // The pods list colors these by `status::tone`: a crash loop must not read as healthy.
+        assert_eq!(crate::status::tone("CrashLoopBackOff"), Some(crate::status::Tone::Bad));
+    }
+
     use serde_json::json;
 
     use super::{PodRow, PodSort, field_ref, fill_usage_from_kubelet, next_pod_order, sort_pod_rows};
