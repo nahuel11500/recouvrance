@@ -35,7 +35,7 @@ impl AppView {
             Route::Workloads(p) => p.update(cx, |p, cx| p.set_scope(scope, cx)),
             Route::Problems(p) => {
                 let kinds = self.cluster_kinds();
-                p.update(cx, |p, cx| p.set_scope(scope, kinds, namespaces, cx))
+                p.update(cx, |p, cx| p.set_scope(scope, kinds, namespaces, cx));
             }
             Route::Helm(p) => p.update(cx, |p, cx| p.set_scope(scope, cx)),
             _ => return,

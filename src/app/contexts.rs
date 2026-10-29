@@ -448,7 +448,7 @@ mod tests {
         assert_eq!(keys("spoke"), [pod.key()]);
         assert!(own["down"].is_empty());
         // One cluster: every kind is its own.
-        let (kinds, where_) = merge_kinds(&["a"], vec![Ok(vec![pod.clone(), app.clone()])], &mut Vec::new());
+        let (kinds, where_) = merge_kinds(&["a"], vec![Ok(vec![pod, app])], &mut Vec::new());
         assert_eq!(kinds_per_cluster(&["a"], &kinds, &where_)["a"].len(), 2);
     }
 
