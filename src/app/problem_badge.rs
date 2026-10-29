@@ -1,6 +1,8 @@
 //! The sidebar's problem badge: problems counted across the connected clusters, in the
 //! background.
 
+use std::collections::HashMap;
+
 use gpui_kit::*;
 use kube::Client;
 
@@ -19,8 +21,14 @@ pub(super) struct ProblemBadge {
 
 impl ProblemBadge {
     /// Count problems on `clusters`, again and again; big clusters are scanned less often
-    /// (the interval grows with how long a scan takes). Replaces the running count.
-    pub(super) fn start(&mut self, clusters: Vec<(String, Client)>, kinds: Vec<Kind>, cx: &mut Context<AppView>) {
+    /// (the interval grows with how long a scan takes), each for the kinds it serves
+    /// (`kinds`, by context). Replaces the running count.
+    pub(super) fn start(
+        &mut self,
+        clusters: Vec<(String, Client)>,
+        kinds: HashMap<String, Vec<Kind>>,
+        cx: &mut Context<AppView>,
+    ) {
         *self = Self::default();
         self._watch = Some(cx.spawn(async move |this, cx| {
             let names: Vec<String> = clusters.iter().map(|(name, _)| name.clone()).collect();
@@ -29,7 +37,7 @@ impl ProblemBadge {
                 // A cluster that may not list cluster-wide is read in its accessible namespaces.
                 let scans = clusters.iter().map(|(name, c)| {
                     let accessible = crate::settings::cluster(name).namespaces;
-                    let (c, kinds) = (c.clone(), &kinds);
+                    let (c, kinds) = (c.clone(), kinds.get(name).map(Vec::as_slice).unwrap_or_default());
                     async move { crate::alerts::scan(name, c, kinds, &accessible).await }
                 });
                 let results = futures::future::join_all(scans).await;

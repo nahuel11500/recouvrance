@@ -33,7 +33,10 @@ impl AppView {
         let (scope, namespaces) = (self.namespace_scope(), self.namespaces.clone());
         match self.route().clone() {
             Route::Workloads(p) => p.update(cx, |p, cx| p.set_scope(scope, cx)),
-            Route::Problems(p) => p.update(cx, |p, cx| p.set_scope(scope, namespaces, cx)),
+            Route::Problems(p) => {
+                let kinds = self.cluster_kinds();
+                p.update(cx, |p, cx| p.set_scope(scope, kinds, namespaces, cx))
+            }
             Route::Helm(p) => p.update(cx, |p, cx| p.set_scope(scope, cx)),
             _ => return,
         }
@@ -332,7 +335,7 @@ impl AppView {
             self.navigate(Route::Problems(existing), cx);
             return;
         }
-        let (scope, kinds, ns) = (self.namespace_scope(), self.kinds.clone(), self.namespaces.clone());
+        let (scope, kinds, ns) = (self.namespace_scope(), self.cluster_kinds(), self.namespaces.clone());
         let page = cx.new(|cx| crate::ui::problems_view::ProblemsView::new(scope, kinds, ns, cx));
         self.remember_scope(page.entity_id());
         // Released with the page.

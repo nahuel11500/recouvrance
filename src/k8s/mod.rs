@@ -163,7 +163,8 @@ pub fn mask_secret_values(value: &mut serde_json::Value) {
 pub fn short_error(e: &anyhow::Error) -> String {
     for cause in e.chain() {
         if let Some(kube::Error::Api(status)) = cause.downcast_ref::<kube::Error>() {
-            return impersonation_refused(&status.message).unwrap_or_else(|| status.message.clone());
+            // A plain-text body ("404 page not found\n") keeps its newline.
+            return impersonation_refused(&status.message).unwrap_or_else(|| status.message.trim().to_string());
         }
     }
     let text = format!("{e:#}");
@@ -173,7 +174,7 @@ pub fn short_error(e: &anyhow::Error) -> String {
         let step = if text.contains("Connect") { "connecting to the API server" } else { "waiting for the API server" };
         return format!("The cluster did not answer (timed out {step})");
     }
-    text
+    text.trim().to_string()
 }
 
 /// The HTTP status of an API error (403 forbidden, 404 not found…), if it is one.
@@ -439,6 +440,8 @@ mod tests {
         let request = anyhow!("ServiceError: request timed out");
         assert_eq!(short_error(&request), "The cluster did not answer (timed out waiting for the API server)");
         assert_eq!(short_error(&anyhow!("other")), "other");
+        // A plain-text 404 body ends with a newline, which would break the line it is shown in.
+        assert_eq!(short_error(&anyhow!("404 page not found\n")), "404 page not found");
     }
 
     #[test]

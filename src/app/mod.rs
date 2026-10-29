@@ -575,7 +575,7 @@ impl AppView {
                 Route::Workloads(cx.new(|cx| Dashboard::new(scope, cx)))
             }
             Route::Problems(_) => {
-                let (scope, kinds, ns) = (self.namespace_scope(), self.kinds.clone(), self.namespaces.clone());
+                let (scope, kinds, ns) = (self.namespace_scope(), self.cluster_kinds(), self.namespaces.clone());
                 Route::Problems(cx.new(|cx| crate::ui::problems_view::ProblemsView::new(scope, kinds, ns, cx)))
             }
             Route::Helm(_) => {

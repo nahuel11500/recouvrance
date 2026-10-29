@@ -1,5 +1,7 @@
 //! Problems page: what is broken across the connected clusters, worst first.
 
+use std::collections::HashMap;
+
 use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, h_flex, v_flex};
@@ -13,7 +15,8 @@ use crate::problems::{self, Problem, Severity};
 pub struct ProblemsView {
     /// Each cluster with the namespaces scanned there.
     clusters: crate::ui::Scope,
-    kinds: Vec<Kind>,
+    /// The kinds each cluster serves, by context.
+    kinds: HashMap<String, Vec<Kind>>,
     /// The namespaces chosen, for the header.
     namespaces: Vec<String>,
     /// (context, problem) once loaded.
@@ -27,7 +30,12 @@ pub struct ProblemsView {
 impl EventEmitter<OpenObject> for ProblemsView {}
 
 impl ProblemsView {
-    pub fn new(clusters: crate::ui::Scope, kinds: Vec<Kind>, namespaces: Vec<String>, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        clusters: crate::ui::Scope,
+        kinds: HashMap<String, Vec<Kind>>,
+        namespaces: Vec<String>,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let mut this =
             Self { clusters, kinds, namespaces, found: None, errors: Vec::new(), show_info: false, _task: None };
         this.reload(cx);
@@ -35,8 +43,14 @@ impl ProblemsView {
     }
 
     /// Scan other clusters or namespaces (`namespaces`: the ones chosen, for the header).
-    pub fn set_scope(&mut self, clusters: crate::ui::Scope, namespaces: Vec<String>, cx: &mut Context<Self>) {
-        (self.clusters, self.namespaces, self.found) = (clusters, namespaces, None);
+    pub fn set_scope(
+        &mut self,
+        clusters: crate::ui::Scope,
+        kinds: HashMap<String, Vec<Kind>>,
+        namespaces: Vec<String>,
+        cx: &mut Context<Self>,
+    ) {
+        (self.clusters, self.kinds, self.namespaces, self.found) = (clusters, kinds, namespaces, None);
         self.errors.clear();
         self.reload(cx);
         cx.notify();
@@ -54,7 +68,9 @@ impl ProblemsView {
                 let scans = clusters.iter().filter(|(_, _, ns)| !ns.is_empty()).map(|(ctx, c, ns)| {
                     // `[None]`: the whole cluster; otherwise each namespace, Nodes once.
                     let ns: Vec<String> = ns.iter().flatten().cloned().collect();
-                    let (ctx, c, kinds) = (ctx.clone(), c.clone(), kinds.clone());
+                    let (ctx, c) = (ctx.clone(), c.clone());
+                    // Only the kinds this cluster serves: the others would fail with a 404.
+                    let kinds = kinds.get(&ctx).cloned().unwrap_or_default();
                     async move {
                         let scan = crate::alerts::scan(&ctx, c, &kinds, &ns).await;
                         (ctx, scan)
