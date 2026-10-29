@@ -99,7 +99,7 @@ pub(super) fn ingress(ctx: &Ctx, cx: &App) -> Div {
                         )
                     }))
                     .child(div().text_color(muted).child("secret"))
-                    .child(ctx.link(secret.clone(), "secrets", &secret, cx))
+                    .child(ctx.link(secret.clone(), "secrets", secret, cx))
             }))
         })
 }
