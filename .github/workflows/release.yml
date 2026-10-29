@@ -3,8 +3,9 @@
 # Edited by hand since (dist-workspace.toml: allow-dirty = ["ci"]), so `dist generate` must not
 # overwrite it: read-only token at the top and write only where a job needs it, dist and
 # cargo-cyclonedx downloaded with a checked hash instead of `curl | sh`, the dead rustup step
-# removed, each attestation bundle kept as a release asset (*.sigstore.json), and the SBOM upload
-# fixed (`outputs`, not `output`). After a dist upgrade, regenerate into a scratch file and port
+# removed (a `rustup default stable` step before the build instead), each attestation bundle
+# kept as a release asset (*.sigstore.json), and the SBOM upload fixed (`outputs`, not
+# `output`). After a dist upgrade, regenerate into a scratch file and port
 # the changes by hand.
 #
 # Copyright 2022-2024, axodotdev
@@ -147,6 +148,11 @@ jobs:
       - name: Install dependencies
         run: |
           ${{ matrix.packages_install }}
+      # The runner images lag behind Rust releases (macos-15 had 1.98 when v0.4.0 needed 1.99),
+      # so build with the current stable, as CI does.
+      - name: Update Rust
+        shell: bash
+        run: rustup toolchain install stable --profile minimal && rustup default stable
       - name: Build artifacts
         run: |
           # Actually do builds and make zips and whatnot
