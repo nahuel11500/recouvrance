@@ -5,6 +5,48 @@ and versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.4.0](https://github.com/nahuel11500/recouvrance/compare/v0.3.0...v0.4.0) - 2026-10-29
+
+### Added
+
+- *(confirm)* A short wait instead of typing names to confirm (#589)
+- *(problems)* ExternalSecrets and secret stores that fail to sync, and where a Secret comes from (#581)
+- *(problems)* Objects stuck deleting, with the finalizers holding them (#582)
+- *(alerts)* Firing Prometheus alerts on detail pages and the Problems page (#584)
+- *(argo)* Argo CD details on a namespace's page and on objects it deploys (#587)
+- *(writes)* Run one write action as another identity (kubectl --as) (#585)
+- *(agents)* Explain, can-i, version and wait (#555)
+- *(agents)* Diff a manifest before applying it (#557)
+- *(agents)* Set an image, pause and resume rollouts (#561)
+- *(agents)* Logs of all of a workload's pods (#559)
+- *(agents)* Read Helm releases, history and values (#553)
+- *(agents)* Cordon, uncordon and top nodes (#549)
+- *(agents)* Port-forwards through the MCP server (#545)
+- *(agents)* Run a CronJob now and debug a pod (#551)
+- *(agents)* Rollout history, status and undo (#547)
+
+### Documentation
+
+- Run as, argocd_contexts and the v0.4.0 features (#605)
+- The agents' tools, grouped (#564)
+
+### Fixed
+
+- *(problems)* Scan each cluster for the kinds it serves only (#607)
+- *(alerts)* Ask Alertmanager only for held alerts and say when silences are unknown (#609)
+- *(overview)* Pods tables show kubectl's status, not the phase (#608)
+- *(overview)* No usage bar for a pod without request or limit (#606)
+- *(shell)* Readable exit reason and a hint when the image has no shell (#604)
+- *(problems)* Keep the kind label on one line (#603)
+- *(shell)* Exec in the pod's default container and let the user pick another (#593)
+- *(ctx-picker)* One list with recent first for few contexts, no context listed twice (#592)
+- *(pages)* Workloads, Problems and the assistant follow a selection of several namespaces (#577)
+- *(helm)* List the releases of the namespaces selected, and again when they change (#575)
+- *(assistant)* One centered chat column, code blocks at the text's size (#570)
+- *(table)* A running pod not ready for 5 minutes shows red (#568)
+- *(logs)* Select log lines with the mouse and copy them (#542)
+- *(overview)* Sort the pods on a node, and show their usage (#543)
+
 ## [0.3.0](https://github.com/nahuel11500/recouvrance/compare/v0.2.0...v0.3.0) - 2026-10-26
 
 ### Security
