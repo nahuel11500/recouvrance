@@ -573,17 +573,23 @@ impl Render for TerminalView {
                     ),
             )
             .when_some(self.status.clone(), |d, s| {
-                d.child(h_flex().gap_2().text_xs().text_color(cx.theme().muted_foreground).child(s).when(
-                    self.input.is_none() && !self.once,
-                    |d| {
-                        d.child(Button::new("reconnect").xsmall().ghost().label("Reconnect").on_click(cx.listener(
-                            |this, _, window, cx| {
-                                let attach = this.attach;
-                                this.request(attach, window, cx);
-                            },
-                        )))
-                    },
-                ))
+                // The reconnect button comes first so a long reason, wrapped, never pushes it out.
+                d.child(
+                    h_flex()
+                        .gap_2()
+                        .items_start()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .when(self.input.is_none() && !self.once, |d| {
+                            d.child(Button::new("reconnect").xsmall().ghost().label("Reconnect").on_click(cx.listener(
+                                |this, _, window, cx| {
+                                    let attach = this.attach;
+                                    this.request(attach, window, cx);
+                                },
+                            )))
+                        })
+                        .child(div().flex_1().min_w_0().child(s)),
+                )
             })
             .child(
                 div()

@@ -142,7 +142,15 @@ impl ProblemsView {
                 )
             })
             .child(
-                div().w(px(110.)).flex_shrink_0().text_xs().text_color(theme.muted_foreground).child(p.label.clone()),
+                div()
+                    .w(px(160.))
+                    .flex_shrink_0()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .whitespace_nowrap()
+                    .child(p.label.clone()),
             )
             .child(
                 div()
