@@ -5,7 +5,9 @@ and versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-## [0.5.0](https://github.com/nahuel11500/recouvrance/compare/v0.4.0...v0.5.0) - 2026-10-29
+## [0.4.1](https://github.com/nahuel11500/recouvrance/compare/v0.4.0...v0.4.1) - 2026-10-29
+
+The first published release of 0.4: v0.4.0 was tagged, but its macOS builds failed and it was never published.
 
 ### Added
 
