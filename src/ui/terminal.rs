@@ -6,7 +6,10 @@ use std::rc::Rc;
 use futures::StreamExt as _;
 use futures::channel::mpsc::UnboundedSender;
 use gpui_kit::assets::IconName as Lucide;
+use gpui_kit::component::IndexPath;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::searchable_list::SearchableVec;
+use gpui_kit::component::select::{Select, SelectEvent, SelectState};
 use gpui_kit::component::{ActiveTheme as _, Sizable as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -28,6 +31,11 @@ pub struct TerminalView {
     ns: String,
     pod: String,
     container: Option<String>,
+    /// The pod's containers to choose from (default first, then debug ones), once it is read.
+    containers: Vec<String>,
+    /// Picks another container when the pod has several; a running session restarts in it.
+    container_select: Option<Entity<SelectState<SearchableVec<SharedString>>>>,
+    _container_sub: Option<Subscription>,
     /// Shown before connecting when the context looks like production/admin.
     risky: bool,
     /// Attach to the container's process instead of starting a shell.
@@ -71,6 +79,9 @@ impl TerminalView {
             ns,
             pod,
             container,
+            containers: Vec::new(),
+            container_select: None,
+            _container_sub: None,
             risky,
             attach: false,
             parser: vt100::Parser::new(nz(24), nz(80), SCROLLBACK),
@@ -105,6 +116,64 @@ impl TerminalView {
     pub fn run_once(mut self) -> Self {
         self.once = true;
         self
+    }
+
+    /// The pod's containers as read, and its `default` one. With none chosen yet, the default
+    /// one, as kubectl picks it: the API server refuses an exec naming no container in a pod
+    /// that has several. A choice the pod still has stays.
+    pub fn set_containers(
+        &mut self,
+        names: Vec<String>,
+        default: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if names == self.containers {
+            return;
+        }
+        let gone = self.container.as_ref().is_some_and(|c| !names.contains(c));
+        if self.container.is_none() || (gone && self.session.is_none()) {
+            self.container = default;
+        }
+        self.container_select = None;
+        self._container_sub = None;
+        if names.len() > 1 {
+            let ix = self.container.as_ref().and_then(|c| names.iter().position(|n| n == c));
+            let items: Vec<SharedString> = names.iter().cloned().map(Into::into).collect();
+            let select = cx.new(|cx| {
+                SelectState::new(SearchableVec::new(items), ix.map(|ix| IndexPath::default().row(ix)), window, cx)
+            });
+            self._container_sub = Some(cx.subscribe_in(
+                &select,
+                window,
+                |this, _, ev: &SelectEvent<SearchableVec<SharedString>>, window, cx| {
+                    let SelectEvent::Confirm(Some(name)) = ev else { return };
+                    this.choose_container(name.to_string(), window, cx);
+                },
+            ));
+            self.container_select = Some(select);
+        }
+        self.containers = names;
+        cx.notify();
+    }
+
+    /// Use `name` from now on; a running session ends and starts again in it, through the
+    /// same guard as its button (write mode, the protected context's name).
+    fn choose_container(&mut self, name: String, window: &mut Window, cx: &mut Context<Self>) {
+        if self.container.as_deref() == Some(name.as_str()) {
+            return;
+        }
+        let running = self.session.is_some();
+        // The old container's session ends here, whether or not the new one may start.
+        self.session = None;
+        self.input = None;
+        self.status = None;
+        self.container = Some(name);
+        if running {
+            let attach = self.attach;
+            self.request(attach, window, cx);
+        }
+        cx.notify();
     }
 
     /// A session is open and accepts input.
@@ -361,6 +430,17 @@ impl Render for TerminalView {
                 .justify_center()
                 .gap_3()
                 .child(div().text_sm().text_color(muted).child(format!("Open an interactive shell in {target}")))
+                .when_some(self.container_select.clone().filter(|_| self.local.is_none()), |d, s| {
+                    d.child(
+                        h_flex()
+                            .gap_2()
+                            .items_center()
+                            .text_sm()
+                            .text_color(muted)
+                            .child("Container")
+                            .child(div().w(px(220.)).child(Select::new(&s).small())),
+                    )
+                })
                 .when(self.risky, |d| {
                     d.child(
                         div().text_sm().text_color(warning).child(
@@ -456,6 +536,8 @@ impl Render for TerminalView {
             (Some((ctx, ns)), None) => {
                 format!("kubectl → {ctx}{}", ns.as_ref().map(|n| format!(" / {n}")).unwrap_or_default())
             }
+            // The picker shows the container.
+            _ if self.container_select.is_some() => format!("{}/{}", self.ns, self.pod),
             _ => format!(
                 "{}/{}{}",
                 self.ns,
@@ -463,6 +545,7 @@ impl Render for TerminalView {
                 self.container.as_ref().map(|c| format!(" · {c}")).unwrap_or_default()
             ),
         };
+        let select = self.container_select.clone().filter(|_| self.local.is_none());
         let theme = cx.theme();
         v_flex()
             .size_full()
@@ -477,6 +560,7 @@ impl Render for TerminalView {
                         theme.muted_foreground
                     }))
                     .child(div().text_color(theme.muted_foreground).child(label))
+                    .when_some(select, |d, s| d.child(div().w(px(180.)).child(Select::new(&s).xsmall())))
                     .child(div().flex_1())
                     .child(div().text_color(theme.muted_foreground).child("Ctrl+Shift+V to paste"))
                     .child(

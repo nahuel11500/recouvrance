@@ -115,13 +115,40 @@ fn events_selector(kind: &str, name: &str, uid: &str) -> Result<String> {
 pub async fn containers(client: Client, ns: String, pod: String) -> Result<Vec<String>> {
     run(async move {
         let api: Api<Pod> = Api::namespaced(client, &ns);
-        let pod = api.get(&pod).await?;
-        let default = pod.metadata.annotations.as_ref().and_then(|a| a.get("kubectl.kubernetes.io/default-container"));
-        let names =
-            pod.spec.as_ref().map(|s| s.containers.iter().map(|c| c.name.clone()).collect()).unwrap_or_default();
-        Ok(default_first(names, default.map(String::as_str)))
+        Ok(typed_pod_containers(&api.get(&pod).await?))
     })
     .await
+}
+
+/// A read pod's containers, its default one first (as `pod_containers` for a listed one).
+pub fn typed_pod_containers(pod: &Pod) -> Vec<String> {
+    let default = pod.metadata.annotations.as_ref().and_then(|a| a.get(DEFAULT_CONTAINER));
+    let names = pod.spec.as_ref().map(|s| s.containers.iter().map(|c| c.name.clone()).collect()).unwrap_or_default();
+    default_first(names, default.map(String::as_str))
+}
+
+/// The annotation naming the container kubectl uses when none is given.
+const DEFAULT_CONTAINER: &str = "kubectl.kubernetes.io/default-container";
+
+/// The container kubectl execs into when none is named: the one the
+/// `kubectl.kubernetes.io/default-container` annotation names when the pod has it, else the
+/// first of `spec.containers`. The API server refuses an exec with no container in a pod
+/// that has several.
+pub fn default_container(pod: &serde_json::Value) -> Option<String> {
+    pod_containers(pod).into_iter().next()
+}
+
+/// The containers a shell can open in: the pod's own (default first), then its ephemeral
+/// debug containers.
+pub fn shell_containers(pod: &serde_json::Value) -> Vec<String> {
+    let mut names = pod_containers(pod);
+    let ephemeral = pod.pointer("/spec/ephemeralContainers").and_then(|c| c.as_array());
+    for name in ephemeral.into_iter().flatten().filter_map(|c| c["name"].as_str()) {
+        if !names.iter().any(|n| n == name) {
+            names.push(name.to_string());
+        }
+    }
+    names
 }
 
 /// A listed pod's containers, its default one first (as `containers` reads them).
@@ -131,8 +158,7 @@ pub fn pod_containers(pod: &serde_json::Value) -> Vec<String> {
         .and_then(|c| c.as_array())
         .map(|cs| cs.iter().filter_map(|c| c["name"].as_str().map(String::from)).collect())
         .unwrap_or_default();
-    let default =
-        pod.pointer("/metadata/annotations/kubectl.kubernetes.io~1default-container").and_then(|v| v.as_str());
+    let default = pod.pointer("/metadata/annotations").and_then(|a| a.get(DEFAULT_CONTAINER)).and_then(|v| v.as_str());
     default_first(names, default)
 }
 
@@ -532,6 +558,35 @@ mod tests {
         });
         assert_eq!(super::pod_containers(&pod), ["app", "linkerd-proxy"]);
         assert!(super::pod_containers(&serde_json::json!({})).is_empty());
+    }
+
+    #[test]
+    fn shell_container_like_kubectl() {
+        let pod = |annotation: Option<&str>| {
+            let mut pod = serde_json::json!({
+                "spec": {
+                    "containers": [{"name": "nginx"}, {"name": "uwsgi"}, {"name": "uwsgi-exporter"}],
+                    "ephemeralContainers": [{"name": "debugger-x"}],
+                },
+            });
+            if let Some(a) = annotation {
+                pod["metadata"] = serde_json::json!({"annotations": {"kubectl.kubernetes.io/default-container": a}});
+            }
+            pod
+        };
+        // No annotation: the first container, never none for a pod with several.
+        assert_eq!(super::default_container(&pod(None)).as_deref(), Some("nginx"));
+        // The annotation, when it names one of the pod's containers.
+        assert_eq!(super::default_container(&pod(Some("uwsgi"))).as_deref(), Some("uwsgi"));
+        // A name that isn't one (or an ephemeral one) is ignored, as kubectl does.
+        assert_eq!(super::default_container(&pod(Some("gone"))).as_deref(), Some("nginx"));
+        assert_eq!(super::default_container(&pod(Some("debugger-x"))).as_deref(), Some("nginx"));
+        assert_eq!(super::default_container(&serde_json::json!({})), None);
+        // The shell offers every container, default first, then the debug ones.
+        assert_eq!(super::shell_containers(&pod(Some("uwsgi"))), ["uwsgi", "nginx", "uwsgi-exporter", "debugger-x"]);
+        // The typed read agrees with the listed one.
+        let typed: super::Pod = serde_json::from_value(pod(Some("uwsgi"))).unwrap();
+        assert_eq!(super::typed_pod_containers(&typed), super::pod_containers(&pod(Some("uwsgi"))));
     }
 
     #[test]

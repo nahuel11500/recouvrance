@@ -483,7 +483,7 @@ impl DetailPanel {
                 Ok(value) => {
                     let taken = this.set_object(value, started, cx);
                     if taken {
-                        this.pod_logs_containers(window, cx);
+                        this.pod_containers_read(window, cx);
                     }
                     if taken && reset_yaml || this.yaml.read(cx).value().as_ref() == this.yaml_text {
                         this.refresh_yaml(window, cx);
@@ -599,7 +599,7 @@ impl DetailPanel {
                     if !changed || !this.set_object(value, started, cx) {
                         return;
                     }
-                    this.pod_logs_containers(window, cx);
+                    this.pod_containers_read(window, cx);
                     // Don't overwrite what the user is editing.
                     if this.yaml.read(cx).value().as_ref() == this.yaml_text {
                         this.refresh_yaml(window, cx);
@@ -854,12 +854,18 @@ impl DetailPanel {
     }
 
     /// A pod page's logs take the containers from the pod as read, so they know which one
-    /// to read without waiting for their own listing (or when it fails).
-    fn pod_logs_containers(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// to read without waiting for their own listing (or when it fails). Its shell takes them
+    /// too, so it execs in the default one (kubectl's choice) and offers the others.
+    fn pod_containers_read(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.obj.kind.is("", "Pod") {
             return;
         }
-        let (Some(value), Some(logs)) = (&self.object, &self.logs) else { return };
+        let Some(value) = &self.object else { return };
+        if let Some(terminal) = &self.terminal {
+            let (names, default) = (k8s::shell_containers(value), k8s::default_container(value));
+            terminal.update(cx, |t, cx| t.set_containers(names, default, window, cx));
+        }
+        let Some(logs) = &self.logs else { return };
         let pods = own_pod_logs(&self.obj.name, value);
         logs.update(cx, |l, cx| l.set_pods(pods, window, cx));
     }
