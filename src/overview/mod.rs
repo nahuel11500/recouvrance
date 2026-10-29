@@ -221,6 +221,16 @@ fn card(cx: &App) -> Div {
     v_flex().p_2().gap_1().rounded_md().border_1().border_color(cx.theme().border).bg(cx.theme().secondary.opacity(0.4))
 }
 
+/// `text` in monospace, opening `url` in the browser when there is one.
+fn mono_url(id: impl Into<ElementId>, text: impl Into<SharedString>, url: Option<String>, cx: &App) -> Stateful<Div> {
+    mono(text, cx).id(id).when_some(url, |d, url| {
+        d.text_color(cx.theme().blue)
+            .cursor_pointer()
+            .hover(Styled::underline)
+            .on_click(move |_, _, _| crate::forwards::open_url(&url))
+    })
+}
+
 fn mono(text: impl Into<SharedString>, cx: &App) -> Div {
     div().font_family(cx.theme().mono_font_family.clone()).text_xs().child(text.into())
 }

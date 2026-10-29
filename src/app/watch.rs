@@ -73,6 +73,7 @@ impl AppView {
         let filter_text = self.filter.read(cx).value().to_string();
         self.table.update(cx, |t, cx| {
             t.delegate_mut().pods = is_pod;
+            t.delegate_mut().ingresses = kind.is("networking.k8s.io", "Ingress");
             t.delegate_mut().row_actions = actions;
             t.delegate_mut().reset(
                 show_ns,

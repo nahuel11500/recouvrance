@@ -61,6 +61,26 @@ pub fn opens_browser(port: u16, name: Option<&str>) -> bool {
     WEB_PORTS.contains(&port) || ["http", "web", "ui", "dashboard", "console", "admin"].iter().any(|n| name.contains(n))
 }
 
+/// The address to open for an Ingress host and path: None for a wildcard (`*`,
+/// `*.example.com`) or anything that is not a DNS name. A path that is not plain (a regex
+/// of some controllers) opens the host's root.
+pub fn host_url(host: &str, path: &str, https: bool) -> Option<String> {
+    let dns = |c: char| c.is_ascii_alphanumeric() || c == '-' || c == '.';
+    if host.is_empty() || host.starts_with(['.', '-']) || !host.chars().all(dns) {
+        return None;
+    }
+    let plain = |c: char| c.is_ascii_alphanumeric() || "/-._~".contains(c);
+    let path = if path.starts_with('/') && path.chars().all(plain) { path } else { "/" };
+    Some(format!("{}://{host}{path}", if https { "https" } else { "http" }))
+}
+
+/// Whether a TLS entry's hosts cover `host`: the same name, or a `*.` wildcard one label up.
+pub fn tls_covers(tls_hosts: &[&str], host: &str) -> bool {
+    tls_hosts.iter().any(|t| {
+        *t == host || t.strip_prefix("*.").is_some_and(|d| host.split_once('.').is_some_and(|(_, rest)| rest == d))
+    })
+}
+
 pub fn open_url(url: &str) {
     let opener = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
     spawn_reaped(std::process::Command::new(opener).arg(url).stdin(std::process::Stdio::null()));
@@ -245,6 +265,23 @@ pub fn forget(saved: &SavedForward) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn host_urls() {
+        use super::{host_url, tls_covers};
+        assert_eq!(host_url("a.example.com", "/", true).as_deref(), Some("https://a.example.com/"));
+        assert_eq!(host_url("a.example.com", "/api", false).as_deref(), Some("http://a.example.com/api"));
+        // A controller's regex path opens the root.
+        assert_eq!(host_url("a.example.com", "/api(/|$)(.*)", true).as_deref(), Some("https://a.example.com/"));
+        // Wildcards and anything that is not a DNS name are no link.
+        for h in ["*", "*.example.com", "", "-x", "a b", "a/b", "a.com?x"] {
+            assert_eq!(host_url(h, "/", true), None, "{h}");
+        }
+        assert!(tls_covers(&["a.example.com"], "a.example.com"));
+        assert!(tls_covers(&["*.example.com"], "a.example.com"));
+        assert!(!tls_covers(&["*.example.com"], "a.b.example.com"));
+        assert!(!tls_covers(&["b.example.com"], "a.example.com"));
+    }
+
     #[test]
     fn pod_bases() {
         assert_eq!(super::pod_base("web-7f9d8c4b5-abc12"), "web");

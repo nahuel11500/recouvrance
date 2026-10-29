@@ -271,6 +271,41 @@ impl TableDelegate for ResourceTable {
                 .child(text)
                 .into_any_element();
         }
+        // An Ingress's hosts open the site, https when it serves 443 (kubectl's Ports column).
+        if self.ingresses && self.header(col) == "Hosts" {
+            let https = self.cells_text(row, "Ports").is_some_and(|p| p.split(", ").any(|p| p == "443"));
+            let hosts = ingress_hosts(&cell);
+            if hosts.iter().any(|(h, _)| crate::forwards::host_url(h, "/", https).is_some()) {
+                let last = hosts.len() - 1;
+                return h_flex()
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .when(row.deleting, |d| d.opacity(0.5))
+                    .children(hosts.into_iter().enumerate().map(|(i, (host, more))| {
+                        let sep = if i < last { "," } else { "" };
+                        let url = crate::forwards::host_url(&host, "/", https);
+                        h_flex()
+                            .flex_shrink_0()
+                            .child(
+                                div()
+                                    .id(SharedString::from(format!("host-{}-{i}", row.uid)))
+                                    .when_some(url, |d, url| {
+                                        d.text_color(theme.blue)
+                                            .cursor_pointer()
+                                            .hover(Styled::underline)
+                                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                            .on_click(move |_, _, cx| {
+                                                crate::forwards::open_url(&url);
+                                                cx.stop_propagation();
+                                            })
+                                    })
+                                    .child(host),
+                            )
+                            .child(format!("{sep}{more}"))
+                    }))
+                    .into_any_element();
+            }
+        }
         // Cells that name another object (a CRD's Secret, a pod's Node…) open it.
         if let Some(kind) = self.link_kind(col).filter(|_| linkable(&cell)) {
             let (target, ns) = (cell.into_owned(), row.namespace.clone());
@@ -492,6 +527,19 @@ pub(super) fn link_kind_of(header: &str) -> Option<&'static str> {
     })
 }
 
+/// The hosts of kubectl's Ingress Hosts column ("a.com,b.com,c.com + 2 more..."), each
+/// with the text that follows it (" + 2 more..." after the last).
+pub(super) fn ingress_hosts(cell: &str) -> Vec<(String, String)> {
+    cell.split(',')
+        .map(|h| {
+            let h = h.trim();
+            let (host, more) = h.split_once(' ').map_or((h, ""), |(h, m)| (h, m));
+            (host.to_string(), if more.is_empty() { String::new() } else { format!(" {more}") })
+        })
+        .filter(|(h, _)| !h.is_empty())
+        .collect()
+}
+
 /// Whether a cell names one object: lists, `<none>` and `-` are not links.
 pub(super) fn linkable(value: &str) -> bool {
     let v = value.trim();
@@ -580,6 +628,19 @@ fn ready_total(cell: &str) -> Option<usize> {
 #[cfg(test)]
 mod link_tests {
     use super::{link_kind_of, linkable};
+
+    #[test]
+    fn ingress_hosts_split() {
+        use super::ingress_hosts;
+        let own = |v: &[(&str, &str)]| v.iter().map(|(a, b)| (a.to_string(), b.to_string())).collect::<Vec<_>>();
+        assert_eq!(ingress_hosts("a.com"), own(&[("a.com", "")]));
+        assert_eq!(ingress_hosts("a.com,b.com"), own(&[("a.com", ""), ("b.com", "")]));
+        assert_eq!(
+            ingress_hosts("a.com,b.com,c.com + 2 more..."),
+            own(&[("a.com", ""), ("b.com", ""), ("c.com", " + 2 more...")])
+        );
+        assert!(ingress_hosts("").is_empty());
+    }
 
     #[test]
     fn links() {

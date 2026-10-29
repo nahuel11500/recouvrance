@@ -66,6 +66,8 @@ pub struct ResourceTable {
     pub app_focus: Option<FocusHandle>,
     /// Kind is a Pod: offer logs and shell in the row menu.
     pub pods: bool,
+    /// Kind is an Ingress: its hosts open the site.
+    pub ingresses: bool,
     /// Which write actions the row menu offers for this kind.
     pub row_actions: Vec<&'static str>,
     /// Rows checked for bulk actions: uids by context index (a fast first load's
@@ -111,6 +113,7 @@ impl ResourceTable {
             visible_cols: None,
             app_focus: None,
             pods: false,
+            ingresses: false,
             row_actions: Vec::new(),
             marked: Default::default(),
             widths: HashMap::new(),
