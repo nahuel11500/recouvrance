@@ -40,9 +40,32 @@
 - Review the change, not the codebase: each PR's diff is reviewed as it lands, fixes
   included. Whole-codebase audits are not repeated; bug reports from users set the
   priorities for the long tail.
-- Merges are squash merges once `CI result` passes and the diff has been reviewed.
+- Merge without asking: once the diff has been reviewed, squash merge it as soon as
+  `CI result` passes (`gh pr checks <n> --watch`, then `gh pr merge <n> --squash`). A failing
+  CI is fixed on the branch, never merged around. Dependabot's PRs merge the same way once
+  their CI passes on the current `main`.
+- Nothing is tried in the running app before merging; the test before a release is (see
+  below).
 - `gh pr edit` fails on this repository (Projects classic); change a PR's title or body with
   `gh api -X PATCH repos/nahuel11500/recouvrance/pulls/<n> -f body=...`.
+
+## Before a release
+
+The release is the *chore: release vX.Y.Z* PR that release-plz opens; it is merged only after
+an agent has used the app end to end and found nothing blocking:
+
+- Build once with `--features dev` (the rules under Building apply) and drive the real app with
+  the developer tools in [docs/development.md](docs/development.md#developer-tools---features-dev):
+  snapshots, `RECOUVRANCE_ACT` hooks and `RECOUVRANCE_INPUT` clicks, with `XDG_CONFIG_HOME` in a
+  scratch folder.
+- Cover every feature and fix merged since the last tag (`git log <last tag>..origin/main`,
+  and the PRs it names), then the main paths of [docs/features.md](docs/features.md): switching
+  and combining contexts and namespaces, tables, a detail page and its tabs, logs, shells,
+  Problems, Apply, Settings, the agents' MCP server.
+- Against real clusters, only read. Writes, shells and deletes are tried on a kind cluster (or
+  on another cluster only when the user says so).
+- File an issue for each bug found, with what was done and a snapshot; don't fix them in the
+  same pass. Then say whether the release can go, and which issues block it.
 
 ## Use the shared helpers
 
