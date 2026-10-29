@@ -234,24 +234,20 @@ async fn get(context: &str, client: Client, target: &str, path: &str) -> Result<
     let key = (context.to_string(), target.to_string(), path.to_string());
     k8s::run(async move {
         let running = IN_FLIGHT.lock().unwrap().remove(&key);
-        let (started, mut task) = match running.filter(|(started, _)| reuse(started.elapsed())) {
-            Some(running) => running,
-            None => {
-                let (_, target, path) = key.clone();
-                let task = tokio::spawn(async move {
-                    tokio::time::timeout(LIMIT, get_now(client, target, path))
-                        .await
-                        .map_err(|_| anyhow::anyhow!("timed out"))?
-                });
-                (Instant::now(), task)
-            }
-        };
-        match tokio::time::timeout(WAIT, &mut task).await {
-            Ok(done) => done.map_err(|e| anyhow::anyhow!("task failed: {e}"))?,
-            Err(_) => {
-                IN_FLIGHT.lock().unwrap().insert(key, (started, task));
-                Err(anyhow::anyhow!("timed out"))
-            }
+        let (started, mut task) = running.filter(|(started, _)| reuse(started.elapsed())).unwrap_or_else(|| {
+            let (_, target, path) = key.clone();
+            let task = tokio::spawn(async move {
+                tokio::time::timeout(LIMIT, get_now(client, target, path))
+                    .await
+                    .map_err(|_| anyhow::anyhow!("timed out"))?
+            });
+            (Instant::now(), task)
+        });
+        if let Ok(done) = tokio::time::timeout(WAIT, &mut task).await {
+            done.map_err(|e| anyhow::anyhow!("task failed: {e}"))?
+        } else {
+            IN_FLIGHT.lock().unwrap().insert(key, (started, task));
+            Err(anyhow::anyhow!("timed out"))
         }
     })
     .await
@@ -342,7 +338,9 @@ enum Silences {
 }
 
 /// The last silences each cluster's Alertmanager gave (keyed by context), and when.
-static LAST_HELD: LazyLock<Mutex<HashMap<String, (Instant, Arc<Vec<Held>>)>>> = LazyLock::new(Default::default);
+type LastHeld = HashMap<String, (Instant, Arc<Vec<Held>>)>;
+
+static LAST_HELD: LazyLock<Mutex<LastHeld>> = LazyLock::new(Default::default);
 
 /// How long a cluster's last silences stand in when Alertmanager does not answer: silences
 /// last hours, and a few slow reads in a row should not flip silenced alerts to firing.
