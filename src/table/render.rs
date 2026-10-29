@@ -285,10 +285,12 @@ impl TableDelegate for ResourceTable {
                         let sep = if i < last { "," } else { "" };
                         let url = crate::forwards::host_url(&host, "/", https);
                         h_flex()
-                            .flex_shrink_0()
+                            .min_w_0()
                             .child(
                                 div()
                                     .id(SharedString::from(format!("host-{}-{i}", row.uid)))
+                                    .overflow_hidden()
+                                    .text_ellipsis()
                                     .when_some(url, |d, url| {
                                         d.text_color(theme.blue)
                                             .cursor_pointer()
