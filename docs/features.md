@@ -21,6 +21,20 @@
   more than it lists.
 - **Problems**: one list of what is broken across clusters (crash loops, pending pods, unavailable workloads, NotReady nodes, failed jobs, pending volumes, and alerts firing in the cluster's Prometheus that nobody silenced).
 - **Alerts where you look**: a namespace's page lists the alerts labeled with it, and a pod's, workload's, volume's or node's page the alerts about it (a pod's include its workload's, a workload's its pods'), with severity, summary, how long, runbook link, and silenced or inhibited ones muted when an Alertmanager is found.
+- **Stuck deletions**: the Problems page lists objects (pods, workloads, Jobs, PVCs, PVs,
+  Namespaces, Argo CD Applications) whose deletion has waited more than 10 minutes, with the
+  finalizers holding them (for a Namespace, the resources left); their Delete dialog offers to
+  remove the finalizers.
+- **ExternalSecrets**: ExternalSecrets that fail to sync and secret stores not Ready show on the
+  Problems page; a Secret made by an ExternalSecret shows where it comes from (the ExternalSecret,
+  its store, last refresh, Ready), and an ExternalSecret's page links its store and target Secret.
+- **Argo CD panel**: a namespace's page shows the Applications deploying into it, and an object's
+  page the Application that deployed it (by its tracking id): sync and health, auto-sync,
+  revision, last sync, conditions, the last 5 deployments, a link to the Application, and
+  *Refresh*/*Sync* (write mode and the hub's protection apply). The Applications are read from the
+  hub, found among the connected clusters, else among other kubeconfig contexts that need no
+  separate login; when the hub isn't found, name it with `argocd_contexts` (see
+  [configuration](configuration.md#argo-cd-hub-argocd_contexts)).
 - **Overviews**: cluster capacity and health, workloads status, Helm releases (values masked; install from your repos, roll back and uninstall through your `helm` CLI).
 - **API requests** (Settings → API requests): per cluster, how many requests of each kind
   (discovery, lists, watches, metrics, logs, shells, writes) were made, how many failed, and how
@@ -57,6 +71,16 @@
   kind, API group, namespace or name is refused, and so are masked Secret values. Every
   confirmation shows the equivalent `kubectl` command. A page whose object is deleted says so and
   stops polling.
+- **Run as** (Settings → Contexts → *Run as*): set a user (and groups) a
+  context's writes may run as, like `kubectl --as`. Write confirmations then show a *Run as
+  `<identity>`* checkbox, off each time; checked, that one action runs as the identity and the
+  `kubectl` line shows `--as`. A protected context still asks for its confirmation (a wait or its name). Reads go as you; write mode and
+  the identity are checked again when each request is sent (an identity changed meanwhile sends
+  nothing). Actions disabled because your RBAC forbids them stay enabled when the context has an
+  identity. Covered: scale, restart, rollback, delete (force, finalizers), YAML save, the values
+  editor, Apply, cordon/uncordon, drain, CronJob run, suspend/resume, Flux reconcile, Argo CD
+  refresh/sync, role bindings. Not covered: Helm, bulk delete from tables, plugins, shells, debug,
+  node shell, file copy and ServiceAccount kubeconfigs. Agents never run as it.
 - **Plugins**: your own commands on resources (`~/.config/recouvrance/plugins.yaml`):
   `$CONTEXT`, `$NAMESPACE`, `$NAME`, `$KIND` are filled in and kubectl points at the cluster; they
   run in a terminal page or in the background. A plugin counts as a write (write mode, protected
@@ -90,7 +114,7 @@
 - **Port-forwards** with options: local port, listen address, https, open in the browser; they follow
   replacement pods.
 - **Per-cluster settings**: Prometheus or VictoriaMetrics endpoint, node shell image, accessible
-  namespaces (when you may not list them), metrics off; namespaces can also be added by hand.
+  namespaces (when you may not list them), metrics off, an identity to run as; namespaces can also be added by hand.
 - **Kubeconfig**: extra files and watched folders, reloaded on change; contexts with the same name in
   two files are kept apart as `name@file`.
 

@@ -74,6 +74,7 @@ context already shown as `name@file` keeps that name when `name` is freed.
 | `protect_unset` | `false` | Set when the protection choices could not be read: contexts not listed in `protection` are protected instead of guessed. *Guess them again* in Settings → Contexts turns it off |
 | `prometheus` | found automatically | `{ "ctx": "monitoring/prometheus:9090" }` (see below) |
 | `clusters` | | Per-cluster settings (below) |
+| `argocd_contexts` | `[]` | `["argocd-hub"]`: the contexts Argo CD's Applications are read from (see below). Empty: found on their own. A value that doesn't read is empty. No Settings UI yet |
 | `extra_namespaces` | | Namespaces added by hand, per context |
 | `metrics_enabled` | true | Read metrics-server and Prometheus at all |
 | `accent` | `"brass"` | Accent color: `brass`, `harbour`, `sea`, `kelp`, `signal` or `violet` |
@@ -116,13 +117,40 @@ is read.
   "prod-eu": {
     "node_shell_image": "alpine:3.20",
     "namespaces": ["team-a", "team-b"],
-    "metrics_disabled": true
+    "metrics_disabled": true,
+    "run_as": { "user": "super-admin", "groups": ["ops"] }
   }
 }
 ```
 
 `namespaces` is for users who may not list namespaces: they fill the namespace picker, and
 lists show one of them at a time.
+
+`run_as` (Settings → Contexts, *Run as*; none by default) is who a write on this context may run
+as, like `kubectl --as <user> --as-group <group>`: `user` is required, `groups` optional (a list).
+It only adds a *Run as* checkbox to write confirmations, off each time (see
+[features](features.md)); nothing runs as it otherwise. It fails closed: a value that
+doesn't read (no user, `groups` not a list, a string instead of an object, characters that can't
+go in an HTTP header) counts as none without costing the cluster's other settings, and while
+`settings.json` can't be read no identity is offered. Your own role needs the `impersonate` verb
+on that user and those groups.
+
+### Argo CD hub (`argocd_contexts`)
+
+The Argo CD panel on namespace and object pages reads Applications from the cluster Argo CD runs
+on (the hub). With `argocd_contexts` empty, the hub is found on its own: the connected clusters
+first; only if none serves Applications, the kubeconfig's other contexts that can be asked without
+a login prompt (no exec plugin, or the same exec command line as a connected context).
+
+Set it when the hub isn't connected and its kubeconfig user logs in with an exec plugin whose
+command line differs from the connected contexts' (kubelogin with one OIDC client id per cluster,
+for example): the hub is then never asked, and no Argo CD section shows. Naming it fixes that:
+
+```json
+"argocd_contexts": ["eu-platform-meta"]
+```
+
+Only the named contexts are asked then (their login may run). Connecting the hub as well works too.
 
 ## rules.yaml
 
