@@ -126,7 +126,11 @@ pub fn exec_shell(client: Client, ns: String, pod: String, container: Option<Str
         let reason = match status {
             Some(s) => match s.await {
                 Some(st) if st.status.as_deref() != Some("Success") => {
-                    format!("Session ended: {}", st.message.unwrap_or_default())
+                    let message = st.message.unwrap_or_default();
+                    match ended_reason(&message) {
+                        Some(hint) => format!("Session ended: {hint}: {message}"),
+                        None => format!("Session ended: {message}"),
+                    }
                 }
                 _ => "Session ended".to_string(),
             },
@@ -160,6 +164,17 @@ async fn refused(api: &Api<Pod>, pod: &str, container: Option<&str>, verb: &str,
     }
 }
 
+/// The hint for an image without a shell (distroless, scratch).
+const NO_SHELL: &str = "the shell isn't in the image; Debug adds a container with one";
+
+/// Why a shell that started ended at once, from the failure status' message: the runtime
+/// says the executable was not found when the image has no `sh`.
+fn ended_reason(message: &str) -> Option<String> {
+    let m = message.to_ascii_lowercase();
+    (m.contains("executable file not found") || (m.contains("no such file or directory") && m.contains("exec")))
+        .then(|| format!("no shell in this image ({NO_SHELL})"))
+}
+
 /// Why an exec or attach upgrade answered `status`, from the pod as read (when it could be).
 fn refusal_reason(status: u16, verb: &str, pod: Option<&Pod>, container: Option<&str>) -> Option<String> {
     match status {
@@ -170,7 +185,7 @@ fn refusal_reason(status: u16, verb: &str, pod: Option<&Pod>, container: Option<
         _ => return None,
     }
     let generic = if verb == "exec" {
-        "the container may need choosing, or the shell isn't in the image".to_string()
+        format!("the container may need choosing, or {NO_SHELL}")
     } else {
         "the container may need choosing, or it isn't running".to_string()
     };
@@ -752,7 +767,8 @@ fn attach_target(
 #[cfg(test)]
 mod tests {
     use super::{
-        attach_target, copy_capped, crlf, helm_writes, read_capped, refusal_reason, tar_source, upload_source,
+        NO_SHELL, attach_target, copy_capped, crlf, ended_reason, helm_writes, read_capped, refusal_reason, tar_source,
+        upload_source,
     };
     use k8s_openapi::api::core::v1::{Container, EphemeralContainer, PodSpec};
 
@@ -781,6 +797,13 @@ mod tests {
         assert!(reason(400, "attach", None, None).contains("need choosing"));
         assert!(reason(403, "attach", None, None).contains("pods/attach"));
         assert_eq!(refusal_reason(500, "exec", None, None), None);
+        assert_eq!(
+            ended_reason(
+                "OCI runtime exec failed: exec failed: unable to start container process: exec: \"sh\": executable file not found in $PATH: unknown"
+            ),
+            Some(format!("no shell in this image ({NO_SHELL})"))
+        );
+        assert_eq!(ended_reason("command terminated with non-zero exit code: exit status 130"), None);
     }
 
     #[tokio::test(flavor = "multi_thread")]
