@@ -5,7 +5,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use serde_json::Value;
 
-use super::{Ctx, arr, clipped_list, field, heading, mono, pairs, row, s};
+use super::{Ctx, arr, clipped_list, field, heading, mono, mono_url, pairs, row, s};
 
 pub(super) fn service(ctx: &Ctx, cx: &App) -> Div {
     let obj = ctx.obj;
@@ -44,10 +44,21 @@ pub(super) fn ingress(ctx: &Ctx, cx: &App) -> Div {
         .iter()
         .filter_map(|a| a["ip"].as_str().or(a["hostname"].as_str()).map(String::from))
         .collect();
+    let tls: Vec<(Vec<&str>, String)> = arr(obj, "/spec/tls")
+        .iter()
+        .map(|t| {
+            let hosts: Vec<&str> =
+                t["hosts"].as_array().map(|h| h.iter().filter_map(|v| v.as_str()).collect()).unwrap_or_default();
+            (hosts, t["secretName"].as_str().unwrap_or_default().to_string())
+        })
+        .collect();
+    let https = |host: &str| tls.iter().any(|(hosts, _)| crate::forwards::tls_covers(hosts, host));
     let mut rules = v_flex().gap_1();
-    for r in arr(obj, "/spec/rules") {
+    for (i, r) in arr(obj, "/spec/rules").iter().enumerate() {
         let host = r["host"].as_str().unwrap_or("*").to_string();
-        for p in arr(r, "/http/paths") {
+        for (j, p) in arr(r, "/http/paths").iter().enumerate() {
+            let path = p["path"].as_str().unwrap_or("/");
+            let url = crate::forwards::host_url(&host, path, https(&host));
             let svc = p.pointer("/backend/service/name").and_then(Value::as_str).unwrap_or_default().to_string();
             let port = p
                 .pointer("/backend/service/port/number")
@@ -59,21 +70,13 @@ pub(super) fn ingress(ctx: &Ctx, cx: &App) -> Div {
                 h_flex()
                     .gap_2()
                     .text_sm()
-                    .child(mono(format!("{host}{}", p["path"].as_str().unwrap_or("/")), cx))
+                    .child(mono_url(("ingress-rule", i * 1000 + j), format!("{host}{path}"), url, cx))
                     .child(div().text_color(muted).child("→"))
                     .child(ctx.link(svc.clone(), "services", &svc, cx))
                     .child(div().text_color(muted).child(format!(":{port}"))),
             );
         }
     }
-    let tls: Vec<(String, String)> = arr(obj, "/spec/tls")
-        .iter()
-        .map(|t| {
-            let hosts: Vec<&str> =
-                t["hosts"].as_array().map(|h| h.iter().filter_map(|v| v.as_str()).collect()).unwrap_or_default();
-            (hosts.join(", "), t["secretName"].as_str().unwrap_or_default().to_string())
-        })
-        .collect();
     v_flex()
         .child(row().pt_4().child(field("Class", class, cx)).child(field(
             "Address",
@@ -83,13 +86,20 @@ pub(super) fn ingress(ctx: &Ctx, cx: &App) -> Div {
         .child(heading("Rules"))
         .child(rules)
         .when(!tls.is_empty(), |d| {
-            d.child(heading("TLS")).children(tls.into_iter().map(|(hosts, secret)| {
+            d.child(heading("TLS")).children(tls.iter().enumerate().map(|(i, (hosts, secret))| {
                 h_flex()
                     .gap_2()
                     .text_sm()
-                    .child(mono(hosts, cx))
+                    .children(hosts.iter().enumerate().map(|(j, h)| {
+                        mono_url(
+                            ("ingress-tls", i * 1000 + j),
+                            h.to_string(),
+                            crate::forwards::host_url(h, "/", true),
+                            cx,
+                        )
+                    }))
                     .child(div().text_color(muted).child("secret"))
-                    .child(ctx.link(secret.clone(), "secrets", &secret, cx))
+                    .child(ctx.link(secret.clone(), "secrets", secret, cx))
             }))
         })
 }
