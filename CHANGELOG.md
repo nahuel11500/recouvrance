@@ -5,6 +5,16 @@ and versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.5.0](https://github.com/nahuel11500/recouvrance/compare/v0.4.0...v0.5.0) - 2026-10-29
+
+### Added
+
+- *(ingress)* Open an Ingress's hosts in the browser (#612)
+
+### Fixed
+
+- *(ingress)* Hosts are links in the Ingresses table too (#615)
+
 ## [0.4.0](https://github.com/nahuel11500/recouvrance/compare/v0.3.0...v0.4.0) - 2026-10-29
 
 ### Added
