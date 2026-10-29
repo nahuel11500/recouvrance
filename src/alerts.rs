@@ -413,7 +413,9 @@ const RETRY: Duration = Duration::from_secs(5);
 
 /// How long an answer is shared before it is read again.
 fn kept_for(alerts: &Alerts) -> Duration {
-    if alerts.error.is_some() || alerts.silences_error.is_some() { RETRY } else { FRESH }
+    // Refused (401/403) stays refused: asking again soon would not help.
+    let refused = matches!(alerts.error, Some((Some(401 | 403), _)));
+    if !refused && (alerts.error.is_some() || alerts.silences_error.is_some()) { RETRY } else { FRESH }
 }
 
 type Slot = Arc<tokio::sync::Mutex<Option<(Instant, Arc<Alerts>)>>>;
@@ -718,6 +720,8 @@ mod tests {
         assert!(alerts.silences_note().unwrap().contains("timed out"));
         assert_eq!(kept_for(&alerts), RETRY);
         assert_eq!(kept_for(&Alerts::default()), FRESH);
+        let forbidden = Alerts { list: Vec::new(), error: Some((Some(403), "forbidden".into())), silences_error: None };
+        assert_eq!(kept_for(&forbidden), FRESH);
         assert!(Alerts::default().silences_note().is_none());
     }
 
