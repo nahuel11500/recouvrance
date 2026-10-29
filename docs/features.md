@@ -74,7 +74,7 @@
 - **Run as** (Settings → Contexts → *Run as*): set a user (and groups) a
   context's writes may run as, like `kubectl --as`. Write confirmations then show a *Run as
   `<identity>`* checkbox, off each time; checked, that one action runs as the identity and the
-  `kubectl` line shows `--as`. A protected context still asks for its name. Reads go as you; write mode and
+  `kubectl` line shows `--as`. A protected context still asks for its confirmation (a wait or its name). Reads go as you; write mode and
   the identity are checked again when each request is sent (an identity changed meanwhile sends
   nothing). Actions disabled because your RBAC forbids them stay enabled when the context has an
   identity. Covered: scale, restart, rollback, delete (force, finalizers), YAML save, the values
