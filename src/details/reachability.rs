@@ -1,5 +1,5 @@
-//! The Reachability tab of Services, Ingresses and HTTPRoutes: the path a request takes, step
-//! by step, with the first step that breaks on top.
+//! The Reachability tab of a Service, an Ingress or an HTTPRoute: the path a request takes,
+//! step by step, with the first step that breaks on top.
 
 use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::component::button::{Button, ButtonVariants as _};

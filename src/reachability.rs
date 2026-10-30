@@ -258,11 +258,12 @@ pub async fn gather(reader: Reader, target: Target, obj: Value) -> World {
         }
         Target::HttpRoute => {
             let ar = gateway_ar(&obj);
-            for (_, key) in route_gateways(&obj) {
-                if !world.gateways.contains_key(&key) {
-                    let read = reader.get(ar.clone(), Some(key.0.clone()), key.1.clone()).await;
-                    world.gateways.insert(key, read);
-                }
+            let mut keys: Vec<Key> = route_gateways(&obj).into_iter().map(|(_, key)| key).collect();
+            keys.sort();
+            keys.dedup();
+            for key in keys {
+                let read = reader.get(ar.clone(), Some(key.0.clone()), key.1.clone()).await;
+                world.gateways.insert(key, read);
             }
             secrets = route_secrets(&obj, &world.gateways);
         }
@@ -1785,15 +1786,12 @@ mod tests {
                 .map(|(i, st)| Step::new("S", format!("step {i}"), *st, format!("detail {i}")))
                 .collect();
             let (state, text) = verdict(&steps);
-            match states.iter().position(|s| *s == State::Broken) {
-                Some(i) => {
-                    prop_assert_eq!(state, State::Broken);
-                    prop_assert_eq!(text, format!("Breaks at S › step {i}: detail {i}"));
-                }
-                None => {
-                    prop_assert_ne!(state, State::Broken);
-                    prop_assert_eq!(state == State::Ok, states.iter().all(|s| *s == State::Ok));
-                }
+            if let Some(i) = states.iter().position(|s| *s == State::Broken) {
+                prop_assert_eq!(state, State::Broken);
+                prop_assert_eq!(text, format!("Breaks at S › step {i}: detail {i}"));
+            } else {
+                prop_assert_ne!(state, State::Broken);
+                prop_assert_eq!(state == State::Ok, states.iter().all(|s| *s == State::Ok));
             }
         }
     }
