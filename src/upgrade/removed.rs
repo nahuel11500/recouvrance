@@ -41,7 +41,7 @@ const SELECTOR_NOTE: &str = "spec.selector is required and immutable";
 const ROLLING_NOTE: &str = "spec.selector is required and immutable, and updateStrategy defaults to RollingUpdate";
 
 /// Every removal in the guide, newest release first.
-pub const REMOVALS: &[Removal] = &[
+pub static REMOVALS: &[Removal] = &[
     // v1.32
     rm(32, "flowcontrol.apiserver.k8s.io/v1beta3", "FlowSchema", "flowschemas", false, FLOW_V1, ""),
     rm(
@@ -368,9 +368,12 @@ pub fn between(current: u32, target: u32) -> impl Iterator<Item = &'static Remov
 mod tests {
     use super::*;
 
-    /// The guide, release by release: (release, the API versions it stopped serving, the
-    /// kinds, the version the guide says to migrate to).
-    const GUIDE: &[(u32, &[&str], &[&str], Option<&str>)] = &[
+    /// A release of the guide: (release, the API versions it stopped serving, the kinds, the
+    /// version the guide says to migrate to).
+    type GuideRelease = (u32, &'static [&'static str], &'static [&'static str], Option<&'static str>);
+
+    /// The guide, release by release.
+    const GUIDE: &[GuideRelease] = &[
         (
             32,
             &["flowcontrol.apiserver.k8s.io/v1beta3"],

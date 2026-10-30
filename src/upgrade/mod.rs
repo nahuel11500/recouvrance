@@ -257,7 +257,8 @@ fn assemble(a: Answers) -> Report {
 /// One finding per removed API version and kind, with every object using it and what the
 /// API server's metrics say of it; a metric for an API the table doesn't know is its own.
 fn removed_api_findings(current: u32, target: u32, uses: Vec<Use>, calls: &[DeprecatedCall]) -> Vec<Finding> {
-    let index = |r: &Removal| removed::REMOVALS.iter().position(|o| std::ptr::eq(o, r)).unwrap_or(usize::MAX);
+    // By value: the same entry reached two ways must land in one finding.
+    let index = |r: &Removal| removed::REMOVALS.iter().position(|o| o == r).unwrap_or(usize::MAX);
     let mut by: BTreeMap<usize, (Vec<Object>, Vec<String>)> = BTreeMap::new();
     for (r, o) in uses {
         by.entry(index(r)).or_default().0.push(o);
