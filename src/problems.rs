@@ -145,7 +145,7 @@ pub fn judge(kind: &Kind, defs: &[ColumnDef], row: &Row) -> Option<(Severity, St
 /// Kinds checked, in display order. Namespaces, PersistentVolumes and Argo CD Applications
 /// only for deletions stuck; a kind the cluster doesn't serve is left out. The
 /// external-secrets.io ones are judged from their objects (`external_secrets::problems`).
-/// Services, Ingresses and HTTPRoutes for what they point to that is missing, together
+/// Services, Ingresses and HTTP routes for what they point to that is missing, together
 /// (`references::traffic`).
 pub const CHECKED: [(&str, &str); 16] = [
     ("", "Node"),
@@ -190,7 +190,7 @@ impl Scan {
     }
 
     /// Add another scan's problems and skipped kinds.
-    fn absorb(&mut self, other: Scan) {
+    fn absorb(&mut self, other: Self) {
         self.problems.extend(other.problems);
         self.skipped.extend(other.skipped);
     }

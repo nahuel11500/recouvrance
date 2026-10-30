@@ -4,7 +4,7 @@
 //!
 //! Pods, workloads and PVCs are read only when their row is already a problem (a pod stuck
 //! creating, a Deployment with no ready replica, a PVC pending), and the reason says which
-//! reference is missing. Services, Ingresses and HTTPRoutes are checked whole, with the
+//! reference is missing. Services, Ingresses and HTTP routes are checked whole, with the
 //! Services listed once for the three.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -19,7 +19,7 @@ use serde_json::Value;
 use super::{HELD_PARALLEL, Problem, Scan, Severity, cell, since};
 use crate::k8s::{self, ColumnDef, Kind, Row, Selection};
 
-/// The Gateway API's group, for HTTPRoutes.
+/// The Gateway API's group, for HTTP routes.
 pub(super) const GATEWAY: &str = "gateway.networking.k8s.io";
 
 /// Kinds checked with the Services they point to (`traffic`), not on their own.
@@ -47,39 +47,39 @@ pub enum Of {
 impl Of {
     fn kind(self) -> &'static str {
         match self {
-            Of::ConfigMap => "ConfigMap",
-            Of::Secret => "Secret",
-            Of::Claim => "PersistentVolumeClaim",
-            Of::StorageClass => "StorageClass",
-            Of::ServiceAccount => "ServiceAccount",
-            Of::Service => "Service",
+            Self::ConfigMap => "ConfigMap",
+            Self::Secret => "Secret",
+            Self::Claim => "PersistentVolumeClaim",
+            Self::StorageClass => "StorageClass",
+            Self::ServiceAccount => "ServiceAccount",
+            Self::Service => "Service",
         }
     }
 
     fn plural(self) -> &'static str {
         match self {
-            Of::ConfigMap => "ConfigMaps",
-            Of::Secret => "Secrets",
-            Of::Claim => "PersistentVolumeClaims",
-            Of::StorageClass => "StorageClasses",
-            Of::ServiceAccount => "ServiceAccounts",
-            Of::Service => "Services",
+            Self::ConfigMap => "ConfigMaps",
+            Self::Secret => "Secrets",
+            Self::Claim => "PersistentVolumeClaims",
+            Self::StorageClass => "StorageClasses",
+            Self::ServiceAccount => "ServiceAccounts",
+            Self::Service => "Services",
         }
     }
 
     fn ar(self) -> ApiResource {
         match self {
-            Of::ConfigMap => k8s::ar_of::<core::ConfigMap>(),
-            Of::Secret => k8s::ar_of::<core::Secret>(),
-            Of::Claim => k8s::ar_of::<core::PersistentVolumeClaim>(),
-            Of::StorageClass => k8s::ar_of::<storage::StorageClass>(),
-            Of::ServiceAccount => k8s::ar_of::<core::ServiceAccount>(),
-            Of::Service => k8s::ar_of::<core::Service>(),
+            Self::ConfigMap => k8s::ar_of::<core::ConfigMap>(),
+            Self::Secret => k8s::ar_of::<core::Secret>(),
+            Self::Claim => k8s::ar_of::<core::PersistentVolumeClaim>(),
+            Self::StorageClass => k8s::ar_of::<storage::StorageClass>(),
+            Self::ServiceAccount => k8s::ar_of::<core::ServiceAccount>(),
+            Self::Service => k8s::ar_of::<core::Service>(),
         }
     }
 
     fn namespaced(self) -> bool {
-        self != Of::StorageClass
+        self != Self::StorageClass
     }
 
     /// What a scan says when this kind could not be read.
@@ -322,7 +322,7 @@ async fn lookup(
 }
 
 /// Read the objects of the problems at `which` in `found` and add what they need that
-/// doesn't exist to their reasons ("CreateContainerConfigError: missing ConfigMap app").
+/// doesn't exist to their reasons (`CreateContainerConfigError: missing ConfigMap app`).
 /// Returns what could not be read.
 pub(super) async fn explain(
     client: &Client,
@@ -435,7 +435,7 @@ fn ingress_secrets(ing: &Value) -> Vec<Target> {
 }
 
 /// The port an Ingress backend asks for when the Service doesn't have it: "8080", "named
-/// http". An ExternalName Service forwards elsewhere, on any port.
+/// http". An `ExternalName` Service forwards elsewhere, on any port.
 fn port_missing(service: &Value, port: &Value) -> Option<String> {
     if text(service, "/spec/type") == Some("ExternalName") {
         return None;
@@ -522,9 +522,12 @@ fn problem(kind: &Kind, obj: &Value, severity: Severity, reason: String) -> Opti
     })
 }
 
+/// A problem's severity and reason, if any.
+type Judged = Option<(Severity, String)>;
+
 /// How a Service with no ready endpoint stands, from its pods (listed by its selector): None
 /// when they turn out ready (the Endpoints were behind).
-async fn judge_unserved(client: Client, kind: &Kind, svc: &Value) -> anyhow::Result<Option<(Severity, String)>> {
+async fn judge_unserved(client: Client, kind: &Kind, svc: &Value) -> anyhow::Result<Judged> {
     let (Some(ns), Some(selector)) = (text(svc, "/metadata/namespace"), k8s::pod_selection(kind, svc).list_selector())
     else {
         return Ok(None);
@@ -571,7 +574,7 @@ async fn unserved(client: &Client, kind: &Kind, services: &[Value], namespace: O
     // Collected first, and each future owns what it reads: closures over references held
     // across an await would make the scan's future not `Send` for the agents' server.
     let unready: Vec<Value> = selecting.into_iter().filter(|s| !ready.contains(&key(s))).cloned().collect();
-    let judged: Vec<(Value, anyhow::Result<Option<(Severity, String)>>)> = futures::stream::iter(unready)
+    let judged: Vec<(Value, anyhow::Result<Judged>)> = futures::stream::iter(unready)
         .map(|svc| {
             let (client, kind) = (client.clone(), kind.clone());
             async move {
@@ -624,7 +627,7 @@ pub(super) fn with_services(kinds: &[Kind]) -> (Option<Kind>, Option<Kind>) {
     (kinds.iter().find(|x| x.is(ig, ik)).cloned(), kinds.iter().find(|x| x.is(rg, rk)).cloned())
 }
 
-/// Services that select no pod or no ready one, and Ingresses and HTTPRoutes whose Services
+/// Services that select no pod or no ready one, and Ingresses and HTTP routes whose Services
 /// (or TLS Secrets) are missing, in `namespace` or the whole cluster. A kind the cluster
 /// doesn't serve (`ingress`, `route` None) is left out, and one that can't be read is
 /// skipped alone.
@@ -1000,7 +1003,7 @@ mod tests {
         }
     }
 
-    /// A cluster with Services, their Endpoints and pods, Ingresses and HTTPRoutes in
+    /// A cluster with Services, their Endpoints and pods, Ingresses and HTTP routes in
     /// namespace `app`; records the paths it was asked for.
     #[derive(Clone, Default)]
     struct Cluster(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
