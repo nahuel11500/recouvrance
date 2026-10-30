@@ -120,6 +120,22 @@ pub(crate) fn tone(status: &str) -> Option<Tone> {
     None
 }
 
+/// The tone of a node's Status (kubectl's, with its trouble taints' labels after it, see
+/// `taints`): bad when not Ready, busy when cordoned or tainted, good when only Ready. Not
+/// `tone`: a taint's label holds words ("`CiliumAgentNotReady`") that would read as the
+/// node's own state.
+pub(crate) fn node_tone(status: &str) -> Option<Tone> {
+    let words = || status.split(',').map(str::trim).filter(|w| !w.is_empty());
+    words().next()?;
+    Some(if words().any(|w| matches!(w, "NotReady" | "Unknown")) {
+        Tone::Bad
+    } else if words().all(|w| w == "Ready") {
+        Tone::Good
+    } else {
+        Tone::Busy
+    })
+}
+
 /// Does a good word start `rest` ("readyyet")? Short words must be all of it.
 fn starts_good(rest: &str) -> bool {
     GOOD.iter().any(|g| rest.starts_with(g)) || GOOD_WORDS.contains(&rest)
@@ -262,7 +278,7 @@ pub(crate) fn condition_tone(ty: &str, status: &str) -> Option<Tone> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Tone, condition_tone, node_condition_bad, tone, words};
+    use super::{Tone, condition_tone, node_condition_bad, node_tone, tone, words};
 
     #[test]
     fn condition_tones() {
@@ -305,6 +321,25 @@ mod tests {
     }
 
     #[test]
+    fn node_tones() {
+        let cases: &[(&str, Option<Tone>)] = &[
+            ("Ready", Some(Tone::Good)),
+            ("Ready,SchedulingDisabled", Some(Tone::Busy)),
+            ("Ready,CiliumAgentNotReady", Some(Tone::Busy)),
+            ("Ready,NetworkUnavailable", Some(Tone::Busy)),
+            ("Ready,SchedulingDisabled,ToBeDeleted", Some(Tone::Busy)),
+            ("NotReady", Some(Tone::Bad)),
+            ("NotReady,SchedulingDisabled", Some(Tone::Bad)),
+            ("NotReady,CiliumAgentNotReady", Some(Tone::Bad)),
+            ("Unknown", Some(Tone::Bad)),
+            ("", None),
+        ];
+        for (status, want) in cases {
+            assert_eq!(node_tone(status), *want, "{status:?}");
+        }
+    }
+
+    #[test]
     fn tones() {
         let cases: &[(&str, Option<Tone>)] = &[
             // Good.
@@ -320,7 +355,6 @@ mod tests {
             ("True", Some(Tone::Good)),
             ("OK", Some(Tone::Good)),
             ("Up", Some(Tone::Good)),
-            ("Ready,SchedulingDisabled", Some(Tone::Good)),
             ("MinimumReplicasAvailable", Some(Tone::Good)),
             ("Installed", None),
             // Done and busy.

@@ -68,6 +68,8 @@ pub struct ResourceTable {
     pub pods: bool,
     /// Kind is an Ingress: its hosts open the site.
     pub ingresses: bool,
+    /// Kind is a Node: its Status is colored by `status::node_tone`.
+    pub nodes: bool,
     /// Which write actions the row menu offers for this kind.
     pub row_actions: Vec<&'static str>,
     /// Rows checked for bulk actions: uids by context index (a fast first load's
@@ -114,6 +116,7 @@ impl ResourceTable {
             app_focus: None,
             pods: false,
             ingresses: false,
+            nodes: false,
             row_actions: Vec::new(),
             marked: Default::default(),
             widths: HashMap::new(),
@@ -244,8 +247,8 @@ impl ResourceTable {
         visible_cols: Option<Vec<String>>,
         widths: HashMap<String, f32>,
     ) {
-        let (app_focus, pods, ingresses, row_actions) =
-            (self.app_focus.take(), self.pods, self.ingresses, std::mem::take(&mut self.row_actions));
+        let (app_focus, pods, ingresses, nodes, row_actions) =
+            (self.app_focus.take(), self.pods, self.ingresses, self.nodes, std::mem::take(&mut self.row_actions));
         *self = Self {
             show_namespace,
             contexts,
@@ -253,6 +256,7 @@ impl ResourceTable {
             app_focus,
             pods,
             ingresses,
+            nodes,
             row_actions,
             widths,
             ..Self::new()

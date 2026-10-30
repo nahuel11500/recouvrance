@@ -123,9 +123,14 @@ pub fn judge(kind: &Kind, defs: &[ColumnDef], row: &Row) -> Option<(Severity, St
         }
         ("", "Node") => {
             let status = c("Status");
+            // The labels of the taints that keep pods off it because something is wrong
+            // (`CiliumAgentNotReady`); a new node has some for a moment while it starts.
+            let tainted: Vec<&str> = crate::taints::labels_in(status).collect();
             if status.split(',').any(|s| s == "NotReady" || s == "Unknown") {
                 Some((Severity::Critical, status.into()))
-            } else if status.contains("SchedulingDisabled") {
+            } else if !tainted.is_empty() && older_than(row, 300) {
+                Some((Severity::Warning, format!("tainted {}: no new pods", tainted.join(", "))))
+            } else if status.split(',').any(|s| s == "SchedulingDisabled") {
                 Some((Severity::Info, "cordoned".into()))
             } else {
                 None
@@ -525,6 +530,31 @@ mod tests {
         let d = defs(&["Name", "Status"]);
         assert_eq!(judge(&node, &d, &row(&["n", "Ready,SchedulingDisabled"])).map(|j| j.0), Some(Severity::Info));
         assert_eq!(judge(&node, &d, &row(&["n", "NotReady"])).map(|j| j.0), Some(Severity::Critical));
+        assert_eq!(judge(&node, &d, &row(&["n", "Ready"])), None);
+    }
+
+    #[test]
+    fn tainted_nodes_are_warnings_once_started() {
+        let node = kind("", "Node");
+        let d = defs(&["Name", "Status"]);
+        let at = |status: &str, secs: i64| {
+            let mut r = row(&["n", status]);
+            r.created = ago(secs);
+            judge(&node, &d, &r)
+        };
+        assert_eq!(
+            at("Ready,CiliumAgentNotReady", 3600),
+            Some((Severity::Warning, "tainted CiliumAgentNotReady: no new pods".into()))
+        );
+        assert_eq!(
+            at("Ready,SchedulingDisabled,ToBeDeleted,Disrupted", 3600),
+            Some((Severity::Warning, "tainted ToBeDeleted, Disrupted: no new pods".into()))
+        );
+        // A node starting: its network agent and cloud set-up taints come off in a moment.
+        assert_eq!(at("Ready,CiliumAgentNotReady", 60), None);
+        assert_eq!(at("Ready,SchedulingDisabled,Uninitialized", 60).map(|j| j.0), Some(Severity::Info));
+        // Not ready says more than its taints.
+        assert_eq!(at("NotReady,CiliumAgentNotReady", 3600).map(|j| j.0), Some(Severity::Critical));
     }
 
     /// A cluster that may list nodes and the pods of namespace `a` only, and records
