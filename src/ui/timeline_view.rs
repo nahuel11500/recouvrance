@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gpui_kit::assets::IconName as Lucide;
-use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
@@ -28,7 +28,7 @@ enum Entry {
 impl Entry {
     fn context(&self) -> &str {
         match self {
-            Self::Change(c, _) | Self::Event(c, _) => &**c,
+            Self::Change(c, _) | Self::Event(c, _) => c,
         }
     }
 
@@ -506,8 +506,8 @@ impl Render for TimelineView {
                 contexts = contexts.child(
                     Button::new(("timeline-ctx", i))
                         .xsmall()
-                        .when(on, |b| b.primary())
-                        .when(!on, |b| b.ghost())
+                        .when(on, ButtonVariants::primary)
+                        .when(!on, ButtonVariants::ghost)
                         .label(ctx.clone())
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.context = Some(c.clone());
@@ -525,8 +525,8 @@ impl Render for TimelineView {
                     row.child(
                         Button::new(("timeline-events", i))
                             .xsmall()
-                            .when(v == self.events_shown, |b| b.primary())
-                            .when(v != self.events_shown, |b| b.ghost())
+                            .when(v == self.events_shown, ButtonVariants::primary)
+                            .when(v != self.events_shown, ButtonVariants::ghost)
                             .label(label)
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 if this.events_shown != v {
