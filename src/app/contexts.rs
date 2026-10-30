@@ -125,6 +125,10 @@ impl AppView {
                             this.ns_picker.update(cx, |p, _| p.context = first);
                         }
                         this.client = Some(client);
+                        // Copies of pods left behind by a run of the app that was killed.
+                        for (name, client) in &clusters {
+                            k8s::pod_copy::clean_up(name, client.clone(), crate::settings::cluster(name).namespaces);
+                        }
                         this.clusters = clusters;
                         let keep = this.kind.as_ref().map(Kind::key);
                         let wanted = dev_var("RECOUVRANCE_KIND").and_then(|q| k8s::find_kind(&kinds, &q).cloned());

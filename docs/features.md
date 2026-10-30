@@ -94,6 +94,20 @@
   (`SYS_PTRACE`), none added where Pod Security is `baseline`, and `restricted`'s where it
   requires it. Browsing again reuses one still running; it is greyed out when your RBAC does not
   allow `patch` on `pods/ephemeralcontainers`.
+  A container that isn't running (crash loop, exited, waiting) is read from a **copy of the pod**,
+  after one confirmation that shows the `kubectl debug <pod> --copy-to=… --same-node` equivalent:
+  the same spec and volumes (mounted ConfigMaps and Secrets are there) on the same node, without
+  its labels, annotations, owner references, init containers and probes (no Service sends it
+  traffic, no controller adopts it), every container sleeping instead of starting its app. A
+  distroless image has no `sleep`: an init container copies a static busybox (`busybox:1.37-musl`,
+  or the cluster's node shell image when set) into the copy, at `/.recouvrance-copy`, and the copy
+  runs and is read with it. The copy shows *copy of the pod* next to its files, and says that files
+  the container wrote while it ran are not there (it starts from the image again). It is deleted,
+  by its uid, when the page closes, on its *Delete the copy* button and when the app quits; it
+  stops by itself after an hour, and one left behind (the app killed) is deleted the next time the
+  app connects to its cluster (pods labelled `recouvrance/pod-copy` older than an hour). It needs
+  write mode and RBAC to create and delete pods in the namespace (greyed out with the reason
+  otherwise). Agents' `browse_files` reads running containers only.
 - **RBAC-aware**: actions your Kubernetes RBAC forbids are disabled; *My access* shows a can-i
   matrix for the namespace, and says when the cluster (webhook or cloud IAM authorizer) may allow
   more than it lists.

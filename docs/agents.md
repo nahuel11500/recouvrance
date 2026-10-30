@@ -136,6 +136,8 @@ tools. What some of them need beyond the obvious verb:
   (distroless), `debug: true` reads through a debug container as the Files tab does: it reuses one
   still running that the Files tab or `browse_files` added, else adds one, which stays in the pod's
   spec. That needs `exec` on the pod too, the rule `debug_pod` adds its containers under.
+  Unlike the Files tab, it doesn't make a copy of a pod whose container isn't running (that
+  creates a pod): it says the container isn't running.
 - **Port-forwards:** `port_forward` needs the `forward` verb on the pod or Service (no preset grants
   it): it is a network path into the cluster. It listens on 127.0.0.1 only, for `minutes` (60 by
   default, 8 hours at most), shows in the sidebar's port-forwards with the agent's name, and stops

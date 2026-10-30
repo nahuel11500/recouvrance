@@ -21,6 +21,9 @@ pub mod debug;
 pub enum Origin {
     /// Exec in the container itself: its live filesystem, mounts included.
     Live,
+    /// Exec in a copy of the pod (`pod_copy`): the image's files and the pod's volumes, not
+    /// what the stopped container wrote.
+    Copy,
     /// Exec in a debug container sharing its processes, through `/proc/<pid>/root`: the
     /// same live filesystem, for an image without a shell or tools.
     Debug,
@@ -30,6 +33,7 @@ impl Origin {
     pub fn label(self) -> &'static str {
         match self {
             Self::Live => "live container",
+            Self::Copy => "copy of the pod",
             Self::Debug => "through a debug container",
         }
     }
@@ -68,6 +72,12 @@ impl FileSource {
     pub fn debug(client: Client, ns: String, pod: String, debug: String, pid: u32) -> Self {
         let root = format!("/proc/{pid}/root").into_bytes();
         Self { client, ns, pod, container: Some(debug), root, origin: Origin::Debug }
+    }
+
+    /// Exec in `container` of `copy`, a copy of the pod made by `pod_copy`, with the busybox
+    /// it carries: its image may have no tools of its own.
+    pub fn copy(client: Client, ns: String, copy: String, container: Option<String>) -> Self {
+        Self { client, ns, pod: copy, container, root: Vec::new(), origin: Origin::Copy }
     }
 
     pub fn origin(&self) -> Origin {
@@ -216,10 +226,22 @@ impl FileSource {
             let root = super::shell_quote(&String::from_utf8_lossy(&self.root));
             format!("R={root}\n{IN_ROOT}{script}")
         };
-        let mut command = vec!["sh".to_string(), "-c".into(), script, "sh".into()];
-        command.extend(args);
-        command
+        shell_command(self.origin, script, args)
     }
+}
+
+/// The command that runs `script` with `args` as `$1`…: the container's `sh`, or in a copy
+/// of the pod the busybox it carries, its applets first in `PATH` (exported: `xargs` runs
+/// `stat` through it).
+fn shell_command(origin: Origin, script: String, args: Vec<String>) -> Vec<String> {
+    use super::pod_copy::TOOLS_BIN;
+    let (sh, script) = match origin {
+        Origin::Copy => (format!("{TOOLS_BIN}/sh"), format!("export PATH={TOOLS_BIN}:$PATH\n{script}")),
+        _ => ("sh".to_string(), script),
+    };
+    let mut command = vec![sh, "-c".into(), script, "sh".into()];
+    command.extend(args);
+    command
 }
 
 /// Decodes `$1` (a path passed as `printf %b` escapes) into `$p`. `dec` keeps a trailing
@@ -1035,5 +1057,17 @@ mod tests {
             let entries = parse_listing(&listing(&rows)).unwrap();
             prop_assert_eq!(names(&entries), listed);
         }
+    }
+
+    #[test]
+    fn a_copy_of_the_pod_runs_the_scripts_with_its_busybox() {
+        use super::{Origin, shell_command};
+        use crate::k8s::pod_copy::TOOLS_BIN;
+        let args = vec!["/etc".to_string()];
+        assert_eq!(shell_command(Origin::Live, "ls".into(), args.clone()), ["sh", "-c", "ls", "sh", "/etc"]);
+        let copy = shell_command(Origin::Copy, "ls".into(), args);
+        assert_eq!(copy[0], format!("{TOOLS_BIN}/sh"));
+        assert_eq!(copy[2], format!("export PATH={TOOLS_BIN}:$PATH\nls"));
+        assert_eq!(copy[3..], ["sh", "/etc"]);
     }
 }

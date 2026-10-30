@@ -3,7 +3,9 @@
 //! by name. Every command runs in the container, so like a shell it needs write mode, and
 //! on a protected context its name typed once for the tab. A container without a shell or
 //! the tools is read through a debug container instead (`k8s::files::debug`), offered once
-//! its listing fails.
+//! its listing fails. A container that isn't running is read from a copy of the pod (`copy`).
+
+mod copy;
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -29,6 +31,7 @@ use crate::k8s;
 use crate::k8s::files::debug::{self, Look, Plan};
 use crate::k8s::files::{self, Entry, FileKind, FileSource, Found, Origin, Preview};
 use crate::latest::Latest;
+use copy::CopyState;
 
 /// The most of a file previewed.
 const PREVIEW_BYTES: usize = 256 * 1024;
@@ -50,6 +53,13 @@ pub struct FileBrowser {
     exec_denied: bool,
     /// The API server says this user may not add debug containers to the pod.
     debug_denied: bool,
+    /// The pod as last read: its containers' states, and the spec a copy is made from.
+    pod_read: Option<serde_json::Value>,
+    /// Why RBAC refuses a copy of the pod (create or delete pods), if it does.
+    copy_denied: Option<&'static str>,
+    /// The copy of the pod that stopped containers are read from, and its creation.
+    copy: CopyState,
+    _copy_task: Option<Task<()>>,
     /// The protected context's name was typed (or its wait passed) once for this tab.
     authorized: bool,
     /// A name to search for, or a path to open.
@@ -155,6 +165,10 @@ impl FileBrowser {
             places: HashMap::new(),
             exec_denied: false,
             debug_denied: false,
+            pod_read: None,
+            copy_denied: None,
+            copy: CopyState::None,
+            _copy_task: None,
             authorized: false,
             query,
             preview,
@@ -602,6 +616,9 @@ impl FileBrowser {
 
     /// Before browsing: what will run, and the button that starts.
     fn render_start(&self, cx: &mut Context<Self>) -> AnyElement {
+        if let Some(why) = self.stopped() {
+            return self.render_copy_start(&why, cx);
+        }
         let muted = cx.theme().muted_foreground;
         let target = format!(
             "{}/{}{}",
@@ -816,12 +833,15 @@ impl FileBrowser {
 
     /// Why a listing failed, and a button to try again.
     fn render_error(&self, e: SharedString, dir: Option<Vec<u8>>, cx: &mut Context<Self>) -> AnyElement {
+        // The container stopped meanwhile: offer its copy.
+        let copy = (self.stopped().is_some() && !self.place().is_some_and(Place::read_from_copy))
+            .then(|| self.copy_button(cx));
         v_flex()
             .gap_2()
             .p_2()
             .child(error_box(e, cx))
             .children(self.render_debug(cx))
-            .child(h_flex().child(
+            .child(h_flex().gap_2().children(copy).child(
                 Button::new("files-retry").xsmall().outline().icon(Lucide::RotateCw).label("Try again").on_click(
                     cx.listener(move |this, _, window, cx| {
                         let dir = dir.clone().unwrap_or_else(|| b"/".to_vec());
@@ -1069,6 +1089,7 @@ impl Render for FileBrowser {
             .size_full()
             .gap_2()
             .child(self.render_toolbar(place, cx))
+            .children(self.render_copy_note(place, cx))
             .child(
                 h_flex()
                     .flex_1()

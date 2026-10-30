@@ -423,6 +423,10 @@ impl DetailPanel {
                 let exec =
                     k8s::can_i(client.clone(), kind.clone(), "create", ns.clone(), Some(name.clone()), Some("exec"));
                 checks.push(("exec", exec));
+                // A container that isn't running is read from a copy of the pod, deleted after.
+                checks.push(("copy", k8s::can_i(client.clone(), kind.clone(), "create", ns.clone(), None, None)));
+                checks
+                    .push(("copy-delete", k8s::can_i(client.clone(), kind.clone(), "delete", ns.clone(), None, None)));
             }
             // A ServiceAccount's kubeconfig asks for a token (`create serviceaccounts/token`).
             if kind.is("", "ServiceAccount") {
@@ -451,6 +455,9 @@ impl DetailPanel {
                 if let Some(files) = &this.files {
                     files.update(cx, |f, cx| f.set_exec_denied(denied.contains("exec"), cx));
                     files.update(cx, |f, cx| f.set_debug_denied(denied.contains("debug"), cx));
+                    files.update(cx, |f, cx| {
+                        f.set_copy_denied(denied.contains("copy"), denied.contains("copy-delete"), cx);
+                    });
                 }
                 this.denied = denied;
                 cx.notify();
@@ -925,6 +932,7 @@ impl DetailPanel {
         if let Some(files) = &self.files {
             let (names, default) = (k8s::pod_containers(value), k8s::default_container(value));
             files.update(cx, |f, cx| f.set_containers(names, default, window, cx));
+            files.update(cx, |f, cx| f.set_pod(value, cx));
         }
         let Some(logs) = &self.logs else { return };
         let pods = own_pod_logs(&self.obj.name, value);
