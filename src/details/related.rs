@@ -96,9 +96,15 @@ pub(super) async fn fetch_related(
     kind: &k8s::Kind,
     ns: Option<String>,
     obj: &serde_json::Value,
+    connected: Vec<String>,
 ) -> Related {
     use k8s_openapi::api::{apps::v1 as apps, batch::v1 as batch, core::v1 as core};
     let mut related = Related::default();
+    if kind.is("argoproj.io", "Application") {
+        let dest = k8s::argo::destination_of(obj.clone(), context.to_string(), connected).await;
+        related.argo_destination = Some(dest);
+        return related;
+    }
     if kind.is("", "Node") {
         let name = obj.pointer("/metadata/name").and_then(|v| v.as_str()).unwrap_or_default();
         let pods = k8s::list_values_fields(

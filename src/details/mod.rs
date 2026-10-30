@@ -29,7 +29,7 @@ mod related;
 mod tabs;
 
 pub(crate) use actions::*;
-pub(crate) use argo::OpenOnContext;
+pub(crate) use argo::{ArgoAction, OpenNamespace, OpenOnContext, confirm_argo_action};
 use browser::FileBrowser;
 pub(crate) use compare::diff_block;
 pub(crate) use guard::*;
@@ -667,7 +667,11 @@ impl DetailPanel {
                 let Ok(Some(obj)) = this.update(cx, |this, _| this.object.clone().filter(|_| !this.deleted)) else {
                     break;
                 };
-                let related = fetch_related(client.clone(), &context, &kind, ns.clone(), &obj).await;
+                // Where an Application deploys is shown on a connected context first.
+                let connected: Vec<String> = this
+                    .update(cx, |this, _| this.clusters.iter().map(|(n, _)| n.clone()).collect())
+                    .unwrap_or_default();
+                let related = fetch_related(client.clone(), &context, &kind, ns.clone(), &obj, connected).await;
                 let indexed = obj.clone();
                 let mut related = exec
                     .spawn(async move {
