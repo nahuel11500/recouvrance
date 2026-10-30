@@ -7,7 +7,7 @@ use std::collections::HashSet;
 use std::time::Instant;
 
 use gpui_kit::assets::IconName as Lucide;
-use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::{ActiveTheme as _, Sizable as _, h_flex, v_flex};
@@ -202,11 +202,11 @@ impl Rows {
         let order = tree_order(&parents, |a, b| sort_key(a).cmp(&sort_key(b)));
         let tones: Vec<Tone> = apps.iter().map(|a| argo::attention(&a.app)).collect();
         let (mut children, mut failing) = (vec![0; apps.len()], vec![0; apps.len()]);
-        for i in 0..apps.len() {
+        for (i, tone) in tones.iter().enumerate() {
             if let Some(p) = ancestors(&parents, i).first() {
                 children[*p] += 1;
             }
-            if tones[i] == Tone::Bad {
+            if *tone == Tone::Bad {
                 for p in ancestors(&parents, i) {
                     failing[p] += 1;
                 }
@@ -394,7 +394,7 @@ impl ArgoView {
         let Some(a) = self.find(k).cloned() else { return };
         let view = cx.entity().downgrade();
         let done = move |_: &mut Window, cx: &mut App| {
-            let _ = view.update(cx, |this, cx| this.reload(cx));
+            let _ = view.update(cx, Self::reload);
         };
         confirm_argo_action(&a.hub, &a.app.namespace, &a.app.name, action, done, window, cx);
     }
@@ -536,8 +536,8 @@ impl ArgoView {
         let toggle = |id: &'static str, label: &str, n: usize, on: bool, flip: fn(&mut Filter)| {
             Button::new(id)
                 .small()
-                .when(on, |b| b.primary())
-                .when(!on, |b| b.outline())
+                .when(on, ButtonVariants::primary)
+                .when(!on, ButtonVariants::outline)
                 .label(format!("{label} ({n})"))
                 .on_click(cx.listener(move |this, _, _, cx| this.change_filter(flip, cx)))
         };
@@ -801,7 +801,7 @@ mod tests {
         let problems = Filter { out_of_sync: true, failed: true, ..Default::default() };
         assert!(keeps(&problems, &out_of_sync) && keeps(&problems, &failed));
         assert!(!keeps(&problems, &degraded) && !keeps(&problems, &fine));
-        let shop = Filter { project: Some("shop".into()), ..problems.clone() };
+        let shop = Filter { project: Some("shop".into()), ..problems };
         assert!(keeps(&shop, &out_of_sync) && !keeps(&shop, &failed));
         let elsewhere = Filter { destination: Some("staging".into()), ..Default::default() };
         assert!(!keeps(&elsewhere, &fine));

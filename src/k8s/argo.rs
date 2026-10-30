@@ -1096,7 +1096,7 @@ mod tests {
         ];
         assert_eq!(parents(&apps), [None, Some(0), Some(0), Some(0), None, None, Some(7), None]);
         // The parent's namespace isn't `argocd`: found by its name when only one has it.
-        let mut moved = apps.clone();
+        let mut moved = apps;
         moved[0]["metadata"]["namespace"] = json!("gitops");
         assert_eq!(parents(&moved)[1], Some(0));
     }

@@ -221,7 +221,7 @@ impl DetailPanel {
         let action = if sync { ArgoAction::Sync } else { ArgoAction::Refresh };
         let panel = cx.entity().downgrade();
         let done = move |_: &mut Window, cx: &mut App| {
-            let _ = panel.update(cx, |this, cx| this.reload_argo(cx));
+            let _ = panel.update(cx, Self::reload_argo);
         };
         confirm_argo_action(&found.hub, &found.app.namespace, &found.app.name, action, done, window, cx);
     }

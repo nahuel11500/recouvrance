@@ -168,7 +168,7 @@ pub(super) fn destination(ctx: &Ctx, cx: &App) -> Option<Div> {
                 .hover(Styled::underline)
                 .child(argo::destination_text(context, &dest.namespace))
                 .on_click(move |_, _, cx| {
-                    let _ = panel.update(cx, |p, cx| p.open_destination(cx));
+                    let _ = panel.update(cx, crate::details::DetailPanel::open_destination);
                 })
                 .into_any_element()
         }
