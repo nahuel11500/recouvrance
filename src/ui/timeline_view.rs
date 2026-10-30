@@ -28,7 +28,7 @@ enum Entry {
 impl Entry {
     fn context(&self) -> &str {
         match self {
-            Self::Change(c, _) | Self::Event(c, _) => c,
+            Self::Change(c, _) | Self::Event(c, _) => &**c,
         }
     }
 
@@ -126,11 +126,15 @@ fn parse_filter(input: &str) -> Filter {
     let mut f = Filter::default();
     for word in input.split_whitespace() {
         let word = word.to_lowercase();
-        match word.split_once(':') {
-            Some(("ctx" | "context", v)) if !v.is_empty() => f.context.push(v.into()),
-            Some(("ns" | "namespace", v)) if !v.is_empty() => f.namespace.push(v.into()),
-            Some(("kind", v)) if !v.is_empty() => f.kind.push(v.into()),
-            _ => f.text.push(word),
+        let term = match word.split_once(':') {
+            Some(("ctx" | "context", v)) if !v.is_empty() => Some((&mut f.context, v.to_string())),
+            Some(("ns" | "namespace", v)) if !v.is_empty() => Some((&mut f.namespace, v.to_string())),
+            Some(("kind", v)) if !v.is_empty() => Some((&mut f.kind, v.to_string())),
+            _ => None,
+        };
+        match term {
+            Some((terms, v)) => terms.push(v),
+            None => f.text.push(word),
         }
     }
     f
