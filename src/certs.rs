@@ -26,6 +26,14 @@ pub fn days_ago(t: jiff::Timestamp, now: jiff::Timestamp) -> i64 {
     (now.as_second() - t.as_second()).div_euclid(86400)
 }
 
+/// The certificate a `kubernetes.io/tls` Secret serves: the first in its `tls.crt` chain (the
+/// leaf). None when it holds no certificate.
+pub fn of_tls_secret(secret: &serde_json::Value) -> Option<CertInfo> {
+    use base64::Engine as _;
+    let pem = base64::engine::general_purpose::STANDARD.decode(secret.pointer("/data/tls.crt")?.as_str()?).ok()?;
+    parse_pem(&pem).into_iter().next()
+}
+
 /// Every certificate in a PEM bundle; empty when the text holds none.
 pub fn parse_pem(text: &[u8]) -> Vec<CertInfo> {
     let Ok(blocks) = pem::parse_many(text) else { return Vec::new() };

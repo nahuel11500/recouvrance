@@ -25,6 +25,7 @@ mod workloads;
 
 use access::{binding_page, role_page, service_account_page};
 pub(crate) use config::*;
+pub(crate) use network::same_parent;
 use network::{gateway, ingress, netpol, route, service};
 use nodes::{node, node_allocation, node_devices};
 pub(crate) use pods::*;
@@ -59,6 +60,9 @@ pub struct Related {
     pub crash_logs: Option<(String, String)>,
     /// The `ExternalSecret` a Secret comes from, when one owns it.
     pub external_secret: Option<Value>,
+    /// Where an Argo CD Application deploys, and the context that reaches it (a connected
+    /// one first).
+    pub argo_destination: Option<(k8s::argo::Destination, Option<String>)>,
     /// Roles and bindings, for RBAC and ServiceAccount pages.
     pub rbac: Option<crate::rbac::Snapshot>,
     /// Lists that could not be loaded, by field ("pods", "services"…): "forbidden" or
@@ -397,6 +401,9 @@ fn top(ctx: &Ctx, cx: &App) -> Div {
     } else {
         if kind.is(crate::external_secrets::GROUP, "ExternalSecret") {
             root = root.child(external_secret_page(ctx, cx));
+        }
+        if kind.is("argoproj.io", "Application") {
+            root = root.children(argo::destination(ctx, cx));
         }
         // Anything else (CRDs especially): spec and status as readable fields.
         root = root.child(generic_section("Spec", ctx.obj.get("spec"), cx)).child(generic_section(
