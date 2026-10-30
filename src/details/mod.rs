@@ -27,7 +27,7 @@ mod related;
 mod tabs;
 
 pub(crate) use actions::*;
-pub(crate) use argo::OpenOnContext;
+pub(crate) use argo::{ArgoAction, OpenNamespace, OpenOnContext, confirm_argo_action};
 pub(crate) use guard::*;
 pub(crate) use logs::*;
 use related::{container_history_for, container_names, fetch_related, gpu_history_for, history_for};
@@ -640,7 +640,11 @@ impl DetailPanel {
                 let Ok(Some(obj)) = this.update(cx, |this, _| this.object.clone().filter(|_| !this.deleted)) else {
                     break;
                 };
-                let related = fetch_related(client.clone(), &context, &kind, ns.clone(), &obj).await;
+                // Where an Application deploys is shown on a connected context first.
+                let connected: Vec<String> = this
+                    .update(cx, |this, _| this.clusters.iter().map(|(n, _)| n.clone()).collect())
+                    .unwrap_or_default();
+                let related = fetch_related(client.clone(), &context, &kind, ns.clone(), &obj, connected).await;
                 let indexed = obj.clone();
                 let mut related = exec
                     .spawn(async move {

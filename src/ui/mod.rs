@@ -1,8 +1,9 @@
 //! Pages and widgets that are not the main window's own: settings, agents' helpers,
-//! pickers, terminal, Helm, apply, cluster and workloads overviews.
+//! pickers, terminal, Helm, Argo CD, apply, cluster and workloads overviews.
 
 pub mod access_view;
 pub mod apply_view;
+pub mod argo;
 pub mod assistant_view;
 pub mod cluster;
 pub mod ctx_picker;

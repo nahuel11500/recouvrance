@@ -153,6 +153,35 @@ fn header(ctx: &Ctx, ix: usize, found: &Found, cx: &App) -> Div {
         ))
 }
 
+/// An Application's page: where it deploys, its namespace opening on the context that
+/// reaches its cluster (connected or not).
+pub(super) fn destination(ctx: &Ctx, cx: &App) -> Option<Div> {
+    let (dest, on) = ctx.related.argo_destination.as_ref()?;
+    let muted = cx.theme().muted_foreground;
+    let value: AnyElement = match on {
+        Some(context) if !dest.namespace.is_empty() => {
+            let panel = ctx.panel.clone();
+            div()
+                .id("argo-destination")
+                .text_color(cx.theme().blue)
+                .cursor_pointer()
+                .hover(Styled::underline)
+                .child(argo::destination_text(context, &dest.namespace))
+                .on_click(move |_, _, cx| {
+                    let _ = panel.update(cx, |p, cx| p.open_destination(cx));
+                })
+                .into_any_element()
+        }
+        Some(context) => div().child(context.clone()).into_any_element(),
+        None => h_flex()
+            .gap_2()
+            .child(mono(argo::destination_text(&dest.cluster, &dest.namespace), cx))
+            .child(div().text_xs().text_color(muted).child("no context of your kubeconfig reaches this cluster"))
+            .into_any_element(),
+    };
+    Some(row().pt_4().child(field("Destination", value, cx)))
+}
+
 /// A link's host, for a button's label.
 fn short_url(url: &str) -> String {
     let rest = url.split_once("://").map_or(url, |(_, r)| r);
