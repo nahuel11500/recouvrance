@@ -1,8 +1,10 @@
-//! Cluster overview: capacity, usage, node health and top namespaces, per cluster.
+//! Cluster overview: capacity, usage, node health and top namespaces, per cluster; and the
+//! Upgrade check tab.
 
 use std::collections::HashMap;
 
 use gpui_kit::assets::IconName as Lucide;
+use gpui_kit::component::tab::{Tab, TabBar};
 use gpui_kit::component::{ActiveTheme as _, Icon, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -54,6 +56,10 @@ struct Summary {
 
 pub struct ClusterOverview {
     summaries: Option<Vec<Summary>>,
+    clusters: Vec<(String, Client)>,
+    /// The Upgrade check tab is shown (made the first time it is).
+    upgrade_shown: bool,
+    upgrade: Option<(Entity<crate::ui::upgrade_view::UpgradeView>, Subscription)>,
     _task: Task<()>,
 }
 
@@ -61,6 +67,7 @@ impl EventEmitter<OpenObject> for ClusterOverview {}
 
 impl ClusterOverview {
     pub fn new(clusters: Vec<(String, Client)>, cx: &mut Context<Self>) -> Self {
+        let shown = clusters.clone();
         let task = cx.spawn(async move |this, cx| {
             loop {
                 let exec = cx.background_executor().clone();
@@ -109,7 +116,20 @@ impl ClusterOverview {
                 cx.background_executor().timer(wait).await;
             }
         });
-        Self { summaries: None, _task: task }
+        Self { summaries: None, clusters: shown, upgrade_shown: false, upgrade: None, _task: task }
+    }
+
+    /// Show the overview (0) or the Upgrade check (1), which checks when first shown.
+    fn select_tab(&mut self, ix: usize, cx: &mut Context<Self>) {
+        self.upgrade_shown = ix == 1;
+        if self.upgrade_shown && self.upgrade.is_none() {
+            let clusters = self.clusters.clone();
+            let view = cx.new(|cx| crate::ui::upgrade_view::UpgradeView::new(clusters, cx));
+            // Its links open objects like the overview's.
+            let links = cx.subscribe(&view, |_, _, ev: &OpenObject, cx| cx.emit(ev.clone()));
+            self.upgrade = Some((view, links));
+        }
+        cx.notify();
     }
 }
 
@@ -474,6 +494,29 @@ impl ClusterOverview {
 
 impl Render for ClusterOverview {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let body = match &self.upgrade {
+            Some((view, _)) if self.upgrade_shown => view.clone().into_any_element(),
+            _ => self.overview(cx),
+        };
+        let page = cx.entity().downgrade();
+        v_flex()
+            .size_full()
+            .child(
+                TabBar::new("cluster-tabs")
+                    .underline()
+                    .px_2()
+                    .selected_index(usize::from(self.upgrade_shown))
+                    .children([Tab::new().label("Overview"), Tab::new().label("Upgrade check")])
+                    .on_click(move |ix, _, cx| {
+                        let _ = page.update(cx, |this, cx| this.select_tab(*ix, cx));
+                    }),
+            )
+            .child(div().flex_1().min_h_0().child(body))
+    }
+}
+
+impl ClusterOverview {
+    fn overview(&self, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme().clone();
         let Some(summaries) = &self.summaries else {
             return div()
