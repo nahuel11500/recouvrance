@@ -60,6 +60,7 @@ enum Route {
     Assistant(Entity<crate::ui::assistant_view::AssistantView>),
     Helm(Entity<HelmList>),
     HelmRelease(Entity<HelmRelease>),
+    Argo(Entity<crate::ui::argo::ArgoView>),
     Contexts,
     Settings,
     Terminal(Entity<crate::ui::terminal::TerminalView>),
@@ -267,6 +268,8 @@ pub struct AppView {
     skip_select: Option<usize>,
     /// The contexts and namespace each Workloads or Problems page was built for.
     page_scopes: HashMap<EntityId, (Vec<String>, Vec<String>)>,
+    /// Connecting to a context to open a namespace there (an Application's destination).
+    namespace_open: crate::latest::Latest,
     /// Selected namespaces; empty means all.
     namespaces: Vec<String>,
     filter: Entity<InputState>,
@@ -496,6 +499,7 @@ impl AppView {
             ns_open: false,
             skip_select: None,
             page_scopes: HashMap::new(),
+            namespace_open: Default::default(),
             sidebar_hidden: false,
             problems: problem_badge::ProblemBadge::default(),
             namespaces: Vec::new(),
@@ -600,6 +604,7 @@ impl AppView {
                 let scope = self.namespace_scope();
                 Route::Helm(cx.new(|cx| HelmList::new(scope, window, cx)))
             }
+            Route::Argo(_) => Route::Argo(cx.new(|cx| crate::ui::argo::ArgoView::new(clusters, window, cx))),
             _ => return,
         };
         match &route {
@@ -632,6 +637,7 @@ impl AppView {
                 })
                 .detach(),
             Route::Helm(p) => self.subscribe_helm(p, window, cx),
+            Route::Argo(p) => self.subscribe_argo(p, window, cx),
             _ => return,
         }
         if let Some(slot) = self.history.get_mut(self.pos) {

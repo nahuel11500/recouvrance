@@ -176,6 +176,8 @@ pub struct Deployment {
 pub struct Summary {
     pub name: String,
     pub namespace: String,
+    /// Its Argo CD project (`default` when it names none).
+    pub project: String,
     pub sync: String,
     pub health: String,
     pub health_message: Option<String>,
@@ -264,6 +266,7 @@ impl Summary {
         Self {
             name: s("/metadata/name").unwrap_or_default(),
             namespace: s("/metadata/namespace").unwrap_or_default(),
+            project: s("/spec/project").unwrap_or_else(|| "default".into()),
             sync: s("/status/sync/status").unwrap_or_else(|| "Unknown".into()),
             health: s("/status/health/status").unwrap_or_else(|| "Unknown".into()),
             health_message: s("/status/health/message"),
@@ -320,6 +323,39 @@ pub fn operation_tone(phase: &str) -> Tone {
         "Running" | "Terminating" => Tone::Busy,
         "Failed" | "Error" => Tone::Bad,
         _ => Tone::Done,
+    }
+}
+
+/// An Application's health in a list of them. Missing is what an Application synced by hand
+/// shows for what it has not deployed yet, so it is only wrong when auto-sync is on.
+pub fn listed_health_tone(health: &str, automated: bool) -> Tone {
+    match health {
+        "Missing" if !automated => Tone::Done,
+        _ => health_tone(health),
+    }
+}
+
+/// Whether the last sync failed.
+pub fn sync_failed(app: &Summary) -> bool {
+    app.operation.as_ref().is_some_and(|(phase, _, _)| operation_tone(phase) == Tone::Bad)
+}
+
+/// How an Application reads in a list of them: red for a failed sync, an error Argo CD
+/// reports (a manifest it can't render) or Degraded health; amber while it is on its way or
+/// out of sync with auto-sync on. Out of sync with auto-sync off is never red on its own: it
+/// is how an Application synced by hand (`*-workload`) waits for its next sync.
+pub fn attention(app: &Summary) -> Tone {
+    let error = app.conditions.iter().any(|(ty, _)| ty.ends_with("Error"));
+    let running = app.operation.as_ref().is_some_and(|(phase, _, _)| operation_tone(phase) == Tone::Busy);
+    let health = listed_health_tone(&app.health, app.automated);
+    if sync_failed(app) || error || health == Tone::Bad {
+        Tone::Bad
+    } else if running || health == Tone::Busy || sync_tone(&app.sync, app.automated) == Tone::Busy {
+        Tone::Busy
+    } else if app.sync == "Synced" && health == Tone::Good {
+        Tone::Good
+    } else {
+        Tone::Done
     }
 }
 
@@ -699,6 +735,165 @@ async fn namespace_lookup(connected: Vec<(String, Client)>, here: String, ns: St
     lookup
 }
 
+// MARK: Every Application
+
+/// Where an Application deploys: the kubeconfig's contexts that reach its destination
+/// cluster (several may), and the server URL or cluster name it gives, shown when none does.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Destination {
+    pub contexts: Vec<String>,
+    pub cluster: String,
+    pub namespace: String,
+}
+
+impl Destination {
+    /// The context to show it on and open it with: a connected one first.
+    pub fn context(&self, connected: &[String]) -> Option<&str> {
+        self.contexts.iter().find(|c| connected.contains(c)).or(self.contexts.first()).map(String::as_str)
+    }
+}
+
+/// "cluster / namespace" as shown, the cluster alone for none.
+pub fn destination_text(cluster: &str, namespace: &str) -> String {
+    if namespace.is_empty() { cluster.to_string() } else { format!("{cluster} / {namespace}") }
+}
+
+/// Where an Application read on the hub `hub` deploys, among the contexts `targets`.
+pub fn destination(app: &Value, hub: &ContextTarget, targets: &[ContextTarget]) -> Destination {
+    let dest = |p: &str| app.pointer(p).and_then(Value::as_str).filter(|s| !s.is_empty());
+    let cluster = dest("/spec/destination/server").or_else(|| dest("/spec/destination/name")).unwrap_or_default();
+    Destination {
+        contexts: targets.iter().filter(|t| targets_cluster(app, hub, t)).map(|t| t.name.clone()).collect(),
+        cluster: cluster.to_string(),
+        namespace: dest("/spec/destination/namespace").unwrap_or_default().to_string(),
+    }
+}
+
+/// Where the Application `app`, read on the hub `hub`, deploys, and the context shown for it
+/// (a connected one first). The kubeconfig is read off the UI thread.
+pub async fn destination_of(app: Value, hub: String, connected: Vec<String>) -> (Destination, Option<String>) {
+    let read = super::run(async move {
+        let targets = targets();
+        let dest = destination(&app, &target(&targets, &hub), &targets);
+        let on = dest.context(&connected).map(String::from);
+        Ok((dest, on))
+    });
+    read.await.unwrap_or_default()
+}
+
+/// The Application that made each one (an app of apps), as an index in `apps` (one hub's):
+/// the one its tracking id names, else the one listing it among its resources, else the one
+/// its instance label names (label tracking), when only one has that name.
+pub fn parents(apps: &[Value]) -> Vec<Option<usize>> {
+    fn meta<'a>(app: &'a Value, field: &str) -> &'a str {
+        app.get("metadata").and_then(|m| m.get(field)).and_then(Value::as_str).unwrap_or_default()
+    }
+    let mut by_key: HashMap<(&str, &str), usize> = HashMap::new();
+    let mut by_name: HashMap<&str, Vec<usize>> = HashMap::new();
+    for (i, a) in apps.iter().enumerate() {
+        by_key.insert((meta(a, "namespace"), meta(a, "name")), i);
+        by_name.entry(meta(a, "name")).or_default().push(i);
+    }
+    let only = |name: &str| match by_name.get(name).map(Vec::as_slice) {
+        Some([one]) => Some(*one),
+        _ => None,
+    };
+    // Who lists whom: the first parent found wins.
+    let mut listed: HashMap<(&str, &str), usize> = HashMap::new();
+    for (i, a) in apps.iter().enumerate() {
+        for r in resources(a).filter(|r| r["group"] == "argoproj.io" && r["kind"] == "Application") {
+            let (ns, name) =
+                (r["namespace"].as_str().unwrap_or(DEFAULT_NAMESPACE), r["name"].as_str().unwrap_or_default());
+            listed.entry((ns, name)).or_insert(i);
+        }
+    }
+    apps.iter()
+        .enumerate()
+        .map(|(i, a)| {
+            let key = (meta(a, "namespace"), meta(a, "name"));
+            let tracked = tracking_of("argoproj.io", "Application", a).and_then(|t| {
+                let ns = t.app_ns.as_deref().unwrap_or(DEFAULT_NAMESPACE);
+                // Without `<ns>_`, the parent is in Argo CD's own namespace, which may not be `argocd`.
+                by_key
+                    .get(&(ns, t.app.as_str()))
+                    .copied()
+                    .or_else(|| t.app_ns.is_none().then(|| only(&t.app)).flatten())
+            });
+            let label = || {
+                let name = a.pointer("/metadata/labels").and_then(|l| l.get(INSTANCE_LABEL)).and_then(Value::as_str)?;
+                only(name)
+            };
+            tracked.or_else(|| listed.get(&key).copied()).or_else(label).filter(|p| *p != i)
+        })
+        .collect()
+}
+
+/// One Application of the Applications page.
+#[derive(Clone)]
+pub struct FleetApp {
+    pub hub: Hub,
+    pub app: Summary,
+    pub dest: Destination,
+    /// The context its destination is shown on (a connected one first), if any reaches it.
+    pub on: Option<String>,
+    /// The Application that made it (an app of apps), as an index in the fleet.
+    pub parent: Option<usize>,
+}
+
+/// Every Application of every hub, and why some hubs could not be read.
+#[derive(Clone, Default)]
+pub struct Fleet {
+    pub apps: Vec<FleetApp>,
+    /// "context: why", for each hub not read and each context that could not be checked.
+    pub errors: Vec<String>,
+    /// The hubs found, read or not.
+    pub hubs: Vec<String>,
+}
+
+/// Every Application, read with one list per hub (kept `LIST_TTL`, shared with the pages'
+/// Argo CD sections). One hub that can't be read is reported; the others are shown.
+pub async fn fleet(connected: Vec<(String, Client)>) -> Fleet {
+    super::run(async move { Ok(read_fleet(connected).await) })
+        .await
+        .unwrap_or_else(|e| Fleet { errors: vec![format!("Argo CD could not be read: {e:#}")], ..Default::default() })
+}
+
+async fn read_fleet(connected: Vec<(String, Client)>) -> Fleet {
+    let names: Vec<String> = connected.iter().map(|(n, _)| n.clone()).collect();
+    let hubs = hubs(connected).await;
+    let targets = targets();
+    let lists =
+        futures::future::join_all(hubs.found.iter().map(|hub| async move { (hub, applications(hub).await) })).await;
+    let mut fleet = Fleet {
+        errors: hubs.failed.iter().map(|(c, e)| format!("{c}: {e}")).collect(),
+        hubs: hubs.found.iter().map(|h| h.context.clone()).collect(),
+        ..Default::default()
+    };
+    for (hub, list) in lists {
+        let list = match list {
+            Ok(list) => list,
+            Err(e) => {
+                fleet.errors.push(format!("{}: {}", hub.context, super::lists::load_error(&e)));
+                continue;
+            }
+        };
+        let hub_target = target(&targets, &hub.context);
+        let base = fleet.apps.len();
+        for (app, parent) in list.iter().zip(parents(&list)) {
+            let dest = destination(app, &hub_target, &targets);
+            let on = dest.context(&names).map(String::from);
+            fleet.apps.push(FleetApp {
+                hub: hub.clone(),
+                app: Summary::of(app),
+                dest,
+                on,
+                parent: parent.map(|p| base + p),
+            });
+        }
+    }
+    fleet
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -838,6 +1033,103 @@ mod tests {
         // Auto-sync turned off with `enabled: false` (newer Argo CD).
         let off = json!({"spec": {"syncPolicy": {"automated": {"enabled": false}}}});
         assert!(!Summary::of(&off).automated);
+    }
+
+    #[test]
+    fn a_destination_is_the_contexts_that_reach_its_cluster() {
+        let hub = ctx("mgmt", "https://mgmt.example", None);
+        let targets = vec![
+            hub.clone(),
+            ctx("prod", "https://prod.example:443", None),
+            ctx("prod-admin", "https://PROD.example/", None),
+            ctx("staging", "https://staging.example", None),
+        ];
+        let to = |dest: Value| json!({"spec": {"destination": dest}});
+        let prod = destination(&to(json!({"server": "https://prod.example", "namespace": "shop"})), &hub, &targets);
+        assert_eq!(prod.contexts, ["prod", "prod-admin"]);
+        assert_eq!((prod.cluster.as_str(), prod.namespace.as_str()), ("https://prod.example", "shop"));
+        // A connected context first, else the kubeconfig's first.
+        assert_eq!(prod.context(&["prod-admin".into()]), Some("prod-admin"));
+        assert_eq!(prod.context(&[]), Some("prod"));
+        // Argo CD's own cluster, by URL or by name.
+        let own = destination(&to(json!({"server": IN_CLUSTER, "namespace": "argocd"})), &hub, &targets);
+        assert_eq!(own.contexts, ["mgmt"]);
+        assert_eq!(destination(&to(json!({"name": "in-cluster"})), &hub, &targets).contexts, ["mgmt"]);
+        assert_eq!(destination(&to(json!({"name": "staging-cluster"})), &hub, &targets).contexts, ["staging"]);
+        // A cluster no context reaches keeps what the Application names.
+        let gone = destination(&to(json!({"server": "https://gone.example", "namespace": "x"})), &hub, &targets);
+        assert!(gone.contexts.is_empty() && gone.context(&["prod".into()]).is_none());
+        assert_eq!(gone.cluster, "https://gone.example");
+        assert_eq!(destination_text(&gone.cluster, &gone.namespace), "https://gone.example / x");
+        assert_eq!(destination_text("prod", ""), "prod");
+    }
+
+    #[test]
+    fn applications_are_children_of_the_app_of_apps_that_made_them() {
+        let app = |ns: &str, name: &str, meta: Value, children: &[(&str, &str)]| {
+            let resources: Vec<Value> = children
+                .iter()
+                .map(|(ns, name)| json!({"group": "argoproj.io", "kind": "Application", "namespace": ns, "name": name}))
+                .collect();
+            let mut a = json!({"metadata": {"namespace": ns, "name": name}, "status": {"resources": resources}});
+            if let (Some(m), Some(extra)) = (a["metadata"].as_object_mut(), meta.as_object()) {
+                m.extend(extra.clone());
+            }
+            a
+        };
+        let tracked = |id: &str| json!({"annotations": {TRACKING_ID: id}});
+        let apps = vec![
+            // 0: the app of apps, in Argo CD's namespace; it lists 2 among its resources.
+            app("argocd", "root", json!({}), &[("shop-argo", "shop-workload")]),
+            // 1: made by root, says its tracking id (no `<ns>_`: Argo CD's own namespace).
+            app("shop-argo", "shop-infra", tracked("root:argoproj.io/Application:shop-argo/shop-infra"), &[]),
+            // 2: no tracking id, listed by root.
+            app("shop-argo", "shop-workload", json!({}), &[]),
+            // 3: label tracking.
+            app("data-argo", "data", json!({"labels": {INSTANCE_LABEL: "root"}}), &[]),
+            // 4: a label naming itself, and 5: a tracking id copied from another object.
+            app("data-argo", "self", json!({"labels": {INSTANCE_LABEL: "self"}}), &[]),
+            app("data-argo", "copy", tracked("root:argoproj.io/Application:shop-argo/shop-infra"), &[]),
+            // 6: tracked by an app of apps in another namespace.
+            app("team", "team-app", tracked("team_team-root:argoproj.io/Application:team/team-app"), &[]),
+            app("team", "team-root", json!({}), &[]),
+        ];
+        assert_eq!(parents(&apps), [None, Some(0), Some(0), Some(0), None, None, Some(7), None]);
+        // The parent's namespace isn't `argocd`: found by its name when only one has it.
+        let mut moved = apps;
+        moved[0]["metadata"]["namespace"] = json!("gitops");
+        assert_eq!(parents(&moved)[1], Some(0));
+    }
+
+    #[test]
+    fn red_is_for_failures_not_for_waiting_for_a_manual_sync() {
+        let app = |sync: &str, health: &str, automated: bool, phase: Option<&str>| Summary {
+            sync: sync.into(),
+            health: health.into(),
+            automated,
+            operation: phase.map(|p| (p.to_string(), None, None)),
+            ..Default::default()
+        };
+        // A `*-workload` Application synced by hand: out of sync (and what it adds Missing) is not red.
+        assert_eq!(attention(&app("OutOfSync", "Healthy", false, Some("Succeeded"))), Tone::Done);
+        assert_eq!(attention(&app("OutOfSync", "Missing", false, None)), Tone::Done);
+        assert_eq!(listed_health_tone("Missing", false), Tone::Done);
+        // With auto-sync on, out of sync is on its way; Missing is wrong.
+        assert_eq!(attention(&app("OutOfSync", "Healthy", true, Some("Succeeded"))), Tone::Busy);
+        assert_eq!(attention(&app("OutOfSync", "Missing", true, None)), Tone::Bad);
+        // A failed sync or Degraded health is red, auto-sync or not.
+        assert_eq!(attention(&app("OutOfSync", "Healthy", false, Some("Failed"))), Tone::Bad);
+        assert_eq!(attention(&app("Synced", "Degraded", false, Some("Succeeded"))), Tone::Bad);
+        assert_eq!(attention(&app("Synced", "Healthy", true, Some("Error"))), Tone::Bad);
+        // An error Argo CD reports (manifests it can't render) too; a warning is not.
+        let mut broken = app("Unknown", "Healthy", false, None);
+        broken.conditions = vec![("ComparisonError".into(), "helm template failed".into())];
+        assert_eq!(attention(&broken), Tone::Bad);
+        broken.conditions = vec![("SharedResourceWarning".into(), "shared".into())];
+        assert_eq!(attention(&broken), Tone::Done);
+        assert_eq!(attention(&app("Synced", "Healthy", false, Some("Running"))), Tone::Busy);
+        assert_eq!(attention(&app("Synced", "Healthy", false, Some("Succeeded"))), Tone::Good);
+        assert!(sync_failed(&app("Synced", "Healthy", false, Some("Failed"))));
     }
 
     #[test]

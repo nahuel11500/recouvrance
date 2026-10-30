@@ -88,6 +88,19 @@
   hub, found among the connected clusters, else among other kubeconfig contexts that need no
   separate login; when the hub isn't found, name it with `argocd_contexts` (see
   [configuration](configuration.md#argo-cd-hub-argocd_contexts)).
+- **Argo CD page** (sidebar → *Argo CD*): every Application of every context that serves Argo
+  CD, read with one list per Argo CD cluster: name, project, sync, health, revision, destination
+  (the kubeconfig context whose API server is the Application's `destination.server`, and its
+  namespace), auto-sync, last sync and its result. Applications sit under the app of apps that
+  made them (its tracking id, the parent listing them among its resources, or the instance
+  label), with how many they hold and how many of those are red; groups fold. Filters: out of
+  sync, Degraded, failed sync (any of those picked), project, destination context, and a search.
+  Red is for a failed sync, an error Argo CD reports or Degraded health: an Application with
+  auto-sync off that is out of sync (a `*-workload` one synced by hand) is not red. A click opens
+  the Application's page, which links to its destination namespace (connecting to that context
+  when it isn't); the row menu also opens the destination and asks for *Refresh*, *Hard refresh*
+  or *Sync* (write mode and the Argo CD cluster's protection apply). An Argo CD cluster that
+  can't be read is named above the list; the others are shown.
 - **Overviews**: cluster capacity and health, workloads status, Helm releases (values masked; install from your repos, roll back and uninstall through your `helm` CLI).
 - **API requests** (Settings → API requests): per cluster, how many requests of each kind
   (discovery, lists, watches, metrics, logs, shells, writes) were made, how many failed, and how
@@ -119,7 +132,7 @@
   debug pods with an ephemeral container (falls back to a Pod Security "restricted" profile), run a CronJob now, suspend/resume (CronJobs, Flux, Argo CronWorkflows), drain nodes, force delete
   or remove finalizers (only once the delete leaves it stuck terminating: it already was, or still is
   after 10 seconds), Flux *Reconcile*, Argo CD
-  *Refresh*/*Sync*, create/apply YAML (a server dry run first, then a confirmation listing each
+  *Refresh*/*Hard refresh*/*Sync*, create/apply YAML (a server dry run first, then a confirmation listing each
   object's kind, namespace and name). YAML edits on a detail page save only that object: a changed
   kind, API group, namespace or name is refused, and so are masked Secret values. Every
   confirmation shows the equivalent `kubectl` command. A page whose object is deleted says so and
