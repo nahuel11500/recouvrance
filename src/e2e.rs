@@ -926,6 +926,57 @@ fn an_agent_finds_a_pod_s_missing_config_map() {
     });
 }
 
+/// The reachability check reads the real cluster through the agent's rules: a Service that
+/// selects no pods breaks at its selector, an Ingress sending to a port its Service lacks
+/// breaks at that backend, and the TLS Secret the rules hide is not read.
+#[test]
+#[ignore]
+fn an_agent_checks_why_a_service_does_not_answer() {
+    use k8s_openapi::api::core::v1::Service;
+    use k8s_openapi::api::networking::v1::Ingress;
+
+    run(async {
+        let ctx = context();
+        let client = k8s::connect_for_agents(ctx.clone()).await?;
+        let services: Api<Service> = Api::namespaced(client.clone(), NS);
+        let ingresses: Api<Ingress> = Api::namespaced(client, NS);
+        let name = "e2e-reach";
+        let _ = services.delete(name, &DeleteParams::default()).await;
+        let _ = ingresses.delete(name, &DeleteParams::default()).await;
+        let svc = json!({
+            "metadata": {"name": name, "namespace": NS},
+            "spec": {"selector": {"app": "e2e-reach-none"}, "ports": [{"name": "http", "port": 80, "targetPort": "http"}]},
+        });
+        let ing = json!({
+            "metadata": {"name": name, "namespace": NS},
+            "spec": {
+                "tls": [{"hosts": ["e2e.example"], "secretName": "e2e-reach-tls"}],
+                "rules": [{"host": "e2e.example", "http": {"paths": [{"path": "/", "pathType": "Prefix",
+                    "backend": {"service": {"name": name, "port": {"number": 81}}}}]}}],
+            },
+        });
+        services.create(&PostParams::default(), &serde_json::from_value(svc)?).await?;
+        ingresses.create(&PostParams::default(), &serde_json::from_value(ing)?).await?;
+        let checked = async {
+            let (hub, _agent, token, _server) = agent(&["get,list *"], &["* secrets"]).await?;
+            let mcp = crate::assistant::Mcp::connect(hub.port(), token).await?;
+            let args = |kind: &str| json!({"context": ctx, "kind": kind, "namespace": NS, "name": name});
+            let out = mcp.call("check_reachability", args("services")).await;
+            assert!(out.contains("[BROKEN] Selects no pods"), "{out}");
+            let out = mcp.call("check_reachability", args("ingresses")).await;
+            assert!(out.contains("has no port 81"), "{out}");
+            assert!(out.contains(crate::reachability::NOT_ALLOWED), "{out}");
+            let out = mcp.call("check_reachability", args("configmaps")).await;
+            assert!(out.contains("takes a Service, an Ingress or an HTTPRoute"), "{out}");
+            Ok(())
+        };
+        let result: Result<()> = checked.await;
+        services.delete(name, &DeleteParams::default()).await?;
+        ingresses.delete(name, &DeleteParams::default()).await?;
+        result
+    });
+}
+
 /// The Files tab reads a container through exec, so write mode gates it like a shell: off,
 /// the UI's client refuses the listing; on, `/etc` lists, and names with spaces, newlines
 /// and non-UTF-8 bytes come back whole, a file previews and a search finds it, with
