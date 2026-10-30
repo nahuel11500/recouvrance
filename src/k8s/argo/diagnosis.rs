@@ -754,7 +754,10 @@ fn same_scalar(a: &Value, l: &Value, path: &[Seg]) -> bool {
         (Value::Number(x), Value::Number(y)) => x.as_f64() == y.as_f64(),
         (Value::String(x), Value::String(y)) => holds_quantities(path) && crate::quantity::same_amount(x, y),
         (Value::String(x), other @ (Value::Number(_) | Value::Bool(_)))
-        | (other @ (Value::Number(_) | Value::Bool(_)), Value::String(x)) => *x == other.to_string(),
+        | (other @ (Value::Number(_) | Value::Bool(_)), Value::String(x)) => {
+            // `"80"` set, `80` kept (an int-or-string field), or the other way round.
+            serde_json::from_str::<Value>(x).is_ok_and(|parsed| parsed == *other)
+        }
         _ => false,
     }
 }
@@ -801,36 +804,33 @@ fn walk(a: &Value, l: Option<&Value>, path: &mut Vec<Seg>, out: &mut Vec<FieldDi
                 }
                 return;
             }
-            match list_key(items) {
-                Some(key) => {
-                    for item in items {
-                        let value = item[key].clone();
-                        let there = live_items.iter().find(|li| li.get(key) == Some(&value));
-                        path.push(Seg::Item { key: key.to_string(), value });
-                        walk(item, there, path, out);
-                        path.pop();
-                    }
-                    // Added by something else: a webhook's sidecar, a controller's entry.
-                    for li in live_items {
-                        let Some(value) = li.get(key).filter(|v| !v.is_null()) else { continue };
-                        if !items.iter().any(|i| i.get(key) == Some(value)) {
-                            path.push(Seg::Item { key: key.to_string(), value: value.clone() });
-                            out.push(FieldDiff { path: path.clone(), applied: None, live: Some(li.clone()) });
-                            path.pop();
-                        }
-                    }
+            if let Some(key) = list_key(items) {
+                for item in items {
+                    let value = item[key].clone();
+                    let there = live_items.iter().find(|li| li.get(key) == Some(&value));
+                    path.push(Seg::Item { key: key.to_string(), value });
+                    walk(item, there, path, out);
+                    path.pop();
                 }
-                None => {
-                    for (i, item) in items.iter().enumerate() {
-                        path.push(Seg::Index(i));
-                        walk(item, live_items.get(i), path, out);
-                        path.pop();
-                    }
-                    for (i, li) in live_items.iter().enumerate().skip(items.len()) {
-                        path.push(Seg::Index(i));
+                // Added by something else: a webhook's sidecar, a controller's entry.
+                for li in live_items {
+                    let Some(value) = li.get(key).filter(|v| !v.is_null()) else { continue };
+                    if !items.iter().any(|i| i.get(key) == Some(value)) {
+                        path.push(Seg::Item { key: key.to_string(), value: value.clone() });
                         out.push(FieldDiff { path: path.clone(), applied: None, live: Some(li.clone()) });
                         path.pop();
                     }
+                }
+            } else {
+                for (i, item) in items.iter().enumerate() {
+                    path.push(Seg::Index(i));
+                    walk(item, live_items.get(i), path, out);
+                    path.pop();
+                }
+                for (i, li) in live_items.iter().enumerate().skip(items.len()) {
+                    path.push(Seg::Index(i));
+                    out.push(FieldDiff { path: path.clone(), applied: None, live: Some(li.clone()) });
+                    path.pop();
                 }
             }
         }
@@ -1055,8 +1055,11 @@ pub struct DriftRead {
 /// One group's kinds on a context, as discovery gave them.
 type GroupKinds = Arc<Vec<(ApiResource, bool)>>;
 
+/// Each group's kinds by (context, group), with when they were discovered.
+type Groups = HashMap<(String, String), (Instant, GroupKinds)>;
+
 /// Each context's groups, discovered when first needed.
-static GROUPS: LazyLock<Mutex<HashMap<(String, String), (Instant, GroupKinds)>>> = LazyLock::new(Default::default);
+static GROUPS: LazyLock<Mutex<Groups>> = LazyLock::new(Default::default);
 
 /// The kinds of one API group on a context (every version), discovered once a while.
 async fn group_kinds(client: &Client, context: &str, group: &str) -> anyhow::Result<GroupKinds> {
@@ -1292,7 +1295,7 @@ mod tests {
         assert_eq!(d.to_compare, [deployment()]);
         assert!(d.looping.is_empty());
         // With auto-sync on, the same is something to look at.
-        let mut auto = app.clone();
+        let mut auto = app;
         auto["spec"]["syncPolicy"]["automated"] = json!({"selfHeal": true});
         assert_eq!(Diagnosis::of(&auto, now()).findings[0].tone, Tone::Busy);
     }
@@ -1400,7 +1403,7 @@ mod tests {
         );
         assert_eq!(f.objects[0].0.label(), "PersistentVolumeClaim shop/data");
         // Just asked: on its way, not held yet.
-        let mut fresh = app.clone();
+        let mut fresh = app;
         fresh["metadata"]["deletionTimestamp"] = json!("2026-10-30T11:59:00Z");
         assert_eq!(Diagnosis::of(&fresh, now()).findings[0].tone, Tone::Busy);
     }
@@ -1497,7 +1500,7 @@ mod tests {
         assert_eq!(json_pointer(&fields[1].path), None);
         assert_eq!(jq_path(&fields[1].path), ".spec.template.spec.containers[] | select(.name == \"istio-proxy\")");
         // A field removed live, an image changed in place.
-        let mut changed = live.clone();
+        let mut changed = live;
         changed["spec"]["template"]["spec"]["containers"][0]["image"] = json!("web:2");
         changed["metadata"]["labels"] = json!({});
         let paths: Vec<String> = compare(&applied, &changed).iter().map(|f| path_text(&f.path)).collect();
@@ -1537,7 +1540,7 @@ mod tests {
         assert!(snippet.contains("- /spec/replicas"), "{snippet}");
         assert!(snippet.contains("RespectIgnoreDifferences=true"), "{snippet}");
         // Applied server side: no copy, only who wrote since; ignored by manager.
-        let mut ssa = live.clone();
+        let mut ssa = live;
         ssa["metadata"]["annotations"] = json!({});
         ssa["metadata"]["managedFields"][0]["operation"] = json!("Apply");
         let d = drift_of(&deployment(), &ssa, Some(since));
