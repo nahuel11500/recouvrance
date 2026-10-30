@@ -555,55 +555,6 @@ mod tests {
         assert_eq!(drag(cx, (7., 90.), (7., 90.)), "");
     }
 
-    // TEMPORARY: measures what selectable text costs a frame; removed before review.
-    struct Many(usize, bool);
-
-    impl Render for Many {
-        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-            let (n, sel) = (self.0, self.1);
-            div().size_full().child(TextSelectionLayer).flex().flex_wrap().children((0..n).map(move |i| {
-                let cell = div().w(px(60.)).h(px(16.));
-                if sel { cell.child(selectable(format!("t{i}"))) } else { cell.child(format!("t{i}")) }
-            }))
-        }
-    }
-
-    #[gpui_kit::test]
-    fn zz_measure_cost(cx: &mut TestAppContext) {
-        cx.update(gpui_kit::init);
-        let mut report = String::new();
-        for n in [100usize, 300, 600] {
-            for sel in [false, true] {
-                let (_, vcx) = cx.add_window_view(move |_, _| Many(n, sel));
-                let vcx: &mut VisualTestContext = vcx;
-                vcx.update(|window, cx| drop(window.draw(cx)));
-                let time = |vcx: &mut VisualTestContext| {
-                    let start = std::time::Instant::now();
-                    for _ in 0..10 {
-                        vcx.update(|window, cx| {
-                            window.refresh();
-                            drop(window.draw(cx));
-                        });
-                    }
-                    start.elapsed() / 10
-                };
-                let idle = time(vcx);
-                vcx.simulate_mouse_down(point(px(1.), px(5.)), MouseButton::Left, Modifiers::default());
-                vcx.simulate_mouse_move(point(px(500.), px(40.)), Some(MouseButton::Left), Modifiers::default());
-                let dragging = time(vcx);
-                let during = vcx.update(|window, cx| TextSelection::selected_text(window, cx).len());
-                vcx.simulate_mouse_up(point(px(500.), px(40.)), MouseButton::Left, Modifiers::default());
-                let selected = time(vcx);
-                let chars = vcx.update(|window, cx| TextSelection::selected_text(window, cx).len());
-                report.push_str(&format!(
-                    "n={n} selectable={sel}: frame {idle:?}, dragging {dragging:?} ({during} bytes), \
-                     with a selection {selected:?} ({chars} bytes)\n"
-                ));
-            }
-        }
-        panic!("MEASURE\n{report}");
-    }
-
     #[test]
     fn a_click_is_not_a_drag() {
         let click = |from: f32, to: f32| {
