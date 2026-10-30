@@ -537,7 +537,7 @@ impl ArgoView {
             Button::new(id)
                 .small()
                 .when(on, ButtonVariants::primary)
-                .when(!on, ButtonVariants::outline)
+                .when(!on, Button::outline)
                 .label(format!("{label} ({n})"))
                 .on_click(cx.listener(move |this, _, _, cx| this.change_filter(flip, cx)))
         };
