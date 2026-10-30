@@ -834,8 +834,8 @@ impl FileBrowser {
     /// Why a listing failed, and a button to try again.
     fn render_error(&self, e: SharedString, dir: Option<Vec<u8>>, cx: &mut Context<Self>) -> AnyElement {
         // The container stopped meanwhile: offer its copy.
-        let copy =
-            (self.stopped().is_some() && !self.place().is_some_and(Place::from_copy)).then(|| self.copy_button(cx));
+        let copy = (self.stopped().is_some() && !self.place().is_some_and(Place::read_from_copy))
+            .then(|| self.copy_button(cx));
         v_flex()
             .gap_2()
             .p_2()

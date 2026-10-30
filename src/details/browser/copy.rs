@@ -30,7 +30,7 @@ pub(super) enum CopyState {
 
 impl Place {
     /// Read from the copy of the pod: the container wasn't running.
-    pub(super) fn from_copy(&self) -> bool {
+    pub(super) fn read_from_copy(&self) -> bool {
         self.source.as_ref().is_some_and(|s| s.origin() == Origin::Copy)
     }
 }
@@ -181,7 +181,7 @@ impl FileBrowser {
             pod_copy::delete(copy);
         }
         self._copy_task = None;
-        self.places.retain(|_, p| !p.from_copy());
+        self.places.retain(|_, p| !p.read_from_copy());
         self.previewed = None;
         cx.notify();
     }
@@ -246,7 +246,7 @@ impl FileBrowser {
     /// Above a container read from the copy: what it is, and what it is not.
     pub(super) fn render_copy_note(&self, place: &Place, cx: &mut Context<Self>) -> Option<AnyElement> {
         let CopyState::Ready(copy) = &self.copy else { return None };
-        if !place.from_copy() {
+        if !place.read_from_copy() {
             return None;
         }
         let theme = cx.theme().clone();

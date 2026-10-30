@@ -1317,7 +1317,8 @@ fn a_stopped_container_is_read_from_a_copy_of_its_pod() {
             let etc = source.list(b"/etc").await?;
             assert!(etc.iter().any(|e| e.name == b"passwd"), "the image's own files are not there: {etc:?}");
             let found = source.find(b"/etc/app", "GREET").await?;
-            assert_eq!(found.paths, [b"/etc/app/greeting".to_vec()]);
+            // The ConfigMap's link, and the file it leads to in its timestamped folder.
+            assert!(found.paths.contains(&b"/etc/app/greeting".to_vec()), "{:?}", found.paths);
 
             // Deleted even with write mode off (the page closed after it was turned off).
             gate::set_ui_writes(false);
