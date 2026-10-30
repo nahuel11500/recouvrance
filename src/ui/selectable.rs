@@ -13,8 +13,7 @@ use std::rc::Rc;
 
 use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::base::{
-    TextSelection, TextSelectionCoverage, TextSelectionHandle, TextSelectionRegistration, TextSelectionRun,
-    TextSelectionSnapshot,
+    TextSelection, TextSelectionHandle, TextSelectionRegistration, TextSelectionRun, TextSelectionSnapshot,
 };
 use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::component::menu::{PopupMenu, PopupMenuItem};
@@ -276,7 +275,7 @@ impl Participant {
         let mut copied = self.copied.borrow_mut();
         copied.clear();
         if shortened {
-            if selection.is_some_and(|s| covers_text(&s)) {
+            if selection.is_some_and(|s| covers(&s, bounds)) {
                 window.paint_quad(fill(bounds, color));
                 copied.push_str(text);
             }
@@ -289,11 +288,13 @@ impl Participant {
     }
 }
 
-/// Whether a selection that reaches a participant covers some of it, rather than being a
-/// click on it (both ends at the same point).
-fn covers_text(selection: &TextSelectionSnapshot) -> bool {
-    selection.coverage() != TextSelectionCoverage::Bounded
-        || selection.anchor().content_point() != selection.cursor().content_point()
+/// Whether a selection that reaches a text drawn at `bounds` covers some of it: the lines it
+/// spans cross the text, and it is not a click (both ends at the same point). A participant
+/// can be in a selection's order without being under it (another pane's text).
+fn covers(selection: &TextSelectionSnapshot, bounds: Bounds<Pixels>) -> bool {
+    let Some(points) = selection.window_points() else { return false };
+    let (anchor, cursor) = (points.anchor(), points.cursor());
+    anchor != cursor && bounds.bottom() > anchor.y.min(cursor.y) && bounds.top() <= anchor.y.max(cursor.y)
 }
 
 /// Each window's selectable texts, so that a text keeps its participant from one frame to
@@ -501,7 +502,7 @@ mod tests {
     impl Render for Many {
         fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
             let (n, sel) = (self.0, self.1);
-            div().size_full().flex().flex_wrap().children((0..n).map(move |i| {
+            div().size_full().child(TextSelectionLayer).flex().flex_wrap().children((0..n).map(move |i| {
                 let cell = div().w(px(60.)).h(px(16.));
                 if sel { cell.child(selectable(format!("t{i}"))) } else { cell.child(format!("t{i}")) }
             }))

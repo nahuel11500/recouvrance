@@ -201,6 +201,5 @@
 | g then p / o / w / h / i / s | Go to Problems / Cluster overview / Workloads overview / Helm / Assistant / Settings |
 | ? | List the keyboard shortcuts |
 | Right-click a row | Open, logs, shell, YAML, events, copy name, favorite |
-| Drag, then Ctrl+C or right-click | Copy the text selected on a detail page |
 
 Single keys (?, g, j, k) work when no text field or terminal has focus; `?` lists every shortcut.
