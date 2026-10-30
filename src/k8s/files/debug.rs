@@ -265,7 +265,7 @@ mod tests {
         assert!(p.name.starts_with(PREFIX));
     }
 
-    /// `general` adds SYS_PTRACE, `baseline` nothing, `restricted` what it requires, never
+    /// `general` adds `SYS_PTRACE`, `baseline` nothing, `restricted` what it requires, never
     /// as root; all as the container's user.
     #[test]
     fn profiles_follow_pod_security() {
