@@ -1,7 +1,10 @@
 //! The Files tab of a pod: a container's filesystem as a folder tree, read through exec
 //! (`k8s::files`). Open folders, preview a text file, download a file or a folder, search
 //! by name. Every command runs in the container, so like a shell it needs write mode, and
-//! on a protected context its name typed once for the tab.
+//! on a protected context its name typed once for the tab. A container that isn't running
+//! is read from a copy of the pod (`copy`).
+
+mod copy;
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -26,6 +29,7 @@ use super::tabs::error_box;
 use crate::k8s;
 use crate::k8s::files::{self, Entry, FileKind, FileSource, Found, Preview};
 use crate::latest::Latest;
+use copy::CopyState;
 
 /// The most of a file previewed.
 const PREVIEW_BYTES: usize = 256 * 1024;
@@ -45,6 +49,13 @@ pub struct FileBrowser {
     places: HashMap<String, Place>,
     /// The API server says this user may not exec in the pod.
     exec_denied: bool,
+    /// The pod as last read: its containers' states, and the spec a copy is made from.
+    pod_read: Option<serde_json::Value>,
+    /// Why RBAC refuses a copy of the pod (create or delete pods), if it does.
+    copy_denied: Option<&'static str>,
+    /// The copy of the pod that stopped containers are read from, and its creation.
+    copy: CopyState,
+    _copy_task: Option<Task<()>>,
     /// The protected context's name was typed (or its wait passed) once for this tab.
     authorized: bool,
     /// A name to search for, or a path to open.
@@ -73,6 +84,8 @@ struct Place {
     list_load: Latest,
     preview_load: Latest,
     search_load: Latest,
+    /// Read from the copy of the pod: the container wasn't running.
+    copy: bool,
 }
 
 impl Place {
@@ -129,6 +142,10 @@ impl FileBrowser {
             _container_sub: None,
             places: HashMap::new(),
             exec_denied: false,
+            pod_read: None,
+            copy_denied: None,
+            copy: CopyState::None,
+            _copy_task: None,
             authorized: false,
             query,
             preview,
@@ -204,6 +221,9 @@ impl FileBrowser {
     }
 
     fn source(&self) -> FileSource {
+        if let Some(source) = self.copy_source(self.place()) {
+            return source;
+        }
         FileSource::exec(self.client.clone(), self.ns.clone(), self.pod.clone(), self.container.clone())
     }
 
@@ -457,6 +477,9 @@ impl FileBrowser {
 
     /// Before browsing: what will run, and the button that starts.
     fn render_start(&self, cx: &mut Context<Self>) -> AnyElement {
+        if let Some(why) = self.stopped() {
+            return self.render_copy_start(&why, cx);
+        }
         let muted = cx.theme().muted_foreground;
         let target = format!(
             "{}/{}{}",
@@ -671,11 +694,13 @@ impl FileBrowser {
 
     /// Why a listing failed, and a button to try again.
     fn render_error(&self, e: SharedString, dir: Option<Vec<u8>>, cx: &mut Context<Self>) -> AnyElement {
+        // The container stopped meanwhile: offer its copy.
+        let copy = (self.stopped().is_some() && !self.place().is_some_and(|p| p.copy)).then(|| self.copy_button(cx));
         v_flex()
             .gap_2()
             .p_2()
             .child(error_box(e, cx))
-            .child(h_flex().child(
+            .child(h_flex().gap_2().children(copy).child(
                 Button::new("files-retry").xsmall().outline().icon(Lucide::RotateCw).label("Try again").on_click(
                     cx.listener(move |this, _, window, cx| {
                         let dir = dir.clone().unwrap_or_else(|| b"/".to_vec());
@@ -856,6 +881,7 @@ impl Render for FileBrowser {
             .size_full()
             .gap_2()
             .child(self.render_toolbar(place, cx))
+            .children(self.render_copy_note(place, cx))
             .child(
                 h_flex()
                     .flex_1()

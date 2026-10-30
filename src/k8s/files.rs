@@ -19,12 +19,16 @@ use super::exec::{MAX_EXEC_OUTPUT, ended_reason, exec_to, save_download};
 pub enum Origin {
     /// Exec in the container itself: its live filesystem, mounts included.
     Live,
+    /// Exec in a copy of the pod (`pod_copy`): the image's files and the pod's volumes, not
+    /// what the stopped container wrote.
+    Copy,
 }
 
 impl Origin {
     pub fn label(self) -> &'static str {
         match self {
             Self::Live => "live container",
+            Self::Copy => "copy of the pod",
         }
     }
 }
@@ -55,6 +59,12 @@ impl FileSource {
     /// Exec in `container` of the pod (its default one when none is named).
     pub fn exec(client: Client, ns: String, pod: String, container: Option<String>) -> Self {
         Self { client, ns, pod, container, root: Vec::new(), origin: Origin::Live }
+    }
+
+    /// Exec in `container` of `copy`, a copy of the pod made by `pod_copy`, with the busybox
+    /// it carries: its image may have no tools of its own.
+    pub fn copy(client: Client, ns: String, copy: String, container: Option<String>) -> Self {
+        Self { client, ns, pod: copy, container, root: Vec::new(), origin: Origin::Copy }
     }
 
     pub fn origin(&self) -> Origin {
@@ -141,8 +151,7 @@ impl FileSource {
         } else {
             (format!("{DECODE}exec cat -- \"$p\"\n"), vec![sh_arg(&real)], format!("{}-{base}", self.pod))
         };
-        let mut command = vec!["sh".to_string(), "-c".into(), script, "sh".into()];
-        command.extend(args);
+        let command = shell_command(self.origin, script, args);
         let (client, ns, pod, container) =
             (self.client.clone(), self.ns.clone(), self.pod.clone(), self.container.clone());
         super::run_abortable(
@@ -154,8 +163,7 @@ impl FileSource {
     /// Run `script` with `args` (as `$1`…), and return what it printed: at most `max`
     /// bytes (more is an error), within `secs`.
     async fn script(&self, script: String, args: Vec<String>, max: u64, secs: u64) -> Result<Vec<u8>> {
-        let mut command = vec!["sh".to_string(), "-c".into(), script, "sh".into()];
-        command.extend(args);
+        let command = shell_command(self.origin, script, args);
         let (client, ns, pod, container) =
             (self.client.clone(), self.ns.clone(), self.pod.clone(), self.container.clone());
         // Abortable: a newer listing replacing this one ends the command in the container.
@@ -174,6 +182,20 @@ impl FileSource {
         })
         .await
     }
+}
+
+/// The command that runs `script` with `args` as `$1`…: the container's `sh`, or in a copy
+/// of the pod the busybox it carries, its applets first in `PATH` (exported: `xargs` runs
+/// `stat` through it).
+fn shell_command(origin: Origin, script: String, args: Vec<String>) -> Vec<String> {
+    use super::pod_copy::TOOLS_BIN;
+    let (sh, script) = match origin {
+        Origin::Copy => (format!("{TOOLS_BIN}/sh"), format!("export PATH={TOOLS_BIN}:$PATH\n{script}")),
+        _ => ("sh".to_string(), script),
+    };
+    let mut command = vec![sh, "-c".into(), script, "sh".into()];
+    command.extend(args);
+    command
 }
 
 /// Decodes `$1` (a path passed as `printf %b` escapes) into `$p`. `dec` keeps a trailing
@@ -919,5 +941,17 @@ mod tests {
             let entries = parse_listing(&listing(&rows)).unwrap();
             prop_assert_eq!(names(&entries), listed);
         }
+    }
+
+    #[test]
+    fn a_copy_of_the_pod_runs_the_scripts_with_its_busybox() {
+        use super::{Origin, shell_command};
+        use crate::k8s::pod_copy::TOOLS_BIN;
+        let args = vec!["/etc".to_string()];
+        assert_eq!(shell_command(Origin::Live, "ls".into(), args.clone()), ["sh", "-c", "ls", "sh", "/etc"]);
+        let copy = shell_command(Origin::Copy, "ls".into(), args);
+        assert_eq!(copy[0], format!("{TOOLS_BIN}/sh"));
+        assert_eq!(copy[2], format!("export PATH={TOOLS_BIN}:$PATH\nls"));
+        assert_eq!(copy[3..], ["sh", "/etc"]);
     }
 }

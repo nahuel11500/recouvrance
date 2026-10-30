@@ -370,7 +370,7 @@ async fn start_node_shell(client: Client, node: String, image: String, dry_run: 
 
 /// A create that failed with this error may still have stored the object: only a refusal
 /// (a 4xx other than a conflict) says for sure it did not.
-fn may_have_stored(e: &kube::Error) -> bool {
+pub(super) fn may_have_stored(e: &kube::Error) -> bool {
     !matches!(e, kube::Error::Api(s) if (400..500).contains(&s.code) && s.code != 409)
 }
 

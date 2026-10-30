@@ -951,3 +951,131 @@ fn the_files_tab_reads_a_container() {
         result
     });
 }
+
+/// The copies of pods in the test namespace.
+async fn pod_copies(pods: &Api<k8s_openapi::api::core::v1::Pod>) -> Result<Vec<k8s_openapi::api::core::v1::Pod>> {
+    let lp = kube::api::ListParams::default().labels(&format!("{}=true", k8s::pod_copy::LABEL));
+    Ok(pods.list(&lp).await?.items)
+}
+
+/// Wait until pod `name` is gone.
+async fn pod_gone(pods: &Api<k8s_openapi::api::core::v1::Pod>, name: &str) -> Result<()> {
+    for _ in 0..60 {
+        if pods.get_opt(name).await?.is_none() {
+            return Ok(());
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+    bail!("{name} is still there")
+}
+
+/// A container that isn't running is read from a copy of its pod: a crash-looping
+/// distroless pod (no shell, no `sleep`) is copied with write mode on only, the copy runs the
+/// busybox it carries, the pod's ConfigMap is mounted in it, and nothing selects it. The copy
+/// is deleted even with write mode off, and one left behind (the app killed) is deleted by
+/// the sweep run when the app connects again.
+#[test]
+#[ignore]
+fn a_stopped_container_is_read_from_a_copy_of_its_pod() {
+    use k8s_openapi::api::core::v1::Pod;
+
+    use crate::k8s::files::{FileSource, Origin};
+    use crate::k8s::pod_copy;
+
+    const NAME: &str = "e2e-files-crash";
+    const CONFIG: &str = "e2e-files-crash-config";
+    const BUSYBOX: &str = "busybox:1.37";
+
+    run(async {
+        let ctx = context();
+        let truth = k8s::connect_for_agents(ctx.clone()).await?;
+        let pods: Api<Pod> = Api::namespaced(truth.clone(), NS);
+        let maps: Api<ConfigMap> = Api::namespaced(truth, NS);
+        let ui = k8s::connect(ctx).await?;
+        let checked = async {
+            let _ = pods.delete(NAME, &DeleteParams::default().grace_period(0)).await;
+            let _ = maps.delete(CONFIG, &DeleteParams::default()).await;
+            pod_gone(&pods, NAME).await?;
+            let map = json!({"metadata": {"name": CONFIG, "namespace": NS}, "data": {"greeting": "hello"}});
+            maps.create(&PostParams::default(), &serde_json::from_value(map)?).await?;
+            // Distroless: nothing to exec in, and a command that isn't there, so it never runs.
+            let pod = json!({
+                "metadata": {"name": NAME, "namespace": NS, "labels": {"app": NAME}},
+                "spec": {
+                    "securityContext": {"runAsNonRoot": true, "runAsUser": 65532},
+                    "containers": [{
+                        "name": "main", "image": "gcr.io/distroless/static-debian12:nonroot", "command": ["/app"],
+                        "livenessProbe": {"exec": {"command": ["/app", "health"]}},
+                        "volumeMounts": [{"name": "config", "mountPath": "/etc/app"}],
+                    }],
+                    "volumes": [{"name": "config", "configMap": {"name": CONFIG}}],
+                },
+            });
+            pods.create(&PostParams::default(), &serde_json::from_value(pod)?).await?;
+            let mut read = None;
+            for _ in 0..120 {
+                let value = serde_json::to_value(pods.get(NAME).await?)?;
+                let stopped = pod_copy::not_running(&value, "main");
+                if stopped.as_deref().is_some_and(|s| s != "not started" && s != "ContainerCreating") {
+                    read = Some(value);
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+            let read = read.context("the pod's container never stopped")?;
+            let node = read.pointer("/spec/nodeName").cloned();
+
+            // Write mode off: the UI's client refuses to create the copy.
+            gate::set_ui_writes(false);
+            let refused = pod_copy::create(ui.clone(), read.clone(), pod_copy::new_name(NAME), BUSYBOX.into()).await;
+            let refused = refused.err().map(|e| format!("{e:#}")).unwrap_or_default();
+            assert!(refused.contains(gate::WRITES_OFF), "{refused}");
+            assert!(pod_copies(&pods).await?.is_empty(), "a copy was created with write mode off");
+
+            gate::set_ui_writes(true);
+            let copy = pod_copy::create(ui.clone(), read.clone(), pod_copy::new_name(NAME), BUSYBOX.into()).await?;
+            let made = pods.get(&copy.name).await?;
+            assert_eq!(made.metadata.uid.as_deref(), Some(copy.uid.as_str()));
+            let made = serde_json::to_value(made)?;
+            // On the same node, selected by nothing, with no probes.
+            assert_eq!(made.pointer("/spec/nodeName").cloned(), node);
+            assert!(made.pointer("/metadata/labels/app").is_none(), "{made}");
+            assert!(made.pointer("/metadata/ownerReferences").is_none(), "{made}");
+            assert!(made.pointer("/spec/containers/0/livenessProbe").is_none(), "{made}");
+
+            let source = FileSource::copy(ui.clone(), NS.into(), copy.name.clone(), Some("main".into()));
+            assert_eq!(source.origin(), Origin::Copy);
+            let config = source.list(b"/etc/app").await?;
+            assert!(config.iter().any(|e| e.name == b"greeting"), "the ConfigMap is not mounted: {config:?}");
+            assert_eq!(source.read(b"/etc/app/greeting", 1024).await?.text(), Some("hello"));
+            let etc = source.list(b"/etc").await?;
+            assert!(etc.iter().any(|e| e.name == b"passwd"), "the image's own files are not there: {etc:?}");
+            let found = source.find(b"/etc/app", "GREET").await?;
+            assert_eq!(found.paths, [b"/etc/app/greeting".to_vec()]);
+
+            // Deleted even with write mode off (the page closed after it was turned off).
+            gate::set_ui_writes(false);
+            pod_copy::delete(copy.clone());
+            pod_gone(&pods, &copy.name).await?;
+            assert!(pods.get_opt(NAME).await?.is_some(), "the original pod went too");
+
+            // The app killed with a copy: the sweep of its next connection deletes it.
+            gate::set_ui_writes(true);
+            let left = pod_copy::create(ui.clone(), read, pod_copy::new_name(NAME), BUSYBOX.into()).await?;
+            gate::set_ui_writes(false);
+            let swept = pod_copy::sweep(ui, Vec::new(), jiff::SignedDuration::ZERO).await?;
+            assert_eq!(swept, 1);
+            pod_gone(&pods, &left.name).await?;
+            Ok(())
+        };
+        let result: Result<()> = checked.await;
+        gate::set_ui_writes(false);
+        for copy in pod_copies(&pods).await.unwrap_or_default() {
+            let name = copy.metadata.name.unwrap_or_default();
+            let _ = pods.delete(&name, &DeleteParams::default().grace_period(0)).await;
+        }
+        let _ = pods.delete(NAME, &DeleteParams::default().grace_period(0)).await;
+        let _ = maps.delete(CONFIG, &DeleteParams::default()).await;
+        result
+    });
+}

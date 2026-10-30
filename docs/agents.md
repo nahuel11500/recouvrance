@@ -113,7 +113,9 @@ tools. What some of them need beyond the obvious verb:
 - **Files:** `browse_files` lists a folder (mode, owner, size, modification time, symlink targets)
   or returns a file's first bytes (64 KiB by default, 1 MiB at most; a binary file only its type)
   in a container, like the app's Files tab. It runs `sh`, `stat` and `head` there, so it needs
-  `exec` on the pod, like `exec_command`, and changes nothing.
+  `exec` on the pod, like `exec_command`, and changes nothing. Unlike the app's Files tab, it
+  doesn't make a copy of a pod whose container isn't running (that creates a pod): it says the
+  container isn't running.
 - **Port-forwards:** `port_forward` needs the `forward` verb on the pod or Service (no preset grants
   it): it is a network path into the cluster. It listens on 127.0.0.1 only, for `minutes` (60 by
   default, 8 hours at most), shows in the sidebar's port-forwards with the agent's name, and stops

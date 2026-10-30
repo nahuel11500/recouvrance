@@ -27,6 +27,7 @@ pub(crate) mod lists;
 pub(crate) mod meter;
 mod metrics;
 pub(crate) mod names;
+pub(crate) mod pod_copy;
 mod pods;
 pub(crate) mod podspec;
 pub(crate) mod rollouts;
