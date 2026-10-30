@@ -15,6 +15,7 @@ mod filter_syntax;
 mod forwards;
 mod glob;
 mod helm;
+mod history;
 mod k8s;
 mod latest;
 mod mcp;

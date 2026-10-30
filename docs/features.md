@@ -7,6 +7,20 @@
   mounts), workloads (scheduling, pods, revisions with diffs), services (port-forward, backing
   pods), secrets (masked, referenced by), ingresses, PVCs, namespaces (quotas), nodes, CronJobs,
   and a generic spec/status view for anything else.
+- **History**: an object's page has a History tab listing what changed, newest first, from what
+  the cluster already keeps (nothing runs in the background; it is read when the tab is first
+  opened): a Deployment's ReplicaSets and a StatefulSet's or DaemonSet's ControllerRevisions
+  (what changed in the pod template: images, a restart, the other fields; a rollback says which
+  revision it went back to), the revisions of the Helm release that installed the object
+  (status, chart, values changed), an Argo CD Application's deployments and a sync that failed
+  (and, on an object it deployed, the Application's last deployments), which field managers last
+  wrote which fields and when (`managedFields`; status writes left out), and the object's events,
+  Warnings highlighted. A pod's page shows its owner's revisions (its ReplicaSet's Deployment).
+  *Diff* shows a change's diff, worked out when clicked, the way Compare shows one (the
+  pod-template-hash and other noise left out, secret-looking Helm values masked). A Helm
+  release's History tab has a *Values diff* against the revision before. A source that can't be
+  read (Helm's Secrets forbidden, say) is named; the others still show. ConfigMaps and Secrets
+  keep no history in Kubernetes.
 - **GPU usage**: utilization and memory per pod, workload, node and cluster, from NVIDIA's DCGM
   exporter (shown when its metrics are in Prometheus or VictoriaMetrics).
 - **Usage history** (CPU and memory against requests and limits, over 15 minutes to 7 days; the

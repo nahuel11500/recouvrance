@@ -61,6 +61,7 @@ impl DetailPanel {
         }
         self.argo_started = Some(started);
         self.argo = lookup;
+        self.merge_history();
         cx.notify();
     }
 

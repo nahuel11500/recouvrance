@@ -81,7 +81,7 @@ Tools, by what they do:
 
 - **Read:** `my_permissions`, `list_contexts`, `list_resource_types`, `list_resources`, `get_resource`,
   `describe_resource`, `search`, `get_events`, `find_problems`, `check_certificates`, `top_pods`,
-  `top_nodes`, `usage_history`, `get_logs`, `workload_logs`, `rollout_history`, `rollout_status`,
+  `top_nodes`, `usage_history`, `get_logs`, `workload_logs`, `get_changes`, `rollout_history`, `rollout_status`,
   `list_helm_releases`, `helm_history`, `helm_get_values`, `diff_manifest`, `explain_resource`,
   `can_i`, `cluster_version`, `wait_for`, `list_port_forwards`.
 - **Change:** `scale`, `rollout_restart`, `rollout_undo`, `rollout_pause`, `rollout_resume`,
@@ -95,6 +95,12 @@ tools. What some of them need beyond the obvious verb:
 - **Logs of a workload:** `workload_logs` merges the logs of a workload's or Service's pods (the
   newest 20) in time order, each line prefixed with its pod. It needs `get` on the workload; pods
   whose logs the rules don't allow are left out and counted.
+- **What changed:** `get_changes` returns what changed on an object, newest first, as the app's
+  History tab shows it: time, source, object, what changed, and up to 12 changed lines of its
+  diff (`limit` changes, 30 by default). It needs `get` on the object. A pod's owner (its
+  ReplicaSet, then the Deployment) is read only if the rules allow `get` on it, the Helm
+  revisions only those `list` on secrets allows (values masked), the events only with `list` on
+  events. A source that failed, or an owner the rules don't let it read, is named at the end.
 - **Rollouts:** `rollout_undo`, `rollout_pause`, `rollout_resume` and `set_image` need `patch`.
   `rollout_status` and `wait_for` need `get` and wait up to 5 minutes, stopping when the agent's
   access ends.
