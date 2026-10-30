@@ -274,7 +274,7 @@ async fn lookup(
         if targets.len() > READ_AT_MOST {
             let kind = Kind { ar: of.ar(), namespaced: of.namespaced(), section: "", label: of.plural().into() };
             let ns = scope.filter(|_| of.namespaced()).map(String::from);
-            match k8s::list_light(client.clone(), kind, ns.clone(), true).await {
+            match k8s::list_light(client.clone(), kind, ns.clone(), true, None).await {
                 Ok((_, rows)) => {
                     let listed = Listed::new(
                         ns.as_deref(),
@@ -562,7 +562,7 @@ async fn unserved(client: &Client, kind: &Kind, services: &[Value], namespace: O
     // without one are looked into, their pods (the truth) listed.
     let endpoints =
         Kind { ar: k8s::ar_of::<core::Endpoints>(), namespaced: true, section: "", label: "Endpoints".into() };
-    let ready = match k8s::list_light(client.clone(), endpoints, namespace, true).await {
+    let ready = match k8s::list_light(client.clone(), endpoints, namespace, true, None).await {
         Ok((defs, rows)) => served(&defs, &rows),
         Err(e) => {
             out.skipped.push((kind.label.clone(), e));

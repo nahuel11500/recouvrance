@@ -20,6 +20,7 @@ enum Section {
     Appearance,
     Refresh,
     Logs,
+    Timeline,
     Kubeconfig,
     Agents,
     Assistant,
@@ -29,13 +30,14 @@ enum Section {
     About,
 }
 
-const SECTIONS: [(Section, &str, Lucide); 13] = [
+const SECTIONS: [(Section, &str, Lucide); 14] = [
     (Section::General, "General", Lucide::Settings),
     (Section::Contexts, "Contexts", Lucide::Ship),
     (Section::Clusters, "Per cluster", Lucide::Server),
     (Section::Appearance, "Appearance", Lucide::Palette),
     (Section::Refresh, "Refresh rates", Lucide::RefreshCw),
     (Section::Logs, "Log viewer", Lucide::ScrollText),
+    (Section::Timeline, "Timeline", Lucide::ClockArrowDown),
     (Section::Kubeconfig, "Kubeconfig", Lucide::FileText),
     (Section::Agents, "Agents (MCP)", Lucide::Bot),
     (Section::Assistant, "Assistant", Lucide::Sparkles),
@@ -51,6 +53,10 @@ pub struct SettingsView {
     detail: Entity<InputState>,
     overview: Entity<InputState>,
     tail: Entity<InputState>,
+    /// The timeline: kinds watched whole, MB and days kept per context.
+    timeline_kinds: Entity<InputState>,
+    timeline_mb: Entity<InputState>,
+    timeline_days: Entity<InputState>,
     kubeconfig: Entity<crate::ui::kubeconfig_sources::KubeconfigSources>,
     mcp_port: Entity<InputState>,
     /// Why the port typed is not saved.
@@ -84,6 +90,9 @@ impl SettingsView {
         let detail = field(s.detail_refresh.to_string(), "5", window, cx);
         let overview = field(s.overview_refresh.to_string(), "30", window, cx);
         let tail = field(s.log_tail_lines.to_string(), "1000", window, cx);
+        let timeline_kinds = field(s.timeline.kinds.join(", "), "configmaps, secrets, deployments.apps", window, cx);
+        let timeline_mb = field(s.timeline.max_mb().to_string(), "16", window, cx);
+        let timeline_days = field(s.timeline.days().to_string(), "14", window, cx);
         let mcp_port = field(hub.port().to_string(), "47070", window, cx);
         let kubeconfig = cx.new(|cx| crate::ui::kubeconfig_sources::KubeconfigSources::new(window, cx));
         let textarea = |value: String, placeholder: &'static str, window: &mut Window, cx: &mut Context<Self>| {
@@ -115,6 +124,11 @@ impl SettingsView {
         subs.push(number(&detail, |s, n| s.detail_refresh = n, cx));
         subs.push(number(&overview, |s, n| s.overview_refresh = n, cx));
         subs.push(number(&tail, |s, n| s.log_tail_lines = n as i64, cx));
+        subs.push(number(&timeline_mb, |s, n| s.timeline.max_mb = n, cx));
+        subs.push(number(&timeline_days, |s, n| s.timeline.days = n, cx));
+        subs.push(Self::save_typed(&timeline_kinds, input_text, cx, |v| {
+            settings::update(|s| s.timeline.kinds = kind_list(&v));
+        }));
         let hub2 = hub.clone();
         subs.push(cx.subscribe(&mcp_port, move |this, state, ev: &InputEvent, cx| {
             if matches!(ev, InputEvent::Change) {
@@ -166,6 +180,9 @@ impl SettingsView {
             detail,
             overview,
             tail,
+            timeline_kinds,
+            timeline_mb,
+            timeline_days,
             kubeconfig,
             mcp_port,
             mcp_port_error: None,
@@ -326,6 +343,9 @@ impl SettingsView {
             (self.detail.clone(), s.detail_refresh.to_string()),
             (self.overview.clone(), s.overview_refresh.to_string()),
             (self.tail.clone(), s.log_tail_lines.to_string()),
+            (self.timeline_kinds.clone(), s.timeline.kinds.join(", ")),
+            (self.timeline_mb.clone(), s.timeline.max_mb().to_string()),
+            (self.timeline_days.clone(), s.timeline.days().to_string()),
             (self.mcp_port.clone(), self.hub.port().to_string()),
         ];
         for (ctx, input) in &self.prometheus {
@@ -486,6 +506,7 @@ impl SettingsView {
             Section::Appearance => self.appearance_section(cx),
             Section::Refresh => self.refresh_section(cx),
             Section::Logs => self.logs_section(cx),
+            Section::Timeline => self.timeline_section(cx),
             Section::Kubeconfig => self.kubeconfig_section(),
             Section::Agents => self.agents_section(cx),
             Section::Assistant => self.assistant_section(cx),
@@ -904,6 +925,51 @@ impl SettingsView {
             .into_any_element()
     }
 
+    fn timeline_section(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let s = settings::get();
+        let number_input = |e: &Entity<InputState>| div().w(px(110.)).child(Input::new(e).small());
+        let on = s.timeline.record;
+        v_flex()
+            .child(div().pb_2().text_sm().text_color(cx.theme().muted_foreground).child(
+                "While a cluster is connected, changes to what the lists and the Problems scan watch are recorded \
+                 (pods, events and ReplicaSets excepted), with no request added. Kept on disk per context in \
+                 ~/.local/share/recouvrance/timeline/; a Secret's values never, only which keys changed.",
+            ))
+            .child(Self::row(
+                "Record changes",
+                "Off: nothing more is recorded; what was is still shown.",
+                Switch::new("timeline-on").checked(on).label(if on { "On" } else { "Off" }).on_click(
+                    |v: &bool, _, cx| {
+                        let v = *v;
+                        settings::update(|s| s.timeline.record = v);
+                        cx.refresh_windows();
+                    },
+                ),
+                cx,
+            ))
+            .child(Self::row(
+                "Kinds watched whole",
+                "Comma-separated (configmaps, secrets, deployments.apps). Each gets a watch of its own on every \
+                 connected cluster, and its changes a diff of the whole object, not only labels and annotations. \
+                 Applies when you connect next.",
+                div().w(px(320.)).child(Input::new(&self.timeline_kinds).small()),
+                cx,
+            ))
+            .child(Self::row(
+                "Size kept",
+                "MB per context (1 to 1024); the oldest records go first.",
+                number_input(&self.timeline_mb),
+                cx,
+            ))
+            .child(Self::row(
+                "Days kept",
+                "Records older than this are dropped (1 to 365).",
+                number_input(&self.timeline_days),
+                cx,
+            ))
+            .into_any_element()
+    }
+
     fn kubeconfig_section(&mut self) -> AnyElement {
         self.kubeconfig.clone().into_any_element()
     }
@@ -1230,6 +1296,11 @@ impl Render for SettingsView {
                 ),
             )
     }
+}
+
+/// Kinds typed in a list: `configmaps, secrets deployments.apps`.
+fn kind_list(text: &str) -> Vec<String> {
+    text.split([',', ' ', '\n']).map(str::trim).filter(|k| !k.is_empty()).map(String::from).collect()
 }
 
 fn input_text(state: &InputState) -> String {

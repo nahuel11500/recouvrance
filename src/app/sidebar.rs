@@ -293,8 +293,8 @@ impl AppView {
     }
 
     /// The pages: agents (with pending approvals), assistant, problems (with their
-    /// count), overviews, Helm and Argo CD.
-    fn page_links(&self, colors: Colors, cx: &mut Context<Self>) -> [Stateful<Div>; 7] {
+    /// count), the timeline, overviews, Helm and Argo CD.
+    fn page_links(&self, colors: Colors, cx: &mut Context<Self>) -> [Stateful<Div>; 8] {
         let route = self.route();
         let (danger, warning) = (cx.theme().danger, cx.theme().warning);
         let badge = |n: usize, color: Hsla| {
@@ -317,6 +317,8 @@ impl AppView {
                 .when_some(self.problems.gaps(), |d, gaps| {
                     d.tooltip(move |w, cx| component::tooltip::Tooltip::new(gaps.clone()).build(w, cx))
                 }),
+            nav_row("nav-timeline", Lucide::ClockArrowDown, "Timeline", matches!(route, Route::Timeline(_)), colors)
+                .on_click(cx.listener(|this, _, window, cx| this.open_timeline(window, cx))),
             nav_row("nav-cluster", Lucide::Server, "Cluster overview", matches!(route, Route::Cluster(_)), colors)
                 .on_click(cx.listener(|this, _, window, cx| this.open_cluster(window, cx))),
             nav_row(
