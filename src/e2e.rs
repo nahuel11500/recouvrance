@@ -951,3 +951,73 @@ fn the_files_tab_reads_a_container() {
         result
     });
 }
+
+/// The timeline records what a list's watch sees change, from the metadata alone: a label
+/// set by someone (and who), then the deletion. The agents' `get_changes` returns the record
+/// with its source.
+#[test]
+#[ignore]
+fn the_timeline_records_what_a_watch_sees_change() {
+    run(async {
+        use futures::StreamExt as _;
+        let ctx = context();
+        let client = k8s::connect_for_agents(ctx.clone()).await?;
+        let cms: Api<ConfigMap> = Api::namespaced(client.clone(), NS);
+        let name = "e2e-timeline";
+        let _ = cms.delete(name, &DeleteParams::default()).await;
+        let created = cms.create(&PostParams::default(), &config_map(name)).await?;
+        let uid = created.metadata.uid.clone().unwrap_or_default();
+        let checked = async {
+            let kinds = k8s::discover(client.clone()).await?;
+            let kind = k8s::find_kind(&kinds, "configmaps").cloned().context("no configmaps")?;
+            let tap = crate::timeline::tap(&ctx, &kind, Some(NS.into())).context("configmaps are recorded")?;
+            // As the app's list does, its rows held back.
+            let pause = k8s::Pause::default();
+            pause.set(true);
+            let (_watch, mut rx) =
+                k8s::watch_table_paused(client.clone(), kind, Some(NS.into()), Arc::default(), pause, false, Some(tap));
+            while let Some(msg) = rx.next().await {
+                if matches!(msg, k8s::TableMsg::Listed) {
+                    break;
+                }
+            }
+            let _drain = k8s::spawn_guarded(async move { while rx.next().await.is_some() {} });
+            let recorded = || crate::timeline::changes_for(&ctx, "configmaps", Some(NS), name, &uid);
+            assert!(recorded().is_empty(), "the first list only notes what is there");
+
+            let by = PatchParams { field_manager: Some("e2e-editor".into()), ..Default::default() };
+            cms.patch(name, &by, &Patch::Merge(json!({"metadata": {"labels": {"tier": "front"}}}))).await?;
+            let mut found = Vec::new();
+            for _ in 0..60 {
+                found = recorded();
+                if !found.is_empty() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+            let summaries: Vec<&str> = found.iter().map(|c| c.summary.as_str()).collect();
+            assert_eq!(summaries, ["labels changed: tier by e2e-editor"]);
+            let diff = found[0].diff.as_ref().map(|d| d.short(5)).unwrap_or_default();
+            assert!(diff.contains("tier: front"), "{diff}");
+
+            let (hub, _agent, token, _server) = agent(&["get,list *"], &[]).await?;
+            let mcp = crate::assistant::Mcp::connect(hub.port(), token).await?;
+            let target = json!({"context": ctx, "kind": "configmaps", "namespace": NS, "name": name});
+            let out = mcp.call("get_changes", target).await;
+            assert!(out.contains("Recorded  ConfigMap e2e-timeline: labels changed: tier by e2e-editor"), "{out}");
+
+            cms.delete(name, &DeleteParams::default()).await?;
+            for _ in 0..60 {
+                if recorded().iter().any(|c| c.summary == "deleted") {
+                    return Ok(());
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+            let summaries: Vec<String> = recorded().into_iter().map(|c| c.summary).collect();
+            bail!("the deletion was not recorded: {summaries:?}")
+        };
+        let result: Result<()> = checked.await;
+        let _ = cms.delete(name, &DeleteParams::default()).await;
+        result
+    });
+}
