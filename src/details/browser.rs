@@ -1,8 +1,9 @@
 //! The Files tab of a pod: a container's filesystem as a folder tree, read through exec
 //! (`k8s::files`). Open folders, preview a text file, download a file or a folder, search
 //! by name. Every command runs in the container, so like a shell it needs write mode, and
-//! on a protected context its name typed once for the tab. A container that isn't running
-//! is read from a copy of the pod (`copy`).
+//! on a protected context its name typed once for the tab. A container without a shell or
+//! the tools is read through a debug container instead (`k8s::files::debug`), offered once
+//! its listing fails. A container that isn't running is read from a copy of the pod (`copy`).
 
 mod copy;
 
@@ -27,7 +28,8 @@ use kube::Client;
 use super::ConfirmButtons as _;
 use super::tabs::error_box;
 use crate::k8s;
-use crate::k8s::files::{self, Entry, FileKind, FileSource, Found, Preview};
+use crate::k8s::files::debug::{self, Look, Plan};
+use crate::k8s::files::{self, Entry, FileKind, FileSource, Found, Origin, Preview};
 use crate::latest::Latest;
 use copy::CopyState;
 
@@ -49,6 +51,8 @@ pub struct FileBrowser {
     places: HashMap<String, Place>,
     /// The API server says this user may not exec in the pod.
     exec_denied: bool,
+    /// The API server says this user may not add debug containers to the pod.
+    debug_denied: bool,
     /// The pod as last read: its containers' states, and the spec a copy is made from.
     pod_read: Option<serde_json::Value>,
     /// Why RBAC refuses a copy of the pod (create or delete pods), if it does.
@@ -84,8 +88,26 @@ struct Place {
     list_load: Latest,
     preview_load: Latest,
     search_load: Latest,
-    /// Read from the copy of the pod: the container wasn't running.
-    copy: bool,
+    /// How the files are read when not by exec in the container itself: a debug container.
+    source: Option<FileSource>,
+    /// The container lacks a shell or tools: reading it through a debug container.
+    debug: Debug,
+    debug_load: Latest,
+}
+
+/// Reading a container that lacks a shell or tools through a debug container.
+#[derive(Default)]
+enum Debug {
+    #[default]
+    No,
+    /// Looking for one added before that still runs.
+    Looking,
+    /// None to reuse: this one can be added.
+    Offer(Plan),
+    /// Being added.
+    Adding,
+    /// Looking or adding failed.
+    Failed(SharedString),
 }
 
 impl Place {
@@ -142,6 +164,7 @@ impl FileBrowser {
             _container_sub: None,
             places: HashMap::new(),
             exec_denied: false,
+            debug_denied: false,
             pod_read: None,
             copy_denied: None,
             copy: CopyState::None,
@@ -201,6 +224,15 @@ impl FileBrowser {
         }
     }
 
+    /// Whether the API server refuses this user a debug container in the pod (`patch` on
+    /// `pods/ephemeralcontainers`).
+    pub fn set_debug_denied(&mut self, denied: bool, cx: &mut Context<Self>) {
+        if self.debug_denied != denied {
+            self.debug_denied = denied;
+            cx.notify();
+        }
+    }
+
     /// Show another container: its own folder, as it was left.
     fn choose_container(&mut self, name: String, window: &mut Window, cx: &mut Context<Self>) {
         if self.container.as_deref() == Some(name.as_str()) {
@@ -220,11 +252,13 @@ impl FileBrowser {
         self.places.get(&self.key())
     }
 
+    /// How the container shown is read: through the debug container it was switched to, else
+    /// by exec in it.
     fn source(&self) -> FileSource {
-        if let Some(source) = self.copy_source(self.place()) {
-            return source;
+        match self.place().and_then(|p| p.source.clone()) {
+            Some(source) => source,
+            None => FileSource::exec(self.client.clone(), self.ns.clone(), self.pod.clone(), self.container.clone()),
         }
-        FileSource::exec(self.client.clone(), self.ns.clone(), self.pod.clone(), self.container.clone())
     }
 
     /// Run `then` once a command may run in the container: write mode on (offered when
@@ -288,6 +322,7 @@ impl FileBrowser {
         }
         let dir = files::normalize(&dir);
         let (key, source) = (self.key(), self.source());
+        let used = source.clone();
         let place = self.places.entry(key.clone()).or_default();
         place.dir = Some(dir.clone());
         place.listing = None;
@@ -305,7 +340,19 @@ impl FileBrowser {
             move |this, result, window, cx| {
                 // Another folder was opened since: this listing is not shown.
                 let Some(place) = this.places.get_mut(&key).filter(|p| p.dir.as_ref() == Some(&want)) else { return };
+                // No shell or tools: a debug container would bring them. The debug container
+                // read through ended: another is needed.
+                let live = used.origin() == Origin::Live;
+                let ended = result.as_ref().is_err_and(|e| debug::ended(&used, e));
+                let lacks_tools = (live && result.as_ref().is_err_and(debug::needed)) || ended;
                 place.listing = Some(result.map_err(|e| short(&e)));
+                if ended {
+                    place.source = None;
+                }
+                if lacks_tools && matches!(place.debug, Debug::No | Debug::Offer(_) | Debug::Failed(_)) {
+                    this.look_for_debug(key.clone(), window, cx);
+                }
+                let Some(place) = this.places.get_mut(&key) else { return };
                 let entry =
                     place.pending.take().and_then(|name| place.entries()?.iter().find(|e| e.name == name).cloned());
                 // Still the container shown: what was asked for opens.
@@ -317,6 +364,98 @@ impl FileBrowser {
         );
         self.sync_preview(window, cx);
         cx.notify();
+    }
+
+    /// Container `key` lacks a shell or tools: read it through a debug container this tab
+    /// added before if one still runs, else offer to add one.
+    fn look_for_debug(&mut self, key: String, window: &mut Window, cx: &mut Context<Self>) {
+        let (client, ns, pod) = (self.client.clone(), self.ns.clone(), self.pod.clone());
+        let look = debug::look(client, ns, pod, key.clone(), debug::image(&self.context));
+        let Some(place) = self.places.get_mut(&key) else { return };
+        place.debug = Debug::Looking;
+        place.debug_load.spawn_in(window, cx, look, move |this, result, window, cx| {
+            let Some(place) = this.places.get_mut(&key) else { return };
+            match result {
+                Ok(Look::Reuse(source)) => this.read_through(key, source, window, cx),
+                Ok(Look::Add(plan)) => place.debug = Debug::Offer(plan),
+                Err(e) => place.debug = Debug::Failed(short(&e)),
+            }
+            cx.notify();
+        });
+        cx.notify();
+    }
+
+    /// Ask, then add the debug container `plan` says, and read through it.
+    fn confirm_debug(&mut self, plan: Plan, window: &mut Window, cx: &mut Context<Self>) {
+        if !super::ensure_writes(window, cx) {
+            return;
+        }
+        let guard = super::Guard::protected(&self.context, window, cx);
+        let me = cx.entity().downgrade();
+        let cmd = super::kubectl(&self.context, Some(self.ns.as_str()), &kubectl_debug(&self.pod, &plan));
+        let title = format!("Read {} through a debug container?", plan.target);
+        let user = match plan.user {
+            Some(user) => format!("as user {user}, group {}", plan.group.unwrap_or(user)),
+            None => "as its image's user".to_string(),
+        };
+        let description = format!(
+            "This image has no shell, or lacks the tools to list files (distroless, scratch). Recouvrance adds an \
+             ephemeral container ({}) that shares the processes of {}, runs {user} and sleeps for {} hours, and reads \
+             the files through /proc/<pid>/root of its process. An ephemeral container can't be removed: it stays \
+             in the pod's spec until the pod is replaced. Browsing again reuses it while it runs.",
+            plan.image,
+            plan.target,
+            debug::SLEEP_SECS / 3600
+        );
+        window.open_alert_dialog(cx, move |alert, _, cx| {
+            let (me, guard, plan) = (me.clone(), guard.clone(), plan.clone());
+            alert
+                .title(title.clone())
+                .description(description.clone())
+                .child(super::confirm_extras(&cmd, guard.as_ref(), cx))
+                .confirm_buttons("Add debug container", false, guard.as_ref())
+                .on_ok(move |_, window, cx| {
+                    if !super::guard_ok(guard.as_ref(), cx) {
+                        return false;
+                    }
+                    if !super::writes_still_on(window, cx) {
+                        return true;
+                    }
+                    let plan = plan.clone();
+                    let _ = me.update(cx, |this, cx| this.add_debug(plan, window, cx));
+                    true
+                })
+        });
+    }
+
+    fn add_debug(&mut self, plan: Plan, window: &mut Window, cx: &mut Context<Self>) {
+        let (client, ns, pod) = (self.client.clone(), self.ns.clone(), self.pod.clone());
+        let key = plan.target.clone();
+        let Some(place) = self.places.get_mut(&key) else { return };
+        place.debug = Debug::Adding;
+        let add = debug::add(client, ns, pod, plan);
+        place.debug_load.spawn_in(window, cx, add, move |this, result, window, cx| {
+            match result {
+                Ok(source) => this.read_through(key, source, window, cx),
+                Err(e) => {
+                    let Some(place) = this.places.get_mut(&key) else { return };
+                    place.debug = Debug::Failed(short(&e));
+                }
+            }
+            cx.notify();
+        });
+        cx.notify();
+    }
+
+    /// Read container `key` through `source` from now on: its folder lists again.
+    fn read_through(&mut self, key: String, source: FileSource, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(place) = self.places.get_mut(&key) else { return };
+        place.source = Some(source);
+        place.debug = Debug::No;
+        let dir = place.dir.clone().unwrap_or_else(|| b"/".to_vec());
+        if self.key() == key {
+            self.open_dir(dir, None, window, cx);
+        }
     }
 
     /// Open the entry `ix` of the folder shown.
@@ -695,11 +834,13 @@ impl FileBrowser {
     /// Why a listing failed, and a button to try again.
     fn render_error(&self, e: SharedString, dir: Option<Vec<u8>>, cx: &mut Context<Self>) -> AnyElement {
         // The container stopped meanwhile: offer its copy.
-        let copy = (self.stopped().is_some() && !self.place().is_some_and(|p| p.copy)).then(|| self.copy_button(cx));
+        let copy =
+            (self.stopped().is_some() && !self.place().is_some_and(Place::from_copy)).then(|| self.copy_button(cx));
         v_flex()
             .gap_2()
             .p_2()
             .child(error_box(e, cx))
+            .children(self.render_debug(cx))
             .child(h_flex().gap_2().children(copy).child(
                 Button::new("files-retry").xsmall().outline().icon(Lucide::RotateCw).label("Try again").on_click(
                     cx.listener(move |this, _, window, cx| {
@@ -709,6 +850,53 @@ impl FileBrowser {
                 ),
             ))
             .into_any_element()
+    }
+
+    /// For a container that lacks a shell or tools: where reading it through a debug container
+    /// is, and the button that adds one.
+    fn render_debug(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let muted = cx.theme().muted_foreground;
+        let note = |text: &str| div().text_sm().text_color(muted).child(text.to_string()).into_any_element();
+        Some(match &self.place()?.debug {
+            Debug::No => return None,
+            Debug::Looking => note("Looking for a debug container added before…"),
+            Debug::Adding => note("Adding a debug container and waiting for it to run…"),
+            Debug::Offer(plan) => {
+                let add =
+                    Button::new("files-debug").primary().icon(Lucide::Bug).label("Read through a debug container");
+                let add = if self.debug_denied {
+                    add.disabled(true)
+                        .tooltip("Your RBAC does not allow adding debug containers (patch on pods/ephemeralcontainers)")
+                } else {
+                    let plan = plan.clone();
+                    add.on_click(cx.listener(move |this, _, window, cx| this.confirm_debug(plan.clone(), window, cx)))
+                };
+                v_flex()
+                    .gap_2()
+                    .child(note(
+                        "This image has no shell, or lacks the tools to list files (distroless, scratch). Its files can \
+                         be read through an ephemeral debug container that shares its processes.",
+                    ))
+                    .child(h_flex().child(add))
+                    .into_any_element()
+            }
+            Debug::Failed(e) => {
+                let key = self.key();
+                let again = Button::new("files-debug-again").xsmall().outline().icon(Lucide::RotateCw);
+                let again = again.label("Look for a debug container again").on_click(cx.listener(
+                    move |this, _, window, cx| {
+                        let key = key.clone();
+                        this.guarded(move |this, window, cx| this.look_for_debug(key, window, cx), window, cx);
+                    },
+                ));
+                v_flex()
+                    .gap_2()
+                    .child(note("Reading it through a debug container failed:"))
+                    .child(error_box(e.clone(), cx))
+                    .child(h_flex().child(again))
+                    .into_any_element()
+            }
+        })
     }
 
     fn render_search(
@@ -867,6 +1055,26 @@ impl FileBrowser {
     }
 }
 
+/// The `kubectl debug` arguments that add the debug container `plan` says to `pod`: its user
+/// through `--custom` (kubectl 1.31 and later).
+fn kubectl_debug(pod: &str, plan: &Plan) -> String {
+    let user = match plan.user {
+        Some(user) => format!(
+            " --custom=<(echo '{{\"securityContext\":{{\"runAsUser\":{user},\"runAsGroup\":{}}}}}')",
+            plan.group.unwrap_or(user)
+        ),
+        None => String::new(),
+    };
+    format!(
+        "debug {} --image={} --target={} --profile=general -c {}{user} -- sleep {}",
+        super::shell_word(pod),
+        super::shell_word(&plan.image),
+        super::shell_word(&plan.target),
+        super::shell_word(&plan.name),
+        debug::SLEEP_SECS
+    )
+}
+
 impl Render for FileBrowser {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let Some(place) = self.place().filter(|p| p.dir.is_some()) else {
@@ -891,5 +1099,28 @@ impl Render for FileBrowser {
                     .children(preview),
             )
             .into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Plan, kubectl_debug};
+
+    #[test]
+    fn the_kubectl_equivalent_runs_as_the_same_user() {
+        let mut plan = Plan {
+            target: "app".into(),
+            name: "recouvrance-files-ab12c".into(),
+            image: "busybox:1.37".into(),
+            user: Some(65532),
+            group: Some(65532),
+        };
+        assert_eq!(
+            kubectl_debug("web-0", &plan),
+            "debug web-0 --image=busybox:1.37 --target=app --profile=general -c recouvrance-files-ab12c \
+             --custom=<(echo '{\"securityContext\":{\"runAsUser\":65532,\"runAsGroup\":65532}}') -- sleep 14400"
+        );
+        plan.user = None;
+        assert!(kubectl_debug("web-0", &plan).ends_with("-c recouvrance-files-ab12c -- sleep 14400"));
     }
 }

@@ -15,7 +15,7 @@ use super::{FileBrowser, Place, short};
 use crate::details::{
     ConfirmButtons as _, Guard, confirm_extras, ensure_writes, guard_ok, kubectl, shell_word, writes_still_on,
 };
-use crate::k8s::files::FileSource;
+use crate::k8s::files::{FileSource, Origin};
 use crate::k8s::pod_copy::{self, COPY_SECS, PodCopy};
 
 /// The copy of the pod that stopped containers are read from.
@@ -26,6 +26,13 @@ pub(super) enum CopyState {
     Starting,
     Ready(PodCopy),
     Failed(SharedString),
+}
+
+impl Place {
+    /// Read from the copy of the pod: the container wasn't running.
+    pub(super) fn from_copy(&self) -> bool {
+        self.source.as_ref().is_some_and(|s| s.origin() == Origin::Copy)
+    }
 }
 
 impl FileBrowser {
@@ -56,13 +63,6 @@ impl FileBrowser {
     /// Why the container shown isn't running, when it isn't.
     pub(super) fn stopped(&self) -> Option<String> {
         pod_copy::not_running(self.pod_read.as_ref()?, self.container.as_deref()?)
-    }
-
-    /// The copy, for a container read from it.
-    pub(super) fn copy_source(&self, place: Option<&Place>) -> Option<FileSource> {
-        let CopyState::Ready(copy) = &self.copy else { return None };
-        place.filter(|p| p.copy)?;
-        Some(FileSource::copy(self.client.clone(), copy.ns.clone(), copy.name.clone(), self.container.clone()))
     }
 
     /// Read the container shown from the copy: made once, after its confirmation.
@@ -163,12 +163,14 @@ impl FileBrowser {
 
     /// Read the container shown from the copy, in the folder it was in.
     fn browse_copy(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let CopyState::Ready(copy) = &self.copy else { return };
         if self.container.is_none() {
             return;
         }
+        let source = FileSource::copy(self.client.clone(), copy.ns.clone(), copy.name.clone(), self.container.clone());
         let key = self.key();
         let place = self.places.entry(key).or_default();
-        place.copy = true;
+        place.source = Some(source);
         let dir = place.dir.clone().unwrap_or_else(|| b"/".to_vec());
         self.open_dir(dir, None, window, cx);
     }
@@ -179,7 +181,7 @@ impl FileBrowser {
             pod_copy::delete(copy);
         }
         self._copy_task = None;
-        self.places.retain(|_, p| !p.copy);
+        self.places.retain(|_, p| !p.from_copy());
         self.previewed = None;
         cx.notify();
     }
@@ -244,7 +246,7 @@ impl FileBrowser {
     /// Above a container read from the copy: what it is, and what it is not.
     pub(super) fn render_copy_note(&self, place: &Place, cx: &mut Context<Self>) -> Option<AnyElement> {
         let CopyState::Ready(copy) = &self.copy else { return None };
-        if !place.copy {
+        if !place.from_copy() {
             return None;
         }
         let theme = cx.theme().clone();

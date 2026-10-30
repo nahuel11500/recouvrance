@@ -454,6 +454,7 @@ impl DetailPanel {
             let _ = this.update(cx, |this, cx| {
                 if let Some(files) = &this.files {
                     files.update(cx, |f, cx| f.set_exec_denied(denied.contains("exec"), cx));
+                    files.update(cx, |f, cx| f.set_debug_denied(denied.contains("debug"), cx));
                     files.update(cx, |f, cx| {
                         f.set_copy_denied(denied.contains("copy"), denied.contains("copy-delete"), cx);
                     });

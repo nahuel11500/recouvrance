@@ -48,21 +48,31 @@
   folder shown, or type a `/path` to go there. Each container keeps its own place. Names with
   spaces, newlines or bytes that aren't UTF-8 are shown escaped and still open. Like a shell it
   needs write mode, and the context name typed (or a wait) once on a protected context; it is
-  greyed out when your RBAC does not allow `pods/exec`. A container without a shell says so.
+  greyed out when your RBAC does not allow `pods/exec`. A container without a shell or those
+  tools (distroless, scratch) is offered a **debug container**, like `kubectl debug --target`:
+  one confirmation shows the `kubectl debug` equivalent and that an ephemeral container stays in
+  the pod's spec until the pod is replaced. It runs the node shell image (busybox by default),
+  shares the container's processes, runs as its user (from what the kubelet reports, else the
+  container's or the pod's `securityContext`) and sleeps for 4 hours; the files are read live
+  through `/proc/<pid>/root` of its main process, symlinks followed as the container sees them,
+  and the toolbar says *through a debug container*. It uses `kubectl debug`'s `general` profile
+  (`SYS_PTRACE`), none added where Pod Security is `baseline`, and `restricted`'s where it
+  requires it. Browsing again reuses one still running; it is greyed out when your RBAC does not
+  allow `patch` on `pods/ephemeralcontainers`.
   A container that isn't running (crash loop, exited, waiting) is read from a **copy of the pod**,
   after one confirmation that shows the `kubectl debug <pod> --copy-to=… --same-node` equivalent:
   the same spec and volumes (mounted ConfigMaps and Secrets are there) on the same node, without
   its labels, annotations, owner references, init containers and probes (no Service sends it
   traffic, no controller adopts it), every container sleeping instead of starting its app. A
-  distroless image has no `sleep`: an init container copies a static busybox (`busybox:1.37-musl`, or
-  the cluster's node shell image when set) into the copy, at `/.recouvrance-copy`, and the copy runs and is read with it. The
-  copy shows *copy of the pod* next to its files, and says that files the container wrote while it
-  ran are not there (it starts from the image again). It is deleted, by its uid, when the page
-  closes, on its *Delete the copy* button and when the app quits; it stops by itself after an
-  hour, and one left behind (the app killed) is deleted the next time the app connects to its
-  cluster (pods labelled `recouvrance/pod-copy` older than an hour). It needs write mode and RBAC
-  to create and delete pods in the namespace (greyed out with the reason otherwise). Agents'
-  `browse_files` reads running containers only.
+  distroless image has no `sleep`: an init container copies a static busybox (`busybox:1.37-musl`,
+  or the cluster's node shell image when set) into the copy, at `/.recouvrance-copy`, and the copy
+  runs and is read with it. The copy shows *copy of the pod* next to its files, and says that files
+  the container wrote while it ran are not there (it starts from the image again). It is deleted,
+  by its uid, when the page closes, on its *Delete the copy* button and when the app quits; it
+  stops by itself after an hour, and one left behind (the app killed) is deleted the next time the
+  app connects to its cluster (pods labelled `recouvrance/pod-copy` older than an hour). It needs
+  write mode and RBAC to create and delete pods in the namespace (greyed out with the reason
+  otherwise). Agents' `browse_files` reads running containers only.
 - **RBAC-aware**: actions your Kubernetes RBAC forbids are disabled; *My access* shows a can-i
   matrix for the namespace, and says when the cluster (webhook or cloud IAM authorizer) may allow
   more than it lists.
@@ -88,6 +98,14 @@
 
   Each finding links to its objects. A part that can't be read (the API server's metrics need `get`
   on `/metrics`) is named, and the rest is still checked.
+- **References to missing objects**: the Problems page lists what points to something that
+  doesn't exist, on the object that points to it: a Service that selects no pod (minor when its
+  Deployment or StatefulSet is scaled to 0) or no ready one, an Ingress whose backend Service,
+  its port or a TLS Secret is missing, an HTTPRoute whose backend Service is missing (when the
+  cluster serves the Gateway API). A pod stuck creating, a workload short of ready replicas or a
+  pending PVC says which ConfigMap, Secret, PVC, ServiceAccount or StorageClass it waits on
+  (`optional: true` references aren't needed, and a running pod needs none any more). Kinds that
+  can't be read are named, not reported missing.
 - **Stuck deletions**: the Problems page lists objects (pods, workloads, Jobs, PVCs, PVs,
   Namespaces, Argo CD Applications) whose deletion has waited more than 10 minutes, with the
   finalizers holding them (for a Namespace, the resources left); their Delete dialog offers to
