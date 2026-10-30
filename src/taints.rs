@@ -119,7 +119,7 @@ pub fn labels_in(status: &str) -> impl Iterator<Item = &str> {
     status.split(',').filter(|w| !w.is_empty() && !KUBECTL_WORDS.contains(w))
 }
 
-/// "agent-not-ready" -> "AgentNotReady"; letters and digits only, so a label never holds
+/// `agent-not-ready` -> `AgentNotReady`; letters and digits only, so a label never holds
 /// the comma that separates them.
 fn camel(name: &str) -> String {
     name.split(|c: char| !c.is_ascii_alphanumeric())
@@ -261,7 +261,7 @@ mod tests {
             unschedulable in any::<bool>(),
         ) {
             let labels = trouble_labels(taints.iter().map(|(k, e)| (k.as_str(), e.as_str())));
-            prop_assert!(labels.is_empty(), "{:?}", labels);
+            prop_assert!(labels.is_empty(), "{labels:?}");
             prop_assert_eq!(node_status(ready, unschedulable, &labels), node_status(ready, unschedulable, &[]));
         }
 
@@ -287,7 +287,7 @@ mod tests {
         ) {
             let labels = trouble_labels(keys.iter().map(|k| (k.as_str(), effect.as_str())));
             for l in &labels {
-                prop_assert!(!l.is_empty() && l.chars().all(|c| c.is_ascii_alphanumeric()), "{}", l);
+                prop_assert!(!l.is_empty() && l.chars().all(|c| c.is_ascii_alphanumeric()), "{l}");
             }
             let base = node_status(Some("True"), unschedulable, &[]);
             let status = node_status(Some("True"), unschedulable, &labels);
