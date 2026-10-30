@@ -4,6 +4,7 @@ use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::input::Editor;
+use gpui_kit::component::menu::ContextMenuExt as _;
 use gpui_kit::component::tab::{Tab, TabBar};
 use gpui_kit::component::{ActiveTheme as _, Icon, IconName, Sizable as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
@@ -12,6 +13,7 @@ use gpui_kit::*;
 use super::{DetailPanel, DetailTab, container_names, writes_enabled};
 use crate::favorites::FavObject;
 use crate::k8s;
+use crate::ui::selectable::{copy_menu, selectable};
 
 impl DetailPanel {
     pub(super) fn render_overview(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -169,7 +171,7 @@ impl DetailPanel {
             .px_2()
             .gap_2()
             .flex_wrap()
-            .child(div().text_xs().text_color(muted).child(format!("Port forward (via {pod_name})")))
+            .child(div().text_xs().text_color(muted).child(selectable(format!("Port forward (via {pod_name})"))))
             .children(ports.iter().enumerate().filter_map(|(i, p)| {
                 let port = p["port"].as_i64()?;
                 let remote = resolve(&p["targetPort"], port)?;
@@ -358,12 +360,12 @@ impl DetailPanel {
                 .items_center()
                 .justify_center()
                 .gap_1()
-                .child(div().text_lg().child("No recent events"))
+                .child(div().text_lg().child(selectable("No recent events")))
                 .child(
                     div()
                         .text_sm()
                         .text_color(muted)
-                        .child("Events have a default time to live of 1 hour in Kubernetes"),
+                        .child(selectable("Events have a default time to live of 1 hour in Kubernetes")),
                 )
                 .into_any_element(),
             Some(Ok(events)) => {
@@ -387,15 +389,15 @@ impl DetailPanel {
                                         div()
                                             .font_weight(FontWeight::SEMIBOLD)
                                             .when(e.kind == "Warning", |d| d.text_color(warning))
-                                            .child(e.reason.clone()),
+                                            .child(selectable(e.reason.clone())),
                                     )
-                                    .child(div().text_color(muted).child(format!(
+                                    .child(div().text_color(muted).child(selectable(format!(
                                         "{} ago{}",
                                         e.age,
                                         if e.count > 1 { format!(" · ×{}", e.count) } else { String::new() }
-                                    ))),
+                                    )))),
                             )
-                            .child(div().text_sm().child(e.message.clone()))
+                            .child(div().text_sm().child(selectable(e.message.clone())))
                     }))
                     .into_any_element()
             }
@@ -439,6 +441,9 @@ impl Render for DetailPanel {
             self.tab = DetailTab::Overview;
         }
         let selected = tabs.iter().position(|t| *t == self.tab).unwrap_or(0);
+        // Pages of text get a right-click "Copy" for what is selected; the editor, the
+        // file browser and the terminals have their own.
+        let copy = !matches!(self.tab, DetailTab::Yaml | DetailTab::Files | DetailTab::Shell | DetailTab::Debug);
         let body = match self.tab {
             DetailTab::Overview => self.render_overview(cx),
             DetailTab::Container(ix) => self.render_container(ix, cx),
@@ -502,9 +507,9 @@ impl Render for DetailPanel {
                             .gap_1()
                             .text_xs()
                             .text_color(theme.muted_foreground)
-                            .child(self.context.clone())
+                            .child(selectable(self.context.clone()))
                             .child("·")
-                            .child(div().text_color(theme.blue).child(self.obj.kind.ar.kind.clone())),
+                            .child(div().text_color(theme.blue).child(selectable(self.obj.kind.ar.kind.clone()))),
                     )
                     .child(
                         h_flex()
@@ -516,9 +521,17 @@ impl Render for DetailPanel {
                                     .overflow_hidden()
                                     .whitespace_nowrap()
                                     .when_some(self.obj.namespace.clone(), |d, ns| {
-                                        d.child(div().text_color(theme.muted_foreground).child(format!("{ns} / ")))
+                                        d.child(
+                                            div()
+                                                .text_color(theme.muted_foreground)
+                                                .child(selectable(format!("{ns} / "))),
+                                        )
                                     })
-                                    .child(div().font_weight(FontWeight::SEMIBOLD).child(self.obj.name.clone())),
+                                    .child(
+                                        div()
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .child(selectable(self.obj.name.clone())),
+                                    ),
                             )
                             .child({
                                 let fav = FavObject {
@@ -549,7 +562,7 @@ impl Render for DetailPanel {
                                         .text_xs()
                                         .text_color(theme.success)
                                         .child(div().size_1p5().rounded_full().bg(theme.success))
-                                        .child(k8s::age(t)),
+                                        .child(selectable(k8s::age(t))),
                                 )
                             })
                             .child(div().flex_1())
@@ -599,7 +612,11 @@ impl Render for DetailPanel {
                         });
                     }),
             )
-            .child(div().flex_1().min_h_0().p_2().child(body))
+            .child(if copy {
+                div().id("detail-body").flex_1().min_h_0().p_2().child(body).context_menu(copy_menu).into_any_element()
+            } else {
+                div().flex_1().min_h_0().p_2().child(body).into_any_element()
+            })
     }
 }
 
@@ -611,5 +628,5 @@ pub(super) fn error_box(msg: SharedString, cx: &App) -> impl IntoElement {
         .border_color(cx.theme().danger)
         .text_color(cx.theme().danger)
         .text_sm()
-        .child(msg)
+        .child(selectable(msg))
 }

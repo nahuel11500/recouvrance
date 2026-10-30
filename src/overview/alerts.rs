@@ -8,6 +8,7 @@ use super::{Ctx, card, heading, s};
 use crate::alerts::Alert;
 use crate::k8s;
 use crate::problems::Severity;
+use crate::ui::selectable::selectable;
 
 /// The alerts section; nothing when there are none (or no Prometheus).
 pub(super) fn alerts(ctx: &Ctx, cx: &App) -> Option<Div> {
@@ -22,7 +23,8 @@ pub(super) fn alerts(ctx: &Ctx, cx: &App) -> Option<Div> {
         format!("Alerts ({firing} firing, {} in all)", alerts.len())
     };
     let rows = alerts.iter().enumerate().map(|(i, a)| alert_row(ctx, i, a, cx));
-    let note = ctx.related.alerts_note.clone().map(|n| div().text_xs().text_color(cx.theme().warning).child(n));
+    let note =
+        ctx.related.alerts_note.clone().map(|n| div().text_xs().text_color(cx.theme().warning).child(selectable(n)));
     Some(v_flex().child(heading(&title)).child(card(cx).p_3().gap_3().children(note).children(rows)))
 }
 
@@ -65,12 +67,12 @@ fn alert_row(ctx: &Ctx, i: usize, a: &Alert, cx: &App) -> Div {
                         .text_sm()
                         .font_weight(FontWeight::MEDIUM)
                         .when(quiet, |d| d.text_color(muted))
-                        .child(a.name().to_string()),
+                        .child(selectable(a.name().to_string())),
                 )
                 .when(!a.severity_label().is_empty(), |d| {
-                    d.child(div().text_xs().text_color(color).child(a.severity_label().to_string()))
+                    d.child(div().text_xs().text_color(color).child(selectable(a.severity_label().to_string())))
                 })
-                .child(div().text_xs().text_color(muted).child(state))
+                .child(div().text_xs().text_color(muted).child(selectable(state)))
                 .children(object.map(|o| {
                     div()
                         .min_w_0()
@@ -79,7 +81,7 @@ fn alert_row(ctx: &Ctx, i: usize, a: &Alert, cx: &App) -> Div {
                         .overflow_hidden()
                         .text_ellipsis()
                         .whitespace_nowrap()
-                        .child(o)
+                        .child(selectable(o))
                 }))
                 .child(div().flex_1())
                 .children(a.runbook.clone().map(|url| {
@@ -95,9 +97,9 @@ fn alert_row(ctx: &Ctx, i: usize, a: &Alert, cx: &App) -> Div {
                 })),
         )
         .when(!a.summary.is_empty(), |d| {
-            d.child(div().pl_4().text_sm().when(quiet, |d| d.text_color(muted)).child(a.summary.clone()))
+            d.child(div().pl_4().text_sm().when(quiet, |d| d.text_color(muted)).child(selectable(a.summary.clone())))
         })
         .when(!description.is_empty() && a.description != a.summary, |d| {
-            d.child(div().pl_4().text_xs().text_color(muted).child(description))
+            d.child(div().pl_4().text_xs().text_color(muted).child(selectable(description)))
         })
 }

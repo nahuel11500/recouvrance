@@ -11,6 +11,7 @@ use super::{
     pods_table, row, s, scroll, state_color,
 };
 use crate::k8s;
+use crate::ui::selectable::selectable;
 
 pub(super) fn workload(ctx: &Ctx, cx: &App) -> Div {
     let obj = ctx.obj;
@@ -39,7 +40,9 @@ pub(super) fn workload(ctx: &Ctx, cx: &App) -> Div {
             .when_some(strategy, |d, st| {
                 d.child(field(
                     "Strategy",
-                    v_flex().child(st.to_string()).when_some(surge.clone(), |d, s| d.child(div().text_xs().child(s))),
+                    v_flex()
+                        .child(selectable(st.to_string()))
+                        .when_some(surge.clone(), |d, s| d.child(div().text_xs().child(selectable(s)))),
                     cx,
                 ))
             })
@@ -74,14 +77,14 @@ pub(super) fn workload(ctx: &Ctx, cx: &App) -> Div {
                         h_flex()
                             .gap_2()
                             .child(Icon::new(Lucide::Box).size_4())
-                            .child(div().font_weight(FontWeight::SEMIBOLD).child(name.to_string())),
+                            .child(div().font_weight(FontWeight::SEMIBOLD).child(selectable(name.to_string()))),
                     )
                     .child(
                         div()
                             .w(px(500.))
                             .text_xs()
                             .text_color(cx.theme().muted_foreground)
-                            .child(c["image"].as_str().unwrap_or_default().to_string()),
+                            .child(selectable(c["image"].as_str().unwrap_or_default().to_string())),
                     )
                     .child(container_usage_row(c, avg.as_ref(), cx))
             },
@@ -97,10 +100,10 @@ pub(super) fn workload(ctx: &Ctx, cx: &App) -> Div {
                     .gap_4()
                     .text_sm()
                     .pb_2()
-                    .child(format!("{desired} desired"))
-                    .child(format!("{updated} updated"))
-                    .child(format!("{ready} ready"))
-                    .child(format!("{available} available")),
+                    .child(selectable(format!("{desired} desired")))
+                    .child(selectable(format!("{updated} updated")))
+                    .child(selectable(format!("{ready} ready")))
+                    .child(selectable(format!("{available} available"))),
             )
             .child(pods_table(ctx, cx));
     }
@@ -129,8 +132,8 @@ pub(super) fn scheduling(obj: &Value, spec: &str, cx: &App) -> AnyElement {
             col = col.child(field(
                 "Node affinity (preferred)",
                 card(cx)
-                    .child(div().text_xs().child(format!("Weight: {}", term["weight"])))
-                    .children(exprs.into_iter().map(|e| div().text_xs().child(e))),
+                    .child(div().text_xs().child(selectable(format!("Weight: {}", term["weight"]))))
+                    .children(exprs.into_iter().map(|e| div().text_xs().child(selectable(e)))),
                 cx,
             ));
         }
@@ -138,7 +141,7 @@ pub(super) fn scheduling(obj: &Value, spec: &str, cx: &App) -> AnyElement {
             let exprs: Vec<String> = arr(term, "/matchExpressions").iter().map(expr).collect();
             col = col.child(field(
                 "Node affinity (required)",
-                card(cx).children(exprs.into_iter().map(|e| div().text_xs().child(e))),
+                card(cx).children(exprs.into_iter().map(|e| div().text_xs().child(selectable(e)))),
                 cx,
             ));
         }
@@ -154,13 +157,12 @@ pub(super) fn scheduling(obj: &Value, spec: &str, cx: &App) -> AnyElement {
                         &format!("{label} ({mode})"),
                         card(cx)
                             .when_some(term["weight"].as_i64(), |d, w| {
-                                d.child(div().text_xs().child(format!("Weight: {w}")))
+                                d.child(div().text_xs().child(selectable(format!("Weight: {w}"))))
                             })
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .child(format!("topologyKey: {}", t["topologyKey"].as_str().unwrap_or("-"))),
-                            )
+                            .child(div().text_xs().child(selectable(format!(
+                                "topologyKey: {}",
+                                t["topologyKey"].as_str().unwrap_or("-")
+                            ))))
                             .child(clipped_list(labels, 6, cx)),
                         cx,
                     ));
@@ -205,9 +207,15 @@ pub fn relations(ctx: &Ctx, cx: &App) -> AnyElement {
             .text_sm()
             .child(div().w(px(14.)).text_color(theme.border).child(if depth == 0 { "" } else { "└" }))
             .child(Icon::new(icon).size_4().text_color(theme.muted_foreground))
-            .child(div().w(px(110.)).text_xs().text_color(theme.muted_foreground).child(kind_label.to_string()))
+            .child(
+                div()
+                    .w(px(110.))
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child(selectable(kind_label.to_string())),
+            )
             .child(content)
-            .when_some(note, |d, (n, c)| d.child(div().text_xs().text_color(c).child(n)))
+            .when_some(note, |d, (n, c)| d.child(div().text_xs().text_color(c).child(selectable(n))))
             .into_any_element()
     };
     let mut rows: Vec<AnyElement> = Vec::new();
@@ -216,7 +224,7 @@ pub fn relations(ctx: &Ctx, cx: &App) -> AnyElement {
         0,
         Lucide::Boxes,
         &ctx.kind.ar.kind,
-        div().font_weight(FontWeight::SEMIBOLD).child(own_name).into_any_element(),
+        div().font_weight(FontWeight::SEMIBOLD).child(selectable(own_name)).into_any_element(),
         None,
     ));
 
@@ -413,11 +421,11 @@ pub fn revisions(ctx: &Ctx, cx: &App) -> AnyElement {
         .text_color(muted)
         .border_b_1()
         .border_color(theme.border)
-        .child(div().w(px(70.)).child("Revision"))
-        .child(div().w(px(380.)).child("Name"))
-        .child(div().w(px(70.)).child("Replicas"))
-        .child(div().w(px(340.)).child("Images"))
-        .child(div().w(px(70.)).child("Age"))
+        .child(div().w(px(70.)).child(selectable("Revision")))
+        .child(div().w(px(380.)).child(selectable("Name")))
+        .child(div().w(px(70.)).child(selectable("Replicas")))
+        .child(div().w(px(340.)).child(selectable("Images")))
+        .child(div().w(px(70.)).child(selectable("Age")))
         .child(div().w(px(110.)))
         .child(div().w(px(110.)));
     let rs_kind = if ctx.kind.is("apps", "Deployment") { "replicasets" } else { "controllerrevisions" };
@@ -436,9 +444,13 @@ pub fn revisions(ctx: &Ctx, cx: &App) -> AnyElement {
             .border_b_1()
             .border_color(theme.border)
             .when(selected, |d| d.bg(theme.list_active))
-            .child(div().w(px(70.)).child(format!("{}{}", rev(r), if i == 0 { " (current)" } else { "" })))
+            .child(div().w(px(70.)).child(selectable(format!("{}{}", rev(r), if i == 0 { " (current)" } else { "" }))))
             .child(div().w(px(380.)).child(ctx.link(name.clone(), rs_kind, &name, cx)))
-            .child(div().w(px(70.)).child(n(r, "/status/replicas").map_or_else(|| "-".into(), |n| n.to_string())))
+            .child(
+                div()
+                    .w(px(70.))
+                    .child(selectable(n(r, "/status/replicas").map_or_else(|| "-".into(), |n| n.to_string()))),
+            )
             .child(
                 div()
                     .w(px(340.))
@@ -446,10 +458,13 @@ pub fn revisions(ctx: &Ctx, cx: &App) -> AnyElement {
                     .text_ellipsis()
                     .whitespace_nowrap()
                     .text_xs()
-                    .child(images.join(", ")),
+                    .child(selectable(images.join(", "))),
             )
             .child(
-                div().w(px(70.)).text_color(muted).child(age_of(r, "/metadata/creationTimestamp").unwrap_or_default()),
+                div()
+                    .w(px(70.))
+                    .text_color(muted)
+                    .child(selectable(age_of(r, "/metadata/creationTimestamp").unwrap_or_default())),
             )
             .when(i > 0, |d| {
                 d.child(
@@ -507,7 +522,11 @@ pub fn revisions(ctx: &Ctx, cx: &App) -> AnyElement {
                                     .when_some(bg, Styled::bg)
                                     .text_color(fg)
                                     .child(div().w(px(16.)).child(sign))
-                                    .child(div().whitespace_nowrap().child(change.value().trim_end().to_string()))
+                                    .child(
+                                        div()
+                                            .whitespace_nowrap()
+                                            .child(selectable(change.value().trim_end().to_string())),
+                                    )
                                     .into_any_element(),
                             );
                         }
@@ -517,7 +536,11 @@ pub fn revisions(ctx: &Ctx, cx: &App) -> AnyElement {
                     .gap_1()
                     .child(heading(&format!("Revision {} → {} (current)", rev(old), rev(new))))
                     .child(if lines.is_empty() {
-                        div().text_sm().text_color(muted).child("The pod templates are identical.").into_any_element()
+                        div()
+                            .text_sm()
+                            .text_color(muted)
+                            .child(selectable("The pod templates are identical."))
+                            .into_any_element()
                     } else {
                         v_flex()
                             .rounded_md()
@@ -535,7 +558,7 @@ pub fn revisions(ctx: &Ctx, cx: &App) -> AnyElement {
                 .pt_3()
                 .text_sm()
                 .text_color(muted)
-                .child("Pick an older revision to see what changed in the pod template.")
+                .child(selectable("Pick an older revision to see what changed in the pod template."))
                 .into_any_element(),
         };
     let notes = load_notes(ctx.related, &["revisions"], cx);
@@ -604,10 +627,10 @@ pub(super) fn hpa(ctx: &Ctx, cx: &App) -> Div {
             .text_sm()
             .border_b_1()
             .border_color(theme.border)
-            .child(div().w(px(120.)).text_color(theme.muted_foreground).child(kind.to_string()))
-            .child(div().w(px(260.)).child(name))
-            .child(div().w(px(120.)).child(current))
-            .child(div().w(px(120.)).text_color(theme.muted_foreground).child(format!("target {target}")))
+            .child(div().w(px(120.)).text_color(theme.muted_foreground).child(selectable(kind.to_string())))
+            .child(div().w(px(260.)).child(selectable(name)))
+            .child(div().w(px(120.)).child(selectable(current)))
+            .child(div().w(px(120.)).text_color(theme.muted_foreground).child(selectable(format!("target {target}"))))
     });
     v_flex()
         .child(
@@ -620,14 +643,16 @@ pub(super) fn hpa(ctx: &Ctx, cx: &App) -> Div {
                 ))
                 .child(field(
                     "Replicas",
-                    div().when(at_max, |d| d.text_color(theme.warning)).child(format!("{current} (wants {desired})")),
+                    div()
+                        .when(at_max, |d| d.text_color(theme.warning))
+                        .child(selectable(format!("{current} (wants {desired})"))),
                     cx,
                 ))
                 .child(field("Range", format!("{min} – {max}"), cx))
                 .when(at_max, |d| {
                     d.child(field(
                         "Note",
-                        div().text_color(theme.warning).child("At maximum: it cannot scale further"),
+                        div().text_color(theme.warning).child(selectable("At maximum: it cannot scale further")),
                         cx,
                     ))
                 }),
@@ -666,16 +691,16 @@ pub(super) fn cron_jobs(ctx: &Ctx, cx: &App) -> Div {
                 .border_b_1()
                 .border_color(theme.border)
                 .child(div().w(px(380.)).child(ctx.link(name.clone(), "jobs", &name, cx)))
-                .child(div().w(px(90.)).text_color(color).child(status))
-                .child(div().w(px(110.)).child(format!(
+                .child(div().w(px(90.)).text_color(color).child(selectable(status)))
+                .child(div().w(px(110.)).child(selectable(format!(
                     "{}/{}",
                     n(j, "/status/succeeded").unwrap_or(0),
                     n(j, "/spec/completions").unwrap_or(1)
-                )))
+                ))))
                 .child(
                     div()
                         .text_color(theme.muted_foreground)
-                        .child(age_of(j, "/metadata/creationTimestamp").unwrap_or_default()),
+                        .child(selectable(age_of(j, "/metadata/creationTimestamp").unwrap_or_default())),
                 )
         }))
 }
@@ -728,7 +753,7 @@ pub(super) fn pdb_page(ctx: &Ctx, cx: &App) -> Div {
                         } else {
                             theme.success
                         })
-                        .child(allowed.to_string()),
+                        .child(selectable(allowed.to_string())),
                     cx,
                 ))
                 .child(field(
@@ -748,13 +773,9 @@ pub(super) fn pdb_page(ctx: &Ctx, cx: &App) -> Div {
                 )),
         )
         .when(blocks, |d| {
-            d.child(
-                div()
-                    .pt_2()
-                    .text_sm()
-                    .text_color(theme.warning)
-                    .child("No pod can be evicted now: node drains and cluster upgrades will wait on this budget."),
-            )
+            d.child(div().pt_2().text_sm().text_color(theme.warning).child(selectable(
+                "No pod can be evicted now: node drains and cluster upgrades will wait on this budget.",
+            )))
         })
         .child(heading_for(&format!("Pods it covers ({})", ctx.related.pods.len()), ctx.related, "pods", cx))
         .child(pods_table(ctx, cx))
@@ -788,13 +809,13 @@ pub(super) fn vpa_page(ctx: &Ctx, cx: &App) -> Div {
         .text_color(theme.muted_foreground)
         .border_b_1()
         .border_color(theme.border)
-        .child(div().w(px(160.)).child("Container"))
-        .child(div().w(px(90.)).child("Resource"))
-        .child(div().w(px(110.)).child("Requested now"))
-        .child(div().w(px(110.)).child("Lower bound"))
-        .child(div().w(px(110.)).child("Target"))
-        .child(div().w(px(110.)).child("Upper bound"))
-        .child(div().w(px(110.)).child("Uncapped"));
+        .child(div().w(px(160.)).child(selectable("Container")))
+        .child(div().w(px(90.)).child(selectable("Resource")))
+        .child(div().w(px(110.)).child(selectable("Requested now")))
+        .child(div().w(px(110.)).child(selectable("Lower bound")))
+        .child(div().w(px(110.)).child(selectable("Target")))
+        .child(div().w(px(110.)).child(selectable("Upper bound")))
+        .child(div().w(px(110.)).child(selectable("Uncapped")));
     let mut rows = Vec::new();
     for r in recs {
         let c = r["containerName"].as_str().unwrap_or("?").to_string();
@@ -817,13 +838,15 @@ pub(super) fn vpa_page(ctx: &Ctx, cx: &App) -> Div {
                     .text_sm()
                     .border_b_1()
                     .border_color(theme.border)
-                    .child(div().w(px(160.)).child(c.clone()))
-                    .child(div().w(px(90.)).child(res))
-                    .child(div().w(px(110.)).when(far, |d| d.text_color(theme.warning)).child(now))
-                    .child(div().w(px(110.)).text_color(theme.muted_foreground).child(get("lowerBound")))
-                    .child(div().w(px(110.)).font_weight(FontWeight::MEDIUM).child(target_v))
-                    .child(div().w(px(110.)).text_color(theme.muted_foreground).child(get("upperBound")))
-                    .child(div().w(px(110.)).text_color(theme.muted_foreground).child(get("uncappedTarget"))),
+                    .child(div().w(px(160.)).child(selectable(c.clone())))
+                    .child(div().w(px(90.)).child(selectable(res)))
+                    .child(div().w(px(110.)).when(far, |d| d.text_color(theme.warning)).child(selectable(now)))
+                    .child(div().w(px(110.)).text_color(theme.muted_foreground).child(selectable(get("lowerBound"))))
+                    .child(div().w(px(110.)).font_weight(FontWeight::MEDIUM).child(selectable(target_v)))
+                    .child(div().w(px(110.)).text_color(theme.muted_foreground).child(selectable(get("upperBound"))))
+                    .child(
+                        div().w(px(110.)).text_color(theme.muted_foreground).child(selectable(get("uncappedTarget"))),
+                    ),
             );
         }
     }
@@ -834,7 +857,7 @@ pub(super) fn vpa_page(ctx: &Ctx, cx: &App) -> Div {
                 .pt_4()
                 .child(field(
                     "Target",
-                    h_flex().gap_1().child(tkind).child(ctx.link(tname.clone(), &plural, &tname, cx)),
+                    h_flex().gap_1().child(selectable(tkind)).child(ctx.link(tname.clone(), &plural, &tname, cx)),
                     cx,
                 ))
                 .child(field("Update mode", s(obj, "/spec/updatePolicy/updateMode").unwrap_or("Auto").to_string(), cx))
@@ -851,7 +874,7 @@ pub(super) fn vpa_page(ctx: &Ctx, cx: &App) -> Div {
             div()
                 .text_sm()
                 .text_color(theme.muted_foreground)
-                .child("No recommendation yet (the recommender needs some history).")
+                .child(selectable("No recommendation yet (the recommender needs some history)."))
                 .into_any_element()
         } else {
             v_flex()
@@ -862,7 +885,7 @@ pub(super) fn vpa_page(ctx: &Ctx, cx: &App) -> Div {
                         .pt_1()
                         .text_xs()
                         .text_color(theme.muted_foreground)
-                        .child("Requests more than 2× away from the target are highlighted."),
+                        .child(selectable("Requests more than 2× away from the target are highlighted.")),
                 )
                 .into_any_element()
         })

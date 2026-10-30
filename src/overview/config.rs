@@ -9,6 +9,7 @@ use serde_json::Value;
 
 use super::{Ctx, age_of, arr, clipped_list, field, heading, mono, row, s, state_color};
 use crate::k8s;
+use crate::ui::selectable::{dragged, selectable};
 
 /// Certificates are public, so they are decoded even while values are masked.
 pub(super) fn certificates(data: &serde_json::Map<String, Value>, base64: bool, cx: &App) -> Option<Div> {
@@ -55,11 +56,13 @@ pub(super) fn certificates(data: &serde_json::Map<String, Value>, base64: bool, 
                     h_flex()
                         .gap_2()
                         .child(Icon::new(Lucide::ShieldCheck).text_color(color))
-                        .child(div().font_weight(FontWeight::MEDIUM).child(c.subject.clone()))
-                        .when(c.is_ca, |d| d.child(div().text_xs().px_1().rounded_sm().bg(theme.secondary).child("CA")))
+                        .child(div().font_weight(FontWeight::MEDIUM).child(selectable(c.subject.clone())))
+                        .when(c.is_ca, |d| {
+                            d.child(div().text_xs().px_1().rounded_sm().bg(theme.secondary).child(selectable("CA")))
+                        })
                         .child(div().flex_1())
-                        .child(div().text_sm().text_color(color).child(state))
-                        .child(div().text_xs().text_color(theme.muted_foreground).child(key)),
+                        .child(div().text_sm().text_color(color).child(selectable(state)))
+                        .child(div().text_xs().text_color(theme.muted_foreground).child(selectable(key))),
                 )
                 .child(
                     row()
@@ -99,7 +102,7 @@ pub(super) fn secret(ctx: &Ctx, cx: &App) -> Div {
         .children(external_secret_source(ctx, cx))
         .children(certificates(&data, true, cx))
         .child(heading(&format!("Data ({} keys)", data.len())))
-        .child(div().pb_1().text_xs().text_color(muted).child("Click a value to show or hide it."))
+        .child(div().pb_1().text_xs().text_color(muted).child(selectable("Click a value to show or hide it.")))
 }
 
 /// "From `ExternalSecret`": the `ExternalSecret` that writes this Secret, its store, how often it
@@ -119,9 +122,10 @@ fn external_secret_source(ctx: &Ctx, cx: &App) -> Option<Div> {
             Some(Tone::Done) | None => theme.muted_foreground,
         };
         let why = crate::external_secrets::shorten(if message.trim().is_empty() { reason } else { message });
-        let ready = v_flex()
-            .child(div().text_color(color).child(status.to_string()))
-            .when(!why.is_empty(), |d| d.child(div().text_xs().text_color(theme.muted_foreground).child(why)));
+        let ready =
+            v_flex().child(div().text_color(color).child(selectable(status.to_string()))).when(!why.is_empty(), |d| {
+                d.child(div().text_xs().text_color(theme.muted_foreground).child(selectable(why)))
+            });
         fields = fields.child(field("Ready", ready, cx).max_w(px(480.)));
     }
     Some(v_flex().child(heading("From ExternalSecret")).child(fields))
@@ -180,10 +184,12 @@ pub(super) fn secret_entry(ctx: &Ctx, i: usize, cx: &App) -> AnyElement {
                 .flex_1()
                 .min_w_0()
                 .cursor_pointer()
-                .on_click(move |_, _, cx| {
-                    let _ = panel.update(cx, |p, cx| p.toggle_secret_key(&key, cx));
+                .on_click(move |click, _, cx| {
+                    if !dragged(click) {
+                        let _ = panel.update(cx, |p, cx| p.toggle_secret_key(&key, cx));
+                    }
                 })
-                .child(div().text_xs().text_color(muted).child(k.clone()))
+                .child(div().text_xs().text_color(muted).child(selectable(k.clone())))
                 .child(mono(value, cx)),
         )
         .child(
@@ -217,9 +223,11 @@ pub(super) fn config_entry(obj: &Value, i: usize, cx: &App) -> AnyElement {
         .mb_1()
         .rounded_md()
         .bg(cx.theme().secondary.opacity(0.5))
-        .child(div().text_xs().text_color(muted).child(k.clone()))
+        .child(div().text_xs().text_color(muted).child(selectable(k.clone())))
         .children(lines.into_iter().map(|l| mono(l.to_string(), cx)))
-        .when(more > 0, |d| d.child(div().text_xs().text_color(muted).child(format!("… {more} more lines (see YAML)"))))
+        .when(more > 0, |d| {
+            d.child(div().text_xs().text_color(muted).child(selectable(format!("… {more} more lines (see YAML)"))))
+        })
         .into_any_element()
 }
 
@@ -303,13 +311,13 @@ pub(super) fn crd(ctx: &Ctx, cx: &App) -> Div {
                 .gap_3()
                 .text_sm()
                 .child(mono(v["name"].as_str().unwrap_or_default().to_string(), cx))
-                .when(v["served"] == true, |d| d.child(div().text_color(theme.success).child("served")))
-                .when(v["storage"] == true, |d| d.child(div().text_color(theme.blue).child("storage")))
+                .when(v["served"] == true, |d| d.child(div().text_color(theme.success).child(selectable("served"))))
+                .when(v["storage"] == true, |d| d.child(div().text_color(theme.blue).child(selectable("storage"))))
                 .when(v["deprecated"] == true, |d| {
                     d.child(
                         div()
                             .text_color(theme.warning)
-                            .child(v["deprecationWarning"].as_str().unwrap_or("deprecated").to_string()),
+                            .child(selectable(v["deprecationWarning"].as_str().unwrap_or("deprecated").to_string())),
                     )
                 })
         }))
@@ -333,7 +341,7 @@ pub(super) fn schema_row((depth, name, ty, required, desc): &SchemaRow, cx: &App
                 .pl(px(depth as f32 * 18.))
                 .font_family(theme.mono_font_family.clone())
                 .text_color(if depth == 0 { theme.foreground } else { theme.muted_foreground })
-                .child(name.clone()),
+                .child(selectable(name.clone())),
         )
         .child(
             div()
@@ -342,7 +350,7 @@ pub(super) fn schema_row((depth, name, ty, required, desc): &SchemaRow, cx: &App
                 .font_family(theme.mono_font_family.clone())
                 .text_xs()
                 .text_color(theme.blue)
-                .child(ty.clone()),
+                .child(selectable(ty.clone())),
         )
         .child(
             div()
@@ -350,7 +358,7 @@ pub(super) fn schema_row((depth, name, ty, required, desc): &SchemaRow, cx: &App
                 .flex_shrink_0()
                 .text_xs()
                 .text_color(theme.warning)
-                .when(*required, |d| d.child("required")),
+                .when(*required, |d| d.child(selectable("required"))),
         )
         .child(
             div()
@@ -361,7 +369,7 @@ pub(super) fn schema_row((depth, name, ty, required, desc): &SchemaRow, cx: &App
                 .overflow_hidden()
                 .text_ellipsis()
                 .whitespace_nowrap()
-                .child(desc.clone()),
+                .child(selectable(desc.clone())),
         )
         .into_any_element()
 }
@@ -375,14 +383,14 @@ pub(super) fn pvc(ctx: &Ctx, cx: &App) -> Div {
     v_flex().child(
         row()
             .pt_4()
-            .child(field("Status", div().text_color(state_color(&phase, cx)).child(phase.clone()), cx))
+            .child(field("Status", div().text_color(state_color(&phase, cx)).child(selectable(phase.clone())), cx))
             .child(field("Capacity", s(obj, "/status/capacity/storage").unwrap_or("-").to_string(), cx))
             .child(field("Requested", s(obj, "/spec/resources/requests/storage").unwrap_or("-").to_string(), cx))
             .child(field("Access modes", modes.join(", "), cx))
             .child(field(
                 "Volume",
                 if volume.is_empty() {
-                    div().child("-").into_any_element()
+                    div().child(selectable("-")).into_any_element()
                 } else {
                     ctx.link(volume.clone(), "persistentvolumes", &volume, cx).into_any_element()
                 },
@@ -391,7 +399,7 @@ pub(super) fn pvc(ctx: &Ctx, cx: &App) -> Div {
             .child(field(
                 "Storage class",
                 if class.is_empty() {
-                    div().child("-").into_any_element()
+                    div().child(selectable("-")).into_any_element()
                 } else {
                     ctx.link(class.clone(), "storageclasses", &class, cx).into_any_element()
                 },
@@ -424,8 +432,8 @@ pub(super) fn namespace(ctx: &Ctx, cx: &App) -> Div {
             h_flex()
                 .gap_3()
                 .text_sm()
-                .child(div().w(px(260.)).child(res.clone()))
-                .child(div().w(px(160.)).child(format!("{u} / {h}")))
+                .child(div().w(px(260.)).child(selectable(res.clone())))
+                .child(div().w(px(160.)).child(selectable(format!("{u} / {h}"))))
                 .child(
                     div()
                         .w(px(240.))
@@ -434,7 +442,12 @@ pub(super) fn namespace(ctx: &Ctx, cx: &App) -> Div {
                         .bg(theme.secondary)
                         .child(div().h_full().rounded_full().bg(color).w(relative(pct as f32))),
                 )
-                .child(div().text_xs().text_color(theme.muted_foreground).child(format!("{:.0}%", pct * 100.0)))
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child(selectable(format!("{:.0}%", pct * 100.0))),
+                )
         });
         quotas = quotas.child(
             v_flex()
@@ -458,7 +471,11 @@ pub(super) fn namespace(ctx: &Ctx, cx: &App) -> Div {
         )
         .child(heading("Resource quotas"))
         .child(if ctx.related.extra.is_empty() {
-            div().text_sm().text_color(theme.muted_foreground).child("No quota in this namespace.").into_any_element()
+            div()
+                .text_sm()
+                .text_color(theme.muted_foreground)
+                .child(selectable("No quota in this namespace."))
+                .into_any_element()
         } else {
             quotas.into_any_element()
         })

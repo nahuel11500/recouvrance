@@ -14,6 +14,7 @@ use super::DetailPanel;
 use super::compare::diff_block;
 use crate::history::{self, Change, DiffLine, Fetched};
 use crate::k8s;
+use crate::ui::selectable::selectable;
 
 #[derive(Default)]
 pub(super) struct HistoryState {
@@ -101,11 +102,11 @@ impl DetailPanel {
         }
         let header = h_flex()
             .gap_2()
-            .child(div().flex_1().text_xs().text_color(muted).child(
+            .child(div().flex_1().text_xs().text_color(muted).child(selectable(
                 "From what the cluster keeps: revisions, Helm and Argo CD history, who last wrote which \
                  fields (managedFields), and events (kept about an hour); and what the app recorded while it \
                  watched the object (Recorded, see the Timeline page).",
-            ))
+            )))
             .child(
                 Button::new("history-reload")
                     .xsmall()
@@ -118,60 +119,66 @@ impl DetailPanel {
                         cx.notify();
                     })),
             );
-        let rows = self.history.merged.iter().enumerate().map(|(i, c)| {
-            let key = c.key();
-            let open = self.history.open.get(&key).cloned();
-            let label = if open.is_some() { "Hide diff" } else { "Diff" };
-            v_flex()
-                .gap_1()
-                .py_1()
-                .border_b_1()
-                .border_color(theme.border)
-                .child(
-                    h_flex()
-                        .gap_3()
-                        .items_start()
-                        .text_sm()
-                        .child(
-                            div()
-                                .w(px(56.))
-                                .flex_none()
-                                .text_color(muted)
-                                .child(c.time.map(k8s::age).unwrap_or_default()),
-                        )
-                        .child(div().w(px(64.)).flex_none().text_xs().text_color(theme.blue).child(c.source.label()))
-                        .child(
-                            div()
-                                .w(px(260.))
-                                .flex_none()
-                                .overflow_hidden()
-                                .text_ellipsis()
-                                .whitespace_nowrap()
-                                .child(c.object.clone()),
-                        )
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .when(c.warning, |d| d.text_color(theme.warning))
-                                .child(c.summary.clone()),
-                        )
-                        .when(c.diff.is_some(), |d| {
-                            d.child(
-                                Button::new(("history-diff", i)).xsmall().ghost().label(label).on_click(
-                                    cx.listener(move |this, _, _, cx| this.toggle_change_diff(key.clone(), cx)),
-                                ),
+        let rows =
+            self.history.merged.iter().enumerate().map(|(i, c)| {
+                let key = c.key();
+                let open = self.history.open.get(&key).cloned();
+                let label = if open.is_some() { "Hide diff" } else { "Diff" };
+                v_flex()
+                    .gap_1()
+                    .py_1()
+                    .border_b_1()
+                    .border_color(theme.border)
+                    .child(
+                        h_flex()
+                            .gap_3()
+                            .items_start()
+                            .text_sm()
+                            .child(
+                                div()
+                                    .w(px(56.))
+                                    .flex_none()
+                                    .text_color(muted)
+                                    .child(selectable(c.time.map(k8s::age).unwrap_or_default())),
                             )
-                        }),
-                )
-                .when_some(open, |d, lines| {
-                    d.child(if lines.is_empty() {
-                        div().text_xs().text_color(muted).child("No difference.").into_any_element()
-                    } else {
-                        diff_block(&lines, cx)
+                            .child(
+                                div()
+                                    .w(px(64.))
+                                    .flex_none()
+                                    .text_xs()
+                                    .text_color(theme.blue)
+                                    .child(selectable(c.source.label())),
+                            )
+                            .child(
+                                div()
+                                    .w(px(260.))
+                                    .flex_none()
+                                    .overflow_hidden()
+                                    .text_ellipsis()
+                                    .whitespace_nowrap()
+                                    .child(selectable(c.object.clone())),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .when(c.warning, |d| d.text_color(theme.warning))
+                                    .child(selectable(c.summary.clone())),
+                            )
+                            .when(c.diff.is_some(), |d| {
+                                d.child(Button::new(("history-diff", i)).xsmall().ghost().label(label).on_click(
+                                    cx.listener(move |this, _, _, cx| this.toggle_change_diff(key.clone(), cx)),
+                                ))
+                            }),
+                    )
+                    .when_some(open, |d, lines| {
+                        d.child(if lines.is_empty() {
+                            div().text_xs().text_color(muted).child(selectable("No difference.")).into_any_element()
+                        } else {
+                            diff_block(&lines, cx)
+                        })
                     })
-                })
-        });
+            });
         v_flex()
             .id("history")
             .size_full()
@@ -181,10 +188,10 @@ impl DetailPanel {
             .children(
                 errors
                     .into_iter()
-                    .map(|e| div().text_xs().text_color(theme.danger).child(format!("Could not read {e}"))),
+                    .map(|e| div().text_xs().text_color(theme.danger).child(selectable(format!("Could not read {e}")))),
             )
             .when(self.history.merged.is_empty(), |d| {
-                d.child(div().text_sm().text_color(muted).child("No changes found."))
+                d.child(div().text_sm().text_color(muted).child(selectable("No changes found.")))
             })
             .child(v_flex().children(rows))
             .into_any_element()

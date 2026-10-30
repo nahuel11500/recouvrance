@@ -6,6 +6,7 @@ use gpui_kit::*;
 use serde_json::Value;
 
 use super::{Ctx, arr, clipped_list, field, heading, mono, mono_url, pairs, row, s};
+use crate::ui::selectable::selectable;
 
 pub(super) fn service(ctx: &Ctx, cx: &App) -> Div {
     let obj = ctx.obj;
@@ -71,9 +72,9 @@ pub(super) fn ingress(ctx: &Ctx, cx: &App) -> Div {
                     .gap_2()
                     .text_sm()
                     .child(mono_url(("ingress-rule", i * 1000 + j), format!("{host}{path}"), url, cx))
-                    .child(div().text_color(muted).child("→"))
+                    .child(div().text_color(muted).child(selectable("→")))
                     .child(ctx.link(svc.clone(), "services", &svc, cx))
-                    .child(div().text_color(muted).child(format!(":{port}"))),
+                    .child(div().text_color(muted).child(selectable(format!(":{port}")))),
             );
         }
     }
@@ -98,7 +99,7 @@ pub(super) fn ingress(ctx: &Ctx, cx: &App) -> Div {
                             cx,
                         )
                     }))
-                    .child(div().text_color(muted).child("secret"))
+                    .child(div().text_color(muted).child(selectable("secret")))
                     .child(ctx.link(secret.clone(), "secrets", secret, cx))
             }))
         })
@@ -119,7 +120,7 @@ pub(super) fn gw_ref(ctx: &Ctx, r: &Value, default_group: &str, default_kind: &s
     } else {
         h_flex()
             .gap_1()
-            .child(div().text_xs().text_color(cx.theme().muted_foreground).child(kind.to_string()))
+            .child(div().text_xs().text_color(cx.theme().muted_foreground).child(selectable(kind.to_string())))
             .child(link)
             .into_any_element()
     }
@@ -156,7 +157,7 @@ pub(super) fn status_dot(ok: Option<bool>, label: &str, cx: &App) -> Div {
         .text_sm()
         .text_color(color)
         .child(div().size(px(7.)).rounded_full().bg(color))
-        .child(label.to_string())
+        .child(selectable(label.to_string()))
 }
 
 pub(super) fn gateway(ctx: &Ctx, cx: &App) -> Div {
@@ -166,7 +167,8 @@ pub(super) fn gateway(ctx: &Ctx, cx: &App) -> Div {
     let addresses: Vec<String> =
         arr(obj, "/status/addresses").iter().filter_map(|a| a["value"].as_str().map(String::from)).collect();
     let listener_status = arr(obj, "/status/listeners");
-    let header = |t: &str, w: f32| div().w(px(w)).flex_shrink_0().text_xs().text_color(muted).child(t.to_string());
+    let header =
+        |t: &str, w: f32| div().w(px(w)).flex_shrink_0().text_xs().text_color(muted).child(selectable(t.to_string()));
     let listeners = arr(obj, "/spec/listeners").iter().map(|l| {
         let name = l["name"].as_str().unwrap_or_default().to_string();
         let st = listener_status.iter().find(|s| s["name"] == name.as_str());
@@ -182,22 +184,22 @@ pub(super) fn gateway(ctx: &Ctx, cx: &App) -> Div {
             .border_b_1()
             .border_color(theme.border)
             .text_sm()
-            .child(div().w(px(140.)).flex_shrink_0().font_weight(FontWeight::MEDIUM).child(name))
-            .child(div().w(px(120.)).flex_shrink_0().child(format!(
+            .child(div().w(px(140.)).flex_shrink_0().font_weight(FontWeight::MEDIUM).child(selectable(name)))
+            .child(div().w(px(120.)).flex_shrink_0().child(selectable(format!(
                 "{} :{}",
                 l["protocol"].as_str().unwrap_or("-"),
                 l["port"].as_i64().unwrap_or(0)
-            )))
+            ))))
             .child(
                 div()
                     .w(px(220.))
                     .flex_shrink_0()
                     .overflow_hidden()
                     .text_ellipsis()
-                    .child(l["hostname"].as_str().unwrap_or("*").to_string()),
+                    .child(selectable(l["hostname"].as_str().unwrap_or("*").to_string())),
             )
-            .child(div().w(px(90.)).flex_shrink_0().child(attached.to_string()))
-            .child(div().w(px(110.)).flex_shrink_0().text_color(muted).child(from))
+            .child(div().w(px(90.)).flex_shrink_0().child(selectable(attached.to_string())))
+            .child(div().w(px(110.)).flex_shrink_0().text_color(muted).child(selectable(from)))
             .child(div().w(px(110.)).flex_shrink_0().child(status_dot(
                 programmed,
                 if programmed == Some(false) { "Not ready" } else { "Programmed" },
@@ -275,13 +277,13 @@ pub(super) fn route(ctx: &Ctx, cx: &App) -> Div {
             .py_1()
             .child(gw_ref(ctx, p, "gateway.networking.k8s.io", "Gateway", cx))
             .when_some(p["sectionName"].as_str(), |d, s| {
-                d.child(div().text_sm().text_color(muted).child(format!("listener {s}")))
+                d.child(div().text_sm().text_color(muted).child(selectable(format!("listener {s}"))))
             })
             .child(status_dot(accepted, "Accepted", cx))
             .child(status_dot(resolved, "Refs resolved", cx))
-            .when_some(problem, |d, m| d.child(div().text_sm().text_color(theme.danger).child(m)))
+            .when_some(problem, |d, m| d.child(div().text_sm().text_color(theme.danger).child(selectable(m))))
             .when_some(st.and_then(|s| s["controllerName"].as_str()), |d, c| {
-                d.child(div().text_xs().text_color(muted).child(c.to_string()))
+                d.child(div().text_xs().text_color(muted).child(selectable(c.to_string())))
             })
     });
     let rules = arr(obj, "/spec/rules").iter().enumerate().map(|(i, r)| {
@@ -334,9 +336,11 @@ pub(super) fn route(ctx: &Ctx, cx: &App) -> Div {
                 h_flex()
                     .gap_1()
                     .child(gw_ref(ctx, b, "", "Service", cx))
-                    .when_some(b["port"].as_i64(), |d, p| d.child(div().text_color(muted).child(format!(":{p}"))))
+                    .when_some(b["port"].as_i64(), |d, p| {
+                        d.child(div().text_color(muted).child(selectable(format!(":{p}"))))
+                    })
                     .when_some(b["weight"].as_i64(), |d, w| {
-                        d.child(div().text_xs().text_color(muted).child(format!("weight {w}")))
+                        d.child(div().text_xs().text_color(muted).child(selectable(format!("weight {w}"))))
                     })
                     .into_any_element()
             })
@@ -349,7 +353,9 @@ pub(super) fn route(ctx: &Ctx, cx: &App) -> Div {
             .items_start()
             .border_b_1()
             .border_color(theme.border)
-            .child(div().w(px(24.)).flex_shrink_0().text_xs().text_color(muted).child(format!("#{}", i + 1)))
+            .child(
+                div().w(px(24.)).flex_shrink_0().text_xs().text_color(muted).child(selectable(format!("#{}", i + 1))),
+            )
             .child(
                 v_flex().w(px(320.)).flex_shrink_0().children(
                     if matches.is_empty() { vec!["everything".to_string()] } else { matches }
@@ -357,9 +363,9 @@ pub(super) fn route(ctx: &Ctx, cx: &App) -> Div {
                         .map(|m| mono(m, cx)),
                 ),
             )
-            .child(div().text_color(muted).child("→"))
+            .child(div().text_color(muted).child(selectable("→")))
             .child(v_flex().gap_1().children(backends).when(!filters.is_empty(), |d| {
-                d.child(div().text_xs().text_color(muted).child(format!("filters: {}", filters.join(", "))))
+                d.child(div().text_xs().text_color(muted).child(selectable(format!("filters: {}", filters.join(", ")))))
             }))
     });
     v_flex()
@@ -434,8 +440,10 @@ pub(super) fn netpol(ctx: &Ctx, cx: &App) -> Div {
         let applies = types.contains(&title);
         v_flex()
             .child(heading(title))
-            .when(!applies, |d| d.child(div().text_sm().text_color(muted).child("Not restricted by this policy.")))
-            .when(applies && rules.is_empty(), |d| d.child(div().text_sm().child(empty.to_string())))
+            .when(!applies, |d| {
+                d.child(div().text_sm().text_color(muted).child(selectable("Not restricted by this policy.")))
+            })
+            .when(applies && rules.is_empty(), |d| d.child(div().text_sm().child(selectable(empty.to_string()))))
             .children(rules.iter().map(|r| {
                 let peers: Vec<String> =
                     r[peers_key].as_array().map_or_else(|| vec!["anything".into()], |a| a.iter().map(peer).collect());
@@ -444,8 +452,8 @@ pub(super) fn netpol(ctx: &Ctx, cx: &App) -> Div {
                     .text_sm()
                     .border_b_1()
                     .border_color(cx.theme().border)
-                    .children(peers.into_iter().map(|p| div().child(p)))
-                    .child(div().text_xs().text_color(muted).child(ports(r)))
+                    .children(peers.into_iter().map(|p| div().child(selectable(p))))
+                    .child(div().text_xs().text_color(muted).child(selectable(ports(r))))
             }))
     };
     v_flex()

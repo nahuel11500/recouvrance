@@ -19,6 +19,10 @@
   mounts), workloads (scheduling, pods, revisions with diffs), services (port-forward, backing
   pods), secrets (masked, referenced by), ingresses, PVCs, namespaces (quotas), nodes, CronJobs,
   and a generic spec/status view for anything else.
+- **Select and copy text** on detail pages, as on a web page: a drag selects (across fields,
+  labels, annotations, conditions, events, the History, Compare and Reachability tabs), Ctrl+C or
+  a right-click *Copy* copies it, a double-click selects a word. Text cut short with `…` is
+  selected and copied whole. Links still open on a click; a drag over one selects its text.
 - **History**: an object's page has a History tab listing what changed, newest first, from what
   the cluster already keeps (nothing runs in the background; it is read when the tab is first
   opened): a Deployment's ReplicaSets and a StatefulSet's or DaemonSet's ControllerRevisions
