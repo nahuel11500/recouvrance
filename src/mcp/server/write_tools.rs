@@ -200,7 +200,7 @@ impl KubeMcp {
     }
 
     #[tool(
-        description = "GitOps actions: Flux `reconcile` (like `flux reconcile`), `suspend`, `resume`; Argo CD Application `refresh` or `sync`. Authorized as `patch` on the object."
+        description = "GitOps actions: Flux `reconcile` (like `flux reconcile`), `suspend`, `resume`; Argo CD Application `refresh`, `hard_refresh` (renders its manifests again, without Argo CD's cache) or `sync`. Authorized as `patch` on the object."
     )]
     async fn gitops(
         &self,
@@ -215,12 +215,12 @@ impl KubeMcp {
         let argo = kind.is("argoproj.io", "Application");
         let ok = match p.action.as_str() {
             "reconcile" | "suspend" | "resume" => flux,
-            "refresh" | "sync" => argo,
+            "refresh" | "hard_refresh" | "sync" => argo,
             _ => false,
         };
         if !ok {
             return call.finish(Err(anyhow::anyhow!(
-                "`{}` does not apply to {} (Flux: reconcile/suspend/resume; Argo CD applications: refresh/sync)",
+                "`{}` does not apply to {} (Flux: reconcile/suspend/resume; Argo CD applications: refresh/hard_refresh/sync)",
                 p.action,
                 kind.ar.kind
             )));
@@ -233,7 +233,8 @@ impl KubeMcp {
             "reconcile" => k8s::flux_reconcile(client, kind, ns, name).await,
             "suspend" => k8s::merge_patch(client, kind, ns, name, json!({"spec": {"suspend": true}}), false).await,
             "resume" => k8s::merge_patch(client, kind, ns, name, json!({"spec": {"suspend": false}}), false).await,
-            "refresh" => k8s::argo_refresh(client, kind, ns, name).await,
+            "refresh" => k8s::argo_refresh(client, kind, ns, name, false).await,
+            "hard_refresh" => k8s::argo_refresh(client, kind, ns, name, true).await,
             _ => k8s::argo_sync(client, kind, ns, name).await,
         })
     }

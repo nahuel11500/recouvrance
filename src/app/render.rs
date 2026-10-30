@@ -78,8 +78,10 @@ impl AppView {
     fn render_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
         let (view, view2) = (cx.entity().downgrade(), cx.entity().downgrade());
-        let refreshable =
-            matches!(self.route(), Route::Cluster(_) | Route::Workloads(_) | Route::Problems(_) | Route::Helm(_));
+        let refreshable = matches!(
+            self.route(),
+            Route::Cluster(_) | Route::Workloads(_) | Route::Problems(_) | Route::Helm(_) | Route::Argo(_)
+        );
         h_flex()
             .flex_1()
             .min_w_0()
@@ -353,6 +355,7 @@ impl AppView {
             Route::Assistant(d) => d.clone().into_any_element(),
             Route::Helm(d) => d.clone().into_any_element(),
             Route::HelmRelease(d) => d.clone().into_any_element(),
+            Route::Argo(d) => d.clone().into_any_element(),
             Route::Contexts => self.render_contexts(cx).into_any_element(),
             Route::Settings => self.settings_view.clone().into_any_element(),
             Route::Apply(a) => a.clone().into_any_element(),

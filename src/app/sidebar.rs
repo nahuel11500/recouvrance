@@ -293,8 +293,8 @@ impl AppView {
     }
 
     /// The pages: agents (with pending approvals), assistant, problems (with their
-    /// count), the timeline, overviews and Helm.
-    fn page_links(&self, colors: Colors, cx: &mut Context<Self>) -> [Stateful<Div>; 7] {
+    /// count), the timeline, overviews, Helm and Argo CD.
+    fn page_links(&self, colors: Colors, cx: &mut Context<Self>) -> [Stateful<Div>; 8] {
         let route = self.route();
         let (danger, warning) = (cx.theme().danger, cx.theme().warning);
         let badge = |n: usize, color: Hsla| {
@@ -337,6 +337,8 @@ impl AppView {
                 colors,
             )
             .on_click(cx.listener(|this, _, window, cx| this.open_helm(window, cx))),
+            nav_row("nav-argo", Lucide::GitFork, "Argo CD", matches!(route, Route::Argo(_)), colors)
+                .on_click(cx.listener(|this, _, window, cx| this.open_argo(window, cx))),
         ]
     }
 

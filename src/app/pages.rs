@@ -1,4 +1,4 @@
-//! Opening pages: objects, workloads, cluster, problems, Helm, assistant, terminal, apply, plugins.
+//! Opening pages: objects, workloads, cluster, problems, Helm, Argo CD, assistant, terminal, apply, plugins.
 
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::notification::Notification;
@@ -162,7 +162,79 @@ impl AppView {
             this.show_detail_on(ev.context.clone(), ev.client.clone(), ev.obj.clone(), window, cx);
         })
         .detach();
+        cx.subscribe_in(&panel, window, |this, _, ev: &crate::details::OpenNamespace, window, cx| {
+            this.open_namespace_on(ev.context.clone(), ev.namespace.clone(), window, cx);
+        })
+        .detach();
         self.navigate(Route::Detail(panel), cx);
+    }
+
+    /// Open a namespace on a context: on a connected one like any link, else after
+    /// connecting to it (an Application's destination is often not connected).
+    fn open_namespace_on(&mut self, context: String, namespace: String, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(ctx) = self.clusters.iter().position(|(n, _)| *n == context) {
+            self.namespace_open.cancel();
+            self.open_object_in(ctx, "namespaces", namespace, None, window, cx);
+            return;
+        }
+        let kind = k8s::find_kind(&self.kinds, "namespaces").cloned().unwrap_or_else(|| Kind {
+            ar: k8s::ar_of::<k8s_openapi::api::core::v1::Namespace>(),
+            namespaced: false,
+            section: "Cluster",
+            label: "Namespaces".into(),
+        });
+        let obj = ObjectRef { kind, name: namespace, namespace: None, uid: String::new() };
+        window.push_notification(Notification::info(format!("Connecting to {context}…")), cx);
+        // A later click replaces this one: its page does not open over the newer one.
+        let connect = k8s::connect(context.clone());
+        self.namespace_open.spawn_in(window, cx, connect, move |this, client, window, cx| match client {
+            Ok(client) => this.show_detail_with(context, client, obj, window, cx),
+            Err(e) => window.push_notification(
+                Notification::error(format!("Could not connect to {context}: {}", k8s::short_error(&e))),
+                cx,
+            ),
+        });
+    }
+
+    /// Every Argo CD Application of the contexts that serve Argo CD.
+    pub(super) fn open_argo(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Not connected: open the cluster switcher instead of doing nothing.
+        if self.clusters.is_empty() {
+            self.ctx_open = true;
+            cx.notify();
+            return;
+        }
+        // One instance per page: reuse it from history instead of piling up pollers.
+        if let Some(existing) = self.history.iter().find_map(|r| match r {
+            Route::Argo(e) => Some(e.clone()),
+            _ => None,
+        }) {
+            self.navigate(Route::Argo(existing), cx);
+            return;
+        }
+        let clusters = self.clusters.clone();
+        let page = cx.new(|cx| crate::ui::argo::ArgoView::new(clusters, window, cx));
+        self.subscribe_argo(&page, window, cx);
+        self.navigate(Route::Argo(page), cx);
+    }
+
+    /// Open an Application (on Argo CD's cluster) or where it deploys, from the Argo CD page
+    /// (also after F5).
+    pub(super) fn subscribe_argo(
+        &mut self,
+        page: &Entity<crate::ui::argo::ArgoView>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Released with the page.
+        cx.subscribe_in(page, window, |this, _, ev: &crate::details::OpenOnContext, window, cx| {
+            this.show_detail_on(ev.context.clone(), ev.client.clone(), ev.obj.clone(), window, cx);
+        })
+        .detach();
+        cx.subscribe_in(page, window, |this, _, ev: &crate::details::OpenNamespace, window, cx| {
+            this.open_namespace_on(ev.context.clone(), ev.namespace.clone(), window, cx);
+        })
+        .detach();
     }
 
     pub(super) fn open_workloads(&mut self, window: &mut Window, cx: &mut Context<Self>) {
