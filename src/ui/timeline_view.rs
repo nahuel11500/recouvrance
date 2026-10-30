@@ -470,7 +470,7 @@ impl Render for TimelineView {
         };
         let header = h_flex()
             .gap_3()
-            .child(Icon::new(Lucide::History).size_5())
+            .child(Icon::new(Lucide::ClockArrowDown).size_5())
             .child(div().text_xl().font_weight(FontWeight::MEDIUM).child("Timeline"))
             .child(div().text_sm().text_color(muted).child(if recording {
                 "changes recorded while the app watched, and events"
@@ -586,8 +586,12 @@ impl Render for TimelineView {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::k8s::EventLine;
+    // Not `super::*`: gpui_kit's `test` attribute would come with it.
+    use std::sync::Arc;
+
+    use super::{Entry, Events, Filter, merged, parse_filter, shown};
+    use crate::k8s::{ClusterEvent, EventLine};
+    use crate::timeline::{Record, What};
 
     fn change(ctx: &str, kind: &str, ns: &str, name: &str, secs: i64) -> Entry {
         Entry::Change(

@@ -317,7 +317,7 @@ impl AppView {
                 .when_some(self.problems.gaps(), |d, gaps| {
                     d.tooltip(move |w, cx| component::tooltip::Tooltip::new(gaps.clone()).build(w, cx))
                 }),
-            nav_row("nav-timeline", Lucide::History, "Timeline", matches!(route, Route::Timeline(_)), colors)
+            nav_row("nav-timeline", Lucide::ClockArrowDown, "Timeline", matches!(route, Route::Timeline(_)), colors)
                 .on_click(cx.listener(|this, _, window, cx| this.open_timeline(window, cx))),
             nav_row("nav-cluster", Lucide::Server, "Cluster overview", matches!(route, Route::Cluster(_)), colors)
                 .on_click(cx.listener(|this, _, window, cx| this.open_cluster(window, cx))),

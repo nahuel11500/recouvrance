@@ -37,7 +37,7 @@ const SECTIONS: [(Section, &str, Lucide); 14] = [
     (Section::Appearance, "Appearance", Lucide::Palette),
     (Section::Refresh, "Refresh rates", Lucide::RefreshCw),
     (Section::Logs, "Log viewer", Lucide::ScrollText),
-    (Section::Timeline, "Timeline", Lucide::History),
+    (Section::Timeline, "Timeline", Lucide::ClockArrowDown),
     (Section::Kubeconfig, "Kubeconfig", Lucide::FileText),
     (Section::Agents, "Agents (MCP)", Lucide::Bot),
     (Section::Assistant, "Assistant", Lucide::Sparkles),

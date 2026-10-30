@@ -36,7 +36,7 @@ impl AppView {
             ("Terminal (kubectl on this context)", "terminal", Lucide::SquareTerminal),
             ("Create / apply YAML", "apply", Lucide::Plus),
             ("Problems (what is broken)", "problems", Lucide::TriangleAlert),
-            ("Timeline (what changed, across clusters)", "timeline", Lucide::History),
+            ("Timeline (what changed, across clusters)", "timeline", Lucide::ClockArrowDown),
             ("My access (RBAC in this namespace)", "access", Lucide::KeyRound),
             ("Install a Helm chart", "helm-install", Lucide::Download),
             ("Assistant (ask your clusters)", "assistant", Lucide::Sparkles),
