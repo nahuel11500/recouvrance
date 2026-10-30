@@ -22,7 +22,7 @@ A fast Kubernetes desktop client (Rust + [gpui](https://github.com/zed-industrie
 - **Native and fast**: Rust and gpui, no web view. Server-side tables keep clusters with tens of
   thousands of pods in a few hundred megabytes.
 - **Everything in one place**: live tables for every type (CRDs included), logs across pods with
-  find and filters, shell, attach, file copy, port-forwards, YAML with field docs and schema forms,
+  find and filters, shell, attach, a file browser and file copy, port-forwards, YAML with field docs and schema forms,
   Helm, Flux and Argo CD actions, several clusters at once, tabs and windows.
 - **Tells you what is wrong**: a Problems page across clusters, a diagnosis on every broken pod or
   workload, firing alerts, stuck deletions, ExternalSecrets that fail to sync, usage history from

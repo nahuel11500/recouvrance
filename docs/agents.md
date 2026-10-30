@@ -83,7 +83,7 @@ Tools, by what they do:
   `describe_resource`, `search`, `get_events`, `find_problems`, `check_certificates`, `check_reachability`, `top_pods`,
   `top_nodes`, `usage_history`, `get_logs`, `workload_logs`, `get_changes`, `rollout_history`, `rollout_status`,
   `list_helm_releases`, `helm_history`, `helm_get_values`, `diff_manifest`, `explain_resource`,
-  `can_i`, `cluster_version`, `upgrade_check`, `wait_for`, `list_port_forwards`.
+  `can_i`, `cluster_version`, `upgrade_check`, `wait_for`, `list_port_forwards`, `browse_files`.
 - **Change:** `scale`, `rollout_restart`, `rollout_undo`, `rollout_pause`, `rollout_resume`,
   `set_image`, `patch_resource`, `apply_manifest`, `delete_resource`, `trigger_cronjob`,
   `cordon_node`, `uncordon_node`, `drain_node`, `gitops`, `exec_command`, `debug_pod`,
@@ -117,6 +117,10 @@ tools. What some of them need beyond the obvious verb:
   creates, named `<cronjob>-manual-<number>` (so `jobs/nightly-manual-*` can be allowed).
   `debug_pod` needs `exec` on the pod: it adds an ephemeral container (busybox by default) that the
   agent then runs commands in with `exec_command`.
+- **Files:** `browse_files` lists a folder (mode, owner, size, modification time, symlink targets)
+  or returns a file's first bytes (64 KiB by default, 1 MiB at most; a binary file only its type)
+  in a container, like the app's Files tab. It runs `sh`, `stat` and `head` there, so it needs
+  `exec` on the pod, like `exec_command`, and changes nothing.
 - **Port-forwards:** `port_forward` needs the `forward` verb on the pod or Service (no preset grants
   it): it is a network path into the cluster. It listens on 127.0.0.1 only, for `minutes` (60 by
   default, 8 hours at most), shows in the sidebar's port-forwards with the agent's name, and stops
