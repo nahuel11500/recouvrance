@@ -450,6 +450,7 @@ impl DetailPanel {
             let _ = this.update(cx, |this, cx| {
                 if let Some(files) = &this.files {
                     files.update(cx, |f, cx| f.set_exec_denied(denied.contains("exec"), cx));
+                    files.update(cx, |f, cx| f.set_debug_denied(denied.contains("debug"), cx));
                 }
                 this.denied = denied;
                 cx.notify();

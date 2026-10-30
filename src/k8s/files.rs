@@ -13,18 +13,24 @@ use kube::Client;
 
 use super::exec::{MAX_EXEC_OUTPUT, ended_reason, exec_to, save_download};
 
+pub mod debug;
+
 /// Where the files shown come from, said next to them: only a running container's own
 /// show what its process wrote.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Origin {
     /// Exec in the container itself: its live filesystem, mounts included.
     Live,
+    /// Exec in a debug container sharing its processes, through `/proc/<pid>/root`: the
+    /// same live filesystem, for an image without a shell or tools.
+    Debug,
 }
 
 impl Origin {
     pub fn label(self) -> &'static str {
         match self {
             Self::Live => "live container",
+            Self::Debug => "through a debug container",
         }
     }
 }
@@ -57,8 +63,20 @@ impl FileSource {
         Self { client, ns, pod, container, root: Vec::new(), origin: Origin::Live }
     }
 
+    /// Exec in debug container `debug` of the pod, which shares the processes of the
+    /// container read: its process `pid` sees that container's filesystem at its root.
+    pub fn debug(client: Client, ns: String, pod: String, debug: String, pid: u32) -> Self {
+        let root = format!("/proc/{pid}/root").into_bytes();
+        Self { client, ns, pod, container: Some(debug), root, origin: Origin::Debug }
+    }
+
     pub fn origin(&self) -> Origin {
         self.origin
+    }
+
+    /// The container the commands run in; none for the pod's default one.
+    pub fn container(&self) -> Option<&str> {
+        self.container.as_deref()
     }
 
     /// `path` as the commands see it.
@@ -70,8 +88,20 @@ impl FileSource {
     fn own(&self, real: &[u8]) -> Vec<u8> {
         match real.strip_prefix(self.root.as_slice()) {
             Some([]) => b"/".to_vec(),
-            Some(rest) if rest.starts_with(b"/") => rest.to_vec(),
+            Some(rest) if rest.starts_with(b"/") => normalize(rest),
             _ => real.to_vec(),
+        }
+    }
+
+    /// Owners by number only, when read from another container: `stat` names them from that
+    /// container's `/etc/passwd`, not from the one read.
+    fn owners(&self, entries: &mut [Entry]) {
+        if self.root.is_empty() {
+            return;
+        }
+        for e in entries {
+            e.user.clear();
+            e.group.clear();
         }
     }
 
@@ -80,6 +110,7 @@ impl FileSource {
         let script = format!("{DECODE}{LIST}");
         let out = self.script(script, vec![sh_arg(&self.real(dir))], MAX_EXEC_OUTPUT, LIST_SECS).await?;
         let mut entries = parse_listing(&out)?;
+        self.owners(&mut entries);
         sort_entries(&mut entries);
         Ok(entries)
     }
@@ -101,6 +132,7 @@ impl FileSource {
         match out.split_first() {
             Some((b'D', rest)) => {
                 let mut entries = parse_listing(rest.strip_prefix(b"\0").unwrap_or(rest))?;
+                self.owners(&mut entries);
                 sort_entries(&mut entries);
                 Ok(Opened::Folder(entries))
             }
@@ -114,8 +146,9 @@ impl FileSource {
     pub async fn find(&self, dir: &[u8], name: &str) -> Result<Found> {
         let dir = normalize(dir);
         let prune = if dir == b"/" { "\\( -path \"$r/proc\" -o -path \"$r/sys\" \\) -prune -o " } else { "" };
+        // `$r/`: a folder given as a symlink (`/proc/<pid>/root`) is searched, not the link.
         let script = format!(
-            "{DECODE}r=${{p%/}}\n{NEEDS_FIND}find \"$p\" {prune}-iname \"*$2*\" -print0 2>/dev/null | head -c {MAX_FOUND_BYTES}\n"
+            "{DECODE}r=${{p%/}}\n{NEEDS_FIND}find \"$r/\" {prune}-iname \"*$2*\" -print0 2>/dev/null | head -c {MAX_FOUND_BYTES}\n"
         );
         let args = vec![sh_arg(&self.real(&dir)), name.to_string()];
         let out = self.script(script, args, MAX_FOUND_BYTES as u64, FIND_SECS).await?;
@@ -133,16 +166,16 @@ impl FileSource {
         };
         let real = self.real(&path);
         let (script, args, name) = if folder {
-            let (parent, member) = tar_source(&real);
+            let (parent, member) = tar_source(&path);
+            let parent = self.real(&parent);
             let script = format!(
-                "{DECODE}d=$(dec \"$2\"); d=${{d%x}}\nm=$(dec \"$3\"); m=${{m%x}}\nexec tar cf - -C \"$d\" -- \"$m\"\n"
+                "{DECODE}d=$(dec \"$2\"); d=${{d%x}}\n{IN_ROOT_D}m=$(dec \"$3\"); m=${{m%x}}\nexec tar cf - -C \"$d\" -- \"$m\"\n"
             );
             (script, vec![sh_arg(&real), sh_arg(&parent), sh_arg(&member)], format!("{}-{base}.tar", self.pod))
         } else {
             (format!("{DECODE}exec cat -- \"$p\"\n"), vec![sh_arg(&real)], format!("{}-{base}", self.pod))
         };
-        let mut command = vec!["sh".to_string(), "-c".into(), script, "sh".into()];
-        command.extend(args);
+        let command = self.command(&script, args);
         let (client, ns, pod, container) =
             (self.client.clone(), self.ns.clone(), self.pod.clone(), self.container.clone());
         super::run_abortable(
@@ -154,8 +187,7 @@ impl FileSource {
     /// Run `script` with `args` (as `$1`…), and return what it printed: at most `max`
     /// bytes (more is an error), within `secs`.
     async fn script(&self, script: String, args: Vec<String>, max: u64, secs: u64) -> Result<Vec<u8>> {
-        let mut command = vec!["sh".to_string(), "-c".into(), script, "sh".into()];
-        command.extend(args);
+        let command = self.command(&script, args);
         let (client, ns, pod, container) =
             (self.client.clone(), self.ns.clone(), self.pod.clone(), self.container.clone());
         // Abortable: a newer listing replacing this one ends the command in the container.
@@ -174,11 +206,61 @@ impl FileSource {
         })
         .await
     }
+
+    /// `sh -c script` with `args`, `$R` set to the root the paths are under (and `in_root`
+    /// defined when there is one).
+    fn command(&self, script: &str, args: Vec<String>) -> Vec<String> {
+        let script = if self.root.is_empty() {
+            format!("R=\n{script}")
+        } else {
+            let root = super::shell_quote(&String::from_utf8_lossy(&self.root));
+            format!("R={root}\n{IN_ROOT}{script}")
+        };
+        let mut command = vec!["sh".to_string(), "-c".into(), script, "sh".into()];
+        command.extend(args);
+        command
+    }
 }
 
 /// Decodes `$1` (a path passed as `printf %b` escapes) into `$p`. `dec` keeps a trailing
 /// newline of a name, which `$(…)` alone would drop: it ends with an `x`, taken off after.
-const DECODE: &str = "dec() { printf '%b' \"$1\"; printf x; }\np=$(dec \"$1\"); p=${p%x}\n";
+/// Under a root (`$R`), the path's symlinks are then followed as the container sees them.
+const DECODE: &str = concat!(
+    "dec() { printf '%b' \"$1\"; printf x; }\np=$(dec \"$1\"); p=${p%x}\n",
+    "[ -z \"$R\" ] || { p=$(in_root \"${p#\"$R\"}\" && printf x) || exit; p=${p%x}; }\n"
+);
+
+/// The same for the folder `$d` a download archives from.
+const IN_ROOT_D: &str = "[ -z \"$R\" ] || { d=$(in_root \"${d#\"$R\"}\" && printf x) || exit; d=${d%x}; }\n";
+
+/// Prints `$R` followed by path `$1` with its symlinks followed as the container under `$R`
+/// sees them: an absolute target from `$R`, not from the root of the container the commands
+/// run in, which the kernel would use (`/proc/<pid>/root/var/run` leads to its own `/run`).
+/// A part that isn't there is kept as it is, for the command after to say so.
+const IN_ROOT: &str = r#"in_root() {
+rest=$1 out= n=0
+while [ -n "$rest" ]; do
+c=${rest%%/*}
+case $rest in */*) rest=${rest#*/} ;; *) rest= ;; esac
+case $c in
+'' | .) ;;
+..) out=${out%/*} ;;
+*)
+if [ -L "$R$out/$c" ] && t=$(readlink -- "$R$out/$c" && printf x); then
+n=$((n + 1))
+[ "$n" -le 40 ] || { echo "$1: too many levels of symbolic links" >&2; return 1; }
+t=${t%?x}
+case $t in /*) out= ;; esac
+rest=$t/$rest
+else
+out=$out/$c
+fi
+;;
+esac
+done
+printf '%s' "$R$out"
+}
+"#;
 
 /// Lists folder `$p`: its names (each ended by NUL, the list by an empty one), a `stat`
 /// line for each, a NUL, then for each symlink its name, `d` when it leads to a folder, and
@@ -196,7 +278,9 @@ printf '\000'
 for f in "$@"; do
 if [ -L "$f" ]; then
 printf '%s\000' "$f"
-if [ -d "$f" ]; then printf d; fi
+t=$f
+[ -z "$R" ] || { t=$(in_root "${p#"$R"}/$f" && printf x); t=${t%x}; }
+if [ -d "$t" ]; then printf d; fi
 printf '\000'
 readlink -- "$f"
 printf '\000'
@@ -849,6 +933,38 @@ mod tests {
         let want: [(&str, &[u8]); 4] =
             [("/", b"/"), ("var", b"/var"), ("log", b"/var/log"), ("a\\nb", b"/var/log/a\nb")];
         assert_eq!(shown, want.map(|(s, p)| (s.to_string(), p.to_vec())));
+    }
+
+    /// Under a root, the shell follows symlinks as the container under it sees them: an
+    /// absolute target from the root, a relative one from its folder, `..` no higher than
+    /// the root, and a loop is said rather than followed for ever.
+    #[cfg(unix)]
+    #[test]
+    fn paths_resolve_under_the_root() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!("recouvrance-in-root-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for dir in ["run/secrets", "var", "usr/lib"] {
+            std::fs::create_dir_all(root.join(dir)).unwrap();
+        }
+        symlink("/run", root.join("var/run")).unwrap();
+        symlink("../usr/lib", root.join("var/lib")).unwrap();
+        symlink("/../../usr", root.join("up")).unwrap();
+        symlink("loop", root.join("loop")).unwrap();
+        let r = root.to_str().unwrap().to_string();
+        let resolve = |path: &str| {
+            let script = format!("R={}\n{}in_root \"$1\"", super::super::shell_quote(&r), super::IN_ROOT);
+            let out = std::process::Command::new("sh").args(["-c", &script, "sh", path]).output().unwrap();
+            out.status.success().then(|| String::from_utf8(out.stdout).unwrap())
+        };
+        assert_eq!(resolve("/var/run/secrets/token"), Some(format!("{r}/run/secrets/token")));
+        assert_eq!(resolve("/var/lib"), Some(format!("{r}/usr/lib")));
+        assert_eq!(resolve("/up/lib/../lib"), Some(format!("{r}/usr/lib")));
+        assert_eq!(resolve("/var/../../missing"), Some(format!("{r}/missing")));
+        assert_eq!(resolve("/"), Some(r.clone()));
+        assert_eq!(resolve("/loop"), None);
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
