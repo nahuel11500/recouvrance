@@ -174,9 +174,9 @@ impl IntoElement for Selectable {
 
 impl Element for Selectable {
     type RequestLayoutState = ();
-    /// The text's participant and its place in the window's order; None when it takes no
-    /// part this frame (off screen and not selected).
-    type PrepaintState = Option<(Participant, u64)>;
+    /// The text's participant and where it is; None when it takes no part this frame (off
+    /// screen and not selected).
+    type PrepaintState = Option<Placed>;
 
     fn id(&self) -> Option<ElementId> {
         None
@@ -204,25 +204,25 @@ impl Element for Selectable {
         (): &mut (),
         window: &mut Window,
         cx: &mut App,
-    ) -> Option<(Participant, u64)> {
+    ) -> Option<Placed> {
         self.styled.prepaint(global_id, inspector_id, bounds, &mut (), window, cx);
-        let (participant, order, drag) = participant(&self.text, window, cx);
-        // While there is a selection, each participant registering goes over every other
-        // one: a frame costs the square of their number. So only what can take part does:
-        // text on screen, and during a drag only the text near the lines it spans or under
-        // the pointer. Text selected stays (a drag that scrolled past it).
-        let wanted = window.content_mask().bounds.intersects(&bounds)
-            && drag.is_none_or(|(top, bottom)| {
-                (bounds.bottom() >= top && bounds.top() <= bottom) || bounds.contains(&window.mouse_position())
-            });
-        if !wanted && participant.handle.snapshot(cx).is_none() {
+        let (participant, order, band) = participant(&self.text, window, cx);
+        // Text selected stays in (a drag that scrolled past it); other text off screen is out.
+        let selected = participant.handle.snapshot(cx).is_some();
+        if !selected && !window.content_mask().bounds.intersects(&bounds) {
             return None;
         }
         let hitbox = window.insert_hitbox(bounds, HitboxBehavior::Normal);
-        let registration =
-            TextSelectionRegistration::new(hitbox, bounds).with_document_order(order).with_text_bounds(vec![bounds]);
-        participant.handle.register(registration, window, cx);
-        Some((participant, order))
+        // While there is a selection, each participant registering goes over every other
+        // one: a frame would cost the square of their number. So only the text near the
+        // lines it spans, or under the pointer, registers; the rest does when pressed.
+        let near = band.is_none_or(|(top, bottom)| bounds.bottom() >= top && bounds.top() <= bottom)
+            || bounds.contains(&window.mouse_position());
+        let placed = Placed { participant, order, hitbox, bounds, registered: selected || near };
+        if placed.registered {
+            placed.register(window, cx);
+        }
+        Some(placed)
     }
 
     fn paint(
@@ -231,14 +231,44 @@ impl Element for Selectable {
         inspector_id: Option<&InspectorElementId>,
         bounds: Bounds<Pixels>,
         (): &mut (),
-        state: &mut Option<(Participant, u64)>,
+        state: &mut Option<Placed>,
         window: &mut Window,
         cx: &mut App,
     ) {
-        if let Some((participant, order)) = state {
-            participant.paint(&self.text, self.styled.layout(), bounds, *order, window, cx);
+        if let Some(placed) = state {
+            placed.participant.paint(&self.text, self.styled.layout(), bounds, placed.order, window, cx);
+            if !placed.registered {
+                // Pressed: it joins before the selection looks for what is under the press.
+                let placed = placed.clone();
+                window.on_mouse_event(move |event: &MouseDownEvent, phase, window, cx| {
+                    if phase.capture() && event.button == MouseButton::Left && placed.hitbox.is_hovered(window) {
+                        placed.register(window, cx);
+                    }
+                });
+            }
         }
         self.styled.paint(global_id, inspector_id, bounds, &mut (), &mut (), window, cx);
+    }
+}
+
+/// A selectable text as drawn this frame.
+#[derive(Clone)]
+pub struct Placed {
+    participant: Participant,
+    /// Its place in the window's order.
+    order: u64,
+    hitbox: Hitbox,
+    bounds: Bounds<Pixels>,
+    /// It told the selection where it is this frame.
+    registered: bool,
+}
+
+impl Placed {
+    fn register(&self, window: &mut Window, cx: &mut App) {
+        let registration = TextSelectionRegistration::new(self.hitbox.clone(), self.bounds)
+            .with_document_order(self.order)
+            .with_text_bounds(vec![self.bounds]);
+        self.participant.handle.register(registration, window, cx);
     }
 }
 
@@ -319,37 +349,37 @@ struct Frame {
     order: u64,
     /// A frame is being drawn: its end is already scheduled.
     open: bool,
-    /// While a drag selects, the lines it spans (top and bottom, with a margin).
-    drag: Option<(Pixels, Pixels)>,
+    /// While there is a selection, the lines it spans (top and bottom, with a margin).
+    band: Option<(Pixels, Pixels)>,
 }
 
-/// How far around the lines a drag spans text stays ready to join it.
-const DRAG_MARGIN: Pixels = px(48.);
+/// How far around the lines a selection spans text stays ready to join it.
+const BAND_MARGIN: Pixels = px(48.);
 
 /// `text`'s participant (last frame's, when it was drawn then), its place in the order, and
-/// the lines a drag in progress spans.
+/// the lines the selection spans.
 fn participant(text: &SharedString, window: &mut Window, cx: &mut App) -> (Participant, u64, Option<(Pixels, Pixels)>) {
     let id = window.window_handle().window_id();
     if cx.default_global::<Texts>().0.get(&id).is_none_or(|frame| !frame.open) {
-        let drag = drag_band(id, cx);
+        let band = selection_band(id, cx);
         let frame = cx.default_global::<Texts>().0.entry(id).or_default();
         frame.open = true;
-        frame.drag = drag;
+        frame.band = band;
         window.defer(cx, move |_, cx| end_frame(id, cx));
     }
     let frame = cx.default_global::<Texts>().0.entry(id).or_default();
-    let (order, drag) = (frame.order, frame.drag);
+    let (order, band) = (frame.order, frame.band);
     frame.order += 1;
     let kept = frame.last.get_mut(text).and_then(VecDeque::pop_front);
     let participant = kept.unwrap_or_else(|| Participant::new(cx));
     let frame = cx.default_global::<Texts>().0.entry(id).or_default();
     frame.this.entry(text.clone()).or_default().push_back(participant.clone());
-    (participant, order, drag)
+    (participant, order, band)
 }
 
-/// The lines a drag selecting the window's texts spans, from what the last frame's texts
-/// were told of the selection; None when no drag is in progress.
-fn drag_band(id: WindowId, cx: &mut App) -> Option<(Pixels, Pixels)> {
+/// The lines the selection of the window's texts spans, from what the last frame's texts
+/// were told of it; None when there is none.
+fn selection_band(id: WindowId, cx: &mut App) -> Option<(Pixels, Pixels)> {
     let handles: Vec<TextSelectionHandle> = cx
         .default_global::<Texts>()
         .0
@@ -357,9 +387,9 @@ fn drag_band(id: WindowId, cx: &mut App) -> Option<(Pixels, Pixels)> {
         .map(|frame| frame.last.values().flatten().map(|p| p.handle.clone()).collect())
         .unwrap_or_default();
     let selection = handles.iter().find_map(|handle| handle.snapshot(cx))?;
-    let points = selection.window_points().filter(|_| selection.is_selecting())?;
+    let points = selection.window_points()?;
     let (anchor, cursor) = (points.anchor().y, points.cursor().y);
-    Some((anchor.min(cursor) - DRAG_MARGIN, anchor.max(cursor) + DRAG_MARGIN))
+    Some((anchor.min(cursor) - BAND_MARGIN, anchor.max(cursor) + BAND_MARGIN))
 }
 
 /// After a frame: what it drew is what the next one looks up; texts it did not draw are
