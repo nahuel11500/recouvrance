@@ -14,6 +14,7 @@ use kube::{Client, Resource as _};
 use serde::Deserialize;
 
 use super::{Kind, TaskGuard, api_status, lists, run, short_error, spawn_guarded};
+use crate::timeline::Tap;
 
 /// The server-side Table format, the same data `kubectl get` prints.
 #[derive(Deserialize, Debug)]
@@ -203,6 +204,14 @@ pub(super) fn to_row(row: ServerRow, extras: &Extras) -> Option<Arc<Row>> {
     row_from(cells, meta)
 }
 
+/// A listed row, its object shown first to the timeline's tap when one records the list.
+fn listed_row(row: ServerRow, extras: &Extras, tap: Option<&Tap>) -> Option<Arc<Row>> {
+    if let (Some(tap), Some(obj)) = (tap, &row.object) {
+        tap.listed(obj);
+    }
+    to_row(row, extras)
+}
+
 /// A row from its cells and its object's metadata (None without a uid).
 fn row_from(cells: Vec<String>, meta: LeanMeta) -> Option<Arc<Row>> {
     Some(Arc::new(Row {
@@ -250,20 +259,21 @@ pub(super) async fn list_paged(
     url: &str,
     lp: ListParams,
 ) -> Result<(Vec<ColumnDef>, Vec<Arc<Row>>, String)> {
-    list_paged_with(client, url, lp, &Extras::default(), |_, _, _| {}).await
+    list_paged_with(client, url, lp, &Extras::default(), None, |_, _, _| {}).await
 }
 
 /// Like `list_paged`, calling `on_page` with the rows so far after each page, and whether
-/// more pages follow.
+/// more pages follow. A `tap` sees each object (whole ones when it records them whole).
 pub(super) async fn list_paged_with(
     client: &Client,
     url: &str,
     mut lp: ListParams,
     extras: &Extras,
+    tap: Option<&Tap>,
     mut on_page: impl FnMut(&[ColumnDef], &[Arc<Row>], bool),
 ) -> Result<(Vec<ColumnDef>, Vec<Arc<Row>>, String)> {
     lp.limit = Some(PAGE_SIZE);
-    let full = needs_full(extras);
+    let full = needs_full(extras) || tap.is_some_and(Tap::full);
     let (mut defs, mut rows, mut version) = (Vec::new(), Vec::new(), String::new());
     loop {
         let page: ServerTable =
@@ -272,7 +282,7 @@ pub(super) async fn list_paged_with(
             defs = page.column_definitions;
             defs.extend(extras.iter().map(|(name, _)| ColumnDef { name: name.clone(), priority: 0 }));
         }
-        rows.extend(page.rows.into_iter().filter_map(|r| to_row(r, extras)));
+        rows.extend(page.rows.into_iter().filter_map(|r| listed_row(r, extras, tap)));
         version = page.metadata.resource_version.unwrap_or(version);
         let next = page.metadata.continue_.filter(|c| !c.is_empty());
         on_page(&defs, &rows, next.is_some());
@@ -336,6 +346,7 @@ async fn list_fast(
     url: &str,
     tx: &mpsc::UnboundedSender<TableMsg>,
     pause: &Pause,
+    tap: Option<&Tap>,
 ) -> Result<(Vec<ColumnDef>, Vec<Arc<Row>>, String)> {
     let lp = ListParams::default().limit(PAGE_SIZE);
     let page: ServerTable =
@@ -344,7 +355,8 @@ async fn list_fast(
     let _ = tx.unbounded_send(TableMsg::Columns(Arc::new(defs.clone())));
     let more = page.metadata.continue_.as_ref().is_some_and(|c| !c.is_empty());
     let version = page.metadata.resource_version.clone().unwrap_or_default();
-    let mut rows: Vec<Arc<Row>> = page.rows.into_iter().filter_map(|r| to_row(r, &Extras::default())).collect();
+    let mut rows: Vec<Arc<Row>> =
+        page.rows.into_iter().filter_map(|r| listed_row(r, &Extras::default(), tap)).collect();
     rows.sort_by(|a, b| (&a.namespace, &a.name).cmp(&(&b.namespace, &b.name)));
     if !more {
         return Ok((defs, rows, version));
@@ -358,10 +370,10 @@ async fn list_fast(
     {
         let _ = tx.unbounded_send(TableMsg::Rows(cells));
     }
-    match list_whole(client, url).await {
+    match list_whole(client, url, tap).await {
         Ok(listed) => Ok(listed),
         // An API server that can't serve it from its cache: page through it as before.
-        Err(_) => list_paged(client, url, ListParams::default()).await,
+        Err(_) => list_paged_with(client, url, ListParams::default(), &Extras::default(), tap, |_, _, _| {}).await,
     }
 }
 
@@ -387,14 +399,26 @@ struct LeanRow {
 
 /// The whole list in one response from the API server's cache (`resourceVersion=0`), parsed
 /// as it arrives on a blocking thread: memory stays at the rows, not the 160 MB of JSON a
-/// big cluster sends.
-async fn list_whole(client: &Client, url: &str) -> Result<(Vec<ColumnDef>, Vec<Arc<Row>>, String)> {
+/// big cluster sends. With a `tap` (never on pods), the objects' metadata stays raw until
+/// the tap has seen it.
+async fn list_whole(client: &Client, url: &str, tap: Option<&Tap>) -> Result<(Vec<ColumnDef>, Vec<Arc<Row>>, String)> {
     use tokio_util::compat::FuturesAsyncReadCompatExt as _;
     let path = format!("{url}?includeObject=Metadata&resourceVersion=0&resourceVersionMatch=NotOlderThan");
     let mut req = http::Request::get(&path).body(Vec::new())?;
     req.headers_mut().insert(http::header::ACCEPT, http::HeaderValue::from_static(TABLE_ACCEPT));
     let body = client.request_stream(req).await?;
-    let table: LeanTable = lists::parse_streamed(lists::Idle::new(body.compat(), lists::LIST_IDLE)).await?;
+    let body = lists::Idle::new(body.compat(), lists::LIST_IDLE);
+    if let Some(tap) = tap {
+        let table: ServerTable = lists::parse_streamed(body).await?;
+        if table.metadata.continue_.as_ref().is_some_and(|c| !c.is_empty()) {
+            return Err(anyhow!("the API server paged a cached list"));
+        }
+        let mut rows: Vec<Arc<Row>> =
+            table.rows.into_iter().filter_map(|r| listed_row(r, &Extras::default(), Some(tap))).collect();
+        rows.sort_by(|a, b| (&a.namespace, &a.name).cmp(&(&b.namespace, &b.name)));
+        return Ok((table.column_definitions, rows, table.metadata.resource_version.unwrap_or_default()));
+    }
+    let table: LeanTable = lists::parse_streamed(body).await?;
     // A server that pages it anyway: the rows would be partial.
     if table.metadata.continue_.as_ref().is_some_and(|c| !c.is_empty()) {
         return Err(anyhow!("the API server paged a cached list"));
@@ -470,12 +494,13 @@ pub(crate) fn age_seconds(age: &str) -> Option<i64> {
 /// 6 MB instead of 160 MB. Those rows are `is_partial`. `with_namespaces`: each row needs its
 /// namespace (`cells_by_namespace`, one request per namespace, or the whole list when one of
 /// them fails); without, one request does, and rows of every namespace have none (enough for
-/// counts).
+/// counts). A `tap` records a list that came whole with its metadata (a big one doesn't).
 pub async fn list_light(
     client: Client,
     kind: Kind,
     namespace: Option<String>,
     with_namespaces: bool,
+    tap: Option<Tap>,
 ) -> Result<(Vec<ColumnDef>, Vec<Arc<Row>>)> {
     run(async move {
         let ns = if kind.namespaced { namespace } else { None };
@@ -485,7 +510,13 @@ pub async fn list_light(
             lists::request_idle(&client, with_table_format(Request::new(&url).list(&lp)?, false)?).await?;
         let defs = page.column_definitions.clone();
         if page.metadata.continue_.as_ref().is_none_or(String::is_empty) {
-            let rows = page.rows.into_iter().filter_map(|r| to_row(r, &Extras::default())).collect();
+            if let Some(tap) = &tap {
+                tap.begin_list();
+            }
+            let rows = page.rows.into_iter().filter_map(|r| listed_row(r, &Extras::default(), tap.as_ref())).collect();
+            if let Some(tap) = &tap {
+                tap.end_list();
+            }
             return Ok((defs, rows));
         }
         let rows = match (&ns, kind.namespaced) {
@@ -493,7 +524,7 @@ pub async fn list_light(
                 Ok(rows) => rows,
                 // One namespace refused or stalled doesn't fail the kind: the whole list has
                 // every namespace's rows (with their objects' metadata, so more bytes).
-                Err(_) => match list_whole(&client, &url).await {
+                Err(_) => match list_whole(&client, &url, None).await {
                     Ok(listed) => listed.1,
                     Err(_) => list_paged(&client, &url, ListParams::default()).await?.1,
                 },
@@ -577,12 +608,13 @@ pub fn watch_table(
     namespace: Option<String>,
     extras: Extras,
 ) -> (TaskGuard, mpsc::UnboundedReceiver<TableMsg>) {
-    watch_table_paused(client, kind, namespace, extras, Pause::default(), true)
+    watch_table_paused(client, kind, namespace, extras, Pause::default(), true, None)
 }
 
 /// Like `watch_table`, holding snapshots back while `pause` is set. `pages`: show the first
 /// list page by page as it arrives (false when rows from before are on screen: the list
-/// then comes whole, replacing them in one go).
+/// then comes whole, replacing them in one go). A `tap` records what the lists and the
+/// watch see (see `crate::timeline`).
 pub fn watch_table_paused(
     client: Client,
     kind: Kind,
@@ -590,6 +622,7 @@ pub fn watch_table_paused(
     extras: Extras,
     pause: Pause,
     pages: bool,
+    tap: Option<Tap>,
 ) -> (TaskGuard, mpsc::UnboundedReceiver<TableMsg>) {
     let (tx, rx) = mpsc::unbounded();
     let guard = spawn_guarded(async move {
@@ -603,7 +636,7 @@ pub fn watch_table_paused(
             // Whether this round's watch got events: only then does the wait start over. A
             // list alone doesn't count, or a watch that keeps failing would relist every second.
             let mut progress = false;
-            let result = watch_once(&client, &url, &tx, &extras, &mut first, &pause, &mut progress).await;
+            let result = watch_once(&client, &url, &tx, &extras, tap.as_ref(), &mut first, &pause, &mut progress).await;
             if let Err(e) = &result {
                 if api_status(e) == Some(403) {
                     let _ = tx.unbounded_send(TableMsg::Forbidden(short_error(e)));
@@ -660,25 +693,32 @@ pub(super) enum FirstList {
 /// One list then watch. Until a first list completes, pages are shown as they arrive
 /// (`FirstList::Pages`) and `Listed` ends them; on a relist the table keeps its rows
 /// until the new list is complete, then gets it whole.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn watch_once(
     client: &Client,
     url: &str,
     tx: &mpsc::UnboundedSender<TableMsg>,
     extras: &Extras,
+    tap: Option<&Tap>,
     first: &mut FirstList,
     pause: &Pause,
     progress: &mut bool,
 ) -> Result<()> {
     let request = Request::new(url);
-    let full = needs_full(extras);
+    let full = needs_full(extras) || tap.is_some_and(Tap::full);
+    if let Some(tap) = tap {
+        tap.begin_list();
+    }
     let (_, list_rows, version) = match *first {
         // A namespaced kind in every namespace, no custom columns: the fast way (see
         // `list_fast`) when the list turns out big.
-        FirstList::Pages { by_namespace: true } if extras.is_empty() => list_fast(client, url, tx, pause).await?,
+        FirstList::Pages { by_namespace: true } if extras.is_empty() && !full => {
+            list_fast(client, url, tx, pause, tap).await?
+        }
         FirstList::Pages { .. } => {
             // Show rows as pages arrive; big clusters take tens of seconds to list.
             let mut sent_columns = false;
-            let listed = list_paged_with(client, url, ListParams::default(), extras, |defs, rows, _| {
+            let listed = list_paged_with(client, url, ListParams::default(), extras, tap, |defs, rows, _| {
                 if !sent_columns {
                     let _ = tx.unbounded_send(TableMsg::Columns(Arc::new(defs.to_vec())));
                     sent_columns = true;
@@ -697,11 +737,14 @@ pub(super) async fn watch_once(
             listed
         }
         _ => {
-            let listed = list_paged_with(client, url, ListParams::default(), extras, |_, _, _| {}).await?;
+            let listed = list_paged_with(client, url, ListParams::default(), extras, tap, |_, _, _| {}).await?;
             let _ = tx.unbounded_send(TableMsg::Columns(Arc::new(listed.0.clone())));
             listed
         }
     };
+    if let Some(tap) = tap {
+        tap.end_list();
+    }
     let mut rows: HashMap<String, Arc<Row>> = list_rows.into_iter().map(|r| (r.uid.clone(), r)).collect();
     let mut snaps = Snapshots { dirty: true, sent: None };
     snaps.flush(&rows, tx, pause)?;
@@ -762,7 +805,7 @@ pub(super) async fn watch_once(
                             break;
                         };
                         backoff = Backoff::default();
-                        match apply_event(&line, &mut rows, &mut version, extras)? {
+                        match apply_event(&line, &mut rows, &mut version, extras, tap)? {
                             Applied::Changed => snaps.dirty = true,
                             Applied::Unchanged => {}
                             // Our resourceVersion is too old: relist (which sends every row).
@@ -800,12 +843,14 @@ pub(super) enum Applied {
 }
 
 /// Apply one watch frame (a line of the stream) to the rows by uid, keeping the
-/// resourceVersion to resume from. Errors other than 410 end the watch.
+/// resourceVersion to resume from. Errors other than 410 end the watch. A `tap` records
+/// the object's change.
 pub(super) fn apply_event(
     line: &str,
     rows: &mut HashMap<String, Arc<Row>>,
     version: &mut String,
     extras: &Extras,
+    tap: Option<&Tap>,
 ) -> Result<Applied> {
     #[cfg(feature = "dev")]
     let _t = crate::dev::timing::span("watch event parse (bg)");
@@ -829,6 +874,9 @@ pub(super) fn apply_event(
                     .map(|o| o.metadata);
                 if let Some(v) = meta.as_ref().and_then(|m| m.resource_version.clone()) {
                     *version = v;
+                }
+                if let (Some(tap), Some(obj)) = (tap, &row.object) {
+                    tap.event(&event.type_, obj);
                 }
                 if event.type_ == "DELETED" {
                     if let Some(uid) = meta.as_ref().and_then(|m| m.uid.as_ref()) {
@@ -979,7 +1027,7 @@ mod watch_tests {
     fn applies_events() {
         let (mut rows, mut version, extras) = (HashMap::<String, Arc<Row>>::new(), "1".to_string(), Extras::default());
         let mut apply =
-            |line: &str, rows: &mut HashMap<String, Arc<Row>>| apply_event(line, rows, &mut version, &extras);
+            |line: &str, rows: &mut HashMap<String, Arc<Row>>| apply_event(line, rows, &mut version, &extras, None);
         assert_eq!(apply(&frame("ADDED", "u1", "web", "5", "Pending"), &mut rows).unwrap(), Applied::Changed);
         assert_eq!(apply(&frame("ADDED", "u2", "api", "6", "Running"), &mut rows).unwrap(), Applied::Changed);
         assert_eq!(rows.len(), 2);
@@ -1003,15 +1051,15 @@ mod watch_tests {
     #[test]
     fn tracks_resource_version() {
         let (mut rows, mut version, extras) = (HashMap::new(), "1".to_string(), Extras::default());
-        apply_event(&frame("ADDED", "u1", "web", "5", "Running"), &mut rows, &mut version, &extras).unwrap();
+        apply_event(&frame("ADDED", "u1", "web", "5", "Running"), &mut rows, &mut version, &extras, None).unwrap();
         assert_eq!(version, "5");
-        apply_event(&frame("DELETED", "u9", "gone", "9", ""), &mut rows, &mut version, &extras).unwrap();
+        apply_event(&frame("DELETED", "u9", "gone", "9", ""), &mut rows, &mut version, &extras, None).unwrap();
         assert_eq!(version, "9");
         let bookmark = r#"{"type":"BOOKMARK","object":{"kind":"Table","metadata":{"resourceVersion":"42"}}}"#;
-        apply_event(bookmark, &mut rows, &mut version, &extras).unwrap();
+        apply_event(bookmark, &mut rows, &mut version, &extras, None).unwrap();
         assert_eq!(version, "42");
         // A bookmark without a version keeps ours.
-        apply_event(r#"{"type":"BOOKMARK","object":{}}"#, &mut rows, &mut version, &extras).unwrap();
+        apply_event(r#"{"type":"BOOKMARK","object":{}}"#, &mut rows, &mut version, &extras, None).unwrap();
         assert_eq!(version, "42");
     }
 }

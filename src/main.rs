@@ -33,6 +33,7 @@ mod settings;
 mod status;
 mod table;
 mod templates;
+mod timeline;
 mod ui;
 mod upgrade;
 mod yaml;

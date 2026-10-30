@@ -328,7 +328,7 @@ async fn table(
     let (started, plural) = (std::time::Instant::now(), ar.plural.clone());
     let kind = k8s::Kind { ar, namespaced: true, section: "", label: String::new() };
     // Counts and restarts need only the cells: big lists come without their objects.
-    let result = k8s::list_light(client, kind, ns, with_namespaces).await;
+    let result = k8s::list_light(client, kind, ns, with_namespaces, None).await;
     #[cfg(feature = "dev")]
     if std::env::var("RECOUVRANCE_DEBUG").is_ok() {
         eprintln!("table {plural}: {:?} rows={:?}", started.elapsed(), result.as_ref().map(|r| r.1.len()));

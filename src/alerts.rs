@@ -496,8 +496,10 @@ pub fn problems(alerts: &[Alert], namespaces: &[String]) -> Vec<Problem> {
 /// A cluster's problems (see `problems::scan_namespaces`) with its firing alerts in the same
 /// namespaces; alerts that could not be read are noted like a kind.
 pub async fn scan(context: &str, client: Client, kinds: &[Kind], namespaces: &[String]) -> Scan {
-    let (mut scan, alerts) =
-        futures::join!(crate::problems::scan_namespaces(client.clone(), kinds, namespaces), active(context, client));
+    let (mut scan, alerts) = futures::join!(
+        crate::problems::scan_namespaces(client.clone(), kinds, namespaces, Some(context)),
+        active(context, client)
+    );
     add(&mut scan, &alerts, namespaces);
     scan
 }

@@ -37,6 +37,7 @@ impl AppView {
             "workloads" => self.open_workloads(window, cx),
             "cluster" => self.open_cluster(window, cx),
             "problems" => self.open_problems(window, cx),
+            "timeline" => self.open_timeline(window, cx),
             "access" => self.open_access(window, cx),
             "apply" => self.open_apply(window, cx),
             "helm" => self.open_helm(window, cx),

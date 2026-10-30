@@ -41,7 +41,7 @@ pub fn run(ctx: String) {
         if std::env::var("RECOUVRANCE_PROBLEMS").is_ok() {
             let kinds = k8s::discover(client.clone()).await.unwrap();
             let t = std::time::Instant::now();
-            let scan = problems::scan_partial(client.clone(), &kinds, None).await;
+            let scan = problems::scan_partial(client.clone(), &kinds, None, None).await;
             let p = &scan.problems;
             println!("{} problems in {:?}", p.len(), t.elapsed());
             if let Some(skipped) = scan.skipped_text() {

@@ -20,6 +20,7 @@ Recouvrance reads your kubeconfig like `kubectl` does and keeps its own settings
 | `~/.config/recouvrance/anthropic-key` | The assistant's Anthropic API key, when saved in Settings (mode 0600; `ANTHROPIC_API_KEY` is used otherwise) |
 | `~/.config/recouvrance/main-agent` | The built-in assistant's agent id and token (mode 0600) |
 | `~/.local/share/recouvrance/audit.jsonl` | Agent activity log |
+| `~/.local/share/recouvrance/timeline/<context>-<hash>.jsonl` | Changes recorded per context (mode 0600, see [Timeline](#timeline)) |
 
 A JSON file that can't be read is kept aside as `<name>.bad-<time>` so the next save doesn't
 overwrite it. In `settings.json`, only the keys that don't read get their default; the others,
@@ -93,6 +94,30 @@ context already shown as `name@file` keeps that name when `name` is freed.
 | `delete_confirm_kinds` | by kind | `{ "Pod": "off", "Cluster.postgresql.cnpg.io": "type" }`: what deleting asks per kind, a custom resource with its group (see [features](features.md)). A value that doesn't read asks for the name |
 | `namespace_visits` | | Remembered by the app: namespaces chosen per context, with a visit count and the last visit time. The namespace picker shows the five most frequent first (visits weigh half as much after a week without one); 30 kept per context. Older files' `recent_namespaces` are turned into visits once |
 | `last_contexts`, `recent_contexts` | | Remembered by the app |
+| `timeline` | | What the timeline records and keeps (see [Timeline](#timeline)) |
+
+### Timeline
+
+```json
+"timeline": { "record": true, "kinds": ["configmaps", "deployments.apps"], "max_mb": 16, "days": 14 }
+```
+
+| Key | Default | What |
+|---|---|---|
+| `record` | `true` | Record changes to what the lists and the Problems scan watch. Off: nothing more is recorded; what was still shows |
+| `kinds` | `[]` | Kinds watched whole while connected (kubectl names, `configmaps`, `secrets`, `deployments.apps`): each is a watch more on every connected cluster (in each namespace set in `clusters.<ctx>.namespaces` where there are some), and its records a diff of the whole object. Takes effect at the next connect. A name no connected cluster serves is said on the Timeline page |
+| `max_mb` | `16` | MB of records kept per context, 1 to 1024. Past it, the oldest go: the file is rewritten down to 3/4 of it |
+| `days` | `14` | Records older than this are dropped, 1 to 365 |
+
+A `timeline` value that doesn't read gets these defaults (the other settings are kept).
+
+The records of a context are in one file, `~/.local/share/recouvrance/timeline/<context>-<hash>.jsonl`
+(`$XDG_DATA_HOME`): a header line naming the context, then a JSON line a change (time, kind,
+namespace, name, uid, what changed, and the two versions compared, at most 64 KB each; a Secret's
+values never). New records are appended in batches by a thread of their own, at most every half
+second; the file is rewritten (atomically) only when records fall out of the bounds. A file that
+doesn't read (cut short by a crash, edited by hand, another context's) is kept aside as
+`<name>.bad-<time>` and recording starts over; the Timeline page says so.
 
 ### Metrics endpoint
 
