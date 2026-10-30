@@ -69,7 +69,7 @@ impl FileBrowser {
     fn confirm_copy(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         match self.copy {
             CopyState::Ready(_) => {
-                self.guarded(|this, window, cx| this.browse_copy(window, cx), window, cx);
+                self.guarded(Self::browse_copy, window, cx);
                 return;
             }
             CopyState::Starting => return,
