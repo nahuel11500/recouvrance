@@ -95,6 +95,15 @@ tools. What some of them need beyond the obvious verb:
 - **Logs of a workload:** `workload_logs` merges the logs of a workload's or Service's pods (the
   newest 20) in time order, each line prefixed with its pod. It needs `get` on the workload; pods
   whose logs the rules don't allow are left out and counted.
+- **Argo CD diagnosis:** `gitops` with `action: diagnose` on an Application changes nothing and
+  needs `get` on it (not `patch`; the activity log doesn't count it as a change). It returns the
+  diagnosis of the Application's page: a deletion held by a finalizer, a sync running for long,
+  a failed sync (each object and why), a sync loop with the `ignoreDifferences` that would stop
+  it, what is out of sync, and the fields that differ between what was last applied and the
+  live object (Secret values masked), with the field managers that wrote it since the last
+  sync. The live objects are read on the first context reaching the destination that the rules
+  name, each only where an Allow rule (or one approved in this call) gives `get` on it; the
+  others are named as not read.
 - **What changed:** `get_changes` returns what changed on an object, newest first, as the app's
   History tab shows it: time, source, object, what changed, and up to 12 changed lines of its
   diff (`limit` changes, 30 by default). It needs `get` on the object. A pod's owner (its

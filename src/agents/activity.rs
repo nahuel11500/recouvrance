@@ -123,7 +123,9 @@ fn problem(e: &AuditEntry) -> bool {
 }
 
 fn writes(e: &AuditEntry) -> bool {
-    crate::mcp::server::tool_writes(&e.tool)
+    // `gitops` changes things, except its `diagnose`, which only reads.
+    let reads = e.tool == "gitops" && arg(e, "action").as_deref() == Some("diagnose");
+    crate::mcp::server::tool_writes(&e.tool) && !reads
 }
 
 /// What a group touched: contexts, namespaces, then objects, a few of each.

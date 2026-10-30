@@ -54,6 +54,15 @@ pub fn parse_cpu(q: &str) -> f64 {
     quantity_scaled(q, 3).unwrap_or(0.0)
 }
 
+/// Whether two quantities are the same amount, written differently ("1000m" and "1",
+/// "1Gi" and "1024Mi"). False when either does not parse.
+pub fn same_amount(a: &str, b: &str) -> bool {
+    match (quantity_scaled(a, 0), quantity_scaled(b, 0)) {
+        (Some(x), Some(y)) => (x - y).abs() <= 1e-9 * x.abs().max(y.abs()).max(1.0),
+        _ => false,
+    }
+}
+
 /// Memory quantity to bytes: "128Mi", "1Gi", "500M", "12345Ki", "1000", "1e9", "1Pi".
 pub fn parse_bytes(q: &str) -> f64 {
     quantity_scaled(q, 0).unwrap_or(0.0)

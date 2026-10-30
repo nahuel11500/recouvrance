@@ -711,7 +711,9 @@ pub struct GitOpsParams {
     pub kind: String,
     pub namespace: String,
     pub name: String,
-    #[schemars(description = "reconcile (Flux) · refresh, hard_refresh or sync (Argo CD) · suspend or resume (Flux)")]
+    #[schemars(
+        description = "reconcile (Flux) · refresh, hard_refresh or sync (Argo CD) · suspend or resume (Flux) · diagnose (Argo CD, read only)"
+    )]
     pub action: String,
 }
 
