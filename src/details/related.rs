@@ -96,13 +96,17 @@ pub(super) async fn fetch_related(
     kind: &k8s::Kind,
     ns: Option<String>,
     obj: &serde_json::Value,
-    connected: Vec<String>,
+    clusters: Vec<(String, Client)>,
 ) -> Related {
     use k8s_openapi::api::{apps::v1 as apps, batch::v1 as batch, core::v1 as core};
     let mut related = Related::default();
     if kind.is("argoproj.io", "Application") {
+        let connected = clusters.iter().map(|(n, _)| n.clone()).collect();
         let dest = k8s::argo::destination_of(obj.clone(), context.to_string(), connected).await;
+        // Its resources live on the destination: read there, on a connected context.
+        let drift = k8s::argo::diagnosis::drift_for(obj, dest.1.as_deref(), &clusters).await;
         related.argo_destination = Some(dest);
+        related.argo_drift = Some(drift);
         return related;
     }
     if kind.is("", "Node") {

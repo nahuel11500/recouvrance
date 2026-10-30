@@ -18,6 +18,8 @@ use serde_json::Value;
 use super::{ContextTarget, Kind, ObjectRef};
 use crate::status::Tone;
 
+pub mod diagnosis;
+
 /// The annotation Argo CD puts on what it deploys.
 pub const TRACKING_ID: &str = "argocd.argoproj.io/tracking-id";
 /// The label Argo CD's older tracking mode sets (Helm sets it too, so it is only a hint).

@@ -154,6 +154,32 @@
   when it isn't); the row menu also opens the destination and asks for *Refresh*, *Hard refresh*
   or *Sync* (write mode and the Argo CD cluster's protection apply). An Argo CD cluster that
   can't be read is named above the list; the others are shown.
+- **Argo CD diagnosis**: an Application's page says what is wrong with it, worst first, each
+  with its objects (opening on the destination's context when it is connected) and what to do:
+  - *Being deleted*: the finalizers holding it (what each one waits for) and the resources not
+    deleted yet; red after 5 minutes.
+  - *Sync running* for more than 10 minutes: the hook or resource it waits for.
+  - *Last sync failed*: each object that failed and why, from Argo CD's messages: a hook that
+    failed, rejected by admission (a webhook, Pod Security), a webhook that did not answer, a
+    kind not served (CRD missing), a namespace that does not exist, a quota, RBAC, the
+    AppProject, an immutable field, an invalid manifest. Errors Argo CD reports
+    (`ComparisonError`...) too.
+  - *Sync loop*: the same revision synced 3 times or more within an hour by auto-sync (not by
+    a user), the resources it applies again each time, and the `ignoreDifferences` (with
+    `RespectIgnoreDifferences=true`) that would stop it, made from the fields that differ.
+  - *Out of sync*: each resource that differs, is missing or would be pruned, and whether git
+    moved since the last sync. With auto-sync off (a `*-workload` Application) it is said, not
+    as a problem.
+
+  For each out-of-sync resource, the fields that differ are shown as a diff, read on the
+  connected context that reaches the destination. Git's manifests can't be read through the
+  Kubernetes API (Argo CD serves its own diff behind its own login), so the live object is
+  compared with what was last applied to it (the `last-applied-configuration` Argo CD's sync
+  writes): defaults the API server adds are left out, quantities written another way (`1000m`
+  and `1`) are the same, items added to a list (an injected sidecar) are shown, and a
+  Secret's values never are. The field managers that wrote the object since the last sync are
+  named too (with server-side apply that is all there is). A destination that isn't connected
+  is said; open it to connect.
 - **Overviews**: cluster capacity and health, workloads status, Helm releases (values masked; install from your repos, roll back and uninstall through your `helm` CLI).
 - **API requests** (Settings → API requests): per cluster, how many requests of each kind
   (discovery, lists, watches, metrics, logs, shells, writes) were made, how many failed, and how
