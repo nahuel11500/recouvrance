@@ -1042,7 +1042,7 @@ fn a_stopped_container_is_read_from_a_copy_of_its_pod() {
         let truth = k8s::connect_for_agents(ctx.clone()).await?;
         let pods: Api<Pod> = Api::namespaced(truth.clone(), NS);
         let maps: Api<ConfigMap> = Api::namespaced(truth.clone(), NS);
-        let ui = k8s::connect(ctx).await?;
+        let ui = k8s::connect(ctx.clone()).await?;
         let checked = async {
             let _ = pods.delete(NAME, &DeleteParams::default().grace_period(0)).await;
             let _ = maps.delete(CONFIG, &DeleteParams::default()).await;
@@ -1094,16 +1094,38 @@ fn a_stopped_container_is_read_from_a_copy_of_its_pod() {
             assert!(made.pointer("/metadata/ownerReferences").is_none(), "{made}");
             assert!(made.pointer("/spec/containers/0/livenessProbe").is_none(), "{made}");
 
-            // The busybox's applets are installed (or the copy's state says why not).
+            // The busybox's applets are installed (or the copy's state, later tries and kubectl
+            // say why not).
             let tools =
                 vec![format!("{}/busybox", pod_copy::TOOLS), "ls".into(), "-l".into(), pod_copy::TOOLS_BIN.into()];
-            let listed =
-                k8s::exec_capture(truth, NS.into(), copy.name.clone(), Some("main".into()), tools, 30, 1 << 16);
-            match listed.await {
+            let exec = || {
+                k8s::exec_capture(
+                    truth.clone(),
+                    NS.into(),
+                    copy.name.clone(),
+                    Some("main".into()),
+                    tools.clone(),
+                    30,
+                    1 << 16,
+                )
+            };
+            match exec().await {
                 Ok(out) => assert!(out.starts_with("[exit 0]") && out.contains(" sh -> "), "{out}"),
                 Err(e) => {
                     let status = serde_json::to_value(pods.get(&copy.name).await?.status)?;
-                    bail!("exec in the copy: {e:#}\n{status:#}");
+                    let mut later = Vec::new();
+                    for _ in 0..3 {
+                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                        later.push(exec().await.unwrap_or_else(|e| format!("{e:#}")));
+                    }
+                    let kubectl = std::process::Command::new("kubectl")
+                        .args(["--context", ctx.as_str(), "-n", NS, "exec", copy.name.as_str(), "-c", "main", "--"])
+                        .args(&tools)
+                        .output()
+                        .map(|o| {
+                            format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr))
+                        });
+                    bail!("exec in the copy: {e:#}\nlater: {later:#?}\nkubectl: {kubectl:?}\n{status:#}");
                 }
             }
 
