@@ -35,6 +35,11 @@ fn config_map(name: &str) -> ConfigMap {
 
 /// A fresh busybox pod `name` in the test namespace running `script`, once it runs.
 async fn busybox_pod(pods: &Api<k8s_openapi::api::core::v1::Pod>, name: &str, script: &str) -> Result<()> {
+    running_pod(pods, name, "busybox:1.37", script).await
+}
+
+/// A fresh pod `name` of `image` in the test namespace running `script`, once it runs.
+async fn running_pod(pods: &Api<k8s_openapi::api::core::v1::Pod>, name: &str, image: &str, script: &str) -> Result<()> {
     let _ = pods.delete(name, &DeleteParams::default().grace_period(0)).await;
     for _ in 0..60 {
         if pods.get_opt(name).await?.is_none() {
@@ -44,7 +49,7 @@ async fn busybox_pod(pods: &Api<k8s_openapi::api::core::v1::Pod>, name: &str, sc
     }
     let pod = serde_json::from_value(json!({
         "metadata": {"name": name, "namespace": NS},
-        "spec": {"containers": [{"name": "main", "image": "busybox:1.37", "command": ["sh", "-c", script]}]},
+        "spec": {"containers": [{"name": "main", "image": image, "command": ["sh", "-c", script]}]},
     }))?;
     pods.create(&PostParams::default(), &pod).await?;
     for _ in 0..120 {
@@ -407,6 +412,14 @@ fn an_agent_rolls_back_a_deployment() {
             assert!(out.contains("rolled out"), "{out}");
             let out = client.call("rollout_history", target.clone()).await;
             assert!(out.contains("revision 2 (current)") && out.contains("revision 1"), "{out}");
+            // The same revisions as changes, the template's diff with them.
+            let out = client.call("get_changes", target.clone()).await;
+            assert!(
+                out.contains("(revision 2): changed spec.containers[main].command")
+                    && out.lines().any(|l| l.trim_start().starts_with('+') && l.contains("sleep 7200"))
+                    && !out.contains("pod-template-hash"),
+                "{out}"
+            );
 
             let out = client.call("rollout_undo", target.clone()).await;
             assert!(out.contains("Denied"), "{out}");
@@ -795,5 +808,146 @@ fn an_agent_asks_the_cluster() {
         let out = mcp.call("wait_for", wait).await;
         assert!(out.contains(": Ready"), "{out}");
         Ok(())
+    });
+}
+
+/// The upgrade check names a Helm release whose last manifest uses a removed API, and a budget
+/// that would block a drain; the Helm one only while the agent may list the release's Secret.
+#[test]
+#[ignore]
+fn an_agent_checks_an_upgrade() {
+    use k8s_openapi::api::core::v1::{Pod, Secret};
+    use k8s_openapi::api::policy::v1::PodDisruptionBudget;
+
+    run(async {
+        let ctx = context();
+        let client = k8s::connect_for_agents(ctx.clone()).await?;
+        let secrets: Api<Secret> = Api::namespaced(client.clone(), NS);
+        let pods: Api<Pod> = Api::namespaced(client.clone(), NS);
+        let pdbs: Api<PodDisruptionBudget> = Api::namespaced(client, NS);
+        let (release, secret) = ("e2e-upgrade", "sh.helm.release.v1.e2e-upgrade.v1");
+        let _ = secrets.delete(secret, &DeleteParams::default()).await;
+        let _ = pdbs.delete(release, &DeleteParams::default()).await;
+        let mut payload = crate::helm::tests::payload(release, NS, 1);
+        payload["manifest"] = json!(
+            "---\n# Source: c/templates/ingress.yaml\napiVersion: extensions/v1beta1\nkind: Ingress\nmetadata:\n  name: e2e-old-web\n"
+        );
+        secrets
+            .create(&PostParams::default(), &crate::helm::tests::helm_secret((secret, NS, release), &payload, true))
+            .await?;
+        busybox_pod(&pods, release, "sleep 3600").await?;
+        pods.patch(release, &PatchParams::default(), &Patch::Merge(json!({"metadata": {"labels": {"app": release}}})))
+            .await?;
+        let pdb = serde_json::from_value(json!({
+            "metadata": {"name": release, "namespace": NS},
+            "spec": {"minAvailable": 1, "selector": {"matchLabels": {"app": release}}},
+        }))?;
+        pdbs.create(&PostParams::default(), &pdb).await?;
+        // Once the disruption controller has counted the pod.
+        for _ in 0..60 {
+            if pdbs.get(release).await?.status.is_some_and(|s| s.expected_pods == 1) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+        let checked = async {
+            let (hub, agent, token, _server) = agent(&["get,list *"], &[]).await?;
+            let mcp = crate::assistant::Mcp::connect(hub.port(), token).await?;
+            let out = mcp.call("upgrade_check", json!({"context": ctx})).await;
+            assert!(out.contains("Ingress extensions/v1beta1: removed in 1.22 already"), "{out}");
+            assert!(out.contains(&format!("e2e-old-web: in Helm release {NS}/{release} (revision 1)")), "{out}");
+            assert!(out.contains("guards a single pod"), "{out}");
+            assert!(out.contains(&format!("poddisruptionbudgets.policy {NS}/{release}: minAvailable 1")), "{out}");
+            let out = mcp.call("upgrade_check", json!({"context": ctx, "target": "next"})).await;
+            assert!(out.contains("not a Kubernetes 1.x version"), "{out}");
+
+            let deny = rules_file::parse_rule(Mode::Deny, "* secrets")?;
+            hub.update_agent(&agent.id, |a| a.policy.rules.push(deny))?;
+            let out = mcp.call("upgrade_check", json!({"context": ctx})).await;
+            assert!(!out.contains("e2e-old-web") && !out.contains("Ingress extensions/v1beta1"), "{out}");
+            assert!(out.contains("finding(s) about objects you may not see are left out"), "{out}");
+            assert!(out.contains("guards a single pod"), "{out}");
+            Ok(())
+        };
+        let result: Result<()> = checked.await;
+        let _ = pdbs.delete(release, &DeleteParams::default()).await;
+        let _ = pods.delete(release, &DeleteParams::default().grace_period(0)).await;
+        secrets.delete(secret, &DeleteParams::default()).await?;
+        result
+    });
+}
+
+/// The Files tab reads a container through exec, so write mode gates it like a shell: off,
+/// the UI's client refuses the listing; on, `/etc` lists, and names with spaces, newlines
+/// and non-UTF-8 bytes come back whole, a file previews and a search finds it, with
+/// busybox's tools and with GNU's. An agent's `browse_files` needs exec on the pod.
+#[test]
+#[ignore]
+fn the_files_tab_reads_a_container() {
+    use k8s_openapi::api::core::v1::Pod;
+
+    use crate::k8s::files::{FileKind, FileSource, display_name};
+
+    /// Odd names, made with the container's own shell.
+    const MAKE: &str = r#"mkdir -p '/data/a dir' && echo hello > '/data/a dir/file one.txt' && touch "/data/$(printf 'new\nline')" "/data/$(printf 'latin1-\351')" && ln -s '/data/a dir' /data/link && printf '\177ELF\002\001' > /data/bin"#;
+
+    run(async {
+        let ctx = context();
+        let truth = k8s::connect_for_agents(ctx.clone()).await?;
+        let pods: Api<Pod> = Api::namespaced(truth.clone(), NS);
+        let ui = k8s::connect(ctx.clone()).await?;
+        let names = ["e2e-files-busybox", "e2e-files-debian"];
+        let checked = async {
+            running_pod(&pods, names[0], "busybox:1.37", "while true; do sleep 1; done").await?;
+            running_pod(&pods, names[1], "debian:bookworm-slim", "while true; do sleep 1; done").await?;
+            for name in names {
+                let make = vec!["sh".to_string(), "-c".into(), MAKE.into()];
+                let out = k8s::exec_capture(truth.clone(), NS.into(), name.into(), None, make, 30, 4096).await?;
+                assert!(out.starts_with("[exit 0]"), "{name}: {out}");
+                let source = FileSource::exec(ui.clone(), NS.into(), name.into(), None);
+
+                gate::set_ui_writes(false);
+                let refused = source.list(b"/etc").await.err().map(|e| format!("{e:#}")).unwrap_or_default();
+                assert!(refused.contains(gate::WRITES_OFF), "{name}: {refused}");
+                gate::set_ui_writes(true);
+
+                let etc = source.list(b"/etc").await?;
+                assert!(etc.iter().any(|e| e.name == b"passwd" && e.kind == FileKind::File), "{name}: no passwd");
+                let data = source.list(b"/data").await?;
+                let odd: [&[u8]; 5] = [b"a dir", b"new\nline", b"latin1-\xe9", b"link", b"bin"];
+                for want in odd {
+                    assert!(data.iter().any(|e| e.name == want), "{name}: {} is not listed", display_name(want));
+                }
+                let link = data.iter().find(|e| e.name == b"link").context("link")?;
+                assert!(link.opens() && link.target.as_deref() == Some(&b"/data/a dir"[..]), "{name}: {link:?}");
+                let text = source.read(b"/data/a dir/file one.txt", 1024).await?;
+                assert_eq!(text.text(), Some("hello\n"), "{name}");
+                assert_eq!(source.read(b"/data/bin", 1024).await?.kind(), "ELF executable or library", "{name}");
+                assert!(source.read(b"/data/latin1-\xe9", 1024).await?.bytes.is_empty(), "{name}");
+                let found = source.find(b"/data", "ONE").await?;
+                assert_eq!(found.paths, [b"/data/a dir/file one.txt".to_vec()], "{name}");
+            }
+            gate::set_ui_writes(false);
+
+            let (hub, agent, token, _server) = agent(&["get,list *"], &[]).await?;
+            let mcp = crate::assistant::Mcp::connect(hub.port(), token).await?;
+            let browse = json!({"context": ctx, "namespace": NS, "pod": names[0], "path": "/data/a dir"});
+            let out = mcp.call("browse_files", browse.clone()).await;
+            assert!(out.contains("Denied"), "{out}");
+            let allow = rules_file::parse_rule(Mode::Allow, "exec pods/e2e-* -n default")?;
+            hub.update_agent(&agent.id, |a| a.policy.rules.push(allow))?;
+            let out = mcp.call("browse_files", browse).await;
+            assert!(out.contains("file one.txt"), "{out}");
+            let read = json!({"context": ctx, "namespace": NS, "pod": names[0], "path": "/data/a dir/file one.txt"});
+            let out = mcp.call("browse_files", read).await;
+            assert!(out.contains("hello"), "{out}");
+            Ok(())
+        };
+        let result: Result<()> = checked.await;
+        gate::set_ui_writes(false);
+        for name in names {
+            let _ = pods.delete(name, &DeleteParams::default().grace_period(0)).await;
+        }
+        result
     });
 }

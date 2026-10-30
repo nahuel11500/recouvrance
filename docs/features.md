@@ -7,6 +7,20 @@
   mounts), workloads (scheduling, pods, revisions with diffs), services (port-forward, backing
   pods), secrets (masked, referenced by), ingresses, PVCs, namespaces (quotas), nodes, CronJobs,
   and a generic spec/status view for anything else.
+- **History**: an object's page has a History tab listing what changed, newest first, from what
+  the cluster already keeps (nothing runs in the background; it is read when the tab is first
+  opened): a Deployment's ReplicaSets and a StatefulSet's or DaemonSet's ControllerRevisions
+  (what changed in the pod template: images, a restart, the other fields; a rollback says which
+  revision it went back to), the revisions of the Helm release that installed the object
+  (status, chart, values changed), an Argo CD Application's deployments and a sync that failed
+  (and, on an object it deployed, the Application's last deployments), which field managers last
+  wrote which fields and when (`managedFields`; status writes left out), and the object's events,
+  Warnings highlighted. A pod's page shows its owner's revisions (its ReplicaSet's Deployment).
+  *Diff* shows a change's diff, worked out when clicked, the way Compare shows one (the
+  pod-template-hash and other noise left out, secret-looking Helm values masked). A Helm
+  release's History tab has a *Values diff* against the revision before. A source that can't be
+  read (Helm's Secrets forbidden, say) is named; the others still show. ConfigMaps and Secrets
+  keep no history in Kubernetes.
 - **GPU usage**: utilization and memory per pod, workload, node and cluster, from NVIDIA's DCGM
   exporter (shown when its metrics are in Prometheus or VictoriaMetrics).
 - **Usage history** (CPU and memory against requests and limits, over 15 minutes to 7 days; the
@@ -16,11 +30,39 @@
   ends or its page goes away) and **port-forward** for pods and services; forwards are remembered
   and restored with one click. Shells and attach need write mode (they run commands in the
   cluster), checked on every connect, and the context name typed (or a wait) on a protected context.
+- **Files** on a pod: a container's filesystem as a folder tree, read through exec with the tools
+  it has (`sh`, `stat`, `head`, `find`, GNU or busybox). Open folders (size, mode, owner,
+  modification time, symlink targets), preview a text file (its first 256 KiB; a binary file shows
+  its type), download a file or a folder (as a `.tar`) to ~/Downloads, search by name under the
+  folder shown, or type a `/path` to go there. Each container keeps its own place. Names with
+  spaces, newlines or bytes that aren't UTF-8 are shown escaped and still open. Like a shell it
+  needs write mode, and the context name typed (or a wait) once on a protected context; it is
+  greyed out when your RBAC does not allow `pods/exec`. A container without a shell says so.
 - **RBAC-aware**: actions your Kubernetes RBAC forbids are disabled; *My access* shows a can-i
   matrix for the namespace, and says when the cluster (webhook or cloud IAM authorizer) may allow
   more than it lists.
 - **Problems**: one list of what is broken across clusters (crash loops, pending pods, unavailable workloads, NotReady nodes, failed jobs, pending volumes, and alerts firing in the cluster's Prometheus that nobody silenced).
 - **Alerts where you look**: a namespace's page lists the alerts labeled with it, and a pod's, workload's, volume's or node's page the alerts about it (a pod's include its workload's, a workload's its pods'), with severity, summary, how long, runbook link, and silenced or inhibited ones muted when an Alertmanager is found.
+- **Upgrade check** (Cluster overview → *Upgrade check*): per cluster, what needs action before it
+  moves to a newer minor version (the next one by default; the arrows pick another), most urgent first:
+  - *Removed APIs still used*: objects last written in an API version the target no longer serves
+    (by which field manager, or by `kubectl apply`'s last-applied configuration), Helm releases whose
+    last manifest names one (even a version already removed: Helm can't upgrade them), and what the API
+    server's `apiserver_requested_deprecated_apis` metric says clients still call. Each says what to
+    migrate to (e.g. HorizontalPodAutoscaler `autoscaling/v2beta2` → `autoscaling/v2`) and what
+    changes on the way. The removals are those of the Kubernetes deprecation guide.
+  - *Version skew*: kubelets and kube-proxies (by their image in `kube-system`) older than the skew
+    policy allows for the target, or newer than it, and a target more than one minor version ahead
+    (the control plane goes up one at a time).
+  - *Drains that would block*: PodDisruptionBudgets allowing no disruption now (one guarding a single
+    pod waits forever) and pods several budgets select (the eviction API refuses them).
+  - *Feature gates*: the API server's deprecated gates, and alpha ones turned on (from its
+    `kubernetes_feature_enabled` metric; command-line flags can't be seen from the API).
+  - *Add-ons*: CRDs serving versions marked deprecated, and whether objects may still be stored in
+    them.
+
+  Each finding links to its objects. A part that can't be read (the API server's metrics need `get`
+  on `/metrics`) is named, and the rest is still checked.
 - **Stuck deletions**: the Problems page lists objects (pods, workloads, Jobs, PVCs, PVs,
   Namespaces, Argo CD Applications) whose deletion has waited more than 10 minutes, with the
   finalizers holding them (for a Namespace, the resources left); their Delete dialog offers to
@@ -138,5 +180,11 @@
 | Ctrl+T / Ctrl+W / Ctrl+Tab | New tab / close tab / next tab |
 | Ctrl+B / F5 | Hide the sidebar / refresh (in a terminal, F5 goes to the program) |
 | Alt+← / Alt+→ | Back / forward (Esc also goes back from a detail page) |
+| Ctrl+= / Ctrl+- / Ctrl+0 | Zoom in / zoom out / reset the zoom |
 | Ctrl+F or / | Filter the current table: `web` · `!Running` · `app=web` · `tier!=db` · `l:app` · `ns:team-*` · `/^api-\d+/` · `status:Running` · `restarts>3` · `cpu>200m` (all terms must match) |
+| j / k / Enter | Move the selection in a table / open the selected row |
+| g then p / o / w / h / i / s | Go to Problems / Cluster overview / Workloads overview / Helm / Assistant / Settings |
+| ? | List the keyboard shortcuts |
 | Right-click a row | Open, logs, shell, YAML, events, copy name, favorite |
+
+Single keys (?, g, j, k) work when no text field or terminal has focus; `?` lists every shortcut.

@@ -32,7 +32,7 @@ impl DetailPanel {
         if self.logs.is_some() {
             t.push("logs");
         }
-        t.extend(["yaml", "compare", "events"]);
+        t.extend(["yaml", "compare", "history", "events"]);
         t
     }
 

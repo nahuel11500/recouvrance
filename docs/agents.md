@@ -81,9 +81,9 @@ Tools, by what they do:
 
 - **Read:** `my_permissions`, `list_contexts`, `list_resource_types`, `list_resources`, `get_resource`,
   `describe_resource`, `search`, `get_events`, `find_problems`, `check_certificates`, `top_pods`,
-  `top_nodes`, `usage_history`, `get_logs`, `workload_logs`, `rollout_history`, `rollout_status`,
+  `top_nodes`, `usage_history`, `get_logs`, `workload_logs`, `get_changes`, `rollout_history`, `rollout_status`,
   `list_helm_releases`, `helm_history`, `helm_get_values`, `diff_manifest`, `explain_resource`,
-  `can_i`, `cluster_version`, `wait_for`, `list_port_forwards`.
+  `can_i`, `cluster_version`, `upgrade_check`, `wait_for`, `list_port_forwards`, `browse_files`.
 - **Change:** `scale`, `rollout_restart`, `rollout_undo`, `rollout_pause`, `rollout_resume`,
   `set_image`, `patch_resource`, `apply_manifest`, `delete_resource`, `trigger_cronjob`,
   `cordon_node`, `uncordon_node`, `drain_node`, `gitops`, `exec_command`, `debug_pod`,
@@ -95,6 +95,12 @@ tools. What some of them need beyond the obvious verb:
 - **Logs of a workload:** `workload_logs` merges the logs of a workload's or Service's pods (the
   newest 20) in time order, each line prefixed with its pod. It needs `get` on the workload; pods
   whose logs the rules don't allow are left out and counted.
+- **What changed:** `get_changes` returns what changed on an object, newest first, as the app's
+  History tab shows it: time, source, object, what changed, and up to 12 changed lines of its
+  diff (`limit` changes, 30 by default). It needs `get` on the object. A pod's owner (its
+  ReplicaSet, then the Deployment) is read only if the rules allow `get` on it, the Helm
+  revisions only those `list` on secrets allows (values masked), the events only with `list` on
+  events. A source that failed, or an owner the rules don't let it read, is named at the end.
 - **Rollouts:** `rollout_undo`, `rollout_pause`, `rollout_resume` and `set_image` need `patch`.
   `rollout_status` and `wait_for` need `get` and wait up to 5 minutes, stopping when the agent's
   access ends.
@@ -104,6 +110,10 @@ tools. What some of them need beyond the obvious verb:
   creates, named `<cronjob>-manual-<number>` (so `jobs/nightly-manual-*` can be allowed).
   `debug_pod` needs `exec` on the pod: it adds an ephemeral container (busybox by default) that the
   agent then runs commands in with `exec_command`.
+- **Files:** `browse_files` lists a folder (mode, owner, size, modification time, symlink targets)
+  or returns a file's first bytes (64 KiB by default, 1 MiB at most; a binary file only its type)
+  in a container, like the app's Files tab. It runs `sh`, `stat` and `head` there, so it needs
+  `exec` on the pod, like `exec_command`, and changes nothing.
 - **Port-forwards:** `port_forward` needs the `forward` verb on the pod or Service (no preset grants
   it): it is a network path into the cluster. It listens on 127.0.0.1 only, for `minutes` (60 by
   default, 8 hours at most), shows in the sidebar's port-forwards with the agent's name, and stops
@@ -118,6 +128,12 @@ tools. What some of them need beyond the obvious verb:
 - **About the cluster:** `explain_resource` (field docs, CRDs included) and `cluster_version` read
   no objects; `can_i` asks the API server what the kubeconfig user may do (the agent's own rules are
   `my_permissions`).
+- **Upgrade check:** `upgrade_check` gives the findings of the Upgrade check tab (removed APIs still
+  used, version skew, drains that would block, feature gates, deprecated CRD versions) against a
+  `target` minor version, the cluster's next one by default. Like `find_problems`, it asks to list
+  pods in all namespaces, and approving it shows other kinds' objects only where an Allow rule covers
+  them; objects named by a Helm release's manifest show where listing that release's Secret is
+  allowed. A finding none of whose objects the agent may see is left out and counted.
 
 Prompts (slash commands in Claude Code: `/mcp__recouvrance__troubleshoot` …): `troubleshoot`, `rightsize`,
 `cert-audit`, `cluster-health`. They chain the tools above into a read-only workflow.

@@ -15,6 +15,7 @@ mod filter_syntax;
 mod forwards;
 mod glob;
 mod helm;
+mod history;
 mod k8s;
 mod latest;
 mod mcp;
@@ -32,6 +33,7 @@ mod status;
 mod table;
 mod templates;
 mod ui;
+mod upgrade;
 mod yaml;
 
 // Many threads allocate large, short-lived lists (huge clusters); mimalloc

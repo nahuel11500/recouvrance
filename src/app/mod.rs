@@ -37,6 +37,7 @@ mod pages;
 mod problem_badge;
 mod render;
 mod search_index;
+mod shortcuts;
 mod sidebar;
 mod table_page;
 mod theme;
@@ -167,7 +168,14 @@ gpui_kit::actions!(
         RowRun,
         RowScale,
         RowRestart,
-        RowDelete
+        RowDelete,
+        ShowShortcuts,
+        GoProblems,
+        GoCluster,
+        GoWorkloads,
+        GoHelm,
+        GoAssistant,
+        GoSettings
     ]
 );
 
@@ -203,6 +211,16 @@ fn key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("enter", OpenSelected, Some("DataTable")),
         // F5 goes to the program running in a terminal, like the other function keys.
         KeyBinding::new("f5", NoAction, Some("Terminal")),
+        // Single keys: typed as text in an input or a terminal (see `shortcuts::OUTSIDE_TEXT`).
+        KeyBinding::new("?", ShowShortcuts, Some(shortcuts::OUTSIDE_TEXT)),
+        KeyBinding::new("g p", GoProblems, Some(shortcuts::OUTSIDE_TEXT)),
+        KeyBinding::new("g o", GoCluster, Some(shortcuts::OUTSIDE_TEXT)),
+        KeyBinding::new("g w", GoWorkloads, Some(shortcuts::OUTSIDE_TEXT)),
+        KeyBinding::new("g h", GoHelm, Some(shortcuts::OUTSIDE_TEXT)),
+        KeyBinding::new("g i", GoAssistant, Some(shortcuts::OUTSIDE_TEXT)),
+        KeyBinding::new("g s", GoSettings, Some(shortcuts::OUTSIDE_TEXT)),
+        KeyBinding::new("j", base::actions::SelectDown, Some(shortcuts::TABLE_OUTSIDE_TEXT)),
+        KeyBinding::new("k", base::actions::SelectUp, Some(shortcuts::TABLE_OUTSIDE_TEXT)),
     ]
 }
 
