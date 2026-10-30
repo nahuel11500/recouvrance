@@ -246,33 +246,51 @@ pub async fn add_debug_container(
     target: Option<String>,
     dry_run: bool,
 ) -> Result<String> {
+    let name = format!("debugger-{}", &uuid::Uuid::new_v4().simple().to_string()[..5]);
+    let mut container = serde_json::json!({
+        "name": name, "image": image, "stdin": true, "tty": true,
+        "command": ["sh"], "terminationMessagePolicy": "File",
+    });
+    if let Some(t) = target.filter(|t| !t.is_empty()) {
+        container["targetContainerName"] = t.into();
+    }
+    // Namespaces enforcing Pod Security need what `kubectl debug --profile=restricted` sets
+    // (non-root, no privileges).
+    let secure = |_: &str| {
+        serde_json::json!({
+            "allowPrivilegeEscalation": false, "capabilities": {"drop": ["ALL"]},
+            "runAsNonRoot": true, "runAsUser": 65534, "seccompProfile": {"type": "RuntimeDefault"},
+        })
+    };
+    let added = add_ephemeral(client, ns, pod, container, secure, dry_run).await?;
+    Ok(if dry_run { format!("[dry run] debug container {added} accepted") } else { added })
+}
+
+/// Add ephemeral container `container` (its `name` set) to a pod and wait until it runs;
+/// returns its name. Refused by Pod Security, it is tried once more with the
+/// `securityContext` that `secure` gives for the level that refused (`baseline`,
+/// `restricted`).
+pub(crate) async fn add_ephemeral(
+    client: Client,
+    ns: String,
+    pod: String,
+    mut container: serde_json::Value,
+    secure: impl FnOnce(&str) -> serde_json::Value + Send + 'static,
+    dry_run: bool,
+) -> Result<String> {
     run(async move {
         let api: Api<Pod> = Api::namespaced(client, &ns);
-        let name = format!("debugger-{}", &uuid::Uuid::new_v4().simple().to_string()[..5]);
-        let mut container = serde_json::json!({
-            "name": name, "image": image, "stdin": true, "tty": true,
-            "command": ["sh"], "terminationMessagePolicy": "File",
-        });
-        if let Some(t) = target.filter(|t| !t.is_empty()) {
-            container["targetContainerName"] = t.into();
-        }
+        let name = container["name"].as_str().unwrap_or_default().to_string();
         let pp = kube::api::PatchParams { dry_run, ..Default::default() };
         let patch = serde_json::json!({"spec": {"ephemeralContainers": [container.clone()]}});
         if let Err(e) = api.patch_ephemeral_containers(&pod, &pp, &kube::api::Patch::Strategic(&patch)).await {
-            // Namespaces enforcing Pod Security "restricted" need what
-            // `kubectl debug --profile=restricted` sets (non-root, no privileges).
-            if !e.to_string().contains("PodSecurity") {
-                return Err(e.into());
-            }
-            container["securityContext"] = serde_json::json!({
-                "allowPrivilegeEscalation": false, "capabilities": {"drop": ["ALL"]},
-                "runAsNonRoot": true, "runAsUser": 65534, "seccompProfile": {"type": "RuntimeDefault"},
-            });
+            let Some(level) = pod_security_level(&e.to_string()) else { return Err(e.into()) };
+            container["securityContext"] = secure(&level);
             let patch = serde_json::json!({"spec": {"ephemeralContainers": [container]}});
             api.patch_ephemeral_containers(&pod, &pp, &kube::api::Patch::Strategic(&patch)).await?;
         }
         if dry_run {
-            return Ok(format!("[dry run] debug container {name} accepted"));
+            return Ok(name);
         }
         for _ in 0..120 {
             let p = api.get(&pod).await?;
@@ -282,8 +300,13 @@ pub async fn add_debug_container(
                 if state.running.is_some() {
                     return Ok(name);
                 }
+                // An image that can't be pulled, or a container the kubelet won't start (one
+                // that would run as root in a pod that says non-root).
                 if let Some(w) = state.waiting.as_ref().filter(|w| {
-                    matches!(w.reason.as_deref(), Some("ErrImagePull" | "ImagePullBackOff" | "InvalidImageName"))
+                    matches!(
+                        w.reason.as_deref(),
+                        Some("ErrImagePull" | "ImagePullBackOff" | "InvalidImageName" | "CreateContainerConfigError")
+                    )
                 }) {
                     anyhow::bail!(
                         "{}: {}",
@@ -300,6 +323,15 @@ pub async fn add_debug_container(
         anyhow::bail!("debug container {name} did not start within 60s")
     })
     .await
+}
+
+/// The Pod Security level an API error says refused a change (`violates PodSecurity
+/// "restricted:latest"` gives `restricted`), or none when it isn't such a refusal.
+pub(crate) fn pod_security_level(error: &str) -> Option<String> {
+    let (_, after) = error.split_once("PodSecurity")?;
+    let level = after.trim_start().strip_prefix('"').unwrap_or_default();
+    let level: String = level.chars().take_while(char::is_ascii_alphabetic).collect();
+    Some(if level.is_empty() { "restricted".to_string() } else { level })
 }
 
 /// Namespace where node shell pods run (usually allowed to be privileged).
@@ -752,6 +784,20 @@ pub async fn create(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pod_security_refusals_name_their_level() {
+        let refused = |level: &str| {
+            format!(
+                "ApiError: pods \"web\" is forbidden: violates PodSecurity \"{level}\": allowPrivilegeEscalation != false"
+            )
+        };
+        assert_eq!(pod_security_level(&refused("restricted:latest")).as_deref(), Some("restricted"));
+        assert_eq!(pod_security_level(&refused("baseline:v1.33")).as_deref(), Some("baseline"));
+        // Said without a level: the strictest.
+        assert_eq!(pod_security_level("violates PodSecurity").as_deref(), Some("restricted"));
+        assert_eq!(pod_security_level("pods \"web\" not found"), None);
+    }
 
     #[test]
     fn a_node_shell_is_cleaned_up_unless_the_create_was_refused() {

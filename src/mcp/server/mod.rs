@@ -172,7 +172,7 @@ fn describe(a: &Access) -> String {
 
 /// Arguments that change what a call does, for the approval banner: what the user
 /// approves is what runs. Values come from the (redacted) logged arguments.
-const KEY_ARGS: [&str; 11] = [
+const KEY_ARGS: [&str; 12] = [
     "command",
     "path",
     "patch",
@@ -183,6 +183,7 @@ const KEY_ARGS: [&str; 11] = [
     "image",
     "port",
     "minutes",
+    "debug",
     "dry_run",
 ];
 /// Most log bytes one `get_logs` call returns.

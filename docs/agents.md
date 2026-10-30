@@ -113,7 +113,10 @@ tools. What some of them need beyond the obvious verb:
 - **Files:** `browse_files` lists a folder (mode, owner, size, modification time, symlink targets)
   or returns a file's first bytes (64 KiB by default, 1 MiB at most; a binary file only its type)
   in a container, like the app's Files tab. It runs `sh`, `stat` and `head` there, so it needs
-  `exec` on the pod, like `exec_command`, and changes nothing.
+  `exec` on the pod, like `exec_command`, and changes nothing. For an image without a shell
+  (distroless), `debug: true` reads through a debug container as the Files tab does: it reuses one
+  still running that the Files tab or `browse_files` added, else adds one, which stays in the pod's
+  spec. That needs `exec` on the pod too, the rule `debug_pod` adds its containers under.
 - **Port-forwards:** `port_forward` needs the `forward` verb on the pod or Service (no preset grants
   it): it is a network path into the cluster. It listens on 127.0.0.1 only, for `minutes` (60 by
   default, 8 hours at most), shows in the sidebar's port-forwards with the agent's name, and stops

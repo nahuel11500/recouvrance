@@ -37,7 +37,17 @@
   folder shown, or type a `/path` to go there. Each container keeps its own place. Names with
   spaces, newlines or bytes that aren't UTF-8 are shown escaped and still open. Like a shell it
   needs write mode, and the context name typed (or a wait) once on a protected context; it is
-  greyed out when your RBAC does not allow `pods/exec`. A container without a shell says so.
+  greyed out when your RBAC does not allow `pods/exec`. A container without a shell or those
+  tools (distroless, scratch) is offered a **debug container**, like `kubectl debug --target`:
+  one confirmation shows the `kubectl debug` equivalent and that an ephemeral container stays in
+  the pod's spec until the pod is replaced. It runs the node shell image (busybox by default),
+  shares the container's processes, runs as its user (from what the kubelet reports, else the
+  container's or the pod's `securityContext`) and sleeps for 4 hours; the files are read live
+  through `/proc/<pid>/root` of its main process, symlinks followed as the container sees them,
+  and the toolbar says *through a debug container*. It uses `kubectl debug`'s `general` profile
+  (`SYS_PTRACE`), none added where Pod Security is `baseline`, and `restricted`'s where it
+  requires it. Browsing again reuses one still running; it is greyed out when your RBAC does not
+  allow `patch` on `pods/ephemeralcontainers`.
 - **RBAC-aware**: actions your Kubernetes RBAC forbids are disabled; *My access* shows a can-i
   matrix for the namespace, and says when the cluster (webhook or cloud IAM authorizer) may allow
   more than it lists.

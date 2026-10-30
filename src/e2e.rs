@@ -951,3 +951,134 @@ fn the_files_tab_reads_a_container() {
         result
     });
 }
+
+/// A container without a shell (`pause`, a scratch image like distroless) is read through a
+/// debug container: exec finds no shell, the debug container added shares its processes, and
+/// its files read through `/proc/<pid>/root`, a mounted volume and absolute symlinks included.
+/// Browsing again reuses it. The same in a namespace enforcing Pod Security `restricted`, as
+/// the container's user. An agent's `browse_files` does it with `debug` and the exec rule.
+#[test]
+#[ignore]
+fn a_container_without_a_shell_is_read_through_a_debug_container() {
+    use k8s_openapi::api::core::v1::{Namespace, Pod};
+
+    use crate::k8s::files::debug::{self, Look};
+    use crate::k8s::files::{FileSource, Origin};
+
+    /// What the init container leaves in the shared volume: a file and a folder, and absolute
+    /// symlinks to them, which only resolve from the container's own root.
+    const MAKE: &str = "mkdir /data/dir && echo inner > /data/dir/inner && echo hello > /data/file && ln -s /data/file /data/abs-file && ln -s /data/dir /data/abs-dir";
+    const RESTRICTED: &str = "e2e-files-restricted";
+    const NAME: &str = "e2e-files-shellless";
+    const USER: i64 = 65532;
+
+    /// A pod whose container has no shell, with the volume made; in `restricted`, as `USER`.
+    async fn shellless_pod(pods: &Api<Pod>, ns: &str, restricted: bool) -> Result<()> {
+        let locked = json!({"allowPrivilegeEscalation": false, "capabilities": {"drop": ["ALL"]}});
+        let mut spec = json!({
+            "volumes": [{"name": "data", "emptyDir": {}}],
+            "initContainers": [{"name": "make", "image": "busybox:1.37", "command": ["sh", "-c", MAKE],
+                "volumeMounts": [{"name": "data", "mountPath": "/data"}]}],
+            "containers": [{"name": "main", "image": "registry.k8s.io/pause:3.10",
+                "volumeMounts": [{"name": "data", "mountPath": "/data"}]}],
+        });
+        if restricted {
+            spec["securityContext"] = json!({"runAsNonRoot": true, "runAsUser": USER, "runAsGroup": USER,
+                "fsGroup": USER, "seccompProfile": {"type": "RuntimeDefault"}});
+            spec["initContainers"][0]["securityContext"] = locked.clone();
+            spec["containers"][0]["securityContext"] = locked;
+        }
+        let pod = serde_json::from_value(json!({"metadata": {"name": NAME, "namespace": ns}, "spec": spec}))?;
+        pods.create(&PostParams::default(), &pod).await?;
+        for _ in 0..180 {
+            let phase = pods.get(NAME).await?.status.and_then(|s| s.phase);
+            if phase.as_deref() == Some("Running") {
+                return Ok(());
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+        bail!("{ns}/{NAME} did not start")
+    }
+
+    run(async {
+        let ctx = context();
+        let truth = k8s::connect_for_agents(ctx.clone()).await?;
+        let ui = k8s::connect(ctx.clone()).await?;
+        let namespaces: Api<Namespace> = Api::all(truth.clone());
+        let _ = Api::<Pod>::namespaced(truth.clone(), NS).delete(NAME, &DeleteParams::default().grace_period(0)).await;
+        let _ = namespaces.delete(RESTRICTED, &DeleteParams::default()).await;
+        for _ in 0..120 {
+            let gone = namespaces.get_opt(RESTRICTED).await?.is_none();
+            let pod_gone = Api::<Pod>::namespaced(truth.clone(), NS).get_opt(NAME).await?.is_none();
+            if gone && pod_gone {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+        let ns =
+            json!({"metadata": {"name": RESTRICTED, "labels": {"pod-security.kubernetes.io/enforce": "restricted"}}});
+        namespaces.create(&PostParams::default(), &serde_json::from_value(ns)?).await?;
+        let checked = async {
+            for (ns, restricted) in [(NS, false), (RESTRICTED, true)] {
+                let pods: Api<Pod> = Api::namespaced(truth.clone(), ns);
+                shellless_pod(&pods, ns, restricted).await?;
+                gate::set_ui_writes(true);
+                let exec = FileSource::exec(ui.clone(), ns.into(), NAME.into(), Some("main".into()));
+                let refused = exec.list(b"/").await.err().context("pause has no shell")?;
+                assert!(debug::needed(&refused), "{ns}: {refused:#}");
+
+                let look = || debug::look(ui.clone(), ns.into(), NAME.into(), "main".into(), "busybox:1.37".into());
+                let Look::Add(plan) = look().await? else { bail!("{ns}: a debug container to reuse already") };
+                if restricted {
+                    assert_eq!((plan.user, plan.group), (Some(USER), Some(USER)), "{ns}");
+                }
+                let source = debug::add(ui.clone(), ns.into(), NAME.into(), plan).await?;
+                assert_eq!(source.origin(), Origin::Debug);
+                let root = source.list(b"/").await?;
+                assert!(root.iter().any(|e| e.name == b"pause"), "{ns}: no /pause in {root:?}");
+                let data = source.list(b"/data").await?;
+                let dir = data.iter().find(|e| e.name == b"abs-dir").context("abs-dir")?;
+                assert!(dir.opens(), "{ns}: {dir:?}");
+                let file = data.iter().find(|e| e.name == b"abs-file").context("abs-file")?;
+                assert!(!file.opens(), "{ns}: {file:?}");
+                assert_eq!(source.read(b"/data/abs-file", 64).await?.text(), Some("hello\n"), "{ns}");
+                assert_eq!(source.read(b"/data/abs-dir/inner", 64).await?.text(), Some("inner\n"), "{ns}");
+                assert!(source.list(b"/data/abs-dir").await?.iter().any(|e| e.name == b"inner"), "{ns}");
+                let found = source.find(b"/data", "INNER").await?;
+                assert_eq!(found.paths, [b"/data/dir/inner".to_vec()], "{ns}");
+                let hostname = source.read(b"/etc/hostname", 64).await?;
+                assert_eq!(hostname.text().map(str::trim), Some(NAME), "{ns}");
+
+                let Look::Reuse(again) = look().await? else { bail!("{ns}: the debug container is not reused") };
+                assert_eq!(again.container(), source.container(), "{ns}");
+                gate::set_ui_writes(false);
+            }
+
+            let (hub, agent, token, _server) = agent(&["get,list *"], &[]).await?;
+            let mcp = crate::assistant::Mcp::connect(hub.port(), token).await?;
+            let read = json!({"context": ctx, "namespace": NS, "pod": NAME, "path": "/data/abs-file", "debug": true});
+            let out = mcp.call("browse_files", read.clone()).await;
+            assert!(out.contains("Denied"), "{out}");
+            let allow = rules_file::parse_rule(Mode::Allow, "exec pods/e2e-* -n default")?;
+            hub.update_agent(&agent.id, |a| a.policy.rules.push(allow))?;
+            let plain = json!({"context": ctx, "namespace": NS, "pod": NAME, "path": "/data"});
+            let out = mcp.call("browse_files", plain).await;
+            assert!(out.contains("debug: true"), "{out}");
+            let out = mcp.call("browse_files", read).await;
+            assert!(out.contains("hello"), "{out}");
+            let folder = json!({"context": ctx, "namespace": NS, "pod": NAME, "path": "/data", "debug": true});
+            let out = mcp.call("browse_files", folder).await;
+            assert!(out.contains("abs-dir -> /data/dir") && out.contains("through a debug container"), "{out}");
+            // Reused: still the one debug container the app added.
+            let pod = Api::<Pod>::namespaced(truth.clone(), NS).get(NAME).await?;
+            let added = pod.spec.and_then(|s| s.ephemeral_containers).unwrap_or_default();
+            assert_eq!(added.len(), 1, "{:?}", added.iter().map(|c| &c.name).collect::<Vec<_>>());
+            Ok(())
+        };
+        let result: Result<()> = checked.await;
+        gate::set_ui_writes(false);
+        let _ = Api::<Pod>::namespaced(truth.clone(), NS).delete(NAME, &DeleteParams::default().grace_period(0)).await;
+        let _ = namespaces.delete(RESTRICTED, &DeleteParams::default()).await;
+        result
+    });
+}
