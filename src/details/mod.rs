@@ -25,11 +25,12 @@ mod forward_options;
 mod guard;
 mod history;
 mod logs;
+mod reachability;
 mod related;
 mod tabs;
 
 pub(crate) use actions::*;
-pub(crate) use argo::OpenOnContext;
+pub(crate) use argo::{ArgoAction, OpenNamespace, OpenOnContext, confirm_argo_action};
 use browser::FileBrowser;
 pub(crate) use compare::diff_block;
 pub(crate) use guard::*;
@@ -44,6 +45,8 @@ enum DetailTab {
     /// A pod's container, by index in spec.containers.
     Container(usize),
     Revisions,
+    /// The path a request takes to a Service, an Ingress or an HTTPRoute.
+    Reachability,
     Map,
     Compare,
     /// What changed: revisions, Helm and Argo CD history, field managers, events.
@@ -164,6 +167,8 @@ pub struct DetailPanel {
     /// One-shot reads of the object, and of its events: the latest wins.
     object_read: crate::latest::Latest,
     events_load: crate::latest::Latest,
+    /// The Reachability tab's check, and its test from this machine.
+    reach: reachability::Reach,
     /// The Argo CD Applications that deploy the object or into the namespace, when the read
     /// shown started, and a read made at once (after a Sync).
     argo: k8s::argo::Lookup,
@@ -272,6 +277,7 @@ impl DetailPanel {
             pod_order: None,
             object_read: Default::default(),
             events_load: Default::default(),
+            reach: Default::default(),
             argo: Default::default(),
             argo_started: None,
             argo_load: Default::default(),
@@ -491,7 +497,17 @@ impl DetailPanel {
     pub fn select_tab_named(&mut self, name: &str, cx: &mut Context<Self>) {
         self.tab = tab_named(name);
         self.resume_logs_if_shown(cx);
+        if self.tab == DetailTab::Reachability {
+            self.check_reachability(cx);
+        }
         cx.notify();
+    }
+
+    /// The Reachability tab shown before the object was read is checked once it is.
+    fn check_reachability_if_waiting(&mut self, cx: &mut Context<Self>) {
+        if self.tab == DetailTab::Reachability && self.reach.unchecked() {
+            self.check_reachability(cx);
+        }
     }
 
     /// Read the object once; the first success also starts the page's polling loops, a
@@ -517,6 +533,7 @@ impl DetailPanel {
                         this.refresh_yaml(window, cx);
                     }
                     this.start_loops(window, cx);
+                    this.check_reachability_if_waiting(cx);
                     if let Some(action) = this.pending_action.take() {
                         this.quick_action(&action, window, cx);
                     }
@@ -634,6 +651,7 @@ impl DetailPanel {
                     }
                     // The first read failed: this one starts the page.
                     this.start_loops(window, cx);
+                    this.check_reachability_if_waiting(cx);
                     cx.notify();
                 });
                 if alive.is_err() {
@@ -668,7 +686,11 @@ impl DetailPanel {
                 let Ok(Some(obj)) = this.update(cx, |this, _| this.object.clone().filter(|_| !this.deleted)) else {
                     break;
                 };
-                let related = fetch_related(client.clone(), &context, &kind, ns.clone(), &obj).await;
+                // Where an Application deploys is shown on a connected context first.
+                let connected: Vec<String> = this
+                    .update(cx, |this, _| this.clusters.iter().map(|(n, _)| n.clone()).collect())
+                    .unwrap_or_default();
+                let related = fetch_related(client.clone(), &context, &kind, ns.clone(), &obj, connected).await;
                 let indexed = obj.clone();
                 let mut related = exec
                     .spawn(async move {
@@ -956,6 +978,7 @@ fn tab_named(name: &str) -> DetailTab {
         "events" => DetailTab::Events,
         "logs" => DetailTab::Logs,
         "revisions" => DetailTab::Revisions,
+        "reachability" => DetailTab::Reachability,
         "map" => DetailTab::Map,
         "compare" => DetailTab::Compare,
         "history" => DetailTab::History,
@@ -1011,6 +1034,7 @@ mod tests {
         assert!(tab_named("shell") == DetailTab::Shell);
         assert!(tab_named("files") == DetailTab::Files);
         assert!(tab_named("debug") != tab_named("shell"));
+        assert!(tab_named("reachability") == DetailTab::Reachability);
     }
 
     #[test]

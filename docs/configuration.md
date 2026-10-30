@@ -137,7 +137,7 @@ on that user and those groups.
 
 ### Argo CD hub (`argocd_contexts`)
 
-The Argo CD panel on namespace and object pages reads Applications from the cluster Argo CD runs
+The Argo CD panel on namespace and object pages, and the Argo CD page, read Applications from the cluster Argo CD runs
 on (the hub). With `argocd_contexts` empty, the hub is found on its own: the connected clusters
 first; only if none serves Applications, the kubeconfig's other contexts that can be asked without
 a login prompt (no exec plugin, or the same exec command line as a connected context).

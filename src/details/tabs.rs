@@ -406,6 +406,9 @@ impl DetailPanel {
 impl Render for DetailPanel {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let mut tabs = vec![DetailTab::Overview];
+        if crate::reachability::Target::of(&self.obj.kind).is_some() {
+            tabs.push(DetailTab::Reachability);
+        }
         let containers = self.object.as_ref().map(container_names).unwrap_or_default();
         if self.obj.kind.is("", "Pod") {
             tabs.extend((0..containers.len()).map(DetailTab::Container));
@@ -439,6 +442,7 @@ impl Render for DetailPanel {
         let body = match self.tab {
             DetailTab::Overview => self.render_overview(cx),
             DetailTab::Container(ix) => self.render_container(ix, cx),
+            DetailTab::Reachability => self.render_reachability(cx),
             DetailTab::Compare => self.render_compare(cx),
             DetailTab::History => self.render_history(cx),
             DetailTab::Map => match &self.object {
@@ -568,6 +572,7 @@ impl Render for DetailPanel {
                             other => Tab::new().label(match other {
                                 DetailTab::Overview => "Overview",
                                 DetailTab::Revisions => "Revisions",
+                                DetailTab::Reachability => "Reachability",
                                 DetailTab::Map => "Map",
                                 DetailTab::Compare => "Compare",
                                 DetailTab::History => "History",
@@ -586,6 +591,10 @@ impl Render for DetailPanel {
                         let _ = view.update(cx, |this, cx| {
                             this.tab = tab;
                             this.resume_logs_if_shown(cx);
+                            // Checked again each time it is opened: the cluster moves on.
+                            if tab == DetailTab::Reachability {
+                                this.check_reachability(cx);
+                            }
                             cx.notify();
                         });
                     }),

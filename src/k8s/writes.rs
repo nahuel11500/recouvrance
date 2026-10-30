@@ -468,14 +468,16 @@ pub async fn flux_reconcile(client: Client, kind: Kind, ns: Option<String>, name
     .await
 }
 
-/// Ask Argo CD to refresh an Application from git.
-pub async fn argo_refresh(client: Client, kind: Kind, ns: Option<String>, name: String) -> Result<String> {
+/// Ask Argo CD to refresh an Application from git; a hard refresh renders its manifests
+/// again instead of using its cache.
+pub async fn argo_refresh(client: Client, kind: Kind, ns: Option<String>, name: String, hard: bool) -> Result<String> {
+    let mode = if hard { "hard" } else { "normal" };
     merge_patch(
         client,
         kind,
         ns,
         name,
-        serde_json::json!({"metadata": {"annotations": {"argocd.argoproj.io/refresh": "normal"}}}),
+        serde_json::json!({"metadata": {"annotations": {"argocd.argoproj.io/refresh": mode}}}),
         false,
     )
     .await

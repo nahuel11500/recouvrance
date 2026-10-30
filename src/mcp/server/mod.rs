@@ -684,6 +684,15 @@ pub struct CertParams {
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
+pub struct ReachParams {
+    pub context: String,
+    #[schemars(description = "services, ingresses or httproutes")]
+    pub kind: String,
+    pub namespace: String,
+    pub name: String,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
 pub struct ProblemsParams {
     pub context: String,
     #[schemars(description = "Only this namespace; all namespaces you may list when omitted")]
@@ -712,7 +721,7 @@ pub struct GitOpsParams {
     pub kind: String,
     pub namespace: String,
     pub name: String,
-    #[schemars(description = "reconcile (Flux) · refresh or sync (Argo CD) · suspend or resume (Flux)")]
+    #[schemars(description = "reconcile (Flux) · refresh, hard_refresh or sync (Argo CD) · suspend or resume (Flux)")]
     pub action: String,
 }
 
