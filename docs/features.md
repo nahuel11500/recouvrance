@@ -16,6 +16,14 @@
   ends or its page goes away) and **port-forward** for pods and services; forwards are remembered
   and restored with one click. Shells and attach need write mode (they run commands in the
   cluster), checked on every connect, and the context name typed (or a wait) on a protected context.
+- **Files** on a pod: a container's filesystem as a folder tree, read through exec with the tools
+  it has (`sh`, `stat`, `head`, `find`, GNU or busybox). Open folders (size, mode, owner,
+  modification time, symlink targets), preview a text file (its first 256 KiB; a binary file shows
+  its type), download a file or a folder (as a `.tar`) to ~/Downloads, search by name under the
+  folder shown, or type a `/path` to go there. Each container keeps its own place. Names with
+  spaces, newlines or bytes that aren't UTF-8 are shown escaped and still open. Like a shell it
+  needs write mode, and the context name typed (or a wait) once on a protected context; it is
+  greyed out when your RBAC does not allow `pods/exec`. A container without a shell says so.
 - **RBAC-aware**: actions your Kubernetes RBAC forbids are disabled; *My access* shows a can-i
   matrix for the namespace, and says when the cluster (webhook or cloud IAM authorizer) may allow
   more than it lists.

@@ -423,6 +423,9 @@ impl Render for DetailPanel {
             tabs.push(DetailTab::Logs);
         }
         tabs.extend([DetailTab::Yaml, DetailTab::Compare, DetailTab::Events]);
+        if self.files.is_some() {
+            tabs.push(DetailTab::Files);
+        }
         if self.terminal.is_some() {
             tabs.push(DetailTab::Shell);
         }
@@ -449,6 +452,9 @@ impl Render for DetailPanel {
             DetailTab::Events => self.render_events(cx),
             DetailTab::Logs => {
                 self.logs.clone().map_or_else(|| div().into_any_element(), IntoElement::into_any_element)
+            }
+            DetailTab::Files => {
+                self.files.clone().map_or_else(|| div().into_any_element(), IntoElement::into_any_element)
             }
             DetailTab::Shell => {
                 self.terminal.clone().map_or_else(|| div().into_any_element(), IntoElement::into_any_element)
@@ -566,6 +572,7 @@ impl Render for DetailPanel {
                                 DetailTab::Yaml => "YAML",
                                 DetailTab::Events => "Events",
                                 DetailTab::Logs => "Logs",
+                                DetailTab::Files => "Files",
                                 DetailTab::Shell => "Shell",
                                 DetailTab::Debug => "Debug",
                                 DetailTab::Container(_) => "",
