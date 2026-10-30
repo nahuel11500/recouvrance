@@ -1604,7 +1604,7 @@ mod tests {
         // Expired: the days that went by, rounded down (3 hours is today, not "-1 days").
         let (state, detail) = of_test_cert(&["test.example"], end + hours(3));
         assert_eq!(state, State::Broken);
-        assert!(detail.starts_with("Expired today"), "{detail}");
+        assert!(detail.starts_with("Expired today"));
         assert!(of_test_cert(&["test.example"], end + hours(24 * 3 + 1)).1.starts_with("Expired 3 days ago"));
         assert_eq!(of_test_cert(&["test.example"], start - hours(1)).0, State::Broken);
         // Expiring soon is a warning.
@@ -1624,7 +1624,7 @@ mod tests {
         let steps = check(CTX, Target::Ingress, &ingress(json!({"number": 80})), &ingress_world(), now);
         let broken = first_break(&steps).unwrap();
         assert_eq!(broken.title, "Secret site-tls");
-        assert!(broken.detail.starts_with("Expired 2 days ago"), "{}", broken.detail);
+        assert!(broken.detail.starts_with("Expired 2 days ago"));
         assert!(broken.command.as_deref().unwrap().contains("jsonpath='{.data.tls\\.crt}' | base64 -d"));
     }
 
