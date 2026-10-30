@@ -80,7 +80,7 @@ names only those an Allow rule lets the agent list.
 Tools, by what they do:
 
 - **Read:** `my_permissions`, `list_contexts`, `list_resource_types`, `list_resources`, `get_resource`,
-  `describe_resource`, `search`, `get_events`, `find_problems`, `check_certificates`, `top_pods`,
+  `describe_resource`, `search`, `get_events`, `find_problems`, `check_certificates`, `check_reachability`, `top_pods`,
   `top_nodes`, `usage_history`, `get_logs`, `workload_logs`, `get_changes`, `rollout_history`, `rollout_status`,
   `list_helm_releases`, `helm_history`, `helm_get_values`, `diff_manifest`, `explain_resource`,
   `can_i`, `cluster_version`, `upgrade_check`, `wait_for`, `list_port_forwards`.
@@ -101,6 +101,13 @@ tools. What some of them need beyond the obvious verb:
   ReplicaSet, then the Deployment) is read only if the rules allow `get` on it, the Helm
   revisions only those `list` on secrets allows (values masked), the events only with `list` on
   events. A source that failed, or an owner the rules don't let it read, is named at the end.
+- **Reachability:** `check_reachability` follows the path a request takes to a Service, an Ingress
+  or an HTTPRoute and names the first step that breaks, with the `kubectl` command to see it (the
+  Reachability tab's checks). It needs `get` on the object, then reads what the path goes through
+  only where the rules allow it: `get` on the backend Services, Gateways and TLS Secrets, `list` on
+  IngressClasses and on the pods and EndpointSlices behind each Service. A step it may not read says
+  so and is not counted as broken. Of a Secret it keeps only the certificate; it sends nothing to the
+  hosts themselves (the tab's *Test from this machine* is not a tool).
 - **Rollouts:** `rollout_undo`, `rollout_pause`, `rollout_resume` and `set_image` need `patch`.
   `rollout_status` and `wait_for` need `get` and wait up to 5 minutes, stopping when the agent's
   access ends.

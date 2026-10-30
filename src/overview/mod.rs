@@ -25,6 +25,7 @@ mod workloads;
 
 use access::{binding_page, role_page, service_account_page};
 pub(crate) use config::*;
+pub(crate) use network::same_parent;
 use network::{gateway, ingress, netpol, route, service};
 use nodes::{node, node_allocation, node_devices};
 pub(crate) use pods::*;

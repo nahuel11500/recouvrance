@@ -127,7 +127,7 @@ pub(super) fn gw_ref(ctx: &Ctx, r: &Value, default_group: &str, default_kind: &s
 
 /// Whether a route's status `parentRef` is this `spec.parentRefs` entry: the same gateway
 /// (group, kind, namespace and name, with their defaults) and the same listener (section, port).
-fn same_parent(spec: &Value, status: &Value, route_ns: Option<&str>) -> bool {
+pub(crate) fn same_parent(spec: &Value, status: &Value, route_ns: Option<&str>) -> bool {
     let str_or = |r: &Value, key: &str, default: Option<&str>| r[key].as_str().or(default).map(String::from);
     let group = |r: &Value| str_or(r, "group", Some("gateway.networking.k8s.io"));
     let kind = |r: &Value| str_or(r, "kind", Some("Gateway"));

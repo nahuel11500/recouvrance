@@ -671,6 +671,15 @@ pub struct CertParams {
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
+pub struct ReachParams {
+    pub context: String,
+    #[schemars(description = "services, ingresses or httproutes")]
+    pub kind: String,
+    pub namespace: String,
+    pub name: String,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
 pub struct ProblemsParams {
     pub context: String,
     #[schemars(description = "Only this namespace; all namespaces you may list when omitted")]
