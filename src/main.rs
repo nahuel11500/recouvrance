@@ -32,6 +32,7 @@ mod schema;
 mod settings;
 mod status;
 mod table;
+mod taints;
 mod templates;
 mod ui;
 mod upgrade;

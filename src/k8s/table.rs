@@ -113,7 +113,29 @@ pub fn json_path(v: &serde_json::Value, path: &str) -> String {
 #[derive(Deserialize, Clone, Debug)]
 pub(super) struct PartialObject {
     #[serde(default)]
+    pub(super) kind: Option<IsNode>,
+    #[serde(default)]
     pub(super) metadata: LeanMeta,
+}
+
+/// Whether an object's `kind` is Node, read without keeping the string (every row has one).
+#[derive(Clone, Copy, Debug)]
+pub(super) struct IsNode(bool);
+
+impl<'de> Deserialize<'de> for IsNode {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        struct Kind;
+        impl serde::de::Visitor<'_> for Kind {
+            type Value = IsNode;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a kind")
+            }
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> std::result::Result<IsNode, E> {
+                Ok(IsNode(v == "Node"))
+            }
+        }
+        d.deserialize_str(Kind)
+    }
 }
 
 /// Only the metadata the tables need. Everything else (annotations,
@@ -180,6 +202,17 @@ pub(super) fn with_table_format(mut req: http::Request<Vec<u8>>, full: bool) -> 
     Ok(req)
 }
 
+/// The path Nodes are listed at. Their rows are read with their whole objects: the taints
+/// that keep pods off a node are in its `spec` (see `add_trouble_taints`).
+const NODES: &str = "/api/v1/nodes";
+
+/// Whether rows of `url` need whole objects: Nodes, or custom columns beyond the metadata.
+/// A node's object is mostly `status.images` (about 24 KB against the 7 KB of its metadata
+/// on a real cluster), but nodes are few.
+pub(super) fn needs_object(url: &str, extras: &Extras) -> bool {
+    url == NODES || needs_full(extras)
+}
+
 /// Whether these custom columns need whole objects (anything beyond labels/annotations).
 pub(super) fn needs_full(extras: &Extras) -> bool {
     extras.iter().any(|(_, p)| {
@@ -193,14 +226,43 @@ pub(super) fn needs_full(extras: &Extras) -> bool {
 
 pub(super) fn to_row(row: ServerRow, extras: &Extras) -> Option<Arc<Row>> {
     let raw = row.object?;
-    let meta = serde_json::from_str::<PartialObject>(raw.get()).ok()?.metadata;
+    let object = serde_json::from_str::<PartialObject>(raw.get()).ok()?;
+    let meta = object.metadata;
     let mut cells: Vec<String> = row.cells.iter().map(cell_text).collect();
+    if object.kind.is_some_and(|k| k.0) {
+        add_trouble_taints(&mut cells, raw.get());
+    }
     if !extras.is_empty()
         && let Ok(obj) = serde_json::from_str::<serde_json::Value>(raw.get())
     {
         cells.extend(extras.iter().map(|(_, path)| json_path(&obj, path)));
     }
     row_from(cells, meta)
+}
+
+/// A node's taints, all of its object that is read for them (metadata and status skipped).
+#[derive(Deserialize, Default)]
+struct NodeTaints {
+    #[serde(default)]
+    spec: NodeSpecTaints,
+}
+
+#[derive(Deserialize, Default)]
+struct NodeSpecTaints {
+    #[serde(default, deserialize_with = "null_default")]
+    taints: Vec<crate::taints::Taint>,
+}
+
+/// The labels of the taints that keep pods off a node because something is wrong, after
+/// kubectl's Status (its second cell): `Ready,CiliumAgentNotReady`. kubectl's own column
+/// only says `SchedulingDisabled` (from `spec.unschedulable`). Nothing changes for a node
+/// whose object isn't there (`includeObject=Metadata`) or has no such taint.
+fn add_trouble_taints(cells: &mut [String], raw: &str) {
+    let Ok(node) = serde_json::from_str::<NodeTaints>(raw) else { return };
+    let labels = crate::taints::labels_of(&node.spec.taints);
+    if let Some(status) = cells.get_mut(1).filter(|_| !labels.is_empty()) {
+        crate::taints::append(status, &labels);
+    }
 }
 
 /// A row from its cells and its object's metadata (None without a uid).
@@ -263,7 +325,7 @@ pub(super) async fn list_paged_with(
     mut on_page: impl FnMut(&[ColumnDef], &[Arc<Row>], bool),
 ) -> Result<(Vec<ColumnDef>, Vec<Arc<Row>>, String)> {
     lp.limit = Some(PAGE_SIZE);
-    let full = needs_full(extras);
+    let full = needs_object(url, extras);
     let (mut defs, mut rows, mut version) = (Vec::new(), Vec::new(), String::new());
     loop {
         let page: ServerTable =
@@ -481,8 +543,9 @@ pub async fn list_light(
         let ns = if kind.namespaced { namespace } else { None };
         let url = DynamicObject::url_path(&kind.ar, ns.as_deref());
         let lp = ListParams::default().limit(LIGHT_PROBE);
+        let full = needs_object(&url, &Extras::default());
         let page: ServerTable =
-            lists::request_idle(&client, with_table_format(Request::new(&url).list(&lp)?, false)?).await?;
+            lists::request_idle(&client, with_table_format(Request::new(&url).list(&lp)?, full)?).await?;
         let defs = page.column_definitions.clone();
         if page.metadata.continue_.as_ref().is_none_or(String::is_empty) {
             let rows = page.rows.into_iter().filter_map(|r| to_row(r, &Extras::default())).collect();
@@ -670,7 +733,7 @@ pub(super) async fn watch_once(
     progress: &mut bool,
 ) -> Result<()> {
     let request = Request::new(url);
-    let full = needs_full(extras);
+    let full = needs_object(url, extras);
     let (_, list_rows, version) = match *first {
         // A namespaced kind in every namespace, no custom columns: the fast way (see
         // `list_fast`) when the list turns out big.
@@ -1059,5 +1122,81 @@ mod json_path_tests {
         assert_eq!(super::json_path(&v, ".spec.containers[*].image"), "a,b");
         assert_eq!(super::json_path(&v, ".metadata.labels['app.kubernetes.io/name']"), "web");
         assert_eq!(super::json_path(&v, ".nope"), "");
+    }
+}
+
+#[cfg(test)]
+mod node_tests {
+    use super::{Extras, HashMap, ServerRow, apply_event, needs_object, to_row};
+
+    /// A Nodes table row with its whole object (`includeObject=Object`).
+    fn node_row(kind: &str, status: &str, spec: serde_json::Value) -> ServerRow {
+        let row = serde_json::json!({
+            "cells": ["n1", status, "<none>", "5d", "v1.33.1"],
+            "object": {"kind": kind, "apiVersion": "v1", "metadata": {"name": "n1", "uid": "u1"}, "spec": spec,
+                "status": {"images": [{"names": ["nginx"], "sizeBytes": 1}]}}
+        });
+        serde_json::from_str(&row.to_string()).unwrap()
+    }
+
+    fn status_of(row: ServerRow) -> String {
+        to_row(row, &Extras::default()).unwrap().cells[1].clone()
+    }
+
+    #[test]
+    fn trouble_taints_add_to_a_nodes_status() {
+        let taints = serde_json::json!({"taints": [
+            {"key": "production", "value": "true", "effect": "NoSchedule"},
+            {"key": "node.cilium.io/agent-not-ready", "effect": "NoSchedule"},
+            {"key": "node.kubernetes.io/unschedulable", "effect": "NoSchedule"},
+        ], "unschedulable": true});
+        assert_eq!(
+            status_of(node_row("Node", "Ready,SchedulingDisabled", taints)),
+            "Ready,SchedulingDisabled,CiliumAgentNotReady"
+        );
+        let ebs = serde_json::json!({"taints": [{"key": "ebs.csi.aws.com/agent-not-ready", "effect": "NoExecute"}]});
+        assert_eq!(status_of(node_row("Node", "Ready", ebs)), "Ready,AgentNotReady");
+    }
+
+    #[test]
+    fn nodes_without_trouble_taints_are_unchanged() {
+        assert_eq!(status_of(node_row("Node", "Ready", serde_json::json!({}))), "Ready");
+        assert_eq!(status_of(node_row("Node", "Ready", serde_json::json!({"taints": null}))), "Ready");
+        let dedicated = serde_json::json!({"taints": [
+            {"key": "node-role.kubernetes.io/control-plane", "effect": "NoSchedule"},
+            {"key": "NodeGpu", "value": "true", "effect": "NoSchedule"},
+        ]});
+        assert_eq!(status_of(node_row("Node", "Ready", dedicated)), "Ready");
+        // Taints of a shape not understood: the row is still there, as kubectl has it.
+        assert_eq!(status_of(node_row("Node", "NotReady", serde_json::json!({"taints": "x"}))), "NotReady");
+        // Only Nodes: another kind's `spec.taints` (a Karpenter NodeClaim's) is left alone.
+        let claim = serde_json::json!({"taints": [{"key": "node.cilium.io/agent-not-ready", "effect": "NoSchedule"}]});
+        assert_eq!(status_of(node_row("NodeClaim", "True", claim)), "True");
+        // A row with its metadata only, as every other kind is listed.
+        let meta: ServerRow = serde_json::from_str(
+            r#"{"cells": ["n1", "Ready"], "object": {"kind": "PartialObjectMetadata", "metadata": {"name": "n1", "uid": "u1"}}}"#,
+        )
+        .unwrap();
+        assert_eq!(status_of(meta), "Ready");
+    }
+
+    #[test]
+    fn a_watched_node_gets_its_taints() {
+        let frame = serde_json::json!({"type": "MODIFIED", "object": {"kind": "Table", "metadata": {}, "columnDefinitions": null,
+            "rows": [{"cells": ["n1", "Ready"], "object": {"kind": "Node", "metadata": {"name": "n1", "uid": "u1", "resourceVersion": "7"},
+                "spec": {"taints": [{"key": "ToBeDeletedByClusterAutoscaler", "value": "1700000000", "effect": "NoSchedule"}]}}}]}});
+        let (mut rows, mut version) = (HashMap::new(), String::new());
+        apply_event(&frame.to_string(), &mut rows, &mut version, &Extras::default()).unwrap();
+        assert_eq!(rows["u1"].cells, ["n1", "Ready,ToBeDeleted"]);
+        assert_eq!(version, "7");
+    }
+
+    #[test]
+    fn nodes_are_listed_with_their_objects() {
+        assert!(needs_object("/api/v1/nodes", &Extras::default()));
+        assert!(!needs_object("/api/v1/pods", &Extras::default()));
+        assert!(!needs_object("/api/v1/namespaces/a/pods", &Extras::default()));
+        let custom: Extras = std::sync::Arc::new(vec![("Replicas".into(), ".spec.replicas".into())]);
+        assert!(needs_object("/apis/apps/v1/deployments", &custom));
     }
 }

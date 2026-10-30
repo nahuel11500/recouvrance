@@ -3,6 +3,16 @@
 - **Contexts**: pick one or several on launch; tables merge clusters with a Context column.
 - **Live tables** with kubectl's own columns for every type, including CRDs; CPU/memory from
   metrics-server; per-type column choice; multi-namespace filter.
+- **Node status**: a node's Status adds, after kubectl's own words, the taints that keep pods off
+  it because something is wrong, kubectl-style (`Ready,CiliumAgentNotReady`): the
+  `node.kubernetes.io/*` ones (pressure, network unavailable, out of service), the cloud
+  provider's (`Uninitialized`, `Shutdown`), Cilium's agent not ready, the cluster autoscaler's
+  and Karpenter's (`ToBeDeleted`, `DeletionCandidate`, `Disrupted`, `Unregistered`), and others
+  whose name says not ready, unavailable, uninitialized, unreachable or pressure. The taints set
+  on purpose to dedicate nodes (`production=true`, GPUs, control plane, `node-role.*`) don't
+  show. Such a node, or a cordoned one (`SchedulingDisabled`), is yellow; NotReady and Unknown
+  red. `status:` filters and sorting see the labels; the node's page and the cluster overview
+  show them too. Nodes are listed with their whole objects for this (the taints are in `spec`).
 - **Detail pages** for pods (per-container tabs: probes, usage vs requests/limits, ports, env,
   mounts), workloads (scheduling, pods, revisions with diffs), services (port-forward, backing
   pods), secrets (masked, referenced by), ingresses, PVCs, namespaces (quotas), nodes, CronJobs,
@@ -52,7 +62,7 @@
 - **RBAC-aware**: actions your Kubernetes RBAC forbids are disabled; *My access* shows a can-i
   matrix for the namespace, and says when the cluster (webhook or cloud IAM authorizer) may allow
   more than it lists.
-- **Problems**: one list of what is broken across clusters (crash loops, pending pods, unavailable workloads, NotReady nodes, failed jobs, pending volumes, and alerts firing in the cluster's Prometheus that nobody silenced).
+- **Problems**: one list of what is broken across clusters (crash loops, pending pods, unavailable workloads, NotReady nodes, nodes such a taint keeps pods off for more than 5 minutes after they started, failed jobs, pending volumes, and alerts firing in the cluster's Prometheus that nobody silenced).
 - **Alerts where you look**: a namespace's page lists the alerts labeled with it, and a pod's, workload's, volume's or node's page the alerts about it (a pod's include its workload's, a workload's its pods'), with severity, summary, how long, runbook link, and silenced or inhibited ones muted when an Alertmanager is found.
 - **Upgrade check** (Cluster overview → *Upgrade check*): per cluster, what needs action before it
   moves to a newer minor version (the next one by default; the arrows pick another), most urgent first:
