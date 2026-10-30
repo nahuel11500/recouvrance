@@ -33,7 +33,7 @@ fn write<T>(l: &RwLock<T>) -> RwLockWriteGuard<'_, T> {
 
 /// A fresh directory for a test.
 #[cfg(test)]
-fn test_dir() -> std::path::PathBuf {
+pub(crate) fn test_dir() -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!("recouvrance-test-{}", uuid::Uuid::new_v4().simple()));
     std::fs::create_dir_all(&dir).unwrap();
     dir

@@ -6,8 +6,8 @@
 //!
 //! Every source makes [`Change`]s, which [`merge`] puts in one list, newest first. A
 //! change's diff is kept as its two versions and only turned into lines when shown
-//! ([`Diff::lines`]). Another source (changes recorded while the app watches) makes
-//! `Change`s with its own [`Source`] and is merged the same way.
+//! ([`Diff::lines`]). Changes recorded while the app watches (`crate::timeline`) come as
+//! `Change`s of their own [`Source`] and are merged the same way.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -32,6 +32,8 @@ pub enum Source {
     /// `metadata.managedFields`: which manager last wrote which fields, and when.
     Fields,
     Event,
+    /// Recorded by the app while it watched the object (see `crate::timeline`).
+    Recorded,
 }
 
 impl Source {
@@ -42,6 +44,7 @@ impl Source {
             Self::ArgoCd => "Argo CD",
             Self::Fields => "Fields",
             Self::Event => "Event",
+            Self::Recorded => "Recorded",
         }
     }
 }
@@ -315,7 +318,7 @@ fn without_restart(template: &Value) -> Value {
 
 /// Where two values differ, as paths of at most `PATH_DEPTH` segments. Lists of named items
 /// (containers, env, ports) are matched by name, so one added doesn't shift the others.
-fn changed_paths(a: &Value, b: &Value, path: &mut Vec<String>, out: &mut Vec<Vec<String>>) {
+pub(crate) fn changed_paths(a: &Value, b: &Value, path: &mut Vec<String>, out: &mut Vec<Vec<String>>) {
     if a == b {
         return;
     }
@@ -359,7 +362,7 @@ fn named(v: &Value) -> Option<BTreeMap<&str, &Value>> {
 }
 
 /// `spec.containers[app].env` from its segments.
-fn join_path(segments: &[String]) -> String {
+pub(crate) fn join_path(segments: &[String]) -> String {
     let mut s = String::new();
     for seg in segments {
         if !s.is_empty() && !seg.starts_with('[') {
@@ -561,7 +564,7 @@ pub fn field_changes(obj: &Value, subject: &str) -> Vec<Change> {
 }
 
 /// The leaf fields of a `fieldsV1` set, as path segments.
-fn field_paths(v: &Value, path: &mut Vec<String>, out: &mut Vec<Vec<String>>) {
+pub(crate) fn field_paths(v: &Value, path: &mut Vec<String>, out: &mut Vec<Vec<String>>) {
     // "." marks the object itself as owned; its fields are listed next to it.
     let children: Vec<(&String, &Value)> =
         v.as_object().into_iter().flatten().filter(|(k, _)| k.as_str() != ".").collect();
@@ -602,7 +605,7 @@ fn field_segment(key: &str) -> String {
 
 /// The fields a manager owns, in a few paths: the fields under the parent that has the most
 /// of them are folded into it, until `SHOWN_FIELDS` paths are left.
-fn fields_summary(paths: &[Vec<String>]) -> String {
+pub(crate) fn fields_summary(paths: &[Vec<String>]) -> String {
     let mut shown: BTreeSet<Vec<String>> = paths.iter().cloned().collect();
     while shown.len() > SHOWN_FIELDS {
         let mut parents: BTreeMap<&[String], usize> = BTreeMap::new();
@@ -790,7 +793,7 @@ pub fn report(subject: &str, changes: &[Change], errors: &[String], limit: usize
     if changes.is_empty() {
         out.push_str(
             "None found. Kubernetes keeps revisions of Deployments, StatefulSets and DaemonSets only, \
-             and events for about an hour.\n",
+             and events for about an hour; the app records other changes only while it watches the object.\n",
         );
     }
     for c in changes.iter().take(limit) {

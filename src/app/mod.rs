@@ -55,6 +55,7 @@ enum Route {
     Workloads(Entity<Dashboard>),
     Cluster(Entity<ClusterOverview>),
     Problems(Entity<crate::ui::problems_view::ProblemsView>),
+    Timeline(Entity<crate::ui::timeline_view::TimelineView>),
     Access(Entity<crate::ui::access_view::AccessView>),
     HelmInstall(Entity<crate::ui::helm_install::HelmInstall>),
     Assistant(Entity<crate::ui::assistant_view::AssistantView>),
@@ -297,6 +298,8 @@ pub struct AppView {
     connect_errors: Option<SharedString>,
     watch: Option<Vec<(TaskGuard, Task<()>)>>,
     metrics: Option<Vec<(TaskGuard, Task<()>)>>,
+    /// The timeline's own watches (`timeline.kinds`), while connected.
+    recording: Vec<TaskGuard>,
     /// A connect is in flight (`_connect` stays set once it is done).
     connecting: bool,
     _connect: Option<Task<()>>,
@@ -509,6 +512,7 @@ impl AppView {
             client: None,
             clusters: Vec::new(),
             kind_clusters: HashMap::new(),
+            recording: Vec::new(),
             views: Default::default(),
             list: live_list::LiveList::default(),
             view_key: None,

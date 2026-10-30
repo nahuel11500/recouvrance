@@ -34,6 +34,7 @@ mod status;
 mod table;
 mod taints;
 mod templates;
+mod timeline;
 mod ui;
 mod upgrade;
 mod yaml;

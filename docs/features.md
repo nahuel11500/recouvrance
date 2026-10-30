@@ -29,8 +29,31 @@
   *Diff* shows a change's diff, worked out when clicked, the way Compare shows one (the
   pod-template-hash and other noise left out, secret-looking Helm values masked). A Helm
   release's History tab has a *Values diff* against the revision before. A source that can't be
-  read (Helm's Secrets forbidden, say) is named; the others still show. ConfigMaps and Secrets
-  keep no history in Kubernetes.
+  read (Helm's Secrets forbidden, say) is named; the others still show. What the app recorded
+  while it watched the object (see Timeline) is listed too, as *Recorded*.
+- **Timeline**: what Kubernetes keeps no history of (ConfigMaps, which keys of a Secret changed,
+  Services, Ingresses, HPAs, scale changes, custom resources) is recorded while a cluster is
+  connected, from what the app already reads: the lists you open (their watch) and the Problems
+  scan (Deployments, StatefulSets, DaemonSets, Nodes, Namespaces, volumes, Argo CD Applications,
+  every scan; a kind with more than 1000 objects is scanned from its cells alone, and not
+  recorded there). No request is added. A change is recorded when something besides the status
+  changed: labels or annotations, or a field manager's write (who, and which fields:
+  `managedFields`), or the generation; status-only writes, `resourceVersion` and `managedFields`
+  churn, leader-election and other noisy annotations are left out. Creations and deletions are
+  recorded too, except of what a controller made (a CronJob's Jobs). Pods, events, ReplicaSets,
+  ControllerRevisions, Endpoints, EndpointSlices and Leases are never recorded: they change all the
+  time and their history is told elsewhere (a pod's by its owner's revisions and its events). The
+  **Timeline** page (sidebar, or `Timeline` in the palette) lists the connected clusters' changes
+  newest first with their events interleaved (Warnings only by default, all, or none); filters by
+  cluster, and `ns:`, `kind:`, `ctx:` and text in its filter box; a row picked shows its diff,
+  worked out then, and opens its object. Lists compare labels and annotations only, so their
+  records say which fields changed and who changed them but keep no diff of the spec; kinds named
+  in **Settings → Timeline** get a watch of their own on every connected cluster (the one cost,
+  opt-in), and their records a diff of the whole object, its status left out. A Secret's values
+  are never kept, in memory or on disk: only whether each key changed. An object written all the
+  time is recorded at most 10 times an hour (the next record says how many were skipped).
+  Records are kept on disk per context, 16 MB and 14 days by default (see
+  [configuration](configuration.md#timeline)), so the timeline survives a restart.
 - **Reachability**: a tab on Services, Ingresses and HTTPRoutes that follows the path a request
   takes and names the first step that breaks, with the `kubectl` command to see it yourself: the
   Ingress's class and the address its controller gave it (for a route, each Gateway, programmed and
