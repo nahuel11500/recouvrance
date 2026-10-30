@@ -786,7 +786,7 @@ pub(super) fn pod_row(ctx: &Ctx, p: &PodRow, cx: &App) -> AnyElement {
         h_flex()
             .w(px(150.))
             .gap_2()
-            .child(div().w(px(48.)).child(selectable(value.map(format).unwrap_or_default())))
+            .child(div().w(px(48.)).child(value.map(format).unwrap_or_default()))
             .child(div().flex_1().child(usage_bar(value, request, limit, color, cx)))
     };
     // Pods are opened in their own namespace (a node lists pods from every namespace).
@@ -804,7 +804,7 @@ pub(super) fn pod_row(ctx: &Ctx, p: &PodRow, cx: &App) -> AnyElement {
                     .text_ellipsis()
                     .whitespace_nowrap()
                     .text_color(theme.muted_foreground)
-                    .child(selectable(p.namespace.clone().unwrap_or_default())),
+                    .child(p.namespace.clone().unwrap_or_default()),
             )
         })
         .child(div().w(px(320.)).child(ctx.link_in(p.name.clone(), "pods", &p.name, p.namespace.clone(), cx)))
@@ -812,24 +812,14 @@ pub(super) fn pod_row(ctx: &Ctx, p: &PodRow, cx: &App) -> AnyElement {
             div()
                 .w(px(50.))
                 .text_color(if p.ready == p.total { theme.success } else { theme.warning })
-                .child(selectable(format!("{}/{}", p.ready, p.total))),
+                .child(format!("{}/{}", p.ready, p.total)),
         )
-        .child(div().w(px(110.)).text_color(state_color(&p.phase, cx)).child(selectable(p.phase.clone())))
+        .child(div().w(px(110.)).text_color(state_color(&p.phase, cx)).child(p.phase.clone()))
         .child(usage(p.cpu, k8s::format_cpu, theme.blue))
         .child(usage(p.mem, k8s::format_bytes, theme.success))
-        .child(
-            div()
-                .w(px(60.))
-                .when(p.restarts > 0, |d| d.text_color(theme.warning))
-                .child(selectable(p.restarts.to_string())),
-        )
+        .child(div().w(px(60.)).when(p.restarts > 0, |d| d.text_color(theme.warning)).child(p.restarts.to_string()))
         .child(div().w(px(220.)).child(ctx.link(p.node.clone(), "nodes", &p.node, cx)))
-        .child(
-            div()
-                .w(px(60.))
-                .text_color(theme.muted_foreground)
-                .child(selectable(p.created.map(k8s::age).unwrap_or_default())),
-        )
+        .child(div().w(px(60.)).text_color(theme.muted_foreground).child(p.created.map(k8s::age).unwrap_or_default()))
         .into_any_element()
 }
 
