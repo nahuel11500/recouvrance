@@ -1,6 +1,8 @@
 //! "What is broken?": problems found from kubectl's own tables (cheap even on
 //! very large clusters), for the Problems page and the `find_problems` MCP tool.
 
+mod references;
+
 use kube::Client;
 
 use crate::k8s::{self, ColumnDef, Kind, Row};
@@ -143,7 +145,9 @@ pub fn judge(kind: &Kind, defs: &[ColumnDef], row: &Row) -> Option<(Severity, St
 /// Kinds checked, in display order. Namespaces, PersistentVolumes and Argo CD Applications
 /// only for deletions stuck; a kind the cluster doesn't serve is left out. The
 /// external-secrets.io ones are judged from their objects (`external_secrets::problems`).
-pub const CHECKED: [(&str, &str); 13] = [
+/// Services, Ingresses and HTTP routes for what they point to that is missing, together
+/// (`references::traffic`).
+pub const CHECKED: [(&str, &str); 16] = [
     ("", "Node"),
     ("", "Namespace"),
     ("apps", "Deployment"),
@@ -151,6 +155,9 @@ pub const CHECKED: [(&str, &str); 13] = [
     ("apps", "DaemonSet"),
     ("", "Pod"),
     ("batch", "Job"),
+    ("", "Service"),
+    ("networking.k8s.io", "Ingress"),
+    (references::GATEWAY, "HTTPRoute"),
     ("", "PersistentVolumeClaim"),
     ("", "PersistentVolume"),
     ("argoproj.io", "Application"),
@@ -180,6 +187,12 @@ impl Scan {
             })
             .collect();
         (!parts.is_empty()).then(|| parts.join(", "))
+    }
+
+    /// Add another scan's problems and skipped kinds.
+    fn absorb(&mut self, other: Self) {
+        self.problems.extend(other.problems);
+        self.skipped.extend(other.skipped);
     }
 }
 
@@ -275,14 +288,15 @@ async fn held(client: &Client, kind: &Kind, namespace: Option<&str>, name: &str)
 /// Requests at once to read the objects found deleting.
 const HELD_PARALLEL: usize = 16;
 
-/// Problems of one kind, from its table; `namespace`: the one scanned, if any. With the
+/// Problems of one kind, from its table; `namespace`: the one scanned, if any. Skipped:
+/// what could not be read to say why (the references of a pod stuck creating). With the
 /// `context` named, the timeline records what the list shows changed.
 async fn scan_kind(
     client: Client,
     kind: Kind,
     namespace: Option<String>,
     context: Option<String>,
-) -> anyhow::Result<Vec<Problem>> {
+) -> anyhow::Result<Scan> {
     use futures::StreamExt as _;
     let problem = |namespace: Option<String>, name: String, severity, reason, age| Problem {
         severity,
@@ -296,18 +310,21 @@ async fn scan_kind(
     // One namespace: its own object, not every namespace.
     if let Some(ns) = namespace.as_deref().filter(|_| kind.is("", "Namespace")) {
         let held = held(&client, &kind, None, ns).await?;
-        return Ok(held
+        let problems = held
             .and_then(|h| {
                 let reason = stuck_reason(&kind, h.deleted, &h.finalizers, &h.why)?;
                 Some(problem(None, ns.to_string(), Severity::Warning, reason, h.created))
             })
             .into_iter()
-            .collect());
+            .collect();
+        return Ok(Scan { problems, skipped: Vec::new() });
     }
     // Big lists come from their cells alone: a small part of the bytes.
     let tap = context.and_then(|c| crate::timeline::tap(&c, &kind, namespace.clone()));
-    let (defs, rows) = k8s::list_light(client.clone(), kind.clone(), namespace, true, tap).await?;
+    let (defs, rows) = k8s::list_light(client.clone(), kind.clone(), namespace.clone(), true, tap).await?;
     let mut found = Vec::new();
+    // The problems that may come from a missing reference: their objects are read to say.
+    let mut dangling = Vec::new();
     let mut stuck = Vec::new();
     for r in &rows {
         if deleting(&defs, r) {
@@ -318,6 +335,9 @@ async fn scan_kind(
             continue;
         }
         if let Some((severity, reason)) = judge(&kind, &defs, r) {
+            if references::may_dangle(&kind, &defs, r) {
+                dangling.push(found.len());
+            }
             found.push(problem(r.namespace.clone(), r.name.clone(), severity, reason, r.created));
         }
     }
@@ -346,29 +366,41 @@ async fn scan_kind(
             found.push(problem(r.namespace.clone(), r.name.clone(), Severity::Warning, reason, r.created));
         }
     }
-    Ok(found)
+    let skipped = references::explain(&client, &kind, namespace.as_deref(), &mut found, &dangling).await;
+    Ok(Scan { problems: found, skipped })
 }
 
 /// Problems in a cluster (or one namespace), worst first, from every kind that
 /// could be listed: one kind refused (403) does not hide the others. `context`: the app's
 /// own scans name it, for the timeline (see `scan_kind`).
 pub async fn scan_partial(client: Client, kinds: &[Kind], namespace: Option<String>, context: Option<&str>) -> Scan {
-    let jobs = CHECKED.iter().filter_map(|(g, k)| kinds.iter().find(|x| x.is(g, k)).cloned()).map(|kind| {
-        let (client, ns, label) = (client.clone(), namespace.clone(), kind.label.clone());
-        let context = context.map(String::from);
-        async move {
-            if kind.ar.group == crate::external_secrets::GROUP {
-                return crate::external_secrets::problems(client, &kind, ns).await.map_err(|e| (label, e));
+    let with_services = references::with_services(kinds);
+    let jobs = CHECKED
+        .iter()
+        // Checked with the Services they point to.
+        .filter(|kind| !references::WITH_SERVICES.contains(kind))
+        .filter_map(|(g, k)| kinds.iter().find(|x| x.is(g, k)).cloned())
+        .map(|kind| {
+            let (client, ns, label) = (client.clone(), namespace.clone(), kind.label.clone());
+            // Owned: a future borrowing `kinds` here would not be `Send` for the agents' server.
+            let (ingress, route) = with_services.clone();
+            let context = context.map(String::from);
+            async move {
+                let scan = if kind.ar.group == crate::external_secrets::GROUP {
+                    crate::external_secrets::problems(client, &kind, ns)
+                        .await
+                        .map(|problems| Scan { problems, skipped: Vec::new() })
+                } else if kind.is("", "Service") {
+                    Ok(references::traffic(client, &kind, ingress.as_ref(), route.as_ref(), ns).await)
+                } else {
+                    scan_kind(client, kind, ns, context).await
+                };
+                scan.unwrap_or_else(|e| Scan { problems: Vec::new(), skipped: vec![(label, e)] })
             }
-            scan_kind(client, kind, ns, context).await.map_err(|e| (label, e))
-        }
-    });
+        });
     let mut out = Scan::default();
-    for r in futures::future::join_all(jobs).await {
-        match r {
-            Ok(found) => out.problems.extend(found),
-            Err(skipped) => out.skipped.push(skipped),
-        }
+    for scan in futures::future::join_all(jobs).await {
+        out.absorb(scan);
     }
     out.problems
         .sort_by(|a, b| a.severity.cmp(&b.severity).then(a.namespace.cmp(&b.namespace)).then(a.name.cmp(&b.name)));
