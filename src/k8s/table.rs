@@ -1351,7 +1351,7 @@ mod node_tests {
         assert!(needs_object("/api/v1/nodes", &Extras::default()));
         assert!(!needs_object("/api/v1/pods", &Extras::default()));
         assert!(!needs_object("/api/v1/namespaces/a/pods", &Extras::default()));
-        let custom: Extras = std::sync::Arc::new(vec![("Replicas".into(), ".spec.replicas".into())]);
+        let custom: Extras = Arc::new(vec![("Replicas".into(), ".spec.replicas".into())]);
         assert!(needs_object("/apis/apps/v1/deployments", &custom));
     }
 }
