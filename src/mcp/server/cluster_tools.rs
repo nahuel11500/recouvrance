@@ -141,13 +141,12 @@ impl KubeMcp {
     ) -> Result<String, String> {
         let args = json!({"context": p.context, "target": p.target});
         let mut call = self.begin(&parts, "upgrade_check", args)?;
-        let target = match p.target.as_deref() {
-            None => None,
-            Some(t) => match crate::upgrade::minor_of(t) {
-                Some(m) => Some(m),
-                None => return Err(call.fail(format!("target {t:?} is not a Kubernetes 1.x version like \"1.33\""))),
-            },
-        };
+        let target = p.target.as_deref().map(crate::upgrade::minor_of);
+        if target == Some(None) {
+            let t = p.target.as_deref().unwrap_or_default();
+            return Err(call.fail(format!("target {t:?} is not a Kubernetes 1.x version like \"1.33\"")));
+        }
+        let target = target.flatten();
         let (client, pods) = self.kind(&call, &p.context, "pods").await?;
         let access = access_for(&pods, &p.context, Verb::List, None, None);
         self.authorize_list(&mut call, &access, true).await?;

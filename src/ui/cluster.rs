@@ -494,10 +494,8 @@ impl ClusterOverview {
 
 impl Render for ClusterOverview {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let body = match &self.upgrade {
-            Some((view, _)) if self.upgrade_shown => view.clone().into_any_element(),
-            _ => self.overview(cx),
-        };
+        let upgrade = self.upgrade.as_ref().filter(|_| self.upgrade_shown).map(|(view, _)| view.clone());
+        let body = if let Some(view) = upgrade { view.into_any_element() } else { self.overview(cx) };
         let page = cx.entity().downgrade();
         v_flex()
             .size_full()

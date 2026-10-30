@@ -311,14 +311,14 @@ fn skew_of_kubelets_and_kube_proxies() {
         {"metadata": {"name": "kube-proxy-x", "namespace": "lab"},
          "spec": {"nodeName": "a", "containers": [{"image": "registry.k8s.io/kube-proxy:v1.20.1"}]}},
     ]));
-    let found = kube_proxy_skew(31, &pods, Some(&nodes));
+    let found = kube_proxy_skew(31, &pods, Some(nodes.as_slice()));
     let titles: Vec<&str> = found.iter().map(|f| f.title.as_str()).collect();
     assert_eq!(titles, ["kube-proxy 1.27: 4 minor versions behind 1.31"]);
     assert_eq!(found[0].objects[0].name, "kube-proxy-a");
     // Four minor versions from the kubelet next to it.
     let nodes: Vec<NodeLite> =
         lean(json!([{"metadata": {"name": "d"}, "status": {"nodeInfo": {"kubeletVersion": "v1.27.0"}}}]));
-    let found = kube_proxy_skew(31, &pods, Some(&nodes));
+    let found = kube_proxy_skew(31, &pods, Some(nodes.as_slice()));
     assert!(
         found.iter().any(|f| f.title.starts_with("kube-proxy more than three") && f.objects[0].name == "kube-proxy-d")
     );
@@ -367,7 +367,7 @@ fn drains_that_would_block() {
         pod("job-1", json!({"app": "web"}), "Succeeded"),
         pod("other", json!({"app": "other"}), "Running"),
     ]));
-    let found = drain_findings(&pdbs, Some(&pods));
+    let found = drain_findings(&pdbs, Some(pods.as_slice()));
     let titles: Vec<&str> = found.iter().map(|f| f.title.as_str()).collect();
     assert_eq!(
         titles,

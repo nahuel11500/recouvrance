@@ -510,7 +510,7 @@ impl ApiMetrics {
     /// Keep what the check reads from one line of the API server's `/metrics`.
     fn add(&mut self, line: &str) {
         if let Some((labels, value)) = sample(line, "apiserver_requested_deprecated_apis") {
-            let get = |k: &str| labels.iter().find(|(l, _)| l == k).map(|(_, v)| v.clone()).unwrap_or_default();
+            let get = |k: &str| labels.iter().find(|(l, _)| l == k).map_or_else(String::new, |(_, v)| v.clone());
             if value > 0.0 {
                 self.deprecated.push(DeprecatedCall {
                     group: get("group"),
@@ -521,7 +521,7 @@ impl ApiMetrics {
                 });
             }
         } else if let Some((labels, value)) = sample(line, "kubernetes_feature_enabled") {
-            let get = |k: &str| labels.iter().find(|(l, _)| l == k).map(|(_, v)| v.clone()).unwrap_or_default();
+            let get = |k: &str| labels.iter().find(|(l, _)| l == k).map_or_else(String::new, |(_, v)| v.clone());
             self.gates.push(Gate { name: get("name"), stage: get("stage"), enabled: value > 0.0 });
         }
     }
@@ -857,7 +857,7 @@ fn drain_findings(pdbs: &[Value], pods: Option<&[PodLite]>) -> Vec<Finding> {
     }
     let pod_object = |p: &PodLite| {
         let on = if p.spec.node_name.is_empty() { String::new() } else { format!("on node {}", p.spec.node_name) };
-        Object::new("pods", Some(&p.metadata.namespace), &p.metadata.name, on)
+        Object::new("pods", Some(p.metadata.namespace.as_str()), &p.metadata.name, on)
     };
     let mut findings = Vec::new();
     let mut by_ns: HashMap<String, Vec<(String, &Value)>> = HashMap::new();
@@ -873,7 +873,7 @@ fn drain_findings(pdbs: &[Value], pods: Option<&[PodLite]>) -> Vec<Finding> {
         if allowed > 0 || expected == 0 {
             continue;
         }
-        let mut objects = vec![Object::new(PDB_KIND, Some(&ns), &name, budget_text(pdb))];
+        let mut objects = vec![Object::new(PDB_KIND, Some(ns.as_str()), &name, budget_text(pdb))];
         let guarded = pods_by_ns.get(ns.as_str()).into_iter().flatten();
         objects.extend(guarded.filter(|p| pdb_selects(&kind, pdb, &p.metadata.labels)).map(|&p| pod_object(p)));
         let (title, action) = if expected == 1 {
@@ -916,7 +916,7 @@ fn drain_findings(pdbs: &[Value], pods: Option<&[PodLite]>) -> Vec<Finding> {
         }
     }
     for ((ns, names), pods) in shared {
-        let mut objects: Vec<Object> = names.iter().map(|n| Object::new(PDB_KIND, Some(&ns), n, "")).collect();
+        let mut objects: Vec<Object> = names.iter().map(|n| Object::new(PDB_KIND, Some(ns.as_str()), n, "")).collect();
         let count = pods.len();
         objects.extend(pods);
         findings.push(Finding {

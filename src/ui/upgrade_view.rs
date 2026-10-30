@@ -162,7 +162,7 @@ impl UpgradeView {
         let theme = cx.theme().clone();
         let check = &self.checks[ci];
         let target = check.target.map_or_else(|| "next".to_string(), |t| format!("1.{t}"));
-        let current = check.current.map(|c| format!("Kubernetes 1.{c} →")).unwrap_or_default();
+        let current = check.current.map_or_else(String::new, |c| format!("Kubernetes 1.{c} →"));
         let at_lowest = check.current.zip(check.target).is_none_or(|(c, t)| t <= c + 1);
         let idle = check.result.is_some();
         let header = h_flex()
