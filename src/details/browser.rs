@@ -261,6 +261,11 @@ impl FileBrowser {
     /// List folder `dir` of the container shown; once listed, open (or preview) its entry
     /// `then_open`.
     fn open_dir(&mut self, dir: Vec<u8>, then_open: Option<Vec<u8>>, window: &mut Window, cx: &mut Context<Self>) {
+        // Before the pod is read, which container a command would run in isn't known: its
+        // place would be filed under none, and lost once the default one is.
+        if self.container.is_none() {
+            return;
+        }
         let dir = files::normalize(&dir);
         let (key, source) = (self.key(), self.source());
         let place = self.places.entry(key.clone()).or_default();
@@ -462,6 +467,8 @@ impl FileBrowser {
         let browse = Button::new("browse-files").primary().icon(Lucide::FolderOpen).label("Browse files");
         let browse = if self.exec_denied {
             browse.disabled(true).tooltip("Your RBAC does not allow exec in this pod (create on pods/exec)")
+        } else if self.container.is_none() {
+            browse.disabled(true).tooltip("Reading the pod…")
         } else {
             browse.on_click(cx.listener(|this, _, window, cx| {
                 this.guarded(|this, window, cx| this.open_dir(b"/".to_vec(), None, window, cx), window, cx);

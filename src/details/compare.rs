@@ -6,6 +6,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use super::{DetailPanel, error_box};
+use crate::history::DiffLine;
 use crate::k8s;
 use crate::k8s::ObjectRef;
 
@@ -123,29 +124,7 @@ impl DetailPanel {
                 let mask = self.obj.kind.is("", "Secret") && !self.reveal_secrets;
                 let (a, b) = (comparable_yaml(theirs, mask), comparable_yaml(mine, mask));
                 let left = self.compare.target_ctx.clone().or(self.compare.target_name.clone()).unwrap_or_default();
-                let d = similar::TextDiff::from_lines(&a, &b);
-                let mut lines: Vec<AnyElement> = Vec::new();
-                for group in d.grouped_ops(3) {
-                    lines.push(div().text_color(muted).child("⋯").into_any_element());
-                    for op in group {
-                        for change in d.iter_changes(&op) {
-                            let (sign, bg, fg) = match change.tag() {
-                                similar::ChangeTag::Delete => ("-", Some(theme.danger.opacity(0.12)), theme.danger),
-                                similar::ChangeTag::Insert => ("+", Some(theme.success.opacity(0.12)), theme.success),
-                                similar::ChangeTag::Equal => (" ", None, muted),
-                            };
-                            lines.push(
-                                h_flex()
-                                    .px_2()
-                                    .when_some(bg, Styled::bg)
-                                    .text_color(fg)
-                                    .child(div().w(px(16.)).child(sign))
-                                    .child(div().whitespace_nowrap().child(change.value().trim_end().to_string()))
-                                    .into_any_element(),
-                            );
-                        }
-                    }
-                }
+                let lines = crate::history::diff_lines(&a, &b);
                 v_flex()
                     .gap_1()
                     .child(div().text_sm().child(format!("− {left}    + {} (this)", self.context)))
@@ -158,15 +137,7 @@ impl DetailPanel {
                     .child(if lines.is_empty() {
                         div().text_sm().text_color(theme.success).child("Identical.").into_any_element()
                     } else {
-                        v_flex()
-                            .rounded_md()
-                            .border_1()
-                            .border_color(theme.border)
-                            .py_1()
-                            .font_family(theme.mono_font_family.clone())
-                            .text_xs()
-                            .children(lines)
-                            .into_any_element()
+                        diff_block(&lines, cx)
                     })
                     .into_any_element()
             }
@@ -217,18 +188,38 @@ pub(super) fn comparable_yaml(v: &serde_json::Value, mask: bool) -> String {
     if let Some(o) = v.as_object_mut() {
         o.remove("status");
     }
-    fn drop_nulls(v: &mut serde_json::Value) {
-        match v {
-            serde_json::Value::Object(m) => {
-                m.retain(|_, v| !v.is_null());
-                m.values_mut().for_each(drop_nulls);
-            }
-            serde_json::Value::Array(a) => a.iter_mut().for_each(drop_nulls),
-            _ => {}
-        }
-    }
-    drop_nulls(&mut v);
+    crate::history::drop_nulls(&mut v);
     crate::yaml::to_string(&v).unwrap_or_default()
+}
+
+/// A diff as the Compare and History tabs show it: removed lines in red, added ones in
+/// green, a mark where unchanged lines are left out.
+pub(crate) fn diff_block(lines: &[DiffLine], cx: &App) -> AnyElement {
+    let theme = cx.theme();
+    let muted = theme.muted_foreground;
+    v_flex()
+        .rounded_md()
+        .border_1()
+        .border_color(theme.border)
+        .py_1()
+        .font_family(theme.mono_font_family.clone())
+        .text_xs()
+        .children(lines.iter().map(|line| {
+            let (sign, bg, fg, text) = match line {
+                DiffLine::Gap => return div().text_color(muted).child("⋯").into_any_element(),
+                DiffLine::Removed(t) => ("-", Some(theme.danger.opacity(0.12)), theme.danger, t),
+                DiffLine::Added(t) => ("+", Some(theme.success.opacity(0.12)), theme.success, t),
+                DiffLine::Same(t) => (" ", None, muted, t),
+            };
+            h_flex()
+                .px_2()
+                .when_some(bg, Styled::bg)
+                .text_color(fg)
+                .child(div().w(px(16.)).child(sign))
+                .child(div().whitespace_nowrap().child(text.clone()))
+                .into_any_element()
+        }))
+        .into_any_element()
 }
 
 #[cfg(test)]

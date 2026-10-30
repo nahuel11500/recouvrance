@@ -27,6 +27,7 @@ mod cluster_tools;
 mod diff_tools;
 mod file_tools;
 mod helm_tools;
+mod history_tools;
 mod job_tools;
 mod logs_tools;
 mod node_tools;
@@ -852,7 +853,7 @@ impl KubeMcp {
     }
 }
 
-#[tool_handler(router = (Self::read_tools() + Self::write_tools() + Self::rollout_tools() + Self::job_tools() + Self::ops_tools() + Self::node_tools() + Self::helm_tools() + Self::logs_tools() + Self::diff_tools() + Self::cluster_tools() + Self::file_tools()))]
+#[tool_handler(router = (Self::read_tools() + Self::write_tools() + Self::rollout_tools() + Self::job_tools() + Self::ops_tools() + Self::node_tools() + Self::helm_tools() + Self::history_tools() + Self::logs_tools() + Self::diff_tools() + Self::cluster_tools() + Self::file_tools()))]
 #[prompt_handler]
 impl ServerHandler for KubeMcp {
     fn get_info(&self) -> ServerConfig {

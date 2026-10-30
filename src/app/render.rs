@@ -13,10 +13,10 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use super::{
-    AppView, CloseTab, EscapeBack, FocusFilter, GoBack, GoForward, NewTab, NewWindow, NextTab, OpenPalette,
-    OpenSelected, PrevTab, RefreshPage, Route, RowCopyName, RowDelete, RowEvents, RowFavorite, RowLogs, RowOpen,
-    RowOpenTab, RowRestart, RowRun, RowScale, RowShell, RowYaml, ToggleSidebar, ZoomIn, ZoomOut, ZoomReset,
-    open_main_window, set_theme,
+    AppView, CloseTab, EscapeBack, FocusFilter, GoAssistant, GoBack, GoCluster, GoForward, GoHelm, GoProblems,
+    GoSettings, GoWorkloads, NewTab, NewWindow, NextTab, OpenPalette, OpenSelected, PrevTab, RefreshPage, Route,
+    RowCopyName, RowDelete, RowEvents, RowFavorite, RowLogs, RowOpen, RowOpenTab, RowRestart, RowRun, RowScale,
+    RowShell, RowYaml, ShowShortcuts, ToggleSidebar, ZoomIn, ZoomOut, ZoomReset, open_main_window, set_theme,
 };
 use crate::favorites::FavObject;
 
@@ -404,6 +404,13 @@ impl AppView {
                 }
             }))
             .on_action(cx.listener(|this, _: &GoForward, _, cx| this.go(1, cx)))
+            .on_action(|_: &ShowShortcuts, window, cx| super::shortcuts::open_panel(window, cx))
+            .on_action(cx.listener(|this, _: &GoProblems, window, cx| this.open_problems(window, cx)))
+            .on_action(cx.listener(|this, _: &GoCluster, window, cx| this.open_cluster(window, cx)))
+            .on_action(cx.listener(|this, _: &GoWorkloads, window, cx| this.open_workloads(window, cx)))
+            .on_action(cx.listener(|this, _: &GoHelm, window, cx| this.open_helm(window, cx)))
+            .on_action(cx.listener(|this, _: &GoAssistant, window, cx| this.open_assistant(window, cx)))
+            .on_action(cx.listener(|this, _: &GoSettings, _, cx| this.navigate(Route::Settings, cx)))
             .on_action(cx.listener(|this, _: &FocusFilter, window, cx| {
                 this.filter.update(cx, |s, cx| s.focus(window, cx));
             }))

@@ -422,7 +422,7 @@ impl Render for DetailPanel {
         if self.logs.is_some() {
             tabs.push(DetailTab::Logs);
         }
-        tabs.extend([DetailTab::Yaml, DetailTab::Compare, DetailTab::Events]);
+        tabs.extend([DetailTab::Yaml, DetailTab::Compare, DetailTab::History, DetailTab::Events]);
         if self.files.is_some() {
             tabs.push(DetailTab::Files);
         }
@@ -440,6 +440,7 @@ impl Render for DetailPanel {
             DetailTab::Overview => self.render_overview(cx),
             DetailTab::Container(ix) => self.render_container(ix, cx),
             DetailTab::Compare => self.render_compare(cx),
+            DetailTab::History => self.render_history(cx),
             DetailTab::Map => match &self.object {
                 Some(v) => crate::overview::relations(&self.ctx(v, cx), cx),
                 None => div().into_any_element(),
@@ -569,6 +570,7 @@ impl Render for DetailPanel {
                                 DetailTab::Revisions => "Revisions",
                                 DetailTab::Map => "Map",
                                 DetailTab::Compare => "Compare",
+                                DetailTab::History => "History",
                                 DetailTab::Yaml => "YAML",
                                 DetailTab::Events => "Events",
                                 DetailTab::Logs => "Logs",

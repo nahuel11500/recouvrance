@@ -412,6 +412,14 @@ fn an_agent_rolls_back_a_deployment() {
             assert!(out.contains("rolled out"), "{out}");
             let out = client.call("rollout_history", target.clone()).await;
             assert!(out.contains("revision 2 (current)") && out.contains("revision 1"), "{out}");
+            // The same revisions as changes, the template's diff with them.
+            let out = client.call("get_changes", target.clone()).await;
+            assert!(
+                out.contains("(revision 2): changed spec.containers[main].command")
+                    && out.lines().any(|l| l.trim_start().starts_with('+') && l.contains("sleep 7200"))
+                    && !out.contains("pod-template-hash"),
+                "{out}"
+            );
 
             let out = client.call("rollout_undo", target.clone()).await;
             assert!(out.contains("Denied"), "{out}");
@@ -800,6 +808,72 @@ fn an_agent_asks_the_cluster() {
         let out = mcp.call("wait_for", wait).await;
         assert!(out.contains(": Ready"), "{out}");
         Ok(())
+    });
+}
+
+/// The upgrade check names a Helm release whose last manifest uses a removed API, and a budget
+/// that would block a drain; the Helm one only while the agent may list the release's Secret.
+#[test]
+#[ignore]
+fn an_agent_checks_an_upgrade() {
+    use k8s_openapi::api::core::v1::{Pod, Secret};
+    use k8s_openapi::api::policy::v1::PodDisruptionBudget;
+
+    run(async {
+        let ctx = context();
+        let client = k8s::connect_for_agents(ctx.clone()).await?;
+        let secrets: Api<Secret> = Api::namespaced(client.clone(), NS);
+        let pods: Api<Pod> = Api::namespaced(client.clone(), NS);
+        let pdbs: Api<PodDisruptionBudget> = Api::namespaced(client, NS);
+        let (release, secret) = ("e2e-upgrade", "sh.helm.release.v1.e2e-upgrade.v1");
+        let _ = secrets.delete(secret, &DeleteParams::default()).await;
+        let _ = pdbs.delete(release, &DeleteParams::default()).await;
+        let mut payload = crate::helm::tests::payload(release, NS, 1);
+        payload["manifest"] = json!(
+            "---\n# Source: c/templates/ingress.yaml\napiVersion: extensions/v1beta1\nkind: Ingress\nmetadata:\n  name: e2e-old-web\n"
+        );
+        secrets
+            .create(&PostParams::default(), &crate::helm::tests::helm_secret((secret, NS, release), &payload, true))
+            .await?;
+        busybox_pod(&pods, release, "sleep 3600").await?;
+        pods.patch(release, &PatchParams::default(), &Patch::Merge(json!({"metadata": {"labels": {"app": release}}})))
+            .await?;
+        let pdb = serde_json::from_value(json!({
+            "metadata": {"name": release, "namespace": NS},
+            "spec": {"minAvailable": 1, "selector": {"matchLabels": {"app": release}}},
+        }))?;
+        pdbs.create(&PostParams::default(), &pdb).await?;
+        // Once the disruption controller has counted the pod.
+        for _ in 0..60 {
+            if pdbs.get(release).await?.status.is_some_and(|s| s.expected_pods == 1) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+        let checked = async {
+            let (hub, agent, token, _server) = agent(&["get,list *"], &[]).await?;
+            let mcp = crate::assistant::Mcp::connect(hub.port(), token).await?;
+            let out = mcp.call("upgrade_check", json!({"context": ctx})).await;
+            assert!(out.contains("Ingress extensions/v1beta1: removed in 1.22 already"), "{out}");
+            assert!(out.contains(&format!("e2e-old-web: in Helm release {NS}/{release} (revision 1)")), "{out}");
+            assert!(out.contains("guards a single pod"), "{out}");
+            assert!(out.contains(&format!("poddisruptionbudgets.policy {NS}/{release}: minAvailable 1")), "{out}");
+            let out = mcp.call("upgrade_check", json!({"context": ctx, "target": "next"})).await;
+            assert!(out.contains("not a Kubernetes 1.x version"), "{out}");
+
+            let deny = rules_file::parse_rule(Mode::Deny, "* secrets")?;
+            hub.update_agent(&agent.id, |a| a.policy.rules.push(deny))?;
+            let out = mcp.call("upgrade_check", json!({"context": ctx})).await;
+            assert!(!out.contains("e2e-old-web") && !out.contains("Ingress extensions/v1beta1"), "{out}");
+            assert!(out.contains("finding(s) about objects you may not see are left out"), "{out}");
+            assert!(out.contains("guards a single pod"), "{out}");
+            Ok(())
+        };
+        let result: Result<()> = checked.await;
+        let _ = pdbs.delete(release, &DeleteParams::default()).await;
+        let _ = pods.delete(release, &DeleteParams::default().grace_period(0)).await;
+        secrets.delete(secret, &DeleteParams::default()).await?;
+        result
     });
 }
 

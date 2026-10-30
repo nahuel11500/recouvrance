@@ -8,7 +8,7 @@ use rmcp::{schemars, tool, tool_router};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::{ContextParam, KubeMcp, access_for, check_identity, require_ns};
+use super::{ContextParam, KubeMcp, access_for, check_identity, problem_visible, require_ns};
 use crate::k8s::{self, ObjectRef};
 use crate::mcp::Verb;
 use crate::schema::{Explained, Schema};
@@ -46,6 +46,13 @@ pub struct WaitParams {
     pub condition: String,
     #[schemars(description = "how long to wait, in seconds (default 60, at most 300)")]
     pub timeout_seconds: Option<u32>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct UpgradeParams {
+    pub context: String,
+    #[schemars(description = "the minor version to check against, e.g. \"1.33\"; the cluster's next one when omitted")]
+    pub target: Option<String>,
 }
 
 #[tool_router(router = cluster_tools, vis = "pub(super)")]
@@ -121,6 +128,50 @@ impl KubeMcp {
                 Ok(format!("{} ({}, built {})", s("gitVersion"), s("platform"), s("buildDate")))
             },
         ))
+    }
+
+    #[tool(
+        description = "What needs action before upgrading the cluster to a newer minor version (the next one by default), most urgent first: API versions the target removes that are still used (objects written in them, Helm release manifests, the API server's deprecated-API metric), kubelet and kube-proxy version skew, PodDisruptionBudgets that would block drains, deprecated or alpha feature gates, and add-on CRD versions marked deprecated. Each finding says what to do and lists its objects. Asks to list pods in all namespaces; objects of other kinds show where an Allow rule covers them, and Helm releases' where listing their Secret is allowed.",
+        annotations(read_only_hint = true)
+    )]
+    async fn upgrade_check(
+        &self,
+        Extension(parts): Extension<Parts>,
+        Parameters(p): Parameters<UpgradeParams>,
+    ) -> Result<String, String> {
+        let args = json!({"context": p.context, "target": p.target});
+        let mut call = self.begin(&parts, "upgrade_check", args)?;
+        let target = p.target.as_deref().map(crate::upgrade::minor_of);
+        if target == Some(None) {
+            let t = p.target.as_deref().unwrap_or_default();
+            return Err(call.fail(format!("target {t:?} is not a Kubernetes 1.x version like \"1.33\"")));
+        }
+        let target = target.flatten();
+        let (client, pods) = self.kind(&call, &p.context, "pods").await?;
+        let access = access_for(&pods, &p.context, Verb::List, None, None);
+        self.authorize_list(&mut call, &access, true).await?;
+        let kinds = match self.hub.client(&p.context).await {
+            Ok((_, kinds)) => kinds,
+            Err(e) => return call.finish(Err(e)),
+        };
+        let report = match crate::upgrade::check(client, Ok(kinds.to_vec()), target).await {
+            Ok(r) => r,
+            Err(e) => return call.finish(Err(e)),
+        };
+        let secrets = k8s::find_kind(&kinds, "secrets").cloned();
+        // Like find_problems: the approval named pods; other kinds need an Allow rule.
+        let visible = |o: &crate::upgrade::Object| {
+            let (kind, ns, name) = match &o.helm {
+                Some(h) => (secrets.as_ref(), Some(h.namespace.clone()), h.secret_name()),
+                None => (k8s::find_kind(&kinds, &o.kind), o.namespace.clone(), o.name.clone()),
+            };
+            kind.is_some_and(|k| {
+                let a = access_for(k, &p.context, Verb::List, ns, Some(name));
+                problem_visible(call.policy(), call.approved_rules(), k.is("", "Pod"), &a)
+            })
+        };
+        let text = crate::upgrade::to_text(&p.context, &report, visible);
+        call.finish(Ok(text))
     }
 
     #[tool(

@@ -1,4 +1,4 @@
-//! Detail page for one object: overview, containers, revisions, logs, YAML, events, files, shell.
+//! Detail page for one object: overview, containers, revisions, logs, YAML, history, events, files, shell.
 
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::input::EditorState;
@@ -23,6 +23,7 @@ mod demo;
 mod files;
 mod forward_options;
 mod guard;
+mod history;
 mod logs;
 mod related;
 mod tabs;
@@ -30,7 +31,9 @@ mod tabs;
 pub(crate) use actions::*;
 pub(crate) use argo::OpenOnContext;
 use browser::FileBrowser;
+pub(crate) use compare::diff_block;
 pub(crate) use guard::*;
+use history::HistoryState;
 pub(crate) use logs::*;
 use related::{container_history_for, container_names, fetch_related, gpu_history_for, history_for};
 use tabs::error_box;
@@ -43,6 +46,8 @@ enum DetailTab {
     Revisions,
     Map,
     Compare,
+    /// What changed: revisions, Helm and Argo CD history, field managers, events.
+    History,
     Logs,
     Yaml,
     Events,
@@ -186,6 +191,7 @@ pub struct DetailPanel {
     /// Every connected cluster (for Compare).
     pub(crate) clusters: Vec<(String, Client)>,
     compare: CompareState,
+    history: HistoryState,
     /// The related polling and RBAC check run (started on the first read that worked).
     loops_started: bool,
     /// The live refresh runs (started once; it also retries a first read that failed).
@@ -282,6 +288,7 @@ impl DetailPanel {
             favorites,
             clusters: Vec::new(),
             compare: CompareState::default(),
+            history: HistoryState::default(),
             loops_started: false,
             live_started: false,
             pending_action: None,
@@ -863,6 +870,9 @@ impl DetailPanel {
         if let Some(uid) = new_uid(&self.obj.uid, &value) {
             let recreated = !self.obj.uid.is_empty() && !self.obj.uid.contains('/');
             self.obj.uid = uid;
+            if recreated {
+                self.reset_history();
+            }
             self.load_events(cx);
             if let Some(logs) = self.logs.as_ref().filter(|_| recreated) {
                 logs.update(cx, |l, cx| {
@@ -873,6 +883,8 @@ impl DetailPanel {
             }
         }
         self.object = Some(value);
+        // Its field managers, an Application's deployments: kept current in the History tab.
+        self.merge_history();
         true
     }
 
@@ -931,6 +943,7 @@ impl DetailPanel {
         // After several writes in a row, only the last list of events is shown.
         self.events_load.spawn(cx, fut, |this, result, cx| {
             this.events = Some(result.map_err(|e| SharedString::from(k8s::short_error(&e))));
+            this.merge_history();
             cx.notify();
         });
     }
@@ -944,6 +957,7 @@ fn tab_named(name: &str) -> DetailTab {
         "revisions" => DetailTab::Revisions,
         "map" => DetailTab::Map,
         "compare" => DetailTab::Compare,
+        "history" => DetailTab::History,
         "container" => DetailTab::Container(0),
         "files" => DetailTab::Files,
         "shell" => DetailTab::Shell,

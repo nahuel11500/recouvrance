@@ -202,7 +202,7 @@ pub fn short_revision(rev: &str) -> String {
 }
 
 /// `status.sync.revision`, or each of `status.sync.revisions` (several sources).
-fn revisions(v: &Value) -> Option<String> {
+pub(crate) fn revisions(v: &Value) -> Option<String> {
     let one = v.get("revision").and_then(Value::as_str).filter(|s| !s.is_empty()).map(short_revision);
     let many: Vec<String> = v
         .get("revisions")
