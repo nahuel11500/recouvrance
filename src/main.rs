@@ -27,6 +27,7 @@ mod problems;
 mod prom;
 mod quantity;
 mod rbac;
+mod reachability;
 mod schema;
 mod settings;
 mod status;

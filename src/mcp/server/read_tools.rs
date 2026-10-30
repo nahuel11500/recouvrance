@@ -1,4 +1,4 @@
-//! MCP tools that read: contexts, types, resources, events, describe, top, search, logs, certificates, problems, usage history.
+//! MCP tools that read: contexts, types, resources, events, describe, top, search, logs, certificates, reachability, problems, usage history.
 
 use http::request::Parts;
 use rmcp::handler::server::tool::Extension;
@@ -8,12 +8,13 @@ use serde_json::json;
 
 use super::{
     CertParams, ContextParam, EventsParams, HistoryParams, KubeMcp, ListParams, LogsParams, MAX_LOG_BYTES,
-    ObjectParams, ProblemsParams, SearchParams, TopParams, access_for, check_identity, describe, format_table,
-    is_secret_object, list_verdict, problem_visible, require_ns,
+    ObjectParams, ProblemsParams, ReachParams, SearchParams, TopParams, access_for, check_identity, describe,
+    format_table, is_secret_object, list_verdict, problem_visible, require_ns, visible,
 };
 use crate::k8s;
-use crate::k8s::ObjectRef;
+use crate::k8s::{Kind, ObjectRef};
 use crate::mcp::{Mode, Verb};
+use crate::reachability;
 
 #[tool_router(router = read_tools, vis = "pub(super)")]
 impl KubeMcp {
@@ -588,16 +589,7 @@ impl KubeMcp {
             if !call.may_see(&access_for(&kind, &p.context, Verb::Get, Some(ns.clone()), Some(name.clone()))) {
                 continue;
             }
-            use base64::Engine as _;
-            let Some(pem) = sec
-                .pointer("/data/tls.crt")
-                .and_then(|v| v.as_str())
-                .and_then(|b| base64::engine::general_purpose::STANDARD.decode(b).ok())
-            else {
-                continue;
-            };
-            // The leaf certificate is first in the chain.
-            let Some(c) = crate::certs::parse_pem(&pem).into_iter().next() else { continue };
+            let Some(c) = crate::certs::of_tls_secret(sec) else { continue };
             // Rounded down: negative as soon as the date has passed.
             let days = c.not_after.map_or(i64::MAX, |t| (t.as_second() - now.as_second()).div_euclid(86400));
             // Not valid yet: clients reject it now, so it is listed first whatever the window.
@@ -638,7 +630,55 @@ impl KubeMcp {
     }
 
     #[tool(
-        description = "What is broken: crash-looping or pending pods, unavailable Deployments/StatefulSets/DaemonSets, NotReady nodes, failed Jobs, pending PVCs, ExternalSecrets and secret stores that fail to sync, objects stuck deleting (Namespaces, PVs, Argo CD Applications too) with the finalizers holding them, and alerts firing in the cluster's Prometheus (not silenced). Worst first. Start here when asked to troubleshoot.",
+        description = "Why a Service, an Ingress or an HTTPRoute doesn't answer: follows the path a request takes and names the first step that breaks, with the kubectl command to see it. Checks the Ingress class and address (or the Gateways and the route's status), that each backend Service exists and has the port, the pods its selector matches, the targetPort on their containers, ready endpoints and why each pod is not ready, and the TLS Secret's certificate (there, valid, covering the hosts). Every object it reads must be allowed by your rules (get or list); a step you may not read is reported as not checked, private keys are never returned, and nothing is sent to the hosts themselves.",
+        annotations(read_only_hint = true)
+    )]
+    async fn check_reachability(
+        &self,
+        Extension(parts): Extension<Parts>,
+        Parameters(p): Parameters<ReachParams>,
+    ) -> Result<String, String> {
+        let args = json!({"context": p.context, "kind": p.kind, "namespace": p.namespace, "name": p.name});
+        let mut call = self.begin(&parts, "check_reachability", args)?;
+        let (client, kind) = self.kind(&call, &p.context, &p.kind).await?;
+        let Some(target) = reachability::Target::of(&kind) else {
+            let what = &kind.ar.kind;
+            return Err(
+                call.fail(format!("check_reachability takes a Service, an Ingress or an HTTPRoute, not {what}"))
+            );
+        };
+        let access = access_for(&kind, &p.context, Verb::Get, Some(p.namespace.clone()), Some(p.name.clone()));
+        self.authorize(&mut call, &access).await?;
+        let obj = ObjectRef {
+            kind: kind.clone(),
+            name: p.name.clone(),
+            namespace: Some(p.namespace.clone()),
+            uid: String::new(),
+        };
+        let value = match k8s::get_object(client.clone(), obj).await {
+            Ok(v) => v,
+            Err(e) => return call.finish(Err(e)),
+        };
+        if let Err(e) = check_identity(&kind, Some(p.namespace.as_str()), &p.name, &value) {
+            return call.finish(Err(e));
+        }
+        // Each object the checks read must be one the rules let this agent read (`get` by name,
+        // `list` for pods, EndpointSlices and IngressClasses), decided before it is read.
+        let (policy, approved, context) = (call.policy().clone(), call.approved_rules().to_vec(), p.context.clone());
+        let allowed: reachability::Allowed = std::sync::Arc::new(move |r: &reachability::Read<'_>| {
+            let kind = Kind { ar: r.ar.clone(), namespaced: r.namespace.is_some(), section: "", label: String::new() };
+            let verb = if r.list { Verb::List } else { Verb::Get };
+            let a = access_for(&kind, &context, verb, r.namespace.map(String::from), r.name.map(String::from));
+            visible(&policy, &approved, &a)
+        });
+        let reader = reachability::Reader::new(client, Some(allowed));
+        let world = reachability::gather(reader, target, value.clone()).await;
+        let steps = reachability::check(&p.context, target, &value, &world, jiff::Timestamp::now());
+        call.finish(Ok(reachability::to_text(&steps)))
+    }
+
+    #[tool(
+        description = "What is broken: crash-looping or pending pods, unavailable Deployments/StatefulSets/DaemonSets, NotReady nodes, failed Jobs, pending PVCs, ExternalSecrets and secret stores that fail to sync, Services that select no pod or no ready one, references to objects that don't exist (a pod's ConfigMaps, Secrets and PVCs, a workload's ServiceAccount, a pending PVC's StorageClass, an Ingress's Services, ports and TLS Secrets, an HTTPRoute's Services), objects stuck deleting (Namespaces, PVs, Argo CD Applications too) with the finalizers holding them, and alerts firing in the cluster's Prometheus (not silenced). Worst first. Start here when asked to troubleshoot.",
         annotations(read_only_hint = true)
     )]
     async fn find_problems(

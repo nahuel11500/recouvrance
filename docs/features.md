@@ -21,6 +21,17 @@
   release's History tab has a *Values diff* against the revision before. A source that can't be
   read (Helm's Secrets forbidden, say) is named; the others still show. ConfigMaps and Secrets
   keep no history in Kubernetes.
+- **Reachability**: a tab on Services, Ingresses and HTTPRoutes that follows the path a request
+  takes and names the first step that breaks, with the `kubectl` command to see it yourself: the
+  Ingress's class and the address its controller gave it (for a route, each Gateway, programmed and
+  with an address, and the route accepted on it); each backend Service and its port, by number or
+  name; the pods its selector matches and the `targetPort` on their containers; ready endpoints, and
+  for each pod that is not ready why (readiness probe, pending, terminating), with a link to it; the
+  TLS Secret's certificate (there, valid, covering the hosts). Everything is read in the object's own
+  cluster; a read that fails is shown as not checked rather than as broken. *Test from this machine*
+  resolves each host of an Ingress and sends it a request (status code, TLS error, time), and says
+  when the name doesn't resolve to the Ingress's address. NetworkPolicies are not predicted. The same
+  checks are the agents' `check_reachability` tool.
 - **GPU usage**: utilization and memory per pod, workload, node and cluster, from NVIDIA's DCGM
   exporter (shown when its metrics are in Prometheus or VictoriaMetrics).
 - **Usage history** (CPU and memory against requests and limits, over 15 minutes to 7 days; the
@@ -63,6 +74,14 @@
 
   Each finding links to its objects. A part that can't be read (the API server's metrics need `get`
   on `/metrics`) is named, and the rest is still checked.
+- **References to missing objects**: the Problems page lists what points to something that
+  doesn't exist, on the object that points to it: a Service that selects no pod (minor when its
+  Deployment or StatefulSet is scaled to 0) or no ready one, an Ingress whose backend Service,
+  its port or a TLS Secret is missing, an HTTPRoute whose backend Service is missing (when the
+  cluster serves the Gateway API). A pod stuck creating, a workload short of ready replicas or a
+  pending PVC says which ConfigMap, Secret, PVC, ServiceAccount or StorageClass it waits on
+  (`optional: true` references aren't needed, and a running pod needs none any more). Kinds that
+  can't be read are named, not reported missing.
 - **Stuck deletions**: the Problems page lists objects (pods, workloads, Jobs, PVCs, PVs,
   Namespaces, Argo CD Applications) whose deletion has waited more than 10 minutes, with the
   finalizers holding them (for a Namespace, the resources left); their Delete dialog offers to
