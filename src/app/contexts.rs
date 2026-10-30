@@ -155,6 +155,7 @@ impl AppView {
                         match dev_var("RECOUVRANCE_PAGE").as_deref() {
                             Some("workloads") => this.open_workloads(window, cx),
                             Some("helm") => this.open_helm(window, cx),
+                            Some("argo") => this.open_argo(window, cx),
                             Some("agents") => this.navigate(Route::Agents, cx),
                             Some("cluster") => this.open_cluster(window, cx),
                             Some("settings") => this.navigate(Route::Settings, cx),

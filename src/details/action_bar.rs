@@ -145,7 +145,7 @@ impl DetailPanel {
                     gate(Button::new("act-argo-refresh"), "patch").small().ghost().icon(Lucide::RefreshCw).label("Refresh").on_click(cx.listener(|this, _, w, cx| {
                         let title = format!("Refresh Application {}?", this.obj.name);
                         this.confirm_action(title, super::argo::REFRESH_NOTE, "Refresh", |p, client| {
-                            Box::pin(k8s::argo_refresh(client, p.obj.kind.clone(), p.obj.namespace.clone(), p.obj.name.clone()))
+                            Box::pin(k8s::argo_refresh(client, p.obj.kind.clone(), p.obj.namespace.clone(), p.obj.name.clone(), false))
                         }, w, cx);
                     })),
                 )
