@@ -169,7 +169,7 @@ const NO_SHELL: &str = "the shell isn't in the image; Debug adds a container wit
 
 /// Why a shell that started ended at once, from the failure status' message: the runtime
 /// says the executable was not found when the image has no `sh`.
-fn ended_reason(message: &str) -> Option<String> {
+pub(super) fn ended_reason(message: &str) -> Option<String> {
     let m = message.to_ascii_lowercase();
     (m.contains("executable file not found") || (m.contains("no such file or directory") && m.contains("exec")))
         .then(|| format!("no shell in this image ({NO_SHELL})"))
@@ -225,7 +225,7 @@ fn refusal_reason(status: u16, verb: &str, pod: Option<&Pod>, container: Option<
 /// The most a container download may write to disk (a bigger file or folder is refused).
 pub const MAX_DOWNLOAD_BYTES: u64 = 2 << 30;
 /// The most kept in memory from a command whose output is only a short answer.
-const MAX_EXEC_OUTPUT: u64 = 16 << 20;
+pub(super) const MAX_EXEC_OUTPUT: u64 = 16 << 20;
 /// The most of stderr kept for an error message.
 const MAX_STDERR: usize = 64 * 1024;
 
@@ -358,7 +358,6 @@ pub async fn download_from_container(
     container: Option<String>,
     path: String,
 ) -> Result<std::path::PathBuf> {
-    use std::io::Write as _;
     run(async move {
         let (parent, member, base) = tar_source(&path);
         // Succeeds for a file too, so a failure (refused, no shell) is said, not read as a file.
@@ -380,21 +379,35 @@ pub async fn download_from_container(
         } else {
             (vec!["cat".into(), "--".into(), path.clone()], format!("{pod}-{base}"))
         };
-        // Streamed to a new private file (it may hold secrets), never over an earlier one.
-        let (file, dest) = crate::private_files::create_new_in(&crate::paths::downloads_dir(), &name)?;
-        // Through a buffer, and off the async workers while the disk is written.
-        let mut file = std::io::BufWriter::with_capacity(1 << 20, file);
-        let mut sink = |b: &[u8]| tokio::task::block_in_place(|| file.write_all(b));
-        let copied = exec_to(client, ns, pod, container, cmd, None::<&[u8]>, &mut sink, MAX_DOWNLOAD_BYTES).await;
-        let copied = copied.and_then(|_| Ok(tokio::task::block_in_place(|| file.flush())?));
-        drop(file);
-        if let Err(e) = copied {
-            let _ = std::fs::remove_file(&dest);
-            return Err(e);
-        }
-        Ok(dest)
+        save_download(client, ns, pod, container, cmd, &name).await
     })
     .await
+}
+
+/// Stream what `cmd` prints in the container to a new private file `name` in ~/Downloads
+/// (it may hold secrets), never over an earlier one; a failed copy leaves no file behind.
+/// Run on the shared runtime: the disk is written off its async workers.
+pub(super) async fn save_download(
+    client: Client,
+    ns: String,
+    pod: String,
+    container: Option<String>,
+    cmd: Vec<String>,
+    name: &str,
+) -> Result<std::path::PathBuf> {
+    use std::io::Write as _;
+    let (file, dest) = crate::private_files::create_new_in(&crate::paths::downloads_dir(), name)?;
+    // Through a buffer, and off the async workers while the disk is written.
+    let mut file = std::io::BufWriter::with_capacity(1 << 20, file);
+    let mut sink = |b: &[u8]| tokio::task::block_in_place(|| file.write_all(b));
+    let copied = exec_to(client, ns, pod, container, cmd, None::<&[u8]>, &mut sink, MAX_DOWNLOAD_BYTES).await;
+    let copied = copied.and_then(|_| Ok(tokio::task::block_in_place(|| file.flush())?));
+    drop(file);
+    if let Err(e) = copied {
+        let _ = std::fs::remove_file(&dest);
+        return Err(e);
+    }
+    Ok(dest)
 }
 
 /// For `tar -C parent -- member`: the folder to run in, the entry to archive and the name to save
