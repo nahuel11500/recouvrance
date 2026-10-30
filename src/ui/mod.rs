@@ -19,6 +19,7 @@ pub mod schema_form;
 pub mod selectable;
 pub mod settings_view;
 pub mod terminal;
+pub mod upgrade_view;
 
 use std::sync::{Arc, LazyLock};
 

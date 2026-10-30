@@ -35,6 +35,26 @@
   more than it lists.
 - **Problems**: one list of what is broken across clusters (crash loops, pending pods, unavailable workloads, NotReady nodes, failed jobs, pending volumes, and alerts firing in the cluster's Prometheus that nobody silenced).
 - **Alerts where you look**: a namespace's page lists the alerts labeled with it, and a pod's, workload's, volume's or node's page the alerts about it (a pod's include its workload's, a workload's its pods'), with severity, summary, how long, runbook link, and silenced or inhibited ones muted when an Alertmanager is found.
+- **Upgrade check** (Cluster overview → *Upgrade check*): per cluster, what needs action before it
+  moves to a newer minor version (the next one by default; the arrows pick another), most urgent first:
+  - *Removed APIs still used*: objects last written in an API version the target no longer serves
+    (by which field manager, or by `kubectl apply`'s last-applied configuration), Helm releases whose
+    last manifest names one (even a version already removed: Helm can't upgrade them), and what the API
+    server's `apiserver_requested_deprecated_apis` metric says clients still call. Each says what to
+    migrate to (e.g. HorizontalPodAutoscaler `autoscaling/v2beta2` → `autoscaling/v2`) and what
+    changes on the way. The removals are those of the Kubernetes deprecation guide.
+  - *Version skew*: kubelets and kube-proxies (by their image in `kube-system`) older than the skew
+    policy allows for the target, or newer than it, and a target more than one minor version ahead
+    (the control plane goes up one at a time).
+  - *Drains that would block*: PodDisruptionBudgets allowing no disruption now (one guarding a single
+    pod waits forever) and pods several budgets select (the eviction API refuses them).
+  - *Feature gates*: the API server's deprecated gates, and alpha ones turned on (from its
+    `kubernetes_feature_enabled` metric; command-line flags can't be seen from the API).
+  - *Add-ons*: CRDs serving versions marked deprecated, and whether objects may still be stored in
+    them.
+
+  Each finding links to its objects. A part that can't be read (the API server's metrics need `get`
+  on `/metrics`) is named, and the rest is still checked.
 - **Stuck deletions**: the Problems page lists objects (pods, workloads, Jobs, PVCs, PVs,
   Namespaces, Argo CD Applications) whose deletion has waited more than 10 minutes, with the
   finalizers holding them (for a Namespace, the resources left); their Delete dialog offers to

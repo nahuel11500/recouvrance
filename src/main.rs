@@ -33,6 +33,7 @@ mod status;
 mod table;
 mod templates;
 mod ui;
+mod upgrade;
 mod yaml;
 
 // Many threads allocate large, short-lived lists (huge clusters); mimalloc

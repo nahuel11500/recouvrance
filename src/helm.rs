@@ -198,6 +198,46 @@ pub async fn fill_releases(
     .await
 }
 
+/// What `read` makes of each current release's manifest, next to the release (kept without
+/// it), page by page: the manifests of a thousand releases are never held at once. One answer
+/// per release, its newest revision; with the number of releases that could not be read.
+pub(crate) async fn scan_manifests<T: Send + 'static>(
+    client: Client,
+    read: impl Fn(&Release) -> T + Send + 'static,
+) -> Result<(Vec<(Release, T)>, usize)> {
+    k8s::run(async move {
+        let api: Api<Secret> = Api::all(client);
+        let mut lp = ListParams::default().labels(CURRENT).limit(FILL_PAGE);
+        let (mut out, mut unreadable) = (Vec::new(), 0);
+        loop {
+            let list = api.list(&lp).await?;
+            for secret in &list.items {
+                match decode(secret) {
+                    Ok(r) => {
+                        let found = read(&r);
+                        out.push((summary(r), found));
+                    }
+                    Err(_) => unreadable += 1,
+                }
+            }
+            match list.metadata.continue_.filter(|c| !c.is_empty()) {
+                Some(token) => lp.continue_token = Some(token),
+                None => break,
+            }
+        }
+        out.sort_by(|(a, _), (b, _)| {
+            (&a.namespace, &a.name, std::cmp::Reverse(a.revision)).cmp(&(
+                &b.namespace,
+                &b.name,
+                std::cmp::Reverse(b.revision),
+            ))
+        });
+        out.dedup_by(|(a, _), (b, _)| a.namespace == b.namespace && a.name == b.name);
+        Ok((out, unreadable))
+    })
+    .await
+}
+
 /// One release per (namespace, name): the newest revision, when an upgrade is in flight.
 pub(crate) fn latest_revisions(mut releases: Vec<Release>) -> Vec<Release> {
     releases.sort_by(|a, b| {

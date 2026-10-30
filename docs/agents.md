@@ -83,7 +83,7 @@ Tools, by what they do:
   `describe_resource`, `search`, `get_events`, `find_problems`, `check_certificates`, `top_pods`,
   `top_nodes`, `usage_history`, `get_logs`, `workload_logs`, `get_changes`, `rollout_history`, `rollout_status`,
   `list_helm_releases`, `helm_history`, `helm_get_values`, `diff_manifest`, `explain_resource`,
-  `can_i`, `cluster_version`, `wait_for`, `list_port_forwards`.
+  `can_i`, `cluster_version`, `upgrade_check`, `wait_for`, `list_port_forwards`.
 - **Change:** `scale`, `rollout_restart`, `rollout_undo`, `rollout_pause`, `rollout_resume`,
   `set_image`, `patch_resource`, `apply_manifest`, `delete_resource`, `trigger_cronjob`,
   `cordon_node`, `uncordon_node`, `drain_node`, `gitops`, `exec_command`, `debug_pod`,
@@ -124,6 +124,12 @@ tools. What some of them need beyond the obvious verb:
 - **About the cluster:** `explain_resource` (field docs, CRDs included) and `cluster_version` read
   no objects; `can_i` asks the API server what the kubeconfig user may do (the agent's own rules are
   `my_permissions`).
+- **Upgrade check:** `upgrade_check` gives the findings of the Upgrade check tab (removed APIs still
+  used, version skew, drains that would block, feature gates, deprecated CRD versions) against a
+  `target` minor version, the cluster's next one by default. Like `find_problems`, it asks to list
+  pods in all namespaces, and approving it shows other kinds' objects only where an Allow rule covers
+  them; objects named by a Helm release's manifest show where listing that release's Secret is
+  allowed. A finding none of whose objects the agent may see is left out and counted.
 
 Prompts (slash commands in Claude Code: `/mcp__recouvrance__troubleshoot` …): `troubleshoot`, `rightsize`,
 `cert-audit`, `cluster-health`. They chain the tools above into a read-only workflow.
