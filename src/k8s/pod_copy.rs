@@ -125,9 +125,11 @@ pub fn copy_spec(pod: &Value, name: &str, image: &str) -> Result<Value> {
     if let Some(volumes) = volumes.as_array_mut() {
         volumes.push(json!({"name": TOOLS_VOLUME, "emptyDir": {}}));
     }
-    // `busybox --install` links the applets to where it runs from: the same path in every container.
-    let install =
-        format!("mkdir -p {TOOLS_BIN} && cp /bin/busybox {TOOLS}/busybox && {TOOLS}/busybox --install -s {TOOLS_BIN}");
+    // Each applet a link to `../busybox`: relative, so it holds wherever the folder is mounted.
+    let install = format!(
+        "mkdir -p {TOOLS_BIN} && cp /bin/busybox {TOOLS}/busybox && \
+         for a in $(/bin/busybox --list); do ln -sf ../busybox {TOOLS_BIN}/$a || exit 1; done"
+    );
     // What Pod Security "restricted" asks, as the containers' user: it can read what it copied.
     let security = json!({
         "runAsUser": user, "runAsNonRoot": user != 0, "allowPrivilegeEscalation": false,
@@ -436,7 +438,7 @@ mod tests {
         let init = &inits[0];
         assert_eq!(init["image"], "busybox:1.37");
         assert_eq!(init["command"][0], "/bin/busybox");
-        assert!(init["command"][3].as_str().unwrap().contains(&format!("--install -s {TOOLS_BIN}")));
+        assert!(init["command"][3].as_str().unwrap().contains(&format!("ln -sf ../busybox {TOOLS_BIN}/$a")));
         assert_eq!(init["volumeMounts"], json!([{"name": TOOLS_VOLUME, "mountPath": TOOLS}]));
         assert_eq!(init["securityContext"]["runAsUser"], 65532);
         assert_eq!(init["securityContext"]["runAsNonRoot"], true);

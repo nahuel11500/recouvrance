@@ -1041,7 +1041,7 @@ fn a_stopped_container_is_read_from_a_copy_of_its_pod() {
         let ctx = context();
         let truth = k8s::connect_for_agents(ctx.clone()).await?;
         let pods: Api<Pod> = Api::namespaced(truth.clone(), NS);
-        let maps: Api<ConfigMap> = Api::namespaced(truth, NS);
+        let maps: Api<ConfigMap> = Api::namespaced(truth.clone(), NS);
         let ui = k8s::connect(ctx).await?;
         let checked = async {
             let _ = pods.delete(NAME, &DeleteParams::default().grace_period(0)).await;
@@ -1093,6 +1093,19 @@ fn a_stopped_container_is_read_from_a_copy_of_its_pod() {
             assert!(made.pointer("/metadata/labels/app").is_none(), "{made}");
             assert!(made.pointer("/metadata/ownerReferences").is_none(), "{made}");
             assert!(made.pointer("/spec/containers/0/livenessProbe").is_none(), "{made}");
+
+            // The busybox's applets are installed (or the copy's state says why not).
+            let tools =
+                vec![format!("{}/busybox", pod_copy::TOOLS), "ls".into(), "-l".into(), pod_copy::TOOLS_BIN.into()];
+            let listed =
+                k8s::exec_capture(truth, NS.into(), copy.name.clone(), Some("main".into()), tools, 30, 1 << 16);
+            match listed.await {
+                Ok(out) => assert!(out.starts_with("[exit 0]") && out.contains(" sh -> "), "{out}"),
+                Err(e) => {
+                    let status = serde_json::to_value(pods.get(&copy.name).await?.status)?;
+                    bail!("exec in the copy: {e:#}\n{status:#}");
+                }
+            }
 
             let source = FileSource::copy(ui.clone(), NS.into(), copy.name.clone(), Some("main".into()));
             assert_eq!(source.origin(), Origin::Copy);
