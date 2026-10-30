@@ -125,5 +125,11 @@
 | Ctrl+T / Ctrl+W / Ctrl+Tab | New tab / close tab / next tab |
 | Ctrl+B / F5 | Hide the sidebar / refresh (in a terminal, F5 goes to the program) |
 | Alt+← / Alt+→ | Back / forward (Esc also goes back from a detail page) |
+| Ctrl+= / Ctrl+- / Ctrl+0 | Zoom in / zoom out / reset the zoom |
 | Ctrl+F or / | Filter the current table: `web` · `!Running` · `app=web` · `tier!=db` · `l:app` · `ns:team-*` · `/^api-\d+/` · `status:Running` · `restarts>3` · `cpu>200m` (all terms must match) |
+| j / k / Enter | Move the selection in a table / open the selected row |
+| g then p / o / w / h / i / s | Go to Problems / Cluster overview / Workloads overview / Helm / Assistant / Settings |
+| ? | List the keyboard shortcuts |
 | Right-click a row | Open, logs, shell, YAML, events, copy name, favorite |
+
+Single keys (?, g, j, k) work when no text field or terminal has focus; `?` lists every shortcut.
