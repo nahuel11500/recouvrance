@@ -568,13 +568,16 @@ async fn unserved(client: &Client, kind: &Kind, services: &[Value], namespace: O
             return out;
         }
     };
-    // Collected first: a closure taking a reference, held across the await, would make the
-    // scan's future not `Send` for the agents' server.
-    let unready: Vec<&Value> = selecting.into_iter().filter(|s| !ready.contains(&key(s))).collect();
-    let judged: Vec<(&Value, anyhow::Result<Option<(Severity, String)>>)> = futures::stream::iter(unready)
+    // Collected first, and each future owns what it reads: closures over references held
+    // across an await would make the scan's future not `Send` for the agents' server.
+    let unready: Vec<Value> = selecting.into_iter().filter(|s| !ready.contains(&key(s))).cloned().collect();
+    let judged: Vec<(Value, anyhow::Result<Option<(Severity, String)>>)> = futures::stream::iter(unready)
         .map(|svc| {
-            let client = client.clone();
-            async move { (svc, judge_unserved(client, kind, svc).await) }
+            let (client, kind) = (client.clone(), kind.clone());
+            async move {
+                let judged = judge_unserved(client, &kind, &svc).await;
+                (svc, judged)
+            }
         })
         .buffer_unordered(HELD_PARALLEL)
         .collect()
@@ -582,7 +585,7 @@ async fn unserved(client: &Client, kind: &Kind, services: &[Value], namespace: O
     let mut failed = None;
     for (svc, judged) in judged {
         match judged {
-            Ok(Some((severity, why))) => out.problems.extend(problem(kind, svc, severity, why)),
+            Ok(Some((severity, why))) => out.problems.extend(problem(kind, &svc, severity, why)),
             Ok(None) => {}
             Err(e) => failed = failed.or(Some(e)),
         }
@@ -615,13 +618,23 @@ async fn ingresses(
     out
 }
 
+/// The Ingress and HTTPRoute kinds among `kinds`, those the cluster serves.
+pub(super) fn with_services(kinds: &[Kind]) -> (Option<Kind>, Option<Kind>) {
+    let [(ig, ik), (rg, rk)] = WITH_SERVICES;
+    (kinds.iter().find(|x| x.is(ig, ik)).cloned(), kinds.iter().find(|x| x.is(rg, rk)).cloned())
+}
+
 /// Services that select no pod or no ready one, and Ingresses and HTTPRoutes whose Services
 /// (or TLS Secrets) are missing, in `namespace` or the whole cluster. A kind the cluster
-/// doesn't serve is left out, and one that can't be read is skipped alone.
-pub(super) async fn traffic(client: Client, kinds: &[Kind], service: &Kind, namespace: Option<String>) -> Scan {
-    let [(ig, ik), (rg, rk)] = WITH_SERVICES;
-    let ingress = kinds.iter().find(|x| x.is(ig, ik));
-    let route = kinds.iter().find(|x| x.is(rg, rk));
+/// doesn't serve (`ingress`, `route` None) is left out, and one that can't be read is
+/// skipped alone.
+pub(super) async fn traffic(
+    client: Client,
+    service: &Kind,
+    ingress: Option<&Kind>,
+    route: Option<&Kind>,
+    namespace: Option<String>,
+) -> Scan {
     let (services, ingress_list, route_list) = futures::join!(
         list_all(client.clone(), Some(service.clone()), namespace.clone()),
         list_all(client.clone(), ingress.cloned(), namespace.clone()),
@@ -1060,8 +1073,7 @@ mod tests {
         let client = Client::new(cluster.clone(), "default");
         let (service, ingress) = (kind("", "Service"), kind("networking.k8s.io", "Ingress"));
         let route = kind(GATEWAY, "HTTPRoute");
-        let kinds = [service.clone(), ingress, route];
-        let scan = traffic(client, &kinds, &service, Some("app".into())).await;
+        let scan = traffic(client, &service, Some(&ingress), Some(&route), Some("app".into())).await;
         assert!(scan.skipped.is_empty(), "{:?}", scan.skipped_text());
         let mut found: Vec<(String, String, Severity, String)> =
             scan.problems.into_iter().map(|p| (p.label, p.name, p.severity, p.reason)).collect();
@@ -1088,9 +1100,8 @@ mod tests {
     async fn a_cluster_without_gateway_api_still_checks_the_rest() {
         let client = Client::new(Cluster::default(), "default");
         let service = kind("", "Service");
-        let scan =
-            traffic(client, &[service.clone(), kind("networking.k8s.io", "Ingress")], &service, Some("app".into()))
-                .await;
+        let ingress = kind("networking.k8s.io", "Ingress");
+        let scan = traffic(client, &service, Some(&ingress), None, Some("app".into())).await;
         assert!(scan.skipped.is_empty(), "{:?}", scan.skipped_text());
         assert!(scan.problems.iter().all(|p| p.label != "HTTPRoute"));
         assert_eq!(scan.problems.len(), 4);

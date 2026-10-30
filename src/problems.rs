@@ -366,6 +366,7 @@ async fn scan_kind(client: Client, kind: Kind, namespace: Option<String>) -> any
 /// Problems in a cluster (or one namespace), worst first, from every kind that
 /// could be listed: one kind refused (403) does not hide the others.
 pub async fn scan_partial(client: Client, kinds: &[Kind], namespace: Option<String>) -> Scan {
+    let with_services = references::with_services(kinds);
     let jobs = CHECKED
         .iter()
         // Checked with the Services they point to.
@@ -373,13 +374,15 @@ pub async fn scan_partial(client: Client, kinds: &[Kind], namespace: Option<Stri
         .filter_map(|(g, k)| kinds.iter().find(|x| x.is(g, k)).cloned())
         .map(|kind| {
             let (client, ns, label) = (client.clone(), namespace.clone(), kind.label.clone());
+            // Owned: a future borrowing `kinds` here would not be `Send` for the agents' server.
+            let (ingress, route) = with_services.clone();
             async move {
                 let scan = if kind.ar.group == crate::external_secrets::GROUP {
                     crate::external_secrets::problems(client, &kind, ns)
                         .await
                         .map(|problems| Scan { problems, skipped: Vec::new() })
                 } else if kind.is("", "Service") {
-                    Ok(references::traffic(client, kinds, &kind, ns).await)
+                    Ok(references::traffic(client, &kind, ingress.as_ref(), route.as_ref(), ns).await)
                 } else {
                     scan_kind(client, kind, ns).await
                 };
