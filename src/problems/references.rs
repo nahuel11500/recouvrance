@@ -522,22 +522,19 @@ fn problem(kind: &Kind, obj: &Value, severity: Severity, reason: String) -> Opti
     })
 }
 
-/// A problem's severity and reason, if any.
-type Judged = Option<(Severity, String)>;
-
-/// How a Service with no ready endpoint stands, from its pods (listed by its selector): None
-/// when they turn out ready (the Endpoints were behind).
-async fn judge_unserved(client: Client, kind: &Kind, svc: &Value) -> anyhow::Result<Judged> {
+/// The pods a Service selects, listed by its selector: only those come over the wire, where a
+/// namespace's whole pod list would carry every healthy pod too. None without a selector.
+async fn selected_pods(client: Client, kind: &Kind, svc: &Value) -> anyhow::Result<Option<Vec<Value>>> {
     let (Some(ns), Some(selector)) = (text(svc, "/metadata/namespace"), k8s::pod_selection(kind, svc).list_selector())
     else {
         return Ok(None);
     };
-    let pods = k8s::list_values(client.clone(), k8s::ar_of::<core::Pod>(), Some(ns.into()), selector).await?;
-    if !live(&pods).is_empty() {
-        return Ok(judge_service(&pods, None));
-    }
-    // Selects nothing: maybe its workload was scaled to 0 on purpose. Unreadable workloads
-    // leave it a warning, as if none was.
+    Ok(Some(k8s::list_values(client, k8s::ar_of::<core::Pod>(), Some(ns.into()), selector).await?))
+}
+
+/// A namespace's Deployments and StatefulSets, to tell a Service whose workload was scaled to 0
+/// on purpose. Unreadable ones are left out: the Service stays a warning, as if none was.
+async fn workloads_of(client: Client, ns: &str) -> Vec<(&'static str, Value)> {
     let (deployments, sets) = futures::join!(
         k8s::list_values(client.clone(), k8s::ar_of::<apps::Deployment>(), Some(ns.into()), None),
         k8s::list_values(client, k8s::ar_of::<apps::StatefulSet>(), Some(ns.into()), None),
@@ -548,11 +545,12 @@ async fn judge_unserved(client: Client, kind: &Kind, svc: &Value) -> anyhow::Res
             workloads.extend(listed.into_iter().map(|w| (label, w)));
         }
     }
-    Ok(judge_service(&pods, scaled_to_zero(svc, &workloads).as_deref()))
+    workloads
 }
 
 /// Services (with a selector) without a ready endpoint: their pods say whether they select
-/// none or none is ready.
+/// none or none is ready. One pod list a Service (by its selector), and the workloads of a
+/// namespace listed once, only where a Service selects no pod.
 async fn unserved(client: &Client, kind: &Kind, services: &[Value], namespace: Option<String>) -> Scan {
     let mut out = Scan::default();
     let selecting: Vec<&Value> =
@@ -574,23 +572,46 @@ async fn unserved(client: &Client, kind: &Kind, services: &[Value], namespace: O
     // Collected first, and each future owns what it reads: closures over references held
     // across an await would make the scan's future not `Send` for the agents' server.
     let unready: Vec<Value> = selecting.into_iter().filter(|s| !ready.contains(&key(s))).cloned().collect();
-    let judged: Vec<(Value, anyhow::Result<Judged>)> = futures::stream::iter(unready)
+    let listed: Vec<(Value, anyhow::Result<Option<Vec<Value>>>)> = futures::stream::iter(unready)
         .map(|svc| {
             let (client, kind) = (client.clone(), kind.clone());
             async move {
-                let judged = judge_unserved(client, &kind, &svc).await;
-                (svc, judged)
+                let pods = selected_pods(client, &kind, &svc).await;
+                (svc, pods)
+            }
+        })
+        .buffer_unordered(HELD_PARALLEL)
+        .collect()
+        .await;
+    let idle: BTreeSet<String> = listed
+        .iter()
+        .filter(|(_, pods)| pods.as_ref().is_ok_and(|p| p.as_deref().is_some_and(|p| live(p).is_empty())))
+        .map(|(svc, _)| key(svc).0)
+        .collect();
+    let workloads: HashMap<String, Vec<(&'static str, Value)>> = futures::stream::iter(idle)
+        .map(|ns| {
+            let client = client.clone();
+            async move {
+                let workloads = workloads_of(client, &ns).await;
+                (ns, workloads)
             }
         })
         .buffer_unordered(HELD_PARALLEL)
         .collect()
         .await;
     let mut failed = None;
-    for (svc, judged) in judged {
-        match judged {
-            Ok(Some((severity, why))) => out.problems.extend(problem(kind, &svc, severity, why)),
-            Ok(None) => {}
-            Err(e) => failed = failed.or(Some(e)),
+    for (svc, pods) in listed {
+        let pods = match pods {
+            Ok(Some(pods)) => pods,
+            Ok(None) => continue,
+            Err(e) => {
+                failed = failed.or(Some(e));
+                continue;
+            }
+        };
+        let scaled = workloads.get(&key(&svc).0).and_then(|w| scaled_to_zero(&svc, w));
+        if let Some((severity, why)) = judge_service(&pods, scaled.as_deref()) {
+            out.problems.extend(problem(kind, &svc, severity, why));
         }
     }
     if let Some(e) = failed {
@@ -1097,6 +1118,9 @@ mod tests {
         let asked = cluster.0.lock().unwrap().clone();
         assert_eq!(asked.iter().filter(|p| p.ends_with("/services")).count(), 1, "{asked:?}");
         assert_eq!(asked.iter().filter(|p| p.ends_with("/pods")).count(), 3, "{asked:?}");
+        // Two Services select no pod in `app`: its workloads are listed once for both.
+        assert_eq!(asked.iter().filter(|p| p.ends_with("/deployments")).count(), 1, "{asked:?}");
+        assert_eq!(asked.iter().filter(|p| p.ends_with("/statefulsets")).count(), 1, "{asked:?}");
     }
 
     #[tokio::test(flavor = "multi_thread")]
