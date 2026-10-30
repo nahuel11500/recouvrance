@@ -1077,7 +1077,7 @@ fn a_container_without_a_shell_is_read_through_a_debug_container() {
         };
         let result: Result<()> = checked.await;
         gate::set_ui_writes(false);
-        let _ = Api::<Pod>::namespaced(truth.clone(), NS).delete(NAME, &DeleteParams::default().grace_period(0)).await;
+        let _ = Api::<Pod>::namespaced(truth, NS).delete(NAME, &DeleteParams::default().grace_period(0)).await;
         let _ = namespaces.delete(RESTRICTED, &DeleteParams::default()).await;
         result
     });

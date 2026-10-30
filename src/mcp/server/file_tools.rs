@@ -58,7 +58,7 @@ impl KubeMcp {
         let max = p.max_bytes.unwrap_or(DEFAULT_BYTES).clamp(1, MAX_BYTES) as usize;
         let source = if p.debug == Some(true) {
             // Adding a debug container is what debug_pod does, under the same rule.
-            let (ns, pod, target) = (p.namespace.clone(), p.pod.clone(), p.container.clone().unwrap_or_default());
+            let (ns, pod, target) = (p.namespace, p.pod, p.container.unwrap_or_default());
             let source =
                 match debug::look(client.clone(), ns.clone(), pod.clone(), target, debug::image(&p.context)).await {
                     Ok(Look::Reuse(source)) => Ok(source),
