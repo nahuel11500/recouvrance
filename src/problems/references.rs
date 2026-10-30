@@ -497,6 +497,19 @@ fn judge_route(route: &Value, services: &Listed<&Value>) -> Vec<String> {
     missing(&targets, ns, |t| services.exists(t)).into_iter().collect()
 }
 
+/// An object's (namespace, name).
+fn key(obj: &Value) -> (String, String) {
+    let part = |p: &str| text(obj, p).unwrap_or_default().to_string();
+    (part("/metadata/namespace"), part("/metadata/name"))
+}
+
+/// Every object of `kind` in `namespace` (all when None), or None when the cluster doesn't
+/// serve it.
+async fn list_all(client: Client, kind: Option<Kind>, namespace: Option<String>) -> Option<anyhow::Result<Vec<Value>>> {
+    let kind = kind?;
+    Some(k8s::lists::list_lean_cached::<Value>(client, kind.ar, namespace).await)
+}
+
 fn problem(kind: &Kind, obj: &Value, severity: Severity, reason: String) -> Option<Problem> {
     Some(Problem {
         severity,
@@ -555,16 +568,17 @@ async fn unserved(client: &Client, kind: &Kind, services: &[Value], namespace: O
             return out;
         }
     };
-    let key = |s: &Value| Some((text(s, "/metadata/namespace")?.to_string(), text(s, "/metadata/name")?.to_string()));
-    let judged: Vec<(&Value, anyhow::Result<Option<(Severity, String)>>)> =
-        futures::stream::iter(selecting.into_iter().filter(|&s| key(s).is_some_and(|k| !ready.contains(&k))))
-            .map(|svc| {
-                let client = client.clone();
-                async move { (svc, judge_unserved(client, kind, svc).await) }
-            })
-            .buffer_unordered(HELD_PARALLEL)
-            .collect()
-            .await;
+    // Collected first: a closure taking a reference, held across the await, would make the
+    // scan's future not `Send` for the agents' server.
+    let unready: Vec<&Value> = selecting.into_iter().filter(|s| !ready.contains(&key(s))).collect();
+    let judged: Vec<(&Value, anyhow::Result<Option<(Severity, String)>>)> = futures::stream::iter(unready)
+        .map(|svc| {
+            let client = client.clone();
+            async move { (svc, judge_unserved(client, kind, svc).await) }
+        })
+        .buffer_unordered(HELD_PARALLEL)
+        .collect()
+        .await;
     let mut failed = None;
     for (svc, judged) in judged {
         match judged {
@@ -605,18 +619,14 @@ async fn ingresses(
 /// (or TLS Secrets) are missing, in `namespace` or the whole cluster. A kind the cluster
 /// doesn't serve is left out, and one that can't be read is skipped alone.
 pub(super) async fn traffic(client: Client, kinds: &[Kind], service: &Kind, namespace: Option<String>) -> Scan {
-    let find = |(g, k): (&str, &str)| kinds.iter().find(|x| x.is(g, k));
-    let (ingress, route) = (find(WITH_SERVICES[0]), find(WITH_SERVICES[1]));
-    let list = |kind: Option<&Kind>| {
-        let read = kind.map(|k| k8s::lists::list_lean_cached::<Value>(client.clone(), k.ar.clone(), namespace.clone()));
-        async move {
-            match read {
-                Some(read) => Some(read.await),
-                None => None,
-            }
-        }
-    };
-    let (services, ingress_list, route_list) = futures::join!(list(Some(service)), list(ingress), list(route));
+    let [(ig, ik), (rg, rk)] = WITH_SERVICES;
+    let ingress = kinds.iter().find(|x| x.is(ig, ik));
+    let route = kinds.iter().find(|x| x.is(rg, rk));
+    let (services, ingress_list, route_list) = futures::join!(
+        list_all(client.clone(), Some(service.clone()), namespace.clone()),
+        list_all(client.clone(), ingress.cloned(), namespace.clone()),
+        list_all(client.clone(), route.cloned(), namespace.clone()),
+    );
     let mut out = Scan::default();
     let services = match services {
         Some(Ok(services)) => services,
@@ -666,7 +676,7 @@ mod tests {
 
     fn kind(group: &str, k: &str) -> Kind {
         Kind {
-            ar: kube::discovery::ApiResource {
+            ar: ApiResource {
                 group: group.into(),
                 version: "v1".into(),
                 api_version: if group.is_empty() { "v1".into() } else { format!("{group}/v1") },
