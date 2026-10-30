@@ -33,6 +33,7 @@ impl AppView {
         self.kinds.clear();
         self.watch = None;
         self.metrics = None;
+        self.recording = Vec::new();
         // Watch errors name the old clusters, and would hide "Connecting…" and new failures.
         self.list = super::live_list::LiveList::default();
         // The problem badge counted the old clusters.
@@ -143,6 +144,12 @@ impl AppView {
                         this.settings_view.update(cx, |s, _| s.set_kinds(kinds.clone()));
                         this.kinds = kinds;
                         this.problems.start(this.clusters.clone(), this.cluster_kinds(), cx);
+                        // The timeline: the connected contexts' records, their own watches.
+                        for (c, _) in &this.clusters {
+                            crate::timeline::open(c);
+                        }
+                        this.recording =
+                            crate::timeline::start_watches(&this.clusters, &this.kinds, &this.kind_clusters);
                         this.set_namespaces(namespaces, window, cx);
                         this.restart_watch(cx);
                         if dev_var("RECOUVRANCE_PAGE").is_none() {

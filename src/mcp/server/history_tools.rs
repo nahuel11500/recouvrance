@@ -30,7 +30,7 @@ pub struct ChangesParams {
 #[tool_router(router = history_tools, vis = "pub(super)")]
 impl KubeMcp {
     #[tool(
-        description = "What changed on an object, newest first, each with what changed and a short diff: the revisions of the workload that rolls it out (a pod's: its owner's), of the Helm release that installed it (values masked), an Argo CD Application's deployments, which field managers last wrote which fields and when (managedFields), and its events. Reads only what the cluster keeps. Needs get on the object; a pod's owner needs get, the Helm revisions list on secrets, the events list on events.",
+        description = "What changed on an object, newest first, each with its source, what changed and a short diff: the revisions of the workload that rolls it out (a pod's: its owner's), of the Helm release that installed it (values masked), an Argo CD Application's deployments, which field managers last wrote which fields and when (managedFields), its events, and the changes Recouvrance recorded while it watched the object (source Recorded: ConfigMaps, Services, scale changes... that the cluster keeps no history of; a Secret's values never, only which keys changed). Needs get on the object; a pod's owner needs get, the Helm revisions list on secrets, the events list on events.",
         annotations(read_only_hint = true)
     )]
     async fn get_changes(
@@ -60,6 +60,10 @@ impl KubeMcp {
         let mut errors = fetched.errors;
         let subject = format!("{} {}", kind.ar.kind, p.name);
         let mut lists = vec![fetched.changes, history::own_changes(&kind, &value)];
+        // What the app recorded while it watched this object (this one: by its uid).
+        crate::timeline::opened(&p.context).await;
+        let uid = value.pointer("/metadata/uid").and_then(|v| v.as_str()).unwrap_or_default();
+        lists.push(crate::timeline::changes_for(&p.context, &kind.kubectl_name(), ns.as_deref(), &p.name, uid));
         let events_kind = self.kind(&call, &p.context, "events").await?.1;
         if call.may_see(&access_for(&events_kind, &p.context, Verb::List, ns.clone(), None)) {
             let uid = value.pointer("/metadata/uid").and_then(|v| v.as_str()).unwrap_or_default().to_string();

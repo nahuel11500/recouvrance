@@ -657,7 +657,7 @@ impl KubeMcp {
         };
         // A kind that can't be listed is named, and doesn't hide what the others found.
         let (mut scan, alerts) = futures::join!(
-            crate::problems::scan_partial(client.clone(), &kinds, p.namespace.clone()),
+            crate::problems::scan_partial(client.clone(), &kinds, p.namespace.clone(), None),
             crate::alerts::active(&p.context, client)
         );
         // Firing alerts too, like the Problems page; each one shown only if its object is.

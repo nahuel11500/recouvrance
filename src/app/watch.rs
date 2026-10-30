@@ -123,6 +123,8 @@ impl AppView {
                 Arc::new(self.column_prefs.custom(&kind.kubectl_name())),
                 pause.clone(),
                 progressive,
+                // The timeline records what this list sees change (no request added).
+                crate::timeline::tap(&ctx_name, &kind, ns.clone()),
             );
             let shown = pause.clone();
             let task = cx.spawn(async move |this, cx| {

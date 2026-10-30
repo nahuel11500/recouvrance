@@ -275,8 +275,14 @@ async fn held(client: &Client, kind: &Kind, namespace: Option<&str>, name: &str)
 /// Requests at once to read the objects found deleting.
 const HELD_PARALLEL: usize = 16;
 
-/// Problems of one kind, from its table; `namespace`: the one scanned, if any.
-async fn scan_kind(client: Client, kind: Kind, namespace: Option<String>) -> anyhow::Result<Vec<Problem>> {
+/// Problems of one kind, from its table; `namespace`: the one scanned, if any. With the
+/// `context` named, the timeline records what the list shows changed.
+async fn scan_kind(
+    client: Client,
+    kind: Kind,
+    namespace: Option<String>,
+    context: Option<String>,
+) -> anyhow::Result<Vec<Problem>> {
     use futures::StreamExt as _;
     let problem = |namespace: Option<String>, name: String, severity, reason, age| Problem {
         severity,
@@ -299,7 +305,8 @@ async fn scan_kind(client: Client, kind: Kind, namespace: Option<String>) -> any
             .collect());
     }
     // Big lists come from their cells alone: a small part of the bytes.
-    let (defs, rows) = k8s::list_light(client.clone(), kind.clone(), namespace, true).await?;
+    let tap = context.and_then(|c| crate::timeline::tap(&c, &kind, namespace.clone()));
+    let (defs, rows) = k8s::list_light(client.clone(), kind.clone(), namespace, true, tap).await?;
     let mut found = Vec::new();
     let mut stuck = Vec::new();
     for r in &rows {
@@ -343,15 +350,17 @@ async fn scan_kind(client: Client, kind: Kind, namespace: Option<String>) -> any
 }
 
 /// Problems in a cluster (or one namespace), worst first, from every kind that
-/// could be listed: one kind refused (403) does not hide the others.
-pub async fn scan_partial(client: Client, kinds: &[Kind], namespace: Option<String>) -> Scan {
+/// could be listed: one kind refused (403) does not hide the others. `context`: the app's
+/// own scans name it, for the timeline (see `scan_kind`).
+pub async fn scan_partial(client: Client, kinds: &[Kind], namespace: Option<String>, context: Option<&str>) -> Scan {
     let jobs = CHECKED.iter().filter_map(|(g, k)| kinds.iter().find(|x| x.is(g, k)).cloned()).map(|kind| {
         let (client, ns, label) = (client.clone(), namespace.clone(), kind.label.clone());
+        let context = context.map(String::from);
         async move {
             if kind.ar.group == crate::external_secrets::GROUP {
                 return crate::external_secrets::problems(client, &kind, ns).await.map_err(|e| (label, e));
             }
-            scan_kind(client, kind, ns).await.map_err(|e| (label, e))
+            scan_kind(client, kind, ns, context).await.map_err(|e| (label, e))
         }
     });
     let mut out = Scan::default();
@@ -369,17 +378,17 @@ pub async fn scan_partial(client: Client, kinds: &[Kind], namespace: Option<Stri
 /// Problems in the namespaces a user may read, for a cluster that may not list
 /// cluster-wide; the whole cluster when `namespaces` is empty. Cluster-scoped kinds
 /// (Nodes) are read once, namespaced ones in each namespace, and a Namespace in itself.
-pub async fn scan_namespaces(client: Client, kinds: &[Kind], namespaces: &[String]) -> Scan {
+pub async fn scan_namespaces(client: Client, kinds: &[Kind], namespaces: &[String], context: Option<&str>) -> Scan {
     if namespaces.is_empty() {
-        return scan_partial(client, kinds, None).await;
+        return scan_partial(client, kinds, None, context).await;
     }
     let (cluster, namespaced): (Vec<Kind>, Vec<Kind>) =
         kinds.iter().cloned().partition(|k| !k.namespaced && !k.is("", "Namespace"));
     let (whole, per_ns) = futures::join!(
-        scan_partial(client.clone(), &cluster, None),
+        scan_partial(client.clone(), &cluster, None, context),
         futures::future::join_all(namespaces.iter().map(|ns| {
             let (client, namespaced) = (client.clone(), &namespaced);
-            async move { (ns, scan_partial(client, namespaced, Some(ns.clone())).await) }
+            async move { (ns, scan_partial(client, namespaced, Some(ns.clone()), context).await) }
         })),
     );
     let mut out = whole;
@@ -538,7 +547,7 @@ mod tests {
         let mut node = kind("", "Node");
         node.namespaced = false;
         let kinds = [node, kind("", "Pod")];
-        let scan = scan_namespaces(client, &kinds, &["a".into(), "b".into()]).await;
+        let scan = scan_namespaces(client, &kinds, &["a".into(), "b".into()], None).await;
         let found: Vec<(&str, Option<&str>)> =
             scan.problems.iter().map(|p| (p.name.as_str(), p.namespace.as_deref())).collect();
         assert_eq!(found, [("n1", None), ("p1", Some("a"))]);
@@ -734,7 +743,7 @@ mod tests {
         app.ar.api_version = "argoproj.io/v1alpha1".into();
         let mut ns = kind("", "Namespace");
         ns.namespaced = false;
-        let scan = scan_namespaces(client, &[ns, app], &["argocd".into()]).await;
+        let scan = scan_namespaces(client, &[ns, app], &["argocd".into()], None).await;
         assert!(scan.skipped.is_empty(), "{:?}", scan.skipped_text());
         let found: Vec<(&str, &str)> = scan.problems.iter().map(|p| (p.name.as_str(), p.reason.as_str())).collect();
         assert_eq!(
