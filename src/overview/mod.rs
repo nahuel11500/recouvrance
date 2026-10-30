@@ -63,6 +63,9 @@ pub struct Related {
     /// Where an Argo CD Application deploys, and the context that reaches it (a connected
     /// one first).
     pub argo_destination: Option<(k8s::argo::Destination, Option<String>)>,
+    /// How an Application's resources differ live from what was applied, read on the
+    /// connected context that reaches its destination.
+    pub argo_drift: Option<k8s::argo::diagnosis::DriftRead>,
     /// Roles and bindings, for RBAC and ServiceAccount pages.
     pub rbac: Option<crate::rbac::Snapshot>,
     /// Lists that could not be loaded, by field ("pods", "services"…): "forbidden" or
@@ -403,7 +406,7 @@ fn top(ctx: &Ctx, cx: &App) -> Div {
             root = root.child(external_secret_page(ctx, cx));
         }
         if kind.is("argoproj.io", "Application") {
-            root = root.children(argo::destination(ctx, cx));
+            root = root.children(argo::destination(ctx, cx)).children(argo::diagnosis(ctx, cx));
         }
         // Anything else (CRDs especially): spec and status as readable fields.
         root = root.child(generic_section("Spec", ctx.obj.get("spec"), cx)).child(generic_section(
