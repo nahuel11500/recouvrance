@@ -54,8 +54,8 @@
   the same spec and volumes (mounted ConfigMaps and Secrets are there) on the same node, without
   its labels, annotations, owner references, init containers and probes (no Service sends it
   traffic, no controller adopts it), every container sleeping instead of starting its app. A
-  distroless image has no `sleep`: an init container copies the busybox of the cluster's node
-  shell image into the copy, at `/.recouvrance-copy`, and the copy runs and is read with it. The
+  distroless image has no `sleep`: an init container copies a static busybox (`busybox:1.37-musl`, or
+  the cluster's node shell image when set) into the copy, at `/.recouvrance-copy`, and the copy runs and is read with it. The
   copy shows *copy of the pod* next to its files, and says that files the container wrote while it
   ran are not there (it starts from the image again). It is deleted, by its uid, when the page
   closes, on its *Delete the copy* button and when the app quits; it stops by itself after an

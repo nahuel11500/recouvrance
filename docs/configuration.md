@@ -126,10 +126,11 @@ is read.
 `namespaces` is for users who may not list namespaces: they fill the namespace picker, and
 lists show one of them at a time.
 
-`node_shell_image` (`busybox:1.37` by default) runs node shells, and gives the busybox a copy of a
-pod uses to read a stopped container's files: its `/bin/busybox` is copied into images that may
-have no libraries (distroless), so it must be static, as in the official busybox images (Alpine's
-is not).
+`node_shell_image` (`busybox:1.37` by default) runs node shells. When set, it also gives the
+busybox a copy of a pod uses to read a stopped container's files (`busybox:1.37-musl` otherwise):
+its `/bin/busybox` is copied into images that may have no libraries (distroless), so it must be
+linked statically, as in the `-musl` and `-uclibc` busybox images (`busybox:1.37`, the glibc
+build, and Alpine's are not).
 
 `run_as` (Settings → Contexts, *Run as*; none by default) is who a write on this context may run
 as, like `kubectl --as <user> --as-group <group>`: `user` is required, `groups` optional (a list).

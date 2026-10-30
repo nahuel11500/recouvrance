@@ -85,7 +85,8 @@ impl FileBrowser {
         let original =
             pod.pointer("/metadata/name").and_then(serde_json::Value::as_str).unwrap_or(&self.pod).to_string();
         let name = pod_copy::new_name(&original);
-        let image = crate::settings::cluster(&self.context).node_shell_image.unwrap_or_else(|| "busybox:1.37".into());
+        let image =
+            crate::settings::cluster(&self.context).node_shell_image.unwrap_or_else(|| pod_copy::DEFAULT_IMAGE.into());
         let cmd = kubectl(
             &self.context,
             Some(&self.ns),

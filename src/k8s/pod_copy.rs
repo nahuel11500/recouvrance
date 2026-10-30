@@ -38,6 +38,10 @@ pub const TOOLS: &str = "/.recouvrance-copy";
 pub const TOOLS_BIN: &str = "/.recouvrance-copy/bin";
 /// The `emptyDir` holding them, and the init container that fills it.
 const TOOLS_VOLUME: &str = "recouvrance-copy-tools";
+/// The busybox copied when the cluster's settings name no node shell image: its `-musl`
+/// build, linked statically, so it runs in an image without libraries (`busybox:1.37`, the
+/// glibc build, needs the image's).
+pub const DEFAULT_IMAGE: &str = "busybox:1.37-musl";
 /// The user the init container runs as when no container says one (`nobody`).
 const NOBODY: i64 = 65534;
 
@@ -222,6 +226,9 @@ async fn start(client: Client, spec: Value) -> Result<PodCopy> {
 /// Wait until every container of the copy runs, or say why it won't: a container that
 /// ended, an image that can't be pulled, a pod the kubelet refused (no room on the node).
 async fn wait_running(api: &Api<Pod>, name: &str) -> Result<()> {
+    // Running on two reads in a row: a busybox that can't run in the image (linked against
+    // libraries it doesn't have) shows running for a moment, then ends.
+    let mut running = false;
     // Two minutes: the busybox image may need pulling.
     for _ in 0..240 {
         let pod = api.get(name).await?;
@@ -238,9 +245,12 @@ async fn wait_running(api: &Api<Pod>, name: &str) -> Result<()> {
             bail!("the copy can't be scheduled: {}", c.message.clone().unwrap_or_default());
         }
         let containers = status.container_statuses.unwrap_or_default();
-        if !containers.is_empty() && containers.iter().all(|c| c.state.as_ref().is_some_and(|s| s.running.is_some())) {
+        let all_running =
+            !containers.is_empty() && containers.iter().all(|c| c.state.as_ref().is_some_and(|s| s.running.is_some()));
+        if all_running && running {
             return Ok(());
         }
+        running = all_running;
         let all = status.init_container_statuses.iter().flatten().chain(&containers);
         for c in all {
             let Some(state) = &c.state else { continue };

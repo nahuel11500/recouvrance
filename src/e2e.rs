@@ -1035,7 +1035,7 @@ fn a_stopped_container_is_read_from_a_copy_of_its_pod() {
 
     const NAME: &str = "e2e-files-crash";
     const CONFIG: &str = "e2e-files-crash-config";
-    const BUSYBOX: &str = "busybox:1.37";
+    const BUSYBOX: &str = pod_copy::DEFAULT_IMAGE;
 
     run(async {
         let ctx = context();
@@ -1112,7 +1112,6 @@ fn a_stopped_container_is_read_from_a_copy_of_its_pod() {
             match exec().await {
                 Ok(out) => assert!(out.starts_with("[exit 0]") && out.contains(" sh -> "), "{out}"),
                 Err(e) => {
-                    let status = serde_json::to_value(pods.get(&copy.name).await?.status)?;
                     let mut later = Vec::new();
                     for _ in 0..3 {
                         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
@@ -1125,6 +1124,7 @@ fn a_stopped_container_is_read_from_a_copy_of_its_pod() {
                         .map(|o| {
                             format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr))
                         });
+                    let status = serde_json::to_value(pods.get(&copy.name).await?.status)?;
                     bail!("exec in the copy: {e:#}\nlater: {later:#?}\nkubectl: {kubectl:?}\n{status:#}");
                 }
             }
