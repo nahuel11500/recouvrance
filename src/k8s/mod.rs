@@ -20,6 +20,7 @@ mod exec;
 #[cfg(feature = "dev")]
 #[cfg(feature = "dev")]
 pub(crate) mod experiments;
+pub(crate) mod files;
 mod forward;
 pub(crate) mod gate;
 pub(crate) mod lists;
