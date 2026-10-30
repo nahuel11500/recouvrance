@@ -347,6 +347,36 @@ impl AppView {
         self.navigate(Route::Problems(page), cx);
     }
 
+    /// The Timeline page, for the connected clusters: one instance, reused from history
+    /// while it was built for the same clusters.
+    pub(super) fn open_timeline(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Not connected: open the cluster switcher instead of doing nothing.
+        if self.clusters.is_empty() {
+            self.ctx_open = true;
+            cx.notify();
+            return;
+        }
+        if let Some(existing) = self.history.iter().find_map(|r| match r {
+            Route::Timeline(e) if self.scope_matches(e.entity_id()) => Some(e.clone()),
+            _ => None,
+        }) {
+            self.navigate(Route::Timeline(existing), cx);
+            return;
+        }
+        let clusters = self.clusters.clone();
+        let page = cx.new(|cx| crate::ui::timeline_view::TimelineView::new(clusters, window, cx));
+        self.remember_scope(page.entity_id());
+        // Released with the page. A row of a context not connected has no Open button.
+        cx.subscribe_in(&page, window, |this, _, ev: &OpenObject, window, cx| {
+            let Some(ctx) = ev.context.as_ref().and_then(|c| this.clusters.iter().position(|(n, _)| n == c)) else {
+                return;
+            };
+            this.open_object_in(ctx, &ev.kind, ev.name.clone(), ev.namespace.clone(), window, cx);
+        })
+        .detach();
+        self.navigate(Route::Timeline(page), cx);
+    }
+
     pub(super) fn open_apply(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some((context, client)) = self.clusters.first().cloned() else { return };
         let (kinds, ns) = (self.kinds.clone(), self.namespace.clone());

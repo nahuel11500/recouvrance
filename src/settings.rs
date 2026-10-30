@@ -864,6 +864,18 @@ mod tests {
     }
 
     #[test]
+    fn timeline_settings_that_do_not_read_keep_the_others() {
+        let (s, error, lost) = super::from_bytes(br#"{"timeline": {"max_mb": "big"}, "metrics_refresh": 7}"#);
+        assert!(error.is_some() && !lost);
+        assert_eq!((s.timeline, s.metrics_refresh), (super::TimelineSettings::default(), 7));
+        let s: Settings =
+            serde_json::from_str(r#"{"timeline": {"kinds": ["configmaps"], "max_mb": 0, "days": 9999}}"#).unwrap();
+        assert!(s.timeline.record, "on unless turned off");
+        assert_eq!(s.timeline.kinds, ["configmaps"]);
+        assert_eq!((s.timeline.max_mb(), s.timeline.days()), (1, 365));
+    }
+
+    #[test]
     fn an_old_protected_list_that_does_not_read_protects_everything() {
         let (_, _, lost) = super::from_bytes(br#"{"protected_contexts": "prod"}"#);
         assert!(lost);

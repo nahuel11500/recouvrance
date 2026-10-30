@@ -177,20 +177,19 @@ impl<'a> Observed<'a> {
     pub fn new(head: Head<'a>, whole: Option<Value>, info: &KindInfo) -> Option<Self> {
         let m = head.metadata;
         let ts = |t: &Option<String>| t.as_deref().and_then(|t| t.parse::<jiff::Timestamp>().ok());
-        let version = match whole {
-            Some(obj) => comparable(obj, info),
-            None => {
-                let mut meta = serde_json::Map::new();
-                if let Some(l) = m.labels.as_ref().filter(|l| !l.is_empty()) {
-                    meta.insert("labels".into(), serde_json::to_value(l).unwrap_or_default());
-                }
-                let annotations: BTreeMap<&String, &String> =
-                    m.annotations.iter().flatten().filter(|(k, _)| !noise(k)).collect();
-                if !annotations.is_empty() {
-                    meta.insert("annotations".into(), serde_json::to_value(annotations).unwrap_or_default());
-                }
-                serde_json::json!({ "metadata": meta })
+        let version = if let Some(obj) = whole {
+            comparable(obj, info)
+        } else {
+            let mut meta = serde_json::Map::new();
+            if let Some(l) = m.labels.as_ref().filter(|l| !l.is_empty()) {
+                meta.insert("labels".into(), serde_json::to_value(l).unwrap_or_default());
             }
+            let annotations: BTreeMap<&String, &String> =
+                m.annotations.iter().flatten().filter(|(k, _)| !noise(k)).collect();
+            if !annotations.is_empty() {
+                meta.insert("annotations".into(), serde_json::to_value(annotations).unwrap_or_default());
+            }
+            serde_json::json!({ "metadata": meta })
         };
         let version = serde_json::to_string(&version).ok()?;
         let writers = m

@@ -347,6 +347,7 @@ impl AppView {
             Route::Workloads(d) => d.clone().into_any_element(),
             Route::Cluster(d) => d.clone().into_any_element(),
             Route::Problems(d) => d.clone().into_any_element(),
+            Route::Timeline(d) => d.clone().into_any_element(),
             Route::Access(d) => d.clone().into_any_element(),
             Route::HelmInstall(d) => d.clone().into_any_element(),
             Route::Assistant(d) => d.clone().into_any_element(),

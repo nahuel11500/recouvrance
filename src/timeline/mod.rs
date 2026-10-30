@@ -119,6 +119,13 @@ enum Write {
     Rewrite(Arc<str>, Vec<Arc<Record>>),
 }
 
+/// What is known of each kind's objects, by context and kind (`Kind::key`).
+type KindStates = HashMap<(Arc<str>, String), Arc<Mutex<KindState>>>;
+
+/// What a batch does to each context's file: the last rewrite in it, then the lines
+/// appended after it.
+type FileWrites = HashMap<Arc<str>, (Option<Vec<Arc<Record>>>, String)>;
+
 /// Every context's records and what is known of the objects watched.
 pub struct Recorder {
     /// Where the files go; None keeps everything in memory (tests).
@@ -126,7 +133,7 @@ pub struct Recorder {
     /// The records of each context read so far.
     logs: Mutex<HashMap<Arc<str>, Log>>,
     /// Per context and kind (`Kind::key`).
-    kinds: Mutex<HashMap<(Arc<str>, String), Arc<Mutex<KindState>>>>,
+    kinds: Mutex<KindStates>,
     writer: Mutex<Option<mpsc::Sender<Write>>>,
     /// Counts records, for pages to see something new came.
     version: AtomicU64,
@@ -238,8 +245,7 @@ fn write_files(dir: &std::path::Path, rx: &mpsc::Receiver<Write>, problems: &Mut
                 Err(_) => break,
             }
         }
-        // Per context: the last rewrite in the batch, then the lines appended after it.
-        let mut files: HashMap<Arc<str>, (Option<Vec<Arc<Record>>>, String)> = HashMap::new();
+        let mut files = FileWrites::new();
         for w in batch {
             match w {
                 Write::Append(ctx, line) => files.entry(ctx).or_default().1.push_str(&line),

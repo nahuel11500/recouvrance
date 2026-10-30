@@ -69,17 +69,57 @@ pub async fn events_for(client: Client, obj: ObjectRef) -> Result<Vec<EventLine>
         let lp = ListParams::default().fields(&fields);
         let mut items = api.list(&lp).await?.items;
         items.sort_by_key(|e| std::cmp::Reverse(event_last(e)));
+        Ok(items.iter().map(event_line).collect())
+    })
+    .await
+}
+
+fn event_line(e: &Event) -> EventLine {
+    EventLine {
+        namespace: e.metadata.namespace.clone(),
+        name: e.metadata.name.clone().unwrap_or_default(),
+        age: event_last(e).map(age).unwrap_or_default(),
+        last: event_last(e),
+        kind: e.type_.clone().unwrap_or_default(),
+        reason: e.reason.clone().unwrap_or_default(),
+        message: e.message.clone().unwrap_or_default(),
+        count: event_count(e),
+    }
+}
+
+/// An event of a cluster, with the object it is about.
+pub struct ClusterEvent {
+    pub line: EventLine,
+    /// The object's kind (`Pod`), namespace and name.
+    pub object_kind: String,
+    pub object_namespace: Option<String>,
+    pub object_name: String,
+}
+
+/// Events read at most per type and list: the Warnings first, all of them on most clusters;
+/// Normal ones are many more and say less.
+const RECENT_WARNINGS: u32 = 5000;
+const RECENT_NORMAL: u32 = 2000;
+
+/// The events of a cluster (or one namespace): its Warnings, then its Normal events, each
+/// read in one page (`RECENT_WARNINGS`, `RECENT_NORMAL`). `normal`: read those too.
+pub async fn recent_events(client: Client, namespace: Option<String>, normal: bool) -> Result<Vec<ClusterEvent>> {
+    run(async move {
+        let api: Api<Event> = match &namespace {
+            Some(ns) => Api::namespaced(client, ns),
+            None => Api::all(client),
+        };
+        let mut items = api.list(&ListParams::default().fields("type=Warning").limit(RECENT_WARNINGS)).await?.items;
+        if normal {
+            items.extend(api.list(&ListParams::default().fields("type=Normal").limit(RECENT_NORMAL)).await?.items);
+        }
         Ok(items
             .iter()
-            .map(|e| EventLine {
-                namespace: e.metadata.namespace.clone(),
-                name: e.metadata.name.clone().unwrap_or_default(),
-                age: event_last(e).map(age).unwrap_or_default(),
-                last: event_last(e),
-                kind: e.type_.clone().unwrap_or_default(),
-                reason: e.reason.clone().unwrap_or_default(),
-                message: e.message.clone().unwrap_or_default(),
-                count: event_count(e),
+            .map(|e| ClusterEvent {
+                line: event_line(e),
+                object_kind: e.involved_object.kind.clone().unwrap_or_default(),
+                object_namespace: e.involved_object.namespace.clone(),
+                object_name: e.involved_object.name.clone().unwrap_or_default(),
             })
             .collect())
     })

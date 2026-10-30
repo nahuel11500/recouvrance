@@ -54,7 +54,7 @@ fn a_list_again_finds_what_was_deleted_meanwhile() {
     tap.listed(&cm("b", "ub", 2, "1"));
     tap.end_list();
     assert!(rec.records_of("ctx").is_empty(), "the first list only notes what is there");
-    std::thread::sleep(std::time::Duration::from_millis(5));
+    std::thread::sleep(Duration::from_millis(5));
     tap.begin_list();
     tap.listed(&cm("a", "ua", 1, "1"));
     tap.end_list();
@@ -70,7 +70,7 @@ fn a_list_of_one_namespace_deletes_nothing_elsewhere() {
     all.begin_list();
     all.listed(&cm("a", "ua", 1, "1"));
     all.end_list();
-    std::thread::sleep(std::time::Duration::from_millis(5));
+    std::thread::sleep(Duration::from_millis(5));
     let other = rec.tap("ctx", &kind("", "ConfigMap"), Some("other".into()), false);
     other.begin_list();
     other.end_list();

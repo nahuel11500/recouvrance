@@ -100,7 +100,10 @@ tools. What some of them need beyond the obvious verb:
   diff (`limit` changes, 30 by default). It needs `get` on the object. A pod's owner (its
   ReplicaSet, then the Deployment) is read only if the rules allow `get` on it, the Helm
   revisions only those `list` on secrets allows (values masked), the events only with `list` on
-  events. A source that failed, or an owner the rules don't let it read, is named at the end.
+  events. A source that failed, or an owner the rules don't let it read, is named at the end. The
+  changes the app recorded while it watched the object come too, with source `Recorded` (see the
+  Timeline in [features](features.md)): those of this object (its uid), not of one deleted before
+  under the same name. A Secret's recorded changes say which keys changed, never their values.
 - **Rollouts:** `rollout_undo`, `rollout_pause`, `rollout_resume` and `set_image` need `patch`.
   `rollout_status` and `wait_for` need `get` and wait up to 5 minutes, stopping when the agent's
   access ends.

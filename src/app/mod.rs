@@ -55,6 +55,7 @@ enum Route {
     Workloads(Entity<Dashboard>),
     Cluster(Entity<ClusterOverview>),
     Problems(Entity<crate::ui::problems_view::ProblemsView>),
+    Timeline(Entity<crate::ui::timeline_view::TimelineView>),
     Access(Entity<crate::ui::access_view::AccessView>),
     HelmInstall(Entity<crate::ui::helm_install::HelmInstall>),
     Assistant(Entity<crate::ui::assistant_view::AssistantView>),

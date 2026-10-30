@@ -96,6 +96,7 @@ impl Log {
     }
 
     /// The records' lines, in bytes.
+    #[cfg(test)]
     pub fn bytes(&self) -> usize {
         self.bytes
     }
@@ -345,7 +346,7 @@ mod tests {
             let dir = crate::mcp::test_dir();
             let path = dir.join("t.jsonl");
             let now = jiff::Timestamp::now();
-            let mut sorted = ages.clone();
+            let mut sorted = ages;
             sorted.sort_unstable_by(|a, b| b.cmp(a));
             let records: Vec<Record> = sorted.iter().enumerate().map(|(i, &a)| record(i, a, 5, now)).collect();
             let limits = Limits { max_bytes: 1 << 30, max_age_secs: max_age };

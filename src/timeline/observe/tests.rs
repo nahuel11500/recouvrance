@@ -164,19 +164,19 @@ fn creations_and_deletions() {
 #[test]
 fn a_secret_s_values_are_never_kept_only_which_keys_changed() {
     let (mut st, info, at) = (state(), info(true), Instant::now());
-    let v1 = object(1, 1, json!({}), json!({"password": "c2VjcmV0", "user": "YWRtaW4="}), vec![]);
+    let v1 = object(1, 1, json!({}), json!({"alpha": "b25l", "beta": "dHdv"}), vec![]);
     see(&mut st, &info, true, &v1, How::Listed, at);
-    let mut v2 = object(2, 1, json!({}), json!({"password": "bmV3cGFzcw==", "user": "YWRtaW4="}), vec![]);
+    let mut v2 = object(2, 1, json!({}), json!({"alpha": "dGhyZWU=", "beta": "dHdv"}), vec![]);
     v2["metadata"]["annotations"] =
-        json!({"kubectl.kubernetes.io/last-applied-configuration": "{\"data\":{\"password\":\"bmV3cGFzcw==\"}}"});
+        json!({"kubectl.kubernetes.io/last-applied-configuration": "{\"data\":{\"alpha\":\"dGhyZWU=\"}}"});
     let r = see(&mut st, &info, true, &v2, How::Modified, at).expect("a record");
-    assert_eq!(r.summary, "changed data.password");
+    assert_eq!(r.summary, "changed data.alpha");
     let text = serde_json::to_string(&r).unwrap();
-    for value in ["c2VjcmV0", "bmV3cGFzcw==", "YWRtaW4=", "#"] {
+    for value in ["b25l", "dGhyZWU=", "dHdv", "#"] {
         assert!(!text.contains(value), "{value} in {text}");
     }
     let after = r.after.as_ref().unwrap().get();
-    assert!(after.contains(r#""password":"(hidden, changed)""#) && after.contains(r#""user":"(hidden)""#), "{after}");
+    assert!(after.contains(r#""alpha":"(hidden, changed)""#) && after.contains(r#""beta":"(hidden)""#), "{after}");
 }
 
 #[test]

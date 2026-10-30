@@ -168,6 +168,7 @@ impl AppView {
                             Some("terminal") => this.open_terminal(window, cx),
                             Some("apply") => this.open_apply(window, cx),
                             Some("problems") => this.open_problems(window, cx),
+                            Some("timeline") => this.open_timeline(window, cx),
                             Some("access") => this.open_access(window, cx),
                             Some("helm-install") => this.open_helm_install(window, cx),
                             Some("assistant") => this.open_assistant(window, cx),
