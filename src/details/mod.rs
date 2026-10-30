@@ -693,11 +693,10 @@ impl DetailPanel {
                 let Ok(Some(obj)) = this.update(cx, |this, _| this.object.clone().filter(|_| !this.deleted)) else {
                     break;
                 };
-                // Where an Application deploys is shown on a connected context first.
-                let connected: Vec<String> = this
-                    .update(cx, |this, _| this.clusters.iter().map(|(n, _)| n.clone()).collect())
-                    .unwrap_or_default();
-                let related = fetch_related(client.clone(), &context, &kind, ns.clone(), &obj, connected).await;
+                // Where an Application deploys is shown on a connected context first, and its
+                // resources are read there.
+                let clusters = this.update(cx, |this, _| this.clusters.clone()).unwrap_or_default();
+                let related = fetch_related(client.clone(), &context, &kind, ns.clone(), &obj, clusters).await;
                 let indexed = obj.clone();
                 let mut related = exec
                     .spawn(async move {
