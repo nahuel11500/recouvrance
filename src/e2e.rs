@@ -407,6 +407,14 @@ fn an_agent_rolls_back_a_deployment() {
             assert!(out.contains("rolled out"), "{out}");
             let out = client.call("rollout_history", target.clone()).await;
             assert!(out.contains("revision 2 (current)") && out.contains("revision 1"), "{out}");
+            // The same revisions as changes, the template's diff with them.
+            let out = client.call("get_changes", target.clone()).await;
+            assert!(
+                out.contains("(revision 2): changed spec.containers[main].command")
+                    && out.lines().any(|l| l.trim_start().starts_with('+') && l.contains("sleep 7200"))
+                    && !out.contains("pod-template-hash"),
+                "{out}"
+            );
 
             let out = client.call("rollout_undo", target.clone()).await;
             assert!(out.contains("Denied"), "{out}");

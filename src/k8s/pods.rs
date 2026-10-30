@@ -50,6 +50,8 @@ pub struct EventLine {
     pub namespace: Option<String>,
     pub name: String,
     pub age: String,
+    /// When it last happened.
+    pub last: Option<jiff::Timestamp>,
     pub kind: String,
     pub reason: String,
     pub message: String,
@@ -73,6 +75,7 @@ pub async fn events_for(client: Client, obj: ObjectRef) -> Result<Vec<EventLine>
                 namespace: e.metadata.namespace.clone(),
                 name: e.metadata.name.clone().unwrap_or_default(),
                 age: event_last(e).map(age).unwrap_or_default(),
+                last: event_last(e),
                 kind: e.type_.clone().unwrap_or_default(),
                 reason: e.reason.clone().unwrap_or_default(),
                 message: e.message.clone().unwrap_or_default(),

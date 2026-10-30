@@ -19,6 +19,7 @@ use crate::helm::{
     Release, fill_releases, history, list_releases, mask_manifest, merge_clusters, newest_revision,
     unreadable_revision, values_yaml,
 };
+use crate::history::DiffLine;
 use crate::k8s;
 
 /// Why an upgrade built from revision `shown` must not run, given the release's newest
@@ -334,6 +335,9 @@ pub struct HelmRelease {
     history_load: crate::latest::Latest,
     /// The chart lookup of the upgrade started last (a dry run, then a real one, or back).
     chart_lookup: crate::latest::Latest,
+    /// The revision whose values diff (against the revision before) is shown, and its lines:
+    /// worked out when asked for.
+    values_diff: Option<(i64, Vec<DiffLine>)>,
 }
 
 /// The edited values to upgrade with, or None while secrets are masked: the masked view
@@ -412,6 +416,7 @@ impl HelmRelease {
             _first_load: task,
             history_load: Default::default(),
             chart_lookup: Default::default(),
+            values_diff: None,
         }
     }
 
@@ -436,7 +441,29 @@ impl HelmRelease {
         self.values.update(cx, |s, cx| s.set_value(values, window, cx));
         let manifest = if reveal { self.release.manifest.clone() } else { mask_manifest(&self.release.manifest) };
         self.manifest.update(cx, |s, cx| s.set_value(manifest, window, cx));
+        if let Some((revision, _)) = &self.values_diff {
+            let revision = *revision;
+            self.values_diff = self.values_diff_of(revision).map(|lines| (revision, lines));
+        }
         cx.notify();
+    }
+
+    /// Show the values diff of a revision against the one before, or hide it.
+    fn toggle_values_diff(&mut self, revision: i64, cx: &mut Context<Self>) {
+        self.values_diff = match &self.values_diff {
+            Some((shown, _)) if *shown == revision => None,
+            _ => self.values_diff_of(revision).map(|lines| (revision, lines)),
+        };
+        cx.notify();
+    }
+
+    /// A revision's values against the revision before it, secret-looking values masked
+    /// unless revealed.
+    fn values_diff_of(&self, revision: i64) -> Option<Vec<DiffLine>> {
+        let revs = self.history.as_ref()?.as_ref().ok()?;
+        let rev = revs.iter().find(|r| r.revision == revision)?;
+        let before = revs.iter().filter(|r| r.revision < revision).max_by_key(|r| r.revision);
+        Some(crate::history::helm_values_diff(before, rev, self.reveal)?.lines())
     }
 
     fn reveal_button(&self, id: &'static str, cx: &mut Context<Self>) -> Button {
@@ -792,6 +819,9 @@ impl Render for HelmRelease {
                 None => div().p_2().text_color(theme.muted_foreground).child("Loading history…").into_any_element(),
                 Some(Err(e)) => div().p_2().text_color(theme.danger).child(e.clone()).into_any_element(),
                 Some(Ok(revs)) => v_flex()
+                    .id("helm-history")
+                    .size_full()
+                    .overflow_y_scroll()
                     .p_2()
                     .child(
                         h_flex()
@@ -809,7 +839,10 @@ impl Render for HelmRelease {
                             .child(div().flex_1().child("Description")),
                     )
                     .children(revs.iter().map(|h| {
-                        h_flex()
+                        let has_before = revs.iter().any(|r| r.revision < h.revision);
+                        let diff = self.values_diff.as_ref().filter(|(r, _)| *r == h.revision).map(|(_, lines)| lines);
+                        let diff_label = if diff.is_some() { "Hide diff" } else { "Values diff" };
+                        v_flex().child(h_flex()
                             .gap_3()
                             .py_1()
                             .text_sm()
@@ -821,6 +854,10 @@ impl Render for HelmRelease {
                             .child(div().w(px(140.)).child(h.app_version.clone()))
                             .child(div().w(px(80.)).text_color(theme.muted_foreground).child(h.updated.map(k8s::age).unwrap_or_default()))
                             .child(div().flex_1().min_w_0().overflow_hidden().text_ellipsis().whitespace_nowrap().child(h.description.clone()))
+                            .child(div().w(px(110.)).when(has_before, |d| {
+                                let rev = h.revision;
+                                d.child(Button::new(("values-diff", rev as usize)).xsmall().ghost().label(diff_label).on_click(cx.listener(move |this, _, _, cx| this.toggle_values_diff(rev, cx))))
+                            }))
                             .child(div().w(px(110.)).when(h.revision != current, |d| {
                                 let rev = h.revision;
                                 d.child(Button::new(("rollback", rev as usize)).xsmall().ghost().icon(Lucide::Undo2).label("Roll back").on_click(cx.listener(move |this, _, window, cx| {
@@ -834,7 +871,14 @@ impl Render for HelmRelease {
                                         cx,
                                     );
                                 })))
+                            })))
+                        .when_some(diff, |d, lines| {
+                            d.child(div().py_1().child(if lines.is_empty() {
+                                div().text_xs().text_color(theme.muted_foreground).child("Same values as the revision before.").into_any_element()
+                            } else {
+                                crate::details::diff_block(lines, cx)
                             }))
+                        })
                     }))
                     .into_any_element(),
             },
