@@ -70,7 +70,7 @@ fn describe(path: &str, origin: &str, opened: &Opened) -> String {
 }
 
 fn row(e: &Entry) -> Vec<String> {
-    let modified = jiff::Timestamp::from_second(e.modified).map_or_else(|_| String::new(), |t| t.to_string());
+    let modified = jiff::Timestamp::from_second(e.modified).map_or_else(|_| String::new(), ToString::to_string);
     let mut name = e.display();
     if e.kind == FileKind::Dir {
         name.push('/');

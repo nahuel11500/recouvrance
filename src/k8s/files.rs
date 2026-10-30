@@ -69,7 +69,7 @@ impl FileSource {
     /// `real` the other way: a path the commands printed, as the container sees it.
     fn own(&self, real: &[u8]) -> Vec<u8> {
         match real.strip_prefix(self.root.as_slice()) {
-            Some(rest) if rest.is_empty() => b"/".to_vec(),
+            Some([]) => b"/".to_vec(),
             Some(rest) if rest.starts_with(b"/") => rest.to_vec(),
             _ => real.to_vec(),
         }
@@ -166,13 +166,10 @@ impl FileSource {
                 Ok(())
             };
             let run = exec_to(client, ns, pod, container, command, None::<&[u8]>, &mut sink, max);
-            let done = tokio::time::timeout(Duration::from_secs(secs), run).await;
-            match done {
-                Ok(r) => {
-                    r.map_err(explain)?;
-                }
-                Err(_) => anyhow::bail!("the container did not answer within {secs}s"),
-            }
+            let Ok(done) = tokio::time::timeout(Duration::from_secs(secs), run).await else {
+                anyhow::bail!("the container did not answer within {secs}s");
+            };
+            done.map_err(explain)?;
             Ok(out)
         })
         .await
@@ -478,9 +475,8 @@ fn stat_line(text: &[u8], name: &[u8]) -> Option<(Entry, usize)> {
     let raw = u32::try_from(hex(0)?).ok()?;
     let kind = FileKind::of(raw);
     // Unknown to the container (no /etc/passwd entry): the number says more.
-    let named = |i: usize| match String::from_utf8_lossy(fields[i]) {
-        n if n == "UNKNOWN" => String::new(),
-        n => n.into_owned(),
+    let named = |i: usize| {
+        if fields[i] == b"UNKNOWN" { String::new() } else { String::from_utf8_lossy(fields[i]).into_owned() }
     };
     let device = if matches!(kind, FileKind::CharDevice | FileKind::BlockDevice) { hex(6).zip(hex(7)) } else { None };
     let entry = Entry {
@@ -766,7 +762,7 @@ mod tests {
             row(b"tty", "21b6 1 0 5 0 1700000000 5 0 root tty"),
             row(b"loop10", "61b0 1 0 6 0 1700000000 7 a root disk"),
             link(b"sh", b"busybox", false),
-            row(b"shared", "45e8 2 0 0 4096 1700000000 0 0 root root"),
+            row(b"shared", "45e0 2 0 0 4096 1700000000 0 0 root root"),
         ]);
         let entries = parse_listing(&out).unwrap();
         assert_eq!(named(&entries, b"tty").device, Some((5, 0)));
@@ -786,17 +782,18 @@ mod tests {
             row(&fake, FILE),
             row(b"y", FILE),
             row(b"-n", FILE),
-            row(b"caf\xe9", FILE),
+            row(b"latin1-\xe9", FILE),
             row(b" lead", FILE),
             row(b"trail\n", FILE),
             link(b"link", b"new\nline", false),
         ]);
         let entries = parse_listing(&out).unwrap();
-        let want: [&[u8]; 9] = [b"a b", b"two\nlines", &fake, b"y", b"-n", b"caf\xe9", b" lead", b"trail\n", b"link"];
+        let want: [&[u8]; 9] =
+            [b"a b", b"two\nlines", &fake, b"y", b"-n", b"latin1-\xe9", b" lead", b"trail\n", b"link"];
         assert_eq!(names(&entries), want.map(<[u8]>::to_vec));
         assert_eq!(named(&entries, b"link").target.as_deref(), Some(&b"new\nline"[..]));
         assert_eq!(display_name(b"two\nlines"), "two\\nlines");
-        assert_eq!(display_name(b"caf\xe9"), "caf\u{fffd}");
+        assert_eq!(display_name(b"latin1-\xe9"), "latin1-\u{fffd}");
         assert_eq!(display_name(b"bell\x07"), "bell\\u{7}");
     }
 
@@ -876,7 +873,7 @@ mod tests {
         let (paths, cut) = parse_found(b"/etc/a\0/etc/b c\0", 1000);
         assert_eq!((paths, cut), (vec![b"/etc/a".to_vec(), b"/etc/b c".to_vec()], false));
         // Cut at the cap: the last path, cut short, is dropped.
-        let (paths, cut) = parse_found(b"/etc/a\0/etc/lo", 15);
+        let (paths, cut) = parse_found(b"/etc/a\0/etc/lo", 14);
         assert_eq!((paths, cut), (vec![b"/etc/a".to_vec()], true));
         assert!(parse_found(b"", 10).0.is_empty());
     }

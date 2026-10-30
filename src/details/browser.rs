@@ -499,7 +499,7 @@ impl FileBrowser {
         let crumbs = files::crumbs(&dir);
         let last = crumbs.len() - 1;
         let up = files::parent(&dir);
-        let (here, refresh) = (dir.clone(), dir.clone());
+        let (here, refresh) = (dir.clone(), dir);
         h_flex()
             .gap_1()
             .flex_wrap()

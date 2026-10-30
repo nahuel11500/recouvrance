@@ -815,7 +815,7 @@ fn the_files_tab_reads_a_container() {
     use crate::k8s::files::{FileKind, FileSource, display_name};
 
     /// Odd names, made with the container's own shell.
-    const MAKE: &str = r#"mkdir -p '/data/a dir' && echo hello > '/data/a dir/file one.txt' && touch "/data/$(printf 'new\nline')" "/data/$(printf 'caf\351')" && ln -s '/data/a dir' /data/link && printf '\177ELF\002\001' > /data/bin"#;
+    const MAKE: &str = r#"mkdir -p '/data/a dir' && echo hello > '/data/a dir/file one.txt' && touch "/data/$(printf 'new\nline')" "/data/$(printf 'latin1-\351')" && ln -s '/data/a dir' /data/link && printf '\177ELF\002\001' > /data/bin"#;
 
     run(async {
         let ctx = context();
@@ -840,7 +840,7 @@ fn the_files_tab_reads_a_container() {
                 let etc = source.list(b"/etc").await?;
                 assert!(etc.iter().any(|e| e.name == b"passwd" && e.kind == FileKind::File), "{name}: no passwd");
                 let data = source.list(b"/data").await?;
-                let odd: [&[u8]; 5] = [b"a dir", b"new\nline", b"caf\xe9", b"link", b"bin"];
+                let odd: [&[u8]; 5] = [b"a dir", b"new\nline", b"latin1-\xe9", b"link", b"bin"];
                 for want in odd {
                     assert!(data.iter().any(|e| e.name == want), "{name}: {} is not listed", display_name(want));
                 }
@@ -849,7 +849,7 @@ fn the_files_tab_reads_a_container() {
                 let text = source.read(b"/data/a dir/file one.txt", 1024).await?;
                 assert_eq!(text.text(), Some("hello\n"), "{name}");
                 assert_eq!(source.read(b"/data/bin", 1024).await?.kind(), "ELF executable or library", "{name}");
-                assert!(source.read(b"/data/caf\xe9", 1024).await?.bytes.is_empty(), "{name}");
+                assert!(source.read(b"/data/latin1-\xe9", 1024).await?.bytes.is_empty(), "{name}");
                 let found = source.find(b"/data", "ONE").await?;
                 assert_eq!(found.paths, [b"/data/a dir/file one.txt".to_vec()], "{name}");
             }
