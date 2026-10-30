@@ -946,9 +946,9 @@ mod tests {
     }
 
     fn release(revision: i64, chart_version: &str, values: Value, status: &str) -> Release {
-        let mut r = crate::helm::decode(&crate::helm::tests::helm_secret(
+        let mut r = helm::decode(&helm::tests::helm_secret(
             (&format!("sh.helm.release.v1.web.v{revision}"), "shop", "web"),
-            &crate::helm::tests::payload("web", "shop", revision),
+            &helm::tests::payload("web", "shop", revision),
             false,
         ))
         .unwrap();
@@ -1002,7 +1002,8 @@ mod tests {
             ]
         );
         assert!(changes[0].warning);
-        let (removed, added) = texts(&changes[1].diff.as_ref().unwrap().lines());
+        let lines = changes[1].diff.as_ref().unwrap().lines();
+        let (removed, added) = texts(&lines);
         assert_eq!((removed.len(), added.len()), (1, 1));
         assert!(added[0].contains(&"b".repeat(40)));
         let done = json!({"metadata": {"name": "shop"}, "status": {"operationState": {"phase": "Succeeded"}}});
