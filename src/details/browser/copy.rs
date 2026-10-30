@@ -5,6 +5,7 @@
 
 use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::notification::Notification;
 use gpui_kit::component::select::Select;
 use gpui_kit::component::{ActiveTheme as _, Disableable as _, Icon, Sizable as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
@@ -15,6 +16,7 @@ use super::{FileBrowser, Place, short};
 use crate::details::{
     ConfirmButtons as _, Guard, confirm_extras, ensure_writes, guard_ok, kubectl, shell_word, writes_still_on,
 };
+use crate::k8s;
 use crate::k8s::files::{FileSource, Origin};
 use crate::k8s::pod_copy::{self, COPY_SECS, PodCopy};
 
@@ -176,11 +178,17 @@ impl FileBrowser {
     }
 
     /// Delete the copy; the containers read from it go back to their start.
-    fn end_copy(&mut self, cx: &mut Context<Self>) {
-        if let CopyState::Ready(copy) = std::mem::take(&mut self.copy) {
-            pod_copy::delete(copy);
-        }
+    fn end_copy(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self._copy_task = None;
+        if let CopyState::Ready(copy) = std::mem::take(&mut self.copy) {
+            // On the shared runtime: the delete finishes even if this page goes away meanwhile.
+            self._copy_task = Some(cx.spawn_in(window, async move |_, cx| {
+                if let Err(e) = pod_copy::delete_now(copy).await {
+                    let text = format!("The copy of the pod could not be deleted: {}", k8s::short_error(&e));
+                    let _ = cx.update(|window, cx| window.push_notification(Notification::error(text), cx));
+                }
+            }));
+        }
         self.places.retain(|_, p| !p.read_from_copy());
         self.previewed = None;
         cx.notify();
@@ -275,7 +283,7 @@ impl FileBrowser {
                         .outline()
                         .icon(Lucide::Trash)
                         .label("Delete the copy")
-                        .on_click(cx.listener(|this, _, _, cx| this.end_copy(cx))),
+                        .on_click(cx.listener(|this, _, window, cx| this.end_copy(window, cx))),
                 )
                 .into_any_element(),
         )

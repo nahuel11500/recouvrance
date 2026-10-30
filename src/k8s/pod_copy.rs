@@ -187,8 +187,10 @@ pub async fn create(client: Client, pod: Value, name: String, image: String) -> 
     let (tx, rx) = futures::channel::oneshot::channel::<Result<PodCopy>>();
     spawn_detached(async move {
         let result = start(client, spec).await;
-        if let Err(Ok(copy)) = tx.send(result) {
-            remove(copy).await;
+        if let Err(Ok(copy)) = tx.send(result)
+            && remove(copy).await.is_err()
+        {
+            left_behind();
         }
     });
     rx.await.map_err(|_| anyhow!("the copy's creation stopped"))?
@@ -204,8 +206,10 @@ async fn start(client: Client, spec: Value) -> Result<PodCopy> {
         Ok(created) => created,
         Err(e) => {
             // It may be stored all the same (an answer lost): the name is ours alone.
-            if super::writes::may_have_stored(&e) {
-                remove_named(&client, &ns, &name, None).await;
+            if super::writes::may_have_stored(&e)
+                && let Err(d) = remove_named(&client, &ns, &name, None).await
+            {
+                return Err(not_deleted(&e.into(), &d));
             }
             return Err(e.into());
         }
@@ -216,10 +220,10 @@ async fn start(client: Client, spec: Value) -> Result<PodCopy> {
     live().insert(uid, copy.clone());
     match wait_running(&Api::namespaced(client, &ns), &name).await {
         Ok(()) => Ok(copy),
-        Err(e) => {
-            remove(copy).await;
-            Err(e)
-        }
+        Err(e) => match remove(copy).await {
+            Ok(()) => Err(e),
+            Err(d) => Err(not_deleted(&e, &d)),
+        },
     }
 }
 
@@ -274,32 +278,67 @@ async fn wait_running(api: &Api<Pod>, name: &str) -> Result<()> {
     bail!("the copy did not start within 2 minutes")
 }
 
-/// Delete a copy in the background (its page went away, or the user asked).
+/// Delete a copy in the background: its page went away, there is nobody to tell when it fails.
 pub fn delete(copy: PodCopy) {
-    spawn_detached(remove(copy));
+    spawn_detached(async move {
+        if remove(copy).await.is_err() {
+            left_behind();
+        }
+    });
 }
 
-/// Delete a copy now, by its uid, trying again a few times: the error that made us give up
-/// on it (a 429, a 5xx, a network blip) often fails the first delete too.
-async fn remove(copy: PodCopy) {
-    remove_named(&copy.client, &copy.ns, &copy.name, Some(copy.uid.clone())).await;
+/// Delete a copy now (the user asked), and say why it failed.
+pub async fn delete_now(copy: PodCopy) -> Result<()> {
+    super::run(remove(copy)).await
+}
+
+/// A copy could not be deleted, with nobody to tell. What failed is not logged: it is the API
+/// server's answer to a request made with the user's credentials.
+fn left_behind() {
+    eprintln!(
+        "a copy of a pod made to read its files could not be deleted: it stops within the hour, and is deleted \
+         the next time the app connects to its cluster"
+    );
+}
+
+/// `e`, the error shown, saying the copy made for it could not be deleted either (`d`).
+fn not_deleted(e: &anyhow::Error, d: &anyhow::Error) -> anyhow::Error {
+    anyhow!(
+        "{}; the copy could not be deleted either ({}): it stops within the hour",
+        super::short_error(e),
+        super::short_error(d)
+    )
+}
+
+/// Delete a copy now, by its uid.
+async fn remove(copy: PodCopy) -> Result<()> {
+    let removed = remove_named(&copy.client, &copy.ns, &copy.name, Some(copy.uid.clone())).await;
     live().remove(&copy.uid);
+    removed
 }
 
-async fn remove_named(client: &Client, ns: &str, name: &str, uid: Option<String>) {
-    for _ in 0..5 {
+/// Delete pod `name` (only while it has `uid`), trying again a few times: the error that made
+/// us give up on it (a 429, a 5xx, a network blip) often fails the first delete too. Gone
+/// already, or re-created under its name since (the uid differs), counts as done.
+async fn remove_named(client: &Client, ns: &str, name: &str, uid: Option<String>) -> Result<()> {
+    let mut tries = 0;
+    loop {
         let deleted = super::delete(client.clone(), pod_kind(), Some(ns.into()), name.into(), uid.clone(), false).await;
         match deleted {
-            // Gone already, re-created under its name (the uid differs), or refused: trying
-            // again won't help.
-            Err(e) if transient(&e) => tokio::time::sleep(Duration::from_secs(2)).await,
-            Err(e) if !super::is_not_found(&e) => {
-                eprintln!("could not delete the pod copy {ns}/{name}: {}", super::short_error(&e));
-                return;
+            Err(e) if transient(&e) && tries < 4 => {
+                tries += 1;
+                tokio::time::sleep(Duration::from_secs(2)).await;
             }
-            _ => return,
+            Err(e) if super::is_not_found(&e) || is_conflict(&e) => return Ok(()),
+            Err(e) => return Err(e),
+            Ok(_) => return Ok(()),
         }
     }
+}
+
+/// The server's 409: the uid precondition failed, the pod is another one now.
+fn is_conflict(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| matches!(c.downcast_ref::<kube::Error>(), Some(kube::Error::Api(s)) if s.code == 409))
 }
 
 /// An error worth trying again after: too many requests, the server failing, or no answer.
@@ -335,8 +374,9 @@ pub fn clean_up(context: &str, client: Client, namespaces: Vec<String>) {
     }
     let context = context.to_string();
     spawn_detached(async move {
-        if let Err(e) = sweep(client, namespaces, jiff::SignedDuration::from_secs(COPY_SECS as i64)).await {
-            eprintln!("{context}: pod copies left behind were not read: {}", super::short_error(&e));
+        // Not logged with the error, which is the API server's answer to the user's credentials.
+        if sweep(client, namespaces, jiff::SignedDuration::from_secs(COPY_SECS as i64)).await.is_err() {
+            eprintln!("{context}: pod copies left behind could not be read");
         }
     });
 }
@@ -354,7 +394,7 @@ pub(crate) async fn sweep(client: Client, namespaces: Vec<String>, max_age: jiff
                 // One namespace refused doesn't keep the others from being cleaned.
                 match Api::<Pod>::namespaced(client.clone(), ns).list(&lp).await {
                     Ok(list) => pods.extend(list.items),
-                    Err(e) => eprintln!("pod copies left in {ns} were not read: {e}"),
+                    Err(_) => eprintln!("pod copies left in {ns} could not be read"),
                 }
             }
             pods
@@ -367,9 +407,12 @@ pub(crate) async fn sweep(client: Client, namespaces: Vec<String>, max_age: jiff
         let (Some(ns), Some(name), Some(uid)) = (meta.namespace, meta.name, meta.uid) else { continue };
         let created = meta.creation_timestamp.map(|t| t.0);
         if name.starts_with(NAME_PREFIX) && created.is_some_and(|t| older(t, now, max_age)) {
-            remove_named(&client, &ns, &name, Some(uid.clone())).await;
+            let removed = remove_named(&client, &ns, &name, Some(uid.clone())).await;
             live().remove(&uid);
-            deleted += 1;
+            match removed {
+                Ok(()) => deleted += 1,
+                Err(_) => left_behind(),
+            }
         }
     }
     Ok(deleted)
