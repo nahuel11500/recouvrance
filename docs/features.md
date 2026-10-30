@@ -12,7 +12,9 @@
   on purpose to dedicate nodes (`production=true`, GPUs, control plane, `node-role.*`) don't
   show. Such a node, or a cordoned one (`SchedulingDisabled`), is yellow; NotReady and Unknown
   red. `status:` filters and sorting see the labels; the node's page and the cluster overview
-  show them too. Nodes are listed with their whole objects for this (the taints are in `spec`).
+  show them too. The taints are in a node's `spec`: the Nodes list reads whole nodes once, then
+  watches their metadata (a whole node is mostly its image list, and its status is rewritten every
+  few seconds) and reads one node again when its `managedFields` show a new write to its spec.
 - **Detail pages** for pods (per-container tabs: probes, usage vs requests/limits, ports, env,
   mounts), workloads (scheduling, pods, revisions with diffs), services (port-forward, backing
   pods), secrets (masked, referenced by), ingresses, PVCs, namespaces (quotas), nodes, CronJobs,

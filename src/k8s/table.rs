@@ -13,6 +13,7 @@ use kube::discovery::ApiResource;
 use kube::{Client, Resource as _};
 use serde::Deserialize;
 
+use super::node_specs::{self, NodeSpecs};
 use super::{Kind, TaskGuard, api_status, lists, run, short_error, spawn_guarded};
 use crate::timeline::Tap;
 
@@ -121,7 +122,7 @@ pub(super) struct PartialObject {
 
 /// Whether an object's `kind` is Node, read without keeping the string (every row has one).
 #[derive(Clone, Copy, Debug)]
-pub(super) struct IsNode(bool);
+pub(super) struct IsNode(pub(super) bool);
 
 impl<'de> Deserialize<'de> for IsNode {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
@@ -207,9 +208,9 @@ pub(super) fn with_table_format(mut req: http::Request<Vec<u8>>, full: bool) -> 
 /// that keep pods off a node are in its `spec` (see `add_trouble_taints`).
 const NODES: &str = "/api/v1/nodes";
 
-/// Whether rows of `url` need whole objects: Nodes, or custom columns beyond the metadata.
-/// A node's object is mostly `status.images` (about 24 KB against the 7 KB of its metadata
-/// on a real cluster), but nodes are few.
+/// Whether rows of `url` are listed with whole objects: Nodes, or custom columns beyond the
+/// metadata. A node's object is mostly `status.images` (about 24 KB against the 7 KB of its
+/// metadata on a real cluster): its watch reads metadata (see `node_specs`).
 pub(super) fn needs_object(url: &str, extras: &Extras) -> bool {
     url == NODES || needs_full(extras)
 }
@@ -264,6 +265,24 @@ fn add_trouble_taints(cells: &mut [String], raw: &str) {
     if let Some(status) = cells.get_mut(1).filter(|_| !labels.is_empty()) {
         crate::taints::append(status, &labels);
     }
+}
+
+/// A node's row with its Status's taint labels replaced by `labels` (read again).
+fn relabeled(row: &Row, labels: &[String]) -> Arc<Row> {
+    let mut cells = row.cells.clone();
+    if let Some(status) = cells.get_mut(1) {
+        *status = crate::taints::relabel(status, labels);
+    }
+    Arc::new(Row {
+        uid: row.uid.clone(),
+        name: row.name.clone(),
+        namespace: row.namespace.clone(),
+        created: row.created,
+        cells,
+        labels: row.labels.clone(),
+        deleting: row.deleting,
+        deleted_at: row.deleted_at,
+    })
 }
 
 /// A listed row, its object shown first to the timeline's tap when one records the list.
@@ -321,17 +340,19 @@ pub(super) async fn list_paged(
     url: &str,
     lp: ListParams,
 ) -> Result<(Vec<ColumnDef>, Vec<Arc<Row>>, String)> {
-    list_paged_with(client, url, lp, &Extras::default(), None, |_, _, _| {}).await
+    list_paged_with(client, url, lp, &Extras::default(), None, None, |_, _, _| {}).await
 }
 
 /// Like `list_paged`, calling `on_page` with the rows so far after each page, and whether
-/// more pages follow. A `tap` sees each object (whole ones when it records them whole).
+/// more pages follow. A `tap` sees each object (whole ones when it records them whole), and
+/// `nodes` each whole node, for its watch.
 pub(super) async fn list_paged_with(
     client: &Client,
     url: &str,
     mut lp: ListParams,
     extras: &Extras,
     tap: Option<&Tap>,
+    mut nodes: Option<&mut NodeSpecs>,
     mut on_page: impl FnMut(&[ColumnDef], &[Arc<Row>], bool),
 ) -> Result<(Vec<ColumnDef>, Vec<Arc<Row>>, String)> {
     lp.limit = Some(PAGE_SIZE);
@@ -344,7 +365,12 @@ pub(super) async fn list_paged_with(
             defs = page.column_definitions;
             defs.extend(extras.iter().map(|(name, _)| ColumnDef { name: name.clone(), priority: 0 }));
         }
-        rows.extend(page.rows.into_iter().filter_map(|r| listed_row(r, extras, tap)));
+        rows.extend(page.rows.into_iter().filter_map(|r| {
+            if let (Some(nodes), Some(obj)) = (nodes.as_deref_mut(), &r.object) {
+                nodes.whole(obj.get());
+            }
+            listed_row(r, extras, tap)
+        }));
         version = page.metadata.resource_version.unwrap_or(version);
         let next = page.metadata.continue_.filter(|c| !c.is_empty());
         on_page(&defs, &rows, next.is_some());
@@ -435,7 +461,9 @@ async fn list_fast(
     match list_whole(client, url, tap).await {
         Ok(listed) => Ok(listed),
         // An API server that can't serve it from its cache: page through it as before.
-        Err(_) => list_paged_with(client, url, ListParams::default(), &Extras::default(), tap, |_, _, _| {}).await,
+        Err(_) => {
+            list_paged_with(client, url, ListParams::default(), &Extras::default(), tap, None, |_, _, _| {}).await
+        }
     }
 }
 
@@ -768,7 +796,10 @@ pub(super) async fn watch_once(
     progress: &mut bool,
 ) -> Result<()> {
     let request = Request::new(url);
-    let full = needs_object(url, extras) || tap.is_some_and(Tap::full);
+    // Whole objects to watch; Nodes are listed whole but watched by their metadata.
+    let watch_full = needs_full(extras) || tap.is_some_and(Tap::full);
+    let full = watch_full || needs_object(url, extras);
+    let mut nodes = (url == NODES && !watch_full).then(NodeSpecs::default);
     if let Some(tap) = tap {
         tap.begin_list();
     }
@@ -781,26 +812,28 @@ pub(super) async fn watch_once(
         FirstList::Pages { .. } => {
             // Show rows as pages arrive; big clusters take tens of seconds to list.
             let mut sent_columns = false;
-            let listed = list_paged_with(client, url, ListParams::default(), extras, tap, |defs, rows, _| {
-                if !sent_columns {
-                    let _ = tx.unbounded_send(TableMsg::Columns(Arc::new(defs.to_vec())));
-                    sent_columns = true;
-                }
-                if pause.is_paused() {
-                    return;
-                }
-                let mut partial = rows.to_vec();
-                partial.sort_by(|a, b| (&a.namespace, &a.name).cmp(&(&b.namespace, &b.name)));
-                let _ = tx.unbounded_send(TableMsg::Rows(partial));
-            })
-            .await?;
+            let listed =
+                list_paged_with(client, url, ListParams::default(), extras, tap, nodes.as_mut(), |defs, rows, _| {
+                    if !sent_columns {
+                        let _ = tx.unbounded_send(TableMsg::Columns(Arc::new(defs.to_vec())));
+                        sent_columns = true;
+                    }
+                    if pause.is_paused() {
+                        return;
+                    }
+                    let mut partial = rows.to_vec();
+                    partial.sort_by(|a, b| (&a.namespace, &a.name).cmp(&(&b.namespace, &b.name)));
+                    let _ = tx.unbounded_send(TableMsg::Rows(partial));
+                })
+                .await?;
             if !sent_columns {
                 let _ = tx.unbounded_send(TableMsg::Columns(Arc::new(listed.0.clone())));
             }
             listed
         }
         _ => {
-            let listed = list_paged_with(client, url, ListParams::default(), extras, tap, |_, _, _| {}).await?;
+            let listed =
+                list_paged_with(client, url, ListParams::default(), extras, tap, nodes.as_mut(), |_, _, _| {}).await?;
             let _ = tx.unbounded_send(TableMsg::Columns(Arc::new(listed.0.clone())));
             listed
         }
@@ -819,10 +852,14 @@ pub(super) async fn watch_once(
     // A cut stream or a failed reopen watches again from `version`, waiting longer each time.
     let mut backoff = Backoff::default();
     let mut retrying = false;
+    // Nodes read again after a spec write (see `node_specs`): one read in flight per node.
+    let mut reads: futures::stream::FuturesUnordered<
+        futures::future::BoxFuture<'static, (String, Result<node_specs::NodeRead>)>,
+    > = futures::stream::FuturesUnordered::new();
 
     loop {
         let wp = WatchParams::default().timeout(290);
-        let req = with_table_format(request.watch(&wp, &version)?, full)?;
+        let req = with_table_format(request.watch(&wp, &version)?, watch_full)?;
         let reader = match client.request_stream(req).await {
             Ok(reader) => reader,
             Err(e) if resumable(&e) => {
@@ -843,6 +880,7 @@ pub(super) async fn watch_once(
         while !cut {
             // Wake up for a pending snapshot even when no event comes.
             let flush = snaps.wait(pause);
+            let due = nodes.as_ref().and_then(NodeSpecs::next_due);
             let next = tokio::select! {
                 lines = chunks.next() => Some(lines),
                 () = async {
@@ -851,6 +889,28 @@ pub(super) async fn watch_once(
                         None => std::future::pending().await,
                     }
                 } => None,
+                () = async {
+                    match due {
+                        Some(at) => tokio::time::sleep_until(at.into()).await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    if let Some(nodes) = nodes.as_mut() {
+                        for (uid, name) in nodes.take_due(std::time::Instant::now()) {
+                            reads.push(Box::pin(node_specs::read_node(client.clone(), uid, name)));
+                        }
+                    }
+                    None
+                }
+                Some((uid, read)) = reads.next(), if !reads.is_empty() => {
+                    let labels = nodes.as_mut().and_then(|n| n.read(&uid, read, std::time::Instant::now()));
+                    if let (Some(labels), Some(row)) = (labels, rows.get(&uid)) {
+                        let row = relabeled(row, &labels);
+                        rows.insert(uid, row);
+                        snaps.dirty = true;
+                    }
+                    None
+                }
                 // A healthy watch gets a bookmark about once a minute even when nothing
                 // changes; silence this long is a connection that died without closing
                 // (sleep, VPN, NAT). Watch again from `version`, without a relist.
@@ -868,7 +928,7 @@ pub(super) async fn watch_once(
                             break;
                         };
                         backoff = Backoff::default();
-                        match apply_event(&line, &mut rows, &mut version, extras, tap)? {
+                        match apply_event(&line, &mut rows, &mut version, extras, tap, nodes.as_mut())? {
                             Applied::Changed => snaps.dirty = true,
                             Applied::Unchanged => {}
                             // Our resourceVersion is too old: relist (which sends every row).
@@ -907,13 +967,14 @@ pub(super) enum Applied {
 
 /// Apply one watch frame (a line of the stream) to the rows by uid, keeping the
 /// resourceVersion to resume from. Errors other than 410 end the watch. A `tap` records
-/// the object's change.
+/// the object's change; `nodes`, for a watch of Nodes' metadata, keeps their taints' labels.
 pub(super) fn apply_event(
     line: &str,
     rows: &mut HashMap<String, Arc<Row>>,
     version: &mut String,
     extras: &Extras,
     tap: Option<&Tap>,
+    mut nodes: Option<&mut NodeSpecs>,
 ) -> Result<Applied> {
     #[cfg(feature = "dev")]
     let _t = crate::dev::timing::span("watch event parse (bg)");
@@ -929,7 +990,7 @@ pub(super) fn apply_event(
                 *version = v;
             }
             let mut changed = false;
-            for row in table.rows {
+            for mut row in table.rows {
                 let meta = row
                     .object
                     .as_ref()
@@ -943,9 +1004,17 @@ pub(super) fn apply_event(
                 }
                 if event.type_ == "DELETED" {
                     if let Some(uid) = meta.as_ref().and_then(|m| m.uid.as_ref()) {
+                        if let Some(nodes) = nodes.as_deref_mut() {
+                            nodes.deleted(uid);
+                        }
                         changed |= rows.remove(uid).is_some();
                     }
-                } else if let Some(row) = to_row(row, extras) {
+                    continue;
+                }
+                if let Some(nodes) = nodes.as_deref_mut() {
+                    nodes.event(&mut row, std::time::Instant::now());
+                }
+                if let Some(row) = to_row(row, extras) {
                     rows.insert(row.uid.clone(), row);
                     changed = true;
                 }
@@ -1089,8 +1158,9 @@ mod watch_tests {
     #[test]
     fn applies_events() {
         let (mut rows, mut version, extras) = (HashMap::<String, Arc<Row>>::new(), "1".to_string(), Extras::default());
-        let mut apply =
-            |line: &str, rows: &mut HashMap<String, Arc<Row>>| apply_event(line, rows, &mut version, &extras, None);
+        let mut apply = |line: &str, rows: &mut HashMap<String, Arc<Row>>| {
+            apply_event(line, rows, &mut version, &extras, None, None)
+        };
         assert_eq!(apply(&frame("ADDED", "u1", "web", "5", "Pending"), &mut rows).unwrap(), Applied::Changed);
         assert_eq!(apply(&frame("ADDED", "u2", "api", "6", "Running"), &mut rows).unwrap(), Applied::Changed);
         assert_eq!(rows.len(), 2);
@@ -1114,15 +1184,16 @@ mod watch_tests {
     #[test]
     fn tracks_resource_version() {
         let (mut rows, mut version, extras) = (HashMap::new(), "1".to_string(), Extras::default());
-        apply_event(&frame("ADDED", "u1", "web", "5", "Running"), &mut rows, &mut version, &extras, None).unwrap();
+        apply_event(&frame("ADDED", "u1", "web", "5", "Running"), &mut rows, &mut version, &extras, None, None)
+            .unwrap();
         assert_eq!(version, "5");
-        apply_event(&frame("DELETED", "u9", "gone", "9", ""), &mut rows, &mut version, &extras, None).unwrap();
+        apply_event(&frame("DELETED", "u9", "gone", "9", ""), &mut rows, &mut version, &extras, None, None).unwrap();
         assert_eq!(version, "9");
         let bookmark = r#"{"type":"BOOKMARK","object":{"kind":"Table","metadata":{"resourceVersion":"42"}}}"#;
-        apply_event(bookmark, &mut rows, &mut version, &extras, None).unwrap();
+        apply_event(bookmark, &mut rows, &mut version, &extras, None, None).unwrap();
         assert_eq!(version, "42");
         // A bookmark without a version keeps ours.
-        apply_event(r#"{"type":"BOOKMARK","object":{}}"#, &mut rows, &mut version, &extras, None).unwrap();
+        apply_event(r#"{"type":"BOOKMARK","object":{}}"#, &mut rows, &mut version, &extras, None, None).unwrap();
         assert_eq!(version, "42");
     }
 }
@@ -1175,7 +1246,7 @@ mod json_path_tests {
 
 #[cfg(test)]
 mod node_tests {
-    use super::{Extras, HashMap, ServerRow, apply_event, needs_object, to_row};
+    use super::{Arc, Extras, HashMap, NodeSpecs, Row, ServerRow, apply_event, needs_object, relabeled, to_row};
 
     /// A Nodes table row with its whole object (`includeObject=Object`).
     fn node_row(kind: &str, status: &str, spec: serde_json::Value) -> ServerRow {
@@ -1234,9 +1305,45 @@ mod node_tests {
             "rows": [{"cells": ["n1", "Ready"], "object": {"kind": "Node", "metadata": {"name": "n1", "uid": "u1", "resourceVersion": "7"},
                 "spec": {"taints": [{"key": "ToBeDeletedByClusterAutoscaler", "value": "1700000000", "effect": "NoSchedule"}]}}}]}});
         let (mut rows, mut version) = (HashMap::new(), String::new());
-        apply_event(&frame.to_string(), &mut rows, &mut version, &Extras::default(), None).unwrap();
+        apply_event(&frame.to_string(), &mut rows, &mut version, &Extras::default(), None, None).unwrap();
         assert_eq!(rows["u1"].cells, ["n1", "Ready,ToBeDeleted"]);
         assert_eq!(version, "7");
+    }
+
+    /// A metadata watch frame for node n1, its taints last written by an operator at `spec`.
+    fn meta_frame(status: &str, spec: &str) -> String {
+        serde_json::json!({"type": "MODIFIED", "object": {"kind": "Table", "metadata": {}, "columnDefinitions": null,
+        "rows": [{"cells": ["n1", "Ready"], "object": {"kind": "PartialObjectMetadata",
+            "metadata": {"name": "n1", "uid": "u1", "resourceVersion": "8", "managedFields": [
+                {"manager": "kubelet", "subresource": "status", "time": status, "fieldsV1": {"f:status": {}}},
+                {"manager": "cilium-operator-generic", "time": spec, "fieldsV1": {"f:spec": {"f:taints": {}}}},
+            ]}}}]}})
+        .to_string()
+    }
+
+    #[test]
+    fn a_metadata_watch_keeps_the_labels_read() {
+        let mut nodes = NodeSpecs::default();
+        nodes.whole(
+            &serde_json::json!({"kind": "Node", "metadata": {"name": "n1", "uid": "u1", "managedFields": [
+                {"manager": "cilium-operator-generic", "time": "2026-10-30T09:00:00Z", "fieldsV1": {"f:spec": {"f:taints": {}}}}]},
+                "spec": {"taints": [{"key": "node.cilium.io/agent-not-ready", "effect": "NoSchedule"}]}})
+            .to_string(),
+        );
+        let (mut rows, mut version) = (HashMap::new(), String::new());
+        let mut apply = |line: &str, rows: &mut HashMap<String, Arc<Row>>, nodes: &mut NodeSpecs| {
+            apply_event(line, rows, &mut version, &Extras::default(), None, Some(nodes)).unwrap()
+        };
+        // A heartbeat: the labels stay, nothing is read.
+        apply(&meta_frame("2026-10-30T10:00:00Z", "2026-10-30T09:00:00Z"), &mut rows, &mut nodes);
+        assert_eq!(rows["u1"].cells, ["n1", "Ready,CiliumAgentNotReady"]);
+        assert_eq!(nodes.next_due(), None);
+        // The operator wrote the taints: the node is read again in a moment.
+        apply(&meta_frame("2026-10-30T10:00:10Z", "2026-10-30T10:00:09Z"), &mut rows, &mut nodes);
+        assert_eq!(rows["u1"].cells, ["n1", "Ready,CiliumAgentNotReady"]);
+        assert!(nodes.next_due().is_some());
+        // Its read came back without the taint.
+        assert_eq!(relabeled(&rows["u1"], &[]).cells, ["n1", "Ready"]);
     }
 
     #[test]

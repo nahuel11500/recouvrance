@@ -98,6 +98,13 @@ pub fn append(status: &mut String, labels: &[String]) {
     }
 }
 
+/// A node's Status with its labels replaced: kubectl's words, then `labels`.
+pub fn relabel(status: &str, labels: &[String]) -> String {
+    let mut out = status.split(',').filter(|w| KUBECTL_WORDS.contains(w)).collect::<Vec<_>>().join(",");
+    append(&mut out, labels);
+    out
+}
+
 /// A node's Status as kubectl prints it, from its Ready condition's status (None without
 /// one) and `spec.unschedulable`, with its trouble taints' labels after it.
 pub fn node_status(ready: Option<&str>, unschedulable: bool, labels: &[String]) -> String {
@@ -133,7 +140,7 @@ fn camel(name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{append, camel, labels_in, node_status, trouble_label, trouble_labels};
+    use super::{append, camel, labels_in, node_status, relabel, trouble_label, trouble_labels};
     use proptest::prelude::*;
 
     #[test]
@@ -215,6 +222,8 @@ mod tests {
             ["CiliumAgentNotReady"]
         );
         assert_eq!(labels_in("NotReady,SchedulingDisabled").count(), 0);
+        assert_eq!(relabel("Ready,SchedulingDisabled,CiliumAgentNotReady", &[]), "Ready,SchedulingDisabled");
+        assert_eq!(relabel("Ready,ToBeDeleted", &cilium), "Ready,CiliumAgentNotReady");
     }
 
     #[test]
