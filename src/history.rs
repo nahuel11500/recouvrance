@@ -1032,12 +1032,12 @@ mod tests {
     fn the_report_keeps_to_its_limit_and_says_what_failed() {
         let mut with_diff = change(Some(20), "app: a:1 → a:2");
         with_diff.diff = Some(Arc::new(Diff { before: json!({"image": "a:1"}), after: json!({"image": "a:2"}) }));
-        let changes = [with_diff, change(Some(10), "older")];
+        let changes = [with_diff, change(Some(10), "the earlier one")];
         let out = report("Deployment web", &changes, &["Helm release web: forbidden".into()], 1);
         assert!(out.starts_with("Changes to Deployment web, newest first:\n"), "{out}");
         assert!(out.contains("1970-01-01 00:00:20Z") && out.contains("Event  Pod p: app: a:1 → a:2"), "{out}");
         assert!(out.contains("    - image: a:1\n    + image: a:2\n"), "{out}");
-        assert!(!out.contains("older") && out.contains("1 older changes not shown"), "{out}");
+        assert!(!out.contains("the earlier one") && out.contains("1 older changes not shown"), "{out}");
         assert!(out.ends_with("Could not read Helm release web: forbidden\n"), "{out}");
     }
 
