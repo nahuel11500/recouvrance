@@ -871,3 +871,52 @@ fn an_agent_checks_an_upgrade() {
         result
     });
 }
+
+/// A pod waiting on a ConfigMap that doesn't exist shows in `find_problems` with the
+/// ConfigMap it misses; an optional one it also names isn't reported.
+#[test]
+#[ignore]
+fn an_agent_finds_a_pod_s_missing_config_map() {
+    use k8s_openapi::api::core::v1::Pod;
+
+    run(async {
+        let ctx = context();
+        let pods: Api<Pod> = Api::namespaced(k8s::connect_for_agents(ctx.clone()).await?, NS);
+        let name = "e2e-dangling";
+        let _ = pods.delete(name, &DeleteParams::default().grace_period(0)).await;
+        for _ in 0..60 {
+            if pods.get_opt(name).await?.is_none() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+        let pod = json!({
+            "metadata": {"name": name, "namespace": NS},
+            "spec": {"containers": [{"name": "main", "image": "busybox:1.37", "command": ["sleep", "3600"],
+                "envFrom": [
+                    {"configMapRef": {"name": "e2e-missing-config"}},
+                    {"configMapRef": {"name": "e2e-optional-config", "optional": true}},
+                ]}]},
+        });
+        pods.create(&PostParams::default(), &serde_json::from_value(pod)?).await?;
+        let checked = async {
+            let (hub, _agent, token, _server) = agent(&["get,list *"], &[]).await?;
+            let mcp = crate::assistant::Mcp::connect(hub.port(), token).await?;
+            let mut out = String::new();
+            for _ in 0..90 {
+                out = mcp.call("find_problems", json!({"context": ctx, "namespace": NS})).await;
+                if out.lines().any(|l| l.contains(name) && l.contains("missing ConfigMap e2e-missing-config")) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
+            let line = out.lines().find(|l| l.contains(name)).with_context(|| out.clone())?;
+            assert!(line.contains("missing ConfigMap e2e-missing-config"), "{out}");
+            assert!(!line.contains("e2e-optional-config"), "{out}");
+            Ok(())
+        };
+        let result: Result<()> = checked.await;
+        let _ = pods.delete(name, &DeleteParams::default().grace_period(0)).await;
+        result
+    });
+}
