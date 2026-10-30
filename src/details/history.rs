@@ -65,7 +65,16 @@ impl DetailPanel {
         // deployed the namespace.
         let argo =
             if self.obj.kind.is("", "Namespace") { Vec::new() } else { history::argo_lookup_changes(&self.argo) };
-        self.history.merged = history::merge([fetched.changes.clone(), own, argo, events]);
+        // What the app recorded while it watched this object (this one: by its uid).
+        let uid = self.object.as_ref().and_then(|o| o.pointer("/metadata/uid")).and_then(|u| u.as_str());
+        let recorded = crate::timeline::changes_for(
+            &self.context,
+            &self.obj.kind.kubectl_name(),
+            self.obj.namespace.as_deref(),
+            &self.obj.name,
+            uid.unwrap_or_default(),
+        );
+        self.history.merged = history::merge([fetched.changes.clone(), own, argo, events, recorded]);
     }
 
     fn toggle_change_diff(&mut self, key: String, cx: &mut Context<Self>) {
@@ -95,7 +104,8 @@ impl DetailPanel {
             .gap_2()
             .child(div().flex_1().text_xs().text_color(muted).child(selectable(
                 "From what the cluster keeps: revisions, Helm and Argo CD history, who last wrote which \
-                 fields (managedFields), and events (kept about an hour). ConfigMaps and Secrets keep no history.",
+                 fields (managedFields), and events (kept about an hour); and what the app recorded while it \
+                 watched the object (Recorded, see the Timeline page).",
             )))
             .child(
                 Button::new("history-reload")

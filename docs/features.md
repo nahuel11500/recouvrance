@@ -3,6 +3,18 @@
 - **Contexts**: pick one or several on launch; tables merge clusters with a Context column.
 - **Live tables** with kubectl's own columns for every type, including CRDs; CPU/memory from
   metrics-server; per-type column choice; multi-namespace filter.
+- **Node status**: a node's Status adds, after kubectl's own words, the taints that keep pods off
+  it because something is wrong, kubectl-style (`Ready,CiliumAgentNotReady`): the
+  `node.kubernetes.io/*` ones (pressure, network unavailable, out of service), the cloud
+  provider's (`Uninitialized`, `Shutdown`), Cilium's agent not ready, the cluster autoscaler's
+  and Karpenter's (`ToBeDeleted`, `DeletionCandidate`, `Disrupted`, `Unregistered`), and others
+  whose name says not ready, unavailable, uninitialized, unreachable or pressure. The taints set
+  on purpose to dedicate nodes (`production=true`, GPUs, control plane, `node-role.*`) don't
+  show. Such a node, or a cordoned one (`SchedulingDisabled`), is yellow; NotReady and Unknown
+  red. `status:` filters and sorting see the labels; the node's page and the cluster overview
+  show them too. The taints are in a node's `spec`: the Nodes list reads whole nodes once, then
+  watches their metadata (a whole node is mostly its image list, and its status is rewritten every
+  few seconds) and reads one node again when its `managedFields` show a new write to its spec.
 - **Detail pages** for pods (per-container tabs: probes, usage vs requests/limits, ports, env,
   mounts), workloads (scheduling, pods, revisions with diffs), services (port-forward, backing
   pods), secrets (masked, referenced by), ingresses, PVCs, namespaces (quotas), nodes, CronJobs,
@@ -23,8 +35,31 @@
   *Diff* shows a change's diff, worked out when clicked, the way Compare shows one (the
   pod-template-hash and other noise left out, secret-looking Helm values masked). A Helm
   release's History tab has a *Values diff* against the revision before. A source that can't be
-  read (Helm's Secrets forbidden, say) is named; the others still show. ConfigMaps and Secrets
-  keep no history in Kubernetes.
+  read (Helm's Secrets forbidden, say) is named; the others still show. What the app recorded
+  while it watched the object (see Timeline) is listed too, as *Recorded*.
+- **Timeline**: what Kubernetes keeps no history of (ConfigMaps, which keys of a Secret changed,
+  Services, Ingresses, HPAs, scale changes, custom resources) is recorded while a cluster is
+  connected, from what the app already reads: the lists you open (their watch) and the Problems
+  scan (Deployments, StatefulSets, DaemonSets, Nodes, Namespaces, volumes, Argo CD Applications,
+  every scan; a kind with more than 1000 objects is scanned from its cells alone, and not
+  recorded there). No request is added. A change is recorded when something besides the status
+  changed: labels or annotations, or a field manager's write (who, and which fields:
+  `managedFields`), or the generation; status-only writes, `resourceVersion` and `managedFields`
+  churn, leader-election and other noisy annotations are left out. Creations and deletions are
+  recorded too, except of what a controller made (a CronJob's Jobs). Pods, events, ReplicaSets,
+  ControllerRevisions, Endpoints, EndpointSlices and Leases are never recorded: they change all the
+  time and their history is told elsewhere (a pod's by its owner's revisions and its events). The
+  **Timeline** page (sidebar, or `Timeline` in the palette) lists the connected clusters' changes
+  newest first with their events interleaved (Warnings only by default, all, or none); filters by
+  cluster, and `ns:`, `kind:`, `ctx:` and text in its filter box; a row picked shows its diff,
+  worked out then, and opens its object. Lists compare labels and annotations only, so their
+  records say which fields changed and who changed them but keep no diff of the spec; kinds named
+  in **Settings → Timeline** get a watch of their own on every connected cluster (the one cost,
+  opt-in), and their records a diff of the whole object, its status left out. A Secret's values
+  are never kept, in memory or on disk: only whether each key changed. An object written all the
+  time is recorded at most 10 times an hour (the next record says how many were skipped).
+  Records are kept on disk per context, 16 MB and 14 days by default (see
+  [configuration](configuration.md#timeline)), so the timeline survives a restart.
 - **Reachability**: a tab on Services, Ingresses and HTTPRoutes that follows the path a request
   takes and names the first step that breaks, with the `kubectl` command to see it yourself: the
   Ingress's class and the address its controller gave it (for a route, each Gateway, programmed and
@@ -52,11 +87,35 @@
   folder shown, or type a `/path` to go there. Each container keeps its own place. Names with
   spaces, newlines or bytes that aren't UTF-8 are shown escaped and still open. Like a shell it
   needs write mode, and the context name typed (or a wait) once on a protected context; it is
-  greyed out when your RBAC does not allow `pods/exec`. A container without a shell says so.
+  greyed out when your RBAC does not allow `pods/exec`. A container without a shell or those
+  tools (distroless, scratch) is offered a **debug container**, like `kubectl debug --target`:
+  one confirmation shows the `kubectl debug` equivalent and that an ephemeral container stays in
+  the pod's spec until the pod is replaced. It runs the node shell image (busybox by default),
+  shares the container's processes, runs as its user (from what the kubelet reports, else the
+  container's or the pod's `securityContext`) and sleeps for 4 hours; the files are read live
+  through `/proc/<pid>/root` of its main process, symlinks followed as the container sees them,
+  and the toolbar says *through a debug container*. It uses `kubectl debug`'s `general` profile
+  (`SYS_PTRACE`), none added where Pod Security is `baseline`, and `restricted`'s where it
+  requires it. Browsing again reuses one still running; it is greyed out when your RBAC does not
+  allow `patch` on `pods/ephemeralcontainers`.
+  A container that isn't running (crash loop, exited, waiting) is read from a **copy of the pod**,
+  after one confirmation that shows the `kubectl debug <pod> --copy-to=… --same-node` equivalent:
+  the same spec and volumes (mounted ConfigMaps and Secrets are there) on the same node, without
+  its labels, annotations, owner references, init containers and probes (no Service sends it
+  traffic, no controller adopts it), every container sleeping instead of starting its app. A
+  distroless image has no `sleep`: an init container copies a static busybox (`busybox:1.37-musl`,
+  or the cluster's node shell image when set) into the copy, at `/.recouvrance-copy`, and the copy
+  runs and is read with it. The copy shows *copy of the pod* next to its files, and says that files
+  the container wrote while it ran are not there (it starts from the image again). It is deleted,
+  by its uid, when the page closes, on its *Delete the copy* button and when the app quits; it
+  stops by itself after an hour, and one left behind (the app killed) is deleted the next time the
+  app connects to its cluster (pods labelled `recouvrance/pod-copy` older than an hour). It needs
+  write mode and RBAC to create and delete pods in the namespace (greyed out with the reason
+  otherwise). Agents' `browse_files` reads running containers only.
 - **RBAC-aware**: actions your Kubernetes RBAC forbids are disabled; *My access* shows a can-i
   matrix for the namespace, and says when the cluster (webhook or cloud IAM authorizer) may allow
   more than it lists.
-- **Problems**: one list of what is broken across clusters (crash loops, pending pods, unavailable workloads, NotReady nodes, failed jobs, pending volumes, and alerts firing in the cluster's Prometheus that nobody silenced).
+- **Problems**: one list of what is broken across clusters (crash loops, pending pods, unavailable workloads, NotReady nodes, nodes such a taint keeps pods off for more than 5 minutes after they started, failed jobs, pending volumes, and alerts firing in the cluster's Prometheus that nobody silenced).
 - **Alerts where you look**: a namespace's page lists the alerts labeled with it, and a pod's, workload's, volume's or node's page the alerts about it (a pod's include its workload's, a workload's its pods'), with severity, summary, how long, runbook link, and silenced or inhibited ones muted when an Alertmanager is found.
 - **Upgrade check** (Cluster overview → *Upgrade check*): per cluster, what needs action before it
   moves to a newer minor version (the next one by default; the arrows pick another), most urgent first:
@@ -78,6 +137,14 @@
 
   Each finding links to its objects. A part that can't be read (the API server's metrics need `get`
   on `/metrics`) is named, and the rest is still checked.
+- **References to missing objects**: the Problems page lists what points to something that
+  doesn't exist, on the object that points to it: a Service that selects no pod (minor when its
+  Deployment or StatefulSet is scaled to 0) or no ready one, an Ingress whose backend Service,
+  its port or a TLS Secret is missing, an HTTPRoute whose backend Service is missing (when the
+  cluster serves the Gateway API). A pod stuck creating, a workload short of ready replicas or a
+  pending PVC says which ConfigMap, Secret, PVC, ServiceAccount or StorageClass it waits on
+  (`optional: true` references aren't needed, and a running pod needs none any more). Kinds that
+  can't be read are named, not reported missing.
 - **Stuck deletions**: the Problems page lists objects (pods, workloads, Jobs, PVCs, PVs,
   Namespaces, Argo CD Applications) whose deletion has waited more than 10 minutes, with the
   finalizers holding them (for a Namespace, the resources left); their Delete dialog offers to
@@ -105,6 +172,32 @@
   when it isn't); the row menu also opens the destination and asks for *Refresh*, *Hard refresh*
   or *Sync* (write mode and the Argo CD cluster's protection apply). An Argo CD cluster that
   can't be read is named above the list; the others are shown.
+- **Argo CD diagnosis**: an Application's page says what is wrong with it, worst first, each
+  with its objects (opening on the destination's context when it is connected) and what to do:
+  - *Being deleted*: the finalizers holding it (what each one waits for) and the resources not
+    deleted yet; red after 5 minutes.
+  - *Sync running* for more than 10 minutes: the hook or resource it waits for.
+  - *Last sync failed*: each object that failed and why, from Argo CD's messages: a hook that
+    failed, rejected by admission (a webhook, Pod Security), a webhook that did not answer, a
+    kind not served (CRD missing), a namespace that does not exist, a quota, RBAC, the
+    AppProject, an immutable field, an invalid manifest. Errors Argo CD reports
+    (`ComparisonError`...) too.
+  - *Sync loop*: the same revision synced 3 times or more within an hour by auto-sync (not by
+    a user), the resources it applies again each time, and the `ignoreDifferences` (with
+    `RespectIgnoreDifferences=true`) that would stop it, made from the fields that differ.
+  - *Out of sync*: each resource that differs, is missing or would be pruned, and whether git
+    moved since the last sync. With auto-sync off (a `*-workload` Application) it is said, not
+    as a problem.
+
+  For each out-of-sync resource, the fields that differ are shown as a diff, read on the
+  connected context that reaches the destination. Git's manifests can't be read through the
+  Kubernetes API (Argo CD serves its own diff behind its own login), so the live object is
+  compared with what was last applied to it (the `last-applied-configuration` Argo CD's sync
+  writes): defaults the API server adds are left out, quantities written another way (`1000m`
+  and `1`) are the same, items added to a list (an injected sidecar) are shown, and a
+  Secret's values never are. The field managers that wrote the object since the last sync are
+  named too (with server-side apply that is all there is). A destination that isn't connected
+  is said; open it to connect.
 - **Overviews**: cluster capacity and health, workloads status, Helm releases (values masked; install from your repos, roll back and uninstall through your `helm` CLI).
 - **API requests** (Settings → API requests): per cluster, how many requests of each kind
   (discovery, lists, watches, metrics, logs, shells, writes) were made, how many failed, and how

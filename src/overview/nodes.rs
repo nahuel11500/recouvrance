@@ -5,7 +5,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use serde_json::Value;
 
-use super::{Ctx, arr, card, clipped_list, field, heading, mono, row, s, usage_bar};
+use super::{Ctx, arr, card, clipped_list, field, heading, mono, row, s, tone_color, usage_bar};
 use crate::k8s;
 use crate::ui::selectable::selectable;
 
@@ -13,17 +13,23 @@ pub(super) fn node(obj: &Value, cx: &App) -> Div {
     let info = |k: &str| s(obj, &format!("/status/nodeInfo/{k}")).unwrap_or("-").to_string();
     let cap = |k: &str| s(obj, &format!("/status/capacity/{k}")).unwrap_or("-").to_string();
     let alloc = |k: &str| s(obj, &format!("/status/allocatable/{k}")).unwrap_or("-").to_string();
-    let taints: Vec<String> = arr(obj, "/spec/taints")
+    let text = |t: &Value, k: &str| t[k].as_str().unwrap_or_default().to_string();
+    let spec_taints: Vec<(String, String, String)> =
+        arr(obj, "/spec/taints").iter().map(|t| (text(t, "key"), text(t, "value"), text(t, "effect"))).collect();
+    // As kubectl prints them, and "none" rather than nothing: an empty field reads as not loaded.
+    let mut taints: Vec<String> = spec_taints
         .iter()
-        .map(|t| {
-            format!(
-                "{}={} ({})",
-                t["key"].as_str().unwrap_or("?"),
-                t["value"].as_str().unwrap_or(""),
-                t["effect"].as_str().unwrap_or("")
-            )
-        })
+        .map(|(k, v, e)| if v.is_empty() { format!("{k}:{e}") } else { format!("{k}={v}:{e}") })
         .collect();
+    if taints.is_empty() {
+        taints.push("none".into());
+    }
+    // kubectl's Status, with the taints that keep pods off it because something is wrong.
+    let status = crate::taints::node_status(
+        arr(obj, "/status/conditions").iter().find(|c| c["type"] == "Ready").and_then(|c| c["status"].as_str()),
+        obj.pointer("/spec/unschedulable").and_then(Value::as_bool).unwrap_or(false),
+        &crate::taints::trouble_labels(spec_taints.iter().map(|(k, _, e)| (k.as_str(), e.as_str()))),
+    );
     let addresses: Vec<String> = arr(obj, "/status/addresses")
         .iter()
         .map(|a| format!("{}: {}", a["type"].as_str().unwrap_or("?"), a["address"].as_str().unwrap_or("?")))
@@ -32,6 +38,11 @@ pub(super) fn node(obj: &Value, cx: &App) -> Div {
         .child(
             row()
                 .pt_4()
+                .child(field(
+                    "Status",
+                    div().text_color(tone_color(crate::status::node_tone(&status), cx)).child(status),
+                    cx,
+                ))
                 .child(field("Kubelet", info("kubeletVersion"), cx))
                 .child(field("OS image", info("osImage"), cx))
                 .child(field("Kernel", info("kernelVersion"), cx))

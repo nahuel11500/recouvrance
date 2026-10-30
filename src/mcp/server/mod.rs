@@ -172,7 +172,7 @@ fn describe(a: &Access) -> String {
 
 /// Arguments that change what a call does, for the approval banner: what the user
 /// approves is what runs. Values come from the (redacted) logged arguments.
-const KEY_ARGS: [&str; 11] = [
+const KEY_ARGS: [&str; 12] = [
     "command",
     "path",
     "patch",
@@ -183,6 +183,7 @@ const KEY_ARGS: [&str; 11] = [
     "image",
     "port",
     "minutes",
+    "debug",
     "dry_run",
 ];
 /// Most log bytes one `get_logs` call returns.
@@ -720,7 +721,9 @@ pub struct GitOpsParams {
     pub kind: String,
     pub namespace: String,
     pub name: String,
-    #[schemars(description = "reconcile (Flux) · refresh, hard_refresh or sync (Argo CD) · suspend or resume (Flux)")]
+    #[schemars(
+        description = "reconcile (Flux) · refresh, hard_refresh or sync (Argo CD) · suspend or resume (Flux) · diagnose (Argo CD, read only)"
+    )]
     pub action: String,
 }
 

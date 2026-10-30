@@ -33,6 +33,7 @@ impl AppView {
         self.kinds.clear();
         self.watch = None;
         self.metrics = None;
+        self.recording = Vec::new();
         // Watch errors name the old clusters, and would hide "Connecting…" and new failures.
         self.list = super::live_list::LiveList::default();
         // The problem badge counted the old clusters.
@@ -124,6 +125,10 @@ impl AppView {
                             this.ns_picker.update(cx, |p, _| p.context = first);
                         }
                         this.client = Some(client);
+                        // Copies of pods left behind by a run of the app that was killed.
+                        for (name, client) in &clusters {
+                            k8s::pod_copy::clean_up(name, client.clone(), crate::settings::cluster(name).namespaces);
+                        }
                         this.clusters = clusters;
                         let keep = this.kind.as_ref().map(Kind::key);
                         let wanted = dev_var("RECOUVRANCE_KIND").and_then(|q| k8s::find_kind(&kinds, &q).cloned());
@@ -143,6 +148,12 @@ impl AppView {
                         this.settings_view.update(cx, |s, _| s.set_kinds(kinds.clone()));
                         this.kinds = kinds;
                         this.problems.start(this.clusters.clone(), this.cluster_kinds(), cx);
+                        // The timeline: the connected contexts' records, their own watches.
+                        for (c, _) in &this.clusters {
+                            crate::timeline::open(c);
+                        }
+                        this.recording =
+                            crate::timeline::start_watches(&this.clusters, &this.kinds, &this.kind_clusters);
                         this.set_namespaces(namespaces, window, cx);
                         this.restart_watch(cx);
                         if dev_var("RECOUVRANCE_PAGE").is_none() {
@@ -162,6 +173,7 @@ impl AppView {
                             Some("terminal") => this.open_terminal(window, cx),
                             Some("apply") => this.open_apply(window, cx),
                             Some("problems") => this.open_problems(window, cx),
+                            Some("timeline") => this.open_timeline(window, cx),
                             Some("access") => this.open_access(window, cx),
                             Some("helm-install") => this.open_helm_install(window, cx),
                             Some("assistant") => this.open_assistant(window, cx),

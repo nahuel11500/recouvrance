@@ -1,6 +1,8 @@
 //! "What is broken?": problems found from kubectl's own tables (cheap even on
 //! very large clusters), for the Problems page and the `find_problems` MCP tool.
 
+mod references;
+
 use kube::Client;
 
 use crate::k8s::{self, ColumnDef, Kind, Row};
@@ -121,9 +123,14 @@ pub fn judge(kind: &Kind, defs: &[ColumnDef], row: &Row) -> Option<(Severity, St
         }
         ("", "Node") => {
             let status = c("Status");
+            // The labels of the taints that keep pods off it because something is wrong
+            // (`CiliumAgentNotReady`); a new node has some for a moment while it starts.
+            let tainted: Vec<&str> = crate::taints::labels_in(status).collect();
             if status.split(',').any(|s| s == "NotReady" || s == "Unknown") {
                 Some((Severity::Critical, status.into()))
-            } else if status.contains("SchedulingDisabled") {
+            } else if !tainted.is_empty() && older_than(row, 300) {
+                Some((Severity::Warning, format!("tainted {}: no new pods", tainted.join(", "))))
+            } else if status.split(',').any(|s| s == "SchedulingDisabled") {
                 Some((Severity::Info, "cordoned".into()))
             } else {
                 None
@@ -143,7 +150,9 @@ pub fn judge(kind: &Kind, defs: &[ColumnDef], row: &Row) -> Option<(Severity, St
 /// Kinds checked, in display order. Namespaces, PersistentVolumes and Argo CD Applications
 /// only for deletions stuck; a kind the cluster doesn't serve is left out. The
 /// external-secrets.io ones are judged from their objects (`external_secrets::problems`).
-pub const CHECKED: [(&str, &str); 13] = [
+/// Services, Ingresses and HTTP routes for what they point to that is missing, together
+/// (`references::traffic`).
+pub const CHECKED: [(&str, &str); 16] = [
     ("", "Node"),
     ("", "Namespace"),
     ("apps", "Deployment"),
@@ -151,6 +160,9 @@ pub const CHECKED: [(&str, &str); 13] = [
     ("apps", "DaemonSet"),
     ("", "Pod"),
     ("batch", "Job"),
+    ("", "Service"),
+    ("networking.k8s.io", "Ingress"),
+    (references::GATEWAY, "HTTPRoute"),
     ("", "PersistentVolumeClaim"),
     ("", "PersistentVolume"),
     ("argoproj.io", "Application"),
@@ -180,6 +192,12 @@ impl Scan {
             })
             .collect();
         (!parts.is_empty()).then(|| parts.join(", "))
+    }
+
+    /// Add another scan's problems and skipped kinds.
+    fn absorb(&mut self, other: Self) {
+        self.problems.extend(other.problems);
+        self.skipped.extend(other.skipped);
     }
 }
 
@@ -275,8 +293,15 @@ async fn held(client: &Client, kind: &Kind, namespace: Option<&str>, name: &str)
 /// Requests at once to read the objects found deleting.
 const HELD_PARALLEL: usize = 16;
 
-/// Problems of one kind, from its table; `namespace`: the one scanned, if any.
-async fn scan_kind(client: Client, kind: Kind, namespace: Option<String>) -> anyhow::Result<Vec<Problem>> {
+/// Problems of one kind, from its table; `namespace`: the one scanned, if any. Skipped:
+/// what could not be read to say why (the references of a pod stuck creating). With the
+/// `context` named, the timeline records what the list shows changed.
+async fn scan_kind(
+    client: Client,
+    kind: Kind,
+    namespace: Option<String>,
+    context: Option<String>,
+) -> anyhow::Result<Scan> {
     use futures::StreamExt as _;
     let problem = |namespace: Option<String>, name: String, severity, reason, age| Problem {
         severity,
@@ -290,17 +315,21 @@ async fn scan_kind(client: Client, kind: Kind, namespace: Option<String>) -> any
     // One namespace: its own object, not every namespace.
     if let Some(ns) = namespace.as_deref().filter(|_| kind.is("", "Namespace")) {
         let held = held(&client, &kind, None, ns).await?;
-        return Ok(held
+        let problems = held
             .and_then(|h| {
                 let reason = stuck_reason(&kind, h.deleted, &h.finalizers, &h.why)?;
                 Some(problem(None, ns.to_string(), Severity::Warning, reason, h.created))
             })
             .into_iter()
-            .collect());
+            .collect();
+        return Ok(Scan { problems, skipped: Vec::new() });
     }
     // Big lists come from their cells alone: a small part of the bytes.
-    let (defs, rows) = k8s::list_light(client.clone(), kind.clone(), namespace, true).await?;
+    let tap = context.and_then(|c| crate::timeline::tap(&c, &kind, namespace.clone()));
+    let (defs, rows) = k8s::list_light(client.clone(), kind.clone(), namespace.clone(), true, tap).await?;
     let mut found = Vec::new();
+    // The problems that may come from a missing reference: their objects are read to say.
+    let mut dangling = Vec::new();
     let mut stuck = Vec::new();
     for r in &rows {
         if deleting(&defs, r) {
@@ -311,6 +340,9 @@ async fn scan_kind(client: Client, kind: Kind, namespace: Option<String>) -> any
             continue;
         }
         if let Some((severity, reason)) = judge(&kind, &defs, r) {
+            if references::may_dangle(&kind, &defs, r) {
+                dangling.push(found.len());
+            }
             found.push(problem(r.namespace.clone(), r.name.clone(), severity, reason, r.created));
         }
     }
@@ -339,27 +371,41 @@ async fn scan_kind(client: Client, kind: Kind, namespace: Option<String>) -> any
             found.push(problem(r.namespace.clone(), r.name.clone(), Severity::Warning, reason, r.created));
         }
     }
-    Ok(found)
+    let skipped = references::explain(&client, &kind, namespace.as_deref(), &mut found, &dangling).await;
+    Ok(Scan { problems: found, skipped })
 }
 
 /// Problems in a cluster (or one namespace), worst first, from every kind that
-/// could be listed: one kind refused (403) does not hide the others.
-pub async fn scan_partial(client: Client, kinds: &[Kind], namespace: Option<String>) -> Scan {
-    let jobs = CHECKED.iter().filter_map(|(g, k)| kinds.iter().find(|x| x.is(g, k)).cloned()).map(|kind| {
-        let (client, ns, label) = (client.clone(), namespace.clone(), kind.label.clone());
-        async move {
-            if kind.ar.group == crate::external_secrets::GROUP {
-                return crate::external_secrets::problems(client, &kind, ns).await.map_err(|e| (label, e));
+/// could be listed: one kind refused (403) does not hide the others. `context`: the app's
+/// own scans name it, for the timeline (see `scan_kind`).
+pub async fn scan_partial(client: Client, kinds: &[Kind], namespace: Option<String>, context: Option<&str>) -> Scan {
+    let with_services = references::with_services(kinds);
+    let jobs = CHECKED
+        .iter()
+        // Checked with the Services they point to.
+        .filter(|kind| !references::WITH_SERVICES.contains(kind))
+        .filter_map(|(g, k)| kinds.iter().find(|x| x.is(g, k)).cloned())
+        .map(|kind| {
+            let (client, ns, label) = (client.clone(), namespace.clone(), kind.label.clone());
+            // Owned: a future borrowing `kinds` here would not be `Send` for the agents' server.
+            let (ingress, route) = with_services.clone();
+            let context = context.map(String::from);
+            async move {
+                let scan = if kind.ar.group == crate::external_secrets::GROUP {
+                    crate::external_secrets::problems(client, &kind, ns)
+                        .await
+                        .map(|problems| Scan { problems, skipped: Vec::new() })
+                } else if kind.is("", "Service") {
+                    Ok(references::traffic(client, &kind, ingress.as_ref(), route.as_ref(), ns).await)
+                } else {
+                    scan_kind(client, kind, ns, context).await
+                };
+                scan.unwrap_or_else(|e| Scan { problems: Vec::new(), skipped: vec![(label, e)] })
             }
-            scan_kind(client, kind, ns).await.map_err(|e| (label, e))
-        }
-    });
+        });
     let mut out = Scan::default();
-    for r in futures::future::join_all(jobs).await {
-        match r {
-            Ok(found) => out.problems.extend(found),
-            Err(skipped) => out.skipped.push(skipped),
-        }
+    for scan in futures::future::join_all(jobs).await {
+        out.absorb(scan);
     }
     out.problems
         .sort_by(|a, b| a.severity.cmp(&b.severity).then(a.namespace.cmp(&b.namespace)).then(a.name.cmp(&b.name)));
@@ -369,17 +415,17 @@ pub async fn scan_partial(client: Client, kinds: &[Kind], namespace: Option<Stri
 /// Problems in the namespaces a user may read, for a cluster that may not list
 /// cluster-wide; the whole cluster when `namespaces` is empty. Cluster-scoped kinds
 /// (Nodes) are read once, namespaced ones in each namespace, and a Namespace in itself.
-pub async fn scan_namespaces(client: Client, kinds: &[Kind], namespaces: &[String]) -> Scan {
+pub async fn scan_namespaces(client: Client, kinds: &[Kind], namespaces: &[String], context: Option<&str>) -> Scan {
     if namespaces.is_empty() {
-        return scan_partial(client, kinds, None).await;
+        return scan_partial(client, kinds, None, context).await;
     }
     let (cluster, namespaced): (Vec<Kind>, Vec<Kind>) =
         kinds.iter().cloned().partition(|k| !k.namespaced && !k.is("", "Namespace"));
     let (whole, per_ns) = futures::join!(
-        scan_partial(client.clone(), &cluster, None),
+        scan_partial(client.clone(), &cluster, None, context),
         futures::future::join_all(namespaces.iter().map(|ns| {
             let (client, namespaced) = (client.clone(), &namespaced);
-            async move { (ns, scan_partial(client, namespaced, Some(ns.clone())).await) }
+            async move { (ns, scan_partial(client, namespaced, Some(ns.clone()), context).await) }
         })),
     );
     let mut out = whole;
@@ -484,6 +530,31 @@ mod tests {
         let d = defs(&["Name", "Status"]);
         assert_eq!(judge(&node, &d, &row(&["n", "Ready,SchedulingDisabled"])).map(|j| j.0), Some(Severity::Info));
         assert_eq!(judge(&node, &d, &row(&["n", "NotReady"])).map(|j| j.0), Some(Severity::Critical));
+        assert_eq!(judge(&node, &d, &row(&["n", "Ready"])), None);
+    }
+
+    #[test]
+    fn tainted_nodes_are_warnings_once_started() {
+        let node = kind("", "Node");
+        let d = defs(&["Name", "Status"]);
+        let at = |status: &str, secs: i64| {
+            let mut r = row(&["n", status]);
+            r.created = ago(secs);
+            judge(&node, &d, &r)
+        };
+        assert_eq!(
+            at("Ready,CiliumAgentNotReady", 3600),
+            Some((Severity::Warning, "tainted CiliumAgentNotReady: no new pods".into()))
+        );
+        assert_eq!(
+            at("Ready,SchedulingDisabled,ToBeDeleted,Disrupted", 3600),
+            Some((Severity::Warning, "tainted ToBeDeleted, Disrupted: no new pods".into()))
+        );
+        // A node starting: its network agent and cloud set-up taints come off in a moment.
+        assert_eq!(at("Ready,CiliumAgentNotReady", 60), None);
+        assert_eq!(at("Ready,SchedulingDisabled,Uninitialized", 60).map(|j| j.0), Some(Severity::Info));
+        // Not ready says more than its taints.
+        assert_eq!(at("NotReady,CiliumAgentNotReady", 3600).map(|j| j.0), Some(Severity::Critical));
     }
 
     /// A cluster that may list nodes and the pods of namespace `a` only, and records
@@ -538,7 +609,7 @@ mod tests {
         let mut node = kind("", "Node");
         node.namespaced = false;
         let kinds = [node, kind("", "Pod")];
-        let scan = scan_namespaces(client, &kinds, &["a".into(), "b".into()]).await;
+        let scan = scan_namespaces(client, &kinds, &["a".into(), "b".into()], None).await;
         let found: Vec<(&str, Option<&str>)> =
             scan.problems.iter().map(|p| (p.name.as_str(), p.namespace.as_deref())).collect();
         assert_eq!(found, [("n1", None), ("p1", Some("a"))]);
@@ -734,7 +805,7 @@ mod tests {
         app.ar.api_version = "argoproj.io/v1alpha1".into();
         let mut ns = kind("", "Namespace");
         ns.namespaced = false;
-        let scan = scan_namespaces(client, &[ns, app], &["argocd".into()]).await;
+        let scan = scan_namespaces(client, &[ns, app], &["argocd".into()], None).await;
         assert!(scan.skipped.is_empty(), "{:?}", scan.skipped_text());
         let found: Vec<(&str, &str)> = scan.problems.iter().map(|p| (p.name.as_str(), p.reason.as_str())).collect();
         assert_eq!(

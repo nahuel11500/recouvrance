@@ -28,7 +28,8 @@ pub const WRITES_OFF: &str = "write actions are off: turn them on to change the 
 /// Whether a request changes the cluster or opens a shell in it, and so needs write mode.
 /// Reads, watches, logs and port-forwards don't; neither do server-side dry runs, the
 /// permission checks (`SelfSubjectAccessReview`, `SelfSubjectRulesReview`, who am I) and
-/// the removal of a node shell pod, which must go even after write mode is turned off.
+/// the removal of a node shell pod or of a copy of a pod (`pod_copy`), which must go even
+/// after write mode is turned off.
 pub fn needs_writes(method: &http::Method, path: &str, query: &str) -> bool {
     let stream = path.ends_with("/exec") || path.ends_with("/attach");
     if *method == http::Method::GET {
@@ -46,7 +47,17 @@ pub fn needs_writes(method: &http::Method, path: &str, query: &str) -> bool {
     }
     let node_shell_cleanup = *method == http::Method::DELETE
         && path.starts_with(&format!("/api/v1/namespaces/{}/pods/recouvrance-node-shell-", crate::k8s::NODE_SHELL_NS));
-    !node_shell_cleanup
+    let copy_cleanup = *method == http::Method::DELETE && is_pod_copy(path);
+    !node_shell_cleanup && !copy_cleanup
+}
+
+/// Whether `path` is a copy of a pod made to read its files, in any namespace.
+fn is_pod_copy(path: &str) -> bool {
+    let Some(rest) = path.strip_prefix("/api/v1/namespaces/") else { return false };
+    match rest.split('/').collect::<Vec<_>>().as_slice() {
+        [ns, "pods", name] => !ns.is_empty() && name.starts_with(crate::k8s::pod_copy::NAME_PREFIX),
+        _ => false,
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -120,5 +131,15 @@ mod tests {
         let shell = format!("/api/v1/namespaces/{}/pods/recouvrance-node-shell-abc123", crate::k8s::NODE_SHELL_NS);
         assert!(!needs_writes(&Method::DELETE, &shell, ""));
         assert!(needs_writes(&Method::DELETE, "/api/v1/namespaces/shop/pods/recouvrance-node-shell-abc123", ""));
+        // Nor is removing a copy of a pod, in any namespace; only a pod, and only removing it.
+        let copy = "/api/v1/namespaces/shop/pods/recouvrance-copy-abc123-web-1";
+        assert!(!needs_writes(&Method::DELETE, copy, ""));
+        assert!(needs_writes(&Method::POST, "/api/v1/namespaces/shop/pods", ""));
+        assert!(needs_writes(&Method::PATCH, copy, ""));
+        assert!(needs_writes(&Method::GET, &format!("{copy}/exec"), "command=sh"));
+        assert!(needs_writes(&Method::DELETE, &format!("{copy}/ephemeralcontainers"), ""));
+        assert!(needs_writes(&Method::DELETE, "/api/v1/namespaces/shop/configmaps/recouvrance-copy-abc123", ""));
+        assert!(needs_writes(&Method::DELETE, "/api/v1/namespaces/shop/pods/web-recouvrance-copy-1", ""));
+        assert!(needs_writes(&Method::DELETE, "/api/v1/namespaces/shop/pods", "labelSelector=recouvrance-copy-x"));
     }
 }

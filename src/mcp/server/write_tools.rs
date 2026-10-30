@@ -10,9 +10,12 @@ use super::{
     ApplyParams, DeleteParams, DrainParams, ExecParams, GitOpsParams, KubeMcp, PatchParams, RestartParams, ScaleParams,
     access_for, denied_namespaces, denies_eviction, manifest_objects, manifest_summary, require_ns,
 };
+use std::sync::Arc;
+
 use crate::k8s;
 use crate::k8s::Kind;
-use crate::mcp::{Mode, Verb};
+use crate::k8s::argo::diagnosis::{self, Diagnosis, DriftRead, MayRead, Res};
+use crate::mcp::{Mode, Policy, Verb};
 
 #[tool_router(router = write_tools, vis = "pub(super)")]
 impl KubeMcp {
@@ -200,7 +203,7 @@ impl KubeMcp {
     }
 
     #[tool(
-        description = "GitOps actions: Flux `reconcile` (like `flux reconcile`), `suspend`, `resume`; Argo CD Application `refresh`, `hard_refresh` (renders its manifests again, without Argo CD's cache) or `sync`. Authorized as `patch` on the object."
+        description = "GitOps actions: Flux `reconcile` (like `flux reconcile`), `suspend`, `resume`; Argo CD Application `refresh`, `hard_refresh` (renders its manifests again, without Argo CD's cache) or `sync`, authorized as `patch` on the object. Argo CD `diagnose` changes nothing (authorized as `get`): why the Application drifts, keeps syncing (a sync loop, with the `ignoreDifferences` that would stop it), failed (hook, admission, missing CRD...) or is stuck (a long sync, a finalizer holding its deletion), and for each out-of-sync resource the fields that differ between what was last applied and the live object on its destination, with who wrote them since the last sync. The destination's objects are read only where your rules allow `get`."
     )]
     async fn gitops(
         &self,
@@ -215,15 +218,18 @@ impl KubeMcp {
         let argo = kind.is("argoproj.io", "Application");
         let ok = match p.action.as_str() {
             "reconcile" | "suspend" | "resume" => flux,
-            "refresh" | "hard_refresh" | "sync" => argo,
+            "refresh" | "hard_refresh" | "sync" | "diagnose" => argo,
             _ => false,
         };
         if !ok {
             return call.finish(Err(anyhow::anyhow!(
-                "`{}` does not apply to {} (Flux: reconcile/suspend/resume; Argo CD applications: refresh/hard_refresh/sync)",
+                "`{}` does not apply to {} (Flux: reconcile/suspend/resume; Argo CD applications: refresh/hard_refresh/sync/diagnose)",
                 p.action,
                 kind.ar.kind
             )));
+        }
+        if p.action == "diagnose" {
+            return self.argo_diagnose(call, client, kind, &p.context, &p.namespace, &p.name).await;
         }
         let access = access_for(&kind, &p.context, Verb::Patch, Some(p.namespace.clone()), Some(p.name.clone()));
         self.authorize(&mut call, &access).await?;
@@ -260,6 +266,80 @@ impl KubeMcp {
 pub(super) type Planned = (Kind, Option<String>, String, serde_json::Value);
 
 impl KubeMcp {
+    /// `gitops` `diagnose`: what is wrong with an Argo CD Application, read only. The
+    /// Application needs `get`; each object of its destination is read only where the rules
+    /// allow `get` on it without asking (the others are named as not read).
+    async fn argo_diagnose(
+        &self,
+        mut call: super::Call,
+        client: kube::Client,
+        kind: Kind,
+        context: &str,
+        namespace: &str,
+        name: &str,
+    ) -> Result<String, String> {
+        let access = access_for(&kind, context, Verb::Get, Some(namespace.to_string()), Some(name.to_string()));
+        self.authorize(&mut call, &access).await?;
+        let obj = k8s::ObjectRef {
+            kind: kind.clone(),
+            name: name.to_string(),
+            namespace: Some(namespace.to_string()),
+            uid: String::new(),
+        };
+        let app = match k8s::get_object(client, obj).await {
+            Ok(v) => v,
+            Err(e) => return call.finish(Err(e)),
+        };
+        if let Err(e) = super::check_identity(&kind, Some(namespace), name, &app) {
+            return call.finish(Err(e));
+        }
+        let d = Diagnosis::of(&app, jiff::Timestamp::now());
+        let (dest, _) = k8s::argo::destination_of(app.clone(), context.to_string(), Vec::new()).await;
+        let s = k8s::argo::Summary::of(&app);
+        let head = format!(
+            "Application {namespace}/{name} on {context}: {}, {}, auto-sync {}; deploys to {}",
+            s.sync,
+            s.health,
+            if s.automated { "on" } else { "off" },
+            k8s::argo::destination_text(&dest.cluster, &dest.namespace)
+        );
+        let (policy, approved) = (call.policy().clone(), call.approved_rules().to_vec());
+        let read = self.argo_drift(policy, approved, &dest.contexts, &d).await;
+        call.finish(Ok(diagnosis::report(&head, &d, &read)))
+    }
+
+    /// The drift of what `d` compares, read on the first context reaching the destination
+    /// that the agent's rules (`policy`, with the rules it approved) name.
+    async fn argo_drift(&self, policy: Policy, approved: Vec<usize>, contexts: &[String], d: &Diagnosis) -> DriftRead {
+        let Some(on) = contexts.iter().find(|c| policy.context_allowed(c)) else {
+            let note = if contexts.is_empty() {
+                "no context of the kubeconfig reaches its destination, so its objects were not read".to_string()
+            } else {
+                format!("your rules allow none of the contexts that reach its destination ({})", contexts.join(", "))
+            };
+            return DriftRead { note: Some(note), ..Default::default() };
+        };
+        let mut read = DriftRead { context: Some(on.clone()), ..Default::default() };
+        if d.to_compare.is_empty() {
+            return read;
+        }
+        let (client, kinds) = match self.hub.client(on).await {
+            Ok(c) => c,
+            Err(e) => {
+                read.note = Some(format!("{on} could not be reached: {}", k8s::short_error(&e)));
+                return read;
+            }
+        };
+        let context = on.clone();
+        let may_read: MayRead = Arc::new(move |kind: &Kind, res: &Res| {
+            let ns = (!res.namespace.is_empty()).then(|| res.namespace.clone());
+            super::visible(&policy, &approved, &access_for(kind, &context, Verb::Get, ns, Some(res.name.clone())))
+        });
+        read.drifts =
+            diagnosis::read_drift(client, on.clone(), Some(kinds), d.to_compare.clone(), d.since, may_read).await;
+        read
+    }
+
     /// Parse a manifest and resolve every object (kind, namespace, a valid name) before
     /// anything is asked or changed.
     pub(super) async fn plan_manifest(

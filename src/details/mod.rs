@@ -423,6 +423,10 @@ impl DetailPanel {
                 let exec =
                     k8s::can_i(client.clone(), kind.clone(), "create", ns.clone(), Some(name.clone()), Some("exec"));
                 checks.push(("exec", exec));
+                // A container that isn't running is read from a copy of the pod, deleted after.
+                checks.push(("copy", k8s::can_i(client.clone(), kind.clone(), "create", ns.clone(), None, None)));
+                checks
+                    .push(("copy-delete", k8s::can_i(client.clone(), kind.clone(), "delete", ns.clone(), None, None)));
             }
             // A ServiceAccount's kubeconfig asks for a token (`create serviceaccounts/token`).
             if kind.is("", "ServiceAccount") {
@@ -450,6 +454,10 @@ impl DetailPanel {
             let _ = this.update(cx, |this, cx| {
                 if let Some(files) = &this.files {
                     files.update(cx, |f, cx| f.set_exec_denied(denied.contains("exec"), cx));
+                    files.update(cx, |f, cx| f.set_debug_denied(denied.contains("debug"), cx));
+                    files.update(cx, |f, cx| {
+                        f.set_copy_denied(denied.contains("copy"), denied.contains("copy-delete"), cx);
+                    });
                 }
                 this.denied = denied;
                 cx.notify();
@@ -685,11 +693,10 @@ impl DetailPanel {
                 let Ok(Some(obj)) = this.update(cx, |this, _| this.object.clone().filter(|_| !this.deleted)) else {
                     break;
                 };
-                // Where an Application deploys is shown on a connected context first.
-                let connected: Vec<String> = this
-                    .update(cx, |this, _| this.clusters.iter().map(|(n, _)| n.clone()).collect())
-                    .unwrap_or_default();
-                let related = fetch_related(client.clone(), &context, &kind, ns.clone(), &obj, connected).await;
+                // Where an Application deploys is shown on a connected context first, and its
+                // resources are read there.
+                let clusters = this.update(cx, |this, _| this.clusters.clone()).unwrap_or_default();
+                let related = fetch_related(client.clone(), &context, &kind, ns.clone(), &obj, clusters).await;
                 let indexed = obj.clone();
                 let mut related = exec
                     .spawn(async move {
@@ -925,6 +932,7 @@ impl DetailPanel {
         if let Some(files) = &self.files {
             let (names, default) = (k8s::pod_containers(value), k8s::default_container(value));
             files.update(cx, |f, cx| f.set_containers(names, default, window, cx));
+            files.update(cx, |f, cx| f.set_pod(value, cx));
         }
         let Some(logs) = &self.logs else { return };
         let pods = own_pod_logs(&self.obj.name, value);

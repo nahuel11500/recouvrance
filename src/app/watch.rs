@@ -74,6 +74,7 @@ impl AppView {
         self.table.update(cx, |t, cx| {
             t.delegate_mut().pods = is_pod;
             t.delegate_mut().ingresses = kind.is("networking.k8s.io", "Ingress");
+            t.delegate_mut().nodes = kind.is("", "Node");
             t.delegate_mut().row_actions = actions;
             t.delegate_mut().reset(
                 show_ns,
@@ -123,6 +124,8 @@ impl AppView {
                 Arc::new(self.column_prefs.custom(&kind.kubectl_name())),
                 pause.clone(),
                 progressive,
+                // The timeline records what this list sees change (no request added).
+                crate::timeline::tap(&ctx_name, &kind, ns.clone()),
             );
             let shown = pause.clone();
             let task = cx.spawn(async move |this, cx| {

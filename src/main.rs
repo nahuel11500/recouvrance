@@ -32,7 +32,9 @@ mod schema;
 mod settings;
 mod status;
 mod table;
+mod taints;
 mod templates;
+mod timeline;
 mod ui;
 mod upgrade;
 mod yaml;
@@ -92,6 +94,12 @@ fn main() {
         let mode = app::initial_theme(cx);
         app::apply_theme(mode, None, cx);
         app::open_main_window(cx);
+        // Copies of pods made to read their files go with the app (a few seconds at most).
+        cx.on_app_quit(|_| {
+            k8s::pod_copy::remove_all_now(std::time::Duration::from_secs(5));
+            async {}
+        })
+        .detach();
         cx.activate(true);
     });
 }

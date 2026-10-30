@@ -877,6 +877,55 @@ fn an_agent_checks_an_upgrade() {
     });
 }
 
+/// A pod waiting on a ConfigMap that doesn't exist shows in `find_problems` with the
+/// ConfigMap it misses; an optional one it also names isn't reported.
+#[test]
+#[ignore]
+fn an_agent_finds_a_pod_s_missing_config_map() {
+    use k8s_openapi::api::core::v1::Pod;
+
+    run(async {
+        let ctx = context();
+        let pods: Api<Pod> = Api::namespaced(k8s::connect_for_agents(ctx.clone()).await?, NS);
+        let name = "e2e-dangling";
+        let _ = pods.delete(name, &DeleteParams::default().grace_period(0)).await;
+        for _ in 0..60 {
+            if pods.get_opt(name).await?.is_none() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+        let pod = json!({
+            "metadata": {"name": name, "namespace": NS},
+            "spec": {"containers": [{"name": "main", "image": "busybox:1.37", "command": ["sleep", "3600"],
+                "envFrom": [
+                    {"configMapRef": {"name": "e2e-missing-config"}},
+                    {"configMapRef": {"name": "e2e-optional-config", "optional": true}},
+                ]}]},
+        });
+        pods.create(&PostParams::default(), &serde_json::from_value(pod)?).await?;
+        let checked = async {
+            let (hub, _agent, token, _server) = agent(&["get,list *"], &[]).await?;
+            let mcp = crate::assistant::Mcp::connect(hub.port(), token).await?;
+            let mut out = String::new();
+            for _ in 0..90 {
+                out = mcp.call("find_problems", json!({"context": ctx, "namespace": NS})).await;
+                if out.lines().any(|l| l.contains(name) && l.contains("missing ConfigMap e2e-missing-config")) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
+            let line = out.lines().find(|l| l.contains(name)).with_context(|| out.clone())?;
+            assert!(line.contains("missing ConfigMap e2e-missing-config"), "{out}");
+            assert!(!line.contains("e2e-optional-config"), "{out}");
+            Ok(())
+        };
+        let result: Result<()> = checked.await;
+        let _ = pods.delete(name, &DeleteParams::default().grace_period(0)).await;
+        result
+    });
+}
+
 /// The reachability check reads the real cluster through the agent's rules: a Service that
 /// selects no pods breaks at its selector, an Ingress sending to a port its Service lacks
 /// breaks at that backend, and the TLS Secret the rules hide is not read.
@@ -999,6 +1048,371 @@ fn the_files_tab_reads_a_container() {
         for name in names {
             let _ = pods.delete(name, &DeleteParams::default().grace_period(0)).await;
         }
+        result
+    });
+}
+
+/// The timeline records what a list's watch sees change, from the metadata alone: a label
+/// set by someone (and who), then the deletion. The agents' `get_changes` returns the record
+/// with its source.
+#[test]
+#[ignore]
+fn the_timeline_records_what_a_watch_sees_change() {
+    run(async {
+        use futures::StreamExt as _;
+        let ctx = context();
+        let client = k8s::connect_for_agents(ctx.clone()).await?;
+        let cms: Api<ConfigMap> = Api::namespaced(client.clone(), NS);
+        let name = "e2e-timeline";
+        let _ = cms.delete(name, &DeleteParams::default()).await;
+        let created = cms.create(&PostParams::default(), &config_map(name)).await?;
+        let uid = created.metadata.uid.clone().unwrap_or_default();
+        let checked = async {
+            let kinds = k8s::discover(client.clone()).await?;
+            let kind = k8s::find_kind(&kinds, "configmaps").cloned().context("no configmaps")?;
+            let tap = crate::timeline::tap(&ctx, &kind, Some(NS.into())).context("configmaps are recorded")?;
+            // As the app's list does, its rows held back.
+            let pause = k8s::Pause::default();
+            pause.set(true);
+            let (_watch, mut rx) =
+                k8s::watch_table_paused(client.clone(), kind, Some(NS.into()), Arc::default(), pause, false, Some(tap));
+            while let Some(msg) = rx.next().await {
+                if matches!(msg, k8s::TableMsg::Listed) {
+                    break;
+                }
+            }
+            let _drain = k8s::spawn_guarded(async move { while rx.next().await.is_some() {} });
+            let recorded = || crate::timeline::changes_for(&ctx, "configmaps", Some(NS), name, &uid);
+            assert!(recorded().is_empty(), "the first list only notes what is there");
+
+            let by = PatchParams { field_manager: Some("e2e-editor".into()), ..Default::default() };
+            cms.patch(name, &by, &Patch::Merge(json!({"metadata": {"labels": {"tier": "front"}}}))).await?;
+            let mut found = Vec::new();
+            for _ in 0..60 {
+                found = recorded();
+                if !found.is_empty() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+            let summaries: Vec<&str> = found.iter().map(|c| c.summary.as_str()).collect();
+            assert_eq!(summaries, ["labels changed: tier by e2e-editor"]);
+            let diff = found[0].diff.as_ref().map(|d| d.short(5)).unwrap_or_default();
+            assert!(diff.contains("tier: front"), "{diff}");
+
+            let (hub, _agent, token, _server) = agent(&["get,list *"], &[]).await?;
+            let mcp = crate::assistant::Mcp::connect(hub.port(), token).await?;
+            let target = json!({"context": ctx, "kind": "configmaps", "namespace": NS, "name": name});
+            let out = mcp.call("get_changes", target).await;
+            assert!(out.contains("Recorded  ConfigMap e2e-timeline: labels changed: tier by e2e-editor"), "{out}");
+
+            cms.delete(name, &DeleteParams::default()).await?;
+            for _ in 0..60 {
+                if recorded().iter().any(|c| c.summary == "deleted") {
+                    return Ok(());
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+            let summaries: Vec<String> = recorded().into_iter().map(|c| c.summary).collect();
+            bail!("the deletion was not recorded: {summaries:?}")
+        };
+        let result: Result<()> = checked.await;
+        let _ = cms.delete(name, &DeleteParams::default()).await;
+        result
+    });
+}
+
+/// A container without a shell (`pause`, a scratch image like distroless) is read through a
+/// debug container: exec finds no shell, the debug container added shares its processes, and
+/// its files read through `/proc/<pid>/root`, a mounted volume and absolute symlinks included.
+/// Browsing again reuses it. The same in a namespace enforcing Pod Security `restricted`, as
+/// the container's user. An agent's `browse_files` does it with `debug` and the exec rule.
+#[test]
+#[ignore]
+fn a_container_without_a_shell_is_read_through_a_debug_container() {
+    use k8s_openapi::api::core::v1::{Namespace, Pod};
+
+    use crate::k8s::files::debug::{self, Look};
+    use crate::k8s::files::{FileSource, Origin};
+
+    /// What the init container leaves in the shared volume: a file and a folder, and absolute
+    /// symlinks to them, which only resolve from the container's own root.
+    const MAKE: &str = "mkdir /data/dir && echo inner > /data/dir/inner && echo hello > /data/file && ln -s /data/file /data/abs-file && ln -s /data/dir /data/abs-dir";
+    const RESTRICTED: &str = "e2e-files-restricted";
+    const NAME: &str = "e2e-files-shellless";
+    const USER: i64 = 65532;
+
+    /// A pod whose container has no shell, with the volume made; in `restricted`, as `USER`.
+    async fn shellless_pod(pods: &Api<Pod>, ns: &str, restricted: bool) -> Result<()> {
+        let locked = json!({"allowPrivilegeEscalation": false, "capabilities": {"drop": ["ALL"]}});
+        let mut spec = json!({
+            "volumes": [{"name": "data", "emptyDir": {}}],
+            "initContainers": [{"name": "make", "image": "busybox:1.37", "command": ["sh", "-c", MAKE],
+                "volumeMounts": [{"name": "data", "mountPath": "/data"}]}],
+            "containers": [{"name": "main", "image": "registry.k8s.io/pause:3.10",
+                "volumeMounts": [{"name": "data", "mountPath": "/data"}]}],
+        });
+        if restricted {
+            spec["securityContext"] = json!({"runAsNonRoot": true, "runAsUser": USER, "runAsGroup": USER,
+                "fsGroup": USER, "seccompProfile": {"type": "RuntimeDefault"}});
+            spec["initContainers"][0]["securityContext"] = locked.clone();
+            spec["containers"][0]["securityContext"] = locked;
+        }
+        let pod = serde_json::from_value(json!({"metadata": {"name": NAME, "namespace": ns}, "spec": spec}))?;
+        pods.create(&PostParams::default(), &pod).await?;
+        for _ in 0..180 {
+            let phase = pods.get(NAME).await?.status.and_then(|s| s.phase);
+            if phase.as_deref() == Some("Running") {
+                return Ok(());
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+        bail!("{ns}/{NAME} did not start")
+    }
+
+    run(async {
+        let ctx = context();
+        let truth = k8s::connect_for_agents(ctx.clone()).await?;
+        let ui = k8s::connect(ctx.clone()).await?;
+        let namespaces: Api<Namespace> = Api::all(truth.clone());
+        let _ = Api::<Pod>::namespaced(truth.clone(), NS).delete(NAME, &DeleteParams::default().grace_period(0)).await;
+        let _ = namespaces.delete(RESTRICTED, &DeleteParams::default()).await;
+        for _ in 0..120 {
+            let gone = namespaces.get_opt(RESTRICTED).await?.is_none();
+            let pod_gone = Api::<Pod>::namespaced(truth.clone(), NS).get_opt(NAME).await?.is_none();
+            if gone && pod_gone {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+        let ns =
+            json!({"metadata": {"name": RESTRICTED, "labels": {"pod-security.kubernetes.io/enforce": "restricted"}}});
+        namespaces.create(&PostParams::default(), &serde_json::from_value(ns)?).await?;
+        let checked = async {
+            for (ns, restricted) in [(NS, false), (RESTRICTED, true)] {
+                let pods: Api<Pod> = Api::namespaced(truth.clone(), ns);
+                shellless_pod(&pods, ns, restricted).await?;
+                gate::set_ui_writes(true);
+                let exec = FileSource::exec(ui.clone(), ns.into(), NAME.into(), Some("main".into()));
+                let refused = exec.list(b"/").await.err().context("pause has no shell")?;
+                assert!(debug::needed(&refused), "{ns}: {refused:#}");
+
+                let look = || debug::look(ui.clone(), ns.into(), NAME.into(), "main".into(), "busybox:1.37".into());
+                let Look::Add(plan) = look().await? else { bail!("{ns}: a debug container to reuse already") };
+                if restricted {
+                    assert_eq!((plan.user, plan.group), (Some(USER), Some(USER)), "{ns}");
+                }
+                let source = debug::add(ui.clone(), ns.into(), NAME.into(), plan).await?;
+                assert_eq!(source.origin(), Origin::Debug);
+                let root = source.list(b"/").await?;
+                assert!(root.iter().any(|e| e.name == b"pause"), "{ns}: no /pause in {root:?}");
+                let data = source.list(b"/data").await?;
+                let dir = data.iter().find(|e| e.name == b"abs-dir").context("abs-dir")?;
+                assert!(dir.opens(), "{ns}: {dir:?}");
+                let file = data.iter().find(|e| e.name == b"abs-file").context("abs-file")?;
+                assert!(!file.opens(), "{ns}: {file:?}");
+                assert_eq!(source.read(b"/data/abs-file", 64).await?.text(), Some("hello\n"), "{ns}");
+                assert_eq!(source.read(b"/data/abs-dir/inner", 64).await?.text(), Some("inner\n"), "{ns}");
+                assert!(source.list(b"/data/abs-dir").await?.iter().any(|e| e.name == b"inner"), "{ns}");
+                let found = source.find(b"/data", "INNER").await?;
+                assert_eq!(found.paths, [b"/data/dir/inner".to_vec()], "{ns}");
+                let hostname = source.read(b"/etc/hostname", 64).await?;
+                assert_eq!(hostname.text().map(str::trim), Some(NAME), "{ns}");
+
+                let Look::Reuse(again) = look().await? else { bail!("{ns}: the debug container is not reused") };
+                assert_eq!(again.container(), source.container(), "{ns}");
+                gate::set_ui_writes(false);
+            }
+
+            let (hub, agent, token, _server) = agent(&["get,list *"], &[]).await?;
+            let mcp = crate::assistant::Mcp::connect(hub.port(), token).await?;
+            let read = json!({"context": ctx, "namespace": NS, "pod": NAME, "path": "/data/abs-file", "debug": true});
+            let out = mcp.call("browse_files", read.clone()).await;
+            assert!(out.contains("Denied"), "{out}");
+            let allow = rules_file::parse_rule(Mode::Allow, "exec pods/e2e-* -n default")?;
+            hub.update_agent(&agent.id, |a| a.policy.rules.push(allow))?;
+            let plain = json!({"context": ctx, "namespace": NS, "pod": NAME, "path": "/data"});
+            let out = mcp.call("browse_files", plain).await;
+            assert!(out.contains("debug: true"), "{out}");
+            let out = mcp.call("browse_files", read).await;
+            assert!(out.contains("hello"), "{out}");
+            let folder = json!({"context": ctx, "namespace": NS, "pod": NAME, "path": "/data", "debug": true});
+            let out = mcp.call("browse_files", folder).await;
+            assert!(out.contains("abs-dir -> /data/dir") && out.contains("through a debug container"), "{out}");
+            // Reused: still the one debug container the app added.
+            let pod = Api::<Pod>::namespaced(truth.clone(), NS).get(NAME).await?;
+            let added = pod.spec.and_then(|s| s.ephemeral_containers).unwrap_or_default();
+            assert_eq!(added.len(), 1, "{:?}", added.iter().map(|c| &c.name).collect::<Vec<_>>());
+            Ok(())
+        };
+        let result: Result<()> = checked.await;
+        gate::set_ui_writes(false);
+        let _ = Api::<Pod>::namespaced(truth, NS).delete(NAME, &DeleteParams::default().grace_period(0)).await;
+        let _ = namespaces.delete(RESTRICTED, &DeleteParams::default()).await;
+        result
+    });
+}
+
+/// The copies of pods in the test namespace.
+async fn pod_copies(pods: &Api<k8s_openapi::api::core::v1::Pod>) -> Result<Vec<k8s_openapi::api::core::v1::Pod>> {
+    let lp = kube::api::ListParams::default().labels(&format!("{}=true", k8s::pod_copy::LABEL));
+    Ok(pods.list(&lp).await?.items)
+}
+
+/// Wait until pod `name` is gone.
+async fn pod_gone(pods: &Api<k8s_openapi::api::core::v1::Pod>, name: &str) -> Result<()> {
+    for _ in 0..60 {
+        if pods.get_opt(name).await?.is_none() {
+            return Ok(());
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+    bail!("{name} is still there")
+}
+
+/// A container that isn't running is read from a copy of its pod: a crash-looping
+/// distroless pod (no shell, no `sleep`) is copied with write mode on only, the copy runs the
+/// busybox it carries, the pod's ConfigMap is mounted in it, and nothing selects it. The copy
+/// is deleted even with write mode off, and one left behind (the app killed) is deleted by
+/// the sweep run when the app connects again.
+#[test]
+#[ignore]
+fn a_stopped_container_is_read_from_a_copy_of_its_pod() {
+    use k8s_openapi::api::core::v1::Pod;
+
+    use crate::k8s::files::{FileSource, Origin};
+    use crate::k8s::pod_copy;
+
+    const NAME: &str = "e2e-files-crash";
+    const CONFIG: &str = "e2e-files-crash-config";
+    const BUSYBOX: &str = pod_copy::DEFAULT_IMAGE;
+
+    run(async {
+        let ctx = context();
+        let truth = k8s::connect_for_agents(ctx.clone()).await?;
+        let pods: Api<Pod> = Api::namespaced(truth.clone(), NS);
+        let maps: Api<ConfigMap> = Api::namespaced(truth.clone(), NS);
+        let ui = k8s::connect(ctx.clone()).await?;
+        let checked = async {
+            let _ = pods.delete(NAME, &DeleteParams::default().grace_period(0)).await;
+            let _ = maps.delete(CONFIG, &DeleteParams::default()).await;
+            pod_gone(&pods, NAME).await?;
+            let map = json!({"metadata": {"name": CONFIG, "namespace": NS}, "data": {"greeting": "hello"}});
+            maps.create(&PostParams::default(), &serde_json::from_value(map)?).await?;
+            // Distroless: nothing to exec in, and a command that isn't there, so it never runs.
+            let pod = json!({
+                "metadata": {"name": NAME, "namespace": NS, "labels": {"app": NAME}},
+                "spec": {
+                    "securityContext": {"runAsNonRoot": true, "runAsUser": 65532},
+                    "containers": [{
+                        "name": "main", "image": "gcr.io/distroless/static-debian12:nonroot", "command": ["/app"],
+                        "livenessProbe": {"exec": {"command": ["/app", "health"]}},
+                        "volumeMounts": [{"name": "config", "mountPath": "/etc/app"}],
+                    }],
+                    "volumes": [{"name": "config", "configMap": {"name": CONFIG}}],
+                },
+            });
+            pods.create(&PostParams::default(), &serde_json::from_value(pod)?).await?;
+            let mut read = None;
+            for _ in 0..120 {
+                let value = serde_json::to_value(pods.get(NAME).await?)?;
+                let stopped = pod_copy::not_running(&value, "main");
+                if stopped.as_deref().is_some_and(|s| s != "not started" && s != "ContainerCreating") {
+                    read = Some(value);
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+            let read = read.context("the pod's container never stopped")?;
+            let node = read.pointer("/spec/nodeName").cloned();
+
+            // Write mode off: the UI's client refuses to create the copy.
+            gate::set_ui_writes(false);
+            let refused = pod_copy::create(ui.clone(), read.clone(), pod_copy::new_name(NAME), BUSYBOX.into()).await;
+            let refused = refused.err().map(|e| format!("{e:#}")).unwrap_or_default();
+            assert!(refused.contains(gate::WRITES_OFF), "{refused}");
+            assert!(pod_copies(&pods).await?.is_empty(), "a copy was created with write mode off");
+
+            gate::set_ui_writes(true);
+            let copy = pod_copy::create(ui.clone(), read.clone(), pod_copy::new_name(NAME), BUSYBOX.into()).await?;
+            let made = pods.get(&copy.name).await?;
+            assert_eq!(made.metadata.uid.as_deref(), Some(copy.uid.as_str()));
+            let made = serde_json::to_value(made)?;
+            // On the same node, selected by nothing, with no probes.
+            assert_eq!(made.pointer("/spec/nodeName").cloned(), node);
+            assert!(made.pointer("/metadata/labels/app").is_none(), "{made}");
+            assert!(made.pointer("/metadata/ownerReferences").is_none(), "{made}");
+            assert!(made.pointer("/spec/containers/0/livenessProbe").is_none(), "{made}");
+
+            // The busybox's applets are installed (or the copy's state, later tries and kubectl
+            // say why not).
+            let tools =
+                vec![format!("{}/busybox", pod_copy::TOOLS), "ls".into(), "-l".into(), pod_copy::TOOLS_BIN.into()];
+            let exec = || {
+                k8s::exec_capture(
+                    truth.clone(),
+                    NS.into(),
+                    copy.name.clone(),
+                    Some("main".into()),
+                    tools.clone(),
+                    30,
+                    1 << 16,
+                )
+            };
+            match exec().await {
+                Ok(out) => assert!(out.starts_with("[exit 0]") && out.contains(" sh -> "), "{out}"),
+                Err(e) => {
+                    let mut later = Vec::new();
+                    for _ in 0..3 {
+                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                        later.push(exec().await.unwrap_or_else(|e| format!("{e:#}")));
+                    }
+                    let kubectl = std::process::Command::new("kubectl")
+                        .args(["--context", ctx.as_str(), "-n", NS, "exec", copy.name.as_str(), "-c", "main", "--"])
+                        .args(&tools)
+                        .output()
+                        .map(|o| {
+                            format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr))
+                        });
+                    let status = serde_json::to_value(pods.get(&copy.name).await?.status)?;
+                    bail!("exec in the copy: {e:#}\nlater: {later:#?}\nkubectl: {kubectl:?}\n{status:#}");
+                }
+            }
+
+            let source = FileSource::copy(ui.clone(), NS.into(), copy.name.clone(), Some("main".into()));
+            assert_eq!(source.origin(), Origin::Copy);
+            let config = source.list(b"/etc/app").await?;
+            assert!(config.iter().any(|e| e.name == b"greeting"), "the ConfigMap is not mounted: {config:?}");
+            assert_eq!(source.read(b"/etc/app/greeting", 1024).await?.text(), Some("hello"));
+            let etc = source.list(b"/etc").await?;
+            assert!(etc.iter().any(|e| e.name == b"passwd"), "the image's own files are not there: {etc:?}");
+            let found = source.find(b"/etc/app", "GREET").await?;
+            // The ConfigMap's link, and the file it leads to in its timestamped folder.
+            assert!(found.paths.contains(&b"/etc/app/greeting".to_vec()), "{:?}", found.paths);
+
+            // Deleted even with write mode off (the page closed after it was turned off).
+            gate::set_ui_writes(false);
+            pod_copy::delete(copy.clone());
+            pod_gone(&pods, &copy.name).await?;
+            assert!(pods.get_opt(NAME).await?.is_some(), "the original pod went too");
+
+            // The app killed with a copy: the sweep of its next connection deletes it.
+            gate::set_ui_writes(true);
+            let left = pod_copy::create(ui.clone(), read, pod_copy::new_name(NAME), BUSYBOX.into()).await?;
+            gate::set_ui_writes(false);
+            let swept = pod_copy::sweep(ui, Vec::new(), jiff::SignedDuration::ZERO).await?;
+            assert_eq!(swept, 1);
+            pod_gone(&pods, &left.name).await?;
+            Ok(())
+        };
+        let result: Result<()> = checked.await;
+        gate::set_ui_writes(false);
+        for copy in pod_copies(&pods).await.unwrap_or_default() {
+            let name = copy.metadata.name.unwrap_or_default();
+            let _ = pods.delete(&name, &DeleteParams::default().grace_period(0)).await;
+        }
+        let _ = pods.delete(NAME, &DeleteParams::default().grace_period(0)).await;
+        let _ = maps.delete(CONFIG, &DeleteParams::default()).await;
         result
     });
 }

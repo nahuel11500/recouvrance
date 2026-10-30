@@ -95,12 +95,24 @@ tools. What some of them need beyond the obvious verb:
 - **Logs of a workload:** `workload_logs` merges the logs of a workload's or Service's pods (the
   newest 20) in time order, each line prefixed with its pod. It needs `get` on the workload; pods
   whose logs the rules don't allow are left out and counted.
+- **Argo CD diagnosis:** `gitops` with `action: diagnose` on an Application changes nothing and
+  needs `get` on it (not `patch`; the activity log doesn't count it as a change). It returns the
+  diagnosis of the Application's page: a deletion held by a finalizer, a sync running for long,
+  a failed sync (each object and why), a sync loop with the `ignoreDifferences` that would stop
+  it, what is out of sync, and the fields that differ between what was last applied and the
+  live object (Secret values masked), with the field managers that wrote it since the last
+  sync. The live objects are read on the first context reaching the destination that the rules
+  name, each only where an Allow rule (or one approved in this call) gives `get` on it; the
+  others are named as not read.
 - **What changed:** `get_changes` returns what changed on an object, newest first, as the app's
   History tab shows it: time, source, object, what changed, and up to 12 changed lines of its
   diff (`limit` changes, 30 by default). It needs `get` on the object. A pod's owner (its
   ReplicaSet, then the Deployment) is read only if the rules allow `get` on it, the Helm
   revisions only those `list` on secrets allows (values masked), the events only with `list` on
-  events. A source that failed, or an owner the rules don't let it read, is named at the end.
+  events. A source that failed, or an owner the rules don't let it read, is named at the end. The
+  changes the app recorded while it watched the object come too, with source `Recorded` (see the
+  Timeline in [features](features.md)): those of this object (its uid), not of one deleted before
+  under the same name. A Secret's recorded changes say which keys changed, never their values.
 - **Reachability:** `check_reachability` follows the path a request takes to a Service, an Ingress
   or an HTTPRoute and names the first step that breaks, with the `kubectl` command to see it (the
   Reachability tab's checks). It needs `get` on the object, then reads what the path goes through
@@ -120,7 +132,12 @@ tools. What some of them need beyond the obvious verb:
 - **Files:** `browse_files` lists a folder (mode, owner, size, modification time, symlink targets)
   or returns a file's first bytes (64 KiB by default, 1 MiB at most; a binary file only its type)
   in a container, like the app's Files tab. It runs `sh`, `stat` and `head` there, so it needs
-  `exec` on the pod, like `exec_command`, and changes nothing.
+  `exec` on the pod, like `exec_command`, and changes nothing. For an image without a shell
+  (distroless), `debug: true` reads through a debug container as the Files tab does: it reuses one
+  still running that the Files tab or `browse_files` added, else adds one, which stays in the pod's
+  spec. That needs `exec` on the pod too, the rule `debug_pod` adds its containers under.
+  Unlike the Files tab, it doesn't make a copy of a pod whose container isn't running (that
+  creates a pod): it says the container isn't running.
 - **Port-forwards:** `port_forward` needs the `forward` verb on the pod or Service (no preset grants
   it): it is a network path into the cluster. It listens on 127.0.0.1 only, for `minutes` (60 by
   default, 8 hours at most), shows in the sidebar's port-forwards with the agent's name, and stops

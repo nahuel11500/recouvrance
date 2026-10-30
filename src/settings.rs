@@ -227,6 +227,41 @@ pub struct Settings {
     /// Seconds the confirm button waits with `ConfirmStyle::Wait` (see `CONFIRM_WAIT_RANGE`).
     #[serde(deserialize_with = "wait_secs_or_longest")]
     pub confirm_wait_secs: u64,
+    /// What the timeline records, and how much of it is kept.
+    pub timeline: TimelineSettings,
+}
+
+/// The timeline: changes recorded while the app watches (see `crate::timeline`).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(default)]
+pub struct TimelineSettings {
+    /// Record what the lists and the Problems scan see change.
+    pub record: bool,
+    /// Kinds watched whole while connected, for diffs of the whole object (kubectl names:
+    /// `configmaps`, `deployments.apps`); each is a watch more on every cluster.
+    pub kinds: Vec<String>,
+    /// MB kept per context (see `max_mb`).
+    pub max_mb: u64,
+    /// Days kept (see `days`).
+    pub days: u64,
+}
+
+impl Default for TimelineSettings {
+    fn default() -> Self {
+        Self { record: true, kinds: Vec::new(), max_mb: 16, days: 14 }
+    }
+}
+
+impl TimelineSettings {
+    /// The size bound per context, in MB: 1 to 1024.
+    pub fn max_mb(&self) -> u64 {
+        self.max_mb.clamp(1, 1024)
+    }
+
+    /// The age bound, in days: 1 to 365.
+    pub fn days(&self) -> u64 {
+        self.days.clamp(1, 365)
+    }
 }
 
 /// Kinds that come back on their own are deleted right away; kinds whose loss takes data,
@@ -395,6 +430,7 @@ impl Default for Settings {
             delete_confirm_kinds: default_delete_confirm(),
             confirm_style: ConfirmStyle::Wait,
             confirm_wait_secs: 3,
+            timeline: TimelineSettings::default(),
         }
     }
 }
@@ -825,6 +861,18 @@ mod tests {
         assert_eq!(s.delete_confirm_kinds.get("Pod"), Some(&DeleteConfirm::Off));
         assert_eq!(s.delete_confirm_kinds.get("Node"), Some(&DeleteConfirm::Type));
         assert_eq!(s.metrics_refresh, 42);
+    }
+
+    #[test]
+    fn timeline_settings_that_do_not_read_keep_the_others() {
+        let (s, error, lost) = super::from_bytes(br#"{"timeline": {"max_mb": "big"}, "metrics_refresh": 7}"#);
+        assert!(error.is_some() && !lost);
+        assert_eq!((s.timeline, s.metrics_refresh), (super::TimelineSettings::default(), 7));
+        let s: Settings =
+            serde_json::from_str(r#"{"timeline": {"kinds": ["configmaps"], "max_mb": 0, "days": 9999}}"#).unwrap();
+        assert!(s.timeline.record, "on unless turned off");
+        assert_eq!(s.timeline.kinds, ["configmaps"]);
+        assert_eq!((s.timeline.max_mb(), s.timeline.days()), (1, 365));
     }
 
     #[test]
