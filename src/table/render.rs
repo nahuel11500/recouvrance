@@ -383,7 +383,7 @@ impl TableDelegate for ResourceTable {
                 weight = Some(FontWeight::MEDIUM);
             }
             (Col::Age(_), _) => color = Some(theme.muted_foreground),
-            (_, "Status") => color = status_color(&cell, cx),
+            (_, "Status") => color = status_color(&cell, self.nodes, cx),
             (_, "Type") if cell == "Warning" => color = Some(theme.warning),
             (_, "Type") if cell == "Normal" => color = Some(theme.muted_foreground),
             (_, "Reason") if self.cells_text(row, "Type") == Some("Warning") => color = Some(theme.warning),
@@ -475,9 +475,12 @@ impl TableDelegate for ResourceTable {
     }
 }
 
-fn status_color(status: &str, cx: &App) -> Option<Hsla> {
+/// A node's status is read by its own rule: a taint's label (`CiliumAgentNotReady`) is not
+/// the node's state.
+fn status_color(status: &str, node: bool, cx: &App) -> Option<Hsla> {
     let t = cx.theme();
-    Some(match tone(status)? {
+    let judged = if node { crate::status::node_tone(status) } else { tone(status) };
+    Some(match judged? {
         Tone::Good => t.success,
         Tone::Done => t.muted_foreground,
         Tone::Busy => t.warning,

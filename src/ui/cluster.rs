@@ -163,6 +163,7 @@ struct NodeLite {
 #[serde(default)]
 struct NodeSpecLite {
     unschedulable: bool,
+    taints: Vec<crate::taints::Taint>,
 }
 
 #[derive(Deserialize, Default)]
@@ -244,6 +245,8 @@ fn add_nodes(s: &mut Summary, nodes: &[NodeLite]) {
         if n.spec.unschedulable {
             issues.push("Cordoned".into());
         }
+        // Taints that keep pods off it because something is wrong (`CiliumAgentNotReady`).
+        issues.extend(crate::taints::labels_of(&n.spec.taints));
         if !issues.is_empty() {
             s.node_issues.push((n.metadata.name.clone(), issues));
         }
@@ -868,7 +871,10 @@ mod tests {
                 "conditions": [{"type": "Ready", "status": "True"}, {"type": "DiskPressure", "status": "True"}],
                 "nodeInfo": {"kubeletVersion": "v1.33.1"},
                 "allocatable": {"cpu": "4", "memory": "8Gi", "nvidia.com/gpu": "2"}}},
-            {"metadata": {"name": "n2"}, "spec": {"unschedulable": true}, "status": {
+            {"metadata": {"name": "n2"}, "spec": {"unschedulable": true, "taints": [
+                {"key": "node.kubernetes.io/unschedulable", "effect": "NoSchedule"},
+                {"key": "node.cilium.io/agent-not-ready", "effect": "NoSchedule"},
+                {"key": "production", "value": "true", "effect": "NoSchedule"}]}, "status": {
                 "conditions": [{"type": "Ready", "status": "False"}],
                 "nodeInfo": {"kubeletVersion": "v1.33.1"},
                 "allocatable": {"cpu": "2", "memory": "4Gi"}}}
@@ -887,7 +893,10 @@ mod tests {
         assert_eq!((s.nodes, s.nodes_ready), (2, 1));
         assert_eq!(s.kubelet_versions, [("v1.33.1".to_string(), 2)]);
         assert_eq!(s.node_issues[0], ("n1".to_string(), vec!["DiskPressure".to_string()]));
-        assert_eq!(s.node_issues[1], ("n2".to_string(), vec!["NotReady".to_string(), "Cordoned".to_string()]));
+        assert_eq!(
+            s.node_issues[1],
+            ("n2".to_string(), vec!["NotReady".to_string(), "Cordoned".to_string(), "CiliumAgentNotReady".to_string()])
+        );
         assert_eq!((s.cpu.0, s.cpu.1), (6000.0, 500.0));
         assert_eq!(s.mem.1, 1024.0 * 1024.0 * 1024.0);
         assert_eq!(s.gpus, (2.0, 1.0));
