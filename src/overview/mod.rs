@@ -12,6 +12,7 @@ use serde_json::Value;
 
 use crate::details::{DetailPanel, OpenObject};
 use crate::k8s::{self, ContainerUsage, Kind};
+use crate::ui::selectable::{dragged, selectable};
 
 mod access;
 mod alerts;
@@ -118,11 +119,9 @@ fn heading_for(text: &str, related: &Related, section: &str, cx: &App) -> Div {
     let heading = heading(text);
     match related.errors.get(section) {
         None => heading,
-        Some(e) => heading
-            .flex()
-            .gap_2()
-            .items_baseline()
-            .child(div().text_xs().font_weight(FontWeight::NORMAL).text_color(cx.theme().danger).child(e.clone())),
+        Some(e) => heading.flex().gap_2().items_baseline().child(
+            div().text_xs().font_weight(FontWeight::NORMAL).text_color(cx.theme().danger).child(selectable(e.clone())),
+        ),
     }
 }
 
@@ -130,7 +129,8 @@ fn heading_for(text: &str, related: &Related, section: &str, cx: &App) -> Div {
 fn load_notes(related: &Related, sections: &[&str], cx: &App) -> Option<Div> {
     let notes: Vec<String> =
         sections.iter().filter_map(|s| related.errors.get(s).map(|e| format!("{}: {e}", capitalize(s)))).collect();
-    (!notes.is_empty()).then(|| div().py_1().text_xs().text_color(cx.theme().danger).child(notes.join(" · ")))
+    (!notes.is_empty())
+        .then(|| div().py_1().text_xs().text_color(cx.theme().danger).child(selectable(notes.join(" · "))))
 }
 
 pub struct Ctx<'a> {
@@ -160,7 +160,8 @@ impl Ctx<'_> {
         s(self.obj, "/metadata/namespace").map(String::from)
     }
 
-    /// A blue link that opens another object.
+    /// A blue link that opens another object. Its text can be selected: a drag over it
+    /// selects, a click opens.
     fn link(&self, text: impl Into<SharedString>, kind: &str, name: &str, cx: &App) -> Stateful<Div> {
         self.link_in(text, kind, name, self.ns(), cx)
     }
@@ -184,11 +185,14 @@ impl Ctx<'_> {
             .overflow_hidden()
             .text_ellipsis()
             .whitespace_nowrap()
-            .on_click(move |_, _, cx| {
+            .on_click(move |click, _, cx| {
+                if dragged(click) {
+                    return;
+                }
                 let ev = OpenObject { kind: kind.clone(), name: name.clone(), namespace: ns.clone(), context: None };
                 let _ = panel.update(cx, |_, cx| cx.emit(ev));
             })
-            .child(text)
+            .child(selectable(text))
     }
 }
 
@@ -208,17 +212,58 @@ fn age_of(v: &Value, path: &str) -> Option<String> {
     s(v, path)?.parse::<jiff::Timestamp>().ok().map(k8s::age)
 }
 
-/// A muted label above a value.
-fn field(label: &str, value: impl IntoElement, cx: &App) -> Div {
+/// A muted label above a value. Both can be selected, the value when it is text.
+fn field(label: &str, value: impl Shown, cx: &App) -> Div {
     v_flex()
         .min_w(px(160.))
         .gap_0p5()
-        .child(div().text_xs().text_color(cx.theme().muted_foreground).child(label.to_string()))
-        .child(div().text_sm().child(value))
+        .child(div().text_xs().text_color(cx.theme().muted_foreground).child(selectable(label.to_string())))
+        .child(div().text_sm().child(value.shown()))
+}
+
+/// A field's value: text is drawn selectable, an element as it is.
+trait Shown {
+    fn shown(self) -> AnyElement;
+}
+
+impl Shown for String {
+    fn shown(self) -> AnyElement {
+        selectable(self).into_any_element()
+    }
+}
+
+impl Shown for &str {
+    fn shown(self) -> AnyElement {
+        selectable(self.to_string()).into_any_element()
+    }
+}
+
+impl Shown for SharedString {
+    fn shown(self) -> AnyElement {
+        selectable(self).into_any_element()
+    }
+}
+
+impl Shown for Div {
+    fn shown(self) -> AnyElement {
+        self.into_any_element()
+    }
+}
+
+impl Shown for Stateful<Div> {
+    fn shown(self) -> AnyElement {
+        self.into_any_element()
+    }
+}
+
+impl Shown for AnyElement {
+    fn shown(self) -> AnyElement {
+        self
+    }
 }
 
 fn heading(text: &str) -> Div {
-    div().pt_6().pb_2().text_base().font_weight(FontWeight::SEMIBOLD).child(text.to_string())
+    div().pt_6().pb_2().text_base().font_weight(FontWeight::SEMIBOLD).child(selectable(text.to_string()))
 }
 
 fn card(cx: &App) -> Div {
@@ -228,15 +273,17 @@ fn card(cx: &App) -> Div {
 /// `text` in monospace, opening `url` in the browser when there is one.
 fn mono_url(id: impl Into<ElementId>, text: impl Into<SharedString>, url: Option<String>, cx: &App) -> Stateful<Div> {
     mono(text, cx).id(id).when_some(url, |d, url| {
-        d.text_color(cx.theme().blue)
-            .cursor_pointer()
-            .hover(Styled::underline)
-            .on_click(move |_, _, _| crate::forwards::open_url(&url))
+        d.text_color(cx.theme().blue).cursor_pointer().hover(Styled::underline).on_click(move |click, _, _| {
+            if !dragged(click) {
+                crate::forwards::open_url(&url);
+            }
+        })
     })
 }
 
+/// Selectable `text` in monospace.
 fn mono(text: impl Into<SharedString>, cx: &App) -> Div {
-    div().font_family(cx.theme().mono_font_family.clone()).text_xs().child(text.into())
+    div().font_family(cx.theme().mono_font_family.clone()).text_xs().child(selectable(text))
 }
 
 fn row() -> Div {
@@ -445,7 +492,7 @@ fn references_card(ctx: &Ctx, cx: &App) -> AnyElement {
             let more = names.len().saturating_sub(3);
             by = by.child(
                 v_flex()
-                    .child(div().text_xs().child(kind.clone()))
+                    .child(div().text_xs().child(selectable(kind.clone())))
                     .children(names.iter().take(3).map(|n| div().pl_2().child(ctx.link(n.clone(), kind, n, cx))))
                     .when(more > 0, |d| {
                         d.child(div().pl_2().text_xs().text_color(muted).child(format!("+{more} more")))
@@ -456,7 +503,7 @@ fn references_card(ctx: &Ctx, cx: &App) -> AnyElement {
     }
     // Some workload lists could not be read: who uses this object is not fully known.
     if let Some(e) = ctx.related.errors.get("referenced_by") {
-        let note = div().text_xs().text_color(cx.theme().danger).child(format!("not fully known: {e}"));
+        let note = div().text_xs().text_color(cx.theme().danger).child(selectable(format!("not fully known: {e}")));
         items.push(field("Referenced by", note, cx).into_any_element());
     }
     let any_ref = !items.is_empty();
@@ -547,20 +594,20 @@ fn diagnosis(ctx: &Ctx, cx: &App) -> Option<Div> {
                         h_flex()
                             .gap_2()
                             .child(div().size_2().rounded_full().bg(color))
-                            .child(div().text_sm().font_weight(FontWeight::MEDIUM).child(f.title)),
+                            .child(div().text_sm().font_weight(FontWeight::MEDIUM).child(selectable(f.title))),
                     )
                     .when(!f.detail.is_empty(), |d| {
                         d.child(v_flex().pl_4().children(f.detail.lines().map(|l| {
                             if l.starts_with("Last output")
                                 || f.detail.find("Last output").is_none_or(|i| f.detail[..i].contains(l))
                             {
-                                div().text_sm().child(l.to_string())
+                                div().text_sm().child(selectable(l.to_string()))
                             } else {
                                 mono(l.to_string(), cx)
                             }
                         })))
                     })
-                    .child(div().pl_4().text_xs().text_color(theme.muted_foreground).child(f.hint))
+                    .child(div().pl_4().text_xs().text_color(theme.muted_foreground).child(selectable(f.hint)))
             })),
     )
 }
@@ -591,12 +638,17 @@ fn conditions(obj: &Value, cx: &App) -> AnyElement {
                 .text_sm()
                 .border_b_1()
                 .border_color(cx.theme().border)
-                .child(div().w(px(220.)).flex_shrink_0().child(c["type"].as_str().unwrap_or_default().to_string()))
-                .child(div().w(px(60.)).flex_shrink_0().text_color(color).child(status))
-                .child(div().flex_1().min_w_0().text_color(muted).child(
+                .child(
+                    div()
+                        .w(px(220.))
+                        .flex_shrink_0()
+                        .child(selectable(c["type"].as_str().unwrap_or_default().to_string())),
+                )
+                .child(div().w(px(60.)).flex_shrink_0().text_color(color).child(selectable(status)))
+                .child(div().flex_1().min_w_0().text_color(muted).child(selectable(
                     [c["reason"].as_str(), c["message"].as_str()].into_iter().flatten().collect::<Vec<_>>().join(": "),
-                ))
-                .child(div().text_color(muted).child(age_of(c, "/lastTransitionTime").unwrap_or_default()))
+                )))
+                .child(div().text_color(muted).child(selectable(age_of(c, "/lastTransitionTime").unwrap_or_default())))
         }))
         .into_any_element()
 }
@@ -664,9 +716,11 @@ fn generic_section(title: &str, v: Option<&Value>, cx: &App) -> AnyElement {
                         .overflow_hidden()
                         .text_ellipsis()
                         .whitespace_nowrap()
-                        .child(k),
+                        .child(selectable(k)),
                 )
-                .child(div().flex_1().min_w_0().overflow_hidden().text_ellipsis().whitespace_nowrap().child(v))
+                .child(
+                    div().flex_1().min_w_0().overflow_hidden().text_ellipsis().whitespace_nowrap().child(selectable(v)),
+                )
         }))
         .when(more > 0, |d| {
             d.child(div().pt_1().text_xs().text_color(muted).child(format!("… {more} more fields in YAML")))

@@ -7,6 +7,7 @@ use serde_json::Value;
 
 use super::{Ctx, arr, card, clipped_list, field, heading, mono, row, s, usage_bar};
 use crate::k8s;
+use crate::ui::selectable::selectable;
 
 pub(super) fn node(obj: &Value, cx: &App) -> Div {
     let info = |k: &str| s(obj, &format!("/status/nodeInfo/{k}")).unwrap_or("-").to_string();
@@ -118,12 +119,12 @@ pub(super) fn node_allocation(ctx: &Ctx, cx: &App) -> Div {
         };
         let limits = (name != "pods").then(|| {
             let over = lim > a && a > 0.0;
-            div().when(over, |d| d.text_color(theme.warning)).child(format!(
+            div().when(over, |d| d.text_color(theme.warning)).child(selectable(format!(
                 "limits {}{}{}",
                 fmt(&name, lim),
                 pct(lim, a),
                 if over { " · overcommitted" } else { "" }
-            ))
+            )))
         });
         card(cx)
             .w(px(300.))
@@ -133,13 +134,13 @@ pub(super) fn node_allocation(ctx: &Ctx, cx: &App) -> Div {
                 h_flex()
                     .justify_between()
                     .items_baseline()
-                    .child(div().text_sm().font_weight(FontWeight::MEDIUM).child(name.clone()))
+                    .child(div().text_sm().font_weight(FontWeight::MEDIUM).child(selectable(name.clone())))
                     .child(
                         div()
                             .text_xl()
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(color)
-                            .child(format!("{:.0}%", share * 100.0)),
+                            .child(selectable(format!("{:.0}%", share * 100.0))),
                     ),
             )
             .child(allocation_bar(req, lim, a, color, cx))
@@ -147,15 +148,17 @@ pub(super) fn node_allocation(ctx: &Ctx, cx: &App) -> Div {
                 v_flex()
                     .text_xs()
                     .text_color(muted)
-                    .child(div().text_color(theme.foreground).child(format!(
+                    .child(div().text_color(theme.foreground).child(selectable(format!(
                         "{} of {} {}",
                         fmt(&name, req),
                         fmt(&name, a),
                         if name == "pods" { "running" } else { "requested" }
-                    )))
+                    ))))
                     .children(limits)
                     // Capacity is worth a line only when the node reserves part of it.
-                    .when(fmt(&name, c) != fmt(&name, a), |d| d.child(format!("capacity {}", fmt(&name, c)))),
+                    .when(fmt(&name, c) != fmt(&name, a), |d| {
+                        d.child(selectable(format!("capacity {}", fmt(&name, c))))
+                    }),
             )
     });
     let mut out =
@@ -169,13 +172,13 @@ pub(super) fn node_allocation(ctx: &Ctx, cx: &App) -> Div {
                 v_flex()
                     .w(px(260.))
                     .gap_0p5()
-                    .child(div().text_xs().text_color(muted).child(label.to_string()))
-                    .child(div().text_sm().child(format!(
+                    .child(div().text_xs().text_color(muted).child(selectable(label.to_string())))
+                    .child(div().text_sm().child(selectable(format!(
                         "{} of {}{}",
                         k8s::format_bytes(used),
                         k8s::format_bytes(cap),
                         pct(used, cap)
-                    )))
+                    ))))
                     .child(usage_bar(Some(used), None, Some(cap), theme.blue, cx)),
             )
         };
@@ -224,13 +227,15 @@ pub(super) fn node_devices(ctx: &Ctx, cx: &App) -> Option<Div> {
                 h_flex()
                     .gap_2()
                     .child(
-                        div().font_weight(FontWeight::MEDIUM).child(s(sl, "/spec/driver").unwrap_or("?").to_string()),
+                        div()
+                            .font_weight(FontWeight::MEDIUM)
+                            .child(selectable(s(sl, "/spec/driver").unwrap_or("?").to_string())),
                     )
-                    .child(div().text_xs().text_color(muted).child(format!(
+                    .child(div().text_xs().text_color(muted).child(selectable(format!(
                         "pool {} · {} devices",
                         s(sl, "/spec/pool/name").unwrap_or("?"),
                         devices.len()
-                    ))),
+                    )))),
             )
             .children(devices.iter().take(32).map(|d| {
                 // v1beta1 nests attributes under `basic`.
@@ -253,7 +258,7 @@ pub(super) fn node_devices(ctx: &Ctx, cx: &App) -> Option<Div> {
                     .gap_2()
                     .text_xs()
                     .child(mono(d["name"].as_str().unwrap_or("?").to_string(), cx))
-                    .child(div().text_color(muted).child(text.join("  ")))
+                    .child(div().text_color(muted).child(selectable(text.join("  "))))
             }))
     })))
 }

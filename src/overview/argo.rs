@@ -11,6 +11,7 @@ use super::{Ctx, field, heading, mono, row, tone_color};
 use crate::k8s;
 use crate::k8s::argo::{self, Found, Summary};
 use crate::status::Tone;
+use crate::ui::selectable::{dragged, selectable};
 
 fn ago(t: Option<&str>) -> Option<String> {
     t?.parse::<jiff::Timestamp>().ok().map(|t| format!("{} ago", k8s::age(t)))
@@ -18,7 +19,7 @@ fn ago(t: Option<&str>) -> Option<String> {
 
 /// A word in its tone's color.
 fn word(text: &str, tone: Tone, cx: &App) -> Div {
-    div().text_color(tone_color(Some(tone), cx)).child(text.to_string())
+    div().text_color(tone_color(Some(tone), cx)).child(selectable(text.to_string()))
 }
 
 /// Nothing when Argo CD deploys nothing here; one line when it could not be read.
@@ -35,7 +36,7 @@ pub(super) fn section(ctx: &Ctx, cx: &App) -> Option<Div> {
             .gap_2()
             .child(heading(&title))
             .when_some(lookup.note.as_ref(), |d, note| {
-                d.child(div().text_xs().text_color(cx.theme().muted_foreground).child(note.clone()))
+                d.child(div().text_xs().text_color(cx.theme().muted_foreground).child(selectable(note.clone())))
             })
             .children(lookup.apps.iter().enumerate().map(|(ix, f)| app_card(ctx, ix, f, full, cx))),
     )
@@ -61,12 +62,9 @@ fn app_card(ctx: &Ctx, ix: usize, found: &Found, full: bool, cx: &App) -> Div {
         .child(header(ctx, ix, found, cx))
         .when_some(app.deleting.as_deref(), |d, since| {
             let when = ago(Some(since)).unwrap_or_default();
-            d.child(
-                div()
-                    .text_sm()
-                    .text_color(theme.danger)
-                    .child(format!("Being deleted since {when}: a finalizer or a resource it waits for keeps it")),
-            )
+            d.child(div().text_sm().text_color(theme.danger).child(selectable(format!(
+                "Being deleted since {when}: a finalizer or a resource it waits for keeps it"
+            ))))
         })
         .child(
             row()
@@ -92,14 +90,18 @@ fn app_card(ctx: &Ctx, ix: usize, found: &Found, full: bool, cx: &App) -> Div {
                     ))
                 }),
         )
-        .when_some(app.health_message.as_ref(), |d, m| d.child(div().text_sm().text_color(muted).child(m.clone())))
-        .when_some(app.own.as_ref().and_then(|o| o.2.as_ref()), |d, m| {
-            d.child(div().text_sm().text_color(muted).child(format!("This object: {m}")))
+        .when_some(app.health_message.as_ref(), |d, m| {
+            d.child(div().text_sm().text_color(muted).child(selectable(m.clone())))
         })
-        .when_some(op_message, |d, m| d.child(div().text_sm().text_color(muted).child(format!("Last sync: {m}"))))
+        .when_some(app.own.as_ref().and_then(|o| o.2.as_ref()), |d, m| {
+            d.child(div().text_sm().text_color(muted).child(selectable(format!("This object: {m}"))))
+        })
+        .when_some(op_message, |d, m| {
+            d.child(div().text_sm().text_color(muted).child(selectable(format!("Last sync: {m}"))))
+        })
         .children(app.conditions.iter().map(|(ty, message)| {
             let color = if ty.ends_with("Warning") { theme.warning } else { theme.danger };
-            div().text_sm().text_color(color).child(format!("{ty}: {message}"))
+            div().text_sm().text_color(color).child(selectable(format!("{ty}: {message}")))
         }))
         .when(full && !app.history.is_empty(), |d| d.child(history(app, cx)))
 }
@@ -119,16 +121,18 @@ fn header(ctx: &Ctx, ix: usize, found: &Found, cx: &App) -> Div {
                 .cursor_pointer()
                 .hover(Styled::underline)
                 .font_weight(FontWeight::SEMIBOLD)
-                .child(app.name.clone())
-                .on_click(move |_, _, cx| {
-                    let _ = open.update(cx, |p, cx| p.open_argo_app(ix, cx));
+                .child(selectable(app.name.clone()))
+                .on_click(move |click, _, cx| {
+                    if !dragged(click) {
+                        let _ = open.update(cx, |p, cx| p.open_argo_app(ix, cx));
+                    }
                 }),
         )
         .child(
             div()
                 .text_xs()
                 .text_color(cx.theme().muted_foreground)
-                .child(format!("{}/{} on {}", app.namespace, app.name, found.hub.context)),
+                .child(selectable(format!("{}/{} on {}", app.namespace, app.name, found.hub.context))),
         )
         .child(div().flex_1())
         .children(app.urls.iter().take(3).enumerate().map(|(i, url)| {
@@ -166,17 +170,24 @@ pub(super) fn destination(ctx: &Ctx, cx: &App) -> Option<Div> {
                 .text_color(cx.theme().blue)
                 .cursor_pointer()
                 .hover(Styled::underline)
-                .child(argo::destination_text(context, &dest.namespace))
-                .on_click(move |_, _, cx| {
-                    let _ = panel.update(cx, crate::details::DetailPanel::open_destination);
+                .child(selectable(argo::destination_text(context, &dest.namespace)))
+                .on_click(move |click, _, cx| {
+                    if !dragged(click) {
+                        let _ = panel.update(cx, crate::details::DetailPanel::open_destination);
+                    }
                 })
                 .into_any_element()
         }
-        Some(context) => div().child(context.clone()).into_any_element(),
+        Some(context) => div().child(selectable(context.clone())).into_any_element(),
         None => h_flex()
             .gap_2()
             .child(mono(argo::destination_text(&dest.cluster, &dest.namespace), cx))
-            .child(div().text_xs().text_color(muted).child("no context of your kubeconfig reaches this cluster"))
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(muted)
+                    .child(selectable("no context of your kubeconfig reaches this cluster")),
+            )
             .into_any_element(),
     };
     Some(row().pt_4().child(field("Destination", value, cx)))
@@ -190,16 +201,18 @@ fn short_url(url: &str) -> String {
 
 fn history(app: &Summary, cx: &App) -> Div {
     let muted = cx.theme().muted_foreground;
-    v_flex().gap_0p5().child(div().text_xs().text_color(muted).child("Deployed")).children(app.history.iter().map(
-        |h| {
+    v_flex().gap_0p5().child(div().text_xs().text_color(muted).child(selectable("Deployed"))).children(
+        app.history.iter().map(|h| {
             h_flex()
                 .gap_3()
                 .text_sm()
                 .child(mono(if h.revision.is_empty() { "-".to_string() } else { h.revision.clone() }, cx))
-                .child(div().text_color(muted).child(ago(h.deployed_at.as_deref()).unwrap_or_default()))
-                .when_some(h.by.as_ref(), |d, by| d.child(div().text_color(muted).child(format!("by {by}"))))
-        },
-    ))
+                .child(div().text_color(muted).child(selectable(ago(h.deployed_at.as_deref()).unwrap_or_default())))
+                .when_some(h.by.as_ref(), |d, by| {
+                    d.child(div().text_color(muted).child(selectable(format!("by {by}"))))
+                })
+        }),
+    )
 }
 
 #[cfg(test)]

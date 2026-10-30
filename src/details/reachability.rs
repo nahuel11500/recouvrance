@@ -9,6 +9,7 @@ use gpui_kit::*;
 
 use super::{DetailPanel, OpenObject};
 use crate::reachability::{self as reach, Item, Probe, State, Step, Target};
+use crate::ui::selectable::{dragged, selectable};
 
 /// The tab's last check, and its last test from this machine.
 #[derive(Default)]
@@ -90,13 +91,21 @@ impl DetailPanel {
             return v_flex()
                 .gap_2()
                 .child(toolbar)
-                .child(div().text_sm().text_color(muted).child("Checking…"))
+                .child(div().text_sm().text_color(muted).child(selectable("Checking…")))
                 .into_any_element();
         };
         let (state, verdict) = reach::verdict(steps);
         let color = state_color(state, cx);
         let mut body = v_flex().id("reachability").size_full().overflow_y_scroll().px_2().gap_1().child(toolbar).child(
-            div().mt_2().p_2().rounded_md().border_1().border_color(color).text_color(color).text_sm().child(verdict),
+            div()
+                .mt_2()
+                .p_2()
+                .rounded_md()
+                .border_1()
+                .border_color(color)
+                .text_color(color)
+                .text_sm()
+                .child(selectable(verdict)),
         );
         let mut section = "";
         for (i, step) in steps.iter().enumerate() {
@@ -109,7 +118,8 @@ impl DetailPanel {
         if let Some(probes) = &self.reach.probes {
             body = body.child(heading("From this machine"));
             if probes.is_empty() {
-                body = body.child(div().text_sm().text_color(muted).child("No host to try: its rules name none."));
+                body = body
+                    .child(div().text_sm().text_color(muted).child(selectable("No host to try: its rules name none.")));
             }
             for p in probes {
                 body = body.child(probe_row(p, cx));
@@ -130,7 +140,7 @@ fn state_color(state: State, cx: &App) -> Hsla {
 }
 
 fn heading(text: &str) -> Div {
-    div().pt_4().pb_1().text_base().font_weight(FontWeight::SEMIBOLD).child(text.to_string())
+    div().pt_4().pb_1().text_base().font_weight(FontWeight::SEMIBOLD).child(selectable(text.to_string()))
 }
 
 /// A colored dot, a title, and what was found.
@@ -142,8 +152,14 @@ fn line(state: State, title: Option<String>, detail: String, cx: &App) -> Div {
         .items_start()
         .text_sm()
         .child(div().mt_1p5().size(px(7.)).flex_shrink_0().rounded_full().bg(color))
-        .when_some(title, |d, t| d.child(div().flex_shrink_0().font_weight(FontWeight::MEDIUM).child(t)))
-        .child(div().flex_1().min_w_0().text_color(if state == State::Ok { muted } else { color }).child(detail))
+        .when_some(title, |d, t| d.child(div().flex_shrink_0().font_weight(FontWeight::MEDIUM).child(selectable(t))))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .text_color(if state == State::Ok { muted } else { color })
+                .child(selectable(detail)),
+        )
 }
 
 fn step_row(i: usize, step: &Step, cx: &mut Context<DetailPanel>) -> Div {
@@ -170,7 +186,7 @@ fn step_row(i: usize, step: &Step, cx: &mut Context<DetailPanel>) -> Div {
                             .font_family(mono)
                             .text_xs()
                             .text_color(muted)
-                            .child(format!("$ {cmd}")),
+                            .child(selectable(format!("$ {cmd}"))),
                     )
                     .child(
                         Button::new(("reach-copy", i))
@@ -188,13 +204,16 @@ fn step_row(i: usize, step: &Step, cx: &mut Context<DetailPanel>) -> Div {
 fn item_row(id: usize, item: &Item, cx: &mut Context<DetailPanel>) -> AnyElement {
     let row = div().pl_4().text_xs();
     let Some(link) = item.link.clone() else {
-        return row.text_color(cx.theme().muted_foreground).child(item.text.clone()).into_any_element();
+        return row.text_color(cx.theme().muted_foreground).child(selectable(item.text.clone())).into_any_element();
     };
     row.id(("reach-item", id))
         .text_color(cx.theme().blue)
         .cursor_pointer()
         .hover(Styled::underline)
-        .on_click(cx.listener(move |_, _, _, cx| {
+        .on_click(cx.listener(move |_, click, _, cx| {
+            if dragged(click) {
+                return;
+            }
             cx.emit(OpenObject {
                 kind: link.kind.to_string(),
                 name: link.name.clone(),
@@ -202,7 +221,7 @@ fn item_row(id: usize, item: &Item, cx: &mut Context<DetailPanel>) -> AnyElement
                 context: None,
             });
         }))
-        .child(item.text.clone())
+        .child(selectable(item.text.clone()))
         .into_any_element()
 }
 
@@ -215,7 +234,7 @@ fn probe_row(p: &Probe, cx: &App) -> Div {
         .gap_0p5()
         .border_b_1()
         .border_color(cx.theme().border)
-        .child(div().text_sm().font_weight(FontWeight::MEDIUM).child(p.url.clone()))
+        .child(div().text_sm().font_weight(FontWeight::MEDIUM).child(selectable(p.url.clone())))
         .child(line(dns_state, None, dns, cx))
         .child(line(answer_state, None, answer, cx))
 }

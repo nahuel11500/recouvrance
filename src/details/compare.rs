@@ -9,6 +9,7 @@ use super::{DetailPanel, error_box};
 use crate::history::DiffLine;
 use crate::k8s;
 use crate::k8s::ObjectRef;
+use crate::ui::selectable::selectable;
 
 impl DetailPanel {
     /// Compare with the same object in another cluster.
@@ -110,14 +111,14 @@ impl DetailPanel {
                             .on_click(cx.listener(move |this, _, _, cx| this.compare_with_object(name.clone(), cx)))
                     }))
                     .when_some(self.compare.candidates_error.clone(), |d, e| {
-                        d.child(div().text_xs().text_color(theme.danger).child(e))
+                        d.child(div().text_xs().text_color(theme.danger).child(selectable(e)))
                     }),
             );
         let body: AnyElement = match (&self.object, &self.compare.other) {
             (_, None) if self.compare.target_ctx.is_none() && self.compare.target_name.is_none() => {
-                div().text_sm().text_color(muted).child("Pick what to compare with.").into_any_element()
+                div().text_sm().text_color(muted).child(selectable("Pick what to compare with.")).into_any_element()
             }
-            (_, None) => div().text_sm().text_color(muted).child("Loading…").into_any_element(),
+            (_, None) => div().text_sm().text_color(muted).child(selectable("Loading…")).into_any_element(),
             (_, Some(Err(e))) => error_box(e.clone().into(), cx).into_any_element(),
             (None, _) => div().into_any_element(),
             (Some(mine), Some(Ok(theirs))) => {
@@ -127,15 +128,15 @@ impl DetailPanel {
                 let lines = crate::history::diff_lines(&a, &b);
                 v_flex()
                     .gap_1()
-                    .child(div().text_sm().child(format!("− {left}    + {} (this)", self.context)))
-                    .child(div().text_xs().text_color(muted).child(if mask {
+                    .child(div().text_sm().child(selectable(format!("− {left}    + {} (this)", self.context))))
+                    .child(div().text_xs().text_color(muted).child(selectable(if mask {
                         "Ignoring uid, resourceVersion, timestamps, managedFields and status. \
                                  Secret values are masked: reveal them to compare values."
                     } else {
                         "Ignoring uid, resourceVersion, timestamps, managedFields and status."
-                    }))
+                    })))
                     .child(if lines.is_empty() {
-                        div().text_sm().text_color(theme.success).child("Identical.").into_any_element()
+                        div().text_sm().text_color(theme.success).child(selectable("Identical.")).into_any_element()
                     } else {
                         diff_block(&lines, cx)
                     })
@@ -216,7 +217,7 @@ pub(crate) fn diff_block(lines: &[DiffLine], cx: &App) -> AnyElement {
                 .when_some(bg, Styled::bg)
                 .text_color(fg)
                 .child(div().w(px(16.)).child(sign))
-                .child(div().whitespace_nowrap().child(text.clone()))
+                .child(div().whitespace_nowrap().child(selectable(text.clone())))
                 .into_any_element()
         }))
         .into_any_element()

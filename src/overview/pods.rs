@@ -13,6 +13,7 @@ use super::{
 };
 use crate::k8s;
 use crate::k8s::ContainerUsage;
+use crate::ui::selectable::selectable;
 
 pub(super) fn pod(ctx: &Ctx, cx: &App) -> Div {
     let obj = ctx.obj;
@@ -26,7 +27,7 @@ pub(super) fn pod(ctx: &Ctx, cx: &App) -> Div {
 
     let summary = row()
         .pt_4()
-        .child(field("Status", div().text_color(state_color(&phase, cx)).child(phase.clone()), cx))
+        .child(field("Status", div().text_color(state_color(&phase, cx)).child(selectable(phase.clone())), cx))
         .child(field("Ready", format!("{ready}/{}", containers.len()), cx))
         .child(field("Restarts", restarts.to_string(), cx))
         .child(field("Node", ctx.link(node_name.clone(), "nodes", &node_name, cx), cx))
@@ -51,14 +52,14 @@ pub(super) fn pod(ctx: &Ctx, cx: &App) -> Div {
                 h_flex()
                     .gap_2()
                     .child(Icon::new(Lucide::Box).size_4())
-                    .child(div().font_weight(FontWeight::SEMIBOLD).child(name.to_string()))
-                    .child(div().text_sm().text_color(state_color(&state, cx)).child(state.clone())),
+                    .child(div().font_weight(FontWeight::SEMIBOLD).child(selectable(name.to_string())))
+                    .child(div().text_sm().text_color(state_color(&state, cx)).child(selectable(state.clone()))),
             )
             .child(
                 div()
                     .text_xs()
                     .text_color(cx.theme().muted_foreground)
-                    .child(c["image"].as_str().unwrap_or_default().to_string()),
+                    .child(selectable(c["image"].as_str().unwrap_or_default().to_string())),
             )
             .child(container_usage_row(c, u, cx))
     });
@@ -132,9 +133,9 @@ pub fn container(ctx: &Ctx, name: &str, cx: &App) -> AnyElement {
 
     let status = h_flex()
         .gap_2()
-        .child(div().text_color(state_color(&state, cx)).child(state.clone()))
-        .when(started, |d| d.child("Started"))
-        .when(ready, |d| d.child("Ready"));
+        .child(div().text_color(state_color(&state, cx)).child(selectable(state.clone())))
+        .when(started, |d| d.child(selectable("Started")))
+        .when(ready, |d| d.child(selectable("Ready")));
 
     let root = v_flex()
         .pt_2()
@@ -203,10 +204,20 @@ fn container_ports(ctx: &Ctx, c: &Value, cx: &App) -> Vec<AnyElement> {
         let forward = (port > 0 && protocol == "TCP").then(|| forward_buttons(ctx, port, name.as_deref()));
         card(cx)
             .w(px(260.))
-            .child(div().text_xs().text_color(cx.theme().muted_foreground).child(name.unwrap_or_else(|| "-".into())))
-            .child(h_flex().justify_between().child(div().child(format!("{port}/{protocol}"))).children(forward))
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(selectable(name.unwrap_or_else(|| "-".into()))),
+            )
+            .child(
+                h_flex()
+                    .justify_between()
+                    .child(div().child(selectable(format!("{port}/{protocol}"))))
+                    .children(forward),
+            )
             .when(!services.is_empty(), |d| {
-                d.child(div().pt_1().text_xs().text_color(cx.theme().muted_foreground).child("Services"))
+                d.child(div().pt_1().text_xs().text_color(cx.theme().muted_foreground).child(selectable("Services")))
                     .children(services.iter().map(|svc| ctx.link(svc.clone(), "services", svc, cx)))
             })
     });
@@ -285,12 +296,16 @@ fn container_env(ctx: &Ctx, c: &Value, cx: &App) -> Vec<AnyElement> {
             let Some(name) = from.pointer(key_ptr).and_then(Value::as_str) else { continue };
             let data = ctx.related.env_sources.get(&format!("{kind}/{name}")).and_then(|v| v["data"].as_object());
             let link = |label: String| {
-                h_flex().gap_1().child(label).child(ctx.link(name.to_string(), plural, name, cx)).into_any_element()
+                h_flex()
+                    .gap_1()
+                    .child(selectable(label))
+                    .child(ctx.link(name.to_string(), plural, name, cx))
+                    .into_any_element()
             };
             if data.is_none_or(serde_json::Map::is_empty) {
                 rows.push(env_row(
                     "(all keys)".into(),
-                    div().text_color(muted).child("not readable").into_any_element(),
+                    div().text_color(muted).child(selectable("not readable")).into_any_element(),
                     link(format!("from {kind}")),
                     cx,
                 ));
@@ -299,7 +314,7 @@ fn container_env(ctx: &Ctx, c: &Value, cx: &App) -> Vec<AnyElement> {
                 let v = if kind == "Secret" { sources.secret(name, k) } else { sources.config_map(name, k) };
                 rows.push(env_row(
                     format!("{prefix}{k}"),
-                    div().child(v.unwrap_or_default()).into_any_element(),
+                    div().child(selectable(v.unwrap_or_default())).into_any_element(),
                     link(kind.to_string()),
                     cx,
                 ));
@@ -334,7 +349,7 @@ fn container_env(ctx: &Ctx, c: &Value, cx: &App) -> Vec<AnyElement> {
 
 /// One `env` entry's value and where it comes from.
 fn env_value(ctx: &Ctx, sources: &EnvSources, c: &Value, e: &Value, cx: &App) -> (AnyElement, AnyElement) {
-    let text = |t: String| div().child(t).into_any_element();
+    let text = |t: String| div().child(selectable(t)).into_any_element();
     fn key_ref(r: &Value) -> (&str, &str) {
         (r["name"].as_str().unwrap_or_default(), r["key"].as_str().unwrap_or("?"))
     }
@@ -343,14 +358,22 @@ fn env_value(ctx: &Ctx, sources: &EnvSources, c: &Value, e: &Value, cx: &App) ->
     } else if let Some(r) = e.pointer("/valueFrom/secretKeyRef") {
         let (name, k) = key_ref(r);
         let v = sources.secret(name, k).unwrap_or_else(|| "(not readable)".into());
-        let source =
-            h_flex().gap_1().child(format!("Secret key {k} of")).child(ctx.link(name.to_string(), "secrets", name, cx));
+        let source = h_flex().gap_1().child(selectable(format!("Secret key {k} of"))).child(ctx.link(
+            name.to_string(),
+            "secrets",
+            name,
+            cx,
+        ));
         (text(v), source.into_any_element())
     } else if let Some(r) = e.pointer("/valueFrom/configMapKeyRef") {
         let (name, k) = key_ref(r);
         let v = sources.config_map(name, k).unwrap_or_else(|| "(missing)".into());
-        let source =
-            h_flex().gap_1().child(format!("key {k} of")).child(ctx.link(name.to_string(), "configmaps", name, cx));
+        let source = h_flex().gap_1().child(selectable(format!("key {k} of"))).child(ctx.link(
+            name.to_string(),
+            "configmaps",
+            name,
+            cx,
+        ));
         (text(v), source.into_any_element())
     } else if let Some(p) = e.pointer("/valueFrom/fieldRef/fieldPath").and_then(Value::as_str) {
         (text(field_ref(ctx.obj, p).unwrap_or("-").to_string()), text(format!("field {p}")))
@@ -399,7 +422,7 @@ fn env_row(key: String, value: AnyElement, source: AnyElement, cx: &App) -> AnyE
                 .font_weight(FontWeight::SEMIBOLD)
                 .overflow_hidden()
                 .text_ellipsis()
-                .child(key),
+                .child(selectable(key)),
         )
         .child(
             div()
@@ -438,32 +461,36 @@ fn container_mounts(ctx: &Ctx, c: &Value, cx: &App) -> Vec<AnyElement> {
             }
             Some(v) => {
                 let t = v.as_object().and_then(|o| o.keys().find(|k| *k != "name").cloned()).unwrap_or_default();
-                div().text_xs().text_color(cx.theme().muted_foreground).child(format!("({t})")).into_any_element()
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(selectable(format!("({t})")))
+                    .into_any_element()
             }
             None => div().into_any_element(),
         };
         let ro = m["readOnly"].as_bool().unwrap_or(false);
         card(cx)
             .w(px(360.))
-            .child(div().text_xs().child(vname.to_string()))
+            .child(div().text_xs().child(selectable(vname.to_string())))
             .child(source)
-            .child(div().child(format!(
+            .child(div().child(selectable(format!(
                 "{}{}",
                 m["mountPath"].as_str().unwrap_or_default(),
                 m["subPath"].as_str().map(|p| format!(" (subPath {p})")).unwrap_or_default()
-            )))
-            .child(div().text_xs().text_color(cx.theme().muted_foreground).child(if ro {
+            ))))
+            .child(div().text_xs().text_color(cx.theme().muted_foreground).child(selectable(if ro {
                 "ReadOnly"
             } else {
                 "ReadWrite"
-            }))
+            })))
     });
     vec![heading("Volume mounts").into_any_element(), h_flex().flex_wrap().gap_3().children(cards).into_any_element()]
 }
 
 pub(super) fn probe_card(title: &str, p: &Value, cx: &App) -> Div {
     let body: AnyElement = if p.is_null() {
-        div().child("-").into_any_element()
+        div().child(selectable("-")).into_any_element()
     } else {
         let target = if let Some(h) = p.get("httpGet") {
             let port = h["port"]
@@ -498,13 +525,13 @@ pub(super) fn probe_card(title: &str, p: &Value, cx: &App) -> Div {
         );
         card(cx)
             .child(mono(target, cx))
-            .child(div().text_xs().text_color(cx.theme().muted_foreground).child(sentence))
+            .child(div().text_xs().text_color(cx.theme().muted_foreground).child(selectable(sentence)))
             .into_any_element()
     };
     v_flex()
         .w(px(340.))
         .gap_1()
-        .child(div().text_xs().text_color(cx.theme().muted_foreground).child(title.to_string()))
+        .child(div().text_xs().text_color(cx.theme().muted_foreground).child(selectable(title.to_string())))
         .child(body)
 }
 
@@ -759,7 +786,7 @@ pub(super) fn pod_row(ctx: &Ctx, p: &PodRow, cx: &App) -> AnyElement {
         h_flex()
             .w(px(150.))
             .gap_2()
-            .child(div().w(px(48.)).child(value.map(format).unwrap_or_default()))
+            .child(div().w(px(48.)).child(selectable(value.map(format).unwrap_or_default())))
             .child(div().flex_1().child(usage_bar(value, request, limit, color, cx)))
     };
     // Pods are opened in their own namespace (a node lists pods from every namespace).
@@ -777,7 +804,7 @@ pub(super) fn pod_row(ctx: &Ctx, p: &PodRow, cx: &App) -> AnyElement {
                     .text_ellipsis()
                     .whitespace_nowrap()
                     .text_color(theme.muted_foreground)
-                    .child(p.namespace.clone().unwrap_or_default()),
+                    .child(selectable(p.namespace.clone().unwrap_or_default())),
             )
         })
         .child(div().w(px(320.)).child(ctx.link_in(p.name.clone(), "pods", &p.name, p.namespace.clone(), cx)))
@@ -785,14 +812,24 @@ pub(super) fn pod_row(ctx: &Ctx, p: &PodRow, cx: &App) -> AnyElement {
             div()
                 .w(px(50.))
                 .text_color(if p.ready == p.total { theme.success } else { theme.warning })
-                .child(format!("{}/{}", p.ready, p.total)),
+                .child(selectable(format!("{}/{}", p.ready, p.total))),
         )
-        .child(div().w(px(110.)).text_color(state_color(&p.phase, cx)).child(p.phase.clone()))
+        .child(div().w(px(110.)).text_color(state_color(&p.phase, cx)).child(selectable(p.phase.clone())))
         .child(usage(p.cpu, k8s::format_cpu, theme.blue))
         .child(usage(p.mem, k8s::format_bytes, theme.success))
-        .child(div().w(px(60.)).when(p.restarts > 0, |d| d.text_color(theme.warning)).child(p.restarts.to_string()))
+        .child(
+            div()
+                .w(px(60.))
+                .when(p.restarts > 0, |d| d.text_color(theme.warning))
+                .child(selectable(p.restarts.to_string())),
+        )
         .child(div().w(px(220.)).child(ctx.link(p.node.clone(), "nodes", &p.node, cx)))
-        .child(div().w(px(60.)).text_color(theme.muted_foreground).child(p.created.map(k8s::age).unwrap_or_default()))
+        .child(
+            div()
+                .w(px(60.))
+                .text_color(theme.muted_foreground)
+                .child(selectable(p.created.map(k8s::age).unwrap_or_default())),
+        )
         .into_any_element()
 }
 
@@ -831,16 +868,16 @@ pub(super) fn pod_netpols(ctx: &Ctx, cx: &App) -> Option<Div> {
     Some(
         v_flex()
             .child(heading(&format!("Network policies ({})", pols.len())))
-            .child(div().text_sm().text_color(theme.muted_foreground).child(summary))
+            .child(div().text_sm().text_color(theme.muted_foreground).child(selectable(summary)))
             .children(pols.iter().map(|p| {
                 let name = s(p, "/metadata/name").unwrap_or_default().to_string();
                 let types: Vec<&str> = arr(p, "/spec/policyTypes").iter().filter_map(Value::as_str).collect();
                 h_flex().gap_2().py_0p5().text_sm().child(ctx.link(name.clone(), "networkpolicies", &name, cx)).child(
-                    div().text_xs().text_color(theme.muted_foreground).child(if types.is_empty() {
+                    div().text_xs().text_color(theme.muted_foreground).child(selectable(if types.is_empty() {
                         "Ingress".to_string()
                     } else {
                         types.join(", ")
-                    }),
+                    })),
                 )
             })),
     )

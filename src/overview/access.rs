@@ -6,6 +6,7 @@ use gpui_kit::*;
 use serde_json::Value;
 
 use super::{Ctx, arr, field, heading, pods_table, row, s};
+use crate::ui::selectable::selectable;
 
 /// A table of PolicyRules.
 pub(super) fn rules_table(rules: &[Value], cx: &App) -> Div {
@@ -33,10 +34,10 @@ pub(super) fn rules_table(rules: &[Value], cx: &App) -> Div {
                 .text_color(theme.muted_foreground)
                 .border_b_1()
                 .border_color(theme.border)
-                .child(div().w(px(180.)).child("API groups"))
-                .child(div().w(px(320.)).child("Resources"))
-                .child(div().w(px(200.)).child("Names"))
-                .child(div().flex_1().child("Verbs")),
+                .child(div().w(px(180.)).child(selectable("API groups")))
+                .child(div().w(px(320.)).child(selectable("Resources")))
+                .child(div().w(px(200.)).child(selectable("Names")))
+                .child(div().flex_1().child(selectable("Verbs"))),
         )
         .children(rules.iter().map(|r| {
             let verbs = list(r, "verbs");
@@ -48,19 +49,19 @@ pub(super) fn rules_table(rules: &[Value], cx: &App) -> Div {
                 .text_sm()
                 .border_b_1()
                 .border_color(theme.border)
-                .child(div().w(px(180.)).child(list(r, "apiGroups")))
-                .child(div().w(px(320.)).child(if non_resource == "-" {
+                .child(div().w(px(180.)).child(selectable(list(r, "apiGroups"))))
+                .child(div().w(px(320.)).child(selectable(if non_resource == "-" {
                     list(r, "resources")
                 } else {
                     format!("URLs: {non_resource}")
-                }))
-                .child(div().w(px(200.)).text_color(theme.muted_foreground).child(
+                })))
+                .child(div().w(px(200.)).text_color(theme.muted_foreground).child(selectable(
                     match list(r, "resourceNames").as_str() {
                         "-" => "any".to_string(),
                         n => n.to_string(),
                     },
-                ))
-                .child(div().flex_1().when(danger(&verbs), |d| d.text_color(theme.warning)).child(verbs))
+                )))
+                .child(div().flex_1().when(danger(&verbs), |d| d.text_color(theme.warning)).child(selectable(verbs)))
         }))
 }
 
@@ -75,9 +76,9 @@ pub(super) fn subjects_table(ctx: &Ctx, subjects: &[Value], removable: bool, cx:
                 .text_color(theme.muted_foreground)
                 .border_b_1()
                 .border_color(theme.border)
-                .child(div().w(px(140.)).child("Kind"))
-                .child(div().w(px(380.)).child("Name"))
-                .child(div().w(px(200.)).child("Namespace")),
+                .child(div().w(px(140.)).child(selectable("Kind")))
+                .child(div().w(px(380.)).child(selectable("Name")))
+                .child(div().w(px(200.)).child(selectable("Namespace"))),
         )
         .children(subjects.iter().enumerate().map(|(i, sub)| {
             let kind = sub["kind"].as_str().unwrap_or("?").to_string();
@@ -90,13 +91,18 @@ pub(super) fn subjects_table(ctx: &Ctx, subjects: &[Value], removable: bool, cx:
                 .text_sm()
                 .border_b_1()
                 .border_color(theme.border)
-                .child(div().w(px(140.)).child(kind.clone()))
+                .child(div().w(px(140.)).child(selectable(kind.clone())))
                 .child(div().w(px(380.)).child(if kind == "ServiceAccount" {
                     ctx.link_in(name.clone(), "serviceaccounts", &name, ns.clone(), cx).into_any_element()
                 } else {
-                    div().child(name).into_any_element()
+                    div().child(selectable(name)).into_any_element()
                 }))
-                .child(div().w(px(200.)).text_color(theme.muted_foreground).child(ns.unwrap_or_else(|| "-".into())))
+                .child(
+                    div()
+                        .w(px(200.))
+                        .text_color(theme.muted_foreground)
+                        .child(selectable(ns.unwrap_or_else(|| "-".into()))),
+                )
                 .when(removable, |d| {
                     d.child(
                         div()
@@ -143,7 +149,7 @@ pub(super) fn binding_row(ctx: &Ctx, b: &Value, cx: &App) -> Div {
             ns,
             cx,
         )))
-        .child(div().flex_1().text_xs().child(subjects.join(", ")))
+        .child(div().flex_1().text_xs().child(selectable(subjects.join(", "))))
 }
 
 /// Role or ClusterRole: its rules and who it is bound to.
@@ -164,12 +170,12 @@ pub(super) fn role_page(ctx: &Ctx, cx: &App) -> Div {
                 .pt_2()
                 .text_xs()
                 .text_color(cx.theme().muted_foreground)
-                .child("Aggregated: its rules come from ClusterRoles matching its aggregationRule."),
+                .child(selectable("Aggregated: its rules come from ClusterRoles matching its aggregationRule.")),
         );
     }
     d.child(heading(&format!("Bound by ({})", bindings.len())))
         .when(ctx.related.rbac.is_none(), |d| {
-            d.child(div().text_sm().text_color(cx.theme().muted_foreground).child("Loading…"))
+            d.child(div().text_sm().text_color(cx.theme().muted_foreground).child(selectable("Loading…")))
         })
         .children(rbac_note(ctx, cx))
         .children(bindings.iter().map(|b| binding_row(ctx, b, cx)))
@@ -178,7 +184,7 @@ pub(super) fn role_page(ctx: &Ctx, cx: &App) -> Div {
 /// Which roles and bindings could not be listed, so an empty section does not read as "none".
 fn rbac_note(ctx: &Ctx, cx: &App) -> Option<Div> {
     let note = ctx.related.rbac.as_ref()?.load_note()?;
-    Some(div().py_1().text_xs().text_color(cx.theme().warning).child(note))
+    Some(div().py_1().text_xs().text_color(cx.theme().warning).child(selectable(note)))
 }
 
 /// RoleBinding or ClusterRoleBinding: the role it grants and to whom.
@@ -203,7 +209,7 @@ pub(super) fn binding_page(ctx: &Ctx, cx: &App) -> Div {
                 .pt_4()
                 .child(field(
                     "Grants",
-                    h_flex().gap_1().child(role_kind.clone()).child(ctx.link_in(
+                    h_flex().gap_1().child(selectable(role_kind.clone())).child(ctx.link_in(
                         role.clone(),
                         link_kind,
                         &role,
@@ -230,7 +236,7 @@ pub(super) fn service_account_page(ctx: &Ctx, cx: &App) -> Div {
     let theme = cx.theme();
     let mut d = v_flex().child(heading(&format!("Bindings that apply ({})", grants.len())));
     if ctx.related.rbac.is_none() {
-        d = d.child(div().text_sm().text_color(theme.muted_foreground).child("Loading…"));
+        d = d.child(div().text_sm().text_color(theme.muted_foreground).child(selectable("Loading…")));
     }
     d = d.children(rbac_note(ctx, cx));
     for (binding, role, scope, rules) in grants {
@@ -241,12 +247,16 @@ pub(super) fn service_account_page(ctx: &Ctx, cx: &App) -> Div {
                 .rounded_md()
                 .border_1()
                 .border_color(theme.border)
-                .child(h_flex().gap_2().text_sm().child(div().font_weight(FontWeight::MEDIUM).child(binding)).child(
-                    div().text_color(theme.muted_foreground).child(format!(
-                        "→ {role} · {}",
-                        scope.map_or_else(|| "cluster-wide".into(), |s| format!("in {s}"))
-                    )),
-                ))
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .text_sm()
+                        .child(div().font_weight(FontWeight::MEDIUM).child(selectable(binding)))
+                        .child(div().text_color(theme.muted_foreground).child(selectable(format!(
+                            "→ {role} · {}",
+                            scope.map_or_else(|| "cluster-wide".into(), |s| format!("in {s}"))
+                        )))),
+                )
                 .child(rules_table(&rules, cx)),
         );
     }

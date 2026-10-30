@@ -10,6 +10,7 @@ use serde_json::Value;
 
 use super::{Ctx, card, heading, s};
 use crate::k8s;
+use crate::ui::selectable::selectable;
 
 /// Requests and limits added up over these pods (millicores, bytes): cpu request, cpu limit,
 /// memory request, memory limit.
@@ -196,10 +197,10 @@ pub fn usage_chart(data: &crate::prom::Series, spec: ChartSpec, cx: &App) -> Div
         .child(
             h_flex()
                 .gap_2()
-                .child(div().text_sm().font_weight(FontWeight::MEDIUM).child(title.to_string()))
-                .child(div().text_sm().text_color(color).child(last))
+                .child(div().text_sm().font_weight(FontWeight::MEDIUM).child(selectable(title.to_string())))
+                .child(div().text_sm().text_color(color).child(selectable(last)))
                 .child(div().flex_1())
-                .child(div().text_xs().text_color(theme.muted_foreground).child(legend)),
+                .child(div().text_xs().text_color(theme.muted_foreground).child(selectable(legend))),
         )
         .child(div().h(px(140.)).child(c))
 }
@@ -265,19 +266,25 @@ pub(super) fn usage_card(
     v_flex()
         .w(px(250.))
         .gap_1()
-        .child(h_flex().gap_1().text_xs().child(Icon::new(icon).size_3p5().text_color(color)).child(title.to_string()))
+        .child(
+            h_flex()
+                .gap_1()
+                .text_xs()
+                .child(Icon::new(icon).size_3p5().text_color(color))
+                .child(selectable(title.to_string())),
+        )
         .child(
             card(cx)
-                .child(div().text_xs().text_color(muted).child("Usage"))
+                .child(div().text_xs().text_color(muted).child(selectable("Usage")))
                 .child(
                     h_flex()
                         .gap_2()
-                        .child(div().w(px(56.)).text_sm().child(show(usage)))
+                        .child(div().w(px(56.)).text_sm().child(selectable(show(usage))))
                         .child(div().flex_1().child(usage_bar(usage, request, limit, color, cx))),
                 )
-                .child(div().pt_1().text_xs().text_color(muted).child("Allocation"))
-                .child(div().text_xs().child(format!("Requests: {}", show(request))))
-                .child(div().text_xs().child(format!("Limits: {}", show(limit)))),
+                .child(div().pt_1().text_xs().text_color(muted).child(selectable("Allocation")))
+                .child(div().text_xs().child(selectable(format!("Requests: {}", show(request)))))
+                .child(div().text_xs().child(selectable(format!("Limits: {}", show(limit))))),
         )
 }
 
