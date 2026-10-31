@@ -5,6 +5,24 @@ and versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.5.0](https://github.com/nahuel11500/recouvrance/compare/v0.4.1...v0.5.0) - 2026-10-31
+
+### Added
+
+- *(ui)* Select and copy any text on detail pages (#644)
+- *(files)* Read a container that isn't running from a copy of the pod (#637)
+- *(nodes)* Trouble taints in a node's status, yellow when cordoned or tainted (#643)
+- *(argo)* Diagnose why an Application drifts, loops, failed or is stuck (#642)
+- *(timeline)* Record changes while the app watches, a Timeline page across clusters (#636)
+- *(files)* Read a container without a shell through a debug container (#638)
+- *(problems)* References to objects that don't exist (#630)
+- *(network)* Reachability tab and check_reachability tool (#635)
+- *(argo)* An Argo CD page listing every Application across clusters (#631)
+- *(files)* Browse a container's files through exec (#634)
+- *(upgrade)* Check what breaks on the next Kubernetes minor version (#633)
+- *(history)* A History tab and get_changes, from what the cluster keeps (#632)
+- *(keys)* List the shortcuts on ?, jump to pages with g, move in tables with j/k (#629)
+
 ## [0.4.1](https://github.com/nahuel11500/recouvrance/compare/v0.4.0...v0.4.1) - 2026-10-29
 
 The first published release of 0.4: v0.4.0 was tagged, but its macOS builds failed and it was never published.
