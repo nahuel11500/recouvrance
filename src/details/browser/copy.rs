@@ -270,7 +270,7 @@ impl FileBrowser {
                 .text_xs()
                 .text_color(theme.muted_foreground)
                 .child(Icon::new(Lucide::Info).size_3p5())
-                .child(div().flex_1().child(format!(
+                .child(div().flex_1().min_w_0().child(format!(
                     "Read from pod {}, a copy of this one started from the same images with the same volumes: files \
                      the container wrote while it ran are not here. {} holds the copy's busybox. It stops at {ends}, \
                      and is deleted when this page closes.",

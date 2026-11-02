@@ -36,7 +36,7 @@ pub fn image(context: &str) -> String {
 /// there, or a refusal, is not that.
 pub fn needed(e: &anyhow::Error) -> bool {
     let text = format!("{e:#}").to_ascii_lowercase();
-    text.contains("no shell in this image")
+    text.contains(super::NO_SHELL)
         || text.contains(": not found")
         || text.contains("command not found")
         || (text.contains("xargs: ") && text.contains("no such file or directory"))
@@ -295,7 +295,7 @@ mod tests {
     #[test]
     fn only_a_missing_shell_or_tool_calls_for_a_debug_container() {
         let needed = |text: &str| super::needed(&anyhow::anyhow!("{text}"));
-        assert!(needed("no shell in this image (…): exec: \"sh\": executable file not found in $PATH"));
+        assert!(needed("no shell in this image: exec: \"sh\": executable file not found in $PATH"));
         assert!(needed("sh: stat: not found"));
         assert!(needed("sh: 1: stat: not found"));
         assert!(needed("sh: line 3: readlink: command not found"));

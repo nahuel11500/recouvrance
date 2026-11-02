@@ -320,13 +320,33 @@ exec head -c "$2" "$p"
 const NEEDS_FIND: &str =
     "command -v find >/dev/null 2>&1 || { echo 'there is no find command in this container' >&2; exit 127; }\n";
 
-/// `e`, with the reason when the container has no shell to run the scripts.
+/// How an error from a container without a shell to run the scripts starts; what the
+/// runtime said follows, after `: `.
+pub const NO_SHELL: &str = "no shell in this image";
+
+/// `e`, said plainly when the container has no shell to run the scripts: [`NO_SHELL`] and
+/// what the runtime said, without the API server's wrapping around it.
 fn explain(e: anyhow::Error) -> anyhow::Error {
     let text = format!("{e:#}");
-    match ended_reason(&text) {
-        Some(hint) => anyhow!("{hint}: {text}"),
-        None => e,
+    if ended_reason(&text).is_none() {
+        return e;
     }
+    anyhow!("{NO_SHELL}: {}", runtime_said(&text))
+}
+
+/// The runtime's own words in an exec failure: the API server wraps them in "Internal error
+/// occurred" (twice) and the exec's id, which say nothing to the reader.
+fn runtime_said(text: &str) -> &str {
+    for mark in ["unable to start container process: ", "OCI runtime exec failed: "] {
+        if let Some((_, said)) = text.rsplit_once(mark) {
+            return said.trim();
+        }
+    }
+    let mut said = text.trim();
+    while let Some(rest) = said.strip_prefix("Internal error occurred: ") {
+        said = rest;
+    }
+    said
 }
 
 /// Bytes as an argument for `printf %b`: printable ASCII as is, the rest (and `\`) as
@@ -1069,5 +1089,27 @@ mod tests {
         assert_eq!(copy[0], format!("{TOOLS_BIN}/sh"));
         assert_eq!(copy[2], format!("export PATH={TOOLS_BIN}:$PATH\nls"));
         assert_eq!(copy[3..], ["sh", "/etc"]);
+    }
+
+    #[test]
+    fn a_missing_shell_is_said_in_the_runtime_s_words() {
+        use super::{NO_SHELL, explain};
+        let wrapped = "Internal error occurred: Internal error occurred: error executing command in container: failed \
+                       to exec in container: failed to start exec \"0123456789abcdef\": OCI runtime exec failed: exec \
+                       failed: unable to start container process: exec: \"sh\": executable file not found in $PATH: \
+                       unknown";
+        let said = format!("{:#}", explain(anyhow::anyhow!("{wrapped}")));
+        assert_eq!(said, format!("{NO_SHELL}: exec: \"sh\": executable file not found in $PATH: unknown"));
+        assert!(super::debug::needed(&anyhow::anyhow!("{said}")));
+        // Without the runtime's part, the repeated wrapping goes.
+        let said = format!(
+            "{:#}",
+            explain(anyhow::anyhow!(
+                "Internal error occurred: Internal error occurred: exec: \"sh\": stat sh: no such file or directory"
+            ))
+        );
+        assert_eq!(said, format!("{NO_SHELL}: exec: \"sh\": stat sh: no such file or directory"));
+        // Any other error is left as it is.
+        assert_eq!(format!("{:#}", explain(anyhow::anyhow!("permission denied"))), "permission denied");
     }
 }

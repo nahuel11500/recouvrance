@@ -292,6 +292,7 @@ impl Diagnosis {
         d.findings.extend(stuck(app, now));
         d.findings.extend(failed(app));
         d.findings.extend(errors(app));
+        d.findings.extend(degraded(app));
         let out_of_sync: Vec<&Value> =
             arr(app, "/status/resources").iter().filter(|r| r["status"] == "OutOfSync").collect();
         // Out of sync and still there: what the live object holds is worth comparing.
@@ -305,7 +306,7 @@ impl Diagnosis {
             d.looping = looping(app, &differing);
             d.findings.push(loop_finding(&lp, &d.looping));
         }
-        if let Some(f) = out_of_sync_finding(&out_of_sync, automated, d.moved.as_ref()) {
+        if let Some(f) = out_of_sync_finding(&out_of_sync, live, automated, d.moved.as_ref()) {
             d.findings.push(f);
         }
         let mut seen = BTreeSet::new();
@@ -326,35 +327,24 @@ impl Diagnosis {
     }
 }
 
-/// Whether a resource of an Application's `status.resources` is in the cluster.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Seen {
-    there: bool,
-    /// Read live, not taken from Argo CD's status.
-    live: bool,
-}
-
 /// Whether the resource `r` (an entry of `status.resources`) is in the cluster: the live read
 /// when it read it, else Argo CD's status (a health of `Missing` is gone; any other health,
 /// `Synced` or one to prune, it saw live). None when neither says: Argo CD keeps no health
 /// for kinds without a health check (ConfigMap, Secret...), so an out-of-sync one may be
 /// there or not.
-fn seen(r: &Value, live: &[Drift]) -> Option<Seen> {
+fn there(r: &Value, live: &[Drift]) -> Option<bool> {
     let res = Res::of(r)?;
     match live.iter().find(|d| d.res.same(&res)).map(|d| &d.compared) {
-        Some(Compared::Gone) => return Some(Seen { there: false, live: true }),
-        Some(Compared::LastApplied | Compared::ServerSide | Compared::NoCopy) => {
-            return Some(Seen { there: true, live: true });
-        }
+        Some(Compared::Gone) => return Some(false),
+        Some(Compared::LastApplied | Compared::ServerSide | Compared::NoCopy) => return Some(true),
         Some(Compared::NotRead(_)) | None => {}
     }
-    let there = match s(r, "/health/status") {
-        Some("Missing") => false,
-        Some(_) => true,
-        None if r["status"] == "Synced" || r["requiresPruning"] == true => true,
-        None => return None,
-    };
-    Some(Seen { there, live: false })
+    match s(r, "/health/status") {
+        Some("Missing") => Some(false),
+        Some(_) => Some(true),
+        None if r["status"] == "Synced" || r["requiresPruning"] == true => Some(true),
+        None => None,
+    }
 }
 
 /// When the last sync that worked finished: the newest deployment, else the last operation's end.
@@ -403,16 +393,18 @@ fn deletion(app: &Value, now: Timestamp, live: &[Drift]) -> Option<Finding> {
     let mut gone = 0;
     for r in arr(app, "/status/resources") {
         let Some(res) = Res::of(r) else { continue };
-        let what = match seen(r, live) {
-            Some(Seen { there: false, .. }) => {
+        // Read live, not taken from Argo CD's status.
+        let read = live.iter().any(|d| d.res.same(&res) && !matches!(d.compared, Compared::NotRead(_)));
+        let what = match there(r, live) {
+            Some(false) => {
                 gone += 1;
                 if errors.iter().any(|e| names(e, &res.name)) {
                     failing_on.push((res, "already gone, yet Argo CD's DeletionError is about it".to_string()));
                 }
                 continue;
             }
-            Some(Seen { there: true, live: true }) => "not deleted yet",
-            Some(Seen { there: true, live: false }) => "not deleted yet, as Argo CD last saw it",
+            Some(true) if read => "not deleted yet",
+            Some(true) => "not deleted yet, as Argo CD last saw it",
             None => "listed by Argo CD, its live object wasn't read",
         };
         objects.push((res, what.to_string()));
@@ -608,6 +600,42 @@ fn errors(app: &Value) -> Vec<Finding> {
         .collect()
 }
 
+/// Health Degraded: the resources Argo CD reports degraded, each with its health message.
+/// Argo CD may not keep health per resource in the Application (it can be turned off): it is
+/// then said without a culprit, rather than nothing.
+fn degraded(app: &Value) -> Option<Finding> {
+    if s(app, "/status/health/status") != Some("Degraded") {
+        return None;
+    }
+    let objects: Vec<(Res, String)> = arr(app, "/status/resources")
+        .iter()
+        .filter(|r| s(r, "/health/status") == Some("Degraded"))
+        .filter_map(|r| Some((Res::of(r)?, s(r, "/health/message").unwrap_or("degraded").to_string())))
+        .collect();
+    let n = objects.len();
+    let (objects, more) = clip(objects);
+    let (title, hint) = if n == 0 {
+        (
+            "Degraded; Argo CD doesn't report which resource".to_string(),
+            "This Argo CD keeps no health per resource in the Application: look among its resources for the \
+             unhealthy one (a workload whose pods aren't ready, a failed Job).",
+        )
+    } else {
+        (
+            format!("Degraded: {n} {}", if n == 1 { "resource" } else { "resources" }),
+            "Open the resource: its status, events and pods say why it is unhealthy.",
+        )
+    };
+    Some(Finding {
+        tone: Tone::Bad,
+        title,
+        message: s(app, "/status/health/message").map(String::from),
+        objects,
+        more,
+        hint: hint.into(),
+    })
+}
+
 /// The newest deployments synced the same revision `LOOP_SYNCS` times or more within
 /// `LOOP_WINDOW`, without anyone asking for them (a user's syncs don't make a loop), and the
 /// last of them is recent.
@@ -680,7 +708,14 @@ fn loop_finding(lp: &SyncLoop, looping: &[Res]) -> Finding {
     }
 }
 
-fn out_of_sync_finding(resources: &[&Value], automated: bool, moved: Option<&(String, String)>) -> Option<Finding> {
+/// What is out of sync, each object said as missing or differing only when it is known to be
+/// gone or there (see [`there`]).
+fn out_of_sync_finding(
+    resources: &[&Value],
+    live: &[Drift],
+    automated: bool,
+    moved: Option<&(String, String)>,
+) -> Option<Finding> {
     if resources.is_empty() {
         return None;
     }
@@ -689,10 +724,12 @@ fn out_of_sync_finding(resources: &[&Value], automated: bool, moved: Option<&(St
         .filter_map(|r| {
             let what = if r["requiresPruning"] == true {
                 "in the cluster, no longer in git: a sync with prune deletes it"
-            } else if r.pointer("/health/status").and_then(Value::as_str) == Some("Missing") {
-                "in git, not in the cluster yet"
             } else {
-                "differs from git"
+                match there(r, live) {
+                    Some(false) => "in git, not in the cluster yet",
+                    Some(true) => "differs from git",
+                    None => "out of sync with git (its live object wasn't read)",
+                }
             };
             Some((Res::of(r)?, what.to_string()))
         })
@@ -1386,10 +1423,72 @@ mod tests {
     }
 
     #[test]
+    fn a_kind_without_health_is_missing_or_differing_as_read_live() {
+        // Argo CD keeps no health for a ConfigMap: its status alone can't say it is there.
+        let app = json!({"status": {"resources": [
+            {"version": "v1", "kind": "ConfigMap", "namespace": "shop", "name": "a", "status": "OutOfSync"},
+            {"version": "v1", "kind": "ConfigMap", "namespace": "shop", "name": "b", "status": "OutOfSync"},
+            {"version": "v1", "kind": "ConfigMap", "namespace": "shop", "name": "c", "status": "OutOfSync"}
+        ]}});
+        let cm = |name: &str| Res {
+            kind: "ConfigMap".into(),
+            namespace: "shop".into(),
+            name: name.into(),
+            version: "v1".into(),
+            ..Default::default()
+        };
+        let what = |d: &Diagnosis| d.findings[0].objects.iter().map(|(_, w)| w.clone()).collect::<Vec<_>>();
+        let d = Diagnosis::of(&app, now());
+        // Each is read live: whether it is there isn't known yet.
+        assert_eq!(d.to_compare, [cm("a"), cm("b"), cm("c")]);
+        assert_eq!(what(&d), ["out of sync with git (its live object wasn't read)"; 3]);
+        let live = [
+            Drift::not_read(&cm("a"), Compared::Gone),
+            Drift { compared: Compared::LastApplied, ..Drift::not_read(&cm("b"), Compared::NoCopy) },
+            Drift::not_read(&cm("c"), Compared::NotRead("forbidden".into())),
+        ];
+        let d = Diagnosis::of_live(&app, now(), &live);
+        assert_eq!(
+            what(&d),
+            [
+                "in git, not in the cluster yet",
+                "differs from git",
+                "out of sync with git (its live object wasn't read)"
+            ]
+        );
+    }
+
+    #[test]
     fn nothing_found_for_a_synced_app() {
         let app = json!({"status": {"sync": {"status": "Synced"}, "operationState": {"phase": "Succeeded"},
             "resources": [{"kind": "ConfigMap", "name": "a", "namespace": "x", "status": "Synced"}]}});
         assert!(Diagnosis::of(&app, now()).is_empty());
+    }
+
+    #[test]
+    fn degraded_health_is_said_with_the_resources_or_without() {
+        let app = json!({"status": {"sync": {"status": "Synced"}, "health": {"status": "Degraded"},
+        "resources": [
+            {"group": "apps", "version": "v1", "kind": "Deployment", "namespace": "shop", "name": "web", "status": "Synced",
+             "health": {"status": "Degraded", "message": "Deployment \"web\" exceeded its progress deadline"}},
+            {"version": "v1", "kind": "ConfigMap", "namespace": "shop", "name": "a", "status": "Synced"}
+        ]}});
+        let d = Diagnosis::of(&app, now());
+        assert_eq!(d.findings.len(), 1);
+        let f = &d.findings[0];
+        assert_eq!((f.tone, f.title.as_str()), (Tone::Bad, "Degraded: 1 resource"));
+        assert_eq!(f.objects.len(), 1);
+        assert_eq!(f.objects[0].0, deployment());
+        assert!(f.objects[0].1.contains("progress deadline"), "{:?}", f.objects);
+        // No health per resource: still said.
+        let bare = json!({"status": {"sync": {"status": "Synced"}, "health": {"status": "Degraded"},
+            "resources": [{"group": "apps", "version": "v1", "kind": "Deployment", "namespace": "shop", "name": "web", "status": "Synced"}]}});
+        let f = &Diagnosis::of(&bare, now()).findings[0];
+        assert_eq!(f.title, "Degraded; Argo CD doesn't report which resource");
+        assert!(f.objects.is_empty());
+        // Healthy, or on its way: nothing.
+        let healthy = json!({"status": {"sync": {"status": "Synced"}, "health": {"status": "Progressing"}}});
+        assert!(Diagnosis::of(&healthy, now()).is_empty());
     }
 
     #[test]

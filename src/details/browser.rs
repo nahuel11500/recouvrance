@@ -31,6 +31,7 @@ use crate::k8s;
 use crate::k8s::files::debug::{self, Look, Plan};
 use crate::k8s::files::{self, Entry, FileKind, FileSource, Found, Origin, Preview};
 use crate::latest::Latest;
+use crate::ui::selectable::selectable;
 use copy::CopyState;
 
 /// The most of a file previewed.
@@ -836,11 +837,22 @@ impl FileBrowser {
         // The container stopped meanwhile: offer its copy.
         let copy = (self.stopped().is_some() && !self.place().is_some_and(Place::read_from_copy))
             .then(|| self.copy_button(cx));
+        // No shell: said in a line, what the runtime said under it; the debug container is
+        // the way to read it.
+        let no_shell = no_shell(&e).map(str::to_string);
+        let said = match &no_shell {
+            Some(runtime) => v_flex()
+                .gap_0p5()
+                .child(div().text_sm().child(selectable("This image has no shell.")))
+                .child(div().text_xs().text_color(cx.theme().muted_foreground).child(selectable(runtime.clone())))
+                .into_any_element(),
+            None => error_box(e, cx).into_any_element(),
+        };
         v_flex()
             .gap_2()
             .p_2()
-            .child(error_box(e, cx))
-            .children(self.render_debug(cx))
+            .child(said)
+            .children(self.render_debug(no_shell.is_some(), cx))
             .child(h_flex().gap_2().children(copy).child(
                 Button::new("files-retry").xsmall().outline().icon(Lucide::RotateCw).label("Try again").on_click(
                     cx.listener(move |this, _, window, cx| {
@@ -853,8 +865,8 @@ impl FileBrowser {
     }
 
     /// For a container that lacks a shell or tools: where reading it through a debug container
-    /// is, and the button that adds one.
-    fn render_debug(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+    /// is, and the button that adds one. `no_shell`: the lack is already said above.
+    fn render_debug(&self, no_shell: bool, cx: &mut Context<Self>) -> Option<AnyElement> {
         let muted = cx.theme().muted_foreground;
         let note = |text: &str| div().text_sm().text_color(muted).child(text.to_string()).into_any_element();
         Some(match &self.place()?.debug {
@@ -873,10 +885,12 @@ impl FileBrowser {
                 };
                 v_flex()
                     .gap_2()
-                    .child(note(
+                    .child(note(if no_shell {
+                        "Its files can be read through an ephemeral debug container that shares its processes."
+                    } else {
                         "This image has no shell, or lacks the tools to list files (distroless, scratch). Its files can \
-                         be read through an ephemeral debug container that shares its processes.",
-                    ))
+                         be read through an ephemeral debug container that shares its processes."
+                    }))
                     .child(h_flex().child(add))
                     .into_any_element()
             }
@@ -915,7 +929,7 @@ impl FileBrowser {
             .border_b_1()
             .border_color(theme.border)
             .child(Icon::new(Lucide::Search).size_3p5())
-            .child(div().flex_1().child(match found {
+            .child(div().flex_1().min_w_0().child(match found {
                 None => format!("Searching for “{looked}”…"),
                 Some(Err(_)) => format!("The search for “{looked}” failed"),
                 Some(Ok(f)) => format!(
@@ -1055,6 +1069,11 @@ impl FileBrowser {
     }
 }
 
+/// What the runtime said, when listing error `e` is for want of a shell in the image.
+fn no_shell(e: &str) -> Option<&str> {
+    e.strip_prefix(files::NO_SHELL)?.strip_prefix(": ")
+}
+
 /// The `kubectl debug` arguments that add the debug container `plan` says to `pod`: its user
 /// through `--custom` (kubectl 1.31 and later).
 fn kubectl_debug(pod: &str, plan: &Plan) -> String {
@@ -1104,7 +1123,7 @@ impl Render for FileBrowser {
 
 #[cfg(test)]
 mod tests {
-    use super::{Plan, kubectl_debug};
+    use super::{Plan, kubectl_debug, no_shell};
 
     #[test]
     fn the_kubectl_equivalent_runs_as_the_same_user() {
@@ -1122,5 +1141,12 @@ mod tests {
         );
         plan.user = None;
         assert!(kubectl_debug("web-0", &plan).ends_with("-c recouvrance-files-ab12c -- sleep 14400"));
+    }
+
+    #[test]
+    fn a_missing_shell_shows_what_the_runtime_said() {
+        let e = format!("{}: exec: \"sh\": executable file not found in $PATH: unknown", crate::k8s::files::NO_SHELL);
+        assert_eq!(no_shell(&e), Some("exec: \"sh\": executable file not found in $PATH: unknown"));
+        assert_eq!(no_shell("sh: stat: not found"), None);
     }
 }

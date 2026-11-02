@@ -23,24 +23,64 @@ fn word(text: &str, tone: Tone, cx: &App) -> Div {
     div().text_color(tone_color(Some(tone), cx)).child(selectable(text.to_string()))
 }
 
-/// Nothing when Argo CD deploys nothing here; one line when it could not be read.
+/// Nothing when Argo CD deploys nothing here; one line when it could not be read. On an
+/// Application's page, its own status first: the Application that deployed it (its parent)
+/// comes after, under "Deployed by", so its status isn't read as this one's.
 pub(super) fn section(ctx: &Ctx, cx: &App) -> Option<Div> {
     let lookup = ctx.argo;
-    if lookup.apps.is_empty() && lookup.note.is_none() {
+    let own = ctx.kind.is("argoproj.io", "Application").then(|| Summary::of(ctx.obj));
+    if own.is_none() && lookup.apps.is_empty() && lookup.note.is_none() {
         return None;
     }
+    let muted = cx.theme().muted_foreground;
     // A namespace can hold many Applications: one line each. An object has its one in full.
     let full = !ctx.kind.is("", "Namespace");
     let title = if full { "Argo CD".to_string() } else { format!("Argo CD Applications ({})", lookup.apps.len()) };
+    let deployed_by = own.is_some() && !lookup.apps.is_empty();
     Some(
         v_flex()
             .gap_2()
             .child(heading(&title))
+            .when_some(own.as_ref(), |d, app| d.child(own_card(app, cx)))
+            .when(deployed_by, |d| d.child(div().text_xs().text_color(muted).child(selectable("Deployed by"))))
             .when_some(lookup.note.as_ref(), |d, note| {
-                d.child(div().text_xs().text_color(cx.theme().muted_foreground).child(selectable(note.clone())))
+                d.child(div().text_xs().text_color(muted).child(selectable(note.clone())))
             })
             .children(lookup.apps.iter().enumerate().map(|(ix, f)| app_card(ctx, ix, f, full, cx))),
     )
+}
+
+/// An Application's sync, health, auto-sync, revision and last sync, in one row.
+fn status_row(app: &Summary, cx: &App) -> Div {
+    row()
+        .child(field("Sync", word(&app.sync, argo::sync_tone(&app.sync, app.automated), cx), cx))
+        .child(field("Health", word(&app.health, argo::health_tone(&app.health), cx), cx))
+        .child(field("Auto-sync", if app.automated { "On" } else { "Off" }, cx))
+        .when_some(app.revision.as_ref(), |d, rev| d.child(field("Revision", mono(rev.clone(), cx), cx)))
+        .when_some(app.operation.as_ref(), |d, (phase, _, finished)| {
+            let text = match ago(finished.as_deref()) {
+                Some(when) => format!("{phase}, {when}"),
+                None => phase.clone(),
+            };
+            d.child(field("Last sync", word(&text, argo::operation_tone(phase), cx), cx))
+        })
+}
+
+/// The Application of the page itself: its status and health message. What is wrong with it
+/// (a failed sync, errors, a deletion held) is under Diagnosis.
+fn own_card(app: &Summary, cx: &App) -> Div {
+    let theme = cx.theme();
+    v_flex()
+        .p_2()
+        .gap_2()
+        .rounded_md()
+        .border_1()
+        .border_color(theme.border)
+        .bg(theme.secondary.opacity(0.4))
+        .child(status_row(app, cx))
+        .when_some(app.health_message.as_ref(), |d, m| {
+            d.child(div().text_sm().text_color(theme.muted_foreground).child(selectable(m.clone())))
+        })
 }
 
 fn app_card(ctx: &Ctx, ix: usize, found: &Found, full: bool, cx: &App) -> Div {
@@ -67,30 +107,16 @@ fn app_card(ctx: &Ctx, ix: usize, found: &Found, full: bool, cx: &App) -> Div {
                 "Being deleted since {when}: a finalizer or a resource it waits for keeps it"
             ))))
         })
-        .child(
-            row()
-                .child(field("Sync", word(&app.sync, argo::sync_tone(&app.sync, app.automated), cx), cx))
-                .child(field("Health", word(&app.health, argo::health_tone(&app.health), cx), cx))
-                .child(field("Auto-sync", if app.automated { "On" } else { "Off" }, cx))
-                .when_some(app.revision.as_ref(), |d, rev| d.child(field("Revision", mono(rev.clone(), cx), cx)))
-                .when_some(app.operation.as_ref(), |d, (phase, _, finished)| {
-                    let text = match ago(finished.as_deref()) {
-                        Some(when) => format!("{phase}, {when}"),
-                        None => phase.clone(),
-                    };
-                    d.child(field("Last sync", word(&text, argo::operation_tone(phase), cx), cx))
-                })
-                .when_some(app.own.as_ref(), |d, (sync, health, _)| {
-                    d.child(field(
-                        "This object",
-                        h_flex()
-                            .gap_2()
-                            .child(word(sync, argo::sync_tone(sync, app.automated), cx))
-                            .when(!health.is_empty(), |d| d.child(word(health, argo::health_tone(health), cx))),
-                        cx,
-                    ))
-                }),
-        )
+        .child(status_row(app, cx).when_some(app.own.as_ref(), |d, (sync, health, _)| {
+            d.child(field(
+                "This object",
+                h_flex()
+                    .gap_2()
+                    .child(word(sync, argo::sync_tone(sync, app.automated), cx))
+                    .when(!health.is_empty(), |d| d.child(word(health, argo::health_tone(health), cx))),
+                cx,
+            ))
+        }))
         .when_some(app.health_message.as_ref(), |d, m| {
             d.child(div().text_sm().text_color(muted).child(selectable(m.clone())))
         })
