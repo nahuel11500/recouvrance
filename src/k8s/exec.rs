@@ -157,7 +157,8 @@ async fn refused(api: &Api<Pod>, pod: &str, container: Option<&str>, verb: &str,
     let kube::Error::UpgradeConnection(kube::client::UpgradeConnectionError::ProtocolSwitch(status)) = &e else {
         return e.to_string();
     };
-    let read = if status.as_u16() == 400 { api.get(pod).await.ok() } else { None };
+    // A container that isn't running is refused with a 400 or a 500, depending on the runtime.
+    let read = if matches!(status.as_u16(), 400 | 500) { api.get(pod).await.ok() } else { None };
     match refusal_reason(status.as_u16(), verb, read.as_ref(), container) {
         Some(reason) => format!("{e} ({reason})"),
         None => e.to_string(),
@@ -179,6 +180,10 @@ pub(super) fn ended_reason(message: &str) -> Option<String> {
 fn refusal_reason(status: u16, verb: &str, pod: Option<&Pod>, container: Option<&str>) -> Option<String> {
     match status {
         400 => {}
+        500 => {
+            let name = container?;
+            return container_stopped(pod?, name).map(|why| format!("container {name} is not running: {why}"));
+        }
         401 => return Some("the cluster did not accept your credentials".into()),
         403 => return Some(format!("your access does not allow it: create on pods/{verb}")),
         404 => return Some("the pod is gone".into()),
@@ -207,19 +212,27 @@ fn refusal_reason(status: u16, verb: &str, pod: Option<&Pod>, container: Option<
     if !known {
         return Some(format!("the pod has no container {name}"));
     }
-    let state = pod.status.as_ref().and_then(|s| {
-        let all = s.container_statuses.iter().flatten().chain(s.init_container_statuses.iter().flatten());
-        all.chain(s.ephemeral_container_statuses.iter().flatten()).find(|c| c.name == name)?.state.clone()
-    });
-    if let Some(state) = state.filter(|s| s.running.is_none()) {
-        let why = match (state.waiting, state.terminated) {
-            (Some(w), _) => w.reason.unwrap_or_else(|| "waiting".into()),
-            (None, Some(t)) => t.reason.unwrap_or_else(|| "terminated".into()),
-            (None, None) => "not started".into(),
-        };
+    if let Some(why) = container_stopped(pod, name) {
         return Some(format!("container {name} is not running: {why}"));
     }
     Some(generic)
+}
+
+/// Why container `name` of `pod` (as read) isn't running (`CrashLoopBackOff`, `Completed`...),
+/// when its status says so. One the status doesn't list is not known to be stopped.
+pub fn container_stopped(pod: &Pod, name: &str) -> Option<String> {
+    let state = pod.status.as_ref().and_then(|s| {
+        let all = s.container_statuses.iter().flatten().chain(s.init_container_statuses.iter().flatten());
+        all.chain(s.ephemeral_container_statuses.iter().flatten()).find(|c| c.name == name)?.state.clone()
+    })?;
+    if state.running.is_some() {
+        return None;
+    }
+    Some(match (state.waiting, state.terminated) {
+        (Some(w), _) => w.reason.unwrap_or_else(|| "waiting".into()),
+        (None, Some(t)) => t.reason.unwrap_or_else(|| "terminated".into()),
+        (None, None) => "not started".into(),
+    })
 }
 
 /// The most a container download may write to disk (a bigger file or folder is refused).
@@ -810,6 +823,16 @@ mod tests {
         assert!(reason(400, "attach", None, None).contains("need choosing"));
         assert!(reason(403, "attach", None, None).contains("pods/attach"));
         assert_eq!(refusal_reason(500, "exec", None, None), None);
+        // Some runtimes refuse a stopped container with a 500: then it says so, else nothing.
+        assert!(reason(500, "exec", Some(&three), Some("uwsgi")).contains("uwsgi is not running: CrashLoopBackOff"));
+        assert_eq!(refusal_reason(500, "exec", Some(&three), Some("nginx")), None);
+        assert_eq!(refusal_reason(500, "exec", Some(&three), None), None);
+        let done = pod(serde_json::json!({
+            "spec": {"containers": [{"name": "job"}]},
+            "status": {"containerStatuses": [{"name": "job", "image": "", "imageID": "", "ready": false,
+                "restartCount": 0, "state": {"terminated": {"exitCode": 0, "reason": "Completed"}}}]},
+        }));
+        assert!(reason(500, "exec", Some(&done), Some("job")).contains("job is not running: Completed"));
         assert_eq!(
             ended_reason(
                 "OCI runtime exec failed: exec failed: unable to start container process: exec: \"sh\": executable file not found in $PATH: unknown"
