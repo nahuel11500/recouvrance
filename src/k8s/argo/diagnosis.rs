@@ -277,6 +277,13 @@ impl Diagnosis {
     /// auto-sync off that is out of sync (one synced by hand) is not a problem by itself: it
     /// is said, neutral, with what differs.
     pub fn of(app: &Value, now: Timestamp) -> Self {
+        Self::of_live(app, now, &[])
+    }
+
+    /// The same, told with what was read live on the destination (`live`, the drift read
+    /// for [`Diagnosis::to_compare`]): whether an object is there is the live read's word
+    /// over Argo CD's status.
+    pub fn of_live(app: &Value, now: Timestamp, live: &[Drift]) -> Self {
         let automated = app
             .pointer("/spec/syncPolicy/automated")
             .is_some_and(|a| a.is_object() && a.get("enabled").and_then(Value::as_bool) != Some(false));
@@ -317,6 +324,37 @@ impl Diagnosis {
     pub fn is_empty(&self) -> bool {
         self.findings.is_empty()
     }
+}
+
+/// Whether a resource of an Application's `status.resources` is in the cluster.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Seen {
+    there: bool,
+    /// Read live, not taken from Argo CD's status.
+    live: bool,
+}
+
+/// Whether the resource `r` (an entry of `status.resources`) is in the cluster: the live read
+/// when it read it, else Argo CD's status (a health of `Missing` is gone; any other health,
+/// `Synced` or one to prune, it saw live). None when neither says: Argo CD keeps no health
+/// for kinds without a health check (ConfigMap, Secret...), so an out-of-sync one may be
+/// there or not.
+fn seen(r: &Value, live: &[Drift]) -> Option<Seen> {
+    let res = Res::of(r)?;
+    match live.iter().find(|d| d.res.same(&res)).map(|d| &d.compared) {
+        Some(Compared::Gone) => return Some(Seen { there: false, live: true }),
+        Some(Compared::LastApplied | Compared::ServerSide | Compared::NoCopy) => {
+            return Some(Seen { there: true, live: true });
+        }
+        Some(Compared::NotRead(_)) | None => {}
+    }
+    let there = match s(r, "/health/status") {
+        Some("Missing") => false,
+        Some(_) => true,
+        None if r["status"] == "Synced" || r["requiresPruning"] == true => true,
+        None => return None,
+    };
+    Some(Seen { there, live: false })
 }
 
 /// When the last sync that worked finished: the newest deployment, else the last operation's end.

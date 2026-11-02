@@ -204,11 +204,11 @@ const DRIFT_SOURCE: &str = "Each live object is compared with what was last appl
 /// error Argo CD reports, a sync loop) and what is out of sync, with the fields that differ
 /// live. Nothing when all is well. Out of sync with auto-sync off is said, not as a problem.
 pub(super) fn diagnosis(ctx: &Ctx, cx: &App) -> Option<Div> {
-    let d = Diagnosis::of(ctx.obj, jiff::Timestamp::now());
+    let read = ctx.related.argo_drift.as_ref();
+    let d = Diagnosis::of_live(ctx.obj, jiff::Timestamp::now(), read.map(|r| r.drifts.as_slice()).unwrap_or_default());
     if d.is_empty() {
         return None;
     }
-    let read = ctx.related.argo_drift.as_ref();
     let on = read.and_then(|r| r.context.as_deref());
     let muted = cx.theme().muted_foreground;
     let mut section = v_flex().gap_3().child(heading("Diagnosis"));
