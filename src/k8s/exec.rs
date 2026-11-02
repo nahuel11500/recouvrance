@@ -227,15 +227,8 @@ fn refusal_reason(
         500 => {
             let pod = pod?;
             // None named (the pod couldn't be read before the exec): the server took the default one.
-            let default;
-            let name = match container {
-                Some(name) => name,
-                None => {
-                    default = super::typed_pod_containers(pod).into_iter().next()?;
-                    default.as_str()
-                }
-            };
-            return not_running(pod, name, now).map(Known);
+            let name = container.map(str::to_string).or_else(|| super::typed_pod_containers(pod).into_iter().next())?;
+            return not_running(pod, &name, now).map(Known);
         }
         401 => return Some(Known("the cluster did not accept your credentials".into())),
         403 => return Some(Known(format!("your access does not allow it: create on pods/{verb}"))),
