@@ -234,6 +234,16 @@ impl Rows {
 /// Column widths.
 const NAME: f32 = 340.;
 const INDENT: f32 = 16.;
+/// The space kept for a row's menu, so no column draws under it.
+const MENU: f32 = 24.;
+
+/// A column, the same in the header and the rows so they line up. In a narrow window the wide
+/// columns give up width (down to half of it, their text cut with an ellipsis); the short ones
+/// keep theirs. Both shrink alike: the header keeps room for the menu, as the rows do.
+fn column(w: f32, shrinks: bool) -> Div {
+    let d = div().w(px(w)).overflow_hidden().text_ellipsis().whitespace_nowrap();
+    if shrinks { d.flex_shrink(1.).min_w(px(w / 2.)) } else { d.flex_none() }
+}
 
 pub struct ArgoView {
     clusters: Vec<(String, Client)>,
@@ -439,11 +449,11 @@ impl ArgoView {
             Some(context) => div().child(argo::destination_text(context, &a.dest.namespace)),
             None => div().text_color(muted).child(argo::destination_text(&a.dest.cluster, &a.dest.namespace)),
         };
-        let cell = |w: f32| div().w(px(w)).flex_none().overflow_hidden().text_ellipsis().whitespace_nowrap();
         let opener = h_flex()
             .id(("argo-open", i))
             .flex_1()
             .min_w_0()
+            .overflow_hidden()
             .gap_3()
             .cursor_pointer()
             .on_click(open)
@@ -472,25 +482,27 @@ impl ArgoView {
                         d.child(div().flex_none().text_xs().text_color(theme.danger).child(format!("{n} red")))
                     }),
             )
-            .child(cell(130.).text_color(muted).child(app.project.clone()))
+            .child(column(130., true).text_color(muted).child(app.project.clone()))
             .child(
-                cell(90.).text_color(tone_color(argo::sync_tone(&app.sync, app.automated), cx)).child(app.sync.clone()),
+                column(90., false)
+                    .text_color(tone_color(argo::sync_tone(&app.sync, app.automated), cx))
+                    .child(app.sync.clone()),
             )
             .child(
-                cell(100.)
+                column(100., false)
                     .text_color(tone_color(argo::listed_health_tone(&app.health, app.automated), cx))
                     .child(app.health.clone()),
             )
             .child(
-                cell(90.)
+                column(90., false)
                     .font_family(theme.mono_font_family.clone())
                     .text_xs()
                     .child(app.revision.clone().unwrap_or_default()),
             )
-            .child(cell(260.).child(destination))
-            .child(cell(70.).text_color(muted).child(if app.automated { "On" } else { "Off" }))
-            .child(cell(190.).children(last_sync))
-            .when(self.several_hubs(), |d| d.child(cell(150.).text_color(muted).child(a.hub.context.clone())));
+            .child(column(260., true).child(destination))
+            .child(column(70., false).text_color(muted).child(if app.automated { "On" } else { "Off" }))
+            .child(column(190., true).children(last_sync))
+            .when(self.several_hubs(), |d| d.child(column(150., true).text_color(muted).child(a.hub.context.clone())));
         h_flex()
             .id(("argo-row", i))
             .w_full()
@@ -505,12 +517,16 @@ impl ArgoView {
             .child(div().w(px(indent)).flex_none())
             .child(div().w(px(20.)).flex_none().when(grouped, |d| d.child(toggle)))
             .child(opener)
-            .child(row_menu(&k, a.on.is_some() && !a.dest.namespace.is_empty(), view))
+            .child(div().w(px(MENU)).flex_none().child(row_menu(
+                &k,
+                a.on.is_some() && !a.dest.namespace.is_empty(),
+                view,
+            )))
             .into_any_element()
     }
 
     fn header(&self, cx: &App) -> Div {
-        let cell = |w: f32, text: &'static str| div().w(px(w)).flex_none().child(text);
+        let cell = |w: f32, shrinks: bool, text: &'static str| column(w, shrinks).child(text);
         h_flex()
             .gap_3()
             .px_2()
@@ -520,14 +536,17 @@ impl ArgoView {
             .border_b_1()
             .border_color(cx.theme().border)
             .child(div().w(px(NAME + 4.)).flex_none().child("Application"))
-            .child(cell(130., "Project"))
-            .child(cell(90., "Sync"))
-            .child(cell(100., "Health"))
-            .child(cell(90., "Revision"))
-            .child(cell(260., "Destination"))
-            .child(cell(70., "Auto-sync"))
-            .child(cell(190., "Last sync"))
-            .when(self.several_hubs(), |d| d.child(cell(150., "Argo CD on")))
+            .child(cell(130., true, "Project"))
+            .child(cell(90., false, "Sync"))
+            .child(cell(100., false, "Health"))
+            .child(cell(90., false, "Revision"))
+            .child(cell(260., true, "Destination"))
+            .child(cell(70., false, "Auto-sync"))
+            .child(cell(190., true, "Last sync"))
+            .when(self.several_hubs(), |d| d.child(cell(150., true, "Argo CD on")))
+            // Where the rows have their menu (after a 4 px gap, the header's are 12): the columns
+            // get the same room in both, so they shrink alike.
+            .child(div().w(px(MENU - 8.)).flex_none())
     }
 
     /// The search, the state toggles with their counts, and the project and destination pickers.
