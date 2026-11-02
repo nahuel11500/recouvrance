@@ -13,6 +13,8 @@ pub(super) fn node(obj: &Value, cx: &App) -> Div {
     let info = |k: &str| s(obj, &format!("/status/nodeInfo/{k}")).unwrap_or("-").to_string();
     let cap = |k: &str| s(obj, &format!("/status/capacity/{k}")).unwrap_or("-").to_string();
     let alloc = |k: &str| s(obj, &format!("/status/allocatable/{k}")).unwrap_or("-").to_string();
+    // "126695024Ki" -> "120.82Gi", as the rest of the page reads memory.
+    let bytes = |q: &str| if q == "-" { q.to_string() } else { k8s::format_bytes(k8s::parse_bytes(q)) };
     let text = |t: &Value, k: &str| t[k].as_str().unwrap_or_default().to_string();
     let spec_taints: Vec<(String, String, String)> =
         arr(obj, "/spec/taints").iter().map(|t| (text(t, "key"), text(t, "value"), text(t, "effect"))).collect();
@@ -48,7 +50,11 @@ pub(super) fn node(obj: &Value, cx: &App) -> Div {
                 .child(field("Kernel", info("kernelVersion"), cx))
                 .child(field("Runtime", info("containerRuntimeVersion"), cx))
                 .child(field("CPU", format!("{} ({} allocatable)", cap("cpu"), alloc("cpu")), cx))
-                .child(field("Memory", format!("{} ({} allocatable)", cap("memory"), alloc("memory")), cx))
+                .child(field(
+                    "Memory",
+                    format!("{} ({} allocatable)", bytes(&cap("memory")), bytes(&alloc("memory"))),
+                    cx,
+                ))
                 .child(field("Architecture", format!("{}/{}", info("operatingSystem"), info("architecture")), cx))
                 .child(field(
                     "Instance type",

@@ -104,6 +104,27 @@ fn sum_series(all: impl IntoIterator<Item = (i64, f64)>) -> Series {
     by_time.into_iter().collect()
 }
 
+/// Two series charted side by side, kept to the times both have, so their x-axis labels
+/// read the same times (memory often has a point CPU's rate has not, or the other way).
+/// When they share no time (one is empty), both as they are.
+pub fn same_times(a: &[(i64, f64)], b: &[(i64, f64)]) -> (Series, Series) {
+    let times = |s: &[(i64, f64)]| s.iter().map(|p| p.0).collect::<std::collections::HashSet<i64>>();
+    let (ta, tb) = (times(a), times(b));
+    if ta.is_disjoint(&tb) {
+        return (a.to_vec(), b.to_vec());
+    }
+    let keep = |s: &[(i64, f64)], other: &std::collections::HashSet<i64>| -> Series {
+        s.iter().filter(|p| other.contains(&p.0)).copied().collect()
+    };
+    (keep(a, &tb), keep(b, &ta))
+}
+
+/// The end of a range query: now, on a 15 s grid. Every step is a multiple of 15 s, so
+/// queries sent together (CPU and memory) land their points on the same times.
+fn range_end(now: i64) -> i64 {
+    now - now.rem_euclid(15)
+}
+
 /// `query_range` over the last `minutes`, summed into one series.
 pub async fn range(client: Client, target: String, promql: String, minutes: i64, step_secs: i64) -> Result<Series> {
     let all = range_by(client, target, promql, minutes, step_secs, "").await?;
@@ -121,7 +142,7 @@ pub async fn range_by(
 ) -> Result<HashMap<String, Series>> {
     let label = label.to_string();
     run(async move {
-        let end = jiff::Timestamp::now().as_second();
+        let end = range_end(jiff::Timestamp::now().as_second());
         let start = end - minutes * 60;
         let mut q = form_urlencoded(&[
             ("query", &promql),
@@ -414,6 +435,32 @@ mod tests {
         let summed = super::sum_series([(30, 1.0), (10, 2.0), (30, 0.5), (20, 4.0), (10, 1.0)]);
         assert_eq!(summed, [(10, 3.0), (20, 4.0), (30, 1.5)]);
         assert!(super::sum_series([]).is_empty());
+    }
+
+    #[test]
+    fn side_by_side_series_share_their_times() {
+        let cpu = [(15, 1.0), (30, 2.0), (45, 3.0), (60, 4.0)];
+        let mem = [(0, 9.0), (15, 8.0), (45, 7.0), (60, 6.0), (75, 5.0)];
+        let (c, m) = super::same_times(&cpu, &mem);
+        assert_eq!(c, [(15, 1.0), (45, 3.0), (60, 4.0)]);
+        assert_eq!(m, [(15, 8.0), (45, 7.0), (60, 6.0)]);
+        // Nothing in common (one empty): left as they are, not both emptied.
+        let (c, m) = super::same_times(&cpu, &[]);
+        assert_eq!((c.as_slice(), m.as_slice()), (&cpu[..], &[][..]));
+        let (c, m) = super::same_times(&cpu, &[(16, 1.0)]);
+        assert_eq!((c.as_slice(), m.as_slice()), (&cpu[..], &[(16, 1.0)][..]));
+    }
+
+    #[test]
+    fn range_queries_end_on_a_shared_grid() {
+        for now in [0, 1, 14, 15, 1_700_000_007, 1_700_000_014] {
+            let end = super::range_end(now);
+            assert!(end <= now && now - end < 15 && end % 15 == 0, "{now} -> {end}");
+        }
+        // Every step the charts use is a multiple of the grid.
+        for minutes in [15, 60, 360, 1440, 10080] {
+            assert_eq!((minutes * 60 / 120).max(15) % 15, 0, "{minutes}");
+        }
     }
 
     #[test]

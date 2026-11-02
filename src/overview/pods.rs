@@ -667,22 +667,29 @@ pub fn sort_pod_rows(rows: &mut [PodRow], order: PodOrder) {
 }
 
 /// The pods table's columns: header, width, sort. Namespace only when the pods come from
-/// several namespaces (a node's page).
-fn pod_columns(ctx: &Ctx) -> Vec<(&'static str, f32, PodSort)> {
+/// several namespaces (a node's page). The header and every row take their widths from
+/// here, so the cells line up.
+fn pod_columns(namespaced: bool) -> Vec<(&'static str, f32, PodSort)> {
     let mut cols = vec![("Name", 320., PodSort::Name)];
-    if ctx.ns().is_none() {
+    if !namespaced {
         cols.insert(0, ("Namespace", 180., PodSort::Namespace));
     }
     cols.extend([
         ("Ready", 50., PodSort::Ready),
-        ("Status", 110., PodSort::Status),
-        ("CPU", 150., PodSort::Cpu),
-        ("Memory", 150., PodSort::Memory),
+        // "CreateContainerConfigError" whole.
+        ("Status", 200., PodSort::Status),
+        ("CPU", 160., PodSort::Cpu),
+        ("Memory", 160., PodSort::Memory),
         ("Restarts", 60., PodSort::Restarts),
         ("Node", 220., PodSort::Node),
         ("Age", 60., PodSort::Age),
     ]);
     cols
+}
+
+/// One cell of the pods table: its column's width, never more or less, on one line.
+fn pod_cell(width: f32) -> Div {
+    div().w(px(width)).flex_none().overflow_hidden().text_ellipsis().whitespace_nowrap()
 }
 
 /// The header of a pods table; its rows are items of the page's list (`pod_row`). A click
@@ -699,12 +706,13 @@ pub(super) fn pods_table(ctx: &Ctx, cx: &App) -> AnyElement {
         .text_color(muted)
         .border_b_1()
         .border_color(cx.theme().border)
-        .children(pod_columns(ctx).into_iter().map(|(title, width, col)| {
+        .children(pod_columns(ctx.ns().is_some()).into_iter().map(|(title, width, col)| {
             let sorted = ctx.pod_order.filter(|(c, _)| *c == col).map(|(_, desc)| desc);
             let panel = ctx.panel.clone();
             h_flex()
                 .id(title)
                 .w(px(width))
+                .flex_none()
                 .gap_1()
                 .cursor_pointer()
                 .hover(|s| s.text_color(cx.theme().foreground))
@@ -785,45 +793,33 @@ pub(crate) fn pod_status(p: &Value) -> String {
 
 pub(super) fn pod_row(ctx: &Ctx, p: &PodRow, cx: &App) -> AnyElement {
     let theme = cx.theme();
-    let usage = |[value, request, limit]: [Option<f64>; 3], format: fn(f64) -> String, color: Hsla| {
-        h_flex()
-            .w(px(150.))
-            .gap_2()
-            .child(div().w(px(48.)).child(value.map(format).unwrap_or_default()))
-            .child(div().flex_1().child(usage_bar(value, request, limit, color, cx)))
+    let usage = |cell: Div, [value, request, limit]: [Option<f64>; 3], format: fn(f64) -> String, color: Hsla| {
+        // Wide enough for "125.47Gi" on one line.
+        cell.child(
+            h_flex()
+                .gap_2()
+                .child(div().w(px(64.)).flex_none().child(value.map(format).unwrap_or_default()))
+                .child(div().flex_1().child(usage_bar(value, request, limit, color, cx))),
+        )
     };
     // Pods are opened in their own namespace (a node lists pods from every namespace).
-    h_flex()
-        .gap_3()
-        .py_1()
-        .text_sm()
-        .border_b_1()
-        .border_color(theme.border)
-        .when(ctx.ns().is_none(), |d| {
-            d.child(
-                div()
-                    .w(px(180.))
-                    .overflow_hidden()
-                    .text_ellipsis()
-                    .whitespace_nowrap()
-                    .text_color(theme.muted_foreground)
-                    .child(p.namespace.clone().unwrap_or_default()),
-            )
-        })
-        .child(div().w(px(320.)).child(ctx.link_in(p.name.clone(), "pods", &p.name, p.namespace.clone(), cx)))
-        .child(
-            div()
-                .w(px(50.))
+    let cells = pod_columns(ctx.ns().is_some()).into_iter().map(|(title, width, _)| {
+        let cell = pod_cell(width);
+        match title {
+            "Namespace" => cell.text_color(theme.muted_foreground).child(p.namespace.clone().unwrap_or_default()),
+            "Name" => cell.child(ctx.link_in(p.name.clone(), "pods", &p.name, p.namespace.clone(), cx)),
+            "Ready" => cell
                 .text_color(if p.ready == p.total { theme.success } else { theme.warning })
                 .child(format!("{}/{}", p.ready, p.total)),
-        )
-        .child(div().w(px(110.)).text_color(state_color(&p.phase, cx)).child(p.phase.clone()))
-        .child(usage(p.cpu, k8s::format_cpu, theme.blue))
-        .child(usage(p.mem, k8s::format_bytes, theme.success))
-        .child(div().w(px(60.)).when(p.restarts > 0, |d| d.text_color(theme.warning)).child(p.restarts.to_string()))
-        .child(div().w(px(220.)).child(ctx.link(p.node.clone(), "nodes", &p.node, cx)))
-        .child(div().w(px(60.)).text_color(theme.muted_foreground).child(p.created.map(k8s::age).unwrap_or_default()))
-        .into_any_element()
+            "Status" => cell.text_color(state_color(&p.phase, cx)).child(p.phase.clone()),
+            "CPU" => usage(cell, p.cpu, k8s::format_cpu, theme.blue),
+            "Memory" => usage(cell, p.mem, k8s::format_bytes, theme.success),
+            "Restarts" => cell.when(p.restarts > 0, |d| d.text_color(theme.warning)).child(p.restarts.to_string()),
+            "Node" => cell.child(ctx.link(p.node.clone(), "nodes", &p.node, cx)),
+            _ => cell.text_color(theme.muted_foreground).child(p.created.map(k8s::age).unwrap_or_default()),
+        }
+    });
+    h_flex().gap_3().py_1().text_sm().border_b_1().border_color(theme.border).children(cells).into_any_element()
 }
 
 /// A pod's ephemeral storage use (from the kubelet), against its limit if any.
@@ -882,6 +878,7 @@ fn container_history(ctx: &Ctx, c: &Value, name: &str, cx: &App) -> Option<Div> 
     if cpu.is_empty() && mem.is_empty() {
         return None;
     }
+    let (cpu, mem) = &crate::prom::same_times(cpu, mem);
     let theme = cx.theme();
     let res = |p: &str, f: fn(&str) -> f64| c.pointer(p).and_then(Value::as_str).map(f);
     let chart = |title: &'static str, data: &crate::prom::Series, req, lim, color, fmt, id| {
@@ -929,6 +926,20 @@ fn container_history(ctx: &Ctx, c: &Value, name: &str, cx: &App) -> Option<Div> 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn pod_columns_fit_long_statuses() {
+        use super::pod_columns;
+        let width =
+            |cols: &[(&str, f32, super::PodSort)], title: &str| cols.iter().find(|c| c.0 == title).map_or(0., |c| c.1);
+        // About 7.5 px a character at 14 px.
+        let needed = |text: &str| text.chars().count() as f32 * 7.5;
+        for namespaced in [true, false] {
+            let cols = pod_columns(namespaced);
+            assert!(width(&cols, "Status") >= needed("CreateContainerConfigError"));
+            assert_eq!(cols.iter().any(|c| c.0 == "Namespace"), !namespaced);
+        }
+    }
+
     #[test]
     fn pod_status_as_kubectl() {
         use super::pod_status;
