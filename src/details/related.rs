@@ -216,10 +216,10 @@ pub(super) async fn fetch_related(
     if kind.is("", "Pod") {
         let selector = None;
         // Metrics are optional (no metrics-server): no usage is not an error to show.
-        if crate::settings::metrics_on(context) {
-            if let Ok((usage, read)) = k8s::container_usage_read(client.clone(), ns.clone(), selector).await {
-                (related.usage, related.usage_read) = (usage, Some(read));
-            }
+        if crate::settings::metrics_on(context)
+            && let Ok((usage, read)) = k8s::container_usage_read(client.clone(), ns.clone(), selector).await
+        {
+            (related.usage, related.usage_read) = (usage, Some(read));
         }
         // ConfigMaps and Secrets the environment reads, to show resolved values.
         let mut refs: std::collections::BTreeSet<(&str, String)> = Default::default();
@@ -308,12 +308,11 @@ pub(super) async fn fetch_related(
             let services =
                 k8s::list_values(client.clone(), k8s::ar_of::<core::Service>(), Some(ns.clone()), None).await;
             related.services = related.noted("services", services);
-            if crate::settings::metrics_on(context) {
-                if let Ok((usage, read)) =
+            if crate::settings::metrics_on(context)
+                && let Ok((usage, read)) =
                     k8s::container_usage_read(client.clone(), ns.clone(), Some(sel.clone())).await
-                {
-                    (related.usage, related.usage_read) = (usage, Some(read));
-                }
+            {
+                (related.usage, related.usage_read) = (usage, Some(read));
             }
             if kind.is("apps", "StatefulSet") || kind.is("apps", "DaemonSet") || kind.is("apps", "Deployment") {
                 let revisions = k8s::rollouts::revisions(client, kind, ns, obj).await;

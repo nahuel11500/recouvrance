@@ -41,7 +41,12 @@ async fn get_metrics(client: &Client, path: &str) -> Result<(serde_json::Value, 
     let status = res.status();
     let body = res.into_body().collect_bytes().await?;
     if !status.is_success() {
-        anyhow::bail!("{status}: {}", String::from_utf8_lossy(&body));
+        // The same error `Client::request` gives, so callers still see a 404 as one.
+        let text = String::from_utf8_lossy(&body);
+        let refusal = serde_json::from_slice::<kube::core::Status>(&body)
+            .unwrap_or_else(|_| kube::core::Status::failure(&text, "Failed to parse error data"))
+            .with_code(status.as_u16());
+        return Err(kube::Error::Api(refusal.boxed()).into());
     }
     let list: serde_json::Value = serde_json::from_slice(&body)?;
     let read = reading(list["items"].as_array().map(Vec::as_slice).unwrap_or_default(), date);
