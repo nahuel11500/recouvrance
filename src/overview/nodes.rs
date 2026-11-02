@@ -25,11 +25,7 @@ pub(super) fn node(obj: &Value, cx: &App) -> Div {
         taints.push("none".into());
     }
     // kubectl's Status, with the taints that keep pods off it because something is wrong.
-    let status = crate::taints::node_status(
-        arr(obj, "/status/conditions").iter().find(|c| c["type"] == "Ready").and_then(|c| c["status"].as_str()),
-        obj.pointer("/spec/unschedulable").and_then(Value::as_bool).unwrap_or(false),
-        &crate::taints::trouble_labels(spec_taints.iter().map(|(k, _, e)| (k.as_str(), e.as_str()))),
-    );
+    let status = crate::taints::node_status_of(obj);
     let addresses: Vec<String> = arr(obj, "/status/addresses")
         .iter()
         .map(|a| format!("{}: {}", a["type"].as_str().unwrap_or("?"), a["address"].as_str().unwrap_or("?")))
@@ -63,22 +59,7 @@ pub(super) fn node(obj: &Value, cx: &App) -> Div {
                 .when_some(s(obj, "/metadata/labels/nvidia.com~1gpu.product"), |r, gpu| {
                     r.child(field("GPU", gpu.to_string(), cx))
                 })
-                .child(field(
-                    "Pressure",
-                    {
-                        let p: Vec<String> = arr(obj, "/status/conditions")
-                            .iter()
-                            .filter(|c| {
-                                c["type"].as_str().is_some_and(|ty| {
-                                    crate::status::node_condition_bad(ty, c["status"].as_str().unwrap_or_default())
-                                })
-                            })
-                            .filter_map(|c| c["type"].as_str().map(String::from))
-                            .collect();
-                        if p.is_empty() { "none".to_string() } else { p.join(", ") }
-                    },
-                    cx,
-                ))
+                .child(field("Pressure", pressure(arr(obj, "/status/conditions")), cx))
                 .child(field("Images", arr(obj, "/status/images").len().to_string(), cx))
                 .child(field("Max pods", cap("pods"), cx))
                 .child(field(
@@ -92,6 +73,30 @@ pub(super) fn node(obj: &Value, cx: &App) -> Div {
             clipped_list(taints, 10, cx),
             cx,
         )))
+}
+
+/// The conditions that report a problem, and those whose state is unknown: a kubelet that
+/// stopped posting status leaves them all `Unknown`, which is no "none". "none" only when
+/// every condition that is bad when True says False.
+fn pressure(conditions: &[Value]) -> String {
+    let (mut bad, mut unknown) = (Vec::new(), Vec::new());
+    for c in conditions {
+        let Some(ty) = c["type"].as_str() else { continue };
+        let status = c["status"].as_str().unwrap_or_default();
+        if crate::status::node_condition_bad(ty, status) {
+            bad.push(ty);
+        } else if status != "True" && status != "False" && crate::status::node_condition_bad(ty, "True") {
+            // A condition bad when True (`status::true_is_bad`, or one we don't know), of
+            // unknown state.
+            unknown.push(ty);
+        }
+    }
+    match (bad.is_empty(), unknown.is_empty()) {
+        (true, true) => "none".into(),
+        (false, true) => bad.join(", "),
+        (true, false) => format!("unknown ({})", unknown.join(", ")),
+        (false, false) => format!("{} · unknown ({})", bad.join(", "), unknown.join(", ")),
+    }
 }
 
 /// Requests and limits of the node's pods against what it can allocate, for CPU,
@@ -272,4 +277,31 @@ pub(super) fn node_devices(ctx: &Ctx, cx: &App) -> Option<Div> {
                     .child(div().text_color(muted).child(selectable(text.join("  "))))
             }))
     })))
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::{Value, json};
+
+    fn conds(list: &[(&str, &str)]) -> Vec<Value> {
+        list.iter().map(|(t, s)| json!({"type": t, "status": s})).collect()
+    }
+
+    #[test]
+    fn pressure_says_unknown_when_the_kubelet_stopped_posting() {
+        let healthy = conds(&[("Ready", "True"), ("MemoryPressure", "False"), ("DiskPressure", "False")]);
+        assert_eq!(super::pressure(&healthy), "none");
+        let gone = conds(&[
+            ("Ready", "Unknown"),
+            ("MemoryPressure", "Unknown"),
+            ("DiskPressure", "Unknown"),
+            ("PIDPressure", "Unknown"),
+        ]);
+        assert_eq!(super::pressure(&gone), "unknown (MemoryPressure, DiskPressure, PIDPressure)");
+        let mixed = conds(&[("Ready", "True"), ("DiskPressure", "True"), ("MemoryPressure", "Unknown")]);
+        assert_eq!(super::pressure(&mixed), "DiskPressure · unknown (MemoryPressure)");
+        // A condition good when True is no pressure, whatever its state.
+        assert_eq!(super::pressure(&conds(&[("Ready", "Unknown"), ("GPUHealthy", "Unknown")])), "none");
+        assert_eq!(super::pressure(&[]), "none");
+    }
 }

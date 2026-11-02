@@ -479,6 +479,16 @@ impl Render for DetailPanel {
             .and_then(|o| o.pointer("/metadata/creationTimestamp"))
             .and_then(|v| v.as_str())
             .and_then(|t| t.parse::<jiff::Timestamp>().ok());
+        let dot = {
+            use crate::status::Tone;
+            let theme = cx.theme();
+            match self.object.as_ref().map_or(Tone::Good, |o| title_tone(&self.obj.kind, o)) {
+                Tone::Good => theme.success,
+                Tone::Busy => theme.warning,
+                Tone::Bad => theme.danger,
+                Tone::Done => theme.muted_foreground,
+            }
+        };
         let full_name = self.obj.name.clone();
         let actions = h_flex()
             .gap_1()
@@ -560,8 +570,8 @@ impl Render for DetailPanel {
                                     h_flex()
                                         .gap_1()
                                         .text_xs()
-                                        .text_color(theme.success)
-                                        .child(div().size_1p5().rounded_full().bg(theme.success))
+                                        .text_color(dot)
+                                        .child(div().size_1p5().rounded_full().bg(dot))
                                         .child(selectable(k8s::age(t))),
                                 )
                             })
@@ -617,6 +627,19 @@ impl Render for DetailPanel {
             } else {
                 div().flex_1().min_h_0().p_2().child(body).into_any_element()
             })
+    }
+}
+
+/// The tone of the dot before the object's age: its state where its kind has one kubectl
+/// shows (a node's Status, a pod's), good otherwise. A node that stopped reporting is red.
+fn title_tone(kind: &k8s::Kind, obj: &serde_json::Value) -> crate::status::Tone {
+    use crate::status::Tone;
+    if kind.is("", "Node") {
+        crate::status::node_tone(&crate::taints::node_status_of(obj)).unwrap_or(Tone::Good)
+    } else if kind.is("", "Pod") {
+        crate::status::tone(&crate::overview::pod_status(obj)).unwrap_or(Tone::Good)
+    } else {
+        Tone::Good
     }
 }
 

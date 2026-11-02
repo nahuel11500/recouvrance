@@ -121,6 +121,17 @@ pub fn node_status(ready: Option<&str>, unschedulable: bool, labels: &[String]) 
     status
 }
 
+/// `node_status` of a Node object as the API returns it.
+pub fn node_status_of(node: &serde_json::Value) -> String {
+    let list = |path: &str| node.pointer(path).and_then(serde_json::Value::as_array).map_or(&[][..], Vec::as_slice);
+    let ready = list("/status/conditions").iter().find(|c| c["type"] == "Ready").and_then(|c| c["status"].as_str());
+    let unschedulable = node.pointer("/spec/unschedulable").and_then(serde_json::Value::as_bool).unwrap_or(false);
+    let taints = list("/spec/taints")
+        .iter()
+        .map(|t| (t["key"].as_str().unwrap_or_default(), t["effect"].as_str().unwrap_or_default()));
+    node_status(ready, unschedulable, &trouble_labels(taints))
+}
+
 /// The labels in a node's Status beyond kubectl's own words: its trouble taints.
 pub fn labels_in(status: &str) -> impl Iterator<Item = &str> {
     status.split(',').filter(|w| !w.is_empty() && !KUBECTL_WORDS.contains(w))
@@ -204,6 +215,25 @@ mod tests {
         ];
         assert_eq!(trouble_labels(taints), ["CiliumAgentNotReady", "ToBeDeleted"]);
         assert!(trouble_labels(Vec::<(&str, &str)>::new()).is_empty());
+    }
+
+    #[test]
+    fn status_of_a_node_object() {
+        use crate::status::{Tone, node_tone};
+        // A kubelet that stopped posting status: Ready is Unknown, the node controller taints it.
+        let gone = serde_json::json!({
+            "spec": {"taints": [{"key": "node.kubernetes.io/unreachable", "effect": "NoExecute"}]},
+            "status": {"conditions": [{"type": "Ready", "status": "Unknown"}]}
+        });
+        assert_eq!(super::node_status_of(&gone), "NotReady");
+        assert_eq!(node_tone(&super::node_status_of(&gone)), Some(Tone::Bad));
+        let cordoned = serde_json::json!({
+            "spec": {"unschedulable": true,
+                     "taints": [{"key": "node.cilium.io/agent-not-ready", "effect": "NoSchedule"}]},
+            "status": {"conditions": [{"type": "Ready", "status": "True"}]}
+        });
+        assert_eq!(super::node_status_of(&cordoned), "Ready,SchedulingDisabled,CiliumAgentNotReady");
+        assert_eq!(super::node_status_of(&serde_json::json!({})), "Unknown");
     }
 
     #[test]

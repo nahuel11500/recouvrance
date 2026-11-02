@@ -161,8 +161,18 @@ pub fn usage_chart(data: &crate::prom::Series, spec: ChartSpec, cx: &App) -> Div
         None => [Some(max), req, lim.filter(|_| pin_lim)].into_iter().flatten().fold(0.0, f64::max) * 1.25,
     };
     let shown_lim = lim.filter(|l| *l <= top);
+    // A series that stopped (a node that no longer reports) has an old last value: say how
+    // old, in grey, rather than show it as the current usage.
+    let stale = data
+        .last()
+        .filter(|p| is_stale(p.0, jiff::Timestamp::now().as_second(), minutes))
+        .and_then(|p| jiff::Timestamp::from_second(p.0).ok());
     let data: Vec<(String, f64)> = data.iter().map(|(t, v)| (label(*t), *v)).collect();
     let last = data.last().map(|p| fmt(p.1)).unwrap_or_default();
+    let last = match stale {
+        Some(t) => format!("{last} · {} ago", k8s::age(t)),
+        None => last,
+    };
     let legend = [req.map(|r| format!("{req_word} {}", fmt(r))), lim.map(|l| format!("{lim_word} {}", fmt(l)))]
         .into_iter()
         .flatten()
@@ -198,11 +208,25 @@ pub fn usage_chart(data: &crate::prom::Series, spec: ChartSpec, cx: &App) -> Div
             h_flex()
                 .gap_2()
                 .child(div().text_sm().font_weight(FontWeight::MEDIUM).child(selectable(title.to_string())))
-                .child(div().text_sm().text_color(color).child(selectable(last)))
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(if stale.is_some() { theme.muted_foreground } else { color })
+                        .child(selectable(last)),
+                )
                 .child(div().flex_1())
                 .child(div().text_xs().text_color(theme.muted_foreground).child(selectable(legend))),
         )
         .child(div().h(px(140.)).child(c))
+}
+
+/// Whether a chart's last point, at `last`, is too old to be the current usage: further back
+/// than two of the chart's steps (the range over 120 points, 15 s at least, as `prom`
+/// queries it) and than five minutes, Prometheus' lookback. A series still reported ends
+/// within a step of now.
+fn is_stale(last: i64, now: i64, minutes: i64) -> bool {
+    let step = (minutes * 60 / 120).max(15);
+    now - last > (2 * step).max(300)
 }
 
 pub(super) fn quantity_cpu(v: Option<&str>) -> Option<f64> {
@@ -300,6 +324,22 @@ mod tests {
         assert_eq!(bar_max(0.5, Some(1.0), Some(4.0)), Some(4.0));
         assert_eq!(bar_max(0.5, Some(1.0), None), Some(2.0));
         assert_eq!(bar_max(3.0, Some(1.0), None), Some(3.0));
+    }
+
+    #[test]
+    fn a_series_that_stopped_is_stale() {
+        use super::is_stale;
+        let now = 1_700_000_000;
+        // Reported: the last point is within a step of now, on every range.
+        for minutes in [15, 60, 360, 1440, 10080] {
+            let step = (minutes * 60 / 120).max(15);
+            assert!(!is_stale(now - step, now, minutes), "{minutes}");
+        }
+        // A node gone 20 minutes ago, on the 15 min and 1 h ranges.
+        assert!(is_stale(now - 1200, now, 15));
+        assert!(is_stale(now - 1200, now, 60));
+        // Gone a day ago, on the 7 d range (a point every 84 min).
+        assert!(is_stale(now - 86400, now, 10080));
     }
 
     #[test]
