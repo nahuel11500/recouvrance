@@ -9,7 +9,7 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use kube::Client;
 use serde::Deserialize;
 
-use super::cadence::{Cadence, Freshness, Reading, reading};
+use super::cadence::{Cadence, Freshness, Reading, date_header, reading};
 use super::{Pause, TaskGuard, ar_of, get_json, lists, podspec, run, spawn_guarded, url_escape};
 
 /// Pod usage from metrics-server: (namespace, name) -> (millicores, bytes).
@@ -33,11 +33,7 @@ async fn wait_unpaused(pause: &Pause) {
 /// header), and the times its items were measured.
 async fn get_metrics(client: &Client, path: &str) -> Result<(serde_json::Value, Reading)> {
     let res = client.send(http::Request::get(path).body(kube::client::Body::empty())?).await?;
-    let date = res
-        .headers()
-        .get(http::header::DATE)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| jiff::fmt::rfc2822::DateTimeParser::new().parse_timestamp(v).ok());
+    let date = res.headers().get(http::header::DATE).and_then(|v| v.to_str().ok()).and_then(date_header);
     let status = res.status();
     let body = res.into_body().collect_bytes().await?;
     if !status.is_success() {
