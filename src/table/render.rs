@@ -62,20 +62,9 @@ impl TableDelegate for ResourceTable {
             return Column::new("check", "").width(px(36. * crate::app::zoom(cx))).resizable(false);
         }
         let name = self.header(col).to_string();
-        let saved = self.widths.get(&name).copied();
-        let width = match (col, name.as_str()) {
-            _ if saved.is_some() => saved.unwrap_or_default(),
-            (_, "Name") => 340.,
-            (_, "Message") => 640.,
-            (_, "Object") => 320.,
-            (_, "Last Seen" | "Type") => 90.,
-            (Col::Namespace | Col::Context, _) => 170.,
-            (Col::Cpu | Col::Memory, _) if self.capacity.is_some() || self.pods => 190.,
-            (_, "Age" | "Ready" | "Restarts" | "Status" | "CPU" | "Memory") => 90.,
-            _ => 150.,
-        };
-        // Room for the usage bars: widths saved before they existed were 90.
         let bars = matches!(col, Col::Cpu | Col::Memory) && (self.capacity.is_some() || self.pods);
+        let width = self.widths.get(&name).copied().unwrap_or_else(|| default_width(col, &name, self.nodes, bars));
+        // Room for the usage bars: widths saved before they existed were 90.
         let width = if bars { width.max(170.) } else { width };
         // Not `.sort()`: the table's own control shows a two-way arrow on every column.
         // `render_th` sorts on a click and shows one arrow, on the sorted column only.
@@ -414,8 +403,10 @@ impl TableDelegate for ResourceTable {
             _ => {}
         }
         let dot = (header == "Status" && !shown.is_empty()).then_some(color).flatten();
+        // A status can outgrow its column (a node's trouble taints): the whole of it on hover.
+        let tip = (header == "Status" && !shown.is_empty()).then(|| shown.to_string());
         let text = shown_text(shown, row.deleting && col == Col::Cell(0));
-        h_flex()
+        let drawn = h_flex()
             .gap_1p5()
             .overflow_hidden()
             .when(row.deleting, |d| d.opacity(0.5))
@@ -428,8 +419,14 @@ impl TableDelegate for ResourceTable {
                     .when_some(color, Styled::text_color)
                     .when_some(weight, Styled::font_weight)
                     .child(text),
-            )
-            .into_any_element()
+            );
+        match tip {
+            Some(tip) => drawn
+                .id(SharedString::from(format!("st-{ctx}-{}-{col_ix}", row.uid)))
+                .tooltip(move |w, cx| component::tooltip::Tooltip::new(tip.clone()).build(w, cx))
+                .into_any_element(),
+            None => drawn.into_any_element(),
+        }
     }
 
     fn context_menu(
@@ -637,6 +634,37 @@ fn shown_text(shown: &str, deleting_name: bool) -> String {
 /// The container count of a pod's Ready cell ("1/2" -> 2).
 fn ready_total(cell: &str) -> Option<usize> {
     cell.split_once('/')?.1.parse().ok()
+}
+
+/// A column's width (at zoom 1) before the user resizes it.
+fn default_width(col: Col, name: &str, nodes: bool, bars: bool) -> f32 {
+    match (col, name) {
+        (_, "Name") => 340.,
+        (_, "Message") => 640.,
+        (_, "Object") => 320.,
+        (_, "Last Seen" | "Type") => 90.,
+        (Col::Namespace | Col::Context, _) => 170.,
+        (Col::Cpu | Col::Memory, _) if bars => 190.,
+        // kubectl's words ("NotReady,SchedulingDisabled") and then the trouble taints.
+        (_, "Status") if nodes => 230.,
+        (_, "Age" | "Ready" | "Restarts" | "Status" | "CPU" | "Memory") => 90.,
+        _ => 150.,
+    }
+}
+
+#[cfg(test)]
+mod width_tests {
+    use super::{Col, default_width};
+
+    #[test]
+    fn node_status_fits_kubectl_words() {
+        // About 7.5 px a character at 14 px, after the 13 px status dot.
+        let needed = |text: &str| text.chars().count() as f32 * 7.5 + 13.;
+        let node = default_width(Col::Cell(1), "Status", true, false);
+        assert!(node >= needed("NotReady,SchedulingDisabled"), "{node}");
+        // Other kinds keep a narrow Status ("Running", "Bound").
+        assert!(default_width(Col::Cell(1), "Status", false, false) < node);
+    }
 }
 
 #[cfg(test)]
