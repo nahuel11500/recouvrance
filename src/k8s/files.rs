@@ -1010,7 +1010,7 @@ mod tests {
                 "R=\n".to_string()
             };
             let script = format!("{prefix}{}{}", super::DECODE, super::READ);
-            let arg = super::sh_arg(format!("{r}{path}").as_bytes());
+            let arg = sh_arg(format!("{r}{path}").as_bytes());
             let out = std::process::Command::new("sh").args(["-c", &script, "sh", &arg, "100"]).output().unwrap();
             (out.status.success(), String::from_utf8(out.stdout).unwrap(), String::from_utf8(out.stderr).unwrap())
         };
