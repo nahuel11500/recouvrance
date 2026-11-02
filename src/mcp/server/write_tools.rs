@@ -305,6 +305,8 @@ impl KubeMcp {
         );
         let (policy, approved) = (call.policy().clone(), call.approved_rules().to_vec());
         let read = self.argo_drift(policy, approved, &dest.contexts, &d).await;
+        // Told again with what was read live: whether an object is there.
+        let d = Diagnosis::of_live(&app, jiff::Timestamp::now(), &read.drifts);
         call.finish(Ok(diagnosis::report(&head, &d, &read)))
     }
 
