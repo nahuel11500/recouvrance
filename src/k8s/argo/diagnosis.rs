@@ -326,35 +326,24 @@ impl Diagnosis {
     }
 }
 
-/// Whether a resource of an Application's `status.resources` is in the cluster.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Seen {
-    there: bool,
-    /// Read live, not taken from Argo CD's status.
-    live: bool,
-}
-
 /// Whether the resource `r` (an entry of `status.resources`) is in the cluster: the live read
 /// when it read it, else Argo CD's status (a health of `Missing` is gone; any other health,
 /// `Synced` or one to prune, it saw live). None when neither says: Argo CD keeps no health
 /// for kinds without a health check (ConfigMap, Secret...), so an out-of-sync one may be
 /// there or not.
-fn seen(r: &Value, live: &[Drift]) -> Option<Seen> {
+fn there(r: &Value, live: &[Drift]) -> Option<bool> {
     let res = Res::of(r)?;
     match live.iter().find(|d| d.res.same(&res)).map(|d| &d.compared) {
-        Some(Compared::Gone) => return Some(Seen { there: false, live: true }),
-        Some(Compared::LastApplied | Compared::ServerSide | Compared::NoCopy) => {
-            return Some(Seen { there: true, live: true });
-        }
+        Some(Compared::Gone) => return Some(false),
+        Some(Compared::LastApplied | Compared::ServerSide | Compared::NoCopy) => return Some(true),
         Some(Compared::NotRead(_)) | None => {}
     }
-    let there = match s(r, "/health/status") {
-        Some("Missing") => false,
-        Some(_) => true,
-        None if r["status"] == "Synced" || r["requiresPruning"] == true => true,
-        None => return None,
-    };
-    Some(Seen { there, live: false })
+    match s(r, "/health/status") {
+        Some("Missing") => Some(false),
+        Some(_) => Some(true),
+        None if r["status"] == "Synced" || r["requiresPruning"] == true => Some(true),
+        None => None,
+    }
 }
 
 /// When the last sync that worked finished: the newest deployment, else the last operation's end.
@@ -634,7 +623,7 @@ fn loop_finding(lp: &SyncLoop, looping: &[Res]) -> Finding {
 }
 
 /// What is out of sync, each object said as missing or differing only when it is known to be
-/// gone or there (see [`seen`]).
+/// gone or there (see [`there`]).
 fn out_of_sync_finding(
     resources: &[&Value],
     live: &[Drift],
@@ -650,9 +639,9 @@ fn out_of_sync_finding(
             let what = if r["requiresPruning"] == true {
                 "in the cluster, no longer in git: a sync with prune deletes it"
             } else {
-                match seen(r, live) {
-                    Some(Seen { there: false, .. }) => "in git, not in the cluster yet",
-                    Some(Seen { there: true, .. }) => "differs from git",
+                match there(r, live) {
+                    Some(false) => "in git, not in the cluster yet",
+                    Some(true) => "differs from git",
                     None => "out of sync with git (its live object wasn't read)",
                 }
             };
