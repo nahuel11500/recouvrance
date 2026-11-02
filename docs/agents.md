@@ -109,7 +109,8 @@ tools. What some of them need beyond the obvious verb:
   diff (`limit` changes, 30 by default). It needs `get` on the object. A pod's owner (its
   ReplicaSet, then the Deployment) is read only if the rules allow `get` on it, the Helm
   revisions only those `list` on secrets allows (values masked), the events only with `list` on
-  events. A source that failed, or an owner the rules don't let it read, is named at the end. The
+  events. A source that failed, or that the rules don't let it read (an owner, the Helm release or
+  some of its revisions, the events or some of them), is named at the end. The
   changes the app recorded while it watched the object come too, with source `Recorded` (see the
   Timeline in [features](features.md)): those of this object (its uid), not of one deleted before
   under the same name. A Secret's recorded changes say which keys changed, never their values.

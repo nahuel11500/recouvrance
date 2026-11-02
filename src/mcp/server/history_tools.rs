@@ -65,25 +65,42 @@ impl KubeMcp {
         let uid = value.pointer("/metadata/uid").and_then(|v| v.as_str()).unwrap_or_default();
         lists.push(crate::timeline::changes_for(&p.context, &kind.kubectl_name(), ns.as_deref(), &p.name, uid));
         let events_kind = self.kind(&call, &p.context, "events").await?.1;
+        // Events the rules keep it from reading are said, as a failure is: the history is incomplete.
         if call.may_see(&access_for(&events_kind, &p.context, Verb::List, ns.clone(), None)) {
             let uid = value.pointer("/metadata/uid").and_then(|v| v.as_str()).unwrap_or_default().to_string();
             match k8s::events_for(client, ObjectRef { uid, ..obj }).await {
                 Ok(mut events) => {
                     // The check above has no name: an Allow of some event names passes it.
+                    let total = events.len();
                     events.retain(|e| {
                         let a =
                             access_for(&events_kind, &p.context, Verb::List, e.namespace.clone(), Some(e.name.clone()));
                         call.may_see(&a)
                     });
+                    if let Some(note) = events_hidden(total - events.len()) {
+                        errors.push(note);
+                    }
                     lists.push(history::event_changes(&events, &subject));
                 }
                 Err(e) => errors.push(format!("events: {}", k8s::short_error(&e))),
             }
+        } else {
+            errors.push(EVENTS_DENIED.to_string());
         }
         let changes = history::merge(lists);
         let limit = p.limit.unwrap_or(30).clamp(1, 200) as usize;
         call.finish(Ok(history::report(&subject, &changes, &errors, limit)))
     }
+}
+
+/// The events left out when the rules allow listing none of them.
+const EVENTS_DENIED: &str = "events: not allowed by your rules (list on events)";
+
+/// The note on `hidden` events the rules don't allow listing, when there are any.
+fn events_hidden(hidden: usize) -> Option<String> {
+    (hidden > 0).then(|| {
+        format!("{hidden} event{}: not allowed by your rules (list on events)", if hidden == 1 { "" } else { "s" })
+    })
 }
 
 /// What `history::fetch` may read for an agent: an owner it may get, Helm's Secrets it may list.
@@ -102,4 +119,20 @@ fn by_rules(policy: Policy, approved: Vec<usize>, context: String) -> Allowed {
             visible(&policy, &approved, &access_for(&secrets, &context, Verb::List, Some(ns.into()), Some(name.into())))
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{EVENTS_DENIED, events_hidden};
+    use crate::history;
+
+    /// What the rules left out is named in the reply, not dropped without a word.
+    #[test]
+    fn events_left_out_are_named() {
+        assert_eq!(events_hidden(0), None);
+        assert_eq!(events_hidden(1).as_deref(), Some("1 event: not allowed by your rules (list on events)"));
+        let out = history::report("Deployment web", &[], &[EVENTS_DENIED.into(), events_hidden(3).unwrap()], 30);
+        assert!(out.contains("Could not read events: not allowed by your rules (list on events)\n"), "{out}");
+        assert!(out.contains("Could not read 3 events: not allowed by your rules"), "{out}");
+    }
 }
