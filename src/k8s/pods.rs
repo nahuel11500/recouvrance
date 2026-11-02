@@ -87,13 +87,52 @@ fn event_line(e: &Event) -> EventLine {
     }
 }
 
-/// An event of a cluster, with the object it is about.
+/// An event of a cluster, with the object it is about: the events of one object with the
+/// same type and reason as one (see `grouped`).
 pub struct ClusterEvent {
+    /// The latest of them, its count their counts added up.
     pub line: EventLine,
     /// The object's kind (`Pod`), namespace and name.
     pub object_kind: String,
     pub object_namespace: Option<String>,
     pub object_name: String,
+    /// How many Event objects it stands for.
+    pub events: usize,
+}
+
+/// The events of one object with the same type and reason as one: the latest one's message
+/// and time, their counts added up, in the order each was first met. A pod that can't be
+/// scheduled gets a new Event each time the message changes (`0/12 nodes are available…`),
+/// and dozens of them would bury everything else.
+pub fn grouped(events: impl IntoIterator<Item = ClusterEvent>) -> Vec<ClusterEvent> {
+    type Key = (String, Option<String>, String, String, String);
+    let mut out: Vec<ClusterEvent> = Vec::new();
+    let mut at: HashMap<Key, usize> = HashMap::new();
+    for e in events {
+        let key = (
+            e.object_kind.clone(),
+            e.object_namespace.clone(),
+            e.object_name.clone(),
+            e.line.kind.clone(),
+            e.line.reason.clone(),
+        );
+        match at.entry(key) {
+            std::collections::hash_map::Entry::Occupied(o) => {
+                let g = &mut out[*o.get()];
+                let count = g.line.count.saturating_add(e.line.count);
+                if e.line.last > g.line.last {
+                    g.line = e.line;
+                }
+                g.line.count = count;
+                g.events += e.events;
+            }
+            std::collections::hash_map::Entry::Vacant(v) => {
+                v.insert(out.len());
+                out.push(e);
+            }
+        }
+    }
+    out
 }
 
 /// Events read at most per type and list: the Warnings first, all of them on most clusters;
@@ -102,7 +141,8 @@ const RECENT_WARNINGS: u32 = 5000;
 const RECENT_NORMAL: u32 = 2000;
 
 /// The events of a cluster (or one namespace): its Warnings, then its Normal events, each
-/// read in one page (`RECENT_WARNINGS`, `RECENT_NORMAL`). `normal`: read those too.
+/// read in one page (`RECENT_WARNINGS`, `RECENT_NORMAL`). `normal`: read those too. Those of
+/// one object with the same type and reason come as one (`grouped`).
 pub async fn recent_events(client: Client, namespace: Option<String>, normal: bool) -> Result<Vec<ClusterEvent>> {
     run(async move {
         let api: Api<Event> = match &namespace {
@@ -113,15 +153,13 @@ pub async fn recent_events(client: Client, namespace: Option<String>, normal: bo
         if normal {
             items.extend(api.list(&ListParams::default().fields("type=Normal").limit(RECENT_NORMAL)).await?.items);
         }
-        Ok(items
-            .iter()
-            .map(|e| ClusterEvent {
-                line: event_line(e),
-                object_kind: e.involved_object.kind.clone().unwrap_or_default(),
-                object_namespace: e.involved_object.namespace.clone(),
-                object_name: e.involved_object.name.clone().unwrap_or_default(),
-            })
-            .collect())
+        Ok(grouped(items.iter().map(|e| ClusterEvent {
+            line: event_line(e),
+            object_kind: e.involved_object.kind.clone().unwrap_or_default(),
+            object_namespace: e.involved_object.namespace.clone(),
+            object_name: e.involved_object.name.clone().unwrap_or_default(),
+            events: 1,
+        })))
     })
     .await
 }
@@ -538,7 +576,61 @@ async fn read_line_capped<R: futures::AsyncBufRead + Unpin>(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use futures::StreamExt as _;
+    use proptest::prelude::*;
+
+    use super::{ClusterEvent, EventLine, grouped};
+
+    fn event(pod: u8, reason: u8, warning: bool, secs: Option<i64>, count: i32) -> ClusterEvent {
+        ClusterEvent {
+            line: EventLine {
+                namespace: Some("shop".into()),
+                name: format!("e{pod}-{reason}-{secs:?}"),
+                age: String::new(),
+                last: secs.map(|s| jiff::Timestamp::from_second(1_700_000_000 + s).unwrap()),
+                kind: if warning { "Warning" } else { "Normal" }.into(),
+                reason: format!("R{reason}"),
+                message: format!("at {secs:?}"),
+                count,
+            },
+            object_kind: "Pod".into(),
+            object_namespace: Some("shop".into()),
+            object_name: format!("web-{pod}"),
+            events: 1,
+        }
+    }
+
+    proptest! {
+        /// One row per object, type and reason; its count is theirs added up, its message and
+        /// time the latest one's, and no event is lost.
+        #[test]
+        fn events_of_one_object_and_reason_are_one(
+            raw in prop::collection::vec((0u8..4, 0u8..3, any::<bool>(), prop::option::of(0i64..100), 1i32..50), 0..60)
+        ) {
+            let groups = grouped(raw.iter().map(|&(p, r, w, s, c)| event(p, r, w, s, c)));
+            let mut seen = HashMap::new();
+            for g in &groups {
+                let key = (g.object_name.clone(), g.line.kind.clone(), g.line.reason.clone());
+                prop_assert!(seen.insert(key, ()).is_none(), "one row per object, type and reason");
+                let of: Vec<_> = raw
+                    .iter()
+                    .filter(|&&(p, r, w, _, _)| {
+                        format!("web-{p}") == g.object_name
+                            && format!("R{r}") == g.line.reason
+                            && (if w { "Warning" } else { "Normal" }) == g.line.kind
+                    })
+                    .collect();
+                prop_assert_eq!(g.events, of.len());
+                prop_assert_eq!(g.line.count, of.iter().map(|e| e.4).sum::<i32>());
+                let latest = of.iter().map(|e| e.3).max().flatten();
+                prop_assert_eq!(g.line.last, latest.map(|s| jiff::Timestamp::from_second(1_700_000_000 + s).unwrap()));
+                prop_assert_eq!(&g.line.message, &format!("at {:?}", g.line.last.map(|t| t.as_second() - 1_700_000_000)));
+            }
+            prop_assert_eq!(groups.iter().map(|g| g.events).sum::<usize>(), raw.len());
+        }
+    }
 
     #[test]
     fn a_container_that_ended_for_good_logs_no_more() {
