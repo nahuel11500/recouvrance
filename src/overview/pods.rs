@@ -929,8 +929,7 @@ mod tests {
     #[test]
     fn pod_columns_fit_long_statuses() {
         use super::pod_columns;
-        let width =
-            |cols: &[(&str, f32, super::PodSort)], title: &str| cols.iter().find(|c| c.0 == title).map_or(0., |c| c.1);
+        let width = |cols: &[(&str, f32, PodSort)], title: &str| cols.iter().find(|c| c.0 == title).map_or(0., |c| c.1);
         // About 7.5 px a character at 14 px.
         let needed = |text: &str| text.chars().count() as f32 * 7.5;
         for namespaced in [true, false] {
