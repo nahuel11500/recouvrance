@@ -65,7 +65,11 @@ impl Entry {
             Self::Change(_, r) => r.summary.clone(),
             Self::Event(_, e) => {
                 let l = &e.line;
-                let count = if l.count > 1 { format!(" (×{})", l.count) } else { String::new() };
+                let count = match (l.count, e.events) {
+                    (_, n) if n > 1 => format!(" (×{}, {n} events)", l.count),
+                    (c, _) if c > 1 => format!(" (×{c})"),
+                    _ => String::new(),
+                };
                 format!("{} {}: {}{count}", l.kind, l.reason, l.message)
             }
         }
@@ -628,6 +632,7 @@ mod tests {
                 object_kind: "Pod".into(),
                 object_namespace: Some("shop".into()),
                 object_name: "web-1".into(),
+                events: 1,
             }),
         )
     }

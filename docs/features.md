@@ -58,7 +58,8 @@
   ControllerRevisions, Endpoints, EndpointSlices and Leases are never recorded: they change all the
   time and their history is told elsewhere (a pod's by its owner's revisions and its events). The
   **Timeline** page (sidebar, or `Timeline` in the palette) lists the connected clusters' changes
-  newest first with their events interleaved (Warnings only by default, all, or none); filters by
+  newest first with their events interleaved (Warnings only by default, all, or none; the events
+  of one object with the same reason make one row, with their count); filters by
   cluster, and `ns:`, `kind:`, `ctx:` and text in its filter box; a row picked shows its diff,
   worked out then, and opens its object. Lists compare labels and annotations only, so their
   records say which fields changed and who changed them but keep no diff of the spec; kinds named
