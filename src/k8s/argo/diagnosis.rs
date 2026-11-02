@@ -288,7 +288,7 @@ impl Diagnosis {
             .pointer("/spec/syncPolicy/automated")
             .is_some_and(|a| a.is_object() && a.get("enabled").and_then(Value::as_bool) != Some(false));
         let mut d = Self { since: last_sync(app), moved: moved(app), ..Default::default() };
-        d.findings.extend(deletion(app, now));
+        d.findings.extend(deletion(app, now, live));
         d.findings.extend(stuck(app, now));
         d.findings.extend(failed(app));
         d.findings.extend(errors(app));
@@ -362,12 +362,12 @@ fn moved(app: &Value) -> Option<(String, String)> {
 }
 
 /// Deleted, and still there: the finalizers holding it, and the resources it waits for.
-fn deletion(app: &Value, now: Timestamp) -> Option<Finding> {
+fn deletion(app: &Value, now: Timestamp, live: &[Drift]) -> Option<Finding> {
     let since = time(app, "/metadata/deletionTimestamp")?;
     let finalizers: Vec<&str> = arr(app, "/metadata/finalizers").iter().filter_map(Value::as_str).collect();
     let age = now.as_second() - since.as_second();
     let held = !finalizers.is_empty() && age >= DELETE_STUCK_AFTER;
-    let lines: Vec<String> = finalizers
+    let mut lines: Vec<String> = finalizers
         .iter()
         .map(|f| {
             let what = match *f {
@@ -381,13 +381,54 @@ fn deletion(app: &Value, now: Timestamp) -> Option<Finding> {
             format!("{f}: {what}")
         })
         .collect();
-    let objects: Vec<(Res, String)> =
-        arr(app, "/status/resources").iter().filter_map(Res::of).map(|r| (r, "not deleted yet".to_string())).collect();
-    let (objects, more) = clip(objects);
+    // Argo CD's own word on why the deletion fails.
+    let errors: Vec<&str> = arr(app, "/status/conditions")
+        .iter()
+        .filter(|c| c["type"] == "DeletionError")
+        .filter_map(|c| c["message"].as_str())
+        .collect();
+    // Only what is still there (or may be) is waited for; one already gone that an error
+    // names is what the deletion fails on.
+    let (mut failing_on, mut objects) = (Vec::new(), Vec::new());
+    let mut gone = 0;
+    for r in arr(app, "/status/resources") {
+        let Some(res) = Res::of(r) else { continue };
+        // Read live, not taken from Argo CD's status.
+        let read = live.iter().any(|d| d.res.same(&res) && !matches!(d.compared, Compared::NotRead(_)));
+        let what = match there(r, live) {
+            Some(false) => {
+                gone += 1;
+                if errors.iter().any(|e| names(e, &res.name)) {
+                    failing_on.push((res, "already gone, yet Argo CD's DeletionError is about it".to_string()));
+                }
+                continue;
+            }
+            Some(true) if read => "not deleted yet",
+            Some(true) => "not deleted yet, as Argo CD last saw it",
+            None => "listed by Argo CD, its live object wasn't read",
+        };
+        objects.push((res, what.to_string()));
+    }
+    if gone > 0 {
+        let left = if objects.is_empty() { ", nothing it lists is left" } else { "" };
+        lines.push(format!("{gone} of the resources it lists already gone{left}."));
+    }
+    let blocked = !failing_on.is_empty();
+    failing_on.extend(objects);
+    let (objects, more) = clip(failing_on);
     let held_by = match finalizers.len() {
         0 => String::new(),
         1 => ", held by a finalizer".to_string(),
         n => format!(", held by {n} finalizers"),
+    };
+    let hint = if blocked {
+        "Argo CD's deletion fails on a resource that is already gone: a hard refresh of the Application lets it \
+         see that. If the error stays, removing the finalizer deletes the Application and leaves what is left of \
+         its resources in place."
+    } else {
+        "Argo CD deletes each resource first: one that can't be deleted (a finalizer of its own, a namespace that is \
+         terminating, an unreachable destination cluster) keeps the Application. Removing the finalizer deletes the \
+         Application and leaves its resources in place."
     };
     Some(Finding {
         tone: if held { Tone::Bad } else { Tone::Busy },
@@ -395,10 +436,18 @@ fn deletion(app: &Value, now: Timestamp) -> Option<Finding> {
         message: (!lines.is_empty()).then(|| lines.join("\n")),
         objects,
         more,
-        hint: "Argo CD deletes each resource first: one that can't be deleted (a finalizer of its own, a namespace \
-               that is terminating, an unreachable destination cluster) keeps the Application. Removing the finalizer \
-               deletes the Application and leaves its resources in place."
-            .into(),
+        hint: hint.into(),
+    })
+}
+
+/// Whether `message` names `name` as a whole word (`"child" not found`, `.../child`), not
+/// as part of a longer name.
+fn names(message: &str, name: &str) -> bool {
+    let part = |c: char| c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_');
+    message.match_indices(name).any(|(at, _)| {
+        let before = message[..at].chars().next_back();
+        let after = message[at + name.len()..].chars().next();
+        !before.is_some_and(part) && !after.is_some_and(part)
     })
 }
 
@@ -1541,6 +1590,68 @@ mod tests {
         let mut fresh = app;
         fresh["metadata"]["deletionTimestamp"] = json!("2026-10-30T11:59:00Z");
         assert_eq!(Diagnosis::of(&fresh, now()).findings[0].tone, Tone::Busy);
+    }
+
+    #[test]
+    fn a_deletion_waits_only_for_what_is_still_there() {
+        let app = json!({
+            "metadata": {"deletionTimestamp": "2026-10-24T12:00:00Z", "finalizers": ["resources-finalizer.argocd.argoproj.io"]},
+            "status": {
+                "conditions": [{"type": "DeletionError", "message": "applications.argoproj.io \"child\" not found"}],
+                "resources": [
+                    {"group": "argoproj.io", "version": "v1alpha1", "kind": "Application", "namespace": "argo", "name": "child", "status": "OutOfSync"},
+                    {"group": "argoproj.io", "version": "v1alpha1", "kind": "Application", "namespace": "argo", "name": "child-2", "status": "OutOfSync"},
+                    {"version": "v1", "kind": "ConfigMap", "namespace": "shop", "name": "kept", "status": "OutOfSync"},
+                    {"version": "v1", "kind": "Service", "namespace": "shop", "name": "web", "status": "Synced"},
+                    {"version": "v1", "kind": "Secret", "namespace": "shop", "name": "gone", "status": "OutOfSync", "health": {"status": "Missing"}}
+                ]
+            }
+        });
+        let child = |name: &str| Res {
+            group: "argoproj.io".into(),
+            kind: "Application".into(),
+            namespace: "argo".into(),
+            name: name.into(),
+            version: "v1alpha1".into(),
+        };
+        let kept =
+            Res { kind: "ConfigMap".into(), namespace: "shop".into(), name: "kept".into(), ..Default::default() };
+        let live = [
+            Drift::not_read(&child("child"), Compared::Gone),
+            Drift::not_read(&child("child-2"), Compared::Gone),
+            Drift::not_read(&kept, Compared::NoCopy),
+        ];
+        let f = &Diagnosis::of_live(&app, now(), &live).findings[0];
+        assert_eq!(f.title, "Being deleted for 6 days, held by a finalizer");
+        let what: Vec<(String, &str)> = f.objects.iter().map(|(r, w)| (r.label(), w.as_str())).collect();
+        assert_eq!(
+            what,
+            [
+                // The error is about it (not about child-2, whose name only starts the same).
+                ("Application argo/child".to_string(), "already gone, yet Argo CD's DeletionError is about it"),
+                ("ConfigMap shop/kept".to_string(), "not deleted yet"),
+                ("Service shop/web".to_string(), "not deleted yet, as Argo CD last saw it"),
+            ]
+        );
+        assert!(
+            f.message.as_deref().unwrap().ends_with("3 of the resources it lists already gone."),
+            "{:?}",
+            f.message
+        );
+        assert!(f.hint.contains("already gone"), "{}", f.hint);
+        // Without the live read, Argo CD's status alone can't say a child Application is gone.
+        let f = &Diagnosis::of(&app, now()).findings[0];
+        assert_eq!(f.objects.len(), 4);
+        assert_eq!(f.objects[0].1, "listed by Argo CD, its live object wasn't read");
+        assert!(!f.hint.contains("already gone"), "{}", f.hint);
+    }
+
+    #[test]
+    fn names_a_whole_name_only() {
+        assert!(names("applications.argoproj.io \"child\" not found", "child"));
+        assert!(names("deleting argoproj.io/Application/child: not found", "child"));
+        assert!(!names("applications.argoproj.io \"child-2\" not found", "child"));
+        assert!(!names("my-child failed", "child"));
     }
 
     #[test]
