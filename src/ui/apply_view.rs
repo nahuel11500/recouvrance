@@ -414,7 +414,7 @@ impl ApplyView {
         let me = cx.entity().downgrade();
         window.open_alert_dialog(cx, move |alert, _, cx| {
             let (me, guard, docs, run_as) = (me.clone(), guard.clone(), docs.clone(), run_as.clone());
-            let muted = cx.theme().muted_foreground;
+            let (muted, mono) = (cx.theme().muted_foreground, cx.theme().mono_font_family.clone());
             alert
                 .title(title.clone())
                 .description(if refused {
@@ -429,7 +429,7 @@ impl ApplyView {
                             .take(20)
                             .cloned()
                             .chain((n > 20).then(|| format!("…and {} more", n - 20)))
-                            .map(|o| div().text_sm().font_family("monospace").text_color(muted).child(o)),
+                            .map(|o| div().text_sm().font_family(mono.clone()).text_color(muted).child(o)),
                     ),
                 )
                 .child(crate::details::confirm_with(&cmd, guard.as_ref(), &run_as, cx))
