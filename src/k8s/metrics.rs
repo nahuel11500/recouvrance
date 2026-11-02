@@ -9,6 +9,7 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use kube::Client;
 use serde::Deserialize;
 
+use super::cadence::{Cadence, Freshness, Reading, reading};
 use super::{Pause, TaskGuard, ar_of, get_json, lists, podspec, run, spawn_guarded, url_escape};
 
 /// Pod usage from metrics-server: (namespace, name) -> (millicores, bytes).
@@ -28,13 +29,33 @@ async fn wait_unpaused(pause: &Pause) {
     }
 }
 
-/// Poll metrics-server every 15s. Keeps retrying (backing off) while metrics
-/// aren't available; polls nothing while `pause` is set.
+/// GET a metrics.k8s.io list, with the API server's clock when it answered (its `Date`
+/// header), and the times its items were measured.
+async fn get_metrics(client: &Client, path: &str) -> Result<(serde_json::Value, Reading)> {
+    let res = client.send(http::Request::get(path).body(kube::client::Body::empty())?).await?;
+    let date = res
+        .headers()
+        .get(http::header::DATE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| jiff::fmt::rfc2822::DateTimeParser::new().parse_timestamp(v).ok());
+    let status = res.status();
+    let body = res.into_body().collect_bytes().await?;
+    if !status.is_success() {
+        anyhow::bail!("{status}: {}", String::from_utf8_lossy(&body));
+    }
+    let list: serde_json::Value = serde_json::from_slice(&body)?;
+    let read = reading(list["items"].as_array().map(Vec::as_slice).unwrap_or_default(), date);
+    Ok((list, read))
+}
+
+/// Poll metrics-server when its next sample is due ([`Cadence`]), never more often than
+/// `metrics_refresh`. Keeps retrying (backing off) while metrics aren't available; polls
+/// nothing while `pause` is set.
 pub fn watch_pod_metrics(
     client: Client,
     namespace: Option<String>,
     pause: Pause,
-) -> (TaskGuard, mpsc::UnboundedReceiver<PodUsage>) {
+) -> (TaskGuard, mpsc::UnboundedReceiver<(PodUsage, Freshness)>) {
     let (tx, rx) = mpsc::unbounded();
     let guard = spawn_guarded(async move {
         let path = match &namespace {
@@ -42,10 +63,10 @@ pub fn watch_pod_metrics(
             None => "/apis/metrics.k8s.io/v1beta1/pods".to_string(),
         };
         let mut failures = 0;
+        let mut cadence = Cadence::default();
         loop {
             wait_unpaused(&pause).await;
-            let Ok(req) = http::Request::get(&path).body(Vec::new()) else { return };
-            let Ok(list) = client.request::<serde_json::Value>(req).await else {
+            let Ok((list, read)) = get_metrics(&client, &path).await else {
                 if tx.is_closed() {
                     return;
                 }
@@ -64,10 +85,11 @@ pub fn watch_pod_metrics(
                 }
                 usage.insert((ns.to_string(), name.to_string()), (cpu, mem));
             }
-            if tx.unbounded_send(usage).is_err() {
+            let wait = cadence.next(&read, crate::settings::secs(crate::settings::get().metrics_refresh));
+            if tx.unbounded_send((usage, Freshness::new(&read, cadence.every()))).is_err() {
                 return;
             }
-            tokio::time::sleep(crate::settings::secs(crate::settings::get().metrics_refresh)).await;
+            tokio::time::sleep(wait).await;
         }
     });
     (guard, rx)
@@ -103,12 +125,21 @@ pub async fn container_usage(
     namespace: String,
     label_selector: Option<String>,
 ) -> Result<ContainerUsage> {
+    Ok(container_usage_read(client, namespace, label_selector).await?.0)
+}
+
+/// [`container_usage`], with when it was measured.
+pub async fn container_usage_read(
+    client: Client,
+    namespace: String,
+    label_selector: Option<String>,
+) -> Result<(ContainerUsage, Reading)> {
     run(async move {
         let mut path = format!("/apis/metrics.k8s.io/v1beta1/namespaces/{namespace}/pods");
         if let Some(l) = &label_selector {
             path.push_str(&format!("?labelSelector={}", url_escape(l)));
         }
-        let list: serde_json::Value = client.request(http::Request::get(&path).body(Vec::new())?).await?;
+        let (list, read) = get_metrics(&client, &path).await?;
         let mut out = ContainerUsage::new();
         for item in list["items"].as_array().into_iter().flatten() {
             let pod = item.pointer("/metadata/name").and_then(|v| v.as_str()).unwrap_or_default().to_string();
@@ -120,7 +151,7 @@ pub async fn container_usage(
                 containers.insert(name, (cpu, mem));
             }
         }
-        Ok(out)
+        Ok((out, read))
     })
     .await
 }
@@ -214,13 +245,12 @@ pub fn watch_pod_resources(
 
 /// Node usage and allocatable now, from metrics-server and the nodes.
 pub async fn node_usage(client: Client) -> Result<NodeUsage> {
-    run(node_usage_now(client)).await
+    Ok(run(node_usage_now(client)).await?.0)
 }
 
-async fn node_usage_now(client: Client) -> Result<NodeUsage> {
-    let req = http::Request::get("/apis/metrics.k8s.io/v1beta1/nodes").body(Vec::new())?;
-    let (metrics, list) = futures::try_join!(
-        async { Ok::<_, anyhow::Error>(client.request::<serde_json::Value>(req).await?) },
+async fn node_usage_now(client: Client) -> Result<(NodeUsage, Reading)> {
+    let ((metrics, read), list) = futures::try_join!(
+        get_metrics(&client, "/apis/metrics.k8s.io/v1beta1/nodes"),
         lists::list_lean::<NodeAllocatable>(client.clone(), ar_of::<k8s_openapi::api::core::v1::Node>(), None),
     )?;
     let mut out = NodeUsage::new();
@@ -239,18 +269,22 @@ async fn node_usage_now(client: Client) -> Result<NodeUsage> {
             e.0 = (cpu, mem);
         }
     }
-    Ok(out)
+    Ok((out, read))
 }
 
-/// Poll node metrics and allocatable, retrying (backing off) on errors; nothing while
-/// `pause` is set.
-pub fn watch_node_metrics(client: Client, pause: Pause) -> (TaskGuard, mpsc::UnboundedReceiver<NodeUsage>) {
+/// Poll node metrics and allocatable when the next sample is due (as pods do), retrying
+/// (backing off) on errors; nothing while `pause` is set.
+pub fn watch_node_metrics(
+    client: Client,
+    pause: Pause,
+) -> (TaskGuard, mpsc::UnboundedReceiver<(NodeUsage, Freshness)>) {
     let (tx, rx) = mpsc::unbounded();
     let guard = spawn_guarded(async move {
         let mut failures = 0;
+        let mut cadence = Cadence::default();
         loop {
             wait_unpaused(&pause).await;
-            let Ok(out) = node_usage_now(client.clone()).await else {
+            let Ok((out, read)) = node_usage_now(client.clone()).await else {
                 if tx.is_closed() {
                     return;
                 }
@@ -258,10 +292,11 @@ pub fn watch_node_metrics(client: Client, pause: Pause) -> (TaskGuard, mpsc::Unb
                 continue;
             };
             failures = 0;
-            if tx.unbounded_send(out).is_err() {
+            let wait = cadence.next(&read, crate::settings::secs(crate::settings::get().metrics_refresh));
+            if tx.unbounded_send((out, Freshness::new(&read, cadence.every()))).is_err() {
                 return;
             }
-            tokio::time::sleep(crate::settings::secs(crate::settings::get().metrics_refresh)).await;
+            tokio::time::sleep(wait).await;
         }
     });
     (guard, rx)

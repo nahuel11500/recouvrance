@@ -683,6 +683,8 @@ impl DetailPanel {
         // Workload logs follow its pods (one namespace); a pod page has its own.
         let pods_logs = !kind.is("", "Pod") && ns.is_some();
         let task = cx.spawn_in(window, async move |this, cx| {
+            // How often metrics-server measures, learnt over the reads, for the usage's age.
+            let mut cadence = k8s::Cadence::default();
             loop {
                 let exec = cx.background_executor().clone();
                 if !crate::app::wait_visible(&this, cx, &exec).await {
@@ -705,6 +707,12 @@ impl DetailPanel {
                         related
                     })
                     .await;
+                if let Some(read) = related.usage_read {
+                    // The page reads more than usage: it keeps its own pace, and only learns
+                    // how often metrics-server measures.
+                    cadence.next(&read, crate::settings::secs(crate::settings::get().metrics_refresh));
+                    related.usage_fresh = k8s::Freshness::new(&read, cadence.every());
+                }
                 // Prometheus can be slow: show the rest first, keeping the previous charts.
                 let pods_for_history = if wants_history { related.pods.clone() } else { Vec::new() };
                 let focus = crate::alerts::focus(&kind, &obj, &related.pods);

@@ -161,10 +161,10 @@ impl AppView {
                 let (guard, mut rx) = k8s::watch_pod_metrics(client, ns, pause.clone());
                 let task = cx.spawn(async move |this, cx| {
                     while let Some(usage) = rx.next().await {
-                        let usage = latest(&mut rx, usage);
+                        let (usage, fresh) = latest(&mut rx, usage);
                         let alive = this.update(cx, |this, cx| {
                             this.table.update(cx, |t, cx| {
-                                if t.delegate_mut().set_usage(ix, usage) {
+                                if t.delegate_mut().set_usage(ix, usage, fresh) {
                                     t.refresh(cx);
                                 }
                                 cx.notify();
@@ -181,10 +181,10 @@ impl AppView {
                 let (guard, mut rx) = k8s::watch_node_metrics(client, pause.clone());
                 let task = cx.spawn(async move |this, cx| {
                     while let Some(usage) = rx.next().await {
-                        let usage = latest(&mut rx, usage);
+                        let (usage, fresh) = latest(&mut rx, usage);
                         let alive = this.update(cx, |this, cx| {
                             this.table.update(cx, |t, cx| {
-                                if t.delegate_mut().set_node_usage(ix, usage) {
+                                if t.delegate_mut().set_node_usage(ix, usage, fresh) {
                                     t.refresh(cx);
                                 }
                                 cx.notify();

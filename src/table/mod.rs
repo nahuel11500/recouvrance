@@ -55,6 +55,8 @@ pub struct ResourceTable {
     /// The selected row: (context index, uid).
     pub selected: Option<(usize, String)>,
     usage: Option<HashMap<usize, UsageIndex>>,
+    /// How old each context's usage is, for the CPU and Memory headers' tooltip.
+    freshness: HashMap<usize, k8s::Freshness>,
     /// Pods' requests and limits by context, namespace and name, for their usage bars.
     resources: HashMap<usize, HashMap<String, HashMap<String, k8s::PodResources>>>,
     /// When several namespaces are selected, rows outside them are hidden.
@@ -109,6 +111,7 @@ impl ResourceTable {
             sort: None,
             selected: None,
             usage: None,
+            freshness: HashMap::new(),
             resources: HashMap::new(),
             ns_filter: None,
             capacity: None,
@@ -358,15 +361,16 @@ impl ResourceTable {
     }
 
     /// Node usage with allocatable; shown as bars with a percentage.
-    pub fn set_node_usage(&mut self, ctx: usize, usage: k8s::NodeUsage) -> bool {
+    pub fn set_node_usage(&mut self, ctx: usize, usage: k8s::NodeUsage, fresh: k8s::Freshness) -> bool {
         let pod_like: k8s::PodUsage = usage.iter().map(|(n, (u, _))| ((String::new(), n.clone()), *u)).collect();
         let capacity = self.capacity.get_or_insert_default();
         capacity.insert(ctx, usage.into_iter().map(|(n, (_, cap))| (n, cap)).collect());
-        self.set_usage(ctx, pod_like)
+        self.set_usage(ctx, pod_like, fresh)
     }
 
     /// Pod usage from metrics-server; adds CPU and Memory columns after Status.
-    pub fn set_usage(&mut self, ctx: usize, usage: k8s::PodUsage) -> bool {
+    pub fn set_usage(&mut self, ctx: usize, usage: k8s::PodUsage, fresh: k8s::Freshness) -> bool {
+        self.freshness.insert(ctx, fresh);
         let added = self.usage.is_none();
         let mut index = UsageIndex::new();
         for ((ns, name), u) in usage {
@@ -378,6 +382,20 @@ impl ResourceTable {
         }
         self.recompute();
         added
+    }
+
+    /// How old the usage shown is, as the CPU and Memory headers' tooltip says it: one line
+    /// per context when there are several.
+    fn usage_age(&self) -> Option<String> {
+        let mut lines: Vec<(usize, String)> =
+            self.freshness.iter().filter_map(|(ctx, f)| Some((*ctx, f.describe()?))).collect();
+        lines.sort();
+        if self.contexts.len() > 1 {
+            for (ctx, line) in &mut lines {
+                *line = format!("{}: {line}", self.contexts.get(*ctx).map(String::as_str).unwrap_or_default());
+            }
+        }
+        (!lines.is_empty()).then(|| lines.into_iter().map(|(_, l)| l).collect::<Vec<_>>().join("\n"))
     }
 
     fn insert_usage_cols(&mut self) {

@@ -37,6 +37,10 @@ pub(crate) use workloads::*;
 #[derive(Default)]
 pub struct Related {
     pub usage: ContainerUsage,
+    /// When `usage` was measured (None when it was not read).
+    pub usage_read: Option<k8s::Reading>,
+    /// How old `usage` is and how often metrics-server measures, for the Containers heading.
+    pub usage_fresh: k8s::Freshness,
     pub pods: Vec<Value>,
     pub services: Vec<Value>,
     pub revisions: Vec<Value>,
@@ -124,6 +128,22 @@ fn heading_for(text: &str, related: &Related, section: &str, cx: &App) -> Div {
         None => heading,
         Some(e) => heading.flex().gap_2().items_baseline().child(
             div().text_xs().font_weight(FontWeight::NORMAL).text_color(cx.theme().danger).child(selectable(e.clone())),
+        ),
+    }
+}
+
+/// A heading over live usage, saying how old it is when metrics-server was read: "usage as
+/// of 40s ago · metrics-server measures every 60s".
+fn usage_heading(text: &str, related: &Related, cx: &App) -> Div {
+    let heading = heading(text);
+    match related.usage_read.and(related.usage_fresh.describe()) {
+        None => heading,
+        Some(age) => heading.flex().gap_2().items_baseline().child(
+            div()
+                .text_xs()
+                .font_weight(FontWeight::NORMAL)
+                .text_color(cx.theme().muted_foreground)
+                .child(selectable(format!("usage {age}"))),
         ),
     }
 }
