@@ -208,7 +208,9 @@ mod tests {
         assert_eq!(ms(go_duration("45.5s")), Some(45_500));
         assert_eq!(ms(go_duration("1m0.025s")), Some(60_025));
         assert_eq!(ms(go_duration("500ms")), Some(500));
-        assert_eq!(ms(go_duration("1h2m")), Some(3_720_000));
+        assert_eq!(ms(go_duration("2m3s")), Some(123_000));
+        // Capped: a window that long says nothing about a resolution.
+        assert_eq!(ms(go_duration("1h2m")), Some(3_000_000));
         for bad in ["", "0s", "5", "s", "1x", "-1s", "1.2.3s"] {
             assert_eq!(go_duration(bad), None, "{bad}");
         }
