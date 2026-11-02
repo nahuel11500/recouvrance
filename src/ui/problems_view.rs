@@ -164,9 +164,12 @@ impl ProblemsView {
                     .child(p.namespace.clone().unwrap_or_default()),
             )
             .child(
+                // The name takes its share up to a cap; the message gets every pixel left, so a
+                // long message is not cut while a gap sits after a short name (#660).
                 div()
                     .flex_1()
                     .min_w_0()
+                    .max_w(px(320.))
                     .text_sm()
                     .text_color(theme.blue)
                     .overflow_hidden()
@@ -176,7 +179,8 @@ impl ProblemsView {
             )
             .child(
                 div()
-                    .w(px(300.))
+                    .flex_grow()
+                    .flex_basis(px(300.))
                     .flex_shrink_0()
                     .text_sm()
                     .text_color(color)
