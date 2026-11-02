@@ -285,6 +285,7 @@ impl Diagnosis {
         d.findings.extend(stuck(app, now));
         d.findings.extend(failed(app));
         d.findings.extend(errors(app));
+        d.findings.extend(degraded(app));
         let out_of_sync: Vec<&Value> =
             arr(app, "/status/resources").iter().filter(|r| r["status"] == "OutOfSync").collect();
         // Out of sync and still there: what the live object holds is worth comparing.
@@ -521,6 +522,42 @@ fn errors(app: &Value) -> Vec<Finding> {
             })
         })
         .collect()
+}
+
+/// Health Degraded: the resources Argo CD reports degraded, each with its health message.
+/// Argo CD may not keep health per resource in the Application (it can be turned off): it is
+/// then said without a culprit, rather than nothing.
+fn degraded(app: &Value) -> Option<Finding> {
+    if s(app, "/status/health/status") != Some("Degraded") {
+        return None;
+    }
+    let objects: Vec<(Res, String)> = arr(app, "/status/resources")
+        .iter()
+        .filter(|r| s(r, "/health/status") == Some("Degraded"))
+        .filter_map(|r| Some((Res::of(r)?, s(r, "/health/message").unwrap_or("degraded").to_string())))
+        .collect();
+    let n = objects.len();
+    let (objects, more) = clip(objects);
+    let (title, hint) = if n == 0 {
+        (
+            "Degraded; Argo CD doesn't report which resource".to_string(),
+            "This Argo CD keeps no health per resource in the Application: look among its resources for the \
+             unhealthy one (a workload whose pods aren't ready, a failed Job).",
+        )
+    } else {
+        (
+            format!("Degraded: {n} {}", if n == 1 { "resource" } else { "resources" }),
+            "Open the resource: its status, events and pods say why it is unhealthy.",
+        )
+    };
+    Some(Finding {
+        tone: Tone::Bad,
+        title,
+        message: s(app, "/status/health/message").map(String::from),
+        objects,
+        more,
+        hint: hint.into(),
+    })
 }
 
 /// The newest deployments synced the same revision `LOOP_SYNCS` times or more within
@@ -1305,6 +1342,32 @@ mod tests {
         let app = json!({"status": {"sync": {"status": "Synced"}, "operationState": {"phase": "Succeeded"},
             "resources": [{"kind": "ConfigMap", "name": "a", "namespace": "x", "status": "Synced"}]}});
         assert!(Diagnosis::of(&app, now()).is_empty());
+    }
+
+    #[test]
+    fn degraded_health_is_said_with_the_resources_or_without() {
+        let app = json!({"status": {"sync": {"status": "Synced"}, "health": {"status": "Degraded"},
+        "resources": [
+            {"group": "apps", "version": "v1", "kind": "Deployment", "namespace": "shop", "name": "web", "status": "Synced",
+             "health": {"status": "Degraded", "message": "Deployment \"web\" exceeded its progress deadline"}},
+            {"version": "v1", "kind": "ConfigMap", "namespace": "shop", "name": "a", "status": "Synced"}
+        ]}});
+        let d = Diagnosis::of(&app, now());
+        assert_eq!(d.findings.len(), 1);
+        let f = &d.findings[0];
+        assert_eq!((f.tone, f.title.as_str()), (Tone::Bad, "Degraded: 1 resource"));
+        assert_eq!(f.objects.len(), 1);
+        assert_eq!(f.objects[0].0, deployment());
+        assert!(f.objects[0].1.contains("progress deadline"), "{:?}", f.objects);
+        // No health per resource: still said.
+        let bare = json!({"status": {"sync": {"status": "Synced"}, "health": {"status": "Degraded"},
+            "resources": [{"group": "apps", "version": "v1", "kind": "Deployment", "namespace": "shop", "name": "web", "status": "Synced"}]}});
+        let f = &Diagnosis::of(&bare, now()).findings[0];
+        assert_eq!(f.title, "Degraded; Argo CD doesn't report which resource");
+        assert!(f.objects.is_empty());
+        // Healthy, or on its way: nothing.
+        let healthy = json!({"status": {"sync": {"status": "Synced"}, "health": {"status": "Progressing"}}});
+        assert!(Diagnosis::of(&healthy, now()).is_empty());
     }
 
     #[test]
