@@ -687,9 +687,17 @@ fn pod_columns(namespaced: bool) -> Vec<(&'static str, f32, PodSort)> {
     cols
 }
 
-/// One cell of the pods table: its column's width, never more or less, on one line.
-fn pod_cell(width: f32) -> Div {
-    div().w(px(width)).flex_none().overflow_hidden().text_ellipsis().whitespace_nowrap()
+/// One cell of the pods table, on one line, the same in the header and the rows so they line
+/// up. Names (namespace, pod, node) give up width in a narrow window, down to half of theirs and
+/// cut with an ellipsis; the other columns keep theirs.
+fn pod_cell(title: &str, width: f32) -> Div {
+    let d = div().w(px(width)).overflow_hidden().text_ellipsis().whitespace_nowrap();
+    if shrinks(title) { d.flex_shrink(1.).min_w(px(width / 2.)) } else { d.flex_none() }
+}
+
+/// The columns that shrink: names, which an ellipsis still leaves recognizable.
+fn shrinks(title: &str) -> bool {
+    matches!(title, "Namespace" | "Name" | "Node")
 }
 
 /// The header of a pods table; its rows are items of the page's list (`pod_row`). A click
@@ -709,10 +717,10 @@ pub(super) fn pods_table(ctx: &Ctx, cx: &App) -> AnyElement {
         .children(pod_columns(ctx.ns().is_some()).into_iter().map(|(title, width, col)| {
             let sorted = ctx.pod_order.filter(|(c, _)| *c == col).map(|(_, desc)| desc);
             let panel = ctx.panel.clone();
-            h_flex()
+            pod_cell(title, width)
+                .flex()
+                .items_center()
                 .id(title)
-                .w(px(width))
-                .flex_none()
                 .gap_1()
                 .cursor_pointer()
                 .hover(|s| s.text_color(cx.theme().foreground))
@@ -804,7 +812,7 @@ pub(super) fn pod_row(ctx: &Ctx, p: &PodRow, cx: &App) -> AnyElement {
     };
     // Pods are opened in their own namespace (a node lists pods from every namespace).
     let cells = pod_columns(ctx.ns().is_some()).into_iter().map(|(title, width, _)| {
-        let cell = pod_cell(width);
+        let cell = pod_cell(title, width);
         match title {
             "Namespace" => cell.text_color(theme.muted_foreground).child(p.namespace.clone().unwrap_or_default()),
             "Name" => cell.child(ctx.link_in(p.name.clone(), "pods", &p.name, p.namespace.clone(), cx)),
@@ -936,6 +944,10 @@ mod tests {
             let cols = pod_columns(namespaced);
             assert!(width(&cols, "Status") >= needed("CreateContainerConfigError"));
             assert_eq!(cols.iter().any(|c| c.0 == "Namespace"), !namespaced);
+            // In a 1500 px window the table has about 1240 px: once the names shrink, it fits.
+            let least: f32 = cols.iter().map(|&(t, w, _)| if super::shrinks(t) { w / 2. } else { w }).sum::<f32>()
+                + 12. * (cols.len() - 1) as f32;
+            assert!(least <= 1240., "{least}");
         }
     }
 
