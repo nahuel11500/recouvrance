@@ -125,13 +125,7 @@ pub fn exec_shell(client: Client, ns: String, pod: String, container: Option<Str
         }
         let reason = match status {
             Some(s) => match s.await {
-                Some(st) if st.status.as_deref() != Some("Success") => {
-                    let message = st.message.unwrap_or_default();
-                    match ended_reason(&message) {
-                        Some(hint) => format!("Session ended: {hint}: {message}"),
-                        None => format!("Session ended: {message}"),
-                    }
-                }
+                Some(st) if st.status.as_deref() != Some("Success") => shell_ended(&st.message.unwrap_or_default()),
                 _ => "Session ended".to_string(),
             },
             None => "Session ended".to_string(),
@@ -210,6 +204,19 @@ pub(super) fn ended_reason(message: &str) -> Option<String> {
     let m = message.to_ascii_lowercase();
     (m.contains("executable file not found") || (m.contains("no such file or directory") && m.contains("exec")))
         .then(|| format!("no shell in this image ({NO_SHELL})"))
+}
+
+/// What the Shell tab says when its shell failed with `message`: for an image without a
+/// shell, that plainly (as the Files tab does), Debug as the way in, and what the runtime
+/// said without the API server's wrapping around it.
+fn shell_ended(message: &str) -> String {
+    if ended_reason(message).is_none() {
+        return format!("Session ended: {message}");
+    }
+    format!(
+        "This image has no shell; Debug adds a container with one. The runtime said: {}",
+        super::files::runtime_said(message)
+    )
 }
 
 /// Why an exec or attach upgrade answered `status`, from the pod as read (when it could be)
@@ -867,7 +874,7 @@ fn attach_target(
 mod tests {
     use super::{
         NO_SHELL, Refusal, attach_target, copy_capped, crlf, ended_reason, helm_writes, read_capped, refusal_reason,
-        tar_source, upload_source,
+        shell_ended, tar_source, upload_source,
     };
     use k8s_openapi::api::core::v1::{Container, EphemeralContainer, PodSpec};
 
@@ -969,6 +976,24 @@ mod tests {
         // Restarted long ago, or never: not known to be crash looping.
         assert_eq!(said(&pod(7, 600, Some("Error")), 500, Some("worker")), None);
         assert_eq!(said(&pod(0, 3, None), 500, Some("worker")), None);
+    }
+
+    #[test]
+    fn a_shell_in_an_image_without_one_says_so_in_the_runtime_s_words() {
+        let wrapped = "Internal error occurred: Internal error occurred: error executing command in container: failed \
+                       to exec in container: failed to start exec \"0123456789abcdef\": OCI runtime exec failed: exec \
+                       failed: unable to start container process: exec: \"sh\": executable file not found in $PATH: \
+                       unknown";
+        assert_eq!(
+            shell_ended(wrapped),
+            "This image has no shell; Debug adds a container with one. The runtime said: exec: \"sh\": executable \
+             file not found in $PATH: unknown"
+        );
+        // Any other end is said as it came.
+        assert_eq!(
+            shell_ended("command terminated with non-zero exit code: exit status 130"),
+            "Session ended: command terminated with non-zero exit code: exit status 130"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

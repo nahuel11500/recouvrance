@@ -340,7 +340,7 @@ fn explain(e: anyhow::Error) -> anyhow::Error {
 
 /// The runtime's own words in an exec failure: the API server wraps them in "Internal error
 /// occurred" (twice) and the exec's id, which say nothing to the reader.
-fn runtime_said(text: &str) -> &str {
+pub(super) fn runtime_said(text: &str) -> &str {
     for mark in ["unable to start container process: ", "OCI runtime exec failed: "] {
         if let Some((_, said)) = text.rsplit_once(mark) {
             return said.trim();
