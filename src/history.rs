@@ -704,24 +704,43 @@ pub async fn fetch(client: Client, kind: Kind, ns: Option<String>, obj: Value, a
         }
     }
     let release = helm_release_of(&obj).or_else(|| workload.as_ref().and_then(|(_, w)| helm_release_of(w)));
-    if let Some((rns, rname)) = release
-        && allowed(Read::Helm { ns: &rns, secret: None })
-    {
-        match helm::history(client, rns.clone(), rname.clone()).await {
-            Ok(revs) => {
-                let revs: Vec<Release> = revs
-                    .into_iter()
-                    .filter(|r| {
-                        let secret = format!("sh.helm.release.v1.{}.v{}", r.name, r.revision);
-                        allowed(Read::Helm { ns: &rns, secret: Some(&secret) })
-                    })
-                    .collect();
-                out.changes.extend(helm_changes(&revs));
+    // What the rules keep it from reading is said, as a failure is: the history is incomplete.
+    if let Some((rns, rname)) = release {
+        if allowed(Read::Helm { ns: &rns, secret: None }) {
+            match helm::history(client, rns.clone(), rname.clone()).await {
+                Ok(revs) => {
+                    let (revs, hidden) = readable_revisions(revs, &rns, &allowed);
+                    out.changes.extend(helm_changes(&revs));
+                    if hidden > 0 {
+                        out.errors.push(format!(
+                            "{hidden} revision{} of Helm release {rname}: not allowed by your rules (list on their \
+                             secrets)",
+                            if hidden == 1 { "" } else { "s" }
+                        ));
+                    }
+                }
+                Err(e) => out.errors.push(format!("Helm release {rname}: {}", k8s::short_error(&e))),
             }
-            Err(e) => out.errors.push(format!("Helm release {rname}: {}", k8s::short_error(&e))),
+        } else {
+            out.errors.push(format!("Helm release {rname}: not allowed by your rules (list on secrets in {rns})"));
         }
     }
     out
+}
+
+/// The Helm revisions of namespace `ns` whose Secret `allowed` lets be read, and how many it
+/// doesn't.
+fn readable_revisions(revs: Vec<Release>, ns: &str, allowed: &Allowed) -> (Vec<Release>, usize) {
+    let total = revs.len();
+    let kept: Vec<Release> = revs
+        .into_iter()
+        .filter(|r| {
+            let secret = format!("sh.helm.release.v1.{}.v{}", r.name, r.revision);
+            allowed(Read::Helm { ns, secret: Some(&secret) })
+        })
+        .collect();
+    let hidden = total - kept.len();
+    (kept, hidden)
 }
 
 /// The workload that rolls the object out: itself, or the controller that owns a pod or a
@@ -981,6 +1000,19 @@ mod tests {
         let same =
             [release(1, "1.0.0", json!({"a": 1}), "superseded"), release(2, "1.0.0", json!({"a": 1}), "deployed")];
         assert!(helm_changes(&same)[1].diff.is_none());
+    }
+
+    /// The revisions the rules keep it from reading are counted, for the reply to say so.
+    #[test]
+    fn helm_revisions_not_allowed_are_counted() {
+        let revs = || (1..=3).map(|n| release(n, "1.0.0", json!({}), "superseded")).collect::<Vec<_>>();
+        let only_v2: Allowed = Arc::new(|read: Read<'_>| {
+            matches!(read, Read::Helm { ns: "shop", secret: Some("sh.helm.release.v1.web.v2") | None })
+        });
+        let (kept, hidden) = readable_revisions(revs(), "shop", &only_v2);
+        assert_eq!((kept.iter().map(|r| r.revision).collect::<Vec<_>>(), hidden), (vec![2], 2));
+        let (kept, hidden) = readable_revisions(revs(), "shop", &all_allowed());
+        assert_eq!((kept.len(), hidden), (3, 0));
     }
 
     #[test]
