@@ -5,6 +5,50 @@ and versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.5.0](https://github.com/nahuel11500/recouvrance/compare/v0.4.1...v0.5.0) - 2026-11-02
+
+### Added
+
+- *(assistant)* Tool calls in words, folded once answered; inline code and tables that read (#685)
+- *(metrics)* Read metrics-server when its next sample is due, and say how old usage is (#647)
+- *(ui)* Select and copy any text on detail pages (#644)
+- *(files)* Read a container that isn't running from a copy of the pod (#637)
+- *(nodes)* Trouble taints in a node's status, yellow when cordoned or tainted (#643)
+- *(argo)* Diagnose why an Application drifts, loops, failed or is stuck (#642)
+- *(timeline)* Record changes while the app watches, a Timeline page across clusters (#636)
+- *(files)* Read a container without a shell through a debug container (#638)
+- *(problems)* References to objects that don't exist (#630)
+- *(network)* Reachability tab and check_reachability tool (#635)
+- *(argo)* An Argo CD page listing every Application across clusters (#631)
+- *(files)* Browse a container's files through exec (#634)
+- *(upgrade)* Check what breaks on the next Kubernetes minor version (#633)
+- *(history)* A History tab and get_changes, from what the cluster keeps (#632)
+- *(keys)* List the shortcuts on ?, jump to pages with g, move in tables with j/k (#629)
+
+### Fixed
+
+- *(exec)* A refused exec says why in place of the raw 500, also between a crash-looping container's restarts (#692)
+- *(shell)* An image without a shell says so in the runtime's words, not the raw API error (#693)
+- *(overview)* Pods table names shrink so the table fits the page (#691)
+- *(argo)* An Application being deleted waits only for what is still there (#675)
+- *(mcp)* Get_changes names the Helm revisions and events the rules left out (#679)
+- *(files)* Say a container isn't running instead of a raw 500, and that a path is missing (#673)
+- *(timeline)* Treat an object a controller adopts once created as controller-made (#674)
+- *(timeline)* Group the events of one object with the same reason into one row (#680)
+- *(nodes)* An unreachable node reads as unknown pressure, old usage is marked, and its title dot is red (#682)
+- *(nodes)* Memory in Gi on a node's page, a pods table whose cells line up, and charts with the same times (#681)
+- *(nodes)* A Status column wide enough for a node's status, and the whole status on hover (#669)
+- *(history)* Put the revision number before the name in change labels (#677)
+- *(upgrade)* Report only the deprecated feature gates the API server's flags set (#671)
+- *(metrics)* Keep the interval learnt when a read steps back to another replica's sample (#684)
+- *(argo)* Say a resource is missing when the live read doesn't find it, whatever its health (#670)
+- *(problems)* Let the message take the row's free width (#666)
+- *(files)* Say plainly that an image has no shell, and point to the debug container (#672)
+- *(ui)* Show commands in confirmation dialogs in the theme's mono font (#678)
+- *(files)* Wrap the pod-copy note so Delete the copy stays on screen (#667)
+- *(argo)* Show an Application's own sync and health on its page, and say when it is Degraded (#676)
+- *(argo)* Shrink the wide columns so the row menu keeps its own space (#668)
+
 ## [0.4.1](https://github.com/nahuel11500/recouvrance/compare/v0.4.0...v0.4.1) - 2026-10-29
 
 The first published release of 0.4: v0.4.0 was tagged, but its macOS builds failed and it was never published.
