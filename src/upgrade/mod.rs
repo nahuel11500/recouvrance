@@ -584,7 +584,7 @@ fn feature_gate_flags(pods: &[PodLite]) -> Option<BTreeMap<String, String>> {
     for p in pods.iter().filter(|p| p.metadata.namespace == "kube-system") {
         for c in &p.spec.containers {
             let program = c.command.first().or(c.args.first());
-            if !program.is_some_and(|w| w.rsplit('/').next() == Some("kube-apiserver")) {
+            if program.is_none_or(|w| w.rsplit('/').next() != Some("kube-apiserver")) {
                 continue;
             }
             found = true;
