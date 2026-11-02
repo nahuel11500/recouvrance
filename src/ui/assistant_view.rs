@@ -496,7 +496,7 @@ fn chat_text_style(theme: &component::Theme) -> component::text::TextViewStyle {
         .table_cell(StyleRefinement::default().bg(theme.background))
 }
 
-/// "describe_resource" → "Describe resource".
+/// `describe_resource` → "Describe resource".
 fn tool_title(name: &str) -> String {
     let words = name.replace('_', " ");
     let mut chars = words.chars();
