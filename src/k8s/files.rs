@@ -310,9 +310,13 @@ fi
 done
 "#;
 
-/// Prints the first `$2` bytes of regular file `$p`.
-const READ: &str = r#"if [ -d "$p" ]; then echo "$p is a folder" >&2; exit 1; fi
-if [ ! -f "$p" ]; then echo "$p is not a regular file" >&2; exit 1; fi
+/// Prints the first `$2` bytes of regular file `$p`, else says why not, with the path as the
+/// container sees it (without `$R`). "or folder", not "or directory": the runtime's own "no
+/// such file or directory" means its shell is missing (`ended_reason`).
+const READ: &str = r#"s=${p#"$R"}
+if [ -d "$p" ]; then echo "${s:-/} is a folder" >&2; exit 1; fi
+if [ ! -e "$p" ] && [ ! -L "$p" ]; then echo "$s: no such file or folder" >&2; exit 1; fi
+if [ ! -f "$p" ]; then echo "$s is not a regular file" >&2; exit 1; fi
 exec head -c "$2" "$p"
 "#;
 
@@ -1006,6 +1010,36 @@ mod tests {
         assert_eq!(resolve("/var/../../missing"), Some(format!("{r}/missing")));
         assert_eq!(resolve("/"), Some(r.clone()));
         assert_eq!(resolve("/loop"), None);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A file that can't be read says why, with the path as the container sees it, under a
+    /// root or not; and never in words read as a missing shell.
+    #[cfg(unix)]
+    #[test]
+    fn reads_say_why_not() {
+        let root = std::env::temp_dir().join(format!("recouvrance-read-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("etc")).unwrap();
+        std::fs::write(root.join("etc/hosts"), "localhost\n").unwrap();
+        let r = root.to_str().unwrap().to_string();
+        let read = |under: bool, path: &str| {
+            let prefix = if under {
+                format!("R={}\n{}", super::super::shell_quote(&r), super::IN_ROOT)
+            } else {
+                "R=\n".to_string()
+            };
+            let script = format!("{prefix}{}{}", super::DECODE, super::READ);
+            let arg = sh_arg(format!("{r}{path}").as_bytes());
+            let out = std::process::Command::new("sh").args(["-c", &script, "sh", &arg, "100"]).output().unwrap();
+            (out.status.success(), String::from_utf8(out.stdout).unwrap(), String::from_utf8(out.stderr).unwrap())
+        };
+        assert_eq!(read(true, "/etc/hosts"), (true, "localhost\n".into(), String::new()));
+        assert_eq!(read(true, "/nope"), (false, String::new(), "/nope: no such file or folder\n".into()));
+        assert_eq!(read(true, "/etc"), (false, String::new(), "/etc is a folder\n".into()));
+        assert_eq!(read(false, "/nope"), (false, String::new(), format!("{r}/nope: no such file or folder\n")));
+        let (_, _, missing) = read(true, "/usr/libexec/nope");
+        assert_eq!(super::super::exec::ended_reason(&missing), None, "{missing}");
         std::fs::remove_dir_all(&root).unwrap();
     }
 

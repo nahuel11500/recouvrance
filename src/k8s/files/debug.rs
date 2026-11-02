@@ -166,6 +166,10 @@ pub async fn look(client: Client, ns: String, pod: String, target: String, image
         } else {
             target
         };
+        // A debug container shares a running container's processes: one added now would read nothing.
+        if let Some(why) = crate::k8s::container_stopped(&read, &target) {
+            anyhow::bail!("container {target} isn't running ({why}): nothing can be read in it");
+        }
         for debug in running(&read, &target) {
             // One that no longer sees the container (restarted since) is passed over.
             if let Ok(source) = through(&client, &ns, &pod, &read, &debug, &target).await {
