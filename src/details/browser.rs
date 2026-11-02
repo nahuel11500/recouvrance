@@ -915,7 +915,7 @@ impl FileBrowser {
             .border_b_1()
             .border_color(theme.border)
             .child(Icon::new(Lucide::Search).size_3p5())
-            .child(div().flex_1().child(match found {
+            .child(div().flex_1().min_w_0().child(match found {
                 None => format!("Searching for “{looked}”…"),
                 Some(Err(_)) => format!("The search for “{looked}” failed"),
                 Some(Ok(f)) => format!(
