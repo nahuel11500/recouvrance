@@ -33,6 +33,8 @@ pub struct AssistantView {
     started: Option<std::time::Instant>,
     /// Tool results expanded in the transcript, by (entry, step).
     open: std::collections::HashSet<(usize, usize)>,
+    /// Blocks of tool calls unfolded, by (entry, first step).
+    open_groups: std::collections::HashSet<(usize, usize)>,
     scroll: ScrollHandle,
     _task: Option<Task<()>>,
     _subs: Vec<Subscription>,
@@ -66,14 +68,23 @@ impl AssistantView {
             .map(|md| {
                 vec![
                     Entry::User("Why are five Elasticsearch pods not ready?".into()),
-                    Entry::Assistant(vec![
-                        Step::Tool {
-                            name: "get_events".into(),
-                            args: "{\"namespace\":\"logging\"}".into(),
-                            result: "…".into(),
-                        },
-                        Step::Text(md),
-                    ]),
+                    Entry::Assistant(
+                        [
+                            (
+                                "describe_resource",
+                                r#"{"context":"kind-dev","kind":"pod","name":"es-0","namespace":"logging"}"#,
+                            ),
+                            ("get_events", r#"{"context":"kind-dev","namespace":"logging"}"#),
+                            (
+                                "get_logs",
+                                r#"{"context":"kind-dev","namespace":"logging","pod":"es-0","previous":true}"#,
+                            ),
+                        ]
+                        .into_iter()
+                        .map(|(name, args)| Step::Tool { name: name.into(), args: args.into(), result: "…".into() })
+                        .chain([Step::Text(md)])
+                        .collect(),
+                    ),
                 ]
             })
             .unwrap_or_default();
@@ -90,6 +101,7 @@ impl AssistantView {
             busy: false,
             started: None,
             open: Default::default(),
+            open_groups: Default::default(),
             scroll: ScrollHandle::new(),
             _task: None,
             _subs: subs,
@@ -116,6 +128,102 @@ impl AssistantView {
         self.conv = Default::default();
         self.entries.clear();
         self.open.clear();
+        self.open_groups.clear();
+    }
+
+    /// Tool calls in a row: "Used 3 tools" and their names, unfolded while the answer is
+    /// being written or when clicked.
+    fn render_tools(&self, ei: usize, start: usize, steps: &[Step], live: bool, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme().clone();
+        let group = (ei, start);
+        let unfolded = live || self.open_groups.contains(&group);
+        let mut names: Vec<String> = Vec::new();
+        for s in steps {
+            if let Step::Running { name, .. } | Step::Tool { name, .. } = s
+                && !names.contains(&tool_title(name))
+            {
+                names.push(tool_title(name));
+            }
+        }
+        let used = match steps.len() {
+            1 => "Used 1 tool".to_string(),
+            n => format!("Used {n} tools"),
+        };
+        let summary = h_flex()
+            .id(SharedString::from(format!("tools-{ei}-{start}")))
+            .gap_2()
+            .text_xs()
+            .text_color(theme.muted_foreground)
+            .cursor_pointer()
+            .child(Icon::new(if unfolded { Lucide::ChevronDown } else { Lucide::ChevronRight }).size_3())
+            .child(div().flex_none().child(used))
+            .when(!unfolded, |d| d.child(div().flex_1().min_w_0().truncate().child(names.join(", "))))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                if !this.open_groups.remove(&group) {
+                    this.open_groups.insert(group);
+                }
+                cx.notify();
+            }));
+        let rows: Vec<AnyElement> = if unfolded {
+            steps.iter().enumerate().map(|(i, s)| self.render_tool(ei, start + i, s, cx)).collect()
+        } else {
+            Vec::new()
+        };
+        v_flex()
+            .gap_1()
+            .child(summary)
+            .when(unfolded, |d| {
+                d.child(v_flex().ml(px(5.)).pl_3().gap_1().border_l_1().border_color(theme.border).children(rows))
+            })
+            .into_any_element()
+    }
+
+    /// One tool call: what it looked at, in words; its result when clicked.
+    fn render_tool(&self, ei: usize, si: usize, step: &Step, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme().clone();
+        let (name, args, result) = match step {
+            Step::Running { name, args } => (name, args, None),
+            Step::Tool { name, args, result } => (name, args, Some(result)),
+            Step::Text(_) => return div().into_any_element(),
+        };
+        let key = (ei, si);
+        let open = result.is_some() && self.open.contains(&key);
+        let row = h_flex()
+            .id(SharedString::from(format!("tool-{ei}-{si}")))
+            .gap_2()
+            .text_xs()
+            .child(match result {
+                None => div().text_color(theme.blue).child(Icon::new(Lucide::LoaderCircle).size_3()),
+                Some(_) => div()
+                    .text_color(theme.muted_foreground)
+                    .child(Icon::new(if open { Lucide::ChevronDown } else { Lucide::ChevronRight }).size_3()),
+            })
+            .child(div().flex_none().child(tool_title(name)))
+            .child(div().flex_1().min_w_0().truncate().text_color(theme.muted_foreground).child(tool_detail(args)))
+            .when(result.is_some(), |d| {
+                d.cursor_pointer().on_click(cx.listener(move |this, _, _, cx| {
+                    if !this.open.remove(&key) {
+                        this.open.insert(key);
+                    }
+                    cx.notify();
+                }))
+            });
+        v_flex()
+            .child(row)
+            .when_some(result.filter(|_| open), |d, result| {
+                d.child(
+                    div()
+                        .ml_5()
+                        .mt_1()
+                        .p_2()
+                        .rounded_md()
+                        .bg(theme.secondary)
+                        .font_family(theme.mono_font_family.clone())
+                        .text_xs()
+                        .children(result.lines().take(60).map(|l| div().whitespace_nowrap().child(l.to_string()))),
+                )
+            })
+            .into_any_element()
     }
 
     pub fn send(&mut self, question: String, cx: &mut Context<Self>) {
@@ -250,29 +358,18 @@ impl Render for AssistantView {
                     rows.push(div().text_sm().text_color(theme.danger).child(m.clone()).into_any_element());
                 }
                 Entry::Assistant(steps) => {
-                    let mut col = v_flex().gap_2();
-                    for (si, s) in steps.iter().enumerate() {
-                        col = col.child(match s {
-                            Step::Running { name, args } => h_flex()
-                                .gap_2()
-                                .text_xs()
-                                .text_color(theme.blue)
-                                .child(Icon::new(Lucide::LoaderCircle).size_3())
-                                .child(
-                                    div()
-                                        .font_family(theme.mono_font_family.clone())
-                                        .child(format!("{name} {}", truncate(args, 120))),
-                                )
-                                .child(div().text_color(muted).child("running…"))
-                                .into_any_element(),
-                            Step::Text(t) => div()
-                                .text_sm()
-                                .child(
+                    let mut col = v_flex().gap_3();
+                    let live = self.busy && ei + 1 == self.entries.len();
+                    let mut si = 0;
+                    while si < steps.len() {
+                        if let Step::Text(t) = &steps[si] {
+                            col = col.child(
+                                div().text_sm().child(
                                     component::text::TextView::markdown(
                                         SharedString::from(format!("md-{ei}-{si}")),
                                         t.clone(),
                                     )
-                                    .style(chat_text_style())
+                                    .style(chat_text_style(&theme))
                                     .selectable(true)
                                     // Model output is untrusted: only web links open.
                                     .on_link_click(|url, _, _, cx| {
@@ -280,60 +377,18 @@ impl Render for AssistantView {
                                             cx.open_url(url);
                                         }
                                     }),
-                                )
-                                .into_any_element(),
-                            Step::Tool { name, args, result } => {
-                                let key = (ei, si);
-                                let open = self.open.contains(&key);
-                                v_flex()
-                                    .child(
-                                        h_flex()
-                                            .id(SharedString::from(format!("tool-{ei}-{si}")))
-                                            .gap_2()
-                                            .cursor_pointer()
-                                            .text_xs()
-                                            .text_color(muted)
-                                            .child(
-                                                Icon::new(if open {
-                                                    Lucide::ChevronDown
-                                                } else {
-                                                    Lucide::ChevronRight
-                                                })
-                                                .size_3(),
-                                            )
-                                            .child(Icon::new(Lucide::Wrench).size_3())
-                                            .child(
-                                                div()
-                                                    .font_family(theme.mono_font_family.clone())
-                                                    .child(format!("{name} {}", truncate(args, 120))),
-                                            )
-                                            .on_click(cx.listener(move |this, _, _, cx| {
-                                                if !this.open.remove(&key) {
-                                                    this.open.insert(key);
-                                                }
-                                                cx.notify();
-                                            })),
-                                    )
-                                    .when(open, |d| {
-                                        d.child(
-                                            div()
-                                                .ml_5()
-                                                .p_2()
-                                                .rounded_md()
-                                                .bg(theme.secondary)
-                                                .font_family(theme.mono_font_family.clone())
-                                                .text_xs()
-                                                .children(
-                                                    result
-                                                        .lines()
-                                                        .take(60)
-                                                        .map(|l| div().whitespace_nowrap().child(l.to_string())),
-                                                ),
-                                        )
-                                    })
-                                    .into_any_element()
-                            }
-                        });
+                                ),
+                            );
+                            si += 1;
+                            continue;
+                        }
+                        // Tool calls in a row make one block, folded to a line once the
+                        // answer goes on.
+                        let start = si;
+                        while si < steps.len() && !matches!(steps[si], Step::Text(_)) {
+                            si += 1;
+                        }
+                        col = col.child(self.render_tools(ei, start, &steps[start..si], live && si == steps.len(), cx));
                     }
                     if self.busy && ei + 1 == self.entries.len() {
                         let secs = self.started.map_or(0, |t| t.elapsed().as_secs());
@@ -431,13 +486,52 @@ impl Render for AssistantView {
 const CHAT_WIDTH: f32 = 920.;
 
 /// Answers' Markdown: code blocks in the same small size as the text around them (the theme
-/// draws them larger, which made a reply's commands the biggest thing on screen).
-fn chat_text_style() -> component::text::TextViewStyle {
-    component::text::TextViewStyle::default().code_block(StyleRefinement::default().text_xs())
+/// draws them larger, which made a reply's commands the biggest thing on screen), inline code
+/// on a tint that shows, and tables on the page's color.
+fn chat_text_style(theme: &component::Theme) -> component::text::TextViewStyle {
+    component::text::TextViewStyle::default()
+        .code_block(StyleRefinement::default().text_xs())
+        .inline_code(HighlightStyle { background_color: Some(theme.border), ..Default::default() })
+        .table(StyleRefinement::default().bg(theme.background))
+        .table_cell(StyleRefinement::default().bg(theme.background))
 }
 
-fn truncate(s: &str, n: usize) -> String {
-    if s.chars().count() > n { format!("{}…", s.chars().take(n).collect::<String>()) } else { s.to_string() }
+/// "describe_resource" → "Describe resource".
+fn tool_title(name: &str) -> String {
+    let words = name.replace('_', " ");
+    let mut chars = words.chars();
+    chars.next().map_or_else(String::new, |c| c.to_uppercase().chain(chars).collect())
+}
+
+/// A tool's arguments as what it looked at: "pod · web-7f9c · shop · kind-dev", the object
+/// first and the context last; other arguments as "key: value". Not JSON: as is.
+fn tool_detail(args: &str) -> String {
+    let Ok(serde_json::Value::Object(map)) = serde_json::from_str::<serde_json::Value>(args) else {
+        return args.to_string();
+    };
+    fn scalar(v: &serde_json::Value) -> Option<String> {
+        match v {
+            serde_json::Value::String(s) => Some(s.clone()),
+            serde_json::Value::Number(n) => Some(n.to_string()),
+            serde_json::Value::Bool(b) => Some(b.to_string()),
+            serde_json::Value::Array(a) => {
+                let items: Vec<String> = a.iter().filter_map(scalar).collect();
+                (!items.is_empty()).then(|| items.join(", "))
+            }
+            _ => None,
+        }
+    }
+    const OBJECT: [&str; 4] = ["kind", "object_kind", "name", "namespace"];
+    const LAST: [&str; 2] = ["context", "contexts"];
+    let mut parts: Vec<String> = OBJECT.iter().filter_map(|k| map.get(*k).and_then(scalar)).collect();
+    parts.extend(
+        map.iter()
+            .filter(|(k, _)| !OBJECT.contains(&k.as_str()) && !LAST.contains(&k.as_str()))
+            .filter_map(|(k, v)| scalar(v).map(|v| format!("{k}: {v}"))),
+    );
+    parts.extend(LAST.iter().filter_map(|k| map.get(*k).and_then(scalar)));
+    parts.retain(|p| !p.is_empty());
+    parts.join(" · ")
 }
 
 /// http(s) only: no file://, custom schemes or anything else the desktop would launch.
@@ -448,6 +542,21 @@ fn is_web_link(url: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn tool_calls_read_as_words() {
+        assert_eq!(super::tool_title("describe_resource"), "Describe resource");
+        assert_eq!(super::tool_title(""), "");
+        assert_eq!(
+            super::tool_detail(
+                r#"{"context":"kind-dev","namespace":"shop","name":"web-7f9c","kind":"pod","previous":true,"tail":50}"#
+            ),
+            "pod · web-7f9c · shop · previous: true · tail: 50 · kind-dev"
+        );
+        assert_eq!(super::tool_detail(r#"{"contexts":["a","b"],"query":"web"}"#), "query: web · a, b");
+        assert_eq!(super::tool_detail("not json"), "not json");
+        assert_eq!(super::tool_detail("{}"), "");
+    }
+
     #[test]
     fn only_web_links_open() {
         assert!(super::is_web_link("https://kubernetes.io/docs"));
