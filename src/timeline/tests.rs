@@ -119,6 +119,56 @@ fn a_watch_of_whole_objects_takes_over_from_metadata() {
     assert_eq!(rec.records_of("ctx").len(), 2, "recorded again once the whole watch stopped");
 }
 
+fn secret(rv: u64, owner: bool) -> Box<RawValue> {
+    let mut v = json!({
+        "metadata": {
+            "name": "scan", "namespace": "default", "uid": "us", "resourceVersion": rv.to_string(),
+            "creationTimestamp": jiff::Timestamp::now().to_string(),
+        },
+        "data": {"k": "dg=="},
+    });
+    if owner {
+        v["metadata"]["ownerReferences"] = json!([{"controller": true, "kind": "Job", "name": "scan", "uid": "j"}]);
+    }
+    raw(&v)
+}
+
+#[test]
+fn a_creation_is_recorded_once_held_back_unless_a_controller_adopts_it() {
+    let hold = Duration::from_millis(30);
+    let rec: &'static Recorder = Box::leak(Box::new(Recorder { hold, ..Recorder::new(None) }));
+    for full in [false, true] {
+        let ctx = if full { "whole" } else { "meta" };
+        let tap = rec.tap(ctx, &kind("", "Secret"), None, full);
+        tap.begin_list();
+        tap.end_list();
+        // Made, adopted by its operator a moment later, then deleted: nothing to say.
+        tap.event("ADDED", &secret(1, false));
+        tap.event("MODIFIED", &secret(2, true));
+        tap.event("DELETED", &secret(3, true));
+        std::thread::sleep(hold * 2);
+        rec.release();
+        assert!(rec.records_of(ctx).is_empty(), "{:?}", rec.records_of(ctx));
+    }
+    let tap = rec.tap("ctx", &kind("", "Secret"), None, true);
+    tap.begin_list();
+    tap.end_list();
+    tap.event("ADDED", &secret(1, false));
+    assert!(rec.records_of("ctx").is_empty(), "held back");
+    std::thread::sleep(hold * 2);
+    rec.release();
+    let whats: Vec<What> = rec.records_of("ctx").iter().map(|r| r.what).collect();
+    assert_eq!(whats, [What::Created]);
+    // Made and deleted before its creation was due: both, in order.
+    let other = rec.tap("other", &kind("", "Secret"), None, true);
+    other.begin_list();
+    other.end_list();
+    other.event("ADDED", &secret(1, false));
+    other.event("DELETED", &secret(2, false));
+    let whats: Vec<What> = rec.records_of("other").iter().map(|r| r.what).collect();
+    assert_eq!(whats, [What::Created, What::Deleted]);
+}
+
 #[test]
 fn a_record_is_a_history_entry_of_its_source() {
     let r = Record {

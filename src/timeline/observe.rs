@@ -126,7 +126,8 @@ impl Stamp<'_> {
         }
     }
 
-    /// The fields this manager owns, outside the status and noisy annotations.
+    /// The fields this manager owns, outside the status, noisy annotations and owner
+    /// references.
     fn paths(&self) -> Vec<Vec<String>> {
         let Some(v) = self.fields.and_then(|f| serde_json::from_str::<Value>(f.get()).ok()) else {
             return Vec::new();
@@ -136,10 +137,16 @@ impl Stamp<'_> {
         paths.retain(|p| {
             let status = p.first().is_some_and(|s| s == "status");
             let noisy = p.len() >= 3 && p[0] == "metadata" && p[1] == "annotations" && noise(&p[2]);
-            !status && !noisy
+            !status && !noisy && !owners(p)
         });
         paths
     }
+}
+
+/// `metadata.ownerReferences`: an operator adopting what it made (a Secret it owns once
+/// created) is not news, nor is a garbage collector letting go of it.
+fn owners(path: &[String]) -> bool {
+    path.len() >= 2 && path[0] == "metadata" && path[1] == "ownerReferences"
 }
 
 /// One observation, ready to compare.
@@ -222,7 +229,7 @@ impl<'a> Observed<'a> {
 }
 
 /// A whole object as compared: no status, no metadata that changes on every write, no
-/// noisy annotations, a Secret's values hidden.
+/// owner references (see `owners`), no noisy annotations, a Secret's values hidden.
 fn comparable(mut obj: Value, info: &KindInfo) -> Value {
     if let Some(o) = obj.as_object_mut() {
         o.remove("status");
@@ -235,7 +242,15 @@ fn comparable(mut obj: Value, info: &KindInfo) -> Value {
         }
     }
     if let Some(m) = obj.get_mut("metadata").and_then(Value::as_object_mut) {
-        for key in ["resourceVersion", "managedFields", "generation", "uid", "selfLink", "creationTimestamp"] {
+        for key in [
+            "resourceVersion",
+            "managedFields",
+            "generation",
+            "uid",
+            "selfLink",
+            "creationTimestamp",
+            "ownerReferences",
+        ] {
             m.remove(key);
         }
         let none_left = m.get_mut("annotations").and_then(Value::as_object_mut).is_some_and(|a| {
@@ -328,7 +343,9 @@ pub(super) enum How {
     Deleted,
 }
 
-/// Compare an observation with what was kept, keep it, and say what changed, if anything.
+/// Compare an observation with what was kept, keep it, and say what changed, if anything,
+/// and whether a controller just adopted the object (its creation, recorded or held back,
+/// is then not news either: see `Recorder::hold`).
 pub(super) fn observe(
     state: &mut KindState,
     info: &KindInfo,
@@ -337,10 +354,10 @@ pub(super) fn observe(
     how: How,
     now: jiff::Timestamp,
     at: Instant,
-) -> Option<Record> {
+) -> (Option<Record>, bool) {
     if how == How::Deleted {
-        let seen = state.remove(&obs.uid)?;
-        return deleted(info, obs.uid, seen, obs.deleting.unwrap_or(now), "deleted");
+        let Some(seen) = state.remove(&obs.uid) else { return (None, false) };
+        return (deleted(info, obs.uid, seen, obs.deleting.unwrap_or(now), "deleted"), false);
     }
     let writers: Box<[(u64, i64)]> = obs.writers.iter().map(|w| (w.key, w.time)).collect();
     if !state.objects.contains_key(&obs.uid) {
@@ -383,7 +400,7 @@ pub(super) fn observe(
                 missed: 0,
             },
         );
-        return record;
+        return (record, false);
     }
     let seen = &state.objects[&obs.uid];
     // The same version, or an older one than already seen (another list behind a watch).
@@ -393,18 +410,21 @@ pub(super) fn observe(
         if let Some(seen) = state.objects.get_mut(&obs.uid) {
             seen.at = at;
         }
-        return None;
+        return (None, false);
     }
     // Last compared the other way (a watch of whole objects started or stopped): this
     // observation is the new baseline.
     let same_way = seen.full == full;
+    // Made by a controller after all: it gave itself an owner once created (an operator's
+    // Secret). That write is not news, and its deletion won't be.
+    let adopted = !seen.owned && obs.owned;
     let generation_changed = matches!((seen.generation, obs.generation), (Some(a), Some(b)) if a != b);
     let hash_changed = seen.hash != obs.hash;
     let new_writers: Vec<&Stamp<'_>> =
         obs.writers.iter().filter(|w| !seen.writers.contains(&(w.key, w.time))).collect();
     let written: Vec<(&Stamp<'_>, Vec<Vec<String>>)> =
         new_writers.iter().map(|w| (*w, w.paths())).filter(|(_, p)| !p.is_empty()).collect();
-    let changed = if !same_way {
+    let changed = if !same_way || adopted {
         false
     } else if full {
         hash_changed
@@ -468,29 +488,30 @@ pub(super) fn observe(
     }
     let old_kept = state.objects.get_mut(&obs.uid).and_then(|s| s.kept.take());
     let kept = state.keep(old_kept, &obs.version, full);
-    let seen = state.objects.get_mut(&obs.uid)?;
+    let Some(seen) = state.objects.get_mut(&obs.uid) else { return (None, false) };
     seen.rv = obs.rv;
     seen.generation = obs.generation;
     seen.hash = obs.hash;
     seen.full = full;
     seen.writers = writers;
+    seen.owned = obs.owned;
     seen.kept = kept;
     seen.at = at;
-    let mut record = record?;
+    let Some(mut record) = record else { return (None, adopted) };
     // At most `BURST` records an hour per object; the next one says how many were skipped.
     if at.duration_since(seen.burst.0) > BURST_WINDOW {
         seen.burst = (at, 0);
     }
     if seen.burst.1 >= BURST {
         seen.missed += 1;
-        return None;
+        return (None, false);
     }
     seen.burst.1 += 1;
     if seen.missed > 0 {
         record.summary = format!("{} ({} changes before it not recorded: too many)", record.summary, seen.missed);
         seen.missed = 0;
     }
-    Some(record)
+    (Some(record), false)
 }
 
 /// The record of a deleted object, from what was kept of it; none for one a controller
