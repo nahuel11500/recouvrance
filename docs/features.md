@@ -54,7 +54,9 @@
   changed: labels or annotations, or a field manager's write (who, and which fields:
   `managedFields`), or the generation; status-only writes, `resourceVersion` and `managedFields`
   churn, leader-election and other noisy annotations are left out. Creations and deletions are
-  recorded too, except of what a controller made (a CronJob's Jobs). Pods, events, ReplicaSets,
+  recorded too (a creation shows after 30 s), except of what a controller made (a CronJob's Jobs,
+  or a Secret an operator gives itself as owner just after making it); a change to the owner
+  references alone is not recorded. Pods, events, ReplicaSets,
   ControllerRevisions, Endpoints, EndpointSlices and Leases are never recorded: they change all the
   time and their history is told elsewhere (a pod's by its owner's revisions and its events). The
   **Timeline** page (sidebar, or `Timeline` in the palette) lists the connected clusters' changes

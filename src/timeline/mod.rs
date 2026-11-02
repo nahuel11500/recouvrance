@@ -13,7 +13,7 @@
 mod observe;
 pub mod store;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError, mpsc};
@@ -114,6 +114,10 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 /// Writes waiting up to this long go to disk together.
 const BATCH: Duration = Duration::from_millis(500);
 
+/// How long a creation is held back before it is recorded: an operator may give what it made
+/// its owner just after (see `observe`), and its creation is then not news.
+const HOLD: Duration = Duration::from_secs(30);
+
 enum Write {
     Append(Arc<str>, String),
     Rewrite(Arc<str>, Vec<Arc<Record>>),
@@ -139,6 +143,9 @@ pub struct Recorder {
     version: AtomicU64,
     /// Files kept aside and writes that failed, to show on the Timeline page.
     problems: Arc<Mutex<Vec<String>>>,
+    /// Creations held back (`HOLD`), by when they are due, and for how long.
+    held: Mutex<VecDeque<(Instant, Arc<str>, Record)>>,
+    hold: Duration,
 }
 
 static RECORDER: LazyLock<Recorder> = LazyLock::new(|| Recorder::new(Some(crate::paths::data_dir().join("timeline"))));
@@ -152,6 +159,8 @@ impl Recorder {
             writer: Mutex::new(None),
             version: AtomicU64::new(0),
             problems: Arc::default(),
+            held: Mutex::default(),
+            hold: HOLD,
         }
     }
 
@@ -195,6 +204,42 @@ impl Recorder {
         }
         logs.insert(ctx.clone(), loaded.log);
         self.version.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record `r`, a creation once it was held back for `hold`: until then, a controller
+    /// adopting the object (`unhold`) drops it.
+    fn record(&self, ctx: &Arc<str>, r: Record, at: Instant) {
+        if r.what == What::Created {
+            lock(&self.held).push_back((at + self.hold, ctx.clone(), r));
+            return;
+        }
+        // Its creation first, if still held back (deleted meanwhile).
+        let held = {
+            let mut held = lock(&self.held);
+            held.iter().position(|(_, c, h)| h.uid == r.uid && c == ctx).and_then(|i| held.remove(i))
+        };
+        if let Some((_, _, created)) = held {
+            self.add(ctx, created);
+        }
+        self.add(ctx, r);
+    }
+
+    /// Drop the creation held back of an object a controller adopted.
+    fn unhold(&self, ctx: &Arc<str>, uid: &str) {
+        lock(&self.held).retain(|(_, c, h)| h.uid != uid || c != ctx);
+    }
+
+    /// Record the creations held back long enough. Cheap when there are none: one lock.
+    fn release(&self) {
+        let now = Instant::now();
+        let due: Vec<(Instant, Arc<str>, Record)> = {
+            let mut held = lock(&self.held);
+            let n = held.iter().take_while(|(t, _, _)| *t <= now).count();
+            held.drain(..n).collect()
+        };
+        for (_, ctx, r) in due {
+            self.add(&ctx, r);
+        }
     }
 
     fn add(&self, ctx: &Arc<str>, r: Record) {
@@ -355,8 +400,9 @@ impl Tap {
             .collect();
         drop(state);
         for r in records {
-            self.rec.add(&self.ctx, r);
+            self.rec.record(&self.ctx, r, Instant::now());
         }
+        self.rec.release();
     }
 
     fn observe(&self, how: How, obj: &RawValue) {
@@ -389,13 +435,17 @@ impl Tap {
         }
         let whole = if self.full { serde_json::from_str::<Value>(obj.get()).ok() } else { None };
         let Some(obs) = Observed::new(head, whole, &self.info) else { return };
-        let record = {
+        let (record, adopted) = {
             let mut state = lock(&self.state);
             observe::observe(&mut state, &self.info, self.full, obs, how, jiff::Timestamp::now(), at)
         };
-        if let Some(r) = record {
-            self.rec.add(&self.ctx, r);
+        if adopted {
+            self.rec.unhold(&self.ctx, &uid);
         }
+        if let Some(r) = record {
+            self.rec.record(&self.ctx, r, at);
+        }
+        self.rec.release();
     }
 }
 
@@ -427,6 +477,7 @@ pub async fn opened(context: &str) {
 /// Changes recorded on an object of `context`, as history entries. By uid: an object
 /// re-created under the name is another one (an empty uid matches by name only).
 pub fn changes_for(context: &str, resource: &str, namespace: Option<&str>, name: &str, uid: &str) -> Vec<Change> {
+    RECORDER.release();
     let logs = lock(&RECORDER.logs);
     let Some(log) = logs.get(context) else { return Vec::new() };
     log.records
@@ -449,6 +500,8 @@ pub fn all() -> Vec<(Arc<str>, Arc<Record>)> {
 
 /// Counts records added and contexts read: what a page shows is stale once it moved.
 pub fn version() -> u64 {
+    // Creations held back are recorded once due even while no watch sees anything new.
+    RECORDER.release();
     RECORDER.version.load(Ordering::Relaxed)
 }
 

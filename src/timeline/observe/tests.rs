@@ -42,7 +42,7 @@ fn see(state: &mut KindState, info: &KindInfo, full: bool, obj: &Value, how: How
     let head: Head<'_> = serde_json::from_str(raw.get()).unwrap();
     let whole = full.then(|| obj.clone());
     let obs = Observed::new(head, whole, info).unwrap();
-    observe(state, info, full, obs, how, jiff::Timestamp::now(), at)
+    observe(state, info, full, obs, how, jiff::Timestamp::now(), at).0
 }
 
 fn spec_fields() -> Value {
@@ -159,6 +159,33 @@ fn creations_and_deletions() {
     owned["metadata"]["ownerReferences"] = json!([{"controller": true, "kind": "CronJob", "name": "x", "uid": "c"}]);
     assert!(see(&mut st, &info, false, &owned, How::Added, at).is_none());
     assert!(see(&mut st, &info, false, &owned, How::Deleted, at).is_none());
+}
+
+#[test]
+fn an_object_adopted_by_a_controller_once_created_is_treated_as_its_own() {
+    for full in [false, true] {
+        let (mut st, info, at) = (state(), info(true), Instant::now());
+        let made = writer("operator", "", 0, json!({"f:data": {"f:token": {}}}));
+        let v1 = object(1, 1, json!({}), json!({"token": "dG9r"}), vec![made]);
+        let r = see(&mut st, &info, full, &v1, How::Added, at).expect("created");
+        assert_eq!(r.what, What::Created);
+        // The operator gives it its owner a moment later.
+        let fields = json!({"f:data": {"f:token": {}}, "f:metadata": {"f:ownerReferences": {"k:{\"uid\":\"j\"}": {}}}});
+        let mut v2 = object(2, 1, json!({}), json!({"token": "dG9r"}), vec![writer("operator", "", 1, fields)]);
+        let owner = json!({"controller": true, "kind": "Job", "name": "scan", "uid": "j"});
+        v2["metadata"]["ownerReferences"] = json!([owner.clone()]);
+        let raw = serde_json::value::to_raw_value(&v2).unwrap();
+        let obs = Observed::new(serde_json::from_str(raw.get()).unwrap(), full.then(|| v2.clone()), &info).unwrap();
+        let (record, adopted) = observe(&mut st, &info, full, obs, How::Modified, jiff::Timestamp::now(), at);
+        assert!(record.is_none() && adopted, "full: {full}");
+        // Another owner added later is not news either.
+        let gc = writer("gc", "", 2, json!({"f:metadata": {"f:ownerReferences": {"k:{\"uid\":\"p\"}": {}}}}));
+        let mut v3 = object(3, 1, json!({}), json!({"token": "dG9r"}), vec![gc]);
+        v3["metadata"]["ownerReferences"] = json!([owner, {"kind": "Pod", "name": "p", "uid": "p"}]);
+        assert!(see(&mut st, &info, full, &v3, How::Modified, at).is_none(), "full: {full}");
+        assert!(see(&mut st, &info, full, &v3, How::Deleted, at).is_none(), "full: {full}");
+        assert!(st.objects.is_empty());
+    }
 }
 
 #[test]
