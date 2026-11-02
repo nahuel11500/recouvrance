@@ -179,7 +179,7 @@ impl ProblemsView {
             )
             .child(
                 div()
-                    .flex_grow()
+                    .flex_grow(1.)
                     .flex_basis(px(300.))
                     .flex_shrink_0()
                     .text_sm()
