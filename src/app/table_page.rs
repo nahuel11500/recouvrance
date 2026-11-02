@@ -412,7 +412,11 @@ impl AppView {
                     .join(" "),
                 )
                 .child(v_flex().gap_0p5().max_h(px(200.)).overflow_hidden().children(preview.iter().map(|p| {
-                    div().text_sm().font_family("monospace").text_color(theme.muted_foreground).child(p.clone())
+                    div()
+                        .text_sm()
+                        .font_family(theme.mono_font_family.clone())
+                        .text_color(theme.muted_foreground)
+                        .child(p.clone())
                 })))
                 .when_some(replicas.clone(), |a, input| {
                     a.child(div().pt_1().text_sm().child("New replica count for all of them:"))
