@@ -46,6 +46,11 @@ pub fn reading(items: &[Value], now: Option<Timestamp>) -> Reading {
     Reading { newest, window, now: now.unwrap_or_else(Timestamp::now) }
 }
 
+/// The API server's clock from a response's `Date` header ("Mon, 02 Nov 2026 14:08:36 GMT").
+pub fn date_header(value: &str) -> Option<Timestamp> {
+    jiff::fmt::rfc2822::DateTimeParser::new().parse_timestamp(value).ok()
+}
+
 /// A Go duration as metrics-server prints it: "45.5s", "1m0.025s", "500ms".
 fn go_duration(text: &str) -> Option<Duration> {
     let mut rest = text;
@@ -71,9 +76,15 @@ fn go_duration(text: &str) -> Option<Duration> {
 }
 
 /// Learns how often metrics-server measures, and says when its next sample is due.
+///
+/// Reads don't always see one series of samples going forward. metrics-server run with
+/// two replicas (as its chart does for high availability) answers from either, and each
+/// measures on its own clock: one read's newest measure can be a few seconds behind the
+/// previous read's, or just ahead of it in the same round. A pod leaving the list can take
+/// the newest measure with it too. Neither says the interval changed.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Cadence {
-    /// The newest measure seen so far.
+    /// The start of the newest round of measures seen so far (never a step back).
     last: Option<Timestamp>,
     /// When the previous read was answered (API server clock).
     read: Option<Timestamp>,
@@ -97,21 +108,29 @@ impl Cadence {
             *self = Self { read: Some(r.now), ..Self::default() };
             return min;
         };
-        let age = r.now.duration_since(newest);
-        let last = self.last.replace(newest);
-        if age < SignedDuration::from_secs(1) {
+        // Stamped as read, or from the future: says nothing, and isn't kept either, so the
+        // same sample read again a moment later still counts as a new one.
+        if r.now.duration_since(newest) < SignedDuration::from_secs(1) {
             return min;
         }
-        match last {
-            Some(last) if newest > last => {
+        // Within a third of an interval of the round seen last: another replica's take on
+        // that round, not a new one. The interval learnt says it best; a window can be up
+        // to twice the interval (a container whose stats didn't move between two scrapes).
+        let round = self.every.or(r.window).map(|w| w / 3);
+        match self.last {
+            None => self.last = Some(newest),
+            Some(last) if newest > last && round.is_none_or(|third| unsigned(newest.duration_since(last)) >= third) => {
                 let delta = unsigned(newest.duration_since(last));
+                self.last = Some(newest);
                 let gap = previous_read.map(|p| unsigned(r.now.duration_since(p)));
                 // Several measures apart (a hidden list, a slow read) says how many were
                 // missed, not how often: the window a measure covers says that better.
                 // Without one, a long gap is only trusted when it shortens the interval
                 // (a short guess corrects itself: the next read comes early and waits less).
                 let learnt = match r.window {
-                    Some(w) if delta > w * 3 / 2 => Some(w),
+                    // Far from the window: several measures apart, or one replica's round
+                    // after another's (their phases can be anything).
+                    Some(w) if delta > w * 3 / 2 || delta < w * 3 / 4 => Some(w),
                     Some(_) => Some(delta),
                     None if gap.is_some_and(|g| g <= min.saturating_add(SLACK)) => Some(delta),
                     None if self.every.is_some_and(|e| delta < e) => Some(delta),
@@ -121,13 +140,18 @@ impl Cadence {
                     self.every = Some(every.min(LONGEST));
                 }
             }
-            // Earlier than before: metrics-server restarted or was replaced.
-            Some(last) if newest < last => self.every = None,
+            // Far behind (the clocks were set back): start again from there.
+            Some(last) if unsigned(last.duration_since(newest)) > LONGEST => {
+                *self = Self { last: Some(newest), read: Some(r.now), every: None };
+            }
+            // A step back (another replica, the pod that had the newest measure gone) or the
+            // same round again: nothing new.
             _ => {}
         }
         let Some(every) = self.every else { return min };
-        // Due one interval after the newest measure, counted from the API server's now.
-        let due = (every + SLACK).saturating_sub(unsigned(age));
+        // Due one interval after the newest round, counted from the API server's now.
+        let age = self.last.map_or(Duration::ZERO, |last| unsigned(r.now.duration_since(last)));
+        let due = (every + SLACK).saturating_sub(age);
         due.clamp(min, (every * 2).min(LONGEST).max(min))
     }
 }
@@ -299,6 +323,112 @@ mod tests {
         assert_eq!(short(Duration::from_secs(150)), "2m");
     }
 
+    /// A metrics.k8s.io list as metrics-server returns it: one item per pod, the first
+    /// measured at `newest`, the others a few seconds before.
+    fn pod_list(newest: &str, windows: &[&str]) -> Vec<Value> {
+        let newest: Timestamp = newest.parse().unwrap();
+        windows
+            .iter()
+            .enumerate()
+            .map(|(i, window)| {
+                let at = Timestamp::from_second(newest.as_second() - 3 * i as i64).unwrap();
+                json!({
+                    "metadata": {"name": format!("web-{i}"), "namespace": "shop", "creationTimestamp": "2026-11-02T14:10:30Z"},
+                    "timestamp": at.to_string(),
+                    "window": window,
+                    "containers": [{"name": "web", "usage": {"cpu": "126214728n", "memory": "110964Ki"}}],
+                })
+            })
+            .collect()
+    }
+
+    /// metrics-server run with two replicas measuring every 60s, two seconds apart: reads
+    /// answered by either (recorded on a real cluster, read every 7s). Each step back to the
+    /// other replica's round used to forget the interval learnt, so it was never shown.
+    #[test]
+    fn two_replicas_keep_the_interval() {
+        let min = Duration::from_secs(15);
+        let mut c = Cadence::default();
+        let reads = [
+            ("Mon, 02 Nov 2026 14:10:30 GMT", "2026-11-02T14:10:14Z", ["49.897s", "1m0.336s", "47.37s"]),
+            ("Mon, 02 Nov 2026 14:10:37 GMT", "2026-11-02T14:10:14Z", ["49.897s", "1m0.336s", "47.37s"]),
+            ("Mon, 02 Nov 2026 14:10:44 GMT", "2026-11-02T14:10:12Z", ["47.919s", "1m6.39s", "44.333s"]),
+            ("Mon, 02 Nov 2026 14:10:51 GMT", "2026-11-02T14:10:14Z", ["49.897s", "1m0.336s", "47.37s"]),
+            ("Mon, 02 Nov 2026 14:10:58 GMT", "2026-11-02T14:10:12Z", ["47.919s", "1m6.39s", "44.333s"]),
+            ("Mon, 02 Nov 2026 14:11:20 GMT", "2026-11-02T14:11:15Z", ["1m6.606s", "1m1.44s", "55.194s"]),
+            ("Mon, 02 Nov 2026 14:11:27 GMT", "2026-11-02T14:11:15Z", ["1m6.606s", "1m1.44s", "55.194s"]),
+            ("Mon, 02 Nov 2026 14:11:35 GMT", "2026-11-02T14:11:12Z", ["50.901s", "56.462s", "1m6.727s"]),
+            ("Mon, 02 Nov 2026 14:11:42 GMT", "2026-11-02T14:11:15Z", ["1m6.606s", "1m1.44s", "55.194s"]),
+        ];
+        let mut shown = Vec::new();
+        for (date, newest, windows) in reads {
+            let read = reading(&pod_list(newest, &windows), date_header(date));
+            assert!(read.now == date_header(date).unwrap() && read.window.is_some(), "{read:?}");
+            let wait = c.next(&read, min);
+            assert!(wait >= min);
+            shown.push(Freshness::new(&read, c.every()).describe().unwrap());
+        }
+        // Learnt at the first new round, and kept through the reads of the other replica.
+        assert!(shown[..5].iter().all(|s| !s.contains("measures every")), "{shown:?}");
+        for s in &shown[5..] {
+            assert!(s.ends_with(" · metrics-server measures every 61s"), "{shown:?}");
+        }
+    }
+
+    /// The other replica's round, 41s after the first's (their phases can be anything): not
+    /// taken for the interval when the windows say about a minute.
+    #[test]
+    fn another_replicas_round_is_not_the_interval() {
+        let min = Duration::from_secs(15);
+        let mut c = Cadence::default();
+        let windows = ["55.684s", "57.454s", "1m0.03s"];
+        c.next(
+            &reading(&pod_list("2026-11-02T14:14:13Z", &windows), date_header("Mon, 02 Nov 2026 14:14:31 GMT")),
+            min,
+        );
+        c.next(
+            &reading(&pod_list("2026-11-02T14:14:54Z", &windows), date_header("Mon, 02 Nov 2026 14:15:02 GMT")),
+            min,
+        );
+        let every = c.every().unwrap();
+        assert!(every > Duration::from_secs(55) && every < Duration::from_secs(61), "{every:?}");
+        c.next(
+            &reading(&pod_list("2026-11-02T14:15:56Z", &windows), date_header("Mon, 02 Nov 2026 14:16:02 GMT")),
+            min,
+        );
+        assert_eq!(c.every(), Some(Duration::from_secs(62)));
+    }
+
+    /// A sample read less than a second after it was measured says nothing yet; read again
+    /// later, it is still the new one.
+    #[test]
+    fn a_sample_too_fresh_counts_when_read_again() {
+        let min = Duration::from_secs(15);
+        let mut c = Cadence::default();
+        c.next(&read(Some(0), 5, Some(15)), min);
+        assert_eq!(c.next(&read(Some(15), 15, Some(15)), min), min);
+        c.next(&read(Some(15), 30, Some(15)), min);
+        assert_eq!(c.every(), Some(Duration::from_secs(15)));
+    }
+
+    /// The pod that had the newest measure left the list: a step back keeps the interval.
+    /// Clocks set far back start again from there.
+    #[test]
+    fn steps_back() {
+        let min = Duration::from_secs(15);
+        let mut c = Cadence::default();
+        c.next(&read(Some(0), 5, Some(60)), min);
+        c.next(&read(Some(60), 65, Some(60)), min);
+        c.next(&read(Some(55), 80, Some(60)), min);
+        assert_eq!(c.every(), Some(Duration::from_secs(60)));
+        // Due one interval after the newest round seen, not after the older sample.
+        assert_eq!(c.next(&read(Some(55), 95, Some(60)), min), Duration::from_secs(28));
+        c.next(&read(Some(-1000), 100, Some(60)), min);
+        assert_eq!(c.every(), None);
+        c.next(&read(Some(-940), 160, Some(60)), min);
+        assert_eq!(c.every(), Some(Duration::from_secs(60)));
+    }
+
     mod properties {
         use super::*;
         use proptest::prelude::*;
@@ -324,6 +454,35 @@ mod tests {
                         prop_assert!(every <= LONGEST);
                         prop_assert!(wait <= (every * 2).max(min));
                     }
+                }
+            }
+
+            /// Two replicas measuring at the same interval, a little out of phase, answering
+            /// reads in any order: once learnt, the interval stays about theirs.
+            #[test]
+            fn two_replicas_keep_their_interval(
+                every in 15..300i64,
+                quarter in 0..100i64,
+                lag in 1..5i64,
+                replicas in prop::collection::vec(any::<bool>(), 1..60),
+            ) {
+                let offset = every * quarter / 400;
+                let min = Duration::from_secs(15);
+                let mut c = Cadence::default();
+                let (mut now, mut learnt) = (every + 10, false);
+                for second in replicas {
+                    let phase = if second { offset } else { 0 };
+                    let newest = phase + (now - lag - phase).div_euclid(every) * every;
+                    let wait = c.next(&read(Some(newest), now, Some(every as u64)), min);
+                    match c.every() {
+                        Some(e) => {
+                            learnt = true;
+                            let e = e.as_secs() as i64;
+                            prop_assert!((every - offset..=every + offset).contains(&e), "{} for {}±{}", e, every, offset);
+                        }
+                        None => prop_assert!(!learnt, "the interval was forgotten"),
+                    }
+                    now += wait.as_secs() as i64;
                 }
             }
 
