@@ -150,19 +150,55 @@ async fn named_container(api: &Api<Pod>, pod: &str, container: Option<String>) -
     api.get(pod).await.ok().and_then(|p| super::typed_pod_containers(&p).into_iter().next())
 }
 
-/// `e`, with the likely reason when the API server refused the WebSocket upgrade: kube-rs
-/// keeps only the status ("400 Bad Request"), not the server's message, so the reason is
-/// read from the pod.
+/// `e`, said plainly when the API server refused the WebSocket upgrade: kube-rs keeps only
+/// the status ("400 Bad Request"), not the server's message, so the reason is read from the
+/// pod. A known reason replaces the raw status; a likely one is added to it.
 async fn refused(api: &Api<Pod>, pod: &str, container: Option<&str>, verb: &str, e: kube::Error) -> String {
     let kube::Error::UpgradeConnection(kube::client::UpgradeConnectionError::ProtocolSwitch(status)) = &e else {
         return e.to_string();
     };
+    let status = status.as_u16();
     // A container that isn't running is refused with a 400 or a 500, depending on the runtime.
-    let read = if matches!(status.as_u16(), 400 | 500) { api.get(pod).await.ok() } else { None };
-    match refusal_reason(status.as_u16(), verb, read.as_ref(), container) {
-        Some(reason) => format!("{e} ({reason})"),
+    if !matches!(status, 400 | 500) {
+        return said(&e, refusal_reason(status, verb, None, container, jiff::Timestamp::now()));
+    }
+    let reason = refusal_reason(status, verb, read_pod(api, pod).await.as_ref(), container, jiff::Timestamp::now());
+    if matches!(reason, Some(Refusal::Known(_))) {
+        return said(&e, reason);
+    }
+    // A crash-looping container's exit reaches the pod's status a moment after the refusal
+    // (the kubelet reports it about every second): read it once more.
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+    let again = refusal_reason(status, verb, read_pod(api, pod).await.as_ref(), container, jiff::Timestamp::now());
+    said(&e, again.or(reason))
+}
+
+/// The pod, read again once when the first read fails (a timeout, the API server busy).
+async fn read_pod(api: &Api<Pod>, pod: &str) -> Option<Pod> {
+    if let Ok(p) = api.get(pod).await {
+        return Some(p);
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    api.get(pod).await.ok()
+}
+
+/// The refusal `e` as said to the reader: a known reason alone, a likely one after `e`.
+fn said(e: &kube::Error, reason: Option<Refusal>) -> String {
+    match reason {
+        Some(Refusal::Known(why)) => why,
+        Some(Refusal::Likely(hint)) => format!("{e} ({hint})"),
         None => e.to_string(),
     }
+}
+
+/// Why an exec or attach upgrade was refused.
+#[derive(Debug, PartialEq, Eq)]
+enum Refusal {
+    /// What the pod or the status says for sure: it replaces the raw status.
+    Known(String),
+    /// A guess (the container may need choosing, the image may have no shell): it is added
+    /// to the raw status.
+    Likely(String),
 }
 
 /// The hint for an image without a shell (distroless, scratch).
@@ -176,30 +212,47 @@ pub(super) fn ended_reason(message: &str) -> Option<String> {
         .then(|| format!("no shell in this image ({NO_SHELL})"))
 }
 
-/// Why an exec or attach upgrade answered `status`, from the pod as read (when it could be).
-fn refusal_reason(status: u16, verb: &str, pod: Option<&Pod>, container: Option<&str>) -> Option<String> {
+/// Why an exec or attach upgrade answered `status`, from the pod as read (when it could be)
+/// at `now`.
+fn refusal_reason(
+    status: u16,
+    verb: &str,
+    pod: Option<&Pod>,
+    container: Option<&str>,
+    now: jiff::Timestamp,
+) -> Option<Refusal> {
+    use Refusal::{Known, Likely};
     match status {
         400 => {}
         500 => {
-            let name = container?;
-            return container_stopped(pod?, name).map(|why| format!("container {name} is not running: {why}"));
+            let pod = pod?;
+            // None named (the pod couldn't be read before the exec): the server took the default one.
+            let default;
+            let name = match container {
+                Some(name) => name,
+                None => {
+                    default = super::typed_pod_containers(pod).into_iter().next()?;
+                    default.as_str()
+                }
+            };
+            return not_running(pod, name, now).map(Known);
         }
-        401 => return Some("the cluster did not accept your credentials".into()),
-        403 => return Some(format!("your access does not allow it: create on pods/{verb}")),
-        404 => return Some("the pod is gone".into()),
+        401 => return Some(Known("the cluster did not accept your credentials".into())),
+        403 => return Some(Known(format!("your access does not allow it: create on pods/{verb}"))),
+        404 => return Some(Known("the pod is gone".into())),
         _ => return None,
     }
-    let generic = if verb == "exec" {
+    let generic = Likely(if verb == "exec" {
         format!("the container may need choosing, or {NO_SHELL}")
     } else {
         "the container may need choosing, or it isn't running".to_string()
-    };
+    });
     let Some(pod) = pod else { return Some(generic) };
     let spec = pod.spec.as_ref();
     let Some(name) = container else {
         let names: Vec<&str> = spec.map(|s| s.containers.iter().map(|c| c.name.as_str()).collect()).unwrap_or_default();
         return Some(if names.len() > 1 {
-            format!("the pod has several containers ({}): choose one", names.join(", "))
+            Known(format!("the pod has several containers ({}): choose one", names.join(", ")))
         } else {
             generic
         });
@@ -210,21 +263,48 @@ fn refusal_reason(status: u16, verb: &str, pod: Option<&Pod>, container: Option<
         regular.chain(ephemeral).any(|n| n == name)
     });
     if !known {
-        return Some(format!("the pod has no container {name}"));
+        return Some(Known(format!("the pod has no container {name}")));
     }
+    Some(not_running(pod, name, now).map_or(generic, Known))
+}
+
+/// How long after a restart a refused container is taken to be crash looping: its process
+/// may have ended again before the kubelet says so in the pod's status.
+const JUST_RESTARTED_SECS: i64 = 60;
+
+/// "container `name` is not running: …" when its status says it stopped, or "… is crash
+/// looping: …" when it says it was restarted less than [`JUST_RESTARTED_SECS`] before `now`.
+fn not_running(pod: &Pod, name: &str, now: jiff::Timestamp) -> Option<String> {
     if let Some(why) = container_stopped(pod, name) {
         return Some(format!("container {name} is not running: {why}"));
     }
-    Some(generic)
+    let status = container_status(pod, name)?;
+    let started = status.state.as_ref()?.running.as_ref()?.started_at.as_ref()?.0;
+    let restarts = status.restart_count;
+    if restarts == 0 || now.as_second() - started.as_second() > JUST_RESTARTED_SECS {
+        return None;
+    }
+    let plural = if restarts == 1 { "" } else { "s" };
+    let last = status.last_state.as_ref().and_then(|s| s.terminated.as_ref()).and_then(|t| t.reason.as_deref());
+    Some(match last {
+        Some(reason) => {
+            format!("container {name} is crash looping: restarted {restarts} time{plural}, last ended with {reason}")
+        }
+        None => format!("container {name} is crash looping: restarted {restarts} time{plural}"),
+    })
+}
+
+/// The status of container `name` of `pod` (regular, init or ephemeral), as read.
+fn container_status<'a>(pod: &'a Pod, name: &str) -> Option<&'a k8s_openapi::api::core::v1::ContainerStatus> {
+    let s = pod.status.as_ref()?;
+    let all = s.container_statuses.iter().flatten().chain(s.init_container_statuses.iter().flatten());
+    all.chain(s.ephemeral_container_statuses.iter().flatten()).find(|c| c.name == name)
 }
 
 /// Why container `name` of `pod` (as read) isn't running (`CrashLoopBackOff`, `Completed`...),
 /// when its status says so. One the status doesn't list is not known to be stopped.
 pub fn container_stopped(pod: &Pod, name: &str) -> Option<String> {
-    let state = pod.status.as_ref().and_then(|s| {
-        let all = s.container_statuses.iter().flatten().chain(s.init_container_statuses.iter().flatten());
-        all.chain(s.ephemeral_container_statuses.iter().flatten()).find(|c| c.name == name)?.state.clone()
-    })?;
+    let state = container_status(pod, name)?.state.clone()?;
     if state.running.is_some() {
         return None;
     }
@@ -793,8 +873,8 @@ fn attach_target(
 #[cfg(test)]
 mod tests {
     use super::{
-        NO_SHELL, attach_target, copy_capped, crlf, ended_reason, helm_writes, read_capped, refusal_reason, tar_source,
-        upload_source,
+        NO_SHELL, Refusal, attach_target, copy_capped, crlf, ended_reason, helm_writes, read_capped, refusal_reason,
+        tar_source, upload_source,
     };
     use k8s_openapi::api::core::v1::{Container, EphemeralContainer, PodSpec};
 
@@ -810,29 +890,39 @@ mod tests {
                  "state": {"waiting": {"reason": "CrashLoopBackOff"}}},
             ]},
         }));
-        let reason = |status, verb, pod, container| refusal_reason(status, verb, pod, container).unwrap();
+        let now = jiff::Timestamp::now();
+        let known = |status, verb, pod, container| match refusal_reason(status, verb, pod, container, now) {
+            Some(Refusal::Known(why)) => why,
+            other => panic!("{status} {container:?}: {other:?}"),
+        };
+        let likely = |status, verb, pod, container| match refusal_reason(status, verb, pod, container, now) {
+            Some(Refusal::Likely(hint)) => hint,
+            other => panic!("{status} {container:?}: {other:?}"),
+        };
         // No container named in a pod with several: the reason the issue hit.
         assert_eq!(
-            reason(400, "exec", Some(&three), None),
+            known(400, "exec", Some(&three), None),
             "the pod has several containers (nginx, uwsgi, uwsgi-exporter): choose one"
         );
-        assert!(reason(400, "exec", Some(&three), Some("app")).contains("no container app"));
-        assert!(reason(400, "exec", Some(&three), Some("uwsgi")).contains("not running: CrashLoopBackOff"));
-        // Running, or the pod unreadable: the hint.
-        assert!(reason(400, "exec", Some(&three), Some("nginx")).contains("shell isn't in the image"));
-        assert!(reason(400, "attach", None, None).contains("need choosing"));
-        assert!(reason(403, "attach", None, None).contains("pods/attach"));
-        assert_eq!(refusal_reason(500, "exec", None, None), None);
+        assert!(known(400, "exec", Some(&three), Some("app")).contains("no container app"));
+        assert_eq!(known(400, "exec", Some(&three), Some("uwsgi")), "container uwsgi is not running: CrashLoopBackOff");
+        // Running, or the pod unreadable: a likely reason, said after the status.
+        assert!(likely(400, "exec", Some(&three), Some("nginx")).contains("shell isn't in the image"));
+        assert!(likely(400, "attach", None, None).contains("need choosing"));
+        assert!(known(403, "attach", None, None).contains("pods/attach"));
+        assert_eq!(refusal_reason(500, "exec", None, None, now), None);
         // Some runtimes refuse a stopped container with a 500: then it says so, else nothing.
-        assert!(reason(500, "exec", Some(&three), Some("uwsgi")).contains("uwsgi is not running: CrashLoopBackOff"));
-        assert_eq!(refusal_reason(500, "exec", Some(&three), Some("nginx")), None);
-        assert_eq!(refusal_reason(500, "exec", Some(&three), None), None);
+        assert_eq!(known(500, "exec", Some(&three), Some("uwsgi")), "container uwsgi is not running: CrashLoopBackOff");
+        assert_eq!(refusal_reason(500, "exec", Some(&three), Some("nginx"), now), None);
+        // None named (the pod unread before the exec): the default container, the first.
+        assert_eq!(refusal_reason(500, "exec", Some(&three), None, now), None);
         let done = pod(serde_json::json!({
             "spec": {"containers": [{"name": "job"}]},
             "status": {"containerStatuses": [{"name": "job", "image": "", "imageID": "", "ready": false,
                 "restartCount": 0, "state": {"terminated": {"exitCode": 0, "reason": "Completed"}}}]},
         }));
-        assert!(reason(500, "exec", Some(&done), Some("job")).contains("job is not running: Completed"));
+        assert_eq!(known(500, "exec", Some(&done), Some("job")), "container job is not running: Completed");
+        assert_eq!(known(500, "exec", Some(&done), None), "container job is not running: Completed");
         assert_eq!(
             ended_reason(
                 "OCI runtime exec failed: exec failed: unable to start container process: exec: \"sh\": executable file not found in $PATH: unknown"
@@ -840,6 +930,52 @@ mod tests {
             Some(format!("no shell in this image ({NO_SHELL})"))
         );
         assert_eq!(ended_reason("command terminated with non-zero exit code: exit status 130"), None);
+    }
+
+    /// Between two crashes the status says running, or hasn't caught up with the exit yet:
+    /// a refusal then still says the container is crash looping, while one that has run a
+    /// while, or never restarted, isn't said to be.
+    #[test]
+    fn a_refused_crash_looping_container_says_so_between_restarts() {
+        let now = jiff::Timestamp::now();
+        let pod = |restarts: i32, started_ago: i64, last: Option<&str>| -> k8s_openapi::api::core::v1::Pod {
+            let started = jiff::Timestamp::from_second(now.as_second() - started_ago).unwrap().to_string();
+            let last = last.map_or(
+                serde_json::json!({}),
+                |reason| serde_json::json!({"terminated": {"exitCode": 1, "reason": reason}}),
+            );
+            serde_json::from_value(serde_json::json!({
+                "spec": {"containers": [{"name": "worker"}]},
+                "status": {"containerStatuses": [{"name": "worker", "image": "", "imageID": "", "ready": false,
+                    "restartCount": restarts, "state": {"running": {"startedAt": started}}, "lastState": last}]},
+            }))
+            .unwrap()
+        };
+        let said = |pod: &k8s_openapi::api::core::v1::Pod, status, container| match refusal_reason(
+            status,
+            "exec",
+            Some(pod),
+            container,
+            now,
+        ) {
+            Some(Refusal::Known(why)) => Some(why),
+            _ => None,
+        };
+        let looping = pod(7, 3, Some("Error"));
+        for (status, container) in [(500, Some("worker")), (500, None), (400, Some("worker"))] {
+            assert_eq!(
+                said(&looping, status, container).as_deref(),
+                Some("container worker is crash looping: restarted 7 times, last ended with Error"),
+                "{status} {container:?}"
+            );
+        }
+        assert_eq!(
+            said(&pod(1, 10, None), 500, Some("worker")).as_deref(),
+            Some("container worker is crash looping: restarted 1 time")
+        );
+        // Restarted long ago, or never: not known to be crash looping.
+        assert_eq!(said(&pod(7, 600, Some("Error")), 500, Some("worker")), None);
+        assert_eq!(said(&pod(0, 3, None), 500, Some("worker")), None);
     }
 
     #[tokio::test(flavor = "multi_thread")]
