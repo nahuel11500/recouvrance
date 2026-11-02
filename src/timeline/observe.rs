@@ -488,7 +488,7 @@ pub(super) fn observe(
     }
     let old_kept = state.objects.get_mut(&obs.uid).and_then(|s| s.kept.take());
     let kept = state.keep(old_kept, &obs.version, full);
-    let seen = state.objects.get_mut(&obs.uid)?;
+    let Some(seen) = state.objects.get_mut(&obs.uid) else { return (None, false) };
     seen.rv = obs.rv;
     seen.generation = obs.generation;
     seen.hash = obs.hash;
