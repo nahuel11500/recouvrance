@@ -55,7 +55,8 @@ pub struct Change {
     /// When it happened; None when the source doesn't say (listed last).
     pub time: Option<jiff::Timestamp>,
     pub source: Source,
-    /// What changed: `ReplicaSet web-7d9f (revision 4)`, `Helm release web, revision 5`.
+    /// What changed, its number first (the page cuts a long name at the end): `Revision 4 ·
+    /// ReplicaSet web-7d9f`, `Revision 5 · Helm release web`.
     pub object: String,
     /// What changed in it, in one line.
     pub summary: String,
@@ -203,10 +204,10 @@ pub fn revision_changes(revs: &[Value]) -> Vec<Change> {
             time,
             source: Source::Rollout,
             object: format!(
-                "{} {} (revision {})",
+                "Revision {} · {} {}",
+                rollouts::number(rev),
                 s("/kind").unwrap_or("ReplicaSet"),
-                s("/metadata/name").unwrap_or_default(),
-                rollouts::number(rev)
+                s("/metadata/name").unwrap_or_default()
             ),
             summary,
             warning: false,
@@ -424,7 +425,7 @@ pub fn helm_changes(revs: &[Release]) -> Vec<Change> {
         out.push(Change {
             time: r.updated,
             source: Source::Helm,
-            object: format!("Helm release {}, revision {}", r.name, r.revision),
+            object: format!("Revision {} · Helm release {}", r.revision, r.name),
             summary,
             warning: r.status == "failed",
             diff: diff.map(Arc::new),
@@ -455,7 +456,7 @@ pub fn argo_changes(app: &Value) -> Vec<Change> {
         out.push(Change {
             time: timestamp(h.get("deployedAt")),
             source: Source::ArgoCd,
-            object: format!("Application {name}, deployment {}", h["id"].as_i64().unwrap_or(0)),
+            object: format!("Deployment {} · Application {name}", h["id"].as_i64().unwrap_or(0)),
             summary: format!("deployed {revision}{}{}", argo_source(h), argo_initiator(h)),
             warning: false,
             diff: before
@@ -473,7 +474,7 @@ pub fn argo_changes(app: &Value) -> Vec<Change> {
         out.push(Change {
             time: timestamp(op.get("finishedAt")).or_else(|| timestamp(op.get("startedAt"))),
             source: Source::ArgoCd,
-            object: format!("Application {name}, last sync"),
+            object: format!("Last sync · Application {name}"),
             summary: format!("sync {phase}{message}"),
             warning: matches!(phase, "Failed" | "Error"),
             diff: None,
@@ -870,7 +871,7 @@ mod tests {
         assert_eq!(changes.len(), 2);
         let (first, second) = (&changes[0], &changes[1]);
         assert!(first.diff.is_none() && first.summary.contains("app=nginx:1.25"), "{}", first.summary);
-        assert_eq!(second.object, "ReplicaSet web-bbb (revision 2)");
+        assert_eq!(second.object, "Revision 2 · ReplicaSet web-bbb");
         assert_eq!(second.time, Some("2026-01-02T00:00:00Z".parse().unwrap()));
         let lines = second.diff.as_ref().unwrap().lines();
         let (removed, added) = texts(&lines);
@@ -891,7 +892,7 @@ mod tests {
                 "spec": {"template": {"$patch": "replace", "spec": {"containers": [{"name": "db", "image": image}]}}}})
         };
         let changes = revision_changes(&[shaped(1, "pg:16"), shaped(2, "pg:17")]);
-        assert_eq!(changes[1].object, "ControllerRevision db-2 (revision 2)");
+        assert_eq!(changes[1].object, "Revision 2 · ControllerRevision db-2");
         assert_eq!(changes[1].summary, "db: pg:16 → pg:17");
         let lines = changes[1].diff.as_ref().unwrap().lines();
         assert!(!lines.iter().any(|l| format!("{l:?}").contains("$patch")), "{lines:?}");
@@ -968,7 +969,7 @@ mod tests {
             release(1, "1.0.0", json!({"db": {"password": "example-a", "host": "pg-1"}}), "superseded"),
         ];
         let changes = helm_changes(&revs);
-        assert_eq!(changes[1].object, "Helm release web, revision 2");
+        assert_eq!(changes[1].object, "Revision 2 · Helm release web");
         assert_eq!(changes[1].summary, "failed: c-1.1.0 (was c-1.0.0); values changed");
         assert!(changes[1].warning && !changes[0].warning);
         let lines = changes[1].diff.as_ref().unwrap().lines();
@@ -1005,6 +1006,11 @@ mod tests {
             ]
         );
         assert!(changes[0].warning);
+        let objects: Vec<&str> = changes.iter().map(|c| c.object.as_str()).collect();
+        assert_eq!(
+            objects,
+            ["Last sync · Application shop", "Deployment 2 · Application shop", "Deployment 1 · Application shop"]
+        );
         let lines = changes[1].diff.as_ref().unwrap().lines();
         let (removed, added) = texts(&lines);
         assert_eq!((removed.len(), added.len()), (1, 1));
@@ -1119,7 +1125,7 @@ mod tests {
         let fetched = fetch(client, kind.clone(), Some("shop".into()), pod.clone(), all_allowed()).await;
         assert!(fetched.errors.is_empty(), "{:?}", fetched.errors);
         let objects: Vec<&str> = fetched.changes.iter().map(|c| c.object.as_str()).collect();
-        assert_eq!(objects, ["ReplicaSet web-aaa (revision 1)", "ReplicaSet web-bbb (revision 2)"]);
+        assert_eq!(objects, ["Revision 1 · ReplicaSet web-aaa", "Revision 2 · ReplicaSet web-bbb"]);
         assert_eq!(fetched.changes[1].summary, "app: nginx:1.25 → nginx:1.26");
 
         // A Deployment re-created under the name is not this pod's owner.
@@ -1144,6 +1150,15 @@ mod tests {
             let changes = revision_changes(&[first, second]);
             prop_assert!(changes[1].diff.as_ref().unwrap().lines().is_empty());
             prop_assert_eq!(&changes[1].summary, "no change to the pod template");
+        }
+
+        /// The revision number leads the label, however long the name: the History tab cuts
+        /// the end of a label too long for its column.
+        #[test]
+        fn the_revision_comes_before_the_name(name in "[a-z0-9-]{1,253}", n in 1..1000i64) {
+            let changes = revision_changes(&[rs(&name, n, "h", "nginx", "x", "1")]);
+            let revision = format!("Revision {n} · ");
+            prop_assert!(changes[0].object.starts_with(&revision), "{}", changes[0].object);
         }
 
         /// Two values differ exactly when some path says where.

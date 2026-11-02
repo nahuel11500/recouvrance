@@ -415,7 +415,9 @@ fn an_agent_rolls_back_a_deployment() {
             // The same revisions as changes, the template's diff with them.
             let out = client.call("get_changes", target.clone()).await;
             assert!(
-                out.contains("(revision 2): changed spec.containers[main].command")
+                out.lines()
+                    .any(|l| l.contains("Revision 2 · ReplicaSet ")
+                        && l.contains(": changed spec.containers[main].command"))
                     && out.lines().any(|l| l.trim_start().starts_with('+') && l.contains("sleep 7200"))
                     && !out.contains("pod-template-hash"),
                 "{out}"
