@@ -66,7 +66,7 @@ context already shown as `name@file` keeps that name when `name` is freed.
 |---|---|---|
 | `startup` | `"reconnect"` | Reconnect to the last contexts (`reconnect`) or open the context picker (`ask`) |
 | `initial_view` | `"pods"` | First page after connecting: `pods`, `workloads`, `cluster` |
-| `metrics_refresh`, `detail_refresh`, `overview_refresh` | 15, 5, 30 | Seconds between refreshes |
+| `metrics_refresh`, `detail_refresh`, `overview_refresh` | 15, 5, 30 | Seconds between refreshes. `metrics_refresh` is the shortest wait between reads of metrics-server: the pods and nodes lists read it again when its next sample is due (up to twice its interval or 5 minutes later), and every `metrics_refresh` when its timestamps say nothing; detail pages refresh their related objects and usage every `metrics_refresh` |
 | `log_tail_lines`, `log_timestamps` | 1000, true | Log viewer |
 | `kubeconfigs`, `kubeconfig_folders` | | Extra kubeconfig files and watched folders (see above) |
 | `context_files` | | `{ "prod": "~/.kube/team-a.yaml" }`: the file each context name belongs to, so a name several files share stays with the first one, and the `name@file` names the others get stay with theirs (see above); filled in on its own |

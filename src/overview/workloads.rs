@@ -8,7 +8,7 @@ use serde_json::Value;
 
 use super::{
     Ctx, age_of, arr, card, clipped_list, container_usage_row, field, heading, heading_for, load_notes, mono, n, pairs,
-    pods_table, row, s, scroll, state_color,
+    pods_table, row, s, scroll, state_color, usage_heading,
 };
 use crate::k8s;
 use crate::ui::selectable::selectable;
@@ -55,8 +55,8 @@ pub(super) fn workload(ctx: &Ctx, cx: &App) -> Div {
     let containers = arr(obj, &format!("{template_spec}/containers"));
     if !containers.is_empty() {
         let pods = &ctx.related.pods;
-        root = root.child(heading("Containers")).child(h_flex().flex_wrap().gap_3().children(containers.iter().map(
-            |c| {
+        root = root.child(usage_heading("Containers", ctx.related, cx)).child(h_flex().flex_wrap().gap_3().children(
+            containers.iter().map(|c| {
                 let name = c["name"].as_str().unwrap_or_default();
                 let samples: Vec<(f64, f64)> = pods
                     .iter()
@@ -87,8 +87,8 @@ pub(super) fn workload(ctx: &Ctx, cx: &App) -> Div {
                             .child(selectable(c["image"].as_str().unwrap_or_default().to_string())),
                     )
                     .child(container_usage_row(c, avg.as_ref(), cx))
-            },
-        )));
+            }),
+        ));
     }
 
     // The workload's pods.

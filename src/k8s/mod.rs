@@ -14,6 +14,7 @@ use kube::discovery::ApiResource;
 
 mod access;
 pub(crate) mod argo;
+mod cadence;
 mod config;
 mod discovery;
 mod exec;
@@ -38,6 +39,7 @@ mod table;
 mod writes;
 
 pub(crate) use access::*;
+pub(crate) use cadence::{Cadence, Freshness, Reading};
 pub(crate) use config::*;
 pub(crate) use discovery::*;
 pub(crate) use exec::*;

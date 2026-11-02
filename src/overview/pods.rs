@@ -9,7 +9,7 @@ use serde_json::Value;
 
 use super::{
     ChartSpec, Ctx, age_of, arr, capitalize, card, field, heading, mono, n, quantity_cpu, quantity_mem, row, s, scroll,
-    state_color, usage_bar, usage_card, usage_chart,
+    state_color, usage_bar, usage_card, usage_chart, usage_heading,
 };
 use crate::k8s;
 use crate::k8s::ContainerUsage;
@@ -63,7 +63,10 @@ pub(super) fn pod(ctx: &Ctx, cx: &App) -> Div {
             )
             .child(container_usage_row(c, u, cx))
     });
-    v_flex().child(summary).child(heading("Containers")).child(h_flex().flex_wrap().gap_3().children(cards))
+    v_flex()
+        .child(summary)
+        .child(usage_heading("Containers", ctx.related, cx))
+        .child(h_flex().flex_wrap().gap_3().children(cards))
 }
 
 pub(super) fn container_state(st: Option<&Value>) -> String {
@@ -170,7 +173,7 @@ pub fn container(ctx: &Ctx, name: &str, cx: &App) -> AnyElement {
                 .child(probe_card("Liveness", &c["livenessProbe"], cx))
                 .child(probe_card("Readiness", &c["readinessProbe"], cx)),
         )
-        .child(heading("Utilization"))
+        .child(usage_heading("Utilization", ctx.related, cx))
         .child(container_usage_row(c, usage, cx))
         .children(container_history(ctx, c, name, cx));
 

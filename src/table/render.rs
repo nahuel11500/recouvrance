@@ -89,9 +89,18 @@ impl TableDelegate for ResourceTable {
             return div().into_any_element();
         }
         let sort = self.sort.filter(|(c, _)| *c == col).map(|(_, s)| s);
+        // How old the usage is: worked out when the tooltip shows, not when the header was drawn.
+        let usage = matches!(col, Col::Cpu | Col::Memory).then(|| cx.entity().downgrade());
         h_flex()
             .id(("th", col_ix))
             .size_full()
+            .when_some(usage, |this, table| {
+                this.tooltip(move |w, cx| {
+                    let text = table.upgrade().and_then(|t| t.read(cx).delegate().usage_age());
+                    component::tooltip::Tooltip::new(text.unwrap_or_else(|| "usage from metrics-server".into()))
+                        .build(w, cx)
+                })
+            })
             .gap_1()
             .justify_between()
             .child(div().overflow_hidden().text_ellipsis().child(self.header(col).to_string()))

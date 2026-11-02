@@ -3,6 +3,14 @@
 - **Contexts**: pick one or several on launch; tables merge clusters with a Context column.
 - **Live tables** with kubectl's own columns for every type, including CRDs; CPU/memory from
   metrics-server; per-type column choice; multi-namespace filter.
+- **Usage timed to metrics-server**: metrics-server measures every `--metric-resolution` (15 s by
+  default, often 60 s), so reading it more often returns the same numbers. The pods and nodes
+  lists learn the interval from the samples' timestamps and read again just after the next one
+  is due (never more often than `metrics_refresh`, never later than twice the interval or
+  5 minutes; every `metrics_refresh` when the timestamps don't move or don't add up). The CPU and
+  Memory headers' tooltip, and the Containers and Utilization headings of pod and workload pages,
+  say how old the numbers are: "as of 40s ago · metrics-server measures every 60s". Ages are
+  counted on the API server's clock (its `Date` header), so a skewed local clock doesn't matter.
 - **Node status**: a node's Status adds, after kubectl's own words, the taints that keep pods off
   it because something is wrong, kubectl-style (`Ready,CiliumAgentNotReady`): the
   `node.kubernetes.io/*` ones (pressure, network unavailable, out of service), the cloud
