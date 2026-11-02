@@ -7,7 +7,8 @@
 //!   API server's `apiserver_requested_deprecated_apis` metric.
 //! - Version skew: kubelets and kube-proxies against the target, by the skew policy.
 //! - Drains that would block: budgets allowing no disruption, pods under several budgets.
-//! - Feature gates the API server reports as deprecated, or alpha and turned on.
+//! - Feature gates the API server reports as deprecated and its flags set (all of them, to
+//!   look for, when its flags can't be read), or alpha and turned on.
 //! - Add-ons: CRD versions marked deprecated.
 
 pub mod removed;
@@ -242,7 +243,8 @@ fn assemble(a: Answers) -> Report {
         Err(e) => skipped.push(not_checked("PodDisruptionBudgets", &e, "drains")),
     }
     if let Some(gates) = gates {
-        findings.extend(gate_findings(target, &gates));
+        let flags = pods.as_deref().and_then(feature_gate_flags);
+        findings.extend(gate_findings(target, &gates, flags.as_ref()));
     }
     match a.crds {
         Ok(crds) => findings.extend(crd_findings(&crds)),
@@ -573,9 +575,43 @@ async fn api_metrics(client: Client) -> Result<ApiMetrics> {
     .await
 }
 
-/// Gates deprecated (a later release removes them, and an API server whose flags name a
-/// removed gate does not start), and alpha ones turned on.
-fn gate_findings(target: u32, gates: &[Gate]) -> Vec<Finding> {
+/// The gates the API server's `--feature-gates` sets, read from its pods in kube-system
+/// (kubeadm and kind run it as a static pod) and merged over them. None when no such pod is
+/// seen (a managed control plane, or pods not listed): its flags are then unknown.
+fn feature_gate_flags(pods: &[PodLite]) -> Option<BTreeMap<String, String>> {
+    let mut found = false;
+    let mut set = BTreeMap::new();
+    for p in pods.iter().filter(|p| p.metadata.namespace == "kube-system") {
+        for c in &p.spec.containers {
+            let program = c.command.first().or(c.args.first());
+            if !program.is_some_and(|w| w.rsplit('/').next() == Some("kube-apiserver")) {
+                continue;
+            }
+            found = true;
+            let mut words = c.command.iter().chain(&c.args);
+            while let Some(w) = words.next() {
+                let value = match w.strip_prefix("--feature-gates") {
+                    Some("") => words.next().map_or("", String::as_str),
+                    Some(v) => match v.strip_prefix('=') {
+                        Some(v) => v,
+                        None => continue,
+                    },
+                    None => continue,
+                };
+                for (name, on) in value.split(',').filter_map(|pair| pair.split_once('=')) {
+                    set.insert(name.trim().to_string(), on.trim().to_string());
+                }
+            }
+        }
+    }
+    found.then_some(set)
+}
+
+/// Deprecated gates the API server's flags set (a later release removes them, and an API
+/// server whose flags name a removed gate does not start), or, when its `flags` are unknown,
+/// every deprecated one to look for: the metric lists all the gates the server knows, most
+/// at their default. And alpha gates turned on.
+fn gate_findings(target: u32, gates: &[Gate], flags: Option<&BTreeMap<String, String>>) -> Vec<Finding> {
     let names = |pick: &dyn Fn(&Gate) -> bool| -> Vec<String> {
         let mut names: Vec<String> = gates
             .iter()
@@ -587,15 +623,27 @@ fn gate_findings(target: u32, gates: &[Gate]) -> Vec<Finding> {
         names
     };
     let mut out = Vec::new();
-    let deprecated = names(&|g: &Gate| g.stage == "DEPRECATED");
+    let deprecated = names(&|g: &Gate| g.stage == "DEPRECATED" && flags.is_none_or(|f| f.contains_key(&g.name)));
     if !deprecated.is_empty() {
+        let n = deprecated.len();
+        let (title, action) = match flags {
+            Some(_) => (
+                format!("{n} deprecated feature gate(s) set in the API server's --feature-gates"),
+                "A later release removes them, and an API server whose --feature-gates names a removed gate does \
+                 not start: take them out of its flags",
+            ),
+            None => (
+                format!("{n} deprecated feature gate(s): check the API server's --feature-gates"),
+                "Its flags could not be read, and most of these gates are likely at their default, set by no \
+                 flag. A later release removes them, and an API server whose --feature-gates names a removed \
+                 gate does not start: take out any its flags set",
+            ),
+        };
         out.push(Finding {
             severity: Severity::Info,
             area: Area::FeatureGates,
-            title: format!("{} deprecated feature gate(s) on the API server", deprecated.len()),
-            action: "A later release removes them, and an API server whose --feature-gates names a removed gate \
-                     does not start: take them out of its flags"
-                .into(),
+            title,
+            action: action.into(),
             details: deprecated,
             objects: Vec::new(),
         });
@@ -670,6 +718,8 @@ struct PodSpecLite {
 #[serde(default)]
 struct ContainerLite {
     image: String,
+    command: Vec<String>,
+    args: Vec<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -973,9 +1023,10 @@ struct CrdStatusLite {
     stored_versions: Vec<String>,
 }
 
-/// CRDs serving versions their add-on marks deprecated.
+/// CRDs serving versions their add-on marks deprecated: one finding per set of versions
+/// (an add-on deprecates the same ones on all its CRDs), each CRD saying where to move.
 fn crd_findings(crds: &[CrdLite]) -> Vec<Finding> {
-    let mut out = Vec::new();
+    let mut by_versions: BTreeMap<Vec<&str>, Vec<(String, Object)>> = BTreeMap::new();
     for crd in crds {
         let deprecated: Vec<&CrdVersionLite> = crd.spec.versions.iter().filter(|v| v.served && v.deprecated).collect();
         if deprecated.is_empty() {
@@ -1000,18 +1051,29 @@ fn crd_findings(crds: &[CrdLite]) -> Vec<Finding> {
                 stored.join(", ")
             ));
         }
+        let object =
+            Object::new("customresourcedefinitions.apiextensions.k8s.io", None, &crd.metadata.name, notes.join(" · "));
+        by_versions.entry(versions).or_default().push((action, object));
+    }
+    let mut out = Vec::new();
+    for (versions, group) in by_versions {
+        // One action when the CRDs share it; otherwise each says its own first.
+        let shared = group.iter().all(|(a, _)| *a == group[0].0);
+        let action = if shared {
+            group[0].0.clone()
+        } else {
+            "Move manifests and clients off them: each custom resource definition says how".into()
+        };
+        let objects = (group.into_iter())
+            .map(|(a, o)| if shared { o } else { Object { note: format!("{a} · {}", o.note), ..o } })
+            .collect();
         out.push(Finding {
             severity: Severity::Warning,
             area: Area::AddOns,
             title: format!("Deprecated custom resource versions served: {}", versions.join(", ")),
             action,
             details: Vec::new(),
-            objects: vec![Object::new(
-                "customresourcedefinitions.apiextensions.k8s.io",
-                None,
-                &crd.metadata.name,
-                notes.join(" · "),
-            )],
+            objects,
         });
     }
     out

@@ -138,10 +138,12 @@
     (the control plane goes up one at a time).
   - *Drains that would block*: PodDisruptionBudgets allowing no disruption now (one guarding a single
     pod waits forever) and pods several budgets select (the eviction API refuses them).
-  - *Feature gates*: the API server's deprecated gates, and alpha ones turned on (from its
-    `kubernetes_feature_enabled` metric; command-line flags can't be seen from the API).
-  - *Add-ons*: CRDs serving versions marked deprecated, and whether objects may still be stored in
-    them.
+  - *Feature gates*: deprecated gates the API server's `--feature-gates` sets, and alpha ones turned
+    on (from its `kubernetes_feature_enabled` metric). The flags are read from its pod in
+    `kube-system` (kubeadm, kind); where it has none (a managed control plane), every deprecated
+    gate is listed to look for in them.
+  - *Add-ons*: CRDs serving versions marked deprecated, one finding per set of versions, and whether
+    objects may still be stored in them.
 
   Each finding links to its objects. A part that can't be read (the API server's metrics need `get`
   on `/metrics`) is named, and the rest is still checked.

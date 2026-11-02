@@ -166,11 +166,63 @@ fn metric_lines() {
     let gates: Vec<(&str, &str, bool)> =
         m.gates.iter().map(|g| (g.name.as_str(), g.stage.as_str(), g.enabled)).collect();
     assert_eq!(gates, [("OldThing", "DEPRECATED", false), ("New\"Thing", "ALPHA", true), ("Done", "", true)]);
-    let findings = gate_findings(33, &m.gates);
+    let findings = gate_findings(33, &m.gates, None);
     assert_eq!(findings.len(), 2);
     assert_eq!(findings[0].details, ["OldThing (off)"]);
+    assert!(findings[0].title.contains("check the API server's --feature-gates"), "{}", findings[0].title);
     assert_eq!(findings[1].details, ["New\"Thing (on)"]);
     assert!(findings[1].action.contains("1.33"));
+}
+
+fn gate(name: &str, stage: &str, enabled: bool) -> Gate {
+    Gate { name: name.into(), stage: stage.into(), enabled }
+}
+
+#[test]
+fn only_deprecated_gates_the_flags_set() {
+    let gates =
+        [gate("KMSv1", "DEPRECATED", false), gate("Legacy", "DEPRECATED", true), gate("Old", "DEPRECATED", true)];
+    let pods: Vec<PodLite> = lean(json!([
+        {"metadata": {"name": "kube-apiserver-cp", "namespace": "kube-system"}, "spec": {"containers": [
+            {"image": "registry.k8s.io/kube-apiserver:v1.31.0", "command": ["kube-apiserver",
+                "--advertise-address=10.0.0.1", "--feature-gates=Legacy=true,SomeBeta=false"]}]}},
+        {"metadata": {"name": "web", "namespace": "shop"}, "spec": {"containers": [
+            {"image": "web", "command": ["/bin/kube-apiserver", "--feature-gates=Old=true"]}]}},
+    ]));
+    let flags = feature_gate_flags(&pods).unwrap();
+    assert_eq!(flags.keys().collect::<Vec<_>>(), ["Legacy", "SomeBeta"]);
+    let found = gate_findings(32, &gates, Some(&flags));
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].details, ["Legacy (on)"]);
+    assert!(found[0].title.contains("set in the API server's --feature-gates"), "{}", found[0].title);
+
+    // An API server started with no --feature-gates (kind, by default): nothing to take out.
+    let stock: Vec<PodLite> = lean(json!([{"metadata": {"name": "kube-apiserver-cp", "namespace": "kube-system"},
+        "spec": {"containers": [{"command": ["kube-apiserver", "--secure-port=6443"]}]}}]));
+    let flags = feature_gate_flags(&stock).unwrap();
+    assert!(gate_findings(32, &gates, Some(&flags)).is_empty());
+
+    // The flag and its value as two words, in args.
+    let split: Vec<PodLite> = lean(json!([{"metadata": {"name": "apiserver", "namespace": "kube-system"},
+        "spec": {"containers": [{"args": ["/usr/local/bin/kube-apiserver", "--feature-gates", "KMSv1=true"]}]}}]));
+    assert_eq!(feature_gate_flags(&split).unwrap().keys().collect::<Vec<_>>(), ["KMSv1"]);
+
+    // No API server pod seen (a managed control plane): flags unknown, every deprecated gate listed.
+    assert_eq!(feature_gate_flags(&pods[1..]), None);
+    assert_eq!(gate_findings(32, &gates, None)[0].details.len(), 3);
+}
+
+#[test]
+fn the_flags_come_from_the_listed_pods() {
+    let stock: Vec<PodLite> = lean(json!([{"metadata": {"name": "kube-apiserver-cp", "namespace": "kube-system"},
+        "spec": {"containers": [{"command": ["kube-apiserver"]}]}}]));
+    let metrics = || Ok(ApiMetrics { gates: vec![gate("KMSv1", "DEPRECATED", false)], ..ApiMetrics::default() });
+    let report = assemble(Answers { metrics: metrics(), pods: Ok(stock), ..answers() });
+    assert!(report.findings.iter().all(|f| f.area != Area::FeatureGates));
+    let report = assemble(Answers { metrics: metrics(), pods: Err(forbidden()), ..answers() });
+    let found: Vec<&Finding> = report.findings.iter().filter(|f| f.area == Area::FeatureGates).collect();
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].details, ["KMSv1 (off)"]);
 }
 
 fn answers() -> Answers {
@@ -410,6 +462,7 @@ fn deprecated_crd_versions() {
     ]));
     let found = crd_findings(&crds);
     assert_eq!(found.len(), 1);
+    assert_eq!(found[0].objects.len(), 1);
     assert_eq!(found[0].title, "Deprecated custom resource versions served: v1alpha2, v1beta1");
     assert_eq!(found[0].action, "Move manifests and clients to cert-manager.io/v1");
     let note = &found[0].objects[0].note;
@@ -417,6 +470,35 @@ fn deprecated_crd_versions() {
         note.starts_with("Certificate · v1alpha2 is going away · objects may still be stored in v1alpha2"),
         "{note}"
     );
+}
+
+#[test]
+fn crds_deprecating_the_same_versions_make_one_finding() {
+    let crd = |name: &str, group: &str, kind: &str, to: &str| {
+        json!({"metadata": {"name": name}, "spec": {"group": group, "names": {"kind": kind}, "versions": [
+            {"name": "v2alpha1", "served": true, "deprecated": true}, {"name": to, "served": true}]}})
+    };
+    let crds: Vec<CrdLite> = lean(json!([
+        crd("a.example.com", "example.com", "A", "v2"),
+        crd("b.example.com", "example.com", "B", "v2"),
+        crd("c.other.io", "other.io", "C", "v2beta1"),
+    ]));
+    let found = crd_findings(&crds);
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].title, "Deprecated custom resource versions served: v2alpha1");
+    let notes: Vec<&str> = found[0].objects.iter().map(|o| o.note.as_str()).collect();
+    assert_eq!(
+        notes,
+        [
+            "Move manifests and clients to example.com/v2 · A",
+            "Move manifests and clients to example.com/v2 · B",
+            "Move manifests and clients to other.io/v2beta1 · C"
+        ]
+    );
+    // The same target for all: said once, in the action.
+    let found = crd_findings(&crds[..2]);
+    assert_eq!(found[0].action, "Move manifests and clients to example.com/v2");
+    assert_eq!(found[0].objects.iter().map(|o| o.note.as_str()).collect::<Vec<_>>(), ["A", "B"]);
 }
 
 #[test]
