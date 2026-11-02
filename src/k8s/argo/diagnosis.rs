@@ -277,6 +277,13 @@ impl Diagnosis {
     /// auto-sync off that is out of sync (one synced by hand) is not a problem by itself: it
     /// is said, neutral, with what differs.
     pub fn of(app: &Value, now: Timestamp) -> Self {
+        Self::of_live(app, now, &[])
+    }
+
+    /// The same, told with what was read live on the destination (`live`, the drift read
+    /// for [`Diagnosis::to_compare`]): whether an object is there is the live read's word
+    /// over Argo CD's status.
+    pub fn of_live(app: &Value, now: Timestamp, live: &[Drift]) -> Self {
         let automated = app
             .pointer("/spec/syncPolicy/automated")
             .is_some_and(|a| a.is_object() && a.get("enabled").and_then(Value::as_bool) != Some(false));
@@ -299,7 +306,7 @@ impl Diagnosis {
             d.looping = looping(app, &differing);
             d.findings.push(loop_finding(&lp, &d.looping));
         }
-        if let Some(f) = out_of_sync_finding(&out_of_sync, automated, d.moved.as_ref()) {
+        if let Some(f) = out_of_sync_finding(&out_of_sync, live, automated, d.moved.as_ref()) {
             d.findings.push(f);
         }
         let mut seen = BTreeSet::new();
@@ -317,6 +324,26 @@ impl Diagnosis {
     /// Whether nothing was found.
     pub fn is_empty(&self) -> bool {
         self.findings.is_empty()
+    }
+}
+
+/// Whether the resource `r` (an entry of `status.resources`) is in the cluster: the live read
+/// when it read it, else Argo CD's status (a health of `Missing` is gone; any other health,
+/// `Synced` or one to prune, it saw live). None when neither says: Argo CD keeps no health
+/// for kinds without a health check (ConfigMap, Secret...), so an out-of-sync one may be
+/// there or not.
+fn there(r: &Value, live: &[Drift]) -> Option<bool> {
+    let res = Res::of(r)?;
+    match live.iter().find(|d| d.res.same(&res)).map(|d| &d.compared) {
+        Some(Compared::Gone) => return Some(false),
+        Some(Compared::LastApplied | Compared::ServerSide | Compared::NoCopy) => return Some(true),
+        Some(Compared::NotRead(_)) | None => {}
+    }
+    match s(r, "/health/status") {
+        Some("Missing") => Some(false),
+        Some(_) => Some(true),
+        None if r["status"] == "Synced" || r["requiresPruning"] == true => Some(true),
+        None => None,
     }
 }
 
@@ -632,7 +659,14 @@ fn loop_finding(lp: &SyncLoop, looping: &[Res]) -> Finding {
     }
 }
 
-fn out_of_sync_finding(resources: &[&Value], automated: bool, moved: Option<&(String, String)>) -> Option<Finding> {
+/// What is out of sync, each object said as missing or differing only when it is known to be
+/// gone or there (see [`there`]).
+fn out_of_sync_finding(
+    resources: &[&Value],
+    live: &[Drift],
+    automated: bool,
+    moved: Option<&(String, String)>,
+) -> Option<Finding> {
     if resources.is_empty() {
         return None;
     }
@@ -641,10 +675,12 @@ fn out_of_sync_finding(resources: &[&Value], automated: bool, moved: Option<&(St
         .filter_map(|r| {
             let what = if r["requiresPruning"] == true {
                 "in the cluster, no longer in git: a sync with prune deletes it"
-            } else if r.pointer("/health/status").and_then(Value::as_str) == Some("Missing") {
-                "in git, not in the cluster yet"
             } else {
-                "differs from git"
+                match there(r, live) {
+                    Some(false) => "in git, not in the cluster yet",
+                    Some(true) => "differs from git",
+                    None => "out of sync with git (its live object wasn't read)",
+                }
             };
             Some((Res::of(r)?, what.to_string()))
         })
@@ -1335,6 +1371,42 @@ mod tests {
         let mut auto = app;
         auto["spec"]["syncPolicy"]["automated"] = json!({"selfHeal": true});
         assert_eq!(Diagnosis::of(&auto, now()).findings[0].tone, Tone::Busy);
+    }
+
+    #[test]
+    fn a_kind_without_health_is_missing_or_differing_as_read_live() {
+        // Argo CD keeps no health for a ConfigMap: its status alone can't say it is there.
+        let app = json!({"status": {"resources": [
+            {"version": "v1", "kind": "ConfigMap", "namespace": "shop", "name": "a", "status": "OutOfSync"},
+            {"version": "v1", "kind": "ConfigMap", "namespace": "shop", "name": "b", "status": "OutOfSync"},
+            {"version": "v1", "kind": "ConfigMap", "namespace": "shop", "name": "c", "status": "OutOfSync"}
+        ]}});
+        let cm = |name: &str| Res {
+            kind: "ConfigMap".into(),
+            namespace: "shop".into(),
+            name: name.into(),
+            version: "v1".into(),
+            ..Default::default()
+        };
+        let what = |d: &Diagnosis| d.findings[0].objects.iter().map(|(_, w)| w.clone()).collect::<Vec<_>>();
+        let d = Diagnosis::of(&app, now());
+        // Each is read live: whether it is there isn't known yet.
+        assert_eq!(d.to_compare, [cm("a"), cm("b"), cm("c")]);
+        assert_eq!(what(&d), ["out of sync with git (its live object wasn't read)"; 3]);
+        let live = [
+            Drift::not_read(&cm("a"), Compared::Gone),
+            Drift { compared: Compared::LastApplied, ..Drift::not_read(&cm("b"), Compared::NoCopy) },
+            Drift::not_read(&cm("c"), Compared::NotRead("forbidden".into())),
+        ];
+        let d = Diagnosis::of_live(&app, now(), &live);
+        assert_eq!(
+            what(&d),
+            [
+                "in git, not in the cluster yet",
+                "differs from git",
+                "out of sync with git (its live object wasn't read)"
+            ]
+        );
     }
 
     #[test]
