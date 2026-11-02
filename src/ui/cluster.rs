@@ -627,6 +627,8 @@ impl ClusterOverview {
                     };
                     let ratio = |used: f64, req: f64| if req > 0.0 { used / req * 100.0 } else { 0.0 };
                     let (cpu_eff, mem_eff) = (ratio(avg(cpu), s.cpu.1), ratio(avg(mem), s.mem.1));
+                    // Side by side: on the same times, so their x-axis labels match.
+                    let (cpu, mem) = &crate::prom::same_times(cpu, mem);
                     let tone = |p: f64| if p < 30.0 { theme.warning } else { theme.muted_foreground };
                     // Requests come from the pods: without them the share is unknown.
                     d.when(known_req, |d| {
@@ -687,9 +689,10 @@ impl ClusterOverview {
                     let pct = |v: f64| format!("{v:.0}%");
                     let mut row = h_flex().gap_3();
                     if let Some(g) = &s.gpu {
+                        let (util, used) = crate::prom::same_times(&g.util, &g.mem);
                         row = row
                             .child(usage_chart(
-                                &g.util,
+                                &util,
                                 ChartSpec {
                                     title: "GPU utilization (average)",
                                     req: None,
@@ -705,7 +708,7 @@ impl ClusterOverview {
                                 cx,
                             ))
                             .child(usage_chart(
-                                &g.mem,
+                                &used,
                                 ChartSpec {
                                     title: "GPU memory used",
                                     req: None,

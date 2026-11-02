@@ -220,7 +220,13 @@ impl TableDelegate for ResourceTable {
                 .child(
                     h_flex()
                         .gap_2()
-                        .child(div().w(px(56.)).flex_shrink_0().child(self.cell(ctx, row, col).into_owned()))
+                        .child(
+                            div()
+                                .w(px(56.))
+                                .flex_shrink_0()
+                                .whitespace_nowrap()
+                                .child(self.cell(ctx, row, col).into_owned()),
+                        )
                         .child(
                             div()
                                 .flex_1()
@@ -571,7 +577,7 @@ fn usage_bar(
     let format: fn(f64) -> String = if cpu { k8s::format_cpu } else { k8s::format_bytes };
     let (value, color) = if cpu { (used.0, theme.blue) } else { (used.1, theme.success) };
     let (request, limit) = res.map(|r| if cpu { r.cpu } else { r.mem }).unwrap_or_default();
-    let figure = div().w(px(52.)).flex_shrink_0().text_right().child(format(value));
+    let figure = div().w(px(52.)).flex_shrink_0().whitespace_nowrap().text_right().child(format(value));
     if request.is_none() && limit.is_none() {
         // Nothing to measure it against: a bar would only show the scale.
         let note = if res.is_some() { "no request" } else { "" };

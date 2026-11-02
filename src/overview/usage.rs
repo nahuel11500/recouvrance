@@ -32,6 +32,8 @@ pub(super) fn history(ctx: &Ctx, cx: &App) -> Option<Div> {
     if !has_cpu_mem && ctx.related.gpu.is_none() {
         return None;
     }
+    // Side by side: on the same times, so their x-axis labels match.
+    let (cpu, mem) = &crate::prom::same_times(cpu, mem);
     // Requests and limits of the pods the charts measure.
     let (pods, total): (Vec<&Value>, usize) =
         if ctx.kind.is("", "Pod") { (vec![ctx.obj], 1) } else { crate::prom::chart_pods(&ctx.related.pods) };
@@ -126,7 +128,8 @@ fn gpu_charts(ctx: &Ctx, g: &crate::prom::GpuUsage, cx: &App) -> Div {
         id: "hist-gpu-mem",
         minutes,
     };
-    h_flex().pt_3().gap_3().child(usage_chart(&g.util, util, cx)).child(usage_chart(&g.mem, mem, cx))
+    let (util_data, mem_data) = crate::prom::same_times(&g.util, &g.mem);
+    h_flex().pt_3().gap_3().child(usage_chart(&util_data, util, cx)).child(usage_chart(&mem_data, mem, cx))
 }
 
 /// One usage chart: a series against optional request and limit/capacity lines.
@@ -175,7 +178,9 @@ pub fn usage_chart(data: &crate::prom::Series, spec: ChartSpec, cx: &App) -> Div
         .stroke(color)
         .fill(color.opacity(0.15))
         .linear()
-        .tick_margin(30)
+        // Five times spread from the first point to the last, not every 30th point: two
+        // charts over the same times label the same times whatever their point count.
+        .x_tick_count(5)
         .y_domain(0.0, top.max(1.0))
         // No headroom above a pinned ceiling, so the top tick reads exactly the ceiling.
         .y_padding(if pin_lim && lim == Some(top) { 0.0 } else { 10.0 }, 0.0)
@@ -279,7 +284,9 @@ pub(super) fn usage_card(
                 .child(
                     h_flex()
                         .gap_2()
-                        .child(div().w(px(56.)).text_sm().child(selectable(show(usage))))
+                        .child(
+                            div().w(px(56.)).flex_none().whitespace_nowrap().text_sm().child(selectable(show(usage))),
+                        )
                         .child(div().flex_1().child(usage_bar(usage, request, limit, color, cx))),
                 )
                 .child(div().pt_1().text_xs().text_color(muted).child(selectable("Allocation")))
