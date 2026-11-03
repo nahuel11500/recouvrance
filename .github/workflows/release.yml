@@ -335,8 +335,15 @@ jobs:
           PRERELEASE_FLAG: "${{ fromJson(steps.host.outputs.manifest).announcement_is_prerelease && '--prerelease' || '' }}"
           RELEASE_COMMIT: "${{ github.sha }}"
         run: |
-          # If we're editing a release in place, we need to upload things ahead of time
-          gh release upload "${{ needs.plan.outputs.tag }}" artifacts/*
+          # If we're editing a release in place, we need to upload things ahead of time.
+          # --clobber and a few tries: an upload can succeed on GitHub's side and still fail
+          # for the client, which retries it into "ReleaseAsset.name already exists" (v0.5.0);
+          # with --clobber that retry, or a rerun of this job, replaces the file instead.
+          for try in 1 2 3; do
+            gh release upload "${{ needs.plan.outputs.tag }}" artifacts/* --clobber && break
+            [ "$try" = 3 ] && exit 1
+            sleep 20
+          done
 
           gh release edit "${{ needs.plan.outputs.tag }}" --target "$RELEASE_COMMIT" $PRERELEASE_FLAG --draft=false
 
