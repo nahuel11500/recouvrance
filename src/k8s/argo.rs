@@ -413,10 +413,10 @@ fn target(targets: &[ContextTarget], context: &str) -> ContextTarget {
         .unwrap_or_else(|| ContextTarget { name: context.to_string(), ..Default::default() })
 }
 
-/// The contexts not connected that may be probed without asking anything of the user (no
-/// exec plugin, or the same one as a connected context, whose login is done), and those left out because asking them may run a
-/// login of their own: one per cluster, none for a cluster connected or asked quietly, the
-/// likeliest hubs first (see `hub_likeness`).
+/// The contexts not connected that may be asked without asking anything of the user (no exec
+/// plugin, or the same one as a connected context, whose login is done), and those left out
+/// because asking them may run a login of their own. One context per cluster, none for a
+/// cluster connected or asked quietly; the left-out ones likeliest hub first (`hub_likeness`).
 fn candidates(targets: &[ContextTarget], connected: &[String]) -> (Vec<String>, Vec<String>) {
     let open: Vec<&ContextTarget> = targets.iter().filter(|t| connected.contains(&t.name)).collect();
     let mut seen: Vec<String> = open.iter().filter_map(|t| t.server.as_deref().map(server_key)).collect();
