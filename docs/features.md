@@ -127,7 +127,7 @@
 - **RBAC-aware**: actions your Kubernetes RBAC forbids are disabled; *My access* shows a can-i
   matrix for the namespace, and says when the cluster (webhook or cloud IAM authorizer) may allow
   more than it lists.
-- **Problems**: one list of what is broken across clusters (crash loops, pending pods, unavailable workloads, NotReady nodes, nodes such a taint keeps pods off for more than 5 minutes after they started, failed jobs, pending volumes, and alerts firing in the cluster's Prometheus that nobody silenced).
+- **Problems**: one list of what is broken across clusters (crash loops, pending pods, unavailable workloads, NotReady nodes, nodes such a taint keeps pods off for more than 5 minutes after they started, failed jobs, pending volumes, and alerts firing in the cluster's Prometheus that nobody silenced). Click a count (critical, warnings, minor) to show that severity alone; the filter box takes text and `ns:`, `kind:` (`kind:alert`, `kind:service`) and `ctx:` terms, as the Timeline's.
 - **Alerts where you look**: a namespace's page lists the alerts labeled with it, and a pod's, workload's, volume's or node's page the alerts about it (a pod's include its workload's, a workload's its pods'), with severity, summary, how long, runbook link, and silenced or inhibited ones muted when an Alertmanager is found.
 - **Upgrade check** (Cluster overview → *Upgrade check*): per cluster, what needs action before it
   moves to a newer minor version (the next one by default; the arrows pick another), most urgent first:

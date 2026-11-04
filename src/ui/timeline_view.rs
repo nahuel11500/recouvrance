@@ -17,6 +17,7 @@ use crate::details::{OpenObject, diff_block};
 use crate::history::DiffLine;
 use crate::k8s::{self, ClusterEvent};
 use crate::timeline::{self, Record, What};
+use crate::ui::page_filter::PageFilter;
 
 /// One row: a change recorded, or an event, with its context.
 #[derive(Clone)]
@@ -116,38 +117,10 @@ enum Events {
     Hidden,
 }
 
-/// The filter as typed: `ctx:`, `ns:` and `kind:` terms, the rest searched as text. Each
-/// term must match (lowercase).
-#[derive(Default, Debug, PartialEq)]
-struct Filter {
-    context: Vec<String>,
-    namespace: Vec<String>,
-    kind: Vec<String>,
-    text: Vec<String>,
-}
-
-fn parse_filter(input: &str) -> Filter {
-    let mut f = Filter::default();
-    for word in input.split_whitespace() {
-        let word = word.to_lowercase();
-        let term = match word.split_once(':') {
-            Some(("ctx" | "context", v)) if !v.is_empty() => Some((&mut f.context, v.to_string())),
-            Some(("ns" | "namespace", v)) if !v.is_empty() => Some((&mut f.namespace, v.to_string())),
-            Some(("kind", v)) if !v.is_empty() => Some((&mut f.kind, v.to_string())),
-            _ => None,
-        };
-        match term {
-            Some((terms, v)) => terms.push(v),
-            None => f.text.push(word),
-        }
-    }
-    f
-}
-
 /// Whether a row is shown: on `context` (None: all), in one of `namespaces` (none chosen:
 /// any, cluster-scoped objects too), with the events asked for, matching every term of the
 /// filter.
-fn shown(e: &Entry, f: &Filter, context: Option<&str>, namespaces: &[String], events: Events) -> bool {
+fn shown(e: &Entry, f: &PageFilter, context: Option<&str>, namespaces: &[String], events: Events) -> bool {
     if context.is_some_and(|c| c != e.context()) {
         return false;
     }
@@ -159,21 +132,9 @@ fn shown(e: &Entry, f: &Filter, context: Option<&str>, namespaces: &[String], ev
         Events::Warnings if e.is_event() && !e.warning() => return false,
         _ => {}
     }
-    let kind = e.kind().to_lowercase();
-    // `kind:configmap`, `kind:configmaps`, `kind:config`.
-    let kind_ok = |k: &String| kind.contains(k.as_str()) || format!("{kind}s") == *k;
-    let ns = e.namespace().unwrap_or_default().to_lowercase();
-    if !(f.context.iter().all(|c| e.context().to_lowercase().contains(c.as_str()))
-        && f.namespace.iter().all(|n| ns.contains(n.as_str()))
-        && f.kind.iter().all(kind_ok))
-    {
-        return false;
-    }
-    if f.text.is_empty() {
-        return true;
-    }
-    let text = format!("{} {kind} {ns}/{} {}", e.context(), e.name(), e.summary()).to_lowercase();
-    f.text.iter().all(|t| text.contains(t.as_str()))
+    let text =
+        format!("{} {} {}/{} {}", e.context(), e.kind(), e.namespace().unwrap_or_default(), e.name(), e.summary());
+    f.matches(e.context(), e.namespace(), e.kind(), &text)
 }
 
 /// Changes and events in one list, newest first (no time last).
@@ -355,7 +316,7 @@ impl TimelineView {
     }
 
     fn refilter(&mut self, cx: &App) {
-        let f = parse_filter(&self.filter.read(cx).value());
+        let f = PageFilter::parse(&self.filter.read(cx).value());
         let (context, namespaces, events) = (self.context.as_deref(), &self.namespaces, self.events_shown);
         self.shown =
             (0..self.entries.len()).filter(|&i| shown(&self.entries[i], &f, context, namespaces, events)).collect();
@@ -621,9 +582,10 @@ mod tests {
     // Not `super::*`: gpui_kit's `test` attribute would come with it.
     use std::sync::Arc;
 
-    use super::{Entry, Events, Filter, merged, parse_filter, shown};
+    use super::{Entry, Events, merged, shown};
     use crate::k8s::{ClusterEvent, EventLine};
     use crate::timeline::{Record, What};
+    use crate::ui::page_filter::PageFilter as Filter;
 
     fn change(ctx: &str, kind: &str, ns: &str, name: &str, secs: i64) -> Entry {
         Entry::Change(
@@ -677,7 +639,7 @@ mod tests {
     #[test]
     fn filters() {
         let e = change("prod", "ConfigMap", "shop", "web", 0);
-        let ok = |f: &str, ctx: Option<&str>| shown(&e, &parse_filter(f), ctx, &[], Events::All);
+        let ok = |f: &str, ctx: Option<&str>| shown(&e, &Filter::parse(f), ctx, &[], Events::All);
         assert!(ok("", None));
         assert!(ok("kind:configmap ns:shop ctx:prod", None));
         assert!(ok("kind:configmaps data.a", None));

@@ -14,6 +14,7 @@ pub mod helm;
 pub mod helm_install;
 pub mod kubeconfig_sources;
 pub mod ns_picker;
+pub mod page_filter;
 pub mod palette;
 pub mod problems_view;
 pub mod schema_form;
