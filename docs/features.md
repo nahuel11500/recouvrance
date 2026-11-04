@@ -170,7 +170,9 @@
   revision, last sync, conditions, the last 5 deployments, a link to the Application, and
   *Refresh*/*Sync* (write mode and the hub's protection apply). The Applications are read from the
   hub, found among the connected clusters, else among other kubeconfig contexts that need no
-  separate login; when the hub isn't found, name it with `argocd_contexts` (see
+  separate login; when the hub isn't found, the Argo CD page lists the contexts left out (named
+  like a hub first) to ask with one click, and the one that answers is kept. It can also be
+  ticked in Settings → Contexts (*Argo CD*; see
   [configuration](configuration.md#argo-cd-hub-argocd_contexts)).
 - **Argo CD page** (sidebar → *Argo CD*): every Application of every context that serves Argo
   CD, read with one list per Argo CD cluster: name, project, sync, health, revision, destination

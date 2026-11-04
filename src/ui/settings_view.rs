@@ -636,7 +636,9 @@ impl SettingsView {
             .child(div().pb_2().text_sm().text_color(muted).child(
                 "Color a context to recognise it at a glance. Protected contexts ask you to type their name (or to wait, see General → Confirming) before any write. \
                  Run as: an identity you may impersonate (`kubectl --as`); write confirmations then offer to run that one \
-                 action as it, off each time. Never for agents. Metrics, node shell and namespaces per cluster are under Per cluster.",
+                 action as it, off each time. Never for agents. Argo CD: the contexts Argo CD's Applications are read from; none \
+                 ticked, they are found on their own (a context whose login may prompt is only asked once ticked). \
+                 Metrics, node shell and namespaces per cluster are under Per cluster.",
             ))
             .when(s.protect_unset, |d| {
                 d.child(
@@ -686,6 +688,8 @@ impl SettingsView {
                         })
                 }));
                 let c2 = ctx.clone();
+                let c3 = ctx.clone();
+                let argo_hub = s.argocd_contexts.contains(&ctx);
                 let run_as = self.run_as_inputs.iter().find(|(c, ..)| *c == ctx).map(|(_, u, g)| (u.clone(), g.clone()));
                 v_flex()
                     .gap_1()
@@ -697,6 +701,22 @@ impl SettingsView {
                             .gap_4()
                             .child(div().flex_1().min_w_0().text_sm().child(ctx))
                             .child(swatches)
+                            .child(
+                                Checkbox::new(("argo-hub", i))
+                                    .label("Argo CD")
+                                    .checked(argo_hub)
+                                    .tooltip("Read Argo CD's Applications from this context")
+                                    .on_click(move |v: &bool, _, cx| {
+                                        let v = *v;
+                                        settings::update(|s| {
+                                            s.argocd_contexts.retain(|c| *c != c3);
+                                            if v {
+                                                s.argocd_contexts.push(c3.clone());
+                                            }
+                                        });
+                                        cx.refresh_windows();
+                                    }),
+                            )
                             .child(
                                 Checkbox::new(("protect", i)).label("Protected").checked(protected).on_click(move |v: &bool, _, cx| {
                                     settings::set_protected(&c2, *v);

@@ -262,6 +262,11 @@ pub struct ArgoView {
     _poll: Task<()>,
     /// A read right after a write.
     after_write: crate::latest::Latest,
+    /// With no hub found: the context being asked whether it serves Applications, and what
+    /// the last one asked answered.
+    checking: Option<String>,
+    check_note: Option<String>,
+    check: crate::latest::Latest,
     _subs: Vec<Subscription>,
 }
 
@@ -306,6 +311,9 @@ impl ArgoView {
             kept: 0,
             _poll: poll,
             after_write: Default::default(),
+            checking: None,
+            check_note: None,
+            check: Default::default(),
             _subs: subs,
         }
     }
@@ -327,6 +335,90 @@ impl ArgoView {
         self.after_write.spawn(cx, async move { read(clusters, &exec).await }, move |this, rows, cx| {
             this.set_rows(rows, started, cx);
         });
+    }
+
+    /// Ask a context left out of the search (its login may prompt) whether Argo CD runs
+    /// there; if it does, keep it in Settings as the Argo CD cluster and read it.
+    fn check_hub(&mut self, context: String, cx: &mut Context<Self>) {
+        self.checking = Some(context.clone());
+        self.check_note = None;
+        cx.notify();
+        let ctx = context.clone();
+        self.check.spawn(cx, argo::check_hub(context), move |this, answer, cx| {
+            this.checking = None;
+            match answer {
+                Ok(true) => {
+                    crate::settings::update(|s| {
+                        if !s.argocd_contexts.contains(&ctx) {
+                            s.argocd_contexts.push(ctx.clone());
+                        }
+                    });
+                    this.reload(cx);
+                }
+                Ok(false) => this.check_note = Some(format!("{ctx} does not serve Argo CD's Applications.")),
+                Err(why) => this.check_note = Some(format!("{ctx}: {why}")),
+            }
+            cx.notify();
+        });
+    }
+
+    /// What the page shows when no context serves Applications: why, and the contexts that
+    /// were not asked because their login may prompt, each with a button to ask it.
+    fn no_hub(&self, fleet: &Fleet, cx: &mut Context<Self>) -> AnyElement {
+        /// The most offered: the likeliest first, the rest are in Settings → Contexts.
+        const OFFERED: usize = 12;
+        let theme = cx.theme().clone();
+        let chosen = crate::settings::with(|s| s.argocd_contexts.clone());
+        let intro = if chosen.is_empty() {
+            "No context serves Argo CD's Applications. The connected clusters were asked, and the other contexts \
+             that need no login of their own."
+                .to_string()
+        } else {
+            format!(
+                "None of the Argo CD clusters set in Settings → Contexts ({}) serves Argo CD's Applications.",
+                chosen.join(", ")
+            )
+        };
+        let busy = self.checking.is_some();
+        v_flex()
+            .p_4()
+            .gap_3()
+            .text_sm()
+            .text_color(theme.muted_foreground)
+            .child(intro)
+            .children(fleet.errors.iter().map(|e| div().text_color(theme.danger).child(e.clone())))
+            .when(!fleet.not_asked.is_empty(), |d| {
+                d.child(
+                    "Not asked, because their login may open a browser or ask for something. Pick the one Argo CD \
+                     runs on: once it answers, it is kept as the Argo CD cluster (Settings → Contexts).",
+                )
+                .child(h_flex().flex_wrap().gap_2().children(fleet.not_asked.iter().take(OFFERED).enumerate().map(
+                    |(i, c)| {
+                        let context = c.clone();
+                        Button::new(("argo-hub", i))
+                            .small()
+                            .outline()
+                            .label(c.clone())
+                            .loading(self.checking.as_deref() == Some(c.as_str()))
+                            .disabled(busy)
+                            .on_click(cx.listener(move |this, _, _, cx| this.check_hub(context.clone(), cx)))
+                    },
+                )))
+                .when(fleet.not_asked.len() > OFFERED, |d| {
+                    d.child(format!(
+                        "{} more: tick Argo CD on the one it runs on in Settings → Contexts.",
+                        fleet.not_asked.len() - OFFERED
+                    ))
+                })
+            })
+            .when(fleet.not_asked.is_empty() && chosen.is_empty(), |d| {
+                d.child(
+                    "If Argo CD runs on a cluster not in your kubeconfig, add its kubeconfig in Settings → Kubeconfig.",
+                )
+            })
+            .children(self.checking.as_ref().map(|c| format!("Asking {c}… its login may open in your browser.")))
+            .children(self.check_note.clone().map(|n| div().text_color(theme.warning).child(n)))
+            .into_any_element()
     }
 
     fn refilter(&mut self) {
@@ -694,15 +786,7 @@ impl Render for ArgoView {
         let theme = cx.theme().clone();
         let body: AnyElement = match &self.rows {
             None => div().p_4().text_color(theme.muted_foreground).child("Reading Argo CD…").into_any_element(),
-            Some(rows) if rows.fleet.hubs.is_empty() => v_flex()
-                .p_4()
-                .gap_2()
-                .text_color(theme.muted_foreground)
-                .child(
-                    "No context serves Argo CD's Applications. If Argo CD runs on a cluster whose context needs a \
-                     separate login, name it in `argocd_contexts` (see the configuration docs).",
-                )
-                .into_any_element(),
+            Some(rows) if rows.fleet.hubs.is_empty() => self.no_hub(&rows.fleet, cx),
             Some(rows) => {
                 let count = self.shown.len();
                 let total = rows.fleet.apps.len();
