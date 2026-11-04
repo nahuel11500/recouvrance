@@ -4,6 +4,7 @@ use std::collections::HashMap;
 
 use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -11,6 +12,7 @@ use gpui_kit::*;
 use crate::details::OpenObject;
 use crate::k8s::{self, Kind};
 use crate::problems::{self, Problem, Severity};
+use crate::ui::page_filter::PageFilter;
 
 pub struct ProblemsView {
     /// Each cluster with the namespaces scanned there.
@@ -24,7 +26,13 @@ pub struct ProblemsView {
     errors: Vec<String>,
     /// Hide Info rows (restarts, cordoned nodes).
     show_info: bool,
+    /// One severity only, picked with its count.
+    only: Option<Severity>,
+    filter: Entity<InputState>,
+    /// The filter as last typed, parsed.
+    parsed: PageFilter,
     _task: Option<Task<()>>,
+    _subs: Vec<Subscription>,
 }
 
 impl EventEmitter<OpenObject> for ProblemsView {}
@@ -34,10 +42,29 @@ impl ProblemsView {
         clusters: crate::ui::Scope,
         kinds: HashMap<String, Vec<Kind>>,
         namespaces: Vec<String>,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let mut this =
-            Self { clusters, kinds, namespaces, found: None, errors: Vec::new(), show_info: false, _task: None };
+        let filter = cx.new(|cx| InputState::new(window, cx).placeholder("Filter: text, ns:shop, kind:Pod, ctx:prod"));
+        let subs = vec![cx.subscribe(&filter, |this: &mut Self, state, ev: &InputEvent, cx| {
+            if matches!(ev, InputEvent::Change) {
+                this.parsed = PageFilter::parse(&state.read(cx).value());
+                cx.notify();
+            }
+        })];
+        let mut this = Self {
+            clusters,
+            kinds,
+            namespaces,
+            found: None,
+            errors: Vec::new(),
+            show_info: false,
+            only: None,
+            filter,
+            parsed: PageFilter::default(),
+            _task: None,
+            _subs: subs,
+        };
         this.reload(cx);
         this
     }
@@ -92,10 +119,11 @@ impl ProblemsView {
         }));
     }
 
-    /// Indices in `found` of the problems shown (minor ones only when asked).
+    /// Indices in `found` of the problems shown: minor ones only when asked, the severity
+    /// picked, and what the filter keeps.
     fn shown(&self) -> Vec<usize> {
         let found = self.found.as_deref().unwrap_or_default();
-        (0..found.len()).filter(|&i| self.show_info || found[i].1.severity != Severity::Info).collect()
+        (0..found.len()).filter(|&i| keeps(&found[i].0, &found[i].1, &self.parsed, self.only, self.show_info)).collect()
     }
 
     fn row(&self, i: usize, ix: usize, cx: &mut Context<Self>) -> AnyElement {
@@ -201,6 +229,23 @@ impl ProblemsView {
     }
 }
 
+/// Whether a problem is shown: of the severity picked (none: any, minor ones only with
+/// `show_info`), and matching the filter. `kind:` matches the kind as listed (`Pod alert`,
+/// `Service`) or as kubectl names it (`pods`).
+fn keeps(context: &str, p: &Problem, f: &PageFilter, only: Option<Severity>, show_info: bool) -> bool {
+    let severity_ok = match only {
+        Some(s) => p.severity == s,
+        None => show_info || p.severity != Severity::Info,
+    };
+    if !severity_ok {
+        return false;
+    }
+    let ns = p.namespace.as_deref();
+    let text = format!("{context} {} {} {}/{} {}", p.label, p.kind, ns.unwrap_or_default(), p.name, p.reason);
+    let kinds = format!("{} {}", p.label, p.kind);
+    f.matches(context, ns, &kinds, &text)
+}
+
 /// What the page says when nothing is found, and whether it is an all-clear: only when
 /// every cluster and kind could be read.
 fn nothing_found(errors: &[String]) -> (bool, &'static str) {
@@ -264,17 +309,32 @@ impl Render for ProblemsView {
         };
         let count = |s: Severity| found.iter().filter(|(_, p)| p.severity == s).count();
         let (crit, warn, info) = (count(Severity::Critical), count(Severity::Warning), count(Severity::Info));
-        let pill = |n: usize, label: &str, color: Hsla| {
+        // A count picks its severity alone; picked again, every severity.
+        let only = self.only;
+        let pill = |n: usize, label: &str, color: Hsla, severity: Severity, cx: &mut Context<Self>| {
+            let picked = only == Some(severity);
             h_flex()
+                .id(SharedString::from(format!("only-{label}")))
                 .gap_1p5()
                 .px_3()
                 .py_1()
                 .rounded_md()
-                .bg(color.opacity(0.1))
+                .bg(color.opacity(if picked { 0.25 } else { 0.1 }))
+                .border_1()
+                .border_color(if picked { color } else { color.opacity(0.) })
+                .cursor_pointer()
+                .hover(|s| s.bg(color.opacity(0.2)))
                 .child(div().font_weight(FontWeight::BOLD).text_color(color).child(n.to_string()))
                 .child(div().text_sm().child(label.to_string()))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.only = if this.only == Some(severity) { None } else { Some(severity) };
+                    cx.notify();
+                }))
         };
         let shown = self.shown().len();
+        // How many of what the counts and "Show minor" let through the filter keeps.
+        let filtered = !self.parsed.is_empty() || self.only.is_some();
+        let listed = crit + warn + if self.show_info || self.only == Some(Severity::Info) { info } else { 0 };
         v_flex()
             .size_full()
             .p_4()
@@ -283,12 +343,20 @@ impl Render for ProblemsView {
             .child(
                 h_flex()
                     .gap_2()
-                    .child(pill(crit, "critical", theme.danger))
-                    .child(pill(warn, "warnings", theme.warning))
-                    .child(pill(info, "minor", theme.muted_foreground)),
+                    .flex_wrap()
+                    .child(pill(crit, "critical", theme.danger, Severity::Critical, cx))
+                    .child(pill(warn, "warnings", theme.warning, Severity::Warning, cx))
+                    .child(pill(info, "minor", theme.muted_foreground, Severity::Info, cx))
+                    .child(div().w(px(340.)).ml_2().child(Input::new(&self.filter).small().cleanable(true)))
+                    .when(filtered, |d| {
+                        d.child(div().text_sm().text_color(theme.muted_foreground).child(format!("{shown} shown")))
+                    }),
             )
             .children(self.errors.iter().map(|e| div().text_sm().text_color(theme.danger).child(e.clone())))
-            .when(crit + warn + if self.show_info { info } else { 0 } == 0, |d| {
+            .when(filtered && listed > 0 && shown == 0, |d| {
+                d.child(div().text_sm().text_color(theme.muted_foreground).child("Nothing matches the filter."))
+            })
+            .when(crit + warn + if self.show_info { info } else { 0 } == 0 && !filtered, |d| {
                 let (all_clear, text) = nothing_found(&self.errors);
                 if all_clear {
                     d.child(
@@ -317,6 +385,35 @@ impl Render for ProblemsView {
 #[cfg(test)]
 mod tests {
     use crate::problems::{Problem, Scan, Severity};
+    use crate::ui::page_filter::PageFilter;
+
+    #[test]
+    fn the_filter_and_the_severity_picked() {
+        let p = |severity, label: &str, kind: &str, ns: &str, name: &str, reason: &str| Problem {
+            severity,
+            kind: kind.into(),
+            label: label.into(),
+            namespace: Some(ns.into()),
+            name: name.into(),
+            reason: reason.into(),
+            age: None,
+        };
+        let alert = p(Severity::Warning, "Pod alert", "pods", "monitoring", "prom-0", "NodeMemoryMajorPagesFaults");
+        let svc = p(Severity::Warning, "Service", "services", "monitoring", "nginx", "selects no pod");
+        let restarts = p(Severity::Info, "Pod", "pods", "shop", "web", "restarted 3 times");
+        let keeps = |pr: &Problem, f: &str, only, info| super::keeps("prod", pr, &PageFilter::parse(f), only, info);
+        assert!(keeps(&alert, "", None, false));
+        assert!(keeps(&alert, "kind:alert", None, false) && !keeps(&svc, "kind:alert", None, false));
+        assert!(keeps(&alert, "kind:pods", None, false), "kubectl's name too");
+        assert!(keeps(&svc, "selects ns:monitor ctx:prod", None, false));
+        assert!(!keeps(&svc, "ctx:staging", None, false));
+        // Minor ones: only when shown, or picked with their count.
+        assert!(!keeps(&restarts, "", None, false));
+        assert!(keeps(&restarts, "", None, true));
+        assert!(keeps(&restarts, "", Some(Severity::Info), false));
+        assert!(!keeps(&alert, "", Some(Severity::Critical), true));
+        assert!(keeps(&alert, "", Some(Severity::Warning), false));
+    }
 
     #[test]
     fn no_all_clear_when_a_scan_failed() {
