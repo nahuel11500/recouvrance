@@ -314,7 +314,7 @@
 | Ctrl+F or / | Filter the current table: `web` · `!Running` · `app=web` · `tier!=db` · `l:app` · `ns:team-*` · `/^api-\d+/` · `status:Running` · `restarts>3` · `cpu>200m` (all terms must match) |
 | j / k / Enter | Move the selection in a table / open the selected row |
 | g then p / o / w / h / i / s | Go to Problems / Cluster overview / Workloads overview / Helm / Assistant / Settings |
-| Ctrl+J | Show or hide the assistant beside the page |
+| Ctrl+J | Show or hide the assistant beside the page: it is told what is on screen |
 | ? | List the keyboard shortcuts |
 | Right-click a row | Open, logs, shell, YAML, events, copy name, favorite |
 
