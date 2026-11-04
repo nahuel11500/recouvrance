@@ -176,7 +176,8 @@ gpui_kit::actions!(
         GoWorkloads,
         GoHelm,
         GoAssistant,
-        GoSettings
+        GoSettings,
+        ToggleAssistant
     ]
 );
 
@@ -195,6 +196,7 @@ fn key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("ctrl-shift-tab", PrevTab, None),
         KeyBinding::new("ctrl-pageup", PrevTab, None),
         KeyBinding::new("ctrl-b", ToggleSidebar, None),
+        KeyBinding::new("ctrl-j", ToggleAssistant, None),
         KeyBinding::new("f5", RefreshPage, None),
         KeyBinding::new("ctrl-r", RefreshPage, None),
         KeyBinding::new("ctrl-=", ZoomIn, None),
@@ -264,6 +266,11 @@ pub struct AppView {
     problems: problem_badge::ProblemBadge,
     /// Sidebar hidden (Ctrl+B).
     sidebar_hidden: bool,
+    /// The window's assistant chat, the same on its page and beside the others; made when
+    /// first opened.
+    assistant: Option<Entity<crate::ui::assistant_view::AssistantView>>,
+    /// The assistant shown beside the page (Ctrl+J).
+    assistant_docked: bool,
     /// Selection events the app caused itself (keeping the selection on its row
     /// after an update); they must not open the row like a click does.
     skip_select: Option<usize>,
@@ -504,6 +511,8 @@ impl AppView {
             page_scopes: HashMap::new(),
             namespace_open: Default::default(),
             sidebar_hidden: false,
+            assistant: None,
+            assistant_docked: false,
             problems: problem_badge::ProblemBadge::default(),
             namespaces: Vec::new(),
             filter,

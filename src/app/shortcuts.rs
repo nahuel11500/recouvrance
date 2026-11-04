@@ -29,6 +29,7 @@ pub(super) const SHORTCUTS: &[(&str, &str)] = &[
         "g then p / o / w / h / i / s",
         "Go to Problems / Cluster overview / Workloads overview / Helm / Assistant / Settings",
     ),
+    ("Ctrl+J", "Show or hide the assistant beside the page: it is told what is on screen"),
     ("?", "List the keyboard shortcuts"),
     ("Right-click a row", "Open, logs, shell, YAML, events, copy name, favorite"),
 ];

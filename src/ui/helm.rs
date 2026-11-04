@@ -375,6 +375,11 @@ fn chart_refs(search_json: &str, chart: &str) -> Vec<String> {
 }
 
 impl HelmRelease {
+    /// The release shown: (context, namespace, name).
+    pub fn subject(&self) -> (String, String, String) {
+        (self.context.clone(), self.release.namespace.clone(), self.release.name.clone())
+    }
+
     pub fn new(client: Client, context: String, release: Release, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let editor = |text: String, window: &mut Window, cx: &mut Context<Self>| {
             cx.new(|cx| {
