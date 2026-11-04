@@ -144,10 +144,14 @@ fn parse_filter(input: &str) -> Filter {
     f
 }
 
-/// Whether a row is shown: on `context` (None: all), with the events asked for, matching
-/// every term of the filter.
-fn shown(e: &Entry, f: &Filter, context: Option<&str>, events: Events) -> bool {
+/// Whether a row is shown: on `context` (None: all), in one of `namespaces` (none chosen:
+/// any, cluster-scoped objects too), with the events asked for, matching every term of the
+/// filter.
+fn shown(e: &Entry, f: &Filter, context: Option<&str>, namespaces: &[String], events: Events) -> bool {
     if context.is_some_and(|c| c != e.context()) {
+        return false;
+    }
+    if !namespaces.is_empty() && !e.namespace().is_some_and(|ns| namespaces.iter().any(|n| n == ns)) {
         return false;
     }
     match events {
@@ -182,6 +186,10 @@ fn merged(records: &[Entry], events: &[Entry]) -> Vec<Entry> {
 pub struct TimelineView {
     /// The connected clusters: their records, and their events.
     clusters: Vec<(String, Client)>,
+    /// Each cluster with the namespaces its events are read in (see `crate::ui::Scope`).
+    scope: crate::ui::Scope,
+    /// The namespaces picked (none: all): only their rows are shown.
+    namespaces: Vec<String>,
     /// The connected contexts' records, read at `version` (see `timeline::version`).
     records: Vec<Entry>,
     version: u64,
@@ -212,7 +220,8 @@ impl EventEmitter<OpenObject> for TimelineView {}
 const POLL: Duration = Duration::from_secs(2);
 
 impl TimelineView {
-    pub fn new(clusters: Vec<(String, Client)>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(scope: crate::ui::Scope, namespaces: Vec<String>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let clusters = scope.iter().map(|(ctx, client, _)| (ctx.clone(), client.clone())).collect();
         let filter =
             cx.new(|cx| InputState::new(window, cx).placeholder("Filter: text, ns:shop, kind:ConfigMap, ctx:prod"));
         let subs = vec![cx.subscribe(&filter, |this: &mut Self, _, ev: &InputEvent, cx| {
@@ -246,6 +255,8 @@ impl TimelineView {
         });
         let mut this = Self {
             clusters,
+            scope,
+            namespaces,
             records: Vec::new(),
             version: 0,
             events: Vec::new(),
@@ -277,7 +288,21 @@ impl TimelineView {
         self.rebuild(cx);
     }
 
-    /// Each cluster's events: every namespace, or each one set as accessible for it.
+    /// Show the namespaces picked now: their rows, and their events read again.
+    pub fn set_scope(&mut self, scope: crate::ui::Scope, namespaces: Vec<String>, cx: &mut Context<Self>) {
+        self.clusters = scope.iter().map(|(ctx, client, _)| (ctx.clone(), client.clone())).collect();
+        (self.scope, self.namespaces) = (scope, namespaces);
+        if self.context.as_ref().is_some_and(|c| !self.clusters.iter().any(|(n, _)| n == c)) {
+            self.context = None;
+        }
+        self.events.clear();
+        self.read_records(cx);
+        self.read_events(cx);
+        cx.notify();
+    }
+
+    /// Each cluster's events, in the namespaces of the scope: all at once, or each one (the
+    /// ones picked, or those set as accessible for it).
     fn read_events(&mut self, cx: &mut Context<Self>) {
         if self.events_shown == Events::Hidden {
             self.events.clear();
@@ -287,13 +312,8 @@ impl TimelineView {
         }
         self.events_loading = true;
         let normal = self.events_shown == Events::All;
-        let reads: Vec<(String, Client, Option<String>)> = (self.clusters.iter())
-            .flat_map(|(ctx, client)| {
-                let accessible = crate::settings::cluster(ctx).namespaces;
-                let scopes: Vec<Option<String>> =
-                    if accessible.is_empty() { vec![None] } else { accessible.into_iter().map(Some).collect() };
-                scopes.into_iter().map(move |ns| (ctx.clone(), client.clone(), ns))
-            })
+        let reads: Vec<(String, Client, Option<String>)> = (self.scope.iter())
+            .flat_map(|(ctx, client, scopes)| scopes.iter().map(move |ns| (ctx.clone(), client.clone(), ns.clone())))
             .collect();
         let work = futures::future::join_all(reads.into_iter().map(|(ctx, client, ns)| async move {
             let read = k8s::recent_events(client, ns.clone(), normal).await;
@@ -336,8 +356,9 @@ impl TimelineView {
 
     fn refilter(&mut self, cx: &App) {
         let f = parse_filter(&self.filter.read(cx).value());
-        let (context, events) = (self.context.as_deref(), self.events_shown);
-        self.shown = (0..self.entries.len()).filter(|&i| shown(&self.entries[i], &f, context, events)).collect();
+        let (context, namespaces, events) = (self.context.as_deref(), &self.namespaces, self.events_shown);
+        self.shown =
+            (0..self.entries.len()).filter(|&i| shown(&self.entries[i], &f, context, namespaces, events)).collect();
     }
 
     fn pick(&mut self, ix: usize, cx: &mut Context<Self>) {
@@ -476,11 +497,18 @@ impl Render for TimelineView {
             .gap_3()
             .child(Icon::new(Lucide::ClockArrowDown).size_5())
             .child(div().text_xl().font_weight(FontWeight::MEDIUM).child("Timeline"))
-            .child(div().text_sm().text_color(muted).child(if recording {
-                "changes recorded while the app watched, and events"
-            } else {
-                "recording is off (Settings → Timeline): what was recorded, and events"
-            }))
+            .child(div().text_sm().text_color(muted).child(format!(
+                "{}, {}",
+                if recording {
+                    "changes recorded while the app watched, and events"
+                } else {
+                    "recording is off (Settings → Timeline): what was recorded, and events"
+                },
+                match self.namespaces.as_slice() {
+                    [] => "all namespaces".to_string(),
+                    chosen => format!("in {}", chosen.join(", ")),
+                }
+            )))
             .child(div().flex_1())
             .child(
                 Button::new("timeline-refresh")
@@ -649,7 +677,7 @@ mod tests {
     #[test]
     fn filters() {
         let e = change("prod", "ConfigMap", "shop", "web", 0);
-        let ok = |f: &str, ctx: Option<&str>| shown(&e, &parse_filter(f), ctx, Events::All);
+        let ok = |f: &str, ctx: Option<&str>| shown(&e, &parse_filter(f), ctx, &[], Events::All);
         assert!(ok("", None));
         assert!(ok("kind:configmap ns:shop ctx:prod", None));
         assert!(ok("kind:configmaps data.a", None));
@@ -660,9 +688,30 @@ mod tests {
         let normal = event("prod", "Normal", 0);
         let warning = event("prod", "Warning", 0);
         let f = Filter::default();
-        assert!(!shown(&normal, &f, None, Events::Warnings) && shown(&warning, &f, None, Events::Warnings));
-        assert!(!shown(&warning, &f, None, Events::Hidden));
-        assert!(shown(&e, &f, None, Events::Hidden), "changes stay when events are hidden");
+        assert!(!shown(&normal, &f, None, &[], Events::Warnings) && shown(&warning, &f, None, &[], Events::Warnings));
+        assert!(!shown(&warning, &f, None, &[], Events::Hidden));
+        assert!(shown(&e, &f, None, &[], Events::Hidden), "changes stay when events are hidden");
         assert_eq!(warning.summary(), "Warning BackOff: restarting (×3)");
+    }
+
+    #[test]
+    fn only_the_namespaces_picked() {
+        let f = Filter::default();
+        let ns = |l: &[&str]| l.iter().map(ToString::to_string).collect::<Vec<_>>();
+        let shop = change("prod", "ConfigMap", "shop", "web", 0);
+        let shopping = change("prod", "ConfigMap", "shopping", "web", 0);
+        let mut node = change("prod", "Node", "", "n1", 0);
+        if let Entry::Change(_, r) = &mut node {
+            Arc::make_mut(r).namespace = None;
+        }
+        for e in [&shop, &shopping, &node] {
+            assert!(shown(e, &f, None, &[], Events::All), "no namespace picked: every row");
+        }
+        assert!(shown(&shop, &f, None, &ns(&["shop"]), Events::All));
+        assert!(!shown(&shopping, &f, None, &ns(&["shop"]), Events::All), "the name exactly");
+        assert!(!shown(&node, &f, None, &ns(&["shop"]), Events::All), "cluster-scoped rows are left out");
+        assert!(shown(&shopping, &f, None, &ns(&["shop", "shopping"]), Events::All));
+        // An event is placed by its object's namespace.
+        assert!(shown(&event("prod", "Warning", 0), &f, None, &ns(&["shop"]), Events::All));
     }
 }
