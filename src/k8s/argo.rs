@@ -370,11 +370,13 @@ pub struct Hub {
     pub client: Client,
 }
 
-/// The hubs found, and the contexts that could not be checked with why.
+/// The hubs found, the contexts that could not be checked with why, and (when none was
+/// found on its own) the contexts left out because their login may prompt.
 #[derive(Clone, Default)]
 pub struct Hubs {
     pub found: Vec<Hub>,
     pub failed: Vec<(String, String)>,
+    pub not_asked: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -411,22 +413,49 @@ fn target(targets: &[ContextTarget], context: &str) -> ContextTarget {
         .unwrap_or_else(|| ContextTarget { name: context.to_string(), ..Default::default() })
 }
 
-/// The contexts that are not connected and may be probed without asking anything of the
-/// user: no exec plugin, or the same one as a connected context (whose login is done, so it
-/// opens no browser). One context per cluster, and none for a cluster already connected.
-pub fn probe_candidates(targets: &[ContextTarget], connected: &[String]) -> Vec<String> {
+/// The contexts not connected that may be asked without asking anything of the user (no exec
+/// plugin, or the same one as a connected context, whose login is done), and those left out
+/// because asking them may run a login of their own. One context per cluster, none for a
+/// cluster connected or asked quietly; the left-out ones likeliest hub first (`hub_likeness`).
+fn candidates(targets: &[ContextTarget], connected: &[String]) -> (Vec<String>, Vec<String>) {
     let open: Vec<&ContextTarget> = targets.iter().filter(|t| connected.contains(&t.name)).collect();
     let mut seen: Vec<String> = open.iter().filter_map(|t| t.server.as_deref().map(server_key)).collect();
-    let mut out = Vec::new();
-    for t in targets.iter().filter(|t| !connected.contains(&t.name)) {
+    let (mut quiet, mut loud) = (Vec::new(), Vec::new());
+    let others: Vec<&ContextTarget> = targets.iter().filter(|t| !connected.contains(&t.name)).collect();
+    let is_quiet =
+        |t: &ContextTarget| t.exec.as_ref().is_none_or(|cmd| open.iter().any(|o| o.exec.as_ref() == Some(cmd)));
+    for t in others.iter().filter(|t| is_quiet(t)) {
         let Some(server) = t.server.as_deref().map(server_key) else { continue };
-        let quiet = t.exec.as_ref().is_none_or(|cmd| open.iter().any(|o| o.exec.as_ref() == Some(cmd)));
-        if quiet && !seen.contains(&server) {
+        if !seen.contains(&server) {
             seen.push(server);
-            out.push(t.name.clone());
+            quiet.push(t.name.clone());
         }
     }
-    out
+    for t in others.iter().filter(|t| !is_quiet(t)) {
+        let Some(server) = t.server.as_deref().map(server_key) else { continue };
+        if !seen.contains(&server) {
+            seen.push(server);
+            loud.push(t.name.clone());
+        }
+    }
+    loud.sort_by_key(|n| (std::cmp::Reverse(hub_likeness(n)), n.clone()));
+    (quiet, loud)
+}
+
+/// How much a context's name looks like Argo CD's cluster: `argo` in it most, then the words
+/// a management cluster is often named with. Only an order to offer them in: none is asked
+/// for it.
+pub fn hub_likeness(name: &str) -> u8 {
+    const HUB_WORDS: [&str; 10] =
+        ["hub", "meta", "mgmt", "management", "platform", "ops", "infra", "tools", "shared", "control"];
+    let name = name.to_lowercase();
+    if name.contains("argo") {
+        2
+    } else if name.split(|c: char| !c.is_ascii_alphanumeric()).any(|w| HUB_WORDS.contains(&w)) {
+        1
+    } else {
+        0
+    }
 }
 
 /// Whether the context serves Applications: one discovery request, bounded in time.
@@ -518,13 +547,31 @@ pub async fn hubs(connected: Vec<(String, Client)>) -> Hubs {
         if !open.found.is_empty() {
             return Ok(open);
         }
-        let others = probe_candidates(&targets(), &names);
-        let mut hubs = hubs_of(probe_all(others, &connected).await, &connected);
+        let (quiet, loud) = candidates(&targets(), &names);
+        let mut hubs = hubs_of(probe_all(quiet, &connected).await, &connected);
         hubs.failed.extend(open.failed);
+        if hubs.found.is_empty() {
+            // Those asked by hand already and found without Argo CD are not offered again.
+            let probes = PROBES.lock().unwrap_or_else(PoisonError::into_inner);
+            hubs.not_asked = loud.into_iter().filter(|c| !matches!(probes.get(c), Some(Probe::No))).collect();
+        }
         Ok(hubs)
     })
     .await
     .unwrap_or_default()
+}
+
+/// Ask one context whether it serves Applications, now (its login may run): Ok(true) when it
+/// does. What it answered is kept, as for the contexts asked on their own.
+pub async fn check_hub(context: String) -> Result<bool, String> {
+    let (context, answer) =
+        super::run(async move { Ok(probe(context, None).await) }).await.map_err(|e| format!("{e:#}"))?;
+    PROBES.lock().unwrap_or_else(PoisonError::into_inner).insert(context, answer.clone());
+    match answer {
+        Probe::Serves(_) => Ok(true),
+        Probe::No => Ok(false),
+        Probe::Failed(why, _) => Err(why),
+    }
 }
 
 // MARK: Reading Applications
@@ -850,6 +897,8 @@ pub struct Fleet {
     pub errors: Vec<String>,
     /// The hubs found, read or not.
     pub hubs: Vec<String>,
+    /// With no hub: the contexts not asked because their login may prompt, likeliest first.
+    pub not_asked: Vec<String>,
 }
 
 /// Every Application, read with one list per hub (kept `LIST_TTL`, shared with the pages'
@@ -869,6 +918,7 @@ async fn read_fleet(connected: Vec<(String, Client)>) -> Fleet {
     let mut fleet = Fleet {
         errors: hubs.failed.iter().map(|(c, e)| format!("{c}: {e}")).collect(),
         hubs: hubs.found.iter().map(|h| h.context.clone()).collect(),
+        not_asked: hubs.not_asked.clone(),
         ..Default::default()
     };
     for (hub, list) in lists {
@@ -997,9 +1047,27 @@ mod tests {
         ];
         // The same login as a connected context; no login; never another login, nor a
         // second context for a cluster already asked or connected.
-        assert_eq!(probe_candidates(&targets, &["work".into()]), ["hub", "kind"]);
+        assert_eq!(candidates(&targets, &["work".into()]).0, ["hub", "kind"]);
         // Nothing connected: only contexts without a login.
-        assert_eq!(probe_candidates(&targets, &[]), ["hub-admin", "kind", "work-again"]);
+        assert_eq!(candidates(&targets, &[]).0, ["hub-admin", "kind", "work-again"]);
+        // Left out, to be offered: a login of their own, one per cluster not asked otherwise.
+        assert_eq!(candidates(&targets, &["work".into()]).1, ["eks"]);
+        assert_eq!(candidates(&targets, &[]).1, ["eks"]);
+    }
+
+    #[test]
+    fn contexts_named_like_a_hub_are_offered_first() {
+        let targets = vec![
+            ctx("prod-eu", "https://a.example", Some("kubelogin --a")),
+            ctx("eu-platform-meta", "https://b.example", Some("kubelogin --b")),
+            ctx("argocd", "https://c.example", Some("kubelogin --c")),
+            ctx("dev", "https://d.example", Some("kubelogin --d")),
+            ctx("hubble", "https://e.example", Some("kubelogin --e")),
+        ];
+        assert_eq!(candidates(&targets, &[]).1, ["argocd", "eu-platform-meta", "dev", "hubble", "prod-eu"]);
+        assert_eq!(hub_likeness("ArgoCD-prod"), 2);
+        assert_eq!(hub_likeness("mgmt"), 1);
+        assert_eq!(hub_likeness("hubble"), 0);
     }
 
     #[test]

@@ -75,7 +75,7 @@ context already shown as `name@file` keeps that name when `name` is freed.
 | `protect_unset` | `false` | Set when the protection choices could not be read: contexts not listed in `protection` are protected instead of guessed. *Guess them again* in Settings → Contexts turns it off |
 | `prometheus` | found automatically | `{ "ctx": "monitoring/prometheus:9090" }` (see below) |
 | `clusters` | | Per-cluster settings (below) |
-| `argocd_contexts` | `[]` | `["argocd-hub"]`: the contexts Argo CD's Applications are read from (see below). Empty: found on their own. A value that doesn't read is empty. No Settings UI yet |
+| `argocd_contexts` | `[]` | `["argocd-hub"]`: the contexts Argo CD's Applications are read from (see below). Empty: found on their own. A value that doesn't read is empty. Settings → Contexts, *Argo CD* |
 | `extra_namespaces` | | Namespaces added by hand, per context |
 | `metrics_enabled` | true | Read metrics-server and Prometheus at all |
 | `accent` | `"brass"` | Accent color: `brass`, `harbour`, `sea`, `kelp`, `signal` or `violet` |
@@ -173,9 +173,12 @@ on (the hub). With `argocd_contexts` empty, the hub is found on its own: the con
 first; only if none serves Applications, the kubeconfig's other contexts that can be asked without
 a login prompt (no exec plugin, or the same exec command line as a connected context).
 
-Set it when the hub isn't connected and its kubeconfig user logs in with an exec plugin whose
-command line differs from the connected contexts' (kubelogin with one OIDC client id per cluster,
-for example): the hub is then never asked, and no Argo CD section shows. Naming it fixes that:
+When the hub isn't connected and its kubeconfig user logs in with an exec plugin whose command
+line differs from the connected contexts' (kubelogin with one OIDC client id per cluster, for
+example), it is not asked on its own. The Argo CD page then lists those contexts, the ones named
+like a hub first (`argo`, then `hub`, `meta`, `mgmt`, `platform`...): click the one Argo CD runs
+on and it is asked (its login may run); if it serves Applications, it is kept here. Or tick
+*Argo CD* on it in Settings → Contexts, or set it by hand:
 
 ```json
 "argocd_contexts": ["eu-platform-meta"]
