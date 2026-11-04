@@ -557,7 +557,9 @@ pub async fn hubs(connected: Vec<(String, Client)>) -> Hubs {
         let mut hubs = hubs_of(probe_all(quiet, &connected).await, &connected);
         hubs.failed.extend(open.failed);
         if hubs.found.is_empty() {
-            hubs.not_asked = loud;
+            // Those asked by hand already and found without Argo CD are not offered again.
+            let probes = PROBES.lock().unwrap_or_else(PoisonError::into_inner);
+            hubs.not_asked = loud.into_iter().filter(|c| !matches!(probes.get(c), Some(Probe::No))).collect();
         }
         Ok(hubs)
     })
