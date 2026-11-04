@@ -414,12 +414,7 @@ impl AppView {
         match self.route() {
             Route::Detail(d) => {
                 let (context, obj) = d.read(cx).subject();
-                OnScreen::Object {
-                    kind: obj.kind.ar.kind.clone(),
-                    namespace: obj.namespace.clone(),
-                    name: obj.name.clone(),
-                    context,
-                }
+                OnScreen::Object { kind: obj.kind.ar.kind, namespace: obj.namespace, name: obj.name, context }
             }
             Route::Resources(Some(kind)) => {
                 let d = self.table.read(cx).delegate();
