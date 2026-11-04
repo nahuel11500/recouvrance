@@ -18,13 +18,14 @@ impl AppView {
         (self.clusters.iter().map(|(c, _)| c.clone()).collect(), self.namespaces.clone())
     }
 
-    /// The Workloads, Problems or Helm page on screen lists what the namespaces chosen
+    /// The Workloads, Problems, Helm or Timeline page on screen lists what the namespaces chosen
     /// now ask for, when it was built for others.
     pub(super) fn rescope_page(&mut self, cx: &mut Context<Self>) {
         let id = match self.route() {
             Route::Workloads(p) => p.entity_id(),
             Route::Problems(p) => p.entity_id(),
             Route::Helm(p) => p.entity_id(),
+            Route::Timeline(p) => p.entity_id(),
             _ => return,
         };
         if self.scope_matches(id) {
@@ -38,12 +39,13 @@ impl AppView {
                 p.update(cx, |p, cx| p.set_scope(scope, kinds, namespaces, cx));
             }
             Route::Helm(p) => p.update(cx, |p, cx| p.set_scope(scope, cx)),
+            Route::Timeline(p) => p.update(cx, |p, cx| p.set_scope(scope, namespaces, cx)),
             _ => return,
         }
         self.remember_scope(id);
     }
 
-    /// Note what a Workloads, Problems or Helm page was built for.
+    /// Note what a Workloads, Problems, Helm or Timeline page was built for.
     pub(super) fn remember_scope(&mut self, page: EntityId) {
         let scope = self.page_scope();
         self.page_scopes.insert(page, scope);
@@ -435,8 +437,8 @@ impl AppView {
             self.navigate(Route::Timeline(existing), cx);
             return;
         }
-        let clusters = self.clusters.clone();
-        let page = cx.new(|cx| crate::ui::timeline_view::TimelineView::new(clusters, window, cx));
+        let (scope, ns) = (self.namespace_scope(), self.namespaces.clone());
+        let page = cx.new(|cx| crate::ui::timeline_view::TimelineView::new(scope, ns, window, cx));
         self.remember_scope(page.entity_id());
         // Released with the page. A row of a context not connected has no Open button.
         cx.subscribe_in(&page, window, |this, _, ev: &OpenObject, window, cx| {
