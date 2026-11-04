@@ -482,7 +482,7 @@ impl AppView {
             return;
         }
         let (scope, kinds, ns) = (self.namespace_scope(), self.cluster_kinds(), self.namespaces.clone());
-        let page = cx.new(|cx| crate::ui::problems_view::ProblemsView::new(scope, kinds, ns, cx));
+        let page = cx.new(|cx| crate::ui::problems_view::ProblemsView::new(scope, kinds, ns, window, cx));
         self.remember_scope(page.entity_id());
         // Released with the page.
         cx.subscribe_in(&page, window, |this, _, ev: &OpenObject, window, cx| {

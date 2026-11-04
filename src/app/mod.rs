@@ -611,7 +611,7 @@ impl AppView {
             }
             Route::Problems(_) => {
                 let (scope, kinds, ns) = (self.namespace_scope(), self.cluster_kinds(), self.namespaces.clone());
-                Route::Problems(cx.new(|cx| crate::ui::problems_view::ProblemsView::new(scope, kinds, ns, cx)))
+                Route::Problems(cx.new(|cx| crate::ui::problems_view::ProblemsView::new(scope, kinds, ns, window, cx)))
             }
             Route::Helm(_) => {
                 let scope = self.namespace_scope();
