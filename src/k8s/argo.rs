@@ -413,14 +413,8 @@ fn target(targets: &[ContextTarget], context: &str) -> ContextTarget {
         .unwrap_or_else(|| ContextTarget { name: context.to_string(), ..Default::default() })
 }
 
-/// The contexts that are not connected and may be probed without asking anything of the
-/// user: no exec plugin, or the same one as a connected context (whose login is done, so it
-/// opens no browser). One context per cluster, and none for a cluster already connected.
-pub fn probe_candidates(targets: &[ContextTarget], connected: &[String]) -> Vec<String> {
-    candidates(targets, connected).0
-}
-
-/// The quiet contexts (`probe_candidates`), and those left out because asking them may run a
+/// The contexts not connected that may be probed without asking anything of the user (no
+/// exec plugin, or the same one as a connected context, whose login is done), and those left out because asking them may run a
 /// login of their own: one per cluster, none for a cluster connected or asked quietly, the
 /// likeliest hubs first (see `hub_likeness`).
 fn candidates(targets: &[ContextTarget], connected: &[String]) -> (Vec<String>, Vec<String>) {
@@ -1053,9 +1047,9 @@ mod tests {
         ];
         // The same login as a connected context; no login; never another login, nor a
         // second context for a cluster already asked or connected.
-        assert_eq!(probe_candidates(&targets, &["work".into()]), ["hub", "kind"]);
+        assert_eq!(candidates(&targets, &["work".into()]).0, ["hub", "kind"]);
         // Nothing connected: only contexts without a login.
-        assert_eq!(probe_candidates(&targets, &[]), ["hub-admin", "kind", "work-again"]);
+        assert_eq!(candidates(&targets, &[]).0, ["hub-admin", "kind", "work-again"]);
         // Left out, to be offered: a login of their own, one per cluster not asked otherwise.
         assert_eq!(candidates(&targets, &["work".into()]).1, ["eks"]);
         assert_eq!(candidates(&targets, &[]).1, ["eks"]);
