@@ -166,8 +166,8 @@ impl AppView {
                 self.restart_watch(cx);
                 return;
             }
-            Route::Problems(p) => p.update(cx, |p, cx| p.refresh(cx)),
-            Route::Timeline(p) => p.update(cx, |p, cx| p.refresh(cx)),
+            Route::Problems(p) => p.update(cx, ProblemsView::refresh),
+            Route::Timeline(p) => p.update(cx, TimelineView::refresh),
             route => {
                 let Some((which, _)) = Overview::of(&route) else { return };
                 let fresh = self.build_overview(which, window, cx);
