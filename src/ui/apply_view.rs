@@ -86,8 +86,10 @@ pub struct ApplyView {
     docs: Option<Entity<crate::ui::field_docs::FieldDocs>>,
     schema_form: Option<Entity<crate::ui::schema_form::SchemaForm>>,
     _task: Option<Task<()>>,
-    /// The file picker or URL fetch, kept apart so it never drops a running apply.
-    _load: Option<Task<()>>,
+    /// The file picker and the URL fetch, kept apart from the apply and from each other: a
+    /// URL loaded while the picker is open must not drop the file picked.
+    _pick_file: Option<Task<()>>,
+    _fetch_url: Option<Task<()>>,
     _watch: Option<Task<()>>,
     _subs: Vec<Subscription>,
     /// The open form's save: replaced when another form opens.
@@ -134,7 +136,8 @@ impl ApplyView {
             docs: None,
             schema_form: None,
             _task: None,
-            _load: None,
+            _pick_file: None,
+            _fetch_url: None,
             _watch: None,
             _subs: subs,
             _form_sub: None,
@@ -228,7 +231,7 @@ impl ApplyView {
             multiple: false,
             prompt: Some("Open YAML".into()),
         });
-        self._load = Some(cx.spawn_in(window, async move |this, cx| {
+        self._pick_file = Some(cx.spawn_in(window, async move |this, cx| {
             let Ok(Ok(Some(paths))) = picked.await else { return };
             let _ = this.update_in(cx, |this, window, cx| this.load_paths(&paths, window, cx));
         }));
@@ -280,7 +283,7 @@ impl ApplyView {
         self.busy = true;
         cx.notify();
         let fetch = k8s::run(crate::assistant::get_url(url.clone()));
-        self._load = Some(cx.spawn_in(window, async move |this, cx| {
+        self._fetch_url = Some(cx.spawn_in(window, async move |this, cx| {
             let r = fetch.await;
             let _ = this.update_in(cx, |this, window, cx| {
                 this.busy = false;
