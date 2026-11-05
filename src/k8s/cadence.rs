@@ -188,11 +188,7 @@ impl Freshness {
 
 /// "45s", "3m", "2h".
 fn short(d: Duration) -> String {
-    match d.as_secs() {
-        s if s < 120 => format!("{s}s"),
-        s if s < 7200 => format!("{}m", s.div_euclid(60)),
-        s => format!("{}h", s.div_euclid(3600)),
-    }
+    super::duration_text(i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
 }
 
 #[cfg(test)]
