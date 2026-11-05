@@ -21,6 +21,7 @@ use kube::discovery::{ApiResource, Scope};
 use serde_json::{Value, json};
 
 use crate::history::DiffLine;
+use crate::json::{arr_at as arr, nonempty_at as s, time_at as time};
 use crate::k8s::{self, Kind, ObjectRef};
 use crate::status::Tone;
 
@@ -227,18 +228,6 @@ pub struct Diagnosis {
     pub since: Option<Timestamp>,
     /// The revision deployed and the one git is at, when they differ.
     pub moved: Option<(String, String)>,
-}
-
-fn s<'a>(v: &'a Value, p: &str) -> Option<&'a str> {
-    v.pointer(p).and_then(Value::as_str).filter(|s| !s.is_empty())
-}
-
-fn arr<'a>(v: &'a Value, p: &str) -> &'a [Value] {
-    v.pointer(p).and_then(Value::as_array).map_or(&[][..], Vec::as_slice)
-}
-
-fn time(v: &Value, p: &str) -> Option<Timestamp> {
-    s(v, p)?.parse().ok()
 }
 
 /// A duration as said in a title: `40 s`, `12 min`, `5 h`, `3 days`.

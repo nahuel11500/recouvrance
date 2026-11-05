@@ -20,6 +20,7 @@ use kube::discovery::ApiResource;
 use serde_json::{Value, json};
 
 use crate::details::{kubectl, shell_word};
+use crate::json::{arr_at as arr, str_or_empty as s};
 use crate::k8s::{self, Kind, ObjectRef};
 
 /// The kinds whose path is checked.
@@ -386,14 +387,6 @@ pub fn check(context: &str, target: Target, obj: &Value, world: &World, now: jif
         }
     }
     steps
-}
-
-fn s<'a>(v: &'a Value, path: &str) -> &'a str {
-    v.pointer(path).and_then(Value::as_str).unwrap_or("")
-}
-
-fn arr<'a>(v: &'a Value, path: &str) -> &'a [Value] {
-    v.pointer(path).and_then(Value::as_array).map_or(&[][..], Vec::as_slice)
 }
 
 fn find_condition<'a>(conditions: &'a [Value], ty: &str) -> Option<&'a Value> {

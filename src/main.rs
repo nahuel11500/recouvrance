@@ -17,6 +17,7 @@ mod glob;
 mod helm;
 mod hex;
 mod history;
+mod json;
 mod k8s;
 mod latest;
 mod mcp;
