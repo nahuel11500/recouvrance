@@ -20,16 +20,15 @@ pub(super) fn pod(ctx: &Ctx, cx: &App) -> Div {
     let phase = pod_status(obj);
     let statuses = arr(obj, "/status/containerStatuses");
     let containers = arr(obj, "/spec/containers");
-    let ready = statuses.iter().filter(|c| c["ready"].as_bool() == Some(true)).count();
-    let restarts: i64 = statuses.iter().filter_map(|c| c["restartCount"].as_i64()).sum();
+    let counts = k8s::pod_counts(obj);
     let node_name = s(obj, "/spec/nodeName").unwrap_or("-").to_string();
     let pod_name = s(obj, "/metadata/name").unwrap_or_default();
 
     let summary = row()
         .pt_4()
         .child(field("Status", div().text_color(state_color(&phase, cx)).child(selectable(phase.clone())), cx))
-        .child(field("Ready", format!("{ready}/{}", containers.len()), cx))
-        .child(field("Restarts", restarts.to_string(), cx))
+        .child(field("Ready", format!("{}/{}", counts.ready, counts.total), cx))
+        .child(field("Restarts", counts.restarts.to_string(), cx))
         .child(field("Node", ctx.link(node_name.clone(), "nodes", &node_name, cx), cx))
         .child(field("Pod IP", s(obj, "/status/podIP").unwrap_or("-").to_string(), cx))
         .child(field("QoS", s(obj, "/status/qosClass").unwrap_or("-").to_string(), cx))
@@ -562,8 +561,7 @@ pub fn pod_rows(pods: &[Value], usage: &ContainerUsage) -> Vec<PodRow> {
         .enumerate()
         .map(|(order, p)| {
             let name = s(p, "/metadata/name").unwrap_or_default().to_string();
-            let statuses = arr(p, "/status/containerStatuses");
-            let containers = arr(p, "/spec/containers");
+            let counts = k8s::pod_counts(p);
             let usage = usage.get(&name);
             let sum = |f: fn(&(f64, f64)) -> f64| usage.map(|u| u.values().map(f).sum::<f64>());
             let spec = |r: &str| {
@@ -574,9 +572,9 @@ pub fn pod_rows(pods: &[Value], usage: &ContainerUsage) -> Vec<PodRow> {
             PodRow {
                 order,
                 namespace: s(p, "/metadata/namespace").map(String::from),
-                ready: statuses.iter().filter(|c| c["ready"].as_bool() == Some(true)).count(),
-                total: containers.len(),
-                restarts: statuses.iter().filter_map(|c| c["restartCount"].as_i64()).sum(),
+                ready: counts.ready,
+                total: counts.total,
+                restarts: counts.restarts,
                 phase: pod_status(p),
                 cpu: [sum(|u| u.0), cpu.0, cpu.1],
                 mem: [sum(|u| u.1), mem.0, mem.1],
@@ -787,10 +785,7 @@ pub(crate) fn pod_status(p: &Value) -> String {
             }
         }
         if reason == "Completed" && has_running {
-            let ready = arr(p, "/status/conditions")
-                .iter()
-                .any(|c| c["type"].as_str() == Some("Ready") && c["status"].as_str() == Some("True"));
-            reason = if ready { "Running" } else { "NotReady" }.into();
+            reason = if k8s::pod_ready(p) { "Running" } else { "NotReady" }.into();
         }
     }
     if s(p, "/metadata/deletionTimestamp").is_some() {

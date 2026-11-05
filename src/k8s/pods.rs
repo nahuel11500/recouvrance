@@ -215,6 +215,43 @@ const DEFAULT_CONTAINER: &str = "kubectl.kubernetes.io/default-container";
 /// `kubectl.kubernetes.io/default-container` annotation names when the pod has it, else the
 /// first of `spec.containers`. The API server refuses an exec with no container in a pod
 /// that has several.
+/// Whether a pod's Ready condition is True.
+pub fn pod_ready(pod: &serde_json::Value) -> bool {
+    pod.pointer("/status/conditions")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|cs| cs.iter().any(|c| c["type"] == "Ready" && c["status"] == "True"))
+}
+
+/// A pod's READY and RESTARTS columns as kubectl counts them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PodCounts {
+    pub ready: usize,
+    pub total: usize,
+    pub restarts: i64,
+}
+
+/// READY counts its containers and its sidecars (init containers with `restartPolicy:
+/// Always`, which keep running); RESTARTS adds up every container's restarts, init ones
+/// included, as kubectl does.
+pub fn pod_counts(pod: &serde_json::Value) -> PodCounts {
+    use serde_json::Value;
+    let list = |p: &str| pod.pointer(p).and_then(Value::as_array).map_or(&[][..], Vec::as_slice);
+    let (statuses, init_statuses) = (list("/status/containerStatuses"), list("/status/initContainerStatuses"));
+    let sidecars: Vec<&str> = list("/spec/initContainers")
+        .iter()
+        .filter(|c| c["restartPolicy"] == "Always")
+        .filter_map(|c| c["name"].as_str())
+        .collect();
+    let is_ready = |c: &&Value| c["ready"] == true;
+    let sidecar_ready =
+        init_statuses.iter().filter(|c| c["name"].as_str().is_some_and(|n| sidecars.contains(&n))).filter(is_ready);
+    PodCounts {
+        ready: statuses.iter().filter(is_ready).count() + sidecar_ready.count(),
+        total: list("/spec/containers").len() + sidecars.len(),
+        restarts: statuses.iter().chain(init_statuses).filter_map(|c| c["restartCount"].as_i64()).sum(),
+    }
+}
+
 pub fn default_container(pod: &serde_json::Value) -> Option<String> {
     pod_containers(pod).into_iter().next()
 }
@@ -571,6 +608,38 @@ async fn read_line_capped<R: futures::AsyncBufRead + Unpin>(
         if newline.is_some() {
             return Ok(Some(cut));
         }
+    }
+}
+
+#[cfg(test)]
+mod counts_tests {
+    use serde_json::json;
+
+    #[test]
+    fn ready_and_restarts_as_kubectl_counts_them() {
+        let pod = json!({
+            "spec": {
+                "initContainers": [{"name": "migrate"}, {"name": "proxy", "restartPolicy": "Always"}],
+                "containers": [{"name": "web"}, {"name": "worker"}]
+            },
+            "status": {
+                "conditions": [{"type": "Ready", "status": "False"}],
+                "initContainerStatuses": [
+                    {"name": "migrate", "ready": false, "restartCount": 2},
+                    {"name": "proxy", "ready": true, "restartCount": 1}
+                ],
+                "containerStatuses": [
+                    {"name": "web", "ready": true, "restartCount": 3},
+                    {"name": "worker", "ready": false, "restartCount": 0}
+                ]
+            }
+        });
+        // web and the proxy sidecar are ready, of web, worker and the sidecar.
+        assert_eq!(super::pod_counts(&pod), super::PodCounts { ready: 2, total: 3, restarts: 6 });
+        assert!(!super::pod_ready(&pod));
+        let ready = json!({"status": {"conditions": [{"type": "Ready", "status": "True"}]}});
+        assert!(super::pod_ready(&ready));
+        assert_eq!(super::pod_counts(&json!({})), super::PodCounts::default());
     }
 }
 

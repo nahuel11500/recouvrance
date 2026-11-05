@@ -390,8 +390,7 @@ fn live(pods: &[Value]) -> Vec<&Value> {
 
 fn pod_ready(pod: &Value) -> bool {
     let deleting = pod.pointer("/metadata/deletionTimestamp").is_some_and(|t| !t.is_null());
-    !deleting
-        && items(&pod["status"]["conditions"]).any(|c| c["type"].as_str() == Some("Ready") && c["status"] == "True")
+    !deleting && k8s::pod_ready(pod)
 }
 
 /// A Service whose pods are `selected` (listed by its selector): selecting none is a warning,

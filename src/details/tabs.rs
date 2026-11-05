@@ -133,11 +133,7 @@ impl DetailPanel {
         if ports.is_empty() {
             return div().into_any_element();
         }
-        let ready_pod = self.related.pods.iter().find(|p| {
-            p.pointer("/status/conditions")
-                .and_then(|c| c.as_array())
-                .is_some_and(|cs| cs.iter().any(|c| c["type"] == "Ready" && c["status"] == "True"))
-        });
+        let ready_pod = self.related.pods.iter().find(|p| k8s::pod_ready(p));
         let muted = cx.theme().muted_foreground;
         let Some(pod) = ready_pod.cloned() else {
             return div()
