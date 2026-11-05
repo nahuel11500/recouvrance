@@ -8,8 +8,8 @@ use rmcp::{schemars, tool, tool_router};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::{ContextParam, KubeMcp, access_for, check_identity, problem_visible, require_ns};
-use crate::k8s::{self, ObjectRef};
+use super::{ContextParam, KubeMcp, access_for, get_named, problem_visible, require_ns};
+use crate::k8s;
 use crate::mcp::Verb;
 use crate::schema::{Explained, Schema};
 
@@ -194,14 +194,8 @@ impl KubeMcp {
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(secs);
         let deleted = p.condition == "deleted";
         loop {
-            let obj = ObjectRef { kind: kind.clone(), name: p.name.clone(), namespace: ns.clone(), uid: String::new() };
-            let state = match k8s::get_object(client.clone(), obj).await {
-                Ok(v) => {
-                    if let Err(e) = check_identity(&kind, ns.as_deref(), &p.name, &v) {
-                        return call.finish(Err(e));
-                    }
-                    (!deleted).then(|| condition_met(&v, &p.condition)).flatten()
-                }
+            let state = match get_named(&client, &kind, ns.as_deref(), &p.name, false).await {
+                Ok(v) => (!deleted).then(|| condition_met(&v, &p.condition)).flatten(),
                 Err(e) if k8s::is_not_found(&e) => deleted.then_some(true),
                 Err(e) => return call.finish(Err(e)),
             };

@@ -263,6 +263,23 @@ fn check_identity(kind: &Kind, ns: Option<&str>, name: &str, value: &serde_json:
     }
 }
 
+/// The object an agent named, read for it (with its managedFields when asked): no namespace
+/// for a cluster-scoped kind, and what came back must be that object (`check_identity`).
+pub(super) async fn get_named(
+    client: &kube::Client,
+    kind: &Kind,
+    ns: Option<&str>,
+    name: &str,
+    managed_fields: bool,
+) -> anyhow::Result<serde_json::Value> {
+    let namespace = if kind.namespaced { ns.map(String::from) } else { None };
+    let obj = k8s::ObjectRef { kind: kind.clone(), name: name.to_string(), namespace, uid: String::new() };
+    let ns = obj.namespace.clone();
+    let value = k8s::get_object_opts(client.clone(), obj, managed_fields).await?;
+    check_identity(kind, ns.as_deref(), name, &value)?;
+    Ok(value)
+}
+
 /// A manifest for the approval banner: each object's kind and name, then the YAML
 /// that will be applied (a Secret's values masked).
 fn manifest_summary(planned: &[(Kind, Option<String>, String, serde_json::Value)]) -> String {
@@ -1005,6 +1022,57 @@ pub fn start(hub: Arc<Hub>) -> TaskGuard {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// A cluster answering any GET with a Node named after the last segment of the path,
+    /// or `other` for `/n2`; records the paths asked.
+    #[derive(Clone, Default)]
+    struct Nodes(Arc<std::sync::Mutex<Vec<String>>>);
+
+    impl tower::Service<http::Request<kube::client::Body>> for Nodes {
+        type Response = http::Response<http_body_util::Full<bytes::Bytes>>;
+        type Error = std::convert::Infallible;
+        type Future = std::future::Ready<Result<Self::Response, Self::Error>>;
+
+        fn poll_ready(&mut self, _: &mut std::task::Context<'_>) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, req: http::Request<kube::client::Body>) -> Self::Future {
+            let path = req.uri().path().to_string();
+            let name = match path.rsplit('/').next() {
+                Some("n2") => "other",
+                Some(n) => n,
+                None => "",
+            };
+            let body = json!({"apiVersion": "v1", "kind": "Node", "metadata": {"name": name}}).to_string();
+            self.0.lock().unwrap().push(path);
+            std::future::ready(Ok(http::Response::new(http_body_util::Full::new(bytes::Bytes::from(body)))))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_named_object_is_read_where_its_kind_lives_and_must_be_the_one_named() {
+        let node = Kind {
+            ar: kube::discovery::ApiResource {
+                group: String::new(),
+                version: "v1".into(),
+                api_version: "v1".into(),
+                kind: "Node".into(),
+                plural: "nodes".into(),
+            },
+            namespaced: false,
+            section: "",
+            label: String::new(),
+        };
+        let cluster = Nodes::default();
+        let client = kube::Client::new(cluster.clone(), "default");
+        // A namespace given for a cluster-scoped kind is left out of the path.
+        let v = get_named(&client, &node, Some("default"), "n1", false).await.unwrap();
+        assert_eq!(v["metadata"]["name"], "n1");
+        assert_eq!(cluster.0.lock().unwrap().as_slice(), ["/api/v1/nodes/n1"]);
+        // Another object than the one named is refused.
+        assert!(get_named(&client, &node, None, "n2", false).await.is_err());
+    }
 
     #[test]
     fn approving_find_problems_shows_only_pod_findings() {

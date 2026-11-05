@@ -7,8 +7,8 @@ use rmcp::{schemars, tool, tool_router};
 use serde::Deserialize;
 use serde_json::json;
 
-use super::{KubeMcp, access_for, check_identity};
-use crate::k8s::{self, ObjectRef, rollouts};
+use super::{KubeMcp, access_for, get_named};
+use crate::k8s::{self, rollouts};
 use crate::mcp::Verb;
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -103,19 +103,10 @@ impl KubeMcp {
         let (client, kind) = self.kind(&call, &p.context, &p.kind).await?;
         let access = access_for(&kind, &p.context, Verb::Patch, Some(p.namespace.clone()), Some(p.name.clone()));
         self.authorize(&mut call, &access).await?;
-        let obj = ObjectRef {
-            kind: kind.clone(),
-            name: p.name.clone(),
-            namespace: Some(p.namespace.clone()),
-            uid: String::new(),
-        };
-        let value = match k8s::get_object(client.clone(), obj).await {
+        let value = match get_named(&client, &kind, Some(&p.namespace), &p.name, false).await {
             Ok(v) => v,
             Err(e) => return call.finish(Err(e)),
         };
-        if let Err(e) = check_identity(&kind, Some(&p.namespace), &p.name, &value) {
-            return call.finish(Err(e));
-        }
         let patch = match rollouts::image_patch(&kind, &value, &p.container, &p.image) {
             Ok(patch) => patch,
             Err(e) => return call.finish(Err(anyhow::anyhow!(e))),
@@ -264,9 +255,6 @@ impl KubeMcp {
             "{} has no rollouts (Deployments, StatefulSets and DaemonSets do)",
             kind.ar.kind
         );
-        let obj = ObjectRef { kind: kind.clone(), name: name.into(), namespace: Some(ns.into()), uid: String::new() };
-        let value = k8s::get_object(client.clone(), obj).await?;
-        check_identity(kind, Some(ns), name, &value)?;
-        Ok(value)
+        get_named(client, kind, Some(ns), name, false).await
     }
 }

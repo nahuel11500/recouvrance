@@ -280,19 +280,10 @@ impl KubeMcp {
     ) -> Result<String, String> {
         let access = access_for(&kind, context, Verb::Get, Some(namespace.to_string()), Some(name.to_string()));
         self.authorize(&mut call, &access).await?;
-        let obj = k8s::ObjectRef {
-            kind: kind.clone(),
-            name: name.to_string(),
-            namespace: Some(namespace.to_string()),
-            uid: String::new(),
-        };
-        let app = match k8s::get_object(client, obj).await {
+        let app = match super::get_named(&client, &kind, Some(namespace), name, false).await {
             Ok(v) => v,
             Err(e) => return call.finish(Err(e)),
         };
-        if let Err(e) = super::check_identity(&kind, Some(namespace), name, &app) {
-            return call.finish(Err(e));
-        }
         let d = Diagnosis::of(&app, jiff::Timestamp::now());
         let (dest, _) = k8s::argo::destination_of(app.clone(), context.to_string(), Vec::new()).await;
         let s = k8s::argo::Summary::of(&app);
