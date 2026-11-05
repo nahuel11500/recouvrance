@@ -590,8 +590,7 @@ impl KubeMcp {
                 continue;
             }
             let Some(c) = crate::certs::of_tls_secret(sec) else { continue };
-            // Rounded down: negative as soon as the date has passed.
-            let days = c.not_after.map_or(i64::MAX, |t| (t.as_second() - now.as_second()).div_euclid(86400));
+            let days = c.not_after.map_or(i64::MAX, |t| crate::certs::days_left(t, now));
             // Not valid yet: clients reject it now, so it is listed first whatever the window.
             let early = c.not_yet_valid(now);
             if !early && p.within_days.is_some_and(|w| days > w) {

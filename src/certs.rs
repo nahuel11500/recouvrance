@@ -26,6 +26,25 @@ pub fn days_ago(t: jiff::Timestamp, now: jiff::Timestamp) -> i64 {
     (now.as_second() - t.as_second()).div_euclid(86400)
 }
 
+/// Whole days until `t`, rounded down: negative as soon as it has passed (-1 for a
+/// certificate that expired 3 hours ago; how long ago is told with `days_ago`).
+pub fn days_left(t: jiff::Timestamp, now: jiff::Timestamp) -> i64 {
+    (t.as_second() - now.as_second()).div_euclid(86400)
+}
+
+/// "1 day", "3 days".
+pub fn days_text(n: i64) -> String {
+    if n == 1 { "1 day".into() } else { format!("{n} days") }
+}
+
+/// How long ago `t` passed, in the days that went by: "less than a day ago", "1 day ago".
+pub fn ago_text(t: jiff::Timestamp, now: jiff::Timestamp) -> String {
+    match days_ago(t, now) {
+        n if n > 0 => format!("{} ago", days_text(n)),
+        _ => "less than a day ago".into(),
+    }
+}
+
 /// The certificate a `kubernetes.io/tls` Secret serves: the first in its `tls.crt` chain (the
 /// leaf). None when it holds no certificate.
 pub fn of_tls_secret(secret: &serde_json::Value) -> Option<CertInfo> {
