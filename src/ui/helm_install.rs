@@ -6,13 +6,14 @@ use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::input::{Editor, EditorState, Input, InputEvent, InputState};
 use gpui_kit::component::notification::Notification;
-use gpui_kit::component::{ActiveTheme as _, Disableable as _, Icon, Sizable as _, WindowExt as _, h_flex, v_flex};
+use gpui_kit::component::{ActiveTheme as _, Disableable as _, Sizable as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use serde::Deserialize;
 
 use crate::details::ConfirmButtons as _;
 use crate::k8s;
+use crate::ui::page_header::page_header;
 
 /// The values editor's text while the picked chart's values load.
 const LOADING_VALUES: &str = "# loading chart values…";
@@ -464,13 +465,13 @@ impl Render for HelmInstall {
             .size_full()
             .p_3()
             .gap_3()
-            .child(
-                h_flex()
-                    .gap_3()
-                    .child(Icon::new(Lucide::Ship).size_5().text_color(theme.blue))
-                    .child(div().text_xl().font_weight(FontWeight::MEDIUM).child("Install a chart"))
-                    .child(div().text_sm().text_color(muted).child(format!("on {} · via your helm CLI", self.context))),
-            )
+            .child(page_header(
+                Lucide::Ship,
+                Some(theme.blue),
+                "Install a chart",
+                format!("on {} · via your helm CLI", self.context),
+                cx,
+            ))
             .child(
                 h_flex()
                     .flex_1()

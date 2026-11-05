@@ -13,6 +13,7 @@ use crate::details::OpenObject;
 use crate::k8s::{self, Kind};
 use crate::problems::{self, Problem, Severity};
 use crate::ui::page_filter::PageFilter;
+use crate::ui::page_header::{page_header, scope_text};
 
 pub struct ProblemsView {
     /// Each cluster with the namespaces scanned there.
@@ -274,32 +275,28 @@ fn merge(results: Vec<(String, problems::Scan)>) -> (Vec<(String, Problem)>, Vec
 impl Render for ProblemsView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
-        let header = h_flex()
-            .gap_3()
-            .child(Icon::new(Lucide::TriangleAlert).size_5().text_color(theme.warning))
-            .child(div().text_xl().font_weight(FontWeight::MEDIUM).child("Problems"))
-            .child(div().text_sm().text_color(theme.muted_foreground).child(match self.namespaces.as_slice() {
-                [] => "all namespaces".into(),
-                chosen => format!("in {}", chosen.join(", ")),
-            }))
-            .child(div().flex_1())
-            .child(
-                Button::new("show-info")
-                    .small()
-                    .ghost()
-                    .label(if self.show_info { "Hide minor" } else { "Show minor" })
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.show_info = !this.show_info;
-                        cx.notify();
-                    })),
-            )
-            .child(Button::new("reload-problems").small().ghost().icon(Lucide::RefreshCw).label("Refresh").on_click(
-                cx.listener(|this, _, _, cx| {
-                    this.found = None;
-                    this.reload(cx);
-                    cx.notify();
-                }),
-            ));
+        let header =
+            page_header(Lucide::TriangleAlert, Some(theme.warning), "Problems", scope_text(&self.namespaces), cx)
+                .child(div().flex_1())
+                .child(
+                    Button::new("show-info")
+                        .small()
+                        .ghost()
+                        .label(if self.show_info { "Hide minor" } else { "Show minor" })
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.show_info = !this.show_info;
+                            cx.notify();
+                        })),
+                )
+                .child(
+                    Button::new("reload-problems").small().ghost().icon(Lucide::RefreshCw).label("Refresh").on_click(
+                        cx.listener(|this, _, _, cx| {
+                            this.found = None;
+                            this.reload(cx);
+                            cx.notify();
+                        }),
+                    ),
+                );
         let Some(found) = &self.found else {
             return v_flex().size_full().p_4().gap_4().child(header).child(
                 div().text_color(theme.muted_foreground).child(

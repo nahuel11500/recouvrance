@@ -12,6 +12,7 @@ use crate::details::OpenObject;
 use crate::k8s;
 use crate::latest::Latest;
 use crate::problems::Severity;
+use crate::ui::page_header::page_header;
 use crate::upgrade::{Finding, Report};
 
 /// Objects listed under a finding; the rest are counted.
@@ -262,18 +263,13 @@ impl Render for UpgradeView {
             .overflow_y_scroll()
             .p_4()
             .gap_8()
-            .child(
-                h_flex()
-                    .gap_3()
-                    .child(Icon::new(Lucide::CircleArrowUp).size_5().text_color(theme.blue))
-                    .child(div().text_xl().font_weight(FontWeight::MEDIUM).child("Upgrade check"))
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(theme.muted_foreground)
-                            .child("What needs action before a cluster moves to a newer minor version"),
-                    ),
-            )
+            .child(page_header(
+                Lucide::CircleArrowUp,
+                Some(theme.blue),
+                "Upgrade check",
+                "What needs action before a cluster moves to a newer minor version",
+                cx,
+            ))
             .children(clusters)
     }
 }
