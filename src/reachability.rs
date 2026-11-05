@@ -988,11 +988,7 @@ fn cert_verdict(secret: &Value, hosts: &[&str], now: jiff::Timestamp) -> (State,
     if let Some(end) = cert.not_after
         && end < now
     {
-        let ago = match crate::certs::days_ago(end, now) {
-            0 => "today".to_string(),
-            1 => "1 day ago".to_string(),
-            n => format!("{n} days ago"),
-        };
+        let ago = crate::certs::ago_text(end, now);
         return (State::Broken, format!("Expired {ago} ({}): clients reject it.", date(Some(end))));
     }
     let sans: Vec<String> = cert.sans.iter().map(|n| n.to_lowercase()).collect();
@@ -1004,9 +1000,9 @@ fn cert_verdict(secret: &Value, hosts: &[&str], now: jiff::Timestamp) -> (State,
         return (State::Broken, format!("It does not cover {}: it names {has}.", uncovered.join(", ")));
     }
     let until = date(cert.not_after);
-    let days = cert.not_after.map_or(i64::MAX, |t| (t.as_second() - now.as_second()).div_euclid(86400));
+    let days = cert.not_after.map_or(i64::MAX, |t| crate::certs::days_left(t, now));
     if days < 14 {
-        return (State::Warn, format!("Expires in {days} day(s), on {until}."));
+        return (State::Warn, format!("Expires in {}, on {until}.", crate::certs::days_text(days)));
     }
     let covers = if hosts.is_empty() { String::new() } else { format!("; covers {}", hosts.join(", ")) };
     (State::Ok, format!("Valid until {until}{covers}."))
@@ -1604,7 +1600,7 @@ mod tests {
         // Expired: the days that went by, rounded down (3 hours is today, not "-1 days").
         let (state, detail) = of_test_cert(&["test.example"], end + hours(3));
         assert_eq!(state, State::Broken);
-        assert!(detail.starts_with("Expired today"));
+        assert!(detail.starts_with("Expired less than a day ago"));
         assert!(of_test_cert(&["test.example"], end + hours(24 * 3 + 1)).1.starts_with("Expired 3 days ago"));
         assert_eq!(of_test_cert(&["test.example"], start - hours(1)).0, State::Broken);
         // Expiring soon is a warning.
