@@ -24,6 +24,7 @@ mod pods;
 mod usage;
 mod workloads;
 
+use crate::json::{arr_at as arr, i64_at as n, str_at as s};
 use access::{binding_page, role_page, service_account_page};
 pub(crate) use config::*;
 pub(crate) use network::same_parent;
@@ -217,18 +218,6 @@ impl Ctx<'_> {
             })
             .child(selectable(text))
     }
-}
-
-fn s<'a>(v: &'a Value, path: &str) -> Option<&'a str> {
-    v.pointer(path).and_then(Value::as_str)
-}
-
-fn n(v: &Value, path: &str) -> Option<i64> {
-    v.pointer(path).and_then(Value::as_i64)
-}
-
-fn arr<'a>(v: &'a Value, path: &str) -> &'a [Value] {
-    v.pointer(path).and_then(Value::as_array).map_or(&[][..], Vec::as_slice)
 }
 
 fn age_of(v: &Value, path: &str) -> Option<String> {

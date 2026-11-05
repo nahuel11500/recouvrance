@@ -13,6 +13,7 @@ use kube::Client;
 use serde_json::Value;
 
 use crate::details::OpenObject;
+use crate::json::{str_or_empty as st, time_at as ts};
 use crate::k8s;
 use crate::status::Tone;
 
@@ -265,14 +266,6 @@ async fn list(client: &Client, ar: kube::discovery::ApiResource, ns: Option<&str
 
 fn n(v: &Value, p: &str) -> i64 {
     v.pointer(p).and_then(Value::as_i64).unwrap_or(0)
-}
-
-fn st<'a>(v: &'a Value, p: &str) -> &'a str {
-    v.pointer(p).and_then(Value::as_str).unwrap_or_default()
-}
-
-fn ts(v: &Value, p: &str) -> Option<jiff::Timestamp> {
-    v.pointer(p).and_then(Value::as_str).and_then(|t| t.parse().ok())
 }
 
 fn tally<L: Into<String>>(items: impl Iterator<Item = (L, Tone)>) -> Vec<(String, usize, Tone)> {

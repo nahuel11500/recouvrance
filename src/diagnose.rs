@@ -1,6 +1,7 @@
 //! "Why is this broken?": plain-language findings for a pod or workload, from its
 //! status, events and the last lines its crashed containers wrote.
 
+use crate::json::str_or_empty as s;
 use serde_json::Value;
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
@@ -20,10 +21,6 @@ pub struct Finding {
 
 /// An event as diagnosis needs it: (type, reason, message, count).
 pub type Ev<'a> = (&'a str, &'a str, &'a str, i32);
-
-fn s<'a>(v: &'a Value, p: &str) -> &'a str {
-    v.pointer(p).and_then(Value::as_str).unwrap_or("")
-}
 
 fn statuses(pod: &Value) -> impl Iterator<Item = (&Value, bool)> {
     let get = |p: &str| pod.pointer(p).and_then(Value::as_array).map_or(&[][..], Vec::as_slice);

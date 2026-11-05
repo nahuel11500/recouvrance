@@ -17,6 +17,7 @@ use kube::discovery::ApiResource;
 use serde_json::Value;
 
 use super::{HELD_PARALLEL, Problem, Scan, Severity, cell, since};
+use crate::json::nonempty_at as text;
 use crate::k8s::{self, ColumnDef, Kind, Row, Selection};
 
 /// The Gateway API's group, for HTTP routes.
@@ -105,10 +106,6 @@ impl Target {
             _ => format!("{} {}", self.of.kind(), self.name),
         }
     }
-}
-
-fn text<'a>(v: &'a Value, pointer: &str) -> Option<&'a str> {
-    v.pointer(pointer).and_then(Value::as_str).filter(|s| !s.is_empty())
 }
 
 fn items(v: &Value) -> impl Iterator<Item = &Value> {

@@ -14,6 +14,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::details::OpenObject;
+use crate::json::str_or_empty as st;
 use crate::k8s;
 
 #[derive(Default)]
@@ -136,10 +137,6 @@ impl ClusterOverview {
 /// GPUs in a resource list: every extended resource whose name ends in `/gpu`.
 fn gpu_count(resources: &HashMap<String, String>) -> f64 {
     resources.iter().filter(|(k, _)| k.ends_with("/gpu")).filter_map(|(_, v)| v.parse::<f64>().ok()).sum()
-}
-
-fn st<'a>(v: &'a Value, p: &str) -> &'a str {
-    v.pointer(p).and_then(Value::as_str).unwrap_or_default()
 }
 
 // Only the fields the overview reads: big clusters' pods and nodes are never held as JSON.
