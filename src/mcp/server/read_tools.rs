@@ -416,14 +416,8 @@ impl KubeMcp {
         let (client, kind) = self.kind(&call, &p.context, "pods").await?;
         let access = access_for(&kind, &p.context, Verb::List, p.namespace.clone(), None);
         self.authorize_list(&mut call, &access, p.namespace.is_none()).await?;
-        let usage = match &p.namespace {
-            Some(ns) => k8s::container_usage(client, ns.clone(), None)
-                .await
-                .map(|u| u.into_iter().map(|(pod, c)| ((ns.clone(), pod), c)).collect::<Vec<_>>()),
-            None => k8s::all_container_usage(client).await,
-        };
-        let usage = match usage {
-            Ok(u) => u,
+        let usage = match k8s::pod_usage(client, p.namespace.clone(), None).await {
+            Ok((u, _)) => u,
             Err(e) => return call.finish(Err(e)),
         };
         let mut rows: Vec<(String, String, f64, f64)> = usage
