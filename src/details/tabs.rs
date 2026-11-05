@@ -503,37 +503,11 @@ impl Render for DetailPanel {
                     .pt_3()
                     .pb_1()
                     .gap_0p5()
-                    .child(
-                        h_flex()
-                            .gap_1()
-                            .text_xs()
-                            .text_color(theme.muted_foreground)
-                            .child(selectable(self.context.clone()))
-                            .child("·")
-                            .child(div().text_color(theme.blue).child(selectable(self.obj.kind.ar.kind.clone()))),
-                    )
+                    .child(heading_path(&self.context, &self.obj.kind.ar.kind, cx))
                     .child(
                         h_flex()
                             .gap_2()
-                            .child(
-                                h_flex()
-                                    .min_w_0()
-                                    .text_xl()
-                                    .overflow_hidden()
-                                    .whitespace_nowrap()
-                                    .when_some(self.obj.namespace.clone(), |d, ns| {
-                                        d.child(
-                                            div()
-                                                .text_color(theme.muted_foreground)
-                                                .child(selectable(format!("{ns} / "))),
-                                        )
-                                    })
-                                    .child(
-                                        div()
-                                            .font_weight(FontWeight::SEMIBOLD)
-                                            .child(selectable(self.obj.name.clone())),
-                                    ),
-                            )
+                            .child(heading_name(self.obj.namespace.as_deref(), &self.obj.name, cx))
                             .child({
                                 let fav = FavObject {
                                     context: self.context.clone(),
@@ -643,4 +617,30 @@ pub(super) fn error_box(msg: SharedString, cx: &App) -> impl IntoElement {
         .text_color(cx.theme().danger)
         .text_sm()
         .child(selectable(msg))
+}
+
+/// The first line of an object's page: its context and its kind, selectable.
+pub(crate) fn heading_path(context: &str, kind: &str, cx: &App) -> Div {
+    let theme = cx.theme();
+    h_flex()
+        .gap_1()
+        .text_xs()
+        .text_color(theme.muted_foreground)
+        .child(selectable(context.to_string()))
+        .child("·")
+        .child(div().text_color(theme.blue).child(selectable(kind.to_string())))
+}
+
+/// An object's name as its page's title, after its namespace: "shop / web", selectable,
+/// cut when the window is narrow.
+pub(crate) fn heading_name(namespace: Option<&str>, name: &str, cx: &App) -> Div {
+    h_flex()
+        .min_w_0()
+        .text_xl()
+        .overflow_hidden()
+        .whitespace_nowrap()
+        .when_some(namespace, |d, ns| {
+            d.child(div().text_color(cx.theme().muted_foreground).child(selectable(format!("{ns} / "))))
+        })
+        .child(div().font_weight(FontWeight::SEMIBOLD).child(selectable(name.to_string())))
 }

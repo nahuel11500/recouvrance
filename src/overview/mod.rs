@@ -236,7 +236,7 @@ fn age_of(v: &Value, path: &str) -> Option<String> {
 }
 
 /// A muted label above a value. Both can be selected, the value when it is text.
-fn field(label: &str, value: impl Shown, cx: &App) -> Div {
+pub(crate) fn field(label: &str, value: impl Shown, cx: &App) -> Div {
     v_flex()
         .min_w(px(160.))
         .gap_0p5()
@@ -245,7 +245,7 @@ fn field(label: &str, value: impl Shown, cx: &App) -> Div {
 }
 
 /// A field's value: text is drawn selectable, an element as it is.
-trait Shown {
+pub(crate) trait Shown {
     fn shown(self) -> AnyElement;
 }
 

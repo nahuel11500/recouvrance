@@ -38,6 +38,7 @@ use history::HistoryState;
 pub(crate) use logs::*;
 use related::{container_history_for, container_names, fetch_related, gpu_history_for, history_for};
 use tabs::error_box;
+pub(crate) use tabs::{heading_name, heading_path};
 
 #[derive(Clone, Copy, PartialEq)]
 enum DetailTab {
