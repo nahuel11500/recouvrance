@@ -223,8 +223,8 @@ struct CompareState {
     /// Candidates were listed (or are being listed): never list them again.
     candidates_loaded: bool,
     _candidates: Option<Task<()>>,
-    /// The comparison being fetched; replacing it cancels the previous one.
-    _compare: Option<Task<()>>,
+    /// The comparison being fetched: a new one replaces (and cancels) it.
+    fetch: crate::latest::Latest,
 }
 
 impl DetailPanel {

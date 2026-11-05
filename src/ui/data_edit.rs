@@ -50,7 +50,10 @@ pub struct DataEditor {
     registry: [Entity<InputState>; 4],
     status: Option<(bool, String)>,
     busy: bool,
-    _task: Option<Task<()>>,
+    /// The server dry run before the confirmation, and the write after it: kept apart, so
+    /// neither drops the other.
+    _dry_run: Option<Task<()>>,
+    _write: Option<Task<()>>,
 }
 
 /// A stored value as the form shows it.
@@ -128,7 +131,8 @@ impl DataEditor {
             registry,
             status: None,
             busy: false,
-            _task: None,
+            _dry_run: None,
+            _write: None,
         };
         match original.as_ref().and_then(|o| o.get("data")).and_then(|d| d.as_object()) {
             Some(data) => {
@@ -300,7 +304,7 @@ impl DataEditor {
         cx.notify();
         let dry = send(creating, client.clone(), kind.clone(), ns.clone(), obj.clone(), true);
         let me = cx.entity().downgrade();
-        self._task = Some(cx.spawn_in(window, async move |this, cx| {
+        self._dry_run = Some(cx.spawn_in(window, async move |this, cx| {
             let check = dry.await;
             let _ = this.update_in(cx, |this, window, cx| {
                 this.busy = false;
@@ -361,7 +365,7 @@ impl DataEditor {
     ) {
         self.busy = true;
         cx.notify();
-        self._task = Some(cx.spawn_in(window, async move |this, cx| {
+        self._write = Some(cx.spawn_in(window, async move |this, cx| {
             let r = fut.await;
             let _ = this.update_in(cx, |this, window, cx| {
                 this.busy = false;
