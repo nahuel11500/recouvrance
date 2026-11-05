@@ -42,6 +42,7 @@ impl AppView {
             "apply" => self.open_apply(window, cx),
             "helm" => self.open_helm(window, cx),
             "assistant" => self.open_assistant(window, cx),
+            "assistant-dock" => self.toggle_assistant(window, cx),
             "settings" => self.navigate(Route::Settings, cx),
             "agents" => self.navigate(Route::Agents, cx),
             "contexts" => self.navigate(Route::Contexts, cx),

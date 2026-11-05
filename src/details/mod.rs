@@ -228,6 +228,11 @@ struct CompareState {
 }
 
 impl DetailPanel {
+    /// The object shown, with its context.
+    pub fn subject(&self) -> (String, ObjectRef) {
+        (self.context.clone(), self.obj.clone())
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         client: Client,

@@ -137,7 +137,10 @@ impl AppView {
                 &ev.name,
                 &ev.findings,
             );
-            this.open_assistant(window, cx);
+            // Beside the page when the assistant is there, else on its own page.
+            if this.docked_assistant().is_none() {
+                this.open_assistant(window, cx);
+            }
             if let Some(page) = this.assistant_page() {
                 page.update(cx, |a, cx| a.start_over(q, cx));
             }
@@ -337,46 +340,115 @@ impl AppView {
     }
 
     fn assistant_page(&self) -> Option<Entity<crate::ui::assistant_view::AssistantView>> {
-        self.history.iter().find_map(|r| match r {
-            Route::Assistant(e) => Some(e.clone()),
-            _ => None,
+        self.assistant.clone()
+    }
+
+    /// The window's assistant chat, made on first use and kept across pages and tabs.
+    fn assistant_chat(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<crate::ui::assistant_view::AssistantView> {
+        let scope = self.assistant_scope(cx);
+        if let Some(p) = &self.assistant {
+            p.update(cx, |p, cx| p.set_scope(scope, cx));
+            return p.clone();
+        }
+        let hub = self.hub.clone();
+        let page = cx.new(|cx| crate::ui::assistant_view::AssistantView::new(hub, scope, window, cx));
+        cx.subscribe_in(&page, window, |this, _, ev: &crate::ui::assistant_view::DockEvent, window, cx| match ev {
+            crate::ui::assistant_view::DockEvent::Close => {
+                this.assistant_docked = false;
+                cx.notify();
+            }
+            crate::ui::assistant_view::DockEvent::Expand => this.open_assistant(window, cx),
         })
+        .detach();
+        self.assistant = Some(page.clone());
+        page
     }
 
     /// One assistant chat per window, kept across navigation.
     pub(super) fn open_assistant(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let scope = self.assistant_scope();
-        let page = if let Some(p) = self.assistant_page() {
-            p.update(cx, |p, cx| p.set_scope(scope, cx));
-            p
-        } else {
-            let hub = self.hub.clone();
-            cx.new(|cx| crate::ui::assistant_view::AssistantView::new(hub, scope, window, cx))
-        };
+        let page = self.assistant_chat(window, cx);
+        // On its page, it is not beside it too.
+        self.assistant_docked = false;
+        page.update(cx, |p, cx| p.set_docked(false, cx));
         self.navigate(Route::Assistant(page), cx);
     }
 
-    /// What the assistant is told the user is looking at.
-    fn assistant_scope(&self) -> String {
-        let (contexts, namespaces) = self.page_scope();
-        scope_text(&contexts, &namespaces)
+    /// Show or hide the assistant beside the page (Ctrl+J). On the assistant's own page it
+    /// opens beside the page before it.
+    pub(super) fn toggle_assistant(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let page = self.assistant_chat(window, cx);
+        if matches!(self.route(), Route::Assistant(_)) {
+            self.go(-1, cx);
+            self.assistant_docked = !matches!(self.route(), Route::Assistant(_));
+        } else {
+            self.assistant_docked = !self.assistant_docked;
+        }
+        page.update(cx, |p, cx| p.set_docked(self.assistant_docked, cx));
+        if self.assistant_docked {
+            page.update(cx, |p, cx| p.focus_input(window, cx));
+        }
+        cx.notify();
     }
 
-    /// Tell open assistant chats, in every tab, about a new namespace selection.
-    pub(super) fn update_assistant_scope(&self, cx: &mut Context<Self>) {
-        let pages: Vec<_> = self
-            .history
-            .iter()
-            .chain(self.tabs.iter().flat_map(|t| t.history.iter()))
-            .filter_map(|r| match r {
-                Route::Assistant(e) => Some(e.clone()),
-                _ => None,
-            })
-            .collect();
-        let scope = self.assistant_scope();
-        for page in pages {
-            page.update(cx, |p, cx| p.set_scope(scope.clone(), cx));
+    /// The assistant beside the page, when it is open and the page is not its own.
+    pub(super) fn docked_assistant(&self) -> Option<Entity<crate::ui::assistant_view::AssistantView>> {
+        let own_page = matches!(self.route(), Route::Assistant(_));
+        self.assistant.clone().filter(|_| self.assistant_docked && !own_page)
+    }
+
+    /// What the assistant is told the user is looking at: the clusters and namespaces, and
+    /// the page on screen (an object, a list and its filter, Problems...).
+    pub(super) fn assistant_scope(&self, cx: &App) -> String {
+        let (contexts, namespaces) = self.page_scope();
+        let base = scope_text(&contexts, &namespaces);
+        match self.on_screen(cx).text() {
+            Some(page) => format!("{base}; on screen: {page}"),
+            None => base,
         }
+    }
+
+    fn on_screen(&self, cx: &App) -> OnScreen {
+        let context_of = |i: usize| self.clusters.get(i).map(|(c, _)| c.clone()).unwrap_or_default();
+        match self.route() {
+            Route::Detail(d) => {
+                let (context, obj) = d.read(cx).subject();
+                OnScreen::Object { kind: obj.kind.ar.kind, namespace: obj.namespace, name: obj.name, context }
+            }
+            Route::Resources(Some(kind)) => {
+                let d = self.table.read(cx).delegate();
+                let selected = d.selected.as_ref().and_then(|(ctx, uid)| {
+                    let row = d.find_row(*ctx, uid)?;
+                    Some((context_of(*ctx), row.namespace.clone(), row.name.clone()))
+                });
+                OnScreen::List {
+                    kind: kind.ar.kind.clone(),
+                    filter: self.filter.read(cx).value().trim().to_string(),
+                    selected,
+                }
+            }
+            Route::HelmRelease(h) => {
+                let (context, namespace, name) = h.read(cx).subject();
+                OnScreen::Object { kind: "Helm release".into(), namespace: Some(namespace), name, context }
+            }
+            Route::Problems(_) => OnScreen::Page("the Problems page (what is broken)"),
+            Route::Timeline(_) => OnScreen::Page("the Timeline page (recent changes and events)"),
+            Route::Workloads(_) => OnScreen::Page("the Workloads overview"),
+            Route::Cluster(_) => OnScreen::Page("the Cluster overview"),
+            Route::Helm(_) => OnScreen::Page("the list of Helm releases"),
+            Route::Argo(_) => OnScreen::Page("the Argo CD Applications page"),
+            _ => OnScreen::Nothing,
+        }
+    }
+
+    /// Tell the assistant chat about a new namespace selection or page.
+    pub(super) fn update_assistant_scope(&self, cx: &mut Context<Self>) {
+        let Some(page) = self.assistant.clone() else { return };
+        let scope = self.assistant_scope(cx);
+        page.update(cx, |p, cx| p.set_scope(scope, cx));
     }
 
     pub(super) fn open_helm_install(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -506,6 +578,51 @@ impl AppView {
     }
 }
 
+/// The page on screen, as the assistant is told about it.
+#[derive(Debug, PartialEq)]
+enum OnScreen {
+    Object {
+        kind: String,
+        namespace: Option<String>,
+        name: String,
+        context: String,
+    },
+    /// A list: its kind, its filter, and the row selected (context, namespace, name).
+    List {
+        kind: String,
+        filter: String,
+        selected: Option<(String, Option<String>, String)>,
+    },
+    Page(&'static str),
+    Nothing,
+}
+
+impl OnScreen {
+    fn text(&self) -> Option<String> {
+        let place = |ns: &Option<String>, name: &str| match ns {
+            Some(ns) => format!("{ns}/{name}"),
+            None => name.to_string(),
+        };
+        Some(match self {
+            Self::Object { kind, namespace, name, context } => {
+                format!("the page of {kind} {} on context {context}", place(namespace, name))
+            }
+            Self::List { kind, filter, selected } => {
+                let mut s = format!("the list of {kind} objects");
+                if !filter.is_empty() {
+                    s.push_str(&format!(" filtered by `{filter}`"));
+                }
+                if let Some((context, ns, name)) = selected {
+                    s.push_str(&format!(", row selected: {kind} {} on context {context}", place(ns, name)));
+                }
+                s
+            }
+            Self::Page(p) => (*p).to_string(),
+            Self::Nothing => return None,
+        })
+    }
+}
+
 /// What the assistant is told about `contexts` and the namespace picked.
 fn scope_text(contexts: &[String], namespaces: &[String]) -> String {
     if contexts.is_empty() {
@@ -522,7 +639,32 @@ fn scope_text(contexts: &[String], namespaces: &[String]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::scope_text;
+    use super::{OnScreen, scope_text};
+
+    #[test]
+    fn the_assistant_is_told_what_is_on_screen() {
+        let pod = OnScreen::Object {
+            kind: "Pod".into(),
+            namespace: Some("monitoring".into()),
+            name: "prom-0".into(),
+            context: "prod".into(),
+        };
+        assert_eq!(pod.text().unwrap(), "the page of Pod monitoring/prom-0 on context prod");
+        let node = OnScreen::Object { kind: "Node".into(), namespace: None, name: "n1".into(), context: "prod".into() };
+        assert_eq!(node.text().unwrap(), "the page of Node n1 on context prod");
+        let list = OnScreen::List {
+            kind: "Deployment".into(),
+            filter: "web".into(),
+            selected: Some(("prod".into(), Some("shop".into()), "web".into())),
+        };
+        assert_eq!(
+            list.text().unwrap(),
+            "the list of Deployment objects filtered by `web`, row selected: Deployment shop/web on context prod"
+        );
+        let plain = OnScreen::List { kind: "Pod".into(), filter: String::new(), selected: None };
+        assert_eq!(plain.text().unwrap(), "the list of Pod objects");
+        assert_eq!(OnScreen::Nothing.text(), None);
+    }
 
     #[test]
     fn the_assistant_scope_names_the_namespace_picked_now() {

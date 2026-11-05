@@ -19,8 +19,18 @@ enum Entry {
     Error(String),
 }
 
+/// What the chat asks of the window when shown beside a page.
+pub enum DockEvent {
+    /// Hide it.
+    Close,
+    /// Show it on its own page.
+    Expand,
+}
+
 pub struct AssistantView {
     hub: Arc<Hub>,
+    /// Shown beside a page (Ctrl+J) rather than on its own.
+    docked: bool,
     /// What the user is looking at, given to the model.
     scope: String,
     conv: assistant::Conversation,
@@ -39,6 +49,11 @@ pub struct AssistantView {
     _task: Option<Task<()>>,
     _subs: Vec<Subscription>,
 }
+
+impl EventEmitter<DockEvent> for AssistantView {}
+
+/// Asked first beside a page: the model is told what is on screen.
+const ON_SCREEN: &str = "Explain what I am looking at, how it is set up, and whether anything looks off.";
 
 const SUGGESTIONS: [&str; 4] = [
     "What is broken right now, and why?",
@@ -92,6 +107,7 @@ impl AssistantView {
         let entries = Vec::new();
         Self {
             hub,
+            docked: false,
             scope,
             conv: Default::default(),
             entries,
@@ -114,6 +130,19 @@ impl AssistantView {
             self.scope = scope;
             cx.notify();
         }
+    }
+
+    /// Shown beside a page, or on its own.
+    pub fn set_docked(&mut self, docked: bool, cx: &mut Context<Self>) {
+        if self.docked != docked {
+            self.docked = docked;
+            cx.notify();
+        }
+    }
+
+    /// Put the cursor in the question field.
+    pub fn focus_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.input.update(cx, |s, cx| s.focus(window, cx));
     }
 
     /// A new chat with this question, stopping the one running.
@@ -401,32 +430,56 @@ impl Render for AssistantView {
         v_flex()
             .size_full()
             .child(
-                h_flex()
-                    .gap_3()
+                v_flex()
+                    .gap_1()
                     .px_4()
                     .py_3()
                     .border_b_1()
                     .border_color(theme.border)
-                    .child(Icon::new(Lucide::Sparkles).size_5().text_color(theme.blue))
-                    .child(div().text_lg().font_weight(FontWeight::SEMIBOLD).child("Assistant"))
-                    .child(div().text_sm().text_color(muted).child(format!(
+                    .child(
+                        h_flex()
+                            .gap_3()
+                            .child(Icon::new(Lucide::Sparkles).size_5().text_color(theme.blue))
+                            .child(div().text_lg().font_weight(FontWeight::SEMIBOLD).child("Assistant"))
+                            .child(div().flex_1())
+                            .child(
+                                Button::new("new-chat")
+                                    .small()
+                                    .ghost()
+                                    .icon(Lucide::Plus)
+                                    .when(!self.docked, |b| b.label("New chat"))
+                                    .tooltip("New chat")
+                                    .disabled(self.busy)
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.clear();
+                                        cx.notify();
+                                    })),
+                            )
+                            .when(self.docked, |d| {
+                                d.child(
+                                    Button::new("expand-assistant")
+                                        .small()
+                                        .ghost()
+                                        .icon(Lucide::Maximize2)
+                                        .tooltip("Open the assistant's page")
+                                        .on_click(cx.listener(|_, _, _, cx| cx.emit(DockEvent::Expand))),
+                                )
+                                .child(
+                                    Button::new("close-assistant")
+                                        .small()
+                                        .ghost()
+                                        .icon(Lucide::X)
+                                        .tooltip("Hide the assistant (Ctrl+J)")
+                                        .on_click(cx.listener(|_, _, _, cx| cx.emit(DockEvent::Close))),
+                                )
+                            }),
+                    )
+                    // What the model is told: the clusters, namespaces and the page on screen.
+                    .child(div().text_xs().text_color(muted).child(format!(
                         "{} · as agent \"{}\" · {via}",
                         self.scope,
                         assistant::AGENT_NAME
-                    )))
-                    .child(div().flex_1())
-                    .child(
-                        Button::new("new-chat")
-                            .small()
-                            .ghost()
-                            .icon(Lucide::Plus)
-                            .label("New chat")
-                            .disabled(self.busy)
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.clear();
-                                cx.notify();
-                            })),
-                    ),
+                    ))),
             )
             .child(
                 div().flex_1().min_h_0().child(
@@ -444,8 +497,9 @@ impl Render for AssistantView {
                                 .max_w(px(CHAT_WIDTH))
                                 .gap_4()
                                 .when(self.entries.is_empty(), |d| {
+                                    let docked = self.docked.then_some(ON_SCREEN);
                                     d.child(div().text_sm().text_color(muted).child("Try:")).children(
-                                        SUGGESTIONS.iter().enumerate().map(|(i, s)| {
+                                        docked.iter().chain(SUGGESTIONS.iter()).enumerate().map(|(i, s)| {
                                             let q = s.to_string();
                                             Button::new(("suggest", i))
                                                 .outline()

@@ -214,6 +214,12 @@
   Secret's values never are. The field managers that wrote the object since the last sync are
   named too (with server-side apply that is all there is). A destination that isn't connected
   is said; open it to connect.
+- **Assistant beside any page** (Ctrl+J, or the sparkles button in the top bar): the window's
+  assistant chat opens on the right of the page shown, the same chat as on its own page (the
+  expand button opens it there). It is told what is on screen, as its header shows: the
+  clusters and namespaces picked, and the object whose page is open (with its context), or the
+  list with its filter and the row selected, or the page (Problems, Timeline, overviews, Helm,
+  Argo CD). A page's *Investigate* asks it beside the page when it is open there.
 - **Overviews**: cluster capacity and health, workloads status, Helm releases (values masked; install from your repos, roll back and uninstall through your `helm` CLI).
 - **API requests** (Settings → API requests): per cluster, how many requests of each kind
   (discovery, lists, watches, metrics, logs, shells, writes) were made, how many failed, and how
@@ -308,6 +314,7 @@
 | Ctrl+F or / | Filter the current table: `web` · `!Running` · `app=web` · `tier!=db` · `l:app` · `ns:team-*` · `/^api-\d+/` · `status:Running` · `restarts>3` · `cpu>200m` (all terms must match) |
 | j / k / Enter | Move the selection in a table / open the selected row |
 | g then p / o / w / h / i / s | Go to Problems / Cluster overview / Workloads overview / Helm / Assistant / Settings |
+| Ctrl+J | Show or hide the assistant beside the page: it is told what is on screen |
 | ? | List the keyboard shortcuts |
 | Right-click a row | Open, logs, shell, YAML, events, copy name, favorite |
 

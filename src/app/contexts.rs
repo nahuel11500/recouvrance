@@ -177,6 +177,7 @@ impl AppView {
                             Some("access") => this.open_access(window, cx),
                             Some("helm-install") => this.open_helm_install(window, cx),
                             Some("assistant") => this.open_assistant(window, cx),
+                            Some("assistant-dock") => this.toggle_assistant(window, cx),
                             _ => {}
                         }
                     }

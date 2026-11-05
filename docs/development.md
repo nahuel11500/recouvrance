@@ -38,7 +38,7 @@ RECOUVRANCE_CONTEXT=kind-dev RECOUVRANCE_KIND=pods RECOUVRANCE_NS=default RECOUV
 RECOUVRANCE_TAB=logs cargo run --features dev -- --snapshot out.png 8
 ```
 
-Useful variables: `RECOUVRANCE_PAGE` (`apply`, `settings`, `cluster`, `access`…),
+Useful variables: `RECOUVRANCE_PAGE` (`apply`, `settings`, `cluster`, `access`, `assistant-dock`…),
 `RECOUVRANCE_FILTER`, `RECOUVRANCE_ACT` (comma-separated hooks, see `src/app/demo.rs` and
 `src/details/demo.rs`), `RECOUVRANCE_INPUT` (`click:x,y;key:enter;wait:2`), `RECOUVRANCE_WRITES=1`,
 `RECOUVRANCE_DARK=1`, `RECOUVRANCE_ZOOM`. Point `XDG_CONFIG_HOME` at a scratch folder to keep your

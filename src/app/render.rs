@@ -6,8 +6,8 @@ use gpui_kit::component::input::Input;
 use gpui_kit::component::popover::Popover;
 use gpui_kit::component::table::DataTable;
 use gpui_kit::component::{
-    ActiveTheme as _, Icon, IconName, Sizable as _, Theme, ThemeMode, TitleBar, WindowExt as _, h_flex, h_resizable,
-    resizable_panel, v_flex,
+    ActiveTheme as _, Icon, IconName, Selectable as _, Sizable as _, Theme, ThemeMode, TitleBar, WindowExt as _,
+    h_flex, h_resizable, resizable_panel, v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -16,7 +16,8 @@ use super::{
     AppView, CloseTab, EscapeBack, FocusFilter, GoAssistant, GoBack, GoCluster, GoForward, GoHelm, GoProblems,
     GoSettings, GoWorkloads, NewTab, NewWindow, NextTab, OpenPalette, OpenSelected, PrevTab, RefreshPage, Route,
     RowCopyName, RowDelete, RowEvents, RowFavorite, RowLogs, RowOpen, RowOpenTab, RowRestart, RowRun, RowScale,
-    RowShell, RowYaml, ShowShortcuts, ToggleSidebar, ZoomIn, ZoomOut, ZoomReset, open_main_window, set_theme,
+    RowShell, RowYaml, ShowShortcuts, ToggleAssistant, ToggleSidebar, ZoomIn, ZoomOut, ZoomReset, open_main_window,
+    set_theme,
 };
 use crate::favorites::FavObject;
 
@@ -25,10 +26,23 @@ impl Render for AppView {
         #[cfg(feature = "dev")]
         let _t = crate::dev::timing::span("app render");
         self.keep_focus(window, cx);
+        let page = self.render_content(cx);
+        // The assistant beside the page, told what is on screen now.
+        let page = match self.docked_assistant() {
+            Some(assistant) => {
+                let scope = self.assistant_scope(cx);
+                assistant.update(cx, |a, cx| a.set_scope(scope, cx));
+                h_resizable("assistant-dock")
+                    .child(resizable_panel().child(page))
+                    .child(resizable_panel().size(px(420.)).size_range(px(300.)..px(900.)).child(assistant))
+                    .into_any_element()
+            }
+            None => page,
+        };
         let content = v_flex()
             .size_full()
             .children(self.render_tabs(cx))
-            .child(div().flex_1().min_h_0().child(self.render_content(cx)))
+            .child(div().flex_1().min_h_0().child(page))
             .into_any_element();
         let body = if self.sidebar_hidden {
             div().size_full().child(content).into_any_element()
@@ -155,6 +169,15 @@ impl AppView {
                     .on_click(cx.listener(|this, _, window, cx| this.open_palette(window, cx))),
             )
             .child(write_mode_button(cx))
+            .child(
+                Button::new("toggle-assistant")
+                    .ghost()
+                    .small()
+                    .icon(Lucide::Sparkles)
+                    .selected(self.docked_assistant().is_some())
+                    .tooltip("Ask the assistant about what is on screen (Ctrl+J)")
+                    .on_click(cx.listener(|this, _, window, cx| this.toggle_assistant(window, cx))),
+            )
             .child(
                 Button::new("create")
                     .ghost()
@@ -414,6 +437,7 @@ impl AppView {
             .on_action(cx.listener(|this, _: &GoWorkloads, window, cx| this.open_workloads(window, cx)))
             .on_action(cx.listener(|this, _: &GoHelm, window, cx| this.open_helm(window, cx)))
             .on_action(cx.listener(|this, _: &GoAssistant, window, cx| this.open_assistant(window, cx)))
+            .on_action(cx.listener(|this, _: &ToggleAssistant, window, cx| this.toggle_assistant(window, cx)))
             .on_action(cx.listener(|this, _: &GoSettings, _, cx| this.navigate(Route::Settings, cx)))
             .on_action(cx.listener(|this, _: &FocusFilter, window, cx| {
                 this.filter.update(cx, |s, cx| s.focus(window, cx));
