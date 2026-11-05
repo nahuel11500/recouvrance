@@ -190,9 +190,15 @@ pub fn api_status(e: &anyhow::Error) -> Option<u16> {
     })
 }
 
+/// How long ago `t` was, as kubectl's AGE column says it: "45s", "3m", "5h", "3d", "2y".
 pub fn age(t: jiff::Timestamp) -> String {
-    let secs = (jiff::Timestamp::now().as_second() - t.as_second()).max(0);
-    match secs {
+    duration_text(jiff::Timestamp::now().as_second() - t.as_second())
+}
+
+/// A duration as kubectl says it, in its largest unit with at least two of them: "45s",
+/// "3m", "5h", "3d", "2y". Negative counts as 0.
+pub fn duration_text(secs: i64) -> String {
+    match secs.max(0) {
         s if s < 120 => format!("{s}s"),
         s if s < 3600 * 2 => format!("{}m", s / 60),
         s if s < 86400 * 2 => format!("{}h", s / 3600),
@@ -421,6 +427,17 @@ mod selector_tests {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn durations_in_their_largest_unit() {
+        use super::duration_text as d;
+        assert_eq!(d(-5), "0s");
+        assert_eq!(d(119), "119s");
+        assert_eq!(d(150), "2m");
+        assert_eq!(d(3 * 3600), "3h");
+        assert_eq!(d(3 * 86400 + 5), "3d");
+        assert_eq!(d(3 * 365 * 86400), "3y");
+    }
+
     use super::*;
 
     #[test]
