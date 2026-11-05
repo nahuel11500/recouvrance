@@ -5,6 +5,24 @@ and versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.6.0](https://github.com/nahuel11500/recouvrance/compare/v0.5.0...v0.6.0) - 2026-11-05
+
+### Added
+
+- F5 refreshes Problems and the Timeline in place (#708)
+- *(assistant)* Open it beside any page (Ctrl+J), told what is on screen (#702)
+- *(problems)* Filter by text, ns:, kind: and ctx:, and by severity with its count (#704)
+- *(timeline)* Show only the namespaces picked in the namespace picker (#700)
+- *(argo)* Pick the Argo CD cluster from the Argo CD page or Settings → Contexts (#698)
+
+### Fixed
+
+- *(pods)* Ready containers counted as kubectl does, sidecars included (#740)
+- *(overview)* A workload's conditions in their polarity's color (#728)
+- *(certs)* Expiry said as "Expires in N days" and "Expired less than a day ago" (#726)
+- *(agents)* Usage_history works on nodes (#724)
+- *(dashboard)* Say when metrics-server can't be read instead of showing no usage (#718)
+
 ## [0.5.0](https://github.com/nahuel11500/recouvrance/compare/v0.4.1...v0.5.0) - 2026-11-02
 
 ### Added
