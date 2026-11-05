@@ -6,15 +6,15 @@ use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::notification::Notification;
-use gpui_kit::component::searchable_list::SearchableVec;
-use gpui_kit::component::select::{Select, SelectEvent, SelectState};
-use gpui_kit::component::{ActiveTheme as _, Icon, IndexPath, Sizable as _, WindowExt as _, h_flex, v_flex};
+use gpui_kit::component::select::Select;
+use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use kube::Client;
 
 use crate::k8s;
 use crate::k8s::TaskGuard;
+use crate::ui::container_select::{ContainerSelect, container_select};
 use crate::ui::selectable::SelectableLine;
 
 mod model;
@@ -74,7 +74,9 @@ pub struct LogsView {
     /// Each pod's containers, default first (empty when not known).
     pub(super) pod_containers: Vec<Vec<String>>,
     /// The first pod's containers; the chosen one is read from every pod that has it.
-    pub(super) containers: Option<Entity<SelectState<SearchableVec<SharedString>>>>,
+    pub(super) containers: Option<ContainerSelect>,
+    /// The containers the picker offers (`set_containers`).
+    pub(super) container_names: Vec<String>,
     pub(super) _containers_sub: Option<Subscription>,
     pub(super) container: Option<String>,
     pub(super) previous: bool,
@@ -151,6 +153,7 @@ impl LogsView {
             left_out: 0,
             pod_containers,
             containers: None,
+            container_names: Vec::new(),
             _containers_sub: None,
             container: None,
             previous: false,
@@ -274,27 +277,22 @@ impl LogsView {
         pods.map(|(ix, pod)| (pod.clone(), container_for(self.container.as_deref(), containers(ix)))).collect()
     }
 
-    /// The containers to choose from; the choice stays when the new list has it.
+    /// The containers to choose from (the pod's default one first, as `k8s::containers` and
+    /// the pod lists give them); the choice stays when the new list has it, else the default.
     fn set_containers(&mut self, names: Vec<String>, window: &mut Window, cx: &mut Context<Self>) {
-        let ix = self.container.as_ref().and_then(|c| names.iter().position(|n| n == c)).unwrap_or(0);
-        self.container = names.get(ix).cloned();
-        self.containers = None;
-        self._containers_sub = None;
-        if names.len() > 1 {
-            let items: Vec<SharedString> = names.into_iter().map(Into::into).collect();
-            let select = cx
-                .new(|cx| SelectState::new(SearchableVec::new(items), Some(IndexPath::default().row(ix)), window, cx));
-            self._containers_sub = Some(cx.subscribe_in(
-                &select,
-                window,
-                |this, _, ev: &SelectEvent<SearchableVec<SharedString>>, _, cx| {
-                    let SelectEvent::Confirm(Some(name)) = ev else { return };
-                    this.container = Some(name.to_string());
-                    this.restart(cx);
-                },
-            ));
-            self.containers = Some(select);
+        if names == self.container_names {
+            return;
         }
+        let default = names.first();
+        if self.container.as_ref().is_none_or(|c| !names.contains(c)) {
+            self.container = default.cloned();
+        }
+        let picker = container_select(&names, self.container.as_deref(), window, cx, |this, name, _, cx| {
+            this.container = Some(name);
+            this.restart(cx);
+        });
+        (self.containers, self._containers_sub) = picker.unzip();
+        self.container_names = names;
         cx.notify();
     }
 
