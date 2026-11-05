@@ -34,6 +34,12 @@ body = """
 # Messages that read well in the history but not in the release notes.
 commit_preprocessors = [
   { pattern = '^fix: property tests for rules\.yaml, the kubeconfig merge and settings loading, and what they found \(#465\)', replace = "fix(agents): refuse a rules.yaml with a misspelt key, and don't write over one just saved in an editor (#465)" },
+  # 0.6.0: the refactors that change something users see, said as what they see.
+  { pattern = '^refactor[^\n]*\(#708\)', replace = "feat: F5 refreshes Problems and the Timeline in place (#708)" },
+  { pattern = '^refactor[^\n]*\(#718\)', replace = "fix(dashboard): say when metrics-server can't be read instead of showing no usage (#718)" },
+  { pattern = '^refactor[^\n]*\(#724\)', replace = "fix(agents): usage_history works on nodes (#724)" },
+  { pattern = '^refactor[^\n]*\(#726\)', replace = "fix(certs): expiry said as \"Expires in N days\" and \"Expired less than a day ago\" (#726)" },
+  { pattern = '^refactor[^\n]*\(#740\)', replace = "fix(pods): ready containers counted as kubectl does, sidecars included (#740)" },
 ]
 # The first parser that matches wins. Fixes for issues labelled `security` go under Security, at
 # the top of the release notes (the HTML comment sorts the group first; the body strips it): before
@@ -44,6 +50,8 @@ commit_parsers = [
   # Internal changes.
   { message = '^fix: shared helpers for the bug classes the audits keep finding \(#355\)', skip = true },
   { message = '^docs: quote a doc comment so cargo doc builds again \(#155\)', skip = true },
+  # 0.6.0: refactors with nothing new for users.
+  { message = '^refactor[^\n]*\(#(710|712|714|716|720|722|730|732|734|738)\)', skip = true },
   { message = "^feat", group = "added" },
   { message = "^fix", group = "fixed" },
   { message = "^perf", group = "performance" },
