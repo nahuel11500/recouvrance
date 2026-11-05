@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
-use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, h_flex, v_flex};
+use gpui_kit::component::{ActiveTheme as _, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use kube::Client;
@@ -18,6 +18,7 @@ use crate::history::DiffLine;
 use crate::k8s::{self, ClusterEvent};
 use crate::timeline::{self, Record, What};
 use crate::ui::page_filter::PageFilter;
+use crate::ui::page_header::{page_header, scope_text};
 
 /// One row: a change recorded, or an event, with its context.
 #[derive(Clone)]
@@ -461,31 +462,20 @@ impl Render for TimelineView {
             let b = Button::new(id).xsmall();
             if on { b.primary() } else { b.ghost() }
         };
-        let header = h_flex()
-            .gap_3()
-            .child(Icon::new(Lucide::ClockArrowDown).size_5())
-            .child(div().text_xl().font_weight(FontWeight::MEDIUM).child("Timeline"))
-            .child(div().text_sm().text_color(muted).child(format!(
-                "{}, {}",
-                if recording {
-                    "changes recorded while the app watched, and events"
-                } else {
-                    "recording is off (Settings → Timeline): what was recorded, and events"
-                },
-                match self.namespaces.as_slice() {
-                    [] => "all namespaces".to_string(),
-                    chosen => format!("in {}", chosen.join(", ")),
-                }
-            )))
-            .child(div().flex_1())
-            .child(
-                Button::new("timeline-refresh")
-                    .small()
-                    .ghost()
-                    .icon(Lucide::RefreshCw)
-                    .label(if self.events_loading { "Reading events…" } else { "Refresh" })
-                    .on_click(cx.listener(|this, _, _, cx| this.refresh(cx))),
-            );
+        let what = if recording {
+            "changes recorded while the app watched, and events"
+        } else {
+            "recording is off (Settings → Timeline): what was recorded, and events"
+        };
+        let subtitle = format!("{what}, {}", scope_text(&self.namespaces));
+        let header = page_header(Lucide::ClockArrowDown, None, "Timeline", subtitle, cx).child(div().flex_1()).child(
+            Button::new("timeline-refresh")
+                .small()
+                .ghost()
+                .icon(Lucide::RefreshCw)
+                .label(if self.events_loading { "Reading events…" } else { "Refresh" })
+                .on_click(cx.listener(|this, _, _, cx| this.refresh(cx))),
+        );
         let mut contexts = h_flex().gap_1();
         if self.clusters.len() > 1 {
             contexts =

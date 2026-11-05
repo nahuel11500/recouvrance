@@ -10,6 +10,7 @@ use gpui_kit::*;
 use kube::Client;
 
 use crate::k8s::{self, Rules};
+use crate::ui::page_header::page_header;
 
 /// "Who can": the grants found, and which lists could not be read.
 type WhoAnswer = (Vec<crate::rbac::Grant>, Option<String>);
@@ -322,14 +323,9 @@ impl Render for AccessView {
             "create" | "update" | "patch" => theme.warning,
             _ => theme.success,
         };
-        let header = h_flex()
-            .gap_3()
-            .child(Icon::new(Lucide::KeyRound).size_5().text_color(theme.blue))
-            .child(div().text_xl().font_weight(FontWeight::MEDIUM).child("My access"))
-            .child(div().text_sm().text_color(muted).child(format!(
-                "{} · namespace {} · as the API server sees your kubeconfig user",
-                self.context, self.namespace
-            )));
+        let subtitle =
+            format!("{} · namespace {} · as the API server sees your kubeconfig user", self.context, self.namespace);
+        let header = page_header(Lucide::KeyRound, Some(theme.blue), "My access", subtitle, cx);
         let body: AnyElement = match &self.rules {
             None => div().text_color(muted).child("Asking the API server…").into_any_element(),
             Some(Err(e)) => div().text_color(theme.danger).child(e.clone()).into_any_element(),
