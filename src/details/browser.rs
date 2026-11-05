@@ -12,12 +12,10 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use gpui_kit::assets::IconName as Lucide;
-use gpui_kit::component::IndexPath;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Editor, EditorState, Input, InputEvent, InputState};
 use gpui_kit::component::notification::Notification;
-use gpui_kit::component::searchable_list::SearchableVec;
-use gpui_kit::component::select::{Select, SelectEvent, SelectState};
+use gpui_kit::component::select::Select;
 use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, Icon, Selectable as _, Sizable as _, WindowExt as _, h_flex, v_flex,
 };
@@ -31,6 +29,7 @@ use crate::k8s;
 use crate::k8s::files::debug::{self, Look, Plan};
 use crate::k8s::files::{self, Entry, FileKind, FileSource, Found, Origin, Preview};
 use crate::latest::Latest;
+use crate::ui::container_select::{ContainerSelect, container_select};
 use crate::ui::selectable::selectable;
 use copy::CopyState;
 
@@ -46,7 +45,7 @@ pub struct FileBrowser {
     containers: Vec<String>,
     /// The container shown; none until the pod is read (its default one then).
     container: Option<String>,
-    container_select: Option<Entity<SelectState<SearchableVec<SharedString>>>>,
+    container_select: Option<ContainerSelect>,
     _container_sub: Option<Subscription>,
     /// Each container's folder, listing, preview and search, kept while another is shown.
     places: HashMap<String, Place>,
@@ -194,24 +193,8 @@ impl FileBrowser {
         if self.container.as_ref().is_none_or(|c| !names.contains(c)) {
             self.container = default;
         }
-        self.container_select = None;
-        self._container_sub = None;
-        if names.len() > 1 {
-            let ix = self.container.as_ref().and_then(|c| names.iter().position(|n| n == c));
-            let items: Vec<SharedString> = names.iter().cloned().map(Into::into).collect();
-            let select = cx.new(|cx| {
-                SelectState::new(SearchableVec::new(items), ix.map(|ix| IndexPath::default().row(ix)), window, cx)
-            });
-            self._container_sub = Some(cx.subscribe_in(
-                &select,
-                window,
-                |this, _, ev: &SelectEvent<SearchableVec<SharedString>>, window, cx| {
-                    let SelectEvent::Confirm(Some(name)) = ev else { return };
-                    this.choose_container(name.to_string(), window, cx);
-                },
-            ));
-            self.container_select = Some(select);
-        }
+        let picker = container_select(&names, self.container.as_deref(), window, cx, Self::choose_container);
+        (self.container_select, self._container_sub) = picker.unzip();
         self.containers = names;
         self.sync_preview(window, cx);
         cx.notify();

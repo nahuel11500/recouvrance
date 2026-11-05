@@ -6,6 +6,7 @@ pub mod apply_view;
 pub mod argo;
 pub mod assistant_view;
 pub mod cluster;
+pub mod container_select;
 pub mod ctx_picker;
 pub mod dashboard;
 pub mod data_edit;

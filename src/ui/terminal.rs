@@ -6,10 +6,8 @@ use std::rc::Rc;
 use futures::StreamExt as _;
 use futures::channel::mpsc::UnboundedSender;
 use gpui_kit::assets::IconName as Lucide;
-use gpui_kit::component::IndexPath;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::searchable_list::SearchableVec;
-use gpui_kit::component::select::{Select, SelectEvent, SelectState};
+use gpui_kit::component::select::Select;
 use gpui_kit::component::{ActiveTheme as _, Sizable as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -17,6 +15,7 @@ use kube::Client;
 
 use crate::details::ConfirmButtons as _;
 use crate::k8s::{self, ExecInput, ExecOutput, TaskGuard};
+use crate::ui::container_select::{ContainerSelect, container_select};
 
 const SCROLLBACK: usize = 5000;
 
@@ -34,7 +33,7 @@ pub struct TerminalView {
     /// The pod's containers to choose from (default first, then debug ones), once it is read.
     containers: Vec<String>,
     /// Picks another container when the pod has several; a running session restarts in it.
-    container_select: Option<Entity<SelectState<SearchableVec<SharedString>>>>,
+    container_select: Option<ContainerSelect>,
     _container_sub: Option<Subscription>,
     /// Shown before connecting when the context looks like production/admin.
     risky: bool,
@@ -135,24 +134,8 @@ impl TerminalView {
         if self.container.is_none() || (gone && self.session.is_none()) {
             self.container = default;
         }
-        self.container_select = None;
-        self._container_sub = None;
-        if names.len() > 1 {
-            let ix = self.container.as_ref().and_then(|c| names.iter().position(|n| n == c));
-            let items: Vec<SharedString> = names.iter().cloned().map(Into::into).collect();
-            let select = cx.new(|cx| {
-                SelectState::new(SearchableVec::new(items), ix.map(|ix| IndexPath::default().row(ix)), window, cx)
-            });
-            self._container_sub = Some(cx.subscribe_in(
-                &select,
-                window,
-                |this, _, ev: &SelectEvent<SearchableVec<SharedString>>, window, cx| {
-                    let SelectEvent::Confirm(Some(name)) = ev else { return };
-                    this.choose_container(name.to_string(), window, cx);
-                },
-            ));
-            self.container_select = Some(select);
-        }
+        let picker = container_select(&names, self.container.as_deref(), window, cx, Self::choose_container);
+        (self.container_select, self._container_sub) = picker.unzip();
         self.containers = names;
         cx.notify();
     }
