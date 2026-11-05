@@ -353,10 +353,7 @@ struct Answers {
 /// doesn't hide the others (a user who can't list nodes still sees the pods).
 fn summarize(context: String, a: Answers) -> Summary {
     let mut s = Summary { context, ..Default::default() };
-    let failed = |what: &str, e: &anyhow::Error| match k8s::api_status(e) {
-        Some(403) => format!("{what}: forbidden"),
-        _ => format!("{what}: {}", k8s::short_error(e)),
-    };
+    let failed = |what: &str, e: &anyhow::Error| format!("{what}: {}", k8s::lists::load_error(e));
     match a.version {
         Ok(v) => s.version = Some(v),
         Err(e) => s.errors.push(failed("Version", &e)),
@@ -864,7 +861,7 @@ mod tests {
                 pod_metrics: Some(MetricsList::default()),
             },
         );
-        assert_eq!(s.error.as_deref(), Some("Version: connection refused"));
+        assert_eq!(s.error.as_deref(), Some("Version: failed: connection refused"));
     }
 
     #[test]

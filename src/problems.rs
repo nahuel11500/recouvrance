@@ -183,14 +183,8 @@ pub struct Scan {
 impl Scan {
     /// "Pods (forbidden), Jobs (failed: timeout)", or None when nothing was skipped.
     pub fn skipped_text(&self) -> Option<String> {
-        let parts: Vec<String> = self
-            .skipped
-            .iter()
-            .map(|(kind, e)| match k8s::api_status(e) {
-                Some(403) => format!("{kind} (forbidden)"),
-                _ => format!("{kind} (failed: {})", k8s::short_error(e)),
-            })
-            .collect();
+        let parts: Vec<String> =
+            self.skipped.iter().map(|(kind, e)| format!("{kind} ({})", k8s::lists::load_error(e))).collect();
         (!parts.is_empty()).then(|| parts.join(", "))
     }
 
