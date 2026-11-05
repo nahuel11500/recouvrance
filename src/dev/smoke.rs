@@ -28,7 +28,7 @@ pub fn run(ctx: String) {
                 if k8s::is_custom(k) {
                     if k.ar.group != last.1 {
                         print!("\n  {}: ", k.ar.group);
-                        last.1 = k.ar.group.clone();
+                        last.1.clone_from(&k.ar.group);
                     }
                     print!("{} ", k.ar.kind);
                 } else {

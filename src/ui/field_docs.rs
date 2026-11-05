@@ -46,7 +46,7 @@ impl FieldDocs {
         let path = crate::schema::yaml_path_at(&text, line);
         let kind = crate::schema::doc_kind_at(&text, line);
         if kind != self.kind {
-            self.kind = kind.clone();
+            self.kind.clone_from(&kind);
             self.schema = None;
             self.schema_load.cancel();
             if let Some((api_version, kind)) = kind {

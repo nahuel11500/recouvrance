@@ -228,7 +228,7 @@ impl Hub {
             // different.
             let mut cfg = write(&self.config);
             let loaded = rules_file::read(&path).and_then(|text| {
-                *lock(&self.rules_text) = text.clone();
+                (*lock(&self.rules_text)).clone_from(&text);
                 text.map(|t| rules_file::check(&t)).transpose()
             });
             let file = match loaded {

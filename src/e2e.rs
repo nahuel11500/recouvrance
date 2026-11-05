@@ -92,7 +92,7 @@ async fn agent(allow: &[&str], deny: &[&str]) -> Result<(Arc<mcp::Hub>, mcp::Age
 /// With write mode off, the UI's client refuses a write when it is sent, and nothing
 /// reaches the cluster; dry runs and reads still go through. On, the same write lands.
 #[test]
-#[ignore]
+#[ignore = "needs a kind cluster: RECOUVRANCE_E2E_CONTEXT"]
 fn write_mode_off_refuses_the_ui_s_writes() {
     run(async {
         let ui: Api<ConfigMap> = Api::namespaced(k8s::connect(context()).await?, NS);
@@ -124,7 +124,7 @@ fn write_mode_off_refuses_the_ui_s_writes() {
 /// don't allow is refused and the object stays; the kill switch refuses even reads; with a
 /// delete rule, the same call deletes (so the refusals above are not a broken setup).
 #[test]
-#[ignore]
+#[ignore = "needs a kind cluster: RECOUVRANCE_E2E_CONTEXT"]
 fn an_agent_gets_only_what_its_rules_allow() {
     run(async {
         let ctx = context();
@@ -170,7 +170,7 @@ fn an_agent_gets_only_what_its_rules_allow() {
 /// Turning agent access off while an agent's drain runs stops it before the next
 /// eviction; so does turning write mode off during a drain started in the app.
 #[test]
-#[ignore]
+#[ignore = "needs a kind cluster: RECOUVRANCE_E2E_CONTEXT"]
 fn turning_access_off_stops_a_drain() {
     run(async {
         let ctx = context();
@@ -236,7 +236,7 @@ fn turning_access_off_stops_a_drain() {
 /// mode off, or the identity changed in the settings since, refuses it before it is sent.
 /// An agent allowed everything never runs as it, whatever the settings say.
 #[test]
-#[ignore]
+#[ignore = "needs a kind cluster: RECOUVRANCE_E2E_CONTEXT"]
 fn a_write_runs_as_the_identity_chosen_for_it_only() {
     run(async {
         let ctx = context();
@@ -292,7 +292,7 @@ fn a_write_runs_as_the_identity_chosen_for_it_only() {
 /// A shell in a container answers what is typed, and says when it ends; an attach shows
 /// the container's own output. (The terminal view only draws what these sessions send.)
 #[test]
-#[ignore]
+#[ignore = "needs a kind cluster: RECOUVRANCE_E2E_CONTEXT"]
 fn shells_and_attach_reach_the_container() {
     use futures::StreamExt as _;
     use k8s_openapi::api::core::v1::Pod;
@@ -370,7 +370,7 @@ fn shells_and_attach_reach_the_container() {
 /// An agent rolls a Deployment back only with a patch rule; the template it goes back to
 /// is the previous revision's, and the rollout status says when it is done.
 #[test]
-#[ignore]
+#[ignore = "needs a kind cluster: RECOUVRANCE_E2E_CONTEXT"]
 fn an_agent_rolls_back_a_deployment() {
     use k8s_openapi::api::apps::v1::Deployment;
 
@@ -444,7 +444,7 @@ fn an_agent_rolls_back_a_deployment() {
 /// Running a CronJob now needs apply on jobs; a debug container needs exec on the pod, and
 /// the agent then runs commands in it.
 #[test]
-#[ignore]
+#[ignore = "needs a kind cluster: RECOUVRANCE_E2E_CONTEXT"]
 fn an_agent_runs_a_cronjob_and_debugs_a_pod() {
     use k8s_openapi::api::batch::v1::{CronJob, Job};
     use k8s_openapi::api::core::v1::Pod;
@@ -503,7 +503,7 @@ fn an_agent_runs_a_cronjob_and_debugs_a_pod() {
 /// An agent's port-forward needs a rule for it, reaches the pod, and closes when agent
 /// access is switched off.
 #[test]
-#[ignore]
+#[ignore = "needs a kind cluster: RECOUVRANCE_E2E_CONTEXT"]
 fn an_agent_s_port_forward_follows_its_rules() {
     use k8s_openapi::api::core::v1::Pod;
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -555,7 +555,7 @@ fn an_agent_s_port_forward_follows_its_rules() {
 
 /// Cordoning and uncordoning a node need the agent's drain rule; `top_nodes` reads usage.
 #[test]
-#[ignore]
+#[ignore = "needs a kind cluster: RECOUVRANCE_E2E_CONTEXT"]
 fn an_agent_cordons_a_node_with_its_drain_rule() {
     run(async {
         let ctx = context();
@@ -597,7 +597,7 @@ fn an_agent_cordons_a_node_with_its_drain_rule() {
 /// Helm releases are read from their Secrets: denied by a Deny on secrets, listed with the
 /// chart otherwise, and their secret-looking values masked unless the agent may reveal.
 #[test]
-#[ignore]
+#[ignore = "needs a kind cluster: RECOUVRANCE_E2E_CONTEXT"]
 fn an_agent_reads_helm_releases_by_its_secret_rules() {
     use k8s_openapi::api::core::v1::Secret;
 
@@ -641,7 +641,7 @@ fn an_agent_reads_helm_releases_by_its_secret_rules() {
 /// A Deployment's logs come from all its pods, merged; pods whose logs the rules deny are
 /// left out and counted.
 #[test]
-#[ignore]
+#[ignore = "needs a kind cluster: RECOUVRANCE_E2E_CONTEXT"]
 fn an_agent_reads_a_workload_s_logs() {
     use k8s_openapi::api::apps::v1::Deployment;
     use k8s_openapi::api::core::v1::Pod;
@@ -700,7 +700,7 @@ fn an_agent_reads_a_workload_s_logs() {
 /// Pausing, resuming and setting an image need the agent's patch rule; the image lands on
 /// the container named, and a paused Deployment says so.
 #[test]
-#[ignore]
+#[ignore = "needs a kind cluster: RECOUVRANCE_E2E_CONTEXT"]
 fn an_agent_pauses_and_sets_an_image() {
     use k8s_openapi::api::apps::v1::Deployment;
 
@@ -758,7 +758,7 @@ fn an_agent_pauses_and_sets_an_image() {
 
 /// `diff_manifest` shows what an apply would change, with get rules only, and changes nothing.
 #[test]
-#[ignore]
+#[ignore = "needs a kind cluster: RECOUVRANCE_E2E_CONTEXT"]
 fn an_agent_diffs_a_manifest_without_changing_anything() {
     run(async {
         let ctx = context();
@@ -790,7 +790,7 @@ fn an_agent_diffs_a_manifest_without_changing_anything() {
 
 /// The read-only questions about the cluster: explain, can-i, version and wait.
 #[test]
-#[ignore]
+#[ignore = "needs a kind cluster: RECOUVRANCE_E2E_CONTEXT"]
 fn an_agent_asks_the_cluster() {
     run(async {
         let ctx = context();
@@ -816,7 +816,7 @@ fn an_agent_asks_the_cluster() {
 /// The upgrade check names a Helm release whose last manifest uses a removed API, and a budget
 /// that would block a drain; the Helm one only while the agent may list the release's Secret.
 #[test]
-#[ignore]
+#[ignore = "needs a kind cluster: RECOUVRANCE_E2E_CONTEXT"]
 fn an_agent_checks_an_upgrade() {
     use k8s_openapi::api::core::v1::{Pod, Secret};
     use k8s_openapi::api::policy::v1::PodDisruptionBudget;
@@ -882,7 +882,7 @@ fn an_agent_checks_an_upgrade() {
 /// A pod waiting on a ConfigMap that doesn't exist shows in `find_problems` with the
 /// ConfigMap it misses; an optional one it also names isn't reported.
 #[test]
-#[ignore]
+#[ignore = "needs a kind cluster: RECOUVRANCE_E2E_CONTEXT"]
 fn an_agent_finds_a_pod_s_missing_config_map() {
     use k8s_openapi::api::core::v1::Pod;
 
@@ -932,7 +932,7 @@ fn an_agent_finds_a_pod_s_missing_config_map() {
 /// selects no pods breaks at its selector, an Ingress sending to a port its Service lacks
 /// breaks at that backend, and the TLS Secret the rules hide is not read.
 #[test]
-#[ignore]
+#[ignore = "needs a kind cluster: RECOUVRANCE_E2E_CONTEXT"]
 fn an_agent_checks_why_a_service_does_not_answer() {
     use k8s_openapi::api::core::v1::Service;
     use k8s_openapi::api::networking::v1::Ingress;
@@ -984,7 +984,7 @@ fn an_agent_checks_why_a_service_does_not_answer() {
 /// and non-UTF-8 bytes come back whole, a file previews and a search finds it, with
 /// busybox's tools and with GNU's. An agent's `browse_files` needs exec on the pod.
 #[test]
-#[ignore]
+#[ignore = "needs a kind cluster: RECOUVRANCE_E2E_CONTEXT"]
 fn the_files_tab_reads_a_container() {
     use k8s_openapi::api::core::v1::Pod;
 
@@ -1058,7 +1058,7 @@ fn the_files_tab_reads_a_container() {
 /// set by someone (and who), then the deletion. The agents' `get_changes` returns the record
 /// with its source.
 #[test]
-#[ignore]
+#[ignore = "needs a kind cluster: RECOUVRANCE_E2E_CONTEXT"]
 fn the_timeline_records_what_a_watch_sees_change() {
     run(async {
         use futures::StreamExt as _;
@@ -1130,7 +1130,7 @@ fn the_timeline_records_what_a_watch_sees_change() {
 /// Browsing again reuses it. The same in a namespace enforcing Pod Security `restricted`, as
 /// the container's user. An agent's `browse_files` does it with `debug` and the exec rule.
 #[test]
-#[ignore]
+#[ignore = "needs a kind cluster: RECOUVRANCE_E2E_CONTEXT"]
 fn a_container_without_a_shell_is_read_through_a_debug_container() {
     use k8s_openapi::api::core::v1::{Namespace, Pod};
 
@@ -1278,7 +1278,7 @@ async fn pod_gone(pods: &Api<k8s_openapi::api::core::v1::Pod>, name: &str) -> Re
 /// is deleted even with write mode off, and one left behind (the app killed) is deleted by
 /// the sweep run when the app connects again.
 #[test]
-#[ignore]
+#[ignore = "needs a kind cluster: RECOUVRANCE_E2E_CONTEXT"]
 fn a_stopped_container_is_read_from_a_copy_of_its_pod() {
     use k8s_openapi::api::core::v1::Pod;
 

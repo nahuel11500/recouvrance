@@ -375,7 +375,7 @@ fn mask_manifest_doc(doc: &str) -> String {
         return doc.to_string();
     }
     let comments: String =
-        doc.lines().take_while(|l| l.trim_start().starts_with('#')).map(|l| format!("{l}\n")).collect();
+        doc.lines().take_while(|l| l.trim_start().starts_with('#')).flat_map(|l| [l, "\n"]).collect();
     match crate::yaml::from_str::<Value>(doc) {
         Ok(mut v) if v["kind"] == "Secret" => {
             k8s::mask_secret_values(&mut v);

@@ -856,7 +856,7 @@ impl DetailPanel {
         match k8s::to_yaml(&value, self.obj.kind.is("", "Secret"), self.reveal_secrets) {
             Ok(text) => {
                 self.yaml_error = None;
-                self.yaml_text = text.clone();
+                self.yaml_text.clone_from(&text);
                 self.yaml.update(cx, |s, cx| s.set_value(text, window, cx));
             }
             Err(e) => self.yaml_error = Some(format!("{e:#}").into()),
