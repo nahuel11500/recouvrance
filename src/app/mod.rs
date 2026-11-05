@@ -6,14 +6,13 @@ use std::sync::Arc;
 use futures::StreamExt as _;
 use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::component::input::{InputEvent, InputState};
-use gpui_kit::component::notification::Notification;
 use gpui_kit::component::table::{TableEvent, TableState};
 use gpui_kit::component::{TitleBar, WindowExt as _};
 use gpui_kit::*;
 use kube::Client;
 
 use crate::agents::AgentsView;
-use crate::details::{DetailPanel, OpenObject};
+use crate::details::DetailPanel;
 use crate::favorites::{ColumnPrefs, Favorites};
 use crate::forwards::Forwards;
 use crate::k8s::{self, Kind, TaskGuard};
@@ -33,6 +32,7 @@ mod contexts;
 mod demo;
 mod live_list;
 mod navigation;
+mod overviews;
 mod pages;
 mod problem_badge;
 mod render;
@@ -592,72 +592,6 @@ impl AppView {
             Route::Detail(d) => Some(d),
             _ => None,
         }
-    }
-
-    // MARK: Tabs
-
-    /// Reload what is shown now (F5): the list, or a fresh overview page.
-    fn refresh_page(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let clusters = self.clusters.clone();
-        let route = match self.route().clone() {
-            Route::Resources(_) => {
-                self.restart_watch(cx);
-                return;
-            }
-            Route::Cluster(_) => Route::Cluster(cx.new(|cx| ClusterOverview::new(clusters, cx))),
-            Route::Workloads(_) => {
-                let scope = self.namespace_scope();
-                Route::Workloads(cx.new(|cx| Dashboard::new(scope, cx)))
-            }
-            Route::Problems(_) => {
-                let (scope, kinds, ns) = (self.namespace_scope(), self.cluster_kinds(), self.namespaces.clone());
-                Route::Problems(cx.new(|cx| crate::ui::problems_view::ProblemsView::new(scope, kinds, ns, window, cx)))
-            }
-            Route::Helm(_) => {
-                let scope = self.namespace_scope();
-                Route::Helm(cx.new(|cx| HelmList::new(scope, window, cx)))
-            }
-            Route::Argo(_) => Route::Argo(cx.new(|cx| crate::ui::argo::ArgoView::new(clusters, window, cx))),
-            _ => return,
-        };
-        match &route {
-            Route::Workloads(p) => self.remember_scope(p.entity_id()),
-            Route::Problems(p) => self.remember_scope(p.entity_id()),
-            Route::Helm(p) => self.remember_scope(p.entity_id()),
-            _ => {}
-        }
-        // Same place in history, fresh data (links keep working: subscribe like the openers do).
-        match &route {
-            Route::Cluster(p) => cx
-                .subscribe_in(p, window, |this, _, ev: &OpenObject, window, cx| {
-                    let ctx =
-                        ev.context.as_ref().and_then(|c| this.clusters.iter().position(|(n, _)| n == c)).unwrap_or(0);
-                    this.open_object_in(ctx, &ev.kind, ev.name.clone(), ev.namespace.clone(), window, cx);
-                })
-                .detach(),
-            Route::Workloads(p) => cx
-                .subscribe_in(p, window, |this, _, ev: &OpenObject, window, cx| {
-                    let ctx =
-                        ev.context.as_ref().and_then(|c| this.clusters.iter().position(|(n, _)| n == c)).unwrap_or(0);
-                    this.open_object_in(ctx, &ev.kind, ev.name.clone(), ev.namespace.clone(), window, cx);
-                })
-                .detach(),
-            Route::Problems(p) => cx
-                .subscribe_in(p, window, |this, _, ev: &OpenObject, window, cx| {
-                    let ctx =
-                        ev.context.as_ref().and_then(|c| this.clusters.iter().position(|(n, _)| n == c)).unwrap_or(0);
-                    this.open_object_in(ctx, &ev.kind, ev.name.clone(), ev.namespace.clone(), window, cx);
-                })
-                .detach(),
-            Route::Helm(p) => self.subscribe_helm(p, window, cx),
-            Route::Argo(p) => self.subscribe_argo(p, window, cx),
-            _ => return,
-        }
-        if let Some(slot) = self.history.get_mut(self.pos) {
-            *slot = route;
-        }
-        self.apply_route(cx);
-        window.push_notification(Notification::info("Refreshed"), cx);
     }
 }
 

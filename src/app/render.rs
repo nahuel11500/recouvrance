@@ -94,7 +94,12 @@ impl AppView {
         let (view, view2) = (cx.entity().downgrade(), cx.entity().downgrade());
         let refreshable = matches!(
             self.route(),
-            Route::Cluster(_) | Route::Workloads(_) | Route::Problems(_) | Route::Helm(_) | Route::Argo(_)
+            Route::Cluster(_)
+                | Route::Workloads(_)
+                | Route::Problems(_)
+                | Route::Timeline(_)
+                | Route::Helm(_)
+                | Route::Argo(_)
         );
         h_flex()
             .flex_1()
