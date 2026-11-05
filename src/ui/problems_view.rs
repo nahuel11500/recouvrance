@@ -84,6 +84,13 @@ impl ProblemsView {
         cx.notify();
     }
 
+    /// Scan again now (F5), keeping the filter and the severity picked.
+    pub fn refresh(&mut self, cx: &mut Context<Self>) {
+        self.found = None;
+        self.reload(cx);
+        cx.notify();
+    }
+
     fn reload(&mut self, cx: &mut Context<Self>) {
         let (clusters, kinds) = (self.clusters.clone(), self.kinds.clone());
         self._task = Some(cx.spawn(async move |this, cx| {
@@ -289,13 +296,12 @@ impl Render for ProblemsView {
                         })),
                 )
                 .child(
-                    Button::new("reload-problems").small().ghost().icon(Lucide::RefreshCw).label("Refresh").on_click(
-                        cx.listener(|this, _, _, cx| {
-                            this.found = None;
-                            this.reload(cx);
-                            cx.notify();
-                        }),
-                    ),
+                    Button::new("reload-problems")
+                        .small()
+                        .ghost()
+                        .icon(Lucide::RefreshCw)
+                        .label("Refresh")
+                        .on_click(cx.listener(|this, _, _, cx| this.refresh(cx))),
                 );
         let Some(found) = &self.found else {
             return v_flex().size_full().p_4().gap_4().child(header).child(

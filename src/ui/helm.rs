@@ -106,7 +106,7 @@ impl HelmList {
                 async move {
                     let rels = list_releases(client, ns).await.map(|mut rels| {
                         for r in &mut rels {
-                            r.context = ctx.clone();
+                            r.context.clone_from(&ctx);
                         }
                         rels
                     });

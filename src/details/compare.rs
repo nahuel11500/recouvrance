@@ -19,14 +19,7 @@ impl DetailPanel {
         self.compare.target_name = None;
         self.compare.other = None;
         let obj = self.obj.clone();
-        self.compare._compare = Some(cx.spawn(async move |this, cx| {
-            let r = k8s::get_object(client, obj).await.map_err(|e| k8s::short_error(&e));
-            let _ = this.update(cx, |this, cx| {
-                this.compare.other = Some(r);
-                cx.notify();
-            });
-        }));
-        cx.notify();
+        self.fetch_other(client, obj, cx);
     }
 
     /// Compare with another object of the same kind (same namespace).
@@ -36,13 +29,16 @@ impl DetailPanel {
         self.compare.other = None;
         let obj = ObjectRef { name, uid: String::new(), ..self.obj.clone() };
         let client = self.client.clone();
-        self.compare._compare = Some(cx.spawn(async move |this, cx| {
-            let r = k8s::get_object(client, obj).await.map_err(|e| k8s::short_error(&e));
-            let _ = this.update(cx, |this, cx| {
-                this.compare.other = Some(r);
-                cx.notify();
-            });
-        }));
+        self.fetch_other(client, obj, cx);
+    }
+
+    /// Read the object compared with; a newer pick replaces the read running.
+    fn fetch_other(&mut self, client: kube::Client, obj: ObjectRef, cx: &mut Context<Self>) {
+        let read = async move { k8s::get_object(client, obj).await.map_err(|e| k8s::short_error(&e)) };
+        self.compare.fetch.spawn(cx, read, |this, r, cx| {
+            this.compare.other = Some(r);
+            cx.notify();
+        });
         cx.notify();
     }
 

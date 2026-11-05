@@ -2,7 +2,6 @@
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::{ActiveTheme as _, Icon, h_flex};
-use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 /// `icon` (in `color`, else the text's), `title`, then `subtitle` muted. Buttons go after it:
@@ -14,9 +13,14 @@ pub fn page_header(
     subtitle: impl Into<SharedString>,
     cx: &App,
 ) -> Div {
+    let icon = Icon::new(icon).size_5();
+    let icon = match color {
+        Some(c) => icon.text_color(c),
+        None => icon,
+    };
     h_flex()
         .gap_3()
-        .child(Icon::new(icon).size_5().when_some(color, |i, c| i.text_color(c)))
+        .child(icon)
         .child(div().text_xl().font_weight(FontWeight::MEDIUM).child(title.into()))
         .child(div().text_sm().text_color(cx.theme().muted_foreground).child(subtitle.into()))
 }

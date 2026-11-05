@@ -7,7 +7,7 @@ use gpui_kit::component::{ActiveTheme as _, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use super::{Ctx, field, heading, mono, row, tone_color};
+use super::{Ctx, field, heading, mono, row};
 use crate::k8s;
 use crate::k8s::argo::diagnosis::{self, Compared, Diagnosis, Drift, DriftRead, Finding, Res};
 use crate::k8s::argo::{self, Found, Summary};
@@ -20,7 +20,7 @@ fn ago(t: Option<&str>) -> Option<String> {
 
 /// A word in its tone's color.
 fn word(text: &str, tone: Tone, cx: &App) -> Div {
-    div().text_color(tone_color(Some(tone), cx)).child(selectable(text.to_string()))
+    div().text_color(tone.color(cx)).child(selectable(text.to_string()))
 }
 
 /// Nothing when Argo CD deploys nothing here; one line when it could not be read. On an
@@ -267,7 +267,7 @@ fn finding(ctx: &Ctx, ix: usize, f: &Finding, on: Option<&str>, cx: &App) -> Div
         .child(
             h_flex()
                 .gap_2()
-                .child(div().size_2().flex_shrink_0().rounded_full().bg(tone_color(Some(f.tone), cx)))
+                .child(div().size_2().flex_shrink_0().rounded_full().bg(f.tone.color(cx)))
                 .child(div().text_sm().font_weight(FontWeight::MEDIUM).child(selectable(f.title.clone()))),
         )
         .when_some(f.message.as_ref(), |d, m| {

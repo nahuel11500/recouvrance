@@ -241,6 +241,13 @@ impl TimelineView {
         this
     }
 
+    /// Read the records and the events again now (F5), keeping the filters.
+    pub fn refresh(&mut self, cx: &mut Context<Self>) {
+        self.read_records(cx);
+        self.read_events(cx);
+        cx.notify();
+    }
+
     /// The records of the connected contexts, as the recorder has them now.
     fn read_records(&mut self, cx: &App) {
         self.version = timeline::version();
@@ -467,11 +474,7 @@ impl Render for TimelineView {
                 .ghost()
                 .icon(Lucide::RefreshCw)
                 .label(if self.events_loading { "Reading events…" } else { "Refresh" })
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.read_records(cx);
-                    this.read_events(cx);
-                    cx.notify();
-                })),
+                .on_click(cx.listener(|this, _, _, cx| this.refresh(cx))),
         );
         let mut contexts = h_flex().gap_1();
         if self.clusters.len() > 1 {

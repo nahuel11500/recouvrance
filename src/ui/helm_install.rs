@@ -13,6 +13,7 @@ use serde::Deserialize;
 
 use crate::details::ConfirmButtons as _;
 use crate::k8s;
+use crate::latest::Latest;
 use crate::ui::page_header::page_header;
 
 /// The values editor's text while the picked chart's values load.
@@ -44,9 +45,9 @@ pub struct HelmInstall {
     /// Counts runs and picks: a run shows its result only if neither came after it.
     run_id: u64,
     /// The chart search running; a new search cancels it.
-    _search: Option<Task<()>>,
+    search_load: Latest,
     /// Loading the picked chart's versions and values; a new pick cancels it.
-    _pick: Option<Task<()>>,
+    pick_load: Latest,
     _tasks: Vec<Task<()>>,
     _subs: Vec<Subscription>,
 }
@@ -84,8 +85,8 @@ impl HelmInstall {
             output: None,
             busy: false,
             run_id: 0,
-            _search: None,
-            _pick: None,
+            search_load: Latest::default(),
+            pick_load: Latest::default(),
             _tasks: Vec::new(),
             _subs: subs,
         }
@@ -98,19 +99,17 @@ impl HelmInstall {
         }
         self.results = None;
         let context = self.context.clone();
-        let task = cx.spawn(async move |this, cx| {
+        let search = async move {
             let r =
                 k8s::helm(context, vec!["search".into(), "repo".into(), "-o".into(), "json".into(), "--".into(), q])
                     .await;
-            let parsed = r
-                .map_err(|e| format!("{e:#}"))
-                .and_then(|out| serde_json::from_str::<Vec<Chart>>(&out).map_err(|e| e.to_string()));
-            let _ = this.update(cx, |this, cx| {
-                this.results = Some(parsed);
-                cx.notify();
-            });
+            r.map_err(|e| format!("{e:#}"))
+                .and_then(|out| serde_json::from_str::<Vec<Chart>>(&out).map_err(|e| e.to_string()))
+        };
+        self.search_load.spawn(cx, search, |this, parsed, cx| {
+            this.results = Some(parsed);
+            cx.notify();
         });
-        self._search = Some(task);
         cx.notify();
     }
 
@@ -126,7 +125,8 @@ impl HelmInstall {
         self.versions.clear();
         self.chart = Some(chart.clone());
         let context = self.context.clone();
-        let task = cx.spawn_in(window, async move |this, cx| {
+        let name = chart.name.clone();
+        let load = async move {
             let versions = k8s::helm(
                 context.clone(),
                 vec![
@@ -152,28 +152,24 @@ impl HelmInstall {
                 ],
             )
             .await;
-            let _ = this.update_in(cx, |this, window, cx| {
-                // Only for the chart and version still picked.
-                if this.chart.as_ref().is_none_or(|c| c.name != chart.name || c.version != chart.version) {
-                    return;
-                }
-                this.versions = versions
-                    .ok()
-                    .and_then(|o| serde_json::from_str::<Vec<Chart>>(&o).ok())
-                    .map(|v| v.into_iter().filter(|c| c.name == chart.name).map(|c| c.version).take(12).collect())
-                    .unwrap_or_default();
-                // Values typed while loading are kept.
-                if this.values.read(cx).value() == LOADING_VALUES {
-                    let text = values.unwrap_or_else(|e| format!("# could not read the chart's values: {e}"));
-                    this.values.update(cx, |s, cx| s.set_value(text, window, cx));
-                } else if let Err(e) = values {
-                    window
-                        .push_notification(Notification::error(format!("Could not read the chart's values: {e}")), cx);
-                }
-                cx.notify();
-            });
+            (versions, values)
+        };
+        // Only for the chart still picked: a new pick replaces (and cancels) this load.
+        self.pick_load.spawn_in(window, cx, load, move |this, (versions, values), window, cx| {
+            this.versions = versions
+                .ok()
+                .and_then(|o| serde_json::from_str::<Vec<Chart>>(&o).ok())
+                .map(|v| v.into_iter().filter(|c| c.name == name).map(|c| c.version).take(12).collect())
+                .unwrap_or_default();
+            // Values typed while loading are kept.
+            if this.values.read(cx).value() == LOADING_VALUES {
+                let text = values.unwrap_or_else(|e| format!("# could not read the chart's values: {e}"));
+                this.values.update(cx, |s, cx| s.set_value(text, window, cx));
+            } else if let Err(e) = values {
+                window.push_notification(Notification::error(format!("Could not read the chart's values: {e}")), cx);
+            }
+            cx.notify();
         });
-        self._pick = Some(task);
         cx.notify();
     }
 

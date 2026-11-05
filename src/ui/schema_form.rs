@@ -111,7 +111,11 @@ fn doc_ranges(text: &str) -> Vec<(usize, usize)> {
 }
 
 fn pointer(path: &[String]) -> String {
-    path.iter().map(|p| format!("/{}", p.replace('~', "~0").replace('/', "~1"))).collect()
+    path.iter().fold(String::new(), |mut out, p| {
+        out.push('/');
+        out.push_str(&p.replace('~', "~0").replace('/', "~1"));
+        out
+    })
 }
 
 /// The object at `path` in `doc`, made where it is missing or null. A list item is reached
@@ -242,7 +246,7 @@ impl SchemaForm {
         ))
         .filter(|(a, k)| !a.is_empty() && !k.is_empty());
         if kind != self.kind {
-            self.kind = kind.clone();
+            self.kind.clone_from(&kind);
             self.schema = None;
             self.path.clear();
             // A document without a kind has no schema: a load still running for the

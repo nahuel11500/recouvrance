@@ -117,7 +117,7 @@ pub struct AccessView {
     who_ns: Entity<InputState>,
     who: Option<Result<WhoAnswer, String>>,
     who_busy: bool,
-    _who_task: Option<Task<()>>,
+    who_load: crate::latest::Latest,
     _subs: Vec<Subscription>,
     _task: Task<()>,
 }
@@ -189,7 +189,7 @@ impl AccessView {
             who_ns,
             who: None,
             who_busy: false,
-            _who_task: None,
+            who_load: crate::latest::Latest::default(),
             _subs: subs,
             _task: task,
         }
@@ -205,19 +205,20 @@ impl AccessView {
         let client = self.client.clone();
         self.who_busy = true;
         cx.notify();
-        self._who_task = Some(cx.spawn(async move |this, cx| {
+        let ask = async move {
             let snap = k8s::rbac_snapshot(client, ns.clone()).await;
-            let result = if snap.no_bindings() {
+            if snap.no_bindings() {
                 Err(snap.load_note().unwrap_or_default())
             } else {
                 Ok((crate::rbac::who_can(&snap, &verb, &group, &resource, rules_ns.as_deref()), snap.load_note()))
-            };
-            let _ = this.update(cx, |this, cx| {
-                this.who = Some(result);
-                this.who_busy = false;
-                cx.notify();
-            });
-        }));
+            }
+        };
+        // A new question replaces (and cancels) the one running.
+        self.who_load.spawn(cx, ask, |this, result, cx| {
+            this.who = Some(result);
+            this.who_busy = false;
+            cx.notify();
+        });
     }
 
     fn render_who(&self, cx: &mut Context<Self>) -> impl IntoElement {

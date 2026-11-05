@@ -12,7 +12,7 @@ use gpui_kit::*;
 use super::{Col, ResourceTable, normalized};
 use crate::k8s;
 use crate::k8s::{ColumnDef, Row};
-use crate::status::{Tone, tone};
+use crate::status::tone;
 
 /// Keep the highlight on the selected object after its rows moved (an update, a filter,
 /// a sort), and the row menu's highlight on its row. The table reports the move as a
@@ -490,14 +490,8 @@ impl TableDelegate for ResourceTable {
 /// A node's status is read by its own rule: a taint's label (`CiliumAgentNotReady`) is not
 /// the node's state.
 fn status_color(status: &str, node: bool, cx: &App) -> Option<Hsla> {
-    let t = cx.theme();
     let judged = if node { crate::status::node_tone(status) } else { tone(status) };
-    Some(match judged? {
-        Tone::Good => t.success,
-        Tone::Done => t.muted_foreground,
-        Tone::Busy => t.warning,
-        Tone::Bad => t.danger,
-    })
+    Some(judged?.color(cx))
 }
 
 /// Green when all replicas/containers are ready, amber otherwise; muted for finished pods.

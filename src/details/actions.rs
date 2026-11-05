@@ -875,7 +875,7 @@ pub fn confirm_with(cmd: &str, guard: Option<&Guard>, run_as: &RunAs, cx: &App) 
                     .font_family(theme.mono_font_family.clone())
                     .text_xs()
                     .text_color(theme.muted_foreground)
-                    .child(cmd.to_string()),
+                    .child(cmd.clone()),
             )
         })
         .when_some(guard, |d, guard| d.child(guard.render(cx)))

@@ -30,6 +30,20 @@ use std::sync::{Arc, LazyLock};
 use gpui_kit::{Image, ImageFormat, Img, Pixels, Styled as _, img};
 use kube::Client;
 
+impl crate::status::Tone {
+    /// The theme's color for it: green, muted, amber, red.
+    pub fn color(self, cx: &gpui_kit::App) -> gpui_kit::Hsla {
+        use gpui_kit::component::ActiveTheme as _;
+        let t = cx.theme();
+        match self {
+            Self::Good => t.success,
+            Self::Done => t.muted_foreground,
+            Self::Busy => t.warning,
+            Self::Bad => t.danger,
+        }
+    }
+}
+
 /// What a page lists: each connected cluster with the namespaces to read there (`None`:
 /// all of them at once; none: the cluster is left out).
 pub type Scope = Vec<(String, Client, Vec<Option<String>>)>;

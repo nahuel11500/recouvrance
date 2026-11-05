@@ -75,7 +75,7 @@ pub(super) fn merge_unique(kc: &mut Kubeconfig, mut more: Kubeconfig, file: &str
             c.name = free_name(&old, file, &mut taken_clusters);
             for ctx in more.contexts.iter_mut().filter_map(|x| x.context.as_mut()) {
                 if ctx.cluster == old {
-                    ctx.cluster = c.name.clone();
+                    ctx.cluster.clone_from(&c.name);
                 }
             }
         }

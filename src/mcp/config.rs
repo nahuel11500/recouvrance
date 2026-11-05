@@ -51,7 +51,7 @@ impl Default for Config {
 
 pub fn hash_token(token: &str) -> String {
     let digest = Sha256::digest(token.as_bytes());
-    digest.iter().map(|b| format!("{b:02x}")).collect()
+    crate::hex::lower(&digest)
 }
 
 pub(super) fn new_token() -> String {

@@ -14,14 +14,7 @@ use serde_json::Value;
 
 use crate::details::OpenObject;
 use crate::k8s;
-
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
-enum Tone {
-    Good,
-    Neutral,
-    Warn,
-    Bad,
-}
+use crate::status::Tone;
 
 struct KindSummary {
     title: &'static str,
@@ -338,7 +331,7 @@ async fn table(
 
 fn ready_state(ready: i64, desired: i64) -> (&'static str, Tone) {
     if desired == 0 {
-        ("Idle", Tone::Neutral)
+        ("Idle", Tone::Done)
     } else if ready >= desired {
         ("Running", Tone::Good)
     } else {
@@ -349,18 +342,14 @@ fn ready_state(ready: i64, desired: i64) -> (&'static str, Tone) {
 fn pod_counts(pods: &Tbl) -> Vec<(String, usize, Tone)> {
     // kubectl's Status column says *why* a pod is unhealthy (CrashLoopBackOff, …).
     // Colors as in the pod list; a status we do not know is a failure reason here.
-    use crate::status::Tone as T;
     tally(pods.rows.iter().map(|r| {
         let status = pods.cell(r, "Status");
         let tone = crate::status::tone(status);
         match (status, tone) {
-            ("", _) => ("Unknown".to_string(), Tone::Warn),
-            ("Completed" | "Succeeded", _) => ("Completed".to_string(), Tone::Neutral),
-            (s, Some(T::Busy)) if s.starts_with("Init:") => ("Initializing".to_string(), Tone::Warn),
-            (s, Some(T::Good)) => (s.to_string(), Tone::Good),
-            (s, Some(T::Done)) => (s.to_string(), Tone::Neutral),
-            (s, Some(T::Busy)) => (s.to_string(), Tone::Warn),
-            (s, Some(T::Bad) | None) => (s.to_string(), Tone::Bad),
+            ("", _) => ("Unknown".to_string(), Tone::Busy),
+            ("Completed" | "Succeeded", _) => ("Completed".to_string(), Tone::Done),
+            (s, Some(Tone::Busy)) if s.starts_with("Init:") => ("Initializing".to_string(), Tone::Busy),
+            (s, tone) => (s.to_string(), tone.unwrap_or(Tone::Bad)),
         }
     }))
 }
@@ -560,11 +549,7 @@ async fn load(client: Client, ns: Option<String>, context: String, tx: futures::
             slot("cronjobs"),
             t.map(|t| {
                 tally(t.rows.iter().map(|r| {
-                    if t.cell(r, "Suspend") == "True" {
-                        ("Suspended", Tone::Neutral)
-                    } else {
-                        ("Scheduled", Tone::Good)
-                    }
+                    if t.cell(r, "Suspend") == "True" { ("Suspended", Tone::Done) } else { ("Scheduled", Tone::Good) }
                 }))
             }),
         ));
@@ -577,12 +562,12 @@ async fn load(client: Client, ns: Option<String>, context: String, tx: futures::
                 tally(t.rows.iter().map(|r| {
                     let (done, want) = t.ratio(r, "Completions");
                     match t.cell(r, "Status") {
-                        "Complete" => ("Complete", Tone::Neutral),
+                        "Complete" => ("Complete", Tone::Done),
                         "Failed" => ("Failed", Tone::Bad),
                         "Running" => ("Running", Tone::Good),
-                        "Suspended" => ("Suspended", Tone::Neutral),
+                        "Suspended" => ("Suspended", Tone::Done),
                         // Older servers have no Status column.
-                        _ if want > 0 && done >= want => ("Complete", Tone::Neutral),
+                        _ if want > 0 && done >= want => ("Complete", Tone::Done),
                         _ => ("Running", Tone::Good),
                     }
                 }))
@@ -604,7 +589,7 @@ async fn load(client: Client, ns: Option<String>, context: String, tx: futures::
             t.map(|t| {
                 tally(t.rows.iter().map(|r| match t.cell(r, "Status") {
                     "Bound" => ("Bound", Tone::Good),
-                    "Pending" => ("Pending", Tone::Warn),
+                    "Pending" => ("Pending", Tone::Busy),
                     _ => ("Lost", Tone::Bad),
                 }))
             }),
@@ -654,8 +639,8 @@ fn helm_counts(releases: &[(Option<String>, BTreeMap<String, String>)]) -> Vec<(
     tally(latest.values().map(|(_, status)| match status.as_str() {
         "deployed" => ("Deployed", Tone::Good),
         "failed" => ("Failed", Tone::Bad),
-        "superseded" | "uninstalled" => ("Superseded", Tone::Neutral),
-        _ => ("Pending", Tone::Warn),
+        "superseded" | "uninstalled" => ("Superseded", Tone::Done),
+        _ => ("Pending", Tone::Busy),
     }))
 }
 
@@ -700,11 +685,11 @@ fn hpa_counts(hpas: &[Value]) -> Vec<(String, usize, Tone)> {
                 .to_string()
         };
         if cond("ScalingLimited") == "True" {
-            ("ScalingLimited", Tone::Warn)
+            ("ScalingLimited", Tone::Busy)
         } else if cond("ScalingActive") == "True" {
             ("AtTarget", Tone::Good)
         } else {
-            ("Unknown", Tone::Warn)
+            ("Unknown", Tone::Busy)
         }
     }))
 }
@@ -715,7 +700,7 @@ fn pdb_counts(pdbs: &[Value]) -> Vec<(String, usize, Tone)> {
         if crate::overview::pdb_blocks(p) {
             ("InsufficientPods", Tone::Bad)
         } else if n(p, "/status/expectedPods") == 0 {
-            ("NoPods", Tone::Neutral)
+            ("NoPods", Tone::Done)
         } else {
             ("DisruptionAllowed", Tone::Good)
         }
@@ -758,16 +743,6 @@ fn pod_usage(list: &Value) -> PodUsage {
 }
 
 impl Dashboard {
-    fn tone(&self, t: Tone, cx: &App) -> Hsla {
-        let th = cx.theme();
-        match t {
-            Tone::Good => th.success,
-            Tone::Neutral => th.muted_foreground,
-            Tone::Warn => th.warning,
-            Tone::Bad => th.danger,
-        }
-    }
-
     fn open_link(
         &self,
         text: String,
@@ -807,9 +782,10 @@ impl Render for Dashboard {
 
         let bars = h_flex().flex_wrap().items_start().gap_4().children(data.kinds.iter().map(|k| {
             let total: usize = k.counts.iter().map(|c| c.1).sum();
-            let segments = k.counts.iter().map(|(_, n, tone)| {
-                div().h_full().bg(self.tone(*tone, cx)).w(relative(*n as f32 / total.max(1) as f32))
-            });
+            let segments = k
+                .counts
+                .iter()
+                .map(|(_, n, tone)| div().h_full().bg(tone.color(cx)).w(relative(*n as f32 / total.max(1) as f32)));
             v_flex()
                 .w(px(170.))
                 .gap_1()
@@ -819,9 +795,9 @@ impl Render for Dashboard {
                 )
                 .child(
                     v_flex().text_xs().children(
-                        k.counts.iter().map(|(label, n, tone)| {
-                            div().text_color(self.tone(*tone, cx)).child(format!("{n} {label}"))
-                        }),
+                        k.counts
+                            .iter()
+                            .map(|(label, n, tone)| div().text_color(tone.color(cx)).child(format!("{n} {label}"))),
                     ),
                 )
                 .when(!k.errors.is_empty(), |d| {
@@ -1050,7 +1026,7 @@ mod tests {
             [
                 ("DisruptionAllowed".to_string(), 1, Tone::Good),
                 ("InsufficientPods".to_string(), 1, Tone::Bad),
-                ("NoPods".to_string(), 1, Tone::Neutral),
+                ("NoPods".to_string(), 1, Tone::Done),
             ]
         );
     }
@@ -1075,13 +1051,13 @@ mod tests {
         let mut counts = pod_counts(&t);
         counts.sort_by(|a, b| a.0.cmp(&b.0));
         let want = [
-            ("Completed", Tone::Neutral),
+            ("Completed", Tone::Done),
             ("Init:Error", Tone::Bad),
-            ("Initializing", Tone::Warn),
+            ("Initializing", Tone::Busy),
             ("NotReady", Tone::Bad),
-            ("Pending", Tone::Warn),
+            ("Pending", Tone::Busy),
             ("Running", Tone::Good),
-            ("Unknown", Tone::Warn),
+            ("Unknown", Tone::Busy),
             ("Unready", Tone::Bad),
         ];
         let got: Vec<(&str, Tone)> = counts.iter().map(|(l, _, t)| (l.as_str(), *t)).collect();

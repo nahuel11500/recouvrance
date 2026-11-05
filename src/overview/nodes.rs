@@ -5,7 +5,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use serde_json::Value;
 
-use super::{Ctx, arr, card, clipped_list, field, heading, mono, row, s, tone_color, usage_bar};
+use super::{Ctx, arr, card, clipped_list, field, heading, mono, row, s, usage_bar};
 use crate::k8s;
 use crate::ui::selectable::selectable;
 
@@ -38,7 +38,11 @@ pub(super) fn node(obj: &Value, cx: &App) -> Div {
                 .pt_4()
                 .child(field(
                     "Status",
-                    div().text_color(tone_color(crate::status::node_tone(&status), cx)).child(status),
+                    div()
+                        .text_color(
+                            crate::status::node_tone(&status).map_or(cx.theme().muted_foreground, |t| t.color(cx)),
+                        )
+                        .child(status),
                     cx,
                 ))
                 .child(field("Kubelet", info("kubeletVersion"), cx))

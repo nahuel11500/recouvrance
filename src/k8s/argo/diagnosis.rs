@@ -830,7 +830,7 @@ pub fn jq_path(path: &[Seg]) -> String {
 }
 
 /// A field that differs: what was applied, and what is live (None: not there).
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FieldDiff {
     pub path: Vec<Seg>,
     pub applied: Option<Value>,
@@ -1021,7 +1021,7 @@ pub enum Compared {
 }
 
 /// How one live object differs from what was applied to it.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Drift {
     pub res: Res,
     pub compared: Compared,
