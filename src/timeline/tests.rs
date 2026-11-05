@@ -3,18 +3,7 @@ use serde_json::{Value, json};
 use super::*;
 
 fn kind(group: &str, k: &str) -> Kind {
-    Kind {
-        ar: kube::discovery::ApiResource {
-            group: group.into(),
-            version: "v1".into(),
-            api_version: if group.is_empty() { "v1".into() } else { format!("{group}/v1") },
-            kind: k.into(),
-            plural: format!("{}s", k.to_lowercase()),
-        },
-        namespaced: true,
-        section: "",
-        label: k.into(),
-    }
+    Kind::fake(group, k)
 }
 
 fn raw(v: &Value) -> Box<RawValue> {

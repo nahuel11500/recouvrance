@@ -385,18 +385,7 @@ mod selector_tests {
     fn which_pods_an_object_selects() {
         use super::{Kind, Selection, pod_selection};
         use serde_json::json;
-        let kind = |group: &str, k: &str| Kind {
-            ar: kube::discovery::ApiResource {
-                group: group.into(),
-                version: "v1".into(),
-                api_version: "v1".into(),
-                kind: k.into(),
-                plural: format!("{}s", k.to_lowercase()),
-            },
-            namespaced: true,
-            section: "",
-            label: String::new(),
-        };
+        let kind = Kind::fake;
         let pdb = kind("policy", "PodDisruptionBudget");
         assert_eq!(pod_selection(&pdb, &json!({"spec": {"minAvailable": 1}})), Selection::Nothing);
         assert_eq!(pod_selection(&pdb, &json!({"spec": {"selector": null}})), Selection::Nothing);

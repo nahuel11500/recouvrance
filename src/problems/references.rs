@@ -712,18 +712,7 @@ mod tests {
     use serde_json::json;
 
     fn kind(group: &str, k: &str) -> Kind {
-        Kind {
-            ar: ApiResource {
-                group: group.into(),
-                version: "v1".into(),
-                api_version: if group.is_empty() { "v1".into() } else { format!("{group}/v1") },
-                kind: k.into(),
-                plural: if k == "Ingress" { "ingresses".into() } else { format!("{}s", k.to_lowercase()) },
-            },
-            namespaced: true,
-            section: "",
-            label: format!("{k}s"),
-        }
+        Kind { label: format!("{k}s"), ..Kind::fake(group, k) }
     }
 
     /// A fake list of objects of one kind, as (namespace, name), listed in every namespace.
