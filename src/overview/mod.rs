@@ -624,6 +624,17 @@ fn diagnosis(ctx: &Ctx, cx: &App) -> Option<Div> {
     )
 }
 
+/// A condition's status color: good, bad or unknown by its polarity (`status::condition_tone`),
+/// a problem the object reports about itself (True when True is bad) in the warning color.
+fn condition_color(ty: &str, status: &str, cx: &App) -> Hsla {
+    use crate::status::Tone;
+    match crate::status::condition_tone(ty, status) {
+        Some(Tone::Bad) if status == "True" => Tone::Busy.color(cx),
+        Some(tone) => tone.color(cx),
+        None => cx.theme().muted_foreground,
+    }
+}
+
 fn conditions(obj: &Value, cx: &App) -> AnyElement {
     let conds = arr(obj, "/status/conditions");
     if conds.is_empty() {
@@ -635,13 +646,7 @@ fn conditions(obj: &Value, cx: &App) -> AnyElement {
         .children(conds.iter().map(|c| {
             let status = c["status"].as_str().unwrap_or_default().to_string();
             let ty = c["type"].as_str().unwrap_or_default();
-            use crate::status::Tone;
-            let color = match crate::status::condition_tone(ty, &status) {
-                // A problem the object reports about itself.
-                Some(Tone::Bad) if status == "True" => Tone::Busy.color(cx),
-                Some(tone) => tone.color(cx),
-                None => muted,
-            };
+            let color = condition_color(ty, &status, cx);
             h_flex()
                 .gap_3()
                 .py_1()

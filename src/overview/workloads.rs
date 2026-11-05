@@ -7,8 +7,8 @@ use gpui_kit::*;
 use serde_json::Value;
 
 use super::{
-    Ctx, age_of, arr, card, clipped_list, container_usage_row, field, heading, heading_for, load_notes, mono, n, pairs,
-    pods_table, row, s, scroll, state_color, usage_heading,
+    Ctx, age_of, arr, card, clipped_list, condition_color, container_usage_row, field, heading, heading_for,
+    load_notes, mono, n, pairs, pods_table, row, s, scroll, state_color, usage_heading,
 };
 use crate::k8s;
 use crate::ui::selectable::selectable;
@@ -26,11 +26,18 @@ pub(super) fn workload(ctx: &Ctx, cx: &App) -> Div {
         };
         format!("surge: {}, unavailable: {}", v("maxSurge"), v("maxUnavailable"))
     });
+    // The conditions that hold, each in its polarity's color: a True `ReplicaFailure` is a
+    // problem, not one more good sign.
     let true_conditions: Vec<String> = arr(obj, "/status/conditions")
         .iter()
         .filter(|c| c["status"].as_str() == Some("True"))
         .filter_map(|c| c["type"].as_str().map(String::from))
         .collect();
+    let conditions_shown = h_flex().gap_3().flex_wrap().children(
+        true_conditions
+            .iter()
+            .map(|ty| div().text_color(condition_color(ty, "True", cx)).child(selectable(ty.clone()))),
+    );
 
     let template_spec =
         if ctx.kind.is("batch", "CronJob") { "/spec/jobTemplate/spec/template/spec" } else { "/spec/template/spec" };
@@ -47,7 +54,7 @@ pub(super) fn workload(ctx: &Ctx, cx: &App) -> Div {
                 ))
             })
             .when_some(s(obj, "/spec/schedule"), |d, sch| d.child(field("Schedule", mono(sch.to_string(), cx), cx)))
-            .when(!true_conditions.is_empty(), |d| d.child(field("Conditions", true_conditions.join("  "), cx))),
+            .when(!true_conditions.is_empty(), |d| d.child(field("Conditions", conditions_shown, cx))),
     );
     root = root.child(scheduling(obj, template_spec, cx));
 
