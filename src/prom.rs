@@ -276,50 +276,39 @@ pub async fn pod_usage(
     pods: &[String],
     minutes: i64,
 ) -> Result<(Series, Series)> {
-    let sel = format!(r#"namespace="{ns}",pod=~"{}",container!="",container!="POD""#, pods_regex(pods));
-    let step = (minutes * 60 / 120).max(15);
-    let cpu = range(
-        client.clone(),
-        target.clone(),
-        format!("sum(rate(container_cpu_usage_seconds_total{{{sel}}}[{}s]))", step.max(300)),
-        minutes,
-        step,
-    );
-    let mem = range(client, target, format!("sum(container_memory_working_set_bytes{{{sel}}})"), minutes, step);
-    let (cpu, mem) = futures::join!(cpu, mem);
-    Ok((cpu?, mem?))
+    let sel = format!(r#"namespace="{ns}",pod=~"{}","#, pods_regex(pods));
+    usage(client, target, &sel, minutes).await
 }
 
 /// CPU (cores) and memory (bytes) used by every container in the cluster.
 pub async fn cluster_usage(client: Client, target: String, minutes: i64) -> Result<(Series, Series)> {
-    let sel = r#"container!="",container!="POD""#;
-    let step = (minutes * 60 / 120).max(15);
-    let cpu = range(
-        client.clone(),
-        target.clone(),
-        format!("sum(rate(container_cpu_usage_seconds_total{{{sel}}}[{}s]))", step.max(300)),
-        minutes,
-        step,
-    );
-    let mem = range(client, target, format!("sum(container_memory_working_set_bytes{{{sel}}})"), minutes, step);
-    let (cpu, mem) = futures::join!(cpu, mem);
-    Ok((cpu?, mem?))
+    usage(client, target, "", minutes).await
 }
 
 /// CPU (cores) and memory (bytes) used by all containers on a node.
 pub async fn node_usage(client: Client, target: String, node: &str, minutes: i64) -> Result<(Series, Series)> {
-    let sel = format!(r#"node="{node}",container!="",container!="POD""#);
+    usage(client, target, &format!(r#"node="{node}","#), minutes).await
+}
+
+/// CPU and memory of the containers `matchers` picks (`label="value",` terms, each with its
+/// comma, or nothing for all), over the last `minutes`: about 120 points.
+async fn usage(client: Client, target: String, matchers: &str, minutes: i64) -> Result<(Series, Series)> {
     let step = (minutes * 60 / 120).max(15);
-    let cpu = range(
-        client.clone(),
-        target.clone(),
-        format!("sum(rate(container_cpu_usage_seconds_total{{{sel}}}[{}s]))", step.max(300)),
-        minutes,
-        step,
-    );
-    let mem = range(client, target, format!("sum(container_memory_working_set_bytes{{{sel}}})"), minutes, step);
+    let (cpu, mem) = usage_queries(matchers, step);
+    let cpu = range(client.clone(), target.clone(), cpu, minutes, step);
+    let mem = range(client, target, mem, minutes, step);
     let (cpu, mem) = futures::join!(cpu, mem);
     Ok((cpu?, mem?))
+}
+
+/// The CPU (a rate over at least 5 minutes, so a sparse scrape still draws a line) and
+/// working-set memory queries, the pause container and pod-level series left out.
+fn usage_queries(matchers: &str, step: i64) -> (String, String) {
+    let sel = format!(r#"{matchers}container!="",container!="POD""#);
+    (
+        format!("sum(rate(container_cpu_usage_seconds_total{{{sel}}}[{}s]))", step.max(300)),
+        format!("sum(container_memory_working_set_bytes{{{sel}}})"),
+    )
 }
 
 /// GPU use from NVIDIA's DCGM exporter: average utilization (%), memory used and total (bytes),
@@ -428,6 +417,18 @@ mod target_tests {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn usage_queries_pick_the_containers_asked() {
+        let (cpu, mem) = super::usage_queries(r#"node="n1","#, 30);
+        assert_eq!(
+            cpu,
+            r#"sum(rate(container_cpu_usage_seconds_total{node="n1",container!="",container!="POD"}[300s]))"#
+        );
+        assert_eq!(mem, r#"sum(container_memory_working_set_bytes{node="n1",container!="",container!="POD"})"#);
+        let (cpu, _) = super::usage_queries("", 600);
+        assert_eq!(cpu, r#"sum(rate(container_cpu_usage_seconds_total{container!="",container!="POD"}[600s]))"#);
+    }
+
     use std::time::{Duration, Instant};
 
     #[test]
