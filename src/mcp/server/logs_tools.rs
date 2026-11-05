@@ -8,8 +8,8 @@ use rmcp::{schemars, tool, tool_router};
 use serde::Deserialize;
 use serde_json::json;
 
-use super::{KubeMcp, MAX_LOG_BYTES, access_for, check_identity};
-use crate::k8s::{self, ObjectRef};
+use super::{KubeMcp, MAX_LOG_BYTES, access_for, get_named};
+use crate::k8s;
 use crate::mcp::{Mode, Verb};
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -50,19 +50,10 @@ impl KubeMcp {
         let access = access_for(&kind, &p.context, Verb::Get, Some(p.namespace.clone()), Some(p.name.clone()));
         self.authorize(&mut call, &access).await?;
         let (_, pod_kind) = self.kind(&call, &p.context, "pods").await?;
-        let obj = ObjectRef {
-            kind: kind.clone(),
-            name: p.name.clone(),
-            namespace: Some(p.namespace.clone()),
-            uid: String::new(),
-        };
-        let value = match k8s::get_object(client.clone(), obj).await {
+        let value = match get_named(&client, &kind, Some(&p.namespace), &p.name, false).await {
             Ok(v) => v,
             Err(e) => return call.finish(Err(e)),
         };
-        if let Err(e) = check_identity(&kind, Some(&p.namespace), &p.name, &value) {
-            return call.finish(Err(e));
-        }
         let Some(Some(selector)) = k8s::pod_selection(&kind, &value).list_selector() else {
             return call.finish(Err(anyhow::anyhow!("{} {} selects no pods", kind.ar.kind, p.name)));
         };

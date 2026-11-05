@@ -10,7 +10,7 @@ use rmcp::{schemars, tool, tool_router};
 use serde::Deserialize;
 use serde_json::json;
 
-use super::{KubeMcp, access_for, check_identity, require_ns, visible};
+use super::{KubeMcp, access_for, get_named, require_ns, visible};
 use crate::history::{self, Allowed, Read};
 use crate::k8s::{self, Kind, ObjectRef};
 use crate::mcp::{Policy, Verb};
@@ -46,15 +46,11 @@ impl KubeMcp {
         let access = access_for(&kind, &p.context, Verb::Get, p.namespace.clone(), Some(p.name.clone()));
         self.authorize(&mut call, &access).await?;
         let ns = if kind.namespaced { p.namespace.clone() } else { None };
-        let obj = ObjectRef { kind: kind.clone(), name: p.name.clone(), namespace: ns.clone(), uid: String::new() };
         // With its managedFields: who wrote it, and when.
-        let value = match k8s::get_object_opts(client.clone(), obj.clone(), true).await {
+        let value = match get_named(&client, &kind, ns.as_deref(), &p.name, true).await {
             Ok(v) => v,
             Err(e) => return call.finish(Err(e)),
         };
-        if let Err(e) = check_identity(&kind, ns.as_deref(), &p.name, &value) {
-            return call.finish(Err(e));
-        }
         let allowed = by_rules(call.policy().clone(), call.approved_rules().to_vec(), p.context.clone());
         let fetched = history::fetch(client.clone(), kind.clone(), ns.clone(), value.clone(), allowed).await;
         let mut errors = fetched.errors;
@@ -68,7 +64,8 @@ impl KubeMcp {
         // Events the rules keep it from reading are said, as a failure is: the history is incomplete.
         if call.may_see(&access_for(&events_kind, &p.context, Verb::List, ns.clone(), None)) {
             let uid = value.pointer("/metadata/uid").and_then(|v| v.as_str()).unwrap_or_default().to_string();
-            match k8s::events_for(client, ObjectRef { uid, ..obj }).await {
+            let obj = ObjectRef { kind: kind.clone(), name: p.name.clone(), namespace: ns.clone(), uid };
+            match k8s::events_for(client, obj).await {
                 Ok(mut events) => {
                     // The check above has no name: an Allow of some event names passes it.
                     let total = events.len();

@@ -8,8 +8,8 @@ use serde_json::json;
 
 use super::{
     CertParams, ContextParam, EventsParams, HistoryParams, KubeMcp, ListParams, LogsParams, MAX_LOG_BYTES,
-    ObjectParams, ProblemsParams, ReachParams, SearchParams, TopParams, access_for, check_identity, describe,
-    format_table, is_secret_object, list_verdict, problem_visible, require_ns, visible,
+    ObjectParams, ProblemsParams, ReachParams, SearchParams, TopParams, access_for, describe, format_table, get_named,
+    is_secret_object, list_verdict, problem_visible, require_ns, visible,
 };
 use crate::k8s;
 use crate::k8s::{Kind, ObjectRef};
@@ -196,15 +196,10 @@ impl KubeMcp {
             let a = access_for(&kind, &p.context, Verb::Reveal, p.namespace.clone(), Some(p.name.clone()));
             call.policy().decide(&a).mode == Mode::Allow
         };
-        let ns = if kind.namespaced { p.namespace } else { None };
-        let obj = ObjectRef { kind: kind.clone(), name: p.name.clone(), namespace: ns.clone(), uid: String::new() };
-        let value = match k8s::get_object(client, obj).await {
+        let value = match get_named(&client, &kind, p.namespace.as_deref(), &p.name, false).await {
             Ok(v) => v,
             Err(e) => return call.finish(Err(e)),
         };
-        if let Err(e) = check_identity(&kind, ns.as_deref(), &p.name, &value) {
-            return call.finish(Err(e));
-        }
         // Masking follows what came back, not only what was asked for.
         let secret = kind.is("", "Secret") || is_secret_object(&value);
         call.finish(k8s::to_yaml(&value, secret, reveal))
@@ -282,13 +277,10 @@ impl KubeMcp {
         self.authorize(&mut call, &access).await?;
         let ns = if kind.namespaced { p.namespace.clone() } else { None };
         let obj = ObjectRef { kind: kind.clone(), name: p.name.clone(), namespace: ns.clone(), uid: String::new() };
-        let value = match k8s::get_object(client.clone(), obj.clone()).await {
+        let value = match get_named(&client, &kind, ns.as_deref(), &p.name, false).await {
             Ok(v) => v,
             Err(e) => return call.finish(Err(e)),
         };
-        if let Err(e) = check_identity(&kind, ns.as_deref(), &p.name, &value) {
-            return call.finish(Err(e));
-        }
         let mut out = format!(
             "{} {}{}\n",
             kind.ar.kind,
@@ -649,19 +641,10 @@ impl KubeMcp {
         };
         let access = access_for(&kind, &p.context, Verb::Get, Some(p.namespace.clone()), Some(p.name.clone()));
         self.authorize(&mut call, &access).await?;
-        let obj = ObjectRef {
-            kind: kind.clone(),
-            name: p.name.clone(),
-            namespace: Some(p.namespace.clone()),
-            uid: String::new(),
-        };
-        let value = match k8s::get_object(client.clone(), obj).await {
+        let value = match get_named(&client, &kind, Some(&p.namespace), &p.name, false).await {
             Ok(v) => v,
             Err(e) => return call.finish(Err(e)),
         };
-        if let Err(e) = check_identity(&kind, Some(p.namespace.as_str()), &p.name, &value) {
-            return call.finish(Err(e));
-        }
         // Each object the checks read must be one the rules let this agent read (`get` by name,
         // `list` for pods, EndpointSlices and IngressClasses), decided before it is read.
         let (policy, approved, context) = (call.policy().clone(), call.approved_rules().to_vec(), p.context.clone());
@@ -752,20 +735,11 @@ impl KubeMcp {
         let (client, kind) = self.kind(&call, &p.context, &p.kind).await?;
         let access = access_for(&kind, &p.context, Verb::Get, Some(p.namespace.clone()), Some(p.name.clone()));
         self.authorize(&mut call, &access).await?;
-        let obj = ObjectRef {
-            kind: kind.clone(),
-            name: p.name.clone(),
-            namespace: Some(p.namespace.clone()),
-            uid: String::new(),
-        };
-        let value = match k8s::get_object(client.clone(), obj).await {
+        // A cluster-scoped kind (a node) is read without the namespace given.
+        let value = match get_named(&client, &kind, Some(&p.namespace), &p.name, false).await {
             Ok(v) => v,
             Err(e) => return call.finish(Err(e)),
         };
-        let ns = kind.namespaced.then_some(p.namespace.as_str());
-        if let Err(e) = check_identity(&kind, ns, &p.name, &value) {
-            return call.finish(Err(e));
-        }
         // The pods to sum: the pod itself, or the workload's pods by its selector that the
         // agent may list.
         let (pods, hidden): (Vec<serde_json::Value>, usize) = if kind.is("", "Pod") {
