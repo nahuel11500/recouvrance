@@ -314,18 +314,7 @@ fn row() -> Div {
 }
 
 fn state_color(text: &str, cx: &App) -> Hsla {
-    tone_color(crate::status::tone(text), cx)
-}
-
-fn tone_color(tone: Option<crate::status::Tone>, cx: &App) -> Hsla {
-    use crate::status::Tone;
-    let t = cx.theme();
-    match tone {
-        Some(Tone::Good) => t.success,
-        Some(Tone::Busy) => t.warning,
-        Some(Tone::Bad) => t.danger,
-        Some(Tone::Done) | None => t.muted_foreground,
-    }
+    crate::status::tone(text).map_or(cx.theme().muted_foreground, |t| t.color(cx))
 }
 
 fn pairs(v: &Value, path: &str) -> Vec<String> {
@@ -648,12 +637,10 @@ fn conditions(obj: &Value, cx: &App) -> AnyElement {
             let ty = c["type"].as_str().unwrap_or_default();
             use crate::status::Tone;
             let color = match crate::status::condition_tone(ty, &status) {
-                Some(Tone::Good) => cx.theme().success,
                 // A problem the object reports about itself.
-                Some(Tone::Bad) if status == "True" => cx.theme().warning,
-                Some(Tone::Bad) => cx.theme().danger,
-                Some(Tone::Busy) => cx.theme().warning,
-                Some(Tone::Done) | None => muted,
+                Some(Tone::Bad) if status == "True" => Tone::Busy.color(cx),
+                Some(tone) => tone.color(cx),
+                None => muted,
             };
             h_flex()
                 .gap_3()
