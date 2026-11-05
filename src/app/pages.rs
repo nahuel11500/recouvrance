@@ -8,8 +8,6 @@ use super::{AppView, Route};
 use crate::details::{DetailPanel, OpenObject};
 use crate::k8s;
 use crate::k8s::{Kind, ObjectRef};
-use crate::ui::cluster::ClusterOverview;
-use crate::ui::dashboard::Dashboard;
 use crate::ui::helm::{HelmList, HelmRelease, OpenRelease};
 
 impl AppView {
@@ -52,7 +50,7 @@ impl AppView {
     }
 
     /// Whether a page was built for the contexts and namespaces shown now.
-    fn scope_matches(&self, page: EntityId) -> bool {
+    pub(super) fn scope_matches(&self, page: EntityId) -> bool {
         self.page_scopes.get(&page) == Some(&self.page_scope())
     }
 
@@ -201,28 +199,6 @@ impl AppView {
         });
     }
 
-    /// Every Argo CD Application of the contexts that serve Argo CD.
-    pub(super) fn open_argo(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        // Not connected: open the cluster switcher instead of doing nothing.
-        if self.clusters.is_empty() {
-            self.ctx_open = true;
-            cx.notify();
-            return;
-        }
-        // One instance per page: reuse it from history instead of piling up pollers.
-        if let Some(existing) = self.history.iter().find_map(|r| match r {
-            Route::Argo(e) => Some(e.clone()),
-            _ => None,
-        }) {
-            self.navigate(Route::Argo(existing), cx);
-            return;
-        }
-        let clusters = self.clusters.clone();
-        let page = cx.new(|cx| crate::ui::argo::ArgoView::new(clusters, window, cx));
-        self.subscribe_argo(&page, window, cx);
-        self.navigate(Route::Argo(page), cx);
-    }
-
     /// Open an Application (on Argo CD's cluster) or where it deploys, from the Argo CD page
     /// (also after F5).
     pub(super) fn subscribe_argo(
@@ -240,59 +216,6 @@ impl AppView {
             this.open_namespace_on(ev.context.clone(), ev.namespace.clone(), window, cx);
         })
         .detach();
-    }
-
-    pub(super) fn open_workloads(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        // Not connected: open the cluster switcher instead of doing nothing.
-        if self.clusters.is_empty() {
-            self.ctx_open = true;
-            cx.notify();
-            return;
-        }
-        // One instance per page: reuse it from history instead of piling up pollers,
-        // unless it was built for other contexts or another namespace.
-        if let Some(existing) = self.history.iter().find_map(|r| match r {
-            Route::Workloads(e) if self.scope_matches(e.entity_id()) => Some(e.clone()),
-            _ => None,
-        }) {
-            self.navigate(Route::Workloads(existing), cx);
-            return;
-        }
-        let scope = self.namespace_scope();
-        let dash = cx.new(|cx| Dashboard::new(scope, cx));
-        self.remember_scope(dash.entity_id());
-        // Released with the page.
-        cx.subscribe_in(&dash, window, |this, _, ev: &OpenObject, window, cx| {
-            let ctx = ev.context.as_ref().and_then(|c| this.clusters.iter().position(|(n, _)| n == c)).unwrap_or(0);
-            this.open_object_in(ctx, &ev.kind, ev.name.clone(), ev.namespace.clone(), window, cx);
-        })
-        .detach();
-        self.navigate(Route::Workloads(dash), cx);
-    }
-
-    pub(super) fn open_cluster(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        // Not connected: open the cluster switcher instead of doing nothing.
-        if self.clusters.is_empty() {
-            self.ctx_open = true;
-            cx.notify();
-            return;
-        }
-        // One instance per page: reuse it from history instead of piling up pollers.
-        if let Some(existing) = self.history.iter().find_map(|r| match r {
-            Route::Cluster(e) => Some(e.clone()),
-            _ => None,
-        }) {
-            self.navigate(Route::Cluster(existing), cx);
-            return;
-        }
-        let page = cx.new(|cx| ClusterOverview::new(self.clusters.clone(), cx));
-        // Released with the page.
-        cx.subscribe_in(&page, window, |this, _, ev: &OpenObject, window, cx| {
-            let ctx = ev.context.as_ref().and_then(|c| this.clusters.iter().position(|(n, _)| n == c)).unwrap_or(0);
-            this.open_object_in(ctx, &ev.kind, ev.name.clone(), ev.namespace.clone(), window, cx);
-        })
-        .detach();
-        self.navigate(Route::Cluster(page), cx);
     }
 
     /// A plugin runs in a terminal page, or in the background with a notification.
@@ -465,64 +388,6 @@ impl AppView {
         self.navigate(Route::Access(page), cx);
     }
 
-    pub(super) fn open_problems(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        // Not connected: open the cluster switcher instead of doing nothing.
-        if self.clusters.is_empty() {
-            self.ctx_open = true;
-            cx.notify();
-            return;
-        }
-        // One instance per page: reuse it from history instead of piling up pollers,
-        // unless it was built for other contexts or another namespace.
-        if let Some(existing) = self.history.iter().find_map(|r| match r {
-            Route::Problems(e) if self.scope_matches(e.entity_id()) => Some(e.clone()),
-            _ => None,
-        }) {
-            self.navigate(Route::Problems(existing), cx);
-            return;
-        }
-        let (scope, kinds, ns) = (self.namespace_scope(), self.cluster_kinds(), self.namespaces.clone());
-        let page = cx.new(|cx| crate::ui::problems_view::ProblemsView::new(scope, kinds, ns, window, cx));
-        self.remember_scope(page.entity_id());
-        // Released with the page.
-        cx.subscribe_in(&page, window, |this, _, ev: &OpenObject, window, cx| {
-            let ctx = ev.context.as_ref().and_then(|c| this.clusters.iter().position(|(n, _)| n == c)).unwrap_or(0);
-            this.open_object_in(ctx, &ev.kind, ev.name.clone(), ev.namespace.clone(), window, cx);
-        })
-        .detach();
-        self.navigate(Route::Problems(page), cx);
-    }
-
-    /// The Timeline page, for the connected clusters: one instance, reused from history
-    /// while it was built for the same clusters.
-    pub(super) fn open_timeline(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        // Not connected: open the cluster switcher instead of doing nothing.
-        if self.clusters.is_empty() {
-            self.ctx_open = true;
-            cx.notify();
-            return;
-        }
-        if let Some(existing) = self.history.iter().find_map(|r| match r {
-            Route::Timeline(e) if self.scope_matches(e.entity_id()) => Some(e.clone()),
-            _ => None,
-        }) {
-            self.navigate(Route::Timeline(existing), cx);
-            return;
-        }
-        let (scope, ns) = (self.namespace_scope(), self.namespaces.clone());
-        let page = cx.new(|cx| crate::ui::timeline_view::TimelineView::new(scope, ns, window, cx));
-        self.remember_scope(page.entity_id());
-        // Released with the page. A row of a context not connected has no Open button.
-        cx.subscribe_in(&page, window, |this, _, ev: &OpenObject, window, cx| {
-            let Some(ctx) = ev.context.as_ref().and_then(|c| this.clusters.iter().position(|(n, _)| n == c)) else {
-                return;
-            };
-            this.open_object_in(ctx, &ev.kind, ev.name.clone(), ev.namespace.clone(), window, cx);
-        })
-        .detach();
-        self.navigate(Route::Timeline(page), cx);
-    }
-
     pub(super) fn open_apply(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some((context, client)) = self.clusters.first().cloned() else { return };
         let (kinds, ns) = (self.kinds.clone(), self.namespace.clone());
@@ -543,20 +408,6 @@ impl AppView {
         };
         term.update(cx, |t, cx| t.focus(window, cx));
         self.navigate(Route::Terminal(term), cx);
-    }
-
-    pub(super) fn open_helm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        // Not connected: open the cluster switcher instead of doing nothing.
-        if self.clusters.is_empty() {
-            self.ctx_open = true;
-            cx.notify();
-            return;
-        }
-        let scope = self.namespace_scope();
-        let list = cx.new(|cx| HelmList::new(scope, window, cx));
-        self.remember_scope(list.entity_id());
-        self.subscribe_helm(&list, window, cx);
-        self.navigate(Route::Helm(list), cx);
     }
 
     /// Open a release or the install page from the release list (also after F5).
