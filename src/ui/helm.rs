@@ -21,6 +21,8 @@ use crate::helm::{
 };
 use crate::history::DiffLine;
 use crate::k8s;
+use crate::overview::field;
+use crate::ui::selectable::selectable;
 
 /// Why an upgrade built from revision `shown` must not run, given the release's newest
 /// revision now: it would send that revision's chart version and values over newer ones.
@@ -709,14 +711,6 @@ impl HelmRelease {
                 })
         });
     }
-
-    fn field(label: &str, value: impl IntoElement, cx: &App) -> Div {
-        v_flex()
-            .min_w(px(160.))
-            .gap_0p5()
-            .child(div().text_xs().text_color(cx.theme().muted_foreground).child(label.to_string()))
-            .child(div().text_sm().child(value))
-    }
 }
 
 impl Render for HelmRelease {
@@ -743,15 +737,15 @@ impl Render for HelmRelease {
                         .flex_wrap()
                         .gap_x_8()
                         .gap_y_4()
-                        .child(Self::field("Status", div().text_color(status_color(&r.status, cx)).child(r.status.clone()), cx))
-                        .child(Self::field("Revision", r.revision.to_string(), cx))
-                        .child(Self::field("Chart", format!("{} {}", r.chart, r.chart_version), cx))
-                        .child(Self::field("App version", r.app_version.clone(), cx))
-                        .child(Self::field("Updated", r.updated.map(|t| format!("{} ago", k8s::age(t))).unwrap_or_default(), cx)),
+                        .child(field("Status", div().text_color(status_color(&r.status, cx)).child(selectable(r.status.clone())), cx))
+                        .child(field("Revision", r.revision.to_string(), cx))
+                        .child(field("Chart", format!("{} {}", r.chart, r.chart_version), cx))
+                        .child(field("App version", r.app_version.clone(), cx))
+                        .child(field("Updated", r.updated.map(|t| format!("{} ago", k8s::age(t))).unwrap_or_default(), cx)),
                 )
-                .child(Self::field("Description", r.description.clone(), cx))
+                .child(field("Description", r.description.clone(), cx))
                 .when(!r.notes.is_empty(), |d| {
-                    d.child(Self::field(
+                    d.child(field(
                         "Notes",
                         div()
                             .p_2()
@@ -898,22 +892,12 @@ impl Render for HelmRelease {
                     .pt_3()
                     .pb_1()
                     .gap_0p5()
-                    .child(
-                        h_flex()
-                            .gap_1()
-                            .text_xs()
-                            .text_color(theme.muted_foreground)
-                            .child(self.context.clone())
-                            .child("·")
-                            .child(div().text_color(theme.blue).child("Helm Release")),
-                    )
+                    .child(crate::details::heading_path(&self.context, "Helm Release", cx))
                     .child(
                         h_flex()
                             .gap_2()
-                            .text_xl()
                             .child(Icon::new(Lucide::Ship).size_5())
-                            .child(div().text_color(theme.muted_foreground).child(format!("{} / ", r.namespace)))
-                            .child(div().font_weight(FontWeight::SEMIBOLD).child(r.name.clone()))
+                            .child(crate::details::heading_name(Some(&r.namespace), &r.name, cx))
                             .child(div().flex_1())
                             .child(
                                 Button::new("helm-uninstall")
