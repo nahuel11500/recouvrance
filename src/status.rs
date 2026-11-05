@@ -1,9 +1,12 @@
 //! What a status word means, for pods and for any CRD's status column ("`SecretSynced`",
 //! "Valid", "Healthy", "Progressing"…): one classifier for tables, overviews and the dashboard.
 
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+/// What a status says, best first: the order lists sort by (the dashboard's counts). Its
+/// color is `Tone::color`, in the UI.
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone, Copy)]
 pub(crate) enum Tone {
     Good,
+    /// Finished, idle or suspended: nothing to do, nothing wrong.
     Done,
     Busy,
     Bad,

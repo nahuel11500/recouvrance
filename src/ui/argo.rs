@@ -535,7 +535,7 @@ impl ArgoView {
                 Some(when) => format!("{phase}, {when} ago"),
                 None => phase.clone(),
             };
-            div().text_color(tone_color(argo::operation_tone(phase), cx)).child(text)
+            div().text_color(argo::operation_tone(phase).color(cx)).child(text)
         });
         let destination = match &a.on {
             Some(context) => div().child(argo::destination_text(context, &a.dest.namespace)),
@@ -555,7 +555,7 @@ impl ArgoView {
                     .flex_none()
                     .gap_1p5()
                     .overflow_hidden()
-                    .child(div().size(px(7.)).flex_none().rounded_full().bg(tone_color(rows.tones[s.ix], cx)))
+                    .child(div().size(px(7.)).flex_none().rounded_full().bg(rows.tones[s.ix].color(cx)))
                     .child(
                         div()
                             .flex_1()
@@ -577,12 +577,12 @@ impl ArgoView {
             .child(column(130., true).text_color(muted).child(app.project.clone()))
             .child(
                 column(90., false)
-                    .text_color(tone_color(argo::sync_tone(&app.sync, app.automated), cx))
+                    .text_color(argo::sync_tone(&app.sync, app.automated).color(cx))
                     .child(app.sync.clone()),
             )
             .child(
                 column(100., false)
-                    .text_color(tone_color(argo::listed_health_tone(&app.health, app.automated), cx))
+                    .text_color(argo::listed_health_tone(&app.health, app.automated).color(cx))
                     .child(app.health.clone()),
             )
             .child(
@@ -769,16 +769,6 @@ fn row_menu(k: &Key, has_destination: bool, view: WeakEntity<ArgoView>) -> impl 
 async fn read(clusters: Vec<(String, Client)>, exec: &BackgroundExecutor) -> Rows {
     let fleet = argo::fleet(clusters).await;
     exec.spawn(async move { Rows::new(fleet) }).await
-}
-
-fn tone_color(tone: Tone, cx: &App) -> Hsla {
-    let t = cx.theme();
-    match tone {
-        Tone::Good => t.success,
-        Tone::Busy => t.warning,
-        Tone::Bad => t.danger,
-        Tone::Done => t.muted_foreground,
-    }
 }
 
 impl Render for ArgoView {

@@ -479,16 +479,7 @@ impl Render for DetailPanel {
             .and_then(|o| o.pointer("/metadata/creationTimestamp"))
             .and_then(|v| v.as_str())
             .and_then(|t| t.parse::<jiff::Timestamp>().ok());
-        let dot = {
-            use crate::status::Tone;
-            let theme = cx.theme();
-            match self.object.as_ref().map_or(Tone::Good, |o| title_tone(&self.obj.kind, o)) {
-                Tone::Good => theme.success,
-                Tone::Busy => theme.warning,
-                Tone::Bad => theme.danger,
-                Tone::Done => theme.muted_foreground,
-            }
-        };
+        let dot = self.object.as_ref().map_or(crate::status::Tone::Good, |o| title_tone(&self.obj.kind, o)).color(cx);
         let full_name = self.obj.name.clone();
         let actions = h_flex()
             .gap_1()
