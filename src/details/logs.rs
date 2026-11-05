@@ -252,7 +252,7 @@ impl LogsView {
                     // The listing is the first pod's.
                     let mut known = this.pod_containers.clone();
                     if let Some(first) = known.first_mut().filter(|k| k.is_empty()) {
-                        *first = names.clone();
+                        first.clone_from(&names);
                     }
                     this.set_containers(names, window, cx);
                     if !this.paused && !same_reads(&before, &this.reads(), &known) {

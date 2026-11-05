@@ -573,7 +573,7 @@ impl AgentsView {
             .chain(a.contexts.iter().map(|c| (Some(c.clone()), c.clone())))
             .map(|(c, label)| {
                 let on = a.context == c;
-                chip(format!("act-ctx-{label}").into(), label, on, Box::new(move |a| a.context = c.clone()))
+                chip(format!("act-ctx-{label}").into(), label, on, Box::new(move |a| a.context.clone_from(&c)))
             });
         let agents = self.hub.config().agents;
         let agent_chips = (agents.len() > 1).then(|| {
@@ -581,7 +581,7 @@ impl AgentsView {
                 .chain(agents.iter().map(|ag| (Some(ag.id.clone()), ag.name.clone())))
                 .map(|(id, label)| {
                     let on = a.agent == id;
-                    chip(format!("act-agent-{label}").into(), label, on, Box::new(move |a| a.agent = id.clone()))
+                    chip(format!("act-agent-{label}").into(), label, on, Box::new(move |a| a.agent.clone_from(&id)))
                 })
                 .collect::<Vec<_>>()
         });
@@ -646,7 +646,7 @@ impl AgentsView {
         let see_all =
             Button::new("act-see-all").small().outline().icon(Lucide::Activity).label("See all activity").on_click(
                 cx.listener(move |this, _, _, cx| {
-                    this.activity.agent = agent.clone();
+                    this.activity.agent.clone_from(&agent);
                     this.all_activity = true;
                     cx.notify();
                 }),

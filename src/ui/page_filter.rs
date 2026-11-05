@@ -1,7 +1,7 @@
 //! The filter box of the Timeline and Problems pages: `ctx:`, `ns:` and `kind:` terms, the
 //! rest searched as text. Every term must match, ignoring case.
 
-#[derive(Default, Debug, PartialEq)]
+#[derive(Default, Debug, PartialEq, Eq)]
 pub struct PageFilter {
     pub context: Vec<String>,
     pub namespace: Vec<String>,

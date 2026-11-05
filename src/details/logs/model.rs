@@ -597,10 +597,10 @@ mod tests {
 
     #[test]
     fn detects_levels() {
-        assert!(level_of(r#"{"levelname":"INFO","msg":"no error here"}"#) == Some(Level::Info));
-        assert!(level_of("time=1 level=warn msg=x") == Some(Level::Warn));
-        assert!(level_of("E1015 12:00:00.1 1 foo.go:1] boom") == Some(Level::Error));
-        assert!(level_of("2025/07/22 08:56:50 [error] 34#34: open()") == Some(Level::Error));
+        assert_eq!(level_of(r#"{"levelname":"INFO","msg":"no error here"}"#), Some(Level::Info));
+        assert_eq!(level_of("time=1 level=warn msg=x"), Some(Level::Warn));
+        assert_eq!(level_of("E1015 12:00:00.1 1 foo.go:1] boom"), Some(Level::Error));
+        assert_eq!(level_of("2025/07/22 08:56:50 [error] 34#34: open()"), Some(Level::Error));
         assert!(level_of("127.0.0.1 - - GET /a 200").is_none());
     }
 

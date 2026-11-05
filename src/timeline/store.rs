@@ -142,7 +142,7 @@ pub fn file_name(context: &str) -> String {
         .take(80)
         .collect();
     let digest = Sha256::digest(context.as_bytes());
-    let hash: String = digest.iter().take(4).map(|b| format!("{b:02x}")).collect();
+    let hash = crate::hex::lower(&digest[..4]);
     format!("{readable}-{hash}.jsonl")
 }
 

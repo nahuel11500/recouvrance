@@ -292,7 +292,7 @@ fn manifest_objects(planned: &[(Kind, Option<String>, String, serde_json::Value)
         .map(|(kind, ns, name, doc)| {
             let secret = kind.is("", "Secret") || is_secret_object(doc);
             let yaml = k8s::to_yaml(doc, secret, false).unwrap_or_default();
-            let hash: String = sha2::Sha256::digest(yaml.as_bytes())[..6].iter().map(|b| format!("{b:02x}")).collect();
+            let hash = crate::hex::lower(&sha2::Sha256::digest(yaml.as_bytes())[..6]);
             let ns = ns.as_ref().map(|n| format!("{n}/")).unwrap_or_default();
             format!("{} {ns}{name} sha256:{hash}", kind.ar.kind)
         })

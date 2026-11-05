@@ -1006,7 +1006,7 @@ mod tests {
         std::fs::write(&file, &data).unwrap();
         let mut read = Vec::new();
         upload_source(&file).await.unwrap().read_to_end(&mut read).await.unwrap();
-        assert!(read == data);
+        assert_eq!(read, data);
         assert!(upload_source(&dir).await.is_err());
         assert!(upload_source(&dir.join("missing")).await.is_err());
         let _ = std::fs::remove_dir_all(&dir);

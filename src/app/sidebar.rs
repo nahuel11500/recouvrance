@@ -484,7 +484,7 @@ impl AppView {
                 );
             }
             if kind.ar.group != group {
-                group = kind.ar.group.clone();
+                group.clone_from(&kind.ar.group);
                 let g = group.clone();
                 rows.push(
                     h_flex()

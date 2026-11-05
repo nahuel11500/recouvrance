@@ -14,7 +14,7 @@ const SLACK: Duration = Duration::from_secs(3);
 const LONGEST: Duration = Duration::from_secs(300);
 
 /// What one read of metrics-server says about time.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Reading {
     /// The newest measure in the list (each item has its own `timestamp`).
     pub newest: Option<Timestamp>,
@@ -161,7 +161,7 @@ fn unsigned(d: SignedDuration) -> Duration {
 }
 
 /// How old the numbers shown are, and how often metrics-server measures.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Freshness {
     /// When the newest measure was taken, on this machine's monotonic clock.
     pub measured: Option<Instant>,

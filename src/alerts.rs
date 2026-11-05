@@ -15,7 +15,7 @@ use crate::k8s::{self, Kind};
 use crate::problems::{Problem, Scan, Severity};
 
 /// One alert, as Prometheus reports it.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Alert {
     pub labels: BTreeMap<String, String>,
     /// Firing; otherwise pending (its condition holds, not for long enough yet).
@@ -518,7 +518,7 @@ pub fn add(scan: &mut Scan, alerts: &Alerts, namespaces: &[String]) {
 }
 
 /// What a detail page shows alerts for.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Focus {
     /// Every alert labeled with this namespace.
     Namespace(String),

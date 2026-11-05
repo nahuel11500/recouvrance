@@ -358,7 +358,7 @@ fn binding_name(role_kind: &str, role: &str, subject: &serde_json::Value) -> Str
         .take(240)
         .collect();
     let digest = Sha256::digest(format!("{role_kind}\n{role}\n{kind}\n{ns}\n{name}").as_bytes());
-    let hash: String = digest.iter().take(4).map(|b| format!("{b:02x}")).collect();
+    let hash = crate::hex::lower(&digest[..4]);
     format!("{readable}-{hash}")
 }
 

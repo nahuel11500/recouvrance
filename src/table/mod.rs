@@ -483,7 +483,7 @@ impl ResourceTable {
             }
             for picked in [&mut self.selected, &mut self.menu_row].into_iter().flatten() {
                 if picked.0 == ctx && picked.1 == stand_in {
-                    picked.1 = uid.clone();
+                    picked.1.clone_from(&uid);
                 }
             }
         }
