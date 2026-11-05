@@ -1,7 +1,7 @@
 //! Workloads overview: status bars per kind, recent warnings and restarts,
 //! and containers close to their limits.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 
 use gpui_kit::component::{ActiveTheme as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
@@ -39,6 +39,8 @@ enum Section {
     Warnings,
     /// Restarts and containers near their limits, from the pods.
     Pods,
+    /// Containers near their limits: metrics-server's usage.
+    Usage,
 }
 
 /// Card order on the page.
@@ -82,6 +84,8 @@ struct ClusterState {
     /// Why the warnings, or the pods behind restarts and limits, could not be listed.
     warnings_error: Option<String>,
     pods_error: Option<String>,
+    /// Why the usage set against limits could not be read.
+    usage_error: Option<String>,
 }
 
 struct Warning {
@@ -123,6 +127,8 @@ struct Data {
     /// Clusters whose warnings, or pods, could not be listed (and why).
     warnings_errors: Vec<String>,
     pods_errors: Vec<String>,
+    /// Clusters whose usage could not be read: their limits were not checked.
+    usage_errors: Vec<String>,
 }
 
 pub struct Dashboard {
@@ -194,9 +200,10 @@ impl Dashboard {
             // Data arriving clears an earlier failure; a failure follows its (empty) data.
             Piece::Warnings(w) => (state.warnings, state.warnings_error) = (Some(w), None),
             Piece::Restarts(r) => (state.restarts, state.pods_error) = (Some(r), None),
-            Piece::Hot(h, skipped) => state.hot = Some((h, skipped)),
+            Piece::Hot(h, skipped) => (state.hot, state.usage_error) = (Some((h, skipped)), None),
             Piece::Failed(Section::Warnings, e) => state.warnings_error = Some(e),
             Piece::Failed(Section::Pods, e) => state.pods_error = Some(e),
+            Piece::Failed(Section::Usage, e) => state.usage_error = Some(e),
             Piece::Done(_) => {}
         }
         cx.notify();
@@ -229,6 +236,7 @@ impl Dashboard {
             }
             out.warnings_errors.extend(state.warnings_error.iter().map(|e| about(&state.context, e)));
             out.pods_errors.extend(state.pods_error.iter().map(|e| about(&state.context, e)));
+            out.usage_errors.extend(state.usage_error.iter().map(|e| about(&state.context, e)));
             for w in state.warnings.iter().flatten() {
                 match out.warnings.iter_mut().find(|x| x.reason == w.reason) {
                     Some(x) => {
@@ -394,27 +402,29 @@ struct PodStatusLite {
     container_statuses: Vec<Value>,
 }
 
+/// What `pod_details` found: restarts, containers near their limits, and why usage could
+/// not be read (limits then unchecked, not fine).
+type Details = (Vec<Restart>, Vec<Hot>, Option<String>);
+
 /// Restarts in the last hour and containers near their limits, from pod specs.
-async fn pod_details(client: &Client, ns: Option<&str>, context: &str) -> Result<(Vec<Restart>, Vec<Hot>), String> {
+async fn pod_details(client: &Client, ns: Option<&str>, context: &str) -> Result<Details, String> {
     let usage = async {
-        match ns {
-            _ if !crate::settings::metrics_on(context) => PodUsage::new(),
-            Some(ns) => k8s::container_usage(client.clone(), ns.to_string(), None)
-                .await
-                .unwrap_or_default()
-                .into_iter()
-                .map(|(pod, u)| ((ns.to_string(), pod), u))
-                .collect(),
-            None => all_usage(client).await,
+        if !crate::settings::metrics_on(context) {
+            return Ok(k8s::PodContainerUsage::new());
         }
+        k8s::pod_usage(client.clone(), ns.map(String::from), None).await.map(|(u, _)| u)
     };
     let pods = async {
         k8s::lists::list_lean::<PodDetail>(client.clone(), k8s::ar_of::<core::Pod>(), ns.map(String::from))
             .await
             .map_err(|e| k8s::lists::load_error(&e))
     };
-    let (pods, usage): (Result<Vec<PodDetail>, String>, PodUsage) = futures::join!(pods, usage);
+    let (pods, usage) = futures::join!(pods, usage);
     let pods = pods?;
+    let (usage, usage_error) = match usage {
+        Ok(u) => (u, None),
+        Err(e) => (k8s::PodContainerUsage::new(), Some(unchecked_why(&e))),
+    };
     let hour_ago = jiff::Timestamp::now() - jiff::SignedDuration::from_secs(3600);
     let (mut restarts, mut hot) = (Vec::new(), Vec::new());
     for p in &pods {
@@ -453,7 +463,16 @@ async fn pod_details(client: &Client, ns: Option<&str>, context: &str) -> Result
         }
     }
     restarts.sort_by_key(|r| std::cmp::Reverse(r.when));
-    Ok((restarts, hot))
+    Ok((restarts, hot, usage_error))
+}
+
+/// Why limits were not checked: metrics-server missing, refused or failing.
+fn unchecked_why(e: &anyhow::Error) -> String {
+    if k8s::is_not_found(e) {
+        "limits not checked: no metrics-server".into()
+    } else {
+        format!("limits not checked: usage {}", k8s::lists::load_error(e))
+    }
 }
 
 /// Restarts in the last hour from kubectl's table ("3 (12m ago)"), for very large clusters.
@@ -503,12 +522,19 @@ async fn load(client: Client, ns: Option<String>, context: String, tx: futures::
         };
         send(Piece::Kind(slot("pods"), Ok(pod_counts(&t))));
         if t.rows.len() <= FULL_POD_LIMIT {
-            let details = pod_details(&client, ns.as_deref(), &context).await;
-            let (restarts, hot) = details.clone().unwrap_or_default();
-            send(Piece::Restarts(restarts));
-            send(Piece::Hot(hot, false));
-            if let Err(e) = details {
-                send(Piece::Failed(Section::Pods, e));
+            match pod_details(&client, ns.as_deref(), &context).await {
+                Ok((restarts, hot, usage_error)) => {
+                    send(Piece::Restarts(restarts));
+                    send(Piece::Hot(hot, false));
+                    if let Some(e) = usage_error {
+                        send(Piece::Failed(Section::Usage, e));
+                    }
+                }
+                Err(e) => {
+                    send(Piece::Restarts(Vec::new()));
+                    send(Piece::Hot(Vec::new(), false));
+                    send(Piece::Failed(Section::Pods, e));
+                }
             }
         } else {
             send(Piece::Restarts(table_restarts(&t, &context)));
@@ -725,36 +751,6 @@ fn pdb_counts(pdbs: &[Value]) -> Vec<(String, usize, Tone)> {
 /// "forbidden" / "failed: …" next to a section's title, when its list could not be read.
 fn section_error(errors: &[String], color: Hsla) -> Option<Div> {
     (!errors.is_empty()).then(|| div().text_xs().text_color(color).child(errors.join(", ")))
-}
-
-/// Container usage by (namespace, pod): the same pod name can be in several namespaces.
-type PodUsage = HashMap<(String, String), HashMap<String, (f64, f64)>>;
-
-/// Usage for every namespace in one call.
-async fn all_usage(client: &Client) -> PodUsage {
-    let client = client.clone();
-    k8s::run(async move {
-        let list: Value =
-            client.request(http::Request::get("/apis/metrics.k8s.io/v1beta1/pods").body(Vec::new())?).await?;
-        Ok(pod_usage(&list))
-    })
-    .await
-    .unwrap_or_default()
-}
-
-/// A metrics.k8s.io pod list, by (namespace, pod) then container.
-fn pod_usage(list: &Value) -> PodUsage {
-    let mut out = PodUsage::new();
-    for item in list["items"].as_array().into_iter().flatten() {
-        let key = (st(item, "/metadata/namespace").to_string(), st(item, "/metadata/name").to_string());
-        let entry = out.entry(key).or_default();
-        for c in item["containers"].as_array().into_iter().flatten() {
-            let cpu = c.pointer("/usage/cpu").and_then(Value::as_str).map_or(0.0, k8s::parse_cpu);
-            let mem = c.pointer("/usage/memory").and_then(Value::as_str).map_or(0.0, k8s::parse_bytes);
-            entry.insert(st(c, "/name").to_string(), (cpu, mem));
-        }
-    }
-    out
 }
 
 impl Dashboard {
@@ -984,7 +980,8 @@ impl Render for Dashboard {
                     .gap_2()
                     .items_baseline()
                     .child(div().text_base().child("Abnormal resource usage"))
-                    .children(section_error(&data.pods_errors, theme.danger)),
+                    .children(section_error(&data.pods_errors, theme.danger))
+                    .children(section_error(&data.usage_errors, theme.warning)),
             )
             .child(div().text_xs().text_color(muted).child("Containers using more than 95% of a CPU or memory limit"))
             .child(
@@ -1005,13 +1002,17 @@ impl Render for Dashboard {
                     "More than {FULL_POD_LIMIT} pods: limits not checked everywhere. Pick a namespace to see them."
                 )))
             })
-            .when(hot_rows.is_empty() && !data.hot_skipped && data.pods_errors.is_empty(), |d| {
-                d.child(div().py_2().text_sm().text_color(muted).child(if data.loading_details {
-                    "Loading…"
-                } else {
-                    "Nothing close to its limits."
-                }))
-            })
+            // No all-clear while some usage could not be read.
+            .when(
+                hot_rows.is_empty() && !data.hot_skipped && data.pods_errors.is_empty() && data.usage_errors.is_empty(),
+                |d| {
+                    d.child(div().py_2().text_sm().text_color(muted).child(if data.loading_details {
+                        "Loading…"
+                    } else {
+                        "Nothing close to its limits."
+                    }))
+                },
+            )
             .children(hot_rows);
 
         v_flex()
@@ -1037,7 +1038,7 @@ pub async fn debug_load(client: Client) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{Tbl, Tone, pdb_counts, pod_counts, pod_usage, recent_warnings, restart_ago};
+    use super::{Tbl, Tone, pdb_counts, pod_counts, recent_warnings, restart_ago};
     use crate::k8s;
 
     #[test]
@@ -1108,18 +1109,5 @@ mod tests {
         assert_eq!(restart_ago("3 (12m ago)").unwrap().as_secs(), 720);
         assert_eq!(restart_ago("1 (2d4h ago)").unwrap().as_secs(), 2 * 86400 + 4 * 3600);
         assert!(restart_ago("0").is_none());
-    }
-
-    #[test]
-    fn usage_keeps_namespaces_apart() {
-        let list = serde_json::json!({"items": [
-            {"metadata": {"name": "redis-0", "namespace": "a"},
-             "containers": [{"name": "redis", "usage": {"cpu": "100m", "memory": "1Mi"}}]},
-            {"metadata": {"name": "redis-0", "namespace": "b"},
-             "containers": [{"name": "redis", "usage": {"cpu": "900m", "memory": "2Mi"}}]},
-        ]});
-        let u = pod_usage(&list);
-        let cpu = |ns: &str| u[&(ns.to_string(), "redis-0".to_string())]["redis"].0;
-        assert_eq!((cpu("a"), cpu("b")), (100.0, 900.0));
     }
 }

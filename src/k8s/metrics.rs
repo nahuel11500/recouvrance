@@ -15,6 +15,62 @@ use super::{Pause, TaskGuard, ar_of, get_json, lists, podspec, run, spawn_guarde
 /// Pod usage from metrics-server: (namespace, name) -> (millicores, bytes).
 pub type PodUsage = HashMap<(String, String), (f64, f64)>;
 
+/// Per-container usage of pods: (namespace, pod) -> container -> (millicores, bytes). The
+/// same pod name can be in several namespaces.
+pub type PodContainerUsage = HashMap<(String, String), HashMap<String, (f64, f64)>>;
+
+/// A metrics.k8s.io pod list, by (namespace, pod) then container. A quantity that does not
+/// read counts 0.
+pub fn parse_pod_metrics(list: &serde_json::Value) -> PodContainerUsage {
+    fn text<'a>(v: &'a serde_json::Value, p: &str) -> &'a str {
+        v.pointer(p).and_then(serde_json::Value::as_str).unwrap_or_default()
+    }
+    let mut out = PodContainerUsage::new();
+    for item in list["items"].as_array().into_iter().flatten() {
+        let key = (text(item, "/metadata/namespace").to_string(), text(item, "/metadata/name").to_string());
+        let containers = out.entry(key).or_default();
+        for c in item["containers"].as_array().into_iter().flatten() {
+            let usage = (parse_cpu(text(c, "/usage/cpu")), parse_bytes(text(c, "/usage/memory")));
+            containers.insert(text(c, "/name").to_string(), usage);
+        }
+    }
+    out
+}
+
+/// A pod's usage: its containers' added up.
+fn pod_total(containers: &HashMap<String, (f64, f64)>) -> (f64, f64) {
+    containers.values().fold((0.0, 0.0), |(cpu, mem), (c, m)| (cpu + c, mem + m))
+}
+
+/// The metrics.k8s.io pod list of a namespace (None: every namespace), with the pods a
+/// label selector picks.
+fn pod_metrics_path(namespace: Option<&str>, label_selector: Option<&str>) -> String {
+    let mut path = match namespace {
+        Some(ns) => format!("/apis/metrics.k8s.io/v1beta1/namespaces/{ns}/pods"),
+        None => "/apis/metrics.k8s.io/v1beta1/pods".to_string(),
+    };
+    if let Some(l) = label_selector {
+        path.push_str("?labelSelector=");
+        path.push_str(&url_escape(l));
+    }
+    path
+}
+
+/// Per-container usage of the pods of a namespace (None: every namespace) a label selector
+/// picks, with when it was measured.
+pub async fn pod_usage(
+    client: Client,
+    namespace: Option<String>,
+    label_selector: Option<String>,
+) -> Result<(PodContainerUsage, Reading)> {
+    run(async move {
+        let path = pod_metrics_path(namespace.as_deref(), label_selector.as_deref());
+        let (list, read) = get_metrics(&client, &path).await?;
+        Ok((parse_pod_metrics(&list), read))
+    })
+    .await
+}
+
 /// After a failed poll: wait (doubling up to 5 minutes), then try again.
 async fn retry_wait(failures: &mut u32) {
     *failures = failures.saturating_add(1);
@@ -59,10 +115,7 @@ pub fn watch_pod_metrics(
 ) -> (TaskGuard, mpsc::UnboundedReceiver<(PodUsage, Freshness)>) {
     let (tx, rx) = mpsc::unbounded();
     let guard = spawn_guarded(async move {
-        let path = match &namespace {
-            Some(ns) => format!("/apis/metrics.k8s.io/v1beta1/namespaces/{ns}/pods"),
-            None => "/apis/metrics.k8s.io/v1beta1/pods".to_string(),
-        };
+        let path = pod_metrics_path(namespace.as_deref(), None);
         let mut failures = 0;
         let mut cadence = Cadence::default();
         loop {
@@ -75,17 +128,7 @@ pub fn watch_pod_metrics(
                 continue;
             };
             failures = 0;
-            let mut usage = PodUsage::new();
-            for item in list["items"].as_array().into_iter().flatten() {
-                let ns = item.pointer("/metadata/namespace").and_then(|v| v.as_str()).unwrap_or_default();
-                let name = item.pointer("/metadata/name").and_then(|v| v.as_str()).unwrap_or_default();
-                let (mut cpu, mut mem) = (0.0, 0.0);
-                for c in item["containers"].as_array().into_iter().flatten() {
-                    cpu += c.pointer("/usage/cpu").and_then(|v| v.as_str()).map_or(0.0, parse_cpu);
-                    mem += c.pointer("/usage/memory").and_then(|v| v.as_str()).map_or(0.0, parse_bytes);
-                }
-                usage.insert((ns.to_string(), name.to_string()), (cpu, mem));
-            }
+            let usage: PodUsage = parse_pod_metrics(&list).into_iter().map(|(k, c)| (k, pod_total(&c))).collect();
             let wait = cadence.next(&read, crate::settings::secs(crate::settings::get().metrics_refresh));
             if tx.unbounded_send((usage, Freshness::new(&read, cadence.every()))).is_err() {
                 return;
@@ -121,40 +164,15 @@ pub fn format_bytes(bytes: f64) -> String {
 /// Per-container usage of pods in a namespace: pod -> container -> (millicores, bytes).
 pub type ContainerUsage = HashMap<String, HashMap<String, (f64, f64)>>;
 
-pub async fn container_usage(
-    client: Client,
-    namespace: String,
-    label_selector: Option<String>,
-) -> Result<ContainerUsage> {
-    Ok(container_usage_read(client, namespace, label_selector).await?.0)
-}
-
-/// [`container_usage`], with when it was measured.
+/// Per-container usage of the pods of a namespace a label selector picks, by pod, with when
+/// it was measured.
 pub async fn container_usage_read(
     client: Client,
     namespace: String,
     label_selector: Option<String>,
 ) -> Result<(ContainerUsage, Reading)> {
-    run(async move {
-        let mut path = format!("/apis/metrics.k8s.io/v1beta1/namespaces/{namespace}/pods");
-        if let Some(l) = &label_selector {
-            path.push_str(&format!("?labelSelector={}", url_escape(l)));
-        }
-        let (list, read) = get_metrics(&client, &path).await?;
-        let mut out = ContainerUsage::new();
-        for item in list["items"].as_array().into_iter().flatten() {
-            let pod = item.pointer("/metadata/name").and_then(|v| v.as_str()).unwrap_or_default().to_string();
-            let containers = out.entry(pod).or_default();
-            for c in item["containers"].as_array().into_iter().flatten() {
-                let name = c["name"].as_str().unwrap_or_default().to_string();
-                let cpu = c.pointer("/usage/cpu").and_then(|v| v.as_str()).map_or(0.0, parse_cpu);
-                let mem = c.pointer("/usage/memory").and_then(|v| v.as_str()).map_or(0.0, parse_bytes);
-                containers.insert(name, (cpu, mem));
-            }
-        }
-        Ok((out, read))
-    })
-    .await
+    let (usage, read) = pod_usage(client, Some(namespace), label_selector).await?;
+    Ok((usage.into_iter().map(|((_, pod), c)| (pod, c)).collect(), read))
 }
 
 /// Node usage and allocatable: name -> ((millicores, bytes) used, (millicores, bytes) allocatable).
@@ -303,28 +321,6 @@ pub fn watch_node_metrics(
     (guard, rx)
 }
 
-/// Per-container usage in every namespace: ((namespace, pod), container -> (millicores, bytes)).
-pub async fn all_container_usage(client: Client) -> Result<Vec<((String, String), HashMap<String, (f64, f64)>)>> {
-    run(async move {
-        let list: serde_json::Value =
-            client.request(http::Request::get("/apis/metrics.k8s.io/v1beta1/pods").body(Vec::new())?).await?;
-        let mut out = Vec::new();
-        for item in list["items"].as_array().into_iter().flatten() {
-            let ns = item.pointer("/metadata/namespace").and_then(|v| v.as_str()).unwrap_or_default().to_string();
-            let pod = item.pointer("/metadata/name").and_then(|v| v.as_str()).unwrap_or_default().to_string();
-            let mut c = HashMap::new();
-            for cont in item["containers"].as_array().into_iter().flatten() {
-                let cpu = cont.pointer("/usage/cpu").and_then(|v| v.as_str()).map_or(0.0, parse_cpu);
-                let mem = cont.pointer("/usage/memory").and_then(|v| v.as_str()).map_or(0.0, parse_bytes);
-                c.insert(cont["name"].as_str().unwrap_or_default().to_string(), (cpu, mem));
-            }
-            out.push(((ns, pod), c));
-        }
-        Ok(out)
-    })
-    .await
-}
-
 /// The kubelet's stats summary for a node (filesystem and per-pod ephemeral storage);
 /// needs `nodes/proxy`.
 pub async fn node_stats(client: Client, node: String) -> Option<serde_json::Value> {
@@ -355,6 +351,49 @@ pub fn pods_allocated(pods: &[serde_json::Value], resource: &str) -> (f64, f64) 
         lim += e.limit;
     }
     (req, lim)
+}
+
+#[cfg(test)]
+mod pod_metrics_tests {
+    use super::{parse_pod_metrics, pod_metrics_path, pod_total};
+
+    #[test]
+    fn reads_every_container_of_every_pod() {
+        let list = serde_json::json!({"items": [
+            {"metadata": {"name": "web-1", "namespace": "shop"}, "containers": [
+                {"name": "app", "usage": {"cpu": "250000000n", "memory": "512Ki"}},
+                {"name": "proxy", "usage": {"cpu": "1500u", "memory": "2Mi"}},
+            ]},
+            {"metadata": {"name": "db-0", "namespace": "data"}, "containers": [
+                {"name": "pg", "usage": {"cpu": "1", "memory": "1Gi"}},
+                // A quantity that does not read counts 0.
+                {"name": "exporter", "usage": {"cpu": "?"}},
+            ]},
+            // The same pod name in another namespace stays apart.
+            {"metadata": {"name": "web-1", "namespace": "staging"}, "containers": [
+                {"name": "app", "usage": {"cpu": "10m", "memory": "1Mi"}},
+            ]},
+        ]});
+        let u = parse_pod_metrics(&list);
+        let pod = |ns: &str, name: &str| &u[&(ns.to_string(), name.to_string())];
+        assert_eq!(pod("shop", "web-1")["app"], (250.0, 512.0 * 1024.0));
+        assert_eq!(pod("shop", "web-1")["proxy"], (1.5, 2.0 * 1024.0 * 1024.0));
+        assert_eq!(pod("data", "db-0")["pg"], (1000.0, 1024f64.powi(3)));
+        assert_eq!(pod("data", "db-0")["exporter"], (0.0, 0.0));
+        assert_eq!(pod("staging", "web-1")["app"].0, 10.0);
+        assert_eq!(pod_total(pod("shop", "web-1")), (251.5, 512.0 * 1024.0 + 2.0 * 1024.0 * 1024.0));
+        assert!(parse_pod_metrics(&serde_json::json!({})).is_empty());
+    }
+
+    #[test]
+    fn paths() {
+        assert_eq!(pod_metrics_path(None, None), "/apis/metrics.k8s.io/v1beta1/pods");
+        assert_eq!(pod_metrics_path(Some("shop"), None), "/apis/metrics.k8s.io/v1beta1/namespaces/shop/pods");
+        assert!(
+            pod_metrics_path(Some("shop"), Some("app=web"))
+                .starts_with("/apis/metrics.k8s.io/v1beta1/namespaces/shop/pods?labelSelector=app")
+        );
+    }
 }
 
 #[cfg(test)]
