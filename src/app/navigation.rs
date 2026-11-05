@@ -287,18 +287,7 @@ mod tests {
     use super::{Kind, Route, new_kind};
 
     fn kind(k: &str) -> Kind {
-        Kind {
-            ar: kube::discovery::ApiResource {
-                group: String::new(),
-                version: "v1".into(),
-                api_version: "v1".into(),
-                kind: k.into(),
-                plural: format!("{}s", k.to_lowercase()),
-            },
-            namespaced: true,
-            section: "",
-            label: k.into(),
-        }
+        Kind::fake("", k)
     }
 
     #[test]

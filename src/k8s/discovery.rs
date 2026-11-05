@@ -20,6 +20,25 @@ pub struct Kind {
 }
 
 impl Kind {
+    /// A namespaced kind of `group`/v1 for tests: plural from the kind (`Ingress` →
+    /// `ingresses`), labelled with its kind.
+    #[cfg(test)]
+    pub fn fake(group: &str, kind: &str) -> Self {
+        let lower = kind.to_lowercase();
+        Self {
+            ar: ApiResource {
+                group: group.into(),
+                version: "v1".into(),
+                api_version: if group.is_empty() { "v1".into() } else { format!("{group}/v1") },
+                kind: kind.into(),
+                plural: if lower.ends_with("ss") { format!("{lower}es") } else { format!("{lower}s") },
+            },
+            namespaced: true,
+            section: "",
+            label: kind.into(),
+        }
+    }
+
     pub fn key(&self) -> String {
         format!("{}/{}", self.ar.api_version, self.ar.plural)
     }

@@ -788,18 +788,7 @@ mod tests {
     }
 
     fn kind(group: &str, k: &str) -> Kind {
-        Kind {
-            ar: kube::discovery::ApiResource {
-                group: group.into(),
-                version: "v1".into(),
-                api_version: "v1".into(),
-                kind: k.into(),
-                plural: format!("{}s", k.to_lowercase()),
-            },
-            namespaced: true,
-            section: "",
-            label: k.into(),
-        }
+        Kind::fake(group, k)
     }
 
     #[test]
