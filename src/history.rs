@@ -260,6 +260,30 @@ fn container_images(template: &Value) -> BTreeMap<String, String> {
         .collect()
 }
 
+/// An image and its tag (or digest): `("registry/team/app", ":v2")`; no tag is `""`.
+fn image_parts(image: &str) -> (&str, &str) {
+    if let Some(at) = image.find('@') {
+        return image.split_at(at);
+    }
+    // A colon before the last slash is a registry's port, not a tag.
+    let name_start = image.rfind('/').map_or(0, |i| i + 1);
+    match image[name_start..].rfind(':') {
+        Some(i) => image.split_at(name_start + i),
+        None => (image, ""),
+    }
+}
+
+/// `nginx:1.25 → 1.26`: a new tag of the same image names the image once, by its last path
+/// segment (the repository is in the diff). Another image is written out in full.
+pub(crate) fn image_change(was: &str, now: &str) -> String {
+    let ((old_repo, old_tag), (new_repo, new_tag)) = (image_parts(was), image_parts(now));
+    if old_repo != new_repo || old_tag.is_empty() || new_tag.is_empty() {
+        return format!("{was} → {now}");
+    }
+    let name = old_repo.rsplit('/').next().unwrap_or(old_repo);
+    format!("{name}{old_tag} → {}", new_tag.trim_start_matches(':'))
+}
+
 /// What changed from one pod template to the next, in one line: images first, a restart,
 /// then the other fields that changed.
 fn template_summary(before: Option<&Value>, after: &Value) -> String {
@@ -273,7 +297,7 @@ fn template_summary(before: Option<&Value>, after: &Value) -> String {
     for (c, image) in &images {
         match old.get(c) {
             None => parts.push(format!("container {c} added ({image})")),
-            Some(was) if was != image => parts.push(format!("{c}: {was} → {image}")),
+            Some(was) if was != image => parts.push(format!("{c}: {}", image_change(was, image))),
             Some(_) => {}
         }
     }
@@ -589,9 +613,15 @@ fn field_segment(key: &str) -> String {
     }
     if let Some(item) = key.strip_prefix("k:") {
         let parsed: Value = serde_json::from_str(item).unwrap_or(Value::Null);
-        let label = match parsed.get("name").and_then(Value::as_str) {
-            Some(name) => name.to_string(),
-            None => parsed
+        // An owner reference is keyed by its uid alone: its start is enough to tell them apart.
+        let uid = parsed.as_object().filter(|m| m.len() == 1).and_then(|m| m.get("uid")).and_then(Value::as_str);
+        let label = match (parsed.get("name").and_then(Value::as_str), uid) {
+            (Some(name), _) => name.to_string(),
+            (None, Some(uid)) => match uid.get(..8) {
+                Some(start) if uid.len() > 8 => format!("{start}…"),
+                _ => uid.to_string(),
+            },
+            (None, None) => parsed
                 .as_object()
                 .map(|m| m.values().map(|v| v.as_str().map_or_else(|| v.to_string(), String::from)).collect::<Vec<_>>())
                 .map_or_else(|| item.to_string(), |values| values.join(",")),
@@ -899,7 +929,7 @@ mod tests {
         assert!(!lines.iter().any(|l| format!("{l:?}").contains("pod-template-hash")), "{lines:?}");
         assert_eq!(
             second.summary,
-            "app: nginx:1.25 → nginx:1.26; changed spec.containers[app].env, spec.containers[app].resources"
+            "app: nginx:1.25 → 1.26; changed spec.containers[app].env, spec.containers[app].resources"
         );
     }
 
@@ -912,7 +942,7 @@ mod tests {
         };
         let changes = revision_changes(&[shaped(1, "pg:16"), shaped(2, "pg:17")]);
         assert_eq!(changes[1].object, "Revision 2 · ControllerRevision db-2");
-        assert_eq!(changes[1].summary, "db: pg:16 → pg:17");
+        assert_eq!(changes[1].summary, "db: pg:16 → 17");
         let lines = changes[1].diff.as_ref().unwrap().lines();
         assert!(!lines.iter().any(|l| format!("{l:?}").contains("$patch")), "{lines:?}");
     }
@@ -930,9 +960,30 @@ mod tests {
         ]);
         let changes = revision_changes(&[back, restarted, plain]);
         assert_eq!(changes[1].summary, "restarted");
-        assert_eq!(changes[2].summary, "back to the template of revision 1: app: nginx:1.25 → nginx:1.24");
+        assert_eq!(changes[2].summary, "back to the template of revision 1: app: nginx:1.25 → 1.24");
         // When it came back, not when the ReplicaSet was first made; status writes don't count.
         assert_eq!(changes[2].time, Some("2026-01-09T00:00:00Z".parse().unwrap()));
+    }
+
+    /// A new tag of the same image names the image once; another image is written in full.
+    #[test]
+    fn image_changes_are_short() {
+        assert_eq!(image_change("nginx:1.25", "nginx:1.26"), "nginx:1.25 → 1.26");
+        assert_eq!(
+            image_change("reg.io:5000/team/app:main-aaa", "reg.io:5000/team/app:main-bbb"),
+            "app:main-aaa → main-bbb"
+        );
+        assert_eq!(image_change("app@sha256:aa", "app@sha256:bb"), "app@sha256:aa → @sha256:bb");
+        assert_eq!(image_change("nginx:1.25", "httpd:2.4"), "nginx:1.25 → httpd:2.4");
+        assert_eq!(image_change("reg.io:5000/app", "reg.io:5000/app:v2"), "reg.io:5000/app → reg.io:5000/app:v2");
+    }
+
+    /// An owner reference's uid is cut to its start in a field manager's paths.
+    #[test]
+    fn owner_uids_are_cut() {
+        assert_eq!(field_segment(r#"k:{"uid":"6a43bb5a-200a-47b8-bc0c-c25e30c1e188"}"#), "[6a43bb5a…]");
+        assert_eq!(field_segment(r#"k:{"uid":"short"}"#), "[short]");
+        assert_eq!(field_segment(r#"k:{"name":"app"}"#), "[app]");
     }
 
     #[test]
@@ -1158,7 +1209,7 @@ mod tests {
         assert!(fetched.errors.is_empty(), "{:?}", fetched.errors);
         let objects: Vec<&str> = fetched.changes.iter().map(|c| c.object.as_str()).collect();
         assert_eq!(objects, ["Revision 1 · ReplicaSet web-aaa", "Revision 2 · ReplicaSet web-bbb"]);
-        assert_eq!(fetched.changes[1].summary, "app: nginx:1.25 → nginx:1.26");
+        assert_eq!(fetched.changes[1].summary, "app: nginx:1.25 → 1.26");
 
         // A Deployment re-created under the name is not this pod's owner.
         let client = Client::new(Shop { deployment: "another" }, "default");
