@@ -50,12 +50,29 @@ pub struct EventLine {
     pub namespace: Option<String>,
     pub name: String,
     pub age: String,
-    /// When it last happened.
+    /// When it first and last happened.
+    pub first: Option<jiff::Timestamp>,
     pub last: Option<jiff::Timestamp>,
     pub kind: String,
     pub reason: String,
     pub message: String,
     pub count: i32,
+    /// What reported it (`kubelet`, `deployment-controller`, an operator), when it says.
+    pub source: String,
+}
+
+impl EventLine {
+    /// How often and over how long it happened, when more than once: "×10 over 11m".
+    pub fn repeats(&self) -> Option<String> {
+        if self.count <= 1 {
+            return None;
+        }
+        let span = self.first.zip(self.last).map(|(f, l)| l.as_second() - f.as_second()).filter(|s| *s > 0);
+        Some(match span {
+            Some(s) => format!("×{} over {}", self.count, super::duration_text(s)),
+            None => format!("×{}", self.count),
+        })
+    }
 }
 
 pub async fn events_for(client: Client, obj: ObjectRef) -> Result<Vec<EventLine>> {
@@ -79,12 +96,33 @@ fn event_line(e: &Event) -> EventLine {
         namespace: e.metadata.namespace.clone(),
         name: e.metadata.name.clone().unwrap_or_default(),
         age: event_last(e).map(age).unwrap_or_default(),
+        first: event_first(e),
         last: event_last(e),
         kind: e.type_.clone().unwrap_or_default(),
         reason: e.reason.clone().unwrap_or_default(),
         message: e.message.clone().unwrap_or_default(),
         count: event_count(e),
+        source: event_source(e),
     }
+}
+
+/// When an event first happened.
+fn event_first(e: &Event) -> Option<jiff::Timestamp> {
+    e.first_timestamp
+        .as_ref()
+        .map(|t| t.0)
+        .or_else(|| e.event_time.as_ref().map(|t| t.0))
+        .or_else(|| e.metadata.creation_timestamp.as_ref().map(|t| t.0))
+}
+
+/// The component that reported an event: the new field, else the old one.
+fn event_source(e: &Event) -> String {
+    [e.reporting_component.as_deref(), e.source.as_ref().and_then(|s| s.component.as_deref())]
+        .into_iter()
+        .flatten()
+        .find(|c| !c.is_empty())
+        .unwrap_or_default()
+        .to_string()
 }
 
 /// An event of a cluster, with the object it is about: the events of one object with the
@@ -120,10 +158,15 @@ pub fn grouped(events: impl IntoIterator<Item = ClusterEvent>) -> Vec<ClusterEve
             std::collections::hash_map::Entry::Occupied(o) => {
                 let g = &mut out[*o.get()];
                 let count = g.line.count.saturating_add(e.line.count);
+                let first = match (g.line.first, e.line.first) {
+                    (Some(a), Some(b)) => Some(a.min(b)),
+                    (a, b) => a.or(b),
+                };
                 if e.line.last > g.line.last {
                     g.line = e.line;
                 }
                 g.line.count = count;
+                g.line.first = first;
                 g.events += e.events;
             }
             std::collections::hash_map::Entry::Vacant(v) => {
@@ -658,17 +701,58 @@ mod tests {
                 namespace: Some("shop".into()),
                 name: format!("e{pod}-{reason}-{secs:?}"),
                 age: String::new(),
+                first: None,
                 last: secs.map(|s| jiff::Timestamp::from_second(1_700_000_000 + s).unwrap()),
                 kind: if warning { "Warning" } else { "Normal" }.into(),
                 reason: format!("R{reason}"),
                 message: format!("at {secs:?}"),
                 count,
+                source: String::new(),
             },
             object_kind: "Pod".into(),
             object_namespace: Some("shop".into()),
             object_name: format!("web-{pod}"),
             events: 1,
         }
+    }
+
+    /// An event said once has no repeat; one said again says how often, and over how long
+    /// when its first and last times are known.
+    #[test]
+    fn repeats() {
+        let at = |s: i64| Some(jiff::Timestamp::from_second(1_700_000_000 + s).unwrap());
+        let line = |count, first, last| EventLine { first, last, count, ..event(0, 0, true, None, 1).line };
+        assert_eq!(line(1, at(0), at(600)).repeats(), None);
+        assert_eq!(line(10, at(0), at(660)).repeats().as_deref(), Some("×10 over 11m"));
+        assert_eq!(line(3, None, at(60)).repeats().as_deref(), Some("×3"));
+        assert_eq!(line(3, at(60), at(60)).repeats().as_deref(), Some("×3"));
+    }
+
+    /// The first time, and who reported it, from the new fields or the old ones.
+    #[test]
+    fn first_time_and_source() {
+        let e: k8s_openapi::api::core::v1::Event = serde_json::from_value(serde_json::json!({
+            "metadata": {"name": "e", "namespace": "shop", "creationTimestamp": "2026-01-01T00:00:00Z"},
+            "involvedObject": {},
+            "firstTimestamp": "2026-01-01T00:00:05Z",
+            "lastTimestamp": "2026-01-01T00:11:05Z",
+            "count": 10,
+            "source": {"component": "external-secrets"},
+            "type": "Warning", "reason": "UpdateFailed", "message": "could not get secret data from provider"
+        }))
+        .unwrap();
+        let l = super::event_line(&e);
+        assert_eq!(l.source, "external-secrets");
+        assert_eq!(l.repeats().as_deref(), Some("×10 over 11m"));
+        let e: k8s_openapi::api::core::v1::Event = serde_json::from_value(serde_json::json!({
+            "metadata": {"name": "e", "creationTimestamp": "2026-01-01T00:00:00Z"},
+            "involvedObject": {},
+            "reportingComponent": "kubelet",
+            "source": {"component": "old"},
+        }))
+        .unwrap();
+        let l = super::event_line(&e);
+        assert_eq!((l.source.as_str(), l.first), ("kubelet", Some("2026-01-01T00:00:00Z".parse().unwrap())));
     }
 
     proptest! {
