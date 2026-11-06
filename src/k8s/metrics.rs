@@ -161,6 +161,36 @@ pub fn format_bytes(bytes: f64) -> String {
     if mi >= 1024.0 { format!("{:.2}Gi", mi / 1024.0) } else { format!("{mi:.0}Mi") }
 }
 
+/// A figure in at most three significant digits: "8.64", "11.2", "111", "1023".
+fn three_digits(x: f64) -> String {
+    match x {
+        x if x < 9.995 => format!("{x:.2}"),
+        x if x < 99.95 => format!("{x:.1}"),
+        x => format!("{x:.0}"),
+    }
+}
+
+/// CPU short enough for a narrow column: "250m", "1.50", "12.9", "128".
+pub fn short_cpu(millicores: f64) -> String {
+    let m = millicores.max(0.0);
+    if m < 999.5 { format!("{m:.0}m") } else { three_digits(m / 1000.0) }
+}
+
+/// Memory short enough for a narrow column: "512Mi", "8.64Gi", "11.2Gi", "111Gi", "1.50Ti".
+pub fn short_bytes(bytes: f64) -> String {
+    const UNITS: [&str; 4] = ["Mi", "Gi", "Ti", "Pi"];
+    let mut v = bytes.max(0.0) / (1024.0 * 1024.0);
+    if v < 1023.5 {
+        return format!("{v:.0}Mi");
+    }
+    let mut unit = 0;
+    while v >= 1023.5 && unit < UNITS.len() - 1 {
+        v /= 1024.0;
+        unit += 1;
+    }
+    format!("{}{}", three_digits(v), UNITS[unit])
+}
+
 /// Per-container usage of pods in a namespace: pod -> container -> (millicores, bytes).
 pub type ContainerUsage = HashMap<String, HashMap<String, (f64, f64)>>;
 
@@ -398,7 +428,34 @@ mod pod_metrics_tests {
 
 #[cfg(test)]
 mod quantity_tests {
-    use super::{parse_bytes, parse_cpu};
+    use proptest::prelude::*;
+
+    use super::{parse_bytes, parse_cpu, short_bytes, short_cpu};
+
+    #[test]
+    fn short_figures() {
+        let gi = 1024f64.powi(3);
+        assert_eq!(short_bytes(512.0 * 1024.0 * 1024.0), "512Mi");
+        assert_eq!(short_bytes(8.64 * gi), "8.64Gi");
+        assert_eq!(short_bytes(11.17 * gi), "11.2Gi");
+        assert_eq!(short_bytes(111.17 * gi), "111Gi");
+        assert_eq!(short_bytes(1500.0 * gi), "1.46Ti");
+        assert_eq!(short_bytes(1023.9 * 1024.0 * 1024.0), "1.00Gi");
+        assert_eq!(short_cpu(6.0), "6m");
+        assert_eq!(short_cpu(999.7), "1.00");
+        assert_eq!(short_cpu(12_890.0), "12.9");
+        assert_eq!(short_cpu(128_000.0), "128");
+    }
+
+    proptest! {
+        /// Every figure fits the usage column: at most six characters, for any usage up
+        /// to an exabyte and ten thousand cores.
+        #[test]
+        fn short_figures_fit(bytes in 0.0f64..1e18, millicores in 0.0f64..1e7) {
+            prop_assert!(short_bytes(bytes).len() <= 6, "{}", short_bytes(bytes));
+            prop_assert!(short_cpu(millicores).len() <= 6, "{}", short_cpu(millicores));
+        }
+    }
 
     #[test]
     fn cpu() {

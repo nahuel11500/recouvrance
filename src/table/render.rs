@@ -571,7 +571,9 @@ fn usage_bar(
     let format: fn(f64) -> String = if cpu { k8s::format_cpu } else { k8s::format_bytes };
     let (value, color) = if cpu { (used.0, theme.blue) } else { (used.1, theme.success) };
     let (request, limit) = res.map(|r| if cpu { r.cpu } else { r.mem }).unwrap_or_default();
-    let figure = div().w(px(52.)).flex_shrink_0().whitespace_nowrap().text_right().child(format(value));
+    // Short figures keep the bars lined up; never clipped if one is wider. Exact ones on hover.
+    let short = if cpu { k8s::short_cpu(value) } else { k8s::short_bytes(value) };
+    let figure = div().min_w(px(52.)).flex_shrink_0().whitespace_nowrap().text_right().child(short);
     if request.is_none() && limit.is_none() {
         // Nothing to measure it against: a bar would only show the scale.
         let note = if res.is_some() { "no request" } else { "" };
