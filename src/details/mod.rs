@@ -186,6 +186,8 @@ pub struct DetailPanel {
     /// Write actions the API server says this user may not do ("patch", "delete", …).
     denied: std::collections::HashSet<&'static str>,
     events: Option<Result<Vec<EventLine>, SharedString>>,
+    /// The Events tab shows the warnings alone.
+    warnings_only: bool,
     logs: Option<Entity<LogsView>>,
     terminal: Option<Entity<TerminalView>>,
     /// A pod's Files tab.
@@ -292,6 +294,7 @@ impl DetailPanel {
             show_managed: false,
             field_docs: None,
             events: None,
+            warnings_only: false,
             logs,
             terminal,
             files,

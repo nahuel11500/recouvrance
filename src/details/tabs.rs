@@ -365,40 +365,120 @@ impl DetailPanel {
                 )
                 .into_any_element(),
             Some(Ok(events)) => {
-                let warning = cx.theme().warning;
+                let warnings = events.iter().filter(|e| is_warning(e)).count();
+                // Picking warnings when there are none would show nothing.
+                let only = self.warnings_only && warnings > 0;
                 v_flex()
-                    .id("events")
                     .size_full()
-                    .overflow_y_scroll()
                     .gap_2()
-                    .children(events.iter().map(|e| {
+                    .child(self.events_summary(events.len(), warnings, only, cx))
+                    .child(
                         v_flex()
-                            .gap_0p5()
-                            .pb_2()
-                            .border_b_1()
-                            .border_color(cx.theme().border)
-                            .child(
-                                h_flex()
-                                    .gap_2()
-                                    .text_sm()
-                                    .child(
-                                        div()
-                                            .font_weight(FontWeight::SEMIBOLD)
-                                            .when(e.kind == "Warning", |d| d.text_color(warning))
-                                            .child(selectable(e.reason.clone())),
-                                    )
-                                    .child(div().text_color(muted).child(selectable(format!(
-                                        "{} ago{}",
-                                        e.age,
-                                        if e.count > 1 { format!(" · ×{}", e.count) } else { String::new() }
-                                    )))),
-                            )
-                            .child(div().text_sm().child(selectable(e.message.clone())))
-                    }))
+                            .id("events")
+                            .flex_1()
+                            .min_h_0()
+                            .overflow_y_scroll()
+                            .children(events.iter().filter(|e| !only || is_warning(e)).map(|e| event_row(e, cx))),
+                    )
                     .into_any_element()
             }
         }
     }
+
+    /// How many events, and the warnings among them: a pill that shows them alone.
+    fn events_summary(&self, total: usize, warnings: usize, only: bool, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let (muted, warning) = (theme.muted_foreground, theme.warning);
+        h_flex()
+            .gap_2()
+            .px_2()
+            .text_sm()
+            .child(div().text_color(muted).child(format!("{total} {}", plural(total, "event", "events"))))
+            .when(warnings > 0, |d| {
+                d.child(
+                    h_flex()
+                        .id("events-warnings-only")
+                        .gap_1()
+                        .px_2()
+                        .py_0p5()
+                        .rounded_md()
+                        .cursor_pointer()
+                        .bg(warning.opacity(if only { 0.25 } else { 0.1 }))
+                        .border_1()
+                        .border_color(if only { warning } else { warning.opacity(0.) })
+                        .hover(|s| s.bg(warning.opacity(0.2)))
+                        .child(Icon::new(Lucide::TriangleAlert).size_3p5().text_color(warning))
+                        .child(format!("{warnings} {}", plural(warnings, "warning", "warnings")))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.warnings_only = !this.warnings_only;
+                            cx.notify();
+                        })),
+                )
+            })
+            .when(only, |d| d.child(div().text_color(muted).child("shown alone")))
+    }
+}
+
+fn is_warning(e: &k8s::EventLine) -> bool {
+    e.kind == "Warning"
+}
+
+/// A tab's count: a small number on a tint of its color.
+fn count_badge(n: usize, color: Hsla) -> impl IntoElement {
+    div().ml_1p5().px_1p5().rounded_full().text_xs().bg(color.opacity(0.15)).text_color(color).child(n.to_string())
+}
+
+fn plural<'a>(n: usize, one: &'a str, many: &'a str) -> &'a str {
+    if n == 1 { one } else { many }
+}
+
+/// One event: what happened and who said so, the message, then when and how often.
+fn event_row(e: &k8s::EventLine, cx: &App) -> impl IntoElement {
+    let theme = cx.theme();
+    let warning = is_warning(e);
+    let tone = if warning { theme.warning } else { theme.muted_foreground };
+    let when = e.last.map(|t| format!("{} ago", k8s::age(t))).unwrap_or_default();
+    h_flex()
+        .w_full()
+        .items_start()
+        .gap_3()
+        .px_2()
+        .py_2()
+        .border_b_1()
+        .border_color(theme.border)
+        .when(warning, |d| d.bg(theme.warning.opacity(0.05)))
+        .child(
+            div()
+                .pt_0p5()
+                .child(Icon::new(if warning { Lucide::TriangleAlert } else { Lucide::Info }).size_4().text_color(tone)),
+        )
+        .child(
+            v_flex()
+                .w(px(200.))
+                .flex_none()
+                .gap_0p5()
+                .child(
+                    div()
+                        .text_sm()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .when(warning, |d| d.text_color(theme.warning))
+                        .child(selectable(e.reason.clone())),
+                )
+                .when(!e.source.is_empty(), |d| {
+                    d.child(div().text_xs().text_color(theme.muted_foreground).child(selectable(e.source.clone())))
+                }),
+        )
+        .child(div().flex_1().min_w_0().text_sm().child(selectable(e.message.clone())))
+        .child(
+            v_flex()
+                .flex_none()
+                .items_end()
+                .gap_0p5()
+                .text_xs()
+                .text_color(theme.muted_foreground)
+                .child(div().text_sm().child(selectable(when)))
+                .children(e.repeats().map(selectable)),
+        )
 }
 
 impl Render for DetailPanel {
@@ -408,6 +488,14 @@ impl Render for DetailPanel {
             tabs.push(DetailTab::Reachability);
         }
         let containers = self.object.as_ref().map(container_names).unwrap_or_default();
+        // How many events, in the warning color when one is a warning.
+        let events_badge = match &self.events {
+            Some(Ok(events)) if !events.is_empty() => {
+                let warned = events.iter().any(is_warning);
+                Some((events.len(), if warned { cx.theme().warning } else { cx.theme().muted_foreground }))
+            }
+            _ => None,
+        };
         if self.obj.kind.is("", "Pod") {
             tabs.extend((0..containers.len()).map(DetailTab::Container));
         }
@@ -553,6 +641,10 @@ impl Render for DetailPanel {
                             DetailTab::Container(ix) => Tab::new()
                                 .prefix(Icon::new(Lucide::Box).size_3p5())
                                 .label(containers.get(*ix).cloned().unwrap_or_default()),
+                            DetailTab::Events => match events_badge {
+                                Some((n, color)) => Tab::new().label("Events").suffix(count_badge(n, color)),
+                                None => Tab::new().label("Events"),
+                            },
                             other => Tab::new().label(match other {
                                 DetailTab::Overview => "Overview",
                                 DetailTab::Revisions => "Revisions",
@@ -561,12 +653,11 @@ impl Render for DetailPanel {
                                 DetailTab::Compare => "Compare",
                                 DetailTab::History => "History",
                                 DetailTab::Yaml => "YAML",
-                                DetailTab::Events => "Events",
                                 DetailTab::Logs => "Logs",
                                 DetailTab::Files => "Files",
                                 DetailTab::Shell => "Shell",
                                 DetailTab::Debug => "Debug",
-                                DetailTab::Container(_) => "",
+                                DetailTab::Events | DetailTab::Container(_) => "",
                             }),
                         }
                     }))
