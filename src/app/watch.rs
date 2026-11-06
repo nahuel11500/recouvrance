@@ -69,7 +69,7 @@ impl AppView {
         if !kind.is("", "Event") {
             actions.push("delete");
         }
-        // The filter box keeps its text across kinds; the table applies what it shows.
+        // The table applies what the box shows (each kind's own filter: see `kind_filters`).
         let filter_text = self.filter.read(cx).value().to_string();
         self.table.update(cx, |t, cx| {
             t.delegate_mut().pods = is_pod;

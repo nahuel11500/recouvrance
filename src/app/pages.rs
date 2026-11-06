@@ -73,8 +73,12 @@ impl AppView {
         };
         // No name: open the list of that kind (e.g. a CRD's instances).
         if name.is_empty() {
-            // The table too: the same kind's list keeps its watch, and its filter with it.
-            self.apply_filter_text(String::new(), window, cx);
+            // All of them: unfiltered. The same kind's list keeps its watch, so its box is
+            // cleared here; another kind's opens with no filter.
+            if self.kind.as_ref().map(Kind::key) == Some(kind.key()) {
+                self.put_filter(String::new(), window, cx);
+            }
+            self.kind_filters.forget(&kind);
             self.select_kind(kind, cx);
             return;
         }

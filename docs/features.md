@@ -2,7 +2,8 @@
 
 - **Contexts**: pick one or several on launch; tables merge clusters with a Context column.
 - **Live tables** with kubectl's own columns for every type, including CRDs; CPU/memory from
-  metrics-server; per-type column choice; multi-namespace filter.
+  metrics-server; per-type column choice; multi-namespace filter; each type keeps its own filter text (Nodes
+  doesn't show the pod name typed on Pods, and Pods has it back).
 - **Usage timed to metrics-server**: metrics-server measures every `--metric-resolution` (15 s by
   default, often 60 s), so reading it more often returns the same numbers. The pods and nodes
   lists learn the interval from the samples' timestamps and read again just after the next one

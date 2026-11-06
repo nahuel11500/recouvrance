@@ -76,11 +76,7 @@ impl AppView {
 
     #[cfg(feature = "dev")]
     pub fn demo_filter(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
-        self.filter.update(cx, |s, cx| s.set_value(text.to_string(), window, cx));
-        self.table.update(cx, |t, cx| {
-            t.delegate_mut().set_filter(text.to_string());
-            cx.notify();
-        });
+        self.put_filter(text.to_string(), window, cx);
     }
 
     /// Check the first `n` rows, then optionally open a bulk confirmation (never confirmed).
