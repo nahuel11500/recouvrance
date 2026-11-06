@@ -26,6 +26,7 @@ impl Render for AppView {
         #[cfg(feature = "dev")]
         let _t = crate::dev::timing::span("app render");
         self.keep_focus(window, cx);
+        self.sync_kind_filter(window, cx);
         let page = self.render_content(cx);
         // The assistant beside the page, told what is on screen now.
         let page = match self.docked_assistant() {

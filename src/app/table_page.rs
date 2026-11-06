@@ -92,13 +92,8 @@ impl AppView {
     }
 
     pub fn apply_filter_text(&mut self, text: String, window: &mut Window, cx: &mut Context<Self>) {
-        self.filter.update(cx, |s, cx| s.set_value(text.clone(), window, cx));
         crate::settings::remember_filter(&text);
-        self.table.update(cx, |t, cx| {
-            t.delegate_mut().set_filter(text);
-            cx.notify();
-        });
-        self.follow_selection(cx);
+        self.put_filter(text, window, cx);
     }
 
     /// Recent filters, saved searches and the filter syntax.
@@ -530,13 +525,7 @@ impl AppView {
         if same_kind {
             self.restart_watch(cx);
         }
-        let filter = v.filter.clone();
-        self.filter.update(cx, |s, cx| s.set_value(filter.clone(), window, cx));
-        self.table.update(cx, |t, cx| {
-            t.delegate_mut().set_filter(filter);
-            cx.notify();
-        });
-        self.follow_selection(cx);
+        self.put_filter(v.filter.clone(), window, cx);
     }
 
     /// Save the rows shown (filtered, sorted, visible columns) as CSV in ~/Downloads.

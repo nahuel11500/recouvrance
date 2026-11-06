@@ -30,6 +30,7 @@ mod chrome;
 mod contexts;
 #[cfg(feature = "dev")]
 mod demo;
+mod kind_filters;
 mod live_list;
 mod navigation;
 mod overviews;
@@ -281,6 +282,8 @@ pub struct AppView {
     /// Selected namespaces; empty means all.
     namespaces: Vec<String>,
     filter: Entity<InputState>,
+    /// The filter typed for each resource type.
+    kind_filters: kind_filters::KindFilters,
     kind_filter: Entity<InputState>,
     /// Primary context (sidebar kinds, overview, Helm); first of `clusters`.
     context: Option<String>,
@@ -516,6 +519,7 @@ impl AppView {
             problems: problem_badge::ProblemBadge::default(),
             namespaces: Vec::new(),
             filter,
+            kind_filters: Default::default(),
             kind_filter,
             context: None,
             client: None,

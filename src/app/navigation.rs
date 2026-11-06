@@ -25,13 +25,6 @@ impl AppView {
     pub(super) fn load_tab(&mut self, t: TabState, window: &mut Window, cx: &mut Context<Self>) {
         self.history = t.history;
         self.pos = t.pos.min(self.history.len().saturating_sub(1));
-        self.filter.update(cx, |s, cx| s.set_value(t.filter.clone(), window, cx));
-        self.table.update(cx, |tb, cx| {
-            tb.delegate_mut().set_filter(t.filter);
-            cx.notify();
-        });
-        // `set_value` sends no change event: move the highlight here.
-        self.follow_selection(cx);
         // Set the namespaces and the kind first, then restart the watch once: restarting in
         // between would start a list of the old kind in the new namespaces, then drop it.
         let mut restart = false;
@@ -48,6 +41,8 @@ impl AppView {
             self.kind = Some(kind);
             restart = true;
         }
+        // The tab's filter, for its kind: set before the watch restarts, which applies it.
+        self.put_filter(t.filter, window, cx);
         if restart {
             self.restart_watch(cx);
         }
