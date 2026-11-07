@@ -5,6 +5,18 @@ and versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.7.0](https://github.com/nahuel11500/recouvrance/compare/v0.6.0...v0.7.0) - 2026-11-07
+
+### Added
+
+- *(history)* A timeline grouped by day, shorter image changes (#765)
+- *(table)* Each resource type keeps its own filter (#760)
+- *(details)* An Events tab that scans: warnings counted on the tab, who reported each event, how often and over how long (#756)
+
+### Fixed
+
+- *(table)* Usage figures in three digits, never cut (111.17Gi read 11.17Gi) (#758)
+
 ## [0.6.0](https://github.com/nahuel11500/recouvrance/compare/v0.5.0...v0.6.0) - 2026-11-05
 
 ### Added
