@@ -98,6 +98,58 @@ pub(super) async fn fetch_related(
     obj: &serde_json::Value,
     clusters: Vec<(String, Client)>,
 ) -> Related {
+    let mut related = fetch_objects(client.clone(), context, kind, ns, obj, clusters).await;
+    // Every pods table has CPU and Memory columns: whatever page listed the pods (a workload,
+    // a Service, a PDB, a ServiceAccount…), read their usage here, in one place.
+    // Metrics are optional (no metrics-server): no usage is not an error to show.
+    if related.usage_read.is_none()
+        && crate::settings::metrics_on(context)
+        && let Some((ns, selector)) = usage_scope(kind, obj, &related.pods)
+        && let Ok((usage, read)) = k8s::container_usage_read(client, ns, selector).await
+    {
+        (related.usage, related.usage_read) = (usage, Some(read));
+    }
+    related
+}
+
+/// Where to read the usage of the pods a page lists: their namespace, narrowed by the label
+/// selector they were listed with, if any. None without pods, or when they are in several
+/// namespaces (a node's page, whose kubelet gives their usage).
+fn usage_scope(
+    kind: &k8s::Kind,
+    obj: &serde_json::Value,
+    pods: &[serde_json::Value],
+) -> Option<(String, Option<String>)> {
+    // A namespace's page counts its pods but has no table of them.
+    if kind.is("", "Namespace") {
+        return None;
+    }
+    fn ns_of(p: &serde_json::Value) -> Option<&str> {
+        p.pointer("/metadata/namespace").and_then(|v| v.as_str())
+    }
+    let ns = ns_of(pods.first()?)?;
+    if pods.iter().any(|p| ns_of(p) != Some(ns)) {
+        return None;
+    }
+    // Only kinds whose selector picks pods: a PVC's `spec.selector` picks volumes. Without
+    // one, the whole namespace is read: more than needed, never less.
+    let selects_pods = kind.is("", "Service")
+        || kind.is("policy", "PodDisruptionBudget")
+        || kind.is("networking.k8s.io", "NetworkPolicy")
+        || kind.ar.group == "apps"
+        || kind.is("batch", "Job");
+    let selector = selects_pods.then(|| k8s::pod_selection(kind, obj).list_selector().flatten()).flatten();
+    Some((ns.to_string(), selector))
+}
+
+async fn fetch_objects(
+    client: Client,
+    context: &str,
+    kind: &k8s::Kind,
+    ns: Option<String>,
+    obj: &serde_json::Value,
+    clusters: Vec<(String, Client)>,
+) -> Related {
     use k8s_openapi::api::{apps::v1 as apps, batch::v1 as batch, core::v1 as core};
     let mut related = Related::default();
     if kind.is("argoproj.io", "Application") {
@@ -324,12 +376,6 @@ pub(super) async fn fetch_related(
             let services =
                 k8s::list_values(client.clone(), k8s::ar_of::<core::Service>(), Some(ns.clone()), None).await;
             related.services = related.noted("services", services);
-            if crate::settings::metrics_on(context)
-                && let Ok((usage, read)) =
-                    k8s::container_usage_read(client.clone(), ns.clone(), Some(sel.clone())).await
-            {
-                (related.usage, related.usage_read) = (usage, Some(read));
-            }
             if kind.is("apps", "StatefulSet") || kind.is("apps", "DaemonSet") || kind.is("apps", "Deployment") {
                 let revisions = k8s::rollouts::revisions(client, kind, ns, obj).await;
                 related.revisions = related.noted("revisions", revisions);
@@ -401,4 +447,56 @@ pub(super) fn references(spec: &serde_json::Value, name: &str, secret: bool) -> 
     });
     let in_pull = secret && spec["imagePullSecrets"].as_array().into_iter().flatten().any(|p| is(p.get("name")));
     in_volumes || in_env || in_pull
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::usage_scope;
+    use crate::k8s;
+
+    fn kind(group: &str, kind: &str) -> k8s::Kind {
+        k8s::Kind::fake(group, kind)
+    }
+
+    fn pod(ns: &str, name: &str) -> serde_json::Value {
+        json!({ "metadata": { "namespace": ns, "name": name } })
+    }
+
+    /// Every page that lists pods reads their usage, not only workloads' (#747).
+    #[test]
+    fn pages_listing_pods_read_their_usage() {
+        let svc = json!({ "spec": { "selector": { "app": "shop" } } });
+        let pods = [pod("shop", "a"), pod("shop", "b")];
+        assert_eq!(usage_scope(&kind("", "Service"), &svc, &pods), Some(("shop".into(), Some("app=shop".into()))));
+        let deploy = json!({ "spec": { "selector": { "matchLabels": { "app": "shop" } } } });
+        assert_eq!(
+            usage_scope(&kind("apps", "Deployment"), &deploy, &pods),
+            Some(("shop".into(), Some("app=shop".into())))
+        );
+        // A ServiceAccount has no selector: its namespace is read.
+        assert_eq!(usage_scope(&kind("", "ServiceAccount"), &json!({}), &pods), Some(("shop".into(), None)));
+    }
+
+    /// A PVC's selector picks volumes, not pods: it must not narrow the read.
+    #[test]
+    fn a_selector_that_does_not_pick_pods_is_not_used() {
+        let pvc = json!({ "spec": { "selector": { "matchLabels": { "tier": "fast" } } } });
+        assert_eq!(
+            usage_scope(&kind("", "PersistentVolumeClaim"), &pvc, &[pod("shop", "a")]),
+            Some(("shop".into(), None))
+        );
+    }
+
+    #[test]
+    fn no_read_without_pods_or_across_namespaces() {
+        let svc = json!({ "spec": { "selector": { "app": "shop" } } });
+        assert_eq!(usage_scope(&kind("", "Service"), &svc, &[]), None);
+        // A node's pods come from every namespace: its kubelet gives their usage.
+        let pods = [pod("shop", "a"), pod("kube-system", "b")];
+        assert_eq!(usage_scope(&kind("", "Node"), &json!({}), &pods), None);
+        // A namespace's page shows no pods table.
+        assert_eq!(usage_scope(&kind("", "Namespace"), &json!({}), &[pod("shop", "a")]), None);
+    }
 }
