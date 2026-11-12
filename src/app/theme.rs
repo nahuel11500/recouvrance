@@ -253,7 +253,7 @@ mod tests {
     use super::{STATIC_UI_FONTS, bold_capable_family};
 
     fn names(names: &[&str]) -> Vec<String> {
-        names.iter().map(|n| n.to_string()).collect()
+        names.iter().map(ToString::to_string).collect()
     }
 
     /// Ubuntu, Ubuntu Sans and Cantarell ship as variable fonts: bold resolves to their regular face.
