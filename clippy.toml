@@ -13,4 +13,5 @@ doc-valid-idents = [
     "StatefulSet", "StatefulSets", "StorageClass", "TLSRoute", "HTTPRoute", "GRPCRoute", "TokenRequest",
     "VerticalPodAutoscaler", "VictoriaMetrics", "ValidatingWebhookConfiguration", "MutatingWebhookConfiguration",
     "ControllerRevision", "ControllerRevisions", "ClusterSecretStore", "SecretStore", "macOS", "WebSocket", "OAuth", "JavaScript", "TypeScript", "PostgreSQL", "ClickHouse", "MiB", "GiB", "KiB",
+    "TopoLVM", "LogicalVolume", "LogicalVolumes",
 ]

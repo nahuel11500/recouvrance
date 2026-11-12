@@ -216,7 +216,58 @@ pub(super) fn node_allocation(ctx: &Ctx, cx: &App) -> Div {
                 .children(fs("/node/runtime/containerFs", "Container filesystem")),
         );
     }
+    let local = local_storage(ctx, cx);
+    if !local.is_empty() {
+        out = out.child(row().pt_4().children(local));
+    }
     out
+}
+
+/// One entry per TopoLVM device class of the node: what its volumes take of the volume
+/// group, and what is left for new local PersistentVolumes. Nothing on a node without
+/// TopoLVM; only the free space when its LogicalVolumes could not be read.
+fn local_storage(ctx: &Ctx, cx: &App) -> Vec<Div> {
+    let theme = cx.theme();
+    let muted = theme.muted_foreground;
+    let unread = ctx.related.errors.get("local_volumes");
+    k8s::topolvm::local_storage(ctx.obj, ctx.related.local_volumes.as_deref())
+        .into_iter()
+        .map(|class| {
+            let b = k8s::short_bytes;
+            let entry = v_flex().w(px(260.)).gap_0p5().child(
+                div()
+                    .text_xs()
+                    .text_color(muted)
+                    .child(selectable(format!("Local storage (TopoLVM) · {}", class.name))),
+            );
+            let line = |text: String| div().text_sm().child(selectable(text));
+            let note = |text: String, color: Hsla| div().text_xs().text_color(color).child(selectable(text));
+            match (class.free, class.used) {
+                (Some(free), Some(used)) => {
+                    let total = free + used;
+                    let share = if total > 0.0 { used / total } else { 0.0 };
+                    let color = match share {
+                        s if s >= 0.95 => theme.danger,
+                        s if s >= 0.8 => theme.warning,
+                        _ => theme.blue,
+                    };
+                    entry
+                        .child(line(format!("{} of {} ({:.0}%)", b(used), b(total), share * 100.0)))
+                        .child(usage_bar(Some(used), None, Some(total), color, cx))
+                        .child(note(format!("{} free", b(free)), if share >= 0.8 { color } else { muted }))
+                }
+                (Some(free), None) => entry.child(line(format!("{} free", b(free)))).child(note(
+                    format!("used unknown: LogicalVolumes {}", unread.map_or("not read", String::as_str)),
+                    muted,
+                )),
+                // Volumes in a class the node no longer reports, or a value that does not read.
+                (None, Some(used)) => {
+                    entry.child(line(format!("{} used", b(used)))).child(note("free unknown".into(), muted))
+                }
+                (None, None) => entry.child(line("unknown".into())),
+            }
+        })
+        .collect()
 }
 
 /// Requests as a solid fill and limits as a lighter one behind it, against what the
