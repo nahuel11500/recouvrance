@@ -309,9 +309,9 @@ pub(super) fn node_devices(ctx: &Ctx, cx: &App) -> Option<Div> {
                             .child(selectable(s(sl, "/spec/driver").unwrap_or("?").to_string())),
                     )
                     .child(div().text_xs().text_color(muted).child(selectable(format!(
-                        "pool {} · {} devices",
+                        "pool {} · {}",
                         s(sl, "/spec/pool/name").unwrap_or("?"),
-                        devices.len()
+                        crate::plural::count(devices.len(), "device")
                     )))),
             )
             .children(devices.iter().take(32).map(|d| {

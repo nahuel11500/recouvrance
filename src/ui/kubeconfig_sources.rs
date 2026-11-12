@@ -186,13 +186,12 @@ impl KubeconfigSources {
             SourceKind::Added => Lucide::FileKey,
             _ => Lucide::File,
         };
-        let plural = |n: usize, one: &str| format!("{n} {one}{}", if n == 1 { "" } else { "s" });
         let mut facts = Vec::new();
         if src.error.is_none() && (src.kind == SourceKind::Folder || src.files != 1) {
-            facts.push(plural(src.files, "file"));
+            facts.push(crate::plural::count(src.files, "file"));
         }
         if src.files > 0 && src.error.is_none() {
-            facts.push(plural(src.contexts, "context"));
+            facts.push(crate::plural::count(src.contexts, "context"));
         }
         facts.push(
             match src.kind {
@@ -361,7 +360,8 @@ impl Render for KubeconfigSources {
                 v_flex()
                     .child(div().text_base().font_weight(FontWeight::SEMIBOLD).child("Kubeconfig sources"))
                     .child(div().text_sm().text_color(muted).child(format!(
-                        "Where contexts come from, merged in this order ({total} contexts). Changes to these files are picked up within seconds."
+                        "Where contexts come from, merged in this order ({}). Changes to these files are picked up within seconds.",
+                        crate::plural::count(total, "context")
                     ))),
             )
             .child(

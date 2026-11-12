@@ -89,7 +89,7 @@ pub(super) fn secret(ctx: &Ctx, cx: &App) -> Div {
         .child(row().pt_4().child(field("Type", s(obj, "/type").unwrap_or("Opaque").to_string(), cx)))
         .children(external_secret_source(ctx, cx))
         .children(certificates(&data, true, cx))
-        .child(heading(&format!("Data ({} keys)", data.len())))
+        .child(heading(&format!("Data ({})", crate::plural::count(data.len(), "key"))))
         .child(div().pb_1().text_xs().text_color(muted).child(selectable("Click a value to show or hide it.")))
 }
 
@@ -194,7 +194,9 @@ pub(super) fn secret_entry(ctx: &Ctx, i: usize, cx: &App) -> AnyElement {
 /// A ConfigMap's certificates; its keys are items of the page's list (`config_entry`).
 pub(super) fn config_map(obj: &Value, cx: &App) -> Div {
     let data = obj.get("data").and_then(Value::as_object).cloned().unwrap_or_default();
-    v_flex().children(certificates(&data, false, cx)).child(heading(&format!("Data ({} keys)", data.len())))
+    v_flex()
+        .children(certificates(&data, false, cx))
+        .child(heading(&format!("Data ({})", crate::plural::count(data.len(), "key"))))
 }
 
 pub(super) fn config_entry(obj: &Value, i: usize, cx: &App) -> AnyElement {
@@ -214,7 +216,12 @@ pub(super) fn config_entry(obj: &Value, i: usize, cx: &App) -> AnyElement {
         .child(div().text_xs().text_color(muted).child(selectable(k.clone())))
         .children(lines.into_iter().map(|l| mono(l.to_string(), cx)))
         .when(more > 0, |d| {
-            d.child(div().text_xs().text_color(muted).child(selectable(format!("… {more} more lines (see YAML)"))))
+            d.child(
+                div().text_xs().text_color(muted).child(selectable(format!(
+                    "… {more} more {} (see YAML)",
+                    crate::plural::pick(more, "line", "lines")
+                ))),
+            )
         })
         .into_any_element()
 }

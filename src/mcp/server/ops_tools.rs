@@ -204,7 +204,7 @@ impl KubeMcp {
 }
 
 fn forward_line(f: &ForwardInfo) -> String {
-    let mut line = format!("{} — {} connection(s)", f.describe(), f.connections);
+    let mut line = format!("{} — {}", f.describe(), crate::plural::count(f.connections, "connection"));
     if let Some(e) = &f.error {
         line.push_str(&format!(", last error: {e}"));
     }

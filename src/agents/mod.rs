@@ -543,8 +543,8 @@ impl AgentsView {
                                     .min_w_0()
                                     .child(div().text_sm().font_weight(FontWeight::MEDIUM).child(a.name.clone()))
                                     .child(div().text_xs().text_color(muted).child(format!(
-                                        "{} rules{} · {}",
-                                        a.policy.rules.len(),
+                                        "{}{} · {}",
+                                        crate::plural::count(a.policy.rules.len(), "rule"),
                                         if writes { " · can write" } else { "" },
                                         match seen {
                                             Some(t) => format!("seen {} ago", k8s::age(t)),

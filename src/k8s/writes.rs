@@ -32,7 +32,12 @@ pub async fn scale(
         let patch = kube::api::Patch::Merge(serde_json::json!({ "spec": { "replicas": replicas } }));
         let s = api.patch_scale(&name, &patch_params(dry_run), &patch).await?;
         let now = s.spec.and_then(|sp| sp.replicas).unwrap_or(replicas);
-        Ok(format!("{}{} {name} scaled to {now} replicas", if dry_run { "[dry run] " } else { "" }, kind.ar.kind))
+        Ok(format!(
+            "{}{} {name} scaled to {}",
+            if dry_run { "[dry run] " } else { "" },
+            kind.ar.kind,
+            crate::plural::count(now, "replica")
+        ))
     })
     .await
 }
@@ -600,8 +605,10 @@ impl Drained {
             }
         };
         let mut msg = format!(
-            "Node {} cordoned; {} pods evicted, {} skipped (DaemonSet/static/finished)",
-            self.node, self.evicted, self.skipped
+            "Node {} cordoned; {} evicted, {} skipped (DaemonSet/static/finished)",
+            self.node,
+            crate::plural::count(self.evicted, "pod"),
+            self.skipped
         );
         if !self.refused.is_empty() {
             let names = self
@@ -686,9 +693,9 @@ pub async fn drain_report(
             }
             if let Some(reason) = stop() {
                 anyhow::bail!(
-                    "drain of {} stopped after {} evictions: {reason}; the node stays cordoned",
+                    "drain of {} stopped after {}: {reason}; the node stays cordoned",
                     out.node,
-                    out.evicted
+                    crate::plural::count(out.evicted, "eviction")
                 );
             }
             if let Some(reason) = keep(&ns, &name) {

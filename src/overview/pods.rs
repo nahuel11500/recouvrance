@@ -527,11 +527,11 @@ pub(super) fn probe_card(title: &str, p: &Value, cx: &App) -> Div {
             format!("First probe {delay}s after startup")
         };
         let sentence = format!(
-            "{first}, then every {}s with {}s timeout. Status changes after {} success or {} consecutive failures.",
+            "{first}, then every {}s with {}s timeout. Status changes after {} or {}.",
             n(p, "/periodSeconds").unwrap_or(10),
             n(p, "/timeoutSeconds").unwrap_or(1),
-            n(p, "/successThreshold").unwrap_or(1),
-            n(p, "/failureThreshold").unwrap_or(3),
+            crate::plural::count_as(n(p, "/successThreshold").unwrap_or(1), "success", "successes"),
+            crate::plural::count(n(p, "/failureThreshold").unwrap_or(3), "consecutive failure"),
         );
         card(cx)
             .child(mono(target, cx))

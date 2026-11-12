@@ -346,12 +346,11 @@ fn drifts(ctx: &Ctx, d: &Diagnosis, on: Option<&str>, compared: &[&Drift], cx: &
                 )
                 .when(!lines.is_empty(), |d| d.child(crate::details::diff_block(&lines, cx)))
                 .when(drift.more > 0, |d| {
-                    d.child(
-                        div()
-                            .text_xs()
-                            .text_color(muted)
-                            .child(selectable(format!("+{} more fields differ", drift.more))),
-                    )
+                    d.child(div().text_xs().text_color(muted).child(selectable(format!(
+                        "+{} more {}",
+                        drift.more,
+                        crate::plural::pick(drift.more, "field differs", "fields differ")
+                    ))))
                 })
                 .when(unchanged, |d| {
                     d.child(

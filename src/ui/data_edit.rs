@@ -73,7 +73,10 @@ fn decode(v: &serde_json::Value, secret: bool) -> Decoded {
     match base64::engine::general_purpose::STANDARD.decode(s) {
         Ok(b) => match String::from_utf8(b) {
             Ok(t) => Decoded::Text(t),
-            Err(e) => Decoded::Kept { b64: s.to_string(), label: format!("binary, {} bytes", e.as_bytes().len()) },
+            Err(e) => Decoded::Kept {
+                b64: s.to_string(),
+                label: format!("binary, {}", crate::plural::count(e.as_bytes().len(), "byte")),
+            },
         },
         Err(_) => Decoded::Kept { b64: s.to_string(), label: "not valid base64, kept as it is".into() },
     }
@@ -525,12 +528,13 @@ impl Render for DataEditor {
                 )
             })
             .when(binary > 0, |d| {
-                d.child(
-                    div()
-                        .text_xs()
-                        .text_color(theme.muted_foreground)
-                        .child(format!("{binary} binary key(s) are kept as they are.")),
-                )
+                d.child(div().text_xs().text_color(theme.muted_foreground).child(format!(
+                    "{} {} kept as {} {}.",
+                    crate::plural::count(binary, "binary key"),
+                    crate::plural::pick(binary, "is", "are"),
+                    crate::plural::pick(binary, "it", "they"),
+                    crate::plural::pick(binary, "is", "are")
+                )))
             })
             .when_some(self.status.clone(), |d, (ok, msg)| {
                 d.child(div().text_sm().text_color(if ok { theme.success } else { theme.danger }).child(msg))

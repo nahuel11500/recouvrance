@@ -35,11 +35,7 @@ pub fn days_left(t: jiff::Timestamp, now: jiff::Timestamp) -> i64 {
 /// Whole days, rounded down, in words: "less than a day" for 0 (a certificate that ends
 /// in 5 hours expires in less than a day, not in "0 days"), "1 day", "3 days".
 pub fn days_text(n: i64) -> String {
-    match n {
-        ..1 => "less than a day".into(),
-        1 => "1 day".into(),
-        n => format!("{n} days"),
-    }
+    if n < 1 { "less than a day".into() } else { crate::plural::count(n, "day") }
 }
 
 /// Whole days, rounded down, for a column of numbers: "<1" for 0, "3".

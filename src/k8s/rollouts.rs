@@ -76,7 +76,7 @@ pub fn status(kind: &Kind, obj: &Value) -> (bool, String) {
         if available < desired {
             return (false, format!("{available} of {desired} updated pods available"));
         }
-        return (true, format!("rolled out: {desired} pods"));
+        return (true, format!("rolled out: {}", crate::plural::count(desired, "pod")));
     }
     let desired = int("/spec/replicas").unwrap_or(1);
     let updated = int("/status/updatedReplicas").unwrap_or(0);
@@ -97,12 +97,12 @@ pub fn status(kind: &Kind, obj: &Value) -> (bool, String) {
         return (false, format!("{updated} of {desired} replicas updated"));
     }
     if total > updated {
-        return (false, format!("{} old replicas pending termination", total - updated));
+        return (false, format!("{} pending termination", crate::plural::count(total - updated, "old replica")));
     }
     if available < updated {
         return (false, format!("{available} of {updated} updated replicas available"));
     }
-    (true, format!("rolled out: {desired} replicas"))
+    (true, format!("rolled out: {}", crate::plural::count(desired, "replica")))
 }
 
 /// The patch that sets `container`'s image in a workload's pod template (a Pod's own spec
@@ -170,9 +170,13 @@ mod tests {
                 "status": {"observedGeneration": 2, "updatedReplicas": updated, "replicas": total, "availableReplicas": available}})
         };
         assert_eq!(status(&kind, &dep(1, 4, 3)), (false, "1 of 3 replicas updated".into()));
-        assert_eq!(status(&kind, &dep(3, 4, 3)), (false, "1 old replicas pending termination".into()));
+        assert_eq!(status(&kind, &dep(3, 4, 3)), (false, "1 old replica pending termination".into()));
+        assert_eq!(status(&kind, &dep(3, 5, 3)), (false, "2 old replicas pending termination".into()));
         assert_eq!(status(&kind, &dep(3, 3, 2)), (false, "2 of 3 updated replicas available".into()));
-        assert!(status(&kind, &dep(3, 3, 3)).0);
+        assert_eq!(status(&kind, &dep(3, 3, 3)), (true, "rolled out: 3 replicas".into()));
+        let single = json!({"metadata": {"generation": 1}, "spec": {"replicas": 1},
+            "status": {"observedGeneration": 1, "updatedReplicas": 1, "replicas": 1, "availableReplicas": 1}});
+        assert_eq!(status(&kind, &single), (true, "rolled out: 1 replica".into()));
         let unseen = json!({"metadata": {"generation": 3}, "status": {"observedGeneration": 2}});
         assert!(!status(&kind, &unseen).0);
     }

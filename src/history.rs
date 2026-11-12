@@ -866,7 +866,10 @@ pub fn report(subject: &str, changes: &[Change], errors: &[String], limit: usize
         }
     }
     if changes.len() > limit {
-        out.push_str(&format!("… {} older changes not shown (raise `limit`)\n", changes.len() - limit));
+        out.push_str(&format!(
+            "… {} not shown (raise `limit`)\n",
+            crate::plural::count(changes.len() - limit, "older change")
+        ));
     }
     for e in errors {
         out.push_str(&format!("Could not read {e}\n"));
@@ -1136,7 +1139,7 @@ mod tests {
         assert!(out.starts_with("Changes to Deployment web, newest first:\n"), "{out}");
         assert!(out.contains("1970-01-01 00:00:20Z") && out.contains("Event  Pod p: app: a:1 → a:2"), "{out}");
         assert!(out.contains("    - image: a:1\n    + image: a:2\n"), "{out}");
-        assert!(!out.contains("the earlier one") && out.contains("1 older changes not shown"), "{out}");
+        assert!(!out.contains("the earlier one") && out.contains("1 older change not shown"), "{out}");
         assert!(out.ends_with("Could not read Helm release web: forbidden\n"), "{out}");
     }
 

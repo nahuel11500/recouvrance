@@ -254,7 +254,7 @@ impl Render for HelmList {
                             .pb_2()
                             .text_sm()
                             .child(div().size_2().rounded_full().bg(theme.success))
-                            .child(format!("{count} Helm releases")),
+                            .child(crate::plural::count(count, "Helm release")),
                     )
                     .when(!self.errors.is_empty(), |d| {
                         d.child(

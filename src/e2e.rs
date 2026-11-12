@@ -211,7 +211,7 @@ fn turning_access_off_stops_a_drain() {
         hub.set_agents_enabled(true)?;
         uncordon().await?;
         let err = format!("{:#}", drained.expect_err("the drain went on after access was switched off"));
-        assert!(err.contains("stopped after 1 evictions") && err.contains("switched off"), "{err}");
+        assert!(err.contains("stopped after 1 eviction:") && err.contains("switched off"), "{err}");
 
         // In the app: write mode off stops it at once.
         gate::set_ui_writes(true);
@@ -908,7 +908,7 @@ fn an_agent_checks_an_upgrade() {
             hub.update_agent(&agent.id, |a| a.policy.rules.push(deny))?;
             let out = mcp.call("upgrade_check", json!({"context": ctx})).await;
             assert!(!out.contains("e2e-old-web") && !out.contains("Ingress extensions/v1beta1"), "{out}");
-            assert!(out.contains("finding(s) about objects you may not see are left out"), "{out}");
+            assert!(out.contains("about objects you may not see"), "{out}");
             assert!(out.contains("guards a single pod"), "{out}");
             Ok(())
         };

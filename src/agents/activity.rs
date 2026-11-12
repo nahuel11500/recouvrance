@@ -290,10 +290,6 @@ fn fmt_day_time(t: jiff::Timestamp) -> String {
     }
 }
 
-fn plural(n: usize, word: &str) -> String {
-    format!("{n} {word}{}", if n == 1 { "" } else { "s" })
-}
-
 /// Draw one line of the page; clicks expand or fold through `view`.
 fn render_item(item: &Item, ix: usize, view: &WeakEntity<AgentsView>, cx: &App) -> AnyElement {
     let theme = cx.theme();
@@ -394,8 +390,10 @@ fn render_item(item: &Item, ix: usize, view: &WeakEntity<AgentsView>, cx: &App) 
                 d.child(div().text_color(muted).child(format!("session {}", s.chars().take(8).collect::<String>())))
             })
             .child(div().text_color(muted).child(format!("{} – {}", fmt_day_time(*first), fmt_time(*last))))
-            .child(plural(*calls, "call"))
-            .when(*writes > 0, |d| d.child(div().text_color(theme.warning).child(plural(*writes, "write"))))
+            .child(crate::plural::count(*calls, "call"))
+            .when(*writes > 0, |d| {
+                d.child(div().text_color(theme.warning).child(crate::plural::count(*writes, "write")))
+            })
             .when(*problems > 0, |d| {
                 d.child(div().text_color(theme.danger).child(format!("{problems} denied or failed")))
             })
@@ -446,7 +444,7 @@ fn render_item(item: &Item, ix: usize, view: &WeakEntity<AgentsView>, cx: &App) 
                 .justify_center()
                 .text_xs()
                 .text_color(muted)
-                .child(format!("Showing {shown} of {}", plural(*total, "call")))
+                .child(format!("Showing {shown} of {}", crate::plural::count(*total, "call")))
                 .when(*loading, |d| d.child("Reading the log on disk…"))
                 .when(!*loading && (shown < total || *can_load), |d| {
                     d.child(

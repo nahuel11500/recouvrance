@@ -204,7 +204,11 @@ fn assemble(a: Answers) -> Report {
         Ok((found, unreadable)) => {
             uses.extend(found);
             if unreadable > 0 {
-                skipped.push(format!("Helm: {unreadable} release(s) could not be read (their manifests not checked)"));
+                skipped.push(format!(
+                    "Helm: {} could not be read ({} not checked)",
+                    crate::plural::count(unreadable, "release"),
+                    crate::plural::pick(unreadable, "its manifests", "their manifests")
+                ));
             }
         }
         Err(e) => skipped.push(not_checked("Helm releases", &e, "their manifests")),
@@ -628,12 +632,18 @@ fn gate_findings(target: u32, gates: &[Gate], flags: Option<&BTreeMap<String, St
         let n = deprecated.len();
         let (title, action) = match flags {
             Some(_) => (
-                format!("{n} deprecated feature gate(s) set in the API server's --feature-gates"),
+                format!(
+                    "{} set in the API server's --feature-gates",
+                    crate::plural::count(n, "deprecated feature gate")
+                ),
                 "A later release removes them, and an API server whose --feature-gates names a removed gate does \
                  not start: take them out of its flags",
             ),
             None => (
-                format!("{n} deprecated feature gate(s): check the API server's --feature-gates"),
+                format!(
+                    "{}: check the API server's --feature-gates",
+                    crate::plural::count(n, "deprecated feature gate")
+                ),
                 "Its flags could not be read, and most of these gates are likely at their default, set by no \
                  flag. A later release removes them, and an API server whose --feature-gates names a removed \
                  gate does not start: take out any its flags set",
@@ -653,7 +663,7 @@ fn gate_findings(target: u32, gates: &[Gate], flags: Option<&BTreeMap<String, St
         out.push(Finding {
             severity: Severity::Info,
             area: Area::FeatureGates,
-            title: format!("{} alpha feature gate(s) turned on", alpha.len()),
+            title: format!("{} turned on", crate::plural::count(alpha.len(), "alpha feature gate")),
             action: format!(
                 "Alpha features change or go away in any release: check the 1.{target} release notes for them"
             ),
@@ -733,7 +743,10 @@ fn control_plane_hop(current: u32, target: u32) -> Option<Finding> {
     (target > current + 1).then(|| Finding {
         severity: Severity::Warning,
         area: Area::Skew,
-        title: format!("1.{current} → 1.{target} skips {} minor version(s)", target - current - 1),
+        title: format!(
+            "1.{current} → 1.{target} skips {}",
+            crate::plural::count(target - current - 1, "minor version")
+        ),
         action: format!(
             "The control plane upgrades one minor version at a time: {}",
             (current..=target).map(|m| format!("1.{m}")).collect::<Vec<_>>().join(" → ")
@@ -760,8 +773,8 @@ fn kubelet_skew(target: u32, nodes: &[NodeLite]) -> Vec<Finding> {
                 severity: Severity::Critical,
                 area: Area::Skew,
                 title: format!(
-                    "{} node(s) on kubelet 1.{m}, {} minor versions behind 1.{target}",
-                    names.len(),
+                    "{} on kubelet 1.{m}, {} minor versions behind 1.{target}",
+                    crate::plural::count(names.len(), "node"),
                     target - m
                 ),
                 action: format!(
@@ -776,7 +789,7 @@ fn kubelet_skew(target: u32, nodes: &[NodeLite]) -> Vec<Finding> {
             out.push(Finding {
                 severity: Severity::Warning,
                 area: Area::Skew,
-                title: format!("{} node(s) on kubelet 1.{m}, newer than 1.{target}", names.len()),
+                title: format!("{} on kubelet 1.{m}, newer than 1.{target}", crate::plural::count(names.len(), "node")),
                 action: format!("A kubelet must not be newer than the API server: go to 1.{m} or later"),
                 details: Vec::new(),
                 objects,
@@ -973,7 +986,7 @@ fn drain_findings(pdbs: &[Value], pods: Option<&[PodLite]>) -> Vec<Finding> {
         findings.push(Finding {
             severity: Severity::Warning,
             area: Area::Drains,
-            title: format!("{count} pod(s) selected by {} PodDisruptionBudgets", names.len()),
+            title: format!("{} selected by {} PodDisruptionBudgets", crate::plural::count(count, "pod"), names.len()),
             action: "The eviction API refuses a pod that more than one budget selects, so drains stop on these: make \
                      the budgets' selectors disjoint"
                 .into(),
@@ -1121,7 +1134,11 @@ pub fn to_text(context: &str, report: &Report, visible: impl Fn(&Object) -> bool
         });
     }
     if left_out > 0 {
-        out.push_str(&format!("\n{left_out} finding(s) about objects you may not see are left out.\n"));
+        out.push_str(&format!(
+            "\n{} about objects you may not see {} left out.\n",
+            crate::plural::count(left_out, "finding"),
+            crate::plural::pick(left_out, "is", "are")
+        ));
     }
     if !report.skipped.is_empty() {
         out.push_str(&format!("\nNot checked: {}\n", report.skipped.join("; ")));

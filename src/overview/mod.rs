@@ -681,10 +681,12 @@ fn flatten(prefix: &str, v: &Value, depth: usize, out: &mut Vec<(String, String)
             if scalars.len() == items.len() {
                 out.push((prefix.to_string(), scalars.join(", ")));
             } else {
-                out.push((prefix.to_string(), format!("{} items (see YAML)", items.len())));
+                out.push((prefix.to_string(), format!("{} (see YAML)", crate::plural::count(items.len(), "item"))));
             }
         }
-        Value::Object(map) => out.push((prefix.to_string(), format!("{} fields (see YAML)", map.len()))),
+        Value::Object(map) => {
+            out.push((prefix.to_string(), format!("{} (see YAML)", crate::plural::count(map.len(), "field"))));
+        }
         Value::String(s) => out.push((prefix.to_string(), s.clone())),
         Value::Null => {}
         other => out.push((prefix.to_string(), other.to_string())),
@@ -726,7 +728,13 @@ fn generic_section(title: &str, v: Option<&Value>, cx: &App) -> AnyElement {
                 )
         }))
         .when(more > 0, |d| {
-            d.child(div().pt_1().text_xs().text_color(muted).child(format!("… {more} more fields in YAML")))
+            d.child(
+                div()
+                    .pt_1()
+                    .text_xs()
+                    .text_color(muted)
+                    .child(format!("… {more} more {} in YAML", crate::plural::pick(more, "field", "fields"))),
+            )
         })
         .into_any_element()
 }

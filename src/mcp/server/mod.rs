@@ -206,7 +206,10 @@ fn arg_details(args: &serde_json::Value) -> String {
 
 fn cap_chars(text: &str, max: usize) -> String {
     match text.char_indices().nth(max) {
-        Some((i, _)) => format!("{}… ({} more chars)", &text[..i], text[i..].chars().count()),
+        Some((i, _)) => {
+            let more = text[i..].chars().count();
+            format!("{}… ({more} more {})", &text[..i], crate::plural::pick(more, "char", "chars"))
+        }
         None => text.to_string(),
     }
 }
@@ -376,7 +379,10 @@ impl KubeMcp {
         };
         self.ensure_active(&call)?;
         if !self.hub.take_call(&call.agent.id, call.agent.policy.max_calls_per_minute) {
-            return Err(call.deny(format!("rate limit: {} calls per minute", call.agent.policy.max_calls_per_minute)));
+            return Err(call.deny(format!(
+                "rate limit: {} per minute",
+                crate::plural::count(call.agent.policy.max_calls_per_minute, "call")
+            )));
         }
         if let Some(e) = invalid {
             return Err(call.fail(e));
