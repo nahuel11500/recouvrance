@@ -59,7 +59,15 @@ pub fn pod(pod: &Value, events: &[Ev], crash_logs: Option<&(String, String)>) ->
             title: "Being deleted".into(),
             detail: format!(
                 "Deletion was requested{}.",
-                if finalizers > 0 { format!("; {finalizers} finalizer(s) hold it") } else { String::new() }
+                if finalizers > 0 {
+                    format!(
+                        "; {} {} it",
+                        crate::plural::count(finalizers, "finalizer"),
+                        crate::plural::pick(finalizers, "holds", "hold")
+                    )
+                } else {
+                    String::new()
+                }
             ),
             hint: "If it stays Terminating, the node may be unreachable: Delete → force, or remove finalizers.".into(),
         });

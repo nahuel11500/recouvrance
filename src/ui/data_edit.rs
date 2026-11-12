@@ -528,12 +528,13 @@ impl Render for DataEditor {
                 )
             })
             .when(binary > 0, |d| {
-                d.child(
-                    div()
-                        .text_xs()
-                        .text_color(theme.muted_foreground)
-                        .child(format!("{binary} binary key(s) are kept as they are.")),
-                )
+                d.child(div().text_xs().text_color(theme.muted_foreground).child(format!(
+                    "{} {} kept as {} {}.",
+                    crate::plural::count(binary, "binary key"),
+                    crate::plural::pick(binary, "is", "are"),
+                    crate::plural::pick(binary, "it", "they"),
+                    crate::plural::pick(binary, "is", "are")
+                )))
             })
             .when_some(self.status.clone(), |d, (ok, msg)| {
                 d.child(div().text_sm().text_color(if ok { theme.success } else { theme.danger }).child(msg))

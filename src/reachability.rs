@@ -118,7 +118,7 @@ pub fn verdict(steps: &[Step]) -> (State, String) {
     let count = |state: State| steps.iter().filter(|s| s.state == state).count();
     match (count(State::Unknown), count(State::Warn)) {
         (0, 0) => (State::Ok, "Every step checks out.".into()),
-        (0, warn) => (State::Warn, format!("No step breaks; {warn} warning(s).")),
+        (0, warn) => (State::Warn, format!("No step breaks; {}.", crate::plural::count(warn, "warning"))),
         (unknown, _) => (State::Unknown, format!("No step breaks, but {unknown} could not be checked.")),
     }
 }
@@ -619,7 +619,12 @@ fn service_steps(context: &str, key: &Key, svc: &Value, only: Option<&[Value]>, 
             Some(Ok(pods)) if pods.is_empty() => {
                 Step::new(&section, "Selects no pods", State::Broken, format!("No pod in {ns} has the labels {sel}."))
             }
-            Some(Ok(pods)) => Step::new(&section, "Selector", State::Ok, format!("{} pod(s) match {sel}.", pods.len())),
+            Some(Ok(pods)) => Step::new(
+                &section,
+                "Selector",
+                State::Ok,
+                format!("{} {sel}.", crate::plural::count_as(pods.len(), "pod matches", "pods match")),
+            ),
         };
         steps.push(step.with_command(command));
         world.pods.get(key).and_then(|r| r.as_ref().ok()).map(Vec::as_slice)

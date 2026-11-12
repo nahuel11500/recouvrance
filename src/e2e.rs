@@ -867,7 +867,7 @@ fn an_agent_checks_an_upgrade() {
             hub.update_agent(&agent.id, |a| a.policy.rules.push(deny))?;
             let out = mcp.call("upgrade_check", json!({"context": ctx})).await;
             assert!(!out.contains("e2e-old-web") && !out.contains("Ingress extensions/v1beta1"), "{out}");
-            assert!(out.contains("finding(s) about objects you may not see are left out"), "{out}");
+            assert!(out.contains("about objects you may not see"), "{out}");
             assert!(out.contains("guards a single pod"), "{out}");
             Ok(())
         };

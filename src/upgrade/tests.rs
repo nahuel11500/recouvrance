@@ -252,7 +252,7 @@ fn a_part_refused_keeps_the_others() {
         ]
     );
     assert_eq!(report.findings.len(), 1);
-    assert_eq!(report.findings[0].title, "1 node(s) on kubelet 1.27, 5 minor versions behind 1.32");
+    assert_eq!(report.findings[0].title, "1 node on kubelet 1.27, 5 minor versions behind 1.32");
     // Nothing found and nothing refused: an all-clear.
     let clear = assemble(answers());
     assert!(clear.findings.is_empty() && clear.skipped.is_empty());
@@ -321,7 +321,7 @@ fn one_finding_per_removed_api_with_every_source() {
     assert!(flow.details[0].contains("flowschemas in flowcontrol.apiserver.k8s.io/v1beta3"));
     assert!(report.findings[1].action.contains("helm-mapkubeapis") && report.findings[1].details.is_empty());
     assert!(!flow.action.contains("Helm"));
-    assert_eq!(report.skipped, ["Helm: 2 release(s) could not be read (their manifests not checked)"]);
+    assert_eq!(report.skipped, ["Helm: 2 releases could not be read (their manifests not checked)"]);
 }
 
 #[test]
@@ -337,8 +337,8 @@ fn skew_of_kubelets_and_kube_proxies() {
     assert_eq!(
         titles,
         [
-            (Severity::Critical, "1 node(s) on kubelet 1.27, 4 minor versions behind 1.31"),
-            (Severity::Warning, "1 node(s) on kubelet 1.33, newer than 1.31"),
+            (Severity::Critical, "1 node on kubelet 1.27, 4 minor versions behind 1.31"),
+            (Severity::Warning, "1 node on kubelet 1.33, newer than 1.31"),
         ]
     );
     assert_eq!(found[0].objects[0].name, "b");
@@ -426,8 +426,8 @@ fn drains_that_would_block() {
         [
             "A PodDisruptionBudget guards a single pod: draining its node waits forever",
             "A PodDisruptionBudget allows no disruption (2 of 3 pods healthy)",
-            "1 pod(s) selected by 2 PodDisruptionBudgets",
-            "2 pod(s) selected by 2 PodDisruptionBudgets",
+            "1 pod selected by 2 PodDisruptionBudgets",
+            "2 pods selected by 2 PodDisruptionBudgets",
         ]
     );
     let names = |f: &Finding| f.objects.iter().map(|o| format!("{} {}", o.kind, o.name)).collect::<Vec<_>>();
@@ -543,6 +543,6 @@ fn the_text_leaves_out_what_an_agent_may_not_see() {
     assert!(text.contains("CRITICAL · Removed APIs · FlowSchema") && !text.contains("secret-one"), "{text}");
     assert!(!text.contains("guards a single pod") && !text.contains("db-0"), "{text}");
     assert!(text.contains("  - pods ok/y: on n1\n  (1 more you may not see)"), "{text}");
-    assert!(text.contains("1 finding(s) about objects you may not see are left out."), "{text}");
+    assert!(text.contains("1 finding about objects you may not see is left out."), "{text}");
     assert!(text.contains("Not checked: CRDs: forbidden"), "{text}");
 }
