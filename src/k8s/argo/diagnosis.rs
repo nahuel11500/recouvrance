@@ -34,7 +34,8 @@ const LOOP_SYNCS: usize = 3;
 const LOOP_WINDOW: i64 = 60 * 60;
 /// ...unless the last of them is older than this: the loop stopped.
 const LOOP_RECENT: i64 = 6 * 60 * 60;
-/// Live objects read for their drift, at most (the first ones Argo CD lists).
+/// Live objects read for their drift, at most (the first ones Argo CD lists). As many
+/// again are read for whether they are still there, for an Application being deleted.
 pub const DRIFT_READS: usize = 20;
 /// Live objects read at the same time.
 const READS_AT_ONCE: usize = 6;
@@ -222,6 +223,9 @@ pub struct Diagnosis {
     /// The resources whose live object is worth comparing: out of sync, or applied again
     /// and again by a sync loop.
     pub to_compare: Vec<Res>,
+    /// An Application being deleted: the resources it lists that Argo CD doesn't know gone,
+    /// read to say which are really left (Argo CD's status lags behind).
+    pub to_find: Vec<Res>,
     /// Those a sync loop keeps applying: their fields go in the `ignoreDifferences` suggested.
     pub looping: Vec<Res>,
     /// When the last sync finished: writes after it are what changed since.
@@ -307,12 +311,32 @@ impl Diagnosis {
             .take(DRIFT_READS)
             .cloned()
             .collect();
+        if app.pointer("/metadata/deletionTimestamp").is_some_and(|t| !t.is_null()) {
+            d.to_find = arr(app, "/status/resources")
+                .iter()
+                .filter(|r| there(r, &[]) != Some(false))
+                .filter_map(Res::of)
+                .filter(|r| !d.to_compare.iter().any(|c| c.same(r)))
+                .take(DRIFT_READS)
+                .collect();
+        }
         d
     }
 
     /// Whether nothing was found.
     pub fn is_empty(&self) -> bool {
         self.findings.is_empty()
+    }
+
+    /// The live objects to read: those compared, then those only looked for.
+    pub fn to_read(&self) -> Vec<Res> {
+        self.to_compare.iter().chain(&self.to_find).cloned().collect()
+    }
+
+    /// The drifts of `read` worth showing: not those of [`Self::to_find`], read only to know
+    /// whether they are there.
+    pub fn compared<'a>(&self, read: &'a DriftRead) -> Vec<&'a Drift> {
+        read.drifts.iter().filter(|dr| !self.to_find.iter().any(|r| r.same(&dr.res))).collect()
     }
 }
 
@@ -1273,9 +1297,10 @@ pub async fn drift_for(app: &Value, on: Option<&str>, clusters: &[(String, Clien
     };
     let d = Diagnosis::of(app, Timestamp::now());
     let mut read = DriftRead { context: Some(context.clone()), ..Default::default() };
-    if !d.to_compare.is_empty() {
+    let targets = d.to_read();
+    if !targets.is_empty() {
         let all: MayRead = Arc::new(|_: &Kind, _: &Res| true);
-        read.drifts = read_drift(client.clone(), context.clone(), None, d.to_compare, d.since, all).await;
+        read.drifts = read_drift(client.clone(), context.clone(), None, targets, d.since, all).await;
     }
     read
 }
@@ -1318,12 +1343,13 @@ pub fn report(head: &str, d: &Diagnosis, read: &DriftRead) -> String {
     if let Some(note) = &read.note {
         out.push(format!("\nLive objects: {note}"));
     }
-    if !read.drifts.is_empty() {
+    let compared = d.compared(read);
+    if !compared.is_empty() {
         let on = read.context.as_deref().unwrap_or("?");
         out.push(format!(
             "\nDrift on {on} (git's manifests aren't readable through the Kubernetes API: compared with what was last applied):"
         ));
-        for drift in &read.drifts {
+        for drift in compared {
             out.push(format!("{} — {}", drift.res.label(), compared_text(&drift.compared)));
             for line in drift.lines() {
                 match line {
@@ -1633,6 +1659,66 @@ mod tests {
         assert_eq!(f.objects.len(), 4);
         assert_eq!(f.objects[0].1, "listed by Argo CD, its live object wasn't read");
         assert!(!f.hint.contains("already gone"), "{}", f.hint);
+    }
+
+    /// An Application being deleted reads what it lists live, synced resources included:
+    /// one Argo CD last saw is said gone once the read finds it gone (#690).
+    #[test]
+    fn a_deletion_reads_what_it_lists_live() {
+        let app = json!({
+            "metadata": {"deletionTimestamp": "2026-10-30T11:00:00Z", "finalizers": ["resources-finalizer.argocd.argoproj.io"]},
+            "status": {"resources": [
+                {"group": "apps", "version": "v1", "kind": "Deployment", "namespace": "shop", "name": "web", "status": "OutOfSync", "health": {"status": "Healthy"}},
+                {"version": "v1", "kind": "Service", "namespace": "shop", "name": "web", "status": "Synced", "health": {"status": "Healthy"}},
+                {"version": "v1", "kind": "ConfigMap", "namespace": "shop", "name": "conf", "status": "Synced"},
+                {"version": "v1", "kind": "Secret", "namespace": "shop", "name": "gone", "status": "Synced", "health": {"status": "Missing"}}
+            ]}
+        });
+        let res = |kind: &str, name: &str| Res {
+            kind: kind.into(),
+            namespace: "shop".into(),
+            name: name.into(),
+            version: "v1".into(),
+            ..Default::default()
+        };
+        let (service, conf) = (res("Service", "web"), res("ConfigMap", "conf"));
+        let d = Diagnosis::of(&app, now());
+        // Out of sync: compared. The synced ones: looked for. Missing: not read.
+        assert_eq!(d.to_compare, [deployment()]);
+        assert_eq!(d.to_find, [service.clone(), conf.clone()]);
+        assert_eq!(d.to_read(), [deployment(), service.clone(), conf.clone()]);
+
+        let live = [
+            Drift::not_read(&deployment(), Compared::NoCopy),
+            Drift::not_read(&service, Compared::Gone),
+            Drift { res: conf, compared: Compared::LastApplied, fields: Vec::new(), more: 0, writers: Vec::new() },
+        ];
+        let d = Diagnosis::of_live(&app, now(), &live);
+        let f = &d.findings[0];
+        let what: Vec<(String, &str)> = f.objects.iter().map(|(r, w)| (r.label(), w.as_str())).collect();
+        assert_eq!(
+            what,
+            [
+                ("Deployment shop/web".to_string(), "not deleted yet"),
+                ("ConfigMap shop/conf".to_string(), "not deleted yet"),
+            ]
+        );
+        assert!(
+            f.message.as_deref().unwrap().ends_with("2 of the resources it lists already gone."),
+            "{:?}",
+            f.message
+        );
+        // Read only to know whether they are there: not shown as drift.
+        let read = DriftRead { context: Some("prod".into()), drifts: live.to_vec(), note: None };
+        let shown: Vec<String> = d.compared(&read).iter().map(|dr| dr.res.label()).collect();
+        assert_eq!(shown, ["Deployment shop/web"]);
+        let text = report("Application shop", &d, &read);
+        assert!(!text.contains("ConfigMap shop/conf —"), "{text}");
+
+        // Not being deleted: nothing more is read.
+        let mut kept = app;
+        kept["metadata"] = json!({});
+        assert!(Diagnosis::of(&kept, now()).to_find.is_empty());
     }
 
     #[test]

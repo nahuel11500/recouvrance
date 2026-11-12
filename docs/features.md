@@ -192,7 +192,7 @@
 - **Argo CD diagnosis**: an Application's page says what is wrong with it, worst first, each
   with its objects (opening on the destination's context when it is connected) and what to do:
   - *Being deleted*: the finalizers holding it (what each one waits for) and the resources not
-    deleted yet; red after 5 minutes.
+    deleted yet, read live on the destination when it is connected; red after 5 minutes.
   - *Sync running* for more than 10 minutes: the hook or resource it waits for.
   - *Last sync failed*: each object that failed and why, from Argo CD's messages: a hook that
     failed, rejected by admission (a webhook, Pod Security), a webhook that did not answer, a
