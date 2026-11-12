@@ -353,10 +353,13 @@ fn render_item(item: &Item, ix: usize, view: &WeakEntity<AgentsView>, cx: &App) 
                     .text_color(theme.blue)
                     .when(calls.len() > 1, |d| d.child(format!("×{}", calls.len()))),
             )
+            // As the page narrows (the assistant dock open), the result beside the call gives up
+            // room twice as readily as the call, which keeps at least 120px (#749).
             .child(
                 div()
-                    .flex_1()
-                    .min_w_0()
+                    .flex_grow(1.)
+                    .flex_basis(px(240.))
+                    .min_w(px(120.))
                     .overflow_hidden()
                     .text_ellipsis()
                     .whitespace_nowrap()
@@ -364,8 +367,9 @@ fn render_item(item: &Item, ix: usize, view: &WeakEntity<AgentsView>, cx: &App) 
             )
             .child(
                 div()
-                    .w(px(240.))
-                    .flex_shrink_0()
+                    .flex_basis(px(240.))
+                    .flex_shrink(2.)
+                    .min_w(px(80.))
                     .overflow_hidden()
                     .text_ellipsis()
                     .whitespace_nowrap()
