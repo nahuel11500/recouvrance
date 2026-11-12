@@ -672,7 +672,8 @@ fn an_agent_reads_helm_releases_by_its_secret_rules() {
 }
 
 /// A Deployment's logs come from all its pods, merged; pods whose logs the rules deny are
-/// left out and counted.
+/// left out and counted. With no container named, each pod's default one is read (the API
+/// server refuses a pod with several), and the others are named.
 #[test]
 #[ignore = "needs a kind cluster: RECOUVRANCE_E2E_CONTEXT"]
 fn an_agent_reads_a_workload_s_logs() {
@@ -691,7 +692,8 @@ fn an_agent_reads_a_workload_s_logs() {
             "spec": {"replicas": 2, "selector": {"matchLabels": {"app": name}}, "template": {
                 "metadata": {"labels": {"app": name}},
                 "spec": {"terminationGracePeriodSeconds": 0, "containers": [{"name": "main", "image": "busybox:1.37",
-                    "command": ["sh", "-c", "while true; do echo tick-$HOSTNAME; sleep 1; done"]}]},
+                    "command": ["sh", "-c", "while true; do echo tick-$HOSTNAME; sleep 1; done"]},
+                    {"name": "helper", "image": "busybox:1.37", "command": ["sleep", "3600"]}]},
             }},
         });
         deps.create(&PostParams::default(), &serde_json::from_value(dep)?).await?;
@@ -715,8 +717,14 @@ fn an_agent_reads_a_workload_s_logs() {
             let mcp = crate::assistant::Mcp::connect(hub.port(), token).await?;
             let args = json!({"context": ctx, "kind": "deployments", "namespace": NS, "name": name, "grep": "tick"});
             let out = mcp.call("workload_logs", args.clone()).await;
-            let prefixes: std::collections::HashSet<&str> = out.lines().filter_map(|l| l.split(']').next()).collect();
+            let ticks = out.lines().filter(|l| l.contains("tick-"));
+            let prefixes: std::collections::HashSet<&str> = ticks.filter_map(|l| l.split(']').next()).collect();
             assert_eq!(prefixes.len(), 2, "{out}");
+            assert!(out.contains("logs of container main (the default), not of helper"), "{out}");
+            let pod = pods.list(&kube::api::ListParams::default().labels(&format!("app={name}"))).await?.items;
+            let pod = pod.first().and_then(|p| p.metadata.name.clone()).unwrap_or_default();
+            let one = mcp.call("get_logs", json!({"context": ctx, "namespace": NS, "pod": pod, "grep": "tick"})).await;
+            assert!(one.contains(&format!("tick-{pod}")) && one.contains("not of helper"), "{one}");
 
             let deny = rules_file::parse_rule(Mode::Deny, "logs pods/e2e-logs-* -n default")?;
             hub.update_agent(&agent.id, |a| a.policy.rules.push(deny))?;

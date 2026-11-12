@@ -6,6 +6,7 @@ use rmcp::handler::server::wrapper::Parameters;
 use rmcp::{tool, tool_router};
 use serde_json::json;
 
+use super::logs_tools::{containers_note, log_containers};
 use super::{
     CertParams, ContextParam, EventsParams, HistoryParams, KubeMcp, ListParams, LogsParams, MAX_LOG_BYTES,
     ObjectParams, ProblemsParams, ReachParams, SearchParams, TopParams, access_for, describe, format_table, get_named,
@@ -503,7 +504,7 @@ impl KubeMcp {
     }
 
     #[tool(
-        description = "Read a pod's container logs (most recent lines, at most 1 MiB), like `kubectl logs --tail`.",
+        description = "Read a pod's container logs (most recent lines, at most 1 MiB), like `kubectl logs --tail`. With no container named, the pod's default one, as kubectl picks it; the others are named in a note.",
         annotations(read_only_hint = true)
     )]
     async fn get_logs(
@@ -517,8 +518,22 @@ impl KubeMcp {
         let (client, kind) = self.kind(&call, &p.context, "pods").await?;
         let access = access_for(&kind, &p.context, Verb::Logs, Some(p.namespace.clone()), Some(p.pod.clone()));
         self.authorize(&mut call, &access).await?;
+        // With no container named, the pod's default one, as kubectl picks it: the API server
+        // refuses a pod that has several. When the pod can't be read, none is named and the
+        // logs call says why.
+        let (container, note) = match p.container {
+            Some(c) => (Some(c), None),
+            None => match get_named(&client, &kind, Some(&p.namespace), &p.pod, false).await {
+                Ok(pod) => {
+                    let c = log_containers(&pod);
+                    let note = containers_note(c.read.as_slice(), &c.others);
+                    (c.read, note)
+                }
+                Err(_) => (None, None),
+            },
+        };
         let lp = kube::api::LogParams {
-            container: p.container,
+            container,
             tail_lines: Some(i64::from(p.tail_lines.unwrap_or(200).min(call.policy().max_log_lines))),
             since_seconds: p.since_seconds,
             previous: p.previous.unwrap_or(false),
@@ -532,12 +547,18 @@ impl KubeMcp {
             Ok(api.logs(&pod, &lp).await?)
         })
         .await;
-        call.finish(result.map(|text| match &p.grep {
-            Some(g) => {
-                let g = g.to_lowercase();
-                text.lines().filter(|l| l.to_lowercase().contains(&g)).collect::<Vec<_>>().join("\n")
+        call.finish(result.map(|text| {
+            let text = match &p.grep {
+                Some(g) => {
+                    let g = g.to_lowercase();
+                    text.lines().filter(|l| l.to_lowercase().contains(&g)).collect::<Vec<_>>().join("\n")
+                }
+                None => text,
+            };
+            match note {
+                Some(note) => format!("[{note}]\n{text}"),
+                None => text,
             }
-            None => text,
         }))
     }
 

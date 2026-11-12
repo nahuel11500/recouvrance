@@ -254,10 +254,6 @@ pub fn typed_pod_containers(pod: &Pod) -> Vec<String> {
 /// The annotation naming the container kubectl uses when none is given.
 const DEFAULT_CONTAINER: &str = "kubectl.kubernetes.io/default-container";
 
-/// The container kubectl execs into when none is named: the one the
-/// `kubectl.kubernetes.io/default-container` annotation names when the pod has it, else the
-/// first of `spec.containers`. The API server refuses an exec with no container in a pod
-/// that has several.
 /// Whether a pod's Ready condition is True.
 pub fn pod_ready(pod: &serde_json::Value) -> bool {
     pod.pointer("/status/conditions")
@@ -295,6 +291,10 @@ pub fn pod_counts(pod: &serde_json::Value) -> PodCounts {
     }
 }
 
+/// The container kubectl execs into (or reads the logs of) when none is named: the one the
+/// `kubectl.kubernetes.io/default-container` annotation names when the pod has it, else the
+/// first of `spec.containers`. The API server refuses an exec or a logs call with no container
+/// in a pod that has several.
 pub fn default_container(pod: &serde_json::Value) -> Option<String> {
     pod_containers(pod).into_iter().next()
 }
