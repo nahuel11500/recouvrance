@@ -105,8 +105,8 @@ pub fn exec_shell(client: Client, ns: String, pod: String, container: Option<Str
         if let Some(c) = container.clone() {
             ap = ap.container(c);
         }
-        let shell = ["sh", "-c", "command -v bash >/dev/null 2>&1 && exec bash || exec sh"];
-        let mut proc = match api.exec(&pod, shell, &ap).await {
+        let id = uuid::Uuid::new_v4().simple().to_string();
+        let mut proc = match api.exec(&pod, shell_command(&id), &ap).await {
             Ok(p) => p,
             Err(e) => {
                 let why = refused(&api, &pod, container.as_deref(), "exec", e).await;
@@ -114,6 +114,9 @@ pub fn exec_shell(client: Client, ns: String, pod: String, container: Option<Str
                 return;
             }
         };
+        // Dropped with the session (Close shell, another container, the view closed): a
+        // shell still running then is hung up.
+        let mut hang_up = HangUp { api: Some(api.clone()), pod: pod.clone(), container: container.clone(), id };
         let (Some(stdin), Some(stdout), Some(resize)) = (proc.stdin(), proc.stdout(), proc.terminal_size()) else {
             let _ = out.unbounded_send(ExecOutput::Exit("no tty streams".into()));
             return;
@@ -123,15 +126,85 @@ pub fn exec_shell(client: Client, ns: String, pod: String, container: Option<Str
             () = forward_output(stdout, out.clone(), false) => {}
             () = forward_input(keys, Some(stdin), Some(resize)) => {}
         }
+        let status = match status {
+            Some(s) => s.await,
+            None => None,
+        };
+        // The shell said how it ended: there is nothing left to hang up (its background jobs
+        // stay, as they do when a terminal's shell exits).
+        if status.is_some() {
+            hang_up.api = None;
+        }
         let reason = match status {
-            Some(s) => match s.await {
-                Some(st) if st.status.as_deref() != Some("Success") => shell_ended(&st.message.unwrap_or_default()),
-                _ => "Session ended".to_string(),
-            },
-            None => "Session ended".to_string(),
+            Some(st) if st.status.as_deref() != Some("Success") => shell_ended(&st.message.unwrap_or_default()),
+            _ => "Session ended".to_string(),
         };
         let _ = out.unbounded_send(ExecOutput::Exit(reason));
     })
+}
+
+/// The interactive shell of session `id`: bash if present, else sh, with
+/// `RECOUVRANCE_SESSION` set to `id`. The shell and everything started from it inherit it,
+/// so [`HANGUP_SCRIPT`] finds them.
+fn shell_command(id: &str) -> Vec<String> {
+    let script = "RECOUVRANCE_SESSION=$1; export RECOUVRANCE_SESSION; \
+                  command -v bash >/dev/null 2>&1 && exec bash || exec sh";
+    vec!["sh".into(), "-c".into(), script.into(), "sh".into(), id.into()]
+}
+
+/// Hangs up the processes of the session given as `$1`, as a terminal closing does: SIGHUP,
+/// then SIGCONT for stopped jobs, to every process whose environment carries its mark.
+/// Closing the exec's connection doesn't: with a tty the runtime only detaches, and the shell
+/// (with whatever runs in it) stays in the container. Processes the shell's user can't
+/// signal and ones that ignore SIGHUP (`nohup`) stay, as they would.
+const HANGUP_SCRIPT: &str = r#"for p in /proc/[0-9]*; do
+case "$(cat "$p/environ")" in
+*"RECOUVRANCE_SESSION=$1"*) kill -HUP "${p#/proc/}"; kill -CONT "${p#/proc/}";;
+esac
+done 2>/dev/null"#;
+
+/// The command that hangs up session `id`.
+fn hangup_command(id: &str) -> Vec<String> {
+    vec!["sh".into(), "-c".into(), HANGUP_SCRIPT.into(), "sh".into(), id.into()]
+}
+
+/// Whether `command` is [`hangup_command`] of a session (a 32-digit hex id). The write gate
+/// lets it through: it ends a shell opened while write mode was on, and must still go
+/// after write mode is turned off.
+pub(super) fn is_hangup_command(command: &[String]) -> bool {
+    let [sh, c, script, zero, id] = command else { return false };
+    sh == "sh"
+        && c == "-c"
+        && script == HANGUP_SCRIPT
+        && zero == "sh"
+        && id.len() == 32
+        && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// Hangs up a container shell when its session is dropped while the shell still runs;
+/// `api` is `None` once the shell ended by itself.
+struct HangUp {
+    api: Option<Api<Pod>>,
+    pod: String,
+    container: Option<String>,
+    id: String,
+}
+
+impl Drop for HangUp {
+    fn drop(&mut self) {
+        let Some(api) = self.api.take() else { return };
+        let (pod, container, id) = (std::mem::take(&mut self.pod), self.container.take(), std::mem::take(&mut self.id));
+        super::spawn_detached(async move {
+            let mut ap = kube::api::AttachParams::default().stdin(false).stdout(false).stderr(true);
+            if let Some(c) = container {
+                ap = ap.container(c);
+            }
+            let Ok(mut proc) = api.exec(&pod, hangup_command(&id), &ap).await else { return };
+            if let Some(status) = proc.take_status() {
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(30), status).await;
+            }
+        });
+    }
 }
 
 /// The container to exec in: the one named, else the pod's default one as kubectl picks it
@@ -873,8 +946,8 @@ fn attach_target(
 #[cfg(test)]
 mod tests {
     use super::{
-        NO_SHELL, Refusal, attach_target, copy_capped, crlf, ended_reason, helm_writes, read_capped, refusal_reason,
-        shell_ended, tar_source, upload_source,
+        NO_SHELL, Refusal, attach_target, copy_capped, crlf, ended_reason, hangup_command, helm_writes, read_capped,
+        refusal_reason, shell_command, shell_ended, tar_source, upload_source,
     };
     use k8s_openapi::api::core::v1::{Container, EphemeralContainer, PodSpec};
 
@@ -1023,6 +1096,77 @@ mod tests {
         assert!(writes("upgrade web ./chart --dry-run=none"));
         assert!(writes("upgrade web ./chart --dry-run --dry-run=false"));
         assert!(!writes("history web"));
+    }
+
+    /// The exec request kube sends for `command`, as the write gate sees it.
+    fn exec_needs_writes(command: Vec<String>, tty: bool) -> bool {
+        let ap = if tty {
+            kube::api::AttachParams::interactive_tty().container("web")
+        } else {
+            kube::api::AttachParams::default().stdin(false).stdout(false).stderr(true).container("web")
+        };
+        let req = kube::core::Request::new("/api/v1/namespaces/shop/pods").exec("web-1", command, &ap).unwrap();
+        crate::k8s::gate::needs_writes(req.method(), req.uri().path(), req.uri().query().unwrap_or_default())
+    }
+
+    #[test]
+    fn a_closed_shell_is_hung_up_even_with_write_mode_off_and_only_it() {
+        let id = uuid::Uuid::new_v4().simple().to_string();
+        assert!(exec_needs_writes(shell_command(&id), true));
+        assert!(!exec_needs_writes(hangup_command(&id), false));
+        // Any other command, or another id than a session's, still needs write mode.
+        let mut other = hangup_command(&id);
+        other[2].push_str("; rm -rf /");
+        assert!(exec_needs_writes(other, false));
+        for bad in ["x; rm -rf /", "", "ABCDEF0123456789ABCDEF0123456789"] {
+            assert!(exec_needs_writes(hangup_command(bad), false), "{bad}");
+        }
+        let mut extra = hangup_command(&id);
+        extra.push("more".into());
+        assert!(exec_needs_writes(extra, false));
+    }
+
+    /// Whether process `pid` ended (gone, or a zombie waiting for its parent).
+    #[cfg(target_os = "linux")]
+    fn ended(pid: u32) -> bool {
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else { return true };
+        stat.rsplit_once(") ").is_some_and(|(_, rest)| rest.starts_with('Z'))
+    }
+
+    /// The hangup ends the session's shell and what was started from it, and leaves another
+    /// session's shell running.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn the_hangup_ends_the_session_s_processes_and_only_them() {
+        use std::io::{BufRead as _, Write as _};
+        use std::process::{Command, Stdio};
+        let shell = |id: &str| {
+            let cmd = shell_command(id);
+            Command::new(&cmd[0]).args(&cmd[1..]).stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap()
+        };
+        let (id, other_id) = (uuid::Uuid::new_v4().simple().to_string(), uuid::Uuid::new_v4().simple().to_string());
+        let (mut session, mut other) = (shell(&id), shell(&other_id));
+        // A job started from the shell, as the user would.
+        let mut stdin = session.stdin.take().unwrap();
+        stdin.write_all(b"sleep 300 & echo $!\n").unwrap();
+        let mut line = String::new();
+        std::io::BufReader::new(session.stdout.take().unwrap()).read_line(&mut line).unwrap();
+        let job: u32 = line.trim().parse().unwrap();
+
+        let hangup = hangup_command(&id);
+        assert!(Command::new(&hangup[0]).args(&hangup[1..]).status().unwrap().success());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !(session.try_wait().unwrap().is_some() && ended(job)) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let still = (session.try_wait().unwrap().is_none(), !ended(job));
+        let other_ran = other.try_wait().unwrap().is_none();
+        let _ = other.kill();
+        let _ = other.wait();
+        let _ = session.kill();
+        drop(stdin);
+        assert_eq!(still, (false, false), "the session's shell and job are hung up");
+        assert!(other_ran, "another session's shell keeps running");
     }
 
     #[test]
