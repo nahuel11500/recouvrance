@@ -117,8 +117,11 @@ pub(super) async fn fetch_related(
         )
         .await;
         related.pods = related.noted("pods", pods);
-        related.node_stats = k8s::node_stats(client.clone(), name.to_string()).await;
-        related.extra = k8s::resource_slices(client, name.to_string()).await;
+        let (stats, slices) = futures::join!(
+            k8s::node_stats(client.clone(), name.to_string()),
+            k8s::resource_slices(client, name.to_string())
+        );
+        (related.node_stats, related.extra) = (stats, slices);
         return related;
     }
     if kind.is("", "Namespace") {
@@ -211,92 +214,105 @@ pub(super) async fn fetch_related(
         return related;
     }
     if kind.is("", "Pod") {
-        let selector = None;
-        // Metrics are optional (no metrics-server): no usage is not an error to show.
-        if crate::settings::metrics_on(context)
-            && let Ok((usage, read)) = k8s::container_usage_read(client.clone(), ns.clone(), selector).await
-        {
-            (related.usage, related.usage_read) = (usage, Some(read));
-        }
-        // ConfigMaps and Secrets the environment reads, to show resolved values.
-        let mut refs: std::collections::BTreeSet<(&str, String)> = Default::default();
-        for c in k8s::spec_containers(&obj["spec"]).iter().map(|c| c.spec) {
-            for e in c["env"].as_array().into_iter().flatten() {
-                if let Some(n) = e.pointer("/valueFrom/configMapKeyRef/name").and_then(|v| v.as_str()) {
-                    refs.insert(("ConfigMap", n.to_string()));
-                }
-                if let Some(n) = e.pointer("/valueFrom/secretKeyRef/name").and_then(|v| v.as_str()) {
-                    refs.insert(("Secret", n.to_string()));
+        // The kubelet's stats only add ephemeral storage, and a busy kubelet can take tens of
+        // seconds: read them alongside the rest, not before the usage and the other sections.
+        let node = obj.pointer("/spec/nodeName").and_then(|v| v.as_str()).map(String::from);
+        let stats = {
+            let client = client.clone();
+            async move {
+                match node {
+                    Some(node) => k8s::node_stats(client, node).await,
+                    None => None,
                 }
             }
-            for e in c["envFrom"].as_array().into_iter().flatten() {
-                if let Some(n) = e.pointer("/configMapRef/name").and_then(|v| v.as_str()) {
-                    refs.insert(("ConfigMap", n.to_string()));
+        };
+        let rest = async {
+            let selector = None;
+            // Metrics are optional (no metrics-server): no usage is not an error to show.
+            if crate::settings::metrics_on(context)
+                && let Ok((usage, read)) = k8s::container_usage_read(client.clone(), ns.clone(), selector).await
+            {
+                (related.usage, related.usage_read) = (usage, Some(read));
+            }
+            // ConfigMaps and Secrets the environment reads, to show resolved values.
+            let mut refs: std::collections::BTreeSet<(&str, String)> = Default::default();
+            for c in k8s::spec_containers(&obj["spec"]).iter().map(|c| c.spec) {
+                for e in c["env"].as_array().into_iter().flatten() {
+                    if let Some(n) = e.pointer("/valueFrom/configMapKeyRef/name").and_then(|v| v.as_str()) {
+                        refs.insert(("ConfigMap", n.to_string()));
+                    }
+                    if let Some(n) = e.pointer("/valueFrom/secretKeyRef/name").and_then(|v| v.as_str()) {
+                        refs.insert(("Secret", n.to_string()));
+                    }
                 }
-                if let Some(n) = e.pointer("/secretRef/name").and_then(|v| v.as_str()) {
-                    refs.insert(("Secret", n.to_string()));
+                for e in c["envFrom"].as_array().into_iter().flatten() {
+                    if let Some(n) = e.pointer("/configMapRef/name").and_then(|v| v.as_str()) {
+                        refs.insert(("ConfigMap", n.to_string()));
+                    }
+                    if let Some(n) = e.pointer("/secretRef/name").and_then(|v| v.as_str()) {
+                        refs.insert(("Secret", n.to_string()));
+                    }
                 }
             }
-        }
-        for (kind, name) in refs {
-            let ar = if kind == "Secret" { k8s::ar_of::<core::Secret>() } else { k8s::ar_of::<core::ConfigMap>() };
-            if let Some(v) = k8s::list_values_fields(
+            for (kind, name) in refs {
+                let ar = if kind == "Secret" { k8s::ar_of::<core::Secret>() } else { k8s::ar_of::<core::ConfigMap>() };
+                if let Some(v) = k8s::list_values_fields(
+                    client.clone(),
+                    ar,
+                    Some(ns.clone()),
+                    None,
+                    Some(format!("metadata.name={name}")),
+                )
+                .await
+                .ok()
+                .and_then(|l| l.into_iter().next())
+                {
+                    related.env_sources.insert(format!("{kind}/{name}"), v);
+                }
+            }
+            // NetworkPolicies whose podSelector selects this pod.
+            let labels = obj.pointer("/metadata/labels").and_then(|l| l.as_object()).cloned().unwrap_or_default();
+            related.netpols = k8s::list_values(
                 client.clone(),
-                ar,
+                k8s::ar_of::<k8s_openapi::api::networking::v1::NetworkPolicy>(),
                 Some(ns.clone()),
                 None,
-                Some(format!("metadata.name={name}")),
             )
             .await
             .ok()
-            .and_then(|l| l.into_iter().next())
+            .map(|all| {
+                all.into_iter()
+                    .filter(|p| p.pointer("/spec/podSelector").is_some_and(|s| k8s::selector_matches(s, &labels)))
+                    .collect()
+            });
+            // Events and the last crash output, for the diagnosis.
+            let uid = obj.pointer("/metadata/uid").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+            let name = obj.pointer("/metadata/name").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+            let objref = ObjectRef { kind: kind.clone(), name: name.clone(), namespace: Some(ns.clone()), uid };
+            let events = k8s::events_for(client.clone(), objref).await;
+            related.events =
+                related.noted("events", events).into_iter().map(|e| (e.kind, e.reason, e.message, e.count)).collect();
+            // A container that failed: its previous run if it restarted, else its current one.
+            let failed = |c: &&serde_json::Value| {
+                let code = |p: &str| c.pointer(p).and_then(serde_json::Value::as_i64).unwrap_or(0);
+                code("/lastState/terminated/exitCode") != 0 || code("/state/terminated/exitCode") != 0
+            };
+            let crashing = obj
+                .pointer("/status/containerStatuses")
+                .and_then(|c| c.as_array())
+                .and_then(|cs| cs.iter().find(failed))
+                .and_then(|c| Some((c["name"].as_str()?.to_string(), c.pointer("/state/terminated").is_none())));
+            if let Some((container, previous)) = crashing
+                && let Ok(text) =
+                    k8s::logs_text(client.clone(), ns.clone(), name, Some(container.clone()), 30, None, previous).await
             {
-                related.env_sources.insert(format!("{kind}/{name}"), v);
+                related.crash_logs = Some((container, text));
             }
-        }
-        // NetworkPolicies whose podSelector selects this pod.
-        let labels = obj.pointer("/metadata/labels").and_then(|l| l.as_object()).cloned().unwrap_or_default();
-        related.netpols = k8s::list_values(
-            client.clone(),
-            k8s::ar_of::<k8s_openapi::api::networking::v1::NetworkPolicy>(),
-            Some(ns.clone()),
-            None,
-        )
-        .await
-        .ok()
-        .map(|all| {
-            all.into_iter()
-                .filter(|p| p.pointer("/spec/podSelector").is_some_and(|s| k8s::selector_matches(s, &labels)))
-                .collect()
-        });
-        // Events and the last crash output, for the diagnosis.
-        let uid = obj.pointer("/metadata/uid").and_then(|v| v.as_str()).unwrap_or_default().to_string();
-        let name = obj.pointer("/metadata/name").and_then(|v| v.as_str()).unwrap_or_default().to_string();
-        let objref = ObjectRef { kind: kind.clone(), name: name.clone(), namespace: Some(ns.clone()), uid };
-        let events = k8s::events_for(client.clone(), objref).await;
-        related.events =
-            related.noted("events", events).into_iter().map(|e| (e.kind, e.reason, e.message, e.count)).collect();
-        // A container that failed: its previous run if it restarted, else its current one.
-        let failed = |c: &&serde_json::Value| {
-            let code = |p: &str| c.pointer(p).and_then(serde_json::Value::as_i64).unwrap_or(0);
-            code("/lastState/terminated/exitCode") != 0 || code("/state/terminated/exitCode") != 0
+            let services = k8s::list_values(client, k8s::ar_of::<core::Service>(), Some(ns), None).await;
+            related.services = related.noted("services", services);
         };
-        let crashing = obj
-            .pointer("/status/containerStatuses")
-            .and_then(|c| c.as_array())
-            .and_then(|cs| cs.iter().find(failed))
-            .and_then(|c| Some((c["name"].as_str()?.to_string(), c.pointer("/state/terminated").is_none())));
-        if let Some((container, previous)) = crashing
-            && let Ok(text) =
-                k8s::logs_text(client.clone(), ns.clone(), name, Some(container.clone()), 30, None, previous).await
-        {
-            related.crash_logs = Some((container, text));
-        }
-        if let Some(node) = obj.pointer("/spec/nodeName").and_then(|v| v.as_str()) {
-            related.node_stats = k8s::node_stats(client.clone(), node.to_string()).await;
-        }
-        let services = k8s::list_values(client, k8s::ar_of::<core::Service>(), Some(ns), None).await;
-        related.services = related.noted("services", services);
+        let ((), stats) = futures::join!(rest, stats);
+        related.node_stats = stats;
     } else if kind.ar.group == "apps" || kind.is("batch", "Job") {
         if let Some(Some(sel)) = k8s::pod_selection(kind, obj).list_selector() {
             let pods =

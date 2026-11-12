@@ -707,7 +707,11 @@ impl DetailPanel {
                 // Where an Application deploys is shown on a connected context first, and its
                 // resources are read there.
                 let clusters = this.update(cx, |this, _| this.clusters.clone()).unwrap_or_default();
-                let related = fetch_related(client.clone(), &context, &kind, ns.clone(), &obj, clusters).await;
+                let mut related = fetch_related(client.clone(), &context, &kind, ns.clone(), &obj, clusters).await;
+                // A kubelet too slow this time keeps what it said last.
+                if related.node_stats.is_none() {
+                    related.node_stats = this.update(cx, |this, _| this.related.node_stats.clone()).ok().flatten();
+                }
                 let indexed = obj.clone();
                 let mut related = exec
                     .spawn(async move {
