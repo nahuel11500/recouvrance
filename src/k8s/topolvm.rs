@@ -278,7 +278,7 @@ mod tests {
     }
 
     fn class() -> impl Strategy<Value = String> {
-        prop_oneof![Just("00default".to_string()), Just("".to_string()), "[a-c]{1,2}"]
+        prop_oneof![Just("00default".to_string()), Just(String::new()), "[a-c]{1,2}"]
     }
 
     proptest! {
@@ -298,7 +298,7 @@ mod tests {
                 .collect();
             let refs: Vec<(&str, &str)> = annotations.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
             let n = node(&refs);
-            let vols: Vec<LocalVolume> = vols.into_iter().map(|(c, b)| lv(&c, b as f64)).collect();
+            let vols: Vec<LocalVolume> = vols.into_iter().map(|(c, b)| lv(&c, f64::from(b))).collect();
             let rows = local_storage(&n, known.then_some(vols.as_slice()));
             let classes: Vec<&String> = free.keys().filter(|c| !c.is_empty()).collect();
             if classes.is_empty() {
