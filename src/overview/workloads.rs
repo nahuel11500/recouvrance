@@ -59,12 +59,12 @@ pub(super) fn workload(ctx: &Ctx, cx: &App) -> Div {
     root = root.child(scheduling(obj, template_spec, cx));
 
     // Template containers with average usage across the workload's pods.
-    let containers = arr(obj, &format!("{template_spec}/containers"));
+    let containers = obj.pointer(template_spec).map(k8s::spec_containers).unwrap_or_default();
     if !containers.is_empty() {
         let pods = &ctx.related.pods;
         root = root.child(usage_heading("Containers", ctx.related, cx)).child(h_flex().flex_wrap().gap_3().children(
-            containers.iter().map(|c| {
-                let name = c["name"].as_str().unwrap_or_default();
+            containers.iter().map(|sc| {
+                let (name, c) = (sc.name, sc.spec);
                 let samples: Vec<(f64, f64)> = pods
                     .iter()
                     .filter_map(|p| s(p, "/metadata/name"))
@@ -84,7 +84,8 @@ pub(super) fn workload(ctx: &Ctx, cx: &App) -> Div {
                         h_flex()
                             .gap_2()
                             .child(Icon::new(Lucide::Box).size_4())
-                            .child(div().font_weight(FontWeight::SEMIBOLD).child(selectable(name.to_string()))),
+                            .child(div().font_weight(FontWeight::SEMIBOLD).child(selectable(name.to_string())))
+                            .children(super::pods::kind_tag(sc.kind, cx)),
                     )
                     .child(
                         div()
@@ -439,8 +440,8 @@ pub fn revisions(ctx: &Ctx, cx: &App) -> AnyElement {
     let newest = rs.first().copied();
     let rows = rs.iter().enumerate().map(|(i, r)| {
         let name = s(r, "/metadata/name").unwrap_or_default().to_string();
-        let images: Vec<&str> =
-            arr(r, "/spec/template/spec/containers").iter().filter_map(|c| c["image"].as_str()).collect();
+        let template = r.pointer("/spec/template/spec").map(k8s::spec_containers).unwrap_or_default();
+        let images: Vec<&str> = template.iter().filter_map(|c| c.spec["image"].as_str()).collect();
         let selected = ctx.compare == Some(name.as_str());
         let panel = ctx.panel.clone();
         let pick = name.clone();

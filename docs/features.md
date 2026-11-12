@@ -24,8 +24,8 @@
   show them too. The taints are in a node's `spec`: the Nodes list reads whole nodes once, then
   watches their metadata (a whole node is mostly its image list, and its status is rewritten every
   few seconds) and reads one node again when its `managedFields` show a new write to its spec.
-- **Detail pages** for pods (per-container tabs: probes, usage vs requests/limits, ports, env,
-  mounts), workloads (scheduling, pods, revisions with diffs), services (port-forward, backing
+- **Detail pages** for pods (per-container tabs, native sidecars, init and debug containers
+  included: probes, usage vs requests/limits, ports, env, mounts), workloads (scheduling, pods, revisions with diffs), services (port-forward, backing
   pods), secrets (masked, referenced by), ingresses, PVCs, namespaces (quotas), nodes, CronJobs,
   and a generic spec/status view for anything else.
 - **Select and copy text** on detail pages, as on a web page: a drag selects (across fields,

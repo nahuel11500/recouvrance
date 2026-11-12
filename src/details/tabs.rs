@@ -92,7 +92,7 @@ impl DetailPanel {
         let Some(value) = &self.object else {
             return div().into_any_element();
         };
-        let Some(name) = container_names(value).get(ix).cloned() else {
+        let Some(name) = container_names(value).get(ix).map(|(name, _)| name.clone()) else {
             return div().into_any_element();
         };
         let (n1, n2) = (name.clone(), name.clone());
@@ -638,9 +638,19 @@ impl Render for DetailPanel {
                     .selected_index(selected)
                     .children(tabs.iter().map(|t| {
                         match t {
-                            DetailTab::Container(ix) => Tab::new()
-                                .prefix(Icon::new(Lucide::Box).size_3p5())
-                                .label(containers.get(*ix).cloned().unwrap_or_default()),
+                            DetailTab::Container(ix) => {
+                                let (name, kind) = containers.get(*ix).cloned().unzip();
+                                let tab = Tab::new()
+                                    .prefix(Icon::new(Lucide::Box).size_3p5())
+                                    .label(name.unwrap_or_default());
+                                // Sidecars, init and debug containers say what they are.
+                                match kind.and_then(k8s::ContainerKind::tag) {
+                                    Some(tag) => tab.suffix(
+                                        div().ml_1p5().text_xs().text_color(cx.theme().muted_foreground).child(tag),
+                                    ),
+                                    None => tab,
+                                }
+                            }
                             DetailTab::Events => match events_badge {
                                 Some((n, color)) => Tab::new().label("Events").suffix(count_badge(n, color)),
                                 None => Tab::new().label("Events"),
