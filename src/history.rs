@@ -91,7 +91,7 @@ pub enum DiffLine {
 
 impl Diff {
     pub fn lines(&self) -> Vec<DiffLine> {
-        diff_lines(&yaml(&self.before), &yaml(&self.after))
+        diff_lines(&diff_text(&self.before), &diff_text(&self.after))
     }
 
     /// The changed lines alone (`-` and `+`), at most `max`, then how many more there are.
@@ -113,8 +113,15 @@ impl Diff {
     }
 }
 
-fn yaml(v: &Value) -> String {
-    if v.is_null() { String::new() } else { crate::yaml::to_string(v).unwrap_or_default() }
+/// A value as YAML to diff by lines, its keys sorted at every level: two copies of an object
+/// whose keys come in another order (the API keeps each writer's order) read the same.
+pub fn diff_text(v: &Value) -> String {
+    if v.is_null() {
+        return String::new();
+    }
+    let mut v = v.clone();
+    v.sort_all_objects();
+    crate::yaml::to_string(&v).unwrap_or_default()
 }
 
 /// A line diff of two texts as shown: the changes with three lines around them, a gap
@@ -1245,6 +1252,13 @@ mod tests {
             let changes = revision_changes(&[rs(&name, n, "h", "nginx", "x", "1")]);
             let revision = format!("Revision {n} · ");
             prop_assert!(changes[0].object.starts_with(&revision), "{}", changes[0].object);
+        }
+
+        /// The same value with its keys in another order has no diff.
+        #[test]
+        fn key_order_is_no_change(v in json_value(), seed in any::<u64>()) {
+            let diff = Diff { before: v.clone(), after: crate::json::reordered(&v, seed) };
+            prop_assert!(diff.lines().is_empty());
         }
 
         /// Two values differ exactly when some path says where.

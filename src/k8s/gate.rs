@@ -28,10 +28,13 @@ pub const WRITES_OFF: &str = "write actions are off: turn them on to change the 
 /// Whether a request changes the cluster or opens a shell in it, and so needs write mode.
 /// Reads, watches, logs and port-forwards don't; neither do server-side dry runs, the
 /// permission checks (`SelfSubjectAccessReview`, `SelfSubjectRulesReview`, who am I) and
-/// the removal of a node shell pod or of a copy of a pod (`pod_copy`), which must go even
-/// after write mode is turned off.
+/// the removal of a node shell pod or of a copy of a pod (`pod_copy`) and the hangup of a
+/// closed shell, which must go even after write mode is turned off.
 pub fn needs_writes(method: &http::Method, path: &str, query: &str) -> bool {
     let stream = path.ends_with("/exec") || path.ends_with("/attach");
+    if path.ends_with("/exec") && super::exec::is_hangup_command(&query_values(query, "command")) {
+        return false;
+    }
     if *method == http::Method::GET {
         return stream;
     }
@@ -49,6 +52,34 @@ pub fn needs_writes(method: &http::Method, path: &str, query: &str) -> bool {
         && path.starts_with(&format!("/api/v1/namespaces/{}/pods/recouvrance-node-shell-", crate::k8s::NODE_SHELL_NS));
     let copy_cleanup = *method == http::Method::DELETE && is_pod_copy(path);
     !node_shell_cleanup && !copy_cleanup
+}
+
+/// The values of `key` in a query string, in order and decoded (`+` is a space).
+fn query_values(query: &str, key: &str) -> Vec<String> {
+    let decode = |s: &str| {
+        let (b, mut out, mut i) = (s.as_bytes(), Vec::with_capacity(s.len()), 0);
+        while i < b.len() {
+            let hex = b.get(i + 1..i + 3).filter(|h| h.iter().all(u8::is_ascii_hexdigit));
+            let hex = hex.and_then(|h| std::str::from_utf8(h).ok());
+            match (b[i], hex.and_then(|h| u8::from_str_radix(h, 16).ok())) {
+                (b'%', Some(byte)) => {
+                    out.push(byte);
+                    i += 3;
+                }
+                (c, _) => {
+                    out.push(if c == b'+' { b' ' } else { c });
+                    i += 1;
+                }
+            }
+        }
+        String::from_utf8_lossy(&out).into_owned()
+    };
+    query
+        .split('&')
+        .filter_map(|p| p.split_once('='))
+        .filter(|(k, _)| decode(k) == key)
+        .map(|(_, v)| decode(v))
+        .collect()
 }
 
 /// Whether `path` is a copy of a pod made to read its files, in any namespace.

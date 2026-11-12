@@ -149,93 +149,84 @@ impl ProblemsView {
             namespace: p.namespace.clone(),
             context: Some(ctx.clone()),
         };
-        h_flex()
+        cells(&theme, multi.then_some(ctx.as_str()), p, color)
             .id(("problem", i))
-            .w_full()
-            .gap_3()
-            .px_2()
-            .py_1p5()
-            .border_b_1()
-            .border_color(theme.border)
             // An alert about no object in particular has nothing to open.
             .when(!p.kind.is_empty(), |d| {
                 d.cursor_pointer()
                     .hover(|s| s.bg(theme.list_hover))
                     .on_click(cx.listener(move |_, _, _, cx| cx.emit(ev.clone())))
             })
-            .child(div().size(px(8.)).flex_shrink_0().rounded_full().bg(color))
-            .when(multi, |d| {
-                d.child(
-                    div()
-                        .w(px(150.))
-                        .flex_shrink_0()
-                        .text_sm()
-                        .text_color(theme.muted_foreground)
-                        .overflow_hidden()
-                        .text_ellipsis()
-                        .whitespace_nowrap()
-                        .child(ctx.clone()),
-                )
-            })
-            .child(
-                div()
-                    .w(px(160.))
-                    .flex_shrink_0()
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .overflow_hidden()
-                    .text_ellipsis()
-                    .whitespace_nowrap()
-                    .child(p.label.clone()),
-            )
-            .child(
-                div()
-                    .w(px(180.))
-                    .flex_shrink_0()
-                    .text_sm()
-                    .text_color(theme.muted_foreground)
-                    .overflow_hidden()
-                    .text_ellipsis()
-                    .whitespace_nowrap()
-                    .child(p.namespace.clone().unwrap_or_default()),
-            )
-            .child(
-                // The name takes its share up to a cap; the message gets every pixel left, so a
-                // long message is not cut while a gap sits after a short name (#660).
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .max_w(px(320.))
-                    .text_sm()
-                    .text_color(theme.blue)
-                    .overflow_hidden()
-                    .text_ellipsis()
-                    .whitespace_nowrap()
-                    .child(p.name.clone()),
-            )
-            .child(
-                div()
-                    .flex_grow(1.)
-                    .flex_basis(px(300.))
-                    .flex_shrink_0()
-                    .text_sm()
-                    .text_color(color)
-                    .overflow_hidden()
-                    .text_ellipsis()
-                    .whitespace_nowrap()
-                    .child(p.reason.clone()),
-            )
-            .child(
-                div()
-                    .w(px(50.))
-                    .flex_shrink_0()
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .child(p.age.map(k8s::age).unwrap_or_default()),
-            )
             .into_any_element()
     }
 }
+
+/// A problem's row: its severity dot, the cluster (with several), kind, namespace, name, message
+/// and age. As the page narrows (the assistant dock open, a small window) every text column
+/// gives up room: the kind, namespace and cluster first, down to a floor, then the name and the
+/// message. The name, the link to click, never goes under `NAME_MIN` (#749). On a wide page it
+/// grows up to `NAME_MAX` and the message takes the rest (#660).
+fn cells(theme: &component::Theme, context: Option<&str>, p: &Problem, color: Hsla) -> Div {
+    // A column with a usual width that gives up room (twice as readily as the name) down to `min`.
+    let side = |basis: f32, min: f32| {
+        div().flex_basis(px(basis)).flex_shrink(2.).min_w(px(min)).overflow_hidden().text_ellipsis().whitespace_nowrap()
+    };
+    h_flex()
+        .w_full()
+        .gap_3()
+        .px_2()
+        .py_1p5()
+        .border_b_1()
+        .border_color(theme.border)
+        .child(div().size(px(8.)).flex_shrink_0().rounded_full().bg(color))
+        .when_some(context, |d, ctx| {
+            d.child(side(150., 70.).text_sm().text_color(theme.muted_foreground).child(ctx.to_string()))
+        })
+        .child(side(160., 80.).text_xs().text_color(theme.muted_foreground).child(p.label.clone()))
+        .child(
+            side(180., 80.).text_sm().text_color(theme.muted_foreground).child(p.namespace.clone().unwrap_or_default()),
+        )
+        .child(
+            div()
+                .debug_selector(|| "problem-name".into())
+                .flex_grow(1.)
+                .flex_basis(px(NAME_BASIS))
+                .min_w(px(NAME_MIN))
+                .max_w(px(NAME_MAX))
+                .text_sm()
+                .text_color(theme.blue)
+                .overflow_hidden()
+                .text_ellipsis()
+                .whitespace_nowrap()
+                .child(p.name.clone()),
+        )
+        .child(
+            div()
+                .debug_selector(|| "problem-message".into())
+                .flex_grow(1.)
+                .flex_basis(px(300.))
+                .min_w(px(120.))
+                .text_sm()
+                .text_color(color)
+                .overflow_hidden()
+                .text_ellipsis()
+                .whitespace_nowrap()
+                .child(p.reason.clone()),
+        )
+        .child(
+            div()
+                .w(px(50.))
+                .flex_shrink_0()
+                .text_xs()
+                .text_color(theme.muted_foreground)
+                .child(p.age.map(k8s::age).unwrap_or_default()),
+        )
+}
+
+/// The name column's usual width, its floor and its cap.
+const NAME_BASIS: f32 = 220.;
+const NAME_MIN: f32 = 140.;
+const NAME_MAX: f32 = 320.;
 
 /// Whether a problem is shown: of the severity picked (none: any, minor ones only with
 /// `show_info`), and matching the filter. `kind:` matches the kind as listed (`Pod alert`,
@@ -448,5 +439,65 @@ mod tests {
         let names: Vec<(&str, &str)> = found.iter().map(|(ctx, p)| (ctx.as_str(), p.name.as_str())).collect();
         assert_eq!(names, [("two", "c"), ("one", "w")]);
         assert_eq!(errors, ["one: could not read Nodes (forbidden)"]);
+    }
+}
+
+#[cfg(all(test, feature = "dev"))]
+mod layout_tests {
+    use gpui_kit::component::ActiveTheme as _;
+    use gpui_kit::{Context, IntoElement, ParentElement as _, Render, Styled as _, TestAppContext, Window, div, px};
+
+    use super::{NAME_MAX, NAME_MIN};
+    use crate::problems::{Problem, Severity};
+
+    /// One row of the page, `width` wide, with one cluster or several.
+    struct Row {
+        width: f32,
+        several: bool,
+    }
+
+    impl Render for Row {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let theme = cx.theme().clone();
+            let p = Problem {
+                severity: Severity::Warning,
+                kind: "deployments.apps".into(),
+                label: "Deployment".into(),
+                namespace: Some("payments".into()),
+                name: "fraud-check-b668cf779-k6km9".into(),
+                reason: "0 of 1 replicas available".into(),
+                age: None,
+            };
+            let ctx = self.several.then_some("kind-staging");
+            div().w(px(self.width)).child(super::cells(&theme, ctx, &p, theme.warning))
+        }
+    }
+
+    /// The width of the name and of the message in a row `width` wide.
+    fn widths(cx: &mut TestAppContext, width: f32, several: bool) -> (f32, f32) {
+        let (_, cx) = cx.add_window_view(|_, _| Row { width, several });
+        cx.update(|window, cx| drop(window.draw(cx)));
+        let name = cx.debug_bounds("problem-name").expect("the name is drawn").size.width;
+        let message = cx.debug_bounds("problem-message").expect("the message is drawn").size.width;
+        (f32::from(name), f32::from(message))
+    }
+
+    #[gpui_kit::test]
+    fn the_name_stays_readable_as_the_page_narrows(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        // From a page beside the assistant dock to a wide window, one cluster or several.
+        for width in [560., 700., 760., 900., 1100., 1400., 1800.] {
+            for several in [false, true] {
+                let (name, message) = widths(cx, width, several);
+                let at = format!("{width}px wide, several clusters: {several}");
+                assert!(name >= NAME_MIN - 0.5, "{at}: the name is {name}px wide");
+                assert!(name <= NAME_MAX + 0.5, "{at}: the name is {name}px wide");
+                assert!(message >= 119.5, "{at}: the message is {message}px wide");
+            }
+        }
+        // A wide page: the name at its cap, the message takes the rest (#660).
+        let (name, message) = widths(cx, 1800., false);
+        assert!((name - NAME_MAX).abs() < 0.5, "the name is {name}px wide");
+        assert!(message > 900., "the message is {message}px wide");
     }
 }

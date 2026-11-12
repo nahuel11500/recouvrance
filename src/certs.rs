@@ -32,17 +32,20 @@ pub fn days_left(t: jiff::Timestamp, now: jiff::Timestamp) -> i64 {
     (t.as_second() - now.as_second()).div_euclid(86400)
 }
 
-/// "1 day", "3 days".
+/// Whole days, rounded down, in words: "less than a day" for 0 (a certificate that ends
+/// in 5 hours expires in less than a day, not in "0 days"), "1 day", "3 days".
 pub fn days_text(n: i64) -> String {
-    crate::plural::count(n, "day")
+    if n < 1 { "less than a day".into() } else { crate::plural::count(n, "day") }
+}
+
+/// Whole days, rounded down, for a column of numbers: "<1" for 0, "3".
+pub fn days_short(n: i64) -> String {
+    if n < 1 { "<1".into() } else { n.to_string() }
 }
 
 /// How long ago `t` passed, in the days that went by: "less than a day ago", "1 day ago".
 pub fn ago_text(t: jiff::Timestamp, now: jiff::Timestamp) -> String {
-    match days_ago(t, now) {
-        n if n > 0 => format!("{} ago", days_text(n)),
-        _ => "less than a day ago".into(),
-    }
+    format!("{} ago", days_text(days_ago(t, now)))
 }
 
 /// The certificate a `kubernetes.io/tls` Secret serves: the first in its `tls.crt` chain (the
@@ -118,5 +121,31 @@ mod tests {
         assert!(c.not_yet_valid(start - jiff::SignedDuration::from_hours(1)));
         assert!(!c.not_yet_valid(start));
         assert!(!c.not_yet_valid(start + jiff::SignedDuration::from_hours(1)));
+    }
+
+    proptest::proptest! {
+        /// Whenever a certificate ends, before or after now, its days are told in words that
+        /// say so: never "0 days" (nor a negative count), "less than a day" for the last 24
+        /// hours on either side, and the whole days otherwise.
+        #[test]
+        fn days_never_read_zero(secs in -(400 * 86400i64)..400 * 86400) {
+            let now: jiff::Timestamp = "2026-01-10T12:00:00Z".parse().unwrap();
+            let end = now + jiff::SignedDuration::from_secs(secs);
+            let (left, ago) = (super::days_left(end, now), super::days_ago(end, now));
+            for (text, short, days) in [
+                (super::days_text(left), super::days_short(left), secs.div_euclid(86400)),
+                (super::ago_text(end, now), super::days_short(ago), (-secs).div_euclid(86400)),
+            ] {
+                proptest::prop_assert!(!text.starts_with('0') && !text.starts_with('-'), "{}", text);
+                proptest::prop_assert!(!short.starts_with('0') && !short.starts_with('-'), "{}", short);
+                if days < 1 {
+                    proptest::prop_assert!(text.starts_with("less than a day"), "{}s: {}", secs, text);
+                    proptest::prop_assert_eq!(short, "<1");
+                } else {
+                    proptest::prop_assert!(text.starts_with(&format!("{days} day")), "{}s: {}", secs, text);
+                    proptest::prop_assert_eq!(short, days.to_string());
+                }
+            }
+        }
     }
 }

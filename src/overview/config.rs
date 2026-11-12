@@ -494,6 +494,8 @@ mod tests {
         assert_eq!(at("2026-01-10T15:00:00Z"), 0);
         assert_eq!(at("2026-01-12T12:00:00Z"), 2);
         assert_eq!(crate::certs::days_text(1), "1 day");
-        assert_eq!(crate::certs::days_text(0), "0 days");
+        // One that ends in 3 hours expires in less than a day, not in "0 days".
+        assert_eq!(crate::certs::days_text(0), "less than a day");
+        assert_eq!(crate::certs::days_text(3), "3 days");
     }
 }

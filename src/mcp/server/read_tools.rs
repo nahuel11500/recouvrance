@@ -6,6 +6,7 @@ use rmcp::handler::server::wrapper::Parameters;
 use rmcp::{tool, tool_router};
 use serde_json::json;
 
+use super::logs_tools::{containers_note, log_containers};
 use super::{
     CertParams, ContextParam, EventsParams, HistoryParams, KubeMcp, ListParams, LogsParams, MAX_LOG_BYTES,
     ObjectParams, ProblemsParams, ReachParams, SearchParams, TopParams, access_for, describe, format_table, get_named,
@@ -417,7 +418,7 @@ impl KubeMcp {
         self.authorize_list(&mut call, &access, p.namespace.is_none()).await?;
         let usage = match k8s::pod_usage(client, p.namespace.clone(), None).await {
             Ok((u, _)) => u,
-            Err(e) => return call.finish(Err(e)),
+            Err(e) => return call.finish(Err(k8s::explain_metrics_error(e, "pod metrics"))),
         };
         let mut rows: Vec<(String, String, f64, f64)> = usage
             .into_iter()
@@ -510,7 +511,7 @@ impl KubeMcp {
     }
 
     #[tool(
-        description = "Read a pod's container logs (most recent lines, at most 1 MiB), like `kubectl logs --tail`.",
+        description = "Read a pod's container logs (most recent lines, at most 1 MiB), like `kubectl logs --tail`. With no container named, the pod's default one, as kubectl picks it; the others are named in a note.",
         annotations(read_only_hint = true)
     )]
     async fn get_logs(
@@ -524,8 +525,22 @@ impl KubeMcp {
         let (client, kind) = self.kind(&call, &p.context, "pods").await?;
         let access = access_for(&kind, &p.context, Verb::Logs, Some(p.namespace.clone()), Some(p.pod.clone()));
         self.authorize(&mut call, &access).await?;
+        // With no container named, the pod's default one, as kubectl picks it: the API server
+        // refuses a pod that has several. When the pod can't be read, none is named and the
+        // logs call says why.
+        let (container, note) = match p.container {
+            Some(c) => (Some(c), None),
+            None => match get_named(&client, &kind, Some(&p.namespace), &p.pod, false).await {
+                Ok(pod) => {
+                    let c = log_containers(&pod);
+                    let note = containers_note(c.read.as_slice(), &c.others);
+                    (c.read, note)
+                }
+                Err(_) => (None, None),
+            },
+        };
         let lp = kube::api::LogParams {
-            container: p.container,
+            container,
             tail_lines: Some(i64::from(p.tail_lines.unwrap_or(200).min(call.policy().max_log_lines))),
             since_seconds: p.since_seconds,
             previous: p.previous.unwrap_or(false),
@@ -539,12 +554,18 @@ impl KubeMcp {
             Ok(api.logs(&pod, &lp).await?)
         })
         .await;
-        call.finish(result.map(|text| match &p.grep {
-            Some(g) => {
-                let g = g.to_lowercase();
-                text.lines().filter(|l| l.to_lowercase().contains(&g)).collect::<Vec<_>>().join("\n")
+        call.finish(result.map(|text| {
+            let text = match &p.grep {
+                Some(g) => {
+                    let g = g.to_lowercase();
+                    text.lines().filter(|l| l.to_lowercase().contains(&g)).collect::<Vec<_>>().join("\n")
+                }
+                None => text,
+            };
+            match note {
+                Some(note) => format!("[{note}]\n{text}"),
+                None => text,
             }
-            None => text,
         }))
     }
 
@@ -607,11 +628,12 @@ impl KubeMcp {
                         let from = c.not_before.map(|t| t.strftime("%Y-%m-%d").to_string()).unwrap_or_default();
                         format!("NOT VALID UNTIL {from}")
                     } else if days < 0 {
-                        // The days that went by: 3 hours ago is 0, not the -1 days left.
+                        // The days that went by: 3 hours ago is "<1", not the -1 days left.
                         let ago = c.not_after.map_or(0, |t| crate::certs::days_ago(t, now));
-                        format!("EXPIRED {ago}d ago")
+                        format!("EXPIRED {}d ago", crate::certs::days_short(ago))
                     } else {
-                        days.to_string()
+                        // Ends within the day: "<1", not 0.
+                        crate::certs::days_short(days)
                     },
                 ],
             ));
@@ -722,7 +744,7 @@ impl KubeMcp {
     }
 
     #[tool(
-        description = "CPU and memory history of a pod or workload (all its pods summed) from the cluster's Prometheus: min, average, p95, max and last, next to requests and limits. Good for right-sizing.",
+        description = "CPU and memory history from the cluster's Prometheus: min, average, p95, max and last. For a pod or a workload (all its pods summed; also anything that selects pods, like a Service), next to its requests and limits: good for right-sizing. For a node, all the containers on it, next to its allocatable and capacity.",
         annotations(read_only_hint = true)
     )]
     async fn usage_history(
@@ -733,39 +755,63 @@ impl KubeMcp {
         let args = json!({"context": p.context, "kind": p.kind, "namespace": p.namespace, "name": p.name, "minutes": p.minutes});
         let mut call = self.begin(&parts, "usage_history", args)?;
         let (client, kind) = self.kind(&call, &p.context, &p.kind).await?;
-        let access = access_for(&kind, &p.context, Verb::Get, Some(p.namespace.clone()), Some(p.name.clone()));
+        require_ns(&call, &kind, p.namespace.as_deref())?;
+        let access = access_for(&kind, &p.context, Verb::Get, p.namespace.clone(), Some(p.name.clone()));
         self.authorize(&mut call, &access).await?;
-        // A cluster-scoped kind (a node) is read without the namespace given.
-        let value = match get_named(&client, &kind, Some(&p.namespace), &p.name, false).await {
+        let value = match get_named(&client, &kind, p.namespace.as_deref(), &p.name, false).await {
             Ok(v) => v,
             Err(e) => return call.finish(Err(e)),
         };
-        // The pods to sum: the pod itself, or the workload's pods by its selector that the
-        // agent may list.
-        let (pods, hidden): (Vec<serde_json::Value>, usize) = if kind.is("", "Pod") {
-            (vec![value.clone()], 0)
-        } else {
-            let pods_kind = self.kind(&call, &p.context, "pods").await?.1;
-            let Some(Some(selector)) = k8s::pod_selection(&kind, &value).list_selector() else {
-                return call.finish(Err(anyhow::anyhow!("{} has no label selector", kind.ar.kind)));
-            };
-            let pod_ar = k8s::ar_of::<k8s_openapi::api::core::v1::Pod>();
-            let mut pods =
-                match k8s::list_values(client.clone(), pod_ar, Some(p.namespace.clone()), Some(selector)).await {
+        let what = match measured(&kind, &value) {
+            Ok(m) => m,
+            Err(e) => return call.finish(Err(anyhow::anyhow!(e))),
+        };
+        let minutes = p.minutes.unwrap_or(60).clamp(5, 10080);
+        // `require_ns` made sure a namespaced kind has one; a node has none.
+        let ns = p.namespace.clone().unwrap_or_default();
+        // The pods to sum: the pod itself, or the pods the object selects that the agent may list.
+        let (pods, hidden): (Vec<serde_json::Value>, usize) = match what {
+            Measured::Node => {
+                // Every container on the node, as on the node page, against what the node offers.
+                let target = match prometheus(&p.context, &client).await {
+                    Ok(t) => t,
+                    Err(e) => return call.finish(Err(e)),
+                };
+                let (cpu, mem) = match crate::prom::node_usage(client, target, &p.name, minutes).await {
+                    Ok(r) => r,
+                    Err(e) => return call.finish(Err(e)),
+                };
+                let status = |field: &str, res: &str, parse: fn(&str) -> f64| {
+                    value.pointer(&format!("/status/{field}/{res}")).and_then(|v| v.as_str()).map(parse)
+                };
+                let cpu_spec =
+                    (status("allocatable", "cpu", k8s::parse_cpu), status("capacity", "cpu", k8s::parse_cpu));
+                let mem_spec =
+                    (status("allocatable", "memory", k8s::parse_bytes), status("capacity", "memory", k8s::parse_bytes));
+                let header = format!("node {}, last {minutes} minutes, summed over all its containers\n", p.name);
+                let table = usage_table(&cpu, &mem, cpu_spec, mem_spec, ["ALLOCATABLE", "CAPACITY"]);
+                return call.finish(Ok(header + &table));
+            }
+            Measured::Pod => (vec![value.clone()], 0),
+            Measured::Selected(selector) => {
+                let pods_kind = self.kind(&call, &p.context, "pods").await?.1;
+                let pod_ar = k8s::ar_of::<k8s_openapi::api::core::v1::Pod>();
+                let mut pods = match k8s::list_values(client.clone(), pod_ar, Some(ns.clone()), selector).await {
                     Ok(v) => v,
                     Err(e) => return call.finish(Err(e)),
                 };
-            let listed = pods.len();
-            pods.retain(|pod| {
-                let name = pod.pointer("/metadata/name").and_then(|v| v.as_str()).unwrap_or_default();
-                let a = access_for(&pods_kind, &p.context, Verb::List, Some(p.namespace.clone()), Some(name.into()));
-                call.policy().decide(&a).mode == Mode::Allow
-            });
-            if pods.is_empty() && listed > 0 {
-                return Err(call.deny(format!("{} — you may not list its pods", describe(&access))));
+                let listed = pods.len();
+                pods.retain(|pod| {
+                    let name = pod.pointer("/metadata/name").and_then(|v| v.as_str()).unwrap_or_default();
+                    let a = access_for(&pods_kind, &p.context, Verb::List, Some(ns.clone()), Some(name.into()));
+                    call.policy().decide(&a).mode == Mode::Allow
+                });
+                if pods.is_empty() && listed > 0 {
+                    return Err(call.deny(format!("{} — you may not list its pods", describe(&access))));
+                }
+                let hidden = listed - pods.len();
+                (pods, hidden)
             }
-            let hidden = listed - pods.len();
-            (pods, hidden)
         };
         // Like the charts: pods not finished, at most as many as fit in the query.
         let (pods, total) = crate::prom::chart_pods(&pods);
@@ -778,17 +824,11 @@ impl KubeMcp {
         if names.is_empty() {
             return call.finish(Ok("No running pods.".into()));
         }
-        let target = match crate::prom::target(&p.context, client.clone()).await {
-            Ok(Some(t)) => t,
-            Ok(None) => {
-                return call.finish(Err(anyhow::anyhow!(
-                    "no Prometheus found in this cluster (set one in Recouvrance Settings → Contexts)"
-                )));
-            }
+        let target = match prometheus(&p.context, &client).await {
+            Ok(t) => t,
             Err(e) => return call.finish(Err(e)),
         };
-        let minutes = p.minutes.unwrap_or(60).clamp(5, 10080);
-        let (cpu, mem) = match crate::prom::pod_usage(client, target, &p.namespace, &names, minutes).await {
+        let (cpu, mem) = match crate::prom::pod_usage(client, target, &ns, &names, minutes).await {
             Ok(r) => r,
             Err(e) => return call.finish(Err(e)),
         };
@@ -798,26 +838,6 @@ impl KubeMcp {
         } else {
             ((None, None), (None, None))
         };
-        let stats = |s: &crate::prom::Series, scale: f64, fmt: fn(f64) -> String| -> Vec<String> {
-            let mut v: Vec<f64> = s.iter().map(|p| p.1 * scale).collect();
-            if v.is_empty() {
-                return vec!["-".into(); 5];
-            }
-            let last = *v.last().unwrap_or(&0.0);
-            v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-            let avg = v.iter().sum::<f64>() / v.len() as f64;
-            let p95 = v[((v.len() as f64 * 0.95) as usize).min(v.len() - 1)];
-            [v[0], avg, p95, v[v.len() - 1], last].into_iter().map(fmt).collect()
-        };
-        let opt = |v: Option<f64>, fmt: fn(f64) -> String| v.map_or_else(|| "-".into(), fmt);
-        let mut cpu_row = vec!["cpu".to_string()];
-        cpu_row.extend(stats(&cpu, 1000.0, k8s::format_cpu));
-        cpu_row.push(opt(cpu_spec.0, k8s::format_cpu));
-        cpu_row.push(opt(cpu_spec.1, k8s::format_cpu));
-        let mut mem_row = vec!["memory".to_string()];
-        mem_row.extend(stats(&mem, 1.0, k8s::format_bytes));
-        mem_row.push(opt(mem_spec.0, k8s::format_bytes));
-        mem_row.push(opt(mem_spec.1, k8s::format_bytes));
         let of = if names.len() < total { format!(" of {total}") } else { String::new() };
         let left_out = if hidden > 0 { " (pods you may not list are left out)" } else { "" };
         let header = format!(
@@ -826,7 +846,129 @@ impl KubeMcp {
             crate::plural::pick(total.max(names.len()), "pod", "pods"),
             crate::plural::count(minutes, "minute")
         );
-        call.finish(Ok(header
-            + &format_table(&["", "MIN", "AVG", "P95", "MAX", "LAST", "REQUESTS", "LIMITS"], &[cpu_row, mem_row])))
+        call.finish(Ok(header + &usage_table(&cpu, &mem, cpu_spec, mem_spec, ["REQUESTS", "LIMITS"])))
+    }
+}
+
+/// The cluster's Prometheus, or an error that says where to set one.
+async fn prometheus(context: &str, client: &kube::Client) -> anyhow::Result<String> {
+    crate::prom::target(context, client.clone()).await?.ok_or_else(|| {
+        anyhow::anyhow!("no Prometheus found in this cluster (set one in Recouvrance Settings → Contexts)")
+    })
+}
+
+/// What `usage_history` sums for an object.
+#[derive(Debug, PartialEq)]
+enum Measured {
+    /// Every container on the node.
+    Node,
+    /// The pod itself.
+    Pod,
+    /// The pods this label selector lists (`None`: every pod in the namespace).
+    Selected(Option<String>),
+}
+
+/// What `usage_history` measures for `obj`, or why it can't: a node, a pod, or the pods the
+/// object selects (`k8s::pod_selection`: workloads, Services, PDBs...).
+fn measured(kind: &Kind, obj: &serde_json::Value) -> Result<Measured, String> {
+    if kind.is("", "Node") {
+        return Ok(Measured::Node);
+    }
+    if kind.is("", "Pod") {
+        return Ok(Measured::Pod);
+    }
+    k8s::pod_selection(kind, obj).list_selector().map(Measured::Selected).ok_or_else(|| {
+        format!(
+            "usage_history takes a pod, a workload (or anything that selects pods) or a node; this {} selects no pods",
+            kind.ar.kind
+        )
+    })
+}
+
+/// The CPU and memory rows of `usage_history`: min, average, p95, max and last of each series
+/// (CPU in cores, memory in bytes), then two figures to set them against, named by `columns`
+/// (CPU in millicores).
+fn usage_table(
+    cpu: &crate::prom::Series,
+    mem: &crate::prom::Series,
+    cpu_spec: (Option<f64>, Option<f64>),
+    mem_spec: (Option<f64>, Option<f64>),
+    columns: [&str; 2],
+) -> String {
+    let stats = |s: &crate::prom::Series, scale: f64, fmt: fn(f64) -> String| -> Vec<String> {
+        let mut v: Vec<f64> = s.iter().map(|p| p.1 * scale).collect();
+        if v.is_empty() {
+            return vec!["-".into(); 5];
+        }
+        let last = *v.last().unwrap_or(&0.0);
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let avg = v.iter().sum::<f64>() / v.len() as f64;
+        let p95 = v[((v.len() as f64 * 0.95) as usize).min(v.len() - 1)];
+        [v[0], avg, p95, v[v.len() - 1], last].into_iter().map(fmt).collect()
+    };
+    let opt = |v: Option<f64>, fmt: fn(f64) -> String| v.map_or_else(|| "-".into(), fmt);
+    let mut cpu_row = vec!["cpu".to_string()];
+    cpu_row.extend(stats(cpu, 1000.0, k8s::format_cpu));
+    cpu_row.push(opt(cpu_spec.0, k8s::format_cpu));
+    cpu_row.push(opt(cpu_spec.1, k8s::format_cpu));
+    let mut mem_row = vec!["memory".to_string()];
+    mem_row.extend(stats(mem, 1.0, k8s::format_bytes));
+    mem_row.push(opt(mem_spec.0, k8s::format_bytes));
+    mem_row.push(opt(mem_spec.1, k8s::format_bytes));
+    format_table(&["", "MIN", "AVG", "P95", "MAX", "LAST", columns[0], columns[1]], &[cpu_row, mem_row])
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::{Measured, measured};
+    use crate::k8s::Kind;
+
+    fn kind(group: &str, kind: &str, plural: &str, namespaced: bool) -> Kind {
+        let gvk = kube::api::GroupVersionKind::gvk(group, "v1", kind);
+        Kind {
+            ar: kube::discovery::ApiResource::from_gvk_with_plural(&gvk, plural),
+            namespaced,
+            section: "",
+            label: kind.into(),
+        }
+    }
+
+    #[test]
+    fn a_node_is_measured_as_a_node_not_as_a_workload() {
+        let node = json!({"kind": "Node", "metadata": {"name": "n1"}, "status": {"allocatable": {"cpu": "4"}}});
+        assert_eq!(measured(&kind("", "Node", "nodes", false), &node), Ok(Measured::Node));
+    }
+
+    #[test]
+    fn pods_and_what_selects_pods_are_measured() {
+        let pod = json!({"metadata": {"name": "p"}});
+        assert_eq!(measured(&kind("", "Pod", "pods", true), &pod), Ok(Measured::Pod));
+        let deploy = json!({"spec": {"selector": {"matchLabels": {"app": "web"}}}});
+        assert_eq!(
+            measured(&kind("apps", "Deployment", "deployments", true), &deploy),
+            Ok(Measured::Selected(Some("app=web".into())))
+        );
+        let svc = json!({"spec": {"selector": {"app": "web"}}});
+        assert_eq!(
+            measured(&kind("", "Service", "services", true), &svc),
+            Ok(Measured::Selected(Some("app=web".into())))
+        );
+        // An empty PDB selector selects every pod of its namespace.
+        let pdb = json!({"spec": {"selector": {}}});
+        assert_eq!(
+            measured(&kind("policy", "PodDisruptionBudget", "poddisruptionbudgets", true), &pdb),
+            Ok(Measured::Selected(None))
+        );
+    }
+
+    #[test]
+    fn a_kind_that_selects_no_pods_says_what_the_tool_takes() {
+        let err = measured(&kind("", "ConfigMap", "configmaps", true), &json!({"data": {}})).unwrap_err();
+        assert!(err.contains("takes a pod, a workload"), "{err}");
+        // A Service without a selector (its endpoints set by hand) selects none.
+        let err = measured(&kind("", "Service", "services", true), &json!({"spec": {}})).unwrap_err();
+        assert!(err.contains("Service selects no pods"), "{err}");
     }
 }

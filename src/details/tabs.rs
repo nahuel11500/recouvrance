@@ -679,7 +679,9 @@ impl Render for DetailPanel {
 }
 
 /// The tone of the dot before the object's age: its state where its kind has one kubectl
-/// shows (a node's Status, a pod's), good otherwise. A node that stopped reporting is red.
+/// shows (a node's Status, a pod's), else what its own status says: the worst of its
+/// conditions as the page shows them, its phase, its health (`status::object_tone`). Good
+/// when nothing says otherwise. A node that stopped reporting is red.
 fn title_tone(kind: &k8s::Kind, obj: &serde_json::Value) -> crate::status::Tone {
     use crate::status::Tone;
     if kind.is("", "Node") {
@@ -687,7 +689,7 @@ fn title_tone(kind: &k8s::Kind, obj: &serde_json::Value) -> crate::status::Tone 
     } else if kind.is("", "Pod") {
         crate::status::tone(&crate::overview::pod_status(obj)).unwrap_or(Tone::Good)
     } else {
-        Tone::Good
+        crate::status::object_tone(obj).unwrap_or(Tone::Good)
     }
 }
 

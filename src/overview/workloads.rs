@@ -410,7 +410,7 @@ pub(super) fn template_yaml(rs: &Value) -> String {
     if let Some(labels) = t.pointer_mut("/metadata/labels").and_then(Value::as_object_mut) {
         labels.remove("pod-template-hash");
     }
-    crate::yaml::to_string(&t).unwrap_or_default()
+    crate::history::diff_text(&t)
 }
 
 /// Revisions tab: the Deployment's ReplicaSets, newest first, with a diff of

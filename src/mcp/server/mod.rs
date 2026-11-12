@@ -663,7 +663,9 @@ pub struct LogsParams {
     pub context: String,
     pub namespace: String,
     pub pod: String,
-    #[schemars(description = "container name; defaults to the pod's first container")]
+    #[schemars(
+        description = "container name; defaults to the pod's default container (its `kubectl.kubernetes.io/default-container` annotation, else its first), as kubectl does"
+    )]
     pub container: Option<String>,
     #[schemars(description = "number of most recent lines (capped by policy)")]
     pub tail_lines: Option<u32>,
@@ -727,9 +729,10 @@ pub struct ProblemsParams {
 #[derive(Deserialize, schemars::JsonSchema)]
 pub struct HistoryParams {
     pub context: String,
-    #[schemars(description = "pods, deployments, statefulsets, daemonsets, replicasets or jobs")]
+    #[schemars(description = "pods, deployments, statefulsets, daemonsets, replicasets, jobs, services or nodes")]
     pub kind: String,
-    pub namespace: String,
+    #[schemars(description = "required for namespaced kinds (all but nodes)")]
+    pub namespace: Option<String>,
     pub name: String,
     #[schemars(description = "How far back, in minutes (default 60, max 10080)")]
     pub minutes: Option<i64>,

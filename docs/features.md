@@ -192,7 +192,7 @@
 - **Argo CD diagnosis**: an Application's page says what is wrong with it, worst first, each
   with its objects (opening on the destination's context when it is connected) and what to do:
   - *Being deleted*: the finalizers holding it (what each one waits for) and the resources not
-    deleted yet; red after 5 minutes.
+    deleted yet, read live on the destination when it is connected; red after 5 minutes.
   - *Sync running* for more than 10 minutes: the hook or resource it waits for.
   - *Last sync failed*: each object that failed and why, from Argo CD's messages: a hook that
     failed, rejected by admission (a webhook, Pod Security), a webhook that did not answer, a
@@ -289,7 +289,8 @@
   inspector, and a kubeconfig for a ServiceAccount (token valid 1 hour by default, 24 at most,
   saved to ~/Downloads readable only by you, never overwriting a file). PDB and VPA pages.
 - **Nodes**: requests/limits against allocatable (GPUs and other extended resources included),
-  filesystems, DRA devices; ephemeral storage per pod.
+  filesystems, local storage left in TopoLVM volume groups (used of total per device class), DRA
+  devices; ephemeral storage per pod.
 - **YAML**: templates (plus your own in `~/.config/recouvrance/templates/`), open/drop files, load an
   https URL, edit in `$EDITOR`, errors located on their line, field docs (`kubectl explain`) and forms
   generated from the cluster's schema, managedFields toggle, download as YAML.

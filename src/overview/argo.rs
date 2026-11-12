@@ -9,7 +9,7 @@ use gpui_kit::*;
 
 use super::{Ctx, field, heading, mono, row};
 use crate::k8s;
-use crate::k8s::argo::diagnosis::{self, Compared, Diagnosis, Drift, DriftRead, Finding, Res};
+use crate::k8s::argo::diagnosis::{self, Compared, Diagnosis, Drift, Finding, Res};
 use crate::k8s::argo::{self, Found, Summary};
 use crate::status::Tone;
 use crate::ui::selectable::{dragged, selectable};
@@ -242,18 +242,19 @@ pub(super) fn diagnosis(ctx: &Ctx, cx: &App) -> Option<Div> {
         section = section.child(finding(ctx, ix, f, on, cx));
     }
     match read {
-        None if !d.to_compare.is_empty() => {
+        None if !d.to_read().is_empty() => {
             section = section.child(div().text_xs().text_color(muted).child(selectable("Reading the live objects…")));
         }
         None => {}
         Some(read) => {
             if let Some(note) = &read.note
-                && !d.to_compare.is_empty()
+                && !d.to_read().is_empty()
             {
                 section = section.child(div().text_xs().text_color(muted).child(selectable(note.clone())));
             }
-            if !read.drifts.is_empty() {
-                section = section.child(drifts(ctx, &d, read, cx));
+            let compared = d.compared(read);
+            if !compared.is_empty() {
+                section = section.child(drifts(ctx, &d, read.context.as_deref(), &compared, cx));
             }
         }
     }
@@ -314,10 +315,9 @@ fn object_link(ctx: &Ctx, id: String, res: &Res, on: Option<&str>, cx: &App) -> 
 
 /// The fields that differ on each object read, who wrote it since the last sync, and the
 /// `ignoreDifferences` that would stop a sync loop.
-fn drifts(ctx: &Ctx, d: &Diagnosis, read: &DriftRead, cx: &App) -> Div {
+fn drifts(ctx: &Ctx, d: &Diagnosis, on: Option<&str>, compared: &[&Drift], cx: &App) -> Div {
     let muted = cx.theme().muted_foreground;
-    let on = read.context.as_deref();
-    let looping: Vec<&Drift> = read.drifts.iter().filter(|dr| d.looping.contains(&dr.res)).collect();
+    let looping: Vec<&Drift> = compared.iter().copied().filter(|dr| d.looping.contains(&dr.res)).collect();
     v_flex()
         .gap_2()
         .child(
@@ -327,7 +327,7 @@ fn drifts(ctx: &Ctx, d: &Diagnosis, read: &DriftRead, cx: &App) -> Div {
                 .child(selectable(format!("What differs live, on {}", on.unwrap_or_default()))),
         )
         .child(div().text_xs().text_color(muted).child(selectable(DRIFT_SOURCE)))
-        .children(read.drifts.iter().enumerate().map(|(i, drift)| {
+        .children(compared.iter().enumerate().map(|(i, drift)| {
             let lines = drift.lines();
             let unchanged = drift.compared == Compared::LastApplied && drift.fields.is_empty();
             v_flex()
