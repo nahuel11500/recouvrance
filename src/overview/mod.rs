@@ -60,6 +60,9 @@ pub struct Related {
     pub netpols: Option<Vec<Value>>,
     /// Kubelet stats summary of the node (a node's page, or a pod's node).
     pub node_stats: Option<Value>,
+    /// A node's TopoLVM volumes, read only when it has TopoLVM's capacity annotation (None:
+    /// not read, or could not be, the reason under `errors["local_volumes"]`).
+    pub local_volumes: Option<Vec<k8s::topolvm::LocalVolume>>,
     /// A pod's events as (type, reason, message, count), for diagnosis.
     pub events: Vec<(String, String, String, i32)>,
     /// Last lines of a crash-looping container's previous run: (container, text).

@@ -36,6 +36,7 @@ pub(crate) mod rollouts;
 mod run_as;
 mod sources;
 mod table;
+pub(crate) mod topolvm;
 mod writes;
 
 pub(crate) use access::*;

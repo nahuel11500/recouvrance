@@ -117,11 +117,29 @@ pub(super) async fn fetch_related(
             None,
             None,
             Some(format!("spec.nodeName={name}")),
-        )
-        .await;
+        );
+        // TopoLVM's volumes are listed for the whole cluster: only on a node it manages.
+        let topolvm = k8s::topolvm::has_local_storage(obj);
+        let volumes = async {
+            if topolvm { Some(k8s::topolvm::logical_volumes(client.clone(), name.to_string()).await) } else { None }
+        };
+        let (pods, stats, slices, volumes) = futures::join!(
+            pods,
+            k8s::node_stats(client.clone(), name.to_string()),
+            k8s::resource_slices(client.clone(), name.to_string()),
+            volumes,
+        );
         related.pods = related.noted("pods", pods);
-        related.node_stats = k8s::node_stats(client.clone(), name.to_string()).await;
-        related.extra = k8s::resource_slices(client, name.to_string()).await;
+        related.node_stats = stats;
+        related.extra = slices;
+        related.local_volumes = match volumes {
+            Some(Ok(v)) => Some(v),
+            Some(Err(e)) => {
+                related.errors.insert("local_volumes", k8s::lists::load_error(&e));
+                None
+            }
+            None => None,
+        };
         return related;
     }
     if kind.is("", "Namespace") {

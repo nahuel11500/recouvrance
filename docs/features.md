@@ -289,7 +289,8 @@
   inspector, and a kubeconfig for a ServiceAccount (token valid 1 hour by default, 24 at most,
   saved to ~/Downloads readable only by you, never overwriting a file). PDB and VPA pages.
 - **Nodes**: requests/limits against allocatable (GPUs and other extended resources included),
-  filesystems, DRA devices; ephemeral storage per pod.
+  filesystems, local storage left in TopoLVM volume groups (used of total per device class), DRA
+  devices; ephemeral storage per pod.
 - **YAML**: templates (plus your own in `~/.config/recouvrance/templates/`), open/drop files, load an
   https URL, edit in `$EDITOR`, errors located on their line, field docs (`kubectl explain`) and forms
   generated from the cluster's schema, managedFields toggle, download as YAML.
