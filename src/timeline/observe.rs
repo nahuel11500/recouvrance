@@ -508,7 +508,11 @@ pub(super) fn observe(
     }
     seen.burst.1 += 1;
     if seen.missed > 0 {
-        record.summary = format!("{} ({} changes before it not recorded: too many)", record.summary, seen.missed);
+        record.summary = format!(
+            "{} ({} before it not recorded: too many)",
+            record.summary,
+            crate::plural::count(seen.missed, "change")
+        );
         seen.missed = 0;
     }
     (Some(record), false)

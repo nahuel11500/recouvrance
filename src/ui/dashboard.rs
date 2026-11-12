@@ -809,10 +809,10 @@ impl Render for Dashboard {
                     .child(div().text_base().child("Recent warnings"))
                     .child(
                         // Event counts are cumulative since first seen, so count reasons, not occurrences.
-                        div()
-                            .text_xs()
-                            .text_color(muted)
-                            .child(format!("{} reasons active in the last hour", data.warnings.len())),
+                        div().text_xs().text_color(muted).child(format!(
+                            "{} active in the last hour",
+                            crate::plural::count(data.warnings.len(), "reason")
+                        )),
                     )
                     .children(section_error(&data.warnings_errors, theme.danger)),
             )

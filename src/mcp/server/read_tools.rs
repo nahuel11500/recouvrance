@@ -47,8 +47,11 @@ impl KubeMcp {
             ));
         }
         out.push_str(&format!(
-            "\nLimits: {} rows per list, {} log lines per call, exec timeout {}s, {} calls per minute.\nscale, rollout_restart, patch_resource, apply_manifest and delete_resource accept dry_run=true: prefer it first.",
-            p.max_rows, p.max_log_lines, p.exec_timeout, p.max_calls_per_minute
+            "\nLimits: {} per list, {} per call, exec timeout {}s, {} per minute.\nscale, rollout_restart, patch_resource, apply_manifest and delete_resource accept dry_run=true: prefer it first.",
+            crate::plural::count(p.max_rows, "row"),
+            crate::plural::count(p.max_log_lines, "log line"),
+            p.exec_timeout,
+            crate::plural::count(p.max_calls_per_minute, "call")
         ));
         call.finish(Ok(out))
     }
@@ -172,7 +175,11 @@ impl KubeMcp {
             ));
         }
         if hidden > 0 {
-            out.push_str(&format!("\n({hidden} items you may not access were omitted.)"));
+            out.push_str(&format!(
+                "\n({} you may not access {} omitted.)",
+                crate::plural::count(hidden, "item"),
+                crate::plural::pick(hidden, "was", "were")
+            ));
         }
         call.finish(Ok(out))
     }
@@ -813,7 +820,12 @@ impl KubeMcp {
         mem_row.push(opt(mem_spec.1, k8s::format_bytes));
         let of = if names.len() < total { format!(" of {total}") } else { String::new() };
         let left_out = if hidden > 0 { " (pods you may not list are left out)" } else { "" };
-        let header = format!("{}{of} pod(s), last {minutes} minutes, summed over pods{left_out}\n", names.len());
+        let header = format!(
+            "{}{of} {}, last {}, summed over pods{left_out}\n",
+            names.len(),
+            crate::plural::pick(total.max(names.len()), "pod", "pods"),
+            crate::plural::count(minutes, "minute")
+        );
         call.finish(Ok(header
             + &format_table(&["", "MIN", "AVG", "P95", "MAX", "LAST", "REQUESTS", "LIMITS"], &[cpu_row, mem_row])))
     }

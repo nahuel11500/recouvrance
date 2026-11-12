@@ -336,7 +336,11 @@ pub fn relations(ctx: &Ctx, cx: &App) -> AnyElement {
         let name = s(p, "/metadata/name").unwrap_or_default().to_string();
         let phase = s(p, "/status/phase").unwrap_or("?").to_string();
         let restarts: i64 = arr(p, "/status/containerStatuses").iter().filter_map(|c| c["restartCount"].as_i64()).sum();
-        let note = if restarts > 0 { format!("{phase} · {restarts} restarts") } else { phase.clone() };
+        let note = if restarts > 0 {
+            format!("{phase} · {}", crate::plural::count(restarts, "restart"))
+        } else {
+            phase.clone()
+        };
         let mut out = vec![node(
             depth,
             Lucide::Box,

@@ -170,7 +170,7 @@ pub fn pod(pod: &Value, events: &[Ev], crash_logs: Option<&(String, String)>) ->
                 });
             }
             "CrashLoopBackOff" | "RunContainerError" => {
-                let mut detail = format!("Restarted {restarts} times.");
+                let mut detail = format!("Restarted {}.", crate::plural::count(restarts, "time"));
                 if let Some(code) = last_code {
                     detail.push_str(&format!(
                         " Last exit code {code}{}",
@@ -203,7 +203,8 @@ pub fn pod(pod: &Value, events: &[Ev], crash_logs: Option<&(String, String)>) ->
                         level: Level::Warning,
                         title: format!("{} was killed for using too much memory", capital(&label)),
                         detail: format!(
-                            "OOMKilled; restarted {restarts} times{}.",
+                            "OOMKilled; restarted {}{}.",
+                            crate::plural::count(restarts, "time"),
                             if limit.is_empty() { String::new() } else { format!(", memory limit {limit}") }
                         ),
                         hint: "Raise the memory limit, or look at the memory chart for a leak.".into(),

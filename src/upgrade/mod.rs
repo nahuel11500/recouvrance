@@ -733,7 +733,10 @@ fn control_plane_hop(current: u32, target: u32) -> Option<Finding> {
     (target > current + 1).then(|| Finding {
         severity: Severity::Warning,
         area: Area::Skew,
-        title: format!("1.{current} → 1.{target} skips {} minor version(s)", target - current - 1),
+        title: format!(
+            "1.{current} → 1.{target} skips {}",
+            crate::plural::count(target - current - 1, "minor version")
+        ),
         action: format!(
             "The control plane upgrades one minor version at a time: {}",
             (current..=target).map(|m| format!("1.{m}")).collect::<Vec<_>>().join(" → ")
@@ -760,8 +763,8 @@ fn kubelet_skew(target: u32, nodes: &[NodeLite]) -> Vec<Finding> {
                 severity: Severity::Critical,
                 area: Area::Skew,
                 title: format!(
-                    "{} node(s) on kubelet 1.{m}, {} minor versions behind 1.{target}",
-                    names.len(),
+                    "{} on kubelet 1.{m}, {} minor versions behind 1.{target}",
+                    crate::plural::count(names.len(), "node"),
                     target - m
                 ),
                 action: format!(
@@ -973,7 +976,7 @@ fn drain_findings(pdbs: &[Value], pods: Option<&[PodLite]>) -> Vec<Finding> {
         findings.push(Finding {
             severity: Severity::Warning,
             area: Area::Drains,
-            title: format!("{count} pod(s) selected by {} PodDisruptionBudgets", names.len()),
+            title: format!("{} selected by {} PodDisruptionBudgets", crate::plural::count(count, "pod"), names.len()),
             action: "The eviction API refuses a pod that more than one budget selects, so drains stop on these: make \
                      the budgets' selectors disjoint"
                 .into(),

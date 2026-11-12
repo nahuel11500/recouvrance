@@ -781,9 +781,9 @@ impl Render for ArgoView {
                 let count = self.shown.len();
                 let total = rows.fleet.apps.len();
                 let summary = if self.filter == Filter::default() {
-                    format!("{total} Applications")
+                    crate::plural::count(total, "Application")
                 } else {
-                    format!("{} of {total} Applications", self.kept)
+                    format!("{} of {}", self.kept, crate::plural::count(total, "Application"))
                 };
                 v_flex()
                     .size_full()

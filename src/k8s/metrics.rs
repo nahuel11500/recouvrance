@@ -150,7 +150,7 @@ pub fn format_cores(millicores: f64) -> String {
     match millicores {
         m if m < 1000.0 => format!("{m:.0}m"),
         m if m < 10_000.0 => {
-            format!("{} cores", format!("{:.2}", m / 1000.0).trim_end_matches('0').trim_end_matches('.'))
+            crate::plural::count(format!("{:.2}", m / 1000.0).trim_end_matches('0').trim_end_matches('.'), "core")
         }
         m => format!("{:.0} cores", m / 1000.0),
     }

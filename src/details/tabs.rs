@@ -393,7 +393,7 @@ impl DetailPanel {
             .gap_2()
             .px_2()
             .text_sm()
-            .child(div().text_color(muted).child(format!("{total} {}", plural(total, "event", "events"))))
+            .child(div().text_color(muted).child(crate::plural::count(total, "event")))
             .when(warnings > 0, |d| {
                 d.child(
                     h_flex()
@@ -408,7 +408,7 @@ impl DetailPanel {
                         .border_color(if only { warning } else { warning.opacity(0.) })
                         .hover(|s| s.bg(warning.opacity(0.2)))
                         .child(Icon::new(Lucide::TriangleAlert).size_3p5().text_color(warning))
-                        .child(format!("{warnings} {}", plural(warnings, "warning", "warnings")))
+                        .child(crate::plural::count(warnings, "warning"))
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.warnings_only = !this.warnings_only;
                             cx.notify();
@@ -426,10 +426,6 @@ fn is_warning(e: &k8s::EventLine) -> bool {
 /// A tab's count: a small number on a tint of its color.
 fn count_badge(n: usize, color: Hsla) -> impl IntoElement {
     div().ml_1p5().px_1p5().rounded_full().text_xs().bg(color.opacity(0.15)).text_color(color).child(n.to_string())
-}
-
-fn plural<'a>(n: usize, one: &'a str, many: &'a str) -> &'a str {
-    if n == 1 { one } else { many }
 }
 
 /// One event: what happened and who said so, the message, then when and how often.

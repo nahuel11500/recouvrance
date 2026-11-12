@@ -211,7 +211,7 @@ fn turning_access_off_stops_a_drain() {
         hub.set_agents_enabled(true)?;
         uncordon().await?;
         let err = format!("{:#}", drained.expect_err("the drain went on after access was switched off"));
-        assert!(err.contains("stopped after 1 evictions") && err.contains("switched off"), "{err}");
+        assert!(err.contains("stopped after 1 eviction:") && err.contains("switched off"), "{err}");
 
         // In the app: write mode off stops it at once.
         gate::set_ui_writes(true);

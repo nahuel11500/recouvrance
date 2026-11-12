@@ -1334,7 +1334,11 @@ pub fn report(head: &str, d: &Diagnosis, read: &DriftRead) -> String {
                 }
             }
             if drift.more > 0 {
-                out.push(format!("  … {} more fields differ", drift.more));
+                out.push(format!(
+                    "  … {} more {}",
+                    drift.more,
+                    crate::plural::pick(drift.more, "field differs", "fields differ")
+                ));
             }
             if drift.compared == Compared::LastApplied && drift.fields.is_empty() {
                 out.push("  every field applied has its applied value".into());

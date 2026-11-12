@@ -73,7 +73,10 @@ fn decode(v: &serde_json::Value, secret: bool) -> Decoded {
     match base64::engine::general_purpose::STANDARD.decode(s) {
         Ok(b) => match String::from_utf8(b) {
             Ok(t) => Decoded::Text(t),
-            Err(e) => Decoded::Kept { b64: s.to_string(), label: format!("binary, {} bytes", e.as_bytes().len()) },
+            Err(e) => Decoded::Kept {
+                b64: s.to_string(),
+                label: format!("binary, {}", crate::plural::count(e.as_bytes().len(), "byte")),
+            },
         },
         Err(_) => Decoded::Kept { b64: s.to_string(), label: "not valid base64, kept as it is".into() },
     }

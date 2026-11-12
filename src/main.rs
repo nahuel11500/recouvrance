@@ -24,6 +24,7 @@ mod mcp;
 mod overview;
 mod paths;
 mod plugins;
+mod plural;
 mod private_files;
 mod problems;
 mod prom;

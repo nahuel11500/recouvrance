@@ -34,7 +34,7 @@ pub fn days_left(t: jiff::Timestamp, now: jiff::Timestamp) -> i64 {
 
 /// "1 day", "3 days".
 pub fn days_text(n: i64) -> String {
-    if n == 1 { "1 day".into() } else { format!("{n} days") }
+    crate::plural::count(n, "day")
 }
 
 /// How long ago `t` passed, in the days that went by: "less than a day ago", "1 day ago".
