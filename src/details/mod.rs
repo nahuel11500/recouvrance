@@ -947,7 +947,7 @@ impl DetailPanel {
         }
         let Some(value) = &self.object else { return };
         if let Some(terminal) = &self.terminal {
-            let (names, default) = (k8s::shell_containers(value), k8s::default_container(value));
+            let (names, default) = (k8s::pod_containers(value), k8s::default_container(value));
             terminal.update(cx, |t, cx| t.set_containers(names, default, window, cx));
         }
         if let Some(files) = &self.files {

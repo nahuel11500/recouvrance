@@ -18,8 +18,7 @@ use crate::ui::selectable::selectable;
 pub(super) fn pod(ctx: &Ctx, cx: &App) -> Div {
     let obj = ctx.obj;
     let phase = pod_status(obj);
-    let statuses = arr(obj, "/status/containerStatuses");
-    let containers = arr(obj, "/spec/containers");
+    let containers = k8s::spec_containers(&obj["spec"]);
     let counts = k8s::pod_counts(obj);
     let node_name = s(obj, "/spec/nodeName").unwrap_or("-").to_string();
     let pod_name = s(obj, "/metadata/name").unwrap_or_default();
@@ -35,10 +34,9 @@ pub(super) fn pod(ctx: &Ctx, cx: &App) -> Div {
         .children(pod_ephemeral(ctx).map(|text| field("Ephemeral storage", text, cx)));
 
     let usage = ctx.related.usage.get(pod_name);
-    let cards = containers.iter().map(|c| {
-        let name = c["name"].as_str().unwrap_or_default();
-        let st = statuses.iter().find(|x| x["name"].as_str() == Some(name));
-        let state = container_state(st);
+    let cards = containers.iter().map(|sc| {
+        let (name, c) = (sc.name, sc.spec);
+        let state = container_state(sc.status(obj));
         let u = usage.and_then(|u| u.get(name));
         v_flex()
             .w(px(520.))
@@ -52,6 +50,7 @@ pub(super) fn pod(ctx: &Ctx, cx: &App) -> Div {
                     .gap_2()
                     .child(Icon::new(Lucide::Box).size_4())
                     .child(div().font_weight(FontWeight::SEMIBOLD).child(selectable(name.to_string())))
+                    .children(kind_tag(sc.kind, cx))
                     .child(div().text_sm().text_color(state_color(&state, cx)).child(selectable(state.clone()))),
             )
             .child(
@@ -107,13 +106,21 @@ pub(super) fn container_usage_row(c: &Value, usage: Option<&(f64, f64)>, cx: &Ap
         ))
 }
 
-/// The per-container tab of a pod.
+/// What a sidecar, init or debug container is, next to its name.
+pub(super) fn kind_tag(kind: k8s::ContainerKind, cx: &App) -> Option<Div> {
+    let tag = kind.tag()?;
+    let color = cx.theme().muted_foreground;
+    Some(div().px_1p5().rounded_full().text_xs().bg(color.opacity(0.15)).text_color(color).child(selectable(tag)))
+}
+
+/// The per-container tab of a pod (any of its containers: sidecar, init and debug ones too).
 pub fn container(ctx: &Ctx, name: &str, cx: &App) -> AnyElement {
     let obj = ctx.obj;
-    let Some(c) = arr(obj, "/spec/containers").iter().find(|c| c["name"].as_str() == Some(name)) else {
+    let containers = k8s::spec_containers(&obj["spec"]);
+    let Some(sc) = containers.iter().find(|c| c.name == name) else {
         return div().child("Container not found").into_any_element();
     };
-    let st = arr(obj, "/status/containerStatuses").iter().find(|x| x["name"].as_str() == Some(name));
+    let (c, st) = (sc.spec, sc.status(obj));
     let state = container_state(st);
     let ready = st.and_then(|s| s["ready"].as_bool()).unwrap_or(false);
     let started = st.and_then(|s| s["started"].as_bool()).unwrap_or(false);
@@ -135,6 +142,7 @@ pub fn container(ctx: &Ctx, name: &str, cx: &App) -> AnyElement {
 
     let status = h_flex()
         .gap_2()
+        .children(kind_tag(sc.kind, cx))
         .child(div().text_color(state_color(&state, cx)).child(selectable(state.clone())))
         .when(started, |d| d.child(selectable("Started")))
         .when(ready, |d| d.child(selectable("Ready")));

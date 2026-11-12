@@ -244,11 +244,9 @@ pub async fn containers(client: Client, ns: String, pod: String) -> Result<Vec<S
     .await
 }
 
-/// A read pod's containers, its default one first (as `pod_containers` for a listed one).
+/// A read pod's containers, as `pod_containers` lists them.
 pub fn typed_pod_containers(pod: &Pod) -> Vec<String> {
-    let default = pod.metadata.annotations.as_ref().and_then(|a| a.get(DEFAULT_CONTAINER));
-    let names = pod.spec.as_ref().map(|s| s.containers.iter().map(|c| c.name.clone()).collect()).unwrap_or_default();
-    default_first(names, default.map(String::as_str))
+    serde_json::to_value(pod).map(|v| pod_containers(&v)).unwrap_or_default()
 }
 
 /// The annotation naming the container kubectl uses when none is given.
@@ -299,28 +297,82 @@ pub fn default_container(pod: &serde_json::Value) -> Option<String> {
     pod_containers(pod).into_iter().next()
 }
 
-/// The containers a shell can open in: the pod's own (default first), then its ephemeral
-/// debug containers.
-pub fn shell_containers(pod: &serde_json::Value) -> Vec<String> {
-    let mut names = pod_containers(pod);
-    let ephemeral = pod.pointer("/spec/ephemeralContainers").and_then(|c| c.as_array());
-    for name in ephemeral.into_iter().flatten().filter_map(|c| c["name"].as_str()) {
-        if !names.iter().any(|n| n == name) {
-            names.push(name.to_string());
-        }
-    }
-    names
+/// What a container of a pod is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ContainerKind {
+    /// One of `spec.containers`.
+    Main,
+    /// A native sidecar: an init container with `restartPolicy: Always`, which starts
+    /// before the others and keeps running beside them.
+    Sidecar,
+    /// An init container that runs to its end before the others start.
+    Init,
+    /// An ephemeral (debug) container.
+    Ephemeral,
 }
 
-/// A listed pod's containers, its default one first (as `containers` reads them).
+impl ContainerKind {
+    /// What it is said to be next to its name; nothing for a pod's own containers.
+    pub fn tag(self) -> Option<&'static str> {
+        match self {
+            Self::Main => None,
+            Self::Sidecar => Some("sidecar"),
+            Self::Init => Some("init"),
+            Self::Ephemeral => Some("debug"),
+        }
+    }
+
+    /// Where a pod's status keeps the state of such containers.
+    fn statuses(self) -> &'static str {
+        match self {
+            Self::Main => "/status/containerStatuses",
+            Self::Sidecar | Self::Init => "/status/initContainerStatuses",
+            Self::Ephemeral => "/status/ephemeralContainerStatuses",
+        }
+    }
+}
+
+/// One container of a pod spec.
+pub struct SpecContainer<'a> {
+    pub name: &'a str,
+    pub kind: ContainerKind,
+    pub spec: &'a serde_json::Value,
+}
+
+impl SpecContainer<'_> {
+    /// Its status in `pod` (as listed or read), when the kubelet reported one.
+    pub fn status<'p>(&self, pod: &'p serde_json::Value) -> Option<&'p serde_json::Value> {
+        let list = pod.pointer(self.kind.statuses())?.as_array()?;
+        list.iter().find(|s| s["name"].as_str() == Some(self.name))
+    }
+}
+
+/// Every container of pod spec `spec` (a pod's `spec`, or a template's): its containers,
+/// then its init containers in their order (native sidecars among them), then its ephemeral
+/// ones. The pod and workload pages, the container pickers and the agents' tools all list
+/// them this way.
+pub fn spec_containers(spec: &serde_json::Value) -> Vec<SpecContainer<'_>> {
+    use serde_json::Value;
+    let list = |key: &str| spec.get(key).and_then(Value::as_array).map_or(&[][..], Vec::as_slice);
+    let init_kind =
+        |c: &Value| if c["restartPolicy"] == "Always" { ContainerKind::Sidecar } else { ContainerKind::Init };
+    let main = list("containers").iter().map(|c| (c, ContainerKind::Main));
+    let init = list("initContainers").iter().map(|c| (c, init_kind(c)));
+    let ephemeral = list("ephemeralContainers").iter().map(|c| (c, ContainerKind::Ephemeral));
+    main.chain(init)
+        .chain(ephemeral)
+        .filter_map(|(spec, kind)| Some(SpecContainer { name: spec["name"].as_str()?, kind, spec }))
+        .collect()
+}
+
+/// A listed pod's containers to pick from (logs, shell, files): all of `spec_containers`,
+/// the default one first. The annotation picks among the pod's own containers only.
 pub fn pod_containers(pod: &serde_json::Value) -> Vec<String> {
-    let names = pod
-        .pointer("/spec/containers")
-        .and_then(|c| c.as_array())
-        .map(|cs| cs.iter().filter_map(|c| c["name"].as_str().map(String::from)).collect())
-        .unwrap_or_default();
-    let default = pod.pointer("/metadata/annotations").and_then(|a| a.get(DEFAULT_CONTAINER)).and_then(|v| v.as_str());
-    default_first(names, default)
+    let all = spec_containers(&pod["spec"]);
+    let annotation =
+        pod.pointer("/metadata/annotations").and_then(|a| a.get(DEFAULT_CONTAINER)).and_then(|v| v.as_str());
+    let default = annotation.filter(|d| all.iter().any(|c| c.kind == ContainerKind::Main && c.name == *d));
+    default_first(all.iter().map(|c| c.name.to_string()).collect(), default)
 }
 
 /// `names` with `default` moved to the front, when it is one of them.
@@ -870,11 +922,60 @@ mod tests {
         assert_eq!(super::default_container(&pod(Some("gone"))).as_deref(), Some("nginx"));
         assert_eq!(super::default_container(&pod(Some("debugger-x"))).as_deref(), Some("nginx"));
         assert_eq!(super::default_container(&serde_json::json!({})), None);
-        // The shell offers every container, default first, then the debug ones.
-        assert_eq!(super::shell_containers(&pod(Some("uwsgi"))), ["uwsgi", "nginx", "uwsgi-exporter", "debugger-x"]);
+        // The pickers offer every container, default first, then the debug ones.
+        assert_eq!(super::pod_containers(&pod(Some("uwsgi"))), ["uwsgi", "nginx", "uwsgi-exporter", "debugger-x"]);
         // The typed read agrees with the listed one.
         let typed: super::Pod = serde_json::from_value(pod(Some("uwsgi"))).unwrap();
         assert_eq!(super::typed_pod_containers(&typed), super::pod_containers(&pod(Some("uwsgi"))));
+    }
+
+    /// Native sidecars and init containers are listed and picked like the others, after
+    /// them and in their order, then the debug ones; the default stays one of the pod's own.
+    #[test]
+    fn sidecars_and_init_containers_are_listed_and_picked() {
+        use super::ContainerKind::{Ephemeral, Init, Main, Sidecar};
+        let pod = serde_json::json!({
+            "metadata": {"annotations": {"kubectl.kubernetes.io/default-container": "helper"}},
+            "spec": {
+                "initContainers": [
+                    {"name": "migrate", "image": "m:1"},
+                    {"name": "proxy-sidecar", "image": "p:1", "restartPolicy": "Always"},
+                ],
+                "containers": [{"name": "app", "image": "a:1"}, {"name": "helper", "image": "h:1"}],
+                "ephemeralContainers": [{"name": "debugger", "image": "busybox"}],
+            },
+            "status": {
+                "containerStatuses": [{"name": "app", "ready": true}],
+                "initContainerStatuses": [{"name": "proxy-sidecar", "ready": true}],
+            },
+        });
+        let all = super::spec_containers(&pod["spec"]);
+        let listed: Vec<_> = all.iter().map(|c| (c.name, c.kind)).collect();
+        assert_eq!(
+            listed,
+            [("app", Main), ("helper", Main), ("migrate", Init), ("proxy-sidecar", Sidecar), ("debugger", Ephemeral)]
+        );
+        // Each one's status is read from its own list.
+        let ready =
+            |name: &str| all.iter().find(|c| c.name == name).and_then(|c| c.status(&pod)).map(|s| s["ready"].clone());
+        assert_eq!(ready("proxy-sidecar"), Some(serde_json::json!(true)));
+        assert_eq!(ready("app"), Some(serde_json::json!(true)));
+        assert_eq!(ready("migrate"), None);
+        assert_eq!(super::pod_containers(&pod), ["helper", "app", "migrate", "proxy-sidecar", "debugger"]);
+        let mut bare = pod.clone();
+        bare.as_object_mut().unwrap().remove("status");
+        let typed: super::Pod = serde_json::from_value(bare).unwrap();
+        assert_eq!(super::typed_pod_containers(&typed), super::pod_containers(&pod));
+        // The annotation naming a sidecar is ignored: the default is one of the pod's own.
+        let mut sidecar_default = pod.clone();
+        sidecar_default["metadata"]["annotations"]["kubectl.kubernetes.io/default-container"] = "proxy-sidecar".into();
+        assert_eq!(super::default_container(&sidecar_default).as_deref(), Some("app"));
+        // A template has the same containers, and a revision's images list them all.
+        let rev = serde_json::json!({"spec": {"template": {"spec": pod["spec"].clone()}}});
+        assert_eq!(
+            super::super::rollouts::images(&rev),
+            ["app=a:1", "helper=h:1", "migrate=m:1", "proxy-sidecar=p:1", "debugger=busybox"]
+        );
     }
 
     #[test]

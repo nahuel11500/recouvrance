@@ -145,10 +145,9 @@ pub(super) struct LogContainers {
 }
 
 pub(super) fn log_containers(pod: &serde_json::Value) -> LogContainers {
-    let read = k8s::default_container(pod);
-    let init = pod.pointer("/spec/initContainers").and_then(|c| c.as_array());
-    let init = init.into_iter().flatten().filter_map(|c| c["name"].as_str()).map(String::from);
-    let others = k8s::pod_containers(pod).into_iter().chain(init).filter(|c| Some(c) != read.as_ref()).collect();
+    // Every container, default first: sidecars, init and debug ones included.
+    let mut others = k8s::pod_containers(pod);
+    let read = (!others.is_empty()).then(|| others.remove(0));
     LogContainers { read, others }
 }
 

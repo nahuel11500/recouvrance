@@ -38,14 +38,11 @@ pub fn number(rev: &Value) -> i64 {
         .unwrap_or(0)
 }
 
-/// The images of a revision's pod template, `container=image`.
+/// The images of a revision's pod template, `container=image`: its containers, then its
+/// init containers (native sidecars among them).
 pub fn images(rev: &Value) -> Vec<String> {
-    rev.pointer("/spec/template/spec/containers")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .map(|c| format!("{}={}", c["name"].as_str().unwrap_or("?"), c["image"].as_str().unwrap_or("?")))
-        .collect()
+    let containers = rev.pointer("/spec/template/spec").map(super::spec_containers).unwrap_or_default();
+    containers.iter().map(|c| format!("{}={}", c.name, c.spec["image"].as_str().unwrap_or("?"))).collect()
 }
 
 /// The revision to roll back to: `to` when given, else the newest one before the current

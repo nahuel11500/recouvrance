@@ -6,12 +6,9 @@ use crate::k8s;
 use crate::k8s::ObjectRef;
 use crate::overview::Related;
 
-pub(super) fn container_names(value: &serde_json::Value) -> Vec<String> {
-    value
-        .pointer("/spec/containers")
-        .and_then(|c| c.as_array())
-        .map(|cs| cs.iter().filter_map(|c| c["name"].as_str().map(String::from)).collect())
-        .unwrap_or_default()
+/// A pod's containers as its tabs show them (`k8s::spec_containers`), with what each is.
+pub(super) fn container_names(value: &serde_json::Value) -> Vec<(String, k8s::ContainerKind)> {
+    k8s::spec_containers(&value["spec"]).iter().map(|c| (c.name.to_string(), c.kind)).collect()
 }
 
 /// Names of the workload pods the charts measure (see `prom::chart_pods`).
@@ -306,7 +303,7 @@ async fn fetch_objects(
             }
             // ConfigMaps and Secrets the environment reads, to show resolved values.
             let mut refs: std::collections::BTreeSet<(&str, String)> = Default::default();
-            for c in obj.pointer("/spec/containers").and_then(|c| c.as_array()).into_iter().flatten() {
+            for c in k8s::spec_containers(&obj["spec"]).iter().map(|c| c.spec) {
                 for e in c["env"].as_array().into_iter().flatten() {
                     if let Some(n) = e.pointer("/valueFrom/configMapKeyRef/name").and_then(|v| v.as_str()) {
                         refs.insert(("ConfigMap", n.to_string()));

@@ -323,8 +323,9 @@ fn refusal_reason(
     let Some(pod) = pod else { return Some(generic) };
     let spec = pod.spec.as_ref();
     let Some(name) = container else {
-        let names: Vec<&str> = spec.map(|s| s.containers.iter().map(|c| c.name.as_str()).collect()).unwrap_or_default();
-        return Some(if names.len() > 1 {
+        // The server takes the only one of `spec.containers` when there is one, else refuses.
+        return Some(if spec.is_some_and(|s| s.containers.len() > 1) {
+            let names = super::typed_pod_containers(pod);
             Known(format!("the pod has several containers ({}): choose one", names.join(", ")))
         } else {
             generic

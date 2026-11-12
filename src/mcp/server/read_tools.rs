@@ -320,19 +320,8 @@ impl KubeMcp {
                 ));
             }
         }
-        for c in value.pointer("/status/containerStatuses").and_then(|c| c.as_array()).into_iter().flatten() {
-            let state = c["state"].as_object().and_then(|m| m.keys().next().cloned()).unwrap_or_default();
-            let reason = c.pointer(&format!("/state/{state}/reason")).and_then(|v| v.as_str()).unwrap_or("");
-            let last = c
-                .pointer("/lastState/terminated")
-                .map(|t| format!(", last terminated: {} (exit {})", t["reason"].as_str().unwrap_or("?"), t["exitCode"]))
-                .unwrap_or_default();
-            out.push_str(&format!(
-                "Container {}: {state} {reason}, ready={}, restarts={}{last}\n",
-                c["name"].as_str().unwrap_or("?"),
-                c["ready"],
-                c["restartCount"]
-            ));
+        if kind.is("", "Pod") {
+            out.push_str(&container_lines(&value));
         }
         // Pods behind workloads, services and budgets, picked as the app's pages pick them.
         let selects_pods = kind.is("", "Service")
@@ -906,11 +895,43 @@ fn usage_table(
     format_table(&["", "MIN", "AVG", "P95", "MAX", "LAST", columns[0], columns[1]], &[cpu_row, mem_row])
 }
 
+/// One line a container of `pod` (sidecars, init and debug containers too, as the pod page
+/// lists them): what it is, its state, whether it is ready and its restarts.
+fn container_lines(pod: &serde_json::Value) -> String {
+    let mut out = String::new();
+    for c in k8s::spec_containers(&pod["spec"]) {
+        let what = match c.kind {
+            k8s::ContainerKind::Main => "Container",
+            k8s::ContainerKind::Sidecar => "Sidecar container",
+            k8s::ContainerKind::Init => "Init container",
+            k8s::ContainerKind::Ephemeral => "Ephemeral container",
+        };
+        let Some(st) = c.status(pod) else {
+            out.push_str(&format!("{what} {}: no status yet\n", c.name));
+            continue;
+        };
+        let state = st["state"].as_object().and_then(|m| m.keys().next().cloned()).unwrap_or_default();
+        let reason = st.pointer(&format!("/state/{state}/reason")).and_then(|v| v.as_str());
+        let last = st
+            .pointer("/lastState/terminated")
+            .map(|t| format!(", last terminated: {} (exit {})", t["reason"].as_str().unwrap_or("?"), t["exitCode"]))
+            .unwrap_or_default();
+        out.push_str(&format!(
+            "{what} {}: {state}{}, ready={}, restarts={}{last}\n",
+            c.name,
+            reason.map(|r| format!(" {r}")).unwrap_or_default(),
+            st["ready"],
+            st["restartCount"]
+        ));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
 
-    use super::{Measured, measured};
+    use super::{Measured, container_lines, measured};
     use crate::k8s::Kind;
 
     fn kind(group: &str, kind: &str, plural: &str, namespaced: bool) -> Kind {
@@ -958,5 +979,36 @@ mod tests {
         // A Service without a selector (its endpoints set by hand) selects none.
         let err = measured(&kind("", "Service", "services", true), &json!({"spec": {}})).unwrap_err();
         assert!(err.contains("Service selects no pods"), "{err}");
+    }
+
+    #[test]
+    fn a_pod_s_description_has_every_container() {
+        let pod = json!({
+            "spec": {
+                "containers": [{"name": "app"}, {"name": "helper"}],
+                "initContainers": [{"name": "migrate"}, {"name": "proxy-sidecar", "restartPolicy": "Always"}],
+                "ephemeralContainers": [{"name": "debugger"}],
+            },
+            "status": {
+                "containerStatuses": [
+                    {"name": "app", "state": {"running": {}}, "ready": true, "restartCount": 0},
+                    {"name": "helper", "state": {"waiting": {"reason": "CrashLoopBackOff"}}, "ready": false,
+                     "restartCount": 3, "lastState": {"terminated": {"reason": "Error", "exitCode": 1}}},
+                ],
+                "initContainerStatuses": [
+                    {"name": "migrate", "state": {"terminated": {"reason": "Completed"}}, "ready": false,
+                     "restartCount": 0},
+                    {"name": "proxy-sidecar", "state": {"running": {}}, "ready": true, "restartCount": 1},
+                ],
+            },
+        });
+        assert_eq!(
+            container_lines(&pod),
+            "Container app: running, ready=true, restarts=0\n\
+             Container helper: waiting CrashLoopBackOff, ready=false, restarts=3, last terminated: Error (exit 1)\n\
+             Init container migrate: terminated Completed, ready=false, restarts=0\n\
+             Sidecar container proxy-sidecar: running, ready=true, restarts=1\n\
+             Ephemeral container debugger: no status yet\n"
+        );
     }
 }
