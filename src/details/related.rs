@@ -124,7 +124,9 @@ fn usage_scope(
     if kind.is("", "Namespace") {
         return None;
     }
-    let ns_of = |p: &serde_json::Value| p.pointer("/metadata/namespace").and_then(|v| v.as_str());
+    fn ns_of(p: &serde_json::Value) -> Option<&str> {
+        p.pointer("/metadata/namespace").and_then(|v| v.as_str())
+    }
     let ns = ns_of(pods.first()?)?;
     if pods.iter().any(|p| ns_of(p) != Some(ns)) {
         return None;
