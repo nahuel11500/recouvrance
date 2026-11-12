@@ -351,10 +351,15 @@ pub fn watch_node_metrics(
     (guard, rx)
 }
 
+/// How long a page waits for a kubelet's stats: a busy one can take tens of seconds, and
+/// one that never answers would hold the page's other sections for minutes.
+const NODE_STATS_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// The kubelet's stats summary for a node (filesystem and per-pod ephemeral storage);
-/// needs `nodes/proxy`.
+/// needs `nodes/proxy`. None when it doesn't answer within `NODE_STATS_WAIT`.
 pub async fn node_stats(client: Client, node: String) -> Option<serde_json::Value> {
-    get_json(client, format!("/api/v1/nodes/{node}/proxy/stats/summary")).await
+    let read = get_json(client, format!("/api/v1/nodes/{node}/proxy/stats/summary"));
+    run(async move { Ok(tokio::time::timeout(NODE_STATS_WAIT, read).await.ok().flatten()) }).await.ok().flatten()
 }
 
 /// DRA ResourceSlices published for a node (resource.k8s.io v1, then v1beta1/v1beta2).
