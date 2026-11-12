@@ -66,12 +66,8 @@ impl KubeMcp {
         self.authorize_list(&mut call, &access, true).await?;
         let usage = match k8s::node_usage(client).await {
             Ok(u) => u,
-            // No metrics API: say what is missing, not "404 page not found".
-            Err(e) if k8s::api_status(&e) == Some(404) => {
-                return call
-                    .finish(Err(anyhow::anyhow!("no node metrics: metrics-server is not installed in this cluster")));
-            }
-            Err(e) => return call.finish(Err(e)),
+            // No metrics API, or it is down: say what is missing, not "404 page not found".
+            Err(e) => return call.finish(Err(k8s::explain_metrics_error(e, "node metrics"))),
         };
         let pct = |used: f64, alloc: f64| if alloc > 0.0 { used / alloc * 100.0 } else { 0.0 };
         // (name, cpu, cpu %, memory, memory %)

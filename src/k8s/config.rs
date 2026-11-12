@@ -7,7 +7,7 @@ use anyhow::{Context as _, Result};
 use kube::config::{KubeConfigOptions, Kubeconfig};
 use kube::{Client, Config};
 
-use super::{added_dir, folder_files, gate, meter, run};
+use super::{added_dir, folder_files, gate, meter, retry, run};
 use crate::paths::tilde;
 use crate::private_files::{TempFile, save_new};
 
@@ -442,21 +442,27 @@ async fn connect_with(context: String, gated: bool) -> Result<Client> {
         let opts = KubeConfigOptions { context: Some(context.clone()), ..Default::default() };
         let config =
             Config::from_custom_kubeconfig(kc, &opts).await.with_context(|| format!("loading context {context}"))?;
-        // kube sets no read timeout: on a connection that died without a word (sleep, VPN,
-        // NAT), a request would wait forever. This bounds the wait for the response headers;
-        // watches, logs and shells stream after that and are not cut.
-        let timeout = tower::timeout::TimeoutLayer::new(REQUEST_TIMEOUT);
-        // Outside the timeout, so a request it cuts is counted as failed.
-        let meter = meter::MeterLayer { context: context.clone() };
         // The exec plugin runs as a blocking process here (a browser login can take minutes):
         // off the shared runtime's few threads, so other clusters keep streaming meanwhile.
-        let builder = tokio::task::spawn_blocking(move || kube::client::ClientBuilder::try_from(config))
-            .await
-            .context("building the client")??;
-        let builder = builder.with_layer(&timeout).with_layer(&meter);
-        Ok(if gated { builder.with_layer(&gate::WriteGateLayer).build() } else { builder.build() })
+        tokio::task::spawn_blocking(move || client(config, context, gated)).await.context("building the client")?
     })
     .await
+}
+
+/// A context's client from its config, with the app's layers. Runs the exec plugin, if any.
+fn client(mut config: Config, context: String, gated: bool) -> Result<Client> {
+    // kube's retry sends a 503 again for about three minutes: an aggregated API that is down
+    // (metrics-server) held pages that long. `retry` only waits when the server says when.
+    config.default_retry = false;
+    // kube sets no read timeout: on a connection that died without a word (sleep, VPN,
+    // NAT), a request would wait forever. This bounds the wait for the response headers;
+    // watches, logs and shells stream after that and are not cut.
+    let timeout = tower::timeout::TimeoutLayer::new(REQUEST_TIMEOUT);
+    // Outside the timeout, so a request it cuts is counted as failed.
+    let meter = meter::MeterLayer { context };
+    let builder = kube::client::ClientBuilder::try_from(config)?;
+    let builder = builder.with_layer(&retry::RetryLayer).with_layer(&timeout).with_layer(&meter);
+    Ok(if gated { builder.with_layer(&gate::WriteGateLayer).build() } else { builder.build() })
 }
 
 /// Where a context points: its kubeconfig cluster's name and server URL, and its user's
@@ -886,6 +892,34 @@ mod kubeconfig_tests {
 mod tests {
     use super::exec_command;
     use kube::config::Kubeconfig;
+
+    /// An aggregated API whose backend is down answers 503 at once: so must the client,
+    /// not after minutes of retries (#742).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_503_comes_back_at_once() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut conn, _)) = listener.accept().await {
+                let mut buf = [0u8; 4096];
+                let _ = conn.read(&mut buf).await;
+                let body = r#"{"kind":"Status","apiVersion":"v1","status":"Failure","message":"service unavailable","reason":"ServiceUnavailable","code":503}"#;
+                let res = format!(
+                    "HTTP/1.1 503 Service Unavailable\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = conn.write_all(res.as_bytes()).await;
+            }
+        });
+        let config = kube::Config::new(format!("http://{addr}").parse().unwrap());
+        let client = super::client(config, "test".into(), false).unwrap();
+        let read =
+            client.request_text(http::Request::get("/apis/metrics.k8s.io/v1beta1/nodes").body(Vec::new()).unwrap());
+        let answer = tokio::time::timeout(std::time::Duration::from_secs(5), read).await;
+        let err = answer.expect("the 503 should come back at once").expect_err("a 503 is an error");
+        assert!(matches!(err, kube::Error::Api(ref s) if s.code == 503), "{err}");
+    }
 
     #[test]
     fn exec_command_of_a_context() {

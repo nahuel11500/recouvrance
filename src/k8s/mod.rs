@@ -32,6 +32,7 @@ mod node_specs;
 pub(crate) mod pod_copy;
 mod pods;
 pub(crate) mod podspec;
+mod retry;
 pub(crate) mod rollouts;
 mod run_as;
 mod sources;
