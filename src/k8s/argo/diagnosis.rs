@@ -1716,7 +1716,7 @@ mod tests {
         assert!(!text.contains("ConfigMap shop/conf —"), "{text}");
 
         // Not being deleted: nothing more is read.
-        let mut kept = app.clone();
+        let mut kept = app;
         kept["metadata"] = json!({});
         assert!(Diagnosis::of(&kept, now()).to_find.is_empty());
     }
