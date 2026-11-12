@@ -277,13 +277,13 @@ fn add_pods(s: &mut Summary, pods: &[PodLite]) {
     }
 }
 
-/// A metrics.k8s.io list, or None when metrics are off or metrics-server didn't answer
-/// (missing, down or refused): usage is then unknown, not zero.
-async fn metrics(on: bool, client: Client, path: &'static str) -> Option<MetricsList> {
+/// A metrics.k8s.io list, or None when metrics are off. When metrics-server didn't answer
+/// (missing, down or refused), usage is unknown, not zero.
+async fn metrics(on: bool, client: Client, path: &'static str) -> Option<Result<MetricsList>> {
     if !on {
         return None;
     }
-    k8s::run(async move { Ok(client.request(http::Request::get(path).body(Vec::new())?).await?) }).await.ok()
+    Some(k8s::run(async move { Ok(client.request(http::Request::get(path).body(Vec::new())?).await?) }).await)
 }
 
 /// The cluster overview's load, for the dev smoke run's timings.
@@ -342,8 +342,9 @@ struct Answers {
     nodes: Result<Vec<NodeLite>>,
     pods: Result<Vec<PodLite>>,
     namespaces: Result<Vec<String>>,
-    node_metrics: Option<MetricsList>,
-    pod_metrics: Option<MetricsList>,
+    /// None when metrics are off.
+    node_metrics: Option<Result<MetricsList>>,
+    pod_metrics: Option<Result<MetricsList>>,
 }
 
 /// The summary from what was answered: a part that failed is said, not taken as 0, and
@@ -374,15 +375,30 @@ fn summarize(context: String, a: Answers) -> Summary {
         Err(e) => s.errors.push(failed("Namespaces", &e)),
     }
 
-    // Usage: nodes for the totals, pods for the per-namespace ranking.
-    if let Some(node_metrics) = a.node_metrics {
+    // Usage: nodes for the totals, pods for the per-namespace ranking. Both come from the
+    // same API and fail together: one line says why, unless there is no metrics-server at
+    // all (the bars then say usage is unavailable).
+    let mut usage_failed = None;
+    let mut answered = |m: Option<Result<MetricsList>>| match m {
+        Some(Ok(list)) => Some(list),
+        Some(Err(e)) => {
+            usage_failed.get_or_insert(e);
+            None
+        }
+        None => None,
+    };
+    let (node_metrics, pod_metrics) = (answered(a.node_metrics), answered(a.pod_metrics));
+    if let Some(e) = usage_failed.filter(|e| !k8s::is_not_found(e)) {
+        s.errors.push(format!("Usage: {}", k8s::metrics_error(&e)));
+    }
+    if let Some(node_metrics) = node_metrics {
         for n in node_metrics.items {
             s.cpu.2 += k8s::parse_cpu(quantity(&n.usage, "cpu"));
             s.mem.2 += k8s::parse_bytes(quantity(&n.usage, "memory"));
         }
         s.usage_known = true;
     }
-    if let Some(pod_metrics) = a.pod_metrics {
+    if let Some(pod_metrics) = pod_metrics {
         let mut by_ns: HashMap<String, (f64, f64)> = HashMap::new();
         for p in pod_metrics.items {
             let e = by_ns.entry(p.metadata.namespace).or_default();
@@ -855,10 +871,31 @@ mod tests {
                 pods: Err(anyhow::anyhow!("connection refused")),
                 namespaces: Err(anyhow::anyhow!("connection refused")),
                 node_metrics: None,
-                pod_metrics: Some(MetricsList::default()),
+                pod_metrics: Some(Ok(MetricsList::default())),
             },
         );
         assert_eq!(s.error.as_deref(), Some("Version: failed: connection refused"));
+    }
+
+    /// metrics-server down: the rest is shown, and why usage is missing is said (#742).
+    #[test]
+    fn says_why_usage_is_missing() {
+        let refused = |code: u16| -> anyhow::Error {
+            kube::Error::Api(kube::core::Status::failure("service unavailable", "").with_code(code).boxed()).into()
+        };
+        let answers = |code: u16| Answers {
+            version: Ok("v1.33.1".into()),
+            nodes: Ok(Vec::new()),
+            pods: Ok(Vec::new()),
+            namespaces: Ok(Vec::new()),
+            node_metrics: Some(Err(refused(code))),
+            pod_metrics: Some(Err(refused(code))),
+        };
+        let s = summarize("c".into(), answers(503));
+        assert!(s.error.is_none() && s.nodes_known && s.pods_known && !s.usage_known);
+        assert_eq!(s.errors, ["Usage: metrics-server unavailable"]);
+        // No metrics-server at all is not a failure: the bars say usage is unavailable.
+        assert!(summarize("c".into(), answers(404)).errors.is_empty());
     }
 
     #[test]

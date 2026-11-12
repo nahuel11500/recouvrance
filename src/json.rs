@@ -33,6 +33,26 @@ pub fn time_at(v: &Value, path: &str) -> Option<jiff::Timestamp> {
     str_at(v, path)?.parse().ok()
 }
 
+/// The same value, the keys of every object in another order (picked by `seed`): for tests
+/// of views that must not care about key order.
+#[cfg(test)]
+pub fn reordered(v: &Value, seed: u64) -> Value {
+    use std::hash::{DefaultHasher, Hash as _, Hasher as _};
+    match v {
+        Value::Object(m) => {
+            let mut entries: Vec<(&String, &Value)> = m.iter().collect();
+            entries.sort_by_key(|(k, _)| {
+                let mut h = DefaultHasher::new();
+                (seed, k.as_str()).hash(&mut h);
+                h.finish()
+            });
+            Value::Object(entries.into_iter().map(|(k, v)| (k.clone(), reordered(v, seed))).collect())
+        }
+        Value::Array(items) => Value::Array(items.iter().map(|i| reordered(i, seed)).collect()),
+        other => other.clone(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;

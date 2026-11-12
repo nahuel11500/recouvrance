@@ -289,8 +289,9 @@ fn a_write_runs_as_the_identity_chosen_for_it_only() {
     });
 }
 
-/// A shell in a container answers what is typed, and says when it ends; an attach shows
-/// the container's own output. (The terminal view only draws what these sessions send.)
+/// A shell in a container answers what is typed, says when it ends, and is hung up when
+/// closed; an attach shows the container's own output. (The terminal view only draws what
+/// these sessions send.)
 #[test]
 #[ignore = "needs a kind cluster: RECOUVRANCE_E2E_CONTEXT"]
 fn shells_and_attach_reach_the_container() {
@@ -359,9 +360,41 @@ fn shells_and_attach_reach_the_container() {
             let mut attached = k8s::attach_container(client.clone(), NS.into(), name.into(), None);
             let text = read_until(&mut attached, "output only").await;
             assert!(text.contains("Attached to the container's main process"), "{text}");
+            drop(attached);
+
+            // Closing a shell ends it, with what runs in it, even once write mode is off: the
+            // runtime only detaches a tty session whose connection is dropped.
+            gate::set_ui_writes(true);
+            let mut shell = k8s::exec_shell(k8s::connect(context()).await?, NS.into(), name.into(), None);
+            let _ = shell.input.unbounded_send(ExecInput::Resize { cols: 80, rows: 24 });
+            let _ = shell.input.unbounded_send(ExecInput::Bytes(b"echo $((40+2))-sleeping; sleep 4321\n".to_vec()));
+            let text = read_until(&mut shell, "42-sleeping").await;
+            gate::set_ui_writes(false);
+            assert!(text.contains("42-sleeping"), "{text}");
+            drop(shell);
+            // The shell (`sh`: busybox has no bash) and its `sleep`, as `ps` lists them.
+            let left = |ps: &str| {
+                ps.lines()
+                    .filter(|l| {
+                        let command: Vec<&str> = l.split_whitespace().skip(3).collect();
+                        command == ["sh"] || command == ["sleep", "4321"]
+                    })
+                    .count()
+            };
+            let mut ps = String::new();
+            for _ in 0..30 {
+                ps = k8s::exec_capture(client.clone(), NS.into(), name.into(), None, vec!["ps".into()], 30, 1 << 16)
+                    .await?;
+                if left(&ps) == 0 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+            assert_eq!(left(&ps), 0, "the closed shell is still running:\n{ps}");
             Ok(())
         };
         let result: Result<()> = checked.await;
+        gate::set_ui_writes(false);
         pods.delete(name, &DeleteParams::default().grace_period(0)).await?;
         result
     });
