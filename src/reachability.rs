@@ -1601,7 +1601,7 @@ mod tests {
         // Within the day: less than a day, not "0 days".
         let (state, detail) = of_test_cert(&["test.example"], end - hours(5));
         assert_eq!(state, State::Warn);
-        assert!(detail.starts_with("Expires in less than a day, on "), "{detail}");
+        assert!(detail.starts_with("Expires in less than a day, on "));
         let (state, detail) = of_test_cert(&["test.example", "other.example"], start + hours(24));
         assert_eq!(state, State::Broken);
         assert_eq!(detail, "It does not cover other.example: it names test.example, 10.0.0.1.");
