@@ -31,6 +31,7 @@ pub fn system_theme(appearance: WindowAppearance) -> ThemeMode {
 /// Apply a theme mode with the app's typography on top, without saving it.
 pub fn apply_theme(mode: ThemeMode, window: Option<&mut Window>, cx: &mut App) {
     Theme::change(mode, window, cx);
+    keep_bold_ui_font(cx);
     let z = zoom(cx);
     let theme = Theme::global_mut(cx);
     theme.font_size = px((13. * z).round());
@@ -134,6 +135,56 @@ pub fn apply_theme(mode: ThemeMode, window: Option<&mut Window>, cx: &mut App) {
     cx.refresh_windows();
 }
 
+/// Families with a bold face of their own, tried in order when the UI font has none.
+const STATIC_UI_FONTS: &[&str] = &["Noto Sans", "DejaVu Sans", "Liberation Sans", "Cantarell", "Adwaita Sans"];
+
+/// On Linux, gpui's text system (cosmic-text) loads a variable font as one face at its default
+/// instance and never sets its `wght` axis, so every weight of a variable family is drawn regular.
+/// The UI font is then never bold: with Ubuntu or Ubuntu Sans, nothing in the app is. When bold
+/// resolves to the same face as regular, switch the theme to an installed family that has a bold
+/// face. Other platforms have their own text systems and are left alone.
+fn keep_bold_ui_font(cx: &mut App) {
+    if !cfg!(any(target_os = "linux", target_os = "freebsd")) {
+        return;
+    }
+    let current = cx.theme().font_family.clone();
+    if draws_bold(&current, cx) {
+        return;
+    }
+    let installed = cx.text_system().all_font_names();
+    let Some(family) = bold_capable_family(&current, STATIC_UI_FONTS, &installed, |f| draws_bold(f, cx)) else {
+        return;
+    };
+    let family = SharedString::from(family.to_string());
+    Theme::update(cx, |theme| theme.font_family = family);
+}
+
+/// Whether bold text in `family` is drawn with another face than regular text.
+fn draws_bold(family: &str, cx: &App) -> bool {
+    let regular = font(SharedString::from(family.to_string()));
+    let bold = Font { weight: FontWeight::BOLD, ..regular.clone() };
+    let text = cx.text_system();
+    text.resolve_font(&regular) != text.resolve_font(&bold)
+}
+
+/// The family to use instead of `current` so bold is drawn bold: `None` when `current` already
+/// is, else the first installed candidate that is.
+fn bold_capable_family<'a>(
+    current: &str,
+    candidates: &[&'a str],
+    installed: &[String],
+    draws_bold: impl Fn(&str) -> bool,
+) -> Option<&'a str> {
+    if draws_bold(current) {
+        return None;
+    }
+    candidates
+        .iter()
+        .copied()
+        .filter(|c| *c != current && installed.iter().any(|name| name == c))
+        .find(|c| draws_bold(c))
+}
+
 /// UI zoom factor (1.0 = 13px base text).
 pub(super) struct Zoom(f32);
 
@@ -194,4 +245,57 @@ pub fn initial_theme(cx: &mut App) -> ThemeMode {
     };
     cx.set_global(FollowSystem(saved.is_none()));
     saved.unwrap_or_else(|| system_theme(cx.window_appearance()))
+}
+
+#[cfg(test)]
+mod tests {
+    // Not `super::*`: gpui's `test` macro, glob-imported there, would shadow the built-in one.
+    use super::{STATIC_UI_FONTS, bold_capable_family};
+
+    fn names(names: &[&str]) -> Vec<String> {
+        names.iter().map(ToString::to_string).collect()
+    }
+
+    /// Ubuntu, Ubuntu Sans and Cantarell ship as variable fonts: bold resolves to their regular face.
+    fn static_bold(family: &str) -> bool {
+        !family.starts_with("Ubuntu") && family != "Cantarell"
+    }
+
+    #[test]
+    fn keeps_a_family_that_draws_bold() {
+        let installed = names(&["Noto Sans", "Ubuntu Sans"]);
+        assert_eq!(bold_capable_family("Noto Sans", STATIC_UI_FONTS, &installed, static_bold), None);
+    }
+
+    #[test]
+    fn replaces_a_variable_family_with_the_first_installed_static_one() {
+        let installed = names(&["Ubuntu", "Ubuntu Sans", "DejaVu Sans", "Liberation Sans"]);
+        assert_eq!(bold_capable_family("Ubuntu Sans", STATIC_UI_FONTS, &installed, static_bold), Some("DejaVu Sans"));
+    }
+
+    #[test]
+    fn skips_candidates_that_are_variable_too() {
+        let installed = names(&["Ubuntu", "Cantarell", "Adwaita Sans"]);
+        assert_eq!(bold_capable_family("Ubuntu", STATIC_UI_FONTS, &installed, static_bold), Some("Adwaita Sans"));
+    }
+
+    #[test]
+    fn keeps_the_family_when_no_candidate_draws_bold() {
+        let installed = names(&["Ubuntu", "Ubuntu Sans", "Cantarell"]);
+        assert_eq!(bold_capable_family("Ubuntu", STATIC_UI_FONTS, &installed, static_bold), None);
+        assert_eq!(bold_capable_family("Ubuntu", STATIC_UI_FONTS, &[], static_bold), None);
+    }
+
+    #[test]
+    fn never_checks_a_family_that_is_not_installed() {
+        // A missing family resolves to gpui's fallback stack, which says nothing about its bold.
+        let installed = names(&["Ubuntu", "Liberation Sans"]);
+        let checked = std::cell::RefCell::new(Vec::new());
+        let found = bold_capable_family("Ubuntu", STATIC_UI_FONTS, &installed, |f| {
+            checked.borrow_mut().push(f.to_string());
+            static_bold(f)
+        });
+        assert_eq!(found, Some("Liberation Sans"));
+        assert_eq!(*checked.borrow(), ["Ubuntu", "Liberation Sans"]);
+    }
 }
