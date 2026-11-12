@@ -91,17 +91,15 @@ impl KubeMcp {
         // refuses a pod that has several. The containers left aside are named.
         let (mut read, mut others) = (Vec::new(), Vec::new());
         for pod in allowed.iter().take(MAX_PODS) {
-            let container = match &p.container {
-                Some(c) => Some(c.clone()),
-                None => {
-                    let value = pods
-                        .iter()
-                        .find(|v| v.pointer("/metadata/name").and_then(|n| n.as_str()) == Some(pod.as_str()));
-                    let c = value.map(log_containers).unwrap_or_default();
-                    add_new(&mut read, c.read.iter().cloned());
-                    add_new(&mut others, c.others);
-                    c.read
-                }
+            let container = if let Some(c) = &p.container {
+                Some(c.clone())
+            } else {
+                let value =
+                    pods.iter().find(|v| v.pointer("/metadata/name").and_then(|n| n.as_str()) == Some(pod.as_str()));
+                let c = value.map(log_containers).unwrap_or_default();
+                add_new(&mut read, c.read.iter().cloned());
+                add_new(&mut others, c.others);
+                c.read
             };
             let lp = kube::api::LogParams {
                 container,
@@ -226,7 +224,7 @@ mod tests {
 
     #[test]
     fn with_no_container_named_the_default_one_is_read() {
-        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        let s = |v: &[&str]| v.iter().map(ToString::to_string).collect::<Vec<_>>();
         // The first container, not the sidecar the API server lists first.
         assert_eq!(
             log_containers(&multi(None)),
@@ -247,7 +245,7 @@ mod tests {
 
     #[test]
     fn the_note_names_what_was_read_and_what_was_not() {
-        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        let s = |v: &[&str]| v.iter().map(ToString::to_string).collect::<Vec<_>>();
         let note = containers_note(&s(&["app"]), &s(&["helper", "proxy"])).unwrap();
         assert!(note.contains("container app (the default)") && note.contains("not of helper, proxy:"), "{note}");
         // Pods of a workload that default to different containers: one read in some pod is not listed as unread.
