@@ -279,9 +279,129 @@ pub(crate) fn condition_tone(ty: &str, status: &str) -> Option<Tone> {
     }
 }
 
+/// The tone a page shows a condition in: `condition_tone`, but a problem the object reports
+/// about itself (True where True is bad: `ScalingLimited`, `Degraded`) in the warning color,
+/// busy. Red is kept for what should be true and is not (Ready False).
+pub(crate) fn condition_shown_tone(ty: &str, status: &str) -> Option<Tone> {
+    match condition_tone(ty, status) {
+        Some(Tone::Bad) if status == "True" => Some(Tone::Busy),
+        tone => tone,
+    }
+}
+
+/// The state of any object from its own status: the worst of its conditions as a page shows
+/// them (`condition_shown_tone`), its `status.phase` and an Argo CD-style
+/// `status.health.status`. None when none of them says anything.
+pub(crate) fn object_tone(obj: &serde_json::Value) -> Option<Tone> {
+    let conditions = obj.pointer("/status/conditions").and_then(serde_json::Value::as_array).into_iter().flatten();
+    let conditions = conditions.filter_map(|c| {
+        let ty = c.get("type")?.as_str()?;
+        condition_shown_tone(ty, c.get("status").and_then(serde_json::Value::as_str).unwrap_or_default())
+    });
+    let words = ["/status/phase", "/status/health/status"]
+        .into_iter()
+        .filter_map(|p| obj.pointer(p)?.as_str())
+        .filter_map(tone);
+    conditions.chain(words).max()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Tone, condition_tone, node_condition_bad, node_tone, tone, words};
+    use super::{
+        Tone, condition_shown_tone, condition_tone, node_condition_bad, node_tone, object_tone, tone, true_is_good,
+        words,
+    };
+    use proptest::prelude::*;
+    use serde_json::json;
+
+    #[test]
+    fn object_tones() {
+        let cases = [
+            // An ExternalSecret that cannot sync.
+            (
+                json!({"status": {"conditions": [
+                    {"type": "Ready", "status": "False", "reason": "SecretSyncedError"}]}}),
+                Some(Tone::Bad),
+            ),
+            (json!({"status": {"conditions": [{"type": "Ready", "status": "True"}]}}), Some(Tone::Good)),
+            // A Deployment past its deadline.
+            (
+                json!({"status": {"conditions": [
+                    {"type": "Available", "status": "True"},
+                    {"type": "Progressing", "status": "False", "reason": "ProgressDeadlineExceeded"}]}}),
+                Some(Tone::Bad),
+            ),
+            // A problem the object reports about itself: a warning, as its condition's line says.
+            (
+                json!({"status": {"conditions": [
+                    {"type": "AbleToScale", "status": "True"},
+                    {"type": "ScalingActive", "status": "True"},
+                    {"type": "ScalingLimited", "status": "True", "reason": "TooFewReplicas"}]}}),
+                Some(Tone::Busy),
+            ),
+            (json!({"status": {"conditions": [{"type": "Degraded", "status": "False"}]}}), Some(Tone::Good)),
+            (json!({"status": {"phase": "Bound"}}), Some(Tone::Good)),
+            (json!({"status": {"phase": "Lost"}}), Some(Tone::Bad)),
+            (
+                json!({"status": {"phase": "Active", "conditions": [{"type": "Ready", "status": "True"}]}}),
+                Some(Tone::Good),
+            ),
+            (json!({"status": {"health": {"status": "Degraded"}, "sync": {"status": "Synced"}}}), Some(Tone::Bad)),
+            (json!({"status": {"health": {"status": "Progressing"}}}), Some(Tone::Busy)),
+            // Nothing that says: no tone, the page draws it green.
+            (json!({"spec": {}}), None),
+            (json!({"status": {"conditions": [{"type": "Lorem", "status": "False"}]}}), None),
+            (json!({"status": {"conditions": [{"status": "False"}], "phase": 3}}), None),
+        ];
+        for (obj, want) in cases {
+            assert_eq!(object_tone(&obj), want, "{obj}");
+        }
+    }
+
+    proptest! {
+        /// The object's tone is never better than any of its conditions as shown, its phase
+        /// or its health, and is none only when none of them says anything: a condition
+        /// that should be True and is False makes it red, whatever else it says.
+        #[test]
+        fn object_tone_is_the_worst(
+            conds in prop::collection::vec(
+                (
+                    prop::sample::select(vec!["Ready", "Available", "Synced", "Degraded", "ScalingLimited",
+                        "Reconciling", "Lorem", "Stalled", "Progressing"]),
+                    prop::sample::select(vec!["True", "False", "Unknown", ""]),
+                ),
+                0..6,
+            ),
+            phase in prop::option::of(prop::sample::select(vec!["Running", "Pending", "Failed", "Active", "Lorem"])),
+            health in prop::option::of(prop::sample::select(vec!["Healthy", "Degraded", "Missing", "Suspended"])),
+        ) {
+            let mut status = json!({
+                "conditions": conds.iter().map(|(t, s)| json!({"type": t, "status": s})).collect::<Vec<_>>(),
+            });
+            if let Some(p) = phase {
+                status["phase"] = json!(p);
+            }
+            if let Some(h) = health {
+                status["health"] = json!({"status": h});
+            }
+            let got = object_tone(&json!({"status": status}));
+            for (t, s) in &conds {
+                prop_assert!(got >= condition_shown_tone(t, s), "{}={}: {:?}", t, s, got);
+                if true_is_good(t) && *s == "False" {
+                    prop_assert_eq!(got, Some(Tone::Bad));
+                }
+            }
+            for word in phase.into_iter().chain(health) {
+                prop_assert!(got >= tone(word), "{}: {:?}", word, got);
+            }
+            let says = conds
+                .iter()
+                .map(|(t, s)| condition_shown_tone(t, s))
+                .chain(phase.into_iter().chain(health).map(tone))
+                .any(|t| t.is_some());
+            prop_assert_eq!(got.is_some(), says);
+        }
+    }
 
     #[test]
     fn condition_tones() {

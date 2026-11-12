@@ -613,15 +613,11 @@ fn diagnosis(ctx: &Ctx, cx: &App) -> Option<Div> {
     )
 }
 
-/// A condition's status color: good, bad or unknown by its polarity (`status::condition_tone`),
-/// a problem the object reports about itself (True when True is bad) in the warning color.
+/// A condition's status color: good, bad or unknown by its polarity, a problem the object
+/// reports about itself (True when True is bad) in the warning color
+/// (`status::condition_shown_tone`, which the dot before the page's age follows too).
 fn condition_color(ty: &str, status: &str, cx: &App) -> Hsla {
-    use crate::status::Tone;
-    match crate::status::condition_tone(ty, status) {
-        Some(Tone::Bad) if status == "True" => Tone::Busy.color(cx),
-        Some(tone) => tone.color(cx),
-        None => cx.theme().muted_foreground,
-    }
+    crate::status::condition_shown_tone(ty, status).map_or(cx.theme().muted_foreground, |tone| tone.color(cx))
 }
 
 fn conditions(obj: &Value, cx: &App) -> AnyElement {
