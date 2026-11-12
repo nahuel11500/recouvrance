@@ -410,7 +410,7 @@ impl KubeMcp {
         self.authorize_list(&mut call, &access, p.namespace.is_none()).await?;
         let usage = match k8s::pod_usage(client, p.namespace.clone(), None).await {
             Ok((u, _)) => u,
-            Err(e) => return call.finish(Err(e)),
+            Err(e) => return call.finish(Err(k8s::explain_metrics_error(e, "pod metrics"))),
         };
         let mut rows: Vec<(String, String, f64, f64)> = usage
             .into_iter()

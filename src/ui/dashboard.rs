@@ -448,12 +448,11 @@ async fn pod_details(client: &Client, ns: Option<&str>, context: &str) -> Result
     Ok((restarts, hot, usage_error))
 }
 
-/// Why limits were not checked: metrics-server missing, refused or failing.
+/// Why limits were not checked: metrics-server missing, unavailable, refused or failing.
 fn unchecked_why(e: &anyhow::Error) -> String {
-    if k8s::is_not_found(e) {
-        "limits not checked: no metrics-server".into()
-    } else {
-        format!("limits not checked: usage {}", k8s::lists::load_error(e))
+    match k8s::api_status(e) {
+        Some(404 | 503) => format!("limits not checked: {}", k8s::metrics_error(e)),
+        _ => format!("limits not checked: usage {}", k8s::lists::load_error(e)),
     }
 }
 
