@@ -313,7 +313,8 @@ impl KubeMcp {
             return DriftRead { note: Some(note), ..Default::default() };
         };
         let mut read = DriftRead { context: Some(on.clone()), ..Default::default() };
-        if d.to_compare.is_empty() {
+        let targets = d.to_read();
+        if targets.is_empty() {
             return read;
         }
         let (client, kinds) = match self.hub.client(on).await {
@@ -328,8 +329,7 @@ impl KubeMcp {
             let ns = (!res.namespace.is_empty()).then(|| res.namespace.clone());
             super::visible(&policy, &approved, &access_for(kind, &context, Verb::Get, ns, Some(res.name.clone())))
         });
-        read.drifts =
-            diagnosis::read_drift(client, on.clone(), Some(kinds), d.to_compare.clone(), d.since, may_read).await;
+        read.drifts = diagnosis::read_drift(client, on.clone(), Some(kinds), targets, d.since, may_read).await;
         read
     }
 
