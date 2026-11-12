@@ -75,8 +75,11 @@ impl KubeMcp {
     }
 }
 
+/// The object without the server's noise, its keys sorted (the live object and the dry
+/// run's can come in another order).
 fn without_noise(v: &Value) -> Value {
     let mut v = v.clone();
+    v.sort_all_objects();
     for path in NOISE {
         if let Some((parent, key)) = path.rsplit_once('/')
             && let Some(obj) =
@@ -108,6 +111,9 @@ mod tests {
     fn noise_goes_and_changes_show() {
         let v = json!({"metadata": {"name": "a", "resourceVersion": "9", "managedFields": []}, "status": {}, "data": {"k": "v"}});
         assert_eq!(without_noise(&v), json!({"metadata": {"name": "a"}, "data": {"k": "v"}}));
+        let reordered = json!({"data": {"k": "v"}, "metadata": {"resourceVersion": "9", "name": "a"}});
+        let text = |v: &serde_json::Value| crate::k8s::to_yaml(&without_noise(v), false, false).unwrap();
+        assert_eq!(text(&v), text(&reordered));
         assert_eq!(unified("ConfigMap a", "x: 1\n", "x: 1\n", false), "ConfigMap a: no change");
         let d = unified("ConfigMap a", "x: 1\n", "x: 2\n", false);
         assert!(d.contains("-x: 1") && d.contains("+x: 2"), "{d}");
