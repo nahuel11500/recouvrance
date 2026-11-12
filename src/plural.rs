@@ -45,7 +45,8 @@ mod tests {
         fn the_noun_is_singular_exactly_when_the_count_is_one(n in any::<i64>()) {
             let text = count(n, "pod");
             prop_assert_eq!(text.ends_with("pods"), n != 1);
-            prop_assert!(text.starts_with(&format!("{n} ")));
+            let start = format!("{n} ");
+            prop_assert!(text.starts_with(&start));
         }
     }
 }

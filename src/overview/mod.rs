@@ -686,7 +686,7 @@ fn flatten(prefix: &str, v: &Value, depth: usize, out: &mut Vec<(String, String)
             }
         }
         Value::Object(map) => {
-            out.push((prefix.to_string(), format!("{} (see YAML)", crate::plural::count(map.len(), "field"))))
+            out.push((prefix.to_string(), format!("{} (see YAML)", crate::plural::count(map.len(), "field"))));
         }
         Value::String(s) => out.push((prefix.to_string(), s.clone())),
         Value::Null => {}
