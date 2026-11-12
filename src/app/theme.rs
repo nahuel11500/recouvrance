@@ -249,7 +249,8 @@ pub fn initial_theme(cx: &mut App) -> ThemeMode {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    // Not `super::*`: gpui's `test` macro, glob-imported there, would shadow the built-in one.
+    use super::{STATIC_UI_FONTS, bold_capable_family};
 
     fn names(names: &[&str]) -> Vec<String> {
         names.iter().map(|n| n.to_string()).collect()
