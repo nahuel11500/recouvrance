@@ -289,10 +289,10 @@ pub fn pod_counts(pod: &serde_json::Value) -> PodCounts {
     }
 }
 
-/// The container kubectl execs into when none is named: the one the
+/// The container kubectl execs into (or reads the logs of) when none is named: the one the
 /// `kubectl.kubernetes.io/default-container` annotation names when the pod has it, else the
-/// first of `spec.containers`. The API server refuses an exec with no container in a pod
-/// that has several.
+/// first of `spec.containers`. The API server refuses an exec or a logs call with no container
+/// in a pod that has several.
 pub fn default_container(pod: &serde_json::Value) -> Option<String> {
     pod_containers(pod).into_iter().next()
 }

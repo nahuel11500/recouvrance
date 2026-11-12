@@ -657,7 +657,9 @@ pub struct LogsParams {
     pub context: String,
     pub namespace: String,
     pub pod: String,
-    #[schemars(description = "container name; defaults to the pod's first container")]
+    #[schemars(
+        description = "container name; defaults to the pod's default container (its `kubectl.kubernetes.io/default-container` annotation, else its first), as kubectl does"
+    )]
     pub container: Option<String>,
     #[schemars(description = "number of most recent lines (capped by policy)")]
     pub tail_lines: Option<u32>,

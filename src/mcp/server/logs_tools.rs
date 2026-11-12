@@ -19,7 +19,9 @@ pub struct WorkloadLogsParams {
     pub kind: String,
     pub namespace: String,
     pub name: String,
-    #[schemars(description = "container name; defaults to each pod's first container")]
+    #[schemars(
+        description = "container name; defaults to each pod's default container (its `kubectl.kubernetes.io/default-container` annotation, else its first), as kubectl does"
+    )]
     pub container: Option<String>,
     #[schemars(description = "most recent lines per pod (default 100, capped by policy)")]
     pub tail_lines: Option<u32>,
@@ -85,9 +87,22 @@ impl KubeMcp {
         });
         let tail = i64::from(p.tail_lines.unwrap_or(100).min(call.policy().max_log_lines));
         let mut texts = Vec::new();
+        // With no container named, each pod's default one, as kubectl picks it: the API server
+        // refuses a pod that has several. The containers left aside are named.
+        let (mut read, mut others) = (Vec::new(), Vec::new());
         for pod in allowed.iter().take(MAX_PODS) {
+            let container = if let Some(c) = &p.container {
+                Some(c.clone())
+            } else {
+                let value =
+                    pods.iter().find(|v| v.pointer("/metadata/name").and_then(|n| n.as_str()) == Some(pod.as_str()));
+                let c = value.map(log_containers).unwrap_or_default();
+                add_new(&mut read, c.read.iter().cloned());
+                add_new(&mut others, c.others);
+                c.read
+            };
             let lp = kube::api::LogParams {
-                container: p.container.clone(),
+                container,
                 tail_lines: Some(tail),
                 since_seconds: p.since_seconds,
                 timestamps: true,
@@ -106,7 +121,7 @@ impl KubeMcp {
             ));
         }
         let mut out = merge_logs(&texts, p.grep.as_deref());
-        let mut notes = Vec::new();
+        let mut notes: Vec<String> = containers_note(&read, &others).into_iter().collect();
         if allowed.len() > MAX_PODS {
             notes.push(format!("{} of {} pods read (the newest)", MAX_PODS, allowed.len()));
         }
@@ -117,6 +132,45 @@ impl KubeMcp {
             out = format!("[{}]\n{out}", notes.join("; "));
         }
         call.finish(Ok(out))
+    }
+}
+
+/// The containers of a pod whose logs are read when none is named: its default one, as
+/// kubectl picks it (`k8s::default_container`), and the others it has, init containers
+/// (native sidecars) included, to name in a note.
+#[derive(Debug, Default, PartialEq)]
+pub(super) struct LogContainers {
+    pub read: Option<String>,
+    pub others: Vec<String>,
+}
+
+pub(super) fn log_containers(pod: &serde_json::Value) -> LogContainers {
+    // Every container, default first: sidecars, init and debug ones included.
+    let mut others = k8s::pod_containers(pod);
+    let read = (!others.is_empty()).then(|| others.remove(0));
+    LogContainers { read, others }
+}
+
+/// What an agent is told when logs were read from the default container of pods that have
+/// others: which one was read, and that `container` reads another.
+pub(super) fn containers_note(read: &[String], others: &[String]) -> Option<String> {
+    let others: Vec<&str> = others.iter().filter(|o| !read.contains(*o)).map(String::as_str).collect();
+    if read.is_empty() || others.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "logs of container {} (the default), not of {}: pass `container` to read one",
+        read.join(", "),
+        others.join(", ")
+    ))
+}
+
+/// `items` added to `to`, each once, in order.
+fn add_new(to: &mut Vec<String>, items: impl IntoIterator<Item = String>) {
+    for item in items {
+        if !to.contains(&item) {
+            to.push(item);
+        }
     }
 }
 
@@ -147,7 +201,56 @@ fn merge_logs(texts: &[(String, String)], grep: Option<&str>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::merge_logs;
+    use serde_json::json;
+
+    use super::{LogContainers, containers_note, log_containers, merge_logs};
+
+    /// A pod with `app` and `helper`, and a native sidecar `proxy` (listed first by the API
+    /// server when it refuses a call with no container).
+    fn multi(annotation: Option<&str>) -> serde_json::Value {
+        let mut pod = json!({
+            "metadata": {"name": "multi-1"},
+            "spec": {
+                "initContainers": [{"name": "proxy", "restartPolicy": "Always"}],
+                "containers": [{"name": "app"}, {"name": "helper"}],
+            },
+        });
+        if let Some(a) = annotation {
+            pod["metadata"]["annotations"] = json!({"kubectl.kubernetes.io/default-container": a});
+        }
+        pod
+    }
+
+    #[test]
+    fn with_no_container_named_the_default_one_is_read() {
+        let s = |v: &[&str]| v.iter().map(ToString::to_string).collect::<Vec<_>>();
+        // The first container, not the sidecar the API server lists first.
+        assert_eq!(
+            log_containers(&multi(None)),
+            LogContainers { read: Some("app".into()), others: s(&["helper", "proxy"]) }
+        );
+        // The annotation's container when the pod has it.
+        assert_eq!(
+            log_containers(&multi(Some("helper"))),
+            LogContainers { read: Some("helper".into()), others: s(&["app", "proxy"]) }
+        );
+        assert_eq!(log_containers(&multi(Some("gone"))).read.as_deref(), Some("app"));
+        // A pod with one container: no others, no note.
+        let single = json!({"spec": {"containers": [{"name": "web"}]}});
+        let c = log_containers(&single);
+        assert_eq!(c, LogContainers { read: Some("web".into()), others: vec![] });
+        assert_eq!(containers_note(&s(&["web"]), &c.others), None);
+    }
+
+    #[test]
+    fn the_note_names_what_was_read_and_what_was_not() {
+        let s = |v: &[&str]| v.iter().map(ToString::to_string).collect::<Vec<_>>();
+        let note = containers_note(&s(&["app"]), &s(&["helper", "proxy"])).unwrap();
+        assert!(note.contains("container app (the default)") && note.contains("not of helper, proxy:"), "{note}");
+        // Pods of a workload that default to different containers: one read in some pod is not listed as unread.
+        let note = containers_note(&s(&["app", "helper"]), &s(&["helper", "app", "proxy"])).unwrap();
+        assert!(note.contains("not of proxy:"), "{note}");
+    }
 
     #[test]
     fn pods_lines_interleave_by_time() {

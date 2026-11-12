@@ -6,6 +6,7 @@ use rmcp::handler::server::wrapper::Parameters;
 use rmcp::{tool, tool_router};
 use serde_json::json;
 
+use super::logs_tools::{containers_note, log_containers};
 use super::{
     CertParams, ContextParam, EventsParams, HistoryParams, KubeMcp, ListParams, LogsParams, MAX_LOG_BYTES,
     ObjectParams, ProblemsParams, ReachParams, SearchParams, TopParams, access_for, describe, format_table, get_named,
@@ -399,7 +400,7 @@ impl KubeMcp {
         self.authorize_list(&mut call, &access, p.namespace.is_none()).await?;
         let usage = match k8s::pod_usage(client, p.namespace.clone(), None).await {
             Ok((u, _)) => u,
-            Err(e) => return call.finish(Err(e)),
+            Err(e) => return call.finish(Err(k8s::explain_metrics_error(e, "pod metrics"))),
         };
         let mut rows: Vec<(String, String, f64, f64)> = usage
             .into_iter()
@@ -492,7 +493,7 @@ impl KubeMcp {
     }
 
     #[tool(
-        description = "Read a pod's container logs (most recent lines, at most 1 MiB), like `kubectl logs --tail`.",
+        description = "Read a pod's container logs (most recent lines, at most 1 MiB), like `kubectl logs --tail`. With no container named, the pod's default one, as kubectl picks it; the others are named in a note.",
         annotations(read_only_hint = true)
     )]
     async fn get_logs(
@@ -506,8 +507,22 @@ impl KubeMcp {
         let (client, kind) = self.kind(&call, &p.context, "pods").await?;
         let access = access_for(&kind, &p.context, Verb::Logs, Some(p.namespace.clone()), Some(p.pod.clone()));
         self.authorize(&mut call, &access).await?;
+        // With no container named, the pod's default one, as kubectl picks it: the API server
+        // refuses a pod that has several. When the pod can't be read, none is named and the
+        // logs call says why.
+        let (container, note) = match p.container {
+            Some(c) => (Some(c), None),
+            None => match get_named(&client, &kind, Some(&p.namespace), &p.pod, false).await {
+                Ok(pod) => {
+                    let c = log_containers(&pod);
+                    let note = containers_note(c.read.as_slice(), &c.others);
+                    (c.read, note)
+                }
+                Err(_) => (None, None),
+            },
+        };
         let lp = kube::api::LogParams {
-            container: p.container,
+            container,
             tail_lines: Some(i64::from(p.tail_lines.unwrap_or(200).min(call.policy().max_log_lines))),
             since_seconds: p.since_seconds,
             previous: p.previous.unwrap_or(false),
@@ -521,12 +536,18 @@ impl KubeMcp {
             Ok(api.logs(&pod, &lp).await?)
         })
         .await;
-        call.finish(result.map(|text| match &p.grep {
-            Some(g) => {
-                let g = g.to_lowercase();
-                text.lines().filter(|l| l.to_lowercase().contains(&g)).collect::<Vec<_>>().join("\n")
+        call.finish(result.map(|text| {
+            let text = match &p.grep {
+                Some(g) => {
+                    let g = g.to_lowercase();
+                    text.lines().filter(|l| l.to_lowercase().contains(&g)).collect::<Vec<_>>().join("\n")
+                }
+                None => text,
+            };
+            match note {
+                Some(note) => format!("[{note}]\n{text}"),
+                None => text,
             }
-            None => text,
         }))
     }
 
@@ -873,11 +894,43 @@ fn usage_table(
     format_table(&["", "MIN", "AVG", "P95", "MAX", "LAST", columns[0], columns[1]], &[cpu_row, mem_row])
 }
 
+/// One line a container of `pod` (sidecars, init and debug containers too, as the pod page
+/// lists them): what it is, its state, whether it is ready and its restarts.
+fn container_lines(pod: &serde_json::Value) -> String {
+    let mut out = String::new();
+    for c in k8s::spec_containers(&pod["spec"]) {
+        let what = match c.kind {
+            k8s::ContainerKind::Main => "Container",
+            k8s::ContainerKind::Sidecar => "Sidecar container",
+            k8s::ContainerKind::Init => "Init container",
+            k8s::ContainerKind::Ephemeral => "Ephemeral container",
+        };
+        let Some(st) = c.status(pod) else {
+            out.push_str(&format!("{what} {}: no status yet\n", c.name));
+            continue;
+        };
+        let state = st["state"].as_object().and_then(|m| m.keys().next().cloned()).unwrap_or_default();
+        let reason = st.pointer(&format!("/state/{state}/reason")).and_then(|v| v.as_str());
+        let last = st
+            .pointer("/lastState/terminated")
+            .map(|t| format!(", last terminated: {} (exit {})", t["reason"].as_str().unwrap_or("?"), t["exitCode"]))
+            .unwrap_or_default();
+        out.push_str(&format!(
+            "{what} {}: {state}{}, ready={}, restarts={}{last}\n",
+            c.name,
+            reason.map(|r| format!(" {r}")).unwrap_or_default(),
+            st["ready"],
+            st["restartCount"]
+        ));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
 
-    use super::{Measured, measured};
+    use super::{Measured, container_lines, measured};
     use crate::k8s::Kind;
 
     fn kind(group: &str, kind: &str, plural: &str, namespaced: bool) -> Kind {
@@ -926,43 +979,6 @@ mod tests {
         let err = measured(&kind("", "Service", "services", true), &json!({"spec": {}})).unwrap_err();
         assert!(err.contains("Service selects no pods"), "{err}");
     }
-}
-
-/// One line a container of `pod` (sidecars, init and debug containers too, as the pod page
-/// lists them): what it is, its state, whether it is ready and its restarts.
-fn container_lines(pod: &serde_json::Value) -> String {
-    let mut out = String::new();
-    for c in k8s::spec_containers(&pod["spec"]) {
-        let what = match c.kind {
-            k8s::ContainerKind::Main => "Container",
-            k8s::ContainerKind::Sidecar => "Sidecar container",
-            k8s::ContainerKind::Init => "Init container",
-            k8s::ContainerKind::Ephemeral => "Ephemeral container",
-        };
-        let Some(st) = c.status(pod) else {
-            out.push_str(&format!("{what} {}: no status yet\n", c.name));
-            continue;
-        };
-        let state = st["state"].as_object().and_then(|m| m.keys().next().cloned()).unwrap_or_default();
-        let reason = st.pointer(&format!("/state/{state}/reason")).and_then(|v| v.as_str());
-        let last = st
-            .pointer("/lastState/terminated")
-            .map(|t| format!(", last terminated: {} (exit {})", t["reason"].as_str().unwrap_or("?"), t["exitCode"]))
-            .unwrap_or_default();
-        out.push_str(&format!(
-            "{what} {}: {state}{}, ready={}, restarts={}{last}\n",
-            c.name,
-            reason.map(|r| format!(" {r}")).unwrap_or_default(),
-            st["ready"],
-            st["restartCount"]
-        ));
-    }
-    out
-}
-
-#[cfg(test)]
-mod tests {
-    use serde_json::json;
 
     #[test]
     fn a_pod_s_description_has_every_container() {
@@ -986,7 +1002,7 @@ mod tests {
             },
         });
         assert_eq!(
-            super::container_lines(&pod),
+            container_lines(&pod),
             "Container app: running, ready=true, restarts=0\n\
              Container helper: waiting CrashLoopBackOff, ready=false, restarts=3, last terminated: Error (exit 1)\n\
              Init container migrate: terminated Completed, ready=false, restarts=0\n\

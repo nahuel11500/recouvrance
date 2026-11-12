@@ -289,8 +289,9 @@ fn a_write_runs_as_the_identity_chosen_for_it_only() {
     });
 }
 
-/// A shell in a container answers what is typed, and says when it ends; an attach shows
-/// the container's own output. (The terminal view only draws what these sessions send.)
+/// A shell in a container answers what is typed, says when it ends, and is hung up when
+/// closed; an attach shows the container's own output. (The terminal view only draws what
+/// these sessions send.)
 #[test]
 #[ignore = "needs a kind cluster: RECOUVRANCE_E2E_CONTEXT"]
 fn shells_and_attach_reach_the_container() {
@@ -359,9 +360,41 @@ fn shells_and_attach_reach_the_container() {
             let mut attached = k8s::attach_container(client.clone(), NS.into(), name.into(), None);
             let text = read_until(&mut attached, "output only").await;
             assert!(text.contains("Attached to the container's main process"), "{text}");
+            drop(attached);
+
+            // Closing a shell ends it, with what runs in it, even once write mode is off: the
+            // runtime only detaches a tty session whose connection is dropped.
+            gate::set_ui_writes(true);
+            let mut shell = k8s::exec_shell(k8s::connect(context()).await?, NS.into(), name.into(), None);
+            let _ = shell.input.unbounded_send(ExecInput::Resize { cols: 80, rows: 24 });
+            let _ = shell.input.unbounded_send(ExecInput::Bytes(b"echo $((40+2))-sleeping; sleep 4321\n".to_vec()));
+            let text = read_until(&mut shell, "42-sleeping").await;
+            gate::set_ui_writes(false);
+            assert!(text.contains("42-sleeping"), "{text}");
+            drop(shell);
+            // The shell (`sh`: busybox has no bash) and its `sleep`, as `ps` lists them.
+            let left = |ps: &str| {
+                ps.lines()
+                    .filter(|l| {
+                        let command: Vec<&str> = l.split_whitespace().skip(3).collect();
+                        command == ["sh"] || command == ["sleep", "4321"]
+                    })
+                    .count()
+            };
+            let mut ps = String::new();
+            for _ in 0..30 {
+                ps = k8s::exec_capture(client.clone(), NS.into(), name.into(), None, vec!["ps".into()], 30, 1 << 16)
+                    .await?;
+                if left(&ps) == 0 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+            assert_eq!(left(&ps), 0, "the closed shell is still running:\n{ps}");
             Ok(())
         };
         let result: Result<()> = checked.await;
+        gate::set_ui_writes(false);
         pods.delete(name, &DeleteParams::default().grace_period(0)).await?;
         result
     });
@@ -639,7 +672,8 @@ fn an_agent_reads_helm_releases_by_its_secret_rules() {
 }
 
 /// A Deployment's logs come from all its pods, merged; pods whose logs the rules deny are
-/// left out and counted.
+/// left out and counted. With no container named, each pod's default one is read (the API
+/// server refuses a pod with several), and the others are named.
 #[test]
 #[ignore = "needs a kind cluster: RECOUVRANCE_E2E_CONTEXT"]
 fn an_agent_reads_a_workload_s_logs() {
@@ -658,7 +692,8 @@ fn an_agent_reads_a_workload_s_logs() {
             "spec": {"replicas": 2, "selector": {"matchLabels": {"app": name}}, "template": {
                 "metadata": {"labels": {"app": name}},
                 "spec": {"terminationGracePeriodSeconds": 0, "containers": [{"name": "main", "image": "busybox:1.37",
-                    "command": ["sh", "-c", "while true; do echo tick-$HOSTNAME; sleep 1; done"]}]},
+                    "command": ["sh", "-c", "while true; do echo tick-$HOSTNAME; sleep 1; done"]},
+                    {"name": "helper", "image": "busybox:1.37", "command": ["sleep", "3600"]}]},
             }},
         });
         deps.create(&PostParams::default(), &serde_json::from_value(dep)?).await?;
@@ -682,8 +717,14 @@ fn an_agent_reads_a_workload_s_logs() {
             let mcp = crate::assistant::Mcp::connect(hub.port(), token).await?;
             let args = json!({"context": ctx, "kind": "deployments", "namespace": NS, "name": name, "grep": "tick"});
             let out = mcp.call("workload_logs", args.clone()).await;
-            let prefixes: std::collections::HashSet<&str> = out.lines().filter_map(|l| l.split(']').next()).collect();
+            let ticks = out.lines().filter(|l| l.contains("tick-"));
+            let prefixes: std::collections::HashSet<&str> = ticks.filter_map(|l| l.split(']').next()).collect();
             assert_eq!(prefixes.len(), 2, "{out}");
+            assert!(out.contains("logs of container main (the default), not of helper"), "{out}");
+            let pod = pods.list(&kube::api::ListParams::default().labels(&format!("app={name}"))).await?.items;
+            let pod = pod.first().and_then(|p| p.metadata.name.clone()).unwrap_or_default();
+            let one = mcp.call("get_logs", json!({"context": ctx, "namespace": NS, "pod": pod, "grep": "tick"})).await;
+            assert!(one.contains(&format!("tick-{pod}")) && one.contains("not of helper"), "{one}");
 
             let deny = rules_file::parse_rule(Mode::Deny, "logs pods/e2e-logs-* -n default")?;
             hub.update_agent(&agent.id, |a| a.policy.rules.push(deny))?;

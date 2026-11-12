@@ -71,6 +71,29 @@ pub async fn pod_usage(
     .await
 }
 
+/// Why metrics-server could not be read, for a page or a tool to say: "no metrics-server"
+/// (no metrics API), "metrics-server unavailable" (its APIService answers 503: not running
+/// or not ready), "forbidden" or "failed: …".
+pub fn metrics_error(e: &anyhow::Error) -> String {
+    match super::api_status(e) {
+        Some(404) => "no metrics-server".into(),
+        Some(503) => "metrics-server unavailable".into(),
+        _ => lists::load_error(e),
+    }
+}
+
+/// The same for an agent, as an error: what is missing or down, not "404 page not found"
+/// or "service unavailable". `what` is what could not be read ("node metrics").
+pub fn explain_metrics_error(e: anyhow::Error, what: &str) -> anyhow::Error {
+    match super::api_status(&e) {
+        Some(404) => anyhow::anyhow!("no {what}: metrics-server is not installed in this cluster"),
+        Some(503) => anyhow::anyhow!(
+            "no {what}: metrics-server is unavailable (the metrics.k8s.io APIService answers 503: not running or not ready)"
+        ),
+        _ => e,
+    }
+}
+
 /// After a failed poll: wait (doubling up to 5 minutes), then try again.
 async fn retry_wait(failures: &mut u32) {
     *failures = failures.saturating_add(1);
@@ -390,7 +413,18 @@ pub fn pods_allocated(pods: &[serde_json::Value], resource: &str) -> (f64, f64) 
 
 #[cfg(test)]
 mod pod_metrics_tests {
-    use super::{parse_pod_metrics, pod_metrics_path, pod_total};
+    use super::{metrics_error, parse_pod_metrics, pod_metrics_path, pod_total};
+
+    #[test]
+    fn says_why_metrics_server_could_not_be_read() {
+        let refused = |code: u16| -> anyhow::Error {
+            kube::Error::Api(kube::core::Status::failure("refused", "Refused").with_code(code).boxed()).into()
+        };
+        assert_eq!(metrics_error(&refused(404)), "no metrics-server");
+        // Its APIService down (metrics-server scaled to 0, not ready).
+        assert_eq!(metrics_error(&refused(503)), "metrics-server unavailable");
+        assert_eq!(metrics_error(&refused(403)), "forbidden");
+    }
 
     #[test]
     fn reads_every_container_of_every_pod() {
