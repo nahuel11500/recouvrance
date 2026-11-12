@@ -181,12 +181,19 @@ pub(super) fn comparable_yaml(v: &serde_json::Value, mask: bool) -> String {
             a.remove("kubectl.kubernetes.io/last-applied-configuration");
             a.remove("deployment.kubernetes.io/revision");
         }
+        // No annotations (or none left) reads the same as an empty map.
+        for k in ["annotations", "labels"] {
+            if m.get(k).and_then(serde_json::Value::as_object).is_some_and(serde_json::Map::is_empty) {
+                m.remove(k);
+            }
+        }
     }
     if let Some(o) = v.as_object_mut() {
         o.remove("status");
     }
     crate::history::drop_nulls(&mut v);
-    crate::yaml::to_string(&v).unwrap_or_default()
+    // Keys sorted: the two copies' keys can come in another order.
+    crate::history::diff_text(&v)
 }
 
 /// A diff as the Compare and History tabs show it: removed lines in red, added ones in
@@ -221,7 +228,70 @@ pub(crate) fn diff_block(lines: &[DiffLine], cx: &App) -> AnyElement {
 
 #[cfg(test)]
 mod tests {
-    use serde_json::json;
+    use proptest::prelude::*;
+    use serde_json::{Value, json};
+
+    use crate::json::reordered;
+
+    fn json_value() -> impl Strategy<Value = Value> {
+        let leaf = prop_oneof![
+            Just(Value::Null),
+            any::<bool>().prop_map(Value::Bool),
+            (0..5i64).prop_map(|n| json!(n)),
+            "[ab]{0,2}".prop_map(Value::String),
+        ];
+        leaf.prop_recursive(4, 32, 6, |inner| {
+            prop_oneof![
+                prop::collection::vec(inner.clone(), 0..4).prop_map(Value::Array),
+                prop::collection::btree_map("[a-z]{1,3}", inner, 0..6)
+                    .prop_map(|m| Value::Object(m.into_iter().collect())),
+            ]
+        })
+    }
+
+    /// An object with the fields Compare strips or keeps, each set or not.
+    fn object() -> impl Strategy<Value = Value> {
+        let map = || prop::collection::btree_map("[a-z./-]{1,8}", "[a-z0-9]{0,3}", 0..4);
+        (
+            prop::option::of(map()),
+            prop::option::of(map()),
+            "[a-z]{1,5}",
+            json_value(),
+            json_value(),
+            any::<bool>(),
+        )
+            .prop_map(|(labels, annotations, name, spec, status, revision)| {
+                let mut metadata = json!({"name": name, "namespace": "kube-system", "uid": "u", "resourceVersion": "1"});
+                if let Some(l) = labels {
+                    metadata["labels"] = json!(l);
+                }
+                if let Some(mut a) = annotations {
+                    if revision {
+                        a.insert("deployment.kubernetes.io/revision".into(), "3".into());
+                    }
+                    metadata["annotations"] = json!(a);
+                }
+                json!({"apiVersion": "apps/v1", "kind": "Deployment", "metadata": metadata, "spec": spec, "status": status})
+            })
+    }
+
+    proptest! {
+        /// The same object with its keys in another order compares as identical (#750).
+        #[test]
+        fn key_order_is_no_change(v in object(), seed in any::<u64>(), mask in any::<bool>()) {
+            let (a, b) = (super::comparable_yaml(&v, mask), super::comparable_yaml(&reordered(&v, seed), mask));
+            prop_assert!(crate::history::diff_lines(&a, &b).is_empty(), "\n{a}\n---\n{b}");
+        }
+    }
+
+    /// Annotations left empty once the ignored ones are taken out read as none.
+    #[test]
+    fn no_annotations_left_is_none() {
+        let with = json!({"metadata": {"name": "a", "annotations": {"deployment.kubernetes.io/revision": "2"}}});
+        let without = json!({"metadata": {"name": "a"}});
+        assert_eq!(super::comparable_yaml(&with, false), super::comparable_yaml(&without, false));
+        assert!(!super::comparable_yaml(&with, false).contains("annotations"));
+    }
 
     #[test]
     fn comparable_yaml_masks_secrets() {
