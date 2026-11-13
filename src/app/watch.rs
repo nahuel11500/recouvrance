@@ -249,7 +249,7 @@ impl AppView {
     }
 
     pub(super) fn on_table_msg(&mut self, ctx: usize, msg: TableMsg, cx: &mut Context<Self>) {
-        let name = self.clusters.get(ctx).map(|c| c.0.clone()).unwrap_or_default();
+        let name = self.clusters.get(ctx).map_or_default(|c| c.0.clone());
         let shown = {
             let table = self.table.read(cx);
             if table.delegate().columns_count(cx) > 0 { table.delegate().defs() } else { Arc::default() }

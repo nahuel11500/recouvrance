@@ -1050,7 +1050,7 @@ fn the_files_tab_reads_a_container() {
                 let source = FileSource::exec(ui.clone(), NS.into(), name.into(), None);
 
                 gate::set_ui_writes(false);
-                let refused = source.list(b"/etc").await.err().map(|e| format!("{e:#}")).unwrap_or_default();
+                let refused = source.list(b"/etc").await.err().map_or_default(|e| format!("{e:#}"));
                 assert!(refused.contains(gate::WRITES_OFF), "{name}: {refused}");
                 gate::set_ui_writes(true);
 
@@ -1140,7 +1140,7 @@ fn the_timeline_records_what_a_watch_sees_change() {
             }
             let summaries: Vec<&str> = found.iter().map(|c| c.summary.as_str()).collect();
             assert_eq!(summaries, ["labels changed: tier by e2e-editor"]);
-            let diff = found[0].diff.as_ref().map(|d| d.short(5)).unwrap_or_default();
+            let diff = found[0].diff.as_ref().map_or_default(|d| d.short(5));
             assert!(diff.contains("tier: front"), "{diff}");
 
             let (hub, _agent, token, _server) = agent(&["get,list *"], &[]).await?;
@@ -1372,7 +1372,7 @@ fn a_stopped_container_is_read_from_a_copy_of_its_pod() {
             // Write mode off: the UI's client refuses to create the copy.
             gate::set_ui_writes(false);
             let refused = pod_copy::create(ui.clone(), read.clone(), pod_copy::new_name(NAME), BUSYBOX.into()).await;
-            let refused = refused.err().map(|e| format!("{e:#}")).unwrap_or_default();
+            let refused = refused.err().map_or_default(|e| format!("{e:#}"));
             assert!(refused.contains(gate::WRITES_OFF), "{refused}");
             assert!(pod_copies(&pods).await?.is_empty(), "a copy was created with write mode off");
 

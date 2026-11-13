@@ -67,8 +67,8 @@ impl KubeMcp {
                 Err(e) => return call.finish(Err(e.context(format!("{} {name}", kind.ar.kind)))),
             };
             let shown = |v: &Value| k8s::to_yaml(&without_noise(v), secret, reveal).unwrap_or_default();
-            let (before, after) = (live.as_ref().map(shown).unwrap_or_default(), shown(&after));
-            let title = format!("{} {}{name}{note}", kind.ar.kind, ns.map(|n| format!("{n}/")).unwrap_or_default());
+            let (before, after) = (live.as_ref().map_or_default(shown), shown(&after));
+            let title = format!("{} {}{name}{note}", kind.ar.kind, ns.map_or_default(|n| format!("{n}/")));
             out.push(unified(&title, &before, &after, live.is_none()));
         }
         call.finish(Ok(out.join("\n")))

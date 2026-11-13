@@ -43,7 +43,7 @@ impl KubeMcp {
                 list(&r.namespaces),
                 list(&r.contexts),
                 list(&r.names),
-                r.expires.map(|t| format!(", until {t}")).unwrap_or_default(),
+                r.expires.map_or_default(|t| format!(", until {t}")),
                 if r.note.is_empty() { String::new() } else { format!("  — {}", r.note) },
             ));
         }
@@ -155,7 +155,7 @@ impl KubeMcp {
                 }
                 row.extend(cols.iter().map(|&i| {
                     if defs[i].name == "Age" {
-                        r.created.map(k8s::age).unwrap_or_default()
+                        r.created.map_or_default(k8s::age)
                     } else {
                         r.cells.get(i).cloned().unwrap_or_default()
                     }
@@ -289,12 +289,8 @@ impl KubeMcp {
             Ok(v) => v,
             Err(e) => return call.finish(Err(e)),
         };
-        let mut out = format!(
-            "{} {}{}\n",
-            kind.ar.kind,
-            p.name,
-            ns.as_ref().map(|n| format!(" (namespace {n})")).unwrap_or_default()
-        );
+        let mut out =
+            format!("{} {}{}\n", kind.ar.kind, p.name, ns.as_ref().map_or_default(|n| format!(" (namespace {n})")));
         let get = |path: &str| {
             value.pointer(path).map(|v| match v.as_str() {
                 Some(s) => s.to_string(),
@@ -612,9 +608,9 @@ impl KubeMcp {
                     name,
                     names.join(","),
                     c.issuer.clone(),
-                    c.not_after.map(|t| t.strftime("%Y-%m-%d").to_string()).unwrap_or_default(),
+                    c.not_after.map_or_default(|t| t.strftime("%Y-%m-%d").to_string()),
                     if early {
-                        let from = c.not_before.map(|t| t.strftime("%Y-%m-%d").to_string()).unwrap_or_default();
+                        let from = c.not_before.map_or_default(|t| t.strftime("%Y-%m-%d").to_string());
                         format!("NOT VALID UNTIL {from}")
                     } else if days < 0 {
                         // The days that went by: 3 hours ago is "<1", not the -1 days left.
@@ -717,7 +713,7 @@ impl KubeMcp {
                     x.namespace.unwrap_or_default(),
                     x.name,
                     x.reason,
-                    x.age.map(k8s::age).unwrap_or_default(),
+                    x.age.map_or_default(k8s::age),
                 ]
             })
             .collect();
@@ -924,14 +920,13 @@ fn container_lines(pod: &serde_json::Value) -> String {
         };
         let state = st["state"].as_object().and_then(|m| m.keys().next().cloned()).unwrap_or_default();
         let reason = st.pointer(&format!("/state/{state}/reason")).and_then(|v| v.as_str());
-        let last = st
-            .pointer("/lastState/terminated")
-            .map(|t| format!(", last terminated: {} (exit {})", t["reason"].as_str().unwrap_or("?"), t["exitCode"]))
-            .unwrap_or_default();
+        let last = st.pointer("/lastState/terminated").map_or_default(|t| {
+            format!(", last terminated: {} (exit {})", t["reason"].as_str().unwrap_or("?"), t["exitCode"])
+        });
         out.push_str(&format!(
             "{what} {}: {state}{}, ready={}, restarts={}{last}\n",
             c.name,
-            reason.map(|r| format!(" {r}")).unwrap_or_default(),
+            reason.map_or_default(|r| format!(" {r}")),
             st["ready"],
             st["restartCount"]
         ));

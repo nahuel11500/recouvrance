@@ -384,8 +384,7 @@ fn selection_band(id: WindowId, cx: &mut App) -> Option<(Pixels, Pixels)> {
         .default_global::<Texts>()
         .0
         .get(&id)
-        .map(|frame| frame.last.values().flatten().map(|p| p.handle.clone()).collect())
-        .unwrap_or_default();
+        .map_or_default(|frame| frame.last.values().flatten().map(|p| p.handle.clone()).collect());
     let selection = handles.iter().find_map(|handle| handle.snapshot(cx))?;
     let points = selection.window_points()?;
     let (anchor, cursor) = (points.anchor().y, points.cursor().y);

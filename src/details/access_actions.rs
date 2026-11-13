@@ -130,7 +130,7 @@ impl DetailPanel {
                     let kind = k.read(cx).value().trim().to_string();
                     let name = n.read(cx).value().trim().to_string();
                     let ns = ns.read(cx).value().trim().to_string();
-                    let scope_ns = scope_in.as_ref().map(|s| s.read(cx).value().trim().to_string()).unwrap_or_default();
+                    let scope_ns = scope_in.as_ref().map_or_default(|s| s.read(cx).value().trim().to_string());
                     let Some(subject) = subject_of(&kind, &name, &ns) else { return false };
                     let binding = binding.clone();
                     let _ = panel.update(cx, |this, cx| {

@@ -80,7 +80,7 @@ impl AssistantView {
         let entries = std::env::var("RECOUVRANCE_CHAT_FILE")
             .ok()
             .and_then(|p| std::fs::read_to_string(p).ok())
-            .map(|md| {
+            .map_or_default(|md| {
                 vec![
                     Entry::User("Why are five Elasticsearch pods not ready?".into()),
                     Entry::Assistant(
@@ -101,8 +101,7 @@ impl AssistantView {
                         .collect(),
                     ),
                 ]
-            })
-            .unwrap_or_default();
+            });
         #[cfg(not(feature = "dev"))]
         let entries = Vec::new();
         Self {

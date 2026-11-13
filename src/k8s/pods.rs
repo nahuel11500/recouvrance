@@ -95,7 +95,7 @@ fn event_line(e: &Event) -> EventLine {
     EventLine {
         namespace: e.metadata.namespace.clone(),
         name: e.metadata.name.clone().unwrap_or_default(),
-        age: event_last(e).map(age).unwrap_or_default(),
+        age: event_last(e).map_or_default(age),
         first: event_first(e),
         last: event_last(e),
         kind: e.type_.clone().unwrap_or_default(),
@@ -246,7 +246,7 @@ pub async fn containers(client: Client, ns: String, pod: String) -> Result<Vec<S
 
 /// A read pod's containers, as `pod_containers` lists them.
 pub fn typed_pod_containers(pod: &Pod) -> Vec<String> {
-    serde_json::to_value(pod).map(|v| pod_containers(&v)).unwrap_or_default()
+    serde_json::to_value(pod).map_or_default(|v| pod_containers(&v))
 }
 
 /// The annotation naming the container kubectl uses when none is given.

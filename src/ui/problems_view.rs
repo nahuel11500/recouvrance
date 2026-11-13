@@ -219,7 +219,7 @@ fn cells(theme: &component::Theme, context: Option<&str>, p: &Problem, color: Hs
                 .flex_shrink_0()
                 .text_xs()
                 .text_color(theme.muted_foreground)
-                .child(p.age.map(k8s::age).unwrap_or_default()),
+                .child(p.age.map_or_default(k8s::age)),
         )
 }
 

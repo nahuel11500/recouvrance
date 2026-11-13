@@ -295,7 +295,7 @@ impl DataEditor {
         let cmd = format!(
             "kubectl --context {}{} {} {} {name}",
             self.context,
-            ns.as_ref().map(|n| format!(" -n {n}")).unwrap_or_default(),
+            ns.as_ref().map_or_default(|n| format!(" -n {n}")),
             if creating { "create" } else { "replace" },
             self.kind.ar.kind.to_lowercase()
         );

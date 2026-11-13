@@ -604,12 +604,8 @@ impl FileBrowser {
             return self.render_copy_start(&why, cx);
         }
         let muted = cx.theme().muted_foreground;
-        let target = format!(
-            "{}/{}{}",
-            self.ns,
-            self.pod,
-            self.container.as_ref().map(|c| format!(" ({c})")).unwrap_or_default()
-        );
+        let target =
+            format!("{}/{}{}", self.ns, self.pod, self.container.as_ref().map_or_default(|c| format!(" ({c})")));
         let browse = Button::new("browse-files").primary().icon(Lucide::FolderOpen).label("Browse files");
         let browse = if self.exec_denied {
             browse.disabled(true).tooltip("Your RBAC does not allow exec in this pod (create on pods/exec)")

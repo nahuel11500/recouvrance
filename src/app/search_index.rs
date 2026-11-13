@@ -46,7 +46,7 @@ impl Entry {
             detail: format!(
                 "{}{}{}",
                 self.label,
-                self.namespace.as_ref().map(|n| format!(" · {n}")).unwrap_or_default(),
+                self.namespace.as_ref().map_or_default(|n| format!(" · {n}")),
                 on_cluster(clusters, self.ctx)
             ),
             icon: self.icon,

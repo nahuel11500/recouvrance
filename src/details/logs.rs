@@ -487,11 +487,8 @@ impl LogsView {
     pub(super) fn render_line(&self, i: usize, cx: &App) -> AnyElement {
         let theme = cx.theme();
         let Some(l) = self.buf.shown(i) else { return div().into_any_element() };
-        let time = l
-            .time
-            .map(|t| t.to_zoned(jiff::tz::TimeZone::system()).strftime("%H:%M:%S").to_string())
-            .unwrap_or_default();
-        let pod = self.pods.get(l.src).map(String::as_str).unwrap_or_default();
+        let time = l.time.map_or_default(|t| t.to_zoned(jiff::tz::TimeZone::system()).strftime("%H:%M:%S").to_string());
+        let pod = self.pods.get(l.src).map_or_default(String::as_str);
         let suffix = pod.rsplit('-').next().unwrap_or(pod).to_string();
         let base = match l.level {
             Some(Level::Error) => Some(theme.danger),
@@ -579,8 +576,8 @@ impl LogsView {
         self.buf
             .shown_lines()
             .map(|l| {
-                let time = l.time.map(|t| t.to_string()).unwrap_or_default();
-                let pod = self.pods.get(l.src).map(String::as_str).unwrap_or_default();
+                let time = l.time.map_or_default(|t| t.to_string());
+                let pod = self.pods.get(l.src).map_or_default(String::as_str);
                 if multi { format!("{time} {pod} {}", l.text) } else { format!("{time} {}", l.text) }
             })
             .collect::<Vec<_>>()

@@ -231,7 +231,7 @@ const DRIFT_SOURCE: &str = "Each live object is compared with what was last appl
 /// live. Nothing when all is well. Out of sync with auto-sync off is said, not as a problem.
 pub(super) fn diagnosis(ctx: &Ctx, cx: &App) -> Option<Div> {
     let read = ctx.related.argo_drift.as_ref();
-    let d = Diagnosis::of_live(ctx.obj, jiff::Timestamp::now(), read.map(|r| r.drifts.as_slice()).unwrap_or_default());
+    let d = Diagnosis::of_live(ctx.obj, jiff::Timestamp::now(), read.map_or_default(|r| r.drifts.as_slice()));
     if d.is_empty() {
         return None;
     }

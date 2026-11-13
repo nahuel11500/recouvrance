@@ -37,7 +37,7 @@ impl ProblemBadge {
                 // A cluster that may not list cluster-wide is read in its accessible namespaces.
                 let scans = clusters.iter().map(|(name, c)| {
                     let accessible = crate::settings::cluster(name).namespaces;
-                    let (c, kinds) = (c.clone(), kinds.get(name).map(Vec::as_slice).unwrap_or_default());
+                    let (c, kinds) = (c.clone(), kinds.get(name).map_or_default(Vec::as_slice));
                     async move { crate::alerts::scan(name, c, kinds, &accessible).await }
                 });
                 let results = futures::future::join_all(scans).await;

@@ -290,8 +290,8 @@ impl EnvSources<'_> {
 /// The container's environment variables, with values resolved from ConfigMaps, Secrets
 /// and the pod: a heading and the list (long ones folded), or nothing.
 fn container_env(ctx: &Ctx, c: &Value, cx: &App) -> Vec<AnyElement> {
-    let env = c["env"].as_array().map(Vec::as_slice).unwrap_or_default();
-    let env_from = c["envFrom"].as_array().map(Vec::as_slice).unwrap_or_default();
+    let env = c["env"].as_array().map_or_default(Vec::as_slice);
+    let env_from = c["envFrom"].as_array().map_or_default(Vec::as_slice);
     if env.is_empty() && env_from.is_empty() {
         return Vec::new();
     }
@@ -487,7 +487,7 @@ fn container_mounts(ctx: &Ctx, c: &Value, cx: &App) -> Vec<AnyElement> {
             .child(div().child(selectable(format!(
                 "{}{}",
                 m["mountPath"].as_str().unwrap_or_default(),
-                m["subPath"].as_str().map(|p| format!(" (subPath {p})")).unwrap_or_default()
+                m["subPath"].as_str().map_or_default(|p| format!(" (subPath {p})"))
             ))))
             .child(div().text_xs().text_color(cx.theme().muted_foreground).child(selectable(if ro {
                 "ReadOnly"
@@ -513,7 +513,7 @@ pub(super) fn probe_card(title: &str, p: &Value, cx: &App) -> Div {
             format!("TCP :{}", t["port"])
         } else if let Some(e) = p.get("exec") {
             let cmd: Vec<&str> =
-                e["command"].as_array().map(|a| a.iter().filter_map(|v| v.as_str()).collect()).unwrap_or_default();
+                e["command"].as_array().map_or_default(|a| a.iter().filter_map(|v| v.as_str()).collect());
             cmd.join(" ")
         } else if p.get("grpc").is_some() {
             format!("gRPC :{}", p.pointer("/grpc/port").and_then(Value::as_i64).unwrap_or(0))
@@ -809,7 +809,7 @@ pub(super) fn pod_row(ctx: &Ctx, p: &PodRow, cx: &App) -> AnyElement {
         cell.child(
             h_flex()
                 .gap_2()
-                .child(div().w(px(64.)).flex_none().child(value.map(format).unwrap_or_default()))
+                .child(div().w(px(64.)).flex_none().child(value.map_or_default(format)))
                 .child(div().flex_1().child(usage_bar(value, request, limit, color, cx))),
         )
     };
@@ -827,7 +827,7 @@ pub(super) fn pod_row(ctx: &Ctx, p: &PodRow, cx: &App) -> AnyElement {
             "Memory" => usage(cell, p.mem, k8s::format_bytes, theme.success),
             "Restarts" => cell.when(p.restarts > 0, |d| d.text_color(theme.warning)).child(p.restarts.to_string()),
             "Node" => cell.child(ctx.link(p.node.clone(), "nodes", &p.node, cx)),
-            _ => cell.text_color(theme.muted_foreground).child(p.created.map(k8s::age).unwrap_or_default()),
+            _ => cell.text_color(theme.muted_foreground).child(p.created.map_or_default(k8s::age)),
         }
     });
     h_flex().gap_3().py_1().text_sm().border_b_1().border_color(theme.border).children(cells).into_any_element()

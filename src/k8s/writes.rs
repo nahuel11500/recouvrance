@@ -75,7 +75,7 @@ pub async fn merge_patch(
     run(async move {
         let api = dyn_api(client, &kind, ns.as_deref());
         let obj = api.patch(&name, &patch_params(dry_run), &kube::api::Patch::Merge(patch)).await?;
-        let version = obj.metadata.resource_version.map(|v| format!(" (resourceVersion {v})")).unwrap_or_default();
+        let version = obj.metadata.resource_version.map_or_default(|v| format!(" (resourceVersion {v})"));
         Ok(format!("{}{} {name} patched{version}", if dry_run { "[dry run] " } else { "" }, kind.ar.kind))
     })
     .await

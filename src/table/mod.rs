@@ -392,7 +392,7 @@ impl ResourceTable {
         lines.sort();
         if self.contexts.len() > 1 {
             for (ctx, line) in &mut lines {
-                *line = format!("{}: {line}", self.contexts.get(*ctx).map(String::as_str).unwrap_or_default());
+                *line = format!("{}: {line}", self.contexts.get(*ctx).map_or_default(String::as_str));
             }
         }
         (!lines.is_empty()).then(|| lines.into_iter().map(|(_, l)| l).collect::<Vec<_>>().join("\n"))
@@ -572,15 +572,15 @@ impl ResourceTable {
     fn cell<'a>(&'a self, ctx: usize, row: &'a Row, col: Col) -> Cow<'a, str> {
         match col {
             Col::Check => Cow::Borrowed(""),
-            Col::Context => Cow::Borrowed(self.contexts.get(ctx).map(String::as_str).unwrap_or_default()),
+            Col::Context => Cow::Borrowed(self.contexts.get(ctx).map_or_default(String::as_str)),
             Col::Namespace => Cow::Borrowed(row.namespace.as_deref().unwrap_or_default()),
-            Col::Cpu => self.usage_of(ctx, row).map(|u| k8s::format_cpu(u.0)).unwrap_or_default().into(),
-            Col::Memory => self.usage_of(ctx, row).map(|u| k8s::format_bytes(u.1)).unwrap_or_default().into(),
+            Col::Cpu => self.usage_of(ctx, row).map_or_default(|u| k8s::format_cpu(u.0)).into(),
+            Col::Memory => self.usage_of(ctx, row).map_or_default(|u| k8s::format_bytes(u.1)).into(),
             Col::Age(i) => match row.created {
                 Some(t) => k8s::age(t).into(),
-                None => Cow::Borrowed(row.cells.get(i).map(String::as_str).unwrap_or_default()),
+                None => Cow::Borrowed(row.cells.get(i).map_or_default(String::as_str)),
             },
-            Col::Cell(i) => Cow::Borrowed(row.cells.get(i).map(String::as_str).unwrap_or_default()),
+            Col::Cell(i) => Cow::Borrowed(row.cells.get(i).map_or_default(String::as_str)),
         }
     }
 

@@ -47,7 +47,7 @@ async fn find(client: Client) -> Result<Option<String>> {
     let list = api.list_metadata(&ListParams::default()).await?;
     let mut best: Option<(usize, String)> = None;
     for s in list.items {
-        let (Some(name), Some(ns)) = (s.metadata.name.clone(), s.metadata.namespace.clone()) else { continue };
+        let (Some(name), Some(ns)) = (s.metadata.name.clone(), s.metadata.namespace) else { continue };
         let Some(rank) = CANDIDATES.iter().position(|c| name == *c || name.ends_with(&format!("-{c}"))) else {
             continue;
         };

@@ -396,16 +396,12 @@ impl Render for TerminalView {
         if self.session.is_none() {
             let (warning, muted) = (theme.warning, theme.muted_foreground);
             let target = match &self.local {
-                Some((ctx, ns)) => format!(
-                    "this machine, kubectl on {ctx}{}",
-                    ns.as_ref().map(|n| format!(" / {n}")).unwrap_or_default()
-                ),
-                None => format!(
-                    "{}/{}{}",
-                    self.ns,
-                    self.pod,
-                    self.container.as_ref().map(|c| format!(" ({c})")).unwrap_or_default()
-                ),
+                Some((ctx, ns)) => {
+                    format!("this machine, kubectl on {ctx}{}", ns.as_ref().map_or_default(|n| format!(" / {n}")))
+                }
+                None => {
+                    format!("{}/{}{}", self.ns, self.pod, self.container.as_ref().map_or_default(|c| format!(" ({c})")))
+                }
             };
             return v_flex()
                 .size_full()
@@ -517,16 +513,11 @@ impl Render for TerminalView {
         let label = match (&self.local, &self.command) {
             (Some((ctx, _)), Some(c)) => format!("{c}  ·  on {ctx}"),
             (Some((ctx, ns)), None) => {
-                format!("kubectl → {ctx}{}", ns.as_ref().map(|n| format!(" / {n}")).unwrap_or_default())
+                format!("kubectl → {ctx}{}", ns.as_ref().map_or_default(|n| format!(" / {n}")))
             }
             // The picker shows the container.
             _ if self.container_select.is_some() => format!("{}/{}", self.ns, self.pod),
-            _ => format!(
-                "{}/{}{}",
-                self.ns,
-                self.pod,
-                self.container.as_ref().map(|c| format!(" · {c}")).unwrap_or_default()
-            ),
+            _ => format!("{}/{}{}", self.ns, self.pod, self.container.as_ref().map_or_default(|c| format!(" · {c}"))),
         };
         let select = self.container_select.clone().filter(|_| self.local.is_none());
         let theme = cx.theme();
