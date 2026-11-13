@@ -6,7 +6,6 @@ rust-version = "1.99"
 description = "A fast native Kubernetes desktop client, with an MCP server for your agents"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/nahuel11500/recouvrance"
-homepage = "https://github.com/nahuel11500/recouvrance"
 readme = "README.md"
 keywords = ["kubernetes", "k8s", "desktop", "gui", "mcp"]
 categories = ["gui", "development-tools"]

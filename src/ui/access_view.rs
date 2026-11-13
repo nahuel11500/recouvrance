@@ -294,7 +294,7 @@ impl AccessView {
                                 .child(div().w(px(130.)).child(g.subject_kind.clone()))
                                 .child(div().w(px(300.)).child(format!(
                                     "{}{}",
-                                    g.subject_ns.as_ref().map(|n| format!("{n}/")).unwrap_or_default(),
+                                    g.subject_ns.as_ref().map_or_default(|n| format!("{n}/")),
                                     g.subject
                                 )))
                                 .child(div().w(px(330.)).text_xs().child(format!("{} → {}", g.binding, g.role)))

@@ -159,8 +159,7 @@ impl HelmInstall {
             this.versions = versions
                 .ok()
                 .and_then(|o| serde_json::from_str::<Vec<Chart>>(&o).ok())
-                .map(|v| v.into_iter().filter(|c| c.name == name).map(|c| c.version).take(12).collect())
-                .unwrap_or_default();
+                .map_or_default(|v| v.into_iter().filter(|c| c.name == name).map(|c| c.version).take(12).collect());
             // Values typed while loading are kept.
             if this.values.read(cx).value() == LOADING_VALUES {
                 let text = values.unwrap_or_else(|e| format!("# could not read the chart's values: {e}"));

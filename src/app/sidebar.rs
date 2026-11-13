@@ -181,7 +181,7 @@ impl AppView {
                     Some(svc) => format!("svc/{svc}"),
                     None => crate::forwards::pod_base(&saved.pod).to_string(),
                 };
-                let local = saved.local.map(|p| format!("localhost:{p} → ")).unwrap_or_default();
+                let local = saved.local.map_or_default(|p| format!("localhost:{p} → "));
                 let (start, forget) = (saved.clone(), saved.clone());
                 h_flex()
                     .gap_1()

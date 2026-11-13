@@ -96,7 +96,7 @@ impl KubeMcp {
             } else {
                 let value =
                     pods.iter().find(|v| v.pointer("/metadata/name").and_then(|n| n.as_str()) == Some(pod.as_str()));
-                let c = value.map(log_containers).unwrap_or_default();
+                let c = value.map_or_default(log_containers);
                 add_new(&mut read, c.read.iter().cloned());
                 add_new(&mut others, c.others);
                 c.read

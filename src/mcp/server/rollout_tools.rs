@@ -149,8 +149,7 @@ impl KubeMcp {
                 let cause = r
                     .pointer("/metadata/annotations/kubernetes.io~1change-cause")
                     .and_then(|v| v.as_str())
-                    .map(|c| format!(" — {c}"))
-                    .unwrap_or_default();
+                    .map_or_default(|c| format!(" — {c}"));
                 let mark = if Some(n) == current { " (current)" } else { "" };
                 format!("revision {n}{mark}, {created}: {}{cause}", rollouts::images(r).join(", "))
             })

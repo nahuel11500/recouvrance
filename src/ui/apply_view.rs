@@ -108,8 +108,7 @@ impl ApplyView {
         let first = crate::templates::all(namespace.as_deref().unwrap_or("default"))
             .into_iter()
             .find(|t| t.name == "ConfigMap")
-            .map(|t| t.body)
-            .unwrap_or_default();
+            .map_or_default(|t| t.body);
         let editor = cx.new(|cx| {
             let mut s = EditorState::new(window, cx).language("yaml").line_number(true).searchable(true);
             s.set_value(format!("{HEADER}{first}"), window, cx);
@@ -404,7 +403,7 @@ impl ApplyView {
                     uses_page_ns |= k.namespaced && d.value.pointer("/metadata/namespace").is_none();
                     target_ns(&d.value, k.namespaced, default_ns)
                 });
-                format!("{kind_name} {}{name}", ns.map(|n| format!("{n}/")).unwrap_or_default())
+                format!("{kind_name} {}{name}", ns.map_or_default(|n| format!("{n}/")))
             })
             .collect();
         // Objects without a namespace go where the page is, as `-n` would send them.
@@ -525,8 +524,7 @@ fn resolve_kind(kinds: &[Kind], doc: &serde_json::Value) -> Result<Kind, String>
     let hint = kinds
         .iter()
         .find(|k| k.ar.kind == kind_name)
-        .map(|k| format!(" (did you mean apiVersion: {}?)", k.ar.api_version))
-        .unwrap_or_default();
+        .map_or_default(|k| format!(" (did you mean apiVersion: {}?)", k.ar.api_version));
     Err(format!("unknown type {api_version} {kind_name}{hint}"))
 }
 
@@ -575,7 +573,7 @@ async fn apply_docs_counted(
                 forbidden += usize::from(k8s::api_status(&e) == Some(403));
                 let msg = format!("{e:#}");
                 let line = field_from_error(&msg).and_then(|path| line_of_path(&body, &path)).map(|l| l + base);
-                let at = line.map(|l| format!(" (line {})", l + 1)).unwrap_or_default();
+                let at = line.map_or_default(|l| format!(" (line {})", l + 1));
                 let why = if msg.contains("cannot impersonate") { k8s::short_error(&e) } else { explain(&msg) };
                 results.push(Problem { ok: false, text: format!("{kind_name} {name}{at}: {why}"), line });
             }
@@ -715,7 +713,7 @@ fn launch_editor(path: &std::path::Path) -> Result<(), String> {
     let editor = std::env::var("VISUAL").or_else(|_| std::env::var("EDITOR")).unwrap_or_else(|_| "xdg-open".into());
     let mut parts = editor.split_whitespace().map(String::from).collect::<Vec<_>>();
     let bin = parts.first().cloned().unwrap_or_default();
-    let base = std::path::Path::new(&bin).file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+    let base = std::path::Path::new(&bin).file_name().map_or_default(|s| s.to_string_lossy().to_string());
     let gui = matches!(
         base.as_str(),
         "code"
@@ -980,7 +978,7 @@ impl Render for ApplyView {
                     .child(div().text_sm().text_color(muted).child(format!(
                         "into {}{} · kubectl apply --server-side · drop YAML files on the editor",
                         self.context,
-                        self.namespace.as_ref().map(|n| format!(" / {n} (default namespace)")).unwrap_or_default()
+                        self.namespace.as_ref().map_or_default(|n| format!(" / {n} (default namespace)"))
                     ))),
             )
             .child(h_flex().flex_1().min_h_0().gap_3().items_start().child(sidebar).child(main))

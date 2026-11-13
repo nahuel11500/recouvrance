@@ -130,7 +130,7 @@ pub(super) fn binding_row(ctx: &Ctx, b: &Value, cx: &App) -> Div {
             format!(
                 "{} {}{}",
                 x["kind"].as_str().unwrap_or("?"),
-                x["namespace"].as_str().map(|n| format!("{n}/")).unwrap_or_default(),
+                x["namespace"].as_str().map_or_default(|n| format!("{n}/")),
                 x["name"].as_str().unwrap_or("?")
             )
         })
@@ -143,7 +143,7 @@ pub(super) fn binding_row(ctx: &Ctx, b: &Value, cx: &App) -> Div {
         .border_b_1()
         .border_color(theme.border)
         .child(div().w(px(320.)).child(ctx.link_in(
-            format!("{}{name}", ns.as_ref().map(|n| format!("{n}/")).unwrap_or_default()),
+            format!("{}{name}", ns.as_ref().map_or_default(|n| format!("{n}/"))),
             kind,
             &name,
             ns,
@@ -161,8 +161,7 @@ pub(super) fn role_page(ctx: &Ctx, cx: &App) -> Div {
         .related
         .rbac
         .as_ref()
-        .map(|snap| crate::rbac::bindings_of(snap, &kind, &name, s(ctx.obj, "/metadata/namespace")))
-        .unwrap_or_default();
+        .map_or_default(|snap| crate::rbac::bindings_of(snap, &kind, &name, s(ctx.obj, "/metadata/namespace")));
     let mut d = v_flex().child(heading(&format!("Rules ({})", rules.len()))).child(rules_table(&rules, cx));
     if ctx.obj.get("aggregationRule").is_some() {
         d = d.child(
@@ -231,8 +230,7 @@ pub(super) fn binding_page(ctx: &Ctx, cx: &App) -> Div {
 pub(super) fn service_account_page(ctx: &Ctx, cx: &App) -> Div {
     let ns = ctx.ns().unwrap_or_default();
     let name = s(ctx.obj, "/metadata/name").unwrap_or_default().to_string();
-    let grants =
-        ctx.related.rbac.as_ref().map(|snap| crate::rbac::service_account_grants(snap, &ns, &name)).unwrap_or_default();
+    let grants = ctx.related.rbac.as_ref().map_or_default(|snap| crate::rbac::service_account_grants(snap, &ns, &name));
     let theme = cx.theme();
     let mut d = v_flex().child(heading(&format!("Bindings that apply ({})", grants.len())));
     if ctx.related.rbac.is_none() {

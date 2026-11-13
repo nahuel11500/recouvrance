@@ -240,7 +240,7 @@ fn name_owners(
     let renamed: std::collections::HashSet<(String, String)> = kept
         .iter()
         .flat_map(|(given, file)| {
-            let names = read.get(file.as_str()).copied().flatten().map(Vec::as_slice).unwrap_or_default();
+            let names = read.get(file.as_str()).copied().flatten().map_or_default(Vec::as_slice);
             let own = names.contains(given);
             names
                 .iter()
@@ -388,7 +388,7 @@ pub(super) fn risky_contexts(kc: &Kubeconfig) -> Vec<String> {
         .iter()
         .filter(|c| {
             let ctx = c.context.as_ref();
-            let cluster = ctx.map(|x| x.cluster.as_str()).unwrap_or_default();
+            let cluster = ctx.map_or_default(|x| x.cluster.as_str());
             let server = kc
                 .clusters
                 .iter()
@@ -484,7 +484,7 @@ fn targets_of(kc: &Kubeconfig) -> Vec<ContextTarget> {
     kc.contexts
         .iter()
         .map(|c| {
-            let cluster = c.context.as_ref().map(|x| x.cluster.clone()).unwrap_or_default();
+            let cluster = c.context.as_ref().map_or_default(|x| x.cluster.clone());
             let server = kc
                 .clusters
                 .iter()
@@ -521,12 +521,8 @@ pub fn private_kubeconfig(context: &str, namespace: Option<&str>, purpose: &str)
     kc.current_context = Some(context.to_string());
     // Only this context, its cluster and its user: a plugin or helm never sees other clusters' credentials.
     kc.contexts.retain(|c| c.name == context);
-    let (cluster, user) = kc
-        .contexts
-        .first()
-        .and_then(|c| c.context.as_ref())
-        .map(|c| (c.cluster.clone(), c.user.clone()))
-        .unwrap_or_default();
+    let (cluster, user) =
+        kc.contexts.first().and_then(|c| c.context.as_ref()).map_or_default(|c| (c.cluster.clone(), c.user.clone()));
     kc.clusters.retain(|c| c.name == cluster);
     kc.auth_infos.retain(|a| Some(&a.name) == user.as_ref());
     if let Some(ns) = namespace {

@@ -330,7 +330,7 @@ impl AgentsView {
                     };
                     let why = match v.rule {
                         Some(i) => {
-                            let note = agent.policy.rules.get(i).map(|r| r.note.clone()).unwrap_or_default();
+                            let note = agent.policy.rules.get(i).map_or_default(|r| r.note.clone());
                             format!(
                                 "by rule #{}{}",
                                 i + 1,

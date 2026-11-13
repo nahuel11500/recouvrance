@@ -299,7 +299,7 @@ impl AppView {
             let t = self.table.read(cx).delegate();
             (t.total(), t.rows_count_visible())
         };
-        let kind_label = self.kind.as_ref().map(|k| k.label.clone()).unwrap_or_default();
+        let kind_label = self.kind.as_ref().map_or_default(|k| k.label.clone());
         let view_bar = h_flex()
             .gap_3()
             .px_3()
