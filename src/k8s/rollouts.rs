@@ -41,7 +41,7 @@ pub fn number(rev: &Value) -> i64 {
 /// The images of a revision's pod template, `container=image`: its containers, then its
 /// init containers (native sidecars among them).
 pub fn images(rev: &Value) -> Vec<String> {
-    let containers = rev.pointer("/spec/template/spec").map(super::spec_containers).unwrap_or_default();
+    let containers = rev.pointer("/spec/template/spec").map_or_default(super::spec_containers);
     containers.iter().map(|c| format!("{}={}", c.name, c.spec["image"].as_str().unwrap_or("?"))).collect()
 }
 

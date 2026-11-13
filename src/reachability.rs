@@ -916,7 +916,7 @@ fn ingress_steps(context: &str, ing: &Value, world: &World, steps: &mut Vec<Step
     }
     let describe = kubectl(context, Some(ns), &format!("describe ingress {}", shell_word(name)));
     if addresses.is_empty() {
-        let by = controller.map(|c| format!(" ({c})")).unwrap_or_default();
+        let by = controller.map_or_default(|c| format!(" ({c})"));
         let detail = format!(
             "No address in its status: the controller{by} has not taken it, or doesn't report addresses. \
              Check that the controller runs, and the Ingress's events."

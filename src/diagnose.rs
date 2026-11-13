@@ -85,8 +85,7 @@ pub fn pod(pod: &Value, events: &[Ev], crash_logs: Option<&(String, String)>) ->
     let gates: Vec<&str> = pod
         .pointer("/spec/schedulingGates")
         .and_then(Value::as_array)
-        .map(|g| g.iter().filter_map(|g| g["name"].as_str()).collect())
-        .unwrap_or_default();
+        .map_or_default(|g| g.iter().filter_map(|g| g["name"].as_str()).collect());
     if phase == "Pending" && s(pod, "/spec/nodeName").is_empty() && !gates.is_empty() {
         out.push(Finding {
             level: Level::Warning,
@@ -144,8 +143,7 @@ pub fn pod(pod: &Value, events: &[Ev], crash_logs: Option<&(String, String)>) ->
             pod.pointer(if init { "/spec/initContainers" } else { "/spec/containers" })
                 .and_then(Value::as_array)
                 .and_then(|cs| cs.iter().find(|x| x["name"] == name))
-                .map(|x| s(x, "/resources/limits/memory").to_string())
-                .unwrap_or_default()
+                .map_or_default(|x| s(x, "/resources/limits/memory").to_string())
         };
         match waiting {
             "ImagePullBackOff" | "ErrImagePull" | "InvalidImageName" => {
@@ -256,7 +254,7 @@ pub fn pod(pod: &Value, events: &[Ev], crash_logs: Option<&(String, String)>) ->
         }
         // Running but not ready: probes.
         if !init && c.pointer("/state/running").is_some() && c["ready"] == false && phase == "Running" {
-            let probe = events.iter().find(|e| e.1 == "Unhealthy").map(|e| e.2.to_string()).unwrap_or_default();
+            let probe = events.iter().find(|e| e.1 == "Unhealthy").map_or_default(|e| e.2.to_string());
             out.push(Finding {
                 level: Level::Warning,
                 title: format!("{} is running but not ready", capital(&label)),
@@ -374,7 +372,7 @@ pub fn workload(obj: &Value, pods: &[Value]) -> Vec<Finding> {
 
 fn capital(s: &str) -> String {
     let mut c = s.chars();
-    c.next().map(|f| f.to_uppercase().collect::<String>() + c.as_str()).unwrap_or_default()
+    c.next().map_or_default(|f| f.to_uppercase().collect::<String>() + c.as_str())
 }
 
 #[cfg(test)]

@@ -43,7 +43,7 @@ fn secret_name(r: &Release) -> String {
 }
 
 fn updated(r: &Release) -> String {
-    r.updated.map(|t| t.strftime("%Y-%m-%d %H:%M").to_string()).unwrap_or_default()
+    r.updated.map_or_default(|t| t.strftime("%Y-%m-%d %H:%M").to_string())
 }
 
 #[tool_router(router = helm_tools, vis = "pub(super)")]

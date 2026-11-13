@@ -15,7 +15,7 @@ pub(super) fn service(ctx: &Ctx, cx: &App) -> Div {
         .map(|p| {
             format!(
                 "{}{} → {} / {}",
-                p["name"].as_str().map(|n| format!("{n}: ")).unwrap_or_default(),
+                p["name"].as_str().map_or_default(|n| format!("{n}: ")),
                 p["port"].as_i64().unwrap_or(0),
                 p["targetPort"]
                     .as_i64()
@@ -49,7 +49,7 @@ pub(super) fn ingress(ctx: &Ctx, cx: &App) -> Div {
         .iter()
         .map(|t| {
             let hosts: Vec<&str> =
-                t["hosts"].as_array().map(|h| h.iter().filter_map(|v| v.as_str()).collect()).unwrap_or_default();
+                t["hosts"].as_array().map_or_default(|h| h.iter().filter_map(|v| v.as_str()).collect());
             (hosts, t["secretName"].as_str().unwrap_or_default().to_string())
         })
         .collect();
@@ -172,7 +172,7 @@ pub(super) fn gateway(ctx: &Ctx, cx: &App) -> Div {
     let listeners = arr(obj, "/spec/listeners").iter().map(|l| {
         let name = l["name"].as_str().unwrap_or_default().to_string();
         let st = listener_status.iter().find(|s| s["name"] == name.as_str());
-        let conds = st.map(|s| arr(s, "/conditions")).unwrap_or_default();
+        let conds = st.map_or_default(|s| arr(s, "/conditions"));
         let attached = st.and_then(|s| s["attachedRoutes"].as_i64()).unwrap_or(0);
         let programmed = condition_ok(conds, "Programmed");
         let certs: Vec<AnyElement> =
@@ -264,7 +264,7 @@ pub(super) fn route(ctx: &Ctx, cx: &App) -> Div {
     let parents_status = arr(obj, "/status/parents");
     let parents = arr(obj, "/spec/parentRefs").iter().map(|p| {
         let st = parents_status.iter().find(|s| same_parent(p, &s["parentRef"], ctx.ns().as_deref()));
-        let conds = st.map(|s| arr(s, "/conditions")).unwrap_or_default();
+        let conds = st.map_or_default(|s| arr(s, "/conditions"));
         let accepted = condition_ok(conds, "Accepted");
         let resolved = condition_ok(conds, "ResolvedRefs");
         let problem = conds
@@ -408,8 +408,7 @@ pub(super) fn netpol(ctx: &Ctx, cx: &App) -> Div {
             let except: Vec<&str> = p
                 .pointer("/ipBlock/except")
                 .and_then(Value::as_array)
-                .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
-                .unwrap_or_default();
+                .map_or_default(|a| a.iter().filter_map(|v| v.as_str()).collect());
             return if except.is_empty() {
                 format!("CIDR {c}")
             } else {
@@ -482,7 +481,7 @@ fn netpol_port(p: &Value) -> String {
         .map(|n| n.to_string())
         .or_else(|| p["port"].as_str().map(String::from))
         .unwrap_or("*".into());
-    let end = p["endPort"].as_i64().map(|n| format!("-{n}")).unwrap_or_default();
+    let end = p["endPort"].as_i64().map_or_default(|n| format!("-{n}"));
     format!("{port}{end}/{}", p["protocol"].as_str().unwrap_or("TCP"))
 }
 

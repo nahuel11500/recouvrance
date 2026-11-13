@@ -275,7 +275,7 @@ impl Recorder {
     }
 
     fn records_of(&self, ctx: &str) -> Vec<Arc<Record>> {
-        lock(&self.logs).get(ctx).map(|l| l.records.iter().cloned().collect()).unwrap_or_default()
+        lock(&self.logs).get(ctx).map_or_default(|l| l.records.iter().cloned().collect())
     }
 }
 

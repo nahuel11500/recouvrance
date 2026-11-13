@@ -235,7 +235,7 @@ fn stuck_reason(
 /// What a Namespace's deletion waits on, from its conditions (`NamespaceContentRemaining`,
 /// `NamespaceFinalizersRemaining`, `NamespaceDeletion*Failure`): the resources left in it.
 fn namespace_why(status: &serde_json::Value) -> Vec<String> {
-    let conditions = status.get("conditions").and_then(|c| c.as_array()).map(Vec::as_slice).unwrap_or_default();
+    let conditions = status.get("conditions").and_then(|c| c.as_array()).map_or_default(Vec::as_slice);
     conditions
         .iter()
         .filter_map(|c| {

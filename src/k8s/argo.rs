@@ -1242,7 +1242,7 @@ mod properties {
             ns in "([a-z0-9][a-z0-9-]{0,10})?",
             name in "[a-z0-9][a-z0-9.-]{0,20}",
         ) {
-            let prefix = app_ns.as_ref().map(|n| format!("{n}_")).unwrap_or_default();
+            let prefix = app_ns.as_ref().map_or_default(|n| format!("{n}_"));
             let t = parse_tracking(&format!("{prefix}{app}:{group}/{kind}:{ns}/{name}")).unwrap();
             prop_assert_eq!(t.app_ns, app_ns);
             prop_assert_eq!((t.app, t.group, t.kind, t.namespace, t.name), (app, group, kind, ns, name));

@@ -72,7 +72,7 @@ pub fn load() -> Result<Vec<Plugin>, String> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
         Err(e) => Err(e.to_string()),
         Ok(text) => crate::yaml::from_str::<File>(&text).map(|f| f.plugins).map_err(|e| {
-            let at = e.location().map(|l| format!("line {}: ", l.line())).unwrap_or_default();
+            let at = e.location().map_or_default(|l| format!("line {}: ", l.line()));
             format!("{at}{}", crate::yaml::message(&e))
         }),
     }
@@ -152,8 +152,7 @@ pub fn reload(cx: &mut gpui_kit::App) {
 /// Plugins offered for a kind.
 pub fn for_kind(kubectl_name: &str, plural: &str, cx: &gpui_kit::App) -> Vec<Plugin> {
     cx.try_global::<Loaded>()
-        .map(|l| l.0.iter().filter(|p| p.applies(kubectl_name, plural)).cloned().collect())
-        .unwrap_or_default()
+        .map_or_default(|l| l.0.iter().filter(|p| p.applies(kubectl_name, plural)).cloned().collect())
 }
 
 /// Ask the app to run a plugin (its script, and the values it reads from the environment).

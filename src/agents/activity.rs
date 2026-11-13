@@ -157,8 +157,7 @@ pub(super) fn call_text(e: &AuditEntry, with_context: bool) -> String {
             .args
             .get("command")
             .and_then(|c| c.as_array())
-            .map(|a| a.iter().map(|v| v.as_str().map_or_else(|| v.to_string(), String::from)).collect())
-            .unwrap_or_default();
+            .map_or_default(|a| a.iter().map(|v| v.as_str().map_or_else(|| v.to_string(), String::from)).collect());
         let pod = arg(e, "pod").unwrap_or_default();
         let at = match arg(e, "container") {
             Some(c) => format!("{pod}/{c}"),
@@ -433,7 +432,7 @@ fn render_item(item: &Item, ix: usize, view: &WeakEntity<AgentsView>, cx: &App) 
                 call.time.to_zoned(jiff::tz::TimeZone::system()).strftime("%Y-%m-%d %H:%M:%S"),
                 call.duration_ms,
                 call.result_bytes,
-                call.session.as_ref().map(|s| format!(" · session {s}")).unwrap_or_default()
+                call.session.as_ref().map_or_default(|s| format!(" · session {s}"))
             )))
             .into_any_element(),
         Item::More { shown, total, can_load, loading } => {

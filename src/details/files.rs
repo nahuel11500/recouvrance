@@ -12,7 +12,7 @@ impl DetailPanel {
     /// Save the object's YAML (as shown: managedFields dropped, Secrets masked unless revealed).
     pub fn download_yaml(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         use std::io::Write as _;
-        let ns = self.obj.namespace.as_ref().map(|n| format!("{n}-")).unwrap_or_default();
+        let ns = self.obj.namespace.as_ref().map_or_default(|n| format!("{n}-"));
         let name = format!("{}-{ns}{}.yaml", self.obj.kind.ar.kind.to_lowercase(), self.obj.name);
         // Private (a revealed Secret is in there) and never over an earlier download.
         let r = crate::private_files::create_new_in(&crate::paths::downloads_dir(), &name)
@@ -130,7 +130,7 @@ impl DetailPanel {
         let panel = cx.entity().downgrade();
         let (ns, pod, ctx) =
             (self.obj.namespace.clone().unwrap_or_default(), self.obj.name.clone(), self.context.clone());
-        let file = local.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+        let file = local.file_name().map_or_default(|n| n.to_string_lossy().to_string());
         window.open_alert_dialog(cx, move |alert, _, cx| {
             let (input, panel, container, local, guard) =
                 (input.clone(), panel.clone(), container.clone(), local.clone(), guard.clone());

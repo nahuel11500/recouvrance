@@ -72,7 +72,7 @@ impl Call {
     fn rule_label(&self, rule: Option<usize>) -> String {
         match rule {
             Some(i) => {
-                let note = self.policy().rules.get(i).map(|r| r.note.clone()).unwrap_or_default();
+                let note = self.policy().rules.get(i).map_or_default(|r| r.note.clone());
                 if note.is_empty() { format!("rule #{}", i + 1) } else { format!("rule #{} ({note})", i + 1) }
             }
             None => "no matching rule".into(),
@@ -288,7 +288,7 @@ pub(super) async fn get_named(
 fn manifest_summary(planned: &[(Kind, Option<String>, String, serde_json::Value)]) -> String {
     let mut out = String::from("Objects:\n");
     for (kind, ns, name, _) in planned {
-        let ns = ns.as_ref().map(|n| format!("{n}/")).unwrap_or_default();
+        let ns = ns.as_ref().map_or_default(|n| format!("{n}/"));
         out.push_str(&format!("  {} {ns}{name}\n", kind.ar.kind));
     }
     for (kind, _, _, doc) in planned {
@@ -313,7 +313,7 @@ fn manifest_objects(planned: &[(Kind, Option<String>, String, serde_json::Value)
             let secret = kind.is("", "Secret") || is_secret_object(doc);
             let yaml = k8s::to_yaml(doc, secret, false).unwrap_or_default();
             let hash = crate::hex::lower(&sha2::Sha256::digest(yaml.as_bytes())[..6]);
-            let ns = ns.as_ref().map(|n| format!("{n}/")).unwrap_or_default();
+            let ns = ns.as_ref().map_or_default(|n| format!("{n}/"));
             format!("{} {ns}{name} sha256:{hash}", kind.ar.kind)
         })
         .collect()
@@ -333,7 +333,7 @@ fn denied_namespaces(pods: &[serde_json::Value], denied: impl Fn(&str, &str) -> 
         .iter()
         .filter(|p| {
             let owners = p.pointer("/metadata/ownerReferences").and_then(|o| o.as_array());
-            let owners = owners.map(Vec::as_slice).unwrap_or_default();
+            let owners = owners.map_or_default(Vec::as_slice);
             let daemon = owners.iter().any(|o| o["kind"] == "DaemonSet");
             let managed = owners.iter().any(|o| o["controller"] == true);
             let mirror = p.pointer("/metadata/annotations/kubernetes.io~1config.mirror").is_some();
@@ -869,7 +869,7 @@ impl KubeMcp {
                     and its Ready condition and events.\n\
                  3. Report: certificates at risk, why renewal is not happening, and the fix. Read only.",
                 a.context,
-                a.namespace.as_ref().map(|n| format!(", namespace `{n}`")).unwrap_or_default()
+                a.namespace.as_ref().map_or_default(|n| format!(", namespace `{n}`"))
             ),
         )]
     }

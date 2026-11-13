@@ -166,7 +166,7 @@ impl AppView {
 
     pub(super) fn render_columns_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let choices = self.table.read(cx).delegate().column_choices();
-        let kind_name = self.kind.as_ref().map(Kind::kubectl_name).unwrap_or_default();
+        let kind_name = self.kind.as_ref().map_or_default(Kind::kubectl_name);
         let custom = self.column_prefs.custom(&kind_name);
         Popover::new("columns-popover")
             .anchor(Anchor::TopRight)

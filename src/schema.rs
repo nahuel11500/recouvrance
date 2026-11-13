@@ -127,8 +127,7 @@ impl Schema {
             required,
             enum_values: n["enum"]
                 .as_array()
-                .map(|e| e.iter().filter_map(|v| v.as_str().map(String::from)).collect())
-                .unwrap_or_default(),
+                .map_or_default(|e| e.iter().filter_map(|v| v.as_str().map(String::from)).collect()),
         }
     }
 
@@ -165,8 +164,7 @@ impl Schema {
                 }
                 p["required"]
                     .as_array()
-                    .map(|r| r.iter().filter_map(|x| x.as_str().map(String::from)).collect())
-                    .unwrap_or_default()
+                    .map_or_default(|r| r.iter().filter_map(|x| x.as_str().map(String::from)).collect())
             }),
             None => None,
         }
@@ -181,12 +179,10 @@ impl Schema {
         }
         let required: Vec<String> = inner["required"]
             .as_array()
-            .map(|r| r.iter().filter_map(|x| x.as_str().map(String::from)).collect())
-            .unwrap_or_default();
+            .map_or_default(|r| r.iter().filter_map(|x| x.as_str().map(String::from)).collect());
         let mut children: Vec<Field> = inner["properties"]
             .as_object()
-            .map(|props| props.iter().map(|(k, v)| self.field(k, v, required.contains(k))).collect())
-            .unwrap_or_default();
+            .map_or_default(|props| props.iter().map(|(k, v)| self.field(k, v, required.contains(k))).collect());
         children.sort_by(|a, b| b.required.cmp(&a.required).then(a.name.cmp(&b.name)));
         Some(Explained { path: path.to_vec(), field, children })
     }

@@ -58,7 +58,7 @@ impl DetailPanel {
     pub(super) fn merge_history(&mut self) {
         let Some(fetched) = &self.history.fetched else { return };
         let subject = format!("{} {}", self.obj.kind.ar.kind, self.obj.name);
-        let own = self.object.as_ref().map(|o| history::own_changes(&self.obj.kind, o)).unwrap_or_default();
+        let own = self.object.as_ref().map_or_default(|o| history::own_changes(&self.obj.kind, o));
         let events = match &self.events {
             Some(Ok(events)) => history::event_changes(events, &subject),
             _ => Vec::new(),
@@ -327,7 +327,7 @@ fn change_row(
     let (icon, color) = source_look(c.source, cx);
     let color = if c.warning { theme.warning } else { color };
     let (title, body) = title_and_body(c, subject);
-    let when = c.time.map(|t| format!("{} ago", k8s::age(t))).unwrap_or_default();
+    let when = c.time.map_or_default(|t| format!("{} ago", k8s::age(t)));
     let exact = c.time.map(|t| t.to_zoned(jiff::tz::TimeZone::system()).strftime("%Y-%m-%d %H:%M:%S").to_string());
     let body = match c.source {
         _ if body.is_empty() => None,

@@ -43,7 +43,7 @@ pub struct Grant {
 }
 
 fn strs(v: &Value, key: &str) -> Vec<String> {
-    v[key].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default()
+    v[key].as_array().map_or_default(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
 }
 
 /// Whether one PolicyRule allows `verb` on `group`/`resource` (resource may be `pods/log`).
@@ -150,8 +150,7 @@ pub fn service_account_grants(
         if !applies {
             continue;
         }
-        let rules =
-            role_rules(snap, b).map(|(r, _)| r["rules"].as_array().cloned().unwrap_or_default()).unwrap_or_default();
+        let rules = role_rules(snap, b).map_or_default(|(r, _)| r["rules"].as_array().cloned().unwrap_or_default());
         let role = format!(
             "{} {}",
             b.pointer("/roleRef/kind").and_then(Value::as_str).unwrap_or("?"),

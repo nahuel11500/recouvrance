@@ -267,7 +267,7 @@ impl SettingsView {
     /// Per cluster rows for the kubeconfig's current contexts (contexts come and go;
     /// checked when the section opens and when the kubeconfig reloads).
     pub fn sync_clusters(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let names = crate::k8s::load_contexts().map(|c| c.names).unwrap_or_default();
+        let names = crate::k8s::load_contexts().map_or_default(|c| c.names);
         self.cluster_inputs.retain(|(ctx, ..)| names.contains(ctx));
         self.prometheus.retain(|(ctx, _)| names.contains(ctx));
         self.run_as_inputs.retain(|(ctx, ..)| names.contains(ctx));
@@ -631,7 +631,7 @@ impl SettingsView {
         let s = settings::get();
         let theme = cx.theme().clone();
         let muted = theme.muted_foreground;
-        let names = crate::k8s::load_contexts().map(|c| c.names).unwrap_or_default();
+        let names = crate::k8s::load_contexts().map_or_default(|c| c.names);
         v_flex()
             .child(div().pb_2().text_sm().text_color(muted).child(
                 "Color a context to recognise it at a glance. Protected contexts ask you to type their name (or to wait, see General → Confirming) before any write. \
@@ -1075,8 +1075,7 @@ impl SettingsView {
     fn plugins_section(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme().clone();
         let muted = theme.muted_foreground;
-        let (plugins, error) =
-            cx.try_global::<crate::plugins::Loaded>().map(|l| (l.0.clone(), l.1.clone())).unwrap_or_default();
+        let (plugins, error) = cx.try_global::<crate::plugins::Loaded>().map_or_default(|l| (l.0.clone(), l.1.clone()));
         v_flex()
             .gap_3()
             .child(div().text_sm().text_color(muted).child(

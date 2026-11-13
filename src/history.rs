@@ -501,7 +501,7 @@ pub fn argo_changes(app: &Value) -> Vec<Change> {
         && let Some(phase) = op["phase"].as_str()
         && phase != "Succeeded"
     {
-        let message = op["message"].as_str().filter(|m| !m.is_empty()).map(|m| format!(": {m}")).unwrap_or_default();
+        let message = op["message"].as_str().filter(|m| !m.is_empty()).map_or_default(|m| format!(": {m}"));
         out.push(Change {
             time: timestamp(op.get("finishedAt")).or_else(|| timestamp(op.get("startedAt"))),
             source: Source::ArgoCd,
@@ -532,7 +532,7 @@ fn argo_initiator(h: &Value) -> String {
     if h.pointer("/initiatedBy/automated").and_then(Value::as_bool) == Some(true) {
         return " by auto-sync".into();
     }
-    h.pointer("/initiatedBy/username").and_then(Value::as_str).map(|u| format!(" by {u}")).unwrap_or_default()
+    h.pointer("/initiatedBy/username").and_then(Value::as_str).map_or_default(|u| format!(" by {u}"))
 }
 
 /// The deployments of the Applications that deployed an object, as its page's Argo CD
@@ -546,11 +546,7 @@ pub fn argo_lookup_changes(lookup: &k8s::argo::Lookup) -> Vec<Change> {
                 time: d.deployed_at.as_deref().and_then(|t| t.parse().ok()),
                 source: Source::ArgoCd,
                 object: format!("Application {}", found.app.name),
-                summary: format!(
-                    "deployed {}{}",
-                    d.revision,
-                    d.by.as_ref().map(|b| format!(" by {b}")).unwrap_or_default()
-                ),
+                summary: format!("deployed {}{}", d.revision, d.by.as_ref().map_or_default(|b| format!(" by {b}"))),
                 warning: false,
                 diff: None,
             })

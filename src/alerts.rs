@@ -808,7 +808,7 @@ mod tests {
         let names = |page: &Focus| -> Vec<(String, String)> {
             about(&all, page)
                 .iter()
-                .map(|a| (a.name().to_string(), a.object().map(|o| o.2.to_string()).unwrap_or_default()))
+                .map(|a| (a.name().to_string(), a.object().map_or_default(|o| o.2.to_string())))
                 .collect()
         };
         let own = [("Crash".to_string(), "web-7d9f-x2".to_string()), ("Mismatch".to_string(), "web".to_string())];

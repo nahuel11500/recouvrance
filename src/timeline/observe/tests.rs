@@ -173,7 +173,7 @@ fn an_object_adopted_by_a_controller_once_created_is_treated_as_its_own() {
         let fields = json!({"f:data": {"f:token": {}}, "f:metadata": {"f:ownerReferences": {"k:{\"uid\":\"j\"}": {}}}});
         let mut v2 = object(2, 1, json!({}), json!({"token": "dG9r"}), vec![writer("operator", "", 1, fields)]);
         let owner = json!({"controller": true, "kind": "Job", "name": "scan", "uid": "j"});
-        v2["metadata"]["ownerReferences"] = json!([owner.clone()]);
+        v2["metadata"]["ownerReferences"] = json!([owner]);
         let raw = serde_json::value::to_raw_value(&v2).unwrap();
         let obs = Observed::new(serde_json::from_str(raw.get()).unwrap(), full.then(|| v2.clone()), &info).unwrap();
         let (record, adopted) = observe(&mut st, &info, full, obs, How::Modified, jiff::Timestamp::now(), at);

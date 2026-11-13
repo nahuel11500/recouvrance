@@ -153,8 +153,7 @@ pub(super) fn secret_entry(ctx: &Ctx, i: usize, cx: &App) -> AnyElement {
     let decoded = v
         .as_str()
         .and_then(|b| base64::engine::general_purpose::STANDARD.decode(b).ok())
-        .map(String::from_utf8_lossy_owned)
-        .unwrap_or_default();
+        .map_or_default(String::from_utf8_lossy_owned);
     let shown = ctx.reveal || ctx.revealed_keys.contains(k);
     let value = if shown { decoded.clone() } else { "••••••••••••".to_string() };
     let (panel, key) = (ctx.panel.clone(), k.clone());
@@ -258,7 +257,7 @@ pub fn crd_rows(obj: &Value) -> Vec<SchemaRow> {
 fn schema_rows(node: &Value, depth: usize, out: &mut Vec<SchemaRow>) {
     let node = if node["type"] == "array" { &node["items"] } else { node };
     let required: Vec<&str> =
-        node["required"].as_array().map(|r| r.iter().filter_map(Value::as_str).collect()).unwrap_or_default();
+        node["required"].as_array().map_or_default(|r| r.iter().filter_map(Value::as_str).collect());
     let Some(props) = node["properties"].as_object() else { return };
     for (name, p) in props {
         let desc = p["description"].as_str().unwrap_or_default().lines().next().unwrap_or_default().to_string();
@@ -277,8 +276,7 @@ pub(super) fn crd(ctx: &Ctx, cx: &App) -> Div {
     let plural = names["plural"].as_str().unwrap_or_default().to_string();
     let short: Vec<String> = names["shortNames"]
         .as_array()
-        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
-        .unwrap_or_default();
+        .map_or_default(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect());
     let versions = arr(obj, "/spec/versions");
     let storage = versions.iter().find(|v| v["storage"] == true).or(versions.first());
     let storage = storage.and_then(|v| v["name"].as_str()).unwrap_or_default();

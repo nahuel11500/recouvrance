@@ -570,7 +570,7 @@ fn usage_bar(
     let cpu = col == Col::Cpu;
     let format: fn(f64) -> String = if cpu { k8s::format_cpu } else { k8s::format_bytes };
     let (value, color) = if cpu { (used.0, theme.blue) } else { (used.1, theme.success) };
-    let (request, limit) = res.map(|r| if cpu { r.cpu } else { r.mem }).unwrap_or_default();
+    let (request, limit) = res.map_or_default(|r| if cpu { r.cpu } else { r.mem });
     // Short figures keep the bars lined up; never clipped if one is wider. Exact ones on hover.
     let short = if cpu { k8s::short_cpu(value) } else { k8s::short_bytes(value) };
     let figure = div().min_w(px(52.)).flex_shrink_0().whitespace_nowrap().text_right().child(short);

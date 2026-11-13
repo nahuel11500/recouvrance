@@ -377,7 +377,7 @@ impl TimelineView {
             .hover(|s| s.bg(theme.list_hover))
             .when(picked, |d| d.bg(theme.blue.opacity(0.12)))
             .on_click(cx.listener(move |this, _, _, cx| this.pick(ix, cx)))
-            .child(cell(56.).text_sm().text_color(muted).child(e.time().map(k8s::age).unwrap_or_default()))
+            .child(cell(56.).text_sm().text_color(muted).child(e.time().map_or_default(k8s::age)))
             .when(multi, |d| d.child(cell(140.).text_sm().text_color(muted).child(e.context().to_string())))
             .child(cell(64.).text_xs().text_color(if e.is_event() { muted } else { theme.blue }).child(source))
             .child(cell(130.).text_xs().text_color(muted).child(e.kind().to_string()))
@@ -400,7 +400,7 @@ impl TimelineView {
     fn detail(&self, e: &Entry, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme().clone();
         let muted = theme.muted_foreground;
-        let when = e.time().map(|t| t.strftime("%Y-%m-%d %H:%M:%S UTC").to_string()).unwrap_or_default();
+        let when = e.time().map_or_default(|t| t.strftime("%Y-%m-%d %H:%M:%S UTC").to_string());
         let connected = self.clusters.iter().any(|(c, _)| c == e.context());
         let deleted = matches!(e, Entry::Change(_, r) if r.what == What::Deleted);
         let open = e.open();
@@ -434,7 +434,7 @@ impl TimelineView {
                     .child(div().text_sm().font_weight(FontWeight::MEDIUM).child(format!(
                         "{} {}{}",
                         e.kind(),
-                        e.namespace().map(|ns| format!("{ns}/")).unwrap_or_default(),
+                        e.namespace().map_or_default(|ns| format!("{ns}/")),
                         e.name()
                     )))
                     .child(div().text_xs().text_color(muted).child(format!("{} · {when}", e.context())))

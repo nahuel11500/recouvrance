@@ -433,7 +433,7 @@ fn event_row(e: &k8s::EventLine, cx: &App) -> impl IntoElement {
     let theme = cx.theme();
     let warning = is_warning(e);
     let tone = if warning { theme.warning } else { theme.muted_foreground };
-    let when = e.last.map(|t| format!("{} ago", k8s::age(t))).unwrap_or_default();
+    let when = e.last.map_or_default(|t| format!("{} ago", k8s::age(t)));
     h_flex()
         .w_full()
         .items_start()
@@ -483,7 +483,7 @@ impl Render for DetailPanel {
         if crate::reachability::Target::of(&self.obj.kind).is_some() {
             tabs.push(DetailTab::Reachability);
         }
-        let containers = self.object.as_ref().map(container_names).unwrap_or_default();
+        let containers = self.object.as_ref().map_or_default(container_names);
         // How many events, in the warning color when one is a warning.
         let events_badge = match &self.events {
             Some(Ok(events)) if !events.is_empty() => {
