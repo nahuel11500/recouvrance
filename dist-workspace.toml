@@ -52,6 +52,9 @@ libx11-xcb-dev = "*"
 libxcb1-dev = "*"
 
 [dist.github-custom-runners]
+# dist's default for Apple Silicon, macos-14, is no longer offered by GitHub ("The configuration
+# 'macos-14-arm64-us-default' is not supported"): its job is cancelled at once.
+aarch64-apple-darwin = "macos-15"
 aarch64-unknown-linux-gnu = "ubuntu-24.04-arm"
 # Intel Macs are cross-built on Apple Silicon: the Intel runners take three times as long.
 x86_64-apple-darwin = { runner = "macos-15", host = "aarch64-apple-darwin" }
