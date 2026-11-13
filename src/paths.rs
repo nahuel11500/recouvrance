@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 /// The user's home directory (empty when `HOME` is not set).
 pub fn home() -> PathBuf {
-    std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default()
+    std::env::var_os("HOME").map_or_default(PathBuf::from)
 }
 
 /// `$XDG_CONFIG_HOME/recouvrance`, by default `~/.config/recouvrance`.

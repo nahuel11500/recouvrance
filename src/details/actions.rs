@@ -427,8 +427,7 @@ impl DetailPanel {
             .as_ref()
             .and_then(|o| o.pointer("/spec/containers"))
             .and_then(|c| c.as_array())
-            .map(|a| a.iter().filter_map(|c| c["name"].as_str().map(String::from)).collect())
-            .unwrap_or_default();
+            .map_or_default(|a| a.iter().filter_map(|c| c["name"].as_str().map(String::from)).collect());
         let image = cx.new(|cx| {
             let mut s = InputState::new(window, cx);
             s.set_value("busybox:1.37", window, cx);
@@ -643,7 +642,7 @@ impl DetailPanel {
         let obj: serde_json::Value = match crate::yaml::from_str(&text) {
             Ok(v) => v,
             Err(e) => {
-                let at = e.location().map(|l| format!(" at line {}", l.line())).unwrap_or_default();
+                let at = e.location().map_or_default(|l| format!(" at line {}", l.line()));
                 let msg = format!("Invalid YAML{at}: {}", crate::yaml::message(&e));
                 window.push_notification(Notification::error(msg), cx);
                 return;
@@ -732,7 +731,7 @@ pub(crate) fn shell_word(s: &str) -> String {
 
 /// `kubectl --context C [-n NS] ARGS`, the context and namespace quoted for a shell.
 pub(crate) fn kubectl(context: &str, ns: Option<&str>, args: &str) -> String {
-    let ns = ns.map(|n| format!(" -n {}", shell_word(n))).unwrap_or_default();
+    let ns = ns.map_or_default(|n| format!(" -n {}", shell_word(n)));
     format!("kubectl --context {}{ns} {args}", shell_word(context))
 }
 

@@ -153,8 +153,7 @@ pub fn usage_chart(data: &crate::prom::Series, spec: ChartSpec, cx: &App) -> Div
     let time_fmt = if minutes > 1440 { "%a %H:%M" } else { "%H:%M" };
     let label = move |t: i64| {
         jiff::Timestamp::from_second(t)
-            .map(|t| t.to_zoned(jiff::tz::TimeZone::system()).strftime(time_fmt).to_string())
-            .unwrap_or_default()
+            .map_or_default(|t| t.to_zoned(jiff::tz::TimeZone::system()).strftime(time_fmt).to_string())
     };
     let max = data.iter().map(|p| p.1).fold(0.0, f64::max);
     // Scale to usage and request; a far-away limit would flatten the curve.
@@ -171,7 +170,7 @@ pub fn usage_chart(data: &crate::prom::Series, spec: ChartSpec, cx: &App) -> Div
         .filter(|p| is_stale(p.0, jiff::Timestamp::now().as_second(), minutes))
         .and_then(|p| jiff::Timestamp::from_second(p.0).ok());
     let data: Vec<(String, f64)> = data.iter().map(|(t, v)| (label(*t), *v)).collect();
-    let last = data.last().map(|p| fmt(p.1)).unwrap_or_default();
+    let last = data.last().map_or_default(|p| fmt(p.1));
     let last = match stale {
         Some(t) => format!("{last} · {} ago", k8s::age(t)),
         None => last,

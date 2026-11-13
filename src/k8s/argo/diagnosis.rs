@@ -509,7 +509,7 @@ fn stuck(app: &Value, now: Timestamp) -> Option<Finding> {
     for r in arr(op, "/syncResult/resources").iter().filter(|r| r["hookPhase"] == "Running") {
         let Some(res) = Res::of(r) else { continue };
         if !objects.iter().any(|(o, _)| o.same(&res)) {
-            let hook = r["hookType"].as_str().map(|h| format!("{h} hook ")).unwrap_or_default();
+            let hook = r["hookType"].as_str().map_or_default(|h| format!("{h} hook "));
             objects.push((res, format!("{hook}still running")));
         }
     }

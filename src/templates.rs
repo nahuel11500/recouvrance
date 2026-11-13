@@ -102,7 +102,7 @@ pub fn all(namespace: &str) -> Vec<Template> {
     files.sort();
     for p in files {
         if let Ok(body) = std::fs::read_to_string(&p) {
-            let name = p.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+            let name = p.file_stem().map_or_default(|s| s.to_string_lossy().to_string());
             out.push(Template { name, body: substitute(&body, namespace), user: true });
         }
     }

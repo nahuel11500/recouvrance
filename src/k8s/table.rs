@@ -305,8 +305,7 @@ fn row_from(cells: Vec<String>, meta: LeanMeta) -> Option<Arc<Row>> {
         deleted_at: meta.deletion_timestamp.as_deref().and_then(|t| t.parse::<jiff::Timestamp>().ok()),
         labels: meta
             .labels
-            .map(|l| l.into_iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join("\n"))
-            .unwrap_or_default()
+            .map_or_default(|l| l.into_iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join("\n"))
             .into(),
     }))
 }

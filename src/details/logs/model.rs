@@ -122,10 +122,8 @@ pub(crate) fn readable_json(text: &str) -> Option<(String, usize)> {
     let obj: serde_json::Map<String, serde_json::Value> = serde_json::from_str(t).ok()?;
     let skip = ["level", "levelname", "severity", "lvl", "time", "timestamp", "ts", "@timestamp"];
     let msg_key = ["msg", "message", "event", "log"].into_iter().find(|k| obj.contains_key(*k));
-    let mut line = msg_key
-        .and_then(|k| obj.get(k))
-        .map(|m| m.as_str().map_or_else(|| m.to_string(), escape_controls))
-        .unwrap_or_default();
+    let mut line =
+        msg_key.and_then(|k| obj.get(k)).map_or_default(|m| m.as_str().map_or_else(|| m.to_string(), escape_controls));
     let fields_at = line.len();
     // Sorted, so the same fields line up from one line to the next.
     let mut fields: Vec<_> = obj.iter().collect();
@@ -538,7 +536,7 @@ pub(crate) fn stream_status(pods: &[String], states: &[StreamState]) -> Option<S
     if !states.is_empty() && states.iter().all(|s| *s == StreamState::Connecting) {
         return Some("Connecting…".into());
     }
-    let short = |i: usize| pods.get(i).map(|p| p.rsplit('-').next().unwrap_or(p).to_string()).unwrap_or_default();
+    let short = |i: usize| pods.get(i).map_or_default(|p| p.rsplit('-').next().unwrap_or(p).to_string());
     let group = |label: &str, pick: &dyn Fn(&StreamState) -> Option<String>| {
         let names: Vec<String> =
             states.iter().enumerate().filter_map(|(i, s)| pick(s).map(|n| n + &short(i))).collect();

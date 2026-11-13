@@ -124,7 +124,7 @@ async fn get_metrics(client: &Client, path: &str) -> Result<(serde_json::Value, 
         return Err(kube::Error::Api(refusal.boxed()).into());
     }
     let list: serde_json::Value = serde_json::from_slice(&body)?;
-    let read = reading(list["items"].as_array().map(Vec::as_slice).unwrap_or_default(), date);
+    let read = reading(list["items"].as_array().map_or_default(Vec::as_slice), date);
     Ok((list, read))
 }
 

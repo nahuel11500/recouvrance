@@ -303,7 +303,7 @@ pub fn label_selection(selector: Option<&serde_json::Value>, empty_is_all: bool)
     for e in selector.get("matchExpressions").and_then(|e| e.as_array()).into_iter().flatten() {
         let key = e["key"].as_str().unwrap_or_default();
         let values: Vec<&str> =
-            e["values"].as_array().map(|v| v.iter().filter_map(|x| x.as_str()).collect()).unwrap_or_default();
+            e["values"].as_array().map_or_default(|v| v.iter().filter_map(|x| x.as_str()).collect());
         parts.push(match e["operator"].as_str().unwrap_or_default() {
             "In" => format!("{key} in ({})", values.join(",")),
             "NotIn" => format!("{key} notin ({})", values.join(",")),
@@ -352,7 +352,7 @@ pub fn selector_matches(selector: &serde_json::Value, labels: &serde_json::Map<S
     let me = selector.get("matchExpressions").and_then(|e| e.as_array()).into_iter().flatten().all(|e| {
         let key = e["key"].as_str().unwrap_or_default();
         let values: Vec<&str> =
-            e["values"].as_array().map(|v| v.iter().filter_map(|x| x.as_str()).collect()).unwrap_or_default();
+            e["values"].as_array().map_or_default(|v| v.iter().filter_map(|x| x.as_str()).collect());
         match e["operator"].as_str().unwrap_or_default() {
             "In" => get(key).is_some_and(|v| values.contains(&v)),
             "NotIn" => get(key).is_none_or(|v| !values.contains(&v)),

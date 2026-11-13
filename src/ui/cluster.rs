@@ -220,7 +220,7 @@ struct MetricsContainer {
 }
 
 fn quantity<'a>(m: &'a HashMap<String, String>, key: &str) -> &'a str {
-    m.get(key).map(String::as_str).unwrap_or_default()
+    m.get(key).map_or_default(String::as_str)
 }
 
 /// Nodes into the summary: readiness, problems, kubelet versions and allocatable.

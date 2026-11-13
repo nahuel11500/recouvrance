@@ -312,8 +312,7 @@ fn state_color(text: &str, cx: &App) -> Hsla {
 fn pairs(v: &Value, path: &str) -> Vec<String> {
     v.pointer(path)
         .and_then(Value::as_object)
-        .map(|m| m.iter().map(|(k, v)| format!("{k}: {}", v.as_str().unwrap_or_default())).collect())
-        .unwrap_or_default()
+        .map_or_default(|m| m.iter().map(|(k, v)| format!("{k}: {}", v.as_str().unwrap_or_default())).collect())
 }
 
 /// First few items, then "+N more".

@@ -59,7 +59,7 @@ pub(super) fn workload(ctx: &Ctx, cx: &App) -> Div {
     root = root.child(scheduling(obj, template_spec, cx));
 
     // Template containers with average usage across the workload's pods.
-    let containers = obj.pointer(template_spec).map(k8s::spec_containers).unwrap_or_default();
+    let containers = obj.pointer(template_spec).map_or_default(k8s::spec_containers);
     if !containers.is_empty() {
         let pods = &ctx.related.pods;
         root = root.child(usage_heading("Containers", ctx.related, cx)).child(h_flex().flex_wrap().gap_3().children(
@@ -126,8 +126,7 @@ pub(super) fn scheduling(obj: &Value, spec: &str, cx: &App) -> AnyElement {
         return div().into_any_element();
     }
     let expr = |e: &Value| {
-        let vals: Vec<&str> =
-            e["values"].as_array().map(|a| a.iter().filter_map(|v| v.as_str()).collect()).unwrap_or_default();
+        let vals: Vec<&str> = e["values"].as_array().map_or_default(|a| a.iter().filter_map(|v| v.as_str()).collect());
         format!("{} {} [{}]", e["key"].as_str().unwrap_or("?"), e["operator"].as_str().unwrap_or("?"), vals.join(", "))
     };
     let mut col = v_flex().w(px(520.)).gap_2();
@@ -183,8 +182,8 @@ pub(super) fn scheduling(obj: &Value, spec: &str, cx: &App) -> AnyElement {
             .iter()
             .map(|t| {
                 let key = t["key"].as_str().unwrap_or("*");
-                let value = t["value"].as_str().map(|v| format!(" = {v}")).unwrap_or_default();
-                let effect = t["effect"].as_str().map(|e| format!(" ({e})")).unwrap_or_default();
+                let value = t["value"].as_str().map_or_default(|v| format!(" = {v}"));
+                let effect = t["effect"].as_str().map_or_default(|e| format!(" ({e})"));
                 format!("{key}{value}{effect}")
             })
             .collect();
@@ -444,7 +443,7 @@ pub fn revisions(ctx: &Ctx, cx: &App) -> AnyElement {
     let newest = rs.first().copied();
     let rows = rs.iter().enumerate().map(|(i, r)| {
         let name = s(r, "/metadata/name").unwrap_or_default().to_string();
-        let template = r.pointer("/spec/template/spec").map(k8s::spec_containers).unwrap_or_default();
+        let template = r.pointer("/spec/template/spec").map_or_default(k8s::spec_containers);
         let images: Vec<&str> = template.iter().filter_map(|c| c.spec["image"].as_str()).collect();
         let selected = ctx.compare == Some(name.as_str());
         let panel = ctx.panel.clone();
@@ -594,7 +593,7 @@ fn hpa_metric_id(m: &Value) -> (String, String, String) {
 /// The field holding a metric of this type: "Resource" -> "resource", "" stays "".
 fn metric_key(kind: &str) -> String {
     let mut chars = kind.chars();
-    chars.next().map(|first| first.to_lowercase().chain(chars).collect()).unwrap_or_default()
+    chars.next().map_or_default(|first| first.to_lowercase().chain(chars).collect())
 }
 
 pub(super) fn hpa(ctx: &Ctx, cx: &App) -> Div {

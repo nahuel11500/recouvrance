@@ -422,8 +422,7 @@ pub enum Backend {
 pub fn claude_code() -> Option<PathBuf> {
     let home = crate::paths::home();
     std::env::var_os("PATH")
-        .map(|p| std::env::split_paths(&p).collect::<Vec<_>>())
-        .unwrap_or_default()
+        .map_or_default(|p| std::env::split_paths(&p).collect::<Vec<_>>())
         .into_iter()
         .chain([home.join(".local/bin"), home.join(".claude/local"), PathBuf::from("/usr/local/bin")])
         .map(|d| d.join("claude"))

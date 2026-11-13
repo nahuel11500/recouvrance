@@ -326,8 +326,7 @@ pub(super) fn node_devices(ctx: &Ctx, cx: &App) -> Option<Div> {
                             "{k}={}",
                             v.as_object()
                                 .and_then(|o| o.values().next())
-                                .map(|x| x.to_string().trim_matches('"').to_string())
-                                .unwrap_or_default()
+                                .map_or_default(|x| x.to_string().trim_matches('"').to_string())
                         )
                     })
                     .collect();

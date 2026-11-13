@@ -20,7 +20,7 @@ async fn paged(client: &Client, extra: &str) -> Result<String> {
     let (mut pages, mut rows, mut bytes, mut first) = (0, 0, 0usize, None);
     let mut token: Option<String> = None;
     loop {
-        let cont = token.as_ref().map(|t| format!("&continue={t}")).unwrap_or_default();
+        let cont = token.as_ref().map_or_default(|t| format!("&continue={t}"));
         let include = if extra.contains("includeObject") { "" } else { "&includeObject=Metadata" };
         let path = format!("/api/v1/pods?limit=2000{include}{extra}{cont}");
         let text = client.request_text(table_get(&path)?).await?;

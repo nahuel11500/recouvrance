@@ -339,7 +339,7 @@ impl AppView {
     }
 
     fn on_screen(&self, cx: &App) -> OnScreen {
-        let context_of = |i: usize| self.clusters.get(i).map(|(c, _)| c.clone()).unwrap_or_default();
+        let context_of = |i: usize| self.clusters.get(i).map_or_default(|(c, _)| c.clone());
         match self.route() {
             Route::Detail(d) => {
                 let (context, obj) = d.read(cx).subject();

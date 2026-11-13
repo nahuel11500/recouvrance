@@ -294,12 +294,7 @@ struct Tbl {
 
 impl Tbl {
     fn cell<'a>(&self, row: &'a k8s::Row, name: &str) -> &'a str {
-        self.defs
-            .iter()
-            .position(|d| d.name == name)
-            .and_then(|i| row.cells.get(i))
-            .map(String::as_str)
-            .unwrap_or_default()
+        self.defs.iter().position(|d| d.name == name).and_then(|i| row.cells.get(i)).map_or_default(String::as_str)
     }
 
     /// "3/5" -> (3, 5)
@@ -618,7 +613,7 @@ async fn load(client: Client, ns: Option<String>, context: String, tx: futures::
             k8s::list_values_fields(c(), k8s::ar_of::<core::Event>(), ns.clone(), None, Some("type=Warning".into()))
                 .await
                 .map_err(|e| k8s::lists::load_error(&e));
-        send(Piece::Warnings(events.as_deref().map(recent_warnings).unwrap_or_default()));
+        send(Piece::Warnings(events.as_deref().map_or_default(recent_warnings)));
         if let Err(e) = events {
             send(Piece::Failed(Section::Warnings, e));
         }

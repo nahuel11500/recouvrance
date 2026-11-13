@@ -191,7 +191,7 @@ pub fn inspect_pasted(text: &str) -> Result<Pasted> {
         suggested_name: kc.current_context.clone().unwrap_or_else(|| kc.contexts[0].name.clone()),
         ..Default::default()
     };
-    let existing = load_contexts().map(|c| c.names).unwrap_or_default();
+    let existing = load_contexts().map_or_default(|c| c.names);
     p.taken = p.contexts.iter().filter(|c| existing.contains(c)).cloned().collect();
     for c in &kc.contexts {
         let Some(ctx) = &c.context else {

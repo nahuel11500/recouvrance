@@ -201,12 +201,7 @@ impl HelmList {
             )
             .child(div().w(px(140.)).overflow_hidden().text_ellipsis().whitespace_nowrap().child(r.app_version.clone()))
             .child(div().w(px(100.)).text_color(status_color(&r.status, cx)).child(r.status.clone()))
-            .child(
-                div()
-                    .w(px(80.))
-                    .text_color(cx.theme().muted_foreground)
-                    .child(r.updated.map(k8s::age).unwrap_or_default()),
-            )
+            .child(div().w(px(80.)).text_color(cx.theme().muted_foreground).child(r.updated.map_or_default(k8s::age)))
             .into_any_element()
     }
 }
@@ -741,7 +736,7 @@ impl Render for HelmRelease {
                         .child(field("Revision", r.revision.to_string(), cx))
                         .child(field("Chart", format!("{} {}", r.chart, r.chart_version), cx))
                         .child(field("App version", r.app_version.clone(), cx))
-                        .child(field("Updated", r.updated.map(|t| format!("{} ago", k8s::age(t))).unwrap_or_default(), cx)),
+                        .child(field("Updated", r.updated.map_or_default(|t| format!("{} ago", k8s::age(t))), cx)),
                 )
                 .child(field("Description", r.description.clone(), cx))
                 .when(!r.notes.is_empty(), |d| {
@@ -851,7 +846,7 @@ impl Render for HelmRelease {
                             .child(div().w(px(110.)).text_color(status_color(&h.status, cx)).child(h.status.clone()))
                             .child(div().w(px(240.)).child(format!("{}-{}", h.chart, h.chart_version)))
                             .child(div().w(px(140.)).child(h.app_version.clone()))
-                            .child(div().w(px(80.)).text_color(theme.muted_foreground).child(h.updated.map(k8s::age).unwrap_or_default()))
+                            .child(div().w(px(80.)).text_color(theme.muted_foreground).child(h.updated.map_or_default(k8s::age)))
                             .child(div().flex_1().min_w_0().overflow_hidden().text_ellipsis().whitespace_nowrap().child(h.description.clone()))
                             .child(div().w(px(110.)).when(has_before, |d| {
                                 let rev = h.revision;
