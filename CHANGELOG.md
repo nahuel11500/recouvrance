@@ -5,6 +5,15 @@ and versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.7.1](https://github.com/nahuel11500/recouvrance/compare/v0.7.0...v0.7.1) - 2026-11-13
+
+The same app as 0.7.0, whose binaries were never published: GitHub no longer runs the macOS
+runner its Apple Silicon build asked for.
+
+### Fixed
+
+- *(release)* Build Apple Silicon on macos-15, macos-14 is retired (#796)
+
 ## [0.7.0](https://github.com/nahuel11500/recouvrance/compare/v0.6.0...v0.7.0) - 2026-11-13
 
 ### Added
