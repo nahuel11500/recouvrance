@@ -5,6 +5,34 @@ and versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.7.0](https://github.com/nahuel11500/recouvrance/compare/v0.6.0...v0.7.0) - 2026-11-13
+
+### Added
+
+- *(nodes)* Show the local storage left in TopoLVM volume groups (#782)
+- *(argo)* Read what an Application being deleted lists live (#780)
+- *(history)* A timeline grouped by day, shorter image changes (#765)
+- *(table)* Each resource type keeps its own filter (#760)
+- *(details)* An Events tab that scans: warnings counted on the tab, who reported each event, how often and over how long (#756)
+
+### Fixed
+
+- *(mcp)* Keep trying a busy port instead of staying down (#795)
+- *(ui)* Singular nouns for a count of 1 ("1 reason", "Data (1 key)") (#779)
+- *(pods)* List native sidecars, init and debug containers everywhere (#787)
+- *(certs)* A certificate that ends within the day expires in less than a day, not 0 days (#778)
+- *(theme)* Draw bold text bold on Linux with a variable UI font (#777)
+- *(details)* Read the usage of the pods every page lists (#781)
+- *(mcp)* Logs read the pod's default container when none is named (#783)
+- *(k8s)* Answer at once when an aggregated API is down (#786)
+- *(shell)* Hang up a container shell when it is closed (#784)
+- *(ui)* Keep the object's name readable when the Problems page narrows (#785)
+- *(mcp)* Usage_history measures a node instead of calling it a workload (#776)
+- *(details)* The dot before an object's age follows its conditions, phase and health (#775)
+- *(compare)* Sort keys before diffing, so key order is no change (#774)
+- *(details)* A slow kubelet no longer holds a pod page's usage (#771)
+- *(table)* Usage figures in three digits, never cut (111.17Gi read 11.17Gi) (#758)
+
 ## [0.6.0](https://github.com/nahuel11500/recouvrance/compare/v0.5.0...v0.6.0) - 2026-11-05
 
 ### Added
