@@ -42,7 +42,9 @@ Useful variables: `RECOUVRANCE_PAGE` (`apply`, `settings`, `cluster`, `access`, 
 `RECOUVRANCE_FILTER`, `RECOUVRANCE_ACT` (comma-separated hooks, see `src/app/demo.rs` and
 `src/details/demo.rs`), `RECOUVRANCE_INPUT` (`click:x,y;key:enter;wait:2`), `RECOUVRANCE_WRITES=1`,
 `RECOUVRANCE_DARK=1`, `RECOUVRANCE_ZOOM`. Point `XDG_CONFIG_HOME` at a scratch folder to keep your
-settings untouched.
+settings untouched. Give it another MCP port too (`{"port": 47199, "version": 1}` in
+`$XDG_CONFIG_HOME/recouvrance/agents.json`), so it doesn't take 47070 from the Recouvrance you
+have open.
 
 **Smoke checks**: `RECOUVRANCE_SMOKE=<context> cargo run --features dev` lists types and watches
 pods; add `RECOUVRANCE_LISTTIME=1`, `RECOUVRANCE_PROBLEMS=1`, or dry runs such as

@@ -121,15 +121,23 @@ fn serve() {
     eprintln!("Recouvrance MCP on http://127.0.0.1:{}/mcp", hub.port());
     futures::executor::block_on(async {
         use futures::StreamExt as _;
+        let mut last_error = String::new();
         while let Some(ev) = events.next().await {
             match &*ev {
                 mcp::HubEvent::Audit(e) => {
                     eprintln!("{} {:?} {} {} {}ms {}", e.agent, e.decision, e.tool, e.args, e.duration_ms, e.detail);
                 }
                 mcp::HubEvent::ServerStatus(Err(e)) => {
-                    eprintln!("server error: {e}");
-                    return;
+                    if *e != last_error {
+                        eprintln!("server error: {e}");
+                        last_error.clone_from(e);
+                    }
+                    // A busy port is tried again (`mcp::server`): keep waiting for it.
+                    if !e.contains("trying again") {
+                        return;
+                    }
                 }
+                mcp::HubEvent::ServerStatus(Ok(port)) => eprintln!("listening on 127.0.0.1:{port}"),
                 _ => {}
             }
         }

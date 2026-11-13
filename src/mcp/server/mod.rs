@@ -994,6 +994,33 @@ pub(crate) fn stop_check(
     }
 }
 
+/// How long to wait before trying a busy port again.
+const BIND_RETRY: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Listens on `127.0.0.1` at `port()`. While the address is in use (another Recouvrance, or one
+/// that is quitting), says so through `busy` and tries again every `every`, reading `port()`
+/// again each time, so a port changed in Settings meanwhile is the one tried. Any other
+/// error ends it.
+async fn bind(
+    port: impl Fn() -> u16,
+    every: std::time::Duration,
+    busy: impl Fn(String),
+) -> Result<tokio::net::TcpListener, String> {
+    loop {
+        let port = port();
+        match tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
+            Ok(l) => return Ok(l),
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => busy(format!(
+                "cannot listen on 127.0.0.1:{port}: {e} (another Recouvrance may be running; \
+                 trying again every {}s, or change the port in Settings → Agents)",
+                every.as_secs()
+            )),
+            Err(e) => return Err(format!("cannot listen on 127.0.0.1:{port}: {e}")),
+        }
+        tokio::time::sleep(every).await;
+    }
+}
+
 pub fn start(hub: Arc<Hub>) -> TaskGuard {
     k8s::spawn_guarded(async move {
         let port = hub.port();
@@ -1008,18 +1035,14 @@ pub fn start(hub: Arc<Hub>) -> TaskGuard {
         let app = axum::Router::new()
             .nest_service("/mcp", mcp)
             .layer(axum::middleware::from_fn_with_state(hub.clone(), auth));
-        let listener = match tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
+        let listener = match bind(|| hub.port(), BIND_RETRY, |e| hub.emit(HubEvent::ServerStatus(Err(e)))).await {
             Ok(l) => l,
             Err(e) => {
-                let hint = if e.kind() == std::io::ErrorKind::AddrInUse {
-                    " (another Recouvrance may be running; change the port in Settings → Agents)"
-                } else {
-                    ""
-                };
-                hub.emit(HubEvent::ServerStatus(Err(format!("cannot listen on 127.0.0.1:{port}: {e}{hint}"))));
+                hub.emit(HubEvent::ServerStatus(Err(e)));
                 return;
             }
         };
+        let port = listener.local_addr().map_or(port, |a| a.port());
         hub.emit(HubEvent::ServerStatus(Ok(port)));
         if let Err(e) = axum::serve(listener, app).await {
             hub.emit(HubEvent::ServerStatus(Err(e.to_string())));
@@ -1307,5 +1330,40 @@ mod tests {
         denied.rules.push(rule(Mode::Deny, "delete", "app"));
         assert!(denies_eviction(&denied, &pod("app")));
         assert!(!denies_eviction(&denied, &pod("other")));
+    }
+
+    /// A port busy at start is tried again, and the server listens once it is free (#794).
+    #[tokio::test]
+    async fn a_busy_port_is_tried_again_until_free() {
+        let held = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = held.local_addr().unwrap().port();
+        let said = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let busy = {
+            let said = said.clone();
+            move |e: String| said.lock().unwrap().push(e)
+        };
+        let every = std::time::Duration::from_millis(20);
+        let bound = tokio::spawn(async move { bind(|| port, every, busy).await });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(!bound.is_finished(), "it waits while the port is busy");
+        drop(held);
+        let listener = tokio::time::timeout(std::time::Duration::from_secs(5), bound).await.unwrap().unwrap().unwrap();
+        assert_eq!(listener.local_addr().unwrap().port(), port);
+        let said = said.lock().unwrap();
+        assert!(!said.is_empty() && said[0].contains("trying again"), "{said:?}");
+    }
+
+    /// A port changed while waiting is the one tried next.
+    #[tokio::test]
+    async fn a_port_changed_while_waiting_is_used() {
+        let held = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let busy_port = held.local_addr().unwrap().port();
+        let tries = std::sync::atomic::AtomicU32::new(0);
+        // The first try finds the busy port, the next ones a free one (0: any).
+        let port = || if tries.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 { busy_port } else { 0 };
+        let every = std::time::Duration::from_millis(10);
+        let listener =
+            tokio::time::timeout(std::time::Duration::from_secs(5), bind(port, every, |_| {})).await.unwrap().unwrap();
+        assert_ne!(listener.local_addr().unwrap().port(), busy_port);
     }
 }

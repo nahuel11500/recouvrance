@@ -57,7 +57,9 @@ an agent has used the app end to end and found nothing blocking:
 - Build once with `--features dev` (the rules under Building apply) and drive the real app with
   the developer tools in [docs/development.md](docs/development.md#developer-tools---features-dev):
   snapshots, `RECOUVRANCE_ACT` hooks and `RECOUVRANCE_INPUT` clicks, with `XDG_CONFIG_HOME` in a
-  scratch folder.
+  scratch folder. Give that instance its own MCP port before starting it
+  (`echo '{"port": 47199, "version": 1}' > "$XDG_CONFIG_HOME/recouvrance/agents.json"`): on the
+  default 47070 it takes the port of the user's own Recouvrance, whose agents then can't connect.
 - Cover every feature and fix merged since the last tag (`git log <last tag>..origin/main`,
   and the PRs it names), then the main paths of [docs/features.md](docs/features.md): switching
   and combining contexts and namespaces, tables, a detail page and its tabs, logs, shells,

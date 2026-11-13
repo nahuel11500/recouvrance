@@ -334,7 +334,7 @@ impl Hub {
         read(&self.config).port
     }
 
-    /// Takes effect on the next start.
+    /// Takes effect on the next start (or on the next try, while the server waits for a busy port).
     pub fn set_port(&self, port: u16) -> Result<()> {
         write(&self.config).port = port;
         self.save()
