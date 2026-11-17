@@ -512,7 +512,7 @@ impl SettingsView {
             Section::Assistant => self.assistant_section(cx),
             Section::Plugins => self.plugins_section(cx),
             Section::Shortcuts => self.shortcuts_section(cx),
-            Section::Requests => self.requests_section(cx),
+            Section::Requests => super::api_requests::render(cx),
             Section::About => self.about_section(window, cx),
         }
     }
@@ -1189,57 +1189,6 @@ impl SettingsView {
                     )
                     .child(div().text_sm().child(what))
             }))
-            .into_any_element()
-    }
-
-    fn requests_section(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let theme = cx.theme().clone();
-        let muted = theme.muted_foreground;
-        use crate::k8s::meter;
-        let ms = |d: std::time::Duration| format!("{} ms", d.as_millis());
-        let rows = meter::snapshot();
-        let cell = |w: f32, text: String| div().w(px(w)).flex_shrink_0().child(text);
-        let header = h_flex()
-            .gap_3()
-            .py_1()
-            .text_xs()
-            .text_color(muted)
-            .border_b_1()
-            .border_color(theme.border)
-            .child(cell(170., "Cluster".into()))
-            .child(cell(160., "Requests to".into()))
-            .child(cell(80., "Count".into()))
-            .child(cell(70., "Failed".into()))
-            .child(cell(90., "Average".into()))
-            .child(cell(90., "Slowest".into()))
-            .child(cell(90., "Last".into()));
-        v_flex()
-            .child(div().pb_2().text_sm().text_color(muted).child(
-                "How long the API servers take to start answering, since Recouvrance started (watches and log streams count until they open). Failed: an error status, a timeout or no connection.",
-            ))
-            .child(header)
-            .children(rows.iter().map(|(ctx, class, s)| {
-                h_flex()
-                    .gap_3()
-                    .py_1()
-                    .text_sm()
-                    .border_b_1()
-                    .border_color(theme.border)
-                    .child(cell(170., ctx.clone()).overflow_hidden().text_ellipsis().whitespace_nowrap())
-                    .child(cell(160., class.label().into()))
-                    .child(cell(80., s.count.to_string()))
-                    .child(cell(70., s.errors.to_string()).when(s.errors > 0, |d| d.text_color(theme.warning)))
-                    .child(cell(90., ms(s.average())))
-                    .child(cell(90., ms(s.slowest)))
-                    .child(cell(90., ms(s.last)))
-            }))
-            .when(rows.is_empty(), |d| d.child(div().py_2().text_sm().text_color(muted).child("No requests yet.")))
-            .child(h_flex().pt_3().child(Button::new("meter-reset").small().outline().label("Reset").on_click(
-                cx.listener(|_, _, _, cx| {
-                    meter::reset();
-                    cx.notify();
-                }),
-            )))
             .into_any_element()
     }
 

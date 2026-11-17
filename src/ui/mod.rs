@@ -2,6 +2,7 @@
 //! pickers, terminal, Helm, Argo CD, apply, cluster and workloads overviews.
 
 pub mod access_view;
+pub mod api_requests;
 pub mod apply_view;
 pub mod argo;
 pub mod assistant_view;
