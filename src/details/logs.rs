@@ -24,6 +24,8 @@ pub(super) const MAX_LOG_LINES: usize = 50_000;
 
 /// Pods one page follows at most: each is a connection and its own tail of lines.
 pub(super) const MAX_LOG_PODS: usize = 50;
+/// The most stream messages taken in one update.
+const MSG_BATCH: usize = 1024;
 
 /// The pods whose logs a page follows: all of them, or past the limit the running ones
 /// first, newest first.
@@ -316,21 +318,20 @@ impl LogsView {
             self.streams.push(guard);
             receivers.push(rx.map(move |m| (ix, m)).boxed());
         }
-        let mut merged = futures::stream::select_all(receivers);
+        // Every message ready by the time the view runs is taken in one update: one merge a
+        // pod and one redraw, however many single lines the pods sent.
+        let mut merged = futures::stream::select_all(receivers).ready_chunks(MSG_BATCH);
         let task = cx.spawn(async move |this, cx| {
-            while let Some((ix, msg)) = merged.next().await {
+            while let Some(batch) = merged.next().await {
                 let alive = this.update(cx, |this, cx| {
-                    let state = match msg {
-                        k8s::LogMsg::Lines(lines) => {
-                            this.add_lines(ix, lines, cx);
-                            StreamState::Live
+                    let (lines, states) = coalesce(batch);
+                    for (ix, state) in states {
+                        if let Some(s) = this.pod_states.get_mut(ix) {
+                            *s = state;
                         }
-                        k8s::LogMsg::Reconnecting(why) => StreamState::Reconnecting(why),
-                        k8s::LogMsg::End => StreamState::Ended,
-                        k8s::LogMsg::Error(e) => StreamState::Failed(e),
-                    };
-                    if let Some(s) = this.pod_states.get_mut(ix) {
-                        *s = state;
+                    }
+                    for (ix, lines) in lines {
+                        this.add_lines(ix, lines, cx);
                     }
                     cx.notify();
                 });
