@@ -9,7 +9,7 @@ and versions follow [Semantic Versioning](https://semver.org/).
 
 ### Added
 
-- *(mcp)* Get_metrics reads the custom and external metrics APIs (#805)
+- *(mcp)* `get_metrics` reads the custom and external metrics APIs (#805)
 - *(settings)* API requests page with a card a cluster, charts and percentiles (#802)
 
 ### Fixed
