@@ -172,18 +172,52 @@ async fn get(client: kube::Client, path: String) -> Result<Value> {
     k8s::run(async move { Ok(client.request::<Value>(http::Request::get(path).body(Vec::new())?).await?) }).await
 }
 
-/// A 404 on the API itself means nothing serves it on this cluster.
-fn explain(e: anyhow::Error, group: &str) -> anyhow::Error {
+/// Whether a read failed because the API server has no such path.
+fn not_found(e: &anyhow::Error) -> bool {
     let text = format!("{e:#}");
-    if text.contains("404")
+    text.contains("404")
         && (text.contains("page not found") || text.contains("the server could not find the requested resource"))
-    {
+}
+
+/// The error of the discovery read (no metric): a 404 there means nothing serves the API on
+/// this cluster, which is the whole answer.
+fn explain_discovery(e: anyhow::Error, group: &str) -> anyhow::Error {
+    if not_found(&e) {
         anyhow::anyhow!(
-            "{text}\n{group} may not be served on this cluster (no prometheus-adapter, KEDA or other adapter registered for it), or the metric is unknown: call without metric to list what it serves"
+            "{group} is not served on this cluster: no prometheus-adapter, KEDA or other adapter registers it (the API server answers 404)"
         )
     } else {
         e
     }
+}
+
+/// The error of a value read: a 404 is an unknown metric, object or namespace, or an API
+/// nothing serves; the discovery read tells which.
+fn explain_value(e: anyhow::Error, group: &str) -> anyhow::Error {
+    if not_found(&e) {
+        anyhow::anyhow!(
+            "{e:#}\nThe metric, object or namespace is unknown, or {group} is not served on this cluster: call without metric to list what it serves"
+        )
+    } else {
+        e
+    }
+}
+
+/// The discovery answer: the metrics the rules let the agent see (`rows`, out of `served`),
+/// at most `max` of them, and why the table is empty when it is.
+fn discovery_text(group: &str, rows: &[Vec<String>], served: usize, max: usize) -> String {
+    if served == 0 {
+        return format!("{group} serves no metric on this cluster (its adapter has none configured)");
+    }
+    if rows.is_empty() {
+        return format!("Your rules let you read none of the {served} metric(s) {group} serves");
+    }
+    let more = rows.len().saturating_sub(max);
+    let mut out = format_table(&["METRIC", "OBJECTS"], &rows[..rows.len().min(max)]);
+    if more > 0 {
+        out.push_str(&format!("\n… {more} more"));
+    }
+    out
 }
 
 #[tool_router(router = metrics_tools, vis = "pub(super)")]
@@ -214,13 +248,13 @@ impl KubeMcp {
             // The metrics served, as far as some rule could let the agent read them.
             let list = match get(client, format!("/apis/{group}/v1beta1")).await {
                 Ok(v) => v,
-                Err(e) => return call.finish(Err(explain(e, group))),
+                Err(e) => return call.finish(Err(explain_discovery(e, group))),
             };
-            let rows: Vec<Vec<String>> = list["resources"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter_map(|r| r["name"].as_str())
+            let served: Vec<&str> =
+                list["resources"].as_array().into_iter().flatten().filter_map(|r| r["name"].as_str()).collect();
+            let rows: Vec<Vec<String>> = served
+                .iter()
+                .copied()
                 .filter(|name| {
                     call.policy().decide_any_namespace(&entry_access(api, &p.context, name)).mode != Mode::Deny
                 })
@@ -230,12 +264,7 @@ impl KubeMcp {
                 })
                 .collect();
             let max = call.policy().max_rows as usize;
-            let more = rows.len().saturating_sub(max);
-            let mut out = format_table(&["METRIC", "OBJECTS"], &rows[..rows.len().min(max)]);
-            if more > 0 {
-                out.push_str(&format!("\n… {more} more"));
-            }
-            return call.finish(Ok(out));
+            return call.finish(Ok(discovery_text(group, &rows, served.len(), max)));
         };
         let every = read.access.name.is_none() && read.access.verb == Verb::List;
         if every {
@@ -245,7 +274,7 @@ impl KubeMcp {
         }
         let mut value = match get(client, read.path).await {
             Ok(v) => v,
-            Err(e) => return call.finish(Err(explain(e, group))),
+            Err(e) => return call.finish(Err(explain_value(e, group))),
         };
         let max = call.policy().max_rows as usize;
         let mut note = String::new();
@@ -269,7 +298,7 @@ impl KubeMcp {
 
 #[cfg(test)]
 mod tests {
-    use super::{MetricsApi, MetricsParams, metrics_read};
+    use super::{MetricsApi, MetricsParams, discovery_text, explain_discovery, explain_value, metrics_read};
     use crate::mcp::Verb;
     use proptest::prelude::*;
 
@@ -361,5 +390,31 @@ mod tests {
                 prop_assert_eq!(r.access.namespace.as_deref(), p.namespace.as_deref());
             }
         }
+    }
+
+    /// A 404 on the discovery read says the API is not served, with no hint to call
+    /// without metric (the call already had none); a 404 on a value keeps the hint.
+    #[test]
+    fn a_missing_api_is_said_plainly() {
+        let not_found = || anyhow::anyhow!("ApiError: 404 page not found: Failed to parse error data");
+        let group = "external.metrics.k8s.io";
+        let d = explain_discovery(not_found(), group).to_string();
+        assert!(d.starts_with("external.metrics.k8s.io is not served on this cluster"), "{d}");
+        assert!(!d.contains("call without metric") && !d.contains("Failed to parse"), "{d}");
+        let v = format!("{:#}", explain_value(not_found(), group));
+        assert!(v.contains("call without metric"), "{v}");
+        let other = format!("{:#}", explain_discovery(anyhow::anyhow!("ApiError: 403 forbidden"), group));
+        assert_eq!(other, "ApiError: 403 forbidden");
+    }
+
+    /// An empty discovery says why: nothing served, or nothing the rules let through.
+    #[test]
+    fn an_empty_discovery_says_why() {
+        let group = "custom.metrics.k8s.io";
+        assert!(discovery_text(group, &[], 0, 500).contains("serves no metric"));
+        assert!(discovery_text(group, &[], 3, 500).contains("none of the 3 metric(s)"));
+        let rows = vec![vec!["m".to_string(), "pods".to_string()]; 3];
+        let table = discovery_text(group, &rows, 3, 2);
+        assert!(table.starts_with("METRIC") && table.ends_with("… 1 more"), "{table}");
     }
 }
