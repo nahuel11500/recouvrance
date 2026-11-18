@@ -219,6 +219,18 @@ pub async fn list_values(
     list_values_fields(client, ar, namespace, label_selector, None).await
 }
 
+/// `list_values` from the API server's watch cache (`resourceVersion=0`) rather than etcd: a
+/// moment old at worst, and much lighter and quicker on a big cluster. For background scans,
+/// whose next run catches up; not after a write, whose result must show.
+pub async fn list_values_cached(
+    client: Client,
+    ar: ApiResource,
+    namespace: Option<String>,
+    label_selector: Option<String>,
+) -> Result<Vec<serde_json::Value>> {
+    list_values_with(client, ar, namespace, label_selector, None, true).await
+}
+
 pub async fn list_values_fields(
     client: Client,
     ar: ApiResource,
@@ -226,12 +238,26 @@ pub async fn list_values_fields(
     label_selector: Option<String>,
     field_selector: Option<String>,
 ) -> Result<Vec<serde_json::Value>> {
+    list_values_with(client, ar, namespace, label_selector, field_selector, false).await
+}
+
+async fn list_values_with(
+    client: Client,
+    ar: ApiResource,
+    namespace: Option<String>,
+    label_selector: Option<String>,
+    field_selector: Option<String>,
+    cached: bool,
+) -> Result<Vec<serde_json::Value>> {
     run(async move {
         let api: Api<DynamicObject> = match &namespace {
             Some(ns) => Api::namespaced_with(client, ns, &ar),
             None => Api::all_with(client, &ar),
         };
         let mut lp = ListParams::default();
+        if cached {
+            lp = lp.match_any();
+        }
         if let Some(l) = &label_selector {
             lp = lp.labels(l);
         }
