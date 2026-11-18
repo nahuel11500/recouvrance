@@ -83,7 +83,7 @@ Tools, by what they do:
   `describe_resource`, `search`, `get_events`, `find_problems`, `check_certificates`, `check_reachability`, `top_pods`,
   `top_nodes`, `usage_history`, `get_logs`, `workload_logs`, `get_changes`, `rollout_history`, `rollout_status`,
   `list_helm_releases`, `helm_history`, `helm_get_values`, `diff_manifest`, `explain_resource`,
-  `can_i`, `cluster_version`, `upgrade_check`, `wait_for`, `list_port_forwards`, `browse_files`.
+  `can_i`, `cluster_version`, `upgrade_check`, `wait_for`, `list_port_forwards`, `browse_files`, `get_metrics`.
 - **Change:** `scale`, `rollout_restart`, `rollout_undo`, `rollout_pause`, `rollout_resume`,
   `set_image`, `patch_resource`, `apply_manifest`, `delete_resource`, `trigger_cronjob`,
   `cordon_node`, `uncordon_node`, `drain_node`, `gitops`, `exec_command`, `debug_pod`,
@@ -92,6 +92,14 @@ Tools, by what they do:
 Every change supports `dry_run` except `exec_command`, `drain_node`, `gitops` and the port-forward
 tools. What some of them need beyond the obvious verb:
 
+- **Custom and external metrics:** `get_metrics` reads `custom.metrics.k8s.io` and
+  `external.metrics.k8s.io`, what an HPA or KEDA gets from prometheus-adapter, like
+  `kubectl get --raw`: the metrics served, or a metric's values for a namespace, for objects
+  (one, or every one a label selector picks) or for an external metric. The agent names the
+  parts, never a raw path. Rules see each read as a resource of the API's group:
+  `pods.custom.metrics.k8s.io`, `namespaces.custom.metrics.k8s.io`,
+  `<metric>.external.metrics.k8s.io` (so `*.custom.metrics.k8s.io` covers the whole API), with
+  `get`, or `list` for every object, whose values are then filtered by name.
 - **Logs of a workload:** `workload_logs` merges the logs of a workload's or Service's pods (the
   newest 20) in time order, each line prefixed with its pod. It needs `get` on the workload; pods
   whose logs the rules don't allow are left out and counted.

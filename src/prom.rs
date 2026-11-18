@@ -232,7 +232,7 @@ pub fn proxy_path(target: &str) -> Result<Option<String>> {
     Ok(Some(format!("/api/v1/namespaces/{ns}/services/{svc}/proxy{prefix}")))
 }
 
-fn form_urlencoded(pairs: &[(&str, &str)]) -> String {
+pub(crate) fn form_urlencoded(pairs: &[(&str, &str)]) -> String {
     let enc = |s: &str| {
         s.bytes()
             .map(|b| match b {
