@@ -109,7 +109,9 @@ pub fn metrics_read(p: &MetricsParams) -> Result<Option<MetricsRead>> {
         MetricsApi::Custom => match p.object_kind.as_deref().filter(|k| *k != "namespaces" && *k != "namespace") {
             None => {
                 if p.object_name.is_some() {
-                    bail!("object_name needs object_kind");
+                    bail!(
+                        "object_name needs an object_kind other than namespaces (a namespace's own metric names no object)"
+                    );
                 }
                 let Some(ns) = ns else { bail!("a namespace's metric needs the namespace") };
                 MetricsRead {
