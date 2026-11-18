@@ -84,8 +84,7 @@ pub fn metrics_read(p: &MetricsParams) -> Result<Option<MetricsRead>> {
         .label_selector
         .as_deref()
         .filter(|s| !s.trim().is_empty())
-        .map(|s| format!("?{}", crate::prom::form_urlencoded(&[("labelSelector", s.trim())])))
-        .unwrap_or_default();
+        .map_or_default(|s| format!("?{}", crate::prom::form_urlencoded(&[("labelSelector", s.trim())])));
     let access = |resource: String, verb: Verb, namespace: Option<&str>, name: Option<&str>| Access {
         context: p.context.clone(),
         verb,
@@ -125,7 +124,7 @@ pub fn metrics_read(p: &MetricsParams) -> Result<Option<MetricsRead>> {
                     "*" => None,
                     n => Some(segment("object_name", n)?),
                 };
-                let prefix = ns.map(|ns| format!("/namespaces/{ns}")).unwrap_or_default();
+                let prefix = ns.map_or_default(|ns| format!("/namespaces/{ns}"));
                 let verb = if name.is_some() { Verb::Get } else { Verb::List };
                 MetricsRead {
                     path: format!("/apis/{CUSTOM}/v1beta1{prefix}/{kind}/{}/{metric}{query}", name.unwrap_or("*")),
