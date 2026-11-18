@@ -105,14 +105,7 @@ pub fn service_target_port(service: &serde_json::Value, port: u16, pod: &serde_j
     match &sp["targetPort"] {
         serde_json::Value::Null => Ok(port),
         serde_json::Value::Number(n) => n.as_u64().and_then(|n| u16::try_from(n).ok()).ok_or("bad targetPort".into()),
-        serde_json::Value::String(name) => pod
-            .pointer("/spec/containers")
-            .and_then(|c| c.as_array())
-            .into_iter()
-            .flatten()
-            .flat_map(|c| c["ports"].as_array().cloned().unwrap_or_default())
-            .find(|p| p["name"].as_str() == Some(name))
-            .and_then(|p| p["containerPort"].as_u64())
+        serde_json::Value::String(name) => crate::k8s::named_target_port(pod, name, sp)
             .and_then(|n| u16::try_from(n).ok())
             .ok_or_else(|| format!("no container port named {name:?} on the pod")),
         _ => Err("bad targetPort".into()),
@@ -159,11 +152,16 @@ mod tests {
             {"port": 443, "targetPort": "https"},
             {"port": 9000},
         ]}});
-        let pod = json!({"spec": {"containers": [{"ports": [{"name": "https", "containerPort": 8443}]}]}});
+        let pod =
+            json!({"spec": {"containers": [{"name": "app", "ports": [{"name": "https", "containerPort": 8443}]}]}});
         assert_eq!(service_target_port(&svc, 80, &pod), Ok(8080));
         assert_eq!(service_target_port(&svc, 443, &pod), Ok(8443));
         assert_eq!(service_target_port(&svc, 9000, &pod), Ok(9000));
         assert_eq!(service_target_port(&svc, 5432, &pod), Ok(5432), "not a Service port: the pod's");
         assert!(service_target_port(&svc, 443, &json!({})).is_err());
+        // A native sidecar's port, as Kubernetes finds it.
+        let sidecar = json!({"spec": {"containers": [{"name": "app"}], "initContainers": [
+            {"name": "proxy", "restartPolicy": "Always", "ports": [{"name": "https", "containerPort": 9443}]}]}});
+        assert_eq!(service_target_port(&svc, 443, &sidecar), Ok(9443));
     }
 }

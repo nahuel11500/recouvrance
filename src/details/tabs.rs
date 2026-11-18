@@ -149,18 +149,13 @@ impl DetailPanel {
         };
         let pod_name = pod.pointer("/metadata/name").and_then(|v| v.as_str()).unwrap_or_default().to_string();
         // targetPort may be a number or a container port name.
-        let resolve = |target: &serde_json::Value, port: i64| -> Option<u16> {
+        let resolve = |sp: &serde_json::Value, port: i64| -> Option<u16> {
+            let target = &sp["targetPort"];
             if let Some(n) = target.as_i64() {
-                return Some(n as u16);
+                return u16::try_from(n).ok();
             }
-            let Some(name) = target.as_str() else { return Some(port as u16) };
-            pod.pointer("/spec/containers")?
-                .as_array()?
-                .iter()
-                .flat_map(|c| c["ports"].as_array().cloned().unwrap_or_default())
-                .find(|p| p["name"].as_str() == Some(name))
-                .and_then(|p| p["containerPort"].as_i64())
-                .map(|n| n as u16)
+            let Some(name) = target.as_str() else { return u16::try_from(port).ok() };
+            k8s::named_target_port(&pod, name, sp).and_then(|n| u16::try_from(n).ok())
         };
         let ns = self.obj.namespace.clone().unwrap_or_default();
         h_flex()
@@ -170,7 +165,7 @@ impl DetailPanel {
             .child(div().text_xs().text_color(muted).child(selectable(format!("Port forward (via {pod_name})"))))
             .children(ports.iter().enumerate().filter_map(|(i, p)| {
                 let port = p["port"].as_i64()?;
-                let remote = resolve(&p["targetPort"], port)?;
+                let remote = resolve(p, port)?;
                 let label = match p["name"].as_str() {
                     Some(n) => format!("{n}:{port}"),
                     None => port.to_string(),
