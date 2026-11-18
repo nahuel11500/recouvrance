@@ -525,15 +525,15 @@ async fn selected_pods(client: Client, kind: &Kind, svc: &Value) -> anyhow::Resu
     else {
         return Ok(None);
     };
-    Ok(Some(k8s::list_values(client, k8s::ar_of::<core::Pod>(), Some(ns.into()), selector).await?))
+    Ok(Some(k8s::list_values_cached(client, k8s::ar_of::<core::Pod>(), Some(ns.into()), selector).await?))
 }
 
 /// A namespace's Deployments and StatefulSets, to tell a Service whose workload was scaled to 0
 /// on purpose. Unreadable ones are left out: the Service stays a warning, as if none was.
 async fn workloads_of(client: Client, ns: &str) -> Vec<(&'static str, Value)> {
     let (deployments, sets) = futures::join!(
-        k8s::list_values(client.clone(), k8s::ar_of::<apps::Deployment>(), Some(ns.into()), None),
-        k8s::list_values(client, k8s::ar_of::<apps::StatefulSet>(), Some(ns.into()), None),
+        k8s::list_values_cached(client.clone(), k8s::ar_of::<apps::Deployment>(), Some(ns.into()), None),
+        k8s::list_values_cached(client, k8s::ar_of::<apps::StatefulSet>(), Some(ns.into()), None),
     );
     let mut workloads = Vec::new();
     for (label, listed) in [("Deployment", deployments), ("StatefulSet", sets)] {
