@@ -100,6 +100,8 @@ pub struct LogsView {
     pub(super) scroll: UniformListScrollHandle,
     /// Rows in the unwrapped list at its last layout (its content height is this many rows).
     pub(super) uniform_rows: usize,
+    /// The shown lines are not all from today: their times say the date.
+    pub(super) dated: bool,
     /// Wrap long lines (variable-height list).
     pub(super) wrap: bool,
     pub(super) wrap_list: ListState,
@@ -170,6 +172,7 @@ impl LogsView {
             reload_containers: false,
             scroll: UniformListScrollHandle::new(),
             uniform_rows: 0,
+            dated: false,
             wrap: cfg!(feature = "dev") && std::env::var("RECOUVRANCE_LOG_WRAP").is_ok(),
             wrap_list: ListState::new(0, ListAlignment::Top, px(400.)),
             pretty_json: true,
@@ -487,7 +490,7 @@ impl LogsView {
     pub(super) fn render_line(&self, i: usize, cx: &App) -> AnyElement {
         let theme = cx.theme();
         let Some(l) = self.buf.shown(i) else { return div().into_any_element() };
-        let time = l.time.map_or_default(|t| t.to_zoned(jiff::tz::TimeZone::system()).strftime("%H:%M:%S").to_string());
+        let time = l.time.map_or_default(|t| log_time(t, self.dated, &jiff::tz::TimeZone::system()));
         let pod = self.pods.get(l.src).map_or_default(String::as_str);
         let suffix = pod.rsplit('-').next().unwrap_or(pod).to_string();
         let base = match l.level {
@@ -530,7 +533,8 @@ impl LogsView {
             .items_start()
             .when(!self.wrap, Styled::whitespace_nowrap)
             .when(crate::settings::get().log_timestamps, |d| {
-                d.child(div().w(px(56.)).flex_shrink_0().text_color(theme.muted_foreground).child(time))
+                let w = if self.dated { 108. } else { 56. };
+                d.child(div().w(px(w)).flex_shrink_0().text_color(theme.muted_foreground).child(time))
             })
             .when(self.pods.len() > 1, |d| {
                 d.child(div().w(px(48.)).flex_shrink_0().text_color(pod_color(l.src, cx)).child(suffix))
@@ -598,13 +602,16 @@ impl LogsView {
 
     /// Line counts over time (computed once per change of the shown lines).
     pub(super) fn render_histogram(&mut self, cx: &App) -> AnyElement {
+        let tz = jiff::tz::TimeZone::system();
         let Some((buckets, first, last)) = self.buf.histogram() else {
+            self.dated = false;
             return div().into_any_element();
         };
+        let dated = needs_date(*first, *last, &tz, jiff::Timestamp::now().to_zoned(tz.clone()).date());
         let max = buckets.iter().map(|b| b.0).max().unwrap_or(1).max(1) as f32;
         let theme = cx.theme();
-        let fmt = |t: jiff::Timestamp| t.to_zoned(jiff::tz::TimeZone::system()).strftime("%H:%M:%S").to_string();
-        v_flex()
+        let fmt = |t: jiff::Timestamp| log_time(t, dated, &tz);
+        let out = v_flex()
             .gap_0p5()
             .child(h_flex().h(px(36.)).items_end().gap(px(1.)).children(buckets.iter().map(|&(total, errors)| {
                 let h = total as f32 / max;
@@ -626,7 +633,9 @@ impl LogsView {
                     .child(div().flex_1())
                     .child(fmt(*last)),
             )
-            .into_any_element()
+            .into_any_element();
+        self.dated = dated;
+        out
     }
 
     /// The status line: pods left out, the streams' state and a container list error.
@@ -876,9 +885,39 @@ impl Render for LogsView {
     }
 }
 
+/// Whether log times need their date: the lines from `first` to `last` are not all from
+/// `today` (in `tz`).
+fn needs_date(
+    first: jiff::Timestamp,
+    last: jiff::Timestamp,
+    tz: &jiff::tz::TimeZone,
+    today: jiff::civil::Date,
+) -> bool {
+    first.to_zoned(tz.clone()).date() != today || last.to_zoned(tz.clone()).date() != today
+}
+
+/// A log line's time: `09:33:20`, or `Nov 15 09:33:20` when the lines span other days.
+fn log_time(t: jiff::Timestamp, dated: bool, tz: &jiff::tz::TimeZone) -> String {
+    t.to_zoned(tz.clone()).strftime(if dated { "%b %d %H:%M:%S" } else { "%H:%M:%S" }).to_string()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{MAX_LOG_PODS, followed_pods, px, row_height};
+    use super::{MAX_LOG_PODS, followed_pods, log_time, needs_date, px, row_height};
+
+    #[test]
+    fn times_say_the_date_when_the_lines_span_other_days() {
+        let tz = jiff::tz::TimeZone::UTC;
+        let t = |s: &str| s.parse::<jiff::Timestamp>().unwrap();
+        let today = jiff::civil::date(2026, 11, 18);
+        assert!(!needs_date(t("2026-11-18T00:00:00Z"), t("2026-11-18T23:59:59Z"), &tz, today));
+        // The tail of a quiet pod: three days back, across midnight.
+        assert!(needs_date(t("2026-11-15T09:33:20Z"), t("2026-11-18T10:06:50Z"), &tz, today));
+        // All from another day (Previous logs of a pod gone yesterday).
+        assert!(needs_date(t("2026-11-17T08:00:00Z"), t("2026-11-17T09:00:00Z"), &tz, today));
+        assert_eq!(log_time(t("2026-11-15T09:33:20Z"), true, &tz), "Nov 15 09:33:20");
+        assert_eq!(log_time(t("2026-11-18T10:06:50Z"), false, &tz), "10:06:50");
+    }
 
     #[test]
     fn row_height_is_the_content_over_its_rows() {
