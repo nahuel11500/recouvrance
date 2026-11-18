@@ -5,6 +5,22 @@ and versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.8.0](https://github.com/nahuel11500/recouvrance/compare/v0.7.1...v0.8.0) - 2026-11-18
+
+### Added
+
+- *(mcp)* `get_metrics` reads the custom and external metrics APIs (#805)
+- *(settings)* API requests page with a card a cluster, charts and percentiles (#802)
+
+### Fixed
+
+- *(logs)* Say the date when the lines span other days (#807)
+- Resolve a Service's named targetPort on native sidecars too (#806)
+
+### Performance
+
+- *(problems)* Read Services' pods and workloads from the API server's cache (#809)
+
 ## [0.7.1](https://github.com/nahuel11500/recouvrance/compare/v0.7.0...v0.7.1) - 2026-11-13
 
 The same app as 0.7.0, whose binaries were never published: GitHub no longer runs the macOS
