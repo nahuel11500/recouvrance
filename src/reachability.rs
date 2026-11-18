@@ -641,14 +641,9 @@ fn service_steps(context: &str, key: &Key, svc: &Value, only: Option<&[Value]>, 
     steps.push(endpoints_step(context, &section, key, &ports, pods, world.slices.get(key)));
 }
 
-/// The ports a pod's containers declare.
-fn container_ports(pod: &Value) -> impl Iterator<Item = &Value> {
-    arr(pod, "/spec/containers").iter().flat_map(|c| arr(c, "/ports"))
-}
-
 /// A pod's declared ports, as `8080/http, 9090`.
 fn declared(pod: &Value) -> String {
-    let ports: Vec<String> = container_ports(pod)
+    let ports: Vec<String> = k8s::serving_ports(pod)
         .map(|p| match p["name"].as_str() {
             Some(n) => format!("{}/{n}", p["containerPort"]),
             None => p["containerPort"].to_string(),
@@ -663,10 +658,8 @@ fn declared(pod: &Value) -> String {
 fn target_port_step(section: &str, ns: &str, port: &Value, pods: &[Value]) -> Step {
     let title = format!("Target port of {}", port_label(port));
     if let Value::String(name) = &port["targetPort"] {
-        let missing: Vec<&Value> = pods
-            .iter()
-            .filter(|pod| !container_ports(pod).any(|p| p["name"].as_str() == Some(name.as_str())))
-            .collect();
+        let missing: Vec<&Value> =
+            pods.iter().filter(|pod| k8s::named_target_port(pod, name, port).is_none()).collect();
         if missing.is_empty() {
             return Step::new(section, title, State::Ok, format!("Every pod declares a port named {name}."));
         }
@@ -687,12 +680,12 @@ fn target_port_step(section: &str, ns: &str, port: &Value, pods: &[Value]) -> St
         return Step::new(section, title, State::Warn, detail).with_items(items);
     }
     let n = port["targetPort"].as_i64().or(port["port"].as_i64()).unwrap_or(0);
-    let any_declared = pods.iter().any(|p| container_ports(p).next().is_some());
+    let any_declared = pods.iter().any(|p| k8s::serving_ports(p).next().is_some());
     if !any_declared {
         let detail = format!("Port {n}; the containers declare no ports, which Kubernetes doesn't require.");
         return Step::new(section, title, State::Ok, detail);
     }
-    if pods.iter().any(|pod| container_ports(pod).any(|p| p["containerPort"].as_i64() == Some(n))) {
+    if pods.iter().any(|pod| k8s::serving_ports(pod).any(|p| p["containerPort"].as_i64() == Some(n))) {
         return Step::new(section, title, State::Ok, format!("Port {n}, declared by its containers."));
     }
     let detail = format!(
@@ -1433,6 +1426,23 @@ mod tests {
         assert_eq!(target.state, State::Warn);
         assert_eq!(target.items[0].link.as_ref().unwrap().name, "web-2");
         assert!(first_break(&steps).is_none());
+    }
+
+    #[test]
+    fn a_named_target_port_on_a_native_sidecar_is_found() {
+        let svc = service(http_port());
+        let mut p = pod("web-1", true, json!([]));
+        p["spec"]["initContainers"] =
+            json!([{"name": "proxy", "restartPolicy": "Always", "ports": [{"name": "http", "containerPort": 8443}]}]);
+        let w = world(&svc, vec![p.clone()], vec![slice(&[("10.0.0.5", "web-1", true)])]);
+        let steps = check(CTX, Target::Service, &svc, &w, jiff::Timestamp::now());
+        let target = steps.iter().find(|s| s.title == "Target port of http:80").unwrap();
+        assert_eq!(target.state, State::Ok, "{target:#?}");
+        // A plain init container serves nothing once it has finished.
+        p["spec"]["initContainers"][0]["restartPolicy"] = Value::Null;
+        let w = world(&svc, vec![p], vec![slice(&[("10.0.0.5", "web-1", true)])]);
+        let steps = check(CTX, Target::Service, &svc, &w, jiff::Timestamp::now());
+        assert_eq!(first_break(&steps).unwrap().title, "Target port of http:80");
     }
 
     #[test]

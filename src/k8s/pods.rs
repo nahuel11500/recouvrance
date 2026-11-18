@@ -365,6 +365,27 @@ pub fn spec_containers(spec: &serde_json::Value) -> Vec<SpecContainer<'_>> {
         .collect()
 }
 
+/// The ports a Service can send to on a pod: those its containers and its native sidecars
+/// declare, in that order, as Kubernetes' `FindPort` looks them up. Plain init containers
+/// have finished and ephemeral ones declare none.
+pub fn serving_ports(pod: &serde_json::Value) -> impl Iterator<Item = &serde_json::Value> {
+    spec_containers(&pod["spec"])
+        .into_iter()
+        .filter(|c| matches!(c.kind, ContainerKind::Main | ContainerKind::Sidecar))
+        .flat_map(|c| c.spec["ports"].as_array().map_or(&[][..], Vec::as_slice))
+}
+
+/// The port number a Service port's named `targetPort` reaches on a pod, as Kubernetes
+/// resolves it: the first container (then native sidecar) port with that name and the Service
+/// port's protocol (TCP when unset, on either side).
+pub fn named_target_port(pod: &serde_json::Value, name: &str, service_port: &serde_json::Value) -> Option<i64> {
+    let protocol = |v: &serde_json::Value| v["protocol"].as_str().unwrap_or("TCP").to_string();
+    let wanted = protocol(service_port);
+    serving_ports(pod)
+        .find(|p| p["name"].as_str() == Some(name) && protocol(p) == wanted)
+        .and_then(|p| p["containerPort"].as_i64())
+}
+
 /// A listed pod's containers to pick from (logs, shell, files): all of `spec_containers`,
 /// the default one first. The annotation picks among the pod's own containers only.
 pub fn pod_containers(pod: &serde_json::Value) -> Vec<String> {
@@ -703,6 +724,39 @@ async fn read_line_capped<R: futures::AsyncBufRead + Unpin>(
         if newline.is_some() {
             return Ok(Some(cut));
         }
+    }
+}
+
+#[cfg(test)]
+mod port_tests {
+    use serde_json::json;
+
+    #[test]
+    fn named_ports_resolve_like_kubernetes() {
+        let pod = json!({"spec": {
+            "initContainers": [
+                {"name": "migrate", "ports": [{"name": "admin", "containerPort": 1}]},
+                {"name": "proxy", "restartPolicy": "Always", "ports": [
+                    {"name": "https", "containerPort": 8443},
+                    {"name": "dns", "containerPort": 53, "protocol": "UDP"},
+                    {"name": "web", "containerPort": 9999}
+                ]}
+            ],
+            "containers": [{"name": "app", "ports": [{"name": "web", "containerPort": 8080}]}],
+            "ephemeralContainers": [{"name": "debug", "ports": [{"name": "debug", "containerPort": 2}]}]
+        }});
+        let tcp = json!({"port": 80});
+        let port = |name: &str, sp: &serde_json::Value| super::named_target_port(&pod, name, sp);
+        // A native sidecar's port is found; the main containers come first.
+        assert_eq!(port("https", &tcp), Some(8443));
+        assert_eq!(port("web", &tcp), Some(8080));
+        // A plain init container and an ephemeral one serve nothing.
+        assert_eq!(port("admin", &tcp), None);
+        assert_eq!(port("debug", &tcp), None);
+        // The protocol must match the Service port's.
+        assert_eq!(port("dns", &tcp), None);
+        assert_eq!(port("dns", &json!({"port": 53, "protocol": "UDP"})), Some(53));
+        assert_eq!(super::serving_ports(&pod).count(), 4);
     }
 }
 
