@@ -1,5 +1,7 @@
 //! The sidebar: pages, resource types by section, favorites, port-forwards.
 
+use std::collections::HashMap;
+
 use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::component::button::ButtonCustomVariant;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -260,7 +262,10 @@ impl AppView {
         let colors = Colors::of(cx);
         let query = self.kind_filter.read(cx).value().to_lowercase();
         let selected = self.kind.as_ref().filter(|_| self.route().is_resources()).map(Kind::key);
-        let mut children = Vec::new();
+        // Pages, saved views, favorites and types scroll together under the filter, which
+        // finds pages as well as types.
+        let mut children: Vec<AnyElement> =
+            self.page_links(&query, colors, cx).into_iter().map(IntoElement::into_any_element).collect();
         if query.is_empty() {
             children.extend(self.saved_views(colors, cx));
             children.extend(self.favorite_rows(selected.as_deref(), colors, cx));
@@ -295,7 +300,6 @@ impl AppView {
             .border_r_1()
             .border_color(cx.theme().sidebar_border)
             .child(self.sidebar_header(cx))
-            .children(self.page_links(colors, cx))
             .child(div().px_2().pt_3().pb_1().child(filter))
             .child(v_flex().id("kinds").flex_1().min_h_0().overflow_y_scroll().px_2().pb_4().children(children))
             .child(self.render_forwards(cx))
@@ -355,23 +359,23 @@ impl AppView {
     }
 
     /// The pages: agents (with pending approvals), assistant, problems (with their
-    /// count), the timeline, overviews, Helm and Argo CD.
-    fn page_links(&self, colors: Colors, cx: &mut Context<Self>) -> [Stateful<Div>; 8] {
+    /// count), the timeline, overviews, Helm and Argo CD; those whose name has `query`.
+    fn page_links(&self, query: &str, colors: Colors, cx: &mut Context<Self>) -> [Stateful<Div>; 8] {
         let route = self.route();
         let (danger, warning) = (cx.theme().danger, cx.theme().warning);
         let badge = |n: usize, color: Hsla| {
             div().px_1p5().rounded_full().text_xs().bg(color).text_color(white()).child(n.to_string())
         };
         let pending = self.approvals.len();
+        let nav_row = |id, icon, label, on| nav_row(id, icon, label, on, query, colors);
         [
-            nav_row("nav-agents", Lucide::Bot, "Agents", route.is_agents(), colors)
-                .mt_3()
+            nav_row("nav-agents", Lucide::Bot, "Agents", route.is_agents())
                 .on_click(cx.listener(|this, _, _, cx| this.navigate(Route::Agents, cx)))
                 .when(!self.hub.agents_enabled(), |d| d.child(div().text_xs().text_color(danger).child("off")))
                 .when(pending > 0, |d| d.child(badge(pending, warning))),
-            nav_row("nav-assistant", Lucide::Sparkles, "Assistant", matches!(route, Route::Assistant(_)), colors)
+            nav_row("nav-assistant", Lucide::Sparkles, "Assistant", matches!(route, Route::Assistant(_)))
                 .on_click(cx.listener(|this, _, window, cx| this.open_assistant(window, cx))),
-            nav_row("nav-problems", Lucide::TriangleAlert, "Problems", matches!(route, Route::Problems(_)), colors)
+            nav_row("nav-problems", Lucide::TriangleAlert, "Problems", matches!(route, Route::Problems(_)))
                 .on_click(cx.listener(|this, _, window, cx| this.open_problems(window, cx)))
                 .when_some(self.problems.shown(), |d, (n, critical)| {
                     d.child(badge(n, if critical { danger } else { warning }))
@@ -379,27 +383,20 @@ impl AppView {
                 .when_some(self.problems.gaps(), |d, gaps| {
                     d.tooltip(move |w, cx| component::tooltip::Tooltip::new(gaps.clone()).build(w, cx))
                 }),
-            nav_row("nav-timeline", Lucide::ClockArrowDown, "Timeline", matches!(route, Route::Timeline(_)), colors)
+            nav_row("nav-timeline", Lucide::ClockArrowDown, "Timeline", matches!(route, Route::Timeline(_)))
                 .on_click(cx.listener(|this, _, window, cx| this.open_timeline(window, cx))),
-            nav_row("nav-cluster", Lucide::Server, "Cluster overview", matches!(route, Route::Cluster(_)), colors)
+            nav_row("nav-cluster", Lucide::Server, "Cluster overview", matches!(route, Route::Cluster(_)))
                 .on_click(cx.listener(|this, _, window, cx| this.open_cluster(window, cx))),
             nav_row(
                 "nav-workloads",
                 Lucide::LayoutDashboard,
                 "Workloads overview",
                 matches!(route, Route::Workloads(_)),
-                colors,
             )
             .on_click(cx.listener(|this, _, window, cx| this.open_workloads(window, cx))),
-            nav_row(
-                "nav-helm",
-                Lucide::Ship,
-                "Helm releases",
-                matches!(route, Route::Helm(_) | Route::HelmRelease(_)),
-                colors,
-            )
-            .on_click(cx.listener(|this, _, window, cx| this.open_helm(window, cx))),
-            nav_row("nav-argo", Lucide::GitFork, "Argo CD", matches!(route, Route::Argo(_)), colors)
+            nav_row("nav-helm", Lucide::Ship, "Helm releases", matches!(route, Route::Helm(_) | Route::HelmRelease(_)))
+                .on_click(cx.listener(|this, _, window, cx| this.open_helm(window, cx))),
+            nav_row("nav-argo", Lucide::GitFork, "Argo CD", matches!(route, Route::Argo(_)))
                 .on_click(cx.listener(|this, _, window, cx| this.open_argo(window, cx))),
         ]
     }
@@ -496,6 +493,13 @@ impl AppView {
                 || k.ar.kind.to_lowercase().contains(query)
                 || k.ar.group.to_lowercase().contains(query)
         };
+        // How many types each section shows, and the sections folded (all open while searching).
+        let mut counts: HashMap<&str, usize> = HashMap::new();
+        for k in self.kinds.iter().filter(|k| matches(k)) {
+            *counts.entry(k.section).or_default() += 1;
+        }
+        let folded: Vec<String> =
+            if query.is_empty() { crate::settings::with(|s| s.sidebar_folded.clone()) } else { Vec::new() };
         let mut rows = Vec::new();
         let mut section = "";
         let mut group = String::new();
@@ -503,10 +507,15 @@ impl AppView {
             if !matches(kind) {
                 continue;
             }
+            let shut = folded.iter().any(|f| f == kind.section);
             if kind.section != section {
                 section = kind.section;
                 group.clear();
-                rows.push(section_header(section.into(), section_icon(section), colors).into_any_element());
+                let count = counts.get(section).copied().unwrap_or_default();
+                rows.push(self.section_row(i, section, count, shut, query.is_empty(), colors, cx).into_any_element());
+            }
+            if shut {
+                continue;
             }
             let is_selected = selected == Some(kind.key().as_str());
             let k = kind.clone();
@@ -581,6 +590,47 @@ impl AppView {
     }
 }
 
+impl AppView {
+    /// A section's header: its name and how many types it holds; a click folds or opens it
+    /// (kept in settings.json), except while searching.
+    #[allow(clippy::too_many_arguments)]
+    fn section_row(
+        &self,
+        i: usize,
+        section: &'static str,
+        count: usize,
+        shut: bool,
+        foldable: bool,
+        colors: Colors,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        section_header(section.into(), section_icon(section), colors)
+            .id(("section", i))
+            .rounded_md()
+            .child(div().flex_1())
+            .child(div().font_weight(FontWeight::NORMAL).text_color(colors.muted).child(count.to_string()))
+            .when(foldable, |d| {
+                d.cursor_pointer()
+                    .hover(|s| s.bg(colors.active_bg.opacity(0.6)))
+                    .child(
+                        Icon::new(if shut { IconName::ChevronRight } else { IconName::ChevronDown })
+                            .size_3()
+                            .text_color(colors.muted),
+                    )
+                    .on_click(cx.listener(move |_, _, _, cx| {
+                        crate::settings::update(|s| {
+                            if s.sidebar_folded.iter().any(|f| f == section) {
+                                s.sidebar_folded.retain(|f| f != section);
+                            } else {
+                                s.sidebar_folded.push(section.to_string());
+                            }
+                        });
+                        cx.notify();
+                    }))
+            })
+    }
+}
+
 /// The sidebar's colors, and how many characters of a row's label fit.
 #[derive(Clone, Copy)]
 struct Colors {
@@ -619,23 +669,32 @@ fn tip_if_cut(row: Stateful<Div>, text: &str, fits: usize) -> Stateful<Div> {
     row.tooltip(move |w, cx| component::tooltip::Tooltip::new(text.clone()).build(w, cx))
 }
 
+/// A section's name in small capitals, brighter than the details under it.
 fn section_header(label: SharedString, icon: Lucide, colors: Colors) -> Div {
     h_flex()
         .gap_1p5()
-        .pt_4()
-        .pb_1()
+        .mt_3()
+        .py_1()
         .px_2()
         .text_xs()
-        .text_color(colors.muted)
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_color(colors.fg.opacity(0.8))
         .child(Icon::new(icon).size_3p5())
-        .child(label)
+        .child(label.to_uppercase())
 }
 
-/// A page link at the top of the sidebar.
-fn nav_row(id: &'static str, icon: Lucide, label: &'static str, on: bool, colors: Colors) -> Stateful<Div> {
+/// A page link at the top of the sidebar, hidden when its name doesn't have `query`.
+fn nav_row(
+    id: &'static str,
+    icon: Lucide,
+    label: &'static str,
+    on: bool,
+    query: &str,
+    colors: Colors,
+) -> Stateful<Div> {
     h_flex()
         .id(id)
-        .mx_2()
+        .when(!label.to_lowercase().contains(query), Styled::hidden)
         .gap_2()
         .px_2()
         .py_1()
