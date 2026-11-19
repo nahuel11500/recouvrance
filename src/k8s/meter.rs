@@ -100,8 +100,10 @@ pub struct Minute {
 }
 
 impl Minute {
-    pub fn average(&self) -> Duration {
-        average(self.total, self.count)
+    /// The average time to answer, none in a minute without requests: no request is not a
+    /// fast one.
+    pub fn average(&self) -> Option<Duration> {
+        (self.count > 0).then(|| average(self.total, self.count))
     }
 
     fn add(&mut self, other: &Self) {
