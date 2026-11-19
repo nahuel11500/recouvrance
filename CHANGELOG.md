@@ -16,7 +16,7 @@ and versions follow [Semantic Versioning](https://semver.org/).
 ### Fixed
 
 - *(sidebar)* The types filter box is readable on the navy sidebar (#823)
-- *(mcp)* Get_metrics says plainly when the metrics API is not served or serves nothing (#815)
+- *(mcp)* `get_metrics` says plainly when the metrics API is not served or serves nothing (#815)
 - *(settings)* No latency point for a minute without requests (#814)
 
 ### Performance
