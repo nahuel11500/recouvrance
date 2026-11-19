@@ -49,8 +49,24 @@ impl Render for AppView {
             div().size_full().child(content).into_any_element()
         } else {
             // The sidebar keeps its width when the window is resized; the page takes the rest.
+            let (width, range) =
+                (crate::settings::with(crate::settings::sidebar_width_in), crate::settings::SIDEBAR_WIDTH_RANGE);
             h_resizable("body")
-                .child(resizable_panel().size(px(230.)).fixed().child(self.render_sidebar(cx)))
+                // The width dragged to is kept for the next launch.
+                .on_resize(|state, _, cx| {
+                    if let Some(w) = state.read(cx).sizes().first().map(|w| f32::from(*w))
+                        && w != crate::settings::with(|s| s.sidebar_width)
+                    {
+                        crate::settings::update(|s| s.sidebar_width = w);
+                    }
+                })
+                .child(
+                    resizable_panel()
+                        .size(px(width))
+                        .size_range(px(*range.start())..px(*range.end()))
+                        .fixed()
+                        .child(self.render_sidebar(cx)),
+                )
                 .child(resizable_panel().child(content))
                 .into_any_element()
         };
