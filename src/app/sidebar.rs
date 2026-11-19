@@ -232,7 +232,29 @@ impl AppView {
             children.extend(self.saved_views(colors, cx));
             children.extend(self.favorite_rows(selected.as_deref(), colors, cx));
         }
-        children.extend(self.kind_rows(&query, selected.as_deref(), colors, cx));
+        let kinds = self.kind_rows(&query, selected.as_deref(), colors, cx);
+        if kinds.is_empty() && !query.is_empty() {
+            children.push(
+                div()
+                    .px_2()
+                    .pt_3()
+                    .text_sm()
+                    .text_color(colors.muted)
+                    .child(format!("No resource type matches “{query}”"))
+                    .into_any_element(),
+            );
+        }
+        children.extend(kinds);
+        let theme = cx.theme();
+        // The box sits on the navy hull: a darker field and the sidebar's own light text
+        // (the input's light field left that inherited light text unreadable).
+        let filter = Input::new(&self.kind_filter)
+            .small()
+            .cleanable(true)
+            .prefix(Icon::new(Lucide::Search).size_3p5().text_color(colors.muted))
+            .bg(theme.sidebar_accent)
+            .border_color(theme.sidebar_border)
+            .text_color(theme.sidebar_foreground);
         v_flex()
             .size_full()
             .bg(cx.theme().sidebar)
@@ -242,7 +264,7 @@ impl AppView {
             .child(self.sidebar_header(cx))
             .children(self.page_links(colors, cx))
             .child(self.render_forwards(cx))
-            .child(div().px_2().pt_3().child(Input::new(&self.kind_filter).small().cleanable(true)))
+            .child(div().px_2().pt_3().pb_1().child(filter))
             .child(v_flex().id("kinds").flex_1().min_h_0().overflow_y_scroll().px_2().pb_4().children(children))
     }
 
