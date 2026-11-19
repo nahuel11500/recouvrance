@@ -560,9 +560,7 @@ pub(crate) fn stream_status(pods: &[String], states: &[StreamState]) -> Option<S
 /// lines as one batch, in their order, and the pods' states in the order they came (a pod
 /// ends in its last message's). A busy workload sends a line at a time from tens of pods:
 /// merging and redrawing once per line made its Logs tab fall minutes behind.
-pub(crate) fn coalesce(
-    batch: Vec<(usize, crate::k8s::LogMsg)>,
-) -> (Vec<(usize, Vec<String>)>, Vec<(usize, StreamState)>) {
+pub(crate) fn coalesce(batch: Vec<(usize, crate::k8s::LogMsg)>) -> Coalesced {
     use crate::k8s::LogMsg;
     let mut lines: Vec<(usize, Vec<String>)> = Vec::new();
     let mut states = Vec::with_capacity(batch.len());
@@ -581,7 +579,14 @@ pub(crate) fn coalesce(
         };
         states.push((ix, state));
     }
-    (lines, states)
+    Coalesced { lines, states }
+}
+
+/// Ready stream messages taken together: each pod's lines as one batch, and the pods'
+/// states in the order they came.
+pub(crate) struct Coalesced {
+    pub(crate) lines: Vec<(usize, Vec<String>)>,
+    pub(crate) states: Vec<(usize, StreamState)>,
 }
 
 #[cfg(test)]
@@ -809,7 +814,7 @@ mod tests {
                     (*ix, msg)
                 })
                 .collect();
-            let (lines, states) = coalesce(msgs);
+            let Coalesced { lines, states } = coalesce(msgs);
             for pod in 0..4 {
                 let sent: Vec<String> = batch
                     .iter()

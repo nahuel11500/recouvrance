@@ -324,7 +324,7 @@ impl LogsView {
         let task = cx.spawn(async move |this, cx| {
             while let Some(batch) = merged.next().await {
                 let alive = this.update(cx, |this, cx| {
-                    let (lines, states) = coalesce(batch);
+                    let Coalesced { lines, states } = coalesce(batch);
                     for (ix, state) in states {
                         if let Some(s) = this.pod_states.get_mut(ix) {
                             *s = state;
