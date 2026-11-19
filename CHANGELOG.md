@@ -5,6 +5,24 @@ and versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.9.0](https://github.com/nahuel11500/recouvrance/compare/v0.8.0...v0.9.0) - 2026-11-19
+
+### Added
+
+- *(sidebar)* One scroll for pages and types, foldable sections with counts (#826)
+- *(sidebar)* Start wider, keep the dragged width, show cut names in a tooltip (#825)
+- *(sidebar)* Port forwards fold into one row at the bottom (#824)
+
+### Fixed
+
+- *(sidebar)* The types filter box is readable on the navy sidebar (#823)
+- *(mcp)* `get_metrics` says plainly when the metrics API is not served or serves nothing (#815)
+- *(settings)* No latency point for a minute without requests (#814)
+
+### Performance
+
+- *(logs)* Take the ready lines of every pod in one update (#816)
+
 ## [0.8.0](https://github.com/nahuel11500/recouvrance/compare/v0.7.1...v0.8.0) - 2026-11-18
 
 ### Added
