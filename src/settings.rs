@@ -244,6 +244,8 @@ pub struct Settings {
     pub timeline: TimelineSettings,
     /// The sidebar's width in pixels, as last dragged (read with `sidebar_width_in`).
     pub sidebar_width: f32,
+    /// The sidebar's sections folded (by name: "Workloads", "Custom resources"...).
+    pub sidebar_folded: Vec<String>,
 }
 
 /// The timeline: changes recorded while the app watches (see `crate::timeline`).
@@ -447,6 +449,7 @@ impl Default for Settings {
             confirm_wait_secs: 3,
             timeline: TimelineSettings::default(),
             sidebar_width: SIDEBAR_WIDTH,
+            sidebar_folded: Vec::new(),
         }
     }
 }

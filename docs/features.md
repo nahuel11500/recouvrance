@@ -1,6 +1,10 @@
 # Features
 
 - **Contexts**: pick one or several on launch; tables merge clusters with a Context column.
+- **Sidebar**: the filter at its top finds pages and resource types (by name, kind or API group).
+  Pages, saved views, favorites and types scroll together; a section folds with a click on its
+  name (kept for next time) and says how many types it holds. Port forwards fold into one row at
+  the bottom. Drag its edge to resize it: the width is kept, and a cut name shows whole in a tooltip.
 - **Live tables** with kubectl's own columns for every type, including CRDs; CPU/memory from
   metrics-server; per-type column choice; multi-namespace filter; each type keeps its own filter text (Nodes
   doesn't show the pod name typed on Pods, and Pods has it back).
