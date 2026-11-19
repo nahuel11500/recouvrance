@@ -245,11 +245,24 @@ fn requests_chart(c: &Cluster, cx: &App) -> Div {
     chart_box("Requests per minute", chart, cx)
 }
 
+/// The minutes of `minutes` with requests and their average latency: a minute without
+/// requests has no latency, rather than 0 ms.
+fn latencies(minutes: &[(i64, Minute)]) -> Vec<(i64, Duration)> {
+    minutes.iter().filter_map(|(m, s)| Some((*m, s.average()?))).collect()
+}
+
 fn latency_chart(c: &Cluster, cx: &App) -> Div {
     let theme = cx.theme();
     let color = theme.green;
-    let ms = |d: Duration| d.as_secs_f64() * 1000.0;
-    let data: Vec<(String, f64)> = c.minutes.iter().map(|(m, s)| (minute_label(*m), ms(s.average()))).collect();
+    let title = "Average latency per minute";
+    let points = latencies(&c.minutes);
+    if let [(m, only)] = points.as_slice() {
+        // One point draws no line: say it.
+        let text = format!("{} at {}", duration(*only), minute_label(*m));
+        return chart_box(title, div().pt_4().text_lg().text_color(color).child(selectable(text)), cx);
+    }
+    let ms = |d: &Duration| d.as_secs_f64() * 1000.0;
+    let data: Vec<(String, f64)> = points.iter().map(|(m, d)| (minute_label(*m), ms(d))).collect();
     let top = data.iter().map(|p| p.1).fold(0.0, f64::max);
     let fmt = |v: f64| duration(Duration::from_secs_f64(v.max(0.0) / 1000.0));
     let chart = AreaChart::new(data)
@@ -266,7 +279,7 @@ fn latency_chart(c: &Cluster, cx: &App) -> Div {
         .y_tick_count(3)
         .y_tick_format(fmt)
         .tooltip_value(move |_, _, v| fmt(v).into());
-    chart_box("Average latency per minute", chart, cx)
+    chart_box(title, chart, cx)
 }
 
 fn class_table(c: &Cluster, cx: &App) -> Div {
@@ -310,8 +323,31 @@ fn class_table(c: &Cluster, cx: &App) -> Div {
 
 #[cfg(test)]
 mod tests {
-    use super::{duration, grouped, share};
+    use super::{duration, grouped, latencies, share};
+    use crate::k8s::meter::Minute;
+    use proptest::prelude::*;
     use std::time::Duration;
+
+    proptest! {
+        /// Every minute with requests has its average latency, in order, and a minute without
+        /// requests has none (not 0 ms).
+        #[test]
+        fn idle_minutes_have_no_latency(counts in proptest::collection::vec((0u64..4, 0u64..5_000), 0..60)) {
+            let minutes: Vec<(i64, Minute)> = counts
+                .iter()
+                .enumerate()
+                .map(|(i, &(count, ms))| {
+                    (i as i64, Minute { count, errors: 0, total: Duration::from_millis(ms * count) })
+                })
+                .collect();
+            let points = latencies(&minutes);
+            let busy: Vec<i64> = minutes.iter().filter(|(_, s)| s.count > 0).map(|(m, _)| *m).collect();
+            prop_assert_eq!(points.iter().map(|p| p.0).collect::<Vec<_>>(), busy);
+            for (m, d) in points {
+                prop_assert_eq!(d, Duration::from_millis(counts[m as usize].1));
+            }
+        }
+    }
 
     #[test]
     fn numbers_read_at_a_glance() {
