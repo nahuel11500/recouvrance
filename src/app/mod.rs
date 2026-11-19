@@ -303,6 +303,8 @@ pub struct AppView {
     kind: Option<Kind>,
     namespace: Option<String>,
     expanded_groups: HashSet<String>,
+    /// The port forwards at the bottom of the sidebar are listed (folded into one row else).
+    forwards_open: bool,
     table: Entity<TableState<ResourceTable>>,
     /// Contexts that failed to connect, until the next connect.
     connect_errors: Option<SharedString>,
@@ -533,6 +535,7 @@ impl AppView {
             kind: None,
             namespace: None,
             expanded_groups: HashSet::new(),
+            forwards_open: false,
             table,
             // A kubeconfig that can't be read shows where connect errors do.
             connect_errors: status,

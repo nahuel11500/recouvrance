@@ -53,42 +53,74 @@ impl AppView {
         }
     }
 
+    /// The port forwards, at the bottom: one row saying how many run and how many are
+    /// recent, which a click opens into the list.
     pub(super) fn render_forwards(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
-        let (muted, danger) = (theme.sidebar_foreground.opacity(0.62), theme.danger);
+        let (muted, danger, success, border, hover) = (
+            theme.sidebar_foreground.opacity(0.62),
+            theme.danger,
+            theme.success,
+            theme.sidebar_border,
+            theme.sidebar_accent.opacity(0.6),
+        );
         let items = &self.forwards.read(cx).items;
         let contexts: Vec<String> = self.clusters.iter().map(|c| c.0.clone()).collect();
         let restorable = self.forwards.read(cx).restorable(&contexts).len();
         let recent = self.forwards.read(cx).recent(&contexts);
         let agents = self.hub.forwards();
-        v_flex()
+        let (running, recent_n) = (items.len() + agents.len(), recent.len().min(8));
+        // The restorable ones are among the recent ones.
+        if running + recent_n == 0 {
+            return div().into_any_element();
+        }
+        let summary = match (running, recent_n) {
+            (0, r) => format!("{r} recent"),
+            (n, 0) => format!("{n} running"),
+            (n, r) => format!("{n} running · {r} recent"),
+        };
+        let open = self.forwards_open;
+        let header = h_flex()
+            .id("forwards-toggle")
+            .gap_1p5()
+            .mx_2()
+            .my_1()
             .px_2()
+            .py_1()
+            .rounded_md()
+            .text_sm()
+            .font_weight(FontWeight::MEDIUM)
+            .cursor_pointer()
+            .hover(move |s| s.bg(hover))
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.forwards_open = !this.forwards_open;
+                cx.notify();
+            }))
+            .child(Icon::new(Lucide::ArrowRightLeft).size_4())
+            .child(div().flex_1().child("Port forwards"))
+            .child(div().text_xs().text_color(if running > 0 { success } else { muted }).child(summary))
+            .child(
+                Icon::new(if open { IconName::ChevronDown } else { IconName::ChevronUp }).size_3().text_color(muted),
+            );
+        if !open {
+            return v_flex().border_t_1().border_color(border).child(header).into_any_element();
+        }
+        let list = v_flex()
+            .id("forwards-list")
+            .max_h(px(280.))
+            .overflow_y_scroll()
+            .px_2()
+            .pb_2()
             .when(restorable > 1, |d| {
                 d.child(
-                    div().px_2().pt_2().child(
+                    div().px_2().pb_1().child(
                         Button::new("restore-forwards")
                             .xsmall()
                             .custom(on_hull(cx))
                             .icon(Lucide::ArrowRightLeft)
-                            .label(format!(
-                                "Restore {restorable} port-forward{}",
-                                if restorable > 1 { "s" } else { "" }
-                            ))
+                            .label(format!("Restore {restorable} port-forwards"))
                             .on_click(cx.listener(|this, _, _, cx| this.restore_forwards(cx))),
                     ),
-                )
-            })
-            .when(!items.is_empty() || !recent.is_empty() || !agents.is_empty(), |d| {
-                d.child(
-                    h_flex()
-                        .gap_1p5()
-                        .pt_3()
-                        .pb_1()
-                        .px_2()
-                        .text_xs()
-                        .text_color(muted)
-                        .child(Icon::new(Lucide::ArrowRightLeft).size_3p5())
-                        .child("Port forwards"),
                 )
             })
             .children(items.iter().map(|f| {
@@ -220,7 +252,8 @@ impl AppView {
                                 cx.notify();
                             })),
                     )
-            }))
+            }));
+        v_flex().border_t_1().border_color(border).child(header).child(list).into_any_element()
     }
 
     pub(super) fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -263,9 +296,9 @@ impl AppView {
             .border_color(cx.theme().sidebar_border)
             .child(self.sidebar_header(cx))
             .children(self.page_links(colors, cx))
-            .child(self.render_forwards(cx))
             .child(div().px_2().pt_3().pb_1().child(filter))
             .child(v_flex().id("kinds").flex_1().min_h_0().overflow_y_scroll().px_2().pb_4().children(children))
+            .child(self.render_forwards(cx))
     }
 
     /// Logo, the connected contexts (a click manages them), back and forward.
