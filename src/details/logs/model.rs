@@ -556,6 +556,39 @@ pub(crate) fn stream_status(pods: &[String], states: &[StreamState]) -> Option<S
     (!parts.is_empty()).then(|| parts.join(" · "))
 }
 
+/// The messages that were ready on several pods' streams, taken as one update: each pod's
+/// lines as one batch, in their order, and the pods' states in the order they came (a pod
+/// ends in its last message's). A busy workload sends a line at a time from tens of pods:
+/// merging and redrawing once per line made its Logs tab fall minutes behind.
+pub(crate) fn coalesce(batch: Vec<(usize, crate::k8s::LogMsg)>) -> Coalesced {
+    use crate::k8s::LogMsg;
+    let mut lines: Vec<(usize, Vec<String>)> = Vec::new();
+    let mut states = Vec::with_capacity(batch.len());
+    for (ix, msg) in batch {
+        let state = match msg {
+            LogMsg::Lines(new) => {
+                match lines.iter_mut().find(|(i, _)| *i == ix) {
+                    Some((_, l)) => l.extend(new),
+                    None => lines.push((ix, new)),
+                }
+                StreamState::Live
+            }
+            LogMsg::Reconnecting(why) => StreamState::Reconnecting(why),
+            LogMsg::End => StreamState::Ended,
+            LogMsg::Error(e) => StreamState::Failed(e),
+        };
+        states.push((ix, state));
+    }
+    Coalesced { lines, states }
+}
+
+/// Ready stream messages taken together: each pod's lines as one batch, and the pods'
+/// states in the order they came.
+pub(crate) struct Coalesced {
+    pub(crate) lines: Vec<(usize, Vec<String>)>,
+    pub(crate) states: Vec<(usize, StreamState)>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -760,5 +793,46 @@ mod tests {
             stream_status(&pods, &[Reconnecting("x".into()), Ended, Failed("gone".into())]).as_deref(),
             Some("1 reconnecting (a1) · 1 ended (b2) · 1 failed (gone: c3)")
         );
+    }
+
+    proptest::proptest! {
+        /// Taking the ready messages together changes nothing a pod shows: its lines stay in
+        /// order and whole, and its state is its last message's.
+        #[test]
+        fn coalesced_messages_keep_each_pods_lines_and_state(
+            batch in proptest::collection::vec((0usize..4, 0u8..4, proptest::collection::vec("[a-z]{1,3}", 0..4)), 0..40)
+        ) {
+            use crate::k8s::LogMsg;
+            let msgs: Vec<(usize, LogMsg)> = batch
+                .iter()
+                .map(|(ix, kind, lines)| {
+                    let msg = match kind {
+                        0 | 1 => LogMsg::Lines(lines.clone()),
+                        2 => LogMsg::Reconnecting("cut".into()),
+                        _ => LogMsg::End,
+                    };
+                    (*ix, msg)
+                })
+                .collect();
+            let Coalesced { lines, states } = coalesce(msgs);
+            for pod in 0..4 {
+                let sent: Vec<String> = batch
+                    .iter()
+                    .filter(|(ix, kind, _)| *ix == pod && *kind < 2)
+                    .flat_map(|(_, _, l)| l.clone())
+                    .collect();
+                let got: Vec<String> =
+                    lines.iter().filter(|(ix, _)| *ix == pod).flat_map(|(_, l)| l.clone()).collect();
+                proptest::prop_assert_eq!(got, sent);
+                proptest::prop_assert!(lines.iter().filter(|(ix, _)| *ix == pod).count() <= 1);
+                let last = batch.iter().rev().find(|(ix, _, _)| *ix == pod).map(|(_, kind, _)| match kind {
+                    0 | 1 => StreamState::Live,
+                    2 => StreamState::Reconnecting("cut".into()),
+                    _ => StreamState::Ended,
+                });
+                let applied = states.iter().rev().find(|(ix, _)| *ix == pod).map(|(_, s)| s.clone());
+                proptest::prop_assert_eq!(applied, last);
+            }
+        }
     }
 }
