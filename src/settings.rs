@@ -50,6 +50,19 @@ fn wait_secs_or_longest<'de, D: Deserializer<'de>>(d: D) -> Result<u64, D::Error
 /// The seconds a confirmation may wait: at least one, never long enough to be in the way.
 pub const CONFIRM_WAIT_RANGE: std::ops::RangeInclusive<u64> = 1..=30;
 
+/// The sidebar's width to start with, and how narrow or wide it can be dragged (pixels).
+pub const SIDEBAR_WIDTH: f32 = 260.;
+pub const SIDEBAR_WIDTH_RANGE: std::ops::RangeInclusive<f32> = 180.0..=520.0;
+
+/// The sidebar's width: the one saved, brought within range.
+pub fn sidebar_width_in(s: &Settings) -> f32 {
+    if s.sidebar_width.is_finite() {
+        s.sidebar_width.clamp(*SIDEBAR_WIDTH_RANGE.start(), *SIDEBAR_WIDTH_RANGE.end())
+    } else {
+        SIDEBAR_WIDTH
+    }
+}
+
 fn clamp_wait(secs: u64) -> u64 {
     secs.clamp(*CONFIRM_WAIT_RANGE.start(), *CONFIRM_WAIT_RANGE.end())
 }
@@ -229,6 +242,8 @@ pub struct Settings {
     pub confirm_wait_secs: u64,
     /// What the timeline records, and how much of it is kept.
     pub timeline: TimelineSettings,
+    /// The sidebar's width in pixels, as last dragged (read with `sidebar_width_in`).
+    pub sidebar_width: f32,
 }
 
 /// The timeline: changes recorded while the app watches (see `crate::timeline`).
@@ -431,6 +446,7 @@ impl Default for Settings {
             confirm_style: ConfirmStyle::Wait,
             confirm_wait_secs: 3,
             timeline: TimelineSettings::default(),
+            sidebar_width: SIDEBAR_WIDTH,
         }
     }
 }
@@ -1181,6 +1197,21 @@ mod properties {
                     prop_assert_eq!(&style, &json!("wait"));
                     prop_assert!(super::CONFIRM_WAIT_RANGE.contains(&w));
                 }
+            }
+        }
+
+        /// Whatever width the file holds, the sidebar opens within its range, at the width
+        /// saved when that one is.
+        #[test]
+        fn a_saved_sidebar_width_stays_in_range(width in prop_oneof![bad(), any::<f64>().prop_map(|n| json!(n))]) {
+            let text = json!({"sidebar_width": width, "metrics_refresh": 7});
+            let (read, _, lost) = from_bytes(&serde_json::to_vec(&text).unwrap());
+            prop_assert!(!lost);
+            prop_assert_eq!(read.metrics_refresh, 7);
+            let w = super::sidebar_width_in(&read);
+            prop_assert!(super::SIDEBAR_WIDTH_RANGE.contains(&w));
+            if let Some(n) = width.as_f64().filter(|n| super::SIDEBAR_WIDTH_RANGE.contains(&(*n as f32))) {
+                prop_assert_eq!(w, n as f32);
             }
         }
 

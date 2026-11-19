@@ -311,6 +311,12 @@ impl AppView {
             1 => self.clusters[0].0.clone(),
             n => format!("{n} contexts"),
         };
+        let names: Vec<&str> = self.clusters.iter().map(|c| c.0.as_str()).collect();
+        let tip = SharedString::from(if names.is_empty() {
+            "Manage contexts".to_string()
+        } else {
+            format!("{} — click to manage contexts", names.join(" · "))
+        });
         h_flex()
             .gap_2()
             .px_3()
@@ -327,6 +333,7 @@ impl AppView {
                     .whitespace_nowrap()
                     .cursor_pointer()
                     .on_click(cx.listener(|this, _, _, cx| this.navigate(Route::Contexts, cx)))
+                    .tooltip(move |w, cx| component::tooltip::Tooltip::new(tip.clone()).build(w, cx))
                     .child(context),
             )
             .child(
@@ -542,8 +549,7 @@ impl AppView {
                 group.clone_from(&kind.ar.group);
                 let g = group.clone();
                 rows.push(
-                    h_flex()
-                        .id(("group", i))
+                    tip_if_cut(h_flex().id(("group", i)), &group, colors.fits)
                         .gap_1()
                         .px_2()
                         .py(px(3.))
@@ -575,9 +581,11 @@ impl AppView {
     }
 }
 
-/// The sidebar's colors.
+/// The sidebar's colors, and how many characters of a row's label fit.
 #[derive(Clone, Copy)]
 struct Colors {
+    /// Characters a row's label shows before it is cut (a little under, to be safe).
+    fits: usize,
     fg: Hsla,
     muted: Hsla,
     active_bg: Hsla,
@@ -588,13 +596,27 @@ struct Colors {
 impl Colors {
     fn of(cx: &App) -> Self {
         let theme = cx.theme();
+        // About 7.5 px a character at the sidebar's text size; the row's padding and star
+        // take the rest.
+        let width = crate::settings::with(crate::settings::sidebar_width_in);
+        let fits = ((width - 56.) / (7.5 * crate::app::zoom(cx))).max(0.) as usize;
         Self {
+            fits,
             fg: theme.sidebar_foreground,
             muted: theme.sidebar_foreground.opacity(0.62),
             active_bg: theme.sidebar_accent,
             brass: theme.sidebar_primary,
         }
     }
+}
+
+/// The whole text in a tooltip, when `text` is longer than the `fits` characters shown.
+fn tip_if_cut(row: Stateful<Div>, text: &str, fits: usize) -> Stateful<Div> {
+    if text.chars().count() <= fits {
+        return row;
+    }
+    let text = SharedString::from(text.to_string());
+    row.tooltip(move |w, cx| component::tooltip::Tooltip::new(text.clone()).build(w, cx))
 }
 
 fn section_header(label: SharedString, icon: Lucide, colors: Colors) -> Div {
@@ -641,9 +663,8 @@ fn kind_row(
 ) -> Stateful<Div> {
     let group = SharedString::from(format!("{}-{}", id.0, id.1));
     let favs = favs.clone();
-    h_flex()
-        .id(id)
-        .group(group.clone())
+    let row = tip_if_cut(h_flex().id(id), &label, colors.fits.saturating_sub(if indent { 3 } else { 0 }));
+    row.group(group.clone())
         .px_2()
         .when(indent, Styled::pl_5)
         .py(px(3.))
@@ -684,8 +705,7 @@ fn two_line_row(
     remove: impl Fn(&mut App) + 'static,
 ) -> Stateful<Div> {
     let line = || div().overflow_hidden().text_ellipsis().whitespace_nowrap();
-    h_flex()
-        .id(id)
+    tip_if_cut(h_flex().id(id), &title, colors.fits)
         .group(id.0)
         .px_2()
         .py(px(3.))
