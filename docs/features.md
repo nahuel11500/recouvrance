@@ -1,6 +1,9 @@
 # Features
 
-- **Contexts**: pick one or several on launch; tables merge clusters with a Context column.
+- **Contexts**: pick one or several on launch; tables merge clusters with a Context column. When a
+  context's login command (its kubeconfig exec plugin) fails, the app says which program failed, its
+  exit code and the last line it wrote to stderr: never its arguments, environment or output, where
+  a client secret or a token can be.
 - **Sidebar**: the filter at its top finds pages and resource types (by name, kind or API group).
   Pages, saved views, favorites and types scroll together; a section folds with a click on its
   name (kept for next time) and says how many types it holds. Port forwards fold into one row at

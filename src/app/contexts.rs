@@ -69,7 +69,7 @@ impl AppView {
             for (ctx, r) in contexts.iter().zip(results) {
                 match r {
                     Ok(client) => clusters.push((ctx.clone(), client)),
-                    Err(e) => errors.push(format!("{ctx}: {e:#}")),
+                    Err(e) => errors.push(format!("{ctx}: {}", k8s::error_chain(&e))),
                 }
             }
             let result = async {
@@ -332,7 +332,7 @@ fn merge_kinds(
         let found = match found {
             Ok(found) => found,
             Err(e) => {
-                errors.push(format!("{name}: {e:#}"));
+                errors.push(format!("{name}: {}", k8s::error_chain(&e)));
                 continue;
             }
         };

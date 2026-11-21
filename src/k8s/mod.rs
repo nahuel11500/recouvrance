@@ -25,6 +25,7 @@ pub(crate) mod files;
 mod forward;
 pub(crate) mod gate;
 pub(crate) mod lists;
+mod login;
 pub(crate) mod meter;
 mod metrics;
 pub(crate) mod names;
@@ -164,10 +165,13 @@ pub fn mask_secret_values(value: &mut serde_json::Value) {
     }
 }
 
-/// kubectl-style age: 45s, 12m, 5h, 3d, 2y.
 /// An error as a person reads it: the API server's own message (not kube's debug dump of
-/// the whole Status), otherwise the error chain.
+/// the whole Status), a context's login command that failed by its program and error,
+/// otherwise the error chain.
 pub fn short_error(e: &anyhow::Error) -> String {
+    if let Some(said) = login::login_failure(e.as_ref()) {
+        return said;
+    }
     for cause in e.chain() {
         if let Some(kube::Error::Api(status)) = cause.downcast_ref::<kube::Error>() {
             // A plain-text body ("404 page not found\n") keeps its newline.
@@ -182,6 +186,13 @@ pub fn short_error(e: &anyhow::Error) -> String {
         return format!("The cluster did not answer (timed out {step})");
     }
     text.trim().to_string()
+}
+
+/// An error with what was being done when it happened, as `{e:#}` says it. A context's login
+/// command that failed is said alone (its program, exit code and last stderr line), without
+/// kube's `ServiceError` and the request around it.
+pub fn error_chain(e: &anyhow::Error) -> String {
+    login::login_failure(e.as_ref()).unwrap_or_else(|| format!("{e:#}"))
 }
 
 /// The HTTP status of an API error (403 forbidden, 404 not found…), if it is one.
