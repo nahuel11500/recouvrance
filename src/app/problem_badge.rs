@@ -90,11 +90,24 @@ impl ProblemBadge {
         }
     }
 
-    /// What the badge's tooltip says while counting is on: the counts and how old they
-    /// are, what they leave out, and when they are counted again.
-    pub(super) fn tooltip(&self) -> Option<SharedString> {
+    /// The badge's tooltip while counting is on.
+    pub(super) fn tooltip(&self) -> Option<Tip> {
+        self.counting.is_some().then(|| Tip { counts: self.counts, counted: self.counted, gaps: self.gaps.clone() })
+    }
+}
+
+/// What the badge's tooltip says: the counts and how old they are, what they leave out, and
+/// when they are counted again. Worked out when it shows, so the age is the one at that time.
+pub(super) struct Tip {
+    counts: Option<(usize, usize)>,
+    counted: Option<(Instant, Duration)>,
+    gaps: Option<SharedString>,
+}
+
+impl Tip {
+    pub(super) fn text(&self) -> SharedString {
         let counted = self.counted.map(|(at, every)| (at.elapsed(), every));
-        self.counting.is_some().then(|| tooltip_text(self.counts, counted, self.gaps.as_deref()))
+        tooltip_text(self.counts, counted, self.gaps.as_deref())
     }
 }
 
@@ -227,6 +240,16 @@ mod tests {
             "0 critical, 3 warnings, counted 5s ago\nCounted again every 16m, paused while the window is hidden"
         );
         // Not counting (not connected): no tooltip.
-        assert_eq!(ProblemBadge::default().tooltip(), None);
+        assert!(ProblemBadge::default().tooltip().is_none());
+        // Counting: the badge's own counts, aged when the tooltip shows.
+        let badge = ProblemBadge {
+            counts: Some((1, 0)),
+            counted: Some((std::time::Instant::now(), s(120))),
+            counting: Some(gpui_kit::Task::ready(())),
+            ..ProblemBadge::default()
+        };
+        let text = badge.tooltip().unwrap().text();
+        assert!(text.starts_with("1 critical, 0 warnings, counted "), "{text}");
+        assert!(text.ends_with("\nCounted again every 2m, paused while the window is hidden"), "{text}");
     }
 }

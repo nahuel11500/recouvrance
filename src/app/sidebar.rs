@@ -381,7 +381,7 @@ impl AppView {
                     d.child(badge(n, if critical { danger } else { warning }))
                 })
                 .when_some(self.problems.tooltip(), |d, tip| {
-                    d.tooltip(move |w, cx| component::tooltip::Tooltip::new(tip.clone()).build(w, cx))
+                    d.tooltip(move |w, cx| component::tooltip::Tooltip::new(tip.text()).build(w, cx))
                 }),
             nav_row("nav-timeline", Lucide::ClockArrowDown, "Timeline", matches!(route, Route::Timeline(_)))
                 .on_click(cx.listener(|this, _, window, cx| this.open_timeline(window, cx))),
