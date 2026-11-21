@@ -29,7 +29,8 @@ pub struct TopNodesParams {
 #[tool_router(router = node_tools, vis = "pub(super)")]
 impl KubeMcp {
     #[tool(
-        description = "Mark a node unschedulable, like `kubectl cordon`: running pods stay, new ones go elsewhere. Needs the drain verb. Supports dry_run."
+        description = "Mark a node unschedulable, like `kubectl cordon`: running pods stay, new ones go elsewhere. Needs the drain verb. Supports dry_run.",
+        annotations(read_only_hint = false)
     )]
     async fn cordon_node(
         &self,
@@ -40,7 +41,8 @@ impl KubeMcp {
     }
 
     #[tool(
-        description = "Make a node schedulable again, like `kubectl uncordon`. Needs the drain verb. Supports dry_run."
+        description = "Make a node schedulable again, like `kubectl uncordon`. Needs the drain verb. Supports dry_run.",
+        annotations(read_only_hint = false)
     )]
     async fn uncordon_node(
         &self,

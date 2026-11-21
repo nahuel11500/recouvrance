@@ -122,10 +122,10 @@ fn problem(e: &AuditEntry) -> bool {
     matches!(e.decision, Decision::Denied | Decision::Rejected | Decision::Failed)
 }
 
+/// Whether a call may have changed something: what the Writes filter keeps, each task counts
+/// and the tool's color shows.
 fn writes(e: &AuditEntry) -> bool {
-    // `gitops` changes things, except its `diagnose`, which only reads.
-    let reads = e.tool == "gitops" && arg(e, "action").as_deref() == Some("diagnose");
-    crate::mcp::server::tool_writes(&e.tool) && !reads
+    crate::mcp::server::call_writes(&e.tool, &e.args)
 }
 
 /// What a group touched: contexts, namespaces, then objects, a few of each.
@@ -742,6 +742,28 @@ mod tests {
         assert!(!keep(&e, Shown::Problems, None, None, ""));
         assert!(!keep(&e, Shown::All, Some("staging"), None, ""));
         assert!(!keep(&e, Shown::All, None, Some("other-agent"), ""));
+    }
+
+    /// Writes are the calls that may have changed something: `set_image` is one (a list of
+    /// tools kept by hand missed it), a dry run or an Argo CD diagnosis is not (#843).
+    #[test]
+    fn writes_are_the_calls_that_may_have_changed_something() {
+        let image = serde_json::json!({"context": "prod", "kind": "deployments", "namespace": "app", "name": "web",
+            "container": "web", "image": "web:2", "dry_run": null});
+        let apply = serde_json::json!({"context": "prod", "namespace": "app", "dry_run": true, "bytes": 120});
+        let diagnose = serde_json::json!({"context": "prod", "kind": "applications", "namespace": "argocd",
+            "name": "web", "action": "diagnose"});
+        let calls = vec![
+            call(30, "set_image", image, Decision::Allowed),
+            call(20, "apply_manifest", apply, Decision::Allowed),
+            call(10, "gitops", diagnose, Decision::Allowed),
+        ];
+        let kept: Vec<&str> =
+            calls.iter().filter(|e| keep(e, Shown::Writes, None, None, "")).map(|e| e.tool.as_str()).collect();
+        assert_eq!(kept, ["set_image"]);
+        let lines = items(&group_calls(calls), &HashSet::new());
+        let Some(Item::Header { calls: total, writes, .. }) = lines.first() else { panic!("a header first") };
+        assert_eq!((*total, *writes), (3, 1));
     }
 
     #[test]

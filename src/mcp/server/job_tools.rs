@@ -39,7 +39,8 @@ const DEBUG_IMAGE: &str = "busybox:1.37";
 #[tool_router(router = job_tools, vis = "pub(super)")]
 impl KubeMcp {
     #[tool(
-        description = "Start a Job from a CronJob now, like `kubectl create job --from=cronjob/NAME`. Needs apply on jobs (the Job is named NAME-manual-<number>). Supports dry_run."
+        description = "Start a Job from a CronJob now, like `kubectl create job --from=cronjob/NAME`. Needs apply on jobs (the Job is named NAME-manual-<number>). Supports dry_run.",
+        annotations(read_only_hint = false, destructive_hint = false)
     )]
     async fn trigger_cronjob(
         &self,
@@ -61,7 +62,8 @@ impl KubeMcp {
     }
 
     #[tool(
-        description = "Add an ephemeral debug container to a pod, like `kubectl debug --target`, and return its name: then run commands in it with exec_command (container = that name). It stays until the pod goes. Needs the exec verb on the pod. Supports dry_run."
+        description = "Add an ephemeral debug container to a pod, like `kubectl debug --target`, and return its name: then run commands in it with exec_command (container = that name). It stays until the pod goes. Needs the exec verb on the pod. Supports dry_run.",
+        annotations(read_only_hint = false, destructive_hint = false)
     )]
     async fn debug_pod(
         &self,

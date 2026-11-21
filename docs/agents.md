@@ -89,8 +89,14 @@ Tools, by what they do:
   `cordon_node`, `uncordon_node`, `drain_node`, `gitops`, `exec_command`, `debug_pod`,
   `port_forward`, `stop_port_forward`.
 
+Each tool tells the agent's client whether it only reads (`readOnlyHint`): the tools under **Read**
+say so, except `browse_files`, which may add a debug container; the changes don't. Of those that may
+change something, `trigger_cronjob`, `debug_pod`, `port_forward` and `browse_files` only add
+(`destructiveHint: false`).
+
 Every change supports `dry_run` except `exec_command`, `drain_node`, `gitops` and the port-forward
-tools. What some of them need beyond the obvious verb:
+tools; `my_permissions` names them, from the tools' definitions. What some of them need beyond the
+obvious verb:
 
 - **Custom and external metrics:** `get_metrics` reads `custom.metrics.k8s.io` and
   `external.metrics.k8s.io`, what an HPA or KEDA gets from prometheus-adapter, like
@@ -182,7 +188,9 @@ The Activity page groups calls by task: one agent session, split where the agent
 10 minutes. Each group says what it touched (contexts, namespaces, objects); repeated calls of a tool on
 the same target fold into one line, and any line opens to its full arguments and result. Filter by
 writes, denied or failed calls, context, agent or text. It shows the latest 300 calls; "Show older"
-goes further back, and then reads the log on disk.
+goes further back, and then reads the log on disk. A call counts as a write when its tool may change
+something (the changes above, and `browse_files` with `debug: true`), but not a dry run nor `gitops`'s
+`diagnose`; each group counts its writes.
 
 > These rules govern what agents do *through Recouvrance*. An agent with shell access can still run
 > `kubectl` with your kubeconfig, so block `kubectl`/`helm` in its own permissions if Recouvrance
