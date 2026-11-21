@@ -40,7 +40,8 @@ RECOUVRANCE_TAB=logs cargo run --features dev -- --snapshot out.png 8
 
 Useful variables: `RECOUVRANCE_PAGE` (`apply`, `settings`, `cluster`, `access`, `assistant-dock`…),
 `RECOUVRANCE_FILTER`, `RECOUVRANCE_ACT` (comma-separated hooks, see `src/app/demo.rs` and
-`src/details/demo.rs`), `RECOUVRANCE_INPUT` (`click:x,y;key:enter;wait:2`), `RECOUVRANCE_WRITES=1`,
+`src/details/demo.rs`), `RECOUVRANCE_INPUT` (`click:x,y;key:enter;wait:2`; `shot:name.png` saves a frame next
+to the snapshot, for recordings), `RECOUVRANCE_WRITES=1`,
 `RECOUVRANCE_DARK=1`, `RECOUVRANCE_ZOOM`. Point `XDG_CONFIG_HOME` at a scratch folder to keep your
 settings untouched. Give it another MCP port too (`{"port": 47199, "version": 1}` in
 `$XDG_CONFIG_HOME/recouvrance/agents.json`), so it doesn't take 47070 from the Recouvrance you
