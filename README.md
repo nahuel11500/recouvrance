@@ -14,7 +14,7 @@ A fast Kubernetes desktop client (Rust + [gpui](https://github.com/zed-industrie
 **local MCP server**, so AI agents can work on your clusters under rules you control.
 
 <div align="center">
-  <img src="https://raw.githubusercontent.com/nahuel11500/recouvrance/media/recouvrance-tour.gif" width="85%" alt="A tour of Recouvrance: the pods table, the command palette, a crash diagnosis, logs across pods, the Problems page, an agent's request waiting for approval, the agent activity and the dark theme">
+  <img src="https://raw.githubusercontent.com/nahuel11500/recouvrance/media/recouvrance-tour.gif" width="85%" alt="A tour of Recouvrance: the pods table, the command palette, a crash diagnosis, the assistant finding its cause, logs across pods, the Problems page, an agent's request waiting for approval and the dark theme">
 </div>
 
 ## Highlights
@@ -51,8 +51,12 @@ A fast Kubernetes desktop client (Rust + [gpui](https://github.com/zed-industrie
     <td width="50%"><img src="https://raw.githubusercontent.com/nahuel11500/recouvrance/media/screenshots/diagnosis.png" alt="A crash-looping pod with its diagnosis and last output"></td>
   </tr>
   <tr>
+    <td width="50%"><img src="https://raw.githubusercontent.com/nahuel11500/recouvrance/media/screenshots/assistant.png" alt="The assistant finding why a pod crash-loops: the Service it calls has no endpoints because its backend asks for more memory than any node has"></td>
     <td width="50%"><img src="https://raw.githubusercontent.com/nahuel11500/recouvrance/media/screenshots/logs.png" alt="Logs of every pod of a deployment, merged, with levels and a histogram"></td>
+  </tr>
+  <tr>
     <td width="50%"><img src="https://raw.githubusercontent.com/nahuel11500/recouvrance/media/screenshots/command-palette.png" alt="The command palette (Ctrl+K) finding objects and pages"></td>
+    <td width="50%"><img src="https://raw.githubusercontent.com/nahuel11500/recouvrance/media/screenshots/workloads.png" alt="The workloads overview with warnings and recent restarts"></td>
   </tr>
   <tr>
     <td width="50%"><img src="https://raw.githubusercontent.com/nahuel11500/recouvrance/media/screenshots/approval.png" alt="An agent's request waiting for approval above its rules"></td>
