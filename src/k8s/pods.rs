@@ -1067,10 +1067,8 @@ mod tests {
         let read: Vec<(&str, &str)> = lines.iter().map(|l| (l.kind.as_str(), l.name.as_str())).collect();
         assert_eq!(read, [("Warning", "web-00001.Warning"), ("Normal", "web-00001.Normal")]);
         let asked = cluster.asked();
-        assert!(
-            asked[0].starts_with("/api/v1/namespaces/z/events?fieldSelector=involvedObject.uid%3Dz-1"),
-            "{asked:?}"
-        );
+        assert_eq!(asked.len(), 1, "{asked:?}");
+        assert!(asked[0].starts_with("/api/v1/namespaces/z/events?") && asked[0].contains("involvedObject.uid%3Dz-1"));
     }
 
     proptest! {
