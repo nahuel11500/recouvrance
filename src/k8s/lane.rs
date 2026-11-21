@@ -122,7 +122,8 @@ mod tests {
                     let busy = held.iter().filter(|(l, _)| *l == Lane::Background).count();
                     let free = held.len() < ALL && (lane == Lane::Foreground || busy < BACKGROUND);
                     let slot = take(&slots, lane);
-                    prop_assert_eq!(slot.is_some(), free, "{lane:?} with {} taken, {busy} in the background", held.len());
+                    // Positional: `prop_assert_eq!` puts the message after its own with `concat!`.
+                    prop_assert_eq!(slot.is_some(), free, "{:?} with {} taken, {} in the background", lane, held.len(), busy);
                     held.extend(slot.map(|s| (lane, s)));
                 } else if !held.is_empty() {
                     drop(held.remove(which % held.len()));
