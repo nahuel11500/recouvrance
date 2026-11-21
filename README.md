@@ -14,7 +14,7 @@ A fast Kubernetes desktop client (Rust + [gpui](https://github.com/zed-industrie
 **local MCP server**, so AI agents can work on your clusters under rules you control.
 
 <div align="center">
-  <img src="https://raw.githubusercontent.com/nahuel11500/recouvrance/media/recouvrance-tour.gif" width="85%" alt="A tour of Recouvrance: the pods table, the command palette, a crash diagnosis, logs across pods, the Problems page and the workloads overview">
+  <img src="https://raw.githubusercontent.com/nahuel11500/recouvrance/media/recouvrance-tour.gif" width="85%" alt="A tour of Recouvrance: the pods table, the command palette, a crash diagnosis, logs across pods, the Problems page, an agent's request waiting for approval, the agent activity and the dark theme">
 </div>
 
 ## Highlights
@@ -47,12 +47,16 @@ A fast Kubernetes desktop client (Rust + [gpui](https://github.com/zed-industrie
     <td width="50%"><img src="https://raw.githubusercontent.com/nahuel11500/recouvrance/media/screenshots/pods-dark.png" alt="The same table in the dark theme"></td>
   </tr>
   <tr>
+    <td width="50%"><img src="https://raw.githubusercontent.com/nahuel11500/recouvrance/media/screenshots/problems.png" alt="The Problems page: crash loops, pending pods, image pull errors and failed jobs"></td>
     <td width="50%"><img src="https://raw.githubusercontent.com/nahuel11500/recouvrance/media/screenshots/diagnosis.png" alt="A crash-looping pod with its diagnosis and last output"></td>
-    <td width="50%"><img src="https://raw.githubusercontent.com/nahuel11500/recouvrance/media/screenshots/logs.png" alt="Logs of every pod of a deployment, merged, with levels and a timeline"></td>
   </tr>
   <tr>
+    <td width="50%"><img src="https://raw.githubusercontent.com/nahuel11500/recouvrance/media/screenshots/logs.png" alt="Logs of every pod of a deployment, merged, with levels and a histogram"></td>
     <td width="50%"><img src="https://raw.githubusercontent.com/nahuel11500/recouvrance/media/screenshots/command-palette.png" alt="The command palette (Ctrl+K) finding objects and pages"></td>
-    <td width="50%"><img src="https://raw.githubusercontent.com/nahuel11500/recouvrance/media/screenshots/workloads.png" alt="The workloads overview with warnings and recent restarts"></td>
+  </tr>
+  <tr>
+    <td width="50%"><img src="https://raw.githubusercontent.com/nahuel11500/recouvrance/media/screenshots/approval.png" alt="An agent's request waiting for approval above its rules"></td>
+    <td width="50%"><img src="https://raw.githubusercontent.com/nahuel11500/recouvrance/media/screenshots/activity.png" alt="An agent's calls grouped by task, with the rule that decided each"></td>
   </tr>
 </table>
 
