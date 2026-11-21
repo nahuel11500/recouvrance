@@ -609,20 +609,21 @@ impl DetailPanel {
         let task = cx.spawn_in(window, async move |this, cx| {
             loop {
                 cx.background_executor().timer(crate::settings::secs(crate::settings::get().detail_refresh)).await;
-                // Hidden (in history): stop log streams, then wait to be shown again.
+                // Hidden (in history, or its window hidden): wait to be shown again. In
+                // history, log streams stop too; a hidden window keeps them, like its shells.
                 let hidden = this.update(cx, |this, cx| {
-                    let hidden = !crate::app::is_visible(cx.entity_id(), cx);
-                    if hidden && let Some(l) = &this.logs {
+                    let away = !crate::app::is_current(cx.entity_id(), cx);
+                    if away && let Some(l) = &this.logs {
                         l.update(cx, |l, _| l.pause());
                     }
                     // A node shell pod nobody is connected to is not left running.
-                    if hidden
+                    if away
                         && this.node_shell.is_some()
                         && !this.terminal.as_ref().is_some_and(|t| t.read(cx).connected())
                     {
                         this.end_node_shell(cx);
                     }
-                    hidden
+                    !crate::app::is_visible(cx.entity_id(), cx)
                 });
                 match hidden {
                     Err(_) => break,

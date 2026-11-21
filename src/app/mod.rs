@@ -80,8 +80,6 @@ impl Route {
     }
 }
 
-/// The page each window shows. Hidden pages (in back/forward history) stop
-/// polling and streaming until shown again.
 /// A tab: its own back/forward history, filter and namespaces. The active tab's
 /// state lives in the `AppView` fields; the others are kept here.
 #[derive(Clone, Default)]
@@ -94,16 +92,43 @@ struct TabState {
     kind: Option<Kind>,
 }
 
+/// The page each window shows, and the windows the desktop hides (minimized, on another
+/// workspace). Pages hidden in the back/forward history, and every page of a hidden
+/// window, stop polling until shown again.
 #[derive(Default)]
-struct VisiblePages(HashMap<EntityId, EntityId>);
+struct VisiblePages {
+    /// Each window's page, by the window's `AppView`.
+    pages: HashMap<EntityId, EntityId>,
+    /// The windows hidden, by their `AppView`.
+    hidden: HashSet<EntityId>,
+}
 
 impl Global for VisiblePages {}
 
-pub fn is_visible(page: EntityId, cx: &App) -> bool {
-    cx.try_global::<VisiblePages>().is_some_and(|v| v.0.values().any(|p| *p == page))
+impl VisiblePages {
+    /// Whether `page` is on screen: its window shows it, and is not hidden.
+    fn on_screen(&self, page: EntityId) -> bool {
+        self.pages.iter().any(|(window, p)| *p == page && !self.hidden.contains(window))
+    }
+
+    /// Whether `page` is the one its window shows, hidden or not.
+    fn current(&self, page: EntityId) -> bool {
+        self.pages.values().any(|p| *p == page)
+    }
 }
 
-/// Wait until this page is shown; false once it is gone.
+/// Whether `page` is on screen: the page its window shows, in a window not hidden.
+pub fn is_visible(page: EntityId, cx: &App) -> bool {
+    cx.try_global::<VisiblePages>().is_some_and(|v| v.on_screen(page))
+}
+
+/// Whether `page` is the page its window shows, even while that window is hidden (not one
+/// in the back/forward history).
+pub fn is_current(page: EntityId, cx: &App) -> bool {
+    cx.try_global::<VisiblePages>().is_some_and(|v| v.current(page))
+}
+
+/// Wait until this page is on screen; false once it is gone.
 pub async fn wait_visible<T: 'static, C: AppContext>(
     this: &WeakEntity<T>,
     cx: &mut C,
@@ -294,6 +319,12 @@ pub struct AppView {
     kind_clusters: HashMap<String, Vec<usize>>,
     /// The kind on screen, listed across the clusters.
     list: live_list::LiveList,
+    /// Set while the list isn't on screen (see `list_on_screen`): its watches hold their
+    /// rows back, its metrics stop polling.
+    list_pause: k8s::Pause,
+    /// The desktop hides the window (minimized, on another workspace): its pages stop
+    /// polling, the list pauses and the problem badge waits.
+    window_hidden: bool,
     /// Lists shown recently, shown again at once when you come back to them.
     views: view_cache::ViewCache,
     /// What the list on screen is (clusters, kind, namespace, custom columns), to keep it
@@ -450,6 +481,11 @@ impl AppView {
                     apply_theme(mode, Some(window), cx);
                 }
             }),
+            // Only changes count: a window starts shown, and one whose platform never says it
+            // is hidden keeps working as before.
+            cx.observe_window_visibility(window, |this, visibility, _, cx| {
+                this.set_window_hidden(!visibility.is_visible(), cx);
+            }),
         ];
 
         // One agent hub and MCP server for the whole app, shared by its windows.
@@ -530,6 +566,8 @@ impl AppView {
             recording: Vec::new(),
             views: Default::default(),
             list: live_list::LiveList::default(),
+            list_pause: k8s::Pause::default(),
+            window_hidden: false,
             view_key: None,
             kinds: Vec::new(),
             kind: None,
@@ -600,6 +638,15 @@ impl AppView {
             _ => None,
         }
     }
+
+    /// The desktop hid the window or shows it again. Meanwhile its pages stop polling, the
+    /// list holds its rows back and the problem badge waits; watches, log streams and
+    /// shells keep going. A window on another monitor, shown but not focused, is not hidden.
+    fn set_window_hidden(&mut self, hidden: bool, cx: &mut Context<Self>) {
+        self.window_hidden = hidden;
+        self.mark_visible(cx);
+        cx.notify();
+    }
 }
 
 /// A developer hook from the environment (`RECOUVRANCE_CONTEXT`, `_PAGE`…), read only in
@@ -644,7 +691,25 @@ pub fn open_delete_settings(window: &mut Window, cx: &mut App) {
 
 #[cfg(test)]
 mod tests {
-    use gpui_kit::{KeyContext, Keymap, Keystroke};
+    use gpui_kit::{EntityId, KeyContext, Keymap, Keystroke};
+
+    use super::VisiblePages;
+
+    #[test]
+    fn a_hidden_window_shows_no_page() {
+        let (window, other, page, behind) = (1u64.into(), 2u64.into(), 3u64.into(), 4u64.into());
+        let mut visible = VisiblePages::default();
+        visible.pages.insert(window, page);
+        visible.pages.insert(other, behind);
+        assert!(visible.on_screen(page) && visible.current(page));
+        visible.hidden.insert(window);
+        assert!(!visible.on_screen(page), "its polling pauses");
+        assert!(visible.current(page), "still its window's page: its log streams keep going");
+        assert!(visible.on_screen(behind), "the other window is shown");
+        // A page in the history is neither.
+        let gone: EntityId = 5u64.into();
+        assert!(!visible.on_screen(gone) && !visible.current(gone));
+    }
 
     #[test]
     fn f5_reaches_the_terminal() {

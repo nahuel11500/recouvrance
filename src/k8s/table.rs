@@ -13,6 +13,7 @@ use kube::discovery::ApiResource;
 use kube::{Client, Resource as _};
 use serde::Deserialize;
 
+use super::lane::{Lane, Slots};
 use super::node_specs::{self, NodeSpecs};
 use super::{Kind, TaskGuard, api_status, lists, run, short_error, spawn_guarded};
 use crate::timeline::Tap;
@@ -186,6 +187,9 @@ impl Row {
 pub enum TableMsg {
     Columns(Arc<Vec<ColumnDef>>),
     Rows(Vec<Arc<Row>>),
+    /// The rows sent last hold every row of the initial list, some from their cells alone
+    /// (see `cells_by_namespace`): `Listed` follows once they have their objects' metadata.
+    AllRows,
     /// The initial list is complete (rows before this were partial pages).
     Listed,
     Error(String),
@@ -384,14 +388,18 @@ pub(super) async fn list_paged_with(
 /// Namespaces listed at once by `cells_by_namespace`, across all its callers (lists,
 /// problem scan, overviews), to stay gentle with the API server.
 const FAST_PARALLEL: usize = 32;
-static FAST_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(FAST_PARALLEL);
+/// Of those, the most background work holds (the problem badge's count, a hidden list):
+/// the list or page on screen always has the others.
+const BACKGROUND_PARALLEL: usize = 8;
+static FAST_SLOTS: Slots = Slots::new(FAST_PARALLEL, BACKGROUND_PARALLEL);
 
 /// A big list's rows without their objects, one namespace at a time, many at once, from the
 /// API server's cache. The objects' metadata (managedFields above all) is most of a list's
 /// bytes: on a cluster with 23k pods, 160 MB against 6 MB, so this shows the whole list in
 /// about 2 s where the full one takes 8 to 10 s over a laptop's link. Rows have no uid,
-/// labels or creation time (they come with the full list, which replaces them).
-async fn cells_by_namespace(client: &Client, url: &str) -> Result<Vec<Arc<Row>>> {
+/// labels or creation time (they come with the full list, which replaces them). Its slots
+/// are taken in `lane`.
+async fn cells_by_namespace(client: &Client, url: &str, lane: Lane) -> Result<Vec<Arc<Row>>> {
     let (prefix, resource) = url.rsplit_once('/').ok_or_else(|| anyhow!("unexpected path {url}"))?;
     let mut req = http::Request::get("/api/v1/namespaces?includeObject=None").body(Vec::new())?;
     req.headers_mut().insert(http::header::ACCEPT, http::HeaderValue::from_static(TABLE_ACCEPT));
@@ -404,7 +412,7 @@ async fn cells_by_namespace(client: &Client, url: &str) -> Result<Vec<Arc<Row>>>
             "{prefix}/namespaces/{ns}/{resource}?includeObject=None&resourceVersion=0&resourceVersionMatch=NotOlderThan"
         );
         async move {
-            let _slot = FAST_SLOTS.acquire().await?;
+            let _slot = FAST_SLOTS.acquire(lane).await?;
             let mut req = http::Request::get(&path).body(Vec::new())?;
             req.headers_mut().insert(http::header::ACCEPT, http::HeaderValue::from_static(TABLE_ACCEPT));
             let page: ServerTable = lists::request_idle(&client, req).await?;
@@ -425,9 +433,9 @@ async fn cells_by_namespace(client: &Client, url: &str) -> Result<Vec<Arc<Row>>>
 
 /// The first list of a namespaced kind in every namespace, shown as soon as it can be: its
 /// first page (2000 rows) at once; when more follow, every namespace's rows without their
-/// objects (`cells_by_namespace`: about 2 s for 23k pods over a laptop's link); then the
-/// whole list with its objects' metadata in one response from the API server's cache,
-/// parsed as it streams in (about half the time of paging through it).
+/// objects (`cells_by_namespace`: about 2 s for 23k pods over a laptop's link), then
+/// `AllRows`; then the whole list with its objects' metadata in one response from the API
+/// server's cache, parsed as it streams in (about half the time of paging through it).
 async fn list_fast(
     client: &Client,
     url: &str,
@@ -451,11 +459,14 @@ async fn list_fast(
     if !pause.is_paused() {
         let _ = tx.unbounded_send(TableMsg::Rows(rows));
     }
+    // A hidden list makes way for what is on screen.
+    let lane = if pause.is_paused() { Lane::Background } else { Lane::Foreground };
     // A failure here only means waiting for the whole list.
-    if let Ok(cells) = cells_by_namespace(client, url).await
+    if let Ok(cells) = cells_by_namespace(client, url, lane).await
         && !pause.is_paused()
     {
         let _ = tx.unbounded_send(TableMsg::Rows(cells));
+        let _ = tx.unbounded_send(TableMsg::AllRows);
     }
     match list_whole(client, url, tap).await {
         Ok(listed) => Ok(listed),
@@ -610,7 +621,8 @@ pub async fn list_light(
             return Ok((defs, rows));
         }
         let rows = match (&ns, kind.namespaced) {
-            (None, true) if with_namespaces => match cells_by_namespace(&client, &url).await {
+            // In the lane of whoever asked: the problem badge's count goes in the background.
+            (None, true) if with_namespaces => match cells_by_namespace(&client, &url, Lane::current()).await {
                 Ok(rows) => rows,
                 // One namespace refused or stalled doesn't fail the kind: the whole list has
                 // every namespace's rows (with their objects' metadata, so more bytes).
@@ -1352,5 +1364,89 @@ mod node_tests {
         assert!(!needs_object("/api/v1/namespaces/a/pods", &Extras::default()));
         let custom: Extras = Arc::new(vec![("Replicas".into(), ".spec.replicas".into())]);
         assert!(needs_object("/apis/apps/v1/deployments", &custom));
+    }
+}
+
+#[cfg(test)]
+mod fast_list_tests {
+    use futures::StreamExt as _;
+    use serde_json::{Value, json};
+
+    use super::{Arc, Pause, TableMsg, watch_table_paused};
+    use crate::k8s::Kind;
+
+    /// Three pods in namespaces `a` and `b`, whose first page holds one: a big list.
+    #[derive(Clone)]
+    struct Big;
+
+    impl tower::Service<http::Request<kube::client::Body>> for Big {
+        type Response = http::Response<http_body_util::Full<bytes::Bytes>>;
+        type Error = std::convert::Infallible;
+        type Future = std::future::Ready<Result<Self::Response, Self::Error>>;
+
+        fn poll_ready(&mut self, _: &mut std::task::Context<'_>) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, req: http::Request<kube::client::Body>) -> Self::Future {
+            let query = req.uri().query().unwrap_or_default().to_string();
+            let table = |rows: Vec<Value>, more: &str| {
+                json!({"kind": "Table", "apiVersion": "meta.k8s.io/v1",
+                    "metadata": {"resourceVersion": "7", "continue": more},
+                    "columnDefinitions": [{"name": "Name"}, {"name": "Status"}], "rows": rows})
+            };
+            let pod = |ns: &str, name: &str| {
+                json!({"cells": [name, "Running"],
+                    "object": {"metadata": {"name": name, "namespace": ns, "uid": format!("{ns}-{name}")}}})
+            };
+            let cells = |name: &str| json!({"cells": [name, "Running"]});
+            let body = match req.uri().path() {
+                "/api/v1/namespaces" => table(vec![json!({"cells": ["a"]}), json!({"cells": ["b"]})], ""),
+                "/api/v1/namespaces/a/pods" => table(vec![cells("api"), cells("web")], ""),
+                "/api/v1/namespaces/b/pods" => table(vec![cells("db")], ""),
+                "/api/v1/pods" if query.contains("watch=true") => json!({"kind": "Status", "code": 404}),
+                "/api/v1/pods" if query.contains("resourceVersion=0") => {
+                    table(vec![pod("a", "api"), pod("a", "web"), pod("b", "db")], "")
+                }
+                "/api/v1/pods" if query.contains("continue=") => table(vec![pod("a", "web"), pod("b", "db")], ""),
+                "/api/v1/pods" => table(vec![pod("a", "api")], "next"),
+                _ => json!({"kind": "Status", "code": 404}),
+            };
+            let code = if body["kind"] == "Status" { 404 } else { 200 };
+            let response = http::Response::builder().status(code).body(body.to_string().into_bytes().into()).unwrap();
+            std::future::ready(Ok(response))
+        }
+    }
+
+    /// What a list of pods sends until it is complete (or fails), shown or `hidden`.
+    async fn first_list(hidden: bool) -> Vec<String> {
+        let pause = Pause::default();
+        pause.set(hidden);
+        let client = kube::Client::new(Big, "default");
+        let (_watch, mut rx) =
+            watch_table_paused(client, Kind::fake("", "Pod"), None, Arc::default(), pause, true, None);
+        let mut sent = Vec::new();
+        while let Some(msg) = rx.next().await {
+            let (said, done) = match msg {
+                TableMsg::Columns(_) => ("columns".to_string(), false),
+                TableMsg::Rows(rows) => (format!("rows {}", rows.len()), false),
+                TableMsg::AllRows => ("all rows".to_string(), false),
+                TableMsg::Listed => ("listed".to_string(), true),
+                TableMsg::Error(e) | TableMsg::Forbidden(e) => (e, true),
+            };
+            sent.push(said);
+            if done {
+                break;
+            }
+        }
+        sent
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_big_list_says_when_every_row_is_shown() {
+        // The first page, every namespace's rows from their cells, then the whole list.
+        assert_eq!(first_list(false).await, ["columns", "rows 1", "rows 3", "all rows", "rows 3", "listed"]);
+        // Hidden, it shows nothing, so it never says every row is shown.
+        assert_eq!(first_list(true).await, ["columns", "listed"]);
     }
 }

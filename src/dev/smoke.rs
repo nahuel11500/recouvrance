@@ -213,6 +213,7 @@ pub fn run(ctx: String) {
                 }
                 Some(Some(k8s::TableMsg::Error(e))) => println!("ERROR {e} at={}s", start.elapsed().as_secs()),
                 Some(Some(k8s::TableMsg::Forbidden(e))) => println!("FORBIDDEN {e}"),
+                Some(Some(k8s::TableMsg::AllRows)) => println!("all rows at={}s", start.elapsed().as_secs()),
                 Some(Some(k8s::TableMsg::Listed)) => println!("listed"),
                 Some(None) => break,
                 None => std::thread::sleep(std::time::Duration::from_millis(100)),
