@@ -348,7 +348,7 @@ impl Mcp {
         Ok(mcp)
     }
 
-    async fn call_raw(&self, body: Value) -> Result<String> {
+    pub(crate) async fn call_raw(&self, body: Value) -> Result<String> {
         let auth = format!("Bearer {}", self.token);
         let headers = [
             ("authorization", auth.as_str()),

@@ -5,8 +5,8 @@
 *Assistant* in the sidebar is a chat with Claude about your clusters. It runs through your local
 Claude Code (your subscription, no API key); an Anthropic API key works too if you prefer. It uses
 the same agent as your Claude Code connection (below), so one set of rules, approvals and activity
-log covers both. **Stop** ends a question that is still running; with an API key, a request that
-gets no answer for 10 minutes fails.
+log covers both. **Stop** ends a question that is still running, and with it a request of its own
+still waiting for your approval; with an API key, a request that gets no answer for 10 minutes fails.
 
 ## Agents (MCP)
 
@@ -175,8 +175,12 @@ Prompts (slash commands in Claude Code: `/mcp__recouvrance__troubleshoot` …): 
 Every call is logged with its decision and rule, and appended to
 `~/.local/share/recouvrance/audit.jsonl` (the folder is 0700, the file 0600). At 10 MiB the log moves to
 `audit.jsonl.1`, replacing the older one. If the log cannot be written, the Activity page says so. A
-kill switch cuts all agent access at once. A request nobody answers within 2 minutes is refused; the log
-says whether it was refused, left unanswered or cut off by the kill switch.
+kill switch cuts all agent access at once. A request nobody answers within 2 minutes is refused. An
+approval also ends as soon as the agent stops waiting for it: it cancels the call (Esc in Claude Code),
+its session ends, or it hangs up (**Stop** in the assistant, a `claude -p` killed). The banner goes at
+once, and a click on it after that changes nothing. As with the kill switch, a call whose agent stopped
+waiting makes no change after that (a drain stops before its next eviction). The log says whether a
+request was refused, left unanswered, given up by the agent or cut off by the kill switch.
 
 The Activity page groups calls by task: one agent session, split where the agent paused for more than
 10 minutes. Each group says what it touched (contexts, namespaces, objects); repeated calls of a tool on

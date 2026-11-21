@@ -10,8 +10,10 @@ use axum::http::StatusCode;
 use axum::middleware::Next;
 use axum::response::Response;
 use http::request::Parts;
+use rmcp::handler::server::router::tool::ToolRouter;
+use rmcp::handler::server::tool::ToolCallContext;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{PromptMessage, Role};
+use rmcp::model::{CallToolRequestParams, CallToolResponse, PromptMessage, Role};
 use rmcp::model::{ServerCapabilities, ServerConfig};
 
 use rmcp::transport::streamable_http_server::{
@@ -23,9 +25,12 @@ use serde::Deserialize;
 use super::{Access, Agent, Answer, AuditEntry, Decision, Hub, HubEvent, Mode, Policy, Verb};
 use crate::k8s::{self, Kind, TaskGuard};
 
+pub(crate) use gone::Gone;
+
 mod cluster_tools;
 mod diff_tools;
 mod file_tools;
+mod gone;
 mod helm_tools;
 mod history_tools;
 mod job_tools;
@@ -52,6 +57,8 @@ struct Call {
     agent: Agent,
     tool: &'static str,
     args: serde_json::Value,
+    /// Whether its agent still waits for it.
+    gone: Gone,
     start: Instant,
     approved: bool,
     /// The Ask rules the approval covered: every Ask rule the request meets, in its
@@ -371,6 +378,7 @@ impl KubeMcp {
             agent,
             tool,
             args: redact(args),
+            gone: parts.extensions.get::<Gone>().cloned().unwrap_or_default(),
             start: Instant::now(),
             approved: false,
             approved_rules: Vec::new(),
@@ -397,8 +405,8 @@ impl KubeMcp {
         Ok(call)
     }
 
-    /// Agent access is on and this agent still enabled: checked when a call starts,
-    /// after waiting for approval, and before each change.
+    /// Agent access is on, this agent still enabled and still waiting for the call: checked
+    /// when a call starts, after waiting for approval, and before each change.
     fn ensure_active(&self, call: &Call) -> Result<(), String> {
         match self.inactive(call) {
             Some(reason) => Err(call.deny(reason)),
@@ -406,9 +414,9 @@ impl KubeMcp {
         }
     }
 
-    /// Why calls are refused now, if they are.
+    /// Why this call is refused now, if it is.
     fn inactive(&self, call: &Call) -> Option<&'static str> {
-        inactive(&self.hub, &call.agent.id)
+        inactive(&self.hub, &call.agent.id, &call.gone)
     }
 
     /// Evaluate one access request; Ask waits for the user.
@@ -463,7 +471,10 @@ impl KubeMcp {
                     summary.push_str(detail);
                 }
                 let dry_run = call.args.get("dry_run").and_then(serde_json::Value::as_bool).unwrap_or(false);
-                let answer = self.hub.request_approval(&call.agent, call.tool, summary, access.clone(), dry_run).await;
+                let answer = self
+                    .hub
+                    .request_approval(&call.agent, call.tool, summary, access.clone(), dry_run, call.gone.wait())
+                    .await;
                 // Access may have been switched off, or the rules changed, while the request waited.
                 self.reload_rules(call);
                 if answer == Answer::Approved {
@@ -480,7 +491,7 @@ impl KubeMcp {
                         call.policy().asks(access)
                     };
                     Ok(())
-                } else if answer != Answer::SwitchedOff
+                } else if !matches!(answer, Answer::SwitchedOff | Answer::Abandoned)
                     && let Some(rule) = fallback(call)
                 {
                     call.record(Decision::Rejected, format!("{}; showing the allowed rows only", answer.reason()), 0);
@@ -504,8 +515,8 @@ impl KubeMcp {
 
     /// Right before a change reaches the cluster: decide again on the agent's current rules,
     /// so a Deny added, or an Allow removed, while the call waited (for an approval, a dry
-    /// run, a lookup) still stops it. An approved request stays approved while an Ask rule
-    /// still covers it.
+    /// run, a lookup) still stops it, as does the agent no longer waiting for the call. An
+    /// approved request stays approved while an Ask rule still covers it.
     fn recheck(&self, call: &mut Call, access: &Access) -> Result<(), String> {
         match self.stale_reason(call, access) {
             Some(reason) => Err(call.deny(reason)),
@@ -524,10 +535,10 @@ impl KubeMcp {
     }
 
     /// [`stale_reason`](Self::stale_reason) for a change made of many requests (a drain),
-    /// asked again before each one: agent access or the agent turned off, or its rules
-    /// changed, stop the rest.
+    /// asked again before each one: agent access or the agent turned off, its rules changed,
+    /// or the agent no longer waiting for the call, stop the rest.
     fn still_allowed(&self, call: &Call, access: &Access) -> impl Fn() -> Option<String> + Send + 'static {
-        stop_check(self.hub.clone(), call.agent.id.clone(), call.approved, access.clone())
+        stop_check(self.hub.clone(), call.agent.id.clone(), call.approved, access.clone(), call.gone.clone())
     }
 
     async fn kind(&self, call: &Call, context: &str, query: &str) -> Result<(kube::Client, Kind), String> {
@@ -892,7 +903,25 @@ impl KubeMcp {
     }
 }
 
-#[tool_handler(router = (Self::read_tools() + Self::write_tools() + Self::rollout_tools() + Self::job_tools() + Self::ops_tools() + Self::node_tools() + Self::helm_tools() + Self::history_tools() + Self::logs_tools() + Self::diff_tools() + Self::cluster_tools() + Self::file_tools() + Self::metrics_tools()))]
+impl KubeMcp {
+    fn tools() -> ToolRouter<Self> {
+        Self::read_tools()
+            + Self::write_tools()
+            + Self::rollout_tools()
+            + Self::job_tools()
+            + Self::ops_tools()
+            + Self::node_tools()
+            + Self::helm_tools()
+            + Self::history_tools()
+            + Self::logs_tools()
+            + Self::diff_tools()
+            + Self::cluster_tools()
+            + Self::file_tools()
+            + Self::metrics_tools()
+    }
+}
+
+#[tool_handler(router = Self::tools())]
 #[prompt_handler]
 impl ServerHandler for KubeMcp {
     fn get_info(&self) -> ServerConfig {
@@ -902,6 +931,20 @@ impl ServerHandler for KubeMcp {
              namespace and name) and shown to them; some calls wait for their approval. \
              Prefer dry_run for writes first, and explain what you are about to change.",
         )
+    }
+
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        mut context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<CallToolResponse, rmcp::ErrorData> {
+        // The tools read the request's HTTP parts (`begin`): rmcp's token for this request
+        // joins its connection's there, so the call knows when its agent stops waiting.
+        if let Some(parts) = context.extensions.get_mut::<Parts>() {
+            let gone = parts.extensions.remove::<Gone>().unwrap_or_default();
+            parts.extensions.insert(Gone { request: Some(context.ct.clone()), ..gone });
+        }
+        Self::tools().call(ToolCallContext::new(self, request, context)).await
     }
 }
 
@@ -963,16 +1006,16 @@ async fn auth(State(hub): State<Arc<Hub>>, mut req: Request, next: Next) -> Resu
     Ok(next.run(req).await)
 }
 
-/// Serve MCP on 127.0.0.1 until the guard is dropped.
-/// Why an agent's calls are refused now, if they are.
-fn inactive(hub: &Hub, agent_id: &str) -> Option<&'static str> {
+/// Why an agent's call is refused now, if it is: agent access or the agent turned off, or
+/// the agent no longer waiting for the call (it is not there to see what a change did).
+fn inactive(hub: &Hub, agent_id: &str, gone: &Gone) -> Option<&'static str> {
     if !hub.agents_enabled() {
         return Some("agent access is switched off in Recouvrance");
     }
     if !hub.agent(agent_id).is_some_and(|a| a.enabled) {
         return Some("this agent is disabled");
     }
-    None
+    gone.is_gone().then_some(Answer::Abandoned.reason())
 }
 
 /// Why an agent's change, authorized at first, must stop now (see `still_allowed`).
@@ -981,9 +1024,10 @@ pub(crate) fn stop_check(
     agent_id: String,
     approved: bool,
     access: Access,
+    gone: Gone,
 ) -> impl Fn() -> Option<String> + Send + 'static {
     move || {
-        if let Some(reason) = inactive(&hub, &agent_id) {
+        if let Some(reason) = inactive(&hub, &agent_id, &gone) {
             return Some(reason.to_string());
         }
         let mode = hub.agent(&agent_id).map_or(Mode::Deny, |a| a.policy.decide(&access).mode);
@@ -1022,6 +1066,7 @@ async fn bind(
     }
 }
 
+/// Serve MCP on 127.0.0.1 until the guard is dropped.
 pub fn start(hub: Arc<Hub>) -> TaskGuard {
     k8s::spawn_guarded(async move {
         let port = hub.port();
@@ -1035,6 +1080,7 @@ pub fn start(hub: Arc<Hub>) -> TaskGuard {
         };
         let app = axum::Router::new()
             .nest_service("/mcp", mcp)
+            .layer(axum::middleware::from_fn(gone::hangup))
             .layer(axum::middleware::from_fn_with_state(hub.clone(), auth));
         let listener = match bind(|| hub.port(), BIND_RETRY, |e| hub.emit(HubEvent::ServerStatus(Err(e)))).await {
             Ok(l) => l,
@@ -1055,6 +1101,7 @@ pub fn start(hub: Arc<Hub>) -> TaskGuard {
 mod tests {
     use super::*;
     use serde_json::json;
+    use tokio_util::sync::CancellationToken;
 
     /// A cluster answering any GET with a Node named after the last segment of the path,
     /// or `other` for `/n2`; records the paths asked.
@@ -1331,6 +1378,65 @@ mod tests {
         denied.rules.push(rule(Mode::Deny, "delete", "app"));
         assert!(denies_eviction(&denied, &pod("app")));
         assert!(!denies_eviction(&denied, &pod("other")));
+    }
+
+    /// A call as it starts, by `agent`, that `gone` tells when its agent stops waiting.
+    fn started_call(hub: &Arc<Hub>, agent: &Agent, gone: Gone) -> Call {
+        Call {
+            hub: hub.clone(),
+            agent: agent.clone(),
+            tool: "patch_resource",
+            args: json!({}),
+            gone,
+            start: Instant::now(),
+            approved: false,
+            approved_rules: Vec::new(),
+            rule: None,
+            session: None,
+            approval_detail: None,
+        }
+    }
+
+    /// Once its agent stops waiting, a call changes nothing more, approved or not: the check
+    /// right before a change, and a drain's before each eviction, refuse it as they do with
+    /// agent access switched off.
+    #[test]
+    fn a_call_its_agent_stopped_waiting_for_changes_nothing() {
+        let ask = crate::mcp::Rule {
+            effect: Mode::Ask,
+            verbs: vec!["patch".into()],
+            contexts: vec!["*".into()],
+            ..crate::mcp::Rule::default()
+        };
+        let agent = Agent {
+            id: "a1".into(),
+            name: "claude".into(),
+            token_sha256: String::new(),
+            enabled: true,
+            policy: Policy { rules: vec![ask], ..Policy::default() },
+        };
+        let hub = Hub::for_test(vec![agent.clone()]);
+        let mcp = KubeMcp::new(hub.clone());
+        let cms = kind("", "v1", "ConfigMap", "configmaps", true);
+        let access = access_for(&cms, "c", Verb::Patch, Some("app".into()), Some("cfg".into()));
+        let gone_reason = Some(Answer::Abandoned.reason().to_string());
+        for cancel_request in [true, false] {
+            let (request, connection) = (CancellationToken::new(), CancellationToken::new());
+            let gone = Gone { request: Some(request.clone()), connection: Some(connection.clone()) };
+            let mut call = started_call(&hub, &agent, gone.clone());
+            call.approved = true;
+            let stop = stop_check(hub.clone(), agent.id.clone(), true, access.clone(), gone);
+            // Approved, with its agent waiting: it goes ahead.
+            assert_eq!(mcp.stale_reason(&mut call, &access), None);
+            assert_eq!(stop(), None);
+            if cancel_request {
+                request.cancel();
+            } else {
+                connection.cancel();
+            }
+            assert_eq!(mcp.stale_reason(&mut call, &access), gone_reason, "cancel_request={cancel_request}");
+            assert_eq!(stop(), gone_reason, "cancel_request={cancel_request}");
+        }
     }
 
     /// A port busy at start is tried again, and the server listens once it is free (#794).

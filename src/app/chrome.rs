@@ -255,9 +255,12 @@ impl AppView {
                 // Only offered when a rule can cover exactly this request (not exec, for one).
                 .when(a.as_rule().is_some(), |d| {
                     let (hub, approval) = (self.hub.clone(), a.clone());
+                    // A request that no longer waits (its agent gone, or timed out) adds no rule:
+                    // the click only beat its banner's removal.
                     let hour = Button::new(("hour", a.id as usize)).small().ghost().label("Allow for 1h").on_click(
                         move |_, window, cx| {
-                            if let Some(rule) = approval.as_rule_for_an_hour()
+                            if hub.approval_pending(approval.id)
+                                && let Some(rule) = approval.as_rule_for_an_hour()
                                 && let Err(e) =
                                     hub.update_agent(&approval.agent_id, |agent| agent.policy.rules.push(rule))
                             {
@@ -273,7 +276,8 @@ impl AppView {
                         .label("Always allow this")
                         .tooltip("Approve, and add a rule allowing exactly this request from now on")
                         .on_click(move |_, window, cx| {
-                            if let Some(rule) = approval.as_rule()
+                            if hub.approval_pending(approval.id)
+                                && let Some(rule) = approval.as_rule()
                                 && let Err(e) =
                                     hub.update_agent(&approval.agent_id, |agent| agent.policy.rules.push(rule))
                             {

@@ -167,6 +167,103 @@ fn an_agent_gets_only_what_its_rules_allow() {
     });
 }
 
+/// An approval ends as soon as its agent stops waiting: hanging up (the assistant's Stop, a
+/// killed `claude -p`) or cancelling the call (Claude Code's Esc) takes the banner down at
+/// once, and an Approve clicked after that writes nothing. An approval the agent still waits
+/// for writes (so the refusals are not a broken setup).
+#[test]
+#[ignore = "needs a kind cluster: RECOUVRANCE_E2E_CONTEXT"]
+fn an_approval_ends_when_its_agent_stops_waiting() {
+    use futures::StreamExt as _;
+    use std::time::Duration;
+
+    /// The next approval event within `within`, as (asked, id): `false` when it ended.
+    async fn next_approval(
+        events: &mut futures::channel::mpsc::UnboundedReceiver<Arc<mcp::HubEvent>>,
+        within: Duration,
+    ) -> Result<(bool, u64)> {
+        let deadline = tokio::time::Instant::now() + within;
+        loop {
+            match tokio::time::timeout_at(deadline, events.next()).await {
+                Ok(Some(event)) => match &*event {
+                    mcp::HubEvent::ApprovalRequested(a) => return Ok((true, a.id)),
+                    mcp::HubEvent::ApprovalResolved(id) => return Ok((false, *id)),
+                    _ => {}
+                },
+                Ok(None) => bail!("the hub stopped sending events"),
+                Err(_) => bail!("no approval event within {within:?}"),
+            }
+        }
+    }
+
+    run(async {
+        let ctx = context();
+        let truth: Api<ConfigMap> = Api::namespaced(k8s::connect_for_agents(ctx.clone()).await?, NS);
+        let name = "e2e-abandoned";
+        let _ = truth.delete(name, &DeleteParams::default()).await;
+        truth.create(&PostParams::default(), &config_map(name)).await?;
+
+        let (hub, agent, token, _server) = agent(&["get,list *"], &[]).await?;
+        let ask = rules_file::parse_rule(Mode::Ask, &format!("patch configmaps/{name} -n {NS}"))?;
+        hub.update_agent(&agent.id, |a| a.policy.rules.push(ask))?;
+        // A window to approve in.
+        hub.set_headless(false);
+        let mut events = hub.subscribe();
+        let patch =
+            json!({"context": ctx, "kind": "configmaps", "namespace": NS, "name": name, "patch": {"data": {"a": "2"}}});
+
+        for cancel in [false, true] {
+            let client = Arc::new(crate::assistant::Mcp::connect(hub.port(), token.clone()).await?);
+            let call = tokio::spawn({
+                let (client, patch) = (client.clone(), patch.clone());
+                async move { client.call("patch_resource", patch).await }
+            });
+            // The first call discovers the cluster's kinds before it asks.
+            let (asked, id) = next_approval(&mut events, Duration::from_secs(60)).await?;
+            assert!(asked, "approval {id} ended before it was asked for");
+            if cancel {
+                // What Claude Code sends on Esc (`Mcp::call` numbers its call 3).
+                let params = json!({"requestId": 3, "reason": "e2e"});
+                client
+                    .call_raw(json!({"jsonrpc": "2.0", "method": "notifications/cancelled", "params": params}))
+                    .await?;
+            } else {
+                // The assistant's Stop: its task, with its connection, dropped.
+                call.abort();
+            }
+            let ended = next_approval(&mut events, Duration::from_secs(1)).await?;
+            assert_eq!(ended, (false, id), "cancel={cancel}");
+            assert!(!hub.approval_pending(id));
+            // An Approve clicked after that reaches nothing.
+            hub.resolve_approval(id, true);
+            call.abort();
+            let _ = call.await;
+        }
+        // Time for a write that must not happen.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let data = truth.get(name).await?.data.unwrap_or_default();
+        assert_eq!(data.get("a").map(String::as_str), Some("1"), "an approval its agent stopped waiting for wrote");
+        let abandoned = hub.recent_audit(10, |e| e.agent_id == agent.id && e.detail == mcp::Answer::Abandoned.reason());
+        assert_eq!(abandoned.len(), 2, "the log says why each call was refused");
+
+        // An approval its agent still waits for goes through.
+        let client = crate::assistant::Mcp::connect(hub.port(), token).await?;
+        let approve = async {
+            let (asked, id) = next_approval(&mut events, Duration::from_secs(60)).await?;
+            assert!(asked, "approval {id} ended before it was asked for");
+            hub.resolve_approval(id, true);
+            anyhow::Ok(())
+        };
+        let (out, approved) = tokio::join!(client.call("patch_resource", patch), approve);
+        approved?;
+        assert!(!out.contains("Rejected") && !out.contains("Denied"), "{out}");
+        let data = truth.get(name).await?.data.unwrap_or_default();
+        assert_eq!(data.get("a").map(String::as_str), Some("2"), "{out}");
+        truth.delete(name, &DeleteParams::default()).await?;
+        Ok(())
+    });
+}
+
 /// Turning agent access off while an agent's drain runs stops it before the next
 /// eviction; so does turning write mode off during a drain started in the app.
 #[test]
@@ -197,7 +294,7 @@ fn turning_access_off_stops_a_drain() {
         let kinds = k8s::discover(agents_client.clone()).await?;
         let node_kind = k8s::find_kind(&kinds, "nodes").context("nodes kind")?.clone();
         let access = mcp::server::access_for(&node_kind, &ctx, Verb::Drain, None, Some(node.clone()));
-        let check = mcp::server::stop_check(hub.clone(), agent.id.clone(), false, access);
+        let check = mcp::server::stop_check(hub.clone(), agent.id.clone(), false, access, Default::default());
         let asked = Arc::new(AtomicUsize::new(0));
         let (hub2, asked2) = (hub.clone(), asked.clone());
         // Agent access goes off right after the first eviction.
