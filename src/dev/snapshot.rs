@@ -167,7 +167,7 @@ pub fn run(path: &str, wait: Duration) -> Result<()> {
         cx.update_window(window.into(), |_, window, cx| app_view.update(cx, |a, cx| a.demo_act(act, window, cx)))?;
         pump(&mut cx, Duration::from_secs(2));
     }
-    // RECOUVRANCE_INPUT="click:x,y;dblclick:x,y;drag:x1,y1,x2,y2;selected:;scroll:x,y,dy;key:down;key:enter;wait" drives real input events.
+    // RECOUVRANCE_INPUT="click:x,y;dblclick:x,y;drag:x1,y1,x2,y2;selected:;scroll:x,y,dy;key:down;key:enter;wait;shot:f.png" drives real input events.
     if let Ok(script) = std::env::var("RECOUVRANCE_INPUT") {
         for step in script.split(';') {
             let input = match step.split_once(':') {
@@ -246,6 +246,14 @@ pub fn run(path: &str, wait: Duration) -> Result<()> {
                 }
                 Some(("wait", secs)) => {
                     pump(&mut cx, Duration::from_secs(secs.parse().unwrap_or(1)));
+                    vec![]
+                }
+                // `shot:name.png` saves the window as it is now, next to the final snapshot:
+                // several in one script make the frames of a recording.
+                Some(("shot", file)) => {
+                    draw_twice(&mut cx, window.into())?;
+                    let out = std::path::Path::new(path).with_file_name(file);
+                    cx.capture_screenshot(window.into())?.save(&out)?;
                     vec![]
                 }
                 Some(("type", text)) => {
@@ -344,14 +352,7 @@ drwxr-xr-x 1 root root 4096 Oct 15 \x1b[1;34m.\x1b[0m\r\n\
         cx.update(|cx| app_view.update(cx, |v, cx| v.demo_terminal(demo.as_bytes(), cx)));
         pump(&mut cx, Duration::from_secs(1));
     }
-    // Two frames: some views size themselves from the previous frame's layout.
-    for _ in 0..2 {
-        cx.update_window(window.into(), |_, window, _| window.refresh())?;
-        cx.run_until_parked();
-        cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear(cx))?;
-        cx.run_until_parked();
-    }
-
+    draw_twice(&mut cx, window.into())?;
     cx.capture_screenshot(window.into())?.save(path)?;
     // RECOUVRANCE_FRAMES_END=<n>: time n full redraws of what is on screen at the end.
     let frames = std::env::var("RECOUVRANCE_FRAMES_END").ok().and_then(|n| n.parse::<u32>().ok());
@@ -373,6 +374,17 @@ drwxr-xr-x 1 root root 4096 Oct 15 \x1b[1;34m.\x1b[0m\r\n\
             ms(times[times.len() / 2]),
             ms(times[times.len() * 9 / 10])
         );
+    }
+    Ok(())
+}
+
+/// Two frames: some views size themselves from the previous frame's layout.
+fn draw_twice(cx: &mut HeadlessAppContext, window: AnyWindowHandle) -> Result<()> {
+    for _ in 0..2 {
+        cx.update_window(window, |_, window, _| window.refresh())?;
+        cx.run_until_parked();
+        cx.update_window(window, |_, window, cx| window.draw(cx).clear(cx))?;
+        cx.run_until_parked();
     }
     Ok(())
 }
