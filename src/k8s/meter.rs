@@ -404,11 +404,11 @@ impl Flow {
         self.total.fetch_add(n, Ordering::Relaxed);
         let tag = tag(minute);
         let slot = &self.minutes[minute.rem_euclid(WINDOW) as usize];
-        // A slot that still holds an older minute starts again from these bytes. The swap is
-        // a compare-and-swap: bytes added at once from two threads all count.
-        let _ = slot.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |held| {
-            let bytes = if held & !BYTE_MASK == tag { held & BYTE_MASK } else { 0 };
-            Some(tag | bytes.saturating_add(n).min(BYTE_MASK))
+        // A slot that still holds an older minute starts again from these bytes. `update` is a
+        // compare-and-swap loop: bytes added at once from two threads all count.
+        slot.update(Ordering::Relaxed, Ordering::Relaxed, |held| {
+            let bytes = if (held & !BYTE_MASK) == tag { held & BYTE_MASK } else { 0 };
+            tag | bytes.saturating_add(n).min(BYTE_MASK)
         });
     }
 
@@ -417,7 +417,7 @@ impl Flow {
         (now - WINDOW + 1..=now).filter_map(move |m| {
             let held = self.minutes[m.rem_euclid(WINDOW) as usize].load(Ordering::Relaxed);
             let bytes = held & BYTE_MASK;
-            (held & !BYTE_MASK == tag(m) && bytes > 0).then_some((m, bytes))
+            ((held & !BYTE_MASK) == tag(m) && bytes > 0).then_some((m, bytes))
         })
     }
 
@@ -767,7 +767,7 @@ mod tests {
                 list_heavy(&mut list, request);
             }
             let mut top: Vec<u64> = most.values().copied().collect();
-            top.sort_unstable_by(|a, b| b.cmp(a));
+            top.sort_unstable_by_key(|&b| std::cmp::Reverse(b));
             top.truncate(HEAVIEST);
             prop_assert_eq!(list.iter().map(|h| h.bytes).collect::<Vec<_>>(), top);
             for h in &list {
