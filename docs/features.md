@@ -227,8 +227,14 @@
   Argo CD). A page's *Investigate* asks it beside the page when it is open there.
 - **Overviews**: cluster capacity and health, workloads status, Helm releases (values masked; install from your repos, roll back and uninstall through your `helm` CLI).
 - **API requests** (Settings → API requests): per cluster, how many requests of each kind
-  (discovery, lists, watches, metrics, logs, shells, writes) were made, how many failed, and how
-  long the API server took to start answering: average, slowest, last.
+  (discovery, lists, watches, metrics, logs, shells, writes) were made and how many failed; how
+  long the API server took to start answering (p50, p95, slowest) and, for answers that end, to
+  send the last byte (p50, p95); and how much each kind received per minute over the last hour,
+  counted decompressed as the bodies arrive. Watches, logs and shells are streams that don't
+  end: bytes only, and none for shells and port-forwards, whose data goes over the upgraded
+  connection. Below, the heaviest requests: the one of each kind (cluster, method and path, its
+  names replaced by `{namespace}` and `{name}`) that received the most, with its bytes and both
+  times. Nothing leaves the machine.
 - **Favorites** and **saved views** (type + namespaces + filter, bookmark button), back/forward history, light and dark themes.
 - **Instant back**: the last 8 lists (up to 10,000 rows in all) are kept, so going back to one
   shows it at once, marked "Updating…", while a fresh list loads and replaces it in one go.

@@ -1,5 +1,6 @@
-//! Settings → API requests: how each cluster's API server answers, a card a cluster with its
-//! requests and latency over the last hour and a row a kind of request.
+//! Settings → API requests: how each cluster's API server answers and how much it sends, a
+//! card a cluster with its requests and latency over the last hour and a row a kind of
+//! request, then the heaviest requests.
 
 use std::time::Duration;
 
@@ -9,7 +10,8 @@ use gpui_kit::component::{ActiveTheme as _, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use crate::k8s::meter::{self, Class, Minute, Stats};
+use crate::k8s::files::human_size;
+use crate::k8s::meter::{self, Class, Heavy, Minute, Stats};
 use crate::ui::selectable::selectable;
 
 /// One cluster's numbers.
@@ -20,6 +22,8 @@ struct Cluster {
     minutes: Vec<(i64, Minute)>,
     count: u64,
     errors: u64,
+    /// Bytes received since Recouvrance started.
+    bytes: u64,
 }
 
 impl Cluster {
@@ -49,6 +53,7 @@ fn clusters(rows: Vec<(String, Class, Stats)>, now: i64) -> Vec<Cluster> {
             minutes: meter::per_minute(classes.iter().map(|c| &c.1), now),
             count: classes.iter().map(|c| c.1.count).sum(),
             errors: classes.iter().map(|c| c.1.errors).sum(),
+            bytes: classes.iter().map(|c| c.1.bytes).sum(),
             context,
             classes,
         })
@@ -86,6 +91,11 @@ fn duration(d: Duration) -> String {
     }
 }
 
+/// A latency, or `—` when there is none: no request, or none that ended.
+fn maybe_duration(d: Option<Duration>) -> String {
+    d.map_or_else(|| "—".into(), duration)
+}
+
 /// `errors` out of `count` as a share: `0%`, `<0.1%`, `0.4%`, `18%`.
 fn share(errors: u64, count: u64) -> String {
     if errors == 0 || count == 0 {
@@ -110,10 +120,12 @@ pub fn render(cx: &App) -> AnyElement {
     let theme = cx.theme();
     let muted = theme.muted_foreground;
     let now = meter::now_minute();
-    let clusters = clusters(meter::snapshot(), now);
+    let snapshot = meter::snapshot(now);
+    let clusters = clusters(snapshot.classes, now);
     let count: u64 = clusters.iter().map(|c| c.count).sum();
     let errors: u64 = clusters.iter().map(|c| c.errors).sum();
     let last_minute: u64 = clusters.iter().map(|c| c.last_minute(now)).sum();
+    let bytes: u64 = clusters.iter().map(|c| c.bytes).sum();
     let tile = |label: &str, value: String, color: Option<Hsla>| {
         v_flex()
             .flex_1()
@@ -140,9 +152,13 @@ pub fn render(cx: &App) -> AnyElement {
                 .gap_4()
                 .items_start()
                 .child(div().flex_1().min_w_0().text_sm().text_color(muted).child(
-                    "How long the API servers take to start answering, since Recouvrance started (watches and log \
-                     streams count until they open). Failed: an error status, a timeout or no connection. \
-                     p50 and p95: half and 95% of the requests answered within that.",
+                    "How long the API servers take to answer and how much they send, since Recouvrance started. \
+                     To headers: until the answer starts (watches and log streams count until they open). To last \
+                     byte: until the answer is read to its end, for answers that end. Per minute: data received, \
+                     decompressed, on average over the last hour (or since the first request, if later); shells \
+                     and port-forwards send theirs over the upgraded connection, which is not counted. Failed: an \
+                     error status, a timeout or no connection. p50 and p95: half and 95% of the requests took at \
+                     most that.",
                 ))
                 .child(Button::new("meter-reset").small().outline().label("Reset").on_click(|_, window, _| {
                     meter::reset();
@@ -156,10 +172,12 @@ pub fn render(cx: &App) -> AnyElement {
                 .child(tile("Requests", grouped(count), None))
                 .child(tile("Failed", share(errors, count), (errors > 0).then_some(theme.warning)))
                 .child(tile("Last minute", grouped(last_minute), None))
+                .child(tile("Received", human_size(bytes), None))
                 .child(tile("Clusters", clusters.len().to_string(), None)),
         )
         .when(clusters.is_empty(), |d| d.child(div().py_2().text_sm().text_color(muted).child("No requests yet.")))
         .children(clusters.iter().map(|c| cluster_card(c, now, cx)))
+        .when(!snapshot.heaviest.is_empty(), |d| d.child(heaviest(&snapshot.heaviest, cx)))
         .into_any_element()
 }
 
@@ -167,10 +185,11 @@ fn cluster_card(c: &Cluster, now: i64, cx: &App) -> Div {
     let theme = cx.theme();
     let muted = theme.muted_foreground;
     let summary = format!(
-        "{} requests · {}/min · {} failed",
+        "{} requests · {}/min · {} failed · {} received",
         grouped(c.count),
         grouped(c.last_minute(now)),
-        share(c.errors, c.count)
+        share(c.errors, c.count),
+        human_size(c.bytes)
     );
     v_flex()
         .p_3()
@@ -200,7 +219,7 @@ fn cluster_card(c: &Cluster, now: i64, cx: &App) -> Div {
                 ),
         )
         .when(c.in_window() > 0, |d| d.child(h_flex().gap_3().child(requests_chart(c, cx)).child(latency_chart(c, cx))))
-        .child(class_table(c, cx))
+        .child(class_table(c, now, cx))
 }
 
 fn chart_box(title: &str, chart: impl IntoElement, cx: &App) -> Div {
@@ -282,48 +301,118 @@ fn latency_chart(c: &Cluster, cx: &App) -> Div {
     chart_box(title, chart, cx)
 }
 
-fn class_table(c: &Cluster, cx: &App) -> Div {
+/// The class table's column widths, and the gap between columns.
+const KIND_W: f32 = 140.;
+const COUNT_W: f32 = 70.;
+const FAILED_W: f32 = 90.;
+const TIME_W: f32 = 62.;
+const SLOWEST_W: f32 = 70.;
+const RATE_W: f32 = 80.;
+const GAP: f32 = 8.;
+
+fn class_table(c: &Cluster, now: i64, cx: &App) -> Div {
     let theme = cx.theme();
     let cell = |w: f32, text: String| div().w(px(w)).flex_shrink_0().child(selectable(text));
+    // The times in two groups: until the headers, and until the last byte.
+    let groups = h_flex()
+        .gap(px(GAP))
+        .text_xs()
+        .text_color(theme.muted_foreground)
+        .child(div().w(px(KIND_W + COUNT_W + FAILED_W + 2. * GAP)).flex_shrink_0())
+        .child(cell(2. * TIME_W + SLOWEST_W + 2. * GAP, "To headers".into()))
+        .child(cell(2. * TIME_W + GAP, "To last byte".into()));
     let header = h_flex()
-        .gap_3()
+        .gap(px(GAP))
         .pb_1()
         .text_xs()
         .text_color(theme.muted_foreground)
         .border_b_1()
         .border_color(theme.border)
-        .child(cell(150., "Requests to".into()))
-        .child(cell(90., "Count".into()))
-        .child(cell(110., "Failed".into()))
-        .child(cell(75., "p50".into()))
-        .child(cell(75., "p95".into()))
-        .child(cell(85., "Slowest".into()))
-        .child(cell(75., "Last".into()));
-    v_flex().child(header).children(c.classes.iter().map(|(class, s)| {
+        .child(cell(KIND_W, "Requests to".into()))
+        .child(cell(COUNT_W, "Count".into()))
+        .child(cell(FAILED_W, "Failed".into()))
+        .child(cell(TIME_W, "p50".into()))
+        .child(cell(TIME_W, "p95".into()))
+        .child(cell(SLOWEST_W, "Slowest".into()))
+        .child(cell(TIME_W, "p50".into()))
+        .child(cell(TIME_W, "p95".into()))
+        .child(cell(RATE_W, "Per minute".into()));
+    v_flex().child(groups).child(header).children(c.classes.iter().map(|(class, s)| {
         let failed = if s.errors == 0 {
             "0".to_string()
         } else {
             format!("{} ({})", grouped(s.errors), share(s.errors, s.count))
         };
+        // A shell's or a port-forward's data goes over the upgraded connection: not counted.
+        let rate = if *class == Class::Stream { "—".to_string() } else { human_size(s.bytes_per_minute(now)) };
         h_flex()
-            .gap_3()
+            .gap(px(GAP))
             .py_1()
             .text_sm()
             .border_b_1()
             .border_color(theme.border.opacity(0.5))
-            .child(cell(150., class.label().into()))
-            .child(cell(90., grouped(s.count)))
-            .child(cell(110., failed).when(s.errors > 0, |d| d.text_color(theme.warning)))
-            .child(cell(75., duration(s.percentile(0.5))))
-            .child(cell(75., duration(s.percentile(0.95))))
-            .child(cell(85., duration(s.slowest)))
-            .child(cell(75., duration(s.last)))
+            .child(cell(KIND_W, class.label().into()))
+            .child(cell(COUNT_W, grouped(s.count)))
+            .child(cell(FAILED_W, failed).when(s.errors > 0, |d| d.text_color(theme.warning)))
+            .child(cell(TIME_W, maybe_duration(s.headers.percentile(0.5))))
+            .child(cell(TIME_W, maybe_duration(s.headers.percentile(0.95))))
+            .child(cell(SLOWEST_W, maybe_duration((s.count > 0).then_some(s.headers.slowest))))
+            .child(cell(TIME_W, maybe_duration(s.last_byte.percentile(0.5))))
+            .child(cell(TIME_W, maybe_duration(s.last_byte.percentile(0.95))))
+            .child(cell(RATE_W, rate))
     }))
+}
+
+/// The request of each kind that received the most, heaviest first.
+fn heaviest(list: &[Heavy], cx: &App) -> Div {
+    let theme = cx.theme();
+    let muted = theme.muted_foreground;
+    let cell = |w: f32, text: String| div().w(px(w)).flex_shrink_0().child(selectable(text));
+    let clipped =
+        |text: String| div().min_w_0().overflow_hidden().text_ellipsis().whitespace_nowrap().child(selectable(text));
+    let header = h_flex()
+        .gap(px(GAP))
+        .pb_1()
+        .text_xs()
+        .text_color(muted)
+        .border_b_1()
+        .border_color(theme.border)
+        .child(div().flex_1().min_w_0().child(selectable("Request")))
+        .child(cell(150., "Cluster".into()))
+        .child(cell(75., "Received".into()))
+        .child(cell(80., "To headers".into()))
+        .child(cell(85., "To last byte".into()));
+    v_flex()
+        .p_3()
+        .gap_2()
+        .rounded_md()
+        .border_1()
+        .border_color(theme.border)
+        .child(div().font_weight(FontWeight::SEMIBOLD).child("Heaviest requests"))
+        .child(div().text_sm().text_color(muted).child(
+            "The request of each kind (cluster, method and path) that received the most, since Recouvrance \
+             started. Names in paths read {namespace} and {name}. To last byte is — for a stream, or an answer \
+             not read to its end.",
+        ))
+        .child(v_flex().child(header).children(list.iter().map(|h| {
+            let watch = if h.class == Class::Watch { " (watch)" } else { "" };
+            h_flex()
+                .gap(px(GAP))
+                .py_1()
+                .text_sm()
+                .border_b_1()
+                .border_color(theme.border.opacity(0.5))
+                .child(clipped(format!("{} {}{watch}", h.method, h.path)).flex_1())
+                .child(clipped(h.context.clone()).w(px(150.)).flex_shrink_0())
+                .child(cell(75., human_size(h.bytes)))
+                .child(cell(80., duration(h.headers)))
+                .child(cell(85., maybe_duration(h.last_byte)))
+        })))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{duration, grouped, latencies, share};
+    use super::{duration, grouped, latencies, maybe_duration, share};
     use crate::k8s::meter::Minute;
     use proptest::prelude::*;
     use std::time::Duration;
@@ -337,7 +426,7 @@ mod tests {
                 .iter()
                 .enumerate()
                 .map(|(i, &(count, ms))| {
-                    (i as i64, Minute { count, errors: 0, total: Duration::from_millis(ms * count) })
+                    (i as i64, Minute { count, total: Duration::from_millis(ms * count), ..Minute::default() })
                 })
                 .collect();
             let points = latencies(&minutes);
@@ -359,6 +448,8 @@ mod tests {
         assert_eq!(duration(Duration::from_millis(4_953)), "4.95 s");
         assert_eq!(duration(Duration::from_millis(31_556)), "31.6 s");
         assert_eq!(duration(Duration::from_millis(180_001)), "3 min 0 s");
+        assert_eq!(maybe_duration(None), "—");
+        assert_eq!(maybe_duration(Some(Duration::from_millis(12))), "12 ms");
         assert_eq!(share(0, 10), "0%");
         assert_eq!(share(1, 277), "0.4%");
         assert_eq!(share(1_369, 1_123_560), "0.1%");
