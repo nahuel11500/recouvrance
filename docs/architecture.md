@@ -75,3 +75,8 @@ them after 1.4 s ([measured](COMPARISON.md#measured)).
   last line the plugin wrote to stderr is added when the kubeconfig sets `interactiveMode: Never`:
   kube keeps stderr only then, and otherwise the plugin writes to the terminal Recouvrance was
   started from. Pages, agents and the audit log only ever get that.
+- **Kubeconfig errors keep their secrets too.** The YAML parser's error for a kubeconfig shows
+  the lines around where it failed and can quote a value: a token, a client key, a login
+  command's arguments. Kubeconfig files are read through `k8s::read_kubeconfig_file`, pasted
+  text through `parse_kubeconfig`: their error says the file, line and column, and why in words
+  of their own.

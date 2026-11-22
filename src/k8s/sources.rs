@@ -2,9 +2,8 @@
 //! pasted into Recouvrance (kept in its own folder, private).
 
 use anyhow::{Context as _, Result, anyhow};
-use kube::config::Kubeconfig;
 
-use super::{load_contexts, safe_file_part};
+use super::{load_contexts, parse_kubeconfig, read_kubeconfig_file, safe_file_part};
 use crate::paths::tilde;
 use crate::private_files::{dashed, save_new};
 
@@ -60,9 +59,10 @@ fn count(files: &[std::path::PathBuf]) -> (usize, Option<String>) {
     let mut contexts = 0;
     let mut error = None;
     for f in files {
-        match Kubeconfig::read_from(f) {
+        match read_kubeconfig_file(f) {
             Ok(kc) => contexts += kc.contexts.len(),
-            Err(e) => error = Some(format!("{}: {}", f.file_name().unwrap_or_default().to_string_lossy(), short(&e))),
+            // It names the file.
+            Err(e) => error = Some(short(&e)),
         }
     }
     (contexts, error)
@@ -136,8 +136,9 @@ pub fn add_paths(paths: &[std::path::PathBuf]) -> Vec<String> {
                 }
             });
         } else if p.is_file() {
-            if let Err(e) = Kubeconfig::read_from(p) {
-                problems.push(format!("{shown}: not a kubeconfig ({})", short(&e)));
+            // The error names the file, and what failed in it.
+            if let Err(e) = read_kubeconfig_file(p) {
+                problems.push(short(&e));
                 continue;
             }
             crate::settings::update(|s| {
@@ -184,7 +185,7 @@ pub struct Pasted {
 /// Parse and check pasted text.
 pub fn inspect_pasted(text: &str) -> Result<Pasted> {
     anyhow::ensure!(!text.trim().is_empty(), "paste a kubeconfig");
-    let kc = Kubeconfig::from_yaml(text).map_err(|e| anyhow!("not a kubeconfig: {}", short(&e)))?;
+    let kc = parse_kubeconfig(text).map_err(|e| anyhow!("not a kubeconfig: {}", short(&e)))?;
     anyhow::ensure!(!kc.contexts.is_empty(), "no contexts in this kubeconfig");
     let mut p = Pasted {
         contexts: kc.contexts.iter().map(|c| c.name.clone()).collect(),
@@ -280,6 +281,25 @@ mod tests {
         assert!(super::inspect_pasted("").is_err());
         assert!(super::inspect_pasted("kind: Config\ncontexts: []\n").is_err());
         assert!(super::inspect_pasted("{not yaml").is_err());
+    }
+
+    /// A file that fails to parse is listed by its path, line and column, never by the lines
+    /// around the error, where its token and client key are; the other files still count. A
+    /// paste is said the same way (#860).
+    #[test]
+    fn a_broken_kubeconfig_is_listed_without_what_it_holds() {
+        let broken = "users:\n- name: me\n  user:\n    token: SECRET-TOKEN\n    username: @me\n    \
+                      client-key-data: SECRET-KEY\n";
+        let dir = crate::mcp::test_dir();
+        let (good, bad) = (dir.join("good.yaml"), dir.join("bad.yaml"));
+        std::fs::write(&good, KC).unwrap();
+        std::fs::write(&bad, broken).unwrap();
+        let said = format!("{}: not valid YAML at line 5, column 15", crate::paths::tilde(&bad));
+        assert_eq!(super::count(&[good, bad.clone()]), (2, Some(said.clone())));
+        assert_eq!(super::add_paths(std::slice::from_ref(&bad)), [said]);
+        let pasted = format!("{:#}", super::inspect_pasted(broken).unwrap_err());
+        assert_eq!(pasted, "not a kubeconfig: not valid YAML at line 5, column 15");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

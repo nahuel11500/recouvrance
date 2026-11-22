@@ -321,7 +321,8 @@
 - **Per-cluster settings**: Prometheus or VictoriaMetrics endpoint, node shell image, accessible
   namespaces (when you may not list them), metrics off, an identity to run as; namespaces can also be added by hand.
 - **Kubeconfig**: extra files and watched folders, reloaded on change; contexts with the same name in
-  two files are kept apart as `name@file`.
+  two files are kept apart as `name@file`. A file that fails to parse is reported by its path, line
+  and column, never by what it holds there.
 
 | Shortcut | Action |
 |---|---|
