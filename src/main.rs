@@ -183,4 +183,25 @@ mod tests {
         let args = ["bot".to_string(), "c1".to_string(), "c2".to_string()];
         assert_eq!(super::agent_create_args(&args), ("bot".to_string(), vec!["c1".to_string(), "c2".to_string()]));
     }
+
+    /// The project site builds its compare page from the table in `docs/COMPARISON.md`: from the
+    /// line starting with `| Area` to the first one that doesn't start with `|`, it drops each
+    /// line's first and last character and splits the rest on `|`. A `|` inside a cell, a missing
+    /// cell or a space after the last `|` would shift the site's columns.
+    #[test]
+    fn the_comparison_table_keeps_five_cells_a_row() {
+        let doc = include_str!("../docs/COMPARISON.md");
+        let table: Vec<&str> =
+            doc.lines().skip_while(|l| !l.starts_with("| Area")).take_while(|l| l.starts_with('|')).collect();
+        let (head, rows) = table.split_at_checked(2).expect("docs/COMPARISON.md has a comparison table");
+        assert_eq!(head, ["| Area | Aptakube | FreeLens | Headlamp | Recouvrance |", "|---|---|---|---|---|"]);
+        assert!(!rows.is_empty(), "the comparison table has no rows");
+        for row in rows {
+            let inner = row.strip_prefix('|').and_then(|r| r.strip_suffix('|'));
+            let inner = inner.unwrap_or_else(|| panic!("{row:?} must start and end with `|`"));
+            let cells: Vec<&str> = inner.split('|').map(str::trim).collect();
+            assert_eq!(cells.len(), 5, "{row:?} must have five cells");
+            assert!(!cells.contains(&""), "{row:?} has an empty cell");
+        }
+    }
 }

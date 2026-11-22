@@ -9,7 +9,20 @@ Recouvrance is one Rust binary: a [gpui](https://github.com/zed-industries/zed) 
 - Kubernetes calls run on a **tokio runtime** (`k8s::run`, `k8s::spawn_guarded`). Long-lived work
   (watches, log streams, port-forwards) returns a `TaskGuard`: dropping it cancels the work, so a
   page that goes away stops its streams.
-- Pages hidden in the back/forward history pause their polling (`app::wait_visible`).
+- Pages hidden in the back/forward history pause their polling (`app::wait_visible`), and so does
+  every page of a window hidden as the desktop reports it (gpui's window visibility): minimized or
+  on another workspace, and on macOS also fully covered by other windows or on a display that
+  sleeps. X11 sees a covered window only without a compositor, and Wayland compositors without the
+  xdg-shell `suspended` state never report a window hidden. The list then holds its rows back
+  (a first list that completes meanwhile says so only with them) and stops its metrics, and the
+  sidebar's problem count waits. Watches, log streams and shells keep going, so a window shown
+  again is current at once. A window shown on another monitor, not focused, keeps updating.
+- The page on screen gets the API servers first. Background work (the problem count, a hidden
+  list) takes at most 8 of the 32 slots that requests by namespace share (`k8s::lane`). Each
+  request takes its slot in the lane of that moment, so a list that comes on screen while it loads
+  gets the page's slots for the rest. The first problem count waits for the list on screen to show
+  its rows (15 s at most), and the pods' requests and limits for the usage bars are read after the
+  list's first rows.
 
 ## Source map
 

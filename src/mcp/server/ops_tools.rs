@@ -44,7 +44,8 @@ const LISTEN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 #[tool_router(router = ops_tools, vis = "pub(super)")]
 impl KubeMcp {
     #[tool(
-        description = "Forward a local port on 127.0.0.1 to a pod or Service port, like `kubectl port-forward`. Returns the local address; the forward runs until stopped (stop_port_forward), its time is up (`minutes`), or agent access is switched off. The user sees it in the app."
+        description = "Forward a local port on 127.0.0.1 to a pod or Service port, like `kubectl port-forward`. Returns the local address; the forward runs until stopped (stop_port_forward), its time is up (`minutes`), or agent access is switched off. The user sees it in the app.",
+        annotations(read_only_hint = false, destructive_hint = false)
     )]
     async fn port_forward(
         &self,
@@ -186,7 +187,7 @@ impl KubeMcp {
         call.finish(Ok(if mine.is_empty() { "No port-forwards open.".into() } else { mine.join("\n") }))
     }
 
-    #[tool(description = "Stop one of this agent's port-forwards.")]
+    #[tool(description = "Stop one of this agent's port-forwards.", annotations(read_only_hint = false))]
     async fn stop_port_forward(
         &self,
         Extension(parts): Extension<Parts>,

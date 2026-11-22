@@ -1114,16 +1114,24 @@ fn the_timeline_records_what_a_watch_sees_change() {
             let kinds = k8s::discover(client.clone()).await?;
             let kind = k8s::find_kind(&kinds, "configmaps").cloned().context("no configmaps")?;
             let tap = crate::timeline::tap(&ctx, &kind, Some(NS.into())).context("configmaps are recorded")?;
-            // As the app's list does, its rows held back.
+            // Shown until it has listed (a list held back says so only once shown), then its
+            // rows held back, as the app's list is while another page shows.
             let pause = k8s::Pause::default();
-            pause.set(true);
-            let (_watch, mut rx) =
-                k8s::watch_table_paused(client.clone(), kind, Some(NS.into()), Arc::default(), pause, false, Some(tap));
+            let (_watch, mut rx) = k8s::watch_table_paused(
+                client.clone(),
+                kind,
+                Some(NS.into()),
+                Arc::default(),
+                pause.clone(),
+                false,
+                Some(tap),
+            );
             while let Some(msg) = rx.next().await {
                 if matches!(msg, k8s::TableMsg::Listed) {
                     break;
                 }
             }
+            pause.set(true);
             let _drain = k8s::spawn_guarded(async move { while rx.next().await.is_some() {} });
             let recorded = || crate::timeline::changes_for(&ctx, "configmaps", Some(NS), name, &uid);
             assert!(recorded().is_empty(), "the first list only notes what is there");

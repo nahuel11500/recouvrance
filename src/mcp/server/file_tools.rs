@@ -38,7 +38,8 @@ const MAX_BYTES: u64 = 1024 * 1024;
 #[tool_router(router = file_tools, vis = "pub(super)")]
 impl KubeMcp {
     #[tool(
-        description = "List a folder or read a file in a container, like `kubectl exec -- ls -la` or `head -c`: a folder's entries with mode, owner, size, modification time and symlink targets; a text file's first bytes (a binary file: its type only). Runs `sh`, `stat` and `head` in the container, so it needs the exec verb on the pod. For an image without a shell (distroless), set debug: it reads through an ephemeral debug container sharing the container's processes, like `kubectl debug --target` (the same exec rule as debug_pod), reusing one it added before."
+        description = "List a folder or read a file in a container, like `kubectl exec -- ls -la` or `head -c`: a folder's entries with mode, owner, size, modification time and symlink targets; a text file's first bytes (a binary file: its type only). Runs `sh`, `stat` and `head` in the container, so it needs the exec verb on the pod. For an image without a shell (distroless), set debug: it reads through an ephemeral debug container sharing the container's processes, like `kubectl debug --target` (the same exec rule as debug_pod), reusing one it added before.",
+        annotations(read_only_hint = false, destructive_hint = false)
     )]
     async fn browse_files(
         &self,

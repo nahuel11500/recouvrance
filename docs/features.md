@@ -71,8 +71,9 @@
   ControllerRevisions, Endpoints, EndpointSlices and Leases are never recorded: they change all the
   time and their history is told elsewhere (a pod's by its owner's revisions and its events). The
   **Timeline** page (sidebar, or `Timeline` in the palette) lists the connected clusters' changes
-  newest first with their events interleaved (Warnings only by default, all, or none; the events
-  of one object with the same reason make one row, with their count); shows the namespaces
+  newest first with their events interleaved (Warnings only by default, all, or none; every one
+  the cluster still keeps, an hour's worth by default; the events of one object with the same
+  reason make one row, with their count); shows the namespaces
   picked in the namespace picker only (cluster-scoped objects such as Nodes too when none is
   picked), and filters by cluster, and `ns:`, `kind:`, `ctx:` and text in its filter box; a row picked shows its diff,
   worked out then, and opens its object. Lists compare labels and annotations only, so their
@@ -138,7 +139,7 @@
 - **RBAC-aware**: actions your Kubernetes RBAC forbids are disabled; *My access* shows a can-i
   matrix for the namespace, and says when the cluster (webhook or cloud IAM authorizer) may allow
   more than it lists.
-- **Problems**: one list of what is broken across clusters (crash loops, pending pods, unavailable workloads, NotReady nodes, nodes such a taint keeps pods off for more than 5 minutes after they started, failed jobs, pending volumes, and alerts firing in the cluster's Prometheus that nobody silenced). Click a count (critical, warnings, minor) to show that severity alone; the filter box takes text and `ns:`, `kind:` (`kind:alert`, `kind:service`) and `ctx:` terms, as the Timeline's.
+- **Problems**: one list of what is broken across clusters (crash loops, pending pods, unavailable workloads, NotReady nodes, nodes such a taint keeps pods off for more than 5 minutes after they started, failed jobs, pending volumes, and alerts firing in the cluster's Prometheus that nobody silenced). Click a count (critical, warnings, minor) to show that severity alone; the filter box takes text and `ns:`, `kind:` (`kind:alert`, `kind:service`) and `ctx:` terms, as the Timeline's. The sidebar counts them in the background, again every 2 minutes (eight times as long as a count takes, when that is longer): the first count waits for the list on screen, and counting pauses while the window is hidden. A count reads at most 8 of the 32 namespaces read at once, so the page on screen always has the others; on a big cluster it then takes up to four times as long as the Problems page's scan, and comes that much less often. Its tooltip says how old the count is, and how often it comes.
 - **Alerts where you look**: a namespace's page lists the alerts labeled with it, and a pod's, workload's, volume's or node's page the alerts about it (a pod's include its workload's, a workload's its pods'), with severity, summary, how long, runbook link, and silenced or inhibited ones muted when an Alertmanager is found.
 - **Upgrade check** (Cluster overview → *Upgrade check*): per cluster, what needs action before it
   moves to a newer minor version (the next one by default; the arrows pick another), most urgent first:

@@ -69,7 +69,8 @@ const ROLLOUT_KINDS: [&str; 3] = ["Deployment", "StatefulSet", "DaemonSet"];
 #[tool_router(router = rollout_tools, vis = "pub(super)")]
 impl KubeMcp {
     #[tool(
-        description = "Pause a Deployment's rollouts, like `kubectl rollout pause`: changes to its template wait until resumed. Needs patch. Supports dry_run."
+        description = "Pause a Deployment's rollouts, like `kubectl rollout pause`: changes to its template wait until resumed. Needs patch. Supports dry_run.",
+        annotations(read_only_hint = false)
     )]
     async fn rollout_pause(
         &self,
@@ -80,7 +81,8 @@ impl KubeMcp {
     }
 
     #[tool(
-        description = "Resume a paused Deployment's rollouts, like `kubectl rollout resume`. Needs patch. Supports dry_run."
+        description = "Resume a paused Deployment's rollouts, like `kubectl rollout resume`. Needs patch. Supports dry_run.",
+        annotations(read_only_hint = false)
     )]
     async fn rollout_resume(
         &self,
@@ -91,7 +93,8 @@ impl KubeMcp {
     }
 
     #[tool(
-        description = "Set one container's image, like `kubectl set image` (a workload starts a rollout). Needs patch. Supports dry_run."
+        description = "Set one container's image, like `kubectl set image` (a workload starts a rollout). Needs patch. Supports dry_run.",
+        annotations(read_only_hint = false)
     )]
     async fn set_image(
         &self,
@@ -158,7 +161,8 @@ impl KubeMcp {
     }
 
     #[tool(
-        description = "Roll a Deployment, StatefulSet or DaemonSet back to an earlier revision (the previous one by default), like `kubectl rollout undo`. Supports dry_run."
+        description = "Roll a Deployment, StatefulSet or DaemonSet back to an earlier revision (the previous one by default), like `kubectl rollout undo`. Supports dry_run.",
+        annotations(read_only_hint = false)
     )]
     async fn rollout_undo(
         &self,

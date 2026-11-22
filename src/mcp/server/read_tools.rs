@@ -9,12 +9,12 @@ use serde_json::json;
 use super::logs_tools::{containers_note, log_containers};
 use super::{
     CertParams, ContextParam, EventsParams, HistoryParams, KubeMcp, ListParams, LogsParams, MAX_LOG_BYTES,
-    ObjectParams, ProblemsParams, ReachParams, SearchParams, TopParams, access_for, describe, format_table, get_named,
-    is_secret_object, list_verdict, problem_visible, require_ns, visible,
+    ObjectParams, ProblemsParams, ReachParams, SearchParams, TopParams, access_for, describe, dry_run_tools,
+    format_table, get_named, is_secret_object, list_verdict, problem_visible, require_ns, visible,
 };
 use crate::k8s;
 use crate::k8s::{Kind, ObjectRef};
-use crate::mcp::{Mode, Verb};
+use crate::mcp::{Mode, Policy, Verb};
 use crate::reachability;
 
 #[tool_router(router = read_tools, vis = "pub(super)")]
@@ -25,35 +25,7 @@ impl KubeMcp {
     )]
     async fn my_permissions(&self, Extension(parts): Extension<Parts>) -> Result<String, String> {
         let call = self.begin(&parts, "my_permissions", json!({}))?;
-        let p = call.policy();
-        let mut out = String::from(
-            "Rules are checked together: Deny wins over Ask (needs the user's approval) over Allow; anything not matched is denied.\n\n",
-        );
-        for (i, r) in p.rules.iter().enumerate() {
-            if r.expired() {
-                continue;
-            }
-            let list = |v: &Vec<String>| if v.is_empty() { "(none)".to_string() } else { v.join(", ") };
-            out.push_str(&format!(
-                "#{} {:?}: verbs [{}] on resources [{}] in namespaces [{}], contexts [{}], names [{}]{}{}\n",
-                i + 1,
-                r.effect,
-                list(&r.verbs),
-                list(&r.resources),
-                list(&r.namespaces),
-                list(&r.contexts),
-                list(&r.names),
-                r.expires.map_or_default(|t| format!(", until {t}")),
-                if r.note.is_empty() { String::new() } else { format!("  — {}", r.note) },
-            ));
-        }
-        out.push_str(&format!(
-            "\nLimits: {} per list, {} per call, exec timeout {}s, {} per minute.\nscale, rollout_restart, patch_resource, apply_manifest and delete_resource accept dry_run=true: prefer it first.",
-            crate::plural::count(p.max_rows, "row"),
-            crate::plural::count(p.max_log_lines, "log line"),
-            p.exec_timeout,
-            crate::plural::count(p.max_calls_per_minute, "call")
-        ));
+        let out = permissions(call.policy(), dry_run_tools());
         call.finish(Ok(out))
     }
 
@@ -835,6 +807,45 @@ impl KubeMcp {
     }
 }
 
+/// What `my_permissions` tells an agent: its rules, its limits, and the tools that take
+/// `dry_run` (read from their definitions, so a new one is named too).
+fn permissions(p: &Policy, dry_run: &[String]) -> String {
+    let mut out = String::from(
+        "Rules are checked together: Deny wins over Ask (needs the user's approval) over Allow; anything not matched is denied.\n\n",
+    );
+    for (i, r) in p.rules.iter().enumerate() {
+        if r.expired() {
+            continue;
+        }
+        let list = |v: &Vec<String>| if v.is_empty() { "(none)".to_string() } else { v.join(", ") };
+        out.push_str(&format!(
+            "#{} {:?}: verbs [{}] on resources [{}] in namespaces [{}], contexts [{}], names [{}]{}{}\n",
+            i + 1,
+            r.effect,
+            list(&r.verbs),
+            list(&r.resources),
+            list(&r.namespaces),
+            list(&r.contexts),
+            list(&r.names),
+            r.expires.map_or_default(|t| format!(", until {t}")),
+            if r.note.is_empty() { String::new() } else { format!("  — {}", r.note) },
+        ));
+    }
+    out.push_str(&format!(
+        "\nLimits: {} per list, {} per call, exec timeout {}s, {} per minute.",
+        crate::plural::count(p.max_rows, "row"),
+        crate::plural::count(p.max_log_lines, "log line"),
+        p.exec_timeout,
+        crate::plural::count(p.max_calls_per_minute, "call")
+    ));
+    if let [first @ .., last] = dry_run {
+        let names = if first.is_empty() { last.clone() } else { format!("{} and {last}", first.join(", ")) };
+        let accept = crate::plural::pick(dry_run.len(), "accepts", "accept");
+        out.push_str(&format!("\n{names} {accept} dry_run=true: prefer it first."));
+    }
+    out
+}
+
 /// The cluster's Prometheus, or an error that says where to set one.
 async fn prometheus(context: &str, client: &kube::Client) -> anyhow::Result<String> {
     crate::prom::target(context, client.clone()).await?.ok_or_else(|| {
@@ -936,10 +947,37 @@ fn container_lines(pod: &serde_json::Value) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use serde_json::json;
 
-    use super::{Measured, container_lines, measured};
+    use super::{KubeMcp, Measured, Policy, container_lines, dry_run_tools, measured, permissions};
     use crate::k8s::Kind;
+
+    /// `my_permissions` names every tool whose input takes `dry_run`, and no other: a list kept
+    /// by hand named 5 of 13 (#843).
+    #[test]
+    fn my_permissions_names_every_tool_that_takes_dry_run() {
+        let text = permissions(&Policy::default(), dry_run_tools());
+        let end = " accept dry_run=true: prefer it first.";
+        let line = text.lines().find(|l| l.ends_with(end)).unwrap_or_else(|| panic!("{text}"));
+        let named: BTreeSet<String> = line
+            .trim_end_matches(end)
+            .split([',', ' '])
+            .filter(|w| !w.is_empty() && *w != "and")
+            .map(String::from)
+            .collect();
+        let tools = KubeMcp::tools().list_all();
+        let take: BTreeSet<String> = tools
+            .iter()
+            .filter(|t| t.input_schema.get("properties").and_then(|p| p.get("dry_run")).is_some())
+            .map(|t| t.name.to_string())
+            .collect();
+        assert_eq!(named, take);
+        // Every change but exec_command, drain_node, gitops and the port-forward tools (docs/agents.md).
+        assert_eq!(take.len(), 13, "{take:?}");
+        assert!(take.contains("set_image") && take.contains("cordon_node") && take.contains("debug_pod"), "{take:?}");
+    }
 
     fn kind(group: &str, kind: &str, plural: &str, namespaced: bool) -> Kind {
         let gvk = kube::api::GroupVersionKind::gvk(group, "v1", kind);

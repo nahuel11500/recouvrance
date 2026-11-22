@@ -24,6 +24,7 @@ pub(crate) mod experiments;
 pub(crate) mod files;
 mod forward;
 pub(crate) mod gate;
+pub(crate) mod lane;
 pub(crate) mod lists;
 mod login;
 pub(crate) mod meter;
@@ -63,13 +64,14 @@ static RUNTIME: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
         .expect("tokio runtime")
 });
 
-/// Run a future on the tokio runtime and await it from any executor.
+/// Run a future on the tokio runtime and await it from any executor, in the lane of the
+/// work that runs it (see `lane`).
 pub async fn run<F, T>(f: F) -> Result<T>
 where
     F: Future<Output = Result<T>> + Send + 'static,
     T: Send + 'static,
 {
-    RUNTIME.spawn(f).await.map_err(|e| anyhow!("task failed: {e}"))?
+    RUNTIME.spawn(lane::carry(f)).await.map_err(|e| anyhow!("task failed: {e}"))?
 }
 
 /// Like `run`, but dropping the future stops the work (a Stop button, a closed view).
@@ -78,7 +80,7 @@ where
     F: Future<Output = Result<T>> + Send + 'static,
     T: Send + 'static,
 {
-    let task = RUNTIME.spawn(f);
+    let task = RUNTIME.spawn(lane::carry(f));
     let _guard = TaskGuard(task.abort_handle());
     task.await.map_err(|e| anyhow!("task failed: {e}"))?
 }

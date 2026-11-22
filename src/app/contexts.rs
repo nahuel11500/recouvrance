@@ -147,7 +147,6 @@ impl AppView {
                         }
                         this.settings_view.update(cx, |s, _| s.set_kinds(kinds.clone()));
                         this.kinds = kinds;
-                        this.problems.start(this.clusters.clone(), this.cluster_kinds(), cx);
                         // The timeline: the connected contexts' records, their own watches.
                         for (c, _) in &this.clusters {
                             crate::timeline::open(c);
@@ -156,6 +155,8 @@ impl AppView {
                             crate::timeline::start_watches(&this.clusters, &this.kinds, &this.kind_clusters);
                         this.set_namespaces(namespaces, window, cx);
                         this.restart_watch(cx);
+                        // After the list, whose rows its first count waits for.
+                        this.problems.start(this.clusters.clone(), this.cluster_kinds(), cx);
                         if dev_var("RECOUVRANCE_PAGE").is_none() {
                             match crate::settings::get().initial_view {
                                 crate::settings::InitialView::Workloads => this.open_workloads(window, cx),
