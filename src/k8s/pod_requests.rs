@@ -314,12 +314,11 @@ fn apply_event(line: &str, pods: &mut Arc<PodAllocs>, version: &mut String) -> R
             if !pod.metadata.resource_version.is_empty() {
                 version.clone_from(&pod.metadata.resource_version);
             }
-            let changed = match kind {
-                "DELETED" => PodAllocs::take(pods, &pod.metadata.namespace, &pod.metadata.name),
-                _ => {
-                    let alloc = PodAlloc::of(&pod);
-                    PodAllocs::put(pods, pod.metadata.namespace, pod.metadata.name, alloc)
-                }
+            let changed = if kind == "DELETED" {
+                PodAllocs::take(pods, &pod.metadata.namespace, &pod.metadata.name)
+            } else {
+                let alloc = PodAlloc::of(&pod);
+                PodAllocs::put(pods, pod.metadata.namespace, pod.metadata.name, alloc)
             };
             Ok(if changed { Applied::Changed } else { Applied::Unchanged })
         }
