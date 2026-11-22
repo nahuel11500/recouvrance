@@ -91,8 +91,9 @@ Tools, by what they do:
 
 Each tool tells the agent's client whether it only reads (`readOnlyHint`): the tools under **Read**
 say so, except `browse_files`, which may add a debug container; the changes don't. Of those that may
-change something, `trigger_cronjob`, `debug_pod`, `port_forward` and `browse_files` only add
-(`destructiveHint: false`).
+change something, `debug_pod`, `port_forward` and `browse_files` only add (`destructiveHint: false`).
+`trigger_cronjob` doesn't say so: the Job it starts runs the CronJob's own code, which may delete
+or overwrite data.
 
 Every change supports `dry_run` except `exec_command`, `drain_node`, `gitops` and the port-forward
 tools; `my_permissions` names them, from the tools' definitions. What some of them need beyond the

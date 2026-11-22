@@ -80,7 +80,8 @@ impl Group {
 }
 
 /// Split calls (newest first) into groups, and each group into runs of the same
-/// tool on the same target with the same outcome.
+/// tool on the same target with the same outcome, all writes or none: a line shows
+/// whether its newest call wrote, so a dry run never joins the real call's run.
 pub(super) fn group_calls(entries: Vec<AuditEntry>) -> Vec<Group> {
     let mut groups: Vec<Group> = Vec::new();
     for e in entries {
@@ -93,11 +94,9 @@ pub(super) fn group_calls(entries: Vec<AuditEntry>) -> Vec<Group> {
             continue;
         }
         let Some(g) = groups.last_mut() else { continue };
-        let joins = g
-            .runs
-            .last()
-            .and_then(|r| r.last())
-            .is_some_and(|p| p.tool == e.tool && target(p) == target(&e) && problem(p) == problem(&e));
+        let joins = g.runs.last().and_then(|r| r.last()).is_some_and(|p| {
+            p.tool == e.tool && target(p) == target(&e) && problem(p) == problem(&e) && writes(p) == writes(&e)
+        });
         match g.runs.last_mut() {
             Some(run) if joins => run.push(e),
             _ => g.runs.push(vec![e]),
@@ -729,6 +728,20 @@ mod tests {
         denied.decision = Decision::Denied;
         let groups = group_calls(vec![exec(20, "ls"), denied, exec(0, "ls")]);
         assert_eq!(groups[0].runs.len(), 3);
+    }
+
+    /// A line takes its write color and text from its newest call, so a dry run never folds
+    /// with the real call of the same tool on the same object. Dry runs still fold together.
+    #[test]
+    fn a_dry_run_is_never_folded_into_real_calls() {
+        let set_image = |secs: i64, dry_run: Option<bool>| {
+            let args = serde_json::json!({"context": "prod", "kind": "deployments", "namespace": "app", "name": "web",
+                "container": "web", "image": "web:2", "dry_run": dry_run});
+            call(secs, "set_image", args, Decision::Allowed)
+        };
+        // Newest first: the real call, then the two dry runs that came before it.
+        let groups = group_calls(vec![set_image(30, None), set_image(20, Some(true)), set_image(10, Some(true))]);
+        assert_eq!(groups[0].runs.iter().map(Vec::len).collect::<Vec<_>>(), [1, 2]);
     }
 
     #[test]

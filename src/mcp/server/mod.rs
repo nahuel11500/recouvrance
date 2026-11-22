@@ -1445,6 +1445,21 @@ mod tests {
         }
     }
 
+    /// Only the tools that just add something say `destructiveHint: false`, on which a client
+    /// may soften its confirmation. `trigger_cronjob` doesn't: its Job runs the CronJob's own
+    /// code, which may delete or overwrite data.
+    #[test]
+    fn only_tools_that_just_add_say_they_destroy_nothing() {
+        let tools = KubeMcp::tools().list_all();
+        let additive: HashSet<String> = tools
+            .iter()
+            .filter(|t| t.annotations.as_ref().and_then(|a| a.destructive_hint) == Some(false))
+            .map(|t| t.name.to_string())
+            .collect();
+        let expected: HashSet<String> = ["browse_files", "debug_pod", "port_forward"].map(String::from).into();
+        assert_eq!(additive, expected);
+    }
+
     /// Whether a call wrote comes from the tools' definitions, not from a list of names kept
     /// by hand, which missed 10 tools that change things (#843).
     #[test]

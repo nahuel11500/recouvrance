@@ -40,7 +40,7 @@ const DEBUG_IMAGE: &str = "busybox:1.37";
 impl KubeMcp {
     #[tool(
         description = "Start a Job from a CronJob now, like `kubectl create job --from=cronjob/NAME`. Needs apply on jobs (the Job is named NAME-manual-<number>). Supports dry_run.",
-        annotations(read_only_hint = false, destructive_hint = false)
+        annotations(read_only_hint = false)
     )]
     async fn trigger_cronjob(
         &self,
