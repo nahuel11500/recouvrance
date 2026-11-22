@@ -17,9 +17,7 @@ use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolRequestParams, CallToolResponse, PromptMessage, Role, Tool};
 use rmcp::model::{ServerCapabilities, ServerConfig};
 
-use rmcp::transport::streamable_http_server::{
-    StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
-};
+use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
 use rmcp::{ServerHandler, prompt, prompt_handler, prompt_router, schemars, tool_handler};
 use serde::Deserialize;
 
@@ -41,6 +39,7 @@ mod node_tools;
 mod ops_tools;
 mod read_tools;
 mod rollout_tools;
+mod sessions;
 mod write_tools;
 
 /// Set by the auth middleware for every authenticated request.
@@ -1116,7 +1115,7 @@ pub fn start(hub: Arc<Hub>) -> TaskGuard {
             let hub = hub.clone();
             StreamableHttpService::new(
                 move || Ok(KubeMcp::new(hub.clone())),
-                Arc::new(LocalSessionManager::default()),
+                Arc::new(sessions::Sessions::new(sessions::IDLE)),
                 StreamableHttpServerConfig::default(),
             )
         };

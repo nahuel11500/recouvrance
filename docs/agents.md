@@ -188,6 +188,8 @@ in the assistant, a `claude -p` killed), the banner goes at once; when its sessi
 seconds. A click on the banner after that changes nothing. As with the kill switch, a call whose agent
 stopped waiting makes no change after that (a drain stops before its next eviction). The log says
 whether a request was refused, left unanswered, given up by the agent or cut off by the kill switch.
+A session ends when its client closes it or after an hour unused, never while one of its calls runs,
+however long that takes.
 
 The Activity page groups calls by task: one agent session, split where the agent paused for more than
 10 minutes. Each group says what it touched (contexts, namespaces, objects); repeated calls of a tool on
