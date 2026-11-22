@@ -237,16 +237,6 @@ impl<T> Listed<T> {
     }
 }
 
-/// Services (whole objects) by namespace and name.
-fn services_by_name<'a>(scope: Option<&str>, services: &'a [Value]) -> Listed<&'a Value> {
-    Listed::new(
-        scope,
-        services.iter().filter_map(|s| {
-            Some((text(s, "/metadata/namespace")?.to_string(), text(s, "/metadata/name")?.to_string(), s))
-        }),
-    )
-}
-
 /// Whether each target exists. A few are read one at a time (metadata only); more of one
 /// kind than `READ_AT_MOST`, and that kind is listed in `scope` instead. A kind that could
 /// not be read leaves its targets unknown, and is returned once.

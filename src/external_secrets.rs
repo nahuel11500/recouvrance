@@ -64,8 +64,11 @@ impl LeanObject {
     /// Its Ready condition, as `ready` reads it of a whole object.
     fn ready(&self) -> Option<(&str, &str, &str)> {
         let c = self.status.conditions.iter().find(|c| c.kind.as_deref() == Some("Ready"))?;
-        let text = |s: Option<&str>| s.unwrap_or_default();
-        Some((text(c.status.as_deref()), text(c.reason.as_deref()), text(c.message.as_deref())))
+        Some((
+            c.status.as_deref().unwrap_or_default(),
+            c.reason.as_deref().unwrap_or_default(),
+            c.message.as_deref().unwrap_or_default(),
+        ))
     }
 
     /// Whether an `ExternalSecret` never synced: the operator sets `status.refreshTime` on each

@@ -50,7 +50,7 @@ mod whole {
     pub fn scaled_to_zero(service: &Value, workloads: &[(&str, Value)]) -> Option<String> {
         let ns = text(service, "/metadata/namespace");
         let selector = service.pointer("/spec/selector")?;
-        let selector = serde_json::json!({ "matchLabels": selector });
+        let selector = json!({ "matchLabels": selector });
         workloads.iter().find_map(|(kind, w)| {
             let labels = w.pointer("/spec/template/metadata/labels")?.as_object()?;
             let zero = w.pointer("/spec/replicas").and_then(Value::as_i64) == Some(0);
