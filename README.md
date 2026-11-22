@@ -7,7 +7,7 @@
 [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/nahuel11500/recouvrance/badge)](https://scorecard.dev/viewer/?uri=github.com/nahuel11500/recouvrance)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 
-*Named after the Brest schooner* Recouvrance*, a replica of an 1817 aviso: the fast ships that carried
+*Named after the Brest schooner* Recouvrance, *a replica of an 1817 aviso: the fast ships that carried
 dispatches. In French,* recouvrer *means to recover.*
 
 A fast Kubernetes desktop client (Rust + [gpui](https://github.com/zed-industries/zed)) with a
