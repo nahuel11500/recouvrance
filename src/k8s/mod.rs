@@ -24,7 +24,9 @@ pub(crate) mod experiments;
 pub(crate) mod files;
 mod forward;
 pub(crate) mod gate;
+pub(crate) mod lane;
 pub(crate) mod lists;
+mod login;
 pub(crate) mod meter;
 mod metrics;
 pub(crate) mod names;
@@ -62,13 +64,14 @@ static RUNTIME: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
         .expect("tokio runtime")
 });
 
-/// Run a future on the tokio runtime and await it from any executor.
+/// Run a future on the tokio runtime and await it from any executor, in the lane of the
+/// work that runs it (see `lane`).
 pub async fn run<F, T>(f: F) -> Result<T>
 where
     F: Future<Output = Result<T>> + Send + 'static,
     T: Send + 'static,
 {
-    RUNTIME.spawn(f).await.map_err(|e| anyhow!("task failed: {e}"))?
+    RUNTIME.spawn(lane::carry(f)).await.map_err(|e| anyhow!("task failed: {e}"))?
 }
 
 /// Like `run`, but dropping the future stops the work (a Stop button, a closed view).
@@ -77,7 +80,7 @@ where
     F: Future<Output = Result<T>> + Send + 'static,
     T: Send + 'static,
 {
-    let task = RUNTIME.spawn(f);
+    let task = RUNTIME.spawn(lane::carry(f));
     let _guard = TaskGuard(task.abort_handle());
     task.await.map_err(|e| anyhow!("task failed: {e}"))?
 }
@@ -164,10 +167,13 @@ pub fn mask_secret_values(value: &mut serde_json::Value) {
     }
 }
 
-/// kubectl-style age: 45s, 12m, 5h, 3d, 2y.
 /// An error as a person reads it: the API server's own message (not kube's debug dump of
-/// the whole Status), otherwise the error chain.
+/// the whole Status), a context's login command that failed by its program and error,
+/// otherwise the error chain.
 pub fn short_error(e: &anyhow::Error) -> String {
+    if let Some(said) = login::login_failure(e.as_ref()) {
+        return said;
+    }
     for cause in e.chain() {
         if let Some(kube::Error::Api(status)) = cause.downcast_ref::<kube::Error>() {
             // A plain-text body ("404 page not found\n") keeps its newline.
@@ -182,6 +188,13 @@ pub fn short_error(e: &anyhow::Error) -> String {
         return format!("The cluster did not answer (timed out {step})");
     }
     text.trim().to_string()
+}
+
+/// An error with what was being done when it happened, as `{e:#}` says it. A context's login
+/// command that failed is said alone (its program, exit code and last stderr line), without
+/// kube's `ServiceError` and the request around it.
+pub fn error_chain(e: &anyhow::Error) -> String {
+    login::login_failure(e.as_ref()).unwrap_or_else(|| format!("{e:#}"))
 }
 
 /// The HTTP status of an API error (403 forbidden, 404 not found…), if it is one.

@@ -9,7 +9,20 @@ Recouvrance is one Rust binary: a [gpui](https://github.com/zed-industries/zed) 
 - Kubernetes calls run on a **tokio runtime** (`k8s::run`, `k8s::spawn_guarded`). Long-lived work
   (watches, log streams, port-forwards) returns a `TaskGuard`: dropping it cancels the work, so a
   page that goes away stops its streams.
-- Pages hidden in the back/forward history pause their polling (`app::wait_visible`).
+- Pages hidden in the back/forward history pause their polling (`app::wait_visible`), and so does
+  every page of a window hidden as the desktop reports it (gpui's window visibility): minimized or
+  on another workspace, and on macOS also fully covered by other windows or on a display that
+  sleeps. X11 sees a covered window only without a compositor, and Wayland compositors without the
+  xdg-shell `suspended` state never report a window hidden. The list then holds its rows back
+  (a first list that completes meanwhile says so only with them) and stops its metrics, and the
+  sidebar's problem count waits. Watches, log streams and shells keep going, so a window shown
+  again is current at once. A window shown on another monitor, not focused, keeps updating.
+- The page on screen gets the API servers first. Background work (the problem count, a hidden
+  list) takes at most 8 of the 32 slots that requests by namespace share (`k8s::lane`). Each
+  request takes its slot in the lane of that moment, so a list that comes on screen while it loads
+  gets the page's slots for the rest. The first problem count waits for the list on screen to show
+  its rows (15 s at most), and the pods' requests and limits for the usage bars are read after the
+  list's first rows.
 
 ## Source map
 
@@ -43,3 +56,10 @@ thousands of pods) in a few hundred megabytes.
 - Actions your **RBAC** forbids are disabled (`SelfSubjectAccessReview`).
 - **Agents** go through the hub: rules (deny, ask, allow), approvals, a rate limit, an audit log and
   a kill switch. Write mode and protected contexts don't apply to them: only their rules do.
+- **Login commands keep their secrets.** kube's error for a failed exec plugin holds its whole
+  command line and its output; each client replaces it, when it is built and on every request
+  (a token refresh runs the plugin again), by the program's file name, taken from the kubeconfig,
+  and its exit code (`k8s::login`). A plugin that cannot start is reported with its name too. The
+  last line the plugin wrote to stderr is added when the kubeconfig sets `interactiveMode: Never`:
+  kube keeps stderr only then, and otherwise the plugin writes to the terminal Recouvrance was
+  started from. Pages, agents and the audit log only ever get that.

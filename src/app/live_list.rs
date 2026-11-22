@@ -20,6 +20,9 @@ pub(super) struct LiveList {
     columns: Vec<Arc<Vec<ColumnDef>>>,
     /// Clusters whose list is still arriving.
     listing: HashSet<usize>,
+    /// Clusters that showed every row already, before their list is complete
+    /// (`TableMsg::AllRows`).
+    all_rows: HashSet<usize>,
     /// Clusters that refused to list the kind (403).
     refused: HashSet<usize>,
     /// How many clusters are watched (those serving the kind).
@@ -71,6 +74,12 @@ impl LiveList {
     /// Whether some cluster is still listing.
     pub fn is_loading(&self) -> bool {
         !self.listing.is_empty()
+    }
+
+    /// Whether every cluster watched has shown all its rows (perhaps still without their
+    /// objects' metadata), or answered otherwise: the list on screen has had the API first.
+    pub fn rows_shown(&self) -> bool {
+        self.listing.iter().all(|ix| self.all_rows.contains(ix))
     }
 
     /// What the bar above the list says: what failed (`failed`, then each cluster's
@@ -137,6 +146,9 @@ impl LiveList {
                     *slot = rows;
                 }
                 up.rows = true;
+            }
+            TableMsg::AllRows => {
+                self.all_rows.insert(ctx);
             }
             TableMsg::Listed => {
                 self.listing.remove(&ctx);
@@ -275,6 +287,35 @@ mod tests {
     }
 
     #[test]
+    fn rows_are_shown_once_every_cluster_sent_them_all_or_answered() {
+        let mut list = LiveList::start(3, [0, 1]);
+        assert!(!list.rows_shown());
+        list.apply(0, "a", TableMsg::Rows(vec![row("x")]), &[]);
+        assert!(!list.rows_shown(), "a first page");
+        list.apply(0, "a", TableMsg::AllRows, &[]);
+        assert!(!list.rows_shown(), "b has shown nothing yet");
+        list.apply(1, "b", TableMsg::Error("timeout".into()), &[]);
+        assert!(!list.rows_shown(), "b is retrying");
+        list.apply(1, "b", TableMsg::Forbidden("403".into()), &[]);
+        assert!(list.rows_shown(), "b answered: c is not watched");
+        assert!(list.is_loading(), "a still lists their objects' metadata");
+        // A list that ends without `AllRows` (a small one, or paged): `Listed` counts.
+        let mut list = LiveList::start(1, [0]);
+        list.apply(0, "a", TableMsg::Listed, &[]);
+        assert!(list.rows_shown());
+        // Rows from before, shown while the new list loads, are not the new list.
+        let mut list = LiveList::start(1, [0]);
+        list.restore(super::CachedView {
+            columns: defs(&["Name"]),
+            rows: vec![vec![row("p")]],
+            at: std::time::Instant::now(),
+        });
+        assert!(!list.rows_shown());
+        // Nothing watched: nothing to wait for.
+        assert!(LiveList::start(2, []).rows_shown());
+    }
+
+    #[test]
     fn forbidden_only_when_every_cluster_refused_whichever_answers_last() {
         for order in [[0, 1], [1, 0]] {
             let mut list = LiveList::start(2, [0, 1]);
@@ -373,17 +414,19 @@ mod tests {
     #[test]
     fn coalesces_rows() {
         let rows = |n: usize| TableMsg::Rows((0..n).map(|i| row(&i.to_string())).collect());
-        let batch = vec![rows(1), TableMsg::Columns(Arc::default()), rows(2), TableMsg::Listed, rows(3)];
+        let batch =
+            vec![rows(1), TableMsg::Columns(Arc::default()), rows(2), TableMsg::AllRows, TableMsg::Listed, rows(3)];
         let kept: Vec<String> = coalesce(batch)
             .iter()
             .map(|m| match m {
                 TableMsg::Rows(r) => format!("rows{}", r.len()),
                 TableMsg::Columns(_) => "columns".into(),
                 TableMsg::Listed => "listed".into(),
+                TableMsg::AllRows => "all rows".into(),
                 _ => "other".into(),
             })
             .collect();
-        assert_eq!(kept, ["columns", "listed", "rows3"]);
+        assert_eq!(kept, ["columns", "all rows", "listed", "rows3"]);
         assert_eq!(coalesce(vec![TableMsg::Error("x".into())]).len(), 1);
     }
 }

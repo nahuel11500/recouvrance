@@ -7,7 +7,7 @@ use anyhow::{Context as _, Result};
 use kube::config::{KubeConfigOptions, Kubeconfig};
 use kube::{Client, Config};
 
-use super::{added_dir, folder_files, gate, meter, retry, run};
+use super::{added_dir, folder_files, gate, login, meter, retry, run};
 use crate::paths::tilde;
 use crate::private_files::{TempFile, save_new};
 
@@ -449,7 +449,9 @@ async fn connect_with(context: String, gated: bool) -> Result<Client> {
     .await
 }
 
-/// A context's client from its config, with the app's layers. Runs the exec plugin, if any.
+/// A context's client from its config, with the app's layers. Runs the exec plugin, if any:
+/// when it fails, here or on a later request, the error says its program and its error only
+/// (`login`), not its command line or output.
 fn client(mut config: Config, context: String, gated: bool) -> Result<Client> {
     // kube's retry sends a 503 again for about three minutes: an aggregated API that is down
     // (metrics-server) held pages that long. `retry` only waits when the server says when.
@@ -460,8 +462,18 @@ fn client(mut config: Config, context: String, gated: bool) -> Result<Client> {
     let timeout = tower::timeout::TimeoutLayer::new(REQUEST_TIMEOUT);
     // Outside the timeout, so a request it cuts is counted as failed.
     let meter = meter::MeterLayer { context };
-    let builder = kube::client::ClientBuilder::try_from(config)?;
-    let builder = builder.with_layer(&retry::RetryLayer).with_layer(&timeout).with_layer(&meter);
+    // kube's error for a failed login command names its program among its arguments, or not at
+    // all (when it could not be started): it is named from the kubeconfig instead.
+    let program = login::program(&config.auth_info);
+    let builder =
+        kube::client::ClientBuilder::try_from(config).map_err(|e| login::build_error(e, program.as_deref()))?;
+    // Right around kube's own layers, where a failed token refresh comes out: the app's layers
+    // and every caller only see it said by `login`.
+    let builder = builder
+        .with_layer(&login::LoginErrorLayer::new(program.as_deref()))
+        .with_layer(&retry::RetryLayer)
+        .with_layer(&timeout)
+        .with_layer(&meter);
     Ok(if gated { builder.with_layer(&gate::WriteGateLayer).build() } else { builder.build() })
 }
 
@@ -955,6 +967,77 @@ mod tests {
         assert_eq!((stats.count, stats.bytes, stats.last_byte.count()), (1, 10_000, 1));
         let heavy = snapshot.heaviest.iter().find(|h| h.context == "gzip-test").expect("the request is listed");
         assert_eq!((heavy.path.as_str(), heavy.bytes), ("/api/v1/namespaces/{namespace}/configmaps/{name}", 10_000));
+    }
+
+    /// A context whose login command is `sh -c script`, given an OIDC client secret in its
+    /// arguments as kubelogin is and another in its environment, with `MARK` set to `mark`.
+    /// Its stderr is kept, not shown.
+    fn login_by(script: &str, mark: &std::path::Path) -> kube::Config {
+        let var = |name: &str, value: &str| {
+            std::collections::HashMap::from([
+                ("name".to_string(), name.to_string()),
+                ("value".to_string(), value.to_string()),
+            ])
+        };
+        let mut config = kube::Config::new("http://127.0.0.1:1".parse().unwrap());
+        config.auth_info.exec = Some(kube::config::ExecConfig {
+            api_version: Some("client.authentication.k8s.io/v1".into()),
+            command: Some("sh".into()),
+            args: Some(vec!["-c".into(), script.into(), "login".into(), "--oidc-client-secret=s3cr3t-arg".into()]),
+            env: Some(vec![var("LOGIN_ENV", "s3cr3t-env"), var("MARK", &mark.to_string_lossy())]),
+            drop_env: Some(vec!["S3CR3T_DROPPED".into()]),
+            interactive_mode: Some(kube::config::ExecInteractiveMode::Never),
+            ..Default::default()
+        });
+        config
+    }
+
+    const LOGIN_FAILED: &str = "the login command `sh` failed (exit 3): error: refresh token expired";
+
+    /// A login command that fails while the client is built: the error says its program, exit
+    /// code and last stderr line, never its arguments, environment or output (#827).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_login_command_keeps_its_secrets() {
+        let script = "echo \"token: $LOGIN_ENV\"; echo 'warning: no cached token' >&2; \
+                      echo 'error: refresh token expired' >&2; exit 3";
+        let mark = std::env::temp_dir().join("recouvrance-login-unused");
+        let Err(e) = super::client(login_by(script, &mark), "test".into(), false) else {
+            panic!("the login command fails");
+        };
+        assert_eq!(crate::k8s::short_error(&e), LOGIN_FAILED);
+        assert_eq!(format!("{e:#}"), LOGIN_FAILED);
+        assert!(!format!("{e:?}").contains("s3cr3t"), "{e:?}");
+    }
+
+    /// One that fails when it runs again to refresh the token, on a request: the same (#827).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_login_command_failing_on_refresh_keeps_its_secrets() {
+        let mark = std::env::temp_dir().join(format!("recouvrance-login-{}", uuid::Uuid::new_v4().simple()));
+        // The first run logs in, with a token expired already; every run after fails.
+        let script = r#"if [ -e "$MARK" ]; then echo "$LOGIN_ENV"; echo 'error: refresh token expired' >&2; exit 3; fi
+touch "$MARK"
+echo '{"apiVersion":"client.authentication.k8s.io/v1","kind":"ExecCredential","status":{"token":"s3cr3t-token","expirationTimestamp":"2020-01-01T00:00:00Z"}}'"#;
+        let client = super::client(login_by(script, &mark), "test".into(), false).unwrap();
+        let read = client.request_text(http::Request::get("/version").body(Vec::new()).unwrap()).await;
+        let _ = std::fs::remove_file(mark);
+        let e = read.expect_err("the token refresh fails");
+        assert_eq!(e.to_string(), format!("ServiceError: {LOGIN_FAILED}"));
+        assert!(!format!("{e:?}").contains("s3cr3t"), "{e:?}");
+        assert_eq!(crate::k8s::short_error(&anyhow::Error::from(e)), LOGIN_FAILED);
+    }
+
+    /// A login command that is not there, as when it is not on the `PATH` the app was started
+    /// with: the error names it and says why it could not start (#827).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_login_command_that_is_not_there_is_named() {
+        let mut config = login_by("exit 0", &std::env::temp_dir().join("recouvrance-login-unused"));
+        config.auth_info.exec.as_mut().unwrap().command = Some("/nonexistent/recouvrance-login".into());
+        let Err(e) = super::client(config, "test".into(), false) else {
+            panic!("the login command is not there");
+        };
+        let said = crate::k8s::short_error(&e);
+        assert!(said.starts_with("the login command `recouvrance-login` could not be started: "), "{said}");
+        assert!(said.contains("os error 2"), "{said}");
     }
 
     #[test]
