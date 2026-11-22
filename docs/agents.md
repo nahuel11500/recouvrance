@@ -18,10 +18,35 @@ approved (or cannot be), it shows only the allowed rows, and a rejection is stil
 it shows the rows of every Ask rule the list meets (`find_problems` asks to list pods: approving
 it shows other kinds' findings only where an Allow rule covers them). Rules changed while a call waits for approval
 apply to it: it is checked again once approved, and `apply_manifest` checks each object again before
-applying it (an object whose rule turned into *Ask me* needs its own approval). In **Agents**, click **Connect Claude Code**: it registers the server in your
-Claude Code (`claude mcp add --scope user recouvrance …`). There is one agent, "Claude", with its rules;
-*Several agents…* gives other tools their own token and rules if you ever need that. Tokens are
-stored hashed (the assistant's copy is in a 0600 file).
+applying it (an object whose rule turned into *Ask me* needs its own approval).
+
+### Connecting your tools
+
+In **Agents**, click **Connect Claude Code**: it registers the server in your Claude Code
+(`claude mcp add --scope user recouvrance …`). For another tool, pick it under *Connect* on the
+agent's page and copy its config, or its command where it has one:
+
+| Tool | Where it goes |
+|---|---|
+| Codex | `~/.codex/config.toml` |
+| Cursor | `~/.cursor/mcp.json` |
+| VS Code | `~/.copilot/mcp-config.json`, the file its Copilot agent reads (and Copilot CLI) |
+| Gemini CLI | `~/.gemini/settings.json`, or the `gemini mcp add` command |
+| Zed | its settings file (*zed: open settings file*) |
+
+Each holds the server's URL and the agent's token; *Copy token* copies the token alone, for any other
+MCP client. The page shows the token masked: copying puts it on the clipboard and nowhere else. A
+call can wait 2 minutes for your approval, then `wait_for` and `rollout_status` can wait 5 more, so
+the configs give a tool call 10 minutes where the tool has that setting: Codex and Zed stop one after
+60 s by default, Gemini CLI after 10 minutes; Cursor and VS Code have no such setting. Codex also asks
+before each tool that changes something, then the agent's rules apply as well:
+`default_tools_approval_mode = "approve"` in its entry leaves that to the rules.
+
+There is one agent, "Claude", with its rules, and all these tools can share it; *Several agents…*
+gives each tool its own token and rules if you ever need that. Tokens are stored hashed, but the main
+agent's is also kept for the assistant (in a 0600 file), so its configs can be copied at any time;
+another agent's can be copied only right after it is created or given a **New token** (which cuts off
+the tools that used the old one).
 
 ## Rules
 

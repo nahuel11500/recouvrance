@@ -35,11 +35,11 @@ Site: [nahuelcanavy.com/recouvrance](https://nahuelcanavy.com/recouvrance/)
   RBAC; roll back any Deployment, StatefulSet or DaemonSet. Agents follow their own rules instead.
 - **Access made clear**: Role, binding and ServiceAccount pages, a *who can* inspector, and
   short-lived kubeconfigs for ServiceAccounts.
-- **Built for agents**: a local MCP server so Claude Code (or any MCP client) works on your clusters
-  under rules you control (allow, ask, deny), with approvals and an audit log. 40+ tools cover what
-  you'd do with kubectl and Helm: logs, diffs, rollouts and rollbacks, port-forwards, debug
-  containers, cordon and drain, `explain` and `can-i`. The in-app assistant
-  uses your Claude Code login (no API key needed), or an Anthropic API key without Claude Code.
+- **Built for agents**: a local MCP server so Claude Code, Codex, Cursor, VS Code, Gemini CLI, Zed
+  or any MCP client works on your clusters under rules you control (allow, ask, deny), with approvals
+  and an audit log. 40+ tools cover what you'd do with kubectl and Helm: logs, diffs, rollouts and
+  rollbacks, port-forwards, debug containers, cordon and drain, `explain` and `can-i`. The in-app
+  assistant uses your Claude Code login (no API key needed), or an Anthropic API key without Claude Code.
 
 ## Screenshots
 
@@ -104,7 +104,8 @@ scripts/uninstall.sh    # removes it (settings and the agent log are kept)
 2. Browse with the sidebar or **Ctrl+K**; filter tables with words, labels or expressions such as
    `status:Running restarts>3`.
 3. Click the `read-only` badge when you want to change something.
-4. In **Agents**, click **Connect Claude Code** to let Claude work on your clusters under your rules.
+4. In **Agents**, click **Connect Claude Code** (or copy the config for Codex, Cursor, VS Code, Gemini
+   CLI or Zed) to let your agent work on your clusters under your rules.
 
 | Shortcut | Action |
 |---|---|
