@@ -468,11 +468,12 @@ mod tests {
         assert_eq!(last_line(b"first\n\x1b[0m\n  \n"), Some("first".into()));
         assert_eq!(last_line(b"\xffbad\n"), Some("\u{fffd}bad".into()));
         assert_eq!(last_line(b""), None);
-        // A URL's user and password are left out, before a cut that would keep half of them.
+        // A URL's user and password are left out, before a cut that would keep half of them (it
+        // falls in the password here, and nothing is cut once they are out).
         let said = last_line(b"error: Get https://alice:s3cr3t@issuer.example/token: 401\n");
         assert_eq!(said.as_deref(), Some("error: Get https://issuer.example/token: 401"));
-        let long = format!("{} https://alice:s3cr3t-and-more@issuer.example", "x".repeat(180));
-        assert_eq!(last_line(long.as_bytes()), Some(format!("{} https://issuer.example", "x".repeat(180))));
+        let long = format!("{} https://alice:s3cr3t-and-more@issuer.example", "x".repeat(175));
+        assert_eq!(last_line(long.as_bytes()), Some(format!("{} https://issuer.example", "x".repeat(175))));
     }
 
     /// A URL's user and password are left out of a text, wherever it is and whatever is around
