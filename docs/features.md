@@ -86,7 +86,8 @@
   are never kept, in memory or on disk: only whether each key changed. An object written all the
   time is recorded at most 10 times an hour (the next record says how many were skipped).
   Records are kept on disk per context, 16 MB and 14 days by default (see
-  [configuration](configuration.md#timeline)), so the timeline survives a restart.
+  [configuration](configuration.md#timeline)), so the timeline survives a restart. Agents read
+  it, with its events, through `recent_changes`, under their rules (see [agents](agents.md)).
 - **Reachability**: a tab on Services, Ingresses and HTTPRoutes that follows the path a request
   takes and names the first step that breaks, with the `kubectl` command to see it yourself: the
   Ingress's class and the address its controller gave it (for a route, each Gateway, programmed and
