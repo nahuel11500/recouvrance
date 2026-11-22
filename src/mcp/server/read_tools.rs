@@ -843,8 +843,16 @@ fn permissions(p: &Policy, dry_run: &[String]) -> String {
         let accept = crate::plural::pick(dry_run.len(), "accepts", "accept");
         out.push_str(&format!("\n{names} {accept} dry_run=true: prefer it first."));
     }
+    // An agent waiting for a banner that never comes, or taking a short list for all there is.
+    out.push_str(&format!(
+        "\n{NEVER_ASKS} never asks for approval: it shows the changes and events your Allow rules let you read \
+         (get on each object, list on events) and counts the rest."
+    ));
     out
 }
+
+/// The tool that reads across objects without asking: `my_permissions` names it.
+const NEVER_ASKS: &str = "recent_changes";
 
 /// The cluster's Prometheus, or an error that says where to set one.
 async fn prometheus(context: &str, client: &kube::Client) -> anyhow::Result<String> {
@@ -951,7 +959,7 @@ mod tests {
 
     use serde_json::json;
 
-    use super::{KubeMcp, Measured, Policy, container_lines, dry_run_tools, measured, permissions};
+    use super::{KubeMcp, Measured, NEVER_ASKS, Policy, container_lines, dry_run_tools, measured, permissions};
     use crate::k8s::Kind;
 
     /// `my_permissions` names every tool whose input takes `dry_run`, and no other: a list kept
@@ -977,6 +985,16 @@ mod tests {
         // Every change but exec_command, drain_node, gitops and the port-forward tools (docs/agents.md).
         assert_eq!(take.len(), 13, "{take:?}");
         assert!(take.contains("set_image") && take.contains("cordon_node") && take.contains("debug_pod"), "{take:?}");
+    }
+
+    /// `my_permissions` says which tool never asks, by the name of a tool that only reads.
+    #[test]
+    fn my_permissions_names_the_tool_that_never_asks() {
+        let text = permissions(&Policy::default(), dry_run_tools());
+        assert!(text.contains("\nrecent_changes never asks for approval: it shows"), "{text}");
+        let tools = KubeMcp::tools().list_all();
+        let tool = tools.iter().find(|t| t.name == NEVER_ASKS).unwrap_or_else(|| panic!("no tool {NEVER_ASKS}"));
+        assert_eq!(tool.annotations.as_ref().and_then(|a| a.read_only_hint), Some(true));
     }
 
     fn kind(group: &str, kind: &str, plural: &str, namespaced: bool) -> Kind {

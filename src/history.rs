@@ -849,12 +849,20 @@ pub fn report(subject: &str, changes: &[Change], errors: &[String], limit: usize
              and events for about an hour; the app records other changes only while it watches the object.\n",
         );
     }
+    out.push_str(&change_lines(changes, limit));
+    for e in errors {
+        out.push_str(&format!("Could not read {e}\n"));
+    }
+    out
+}
+
+/// Changes as agents read them (`get_changes`, `recent_changes`), in the order given: at
+/// most `limit`, each with the lines its diff changes, then how many more there are.
+pub fn change_lines(changes: &[Change], limit: usize) -> String {
+    let mut out = String::new();
     for c in changes.iter().take(limit) {
-        let when = c.time.map_or_else(
-            || "time unknown".to_string(),
-            |t| format!("{} ({} ago)", t.strftime("%Y-%m-%d %H:%M:%SZ"), k8s::age(t)),
-        );
-        out.push_str(&format!("{when}  {}  {}: {}\n", c.source.label(), c.object, c.summary));
+        let at = c.time.map_or_else(|| "time unknown".to_string(), when);
+        out.push_str(&format!("{at}  {}  {}: {}\n", c.source.label(), c.object, c.summary));
         if let Some(d) = &c.diff {
             for line in d.short(SHORT_DIFF_LINES).lines() {
                 out.push_str(&format!("    {line}\n"));
@@ -867,10 +875,12 @@ pub fn report(subject: &str, changes: &[Change], errors: &[String], limit: usize
             crate::plural::count(changes.len() - limit, "older change")
         ));
     }
-    for e in errors {
-        out.push_str(&format!("Could not read {e}\n"));
-    }
     out
+}
+
+/// A time as agents read it: when exactly, and how long ago.
+pub fn when(t: jiff::Timestamp) -> String {
+    format!("{} ({} ago)", t.strftime("%Y-%m-%d %H:%M:%SZ"), k8s::age(t))
 }
 
 #[cfg(test)]

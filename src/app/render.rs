@@ -13,11 +13,11 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use super::{
-    AppView, CloseTab, EscapeBack, FocusFilter, GoAssistant, GoBack, GoCluster, GoForward, GoHelm, GoProblems,
-    GoSettings, GoWorkloads, NewTab, NewWindow, NextTab, OpenPalette, OpenSelected, PrevTab, RefreshPage, Route,
-    RowCopyName, RowDelete, RowEvents, RowFavorite, RowLogs, RowOpen, RowOpenTab, RowRestart, RowRun, RowScale,
-    RowShell, RowYaml, ShowShortcuts, ToggleAssistant, ToggleSidebar, ZoomIn, ZoomOut, ZoomReset, open_main_window,
-    set_theme,
+    AppView, CloseTab, CloseWindow, EscapeBack, FocusFilter, GoAssistant, GoBack, GoCluster, GoForward, GoHelm,
+    GoProblems, GoSettings, GoWorkloads, MinimizeWindow, NewTab, NextTab, OpenPalette, OpenSelected, PrevTab,
+    RefreshPage, Route, RowCopyName, RowDelete, RowEvents, RowFavorite, RowLogs, RowOpen, RowOpenTab, RowRestart,
+    RowRun, RowScale, RowShell, RowYaml, ShowAbout, ShowShortcuts, ToggleAssistant, ToggleSidebar, ZoomIn, ZoomOut,
+    ZoomReset, ZoomWindow, set_theme, with_keys,
 };
 use crate::favorites::FavObject;
 
@@ -83,6 +83,12 @@ impl Render for AppView {
 }
 
 impl AppView {
+    /// Settings, on its About section.
+    pub(super) fn show_about(&mut self, cx: &mut Context<Self>) {
+        self.settings_view.update(cx, crate::ui::settings_view::SettingsView::show_about);
+        self.navigate(Route::Settings, cx);
+    }
+
     /// Keep keyboard focus somewhere useful: when the focused element went away
     /// (e.g. the table after opening a row), the list gets it back, or the app
     /// itself so Esc, Ctrl+K and the rest keep working.
@@ -128,7 +134,7 @@ impl AppView {
                     .ghost()
                     .small()
                     .icon(if self.sidebar_hidden { Lucide::PanelLeftOpen } else { Lucide::PanelLeftClose })
-                    .tooltip("Show/hide the sidebar (Ctrl+B)")
+                    .tooltip(with_keys("Show/hide the sidebar ({secondary-b})"))
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.sidebar_hidden = !this.sidebar_hidden;
                         cx.notify();
@@ -168,7 +174,7 @@ impl AppView {
                         .ghost()
                         .small()
                         .icon(Lucide::RefreshCw)
-                        .tooltip("Refresh (F5)")
+                        .tooltip(with_keys("Refresh ({f5|secondary-r})"))
                         .on_click(cx.listener(|this, _, window, cx| this.refresh_page(window, cx))),
                 )
             })
@@ -187,7 +193,15 @@ impl AppView {
                     .text_color(theme.muted_foreground)
                     .child(Icon::new(Lucide::Search).size_4())
                     .child(div().flex_1().child("Jump to anything…"))
-                    .child(div().text_xs().px_1().rounded_sm().border_1().border_color(theme.border).child("Ctrl K"))
+                    .child(
+                        div()
+                            .text_xs()
+                            .px_1()
+                            .rounded_sm()
+                            .border_1()
+                            .border_color(theme.border)
+                            .child(with_keys("{secondary-k}")),
+                    )
                     .on_click(cx.listener(|this, _, window, cx| this.open_palette(window, cx))),
             )
             .child(write_mode_button(cx))
@@ -197,7 +211,7 @@ impl AppView {
                     .small()
                     .icon(Lucide::Sparkles)
                     .selected(self.docked_assistant().is_some())
-                    .tooltip("Ask the assistant about what is on screen (Ctrl+J)")
+                    .tooltip(with_keys("Ask the assistant about what is on screen ({secondary-j})"))
                     .on_click(cx.listener(|this, _, window, cx| this.toggle_assistant(window, cx))),
             )
             .child(
@@ -240,10 +254,7 @@ impl AppView {
                     .xsmall()
                     .label(concat!("v", env!("CARGO_PKG_VERSION")))
                     .tooltip("About Recouvrance")
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.settings_view.update(cx, crate::ui::settings_view::SettingsView::show_about);
-                        this.navigate(Route::Settings, cx);
-                    })),
+                    .on_click(cx.listener(|this, _, _, cx| this.show_about(cx))),
             )
     }
 
@@ -411,10 +422,14 @@ impl AppView {
 
     /// The window's keyboard actions.
     fn with_actions(&self, app: Stateful<Div>, cx: &mut Context<Self>) -> Stateful<Div> {
+        // New window, Quit and the other app-wide actions are handled without a window (`menus`).
         app.on_action(cx.listener(|this, _: &OpenPalette, window, cx| this.open_palette(window, cx)))
-            .on_action(|_: &NewWindow, _, cx| open_main_window(cx))
             .on_action(cx.listener(|this, _: &NewTab, window, cx| this.new_tab(None, window, cx)))
-            .on_action(cx.listener(|this, _: &CloseTab, window, cx| this.close_tab(this.active_tab, window, cx)))
+            .on_action(cx.listener(|this, _: &CloseTab, window, cx| this.close_tab_or_window(window, cx)))
+            .on_action(|_: &CloseWindow, window, _| window.remove_window())
+            .on_action(|_: &MinimizeWindow, window, _| window.minimize_window())
+            .on_action(|_: &ZoomWindow, window, _| window.zoom_window())
+            .on_action(cx.listener(|this, _: &ShowAbout, _, cx| this.show_about(cx)))
             .on_action(cx.listener(|this, _: &NextTab, window, cx| {
                 let n = this.tabs.len();
                 this.switch_tab((this.active_tab + 1) % n, window, cx);
