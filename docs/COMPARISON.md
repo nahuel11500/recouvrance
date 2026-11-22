@@ -53,7 +53,7 @@ welcome: open an issue or a pull request.
 | Helm install from repos | – | ✓ | plugin | ✓ search your repos, pick a version, edit values, server dry run |
 | Map / relations | links between related objects | extension | ✓ | ✓ per object |
 | Command palette | ✓ | ✓ | ✓ global search: objects, clusters, pages | ✓ across clusters |
-| Keyboard navigation | ✓ | partial | partial | ✓ ↑ ↓ Enter Esc / Ctrl+K |
+| Keyboard navigation | ✓ | partial | partial | ✓ ↑ ↓ Enter Esc / Ctrl+K (⌘K on macOS) |
 | Multiple windows / tabs | ✓ both | dock tabs only (terminals, logs, editors) | activities (details, logs, shells, editors) | ✓ both |
 | Kubeconfig folders, reload on change | folders, reloaded with a button | ✓ | ✓ | ✓ contexts with the same name kept apart |
 | AI | – | extensions: AI chat, Claude chat, coding agents in a terminal | plugin: assistant chat, diagnosis of warning events, MCP servers as tools (desktop) | ✓ assistant chat beside any page (Claude, through your Claude Code login or an API key), under the agents' rules; an MCP server and prompts for your own agents |
