@@ -10,6 +10,7 @@ use gpui_kit::component::notification::Notification;
 use gpui_kit::*;
 
 use super::{ConfirmButtons as _, DetailPanel, Guard, WriteFuture, confirm_extras, guard_ok, kubectl, shell_word};
+use crate::k8s::argo::diagnosis::Res;
 use crate::k8s::argo::{Hub, Lookup};
 use crate::k8s::{self, ObjectRef};
 
@@ -137,15 +138,15 @@ pub struct OpenOnContext {
 
 impl EventEmitter<OpenOnContext> for DetailPanel {}
 
-/// Ask the app to open a namespace on a context, connected or not: where an Application
-/// deploys.
+/// Ask the app to open an object on a context, connected or not: where an Application
+/// deploys (its namespace), and what it deploys there.
 #[derive(Clone)]
-pub struct OpenNamespace {
+pub struct OpenOn {
     pub context: String,
-    pub namespace: String,
+    pub res: Res,
 }
 
-impl EventEmitter<OpenNamespace> for DetailPanel {}
+impl EventEmitter<OpenOn> for DetailPanel {}
 
 impl DetailPanel {
     /// The read of the Argo CD section for the object as last read; None once it is gone.
@@ -231,8 +232,14 @@ impl DetailPanel {
     pub fn open_destination(&mut self, cx: &mut Context<Self>) {
         let Some((dest, Some(context))) = self.related.argo_destination.clone() else { return };
         if !dest.namespace.is_empty() {
-            cx.emit(OpenNamespace { context, namespace: dest.namespace });
+            cx.emit(OpenOn { context, res: Res::namespace(&dest.namespace) });
         }
+    }
+
+    /// Show the Application's resources out of sync or unhealthy alone, or all of them again.
+    pub fn toggle_argo_attention(&mut self, cx: &mut Context<Self>) {
+        self.argo_resources.alone = !self.argo_resources.alone;
+        cx.notify();
     }
 }
 
