@@ -794,7 +794,12 @@ pub(super) fn pdb_page(ctx: &Ctx, cx: &App) -> Div {
 
 /// Whether a PodDisruptionBudget stops evictions now: none allowed, with pods to protect.
 pub(crate) fn pdb_blocks(obj: &Value) -> bool {
-    n(obj, "/status/disruptionsAllowed").unwrap_or(0) == 0 && n(obj, "/status/expectedPods").unwrap_or(0) > 0
+    blocks_evictions(n(obj, "/status/disruptionsAllowed").unwrap_or(0), n(obj, "/status/expectedPods").unwrap_or(0))
+}
+
+/// `pdb_blocks` from a budget's status: the disruptions it allows now, and the pods it expects.
+pub(crate) fn blocks_evictions(allowed: i64, expected: i64) -> bool {
+    allowed == 0 && expected > 0
 }
 
 /// VerticalPodAutoscaler: recommendations next to the target's current requests.

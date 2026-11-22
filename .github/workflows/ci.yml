@@ -147,6 +147,13 @@ jobs:
           grep -q "^kinds=" smoke.txt
           grep -q "^rows=" smoke.txt
           RECOUVRANCE_SMOKE=kind-recouvrance RECOUVRANCE_LISTTIME=1 target/ci/recouvrance
+          # The Workloads overview's lean requests (cells alone, lists from the cache), as a real
+          # API server answers them. kind has no metrics-server: only usage may fail.
+          RECOUVRANCE_SMOKE=kind-recouvrance RECOUVRANCE_DASH=1 target/ci/recouvrance | tee dash.txt
+          grep -qE "Deployments: [0-9]+ Running" dash.txt
+          grep -qE "Pods: [0-9]+ Running" dash.txt
+          grep -q "warnings: " dash.txt
+          if grep -E ": (failed: |forbidden)|(warnings|pods) failed" dash.txt; then exit 1; fi
       - name: Write guards (write mode, agent rules, kill switch during a drain)
         env:
           XDG_CONFIG_HOME: ${{ runner.temp }}/guards-config

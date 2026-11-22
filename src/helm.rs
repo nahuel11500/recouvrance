@@ -14,7 +14,7 @@ use serde_json::Value;
 use crate::k8s;
 
 /// Helm's Secrets of current revisions (not the whole history).
-const CURRENT: &str = "owner=helm,status!=superseded";
+pub(crate) const CURRENT: &str = "owner=helm,status!=superseded";
 /// Releases read per request while the list fills in.
 const FILL_PAGE: u32 = 100;
 

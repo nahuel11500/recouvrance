@@ -10,10 +10,8 @@ use k8s_openapi::api::{
     apps::v1 as apps, autoscaling::v2 as autoscaling, batch::v1 as batch, core::v1 as core, policy::v1 as policy,
 };
 use kube::Client;
-use serde_json::Value;
 
 use crate::details::OpenObject;
-use crate::json::{str_or_empty as st, time_at as ts};
 use crate::k8s;
 use crate::status::Tone;
 
@@ -82,11 +80,8 @@ struct ClusterState {
     usage_error: Option<String>,
 }
 
-struct Warning {
-    reason: String,
-    count: i64,
-    last: jiff::Timestamp,
-}
+/// Warning events of one reason: how many times, and when last.
+type Warning = k8s::WarningReason;
 
 #[derive(Clone)]
 struct Restart {
@@ -259,13 +254,13 @@ impl Dashboard {
     }
 }
 
-/// Objects of a kind, or why they could not be listed ("forbidden", "failed: …").
-async fn list(client: &Client, ar: kube::discovery::ApiResource, ns: Option<&str>) -> Result<Vec<Value>, String> {
-    k8s::list_values(client.clone(), ar, ns.map(String::from), None).await.map_err(|e| k8s::lists::load_error(&e))
-}
-
-fn n(v: &Value, p: &str) -> i64 {
-    v.pointer(p).and_then(Value::as_i64).unwrap_or(0)
+/// Objects of a kind with only the fields `T` keeps, from the API server's cache, or why they
+/// could not be listed ("forbidden", "failed: …").
+async fn read_lean<T>(client: &Client, ar: kube::discovery::ApiResource, ns: Option<&str>) -> Result<Vec<T>, String>
+where
+    T: serde::de::DeserializeOwned + Send + 'static,
+{
+    k8s::lists::list_lean_cached(client.clone(), ar, ns.map(String::from)).await.map_err(|e| k8s::lists::load_error(&e))
 }
 
 fn tally<L: Into<String>>(items: impl Iterator<Item = (L, Tone)>) -> Vec<(String, usize, Tone)> {
@@ -306,18 +301,19 @@ impl Tbl {
 }
 
 /// kubectl's table for a kind, or why it could not be listed ("forbidden", "failed: …").
-/// A kind's rows for its counts; `with_namespaces` when each row needs its namespace too.
+/// A kind's rows for its counts, from their cells alone; `named_over`: rows need their
+/// namespace when there are more than that many.
 async fn table(
     client: Client,
     ar: kube::discovery::ApiResource,
     ns: Option<String>,
-    with_namespaces: bool,
+    named_over: Option<usize>,
 ) -> Result<Tbl, String> {
     #[cfg(feature = "dev")]
     let (started, plural) = (std::time::Instant::now(), ar.plural.clone());
     let kind = k8s::Kind { ar, namespaced: true, section: "", label: String::new() };
-    // Counts and restarts need only the cells: big lists come without their objects.
-    let result = k8s::list_light(client, kind, ns, with_namespaces, None).await;
+    // Counts and restarts read the cells only: no object's metadata, however small the list.
+    let result = k8s::list_cells(client, kind, ns, named_over).await;
     #[cfg(feature = "dev")]
     if std::env::var("RECOUVRANCE_DEBUG").is_ok() {
         eprintln!("table {plural}: {:?} rows={:?}", started.elapsed(), result.as_ref().map(|r| r.1.len()));
@@ -350,8 +346,8 @@ fn pod_counts(pods: &Tbl) -> Vec<(String, usize, Tone)> {
     }))
 }
 
-/// The parts of a pod `pod_details` reads: managed fields, volumes and the rest are skipped
-/// while parsing, which matters at thousands of pods.
+/// The parts of a pod `pod_details` reads: managed fields, env, volumes, probes and the rest
+/// are skipped while parsing, never held, which matters at thousands of pods.
 #[derive(serde::Deserialize, Default)]
 #[serde(default)]
 struct PodDetail {
@@ -370,13 +366,43 @@ struct PodMeta {
 #[derive(serde::Deserialize, Default)]
 #[serde(default)]
 struct PodSpecLite {
-    containers: Vec<Value>,
+    containers: Vec<ContainerLite>,
+}
+
+/// A container's name and limits.
+#[derive(serde::Deserialize, Default)]
+#[serde(default)]
+struct ContainerLite {
+    name: String,
+    resources: k8s::podspec::LeanResources,
 }
 
 #[derive(serde::Deserialize, Default)]
 #[serde(default, rename_all = "camelCase")]
 struct PodStatusLite {
-    container_statuses: Vec<Value>,
+    container_statuses: Vec<ContainerStatusLite>,
+}
+
+/// A container's restarts, and how it last ended.
+#[derive(serde::Deserialize, Default)]
+#[serde(default, rename_all = "camelCase")]
+struct ContainerStatusLite {
+    name: String,
+    restart_count: i64,
+    last_state: LastState,
+}
+
+#[derive(serde::Deserialize, Default)]
+#[serde(default)]
+struct LastState {
+    terminated: Option<Terminated>,
+}
+
+#[derive(serde::Deserialize, Default)]
+#[serde(default, rename_all = "camelCase")]
+struct Terminated {
+    finished_at: Option<String>,
+    reason: Option<String>,
 }
 
 /// What `pod_details` found: restarts, containers near their limits, and why usage could
@@ -391,11 +417,8 @@ async fn pod_details(client: &Client, ns: Option<&str>, context: &str) -> Result
         }
         k8s::pod_usage(client.clone(), ns.map(String::from), None).await.map(|(u, _)| u)
     };
-    let pods = async {
-        k8s::lists::list_lean::<PodDetail>(client.clone(), k8s::ar_of::<core::Pod>(), ns.map(String::from))
-            .await
-            .map_err(|e| k8s::lists::load_error(&e))
-    };
+    // From the API server's cache: a moment old at worst, which the next refresh catches up.
+    let pods = read_lean::<PodDetail>(client, k8s::ar_of::<core::Pod>(), ns);
     let (pods, usage) = futures::join!(pods, usage);
     let pods = pods?;
     let (usage, usage_error) = match usage {
@@ -403,36 +426,48 @@ async fn pod_details(client: &Client, ns: Option<&str>, context: &str) -> Result
         Err(e) => (k8s::PodContainerUsage::new(), Some(unchecked_why(&e))),
     };
     let hour_ago = jiff::Timestamp::now() - jiff::SignedDuration::from_secs(3600);
+    let (restarts, hot) = restarts_and_hot(&pods, &usage, context, hour_ago);
+    Ok((restarts, hot, usage_error))
+}
+
+/// The containers of `pods` that ended at `since` or later, newest first, and those using more
+/// than 95% of a CPU or memory limit by `usage`.
+fn restarts_and_hot(
+    pods: &[PodDetail],
+    usage: &k8s::PodContainerUsage,
+    context: &str,
+    since: jiff::Timestamp,
+) -> (Vec<Restart>, Vec<Hot>) {
     let (mut restarts, mut hot) = (Vec::new(), Vec::new());
-    for p in &pods {
+    for p in pods {
         let key = (p.metadata.namespace.clone(), p.metadata.name.clone());
         let usage = usage.get(&key);
         let (namespace, pod) = key;
         for c in &p.status.container_statuses {
-            if let Some(when) = ts(c, "/lastState/terminated/finishedAt").filter(|t| *t >= hour_ago) {
-                restarts.push(Restart {
-                    context: context.to_string(),
-                    namespace: namespace.clone(),
-                    pod: pod.clone(),
-                    container: st(c, "/name").into(),
-                    reason: st(c, "/lastState/terminated/reason").into(),
-                    count: n(c, "/restartCount"),
-                    when,
-                });
-            }
+            let Some(end) = &c.last_state.terminated else { continue };
+            let ended = end.finished_at.as_deref().and_then(|t| t.parse::<jiff::Timestamp>().ok());
+            let Some(when) = ended.filter(|t| *t >= since) else { continue };
+            restarts.push(Restart {
+                context: context.to_string(),
+                namespace: namespace.clone(),
+                pod: pod.clone(),
+                container: c.name.clone(),
+                reason: end.reason.clone().unwrap_or_default(),
+                count: c.restart_count,
+                when,
+            });
         }
         for c in &p.spec.containers {
-            let name = st(c, "/name");
-            let Some(&(cpu, mem)) = usage.and_then(|u| u.get(name)) else { continue };
-            let cpu_limit = c.pointer("/resources/limits/cpu").and_then(Value::as_str).map(k8s::parse_cpu);
-            let mem_limit = c.pointer("/resources/limits/memory").and_then(Value::as_str).map(k8s::parse_bytes);
+            let Some(&(cpu, mem)) = usage.and_then(|u| u.get(&c.name)) else { continue };
+            let cpu_limit = c.resources.limits.get("cpu").map(String::as_str).map(k8s::parse_cpu);
+            let mem_limit = c.resources.limits.get("memory").map(String::as_str).map(k8s::parse_bytes);
             let near = |v: f64, l: Option<f64>| l.is_some_and(|l| l > 0.0 && v >= 0.95 * l);
             if near(cpu, cpu_limit) || near(mem, mem_limit) {
                 hot.push(Hot {
                     context: context.to_string(),
                     namespace: namespace.clone(),
                     pod: pod.clone(),
-                    container: name.into(),
+                    container: c.name.clone(),
                     cpu: (cpu, cpu_limit),
                     mem: (mem, mem_limit),
                 });
@@ -440,7 +475,7 @@ async fn pod_details(client: &Client, ns: Option<&str>, context: &str) -> Result
         }
     }
     restarts.sort_by_key(|r| std::cmp::Reverse(r.when));
-    Ok((restarts, hot, usage_error))
+    (restarts, hot)
 }
 
 /// Why limits were not checked: metrics-server missing, unavailable, refused or failing.
@@ -486,7 +521,8 @@ async fn load(client: Client, ns: Option<String>, context: String, tx: futures::
     let slot = |kind: &str| SLOTS.iter().position(|(_, k)| *k == kind).unwrap_or(0);
 
     let pods = async {
-        let t = match table(c(), k8s::ar_of::<core::Pod>(), ns.clone(), true).await {
+        // Beyond `FULL_POD_LIMIT` pods, restarts come from the rows: they need their namespace.
+        let t = match table(c(), k8s::ar_of::<core::Pod>(), ns.clone(), Some(FULL_POD_LIMIT)).await {
             Ok(t) => t,
             Err(e) => {
                 send(Piece::Kind(slot("pods"), Err(e.clone())));
@@ -521,7 +557,7 @@ async fn load(client: Client, ns: Option<String>, context: String, tx: futures::
         let client = c();
         let ns = ns.clone();
         async move {
-            let t = table(client, ar, ns, false).await;
+            let t = table(client, ar, ns, None).await;
             send(Piece::Kind(
                 slot(kind),
                 t.map(|t| {
@@ -537,7 +573,7 @@ async fn load(client: Client, ns: Option<String>, context: String, tx: futures::
         let client = c();
         let ns = ns.clone();
         async move {
-            let t = table(client, ar, ns, false).await;
+            let t = table(client, ar, ns, None).await;
             send(Piece::Kind(
                 slot(kind),
                 t.map(|t| {
@@ -551,13 +587,15 @@ async fn load(client: Client, ns: Option<String>, context: String, tx: futures::
         }
     };
     let helm = async {
-        let releases = k8s::list_labels(c(), k8s::ar_of::<core::Secret>(), ns.clone(), "owner=helm".into())
+        // The current revisions only, as the Helm page lists them: a release's newest revision is
+        // never superseded, and the older ones are most of Helm's Secrets.
+        let releases = k8s::list_labels(c(), k8s::ar_of::<core::Secret>(), ns.clone(), crate::helm::CURRENT.into())
             .await
             .map_err(|e| k8s::lists::load_error(&e));
         send(Piece::Kind(slot("secrets"), releases.map(|r| helm_counts(&r))));
     };
     let cronjobs = async {
-        let t = table(c(), k8s::ar_of::<batch::CronJob>(), ns.clone(), false).await;
+        let t = table(c(), k8s::ar_of::<batch::CronJob>(), ns.clone(), None).await;
         send(Piece::Kind(
             slot("cronjobs"),
             t.map(|t| {
@@ -568,7 +606,7 @@ async fn load(client: Client, ns: Option<String>, context: String, tx: futures::
         ));
     };
     let jobs = async {
-        let t = table(c(), k8s::ar_of::<batch::Job>(), ns.clone(), false).await;
+        let t = table(c(), k8s::ar_of::<batch::Job>(), ns.clone(), None).await;
         send(Piece::Kind(
             slot("jobs"),
             t.map(|t| {
@@ -588,15 +626,16 @@ async fn load(client: Client, ns: Option<String>, context: String, tx: futures::
         ));
     };
     let hpas = async {
-        let hpas = list(&client, k8s::ar_of::<autoscaling::HorizontalPodAutoscaler>(), ns.as_deref()).await;
+        let hpas =
+            read_lean::<HpaLite>(&client, k8s::ar_of::<autoscaling::HorizontalPodAutoscaler>(), ns.as_deref()).await;
         send(Piece::Kind(slot("horizontalpodautoscalers"), hpas.map(|hpas| hpa_counts(&hpas))));
     };
     let pdbs = async {
-        let pdbs = list(&client, k8s::ar_of::<policy::PodDisruptionBudget>(), ns.as_deref()).await;
+        let pdbs = read_lean::<PdbLite>(&client, k8s::ar_of::<policy::PodDisruptionBudget>(), ns.as_deref()).await;
         send(Piece::Kind(slot("poddisruptionbudgets"), pdbs.map(|pdbs| pdb_counts(&pdbs))));
     };
     let pvcs = async {
-        let t = table(c(), k8s::ar_of::<core::PersistentVolumeClaim>(), ns.clone(), false).await;
+        let t = table(c(), k8s::ar_of::<core::PersistentVolumeClaim>(), ns.clone(), None).await;
         send(Piece::Kind(
             slot("persistentvolumeclaims"),
             t.map(|t| {
@@ -609,13 +648,13 @@ async fn load(client: Client, ns: Option<String>, context: String, tx: futures::
         ));
     };
     let warnings = async {
-        let events =
-            k8s::list_values_fields(c(), k8s::ar_of::<core::Event>(), ns.clone(), None, Some("type=Warning".into()))
-                .await
-                .map_err(|e| k8s::lists::load_error(&e));
-        send(Piece::Warnings(events.as_deref().map_or_default(recent_warnings)));
-        if let Err(e) = events {
-            send(Piece::Failed(Section::Warnings, e));
+        let hour_ago = jiff::Timestamp::now() - jiff::SignedDuration::from_secs(3600);
+        match k8s::warning_reasons(c(), ns.clone(), hour_ago).await {
+            Ok(reasons) => send(Piece::Warnings(reasons)),
+            Err(e) => {
+                send(Piece::Warnings(Vec::new()));
+                send(Piece::Failed(Section::Warnings, k8s::lists::load_error(&e)));
+            }
         }
     };
     futures::join!(
@@ -657,46 +696,31 @@ fn helm_counts(releases: &[(Option<String>, BTreeMap<String, String>)]) -> Vec<(
     }))
 }
 
-/// Warning events of the last hour, by reason, most frequent first.
-fn recent_warnings(events: &[Value]) -> Vec<Warning> {
-    let hour_ago = jiff::Timestamp::now() - jiff::SignedDuration::from_secs(3600);
-    let mut by_reason: BTreeMap<String, Warning> = BTreeMap::new();
-    for e in events {
-        // Events recorded through events.k8s.io keep their repeats in `series`.
-        let Some(last) = ts(e, "/series/lastObservedTime")
-            .or_else(|| ts(e, "/lastTimestamp"))
-            .or_else(|| ts(e, "/eventTime"))
-            .or_else(|| ts(e, "/metadata/creationTimestamp"))
-        else {
-            continue;
-        };
-        if last < hour_ago {
-            continue;
-        }
-        let w = by_reason.entry(st(e, "/reason").to_string()).or_insert(Warning {
-            reason: st(e, "/reason").into(),
-            count: 0,
-            last,
-        });
-        w.count += n(e, "/series/count").max(n(e, "/count")).max(1);
-        w.last = w.last.max(last);
-    }
-    let mut warnings: Vec<Warning> = by_reason.into_values().collect();
-    warnings.sort_by_key(|w| std::cmp::Reverse(w.count));
-    warnings
+/// An HPA's conditions: all the overview reads of it.
+#[derive(serde::Deserialize, Default)]
+#[serde(default)]
+struct HpaLite {
+    status: HpaStatusLite,
+}
+
+#[derive(serde::Deserialize, Default)]
+#[serde(default)]
+struct HpaStatusLite {
+    conditions: Vec<ConditionLite>,
+}
+
+#[derive(serde::Deserialize, Default)]
+#[serde(default)]
+struct ConditionLite {
+    #[serde(rename = "type")]
+    type_: String,
+    status: String,
 }
 
 /// HPAs by whether they are scaling freely, limited, or unknown.
-fn hpa_counts(hpas: &[Value]) -> Vec<(String, usize, Tone)> {
+fn hpa_counts(hpas: &[HpaLite]) -> Vec<(String, usize, Tone)> {
     tally(hpas.iter().map(|h| {
-        let cond = |t: &str| {
-            h.pointer("/status/conditions")
-                .and_then(Value::as_array)
-                .and_then(|cs| cs.iter().find(|c| c["type"].as_str() == Some(t)))
-                .and_then(|c| c["status"].as_str())
-                .unwrap_or("Unknown")
-                .to_string()
-        };
+        let cond = |t: &str| h.status.conditions.iter().find(|c| c.type_ == t).map_or("Unknown", |c| c.status.as_str());
         if cond("ScalingLimited") == "True" {
             ("ScalingLimited", Tone::Busy)
         } else if cond("ScalingActive") == "True" {
@@ -707,12 +731,27 @@ fn hpa_counts(hpas: &[Value]) -> Vec<(String, usize, Tone)> {
     }))
 }
 
+/// A budget's status numbers: all the overview reads of it.
+#[derive(serde::Deserialize, Default)]
+#[serde(default)]
+struct PdbLite {
+    status: PdbStatusLite,
+}
+
+#[derive(serde::Deserialize, Default)]
+#[serde(default, rename_all = "camelCase")]
+struct PdbStatusLite {
+    disruptions_allowed: Option<i64>,
+    expected_pods: Option<i64>,
+}
+
 /// PodDisruptionBudgets by whether they block evictions now. One that covers no pods blocks nothing.
-fn pdb_counts(pdbs: &[Value]) -> Vec<(String, usize, Tone)> {
+fn pdb_counts(pdbs: &[PdbLite]) -> Vec<(String, usize, Tone)> {
     tally(pdbs.iter().map(|p| {
-        if crate::overview::pdb_blocks(p) {
+        let (allowed, expected) = (p.status.disruptions_allowed.unwrap_or(0), p.status.expected_pods.unwrap_or(0));
+        if crate::overview::blocks_evictions(allowed, expected) {
             ("InsufficientPods", Tone::Bad)
-        } else if n(p, "/status/expectedPods") == 0 {
+        } else if expected == 0 {
             ("NoPods", Tone::Done)
         } else {
             ("DisruptionAllowed", Tone::Good)
@@ -1048,12 +1087,25 @@ fn describe(piece: &Piece) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{Tbl, Tone, pdb_counts, pod_counts, recent_warnings, restart_ago};
+    use std::collections::BTreeMap;
+    use std::sync::{Arc, Mutex};
+
+    use futures::StreamExt as _;
+    use proptest::prelude::*;
+    use serde_json::{Value, json};
+
+    use super::{
+        Counts, HpaLite, PdbLite, Piece, PodDetail, SLOTS, Tbl, Tone, helm_counts, hpa_counts, pdb_counts, pod_counts,
+        restart_ago, restarts_and_hot, tally,
+    };
     use crate::k8s;
 
     #[test]
     fn pdb_without_pods_is_not_bad() {
-        let pdb = |allowed: i64, expected: i64| serde_json::json!({"status": {"disruptionsAllowed": allowed, "expectedPods": expected}});
+        let pdb = |allowed: i64, expected: i64| -> PdbLite {
+            serde_json::from_value(json!({"status": {"disruptionsAllowed": allowed, "expectedPods": expected}}))
+                .unwrap()
+        };
         let mut counts = pdb_counts(&[pdb(0, 0), pdb(0, 2), pdb(1, 3)]);
         counts.sort_by(|a, b| a.0.cmp(&b.0));
         assert_eq!(
@@ -1070,7 +1122,7 @@ mod tests {
     fn pod_counts_follow_status_tones() {
         let defs = vec![k8s::ColumnDef { name: "Status".into(), priority: 0 }];
         let row = |status: &str| {
-            std::sync::Arc::new(k8s::Row {
+            Arc::new(k8s::Row {
                 uid: status.into(),
                 name: status.into(),
                 namespace: None,
@@ -1100,24 +1152,628 @@ mod tests {
     }
 
     #[test]
-    fn warnings_count_event_series() {
-        let now = jiff::Timestamp::now();
-        let two_hours_ago = (now - jiff::SignedDuration::from_secs(7200)).to_string();
-        let events = vec![serde_json::json!({
-            "reason": "FailedScheduling",
-            "eventTime": two_hours_ago,
-            "metadata": {"creationTimestamp": two_hours_ago},
-            "series": {"count": 120, "lastObservedTime": now.to_string()},
-        })];
-        let w = recent_warnings(&events);
-        assert_eq!(w.len(), 1);
-        assert_eq!((w[0].reason.as_str(), w[0].count), ("FailedScheduling", 120));
-    }
-
-    #[test]
     fn parses_restart_ages() {
         assert_eq!(restart_ago("3 (12m ago)").unwrap().as_secs(), 720);
         assert_eq!(restart_ago("1 (2d4h ago)").unwrap().as_secs(), 2 * 86400 + 4 * 3600);
         assert!(restart_ago("0").is_none());
+    }
+
+    /// How the overview counted whole HPAs before it read them lean.
+    fn hpa_counts_of_values(hpas: &[Value]) -> Counts {
+        tally(hpas.iter().map(|h| {
+            let cond = |t: &str| {
+                h.pointer("/status/conditions")
+                    .and_then(Value::as_array)
+                    .and_then(|cs| cs.iter().find(|c| c["type"].as_str() == Some(t)))
+                    .and_then(|c| c["status"].as_str())
+                    .unwrap_or("Unknown")
+                    .to_string()
+            };
+            if cond("ScalingLimited") == "True" {
+                ("ScalingLimited", Tone::Busy)
+            } else if cond("ScalingActive") == "True" {
+                ("AtTarget", Tone::Good)
+            } else {
+                ("Unknown", Tone::Busy)
+            }
+        }))
+    }
+
+    /// How the overview counted whole budgets before it read them lean.
+    fn pdb_counts_of_values(pdbs: &[Value]) -> Counts {
+        let n = |v: &Value, p: &str| v.pointer(p).and_then(Value::as_i64).unwrap_or(0);
+        tally(pdbs.iter().map(|p| {
+            if crate::overview::pdb_blocks(p) {
+                ("InsufficientPods", Tone::Bad)
+            } else if n(p, "/status/expectedPods") == 0 {
+                ("NoPods", Tone::Done)
+            } else {
+                ("DisruptionAllowed", Tone::Good)
+            }
+        }))
+    }
+
+    /// An HPA as the API server sends it: conditions of these types and statuses (or without
+    /// one), maybe no conditions or no status at all, and fields the overview never reads.
+    fn whole_hpa() -> impl Strategy<Value = Value> {
+        const TYPES: [&str; 4] = ["ScalingLimited", "ScalingActive", "AbleToScale", ""];
+        const STATUSES: [&str; 4] = ["True", "False", "Unknown", ""];
+        let condition = (0..TYPES.len(), 0..STATUSES.len()).prop_map(|(t, s)| {
+            let mut c = json!({"reason": "R", "message": "m", "lastTransitionTime": "2026-01-01T00:00:00Z"});
+            if !TYPES[t].is_empty() {
+                c["type"] = TYPES[t].into();
+            }
+            if !STATUSES[s].is_empty() {
+                c["status"] = STATUSES[s].into();
+            }
+            c
+        });
+        prop::option::of(prop::option::of(prop::collection::vec(condition, 0..4))).prop_map(|status| {
+            let mut h = json!({"metadata": {"name": "web", "managedFields": [{"manager": "kube-controller-manager"}]},
+                "spec": {"minReplicas": 1, "maxReplicas": 5}});
+            match status {
+                None => {}
+                Some(None) => h["status"] = json!({"currentReplicas": 1}),
+                Some(Some(conditions)) => h["status"] = json!({"currentReplicas": 1, "conditions": conditions}),
+            }
+            h
+        })
+    }
+
+    /// A budget as the API server sends it, its numbers maybe missing, or its whole status.
+    fn whole_pdb() -> impl Strategy<Value = Value> {
+        (prop::option::of(0i64..3), prop::option::of(0i64..3), any::<bool>()).prop_map(|(allowed, expected, status)| {
+            let mut p = json!({"metadata": {"name": "web"}, "spec": {"minAvailable": 1}});
+            if status {
+                p["status"] = json!({"currentHealthy": 1, "desiredHealthy": 1, "observedGeneration": 2});
+                if let Some(a) = allowed {
+                    p["status"]["disruptionsAllowed"] = a.into();
+                }
+                if let Some(e) = expected {
+                    p["status"]["expectedPods"] = e.into();
+                }
+            }
+            p
+        })
+    }
+
+    /// 2026-01-01T03:00:00Z: containers of `pods_and_usage` ended in the two hours before.
+    fn base() -> jiff::Timestamp {
+        jiff::Timestamp::from_second(1_767_236_400).unwrap()
+    }
+
+    /// Pods as the API server sends them, with usage for some of their containers: containers
+    /// `c0`..`c2` with or without limits, statuses that ended minutes before `base` (or never,
+    /// or at a time that doesn't read), and fields the overview never reads.
+    fn pods_and_usage() -> impl Strategy<Value = (Vec<Value>, k8s::PodContainerUsage)> {
+        // (name, CPU limit in millicores, memory limit in MiB, usage of both)
+        let container = (
+            0usize..3,
+            prop::option::of(1u32..2000),
+            prop::option::of(1u32..2000),
+            prop::option::of((0u32..2000, 0u32..2000)),
+        );
+        // (name, restarts, when it ended in minutes before `base`, its reason, whether that time reads)
+        let status = (0usize..3, 0i64..20, prop::option::of((0i64..120, 0usize..3, any::<bool>())));
+        let pod = (0usize..2, prop::collection::vec(container, 0..3), prop::collection::vec(status, 0..3));
+        prop::collection::vec(pod, 0..6).prop_map(|pods| {
+            const REASONS: [&str; 3] = ["OOMKilled", "Error", "Completed"];
+            let mut usage = k8s::PodContainerUsage::new();
+            let mut values = Vec::new();
+            for (i, (ns, containers, statuses)) in pods.into_iter().enumerate() {
+                let (namespace, name) = (format!("ns{ns}"), format!("pod{i}"));
+                let mut specs = Vec::new();
+                for (c, cpu, mem, used) in containers {
+                    let mut limits = serde_json::Map::new();
+                    if let Some(cpu) = cpu {
+                        limits.insert("cpu".into(), format!("{cpu}m").into());
+                    }
+                    if let Some(mem) = mem {
+                        limits.insert("memory".into(), format!("{mem}Mi").into());
+                    }
+                    if let Some((cpu, mem)) = used {
+                        let at = usage.entry((namespace.clone(), name.clone())).or_default();
+                        at.insert(format!("c{c}"), (f64::from(cpu), f64::from(mem) * 1024.0 * 1024.0));
+                    }
+                    specs.push(json!({"name": format!("c{c}"), "image": "app:1", "env": [{"name": "A", "value": "b"}],
+                        "resources": {"limits": limits, "requests": {"cpu": "10m"}},
+                        "volumeMounts": [{"name": "v", "mountPath": "/v"}]}));
+                }
+                let states: Vec<Value> = statuses
+                    .into_iter()
+                    .map(|(c, restarts, ended)| {
+                        let last = match ended {
+                            Some((ago, reason, reads)) => {
+                                let at = (base() - jiff::SignedDuration::from_mins(ago)).to_string();
+                                let at = if reads { at } else { "a while ago".to_string() };
+                                json!({"terminated": {"exitCode": 1, "reason": REASONS[reason], "finishedAt": at}})
+                            }
+                            None => json!({}),
+                        };
+                        json!({"name": format!("c{c}"), "restartCount": restarts, "ready": true, "lastState": last,
+                            "state": {"running": {"startedAt": "2026-01-01T00:00:00Z"}}})
+                    })
+                    .collect();
+                values.push(json!({
+                    "metadata": {"name": name, "namespace": namespace, "managedFields": [{"manager": "kubelet"}]},
+                    "spec": {"containers": specs, "nodeName": "node-1"},
+                    "status": {"phase": "Running", "containerStatuses": states},
+                }));
+            }
+            (values, usage)
+        })
+    }
+
+    /// Restarts as (namespace, pod, container, reason, count, when) and containers near their
+    /// limits as (namespace, pod, container, CPU, memory).
+    type Found = (
+        Vec<(String, String, String, String, i64, jiff::Timestamp)>,
+        Vec<(String, String, String, (f64, Option<f64>), (f64, Option<f64>))>,
+    );
+
+    /// A pod as the overview read it before: each container and its status a JSON tree.
+    #[derive(serde::Deserialize, Default)]
+    #[serde(default)]
+    struct OldPod {
+        metadata: OldMeta,
+        spec: OldSpec,
+        status: OldStatus,
+    }
+
+    #[derive(serde::Deserialize, Default)]
+    #[serde(default)]
+    struct OldMeta {
+        name: String,
+        namespace: String,
+    }
+
+    #[derive(serde::Deserialize, Default)]
+    #[serde(default)]
+    struct OldSpec {
+        containers: Vec<Value>,
+    }
+
+    #[derive(serde::Deserialize, Default)]
+    #[serde(default, rename_all = "camelCase")]
+    struct OldStatus {
+        container_statuses: Vec<Value>,
+    }
+
+    /// What the overview found in whole pods before it read them lean.
+    fn found_in_values(pods: &[Value], usage: &k8s::PodContainerUsage, since: jiff::Timestamp) -> Found {
+        use crate::json::{i64_at, str_or_empty as st, time_at as ts};
+        let pods: Vec<OldPod> = pods.iter().map(|p| serde_json::from_value(p.clone()).unwrap()).collect();
+        let (mut restarts, mut hot) = (Vec::new(), Vec::new());
+        for p in &pods {
+            let key = (p.metadata.namespace.clone(), p.metadata.name.clone());
+            let usage = usage.get(&key);
+            let (namespace, pod) = key;
+            for c in &p.status.container_statuses {
+                if let Some(when) = ts(c, "/lastState/terminated/finishedAt").filter(|t| *t >= since) {
+                    let reason = st(c, "/lastState/terminated/reason").to_string();
+                    let count = i64_at(c, "/restartCount").unwrap_or(0);
+                    restarts.push((namespace.clone(), pod.clone(), st(c, "/name").to_string(), reason, count, when));
+                }
+            }
+            for c in &p.spec.containers {
+                let name = st(c, "/name");
+                let Some(&(cpu, mem)) = usage.and_then(|u| u.get(name)) else { continue };
+                let cpu_limit = c.pointer("/resources/limits/cpu").and_then(Value::as_str).map(k8s::parse_cpu);
+                let mem_limit = c.pointer("/resources/limits/memory").and_then(Value::as_str).map(k8s::parse_bytes);
+                let near = |v: f64, l: Option<f64>| l.is_some_and(|l| l > 0.0 && v >= 0.95 * l);
+                if near(cpu, cpu_limit) || near(mem, mem_limit) {
+                    hot.push((namespace.clone(), pod.clone(), name.to_string(), (cpu, cpu_limit), (mem, mem_limit)));
+                }
+            }
+        }
+        restarts.sort_by_key(|r| std::cmp::Reverse(r.5));
+        (restarts, hot)
+    }
+
+    /// What the overview finds in the same pods read lean.
+    fn found_lean(pods: &[Value], usage: &k8s::PodContainerUsage, since: jiff::Timestamp) -> Found {
+        let pods: Vec<PodDetail> = pods.iter().map(|p| serde_json::from_value(p.clone()).unwrap()).collect();
+        let (restarts, hot) = restarts_and_hot(&pods, usage, "ctx", since);
+        (
+            restarts.into_iter().map(|r| (r.namespace, r.pod, r.container, r.reason, r.count, r.when)).collect(),
+            hot.into_iter().map(|h| (h.namespace, h.pod, h.container, h.cpu, h.mem)).collect(),
+        )
+    }
+
+    proptest! {
+        /// HPAs and budgets read lean count as whole ones did, whatever their status holds.
+        #[test]
+        fn lean_hpas_and_budgets_count_as_whole_ones_did(
+            hpas in prop::collection::vec(whole_hpa(), 0..8),
+            pdbs in prop::collection::vec(whole_pdb(), 0..8),
+        ) {
+            let lean: Vec<HpaLite> = hpas.iter().map(|h| serde_json::from_value(h.clone()).unwrap()).collect();
+            prop_assert_eq!(hpa_counts(&lean), hpa_counts_of_values(&hpas));
+            let lean: Vec<PdbLite> = pdbs.iter().map(|p| serde_json::from_value(p.clone()).unwrap()).collect();
+            prop_assert_eq!(pdb_counts(&lean), pdb_counts_of_values(&pdbs));
+        }
+
+        /// Pods read lean show the restarts and the containers near their limits that whole
+        /// ones did, in the same order.
+        #[test]
+        fn lean_pods_show_what_whole_ones_did((pods, usage) in pods_and_usage()) {
+            let since = base() - jiff::SignedDuration::from_mins(60);
+            prop_assert_eq!(found_lean(&pods, &usage, since), found_in_values(&pods, &usage, since));
+        }
+
+        /// Asking for current revisions only counts the same: Helm marks a revision superseded
+        /// once a newer one replaces it, so a release's newest revision never is.
+        #[test]
+        fn current_revisions_count_as_every_revision(
+            releases in prop::collection::vec((0usize..2, prop::collection::vec(0usize..8, 0..5), 1usize..8), 0..8),
+        ) {
+            const STATUSES: [&str; 8] = [
+                "superseded", "deployed", "failed", "uninstalled", "uninstalling", "pending-install", "pending-upgrade",
+                "pending-rollback",
+            ];
+            let mut every = Vec::new();
+            for (i, (ns, older, newest)) in releases.iter().enumerate() {
+                let statuses = older.iter().chain([newest]).map(|&s| STATUSES[s]);
+                for (v, status) in statuses.enumerate() {
+                    let labels: BTreeMap<String, String> = [
+                        ("name", format!("r{i}")),
+                        ("owner", "helm".to_string()),
+                        ("status", status.to_string()),
+                        ("version", (v + 1).to_string()),
+                    ]
+                    .into_iter()
+                    .map(|(k, v)| (k.to_string(), v))
+                    .collect();
+                    every.push((Some(format!("ns{ns}")), labels));
+                }
+            }
+            let current: Vec<_> = every.iter().filter(|(_, l)| l["status"] != "superseded").cloned().collect();
+            prop_assert_eq!(helm_counts(&current), helm_counts(&every));
+        }
+    }
+
+    /// The context the fixture cluster is loaded as.
+    const CONTEXT: &str = "fixture";
+
+    /// A request the fixture cluster was sent: its path, query and Accept header.
+    type Asked = (String, String, String);
+
+    /// An API server with a few objects of each kind the overview counts, answering in the
+    /// form asked: kubectl's table, whole objects or their metadata. Records each request.
+    #[derive(Clone, Default)]
+    struct Cluster(Arc<Mutex<Vec<Asked>>>);
+
+    impl Cluster {
+        fn asked(&self) -> Vec<Asked> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    impl tower::Service<http::Request<kube::client::Body>> for Cluster {
+        type Response = http::Response<http_body_util::Full<bytes::Bytes>>;
+        type Error = std::convert::Infallible;
+        type Future = std::future::Ready<Result<Self::Response, Self::Error>>;
+
+        fn poll_ready(&mut self, _: &mut std::task::Context<'_>) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, req: http::Request<kube::client::Body>) -> Self::Future {
+            let path = req.uri().path().to_string();
+            let query = req.uri().query().unwrap_or_default().to_string();
+            let accept = req.headers().get(http::header::ACCEPT).and_then(|v| v.to_str().ok()).unwrap_or_default();
+            let body = if accept.contains("as=Table") { table(&path) } else { objects(&path, &query) };
+            self.0.lock().unwrap().push((path, query, accept.to_string()));
+            let code = if body["kind"] == "Status" { 404 } else { 200 };
+            let response = http::Response::builder().status(code).body(body.to_string().into_bytes().into()).unwrap();
+            std::future::ready(Ok(response))
+        }
+    }
+
+    /// A query parameter's value, decoded.
+    fn param(query: &str, key: &str) -> Option<String> {
+        let raw = query.split('&').find_map(|p| p.strip_prefix(key)?.strip_prefix('='))?;
+        let (bytes, mut out, mut i) = (raw.as_bytes(), Vec::new(), 0);
+        while i < bytes.len() {
+            if bytes[i] == b'%' {
+                out.push(u8::from_str_radix(&raw[i + 1..i + 3], 16).unwrap());
+                i += 3;
+            } else {
+                out.push(if bytes[i] == b'+' { b' ' } else { bytes[i] });
+                i += 1;
+            }
+        }
+        Some(String::from_utf8(out).unwrap())
+    }
+
+    /// kubectl's table of a kind on the fixture cluster: its columns and its rows' cells.
+    fn table(path: &str) -> Value {
+        let (columns, rows) = match path {
+            "/api/v1/pods" => (
+                vec!["Name", "Ready", "Status", "Restarts", "Age"],
+                vec![
+                    vec!["web-1", "1/1", "Running", "3 (10m ago)", "5d"],
+                    vec!["web-2", "0/1", "CrashLoopBackOff", "7 (2h ago)", "5d"],
+                    vec!["db-0", "2/2", "Running", "0", "30d"],
+                    vec!["migrate-x", "0/1", "Completed", "0", "1d"],
+                ],
+            ),
+            "/apis/apps/v1/deployments" => (
+                vec!["Name", "Ready", "Up-to-date", "Available", "Age"],
+                vec![
+                    vec!["web", "2/2", "2", "2", "5d"],
+                    vec!["api", "1/3", "3", "1", "5d"],
+                    vec!["batch", "0/0", "0", "0", "5d"],
+                ],
+            ),
+            "/apis/apps/v1/replicasets" => (
+                vec!["Name", "Desired", "Current", "Ready", "Age"],
+                vec![vec!["web-abc", "2", "2", "2", "5d"], vec!["web-old", "0", "0", "0", "9d"]],
+            ),
+            "/apis/apps/v1/statefulsets" => (vec!["Name", "Ready", "Age"], vec![vec!["db", "1/1", "30d"]]),
+            "/apis/apps/v1/daemonsets" => (
+                vec!["Name", "Desired", "Current", "Ready", "Up-to-date", "Available", "Node Selector", "Age"],
+                vec![vec!["agent", "3", "3", "2", "3", "2", "<none>", "30d"]],
+            ),
+            "/apis/batch/v1/cronjobs" => (
+                vec!["Name", "Schedule", "Timezone", "Suspend", "Active", "Last Schedule", "Age"],
+                vec![
+                    vec!["nightly", "0 3 * * *", "<none>", "False", "0", "5h", "30d"],
+                    vec!["paused", "0 4 * * *", "<none>", "True", "0", "9d", "30d"],
+                ],
+            ),
+            "/apis/batch/v1/jobs" => (
+                vec!["Name", "Status", "Completions", "Duration", "Age"],
+                vec![vec!["migrate-x", "Complete", "1/1", "20s", "1d"], vec!["broken", "Failed", "0/1", "5m", "2d"]],
+            ),
+            "/api/v1/persistentvolumeclaims" => (
+                vec![
+                    "Name",
+                    "Status",
+                    "Volume",
+                    "Capacity",
+                    "Access Modes",
+                    "StorageClass",
+                    "VolumeAttributesClass",
+                    "Age",
+                ],
+                vec![
+                    vec!["data-db-0", "Bound", "pv-1", "10Gi", "RWO", "standard", "<unset>", "30d"],
+                    vec!["scratch", "Pending", "", "", "", "standard", "<unset>", "1m"],
+                ],
+            ),
+            _ => return json!({"kind": "Status", "code": 404}),
+        };
+        json!({"kind": "Table", "apiVersion": "meta.k8s.io/v1", "metadata": {"resourceVersion": "7"},
+            "columnDefinitions": columns.iter().map(|c| json!({"name": c, "type": "string"})).collect::<Vec<_>>(),
+            "rows": rows.iter().map(|cells| json!({"cells": cells})).collect::<Vec<_>>()})
+    }
+
+    /// Managed fields, most of a stored object's metadata, which the overview never reads.
+    fn managed() -> Value {
+        json!([{"manager": "kubelet", "operation": "Update", "fieldsType": "FieldsV1", "fieldsV1": {"f:status": {}}}])
+    }
+
+    /// A container with `limits`, and what a real one holds besides.
+    fn container(name: &str, limits: Value) -> Value {
+        json!({"name": name, "image": format!("{name}:1"), "env": [{"name": "LOG", "value": "info"}],
+            "resources": {"limits": limits, "requests": {"cpu": "10m"}},
+            "volumeMounts": [{"name": "data", "mountPath": "/data"}],
+            "livenessProbe": {"httpGet": {"path": "/health", "port": 8080}}})
+    }
+
+    fn pod(ns: &str, name: &str, containers: Value, statuses: Value) -> Value {
+        json!({"metadata": {"name": name, "namespace": ns, "uid": format!("{ns}-{name}"), "labels": {"app": name},
+                "managedFields": managed()},
+            "spec": {"containers": containers, "nodeName": "node-1", "volumes": [{"name": "data", "emptyDir": {}}]},
+            "status": {"phase": "Running", "containerStatuses": statuses, "podIP": "10.0.0.1"}})
+    }
+
+    /// The fixture cluster's objects of a kind, whole (Helm's Secrets: their metadata), as the
+    /// query selects them.
+    fn objects(path: &str, query: &str) -> Value {
+        let list = |kind: &str, items: Vec<Value>| json!({"kind": kind, "apiVersion": "v1", "metadata": {"resourceVersion": "7"}, "items": items});
+        let ago = |mins: i64| (jiff::Timestamp::now() - jiff::SignedDuration::from_mins(mins)).to_string();
+        let ended =
+            |reason: &str, mins: i64| json!({"terminated": {"exitCode": 1, "reason": reason, "finishedAt": ago(mins)}});
+        match path {
+            "/api/v1/pods" => list(
+                "PodList",
+                vec![
+                    pod(
+                        "shop",
+                        "web-1",
+                        json!([container("app", json!({"cpu": "500m", "memory": "128Mi"}))]),
+                        json!([{"name": "app", "restartCount": 3, "ready": true, "lastState": ended("OOMKilled", 10)}]),
+                    ),
+                    pod(
+                        "shop",
+                        "web-2",
+                        json!([container("app", json!({"memory": "128Mi"}))]),
+                        json!([{"name": "app", "restartCount": 7, "ready": false, "lastState": ended("Error", 120)}]),
+                    ),
+                    pod(
+                        "data",
+                        "db-0",
+                        json!([container("db", json!({"memory": "1Gi"})), container("sidecar", json!({}))]),
+                        json!([{"name": "db", "restartCount": 0, "ready": true, "lastState": {}},
+                        {"name": "sidecar", "restartCount": 0, "ready": true, "lastState": {}}]),
+                    ),
+                    pod(
+                        "data",
+                        "migrate-x",
+                        json!([container("migrate", json!({}))]),
+                        json!([{"name": "migrate", "restartCount": 0, "ready": false, "lastState": {}}]),
+                    ),
+                ],
+            ),
+            "/apis/metrics.k8s.io/v1beta1/pods" => list(
+                "PodMetricsList",
+                vec![
+                    json!({"metadata": {"name": "web-1", "namespace": "shop"},
+                    "containers": [{"name": "app", "usage": {"cpu": "100m", "memory": "127Mi"}}]}),
+                    json!({"metadata": {"name": "db-0", "namespace": "data"},
+                    "containers": [{"name": "db", "usage": {"cpu": "2", "memory": "100Mi"}},
+                        {"name": "sidecar", "usage": {"cpu": "5m", "memory": "900Mi"}}]}),
+                ],
+            ),
+            "/api/v1/secrets" => {
+                // Every revision Helm keeps; the API server applies the selector.
+                let current =
+                    param(query, "labelSelector").is_some_and(|s| s.split(',').any(|s| s == "status!=superseded"));
+                let revisions = [
+                    ("shop", "web", 1, "superseded"),
+                    ("shop", "web", 2, "superseded"),
+                    ("shop", "web", 3, "deployed"),
+                    ("data", "db", 1, "deployed"),
+                    ("data", "db", 2, "failed"),
+                    ("tools", "old", 1, "superseded"),
+                    ("tools", "old", 2, "uninstalled"),
+                ];
+                let items: Vec<Value> = revisions
+                    .iter()
+                    .filter(|r| !current || r.3 != "superseded")
+                    .map(|(ns, name, v, status)| json!({"apiVersion": "meta.k8s.io/v1", "kind": "PartialObjectMetadata",
+                        "metadata": {"name": format!("sh.helm.release.v1.{name}.v{v}"), "namespace": ns, "managedFields": managed(),
+                            "labels": {"name": name, "owner": "helm", "status": status, "version": v.to_string()}}}))
+                    .collect();
+                json!({"kind": "PartialObjectMetadataList", "apiVersion": "meta.k8s.io/v1",
+                    "metadata": {"resourceVersion": "7"}, "items": items})
+            }
+            "/apis/autoscaling/v2/horizontalpodautoscalers" => {
+                let hpa = |limited: &str| {
+                    json!({"metadata": {"name": "web", "managedFields": managed()},
+                    "spec": {"minReplicas": 1, "maxReplicas": 5}, "status": {"currentReplicas": 2, "conditions": [
+                        {"type": "AbleToScale", "status": "True"}, {"type": "ScalingActive", "status": "True"},
+                        {"type": "ScalingLimited", "status": limited}]}})
+                };
+                list(
+                    "HorizontalPodAutoscalerList",
+                    vec![hpa("False"), hpa("True"), json!({"metadata": {"name": "new"}})],
+                )
+            }
+            "/apis/policy/v1/poddisruptionbudgets" => {
+                let pdb = |allowed: i64, expected: i64| {
+                    json!({"metadata": {"name": "db", "managedFields": managed()},
+                    "spec": {"minAvailable": 1}, "status": {"disruptionsAllowed": allowed, "expectedPods": expected,
+                        "currentHealthy": expected, "desiredHealthy": 1}})
+                };
+                list("PodDisruptionBudgetList", vec![pdb(0, 2), pdb(1, 3), pdb(0, 0)])
+            }
+            "/api/v1/events" => {
+                let warnings_only = param(query, "fieldSelector").as_deref() == Some("type=Warning");
+                let event = |kind: &str, reason: &str, times: Value| {
+                    let mut e = json!({"metadata": {"name": reason, "namespace": "shop", "managedFields": managed()},
+                        "involvedObject": {"kind": "Pod", "name": "web-1"}, "type": kind, "reason": reason, "message": "m"});
+                    e.as_object_mut().unwrap().extend(times.as_object().unwrap().clone());
+                    e
+                };
+                let events = [
+                    event("Warning", "BackOff", json!({"count": 12, "lastTimestamp": ago(5)})),
+                    event("Warning", "BackOff", json!({"count": 3, "lastTimestamp": ago(20)})),
+                    // Recorded through events.k8s.io: its repeats are in `series`.
+                    event(
+                        "Warning",
+                        "FailedScheduling",
+                        json!({"eventTime": ago(120), "lastTimestamp": null,
+                        "series": {"count": 40, "lastObservedTime": ago(2)}}),
+                    ),
+                    // Over an hour ago: left out.
+                    event("Warning", "Unhealthy", json!({"count": 5, "lastTimestamp": ago(180)})),
+                    event("Normal", "Pulled", json!({"count": 1, "lastTimestamp": ago(1)})),
+                ];
+                list("EventList", events.into_iter().filter(|e| !warnings_only || e["type"] == "Warning").collect())
+            }
+            _ => json!({"kind": "Status", "code": 404}),
+        }
+    }
+
+    /// The overview of a small cluster: the same figures as from whole objects, from lean
+    /// requests only. Counts from kubectl's cells alone, never an object's metadata; whole
+    /// pods, HPAs and budgets and Helm's Secrets (their metadata, current revisions only) from
+    /// the API server's cache; Warning events only, a page at a time; each list asked once.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_overview_reads_only_what_it_shows() {
+        let cluster = Cluster::default();
+        let client = kube::Client::new(cluster.clone(), "default");
+        let (tx, rx) = futures::channel::mpsc::unbounded();
+        super::load(client, None, CONTEXT.into(), tx).await;
+        let pieces: Vec<Piece> = rx.collect().await;
+        let mut kinds = BTreeMap::new();
+        let (mut warnings, mut restarts, mut hot, mut failed) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        for piece in pieces {
+            match piece {
+                Piece::Kind(slot, counts) => {
+                    kinds.insert(SLOTS[slot].0, counts);
+                }
+                Piece::Warnings(w) => warnings.extend(w.into_iter().map(|w| (w.reason, w.count))),
+                Piece::Restarts(r) => {
+                    restarts.extend(r.into_iter().map(|r| (r.namespace, r.pod, r.container, r.reason, r.count)));
+                }
+                Piece::Hot(h, skipped) => {
+                    assert!(!skipped);
+                    hot.extend(h.into_iter().map(|h| (h.pod, h.container)));
+                }
+                Piece::Failed(_, e) => failed.push(e),
+                Piece::Done(_) => {}
+            }
+        }
+        assert!(failed.is_empty(), "{failed:?}");
+        let counts = |c: &[(&str, usize, Tone)]| -> Result<Counts, String> {
+            Ok(c.iter().map(|&(label, n, tone)| (label.to_string(), n, tone)).collect())
+        };
+        let (good, done, busy, bad) = (Tone::Good, Tone::Done, Tone::Busy, Tone::Bad);
+        assert_eq!(
+            kinds["Pods"],
+            counts(&[("Running", 2, good), ("Completed", 1, done), ("CrashLoopBackOff", 1, bad)])
+        );
+        assert_eq!(kinds["Deployments"], counts(&[("Running", 1, good), ("Idle", 1, done), ("Unavailable", 1, bad)]));
+        assert_eq!(
+            kinds["Helm Releases"],
+            counts(&[("Deployed", 1, good), ("Superseded", 1, done), ("Failed", 1, bad)])
+        );
+        assert_eq!(kinds["ReplicaSets"], counts(&[("Running", 1, good), ("Idle", 1, done)]));
+        assert_eq!(kinds["StatefulSets"], counts(&[("Running", 1, good)]));
+        assert_eq!(kinds["DaemonSets"], counts(&[("Unavailable", 1, bad)]));
+        assert_eq!(kinds["CronJobs"], counts(&[("Scheduled", 1, good), ("Suspended", 1, done)]));
+        assert_eq!(kinds["Jobs"], counts(&[("Complete", 1, done), ("Failed", 1, bad)]));
+        assert_eq!(kinds["HPAs"], counts(&[("AtTarget", 1, good), ("ScalingLimited", 1, busy), ("Unknown", 1, busy)]));
+        let budgets = counts(&[("DisruptionAllowed", 1, good), ("NoPods", 1, done), ("InsufficientPods", 1, bad)]);
+        assert_eq!(kinds["Disruption Budgets"], budgets);
+        assert_eq!(kinds["PVCs"], counts(&[("Bound", 1, good), ("Pending", 1, busy)]));
+        assert_eq!(warnings, [("FailedScheduling".to_string(), 40), ("BackOff".to_string(), 15)]);
+        let restarted = ("shop".to_string(), "web-1".to_string(), "app".to_string(), "OOMKilled".to_string(), 3);
+        assert_eq!(restarts, [restarted]);
+        // Usage is read unless this machine's settings turned metrics off.
+        let near: &[(&str, &str)] = if crate::settings::metrics_on(CONTEXT) { &[("web-1", "app")] } else { &[] };
+        assert_eq!(hot.iter().map(|(p, c)| (p.as_str(), c.as_str())).collect::<Vec<_>>(), near);
+
+        let asked = cluster.asked();
+        let (tables, lists): (Vec<&Asked>, Vec<&Asked>) = asked
+            .iter()
+            .filter(|(path, ..)| !path.starts_with("/apis/metrics.k8s.io/"))
+            .partition(|(_, _, accept)| accept.contains("as=Table"));
+        // Pods (their first page held them all), six kinds of workloads, PVCs: cells alone.
+        assert_eq!(tables.len(), 8, "{asked:?}");
+        assert!(tables.iter().all(|(_, q, _)| param(q, "includeObject").as_deref() == Some("None")), "{asked:?}");
+        let mut listed: Vec<&str> = lists.iter().map(|(path, ..)| path.as_str()).collect();
+        listed.sort_unstable();
+        let expected = [
+            "/api/v1/events",
+            "/api/v1/pods",
+            "/api/v1/secrets",
+            "/apis/autoscaling/v2/horizontalpodautoscalers",
+            "/apis/policy/v1/poddisruptionbudgets",
+        ];
+        assert_eq!(listed, expected, "{asked:?}");
+        let (events, cached): (Vec<&Asked>, Vec<&Asked>) =
+            lists.into_iter().partition(|(path, ..)| path == "/api/v1/events");
+        assert!(cached.iter().all(|(_, q, _)| param(q, "resourceVersion").as_deref() == Some("0")), "{asked:?}");
+        let (_, helm_query, helm_accept) = cached.iter().find(|(path, ..)| path == "/api/v1/secrets").unwrap();
+        assert!(helm_accept.contains("as=PartialObjectMetadataList"), "{helm_accept}");
+        assert_eq!(param(helm_query, "labelSelector").as_deref(), Some("owner=helm,status!=superseded"));
+        // The API server keeps no cache of events: they come a page at a time, Warnings only.
+        assert_eq!(param(&events[0].1, "fieldSelector").as_deref(), Some("type=Warning"));
+        assert_eq!(param(&events[0].1, "limit").as_deref(), Some("5000"));
     }
 }
