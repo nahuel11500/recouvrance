@@ -13,6 +13,8 @@ dispatches. In French,* recouvrer *means to recover.*
 A fast Kubernetes desktop client (Rust + [gpui](https://github.com/zed-industries/zed)) with a
 **local MCP server**, so AI agents can work on your clusters under rules you control.
 
+Site: [nahuelcanavy.com/recouvrance](https://nahuelcanavy.com/recouvrance/)
+
 <div align="center">
   <img src="https://raw.githubusercontent.com/nahuel11500/recouvrance/media/recouvrance-tour.gif" width="85%" alt="A tour of Recouvrance: the pods table, the command palette, a crash diagnosis, the assistant finding its cause, logs across pods, the Problems page, an agent's request waiting for approval and the dark theme">
 </div>

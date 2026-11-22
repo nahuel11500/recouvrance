@@ -5,11 +5,13 @@ use std::collections::HashMap;
 use anyhow::{Result, anyhow};
 use futures::channel::mpsc;
 use futures::{AsyncBufReadExt as _, StreamExt as _};
-use k8s_openapi::api::core::v1::{Event, Pod};
-use kube::Client;
+use k8s_openapi::api::core::v1::{Event, EventSeries, EventSource, Pod};
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::{MicroTime, Time};
 use kube::api::{Api, ListParams, LogParams};
+use kube::{Client, Resource as _};
+use serde::Deserialize;
 
-use super::{ObjectRef, TaskGuard, age, api_status, names, run, short_error, spawn_guarded};
+use super::{ObjectRef, TaskGuard, age, api_status, lists, names, run, run_abortable, short_error, spawn_guarded};
 
 pub async fn logs_text(
     client: Client,
@@ -79,35 +81,71 @@ pub async fn events_for(client: Client, obj: ObjectRef) -> Result<Vec<EventLine>
     let fields = events_selector(&obj.kind.ar.kind, &obj.name, &obj.uid)?;
     let ns = obj.namespace.clone();
     run(async move {
-        let api: Api<Event> = match &ns {
-            Some(ns) => Api::namespaced(client, ns),
-            None => Api::all(client),
-        };
+        let url = Event::url_path(&(), ns.as_deref());
+        let mut items = Vec::new();
         let lp = ListParams::default().fields(&fields);
-        let mut items = api.list(&lp).await?.items;
+        lists::each_lean_page(&client, &url, lp, |page: Vec<LeanEvent>| items.extend(page)).await?;
         items.sort_by_key(|e| std::cmp::Reverse(event_last(e)));
-        Ok(items.iter().map(event_line).collect())
+        Ok(items.into_iter().map(event_line).collect())
     })
     .await
 }
 
-fn event_line(e: &Event) -> EventLine {
+/// An Event with only the fields the event views show: its managedFields and the rest are
+/// skipped while parsing, never held. A cluster can keep tens of thousands of events.
+#[derive(Default, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+struct LeanEvent {
+    metadata: LeanEventMeta,
+    involved_object: EventObject,
+    #[serde(rename = "type")]
+    type_: Option<String>,
+    reason: Option<String>,
+    message: Option<String>,
+    count: Option<i32>,
+    first_timestamp: Option<Time>,
+    last_timestamp: Option<Time>,
+    event_time: Option<MicroTime>,
+    series: Option<EventSeries>,
+    reporting_component: Option<String>,
+    source: Option<EventSource>,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+struct LeanEventMeta {
+    name: Option<String>,
+    namespace: Option<String>,
+    creation_timestamp: Option<Time>,
+}
+
+/// The object an event is about.
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct EventObject {
+    kind: Option<String>,
+    namespace: Option<String>,
+    name: Option<String>,
+}
+
+fn event_line(e: LeanEvent) -> EventLine {
+    let (first, last, count, source) = (event_first(&e), event_last(&e), event_count(&e), event_source(&e));
     EventLine {
-        namespace: e.metadata.namespace.clone(),
-        name: e.metadata.name.clone().unwrap_or_default(),
-        age: event_last(e).map_or_default(age),
-        first: event_first(e),
-        last: event_last(e),
-        kind: e.type_.clone().unwrap_or_default(),
-        reason: e.reason.clone().unwrap_or_default(),
-        message: e.message.clone().unwrap_or_default(),
-        count: event_count(e),
-        source: event_source(e),
+        namespace: e.metadata.namespace,
+        name: e.metadata.name.unwrap_or_default(),
+        age: last.map_or_default(age),
+        first,
+        last,
+        kind: e.type_.unwrap_or_default(),
+        reason: e.reason.unwrap_or_default(),
+        message: e.message.unwrap_or_default(),
+        count,
+        source,
     }
 }
 
 /// When an event first happened.
-fn event_first(e: &Event) -> Option<jiff::Timestamp> {
+fn event_first(e: &LeanEvent) -> Option<jiff::Timestamp> {
     e.first_timestamp
         .as_ref()
         .map(|t| t.0)
@@ -116,7 +154,7 @@ fn event_first(e: &Event) -> Option<jiff::Timestamp> {
 }
 
 /// The component that reported an event: the new field, else the old one.
-fn event_source(e: &Event) -> String {
+fn event_source(e: &LeanEvent) -> String {
     [e.reporting_component.as_deref(), e.source.as_ref().and_then(|s| s.component.as_deref())]
         .into_iter()
         .flatten()
@@ -178,38 +216,48 @@ pub fn grouped(events: impl IntoIterator<Item = ClusterEvent>) -> Vec<ClusterEve
     out
 }
 
-/// Events read at most per type and list: the Warnings first, all of them on most clusters;
-/// Normal ones are many more and say less.
-const RECENT_WARNINGS: u32 = 5000;
-const RECENT_NORMAL: u32 = 2000;
+/// Events read per request: one request brings every Warning of most clusters.
+const EVENTS_PAGE: u32 = 5000;
 
-/// The events of a cluster (or one namespace): its Warnings, then its Normal events, each
-/// read in one page (`RECENT_WARNINGS`, `RECENT_NORMAL`). `normal`: read those too. Those of
-/// one object with the same type and reason come as one (`grouped`).
+/// The events of a cluster (or one namespace): its Warnings, or every event when `normal`.
+/// Every page is read: the API server lists events by namespace and name, never by time, so
+/// stopping after the first page would leave out the namespaces late in the alphabet. Each
+/// page is made into rows as it comes, so only what they show is held. Those of one object
+/// with the same type and reason come as one (`grouped`). Dropping the future stops it.
 pub async fn recent_events(client: Client, namespace: Option<String>, normal: bool) -> Result<Vec<ClusterEvent>> {
-    run(async move {
-        let api: Api<Event> = match &namespace {
-            Some(ns) => Api::namespaced(client, ns),
-            None => Api::all(client),
-        };
-        let mut items = api.list(&ListParams::default().fields("type=Warning").limit(RECENT_WARNINGS)).await?.items;
-        if normal {
-            items.extend(api.list(&ListParams::default().fields("type=Normal").limit(RECENT_NORMAL)).await?.items);
+    run_abortable(async move {
+        let url = Event::url_path(&(), namespace.as_deref());
+        let mut lp = ListParams::default().limit(EVENTS_PAGE);
+        // Every event in one list, not a list per type: the API server goes through all the
+        // events it stores either way, a selector only filters what it sends.
+        if !normal {
+            lp = lp.fields("type=Warning");
         }
-        Ok(grouped(items.iter().map(|e| ClusterEvent {
-            line: event_line(e),
-            object_kind: e.involved_object.kind.clone().unwrap_or_default(),
-            object_namespace: e.involved_object.namespace.clone(),
-            object_name: e.involved_object.name.clone().unwrap_or_default(),
-            events: 1,
-        })))
+        let mut events = Vec::new();
+        lists::each_lean_page(&client, &url, lp, |page: Vec<LeanEvent>| {
+            events.extend(page.into_iter().map(cluster_event));
+        })
+        .await?;
+        Ok(grouped(events))
     })
     .await
 }
 
+/// An event with the object it is about, as one of a cluster's.
+fn cluster_event(mut e: LeanEvent) -> ClusterEvent {
+    let object = std::mem::take(&mut e.involved_object);
+    ClusterEvent {
+        line: event_line(e),
+        object_kind: object.kind.unwrap_or_default(),
+        object_namespace: object.namespace,
+        object_name: object.name.unwrap_or_default(),
+        events: 1,
+    }
+}
+
 /// When an event last happened. Events recorded through events.k8s.io (kube-scheduler,
 /// for example) keep their repeats in `series`.
-fn event_last(e: &Event) -> Option<jiff::Timestamp> {
+fn event_last(e: &LeanEvent) -> Option<jiff::Timestamp> {
     e.series
         .as_ref()
         .and_then(|s| s.last_observed_time.as_ref())
@@ -220,7 +268,7 @@ fn event_last(e: &Event) -> Option<jiff::Timestamp> {
 }
 
 /// How many times an event happened, its `series` included.
-fn event_count(e: &Event) -> i32 {
+fn event_count(e: &LeanEvent) -> i32 {
     e.series.as_ref().and_then(|s| s.count).unwrap_or(0).max(e.count.unwrap_or(0)).max(1)
 }
 
@@ -794,7 +842,8 @@ mod counts_tests {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::{BTreeSet, HashMap};
+    use std::sync::{Arc, Mutex};
 
     use futures::StreamExt as _;
     use proptest::prelude::*;
@@ -837,7 +886,7 @@ mod tests {
     /// The first time, and who reported it, from the new fields or the old ones.
     #[test]
     fn first_time_and_source() {
-        let e: k8s_openapi::api::core::v1::Event = serde_json::from_value(serde_json::json!({
+        let e: super::LeanEvent = serde_json::from_value(serde_json::json!({
             "metadata": {"name": "e", "namespace": "shop", "creationTimestamp": "2026-01-01T00:00:00Z"},
             "involvedObject": {},
             "firstTimestamp": "2026-01-01T00:00:05Z",
@@ -847,17 +896,17 @@ mod tests {
             "type": "Warning", "reason": "UpdateFailed", "message": "could not get secret data from provider"
         }))
         .unwrap();
-        let l = super::event_line(&e);
+        let l = super::event_line(e);
         assert_eq!(l.source, "external-secrets");
         assert_eq!(l.repeats().as_deref(), Some("×10 over 11m"));
-        let e: k8s_openapi::api::core::v1::Event = serde_json::from_value(serde_json::json!({
+        let e: super::LeanEvent = serde_json::from_value(serde_json::json!({
             "metadata": {"name": "e", "creationTimestamp": "2026-01-01T00:00:00Z"},
             "involvedObject": {},
             "reportingComponent": "kubelet",
             "source": {"component": "old"},
         }))
         .unwrap();
-        let l = super::event_line(&e);
+        let l = super::event_line(e);
         assert_eq!((l.source.as_str(), l.first), ("kubelet", Some("2026-01-01T00:00:00Z".parse().unwrap())));
     }
 
@@ -888,6 +937,160 @@ mod tests {
                 prop_assert_eq!(&g.line.message, &format!("at {:?}", g.line.last.map(|t| t.as_second() - 1_700_000_000)));
             }
             prop_assert_eq!(groups.iter().map(|g| g.events).sum::<usize>(), raw.len());
+        }
+    }
+
+    /// An API server keeping `per_namespace` Warning events and as many Normal ones in each
+    /// namespace from a to z, each about its own pod. It lists them as a real one does: by
+    /// namespace and name, never by time, `limit` at a time (at most `page`: a server may send
+    /// fewer), with a `continue` token while more follow. Records the requests it was sent.
+    #[derive(Clone)]
+    struct Events {
+        per_namespace: usize,
+        page: usize,
+        asked: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl Events {
+        fn new(per_namespace: usize, page: usize) -> Self {
+            Self { per_namespace, page, asked: Arc::default() }
+        }
+
+        fn asked(&self) -> Vec<String> {
+            self.asked.lock().unwrap().clone()
+        }
+    }
+
+    impl tower::Service<http::Request<kube::client::Body>> for Events {
+        type Response = http::Response<http_body_util::Full<bytes::Bytes>>;
+        type Error = std::convert::Infallible;
+        type Future = std::future::Ready<Result<Self::Response, Self::Error>>;
+
+        fn poll_ready(&mut self, _: &mut std::task::Context<'_>) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, req: http::Request<kube::client::Body>) -> Self::Future {
+            let (path, query) = (req.uri().path(), req.uri().query().unwrap_or_default());
+            self.asked.lock().unwrap().push(format!("{path}?{query}"));
+            let param = |key: &str| query.split('&').find_map(|p| p.strip_prefix(key)?.strip_prefix('='));
+            let selector = param("fieldSelector").unwrap_or_default();
+            let warnings_only = selector == "type%3DWarning";
+            let uid = selector.strip_prefix("involvedObject.uid%3D");
+            let limit = param("limit").and_then(|l| l.parse().ok()).unwrap_or(usize::MAX).min(self.page);
+            let from: usize = param("continue").and_then(|c| c.parse().ok()).unwrap_or(0);
+            let one = path.strip_prefix("/api/v1/namespaces/").and_then(|p| p.strip_suffix("/events"));
+            // In key order: by namespace, then by name.
+            let stored: Vec<(String, usize, bool)> = ('a'..='z')
+                .map(String::from)
+                .filter(|ns| one.is_none_or(|o| o == ns.as_str()))
+                .flat_map(|ns| (0..self.per_namespace).flat_map(move |i| [false, true].map(|w| (ns.clone(), i, w))))
+                .filter(|(_, _, warning)| *warning || !warnings_only)
+                .filter(|(ns, i, _)| uid.is_none_or(|u| u == format!("{ns}-{i}")))
+                .collect();
+            let event = |(ns, i, warning): &(String, usize, bool)| {
+                let (kind, reason) = if *warning { ("Warning", "BackOff") } else { ("Normal", "Pulled") };
+                // A pod's Warning a second after its Normal event.
+                let at = 1_767_225_600 + 2 * i64::try_from(*i).unwrap() + i64::from(*warning);
+                serde_json::json!({
+                    "metadata": {
+                        "name": format!("web-{i:05}.{kind}"), "namespace": ns, "creationTimestamp": "2026-01-01T00:00:00Z",
+                        // Most of a stored event's bytes, which the views never read.
+                        "managedFields": [{"manager": "kubelet", "operation": "Update", "apiVersion": "v1",
+                            "fieldsType": "FieldsV1", "fieldsV1": {"f:count": {}, "f:lastTimestamp": {}, "f:message": {}}}],
+                    },
+                    "involvedObject": {"kind": "Pod", "namespace": ns, "name": format!("web-{i}"), "uid": format!("{ns}-{i}")},
+                    "type": kind, "reason": reason, "message": "something happened", "count": 1,
+                    "lastTimestamp": jiff::Timestamp::from_second(at).unwrap().to_string(),
+                    "source": {"component": "kubelet", "host": "node-1"},
+                })
+            };
+            let items: Vec<serde_json::Value> = stored.iter().skip(from).take(limit).map(event).collect();
+            let next = from + items.len();
+            let mut metadata = serde_json::json!({"resourceVersion": "7"});
+            if next < stored.len() {
+                metadata["continue"] = next.to_string().into();
+            }
+            let body =
+                serde_json::json!({"kind": "EventList", "apiVersion": "v1", "metadata": metadata, "items": items});
+            let response = http::Response::builder().status(200).body(body.to_string().into_bytes().into()).unwrap();
+            std::future::ready(Ok(response))
+        }
+    }
+
+    /// More Warnings than one page holds, over namespaces a to z: those of every namespace come
+    /// back, z's too, though the API server lists them by namespace and the first page ends
+    /// before z.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn every_page_of_warnings_is_read() {
+        let cluster = Events::new(200, usize::MAX);
+        let events = super::recent_events(kube::Client::new(cluster.clone(), "default"), None, false).await.unwrap();
+        let namespaces: BTreeSet<&str> = events.iter().filter_map(|e| e.object_namespace.as_deref()).collect();
+        assert_eq!(namespaces.len(), 26, "{namespaces:?}");
+        assert_eq!(events.len(), 26 * 200);
+        assert!(events.iter().all(|e| e.line.kind == "Warning" && e.line.source == "kubelet"));
+        // 5,200 Warnings: two pages, both of Warnings only.
+        let asked = cluster.asked();
+        assert_eq!(asked.len(), 2, "{asked:?}");
+        assert!(asked.iter().all(|q| q.starts_with("/api/v1/events?") && q.contains("fieldSelector=type%3DWarning")));
+    }
+
+    /// With Normal events shown too, every event of every namespace, in one list; for one
+    /// namespace, its own.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn every_event_when_normal_ones_are_shown_too() {
+        let cluster = Events::new(200, usize::MAX);
+        let client = kube::Client::new(cluster.clone(), "default");
+        let events = super::recent_events(client.clone(), None, true).await.unwrap();
+        assert_eq!(events.len(), 26 * 200 * 2);
+        let in_z = |kind: &str| {
+            events.iter().filter(|e| e.object_namespace.as_deref() == Some("z") && e.line.kind == kind).count()
+        };
+        assert_eq!((in_z("Warning"), in_z("Normal")), (200, 200));
+        // 10,400 events: three pages, with no type asked for.
+        let asked = cluster.asked();
+        assert_eq!(asked.len(), 3, "{asked:?}");
+        assert!(asked.iter().all(|q| !q.contains("fieldSelector")), "{asked:?}");
+        let events = super::recent_events(client, Some("z".into()), false).await.unwrap();
+        assert_eq!(events.len(), 200);
+        assert!(events.iter().all(|e| e.object_namespace.as_deref() == Some("z")));
+        assert!(cluster.asked().last().unwrap().starts_with("/api/v1/namespaces/z/events?"));
+    }
+
+    /// An object's events are read the same lean way, by its uid, newest first.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_object_s_events_newest_first() {
+        let cluster = Events::new(3, usize::MAX);
+        let kind = crate::k8s::Kind::fake("", "Pod");
+        let pod = super::ObjectRef { kind, name: "web-1".into(), namespace: Some("z".into()), uid: "z-1".into() };
+        let lines = super::events_for(kube::Client::new(cluster.clone(), "default"), pod).await.unwrap();
+        let read: Vec<(&str, &str)> = lines.iter().map(|l| (l.kind.as_str(), l.name.as_str())).collect();
+        assert_eq!(read, [("Warning", "web-00001.Warning"), ("Normal", "web-00001.Normal")]);
+        let asked = cluster.asked();
+        assert_eq!(asked.len(), 1, "{asked:?}");
+        assert!(asked[0].starts_with("/api/v1/namespaces/z/events?") && asked[0].contains("involvedObject.uid%3Dz-1"));
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(48))]
+        /// Every event the API server keeps is read once, however few it sends a page: none
+        /// left out, none twice, and no request more than its pages.
+        #[test]
+        fn every_event_is_read_once(per_namespace in 0usize..8, page in 1usize..60, normal in any::<bool>()) {
+            let cluster = Events::new(per_namespace, page);
+            let client = cluster.clone();
+            let events = futures::executor::block_on(crate::k8s::run(async move {
+                super::recent_events(kube::Client::new(client, "default"), None, normal).await
+            }))
+            .unwrap();
+            let stored = 26 * per_namespace * (1 + usize::from(normal));
+            // Each event is about its own pod, so each is a row of its own.
+            prop_assert_eq!(events.len(), stored);
+            prop_assert_eq!(events.iter().map(|e| e.events).sum::<usize>(), stored);
+            prop_assert!(normal || events.iter().all(|e| e.line.kind == "Warning"));
+            let namespaces: BTreeSet<&str> = events.iter().filter_map(|e| e.object_namespace.as_deref()).collect();
+            prop_assert_eq!(namespaces.len(), if per_namespace == 0 { 0 } else { 26 });
+            prop_assert_eq!(cluster.asked().len(), stored.div_ceil(page).max(1));
         }
     }
 
@@ -1034,7 +1237,7 @@ mod tests {
 
     #[test]
     fn event_series_count_and_time() {
-        let event = |v: serde_json::Value| serde_json::from_value::<k8s_openapi::api::core::v1::Event>(v).unwrap();
+        let event = |v: serde_json::Value| serde_json::from_value::<super::LeanEvent>(v).unwrap();
         let e = event(serde_json::json!({
             "metadata": {"name": "web.1", "creationTimestamp": "2024-01-01T00:00:00Z"},
             "involvedObject": {},
