@@ -246,7 +246,8 @@
   upgraded connection. Below, the 10 heaviest requests, one per kind (cluster, method and path,
   its names replaced by `{namespace}` and `{name}`), with their bytes and both times. A stream
   is listed once it ends. Nothing leaves the machine.
-- **Favorites** and **saved views** (type + namespaces + filter, bookmark button), back/forward history, light and dark themes.
+- **Favorites** and **saved views** (type + namespaces + filter, bookmark button), back/forward history, light and dark themes
+  whose status colors, badges and status buttons read at WCAG AA contrast (4.5:1) on what they are drawn on.
 - **Instant back**: the last 8 lists (up to 10,000 rows in all) are kept, so going back to one
   shows it at once, marked "Updating…", while a fresh list loads and replaces it in one go.
 - **Bulk actions**: check rows, then restart, scale, delete or copy names. Scaling needs the number
