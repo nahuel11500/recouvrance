@@ -462,11 +462,15 @@ fn client(mut config: Config, context: String, gated: bool) -> Result<Client> {
     let timeout = tower::timeout::TimeoutLayer::new(REQUEST_TIMEOUT);
     // Outside the timeout, so a request it cuts is counted as failed.
     let meter = meter::MeterLayer { context };
-    let builder = kube::client::ClientBuilder::try_from(config).map_err(login::build_error)?;
+    // kube's error for a failed login command names its program among its arguments, or not at
+    // all (when it could not be started): it is named from the kubeconfig instead.
+    let program = login::program(&config.auth_info);
+    let builder =
+        kube::client::ClientBuilder::try_from(config).map_err(|e| login::build_error(e, program.as_deref()))?;
     // Right around kube's own layers, where a failed token refresh comes out: the app's layers
     // and every caller only see it said by `login`.
     let builder = builder
-        .with_layer(&login::LoginErrorLayer)
+        .with_layer(&login::LoginErrorLayer::new(program.as_deref()))
         .with_layer(&retry::RetryLayer)
         .with_layer(&timeout)
         .with_layer(&meter);
@@ -980,6 +984,20 @@ echo '{"apiVersion":"client.authentication.k8s.io/v1","kind":"ExecCredential","s
         assert_eq!(e.to_string(), format!("ServiceError: {LOGIN_FAILED}"));
         assert!(!format!("{e:?}").contains("s3cr3t"), "{e:?}");
         assert_eq!(crate::k8s::short_error(&anyhow::Error::from(e)), LOGIN_FAILED);
+    }
+
+    /// A login command that is not there, as when it is not on the `PATH` the app was started
+    /// with: the error names it and says why it could not start (#827).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_login_command_that_is_not_there_is_named() {
+        let mut config = login_by("exit 0", &std::env::temp_dir().join("recouvrance-login-unused"));
+        config.auth_info.exec.as_mut().unwrap().command = Some("/nonexistent/recouvrance-login".into());
+        let Err(e) = super::client(config, "test".into(), false) else {
+            panic!("the login command is not there");
+        };
+        let said = crate::k8s::short_error(&e);
+        assert!(said.starts_with("the login command `recouvrance-login` could not be started: "), "{said}");
+        assert!(said.contains("os error 2"), "{said}");
     }
 
     #[test]

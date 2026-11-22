@@ -4,12 +4,15 @@
 //! token is). Errors reach pages, agents and the audit log as text, by many paths: so each
 //! client puts [`LoginFailed`] in that error's place where it comes out, when it is built (the
 //! command runs a first time) and on every request (it runs again when the token expires).
+//! The program is named from the kubeconfig ([`program`]): kube's text is never read.
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use kube::client::AuthError;
+use kube::config::AuthInfo;
 
 /// The most characters of the command's error output shown.
 const MAX_DETAIL: usize = 200;
@@ -28,29 +31,56 @@ impl std::fmt::Display for LoginFailed {
 
 impl std::error::Error for LoginFailed {}
 
+/// The file name of the program a client's login command runs, to name it when it fails:
+/// kube's error doesn't say it (`AuthExecStart`), or says it among the arguments. It is a gcp
+/// auth provider's `cmd-path` when the user has one (kube tries it before the exec plugin),
+/// otherwise the exec plugin's `command`. None without one, or when it is not a plain file
+/// name: no name is better than a strange one.
+pub fn program(auth: &AuthInfo) -> Option<String> {
+    let path = match &auth.auth_provider {
+        Some(provider) if provider.name == "gcp" => provider.config.get("cmd-path")?,
+        // Other providers run no command, and kube doesn't run the exec plugin then.
+        Some(_) => return None,
+        None => auth.exec.as_ref()?.command.as_ref()?,
+    };
+    let name = path.rsplit('/').next()?;
+    let ok = name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
+    (ok && !name.is_empty() && name.len() <= MAX_NAME).then(|| name.to_string())
+}
+
 /// What to say when `e`, or an error behind it, is a context's login command that failed: its
 /// program's file name, its exit code and the last line it wrote to stderr; never its
-/// arguments, environment or standard output. None for any other error.
+/// arguments, environment or standard output. None for any other error. The app's clients
+/// have put [`LoginFailed`] in its place already, which names the program; kube's own error,
+/// from any other client, is said without the name.
 pub fn login_failure(e: &(dyn std::error::Error + 'static)) -> Option<String> {
+    failure(e, None)
+}
+
+/// [`login_failure`] for a client whose login command runs `program` (see [`program`]).
+fn failure(e: &(dyn std::error::Error + 'static), program: Option<&str>) -> Option<String> {
+    let command = || program.map_or_else(|| "the login command".to_string(), |p| format!("the login command `{p}`"));
     std::iter::successors(Some(e), |e| e.source()).find_map(|e| {
         if let Some(failed) = e.downcast_ref::<LoginFailed>() {
             return Some(failed.0.clone());
         }
         match e.downcast_ref::<AuthError>()? {
-            AuthError::AuthExecRun { cmd, out } => Some(run_failed(cmd, out)),
-            // An `io::Error` from starting it ("No such file or directory"), which names nothing.
-            AuthError::AuthExecStart(e) => Some(format!("the login command could not be started: {e}")),
+            AuthError::AuthExecRun { out, .. } => Some(run_failed(&command(), out)),
+            // An `io::Error` from starting it: "No such file or directory" when it is not on the
+            // `PATH` the app was started with.
+            AuthError::AuthExecStart(e) => Some(format!("{} could not be started: {e}", command())),
             // The parse error quotes the output around where it failed.
-            AuthError::AuthExecParse(_) => Some("the login command's output could not be read as a credential".into()),
+            AuthError::AuthExecParse(_) => Some(format!("{}'s output could not be read as a credential", command())),
             _ => None,
         }
     })
 }
 
-/// The error of building a client, with [`LoginFailed`] in its place when it is a failed login
-/// command: building runs it a first time.
-pub fn build_error(e: kube::Error) -> anyhow::Error {
-    match login_failure(&e) {
+/// The error of building a client whose login command runs `program` (see [`program`]), with
+/// [`LoginFailed`] in its place when it is that command that failed: building runs it a first
+/// time.
+pub fn build_error(e: kube::Error, program: Option<&str>) -> anyhow::Error {
+    match failure(&e, program) {
         Some(said) => LoginFailed(said).into(),
         None => e.into(),
     }
@@ -58,20 +88,30 @@ pub fn build_error(e: kube::Error) -> anyhow::Error {
 
 /// Puts [`LoginFailed`] in place of a failed login command's error on every request of a
 /// client: kube runs the command again on whatever request comes after its token expired.
-#[derive(Clone, Copy)]
-pub struct LoginErrorLayer;
+#[derive(Clone)]
+pub struct LoginErrorLayer {
+    program: Option<Arc<str>>,
+}
+
+impl LoginErrorLayer {
+    /// For a client whose login command runs `program` (see [`program`]).
+    pub fn new(program: Option<&str>) -> Self {
+        Self { program: program.map(Arc::from) }
+    }
+}
 
 impl<S> tower::Layer<S> for LoginErrorLayer {
     type Service = LoginErrors<S>;
 
     fn layer(&self, inner: S) -> Self::Service {
-        LoginErrors { inner }
+        LoginErrors { inner, program: self.program.clone() }
     }
 }
 
 #[derive(Clone)]
 pub struct LoginErrors<S> {
     inner: S,
+    program: Option<Arc<str>>,
 }
 
 impl<S, R> tower::Service<R> for LoginErrors<S>
@@ -85,30 +125,31 @@ where
     type Future = Pin<Box<dyn Future<Output = Result<S::Response, tower::BoxError>> + Send>>;
 
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        self.inner.poll_ready(cx).map_err(|e| scrub(e.into()))
+        self.inner.poll_ready(cx).map_err(|e| scrub(e.into(), self.program.as_deref()))
     }
 
     fn call(&mut self, req: R) -> Self::Future {
         let fut = self.inner.call(req);
-        Box::pin(async move { fut.await.map_err(|e| scrub(e.into())) })
+        let program = self.program.clone();
+        Box::pin(async move { fut.await.map_err(|e| scrub(e.into(), program.as_deref())) })
     }
 }
 
-/// `e`, or [`LoginFailed`] in its place when it is a failed login command.
-fn scrub(e: tower::BoxError) -> tower::BoxError {
-    match login_failure(&*e) {
+/// `e`, or [`LoginFailed`] in its place when it is a failed login command of `program`.
+fn scrub(e: tower::BoxError, program: Option<&str>) -> tower::BoxError {
+    match failure(&*e, program) {
         Some(said) => Box::new(LoginFailed(said)),
         None => e,
     }
 }
 
-/// kube's `AuthExecRun`, said by the program's file name, its exit code and its last stderr line.
-fn run_failed(cmd: &str, out: &std::process::Output) -> String {
-    let program = program_name(cmd).map_or_default(|p| format!(" `{p}`"));
+/// kube's `AuthExecRun` of `command` ("the login command `kubelogin`"), said by how it ended
+/// and its last stderr line.
+fn run_failed(command: &str, out: &std::process::Output) -> String {
     let how = ended(out.status);
     match last_line(&out.stderr) {
-        Some(line) => format!("the login command{program} failed ({how}): {line}"),
-        None => format!("the login command{program} failed ({how})"),
+        Some(line) => format!("{command} failed ({how}): {line}"),
+        None => format!("{command} failed ({how})"),
     }
 }
 
@@ -153,144 +194,96 @@ fn plain(line: &str) -> String {
     text.trim().to_string()
 }
 
-/// The file name of the program a failed login command ran, from the command line kube gives as
-/// text: `Command`'s debug form for an exec plugin, `cmd-path` then `cmd-args` for a gcp auth
-/// provider. None when it can't be told apart from the rest or is not a plain file name: no
-/// name is better than a piece of an argument.
-fn program_name(cmd: &str) -> Option<String> {
-    // The debug form quotes every word; a gcp provider's line quotes none.
-    let program = if cmd.contains('"') { debug_program(cmd)? } else { cmd.split_whitespace().next()?.to_string() };
-    let name = program.rsplit('/').next()?;
-    let ok = name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
-    (ok && !name.is_empty() && name.len() <= MAX_NAME).then(|| name.to_string())
-}
-
-/// The program in `Command`'s debug form, which is
-/// `[cd "dir" && ][env -i |env -u KEY …][KEY="value" …][["program"] ]"argv0" "arg" …`.
-fn debug_program(cmd: &str) -> Option<String> {
-    let mut rest = cmd;
-    loop {
-        rest = rest.trim_start_matches(' ');
-        if let Some(r) = rest.strip_prefix("cd ") {
-            rest = quoted(r)?.1.strip_prefix(" && ")?;
-        } else if let Some(r) = rest.strip_prefix("env -i ") {
-            rest = r;
-        } else if let Some(mut r) = rest.strip_prefix("env ") {
-            // The variables taken away, `-u KEY` each.
-            while let Some(after) = r.strip_prefix("-u ") {
-                r = after.split_once(' ')?.1;
-            }
-            rest = r;
-        } else if let Some(r) = rest.strip_prefix('[') {
-            // The program, shown apart when argv[0] was set to something else.
-            return Some(quoted(r)?.0);
-        } else if rest.starts_with('"') {
-            return Some(quoted(rest)?.0);
-        } else {
-            // A variable set for it: `KEY="value"`.
-            rest = quoted(rest.split_once('=')?.1)?.1;
-        }
-    }
-}
-
-/// The quoted string `s` starts with, unescaped (`\"`, `\\` and `\'`; other escapes are kept as
-/// they are), and the text after it.
-fn quoted(s: &str) -> Option<(String, &str)> {
-    let inner = s.strip_prefix('"')?;
-    let mut text = String::new();
-    let mut chars = inner.char_indices();
-    while let Some((i, c)) = chars.next() {
-        match c {
-            '"' => return Some((text, &inner[i + 1..])),
-            '\\' => match chars.next()?.1 {
-                c @ ('"' | '\\' | '\'') => text.push(c),
-                c => {
-                    text.push('\\');
-                    text.push(c);
-                }
-            },
-            c => text.push(c),
-        }
-    }
-    None
-}
-
 #[cfg(test)]
 mod tests {
-    use std::os::unix::process::{CommandExt as _, ExitStatusExt as _};
+    use std::os::unix::process::ExitStatusExt as _;
     use std::process::{Command, ExitStatus, Output};
 
     use super::*;
 
-    /// A failed exec plugin as kube reports it: `Command`'s debug form, then what it printed.
-    fn failed_run(cmd: &Command, code: i32, stdout: &str, stderr: &str) -> AuthError {
+    /// A failed login command as kube reports it: its command line as text, then what it printed.
+    fn failed_run(cmd: String, code: i32, stdout: &str, stderr: &str) -> AuthError {
         let out = Output {
             status: ExitStatus::from_raw(code << 8),
             stdout: stdout.as_bytes().to_vec(),
             stderr: stderr.as_bytes().to_vec(),
         };
-        AuthError::AuthExecRun { cmd: format!("{cmd:?}"), out: Box::new(out) }
+        AuthError::AuthExecRun { cmd, out: Box::new(out) }
     }
 
-    /// kubelogin as kube runs it, with an OIDC client secret in its arguments and another secret
-    /// in its environment.
-    fn kubelogin() -> Command {
+    /// kubelogin's command line as kube gives it for an exec plugin (`Command`'s debug form),
+    /// with an OIDC client secret in its arguments and another secret in its environment.
+    fn kubelogin() -> String {
         let mut cmd = Command::new("/usr/local/bin/kubelogin");
         cmd.args(["get-token", "--oidc-issuer-url=https://issuer.example", "--oidc-client-secret=s3cr3t-arg"]);
         cmd.env("KUBERNETES_EXEC_INFO", r#"{"kind":"ExecCredential","spec":{"interactive":false}}"#);
         cmd.env("LOGIN_ENV", "s3cr3t \"env\" = x");
         cmd.env_remove("S3CR3T_DROPPED");
-        cmd
+        format!("{cmd:?}")
     }
 
     fn expired() -> AuthError {
         let stderr = "warning: no cached token\n\x1b[31merror:\x1b[0m oidc: refresh token expired  \n\n";
-        failed_run(&kubelogin(), 1, r#"{"status":{"token":"s3cr3t-out"}}"#, stderr)
+        failed_run(kubelogin(), 1, r#"{"status":{"token":"s3cr3t-out"}}"#, stderr)
     }
 
     const SAID: &str = "the login command `kubelogin` failed (exit 1): error: oidc: refresh token expired";
+
+    /// What the client of a context that logs in with kubelogin says of `e`.
+    fn by_kubelogin(e: &(dyn std::error::Error + 'static)) -> Option<String> {
+        failure(e, Some("kubelogin"))
+    }
 
     #[test]
     fn a_failed_login_command_says_its_name_exit_code_and_error_only() {
         let e = expired();
         // kube's own text has the arguments, the environment and the output.
         assert!(e.to_string().contains("s3cr3t-arg") && e.to_string().contains("s3cr3t-out"), "{e}");
-        assert_eq!(login_failure(&e).as_deref(), Some(SAID));
+        assert_eq!(by_kubelogin(&e).as_deref(), Some(SAID));
+        // The name comes from the kubeconfig: without it, the rest is said.
+        let unnamed = "the login command failed (exit 1): error: oidc: refresh token expired";
+        assert_eq!(login_failure(&e).as_deref(), Some(unnamed));
         // Nothing on stderr, killed: said by how it ended.
-        let mut quiet = failed_run(&kubelogin(), 2, "s3cr3t-out", " \n");
-        assert_eq!(login_failure(&quiet).as_deref(), Some("the login command `kubelogin` failed (exit 2)"));
+        let mut quiet = failed_run(kubelogin(), 2, "s3cr3t-out", " \n");
+        assert_eq!(by_kubelogin(&quiet).as_deref(), Some("the login command `kubelogin` failed (exit 2)"));
         if let AuthError::AuthExecRun { out, .. } = &mut quiet {
             out.status = ExitStatus::from_raw(9);
         }
-        assert_eq!(login_failure(&quiet).as_deref(), Some("the login command `kubelogin` failed (signal 9)"));
+        assert_eq!(by_kubelogin(&quiet).as_deref(), Some("the login command `kubelogin` failed (signal 9)"));
         // A long last line is cut.
-        let long = failed_run(&kubelogin(), 1, "", &"x".repeat(500));
-        let said = login_failure(&long).unwrap();
+        let long = failed_run(kubelogin(), 1, "", &"x".repeat(500));
+        let said = by_kubelogin(&long).unwrap();
         assert!(said.ends_with(&format!(": {}…", "x".repeat(MAX_DETAIL))), "{said}");
     }
 
     /// Building the client (`kube::Error::Auth`) gives the few words alone, whichever way it is
-    /// printed. kube's error as it comes (in a `Service` error, under the app's context) is
-    /// said the same by the pages' and the agents' formatters.
+    /// printed. A request's error as the client's layer hands it on (in a `Service` error, under
+    /// the app's context) is said the same by the pages' and the agents' formatters.
     #[test]
     fn every_path_says_it_without_the_secrets() {
-        let built = build_error(kube::Error::Auth(expired()));
+        let built = build_error(kube::Error::Auth(expired()), Some("kubelogin"));
         assert!(built.downcast_ref::<LoginFailed>().is_some());
         assert_eq!(format!("{built:#}"), SAID);
         assert!(!format!("{built:?}").contains("s3cr3t"), "{built:?}");
-        let sent = anyhow::Error::from(kube::Error::Service(Box::new(expired()))).context("listing pods");
+        let sent = kube::Error::Service(scrub(Box::new(expired()), Some("kubelogin")));
+        let sent = anyhow::Error::from(sent).context("listing pods");
         for e in [&built, &sent] {
             assert_eq!(crate::k8s::short_error(e), SAID);
             assert_eq!(crate::k8s::error_chain(e), SAID);
         }
+        // kube's error as it comes, from a client without the layer: no name, and no secret.
+        let raw = anyhow::Error::from(kube::Error::Service(Box::new(expired()))).context("listing pods");
+        let unnamed = "the login command failed (exit 1): error: oidc: refresh token expired";
+        assert_eq!(crate::k8s::error_chain(&raw), unnamed);
         // Other errors keep what was being done.
         let other = anyhow::anyhow!("connection refused").context("discovery of apps/v1 failed");
         assert_eq!(crate::k8s::error_chain(&other), "discovery of apps/v1 failed: connection refused");
-        assert!(build_error(kube::Error::Service("refused".into())).downcast_ref::<LoginFailed>().is_none());
+        let refused = build_error(kube::Error::Service("refused".into()), Some("kubelogin"));
+        assert!(refused.downcast_ref::<LoginFailed>().is_none());
     }
 
-    /// A request whose token refresh runs the login command, which fails.
-    struct Refresh;
+    /// A request whose token refresh runs the login command, which fails with this error.
+    struct Refresh(fn() -> AuthError);
 
     impl tower::Service<()> for Refresh {
         type Response = ();
@@ -302,15 +295,22 @@ mod tests {
         }
 
         fn call(&mut self, (): ()) -> Self::Future {
-            let e: tower::BoxError = Box::new(expired());
+            let e: tower::BoxError = Box::new((self.0)());
             std::future::ready(Err(e))
         }
     }
 
+    /// The error of a request whose token refresh fails with `e`, through the layer of the
+    /// client of a context that logs in with kubelogin.
+    fn refreshed(e: fn() -> AuthError) -> tower::BoxError {
+        use tower::{Layer as _, Service as _};
+        let mut client = LoginErrorLayer::new(Some("kubelogin")).layer(Refresh(e));
+        futures::executor::block_on(client.call(())).unwrap_err()
+    }
+
     #[test]
     fn the_layer_replaces_the_error_of_every_request() {
-        use tower::{Layer as _, Service as _};
-        let e = futures::executor::block_on(LoginErrorLayer.layer(Refresh).call(())).unwrap_err();
+        let e = refreshed(expired);
         assert_eq!(e.to_string(), SAID);
         assert!(e.downcast_ref::<LoginFailed>().is_some());
         // As `kube::Client` hands it on.
@@ -322,38 +322,66 @@ mod tests {
 
     #[test]
     fn a_login_command_that_does_not_start_or_prints_no_credential() {
-        let e = AuthError::AuthExecStart(std::io::Error::from_raw_os_error(2));
-        let said = login_failure(&e).unwrap();
-        assert!(said.starts_with("the login command could not be started: ") && said.contains("os error 2"), "{said}");
-        let e = kube::Error::Auth(AuthError::AuthExecParse(Box::new(
-            serde_saphyr::from_str::<std::collections::BTreeMap<String, String>>("token: [s3cr3t").unwrap_err(),
-        )));
-        assert_eq!(login_failure(&e).as_deref(), Some("the login command's output could not be read as a credential"));
+        // Not on the `PATH` the app was started with: named, when the client is built and on a
+        // token refresh.
+        let not_there = || AuthError::AuthExecStart(std::io::Error::from_raw_os_error(2));
+        let built = build_error(kube::Error::Auth(not_there()), Some("kubelogin"));
+        for said in [format!("{built:#}"), refreshed(not_there).to_string()] {
+            assert!(said.starts_with("the login command `kubelogin` could not be started: "), "{said}");
+            assert!(said.contains("os error 2"), "{said}");
+        }
+        let said = login_failure(&not_there()).unwrap();
+        assert!(said.starts_with("the login command could not be started: "), "{said}");
+        let unreadable = || {
+            let e = serde_saphyr::from_str::<std::collections::BTreeMap<String, String>>("token: [s3cr3t").unwrap_err();
+            AuthError::AuthExecParse(Box::new(e))
+        };
+        let built = build_error(kube::Error::Auth(unreadable()), Some("kubelogin"));
+        assert!(!format!("{built:?}").contains("s3cr3t"), "{built:?}");
+        for said in [format!("{built:#}"), refreshed(unreadable).to_string()] {
+            assert_eq!(said, "the login command `kubelogin`'s output could not be read as a credential");
+        }
+        let said = login_failure(&unreadable());
+        assert_eq!(said.as_deref(), Some("the login command's output could not be read as a credential"));
         // Other auth errors say what they say.
         assert_eq!(login_failure(&AuthError::MissingCommand), None);
         assert_eq!(login_failure(&kube::Error::Auth(AuthError::ExecPluginFailed)), None);
     }
 
     #[test]
-    fn the_program_is_found_in_the_command_line() {
-        let debug = |cmd: &Command| program_name(&format!("{cmd:?}"));
-        assert_eq!(debug(&kubelogin()).as_deref(), Some("kubelogin"));
-        let mut cmd = Command::new("aws");
-        cmd.args(["eks", "get-token"]).current_dir("/tmp/a \"b\" && c").env_clear().env("A", "1");
-        assert_eq!(debug(&cmd).as_deref(), Some("aws"));
-        let mut cmd = Command::new("/opt/bin/gke-gcloud-auth-plugin");
-        cmd.arg0("s3cr3t-arg0").env("B", "\\\" \"x\"");
-        assert_eq!(debug(&cmd).as_deref(), Some("gke-gcloud-auth-plugin"));
-        // A gcp auth provider: `cmd-path` then `cmd-args`.
-        assert_eq!(
-            program_name("/usr/lib/google-cloud-sdk/bin/gcloud config config-helper").as_deref(),
-            Some("gcloud")
-        );
-        // A name that is not a plain file name, or a line that doesn't read, names nothing.
-        assert_eq!(debug(&Command::new("/bin/a b")), None);
-        assert_eq!(program_name("KEY=\"s3cr3t\" unquoted"), None);
-        assert_eq!(program_name("KEY=\"unterminated s3cr3t"), None);
-        assert_eq!(program_name(""), None);
+    fn the_program_is_named_from_the_kubeconfig() {
+        let exec = |command: &str| AuthInfo {
+            exec: Some(kube::config::ExecConfig { command: Some(command.into()), ..Default::default() }),
+            ..Default::default()
+        };
+        assert_eq!(program(&exec("/usr/local/bin/kubelogin")).as_deref(), Some("kubelogin"));
+        assert_eq!(program(&exec("aws")).as_deref(), Some("aws"));
+        // A gcp auth provider runs its `cmd-path`, whatever its folder and its `cmd-args` hold,
+        // which kube's text runs together. kube tries it before the exec plugin.
+        for (path, args) in
+            [("/Users/John Doe/sdk/bin/gcloud", "config config-helper"), ("/opt/gcloud", r#"--a="b" "c""#)]
+        {
+            let gcp = kube::config::AuthProviderConfig {
+                name: "gcp".into(),
+                config: [("cmd-path", path), ("cmd-args", args)].map(|(k, v)| (k.to_string(), v.to_string())).into(),
+                ..Default::default()
+            };
+            let auth = AuthInfo { auth_provider: Some(gcp), ..exec("kubelogin") };
+            let e = failed_run(format!("{path} {args}"), 1, "", "");
+            assert_eq!(
+                failure(&e, program(&auth).as_deref()).as_deref(),
+                Some("the login command `gcloud` failed (exit 1)")
+            );
+        }
+        // Another provider runs no command, and kube doesn't run the exec plugin then.
+        let oidc = kube::config::AuthProviderConfig { name: "oidc".into(), ..Default::default() };
+        assert_eq!(program(&AuthInfo { auth_provider: Some(oidc), ..exec("kubelogin") }), None);
+        // A name that is not a plain file name, or no command, names nothing.
+        assert_eq!(program(&exec("/bin/a b")), None);
+        assert_eq!(program(&exec("/usr/bin/")), None);
+        assert_eq!(program(&exec(&"x".repeat(MAX_NAME + 1))), None);
+        assert_eq!(program(&exec("")), None);
+        assert_eq!(program(&AuthInfo::default()), None);
     }
 
     #[test]
@@ -371,26 +399,32 @@ mod properties {
     use std::os::unix::process::{CommandExt as _, ExitStatusExt as _};
     use std::process::{Command, ExitStatus, Output};
 
+    use kube::config::{AuthInfo, ExecConfig};
     use proptest::prelude::*;
 
-    use super::{AuthError, MAX_DETAIL, login_failure};
+    use super::{AuthError, MAX_DETAIL, failure, program};
 
     /// In everything the command was given and printed, never in what is said of it.
     const SECRET: &str = "XSECRETX";
 
-    /// What is said of a command that exited with `code` after printing this.
-    fn say(cmd: &Command, code: i32, stdout: Vec<u8>, stderr: Vec<u8>) -> String {
+    /// What the app's client says of its login command `path` (the kubeconfig's `command`) when
+    /// kube reports it as `cmd`, which exited with `code` after printing this.
+    fn say(path: &str, cmd: &Command, code: i32, stdout: Vec<u8>, stderr: Vec<u8>) -> String {
+        let exec = ExecConfig { command: Some(path.into()), ..Default::default() };
+        let auth = AuthInfo { exec: Some(exec), ..Default::default() };
         let out = Output { status: ExitStatus::from_raw(code << 8), stdout, stderr };
-        login_failure(&AuthError::AuthExecRun { cmd: format!("{cmd:?}"), out: Box::new(out) }).unwrap()
+        failure(&AuthError::AuthExecRun { cmd: format!("{cmd:?}"), out: Box::new(out) }, program(&auth).as_deref())
+            .unwrap()
     }
 
     proptest! {
-        /// Its arguments, environment, folder, `argv[0]` and standard output never show,
-        /// whatever they hold (quotes, spaces, `=`, backslashes, any character); its program's
-        /// name and exit code always do, and so does the last line of stderr with text in it.
+        /// The program's folder, its arguments, environment, working folder, `argv[0]` and
+        /// standard output never show, whatever they hold (quotes, spaces, `=`, backslashes,
+        /// any character); the program's file name and its exit code always do, and so does
+        /// the last line of stderr with text in it.
         #[test]
         fn a_failed_login_never_shows_what_it_was_given(
-            dir in proptest::option::of("/[a-z]{1,8}"),
+            dir in proptest::option::of("[^\\x00]{0,12}"),
             name in "[a-z][a-z0-9._-]{0,15}",
             args in proptest::collection::vec("[^\\x00]{0,12}", 0..4),
             env in proptest::collection::vec(("[A-Z_]{0,6}", "[^\\x00]{0,12}"), 0..3),
@@ -402,7 +436,8 @@ mod properties {
             stdout in "[^\\x00]{0,20}",
             stderr in proptest::collection::vec("[a-z :]{0,20}", 0..4),
         ) {
-            let mut cmd = Command::new(dir.map_or_else(|| name.clone(), |dir| format!("{dir}/{name}")));
+            let path = dir.map_or_else(|| name.clone(), |dir| format!("/{SECRET}{dir}/{name}"));
+            let mut cmd = Command::new(&path);
             cmd.args(args.iter().map(|a| format!("{SECRET}{a}")));
             if clear {
                 cmd.env_clear();
@@ -419,7 +454,8 @@ mod properties {
             if let Some(arg0) = &arg0 {
                 cmd.arg0(format!("{SECRET}{arg0}"));
             }
-            let said = say(&cmd, code, format!("{SECRET}{stdout}").into_bytes(), stderr.join("\n").into_bytes());
+            let stdout = format!("{SECRET}{stdout}").into_bytes();
+            let said = say(&path, &cmd, code, stdout, stderr.join("\n").into_bytes());
             prop_assert!(!said.contains(SECRET), "{said}\nfrom {cmd:?}");
             prop_assert!(said.contains(&format!("`{name}`")), "{said}\nfrom {cmd:?}");
             prop_assert!(said.contains(&format!("(exit {code})")), "{said}");
@@ -433,7 +469,7 @@ mod properties {
         /// characters, at most `MAX_DETAIL` characters and an ellipsis.
         #[test]
         fn stderr_comes_out_as_one_short_line(stderr in proptest::collection::vec(any::<u8>(), 0..600)) {
-            let said = say(&Command::new("kubelogin"), 1, Vec::new(), stderr);
+            let said = say("kubelogin", &Command::new("kubelogin"), 1, Vec::new(), stderr);
             prop_assert!(!said.chars().any(char::is_control), "{said:?}");
             let detail = said.strip_prefix("the login command `kubelogin` failed (exit 1)").unwrap();
             prop_assert!(detail.is_empty() || detail.starts_with(": "), "{said:?}");
