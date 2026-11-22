@@ -5,6 +5,32 @@ and versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.10.0](https://github.com/nahuel11500/recouvrance/compare/v0.9.0...v0.10.0) - 2026-11-22
+
+### Added
+
+- *(settings)* API requests also shows bytes and the time to the last byte (#855)
+- *(dev)* Shot:<file> step in RECOUVRANCE_INPUT saves a frame mid-script (#836)
+
+### Documentation
+
+- *(comparison)* Bring the rows up to date with Aptakube 1.23, FreeLens 2.1 and Headlamp 0.46 (#851)
+- *(readme)* The tagline's italics render without stray asterisks (#862)
+- *(readme)* Link the project site (#841)
+- *(readme)* Show the assistant, and describe the tour as it is now (#834)
+- *(readme)* Screenshots and tour from v0.9.0, with Problems and the agents' approvals and activity (#832)
+
+### Fixed
+
+- *(mcp)* An approval ends when the agent stops waiting, and a late Approve writes nothing (#853)
+- *(k8s)* A failed login command shows its name and error, never its arguments (#854)
+- *(mcp)* Activity counts every write tool and no dry run, and my_permissions lists every dry-run tool (#847)
+- *(timeline)* Read every page of Warning events, so no namespace is left out (#849)
+
+### Performance
+
+- Background work pauses while the window is hidden and waits for the page on screen (#852)
+
 ## [0.9.0](https://github.com/nahuel11500/recouvrance/compare/v0.8.0...v0.9.0) - 2026-11-19
 
 ### Added
