@@ -805,7 +805,7 @@ mod watch_tests {
     /// A cluster with pods `a/api` and `b/db` at version 10. A watch from there adds `a/new`,
     /// resizes `a/api` and deletes `b/db`, sends a bookmark as a real API server does, then
     /// stays open; or, when the version is `gone`, says so at once. When `broken`, an error
-    /// frame follows the changes. It counts the lists, and answers the first `refuses` of
+    /// frame follows the changes. It counts the list requests, and answers the first `refuses` of
     /// them 403.
     #[derive(Clone, Default)]
     struct Cluster {
@@ -917,7 +917,8 @@ mod watch_tests {
     /// after the list's own wait (15 s, up to 5 minutes).
     #[tokio::test(flavor = "multi_thread")]
     async fn a_failed_list_is_tried_again_when_asked() {
-        let cluster = Cluster { refuses: 1, ..Cluster::default() };
+        // The first list fails both ways: from the cache, then in pages.
+        let cluster = Cluster { refuses: 2, ..Cluster::default() };
         let client = kube::Client::new(cluster.clone(), "default");
         let retry = Arc::new(tokio::sync::Notify::new());
         let (_watch, mut rx) =
@@ -925,7 +926,7 @@ mod watch_tests {
         assert!(reads(&mut rx, |read| matches!(read, Some(Err(_)))).await, "the refusal never came");
         retry.notify_one();
         assert!(reads(&mut rx, |read| matches!(read, Some(Ok(_)))).await, "not listed again when asked");
-        assert_eq!(cluster.lists.load(Ordering::Relaxed), 2);
+        assert_eq!(cluster.lists.load(Ordering::Relaxed), 3);
     }
 
     #[tokio::test(flavor = "multi_thread")]
