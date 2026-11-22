@@ -277,6 +277,18 @@ impl Recorder {
     fn records_of(&self, ctx: &str) -> Vec<Arc<Record>> {
         lock(&self.logs).get(ctx).map_or_default(|l| l.records.iter().cloned().collect())
     }
+
+    /// `ctx`'s records made at `from` or later, picked under the lock: only those are
+    /// cloned, not the whole log.
+    fn records_since(&self, ctx: &str, from: jiff::Timestamp) -> Vec<Arc<Record>> {
+        lock(&self.logs).get(ctx).map_or_default(|l| l.records.iter().filter(|r| r.time >= from).cloned().collect())
+    }
+
+    /// When `ctx`'s oldest record kept was made. Records come roughly in time order, not
+    /// exactly (a writer's time from `managedFields`, a creation held back): the least.
+    fn oldest(&self, ctx: &str) -> Option<jiff::Timestamp> {
+        lock(&self.logs).get(ctx).and_then(|l| l.records.iter().map(|r| r.time).min())
+    }
 }
 
 /// The writer thread: batches of writes, at most one file operation per context each.
@@ -490,6 +502,18 @@ pub fn changes_for(context: &str, resource: &str, namespace: Option<&str>, name:
         })
         .map(|r| r.change())
         .collect()
+}
+
+/// The records of `context` made at `from` or later, in the order recorded (for agents:
+/// `recent_changes`). Creations held back long enough are recorded first.
+pub fn since(context: &str, from: jiff::Timestamp) -> Vec<Arc<Record>> {
+    RECORDER.release();
+    RECORDER.records_since(context, from)
+}
+
+/// When the oldest record kept of `context` was made: how far back its records go.
+pub fn oldest(context: &str) -> Option<jiff::Timestamp> {
+    RECORDER.oldest(context)
 }
 
 /// Every record of the contexts read so far, by context.
