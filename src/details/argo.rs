@@ -148,7 +148,7 @@ pub struct OpenNamespace {
 impl EventEmitter<OpenNamespace> for DetailPanel {}
 
 impl DetailPanel {
-    /// The read of the Argo CD section for the object as last read; None once it is gone.
+    /// The read of the Argo CD section for the object as last read; None while it is deleted.
     fn argo_work(&self) -> Option<std::pin::Pin<Box<dyn Future<Output = Lookup>>>> {
         let obj = self.object.clone().filter(|_| !self.deleted)?;
         // This page's cluster counts as connected (a page opened on Argo CD's own cluster).
@@ -184,11 +184,15 @@ impl DetailPanel {
                 if !crate::app::wait_visible(&this, cx, &exec).await {
                     break;
                 }
-                let Ok(Some(work)) = this.update(cx, |this, _| this.argo_work()) else { break };
-                let started = Instant::now();
-                let lookup = work.await;
-                if this.update(cx, |this, cx| this.set_argo(lookup, started, cx)).is_err() {
-                    break;
+                let Ok(work) = this.update(cx, |this, _| this.argo_work()) else { break };
+                // Nothing to read while the object is deleted: one created again under its name
+                // is followed (see `start_live`).
+                if let Some(work) = work {
+                    let started = Instant::now();
+                    let lookup = work.await;
+                    if this.update(cx, |this, cx| this.set_argo(lookup, started, cx)).is_err() {
+                        break;
+                    }
                 }
                 exec.timer(crate::settings::secs(crate::settings::get().metrics_refresh)).await;
             }

@@ -914,10 +914,15 @@ impl SettingsView {
         let number_input = |e: &Entity<InputState>| div().w(px(110.)).child(Input::new(e).small());
         v_flex()
         .child(div().pb_2().text_sm().text_color(muted).child(
-            "Tables are live (Kubernetes watches) and never poll. These intervals control everything that is polled.",
+            "Tables and detail pages are live (Kubernetes watches) and never poll their objects. These intervals control everything that is polled.",
         ))
         .child(Self::row("Metrics", "Seconds between CPU/memory updates (metrics-server).", number_input(&self.metrics), cx))
-        .child(Self::row("Detail pages", "Seconds between refreshes of an open object.", number_input(&self.detail), cx))
+        .child(Self::row(
+            "Detail pages",
+            "Seconds between reads of an open object your access can't watch (a role that only grants get).",
+            number_input(&self.detail),
+            cx,
+        ))
         .child(Self::row("Overviews", "Minimum seconds between overview refreshes; very large clusters wait longer.", number_input(&self.overview), cx))
         .into_any_element()
     }

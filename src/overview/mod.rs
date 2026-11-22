@@ -2,6 +2,7 @@
 //! kind-specific sections, usage bars against requests and limits.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::component::button::Button;
@@ -42,7 +43,9 @@ pub struct Related {
     pub usage_read: Option<k8s::Reading>,
     /// How old `usage` is and how often metrics-server measures, for the Containers heading.
     pub usage_fresh: k8s::Freshness,
-    pub pods: Vec<Value>,
+    /// The pods the page lists, as their watch last sent them (it holds the same ones until
+    /// they change).
+    pub pods: Arc<Vec<Value>>,
     pub services: Vec<Value>,
     pub revisions: Vec<Value>,
     pub referenced_by: BTreeMap<String, Vec<String>>,
@@ -58,8 +61,9 @@ pub struct Related {
     pub env_sources: std::collections::HashMap<String, Value>,
     /// NetworkPolicies selecting this pod (None: not looked up; Some(empty): none).
     pub netpols: Option<Vec<Value>>,
-    /// Kubelet stats summary of the node (a node's page, or a pod's node).
-    pub node_stats: Option<Value>,
+    /// Kubelet stats summary of the node (a node's page, or a pod's node): shared, as the pods
+    /// table is worked out again from it off the UI thread.
+    pub node_stats: Option<Arc<Value>>,
     /// A node's TopoLVM volumes, read only when it has TopoLVM's capacity annotation (None:
     /// not read, or could not be, the reason under `errors["local_volumes"]`).
     pub local_volumes: Option<Vec<k8s::topolvm::LocalVolume>>,
@@ -100,20 +104,35 @@ impl Related {
         }
     }
 
-    /// Work out once what the page draws from the pods: the table's rows and, for a node,
-    /// the pods' requests and limits of each resource it offers. Slow for a thousand pods,
-    /// so run it off the UI thread.
-    pub fn index(&mut self, obj: &Value) {
-        self.pod_rows = pod_rows(&self.pods, &self.usage);
-        if let Some(stats) = &self.node_stats {
-            fill_usage_from_kubelet(&mut self.pod_rows, stats);
+    /// Take a turn of the page's reads (`fetch_related`): the usage always, and the objects it
+    /// links to when they were read again (`links`). The pods and their rows (their watch keeps
+    /// them, and its note under "pods") and the charts and alerts (their own reads) stay. Gives
+    /// back what it replaced, to free off the UI thread.
+    pub fn take_reads(&mut self, mut read: Self, links: bool) -> Self {
+        std::mem::swap(&mut self.usage, &mut read.usage);
+        std::mem::swap(&mut self.usage_read, &mut read.usage_read);
+        std::mem::swap(&mut self.usage_fresh, &mut read.usage_fresh);
+        std::mem::swap(&mut self.node_stats, &mut read.node_stats);
+        if links {
+            if let Some(note) = self.errors.remove("pods") {
+                read.errors.insert("pods", note);
+            }
+            std::mem::swap(&mut self.services, &mut read.services);
+            std::mem::swap(&mut self.revisions, &mut read.revisions);
+            std::mem::swap(&mut self.referenced_by, &mut read.referenced_by);
+            std::mem::swap(&mut self.extra, &mut read.extra);
+            std::mem::swap(&mut self.env_sources, &mut read.env_sources);
+            std::mem::swap(&mut self.netpols, &mut read.netpols);
+            std::mem::swap(&mut self.local_volumes, &mut read.local_volumes);
+            std::mem::swap(&mut self.events, &mut read.events);
+            std::mem::swap(&mut self.crash_logs, &mut read.crash_logs);
+            std::mem::swap(&mut self.external_secret, &mut read.external_secret);
+            std::mem::swap(&mut self.argo_destination, &mut read.argo_destination);
+            std::mem::swap(&mut self.argo_drift, &mut read.argo_drift);
+            std::mem::swap(&mut self.rbac, &mut read.rbac);
+            std::mem::swap(&mut self.errors, &mut read.errors);
         }
-        let resources = obj.pointer("/status/allocatable").and_then(Value::as_object);
-        self.allocated = resources
-            .into_iter()
-            .flat_map(|a| a.keys())
-            .map(|r| (r.clone(), k8s::pods_allocated(&self.pods, r)))
-            .collect();
+        read
     }
 
     /// Keep a list's items, or note why it failed under `section` (and keep nothing).
@@ -123,6 +142,24 @@ impl Related {
             T::default()
         })
     }
+}
+
+/// What a page draws from its pods, worked out once: the table's rows (with a node's or a pod's
+/// kubelet stats, when read) and, for a node, the pods' (requests, limits) of each resource it
+/// offers (`allocatable`). Slow for a thousand pods, so run off the UI thread.
+pub fn pods_index(
+    pods: &[Value],
+    usage: &ContainerUsage,
+    node_stats: Option<&Value>,
+    allocatable: Option<&serde_json::Map<String, Value>>,
+) -> (Vec<PodRow>, std::collections::HashMap<String, (f64, f64)>) {
+    let mut rows = pod_rows(pods, usage);
+    if let Some(stats) = node_stats {
+        fill_usage_from_kubelet(&mut rows, stats);
+    }
+    let allocated =
+        allocatable.into_iter().flat_map(|a| a.keys()).map(|r| (r.clone(), k8s::pods_allocated(pods, r))).collect();
+    (rows, allocated)
 }
 
 /// A heading, with why its list could not be loaded ("forbidden", "failed: …") next to it.
@@ -748,6 +785,66 @@ fn capitalize(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    use serde_json::json;
+
+    use super::{Related, pods_index};
+
+    /// A turn of the page's reads never replaces what other reads keep: the pods and their note
+    /// (their watch's), the alerts (Prometheus's). The objects it links to change only when they
+    /// were read again.
+    #[test]
+    fn reads_replace_only_their_own_parts() {
+        let pods = Arc::new(vec![json!({"metadata": {"name": "web-1", "namespace": "shop"}})]);
+        let shown = || Related {
+            pods: pods.clone(),
+            services: vec![json!({"metadata": {"name": "old"}})],
+            errors: BTreeMap::from([("pods", "failed: timeout".to_string())]),
+            alerts_note: Some("silences unread".into()),
+            ..Related::default()
+        };
+        let read = || Related {
+            node_stats: Some(Arc::new(json!({"node": {}}))),
+            services: vec![json!({"metadata": {"name": "new"}})],
+            errors: BTreeMap::from([("revisions", "forbidden".to_string())]),
+            ..Related::default()
+        };
+        let mut page = shown();
+        let old = page.take_reads(read(), false);
+        assert!(page.node_stats.is_some() && old.node_stats.is_none());
+        assert_eq!(page.services[0]["metadata"]["name"], "old");
+        let old = page.take_reads(read(), true);
+        assert_eq!(page.services[0]["metadata"]["name"], "new");
+        assert_eq!(old.services[0]["metadata"]["name"], "old");
+        assert_eq!(page.errors.get("revisions").map(String::as_str), Some("forbidden"));
+        assert_eq!(page.errors.get("pods").map(String::as_str), Some("failed: timeout"));
+        assert!(Arc::ptr_eq(&page.pods, &pods));
+        assert_eq!(page.alerts_note.as_deref(), Some("silences unread"));
+    }
+
+    /// A node's page sums its pods' requests for each resource it offers, and takes the usage
+    /// metrics-server gave none from the kubelet.
+    #[test]
+    fn pods_are_indexed_with_their_usage_and_requests() {
+        let pod = json!({
+            "metadata": {"name": "web-1", "namespace": "shop"},
+            "spec": {"containers": [{"name": "app", "resources": {"requests": {"cpu": "250m"}}}]},
+            "status": {"phase": "Running"}
+        });
+        let stats = json!({"pods": [{
+            "podRef": {"name": "web-1", "namespace": "shop"},
+            "containers": [{"cpu": {"usageNanoCores": 5e7}, "memory": {"workingSetBytes": 1024.0}}]
+        }]});
+        let allocatable = json!({"cpu": "4", "memory": "8Gi"});
+        let (rows, allocated) = pods_index(&[pod], &Default::default(), Some(&stats), allocatable.as_object());
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].cpu[0], Some(50.0));
+        assert_eq!(allocated.get("cpu").map(|sums| sums.0), Some(250.0));
+        assert!(allocated.contains_key("memory"));
+    }
+
     #[test]
     fn failure_conditions_are_bad_when_true() {
         for ty in ["ReplicaFailure", "FailureTarget", "DisruptionTarget", "MemoryPressure", "Failed"] {

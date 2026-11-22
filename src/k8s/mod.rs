@@ -22,6 +22,7 @@ mod exec;
 #[cfg(feature = "dev")]
 pub(crate) mod experiments;
 pub(crate) mod files;
+mod follow;
 mod forward;
 pub(crate) mod gate;
 pub(crate) mod lane;
@@ -47,6 +48,7 @@ pub(crate) use cadence::{Cadence, Freshness, Reading};
 pub(crate) use config::*;
 pub(crate) use discovery::*;
 pub(crate) use exec::*;
+pub(crate) use follow::{Follow, Followed, Keep, follow};
 pub(crate) use forward::*;
 pub(crate) use metrics::*;
 pub(crate) use pods::*;
