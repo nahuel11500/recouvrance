@@ -1270,6 +1270,74 @@ fn the_timeline_records_what_a_watch_sees_change() {
     });
 }
 
+/// The usage bars' requests and limits (and the cluster overview's pod totals) come from one
+/// list of the pods, then a watch: a pod created shows with its own, a resize in place changes
+/// them, and a deleted pod goes, without another list.
+#[test]
+#[ignore = "needs a kind cluster: RECOUVRANCE_E2E_CONTEXT"]
+fn usage_bar_requests_follow_pods_by_a_watch() {
+    use k8s_openapi::api::core::v1::Pod;
+
+    /// Wait until the requests and limits read for pod `name` are `want`: None once it is gone.
+    async fn read_until(rx: &mut k8s::PodRequestsRx, name: &str, want: Option<k8s::PodResources>) -> Result<()> {
+        let seen = |read: &Option<Result<k8s::PodRequests, String>>| {
+            let pod = read.as_ref().and_then(|r| r.as_ref().ok()).map(|r| r.pods.get(NS, name).map(|p| p.resources));
+            pod == Some(want)
+        };
+        let waited = tokio::time::timeout(std::time::Duration::from_secs(90), rx.wait_for(seen)).await;
+        if waited.is_ok_and(|read| read.is_ok()) {
+            return Ok(());
+        }
+        let last = rx.borrow().clone().map(|read| read.map(|r| r.pods.get(NS, name).map(|p| p.resources)));
+        bail!("{name}: wanted {want:?}, last read {last:?}")
+    }
+
+    run(async {
+        const NAME: &str = "e2e-requests";
+        let client = k8s::connect_for_agents(context()).await?;
+        let pods: Api<Pod> = Api::namespaced(client.clone(), NS);
+        let _ = pods.delete(NAME, &DeleteParams::default().grace_period(0)).await;
+        pod_gone(&pods, NAME).await?;
+        let (_watch, mut rx) =
+            k8s::watch_pod_resources(client.clone(), Some(NS.into()), k8s::Pause::default(), k8s::Pause::default());
+        let checked = async {
+            read_until(&mut rx, NAME, None).await?;
+            let pod = serde_json::from_value(json!({
+                "metadata": {"name": NAME, "namespace": NS},
+                "spec": {"terminationGracePeriodSeconds": 0, "containers": [{
+                    "name": "main", "image": "busybox:1.37", "command": ["sleep", "3600"],
+                    "resources": {"requests": {"cpu": "50m", "memory": "32Mi"},
+                        "limits": {"cpu": "100m", "memory": "64Mi"}},
+                }]},
+            }))?;
+            pods.create(&PostParams::default(), &pod).await?;
+            let mi = 1024.0 * 1024.0;
+            let mut want =
+                k8s::PodResources { cpu: (Some(50.0), Some(100.0)), mem: (Some(32.0 * mi), Some(64.0 * mi)) };
+            read_until(&mut rx, NAME, Some(want)).await?;
+
+            // Resized in place, through the `resize` subresource of Kubernetes 1.33 and later.
+            let resize = json!({"spec": {"containers": [
+                {"name": "main", "resources": {"requests": {"cpu": "60m"}, "limits": {"cpu": "120m"}}},
+            ]}});
+            match pods.patch_subresource("resize", NAME, &PatchParams::default(), &Patch::Strategic(resize)).await {
+                Ok(_) => {
+                    want.cpu = (Some(60.0), Some(120.0));
+                    read_until(&mut rx, NAME, Some(want)).await?;
+                }
+                Err(kube::Error::Api(status)) if status.code == 404 => eprintln!("no in-place resize on this cluster"),
+                Err(e) => return Err(e.into()),
+            }
+
+            pods.delete(NAME, &DeleteParams::default().grace_period(0)).await?;
+            read_until(&mut rx, NAME, None).await
+        };
+        let result: Result<()> = checked.await;
+        let _ = pods.delete(NAME, &DeleteParams::default().grace_period(0)).await;
+        result
+    });
+}
+
 /// A container without a shell (`pause`, a scratch image like distroless) is read through a
 /// debug container: exec finds no shell, the debug container added shares its processes, and
 /// its files read through `/proc/<pid>/root`, a mounted volume and absolute symlinks included.

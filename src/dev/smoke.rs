@@ -123,12 +123,16 @@ pub fn run(ctx: String) {
             let (_g, mut rx) =
                 k8s::watch_pod_resources(client.clone(), None, k8s::Pause::default(), k8s::Pause::default());
             while start.elapsed() < std::time::Duration::from_secs(secs) {
-                match futures::FutureExt::now_or_never(rx.next()) {
-                    Some(Some(pods)) => {
-                        println!("pod resources: {} pods at {:.1}s", pods.len(), start.elapsed().as_secs_f64());
-                    }
-                    Some(None) => break,
-                    None => std::thread::sleep(std::time::Duration::from_millis(100)),
+                if !rx.has_changed().unwrap_or(false) {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    continue;
+                }
+                let read = rx.borrow_and_update().clone();
+                let at = start.elapsed().as_secs_f64();
+                match read {
+                    Some(Ok(read)) => println!("pod resources: {} pods at {at:.1}s", read.totals.pods),
+                    Some(Err(e)) => println!("pod resources: {e} at {at:.1}s"),
+                    None => {}
                 }
             }
             print_reads(&ctx);

@@ -155,14 +155,16 @@ impl AppView {
             watches.push((guard, task));
             let metrics_on = crate::settings::metrics_on(&ctx_name);
             if metrics_on && kind.is("", "Pod") {
-                // Requests and limits, for the usage bars.
+                // Requests and limits, for the usage bars: listed once, then kept by a watch.
                 let (guard, mut rx) = k8s::watch_pod_resources(client.clone(), ns.clone(), pause.clone(), rows_due);
                 let t = self.table.clone();
                 let task = cx.spawn(async move |_, cx| {
-                    while let Some(resources) = rx.next().await {
-                        let resources = latest(&mut rx, resources);
+                    while rx.changed().await.is_ok() {
+                        let read = rx.borrow_and_update().clone();
+                        // A list that failed, or none yet: the bars keep what they have.
+                        let Some(Ok(read)) = read else { continue };
                         t.update(cx, |t, cx| {
-                            t.delegate_mut().set_resources(ix, resources);
+                            t.delegate_mut().set_resources(ix, read.pods);
                             cx.notify();
                         });
                     }
