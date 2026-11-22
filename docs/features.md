@@ -1,6 +1,12 @@
 # Features
 
-- **Contexts**: pick one or several on launch; tables merge clusters with a Context column.
+- **Contexts**: pick one or several on launch; tables merge clusters with a Context column. When a
+  context's login command (its kubeconfig exec plugin) fails, the app says which program failed and
+  its exit code: never its arguments, environment or output, where a client secret or a token can
+  be. It adds the last line the plugin wrote to stderr when the kubeconfig sets
+  `interactiveMode: Never`; otherwise the plugin writes to the terminal Recouvrance was started
+  from. A plugin that cannot start, often because it is not on the `PATH` the app was started
+  with, is reported with its name.
 - **Sidebar**: the filter at its top finds pages and resource types (by name, kind or API group).
   Pages, saved views, favorites and types scroll together; a section folds with a click on its
   name (kept for next time) and says how many types it holds. Port forwards fold into one row at
@@ -65,8 +71,9 @@
   ControllerRevisions, Endpoints, EndpointSlices and Leases are never recorded: they change all the
   time and their history is told elsewhere (a pod's by its owner's revisions and its events). The
   **Timeline** page (sidebar, or `Timeline` in the palette) lists the connected clusters' changes
-  newest first with their events interleaved (Warnings only by default, all, or none; the events
-  of one object with the same reason make one row, with their count); shows the namespaces
+  newest first with their events interleaved (Warnings only by default, all, or none; every one
+  the cluster still keeps, an hour's worth by default; the events of one object with the same
+  reason make one row, with their count); shows the namespaces
   picked in the namespace picker only (cluster-scoped objects such as Nodes too when none is
   picked), and filters by cluster, and `ns:`, `kind:`, `ctx:` and text in its filter box; a row picked shows its diff,
   worked out then, and opens its object. Lists compare labels and annotations only, so their
@@ -132,7 +139,7 @@
 - **RBAC-aware**: actions your Kubernetes RBAC forbids are disabled; *My access* shows a can-i
   matrix for the namespace, and says when the cluster (webhook or cloud IAM authorizer) may allow
   more than it lists.
-- **Problems**: one list of what is broken across clusters (crash loops, pending pods, unavailable workloads, NotReady nodes, nodes such a taint keeps pods off for more than 5 minutes after they started, failed jobs, pending volumes, and alerts firing in the cluster's Prometheus that nobody silenced). Click a count (critical, warnings, minor) to show that severity alone; the filter box takes text and `ns:`, `kind:` (`kind:alert`, `kind:service`) and `ctx:` terms, as the Timeline's.
+- **Problems**: one list of what is broken across clusters (crash loops, pending pods, unavailable workloads, NotReady nodes, nodes such a taint keeps pods off for more than 5 minutes after they started, failed jobs, pending volumes, and alerts firing in the cluster's Prometheus that nobody silenced). Click a count (critical, warnings, minor) to show that severity alone; the filter box takes text and `ns:`, `kind:` (`kind:alert`, `kind:service`) and `ctx:` terms, as the Timeline's. The sidebar counts them in the background, again every 2 minutes (eight times as long as a count takes, when that is longer): the first count waits for the list on screen, and counting pauses while the window is hidden. A count reads at most 8 of the 32 namespaces read at once, so the page on screen always has the others; on a big cluster it then takes up to four times as long as the Problems page's scan, and comes that much less often. Its tooltip says how old the count is, and how often it comes.
 - **Alerts where you look**: a namespace's page lists the alerts labeled with it, and a pod's, workload's, volume's or node's page the alerts about it (a pod's include its workload's, a workload's its pods'), with severity, summary, how long, runbook link, and silenced or inhibited ones muted when an Alertmanager is found.
 - **Upgrade check** (Cluster overview → *Upgrade check*): per cluster, what needs action before it
   moves to a newer minor version (the next one by default; the arrows pick another), most urgent first:
@@ -227,8 +234,15 @@
   Argo CD). A page's *Investigate* asks it beside the page when it is open there.
 - **Overviews**: cluster capacity and health, workloads status, Helm releases (values masked; install from your repos, roll back and uninstall through your `helm` CLI).
 - **API requests** (Settings → API requests): per cluster, how many requests of each kind
-  (discovery, lists, watches, metrics, logs, shells, writes) were made, how many failed, and how
-  long the API server took to start answering: average, slowest, last.
+  (discovery, lists, watches, metrics, logs, shells, writes) were made and how many failed; how
+  long the API server took to start answering (p50, p95, slowest) and, for answers that end,
+  until their last byte was read (p50, p95); and how much each kind received per minute over
+  the last hour, counted decompressed as the bodies arrive. The time to the last byte includes
+  Recouvrance's own parsing when that sets the pace. Watches, logs and shells are streams that
+  run until closed: bytes only, and none for shells and port-forwards, whose data goes over the
+  upgraded connection. Below, the 10 heaviest requests, one per kind (cluster, method and path,
+  its names replaced by `{namespace}` and `{name}`), with their bytes and both times. A stream
+  is listed once it ends. Nothing leaves the machine.
 - **Favorites** and **saved views** (type + namespaces + filter, bookmark button), back/forward history, light and dark themes.
 - **Instant back**: the last 8 lists (up to 10,000 rows in all) are kept, so going back to one
   shows it at once, marked "Updating…", while a fresh list loads and replaces it in one go.

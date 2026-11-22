@@ -20,7 +20,8 @@ use crate::mcp::{Mode, Policy, Verb};
 #[tool_router(router = write_tools, vis = "pub(super)")]
 impl KubeMcp {
     #[tool(
-        description = "Run a command in a container and return its output, like `kubectl exec -- cmd` (no tty, time-limited). This can change the container."
+        description = "Run a command in a container and return its output, like `kubectl exec -- cmd` (no tty, time-limited). This can change the container.",
+        annotations(read_only_hint = false)
     )]
     async fn exec_command(
         &self,
@@ -37,7 +38,10 @@ impl KubeMcp {
         call.finish(k8s::exec_capture(client, p.namespace, p.pod, p.container, p.command, timeout, 64 * 1024).await)
     }
 
-    #[tool(description = "Scale a workload to a number of replicas, like `kubectl scale`. Supports dry_run.")]
+    #[tool(
+        description = "Scale a workload to a number of replicas, like `kubectl scale`. Supports dry_run.",
+        annotations(read_only_hint = false)
+    )]
     pub(super) async fn scale(
         &self,
         Extension(parts): Extension<Parts>,
@@ -53,7 +57,8 @@ impl KubeMcp {
     }
 
     #[tool(
-        description = "Restart a Deployment, StatefulSet or DaemonSet, like `kubectl rollout restart`. Supports dry_run."
+        description = "Restart a Deployment, StatefulSet or DaemonSet, like `kubectl rollout restart`. Supports dry_run.",
+        annotations(read_only_hint = false)
     )]
     async fn rollout_restart(
         &self,
@@ -70,7 +75,8 @@ impl KubeMcp {
     }
 
     #[tool(
-        description = "Apply a JSON merge patch to one object, like `kubectl patch --type merge`. Supports dry_run."
+        description = "Apply a JSON merge patch to one object, like `kubectl patch --type merge`. Supports dry_run.",
+        annotations(read_only_hint = false)
     )]
     async fn patch_resource(
         &self,
@@ -88,7 +94,8 @@ impl KubeMcp {
     }
 
     #[tool(
-        description = "Create or update objects from YAML with server-side apply, like `kubectl apply --server-side`. Each object is authorized separately. Supports dry_run."
+        description = "Create or update objects from YAML with server-side apply, like `kubectl apply --server-side`. Each object is authorized separately. Supports dry_run.",
+        annotations(read_only_hint = false)
     )]
     async fn apply_manifest(
         &self,
@@ -141,7 +148,8 @@ impl KubeMcp {
     }
 
     #[tool(
-        description = "Cordon a node and evict its pods, like `kubectl drain --ignore-daemonsets`. PodDisruptionBudgets are respected; refused evictions are reported. Refused (nothing is changed) when the node runs pods in namespaces your rules deny `delete` on pods for."
+        description = "Cordon a node and evict its pods, like `kubectl drain --ignore-daemonsets`. PodDisruptionBudgets are respected; refused evictions are reported. Refused (nothing is changed) when the node runs pods in namespaces your rules deny `delete` on pods for.",
+        annotations(read_only_hint = false)
     )]
     async fn drain_node(
         &self,
@@ -203,7 +211,8 @@ impl KubeMcp {
     }
 
     #[tool(
-        description = "GitOps actions: Flux `reconcile` (like `flux reconcile`), `suspend`, `resume`; Argo CD Application `refresh`, `hard_refresh` (renders its manifests again, without Argo CD's cache) or `sync`, authorized as `patch` on the object. Argo CD `diagnose` changes nothing (authorized as `get`): why the Application drifts, keeps syncing (a sync loop, with the `ignoreDifferences` that would stop it), failed (hook, admission, missing CRD...) or is stuck (a long sync, a finalizer holding its deletion), and for each out-of-sync resource the fields that differ between what was last applied and the live object on its destination, with who wrote them since the last sync. The destination's objects are read only where your rules allow `get`."
+        description = "GitOps actions: Flux `reconcile` (like `flux reconcile`), `suspend`, `resume`; Argo CD Application `refresh`, `hard_refresh` (renders its manifests again, without Argo CD's cache) or `sync`, authorized as `patch` on the object. Argo CD `diagnose` changes nothing (authorized as `get`): why the Application drifts, keeps syncing (a sync loop, with the `ignoreDifferences` that would stop it), failed (hook, admission, missing CRD...) or is stuck (a long sync, a finalizer holding its deletion), and for each out-of-sync resource the fields that differ between what was last applied and the live object on its destination, with who wrote them since the last sync. The destination's objects are read only where your rules allow `get`.",
+        annotations(read_only_hint = false)
     )]
     async fn gitops(
         &self,
@@ -245,7 +254,10 @@ impl KubeMcp {
         })
     }
 
-    #[tool(description = "Delete one object, like `kubectl delete`. Supports dry_run.")]
+    #[tool(
+        description = "Delete one object, like `kubectl delete`. Supports dry_run.",
+        annotations(read_only_hint = false)
+    )]
     pub(super) async fn delete_resource(
         &self,
         Extension(parts): Extension<Parts>,

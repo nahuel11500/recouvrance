@@ -3,12 +3,24 @@
 use http::request::Parts;
 use rmcp::handler::server::tool::Extension;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::{tool, tool_router};
+use rmcp::{schemars, tool, tool_router};
+use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::{ApplyParams, KubeMcp, access_for};
+use super::{KubeMcp, access_for};
 use crate::k8s::{self, ObjectRef};
 use crate::mcp::{Mode, Verb};
+
+/// What `apply_manifest` takes, without `dry_run`: a diff is always a dry run, and its schema
+/// must not offer a choice that does nothing.
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct DiffParams {
+    pub context: String,
+    #[schemars(description = "one or more YAML documents, as apply_manifest takes them")]
+    pub manifest: String,
+    #[schemars(description = "namespace for objects that don't set one")]
+    pub namespace: Option<String>,
+}
 
 /// Fields the server sets on every write, which a diff would only show as noise.
 const NOISE: [&str; 6] = [
@@ -29,7 +41,7 @@ impl KubeMcp {
     async fn diff_manifest(
         &self,
         Extension(parts): Extension<Parts>,
-        Parameters(p): Parameters<ApplyParams>,
+        Parameters(p): Parameters<DiffParams>,
     ) -> Result<String, String> {
         let args = json!({"context": p.context, "namespace": p.namespace, "bytes": p.manifest.len()});
         let mut call = self.begin(&parts, "diff_manifest", args)?;

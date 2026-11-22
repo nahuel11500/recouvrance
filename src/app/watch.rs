@@ -113,10 +113,17 @@ impl AppView {
         }
         let mut watches = Vec::new();
         let mut metrics = Vec::new();
-        // Set while the list is hidden: watches hold their snapshots back, metrics stop polling.
+        // Set while the list isn't on screen (another page, a hidden window): watches hold
+        // their snapshots back, metrics stop polling.
         let pause = k8s::Pause::default();
+        pause.set(!self.list_on_screen());
+        self.list_pause = pause.clone();
         for (ix, ((ctx_name, client), ns)) in self.clusters.clone().into_iter().zip(watched).enumerate() {
             let Some(ns) = ns else { continue };
+            // Set until this cluster has rows on screen (the ones from before count): the
+            // usage bars' read of whole pods waits for them, the list gets the API first.
+            let rows_due = k8s::Pause::default();
+            rows_due.set(progressive);
             let (guard, mut rx) = k8s::watch_table_paused(
                 client.clone(),
                 kind.clone(),
@@ -127,7 +134,7 @@ impl AppView {
                 // The timeline records what this list sees change (no request added).
                 crate::timeline::tap(&ctx_name, &kind, ns.clone()),
             );
-            let shown = pause.clone();
+            let (shown, rows_in) = (pause.clone(), rows_due.clone());
             let task = cx.spawn(async move |this, cx| {
                 while wait_list_shown(&this, &shown, cx).await {
                     let Some(msg) = rx.next().await else { break };
@@ -135,6 +142,9 @@ impl AppView {
                     let mut batch = vec![msg];
                     while let Ok(msg) = rx.try_recv() {
                         batch.push(msg);
+                    }
+                    if batch.iter().any(|m| matches!(m, TableMsg::Rows(_) | TableMsg::Listed)) {
+                        rows_in.set(false);
                     }
                     let alive = this.update(cx, |this, cx| this.on_table_msgs(ix, batch, cx));
                     if alive.is_err() {
@@ -146,7 +156,7 @@ impl AppView {
             let metrics_on = crate::settings::metrics_on(&ctx_name);
             if metrics_on && kind.is("", "Pod") {
                 // Requests and limits, for the usage bars.
-                let (guard, mut rx) = k8s::watch_pod_resources(client.clone(), ns.clone(), pause.clone());
+                let (guard, mut rx) = k8s::watch_pod_resources(client.clone(), ns.clone(), pause.clone(), rows_due);
                 let t = self.table.clone();
                 let task = cx.spawn(async move |_, cx| {
                     while let Some(resources) = rx.next().await {
@@ -202,6 +212,11 @@ impl AppView {
         self.watch = Some(watches);
         self.metrics = Some(metrics);
         cx.notify();
+    }
+
+    /// Whether the resource list is on screen: its page shown, in a window not hidden.
+    pub(super) fn list_on_screen(&self) -> bool {
+        matches!(self.route(), Route::Resources(_)) && !self.window_hidden
     }
 
     /// Keep the highlight on the selected object once the rows moved: updates, a
@@ -287,11 +302,12 @@ fn latest<T>(rx: &mut futures::channel::mpsc::UnboundedReceiver<T>, mut value: T
     value
 }
 
-/// Wait until the resource list is the page shown, pausing its watches meanwhile
-/// (like detail pages do with `wait_visible`). False once the view is gone.
+/// Wait until the resource list is on screen (its page shown, the window not hidden),
+/// pausing its watches meanwhile (like detail pages do with `wait_visible`). False once
+/// the view is gone.
 async fn wait_list_shown(this: &WeakEntity<AppView>, pause: &k8s::Pause, cx: &mut AsyncApp) -> bool {
     loop {
-        match this.update(cx, |this, _| matches!(this.route(), Route::Resources(_))) {
+        match this.update(cx, |this, _| this.list_on_screen()) {
             Err(_) => return false,
             Ok(true) => {
                 pause.set(false);

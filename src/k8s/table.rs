@@ -13,6 +13,7 @@ use kube::discovery::ApiResource;
 use kube::{Client, Resource as _};
 use serde::Deserialize;
 
+use super::lane::{Lane, Slots};
 use super::node_specs::{self, NodeSpecs};
 use super::{Kind, TaskGuard, api_status, lists, run, short_error, spawn_guarded};
 use crate::timeline::Tap;
@@ -186,7 +187,11 @@ impl Row {
 pub enum TableMsg {
     Columns(Arc<Vec<ColumnDef>>),
     Rows(Vec<Arc<Row>>),
-    /// The initial list is complete (rows before this were partial pages).
+    /// The rows sent last hold every row of the initial list, some from their cells alone
+    /// (see `cells_by_namespace`): `Listed` follows once they have their objects' metadata.
+    AllRows,
+    /// The initial list is complete, and the rows sent right before hold all of it (rows
+    /// before those were partial pages). A paused watch sends both once it is unpaused.
     Listed,
     Error(String),
     /// The user may not list this type here (403): the watch stops instead of retrying.
@@ -384,14 +389,19 @@ pub(super) async fn list_paged_with(
 /// Namespaces listed at once by `cells_by_namespace`, across all its callers (lists,
 /// problem scan, overviews), to stay gentle with the API server.
 const FAST_PARALLEL: usize = 32;
-static FAST_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(FAST_PARALLEL);
+/// Of those, the most background work holds (the problem badge's count, a hidden list):
+/// the list or page on screen always has the others.
+const BACKGROUND_PARALLEL: usize = 8;
+static FAST_SLOTS: Slots = Slots::new(FAST_PARALLEL, BACKGROUND_PARALLEL);
 
 /// A big list's rows without their objects, one namespace at a time, many at once, from the
 /// API server's cache. The objects' metadata (managedFields above all) is most of a list's
 /// bytes: on a cluster with 23k pods, 160 MB against 6 MB, so this shows the whole list in
 /// about 2 s where the full one takes 8 to 10 s over a laptop's link. Rows have no uid,
-/// labels or creation time (they come with the full list, which replaces them).
-async fn cells_by_namespace(client: &Client, url: &str) -> Result<Vec<Arc<Row>>> {
+/// labels or creation time (they come with the full list, which replaces them). Each request
+/// takes its slot in the lane `lane` says at that moment: a hidden list that comes on screen
+/// while it loads takes the page's slots for the namespaces left.
+async fn cells_by_namespace(client: &Client, url: &str, lane: &(dyn Fn() -> Lane + Sync)) -> Result<Vec<Arc<Row>>> {
     let (prefix, resource) = url.rsplit_once('/').ok_or_else(|| anyhow!("unexpected path {url}"))?;
     let mut req = http::Request::get("/api/v1/namespaces?includeObject=None").body(Vec::new())?;
     req.headers_mut().insert(http::header::ACCEPT, http::HeaderValue::from_static(TABLE_ACCEPT));
@@ -404,7 +414,7 @@ async fn cells_by_namespace(client: &Client, url: &str) -> Result<Vec<Arc<Row>>>
             "{prefix}/namespaces/{ns}/{resource}?includeObject=None&resourceVersion=0&resourceVersionMatch=NotOlderThan"
         );
         async move {
-            let _slot = FAST_SLOTS.acquire().await?;
+            let _slot = FAST_SLOTS.acquire(lane()).await?;
             let mut req = http::Request::get(&path).body(Vec::new())?;
             req.headers_mut().insert(http::header::ACCEPT, http::HeaderValue::from_static(TABLE_ACCEPT));
             let page: ServerTable = lists::request_idle(&client, req).await?;
@@ -425,9 +435,9 @@ async fn cells_by_namespace(client: &Client, url: &str) -> Result<Vec<Arc<Row>>>
 
 /// The first list of a namespaced kind in every namespace, shown as soon as it can be: its
 /// first page (2000 rows) at once; when more follow, every namespace's rows without their
-/// objects (`cells_by_namespace`: about 2 s for 23k pods over a laptop's link); then the
-/// whole list with its objects' metadata in one response from the API server's cache,
-/// parsed as it streams in (about half the time of paging through it).
+/// objects (`cells_by_namespace`: about 2 s for 23k pods over a laptop's link), then
+/// `AllRows`; then the whole list with its objects' metadata in one response from the API
+/// server's cache, parsed as it streams in (about half the time of paging through it).
 async fn list_fast(
     client: &Client,
     url: &str,
@@ -452,10 +462,11 @@ async fn list_fast(
         let _ = tx.unbounded_send(TableMsg::Rows(rows));
     }
     // A failure here only means waiting for the whole list.
-    if let Ok(cells) = cells_by_namespace(client, url).await
+    if let Ok(cells) = cells_by_namespace(client, url, &|| pause.lane()).await
         && !pause.is_paused()
     {
         let _ = tx.unbounded_send(TableMsg::Rows(cells));
+        let _ = tx.unbounded_send(TableMsg::AllRows);
     }
     match list_whole(client, url, tap).await {
         Ok(listed) => Ok(listed),
@@ -610,7 +621,8 @@ pub async fn list_light(
             return Ok((defs, rows));
         }
         let rows = match (&ns, kind.namespaced) {
-            (None, true) if with_namespaces => match cells_by_namespace(&client, &url).await {
+            // In the lane of whoever asked: the problem badge's count goes in the background.
+            (None, true) if with_namespaces => match cells_by_namespace(&client, &url, &Lane::current).await {
                 Ok(rows) => rows,
                 // One namespace refused or stalled doesn't fail the kind: the whole list has
                 // every namespace's rows (with their objects' metadata, so more bytes).
@@ -632,7 +644,8 @@ pub async fn list_light(
 const LIGHT_PROBE: u32 = 1000;
 
 /// Holds back a watch's snapshots while its list is hidden: events still apply (the
-/// watch stays current), and the rows are sent once it is shown again.
+/// watch stays current), and the rows are sent once it is shown again (with `Listed`, when
+/// the first list completed meanwhile).
 #[derive(Clone, Default)]
 pub struct Pause(Arc<std::sync::atomic::AtomicBool>);
 
@@ -643,6 +656,11 @@ impl Pause {
 
     pub fn is_paused(&self) -> bool {
         self.0.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The lane of the list's requests now: a hidden list makes way for what is on screen.
+    fn lane(&self) -> Lane {
+        if self.is_paused() { Lane::Background } else { Lane::Foreground }
     }
 }
 
@@ -672,17 +690,23 @@ impl Snapshots {
         }
     }
 
-    /// Send the rows if they changed, the list is shown and the last snapshot is old enough.
+    /// Send the rows if they changed, the list is shown and the last snapshot is old enough;
+    /// right after them, `Listed` when the first list is complete and hasn't said so yet.
     fn flush(
         &mut self,
         rows: &HashMap<String, Arc<Row>>,
         tx: &mpsc::UnboundedSender<TableMsg>,
         pause: &Pause,
+        first: &mut FirstList,
     ) -> Result<()> {
         if self.wait(pause) == Some(std::time::Duration::ZERO) {
             tx.unbounded_send(TableMsg::Rows(snapshot(rows)))?;
             self.dirty = false;
             self.sent = Some(std::time::Instant::now());
+            if *first == FirstList::Unsent {
+                tx.unbounded_send(TableMsg::Listed)?;
+                *first = FirstList::Done;
+            }
         }
         Ok(())
     }
@@ -776,13 +800,19 @@ pub(super) enum FirstList {
     Pages { by_namespace: bool },
     /// Not listed yet, rows from before on screen: send the list whole.
     Whole,
+    /// Listed, but `Listed` not sent yet: it goes right after the rows, which a paused watch
+    /// holds back. Sent before them, it would make the rows the app holds (a first page, rows
+    /// without their objects) pass for the whole list, and keep them as such when the list
+    /// is left. A relist keeps the rows until it is complete.
+    Unsent,
     /// Listed (`Listed` sent): a relist keeps the rows until it is complete.
     Done,
 }
 
 /// One list then watch. Until a first list completes, pages are shown as they arrive
-/// (`FirstList::Pages`) and `Listed` ends them; on a relist the table keeps its rows
-/// until the new list is complete, then gets it whole.
+/// (`FirstList::Pages`), and `Listed` follows the rows of the whole list, once they are
+/// sent (`FirstList::Unsent`); on a relist the table keeps its rows until the new list is
+/// complete, then gets it whole.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn watch_once(
     client: &Client,
@@ -841,12 +871,12 @@ pub(super) async fn watch_once(
         tap.end_list();
     }
     let mut rows: HashMap<String, Arc<Row>> = list_rows.into_iter().map(|r| (r.uid.clone(), r)).collect();
-    let mut snaps = Snapshots { dirty: true, sent: None };
-    snaps.flush(&rows, tx, pause)?;
+    // `Listed` goes with the first rows sent: at once, or when a paused list is unpaused.
     if *first != FirstList::Done {
-        tx.unbounded_send(TableMsg::Listed)?;
-        *first = FirstList::Done;
+        *first = FirstList::Unsent;
     }
+    let mut snaps = Snapshots { dirty: true, sent: None };
+    snaps.flush(&rows, tx, pause, first)?;
     let mut version = version;
     // A cut stream or a failed reopen watches again from `version`, waiting longer each time.
     let mut backoff = Backoff::default();
@@ -938,7 +968,7 @@ pub(super) async fn watch_once(
                 }
                 None => {}
             }
-            snaps.flush(&rows, tx, pause)?;
+            snaps.flush(&rows, tx, pause, first)?;
         }
         if cut {
             tokio::time::sleep(backoff.next()).await;
@@ -1352,5 +1382,164 @@ mod node_tests {
         assert!(!needs_object("/api/v1/namespaces/a/pods", &Extras::default()));
         let custom: Extras = Arc::new(vec![("Replicas".into(), ".spec.replicas".into())]);
         assert!(needs_object("/apis/apps/v1/deployments", &custom));
+    }
+}
+
+#[cfg(test)]
+mod fast_list_tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use futures::StreamExt as _;
+    use futures::channel::mpsc::UnboundedReceiver;
+    use serde_json::{Value, json};
+    use tokio::sync::Semaphore;
+
+    use super::{Arc, Lane, Pause, TableMsg, TaskGuard, cells_by_namespace, watch_table_paused};
+    use crate::k8s::Kind;
+
+    /// Three pods in namespaces `a` and `b`, whose first page holds one: a big list. Its list
+    /// of namespaces waits for a permit of `gate`, and it refuses watches.
+    #[derive(Clone)]
+    struct Big {
+        gate: Arc<Semaphore>,
+    }
+
+    impl Big {
+        /// With the gate open.
+        fn open() -> Self {
+            Self { gate: Arc::new(Semaphore::new(1)) }
+        }
+    }
+
+    impl tower::Service<http::Request<kube::client::Body>> for Big {
+        type Response = http::Response<http_body_util::Full<bytes::Bytes>>;
+        type Error = std::convert::Infallible;
+        type Future = futures::future::BoxFuture<'static, Result<Self::Response, Self::Error>>;
+
+        fn poll_ready(&mut self, _: &mut std::task::Context<'_>) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, req: http::Request<kube::client::Body>) -> Self::Future {
+            let (path, query) = (req.uri().path(), req.uri().query().unwrap_or_default());
+            let table = |rows: Vec<Value>, more: &str| {
+                json!({"kind": "Table", "apiVersion": "meta.k8s.io/v1",
+                    "metadata": {"resourceVersion": "7", "continue": more},
+                    "columnDefinitions": [{"name": "Name"}, {"name": "Status"}], "rows": rows})
+            };
+            let pod = |ns: &str, name: &str| {
+                json!({"cells": [name, "Running"],
+                    "object": {"metadata": {"name": name, "namespace": ns, "uid": format!("{ns}-{name}")}}})
+            };
+            let cells = |name: &str| json!({"cells": [name, "Running"]});
+            let body = match path {
+                "/api/v1/namespaces" => table(vec![json!({"cells": ["a"]}), json!({"cells": ["b"]})], ""),
+                "/api/v1/namespaces/a/pods" => table(vec![cells("api"), cells("web")], ""),
+                "/api/v1/namespaces/b/pods" => table(vec![cells("db")], ""),
+                "/api/v1/pods" if query.contains("watch=true") => json!({"kind": "Status", "code": 404}),
+                "/api/v1/pods" if query.contains("resourceVersion=0") => {
+                    table(vec![pod("a", "api"), pod("a", "web"), pod("b", "db")], "")
+                }
+                "/api/v1/pods" if query.contains("continue=") => table(vec![pod("a", "web"), pod("b", "db")], ""),
+                "/api/v1/pods" => table(vec![pod("a", "api")], "next"),
+                _ => json!({"kind": "Status", "code": 404}),
+            };
+            let code = if body["kind"] == "Status" { 404 } else { 200 };
+            let response = http::Response::builder().status(code).body(body.to_string().into_bytes().into()).unwrap();
+            let gate = (path == "/api/v1/namespaces").then(|| self.gate.clone());
+            Box::pin(async move {
+                if let Some(gate) = gate {
+                    // Taken and given back: once open, the gate lets every request through.
+                    drop(gate.acquire().await);
+                }
+                Ok::<_, std::convert::Infallible>(response)
+            })
+        }
+    }
+
+    /// The list of every pod on `big`, held back while `pause` is set.
+    fn watch(big: Big, pause: &Pause) -> (TaskGuard, UnboundedReceiver<TableMsg>) {
+        let client = kube::Client::new(big, "default");
+        watch_table_paused(client, Kind::fake("", "Pod"), None, Arc::default(), pause.clone(), true, None)
+    }
+
+    /// What the list sends, up to the first `last`.
+    async fn until(rx: &mut UnboundedReceiver<TableMsg>, last: &str) -> Vec<String> {
+        let mut sent = Vec::new();
+        let read = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while let Some(msg) = rx.next().await {
+                sent.push(match msg {
+                    TableMsg::Columns(_) => "columns".to_string(),
+                    TableMsg::Rows(rows) => format!("rows {}", rows.len()),
+                    TableMsg::AllRows => "all rows".to_string(),
+                    TableMsg::Listed => "listed".to_string(),
+                    TableMsg::Error(_) => "error".to_string(),
+                    TableMsg::Forbidden(_) => "forbidden".to_string(),
+                });
+                if sent.last().is_some_and(|said| said == last) {
+                    break;
+                }
+            }
+        })
+        .await;
+        assert!(read.is_ok(), "no {last} after {sent:?}");
+        sent
+    }
+
+    /// The end of what a list sends once it is shown: the whole list, then `Listed`.
+    fn listed_with_its_rows(sent: &[String]) -> bool {
+        sent.ends_with(&["rows 3".to_string(), "listed".to_string()])
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_big_list_says_when_every_row_is_shown() {
+        {
+            // The first page, every namespace's rows from their cells, then the whole list.
+            let (_watch, mut rx) = watch(Big::open(), &Pause::default());
+            assert_eq!(until(&mut rx, "listed").await, ["columns", "rows 1", "rows 3", "all rows", "rows 3", "listed"]);
+        }
+        // Hidden, it shows nothing, so it never says every row is shown, nor that it is listed
+        // (then its watch is refused); shown, it sends the whole list, then `Listed`.
+        let pause = Pause::default();
+        pause.set(true);
+        let (_watch, mut rx) = watch(Big::open(), &pause);
+        assert_eq!(until(&mut rx, "error").await, ["columns", "error"]);
+        pause.set(false);
+        let sent = until(&mut rx, "listed").await;
+        assert!(listed_with_its_rows(&sent), "{sent:?}");
+    }
+
+    /// A list left as it loads (another page, a hidden window) pauses at once, while the app
+    /// may still be waiting on the channel and apply whatever comes: `Listed` before its rows
+    /// would make the first page pass for the whole list, and keep it as such.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_list_left_as_it_loads_says_it_is_listed_only_with_its_rows() {
+        let (pause, big) = (Pause::default(), Big { gate: Arc::new(Semaphore::new(0)) });
+        let gate = big.gate.clone();
+        let (_watch, mut rx) = watch(big, &pause);
+        // The first page shows; every namespace's rows wait at the gate.
+        assert_eq!(until(&mut rx, "rows 1").await, ["columns", "rows 1"]);
+        pause.set(true);
+        gate.add_permits(1);
+        // The list completes, then its watch is refused: nothing in between.
+        assert_eq!(until(&mut rx, "error").await, ["error"]);
+        pause.set(false);
+        let sent = until(&mut rx, "listed").await;
+        assert!(listed_with_its_rows(&sent), "{sent:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn each_namespace_takes_its_slot_in_the_lane_of_that_moment() {
+        let client = kube::Client::new(Big::open(), "default");
+        let asked = AtomicUsize::new(0);
+        let lane = || {
+            asked.fetch_add(1, Ordering::Relaxed);
+            Lane::Foreground
+        };
+        let rows = cells_by_namespace(&client, "/api/v1/pods", &lane).await.unwrap();
+        assert_eq!(rows.len(), 3);
+        // Asked as each request takes its slot, not once for all: a hidden list that comes on
+        // screen while it loads takes the page's slots for the namespaces left.
+        assert_eq!(asked.load(Ordering::Relaxed), 2);
     }
 }
