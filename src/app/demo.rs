@@ -173,6 +173,11 @@ impl AppView {
                 self.ns_picker.update(cx, |p, cx| p.demo_search(&text, window, cx));
             }
             "newtab" => self.new_tab(None, window, cx),
+            // What's new: this version's notes, or those shown after an update from a version.
+            "whats-new" => crate::ui::whats_new::open_own(window, cx),
+            other if other.starts_with("whats-new:") => {
+                crate::ui::whats_new::open_after(&other["whats-new:".len()..], window, cx);
+            }
             other if other.starts_with("page:") => self.qa_page(&other[5..], window, cx),
             other if other.starts_with("kubeconfig-paste:") => {
                 let text = std::fs::read_to_string(&other["kubeconfig-paste:".len()..]).unwrap_or_default();

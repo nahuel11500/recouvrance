@@ -246,6 +246,13 @@
   upgraded connection. Below, the 10 heaviest requests, one per kind (cluster, method and path,
   its names replaced by `{namespace}` and `{name}`), with their bytes and both times. A stream
   is listed once it ends. Nothing leaves the machine.
+- **What's new and updates**: the first start after an update shows the release notes of every
+  version since the one run before (the version's own notes when that one is unknown), once.
+  They are the changelog built into the app: nothing is fetched. Settings → About shows them again,
+  says how the copy you run was installed (the install script, the `.deb`, the AppImage, or a
+  tarball or source build, with its path) and how to update it, with the command to copy.
+  *Check for updates* there asks GitHub for the latest release, only when clicked, and says
+  whether it is newer.
 - **Favorites** and **saved views** (type + namespaces + filter, bookmark button), back/forward history, light and dark themes.
 - **Instant back**: the last 8 lists (up to 10,000 rows in all) are kept, so going back to one
   shows it at once, marked "Updating…", while a fresh list loads and replaces it in one go.

@@ -94,6 +94,7 @@ context already shown as `name@file` keeps that name when `name` is freed.
 | `delete_confirm_kinds` | by kind | `{ "Pod": "off", "Cluster.postgresql.cnpg.io": "type" }`: what deleting asks per kind, a custom resource with its group (see [features](features.md)). A value that doesn't read asks for the name |
 | `namespace_visits` | | Remembered by the app: namespaces chosen per context, with a visit count and the last visit time. The namespace picker shows the five most frequent first (visits weigh half as much after a week without one); 30 kept per context. Older files' `recent_namespaces` are turned into visits once |
 | `last_contexts`, `recent_contexts` | | Remembered by the app |
+| `last_seen_version` | the version installed | Remembered by the app: the newest version whose release notes were shown (What's new, once after an update). A new install starts with its own version; a file without the key, from before What's new, shows the running version's notes once. Never set back by a downgrade. While `settings.json` can't be read, What's new doesn't show |
 | `timeline` | | What the timeline records and keeps (see [Timeline](#timeline)) |
 
 ### Timeline

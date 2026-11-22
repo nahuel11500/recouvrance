@@ -184,8 +184,10 @@ pub fn open_main_window(cx: &mut App) {
         app_id: Some("recouvrance".into()),
         ..TitleBar::window_options()
     };
-    if let Err(e) = open_window(options, cx, |window, cx| cx.new(|cx| AppView::new(window, cx))) {
-        eprintln!("could not open a window: {e:#}");
+    match open_window(options, cx, |window, cx| cx.new(|cx| AppView::new(window, cx))) {
+        // After an update, its release notes, once: the next window finds them seen.
+        Ok((window, _)) => crate::ui::whats_new::show_once(window, cx),
+        Err(e) => eprintln!("could not open a window: {e:#}"),
     }
 }
 
