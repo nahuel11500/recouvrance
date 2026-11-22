@@ -410,7 +410,7 @@ impl ArgoResources {
         let rows = argo::resource_rows(app);
         self.attention = rows.iter().enumerate().filter_map(|(i, r)| r.needs_attention().then_some(i)).collect();
         self.automated = argo::auto_sync(app);
-        self.no_health = argo::keeps_no_health(&rows);
+        self.no_health = argo::keeps_no_health(app);
         self.rows = rows;
     }
 
@@ -479,7 +479,7 @@ pub(super) fn resources_table(ctx: &Ctx, cx: &App) -> Div {
         .child(heading(&format!("Resources ({})", table.rows.len())))
         .when_some(toggle, |d, toggle| d.child(h_flex().pb_2().child(toggle)))
         .when(unreachable && !table.rows.is_empty(), |d| d.child(note(NO_CONTEXT)))
-        .when(table.no_health, |d| d.child(note(NO_HEALTH)))
+        .when(table.no_health && !table.rows.is_empty(), |d| d.child(note(NO_HEALTH)))
         .child(if table.rows.is_empty() {
             note("Argo CD lists no resources for it.")
         } else {
@@ -579,13 +579,19 @@ mod tests {
         let mut table = ArgoResources::default();
         table.set(&app);
         assert_eq!(shown(&table), ["a", "b", "c", "d"]);
+        // It keeps each resource's health: no note over the table.
+        assert!(!table.no_health);
         table.alone = true;
         assert_eq!(shown(&table), ["b", "d"]);
         assert!(table.row(2).is_none());
-        // Read again with nothing wrong: every row, rather than none; the choice is kept.
-        table.set(&json!({"status": {"resources": [{"kind": "ConfigMap", "name": "a", "status": "Synced"}]}}));
+        // Read again with nothing wrong: every row, rather than none; the choice is kept. Its
+        // health is now in Argo CD's resource tree, as the Application says.
+        table.set(&json!({"status": {"resourceHealthSource": "appTree", "resources": [
+            {"kind": "ConfigMap", "name": "a", "status": "Synced"}
+        ]}}));
         assert_eq!(shown(&table), ["a"]);
         assert!(table.alone);
+        assert!(table.no_health);
     }
 }
 

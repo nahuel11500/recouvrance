@@ -78,6 +78,26 @@ impl Route {
     fn is_resources(&self) -> bool {
         matches!(self, Self::Resources(_) | Self::Detail(_))
     }
+
+    /// The page shown, for the routes that are one.
+    fn page(&self) -> Option<EntityId> {
+        match self {
+            Self::Detail(e) => Some(e.entity_id()),
+            Self::Workloads(e) => Some(e.entity_id()),
+            Self::Cluster(e) => Some(e.entity_id()),
+            Self::Problems(e) => Some(e.entity_id()),
+            Self::Timeline(e) => Some(e.entity_id()),
+            Self::Access(e) => Some(e.entity_id()),
+            Self::HelmInstall(e) => Some(e.entity_id()),
+            Self::Assistant(e) => Some(e.entity_id()),
+            Self::Helm(e) => Some(e.entity_id()),
+            Self::HelmRelease(e) => Some(e.entity_id()),
+            Self::Argo(e) => Some(e.entity_id()),
+            Self::Terminal(e) => Some(e.entity_id()),
+            Self::Apply(e) => Some(e.entity_id()),
+            Self::Resources(_) | Self::Contexts | Self::Settings | Self::Agents => None,
+        }
+    }
 }
 
 /// A tab: its own back/forward history, filter and namespaces. The active tab's

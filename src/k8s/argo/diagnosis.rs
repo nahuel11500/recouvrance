@@ -302,7 +302,7 @@ impl Diagnosis {
         let differing: Vec<Res> = out_of_sync
             .iter()
             .copied()
-            .filter(|r| r["requiresPruning"] != true && s(r, "/health/status") != Some("Missing"))
+            .filter(|r| !super::to_prune(r) && s(r, "/health/status") != Some("Missing"))
             .filter_map(Res::of)
             .collect();
         if let Some(lp) = sync_loop(app, now) {
@@ -745,7 +745,8 @@ fn out_of_sync_finding(
     let objects: Vec<(Res, String)> = resources
         .iter()
         .filter_map(|r| {
-            let what = if r["requiresPruning"] == true {
+            // The resources table says the same of the same resources (`argo::to_prune`).
+            let what = if super::to_prune(r) {
                 "in the cluster, no longer in git: a sync with prune deletes it"
             } else {
                 match there(r, live) {
@@ -1225,22 +1226,26 @@ async fn group_kinds(client: &Client, context: &str, group: &str) -> anyhow::Res
     Ok(kinds)
 }
 
-/// The kind to read `res` with: the version Argo CD applied it with, else any.
+/// The kind to read `res` with: the version Argo CD applied it with, else any. Labelled as
+/// the sidebar would, for a page opened with it.
 fn kind_for(kinds: &[(ApiResource, bool)], res: &Res) -> Option<Kind> {
     let of = |v: bool| kinds.iter().find(|(ar, _)| ar.kind == res.kind && (!v || ar.version == res.version));
     let (ar, namespaced) = of(true).or_else(|| of(false))?;
-    Some(Kind { ar: ar.clone(), namespaced: *namespaced, section: "", label: res.kind.clone() })
+    Some(k8s::kind_of(ar.clone(), *namespaced))
 }
 
-/// The kind to open `res` with among `kinds`, the connected clusters' (its group and kind,
-/// not a kind of the same name in another group): any of them on a connected context, else
-/// only a built-in kind, the same on every cluster. None: look it up there (`kind_on`).
-pub fn known_kind(kinds: &[Kind], res: &Res, connected: bool) -> Option<Kind> {
-    kinds.iter().find(|k| k.is(&res.group, &res.kind)).filter(|k| connected || !k8s::is_custom(k)).cloned()
+/// The kind to open `res` with among `kinds`, those its own cluster serves (another cluster's
+/// may not be served there, or not at that version): its group and kind, never a kind of the
+/// same name in another group, at the version Argo CD applied it with when it is served, else
+/// another. None: look it up there (`kind_on`).
+pub fn known_kind<'a>(kinds: impl IntoIterator<Item = &'a Kind>, res: &Res) -> Option<Kind> {
+    let same: Vec<&Kind> = kinds.into_iter().filter(|k| k.is(&res.group, &res.kind)).collect();
+    same.iter().find(|k| k.ar.version == res.version).or_else(|| same.first()).copied().cloned()
 }
 
 /// The kind `res` is served as on the context `context` (its group discovered there, kept a
-/// while), to open it on a cluster whose kinds the app doesn't know: one not connected.
+/// while), to open it on a cluster whose kinds the app doesn't know: one not connected, or
+/// one whose discovery didn't list it.
 pub async fn kind_on(client: Client, context: String, res: Res) -> anyhow::Result<Kind> {
     k8s::run(async move {
         let kinds = match group_kinds(&client, &context, &res.group).await {
@@ -1991,30 +1996,41 @@ mod tests {
     }
 
     #[test]
-    fn an_object_opens_with_a_kind_of_the_connected_clusters_only_when_it_is_the_same_everywhere() {
+    fn an_object_opens_with_the_kind_its_cluster_serves_at_the_version_applied() {
+        let at = |group: &str, kind: &str, version: &str| {
+            let mut k = Kind::fake(group, kind);
+            k.ar.version = version.into();
+            k.ar.api_version = format!("{group}/{version}");
+            k
+        };
         let kinds = vec![
             Kind::fake("apps", "Deployment"),
+            at("autoscaling", "HorizontalPodAutoscaler", "v1"),
+            at("autoscaling", "HorizontalPodAutoscaler", "v2"),
             Kind::fake("cert-manager.io", "Certificate"),
             Kind::fake("", "Namespace"),
         ];
-        let res = |group: &str, kind: &str| Res {
+        let res = |group: &str, kind: &str, version: &str| Res {
             group: group.into(),
             kind: kind.into(),
             name: "x".into(),
+            version: version.into(),
             ..Default::default()
         };
-        // A built-in kind is the same on every cluster, connected or not.
-        for connected in [true, false] {
-            assert!(known_kind(&kinds, &deployment(), connected).is_some_and(|k| k.is("apps", "Deployment")));
-            assert!(known_kind(&kinds, &Res::namespace("shop"), connected).is_some_and(|k| k.is("", "Namespace")));
-        }
-        // A custom resource's only on a connected context: elsewhere it is looked up there.
-        let cert = res("cert-manager.io", "Certificate");
-        assert!(known_kind(&kinds, &cert, true).is_some());
-        assert!(known_kind(&kinds, &cert, false).is_none());
+        assert!(known_kind(&kinds, &deployment()).is_some_and(|k| k.is("apps", "Deployment")));
+        assert!(known_kind(&kinds, &Res::namespace("shop")).is_some_and(|k| k.is("", "Namespace")));
+        assert!(known_kind(&kinds, &res("cert-manager.io", "Certificate", "v1")).is_some());
+        // The version Argo CD applied when the cluster serves it, else one it serves.
+        let hpa = |version: &str| known_kind(&kinds, &res("autoscaling", "HorizontalPodAutoscaler", version));
+        assert_eq!(hpa("v2").map(|k| k.ar.version), Some("v2".into()));
+        assert_eq!(hpa("v1").map(|k| k.ar.version), Some("v1".into()));
+        assert_eq!(hpa("v2beta2").map(|k| k.ar.version), Some("v1".into()));
         // Never a kind of the same name in another group.
-        assert!(known_kind(&kinds, &res("", "Certificate"), true).is_none());
-        assert!(known_kind(&kinds, &res("example.com", "Deployment"), true).is_none());
+        assert!(known_kind(&kinds, &res("", "Certificate", "v1")).is_none());
+        assert!(known_kind(&kinds, &res("example.com", "Deployment", "v1")).is_none());
+        // A kind the cluster doesn't serve (a CRD of another cluster): looked up there.
+        assert!(known_kind(&kinds, &res("gateway.networking.k8s.io", "HTTPRoute", "v1")).is_none());
+        assert!(known_kind(&kinds[..0], &deployment()).is_none());
     }
 
     #[test]

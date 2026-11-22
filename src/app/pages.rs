@@ -171,36 +171,41 @@ impl AppView {
             this.show_detail_on(ev.context.clone(), ev.client.clone(), ev.obj.clone(), window, cx);
         })
         .detach();
-        cx.subscribe_in(&panel, window, move |this, _, ev: &crate::details::OpenOn, window, cx| {
-            this.open_on(ev.context.clone(), ev.res.clone(), Some(own.clone()), window, cx);
+        cx.subscribe_in(&panel, window, move |this, asker, ev: &crate::details::OpenOn, window, cx| {
+            this.open_on(ev.context.clone(), ev.res.clone(), Some(own.clone()), asker.entity_id(), window, cx);
         })
         .detach();
         self.navigate(Route::Detail(panel), cx);
     }
 
     /// Open an object on a context, connected or not: where an Argo CD Application deploys,
-    /// and what it deploys there. On a connected context it opens like any link; on another,
-    /// once connected to it, unless `own` (the asking page's context and client) is that one.
-    /// A kind the app doesn't know there is looked up on that context.
+    /// and what it deploys there. Its kind is the one that context serves, at the version
+    /// Argo CD applied when it is served: from its kinds found when it connected, else (not
+    /// connected, or not among them) from its group discovered there. A connected context's
+    /// page opens at once; another's once connected to it, unless `own` (the asking page's
+    /// context and client) is that one, and only while `asker`, the page that asked, is still
+    /// the one shown.
     fn open_on(
         &mut self,
         context: String,
         res: Res,
         own: Option<(String, kube::Client)>,
+        asker: EntityId,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let connected = self.clusters.iter().find(|(n, _)| *n == context).map(|(_, c)| c.clone());
-        let known = diagnosis::known_kind(&self.kinds, &res, connected.is_some());
-        let (connected, known) = match (connected, known) {
-            (Some(client), Some(kind)) => {
-                self.context_open.cancel();
-                self.show_detail_on(context, client, res.object(kind), window, cx);
-                return;
-            }
-            other => other,
+        let at = self.clusters.iter().position(|(n, _)| *n == context);
+        if let Some(ix) = at
+            && let Some(kind) = diagnosis::known_kind(self.served_kinds(ix), &res)
+        {
+            self.context_open.cancel();
+            self.show_detail_in(ix, res.object(kind), window, cx);
+            return;
+        }
+        let client = match at {
+            Some(ix) => self.clusters.get(ix).map(|(_, client)| client.clone()),
+            None => own.filter(|(c, _)| *c == context).map(|(_, client)| client),
         };
-        let client = connected.or_else(|| own.filter(|(c, _)| *c == context).map(|(_, client)| client));
         if client.is_none() {
             window.push_notification(Notification::info(format!("Connecting to {context}…")), cx);
         }
@@ -212,17 +217,19 @@ impl AppView {
                     .await
                     .map_err(|e| format!("Could not connect to {on}: {}", k8s::short_error(&e)))?,
             };
-            let kind = match known {
-                Some(kind) => kind,
-                None => diagnosis::kind_on(client.clone(), on.clone(), res.clone())
-                    .await
-                    .map_err(|e| format!("Could not open {} on {on}: {}", res.label(), k8s::short_error(&e)))?,
-            };
+            let kind = diagnosis::kind_on(client.clone(), on.clone(), res.clone())
+                .await
+                .map_err(|e| format!("Could not open {} on {on}: {}", res.label(), k8s::short_error(&e)))?;
             Ok::<_, String>((client, res.object(kind)))
         };
-        // A later click replaces this one: its page does not open over the newer one.
+        // A later click replaces this one: its page does not open over the newer one. Nor
+        // over a page the user went to meanwhile (a link, the sidebar, Back): a connect can
+        // wait for a login in the browser.
         self.context_open.spawn_in(window, cx, work, move |this, opened, window, cx| match opened {
-            Ok((client, obj)) => this.show_detail_on(context, client, obj, window, cx),
+            Ok((client, obj)) if this.route().page() == Some(asker) => {
+                this.show_detail_on(context, client, obj, window, cx);
+            }
+            Ok(_) => {}
             Err(e) => window.push_notification(Notification::error(e), cx),
         });
     }
@@ -240,8 +247,8 @@ impl AppView {
             this.show_detail_on(ev.context.clone(), ev.client.clone(), ev.obj.clone(), window, cx);
         })
         .detach();
-        cx.subscribe_in(page, window, |this, _, ev: &crate::details::OpenOn, window, cx| {
-            this.open_on(ev.context.clone(), ev.res.clone(), None, window, cx);
+        cx.subscribe_in(page, window, |this, page, ev: &crate::details::OpenOn, window, cx| {
+            this.open_on(ev.context.clone(), ev.res.clone(), None, page.entity_id(), window, cx);
         })
         .detach();
     }

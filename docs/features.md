@@ -202,14 +202,15 @@
   can't be read is named above the list; the others are shown.
 - **Argo CD resources**: an Application's page lists what Argo CD tracks for it
   (`status.resources`) as a table: kind, namespace/name, sync, health, whether it is a hook, and
-  a message (its health message, and *no longer in git* for one a sync with prune deletes).
+  a message (its health message, and *no longer in git* for one out of sync that a sync with
+  prune deletes; not a hook left from the last sync, nor a resource Argo CD couldn't compare).
   *Out of sync or unhealthy* shows those alone. A row opens the object on the kubeconfig context
-  that reaches the destination, connecting to it when it isn't connected; when no context
-  reaches it, the rows don't open and the page says so. The rows come from the Application
-  itself, with no request per row, and only those on screen are drawn: an Application with
-  thousands of resources stays fast. When Argo CD keeps no health per resource in the
-  Application (from Argo CD 3.0, unless `controller.resource.health.persist` is on), the page
-  says so.
+  that reaches the destination, with the kind and version that cluster serves, connecting to
+  it when it isn't connected; when no context reaches it, the rows don't open and the page says
+  so. The rows come from the Application itself, with no request per row, and only those on
+  screen are drawn: an Application with thousands of resources stays fast. When Argo CD keeps
+  no health per resource in the Application (`status.resourceHealthSource: appTree`, the
+  default from Argo CD 3.0 unless `controller.resource.health.persist` is on), the page says so.
 - **Argo CD diagnosis**: an Application's page says what is wrong with it, worst first, each
   with its objects (opening on the destination's context, connecting to it when it isn't) and
   what to do:
