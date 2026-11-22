@@ -3,8 +3,8 @@
 Sources checked on 2026-11-21: [Aptakube's changelog](https://aptakube.com/changelog) (to 1.23.0),
 its [GitHub releases](https://github.com/aptakube/aptakube/releases) and its site's docs and feature
 pages; [FreeLens's release notes](https://github.com/freelensapp/freelens/releases) (to v2.1.0), its
-issues and its extensions' READMEs; [Headlamp's release notes](https://github.com/kubernetes-sigs/headlamp/releases)
-(to v0.46.0), the READMEs of its [plugins](https://github.com/headlamp-k8s/plugins) and its code.
+issues, its code and its extensions' READMEs; [Headlamp's release notes](https://github.com/kubernetes-sigs/headlamp/releases)
+(to v0.46.0), its code, and the READMEs and code of its [plugins](https://github.com/headlamp-k8s/plugins).
 FreeLens and Headlamp were not installed and run here.
 
 How Recouvrance compares, feature by feature, with other Kubernetes desktop clients. Based on
@@ -27,20 +27,20 @@ welcome: open an issue or a pull request.
 | Ephemeral debug containers | ✓ custom image, profiles | ✓ image, profile and spec in a dialog | ✓ with a target container | ✓ with a Pod Security "restricted" fallback |
 | Node shell | ✓ | ✓ | ✓ | ✓ (privileged pod, confirmed, cleaned up) |
 | Port-forward | ✓ saved, follows replacement pods | ✓ (listen address, SOCKS5) | ✓ Service forwards reconnect to new pods | ✓ remembered and restorable, follows replacement pods; listen address, https, open in browser; through the kubeconfig's `proxy-url` (SOCKS5 or HTTP) |
-| Edit YAML | ✓ warns of changes made meanwhile; shows the JSON patch | ✓ | ✓ dry run; YAML errors on their line; diff before saving | ✓ validated by a server dry run first; errors on their line; field docs and forms from the cluster's schema |
+| Edit YAML | ✓ warns of changes made meanwhile; shows the JSON patch | ✓ | ✓ dry run; YAML errors on their line; diff before saving; warns of changes made meanwhile | ✓ validated by a server dry run first; errors on their line; field docs and forms from the cluster's schema |
 | Edit ConfigMap/Secret values | ✓ | ✓ | ✓ without the YAML editor; ConfigMap `binaryData` too | ✓ as key/value rows; Secret forms (Opaque, registry, TLS, basic auth) |
 | Create / apply YAML | ✓ | ✓ | ✓ forms for common kinds; load from a URL | ✓ multi-document, dry run; templates, files, URLs, `$EDITOR` |
 | Compare objects | ✓ across clusters or namespaces | – | – | ✓ across clusters or objects; revision diffs |
-| History of changes | workload revisions; Helm release history | Helm revisions | workload revision history | ✓ per object: revisions, Helm, Argo CD deployments, field managers, events; a Timeline recorded across clusters |
+| History of changes | workload revisions; Helm release history | Deployment revisions (its ReplicaSets); Helm revisions | workload revision history; Helm release revisions (plugin) | ✓ per object: revisions, Helm, Argo CD deployments, field managers, events; a Timeline recorded across clusters |
 | Scale / restart / delete / cordon / drain / run CronJob | ✓ plus bulk actions, across clusters | ✓ | ✓ plus bulk delete and scale, evict | ✓ plus bulk actions, force delete, finalizer removal |
 | Shows the kubectl equivalent | – | – | – | ✓ on every confirmation |
 | Protected / colored contexts | ✓ protected or read-only; color, icon, tags | icon color and label per cluster | icon and color per cluster | ✓ colors; protected contexts wait a few seconds or ask for the name before writes; production names guessed |
 | Actions match your RBAC | – | – | ✓ | ✓ actions you may not do are disabled; "My access" view |
 | RBAC pages | lists Roles, bindings and ServiceAccounts | ✓ | ✓ | ✓ rules, bindings, ServiceAccounts' effective access, who-can, short-lived ServiceAccount kubeconfig |
 | Node allocation, GPUs, DRA | CPU and memory requests vs allocatable | ✓ | DRA devices (alpha); extended resources such as GPUs in node details | ✓ requests/limits vs allocatable incl. extended resources; DRA devices |
-| Metrics now | ✓ CPU/memory bars with request and limit markers | ✓ CPU/memory columns in pod tables | ✓ CPU/memory columns in pod tables | ✓ CPU/memory columns with bars against requests and limits (pods) or allocatable (nodes) |
+| Metrics now | ✓ CPU/memory bars with request and limit markers | ✓ CPU/memory columns in pod tables | ✓ CPU/memory columns in pod tables, % of request and limit on hover | ✓ CPU/memory columns with bars against requests and limits (pods) or allocatable (nodes) |
 | Usage history | – | ✓ Prometheus | plugin | ✓ Prometheus or VictoriaMetrics, found automatically via the API server proxy; 15m–7d; cluster, nodes, workloads, pods |
-| Request efficiency | now, not over time: near limit, over request, unused requests | – | – | ✓ used vs requested over time |
+| Request efficiency | now, not over time: near limit, over request, unused requests | per-container charts: usage vs requests and limits over time (Prometheus) | – | ✓ used vs requested over time |
 | Problems view | Health page: pod status, recent restarts and warnings | overview warnings: node conditions, Warning events | events on the cluster overview; warning counts on Home | ✓ across clusters: crash loops, pending, unavailable, NotReady, failed jobs, missing references, stuck deletions |
 | Firing alerts | – | – | – | ✓ from the cluster's Prometheus, on Problems and on the pages of what they are about; silenced ones muted |
 | Upgrade check | – | – | – | ✓ what to fix before the next minor version: removed APIs still used (objects, Helm releases, the API server's metric), version skew, drains that would block, feature gates |
