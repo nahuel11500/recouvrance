@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 
-use anyhow::{Context as _, Result};
+use anyhow::{Context as _, Result, anyhow};
 use kube::config::{KubeConfigOptions, Kubeconfig};
 use kube::{Client, Config};
 
@@ -173,7 +173,7 @@ fn read_kubeconfig() -> Result<(Kubeconfig, bool)> {
         let stem = path.file_stem().map_or_else(|| "file".into(), |s| s.to_string_lossy().to_string());
         let key = tilde(&path.canonicalize().unwrap_or_else(|_| path.clone()));
         let before = stamp(&path);
-        let kc = Kubeconfig::read_from(&path);
+        let kc = read_kubeconfig_file(&path);
         let after = stamp(&path);
         let mut seen = SEEN.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if settle(&mut seen, &key, before, after, std::time::Instant::now()) {
@@ -210,6 +210,57 @@ fn read_kubeconfig() -> Result<(Kubeconfig, bool)> {
         (None, None) => anyhow::bail!(
             "no kubeconfig found (KUBECONFIG or ~/.kube/config): add or paste one in Settings → Kubeconfig"
         ),
+    }
+}
+
+/// One kubeconfig file, read as kube reads it. Its error names the file and says what failed,
+/// never what the file holds (see `unquoted`): it reaches pages, agents and the audit log. Read
+/// kubeconfig files with this, not `Kubeconfig::read_from`.
+pub(super) fn read_kubeconfig_file(path: &std::path::Path) -> Result<Kubeconfig> {
+    Kubeconfig::read_from(path).map_err(|e| anyhow!("{}: {}", tilde(path), unquoted(e)))
+}
+
+/// Kubeconfig text pasted in Settings, read as `read_kubeconfig_file` reads a file.
+pub(super) fn parse_kubeconfig(text: &str) -> Result<Kubeconfig> {
+    Kubeconfig::from_yaml(text).map_err(|e| anyhow!(unquoted(e)))
+}
+
+/// What kube's error for a kubeconfig says, without the file's text: a parse error is said by
+/// `parse_failure`, a read error by itself (the caller names the file). Its other errors, two
+/// documents of a file that don't merge, hold no text of the file.
+fn unquoted(e: kube::config::KubeconfigError) -> String {
+    use kube::config::KubeconfigError as E;
+    match e {
+        E::Parse(e) => parse_failure(&e),
+        E::ReadConfig(e, _) => e.to_string(),
+        e => e.to_string(),
+    }
+}
+
+/// Where a kubeconfig failed to parse, and why in words of our own (#860). serde-saphyr's error
+/// shows the lines around the error, and its message can quote a value, a key or a tag
+/// (`invalid type: string "…"`), the parser's a character: there a token, a client key, a
+/// password or a login command's arguments can be. Only the line and column are kept.
+fn parse_failure(e: &serde_saphyr::Error) -> String {
+    use serde_saphyr::Error as E;
+    // An alias fails as what it stands for.
+    let mut inner = e.without_snippet();
+    while let E::AliasError { error, .. } = inner {
+        inner = error.without_snippet();
+    }
+    let why: String = match inner {
+        // The YAML parser's own errors: an unclosed quote or bracket, a tab, a bad indentation.
+        E::ExternalMessage { .. } | E::Eof { .. } | E::UnknownAnchor { .. } | E::InvalidUtf8Input => {
+            "not valid YAML".into()
+        }
+        // A field of kube's types, not a word of the file.
+        E::SerdeMissingField { field, .. } => format!("missing field `{field}`"),
+        E::DuplicateMappingKey { .. } => "a key given twice".into(),
+        _ => "an unexpected value".into(),
+    };
+    match e.location() {
+        Some(at) => format!("{why} at line {}, column {}", at.line(), at.column()),
+        None => why,
     }
 }
 
@@ -1040,6 +1091,61 @@ echo '{"apiVersion":"client.authentication.k8s.io/v1","kind":"ExecCredential","s
         assert!(said.contains("os error 2"), "{said}");
     }
 
+    /// A kubeconfig that fails to parse is said by its file, line and column, and why in words
+    /// of our own: serde-saphyr's error showed the lines around it, here its token and client
+    /// key, and quoted a value of the wrong type (#860).
+    #[test]
+    fn a_kubeconfig_that_fails_to_parse_is_said_without_what_it_holds() {
+        let dir = crate::mcp::test_dir();
+        let path = dir.join("config");
+        let file = crate::paths::tilde(&path);
+        let said = |text: &str| {
+            std::fs::write(&path, text).unwrap();
+            let e = super::read_kubeconfig_file(&path).unwrap_err();
+            let all = format!("{e}\n{e:#}\n{e:?}");
+            assert!(!all.contains("SECRET"), "{all}");
+            e.to_string()
+        };
+        // `@` can't start a value: the broken line is between the token and the key.
+        let broken = "apiVersion: v1\nkind: Config\nusers:\n- name: me\n  user:\n    token: SECRET-TOKEN\n    \
+                      username: @me\n    client-key-data: SECRET-KEY\n";
+        assert_eq!(said(broken), format!("{file}: not valid YAML at line 7, column 15"));
+        let wrong = said("users:\n- name: me\n  user: SECRET-TOKEN\n");
+        assert!(wrong.starts_with(&format!("{file}: an unexpected value")), "{wrong}");
+        let twice = said("users:\n- name: me\n  user:\n    token: SECRET-TOKEN\n    token: SECRET-OTHER\n");
+        assert!(twice.starts_with(&format!("{file}: a key given twice at line 5")), "{twice}");
+        let unnamed = said("contexts:\n- context: {cluster: SECRET-CLUSTER}\n");
+        assert!(unnamed.starts_with(&format!("{file}: missing field `name`")), "{unnamed}");
+        // Pasted text is read the same way, without a file to name.
+        let pasted = super::parse_kubeconfig(broken).unwrap_err();
+        assert_eq!(format!("{pasted:#}"), "not valid YAML at line 7, column 15");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A proxy kube can't use, by its scheme or for having none (an `HTTPS_PROXY` that curl
+    /// reads as http): the error of building the client names it by its host and port, never
+    /// its user and password, however it is printed (#859).
+    #[test]
+    fn a_proxy_s_password_stays_out_of_the_connect_error() {
+        let cases = [
+            ("socks5h://user:secret@proxy.corp:1080", "socks5h://proxy.corp:1080/"),
+            ("user:secret@proxy.corp:3128", "proxy.corp:3128"),
+        ];
+        for (url, shown) in cases {
+            let mut config = kube::Config::new("https://127.0.0.1:1".parse().unwrap());
+            config.proxy_url = Some(url.parse().unwrap());
+            // kube's own error prints the URL whole.
+            let Err(raw) = kube::Client::try_from(config.clone()) else { panic!("kube uses {url}") };
+            assert!(raw.to_string().contains("user:secret@"), "{raw}");
+            let Err(e) = super::client(config, "test".into(), false) else { panic!("kube uses {url}") };
+            assert_eq!(crate::k8s::short_error(&e), format!("configured proxy {shown} uses an unsupported protocol"));
+            for said in [crate::k8s::error_chain(&e), format!("{e:#}"), format!("{e:?}"), format!("{e:#?}")] {
+                assert!(!said.contains("secret") && !said.contains("user:"), "{said}");
+                assert!(said.contains("proxy.corp:"), "{said}");
+            }
+        }
+    }
+
     #[test]
     fn exec_command_of_a_context() {
         let kc = Kubeconfig::from_yaml(
@@ -1184,7 +1290,7 @@ mod name_properties {
 /// corrupt or deleted between reads, with clashing cluster and user names. A bare context
 /// name carries its protection, color and settings, so it must point at the file that owns
 /// it, and never move while that file still has it (kubeconfig naming broke in every audit
-/// round).
+/// round). A corrupt file is said by where it breaks, never by what it holds (#860).
 #[cfg(test)]
 mod merge_properties {
     use super::{merge_owned, name_owners};
@@ -1243,6 +1349,56 @@ mod merge_properties {
             current_context: names.first().map(ToString::to_string),
             ..Kubeconfig::default()
         }
+    }
+
+    /// In each place a kubeconfig keeps a secret, and never in what is said of it.
+    const SECRET: &str = "XSECRETX";
+
+    /// A kubeconfig with `SECRET` in a CA, a token, a client key, a password, and a login
+    /// command's arguments and environment.
+    fn with_secrets() -> String {
+        format!(
+            "apiVersion: v1
+kind: Config
+clusters:
+- name: c
+  cluster:
+    server: https://10.0.0.1
+    certificate-authority-data: {SECRET}ca
+users:
+- name: u
+  user:
+    token: {SECRET}token
+    client-key-data: {SECRET}key
+    username: admin
+    password: {SECRET}password
+- name: oidc
+  user:
+    exec:
+      apiVersion: client.authentication.k8s.io/v1
+      command: kubelogin
+      args: [get-token, --oidc-client-secret={SECRET}arg]
+      env: [{{name: CLIENT_SECRET, value: {SECRET}env}}]
+contexts:
+- name: x
+  context: {{cluster: c, user: u}}
+current-context: x
+"
+        )
+    }
+
+    /// A change that may break a file: at a byte of it, some bytes taken out and a piece put
+    /// in (text, a YAML indicator, a line break or a tab, the secret as a key, a tag or an
+    /// anchor, so that the parser's error is about it).
+    fn edit() -> impl Strategy<Value = (prop::sample::Index, usize, String)> {
+        let indicator = prop::sample::select(vec![
+            "\n", "\t", "  ", ": ", "- ", "? ", "[", "]", "{", "}", ",", "\"", "'", "@", "`", "&a ", "*a", "!", "|",
+            ">", "#", "%", "---\n",
+        ]);
+        let secret = prop::sample::select(vec!["\n$\n", "$: ", "- $", "&$ ", "*$", "!$ ", "\"$", "$: $: "]);
+        let secret = secret.prop_map(|p| p.replace('$', SECRET));
+        let piece = prop_oneof!["[ -~]{0,6}", indicator.prop_map(String::from), secret];
+        (any::<prop::sample::Index>(), 0..8usize, piece)
     }
 
     /// Where a merged context points: (server, user name).
@@ -1326,6 +1482,38 @@ mod merge_properties {
                     }
                 }
                 bare = now;
+            }
+        }
+
+        /// Whatever a corrupt kubeconfig holds around where it breaks, what is said of it names
+        /// the file and never quotes it: it reaches pages, agents and the audit log. So for
+        /// pasted text.
+        #[test]
+        fn a_corrupt_file_never_shows_what_it_holds(
+            edits in prop::collection::vec(edit(), 1..6),
+            cut_short in prop::option::of(any::<prop::sample::Index>()),
+        ) {
+            let mut text = with_secrets();
+            // All ASCII: any byte is a character boundary.
+            for (at, cut, piece) in edits {
+                let at = at.index(text.len() + 1);
+                text.replace_range(at..(at + cut).min(text.len()), &piece);
+            }
+            if let Some(end) = cut_short {
+                text.truncate(end.index(text.len() + 1));
+            }
+            let path = std::env::temp_dir().join(format!("recouvrance-test-{}.yaml", uuid::Uuid::new_v4().simple()));
+            std::fs::write(&path, &text).unwrap();
+            let read = super::read_kubeconfig_file(&path);
+            std::fs::remove_file(&path).unwrap();
+            // `{:#}` says the whole chain.
+            if let Err(e) = read {
+                let file = crate::paths::tilde(&path);
+                prop_assert!(e.to_string().starts_with(&format!("{file}: ")), "{e}");
+                prop_assert!(!format!("{e:#}").contains(SECRET), "{e:#}\nfrom\n{text}");
+            }
+            if let Err(e) = super::parse_kubeconfig(&text) {
+                prop_assert!(!format!("{e:#}").contains(SECRET), "{e:#}\nfrom\n{text}");
             }
         }
     }
