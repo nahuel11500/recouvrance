@@ -757,9 +757,10 @@ fn api_system(prompt: &str) -> Value {
 }
 
 /// One step's request body. The top-level `cache_control` caches the conversation so far
-/// (the API puts it on the last block), so each step reads from the cache the steps before
-/// it and the chat's earlier questions. With the tools' and the system prompt's, that makes
-/// three of the four breakpoints a request may have.
+/// (the API puts it on the last block), so each step reads the steps before it from the
+/// cache, and so does a new question while the system prompt (what is on screen) stays the
+/// same. With the tools' and the system prompt's, that makes three of the four breakpoints
+/// a request may have.
 fn request_body(model: &str, system: &Value, tools: &[Value], messages: &[Value]) -> Value {
     json!({
         "model": model,
