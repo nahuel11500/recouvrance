@@ -286,20 +286,27 @@ async fn metrics(on: bool, client: Client, path: &'static str) -> Option<Result<
     Some(k8s::run(async move { Ok(client.request(http::Request::get(path).body(Vec::new())?).await?) }).await)
 }
 
-/// The cluster overview's load, for the dev smoke run's timings.
+/// The cluster overview's load, `rounds` times in a row as its refreshes do (without the wait
+/// between them), for the dev smoke run: each round's time and what it read.
 #[cfg(feature = "dev")]
-pub async fn debug_load(context: String, client: Client) -> usize {
-    let t = std::time::Instant::now();
-    let numbers = async {
-        let s = load(context.clone(), client.clone()).await;
-        println!("cluster overview numbers: {:?}", t.elapsed());
-        s
-    };
-    let charts = async {
-        usage(&context, client.clone()).await;
-        println!("cluster overview charts: {:?}", t.elapsed());
-    };
-    futures::join!(numbers, charts).0.pods_running
+pub async fn debug_load(context: String, client: Client, rounds: usize) -> usize {
+    let mut running = 0;
+    for round in 1..=rounds.max(1) {
+        let (t, before) = (std::time::Instant::now(), crate::dev::smoke::bytes_read(&context));
+        let numbers = async {
+            let s = load(context.clone(), client.clone()).await;
+            println!("cluster overview numbers: {:?}", t.elapsed());
+            s
+        };
+        let charts = async {
+            usage(&context, client.clone()).await;
+            println!("cluster overview charts: {:?}", t.elapsed());
+        };
+        running = futures::join!(numbers, charts).0.pods_running;
+        let read = crate::dev::smoke::bytes_read(&context).saturating_sub(before) as f64 / 1e6;
+        println!("cluster overview round {round}: {:?}, {read:.1} MB read", t.elapsed());
+    }
+    running
 }
 
 /// CPU and memory over the chosen range, and GPUs, from Prometheus (when there is one).
