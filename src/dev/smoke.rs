@@ -174,10 +174,18 @@ pub fn run(ctx: String) {
             println!("helm fill: {n} releases ({r:?}), first page at {first:?}, all at {:?}", t.elapsed());
             return;
         }
-        if std::env::var("RECOUVRANCE_DASH").is_ok() {
-            let t = std::time::Instant::now();
-            let r = crate::ui::dashboard::debug_load(client.clone()).await;
-            println!("dashboard load: {:?} ok={}", t.elapsed(), r);
+        // RECOUVRANCE_DASH=<runs>: the Workloads overview loaded that many times in a row, as
+        // the page refreshes; each load's parts, requests and bytes, then the peak memory.
+        if let Ok(runs) = std::env::var("RECOUVRANCE_DASH") {
+            let runs = runs.parse::<u32>().unwrap_or(1).max(1);
+            for run in 1..=runs {
+                k8s::meter::reset();
+                let t = std::time::Instant::now();
+                let r = crate::ui::dashboard::debug_load(client.clone()).await;
+                println!("dashboard load {run}: {:?} ok={r}", t.elapsed());
+                print_reads(&ctx);
+            }
+            println!("peak {} MB, now {} MB", mb(memory("VmHWM")), mb(memory("VmRSS")));
             return;
         }
         // RECOUVRANCE_EDIT=ns/deploy: YAML round trip + server-side dry-run replace.
@@ -261,15 +269,17 @@ pub fn bytes_read(ctx: &str) -> u64 {
     seen.classes.iter().filter(|(c, ..)| c == ctx).map(|(_, _, stats)| stats.bytes).sum()
 }
 
-/// What this context's requests brought so far by kind, as Settings → API requests shows it,
-/// and the heaviest of them.
+/// What this context's requests brought since the meter's last reset by kind, as Settings →
+/// API requests shows it, and the heaviest of them with their time to the last byte.
 fn print_reads(ctx: &str) {
     let seen = k8s::meter::snapshot(k8s::meter::now_minute());
     for (_, class, stats) in seen.classes.iter().filter(|(c, ..)| c == ctx) {
-        println!("{}: {} requests, {:.1} MB", class.label(), stats.count, stats.bytes as f64 / 1e6);
+        let megabytes = stats.bytes as f64 / 1e6;
+        println!("{}: {} requests ({} failed), {megabytes:.1} MB", class.label(), stats.count, stats.errors);
     }
     for heavy in seen.heaviest.iter().filter(|h| h.context == ctx) {
-        println!("heaviest: {} {} {:.1} MB", heavy.method, heavy.path, heavy.bytes as f64 / 1e6);
+        let took = heavy.last_byte.map_or_else(|| "-".to_string(), |d| format!("{:.2} s", d.as_secs_f64()));
+        println!("heaviest: {} {} {:.1} MB in {took}", heavy.method, heavy.path, heavy.bytes as f64 / 1e6);
     }
 }
 

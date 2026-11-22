@@ -991,12 +991,59 @@ impl Render for Dashboard {
     }
 }
 
-/// Timing aid for very large clusters (`RECOUVRANCE_SMOKE=ctx RECOUVRANCE_DASH=1`).
+/// Timing aid for very large clusters (`RECOUVRANCE_SMOKE=ctx RECOUVRANCE_DASH=1`): prints each
+/// part of the overview as it arrives, with its figures (counts only, never a name), so two
+/// builds can be compared on one cluster. Whether every part was read.
 #[cfg(feature = "dev")]
 pub async fn debug_load(client: Client) -> bool {
-    let (tx, _rx) = futures::channel::mpsc::unbounded();
-    load(client, None, "debug".into(), tx).await;
-    true
+    let (tx, mut rx) = futures::channel::mpsc::unbounded();
+    let started = std::time::Instant::now();
+    let print = async {
+        let mut ok = true;
+        while let Some(piece) = futures::StreamExt::next(&mut rx).await {
+            ok &= !matches!(piece, Piece::Failed(..) | Piece::Kind(_, Err(_)));
+            println!("  {:>7.2} s  {}", started.elapsed().as_secs_f64(), describe(&piece));
+        }
+        ok
+    };
+    let ((), ok) = futures::join!(load(client, None, "debug".into(), tx), print);
+    ok
+}
+
+/// One part of the overview in a line: a kind's counts, how many warnings, restarts and
+/// containers near their limits there are, or what failed.
+#[cfg(feature = "dev")]
+fn describe(piece: &Piece) -> String {
+    let counts = |c: &[(String, usize, Tone)]| {
+        if c.is_empty() {
+            return "none".to_string();
+        }
+        c.iter().map(|(label, n, _)| format!("{n} {label}")).collect::<Vec<_>>().join(", ")
+    };
+    match piece {
+        Piece::Kind(slot, Ok(c)) => format!("{}: {}", SLOTS[*slot].0, counts(c)),
+        Piece::Kind(slot, Err(e)) => format!("{}: {e}", SLOTS[*slot].0),
+        Piece::Warnings(w) => {
+            format!(
+                "warnings: {} reasons active in the last hour, ×{} in all",
+                w.len(),
+                w.iter().map(|w| w.count).sum::<i64>()
+            )
+        }
+        Piece::Restarts(r) => format!("restarts: {} in the last hour", r.len()),
+        Piece::Hot(h, skipped) => {
+            format!("near their limits: {}{}", h.len(), if *skipped { " (too many pods to check)" } else { "" })
+        }
+        Piece::Failed(section, e) => {
+            let what = match section {
+                Section::Warnings => "warnings",
+                Section::Pods => "pods",
+                Section::Usage => "usage",
+            };
+            format!("{what} failed: {e}")
+        }
+        Piece::Done(took) => format!("done in {took:?}"),
+    }
 }
 
 #[cfg(test)]
