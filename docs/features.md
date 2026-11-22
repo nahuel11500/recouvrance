@@ -228,13 +228,14 @@
 - **Overviews**: cluster capacity and health, workloads status, Helm releases (values masked; install from your repos, roll back and uninstall through your `helm` CLI).
 - **API requests** (Settings → API requests): per cluster, how many requests of each kind
   (discovery, lists, watches, metrics, logs, shells, writes) were made and how many failed; how
-  long the API server took to start answering (p50, p95, slowest) and, for answers that end, to
-  send the last byte (p50, p95); and how much each kind received per minute over the last hour,
-  counted decompressed as the bodies arrive. Watches, logs and shells are streams that don't
-  end: bytes only, and none for shells and port-forwards, whose data goes over the upgraded
-  connection. Below, the heaviest requests: the one of each kind (cluster, method and path, its
-  names replaced by `{namespace}` and `{name}`) that received the most, with its bytes and both
-  times. Nothing leaves the machine.
+  long the API server took to start answering (p50, p95, slowest) and, for answers that end,
+  until their last byte was read (p50, p95); and how much each kind received per minute over
+  the last hour, counted decompressed as the bodies arrive. The time to the last byte includes
+  Recouvrance's own parsing when that sets the pace. Watches, logs and shells are streams that
+  run until closed: bytes only, and none for shells and port-forwards, whose data goes over the
+  upgraded connection. Below, the 10 heaviest requests, one per kind (cluster, method and path,
+  its names replaced by `{namespace}` and `{name}`), with their bytes and both times. A stream
+  is listed once it ends. Nothing leaves the machine.
 - **Favorites** and **saved views** (type + namespaces + filter, bookmark button), back/forward history, light and dark themes.
 - **Instant back**: the last 8 lists (up to 10,000 rows in all) are kept, so going back to one
   shows it at once, marked "Updating…", while a fresh list loads and replaces it in one go.

@@ -11,7 +11,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use crate::k8s::files::human_size;
-use crate::k8s::meter::{self, Class, Heavy, Minute, Stats};
+use crate::k8s::meter::{self, Class, HEAVIEST, Heavy, Minute, Stats};
 use crate::ui::selectable::selectable;
 
 /// One cluster's numbers.
@@ -154,11 +154,11 @@ pub fn render(cx: &App) -> AnyElement {
                 .child(div().flex_1().min_w_0().text_sm().text_color(muted).child(
                     "How long the API servers take to answer and how much they send, since Recouvrance started. \
                      To headers: until the answer starts (watches and log streams count until they open). To last \
-                     byte: until the answer is read to its end, for answers that end. Per minute: data received, \
-                     decompressed, on average over the last hour (or since the first request, if later); shells \
-                     and port-forwards send theirs over the upgraded connection, which is not counted. Failed: an \
-                     error status, a timeout or no connection. p50 and p95: half and 95% of the requests took at \
-                     most that.",
+                     byte: until the last byte was read, for answers that end (Recouvrance's own parsing counts \
+                     when it sets the pace). Per minute: data received, decompressed, on average over the last \
+                     hour (or since the first request, if later); shells and port-forwards send theirs over the \
+                     upgraded connection, which is not counted. Failed: an error status, a timeout or no \
+                     connection. p50 and p95: half and 95% of the requests took at most that.",
                 ))
                 .child(Button::new("meter-reset").small().outline().label("Reset").on_click(|_, window, _| {
                     meter::reset();
@@ -389,11 +389,11 @@ fn heaviest(list: &[Heavy], cx: &App) -> Div {
         .border_1()
         .border_color(theme.border)
         .child(div().font_weight(FontWeight::SEMIBOLD).child("Heaviest requests"))
-        .child(div().text_sm().text_color(muted).child(
-            "The request of each kind (cluster, method and path) that received the most, since Recouvrance \
-             started. Names in paths read {namespace} and {name}. To last byte is — for a stream, or an answer \
-             not read to its end.",
-        ))
+        .child(div().text_sm().text_color(muted).child(format!(
+            "The {HEAVIEST} heaviest requests since Recouvrance started, one per kind (cluster, method and \
+             path). A stream is listed once it ends. Names in paths read {{namespace}} and {{name}}. To last \
+             byte is — for a stream, or an answer not read to its end."
+        )))
         .child(v_flex().child(header).children(list.iter().map(|h| {
             let watch = if h.class == Class::Watch { " (watch)" } else { "" };
             h_flex()

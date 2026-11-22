@@ -385,6 +385,9 @@ struct Flow {
     /// The bytes of the last `WINDOW` minutes: slot `m % WINDOW` holds minute `m` (`tag`)
     /// and the bytes received in it, in its low `BYTE_BITS`.
     minutes: [AtomicU64; WINDOW as usize],
+    /// How many times it was reset. A body opened before the last reset still adds its bytes,
+    /// but its end is not recorded: its bytes and its time started before the counts did.
+    resets: AtomicU64,
     ends: Mutex<Ends>,
 }
 
@@ -395,6 +398,7 @@ impl Flow {
             class,
             total: AtomicU64::new(0),
             minutes: [const { AtomicU64::new(0) }; WINDOW as usize],
+            resets: AtomicU64::new(0),
             ends: Mutex::default(),
         }
     }
@@ -422,10 +426,16 @@ impl Flow {
     }
 
     /// Records how an answer ended: the `bytes` it brought, and its time to the last byte when
-    /// it was read to its end.
-    fn end(&self, sent: Sent, bytes: u64, last_byte: Option<Duration>) {
+    /// it was read to its end. `resets` is the flow's count of resets when the answer opened:
+    /// after another reset, nothing is recorded.
+    fn end(&self, sent: Sent, resets: u64, bytes: u64, last_byte: Option<Duration>) {
         let last_byte = last_byte.filter(|_| self.class.ends());
         let mut ends = self.ends.lock().unwrap_or_else(PoisonError::into_inner);
+        // `reset` counts under this lock too: an end recorded before a reset is cleared by it,
+        // and one after it sees the new count.
+        if self.resets.load(Ordering::Relaxed) != resets {
+            return;
+        }
         if let Some(took) = last_byte {
             ends.last_byte.record(took);
         }
@@ -450,16 +460,20 @@ impl Flow {
         for slot in &self.minutes {
             slot.store(0, Ordering::Relaxed);
         }
-        *self.ends.lock().unwrap_or_else(PoisonError::into_inner) = Ends::default();
+        let mut ends = self.ends.lock().unwrap_or_else(PoisonError::into_inner);
+        self.resets.fetch_add(1, Ordering::Relaxed);
+        *ends = Ends::default();
     }
 }
 
 /// A response body that adds its bytes to its cluster's class as they arrive (decompressed:
 /// `MeterLayer` is outside kube's decompression), and records once how it ended: read to its
-/// end, failed, or dropped before.
+/// end, failed, or dropped before. A reset since it opened skips its end (`Flow::resets`).
 pub struct Counted<B: HttpBody> {
     inner: B,
     flow: Arc<Flow>,
+    /// The flow's resets when this answer opened.
+    resets: u64,
     /// This answer's bytes so far: one task reads a body at a time, no atomic needed.
     bytes: u64,
     /// Taken when the end is recorded, so that it is recorded once.
@@ -468,13 +482,14 @@ pub struct Counted<B: HttpBody> {
 
 impl<B: HttpBody> Counted<B> {
     fn new(inner: B, flow: Arc<Flow>, sent: Sent) -> Self {
-        Self { inner, flow, bytes: 0, sent: Some(sent) }
+        let resets = flow.resets.load(Ordering::Relaxed);
+        Self { inner, flow, resets, bytes: 0, sent: Some(sent) }
     }
 
     fn finish(&mut self, whole: bool) {
         if let Some(sent) = self.sent.take() {
             let last_byte = whole.then(|| sent.start.elapsed());
-            self.flow.end(sent, self.bytes, last_byte);
+            self.flow.end(sent, self.resets, self.bytes, last_byte);
         }
     }
 }
@@ -494,6 +509,8 @@ impl<B: HttpBody + Unpin> HttpBody for Counted<B> {
                     this.flow.add(now_minute(), n);
                 }
                 // A body that knows it has no more is whole now, even if it is never polled again.
+                // kube's stack never says so (tower-http's `DecompressionBody` hides `is_end_stream`):
+                // in the app, a body's end is recorded when its reader polls to the end.
                 if this.inner.is_end_stream() {
                     this.finish(true);
                 }
@@ -516,7 +533,8 @@ impl<B: HttpBody + Unpin> HttpBody for Counted<B> {
 
 impl<B: HttpBody> Drop for Counted<B> {
     fn drop(&mut self) {
-        // Given up before its end (a view closed, a stream stopped), unless all of it came.
+        // Given up before its end (a view closed, a stream stopped), unless it says all of it
+        // came (never under kube's stack: see `poll_frame`).
         let whole = self.inner.is_end_stream();
         self.finish(whole);
     }
@@ -573,8 +591,8 @@ pub fn snapshot(now: i64) -> Snapshot {
     Snapshot { classes, heaviest }
 }
 
-/// Starts every count again. The entries stay: bodies still being read keep counting into
-/// their flows.
+/// Starts every count again. The entries stay: bodies still being read keep adding their
+/// bytes to their flows, but record no end (`Flow::resets`).
 pub fn reset() {
     let mut state = lock();
     for entry in state.values_mut() {
@@ -661,7 +679,7 @@ mod tests {
     use bytes::Bytes;
     use futures::executor::block_on;
     use http::Method;
-    use http_body_util::{BodyExt as _, StreamBody};
+    use http_body_util::{BodyExt as _, Empty, Full, StreamBody};
     use hyper::body::{Body as HttpBody, Frame};
     use proptest::prelude::*;
 
@@ -884,6 +902,57 @@ mod tests {
         let (timed, heaviest) = ends(&flow);
         assert_eq!(timed, 0);
         assert_eq!((heaviest.len(), heaviest[0].bytes, heaviest[0].last_byte), (1, 4, None));
+    }
+
+    /// A body that says when it has no more (`is_end_stream`) is whole once it says so. kube's
+    /// stack never says it (see `poll_frame`).
+    #[test]
+    fn a_body_that_says_it_has_no_more_is_whole() {
+        // Read in one frame: its end is recorded with that frame, with a time, before any
+        // further poll, and nothing more when it is dropped.
+        let flow = Arc::new(Flow::new("shop".into(), Class::List));
+        let mut answer = counted(Full::new(Bytes::from_static(b"abcde")), &flow);
+        block_on(answer.frame()).unwrap().unwrap();
+        let (timed, heaviest) = ends(&flow);
+        assert_eq!((timed, heaviest.len(), heaviest[0].bytes), (1, 1, 5));
+        assert!(heaviest[0].last_byte.is_some());
+        drop(answer);
+        let (timed, heaviest) = ends(&flow);
+        assert_eq!(timed, 1, "not recorded again when dropped");
+        assert!(heaviest[0].last_byte.is_some(), "nor listed again as given up");
+
+        // Dropped without a poll: it had no more, so it ends whole, once, with a time (and no
+        // bytes to list).
+        let flow = Arc::new(Flow::new("shop".into(), Class::List));
+        drop(counted(Empty::<Bytes>::new(), &flow));
+        let (timed, heaviest) = ends(&flow);
+        assert_eq!(timed, 1);
+        assert!(heaviest.is_empty(), "{heaviest:?}");
+    }
+
+    #[test]
+    fn a_body_read_across_a_reset_records_no_end() {
+        // Reset during a list: the bytes it brought before are counted no more, so its end
+        // would list more than was received, and time what started before the reset.
+        let flow = Arc::new(Flow::new("shop".into(), Class::List));
+        let mut answer = counted(body(&["abc", "de"], false), &flow);
+        block_on(async {
+            answer.frame().await.unwrap().unwrap();
+            flow.reset();
+            while let Some(frame) = answer.frame().await {
+                frame.unwrap();
+            }
+        });
+        drop(answer);
+        assert_eq!(flow.total.load(Ordering::Relaxed), 2, "the bytes after the reset count");
+        let (timed, heaviest) = ends(&flow);
+        assert_eq!(timed, 0, "no time to the last byte");
+        assert!(heaviest.is_empty(), "no heaviest entry: {heaviest:?}");
+
+        // One opened after the reset records its end.
+        block_on(counted(body(&["fgh"], false), &flow).collect()).unwrap();
+        let (timed, heaviest) = ends(&flow);
+        assert_eq!((timed, heaviest.len(), heaviest[0].bytes), (1, 1, 3));
     }
 
     #[test]
