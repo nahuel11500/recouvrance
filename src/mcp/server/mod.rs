@@ -2,7 +2,8 @@
 //! (context, verb, resource, namespace, name), checked against the calling
 //! agent's rules, possibly sent to the user for approval, and logged.
 
-use std::sync::Arc;
+use std::collections::HashSet;
+use std::sync::{Arc, LazyLock};
 use std::time::Instant;
 
 use axum::extract::{Request, State};
@@ -10,8 +11,9 @@ use axum::http::StatusCode;
 use axum::middleware::Next;
 use axum::response::Response;
 use http::request::Parts;
+use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{PromptMessage, Role};
+use rmcp::model::{PromptMessage, Role, Tool};
 use rmcp::model::{ServerCapabilities, ServerConfig};
 
 use rmcp::transport::streamable_http_server::{
@@ -892,7 +894,28 @@ impl KubeMcp {
     }
 }
 
-#[tool_handler(router = (Self::read_tools() + Self::write_tools() + Self::rollout_tools() + Self::job_tools() + Self::ops_tools() + Self::node_tools() + Self::helm_tools() + Self::history_tools() + Self::logs_tools() + Self::diff_tools() + Self::cluster_tools() + Self::file_tools() + Self::metrics_tools()))]
+impl KubeMcp {
+    /// Every tool, as `tools/list` gives them to agents. What the Activity page and
+    /// `my_permissions` say about the tools is read from these definitions: lists of names
+    /// kept by hand drifted from them.
+    fn tools() -> ToolRouter<Self> {
+        Self::read_tools()
+            + Self::write_tools()
+            + Self::rollout_tools()
+            + Self::job_tools()
+            + Self::ops_tools()
+            + Self::node_tools()
+            + Self::helm_tools()
+            + Self::history_tools()
+            + Self::logs_tools()
+            + Self::diff_tools()
+            + Self::cluster_tools()
+            + Self::file_tools()
+            + Self::metrics_tools()
+    }
+}
+
+#[tool_handler(router = Self::tools())]
 #[prompt_handler]
 impl ServerHandler for KubeMcp {
     fn get_info(&self) -> ServerConfig {
@@ -905,19 +928,57 @@ impl ServerHandler for KubeMcp {
     }
 }
 
-/// Whether a tool changes the cluster; used by the UI for labels.
-pub fn tool_writes(tool: &str) -> bool {
-    matches!(
-        tool,
-        "exec_command"
-            | "scale"
-            | "rollout_restart"
-            | "patch_resource"
-            | "apply_manifest"
-            | "delete_resource"
-            | "drain_node"
-            | "gitops"
-    )
+/// What the tool definitions say, read once: the tools that only read, and those that take
+/// `dry_run` (by name).
+struct ToolFacts {
+    reads: HashSet<String>,
+    dry_run: Vec<String>,
+}
+
+fn tool_facts() -> &'static ToolFacts {
+    static FACTS: LazyLock<ToolFacts> = LazyLock::new(|| {
+        let tools = KubeMcp::tools().list_all();
+        ToolFacts {
+            reads: tools.iter().filter(|t| only_reads(t)).map(|t| t.name.to_string()).collect(),
+            dry_run: tools.iter().filter(|t| takes_dry_run(t)).map(|t| t.name.to_string()).collect(),
+        }
+    });
+    &FACTS
+}
+
+/// Whether a tool's definition says it changes nothing (`readOnlyHint`).
+fn only_reads(tool: &Tool) -> bool {
+    tool.annotations.as_ref().and_then(|a| a.read_only_hint) == Some(true)
+}
+
+/// Whether a tool's input has a `dry_run` argument.
+fn takes_dry_run(tool: &Tool) -> bool {
+    tool.input_schema.get("properties").and_then(|p| p.get("dry_run")).is_some()
+}
+
+/// Whether a tool may change something: its definition doesn't say it only reads. A tool
+/// this version doesn't know (in a log another version wrote) may have changed something too.
+fn tool_writes(tool: &str) -> bool {
+    !tool_facts().reads.contains(tool)
+}
+
+/// The tools whose input takes `dry_run`, by name.
+fn dry_run_tools() -> &'static [String] {
+    &tool_facts().dry_run
+}
+
+/// Whether a logged call may have changed something. The Activity page shows these calls
+/// under Writes, counts them in each task and colors their tool. A call of a tool that may
+/// change something counts, unless it was a dry run, `gitops`'s `diagnose`, or `browse_files`
+/// without `debug` (the debug container it may add is the only change it makes).
+pub fn call_writes(tool: &str, args: &serde_json::Value) -> bool {
+    let on = |key: &str| args.get(key).and_then(serde_json::Value::as_bool) == Some(true);
+    let reads = match tool {
+        "gitops" => args.get("action").and_then(serde_json::Value::as_str) == Some("diagnose"),
+        "browse_files" => !on("debug"),
+        _ => false,
+    };
+    tool_writes(tool) && !reads && !on("dry_run")
 }
 
 fn format_table(headers: &[&str], rows: &[Vec<String>]) -> String {
@@ -1366,5 +1427,85 @@ mod tests {
         let listener =
             tokio::time::timeout(std::time::Duration::from_secs(5), bind(port, every, |_| {})).await.unwrap().unwrap();
         assert_ne!(listener.local_addr().unwrap().port(), busy_port);
+    }
+
+    fn read_only(tool: &Tool) -> bool {
+        tool.annotations.as_ref().and_then(|a| a.read_only_hint) == Some(true)
+    }
+
+    /// A new tool must say whether it changes anything: the Activity page counts its calls
+    /// from that, and agents' clients read it.
+    #[test]
+    fn every_tool_says_whether_it_only_reads() {
+        let tools = KubeMcp::tools().list_all();
+        assert!(tools.len() >= 49, "{} tools", tools.len());
+        for t in &tools {
+            let hint = t.annotations.as_ref().and_then(|a| a.read_only_hint);
+            assert!(hint.is_some(), "{} doesn't say whether it only reads (readOnlyHint)", t.name);
+        }
+    }
+
+    /// Only the tools that just add something say `destructiveHint: false`, on which a client
+    /// may soften its confirmation. `trigger_cronjob` doesn't: its Job runs the CronJob's own
+    /// code, which may delete or overwrite data.
+    #[test]
+    fn only_tools_that_just_add_say_they_destroy_nothing() {
+        let tools = KubeMcp::tools().list_all();
+        let additive: HashSet<String> = tools
+            .iter()
+            .filter(|t| t.annotations.as_ref().and_then(|a| a.destructive_hint) == Some(false))
+            .map(|t| t.name.to_string())
+            .collect();
+        let expected: HashSet<String> = ["browse_files", "debug_pod", "port_forward"].map(String::from).into();
+        assert_eq!(additive, expected);
+    }
+
+    /// Whether a call wrote comes from the tools' definitions, not from a list of names kept
+    /// by hand, which missed 10 tools that change things (#843).
+    #[test]
+    fn every_tool_that_may_change_something_counts_as_a_write() {
+        let tools = KubeMcp::tools().list_all();
+        // Called for real, with the arguments that make `gitops` and `browse_files` change something.
+        let real = json!({"dry_run": false, "action": "sync", "debug": true});
+        for t in &tools {
+            assert_eq!(call_writes(&t.name, &real), !read_only(t), "{}", t.name);
+        }
+        for tool in [
+            "set_image",
+            "rollout_undo",
+            "rollout_pause",
+            "rollout_resume",
+            "trigger_cronjob",
+            "cordon_node",
+            "uncordon_node",
+            "debug_pod",
+            "port_forward",
+            "stop_port_forward",
+        ] {
+            assert!(tools.iter().any(|t| t.name == tool), "{tool} is a tool");
+            assert!(call_writes(tool, &json!({"dry_run": null})), "{tool}");
+        }
+        // A dry run changes nothing.
+        assert_eq!(dry_run_tools().len(), 13, "{:?}", dry_run_tools());
+        for tool in dry_run_tools() {
+            assert!(!call_writes(tool, &json!({"dry_run": true})), "{tool}");
+        }
+        // Their arguments say when these only read.
+        assert!(!call_writes("gitops", &json!({"action": "diagnose"})));
+        assert!(!call_writes("browse_files", &json!({"path": "/etc", "debug": false})));
+        assert!(!call_writes("get_logs", &json!({})));
+        // A tool this version doesn't know (a log another version wrote) may have changed something.
+        assert!(call_writes("a_tool_of_another_version", &json!({})));
+    }
+
+    /// A tool that takes `dry_run` changes something: a read has nothing to try first, and
+    /// `my_permissions` would offer agents a choice that does nothing.
+    #[test]
+    fn only_changes_take_dry_run() {
+        let tools = KubeMcp::tools().list_all();
+        for t in tools.iter().filter(|t| read_only(t)) {
+            let dry_run = t.input_schema.get("properties").and_then(|p| p.get("dry_run"));
+            assert!(dry_run.is_none(), "{} only reads but takes dry_run", t.name);
+        }
     }
 }
