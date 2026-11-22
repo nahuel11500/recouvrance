@@ -45,6 +45,16 @@ impl KindFilters {
     pub(super) fn forget(&mut self, kind: &Kind) {
         self.by_kind.remove(&kind.key());
     }
+
+    /// The filters saved where the app was left, by `Kind::key`, before any kind is shown.
+    pub(super) fn restore(&mut self, filters: HashMap<String, String>) {
+        self.by_kind = filters;
+    }
+
+    /// Every kind's filter, the box holding `typed`: what is saved where the app is left.
+    pub(super) fn all(&self, typed: &str) -> std::collections::BTreeMap<String, String> {
+        super::session::filters_to_save(&self.by_kind, self.shown_for.as_ref(), typed)
+    }
 }
 
 impl AppView {

@@ -19,6 +19,8 @@ impl AppView {
             filter: self.filter.read(cx).value().to_string(),
             namespaces: self.namespaces.clone(),
             kind: self.kind.clone(),
+            // Opened already: its page is in the history.
+            open: None,
         }
     }
 
@@ -47,6 +49,10 @@ impl AppView {
             self.restart_watch(cx);
         }
         self.apply_route(cx);
+        // A tab reopened on an overview builds it now that it is shown.
+        if let Some(page) = t.open {
+            self.open_overview(page, window, cx);
+        }
     }
 
     /// A new tab showing the current page (Ctrl+T), or `route` when given.
@@ -96,6 +102,7 @@ impl AppView {
             if ix < self.active_tab {
                 self.active_tab -= 1;
             }
+            self.session_changed(cx);
             cx.notify();
         }
     }
@@ -280,6 +287,7 @@ impl AppView {
             self.kind = Some(kind);
             self.restart_watch(cx);
         }
+        self.session_changed(cx);
         cx.notify();
     }
 }

@@ -14,12 +14,16 @@ impl AppView {
     /// Connect to one or more contexts; tables merge them with a Context column.
     pub(super) fn connect_many(&mut self, contexts: Vec<String>, window: &mut Window, cx: &mut Context<Self>) {
         let Some(primary) = contexts.first().cloned() else { return };
+        // Where the contexts connected until now were left, before it is reset below.
+        self.save_session_now(cx);
+        self.session_key = Vec::new();
         if dev_var("RECOUVRANCE_CONTEXT").is_none() {
             let remembered = contexts.clone();
             crate::settings::update(|s| {
                 crate::settings::push_recent(&mut s.recent_contexts, &remembered, 10);
                 s.last_contexts = remembered;
             });
+            self.session_key = crate::settings::session_set(&contexts);
         }
         let connected = contexts.clone();
         self.ctx_picker.update(cx, |p, cx| p.set_connected(connected, cx));
@@ -154,16 +158,29 @@ impl AppView {
                         this.recording =
                             crate::timeline::start_watches(&this.clusters, &this.kinds, &this.kind_clusters);
                         this.set_namespaces(namespaces, window, cx);
+                        // The first window's first connect reopens where this set was left:
+                        // its namespaces before the list starts, so the list starts once.
+                        let reopened =
+                            if std::mem::take(&mut this.restore) { this.restore_session(window, cx) } else { None };
                         this.restart_watch(cx);
                         // After the list, whose rows its first count waits for.
                         this.problems.start(this.clusters.clone(), this.cluster_kinds(), cx);
-                        if dev_var("RECOUVRANCE_PAGE").is_none() {
-                            match crate::settings::get().initial_view {
-                                crate::settings::InitialView::Workloads => this.open_workloads(window, cx),
-                                crate::settings::InitialView::Cluster => this.open_cluster(window, cx),
-                                crate::settings::InitialView::Pods => {}
+                        match reopened {
+                            Some(page) => {
+                                if let Some(page) = super::session::overview(page) {
+                                    this.open_overview(page, window, cx);
+                                }
                             }
+                            None if dev_var("RECOUVRANCE_PAGE").is_none() => {
+                                match crate::settings::get().initial_view {
+                                    crate::settings::InitialView::Workloads => this.open_workloads(window, cx),
+                                    crate::settings::InitialView::Cluster => this.open_cluster(window, cx),
+                                    crate::settings::InitialView::Pods => {}
+                                }
+                            }
+                            None => {}
                         }
+                        this.session_changed(cx);
                         match dev_var("RECOUVRANCE_PAGE").as_deref() {
                             Some("workloads") => this.open_workloads(window, cx),
                             Some("helm") => this.open_helm(window, cx),
@@ -285,6 +302,7 @@ impl AppView {
         self.namespace = (self.namespaces.len() == 1).then(|| self.namespaces[0].clone());
         self.update_assistant_scope(cx);
         self.rescope_page(cx);
+        self.session_changed(cx);
     }
 
     /// Each connected cluster with the namespaces a page lists there.
