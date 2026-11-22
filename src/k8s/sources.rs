@@ -68,9 +68,11 @@ fn count(files: &[std::path::PathBuf]) -> (usize, Option<String>) {
     (contexts, error)
 }
 
+// The error is one line that names the file and says where it failed; cutting it to a length
+// would drop the line and column after a long path.
 fn short(e: &impl std::fmt::Display) -> String {
     let s = e.to_string();
-    s.lines().next().unwrap_or_default().chars().take(160).collect()
+    s.lines().next().unwrap_or_default().to_string()
 }
 
 fn file_source(kind: SourceKind, shown: String, path: &std::path::Path) -> Source {

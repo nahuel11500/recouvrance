@@ -80,3 +80,8 @@ them after 1.4 s ([measured](COMPARISON.md#measured)).
   command's arguments. Kubeconfig files are read through `k8s::read_kubeconfig_file`, pasted
   text through `parse_kubeconfig`: their error says the file, line and column, and why in words
   of their own.
+- **Proxy passwords stay out of errors.** kube's error for a proxy it can't use prints the proxy's
+  URL whole, user and password included. The client's build error puts that URL back without
+  them, scheme or not (`user:password@host:1080` from `HTTPS_PROXY` reads as a URL to kube, not
+  to a text), and leaves out the user and password of any other URL in its text, as of one in the
+  login plugin's stderr line (`k8s::login`).

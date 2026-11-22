@@ -1122,6 +1122,30 @@ echo '{"apiVersion":"client.authentication.k8s.io/v1","kind":"ExecCredential","s
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// A proxy kube can't use, by its scheme or for having none (an `HTTPS_PROXY` that curl
+    /// reads as http): the error of building the client names it by its host and port, never
+    /// its user and password, however it is printed (#859).
+    #[test]
+    fn a_proxy_s_password_stays_out_of_the_connect_error() {
+        let cases = [
+            ("socks5h://user:secret@proxy.corp:1080", "socks5h://proxy.corp:1080/"),
+            ("user:secret@proxy.corp:3128", "proxy.corp:3128"),
+        ];
+        for (url, shown) in cases {
+            let mut config = kube::Config::new("https://127.0.0.1:1".parse().unwrap());
+            config.proxy_url = Some(url.parse().unwrap());
+            // kube's own error prints the URL whole.
+            let Err(raw) = kube::Client::try_from(config.clone()) else { panic!("kube uses {url}") };
+            assert!(raw.to_string().contains("user:secret@"), "{raw}");
+            let Err(e) = super::client(config, "test".into(), false) else { panic!("kube uses {url}") };
+            assert_eq!(crate::k8s::short_error(&e), format!("configured proxy {shown} uses an unsupported protocol"));
+            for said in [crate::k8s::error_chain(&e), format!("{e:#}"), format!("{e:?}"), format!("{e:#?}")] {
+                assert!(!said.contains("secret") && !said.contains("user:"), "{said}");
+                assert!(said.contains("proxy.corp:"), "{said}");
+            }
+        }
+    }
+
     #[test]
     fn exec_command_of_a_context() {
         let kc = Kubeconfig::from_yaml(
