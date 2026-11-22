@@ -31,19 +31,32 @@ where
 {
     run_abortable(async move {
         let url = DynamicObject::url_path(&ar, namespace.as_deref());
-        let mut lp = ListParams::default().limit(LEAN_PAGE);
         let mut out = Vec::new();
-        loop {
-            let page: LeanList<T> = request_idle(&client, Request::new(&url).list(&lp)?).await?;
-            out.extend(page.items);
-            match page.metadata.continue_.filter(|c| !c.is_empty()) {
-                Some(token) => lp.continue_token = Some(token),
-                None => break,
-            }
-        }
+        each_lean_page(&client, &url, ListParams::default(), |page: Vec<T>| out.extend(page)).await?;
         Ok(out)
     })
     .await
+}
+
+/// The objects at `url` that `lp` selects, parsed into `T` (only the wanted fields are ever
+/// held), a page of `lp.limit` items at a time (`LEAN_PAGE` when unset), each page given to
+/// `page` as soon as it is read: a caller keeps only what it needs of them. Every page is
+/// read, to the last `continue` token. For work already on the runtime (`run`).
+pub(super) async fn each_lean_page<T: serde::de::DeserializeOwned>(
+    client: &Client,
+    url: &str,
+    mut lp: ListParams,
+    mut page: impl FnMut(Vec<T>),
+) -> Result<()> {
+    lp.limit = lp.limit.or(Some(LEAN_PAGE));
+    loop {
+        let list: LeanList<T> = request_idle(client, Request::new(url).list(&lp)?).await?;
+        page(list.items);
+        match list.metadata.continue_.filter(|c| !c.is_empty()) {
+            Some(token) => lp.continue_token = Some(token),
+            None => return Ok(()),
+        }
+    }
 }
 
 /// Like `list_lean`, in one response from the API server's cache (`resourceVersion=0`):

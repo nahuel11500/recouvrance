@@ -225,7 +225,8 @@ impl AppView {
         }
     }
 
-    /// Record which page this window shows (see `wait_visible`).
+    /// Record which page this window shows, and whether the window is hidden (see
+    /// `wait_visible`). The list pauses at once when it leaves the screen.
     pub(super) fn mark_visible(&mut self, cx: &mut Context<Self>) {
         let page = match self.route() {
             Route::Detail(e) => Some(e.entity_id()),
@@ -243,12 +244,18 @@ impl AppView {
             Route::Apply(e) => Some(e.entity_id()),
             Route::Resources(_) | Route::Contexts | Route::Settings | Route::Agents => None,
         };
-        let me = cx.entity_id();
-        let pages = &mut cx.default_global::<VisiblePages>().0;
+        self.list_pause.set(!self.list_on_screen());
+        let (me, hidden) = (cx.entity_id(), self.window_hidden);
+        let visible = cx.default_global::<VisiblePages>();
         match page {
-            Some(p) => pages.insert(me, p),
-            None => pages.remove(&me),
+            Some(p) => visible.pages.insert(me, p),
+            None => visible.pages.remove(&me),
         };
+        if hidden {
+            visible.hidden.insert(me);
+        } else {
+            visible.hidden.remove(&me);
+        }
     }
 
     pub(super) fn apply_route(&mut self, cx: &mut Context<Self>) {
