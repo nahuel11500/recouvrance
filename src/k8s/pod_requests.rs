@@ -316,6 +316,11 @@ fn apply_event(line: &str, pods: &mut Arc<PodAllocs>, version: &mut String) -> R
 /// usage, which metrics-server measures every 15 s at best.
 const SEND_EVERY: Duration = Duration::from_secs(2);
 
+/// At most this often while the page is off screen. The cluster overview reads them as soon as
+/// it is back, before the watch may have seen it is: they are then never older than its
+/// refresh (30 s by default).
+const SEND_AWAY_EVERY: Duration = Duration::from_secs(30);
+
 /// How long the watch goes on while its page is off screen. Back sooner, the pods are current
 /// at once; later, they are listed again (watching every pod has a cost too: its events).
 const LINGER: Duration = Duration::from_secs(5 * 60);
@@ -355,15 +360,20 @@ struct Outbox {
 }
 
 impl Outbox {
-    /// At `now`: send what changed (on screen only, at most every `SEND_EVERY`), stop after
-    /// `LINGER` off screen, or wait.
+    /// At `now`: send what changed (at most every `SEND_EVERY` on screen, `SEND_AWAY_EVERY` off
+    /// screen; the list at once), stop after `LINGER` off screen, or wait.
     fn step(&mut self, paused: bool, now: Instant) -> Step {
-        if paused {
+        let every = if paused {
             let away = *self.away.get_or_insert(now);
-            return if now.duration_since(away) >= LINGER { Step::Stop } else { Step::Wait };
-        }
-        self.away = None;
-        if self.dirty && self.sent.is_none_or(|sent| now.duration_since(sent) >= SEND_EVERY) {
+            if now.duration_since(away) >= LINGER {
+                return Step::Stop;
+            }
+            SEND_AWAY_EVERY
+        } else {
+            self.away = None;
+            SEND_EVERY
+        };
+        if self.dirty && self.sent.is_none_or(|sent| now.duration_since(sent) >= every) {
             self.dirty = false;
             self.sent = Some(now);
             return Step::Send;
@@ -389,7 +399,8 @@ impl Outbox {
 
 /// Follows the pods from `version`, applying each change, and gives them to the reader as
 /// `Outbox` says, starting with the list's. A cut stream or the server's timeout watches again
-/// from where it got, without a list. `progress`: some frame came.
+/// from where it got, without a list. `progress`: an event was read (an error frame doesn't
+/// count).
 async fn follow(
     client: &Client,
     url: &str,
@@ -444,12 +455,14 @@ async fn follow(
                 Some(Some(Ok(line))) => {
                     (heard, heard_any) = (tokio::time::Instant::now(), true);
                     backoff = Backoff::default();
-                    *progress = true;
                     match apply_event(&line, &mut pods, &mut version) {
                         Ok(Applied::Changed) => out.dirty = true,
                         Ok(Applied::Unchanged) => {}
                         Ok(Applied::Relist) | Err(_) => return Ended::Relist,
                     }
+                    // Only after an event: a server that answers each watch with an error at
+                    // once would have every pod listed again in a loop.
+                    *progress = true;
                 }
                 None => {}
             }
@@ -463,10 +476,10 @@ async fn follow(
 /// The pods' requests and limits, for the usage bars of the pods list and the cluster overview:
 /// one list, each pod kept only as its sums, then a watch from it, so pods that come, go or are
 /// resized show without another list. Nothing is listed before `rows_due` is cleared (the
-/// list's own rows go first: this list of whole pods is big), nor while `pause` is set; the
-/// changes wait while it is, and after `LINGER` the watch stops until it is cleared. When the
-/// server refuses to watch, the pods are listed again every minute, or ten times as long as a
-/// list takes.
+/// list's own rows go first: this list of whole pods is big), nor while `pause` is set; while
+/// it is, changes go out less often, and after `LINGER` the watch stops until it is cleared.
+/// When the server refuses to watch, the pods are listed again every minute, or ten times as
+/// long as a list takes.
 pub fn watch_pod_resources(
     client: Client,
     namespace: Option<String>,
@@ -521,7 +534,7 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::{AllocList, Applied, Arc, Duration, Instant, Outbox, PodAlloc, PodAllocs, Step, apply_event};
-    use super::{LINGER, SEND_EVERY};
+    use super::{LINGER, SEND_AWAY_EVERY, SEND_EVERY};
 
     /// A pod with one container requesting `cpu` and `memory`, limited to that memory.
     fn pod(ns: &str, name: &str, rv: &str, cpu: &str, memory: &str, phase: &str) -> Value {
@@ -643,9 +656,10 @@ mod tests {
     }
 
     #[test]
-    fn the_reader_gets_changes_on_screen_and_the_watch_stops_long_off_screen() {
+    fn the_reader_gets_changes_and_the_watch_stops_long_off_screen() {
         let start = Instant::now();
         let at = |secs: f64| start + Duration::from_secs_f64(secs);
+        let (every, away) = (SEND_EVERY.as_secs_f64(), SEND_AWAY_EVERY.as_secs_f64());
         let mut out = Outbox { dirty: true, ..Outbox::default() };
         // The list goes at once.
         assert_eq!(out.step(false, at(0.0)), Step::Send);
@@ -653,18 +667,27 @@ mod tests {
         // Changes, then at most every `SEND_EVERY`.
         out.dirty = true;
         assert_eq!(out.step(false, at(1.0)), Step::Wait);
-        assert_eq!(out.step(false, at(SEND_EVERY.as_secs_f64())), Step::Send);
-        // Off screen, changes wait; back, they go.
+        assert_eq!(out.step(false, at(every)), Step::Send);
+        // Off screen, at most every `SEND_AWAY_EVERY`: a page back reads what it has before
+        // the watch sees it is, so that is never older.
         out.dirty = true;
-        assert_eq!(out.step(true, at(10.0)), Step::Wait);
-        assert_eq!(out.step(false, at(11.0)), Step::Send);
+        assert_eq!(out.step(true, at(every + 5.0)), Step::Wait);
+        assert_eq!(out.step(true, at(every + away - 0.5)), Step::Wait);
+        assert_eq!(out.step(true, at(every + away)), Step::Send);
+        // Back, changes go at the pace on screen.
+        out.dirty = true;
+        assert_eq!(out.step(false, at(every + away + 1.0)), Step::Wait);
+        assert_eq!(out.step(false, at(2.0 * every + away)), Step::Send);
         // Away for `LINGER` in one go, the watch stops; being back in between starts it over.
-        let linger = LINGER.as_secs_f64();
-        assert_eq!(out.step(true, at(20.0)), Step::Wait);
-        assert_eq!(out.step(false, at(21.0)), Step::Wait);
-        assert_eq!(out.step(true, at(22.0)), Step::Wait);
-        assert_eq!(out.step(true, at(20.0 + linger)), Step::Wait);
-        assert_eq!(out.step(true, at(22.0 + linger)), Step::Stop);
+        let (linger, t) = (LINGER.as_secs_f64(), 100.0);
+        assert_eq!(out.step(true, at(t)), Step::Wait);
+        assert_eq!(out.step(false, at(t + 1.0)), Step::Wait);
+        assert_eq!(out.step(true, at(t + 2.0)), Step::Wait);
+        assert_eq!(out.step(true, at(t + linger)), Step::Wait);
+        assert_eq!(out.step(true, at(t + 2.0 + linger)), Step::Stop);
+        // Off screen from the start, the list still goes at once.
+        let mut out = Outbox { dirty: true, ..Outbox::default() };
+        assert_eq!(out.step(true, at(0.0)), Step::Send);
     }
 
     proptest! {
@@ -724,13 +747,14 @@ mod watch_tests {
     use super::{Arc, Duration, Pause, PodRequests, PodRequestsRx, watch_pod_resources};
 
     /// A cluster with pods `a/api` and `b/db` at version 10. A watch from there adds `a/new`,
-    /// resizes `a/api` and deletes `b/db`, then stays open. It counts the lists, and answers
-    /// them 403 when it `refuses`.
+    /// resizes `a/api` and deletes `b/db`, then stays open; or, when the version is `gone`,
+    /// says so at once. It counts the lists, and answers them 403 when it `refuses`.
     #[derive(Clone, Default)]
     struct Cluster {
         lists: Arc<AtomicUsize>,
         watched_from: Arc<Mutex<Vec<String>>>,
         refuses: bool,
+        gone: bool,
     }
 
     fn pod(ns: &str, name: &str, rv: &str, cpu: &str) -> Value {
@@ -753,12 +777,16 @@ mod watch_tests {
             let (status, body) = if query.contains("watch=true") {
                 let from = query.split('&').find_map(|p| p.strip_prefix("resourceVersion=")).unwrap_or_default();
                 self.watched_from.lock().unwrap().push(from.to_string());
-                let events = [
+                let changes = [
                     json!({"type": "ADDED", "object": pod("a", "new", "11", "300m")}),
                     json!({"type": "MODIFIED", "object": pod("a", "api", "12", "200m")}),
                     json!({"type": "DELETED", "object": pod("b", "db", "13", "100m")}),
                 ];
-                let frames = events.map(|e| Ok::<_, Infallible>(Frame::data(Bytes::from(format!("{e}\n")))));
+                let too_old = json!({"kind": "Status", "status": "Failure", "code": 410, "message": "too old"});
+                let gone = [json!({"type": "ERROR", "object": too_old})];
+                let events: &[Value] = if self.gone { &gone } else { &changes };
+                let frames: Vec<_> =
+                    events.iter().map(|e| Ok::<_, Infallible>(Frame::data(Bytes::from(format!("{e}\n"))))).collect();
                 let stream = futures::stream::iter(frames).chain(futures::stream::pending());
                 (200, StreamBody::new(stream).boxed_unsync())
             } else {
@@ -810,6 +838,19 @@ mod watch_tests {
         assert!(reads(&mut rx, Option::is_some).await);
         let read = rx.borrow().clone();
         assert_eq!(read.map(Result::err), Some(Some("forbidden".to_string())));
+    }
+
+    /// A watch that fails at once (an API server whose cache doesn't have the list's version)
+    /// doesn't have every pod listed again in a loop: the next list waits.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_watch_failing_at_once_waits_before_listing_again() {
+        let cluster = Cluster { gone: true, ..Cluster::default() };
+        let client = kube::Client::new(cluster.clone(), "default");
+        let (_watch, mut rx) = watch_pod_resources(client, None, Pause::default(), Pause::default());
+        assert!(reads(&mut rx, |read| matches!(read, Some(Ok(_)))).await, "the list never came");
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert!(!cluster.watched_from.lock().unwrap().is_empty(), "never watched");
+        assert_eq!(cluster.lists.load(Ordering::Relaxed), 1, "listed again at once");
     }
 
     #[tokio::test(flavor = "multi_thread")]
