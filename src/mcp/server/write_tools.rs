@@ -369,9 +369,7 @@ impl KubeMcp {
         for doc in docs {
             let api_version = doc["apiVersion"].as_str().unwrap_or_default().to_string();
             let kind_name = doc["kind"].as_str().unwrap_or_default().to_string();
-            let find = |kinds: &[Kind]| {
-                kinds.iter().find(|k| k.ar.api_version == api_version && k.ar.kind == kind_name).cloned()
-            };
+            let find = |kinds: &[Kind]| k8s::manifest_kind(kinds, &api_version, &kind_name).cloned();
             let mut kind = find(&kinds);
             if kind.is_none()
                 && let Some(fresh) = self.hub.rediscover(context).await

@@ -48,7 +48,8 @@ impl AppView {
         ] {
             items.push(PaletteItem { label: label.into(), detail: "page".into(), icon, target: Target::Page(page) });
         }
-        for k in &self.kinds {
+        // The types the sidebar lists, not the noise discovery keeps for lookups.
+        for k in self.kinds.iter().filter(|k| k8s::in_sidebar(k)) {
             items.push(PaletteItem {
                 label: k.label.clone(),
                 detail: format!("{} · {}", k.kubectl_name(), k.section),
