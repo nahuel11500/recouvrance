@@ -1194,7 +1194,8 @@ fn the_files_tab_reads_a_container() {
 
 /// The timeline records what a list's watch sees change, from the metadata alone: a label
 /// set by someone (and who), then the deletion. The agents' `get_changes` returns the record
-/// with its source.
+/// with its source, and `recent_changes` among the namespace's changes, with its events read
+/// from the cluster; rules that keep the agent from reading ConfigMaps leave it out, counted.
 #[test]
 #[ignore = "needs a kind cluster: RECOUVRANCE_E2E_CONTEXT"]
 fn the_timeline_records_what_a_watch_sees_change() {
@@ -1248,11 +1249,20 @@ fn the_timeline_records_what_a_watch_sees_change() {
             let diff = found[0].diff.as_ref().map_or_default(|d| d.short(5));
             assert!(diff.contains("tier: front"), "{diff}");
 
-            let (hub, _agent, token, _server) = agent(&["get,list *"], &[]).await?;
+            let (hub, agent, token, _server) = agent(&["get,list *"], &[]).await?;
             let mcp = crate::assistant::Mcp::connect(hub.port(), token).await?;
             let target = json!({"context": ctx, "kind": "configmaps", "namespace": NS, "name": name});
             let out = mcp.call("get_changes", target).await;
             assert!(out.contains("Recorded  ConfigMap e2e-timeline: labels changed: tier by e2e-editor"), "{out}");
+
+            let recent = json!({"context": ctx, "namespace": NS});
+            let out = mcp.call("recent_changes", recent.clone()).await;
+            let line = "Recorded  ConfigMap default/e2e-timeline: labels changed: tier by e2e-editor";
+            assert!(out.contains(line) && !out.contains("Could not read events"), "{out}");
+            let deny = rules_file::parse_rule(Mode::Deny, "get configmaps")?;
+            hub.update_agent(&agent.id, |a| a.policy.rules.push(deny))?;
+            let out = mcp.call("recent_changes", recent).await;
+            assert!(!out.contains(name) && out.contains("Left out, not allowed by your rules: "), "{out}");
 
             cms.delete(name, &DeleteParams::default()).await?;
             for _ in 0..60 {

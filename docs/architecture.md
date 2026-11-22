@@ -29,7 +29,7 @@ Recouvrance is one Rust binary: a [gpui](https://github.com/zed-industries/zed) 
 | Path | What |
 |---|---|
 | `src/main.rs` | Entry point: the window, `serve` (headless MCP), `agent-create` |
-| `src/app/` | The main window: contexts, sidebar, resource list page, tabs and history, theme |
+| `src/app/` | The main window: contexts, sidebar, resource list page, tabs and history, theme, key bindings and the macOS menu bar |
 | `src/table/` | The resource table (server-side columns, usage bars, links) and its filter language |
 | `src/details/` | A detail page: tabs, actions and their confirmations, logs, compare, related data |
 | `src/overview/` | The Overview tab, per kind: pods, workloads, nodes, networking, configuration, RBAC |
@@ -75,3 +75,13 @@ them after 1.4 s ([measured](COMPARISON.md#measured)).
   last line the plugin wrote to stderr is added when the kubeconfig sets `interactiveMode: Never`:
   kube keeps stderr only then, and otherwise the plugin writes to the terminal Recouvrance was
   started from. Pages, agents and the audit log only ever get that.
+- **Kubeconfig errors keep their secrets too.** The YAML parser's error for a kubeconfig shows
+  the lines around where it failed and can quote a value: a token, a client key, a login
+  command's arguments. Kubeconfig files are read through `k8s::read_kubeconfig_file`, pasted
+  text through `parse_kubeconfig`: their error says the file, line and column, and why in words
+  of their own.
+- **Proxy passwords stay out of errors.** kube's error for a proxy it can't use prints the proxy's
+  URL whole, user and password included. The client's build error puts that URL back without
+  them, scheme or not (`user:password@host:1080` from `HTTPS_PROXY` reads as a URL to kube, not
+  to a text), and leaves out the user and password of any other URL in its text, as of one in the
+  login plugin's stderr line (`k8s::login`).

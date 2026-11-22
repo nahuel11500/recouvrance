@@ -393,7 +393,9 @@ impl AppView {
                 OnScreen::Object { kind: "Helm release".into(), namespace: Some(namespace), name, context }
             }
             Route::Problems(_) => OnScreen::Page("the Problems page (what is broken)"),
-            Route::Timeline(_) => OnScreen::Page("the Timeline page (recent changes and events)"),
+            Route::Timeline(_) => {
+                OnScreen::Page("the Timeline page (recent changes and events: recent_changes reads them)")
+            }
             Route::Workloads(_) => OnScreen::Page("the Workloads overview"),
             Route::Cluster(_) => OnScreen::Page("the Cluster overview"),
             Route::Helm(_) => OnScreen::Page("the list of Helm releases"),

@@ -5,7 +5,12 @@
 //! client puts [`LoginFailed`] in that error's place where it comes out, when it is built (the
 //! command runs a first time) and on every request (it runs again when the token expires).
 //! The program is named from the kubeconfig ([`program`]): kube's text is never read.
+//!
+//! The user and password of a URL never show either: not in the error of building a client
+//! ([`build_error`]), where kube's error for a proxy it can't use prints the proxy's URL whole,
+//! nor in the stderr line said of a failed login command.
 
+use std::borrow::Cow;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -77,13 +82,83 @@ fn failure(e: &(dyn std::error::Error + 'static), program: Option<&str>) -> Opti
 }
 
 /// The error of building a client whose login command runs `program` (see [`program`]), with
-/// [`LoginFailed`] in its place when it is that command that failed: building runs it a first
-/// time.
+/// [`LoginFailed`] in its place when it is that command that failed (building runs it a first
+/// time), and without the user and password of any URL in it. kube's error for a proxy it
+/// can't use prints the proxy's URL whole, from the kubeconfig's `proxy-url` or `HTTPS_PROXY`:
+/// that URL is put back without them first, since a text can't tell that
+/// `user:password@host:1080` (no scheme) is a URL. Other errors stay as they are.
 pub fn build_error(e: kube::Error, program: Option<&str>) -> anyhow::Error {
-    match failure(&e, program) {
-        Some(said) => LoginFailed(said).into(),
-        None => e.into(),
+    if let Some(said) = failure(&e, program) {
+        return LoginFailed(said).into();
     }
+    let e = anyhow::Error::from(proxy_host_only(e));
+    // Any other URL in what it says. `{e:?}` says the same texts as `{e:#}`.
+    match without_userinfo(&format!("{e:#}")) {
+        Cow::Owned(said) => anyhow::Error::msg(said),
+        Cow::Borrowed(_) => e,
+    }
+}
+
+/// kube's error for a proxy it can't use, its URL without user and password; any other error
+/// as it is.
+fn proxy_host_only(e: kube::Error) -> kube::Error {
+    use kube::Error::{ProxyProtocolDisabled, ProxyProtocolUnsupported};
+    match e {
+        ProxyProtocolUnsupported { proxy_url } => {
+            ProxyProtocolUnsupported { proxy_url: Box::new(host_only(*proxy_url)) }
+        }
+        ProxyProtocolDisabled { proxy_url, protocol_feature } => {
+            ProxyProtocolDisabled { proxy_url: Box::new(host_only(*proxy_url)), protocol_feature }
+        }
+        e => e,
+    }
+}
+
+/// `uri` without the user and password before its host: `socks5h://user:password@host:1080/`
+/// gives `socks5h://host:1080/`, `user:password@host:1080` gives `host:1080`.
+fn host_only(uri: http::Uri) -> http::Uri {
+    let Some((_, host)) = uri.authority().and_then(|a| a.as_str().rsplit_once('@')) else {
+        return uri;
+    };
+    // A host that doesn't read on its own (`u[@h]:1`) goes too, and the URL with it: better
+    // than the password.
+    let host = host.parse::<http::uri::Authority>().ok();
+    let mut parts = uri.into_parts();
+    parts.authority = host;
+    http::Uri::from_parts(parts).unwrap_or_default()
+}
+
+/// `text` without the user and password of any URL in it: after each `://`, everything up to
+/// the last `@` before the end of the host and port (a `/`, `?` or `#`, a space, or a character
+/// a URL can't hold unescaped). A text without them comes back as it is.
+fn without_userinfo(text: &str) -> Cow<'_, str> {
+    let mut said = String::new();
+    // How much of `text` is in `said` or left out.
+    let mut done = 0;
+    for (at, _) in text.match_indices("://") {
+        let start = at + "://".len();
+        let rest = &text[start..];
+        let authority = &rest[..rest.find(ends_authority).unwrap_or(rest.len())];
+        // An authority holds no `/`: it ends before the next `://` is over, so `done` never
+        // passes `start`.
+        if let Some(info) = authority.rfind('@') {
+            said.push_str(&text[done..start]);
+            done = start + info + 1;
+        }
+    }
+    if done == 0 {
+        return Cow::Borrowed(text);
+    }
+    said.push_str(&text[done..]);
+    Cow::Owned(said)
+}
+
+/// Whether `c` ends a URL's authority (its user, password, host and port): its path, query or
+/// fragment starts, or it is a space or a character a URL can't hold unescaped.
+fn ends_authority(c: char) -> bool {
+    c.is_whitespace()
+        || c.is_control()
+        || matches!(c, '/' | '?' | '#' | '"' | '<' | '>' | '\\' | '^' | '`' | '{' | '|' | '}')
 }
 
 /// Puts [`LoginFailed`] in place of a failed login command's error on every request of a
@@ -163,13 +238,16 @@ fn ended(status: std::process::ExitStatus) -> String {
     }
 }
 
-/// The last line of `stderr` with text in it, as plain text, at most `MAX_DETAIL` characters.
+/// The last line of `stderr` with text in it, as plain text without the user and password of a
+/// URL, at most `MAX_DETAIL` characters.
 fn last_line(stderr: &[u8]) -> Option<String> {
     let text = String::from_utf8_lossy(stderr);
     let line = text.lines().rev().map(plain).find(|l| !l.is_empty())?;
+    // Before the cut, which could leave half a password without the `@` that tells it is one.
+    let line = without_userinfo(&line);
     Some(match line.char_indices().nth(MAX_DETAIL) {
         Some((cut, _)) => format!("{}…", line[..cut].trim_end()),
-        None => line,
+        None => line.into_owned(),
     })
 }
 
@@ -390,6 +468,77 @@ mod tests {
         assert_eq!(last_line(b"first\n\x1b[0m\n  \n"), Some("first".into()));
         assert_eq!(last_line(b"\xffbad\n"), Some("\u{fffd}bad".into()));
         assert_eq!(last_line(b""), None);
+        // A URL's user and password are left out, before a cut that would keep half of them (it
+        // falls in the password here, and nothing is cut once they are out).
+        let said = last_line(b"error: Get https://alice:s3cr3t@issuer.example/token: 401\n");
+        assert_eq!(said.as_deref(), Some("error: Get https://issuer.example/token: 401"));
+        let long = format!("{} https://alice:s3cr3t-and-more@issuer.example", "x".repeat(175));
+        assert_eq!(last_line(long.as_bytes()), Some(format!("{} https://issuer.example", "x".repeat(175))));
+    }
+
+    /// A URL's user and password are left out of a text, wherever it is and whatever is around
+    /// it; the rest stays.
+    #[test]
+    fn a_url_s_user_and_password_are_left_out() {
+        let cases = [
+            (
+                "configured proxy socks5h://alice:s3cr3t@proxy.corp:1080/ uses an unsupported protocol",
+                "configured proxy socks5h://proxy.corp:1080/ uses an unsupported protocol",
+            ),
+            // The last `@` ends them; a quote, a space, a line break or the path ends the host.
+            (r#"proxy "https://alice:p@ss@[::1]:3128""#, r#"proxy "https://[::1]:3128""#),
+            ("from http://a:b@one to ssh://git@two:22/x?y=z@w", "from http://one to ssh://two:22/x?y=z@w"),
+            ("socks5://alice@h\nnext@line", "socks5://h\nnext@line"),
+        ];
+        for (text, said) in cases {
+            assert_eq!(without_userinfo(text), said);
+        }
+        // Without a user or password in a URL, the text itself.
+        for text in ["mail alice@example.com about https://example.com/a@b", "a@b://", "x://", ""] {
+            assert!(matches!(without_userinfo(text), Cow::Borrowed(t) if t == text), "{text}");
+        }
+    }
+
+    /// kube's error for a proxy it can't use prints its URL whole. The error of building the
+    /// client names the proxy by its scheme, host and port, never its user and password, however
+    /// it is printed; without a scheme too (an `HTTPS_PROXY` that curl reads as http), where only
+    /// the URL kube holds tells that it is one (#859).
+    #[test]
+    fn a_proxy_s_user_and_password_never_show() {
+        let unsupported = |shown: &str| format!("configured proxy {shown} uses an unsupported protocol");
+        let cases = [
+            ("socks5h://alice:s3cr3t@proxy.corp:1080", "socks5h://proxy.corp:1080/"),
+            ("alice:s3cr3t@proxy.corp:3128", "proxy.corp:3128"),
+            ("socks4://alice:s3%40cr3t@[::1]:1080/x?y", "socks4://[::1]:1080/x?y"),
+            ("socks5h://alice@proxy.corp:1080", "socks5h://proxy.corp:1080/"),
+        ];
+        for (url, shown) in cases {
+            let e = kube::Error::ProxyProtocolUnsupported { proxy_url: Box::new(url.parse().unwrap()) };
+            assert!(e.to_string().contains("alice"), "{e}");
+            let built = build_error(e, Some("kubelogin"));
+            assert_eq!(crate::k8s::short_error(&built), unsupported(shown));
+            for said in
+                [format!("{built:#}"), format!("{built:?}"), format!("{built:#?}"), crate::k8s::error_chain(&built)]
+            {
+                assert!(!said.contains("alice") && !said.contains("cr3t"), "{said}");
+            }
+        }
+        let proxy_url = Box::new("socks5://alice:s3cr3t@proxy.corp:1080".parse().unwrap());
+        let built =
+            build_error(kube::Error::ProxyProtocolDisabled { proxy_url, protocol_feature: "kube/socks5" }, None);
+        let said = r#"configured proxy socks5://proxy.corp:1080/ requires the disabled feature "kube/socks5""#;
+        assert_eq!(format!("{built:#}"), said);
+        // Another error that prints a URL: its user and password go, the rest is said.
+        let other =
+            build_error(kube::Error::Service("connecting to https://alice:s3cr3t@api:6443 failed".into()), None);
+        let said = format!("{other:#}");
+        assert!(
+            said.starts_with("ServiceError: connecting to https://api:6443 failed") && !said.contains("alice"),
+            "{said}"
+        );
+        // Without one, kube's error as it was.
+        let refused = build_error(kube::Error::Service("refused".into()), None);
+        assert!(matches!(refused.downcast_ref::<kube::Error>(), Some(kube::Error::Service(_))));
     }
 }
 
@@ -474,6 +623,98 @@ mod properties {
             let detail = said.strip_prefix("the login command `kubelogin` failed (exit 1)").unwrap();
             prop_assert!(detail.is_empty() || detail.starts_with(": "), "{said:?}");
             prop_assert!(detail.chars().count() <= ": ".len() + MAX_DETAIL + 1, "{said:?}");
+        }
+    }
+}
+
+/// Whatever a URL's user and password hold and whatever is around them, they never show.
+#[cfg(test)]
+mod url_properties {
+    use std::borrow::Cow;
+
+    use proptest::prelude::*;
+
+    use super::{build_error, without_userinfo};
+
+    /// In every user and password of a proxy's URL, never in what is said of it.
+    const SECRET: &str = "XSECRETX";
+
+    /// Texts made of URL pieces, so that many hold `://` and `@` in every order, or any text.
+    fn texts() -> impl Strategy<Value = String> {
+        let piece = prop_oneof![
+            Just("://"),
+            Just("@"),
+            Just(":"),
+            Just("/"),
+            Just(" "),
+            Just("a"),
+            Just("?"),
+            Just("\""),
+            Just("["),
+            Just("é")
+        ];
+        prop_oneof![proptest::collection::vec(piece, 0..24).prop_map(|p| p.concat()), "\\PC{0,40}"]
+    }
+
+    proptest! {
+        /// A URL in a text loses its user and password, whatever they hold and whatever text is
+        /// around it; the rest of the text, the URL's scheme, host, port and path included, stays
+        /// as it was.
+        #[test]
+        fn a_url_in_a_text_never_shows_its_user_and_password(
+            before in "[^@]{0,20}",
+            scheme in "[a-z][a-z0-9+.-]{0,8}",
+            user in "[a-zA-Z0-9._~!$&'()*+,;=%-]{0,8}",
+            password in proptest::option::of("[a-zA-Z0-9._~!$&'()*+,;=%:@-]{0,8}"),
+            host in "[a-z0-9.-]{1,16}|\\[[0-9a-f:]{2,12}\\]",
+            port in proptest::option::of(any::<u16>()),
+            path in "([/?#][^@]{0,12})?",
+            after in "([ \"<>\\n][^@]{0,20})?",
+        ) {
+            let userinfo = password.map_or_else(|| user.clone(), |p| format!("{user}:{p}"));
+            let host = port.map_or_else(|| host.clone(), |p| format!("{host}:{p}"));
+            let text = format!("{before}{scheme}://{userinfo}@{host}{path}{after}");
+            let said = without_userinfo(&text);
+            prop_assert_eq!(said, format!("{before}{scheme}://{host}{path}{after}"));
+        }
+
+        /// Whatever the text, what comes back holds no user or password of a URL: read again,
+        /// it comes back the same. A text without both a `://` and an `@` comes back as it is.
+        #[test]
+        fn nothing_is_left_to_leave_out(text in texts()) {
+            let once = without_userinfo(&text).into_owned();
+            prop_assert_eq!(without_userinfo(&once), once.as_str());
+            if !(text.contains("://") && text.contains('@')) {
+                prop_assert!(matches!(without_userinfo(&text), Cow::Borrowed(t) if t == text), "{text}");
+            }
+        }
+
+        /// Whatever a proxy's URL holds, with a scheme or without, the error of building a client
+        /// with it names the proxy by its host and port, never its user and password, however it
+        /// is printed (#859).
+        #[test]
+        fn a_proxy_never_shows_its_user_and_password(
+            scheme in proptest::option::of("[a-z][a-z0-9+.-]{0,8}"),
+            user in "[a-zA-Z0-9._~!$&'()*+,;=-]{0,8}",
+            password in proptest::option::of("[a-zA-Z0-9._~!$&'()*+,;=%:@-]{0,8}"),
+            host in "[a-z0-9][a-z0-9.-]{0,15}|\\[[0-9a-f:]{2,12}\\]",
+            port in any::<u16>(),
+        ) {
+            let userinfo =
+                password.map_or_else(|| format!("{SECRET}{user}"), |p| format!("{SECRET}{user}:{SECRET}{p}"));
+            let at = format!("{host}:{port}");
+            let url = scheme.as_ref().map_or_else(|| format!("{userinfo}@{at}"), |s| format!("{s}://{userinfo}@{at}"));
+            // Not one kube reads (too many colons between brackets): nothing to check.
+            let proxy_url = url.parse::<http::Uri>().map_err(|e| TestCaseError::reject(format!("{url}: {e}")))?;
+            let built = build_error(kube::Error::ProxyProtocolUnsupported { proxy_url: Box::new(proxy_url) }, None);
+            for said in [format!("{built:#}"), format!("{built:?}"), format!("{built:#?}")] {
+                prop_assert!(!said.contains(SECRET), "{said}\nfrom {url}");
+                prop_assert!(said.contains(&at), "{said}\nfrom {url}");
+            }
+            if let Some(scheme) = &scheme {
+                let said = format!("{built:#}");
+                prop_assert!(said.contains(&format!("{scheme}://{at}")), "{said}\nfrom {url}");
+            }
         }
     }
 }
