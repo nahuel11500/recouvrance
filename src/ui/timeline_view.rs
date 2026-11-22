@@ -311,7 +311,25 @@ impl TimelineView {
         });
     }
 
+    /// Show these events (`all`, `warnings`, `none`), as their button does, in dev runs.
+    #[cfg(feature = "dev")]
+    pub fn demo_events(&mut self, which: &str, cx: &mut Context<Self>) {
+        let v = match which {
+            "all" => Events::All,
+            "none" => Events::Hidden,
+            _ => Events::Warnings,
+        };
+        if self.events_shown != v {
+            self.events_shown = v;
+            self.read_events(cx);
+            self.refilter(cx);
+            cx.notify();
+        }
+    }
+
     fn rebuild(&mut self, cx: &App) {
+        #[cfg(feature = "dev")]
+        let _t = crate::dev::timing::span("timeline rebuild (ui)");
         self.entries = merged(&self.records, &self.events);
         // The row picked stays picked if it is still there.
         if let Some(p) = &self.picked
@@ -324,6 +342,8 @@ impl TimelineView {
     }
 
     fn refilter(&mut self, cx: &App) {
+        #[cfg(feature = "dev")]
+        let _t = crate::dev::timing::span("timeline filter (ui)");
         let f = PageFilter::parse(&self.filter.read(cx).value());
         let (context, namespaces, events) = (self.context.as_deref(), &self.namespaces, self.events_shown);
         self.shown =

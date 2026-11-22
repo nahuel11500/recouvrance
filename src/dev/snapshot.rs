@@ -375,6 +375,10 @@ drwxr-xr-x 1 root root 4096 Oct 15 \x1b[1;34m.\x1b[0m\r\n\
             ms(times[times.len() * 9 / 10])
         );
     }
+    // RECOUVRANCE_METER=1: what the run cost (API requests and bytes, peak memory).
+    if std::env::var("RECOUVRANCE_METER").is_ok() {
+        crate::dev::usage::print();
+    }
     Ok(())
 }
 

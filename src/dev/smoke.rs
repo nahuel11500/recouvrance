@@ -147,6 +147,30 @@ pub fn run(ctx: String) {
             println!("dashboard load: {:?} ok={}", t.elapsed(), r);
             return;
         }
+        // RECOUVRANCE_EVENTS=<seconds>: the Timeline's "All events" on every namespace for that
+        // long, each time it gets them, then what it cost (requests, bytes, peak memory).
+        if let Some(secs) = std::env::var("RECOUVRANCE_EVENTS").ok().and_then(|s| s.parse::<u64>().ok()) {
+            let start = std::time::Instant::now();
+            let end = start + std::time::Duration::from_secs(secs);
+            let every = crate::settings::secs(crate::settings::get().overview_refresh);
+            while std::time::Instant::now() < end {
+                let t = std::time::Instant::now();
+                match k8s::recent_events(client.clone(), None, true).await {
+                    Ok(rows) => println!(
+                        "events: {} rows ({} events) read in {:?}, at {}s",
+                        rows.len(),
+                        rows.iter().map(|e| e.events).sum::<usize>(),
+                        t.elapsed(),
+                        start.elapsed().as_secs()
+                    ),
+                    Err(e) => println!("events: ERROR {} at {}s", k8s::short_error(&e), start.elapsed().as_secs()),
+                }
+                // The page reads them again once the refresh interval has passed.
+                std::thread::sleep(every.min(end.saturating_duration_since(std::time::Instant::now())));
+            }
+            crate::dev::usage::print();
+            return;
+        }
         // RECOUVRANCE_EDIT=ns/deploy: YAML round trip + server-side dry-run replace.
         if let Ok(target) = std::env::var("RECOUVRANCE_EDIT") {
             let (ns, name) = target.split_once('/').unwrap();
