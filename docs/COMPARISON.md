@@ -15,7 +15,7 @@ welcome: open an issue or a pull request.
 |---|---|---|---|---|
 | Stack | Tauri (Rust + web UI) | Electron | Web / Electron | Native Rust (gpui), no web view |
 | Several clusters at once | ✓ | – | ✓ incl. side-by-side cluster comparison | ✓ merged tables with a Context column; compare an object across clusters |
-| Live tables with kubectl's columns, CRDs | ✓ | ✓ | ✓ | ✓ server-side tables, paged, 24k pods in ~170 MB |
+| Live tables with kubectl's columns, CRDs | ✓ | ✓ | ✓ | ✓ server-side tables; 20,800 pods listed in 1.4 s |
 | Filter | text, `!not`, either-or terms, wildcards, `/regex/`, labels | text | text; Advanced Search with expressions, saved queries | text, `!not`, `label=value`, `ns:glob`, `/regex/`, column expressions (`restarts>3`, `cpu>200m`, `age<1h`), history and saved searches |
 | Saved views / workspaces | workspaces (sets of contexts, connected at once) | hotbar | projects (resources grouped across namespaces and clusters) | saved views (type + namespaces + filter), opened on the contexts in use; no saved sets of contexts |
 | Pod logs, several pods merged | ✓ level filter, histogram, regex; several workloads at once | ✓ | ✓ | ✓ timeline, level filter, histogram, wrap, readable JSON, find with regex |
@@ -69,23 +69,29 @@ whose write tools are marked for the agent's client to confirm.
 
 ## Measured
 
-On the same laptop (2026-10-16), read from the process table while both were in normal use:
-Aptakube used 4.0 GB plus 1.35 GB for its WebKit view; Recouvrance used 164 MB, 5 minutes after
-starting. Not a controlled benchmark: the clusters and pages each had open are not known.
-
-Recouvrance on its own (release build, metrics read from the process table):
+Recouvrance v0.9.0, release build with the `dev` feature (for its timing hooks), on a laptop, on
+2026-11-21. Read-only, against a production cluster with about 20,800 pods. Memory is the process's
+peak resident memory (VmHWM).
 
 | Scenario | Time | Peak memory |
 |---|---|---|
-| List 23,958 pods (a large production cluster) | 17 s (the API server's time) | 174 MB |
-| Problems scan of that cluster | 31 s | 250 MB |
-| Workloads overview on that cluster, 4 minutes (debug build) | refreshes every ~60 s | flat around 0.9 GB |
+| List every pod (`RECOUVRANCE_SMOKE=<context>`, the window's list path; median of 3 runs) | first rows 0.7 s, all rows 1.4 s, complete with their metadata 4.2 s | 182 MB |
+| Problems scan of that cluster (`RECOUVRANCE_PROBLEMS=1`, 2 runs) | 6 s | 1.2 GB ([#842](https://github.com/nahuel11500/recouvrance/issues/842)) |
+| Workloads overview of that cluster (`RECOUVRANCE_DASH=1`) | 0.9 s | 212 MB |
+| The app on the Pods page, all namespaces, for 2 minutes (`--snapshot`, drawn off screen at 2×) | | 410–440 MB once loaded; 1.5 GB in the first seconds, while the Problems scan runs |
+| A frame of a 20,242-pod table (kwok on kind, `RECOUVRANCE_FRAMES_END`: redraws forced, rows not changing) | 8.2 ms median, 9.1 ms p90 | |
+
+The smoke runs have no window, so their memory leaves out drawing.
+
+On 2026-10-16, with Recouvrance 0.0.1, read from the process table while both were in normal use:
+Aptakube used 4.0 GB plus 1.35 GB for its WebKit view; Recouvrance used 164 MB, 5 minutes after
+starting. Not a controlled benchmark: the clusters and pages each had open are not known.
 
 ## Not offered
 
 - UI extensions that draw their own pages (FreeLens/Headlamp run JavaScript for that). Recouvrance's
   plugins run commands instead, and the MCP server lets agents and scripts drive it.
 - A web mode, for clusters reached through a browser only. Not planned: Recouvrance is a native app
-  on purpose (no web view, low memory).
+  on purpose (no web view).
 - Windows. Recouvrance is built for Linux and macOS; Aptakube, FreeLens and Headlamp also run on
   Windows.

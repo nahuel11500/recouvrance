@@ -42,10 +42,22 @@ Recouvrance is one Rust binary: a [gpui](https://github.com/zed-industries/zed) 
 
 ## How lists stay fast
 
-Lists use the API server's **Table** format (`kubectl get`'s columns, computed server-side), are
-paged, then **watched**. Rows keep only the metadata they need; full objects are fetched only when a
-custom column needs them. Responses are gzip-compressed. This keeps very large clusters (tens of
-thousands of pods) in a few hundred megabytes.
+Lists use the API server's **Table** format (`kubectl get`'s columns, computed server-side), then
+are **watched**. A list of a namespaced kind in every namespace comes in up to three steps
+(`list_fast` in `src/k8s/table.rs`):
+
+1. Its first page (2,000 rows), shown at once.
+2. When more follow, every namespace's rows without their objects, read from the API server's cache,
+   32 namespaces at a time (`cells_by_namespace`): about 6 MB instead of 160 MB for 20,000 pods.
+   These rows have no uid, labels or creation time yet.
+3. The whole list with its objects' metadata, in one response from the cache, parsed as it streams
+   in, with managedFields and the rest skipped (`list_whole`). It replaces the rows of step 2.
+
+Rows keep only the metadata they need; full objects are fetched only when a custom column needs
+them. Responses are gzip-compressed. The usage bars read the pods' requests and limits from a
+separate lean list of the pods, read again every minute (or ten times as long as a read takes, when
+that is longer). On a cluster with about 20,800 pods, the first rows show after 0.7 s and all of
+them after 1.4 s ([measured](COMPARISON.md#measured)).
 
 ## Safety model
 
