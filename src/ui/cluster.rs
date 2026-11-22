@@ -267,23 +267,31 @@ fn add_pods(s: &mut Summary, pods: &k8s::PodTotals) {
 struct PodFeed {
     _watch: k8s::TaskGuard,
     rx: k8s::PodRequestsRx,
+    /// Lists again now, after a failed list.
+    retry: std::sync::Arc<tokio::sync::Notify>,
 }
 
 impl PodFeed {
     /// Its watch stops when the page has been `away` for a while, and lists again once back.
     fn start(client: Client, away: &k8s::Pause) -> Self {
-        let (watch, rx) = k8s::watch_pod_resources(client, None, away.clone(), k8s::Pause::default());
-        Self { _watch: watch, rx }
+        let retry = std::sync::Arc::new(tokio::sync::Notify::new());
+        let (watch, rx) =
+            k8s::watch_pod_resources_retrying(client, None, away.clone(), k8s::Pause::default(), retry.clone());
+        Self { _watch: watch, rx, retry }
     }
 
     /// The pods' totals as last read, once there is a read: "forbidden" or "failed: …" when
-    /// the list failed.
+    /// the list failed. Then the pods are listed again at once, as the refresh did before they
+    /// were watched, so they are back at the next refresh once the cluster answers.
     async fn totals(&mut self) -> Result<k8s::PodTotals, String> {
         let read = self.rx.wait_for(Option::is_some).await;
         let Ok(read) = read else { return Err("failed: stopped".into()) };
         match &*read {
             Some(Ok(pods)) => Ok(pods.totals),
-            Some(Err(e)) => Err(e.clone()),
+            Some(Err(e)) => {
+                self.retry.notify_one();
+                Err(e.clone())
+            }
             None => Err("failed: stopped".into()),
         }
     }

@@ -277,6 +277,21 @@ struct WatchError {
     message: String,
 }
 
+/// A BOOKMARK's object: only its `resourceVersion` counts. The API server sends an empty pod
+/// there, with `"containers": null`, which a `LeanPod` refuses: read as one, every bookmark
+/// (about one a minute) would end the watch and list every pod again.
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct Bookmark {
+    metadata: Option<BookmarkMeta>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default, rename_all = "camelCase")]
+struct BookmarkMeta {
+    resource_version: Option<String>,
+}
+
 /// Applies one watch frame (a line of the stream) to `pods`, keeping the `resourceVersion` to
 /// go on from. A frame that doesn't read, or an error other than 410 Gone, ends the watch.
 fn apply_event(line: &str, pods: &mut Arc<PodAllocs>, version: &mut String) -> Result<Applied> {
@@ -285,14 +300,21 @@ fn apply_event(line: &str, pods: &mut Arc<PodAllocs>, version: &mut String) -> R
     }
     let event: RawEvent = serde_json::from_str(line)?;
     match event.type_.as_str() {
-        kind @ ("ADDED" | "MODIFIED" | "DELETED" | "BOOKMARK") => {
+        // Only a newer resourceVersion: going on from it avoids a 410 and a list. One that
+        // doesn't read changes no pod, so it is skipped.
+        "BOOKMARK" => {
+            let bookmark: Bookmark = serde_json::from_str(event.object.get()).unwrap_or_default();
+            if let Some(rv) = bookmark.metadata.and_then(|m| m.resource_version).filter(|rv| !rv.is_empty()) {
+                *version = rv;
+            }
+            Ok(Applied::Unchanged)
+        }
+        kind @ ("ADDED" | "MODIFIED" | "DELETED") => {
             let pod: LeanPod = serde_json::from_str(event.object.get())?;
             if !pod.metadata.resource_version.is_empty() {
                 version.clone_from(&pod.metadata.resource_version);
             }
             let changed = match kind {
-                // Only a newer resourceVersion: going on from it avoids a 410 and a list.
-                "BOOKMARK" => false,
                 "DELETED" => PodAllocs::take(pods, &pod.metadata.namespace, &pod.metadata.name),
                 _ => {
                     let alloc = PodAlloc::of(&pod);
@@ -331,8 +353,11 @@ const TICK: Duration = Duration::from_secs(1);
 /// How a watch ended.
 #[derive(Debug, PartialEq, Eq)]
 enum Ended {
-    /// The pods must be listed again: 410 Gone, or a frame that doesn't read.
+    /// The pods must be listed again: 410 Gone.
     Relist,
+    /// A frame that doesn't read, or an error frame other than 410: the pods must be listed
+    /// again too, but not at once, or each such frame would cost a list of every pod.
+    Broken,
     /// The server refuses to watch them (a user who may list pods but not watch them).
     Refused,
     /// Off screen for `LINGER`.
@@ -458,7 +483,8 @@ async fn follow(
                     match apply_event(&line, &mut pods, &mut version) {
                         Ok(Applied::Changed) => out.dirty = true,
                         Ok(Applied::Unchanged) => {}
-                        Ok(Applied::Relist) | Err(_) => return Ended::Relist,
+                        Ok(Applied::Relist) => return Ended::Relist,
+                        Err(_) => return Ended::Broken,
                     }
                     // Only after an event: a server that answers each watch with an error at
                     // once would have every pod listed again in a loop.
@@ -486,6 +512,19 @@ pub fn watch_pod_resources(
     pause: Pause,
     rows_due: Pause,
 ) -> (TaskGuard, PodRequestsRx) {
+    watch_pod_resources_retrying(client, namespace, pause, rows_due, Arc::default())
+}
+
+/// `watch_pod_resources`, where `retry` cuts the wait after a failed list short: a page that
+/// shows the failure asks for the pods again at its refresh, rather than showing it for up to
+/// 5 minutes after the cluster answers again.
+pub fn watch_pod_resources_retrying(
+    client: Client,
+    namespace: Option<String>,
+    pause: Pause,
+    rows_due: Pause,
+    retry: Arc<tokio::sync::Notify>,
+) -> (TaskGuard, PodRequestsRx) {
     let (tx, rx) = tokio::sync::watch::channel(None);
     let guard = spawn_guarded(async move {
         let url = DynamicObject::url_path(&ar_of::<Pod>(), namespace.as_deref());
@@ -503,7 +542,10 @@ pub fn watch_pod_resources(
                     if tx.send(Some(Err(lists::load_error(&e)))).is_err() {
                         return;
                     }
-                    retry_wait(&mut failures).await;
+                    tokio::select! {
+                        () = retry_wait(&mut failures) => {}
+                        () = retry.notified() => {}
+                    }
                     continue;
                 }
             };
@@ -514,6 +556,9 @@ pub fn watch_pod_resources(
                 // Listed, then refused at once: wait before listing every pod again.
                 Ended::Relist if !progress => retry_wait(&mut failures).await,
                 Ended::Relist => failures = 0,
+                // Waits longer each time, until a watch ends well: a server that sends a frame
+                // this can't read in every watch has every pod listed at most every 5 minutes.
+                Ended::Broken => retry_wait(&mut failures).await,
                 Ended::Lingered => {
                     // Not kept current any more: a reader waits for the next list.
                     tx.send_replace(None);
@@ -535,6 +580,9 @@ mod tests {
 
     use super::{AllocList, Applied, Arc, Duration, Instant, Outbox, PodAlloc, PodAllocs, Step, apply_event};
     use super::{LINGER, SEND_AWAY_EVERY, SEND_EVERY};
+
+    /// A pod watch's bookmark, as a real API server writes it (an empty `v1.Pod` from Go).
+    pub(super) const BOOKMARK: &str = r#"{"type":"BOOKMARK","object":{"kind":"Pod","apiVersion":"v1","metadata":{"resourceVersion":"42","creationTimestamp":null},"spec":{"containers":null},"status":{}}}"#;
 
     /// A pod with one container requesting `cpu` and `memory`, limited to that memory.
     fn pod(ns: &str, name: &str, rv: &str, cpu: &str, memory: &str, phase: &str) -> Value {
@@ -624,8 +672,16 @@ mod tests {
         // Deleting what isn't there changes nothing.
         assert_eq!(apply(&frame("DELETED", &web), &mut pods), Applied::Unchanged);
         assert_eq!(apply("", &mut pods), Applied::Unchanged);
-        let bookmark = r#"{"type":"BOOKMARK","object":{"kind":"Pod","metadata":{"resourceVersion":"42"}}}"#;
-        assert_eq!(apply(bookmark, &mut pods), Applied::Unchanged);
+        // A bookmark as the API server writes it: an empty pod, its containers null. Its
+        // version is the one to go on from (checked below).
+        assert_eq!(apply(BOOKMARK, &mut pods), Applied::Unchanged);
+        // One without a version, or that doesn't read, keeps ours.
+        assert_eq!(apply(r#"{"type":"BOOKMARK","object":{"metadata":null}}"#, &mut pods), Applied::Unchanged);
+        assert_eq!(
+            apply(r#"{"type":"BOOKMARK","object":{"metadata":{"resourceVersion":""}}}"#, &mut pods),
+            Applied::Unchanged
+        );
+        assert_eq!(apply(r#"{"type":"BOOKMARK","object":[]}"#, &mut pods), Applied::Unchanged);
         let gone = r#"{"type":"ERROR","object":{"kind":"Status","status":"Failure","code":410,"message":"too old"}}"#;
         assert_eq!(apply(gone, &mut pods), Applied::Relist);
         assert_eq!(version, "42");
@@ -744,17 +800,21 @@ mod watch_tests {
     use hyper::body::Frame;
     use serde_json::{Value, json};
 
-    use super::{Arc, Duration, Pause, PodRequests, PodRequestsRx, watch_pod_resources};
+    use super::tests::BOOKMARK;
+    use super::{Arc, Duration, Pause, PodRequests, PodRequestsRx, watch_pod_resources, watch_pod_resources_retrying};
 
     /// A cluster with pods `a/api` and `b/db` at version 10. A watch from there adds `a/new`,
-    /// resizes `a/api` and deletes `b/db`, then stays open; or, when the version is `gone`,
-    /// says so at once. It counts the lists, and answers them 403 when it `refuses`.
+    /// resizes `a/api` and deletes `b/db`, sends a bookmark as a real API server does, then
+    /// stays open; or, when the version is `gone`, says so at once. When `broken`, an error
+    /// frame follows the changes. It counts the lists, and answers the first `refuses` of
+    /// them 403.
     #[derive(Clone, Default)]
     struct Cluster {
         lists: Arc<AtomicUsize>,
         watched_from: Arc<Mutex<Vec<String>>>,
-        refuses: bool,
+        refuses: usize,
         gone: bool,
+        broken: bool,
     }
 
     fn pod(ns: &str, name: &str, rv: &str, cpu: &str) -> Value {
@@ -777,21 +837,30 @@ mod watch_tests {
             let (status, body) = if query.contains("watch=true") {
                 let from = query.split('&').find_map(|p| p.strip_prefix("resourceVersion=")).unwrap_or_default();
                 self.watched_from.lock().unwrap().push(from.to_string());
-                let changes = [
-                    json!({"type": "ADDED", "object": pod("a", "new", "11", "300m")}),
-                    json!({"type": "MODIFIED", "object": pod("a", "api", "12", "200m")}),
-                    json!({"type": "DELETED", "object": pod("b", "db", "13", "100m")}),
-                ];
-                let too_old = json!({"kind": "Status", "status": "Failure", "code": 410, "message": "too old"});
-                let gone = [json!({"type": "ERROR", "object": too_old})];
-                let events: &[Value] = if self.gone { &gone } else { &changes };
+                let error = |code: u16| {
+                    let status = json!({"kind": "Status", "status": "Failure", "code": code, "message": "no"});
+                    json!({"type": "ERROR", "object": status}).to_string()
+                };
+                let mut events = if self.gone {
+                    vec![error(410)]
+                } else {
+                    vec![
+                        json!({"type": "ADDED", "object": pod("a", "new", "11", "300m")}).to_string(),
+                        json!({"type": "MODIFIED", "object": pod("a", "api", "12", "200m")}).to_string(),
+                        json!({"type": "DELETED", "object": pod("b", "db", "13", "100m")}).to_string(),
+                        BOOKMARK.to_string(),
+                    ]
+                };
+                if self.broken {
+                    events.push(error(500));
+                }
                 let frames: Vec<_> =
                     events.iter().map(|e| Ok::<_, Infallible>(Frame::data(Bytes::from(format!("{e}\n"))))).collect();
                 let stream = futures::stream::iter(frames).chain(futures::stream::pending());
                 (200, StreamBody::new(stream).boxed_unsync())
             } else {
-                self.lists.fetch_add(1, Ordering::Relaxed);
-                let (status, answer) = if self.refuses {
+                let listed = self.lists.fetch_add(1, Ordering::Relaxed);
+                let (status, answer) = if listed < self.refuses {
                     (403, json!({"kind": "Status", "status": "Failure", "reason": "Forbidden", "code": 403}))
                 } else {
                     let items = [pod("a", "api", "8", "100m"), pod("b", "db", "9", "100m")];
@@ -825,14 +894,44 @@ mod watch_tests {
         assert_eq!(cpu("a", "api"), Some((Some(200.0), Some(200.0))), "resized in place");
         assert_eq!(cpu("a", "new"), Some((Some(300.0), Some(300.0))));
         assert_eq!((read.totals.pods, read.totals.cpu), (2, 500.0));
+        // The bookmark after the changes goes on with the same watch.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
         assert_eq!(cluster.lists.load(Ordering::Relaxed), 1, "listed once");
         let watched_from = cluster.watched_from.lock().unwrap().clone();
         assert_eq!(watched_from, ["10"], "watched from the list's version");
     }
 
+    /// An error frame after events (or a frame that doesn't read) doesn't have every pod listed
+    /// again at once: each one would cost a list.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_broken_watch_waits_before_listing_again() {
+        let cluster = Cluster { broken: true, ..Cluster::default() };
+        let client = kube::Client::new(cluster.clone(), "default");
+        let (_watch, mut rx) = watch_pod_resources(client, None, Pause::default(), Pause::default());
+        assert!(reads(&mut rx, |read| matches!(read, Some(Ok(_)))).await, "the list never came");
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert_eq!(cluster.watched_from.lock().unwrap().len(), 1);
+        assert_eq!(cluster.lists.load(Ordering::Relaxed), 1, "listed again at once");
+    }
+
+    /// A page showing a failed list asks again at its refresh: the pods come back then, not
+    /// after the list's own wait (15 s, up to 5 minutes).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_list_is_tried_again_when_asked() {
+        let cluster = Cluster { refuses: 1, ..Cluster::default() };
+        let client = kube::Client::new(cluster.clone(), "default");
+        let retry = Arc::new(tokio::sync::Notify::new());
+        let (_watch, mut rx) =
+            watch_pod_resources_retrying(client, None, Pause::default(), Pause::default(), retry.clone());
+        assert!(reads(&mut rx, |read| matches!(read, Some(Err(_)))).await, "the refusal never came");
+        retry.notify_one();
+        assert!(reads(&mut rx, |read| matches!(read, Some(Ok(_)))).await, "not listed again when asked");
+        assert_eq!(cluster.lists.load(Ordering::Relaxed), 2);
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn a_refused_list_says_why() {
-        let cluster = Cluster { refuses: true, ..Cluster::default() };
+        let cluster = Cluster { refuses: usize::MAX, ..Cluster::default() };
         let client = kube::Client::new(cluster, "default");
         let (_watch, mut rx) = watch_pod_resources(client, None, Pause::default(), Pause::default());
         assert!(reads(&mut rx, Option::is_some).await);
