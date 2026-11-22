@@ -3,6 +3,8 @@
 //! without the operator's API has none of these kinds, so nothing here runs there.
 
 use kube::Client;
+use serde::Deserialize;
+use serde::de::IgnoredAny;
 use serde_json::Value;
 
 use crate::k8s::{self, Kind};
@@ -21,18 +23,78 @@ pub fn ready(obj: &Value) -> Option<(&str, &str, &str)> {
     Some((text("status"), text("reason"), text("message")))
 }
 
-/// Whether an `ExternalSecret` never synced: the operator sets `status.refreshTime` on each
-/// sync that worked and never clears it, so without one its Secret was never written.
-pub fn never_synced(es: &Value) -> bool {
-    es.pointer("/status/refreshTime").is_none_or(Value::is_null)
+/// What the Problems scan reads of one of the operator's objects: its name and age, and its
+/// status's conditions and last sync. The rest (spec, managedFields) is skipped while its list
+/// is parsed.
+#[derive(Deserialize, Default)]
+#[serde(default)]
+pub struct LeanObject {
+    metadata: LeanMeta,
+    status: LeanStatus,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default, rename_all = "camelCase")]
+struct LeanMeta {
+    name: Option<String>,
+    namespace: Option<String>,
+    creation_timestamp: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default, rename_all = "camelCase")]
+struct LeanStatus {
+    #[serde(deserialize_with = "k8s::null_default")]
+    conditions: Vec<LeanCondition>,
+    /// Only whether it is set.
+    refresh_time: Option<IgnoredAny>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct LeanCondition {
+    #[serde(rename = "type")]
+    kind: Option<String>,
+    status: Option<String>,
+    reason: Option<String>,
+    message: Option<String>,
+}
+
+impl LeanObject {
+    /// Its Ready condition, as `ready` reads it of a whole object.
+    fn ready(&self) -> Option<(&str, &str, &str)> {
+        let c = self.status.conditions.iter().find(|c| c.kind.as_deref() == Some("Ready"))?;
+        let text = |s: Option<&str>| s.unwrap_or_default();
+        Some((text(c.status.as_deref()), text(c.reason.as_deref()), text(c.message.as_deref())))
+    }
+
+    /// Whether an `ExternalSecret` never synced: the operator sets `status.refreshTime` on each
+    /// sync that worked and never clears it, so without one its Secret was never written.
+    fn never_synced(&self) -> bool {
+        self.status.refresh_time.is_none()
+    }
+
+    /// The problem it is, as an object of `kind`; None when it looks healthy.
+    fn problem(&self, kind: &Kind) -> Option<Problem> {
+        let (severity, reason) = judge(&kind.ar.kind, self)?;
+        Some(Problem {
+            severity,
+            kind: kind.kubectl_name(),
+            label: kind.ar.kind.clone(),
+            namespace: self.metadata.namespace.clone(),
+            name: self.metadata.name.clone()?,
+            reason,
+            age: self.metadata.creation_timestamp.as_deref().and_then(|t| t.parse().ok()),
+        })
+    }
 }
 
 /// Judge an `ExternalSecret`, `SecretStore` or `ClusterSecretStore` from its object; None when
 /// it looks healthy. An `ExternalSecret` not Ready is a warning (its Secret keeps the last
 /// values), critical when it never synced (its Secret may not exist). A store not Ready is
 /// critical: every `ExternalSecret` using it fails.
-pub fn judge(kind: &str, obj: &Value) -> Option<(Severity, String)> {
-    let (status, reason, message) = ready(obj)?;
+pub fn judge(kind: &str, obj: &LeanObject) -> Option<(Severity, String)> {
+    let (status, reason, message) = obj.ready()?;
     // Ready is good when True; Unknown is the operator still deciding.
     let failing = crate::status::true_is_good("Ready") && status == "False";
     if !failing {
@@ -41,7 +103,7 @@ pub fn judge(kind: &str, obj: &Value) -> Option<(Severity, String)> {
     let why = shorten(if message.trim().is_empty() { reason } else { message });
     let why = if why.is_empty() { "not ready".to_string() } else { why };
     match kind {
-        "ExternalSecret" if never_synced(obj) => Some((Severity::Critical, format!("never synced: {why}"))),
+        "ExternalSecret" if obj.never_synced() => Some((Severity::Critical, format!("never synced: {why}"))),
         "ExternalSecret" => Some((Severity::Warning, why)),
         "SecretStore" | "ClusterSecretStore" => Some((Severity::Critical, why)),
         _ => None,
@@ -58,27 +120,13 @@ pub fn shorten(text: &str) -> String {
     format!("{}…", cut.trim_end())
 }
 
-/// Problems among the objects of one of the operator's kinds, read whole: the conditions'
-/// messages are not in kubectl's columns, and there are few of these objects.
+/// Problems among the objects of one of the operator's kinds, read from their objects (the
+/// conditions' messages are not in kubectl's columns), lean: one list from the API server's
+/// cache, parsed as it streams in.
 pub async fn problems(client: Client, kind: &Kind, namespace: Option<String>) -> anyhow::Result<Vec<Problem>> {
     let ns = if kind.namespaced { namespace } else { None };
-    let items = k8s::list_values(client, kind.ar.clone(), ns, None).await?;
-    Ok(items
-        .iter()
-        .filter_map(|obj| {
-            let (severity, reason) = judge(&kind.ar.kind, obj)?;
-            let text = |p: &str| obj.pointer(p).and_then(Value::as_str);
-            Some(Problem {
-                severity,
-                kind: kind.kubectl_name(),
-                label: kind.ar.kind.clone(),
-                namespace: text("/metadata/namespace").map(String::from),
-                name: text("/metadata/name")?.to_string(),
-                reason,
-                age: text("/metadata/creationTimestamp").and_then(|t| t.parse().ok()),
-            })
-        })
-        .collect())
+    let items = k8s::lists::list_lean_cached::<LeanObject>(client, kind.ar.clone(), ns).await?;
+    Ok(items.iter().filter_map(|obj| obj.problem(kind)).collect())
 }
 
 /// The `ExternalSecret` that owns a Secret, as (apiVersion, name), from its ownerReferences.
@@ -142,6 +190,11 @@ mod tests {
     use proptest::prelude::*;
     use serde_json::json;
 
+    /// An object as the scan's list reads it.
+    fn lean(obj: &Value) -> LeanObject {
+        serde_json::from_value(obj.clone()).unwrap()
+    }
+
     fn es(status: &str, refresh: Value) -> Value {
         json!({
             "metadata": {"name": "app", "namespace": "prod"},
@@ -156,22 +209,23 @@ mod tests {
 
     #[test]
     fn judges_external_secrets() {
-        assert_eq!(judge("ExternalSecret", &es("True", json!("2026-01-01T00:00:00Z"))), None);
+        let check = |obj: &Value| judge("ExternalSecret", &lean(obj));
+        assert_eq!(check(&es("True", json!("2026-01-01T00:00:00Z"))), None);
         assert_eq!(
-            judge("ExternalSecret", &es("False", json!("2026-01-01T00:00:00Z"))),
+            check(&es("False", json!("2026-01-01T00:00:00Z"))),
             Some((Severity::Warning, "could not get secret data from provider".into()))
         );
         // Never synced: its Secret may not exist.
-        let never = judge("ExternalSecret", &es("False", Value::Null)).unwrap();
+        let never = check(&es("False", Value::Null)).unwrap();
         assert_eq!(never.0, Severity::Critical);
         assert!(never.1.starts_with("never synced: could not get"));
         // Without a refreshTime at all.
         let mut fresh = es("False", Value::Null);
         fresh["status"].as_object_mut().unwrap().remove("refreshTime");
-        assert_eq!(judge("ExternalSecret", &fresh).unwrap().0, Severity::Critical);
+        assert_eq!(check(&fresh).unwrap().0, Severity::Critical);
         // Still being decided, or not yet seen by the operator.
-        assert_eq!(judge("ExternalSecret", &es("Unknown", Value::Null)), None);
-        assert_eq!(judge("ExternalSecret", &json!({"metadata": {"name": "x"}})), None);
+        assert_eq!(check(&es("Unknown", Value::Null)), None);
+        assert_eq!(check(&json!({"metadata": {"name": "x"}})), None);
     }
 
     #[test]
@@ -179,7 +233,7 @@ mod tests {
         let store = |status: &str, message: &str| {
             let ready =
                 json!({"type": "Ready", "status": status, "reason": "InvalidProviderConfig", "message": message});
-            json!({"status": {"conditions": [ready]}})
+            lean(&json!({"status": {"conditions": [ready]}}))
         };
         for kind in ["SecretStore", "ClusterSecretStore"] {
             assert_eq!(judge(kind, &store("True", "store validated")), None);
@@ -239,10 +293,60 @@ mod tests {
             refresh in prop::option::of("[0-9TZ:-]{0,20}"),
             message in "\\PC{0,80}",
         ) {
-            let obj = json!({"status": {"refreshTime": refresh,
-                "conditions": [{"type": "Ready", "status": status, "message": message}]}});
+            let obj = lean(&json!({"status": {"refreshTime": refresh,
+                "conditions": [{"type": "Ready", "status": status, "message": message}]}}));
             for kind in ["ExternalSecret", "SecretStore", "ClusterSecretStore"] {
                 prop_assert_eq!(judge(kind, &obj).is_some(), status == "False");
+            }
+        }
+
+        /// Read lean, an object gives what its whole object gave before #842: its Ready
+        /// condition, whether it ever synced, and its problem's namespace, name and age.
+        #[test]
+        fn read_lean_as_whole(
+            conditions in prop::option::of(prop::collection::vec((
+                prop::option::of("(Ready|Synced)"),
+                prop::option::of("(True|False|Unknown|)"),
+                prop::option::of("[A-Za-z]{0,12}"),
+                prop::option::of("\\PC{0,30}(\n\\PC{0,10})?"),
+            ), 0..3)),
+            refresh in prop::option::of(prop::option::of("[0-9TZ:-]{1,20}")),
+            name in prop::option::of("[a-z]{0,6}"),
+            created in prop::option::of("(2026-01-01T00:00:00Z|soon|)"),
+        ) {
+            // `null` when None.
+            let field = |v: Option<String>| v.map_or(Value::Null, Value::from);
+            let conditions: Option<Vec<Value>> = conditions.map(|cs| {
+                cs.into_iter()
+                    .map(|(kind, status, reason, message)| {
+                        json!({"type": field(kind), "status": field(status), "reason": field(reason),
+                            "message": field(message), "lastTransitionTime": null})
+                    })
+                    .collect()
+            });
+            let mut status = json!({"conditions": conditions});
+            if let Some(refresh) = refresh {
+                status["refreshTime"] = field(refresh);
+            }
+            let obj = json!({
+                "metadata": {"name": field(name), "namespace": "prod", "creationTimestamp": field(created),
+                    "managedFields": [{"manager": "external-secrets", "fieldsV1": {"f:status": {}}}]},
+                "spec": {"secretStoreRef": {"name": "vault"}, "data": [{"secretKey": "a", "remoteRef": {"key": "k"}}]},
+                "status": status,
+            });
+            let read = lean(&obj);
+            prop_assert_eq!(read.ready(), ready(&obj));
+            prop_assert_eq!(read.never_synced(), obj.pointer("/status/refreshTime").is_none_or(Value::is_null));
+            // What a whole object's problem took of it.
+            let text = |p: &str| obj.pointer(p).and_then(Value::as_str);
+            let found = read.problem(&Kind::fake(GROUP, "ExternalSecret"));
+            let named = text("/metadata/name").is_some();
+            prop_assert_eq!(found.is_some(), judge("ExternalSecret", &read).is_some() && named);
+            if let Some(p) = found {
+                prop_assert_eq!(p.namespace.as_deref(), text("/metadata/namespace"));
+                prop_assert_eq!(Some(p.name.as_str()), text("/metadata/name"));
+                let age = text("/metadata/creationTimestamp").and_then(|t| t.parse::<jiff::Timestamp>().ok());
+                prop_assert_eq!(p.age, age);
             }
         }
     }

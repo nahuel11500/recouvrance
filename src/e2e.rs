@@ -1117,6 +1117,74 @@ fn an_agent_checks_why_a_service_does_not_answer() {
     });
 }
 
+/// The Problems scan reads every kind of a real cluster, the objects it lists whole (Services,
+/// Ingresses...) parsed lean from what the API server sends: none is skipped. The pods of a
+/// label selector, read lean from the API server's cache, are those the selector picks.
+#[test]
+#[ignore = "needs a kind cluster: RECOUVRANCE_E2E_CONTEXT"]
+fn the_problems_scan_reads_a_real_cluster() {
+    use k8s_openapi::api::core::v1::{Pod, Service};
+    use k8s_openapi::api::networking::v1::Ingress;
+
+    run(async {
+        let client = k8s::connect_for_agents(context()).await?;
+        let pods: Api<Pod> = Api::namespaced(client.clone(), NS);
+        let services: Api<Service> = Api::namespaced(client.clone(), NS);
+        let ingresses: Api<Ingress> = Api::namespaced(client.clone(), NS);
+        let name = "e2e-scan";
+        let _ = pods.delete(name, &DeleteParams::default().grace_period(0)).await;
+        let _ = services.delete(name, &DeleteParams::default()).await;
+        let _ = ingresses.delete(name, &DeleteParams::default()).await;
+        let pod = json!({
+            "metadata": {"name": name, "namespace": NS, "labels": {"app": name, "tier": "a"}},
+            "spec": {"containers": [{"name": "main", "image": "busybox:1.37", "command": ["sleep", "3600"]}]},
+        });
+        let svc = json!({
+            "metadata": {"name": name, "namespace": NS},
+            "spec": {"selector": {"app": name}, "ports": [{"name": "http", "port": 80, "targetPort": "http"}]},
+        });
+        let ing = json!({
+            "metadata": {"name": name, "namespace": NS},
+            "spec": {
+                "defaultBackend": {"service": {"name": name, "port": {"name": "http"}}},
+                "tls": [{"hosts": ["e2e.example"], "secretName": "e2e-scan-tls"}],
+                "rules": [{"host": "e2e.example", "http": {"paths": [{"path": "/", "pathType": "Prefix",
+                    "backend": {"service": {"name": name, "port": {"number": 80}}}}]}}],
+            },
+        });
+        pods.create(&PostParams::default(), &serde_json::from_value(pod)?).await?;
+        services.create(&PostParams::default(), &serde_json::from_value(svc)?).await?;
+        ingresses.create(&PostParams::default(), &serde_json::from_value(ing)?).await?;
+        let checked = async {
+            // Escaped into the request, with the operators a Service's selector can't have.
+            let selector = format!("app in ({name},e2e-other),tier=a,!e2e-absent");
+            let mut found = Vec::new();
+            // The cache catches up with the create in a moment.
+            for _ in 0..20 {
+                let ar = k8s::ar_of::<Pod>();
+                let read = Some(selector.clone());
+                found = k8s::lists::list_lean_cached_by::<serde_json::Value>(client.clone(), ar, Some(NS.into()), read)
+                    .await?;
+                if !found.is_empty() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+            let names: Vec<&str> = found.iter().filter_map(|p| p.pointer("/metadata/name")?.as_str()).collect();
+            assert_eq!(names, [name]);
+            let kinds = k8s::discover(client.clone()).await?;
+            let scan = crate::problems::scan_partial(client.clone(), &kinds, None, None).await;
+            assert!(scan.skipped.is_empty(), "{:?}", scan.skipped_text());
+            Ok(())
+        };
+        let result: Result<()> = checked.await;
+        let _ = pods.delete(name, &DeleteParams::default().grace_period(0)).await;
+        let _ = services.delete(name, &DeleteParams::default()).await;
+        let _ = ingresses.delete(name, &DeleteParams::default()).await;
+        result
+    });
+}
+
 /// The Files tab reads a container through exec, so write mode gates it like a shell: off,
 /// the UI's client refuses the listing; on, `/etc` lists, and names with spaces, newlines
 /// and non-UTF-8 bytes come back whole, a file previews and a search finds it, with

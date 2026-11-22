@@ -4,8 +4,9 @@
 //!
 //! Pods, workloads and PVCs are read only when their row is already a problem (a pod stuck
 //! creating, a Deployment with no ready replica, a PVC pending), and the reason says which
-//! reference is missing. Services, Ingresses and HTTP routes are checked whole, with the
-//! Services listed once for the three.
+//! reference is missing. Services, Ingresses and HTTP routes are checked from their lists,
+//! with the Services listed once for the three. Those lists, and the pods and workloads read
+//! for a Service, are parsed lean: only the fields the checks read are kept.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
@@ -14,6 +15,8 @@ use k8s_openapi::api::{apps::v1 as apps, core::v1 as core, storage::v1 as storag
 use kube::Client;
 use kube::api::{Api, DynamicObject};
 use kube::discovery::ApiResource;
+use serde::Deserialize;
+use serde::de::{DeserializeOwned, IgnoredAny};
 use serde_json::Value;
 
 use super::{HELD_PARALLEL, Problem, Scan, Severity, cell, since};
@@ -110,15 +113,6 @@ impl Target {
 
 fn items(v: &Value) -> impl Iterator<Item = &Value> {
     v.as_array().into_iter().flatten()
-}
-
-fn created(obj: &Value) -> Option<jiff::Timestamp> {
-    text(obj, "/metadata/creationTimestamp")?.parse().ok()
-}
-
-/// Not being deleted, and older than `SETTLE` (an unknown age counts as old).
-fn settled(obj: &Value) -> bool {
-    obj.pointer("/metadata/deletionTimestamp").is_none_or(Value::is_null) && since(created(obj), SETTLE)
 }
 
 /// What a pod needs to start: the ConfigMaps, Secrets and PVCs of its volumes (projected ones
@@ -331,11 +325,14 @@ pub(super) async fn explain(
     if which.is_empty() {
         return Vec::new();
     }
-    let read: Vec<(usize, anyhow::Result<Option<Value>>)> = futures::stream::iter(which.iter().copied())
+    // Each object gives way to its references as soon as it is read: whole, they would all be
+    // held at once.
+    let read: Vec<(usize, anyhow::Result<Option<Vec<Target>>>)> = futures::stream::iter(which.iter().copied())
         .map(|i| {
-            let (client, ar, ns, name) =
-                (client.clone(), kind.ar.clone(), found[i].namespace.clone(), found[i].name.clone());
+            let (client, kind, ns, name) =
+                (client.clone(), kind.clone(), found[i].namespace.clone(), found[i].name.clone());
             async move {
+                let ar = kind.ar.clone();
                 let obj = k8s::run(async move {
                     let api: Api<DynamicObject> = match &ns {
                         Some(ns) => Api::namespaced_with(client, ns, &ar),
@@ -344,7 +341,7 @@ pub(super) async fn explain(
                     Ok(api.get_opt(&name).await?.map(serde_json::to_value).transpose()?)
                 })
                 .await;
-                (i, obj)
+                (i, obj.map(|obj| obj.map(|obj| refs_of(&kind, &obj))))
             }
         })
         .buffer_unordered(HELD_PARALLEL)
@@ -352,9 +349,9 @@ pub(super) async fn explain(
         .await;
     let mut skipped = Vec::new();
     let mut refs = Vec::new();
-    for (i, obj) in read {
-        match obj {
-            Ok(Some(obj)) => refs.push((i, refs_of(kind, &obj))),
+    for (i, targets) in read {
+        match targets {
+            Ok(Some(targets)) => refs.push((i, targets)),
             // Deleted in between.
             Ok(None) => {}
             Err(e) if skipped.is_empty() => skipped.push((format!("references from {}", kind.label), e)),
@@ -373,6 +370,267 @@ pub(super) async fn explain(
     skipped
 }
 
+// MARK: Services, Ingresses and HTTP routes
+
+/// What the traffic checks read of an object's metadata. Like the types below, it is parsed as
+/// its list streams in, and what it doesn't name (managedFields, annotations, status) is
+/// skipped while parsing: a Service or Deployment held whole as JSON takes ten times its size.
+#[derive(Deserialize, Default)]
+#[serde(default, rename_all = "camelCase")]
+struct Meta {
+    name: Option<String>,
+    namespace: Option<String>,
+    creation_timestamp: Option<String>,
+    /// Only whether it is set.
+    deletion_timestamp: Option<IgnoredAny>,
+}
+
+impl Meta {
+    fn name(&self) -> Option<&str> {
+        self.name.as_deref().filter(|n| !n.is_empty())
+    }
+
+    fn namespace(&self) -> Option<&str> {
+        self.namespace.as_deref().filter(|n| !n.is_empty())
+    }
+
+    fn created(&self) -> Option<jiff::Timestamp> {
+        self.creation_timestamp.as_deref()?.parse().ok()
+    }
+
+    /// Not being deleted, and older than `SETTLE` (an unknown age counts as old).
+    fn settled(&self) -> bool {
+        self.deletion_timestamp.is_none() && since(self.created(), SETTLE)
+    }
+
+    /// Its (namespace, name), `""` for what it lacks.
+    fn key(&self) -> (String, String) {
+        (self.namespace().unwrap_or_default().to_string(), self.name().unwrap_or_default().to_string())
+    }
+}
+
+/// A Service: the pods it selects, and its ports.
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct Service {
+    metadata: Meta,
+    spec: ServiceSpec,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct ServiceSpec {
+    #[serde(rename = "type")]
+    kind: Option<String>,
+    /// Its labels as written, for `k8s::service_selection`.
+    selector: Option<Value>,
+    #[serde(deserialize_with = "k8s::null_default")]
+    ports: Vec<ServicePort>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct ServicePort {
+    name: Option<String>,
+    port: Option<i64>,
+}
+
+impl Service {
+    fn selection(&self) -> Selection {
+        k8s::service_selection(self.spec.selector.as_ref())
+    }
+}
+
+/// A pod a Service selects: whether it ran to completion, is ready, is being deleted.
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct SelectedPod {
+    metadata: Meta,
+    status: PodStatus,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct PodStatus {
+    phase: Option<String>,
+    #[serde(deserialize_with = "k8s::null_default")]
+    conditions: Vec<Condition>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct Condition {
+    #[serde(rename = "type")]
+    kind: Option<String>,
+    status: Option<String>,
+}
+
+impl SelectedPod {
+    /// It may serve: it didn't run to completion.
+    fn live(&self) -> bool {
+        !matches!(self.status.phase.as_deref(), Some("Succeeded" | "Failed"))
+    }
+
+    /// Ready (its `Ready` condition `True`, as `k8s::pod_ready` reads it), and not being deleted.
+    fn ready(&self) -> bool {
+        let ready = |c: &Condition| c.kind.as_deref() == Some("Ready") && c.status.as_deref() == Some("True");
+        self.metadata.deletion_timestamp.is_none() && self.status.conditions.iter().any(ready)
+    }
+}
+
+/// A Deployment or StatefulSet: its replicas, and the labels of the pods it runs.
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct Workload {
+    metadata: Meta,
+    spec: WorkloadSpec,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct WorkloadSpec {
+    replicas: Option<i64>,
+    template: PodTemplate,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct PodTemplate {
+    metadata: TemplateMeta,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct TemplateMeta {
+    labels: Option<serde_json::Map<String, Value>>,
+}
+
+/// A workload scaled to 0, with the labels of the pods it would run.
+struct Scaled {
+    kind: &'static str,
+    namespace: Option<String>,
+    name: String,
+    labels: serde_json::Map<String, Value>,
+}
+
+impl Workload {
+    /// It, of `kind`, when scaled to 0 with labels for its pods; None otherwise: no Service
+    /// can be idle because of it.
+    fn scaled(self, kind: &'static str) -> Option<Scaled> {
+        if self.spec.replicas != Some(0) {
+            return None;
+        }
+        Some(Scaled {
+            kind,
+            namespace: self.metadata.namespace().map(String::from),
+            name: self.metadata.name().unwrap_or_default().to_string(),
+            labels: self.spec.template.metadata.labels?,
+        })
+    }
+}
+
+/// An Ingress: its backends' Services, and its TLS Secrets.
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct Ingress {
+    metadata: Meta,
+    spec: IngressSpec,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default, rename_all = "camelCase")]
+struct IngressSpec {
+    default_backend: Option<Backend>,
+    #[serde(deserialize_with = "k8s::null_default")]
+    rules: Vec<IngressRule>,
+    #[serde(deserialize_with = "k8s::null_default")]
+    tls: Vec<IngressTls>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct IngressRule {
+    http: Option<IngressHttp>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct IngressHttp {
+    #[serde(deserialize_with = "k8s::null_default")]
+    paths: Vec<IngressPath>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct IngressPath {
+    backend: Backend,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct Backend {
+    service: Option<ServiceBackend>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct ServiceBackend {
+    name: Option<String>,
+    port: Option<BackendPort>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct BackendPort {
+    number: Option<i64>,
+    name: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default, rename_all = "camelCase")]
+struct IngressTls {
+    secret_name: Option<String>,
+}
+
+impl Ingress {
+    /// The Services its backends send to, the default backend's first.
+    fn backends(&self) -> impl Iterator<Item = &ServiceBackend> {
+        let paths = self.spec.rules.iter().filter_map(|r| r.http.as_ref()).flat_map(|h| &h.paths);
+        self.spec.default_backend.iter().chain(paths.map(|p| &p.backend)).filter_map(|b| b.service.as_ref())
+    }
+}
+
+/// An HTTPRoute: the backends of its rules.
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct Route {
+    metadata: Meta,
+    spec: RouteSpec,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct RouteSpec {
+    #[serde(deserialize_with = "k8s::null_default")]
+    rules: Vec<RouteRule>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default, rename_all = "camelCase")]
+struct RouteRule {
+    #[serde(deserialize_with = "k8s::null_default")]
+    backend_refs: Vec<BackendRef>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct BackendRef {
+    group: Option<String>,
+    kind: Option<String>,
+    name: Option<String>,
+    namespace: Option<String>,
+}
+
 /// The Services with a ready endpoint, as (namespace, name), from the Endpoints' rows:
 /// kubectl's column lists the ready addresses only, `<none>` without one. A few bytes a
 /// Service, where its EndpointSlices are whole objects.
@@ -383,82 +641,65 @@ fn served(defs: &[ColumnDef], rows: &[std::sync::Arc<Row>]) -> HashSet<(String, 
         .collect()
 }
 
-/// The pods that may serve: not those that ran to completion.
-fn live(pods: &[Value]) -> Vec<&Value> {
-    pods.iter().filter(|p| !matches!(text(p, "/status/phase"), Some("Succeeded" | "Failed"))).collect()
-}
-
-fn pod_ready(pod: &Value) -> bool {
-    let deleting = pod.pointer("/metadata/deletionTimestamp").is_some_and(|t| !t.is_null());
-    !deleting && k8s::pod_ready(pod)
-}
-
 /// A Service whose pods are `selected` (listed by its selector): selecting none is a warning,
 /// minor when `scaled` names its workload scaled to 0 on purpose; none of them ready, a
 /// warning. Pods that ran to completion don't count.
-fn judge_service(selected: &[Value], scaled: Option<&str>) -> Option<(Severity, String)> {
-    let live = live(selected);
-    if live.is_empty() {
+fn judge_service(selected: &[SelectedPod], scaled: Option<&str>) -> Option<(Severity, String)> {
+    let live = selected.iter().filter(|p| p.live()).count();
+    if live == 0 {
         return Some(match scaled {
             Some(w) => (Severity::Info, format!("selects no pod ({w} scaled to 0)")),
             None => (Severity::Warning, "selects no pod".into()),
         });
     }
-    let ready = live.iter().filter(|p| pod_ready(p)).count();
-    (ready == 0).then(|| (Severity::Warning, format!("no ready pod (0/{} ready)", live.len())))
+    let ready = selected.iter().filter(|p| p.live() && p.ready()).count();
+    (ready == 0).then(|| (Severity::Warning, format!("no ready pod (0/{live} ready)")))
 }
 
 /// The workload scaled to 0 whose pods a Service would select, as "Deployment web".
-/// `workloads`: (kind, object), in any namespace.
-fn scaled_to_zero(service: &Value, workloads: &[(&str, Value)]) -> Option<String> {
-    let ns = text(service, "/metadata/namespace");
-    let selector = service.pointer("/spec/selector")?;
+fn scaled_to_zero(service: &Service, scaled: &[Scaled]) -> Option<String> {
+    let ns = service.metadata.namespace();
+    let selector = service.spec.selector.as_ref()?;
     let selector = serde_json::json!({ "matchLabels": selector });
-    workloads.iter().find_map(|(kind, w)| {
-        let labels = w.pointer("/spec/template/metadata/labels")?.as_object()?;
-        let zero = w.pointer("/spec/replicas").and_then(Value::as_i64) == Some(0);
-        (zero && text(w, "/metadata/namespace") == ns && k8s::selector_matches(&selector, labels))
-            .then(|| format!("{kind} {}", text(w, "/metadata/name").unwrap_or_default()))
-    })
+    scaled
+        .iter()
+        .find(|w| w.namespace.as_deref() == ns && k8s::selector_matches(&selector, &w.labels))
+        .map(|w| format!("{} {}", w.kind, w.name))
 }
 
 /// The TLS Secrets an Ingress names.
-fn ingress_secrets(ing: &Value) -> Vec<Target> {
-    let ns = text(ing, "/metadata/namespace").map(String::from);
+fn ingress_secrets(ing: &Ingress) -> Vec<Target> {
+    let ns = ing.metadata.namespace().map(String::from);
     let names: BTreeSet<&str> =
-        items(&ing["spec"]["tls"]).filter_map(|t| t["secretName"].as_str().filter(|n| !n.is_empty())).collect();
+        ing.spec.tls.iter().filter_map(|t| t.secret_name.as_deref().filter(|n| !n.is_empty())).collect();
     names.into_iter().map(|name| Target { of: Of::Secret, namespace: ns.clone(), name: name.to_string() }).collect()
 }
 
 /// The port an Ingress backend asks for when the Service doesn't have it: "8080", "named
 /// http". An `ExternalName` Service forwards elsewhere, on any port.
-fn port_missing(service: &Value, port: &Value) -> Option<String> {
-    if text(service, "/spec/type") == Some("ExternalName") {
+fn port_missing(service: &Service, port: Option<&BackendPort>) -> Option<String> {
+    if service.spec.kind.as_deref() == Some("ExternalName") {
         return None;
     }
-    let mut ports = items(&service["spec"]["ports"]);
-    if let Some(n) = port["number"].as_i64() {
-        return (!ports.any(|p| p["port"].as_i64() == Some(n))).then(|| n.to_string());
+    let (port, mut ports) = (port?, service.spec.ports.iter());
+    if let Some(n) = port.number {
+        return (!ports.any(|p| p.port == Some(n))).then(|| n.to_string());
     }
-    let name = port["name"].as_str().filter(|n| !n.is_empty())?;
-    (!ports.any(|p| p["name"].as_str() == Some(name))).then(|| format!("named {name}"))
+    let name = port.name.as_deref().filter(|n| !n.is_empty())?;
+    (!ports.any(|p| p.name.as_deref() == Some(name))).then(|| format!("named {name}"))
 }
 
 /// What an Ingress points to that is missing: its backend Services or their ports, and its
 /// TLS Secrets (`secret`: whether one exists, None when that could not be read).
-fn judge_ingress(ing: &Value, services: &Listed<&Value>, secret: impl Fn(&Target) -> Option<bool>) -> Vec<String> {
-    let ns = text(ing, "/metadata/namespace");
-    let spec = &ing["spec"];
-    let backends = std::iter::once(&spec["defaultBackend"])
-        .chain(items(&spec["rules"]).flat_map(|r| items(&r["http"]["paths"]).map(|p| &p["backend"])));
+fn judge_ingress(ing: &Ingress, services: &Listed<&Service>, secret: impl Fn(&Target) -> Option<bool>) -> Vec<String> {
+    let ns = ing.metadata.namespace();
     let mut out = Vec::new();
-    for b in backends {
-        let svc = &b["service"];
-        let Some(name) = svc["name"].as_str().filter(|n| !n.is_empty()) else { continue };
+    for b in ing.backends() {
+        let Some(name) = b.name.as_deref().filter(|n| !n.is_empty()) else { continue };
         let why = match services.get(ns, name) {
             None => continue,
             Some(None) => format!("missing Service {name}"),
-            Some(Some(s)) => match port_missing(s, &svc["port"]) {
+            Some(Some(s)) => match port_missing(s, b.port.as_ref()) {
                 Some(port) => format!("Service {name} has no port {port}"),
                 None => continue,
             },
@@ -477,15 +718,15 @@ fn judge_ingress(ing: &Value, services: &Listed<&Value>, secret: impl Fn(&Target
 
 /// The Services an HTTPRoute sends to that are missing (other kinds of backend aren't
 /// checked). A backend in a namespace that wasn't listed can't be told.
-fn judge_route(route: &Value, services: &Listed<&Value>) -> Vec<String> {
-    let ns = text(route, "/metadata/namespace");
+fn judge_route(route: &Route, services: &Listed<&Service>) -> Vec<String> {
+    let ns = route.metadata.namespace();
     let mut targets = BTreeSet::new();
-    for b in items(&route["spec"]["rules"]).flat_map(|r| items(&r["backendRefs"])) {
-        let core = b["group"].as_str().unwrap_or_default().is_empty();
-        let service = b["kind"].as_str().unwrap_or("Service") == "Service";
-        let Some(name) = b["name"].as_str().filter(|n| !n.is_empty()) else { continue };
+    for b in route.spec.rules.iter().flat_map(|r| &r.backend_refs) {
+        let core = b.group.as_deref().unwrap_or_default().is_empty();
+        let service = b.kind.as_deref().unwrap_or("Service") == "Service";
+        let Some(name) = b.name.as_deref().filter(|n| !n.is_empty()) else { continue };
         if core && service {
-            let namespace = b["namespace"].as_str().filter(|n| !n.is_empty()).or(ns).map(String::from);
+            let namespace = b.namespace.as_deref().filter(|n| !n.is_empty()).or(ns).map(String::from);
             targets.insert(Target { of: Of::Service, namespace, name: name.to_string() });
         }
     }
@@ -493,64 +734,64 @@ fn judge_route(route: &Value, services: &Listed<&Value>) -> Vec<String> {
     missing(&targets, ns, |t| services.exists(t)).into_iter().collect()
 }
 
-/// An object's (namespace, name).
-fn key(obj: &Value) -> (String, String) {
-    let part = |p: &str| text(obj, p).unwrap_or_default().to_string();
-    (part("/metadata/namespace"), part("/metadata/name"))
+/// Services by namespace and name.
+fn services_by_name<'a>(scope: Option<&str>, services: &'a [Service]) -> Listed<&'a Service> {
+    Listed::new(
+        scope,
+        services.iter().filter_map(|s| Some((s.metadata.namespace()?.to_string(), s.metadata.name()?.to_string(), s))),
+    )
 }
 
-/// Every object of `kind` in `namespace` (all when None), or None when the cluster doesn't
-/// serve it.
-async fn list_all(client: Client, kind: Option<Kind>, namespace: Option<String>) -> Option<anyhow::Result<Vec<Value>>> {
+/// Every object of `kind` in `namespace` (all when None), parsed lean as `T`, or None when the
+/// cluster doesn't serve it.
+async fn list_all<T>(client: Client, kind: Option<Kind>, namespace: Option<String>) -> Option<anyhow::Result<Vec<T>>>
+where
+    T: DeserializeOwned + Send + 'static,
+{
     let kind = kind?;
-    Some(k8s::lists::list_lean_cached::<Value>(client, kind.ar, namespace).await)
+    Some(k8s::lists::list_lean_cached::<T>(client, kind.ar, namespace).await)
 }
 
-fn problem(kind: &Kind, obj: &Value, severity: Severity, reason: String) -> Option<Problem> {
+fn problem(kind: &Kind, meta: &Meta, severity: Severity, reason: String) -> Option<Problem> {
     Some(Problem {
         severity,
         kind: kind.kubectl_name(),
         label: kind.ar.kind.clone(),
-        namespace: text(obj, "/metadata/namespace").map(String::from),
-        name: text(obj, "/metadata/name")?.to_string(),
+        namespace: meta.namespace().map(String::from),
+        name: meta.name()?.to_string(),
         reason,
-        age: created(obj),
+        age: meta.created(),
     })
 }
 
-/// The pods a Service selects, listed by its selector: only those come over the wire, where a
-/// namespace's whole pod list would carry every healthy pod too. None without a selector.
-async fn selected_pods(client: Client, kind: &Kind, svc: &Value) -> anyhow::Result<Option<Vec<Value>>> {
-    let (Some(ns), Some(selector)) = (text(svc, "/metadata/namespace"), k8s::pod_selection(kind, svc).list_selector())
-    else {
-        return Ok(None);
-    };
-    Ok(Some(k8s::list_values_cached(client, k8s::ar_of::<core::Pod>(), Some(ns.into()), selector).await?))
-}
-
-/// A namespace's Deployments and StatefulSets, to tell a Service whose workload was scaled to 0
-/// on purpose. Unreadable ones are left out: the Service stays a warning, as if none was.
-async fn workloads_of(client: Client, ns: &str) -> Vec<(&'static str, Value)> {
-    let (deployments, sets) = futures::join!(
-        k8s::list_values_cached(client.clone(), k8s::ar_of::<apps::Deployment>(), Some(ns.into()), None),
-        k8s::list_values_cached(client, k8s::ar_of::<apps::StatefulSet>(), Some(ns.into()), None),
-    );
-    let mut workloads = Vec::new();
-    for (label, listed) in [("Deployment", deployments), ("StatefulSet", sets)] {
+/// A namespace's Deployments and StatefulSets scaled to 0, to tell a Service whose workload was
+/// scaled to 0 on purpose; the others are dropped as each list is read. Unreadable ones are
+/// left out: the Service stays a warning, as if none was.
+async fn workloads_of(client: Client, ns: &str) -> Vec<Scaled> {
+    let list = |ar| k8s::lists::list_lean_cached::<Workload>(client.clone(), ar, Some(ns.into()));
+    let (deployments, sets) =
+        futures::join!(list(k8s::ar_of::<apps::Deployment>()), list(k8s::ar_of::<apps::StatefulSet>()));
+    let mut scaled = Vec::new();
+    for (kind, listed) in [("Deployment", deployments), ("StatefulSet", sets)] {
         if let Ok(listed) = listed {
-            workloads.extend(listed.into_iter().map(|w| (label, w)));
+            scaled.extend(listed.into_iter().filter_map(|w| w.scaled(kind)));
         }
     }
-    workloads
+    scaled
 }
 
 /// Services (with a selector) without a ready endpoint: their pods say whether they select
 /// none or none is ready. One pod list a Service (by its selector), and the workloads of a
 /// namespace listed once, only where a Service selects no pod.
-async fn unserved(client: &Client, kind: &Kind, services: &[Value], namespace: Option<String>) -> Scan {
+async fn unserved(client: &Client, kind: &Kind, services: &[Service], namespace: Option<String>) -> Scan {
     let mut out = Scan::default();
-    let selecting: Vec<&Value> =
-        services.iter().filter(|s| settled(s) && k8s::pod_selection(kind, s) != Selection::Nothing).collect();
+    // By their index in `services`, with the label selector their pods are listed by.
+    let selecting: Vec<(usize, Option<String>)> = services
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| s.metadata.settled())
+        .filter_map(|(i, s)| Some((i, s.selection().list_selector()?)))
+        .collect();
     if selecting.is_empty() {
         return out;
     }
@@ -567,13 +808,18 @@ async fn unserved(client: &Client, kind: &Kind, services: &[Value], namespace: O
     };
     // Collected first, and each future owns what it reads: closures over references held
     // across an await would make the scan's future not `Send` for the agents' server.
-    let unready: Vec<Value> = selecting.into_iter().filter(|s| !ready.contains(&key(s))).cloned().collect();
-    let listed: Vec<(Value, anyhow::Result<Option<Vec<Value>>>)> = futures::stream::iter(unready)
-        .map(|svc| {
-            let (client, kind) = (client.clone(), kind.clone());
+    let unready: Vec<(usize, String, Option<String>)> = selecting
+        .into_iter()
+        .filter(|(i, _)| !ready.contains(&services[*i].metadata.key()))
+        .filter_map(|(i, selector)| Some((i, services[i].metadata.namespace()?.to_string(), selector)))
+        .collect();
+    let listed: Vec<(usize, anyhow::Result<Vec<SelectedPod>>)> = futures::stream::iter(unready)
+        .map(|(i, ns, selector)| {
+            let client = client.clone();
             async move {
-                let pods = selected_pods(client, &kind, &svc).await;
-                (svc, pods)
+                let pod = k8s::ar_of::<core::Pod>();
+                let pods = k8s::lists::list_lean_cached_by::<SelectedPod>(client, pod, Some(ns), selector).await;
+                (i, pods)
             }
         })
         .buffer_unordered(HELD_PARALLEL)
@@ -581,33 +827,33 @@ async fn unserved(client: &Client, kind: &Kind, services: &[Value], namespace: O
         .await;
     let idle: BTreeSet<String> = listed
         .iter()
-        .filter(|(_, pods)| pods.as_ref().is_ok_and(|p| p.as_deref().is_some_and(|p| live(p).is_empty())))
-        .map(|(svc, _)| key(svc).0)
+        .filter(|(_, pods)| pods.as_ref().is_ok_and(|p| !p.iter().any(SelectedPod::live)))
+        .map(|(i, _)| services[*i].metadata.key().0)
         .collect();
-    let workloads: HashMap<String, Vec<(&'static str, Value)>> = futures::stream::iter(idle)
+    let workloads: HashMap<String, Vec<Scaled>> = futures::stream::iter(idle)
         .map(|ns| {
             let client = client.clone();
             async move {
-                let workloads = workloads_of(client, &ns).await;
-                (ns, workloads)
+                let scaled = workloads_of(client, &ns).await;
+                (ns, scaled)
             }
         })
         .buffer_unordered(HELD_PARALLEL)
         .collect()
         .await;
     let mut failed = None;
-    for (svc, pods) in listed {
+    for (i, pods) in listed {
         let pods = match pods {
-            Ok(Some(pods)) => pods,
-            Ok(None) => continue,
+            Ok(pods) => pods,
             Err(e) => {
                 failed = failed.or(Some(e));
                 continue;
             }
         };
-        let scaled = workloads.get(&key(&svc).0).and_then(|w| scaled_to_zero(&svc, w));
+        let svc = &services[i];
+        let scaled = workloads.get(&svc.metadata.key().0).and_then(|w| scaled_to_zero(svc, w));
         if let Some((severity, why)) = judge_service(&pods, scaled.as_deref()) {
-            out.problems.extend(problem(kind, &svc, severity, why));
+            out.problems.extend(problem(kind, &svc.metadata, severity, why));
         }
     }
     if let Some(e) = failed {
@@ -620,19 +866,19 @@ async fn unserved(client: &Client, kind: &Kind, services: &[Value], namespace: O
 async fn ingresses(
     client: &Client,
     kind: &Kind,
-    listed: &[Value],
-    services: &Listed<&Value>,
+    listed: &[Ingress],
+    services: &Listed<&Service>,
     scope: Option<&str>,
 ) -> Scan {
     let mut out = Scan::default();
-    let listed: Vec<&Value> = listed.iter().filter(|i| settled(i)).collect();
+    let listed: Vec<&Ingress> = listed.iter().filter(|i| i.metadata.settled()).collect();
     let secrets = listed.iter().flat_map(|i| ingress_secrets(i)).collect();
     let (exists, skipped) = lookup(client, scope, secrets).await;
     out.skipped = skipped;
     for ing in listed {
         let why = judge_ingress(ing, services, |t| exists.get(t).copied());
         if !why.is_empty() {
-            out.problems.extend(problem(kind, ing, Severity::Warning, why.join("; ")));
+            out.problems.extend(problem(kind, &ing.metadata, Severity::Warning, why.join("; ")));
         }
     }
     out
@@ -656,9 +902,9 @@ pub(super) async fn traffic(
     namespace: Option<String>,
 ) -> Scan {
     let (services, ingress_list, route_list) = futures::join!(
-        list_all(client.clone(), Some(service.clone()), namespace.clone()),
-        list_all(client.clone(), ingress.cloned(), namespace.clone()),
-        list_all(client.clone(), route.cloned(), namespace.clone()),
+        list_all::<Service>(client.clone(), Some(service.clone()), namespace.clone()),
+        list_all::<Ingress>(client.clone(), ingress.cloned(), namespace.clone()),
+        list_all::<Route>(client.clone(), route.cloned(), namespace.clone()),
     );
     let mut out = Scan::default();
     let services = match services {
@@ -688,10 +934,10 @@ pub(super) async fn traffic(
     out.absorb(ingress_scan);
     match (route, route_list) {
         (Some(kind), Some(Ok(listed))) => {
-            for r in listed.iter().filter(|r| settled(r)) {
+            for r in listed.iter().filter(|r| r.metadata.settled()) {
                 let why = judge_route(r, &by_name);
                 if !why.is_empty() {
-                    out.problems.extend(problem(kind, r, Severity::Warning, why.join("; ")));
+                    out.problems.extend(problem(kind, &r.metadata, Severity::Warning, why.join("; ")));
                 }
             }
         }
@@ -700,6 +946,9 @@ pub(super) async fn traffic(
     }
     out
 }
+
+#[cfg(test)]
+mod same_findings;
 
 #[cfg(test)]
 mod tests {
@@ -814,6 +1063,11 @@ mod tests {
         assert_eq!(missing(&[target], Some("app"), |t| one.exists(t)), None);
     }
 
+    /// An object as its list is read: only what the checks use is kept.
+    fn lean<T: DeserializeOwned>(obj: Value) -> T {
+        serde_json::from_value(obj).unwrap()
+    }
+
     fn pod(ns: &str, phase: &str, ready: bool) -> Value {
         json!({"metadata": {"namespace": ns}, "status": {"phase": phase,
             "conditions": [{"type": "Ready", "status": if ready { "True" } else { "False" }}]}})
@@ -821,39 +1075,41 @@ mod tests {
 
     #[test]
     fn a_service_without_pods_or_ready_ones() {
-        assert_eq!(judge_service(&[], None), Some((Severity::Warning, "selects no pod".into())));
+        let judge = |pods: Vec<Value>, scaled: Option<&str>| {
+            judge_service(&pods.into_iter().map(lean::<SelectedPod>).collect::<Vec<_>>(), scaled)
+        };
+        assert_eq!(judge(vec![], None), Some((Severity::Warning, "selects no pod".into())));
         assert_eq!(
-            judge_service(&[], Some("Deployment web")),
+            judge(vec![], Some("Deployment web")),
             Some((Severity::Info, "selects no pod (Deployment web scaled to 0)".into()))
         );
         // Pods of finished runs don't serve.
-        assert_eq!(judge_service(&[pod("app", "Succeeded", false)], None).unwrap().1, "selects no pod");
+        assert_eq!(judge(vec![pod("app", "Succeeded", false)], None).unwrap().1, "selects no pod");
         assert_eq!(
-            judge_service(&[pod("app", "Running", false), pod("app", "Pending", false)], None),
+            judge(vec![pod("app", "Running", false), pod("app", "Pending", false)], None),
             Some((Severity::Warning, "no ready pod (0/2 ready)".into()))
         );
-        assert_eq!(judge_service(&[pod("app", "Running", false), pod("app", "Running", true)], None), None);
+        assert_eq!(judge(vec![pod("app", "Running", false), pod("app", "Running", true)], None), None);
         // Being deleted: not serving any more.
         let mut leaving = pod("app", "Running", true);
         leaving["metadata"]["deletionTimestamp"] = json!("2026-01-01T00:00:00Z");
-        assert_eq!(judge_service(&[leaving], None).unwrap().1, "no ready pod (0/1 ready)");
+        assert_eq!(judge(vec![leaving], None).unwrap().1, "no ready pod (0/1 ready)");
     }
 
     #[test]
     fn a_service_s_workload_scaled_to_zero() {
-        let svc = json!({"metadata": {"name": "web", "namespace": "app"}, "spec": {"selector": {"app": "web"}}});
-        let workload = |ns: &str, replicas: i64, app: &str| {
-            json!({"metadata": {"name": "web", "namespace": ns}, "spec": {"replicas": replicas,
-                "template": {"metadata": {"labels": {"app": app, "tier": "front"}}}}})
+        let svc: Service =
+            lean(json!({"metadata": {"name": "web", "namespace": "app"}, "spec": {"selector": {"app": "web"}}}));
+        let workload = |kind: &'static str, ns: &str, replicas: i64, app: &str| -> Vec<Scaled> {
+            let obj = json!({"metadata": {"name": "web", "namespace": ns}, "spec": {"replicas": replicas,
+                "template": {"metadata": {"labels": {"app": app, "tier": "front"}}}}});
+            lean::<Workload>(obj).scaled(kind).into_iter().collect()
         };
-        assert_eq!(
-            scaled_to_zero(&svc, &[("Deployment", workload("app", 0, "web"))]).as_deref(),
-            Some("Deployment web")
-        );
-        // Running replicas, another app, or the same in another namespace: not it.
-        assert_eq!(scaled_to_zero(&svc, &[("Deployment", workload("app", 2, "web"))]), None);
-        assert_eq!(scaled_to_zero(&svc, &[("Deployment", workload("app", 0, "api"))]), None);
-        assert_eq!(scaled_to_zero(&svc, &[("StatefulSet", workload("other", 0, "web"))]), None);
+        assert_eq!(scaled_to_zero(&svc, &workload("Deployment", "app", 0, "web")).as_deref(), Some("Deployment web"));
+        // Running replicas aren't kept; another app, or the same in another namespace: not it.
+        assert!(workload("Deployment", "app", 2, "web").is_empty());
+        assert_eq!(scaled_to_zero(&svc, &workload("Deployment", "app", 0, "api")), None);
+        assert_eq!(scaled_to_zero(&svc, &workload("StatefulSet", "other", 0, "web")), None);
     }
 
     #[test]
@@ -887,8 +1143,8 @@ mod tests {
         assert!(!has("other", "web"), "another namespace's Service of the same name");
     }
 
-    fn service(ns: &str, name: &str, ports: Value) -> Value {
-        json!({"metadata": {"namespace": ns, "name": name}, "spec": {"ports": ports}})
+    fn service(ns: &str, name: &str, ports: Value) -> Service {
+        lean(json!({"metadata": {"namespace": ns, "name": name}, "spec": {"ports": ports}}))
     }
 
     #[test]
@@ -898,13 +1154,13 @@ mod tests {
             service("other", "api", json!([{"port": 80}])),
         ];
         let by_name = services_by_name(None, &services);
-        let ing = |backend: Value, tls: &str| {
-            json!({"metadata": {"namespace": "app", "name": "front"}, "spec": {
+        let ing = |backend: Value, tls: &str| -> Ingress {
+            lean(json!({"metadata": {"namespace": "app", "name": "front"}, "spec": {
                 "tls": [{"hosts": ["a.example.com"], "secretName": tls}],
-                "rules": [{"http": {"paths": [{"path": "/", "backend": {"service": backend}}]}}]}})
+                "rules": [{"http": {"paths": [{"path": "/", "backend": {"service": backend}}]}}]}}))
         };
         let secrets = listed(&[("app", "front-tls"), ("other", "other-tls")]);
-        let check = |i: &Value| judge_ingress(i, &by_name, |t| secrets.exists(t));
+        let check = |i: &Ingress| judge_ingress(i, &by_name, |t| secrets.exists(t));
         assert!(check(&ing(json!({"name": "web", "port": {"number": 80}}), "front-tls")).is_empty());
         assert!(check(&ing(json!({"name": "web", "port": {"name": "http"}}), "front-tls")).is_empty());
         assert_eq!(
@@ -924,18 +1180,25 @@ mod tests {
         let unknown = judge_ingress(&ing(json!({"name": "web", "port": {"number": 80}}), "x"), &by_name, |_| None);
         assert!(unknown.is_empty());
         // The default backend, and an ExternalName Service on any port.
-        let external = [json!({"metadata": {"namespace": "app", "name": "out"}, "spec": {"type": "ExternalName"}})];
+        let external: [Service; 1] =
+            [lean(json!({"metadata": {"namespace": "app", "name": "out"}, "spec": {"type": "ExternalName"}}))];
         let by_name = services_by_name(Some("app"), &external);
-        let default = json!({"metadata": {"namespace": "app"}, "spec": {"defaultBackend": {"service": {"name": "out", "port": {"number": 443}}}}});
+        let default: Ingress = lean(
+            json!({"metadata": {"namespace": "app"}, "spec": {"defaultBackend": {"service": {"name": "out", "port": {"number": 443}}}}}),
+        );
         assert!(judge_ingress(&default, &by_name, |_| None).is_empty());
-        let default = json!({"metadata": {"namespace": "app"}, "spec": {"defaultBackend": {"service": {"name": "gone", "port": {"number": 1}}}}});
+        let default: Ingress = lean(
+            json!({"metadata": {"namespace": "app"}, "spec": {"defaultBackend": {"service": {"name": "gone", "port": {"number": 1}}}}}),
+        );
         assert_eq!(judge_ingress(&default, &by_name, |_| None), ["missing Service gone"]);
     }
 
     #[test]
     fn an_http_route_misses_its_services() {
         let services = [service("app", "web", json!([])), service("other", "api", json!([]))];
-        let route = |refs: Value| json!({"metadata": {"namespace": "app", "name": "r"}, "spec": {"rules": [{"backendRefs": refs}]}});
+        let route = |refs: Value| -> Route {
+            lean(json!({"metadata": {"namespace": "app", "name": "r"}, "spec": {"rules": [{"backendRefs": refs}]}}))
+        };
         let all = services_by_name(None, &services);
         assert!(judge_route(&route(json!([{"name": "web", "port": 80}])), &all).is_empty());
         // Another namespace's Service of the same name doesn't count; one named there does.
@@ -1010,7 +1273,9 @@ mod tests {
     }
 
     /// A cluster with Services, their Endpoints and pods, Ingresses and HTTP routes in
-    /// namespace `app`; records the paths it was asked for.
+    /// namespace `app`, whole as an API server sends them (managedFields, annotations,
+    /// status, `null`s), so the lean reads skip what they don't use; records the paths it was
+    /// asked for.
     #[derive(Clone, Default)]
     struct Cluster(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
 
@@ -1028,43 +1293,68 @@ mod tests {
             let query = req.uri().query().unwrap_or_default().to_string();
             self.0.lock().unwrap().push(path.clone());
             let old = "2026-01-01T00:00:00Z";
-            let meta = |name: &str| json!({"name": name, "namespace": "app", "creationTimestamp": old});
-            let list = |items: Vec<Value>| json!({"kind": "List", "apiVersion": "v1", "metadata": {}, "items": items});
-            let svc = |name: &str, app: &str| json!({"metadata": meta(name), "spec": {"selector": {"app": app}, "ports": [{"name": "http", "port": 80}]}});
+            let meta = |name: &str| {
+                json!({"name": name, "namespace": "app", "creationTimestamp": old, "uid": format!("uid-{name}"),
+                    "resourceVersion": "4711", "labels": {"app": name},
+                    "annotations": {"kubectl.kubernetes.io/last-applied-configuration": format!("{{\"metadata\":{{\"name\":\"{name}\"}}}}")},
+                    "managedFields": [{"manager": "kubectl", "operation": "Update", "apiVersion": "v1", "time": old,
+                        "fieldsType": "FieldsV1", "fieldsV1": {"f:metadata": {"f:labels": {".": {}, "f:app": {}}}, "f:spec": {"f:ports": {}}}}]})
+            };
+            let list = |items: Vec<Value>| json!({"kind": "List", "apiVersion": "v1", "metadata": {"resourceVersion": "4711"}, "items": items});
+            let svc = |name: &str, app: &str| {
+                json!({"metadata": meta(name), "spec": {"selector": {"app": app}, "clusterIP": "10.96.0.10", "type": "ClusterIP",
+                    "ports": [{"name": "http", "port": 80, "targetPort": "http", "protocol": "TCP"}]},
+                    "status": {"loadBalancer": {}}})
+            };
             let body = match path.as_str() {
                 "/api/v1/namespaces/app/services" => list(vec![
                     svc("web", "web"),
                     svc("idle", "idle"),
                     svc("down", "down"),
                     svc("orphan", "orphan"),
-                    json!({"metadata": meta("external"), "spec": {"type": "ExternalName", "externalName": "x.example.com"}}),
+                    json!({"metadata": meta("external"), "spec": {"type": "ExternalName", "externalName": "x.example.com",
+                        "selector": null, "ports": null}}),
                 ]),
                 "/api/v1/namespaces/app/endpoints" => {
                     let row = |name: &str, endpoints: &str| json!({"cells": [name, endpoints, "1d"], "object": {"metadata": {"name": name, "namespace": "app", "uid": name}}});
                     json!({"kind": "Table", "columnDefinitions": [{"name": "Name"}, {"name": "Endpoints"}, {"name": "Age"}],
                         "rows": [row("web", "10.0.0.1:80"), row("down", "<none>"), row("idle", "<none>")]})
                 }
-                "/api/v1/namespaces/app/pods" if query.contains("down") => list(vec![
-                    json!({"metadata": meta("down-1"), "status": {"phase": "Running", "conditions": [{"type": "Ready", "status": "False"}]}}),
-                ]),
+                "/api/v1/namespaces/app/pods" if query.contains("down") => {
+                    list(vec![json!({"metadata": meta("down-1"),
+                    "spec": {"nodeName": "n1", "containers": [{"name": "main", "image": "busybox:1.37", "env": [{"name": "A", "value": "1"}]}]},
+                    "status": {"phase": "Running", "podIP": "10.0.0.9", "conditions": [
+                        {"type": "PodScheduled", "status": "True", "lastProbeTime": null, "lastTransitionTime": old},
+                        {"type": "Ready", "status": "False", "lastProbeTime": null, "reason": "ContainersNotReady"}],
+                        "containerStatuses": [{"name": "main", "ready": false, "restartCount": 3, "state": {"running": {"startedAt": old}}}]}})])
+                }
                 "/api/v1/namespaces/app/pods" => list(vec![]),
                 "/apis/apps/v1/namespaces/app/deployments" => list(vec![json!({"metadata": meta("idle"),
-                    "spec": {"replicas": 0, "template": {"metadata": {"labels": {"app": "idle"}}}}})]),
+                    "spec": {"replicas": 0, "selector": {"matchLabels": {"app": "idle"}}, "strategy": {"type": "RollingUpdate"},
+                        "template": {"metadata": {"creationTimestamp": null, "labels": {"app": "idle"}},
+                            "spec": {"containers": [{"name": "main", "image": "busybox:1.37", "resources": {}}]}}},
+                    "status": {"observedGeneration": 3, "conditions": [{"type": "Available", "status": "True"}]}})]),
                 "/apis/apps/v1/namespaces/app/statefulsets" => list(vec![]),
                 "/apis/networking.k8s.io/v1/namespaces/app/ingresses" => {
-                    list(vec![json!({"metadata": meta("front"), "spec": {
-                    "tls": [{"secretName": "front-tls"}, {"secretName": "gone-tls"}],
-                    "rules": [{"http": {"paths": [
-                        {"backend": {"service": {"name": "web", "port": {"name": "http"}}}},
-                        {"backend": {"service": {"name": "nothing", "port": {"number": 80}}}},
-                    ]}}]}})])
+                    list(vec![json!({"metadata": meta("front"), "spec": {"ingressClassName": "nginx",
+                    "tls": [{"hosts": ["a.example.com"], "secretName": "front-tls"}, {"secretName": "gone-tls"}],
+                    "rules": [{"host": "a.example.com", "http": {"paths": [
+                        {"path": "/", "pathType": "Prefix", "backend": {"service": {"name": "web", "port": {"name": "http"}}}},
+                        {"path": "/x", "pathType": "Prefix", "backend": {"service": {"name": "nothing", "port": {"number": 80}}}},
+                    ]}}, {"host": "b.example.com"}]},
+                    "status": {"loadBalancer": {"ingress": [{"ip": "192.0.2.1"}]}}})])
                 }
                 "/api/v1/namespaces/app/secrets/front-tls" => {
                     json!({"apiVersion": "meta.k8s.io/v1", "kind": "PartialObjectMetadata", "metadata": meta("front-tls")})
                 }
                 "/apis/gateway.networking.k8s.io/v1/namespaces/app/httproutes" => {
                     list(vec![json!({"metadata": meta("route"),
-                    "spec": {"rules": [{"backendRefs": [{"name": "web", "port": 80}, {"name": "gone", "port": 80}]}]}})])
+                    "spec": {"parentRefs": [{"name": "gateway", "namespace": "infra"}], "hostnames": ["a.example.com"],
+                        "rules": [{"matches": [{"path": {"type": "PathPrefix", "value": "/"}}],
+                            "backendRefs": [{"group": "", "kind": "Service", "name": "web", "port": 80, "weight": 1},
+                                {"name": "gone", "port": 80}]}]},
+                    "status": {"parents": [{"parentRef": {"name": "gateway"}, "controllerName": "example.com/gateway",
+                        "conditions": [{"type": "Accepted", "status": "True"}]}]}})])
                 }
                 _ => {
                     json!({"kind": "Status", "apiVersion": "v1", "status": "Failure", "code": 404, "reason": "NotFound"})

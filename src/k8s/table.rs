@@ -30,8 +30,9 @@ pub(super) struct ServerTable {
     pub(super) metadata: ListMeta,
 }
 
-/// Watch frames send `null` for fields a list response omits.
-pub(super) fn null_default<'de, D, T>(d: D) -> std::result::Result<T, D::Error>
+/// A `null` read as the field's default: watch frames send it for fields a list response omits,
+/// and a lean read of an object takes it like a missing field.
+pub(crate) fn null_default<'de, D, T>(d: D) -> std::result::Result<T, D::Error>
 where
     D: serde::Deserializer<'de>,
     T: Default + Deserialize<'de>,
