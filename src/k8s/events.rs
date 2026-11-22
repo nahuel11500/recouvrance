@@ -60,8 +60,9 @@ pub struct EventRows {
 /// resourceVersion keeps them current. The rows go once listed, then at most every `every`
 /// while they change. A watch whose resourceVersion is too old (410 Gone) lists again. While
 /// `pause` is set (the page off screen), nothing is read and no watch is open: once it is
-/// cleared, the watch goes on from where it was, with what changed meanwhile. A refusal (403)
-/// stops it; other failures are tried again, less and less often. Dropping the guard stops it.
+/// cleared, the watch goes on from where it was, with what changed meanwhile. A refused list
+/// (403) stops it; a refused watch lists again every `every` instead. Other failures are tried
+/// again, less and less often. Dropping the guard stops it.
 pub fn watch_events(
     client: Client,
     namespace: Option<String>,
@@ -112,7 +113,7 @@ struct Follow {
 
 impl Follow {
     /// One list, then the watch from it: Ok once its resourceVersion is too old (list again)
-    /// or nobody takes the rows any more.
+    /// or nobody takes the rows any more. A refused watch lists again every `every`.
     async fn run(&self, progress: &mut bool) -> Result<()> {
         if !self.shown().await {
             return Ok(());
@@ -140,6 +141,12 @@ impl Follow {
             let reader = match self.client.request_stream(request.watch(&wp, &version)?).await {
                 Ok(reader) => reader,
                 Err(kube::Error::Api(status)) if status.code == 410 => return Ok(()),
+                // Allowed to list the events but not to watch them (RBAC grants the two apart):
+                // they are listed again every `every`, as the page did before it watched them.
+                Err(kube::Error::Api(status)) if status.code == 403 => {
+                    drop(held);
+                    return self.list_each().await;
+                }
                 Err(e) if resumable(&e) => {
                     self.tx.unbounded_send(EventsMsg::Error(short_error(&e.into())))?;
                     retrying = true;
@@ -191,6 +198,20 @@ impl Follow {
             if cut {
                 tokio::time::sleep(backoff.next()).await;
             }
+        }
+    }
+
+    /// Without the right to watch: every `every`, while the page is on screen, the events are
+    /// listed again and their rows sent. The watch isn't asked again, which the API server
+    /// would refuse and log each time.
+    async fn list_each(&self) -> Result<()> {
+        loop {
+            tokio::time::sleep(self.every).await;
+            if !self.shown().await {
+                return Ok(());
+            }
+            let (mut held, _) = list_events(&self.client, &self.url, self.normal, self.cap).await?;
+            Rows { dirty: true, ..Rows::default() }.flush(&mut held, self)?;
         }
     }
 
@@ -446,6 +467,8 @@ mod tests {
         expire: usize,
         /// What each watch request gets, in turn: its lines, and whether it ends after them.
         watches: VecDeque<(Vec<String>, bool)>,
+        /// Watches are refused (403): the user may list events, not watch them.
+        no_watch: bool,
         asked: Vec<String>,
     }
 
@@ -454,8 +477,8 @@ mod tests {
     /// real one does: by namespace and name, never by time, `limit` at a time (at most `page`:
     /// a server may send fewer), with a `continue` token while more follow. A `continue` is
     /// refused as too old (410 Gone) while `expire` says so. A watch gets the lines queued
-    /// with `watch` and stays open after them, unless they end it. Records the requests it was
-    /// sent, and counts the watches open.
+    /// with `watch` and stays open after them, unless they end it; after `refuse_watches`,
+    /// it is refused. Records the requests it was sent, and counts the watches open.
     #[derive(Clone)]
     struct Events {
         stored: Arc<Mutex<Stored>>,
@@ -482,6 +505,10 @@ mod tests {
 
         fn watch(&self, lines: Vec<String>, ends: bool) {
             self.stored.lock().unwrap().watches.push_back((lines, ends));
+        }
+
+        fn refuse_watches(&self) {
+            self.stored.lock().unwrap().no_watch = true;
         }
 
         fn asked(&self) -> Vec<String> {
@@ -587,6 +614,11 @@ mod tests {
             stored.asked.push(format!("{path}?{query}"));
             let param = |key: &str| query.split('&').find_map(|p| p.strip_prefix(key)?.strip_prefix('='));
             if param("watch") == Some("true") {
+                if stored.no_watch {
+                    let refused = json!({"kind": "Status", "apiVersion": "v1", "status": "Failure", "reason": "Forbidden",
+                        "code": 403, "message": "events is forbidden: User \"me\" cannot watch resource \"events\""});
+                    return std::future::ready(Ok(json_body(403, &refused)));
+                }
                 // None queued: open, and quiet.
                 let (lines, ends) = stored.watches.pop_front().unwrap_or_default();
                 self.open.fetch_add(1, Ordering::SeqCst);
@@ -740,6 +772,29 @@ mod tests {
         assert!(cluster.watches_asked()[1].contains("resourceVersion=7"), "{:?}", cluster.asked());
     }
 
+    /// Allowed to list the events but not to watch them: they are listed again every `every`,
+    /// with what changed and no error, but not while off screen; the watch isn't asked again.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn without_the_right_to_watch_they_are_listed_again() {
+        let cluster = Events::new(0, 500);
+        cluster.add(warning("shop", "a", 10, 1, "5"));
+        cluster.refuse_watches();
+        let (client, pause) = (kube::Client::new(cluster.clone(), "default"), Pause::default());
+        let every = Duration::from_millis(200);
+        let (_watch, mut rx) = super::watch_events(client, None, false, 100, every, pause.clone());
+        assert_eq!(names(&until(&mut rx, |_| true).await), ["a"]);
+        cluster.add(warning("shop", "b", 20, 1, "6"));
+        assert_eq!(names(&until(&mut rx, |r| r.rows.len() == 2).await), ["b", "a"]);
+        assert!(cluster.lists() >= 2, "{:?}", cluster.asked());
+        assert_eq!(cluster.watches_asked().len(), 1, "{:?}", cluster.asked());
+        pause.set(true);
+        // A list already started ends.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let listed = cluster.lists();
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        assert_eq!(cluster.lists(), listed, "listed while off screen: {:?}", cluster.asked());
+    }
+
     /// A list that pages for longer than etcd keeps its history is refused its next page: it
     /// starts over once, and says so when refused again.
     #[tokio::test(flavor = "multi_thread")]
@@ -817,7 +872,7 @@ mod tests {
         // those of pods 162 to 199 (26 × 38 = 988), then 12 of pod 161's (by namespace).
         let oldest = rows.rows.iter().filter_map(|e| e.line.last).min();
         assert_eq!(rows.since, oldest);
-        assert_eq!(oldest.map(|t| t.as_second()), Some(BASE + 2 * 161 + 1));
+        assert_eq!(oldest.map(jiff::Timestamp::as_second), Some(BASE + 2 * 161 + 1));
         assert!(rows.rows.windows(2).all(|w| w[0].line.last >= w[1].line.last), "newest first");
     }
 

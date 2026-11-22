@@ -73,7 +73,8 @@
   **Timeline** page (sidebar, or `Timeline` in the palette) lists the connected clusters' changes
   newest first with their events interleaved (Warnings only by default, all, or none; those the
   cluster still keeps, an hour's worth by default, read once and then kept current by a watch, so
-  a refresh brings only what changed; the newest 20,000 of a cluster are held, shared by its
+  a refresh brings only what changed (read again at each overview refresh where they may be
+  listed but not watched); the newest 20,000 of a cluster are held, shared by its
   namespaces when they are read one by one, and the page says how many it shows of how many and
   how far back they go when the cluster keeps more; the events of one object with the same
   reason make one row, with their count); shows the namespaces
