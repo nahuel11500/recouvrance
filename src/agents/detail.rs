@@ -80,8 +80,9 @@ impl AgentsView {
         );
         let url = clients::server_url(self.hub.port());
         let snippets: Vec<_> = picked
-            .map(|client| client.snippets(&url, clients::MASKED_TOKEN).into_iter().map(|s| (client, s)).collect())
-            .unwrap_or_default();
+            .into_iter()
+            .flat_map(|client| client.snippets(&url, clients::MASKED_TOKEN).into_iter().map(move |s| (client, s)))
+            .collect();
         let last = snippets.len().saturating_sub(1);
         let blocks = snippets.into_iter().enumerate().map(|(ix, (client, snippet))| {
             let id = agent.id.clone();
