@@ -92,9 +92,9 @@ struct TabState {
     kind: Option<Kind>,
 }
 
-/// The page each window shows, and the windows the desktop hides (minimized, on another
-/// workspace). Pages hidden in the back/forward history, and every page of a hidden
-/// window, stop polling until shown again.
+/// The page each window shows, and the windows hidden as the desktop reports it (see
+/// `AppView::window_hidden`). Pages hidden in the back/forward history, and every page of a
+/// hidden window, stop polling until shown again.
 #[derive(Default)]
 struct VisiblePages {
     /// Each window's page, by the window's `AppView`.
@@ -134,11 +134,35 @@ pub async fn wait_visible<T: 'static, C: AppContext>(
     cx: &mut C,
     exec: &BackgroundExecutor,
 ) -> bool {
+    wait_visible_or_away(this, cx, exec, |_, _| {}).await.is_some()
+}
+
+/// Wait until this page is on screen, calling `away` on each turn it spends in the
+/// back/forward history (not its window's page). Checked on every turn: a page waiting while
+/// its window is hidden can go into history before the window is shown again. Whether it
+/// waited, once it is on screen; None once it is gone.
+pub async fn wait_visible_or_away<T: 'static, C: AppContext>(
+    this: &WeakEntity<T>,
+    cx: &mut C,
+    exec: &BackgroundExecutor,
+    mut away: impl FnMut(&mut T, &mut Context<T>),
+) -> Option<bool> {
+    let mut waited = false;
     loop {
-        match this.update(cx, |_, cx| is_visible(cx.entity_id(), cx)) {
-            Err(_) => return false,
-            Ok(true) => return true,
-            Ok(false) => exec.timer(std::time::Duration::from_millis(500)).await,
+        let shown = this.update(cx, |this, cx| {
+            let page = cx.entity_id();
+            if !is_current(page, cx) {
+                away(this, cx);
+            }
+            is_visible(page, cx)
+        });
+        match shown {
+            Err(_) => return None,
+            Ok(true) => return Some(waited),
+            Ok(false) => {
+                waited = true;
+                exec.timer(std::time::Duration::from_millis(500)).await;
+            }
         }
     }
 }
@@ -322,8 +346,10 @@ pub struct AppView {
     /// Set while the list isn't on screen (see `list_on_screen`): its watches hold their
     /// rows back, its metrics stop polling.
     list_pause: k8s::Pause,
-    /// The desktop hides the window (minimized, on another workspace): its pages stop
-    /// polling, the list pauses and the problem badge waits.
+    /// The desktop reports the window hidden: minimized or on another workspace, and on
+    /// macOS also fully covered by other windows. Wayland compositors without the xdg-shell
+    /// `suspended` state never report it. Its pages stop polling, the list pauses and the
+    /// problem badge waits.
     window_hidden: bool,
     /// Lists shown recently, shown again at once when you come back to them.
     views: view_cache::ViewCache,
@@ -720,5 +746,69 @@ mod tests {
         assert_eq!(bindings.len(), 1);
         let (bindings, _) = keymap.bindings_for_input(&f5, &[app, KeyContext::parse("Terminal").unwrap()]);
         assert!(bindings.is_empty());
+    }
+}
+
+#[cfg(all(test, feature = "dev"))]
+mod wait_tests {
+    use std::cell::Cell;
+    use std::rc::Rc;
+    use std::time::Duration;
+
+    use gpui_kit::{AppContext as _, Entity, EntityId, TestAppContext};
+
+    use super::{VisiblePages, wait_visible_or_away};
+
+    /// A page that counts the turns it spent in the back/forward history.
+    #[derive(Default)]
+    struct Page {
+        away: usize,
+    }
+
+    /// Put `page` in its window (`current`) or in the history, the window `hidden` or not.
+    fn put(cx: &mut TestAppContext, page: &Entity<Page>, current: bool, hidden: bool) {
+        let (window, id): (EntityId, EntityId) = (1000u64.into(), page.entity_id());
+        cx.update(|cx| {
+            let visible = cx.default_global::<VisiblePages>();
+            if current {
+                visible.pages.insert(window, id);
+            } else {
+                visible.pages.remove(&window);
+            }
+            if hidden {
+                visible.hidden.insert(window);
+            } else {
+                visible.hidden.remove(&window);
+            }
+        });
+    }
+
+    /// A page waits while its window is hidden; the window is shown and Back pressed at once,
+    /// between two turns. The next turn finds it in history: it is away (a detail page stops
+    /// its log streams then), though it never was while its window was hidden.
+    #[gpui_kit::test]
+    fn a_page_that_goes_into_history_as_it_waits_is_away(cx: &mut TestAppContext) {
+        let page = cx.new(|_| Page::default());
+        put(cx, &page, true, true);
+        let (weak, shown) = (page.downgrade(), Rc::new(Cell::new(None)));
+        let out = shown.clone();
+        cx.spawn(|mut cx| async move {
+            let exec = cx.background_executor().clone();
+            out.set(Some(wait_visible_or_away(&weak, &mut cx, &exec, |page: &mut Page, _| page.away += 1).await));
+        })
+        .detach();
+        cx.run_until_parked();
+        assert_eq!(page.read_with(cx, |p, _| p.away), 0, "its window is hidden: still its window's page");
+        put(cx, &page, false, false);
+        cx.executor().advance_clock(Duration::from_millis(600));
+        cx.run_until_parked();
+        assert_eq!(page.read_with(cx, |p, _| p.away), 1, "in history");
+        assert_eq!(shown.get(), None, "still waiting");
+        // Forward: on screen again, after a wait.
+        put(cx, &page, true, false);
+        cx.executor().advance_clock(Duration::from_millis(600));
+        cx.run_until_parked();
+        assert_eq!(shown.get(), Some(Some(true)));
+        assert_eq!(page.read_with(cx, |p, _| p.away), 1);
     }
 }
