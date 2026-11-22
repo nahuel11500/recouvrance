@@ -1,10 +1,11 @@
 //! Timeline page: the changes recorded while the app watched (see `crate::timeline`) on the
-//! connected clusters, their events interleaved, newest first. A change's diff is worked
-//! out when its row is picked.
+//! connected clusters, their events interleaved, newest first. The events are listed once,
+//! then watched (`k8s::watch_events`). A change's diff is worked out when its row is picked.
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
+use futures::{FutureExt as _, StreamExt as _};
 use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
@@ -15,7 +16,7 @@ use kube::Client;
 
 use crate::details::{OpenObject, diff_block};
 use crate::history::DiffLine;
-use crate::k8s::{self, ClusterEvent};
+use crate::k8s::{self, ClusterEvent, EventsMsg};
 use crate::timeline::{self, Record, What};
 use crate::ui::page_filter::PageFilter;
 use crate::ui::page_header::{page_header, scope_text};
@@ -86,11 +87,16 @@ impl Entry {
         matches!(self, Self::Event(_, e) if e.line.kind == "Warning")
     }
 
-    /// The same row (a list rebuilt keeps the one picked).
+    /// The same row: the same change, or the same object's events of one type and reason, so
+    /// that the row picked stays picked when newer events of it come.
     fn same(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::Change(_, a), Self::Change(_, b)) => Arc::ptr_eq(a, b),
-            (Self::Event(_, a), Self::Event(_, b)) => Arc::ptr_eq(a, b),
+            (Self::Event(c, a), Self::Event(d, b)) => {
+                c == d
+                    && (&a.object_kind, &a.object_namespace, &a.object_name, &a.line.kind, &a.line.reason)
+                        == (&b.object_kind, &b.object_namespace, &b.object_name, &b.line.kind, &b.line.reason)
+            }
             _ => false,
         }
     }
@@ -133,16 +139,66 @@ fn shown(e: &Entry, f: &PageFilter, context: Option<&str>, namespaces: &[String]
         Events::Warnings if e.is_event() && !e.warning() => return false,
         _ => {}
     }
-    let text =
-        format!("{} {} {}/{} {}", e.context(), e.kind(), e.namespace().unwrap_or_default(), e.name(), e.summary());
+    // The text is put together only for a filter that searches it: the rows are filtered
+    // again each time the events come.
+    let text = if f.text.is_empty() {
+        String::new()
+    } else {
+        format!("{} {} {}/{} {}", e.context(), e.kind(), e.namespace().unwrap_or_default(), e.name(), e.summary())
+    };
     f.matches(e.context(), e.namespace(), e.kind(), &text)
 }
 
-/// Changes and events in one list, newest first (no time last).
-fn merged(records: &[Entry], events: &[Entry]) -> Vec<Entry> {
-    let mut all: Vec<Entry> = records.iter().chain(events).cloned().collect();
+/// Changes and events in one list, newest first (no time last). Each source's events come
+/// newest first, so the sort mostly merges them.
+fn merged<'a>(parts: impl IntoIterator<Item = &'a [Entry]>) -> Vec<Entry> {
+    let mut all: Vec<Entry> = parts.into_iter().flatten().cloned().collect();
     all.sort_by_key(|e| std::cmp::Reverse(e.time()));
     all
+}
+
+/// The events a cluster's namespace read on its own may hold: a cluster's share
+/// (`k8s::EVENTS_KEPT`) split between its reads.
+fn cap_per_read(reads: usize) -> usize {
+    (k8s::EVENTS_KEPT / reads.max(1)).max(1)
+}
+
+/// The events of one cluster, in one namespace or all: what its watch sent last.
+struct Source {
+    context: Arc<str>,
+    namespace: Option<String>,
+    /// Its rows, newest first.
+    rows: Vec<Entry>,
+    /// How many events they are, of how many the cluster keeps there, and when the oldest of
+    /// them last happened.
+    kept: usize,
+    total: usize,
+    since: Option<jiff::Timestamp>,
+    error: Option<String>,
+    /// Waiting for its watch's first rows.
+    loading: bool,
+}
+
+impl Source {
+    fn new(context: Arc<str>, namespace: Option<String>, rows: Vec<Entry>) -> Self {
+        Self { context, namespace, rows, kept: 0, total: 0, since: None, error: None, loading: true }
+    }
+
+    /// What a line about it names: its context, and its namespace when read on its own.
+    fn place(&self) -> String {
+        match &self.namespace {
+            Some(ns) => format!("{}/{ns}", self.context),
+            None => self.context.to_string(),
+        }
+    }
+
+    /// What its rows cover, when the cluster keeps more events there than are held.
+    fn coverage(&self) -> Option<String> {
+        (self.kept < self.total).then(|| {
+            let since = self.since.map_or_default(|t| format!(", from the last {}", k8s::age(t)));
+            format!("{}: the newest {} of {} events{since}", self.place(), self.kept, self.total)
+        })
+    }
 }
 
 pub struct TimelineView {
@@ -155,12 +211,13 @@ pub struct TimelineView {
     /// The connected contexts' records, read at `version` (see `timeline::version`).
     records: Vec<Entry>,
     version: u64,
-    events: Vec<Entry>,
-    /// Events that could not be read, by cluster (the others are shown).
-    event_errors: Vec<String>,
-    events_loading: bool,
-    /// When the events were last read.
-    events_read: Option<Instant>,
+    /// The events of each cluster, by namespace read, in the scope's order.
+    sources: Vec<Source>,
+    /// The sources' watches, and the task that takes what they send: replaced to stop them,
+    /// so nothing from before lands.
+    watches: Option<(Vec<k8s::TaskGuard>, Task<()>)>,
+    /// Set while the page is off screen: the watches close until it is shown again.
+    events_pause: k8s::Pause,
     /// Every row, newest first, and the ones the filters leave.
     entries: Vec<Entry>,
     shown: Vec<usize>,
@@ -171,7 +228,6 @@ pub struct TimelineView {
     /// The row picked, and its diff (worked out when picked).
     picked: Option<Entry>,
     diff: Option<Arc<Vec<DiffLine>>>,
-    load_events: crate::latest::Latest,
     _subs: Vec<Subscription>,
     _poll: Task<()>,
 }
@@ -192,21 +248,21 @@ impl TimelineView {
                 cx.notify();
             }
         })];
-        // While shown: new records every few seconds, events again every overview refresh.
+        // While shown: new records every few seconds. Off screen, the events' watches close
+        // until the page is shown again.
         let poll = cx.spawn(async move |this, cx| {
             loop {
                 let exec = cx.background_executor().clone();
-                if !crate::app::wait_visible(&this, cx, &exec).await {
+                let off =
+                    this.update(cx, |this, cx| this.events_pause.set(!crate::app::is_visible(cx.entity_id(), cx)));
+                if off.is_err() || !crate::app::wait_visible(&this, cx, &exec).await {
                     break;
                 }
                 let alive = this.update(cx, |this, cx| {
+                    this.events_pause.set(false);
                     if timeline::version() != this.version {
                         this.read_records(cx);
                         cx.notify();
-                    }
-                    let every = crate::settings::secs(crate::settings::get().overview_refresh);
-                    if !this.events_loading && this.events_read.is_none_or(|t| t.elapsed() >= every) {
-                        this.read_events(cx);
                     }
                 });
                 if alive.is_err() {
@@ -221,10 +277,9 @@ impl TimelineView {
             namespaces,
             records: Vec::new(),
             version: 0,
-            events: Vec::new(),
-            event_errors: Vec::new(),
-            events_loading: false,
-            events_read: None,
+            sources: Vec::new(),
+            watches: None,
+            events_pause: k8s::Pause::default(),
             entries: Vec::new(),
             shown: Vec::new(),
             filter,
@@ -232,19 +287,19 @@ impl TimelineView {
             events_shown: Events::Warnings,
             picked: None,
             diff: None,
-            load_events: Default::default(),
             _subs: subs,
             _poll: poll,
         };
         this.read_records(cx);
-        this.read_events(cx);
+        this.watch_events(false, cx);
         this
     }
 
-    /// Read the records and the events again now (F5), keeping the filters.
+    /// Read the records again and list the events again (F5), keeping the filters; the
+    /// events shown stay until the new ones come.
     pub fn refresh(&mut self, cx: &mut Context<Self>) {
         self.read_records(cx);
-        self.read_events(cx);
+        self.watch_events(true, cx);
         cx.notify();
     }
 
@@ -257,58 +312,95 @@ impl TimelineView {
         self.rebuild(cx);
     }
 
-    /// Show the namespaces picked now: their rows, and their events read again.
+    /// Show the namespaces picked now: their rows, and their events watched instead.
     pub fn set_scope(&mut self, scope: crate::ui::Scope, namespaces: Vec<String>, cx: &mut Context<Self>) {
         self.clusters = scope.iter().map(|(ctx, client, _)| (ctx.clone(), client.clone())).collect();
         (self.scope, self.namespaces) = (scope, namespaces);
         if self.context.as_ref().is_some_and(|c| !self.clusters.iter().any(|(n, _)| n == c)) {
             self.context = None;
         }
-        self.events.clear();
         self.read_records(cx);
-        self.read_events(cx);
+        self.watch_events(false, cx);
         cx.notify();
     }
 
-    /// Each cluster's events, in the namespaces of the scope: all at once, or each one (the
-    /// ones picked, or those set as accessible for it).
-    fn read_events(&mut self, cx: &mut Context<Self>) {
+    /// Watch each cluster's events in the namespaces of the scope: all at once, or each one
+    /// (the ones picked, or those set as accessible for it). With `keep`, the rows shown stay
+    /// until their watch sends its own; the events the choice leaves out go at once.
+    fn watch_events(&mut self, keep: bool, cx: &mut Context<Self>) {
+        // The watches from before stop, and their task with them: nothing of theirs lands.
+        self.watches = None;
+        let before = std::mem::take(&mut self.sources);
         if self.events_shown == Events::Hidden {
-            self.events.clear();
-            self.event_errors.clear();
             self.rebuild(cx);
             return;
         }
-        self.events_loading = true;
         let normal = self.events_shown == Events::All;
-        let reads: Vec<(String, Client, Option<String>)> = (self.scope.iter())
-            .flat_map(|(ctx, client, scopes)| scopes.iter().map(move |ns| (ctx.clone(), client.clone(), ns.clone())))
-            .collect();
-        let work = futures::future::join_all(reads.into_iter().map(|(ctx, client, ns)| async move {
-            let read = k8s::recent_events(client, ns.clone(), normal).await;
-            (ctx, ns, read)
-        }));
-        // A new read (events shown changed, a refresh) replaces the one running.
-        self.load_events.spawn(cx, work, |this, results, cx| {
-            this.events_loading = false;
-            this.events_read = Some(Instant::now());
-            this.events.clear();
-            this.event_errors.clear();
-            for (ctx, ns, read) in results {
-                match read {
-                    Ok(events) => {
-                        let c: Arc<str> = ctx.into();
-                        this.events.extend(events.into_iter().map(|e| Entry::Event(c.clone(), Arc::new(e))));
-                    }
-                    Err(e) => {
-                        let place = ns.map(|ns| format!("{ctx}/{ns}")).unwrap_or(ctx);
-                        this.event_errors.push(format!("{place}: events: {}", k8s::short_error(&e)));
-                    }
+        // The rows change as often as the overview pages refresh: each change costs a sort and
+        // a filter of every row.
+        let every = crate::settings::secs(crate::settings::get().overview_refresh);
+        let (mut guards, mut streams) = (Vec::new(), Vec::new());
+        for (ctx, client, namespaces) in &self.scope {
+            let (context, cap): (Arc<str>, _) = (ctx.as_str().into(), cap_per_read(namespaces.len()));
+            for ns in namespaces {
+                let ix = self.sources.len();
+                let rows = (before.iter())
+                    .find(|s| *s.context == **ctx && s.namespace == *ns)
+                    .filter(|_| keep)
+                    .map_or_default(|s| s.rows.clone());
+                self.sources.push(Source::new(context.clone(), ns.clone(), rows));
+                let (guard, rx) =
+                    k8s::watch_events(client.clone(), ns.clone(), normal, cap, every, self.events_pause.clone());
+                guards.push(guard);
+                streams.push(rx.map(move |msg| (ix, msg)));
+            }
+        }
+        let mut sent = futures::stream::select_all(streams);
+        let task = cx.spawn(async move |this, cx| {
+            while let Some(first) = sent.next().await {
+                // What already waits goes in the same update: one sort and filter of the rows.
+                let mut batch = vec![first];
+                while let Some(Some(msg)) = sent.next().now_or_never() {
+                    batch.push(msg);
+                }
+                if this.update(cx, |this, cx| this.on_events(batch, cx)).is_err() {
+                    break;
                 }
             }
-            this.rebuild(cx);
-            cx.notify();
         });
+        self.watches = Some((guards, task));
+        self.rebuild(cx);
+    }
+
+    /// What the watches sent: each source's rows replace its own, its error is shown with them.
+    fn on_events(&mut self, batch: Vec<(usize, EventsMsg)>, cx: &mut Context<Self>) {
+        for (ix, msg) in batch {
+            let Some(s) = self.sources.get_mut(ix) else { continue };
+            match msg {
+                EventsMsg::Rows(r) => {
+                    let context = s.context.clone();
+                    s.rows = r.rows.into_iter().map(|e| Entry::Event(context.clone(), e)).collect();
+                    (s.kept, s.total, s.since, s.error, s.loading) = (r.kept, r.total, r.since, None, false);
+                }
+                EventsMsg::Error(e) => s.error = Some(e),
+            }
+        }
+        self.rebuild(cx);
+        cx.notify();
+    }
+
+    /// Some watch has neither sent its first rows nor failed yet.
+    fn events_loading(&self) -> bool {
+        self.sources.iter().any(|s| s.loading && s.error.is_none())
+    }
+
+    /// Show these events, with a watch of their own: Normal events are read only when shown.
+    fn show_events(&mut self, v: Events, cx: &mut Context<Self>) {
+        if self.events_shown != v {
+            self.events_shown = v;
+            self.watch_events(true, cx);
+            cx.notify();
+        }
     }
 
     /// Show these events (`all`, `warnings`, `none`), as their button does, in dev runs.
@@ -319,24 +411,20 @@ impl TimelineView {
             "none" => Events::Hidden,
             _ => Events::Warnings,
         };
-        if self.events_shown != v {
-            self.events_shown = v;
-            self.read_events(cx);
-            self.refilter(cx);
-            cx.notify();
-        }
+        self.show_events(v, cx);
     }
 
     fn rebuild(&mut self, cx: &App) {
         #[cfg(feature = "dev")]
         let _t = crate::dev::timing::span("timeline rebuild (ui)");
-        self.entries = merged(&self.records, &self.events);
-        // The row picked stays picked if it is still there.
-        if let Some(p) = &self.picked
-            && !self.entries.iter().any(|e| e.same(p))
-        {
-            self.picked = None;
-            self.diff = None;
+        let events = self.sources.iter().map(|s| s.rows.as_slice());
+        self.entries = merged(std::iter::once(self.records.as_slice()).chain(events));
+        // The row picked stays picked while it is there, as it is now.
+        if let Some(p) = self.picked.take() {
+            match self.entries.iter().find(|e| e.same(&p)) {
+                Some(e) => self.picked = Some(e.clone()),
+                None => self.diff = None,
+            }
         }
         self.refilter(cx);
     }
@@ -350,8 +438,7 @@ impl TimelineView {
             (0..self.entries.len()).filter(|&i| shown(&self.entries[i], &f, context, namespaces, events)).collect();
     }
 
-    fn pick(&mut self, ix: usize, cx: &mut Context<Self>) {
-        let Some(e) = self.entries.get(ix).cloned() else { return };
+    fn pick(&mut self, e: Entry, cx: &mut Context<Self>) {
         if self.picked.as_ref().is_some_and(|p| p.same(&e)) {
             self.picked = None;
             self.diff = None;
@@ -385,6 +472,8 @@ impl TimelineView {
             Some(ns) => format!("{ns}/{}", e.name()),
             None => e.name().to_string(),
         };
+        // The row itself, not its place: the rows can change between the frame and the click.
+        let clicked = e.clone();
         h_flex()
             .id(("timeline", i))
             .w_full()
@@ -396,7 +485,7 @@ impl TimelineView {
             .cursor_pointer()
             .hover(|s| s.bg(theme.list_hover))
             .when(picked, |d| d.bg(theme.blue.opacity(0.12)))
-            .on_click(cx.listener(move |this, _, _, cx| this.pick(ix, cx)))
+            .on_click(cx.listener(move |this, _, _, cx| this.pick(clicked.clone(), cx)))
             .child(cell(56.).text_sm().text_color(muted).child(e.time().map_or_default(k8s::age)))
             .when(multi, |d| d.child(cell(140.).text_sm().text_color(muted).child(e.context().to_string())))
             .child(cell(64.).text_xs().text_color(if e.is_event() { muted } else { theme.blue }).child(source))
@@ -493,7 +582,7 @@ impl Render for TimelineView {
                 .small()
                 .ghost()
                 .icon(Lucide::RefreshCw)
-                .label(if self.events_loading { "Reading events…" } else { "Refresh" })
+                .label(if self.events_loading() { "Reading events…" } else { "Refresh" })
                 .on_click(cx.listener(|this, _, _, cx| this.refresh(cx))),
         );
         let mut contexts = h_flex().gap_1();
@@ -534,19 +623,7 @@ impl Render for TimelineView {
                             .when(v == self.events_shown, ButtonVariants::primary)
                             .when(v != self.events_shown, ButtonVariants::ghost)
                             .label(label)
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                if this.events_shown != v {
-                                    // Normal events are read only when shown.
-                                    let read =
-                                        v == Events::All || this.events_shown == Events::Hidden || v == Events::Hidden;
-                                    this.events_shown = v;
-                                    if read {
-                                        this.read_events(cx);
-                                    }
-                                    this.refilter(cx);
-                                    cx.notify();
-                                }
-                            })),
+                            .on_click(cx.listener(move |this, _, _, cx| this.show_events(v, cx))),
                     )
                 });
         let controls = h_flex()
@@ -564,6 +641,13 @@ impl Render for TimelineView {
             "Nothing matches the filters."
         };
         let picked = self.picked.clone();
+        // Events that could not be read, by cluster (the others are shown), and what is shown
+        // where a cluster keeps more events than are held.
+        let errors = (self.sources.iter())
+            .filter_map(|s| s.error.as_ref().map(|e| format!("{}: events: {e}", s.place())))
+            .map(|e| div().text_xs().text_color(theme.danger).child(e));
+        let coverage =
+            self.sources.iter().filter_map(Source::coverage).map(|c| div().text_xs().text_color(muted).child(c));
         v_flex()
             .size_full()
             .p_4()
@@ -571,7 +655,8 @@ impl Render for TimelineView {
             .child(header)
             .child(controls)
             .children(problems.into_iter().map(|p| div().text_xs().text_color(theme.danger).child(p)))
-            .children(self.event_errors.iter().map(|e| div().text_xs().text_color(theme.danger).child(e.clone())))
+            .children(errors)
+            .children(coverage)
             .when(empty, |d| d.child(div().text_sm().text_color(muted).child(empty_text)))
             .child(
                 // Only the rows on screen are laid out: a long timeline stays smooth.
@@ -579,8 +664,7 @@ impl Render for TimelineView {
                     "timeline-list",
                     self.shown.len(),
                     cx.processor(|this, range: std::ops::Range<usize>, _, cx| {
-                        let shown = this.shown.clone();
-                        range.filter_map(|i| shown.get(i).map(|&ix| this.row(i, ix, cx))).collect()
+                        range.filter_map(|i| this.shown.get(i).map(|&ix| this.row(i, ix, cx))).collect()
                     }),
                 )
                 .flex_1()
@@ -595,7 +679,7 @@ mod tests {
     // Not `super::*`: gpui_kit's `test` attribute would come with it.
     use std::sync::Arc;
 
-    use super::{Entry, Events, merged, shown};
+    use super::{Entry, Events, Source, cap_per_read, merged, shown};
     use crate::k8s::{ClusterEvent, EventLine};
     use crate::timeline::{Record, What};
     use crate::ui::page_filter::PageFilter as Filter;
@@ -646,9 +730,54 @@ mod tests {
     fn changes_and_events_newest_first() {
         let records = [change("a", "ConfigMap", "shop", "web", 10), change("b", "Service", "shop", "api", 30)];
         let events = [event("a", "Warning", 20)];
-        let all = merged(&records, &events);
+        let all = merged([&records[..], &events[..]]);
         let names: Vec<&str> = all.iter().map(Entry::name).collect();
         assert_eq!(names, ["api", "web-1", "web"]);
+        // Each cluster's events come newest first: merged with the others, ties in the order
+        // they came.
+        let (a, b) = ([event("a", "Warning", 40), event("a", "Normal", 5)], [event("b", "Warning", 40)]);
+        let all = merged([&records[..], &a[..], &b[..]]);
+        let order: Vec<(&str, Option<i64>)> =
+            all.iter().map(|e| (e.context(), e.time().map(|t| t.as_second() - 1_700_000_000))).collect();
+        assert_eq!(order, [("a", Some(40)), ("b", Some(40)), ("b", Some(30)), ("a", Some(10)), ("a", Some(5))]);
+    }
+
+    /// A newer read of an object's events of one type and reason is the same row: picked, it
+    /// stays picked. A change is the one recorded.
+    #[test]
+    fn the_row_picked_is_found_in_a_newer_read() {
+        let (old, new) = (event("prod", "Warning", 0), event("prod", "Warning", 60));
+        assert!(old.same(&new));
+        assert!(!old.same(&event("staging", "Warning", 0)), "another cluster");
+        assert!(!old.same(&event("prod", "Normal", 0)), "another type");
+        let c = change("prod", "ConfigMap", "shop", "web", 0);
+        assert!(c.same(&c.clone()) && !c.same(&change("prod", "ConfigMap", "shop", "web", 0)));
+    }
+
+    /// A cluster's namespaces read one by one share what it may hold, and none holds nothing.
+    #[test]
+    fn a_cluster_s_reads_share_what_it_holds() {
+        assert_eq!(cap_per_read(1), crate::k8s::EVENTS_KEPT);
+        assert_eq!(cap_per_read(0), crate::k8s::EVENTS_KEPT);
+        for reads in 1..=300 {
+            assert!(reads * cap_per_read(reads) <= crate::k8s::EVENTS_KEPT.max(reads));
+            assert!(cap_per_read(reads) >= 1);
+        }
+        assert_eq!(cap_per_read(usize::MAX), 1);
+    }
+
+    /// Fewer events held than the cluster keeps: the page says how many of how many, and how
+    /// far back they go. All of them: nothing to say.
+    #[test]
+    fn what_the_events_cover() {
+        let mut s = Source::new("prod".into(), None, Vec::new());
+        (s.kept, s.total) = (3, 3);
+        assert_eq!(s.coverage(), None);
+        (s.kept, s.total, s.since) = (2, 5, Some(jiff::Timestamp::now() - jiff::SignedDuration::from_secs(600)));
+        assert_eq!(s.coverage().as_deref(), Some("prod: the newest 2 of 5 events, from the last 10m"));
+        s.namespace = Some("shop".into());
+        s.since = None;
+        assert_eq!(s.coverage().as_deref(), Some("prod/shop: the newest 2 of 5 events"));
     }
 
     #[test]

@@ -153,20 +153,25 @@ pub fn run(ctx: String) {
             let start = std::time::Instant::now();
             let end = start + std::time::Duration::from_secs(secs);
             let every = crate::settings::secs(crate::settings::get().overview_refresh);
+            // Listed once, then watched: the rows come again when they changed, at most every
+            // refresh interval.
+            let (_watch, mut rx) =
+                k8s::watch_events(client.clone(), None, true, k8s::EVENTS_KEPT, every, k8s::Pause::default());
             while std::time::Instant::now() < end {
-                let t = std::time::Instant::now();
-                match k8s::recent_events(client.clone(), None, true).await {
-                    Ok(rows) => println!(
-                        "events: {} rows ({} events) read in {:?}, at {}s",
-                        rows.len(),
-                        rows.iter().map(|e| e.events).sum::<usize>(),
-                        t.elapsed(),
+                match futures::FutureExt::now_or_never(rx.next()) {
+                    Some(Some(k8s::EventsMsg::Rows(r))) => println!(
+                        "events: {} rows, the newest {} of {} events, at {}s",
+                        r.rows.len(),
+                        r.kept,
+                        r.total,
                         start.elapsed().as_secs()
                     ),
-                    Err(e) => println!("events: ERROR {} at {}s", k8s::short_error(&e), start.elapsed().as_secs()),
+                    Some(Some(k8s::EventsMsg::Error(e))) => {
+                        println!("events: ERROR {e} at {}s", start.elapsed().as_secs());
+                    }
+                    Some(None) => break,
+                    None => std::thread::sleep(std::time::Duration::from_millis(100)),
                 }
-                // The page reads them again once the refresh interval has passed.
-                std::thread::sleep(every.min(end.saturating_duration_since(std::time::Instant::now())));
             }
             crate::dev::usage::print();
             return;

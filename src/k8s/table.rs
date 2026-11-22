@@ -779,12 +779,12 @@ pub fn watch_table_paused(
 /// Waits between failed attempts: 0.8s doubling up to 30s, each with up to 25% added at
 /// random so lists of many users don't retry in step (the same curve as client-go).
 #[derive(Default)]
-struct Backoff {
+pub(super) struct Backoff {
     attempts: u32,
 }
 
 impl Backoff {
-    fn next(&mut self) -> std::time::Duration {
+    pub(super) fn next(&mut self) -> std::time::Duration {
         let base = (800u64 << self.attempts.min(6)).min(30_000);
         self.attempts += 1;
         let jitter = (uuid::Uuid::new_v4().as_u128() % 1000) as u64 * base / 4000;
@@ -978,7 +978,7 @@ pub(super) async fn watch_once(
 
 /// Whether a failed watch request can go on from its resourceVersion: the connection or the
 /// server failed. A refusal (410 Gone, 403…) goes back to a list.
-fn resumable(e: &kube::Error) -> bool {
+pub(super) fn resumable(e: &kube::Error) -> bool {
     match e {
         kube::Error::Api(status) => status.code == 429 || status.code >= 500,
         _ => true,
