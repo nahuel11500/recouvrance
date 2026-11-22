@@ -392,6 +392,26 @@ impl AppView {
         self.navigate(Route::Access(page), cx);
     }
 
+    /// The Cluster overview on its Upgrade check tab. Not connected: the cluster switcher opens,
+    /// as for the overview.
+    pub(super) fn open_upgrade_check(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_cluster(window, cx);
+        if let Route::Cluster(page) = self.route() {
+            page.update(cx, |page, cx| page.show_upgrade_check(cx));
+        }
+    }
+
+    /// Settings, on `section`.
+    pub(super) fn open_settings_section(
+        &mut self,
+        section: crate::ui::settings_view::Section,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.settings_view.update(cx, |s, cx| s.show(section, window, cx));
+        self.navigate(Route::Settings, cx);
+    }
+
     pub(super) fn open_apply(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some((context, client)) = self.clusters.first().cloned() else { return };
         let (kinds, ns) = (self.kinds.clone(), self.namespace.clone());

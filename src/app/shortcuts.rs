@@ -1,11 +1,12 @@
-//! The keyboard shortcuts: how each platform names a key, and the list shown on `?`.
-//! docs/features.md has the same table (a test keeps them equal), so the panel and the docs
-//! can't disagree.
+//! The keyboard shortcuts: how each platform names a key, and the list shown on `?` and in
+//! Settings → Shortcuts, both made from `commands::COMMANDS`. docs/features.md has the same table
+//! (a test keeps them equal), so the panel and the docs can't disagree.
 
 use gpui_kit::component::{ActiveTheme as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::*;
 
 use super::MAC;
+use super::commands;
 
 /// Single keys (`?`, `g`, `j`, `k`) only act outside text fields and terminals, where they
 /// are typed instead.
@@ -14,33 +15,10 @@ pub(super) const OUTSIDE_TEXT: &str = "App && !Input && !Terminal";
 /// The same for keys that act on the focused table.
 pub(super) const TABLE_OUTSIDE_TEXT: &str = "DataTable && !Input";
 
-/// Keys, then what they do: one row of the panel and of the table in docs/features.md. A key in
-/// braces is named as each platform does (see [`with_keys`]).
-pub(super) const SHORTCUTS: &[(&str, &str)] = &[
-    ("{secondary-k}", "Command palette: resources, pages, contexts, objects"),
-    ("{secondary-shift-n}", "New window"),
-    ("{secondary-t} / {secondary-w} / {ctrl-tab}", "New tab / close tab / next tab"),
-    ("{secondary-b} / {f5}", "Hide the sidebar / refresh (in a terminal, F5 goes to the program)"),
-    ("{alt-left|cmd-[} / {alt-right|cmd-]}", "Back / forward (Esc also goes back from a detail page)"),
-    ("{secondary-=} / {secondary--} / {secondary-0}", "Zoom in / zoom out / reset the zoom"),
-    (
-        "{secondary-f} or {/}",
-        "Filter the current table: `web` · `!Running` · `app=web` · `tier!=db` · `l:app` · `ns:team-*` · \
-         `/^api-\\d+/` · `status:Running` · `restarts>3` · `cpu>200m` (all terms must match)",
-    ),
-    ("{j} / {k} / {enter}", "Move the selection in a table / open the selected row"),
-    (
-        "g then p / o / w / h / i / s",
-        "Go to Problems / Cluster overview / Workloads overview / Helm / Assistant / Settings",
-    ),
-    ("{secondary-j}", "Show or hide the assistant beside the page: it is told what is on screen"),
-    ("{?}", "List the keyboard shortcuts"),
-    ("Right-click a row", "Open, logs, shell, YAML, events, copy name, favorite"),
-];
-
 /// `text` with each key in braces named as this platform does: `{secondary-k}` reads Ctrl+K on
 /// Linux and ⌘K on macOS. A key is written as gpui binds it (`secondary` is ⌘ on macOS and Ctrl
-/// elsewhere); `{alt-left|cmd-[}` is a different key on each, Linux's first.
+/// elsewhere); `{alt-left|cmd-[}` is a different key on each, Linux's first; `{g p}` is two keys
+/// pressed one after the other.
 pub(crate) fn with_keys(text: &str) -> String {
     with_keys_on(text, MAC)
 }
@@ -51,7 +29,9 @@ fn with_keys_on(text: &str, mac: bool) -> String {
     while let Some((before, after)) = rest.split_once('{') {
         let Some((key, after)) = after.split_once('}') else { break };
         out.push_str(before);
-        out.push_str(&key_on(key_for(key, mac), mac));
+        // `{g p}` is `g`, then `p`.
+        let strokes: Vec<String> = key_for(key, mac).split(' ').map(|k| key_on(k, mac)).collect();
+        out.push_str(&strokes.join(" then "));
         rest = after;
     }
     out.push_str(rest);
@@ -65,20 +45,18 @@ fn keys_in(text: &str, mac: bool) -> Vec<String> {
     text.split('{').skip(1).filter_map(|part| part.split_once('}')).map(|(k, _)| key(k)).collect()
 }
 
-/// The keys a text names in braces that no binding takes, on Linux or on macOS.
+/// The actions bound to `keys` (keystrokes separated by spaces, as gpui binds them) on `mac` or
+/// Linux, in any context.
 #[cfg(test)]
-pub(crate) fn unbound_keys(text: &str) -> Vec<String> {
-    let mut unbound = Vec::new();
-    for mac in [false, true] {
-        let keymap = Keymap::new(super::key_bindings_on(mac));
-        for key in keys_in(text, mac) {
-            let stroke = Keystroke::parse(&key).unwrap();
-            if !keymap.bindings().any(|b| matches!(b.keystrokes(), [k] if *k.inner() == stroke)) {
-                unbound.push(format!("{key} (macOS: {mac})"));
-            }
-        }
-    }
-    unbound
+fn actions_of(keys: &str, mac: bool) -> Vec<&'static str> {
+    let strokes: Vec<Keystroke> = keys.split(' ').map(|k| Keystroke::parse(k).unwrap()).collect();
+    let keymap = Keymap::new(super::key_bindings_on(mac));
+    keymap
+        .bindings()
+        .filter(|b| b.keystrokes().len() == strokes.len())
+        .filter(|b| b.keystrokes().iter().zip(&strokes).all(|(k, s)| k.inner() == s))
+        .map(|b| b.action().name())
+        .collect()
 }
 
 /// The platform's side of `linux|mac`.
@@ -133,35 +111,56 @@ fn key_on(keystroke: &str, mac: bool) -> String {
     }
 }
 
-/// Open the list of shortcuts.
-pub(super) fn open_panel(window: &mut Window, cx: &mut App) {
-    window.open_alert_dialog(cx, |alert, _, cx| {
-        let theme = cx.theme();
-        let rows = SHORTCUTS.iter().map(|(keys, action)| {
+/// Keys in a small box, named as this platform does (see [`with_keys`]).
+pub(crate) fn key_cap(keys: &str, cx: &App) -> Div {
+    let theme = cx.theme();
+    div()
+        .text_xs()
+        .px_1()
+        .rounded_sm()
+        .border_1()
+        .border_color(theme.border)
+        .font_family(theme.mono_font_family.clone())
+        .whitespace_nowrap()
+        .child(with_keys(keys))
+}
+
+/// Every command with keys: the keys, what it does and where. The `?` panel and Settings →
+/// Shortcuts both show this.
+pub(crate) fn shortcut_rows(cx: &App) -> AnyElement {
+    let theme = cx.theme();
+    v_flex()
+        .children(commands::with_shortcut().map(|c| {
             h_flex()
                 .gap_4()
                 .py_1()
                 .border_b_1()
                 .border_color(theme.border)
+                .child(div().w(px(200.)).flex_shrink_0().child(key_cap(c.keys, cx)))
+                .child(div().flex_1().min_w_0().text_sm().child(c.described().replace('`', "")))
                 .child(
-                    div().w(px(200.)).flex_shrink_0().child(
-                        div()
-                            .text_xs()
-                            .px_1()
-                            .rounded_sm()
-                            .border_1()
-                            .border_color(theme.border)
-                            .font_family(theme.mono_font_family.clone())
-                            .child(with_keys(keys)),
-                    ),
+                    div()
+                        .w(px(130.))
+                        .flex_shrink_0()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child(c.scope.label()),
                 )
-                .child(div().flex_1().min_w_0().text_sm().child(action.replace('`', "")))
-        });
+        }))
+        .into_any_element()
+}
+
+/// Open the list of shortcuts.
+pub(super) fn open_panel(window: &mut Window, cx: &mut App) {
+    window.open_alert_dialog(cx, |alert, _, cx| {
         alert
             .title("Keyboard shortcuts")
-            .description("Single keys (?, g, j, k) work when no text field or terminal has focus.")
-            .width(px(720.))
-            .child(v_flex().children(rows))
+            .description(with_keys(
+                "Single keys (?, g, j, k) work when no text field or terminal has focus. Every command, with a \
+                 key or without, is in the command palette ({secondary-k}).",
+            ))
+            .width(px(820.))
+            .child(shortcut_rows(cx))
             .ok_text("Close")
     });
 }
@@ -185,22 +184,22 @@ mod tests {
     use gpui_kit::{Action, KeyBinding, KeyContext, Keymap, Keystroke};
     use proptest::prelude::*;
 
-    use super::{SHORTCUTS, describe, keys_in, unbound_keys, with_keys_on};
+    use super::{actions_of, describe, keys_in, with_keys_on};
+    use crate::app::commands::{COMMANDS, Scope, with_shortcut};
     use crate::app::{self as app, key_bindings_on};
 
-    /// The rows of the shortcut table in docs/features.md: the keys on Linux, on macOS, then
-    /// what they do.
-    fn docs_rows() -> Vec<(String, String, String)> {
+    /// The rows of the shortcut table in docs/features.md: the keys on Linux, on macOS, what
+    /// they do, then where.
+    fn docs_rows() -> Vec<[String; 4]> {
         let docs = include_str!("../../docs/features.md");
         docs.lines()
-            .skip_while(|l| l.trim() != "| Linux | macOS | Action |")
+            .skip_while(|l| l.trim() != "| Linux | macOS | Command | Where |")
             .skip(2)
             .take_while(|l| l.starts_with('|'))
             .map(|line| {
                 let inner = line.trim().trim_start_matches("| ").trim_end_matches(" |");
-                let mut cells = inner.splitn(3, " | ").map(String::from);
-                let mut cell = || cells.next().expect("a row has three cells");
-                (cell(), cell(), cell())
+                let mut cells = inner.splitn(4, " | ").map(String::from);
+                std::array::from_fn(|_| cells.next().expect("a row has four cells"))
             })
             .collect()
     }
@@ -208,9 +207,10 @@ mod tests {
     #[test]
     fn the_docs_list_every_shortcut_of_the_panel() {
         let docs = docs_rows();
-        let code: Vec<(String, String, String)> = SHORTCUTS
-            .iter()
-            .map(|&(keys, action)| (with_keys_on(keys, false), with_keys_on(keys, true), action.to_string()))
+        let code: Vec<[String; 4]> = with_shortcut()
+            .map(|c| {
+                [with_keys_on(c.keys, false), with_keys_on(c.keys, true), c.described(), c.scope.label().to_string()]
+            })
             .collect();
         for row in &code {
             assert!(docs.contains(row), "docs/features.md lacks the shortcut {row:?}");
@@ -228,6 +228,7 @@ mod tests {
             ("{j} or {enter}", "j or Enter", "j or Return"),
             ("Close tab ({secondary-w})", "Close tab (Ctrl+W)", "Close tab (⌘W)"),
             ("{cmd-alt-h}", "Alt+Super+H", "⌥⌘H"),
+            ("{g p}", "g then p", "g then p"),
             // A brace left open is text.
             ("a { b", "a { b", "a { b"),
         ] {
@@ -245,14 +246,61 @@ mod tests {
     }
 
     /// The panel and the docs never name a key that does nothing: each key in braces is bound,
-    /// on Linux and on macOS.
+    /// on Linux and on macOS, and to the command's own action when it has one. A shell's paste
+    /// is the terminal's own key, not a binding.
     #[test]
     fn the_panel_names_only_bound_keys() {
-        let named: usize = SHORTCUTS.iter().map(|(keys, _)| keys_in(keys, false).len()).sum();
-        assert!(named > 15, "the list names {named} keys in braces");
-        for (keys, action) in SHORTCUTS {
-            assert_eq!(unbound_keys(keys), Vec::<String>::new(), "{action}");
+        let named: usize = COMMANDS.iter().map(|c| keys_in(c.keys, false).len()).sum();
+        assert!(named > 25, "the list names {named} keys in braces");
+        for c in COMMANDS.iter().filter(|c| c.scope != Scope::Shell) {
+            for mac in [false, true] {
+                for keys in keys_in(c.keys, mac) {
+                    let actions = actions_of(&keys, mac);
+                    assert!(!actions.is_empty(), "{}: {keys} isn't bound (macOS: {mac})", c.name);
+                    if let Some(action) = c.action {
+                        let name = action().name();
+                        assert!(
+                            actions.contains(&name),
+                            "{}: {keys} runs {actions:?}, not {name} (macOS: {mac})",
+                            c.name
+                        );
+                    }
+                }
+            }
         }
+    }
+
+    /// Every key the window binds is in the list, so `?` and Settings → Shortcuts show them all;
+    /// only the keys every Mac app has are left to its menu bar.
+    #[test]
+    fn every_bound_action_is_listed() {
+        let menu_bar_only = ["Quit", "CloseWindow", "MinimizeWindow", "HideApp", "HideOtherApps"];
+        for mac in [false, true] {
+            let listed: Vec<&str> =
+                COMMANDS.iter().flat_map(|c| keys_in(c.keys, mac)).flat_map(|k| actions_of(&k, mac)).collect();
+            for binding in key_bindings_on(mac) {
+                let name = binding.action().name();
+                let short = name.rsplit("::").next().unwrap_or(name);
+                if short == "NoAction" || menu_bar_only.contains(&short) {
+                    continue;
+                }
+                assert!(listed.contains(&name), "{name} is bound but no command lists it (macOS: {mac})");
+            }
+        }
+    }
+
+    /// What the palette lists does something when picked, every command is in a list, and
+    /// each is listed once.
+    #[test]
+    fn palette_commands_run_an_action() {
+        for c in COMMANDS {
+            assert!(!c.palette || c.action.is_some(), "{} is in the palette but runs nothing", c.name);
+            assert!(c.palette || !c.keys.is_empty(), "{} is in no list", c.name);
+        }
+        let mut names: Vec<&str> = COMMANDS.iter().map(|c| c.name).collect();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), COMMANDS.len(), "two commands share a name");
     }
 
     /// Linux keeps the keys it had.

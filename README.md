@@ -114,6 +114,8 @@ scripts/uninstall.sh    # removes it (settings and the agent log are kept)
 | Alt+← / Alt+→ | ⌘[ / ⌘] | Back / forward (Esc also goes back from a detail page) |
 | Ctrl+Shift+N | ⇧⌘N | New window |
 
+Press `?` for every shortcut; the palette also runs every command that has none.
+
 ## Trust and security
 
 Recouvrance holds your cluster credentials and can let AI agents act on your clusters, so here is

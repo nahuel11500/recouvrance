@@ -12,8 +12,9 @@ use gpui_kit::*;
 
 use crate::settings::{self, ConfirmStyle, DeleteConfirm, InitialView, Startup};
 
-#[derive(Clone, Copy, PartialEq)]
-enum Section {
+/// A section of the page, picked on its left.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Section {
     General,
     Contexts,
     Clusters,
@@ -29,25 +30,6 @@ enum Section {
     Requests,
     About,
 }
-
-/// Settings → Shortcuts: keys, named as each platform does (see `app::with_keys`), then what
-/// they do.
-const SHORTCUT_LIST: &[(&str, &str)] = &[
-    ("{secondary-k}", "Command palette: resources, pages, objects across clusters"),
-    ("{secondary-f}  or  /", "Filter the current table"),
-    ("Esc", "Back from a detail page"),
-    ("↑ ↓  then  {enter}", "Move in a table, open the row"),
-    ("{secondary-shift-n}", "New window (shares agents and settings)"),
-    ("{secondary-t} / {secondary-w}", "New tab / close tab (right-click a row: open in new tab)"),
-    ("{ctrl-tab} / {ctrl-shift-tab}", "Next / previous tab"),
-    ("{secondary-b}", "Hide or show the sidebar"),
-    ("F5  or  {secondary-r}", "Refresh the page"),
-    ("{alt-left|cmd-[} / {alt-right|cmd-]}", "Back / forward"),
-    ("{secondary-=} / {secondary--} / {secondary-0}", "Zoom in / out / reset"),
-    ("Right-click a row", "Open, logs, shell, YAML, events, run, scale, restart, delete"),
-    ("{ctrl-shift-v|cmd-v}", "Paste in a shell"),
-    ("Double-click a context", "Connect to just that context"),
-];
 
 const SECTIONS: [(Section, &str, Lucide); 14] = [
     (Section::General, "General", Lucide::Settings),
@@ -400,6 +382,21 @@ impl SettingsView {
 
     pub fn set_kinds(&mut self, kinds: Vec<crate::k8s::Kind>) {
         self.kinds = kinds;
+    }
+
+    /// Every section: its name and icon, in the page's order.
+    pub fn sections() -> &'static [(Section, &'static str, Lucide)] {
+        &SECTIONS
+    }
+
+    /// Show `section`, with its fields read again.
+    pub fn show(&mut self, section: Section, window: &mut Window, cx: &mut Context<Self>) {
+        self.section = section;
+        if matches!(section, Section::Clusters | Section::Contexts) {
+            self.sync_clusters(window, cx);
+        }
+        self.reload_fields(window, cx);
+        cx.notify();
     }
 
     /// Open on the General section (where deletes are configured).
@@ -1169,29 +1166,15 @@ impl SettingsView {
             .into_any_element()
     }
 
+    /// The shortcut list of the `?` panel, then where the commands without a key are.
     fn shortcuts_section(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let theme = cx.theme().clone();
         v_flex()
-            .children(SHORTCUT_LIST.iter().map(|(k, what)| {
-                h_flex()
-                    .gap_4()
-                    .py_2()
-                    .border_b_1()
-                    .border_color(theme.border)
-                    .child(
-                        div().w(px(220.)).child(
-                            div()
-                                .px_2()
-                                .py_0p5()
-                                .rounded_md()
-                                .bg(theme.secondary)
-                                .text_xs()
-                                .font_family(theme.mono_font_family.clone())
-                                .child(crate::app::with_keys(k)),
-                        ),
-                    )
-                    .child(div().text_sm().child(*what))
-            }))
+            .gap_3()
+            .child(div().text_sm().text_color(cx.theme().muted_foreground).child(crate::app::with_keys(
+                "Every command, with a key or without, is in the command palette ({secondary-k}). Single keys \
+                 (?, g, j, k) work when no text field or terminal has focus.",
+            )))
+            .child(crate::app::shortcut_rows(cx))
             .into_any_element()
     }
 
@@ -1242,14 +1225,7 @@ impl Render for SettingsView {
                             .cursor_pointer()
                             .when(on, |d| d.bg(theme.list_active))
                             .hover(|s| s.bg(theme.list_hover))
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.section = sec;
-                                if matches!(sec, Section::Clusters | Section::Contexts) {
-                                    this.sync_clusters(window, cx);
-                                }
-                                this.reload_fields(window, cx);
-                                cx.notify();
-                            }))
+                            .on_click(cx.listener(move |this, _, window, cx| this.show(sec, window, cx)))
                             .child(Icon::new(*icon).size_4().text_color(theme.muted_foreground))
                             .child(*label)
                     })),
@@ -1298,16 +1274,7 @@ fn port_error(typed: &str, save: impl FnOnce(u16) -> Result<()>) -> Option<Share
 
 #[cfg(test)]
 mod tests {
-    use super::{SHORTCUT_LIST, port_error};
-
-    /// The list names only keys that are bound, on Linux and on macOS. A shell's paste is the
-    /// terminal's own key, not a binding.
-    #[test]
-    fn the_shortcut_list_names_only_bound_keys() {
-        for (keys, what) in SHORTCUT_LIST.iter().filter(|(_, what)| *what != "Paste in a shell") {
-            assert_eq!(crate::app::unbound_keys(keys), Vec::<String>::new(), "{what}");
-        }
-    }
+    use super::port_error;
 
     #[test]
     fn a_port_not_saved_says_why() {

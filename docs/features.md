@@ -327,22 +327,47 @@
   two files are kept apart as `name@file`. A file that fails to parse is reported by its path, line
   and column, never by what it holds there.
 
-| Linux | macOS | Action |
-|---|---|---|
-| Ctrl+K | ⌘K | Command palette: resources, pages, contexts, objects |
-| Ctrl+Shift+N | ⇧⌘N | New window |
-| Ctrl+T / Ctrl+W / Ctrl+Tab | ⌘T / ⌘W / ⌃Tab | New tab / close tab / next tab |
-| Ctrl+B / F5 | ⌘B / F5 | Hide the sidebar / refresh (in a terminal, F5 goes to the program) |
-| Alt+← / Alt+→ | ⌘[ / ⌘] | Back / forward (Esc also goes back from a detail page) |
-| Ctrl+= / Ctrl+- / Ctrl+0 | ⌘= / ⌘- / ⌘0 | Zoom in / zoom out / reset the zoom |
-| Ctrl+F or / | ⌘F or / | Filter the current table: `web` · `!Running` · `app=web` · `tier!=db` · `l:app` · `ns:team-*` · `/^api-\d+/` · `status:Running` · `restarts>3` · `cpu>200m` (all terms must match) |
-| j / k / Enter | j / k / Return | Move the selection in a table / open the selected row |
-| g then p / o / w / h / i / s | g then p / o / w / h / i / s | Go to Problems / Cluster overview / Workloads overview / Helm / Assistant / Settings |
-| Ctrl+J | ⌘J | Show or hide the assistant beside the page: it is told what is on screen |
-| ? | ? | List the keyboard shortcuts |
-| Right-click a row | Right-click a row | Open, logs, shell, YAML, events, copy name, favorite |
+The **command palette** (Ctrl+K, ⌘K on macOS, or the search box of the top bar) finds resource
+types, pages, contexts and objects across the connected clusters, and runs every command, with a
+key or without: Upgrade check, API requests, Agent activity, My access, write mode, the theme,
+each Settings section and each saved view. It knows other words for them too (`rbac` finds My
+access, `deprecated` the Upgrade check, `audit` Agent activity) and shows each command's key. A
+word of the detail line finds an object; letters spread out only match its name.
 
-Single keys (?, g, j, k) work when no text field or terminal has focus; `?` lists every shortcut.
+The keyboard shortcuts, as `?` (or the keyboard button of the top bar) and Settings → Shortcuts
+list them; the palette, that list and this table are all made from one list of commands:
+
+| Linux | macOS | Command | Where |
+|---|---|---|---|
+| Ctrl+K | ⌘K | Command palette: resources, pages, contexts, objects and every command | Anywhere |
+| ? | ? | Keyboard shortcuts: this list | Outside text fields |
+| Ctrl+Shift+N | ⇧⌘N | New window | Anywhere |
+| Ctrl+T | ⌘T | New tab: right-click a row to open it in one | Anywhere |
+| Ctrl+W | ⌘W | Close tab | Anywhere |
+| Ctrl+Tab | ⌃Tab | Next tab | Anywhere |
+| Ctrl+Shift+Tab | ⌃⇧Tab | Previous tab | Anywhere |
+| Ctrl+B | ⌘B | Hide or show the sidebar | Anywhere |
+| F5 or Ctrl+R | F5 or ⌘R | Refresh: in a terminal, F5 goes to the program | Anywhere |
+| Alt+← | ⌘[ | Back | Anywhere |
+| Alt+→ | ⌘] | Forward | Anywhere |
+| Esc | Esc | Back to the list | On a detail page |
+| Ctrl+= | ⌘= | Zoom in | Anywhere |
+| Ctrl+- | ⌘- | Zoom out | Anywhere |
+| Ctrl+0 | ⌘0 | Reset the zoom | Anywhere |
+| Ctrl+F or / | ⌘F or / | Filter the table: `web` · `!Running` · `app=web` · `tier!=db` · `l:app` · `ns:team-*` · `/^api-\d+/` · `status:Running` · `restarts>3` · `cpu>200m` (all terms must match) | In a table |
+| j / k / Enter | j / k / Return | Move the selection, open the selected row | In a table |
+| Right-click a row | Right-click a row | Row menu: open, logs, shell, YAML, events, copy name, favorite | In a table |
+| g then p | g then p | Problems: what is broken, across the clusters | Outside text fields |
+| g then o | g then o | Cluster overview: nodes, capacity and versions | Outside text fields |
+| g then w | g then w | Workloads overview | Outside text fields |
+| g then h | g then h | Helm releases | Outside text fields |
+| g then i | g then i | Assistant: ask your clusters | Outside text fields |
+| g then s | g then s | Settings | Outside text fields |
+| Ctrl+J | ⌘J | Assistant beside the page: it is told what is on screen | Anywhere |
+| Ctrl+Shift+V | ⌘V | Paste in a shell | In a shell |
+| Double-click a context | Double-click a context | Connect to just that context | On the Contexts page |
+
+Single keys (?, g, j, k) work when no text field or terminal has focus.
 
 On macOS, ⌘ takes Ctrl's place, so Ctrl keys reach the shell in a terminal (Ctrl+Tab still
 switches tabs), and the menu bar has the keys every Mac app has: ⌘, opens Settings, ⌘Q quits, ⌘W

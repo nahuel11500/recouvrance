@@ -1,4 +1,4 @@
-//! Command palette (Ctrl+K): jump to a resource type, page, context or object.
+//! Command palette (Ctrl+K): jump to a resource type, page, context or object, or run a command.
 
 use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
@@ -11,9 +11,19 @@ use crate::k8s::Kind;
 #[derive(Clone)]
 pub enum Target {
     Kind(Kind),
-    Page(&'static str),
+    /// A command (see `app::commands`): the action its keys run.
+    Action(fn() -> Box<dyn Action>),
+    /// A section of Settings.
+    Settings(crate::ui::settings_view::Section),
+    /// A saved view of a table.
+    View(crate::favorites::SavedView),
     Context(String),
-    Object { ctx: usize, kind: String, name: String, namespace: Option<String> },
+    Object {
+        ctx: usize,
+        kind: String,
+        name: String,
+        namespace: Option<String>,
+    },
 }
 
 #[derive(Clone)]
@@ -22,6 +32,40 @@ pub struct Item {
     pub detail: String,
     pub icon: Lucide,
     pub target: Target,
+    /// The keys that run it, in braces (see `app::with_keys`), shown on its right; empty for none.
+    pub keys: &'static str,
+    /// More words it is found by, not shown (`rbac` for My access).
+    pub also: &'static str,
+}
+
+impl Item {
+    pub fn new(label: String, detail: String, icon: Lucide, target: Target) -> Self {
+        Self { label, detail, icon, target, keys: "", also: "" }
+    }
+}
+
+/// An item and the lowercase text it is searched by, made once when it is added rather than on
+/// each keystroke: the palette can hold tens of thousands of objects.
+struct Row {
+    item: Item,
+    /// The label, detail and other words, lowercase.
+    text: String,
+    /// Where the label ends in `text`.
+    label_end: usize,
+}
+
+impl Row {
+    fn new(item: Item) -> Self {
+        let mut text = item.label.to_lowercase();
+        let label_end = text.len();
+        for part in [item.detail.as_str(), item.also] {
+            if !part.is_empty() {
+                text.push(' ');
+                text.push_str(&part.to_lowercase());
+            }
+        }
+        Self { item, text, label_end }
+    }
 }
 
 pub enum PaletteEvent {
@@ -30,9 +74,11 @@ pub enum PaletteEvent {
 }
 
 pub struct Palette {
-    items: Vec<Item>,
+    items: Vec<Row>,
     status: Option<String>,
     input: Entity<InputState>,
+    /// What is typed, lowercase: kept so a redraw doesn't lowercase it again.
+    query: String,
     selected: usize,
     scroll: ScrollHandle,
     _subs: Vec<Subscription>,
@@ -40,18 +86,22 @@ pub struct Palette {
 
 impl EventEmitter<PaletteEvent> for Palette {}
 
-/// Subsequence match score: consecutive and early matches rank higher.
-fn score(query: &str, text: &str) -> Option<i64> {
+/// How well a lowercase `query` matches a row: a substring of its label, detail or other words
+/// ranks first, earliest best; else the query's letters in order in the label alone, consecutive
+/// ones ranking higher. Letters spread over the detail match nearly anything (`fraud` finds
+/// `PodCertificateRequest`), so they don't count.
+fn score(query: &str, row: &Row) -> Option<i64> {
     if query.is_empty() {
         return Some(0);
     }
-    let text = text.to_lowercase();
+    let text = row.text.as_str();
     if let Some(pos) = text.find(query) {
         return Some(1000 - pos as i64 - text.len() as i64 / 10);
     }
+    let label = &text[..row.label_end];
     let mut score = 0i64;
     let mut last = None;
-    let mut chars = text.char_indices();
+    let mut chars = label.char_indices();
     for q in query.chars() {
         let (i, _) = chars.find(|(_, c)| *c == q)?;
         if last.is_some_and(|l: usize| i == l + 1) {
@@ -60,7 +110,7 @@ fn score(query: &str, text: &str) -> Option<i64> {
         last = Some(i);
         score += 1;
     }
-    Some(score - text.len() as i64 / 10)
+    Some(score - label.len() as i64 / 10)
 }
 
 impl Item {
@@ -75,17 +125,16 @@ impl Item {
     }
 }
 
-/// The items matching `query`, best first, as many as are shown.
-fn ranked<'a>(items: &'a [Item], query: &str) -> Vec<&'a Item> {
-    let mut scored: Vec<(i64, &Item)> =
-        items.iter().filter_map(|i| score(query, &format!("{} {}", i.label, i.detail)).map(|s| (s, i))).collect();
+/// The items matching a lowercase `query`, best first, as many as are shown.
+fn ranked<'a>(items: &'a [Row], query: &str) -> Vec<&'a Item> {
+    let mut scored: Vec<(i64, &Item)> = items.iter().filter_map(|r| score(query, r).map(|s| (s, &r.item))).collect();
     scored.sort_by_key(|(s, _)| std::cmp::Reverse(*s));
     scored.into_iter().take(60).map(|(_, i)| i).collect()
 }
 
 /// Add `more` and return where the highlighted row is now, so Enter still opens what was
 /// highlighted when better matches arrive above it.
-fn add_keeping_selection(items: &mut Vec<Item>, more: Vec<Item>, query: &str, selected: usize) -> usize {
+fn add_keeping_selection(items: &mut Vec<Row>, more: Vec<Item>, query: &str, selected: usize) -> usize {
     let shown = ranked(items, query);
     let key = shown.get(selected.min(shown.len().saturating_sub(1))).map(|i| i.key());
     add_new(items, more);
@@ -93,9 +142,9 @@ fn add_keeping_selection(items: &mut Vec<Item>, more: Vec<Item>, query: &str, se
 }
 
 /// Add the items not already listed, each once.
-fn add_new(items: &mut Vec<Item>, more: Vec<Item>) {
-    let mut seen: std::collections::HashSet<String> = items.iter().map(Item::key).collect();
-    items.extend(more.into_iter().filter(|i| seen.insert(i.key())));
+fn add_new(items: &mut Vec<Row>, more: Vec<Item>) {
+    let mut seen: std::collections::HashSet<String> = items.iter().map(|r| r.item.key()).collect();
+    items.extend(more.into_iter().filter(|i| seen.insert(i.key())).map(Row::new));
 }
 
 impl Palette {
@@ -103,10 +152,11 @@ impl Palette {
         // The current table and the search index can list the same object.
         let mut items = Vec::new();
         add_new(&mut items, more);
-        let input =
-            cx.new(|cx| InputState::new(window, cx).placeholder("Jump to a resource, page, context or object…"));
+        let input = cx
+            .new(|cx| InputState::new(window, cx).placeholder("Jump to a resource, page, context, object or command…"));
         let subs = vec![cx.subscribe_in(&input, window, |this, _, ev: &InputEvent, _, cx| match ev {
             InputEvent::Change => {
+                this.query = this.input.read(cx).value().to_lowercase();
                 this.selected = 0;
                 this.scroll.scroll_to_item(0);
                 cx.notify();
@@ -115,19 +165,19 @@ impl Palette {
             _ => {}
         })];
         input.update(cx, |s, cx| s.focus(window, cx));
-        Self { items, status: None, input, selected: 0, scroll: ScrollHandle::new(), _subs: subs }
+        Self { items, status: None, input, query: String::new(), selected: 0, scroll: ScrollHandle::new(), _subs: subs }
     }
 
     #[cfg(feature = "dev")]
     pub fn set_query(&mut self, q: &str, window: &mut Window, cx: &mut Context<Self>) {
         self.input.update(cx, |s, cx| s.set_value(q.to_string(), window, cx));
+        self.query = q.to_lowercase();
         cx.notify();
     }
 
     /// Results that arrive later (the cluster-wide search index).
     pub fn add_items(&mut self, items: Vec<Item>, cx: &mut Context<Self>) {
-        let query = self.input.read(cx).value().to_lowercase();
-        let selected = add_keeping_selection(&mut self.items, items, &query, self.selected);
+        let selected = add_keeping_selection(&mut self.items, items, &self.query, self.selected);
         if selected != self.selected {
             self.selected = selected;
             self.scroll.scroll_to_item(selected);
@@ -140,18 +190,18 @@ impl Palette {
         cx.notify();
     }
 
-    fn matches(&self, cx: &App) -> Vec<&Item> {
-        ranked(&self.items, &self.input.read(cx).value().to_lowercase())
+    fn matches(&self) -> Vec<&Item> {
+        ranked(&self.items, &self.query)
     }
 
     fn pick(&mut self, cx: &mut Context<Self>) {
-        if let Some(item) = self.matches(cx).get(self.selected) {
+        if let Some(item) = self.matches().get(self.selected) {
             cx.emit(PaletteEvent::Pick(item.target.clone()));
         }
     }
 
     fn on_key(&mut self, ev: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
-        let n = self.matches(cx).len();
+        let n = self.matches().len();
         match ev.keystroke.key.as_str() {
             "down" if n > 0 => self.selected = (self.selected + 1) % n,
             "up" if n > 0 => self.selected = (self.selected + n - 1) % n,
@@ -168,7 +218,7 @@ impl Palette {
 impl Render for Palette {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
-        let matches: Vec<Item> = self.matches(cx).into_iter().cloned().collect();
+        let matches: Vec<Item> = self.matches().into_iter().cloned().collect();
         let selected = self.selected.min(matches.len().saturating_sub(1));
         // Full-window scrim; clicking outside dismisses.
         div()
@@ -239,6 +289,9 @@ impl Render for Palette {
                                             .text_color(theme.muted_foreground)
                                             .child(item.detail),
                                     )
+                                    .when(!item.keys.is_empty(), |d| {
+                                        d.child(crate::app::key_cap(item.keys, cx).text_color(theme.muted_foreground))
+                                    })
                             })),
                     )
                     .child(
@@ -262,28 +315,29 @@ impl Render for Palette {
 
 #[cfg(test)]
 mod tests {
-    use super::{Item, Lucide, Target, add_keeping_selection, add_new, ranked, score};
+    use super::{Item, Lucide, Row, Target, add_keeping_selection, add_new, ranked, score};
+    use crate::app::commands::palette_items;
 
     fn object(ctx: usize, detail: &str) -> Item {
-        Item {
-            label: "web".into(),
-            detail: detail.into(),
-            icon: Lucide::Box,
-            target: Target::Object {
-                ctx,
-                kind: "deployment".into(),
-                name: "web".into(),
-                namespace: Some("prod".into()),
-            },
-        }
+        Item::new(
+            "web".into(),
+            detail.into(),
+            Lucide::Box,
+            Target::Object { ctx, kind: "deployment".into(), name: "web".into(), namespace: Some("prod".into()) },
+        )
+    }
+
+    fn row(label: &str, detail: &str) -> Row {
+        Row::new(Item::new(label.into(), detail.into(), Lucide::Box, Target::Context(label.into())))
     }
 
     #[test]
     fn same_name_on_other_clusters_is_kept() {
-        let mut items = vec![object(0, "Deployments · prod")];
+        let mut items = Vec::new();
+        add_new(&mut items, vec![object(0, "Deployments · prod")]);
         add_new(&mut items, vec![object(0, "Deployments · prod · a"), object(1, "Deployments · prod · b")]);
         assert_eq!(items.len(), 2);
-        assert!(matches!(items[1].target, Target::Object { ctx: 1, .. }));
+        assert!(matches!(items[1].item.target, Target::Object { ctx: 1, .. }));
     }
 
     #[test]
@@ -295,7 +349,8 @@ mod tests {
 
     #[test]
     fn highlight_stays_on_its_object_when_better_matches_arrive() {
-        let mut items = vec![object(0, "Deployments · prod · a"), object(1, "Deployments · prod · b")];
+        let mut items = Vec::new();
+        add_new(&mut items, vec![object(0, "Deployments · prod · a"), object(1, "Deployments · prod · b")]);
         // The second row (cluster b's web) is highlighted; a closer match then arrives.
         let selected = add_keeping_selection(&mut items, vec![object(2, "x")], "web", 1);
         let picked = ranked(&items, "web")[selected];
@@ -305,9 +360,43 @@ mod tests {
 
     #[test]
     fn scoring_prefers_substrings_and_early_matches() {
-        assert!(score("dep", "Deployments").unwrap() > score("dep", "EndpointSlices").unwrap_or(i64::MIN));
-        assert!(score("cfgm", "ConfigMaps").is_some());
-        assert!(score("xyz", "Pods").is_none());
-        assert_eq!(score("", "anything"), Some(0));
+        let deployments = row("Deployments", "deployments.apps · Workloads");
+        let slices = row("EndpointSlices", "endpointslices · Network");
+        assert!(score("dep", &deployments).unwrap() > score("dep", &slices).unwrap_or(i64::MIN));
+        assert!(score("cfgm", &row("ConfigMaps", "configmaps · Config")).is_some());
+        assert!(score("xyz", &row("Pods", "pods · Workloads")).is_none());
+        assert_eq!(score("", &row("anything", "")), Some(0));
+    }
+
+    /// Letters spread over the detail line match nearly any row: only the label is searched
+    /// that way, while a word of the detail still finds its row.
+    #[test]
+    fn scattered_letters_match_the_label_only() {
+        let certs = row("PodCertificateRequests", "podcertificaterequests.certificates.k8s.io · Security");
+        assert_eq!(score("fraud", &certs), None);
+        assert!(score("security", &certs).is_some());
+        assert!(score("pcr", &row("PodCertificateRequests", "")).is_some());
+    }
+
+    /// The commands without a key are found by their name and by the words people search for.
+    #[test]
+    fn commands_are_found_by_name_and_other_words() {
+        let mut items = Vec::new();
+        add_new(&mut items, palette_items().collect());
+        for (query, name) in [
+            ("rbac", "My access"),
+            ("can-i", "My access"),
+            ("deprecated", "Upgrade check"),
+            ("audit", "Agent activity"),
+            ("api requests", "API requests"),
+            ("shortcuts", "Keyboard shortcuts"),
+            ("write", "Write mode on or off"),
+        ] {
+            let found = ranked(&items, query);
+            assert_eq!(found.first().map(|i| i.label.as_str()), Some(name), "{query}");
+        }
+        // A command with a key shows it.
+        let problems = items.iter().find(|r| r.item.label == "Problems").expect("Problems is listed");
+        assert_eq!(problems.item.keys, "{g p}");
     }
 }
