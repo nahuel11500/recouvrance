@@ -89,9 +89,14 @@ fn main() {
             return;
         }
     }
-    gpui_kit::application().with_assets(gpui_kit::assets::AllAssets).run(|cx| {
+    let application = gpui_kit::application().with_assets(gpui_kit::assets::AllAssets);
+    // macOS keeps the app running when its last window closes: its Dock icon brings one back.
+    application.on_reopen(app::reopen);
+    application.run(|cx| {
         gpui_kit::init(cx);
         app::bind_keys(cx);
+        // After the keys: the macOS menu bar shows the keys bound when it is set.
+        app::init_menus(cx);
         plugins::reload(cx);
         app::load_zoom(cx);
         let mode = app::initial_theme(cx);

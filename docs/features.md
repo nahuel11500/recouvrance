@@ -6,7 +6,10 @@
   be. It adds the last line the plugin wrote to stderr when the kubeconfig sets
   `interactiveMode: Never`; otherwise the plugin writes to the terminal Recouvrance was started
   from. A plugin that cannot start, often because it is not on the `PATH` the app was started
-  with, is reported with its name.
+  with, is reported with its name. A proxy the app can't use (the kubeconfig's `proxy-url`, or
+  `HTTPS_PROXY`, with a scheme other than `http`, `https` or `socks5`, or none) is named by its
+  scheme, host and port, never its user and password; neither shows for any other URL in a
+  connection error.
 - **Sidebar**: the filter at its top finds pages and resource types (by name, kind or API group).
   Pages, saved views, favorites and types scroll together; a section folds with a click on its
   name (kept for next time) and says how many types it holds. Port forwards fold into one row at
@@ -39,9 +42,9 @@
   pods), secrets (masked, referenced by), ingresses, PVCs, namespaces (quotas), nodes, CronJobs,
   and a generic spec/status view for anything else.
 - **Select and copy text** on detail pages, as on a web page: a drag selects (across fields,
-  labels, annotations, conditions, events, the History, Compare and Reachability tabs), Ctrl+C or
-  a right-click *Copy* copies it, a double-click selects a word. Text cut short with `…` is
-  selected and copied whole. Links still open on a click; a drag over one selects its text.
+  labels, annotations, conditions, events, the History, Compare and Reachability tabs), Ctrl+C (⌘C
+  on macOS) or a right-click *Copy* copies it, a double-click selects a word. Text cut short with
+  `…` is selected and copied whole. Links still open on a click; a drag over one selects its text.
 - **History**: an object's page has a History tab listing what changed, newest first, from what
   the cluster already keeps (nothing runs in the background; it is read when the tab is first
   opened): a Deployment's ReplicaSets and a StatefulSet's or DaemonSet's ControllerRevisions
@@ -227,8 +230,8 @@
   Secret's values never are. The field managers that wrote the object since the last sync are
   named too (with server-side apply that is all there is). A destination that isn't connected
   is said; open it to connect.
-- **Assistant beside any page** (Ctrl+J, or the sparkles button in the top bar): the window's
-  assistant chat opens on the right of the page shown, the same chat as on its own page (the
+- **Assistant beside any page** (Ctrl+J, ⌘J on macOS, or the sparkles button in the top bar): the
+  window's assistant chat opens on the right of the page shown, the same chat as on its own page (the
   expand button opens it there). It is told what is on screen, as its header shows: the
   clusters and namespaces picked, and the object whose page is open (with its context), or the
   list with its filter and the row selected, or the page (Problems, Timeline, overviews, Helm,
@@ -322,21 +325,30 @@
 - **Per-cluster settings**: Prometheus or VictoriaMetrics endpoint, node shell image, accessible
   namespaces (when you may not list them), metrics off, an identity to run as; namespaces can also be added by hand.
 - **Kubeconfig**: extra files and watched folders, reloaded on change; contexts with the same name in
-  two files are kept apart as `name@file`.
+  two files are kept apart as `name@file`. A file that fails to parse is reported by its path, line
+  and column, never by what it holds there.
 
-| Shortcut | Action |
-|---|---|
-| Ctrl+K | Command palette: resources, pages, contexts, objects |
-| Ctrl+Shift+N | New window |
-| Ctrl+T / Ctrl+W / Ctrl+Tab | New tab / close tab / next tab |
-| Ctrl+B / F5 | Hide the sidebar / refresh (in a terminal, F5 goes to the program) |
-| Alt+← / Alt+→ | Back / forward (Esc also goes back from a detail page) |
-| Ctrl+= / Ctrl+- / Ctrl+0 | Zoom in / zoom out / reset the zoom |
-| Ctrl+F or / | Filter the current table: `web` · `!Running` · `app=web` · `tier!=db` · `l:app` · `ns:team-*` · `/^api-\d+/` · `status:Running` · `restarts>3` · `cpu>200m` (all terms must match) |
-| j / k / Enter | Move the selection in a table / open the selected row |
-| g then p / o / w / h / i / s | Go to Problems / Cluster overview / Workloads overview / Helm / Assistant / Settings |
-| Ctrl+J | Show or hide the assistant beside the page: it is told what is on screen |
-| ? | List the keyboard shortcuts |
-| Right-click a row | Open, logs, shell, YAML, events, copy name, favorite |
+| Linux | macOS | Action |
+|---|---|---|
+| Ctrl+K | ⌘K | Command palette: resources, pages, contexts, objects |
+| Ctrl+Shift+N | ⇧⌘N | New window |
+| Ctrl+T / Ctrl+W / Ctrl+Tab | ⌘T / ⌘W / ⌃Tab | New tab / close tab / next tab |
+| Ctrl+B / F5 | ⌘B / F5 | Hide the sidebar / refresh (in a terminal, F5 goes to the program) |
+| Alt+← / Alt+→ | ⌘[ / ⌘] | Back / forward (Esc also goes back from a detail page) |
+| Ctrl+= / Ctrl+- / Ctrl+0 | ⌘= / ⌘- / ⌘0 | Zoom in / zoom out / reset the zoom |
+| Ctrl+F or / | ⌘F or / | Filter the current table: `web` · `!Running` · `app=web` · `tier!=db` · `l:app` · `ns:team-*` · `/^api-\d+/` · `status:Running` · `restarts>3` · `cpu>200m` (all terms must match) |
+| j / k / Enter | j / k / Return | Move the selection in a table / open the selected row |
+| g then p / o / w / h / i / s | g then p / o / w / h / i / s | Go to Problems / Cluster overview / Workloads overview / Helm / Assistant / Settings |
+| Ctrl+J | ⌘J | Show or hide the assistant beside the page: it is told what is on screen |
+| ? | ? | List the keyboard shortcuts |
+| Right-click a row | Right-click a row | Open, logs, shell, YAML, events, copy name, favorite |
 
 Single keys (?, g, j, k) work when no text field or terminal has focus; `?` lists every shortcut.
+
+On macOS, ⌘ takes Ctrl's place, so Ctrl keys reach the shell in a terminal (Ctrl+Tab still
+switches tabs), and the menu bar has the keys every Mac app has: ⌘, opens Settings, ⌘Q quits, ⌘W
+closes the tab or, at the last tab, the window, ⇧⌘W closes the window, ⌘M minimizes, ⌘H hides,
+⌘R refreshes and ⌘/ lists the shortcuts. Its Edit menu undoes, cuts, copies, pastes and selects
+all in a text field, and copies the text selected on a page; ⌘V pastes in a shell. The app keeps
+running once its last window is closed, as Mac apps do: its Dock icon or File → New Window opens
+one.
