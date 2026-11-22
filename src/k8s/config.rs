@@ -929,6 +929,46 @@ mod tests {
         assert!(matches!(err, kube::Error::Api(ref s) if s.code == 503), "{err}");
     }
 
+    /// The meter is outside kube's decompression: a gzipped answer counts the bytes it
+    /// decompresses to, and one time to its last byte once it is read.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_meter_counts_an_answer_decompressed() {
+        use std::io::Write as _;
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let text = "x".repeat(10_000);
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        gz.write_all(text.as_bytes()).unwrap();
+        let body = gz.finish().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut conn, _)) = listener.accept().await {
+                let mut buf = [0u8; 4096];
+                let _ = conn.read(&mut buf).await;
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-encoding: gzip\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = conn.write_all(head.as_bytes()).await;
+                let _ = conn.write_all(&body).await;
+            }
+        });
+        let config = kube::Config::new(format!("http://{addr}").parse().unwrap());
+        let client = super::client(config, "gzip-test".into(), false).unwrap();
+        let get = http::Request::get("/api/v1/namespaces/shop/configmaps/big").body(Vec::new()).unwrap();
+        let read = tokio::time::timeout(std::time::Duration::from_secs(5), client.request_text(get)).await;
+        assert_eq!(read.expect("the answer should come at once").unwrap(), text);
+        let snapshot = super::meter::snapshot(super::meter::now_minute());
+        let (_, _, stats) = snapshot
+            .classes
+            .iter()
+            .find(|(c, k, _)| c == "gzip-test" && *k == super::meter::Class::List)
+            .expect("the request is counted");
+        assert_eq!((stats.count, stats.bytes, stats.last_byte.count()), (1, 10_000, 1));
+        let heavy = snapshot.heaviest.iter().find(|h| h.context == "gzip-test").expect("the request is listed");
+        assert_eq!((heavy.path.as_str(), heavy.bytes), ("/api/v1/namespaces/{namespace}/configmaps/{name}", 10_000));
+    }
+
     /// A context whose login command is `sh -c script`, given an OIDC client secret in its
     /// arguments as kubelogin is and another in its environment, with `MARK` set to `mark`.
     /// Its stderr is kept, not shown.
