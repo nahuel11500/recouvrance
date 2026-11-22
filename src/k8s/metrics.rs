@@ -283,14 +283,17 @@ fn pod_resources(spec: &podspec::LeanSpec) -> PodResources {
 
 /// The pods' requests and limits, for the usage bars of the pods list: one light list
 /// (only those fields are parsed), again every minute or ten times as long as it took,
-/// for pods that came since. Nothing while `pause` is set.
+/// for pods that came since. Nothing while `pause` is set, nor before `rows_due` is
+/// cleared: the list's own first rows go first, this list of whole pods is big.
 pub fn watch_pod_resources(
     client: Client,
     namespace: Option<String>,
     pause: Pause,
+    rows_due: Pause,
 ) -> (TaskGuard, mpsc::UnboundedReceiver<PodResourcesMap>) {
     let (tx, rx) = mpsc::unbounded();
     let guard = spawn_guarded(async move {
+        wait_unpaused(&rows_due).await;
         let mut failures = 0;
         loop {
             wait_unpaused(&pause).await;
