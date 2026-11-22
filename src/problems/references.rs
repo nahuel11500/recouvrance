@@ -24,7 +24,7 @@ use crate::k8s::{self, ColumnDef, Kind, Row, Selection};
 pub(super) const GATEWAY: &str = "gateway.networking.k8s.io";
 
 /// Kinds checked with the Services they point to (`traffic`), not on their own.
-pub(super) const WITH_SERVICES: [(&str, &str); 2] = [("networking.k8s.io", "Ingress"), (GATEWAY, "HTTPRoute")];
+pub(crate) const WITH_SERVICES: [(&str, &str); 2] = [("networking.k8s.io", "Ingress"), (GATEWAY, "HTTPRoute")];
 
 /// Seconds an object may point to something missing before it is called a problem: what a
 /// release creates with it (a TLS Secret being issued, a ServiceAccount) may still be coming.
