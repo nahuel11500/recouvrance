@@ -176,11 +176,11 @@ Every call is logged with its decision and rule, and appended to
 `~/.local/share/recouvrance/audit.jsonl` (the folder is 0700, the file 0600). At 10 MiB the log moves to
 `audit.jsonl.1`, replacing the older one. If the log cannot be written, the Activity page says so. A
 kill switch cuts all agent access at once. A request nobody answers within 2 minutes is refused. An
-approval also ends as soon as the agent stops waiting for it: it cancels the call (Esc in Claude Code),
-its session ends, or it hangs up (**Stop** in the assistant, a `claude -p` killed). The banner goes at
-once, and a click on it after that changes nothing. As with the kill switch, a call whose agent stopped
-waiting makes no change after that (a drain stops before its next eviction). The log says whether a
-request was refused, left unanswered, given up by the agent or cut off by the kill switch.
+approval also ends when the agent stops waiting for it. When it cancels the call or hangs up (**Stop**
+in the assistant, a `claude -p` killed), the banner goes at once; when its session ends, within
+seconds. A click on the banner after that changes nothing. As with the kill switch, a call whose agent
+stopped waiting makes no change after that (a drain stops before its next eviction). The log says
+whether a request was refused, left unanswered, given up by the agent or cut off by the kill switch.
 
 The Activity page groups calls by task: one agent session, split where the agent paused for more than
 10 minutes. Each group says what it touched (contexts, namespaces, objects); repeated calls of a tool on

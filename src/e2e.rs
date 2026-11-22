@@ -168,9 +168,9 @@ fn an_agent_gets_only_what_its_rules_allow() {
 }
 
 /// An approval ends as soon as its agent stops waiting: hanging up (the assistant's Stop, a
-/// killed `claude -p`) or cancelling the call (Claude Code's Esc) takes the banner down at
-/// once, and an Approve clicked after that writes nothing. An approval the agent still waits
-/// for writes (so the refusals are not a broken setup).
+/// killed `claude -p`) or cancelling the call (MCP's `notifications/cancelled`) takes the
+/// banner down at once, and an Approve clicked after that writes nothing. An approval the
+/// agent still waits for writes (so the refusals are not a broken setup).
 #[test]
 #[ignore = "needs a kind cluster: RECOUVRANCE_E2E_CONTEXT"]
 fn an_approval_ends_when_its_agent_stops_waiting() {
@@ -222,7 +222,7 @@ fn an_approval_ends_when_its_agent_stops_waiting() {
             let (asked, id) = next_approval(&mut events, Duration::from_secs(60)).await?;
             assert!(asked, "approval {id} ended before it was asked for");
             if cancel {
-                // What Claude Code sends on Esc (`Mcp::call` numbers its call 3).
+                // What an MCP client may send to cancel a call (`Mcp::call` numbers its call 3).
                 let params = json!({"requestId": 3, "reason": "e2e"});
                 client
                     .call_raw(json!({"jsonrpc": "2.0", "method": "notifications/cancelled", "params": params}))
