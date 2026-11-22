@@ -200,8 +200,19 @@
   when it isn't); the row menu also opens the destination and asks for *Refresh*, *Hard refresh*
   or *Sync* (write mode and the Argo CD cluster's protection apply). An Argo CD cluster that
   can't be read is named above the list; the others are shown.
+- **Argo CD resources**: an Application's page lists what Argo CD tracks for it
+  (`status.resources`) as a table: kind, namespace/name, sync, health, whether it is a hook, and
+  a message (its health message, and *no longer in git* for one a sync with prune deletes).
+  *Out of sync or unhealthy* shows those alone. A row opens the object on the kubeconfig context
+  that reaches the destination, connecting to it when it isn't connected; when no context
+  reaches it, the rows don't open and the page says so. The rows come from the Application
+  itself, with no request per row, and only those on screen are drawn: an Application with
+  thousands of resources stays fast. When Argo CD keeps no health per resource in the
+  Application (from Argo CD 3.0, unless `controller.resource.health.persist` is on), the page
+  says so.
 - **Argo CD diagnosis**: an Application's page says what is wrong with it, worst first, each
-  with its objects (opening on the destination's context when it is connected) and what to do:
+  with its objects (opening on the destination's context, connecting to it when it isn't) and
+  what to do:
   - *Being deleted*: the finalizers holding it (what each one waits for) and the resources not
     deleted yet, read live on the destination when it is connected; red after 5 minutes.
   - *Sync running* for more than 10 minutes: the hook or resource it waits for.

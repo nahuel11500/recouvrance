@@ -15,9 +15,11 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use kube::Client;
 
-use crate::details::{ArgoAction, OpenNamespace, OpenOnContext, confirm_argo_action};
+use crate::details::{ArgoAction, OpenOn, OpenOnContext, confirm_argo_action};
+use crate::k8s::argo::diagnosis::Res;
 use crate::k8s::argo::{self, Fleet, FleetApp, Summary};
 use crate::k8s::{self, ObjectRef};
+use crate::overview::column_cell as column;
 use crate::status::Tone;
 
 // MARK: Grouping
@@ -234,16 +236,9 @@ impl Rows {
 /// Column widths.
 const NAME: f32 = 340.;
 const INDENT: f32 = 16.;
-/// The space kept for a row's menu, so no column draws under it.
+/// The space kept for a row's menu, so no column draws under it. The header keeps that room
+/// too, so its columns shrink like the rows' in a narrow window (`column`).
 const MENU: f32 = 24.;
-
-/// A column, the same in the header and the rows so they line up. In a narrow window the wide
-/// columns give up width (down to half of it, their text cut with an ellipsis); the short ones
-/// keep theirs. Both shrink alike: the header keeps room for the menu, as the rows do.
-fn column(w: f32, shrinks: bool) -> Div {
-    let d = div().w(px(w)).overflow_hidden().text_ellipsis().whitespace_nowrap();
-    if shrinks { d.flex_shrink(1.).min_w(px(w / 2.)) } else { d.flex_none() }
-}
 
 pub struct ArgoView {
     clusters: Vec<(String, Client)>,
@@ -271,7 +266,7 @@ pub struct ArgoView {
 }
 
 impl EventEmitter<OpenOnContext> for ArgoView {}
-impl EventEmitter<OpenNamespace> for ArgoView {}
+impl EventEmitter<OpenOn> for ArgoView {}
 
 impl ArgoView {
     pub fn new(clusters: Vec<(String, Client)>, window: &mut Window, cx: &mut Context<Self>) -> Self {
@@ -487,7 +482,7 @@ impl ArgoView {
     fn open_destination(&mut self, k: &Key, cx: &mut Context<Self>) {
         let Some(a) = self.find(k) else { return };
         let Some(context) = a.on.clone().filter(|_| !a.dest.namespace.is_empty()) else { return };
-        let ev = OpenNamespace { context, namespace: a.dest.namespace.clone() };
+        let ev = OpenOn { context, res: Res::namespace(&a.dest.namespace) };
         cx.emit(ev);
     }
 

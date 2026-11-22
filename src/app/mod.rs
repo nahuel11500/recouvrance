@@ -326,8 +326,9 @@ pub struct AppView {
     skip_select: Option<usize>,
     /// The contexts and namespace each Workloads or Problems page was built for.
     page_scopes: HashMap<EntityId, (Vec<String>, Vec<String>)>,
-    /// Connecting to a context to open a namespace there (an Application's destination).
-    namespace_open: crate::latest::Latest,
+    /// Opening an object on a context that isn't connected, or whose kind is looked up there
+    /// (where an Argo CD Application deploys, and what it deploys there).
+    context_open: crate::latest::Latest,
     /// Selected namespaces; empty means all.
     namespaces: Vec<String>,
     filter: Entity<InputState>,
@@ -576,7 +577,7 @@ impl AppView {
             ns_open: false,
             skip_select: None,
             page_scopes: HashMap::new(),
-            namespace_open: Default::default(),
+            context_open: Default::default(),
             sidebar_hidden: false,
             assistant: None,
             assistant_docked: false,

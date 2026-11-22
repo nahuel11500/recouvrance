@@ -162,6 +162,57 @@ pub fn resource_of<'a>(app: &'a Value, group: &str, kind: &str, ns: &str, name: 
     })
 }
 
+// MARK: Resources table
+
+/// One line of an Application's resources table, from its `status.resources`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ResourceRow {
+    pub res: diagnosis::Res,
+    /// `Synced` or `OutOfSync`; empty for a hook, whose sync Argo CD doesn't track.
+    pub sync: String,
+    /// Empty when Argo CD keeps none for it: a kind without a health check (`ConfigMap`,
+    /// Secret...), or any kind when it keeps no health per resource in the Application.
+    pub health: String,
+    pub message: Option<String>,
+    /// In the cluster, no longer in git (`requiresPruning`): a sync with prune deletes it.
+    pub prune: bool,
+    /// A hook (a Job run before or after a sync), not something it applies.
+    pub hook: bool,
+}
+
+impl ResourceRow {
+    /// What to look at before a sync: out of sync (to change, to create or to prune), or
+    /// Degraded or Missing. Progressing is on its way, Suspended is on purpose.
+    pub fn needs_attention(&self) -> bool {
+        self.sync == "OutOfSync" || self.prune || matches!(self.health.as_str(), "Degraded" | "Missing")
+    }
+}
+
+/// An Application's resources, in the order Argo CD lists them. Read from the Application
+/// itself: nothing is asked of any cluster, however many there are.
+pub fn resource_rows(app: &Value) -> Vec<ResourceRow> {
+    resources(app)
+        .filter_map(|r| {
+            let s = |p: &str| r.pointer(p).and_then(Value::as_str).filter(|s| !s.is_empty()).map(String::from);
+            Some(ResourceRow {
+                res: diagnosis::Res::of(r)?,
+                sync: s("/status").unwrap_or_default(),
+                health: s("/health/status").unwrap_or_default(),
+                message: s("/health/message"),
+                prune: r["requiresPruning"] == true,
+                hook: r["hook"] == true,
+            })
+        })
+        .collect()
+}
+
+/// Whether the Application keeps no health per resource: not even its workloads, whose kinds
+/// always have a health check, have one. Argo CD 3 keeps it out of the Application unless
+/// `controller.resource.health.persist` is on.
+pub fn keeps_no_health(rows: &[ResourceRow]) -> bool {
+    rows.iter().all(|r| r.health.is_empty()) && rows.iter().any(|r| r.res.group == "apps" && !r.hook)
+}
+
 // MARK: What is shown
 
 /// One past deployment.
@@ -223,12 +274,17 @@ pub(crate) fn revisions(v: &Value) -> Option<String> {
 /// How many past deployments are shown.
 const HISTORY: usize = 5;
 
+/// Whether auto-sync is on: `syncPolicy.automated` set, and not turned off with
+/// `enabled: false` (newer Argo CD).
+pub fn auto_sync(app: &Value) -> bool {
+    app.pointer("/spec/syncPolicy/automated")
+        .is_some_and(|a| a.is_object() && a.get("enabled").and_then(Value::as_bool) != Some(false))
+}
+
 impl Summary {
     pub fn of(app: &Value) -> Self {
         let s = |p: &str| app.pointer(p).and_then(Value::as_str).filter(|s| !s.is_empty()).map(String::from);
-        let automated = app
-            .pointer("/spec/syncPolicy/automated")
-            .is_some_and(|a| a.is_object() && a.get("enabled").and_then(Value::as_bool) != Some(false));
+        let automated = auto_sync(app);
         let operation = s("/status/operationState/phase")
             .map(|phase| (phase, s("/status/operationState/message"), s("/status/operationState/finishedAt")));
         let history = app
@@ -1203,6 +1259,76 @@ mod tests {
     }
 
     #[test]
+    fn the_resources_table_reads_what_argo_cd_lists() {
+        let app = json!({"status": {"resources": [
+            {"group": "apps", "version": "v1", "kind": "Deployment", "namespace": "shop", "name": "web",
+             "status": "OutOfSync", "health": {"status": "Progressing", "message": "Waiting for rollout to finish"}},
+            {"version": "v1", "kind": "ServiceAccount", "namespace": "shop", "name": "old", "status": "OutOfSync",
+             "requiresPruning": true},
+            {"group": "batch", "version": "v1", "kind": "Job", "namespace": "shop", "name": "migrate", "hook": true,
+             "health": {"status": "Healthy"}},
+            {"group": "rbac.authorization.k8s.io", "version": "v1", "kind": "ClusterRole", "name": "reader",
+             "status": "Synced"},
+            // Not a resource it can show: no name.
+            {"version": "v1", "kind": "ConfigMap", "namespace": "shop"}
+        ]}});
+        let rows = resource_rows(&app);
+        let names: Vec<String> = rows.iter().map(|r| r.res.label()).collect();
+        assert_eq!(names, ["Deployment shop/web", "ServiceAccount shop/old", "Job shop/migrate", "ClusterRole reader"]);
+        let web = &rows[0];
+        assert_eq!((web.res.group.as_str(), web.res.version.as_str()), ("apps", "v1"));
+        assert_eq!((web.sync.as_str(), web.health.as_str()), ("OutOfSync", "Progressing"));
+        assert_eq!(web.message.as_deref(), Some("Waiting for rollout to finish"));
+        assert!(rows[1].prune && !rows[1].hook && rows[1].health.is_empty());
+        // A hook: Argo CD tracks no sync for it.
+        assert!(rows[2].hook && rows[2].sync.is_empty());
+        assert_eq!(rows.iter().map(ResourceRow::needs_attention).collect::<Vec<_>>(), [true, true, false, false]);
+        assert!(resource_rows(&json!({})).is_empty());
+    }
+
+    #[test]
+    fn a_resource_needs_attention_when_out_of_sync_or_unhealthy() {
+        let row = |sync: &str, health: &str, prune: bool| ResourceRow {
+            sync: sync.into(),
+            health: health.into(),
+            prune,
+            ..Default::default()
+        };
+        for wrong in [
+            row("OutOfSync", "", false),
+            row("", "", true),
+            row("Synced", "Degraded", false),
+            row("", "Missing", false),
+        ] {
+            assert!(wrong.needs_attention(), "{wrong:?}");
+        }
+        // On its way, suspended on purpose, fine, or a hook with nothing said.
+        for fine in
+            [row("Synced", "Progressing", false), row("Synced", "Suspended", false), row("Synced", "Healthy", false)]
+        {
+            assert!(!fine.needs_attention(), "{fine:?}");
+        }
+        assert!(!row("", "", false).needs_attention());
+    }
+
+    #[test]
+    fn no_health_per_resource_is_told_by_the_workloads() {
+        let row = |group: &str, kind: &str, health: &str, hook: bool| ResourceRow {
+            res: diagnosis::Res { group: group.into(), kind: kind.into(), name: "x".into(), ..Default::default() },
+            health: health.into(),
+            hook,
+            ..Default::default()
+        };
+        // A Deployment always has a health in an Application that keeps them.
+        assert!(keeps_no_health(&[row("apps", "Deployment", "", false), row("", "ConfigMap", "", false)]));
+        assert!(!keeps_no_health(&[row("apps", "Deployment", "Healthy", false), row("", "ConfigMap", "", false)]));
+        // Kinds without a health check say nothing, nor does a hook.
+        assert!(!keeps_no_health(&[row("", "ConfigMap", "", false), row("", "Secret", "", false)]));
+        assert!(!keeps_no_health(&[row("apps", "Deployment", "", true)]));
+        assert!(!keeps_no_health(&[]));
+    }
+
+    #[test]
     fn out_of_sync_is_only_a_warning_with_auto_sync() {
         assert_eq!(sync_tone("OutOfSync", false), Tone::Done);
         assert_eq!(sync_tone("OutOfSync", true), Tone::Busy);
@@ -1213,11 +1339,69 @@ mod tests {
     }
 }
 
-/// Rules that hold for every server URL and tracking id.
+/// Rules that hold for every server URL, tracking id and list of resources.
 #[cfg(test)]
 mod properties {
-    use super::{parse_tracking, server_key};
+    use super::{parse_tracking, resource_rows, server_key};
     use proptest::prelude::*;
+    use serde_json::{Value, json};
+
+    /// An entry of `status.resources`, any of its fields left out or empty.
+    fn entry() -> impl Strategy<Value = Value> {
+        let word = |words: Vec<&'static str>| proptest::sample::select(words);
+        (
+            word(vec!["", "apps", "batch"]),
+            word(vec!["", "Deployment", "Job"]),
+            word(vec!["", "shop"]),
+            word(vec!["", "a", "b"]),
+            proptest::option::of(word(vec!["Synced", "OutOfSync"])),
+            proptest::option::of(word(vec!["", "Healthy", "Progressing", "Degraded", "Missing", "Suspended"])),
+            any::<bool>(),
+            any::<bool>(),
+        )
+            .prop_map(|(group, kind, namespace, name, sync, health, prune, hook)| {
+                let mut e = json!({"group": group, "kind": kind, "namespace": namespace, "name": name});
+                if let Some(sync) = sync {
+                    e["status"] = json!(sync);
+                }
+                if let Some(health) = health {
+                    e["health"] = json!({"status": health});
+                }
+                if prune {
+                    e["requiresPruning"] = json!(true);
+                }
+                if hook {
+                    e["hook"] = json!(true);
+                }
+                e
+            })
+    }
+
+    proptest! {
+        /// Every resource with a kind and a name gets one row, in Argo CD's order, with what it
+        /// lists; it needs attention exactly when it is out of sync, to prune, Degraded or Missing.
+        #[test]
+        fn every_resource_gets_its_row(entries in proptest::collection::vec(entry(), 0..20)) {
+            let app = json!({"status": {"resources": entries}});
+            let rows = resource_rows(&app);
+            let listed: Vec<&Value> =
+                entries.iter().filter(|e| e["kind"] != "" && e["name"] != "").collect();
+            prop_assert_eq!(rows.len(), listed.len());
+            for (row, e) in rows.iter().zip(listed) {
+                let s = |k: &str| e[k].as_str().unwrap_or_default();
+                prop_assert_eq!(
+                    (row.res.group.as_str(), row.res.kind.as_str(), row.res.namespace.as_str(), row.res.name.as_str()),
+                    (s("group"), s("kind"), s("namespace"), s("name"))
+                );
+                prop_assert_eq!(row.sync.as_str(), s("status"));
+                let health = e.pointer("/health/status").and_then(Value::as_str).unwrap_or_default();
+                prop_assert_eq!(row.health.as_str(), health);
+                prop_assert_eq!((row.prune, row.hook), (e["requiresPruning"] == true, e["hook"] == true));
+                let wrong = s("status") == "OutOfSync" || row.prune || matches!(health, "Degraded" | "Missing");
+                prop_assert_eq!(row.needs_attention(), wrong);
+            }
+        }
+    }
 
     proptest! {
         /// A URL compares the same with a trailing slash, its default port or its host in capitals.
