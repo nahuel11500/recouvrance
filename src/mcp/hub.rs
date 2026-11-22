@@ -22,6 +22,9 @@ use crate::k8s::{self, Kind};
 /// Discovery runs again for an unknown kind (a CRD installed since) at most this often.
 const REDISCOVER_EVERY: Duration = Duration::from_secs(60);
 
+/// How long a request waits for the user's answer.
+const APPROVAL_TIMEOUT: Duration = Duration::from_secs(120);
+
 /// How a request for approval ended.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Answer {
@@ -30,6 +33,8 @@ pub enum Answer {
     TimedOut,
     /// The kill switch was turned on while it waited.
     SwitchedOff,
+    /// The agent stopped waiting for the answer: it cancelled the call, or hung up.
+    Abandoned,
 }
 
 impl Answer {
@@ -40,6 +45,7 @@ impl Answer {
             Self::Rejected => "the user did not approve this request",
             Self::TimedOut => "the user did not answer within 2 minutes",
             Self::SwitchedOff => "agent access was switched off while the request waited",
+            Self::Abandoned => "the agent stopped waiting",
         }
     }
 }
@@ -167,7 +173,16 @@ impl Hub {
             agent.policy.migrate();
         }
         let audit = load_audit_tail(&audit_path());
-        Arc::new(Self {
+        Arc::new(Self::new(config, audit, config_error, rules_file::path().exists()))
+    }
+
+    fn new(
+        config: Config,
+        audit: VecDeque<AuditEntry>,
+        config_error: Option<String>,
+        rules_file_present: bool,
+    ) -> Self {
+        Self {
             kill_switch: AtomicBool::new(config.enabled),
             headless: AtomicBool::new(false),
             config: RwLock::new(config),
@@ -179,14 +194,21 @@ impl Hub {
             subscribers: Mutex::default(),
             server_status: Mutex::default(),
             clients: Mutex::default(),
-            rules_file_present: AtomicBool::new(rules_file::path().exists()),
+            rules_file_present: AtomicBool::new(rules_file_present),
             recent_calls: Mutex::default(),
             rules_error: Mutex::default(),
             rules_text: Mutex::default(),
             config_lock: Mutex::default(),
             config_error,
             forwards: super::forwards::AgentForwards::default(),
-        })
+        }
+    }
+
+    /// A hub with these agents that reads no file (and writes none, as long as nothing
+    /// saves the config or records a call).
+    #[cfg(test)]
+    pub(crate) fn for_test(agents: Vec<Agent>) -> Arc<Self> {
+        Arc::new(Self::new(Config { agents, ..Config::default() }, VecDeque::new(), None, false))
     }
 
     /// Why agents.json could not be read at start, if it couldn't.
@@ -562,7 +584,10 @@ impl Hub {
     // Approvals
 
     /// Ask the user in the UI. Anything but [`Answer::Approved`] refuses the call; with
-    /// no window to ask in, the request is refused at once.
+    /// no window to ask in, the request is refused at once. The request ends when `gone`
+    /// does (the agent stopped waiting for the answer). However it ends, even with this
+    /// future dropped, it leaves the hub and its banner goes: an answer given after that
+    /// changes nothing.
     pub async fn request_approval(
         &self,
         agent: &Agent,
@@ -570,6 +595,7 @@ impl Hub {
         summary: String,
         access: Access,
         dry_run: bool,
+        gone: impl Future<Output = ()>,
     ) -> Answer {
         if self.headless() {
             return Answer::Rejected;
@@ -577,6 +603,7 @@ impl Hub {
         let id = self.next_approval.fetch_add(1, Ordering::SeqCst);
         let (tx, rx) = oneshot::channel();
         lock(&self.approvals).insert(id, tx);
+        let _pending = Pending { hub: self, id };
         self.emit(HubEvent::ApprovalRequested(Arc::new(Approval {
             id,
             agent_id: agent.id.clone(),
@@ -586,21 +613,27 @@ impl Hub {
             access,
             dry_run,
         })));
-        let result = tokio::time::timeout(Duration::from_secs(120), rx).await;
-        lock(&self.approvals).remove(&id);
-        self.emit(HubEvent::ApprovalResolved(id));
-        match result {
-            Ok(Ok(answer)) => answer,
-            Ok(Err(_)) => Answer::Rejected,
-            Err(_) => Answer::TimedOut,
+        tokio::select! {
+            // The agent gone first: an Approve clicked as it hung up must not run the call.
+            biased;
+            () = gone => Answer::Abandoned,
+            answer = rx => answer.unwrap_or(Answer::Rejected),
+            () = tokio::time::sleep(APPROVAL_TIMEOUT) => Answer::TimedOut,
         }
     }
 
+    /// Answer a request; a request that no longer waits (answered, timed out, its agent
+    /// gone) is left as it ended.
     pub fn resolve_approval(&self, id: u64, approved: bool) {
         let waiting = lock(&self.approvals).remove(&id);
         if let Some(tx) = waiting {
             let _ = tx.send(if approved { Answer::Approved } else { Answer::Rejected });
         }
+    }
+
+    /// Whether a request still waits for an answer.
+    pub fn approval_pending(&self, id: u64) -> bool {
+        lock(&self.approvals).contains_key(&id)
     }
 
     // Kubernetes access shared by all agents
@@ -667,6 +700,21 @@ impl Hub {
     }
 }
 
+/// A request waiting for the user's answer. Dropped when the wait ends, however it ends, and
+/// with the call if the call is dropped while it waits: the request leaves the hub, and the
+/// UI takes its banner down.
+struct Pending<'a> {
+    hub: &'a Hub,
+    id: u64,
+}
+
+impl Drop for Pending<'_> {
+    fn drop(&mut self) {
+        lock(&self.hub.approvals).remove(&self.id);
+        self.hub.emit(HubEvent::ApprovalResolved(self.id));
+    }
+}
+
 /// Whether rules.yaml must be reloaded, from what reading it gave now (its text, None when
 /// missing, or why it can't be read), why it failed last time and the text last loaded.
 /// By content: an edit within the same second as the last one still counts. A read that
@@ -685,6 +733,8 @@ fn rediscovery_due(last: Option<Instant>, now: Instant) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use tokio_util::sync::CancellationToken;
+
     use super::*;
 
     #[test]
@@ -725,9 +775,110 @@ mod tests {
     #[test]
     fn only_a_refusal_says_the_user_refused() {
         assert!(Answer::Rejected.reason().contains("did not approve"));
-        for a in [Answer::TimedOut, Answer::SwitchedOff] {
+        for a in [Answer::TimedOut, Answer::SwitchedOff, Answer::Abandoned] {
             assert!(!a.reason().contains("did not approve"), "{a:?}");
         }
+    }
+
+    fn agent() -> Agent {
+        Agent {
+            id: "a1".into(),
+            name: "claude".into(),
+            token_sha256: String::new(),
+            enabled: true,
+            policy: Policy::default(),
+        }
+    }
+
+    /// A request for approval of a patch, waiting on its own task until `gone` ends.
+    fn ask(hub: &Arc<Hub>, gone: impl Future<Output = ()> + Send + 'static) -> tokio::task::JoinHandle<Answer> {
+        let hub = hub.clone();
+        let access = Access {
+            context: "c".into(),
+            verb: Verb::Patch,
+            resource: "configmaps".into(),
+            resource_aliases: vec![],
+            namespace: Some("app".into()),
+            name: Some("cfg".into()),
+            cluster_scoped: false,
+        };
+        tokio::spawn(async move {
+            hub.request_approval(&agent(), "patch_resource", "patch".into(), access, false, gone).await
+        })
+    }
+
+    /// Lets the request's task run until request `id` waits in the hub.
+    async fn until_pending(hub: &Hub, id: u64) {
+        while !hub.approval_pending(id) {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// The approval events sent so far, as (asked, id): `true` when the request was made,
+    /// `false` when it ended (the UI then takes its banner down).
+    fn approval_events(events: &mut mpsc::UnboundedReceiver<Arc<HubEvent>>) -> Vec<(bool, u64)> {
+        std::iter::from_fn(|| events.try_recv().ok())
+            .filter_map(|e| match &*e {
+                HubEvent::ApprovalRequested(a) => Some((true, a.id)),
+                HubEvent::ApprovalResolved(id) => Some((false, *id)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The agent stopping waiting ends its request at once: the banner goes, the call is
+    /// told it was abandoned, and an Approve clicked after that reaches nothing.
+    #[tokio::test]
+    async fn a_request_ends_when_its_agent_stops_waiting() {
+        let hub = Hub::for_test(vec![agent()]);
+        let mut events = hub.subscribe();
+        let gone = CancellationToken::new();
+        let wait = ask(&hub, gone.clone().cancelled_owned());
+        until_pending(&hub, 1).await;
+        gone.cancel();
+        let answer = tokio::time::timeout(Duration::from_secs(1), wait).await.unwrap().unwrap();
+        assert_eq!(answer, Answer::Abandoned);
+        assert!(!hub.approval_pending(1));
+        assert_eq!(approval_events(&mut events), [(true, 1), (false, 1)]);
+        // A late Approve: no request waits for it, so nothing is sent and nothing changes.
+        hub.resolve_approval(1, true);
+        assert!(lock(&hub.approvals).is_empty());
+        assert!(approval_events(&mut events).is_empty());
+    }
+
+    /// A call dropped while it waits takes its request with it: no banner is left to approve.
+    #[tokio::test]
+    async fn a_dropped_call_takes_its_request_with_it() {
+        let hub = Hub::for_test(vec![agent()]);
+        let mut events = hub.subscribe();
+        let wait = ask(&hub, std::future::pending());
+        until_pending(&hub, 1).await;
+        wait.abort();
+        assert!(wait.await.unwrap_err().is_cancelled());
+        assert!(!hub.approval_pending(1));
+        assert_eq!(approval_events(&mut events), [(true, 1), (false, 1)]);
+        hub.resolve_approval(1, true);
+        assert!(lock(&hub.approvals).is_empty());
+        assert!(approval_events(&mut events).is_empty());
+    }
+
+    /// An answer reaches a request whose agent still waits; given as the agent goes, the
+    /// request is abandoned all the same.
+    #[tokio::test]
+    async fn an_answer_reaches_only_a_request_still_waited_for() {
+        let hub = Hub::for_test(vec![agent()]);
+        let wait = ask(&hub, std::future::pending());
+        until_pending(&hub, 1).await;
+        hub.resolve_approval(1, true);
+        assert_eq!(wait.await.unwrap(), Answer::Approved);
+
+        let gone = CancellationToken::new();
+        let wait = ask(&hub, gone.clone().cancelled_owned());
+        until_pending(&hub, 2).await;
+        hub.resolve_approval(2, true);
+        gone.cancel();
+        assert_eq!(wait.await.unwrap(), Answer::Abandoned);
+        assert!(lock(&hub.approvals).is_empty());
     }
 
     #[test]
