@@ -609,28 +609,23 @@ impl DetailPanel {
         let task = cx.spawn_in(window, async move |this, cx| {
             loop {
                 cx.background_executor().timer(crate::settings::secs(crate::settings::get().detail_refresh)).await;
-                // Hidden (in history): stop log streams, then wait to be shown again.
-                let hidden = this.update(cx, |this, cx| {
-                    let hidden = !crate::app::is_visible(cx.entity_id(), cx);
-                    if hidden && let Some(l) = &this.logs {
+                // Off screen (in history, or its window hidden): wait to be shown again. On each
+                // turn it spends in history, log streams stop too; a hidden window keeps them,
+                // like its shells, until Back puts the page in history.
+                let exec = cx.background_executor().clone();
+                let waited = crate::app::wait_visible_or_away(&this, cx, &exec, |this, cx| {
+                    if let Some(l) = &this.logs {
                         l.update(cx, |l, _| l.pause());
                     }
                     // A node shell pod nobody is connected to is not left running.
-                    if hidden
-                        && this.node_shell.is_some()
-                        && !this.terminal.as_ref().is_some_and(|t| t.read(cx).connected())
-                    {
+                    if this.node_shell.is_some() && !this.terminal.as_ref().is_some_and(|t| t.read(cx).connected()) {
                         this.end_node_shell(cx);
                     }
-                    hidden
-                });
-                match hidden {
-                    Err(_) => break,
-                    Ok(true) => {
-                        let exec = cx.background_executor().clone();
-                        if !crate::app::wait_visible(&this, cx, &exec).await {
-                            break;
-                        }
+                })
+                .await;
+                match waited {
+                    None => break,
+                    Some(true) => {
                         let _ = this.update(cx, |this, cx| {
                             if this.tab == DetailTab::Logs
                                 && let Some(l) = &this.logs
@@ -639,7 +634,7 @@ impl DetailPanel {
                             }
                         });
                     }
-                    Ok(false) => {}
+                    Some(false) => {}
                 }
                 let started = std::time::Instant::now();
                 let value = match k8s::get_object_opts(client.clone(), obj.clone(), true).await {

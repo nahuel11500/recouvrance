@@ -380,8 +380,8 @@ impl AppView {
                 .when_some(self.problems.shown(), |d, (n, critical)| {
                     d.child(badge(n, if critical { danger } else { warning }))
                 })
-                .when_some(self.problems.gaps(), |d, gaps| {
-                    d.tooltip(move |w, cx| component::tooltip::Tooltip::new(gaps.clone()).build(w, cx))
+                .when_some(self.problems.tooltip(), |d, tip| {
+                    d.tooltip(move |w, cx| component::tooltip::Tooltip::new(tip.text()).build(w, cx))
                 }),
             nav_row("nav-timeline", Lucide::ClockArrowDown, "Timeline", matches!(route, Route::Timeline(_)))
                 .on_click(cx.listener(|this, _, window, cx| this.open_timeline(window, cx))),
