@@ -136,7 +136,7 @@ impl Call {
                 Ok(text)
             }
             Err(e) => {
-                let msg = format!("{e:#}");
+                let msg = k8s::error_chain(&e);
                 self.record(Decision::Failed, msg.clone(), 0);
                 Err(msg)
             }

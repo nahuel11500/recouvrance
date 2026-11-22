@@ -56,3 +56,10 @@ thousands of pods) in a few hundred megabytes.
 - Actions your **RBAC** forbids are disabled (`SelfSubjectAccessReview`).
 - **Agents** go through the hub: rules (deny, ask, allow), approvals, a rate limit, an audit log and
   a kill switch. Write mode and protected contexts don't apply to them: only their rules do.
+- **Login commands keep their secrets.** kube's error for a failed exec plugin holds its whole
+  command line and its output; each client replaces it, when it is built and on every request
+  (a token refresh runs the plugin again), by the program's file name, taken from the kubeconfig,
+  and its exit code (`k8s::login`). A plugin that cannot start is reported with its name too. The
+  last line the plugin wrote to stderr is added when the kubeconfig sets `interactiveMode: Never`:
+  kube keeps stderr only then, and otherwise the plugin writes to the terminal Recouvrance was
+  started from. Pages, agents and the audit log only ever get that.
