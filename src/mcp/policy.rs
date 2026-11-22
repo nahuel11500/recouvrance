@@ -666,6 +666,8 @@ pub(super) mod tests {
             agent: "a".into(),
             tool: "list_resources".into(),
             summary: String::new(),
+            detail: None,
+            preview: None,
             access: pods.clone(),
             dry_run: false,
         };
@@ -802,6 +804,8 @@ pub(super) mod tests {
             agent: "a".into(),
             tool: "rollout_restart".into(),
             summary: String::new(),
+            detail: None,
+            preview: None,
             access: access("c1", "restart", "deployments.apps", Some("team"), Some("web")),
             dry_run: false,
         };
@@ -854,6 +858,8 @@ pub(super) mod tests {
             agent: "a".into(),
             tool: tool.into(),
             summary: String::new(),
+            detail: None,
+            preview: None,
             access: access("c1", verb, "pods", Some("team"), name),
             dry_run: false,
         };
@@ -1058,6 +1064,8 @@ pub(crate) mod properties {
                 agent: "agent".into(),
                 tool: "get_resource".into(),
                 summary: String::new(),
+                detail: None,
+                preview: None,
                 access: a.clone(),
                 dry_run,
             };

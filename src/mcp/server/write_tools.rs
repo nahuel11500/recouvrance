@@ -15,6 +15,7 @@ use std::sync::Arc;
 use crate::k8s;
 use crate::k8s::Kind;
 use crate::k8s::argo::diagnosis::{self, Diagnosis, DriftRead, MayRead, Res};
+use crate::mcp::preview::Plan;
 use crate::mcp::{Mode, Policy, Verb};
 
 #[tool_router(router = write_tools, vis = "pub(super)")]
@@ -51,6 +52,13 @@ impl KubeMcp {
         let mut call = self.begin(&parts, "scale", args)?;
         let (client, kind) = self.kind(&call, &p.context, &p.kind).await?;
         let access = access_for(&kind, &p.context, Verb::Scale, Some(p.namespace.clone()), Some(p.name.clone()));
+        call.plan = Some(Plan::Scale {
+            client: client.clone(),
+            kind: kind.clone(),
+            ns: p.namespace.clone(),
+            name: p.name.clone(),
+            replicas: p.replicas,
+        });
         self.authorize(&mut call, &access).await?;
         self.recheck(&mut call, &access)?;
         call.finish(k8s::scale(client, kind, Some(p.namespace), p.name, p.replicas, p.dry_run.unwrap_or(false)).await)
@@ -88,6 +96,13 @@ impl KubeMcp {
         let (client, kind) = self.kind(&call, &p.context, &p.kind).await?;
         require_ns(&call, &kind, p.namespace.as_deref())?;
         let access = access_for(&kind, &p.context, Verb::Patch, p.namespace.clone(), Some(p.name.clone()));
+        call.plan = Some(Plan::Patch {
+            client: client.clone(),
+            kind: kind.clone(),
+            ns: p.namespace.clone().filter(|_| kind.namespaced),
+            name: p.name.clone(),
+            patch: kube::api::Patch::Merge(p.patch.clone()),
+        });
         self.authorize(&mut call, &access).await?;
         self.recheck(&mut call, &access)?;
         call.finish(k8s::merge_patch(client, kind, p.namespace, p.name, p.patch, p.dry_run.unwrap_or(false)).await)
@@ -111,6 +126,7 @@ impl KubeMcp {
         if let Some(args) = call.args.as_object_mut() {
             args.insert("objects".into(), json!(manifest_objects(&planned)));
         }
+        call.plan = Some(Plan::Apply { client: client.clone(), objects: planned.clone() });
         // Each object is approved on its own: approving one does not cover another.
         let mut approved = Vec::new();
         for (kind, ns, name, _) in &planned {
@@ -241,6 +257,14 @@ impl KubeMcp {
             return self.argo_diagnose(call, client, kind, &p.context, &p.namespace, &p.name).await;
         }
         let access = access_for(&kind, &p.context, Verb::Patch, Some(p.namespace.clone()), Some(p.name.clone()));
+        if p.action == "sync" {
+            call.plan = Some(Plan::Sync {
+                client: client.clone(),
+                kind: kind.clone(),
+                ns: p.namespace.clone(),
+                name: p.name.clone(),
+            });
+        }
         self.authorize(&mut call, &access).await?;
         self.recheck(&mut call, &access)?;
         let (ns, name) = (Some(p.namespace), p.name);
@@ -268,6 +292,12 @@ impl KubeMcp {
         let (client, kind) = self.kind(&call, &p.context, &p.kind).await?;
         require_ns(&call, &kind, p.namespace.as_deref())?;
         let access = access_for(&kind, &p.context, Verb::Delete, p.namespace.clone(), Some(p.name.clone()));
+        call.plan = Some(Plan::Delete {
+            client: client.clone(),
+            kind: kind.clone(),
+            ns: p.namespace.clone().filter(|_| kind.namespaced),
+            name: p.name.clone(),
+        });
         self.authorize(&mut call, &access).await?;
         self.recheck(&mut call, &access)?;
         call.finish(k8s::delete(client, kind, p.namespace, p.name, None, p.dry_run.unwrap_or(false)).await)

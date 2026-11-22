@@ -23,7 +23,8 @@ use rmcp::transport::streamable_http_server::{
 use rmcp::{ServerHandler, prompt, prompt_handler, prompt_router, schemars, tool_handler};
 use serde::Deserialize;
 
-use super::{Access, Agent, Answer, AuditEntry, Decision, Hub, HubEvent, Mode, Policy, Verb};
+use super::preview::{self, Plan};
+use super::{Access, Agent, Answer, Approval, AuditEntry, Decision, Hub, HubEvent, Mode, Policy, Preview, Verb};
 use crate::k8s::{self, Kind, TaskGuard};
 
 pub(crate) use gone::Gone;
@@ -71,6 +72,11 @@ struct Call {
     session: Option<String>,
     /// More for the approval banner than the arguments show (a manifest's objects).
     approval_detail: Option<String>,
+    /// How to work out what the call will change, should it wait for an approval.
+    plan: Option<Plan>,
+    /// What the call will change, worked out once, before its first approval: the banner
+    /// shows it and the activity log keeps it.
+    preview: Option<Preview>,
 }
 
 impl Call {
@@ -105,6 +111,7 @@ impl Call {
             duration_ms: self.start.elapsed().as_millis() as u64,
             result_bytes,
             session: self.session.clone(),
+            change: self.preview.as_ref().map(Preview::text),
         });
     }
 
@@ -386,6 +393,8 @@ impl KubeMcp {
             rule: None,
             session,
             approval_detail: None,
+            plan: None,
+            preview: None,
         };
         self.ensure_active(&call)?;
         if !self.hub.take_call(&call.agent.id, call.agent.policy.max_calls_per_minute) {
@@ -438,71 +447,91 @@ impl KubeMcp {
         any_namespace: bool,
         list: bool,
     ) -> Result<(), String> {
-        // The rules may have changed since the call started (or since its last check).
-        self.reload_rules(call);
-        self.ensure_active(call)?;
         let decide = |call: &Call| {
             if any_namespace { call.policy().decide_any_namespace(access) } else { call.policy().decide(access) }
         };
-        let verdict = decide(call);
-        match verdict.mode {
-            Mode::Allow => {
-                call.allowed_by(verdict.rule);
-                Ok(())
+        // A list can show its allowed rows without approval (Ask rows hidden).
+        let fallback = |call: &Call| if list { call.policy().allow_somewhere(access) } else { None };
+        loop {
+            // The rules may have changed since the call started (or since its last check, or
+            // while what it will change was worked out).
+            self.reload_rules(call);
+            self.ensure_active(call)?;
+            let verdict = decide(call);
+            match verdict.mode {
+                Mode::Allow => {
+                    call.allowed_by(verdict.rule);
+                    return Ok(());
+                }
+                Mode::Deny => {
+                    return Err(call.deny(format!("{} — {}", describe(access), call.rule_label(verdict.rule))));
+                }
+                Mode::Ask => {}
             }
-            Mode::Deny => Err(call.deny(format!("{} — {}", describe(access), call.rule_label(verdict.rule)))),
-            Mode::Ask => {
-                // A list can show its allowed rows without approval (Ask rows hidden).
-                let fallback = |call: &Call| if list { call.policy().allow_somewhere(access) } else { None };
-                if self.hub.headless() {
-                    if let Some(rule) = fallback(call) {
-                        call.allowed_by(Some(rule));
-                        return Ok(());
-                    }
-                    return Err(call.deny(format!(
-                        "{} needs approval in the Recouvrance window ({}); run the app, or add an Allow rule",
-                        describe(access),
-                        call.rule_label(verdict.rule)
-                    )));
-                }
-                let mut summary =
-                    format!("{}{}  [{}]", describe(access), arg_details(&call.args), call.rule_label(verdict.rule));
-                if let Some(detail) = &call.approval_detail {
-                    summary.push('\n');
-                    summary.push_str(detail);
-                }
-                let dry_run = call.args.get("dry_run").and_then(serde_json::Value::as_bool).unwrap_or(false);
-                let answer = self
-                    .hub
-                    .request_approval(&call.agent, call.tool, summary, access.clone(), dry_run, call.gone.wait())
-                    .await;
-                // Access may have been switched off, or the rules changed, while the request waited.
-                self.reload_rules(call);
-                if answer == Answer::Approved {
-                    self.ensure_active(call)?;
-                    let now = decide(call);
-                    if now.mode == Mode::Deny {
-                        return Err(call.deny(format!("{} — {}", describe(access), call.rule_label(now.rule))));
-                    }
-                    call.approved = true;
-                    call.allowed_by(now.rule);
-                    call.approved_rules = if any_namespace {
-                        call.policy().asks_any_namespace(access)
-                    } else {
-                        call.policy().asks(access)
-                    };
-                    Ok(())
-                } else if !matches!(answer, Answer::SwitchedOff | Answer::Abandoned)
-                    && let Some(rule) = fallback(call)
-                {
-                    call.record(Decision::Rejected, format!("{}; showing the allowed rows only", answer.reason()), 0);
+            if self.hub.headless() {
+                if let Some(rule) = fallback(call) {
                     call.allowed_by(Some(rule));
-                    self.ensure_active(call)
-                } else {
-                    call.record(Decision::Rejected, answer.reason().into(), 0);
-                    Err(format!("Rejected: {}", answer.reason()))
+                    return Ok(());
                 }
+                return Err(call.deny(format!(
+                    "{} needs approval in the Recouvrance window ({}); run the app, or add an Allow rule",
+                    describe(access),
+                    call.rule_label(verdict.rule)
+                )));
             }
+            // What the call will change, worked out once, before its first approval
+            // (`apply_manifest` asks for each object): allowed calls never get here and pay
+            // nothing for it. It takes `preview::TIMEOUT` at most, then the call is decided
+            // again: agent access, the agent or its rules may have changed meanwhile.
+            if call.preview.is_none()
+                && let Some(plan) = &call.plan
+            {
+                let gone = call.gone.clone();
+                let worked_out = tokio::select! {
+                    p = preview::preview(plan) => p,
+                    // Nobody is left to ask for.
+                    () = gone.wait() => return Err(call.deny(Answer::Abandoned.reason())),
+                };
+                call.preview = Some(worked_out);
+                continue;
+            }
+            let summary =
+                format!("{}{}  [{}]", describe(access), arg_details(&call.args), call.rule_label(verdict.rule));
+            let request = Approval {
+                id: 0,
+                agent_id: call.agent.id.clone(),
+                agent: call.agent.name.clone(),
+                tool: call.tool.to_string(),
+                summary,
+                detail: call.approval_detail.clone(),
+                preview: call.preview.clone(),
+                access: access.clone(),
+                dry_run: call.args.get("dry_run").and_then(serde_json::Value::as_bool).unwrap_or(false),
+            };
+            let answer = self.hub.request_approval(request, call.gone.wait()).await;
+            // Access may have been switched off, or the rules changed, while the request waited.
+            self.reload_rules(call);
+            return if answer == Answer::Approved {
+                self.ensure_active(call)?;
+                let now = decide(call);
+                if now.mode == Mode::Deny {
+                    return Err(call.deny(format!("{} — {}", describe(access), call.rule_label(now.rule))));
+                }
+                call.approved = true;
+                call.allowed_by(now.rule);
+                call.approved_rules =
+                    if any_namespace { call.policy().asks_any_namespace(access) } else { call.policy().asks(access) };
+                Ok(())
+            } else if !matches!(answer, Answer::SwitchedOff | Answer::Abandoned)
+                && let Some(rule) = fallback(call)
+            {
+                call.record(Decision::Rejected, format!("{}; showing the allowed rows only", answer.reason()), 0);
+                call.allowed_by(Some(rule));
+                self.ensure_active(call)
+            } else {
+                call.record(Decision::Rejected, answer.reason().into(), 0);
+                Err(format!("Rejected: {}", answer.reason()))
+            };
         }
     }
 
@@ -1436,6 +1465,8 @@ mod tests {
             rule: None,
             session: None,
             approval_detail: None,
+            plan: None,
+            preview: None,
         }
     }
 
@@ -1479,6 +1510,105 @@ mod tests {
             assert_eq!(mcp.stale_reason(&mut call, &access), gone_reason, "cancel_request={cancel_request}");
             assert_eq!(stop(), gone_reason, "cancel_request={cancel_request}");
         }
+    }
+
+    /// A cluster holding the ConfigMap `app/cfg` (`a: "1"`): a GET reads it, a patch answers
+    /// with `a: "2"`. Records each request as (method, path and query).
+    #[derive(Clone, Default)]
+    struct OneConfigMap(Arc<std::sync::Mutex<Vec<(String, String)>>>);
+
+    impl OneConfigMap {
+        fn requests(&self) -> Vec<(String, String)> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    impl tower::Service<http::Request<kube::client::Body>> for OneConfigMap {
+        type Response = http::Response<http_body_util::Full<bytes::Bytes>>;
+        type Error = std::convert::Infallible;
+        type Future = std::future::Ready<Result<Self::Response, Self::Error>>;
+
+        fn poll_ready(&mut self, _: &mut std::task::Context<'_>) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, req: http::Request<kube::client::Body>) -> Self::Future {
+            let a = if req.method() == http::Method::PATCH { "2" } else { "1" };
+            let body = json!({"apiVersion": "v1", "kind": "ConfigMap",
+                "metadata": {"name": "cfg", "namespace": "app", "resourceVersion": "7"}, "data": {"a": a}});
+            let target = req.uri().path_and_query().map_or_default(ToString::to_string);
+            self.0.lock().unwrap().push((req.method().to_string(), target));
+            std::future::ready(Ok(http::Response::new(http_body_util::Full::new(bytes::Bytes::from(body.to_string())))))
+        }
+    }
+
+    /// What a patch will change is worked out before its approval is asked for, from a dry
+    /// run, and the approval shows it; an allowed patch reads nothing more.
+    #[tokio::test]
+    async fn an_approval_shows_what_the_patch_will_change() {
+        use futures::StreamExt as _;
+        let cms = kind("", "v1", "ConfigMap", "configmaps", true);
+        let access = access_for(&cms, "c", Verb::Patch, Some("app".into()), Some("cfg".into()));
+        let cluster = OneConfigMap::default();
+        let plan = || Plan::Patch {
+            client: kube::Client::new(cluster.clone(), "default"),
+            kind: cms.clone(),
+            ns: Some("app".into()),
+            name: "cfg".into(),
+            patch: kube::api::Patch::Merge(json!({"data": {"a": "2"}})),
+        };
+        let agent = |effect: Mode| Agent {
+            id: "a1".into(),
+            name: "claude".into(),
+            token_sha256: String::new(),
+            enabled: true,
+            policy: Policy {
+                rules: vec![crate::mcp::Rule {
+                    effect,
+                    verbs: vec!["patch".into()],
+                    contexts: vec!["*".into()],
+                    ..crate::mcp::Rule::default()
+                }],
+                ..Policy::default()
+            },
+        };
+        // Allowed: nothing is worked out, nothing more is read.
+        let allowed = agent(Mode::Allow);
+        let hub = Hub::for_test(vec![allowed.clone()]);
+        let mut call = started_call(&hub, &allowed, Gone::default());
+        call.plan = Some(plan());
+        KubeMcp::new(hub).authorize(&mut call, &access).await.unwrap();
+        assert_eq!(call.preview, None);
+        assert!(cluster.requests().is_empty(), "{:?}", cluster.requests());
+        // Asked: worked out first, and shown with the request.
+        let asker = agent(Mode::Ask);
+        let hub = Hub::for_test(vec![asker.clone()]);
+        let mut events = hub.subscribe();
+        let mut call = started_call(&hub, &asker, Gone::default());
+        call.plan = Some(plan());
+        let mcp = KubeMcp::new(hub.clone());
+        let approve = async {
+            while let Some(event) = events.next().await {
+                if let HubEvent::ApprovalRequested(a) = &*event {
+                    hub.resolve_approval(a.id, true);
+                    return a.preview.clone();
+                }
+            }
+            None
+        };
+        let (authorized, shown) = tokio::join!(mcp.authorize(&mut call, &access), approve);
+        authorized.unwrap();
+        let shown = shown.expect("the approval shows what will change");
+        let text = shown.text();
+        assert!(text.contains("ConfigMap app/cfg: changed") && text.contains("data.a: 1 → 2"), "{text}");
+        assert_eq!(call.preview.as_ref(), Some(&shown));
+        let requests = cluster.requests();
+        assert_eq!(requests.len(), 2, "{requests:?}");
+        assert!(
+            requests.iter().any(|(m, t)| m == "GET" && t == "/api/v1/namespaces/app/configmaps/cfg"),
+            "{requests:?}"
+        );
+        assert!(requests.iter().any(|(m, t)| m == "PATCH" && t.contains("dryRun=All")), "{requests:?}");
     }
 
     /// A port busy at start is tried again, and the server listens once it is free (#794).

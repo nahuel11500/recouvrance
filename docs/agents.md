@@ -55,6 +55,18 @@ effect means Deny, and a missing list means `*` in a Deny or Ask, none in an All
 every object (kind, namespace/name) and the YAML that will be applied, a Secret's values masked; the
 activity log keeps each object with a hash of that YAML, and the objects already applied when a call
 is cut off.
+Before asking, Recouvrance works out what the call will change, and the banner shows it under the
+request: for `scale`, the replicas now and after; for `patch_resource`, `set_image` and
+`apply_manifest`, each field that changes with its value now and after, then the diff, from a
+server-side dry run of the same request (it changes nothing; a dry run the server refuses is said,
+and so is a field another manager owns, on which `apply_manifest` fails); for a `gitops` `sync`, the
+revision deployed and the one it moves to, auto-sync, what is out of sync, and what is no longer in
+git (left in place: the sync Recouvrance starts doesn't prune); for `delete_resource`, what goes with
+the object (a Deployment's ReplicaSets and pods, everything in a namespace, every object of a CRD's
+kind; a Job's pods stay). A Secret's values never show, only which changed. It takes 5 seconds at
+most: past that, or when it fails, the banner says the preview isn't available, and the request is
+asked all the same. Calls an Allow rule lets through are not worked out. The activity log keeps what
+the banner showed with the call.
 The *Always allow this* and *Allow for 1h* offers are left out where no rule can be that narrow:
 exec (a rule cannot pin the command), patches and GitOps actions (nor the patch), scale (nor the
 replica count), `apply_manifest` (nor the content), requests other than lists with no object name
