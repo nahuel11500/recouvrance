@@ -29,7 +29,7 @@ Recouvrance is one Rust binary: a [gpui](https://github.com/zed-industries/zed) 
 | Path | What |
 |---|---|
 | `src/main.rs` | Entry point: the window, `serve` (headless MCP), `agent-create` |
-| `src/app/` | The main window: contexts, sidebar, resource list page, tabs and history, theme |
+| `src/app/` | The main window: contexts, sidebar, resource list page, tabs and history, theme, key bindings and the macOS menu bar |
 | `src/table/` | The resource table (server-side columns, usage bars, links) and its filter language |
 | `src/details/` | A detail page: tabs, actions and their confirmations, logs, compare, related data |
 | `src/overview/` | The Overview tab, per kind: pods, workloads, nodes, networking, configuration, RBAC |

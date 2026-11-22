@@ -32,6 +32,7 @@ mod contexts;
 mod demo;
 mod kind_filters;
 mod live_list;
+mod menus;
 mod navigation;
 mod overviews;
 mod pages;
@@ -45,8 +46,15 @@ mod theme;
 mod view_cache;
 mod watch;
 
+pub use menus::init as init_menus;
+#[cfg(test)]
+pub(crate) use shortcuts::unbound_keys;
+pub(crate) use shortcuts::with_keys;
 use sidebar::section_icon;
 pub(crate) use theme::*;
+
+/// macOS takes ⌘ for the app's shortcuts where Linux takes Ctrl, and has a menu bar.
+pub(crate) const MAC: bool = cfg!(target_os = "macos");
 
 /// Where the main area is; kept in a history for back/forward.
 #[derive(Clone)]
@@ -172,8 +180,9 @@ struct SharedHub(Arc<Hub>, #[allow(dead_code)] Arc<TaskGuard>);
 
 impl Global for SharedHub {}
 
-/// Open a main window (at startup and with Ctrl+Shift+N).
-pub fn open_main_window(cx: &mut App) {
+/// Open a main window: at startup, with Ctrl+Shift+N (⇧⌘N), and on macOS from the Dock or the
+/// menu bar when none is open.
+pub fn open_main_window(cx: &mut App) -> Option<Entity<AppView>> {
     let bounds = Bounds::centered(None, size(px(1500.), px(920.)), cx);
     // The app draws its own title bar (GNOME on Wayland has no server-side
     // decorations): dragging, window controls and resize borders.
@@ -184,8 +193,22 @@ pub fn open_main_window(cx: &mut App) {
         app_id: Some("recouvrance".into()),
         ..TitleBar::window_options()
     };
-    if let Err(e) = open_window(options, cx, |window, cx| cx.new(|cx| AppView::new(window, cx))) {
-        eprintln!("could not open a window: {e:#}");
+    match open_window(options, cx, |window, cx| cx.new(|cx| AppView::new(window, cx))) {
+        Ok((_, view)) => Some(view),
+        Err(e) => {
+            eprintln!("could not open a window: {e:#}");
+            None
+        }
+    }
+}
+
+/// The Dock icon was clicked with no window shown. macOS keeps the app running when its last
+/// window closes: show a minimized window again, or open one.
+pub fn reopen(cx: &mut App) {
+    if let Some(&handle) = cx.windows().first() {
+        let _ = handle.update(cx, |_, window, _| window.activate_window());
+    } else {
+        open_main_window(cx);
     }
 }
 
@@ -195,6 +218,16 @@ gpui_kit::actions!(
         NewWindow,
         NewTab,
         CloseTab,
+        CloseWindow,
+        MinimizeWindow,
+        ZoomWindow,
+        Quit,
+        HideApp,
+        HideOtherApps,
+        ShowAllApps,
+        ShowAbout,
+        OpenHelp,
+        ReportIssue,
         NextTab,
         PrevTab,
         RowOpenTab,
@@ -232,31 +265,54 @@ gpui_kit::actions!(
 );
 
 pub fn bind_keys(cx: &mut App) {
-    cx.bind_keys(key_bindings());
+    cx.bind_keys(key_bindings_on(MAC));
 }
 
-fn key_bindings() -> Vec<KeyBinding> {
-    vec![
-        KeyBinding::new("ctrl-k", OpenPalette, None),
-        KeyBinding::new("ctrl-shift-n", NewWindow, None),
-        KeyBinding::new("ctrl-t", NewTab, None),
-        KeyBinding::new("ctrl-w", CloseTab, None),
+/// The app's key bindings on macOS (`mac`) or Linux. A shortcut that takes Ctrl on Linux takes ⌘
+/// on macOS, where Ctrl keys then reach the shell in a terminal; Ctrl+Tab and Ctrl+Page Up/Down
+/// switch tabs on both, as in browsers. macOS also gets the keys every Mac app has (⌘Q, ⌘,, ⌘M…)
+/// and ⌘[ / ⌘] for back and forward instead of Alt+arrows, which move by word in its shells.
+fn key_bindings_on(mac: bool) -> Vec<KeyBinding> {
+    // gpui's `secondary-` (⌘ on macOS, Ctrl elsewhere), spelled out for the platform asked rather
+    // than the one gpui is built for: the macOS keymap can be checked on Linux too.
+    let key = |keys: &str| keys.replace("secondary-", if mac { "cmd-" } else { "ctrl-" });
+    let mut bindings = Vec::new();
+    if mac {
+        // First: the menu bar shows an action's first binding (⌘, for Settings, ⌘/ for the list).
+        bindings.extend([
+            KeyBinding::new("cmd-q", Quit, None),
+            KeyBinding::new("cmd-,", GoSettings, None),
+            KeyBinding::new("cmd-shift-w", CloseWindow, None),
+            KeyBinding::new("cmd-m", MinimizeWindow, None),
+            KeyBinding::new("cmd-h", HideApp, None),
+            KeyBinding::new("cmd-alt-h", HideOtherApps, None),
+            KeyBinding::new("cmd-/", ShowShortcuts, None),
+            KeyBinding::new("cmd-[", GoBack, None),
+            KeyBinding::new("cmd-]", GoForward, None),
+        ]);
+    } else {
+        bindings.extend([KeyBinding::new("alt-left", GoBack, None), KeyBinding::new("alt-right", GoForward, None)]);
+    }
+    bindings.extend([
+        KeyBinding::new(&key("secondary-k"), OpenPalette, None),
+        KeyBinding::new(&key("secondary-shift-n"), NewWindow, None),
+        KeyBinding::new(&key("secondary-t"), NewTab, None),
+        KeyBinding::new(&key("secondary-w"), CloseTab, None),
         KeyBinding::new("ctrl-tab", NextTab, None),
         KeyBinding::new("ctrl-pagedown", NextTab, None),
         KeyBinding::new("ctrl-shift-tab", PrevTab, None),
         KeyBinding::new("ctrl-pageup", PrevTab, None),
-        KeyBinding::new("ctrl-b", ToggleSidebar, None),
-        KeyBinding::new("ctrl-j", ToggleAssistant, None),
+        KeyBinding::new(&key("secondary-b"), ToggleSidebar, None),
+        KeyBinding::new(&key("secondary-j"), ToggleAssistant, None),
+        // Before F5, so the macOS menu bar shows ⌘R for Refresh, as Mac apps do.
+        KeyBinding::new(&key("secondary-r"), RefreshPage, None),
         KeyBinding::new("f5", RefreshPage, None),
-        KeyBinding::new("ctrl-r", RefreshPage, None),
-        KeyBinding::new("ctrl-=", ZoomIn, None),
-        KeyBinding::new("ctrl-+", ZoomIn, None),
-        KeyBinding::new("ctrl-shift-=", ZoomIn, None),
-        KeyBinding::new("ctrl--", ZoomOut, None),
-        KeyBinding::new("ctrl-0", ZoomReset, None),
-        KeyBinding::new("alt-left", GoBack, None),
-        KeyBinding::new("alt-right", GoForward, None),
-        KeyBinding::new("ctrl-f", FocusFilter, Some("App")),
+        KeyBinding::new(&key("secondary-="), ZoomIn, None),
+        KeyBinding::new(&key("secondary-+"), ZoomIn, None),
+        KeyBinding::new(&key("secondary-shift-="), ZoomIn, None),
+        KeyBinding::new(&key("secondary--"), ZoomOut, None),
+        KeyBinding::new(&key("secondary-0"), ZoomReset, None),
+        KeyBinding::new(&key("secondary-f"), FocusFilter, Some("App")),
         // Inputs and dialogs handle Escape themselves (deeper contexts win).
         KeyBinding::new("escape", EscapeBack, Some("App")),
         // Only while the table has focus, so typing "/" elsewhere is untouched.
@@ -274,7 +330,8 @@ fn key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("g s", GoSettings, Some(shortcuts::OUTSIDE_TEXT)),
         KeyBinding::new("j", base::actions::SelectDown, Some(shortcuts::TABLE_OUTSIDE_TEXT)),
         KeyBinding::new("k", base::actions::SelectUp, Some(shortcuts::TABLE_OUTSIDE_TEXT)),
-    ]
+    ]);
+    bindings
 }
 
 pub struct AppView {
@@ -739,13 +796,15 @@ mod tests {
 
     #[test]
     fn f5_reaches_the_terminal() {
-        let keymap = Keymap::new(super::key_bindings());
-        let f5 = [Keystroke::parse("f5").unwrap()];
-        let app = KeyContext::parse("App").unwrap();
-        let (bindings, _) = keymap.bindings_for_input(&f5, std::slice::from_ref(&app));
-        assert_eq!(bindings.len(), 1);
-        let (bindings, _) = keymap.bindings_for_input(&f5, &[app, KeyContext::parse("Terminal").unwrap()]);
-        assert!(bindings.is_empty());
+        for mac in [false, true] {
+            let keymap = Keymap::new(super::key_bindings_on(mac));
+            let f5 = [Keystroke::parse("f5").unwrap()];
+            let app = KeyContext::parse("App").unwrap();
+            let (bindings, _) = keymap.bindings_for_input(&f5, std::slice::from_ref(&app));
+            assert_eq!(bindings.len(), 1);
+            let (bindings, _) = keymap.bindings_for_input(&f5, &[app, KeyContext::parse("Terminal").unwrap()]);
+            assert!(bindings.is_empty());
+        }
     }
 }
 

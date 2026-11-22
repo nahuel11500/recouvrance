@@ -8,7 +8,7 @@ use gpui_kit::component::{ActiveTheme as _, IconName, Sizable as _, h_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use super::{AppView, Route, TabState, VisiblePages};
+use super::{AppView, MAC, Route, TabState, VisiblePages, with_keys};
 use crate::k8s::Kind;
 
 impl AppView {
@@ -70,6 +70,16 @@ impl AppView {
         let next = std::mem::take(&mut self.tabs[ix]);
         self.active_tab = ix;
         self.load_tab(next, window, cx);
+    }
+
+    /// Close the tab shown (Ctrl+W). ⌘W on macOS closes the window at its last tab, as Mac apps
+    /// do; Linux keeps its last tab.
+    pub(super) fn close_tab_or_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if closes_window(self.tabs.len(), MAC) {
+            window.remove_window();
+        } else {
+            self.close_tab(self.active_tab, window, cx);
+        }
     }
 
     pub fn close_tab(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -179,7 +189,7 @@ impl AppView {
                             .xsmall()
                             .ghost()
                             .icon(IconName::Close)
-                            .tooltip("Close tab (Ctrl+W)")
+                            .tooltip(with_keys("Close tab ({secondary-w})"))
                             .on_click(cx.listener(move |this, _, w, cx| {
                                 this.close_tab(i, w, cx);
                                 cx.stop_propagation();
@@ -192,7 +202,7 @@ impl AppView {
                     .xsmall()
                     .ghost()
                     .icon(Lucide::Plus)
-                    .tooltip("New tab (Ctrl+T)")
+                    .tooltip(with_keys("New tab ({secondary-t})"))
                     .on_click(cx.listener(|this, _, w, cx| this.new_tab(None, w, cx))),
             );
         // A plain mouse wheel scrolls the tabs sideways (it has no other axis).
@@ -274,6 +284,11 @@ impl AppView {
     }
 }
 
+/// Whether closing the tab shown closes its window instead: at the last tab, on macOS.
+fn closes_window(tabs: usize, mac: bool) -> bool {
+    mac && tabs < 2
+}
+
 /// The kind a tab shows, when it is not `current`: its route's, else the one it kept.
 /// Taken from the route, `apply_route` has nothing left to switch (and restart).
 fn new_kind(route: &Route, kept: Option<Kind>, current: Option<&Kind>) -> Option<Kind> {
@@ -286,7 +301,15 @@ fn new_kind(route: &Route, kept: Option<Kind>, current: Option<&Kind>) -> Option
 
 #[cfg(test)]
 mod tests {
-    use super::{Kind, Route, new_kind};
+    use super::{Kind, Route, closes_window, new_kind};
+
+    #[test]
+    fn cmd_w_closes_the_window_at_the_last_tab_on_macos_only() {
+        assert!(closes_window(1, true), "macOS: the last tab's ⌘W closes the window");
+        assert!(!closes_window(2, true), "macOS: with two tabs, ⌘W closes one");
+        assert!(!closes_window(1, false), "Linux keeps its last tab");
+        assert!(!closes_window(3, false));
+    }
 
     fn kind(k: &str) -> Kind {
         Kind::fake("", k)
