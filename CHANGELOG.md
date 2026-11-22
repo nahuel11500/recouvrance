@@ -26,6 +26,10 @@ and versions follow [Semantic Versioning](https://semver.org/).
 - *(k8s)* A failed login command shows its name and error, never its arguments (#854)
 - *(mcp)* Activity counts every write tool and no dry run, and my_permissions lists every dry-run tool (#847)
 - *(timeline)* Read every page of Warning events, so no namespace is left out (#849)
+- *(k8s)* A proxy URL's user and password never show in connection errors (#867)
+- *(k8s)* A kubeconfig that fails to parse is reported by file, line and column, without its content (#870)
+- *(mcp)* A session stays open while a long call runs (#869)
+- *(deps)* Bump url to 2.5.9 for RUSTSEC-2026-0592 (#898)
 
 ### Performance
 
