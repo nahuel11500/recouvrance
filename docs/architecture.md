@@ -80,3 +80,8 @@ them after 1.4 s ([measured](COMPARISON.md#measured)).
   last line the plugin wrote to stderr is added when the kubeconfig sets `interactiveMode: Never`:
   kube keeps stderr only then, and otherwise the plugin writes to the terminal Recouvrance was
   started from. Pages, agents and the audit log only ever get that.
+- **Proxy passwords stay out of errors.** kube's error for a proxy it can't use prints the proxy's
+  URL whole, user and password included. The client's build error puts that URL back without
+  them, scheme or not (`user:password@host:1080` from `HTTPS_PROXY` reads as a URL to kube, not
+  to a text), and leaves out the user and password of any other URL in its text, as of one in the
+  login plugin's stderr line (`k8s::login`).

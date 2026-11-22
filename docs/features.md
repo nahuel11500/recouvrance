@@ -6,7 +6,10 @@
   be. It adds the last line the plugin wrote to stderr when the kubeconfig sets
   `interactiveMode: Never`; otherwise the plugin writes to the terminal Recouvrance was started
   from. A plugin that cannot start, often because it is not on the `PATH` the app was started
-  with, is reported with its name.
+  with, is reported with its name. A proxy the app can't use (the kubeconfig's `proxy-url`, or
+  `HTTPS_PROXY`, with a scheme other than `http`, `https` or `socks5`, or none) is named by its
+  scheme, host and port, never its user and password; neither shows for any other URL in a
+  connection error.
 - **Sidebar**: the filter at its top finds pages and resource types (by name, kind or API group).
   Pages, saved views, favorites and types scroll together; a section folds with a click on its
   name (kept for next time) and says how many types it holds. Port forwards fold into one row at
