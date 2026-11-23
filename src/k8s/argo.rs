@@ -30,7 +30,7 @@ const INSTANCE_LABEL: &str = "app.kubernetes.io/instance";
 /// How Applications name the cluster Argo CD runs in.
 const IN_CLUSTER: &str = "https://kubernetes.default.svc";
 /// Where Argo CD keeps its Applications by default (a tracking id without `<ns>_`).
-const DEFAULT_NAMESPACE: &str = "argocd";
+pub const DEFAULT_NAMESPACE: &str = "argocd";
 /// A context that did not answer is left alone this long before it is tried again.
 const RETRY: Duration = Duration::from_secs(300);
 /// The longest wait for a context to connect, then to answer whether it serves Applications.
@@ -106,6 +106,29 @@ pub fn tracking_of(group: &str, kind: &str, obj: &Value) -> Option<Tracking> {
     let ns = obj.pointer("/metadata/namespace").and_then(Value::as_str).unwrap_or_default();
     let name = obj.pointer("/metadata/name").and_then(Value::as_str).unwrap_or_default();
     (t.group == group && t.kind == kind && t.name == name && (t.namespace.is_empty() || t.namespace == ns)).then_some(t)
+}
+
+/// How an object names the Application that deployed it, per Argo CD's tracking method.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TrackedBy {
+    /// Its tracking id (`annotation` and `annotation+label` tracking): about this very object.
+    Id(Tracking),
+    /// Its `app.kubernetes.io/instance` label (`label` tracking): only a hint, as Helm sets
+    /// the same label.
+    Label(String),
+}
+
+/// The Application an object says deployed it: its tracking id, else its instance label. A
+/// pod carries its workload's label but is deployed by the workload, not by Argo CD.
+pub fn tracked_by(group: &str, kind: &str, obj: &Value) -> Option<TrackedBy> {
+    if let Some(t) = tracking_of(group, kind, obj) {
+        return Some(TrackedBy::Id(t));
+    }
+    if group.is_empty() && kind == "Pod" {
+        return None;
+    }
+    let label = obj.pointer("/metadata/labels").and_then(|l| l.get(INSTANCE_LABEL)).and_then(Value::as_str)?;
+    (!label.is_empty()).then(|| TrackedBy::Label(label.to_string()))
 }
 
 // MARK: Destinations
@@ -364,7 +387,7 @@ impl Summary {
     }
 
     /// The same, with this object's own sync and health in it.
-    fn with_own(mut self, app: &Value, group: &str, kind: &str, ns: &str, name: &str) -> Self {
+    pub fn with_own(mut self, app: &Value, group: &str, kind: &str, ns: &str, name: &str) -> Self {
         self.own = resource_of(app, group, kind, ns, name).map(|r| {
             let s = |p: &str| r.pointer(p).and_then(Value::as_str).filter(|s| !s.is_empty()).map(String::from);
             (
@@ -470,7 +493,7 @@ enum Probe {
 static PROBES: LazyLock<Mutex<HashMap<String, Probe>>> = LazyLock::new(Default::default);
 
 /// What the kubeconfig's contexts point to, read again only when the files change.
-fn targets() -> Arc<Vec<ContextTarget>> {
+pub(crate) fn targets() -> Arc<Vec<ContextTarget>> {
     type Cached = (Vec<(std::path::PathBuf, Option<std::time::SystemTime>, u64)>, Arc<Vec<ContextTarget>>);
     static CACHE: Mutex<Option<Cached>> = Mutex::new(None);
     let signature = super::kubeconfig_signature();
@@ -485,7 +508,7 @@ fn targets() -> Arc<Vec<ContextTarget>> {
     targets
 }
 
-fn target(targets: &[ContextTarget], context: &str) -> ContextTarget {
+pub(crate) fn target(targets: &[ContextTarget], context: &str) -> ContextTarget {
     targets
         .iter()
         .find(|t| t.name == context)
@@ -641,6 +664,16 @@ pub async fn hubs(connected: Vec<(String, Client)>) -> Hubs {
     .unwrap_or_default()
 }
 
+/// The contexts found serving Applications this session (by a page that looked for them),
+/// sorted. No request.
+pub fn known_hubs() -> Vec<String> {
+    let probes = PROBES.lock().unwrap_or_else(PoisonError::into_inner);
+    let mut hubs: Vec<String> =
+        probes.iter().filter(|(_, p)| matches!(p, Probe::Serves(_))).map(|(c, _)| c.clone()).collect();
+    hubs.sort();
+    hubs
+}
+
 /// Ask one context whether it serves Applications, now (its login may run): Ok(true) when it
 /// does. What it answered is kept, as for the contexts asked on their own.
 pub async fn check_hub(context: String) -> Result<bool, String> {
@@ -741,19 +774,13 @@ async fn object_lookup(
     kind: String,
     obj: Value,
 ) -> Lookup {
-    let tracking = tracking_of(&group, &kind, &obj);
+    let (tracking, label) = match tracked_by(&group, &kind, &obj) {
+        Some(TrackedBy::Id(t)) => (Some(t), None),
+        Some(TrackedBy::Label(l)) => (None, Some(l)),
+        None => return Lookup::default(),
+    };
     let ns = obj.pointer("/metadata/namespace").and_then(Value::as_str).unwrap_or_default().to_string();
     let name = obj.pointer("/metadata/name").and_then(Value::as_str).unwrap_or_default().to_string();
-    // Pods are not deployed by Argo CD but by their workloads, and carry its label.
-    let label = obj
-        .pointer("/metadata/labels")
-        .and_then(|l| l.get(INSTANCE_LABEL))
-        .and_then(Value::as_str)
-        .filter(|_| tracking.is_none() && !(group.is_empty() && kind == "Pod"))
-        .map(String::from);
-    if tracking.is_none() && label.is_none() {
-        return Lookup::default();
-    }
     let hubs = hubs(connected).await;
     if hubs.found.is_empty() {
         let note = tracking.map(|t| {
@@ -1071,6 +1098,25 @@ mod tests {
         assert!(tracking_of("apps", "Deployment", &obj("web-copy")).is_none());
         assert!(tracking_of("apps", "StatefulSet", &obj("web")).is_none());
         assert!(tracking_of("apps", "Deployment", &json!({"metadata": {"name": "web"}})).is_none());
+    }
+
+    #[test]
+    fn an_object_names_its_application_by_tracking_id_else_by_label() {
+        let obj = |annotation: Option<&str>, label: Option<&str>| {
+            json!({"metadata": {"name": "web", "namespace": "prod",
+                "annotations": annotation.map(|a| json!({TRACKING_ID: a})),
+                "labels": label.map(|l| json!({INSTANCE_LABEL: l}))}})
+        };
+        let id = tracked_by("apps", "Deployment", &obj(Some("shop:apps/Deployment:prod/web"), Some("other")));
+        assert!(matches!(id, Some(TrackedBy::Id(t)) if t.app == "shop"), "the tracking id wins over the label");
+        // A tracking id copied from another object is not this one's: the label is the hint left.
+        let copied = tracked_by("apps", "Deployment", &obj(Some("shop:apps/Deployment:prod/api"), Some("shop")));
+        assert_eq!(copied, Some(TrackedBy::Label("shop".into())));
+        assert_eq!(tracked_by("apps", "Deployment", &obj(None, Some("shop"))), Some(TrackedBy::Label("shop".into())));
+        assert_eq!(tracked_by("apps", "Deployment", &obj(None, Some(""))), None);
+        assert_eq!(tracked_by("apps", "Deployment", &obj(None, None)), None);
+        // A pod carries its workload's label; its workload is what Argo CD deployed.
+        assert_eq!(tracked_by("", "Pod", &obj(None, Some("shop"))), None);
     }
 
     #[test]
