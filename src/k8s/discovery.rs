@@ -464,6 +464,63 @@ pub fn manifest_kind<'a>(kinds: &'a [Kind], api_version: &str, kind: &str) -> Op
     kinds.iter().find(|k| k.ar.api_version == api_version && k.ar.kind == kind)
 }
 
+/// Whether a manifest's document is a `CustomResourceDefinition`.
+pub fn is_crd(doc: &serde_json::Value) -> bool {
+    doc["kind"] == "CustomResourceDefinition"
+        && doc["apiVersion"].as_str().is_some_and(|v| v.starts_with("apiextensions.k8s.io/"))
+}
+
+/// The kinds a `CustomResourceDefinition` document defines, one per served version, as
+/// discovery lists them once the API server serves them. Empty for any other document.
+pub fn crd_kinds(doc: &serde_json::Value) -> Vec<Kind> {
+    if !is_crd(doc) {
+        return Vec::new();
+    }
+    let spec = &doc["spec"];
+    let text = |path: &str| spec.pointer(path).and_then(|v| v.as_str()).filter(|s| !s.is_empty());
+    let (Some(group), Some(kind), Some(plural)) = (text("/group"), text("/names/kind"), text("/names/plural")) else {
+        return Vec::new();
+    };
+    let namespaced = text("/scope") != Some("Cluster");
+    spec["versions"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|v| v["served"].as_bool() != Some(false))
+        .filter_map(|v| v["name"].as_str().filter(|s| !s.is_empty()))
+        .map(|version| {
+            let ar = ApiResource {
+                group: group.into(),
+                version: version.into(),
+                api_version: format!("{group}/{version}"),
+                kind: kind.into(),
+                plural: plural.into(),
+            };
+            kind_of(ar, namespaced)
+        })
+        .collect()
+}
+
+/// The listable kinds of one group version, asked of the API server now: one request, where
+/// a full discovery asks for every group.
+pub async fn discover_version(client: Client, group: String, version: String) -> Result<Vec<Kind>> {
+    run(async move {
+        let gv = kube::core::GroupVersion::gv(&group, &version);
+        let g = kube::discovery::pinned_group(&client, &gv).await?;
+        Ok(kinds_of(g.recommended_resources()))
+    })
+    .await
+}
+
+/// `kinds` with those of `group`/`version` replaced by `fresh` (what that group version
+/// serves now), in sidebar order.
+pub fn with_version(kinds: &[Kind], group: &str, version: &str, fresh: Vec<Kind>) -> Vec<Kind> {
+    let mut out: Vec<Kind> =
+        kinds.iter().filter(|k| k.ar.group != group || k.ar.version != version).cloned().chain(fresh).collect();
+    sort_for_sidebar(&mut out);
+    out
+}
+
 #[cfg(test)]
 mod required_tests {
     #[test]
@@ -701,5 +758,61 @@ mod noise_tests {
                 prop_assert!(found.is_some_and(in_sidebar), "{} found {:?}", k.ar.plural, found.map(Kind::key));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod crd_tests {
+    use serde_json::json;
+
+    use super::{Kind, crd_kinds, is_crd, with_version};
+
+    fn crd(scope: &str, versions: serde_json::Value) -> serde_json::Value {
+        json!({
+            "apiVersion": "apiextensions.k8s.io/v1",
+            "kind": "CustomResourceDefinition",
+            "metadata": {"name": "stages.kwok.x-k8s.io"},
+            "spec": {"group": "kwok.x-k8s.io", "scope": scope, "names": {"kind": "Stage", "plural": "stages"}, "versions": versions},
+        })
+    }
+
+    /// A CRD in a manifest gives the types its objects in the same manifest are planned as:
+    /// one per served version, with the CRD's plural and scope.
+    #[test]
+    fn a_crd_defines_a_type_per_served_version() {
+        let versions =
+            json!([{"name": "v1alpha1", "served": true}, {"name": "v1alpha2", "served": false}, {"name": "v1"}]);
+        let kinds = crd_kinds(&crd("Cluster", versions.clone()));
+        let found: Vec<(&str, &str, &str, bool)> = kinds
+            .iter()
+            .map(|k| (k.ar.api_version.as_str(), k.ar.kind.as_str(), k.ar.plural.as_str(), k.namespaced))
+            .collect();
+        assert_eq!(
+            found,
+            [("kwok.x-k8s.io/v1alpha1", "Stage", "stages", false), ("kwok.x-k8s.io/v1", "Stage", "stages", false)]
+        );
+        assert!(crd_kinds(&crd("Namespaced", versions.clone())).iter().all(|k| k.namespaced));
+        // Not a CRD, or one without names: nothing.
+        let mut other = crd("Namespaced", versions.clone());
+        other["apiVersion"] = json!("example.com/v1");
+        assert!(!is_crd(&other) && crd_kinds(&other).is_empty());
+        let mut nameless = crd("Namespaced", versions);
+        nameless["spec"]["names"] = json!({});
+        assert!(crd_kinds(&nameless).is_empty());
+        assert!(crd_kinds(&json!({"apiVersion": "v1", "kind": "ConfigMap"})).is_empty());
+    }
+
+    /// What one group version serves now replaces what discovery had of it, and only of it.
+    #[test]
+    fn a_group_version_found_again_replaces_its_kinds_only() {
+        let mut beta = Kind::fake("example.com", "Widget");
+        beta.ar.version = "v1beta1".into();
+        beta.ar.api_version = "example.com/v1beta1".into();
+        let cached = vec![Kind::fake("", "Pod"), Kind::fake("example.com", "Widget"), beta];
+        let fresh = vec![Kind::fake("example.com", "Gadget")];
+        let kinds = with_version(&cached, "example.com", "v1", fresh);
+        let mut found: Vec<String> = kinds.iter().map(|k| format!("{} {}", k.ar.api_version, k.ar.kind)).collect();
+        found.sort();
+        assert_eq!(found, ["example.com/v1 Gadget", "example.com/v1beta1 Widget", "v1 Pod"]);
     }
 }
