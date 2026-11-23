@@ -549,6 +549,10 @@ impl KubeMcp {
         if let Some(kind) = k8s::find_kind(&kinds, query).cloned() {
             return Ok((client, kind));
         }
+        // A CRD an agent just applied is looked up in its own group at once.
+        if let Some(kind) = self.hub.new_kind_named(context, query).await {
+            return Ok((client, kind));
+        }
         // Maybe a CRD installed since the first call.
         match self.hub.rediscover(context).await.and_then(|kinds| k8s::find_kind(&kinds, query).cloned()) {
             Some(kind) => Ok((client, kind)),

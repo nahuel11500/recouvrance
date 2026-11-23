@@ -52,6 +52,18 @@ impl KubeMcp {
         }
         let mut out = Vec::new();
         for (kind, ns, name, doc) in planned {
+            let kind = match self.served(&p.context, &kind).await {
+                Ok(Some(k)) => k,
+                // Its CRD comes with the manifest: the server can't check the object yet.
+                Ok(None) => {
+                    let after = k8s::to_yaml(&without_noise(&doc), false, false).unwrap_or_default();
+                    let ns = ns.map_or_default(|n| format!("{n}/"));
+                    let title = format!("{} {ns}{name} (not checked: its CRD is not on the cluster yet)", kind.ar.kind);
+                    out.push(unified(&title, "", &after, true));
+                    continue;
+                }
+                Err(e) => return call.finish(Err(anyhow::anyhow!("{} {name}: {e}", kind.ar.kind))),
+            };
             let reveal = {
                 let a = access_for(&kind, &p.context, Verb::Reveal, ns.clone(), Some(name.clone()));
                 call.policy().decide(&a).mode == Mode::Allow

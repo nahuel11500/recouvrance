@@ -94,7 +94,7 @@ impl KubeMcp {
     }
 
     #[tool(
-        description = "Create or update objects from YAML with server-side apply, like `kubectl apply --server-side`. Each object is authorized separately. Supports dry_run.",
+        description = "Create or update objects from YAML with server-side apply, like `kubectl apply --server-side`. Each object is authorized separately. CRDs are applied first, and objects of the types they define once the API server serves them. Supports dry_run.",
         annotations(read_only_hint = false)
     )]
     async fn apply_manifest(
@@ -123,6 +123,30 @@ impl KubeMcp {
         let dry = p.dry_run.unwrap_or(false);
         let mut out = Vec::new();
         for ((kind, ns, name, doc), approved) in planned.into_iter().zip(approved) {
+            // A type a CRD of this manifest (or of the call before) defines: applied once
+            // the API server serves it. A dry run created no CRD, so it can't check these.
+            let kind = match self.served(&p.context, &kind).await {
+                Ok(Some(k)) => k,
+                Ok(None) if dry => {
+                    out.push(format!(
+                        "[dry run] {} {name} not checked: its CRD is not on the cluster yet",
+                        kind.ar.kind
+                    ));
+                    continue;
+                }
+                Ok(None) => {
+                    let (secs, ar) = (crate::mcp::hub::SERVE_WAIT.as_secs(), &kind.ar);
+                    out.push(format!(
+                        "error: {} {name}: the API server does not serve {} {} {secs} s after its CRD was applied (see the CRD's conditions)",
+                        ar.kind, ar.api_version, ar.kind
+                    ));
+                    return call.finish(Err(anyhow::anyhow!(out.join("\n"))));
+                }
+                Err(e) => {
+                    out.push(format!("error: {} {name}: {e}", kind.ar.kind));
+                    return call.finish(Err(anyhow::anyhow!(out.join("\n"))));
+                }
+            };
             // Approvals for later objects, and applying earlier ones, can take minutes:
             // access may be off, or the rules changed, by now.
             let access = access_for(&kind, &p.context, Verb::Apply, ns.clone(), Some(name));
@@ -136,8 +160,13 @@ impl KubeMcp {
                 out.push(call.deny(detail));
                 return Err(out.join("\n"));
             }
+            let defines = if dry { Vec::new() } else { k8s::crd_kinds(&doc) };
             match k8s::apply(client.clone(), kind, ns, doc, dry).await {
-                Ok(line) => out.push(line),
+                Ok(line) => {
+                    // The next objects, and the agent's next calls, find its types at once.
+                    self.hub.crds_applied(&p.context, defines);
+                    out.push(line);
+                }
                 Err(e) => {
                     out.push(format!("error: {e:#}"));
                     return call.finish(Err(anyhow::anyhow!(out.join("\n"))));
@@ -354,31 +383,36 @@ impl KubeMcp {
         namespace: Option<&String>,
         manifest: &str,
     ) -> Result<(kube::Client, Vec<Planned>), String> {
-        let (client, mut kinds) = match self.hub.client(context).await {
+        let (client, kinds) = match self.hub.client(context).await {
             Ok(c) => c,
             Err(e) => return Err(call.finish(Err(e)).unwrap_err()),
         };
-        let docs: Vec<serde_json::Value> = match crate::yaml::documents(manifest) {
+        let mut docs: Vec<serde_json::Value> = match crate::yaml::documents(manifest) {
             Ok(d) => d.into_iter().filter(|v| !v.is_null()).collect(),
             Err(e) => return Err(call.finish(Err(anyhow::anyhow!("invalid YAML: {e}"))).unwrap_err()),
         };
         if docs.is_empty() {
             return Err(call.finish(Err(anyhow::anyhow!("no objects in manifest"))).unwrap_err());
         }
+        crds_first(&mut docs);
+        // The types this manifest's CRDs define: its objects of those types are applied once
+        // the API server serves them (see `served`).
+        let defined: Vec<Kind> = docs.iter().flat_map(k8s::crd_kinds).collect();
         let mut planned = Vec::new();
         for doc in docs {
             let api_version = doc["apiVersion"].as_str().unwrap_or_default().to_string();
             let kind_name = doc["kind"].as_str().unwrap_or_default().to_string();
             let find = |kinds: &[Kind]| k8s::manifest_kind(kinds, &api_version, &kind_name).cloned();
-            let mut kind = find(&kinds);
-            if kind.is_none()
-                && let Some(fresh) = self.hub.rediscover(context).await
-            {
-                kind = find(&fresh);
-                kinds = fresh;
+            let mut kind = find(&kinds).or_else(|| find(&defined));
+            if kind.is_none() {
+                // A CRD applied by the call before, or installed since discovery ran.
+                kind = self.hub.new_kind(context, &api_version, &kind_name).await;
             }
             let Some(kind) = kind else {
-                return Err(call.finish(Err(anyhow::anyhow!("unknown type {api_version} {kind_name}"))).unwrap_err());
+                let hint = unknown_hint(&kinds, &kind_name);
+                return Err(call
+                    .finish(Err(anyhow::anyhow!("unknown type {api_version} {kind_name}{hint}")))
+                    .unwrap_err());
             };
             let ns =
                 doc.pointer("/metadata/namespace").and_then(|v| v.as_str()).map(String::from).or(namespace.cloned());
@@ -394,5 +428,74 @@ impl KubeMcp {
             planned.push((kind, ns, name, doc));
         }
         Ok((client, planned))
+    }
+
+    /// `kind` as the API server serves it now. A type discovery doesn't have is one a CRD
+    /// of the same manifest defines (or one applied just before): it is asked of its group
+    /// version, waiting for a CRD applied through the hub to be served. `Ok(None)` when it
+    /// isn't served; an error when it is served as another resource or scope than the one
+    /// the object was authorized as.
+    pub(super) async fn served(&self, context: &str, kind: &Kind) -> Result<Option<Kind>, String> {
+        let (api_version, kind_name) = (&kind.ar.api_version, &kind.ar.kind);
+        let served = match self.hub.known(context, api_version, kind_name) {
+            Some(k) => k,
+            None => match self.hub.new_kind(context, api_version, kind_name).await {
+                Some(k) => k,
+                None => return Ok(None),
+            },
+        };
+        if served.ar.plural != kind.ar.plural || served.namespaced != kind.namespaced {
+            let scope = |k: &Kind| if k.namespaced { "namespaced" } else { "cluster-scoped" };
+            return Err(format!(
+                "the API server serves {api_version} {kind_name} as {} ({}), not as {} ({}) as planned",
+                served.ar.plural,
+                scope(&served),
+                kind.ar.plural,
+                scope(kind)
+            ));
+        }
+        Ok(Some(served))
+    }
+}
+
+/// CRDs first, the rest in manifest order, as Helm installs them: an object of a type the
+/// manifest defines can only be applied once its CRD is.
+fn crds_first(docs: &mut [serde_json::Value]) {
+    docs.sort_by_key(|d| !k8s::is_crd(d));
+}
+
+/// What to do about a type discovery doesn't have: the `apiVersion` the cluster serves that
+/// kind at, if it does, or when discovery runs again.
+fn unknown_hint(kinds: &[Kind], kind_name: &str) -> String {
+    match kinds.iter().find(|k| k.ar.kind == kind_name) {
+        Some(k) => format!(" (did you mean apiVersion: {}?)", k.ar.api_version),
+        None => " (a CRD installed outside apply_manifest in the last minute is found when discovery runs again, at most a minute later)".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::{crds_first, unknown_hint};
+    use crate::k8s::Kind;
+
+    /// A custom resource listed before its CRD is applied after it; the rest keep their order.
+    #[test]
+    fn crds_are_applied_first() {
+        let crd = |name: &str| json!({"apiVersion": "apiextensions.k8s.io/v1", "kind": "CustomResourceDefinition", "metadata": {"name": name}});
+        let obj =
+            |name: &str| json!({"apiVersion": "kwok.x-k8s.io/v1alpha1", "kind": "Stage", "metadata": {"name": name}});
+        let mut docs = vec![obj("fast"), crd("stages.kwok.x-k8s.io"), obj("slow"), crd("attaches.kwok.x-k8s.io")];
+        crds_first(&mut docs);
+        let order: Vec<&str> = docs.iter().filter_map(|d| d["metadata"]["name"].as_str()).collect();
+        assert_eq!(order, ["stages.kwok.x-k8s.io", "attaches.kwok.x-k8s.io", "fast", "slow"]);
+    }
+
+    #[test]
+    fn an_unknown_type_says_what_to_do() {
+        let kinds = vec![Kind::fake("apps", "Deployment")];
+        assert_eq!(unknown_hint(&kinds, "Deployment"), " (did you mean apiVersion: apps/v1?)");
+        assert!(unknown_hint(&kinds, "Stage").contains("discovery runs again"));
     }
 }

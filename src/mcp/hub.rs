@@ -22,6 +22,20 @@ use crate::k8s::{self, Kind};
 /// Discovery runs again for an unknown kind (a CRD installed since) at most this often.
 const REDISCOVER_EVERY: Duration = Duration::from_secs(60);
 
+/// How long the kinds of a CRD applied through the hub count as new: until then a lookup
+/// that misses them asks their own group version, and waits for it to serve them.
+const NEW_CRD_FOR: Duration = Duration::from_secs(300);
+
+/// The most new CRD kinds kept per context.
+const MAX_NEW_KINDS: usize = 256;
+
+/// How long a lookup waits for the API server to serve the kind of a CRD just applied. It
+/// takes about a second once the CRD is accepted; one that never is fails after this.
+pub(crate) const SERVE_WAIT: Duration = Duration::from_secs(20);
+
+/// How often a lookup asks again while it waits.
+const SERVE_POLL: Duration = Duration::from_millis(500);
+
 /// How long a request waits for the user's answer.
 const APPROVAL_TIMEOUT: Duration = Duration::from_secs(120);
 
@@ -124,6 +138,8 @@ struct Cluster {
     /// Discovered kinds and when; discovery runs one at a time per context.
     kinds: Mutex<Option<(Arc<Vec<Kind>>, Instant)>>,
     discovering: tokio::sync::Mutex<()>,
+    /// The kinds of CRDs applied through the hub, and when, that a lookup has not found yet.
+    new_kinds: Mutex<Vec<(Kind, Instant)>>,
 }
 
 /// Shared between the MCP server (tokio) and the UI (gpui).
@@ -698,6 +714,137 @@ impl Hub {
             None
         }
     }
+
+    /// Note the kinds of CRDs just applied on `context` (`k8s::crd_kinds`). Until a lookup
+    /// finds them, one that misses them asks their group version at once, and waits for the
+    /// API server to serve them, instead of waiting for the next full discovery.
+    pub fn crds_applied(&self, context: &str, kinds: Vec<Kind>) {
+        if kinds.is_empty() {
+            return;
+        }
+        let Ok(cluster) = self.cluster(context) else { return };
+        note_new(&mut lock(&cluster.new_kinds), kinds, Instant::now());
+    }
+
+    /// The kind of `api_version` `kind` the kinds discovered on `context` hold. No request.
+    pub fn known(&self, context: &str, api_version: &str, kind: &str) -> Option<Kind> {
+        let cluster = self.cluster(context).ok()?;
+        let kinds = lock(&cluster.kinds);
+        kinds.as_ref().and_then(|(kinds, _)| k8s::manifest_kind(kinds, api_version, kind).cloned())
+    }
+
+    /// A kind missing from the kinds discovered on `context`, looked up again. The kind of a
+    /// CRD applied through the hub lately, or one of a group version discovery doesn't
+    /// have, is asked of its group version at once (one request); for a CRD applied lately
+    /// it waits up to `SERVE_WAIT` for the API server to serve it. Anything else waits for
+    /// the next full discovery (`rediscover`, once a minute).
+    pub async fn new_kind(&self, context: &str, api_version: &str, kind: &str) -> Option<Kind> {
+        let cluster = self.cluster(context).ok()?;
+        let client = cluster.client.get()?.clone();
+        let cached = lock(&cluster.kinds).as_ref().map_or_default(|(k, _)| k.clone());
+        let (group, version, wait) = match lookup(&cached, &new_kinds(&cluster), api_version, kind) {
+            Lookup::Known => return k8s::manifest_kind(&cached, api_version, kind).cloned(),
+            Lookup::Everything => {
+                let kinds = self.rediscover(context).await?;
+                return k8s::manifest_kind(&kinds, api_version, kind).cloned();
+            }
+            Lookup::Group { group, version, wait } => (group, version, wait),
+        };
+        let deadline = Instant::now() + if wait { SERVE_WAIT } else { Duration::ZERO };
+        loop {
+            if let Ok(fresh) = k8s::discover_version(client.clone(), group.clone(), version.clone()).await {
+                let found = k8s::manifest_kind(&fresh, api_version, kind).cloned();
+                {
+                    let mut cache = lock(&cluster.kinds);
+                    if let Some((kinds, _)) = cache.as_mut() {
+                        *kinds = Arc::new(k8s::with_version(kinds, &group, &version, fresh));
+                    }
+                }
+                if let Some(found) = found {
+                    lock(&cluster.new_kinds).retain(|(k, _)| !same_type(k, &found));
+                    return Some(found);
+                }
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            tokio::time::sleep(SERVE_POLL).await;
+        }
+    }
+
+    /// The kind named `query` (`stages`, `stages.kwok.x-k8s.io`) of a CRD applied lately
+    /// that discovery doesn't have yet, looked up in its group version (see `new_kind`).
+    pub async fn new_kind_named(&self, context: &str, query: &str) -> Option<Kind> {
+        let cluster = self.cluster(context).ok()?;
+        let new = k8s::find_kind(&new_kinds(&cluster), query).cloned()?;
+        self.new_kind(context, &new.ar.api_version, &new.ar.kind).await
+    }
+}
+
+/// Where a kind missing from discovery is looked for.
+#[derive(Debug, PartialEq, Eq)]
+enum Lookup {
+    /// It is there now: another call found it meanwhile.
+    Known,
+    /// In its own group version, asked now; `wait`: for the API server to serve it, as the
+    /// kind of a CRD applied lately.
+    Group { group: String, version: String, wait: bool },
+    /// In the next full discovery.
+    Everything,
+}
+
+/// Where to look for `api_version` `kind`, from the kinds discovered (`cached`) and those of
+/// CRDs applied lately (`new`). A kind of a CRD applied lately, or of a group version
+/// discovery doesn't have (its CRD may be new), is asked of its group version: one cheap
+/// request. A kind missing from a group version discovered waits for the next full
+/// discovery, as does anything that can't be an `apiVersion`.
+fn lookup(cached: &[Kind], new: &[Kind], api_version: &str, kind: &str) -> Lookup {
+    if k8s::manifest_kind(cached, api_version, kind).is_some() {
+        return Lookup::Known;
+    }
+    let Some((group, version)) = group_version(api_version) else { return Lookup::Everything };
+    let wait = k8s::manifest_kind(new, api_version, kind).is_some();
+    if wait || !cached.iter().any(|k| k.ar.api_version == api_version) {
+        Lookup::Group { group: group.into(), version: version.into(), wait }
+    } else {
+        Lookup::Everything
+    }
+}
+
+/// The group and version of an `apiVersion` (`v1`, `apps/v1`), when it can be one: they go
+/// into the request's path.
+fn group_version(api_version: &str) -> Option<(&str, &str)> {
+    let (group, version) = match api_version.split_once('/') {
+        Some(("", _)) => return None,
+        Some(gv) => gv,
+        None => ("", api_version),
+    };
+    let name = |s: &str, dots: bool| {
+        s.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || (dots && c == '.'))
+    };
+    (!version.is_empty() && name(version, false) && name(group, true) && !group.starts_with('.'))
+        .then_some((group, version))
+}
+
+/// The same type: the same `apiVersion` and `kind`.
+fn same_type(a: &Kind, b: &Kind) -> bool {
+    a.ar.api_version == b.ar.api_version && a.ar.kind == b.ar.kind
+}
+
+/// `kinds` noted in `new` as applied at `now`: each type once, the expired dropped, and the
+/// oldest past `MAX_NEW_KINDS`.
+fn note_new(new: &mut Vec<(Kind, Instant)>, kinds: Vec<Kind>, now: Instant) {
+    new.retain(|(k, at)| now.duration_since(*at) < NEW_CRD_FOR && !kinds.iter().any(|n| same_type(n, k)));
+    new.extend(kinds.into_iter().map(|k| (k, now)));
+    let excess = new.len().saturating_sub(MAX_NEW_KINDS);
+    new.drain(..excess);
+}
+
+/// The kinds of CRDs applied lately that no lookup has found yet.
+fn new_kinds(cluster: &Cluster) -> Vec<Kind> {
+    let now = Instant::now();
+    let new = lock(&cluster.new_kinds);
+    new.iter().filter(|(_, at)| now.duration_since(*at) < NEW_CRD_FOR).map(|(k, _)| k.clone()).collect()
 }
 
 /// A request waiting for the user's answer. Dropped when the wait ends, however it ends, and
@@ -901,5 +1048,65 @@ mod tests {
         assert!(m.is_poisoned());
         *lock(&m) += 1;
         assert_eq!(*lock(&m), 2);
+    }
+
+    fn group(group: &str, version: &str, wait: bool) -> Lookup {
+        Lookup::Group { group: group.into(), version: version.into(), wait }
+    }
+
+    /// A CR applied right after its CRD (#839): its type is asked of its own group version
+    /// at once, and waited for, instead of being unknown until the next full discovery.
+    #[test]
+    fn a_type_of_a_crd_just_applied_is_asked_of_its_group() {
+        let cached = vec![Kind::fake("", "Pod"), Kind::fake("apps", "Deployment"), Kind::fake("example.com", "Widget")];
+        let stage = Kind::fake("kwok.x-k8s.io", "Stage");
+        let gadget = Kind::fake("example.com", "Gadget");
+        let new = vec![stage, gadget];
+        assert_eq!(lookup(&cached, &new, "apps/v1", "Deployment"), Lookup::Known);
+        // Announced by a CRD just applied: asked of its group, waiting for it to be served,
+        // whether or not its group version was discovered.
+        assert_eq!(lookup(&cached, &new, "kwok.x-k8s.io/v1", "Stage"), group("kwok.x-k8s.io", "v1", true));
+        assert_eq!(lookup(&cached, &new, "example.com/v1", "Gadget"), group("example.com", "v1", true));
+        // A group version discovery doesn't have: its CRD may be new, asked once.
+        assert_eq!(lookup(&cached, &[], "kwok.x-k8s.io/v1alpha1", "Stage"), group("kwok.x-k8s.io", "v1alpha1", false));
+        assert_eq!(lookup(&cached, &[], "v2", "Pod"), group("", "v2", false));
+        // A kind missing from a group version discovered, or no `apiVersion` at all: the next
+        // full discovery, as before.
+        assert_eq!(lookup(&cached, &[], "example.com/v1", "Gadget"), Lookup::Everything);
+        assert_eq!(lookup(&cached, &[], "v1", "Pdo"), Lookup::Everything);
+        for bad in ["", "/v1", "a/b/c", "Example.com/v1", "example.com/", "../v1", "example.com/v1?x=1"] {
+            assert_eq!(lookup(&cached, &new, bad, "Stage"), Lookup::Everything, "{bad}");
+        }
+    }
+
+    #[test]
+    fn only_a_plain_api_version_goes_into_a_request() {
+        assert_eq!(group_version("v1"), Some(("", "v1")));
+        assert_eq!(group_version("kwok.x-k8s.io/v1alpha1"), Some(("kwok.x-k8s.io", "v1alpha1")));
+        assert_eq!(group_version("a/b/c"), None);
+        assert_eq!(group_version("../v1"), None);
+        assert_eq!(group_version("/v1"), None);
+        assert_eq!(group_version("x/v 1"), None);
+    }
+
+    /// The kinds of CRDs applied are kept once each, for a while, and only so many.
+    #[test]
+    fn new_crd_kinds_are_kept_once_for_a_while_and_bounded() {
+        let names = |new: &[(Kind, Instant)]| new.iter().map(|(k, _)| k.ar.kind.clone()).collect::<Vec<_>>();
+        let now = Instant::now();
+        let mut new = Vec::new();
+        note_new(&mut new, vec![Kind::fake("a.io", "Stage")], now);
+        note_new(&mut new, vec![Kind::fake("a.io", "Stage"), Kind::fake("a.io", "Attach")], now);
+        assert_eq!(names(&new), ["Stage", "Attach"]);
+        // Applied again later: kept from then.
+        let later = now + NEW_CRD_FOR / 2;
+        note_new(&mut new, vec![Kind::fake("a.io", "Stage")], later);
+        assert_eq!(names(&new), ["Attach", "Stage"]);
+        note_new(&mut new, vec![Kind::fake("b.io", "Other")], now + NEW_CRD_FOR);
+        assert_eq!(names(&new), ["Stage", "Other"]);
+        let many: Vec<Kind> = (0..MAX_NEW_KINDS + 10).map(|i| Kind::fake("c.io", &format!("K{i}"))).collect();
+        note_new(&mut new, many, now + NEW_CRD_FOR);
+        assert_eq!(new.len(), MAX_NEW_KINDS);
+        assert_eq!(new.first().map(|(k, _)| k.ar.kind.clone()), Some("K10".to_string()));
     }
 }

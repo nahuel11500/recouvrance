@@ -935,6 +935,69 @@ fn an_agent_diffs_a_manifest_without_changing_anything() {
     });
 }
 
+/// Custom resources applied right after their CRD (#839): in the same manifest, even listed
+/// before it, and in the call right after a CRD applied alone, they are applied once the API
+/// server serves their type, not refused as unknown until discovery runs again a minute later.
+#[test]
+#[ignore = "needs a kind cluster: RECOUVRANCE_E2E_CONTEXT"]
+fn an_agent_applies_custom_resources_right_after_their_crd() {
+    use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition;
+
+    fn crd(plural: &str, kind: &str) -> String {
+        let singular = kind.to_lowercase();
+        format!(
+            "apiVersion: apiextensions.k8s.io/v1\nkind: CustomResourceDefinition\nmetadata:\n  name: {plural}.e2e.recouvrance.dev\nspec:\n  group: e2e.recouvrance.dev\n  scope: Namespaced\n  names:\n    kind: {kind}\n    plural: {plural}\n    singular: {singular}\n  versions:\n  - name: v1\n    served: true\n    storage: true\n    schema:\n      openAPIV3Schema:\n        type: object\n        x-kubernetes-preserve-unknown-fields: true\n"
+        )
+    }
+    fn object(kind: &str, name: &str) -> String {
+        format!(
+            "apiVersion: e2e.recouvrance.dev/v1\nkind: {kind}\nmetadata:\n  name: {name}\n  namespace: {NS}\nspec:\n  size: 1\n"
+        )
+    }
+
+    run(async {
+        let ctx = context();
+        let crds: Api<CustomResourceDefinition> = Api::all(k8s::connect_for_agents(ctx.clone()).await?);
+        let names = ["e2ewidgets.e2e.recouvrance.dev", "e2egadgets.e2e.recouvrance.dev"];
+        for n in names {
+            let _ = crds.delete(n, &DeleteParams::default()).await;
+            for _ in 0..60 {
+                if crds.get_opt(n).await?.is_none() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+        }
+        let checked = async {
+            let (hub, _agent, token, _server) = agent(&["get,list,apply *"], &[]).await?;
+            let mcp = crate::assistant::Mcp::connect(hub.port(), token).await?;
+            // One manifest, the object before its CRD. Discovery first runs in this call,
+            // before the CRD exists.
+            let manifest = format!("{}---\n{}", object("E2eWidget", "one"), crd("e2ewidgets", "E2eWidget"));
+            let dry = mcp.call("apply_manifest", json!({"context": ctx, "manifest": manifest, "dry_run": true})).await;
+            assert!(dry.contains("E2eWidget one not checked"), "{dry}");
+            assert!(crds.get_opt(names[0]).await?.is_none(), "a dry run created a CRD");
+            let out = mcp.call("apply_manifest", json!({"context": ctx, "manifest": manifest})).await;
+            assert!(out.contains("E2eWidget one applied"), "{out}");
+            // A CRD alone, then its object in the very next call.
+            let out =
+                mcp.call("apply_manifest", json!({"context": ctx, "manifest": crd("e2egadgets", "E2eGadget")})).await;
+            assert!(out.contains(&format!("CustomResourceDefinition {} applied", names[1])), "{out}");
+            let out = mcp.call("apply_manifest", json!({"context": ctx, "manifest": object("E2eGadget", "two")})).await;
+            assert!(out.contains("E2eGadget two applied"), "{out}");
+            let target = json!({"context": ctx, "kind": "e2egadgets", "namespace": NS, "name": "two"});
+            let out = mcp.call("get_resource", target).await;
+            assert!(out.contains("size"), "{out}");
+            Ok(())
+        };
+        let result: Result<()> = checked.await;
+        for n in names {
+            let _ = crds.delete(n, &DeleteParams::default()).await;
+        }
+        result
+    });
+}
+
 /// The read-only questions about the cluster: explain, can-i, version and wait.
 #[test]
 #[ignore = "needs a kind cluster: RECOUVRANCE_E2E_CONTEXT"]
