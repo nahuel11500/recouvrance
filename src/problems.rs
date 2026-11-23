@@ -463,8 +463,8 @@ async fn run_all(jobs: Vec<Job>) -> Scan {
 }
 
 /// Problems in a cluster (or one namespace), worst first, at once: the developer checks and
-/// the tests. The app scans through `shared`, which shows each check as it finishes.
-#[cfg(any(test, feature = "dev"))]
+/// the end-to-end tests. The app scans through `shared`, which shows each check as it finishes.
+#[cfg(feature = "dev")]
 pub async fn scan_partial(client: Client, kinds: &[Kind], namespace: Option<String>, context: Option<&str>) -> Scan {
     run_all(kind_jobs(&client, kinds, namespace.as_deref(), context)).await
 }
