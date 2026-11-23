@@ -837,7 +837,8 @@ fn an_agent_cordons_a_node_with_its_drain_rule() {
 }
 
 /// Helm releases are read from their Secrets: denied by a Deny on secrets, listed with the
-/// chart otherwise, and their secret-looking values masked unless the agent may reveal.
+/// chart otherwise, and their secret-looking values masked unless the agent may reveal. The
+/// activity log names the client of each call, and the calls that showed Secret values.
 #[test]
 #[ignore = "needs a kind cluster: RECOUVRANCE_E2E_CONTEXT"]
 fn an_agent_reads_helm_releases_by_its_secret_rules() {
@@ -868,10 +869,27 @@ fn an_agent_reads_helm_releases_by_its_secret_rules() {
             let values = json!({"context": ctx, "namespace": NS, "name": release});
             let out = mcp.call("helm_get_values", values.clone()).await;
             assert!(out.contains("db.local") && !out.contains("hunter2"), "{out}");
+            // The activity log names the client, and says when values were shown: not yet.
+            let last = |tool: &'static str| {
+                let logged = hub.recent_audit(1, |e| e.agent_id == agent.id && e.tool == tool);
+                logged.into_iter().next().context("the call is logged")
+            };
+            let masked = last("helm_get_values")?;
+            assert_eq!(masked.client.as_deref(), Some(concat!("recouvrance-assistant ", env!("CARGO_PKG_VERSION"))));
+            assert!(masked.revealed.is_empty(), "{:?}", masked.revealed);
+            let get = json!({"context": ctx, "kind": "secrets", "namespace": NS, "name": name});
+            let out = mcp.call("get_resource", get.clone()).await;
+            assert!(out.contains(name), "{out}");
+            assert!(last("get_resource")?.revealed.is_empty());
+
             let reveal = rules_file::parse_rule(Mode::Allow, "reveal secrets -n default")?;
             hub.update_agent(&agent.id, |a| a.policy.rules.push(reveal))?;
             let out = mcp.call("helm_get_values", values).await;
             assert!(out.contains("hunter2"), "{out}");
+            assert_eq!(last("helm_get_values")?.revealed, [format!("Helm values {NS}/{release} revision 1")]);
+            let out = mcp.call("get_resource", get).await;
+            assert!(out.contains(name), "{out}");
+            assert_eq!(last("get_resource")?.revealed, [format!("Secret {NS}/{name}")]);
             Ok(())
         };
         let result: Result<()> = checked.await;
@@ -1535,6 +1553,74 @@ fn the_timeline_records_what_a_watch_sees_change() {
     });
 }
 
+/// The usage bars' requests and limits (and the cluster overview's pod totals) come from one
+/// list of the pods, then a watch: a pod created shows with its own, a resize in place changes
+/// them, and a deleted pod goes, without another list.
+#[test]
+#[ignore = "needs a kind cluster: RECOUVRANCE_E2E_CONTEXT"]
+fn usage_bar_requests_follow_pods_by_a_watch() {
+    use k8s_openapi::api::core::v1::Pod;
+
+    /// Wait until the requests and limits read for pod `name` are `want`: None once it is gone.
+    async fn read_until(rx: &mut k8s::PodRequestsRx, name: &str, want: Option<k8s::PodResources>) -> Result<()> {
+        let seen = |read: &Option<Result<k8s::PodRequests, String>>| {
+            let pod = read.as_ref().and_then(|r| r.as_ref().ok()).map(|r| r.pods.get(NS, name).map(|p| p.resources));
+            pod == Some(want)
+        };
+        let waited = tokio::time::timeout(std::time::Duration::from_secs(90), rx.wait_for(seen)).await;
+        if waited.is_ok_and(|read| read.is_ok()) {
+            return Ok(());
+        }
+        let last = rx.borrow().clone().map(|read| read.map(|r| r.pods.get(NS, name).map(|p| p.resources)));
+        bail!("{name}: wanted {want:?}, last read {last:?}")
+    }
+
+    run(async {
+        const NAME: &str = "e2e-requests";
+        let client = k8s::connect_for_agents(context()).await?;
+        let pods: Api<Pod> = Api::namespaced(client.clone(), NS);
+        let _ = pods.delete(NAME, &DeleteParams::default().grace_period(0)).await;
+        pod_gone(&pods, NAME).await?;
+        let (_watch, mut rx) =
+            k8s::watch_pod_resources(client.clone(), Some(NS.into()), k8s::Pause::default(), k8s::Pause::default());
+        let checked = async {
+            read_until(&mut rx, NAME, None).await?;
+            let pod = serde_json::from_value(json!({
+                "metadata": {"name": NAME, "namespace": NS},
+                "spec": {"terminationGracePeriodSeconds": 0, "containers": [{
+                    "name": "main", "image": "busybox:1.37", "command": ["sleep", "3600"],
+                    "resources": {"requests": {"cpu": "50m", "memory": "32Mi"},
+                        "limits": {"cpu": "100m", "memory": "64Mi"}},
+                }]},
+            }))?;
+            pods.create(&PostParams::default(), &pod).await?;
+            let mi = 1024.0 * 1024.0;
+            let mut want =
+                k8s::PodResources { cpu: (Some(50.0), Some(100.0)), mem: (Some(32.0 * mi), Some(64.0 * mi)) };
+            read_until(&mut rx, NAME, Some(want)).await?;
+
+            // Resized in place, through the `resize` subresource of Kubernetes 1.33 and later.
+            let resize = json!({"spec": {"containers": [
+                {"name": "main", "resources": {"requests": {"cpu": "60m"}, "limits": {"cpu": "120m"}}},
+            ]}});
+            match pods.patch_subresource("resize", NAME, &PatchParams::default(), &Patch::Strategic(resize)).await {
+                Ok(_) => {
+                    want.cpu = (Some(60.0), Some(120.0));
+                    read_until(&mut rx, NAME, Some(want)).await?;
+                }
+                Err(kube::Error::Api(status)) if status.code == 404 => eprintln!("no in-place resize on this cluster"),
+                Err(e) => return Err(e.into()),
+            }
+
+            pods.delete(NAME, &DeleteParams::default().grace_period(0)).await?;
+            read_until(&mut rx, NAME, None).await
+        };
+        let result: Result<()> = checked.await;
+        let _ = pods.delete(NAME, &DeleteParams::default().grace_period(0)).await;
+        result
+    });
+}
+
 /// A container without a shell (`pause`, a scratch image like distroless) is read through a
 /// debug container: exec finds no shell, the debug container added shares its processes, and
 /// its files read through `/proc/<pid>/root`, a mounted volume and absolute symlinks included.
@@ -1918,11 +2004,11 @@ fn an_agent_syncs_terminates_and_rolls_back_an_argo_cd_application() {
                 args
             };
 
-            // Without a patch rule, nothing is written.
+            // Without a sync rule, nothing is written (a sync is not a patch).
             let out = client.call("gitops", with(json!({"action": "sync"}))).await;
             assert!(out.contains("Denied"), "{out}");
             assert!(read().await?.get("operation").is_none());
-            let allow = rules_file::parse_rule(Mode::Allow, "patch applications/e2e-* -n default")?;
+            let allow = rules_file::parse_rule(Mode::Allow, "sync applications/e2e-* -n default")?;
             hub.update_agent(&agent.id, |a| a.policy.rules.push(allow))?;
 
             // A sync of two resources with prune: it names what prune deletes.

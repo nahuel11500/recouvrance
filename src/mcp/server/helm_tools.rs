@@ -173,8 +173,15 @@ impl KubeMcp {
             call.policy().decide(&a).mode == Mode::Allow
         };
         let mut values = rev.values;
-        if !reveal {
-            helm::mask_secrets(&mut values);
+        let mut masked = values.clone();
+        helm::mask_secrets(&mut masked);
+        if reveal {
+            // Only values that masking would have hidden count as shown.
+            if masked != values {
+                call.revealing(format!("Helm values {}/{} revision {}", p.namespace, p.name, rev.revision));
+            }
+        } else {
+            values = masked;
         }
         let yaml = crate::yaml::to_string(&values).map_err(anyhow::Error::from);
         call.finish(yaml.map(|y| format!("# {} revision {}\n{y}", p.name, rev.revision)))

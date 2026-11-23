@@ -827,6 +827,15 @@ pub fn protected_contexts(contexts: &crate::k8s::Contexts) -> Vec<String> {
     with(|s| protected_among(&s.protection, &contexts.names, &contexts.risky))
 }
 
+/// The kubeconfig's contexts that are not protected (see [`is_protected`]), for agent rules
+/// naming `@protected`. None when the kubeconfig can't be read: every context then counts
+/// as protected.
+pub fn unprotected_contexts() -> Vec<String> {
+    let Ok(contexts) = crate::k8s::load_contexts() else { return Vec::new() };
+    let protected: std::collections::HashSet<String> = protected_contexts(&contexts).into_iter().collect();
+    contexts.names.into_iter().filter(|n| !protected.contains(n)).collect()
+}
+
 fn protected_among(
     chosen: &std::collections::BTreeMap<String, bool>,
     names: &[String],

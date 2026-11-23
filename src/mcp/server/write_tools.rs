@@ -246,7 +246,7 @@ impl KubeMcp {
             (self.hub.clone(), call.agent.id.clone(), p.context.clone(), pods_kind.clone());
         let keep = move |ns: &str, name: &str| {
             let a = access_for(&kind, &context, Verb::Delete, Some(ns.into()), Some(name.into()));
-            match hub.agent(&agent_id) {
+            match hub.agent_for_calls(&agent_id) {
                 Some(agent) if !denies_eviction(&agent.policy, &a) => None,
                 Some(_) => Some("your rules deny deleting it".to_string()),
                 None => Some("this agent is disabled".to_string()),
@@ -261,7 +261,7 @@ impl KubeMcp {
     }
 
     #[tool(
-        description = "GitOps actions: Flux `reconcile` (like `flux reconcile`), `suspend`, `resume`; Argo CD Application `refresh`, `hard_refresh` (renders its manifests again, without Argo CD's cache), `sync` (optionally of some `resources` only, with `prune`, or a `dry_run` whose result is returned), `terminate` (stops the operation running, like `argocd app terminate-op`) or `rollback` (to a deployment of its history, like `argocd app rollback`; refused while auto-sync is on), authorized as `patch` on the object. Like argocd-server, nothing starts while another operation runs. Argo CD `diagnose` changes nothing (authorized as `get`): why the Application drifts, keeps syncing (a sync loop, with the `ignoreDifferences` that would stop it), failed (hook, admission, missing CRD...) or is stuck (a long sync, a finalizer holding its deletion), and for each out-of-sync resource the fields that differ between what was last applied and the live object on its destination, with who wrote them since the last sync. The destination's objects are read only where your rules allow `get`.",
+        description = "GitOps actions: Flux `reconcile` (like `flux reconcile`), `suspend`, `resume`; Argo CD Application `refresh`, `hard_refresh` (renders its manifests again, without Argo CD's cache), `sync` (optionally of some `resources` only, with `prune`, or a `dry_run` whose result is returned), `terminate` (stops the operation running, like `argocd app terminate-op`) or `rollback` (to a deployment of its history, like `argocd app rollback`; refused while auto-sync is on), each authorized by its own verb on the object, not `patch`: `refresh` (refresh, hard_refresh), `sync` (Argo CD sync, terminate and rollback, Flux reconcile) or `suspend` (Flux suspend and resume). Like argocd-server, nothing starts while another operation runs. Argo CD `diagnose` changes nothing (authorized as `get`): why the Application drifts, keeps syncing (a sync loop, with the `ignoreDifferences` that would stop it), failed (hook, admission, missing CRD...) or is stuck (a long sync, a finalizer holding its deletion), and for each out-of-sync resource the fields that differ between what was last applied and the live object on its destination, with who wrote them since the last sync. The destination's objects are read only where your rules allow `get`.",
         annotations(read_only_hint = false)
     )]
     async fn gitops(
@@ -299,8 +299,10 @@ impl KubeMcp {
         if p.action == "diagnose" {
             return self.argo_diagnose(call, client, kind, &p.context, &p.namespace, &p.name).await;
         }
+        let verb =
+            gitops_verb(&p.action).ok_or_else(|| call.fail(format!("`{}` has no verb in the rules", p.action)))?;
         let mut op = argo_op(&p);
-        let access = access_for(&kind, &p.context, Verb::Patch, Some(p.namespace.clone()), Some(p.name.clone()));
+        let access = access_for(&kind, &p.context, verb, Some(p.namespace.clone()), Some(p.name.clone()));
         // What a prune deletes, and the deployment a rollback goes to, are part of what is
         // approved: read before asking, and what is sent is held to what was shown. Never
         // shown to the agent before its rules allow the call (a failed read says nothing).
@@ -365,6 +367,19 @@ impl KubeMcp {
         self.authorize(&mut call, &access).await?;
         self.recheck(&mut call, &access)?;
         call.finish(k8s::delete(client, kind, p.namespace, p.name, None, p.dry_run.unwrap_or(false)).await)
+    }
+}
+
+/// The rules' verb for a GitOps action: a refresh deploys nothing, a sync (or a Flux
+/// reconcile) deploys what the repository holds (a rollback an earlier deployment of it, and
+/// a terminate stops one), and suspend and resume stop or restart that.
+/// None for any other action, so one added later is refused until it is given its verb.
+fn gitops_verb(action: &str) -> Option<Verb> {
+    match action {
+        "refresh" | "hard_refresh" => Some(Verb::Refresh),
+        "sync" | "reconcile" | "terminate" | "rollback" => Some(Verb::Sync),
+        "suspend" | "resume" => Some(Verb::Suspend),
+        _ => None,
     }
 }
 
@@ -620,8 +635,9 @@ fn unknown_hint(kinds: &[Kind], api_version: &str, kind_name: &str) -> String {
 mod tests {
     use serde_json::json;
 
-    use super::{Op, Res, SyncRequest, approval_detail, crds_first, ops, unknown_hint};
+    use super::{Op, Res, SyncRequest, approval_detail, crds_first, gitops_verb, ops, unknown_hint};
     use crate::k8s::Kind;
+    use crate::mcp::Verb;
 
     /// A custom resource listed before its CRD is applied after it; the rest keep their order.
     #[test]
@@ -643,6 +659,26 @@ mod tests {
         assert!(unknown_hint(&kinds, "apps/v1", "Stage").contains("discovery runs again"));
         // A group version discovery didn't have was asked of the API server just now.
         assert_eq!(unknown_hint(&kinds, "kwok.x-k8s.io/v1alpha1", "Stage"), " (the API server serves no such type)");
+    }
+
+    #[test]
+    fn each_gitops_action_has_its_verb() {
+        let cases = [
+            ("refresh", Verb::Refresh),
+            ("hard_refresh", Verb::Refresh),
+            ("sync", Verb::Sync),
+            ("reconcile", Verb::Sync),
+            ("suspend", Verb::Suspend),
+            ("resume", Verb::Suspend),
+            ("terminate", Verb::Sync),
+            ("rollback", Verb::Sync),
+        ];
+        for (action, verb) in cases {
+            assert_eq!(gitops_verb(action), Some(verb), "{action}");
+        }
+        // Never `patch`, and nothing for an action without its own verb.
+        assert_eq!(gitops_verb("diagnose"), None);
+        assert_eq!(gitops_verb("delete"), None);
     }
 
     fn app() -> serde_json::Value {

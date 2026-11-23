@@ -25,8 +25,10 @@
   It leaves out events.k8s.io's copy of Events, the old Endpoints and API priority and fairness
   (FlowSchemas); Apply, links and the agents still know them.
 - **Live tables** with kubectl's own columns for every type, including CRDs; CPU/memory from
-  metrics-server; per-type column choice; multi-namespace filter; each type keeps its own filter text (Nodes
-  doesn't show the pod name typed on Pods, and Pods has it back).
+  metrics-server, as bars against each pod's requests and limits (listed once, then kept by a
+  watch: new and resized pods show without listing every pod again); per-type column choice;
+  multi-namespace filter; each type keeps its own filter text (Nodes doesn't show the pod name
+  typed on Pods, and Pods has it back).
 - **Usage timed to metrics-server**: metrics-server measures every `--metric-resolution` (15 s by
   default, often 60 s), so reading it more often returns the same numbers. The pods and nodes
   lists learn the interval from the samples' timestamps and read again just after the next one
@@ -114,6 +116,14 @@
 - **Usage history** (CPU and memory against requests and limits, over 15 minutes to 7 days; the
   last hour at first) for pods and workloads, from the cluster's Prometheus, found automatically and read through the API server proxy. A workload's charts cover up to 300 of its running or pending pods, and its request and limit lines the same pods; once all its pods have finished (a completed Job), the charts show them without request and limit lines, as they may not have run together.
 - **Logs** across all pods of a workload (up to 50, running and newest first), level filter, time range, timeline histogram.
+- **Logs of the checked rows**: check pods, workloads (Deployments, StatefulSets, DaemonSets,
+  ReplicaSets, Jobs) or Services in any table, merged multi-cluster ones included, then **Logs** in the
+  selection bar. One page merges their pods' lines in time order, each tagged with its pod and
+  container (and its namespace or context when they differ), with the same filters, find, Since,
+  Follow and container picker. It reads at most 50 rows and follows at most 50 pods (running and
+  newest first), and says how many were left out. Each cluster's pods show as soon as its rows are
+  read: a cluster that fails, or does not answer within 15 seconds, is named and never holds back the
+  others' pods. F5 finds their pods again.
 - **Shell** (exec with a real terminal), **node shell** (privileged pod, deleted when its shell
   ends or its page goes away) and **port-forward** for pods and services; forwards are remembered
   and restored with one click. Shells and attach need write mode (they run commands in the
@@ -307,7 +317,7 @@
   whose status colors, badges and status buttons read at WCAG AA contrast (4.5:1) on what they are drawn on.
 - **Instant back**: the last 8 lists (up to 10,000 rows in all) are kept, so going back to one
   shows it at once, marked "Updating…", while a fresh list loads and replaces it in one go.
-- **Bulk actions**: check rows, then restart, scale, delete or copy names. Scaling needs the number
+- **Bulk actions**: check rows, then read their logs together, restart, scale, delete or copy names. Scaling needs the number
   of objects typed (the replica count is never suggested), deleting asks as set for the kind (see
   below), and each protected context among them needs its name typed (or a wait); rows from several contexts
   show which one they are on.

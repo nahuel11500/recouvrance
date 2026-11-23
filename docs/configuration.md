@@ -72,7 +72,7 @@ context already shown as `name@file` keeps that name when `name` is freed.
 | `initial_view` | `"pods"` | First page after connecting: `pods`, `workloads`, `cluster`. A set of contexts with a saved session (`sessions`) reopens on its own page instead |
 | `sessions` | | Remembered by the app: where each set of contexts was left, newest first, 20 kept: `{ "contexts": ["prod"], "tabs": [{ "page": "list", "kind": "deployments.apps", "namespaces": ["team-a"], "filter": "web" }], "active_tab": 0, "filters": { "pods": "api" } }`. `page` is `list`, `workloads`, `cluster`, `problems`, `timeline`, `helm` or `argo`; `kind` is the kubectl name. The first window reopens the session of the contexts it connects to. A value that doesn't read takes its default, an entry that doesn't read is dropped, and a type, namespace or page the clusters no longer have falls back to the default; none of it ever stops the file from loading |
 | `window` | | Remembered by the app: `{ "x": 80, "y": 40, "width": 1500, "height": 920, "maximized": false }`, where the first window opens (centered when that is out of reach of every display). One that doesn't read opens at 1500×920, centered |
-| `metrics_refresh`, `detail_refresh`, `overview_refresh` | 15, 5, 30 | Seconds between refreshes. `metrics_refresh` is the shortest wait between reads of metrics-server: the pods and nodes lists read it again when its next sample is due (up to twice its interval or 5 minutes later), and every `metrics_refresh` when its timestamps say nothing; detail pages refresh their related objects and usage every `metrics_refresh`. A page that isn't on screen refreshes nothing: one in the back/forward history, or any page of a window hidden as the desktop reports it (minimized, on another workspace, or on macOS fully covered by other windows; Wayland compositors without the `suspended` state never report it) |
+| `metrics_refresh`, `detail_refresh`, `overview_refresh` | 15, 5, 30 | Seconds between refreshes. `metrics_refresh` is the shortest wait between reads of metrics-server: the pods and nodes lists read it again when its next sample is due (up to twice its interval or 5 minutes later), and every `metrics_refresh` when its timestamps say nothing; detail pages refresh their related objects and usage every `metrics_refresh`. The cluster overview's refresh doesn't list the pods again: it lists them once, then follows them with a watch. A page that isn't on screen refreshes nothing: one in the back/forward history, or any page of a window hidden as the desktop reports it (minimized, on another workspace, or on macOS fully covered by other windows; Wayland compositors without the `suspended` state never report it). Its watch of the pods' requests stops after 5 minutes off screen |
 | `log_tail_lines`, `log_timestamps` | 1000, true | Log viewer |
 | `kubeconfigs`, `kubeconfig_folders` | | Extra kubeconfig files and watched folders (see above) |
 | `context_files` | | `{ "prod": "~/.kube/team-a.yaml" }`: the file each context name belongs to, so a name several files share stays with the first one, and the `name@file` names the others get stay with theirs (see above); filled in on its own |
@@ -226,8 +226,10 @@ agents:
     allow:
       - get,list,logs *                            # read everything
       - restart,scale deployments/web-* -n team-*  # names after the slash
+      - refresh applications.argoproj.io           # Argo CD refresh, deploys nothing
     ask:
-      - patch,apply,delete * --context staging
+      - patch,sync,apply,delete * --context staging
+      - patch,sync,suspend,apply,delete * --context @protected
     deny:
       - "* secrets"
       - "* * --context *prod*"
@@ -241,8 +243,13 @@ an exec command may run, default 30).
 
 A rule is `VERBS RESOURCES[/NAMES] [-n NAMESPACES] [--context CONTEXTS] [until TIME]`. Lists are
 comma-separated, `*` globs work everywhere, an omitted part means `*`, and `-` is an empty list
-(the rule matches nothing; an exported rule with nothing chosen yet is written that way). Deny wins, then ask,
-then allow; anything no rule matches is denied. `approved` lists the requests you approved with
+(the rule matches nothing; an exported rule with nothing chosen yet is written that way). The verbs
+are `get list logs reveal exec scale restart patch refresh sync suspend apply delete drain forward`
+(or `*`); `refresh`, `sync` and `suspend` are the GitOps actions (see [agents](agents.md#rules)). In
+ask and deny rules, the context `@protected` stands for the contexts protected in Settings →
+Contexts, read at each call (every context when the protection can't be read); it never makes a
+request possible that no other rule covers, and an allow or approved rule naming it fails the load.
+Deny wins, then ask, then allow; anything no rule matches is denied. `approved` lists the requests you approved with
 *Always allow this* or *Allow for 1h*: they are allowed even where an ask rule matches, never where a
 deny rule does. An `approved` rule's resource is matched as written (`pods` is not
 `pods.metrics.k8s.io`), and its names and contexts case included. The file is reloaded when it changes, and edits on the Agents page are written back
@@ -254,7 +261,11 @@ were and the Agents page shows the error.
 While the file exists, an agent it doesn't name has no rules, so everything it asks is denied:
 removing an agent's section takes its access away. Deleting an agent on the Agents page removes its
 section too. Before 0.3.0 a new agent got no section until its rules were edited: on the first start
-of 0.3.0 such an agent keeps its rules, and its section is written to the file.
+of 0.3.0 such an agent keeps its rules, and its section is written to the file. Before the GitOps
+verbs, GitOps actions were checked as `patch`: on the first start of the version that added them,
+every rule that names `patch` gets `refresh`, `sync` and `suspend`, and the file is written again,
+once. A verb you take out of a rule after that stays out. If the file changed on disk meanwhile, it
+is not written over: the load fails with the reason, and your edit is loaded (and upgraded) next.
 
 Each section is for the agent with that name, so agent names are unique: creating a second agent
 with a taken name is refused, and if two agents already share a name the file is neither loaded nor

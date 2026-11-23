@@ -126,6 +126,7 @@ impl AppView {
             Route::Settings => "Settings".into(),
             Route::Terminal(_) => "Terminal".into(),
             Route::Apply(_) => "Create / apply".into(),
+            Route::Logs(l) => l.read(cx).title(),
             Route::Agents => "Agents".into(),
         }
     }

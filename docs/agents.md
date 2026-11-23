@@ -60,16 +60,36 @@ Each agent has rules, like Kubernetes RBAC with an effect:
 | Field | Example |
 |---|---|
 | Effect | Allow · Ask me · Deny |
-| Verbs | get, list, logs, reveal (Secret values), exec, scale, restart, patch, apply, delete, drain, * |
+| Verbs | get, list, logs, reveal (Secret values), exec, scale, restart, patch, refresh, sync, suspend, apply, delete, drain, forward, * |
 | Resources | `pods`, `deployments`, `*.cert-manager.io`, `*` |
 | Namespaces | `team-a`, `team-*`, `*` (also covers cluster-scoped objects) |
-| Contexts | `eu-*`, `staging` |
+| Contexts | `eu-*`, `staging`, `@protected` (Ask and Deny rules) |
 | Names | `web-*`, `*` |
+
+`refresh`, `sync` and `suspend` are the GitOps actions of the `gitops` tool: `refresh` an Argo CD
+Application's refresh and hard refresh (git is read again, nothing is deployed), `sync` an Argo CD
+sync, terminate or rollback, or a Flux reconcile (what git holds is deployed), `suspend` a Flux suspend or resume. They are
+not `patch`, so a rule can let an agent refresh freely and ask before a sync, and a rule that allows
+syncing an Application doesn't allow patching its spec. Rules saved by a version before these
+verbs checked GitOps actions as `patch`: on the first start of this version, every rule that
+names `patch` gets the three verbs, once (and rules.yaml is written again), so what it allowed,
+asked or denied it still does. Take `refresh` out of an Ask rule afterwards to let refreshes
+through.
 
 Write mode and protected contexts are for you in the window: an agent's calls don't check them,
 only its rules (with the rate limit and the kill switch below). An Allow rule for a write lets the
 agent write while the window shows `read-only`, and on a protected context without its name typed or a wait;
 to keep agents off a context or from writing, give them *Ask me* or Deny rules for it (or no Allow).
+The context `@protected` stands for the contexts protected in Settings → Contexts, read again at
+each call, so a context protected later (or guessed as production when it appears) is covered
+without editing the rules. It works in Ask and Deny rules only (the Agents page doesn't save an
+Allow rule naming it), and only makes requests stricter:
+an Ask rule covers a request through it only when another rule covers that request too, so it
+never lets an agent ask for, or reach, a context no other rule names. When the protection can't be
+read, every context counts as protected. An Allow rule naming it allows nothing (rules.yaml refuses
+it). The preset *Ask for writes on protected contexts* allows writes and asks for them on
+`@protected`; *GitOps* reads, allows refreshing Argo CD Applications, asks before syncs,
+reconciles and suspends, and denies deleting Applications.
 
 **Deny wins, then Ask me, then Allow; anything no rule matches is denied.** A Deny limited to some
 names hides those objects from lists rather than refusing the whole list. Patching, applying or
@@ -99,14 +119,18 @@ most: past that, or when it fails, the banner says the preview isn't available, 
 asked all the same. Calls an Allow rule lets through are not worked out. The activity log keeps what
 the banner showed with the call.
 The *Always allow this* and *Allow for 1h* offers are left out where no rule can be that narrow:
-exec (a rule cannot pin the command), patches and GitOps actions (nor the patch), scale (nor the
+exec (a rule cannot pin the command), patches (nor the patch), scale (nor the
 replica count), `apply_manifest` (nor the content), requests other than lists with no object name
 (e.g. `check_certificates`: the rule would cover every name), requests across all namespaces (the
 rule would also cover namespaces no rule allows), and dry runs (the rule would allow the real write
-too).
+too), and Flux suspend and resume (one `suspend` verb covers both, so approving a resume would also
+allow suspending). A refresh or a sync gets one: its rule allows that action (`sync`, say) on that
+object only. An Argo CD sync with prune, a rollback or a terminate doesn't: their `sync` rule would
+allow any other sync, prune or rollback of the Application, beyond what the banner showed.
 
 Before any rule is checked, a call's context must be named by one of the agent's Allow or Ask rules
-and not covered by a Deny of everything (`*` verbs, resources, namespaces and names): other contexts
+(`@protected` names none) and not covered by a Deny of everything (`*` verbs, resources, namespaces
+and names, on that context or on `@protected` when it is protected): other contexts
 are never contacted, nor listed to the agent. Calls follow the kubeconfig as it is now: a context
 removed from it is refused, and one pointed at another cluster or user is connected again. The names
 a call passes are validated: a namespace or
@@ -154,7 +178,7 @@ Every change supports `dry_run` except `exec_command`, `drain_node` and the port
 (`gitops` takes it for an Argo CD `sync` or `rollback` only); `my_permissions` names them, from the
 tools' definitions. What some of them need beyond the obvious verb:
 
-- **Argo CD sync, terminate and rollback:** `gitops` on an Application, authorized as `patch` on
+- **Argo CD sync, terminate and rollback:** `gitops` on an Application, authorized as `sync` on
   it. `sync` takes `resources` (sync those alone; hooks run only when the whole Application
   syncs), `prune` (delete what is no longer in git; the approval banner and the reply name what
   it deletes, and a sync that would delete more than the banner listed is refused) and `dry_run`
@@ -181,7 +205,7 @@ tools' definitions. What some of them need beyond the obvious verb:
   newest 20) in time order, each line prefixed with its pod. It needs `get` on the workload; pods
   whose logs the rules don't allow are left out and counted.
 - **Argo CD diagnosis:** `gitops` with `action: diagnose` on an Application changes nothing and
-  needs `get` on it (not `patch`; the activity log doesn't count it as a change). It returns the
+  needs `get` on it (not `refresh` or `sync`; the activity log doesn't count it as a change). It returns the
   diagnosis of the Application's page: a deletion held by a finalizer, a sync running for long,
   a failed sync (each object and why), a sync loop with the `ignoreDifferences` that would stop
   it, what is out of sync, and the fields that differ between what was last applied and the
@@ -268,8 +292,13 @@ tools' definitions. What some of them need beyond the obvious verb:
 Prompts (slash commands in Claude Code: `/mcp__recouvrance__troubleshoot` …): `troubleshoot`, `rightsize`,
 `cert-audit`, `cluster-health`. They chain the tools above into a read-only workflow.
 
-Every call is logged with its decision and rule, and appended to
-`~/.local/share/recouvrance/audit.jsonl` (the folder is 0700, the file 0600). At 10 MiB the log moves to
+Every call is logged with its decision and rule, the client it came from, and the Secrets whose values
+it returned, and appended to
+`~/.local/share/recouvrance/audit.jsonl` (the folder is 0700, the file 0600). The client is the name and
+version the MCP client gives (`claude-code 2.1.3`); the in-app assistant shows as
+`recouvrance-assistant` with an API key, and as `assistant via claude-code …` through Claude Code. It is
+a label the client chooses, not a check. A call that returned Secret values unmasked, which a `reveal`
+rule allows, says which (`Secret shop/db`, `Helm values shop/web revision 3`). At 10 MiB the log moves to
 `audit.jsonl.1`, replacing the older one. If the log cannot be written, the Activity page says so. A
 kill switch cuts all agent access at once. A request nobody answers within 2 minutes is refused: its
 banner counts down to that. So that it is seen with the window behind others or minimized, every
@@ -285,10 +314,13 @@ whether a request was refused, left unanswered, given up by the agent or cut off
 A session ends when its client closes it or after an hour unused, never while its agent still waits
 for one of its calls, however long that takes.
 
-The Activity page groups calls by task: one agent session, split where the agent paused for more than
-10 minutes. Each group says what it touched (contexts, namespaces, objects); repeated calls of a tool on
-the same target fold into one line, and any line opens to its full arguments and result. Filter by
-writes, denied or failed calls, context, agent or text. It shows the latest 300 calls; "Show older"
+The Activity page groups calls by task: one session of one client, split where the agent paused for
+more than 10 minutes. Each group names its client and says what it touched (contexts, namespaces,
+objects) and how many of its calls showed Secret values; repeated calls of a tool on the same target fold
+into one line, and any line opens to its full arguments and result. Filter by writes, denied or failed
+calls, calls that showed Secret values, context, agent or text. The search box also takes terms:
+`client:`, `tool:`, `ctx:`, `ns:` and `kind:` (part of the value), `is:write` and `is:reveal`; every
+term must match. It shows the latest 300 calls; "Show older"
 goes further back, and then reads the log on disk. A call counts as a write when its tool may change
 something (the changes above, and `browse_files` with `debug: true`), but not a dry run nor `gitops`'s
 `diagnose`; each group counts its writes. A `gitops` dry run counts: it writes the Application's

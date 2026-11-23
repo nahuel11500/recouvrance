@@ -24,7 +24,7 @@ Site: [nahuelcanavy.com/recouvrance](https://nahuelcanavy.com/recouvrance/)
 - **Native and fast**: Rust and gpui, no web view. Server-side tables keep clusters with tens of
   thousands of pods in a few hundred megabytes.
 - **Everything in one place**: live tables for every type (CRDs included), logs across pods with
-  find and filters, shell, attach, a file browser and file copy, port-forwards, YAML with field docs and schema forms,
+  find and filters (a workload's, or the checked rows' across namespaces and clusters), shell, attach, a file browser and file copy, port-forwards, YAML with field docs and schema forms,
   Helm, Flux and Argo CD actions, several clusters at once, tabs and windows.
 - **Tells you what is wrong**: a Problems page across clusters, a diagnosis on every broken pod or
   workload, firing alerts, stuck deletions, ExternalSecrets that fail to sync, usage history from
@@ -135,7 +135,7 @@ what you can check for yourself:
   DaemonSets, PersistentVolumes and their claims, and CRDs get the strict confirmation). A
   protected context always gets the strict confirmation: a few seconds' wait by default (the
   confirm button counts down, then works), or the names typed. Write mode and protection are for you in the window:
-  agents are not bound by them. Agents get only what their rules allow (an *Ask me* rule asks you
+  agents are not bound by them, unless their rules name `@protected`. Agents get only what their rules allow (an *Ask me* rule asks you
   first), every call is logged to
   `~/.local/share/recouvrance/audit.jsonl`, and a kill switch cuts them all off.
 - **Verifiable releases.** Every release archive, `.deb` and AppImage has a build provenance
