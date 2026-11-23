@@ -426,6 +426,7 @@ fn render_item(item: &Item, ix: usize, view: &WeakEntity<AgentsView>, cx: &App) 
             .text_xs()
             .child(serde_json::to_string_pretty(&call.args).unwrap_or_default())
             .when(!call.detail.is_empty(), |d| d.child(div().text_color(muted).child(call.detail.clone())))
+            .when_some(call.change.as_deref(), |d, change| d.child(change_block(change, cx)))
             .child(div().text_color(muted).child(format!(
                 "{} · {}ms · {} bytes returned{}",
                 call.time.to_zoned(jiff::tz::TimeZone::system()).strftime("%Y-%m-%d %H:%M:%S"),
@@ -458,6 +459,26 @@ fn render_item(item: &Item, ix: usize, view: &WeakEntity<AgentsView>, cx: &App) 
                 .into_any_element()
         }
     }
+}
+
+/// What a call was to change, as its approval showed it (`Preview::text`): added lines in
+/// green, removed lines and warnings in red.
+fn change_block(text: &str, cx: &App) -> AnyElement {
+    let theme = cx.theme();
+    v_flex()
+        .py_1()
+        .child(div().text_color(theme.muted_foreground).child("What the approval showed:"))
+        .children(text.lines().map(|line| {
+            let color = if line.starts_with("  + ") {
+                theme.success
+            } else if line.starts_with("  - ") || line.starts_with("  ! ") {
+                theme.danger
+            } else {
+                theme.foreground
+            };
+            div().text_color(color).child(line.to_string())
+        }))
+        .into_any_element()
 }
 
 impl AgentsView {
@@ -700,6 +721,7 @@ mod tests {
             duration_ms: 1,
             result_bytes: 0,
             session: None,
+            change: None,
         }
     }
 

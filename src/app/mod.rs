@@ -748,7 +748,12 @@ impl AppView {
         match ev {
             HubEvent::ApprovalRequested(a) => {
                 self.approvals.push(a.clone());
-                notify_desktop(&format!("{} asks to run {}", a.agent, a.tool), &a.summary);
+                // The request, then what it will change (the notification keeps the first lines).
+                let body = match &a.preview {
+                    Some(p) => format!("{}\n{}", a.summary, p.text()),
+                    None => a.summary.clone(),
+                };
+                notify_desktop(&format!("{} asks to run {}", a.agent, a.tool), &body);
             }
             HubEvent::ApprovalResolved(id) => self.approvals.retain(|a| a.id != *id),
             HubEvent::ServerStatus(status) => {

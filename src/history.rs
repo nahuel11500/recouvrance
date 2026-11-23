@@ -351,16 +351,23 @@ fn without_restart(template: &Value) -> Value {
 /// Where two values differ, as paths of at most `PATH_DEPTH` segments. Lists of named items
 /// (containers, env, ports) are matched by name, so one added doesn't shift the others.
 pub(crate) fn changed_paths(a: &Value, b: &Value, path: &mut Vec<String>, out: &mut Vec<Vec<String>>) {
+    changed_paths_to(a, b, PATH_DEPTH, path, out);
+}
+
+/// [`changed_paths`] with paths of at most `depth` segments: a whole object's fields sit
+/// deeper than a pod template's (`spec.template.spec.containers[web].image`).
+pub(crate) fn changed_paths_to(a: &Value, b: &Value, depth: usize, path: &mut Vec<String>, out: &mut Vec<Vec<String>>) {
     if a == b {
         return;
     }
-    if path.len() < PATH_DEPTH {
+    if path.len() < depth {
         if let (Some(x), Some(y)) = (a.as_object(), b.as_object()) {
             let found = out.len();
             let keys: BTreeSet<&String> = x.keys().chain(y.keys()).collect();
             for k in keys {
                 path.push(k.clone());
-                changed_paths(x.get(k).unwrap_or(&Value::Null), y.get(k).unwrap_or(&Value::Null), path, out);
+                let (before, after) = (x.get(k).unwrap_or(&Value::Null), y.get(k).unwrap_or(&Value::Null));
+                changed_paths_to(before, after, depth, path, out);
                 path.pop();
             }
             // Only a null field added or removed: the object itself changed.
@@ -374,7 +381,7 @@ pub(crate) fn changed_paths(a: &Value, b: &Value, path: &mut Vec<String>, out: &
             for k in keys {
                 path.push(format!("[{k}]"));
                 let (before, after) = (x.get(k).copied(), y.get(k).copied());
-                changed_paths(before.unwrap_or(&Value::Null), after.unwrap_or(&Value::Null), path, out);
+                changed_paths_to(before.unwrap_or(&Value::Null), after.unwrap_or(&Value::Null), depth, path, out);
                 path.pop();
             }
             // The same items in another order (or a name twice): the list itself changed.
