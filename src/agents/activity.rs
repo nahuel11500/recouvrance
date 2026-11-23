@@ -70,11 +70,11 @@ impl Search {
         // Every call of the log, on disk too, goes through here: nothing is allocated for a
         // term that isn't there.
         let client = e.client.as_deref().unwrap_or_default();
-        if !(self.client.iter().all(|c| contains_ci(client, c))
-            && self.tool.iter().all(|t| contains_ci(&e.tool, t))
-            && (!self.writes || writes(e))
-            && (!self.revealed || !e.revealed.is_empty()))
-        {
+        let missed = self.client.iter().any(|c| !contains_ci(client, c))
+            || self.tool.iter().any(|t| !contains_ci(&e.tool, t))
+            || (self.writes && !writes(e))
+            || (self.revealed && e.revealed.is_empty());
+        if missed {
             return false;
         }
         if self.page.is_empty() {
@@ -942,7 +942,7 @@ mod tests {
         let get = |secs: i64, revealed: &[&str]| {
             let args = serde_json::json!({"context": "prod", "kind": "secrets", "namespace": "shop", "name": "db"});
             let mut e = call(secs, "get_resource", args, Decision::Allowed);
-            e.revealed = revealed.iter().map(|r| (*r).to_string()).collect();
+            e.revealed = revealed.iter().map(|r| String::from(*r)).collect();
             e
         };
         let calls = vec![get(30, &["Secret shop/db"]), get(20, &[]), get(10, &[])];

@@ -1750,6 +1750,8 @@ mod tests {
             approved_rules: Vec::new(),
             rule: None,
             session: None,
+            client: None,
+            revealed: Vec::new(),
             approval_detail: None,
             plan: None,
             preview: None,
@@ -2017,21 +2019,23 @@ mod tests {
     #[test]
     fn a_client_is_named_by_what_it_sent() {
         use rmcp::model::Implementation;
-        let info = |name: &str, version: &str| Implementation::new(name, version);
-        assert_eq!(client_label(Some(&info("claude-code", "2.1.3")), None).as_deref(), Some("claude-code 2.1.3"));
         assert_eq!(
-            client_label(Some(&info("claude-code", "2.1.3")), Some("assistant")).as_deref(),
+            client_label(Some(&Implementation::new("claude-code", "2.1.3")), None).as_deref(),
+            Some("claude-code 2.1.3")
+        );
+        assert_eq!(
+            client_label(Some(&Implementation::new("claude-code", "2.1.3")), Some("assistant")).as_deref(),
             Some("assistant via claude-code 2.1.3")
         );
-        assert_eq!(client_label(Some(&info("codex", "")), None).as_deref(), Some("codex"));
+        assert_eq!(client_label(Some(&Implementation::new("codex", "")), None).as_deref(), Some("codex"));
         assert_eq!(client_label(None, Some("assistant")).as_deref(), Some("assistant"));
         // Nothing said, or only blanks: no client.
         assert_eq!(client_label(None, None), None);
-        assert_eq!(client_label(Some(&info(" \n", "1")), Some("")), None);
+        assert_eq!(client_label(Some(&Implementation::new(" \n", "1")), Some("")), None);
         // Control characters can't break the log's lines or the page, and a long name is cut.
-        let odd = client_label(Some(&info("evil\nname\u{1b}[31m", "1\r")), None).unwrap();
+        let odd = client_label(Some(&Implementation::new("evil\nname\u{1b}[31m", "1\r")), None).unwrap();
         assert_eq!(odd, "evilname[31m 1");
-        let long = client_label(Some(&info(&"x".repeat(500), &"9".repeat(500))), None).unwrap();
+        let long = client_label(Some(&Implementation::new("x".repeat(500), "9".repeat(500))), None).unwrap();
         assert!(long.chars().count() <= 2 * (MAX_CLIENT_CHARS + 1) + 1, "{long}");
     }
 }
