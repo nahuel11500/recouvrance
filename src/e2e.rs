@@ -895,27 +895,36 @@ fn an_agent_pauses_and_sets_an_image() {
 }
 
 /// `diff_manifest` shows what an apply would change, with get rules only, and changes nothing.
+/// A type the sidebar leaves out (a `FlowSchema`, which kwok's manifest holds) is planned like
+/// any other: `apply_manifest` resolves types the same way.
 #[test]
 #[ignore = "needs a kind cluster: RECOUVRANCE_E2E_CONTEXT"]
 fn an_agent_diffs_a_manifest_without_changing_anything() {
+    use k8s_openapi::api::flowcontrol::v1::FlowSchema;
+
     run(async {
         let ctx = context();
-        let truth: Api<ConfigMap> = Api::namespaced(k8s::connect_for_agents(ctx.clone()).await?, NS);
-        let (name, new) = ("e2e-diff", "e2e-diff-new");
+        let client = k8s::connect_for_agents(ctx.clone()).await?;
+        let truth: Api<ConfigMap> = Api::namespaced(client.clone(), NS);
+        let flows: Api<FlowSchema> = Api::all(client);
+        let (name, new, flow) = ("e2e-diff", "e2e-diff-new", "e2e-diff-flow");
         for n in [name, new] {
             let _ = truth.delete(n, &DeleteParams::default()).await;
         }
+        let _ = flows.delete(flow, &DeleteParams::default()).await;
         truth.create(&PostParams::default(), &config_map(name)).await?;
         let checked = async {
             let (hub, _agent, token, _server) = agent(&["get,list *"], &[]).await?;
             let mcp = crate::assistant::Mcp::connect(hub.port(), token).await?;
             let manifest = format!(
-                "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: {name}\n  namespace: {NS}\ndata:\n  a: \"2\"\n---\napiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: {new}\n  namespace: {NS}\ndata:\n  b: \"1\"\n"
+                "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: {name}\n  namespace: {NS}\ndata:\n  a: \"2\"\n---\napiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: {new}\n  namespace: {NS}\ndata:\n  b: \"1\"\n---\napiVersion: flowcontrol.apiserver.k8s.io/v1\nkind: FlowSchema\nmetadata:\n  name: {flow}\nspec:\n  priorityLevelConfiguration:\n    name: global-default\n"
             );
             let out = mcp.call("diff_manifest", json!({"context": ctx, "manifest": manifest})).await;
             assert!(out.contains("-  a: '1'") || out.contains("-  a: \"1\""), "{out}");
             assert!(out.contains(&format!("ConfigMap {NS}/{new}: created")), "{out}");
+            assert!(out.contains(&format!("FlowSchema {flow}: created")), "{out}");
             assert!(truth.get_opt(new).await?.is_none(), "a diff created an object");
+            assert!(flows.get_opt(flow).await?.is_none(), "a diff created a FlowSchema");
             let a = truth.get(name).await?.data.and_then(|d| d.get("a").cloned());
             assert_eq!(a.as_deref(), Some("1"), "a diff changed an object");
             Ok(())
@@ -1262,7 +1271,8 @@ fn the_files_tab_reads_a_container() {
 
 /// The timeline records what a list's watch sees change, from the metadata alone: a label
 /// set by someone (and who), then the deletion. The agents' `get_changes` returns the record
-/// with its source.
+/// with its source, and `recent_changes` among the namespace's changes, with its events read
+/// from the cluster; rules that keep the agent from reading ConfigMaps leave it out, counted.
 #[test]
 #[ignore = "needs a kind cluster: RECOUVRANCE_E2E_CONTEXT"]
 fn the_timeline_records_what_a_watch_sees_change() {
@@ -1316,11 +1326,20 @@ fn the_timeline_records_what_a_watch_sees_change() {
             let diff = found[0].diff.as_ref().map_or_default(|d| d.short(5));
             assert!(diff.contains("tier: front"), "{diff}");
 
-            let (hub, _agent, token, _server) = agent(&["get,list *"], &[]).await?;
+            let (hub, agent, token, _server) = agent(&["get,list *"], &[]).await?;
             let mcp = crate::assistant::Mcp::connect(hub.port(), token).await?;
             let target = json!({"context": ctx, "kind": "configmaps", "namespace": NS, "name": name});
             let out = mcp.call("get_changes", target).await;
             assert!(out.contains("Recorded  ConfigMap e2e-timeline: labels changed: tier by e2e-editor"), "{out}");
+
+            let recent = json!({"context": ctx, "namespace": NS});
+            let out = mcp.call("recent_changes", recent.clone()).await;
+            let line = "Recorded  ConfigMap default/e2e-timeline: labels changed: tier by e2e-editor";
+            assert!(out.contains(line) && !out.contains("Could not read events"), "{out}");
+            let deny = rules_file::parse_rule(Mode::Deny, "get configmaps")?;
+            hub.update_agent(&agent.id, |a| a.policy.rules.push(deny))?;
+            let out = mcp.call("recent_changes", recent).await;
+            assert!(!out.contains(name) && out.contains("Left out, not allowed by your rules: "), "{out}");
 
             cms.delete(name, &DeleteParams::default()).await?;
             for _ in 0..60 {

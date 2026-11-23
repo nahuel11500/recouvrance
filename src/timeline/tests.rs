@@ -181,3 +181,36 @@ fn a_record_is_a_history_entry_of_its_source() {
         lines[0].starts_with("- ") && lines[0].contains('1') && lines[1].starts_with("+ ") && lines[1].contains('2')
     );
 }
+
+/// What `recent_changes` reads: a context's records from a time on (not another context's),
+/// and how far back they go. Records come roughly in time order, not exactly.
+#[test]
+fn records_from_a_time_on_by_context() {
+    let rec = recorder();
+    let now = jiff::Timestamp::now();
+    let ago = |mins: i64| now - jiff::SignedDuration::from_mins(mins);
+    let record = |name: &str, time: jiff::Timestamp| Record {
+        time,
+        resource: "configmaps".into(),
+        kind: "ConfigMap".into(),
+        namespace: Some("default".into()),
+        name: name.into(),
+        uid: name.into(),
+        what: What::Updated,
+        summary: "changed data.k".into(),
+        before: None,
+        after: None,
+    };
+    let (ctx, other): (Arc<str>, Arc<str>) = ("ctx".into(), "other".into());
+    rec.add(&ctx, record("b", ago(30)));
+    rec.add(&ctx, record("a", ago(90)));
+    rec.add(&other, record("c", ago(5)));
+    let names = |from: jiff::Timestamp| -> Vec<String> {
+        rec.records_since("ctx", from).iter().map(|r| r.name.clone()).collect()
+    };
+    assert_eq!(names(ago(60)), ["b"]);
+    assert_eq!(names(ago(120)), ["b", "a"]);
+    assert!(names(now).is_empty());
+    assert_eq!(rec.oldest("ctx"), Some(ago(90)));
+    assert_eq!(rec.oldest("nothing recorded"), None);
+}

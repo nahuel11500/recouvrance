@@ -51,8 +51,11 @@ The contexts come from, merged in this order:
    clusters that skip TLS verification. Removing one there deletes its file. Oldest first, so a
    new paste never takes a name an existing context has.
 
-The page shows each source with its file and context counts, or why it can't be read. Changes
-to any of these files are picked up within a few seconds. When two files define a context
+The page shows each source with its file and context counts, or why it can't be read. A file
+that fails to parse is said by its path, line and column and a short reason (not valid YAML, a
+missing field...), never by its lines around the error, where a token or a key can be; the
+status line and the agents get the same when no file can be read. Changes to any of these files
+are picked up within a few seconds. When two files define a context
 (or cluster, or user) with the same name, the later one is renamed `name@file` so both stay usable.
 A context name stays with the file that had it first (kept in `context_files`), even when files
 are saved again, reordered, or one is briefly unreadable: protection and per-cluster settings

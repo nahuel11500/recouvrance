@@ -303,6 +303,12 @@ impl AppView {
         let names: Vec<&str> = self.clusters.iter().map(|(n, _)| n.as_str()).collect();
         kinds_per_cluster(&names, &self.kinds, &self.kind_clusters)
     }
+
+    /// The kinds the connected cluster at `ix` of `clusters` serves (none when its discovery
+    /// failed): `kinds` also holds the other clusters' own.
+    pub(super) fn served_kinds(&self, ix: usize) -> impl Iterator<Item = &Kind> {
+        served_by(&self.kinds, &self.kind_clusters, ix)
+    }
 }
 
 /// The kinds each of `names` serves, from where each kind exists (`merge_kinds`). A
@@ -313,11 +319,17 @@ fn kinds_per_cluster(
     kind_clusters: &HashMap<String, Vec<usize>>,
 ) -> HashMap<String, Vec<Kind>> {
     (names.iter().enumerate())
-        .map(|(ix, name)| {
-            let own = kinds.iter().filter(|k| kind_clusters.get(&k.key()).is_some_and(|c| c.contains(&ix))).cloned();
-            (name.to_string(), own.collect())
-        })
+        .map(|(ix, name)| (name.to_string(), served_by(kinds, kind_clusters, ix).cloned().collect()))
         .collect()
+}
+
+/// The kinds the cluster at `ix` serves, from where each kind exists (`merge_kinds`).
+fn served_by<'a>(
+    kinds: &'a [Kind],
+    kind_clusters: &'a HashMap<String, Vec<usize>>,
+    ix: usize,
+) -> impl Iterator<Item = &'a Kind> {
+    kinds.iter().filter(move |k| kind_clusters.get(&k.key()).is_some_and(|c| c.contains(&ix)))
 }
 
 /// Union of every cluster's kinds, with where each one exists. A cluster whose
@@ -423,11 +435,44 @@ fn one_namespace(wanted: &[String], previous: &[String], accessible: &[String]) 
 mod tests {
     use super::{
         Kind, Route, TabState, all_restricted, cluster_namespace, cluster_namespaces, kinds_per_cluster, merge_kinds,
-        one_namespace, served_lists, served_tab,
+        one_namespace, served_by, served_lists, served_tab,
     };
+    use crate::k8s::argo::diagnosis::{Res, known_kind};
 
     fn kind(k: &str) -> Kind {
         Kind::fake("", k)
+    }
+
+    #[test]
+    fn an_argo_cd_resource_opens_with_a_kind_its_own_cluster_serves() {
+        let at = |group: &str, kind: &str, version: &str| {
+            let mut k = Kind::fake(group, kind);
+            k.ar.version = version.into();
+            k.ar.api_version = format!("{group}/{version}");
+            k
+        };
+        let cert = Kind::fake("cert-manager.io", "Certificate");
+        let (hpa1, hpa2) =
+            (at("autoscaling", "HorizontalPodAutoscaler", "v1"), at("autoscaling", "HorizontalPodAutoscaler", "v2"));
+        // The hub serves the CRD and HPAs at v1 and v2, the spoke HPAs at v1 only.
+        let found = vec![Ok(vec![cert.clone(), hpa1.clone(), hpa2.clone()]), Ok(vec![hpa1.clone()])];
+        let (kinds, where_) = merge_kinds(&["hub", "spoke"], found, &mut Vec::new());
+        let open = |ix: usize, group: &str, kind: &str, version: &str| {
+            let res = Res {
+                group: group.into(),
+                kind: kind.into(),
+                name: "x".into(),
+                version: version.into(),
+                ..Default::default()
+            };
+            known_kind(served_by(&kinds, &where_, ix), &res).map(|k| k.key())
+        };
+        assert_eq!(open(0, "cert-manager.io", "Certificate", "v1"), Some(cert.key()));
+        // The hub's CRD isn't the spoke's: looked up on the spoke instead of opened not found.
+        assert_eq!(open(1, "cert-manager.io", "Certificate", "v1"), None);
+        assert_eq!(open(0, "autoscaling", "HorizontalPodAutoscaler", "v2"), Some(hpa2.key()));
+        // A version only the hub serves: the one the spoke serves.
+        assert_eq!(open(1, "autoscaling", "HorizontalPodAutoscaler", "v2"), Some(hpa1.key()));
     }
 
     #[test]
