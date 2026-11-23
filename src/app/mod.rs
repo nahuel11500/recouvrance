@@ -978,7 +978,9 @@ mod tests {
         assert_eq!(rest, ["recouvrance", title, body]);
         assert!(script.iter().all(|a| !a.contains("shell") && !a.contains("evil")));
         // Each statement follows its own -e.
-        assert!(script.chunks_exact(2).all(|pair| pair[0] == "-e" && pair[1] != "-e"));
+        let (pairs, odd) = script.as_chunks::<2>();
+        assert!(odd.is_empty());
+        assert!(pairs.iter().all(|[flag, statement]| *flag == "-e" && *statement != "-e"));
         assert!(script.iter().any(|a| a.contains("item 2 of argv") && a.contains("item 3 of argv")));
     }
 
