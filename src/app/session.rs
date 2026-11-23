@@ -3,7 +3,10 @@
 //! connects to that set reopens them. The window keeps its place and size.
 //!
 //! Saved a moment after each change and when the window closes or the app quits, never while
-//! connecting: a launch whose reconnect fails keeps what was saved.
+//! connecting: a launch whose reconnect fails keeps what was saved. Nor after a connect that
+//! reached only some of the clusters, or could not list one's namespaces: the types and
+//! namespaces only that one has would read as gone, and be saved so. With two windows on one
+//! set, only one saves it (`SessionOwners`).
 
 use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
@@ -23,6 +26,44 @@ const SAVE_AFTER: Duration = Duration::from_secs(2);
 pub(super) struct FirstWindowOpened;
 
 impl Global for FirstWindowOpened {}
+
+/// Which window saves each set of contexts (by `settings::session_set`). Two windows on one
+/// set would else save over each other, the last to quit winning. The one that reopened the
+/// set, or connected to it first, saves it, until the user changes something in another.
+#[derive(Default)]
+pub(super) struct SessionOwners(HashMap<Vec<String>, EntityId>);
+
+impl Global for SessionOwners {}
+
+impl SessionOwners {
+    pub(super) fn owner(&self, set: &[String]) -> Option<EntityId> {
+        self.0.get(set).copied()
+    }
+
+    fn owns(&self, set: &[String], window: EntityId) -> bool {
+        self.owner(set) == Some(window)
+    }
+
+    fn take(&mut self, set: &[String], window: EntityId) {
+        if !set.is_empty() {
+            self.0.insert(set.to_vec(), window);
+        }
+    }
+
+    /// The window leaves the set: closed, or connected to another.
+    fn leave(&mut self, set: &[String], window: EntityId) {
+        if self.owns(set, window) {
+            self.0.remove(set);
+        }
+    }
+
+    /// After `window` connected to `set`: it saves the set when it reopened it or no other
+    /// window did before (`before`). What the connect itself changed doesn't count.
+    fn settle(&mut self, set: &[String], window: EntityId, before: Option<EntityId>, reopened: bool) {
+        let owner = if reopened { window } else { before.unwrap_or(window) };
+        self.take(set, owner);
+    }
+}
 
 impl AppView {
     /// The tabs, namespaces and filters saved for the contexts just connected, put in place
@@ -53,9 +94,14 @@ impl AppView {
     }
 
     /// Where this window is now on its set of contexts; none while it is connecting or not
-    /// connected, so a failed or unfinished connect never overwrites what was saved.
+    /// connected, so a failed or unfinished connect never overwrites what was saved. None
+    /// either after a connect where a cluster failed (`connect_errors`: it didn't answer, or
+    /// its namespaces didn't list), or in a window that doesn't save this set.
     fn session_snapshot(&self, cx: &App) -> Option<Session> {
-        if self.session_key.is_empty() || self.connecting || self.clusters.is_empty() {
+        if self.session_key.is_empty() || self.connecting || self.clusters.is_empty() || self.connect_errors.is_some() {
+            return None;
+        }
+        if !cx.try_global::<SessionOwners>().is_some_and(|o| o.owns(&self.session_key, self.view_id)) {
             return None;
         }
         let shown = self.tab_snapshot(cx);
@@ -78,11 +124,31 @@ impl AppView {
         }
     }
 
+    /// Leave the set of contexts connected: save where this window is on it, and let another
+    /// window on it save it from now on.
+    pub(super) fn leave_session(&mut self, cx: &mut App) {
+        self.save_session_now(cx);
+        let set = std::mem::take(&mut self.session_key);
+        if cx.has_global::<SessionOwners>() {
+            cx.global_mut::<SessionOwners>().leave(&set, self.view_id);
+        }
+    }
+
+    /// The connect has finished: which window saves its set from now on (see
+    /// `SessionOwners::settle`).
+    pub(super) fn settle_session(&self, before: Option<EntityId>, reopened: bool, cx: &mut App) {
+        cx.default_global::<SessionOwners>().settle(&self.session_key, self.view_id, before, reopened);
+    }
+
     /// Something saved changed: save it once changes stop for a moment. The file is written
-    /// off the UI thread.
+    /// off the UI thread. The user changed it here: this window saves its set from now on.
     pub(super) fn session_changed(&mut self, cx: &mut Context<Self>) {
         if self.session_key.is_empty() || self.connecting {
             return;
+        }
+        let owners = cx.default_global::<SessionOwners>();
+        if !owners.owns(&self.session_key, self.view_id) {
+            owners.take(&self.session_key, self.view_id);
         }
         // Replacing the task cancels the wait before: one save per burst of changes.
         self._save_session = Some(cx.spawn(async move |this, cx| {
@@ -94,7 +160,11 @@ impl AppView {
 
     /// The window moved, was resized or maximized: remember where, once it stops.
     pub(super) fn window_moved(&mut self, window: &Window, cx: &mut Context<Self>) {
-        let place = place_of(window.window_bounds());
+        // Maximized before this window was ever windowed: the place saved last time.
+        let place = place_of(window.window_bounds(), self.windowed.or_else(crate::settings::window_place));
+        if !place.maximized {
+            self.windowed = Some(place);
+        }
         self._save_window = Some(cx.spawn(async move |_, cx| {
             cx.background_executor().timer(SAVE_AFTER).await;
             cx.background_spawn(async move { crate::settings::save_window(place) }).await;
@@ -132,11 +202,15 @@ fn on_a_display(place: &WindowPlace, displays: &[Bounds<Pixels>]) -> bool {
     })
 }
 
-/// The window's place to save: its restore size when maximized or fullscreen.
-fn place_of(bounds: WindowBounds) -> WindowPlace {
+/// The window's place to save. Maximized or fullscreen, it keeps the place it had `windowed`:
+/// X11 gives the screen's size there, not the size to restore (Wayland gives that one).
+fn place_of(bounds: WindowBounds, windowed: Option<WindowPlace>) -> WindowPlace {
     let (b, maximized) = match bounds {
         WindowBounds::Windowed(b) => (b, false),
-        WindowBounds::Maximized(b) | WindowBounds::Fullscreen(b) => (b, true),
+        WindowBounds::Maximized(b) | WindowBounds::Fullscreen(b) => match windowed {
+            Some(place) => return WindowPlace { maximized: true, ..place },
+            None => (b, true),
+        },
     };
     WindowPlace {
         x: f32::from(b.origin.x),
@@ -244,11 +318,11 @@ pub(super) fn filters_to_save(
 mod tests {
     use std::collections::{BTreeMap, HashMap};
 
-    use gpui_kit::{Bounds, WindowBounds, point, px, size};
+    use gpui_kit::{Bounds, EntityId, WindowBounds, point, px, size};
 
     use super::{
-        Kind, Overview, Route, SavedPage, SavedTab, Session, TabState, WindowPlace, filters_to_save, on_a_display,
-        place_of, restored, saved_tab,
+        Kind, Overview, Route, SavedPage, SavedTab, Session, SessionOwners, TabState, WindowPlace, filters_to_save,
+        on_a_display, place_of, restored, saved_tab,
     };
 
     fn kind(group: &str, k: &str) -> Kind {
@@ -362,10 +436,43 @@ mod tests {
     #[test]
     fn a_maximized_window_saves_its_restore_size() {
         let b = Bounds { origin: point(px(10.), px(20.)), size: size(px(1200.), px(800.)) };
-        assert_eq!(place_of(WindowBounds::Windowed(b)), place(10., 20., 1200., 800.));
-        let max = place_of(WindowBounds::Maximized(b));
+        let before = place(50., 60., 1000., 700.);
+        assert_eq!(place_of(WindowBounds::Windowed(b), Some(before)), place(10., 20., 1200., 800.));
+        // X11 reports the screen's size when maximized: the place it had windowed is kept.
+        let screen = Bounds { origin: point(px(0.), px(0.)), size: size(px(1920.), px(1080.)) };
+        for bounds in [WindowBounds::Maximized(screen), WindowBounds::Fullscreen(screen)] {
+            assert_eq!(place_of(bounds, Some(before)), WindowPlace { maximized: true, ..before });
+        }
+        // Never windowed, nothing saved: what the desktop gives.
+        let max = place_of(WindowBounds::Maximized(b), None);
         assert!(max.maximized);
         assert_eq!(WindowPlace { maximized: false, ..max }, place(10., 20., 1200., 800.));
-        assert!(place_of(WindowBounds::Fullscreen(b)).maximized);
+    }
+
+    #[test]
+    fn one_window_saves_each_set_of_contexts() {
+        let (first, second): (EntityId, EntityId) = (1u64.into(), 2u64.into());
+        let (set, other) = (v(&["hub", "prod"]), v(&["dev"]));
+        let mut owners = SessionOwners::default();
+        // The first window reopens the set; a second one connects to it and starts fresh:
+        // its own connect (the overview it opens at start) doesn't make it the one saving.
+        owners.settle(&set, first, None, true);
+        owners.take(&set, second);
+        owners.settle(&set, second, Some(first), false);
+        assert_eq!(owners.owner(&set), Some(first));
+        // The user changes something in the second: it saves the set from now on.
+        owners.take(&set, second);
+        assert!(owners.owns(&set, second) && !owners.owns(&set, first));
+        // The first leaving doesn't free what it no longer saves; the second leaving does.
+        owners.leave(&set, first);
+        assert_eq!(owners.owner(&set), Some(second));
+        owners.leave(&set, second);
+        assert_eq!(owners.owner(&set), None);
+        // A set nobody saved: the window connecting to it saves it, even with nothing reopened.
+        owners.settle(&other, second, None, false);
+        assert_eq!(owners.owner(&other), Some(second));
+        // No set (contexts given by a developer hook): nothing is saved.
+        owners.take(&[], first);
+        assert_eq!(owners.owner(&[]), None);
     }
 }

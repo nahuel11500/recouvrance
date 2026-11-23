@@ -17,7 +17,10 @@
   namespace at launch instead of every pod. A resource type, namespace or page the clusters no longer have falls back to the default; a
   detail page reopens on the list or overview it was opened from; a window that would be out of
   reach (a display unplugged) is centered. A window opened later starts fresh, and write mode is
-  always off at launch.
+  always off at launch. While a cluster of the set doesn't answer, or its namespaces don't list
+  (said above the list), nothing is saved for that set: what only that cluster has would read
+  as gone. With two windows on one set, the one that reopened it saves it, until something is
+  changed in the other.
 - **Sidebar**: the filter at its top finds pages and resource types (by name, kind or API group).
   Pages, saved views, favorites and types scroll together; a section folds with a click on its
   name (kept for next time) and says how many types it holds. Port forwards fold into one row at
