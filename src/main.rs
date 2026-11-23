@@ -130,7 +130,16 @@ fn serve() {
         while let Some(ev) = events.next().await {
             match &*ev {
                 mcp::HubEvent::Audit(e) => {
-                    eprintln!("{} {:?} {} {} {}ms {}", e.agent, e.decision, e.tool, e.args, e.duration_ms, e.detail);
+                    let client = e.client.as_ref().map_or_default(|c| format!(" ({c})"));
+                    let revealed = if e.revealed.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" [shown: {}]", e.revealed.join(", "))
+                    };
+                    eprintln!(
+                        "{}{client} {:?} {} {} {}ms {}{revealed}",
+                        e.agent, e.decision, e.tool, e.args, e.duration_ms, e.detail
+                    );
                 }
                 mcp::HubEvent::ServerStatus(Err(e)) => {
                     if *e != last_error {

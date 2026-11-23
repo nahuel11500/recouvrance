@@ -57,7 +57,13 @@ impl KubeMcp {
             let note = if applied.conflict { format!(" ({CONFLICT})") } else { String::new() };
             let shown = |v: &Value| k8s::to_yaml(&without_noise(v), secret, reveal).unwrap_or_default();
             let (before, after) = (applied.live.as_ref().map_or_default(shown), shown(&applied.after));
-            let title = format!("{} {}{name}{note}", kind.ar.kind, ns.map_or_default(|n| format!("{n}/")));
+            let at = ns.map_or_default(|n| format!("{n}/"));
+            // The diff of a Secret that exists and changes shows its live values around the
+            // change; one being created shows only what the agent sent.
+            if secret && reveal && applied.live.is_some() && before != after {
+                call.revealing(format!("Secret {at}{name}"));
+            }
+            let title = format!("{} {at}{name}{note}", kind.ar.kind);
             out.push(unified(&title, &before, &after, applied.live.is_none()));
         }
         call.finish(Ok(out.join("\n")))
