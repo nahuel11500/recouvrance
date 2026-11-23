@@ -229,9 +229,16 @@ obvious verb:
 - **Helm:** the Helm tools read the Secrets Helm keeps releases in, so the rules on `secrets`
   decide: `list` for releases and history, `get` on `sh.helm.release.v1.<name>.v<revision>` for
   values, whose secret-looking keys are masked unless `reveal` is allowed.
+- **Apply:** `apply_manifest` applies a manifest's CRDs first, then its other objects in order. An
+  object of a type a CRD of the same manifest defines is authorized as that CRD says, and applied
+  once the API server serves the type (it waits up to 20 seconds); a dry run can't check it, as
+  the CRD isn't created, and says so. A type whose CRD an earlier call applied, or whose API group
+  version the app hasn't seen, is looked up in that group version at once; a new type in a group
+  version already known waits for discovery to run again, at most once a minute.
 - **Diff:** `diff_manifest` shows what `apply_manifest` would change, object by object, from a
   server-side dry run. It needs `get` on each object, changes nothing, masks Secret values unless
-  `reveal` is allowed, and says when the apply would hit a field-manager conflict.
+  `reveal` is allowed, and says when the apply would hit a field-manager conflict. An object whose
+  CRD is only in the manifest is shown as created, not checked by the server.
 - **About the cluster:** `explain_resource` (field docs, CRDs included) and `cluster_version` read
   no objects; `can_i` asks the API server what the kubeconfig user may do (the agent's own rules are
   `my_permissions`).
