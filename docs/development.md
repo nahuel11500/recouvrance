@@ -48,8 +48,9 @@ settings untouched. Give it another MCP port too (`{"port": 47199, "version": 1}
 have open.
 
 **Smoke checks**: `RECOUVRANCE_SMOKE=<context> cargo run --features dev` lists types and watches
-pods; add `RECOUVRANCE_LISTTIME=1`, `RECOUVRANCE_PROBLEMS=1`, or dry runs such as
-`RECOUVRANCE_NODESHELLDRY=<node>` (see `src/dev/smoke.rs`).
+pods; add `RECOUVRANCE_LISTTIME=1`, `RECOUVRANCE_PROBLEMS=1` (the Problems scan's time and, on
+Linux, the process's peak memory; `RECOUVRANCE_PROBLEMS=kinds` runs each kind's check alone, with
+its own peak), or dry runs such as `RECOUVRANCE_NODESHELLDRY=<node>` (see `src/dev/smoke.rs`).
 
 **Timings**: `RECOUVRANCE_TIMINGS=1` prints to stderr every 10 seconds where the time went (frames,
 table filtering, watch batches, the assistant's API requests) and, for the assistant with an API

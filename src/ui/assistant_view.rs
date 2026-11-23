@@ -468,7 +468,7 @@ impl Render for AssistantView {
                                         .small()
                                         .ghost()
                                         .icon(Lucide::X)
-                                        .tooltip("Hide the assistant (Ctrl+J)")
+                                        .tooltip(crate::app::with_keys("Hide the assistant ({secondary-j})"))
                                         .on_click(cx.listener(|_, _, _, cx| cx.emit(DockEvent::Close))),
                                 )
                             }),
