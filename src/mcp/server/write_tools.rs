@@ -15,6 +15,7 @@ use std::sync::Arc;
 use crate::k8s;
 use crate::k8s::Kind;
 use crate::k8s::argo::diagnosis::{self, Diagnosis, DriftRead, MayRead, Res};
+use crate::k8s::argo::ops::{self, Op, SyncRequest};
 use crate::mcp::{Mode, Policy, Verb};
 
 #[tool_router(router = write_tools, vis = "pub(super)")]
@@ -211,7 +212,7 @@ impl KubeMcp {
     }
 
     #[tool(
-        description = "GitOps actions: Flux `reconcile` (like `flux reconcile`), `suspend`, `resume`; Argo CD Application `refresh`, `hard_refresh` (renders its manifests again, without Argo CD's cache) or `sync`, authorized as `patch` on the object. Argo CD `diagnose` changes nothing (authorized as `get`): why the Application drifts, keeps syncing (a sync loop, with the `ignoreDifferences` that would stop it), failed (hook, admission, missing CRD...) or is stuck (a long sync, a finalizer holding its deletion), and for each out-of-sync resource the fields that differ between what was last applied and the live object on its destination, with who wrote them since the last sync. The destination's objects are read only where your rules allow `get`.",
+        description = "GitOps actions: Flux `reconcile` (like `flux reconcile`), `suspend`, `resume`; Argo CD Application `refresh`, `hard_refresh` (renders its manifests again, without Argo CD's cache), `sync` (optionally of some `resources` only, with `prune`, or a `dry_run` whose result is returned), `terminate` (stops the operation running, like `argocd app terminate-op`) or `rollback` (to a deployment of its history, like `argocd app rollback`; refused while auto-sync is on), authorized as `patch` on the object. Like argocd-server, nothing starts while another operation runs. Argo CD `diagnose` changes nothing (authorized as `get`): why the Application drifts, keeps syncing (a sync loop, with the `ignoreDifferences` that would stop it), failed (hook, admission, missing CRD...) or is stuck (a long sync, a finalizer holding its deletion), and for each out-of-sync resource the fields that differ between what was last applied and the live object on its destination, with who wrote them since the last sync. The destination's objects are read only where your rules allow `get`.",
         annotations(read_only_hint = false)
     )]
     async fn gitops(
@@ -219,38 +220,61 @@ impl KubeMcp {
         Extension(parts): Extension<Parts>,
         Parameters(p): Parameters<GitOpsParams>,
     ) -> Result<String, String> {
-        let args =
-            json!({"context": p.context, "kind": p.kind, "namespace": p.namespace, "name": p.name, "action": p.action});
+        let resources: Option<Vec<serde_json::Value>> = p.resources.as_ref().map(|rs| {
+            rs.iter()
+                .map(|r| json!({"group": r.group, "kind": r.kind, "namespace": r.namespace, "name": r.name}))
+                .collect()
+        });
+        let args = json!({"context": p.context, "kind": p.kind, "namespace": p.namespace, "name": p.name,
+            "action": p.action, "resources": resources, "prune": p.prune, "dry_run": p.dry_run,
+            "deployment_id": p.deployment_id});
         let mut call = self.begin(&parts, "gitops", args)?;
         let (client, kind) = self.kind(&call, &p.context, &p.kind).await?;
         let flux = kind.ar.group.ends_with(".toolkit.fluxcd.io");
         let argo = kind.is("argoproj.io", "Application");
         let ok = match p.action.as_str() {
             "reconcile" | "suspend" | "resume" => flux,
-            "refresh" | "hard_refresh" | "sync" | "diagnose" => argo,
+            "refresh" | "hard_refresh" | "sync" | "terminate" | "rollback" | "diagnose" => argo,
             _ => false,
         };
         if !ok {
             return call.finish(Err(anyhow::anyhow!(
-                "`{}` does not apply to {} (Flux: reconcile/suspend/resume; Argo CD applications: refresh/hard_refresh/sync/diagnose)",
+                "`{}` does not apply to {} (Flux: reconcile/suspend/resume; Argo CD applications: refresh/hard_refresh/sync/terminate/rollback/diagnose)",
                 p.action,
                 kind.ar.kind
             )));
         }
+        if let Some(why) = gitops_option_misuse(&p) {
+            return Err(call.fail(why));
+        }
         if p.action == "diagnose" {
             return self.argo_diagnose(call, client, kind, &p.context, &p.namespace, &p.name).await;
+        }
+        let op = argo_op(&p);
+        // What a prune deletes is part of what is approved: read before asking, never shown
+        // to the agent before its rules allow the call (a failed read just says nothing).
+        if let Some(Op::Sync(req)) = &op
+            && req.prune
+            && let Ok(app) = super::get_named(&client, &kind, Some(p.namespace.as_str()), &p.name, false).await
+        {
+            let gone = ops::pruned(&app, &req.resources);
+            call.approval_detail = Some(if gone.is_empty() {
+                "prune: nothing to delete".to_string()
+            } else {
+                format!("prune deletes {}: {}", gone.len(), ops::named(&gone))
+            });
         }
         let access = access_for(&kind, &p.context, Verb::Patch, Some(p.namespace.clone()), Some(p.name.clone()));
         self.authorize(&mut call, &access).await?;
         self.recheck(&mut call, &access)?;
         let (ns, name) = (Some(p.namespace), p.name);
-        call.finish(match p.action.as_str() {
-            "reconcile" => k8s::flux_reconcile(client, kind, ns, name).await,
-            "suspend" => k8s::merge_patch(client, kind, ns, name, json!({"spec": {"suspend": true}}), false).await,
-            "resume" => k8s::merge_patch(client, kind, ns, name, json!({"spec": {"suspend": false}}), false).await,
-            "refresh" => k8s::argo_refresh(client, kind, ns, name, false).await,
-            "hard_refresh" => k8s::argo_refresh(client, kind, ns, name, true).await,
-            _ => k8s::argo_sync(client, kind, ns, name).await,
+        call.finish(match (p.action.as_str(), op) {
+            (_, Some(op)) => k8s::argo_operation(client, kind, ns, name, op).await,
+            ("reconcile", _) => k8s::flux_reconcile(client, kind, ns, name).await,
+            ("suspend", _) => k8s::merge_patch(client, kind, ns, name, json!({"spec": {"suspend": true}}), false).await,
+            ("resume", _) => k8s::merge_patch(client, kind, ns, name, json!({"spec": {"suspend": false}}), false).await,
+            ("hard_refresh", _) => k8s::argo_refresh(client, kind, ns, name, true).await,
+            _ => k8s::argo_refresh(client, kind, ns, name, false).await,
         })
     }
 
@@ -271,6 +295,53 @@ impl KubeMcp {
         self.authorize(&mut call, &access).await?;
         self.recheck(&mut call, &access)?;
         call.finish(k8s::delete(client, kind, p.namespace, p.name, None, p.dry_run.unwrap_or(false)).await)
+    }
+}
+
+/// An option given to a `gitops` action that doesn't take it: said, not ignored, so an agent
+/// never believes it got a dry run or a partial sync it did not.
+fn gitops_option_misuse(p: &GitOpsParams) -> Option<String> {
+    let action = p.action.as_str();
+    if p.resources.is_some() && action != "sync" {
+        return Some("`resources` applies to `sync` only".into());
+    }
+    if p.resources.as_ref().is_some_and(Vec::is_empty) {
+        return Some("`resources` is empty: omit it to sync the whole Application".into());
+    }
+    if p.prune == Some(true) && action != "sync" {
+        return Some("`prune` applies to `sync` only (a rollback never prunes)".into());
+    }
+    if p.dry_run == Some(true) && !matches!(action, "sync" | "rollback") {
+        return Some(format!("`{action}` has no dry run: `dry_run` applies to `sync` and `rollback`"));
+    }
+    if p.deployment_id.is_some() && action != "rollback" {
+        return Some("`deployment_id` applies to `rollback` only".into());
+    }
+    None
+}
+
+/// The Argo CD operation a `gitops` action writes, for those that write one.
+fn argo_op(p: &GitOpsParams) -> Option<Op> {
+    let dry_run = p.dry_run.unwrap_or(false);
+    match p.action.as_str() {
+        "sync" => {
+            let resources = p
+                .resources
+                .iter()
+                .flatten()
+                .map(|r| Res {
+                    group: r.group.clone().unwrap_or_default(),
+                    kind: r.kind.clone(),
+                    namespace: r.namespace.clone().unwrap_or_default(),
+                    name: r.name.clone(),
+                    version: String::new(),
+                })
+                .collect();
+            Some(Op::Sync(SyncRequest { resources, prune: p.prune.unwrap_or(false), dry_run }))
+        }
+        "rollback" => Some(Op::Rollback { id: p.deployment_id, dry_run }),
+        "terminate" => Some(Op::Terminate),
+        _ => None,
     }
 }
 

@@ -100,9 +100,21 @@ change something, `debug_pod`, `port_forward` and `browse_files` only add (`dest
 `trigger_cronjob` doesn't say so: the Job it starts runs the CronJob's own code, which may delete
 or overwrite data.
 
-Every change supports `dry_run` except `exec_command`, `drain_node`, `gitops` and the port-forward
-tools; `my_permissions` names them, from the tools' definitions. What some of them need beyond the
-obvious verb:
+Every change supports `dry_run` except `exec_command`, `drain_node` and the port-forward tools
+(`gitops` takes it for an Argo CD `sync` or `rollback` only); `my_permissions` names them, from the
+tools' definitions. What some of them need beyond the obvious verb:
+
+- **Argo CD sync, terminate and rollback:** `gitops` on an Application, authorized as `patch` on
+  it. `sync` takes `resources` (sync those alone; hooks run only when the whole Application
+  syncs), `prune` (delete what is no longer in git; the approval banner and the reply name what
+  it deletes) and `dry_run` (Argo CD's own dry run: nothing is applied, and the reply waits up to
+  30 s for what Argo CD would do). `terminate` stops the operation running, like
+  `argocd app terminate-op`. `rollback` goes back to a deployment of `status.history`
+  (`deployment_id`, or the one before the newest), like `argocd app rollback`: the deployment's
+  revision and source applied again, without hooks and without prune. As argocd-server does,
+  nothing starts while another operation runs, and a rollback is refused while auto-sync is on.
+  The Application is read right before the write, which carries the version read: a change
+  meanwhile refuses it.
 
 - **Custom and external metrics:** `get_metrics` reads `custom.metrics.k8s.io` and
   `external.metrics.k8s.io`, what an HPA or KEDA gets from prometheus-adapter, like

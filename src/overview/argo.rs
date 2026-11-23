@@ -2,15 +2,17 @@
 //! into the namespace, as read on Argo CD's cluster. On an Application's page, where it
 //! deploys, what is wrong with it, and the table of its resources.
 
+use std::rc::Rc;
+
 use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::component::button::{Button, ButtonVariants};
-use gpui_kit::component::{ActiveTheme as _, Sizable as _, h_flex, v_flex};
+use gpui_kit::component::{ActiveTheme as _, Disableable as _, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use serde_json::Value;
 
 use super::{Ctx, column_cell, field, heading, mono, row};
-use crate::details::{DetailPanel, OpenOn};
+use crate::details::{ArgoAction, DetailPanel, OpenOn};
 use crate::k8s;
 use crate::k8s::argo::diagnosis::{self, Compared, Diagnosis, Drift, Finding, Res};
 use crate::k8s::argo::{self, Found, ResourceRow, Summary};
@@ -44,7 +46,7 @@ pub(super) fn section(ctx: &Ctx, cx: &App) -> Option<Div> {
         v_flex()
             .gap_2()
             .child(heading(&title))
-            .when_some(own.as_ref(), |d, app| d.child(own_card(app, cx)))
+            .when_some(own.as_ref(), |d, app| d.child(own_card(ctx, app, cx)))
             .when(deployed_by, |d| d.child(div().text_xs().text_color(muted).child(selectable("Deployed by"))))
             .when_some(lookup.note.as_ref(), |d, note| {
                 d.child(div().text_xs().text_color(muted).child(selectable(note.clone())))
@@ -69,10 +71,15 @@ fn status_row(app: &Summary, cx: &App) -> Div {
         })
 }
 
-/// The Application of the page itself: its status and health message. What is wrong with it
-/// (a failed sync, errors, a deletion held) is under Diagnosis.
-fn own_card(app: &Summary, cx: &App) -> Div {
+/// The Application of the page itself: its status, health message and last deployments (each
+/// but the newest can be rolled back to). What is wrong with it (a failed sync, errors, a
+/// deletion held) is under Diagnosis.
+fn own_card(ctx: &Ctx, app: &Summary, cx: &App) -> Div {
     let theme = cx.theme();
+    let panel = ctx.panel.clone();
+    let roll_back: RollBack = Rc::new(move |id: i64, window: &mut Window, cx: &mut App| {
+        let _ = panel.update(cx, |p, cx| p.confirm_own_argo(ArgoAction::Rollback(Some(id)), window, cx));
+    });
     v_flex()
         .p_2()
         .gap_2()
@@ -84,6 +91,7 @@ fn own_card(app: &Summary, cx: &App) -> Div {
         .when_some(app.health_message.as_ref(), |d, m| {
             d.child(div().text_sm().text_color(theme.muted_foreground).child(selectable(m.clone())))
         })
+        .when(!app.history.is_empty(), |d| d.child(history(app, "argo-own-rollback", &roll_back, cx)))
 }
 
 fn app_card(ctx: &Ctx, ix: usize, found: &Found, full: bool, cx: &App) -> Div {
@@ -133,14 +141,20 @@ fn app_card(ctx: &Ctx, ix: usize, found: &Found, full: bool, cx: &App) -> Div {
             let color = if ty.ends_with("Warning") { theme.warning } else { theme.danger };
             div().text_sm().text_color(color).child(selectable(format!("{ty}: {message}")))
         }))
-        .when(full && !app.history.is_empty(), |d| d.child(history(app, cx)))
+        .when(full && !app.history.is_empty(), |d| {
+            let panel = ctx.panel.clone();
+            let roll_back: RollBack = Rc::new(move |id: i64, window: &mut Window, cx: &mut App| {
+                let _ = panel.update(cx, |p, cx| p.confirm_argo(ix, ArgoAction::Rollback(Some(id)), window, cx));
+            });
+            d.child(history(app, ("argo-rollback", ix * 16), &roll_back, cx))
+        })
 }
 
 /// The name (opens the Application on its cluster), where it runs, and its actions.
 fn header(ctx: &Ctx, ix: usize, found: &Found, cx: &App) -> Div {
     let app = &found.app;
     let panel = ctx.panel.clone();
-    let (open, refresh, sync) = (panel.clone(), panel.clone(), panel);
+    let (open, refresh, sync, terminate) = (panel.clone(), panel.clone(), panel.clone(), panel);
     h_flex()
         .gap_2()
         .flex_wrap()
@@ -177,14 +191,27 @@ fn header(ctx: &Ctx, ix: usize, found: &Found, cx: &App) -> Div {
         }))
         .child(Button::new(("argo-refresh", ix)).xsmall().ghost().icon(Lucide::RefreshCw).label("Refresh").on_click(
             move |_, window, cx| {
-                let _ = refresh.update(cx, |p, cx| p.confirm_argo(ix, false, window, cx));
+                let _ = refresh.update(cx, |p, cx| p.confirm_argo(ix, ArgoAction::Refresh, window, cx));
             },
         ))
         .child(Button::new(("argo-sync", ix)).xsmall().ghost().icon(Lucide::GitBranch).label("Sync").on_click(
             move |_, window, cx| {
-                let _ = sync.update(cx, |p, cx| p.confirm_argo(ix, true, window, cx));
+                let _ = sync.update(cx, |p, cx| p.confirm_argo(ix, ArgoAction::Sync, window, cx));
             },
         ))
+        // While an operation runs: it can be stopped, as `argocd app terminate-op` does.
+        .when(app.in_progress, |d| {
+            d.child(
+                Button::new(("argo-terminate", ix))
+                    .xsmall()
+                    .ghost()
+                    .icon(Lucide::CircleStop)
+                    .label("Terminate")
+                    .on_click(move |_, window, cx| {
+                        let _ = terminate.update(cx, |p, cx| p.confirm_argo(ix, ArgoAction::Terminate, window, cx));
+                    }),
+            )
+        })
 }
 
 /// An Application's page: where it deploys, its namespace opening on the context that
@@ -536,10 +563,31 @@ fn short_url(url: &str) -> String {
     rest.split('/').next().unwrap_or(rest).to_string()
 }
 
-fn history(app: &Summary, cx: &App) -> Div {
+/// Roll an Application back to the deployment with this id (after its confirmation).
+type RollBack = Rc<dyn Fn(i64, &mut Window, &mut App)>;
+
+/// The last deployments, newest first. Each but the newest offers to roll back to it, which
+/// Argo CD allows only with auto-sync off; `id` numbers those buttons.
+fn history(app: &Summary, id: (&'static str, usize), roll_back: &RollBack, cx: &App) -> Div {
     let muted = cx.theme().muted_foreground;
     v_flex().gap_0p5().child(div().text_xs().text_color(muted).child(selectable("Deployed"))).children(
-        app.history.iter().map(|h| {
+        app.history.iter().enumerate().map(|(i, h)| {
+            let button = h.id.filter(|_| i > 0).map(|deployment| {
+                let roll_back = roll_back.clone();
+                Button::new((id.0, id.1 + i))
+                    .xsmall()
+                    .ghost()
+                    .icon(Lucide::Undo2)
+                    .label("Roll back…")
+                    .when(app.automated, |b| {
+                        b.disabled(true)
+                            .tooltip("Auto-sync is on: Argo CD refuses a rollback. Revert the change in git.")
+                    })
+                    .when(!app.automated, |b| {
+                        b.tooltip(format!("Deploy this revision again (deployment {deployment})"))
+                    })
+                    .on_click(move |_, window, cx| roll_back(deployment, window, cx))
+            });
             h_flex()
                 .gap_3()
                 .text_sm()
@@ -548,6 +596,7 @@ fn history(app: &Summary, cx: &App) -> Div {
                 .when_some(h.by.as_ref(), |d, by| {
                     d.child(div().text_color(muted).child(selectable(format!("by {by}"))))
                 })
+                .children(button)
         }),
     )
 }

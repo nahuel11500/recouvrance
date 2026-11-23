@@ -194,8 +194,9 @@
   its store, last refresh, Ready), and an ExternalSecret's page links its store and target Secret.
 - **Argo CD panel**: a namespace's page shows the Applications deploying into it, and an object's
   page the Application that deployed it (by its tracking id): sync and health, auto-sync,
-  revision, last sync, conditions, the last 5 deployments, a link to the Application, and
-  *Refresh*/*Sync* (write mode and the hub's protection apply). The Applications are read from the
+  revision, last sync, conditions, the last 5 deployments (each but the newest with *Roll
+  back…*), a link to the Application, and *Refresh*/*Sync* (*Terminate* while an operation runs;
+  write mode and the hub's protection apply). The Applications are read from the
   hub, found among the connected clusters, else among other kubeconfig contexts that need no
   separate login; when the hub isn't found, the Argo CD page lists the contexts left out (named
   like a hub first) to ask with one click, and the one that answers is kept. It can also be
@@ -211,9 +212,23 @@
   Red is for a failed sync, an error Argo CD reports or Degraded health: an Application with
   auto-sync off that is out of sync (a `*-workload` one synced by hand) is not red. A click opens
   the Application's page, which links to its destination namespace (connecting to that context
-  when it isn't); the row menu also opens the destination and asks for *Refresh*, *Hard refresh*
-  or *Sync* (write mode and the Argo CD cluster's protection apply). An Argo CD cluster that
-  can't be read is named above the list; the others are shown.
+  when it isn't); the row menu also opens the destination and asks for *Refresh*, *Hard refresh*,
+  *Sync*, *Terminate* (while an operation runs) or *Roll back to the previous deployment* (auto-sync
+  off) (write mode and the Argo CD cluster's protection apply). An Argo CD cluster that can't be
+  read is named above the list; the others are shown.
+- **Argo CD sync, terminate and roll back**: *Sync* (the Application's page, its row menu, the
+  Argo CD panel) reads the Application first and lists its resources out of sync, all ticked:
+  untick some to sync only the others (hooks run only when all are synced; past 200 the whole
+  Application syncs). *Prune*, off by default, names exactly what it deletes (out of sync and no
+  longer in git, of the resources ticked); *Dry run* applies nothing, and what Argo CD would do is
+  shown when it ends (waited for up to 30 s). *Terminate* stops the operation running, as
+  `argocd app terminate-op` does. *Roll back…* on a past deployment (the Application's page, the
+  Argo CD panel, the row menu for the previous one) applies that deployment's revision and
+  sources again, without hooks or prune, as `argocd app rollback` does; with auto-sync on it is
+  disabled, since Argo CD refuses it (revert in git instead). Like argocd-server, nothing starts
+  while another operation runs, and the write carries the version of the Application just read,
+  so a change meanwhile refuses it. Each dialog shows the `kubectl patch` it sends; write mode,
+  the hub's protection and *Run as* apply.
 - **Argo CD resources**: an Application's page lists what Argo CD tracks for it
   (`status.resources`) as a table: kind, namespace/name, sync, health, whether it is a hook, and
   a message (its health message, and *no longer in git* for one out of sync that a sync with
@@ -230,7 +245,7 @@
   what to do:
   - *Being deleted*: the finalizers holding it (what each one waits for) and the resources not
     deleted yet, read live on the destination when it is connected; red after 5 minutes.
-  - *Sync running* for more than 10 minutes: the hook or resource it waits for.
+  - *Sync running* for more than 10 minutes: the hook or resource it waits for (*Terminate* stops it).
   - *Last sync failed*: each object that failed and why, from Argo CD's messages: a hook that
     failed, rejected by admission (a webhook, Pod Security), a webhook that did not answer, a
     kind not served (CRD missing), a namespace that does not exist, a quota, RBAC, the
@@ -296,7 +311,7 @@
   debug pods with an ephemeral container (falls back to a Pod Security "restricted" profile), run a CronJob now, suspend/resume (CronJobs, Flux, Argo CronWorkflows), drain nodes, force delete
   or remove finalizers (only once the delete leaves it stuck terminating: it already was, or still is
   after 10 seconds), Flux *Reconcile*, Argo CD
-  *Refresh*/*Hard refresh*/*Sync*, create/apply YAML (a server dry run first, then a confirmation listing each
+  *Refresh*/*Hard refresh*/*Sync*/*Terminate*/*Roll back*, create/apply YAML (a server dry run first, then a confirmation listing each
   object's kind, namespace and name). YAML edits on a detail page save only that object: a changed
   kind, API group, namespace or name is refused, and so are masked Secret values. Every
   confirmation shows the equivalent `kubectl` command. A page whose object is deleted says so and
@@ -309,7 +324,7 @@
   nothing). Actions disabled because your RBAC forbids them stay enabled when the context has an
   identity. Covered: scale, restart, rollback, delete (force, finalizers), YAML save, the values
   editor, Apply, cordon/uncordon, drain, CronJob run, suspend/resume, Flux reconcile, Argo CD
-  refresh/sync, role bindings. Not covered: Helm, bulk delete from tables, plugins, shells, debug,
+  refresh/sync/terminate/rollback, role bindings. Not covered: Helm, bulk delete from tables, plugins, shells, debug,
   node shell, file copy and ServiceAccount kubeconfigs. Agents never run as it.
 - **Plugins**: your own commands on resources (`~/.config/recouvrance/plugins.yaml`):
   `$CONTEXT`, `$NAMESPACE`, `$NAME`, `$KIND` are filled in and kubectl points at the cluster; they

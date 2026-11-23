@@ -180,12 +180,15 @@ fn describe(a: &Access) -> String {
 
 /// Arguments that change what a call does, for the approval banner: what the user
 /// approves is what runs. Values come from the (redacted) logged arguments.
-const KEY_ARGS: [&str; 12] = [
+const KEY_ARGS: [&str; 15] = [
     "command",
     "path",
     "patch",
     "replicas",
     "action",
+    "resources",
+    "prune",
+    "deployment_id",
     "container",
     "to_revision",
     "image",
@@ -760,9 +763,36 @@ pub struct GitOpsParams {
     pub namespace: String,
     pub name: String,
     #[schemars(
-        description = "reconcile (Flux) · refresh, hard_refresh or sync (Argo CD) · suspend or resume (Flux) · diagnose (Argo CD, read only)"
+        description = "reconcile (Flux) · refresh, hard_refresh, sync, terminate (the operation running) or rollback (Argo CD) · suspend or resume (Flux) · diagnose (Argo CD, read only)"
     )]
     pub action: String,
+    #[schemars(
+        description = "sync only: sync these resources of the Application alone (hooks don't run then); omit to sync it whole"
+    )]
+    pub resources: Option<Vec<ArgoResource>>,
+    #[schemars(
+        description = "sync only: also delete what is no longer in git (of the resources named, when some are); the reply names what it deletes"
+    )]
+    pub prune: Option<bool>,
+    #[schemars(
+        description = "sync or rollback: Argo CD applies nothing and reports what it would do (the reply waits up to 30 s for it)"
+    )]
+    pub dry_run: Option<bool>,
+    #[schemars(
+        description = "rollback only: the id of the deployment in status.history to go back to; omit for the one before the newest. Argo CD refuses a rollback while auto-sync is on"
+    )]
+    pub deployment_id: Option<i64>,
+}
+
+/// A resource of an Argo CD Application, as its `status.resources` names it.
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct ArgoResource {
+    #[schemars(description = "API group; empty or omitted for the core group")]
+    pub group: Option<String>,
+    pub kind: String,
+    #[schemars(description = "omit for a cluster-scoped resource")]
+    pub namespace: Option<String>,
+    pub name: String,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]

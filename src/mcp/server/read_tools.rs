@@ -982,9 +982,11 @@ mod tests {
             .map(|t| t.name.to_string())
             .collect();
         assert_eq!(named, take);
-        // Every change but exec_command, drain_node, gitops and the port-forward tools (docs/agents.md).
-        assert_eq!(take.len(), 13, "{take:?}");
+        // Every change but exec_command, drain_node and the port-forward tools (docs/agents.md);
+        // gitops's is Argo CD's own dry run of a sync or a rollback.
+        assert_eq!(take.len(), 14, "{take:?}");
         assert!(take.contains("set_image") && take.contains("cordon_node") && take.contains("debug_pod"), "{take:?}");
+        assert!(take.contains("gitops"), "{take:?}");
     }
 
     /// `my_permissions` says which tool never asks, by the name of a tool that only reads.
