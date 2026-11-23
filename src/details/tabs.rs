@@ -496,9 +496,8 @@ impl Render for DetailPanel {
         {
             tabs.push(DetailTab::Revisions);
         }
-        if self.obj.kind.ar.group == "apps" || self.obj.kind.is("batch", "Job") || self.obj.kind.is("", "Pod") {
-            tabs.push(DetailTab::Map);
-        }
+        // Every kind has a Map: at least its owners and what it owns.
+        tabs.push(DetailTab::Map);
         if self.logs.is_some() {
             tabs.push(DetailTab::Logs);
         }
@@ -525,10 +524,7 @@ impl Render for DetailPanel {
             DetailTab::Reachability => self.render_reachability(cx),
             DetailTab::Compare => self.render_compare(cx),
             DetailTab::History => self.render_history(cx),
-            DetailTab::Map => match &self.object {
-                Some(v) => crate::overview::relations(&self.ctx(v, cx), cx),
-                None => div().into_any_element(),
-            },
+            DetailTab::Map => self.render_map(cx),
             DetailTab::Revisions => match &self.object {
                 Some(v) => crate::overview::revisions(&self.ctx(v, cx), cx),
                 None => div().into_any_element(),
@@ -667,10 +663,7 @@ impl Render for DetailPanel {
                         let _ = view.update(cx, |this, cx| {
                             this.tab = tab;
                             this.resume_logs_if_shown(cx);
-                            // Checked again each time it is opened: the cluster moves on.
-                            if tab == DetailTab::Reachability {
-                                this.check_reachability(cx);
-                            }
+                            this.tab_opened(cx);
                             cx.notify();
                         });
                     }),
