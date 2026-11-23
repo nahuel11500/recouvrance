@@ -480,7 +480,7 @@ impl KubeMcp {
     /// Identify the agent and apply the checks every tool shares.
     fn begin(&self, parts: &Parts, tool: &'static str, args: serde_json::Value) -> Result<Call, String> {
         let id = parts.extensions.get::<AgentId>().map(|a| a.0.clone()).ok_or("unauthenticated")?;
-        let agent = self.hub.agent(&id).ok_or("unknown agent")?;
+        let agent = self.hub.agent_for_calls(&id).ok_or("unknown agent")?;
         let session = parts.headers.get("mcp-session-id").and_then(|v| v.to_str().ok()).map(String::from);
         let invalid = validate_args(&args).err();
         let context = args.get("context").and_then(|v| v.as_str()).map(String::from);
@@ -617,6 +617,9 @@ impl KubeMcp {
                 preview: call.preview.clone(),
                 access: access.clone(),
                 dry_run: call.args.get("dry_run").and_then(serde_json::Value::as_bool).unwrap_or(false),
+                once_only: call.tool == "gitops"
+                    && (matches!(call.args["action"].as_str(), Some("rollback" | "terminate"))
+                        || call.args["prune"].as_bool() == Some(true)),
                 deadline: Instant::now(),
             };
             let answer = self.hub.request_approval(request, call.gone.wait()).await;
@@ -652,7 +655,7 @@ impl KubeMcp {
     /// Read the agent's rules again. A removed agent keeps its old rules, and
     /// [`Self::ensure_active`] then refuses the call.
     fn reload_rules(&self, call: &mut Call) {
-        if let Some(agent) = self.hub.agent(&call.agent.id) {
+        if let Some(agent) = self.hub.agent_for_calls(&call.agent.id) {
             call.agent = agent;
         }
     }
@@ -820,7 +823,7 @@ pub struct PlannedRequest {
     #[schemars(description = "kubeconfig context name, from list_contexts")]
     pub context: String,
     #[schemars(
-        description = "the rules' verb: get, list, logs, reveal, exec, scale, restart, patch, apply, delete, drain or forward"
+        description = "the rules' verb: get, list, logs, reveal, exec, scale, restart, patch, refresh, sync, suspend, apply, delete, drain or forward"
     )]
     pub verb: String,
     #[schemars(description = "resource type like kubectl: pods, deploy, certificates.cert-manager.io")]
@@ -1298,7 +1301,7 @@ pub(crate) fn stop_check(
         if let Some(reason) = inactive(&hub, &agent_id, &gone) {
             return Some(reason.to_string());
         }
-        let mode = hub.agent(&agent_id).map_or(Mode::Deny, |a| a.policy.decide(&access).mode);
+        let mode = hub.agent_for_calls(&agent_id).map_or(Mode::Deny, |a| a.policy.decide(&access).mode);
         match mode {
             Mode::Allow => None,
             Mode::Ask if approved => None,

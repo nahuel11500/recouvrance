@@ -1986,11 +1986,11 @@ fn an_agent_syncs_terminates_and_rolls_back_an_argo_cd_application() {
                 args
             };
 
-            // Without a patch rule, nothing is written.
+            // Without a sync rule, nothing is written (a sync is not a patch).
             let out = client.call("gitops", with(json!({"action": "sync"}))).await;
             assert!(out.contains("Denied"), "{out}");
             assert!(read().await?.get("operation").is_none());
-            let allow = rules_file::parse_rule(Mode::Allow, "patch applications/e2e-* -n default")?;
+            let allow = rules_file::parse_rule(Mode::Allow, "sync applications/e2e-* -n default")?;
             hub.update_agent(&agent.id, |a| a.policy.rules.push(allow))?;
 
             // A sync of two resources with prune: it names what prune deletes.

@@ -18,7 +18,8 @@
 //!
 //! A rule is `VERBS RESOURCES[/NAMES] [-n NAMESPACES] [--context CONTEXTS] [until TIME]`;
 //! lists are comma-separated, `*` globs work everywhere, an omitted part means `*`, and `-`
-//! is an empty list (the rule matches nothing until you fill it in).
+//! is an empty list (the rule matches nothing until you fill it in). In ask and deny rules,
+//! the context `@protected` stands for the contexts protected in Settings → Contexts.
 //! When the file exists it is the source of truth: Recouvrance reloads it when it changes,
 //! and edits on the Agents page are written back to it (its comments are not kept).
 
@@ -28,6 +29,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context as _, Result, bail};
 use serde::{Deserialize, Serialize};
 
+use super::config::{GITOPS_VERBS_VERSION, SECTIONS_VERSION};
+use super::policy::{PROTECTED, is_protected_selector};
 use super::{Mode, Policy, Rule, Verb};
 
 pub fn path() -> PathBuf {
@@ -141,6 +144,10 @@ pub fn parse_rule(effect: Mode, text: &str) -> Result<Rule> {
             let known: Vec<&str> = Verb::ALL.iter().map(|v| v.as_str()).collect();
             bail!("unknown verb `{v}` (known: {}, *)", known.join(", "));
         }
+    }
+    // It would allow nothing: `@protected` only makes requests stricter.
+    if effect == Mode::Allow && rule.contexts.iter().any(|c| is_protected_selector(c)) {
+        bail!("`{PROTECTED}` works in ask and deny rules only");
     }
     Ok(rule)
 }
@@ -301,6 +308,23 @@ pub fn apply_file(file: &RulesFile, agents: &mut Vec<super::Agent>, keep_unnamed
     Ok(())
 }
 
+/// [`apply_file`] for agents.json saved at `version`, upgrading what that version left out:
+/// before 0.3.0 (`SECTIONS_VERSION`) an agent created then had no section until its rules
+/// were edited, so it keeps its rules; before the GitOps verbs (`GITOPS_VERBS_VERSION`)
+/// every rule that names `patch` gets them ([`Policy::add_gitops_verbs`]). Whether the file
+/// must be written again to hold that, once: later loads read it as written.
+pub fn apply_upgrading(file: &RulesFile, agents: &mut Vec<super::Agent>, version: u32) -> Result<bool> {
+    let keep_unnamed = version < SECTIONS_VERSION;
+    apply_file(file, agents, keep_unnamed)?;
+    let mut rewrite = keep_unnamed && agents.iter().any(|a| !file.agents.contains_key(&a.name));
+    if version < GITOPS_VERBS_VERSION {
+        for agent in agents.iter_mut() {
+            rewrite |= agent.policy.add_gitops_verbs();
+        }
+    }
+    Ok(rewrite)
+}
+
 /// The file's text; None when it does not exist.
 pub fn read(path: &Path) -> Result<Option<String>> {
     match std::fs::read_to_string(path) {
@@ -322,7 +346,8 @@ pub const HEADER: &str = "# Recouvrance agent rules. Deny wins, then ask, then a
 # `approved` holds requests you approved in the app: they win over ask, not over deny.\n\
 # A rule: VERBS RESOURCES[/NAMES] [-n NAMESPACES] [--context CONTEXTS] [until 2026-11-01]\n\
 # Lists are comma-separated and * globs work everywhere; an omitted part means *, and - means none.\n\
-# Verbs: get list logs reveal exec scale restart patch apply delete drain (or *).\n\
+# Verbs: get list logs reveal exec scale restart patch refresh sync suspend apply delete drain forward (or *).\n\
+# `--context @protected`, in ask and deny rules, covers the contexts protected in Settings.\n\
 # Recouvrance reloads this file when you save it; edits on the Agents page rewrite it, without comments.\n";
 
 /// A name two agents share: the file keys agents by name, so it could not tell them apart.
@@ -378,6 +403,16 @@ mod tests {
         assert!(parse_rule(Mode::Allow, "fly pods").is_err());
         assert!(parse_rule(Mode::Allow, "get pods --oops").is_err());
         assert!(parse_rule(Mode::Allow, "get pods -n").is_err());
+    }
+
+    #[test]
+    fn protected_contexts_in_ask_and_deny_rules_only() {
+        let r = parse_rule(Mode::Ask, "sync,suspend * --context @protected").unwrap();
+        assert_eq!(r.contexts, [PROTECTED]);
+        assert_eq!(format_rule(&r), "sync,suspend * --context @protected");
+        assert!(parse_rule(Mode::Deny, "delete * --context staging,@protected").is_ok());
+        assert!(parse_rule(Mode::Allow, "delete * --context @protected").is_err());
+        assert!(parse_rule(Mode::Allow, "refresh,sync,suspend applications.argoproj.io").is_ok());
     }
 
     #[test]
@@ -570,6 +605,7 @@ mod tests {
 /// audit rounds).
 #[cfg(test)]
 mod properties {
+    use super::super::config::CONFIG_VERSION;
     use super::super::{Access, Agent};
     use super::*;
     use crate::mcp::policy::properties::{access, policy, rule};
@@ -577,6 +613,24 @@ mod properties {
 
     fn agent(name: &str, policy: Policy) -> Agent {
         Agent { id: format!("id-{name}"), name: name.into(), token_sha256: String::new(), enabled: true, policy }
+    }
+
+    /// Rules the file can hold, which are those the app saves (`Hub::update_agent` refuses
+    /// the rest, see `the_app_holds_only_rules_the_file_can_write`): `@protected` only in
+    /// ask and deny rules.
+    fn writable_policy() -> impl Strategy<Value = Policy> {
+        policy().prop_map(|mut p| {
+            for r in p.rules.iter_mut().filter(|r| r.effect == Mode::Allow) {
+                r.contexts.retain(|c| !is_protected_selector(c));
+            }
+            p
+        })
+    }
+
+    /// The same request with `patch` for a GitOps verb: what rules from before the GitOps
+    /// verbs checked.
+    fn as_before_gitops_verbs(a: &Access) -> Access {
+        if Verb::GITOPS.contains(&a.verb) { Access { verb: Verb::Patch, ..a.clone() } } else { a.clone() }
     }
 
     /// Agent names as people type them, YAML's special words and characters included.
@@ -606,7 +660,7 @@ mod properties {
         /// the same limits, whatever their names.
         #[test]
         fn the_file_round_trips(
-            agents in prop::collection::btree_map(name(), policy(), 1..4),
+            agents in prop::collection::btree_map(name(), writable_policy(), 1..4),
             limits in (0..1000u32, 0..1000u32, 0..1000u32, 0..1000u32),
             requests in prop::collection::vec(access(), 1..16),
         ) {
@@ -627,6 +681,14 @@ mod properties {
                 let l = |p: &Policy| (p.max_calls_per_minute, p.max_log_lines, p.max_rows, p.exec_timeout);
                 prop_assert_eq!(l(&a.policy), l(&b.policy));
             }
+        }
+
+        /// The file refuses exactly the rules the app refuses to save (an Allow naming
+        /// `@protected`): an edit in the app can always be written to rules.yaml.
+        #[test]
+        fn the_app_holds_only_rules_the_file_can_write(p in policy()) {
+            let rendered = render(&[agent("ci", p.clone())]);
+            prop_assert_eq!(rendered.is_ok(), !p.allow_names_protected(), "{:?}", rendered.err());
         }
 
         /// A rule is written only when it reads back as the same rule: blank patterns and
@@ -685,7 +747,9 @@ mod properties {
                 let before = decide(&p);
                 match (before.mode, before.rule) {
                     (Mode::Deny, None) => {
-                        prop_assert_eq!(with(named).mode, Mode::Allow, "{}", text);
+                        // An Ask of `@protected` may cover it too: each call is then approved.
+                        let after = with(named).mode;
+                        prop_assert!(after == Mode::Allow || (after == Mode::Ask && p.names_protected()), "{}", text);
                     }
                     (Mode::Deny, Some(_)) => {
                         prop_assert_eq!(with(Rule { approved: true, ..named }).mode, Mode::Deny);
@@ -708,6 +772,79 @@ mod properties {
             prop_assert_eq!(agents[0].policy.decide(&a).mode, Mode::Deny);
             prop_assert_eq!(agents[0].policy.decide_any_namespace(&a).mode, Mode::Deny);
         }
+
+        /// A file from before the GitOps verbs, loaded by this version, decides a GitOps
+        /// action as it decided `patch` on the object, and every other request as before; it
+        /// is written again only when a rule changed. Written back, it loads as written from
+        /// then on: a verb taken out of a rule afterwards stays out.
+        #[test]
+        fn an_old_file_upgrades_once(
+            policy in writable_policy(),
+            requests in prop::collection::vec(access(), 1..16),
+            version in 0..GITOPS_VERBS_VERSION,
+        ) {
+            let mut old = policy;
+            for r in &mut old.rules {
+                r.verbs.retain(|v| !matches!(v.parse::<Verb>(), Ok(v) if Verb::GITOPS.contains(&v)));
+            }
+            let text = render(&[agent("ci", old.clone())]).unwrap();
+            let mut agents = vec![agent("ci", Policy::default())];
+            let rewrite = apply_upgrading(&check(&text).unwrap(), &mut agents, version).unwrap();
+            let upgraded = agents[0].policy.clone();
+            let names_patch = old.rules.iter().any(|r| r.verbs.iter().any(|v| v == "patch"));
+            prop_assert_eq!(rewrite, names_patch, "{}", text);
+            for a in &requests {
+                let before = as_before_gitops_verbs(a);
+                prop_assert_eq!(upgraded.decide(a).mode, old.decide(&before).mode, "{:?}", a);
+                prop_assert_eq!(upgraded.decide_any_namespace(a).mode, old.decide_any_namespace(&before).mode, "{:?}", a);
+            }
+            // Written back, then `refresh` taken out of every rule by hand.
+            let mut edited = upgraded;
+            for r in &mut edited.rules {
+                r.verbs.retain(|v| v != "refresh");
+            }
+            let text = render(&[agent("ci", edited.clone())]).unwrap();
+            let mut again = vec![agent("ci", Policy::default())];
+            prop_assert!(!apply_upgrading(&check(&text).unwrap(), &mut again, CONFIG_VERSION).unwrap());
+            same_decisions(&edited, &again[0].policy, &requests)?;
+        }
+
+        /// A verb the rules don't know (a typo such as `refrsh`), or `@protected` in an allow
+        /// or approved rule (it would allow nothing), fails the load: the rules in force stay
+        /// as they were and the error is shown.
+        #[test]
+        fn a_rule_the_file_cannot_mean_fails_the_load(verb in "[a-z]{1,8}", section in 0..4usize) {
+            prop_assume!(verb.parse::<Verb>().is_err());
+            let text = format!("agents:\n  ci:\n    allow: [\"get *\"]\n    deny: [\"{verb} pods\"]\n");
+            prop_assert!(check(&text).is_err(), "{}", text);
+            let key = ["allow", "approved", "ask", "deny"][section];
+            let text = format!("agents:\n  ci:\n    {key}: [\"delete pods --context {PROTECTED}\"]\n");
+            prop_assert_eq!(check(&text).is_ok(), matches!(key, "ask" | "deny"), "{}", text);
+        }
+    }
+
+    /// The upgrade written back never overwrites an edit saved on disk since the file was
+    /// read: it is refused, and the edit is loaded next (and upgraded then).
+    #[test]
+    fn an_upgrade_never_overwrites_an_edit_on_disk() {
+        let dir = crate::mcp::test_dir();
+        let path = dir.join("rules.yaml");
+        let old = "agents:\n  ci:\n    allow: [\"patch applications.argoproj.io\"]\n";
+        std::fs::write(&path, old).unwrap();
+        let mut agents = vec![agent("ci", Policy::default())];
+        assert!(apply_upgrading(&check(old).unwrap(), &mut agents, SECTIONS_VERSION).unwrap());
+        assert_eq!(agents[0].policy.rules[0].verbs, ["patch", "refresh", "sync", "suspend"]);
+        let yours = "agents:\n  ci:\n    ask: [\"sync applications.argoproj.io\"]\n";
+        std::fs::write(&path, yours).unwrap();
+        assert!(export_over(&path, &agents, Some(old)).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), yours);
+        // Unchanged since it was read, the file is written once, and then read as written.
+        std::fs::write(&path, old).unwrap();
+        let written = export_over(&path, &agents, Some(old)).unwrap();
+        let mut again = vec![agent("ci", Policy::default())];
+        assert!(!apply_upgrading(&check(&written).unwrap(), &mut again, CONFIG_VERSION).unwrap());
+        assert_eq!(again[0].policy.rules, agents[0].policy.rules);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// An edit saved in an editor and not loaded yet is never overwritten by an edit made

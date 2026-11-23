@@ -13,7 +13,8 @@ use super::audit::{
     AuditEntry, AuditStats, MAX_AUDIT_IN_MEMORY, append_audit, audit_path, load_audit_tail, read_audit,
 };
 use super::config::{
-    Agent, CONFIG_VERSION, Config, config_lock_path, hash_token, load_config, new_token, same_rules, take_lock,
+    Agent, CONFIG_VERSION, Config, GITOPS_VERBS_VERSION, config_lock_path, hash_token, load_config, new_token,
+    same_rules, take_lock,
 };
 use super::policy::{Access, Mode, Policy, Rule, Verb};
 use super::preview::Preview;
@@ -82,6 +83,10 @@ pub struct Approval {
     pub access: Access,
     /// A dry run: approving it must not turn into a rule for real writes.
     pub dry_run: bool,
+    /// What was approved is narrower than any rule for it: an Argo CD prune (held to the
+    /// resources the banner listed), rollback (to the deployment it named) or terminate,
+    /// whose `sync` verb would also allow any other sync, prune or rollback of the object.
+    pub once_only: bool,
     /// When the request is refused unanswered. Set by [`Hub::request_approval`]; the banner
     /// counts down to it.
     pub deadline: Instant,
@@ -94,18 +99,22 @@ impl Approval {
     }
 
     /// A narrow Allow rule for exactly this request, when a rule can be that narrow.
-    /// None for exec (a rule cannot pin the command), patches and GitOps actions (the rule
-    /// would allow any patch), scale (it would allow any replica count, 0 too), apply (the
+    /// None for exec (a rule cannot pin the command), patches (the rule would allow any
+    /// patch), scale (it would allow any replica count, 0 too), Flux suspend and resume (one
+    /// verb for both: approving a resume would allow suspending), apply (the
     /// rule could not pin the content), a request other than a list with no object name
     /// (the rule would cover every name), a request across all namespaces (the rule would
     /// also cover namespaces no rule allows) and dry runs (a rule cannot be limited to dry
-    /// runs, so it would allow the real write).
+    /// runs, so it would allow the real write), and an Argo CD prune, rollback or terminate
+    /// (the `sync` verb would allow every other sync of the object).
     pub fn as_rule(&self) -> Option<Rule> {
         let a = &self.access;
-        if matches!(a.verb, Verb::Exec | Verb::Patch | Verb::Scale)
-            || self.tool == "gitops"
+        // A refresh or a sync has its own verb, so its rule allows that action on that
+        // object only.
+        if matches!(a.verb, Verb::Exec | Verb::Patch | Verb::Scale | Verb::Suspend)
             || self.tool == "apply_manifest"
             || self.dry_run
+            || self.once_only
             || (a.verb != Verb::List && a.name.is_none())
             || (a.namespace.is_none() && !a.cluster_scoped)
         {
@@ -203,6 +212,11 @@ impl Hub {
         }
         for agent in &mut config.agents {
             agent.policy.migrate();
+            // Saved before the GitOps verbs: rules.yaml, when it exists, is upgraded the same
+            // way when it is loaded (`apply_rules_file`), which then sets the version.
+            if config.version < GITOPS_VERBS_VERSION {
+                agent.policy.add_gitops_verbs();
+            }
         }
         let audit = load_audit_tail(&audit_path());
         Arc::new(Self::new(config, audit, config_error, rules_file::path().exists()))
@@ -308,17 +322,15 @@ impl Hub {
                 self.emit(HubEvent::AgentSeen);
                 return Err(e);
             }
-            // agents.json from before 0.3.0: an agent created then had no section until its
-            // rules were edited. It keeps its rules and its section is written, once.
-            let upgrade = cfg.version < CONFIG_VERSION;
+            // Rules saved by an older version are upgraded, and the file written, once: see
+            // `rules_file::apply_upgrading`.
             let mut agents = cfg.agents.clone();
-            rules_file::apply_file(&file, &mut agents, upgrade)?;
-            if upgrade && agents.iter().any(|a| !file.agents.contains_key(&a.name)) {
+            if rules_file::apply_upgrading(&file, &mut agents, cfg.version)? {
                 let mut seen = lock(&self.rules_text);
                 match rules_file::export_over(&path, &agents, seen.as_deref()) {
                     Ok(text) => *seen = Some(text),
                     Err(e) => {
-                        let e = e.context("rules.yaml could not be given the agents it doesn't name");
+                        let e = e.context("rules.yaml could not be upgraded for this version");
                         *lock(&self.rules_error) = Some(format!("{e:#}"));
                         drop((seen, cfg));
                         self.emit(HubEvent::AgentSeen);
@@ -498,7 +510,16 @@ impl Hub {
             let mut cfg = write(&self.config);
             let mut agents = cfg.agents.clone();
             let agent = agents.iter_mut().find(|a| a.id == id).context("unknown agent")?;
+            let allowed_protected = agent.policy.allow_names_protected();
             f(agent);
+            // rules.yaml could not hold it, and it would allow nothing. One already in a
+            // hand-edited agents.json doesn't block other edits.
+            if agent.policy.allow_names_protected() && !allowed_protected {
+                anyhow::bail!(
+                    "`{}` works in Ask and Deny rules only: in an Allow rule it would allow nothing",
+                    super::PROTECTED
+                );
+            }
             // rules.yaml doesn't hold the Enabled switch: only write it when names or rules change.
             if !same_rules(&cfg.agents, &agents) {
                 self.export_rules(&agents)?;
@@ -534,6 +555,18 @@ impl Hub {
     /// Fresh copy of an agent, so rule edits apply to the very next call.
     pub fn agent(&self, id: &str) -> Option<Agent> {
         read(&self.config).agents.iter().find(|a| a.id == id).cloned()
+    }
+
+    /// [`agent`](Self::agent), with its rules ready to decide its calls: when one names
+    /// `@protected`, the protection of contexts is read now (Settings → Contexts and the
+    /// kubeconfig), so a context protected since the last call counts. Unreadable, every
+    /// context counts as protected.
+    pub fn agent_for_calls(&self, id: &str) -> Option<Agent> {
+        let mut agent = self.agent(id)?;
+        if agent.policy.names_protected() {
+            agent.policy.set_unprotected(crate::settings::unprotected_contexts());
+        }
+        Some(agent)
     }
 
     /// Count a call; false when the agent is over its per-minute limit.
@@ -909,6 +942,29 @@ mod tests {
         assert!(!same_rules(std::slice::from_ref(&agent), &[]));
     }
 
+    /// rules.yaml refuses `@protected` in an Allow rule, so the app never holds one it
+    /// could not write back. Refused before anything is saved: no file is written here.
+    #[test]
+    fn an_allow_rule_naming_protected_contexts_is_not_saved() {
+        let protected = |effect| Rule {
+            effect,
+            verbs: vec!["delete".into()],
+            resources: vec!["pods".into()],
+            namespaces: vec!["*".into()],
+            contexts: vec!["staging".into(), super::super::PROTECTED.into()],
+            names: vec!["*".into()],
+            ..Rule::default()
+        };
+        let hub = Hub::for_test(vec![agent()]);
+        assert!(hub.update_agent("a1", |a| a.policy.rules.push(protected(Mode::Allow))).is_err());
+        assert_eq!(hub.agent("a1").unwrap().policy.rules, Policy::default().rules);
+        // Ask and Deny rules may name it.
+        for effect in [Mode::Ask, Mode::Deny] {
+            let p = Policy { rules: vec![protected(effect)], ..Policy::default() };
+            assert!(!p.allow_names_protected());
+        }
+    }
+
     #[test]
     fn an_unreadable_rules_file_is_reloaded_once() {
         let seen = Some("old".to_string());
@@ -963,6 +1019,7 @@ mod tests {
             preview: None,
             access,
             dry_run: false,
+            once_only: false,
             deadline: Instant::now(),
         };
         tokio::spawn(async move { hub.request_approval(request, gone).await })

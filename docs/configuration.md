@@ -202,8 +202,10 @@ agents:
     allow:
       - get,list,logs *                            # read everything
       - restart,scale deployments/web-* -n team-*  # names after the slash
+      - refresh applications.argoproj.io           # Argo CD refresh, deploys nothing
     ask:
-      - patch,apply,delete * --context staging
+      - patch,sync,apply,delete * --context staging
+      - patch,sync,suspend,apply,delete * --context @protected
     deny:
       - "* secrets"
       - "* * --context *prod*"
@@ -217,8 +219,13 @@ an exec command may run, default 30).
 
 A rule is `VERBS RESOURCES[/NAMES] [-n NAMESPACES] [--context CONTEXTS] [until TIME]`. Lists are
 comma-separated, `*` globs work everywhere, an omitted part means `*`, and `-` is an empty list
-(the rule matches nothing; an exported rule with nothing chosen yet is written that way). Deny wins, then ask,
-then allow; anything no rule matches is denied. `approved` lists the requests you approved with
+(the rule matches nothing; an exported rule with nothing chosen yet is written that way). The verbs
+are `get list logs reveal exec scale restart patch refresh sync suspend apply delete drain forward`
+(or `*`); `refresh`, `sync` and `suspend` are the GitOps actions (see [agents](agents.md#rules)). In
+ask and deny rules, the context `@protected` stands for the contexts protected in Settings →
+Contexts, read at each call (every context when the protection can't be read); it never makes a
+request possible that no other rule covers, and an allow or approved rule naming it fails the load.
+Deny wins, then ask, then allow; anything no rule matches is denied. `approved` lists the requests you approved with
 *Always allow this* or *Allow for 1h*: they are allowed even where an ask rule matches, never where a
 deny rule does. An `approved` rule's resource is matched as written (`pods` is not
 `pods.metrics.k8s.io`), and its names and contexts case included. The file is reloaded when it changes, and edits on the Agents page are written back
@@ -230,7 +237,11 @@ were and the Agents page shows the error.
 While the file exists, an agent it doesn't name has no rules, so everything it asks is denied:
 removing an agent's section takes its access away. Deleting an agent on the Agents page removes its
 section too. Before 0.3.0 a new agent got no section until its rules were edited: on the first start
-of 0.3.0 such an agent keeps its rules, and its section is written to the file.
+of 0.3.0 such an agent keeps its rules, and its section is written to the file. Before the GitOps
+verbs, GitOps actions were checked as `patch`: on the first start of the version that added them,
+every rule that names `patch` gets `refresh`, `sync` and `suspend`, and the file is written again,
+once. A verb you take out of a rule after that stays out. If the file changed on disk meanwhile, it
+is not written over: the load fails with the reason, and your edit is loaded (and upgraded) next.
 
 Each section is for the agent with that name, so agent names are unique: creating a second agent
 with a taken name is refused, and if two agents already share a name the file is neither loaded nor
