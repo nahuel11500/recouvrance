@@ -37,6 +37,15 @@ pub struct AuditEntry {
     /// that needed an approval have one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub change: Option<String>,
+    /// The MCP client the call came from, as it named itself (`claude-code 2.1.3`): one agent's
+    /// clients, or the in-app assistant and your own Claude Code, can be told apart. A label
+    /// the client chose, not a check.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client: Option<String>,
+    /// What the call returned Secret values of (`Secret shop/db`, `Helm values shop/web
+    /// revision 3`): only calls a `reveal` rule let see them unmasked have any.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub revealed: Vec<String>,
 }
 
 /// See [`Hub::audit_stats`](super::Hub::audit_stats).
@@ -115,20 +124,33 @@ mod tests {
             result_bytes: 0,
             session: None,
             change: None,
+            client: None,
+            revealed: Vec::new(),
         }
     }
 
-    /// Lines written before `change` existed still read, and a call without one writes none.
+    /// Lines written before `change`, `client` and `revealed` existed still read, and a call
+    /// without them writes none.
     #[test]
     fn a_change_is_kept_only_when_there_is_one() {
         let line = serde_json::to_string(&entry("scale")).unwrap();
-        assert!(!line.contains("change"), "{line}");
+        for field in ["change", "client", "revealed"] {
+            assert!(!line.contains(field), "{line}");
+        }
         let old: AuditEntry = serde_json::from_str(&line).unwrap();
         assert_eq!(old.change, None);
-        let with =
-            AuditEntry { change: Some("Deployment shop/web: scaled\n  replicas: 3 → 0\n".into()), ..entry("scale") };
+        assert_eq!(old.client, None);
+        assert!(old.revealed.is_empty());
+        let with = AuditEntry {
+            change: Some("Deployment shop/web: scaled\n  replicas: 3 → 0\n".into()),
+            client: Some("claude-code 2.1.3".into()),
+            revealed: vec!["Secret shop/db".into()],
+            ..entry("scale")
+        };
         let back: AuditEntry = serde_json::from_str(&serde_json::to_string(&with).unwrap()).unwrap();
         assert_eq!(back.change, with.change);
+        assert_eq!(back.client, with.client);
+        assert_eq!(back.revealed, with.revealed);
     }
 
     #[test]

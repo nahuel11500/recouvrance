@@ -49,6 +49,42 @@ mod write_tools;
 #[derive(Clone)]
 struct AgentId(String);
 
+/// The MCP client a tool call comes from, as [`client_label`] names it: set by `call_tool`
+/// for the tools to read in their request's HTTP parts.
+#[derive(Clone)]
+struct ClientName(String);
+
+/// The header the in-app assistant adds to the MCP config it gives Claude Code, so its calls
+/// are told from those of your own Claude Code (same client, same agent). A label only.
+pub(crate) const CLIENT_HEADER: &str = "x-recouvrance-client";
+
+/// Longest client name or version kept: they come from the client, and end up in a log line
+/// and on the Activity page.
+const MAX_CLIENT_CHARS: usize = 64;
+
+/// How the activity log names a call's client: its `clientInfo` name and version (from
+/// `initialize`, or from each request's metadata in a stateless session), with the in-app
+/// assistant's own label when it adds one (`assistant via claude-code 2.1.3`). Control
+/// characters are dropped and each part is capped. None when the client gave no name.
+fn client_label(info: Option<&rmcp::model::Implementation>, header: Option<&str>) -> Option<String> {
+    let clean = |s: &str| -> String {
+        let s: String = s.chars().filter(|c| !c.is_control()).collect();
+        let s = s.trim();
+        match s.char_indices().nth(MAX_CLIENT_CHARS) {
+            Some((i, _)) => format!("{}…", &s[..i]),
+            None => s.to_string(),
+        }
+    };
+    let name = info.map(|i| clean(&i.name)).filter(|n| !n.is_empty());
+    let version = info.map_or_default(|i| clean(&i.version));
+    let client = name.map(|n| if version.is_empty() { n } else { format!("{n} {version}") });
+    let label = header.map(clean).filter(|l| !l.is_empty());
+    match (label, client) {
+        (Some(label), Some(client)) => Some(format!("{label} via {client}")),
+        (label, client) => label.or(client),
+    }
+}
+
 #[derive(Clone)]
 pub struct KubeMcp {
     hub: Arc<Hub>,
@@ -71,6 +107,10 @@ struct Call {
     /// (the rules may be read again, and renumbered, before the call ends).
     rule: Option<String>,
     session: Option<String>,
+    /// The MCP client it came from (`client_label`).
+    client: Option<String>,
+    /// What the call's answer shows Secret values of (`revealing`): logged when it succeeds.
+    revealed: Vec<String>,
     /// More for the approval banner than the arguments show (a manifest's objects).
     approval_detail: Option<String>,
     /// How to work out what the call will change, should it wait for an approval.
@@ -94,7 +134,15 @@ impl Call {
         self.rule = rule.map(|i| self.rule_label(Some(i)));
     }
 
+    /// Note that the call's answer shows `what`'s Secret values (unmasked, as a `reveal` rule
+    /// allows), for the activity log.
+    fn revealing(&mut self, what: String) {
+        self.revealed.push(what);
+    }
+
     fn record(&self, decision: Decision, detail: String, result_bytes: usize) {
+        // A refused or failed call returned no values, whatever it was about to show.
+        let returned = matches!(decision, Decision::Allowed | Decision::Approved);
         self.hub.record(AuditEntry {
             time: jiff::Timestamp::now(),
             agent_id: self.agent.id.clone(),
@@ -107,6 +155,8 @@ impl Call {
             result_bytes,
             session: self.session.clone(),
             change: self.preview.as_ref().map(Preview::text),
+            client: self.client.clone(),
+            revealed: if returned { self.revealed.clone() } else { Vec::new() },
         });
     }
 
@@ -288,12 +338,15 @@ fn context_refusal(policy: &Policy, context: &str) -> (String, String) {
 
 /// Arguments that change what a call does, for the approval banner: what the user
 /// approves is what runs. Values come from the (redacted) logged arguments.
-const KEY_ARGS: [&str; 12] = [
+const KEY_ARGS: [&str; 15] = [
     "command",
     "path",
     "patch",
     "replicas",
     "action",
+    "resources",
+    "prune",
+    "deployment_id",
     "container",
     "to_revision",
     "image",
@@ -477,8 +530,9 @@ impl KubeMcp {
     /// Identify the agent and apply the checks every tool shares.
     fn begin(&self, parts: &Parts, tool: &'static str, args: serde_json::Value) -> Result<Call, String> {
         let id = parts.extensions.get::<AgentId>().map(|a| a.0.clone()).ok_or("unauthenticated")?;
-        let agent = self.hub.agent(&id).ok_or("unknown agent")?;
+        let agent = self.hub.agent_for_calls(&id).ok_or("unknown agent")?;
         let session = parts.headers.get("mcp-session-id").and_then(|v| v.to_str().ok()).map(String::from);
+        let client = parts.extensions.get::<ClientName>().map(|c| c.0.clone());
         let invalid = validate_args(&args).err();
         let context = args.get("context").and_then(|v| v.as_str()).map(String::from);
         let call = Call {
@@ -492,6 +546,8 @@ impl KubeMcp {
             approved_rules: Vec::new(),
             rule: None,
             session,
+            client,
+            revealed: Vec::new(),
             approval_detail: None,
             plan: None,
             preview: None,
@@ -614,6 +670,10 @@ impl KubeMcp {
                 preview: call.preview.clone(),
                 access: access.clone(),
                 dry_run: call.args.get("dry_run").and_then(serde_json::Value::as_bool).unwrap_or(false),
+                once_only: call.tool == "gitops"
+                    && (matches!(call.args["action"].as_str(), Some("rollback" | "terminate"))
+                        || call.args["prune"].as_bool() == Some(true)),
+                deadline: Instant::now(),
             };
             let answer = self.hub.request_approval(request, call.gone.wait()).await;
             // Access may have been switched off, or the rules changed, while the request waited.
@@ -648,7 +708,7 @@ impl KubeMcp {
     /// Read the agent's rules again. A removed agent keeps its old rules, and
     /// [`Self::ensure_active`] then refuses the call.
     fn reload_rules(&self, call: &mut Call) {
-        if let Some(agent) = self.hub.agent(&call.agent.id) {
+        if let Some(agent) = self.hub.agent_for_calls(&call.agent.id) {
             call.agent = agent;
         }
     }
@@ -703,6 +763,10 @@ impl KubeMcp {
     async fn find_kind(&self, context: &str, query: &str) -> anyhow::Result<(kube::Client, Kind)> {
         let (client, kinds) = self.hub.client(context).await?;
         if let Some(kind) = k8s::find_kind(&kinds, query).cloned() {
+            return Ok((client, kind));
+        }
+        // A CRD an agent just applied is looked up in its own group at once.
+        if let Some(kind) = self.hub.new_kind_named(context, query).await {
             return Ok((client, kind));
         }
         // Maybe a CRD installed since the first call.
@@ -812,7 +876,7 @@ pub struct PlannedRequest {
     #[schemars(description = "kubeconfig context name, from list_contexts")]
     pub context: String,
     #[schemars(
-        description = "the rules' verb: get, list, logs, reveal, exec, scale, restart, patch, apply, delete, drain or forward"
+        description = "the rules' verb: get, list, logs, reveal, exec, scale, restart, patch, refresh, sync, suspend, apply, delete, drain or forward"
     )]
     pub verb: String,
     #[schemars(description = "resource type like kubectl: pods, deploy, certificates.cert-manager.io")]
@@ -948,9 +1012,36 @@ pub struct GitOpsParams {
     pub namespace: String,
     pub name: String,
     #[schemars(
-        description = "reconcile (Flux) · refresh, hard_refresh or sync (Argo CD) · suspend or resume (Flux) · diagnose (Argo CD, read only)"
+        description = "reconcile (Flux) · refresh, hard_refresh, sync, terminate (the operation running) or rollback (Argo CD) · suspend or resume (Flux) · diagnose (Argo CD, read only)"
     )]
     pub action: String,
+    #[schemars(
+        description = "sync only: sync these resources of the Application alone (hooks don't run then); omit to sync it whole"
+    )]
+    pub resources: Option<Vec<ArgoResource>>,
+    #[schemars(
+        description = "sync only: also delete what is no longer in git (of the resources named, when some are); the reply names what it deletes"
+    )]
+    pub prune: Option<bool>,
+    #[schemars(
+        description = "sync or rollback: Argo CD applies nothing and reports what it would do (the reply waits up to 30 s for it)"
+    )]
+    pub dry_run: Option<bool>,
+    #[schemars(
+        description = "rollback only: the id of the deployment in status.history to go back to; omit for the one before the newest. Argo CD refuses a rollback while auto-sync is on"
+    )]
+    pub deployment_id: Option<i64>,
+}
+
+/// A resource of an Argo CD Application, as its `status.resources` names it.
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct ArgoResource {
+    #[schemars(description = "API group; empty or omitted for the core group")]
+    pub group: Option<String>,
+    pub kind: String,
+    #[schemars(description = "omit for a cluster-scoped resource")]
+    pub namespace: Option<String>,
+    pub name: String,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -1132,10 +1223,17 @@ impl ServerHandler for KubeMcp {
         mut context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<CallToolResponse, rmcp::ErrorData> {
         // The tools read the request's HTTP parts (`begin`): rmcp's token for this request
-        // joins its connection's there, so the call knows when its agent stops waiting.
+        // joins its connection's there, so the call knows when its agent stops waiting. The
+        // client is read there too: rmcp knows it from the session's `initialize`, or from the
+        // request itself in a stateless session, where no session id groups the calls.
+        let info = context.client_info();
         if let Some(parts) = context.extensions.get_mut::<Parts>() {
             let gone = parts.extensions.remove::<Gone>().unwrap_or_default();
             parts.extensions.insert(Gone { request: Some(context.ct.clone()), ..gone });
+            let header = parts.headers.get(CLIENT_HEADER).and_then(|v| v.to_str().ok());
+            if let Some(client) = client_label(info.as_ref(), header) {
+                parts.extensions.insert(ClientName(client));
+            }
         }
         Self::tools().call(ToolCallContext::new(self, request, context)).await
     }
@@ -1183,15 +1281,17 @@ fn dry_run_tools() -> &'static [String] {
 /// Whether a logged call may have changed something. The Activity page shows these calls
 /// under Writes, counts them in each task and colors their tool. A call of a tool that may
 /// change something counts, unless it was a dry run, `gitops`'s `diagnose`, or `browse_files`
-/// without `debug` (the debug container it may add is the only change it makes).
+/// without `debug` (the debug container it may add is the only change it makes). A `gitops`
+/// dry run counts: it writes the Application's operation, which Argo CD then runs (applying
+/// nothing) and which blocks any other sync, terminate or rollback until it ends.
 pub fn call_writes(tool: &str, args: &serde_json::Value) -> bool {
     let on = |key: &str| args.get(key).and_then(serde_json::Value::as_bool) == Some(true);
     let reads = match tool {
         "gitops" => args.get("action").and_then(serde_json::Value::as_str) == Some("diagnose"),
         "browse_files" => !on("debug"),
-        _ => false,
+        _ => on("dry_run"),
     };
-    tool_writes(tool) && !reads && !on("dry_run")
+    tool_writes(tool) && !reads
 }
 
 fn format_table(headers: &[&str], rows: &[Vec<String>]) -> String {
@@ -1261,7 +1361,7 @@ pub(crate) fn stop_check(
         if let Some(reason) = inactive(&hub, &agent_id, &gone) {
             return Some(reason.to_string());
         }
-        let mode = hub.agent(&agent_id).map_or(Mode::Deny, |a| a.policy.decide(&access).mode);
+        let mode = hub.agent_for_calls(&agent_id).map_or(Mode::Deny, |a| a.policy.decide(&access).mode);
         match mode {
             Mode::Allow => None,
             Mode::Ask if approved => None,
@@ -1690,6 +1790,8 @@ mod tests {
             approved_rules: Vec::new(),
             rule: None,
             session: None,
+            client: None,
+            revealed: Vec::new(),
             approval_detail: None,
             plan: None,
             preview: None,
@@ -1928,11 +2030,12 @@ mod tests {
             assert!(tools.iter().any(|t| t.name == tool), "{tool} is a tool");
             assert!(call_writes(tool, &json!({"dry_run": null})), "{tool}");
         }
-        // A dry run changes nothing.
-        assert_eq!(dry_run_tools().len(), 13, "{:?}", dry_run_tools());
+        // A dry run changes nothing, but `gitops`'s: Argo CD's own writes the operation.
+        assert_eq!(dry_run_tools().len(), 14, "{:?}", dry_run_tools());
         for tool in dry_run_tools() {
-            assert!(!call_writes(tool, &json!({"dry_run": true})), "{tool}");
+            assert_eq!(call_writes(tool, &json!({"dry_run": true})), tool == "gitops", "{tool}");
         }
+        assert!(call_writes("gitops", &json!({"action": "sync", "dry_run": true})));
         // Their arguments say when these only read.
         assert!(!call_writes("gitops", &json!({"action": "diagnose"})));
         assert!(!call_writes("browse_files", &json!({"path": "/etc", "debug": false})));
@@ -1950,5 +2053,30 @@ mod tests {
             let dry_run = t.input_schema.get("properties").and_then(|p| p.get("dry_run"));
             assert!(dry_run.is_none(), "{} only reads but takes dry_run", t.name);
         }
+    }
+
+    /// A call's client is named by its `clientInfo`, the assistant's label first when it
+    /// adds one; what the client sent is cleaned and capped before it reaches the log.
+    #[test]
+    fn a_client_is_named_by_what_it_sent() {
+        use rmcp::model::Implementation;
+        assert_eq!(
+            client_label(Some(&Implementation::new("claude-code", "2.1.3")), None).as_deref(),
+            Some("claude-code 2.1.3")
+        );
+        assert_eq!(
+            client_label(Some(&Implementation::new("claude-code", "2.1.3")), Some("assistant")).as_deref(),
+            Some("assistant via claude-code 2.1.3")
+        );
+        assert_eq!(client_label(Some(&Implementation::new("codex", "")), None).as_deref(), Some("codex"));
+        assert_eq!(client_label(None, Some("assistant")).as_deref(), Some("assistant"));
+        // Nothing said, or only blanks: no client.
+        assert_eq!(client_label(None, None), None);
+        assert_eq!(client_label(Some(&Implementation::new(" \n", "1")), Some("")), None);
+        // Control characters can't break the log's lines or the page, and a long name is cut.
+        let odd = client_label(Some(&Implementation::new("evil\nname\u{1b}[31m", "1\r")), None).unwrap();
+        assert_eq!(odd, "evilname[31m 1");
+        let long = client_label(Some(&Implementation::new("x".repeat(500), "9".repeat(500))), None).unwrap();
+        assert!(long.chars().count() <= 2 * (MAX_CLIENT_CHARS + 1) + 1, "{long}");
     }
 }

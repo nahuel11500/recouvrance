@@ -45,6 +45,7 @@ impl DetailPanel {
                     .as_ref()
                     .is_some_and(|o| o.pointer("/spec/suspend").is_some_and(serde_json::Value::is_boolean)));
         let is_argo = k.is("argoproj.io", "Application");
+        let argo_busy = is_argo && self.object.as_ref().is_some_and(k8s::argo::ops::in_progress);
         let is_pod = k.is("", "Pod");
         let plugins = crate::plugins::for_kind(&k.kubectl_name(), &k.ar.plural, cx);
         // Actions your RBAC does not allow are disabled (checked like `kubectl auth can-i`).
@@ -150,11 +151,14 @@ impl DetailPanel {
                     })),
                 )
                 .child(gate(Button::new("act-argo-sync"), "patch").small().ghost().icon(Lucide::GitBranch).label("Sync").on_click(cx.listener(|this, _, w, cx| {
-                    let title = format!("Sync Application {}?", this.obj.name);
-                    this.confirm_action(title, super::argo::SYNC_NOTE, "Sync", |p, client| {
-                        Box::pin(k8s::argo_sync(client, p.obj.kind.clone(), p.obj.namespace.clone(), p.obj.name.clone()))
-                    }, w, cx);
+                    this.confirm_own_argo(super::ArgoAction::Sync, w, cx);
                 })))
+                // While an operation runs: it can be stopped, as `argocd app terminate-op` does.
+                .when(argo_busy, |d| {
+                    d.child(gate(Button::new("act-argo-terminate"), "patch").small().ghost().icon(Lucide::CircleStop).label("Terminate").on_click(cx.listener(|this, _, w, cx| {
+                        this.confirm_own_argo(super::ArgoAction::Terminate, w, cx);
+                    })))
+                })
             })
             .when(is_node, |d| {
                 d.child(

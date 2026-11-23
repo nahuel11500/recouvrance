@@ -43,6 +43,18 @@ impl KubeMcp {
         }
         let mut out = Vec::new();
         for (kind, ns, name, doc) in planned {
+            let kind = match self.served(&p.context, &kind).await {
+                Ok(Some(k)) => k,
+                // Its CRD comes with the manifest: the server can't check the object yet.
+                Ok(None) => {
+                    let after = k8s::to_yaml(&without_noise(&doc), false, false).unwrap_or_default();
+                    let ns = ns.map_or_default(|n| format!("{n}/"));
+                    let title = format!("{} {ns}{name} (not checked: its CRD is not on the cluster yet)", kind.ar.kind);
+                    out.push(unified(&title, "", &after, true));
+                    continue;
+                }
+                Err(e) => return call.finish(Err(anyhow::anyhow!("{} {name}: {e}", kind.ar.kind))),
+            };
             let reveal = {
                 let a = access_for(&kind, &p.context, Verb::Reveal, ns.clone(), Some(name.clone()));
                 call.policy().decide(&a).mode == Mode::Allow
@@ -57,7 +69,13 @@ impl KubeMcp {
             let note = if applied.conflict { format!(" ({CONFLICT})") } else { String::new() };
             let shown = |v: &Value| k8s::to_yaml(&without_noise(v), secret, reveal).unwrap_or_default();
             let (before, after) = (applied.live.as_ref().map_or_default(shown), shown(&applied.after));
-            let title = format!("{} {}{name}{note}", kind.ar.kind, ns.map_or_default(|n| format!("{n}/")));
+            let at = ns.map_or_default(|n| format!("{n}/"));
+            // The diff of a Secret that exists and changes shows its live values around the
+            // change; one being created shows only what the agent sent.
+            if secret && reveal && applied.live.is_some() && before != after {
+                call.revealing(format!("Secret {at}{name}"));
+            }
+            let title = format!("{} {at}{name}{note}", kind.ar.kind);
             out.push(unified(&title, &before, &after, applied.live.is_none()));
         }
         call.finish(Ok(out.join("\n")))

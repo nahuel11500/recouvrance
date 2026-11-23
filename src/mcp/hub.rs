@@ -13,7 +13,8 @@ use super::audit::{
     AuditEntry, AuditStats, MAX_AUDIT_IN_MEMORY, append_audit, audit_path, load_audit_tail, read_audit,
 };
 use super::config::{
-    Agent, CONFIG_VERSION, Config, config_lock_path, hash_token, load_config, new_token, same_rules, take_lock,
+    Agent, CONFIG_VERSION, Config, GITOPS_VERBS_VERSION, config_lock_path, hash_token, load_config, new_token,
+    same_rules, take_lock,
 };
 use super::policy::{Access, Mode, Policy, Rule, Verb};
 use super::preview::Preview;
@@ -23,8 +24,23 @@ use crate::k8s::{self, Kind};
 /// Discovery runs again for an unknown kind (a CRD installed since) at most this often.
 const REDISCOVER_EVERY: Duration = Duration::from_secs(60);
 
-/// How long a request waits for the user's answer.
-const APPROVAL_TIMEOUT: Duration = Duration::from_secs(120);
+/// How long the kinds of a CRD applied through the hub count as new: until then a lookup
+/// that misses them asks their own group version, and waits for it to serve them.
+const NEW_CRD_FOR: Duration = Duration::from_secs(300);
+
+/// The most new CRD kinds kept per context.
+const MAX_NEW_KINDS: usize = 256;
+
+/// How long a lookup waits for the API server to serve the kind of a CRD just applied. It
+/// takes about a second once the CRD is accepted; one that never is fails after this.
+pub(crate) const SERVE_WAIT: Duration = Duration::from_secs(20);
+
+/// How often a lookup asks again while it waits.
+const SERVE_POLL: Duration = Duration::from_millis(500);
+
+/// How long a request waits for the user's answer. The configs the Agents page copies
+/// give clients a tool timeout longer than this.
+pub const APPROVAL_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// How a request for approval ended.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -67,22 +83,38 @@ pub struct Approval {
     pub access: Access,
     /// A dry run: approving it must not turn into a rule for real writes.
     pub dry_run: bool,
+    /// What was approved is narrower than any rule for it: an Argo CD prune (held to the
+    /// resources the banner listed), rollback (to the deployment it named) or terminate,
+    /// whose `sync` verb would also allow any other sync, prune or rollback of the object.
+    pub once_only: bool,
+    /// When the request is refused unanswered. Set by [`Hub::request_approval`]; the banner
+    /// counts down to it.
+    pub deadline: Instant,
 }
 
 impl Approval {
+    /// How long the request still waits for an answer.
+    pub fn time_left(&self, now: Instant) -> Duration {
+        self.deadline.saturating_duration_since(now)
+    }
+
     /// A narrow Allow rule for exactly this request, when a rule can be that narrow.
-    /// None for exec (a rule cannot pin the command), patches and GitOps actions (the rule
-    /// would allow any patch), scale (it would allow any replica count, 0 too), apply (the
+    /// None for exec (a rule cannot pin the command), patches (the rule would allow any
+    /// patch), scale (it would allow any replica count, 0 too), Flux suspend and resume (one
+    /// verb for both: approving a resume would allow suspending), apply (the
     /// rule could not pin the content), a request other than a list with no object name
     /// (the rule would cover every name), a request across all namespaces (the rule would
     /// also cover namespaces no rule allows) and dry runs (a rule cannot be limited to dry
-    /// runs, so it would allow the real write).
+    /// runs, so it would allow the real write), and an Argo CD prune, rollback or terminate
+    /// (the `sync` verb would allow every other sync of the object).
     pub fn as_rule(&self) -> Option<Rule> {
         let a = &self.access;
-        if matches!(a.verb, Verb::Exec | Verb::Patch | Verb::Scale)
-            || self.tool == "gitops"
+        // A refresh or a sync has its own verb, so its rule allows that action on that
+        // object only.
+        if matches!(a.verb, Verb::Exec | Verb::Patch | Verb::Scale | Verb::Suspend)
             || self.tool == "apply_manifest"
             || self.dry_run
+            || self.once_only
             || (a.verb != Verb::List && a.name.is_none())
             || (a.namespace.is_none() && !a.cluster_scoped)
         {
@@ -131,6 +163,8 @@ struct Cluster {
     /// Discovered kinds and when; discovery runs one at a time per context.
     kinds: Mutex<Option<(Arc<Vec<Kind>>, Instant)>>,
     discovering: tokio::sync::Mutex<()>,
+    /// The kinds of CRDs applied through the hub, and when, that a lookup has not found yet.
+    new_kinds: Mutex<Vec<(Kind, Instant)>>,
 }
 
 /// Shared between the MCP server (tokio) and the UI (gpui).
@@ -178,6 +212,11 @@ impl Hub {
         }
         for agent in &mut config.agents {
             agent.policy.migrate();
+            // Saved before the GitOps verbs: rules.yaml, when it exists, is upgraded the same
+            // way when it is loaded (`apply_rules_file`), which then sets the version.
+            if config.version < GITOPS_VERBS_VERSION {
+                agent.policy.add_gitops_verbs();
+            }
         }
         let audit = load_audit_tail(&audit_path());
         Arc::new(Self::new(config, audit, config_error, rules_file::path().exists()))
@@ -283,17 +322,15 @@ impl Hub {
                 self.emit(HubEvent::AgentSeen);
                 return Err(e);
             }
-            // agents.json from before 0.3.0: an agent created then had no section until its
-            // rules were edited. It keeps its rules and its section is written, once.
-            let upgrade = cfg.version < CONFIG_VERSION;
+            // Rules saved by an older version are upgraded, and the file written, once: see
+            // `rules_file::apply_upgrading`.
             let mut agents = cfg.agents.clone();
-            rules_file::apply_file(&file, &mut agents, upgrade)?;
-            if upgrade && agents.iter().any(|a| !file.agents.contains_key(&a.name)) {
+            if rules_file::apply_upgrading(&file, &mut agents, cfg.version)? {
                 let mut seen = lock(&self.rules_text);
                 match rules_file::export_over(&path, &agents, seen.as_deref()) {
                     Ok(text) => *seen = Some(text),
                     Err(e) => {
-                        let e = e.context("rules.yaml could not be given the agents it doesn't name");
+                        let e = e.context("rules.yaml could not be upgraded for this version");
                         *lock(&self.rules_error) = Some(format!("{e:#}"));
                         drop((seen, cfg));
                         self.emit(HubEvent::AgentSeen);
@@ -473,7 +510,16 @@ impl Hub {
             let mut cfg = write(&self.config);
             let mut agents = cfg.agents.clone();
             let agent = agents.iter_mut().find(|a| a.id == id).context("unknown agent")?;
+            let allowed_protected = agent.policy.allow_names_protected();
             f(agent);
+            // rules.yaml could not hold it, and it would allow nothing. One already in a
+            // hand-edited agents.json doesn't block other edits.
+            if agent.policy.allow_names_protected() && !allowed_protected {
+                anyhow::bail!(
+                    "`{}` works in Ask and Deny rules only: in an Allow rule it would allow nothing",
+                    super::PROTECTED
+                );
+            }
             // rules.yaml doesn't hold the Enabled switch: only write it when names or rules change.
             if !same_rules(&cfg.agents, &agents) {
                 self.export_rules(&agents)?;
@@ -509,6 +555,18 @@ impl Hub {
     /// Fresh copy of an agent, so rule edits apply to the very next call.
     pub fn agent(&self, id: &str) -> Option<Agent> {
         read(&self.config).agents.iter().find(|a| a.id == id).cloned()
+    }
+
+    /// [`agent`](Self::agent), with its rules ready to decide its calls: when one names
+    /// `@protected`, the protection of contexts is read now (Settings → Contexts and the
+    /// kubeconfig), so a context protected since the last call counts. Unreadable, every
+    /// context counts as protected.
+    pub fn agent_for_calls(&self, id: &str) -> Option<Agent> {
+        let mut agent = self.agent(id)?;
+        if agent.policy.names_protected() {
+            agent.policy.set_unprotected(crate::settings::unprotected_contexts());
+        }
+        Some(agent)
     }
 
     /// Count a call; false when the agent is over its per-minute limit.
@@ -601,6 +659,9 @@ impl Hub {
         }
         let id = self.next_approval.fetch_add(1, Ordering::SeqCst);
         request.id = id;
+        // One deadline for the banner's countdown and the refusal, so they agree.
+        let deadline = Instant::now() + APPROVAL_TIMEOUT;
+        request.deadline = deadline;
         let (tx, rx) = oneshot::channel();
         lock(&self.approvals).insert(id, tx);
         let _pending = Pending { hub: self, id };
@@ -610,7 +671,7 @@ impl Hub {
             biased;
             () = gone => Answer::Abandoned,
             answer = rx => answer.unwrap_or(Answer::Rejected),
-            () = tokio::time::sleep(APPROVAL_TIMEOUT) => Answer::TimedOut,
+            () = tokio::time::sleep_until(deadline.into()) => Answer::TimedOut,
         }
     }
 
@@ -690,6 +751,137 @@ impl Hub {
             None
         }
     }
+
+    /// Note the kinds of CRDs just applied on `context` (`k8s::crd_kinds`). Until a lookup
+    /// finds them, one that misses them asks their group version at once, and waits for the
+    /// API server to serve them, instead of waiting for the next full discovery.
+    pub fn crds_applied(&self, context: &str, kinds: Vec<Kind>) {
+        if kinds.is_empty() {
+            return;
+        }
+        let Ok(cluster) = self.cluster(context) else { return };
+        note_new(&mut lock(&cluster.new_kinds), kinds, Instant::now());
+    }
+
+    /// The kind of `api_version` `kind` the kinds discovered on `context` hold. No request.
+    pub fn known(&self, context: &str, api_version: &str, kind: &str) -> Option<Kind> {
+        let cluster = self.cluster(context).ok()?;
+        let kinds = lock(&cluster.kinds);
+        kinds.as_ref().and_then(|(kinds, _)| k8s::manifest_kind(kinds, api_version, kind).cloned())
+    }
+
+    /// A kind missing from the kinds discovered on `context`, looked up again. The kind of a
+    /// CRD applied through the hub lately, or one of a group version discovery doesn't
+    /// have, is asked of its group version at once (one request); for a CRD applied lately
+    /// it waits up to `SERVE_WAIT` for the API server to serve it. Anything else waits for
+    /// the next full discovery (`rediscover`, once a minute).
+    pub async fn new_kind(&self, context: &str, api_version: &str, kind: &str) -> Option<Kind> {
+        let cluster = self.cluster(context).ok()?;
+        let client = cluster.client.get()?.clone();
+        let cached = lock(&cluster.kinds).as_ref().map_or_default(|(k, _)| k.clone());
+        let (group, version, wait) = match lookup(&cached, &new_kinds(&cluster), api_version, kind) {
+            Lookup::Known => return k8s::manifest_kind(&cached, api_version, kind).cloned(),
+            Lookup::Everything => {
+                let kinds = self.rediscover(context).await?;
+                return k8s::manifest_kind(&kinds, api_version, kind).cloned();
+            }
+            Lookup::Group { group, version, wait } => (group, version, wait),
+        };
+        let deadline = Instant::now() + if wait { SERVE_WAIT } else { Duration::ZERO };
+        loop {
+            if let Ok(fresh) = k8s::discover_version(client.clone(), group.clone(), version.clone()).await {
+                let found = k8s::manifest_kind(&fresh, api_version, kind).cloned();
+                {
+                    let mut cache = lock(&cluster.kinds);
+                    if let Some((kinds, _)) = cache.as_mut() {
+                        *kinds = Arc::new(k8s::with_version(kinds, &group, &version, fresh));
+                    }
+                }
+                if let Some(found) = found {
+                    lock(&cluster.new_kinds).retain(|(k, _)| !same_type(k, &found));
+                    return Some(found);
+                }
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            tokio::time::sleep(SERVE_POLL).await;
+        }
+    }
+
+    /// The kind named `query` (`stages`, `stages.kwok.x-k8s.io`) of a CRD applied lately
+    /// that discovery doesn't have yet, looked up in its group version (see `new_kind`).
+    pub async fn new_kind_named(&self, context: &str, query: &str) -> Option<Kind> {
+        let cluster = self.cluster(context).ok()?;
+        let new = k8s::find_kind(&new_kinds(&cluster), query).cloned()?;
+        self.new_kind(context, &new.ar.api_version, &new.ar.kind).await
+    }
+}
+
+/// Where a kind missing from discovery is looked for.
+#[derive(Debug, PartialEq, Eq)]
+enum Lookup {
+    /// It is there now: another call found it meanwhile.
+    Known,
+    /// In its own group version, asked now; `wait`: for the API server to serve it, as the
+    /// kind of a CRD applied lately.
+    Group { group: String, version: String, wait: bool },
+    /// In the next full discovery.
+    Everything,
+}
+
+/// Where to look for `api_version` `kind`, from the kinds discovered (`cached`) and those of
+/// CRDs applied lately (`new`). A kind of a CRD applied lately, or of a group version
+/// discovery doesn't have (its CRD may be new), is asked of its group version: one cheap
+/// request. A kind missing from a group version discovered waits for the next full
+/// discovery, as does anything that can't be an `apiVersion`.
+fn lookup(cached: &[Kind], new: &[Kind], api_version: &str, kind: &str) -> Lookup {
+    if k8s::manifest_kind(cached, api_version, kind).is_some() {
+        return Lookup::Known;
+    }
+    let Some((group, version)) = group_version(api_version) else { return Lookup::Everything };
+    let wait = k8s::manifest_kind(new, api_version, kind).is_some();
+    if wait || !cached.iter().any(|k| k.ar.api_version == api_version) {
+        Lookup::Group { group: group.into(), version: version.into(), wait }
+    } else {
+        Lookup::Everything
+    }
+}
+
+/// The group and version of an `apiVersion` (`v1`, `apps/v1`), when it can be one: they go
+/// into the request's path.
+fn group_version(api_version: &str) -> Option<(&str, &str)> {
+    let (group, version) = match api_version.split_once('/') {
+        Some(("", _)) => return None,
+        Some(gv) => gv,
+        None => ("", api_version),
+    };
+    let name = |s: &str, dots: bool| {
+        s.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || (dots && c == '.'))
+    };
+    (!version.is_empty() && name(version, false) && name(group, true) && !group.starts_with('.'))
+        .then_some((group, version))
+}
+
+/// The same type: the same `apiVersion` and `kind`.
+fn same_type(a: &Kind, b: &Kind) -> bool {
+    a.ar.api_version == b.ar.api_version && a.ar.kind == b.ar.kind
+}
+
+/// `kinds` noted in `new` as applied at `now`: each type once, the expired dropped, and the
+/// oldest past `MAX_NEW_KINDS`.
+fn note_new(new: &mut Vec<(Kind, Instant)>, kinds: Vec<Kind>, now: Instant) {
+    new.retain(|(k, at)| now.duration_since(*at) < NEW_CRD_FOR && !kinds.iter().any(|n| same_type(n, k)));
+    new.extend(kinds.into_iter().map(|k| (k, now)));
+    let excess = new.len().saturating_sub(MAX_NEW_KINDS);
+    new.drain(..excess);
+}
+
+/// The kinds of CRDs applied lately that no lookup has found yet.
+fn new_kinds(cluster: &Cluster) -> Vec<Kind> {
+    let now = Instant::now();
+    let new = lock(&cluster.new_kinds);
+    new.iter().filter(|(_, at)| now.duration_since(*at) < NEW_CRD_FOR).map(|(k, _)| k.clone()).collect()
 }
 
 /// A request waiting for the user's answer. Dropped when the wait ends, however it ends, and
@@ -750,6 +942,29 @@ mod tests {
         assert!(!same_rules(std::slice::from_ref(&agent), &[]));
     }
 
+    /// rules.yaml refuses `@protected` in an Allow rule, so the app never holds one it
+    /// could not write back. Refused before anything is saved: no file is written here.
+    #[test]
+    fn an_allow_rule_naming_protected_contexts_is_not_saved() {
+        let protected = |effect| Rule {
+            effect,
+            verbs: vec!["delete".into()],
+            resources: vec!["pods".into()],
+            namespaces: vec!["*".into()],
+            contexts: vec!["staging".into(), super::super::PROTECTED.into()],
+            names: vec!["*".into()],
+            ..Rule::default()
+        };
+        let hub = Hub::for_test(vec![agent()]);
+        assert!(hub.update_agent("a1", |a| a.policy.rules.push(protected(Mode::Allow))).is_err());
+        assert_eq!(hub.agent("a1").unwrap().policy.rules, Policy::default().rules);
+        // Ask and Deny rules may name it.
+        for effect in [Mode::Ask, Mode::Deny] {
+            let p = Policy { rules: vec![protected(effect)], ..Policy::default() };
+            assert!(!p.allow_names_protected());
+        }
+    }
+
     #[test]
     fn an_unreadable_rules_file_is_reloaded_once() {
         let seen = Some("old".to_string());
@@ -804,6 +1019,8 @@ mod tests {
             preview: None,
             access,
             dry_run: false,
+            once_only: false,
+            deadline: Instant::now(),
         };
         tokio::spawn(async move { hub.request_approval(request, gone).await })
     }
@@ -845,6 +1062,28 @@ mod tests {
         hub.resolve_approval(1, true);
         assert!(lock(&hub.approvals).is_empty());
         assert!(approval_events(&mut events).is_empty());
+    }
+
+    /// The banner counts down to the moment the hub refuses the request: the deadline it
+    /// carries is the timeout's, not the placeholder its caller gave.
+    #[tokio::test]
+    async fn a_request_carries_the_deadline_it_is_refused_at() {
+        let hub = Hub::for_test(vec![agent()]);
+        let mut events = hub.subscribe();
+        let before = Instant::now();
+        let wait = ask(&hub, std::future::pending());
+        until_pending(&hub, 1).await;
+        let after = Instant::now();
+        let asked = std::iter::from_fn(|| events.try_recv().ok())
+            .find_map(|e| match &*e {
+                HubEvent::ApprovalRequested(a) => Some(a.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert!(asked.deadline >= before + APPROVAL_TIMEOUT && asked.deadline <= after + APPROVAL_TIMEOUT);
+        assert!(asked.time_left(after) <= APPROVAL_TIMEOUT);
+        assert_eq!(asked.time_left(asked.deadline + Duration::from_secs(5)), Duration::ZERO);
+        wait.abort();
     }
 
     /// A call dropped while it waits takes its request with it: no banner is left to approve.
@@ -902,5 +1141,65 @@ mod tests {
         assert!(m.is_poisoned());
         *lock(&m) += 1;
         assert_eq!(*lock(&m), 2);
+    }
+
+    fn group(group: &str, version: &str, wait: bool) -> Lookup {
+        Lookup::Group { group: group.into(), version: version.into(), wait }
+    }
+
+    /// A CR applied right after its CRD (#839): its type is asked of its own group version
+    /// at once, and waited for, instead of being unknown until the next full discovery.
+    #[test]
+    fn a_type_of_a_crd_just_applied_is_asked_of_its_group() {
+        let cached = vec![Kind::fake("", "Pod"), Kind::fake("apps", "Deployment"), Kind::fake("example.com", "Widget")];
+        let stage = Kind::fake("kwok.x-k8s.io", "Stage");
+        let gadget = Kind::fake("example.com", "Gadget");
+        let new = vec![stage, gadget];
+        assert_eq!(lookup(&cached, &new, "apps/v1", "Deployment"), Lookup::Known);
+        // Announced by a CRD just applied: asked of its group, waiting for it to be served,
+        // whether or not its group version was discovered.
+        assert_eq!(lookup(&cached, &new, "kwok.x-k8s.io/v1", "Stage"), group("kwok.x-k8s.io", "v1", true));
+        assert_eq!(lookup(&cached, &new, "example.com/v1", "Gadget"), group("example.com", "v1", true));
+        // A group version discovery doesn't have: its CRD may be new, asked once.
+        assert_eq!(lookup(&cached, &[], "kwok.x-k8s.io/v1alpha1", "Stage"), group("kwok.x-k8s.io", "v1alpha1", false));
+        assert_eq!(lookup(&cached, &[], "v2", "Pod"), group("", "v2", false));
+        // A kind missing from a group version discovered, or no `apiVersion` at all: the next
+        // full discovery, as before.
+        assert_eq!(lookup(&cached, &[], "example.com/v1", "Gadget"), Lookup::Everything);
+        assert_eq!(lookup(&cached, &[], "v1", "Pdo"), Lookup::Everything);
+        for bad in ["", "/v1", "a/b/c", "Example.com/v1", "example.com/", "../v1", "example.com/v1?x=1"] {
+            assert_eq!(lookup(&cached, &new, bad, "Stage"), Lookup::Everything, "{bad}");
+        }
+    }
+
+    #[test]
+    fn only_a_plain_api_version_goes_into_a_request() {
+        assert_eq!(group_version("v1"), Some(("", "v1")));
+        assert_eq!(group_version("kwok.x-k8s.io/v1alpha1"), Some(("kwok.x-k8s.io", "v1alpha1")));
+        assert_eq!(group_version("a/b/c"), None);
+        assert_eq!(group_version("../v1"), None);
+        assert_eq!(group_version("/v1"), None);
+        assert_eq!(group_version("x/v 1"), None);
+    }
+
+    /// The kinds of CRDs applied are kept once each, for a while, and only so many.
+    #[test]
+    fn new_crd_kinds_are_kept_once_for_a_while_and_bounded() {
+        let names = |new: &[(Kind, Instant)]| new.iter().map(|(k, _)| k.ar.kind.clone()).collect::<Vec<_>>();
+        let now = Instant::now();
+        let mut new = Vec::new();
+        note_new(&mut new, vec![Kind::fake("a.io", "Stage")], now);
+        note_new(&mut new, vec![Kind::fake("a.io", "Stage"), Kind::fake("a.io", "Attach")], now);
+        assert_eq!(names(&new), ["Stage", "Attach"]);
+        // Applied again later: kept from then.
+        let later = now + NEW_CRD_FOR / 2;
+        note_new(&mut new, vec![Kind::fake("a.io", "Stage")], later);
+        assert_eq!(names(&new), ["Attach", "Stage"]);
+        note_new(&mut new, vec![Kind::fake("b.io", "Other")], now + NEW_CRD_FOR);
+        assert_eq!(names(&new), ["Stage", "Other"]);
+        let many: Vec<Kind> = (0..MAX_NEW_KINDS + 10).map(|i| Kind::fake("c.io", &format!("K{i}"))).collect();
+        note_new(&mut new, many, now + NEW_CRD_FOR);
+        assert_eq!(new.len(), MAX_NEW_KINDS);
+        assert_eq!(new.first().map(|(k, _)| k.ar.kind.clone()), Some("K10".to_string()));
     }
 }
