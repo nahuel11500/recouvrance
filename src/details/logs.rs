@@ -472,15 +472,13 @@ impl LogsView {
     }
 
     /// Find matches as highlight ranges over `text` (the current hit stronger).
-    pub(super) fn find_highlights(
-        &self,
-        text: &str,
-        row: usize,
-        cx: &App,
-    ) -> Vec<(std::ops::Range<usize>, HighlightStyle)> {
+    pub(super) fn find_highlights(&self, text: &str, row: usize) -> Vec<(std::ops::Range<usize>, HighlightStyle)> {
         let Some(re) = &self.find_re else { return Vec::new() };
         let current = self.buf.hits().get(self.find_cur) == Some(&row);
-        let bg = if current { cx.theme().warning.opacity(0.75) } else { cx.theme().warning.opacity(0.3) };
+        // The bright amber in both themes: the light theme's own is deep, made for text, and
+        // the line's text would not read on it.
+        let amber = crate::app::bright_status().warning;
+        let bg = if current { amber.opacity(0.75) } else { amber.opacity(0.3) };
         re.find_iter(text)
             .filter(|m| !m.is_empty())
             .map(|m| (m.range(), HighlightStyle { background_color: Some(bg), ..Default::default() }))
@@ -513,7 +511,7 @@ impl LogsView {
                 }
                 pos += part.len() + 1;
             }
-            let found = self.find_highlights(line, i, cx);
+            let found = self.find_highlights(line, i);
             SelectableLine::new(
                 ElementId::NamedInteger("log-line".into(), l.id),
                 i as u64,
@@ -523,7 +521,7 @@ impl LogsView {
             .into_any_element()
         } else {
             let colored = base.map(|c| (0..l.text.len(), HighlightStyle { color: Some(c), ..Default::default() }));
-            let found = self.find_highlights(&l.text, i, cx);
+            let found = self.find_highlights(&l.text, i);
             let highlights = merge_highlights(colored.into_iter().collect(), found);
             SelectableLine::new(ElementId::NamedInteger("log-line".into(), l.id), i as u64, l.text.clone(), highlights)
                 .into_any_element()

@@ -1,7 +1,7 @@
 //! Theme, accent color and zoom, saved between runs.
 
 use gpui_kit::component::notification::Notification;
-use gpui_kit::component::{ActiveTheme as _, Theme, ThemeMode, WindowExt as _};
+use gpui_kit::component::{ActiveTheme as _, Theme, ThemeColor, ThemeMode, WindowExt as _};
 use gpui_kit::*;
 
 /// Apply a theme mode and remember it as the user's choice (no longer following the desktop).
@@ -36,12 +36,64 @@ pub fn apply_theme(mode: ThemeMode, window: Option<&mut Window>, cx: &mut App) {
     let theme = Theme::global_mut(cx);
     theme.font_size = px((13. * z).round());
     theme.mono_font_size = px((12. * z).round());
-    let c = |hex: u32| -> Hsla { rgb(hex).into() };
-    // "Harbour", after the schooner Recouvrance: a deep navy hull for the sidebar, sail-canvas
-    // pages, brass fittings for selection and primary actions, and sea and signal colors for
-    // status.
     let t = &mut theme.colors;
-    if mode.is_dark() {
+    paint(t, mode.is_dark());
+    // Accent (brass by default) from Settings → Appearance: selection, primary buttons, focus.
+    let accent = crate::settings::with(|s| s.accent.clone());
+    let (_, dark, light) =
+        crate::settings::ACCENTS.iter().find(|(n, ..)| *n == accent).copied().unwrap_or(crate::settings::ACCENTS[0]);
+    let a = c(if mode.is_dark() { dark } else { light });
+    t.list_active = a.opacity(if mode.is_dark() { 0.24 } else { 0.18 });
+    t.table_active = t.list_active;
+    t.ring = a;
+    t.caret = a;
+    t.selection = a.opacity(0.3);
+    t.primary = a;
+    t.primary_hover = a.opacity(0.9);
+    t.primary_active = a.opacity(0.8);
+    t.primary_foreground = c(if mode.is_dark() { 0x111c2e } else { 0x10233f });
+    t.sidebar_primary = a;
+    t.sidebar_primary_foreground = c(0x10233f);
+    t.button_primary = t.primary;
+    t.button_primary_hover = t.primary_hover;
+    t.button_primary_active = t.primary_active;
+    t.button_primary_foreground = t.primary_foreground;
+    // Components read the derived tokens; rebuild them from the edited colors.
+    theme.tokens = component::theme::ThemeTokens::from(&theme.colors);
+    theme.radius = px(7.);
+    theme.radius_lg = px(10.);
+    cx.refresh_windows();
+}
+
+/// A `0xRRGGBB` color.
+fn c(hex: u32) -> Hsla {
+    rgb(hex).into()
+}
+
+/// The strongest tint of a status color that text of that color sits on: chips, a status
+/// button under the pointer, a picked count on Problems. The tests check that the text reads.
+pub const STATUS_FILL: f32 = 0.15;
+
+/// Success, warning and danger colors.
+#[derive(Clone, Copy)]
+pub struct StatusColors {
+    pub success: Hsla,
+    pub warning: Hsla,
+    pub danger: Hsla,
+}
+
+/// The bright status colors, which read on navy: the dark theme's, and the sidebar's in both
+/// themes, since it is navy in both. Dark text reads on them as fills (the sidebar's badges, a
+/// find match in logs).
+pub fn bright_status() -> StatusColors {
+    StatusColors { success: c(0x5cb88f), warning: c(0xe3a23b), danger: c(0xe58178) }
+}
+
+/// The app's colors over gpui's defaults, the accent apart: "Harbour", after the schooner
+/// Recouvrance. A deep navy hull for the sidebar, sail-canvas pages, brass fittings for
+/// selection and primary actions, and sea and signal colors for status.
+fn paint(t: &mut ThemeColor, dark: bool) {
+    if dark {
         t.background = c(0x111c2e);
         t.foreground = c(0xe8e1d3);
         t.muted_foreground = c(0x8f9aad);
@@ -71,13 +123,13 @@ pub fn apply_theme(mode: ThemeMode, window: Option<&mut Window>, cx: &mut App) {
         t.table_row_border = c(0x1a2740);
         t.blue = c(0x8db8e8);
         t.link = c(0x8db8e8);
-        t.success = c(0x5cb88f);
-        t.warning = c(0xe3a23b);
-        t.danger = c(0xe06c62);
+        let s = bright_status();
+        (t.success, t.warning, t.danger) = (s.success, s.warning, s.danger);
     } else {
         t.background = c(0xfbf8f2);
         t.foreground = c(0x1b2533);
-        t.muted_foreground = c(0x6b7280);
+        // Also the color of what is done (Completed, Succeeded): 4.5:1 on chips and stripes.
+        t.muted_foreground = c(0x585e69);
         t.border = c(0xe7dfcf);
         t.secondary = c(0xf2ece0);
         t.secondary_foreground = c(0x1b2533);
@@ -104,35 +156,26 @@ pub fn apply_theme(mode: ThemeMode, window: Option<&mut Window>, cx: &mut App) {
         t.table_row_border = c(0xefe8da);
         t.blue = c(0x1f5f99);
         t.link = c(0x1f5f99);
-        t.success = c(0x3e8e6a);
-        t.warning = c(0xc27c1e);
-        t.danger = c(0xc2453d);
+        // Deep enough to read as text on every surface of the pages and on their own tints
+        // (WCAG AA, 4.5:1): the bright ones read on navy only.
+        t.success = c(0x2d684d);
+        t.warning = c(0x874f0f);
+        t.danger = c(0xa13a33);
     }
-    // Accent (brass by default) from Settings → Appearance: selection, primary buttons, focus.
-    let accent = crate::settings::with(|s| s.accent.clone());
-    let (_, dark, light) =
-        crate::settings::ACCENTS.iter().find(|(n, ..)| *n == accent).copied().unwrap_or(crate::settings::ACCENTS[0]);
-    let a = c(if mode.is_dark() { dark } else { light });
-    t.list_active = a.opacity(if mode.is_dark() { 0.24 } else { 0.18 });
-    t.table_active = t.list_active;
-    t.ring = a;
-    t.caret = a;
-    t.selection = a.opacity(0.3);
-    t.primary = a;
-    t.primary_hover = a.opacity(0.9);
-    t.primary_active = a.opacity(0.8);
-    t.primary_foreground = c(if mode.is_dark() { 0x111c2e } else { 0x10233f });
-    t.sidebar_primary = a;
-    t.sidebar_primary_foreground = c(0x10233f);
-    t.button_primary = t.primary;
-    t.button_primary_hover = t.primary_hover;
-    t.button_primary_active = t.primary_active;
-    t.button_primary_foreground = t.primary_foreground;
-    // Components read the derived tokens; rebuild them from the edited colors.
-    theme.tokens = component::theme::ThemeTokens::from(&theme.colors);
-    theme.radius = px(7.);
-    theme.radius_lg = px(10.);
-    cx.refresh_windows();
+    // Text and icons on a status fill (gpui's tags, the window's close button on hover): the
+    // page's color reads on the light theme's deep fills and on the dark theme's bright ones.
+    t.success_foreground = t.background;
+    t.warning_foreground = t.background;
+    t.danger_foreground = t.background;
+    // gpui derived its status buttons from its own palette when the theme loaded ("writes on"
+    // was yellow on pale yellow, 1.5:1): derive them from these, on tints their text reads on.
+    // Pressed goes a little further, for a moment.
+    let button = |color: Hsla| (color.opacity(0.1), color.opacity(STATUS_FILL), color.opacity(0.2), color);
+    (t.button_success, t.button_success_hover, t.button_success_active, t.button_success_foreground) =
+        button(t.success);
+    (t.button_warning, t.button_warning_hover, t.button_warning_active, t.button_warning_foreground) =
+        button(t.warning);
+    (t.button_danger, t.button_danger_hover, t.button_danger_active, t.button_danger_foreground) = button(t.danger);
 }
 
 /// Families with a bold face of their own, tried in order when the UI font has none.
@@ -249,8 +292,111 @@ pub fn initial_theme(cx: &mut App) -> ThemeMode {
 
 #[cfg(test)]
 mod tests {
+    use gpui_kit::component::ThemeColor;
+    use gpui_kit::{Hsla, Rgba};
+
     // Not `super::*`: gpui's `test` macro, glob-imported there, would shadow the built-in one.
-    use super::{STATIC_UI_FONTS, bold_capable_family};
+    use super::{STATIC_UI_FONTS, STATUS_FILL, bold_capable_family, bright_status, paint};
+
+    /// WCAG 2's relative luminance of an opaque color.
+    fn luminance(color: Hsla) -> f32 {
+        let c = Rgba::from(color);
+        let linear = |v: f32| if v <= 0.04045 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) };
+        0.2126 * linear(c.r) + 0.7152 * linear(c.g) + 0.0722 * linear(c.b)
+    }
+
+    /// WCAG 2's contrast ratio of two opaque colors, from 1 to 21.
+    fn contrast(a: Hsla, b: Hsla) -> f32 {
+        let (a, b) = (luminance(a), luminance(b));
+        (a.max(b) + 0.05) / (a.min(b) + 0.05)
+    }
+
+    #[test]
+    fn contrast_follows_wcag() {
+        let (black, white) = (gpui_kit::black(), gpui_kit::white());
+        assert!((contrast(black, white) - 21.).abs() < 0.01);
+        assert!((contrast(white, white) - 1.).abs() < 0.001);
+        // #767676 is the lightest gray that reads on white at 4.5:1.
+        let gray: Hsla = gpui_kit::rgb(0x767676).into();
+        assert!((contrast(gray, white) - 4.54).abs() < 0.01, "{}", contrast(gray, white));
+    }
+
+    /// Every status color against what it is drawn on, in both themes, at what WCAG AA asks of
+    /// text this size: 4.5:1. Icons, dots and bars need 3:1, so they pass with the text.
+    #[test]
+    fn status_colors_read_at_wcag_aa() {
+        let mut low = Vec::new();
+        for dark in [false, true] {
+            let mut t = ThemeColor::default();
+            paint(&mut t, dark);
+            let theme = if dark { "dark" } else { "light" };
+            let mut need = |what: String, text: Hsla, under: Hsla| {
+                let ratio = contrast(text, under);
+                if ratio < 4.5 {
+                    low.push(format!("{theme}: {what}: {ratio:.2}:1"));
+                }
+            };
+            let surfaces = [
+                ("the page", t.background),
+                ("striped rows", t.table_even),
+                ("a hovered row", t.table_hover),
+                ("chips", t.secondary),
+                ("muted panels", t.muted),
+                ("popovers", t.popover),
+                ("the active tab", t.tab_active),
+                ("the title bar", t.title_bar),
+                ("a hovered item", t.accent),
+                ("a hovered list row", t.list_hover),
+            ];
+            // Where a tint of a status color carries text of that color: chips, status
+            // buttons, counts.
+            let tinted = [
+                ("the page", t.background),
+                ("striped rows", t.table_even),
+                ("popovers", t.popover),
+                ("the title bar", t.title_bar),
+            ];
+            let statuses =
+                [("success", t.success), ("warning", t.warning), ("danger", t.danger), ("muted", t.muted_foreground)];
+            for (status, color) in statuses {
+                for (surface, under) in surfaces {
+                    need(format!("{status} text on {surface}"), color, under);
+                }
+                for (surface, under) in tinted {
+                    let tint = under.blend(color.opacity(STATUS_FILL));
+                    need(format!("{status} text on its tint over {surface}"), color, tint);
+                }
+            }
+            let buttons = [
+                ("success", t.button_success_foreground, t.button_success, t.button_success_hover),
+                ("warning", t.button_warning_foreground, t.button_warning, t.button_warning_hover),
+                ("danger", t.button_danger_foreground, t.button_danger, t.button_danger_hover),
+            ];
+            for (status, text, fill, hovered) in buttons {
+                for (surface, under) in tinted {
+                    need(format!("a {status} button over {surface}"), text, under.blend(fill));
+                    need(format!("a hovered {status} button over {surface}"), text, under.blend(hovered));
+                }
+            }
+            let fills = [
+                ("success", t.success_foreground, t.success),
+                ("warning", t.warning_foreground, t.warning),
+                ("danger", t.danger_foreground, t.danger),
+            ];
+            for (status, text, fill) in fills {
+                need(format!("text on a {status} fill"), text, fill);
+            }
+            // The sidebar is navy in both themes: its status text, and its badges (the
+            // sidebar's color on a bright fill), take the bright colors.
+            let bright = bright_status();
+            for (status, color) in [("success", bright.success), ("warning", bright.warning), ("danger", bright.danger)]
+            {
+                need(format!("{status} on the sidebar"), color, t.sidebar);
+                need(format!("{status} on the sidebar's selected row"), color, t.sidebar_accent);
+            }
+        }
+        assert!(low.is_empty(), "below WCAG AA (4.5:1):\n{}", low.join("\n"));
+    }
 
     fn names(names: &[&str]) -> Vec<String> {
         names.iter().map(ToString::to_string).collect()
