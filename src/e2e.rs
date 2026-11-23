@@ -122,7 +122,9 @@ fn write_mode_off_refuses_the_ui_s_writes() {
 
 /// An agent's rules decide on the real cluster through the MCP server: a delete its rules
 /// don't allow is refused and the object stays; the kill switch refuses even reads; with a
-/// delete rule, the same call deletes (so the refusals above are not a broken setup).
+/// delete rule, the same call deletes (so the refusals above are not a broken setup). A
+/// refusal says whether it is final, or the rule that would allow the call, and that rule,
+/// added, does; `check_access` says the same without making the call.
 #[test]
 #[ignore = "needs a kind cluster: RECOUVRANCE_E2E_CONTEXT"]
 fn an_agent_gets_only_what_its_rules_allow() {
@@ -141,10 +143,27 @@ fn an_agent_gets_only_what_its_rules_allow() {
         let out = client.call("delete_resource", delete.clone()).await;
         assert!(out.contains("Denied"), "{out}");
         assert!(truth.get_opt(name).await?.is_some(), "a denied delete reached the cluster");
+        let grant = format!("delete configmaps/{name} -n {NS} --context {ctx}");
+        assert!(out.contains("Grantable") && out.contains(&format!("`{grant}` under allow")), "{out}");
         let out = client
             .call("get_resource", json!({"context": ctx, "kind": "secrets", "namespace": "kube-system", "name": "x"}))
             .await;
-        assert!(out.contains("Denied"), "{out}");
+        assert!(out.contains("Denied") && out.contains("Final"), "{out}");
+        let planned = json!({"requests": [
+            {"context": ctx, "verb": "delete", "kind": "cm", "namespace": NS, "name": name},
+            {"context": ctx, "verb": "get", "kind": "secrets", "namespace": "kube-system", "name": "x"},
+            {"context": ctx, "verb": "list", "kind": "pods"},
+            {"context": "e2e-no-such-context", "verb": "get", "kind": "pods"},
+        ]});
+        let out = client.call("check_access", planned.clone()).await;
+        assert!(
+            out.contains(&format!("1. delete configmaps {name} -n {NS} --context {ctx}: denied. Grantable")),
+            "{out}"
+        );
+        assert!(out.contains("2. get secrets x -n kube-system") && out.contains("denied by rule #2"), "{out}");
+        assert!(out.contains("3. list pods (all namespaces / cluster)") && out.contains("allowed by rule #1"), "{out}");
+        assert!(out.contains("4. get pods --context e2e-no-such-context: could not check"), "{out}");
+        assert!(out.contains("1 allowed, 0 needing approval, 2 denied."), "{out}");
 
         hub.set_agents_enabled(false)?;
         let out = client.call("get_resource", get.clone()).await;
@@ -153,8 +172,11 @@ fn an_agent_gets_only_what_its_rules_allow() {
         let out = client.call("get_resource", get).await;
         assert!(out.contains(name), "{out}");
 
-        let allow = rules_file::parse_rule(Mode::Allow, "delete configmaps/e2e-* -n default")?;
+        // The rule the refusal named is enough.
+        let allow = rules_file::parse_rule(Mode::Allow, &grant)?;
         hub.update_agent(&agent.id, |a| a.policy.rules.push(allow))?;
+        let out = client.call("check_access", planned).await;
+        assert!(out.contains(&format!("{name} -n {NS} --context {ctx}: allowed by rule #3")), "{out}");
         let out = client.call("delete_resource", delete).await;
         assert!(!out.contains("Denied"), "{out}");
         for _ in 0..50 {

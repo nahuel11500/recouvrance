@@ -7,8 +7,9 @@ use rmcp::{tool, tool_router};
 use serde_json::json;
 
 use super::{
-    ApplyParams, DeleteParams, DrainParams, ExecParams, GitOpsParams, KubeMcp, PatchParams, RestartParams, ScaleParams,
-    access_for, denied_namespaces, denies_eviction, manifest_objects, manifest_summary, require_ns,
+    ApplyParams, DENIED_BY_RULE, DeleteParams, DrainParams, ExecParams, GitOpsParams, KubeMcp, PatchParams,
+    RestartParams, ScaleParams, access_for, denied_namespaces, denies_eviction, manifest_objects, manifest_summary,
+    require_ns,
 };
 use std::sync::Arc;
 
@@ -133,7 +134,7 @@ impl KubeMcp {
                 // The log says what was applied before.
                 let detail =
                     if out.is_empty() { reason } else { format!("{reason}; applied before: {}", out.join("; ")) };
-                out.push(call.deny(detail));
+                out.push(call.deny_hinted(detail, &self.stale_hint(&call, &access)));
                 return Err(out.join("\n"));
             }
             match k8s::apply(client.clone(), kind, ns, doc, dry).await {
@@ -182,11 +183,14 @@ impl KubeMcp {
             denies_eviction(call.policy(), &a)
         });
         if !denied.is_empty() {
-            return Err(call.deny(format!(
-                "node {} runs pods in namespaces your rules deny (delete pods): {}; nothing was changed",
-                p.node,
-                denied.join(", ")
-            )));
+            return Err(call.deny_hinted(
+                format!(
+                    "node {} runs pods in namespaces your rules deny (delete pods): {}; nothing was changed",
+                    p.node,
+                    denied.join(", ")
+                ),
+                DENIED_BY_RULE,
+            ));
         }
         self.recheck(&mut call, &access)?;
         let stop = self.still_allowed(&call, &access);

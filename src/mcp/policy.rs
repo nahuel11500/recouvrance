@@ -430,8 +430,15 @@ impl Policy {
     /// Whether some non-expired Allow or Ask rule names this context, and no Deny of
     /// everything covers it: checked before connecting.
     pub fn context_allowed(&self, context: &str) -> bool {
+        self.context_denied_by(context).is_none()
+            && self.rules.iter().any(|r| r.effect != Mode::Deny && !r.expired() && any_glob(&r.contexts, context))
+    }
+
+    /// The non-expired Deny of everything (`*` verbs, resources, namespaces and names) that
+    /// covers this context, if one does: no rule added can open the context then.
+    pub fn context_denied_by(&self, context: &str) -> Option<usize> {
         let all = |patterns: &[String]| patterns.iter().any(|p| p.trim() == "*");
-        let denied = self.rules.iter().any(|r| {
+        self.rules.iter().position(|r| {
             r.effect == Mode::Deny
                 && !r.expired()
                 && all(&r.verbs)
@@ -439,8 +446,7 @@ impl Policy {
                 && all(&r.namespaces)
                 && all(&r.names)
                 && any_glob(&r.contexts, context)
-        });
-        !denied && self.rules.iter().any(|r| r.effect != Mode::Deny && !r.expired() && any_glob(&r.contexts, context))
+        })
     }
 
     /// Turn pre-rules settings into rules, once.
