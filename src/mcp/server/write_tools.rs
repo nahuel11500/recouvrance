@@ -620,7 +620,7 @@ fn unknown_hint(kinds: &[Kind], api_version: &str, kind_name: &str) -> String {
 mod tests {
     use serde_json::json;
 
-    use super::{crds_first, unknown_hint};
+    use super::{Op, Res, SyncRequest, approval_detail, crds_first, ops, unknown_hint};
     use crate::k8s::Kind;
 
     /// A custom resource listed before its CRD is applied after it; the rest keep their order.
@@ -644,12 +644,6 @@ mod tests {
         // A group version discovery didn't have was asked of the API server just now.
         assert_eq!(unknown_hint(&kinds, "kwok.x-k8s.io/v1alpha1", "Stage"), " (the API server serves no such type)");
     }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{Op, Res, SyncRequest, approval_detail, ops};
-    use serde_json::json;
 
     fn app() -> serde_json::Value {
         let source = json!({"repoURL": "https://git.example/r", "path": "web"});
