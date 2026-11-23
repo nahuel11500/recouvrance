@@ -445,6 +445,10 @@ pub struct AppView {
     /// This is the first window, and its first connect has not finished: that one reopens
     /// where its set of contexts was left.
     restore: bool,
+    /// This view, by which `session::SessionOwners` knows the window that saves a set.
+    view_id: EntityId,
+    /// Where the window was last, not maximized: what is saved while it is maximized.
+    windowed: Option<crate::settings::WindowPlace>,
     /// The save waiting for changes to stop (see `session_changed`), and the window's.
     _save_session: Option<Task<()>>,
     _save_window: Option<Task<()>>,
@@ -591,7 +595,7 @@ impl AppView {
             }),
             cx.observe_window_bounds(window, |this, window, cx| this.window_moved(window, cx)),
             // Where the window is left is saved as it closes, and as the app quits.
-            cx.on_release(|this, cx| this.save_session_now(cx)),
+            cx.on_release(|this, cx| this.leave_session(cx)),
             cx.on_app_quit(|this, cx| {
                 this.save_session_now(cx);
                 async {}
@@ -695,6 +699,8 @@ impl AppView {
             _connect: None,
             session_key: Vec::new(),
             restore: first_window,
+            view_id: cx.entity_id(),
+            windowed: None,
             _save_session: None,
             _save_window: None,
             _kubeconfig_watch: None,
