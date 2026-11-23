@@ -297,21 +297,25 @@ fn kinds_of(resources: Vec<(ApiResource, ApiCapabilities)>) -> Vec<Kind> {
         if !listable(&caps) || ar.plural.contains('/') {
             continue;
         }
-        let namespaced = caps.scope == Scope::Namespaced;
-        let kind = match KNOWN.iter().find(|(_, g, k, _)| *g == ar.group && *k == ar.kind) {
-            Some((section, _, _, label)) => Kind { ar, namespaced, section, label: label.to_string() },
-            None if is_noise(&ar) => Kind { label: ar.kind.clone(), ar, namespaced, section: HIDDEN_SECTION },
-            // Remaining built-in APIs are cluster plumbing, not custom resources
-            // (some CRD groups end in .k8s.io too: those are mapped above).
-            None if is_builtin_group(&ar.group) && crd_section(&ar.group) == CUSTOM_SECTION => {
-                Kind { label: ar.kind.clone(), ar, namespaced, section: "Administration" }
-            }
-            None => Kind { label: ar.kind.clone(), section: crd_section(&ar.group), ar, namespaced },
-        };
-        kinds.push(kind);
+        kinds.push(kind_of(ar, caps.scope == Scope::Namespaced));
     }
     sort_for_sidebar(&mut kinds);
     kinds
+}
+
+/// A kind discovery found, with its sidebar section and label: a built-in's from `KNOWN`,
+/// the noise (old events.k8s.io duplicates, metrics, flow control) in `HIDDEN_SECTION`.
+pub fn kind_of(ar: ApiResource, namespaced: bool) -> Kind {
+    match KNOWN.iter().find(|(_, g, k, _)| *g == ar.group && *k == ar.kind) {
+        Some((section, _, _, label)) => Kind { ar, namespaced, section, label: label.to_string() },
+        None if is_noise(&ar) => Kind { label: ar.kind.clone(), ar, namespaced, section: HIDDEN_SECTION },
+        // Remaining built-in APIs are cluster plumbing, not custom resources
+        // (some CRD groups end in .k8s.io too: those are mapped above).
+        None if is_builtin_group(&ar.group) && crd_section(&ar.group) == CUSTOM_SECTION => {
+            Kind { label: ar.kind.clone(), ar, namespaced, section: "Administration" }
+        }
+        None => Kind { label: ar.kind.clone(), section: crd_section(&ar.group), ar, namespaced },
+    }
 }
 
 /// Discovery for clusters without aggregated discovery (before 1.26, or turned off): every
@@ -535,6 +539,29 @@ mod section_tests {
         assert_eq!(crd_section("barmancloud.cnpg.io"), "Storage");
         assert_eq!(crd_section("widgets.example.com"), super::CUSTOM_SECTION);
         assert_eq!(crd_section("iam.services.k8s.aws"), "Cloud");
+    }
+
+    /// A kind found by discovery, here or on a context that isn't connected, gets the
+    /// section and label the sidebar gives it.
+    #[test]
+    fn a_discovered_kind_is_labelled_as_in_the_sidebar() {
+        use super::{Kind, is_custom, kind_of};
+        let found = |group: &str, kind: &str| {
+            let k = Kind::fake(group, kind);
+            kind_of(k.ar, k.namespaced)
+        };
+        let shown = |k: &Kind| (k.section, k.label.clone(), is_custom(k));
+        assert_eq!(shown(&found("", "Namespace")), ("Cluster", "Namespaces".into(), false));
+        assert_eq!(shown(&found("apps", "Deployment")), ("Workloads", "Deployments".into(), false));
+        assert_eq!(
+            shown(&found("gateway.networking.k8s.io", "HTTPRoute")),
+            ("Networking", "HTTP Routes".into(), false)
+        );
+        // Built-in plumbing, then custom resources by their group.
+        let csr = found("certificates.k8s.io", "CertificateSigningRequest");
+        assert_eq!(shown(&csr), ("Administration", "CertificateSigningRequest".into(), false));
+        assert_eq!(shown(&found("cert-manager.io", "Certificate")), ("Configuration", "Certificate".into(), true));
+        assert_eq!(shown(&found("widgets.example.com", "Widget")), (super::CUSTOM_SECTION, "Widget".into(), true));
     }
 }
 

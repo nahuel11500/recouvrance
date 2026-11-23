@@ -10,7 +10,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use super::search_index::{Entry, SEARCH_KINDS, on_cluster};
-use super::{AppView, Route, open_main_window, section_icon, set_theme, set_zoom, zoom};
+use super::{AppView, Route, open_main_window, section_icon, set_theme, set_zoom, with_keys, zoom};
 use crate::k8s;
 use crate::k8s::Kind;
 use crate::ui::palette::{Item as PaletteItem, Palette, PaletteEvent, Target};
@@ -40,13 +40,14 @@ impl AppView {
             ("My access (RBAC in this namespace)", "access", Lucide::KeyRound),
             ("Install a Helm chart", "helm-install", Lucide::Download),
             ("Assistant (ask your clusters)", "assistant", Lucide::Sparkles),
-            ("New window (Ctrl Shift N)", "new-window", Lucide::AppWindow),
-            ("Zoom in (Ctrl +)", "zoom-in", Lucide::ZoomIn),
-            ("Zoom out (Ctrl -)", "zoom-out", Lucide::ZoomOut),
-            ("Reset zoom (Ctrl 0)", "zoom-reset", Lucide::Search),
+            ("New window ({secondary-shift-n})", "new-window", Lucide::AppWindow),
+            ("Zoom in ({secondary-=})", "zoom-in", Lucide::ZoomIn),
+            ("Zoom out ({secondary--})", "zoom-out", Lucide::ZoomOut),
+            ("Reset zoom ({secondary-0})", "zoom-reset", Lucide::Search),
             ("Toggle dark / light theme", "theme", Lucide::Moon),
         ] {
-            items.push(PaletteItem { label: label.into(), detail: "page".into(), icon, target: Target::Page(page) });
+            let label = with_keys(label);
+            items.push(PaletteItem { label, detail: "page".into(), icon, target: Target::Page(page) });
         }
         // The types the sidebar lists, not the noise discovery keeps for lookups.
         for k in self.kinds.iter().filter(|k| k8s::in_sidebar(k)) {
@@ -172,7 +173,9 @@ impl AppView {
                     Target::Page("settings") => this.navigate(Route::Settings, cx),
                     Target::Page("terminal") => this.open_terminal(window, cx),
                     Target::Page("apply") => this.open_apply(window, cx),
-                    Target::Page("new-window") => open_main_window(cx),
+                    Target::Page("new-window") => {
+                        open_main_window(cx);
+                    }
                     Target::Page("problems") => this.open_problems(window, cx),
                     Target::Page("timeline") => this.open_timeline(window, cx),
                     Target::Page("access") => this.open_access(window, cx),
