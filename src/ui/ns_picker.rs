@@ -91,6 +91,11 @@ impl NamespacePicker {
         cx.notify();
     }
 
+    /// Every namespace offered: the ones listed and the ones added by hand.
+    pub fn known(&self) -> &[String] {
+        &self.all
+    }
+
     /// Add a namespace by hand, remember it for this context, and show it.
     pub fn add_namespace(&mut self, ns: String, cx: &mut Context<Self>) {
         let ctx = self.context.clone();
