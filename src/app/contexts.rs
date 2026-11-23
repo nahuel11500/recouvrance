@@ -363,7 +363,7 @@ fn served_by<'a>(
 /// allowed to list them is an answer: they are picked by hand there. A timeout or a server
 /// error is not: the namespaces picked there may still exist, and the connect counts as
 /// partial (a session is not saved over, see `session`).
-fn listed_namespaces(ctx: &str, listed: anyhow::Result<Vec<String>>) -> Result<Vec<String>, String> {
+fn listed_namespaces(ctx: &str, listed: Result<Vec<String>>) -> Result<Vec<String>, String> {
     match listed {
         Ok(names) => Ok(names),
         Err(e) if k8s::api_status(&e) == Some(403) => Ok(Vec::new()),

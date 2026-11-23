@@ -118,7 +118,7 @@ impl AppView {
             | Route::Problems(_)
             | Route::Timeline(_)
             | Route::Helm(_)
-            | Route::Argo(_) => Overview::of(route).map(|(o, _)| o.title().to_string()).unwrap_or_default(),
+            | Route::Argo(_) => Overview::of(route).map_or("", |(o, _)| o.title()).to_string(),
             Route::Access(_) => "My access".into(),
             Route::HelmInstall(_) => "Helm install".into(),
             Route::Assistant(_) => "Assistant".into(),

@@ -616,7 +616,7 @@ impl AppView {
             }),
             cx.observe_window_bounds(window, |this, window, cx| this.window_moved(window, cx)),
             // Where the window is left is saved as it closes, and as the app quits.
-            cx.on_release(|this, cx| this.leave_session(cx)),
+            cx.on_release(Self::leave_session),
             cx.on_app_quit(|this, cx| {
                 this.save_session_now(cx);
                 async {}
