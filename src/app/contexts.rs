@@ -15,8 +15,7 @@ impl AppView {
     pub(super) fn connect_many(&mut self, contexts: Vec<String>, window: &mut Window, cx: &mut Context<Self>) {
         let Some(primary) = contexts.first().cloned() else { return };
         // Where the contexts connected until now were left, before it is reset below.
-        self.save_session_now(cx);
-        self.session_key = Vec::new();
+        self.leave_session(cx);
         if dev_var("RECOUVRANCE_CONTEXT").is_none() {
             let remembered = contexts.clone();
             crate::settings::update(|s| {
@@ -25,6 +24,7 @@ impl AppView {
             });
             self.session_key = crate::settings::session_set(&contexts);
         }
+        self.restore.connecting(&self.session_key);
         let connected = contexts.clone();
         self.ctx_picker.update(cx, |p, cx| p.set_connected(connected, cx));
         let ctx_name = primary.clone();
@@ -96,17 +96,22 @@ impl AppView {
                     clusters.iter().enumerate().filter(|(ix, _)| reached.contains(ix)).map(|(_, (name, c))| {
                         // Accessible namespaces set for this cluster replace the listing.
                         let accessible = crate::settings::cluster(name).namespaces;
-                        let c = c.clone();
+                        let (name, c) = (name.clone(), c.clone());
                         async move {
                             if accessible.is_empty() {
-                                k8s::namespaces(c).await.unwrap_or_default()
+                                listed_namespaces(&name, k8s::namespaces(c).await)
                             } else {
-                                accessible
+                                Ok(accessible)
                             }
                         }
                     });
-                let mut namespaces: Vec<String> =
-                    futures::future::join_all(listed).await.into_iter().flatten().collect();
+                let mut namespaces: Vec<String> = Vec::new();
+                for listed in futures::future::join_all(listed).await {
+                    match listed {
+                        Ok(names) => namespaces.extend(names),
+                        Err(e) => errors.push(e),
+                    }
+                }
                 namespaces.sort();
                 namespaces.dedup();
                 anyhow::Ok((client, kinds, kind_clusters, namespaces))
@@ -119,6 +124,10 @@ impl AppView {
                 this.connecting = false;
                 match result {
                     Ok((client, kinds, kind_clusters, namespaces)) => {
+                        // Who saved this set before: what this connect does below is no change
+                        // of the user's (see `session::SessionOwners`).
+                        let owner_before =
+                            (cx.try_global::<super::session::SessionOwners>()).and_then(|o| o.owner(&this.session_key));
                         this.kind_clusters = kind_clusters;
                         this.connect_errors = (!errors.is_empty()).then(|| errors.join("; ").into());
                         // The first context may have failed: namespace visits and the ones added
@@ -158,13 +167,18 @@ impl AppView {
                         this.recording =
                             crate::timeline::start_watches(&this.clusters, &this.kinds, &this.kind_clusters);
                         this.set_namespaces(namespaces, window, cx);
-                        // The first window's first connect reopens where this set was left:
-                        // its namespaces before the list starts, so the list starts once.
-                        let reopened =
-                            if std::mem::take(&mut this.restore) { this.restore_session(window, cx) } else { None };
+                        // The first window's first set reopens where it was left, again until a
+                        // connect reaches every cluster: its namespaces before the list starts,
+                        // so the list starts once.
+                        let reopened = if this.restore.finished(&this.session_key, !errors.is_empty()) {
+                            this.restore_session(window, cx)
+                        } else {
+                            None
+                        };
                         this.restart_watch(cx);
                         // After the list, whose rows its first count waits for.
                         this.problems.start(this.clusters.clone(), this.cluster_kinds(), cx);
+                        let restored = reopened.is_some();
                         match reopened {
                             Some(page) => {
                                 if let Some(page) = super::session::overview(page) {
@@ -180,7 +194,6 @@ impl AppView {
                             }
                             None => {}
                         }
-                        this.session_changed(cx);
                         match dev_var("RECOUVRANCE_PAGE").as_deref() {
                             Some("workloads") => this.open_workloads(window, cx),
                             Some("helm") => this.open_helm(window, cx),
@@ -198,6 +211,7 @@ impl AppView {
                             Some("assistant-dock") => this.toggle_assistant(window, cx),
                             _ => {}
                         }
+                        this.settle_session(owner_before, restored, cx);
                     }
                     Err(e) => {
                         this.list.notice = None;
@@ -350,6 +364,18 @@ fn served_by<'a>(
     kinds.iter().filter(move |k| kind_clusters.get(&k.key()).is_some_and(|c| c.contains(&ix)))
 }
 
+/// A cluster's namespaces as its listing answered, or what failed, to report. Not being
+/// allowed to list them is an answer: they are picked by hand there. A timeout or a server
+/// error is not: the namespaces picked there may still exist, and the connect counts as
+/// partial (a session is not saved over, see `session`).
+fn listed_namespaces(ctx: &str, listed: Result<Vec<String>>) -> Result<Vec<String>, String> {
+    match listed {
+        Ok(names) => Ok(names),
+        Err(e) if k8s::api_status(&e) == Some(403) => Ok(Vec::new()),
+        Err(e) => Err(format!("{ctx}: listing namespaces: {}", k8s::error_chain(&e))),
+    }
+}
+
 /// Union of every cluster's kinds, with where each one exists. A cluster whose
 /// discovery failed adds `name: error` to `errors`.
 fn merge_kinds(
@@ -452,8 +478,8 @@ fn one_namespace(wanted: &[String], previous: &[String], accessible: &[String]) 
 #[cfg(test)]
 mod tests {
     use super::{
-        Kind, Route, TabState, all_restricted, cluster_namespace, cluster_namespaces, kinds_per_cluster, merge_kinds,
-        one_namespace, served_by, served_lists, served_tab,
+        Kind, Route, TabState, all_restricted, cluster_namespace, cluster_namespaces, kinds_per_cluster,
+        listed_namespaces, merge_kinds, one_namespace, served_by, served_lists, served_tab,
     };
     use crate::k8s::argo::diagnosis::{Res, known_kind};
 
@@ -491,6 +517,22 @@ mod tests {
         assert_eq!(open(0, "autoscaling", "HorizontalPodAutoscaler", "v2"), Some(hpa2.key()));
         // A version only the hub serves: the one the spoke serves.
         assert_eq!(open(1, "autoscaling", "HorizontalPodAutoscaler", "v2"), Some(hpa1.key()));
+    }
+
+    #[test]
+    fn a_namespace_listing_that_failed_is_reported_but_a_refusal_is_not() {
+        let api = |code| -> anyhow::Error {
+            kube::Error::Api(kube::core::Status::failure("x", "x").with_code(code).boxed()).into()
+        };
+        let listed = listed_namespaces("a", Ok(vec!["team-a".into()]));
+        assert_eq!(listed, Ok(vec!["team-a".to_string()]));
+        // Not allowed to list them: picked by hand, nothing failed.
+        assert_eq!(listed_namespaces("a", Err(api(403))), Ok(Vec::new()));
+        // A timeout or a server error: the namespaces picked there may still exist.
+        for failed in [api(500), api(401), anyhow::anyhow!("timed out")] {
+            let e = listed_namespaces("hub", Err(failed)).unwrap_err();
+            assert!(e.starts_with("hub: listing namespaces: "), "{e}");
+        }
     }
 
     #[test]

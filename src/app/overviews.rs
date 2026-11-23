@@ -39,6 +39,18 @@ impl Overview {
         })
     }
 
+    /// Its name in the tab strip and the title bar.
+    pub(super) fn title(self) -> &'static str {
+        match self {
+            Self::Cluster => "Cluster",
+            Self::Workloads => "Workloads",
+            Self::Problems => "Problems",
+            Self::Timeline => "Timeline",
+            Self::Helm => "Helm releases",
+            Self::Argo => "Argo CD",
+        }
+    }
+
     /// Whether the page lists the namespaces picked: it is built again for others.
     fn scoped(self) -> bool {
         matches!(self, Self::Workloads | Self::Problems | Self::Timeline | Self::Helm)
