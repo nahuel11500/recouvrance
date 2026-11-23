@@ -1,5 +1,6 @@
 //! Where the time goes (`RECOUVRANCE_TIMINGS=1`): named spans, summed per name and printed to
-//! stderr every 10 seconds (count, total, average, slowest).
+//! stderr every 10 seconds (count, total, average, slowest), with named counts such as the
+//! assistant's tokens (count, total, largest).
 
 use std::collections::BTreeMap;
 use std::sync::{LazyLock, Mutex};
@@ -8,9 +9,12 @@ use std::time::{Duration, Instant};
 static ON: LazyLock<bool> = LazyLock::new(|| std::env::var("RECOUVRANCE_TIMINGS").is_ok());
 /// Per span name: count, total, slowest.
 type Sums = BTreeMap<&'static str, (u64, Duration, Duration)>;
+/// Per count name: how many, total, largest.
+type Counts = BTreeMap<&'static str, (u64, u64, u64)>;
 
-/// Since when, and the sums so far.
-static SPANS: LazyLock<Mutex<(Instant, Sums)>> = LazyLock::new(|| Mutex::new((Instant::now(), BTreeMap::new())));
+/// Since when, and the sums and counts so far.
+static SPANS: LazyLock<Mutex<(Instant, Sums, Counts)>> =
+    LazyLock::new(|| Mutex::new((Instant::now(), BTreeMap::new(), BTreeMap::new())));
 
 /// Ends its span when dropped.
 pub struct Span(&'static str, Instant);
@@ -23,22 +27,44 @@ impl Drop for Span {
         e.0 += 1;
         e.1 += took;
         e.2 = e.2.max(took);
-        if s.0.elapsed() >= Duration::from_secs(10) {
-            let mut out = String::from("timings (last 10 s):\n");
-            for (name, (n, total, max)) in &s.1 {
-                out += &format!(
-                    "  {name:<28} {n:>6}× total {:>8.1} ms  avg {:>7.2} ms  max {:>7.1} ms\n",
-                    total.as_secs_f64() * 1e3,
-                    total.as_secs_f64() * 1e3 / *n as f64,
-                    max.as_secs_f64() * 1e3
-                );
-            }
-            eprint!("{out}");
-            *s = (Instant::now(), BTreeMap::new());
-        }
+        print_due(&mut s);
     }
 }
 
 pub fn span(name: &'static str) -> Option<Span> {
     ON.then(|| Span(name, Instant::now()))
+}
+
+/// Adds `n` to a named count (tokens, bytes), printed with the spans.
+pub fn count(name: &'static str, n: u64) {
+    if !*ON {
+        return;
+    }
+    let mut s = SPANS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let e = s.2.entry(name).or_default();
+    e.0 += 1;
+    e.1 += n;
+    e.2 = e.2.max(n);
+    print_due(&mut s);
+}
+
+/// Prints what was summed and starts again, once 10 seconds have passed.
+fn print_due(s: &mut (Instant, Sums, Counts)) {
+    if s.0.elapsed() < Duration::from_secs(10) {
+        return;
+    }
+    let mut out = String::from("timings (last 10 s):\n");
+    for (name, (n, total, max)) in &s.1 {
+        out += &format!(
+            "  {name:<28} {n:>6}× total {:>8.1} ms  avg {:>7.2} ms  max {:>7.1} ms\n",
+            total.as_secs_f64() * 1e3,
+            total.as_secs_f64() * 1e3 / *n as f64,
+            max.as_secs_f64() * 1e3
+        );
+    }
+    for (name, (n, total, max)) in &s.2 {
+        out += &format!("  {name:<28} {n:>6}× total {total:>8}     max {max:>7}\n");
+    }
+    eprint!("{out}");
+    *s = (Instant::now(), BTreeMap::new(), BTreeMap::new());
 }

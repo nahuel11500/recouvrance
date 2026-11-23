@@ -146,6 +146,15 @@ fn resources(app: &Value) -> impl Iterator<Item = &Value> {
     app.pointer("/status/resources").and_then(Value::as_array).into_iter().flatten()
 }
 
+/// Whether a sync with prune deletes the resource `r` (an entry of `status.resources`): in the
+/// cluster, no longer in git, and out of sync. Argo CD also sets `requiresPruning` on a hook
+/// left from the last sync, which it never prunes and gives no sync, and on every resource
+/// while it can't load the manifests, whose sync is then `Unknown`. Its own UI shows the
+/// prune mark only on what is out of sync too.
+pub(crate) fn to_prune(r: &Value) -> bool {
+    r["requiresPruning"] == true && r["status"] == "OutOfSync"
+}
+
 /// Whether an Application deploys into the namespace: its destination, or anything it tracks there.
 pub fn targets_namespace(app: &Value, ns: &str) -> bool {
     app.pointer("/spec/destination/namespace").and_then(Value::as_str) == Some(ns)
@@ -160,6 +169,63 @@ pub fn resource_of<'a>(app: &'a Value, group: &str, kind: &str, ns: &str, name: 
             && r["namespace"].as_str().unwrap_or_default() == ns
             && r["name"].as_str() == Some(name)
     })
+}
+
+// MARK: Resources table
+
+/// One line of an Application's resources table, from its `status.resources`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ResourceRow {
+    pub res: diagnosis::Res,
+    /// `Synced`, `OutOfSync`, or `Unknown` when Argo CD couldn't compare it (it can't load
+    /// the manifests, or the project doesn't permit the kind); empty for a hook, whose sync
+    /// Argo CD doesn't track.
+    pub sync: String,
+    /// Empty when Argo CD keeps none for it: a hook, a kind without a health check
+    /// (`ConfigMap`, Secret...), or any kind when it keeps no health per resource in the
+    /// Application.
+    pub health: String,
+    pub message: Option<String>,
+    /// Out of sync, in the cluster and no longer in git: a sync with prune deletes it
+    /// ([`to_prune`]).
+    pub prune: bool,
+    /// A hook (a Job run before or after a sync), not something it applies.
+    pub hook: bool,
+}
+
+impl ResourceRow {
+    /// What to look at before a sync: out of sync (to change, to create or to prune), or
+    /// Degraded or Missing. Progressing is on its way, Suspended is on purpose, and `Unknown`
+    /// is Argo CD failing to compare, which the diagnosis says once for the Application.
+    pub fn needs_attention(&self) -> bool {
+        self.sync == "OutOfSync" || matches!(self.health.as_str(), "Degraded" | "Missing")
+    }
+}
+
+/// An Application's resources, in the order Argo CD lists them. Read from the Application
+/// itself: nothing is asked of any cluster, however many there are.
+pub fn resource_rows(app: &Value) -> Vec<ResourceRow> {
+    resources(app)
+        .filter_map(|r| {
+            let s = |p: &str| r.pointer(p).and_then(Value::as_str).filter(|s| !s.is_empty()).map(String::from);
+            Some(ResourceRow {
+                res: diagnosis::Res::of(r)?,
+                sync: s("/status").unwrap_or_default(),
+                health: s("/health/status").unwrap_or_default(),
+                message: s("/health/message"),
+                prune: to_prune(r),
+                hook: r["hook"] == true,
+            })
+        })
+        .collect()
+}
+
+/// Whether Argo CD keeps no health per resource in the Application: it says so with
+/// `status.resourceHealthSource: appTree`, the default from Argo CD 3.0 (it keeps them in its
+/// resource tree then), unless `controller.resource.health.persist` is on. Older versions
+/// don't set the field: they keep each resource's health in the Application.
+pub fn keeps_no_health(app: &Value) -> bool {
+    app.pointer("/status/resourceHealthSource").and_then(Value::as_str) == Some("appTree")
 }
 
 // MARK: What is shown
@@ -223,12 +289,17 @@ pub(crate) fn revisions(v: &Value) -> Option<String> {
 /// How many past deployments are shown.
 const HISTORY: usize = 5;
 
+/// Whether auto-sync is on: `syncPolicy.automated` set, and not turned off with
+/// `enabled: false` (newer Argo CD).
+pub fn auto_sync(app: &Value) -> bool {
+    app.pointer("/spec/syncPolicy/automated")
+        .is_some_and(|a| a.is_object() && a.get("enabled").and_then(Value::as_bool) != Some(false))
+}
+
 impl Summary {
     pub fn of(app: &Value) -> Self {
         let s = |p: &str| app.pointer(p).and_then(Value::as_str).filter(|s| !s.is_empty()).map(String::from);
-        let automated = app
-            .pointer("/spec/syncPolicy/automated")
-            .is_some_and(|a| a.is_object() && a.get("enabled").and_then(Value::as_bool) != Some(false));
+        let automated = auto_sync(app);
         let operation = s("/status/operationState/phase")
             .map(|phase| (phase, s("/status/operationState/message"), s("/status/operationState/finishedAt")));
         let history = app
@@ -1203,6 +1274,97 @@ mod tests {
     }
 
     #[test]
+    fn the_resources_table_reads_what_argo_cd_lists() {
+        let app = json!({"status": {"resources": [
+            {"group": "apps", "version": "v1", "kind": "Deployment", "namespace": "shop", "name": "web",
+             "status": "OutOfSync", "health": {"status": "Progressing", "message": "Waiting for rollout to finish"}},
+            {"version": "v1", "kind": "ServiceAccount", "namespace": "shop", "name": "old", "status": "OutOfSync",
+             "requiresPruning": true},
+            // A hook left from the last sync (kept until the next one, Argo CD's default): it is
+            // flagged `requiresPruning`, with no sync and no health, but a sync never prunes it.
+            {"group": "batch", "version": "v1", "kind": "Job", "namespace": "shop", "name": "migrate", "hook": true,
+             "requiresPruning": true},
+            {"group": "rbac.authorization.k8s.io", "version": "v1", "kind": "ClusterRole", "name": "reader",
+             "status": "Synced"},
+            // Argo CD can't load the manifests: every resource is flagged, its sync Unknown.
+            {"version": "v1", "kind": "Service", "namespace": "shop", "name": "api", "status": "Unknown",
+             "requiresPruning": true},
+            // Not a resource it can show: no name.
+            {"version": "v1", "kind": "ConfigMap", "namespace": "shop"}
+        ]}});
+        let rows = resource_rows(&app);
+        let names: Vec<String> = rows.iter().map(|r| r.res.label()).collect();
+        assert_eq!(
+            names,
+            [
+                "Deployment shop/web",
+                "ServiceAccount shop/old",
+                "Job shop/migrate",
+                "ClusterRole reader",
+                "Service shop/api"
+            ]
+        );
+        let web = &rows[0];
+        assert_eq!((web.res.group.as_str(), web.res.version.as_str()), ("apps", "v1"));
+        assert_eq!((web.sync.as_str(), web.health.as_str()), ("OutOfSync", "Progressing"));
+        assert_eq!(web.message.as_deref(), Some("Waiting for rollout to finish"));
+        // Out of sync and no longer in git: the one row the table says a prune deletes.
+        assert!(rows[1].prune && !rows[1].hook && rows[1].health.is_empty());
+        let hook = &rows[2];
+        assert!(hook.hook && hook.sync.is_empty() && hook.health.is_empty() && !hook.prune);
+        let unknown = &rows[4];
+        assert!(unknown.sync == "Unknown" && !unknown.prune);
+        assert_eq!(rows.iter().map(|r| r.prune).collect::<Vec<_>>(), [false, true, false, false, false]);
+        // Neither the hook nor what Argo CD couldn't compare is something to look at here.
+        assert_eq!(
+            rows.iter().map(ResourceRow::needs_attention).collect::<Vec<_>>(),
+            [true, true, false, false, false]
+        );
+        assert!(resource_rows(&json!({})).is_empty());
+    }
+
+    #[test]
+    fn a_resource_needs_attention_when_out_of_sync_or_unhealthy() {
+        let row =
+            |sync: &str, health: &str| ResourceRow { sync: sync.into(), health: health.into(), ..Default::default() };
+        for wrong in [row("OutOfSync", ""), row("OutOfSync", "Healthy"), row("Synced", "Degraded"), row("", "Missing")]
+        {
+            assert!(wrong.needs_attention(), "{wrong:?}");
+        }
+        // On its way, suspended on purpose, fine, not compared (the diagnosis says why), or a
+        // hook with nothing said.
+        for fine in [
+            row("Synced", "Progressing"),
+            row("Synced", "Suspended"),
+            row("Synced", "Healthy"),
+            row("Unknown", ""),
+            row("", ""),
+        ] {
+            assert!(!fine.needs_attention(), "{fine:?}");
+        }
+    }
+
+    #[test]
+    fn no_health_per_resource_is_what_the_application_says() {
+        let app = |source: Option<&str>| {
+            let mut app = json!({"status": {"resources": [
+                {"group": "apps", "version": "v1", "kind": "Deployment", "namespace": "shop", "name": "web",
+                 "status": "Synced"}
+            ]}});
+            if let Some(source) = source {
+                app["status"]["resourceHealthSource"] = json!(source);
+            }
+            app
+        };
+        // Argo CD 3's default: in its resource tree, not in the Application.
+        assert!(keeps_no_health(&app(Some("appTree"))));
+        // Kept in the Application: older versions don't set the field, newer ones leave it empty.
+        assert!(!keeps_no_health(&app(None)));
+        assert!(!keeps_no_health(&app(Some(""))));
+        assert!(!keeps_no_health(&json!({})));
+    }
+
+    #[test]
     fn out_of_sync_is_only_a_warning_with_auto_sync() {
         assert_eq!(sync_tone("OutOfSync", false), Tone::Done);
         assert_eq!(sync_tone("OutOfSync", true), Tone::Busy);
@@ -1213,11 +1375,73 @@ mod tests {
     }
 }
 
-/// Rules that hold for every server URL and tracking id.
+/// Rules that hold for every server URL, tracking id and list of resources.
 #[cfg(test)]
 mod properties {
-    use super::{parse_tracking, server_key};
+    use super::{parse_tracking, resource_rows, server_key};
     use proptest::prelude::*;
+    use serde_json::{Value, json};
+
+    /// An entry of `status.resources`, any of its fields left out or empty.
+    fn entry() -> impl Strategy<Value = Value> {
+        let word = |words: Vec<&'static str>| proptest::sample::select(words);
+        (
+            word(vec!["", "apps", "batch"]),
+            word(vec!["", "Deployment", "Job"]),
+            word(vec!["", "shop"]),
+            word(vec!["", "a", "b"]),
+            proptest::option::of(word(vec!["Synced", "OutOfSync", "Unknown"])),
+            proptest::option::of(word(vec!["", "Healthy", "Progressing", "Degraded", "Missing", "Suspended"])),
+            any::<bool>(),
+            any::<bool>(),
+        )
+            .prop_map(|(group, kind, namespace, name, sync, health, prune, hook)| {
+                let mut e = json!({"group": group, "kind": kind, "namespace": namespace, "name": name});
+                if let Some(sync) = sync {
+                    e["status"] = json!(sync);
+                }
+                if let Some(health) = health {
+                    e["health"] = json!({"status": health});
+                }
+                if prune {
+                    e["requiresPruning"] = json!(true);
+                }
+                if hook {
+                    e["hook"] = json!(true);
+                }
+                e
+            })
+    }
+
+    proptest! {
+        /// Every resource with a kind and a name gets one row, in Argo CD's order, with what it
+        /// lists. It is to prune only when flagged `requiresPruning` and out of sync (not a hook
+        /// with no sync, nor one Argo CD couldn't compare), and needs attention exactly when it
+        /// is out of sync, Degraded or Missing.
+        #[test]
+        fn every_resource_gets_its_row(entries in proptest::collection::vec(entry(), 0..20)) {
+            let app = json!({"status": {"resources": entries}});
+            let rows = resource_rows(&app);
+            let listed: Vec<&Value> =
+                entries.iter().filter(|e| e["kind"] != "" && e["name"] != "").collect();
+            prop_assert_eq!(rows.len(), listed.len());
+            for (row, e) in rows.iter().zip(listed) {
+                let s = |k: &str| e[k].as_str().unwrap_or_default();
+                prop_assert_eq!(
+                    (row.res.group.as_str(), row.res.kind.as_str(), row.res.namespace.as_str(), row.res.name.as_str()),
+                    (s("group"), s("kind"), s("namespace"), s("name"))
+                );
+                prop_assert_eq!(row.sync.as_str(), s("status"));
+                let health = e.pointer("/health/status").and_then(Value::as_str).unwrap_or_default();
+                prop_assert_eq!(row.health.as_str(), health);
+                let out_of_sync = s("status") == "OutOfSync";
+                prop_assert_eq!(row.prune, e["requiresPruning"] == true && out_of_sync);
+                prop_assert_eq!(row.hook, e["hook"] == true);
+                let wrong = out_of_sync || matches!(health, "Degraded" | "Missing");
+                prop_assert_eq!(row.needs_attention(), wrong);
+            }
+        }
+    }
 
     proptest! {
         /// A URL compares the same with a trailing slash, its default port or its host in capitals.

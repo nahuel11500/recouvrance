@@ -7,6 +7,10 @@ Claude Code (your subscription, no API key); an Anthropic API key works too if y
 the same agent as your Claude Code connection (below), so one set of rules, approvals and activity
 log covers both. **Stop** ends a question that is still running, and with it a request of its own
 still waiting for your approval; with an API key, a request that gets no answer for 10 minutes fails.
+With an API key, each request marks the tool definitions, the instructions and the conversation so
+far for Anthropic's prompt cache, so each step of an answer reads what the step before it sent from
+the cache, sooner and at a fraction of the price. When Claude declines a question, the chat says so
+with the reason the API gives, and the question is dropped from the conversation; ask it another way.
 
 ## Agents (MCP)
 

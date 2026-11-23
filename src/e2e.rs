@@ -917,27 +917,36 @@ fn an_agent_pauses_and_sets_an_image() {
 }
 
 /// `diff_manifest` shows what an apply would change, with get rules only, and changes nothing.
+/// A type the sidebar leaves out (a `FlowSchema`, which kwok's manifest holds) is planned like
+/// any other: `apply_manifest` resolves types the same way.
 #[test]
 #[ignore = "needs a kind cluster: RECOUVRANCE_E2E_CONTEXT"]
 fn an_agent_diffs_a_manifest_without_changing_anything() {
+    use k8s_openapi::api::flowcontrol::v1::FlowSchema;
+
     run(async {
         let ctx = context();
-        let truth: Api<ConfigMap> = Api::namespaced(k8s::connect_for_agents(ctx.clone()).await?, NS);
-        let (name, new) = ("e2e-diff", "e2e-diff-new");
+        let client = k8s::connect_for_agents(ctx.clone()).await?;
+        let truth: Api<ConfigMap> = Api::namespaced(client.clone(), NS);
+        let flows: Api<FlowSchema> = Api::all(client);
+        let (name, new, flow) = ("e2e-diff", "e2e-diff-new", "e2e-diff-flow");
         for n in [name, new] {
             let _ = truth.delete(n, &DeleteParams::default()).await;
         }
+        let _ = flows.delete(flow, &DeleteParams::default()).await;
         truth.create(&PostParams::default(), &config_map(name)).await?;
         let checked = async {
             let (hub, _agent, token, _server) = agent(&["get,list *"], &[]).await?;
             let mcp = crate::assistant::Mcp::connect(hub.port(), token).await?;
             let manifest = format!(
-                "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: {name}\n  namespace: {NS}\ndata:\n  a: \"2\"\n---\napiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: {new}\n  namespace: {NS}\ndata:\n  b: \"1\"\n"
+                "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: {name}\n  namespace: {NS}\ndata:\n  a: \"2\"\n---\napiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: {new}\n  namespace: {NS}\ndata:\n  b: \"1\"\n---\napiVersion: flowcontrol.apiserver.k8s.io/v1\nkind: FlowSchema\nmetadata:\n  name: {flow}\nspec:\n  priorityLevelConfiguration:\n    name: global-default\n"
             );
             let out = mcp.call("diff_manifest", json!({"context": ctx, "manifest": manifest})).await;
             assert!(out.contains("-  a: '1'") || out.contains("-  a: \"1\""), "{out}");
             assert!(out.contains(&format!("ConfigMap {NS}/{new}: created")), "{out}");
+            assert!(out.contains(&format!("FlowSchema {flow}: created")), "{out}");
             assert!(truth.get_opt(new).await?.is_none(), "a diff created an object");
+            assert!(flows.get_opt(flow).await?.is_none(), "a diff created a FlowSchema");
             let a = truth.get(name).await?.data.and_then(|d| d.get("a").cloned());
             assert_eq!(a.as_deref(), Some("1"), "a diff changed an object");
             Ok(())
@@ -1135,6 +1144,74 @@ fn an_agent_checks_why_a_service_does_not_answer() {
         let result: Result<()> = checked.await;
         services.delete(name, &DeleteParams::default()).await?;
         ingresses.delete(name, &DeleteParams::default()).await?;
+        result
+    });
+}
+
+/// The Problems scan reads every kind of a real cluster, the objects it lists whole (Services,
+/// Ingresses...) parsed lean from what the API server sends: none is skipped. The pods of a
+/// label selector, read lean from the API server's cache, are those the selector picks.
+#[test]
+#[ignore = "needs a kind cluster: RECOUVRANCE_E2E_CONTEXT"]
+fn the_problems_scan_reads_a_real_cluster() {
+    use k8s_openapi::api::core::v1::{Pod, Service};
+    use k8s_openapi::api::networking::v1::Ingress;
+
+    run(async {
+        let client = k8s::connect_for_agents(context()).await?;
+        let pods: Api<Pod> = Api::namespaced(client.clone(), NS);
+        let services: Api<Service> = Api::namespaced(client.clone(), NS);
+        let ingresses: Api<Ingress> = Api::namespaced(client.clone(), NS);
+        let name = "e2e-scan";
+        let _ = pods.delete(name, &DeleteParams::default().grace_period(0)).await;
+        let _ = services.delete(name, &DeleteParams::default()).await;
+        let _ = ingresses.delete(name, &DeleteParams::default()).await;
+        let pod = json!({
+            "metadata": {"name": name, "namespace": NS, "labels": {"app": name, "tier": "a"}},
+            "spec": {"containers": [{"name": "main", "image": "busybox:1.37", "command": ["sleep", "3600"]}]},
+        });
+        let svc = json!({
+            "metadata": {"name": name, "namespace": NS},
+            "spec": {"selector": {"app": name}, "ports": [{"name": "http", "port": 80, "targetPort": "http"}]},
+        });
+        let ing = json!({
+            "metadata": {"name": name, "namespace": NS},
+            "spec": {
+                "defaultBackend": {"service": {"name": name, "port": {"name": "http"}}},
+                "tls": [{"hosts": ["e2e.example"], "secretName": "e2e-scan-tls"}],
+                "rules": [{"host": "e2e.example", "http": {"paths": [{"path": "/", "pathType": "Prefix",
+                    "backend": {"service": {"name": name, "port": {"number": 80}}}}]}}],
+            },
+        });
+        pods.create(&PostParams::default(), &serde_json::from_value(pod)?).await?;
+        services.create(&PostParams::default(), &serde_json::from_value(svc)?).await?;
+        ingresses.create(&PostParams::default(), &serde_json::from_value(ing)?).await?;
+        let checked = async {
+            // Escaped into the request, with the operators a Service's selector can't have.
+            let selector = format!("app in ({name},e2e-other),tier=a,!e2e-absent");
+            let mut found = Vec::new();
+            // The cache catches up with the create in a moment.
+            for _ in 0..20 {
+                let ar = k8s::ar_of::<Pod>();
+                let read = Some(selector.clone());
+                found = k8s::lists::list_lean_cached_by::<serde_json::Value>(client.clone(), ar, Some(NS.into()), read)
+                    .await?;
+                if !found.is_empty() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+            let names: Vec<&str> = found.iter().filter_map(|p| p.pointer("/metadata/name")?.as_str()).collect();
+            assert_eq!(names, [name]);
+            let kinds = k8s::discover(client.clone()).await?;
+            let scan = crate::problems::scan_partial(client.clone(), &kinds, None, None).await;
+            assert!(scan.skipped.is_empty(), "{:?}", scan.skipped_text());
+            Ok(())
+        };
+        let result: Result<()> = checked.await;
+        let _ = pods.delete(name, &DeleteParams::default().grace_period(0)).await;
+        let _ = services.delete(name, &DeleteParams::default()).await;
+        let _ = ingresses.delete(name, &DeleteParams::default()).await;
         result
     });
 }

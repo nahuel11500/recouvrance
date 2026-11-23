@@ -10,10 +10,20 @@
   `HTTPS_PROXY`, with a scheme other than `http`, `https` or `socks5`, or none) is named by its
   scheme, host and port, never its user and password; neither shows for any other URL in a
   connection error.
+- **Reopens where you left off**: each set of contexts keeps its tabs (the list or overview each
+  shows, its resource type, namespaces and filter) and each type's filter, and the window keeps
+  its place, size and whether it was maximized. On launch the first window reopens there once its
+  contexts connect: with one namespace picked last time, a big cluster lists and watches only that
+  namespace at launch instead of every pod. A resource type, namespace or page the clusters no longer have falls back to the default; a
+  detail page reopens on the list or overview it was opened from; a window that would be out of
+  reach (a display unplugged) is centered. A window opened later starts fresh, and write mode is
+  always off at launch.
 - **Sidebar**: the filter at its top finds pages and resource types (by name, kind or API group).
   Pages, saved views, favorites and types scroll together; a section folds with a click on its
   name (kept for next time) and says how many types it holds. Port forwards fold into one row at
   the bottom. Drag its edge to resize it: the width is kept, and a cut name shows whole in a tooltip.
+  It leaves out events.k8s.io's copy of Events, the old Endpoints and API priority and fairness
+  (FlowSchemas); Apply, links and the agents still know them.
 - **Live tables** with kubectl's own columns for every type, including CRDs; CPU/memory from
   metrics-server; per-type column choice; multi-namespace filter; each type keeps its own filter text (Nodes
   doesn't show the pod name typed on Pods, and Pods has it back).
@@ -204,8 +214,20 @@
   when it isn't); the row menu also opens the destination and asks for *Refresh*, *Hard refresh*
   or *Sync* (write mode and the Argo CD cluster's protection apply). An Argo CD cluster that
   can't be read is named above the list; the others are shown.
+- **Argo CD resources**: an Application's page lists what Argo CD tracks for it
+  (`status.resources`) as a table: kind, namespace/name, sync, health, whether it is a hook, and
+  a message (its health message, and *no longer in git* for one out of sync that a sync with
+  prune deletes; not a hook left from the last sync, nor a resource Argo CD couldn't compare).
+  *Out of sync or unhealthy* shows those alone. A row opens the object on the kubeconfig context
+  that reaches the destination, with the kind and version that cluster serves, connecting to
+  it when it isn't connected; when no context reaches it, the rows don't open and the page says
+  so. The rows come from the Application itself, with no request per row, and only those on
+  screen are drawn: an Application with thousands of resources stays fast. When Argo CD keeps
+  no health per resource in the Application (`status.resourceHealthSource: appTree`, the
+  default from Argo CD 3.0 unless `controller.resource.health.persist` is on), the page says so.
 - **Argo CD diagnosis**: an Application's page says what is wrong with it, worst first, each
-  with its objects (opening on the destination's context when it is connected) and what to do:
+  with its objects (opening on the destination's context, connecting to it when it isn't) and
+  what to do:
   - *Being deleted*: the finalizers holding it (what each one waits for) and the resources not
     deleted yet, read live on the destination when it is connected; red after 5 minutes.
   - *Sync running* for more than 10 minutes: the hook or resource it waits for.
@@ -247,7 +269,8 @@
   upgraded connection. Below, the 10 heaviest requests, one per kind (cluster, method and path,
   its names replaced by `{namespace}` and `{name}`), with their bytes and both times. A stream
   is listed once it ends. Nothing leaves the machine.
-- **Favorites** and **saved views** (type + namespaces + filter, bookmark button), back/forward history, light and dark themes.
+- **Favorites** and **saved views** (type + namespaces + filter, bookmark button), back/forward history, light and dark themes
+  whose status colors, badges and status buttons read at WCAG AA contrast (4.5:1) on what they are drawn on.
 - **Instant back**: the last 8 lists (up to 10,000 rows in all) are kept, so going back to one
   shows it at once, marked "Updating…", while a fresh list loads and replaces it in one go.
 - **Bulk actions**: check rows, then restart, scale, delete or copy names. Scaling needs the number
