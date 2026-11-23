@@ -607,6 +607,7 @@ impl ArgoView {
             .child(div().w(px(MENU)).flex_none().child(row_menu(
                 &k,
                 a.on.is_some() && !a.dest.namespace.is_empty(),
+                Offers::of(app),
                 view,
             )))
             .into_any_element()
@@ -720,9 +721,26 @@ fn picker(
     )
 }
 
-/// A row's menu: open it or where it deploys, refresh, hard refresh, sync. Its actions find the
-/// Application again by its key: the list may have been read again since it was drawn.
-fn row_menu(k: &Key, has_destination: bool, view: WeakEntity<ArgoView>) -> impl IntoElement {
+/// What a row's menu offers beyond Refresh and Sync, from the Application as listed. Its
+/// dialog reads the Application again and says what Argo CD would refuse.
+#[derive(Clone, Copy)]
+struct Offers {
+    /// An operation runs: it can be terminated.
+    terminate: bool,
+    /// Auto-sync is off and a deployment precedes the newest: Argo CD allows a rollback.
+    roll_back: bool,
+}
+
+impl Offers {
+    fn of(app: &Summary) -> Self {
+        Self { terminate: app.in_progress, roll_back: !app.automated && app.history.len() >= 2 }
+    }
+}
+
+/// A row's menu: open it or where it deploys, refresh, hard refresh, sync, terminate, roll
+/// back. Its actions find the Application again by its key: the list may have been read again
+/// since it was drawn.
+fn row_menu(k: &Key, has_destination: bool, offers: Offers, view: WeakEntity<ArgoView>) -> impl IntoElement {
     let k = k.clone();
     let id = SharedString::from(format!("argo-menu-{}-{}-{}", k.0, k.1, k.2));
     Button::new(id).xsmall().ghost().icon(Lucide::Ellipsis).dropdown_menu(move |menu: PopupMenu, _, _| {
@@ -757,6 +775,18 @@ fn row_menu(k: &Key, has_destination: bool, view: WeakEntity<ArgoView>) -> impl 
                 PopupMenuItem::new("Hard refresh…").icon(Lucide::RefreshCcwDot).on_click(act(ArgoAction::HardRefresh)),
             )
             .item(PopupMenuItem::new("Sync…").icon(Lucide::GitBranch).on_click(act(ArgoAction::Sync)))
+            .item(
+                PopupMenuItem::new("Terminate…")
+                    .icon(Lucide::CircleStop)
+                    .disabled(!offers.terminate)
+                    .on_click(act(ArgoAction::Terminate)),
+            )
+            .item(
+                PopupMenuItem::new("Roll back to the previous deployment…")
+                    .icon(Lucide::Undo2)
+                    .disabled(!offers.roll_back)
+                    .on_click(act(ArgoAction::Rollback(None))),
+            )
     })
 }
 

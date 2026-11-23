@@ -14,8 +14,8 @@ pub mod server;
 
 pub use audit::{AuditEntry, Decision};
 pub use config::{Agent, config_in_use};
-pub use hub::{Answer, Approval, Hub, HubEvent};
-pub use policy::{Access, Mode, Policy, Rule, Verb, any_glob, grants_write};
+pub use hub::{APPROVAL_TIMEOUT, Answer, Approval, Hub, HubEvent};
+pub use policy::{Access, Mode, PROTECTED, Policy, Rule, Verb, any_glob, grants_write, is_protected_selector};
 pub use preview::Preview;
 
 pub const DEFAULT_PORT: u16 = 47070;

@@ -19,7 +19,7 @@ use super::{
 use crate::k8s;
 use crate::k8s::lane::Lane;
 use crate::k8s::{Kind, ObjectRef};
-use crate::mcp::{Mode, Policy, Verb};
+use crate::mcp::{Mode, PROTECTED, Policy, Verb};
 use crate::problems::shared::{self, Fresh};
 use crate::reachability;
 
@@ -36,7 +36,7 @@ impl KubeMcp {
     }
 
     #[tool(
-        description = "Check calls you plan against your rules without making them: for each request (context, verb, kind, namespace, name), whether it is allowed, needs the user's approval or is denied, the rule that decides, and for a denial whether it is final (a Deny rule) or the rule the user could add. Use it before a task that needs several calls, to tell the user up front what to approve or grant. The verb is the rules' verb, not the tool: set_image, rollout_undo, rollout_pause, rollout_resume and patch_resource need patch; rollout_restart restart; apply_manifest apply on each object; trigger_cronjob get on the CronJob and apply on its Job; cordon_node, uncordon_node and drain_node drain on the node; exec_command, debug_pod and browse_files exec on the pod; port_forward forward; get_logs logs.",
+        description = "Check calls you plan against your rules without making them: for each request (context, verb, kind, namespace, name), whether it is allowed, needs the user's approval or is denied, the rule that decides, and for a denial whether it is final (a Deny rule) or the rule the user could add. Use it before a task that needs several calls, to tell the user up front what to approve or grant. The verb is the rules' verb, not the tool: set_image, rollout_undo, rollout_pause, rollout_resume and patch_resource need patch; rollout_restart restart; apply_manifest apply on each object; trigger_cronjob get on the CronJob and apply on its Job; cordon_node, uncordon_node and drain_node drain on the node; exec_command, debug_pod and browse_files exec on the pod; port_forward forward; get_logs logs; gitops refresh (refresh, hard_refresh), sync (sync, reconcile) or suspend (suspend, resume) on the object, and get for diagnose.",
         annotations(read_only_hint = true)
     )]
     async fn check_access(
@@ -224,6 +224,9 @@ impl KubeMcp {
         };
         // Masking follows what came back, not only what was asked for.
         let secret = kind.is("", "Secret") || is_secret_object(&value);
+        if secret && reveal {
+            call.revealing(format!("Secret {}/{}", p.namespace.as_deref().unwrap_or_default(), p.name));
+        }
         call.finish(k8s::to_yaml(&value, secret, reveal))
     }
 
@@ -958,6 +961,12 @@ fn permissions(p: &Policy, dry_run: &[String]) -> String {
         let accept = crate::plural::pick(dry_run.len(), "accepts", "accept");
         out.push_str(&format!("\n{names} {accept} dry_run=true: prefer it first."));
     }
+    if p.names_protected() {
+        out.push_str(&format!(
+            "\nThe context {PROTECTED} stands for the contexts the user protects in Recouvrance: on those, such a rule \
+             asks or denies; it never allows anything by itself."
+        ));
+    }
     // An agent waiting for a banner that never comes, or taking a short list for all there is.
     out.push_str(&format!(
         "\n{NEVER_ASKS} never asks for approval: it shows the changes and events your Allow rules let you read \
@@ -1101,9 +1110,11 @@ mod tests {
             .map(|t| t.name.to_string())
             .collect();
         assert_eq!(named, take);
-        // Every change but exec_command, drain_node, gitops and the port-forward tools (docs/agents.md).
-        assert_eq!(take.len(), 13, "{take:?}");
+        // Every change but exec_command, drain_node and the port-forward tools (docs/agents.md);
+        // gitops's is Argo CD's own dry run of a sync or a rollback.
+        assert_eq!(take.len(), 14, "{take:?}");
         assert!(take.contains("set_image") && take.contains("cordon_node") && take.contains("debug_pod"), "{take:?}");
+        assert!(take.contains("gitops"), "{take:?}");
     }
 
     /// `my_permissions` says which tool never asks, by the name of a tool that only reads.

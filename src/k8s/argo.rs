@@ -2,8 +2,9 @@
 //! clusters open: which contexts serve Applications, the Application that deployed an object
 //! (its tracking id), and the ones that deploy into a namespace.
 //!
-//! Everything here reads. Refresh and Sync go through `argo_refresh` / `argo_sync` with the
-//! hub's UI client, so the write gate applies to them like to any write.
+//! Everything here reads. Refresh goes through `argo_refresh`, and a sync, a rollback or a
+//! terminate through `argo_operation` (built by `ops`), with the hub's UI client, so the
+//! write gate applies to them like to any write.
 
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex, PoisonError};
@@ -19,6 +20,8 @@ use super::{ContextTarget, Kind, ObjectRef};
 use crate::status::Tone;
 
 pub mod diagnosis;
+pub mod ops;
+pub mod server;
 
 /// The annotation Argo CD puts on what it deploys.
 pub const TRACKING_ID: &str = "argocd.argoproj.io/tracking-id";
@@ -233,6 +236,8 @@ pub fn keeps_no_health(app: &Value) -> bool {
 /// One past deployment.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Deployment {
+    /// Its id in `status.history`: what a rollback names.
+    pub id: Option<i64>,
     pub revision: String,
     pub deployed_at: Option<String>,
     /// Who started it: a user, or "auto-sync".
@@ -255,6 +260,8 @@ pub struct Summary {
     pub revision: Option<String>,
     /// The last operation: phase, message, when it finished.
     pub operation: Option<(String, Option<String>, Option<String>)>,
+    /// An operation is running or waiting to start (`operation` is set): it can be terminated.
+    pub in_progress: bool,
     /// The last deployments, newest first.
     pub history: Vec<Deployment>,
     /// Conditions as (type, message): errors and warnings Argo CD reports.
@@ -310,6 +317,7 @@ impl Summary {
             .rev()
             .take(HISTORY)
             .map(|h| Deployment {
+                id: h["id"].as_i64(),
                 revision: revisions(h).unwrap_or_default(),
                 deployed_at: h["deployedAt"].as_str().map(String::from),
                 by: if h.pointer("/initiatedBy/automated").and_then(Value::as_bool) == Some(true) {
@@ -346,6 +354,7 @@ impl Summary {
             automated,
             revision: app.pointer("/status/sync").and_then(revisions),
             operation,
+            in_progress: ops::in_progress(app),
             history,
             conditions,
             urls,

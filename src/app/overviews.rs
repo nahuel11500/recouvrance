@@ -39,6 +39,18 @@ impl Overview {
         })
     }
 
+    /// Its name in the tab strip and the title bar.
+    pub(super) fn title(self) -> &'static str {
+        match self {
+            Self::Cluster => "Cluster",
+            Self::Workloads => "Workloads",
+            Self::Problems => "Problems",
+            Self::Timeline => "Timeline",
+            Self::Helm => "Helm releases",
+            Self::Argo => "Argo CD",
+        }
+    }
+
     /// Whether the page lists the namespaces picked: it is built again for others.
     fn scoped(self) -> bool {
         matches!(self, Self::Workloads | Self::Problems | Self::Timeline | Self::Helm)
@@ -168,6 +180,7 @@ impl AppView {
             }
             Route::Problems(p) => p.update(cx, ProblemsView::refresh),
             Route::Timeline(p) => p.update(cx, TimelineView::refresh),
+            Route::Logs(p) => p.update(cx, |p, cx| p.refresh(window, cx)),
             route => {
                 let Some((which, _)) = Overview::of(&route) else { return };
                 let fresh = self.build_overview(which, window, cx);

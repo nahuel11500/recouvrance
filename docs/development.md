@@ -52,6 +52,9 @@ pods; add `RECOUVRANCE_LISTTIME=1`, `RECOUVRANCE_PROBLEMS=1` (the Problems scan'
 Linux, the process's peak memory; `RECOUVRANCE_PROBLEMS=kinds` runs each kind's check alone, with
 its own peak; `RECOUVRANCE_PROBLEMS=twice` runs two scans in a row, each with its time, requests and
 bytes), or dry runs such as `RECOUVRANCE_NODESHELLDRY=<node>` (see `src/dev/smoke.rs`).
+`RECOUVRANCE_PODRES=<seconds>` reads the usage bars' requests and limits of every pod for that long,
+and `RECOUVRANCE_CLUSTERLOAD=<rounds>` loads the cluster overview that many times in a row; both then
+print what their requests read (as Settings → API requests counts it) and the peak memory (`VmHWM`).
 
 **Timings**: `RECOUVRANCE_TIMINGS=1` prints to stderr every 10 seconds where the time went (frames,
 table filtering, watch batches, the assistant's API requests) and, for the assistant with an API

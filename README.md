@@ -24,7 +24,7 @@ Site: [nahuelcanavy.com/recouvrance](https://nahuelcanavy.com/recouvrance/)
 - **Native and fast**: Rust and gpui, no web view. Server-side tables keep clusters with tens of
   thousands of pods in a few hundred megabytes.
 - **Everything in one place**: live tables for every type (CRDs included), logs across pods with
-  find and filters, shell, attach, a file browser and file copy, port-forwards, YAML with field docs and schema forms,
+  find and filters (a workload's, or the checked rows' across namespaces and clusters), shell, attach, a file browser and file copy, port-forwards, YAML with field docs and schema forms,
   Helm, Flux and Argo CD actions, several clusters at once, tabs and windows.
 - **Tells you what is wrong**: a Problems page across clusters, a diagnosis on every broken pod or
   workload, firing alerts, stuck deletions, ExternalSecrets that fail to sync, usage history from
@@ -35,11 +35,12 @@ Site: [nahuelcanavy.com/recouvrance](https://nahuelcanavy.com/recouvrance/)
   RBAC; roll back any Deployment, StatefulSet or DaemonSet. Agents follow their own rules instead.
 - **Access made clear**: Role, binding and ServiceAccount pages, a *who can* inspector, and
   short-lived kubeconfigs for ServiceAccounts.
-- **Built for agents**: a local MCP server so Claude Code (or any MCP client) works on your clusters
-  under rules you control (allow, ask, deny), with approvals that show what a write will change, and
-  an audit log. 40+ tools cover what you'd do with kubectl and Helm: logs, diffs, rollouts and
-  rollbacks, port-forwards, debug containers, cordon and drain, `explain` and `can-i`. The in-app assistant
-  uses your Claude Code login (no API key needed), or an Anthropic API key without Claude Code.
+- **Built for agents**: a local MCP server so Claude Code, Codex, Cursor, VS Code, Gemini CLI, Zed
+  or any MCP client works on your clusters under rules you control (allow, ask, deny), with approvals
+  that show what a write will change, and an audit log. 40+ tools cover what you'd do with kubectl and
+  Helm: logs, diffs, rollouts and rollbacks, port-forwards, debug containers, cordon and drain,
+  `explain` and `can-i`. The in-app assistant uses your Claude Code login (no API key needed), or an
+  Anthropic API key without Claude Code.
 
 ## Screenshots
 
@@ -78,7 +79,8 @@ recouvrance-update      # later: installs the latest release
 Or download from the [latest release](https://github.com/nahuel11500/recouvrance/releases/latest):
 a tarball for each platform, or for x86_64 Linux only a `.deb` (Debian, Ubuntu) and an AppImage.
 From source with Rust: `cargo install --locked --git https://github.com/nahuel11500/recouvrance` (on Linux, the libraries listed in
-[development](docs/development.md#build) first).
+[development](docs/development.md#build) first). Whichever way you installed it, Settings → About
+says how to update it.
 
 macOS builds aren't notarized. The install script above is not affected; a tarball downloaded with
 a browser is quarantined: the first time, run `xattr -d com.apple.quarantine path/to/recouvrance`
@@ -104,7 +106,8 @@ scripts/uninstall.sh    # removes it (settings and the agent log are kept)
 2. Browse with the sidebar or **Ctrl+K** (**⌘K** on macOS); filter tables with words, labels or
    expressions such as `status:Running restarts>3`.
 3. Click the `read-only` badge when you want to change something.
-4. In **Agents**, click **Connect Claude Code** to let Claude work on your clusters under your rules.
+4. In **Agents**, click **Connect Claude Code** (or copy the config for Codex, Cursor, VS Code, Gemini
+   CLI or Zed) to let your agent work on your clusters under your rules.
 
 | Linux | macOS | Action |
 |---|---|---|
@@ -114,21 +117,25 @@ scripts/uninstall.sh    # removes it (settings and the agent log are kept)
 | Alt+← / Alt+→ | ⌘[ / ⌘] | Back / forward (Esc also goes back from a detail page) |
 | Ctrl+Shift+N | ⇧⌘N | New window |
 
+Press `?` for every shortcut; the palette also runs every command that has none.
+
 ## Trust and security
 
 Recouvrance holds your cluster credentials and can let AI agents act on your clusters, so here is
 what you can check for yourself:
 
 - **No telemetry.** The app talks to your clusters, to the Prometheus or VictoriaMetrics you point
-  it at, to the Anthropic API only if you use the assistant, and to an https URL you load in
-  *Create / apply*. Nothing else, and no analytics.
+  it at, to the Anthropic API only if you use the assistant, to an https URL you load in
+  *Create / apply*, to the Argo CD API server you set in Settings when you ask for its diff, and to GitHub when you click *Check for updates* in Settings → About (one
+  unauthenticated request for the latest release). Nothing else, and no analytics. The release
+  notes shown after an update come with the app.
 - **Safe by default.** Read-only until you turn writes on. Writes show their `kubectl`
   equivalent and ask for confirmation, YAML edits and applies run as a server dry run first, and
   deletes ask as you set per kind (by default, Nodes, Namespaces, Deployments, StatefulSets,
   DaemonSets, PersistentVolumes and their claims, and CRDs get the strict confirmation). A
   protected context always gets the strict confirmation: a few seconds' wait by default (the
   confirm button counts down, then works), or the names typed. Write mode and protection are for you in the window:
-  agents are not bound by them. Agents get only what their rules allow (an *Ask me* rule asks you
+  agents are not bound by them, unless their rules name `@protected`. Agents get only what their rules allow (an *Ask me* rule asks you
   first), every call is logged to
   `~/.local/share/recouvrance/audit.jsonl`, and a kill switch cuts them all off.
 - **Verifiable releases.** Every release archive, `.deb` and AppImage has a build provenance

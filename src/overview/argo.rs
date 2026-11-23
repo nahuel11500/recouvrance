@@ -2,17 +2,20 @@
 //! into the namespace, as read on Argo CD's cluster. On an Application's page, where it
 //! deploys, what is wrong with it, and the table of its resources.
 
+use std::rc::Rc;
+
 use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::component::button::{Button, ButtonVariants};
-use gpui_kit::component::{ActiveTheme as _, Sizable as _, h_flex, v_flex};
+use gpui_kit::component::{ActiveTheme as _, Disableable as _, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use serde_json::Value;
 
 use super::{Ctx, column_cell, field, heading, mono, row};
-use crate::details::{DetailPanel, OpenOn};
+use crate::details::{ArgoAction, DetailPanel, OpenOn};
 use crate::k8s;
 use crate::k8s::argo::diagnosis::{self, Compared, Diagnosis, Drift, Finding, Res};
+use crate::k8s::argo::server::{self, GitDiff};
 use crate::k8s::argo::{self, Found, ResourceRow, Summary};
 use crate::status::Tone;
 use crate::ui::selectable::{dragged, selectable};
@@ -44,7 +47,7 @@ pub(super) fn section(ctx: &Ctx, cx: &App) -> Option<Div> {
         v_flex()
             .gap_2()
             .child(heading(&title))
-            .when_some(own.as_ref(), |d, app| d.child(own_card(app, cx)))
+            .when_some(own.as_ref(), |d, app| d.child(own_card(ctx, app, cx)))
             .when(deployed_by, |d| d.child(div().text_xs().text_color(muted).child(selectable("Deployed by"))))
             .when_some(lookup.note.as_ref(), |d, note| {
                 d.child(div().text_xs().text_color(muted).child(selectable(note.clone())))
@@ -69,10 +72,15 @@ fn status_row(app: &Summary, cx: &App) -> Div {
         })
 }
 
-/// The Application of the page itself: its status and health message. What is wrong with it
-/// (a failed sync, errors, a deletion held) is under Diagnosis.
-fn own_card(app: &Summary, cx: &App) -> Div {
+/// The Application of the page itself: its status, health message and last deployments (each
+/// but the newest can be rolled back to). What is wrong with it (a failed sync, errors, a
+/// deletion held) is under Diagnosis.
+fn own_card(ctx: &Ctx, app: &Summary, cx: &App) -> Div {
     let theme = cx.theme();
+    let panel = ctx.panel.clone();
+    let roll_back: RollBack = Rc::new(move |id: i64, window: &mut Window, cx: &mut App| {
+        let _ = panel.update(cx, |p, cx| p.confirm_own_argo(ArgoAction::Rollback(Some(id)), window, cx));
+    });
     v_flex()
         .p_2()
         .gap_2()
@@ -84,6 +92,7 @@ fn own_card(app: &Summary, cx: &App) -> Div {
         .when_some(app.health_message.as_ref(), |d, m| {
             d.child(div().text_sm().text_color(theme.muted_foreground).child(selectable(m.clone())))
         })
+        .when(!app.history.is_empty(), |d| d.child(history(app, ("argo-own-rollback", 0), &roll_back, cx)))
 }
 
 fn app_card(ctx: &Ctx, ix: usize, found: &Found, full: bool, cx: &App) -> Div {
@@ -133,14 +142,20 @@ fn app_card(ctx: &Ctx, ix: usize, found: &Found, full: bool, cx: &App) -> Div {
             let color = if ty.ends_with("Warning") { theme.warning } else { theme.danger };
             div().text_sm().text_color(color).child(selectable(format!("{ty}: {message}")))
         }))
-        .when(full && !app.history.is_empty(), |d| d.child(history(app, cx)))
+        .when(full && !app.history.is_empty(), |d| {
+            let panel = ctx.panel.clone();
+            let roll_back: RollBack = Rc::new(move |id: i64, window: &mut Window, cx: &mut App| {
+                let _ = panel.update(cx, |p, cx| p.confirm_argo(ix, ArgoAction::Rollback(Some(id)), window, cx));
+            });
+            d.child(history(app, ("argo-rollback", ix * 16), &roll_back, cx))
+        })
 }
 
 /// The name (opens the Application on its cluster), where it runs, and its actions.
 fn header(ctx: &Ctx, ix: usize, found: &Found, cx: &App) -> Div {
     let app = &found.app;
     let panel = ctx.panel.clone();
-    let (open, refresh, sync) = (panel.clone(), panel.clone(), panel);
+    let (open, refresh, sync, terminate) = (panel.clone(), panel.clone(), panel.clone(), panel);
     h_flex()
         .gap_2()
         .flex_wrap()
@@ -177,14 +192,27 @@ fn header(ctx: &Ctx, ix: usize, found: &Found, cx: &App) -> Div {
         }))
         .child(Button::new(("argo-refresh", ix)).xsmall().ghost().icon(Lucide::RefreshCw).label("Refresh").on_click(
             move |_, window, cx| {
-                let _ = refresh.update(cx, |p, cx| p.confirm_argo(ix, false, window, cx));
+                let _ = refresh.update(cx, |p, cx| p.confirm_argo(ix, ArgoAction::Refresh, window, cx));
             },
         ))
         .child(Button::new(("argo-sync", ix)).xsmall().ghost().icon(Lucide::GitBranch).label("Sync").on_click(
             move |_, window, cx| {
-                let _ = sync.update(cx, |p, cx| p.confirm_argo(ix, true, window, cx));
+                let _ = sync.update(cx, |p, cx| p.confirm_argo(ix, ArgoAction::Sync, window, cx));
             },
         ))
+        // While an operation runs: it can be stopped, as `argocd app terminate-op` does.
+        .when(app.in_progress, |d| {
+            d.child(
+                Button::new(("argo-terminate", ix))
+                    .xsmall()
+                    .ghost()
+                    .icon(Lucide::CircleStop)
+                    .label("Terminate")
+                    .on_click(move |_, window, cx| {
+                        let _ = terminate.update(cx, |p, cx| p.confirm_argo(ix, ArgoAction::Terminate, window, cx));
+                    }),
+            )
+        })
 }
 
 /// An Application's page: where it deploys, its namespace opening on the context that
@@ -387,6 +415,152 @@ fn drifts(ctx: &Ctx, d: &Diagnosis, on: Option<&str>, compared: &[&Drift], cx: &
         })
 }
 
+// MARK: Argo CD's diff
+
+/// Lines of diff open at first, about: the first resources' diffs are open, the others one
+/// click away, so a big diff doesn't lay out thousands of lines on every frame.
+const OPEN_LINES: usize = 300;
+
+/// An Application's diff as Argo CD renders it from git, read from its API server on a click.
+#[derive(Default)]
+pub struct ArgoGitDiff {
+    /// A read is running.
+    pub loading: bool,
+    /// The last read, or why it failed (never with the token).
+    pub read: Option<Result<GitDiff, String>>,
+    /// The resources whose diff is shown, by their index in `GitDiff::changed`.
+    pub open: std::collections::HashSet<usize>,
+}
+
+impl ArgoGitDiff {
+    /// Take a read: the first resources' diffs open, up to about `OPEN_LINES` lines (the
+    /// first one always).
+    pub fn set(&mut self, read: Result<GitDiff, String>) {
+        self.loading = false;
+        self.open.clear();
+        if let Ok(d) = &read {
+            let mut lines = 0;
+            for (i, r) in d.changed.iter().enumerate() {
+                lines += r.lines.len();
+                if i > 0 && lines > OPEN_LINES {
+                    break;
+                }
+                self.open.insert(i);
+            }
+        }
+        self.read = Some(read);
+    }
+}
+
+/// Said under the button before Argo CD's diff is read.
+const GIT_DIFF_NOTE: &str = "What a sync would change, as Argo CD renders it from git: one read-only request to \
+    Argo CD's API server, with the argocd CLI's login or the token set in Settings. Secret values are hidden.";
+
+/// An Application's page: Argo CD's own diff, from live to git. Off (one line saying how to
+/// turn it on) until its context's Argo CD server is set in Settings; read on a click.
+pub(super) fn git_diff(ctx: &Ctx, cx: &App) -> Div {
+    let theme = cx.theme();
+    let muted = theme.muted_foreground;
+    let note = |text: String| div().text_xs().text_color(muted).child(selectable(text));
+    let section = v_flex().gap_2().child(heading("Argo CD's diff with git"));
+    let server = match server::server_of(ctx.context) {
+        None => {
+            return section.child(note(format!(
+                "Set the Argo CD server of {} in Settings, Per cluster, to see what a sync would change, as Argo CD \
+                 renders it from git.",
+                ctx.context
+            )));
+        }
+        Some(Err(e)) => {
+            return section.child(
+                div()
+                    .text_sm()
+                    .text_color(theme.danger)
+                    .child(selectable(format!("The Argo CD server set in Settings, Per cluster, doesn't read: {e}"))),
+            );
+        }
+        Some(Ok(server)) => server,
+    };
+    let state = ctx.argo_git;
+    let panel = ctx.panel.clone();
+    let label = match (state.loading, state.read.is_some()) {
+        (true, _) => "Reading…",
+        (false, true) => "Read again",
+        (false, false) => "Show Argo CD's diff",
+    };
+    let button = Button::new("argo-git-diff")
+        .xsmall()
+        .outline()
+        .icon(Lucide::GitCompare)
+        .label(label)
+        .disabled(state.loading)
+        .tooltip(format!("GET {}/api/v1/applications/{{name}}/managed-resources", server.base))
+        .on_click(move |_, _, cx| {
+            let _ = panel.update(cx, DetailPanel::load_argo_git_diff);
+        });
+    let section = section.child(h_flex().gap_2().child(button));
+    match &state.read {
+        None => section.child(note(GIT_DIFF_NOTE.to_string())),
+        Some(Err(e)) => section.child(div().text_sm().text_color(theme.danger).child(selectable(e.clone()))),
+        Some(Ok(d)) => section
+            .child(note(git_diff_summary(d)))
+            .children(d.changed.iter().enumerate().map(|(i, r)| changed_resource(ctx, state, i, r, cx))),
+    }
+}
+
+/// What was read: how many resources differ, from where and with which login.
+fn git_diff_summary(d: &GitDiff) -> String {
+    let differ = d.changed.len() + d.more;
+    let mut text = if differ == 0 {
+        "Nothing differs: a sync would change nothing.".to_string()
+    } else {
+        format!(
+            "{differ} {} from git, {} the same.",
+            crate::plural::pick(differ, "resource differs", "resources differ"),
+            d.same
+        )
+    };
+    if d.hooks > 0 {
+        text.push(' ');
+        text.push_str(crate::plural::pick(d.hooks, "A hook is left out.", "Hooks are left out."));
+    }
+    if d.more > 0 {
+        text.push_str(&format!(" The first {} are shown.", d.changed.len()));
+    }
+    text.push_str(&format!(" Read from {} with {}: - is live, + is git.", d.server, d.login.text()));
+    text
+}
+
+/// A resource that differs: its object (opening on the destination's context), what the sync
+/// does to it, and its diff when open.
+fn changed_resource(ctx: &Ctx, state: &ArgoGitDiff, i: usize, r: &server::ResourceDiff, cx: &App) -> Div {
+    let muted = cx.theme().muted_foreground;
+    let open = state.open.contains(&i);
+    let panel = ctx.panel.clone();
+    v_flex()
+        .gap_1()
+        .child(
+            h_flex()
+                .gap_2()
+                .text_sm()
+                .child(
+                    Button::new(("argo-git-toggle", i))
+                        .xsmall()
+                        .ghost()
+                        .icon(if open { Lucide::ChevronDown } else { Lucide::ChevronRight })
+                        .on_click(move |_, _, cx| {
+                            let _ = panel.update(cx, |p, cx| p.toggle_argo_git(i, cx));
+                        }),
+                )
+                .child(object_link(ctx, ("argo-git-res", i), r.res.label(), &r.res, cx).flex_shrink_0())
+                .child(div().text_xs().text_color(muted).child(selectable(r.change.text()))),
+        )
+        .when(open, |d| d.child(crate::details::diff_block(&r.lines, cx)))
+        .when(open && r.more_lines > 0, |d| {
+            d.child(div().text_xs().text_color(muted).child(selectable(format!("+{} more lines", r.more_lines))))
+        })
+}
+
 // MARK: Resources
 
 /// An Application's resources table, worked out when the Application is read: it can list
@@ -536,10 +710,31 @@ fn short_url(url: &str) -> String {
     rest.split('/').next().unwrap_or(rest).to_string()
 }
 
-fn history(app: &Summary, cx: &App) -> Div {
+/// Roll an Application back to the deployment with this id (after its confirmation).
+type RollBack = Rc<dyn Fn(i64, &mut Window, &mut App)>;
+
+/// The last deployments, newest first. Each but the newest offers to roll back to it, which
+/// Argo CD allows only with auto-sync off; `id` numbers those buttons.
+fn history(app: &Summary, id: (&'static str, usize), roll_back: &RollBack, cx: &App) -> Div {
     let muted = cx.theme().muted_foreground;
     v_flex().gap_0p5().child(div().text_xs().text_color(muted).child(selectable("Deployed"))).children(
-        app.history.iter().map(|h| {
+        app.history.iter().enumerate().map(|(i, h)| {
+            let button = h.id.filter(|_| i > 0).map(|deployment| {
+                let roll_back = roll_back.clone();
+                Button::new((id.0, id.1 + i))
+                    .xsmall()
+                    .ghost()
+                    .icon(Lucide::Undo2)
+                    .label("Roll back…")
+                    .when(app.automated, |b| {
+                        b.disabled(true)
+                            .tooltip("Auto-sync is on: Argo CD refuses a rollback. Revert the change in git.")
+                    })
+                    .when(!app.automated, |b| {
+                        b.tooltip(format!("Deploy this revision again (deployment {deployment})"))
+                    })
+                    .on_click(move |_, window, cx| roll_back(deployment, window, cx))
+            });
             h_flex()
                 .gap_3()
                 .text_sm()
@@ -548,14 +743,51 @@ fn history(app: &Summary, cx: &App) -> Div {
                 .when_some(h.by.as_ref(), |d, by| {
                     d.child(div().text_color(muted).child(selectable(format!("by {by}"))))
                 })
+                .children(button)
         }),
     )
 }
 
 #[cfg(test)]
 mod tests {
-    use super::ArgoResources;
+    use super::{ArgoGitDiff, ArgoResources};
+    use crate::history::DiffLine;
+    use crate::k8s::argo::diagnosis::Res;
+    use crate::k8s::argo::server::{Change, GitDiff, Login, ResourceDiff};
     use serde_json::json;
+
+    #[test]
+    fn the_first_diffs_open_within_a_budget() {
+        let res = |lines: usize| ResourceDiff {
+            res: Res { kind: "ConfigMap".into(), name: "c".into(), ..Default::default() },
+            change: Change::Modified,
+            lines: vec![DiffLine::Added("x".into()); lines],
+            more_lines: 0,
+        };
+        let read = |sizes: &[usize]| {
+            Ok(GitDiff {
+                server: "argocd.example.com".into(),
+                login: Login::Cli,
+                changed: sizes.iter().map(|n| res(*n)).collect(),
+                more: 0,
+                same: 0,
+                hooks: 0,
+            })
+        };
+        let mut state = ArgoGitDiff { loading: true, ..Default::default() };
+        state.set(read(&[100, 150, 100, 10]));
+        let mut open: Vec<usize> = state.open.iter().copied().collect();
+        open.sort_unstable();
+        assert_eq!(open, [0, 1]);
+        assert!(!state.loading);
+        // The first one opens even when it alone is over the budget.
+        state.set(read(&[1000, 5]));
+        assert_eq!(state.open.iter().copied().collect::<Vec<_>>(), [0]);
+        // A failed read opens nothing, and says why.
+        state.set(Err("refused".into()));
+        assert!(state.open.is_empty());
+        assert_eq!(state.read, Some(Err("refused".into())));
+    }
 
     #[test]
     fn a_url_button_shows_its_host() {

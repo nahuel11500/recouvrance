@@ -8,6 +8,7 @@ use gpui_kit::component::{ActiveTheme as _, IconName, Sizable as _, h_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
+use super::overviews::Overview;
 use super::{AppView, MAC, Route, TabState, VisiblePages, with_keys};
 use crate::k8s::Kind;
 
@@ -112,20 +113,21 @@ impl AppView {
             Route::Resources(Some(k)) => k.label.clone(),
             Route::Resources(None) => "Resources".into(),
             Route::Detail(d) => d.read(cx).title(),
-            Route::Workloads(_) => "Workloads".into(),
-            Route::Cluster(_) => "Cluster".into(),
-            Route::Problems(_) => "Problems".into(),
-            Route::Timeline(_) => "Timeline".into(),
+            Route::Workloads(_)
+            | Route::Cluster(_)
+            | Route::Problems(_)
+            | Route::Timeline(_)
+            | Route::Helm(_)
+            | Route::Argo(_) => Overview::of(route).map_or("", |(o, _)| o.title()).to_string(),
             Route::Access(_) => "My access".into(),
             Route::HelmInstall(_) => "Helm install".into(),
             Route::Assistant(_) => "Assistant".into(),
-            Route::Helm(_) => "Helm releases".into(),
             Route::HelmRelease(_) => "Helm release".into(),
-            Route::Argo(_) => "Argo CD".into(),
             Route::Contexts => "Contexts".into(),
             Route::Settings => "Settings".into(),
             Route::Terminal(_) => "Terminal".into(),
             Route::Apply(_) => "Create / apply".into(),
+            Route::Logs(l) => l.read(cx).title(),
             Route::Agents => "Agents".into(),
         }
     }
@@ -143,6 +145,9 @@ impl AppView {
             .map(|(i, t)| {
                 let (route, kind) = if i == self.active_tab {
                     (Some(self.route()), self.kind.as_ref())
+                } else if let Some(page) = t.open {
+                    // Reopened on an overview built when shown: its history is still the list.
+                    return page.title().to_string();
                 } else {
                     (t.history.get(t.pos), t.kind.as_ref())
                 };
