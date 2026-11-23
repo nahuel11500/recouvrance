@@ -180,6 +180,7 @@ impl AppView {
             }
             Route::Problems(p) => p.update(cx, ProblemsView::refresh),
             Route::Timeline(p) => p.update(cx, TimelineView::refresh),
+            Route::Logs(p) => p.update(cx, |p, cx| p.refresh(window, cx)),
             route => {
                 let Some((which, _)) = Overview::of(&route) else { return };
                 let fresh = self.build_overview(which, window, cx);
