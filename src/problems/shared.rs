@@ -608,7 +608,7 @@ mod tests {
         assert_eq!(cluster.asked("/api/v1/namespaces/shop/pods"), 1);
         // Its own findings stand, though the whole cluster's are more recent.
         fresh(&whole, Fresh::Since(Instant::now()), &asks).await;
-        assert!(ensure(&shop, Fresh::Paced, &asks).is_none());
+        assert!(ensure(&shop, Fresh::Paced, asks).is_none());
         assert!(latest(&shop).unwrap().read_all());
         assert_eq!(cluster.asked("/api/v1/namespaces/shop/pods"), 1);
         // With full rights, the whole cluster's scan stands for `shop`.
