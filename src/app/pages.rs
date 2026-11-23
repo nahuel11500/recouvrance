@@ -397,7 +397,7 @@ impl AppView {
     pub(super) fn open_upgrade_check(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.open_cluster(window, cx);
         if let Route::Cluster(page) = self.route() {
-            page.update(cx, |page, cx| page.show_upgrade_check(cx));
+            page.update(cx, crate::ui::cluster::ClusterOverview::show_upgrade_check);
         }
     }
 
