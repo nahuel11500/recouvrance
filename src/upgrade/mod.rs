@@ -371,7 +371,7 @@ struct HeadMeta {
 /// can: in the removed version's group or the replacement's (extensions → apps).
 fn served_kind<'a>(kinds: &'a [Kind], r: &Removal) -> Option<&'a Kind> {
     let to = r.replacement.and_then(|v| v.split_once('/')).map_or("", |(g, _)| g);
-    // Core Events are the same objects as events.k8s.io's, which discovery leaves out.
+    // Core Events are the same objects as events.k8s.io's: either one lists them.
     let core = (r.kind == "Event").then_some("");
     kinds
         .iter()

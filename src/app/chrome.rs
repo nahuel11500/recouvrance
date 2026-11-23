@@ -10,7 +10,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use super::search_index::{Entry, SEARCH_KINDS, on_cluster};
-use super::{AppView, Route, open_main_window, section_icon, set_theme, set_zoom, zoom};
+use super::{AppView, Route, open_main_window, section_icon, set_theme, set_zoom, with_keys, zoom};
 use crate::k8s;
 use crate::k8s::Kind;
 use crate::ui::palette::{Item as PaletteItem, Palette, PaletteEvent, Target};
@@ -40,15 +40,17 @@ impl AppView {
             ("My access (RBAC in this namespace)", "access", Lucide::KeyRound),
             ("Install a Helm chart", "helm-install", Lucide::Download),
             ("Assistant (ask your clusters)", "assistant", Lucide::Sparkles),
-            ("New window (Ctrl Shift N)", "new-window", Lucide::AppWindow),
-            ("Zoom in (Ctrl +)", "zoom-in", Lucide::ZoomIn),
-            ("Zoom out (Ctrl -)", "zoom-out", Lucide::ZoomOut),
-            ("Reset zoom (Ctrl 0)", "zoom-reset", Lucide::Search),
+            ("New window ({secondary-shift-n})", "new-window", Lucide::AppWindow),
+            ("Zoom in ({secondary-=})", "zoom-in", Lucide::ZoomIn),
+            ("Zoom out ({secondary--})", "zoom-out", Lucide::ZoomOut),
+            ("Reset zoom ({secondary-0})", "zoom-reset", Lucide::Search),
             ("Toggle dark / light theme", "theme", Lucide::Moon),
         ] {
-            items.push(PaletteItem { label: label.into(), detail: "page".into(), icon, target: Target::Page(page) });
+            let label = with_keys(label);
+            items.push(PaletteItem { label, detail: "page".into(), icon, target: Target::Page(page) });
         }
-        for k in &self.kinds {
+        // The types the sidebar lists, not the noise discovery keeps for lookups.
+        for k in self.kinds.iter().filter(|k| k8s::in_sidebar(k)) {
             items.push(PaletteItem {
                 label: k.label.clone(),
                 detail: format!("{} · {}", k.kubectl_name(), k.section),
@@ -171,7 +173,9 @@ impl AppView {
                     Target::Page("settings") => this.navigate(Route::Settings, cx),
                     Target::Page("terminal") => this.open_terminal(window, cx),
                     Target::Page("apply") => this.open_apply(window, cx),
-                    Target::Page("new-window") => open_main_window(cx),
+                    Target::Page("new-window") => {
+                        open_main_window(cx);
+                    }
                     Target::Page("problems") => this.open_problems(window, cx),
                     Target::Page("timeline") => this.open_timeline(window, cx),
                     Target::Page("access") => this.open_access(window, cx),
@@ -222,6 +226,7 @@ impl AppView {
     }
 
     pub(super) fn render_approvals(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let cx: &App = cx;
         let theme = cx.theme();
         v_flex().children(self.approvals.iter().map(|a| {
             let (deny, approve) = (a.id, a.id);
@@ -241,15 +246,20 @@ impl AppView {
                         .min_w_0()
                         .text_sm()
                         .child(format!("{} wants to run {}: ", a.agent, a.tool))
-                        // Patches and manifests are shown whole: what is approved is what runs.
+                        // Patches and manifests are shown whole: what is approved is what runs. What
+                        // the call will change comes right under the request, a manifest's YAML after.
                         .child(
-                            div()
+                            v_flex()
                                 .id(("approval-summary", a.id as usize))
-                                .max_h(px(240.))
+                                .max_h(px(300.))
                                 .overflow_y_scroll()
+                                .overflow_x_hidden()
+                                .gap_1()
                                 .font_family(theme.mono_font_family.clone())
                                 .text_xs()
-                                .child(a.summary.clone()),
+                                .child(a.summary.clone())
+                                .when_some(a.preview.as_ref(), |d, p| d.child(preview_block(p, cx)))
+                                .when_some(a.detail.clone(), ParentElement::child),
                         ),
                 )
                 // Only offered when a rule can cover exactly this request (not exec, for one).
@@ -302,7 +312,28 @@ impl AppView {
                 )
         }))
     }
+}
 
+/// What an approval's call will change, under its request: each object with the fields that
+/// change and its diff, or why there is no preview.
+fn preview_block(p: &crate::mcp::Preview, cx: &App) -> AnyElement {
+    let theme = cx.theme();
+    v_flex()
+        .gap_1()
+        .child(div().font_weight(FontWeight::SEMIBOLD).child("What will change"))
+        .when_some(p.note.clone(), |d, note| d.child(div().text_color(theme.muted_foreground).child(note)))
+        .children(p.sections.iter().map(|s| {
+            v_flex()
+                .gap_0p5()
+                .child(div().font_weight(FontWeight::SEMIBOLD).child(s.title.clone()))
+                .children(s.lines.iter().map(|line| div().pl_2().child(line.clone())))
+                .when_some(s.note.clone(), |d, note| d.child(div().pl_2().text_color(theme.danger).child(note)))
+                .when(!s.diff.is_empty(), |d| d.child(crate::details::diff_block(&s.diff, cx)))
+        }))
+        .into_any_element()
+}
+
+impl AppView {
     pub(super) fn toggle_context(&mut self, context: String, cx: &mut Context<Self>) {
         if !self.picked.remove(&context) {
             self.picked.insert(context);

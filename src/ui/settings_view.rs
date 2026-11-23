@@ -30,6 +30,25 @@ enum Section {
     About,
 }
 
+/// Settings → Shortcuts: keys, named as each platform does (see `app::with_keys`), then what
+/// they do.
+const SHORTCUT_LIST: &[(&str, &str)] = &[
+    ("{secondary-k}", "Command palette: resources, pages, objects across clusters"),
+    ("{secondary-f}  or  /", "Filter the current table"),
+    ("Esc", "Back from a detail page"),
+    ("↑ ↓  then  {enter}", "Move in a table, open the row"),
+    ("{secondary-shift-n}", "New window (shares agents and settings)"),
+    ("{secondary-t} / {secondary-w}", "New tab / close tab (right-click a row: open in new tab)"),
+    ("{ctrl-tab} / {ctrl-shift-tab}", "Next / previous tab"),
+    ("{secondary-b}", "Hide or show the sidebar"),
+    ("F5  or  {secondary-r}", "Refresh the page"),
+    ("{alt-left|cmd-[} / {alt-right|cmd-]}", "Back / forward"),
+    ("{secondary-=} / {secondary--} / {secondary-0}", "Zoom in / out / reset"),
+    ("Right-click a row", "Open, logs, shell, YAML, events, run, scale, restart, delete"),
+    ("{ctrl-shift-v|cmd-v}", "Paste in a shell"),
+    ("Double-click a context", "Connect to just that context"),
+];
+
 const SECTIONS: [(Section, &str, Lucide); 14] = [
     (Section::General, "General", Lucide::Settings),
     (Section::Contexts, "Contexts", Lucide::Ship),
@@ -890,7 +909,7 @@ impl SettingsView {
             ))
             .child(Self::row(
                 "Zoom",
-                "Also Ctrl + / Ctrl - / Ctrl 0.",
+                &crate::app::with_keys("Also {secondary-=} / {secondary--} / {secondary-0}."),
                 h_flex()
                     .gap_2()
                     .child(
@@ -1166,24 +1185,8 @@ impl SettingsView {
 
     fn shortcuts_section(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme().clone();
-        let keys = [
-            ("Ctrl K", "Command palette: resources, pages, objects across clusters"),
-            ("Ctrl F  or  /", "Filter the current table"),
-            ("Esc", "Back from a detail page"),
-            ("↑ ↓  then  Enter", "Move in a table, open the row"),
-            ("Ctrl Shift N", "New window (shares agents and settings)"),
-            ("Ctrl T / Ctrl W", "New tab / close tab (right-click a row: open in new tab)"),
-            ("Ctrl Tab / Ctrl Shift Tab", "Next / previous tab"),
-            ("Ctrl B", "Hide or show the sidebar"),
-            ("F5  or  Ctrl R", "Refresh the page"),
-            ("Alt ← / Alt →", "Back / forward"),
-            ("Ctrl + / Ctrl - / Ctrl 0", "Zoom in / out / reset"),
-            ("Right-click a row", "Open, logs, shell, YAML, events, run, scale, restart, delete"),
-            ("Ctrl Shift V", "Paste in a shell"),
-            ("Double-click a context", "Connect to just that context"),
-        ];
         v_flex()
-            .children(keys.into_iter().map(|(k, what)| {
+            .children(SHORTCUT_LIST.iter().map(|(k, what)| {
                 h_flex()
                     .gap_4()
                     .py_2()
@@ -1198,10 +1201,10 @@ impl SettingsView {
                                 .bg(theme.secondary)
                                 .text_xs()
                                 .font_family(theme.mono_font_family.clone())
-                                .child(k),
+                                .child(crate::app::with_keys(k)),
                         ),
                     )
-                    .child(div().text_sm().child(what))
+                    .child(div().text_sm().child(*what))
             }))
             .into_any_element()
     }
@@ -1446,7 +1449,16 @@ fn port_error(typed: &str, save: impl FnOnce(u16) -> Result<()>) -> Option<Share
 
 #[cfg(test)]
 mod tests {
-    use super::port_error;
+    use super::{SHORTCUT_LIST, port_error};
+
+    /// The list names only keys that are bound, on Linux and on macOS. A shell's paste is the
+    /// terminal's own key, not a binding.
+    #[test]
+    fn the_shortcut_list_names_only_bound_keys() {
+        for (keys, what) in SHORTCUT_LIST.iter().filter(|(_, what)| *what != "Paste in a shell") {
+            assert_eq!(crate::app::unbound_keys(keys), Vec::<String>::new(), "{what}");
+        }
+    }
 
     #[test]
     fn a_port_not_saved_says_why() {

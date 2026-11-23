@@ -196,6 +196,26 @@ fn format_exact(r: &Rule) -> Result<String> {
     Ok(text)
 }
 
+/// The narrowest rule that covers this request, as the file writes it: its verb, resource
+/// and name, its namespace and its context (`*` for a part it doesn't name). A refused agent
+/// is shown it, so it can tell the user what to grant. None when a part can't be written
+/// exactly (a space, comma or slash in a name).
+pub fn rule_for(a: &super::Access) -> Option<String> {
+    let one = |v: Option<&String>| vec![v.map_or_else(|| "*".to_string(), String::clone)];
+    let rule = Rule {
+        effect: Mode::Allow,
+        verbs: vec![a.verb.to_string()],
+        resources: vec![a.resource.clone()],
+        namespaces: one(a.namespace.as_ref()),
+        contexts: vec![a.context.clone()],
+        names: one(a.name.as_ref()),
+        note: String::new(),
+        expires: None,
+        approved: false,
+    };
+    format_exact(&rule).ok()
+}
+
 /// The agent's rules and limits as they would appear in the file.
 pub fn from_policy(p: &Policy) -> Result<AgentRules> {
     let pick = |m: Mode, approved: bool| {
@@ -370,6 +390,27 @@ mod tests {
         ] {
             assert_eq!(format_rule(&parse_rule(Mode::Allow, s).unwrap()), s);
         }
+    }
+
+    #[test]
+    fn a_request_s_rule_is_as_narrow_as_the_request() {
+        let mut a = super::super::Access {
+            context: "prod".into(),
+            verb: Verb::Restart,
+            resource: "deployments.apps".into(),
+            resource_aliases: vec!["deployments".into(), "deployment".into()],
+            namespace: Some("team-a".into()),
+            name: Some("web".into()),
+            cluster_scoped: false,
+        };
+        assert_eq!(rule_for(&a).unwrap(), "restart deployments.apps/web -n team-a --context prod");
+        a.verb = Verb::List;
+        a.namespace = None;
+        a.name = None;
+        assert_eq!(rule_for(&a).unwrap(), "list deployments.apps --context prod");
+        // A context name the file can't hold exactly gives no rule rather than a wrong one.
+        a.context = "my cluster".into();
+        assert_eq!(rule_for(&a), None);
     }
 
     fn without_notes(rules: &[Rule]) -> Vec<Rule> {
@@ -623,6 +664,39 @@ mod properties {
                 format!("agents:\n  ci:\n    allow: [\"get *\"]\n    {key}: [\"* secrets\"]\n")
             };
             prop_assert!(check(&text).is_err(), "{}", text);
+        }
+
+        /// What a refusal tells the agent holds for every request: one no rule covers is
+        /// allowed by the rule the refusal names (in one namespace and across all of them),
+        /// one an Ask rule decided is allowed by it among the approved rules, and one a Deny
+        /// rule decided stays denied whatever rule is added, so calling it final is true.
+        #[test]
+        fn the_rule_a_refusal_names_allows_the_request(p in policy(), a in access(), extra in rule()) {
+            for any_namespace in [false, true] {
+                let a = if any_namespace { Access { namespace: None, ..a.clone() } } else { a.clone() };
+                let decide = |p: &Policy| if any_namespace { p.decide_any_namespace(&a) } else { p.decide(&a) };
+                let text = rule_for(&a).ok_or_else(|| TestCaseError::fail(format!("no rule for {a:?}")))?;
+                let named = parse_rule(Mode::Allow, &text).unwrap();
+                let with = |rule: Rule| {
+                    let mut more = p.clone();
+                    more.rules.push(rule);
+                    decide(&more)
+                };
+                let before = decide(&p);
+                match (before.mode, before.rule) {
+                    (Mode::Deny, None) => {
+                        prop_assert_eq!(with(named).mode, Mode::Allow, "{}", text);
+                    }
+                    (Mode::Deny, Some(_)) => {
+                        prop_assert_eq!(with(Rule { approved: true, ..named }).mode, Mode::Deny);
+                        prop_assert_eq!(with(extra.clone()).mode, Mode::Deny);
+                    }
+                    (Mode::Ask, _) => {
+                        prop_assert_eq!(with(Rule { approved: true, ..named }).mode, Mode::Allow, "{}", text);
+                    }
+                    (Mode::Allow, _) => {}
+                }
+            }
         }
 
         /// A section with nothing in it, or no section at all, lets nothing through.

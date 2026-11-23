@@ -33,6 +33,10 @@ pub struct AuditEntry {
     /// MCP session (one agent conversation), when the client sent one.
     #[serde(default)]
     pub session: Option<String>,
+    /// What the call was to change, worked out for its approval (`Preview::text`): only calls
+    /// that needed an approval have one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub change: Option<String>,
 }
 
 /// See [`Hub::audit_stats`](super::Hub::audit_stats).
@@ -110,7 +114,21 @@ mod tests {
             duration_ms: 0,
             result_bytes: 0,
             session: None,
+            change: None,
         }
+    }
+
+    /// Lines written before `change` existed still read, and a call without one writes none.
+    #[test]
+    fn a_change_is_kept_only_when_there_is_one() {
+        let line = serde_json::to_string(&entry("scale")).unwrap();
+        assert!(!line.contains("change"), "{line}");
+        let old: AuditEntry = serde_json::from_str(&line).unwrap();
+        assert_eq!(old.change, None);
+        let with =
+            AuditEntry { change: Some("Deployment shop/web: scaled\n  replicas: 3 → 0\n".into()), ..entry("scale") };
+        let back: AuditEntry = serde_json::from_str(&serde_json::to_string(&with).unwrap()).unwrap();
+        assert_eq!(back.change, with.change);
     }
 
     #[test]

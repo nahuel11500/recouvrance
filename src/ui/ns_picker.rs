@@ -91,6 +91,11 @@ impl NamespacePicker {
         cx.notify();
     }
 
+    /// Every namespace offered: the ones listed and the ones added by hand.
+    pub fn known(&self) -> &[String] {
+        &self.all
+    }
+
     /// Add a namespace by hand, remember it for this context, and show it.
     pub fn add_namespace(&mut self, ns: String, cx: &mut Context<Self>) {
         let ctx = self.context.clone();
@@ -359,11 +364,9 @@ impl Render for NamespacePicker {
                 v_flex().id("ns-list").max_h(px(480.)).overflow_y_scroll().track_scroll(&self.scroll).children(items),
             )
             .child(
-                div()
-                    .px_1()
-                    .text_xs()
-                    .text_color(muted)
-                    .child("Click or Enter shows only one · tick or Ctrl+Enter to combine"),
+                div().px_1().text_xs().text_color(muted).child(crate::app::with_keys(
+                    "Click or {enter} shows only one · tick or {secondary-enter} to combine",
+                )),
             )
     }
 }

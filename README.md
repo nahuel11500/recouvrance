@@ -36,9 +36,9 @@ Site: [nahuelcanavy.com/recouvrance](https://nahuelcanavy.com/recouvrance/)
 - **Access made clear**: Role, binding and ServiceAccount pages, a *who can* inspector, and
   short-lived kubeconfigs for ServiceAccounts.
 - **Built for agents**: a local MCP server so Claude Code (or any MCP client) works on your clusters
-  under rules you control (allow, ask, deny), with approvals and an audit log. 40+ tools cover what
-  you'd do with kubectl and Helm: logs, diffs, rollouts and rollbacks, port-forwards, debug
-  containers, cordon and drain, `explain` and `can-i`. The in-app assistant
+  under rules you control (allow, ask, deny), with approvals that show what a write will change, and
+  an audit log. 40+ tools cover what you'd do with kubectl and Helm: logs, diffs, rollouts and
+  rollbacks, port-forwards, debug containers, cordon and drain, `explain` and `can-i`. The in-app assistant
   uses your Claude Code login (no API key needed), or an Anthropic API key without Claude Code.
 
 ## Screenshots
@@ -102,18 +102,18 @@ scripts/uninstall.sh    # removes it (settings and the agent log are kept)
 ## Quick start
 
 1. Launch Recouvrance and pick one or more contexts from your kubeconfig.
-2. Browse with the sidebar or **Ctrl+K**; filter tables with words, labels or expressions such as
-   `status:Running restarts>3`.
+2. Browse with the sidebar or **Ctrl+K** (**⌘K** on macOS); filter tables with words, labels or
+   expressions such as `status:Running restarts>3`.
 3. Click the `read-only` badge when you want to change something.
 4. In **Agents**, click **Connect Claude Code** to let Claude work on your clusters under your rules.
 
-| Shortcut | Action |
-|---|---|
-| Ctrl+K | Command palette: resources, pages, contexts, objects |
-| Ctrl+T / Ctrl+W / Ctrl+Tab | New tab / close tab / next tab |
-| Ctrl+F or / | Filter the current table |
-| Alt+← / Alt+→ | Back / forward (Esc also goes back from a detail page) |
-| Ctrl+Shift+N | New window |
+| Linux | macOS | Action |
+|---|---|---|
+| Ctrl+K | ⌘K | Command palette: resources, pages, contexts, objects |
+| Ctrl+T / Ctrl+W / Ctrl+Tab | ⌘T / ⌘W / ⌃Tab | New tab / close tab / next tab |
+| Ctrl+F or / | ⌘F or / | Filter the current table |
+| Alt+← / Alt+→ | ⌘[ / ⌘] | Back / forward (Esc also goes back from a detail page) |
+| Ctrl+Shift+N | ⇧⌘N | New window |
 
 ## Trust and security
 

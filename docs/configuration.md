@@ -51,8 +51,11 @@ The contexts come from, merged in this order:
    clusters that skip TLS verification. Removing one there deletes its file. Oldest first, so a
    new paste never takes a name an existing context has.
 
-The page shows each source with its file and context counts, or why it can't be read. Changes
-to any of these files are picked up within a few seconds. When two files define a context
+The page shows each source with its file and context counts, or why it can't be read. A file
+that fails to parse is said by its path, line and column and a short reason (not valid YAML, a
+missing field...), never by its lines around the error, where a token or a key can be; the
+status line and the agents get the same when no file can be read. Changes to any of these files
+are picked up within a few seconds. When two files define a context
 (or cluster, or user) with the same name, the later one is renamed `name@file` so both stay usable.
 A context name stays with the file that had it first (kept in `context_files`), even when files
 are saved again, reordered, or one is briefly unreadable: protection and per-cluster settings
@@ -65,7 +68,9 @@ context already shown as `name@file` keeps that name when `name` is freed.
 | Key | Default | What |
 |---|---|---|
 | `startup` | `"reconnect"` | Reconnect to the last contexts (`reconnect`) or open the context picker (`ask`) |
-| `initial_view` | `"pods"` | First page after connecting: `pods`, `workloads`, `cluster` |
+| `initial_view` | `"pods"` | First page after connecting: `pods`, `workloads`, `cluster`. A set of contexts with a saved session (`sessions`) reopens on its own page instead |
+| `sessions` | | Remembered by the app: where each set of contexts was left, newest first, 20 kept: `{ "contexts": ["prod"], "tabs": [{ "page": "list", "kind": "deployments.apps", "namespaces": ["team-a"], "filter": "web" }], "active_tab": 0, "filters": { "pods": "api" } }`. `page` is `list`, `workloads`, `cluster`, `problems`, `timeline`, `helm` or `argo`; `kind` is the kubectl name. The first window reopens the session of the contexts it connects to. A value that doesn't read takes its default, an entry that doesn't read is dropped, and a type, namespace or page the clusters no longer have falls back to the default; none of it ever stops the file from loading |
+| `window` | | Remembered by the app: `{ "x": 80, "y": 40, "width": 1500, "height": 920, "maximized": false }`, where the first window opens (centered when that is out of reach of every display). One that doesn't read opens at 1500×920, centered |
 | `metrics_refresh`, `detail_refresh`, `overview_refresh` | 15, 5, 30 | Seconds between refreshes. `metrics_refresh` is the shortest wait between reads of metrics-server: the pods and nodes lists read it again when its next sample is due (up to twice its interval or 5 minutes later), and every `metrics_refresh` when its timestamps say nothing; detail pages refresh their related objects and usage every `metrics_refresh`. A page that isn't on screen refreshes nothing: one in the back/forward history, or any page of a window hidden as the desktop reports it (minimized, on another workspace, or on macOS fully covered by other windows; Wayland compositors without the `suspended` state never report it) |
 | `log_tail_lines`, `log_timestamps` | 1000, true | Log viewer |
 | `kubeconfigs`, `kubeconfig_folders` | | Extra kubeconfig files and watched folders (see above) |

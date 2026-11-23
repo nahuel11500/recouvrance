@@ -351,16 +351,23 @@ fn without_restart(template: &Value) -> Value {
 /// Where two values differ, as paths of at most `PATH_DEPTH` segments. Lists of named items
 /// (containers, env, ports) are matched by name, so one added doesn't shift the others.
 pub(crate) fn changed_paths(a: &Value, b: &Value, path: &mut Vec<String>, out: &mut Vec<Vec<String>>) {
+    changed_paths_to(a, b, PATH_DEPTH, path, out);
+}
+
+/// [`changed_paths`] with paths of at most `depth` segments: a whole object's fields sit
+/// deeper than a pod template's (`spec.template.spec.containers[web].image`).
+pub(crate) fn changed_paths_to(a: &Value, b: &Value, depth: usize, path: &mut Vec<String>, out: &mut Vec<Vec<String>>) {
     if a == b {
         return;
     }
-    if path.len() < PATH_DEPTH {
+    if path.len() < depth {
         if let (Some(x), Some(y)) = (a.as_object(), b.as_object()) {
             let found = out.len();
             let keys: BTreeSet<&String> = x.keys().chain(y.keys()).collect();
             for k in keys {
                 path.push(k.clone());
-                changed_paths(x.get(k).unwrap_or(&Value::Null), y.get(k).unwrap_or(&Value::Null), path, out);
+                let (before, after) = (x.get(k).unwrap_or(&Value::Null), y.get(k).unwrap_or(&Value::Null));
+                changed_paths_to(before, after, depth, path, out);
                 path.pop();
             }
             // Only a null field added or removed: the object itself changed.
@@ -374,7 +381,7 @@ pub(crate) fn changed_paths(a: &Value, b: &Value, path: &mut Vec<String>, out: &
             for k in keys {
                 path.push(format!("[{k}]"));
                 let (before, after) = (x.get(k).copied(), y.get(k).copied());
-                changed_paths(before.unwrap_or(&Value::Null), after.unwrap_or(&Value::Null), path, out);
+                changed_paths_to(before.unwrap_or(&Value::Null), after.unwrap_or(&Value::Null), depth, path, out);
                 path.pop();
             }
             // The same items in another order (or a name twice): the list itself changed.
@@ -849,12 +856,20 @@ pub fn report(subject: &str, changes: &[Change], errors: &[String], limit: usize
              and events for about an hour; the app records other changes only while it watches the object.\n",
         );
     }
+    out.push_str(&change_lines(changes, limit));
+    for e in errors {
+        out.push_str(&format!("Could not read {e}\n"));
+    }
+    out
+}
+
+/// Changes as agents read them (`get_changes`, `recent_changes`), in the order given: at
+/// most `limit`, each with the lines its diff changes, then how many more there are.
+pub fn change_lines(changes: &[Change], limit: usize) -> String {
+    let mut out = String::new();
     for c in changes.iter().take(limit) {
-        let when = c.time.map_or_else(
-            || "time unknown".to_string(),
-            |t| format!("{} ({} ago)", t.strftime("%Y-%m-%d %H:%M:%SZ"), k8s::age(t)),
-        );
-        out.push_str(&format!("{when}  {}  {}: {}\n", c.source.label(), c.object, c.summary));
+        let at = c.time.map_or_else(|| "time unknown".to_string(), when);
+        out.push_str(&format!("{at}  {}  {}: {}\n", c.source.label(), c.object, c.summary));
         if let Some(d) = &c.diff {
             for line in d.short(SHORT_DIFF_LINES).lines() {
                 out.push_str(&format!("    {line}\n"));
@@ -867,10 +882,12 @@ pub fn report(subject: &str, changes: &[Change], errors: &[String], limit: usize
             crate::plural::count(changes.len() - limit, "older change")
         ));
     }
-    for e in errors {
-        out.push_str(&format!("Could not read {e}\n"));
-    }
     out
+}
+
+/// A time as agents read it: when exactly, and how long ago.
+pub fn when(t: jiff::Timestamp) -> String {
+    format!("{} ({} ago)", t.strftime("%Y-%m-%d %H:%M:%SZ"), k8s::age(t))
 }
 
 #[cfg(test)]
