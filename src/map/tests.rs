@@ -339,7 +339,6 @@ fn a_listed_object_keeps_what_the_rules_read() {
     assert_eq!(kept.pointer("/secrets/0/name"), Some(&json!("token")));
     assert_eq!(kept.pointer("/metadata/ownerReferences/0/uid"), Some(&json!("o1")));
     assert!(kept.pointer("/metadata/managedFields").is_none() && kept.get("status").is_none());
-    let secret = json!({ "metadata": { "namespace": "shop", "name": "web-tls" } });
     let lists = Lists::default().with("", "ServiceAccount", vec![kept]);
     assert_eq!(
         names(
@@ -353,5 +352,4 @@ fn a_listed_object_keeps_what_the_rules_read() {
         ),
         ["ServiceAccount puller"]
     );
-    let _ = secret;
 }
