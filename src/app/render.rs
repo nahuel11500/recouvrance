@@ -415,6 +415,7 @@ impl AppView {
             Route::Contexts => self.render_contexts(cx).into_any_element(),
             Route::Settings => self.settings_view.clone().into_any_element(),
             Route::Apply(a) => a.clone().into_any_element(),
+            Route::Logs(l) => l.clone().into_any_element(),
             Route::Terminal(t) => div().size_full().p_2().child(t.clone()).into_any_element(),
             Route::Agents => self.agents.clone().into_any_element(),
         }
@@ -463,7 +464,7 @@ impl AppView {
                 }
             }))
             .on_action(cx.listener(|this, _: &EscapeBack, _, cx| {
-                if matches!(this.route(), Route::Detail(_) | Route::HelmRelease(_)) {
+                if matches!(this.route(), Route::Detail(_) | Route::HelmRelease(_) | Route::Logs(_)) {
                     this.go(-1, cx);
                 }
             }))

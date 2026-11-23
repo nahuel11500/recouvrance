@@ -511,6 +511,45 @@ pub(crate) fn same_reads(
         })
 }
 
+/// Where a stream of a view of pods from several places reads: its context, namespace, pod
+/// and the container read (None when the API server picks it).
+pub(crate) struct Source<'a> {
+    pub(crate) context: &'a str,
+    pub(crate) namespace: &'a str,
+    pub(crate) pod: &'a str,
+    pub(crate) container: Option<&'a str>,
+}
+
+/// What each line says it comes from, in a view of pods from several places: the context
+/// when they are on several (`prod: `), the namespace when they are in several, then the pod
+/// and the container read: `prod: shop/web-1/app`. Two pods of the same name on two clusters
+/// never read the same.
+pub(crate) fn source_tags(sources: &[Source<'_>]) -> Vec<String> {
+    let first = sources.first();
+    let contexts = sources.iter().any(|s| first.is_some_and(|f| f.context != s.context));
+    let namespaces = sources.iter().any(|s| first.is_some_and(|f| f.namespace != s.namespace));
+    sources
+        .iter()
+        .map(|s| {
+            let mut tag = String::new();
+            if contexts {
+                tag.push_str(s.context);
+                tag.push_str(": ");
+            }
+            if namespaces {
+                tag.push_str(s.namespace);
+                tag.push('/');
+            }
+            tag.push_str(s.pod);
+            if let Some(c) = s.container {
+                tag.push('/');
+                tag.push_str(c);
+            }
+            tag
+        })
+        .collect()
+}
+
 /// Where one pod's stream is.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum StreamState {
@@ -795,7 +834,47 @@ mod tests {
         );
     }
 
+    #[test]
+    fn lines_say_where_they_come_from() {
+        let src = |context, namespace, pod, container| Source { context, namespace, pod, container };
+        // One cluster, one namespace: the pod and its container.
+        let one = [src("prod", "shop", "web-1", Some("app")), src("prod", "shop", "api-2", None)];
+        assert_eq!(source_tags(&one), ["web-1/app", "api-2"]);
+        // Several namespaces: each says its own.
+        let ns = [src("prod", "shop", "web-1", Some("app")), src("prod", "ingress", "nginx-1", Some("controller"))];
+        assert_eq!(source_tags(&ns), ["shop/web-1/app", "ingress/nginx-1/controller"]);
+        // The same app in two regions: the context tells them apart.
+        let two = [src("eu", "shop", "web-1", Some("app")), src("us", "shop", "web-1", Some("app"))];
+        assert_eq!(source_tags(&two), ["eu: web-1/app", "us: web-1/app"]);
+        assert!(source_tags(&[]).is_empty());
+    }
+
     proptest::proptest! {
+        /// Pods that are not the same (by context, namespace and name) never carry the same
+        /// tag, whatever the context names: lines from two clusters are never mixed up.
+        #[test]
+        fn pods_in_different_places_have_different_tags(
+            pods in proptest::collection::vec(
+                (".{0,6}", "[a-z0-9-]{1,4}", "[a-z0-9-]{1,4}", proptest::option::of("[a-z0-9-]{1,3}")),
+                1..12,
+            )
+        ) {
+            let sources: Vec<Source<'_>> = pods
+                .iter()
+                .map(|(c, n, p, k)| Source { context: c, namespace: n, pod: p, container: k.as_deref() })
+                .collect();
+            let tags = source_tags(&sources);
+            proptest::prop_assert_eq!(tags.len(), pods.len());
+            for i in 0..pods.len() {
+                for j in 0..i {
+                    let (a, b) = (&pods[i], &pods[j]);
+                    if (&a.0, &a.1, &a.2) != (&b.0, &b.1, &b.2) {
+                        proptest::prop_assert_ne!(&tags[i], &tags[j]);
+                    }
+                }
+            }
+        }
+
         /// Taking the ready messages together changes nothing a pod shows: its lines stay in
         /// order and whole, and its state is its last message's.
         #[test]

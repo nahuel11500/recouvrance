@@ -65,6 +65,10 @@ impl AppView {
         if kind.ar.group == "apps" && matches!(kind.ar.kind.as_str(), "Deployment" | "StatefulSet" | "DaemonSet") {
             actions.push("restart");
         }
+        // The checked rows' logs, read together.
+        if k8s::has_pod_logs(&kind) {
+            actions.push("logs");
+        }
         // Event rows open the object they are about: no write actions on them.
         if !kind.is("", "Event") {
             actions.push("delete");

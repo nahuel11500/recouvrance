@@ -91,8 +91,10 @@ impl AppView {
             }
             cx.notify();
         });
-        if let Some(a) = bulk {
-            self.bulk_action(a, window, cx);
+        match bulk {
+            Some("Logs") => self.open_checked_logs(window, cx),
+            Some(a) => self.bulk_action(a, window, cx),
+            None => {}
         }
     }
 

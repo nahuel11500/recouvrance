@@ -76,6 +76,8 @@ enum Route {
     Settings,
     Terminal(Entity<crate::ui::terminal::TerminalView>),
     Apply(Entity<crate::ui::apply_view::ApplyView>),
+    /// The logs of the checked rows.
+    Logs(Entity<crate::details::LogsPage>),
     Agents,
 }
 
@@ -104,6 +106,7 @@ impl Route {
             Self::Argo(e) => Some(e.entity_id()),
             Self::Terminal(e) => Some(e.entity_id()),
             Self::Apply(e) => Some(e.entity_id()),
+            Self::Logs(e) => Some(e.entity_id()),
             Self::Resources(_) | Self::Contexts | Self::Settings | Self::Agents => None,
         }
     }
