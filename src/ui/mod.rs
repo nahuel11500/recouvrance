@@ -26,6 +26,7 @@ pub mod settings_view;
 pub mod terminal;
 pub mod timeline_view;
 pub mod upgrade_view;
+pub mod whats_new;
 
 use std::sync::{Arc, LazyLock};
 

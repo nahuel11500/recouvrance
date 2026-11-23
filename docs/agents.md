@@ -16,7 +16,8 @@ with the reason the API gives, and the question is dropped from the conversation
 
 While the app runs, it serves MCP on `http://127.0.0.1:47070/mcp` (`recouvrance serve` runs it
 without the window; there nobody can approve, so a call an *Ask me* rule covers is refused at once
-with "needs approval in the Recouvrance window": run the app, or add an Allow rule). A list where
+with "needs approval in the Recouvrance window": run the app, or add the request under `approved` in
+rules.yaml, since an Allow rule doesn't win over an Ask rule). A list where
 some rows ask and others are allowed (some namespaces, or some names) is not refused: when it is not
 approved (or cannot be), it shows only the allowed rows, and a rejection is still logged. Approving
 it shows the rows of every Ask rule the list meets (`find_problems` asks to list pods: approving
@@ -59,6 +60,18 @@ effect means Deny, and a missing list means `*` in a Deny or Ask, none in an All
 every object (kind, namespace/name) and the YAML that will be applied, a Secret's values masked; the
 activity log keeps each object with a hash of that YAML, and the objects already applied when a call
 is cut off.
+Before asking, Recouvrance works out what the call will change, and the banner shows it under the
+request: for `scale`, the replicas now and after; for `patch_resource`, `set_image` and
+`apply_manifest`, each field that changes with its value now and after, then the diff, from a
+server-side dry run of the same request (it changes nothing; a dry run the server refuses is said,
+and so is a field another manager owns, on which `apply_manifest` fails); for a `gitops` `sync`, the
+revision deployed and the one it moves to, auto-sync, what is out of sync, and what is no longer in
+git (left in place: the sync Recouvrance starts doesn't prune); for `delete_resource`, what goes with
+the object (a Deployment's ReplicaSets and pods, everything in a namespace, every object of a CRD's
+kind; a Job's pods stay). A Secret's values never show, only which changed. It takes 5 seconds at
+most: past that, or when it fails, the banner says the preview isn't available, and the request is
+asked all the same. Calls an Allow rule lets through are not worked out. The activity log keeps what
+the banner showed with the call.
 The *Always allow this* and *Allow for 1h* offers are left out where no rule can be that narrow:
 exec (a rule cannot pin the command), patches and GitOps actions (nor the patch), scale (nor the
 replica count), `apply_manifest` (nor the content), requests other than lists with no object name
@@ -81,9 +94,20 @@ place, and switching agent access off, disabling the agent or taking away its dr
 evictions that remain (the node stays cordoned). Its reply counts every pod it could not evict but
 names only those an Allow rule lets the agent list.
 
+A refusal tells the agent what it can do about it. One a Deny rule decided (or a context a Deny of
+everything covers) is *final*: no rule added undoes it, so the agent shouldn't retry. One no rule
+covers is *grantable*: the refusal gives the narrowest rule that would allow the call, as rules.yaml
+writes it (`restart deployments.apps/web -n team-a --context staging`), to add under allow or ask.
+Agent access switched off and a disabled agent are final too: only you change them. The activity
+log keeps the reason alone. `check_access` answers the same without making the calls: for each
+request an agent plans (context, verb, kind, namespace, name, up to 20), allowed, needs approval or
+denied, with the rule that decides and what you could grant. It reads only the context's resource
+types (discovery), and only on a context the rules name, so an agent can say up front which calls
+will wait for you.
+
 Tools, by what they do:
 
-- **Read:** `my_permissions`, `list_contexts`, `list_resource_types`, `list_resources`, `get_resource`,
+- **Read:** `my_permissions`, `check_access`, `list_contexts`, `list_resource_types`, `list_resources`, `get_resource`,
   `describe_resource`, `search`, `get_events`, `find_problems`, `check_certificates`, `check_reachability`, `top_pods`,
   `top_nodes`, `usage_history`, `get_logs`, `workload_logs`, `get_changes`, `recent_changes`,
   `rollout_history`, `rollout_status`, `list_helm_releases`, `helm_history`, `helm_get_values`,

@@ -223,7 +223,11 @@ pub fn open_main_window(cx: &mut App) -> Option<Entity<AppView>> {
         ..TitleBar::window_options()
     };
     match open_window(options, cx, |window, cx| cx.new(|cx| AppView::new(window, cx))) {
-        Ok((_, view)) => Some(view),
+        Ok((window, view)) => {
+            // After an update, its release notes, once: the next window finds them seen.
+            crate::ui::whats_new::show_once(window, cx);
+            Some(view)
+        }
         Err(e) => {
             eprintln!("could not open a window: {e:#}");
             None
@@ -760,7 +764,12 @@ impl AppView {
         match ev {
             HubEvent::ApprovalRequested(a) => {
                 self.approvals.push(a.clone());
-                notify_desktop(&format!("{} asks to run {}", a.agent, a.tool), &a.summary);
+                // The request, then what it will change (the notification keeps the first lines).
+                let body = match &a.preview {
+                    Some(p) => format!("{}\n{}", a.summary, p.text()),
+                    None => a.summary.clone(),
+                };
+                notify_desktop(&format!("{} asks to run {}", a.agent, a.tool), &body);
             }
             HubEvent::ApprovalResolved(id) => self.approvals.retain(|a| a.id != *id),
             HubEvent::ServerStatus(status) => {
