@@ -1601,8 +1601,8 @@ mod tests {
             assert!(tools.iter().any(|t| t.name == tool), "{tool} is a tool");
             assert!(call_writes(tool, &json!({"dry_run": null})), "{tool}");
         }
-        // A dry run changes nothing.
-        assert_eq!(dry_run_tools().len(), 13, "{:?}", dry_run_tools());
+        // A dry run changes nothing (`gitops`'s is Argo CD's own: nothing is applied).
+        assert_eq!(dry_run_tools().len(), 14, "{:?}", dry_run_tools());
         for tool in dry_run_tools() {
             assert!(!call_writes(tool, &json!({"dry_run": true})), "{tool}");
         }
