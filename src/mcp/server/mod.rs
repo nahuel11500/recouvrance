@@ -617,6 +617,7 @@ impl KubeMcp {
                 preview: call.preview.clone(),
                 access: access.clone(),
                 dry_run: call.args.get("dry_run").and_then(serde_json::Value::as_bool).unwrap_or(false),
+                deadline: Instant::now(),
             };
             let answer = self.hub.request_approval(request, call.gone.wait()).await;
             // Access may have been switched off, or the rules changed, while the request waited.
@@ -706,6 +707,10 @@ impl KubeMcp {
     async fn find_kind(&self, context: &str, query: &str) -> anyhow::Result<(kube::Client, Kind)> {
         let (client, kinds) = self.hub.client(context).await?;
         if let Some(kind) = k8s::find_kind(&kinds, query).cloned() {
+            return Ok((client, kind));
+        }
+        // A CRD an agent just applied is looked up in its own group at once.
+        if let Some(kind) = self.hub.new_kind_named(context, query).await {
             return Ok((client, kind));
         }
         // Maybe a CRD installed since the first call.
