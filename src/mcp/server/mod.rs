@@ -17,14 +17,14 @@ use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolRequestParams, CallToolResponse, PromptMessage, Role, Tool};
 use rmcp::model::{ServerCapabilities, ServerConfig};
 
-use rmcp::transport::streamable_http_server::{
-    StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
-};
+use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
 use rmcp::{ServerHandler, prompt, prompt_handler, prompt_router, schemars, tool_handler};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use super::preview::{self, Plan};
-use super::{Access, Agent, Answer, Approval, AuditEntry, Decision, Hub, HubEvent, Mode, Policy, Preview, Verb};
+use super::{
+    Access, Agent, Answer, Approval, AuditEntry, Decision, Hub, HubEvent, Mode, Policy, Preview, Verb, rules_file,
+};
 use crate::k8s::{self, Kind, TaskGuard};
 
 pub(crate) use gone::Gone;
@@ -42,6 +42,7 @@ mod node_tools;
 mod ops_tools;
 mod read_tools;
 mod rollout_tools;
+mod sessions;
 mod write_tools;
 
 /// Set by the auth middleware for every authenticated request.
@@ -85,13 +86,7 @@ impl Call {
     }
 
     fn rule_label(&self, rule: Option<usize>) -> String {
-        match rule {
-            Some(i) => {
-                let note = self.policy().rules.get(i).map_or_default(|r| r.note.clone());
-                if note.is_empty() { format!("rule #{}", i + 1) } else { format!("rule #{} ({note})", i + 1) }
-            }
-            None => "no matching rule".into(),
-        }
+        rule_label(self.policy(), rule)
     }
 
     /// Remember the rule that allowed the call.
@@ -116,9 +111,19 @@ impl Call {
     }
 
     fn deny(&self, reason: impl Into<String>) -> String {
+        self.deny_hinted(reason, "")
+    }
+
+    /// [`deny`](Self::deny), followed by what the agent can do about it: told to the agent,
+    /// while the activity log keeps the reason alone.
+    fn deny_hinted(&self, reason: impl Into<String>, hint: &str) -> String {
         let reason = reason.into();
         self.record(Decision::Denied, reason.clone(), 0);
-        format!("Denied by Recouvrance policy: {reason}")
+        if hint.is_empty() {
+            format!("Denied by Recouvrance policy: {reason}")
+        } else {
+            format!("Denied by Recouvrance policy: {reason}. {hint}")
+        }
     }
 
     /// Log a failed call (bad arguments) and return its message.
@@ -184,6 +189,101 @@ fn describe(a: &Access) -> String {
     }
     s.push_str(&format!(" --context {}", a.context));
     s
+}
+
+/// A rule as the agent sees it named: `rule #3 (Never prod)`, or `no matching rule`.
+fn rule_label(policy: &Policy, rule: Option<usize>) -> String {
+    match rule {
+        Some(i) => {
+            let note = policy.rules.get(i).map_or_default(|r| r.note.clone());
+            if note.is_empty() { format!("rule #{}", i + 1) } else { format!("rule #{} ({note})", i + 1) }
+        }
+        None => "no matching rule".into(),
+    }
+}
+
+/// Where the user changes an agent's rules.
+const RULES_ARE_SET: &str = "in Recouvrance (Agents page, or rules.yaml)";
+
+/// Said after a refusal that comes from a state the user set (agent access off, the agent
+/// disabled): no call of the agent's changes it.
+const USER_STATE: &str = "Final: only the user can change this; don't retry until they do.";
+
+/// Said after a refusal a Deny rule decided.
+const DENIED_BY_RULE: &str =
+    "Final: a Deny rule decided; don't retry or work around it, and tell the user if the task needs it.";
+
+/// What an agent can do about a request the rules deny, so it neither retries nor gives up
+/// without telling the user what to grant. Final when a Deny rule decided: no rule the user
+/// adds undoes it. Grantable when no rule covers the request, with the narrowest rule that
+/// would allow it, in rules.yaml's words.
+fn deny_hint(access: &Access, rule: Option<usize>) -> String {
+    if rule.is_some() {
+        return DENIED_BY_RULE.into();
+    }
+    let example = rules_file::rule_for(access)
+        .map_or_default(|r| format!(", e.g. `{r}` under allow (or ask, to approve each call)"));
+    format!("Grantable: no rule allows this; the user can add one {RULES_ARE_SET}{example}.")
+}
+
+/// What an agent can do about a request an Ask rule covers while nobody can approve it
+/// (`recouvrance serve`). An Allow rule doesn't win over the Ask rule; an approved one does.
+fn approval_hint(access: &Access) -> String {
+    let approved = rules_file::rule_for(access).map_or_default(|r| {
+        format!(", or add `{r}` under approved in rules.yaml (an Allow rule doesn't win over the Ask rule)")
+    });
+    format!("Grantable: the user can open the Recouvrance window and approve it when you call again{approved}.")
+}
+
+/// What a call making this request would get, as `check_access` says it: allowed, waiting
+/// for the user, or denied, with the rule that decides and what the user could grant. The
+/// same decision as the call's (`authorize_inner`): across every namespace for a namespaced
+/// kind with none given, and a list an Ask rule covers shows the rows an Allow rule gives
+/// when it isn't approved.
+fn access_verdict(policy: &Policy, access: &Access, any_namespace: bool, headless: bool) -> (Mode, String) {
+    let v = if any_namespace { policy.decide_any_namespace(access) } else { policy.decide(access) };
+    let label = rule_label(policy, v.rule);
+    let text = match v.mode {
+        Mode::Allow => format!("allowed by {label}"),
+        Mode::Deny if v.rule.is_some() => format!("denied by {label}. {}", deny_hint(access, v.rule)),
+        Mode::Deny => format!("denied. {}", deny_hint(access, None)),
+        Mode::Ask => {
+            let rows = if access.verb == Verb::List { policy.allow_somewhere(access) } else { None };
+            let rows = rows.map(|r| rule_label(policy, Some(r)));
+            match (headless, rows) {
+                (false, None) => {
+                    format!(
+                        "needs the user's approval ({label}): the call waits for their answer in the Recouvrance window"
+                    )
+                }
+                (false, Some(rows)) => format!(
+                    "needs the user's approval ({label}) for every row: unapproved, the list shows only the rows {rows} allows"
+                ),
+                (true, None) => format!(
+                    "refused for now: it needs approval ({label}) and the Recouvrance window isn't open. {}",
+                    approval_hint(access)
+                ),
+                (true, Some(rows)) => format!(
+                    "allowed in part: the Recouvrance window isn't open to approve {label}, so the list shows only the rows {rows} allows"
+                ),
+            }
+        }
+    };
+    (v.mode, text)
+}
+
+/// Why a call to a context the rules don't open is refused, and what the agent can do.
+fn context_refusal(policy: &Policy, context: &str) -> (String, String) {
+    let reason = format!("context {context:?} is not allowed for this agent");
+    match policy.context_denied_by(context) {
+        Some(i) => {
+            (format!("{reason} ({} denies everything there)", rule_label(policy, Some(i))), DENIED_BY_RULE.into())
+        }
+        None => (
+            format!("{reason} (no Allow or Ask rule names it)"),
+            format!("Grantable: the user can add a rule with `--context {context}` {RULES_ARE_SET}."),
+        ),
+    }
 }
 
 /// Arguments that change what a call does, for the approval banner: what the user
@@ -410,7 +510,8 @@ impl KubeMcp {
         if let Some(ctx) = context
             && !call.policy().context_allowed(&ctx)
         {
-            return Err(call.deny(format!("context {ctx:?} is not allowed for this agent")));
+            let (reason, hint) = context_refusal(call.policy(), &ctx);
+            return Err(call.deny_hinted(reason, &hint));
         }
         Ok(call)
     }
@@ -419,7 +520,7 @@ impl KubeMcp {
     /// when a call starts, after waiting for approval, and before each change.
     fn ensure_active(&self, call: &Call) -> Result<(), String> {
         match self.inactive(call) {
-            Some(reason) => Err(call.deny(reason)),
+            Some(reason) => Err(call.deny_hinted(reason, USER_STATE)),
             None => Ok(()),
         }
     }
@@ -464,7 +565,10 @@ impl KubeMcp {
                     return Ok(());
                 }
                 Mode::Deny => {
-                    return Err(call.deny(format!("{} — {}", describe(access), call.rule_label(verdict.rule))));
+                    return Err(call.deny_hinted(
+                        format!("{} — {}", describe(access), call.rule_label(verdict.rule)),
+                        &deny_hint(access, verdict.rule),
+                    ));
                 }
                 Mode::Ask => {}
             }
@@ -473,11 +577,14 @@ impl KubeMcp {
                     call.allowed_by(Some(rule));
                     return Ok(());
                 }
-                return Err(call.deny(format!(
-                    "{} needs approval in the Recouvrance window ({}); run the app, or add an Allow rule",
-                    describe(access),
-                    call.rule_label(verdict.rule)
-                )));
+                return Err(call.deny_hinted(
+                    format!(
+                        "{} needs approval in the Recouvrance window ({}), which isn't open",
+                        describe(access),
+                        call.rule_label(verdict.rule)
+                    ),
+                    &approval_hint(access),
+                ));
             }
             // What the call will change, worked out once, before its first approval
             // (`apply_manifest` asks for each object): allowed calls never get here and pay
@@ -515,7 +622,10 @@ impl KubeMcp {
                 self.ensure_active(call)?;
                 let now = decide(call);
                 if now.mode == Mode::Deny {
-                    return Err(call.deny(format!("{} — {}", describe(access), call.rule_label(now.rule))));
+                    return Err(call.deny_hinted(
+                        format!("{} — {}", describe(access), call.rule_label(now.rule)),
+                        &deny_hint(access, now.rule),
+                    ));
                 }
                 call.approved = true;
                 call.allowed_by(now.rule);
@@ -530,7 +640,7 @@ impl KubeMcp {
                 self.ensure_active(call)
             } else {
                 call.record(Decision::Rejected, answer.reason().into(), 0);
-                Err(format!("Rejected: {}", answer.reason()))
+                Err(format!("Rejected: {}.{}", answer.reason(), rejected_hint(answer)))
             };
         }
     }
@@ -549,8 +659,22 @@ impl KubeMcp {
     /// approved request stays approved while an Ask rule still covers it.
     fn recheck(&self, call: &mut Call, access: &Access) -> Result<(), String> {
         match self.stale_reason(call, access) {
-            Some(reason) => Err(call.deny(reason)),
+            Some(reason) => Err(call.deny_hinted(reason, &self.stale_hint(call, access))),
             None => Ok(()),
+        }
+    }
+
+    /// What the agent can do about a change [`stale_reason`](Self::stale_reason) stopped,
+    /// on the rules as they are now.
+    fn stale_hint(&self, call: &Call, access: &Access) -> String {
+        if self.inactive(call).is_some() {
+            return USER_STATE.into();
+        }
+        let v = call.policy().decide(access);
+        match v.mode {
+            Mode::Deny => deny_hint(access, v.rule),
+            Mode::Ask => "An Ask rule covers it now: call again to ask the user.".into(),
+            Mode::Allow => "Call again.".into(),
         }
     }
 
@@ -572,18 +696,29 @@ impl KubeMcp {
     }
 
     async fn kind(&self, call: &Call, context: &str, query: &str) -> Result<(kube::Client, Kind), String> {
-        let (client, kinds) = match self.hub.client(context).await {
-            Ok(c) => c,
-            Err(e) => return Err(call.finish(Err(e)).unwrap_err()),
-        };
+        self.find_kind(context, query).await.map_err(|e| call.finish(Err(e)).unwrap_err())
+    }
+
+    /// The kind a query names in a context, from its discovery, with the context's client.
+    async fn find_kind(&self, context: &str, query: &str) -> anyhow::Result<(kube::Client, Kind)> {
+        let (client, kinds) = self.hub.client(context).await?;
         if let Some(kind) = k8s::find_kind(&kinds, query).cloned() {
             return Ok((client, kind));
         }
         // Maybe a CRD installed since the first call.
         match self.hub.rediscover(context).await.and_then(|kinds| k8s::find_kind(&kinds, query).cloned()) {
             Some(kind) => Ok((client, kind)),
-            None => Err(call.finish(Err(anyhow::anyhow!("unknown resource type {query:?}"))).unwrap_err()),
+            None => Err(anyhow::anyhow!("unknown resource type {query:?}")),
         }
+    }
+}
+
+/// What the agent can do once the user's answer didn't let a call go ahead.
+fn rejected_hint(answer: Answer) -> &'static str {
+    match answer {
+        Answer::Rejected => " The user said no: don't retry unless they ask you to.",
+        Answer::TimedOut => " Call again when the user can answer.",
+        Answer::Approved | Answer::SwitchedOff | Answer::Abandoned => "",
     }
 }
 
@@ -663,6 +798,29 @@ pub struct ObjectParams {
     pub name: String,
     #[schemars(description = "required for namespaced resources")]
     pub namespace: Option<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct CheckAccessParams {
+    #[schemars(description = "the calls you plan, at most 20")]
+    pub requests: Vec<PlannedRequest>,
+}
+
+/// One call an agent plans, as its rules see it.
+#[derive(Deserialize, Serialize, schemars::JsonSchema)]
+pub struct PlannedRequest {
+    #[schemars(description = "kubeconfig context name, from list_contexts")]
+    pub context: String,
+    #[schemars(
+        description = "the rules' verb: get, list, logs, reveal, exec, scale, restart, patch, apply, delete, drain or forward"
+    )]
+    pub verb: String,
+    #[schemars(description = "resource type like kubectl: pods, deploy, certificates.cert-manager.io")]
+    pub kind: String,
+    #[schemars(description = "namespace; omit for a cluster-scoped kind, or for every namespace")]
+    pub namespace: Option<String>,
+    #[schemars(description = "object name; omit for a list")]
+    pub name: Option<String>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -962,6 +1120,8 @@ impl ServerHandler for KubeMcp {
             "Access to the user's Kubernetes clusters through Recouvrance. Start with my_permissions and list_contexts. \
              Every call is checked against rules the user set for you (by context, verb, resource, \
              namespace and name) and shown to them; some calls wait for their approval. \
+             Before a task of several calls, check_access tells which need approval or a rule the user must add. \
+             A refusal says whether it is final (a Deny rule) or what the user could grant. \
              Prefer dry_run for writes first, and explain what you are about to change.",
         )
     }
@@ -1145,7 +1305,7 @@ pub fn start(hub: Arc<Hub>) -> TaskGuard {
             let hub = hub.clone();
             StreamableHttpService::new(
                 move || Ok(KubeMcp::new(hub.clone())),
-                Arc::new(LocalSessionManager::default()),
+                Arc::new(sessions::Sessions::new(sessions::IDLE)),
                 StreamableHttpServerConfig::default(),
             )
         };
@@ -1345,6 +1505,72 @@ mod tests {
         // So does a removed Allow.
         let p = Policy { rules: vec![], ..Policy::default() };
         assert_eq!(stopped_by(&p, &a, false), Some(None));
+    }
+
+    /// A refusal tells a Deny rule (final) from a missing rule (grantable, with the rule that
+    /// would allow the call), and `check_access` says what the call would get.
+    #[test]
+    fn a_refusal_says_whether_the_user_could_allow_it() {
+        use crate::mcp::Rule;
+        let deploys = kind("apps", "v1", "Deployment", "deployments", true);
+        let read = Rule { contexts: vec!["*".into()], ..Rule::default() };
+        let never_prod = Rule {
+            effect: Mode::Deny,
+            verbs: vec!["*".into()],
+            contexts: vec!["prod".into()],
+            note: "Never prod".into(),
+            ..Rule::default()
+        };
+        let ask =
+            Rule { effect: Mode::Ask, verbs: vec!["scale".into()], contexts: vec!["*".into()], ..Rule::default() };
+        let policy = Policy { rules: vec![read, never_prod, ask], ..Policy::default() };
+        let web = |ctx: &str, verb| access_for(&deploys, ctx, verb, Some("team-a".into()), Some("web".into()));
+
+        let (mode, text) = access_verdict(&policy, &web("prod", Verb::Restart), false, false);
+        assert_eq!(mode, Mode::Deny);
+        assert_eq!(text, format!("denied by rule #2 (Never prod). {DENIED_BY_RULE}"));
+        let (mode, text) = access_verdict(&policy, &web("staging", Verb::Restart), false, false);
+        assert_eq!(mode, Mode::Deny);
+        assert!(text.starts_with("denied. Grantable: no rule allows this"), "{text}");
+        assert!(text.contains("`restart deployments.apps/web -n team-a --context staging` under allow"), "{text}");
+
+        let allowed = access_verdict(&policy, &web("staging", Verb::Get), false, false);
+        assert_eq!(allowed, (Mode::Allow, "allowed by rule #1".to_string()));
+        let (mode, text) = access_verdict(&policy, &web("staging", Verb::Scale), false, false);
+        assert_eq!(mode, Mode::Ask);
+        assert!(text.starts_with("needs the user's approval (rule #3)"), "{text}");
+        // Nobody can approve without the window, and an Allow rule doesn't win over the Ask
+        // rule: the rule offered is an approved one.
+        let (_, text) = access_verdict(&policy, &web("staging", Verb::Scale), false, true);
+        assert!(text.contains("`scale deployments.apps/web -n team-a --context staging` under approved"), "{text}");
+
+        // A list across namespaces that asks in some and is allowed in others still shows
+        // the allowed rows when nobody can approve, as the call does.
+        let list = |effect, ns: &str| Rule {
+            effect,
+            verbs: vec!["list".into()],
+            namespaces: vec![ns.into()],
+            contexts: vec!["*".into()],
+            ..Rule::default()
+        };
+        let lists = Policy { rules: vec![list(Mode::Allow, "team-a"), list(Mode::Ask, "team-b")], ..Policy::default() };
+        let all = access_for(&deploys, "c", Verb::List, None, None);
+        let (mode, text) = access_verdict(&lists, &all, true, true);
+        assert_eq!(mode, Mode::Ask);
+        assert!(text.starts_with("allowed in part:") && text.contains("only the rows rule #1 allows"), "{text}");
+
+        // A context no rule names can be granted; one a Deny of everything covers can't.
+        let scoped = Policy {
+            rules: vec![
+                Rule { contexts: vec!["staging".into()], ..Rule::default() },
+                Rule { effect: Mode::Deny, verbs: vec!["*".into()], contexts: vec!["prod".into()], ..Rule::default() },
+            ],
+            ..Policy::default()
+        };
+        assert_eq!(context_refusal(&scoped, "prod").1, DENIED_BY_RULE);
+        let (reason, hint) = context_refusal(&scoped, "dev");
+        assert!(reason.contains("no Allow or Ask rule names it"), "{reason}");
+        assert!(hint.starts_with("Grantable") && hint.contains("`--context dev`"), "{hint}");
     }
 
     #[test]

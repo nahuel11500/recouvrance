@@ -7,8 +7,9 @@ use rmcp::{tool, tool_router};
 use serde_json::json;
 
 use super::{
-    ApplyParams, DeleteParams, DrainParams, ExecParams, GitOpsParams, KubeMcp, PatchParams, RestartParams, ScaleParams,
-    access_for, denied_namespaces, denies_eviction, manifest_objects, manifest_summary, require_ns,
+    ApplyParams, DENIED_BY_RULE, DeleteParams, DrainParams, ExecParams, GitOpsParams, KubeMcp, PatchParams,
+    RestartParams, ScaleParams, access_for, denied_namespaces, denies_eviction, manifest_objects, manifest_summary,
+    require_ns,
 };
 use std::sync::Arc;
 
@@ -149,7 +150,7 @@ impl KubeMcp {
                 // The log says what was applied before.
                 let detail =
                     if out.is_empty() { reason } else { format!("{reason}; applied before: {}", out.join("; ")) };
-                out.push(call.deny(detail));
+                out.push(call.deny_hinted(detail, &self.stale_hint(&call, &access)));
                 return Err(out.join("\n"));
             }
             match k8s::apply(client.clone(), kind, ns, doc, dry).await {
@@ -198,11 +199,14 @@ impl KubeMcp {
             denies_eviction(call.policy(), &a)
         });
         if !denied.is_empty() {
-            return Err(call.deny(format!(
-                "node {} runs pods in namespaces your rules deny (delete pods): {}; nothing was changed",
-                p.node,
-                denied.join(", ")
-            )));
+            return Err(call.deny_hinted(
+                format!(
+                    "node {} runs pods in namespaces your rules deny (delete pods): {}; nothing was changed",
+                    p.node,
+                    denied.join(", ")
+                ),
+                DENIED_BY_RULE,
+            ));
         }
         self.recheck(&mut call, &access)?;
         let stop = self.still_allowed(&call, &access);
@@ -399,9 +403,7 @@ impl KubeMcp {
         for doc in docs {
             let api_version = doc["apiVersion"].as_str().unwrap_or_default().to_string();
             let kind_name = doc["kind"].as_str().unwrap_or_default().to_string();
-            let find = |kinds: &[Kind]| {
-                kinds.iter().find(|k| k.ar.api_version == api_version && k.ar.kind == kind_name).cloned()
-            };
+            let find = |kinds: &[Kind]| k8s::manifest_kind(kinds, &api_version, &kind_name).cloned();
             let mut kind = find(&kinds);
             if kind.is_none()
                 && let Some(fresh) = self.hub.rediscover(context).await

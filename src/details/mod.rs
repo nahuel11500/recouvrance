@@ -30,7 +30,7 @@ mod related;
 mod tabs;
 
 pub(crate) use actions::*;
-pub(crate) use argo::{ArgoAction, OpenNamespace, OpenOnContext, confirm_argo_action};
+pub(crate) use argo::{ArgoAction, OpenOn, OpenOnContext, confirm_argo_action};
 use browser::FileBrowser;
 pub(crate) use compare::diff_block;
 pub(crate) use guard::*;
@@ -177,6 +177,8 @@ pub struct DetailPanel {
     argo_load: crate::latest::Latest,
     /// A CRD's spec fields, worked out when it is loaded rather than on every frame.
     schema_rows: Vec<crate::overview::SchemaRow>,
+    /// An Application's resources table, worked out when it is read rather than on every frame.
+    argo_resources: crate::overview::ArgoResources,
     /// Inline editor of a ConfigMap's or Secret's values.
     data_editor: Option<Entity<crate::ui::data_edit::DataEditor>>,
     /// Show metadata.managedFields in the YAML (hidden by default).
@@ -290,6 +292,7 @@ impl DetailPanel {
             argo_started: None,
             argo_load: Default::default(),
             schema_rows: Vec::new(),
+            argo_resources: Default::default(),
             data_editor: None,
             show_managed: false,
             field_docs: None,
@@ -909,6 +912,9 @@ impl DetailPanel {
         if self.obj.kind.is("apiextensions.k8s.io", "CustomResourceDefinition") {
             self.schema_rows = crate::overview::crd_rows(&value);
         }
+        if self.obj.kind.is("argoproj.io", "Application") {
+            self.argo_resources.set(&value);
+        }
         // Re-created under the same name (a StatefulSet's pod, say), or opened by name:
         // the events and logs shown are this object's. Logs follow the pod by name, so they
         // restart only for a re-created one, not on a page's first read.
@@ -973,6 +979,7 @@ impl DetailPanel {
             schema_rows: &self.schema_rows,
             pod_order: self.pod_order,
             argo: &self.argo,
+            argo_resources: &self.argo_resources,
         }
     }
 

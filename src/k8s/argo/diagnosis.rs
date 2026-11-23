@@ -63,13 +63,25 @@ pub struct Res {
 }
 
 impl Res {
-    fn of(v: &Value) -> Option<Self> {
+    /// An entry of `status.resources` (or of a sync's result); None without a kind or a name.
+    pub(crate) fn of(v: &Value) -> Option<Self> {
         let s = |k: &str| v.get(k).and_then(Value::as_str).unwrap_or_default().to_string();
         let (kind, name) = (s("kind"), s("name"));
         if kind.is_empty() || name.is_empty() {
             return None;
         }
         Some(Self { group: s("group"), kind, namespace: s("namespace"), name, version: s("version") })
+    }
+
+    /// The namespace `name`: where an Application deploys.
+    pub fn namespace(name: &str) -> Self {
+        Self { kind: "Namespace".into(), name: name.to_string(), version: "v1".into(), ..Default::default() }
+    }
+
+    /// The object, read as `kind`: in its namespace only when the kind has namespaces.
+    pub fn object(&self, kind: Kind) -> ObjectRef {
+        let namespace = kind.namespaced.then(|| self.namespace.clone()).filter(|ns| !ns.is_empty());
+        ObjectRef { kind, name: self.name.clone(), namespace, uid: String::new() }
     }
 
     /// `Deployment shop/web`, `ClusterRole reader`.
@@ -277,9 +289,7 @@ impl Diagnosis {
     /// for [`Diagnosis::to_compare`]): whether an object is there is the live read's word
     /// over Argo CD's status.
     pub fn of_live(app: &Value, now: Timestamp, live: &[Drift]) -> Self {
-        let automated = app
-            .pointer("/spec/syncPolicy/automated")
-            .is_some_and(|a| a.is_object() && a.get("enabled").and_then(Value::as_bool) != Some(false));
+        let automated = super::auto_sync(app);
         let mut d = Self { since: last_sync(app), moved: moved(app), ..Default::default() };
         d.findings.extend(deletion(app, now, live));
         d.findings.extend(stuck(app, now));
@@ -292,7 +302,7 @@ impl Diagnosis {
         let differing: Vec<Res> = out_of_sync
             .iter()
             .copied()
-            .filter(|r| r["requiresPruning"] != true && s(r, "/health/status") != Some("Missing"))
+            .filter(|r| !super::to_prune(r) && s(r, "/health/status") != Some("Missing"))
             .filter_map(Res::of)
             .collect();
         if let Some(lp) = sync_loop(app, now) {
@@ -741,7 +751,8 @@ pub fn sync_effects(app: &Value, live: &[Drift]) -> Vec<(Res, SyncEffect)> {
         .iter()
         .filter(|r| r["status"] == "OutOfSync")
         .filter_map(|r| {
-            let effect = if r["requiresPruning"] == true {
+            // The resources table says the same of the same resources (`argo::to_prune`).
+            let effect = if super::to_prune(r) {
                 SyncEffect::Prune
             } else {
                 match there(r, live) {
@@ -1244,11 +1255,39 @@ async fn group_kinds(client: &Client, context: &str, group: &str) -> anyhow::Res
     Ok(kinds)
 }
 
-/// The kind to read `res` with: the version Argo CD applied it with, else any.
+/// The kind to read `res` with: the version Argo CD applied it with, else any. Labelled as
+/// the sidebar would, for a page opened with it.
 fn kind_for(kinds: &[(ApiResource, bool)], res: &Res) -> Option<Kind> {
     let of = |v: bool| kinds.iter().find(|(ar, _)| ar.kind == res.kind && (!v || ar.version == res.version));
     let (ar, namespaced) = of(true).or_else(|| of(false))?;
-    Some(Kind { ar: ar.clone(), namespaced: *namespaced, section: "", label: res.kind.clone() })
+    Some(k8s::kind_of(ar.clone(), *namespaced))
+}
+
+/// The kind to open `res` with among `kinds`, those its own cluster serves (another cluster's
+/// may not be served there, or not at that version): its group and kind, never a kind of the
+/// same name in another group, at the version Argo CD applied it with when it is served, else
+/// another. None: look it up there (`kind_on`).
+pub fn known_kind<'a>(kinds: impl IntoIterator<Item = &'a Kind>, res: &Res) -> Option<Kind> {
+    let same: Vec<&Kind> = kinds.into_iter().filter(|k| k.is(&res.group, &res.kind)).collect();
+    same.iter().find(|k| k.ar.version == res.version).or_else(|| same.first()).copied().cloned()
+}
+
+/// The kind `res` is served as on the context `context` (its group discovered there, kept a
+/// while), to open it on a cluster whose kinds the app doesn't know: one not connected, or
+/// one whose discovery didn't list it.
+pub async fn kind_on(client: Client, context: String, res: Res) -> anyhow::Result<Kind> {
+    k8s::run(async move {
+        let kinds = match group_kinds(&client, &context, &res.group).await {
+            Ok(kinds) => kinds,
+            // Discovery's own errors say the group isn't there: its kinds aren't served.
+            Err(e) if matches!(e.downcast_ref::<kube::Error>(), Some(kube::Error::Discovery(_))) => {
+                GroupKinds::default()
+            }
+            Err(e) => return Err(e),
+        };
+        kind_for(&kinds, &res).ok_or_else(|| anyhow::anyhow!("{} is not served on {context}", res.kind_query()))
+    })
+    .await
 }
 
 /// Who may read what: the app reads what its user may (the API server decides), an agent
@@ -1294,9 +1333,7 @@ pub async fn read_drift(
                 if !may_read(&kind, &res) {
                     return Drift::not_read(&res, Compared::NotRead("your rules don't allow get on it".into()));
                 }
-                let namespace = kind.namespaced.then(|| res.namespace.clone()).filter(|ns| !ns.is_empty());
-                let obj = ObjectRef { kind, name: res.name.clone(), namespace, uid: String::new() };
-                match k8s::get_object_opts(client, obj, true).await {
+                match k8s::get_object_opts(client, res.object(kind), true).await {
                     Ok(live) => drift_of(&res, &live, since),
                     Err(e) if k8s::is_not_found(&e) => Drift::not_read(&res, Compared::Gone),
                     Err(e) => Drift::not_read(&res, Compared::NotRead(k8s::lists::load_error(&e))),
@@ -1985,5 +2022,79 @@ mod tests {
         assert!(text.contains("Drift on prod"), "{text}");
         assert!(text.contains("  - spec.replicas: 2\n  + spec.replicas: 3"), "{text}");
         assert!(text.contains("ignoreDifferences"), "{text}");
+    }
+
+    #[test]
+    fn an_object_opens_with_the_kind_its_cluster_serves_at_the_version_applied() {
+        let at = |group: &str, kind: &str, version: &str| {
+            let mut k = Kind::fake(group, kind);
+            k.ar.version = version.into();
+            k.ar.api_version = format!("{group}/{version}");
+            k
+        };
+        let kinds = vec![
+            Kind::fake("apps", "Deployment"),
+            at("autoscaling", "HorizontalPodAutoscaler", "v1"),
+            at("autoscaling", "HorizontalPodAutoscaler", "v2"),
+            Kind::fake("cert-manager.io", "Certificate"),
+            Kind::fake("", "Namespace"),
+        ];
+        let res = |group: &str, kind: &str, version: &str| Res {
+            group: group.into(),
+            kind: kind.into(),
+            name: "x".into(),
+            version: version.into(),
+            ..Default::default()
+        };
+        assert!(known_kind(&kinds, &deployment()).is_some_and(|k| k.is("apps", "Deployment")));
+        assert!(known_kind(&kinds, &Res::namespace("shop")).is_some_and(|k| k.is("", "Namespace")));
+        assert!(known_kind(&kinds, &res("cert-manager.io", "Certificate", "v1")).is_some());
+        // The version Argo CD applied when the cluster serves it, else one it serves.
+        let hpa = |version: &str| known_kind(&kinds, &res("autoscaling", "HorizontalPodAutoscaler", version));
+        assert_eq!(hpa("v2").map(|k| k.ar.version), Some("v2".into()));
+        assert_eq!(hpa("v1").map(|k| k.ar.version), Some("v1".into()));
+        assert_eq!(hpa("v2beta2").map(|k| k.ar.version), Some("v1".into()));
+        // Never a kind of the same name in another group.
+        assert!(known_kind(&kinds, &res("", "Certificate", "v1")).is_none());
+        assert!(known_kind(&kinds, &res("example.com", "Deployment", "v1")).is_none());
+        // A kind the cluster doesn't serve (a CRD of another cluster): looked up there.
+        assert!(known_kind(&kinds, &res("gateway.networking.k8s.io", "HTTPRoute", "v1")).is_none());
+        assert!(known_kind(&kinds[..0], &deployment()).is_none());
+    }
+
+    #[test]
+    fn an_object_is_read_with_the_version_applied_and_in_a_namespace_only_when_its_kind_has_them() {
+        let ar = |version: &str| {
+            let mut ar = Kind::fake("autoscaling", "HorizontalPodAutoscaler").ar;
+            ar.version = version.into();
+            (ar, true)
+        };
+        let kinds = [ar("v1"), ar("v2")];
+        let mut hpa = Res {
+            group: "autoscaling".into(),
+            kind: "HorizontalPodAutoscaler".into(),
+            namespace: "shop".into(),
+            name: "web".into(),
+            version: "v2".into(),
+        };
+        assert_eq!(kind_for(&kinds, &hpa).map(|k| k.ar.version), Some("v2".into()));
+        // A version no longer served: any other.
+        hpa.version = "v2beta2".into();
+        assert_eq!(kind_for(&kinds, &hpa).map(|k| k.ar.version), Some("v1".into()));
+        hpa.kind = "VerticalPodAutoscaler".into();
+        assert!(kind_for(&kinds, &hpa).is_none());
+
+        let web = deployment().object(Kind::fake("apps", "Deployment"));
+        assert_eq!((web.name.as_str(), web.namespace.as_deref()), ("web", Some("shop")));
+        // A cluster-scoped kind is read without the namespace a resource may still name.
+        let mut namespace = Kind::fake("", "Namespace");
+        namespace.namespaced = false;
+        let shop = Res::namespace("shop");
+        assert_eq!((shop.group.as_str(), shop.kind.as_str(), shop.version.as_str()), ("", "Namespace", "v1"));
+        let in_shop = Res { namespace: "shop".into(), ..shop.clone() };
+        for res in [shop, in_shop] {
+            let obj = res.object(namespace.clone());
+            assert_eq!((obj.name.as_str(), obj.namespace), ("shop", None));
+        }
     }
 }
