@@ -25,8 +25,10 @@
   It leaves out events.k8s.io's copy of Events, the old Endpoints and API priority and fairness
   (FlowSchemas); Apply, links and the agents still know them.
 - **Live tables** with kubectl's own columns for every type, including CRDs; CPU/memory from
-  metrics-server; per-type column choice; multi-namespace filter; each type keeps its own filter text (Nodes
-  doesn't show the pod name typed on Pods, and Pods has it back).
+  metrics-server, as bars against each pod's requests and limits (listed once, then kept by a
+  watch: new and resized pods show without listing every pod again); per-type column choice;
+  multi-namespace filter; each type keeps its own filter text (Nodes doesn't show the pod name
+  typed on Pods, and Pods has it back).
 - **Usage timed to metrics-server**: metrics-server measures every `--metric-resolution` (15 s by
   default, often 60 s), so reading it more often returns the same numbers. The pods and nodes
   lists learn the interval from the samples' timestamps and read again just after the next one

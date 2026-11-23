@@ -54,10 +54,13 @@ are **watched**. A list of a namespaced kind in every namespace comes in up to t
    in, with managedFields and the rest skipped (`list_whole`). It replaces the rows of step 2.
 
 Rows keep only the metadata they need; full objects are fetched only when a custom column needs
-them. Responses are gzip-compressed. The usage bars read the pods' requests and limits from a
-separate lean list of the pods, read again every minute (or ten times as long as a read takes, when
-that is longer). On a cluster with about 20,800 pods, the first rows show after 0.7 s and all of
-them after 1.4 s ([measured](COMPARISON.md#measured)).
+them. Responses are gzip-compressed. The usage bars and the cluster overview take the pods'
+requests and limits from one list of the pods, then follow them with a watch
+(`src/k8s/pod_requests.rs`). The API server can't send less than whole pods (about 300 MB of JSON
+for 20,800 pods), so each pod is kept only as the sums `podspec` makes of it, and pods that come,
+go or are resized in place change them without another list. A page off screen for 5 minutes
+stops its watch and lists again once back. On a cluster with about 20,800 pods, the first rows
+show after 0.7 s and all of them after 1.4 s ([measured](COMPARISON.md#measured)).
 
 The Problems scan reads the big kinds from their cells too (`list_light`). What its checks need
 of whole objects (Services, Ingresses and HTTP routes, the pods a Service selects, the workloads of
