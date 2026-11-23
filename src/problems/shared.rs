@@ -474,7 +474,7 @@ mod tests {
         assert_eq!(Found::default().skipped(), None);
     }
 
-    /// A cluster with one node NotReady; records the paths it was asked for.
+    /// A cluster with one node `NotReady`; records the paths it was asked for.
     #[derive(Clone, Default)]
     struct Cluster(Arc<Mutex<Vec<String>>>);
 
