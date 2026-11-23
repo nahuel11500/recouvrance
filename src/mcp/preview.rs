@@ -20,6 +20,7 @@ use serde_json::Value;
 
 use crate::history::{self, DiffLine};
 use crate::json::{arr_at, nonempty_at, str_at};
+use crate::k8s::argo::ops::SyncRequest;
 use crate::k8s::argo::{self, diagnosis};
 use crate::k8s::{self, Kind, ObjectRef, rollouts};
 use crate::plural;
@@ -170,8 +171,9 @@ pub(crate) enum Plan {
     Image { client: Client, kind: Kind, ns: String, name: String, container: String, image: String },
     /// `apply_manifest`: a dry run of each object.
     Apply { client: Client, objects: Vec<Object> },
-    /// `gitops` `sync` of an Argo CD Application.
-    Sync { client: Client, kind: Kind, ns: String, name: String },
+    /// `gitops` `sync` of an Argo CD Application, with its options; `app` when it was read
+    /// already (to bind what a prune deletes to what is shown), so it isn't read twice.
+    Sync { client: Client, kind: Kind, ns: String, name: String, req: SyncRequest, app: Option<Value> },
     /// `delete_resource`: the object, and what goes with it.
     Delete { client: Client, kind: Kind, ns: Option<String>, name: String },
 }
@@ -220,9 +222,10 @@ async fn work_out(plan: &Plan) -> Preview {
             Preview::of(vec![patched(&label, kind, &live, after)])
         }
         Plan::Apply { client, objects } => Preview::of(applied(client, objects).await),
-        Plan::Sync { client, kind, ns, name } => {
+        Plan::Sync { app: Some(app), req, .. } => Preview::of(vec![sync_section(app, req)]),
+        Plan::Sync { client, kind, ns, name, req, app: None } => {
             match super::server::get_named(client, kind, Some(ns.as_str()), name, false).await {
-                Ok(app) => Preview::of(vec![sync_section(&app)]),
+                Ok(app) => Preview::of(vec![sync_section(&app, req)]),
                 Err(e) => unread(&object_label(kind, Some(ns.as_str()), name), &e),
             }
         }
@@ -487,10 +490,10 @@ fn scale_section(label: &str, now: Option<i32>, replicas: i32) -> Section {
 }
 
 /// `gitops` `sync` of the Application `app`: Argo CD syncs it to its target revision, which
-/// changes what is out of sync. What is no longer in git stays: the sync Recouvrance starts
-/// doesn't prune (`k8s::argo_sync_patch`). Git's manifests can't be read through the
+/// changes what is out of sync (of the resources `req` names, when it names some). What is
+/// no longer in git stays unless `req` prunes. Git's manifests can't be read through the
 /// Kubernetes API, so there is no diff.
-fn sync_section(app: &Value) -> Section {
+fn sync_section(app: &Value, req: &SyncRequest) -> Section {
     let s = argo::Summary::of(app);
     let deployed = s.history.first().map(|d| d.revision.clone()).filter(|r| !r.is_empty());
     let mut lines = vec![match (deployed, s.revision) {
@@ -504,7 +507,19 @@ fn sync_section(app: &Value) -> Section {
         lines.push(format!("target revision: {target} (read again when the sync starts)"));
     }
     lines.push(format!("auto-sync: {}", if s.automated { "on" } else { "off" }));
-    let effects = diagnosis::sync_effects(app, &[]);
+    if req.dry_run {
+        lines.push("dry run: Argo CD applies nothing and says what it would do".into());
+    }
+    let mut effects = diagnosis::sync_effects(app, &[]);
+    if !req.resources.is_empty() {
+        effects.retain(|(r, _)| req.resources.iter().any(|p| p.same(r)));
+        lines.push(format!("of {} only (hooks don't run)", plural::count(req.resources.len(), "resource")));
+    }
+    let pruned = match (req.prune, req.dry_run) {
+        (false, _) => "no longer in git: left in place (this sync doesn't prune)",
+        (true, false) => "no longer in git: deleted (prune)",
+        (true, true) => "no longer in git: would be deleted (prune)",
+    };
     if effects.is_empty() {
         lines.push("nothing out of sync: the sync applies the same manifests again".into());
     } else {
@@ -514,7 +529,7 @@ fn sync_section(app: &Value) -> Section {
         let what = match effect {
             diagnosis::SyncEffect::Create => "in git, not in the cluster yet: created",
             diagnosis::SyncEffect::Update => "differs from git: updated",
-            diagnosis::SyncEffect::Prune => "no longer in git: left in place (this sync doesn't prune)",
+            diagnosis::SyncEffect::Prune => pruned,
             diagnosis::SyncEffect::Unknown => "out of sync with git: created or updated",
         };
         lines.push(format!("{}: {what}", res.label()));
@@ -768,7 +783,29 @@ mod tests {
                 ],
             },
         });
-        let s = sync_section(&app);
+        // With prune, of some resources only: what it deletes, and nothing else listed.
+        let old = diagnosis::Res {
+            kind: "ConfigMap".into(),
+            namespace: "shop".into(),
+            name: "old".into(),
+            ..Default::default()
+        };
+        let new = diagnosis::Res { name: "new".into(), ..old.clone() };
+        let req = SyncRequest { resources: vec![old, new], prune: true, ..Default::default() };
+        let lines = sync_section(&app, &req).lines;
+        assert_eq!(
+            &lines[3..],
+            [
+                "of 2 resources only (hooks don't run)",
+                "out of sync: 2 resources",
+                "ConfigMap shop/new: in git, not in the cluster yet: created",
+                "ConfigMap shop/old: no longer in git: deleted (prune)",
+            ]
+        );
+        let dry = sync_section(&app, &SyncRequest { dry_run: true, ..req }).lines;
+        assert!(dry.iter().any(|l| l.starts_with("dry run:")), "{dry:?}");
+        assert!(dry.iter().any(|l| l.ends_with("would be deleted (prune)")), "{dry:?}");
+        let s = sync_section(&app, &SyncRequest::default());
         assert_eq!(s.title, "Application argocd/shop-workload: sync");
         assert_eq!(
             s.lines,
@@ -789,7 +826,7 @@ mod tests {
             "status": {"sync": {"status": "Synced", "revision": "1.2.0"}, "history": [{"id": 3, "revision": "1.2.0"}]},
         });
         assert_eq!(
-            sync_section(&synced).lines,
+            sync_section(&synced, &SyncRequest::default()).lines,
             [
                 "revision: 1.2.0, deployed already",
                 "auto-sync: on",

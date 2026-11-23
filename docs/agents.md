@@ -90,8 +90,9 @@ request: for `scale`, the replicas now and after; for `patch_resource`, `set_ima
 `apply_manifest`, each field that changes with its value now and after, then the diff, from a
 server-side dry run of the same request (it changes nothing; a dry run the server refuses is said,
 and so is a field another manager owns, on which `apply_manifest` fails); for a `gitops` `sync`, the
-revision deployed and the one it moves to, auto-sync, what is out of sync, and what is no longer in
-git (left in place: the sync Recouvrance starts doesn't prune); for `delete_resource`, what goes with
+revision deployed and the one it moves to, auto-sync, what is out of sync (of the `resources`
+named, when some are), and what is no longer in git (left in place unless `prune`, then deleted);
+for a `rollback`, the deployment it goes to; for `delete_resource`, what goes with
 the object (a Deployment's ReplicaSets and pods, everything in a namespace, every object of a CRD's
 kind; a Job's pods stay). A Secret's values never show, only which changed. It takes 5 seconds at
 most: past that, or when it fails, the banner says the preview isn't available, and the request is
@@ -149,9 +150,24 @@ change something, `debug_pod`, `port_forward` and `browse_files` only add (`dest
 `trigger_cronjob` doesn't say so: the Job it starts runs the CronJob's own code, which may delete
 or overwrite data.
 
-Every change supports `dry_run` except `exec_command`, `drain_node`, `gitops` and the port-forward
-tools; `my_permissions` names them, from the tools' definitions. What some of them need beyond the
-obvious verb:
+Every change supports `dry_run` except `exec_command`, `drain_node` and the port-forward tools
+(`gitops` takes it for an Argo CD `sync` or `rollback` only); `my_permissions` names them, from the
+tools' definitions. What some of them need beyond the obvious verb:
+
+- **Argo CD sync, terminate and rollback:** `gitops` on an Application, authorized as `patch` on
+  it. `sync` takes `resources` (sync those alone; hooks run only when the whole Application
+  syncs), `prune` (delete what is no longer in git; the approval banner and the reply name what
+  it deletes, and a sync that would delete more than the banner listed is refused) and `dry_run`
+  (Argo CD's own dry run: nothing is applied, and the reply waits up to 30 s for what Argo CD
+  would do). `terminate` stops the operation running, like `argocd app terminate-op`, also on an
+  Application being deleted (a stuck sync holds its deletion). `rollback` goes back to a
+  deployment of `status.history` (`deployment_id`, or the one before the newest, which the
+  approval banner names and which is the one sent), like `argocd app rollback`: the deployment's
+  revision and source applied again, without hooks and without prune. As argocd-server does,
+  nothing starts while another operation runs or the Application is being deleted, and a
+  rollback is refused while auto-sync is on. The Application is read right before the write,
+  which carries the version read: a change meanwhile refuses it (a terminate is tried again, as
+  argocd-server does).
 
 - **Custom and external metrics:** `get_metrics` reads `custom.metrics.k8s.io` and
   `external.metrics.k8s.io`, what an HPA or KEDA gets from prometheus-adapter, like
@@ -275,7 +291,8 @@ the same target fold into one line, and any line opens to its full arguments and
 writes, denied or failed calls, context, agent or text. It shows the latest 300 calls; "Show older"
 goes further back, and then reads the log on disk. A call counts as a write when its tool may change
 something (the changes above, and `browse_files` with `debug: true`), but not a dry run nor `gitops`'s
-`diagnose`; each group counts its writes.
+`diagnose`; each group counts its writes. A `gitops` dry run counts: it writes the Application's
+operation, which blocks any other sync until Argo CD is done with it.
 
 > These rules govern what agents do *through Recouvrance*. An agent with shell access can still run
 > `kubectl` with your kubeconfig, so block `kubectl`/`helm` in its own permissions if Recouvrance

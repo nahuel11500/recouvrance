@@ -288,12 +288,15 @@ fn context_refusal(policy: &Policy, context: &str) -> (String, String) {
 
 /// Arguments that change what a call does, for the approval banner: what the user
 /// approves is what runs. Values come from the (redacted) logged arguments.
-const KEY_ARGS: [&str; 12] = [
+const KEY_ARGS: [&str; 15] = [
     "command",
     "path",
     "patch",
     "replicas",
     "action",
+    "resources",
+    "prune",
+    "deployment_id",
     "container",
     "to_revision",
     "image",
@@ -953,9 +956,36 @@ pub struct GitOpsParams {
     pub namespace: String,
     pub name: String,
     #[schemars(
-        description = "reconcile (Flux) · refresh, hard_refresh or sync (Argo CD) · suspend or resume (Flux) · diagnose (Argo CD, read only)"
+        description = "reconcile (Flux) · refresh, hard_refresh, sync, terminate (the operation running) or rollback (Argo CD) · suspend or resume (Flux) · diagnose (Argo CD, read only)"
     )]
     pub action: String,
+    #[schemars(
+        description = "sync only: sync these resources of the Application alone (hooks don't run then); omit to sync it whole"
+    )]
+    pub resources: Option<Vec<ArgoResource>>,
+    #[schemars(
+        description = "sync only: also delete what is no longer in git (of the resources named, when some are); the reply names what it deletes"
+    )]
+    pub prune: Option<bool>,
+    #[schemars(
+        description = "sync or rollback: Argo CD applies nothing and reports what it would do (the reply waits up to 30 s for it)"
+    )]
+    pub dry_run: Option<bool>,
+    #[schemars(
+        description = "rollback only: the id of the deployment in status.history to go back to; omit for the one before the newest. Argo CD refuses a rollback while auto-sync is on"
+    )]
+    pub deployment_id: Option<i64>,
+}
+
+/// A resource of an Argo CD Application, as its `status.resources` names it.
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct ArgoResource {
+    #[schemars(description = "API group; empty or omitted for the core group")]
+    pub group: Option<String>,
+    pub kind: String,
+    #[schemars(description = "omit for a cluster-scoped resource")]
+    pub namespace: Option<String>,
+    pub name: String,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -1188,15 +1218,17 @@ fn dry_run_tools() -> &'static [String] {
 /// Whether a logged call may have changed something. The Activity page shows these calls
 /// under Writes, counts them in each task and colors their tool. A call of a tool that may
 /// change something counts, unless it was a dry run, `gitops`'s `diagnose`, or `browse_files`
-/// without `debug` (the debug container it may add is the only change it makes).
+/// without `debug` (the debug container it may add is the only change it makes). A `gitops`
+/// dry run counts: it writes the Application's operation, which Argo CD then runs (applying
+/// nothing) and which blocks any other sync, terminate or rollback until it ends.
 pub fn call_writes(tool: &str, args: &serde_json::Value) -> bool {
     let on = |key: &str| args.get(key).and_then(serde_json::Value::as_bool) == Some(true);
     let reads = match tool {
         "gitops" => args.get("action").and_then(serde_json::Value::as_str) == Some("diagnose"),
         "browse_files" => !on("debug"),
-        _ => false,
+        _ => on("dry_run"),
     };
-    tool_writes(tool) && !reads && !on("dry_run")
+    tool_writes(tool) && !reads
 }
 
 fn format_table(headers: &[&str], rows: &[Vec<String>]) -> String {
@@ -1933,11 +1965,12 @@ mod tests {
             assert!(tools.iter().any(|t| t.name == tool), "{tool} is a tool");
             assert!(call_writes(tool, &json!({"dry_run": null})), "{tool}");
         }
-        // A dry run changes nothing.
-        assert_eq!(dry_run_tools().len(), 13, "{:?}", dry_run_tools());
+        // A dry run changes nothing, but `gitops`'s: Argo CD's own writes the operation.
+        assert_eq!(dry_run_tools().len(), 14, "{:?}", dry_run_tools());
         for tool in dry_run_tools() {
-            assert!(!call_writes(tool, &json!({"dry_run": true})), "{tool}");
+            assert_eq!(call_writes(tool, &json!({"dry_run": true})), tool == "gitops", "{tool}");
         }
+        assert!(call_writes("gitops", &json!({"action": "sync", "dry_run": true})));
         // Their arguments say when these only read.
         assert!(!call_writes("gitops", &json!({"action": "diagnose"})));
         assert!(!call_writes("browse_files", &json!({"path": "/etc", "debug": false})));
