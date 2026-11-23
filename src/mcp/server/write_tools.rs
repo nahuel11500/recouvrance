@@ -200,7 +200,7 @@ impl KubeMcp {
             (self.hub.clone(), call.agent.id.clone(), p.context.clone(), pods_kind.clone());
         let keep = move |ns: &str, name: &str| {
             let a = access_for(&kind, &context, Verb::Delete, Some(ns.into()), Some(name.into()));
-            match hub.agent(&agent_id) {
+            match hub.agent_for_calls(&agent_id) {
                 Some(agent) if !denies_eviction(&agent.policy, &a) => None,
                 Some(_) => Some("your rules deny deleting it".to_string()),
                 None => Some("this agent is disabled".to_string()),
@@ -215,7 +215,7 @@ impl KubeMcp {
     }
 
     #[tool(
-        description = "GitOps actions: Flux `reconcile` (like `flux reconcile`), `suspend`, `resume`; Argo CD Application `refresh`, `hard_refresh` (renders its manifests again, without Argo CD's cache) or `sync`, authorized as `patch` on the object. Argo CD `diagnose` changes nothing (authorized as `get`): why the Application drifts, keeps syncing (a sync loop, with the `ignoreDifferences` that would stop it), failed (hook, admission, missing CRD...) or is stuck (a long sync, a finalizer holding its deletion), and for each out-of-sync resource the fields that differ between what was last applied and the live object on its destination, with who wrote them since the last sync. The destination's objects are read only where your rules allow `get`.",
+        description = "GitOps actions: Flux `reconcile` (like `flux reconcile`), `suspend`, `resume`; Argo CD Application `refresh`, `hard_refresh` (renders its manifests again, without Argo CD's cache) or `sync`. Each needs its own verb on the object, not `patch`: `refresh` (refresh, hard_refresh), `sync` (Argo CD sync, Flux reconcile) or `suspend` (Flux suspend and resume). Argo CD `diagnose` changes nothing (authorized as `get`): why the Application drifts, keeps syncing (a sync loop, with the `ignoreDifferences` that would stop it), failed (hook, admission, missing CRD...) or is stuck (a long sync, a finalizer holding its deletion), and for each out-of-sync resource the fields that differ between what was last applied and the live object on its destination, with who wrote them since the last sync. The destination's objects are read only where your rules allow `get`.",
         annotations(read_only_hint = false)
     )]
     async fn gitops(
@@ -244,7 +244,8 @@ impl KubeMcp {
         if p.action == "diagnose" {
             return self.argo_diagnose(call, client, kind, &p.context, &p.namespace, &p.name).await;
         }
-        let access = access_for(&kind, &p.context, Verb::Patch, Some(p.namespace.clone()), Some(p.name.clone()));
+        let verb = gitops_verb(&p.action);
+        let access = access_for(&kind, &p.context, verb, Some(p.namespace.clone()), Some(p.name.clone()));
         self.authorize(&mut call, &access).await?;
         self.recheck(&mut call, &access)?;
         let (ns, name) = (Some(p.namespace), p.name);
@@ -275,6 +276,16 @@ impl KubeMcp {
         self.authorize(&mut call, &access).await?;
         self.recheck(&mut call, &access)?;
         call.finish(k8s::delete(client, kind, p.namespace, p.name, None, p.dry_run.unwrap_or(false)).await)
+    }
+}
+
+/// The rules' verb for a GitOps action: a refresh deploys nothing, a sync (or a Flux
+/// reconcile) deploys what the repository holds, and suspend and resume stop or restart that.
+fn gitops_verb(action: &str) -> Verb {
+    match action {
+        "refresh" | "hard_refresh" => Verb::Refresh,
+        "sync" | "reconcile" => Verb::Sync,
+        _ => Verb::Suspend,
     }
 }
 

@@ -9,7 +9,7 @@ use gpui_kit::*;
 
 use super::{AgentsView, RuleInputs, rule_with};
 use crate::k8s;
-use crate::mcp::{Access, Agent, Mode, Rule, Verb};
+use crate::mcp::{Access, Agent, Mode, PROTECTED, Rule, Verb, is_protected_selector};
 
 impl AgentsView {
     pub(super) fn render_rule(
@@ -25,8 +25,10 @@ impl AgentsView {
             Mode::Ask => theme.warning,
             Mode::Deny => theme.danger,
         };
-        let matched = self.matched_contexts(&rule.contexts);
-        let any_protected = matched.iter().any(|c| self.protected.contains(c));
+        let matched = self.matched_contexts(rule);
+        let names_protected = rule.contexts.iter().any(|c| is_protected_selector(c));
+        // A rule that names `@protected` is meant for them: no warning.
+        let any_protected = !names_protected && matched.iter().any(|c| self.protected.contains(c));
         let label = |text: &'static str| {
             div().w(px(96.)).flex_shrink_0().text_xs().text_color(theme.muted_foreground).child(text)
         };
@@ -182,6 +184,13 @@ impl AgentsView {
                             }))
                             .when(any_protected && rule.effect != Mode::Deny, |d| {
                                 d.child(div().text_color(theme.warning).child("· includes protected contexts"))
+                            })
+                            .when(names_protected && rule.effect == Mode::Allow, |d| {
+                                d.child(
+                                    div()
+                                        .text_color(theme.warning)
+                                        .child("· @protected only works in Ask and Deny rules: it allows nothing"),
+                                )
                             }),
                     ),
                 ),
@@ -211,57 +220,7 @@ impl AgentsView {
         }
         contexts.sort();
         contexts.dedup();
-        let all = vec!["*".to_string()];
-        let writes = ["exec", "scale", "restart", "patch", "apply", "delete", "drain"];
-        let read = ["get", "list", "logs"];
-        let presets: Vec<(&'static str, Vec<Rule>)> = vec![
-            (
-                "Read-only",
-                vec![
-                    rule_with(Mode::Allow, &read, &["*"], &["*"], "Read everything", &contexts),
-                    rule_with(Mode::Deny, &["*"], &["secrets"], &["*"], "Never Secrets", &all),
-                ],
-            ),
-            (
-                "Read, ask before any write",
-                vec![
-                    rule_with(Mode::Allow, &read, &["*"], &["*"], "Read everything", &contexts),
-                    rule_with(Mode::Ask, &writes, &["*"], &["*"], "Writes need my approval", &contexts),
-                    rule_with(Mode::Deny, &["*"], &["secrets"], &["*"], "Never Secrets", &all),
-                ],
-            ),
-            (
-                "Operator: restart/scale freely, ask for the rest",
-                vec![
-                    rule_with(Mode::Allow, &read, &["*"], &["*"], "Read everything", &contexts),
-                    rule_with(
-                        Mode::Allow,
-                        &["scale", "restart"],
-                        &["deployments", "statefulsets"],
-                        &["*"],
-                        "Routine operations",
-                        &contexts,
-                    ),
-                    rule_with(
-                        Mode::Ask,
-                        &["exec", "patch", "apply", "delete", "drain"],
-                        &["*"],
-                        &["*"],
-                        "Other writes need approval",
-                        &contexts,
-                    ),
-                    rule_with(Mode::Deny, &["*"], &["secrets"], &["*"], "Never Secrets", &all),
-                    rule_with(
-                        Mode::Deny,
-                        &writes,
-                        &["*"],
-                        &["kube-*", "*-system"],
-                        "No writes in system namespaces",
-                        &all,
-                    ),
-                ],
-            ),
-        ];
+        let presets = presets(&contexts);
         h_flex()
             .flex_wrap()
             .gap_2()
@@ -291,7 +250,8 @@ impl AgentsView {
             name: (!name.is_empty()).then_some(name),
             cluster_scoped: false,
         };
-        let verdict = (!context.is_empty() && !resource.is_empty()).then(|| agent.policy.decide(&access));
+        let verdict =
+            (!context.is_empty() && !resource.is_empty()).then(|| self.resolved(&agent.policy).decide(&access));
         let verbs = h_flex().flex_wrap().gap_1().children(Verb::ALL.into_iter().enumerate().map(|(i, verb)| {
             Button::new(("test-verb", i))
                 .xsmall()
@@ -348,5 +308,153 @@ impl AgentsView {
                     )
                 }
             })
+    }
+}
+
+/// Argo CD's Application, as rules name it (not another group's `applications`).
+const ARGO_APPS: &str = "applications.argoproj.io";
+
+/// The presets, for an agent whose Allow and Ask rules name `contexts`.
+fn presets(contexts: &[String]) -> Vec<(&'static str, Vec<Rule>)> {
+    let all = vec!["*".to_string()];
+    let protected = vec![PROTECTED.to_string()];
+    let writes: Vec<&str> = Verb::ALL.iter().filter(|v| v.is_write()).map(|v| v.as_str()).collect();
+    let read = ["get", "list", "logs"];
+    let read_all = || rule_with(Mode::Allow, &read, &["*"], &["*"], "Read everything", contexts);
+    let no_secrets = || rule_with(Mode::Deny, &["*"], &["secrets"], &["*"], "Never Secrets", &all);
+    vec![
+        ("Read-only", vec![read_all(), no_secrets()]),
+        (
+            "Read, ask before any write",
+            vec![
+                read_all(),
+                rule_with(Mode::Ask, &writes, &["*"], &["*"], "Writes need my approval", contexts),
+                no_secrets(),
+            ],
+        ),
+        (
+            "Operator: restart/scale freely, ask for the rest",
+            vec![
+                read_all(),
+                rule_with(
+                    Mode::Allow,
+                    &["scale", "restart"],
+                    &["deployments", "statefulsets"],
+                    &["*"],
+                    "Routine operations",
+                    contexts,
+                ),
+                rule_with(
+                    Mode::Ask,
+                    &["exec", "patch", "refresh", "sync", "suspend", "apply", "delete", "drain"],
+                    &["*"],
+                    &["*"],
+                    "Other writes need approval",
+                    contexts,
+                ),
+                no_secrets(),
+                rule_with(Mode::Deny, &writes, &["*"], &["kube-*", "*-system"], "No writes in system namespaces", &all),
+            ],
+        ),
+        (
+            "GitOps: read, refresh freely, ask to sync, never delete Applications",
+            vec![
+                read_all(),
+                // A refresh reads the repository again and deploys nothing.
+                rule_with(Mode::Allow, &["refresh"], &[ARGO_APPS], &["*"], "Refresh Argo CD Applications", contexts),
+                rule_with(
+                    Mode::Ask,
+                    &["sync", "suspend"],
+                    &["*"],
+                    &["*"],
+                    "Syncs, reconciles and suspends need my approval",
+                    contexts,
+                ),
+                rule_with(Mode::Deny, &["delete"], &[ARGO_APPS], &["*"], "Never delete Applications", &all),
+                no_secrets(),
+            ],
+        ),
+        (
+            "Ask for writes on protected contexts",
+            vec![
+                read_all(),
+                rule_with(Mode::Allow, &writes, &["*"], &["*"], "Writes", contexts),
+                // Protection is read at each call: a context protected later is covered too,
+                // and every context when it can't be read.
+                rule_with(
+                    Mode::Ask,
+                    &writes,
+                    &["*"],
+                    &["*"],
+                    "Writes on protected contexts need my approval",
+                    &protected,
+                ),
+                no_secrets(),
+            ],
+        ),
+    ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mcp::Policy;
+
+    fn access(context: &str, verb: Verb, resource: &str, name: &str) -> Access {
+        Access {
+            context: context.into(),
+            verb,
+            resource: resource.into(),
+            resource_aliases: vec![],
+            namespace: Some("argocd".into()),
+            name: Some(name.into()),
+            cluster_scoped: false,
+        }
+    }
+
+    fn preset(name: &str, contexts: &[&str]) -> Policy {
+        let contexts: Vec<String> = contexts.iter().map(ToString::to_string).collect();
+        let mut policy = Policy::default();
+        policy.rules = presets(&contexts).into_iter().find(|(n, _)| n.starts_with(name)).unwrap().1;
+        policy
+    }
+
+    #[test]
+    fn the_gitops_preset_refreshes_freely_asks_to_sync_and_never_deletes_applications() {
+        let p = preset("GitOps", &["*"]);
+        let d = |verb: Verb, resource: &str| p.decide(&access("hub", verb, resource, "web")).mode;
+        let flux = "kustomizations.kustomize.toolkit.fluxcd.io";
+        assert_eq!(d(Verb::Refresh, ARGO_APPS), Mode::Allow);
+        assert_eq!(d(Verb::Sync, ARGO_APPS), Mode::Ask);
+        assert_eq!(d(Verb::Sync, flux), Mode::Ask);
+        assert_eq!(d(Verb::Suspend, flux), Mode::Ask);
+        assert_eq!(d(Verb::Delete, ARGO_APPS), Mode::Deny);
+        // A sync rule is not a patch rule: the Application's spec stays out of reach.
+        assert_eq!(d(Verb::Patch, ARGO_APPS), Mode::Deny);
+        assert_eq!(d(Verb::Get, "secrets"), Mode::Deny);
+    }
+
+    #[test]
+    fn the_protected_preset_asks_only_on_protected_contexts_and_everywhere_when_unknown() {
+        let mut p = preset("Ask for writes", &["*"]);
+        let d = |p: &Policy, context: &str| p.decide(&access(context, Verb::Delete, "pods", "web")).mode;
+        // Protection not read: every context counts as protected.
+        assert_eq!(d(&p, "dev"), Mode::Ask);
+        assert_eq!(d(&p, "prod"), Mode::Ask);
+        p.set_unprotected(["dev".to_string()]);
+        assert_eq!(d(&p, "dev"), Mode::Allow);
+        assert_eq!(d(&p, "prod"), Mode::Ask);
+        // A context the kubeconfig didn't have when protection was read.
+        assert_eq!(d(&p, "new"), Mode::Ask);
+        assert_eq!(p.decide(&access("prod", Verb::Get, "pods", "web")).mode, Mode::Allow);
+    }
+
+    #[test]
+    fn presets_ask_for_every_write_verb() {
+        // The writes list follows the verbs: a new write verb is not left out of the Ask.
+        let p = preset("Read, ask", &["*"]);
+        for verb in Verb::ALL.into_iter().filter(|v| v.is_write()) {
+            assert_eq!(p.decide(&access("c", verb, "deployments", "web")).mode, Mode::Ask, "{verb}");
+        }
     }
 }

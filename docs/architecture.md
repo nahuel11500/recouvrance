@@ -72,7 +72,7 @@ keeping only the fields the checks use; of the workloads, only those scaled to 0
 - **Protected contexts** require typing the context name.
 - Actions your **RBAC** forbids are disabled (`SelfSubjectAccessReview`).
 - **Agents** go through the hub: rules (deny, ask, allow), approvals, a rate limit, an audit log and
-  a kill switch. Write mode and protected contexts don't apply to them: only their rules do.
+  a kill switch. Write mode and protected contexts don't apply to them: only their rules do (an Ask or Deny rule can name `@protected`).
 - **Login commands keep their secrets.** kube's error for a failed exec plugin holds its whole
   command line and its output; each client replaces it, when it is built and on every request
   (a token refresh runs the plugin again), by the program's file name, taken from the kubeconfig,

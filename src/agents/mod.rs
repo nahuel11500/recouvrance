@@ -14,7 +14,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use crate::k8s;
-use crate::mcp::{Agent, Hub, Mode, Policy, Rule, Verb, any_glob, grants_write};
+use crate::mcp::{Agent, Hub, Mode, Policy, Rule, Verb, any_glob, grants_write, is_protected_selector};
 
 mod activity;
 mod code;
@@ -352,9 +352,26 @@ impl AgentsView {
         }
     }
 
-    /// Contexts in kubeconfig matched by a rule's patterns.
-    fn matched_contexts(&self, patterns: &[String]) -> Vec<String> {
-        self.contexts.iter().filter(|c| any_glob(patterns, c)).cloned().collect()
+    /// Contexts in kubeconfig a rule covers: those its patterns match, and the protected ones
+    /// for `@protected` in an Ask or Deny rule.
+    fn matched_contexts(&self, rule: &Rule) -> Vec<String> {
+        let protected = rule.effect != Mode::Allow && rule.contexts.iter().any(|p| is_protected_selector(p));
+        let globs: Vec<String> = rule.contexts.iter().filter(|p| !is_protected_selector(p)).cloned().collect();
+        self.contexts
+            .iter()
+            .filter(|c| any_glob(&globs, c) || (protected && self.protected.contains(*c)))
+            .cloned()
+            .collect()
+    }
+
+    /// The rules as they decide an agent's calls now: `@protected` resolved with the
+    /// protection last read, for the access tester.
+    fn resolved(&self, policy: &Policy) -> Policy {
+        let mut policy = policy.clone();
+        if policy.names_protected() {
+            policy.set_unprotected(self.contexts.iter().filter(|c| !self.protected.contains(*c)).cloned());
+        }
+        policy
     }
 
     // MARK: Rendering

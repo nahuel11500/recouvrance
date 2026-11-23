@@ -13,7 +13,8 @@ use super::audit::{
     AuditEntry, AuditStats, MAX_AUDIT_IN_MEMORY, append_audit, audit_path, load_audit_tail, read_audit,
 };
 use super::config::{
-    Agent, CONFIG_VERSION, Config, config_lock_path, hash_token, load_config, new_token, same_rules, take_lock,
+    Agent, CONFIG_VERSION, Config, GITOPS_VERBS_VERSION, config_lock_path, hash_token, load_config, new_token,
+    same_rules, take_lock,
 };
 use super::policy::{Access, Mode, Policy, Rule, Verb};
 use super::{lock, read, rules_file, write};
@@ -64,16 +65,17 @@ pub struct Approval {
 
 impl Approval {
     /// A narrow Allow rule for exactly this request, when a rule can be that narrow.
-    /// None for exec (a rule cannot pin the command), patches and GitOps actions (the rule
-    /// would allow any patch), scale (it would allow any replica count, 0 too), apply (the
+    /// None for exec (a rule cannot pin the command), patches (the rule would allow any
+    /// patch), scale (it would allow any replica count, 0 too), apply (the
     /// rule could not pin the content), a request other than a list with no object name
     /// (the rule would cover every name), a request across all namespaces (the rule would
     /// also cover namespaces no rule allows) and dry runs (a rule cannot be limited to dry
     /// runs, so it would allow the real write).
     pub fn as_rule(&self) -> Option<Rule> {
         let a = &self.access;
+        // A GitOps action has its own verb (`refresh`, `sync`, `suspend`), so its rule
+        // allows that action on that object only.
         if matches!(a.verb, Verb::Exec | Verb::Patch | Verb::Scale)
-            || self.tool == "gitops"
             || self.tool == "apply_manifest"
             || self.dry_run
             || (a.verb != Verb::List && a.name.is_none())
@@ -171,6 +173,11 @@ impl Hub {
         }
         for agent in &mut config.agents {
             agent.policy.migrate();
+            // Saved before the GitOps verbs: rules.yaml, when it exists, is upgraded the same
+            // way when it is loaded (`apply_rules_file`), which then sets the version.
+            if config.version < GITOPS_VERBS_VERSION {
+                agent.policy.add_gitops_verbs();
+            }
         }
         let audit = load_audit_tail(&audit_path());
         Arc::new(Self::new(config, audit, config_error, rules_file::path().exists()))
@@ -276,17 +283,15 @@ impl Hub {
                 self.emit(HubEvent::AgentSeen);
                 return Err(e);
             }
-            // agents.json from before 0.3.0: an agent created then had no section until its
-            // rules were edited. It keeps its rules and its section is written, once.
-            let upgrade = cfg.version < CONFIG_VERSION;
+            // Rules saved by an older version are upgraded, and the file written, once: see
+            // `rules_file::apply_upgrading`.
             let mut agents = cfg.agents.clone();
-            rules_file::apply_file(&file, &mut agents, upgrade)?;
-            if upgrade && agents.iter().any(|a| !file.agents.contains_key(&a.name)) {
+            if rules_file::apply_upgrading(&file, &mut agents, cfg.version)? {
                 let mut seen = lock(&self.rules_text);
                 match rules_file::export_over(&path, &agents, seen.as_deref()) {
                     Ok(text) => *seen = Some(text),
                     Err(e) => {
-                        let e = e.context("rules.yaml could not be given the agents it doesn't name");
+                        let e = e.context("rules.yaml could not be upgraded for this version");
                         *lock(&self.rules_error) = Some(format!("{e:#}"));
                         drop((seen, cfg));
                         self.emit(HubEvent::AgentSeen);
@@ -502,6 +507,18 @@ impl Hub {
     /// Fresh copy of an agent, so rule edits apply to the very next call.
     pub fn agent(&self, id: &str) -> Option<Agent> {
         read(&self.config).agents.iter().find(|a| a.id == id).cloned()
+    }
+
+    /// [`agent`](Self::agent), with its rules ready to decide its calls: when one names
+    /// `@protected`, the protection of contexts is read now (Settings → Contexts and the
+    /// kubeconfig), so a context protected since the last call counts. Unreadable, every
+    /// context counts as protected.
+    pub fn agent_for_calls(&self, id: &str) -> Option<Agent> {
+        let mut agent = self.agent(id)?;
+        if agent.policy.names_protected() {
+            agent.policy.set_unprotected(crate::settings::unprotected_contexts());
+        }
+        Some(agent)
     }
 
     /// Count a call; false when the agent is over its per-minute limit.

@@ -35,16 +35,35 @@ Each agent has rules, like Kubernetes RBAC with an effect:
 | Field | Example |
 |---|---|
 | Effect | Allow · Ask me · Deny |
-| Verbs | get, list, logs, reveal (Secret values), exec, scale, restart, patch, apply, delete, drain, * |
+| Verbs | get, list, logs, reveal (Secret values), exec, scale, restart, patch, refresh, sync, suspend, apply, delete, drain, forward, * |
 | Resources | `pods`, `deployments`, `*.cert-manager.io`, `*` |
 | Namespaces | `team-a`, `team-*`, `*` (also covers cluster-scoped objects) |
-| Contexts | `eu-*`, `staging` |
+| Contexts | `eu-*`, `staging`, `@protected` (Ask and Deny rules) |
 | Names | `web-*`, `*` |
+
+`refresh`, `sync` and `suspend` are the GitOps actions of the `gitops` tool: `refresh` an Argo CD
+Application's refresh and hard refresh (git is read again, nothing is deployed), `sync` an Argo CD
+sync or a Flux reconcile (what git holds is deployed), `suspend` a Flux suspend or resume. They are
+not `patch`, so a rule can let an agent refresh freely and ask before a sync, and a rule that allows
+syncing an Application doesn't allow patching its spec. Rules saved by a version before these
+verbs checked GitOps actions as `patch`: on the first start of this version, every rule that
+names `patch` gets the three verbs, once (and rules.yaml is written again), so what it allowed,
+asked or denied it still does. Take `refresh` out of an Ask rule afterwards to let refreshes
+through.
 
 Write mode and protected contexts are for you in the window: an agent's calls don't check them,
 only its rules (with the rate limit and the kill switch below). An Allow rule for a write lets the
 agent write while the window shows `read-only`, and on a protected context without its name typed or a wait;
 to keep agents off a context or from writing, give them *Ask me* or Deny rules for it (or no Allow).
+The context `@protected` stands for the contexts protected in Settings → Contexts, read again at
+each call, so a context protected later (or guessed as production when it appears) is covered
+without editing the rules. It works in Ask and Deny rules only, and only makes requests stricter:
+an Ask rule covers a request through it only when another rule covers that request too, so it
+never lets an agent ask for, or reach, a context no other rule names. When the protection can't be
+read, every context counts as protected. An Allow rule naming it allows nothing (rules.yaml refuses
+it). The preset *Ask for writes on protected contexts* allows writes and asks for them on
+`@protected`; *GitOps* reads, allows refreshing Argo CD Applications, asks before syncs,
+reconciles and suspends, and denies deleting Applications.
 
 **Deny wins, then Ask me, then Allow; anything no rule matches is denied.** A Deny limited to some
 names hides those objects from lists rather than refusing the whole list. Patching, applying or
@@ -61,14 +80,15 @@ every object (kind, namespace/name) and the YAML that will be applied, a Secret'
 activity log keeps each object with a hash of that YAML, and the objects already applied when a call
 is cut off.
 The *Always allow this* and *Allow for 1h* offers are left out where no rule can be that narrow:
-exec (a rule cannot pin the command), patches and GitOps actions (nor the patch), scale (nor the
+exec (a rule cannot pin the command), patches (nor the patch), scale (nor the
 replica count), `apply_manifest` (nor the content), requests other than lists with no object name
 (e.g. `check_certificates`: the rule would cover every name), requests across all namespaces (the
 rule would also cover namespaces no rule allows), and dry runs (the rule would allow the real write
-too).
+too). A GitOps action gets one: its rule allows that action (`sync`, say) on that object only.
 
 Before any rule is checked, a call's context must be named by one of the agent's Allow or Ask rules
-and not covered by a Deny of everything (`*` verbs, resources, namespaces and names): other contexts
+(`@protected` names none) and not covered by a Deny of everything (`*` verbs, resources, namespaces
+and names, on that context or on `@protected` when it is protected): other contexts
 are never contacted, nor listed to the agent. Calls follow the kubeconfig as it is now: a context
 removed from it is refused, and one pointed at another cluster or user is connected again. The names
 a call passes are validated: a namespace or
@@ -128,7 +148,7 @@ obvious verb:
   newest 20) in time order, each line prefixed with its pod. It needs `get` on the workload; pods
   whose logs the rules don't allow are left out and counted.
 - **Argo CD diagnosis:** `gitops` with `action: diagnose` on an Application changes nothing and
-  needs `get` on it (not `patch`; the activity log doesn't count it as a change). It returns the
+  needs `get` on it (not `refresh` or `sync`; the activity log doesn't count it as a change). It returns the
   diagnosis of the Application's page: a deletion held by a finalizer, a sync running for long,
   a failed sync (each object and why), a sync loop with the `ignoreDifferences` that would stop
   it, what is out of sync, and the fields that differ between what was last applied and the

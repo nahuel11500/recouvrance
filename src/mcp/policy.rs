@@ -1,8 +1,20 @@
 //! Agent rules: what each request may do (allow, ask, deny), decided the same way for every tool.
 
+use std::collections::HashSet;
+use std::sync::Arc;
+
 use serde::{Deserialize, Serialize};
 
 use crate::glob::glob;
+
+/// The context selector for the contexts protected in Settings → Contexts, resolved when a
+/// call is decided. Ask and Deny rules only: it makes requests there stricter, never possible.
+pub const PROTECTED: &str = "@protected";
+
+/// Whether a context pattern is the [`PROTECTED`] selector rather than a glob.
+pub fn is_protected_selector(pattern: &str) -> bool {
+    pattern.trim().eq_ignore_ascii_case(PROTECTED)
+}
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
 #[serde(rename_all = "lowercase")]
@@ -38,6 +50,12 @@ pub enum Verb {
     Scale,
     Restart,
     Patch,
+    /// Argo CD refresh and hard refresh: git is read again, nothing is deployed.
+    Refresh,
+    /// Argo CD sync and Flux reconcile: what git holds is deployed.
+    Sync,
+    /// Flux suspend and resume.
+    Suspend,
     Apply,
     Delete,
     Drain,
@@ -46,7 +64,7 @@ pub enum Verb {
 }
 
 impl Verb {
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 15] = [
         Self::Get,
         Self::List,
         Self::Logs,
@@ -55,6 +73,9 @@ impl Verb {
         Self::Scale,
         Self::Restart,
         Self::Patch,
+        Self::Refresh,
+        Self::Sync,
+        Self::Suspend,
         Self::Apply,
         Self::Delete,
         Self::Drain,
@@ -63,6 +84,10 @@ impl Verb {
 
     /// The verbs that only read (a default policy grants these).
     pub const READ: [Self; 3] = [Self::Get, Self::List, Self::Logs];
+
+    /// The GitOps actions' verbs, which were checked as `patch` before (see
+    /// [`Policy::add_gitops_verbs`]).
+    pub const GITOPS: [Self; 3] = [Self::Refresh, Self::Sync, Self::Suspend];
 
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -74,6 +99,9 @@ impl Verb {
             Self::Scale => "scale",
             Self::Restart => "restart",
             Self::Patch => "patch",
+            Self::Refresh => "refresh",
+            Self::Sync => "sync",
+            Self::Suspend => "suspend",
             Self::Apply => "apply",
             Self::Delete => "delete",
             Self::Drain => "drain",
@@ -91,7 +119,16 @@ impl Verb {
     pub const fn is_write(self) -> bool {
         matches!(
             self,
-            Self::Exec | Self::Scale | Self::Restart | Self::Patch | Self::Apply | Self::Delete | Self::Drain
+            Self::Exec
+                | Self::Scale
+                | Self::Restart
+                | Self::Patch
+                | Self::Refresh
+                | Self::Sync
+                | Self::Suspend
+                | Self::Apply
+                | Self::Delete
+                | Self::Drain
         )
     }
 }
@@ -221,16 +258,47 @@ pub fn any_glob(patterns: &[String], text: &str) -> bool {
     patterns.iter().any(|p| glob(&p.trim().to_lowercase(), &text.to_lowercase()))
 }
 
+/// How a rule covers a request.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Cover {
+    No,
+    /// Its patterns name the request's context.
+    Named,
+    /// Only through [`PROTECTED`]: the context is protected (or its protection unknown).
+    Protected,
+}
+
 impl Rule {
-    /// Does this rule cover the request? `any_namespace` checks whether the
-    /// rule could match some namespace (used before filtering list results).
+    /// Whether the rule has stopped applying.
     pub fn expired(&self) -> bool {
         self.expires.is_some_and(|t| t <= jiff::Timestamp::now())
     }
 
+    /// Does this rule cover the request? `any_namespace` checks whether the rule could match
+    /// some namespace (used before filtering list results). [`PROTECTED`] covers every
+    /// context here, as when protection can't be read; a [`Policy`] knows which are.
     pub fn matches(&self, a: &Access, any_namespace: bool) -> bool {
+        self.covers(a, any_namespace, &HashSet::new()) != Cover::No
+    }
+
+    /// Whether the patterns name this context, the [`PROTECTED`] selector aside.
+    fn names_context(&self, context: &str) -> bool {
+        self.contexts
+            .iter()
+            .any(|p| !is_protected_selector(p) && glob(&p.trim().to_lowercase(), &context.to_lowercase()))
+    }
+
+    /// Whether the contexts hold the [`PROTECTED`] selector.
+    fn names_protected(&self) -> bool {
+        self.contexts.iter().any(|p| is_protected_selector(p))
+    }
+
+    /// `matches`, saying whether only [`PROTECTED`] covers the context. A context is
+    /// protected unless `unprotected` holds it, so an empty set (protection unknown) counts
+    /// every context as protected. An Allow never covers through it.
+    fn covers(&self, a: &Access, any_namespace: bool, unprotected: &HashSet<String>) -> Cover {
         if self.expired() {
-            return false;
+            return Cover::No;
         }
         // A rule made by approving a request covers that request only: its resource as named
         // (not another group's kind with the same plural), names and contexts case included.
@@ -258,7 +326,21 @@ impl Rule {
             None if self.effect == Mode::Deny => self.names.iter().any(|n| n.trim() == "*"),
             None => !self.names.is_empty(),
         };
-        verb && resource && namespace && matches_any(&self.contexts, &a.context) && name
+        if !(verb && resource && namespace && name) {
+            return Cover::No;
+        }
+        let named = if exact {
+            self.contexts.iter().any(|p| !is_protected_selector(p) && glob(p.trim(), &a.context))
+        } else {
+            self.names_context(&a.context)
+        };
+        if named {
+            Cover::Named
+        } else if self.effect != Mode::Allow && self.names_protected() && !unprotected.contains(&a.context) {
+            Cover::Protected
+        } else {
+            Cover::No
+        }
     }
 
     /// Whether both rules cover the same requests, the same way (notes and expiry aside).
@@ -272,8 +354,10 @@ impl Rule {
     }
 
     /// For list filtering: a Deny that blocks the whole request regardless of namespace.
-    fn denies_everywhere(&self, a: &Access) -> bool {
-        self.effect == Mode::Deny && self.namespaces.iter().any(|n| n.trim() == "*") && self.matches(a, true)
+    fn denies_everywhere(&self, a: &Access, unprotected: &HashSet<String>) -> bool {
+        self.effect == Mode::Deny
+            && self.namespaces.iter().any(|n| n.trim() == "*")
+            && self.covers(a, true, unprotected) != Cover::No
     }
 }
 
@@ -302,6 +386,11 @@ pub struct Policy {
     pub(super) read: Option<Mode>,
     #[serde(skip_serializing)]
     pub(super) logs: Option<Mode>,
+    /// The contexts not protected in Settings → Contexts, for [`PROTECTED`]: filled when the
+    /// rules decide an agent's call ([`Policy::set_unprotected`]), never saved. Empty, every
+    /// context counts as protected, which only makes the rules stricter.
+    #[serde(skip)]
+    pub(super) unprotected: Arc<HashSet<String>>,
 }
 
 impl Default for Policy {
@@ -329,6 +418,7 @@ impl Default for Policy {
             reveal_secrets: false,
             read: None,
             logs: None,
+            unprotected: Arc::default(),
         }
     }
 }
@@ -348,14 +438,15 @@ impl Policy {
 
     /// Could the request succeed in some namespace? Rows are then filtered with `decide`.
     pub fn decide_any_namespace(&self, a: &Access) -> Verdict {
-        if let Some(i) = self.rules.iter().position(|r| r.denies_everywhere(a)) {
+        if let Some(i) = self.rules.iter().position(|r| r.denies_everywhere(a, &self.unprotected)) {
             return Verdict { mode: Mode::Deny, rule: Some(i) };
         }
         let mut probe = a.clone();
         probe.namespace = None;
-        let candidates =
-            self.rules.iter().enumerate().filter(|(_, r)| r.effect != Mode::Deny && r.matches(&probe, true));
-        best(candidates)
+        best(self.rules.iter().enumerate().filter(|(_, r)| r.effect != Mode::Deny).filter_map(|(i, r)| {
+            let cover = r.covers(&probe, true, &self.unprotected);
+            (cover != Cover::No).then_some((i, r, cover))
+        }))
     }
 
     /// The Ask rules an all-namespaces request meets in some namespace: what approving it covers.
@@ -363,7 +454,9 @@ impl Policy {
         let mut probe = a.clone();
         probe.namespace = None;
         (0..self.rules.len())
-            .filter(|&i| self.rules[i].effect == Mode::Ask && self.rules[i].matches(&probe, true))
+            .filter(|&i| {
+                self.rules[i].effect == Mode::Ask && self.rules[i].covers(&probe, true, &self.unprotected) != Cover::No
+            })
             .collect()
     }
 
@@ -371,7 +464,9 @@ impl Policy {
     /// covers.
     pub fn asks(&self, a: &Access) -> Vec<usize> {
         (0..self.rules.len())
-            .filter(|&i| self.rules[i].effect == Mode::Ask && self.rules[i].matches(a, false))
+            .filter(|&i| {
+                self.rules[i].effect == Mode::Ask && self.rules[i].covers(a, false, &self.unprotected) != Cover::No
+            })
             .collect()
     }
 
@@ -403,9 +498,49 @@ impl Policy {
 
     fn decide_inner(&self, a: &Access, any_ns: bool) -> Verdict {
         let inside = namespace_contents(a);
-        best(self.rules.iter().enumerate().filter(|(_, r)| {
-            r.matches(a, any_ns) || inside.as_ref().is_some_and(|i| r.effect != Mode::Allow && r.matches(i, false))
+        best(self.rules.iter().enumerate().filter_map(|(i, r)| {
+            let mut cover = r.covers(a, any_ns, &self.unprotected);
+            if cover == Cover::No
+                && r.effect != Mode::Allow
+                && let Some(inside) = &inside
+            {
+                cover = r.covers(inside, false, &self.unprotected);
+            }
+            (cover != Cover::No).then_some((i, r, cover))
         }))
+    }
+
+    /// Whether some rule names the [`PROTECTED`] selector: the protection of contexts must
+    /// then be read ([`Policy::set_unprotected`]) before the rules decide a call.
+    pub fn names_protected(&self) -> bool {
+        self.rules.iter().any(Rule::names_protected)
+    }
+
+    /// The contexts that are not protected, for [`PROTECTED`] in the decisions that follow.
+    /// Any other context counts as protected (one the kubeconfig doesn't have, or every one
+    /// when the protection can't be read).
+    pub fn set_unprotected(&mut self, contexts: impl IntoIterator<Item = String>) {
+        self.unprotected = Arc::new(contexts.into_iter().collect());
+    }
+
+    /// Rules from before the GitOps verbs checked GitOps actions as `patch`: each rule that
+    /// names `patch` gets `refresh`, `sync` and `suspend` too, so it allows, asks or denies
+    /// them as it did. Run once (agents.json says which version wrote the rules): after that,
+    /// a verb taken out of a rule stays out. Whether a rule changed.
+    pub(super) fn add_gitops_verbs(&mut self) -> bool {
+        let mut changed = false;
+        for r in &mut self.rules {
+            if !r.verbs.iter().any(|v| v.trim().eq_ignore_ascii_case(Verb::Patch.as_str())) {
+                continue;
+            }
+            for verb in Verb::GITOPS {
+                if !r.verbs.iter().any(|v| v.trim().eq_ignore_ascii_case(verb.as_str())) {
+                    r.verbs.push(verb.to_string());
+                    changed = true;
+                }
+            }
+        }
+        changed
     }
 
     /// Rules pasted as JSON ("Copy rules" on another agent), None when there are none.
@@ -422,16 +557,22 @@ impl Policy {
         Some(p)
     }
 
-    /// The context patterns of the non-expired Allow and Ask rules.
+    /// The context patterns of the non-expired Allow and Ask rules (not [`PROTECTED`], which
+    /// opens no context).
     pub fn context_patterns(&self) -> Vec<String> {
-        self.rules.iter().filter(|r| r.effect != Mode::Deny && !r.expired()).flat_map(|r| r.contexts.clone()).collect()
+        self.rules
+            .iter()
+            .filter(|r| r.effect != Mode::Deny && !r.expired())
+            .flat_map(|r| r.contexts.iter().filter(|p| !is_protected_selector(p)).cloned())
+            .collect()
     }
 
     /// Whether some non-expired Allow or Ask rule names this context, and no Deny of
-    /// everything covers it: checked before connecting.
+    /// everything covers it: checked before connecting. [`PROTECTED`] names no context here:
+    /// it only makes requests on a context another rule opens stricter.
     pub fn context_allowed(&self, context: &str) -> bool {
         self.context_denied_by(context).is_none()
-            && self.rules.iter().any(|r| r.effect != Mode::Deny && !r.expired() && any_glob(&r.contexts, context))
+            && self.rules.iter().any(|r| r.effect != Mode::Deny && !r.expired() && r.names_context(context))
     }
 
     /// The non-expired Deny of everything (`*` verbs, resources, namespaces and names) that
@@ -445,7 +586,7 @@ impl Policy {
                 && all(&r.resources)
                 && all(&r.namespaces)
                 && all(&r.names)
-                && any_glob(&r.contexts, context)
+                && (r.names_context(context) || (r.names_protected() && !self.unprotected.contains(context)))
         })
     }
 
@@ -523,10 +664,14 @@ fn namespace_contents(a: &Access) -> Option<Access> {
     Some(Access { namespace: Some(a.name.clone()?), ..a.clone() })
 }
 
-fn best<'a>(matching: impl Iterator<Item = (usize, &'a Rule)>) -> Verdict {
+fn best<'a>(matching: impl Iterator<Item = (usize, &'a Rule, Cover)>) -> Verdict {
     let mut verdict = Verdict { mode: Mode::Deny, rule: None };
     let mut rank = 0;
-    for (i, r) in matching {
+    // `@protected` makes requests stricter, never possible: an Ask rule that covers a request
+    // only through it counts when another rule covers the request too. Alone, nothing does.
+    let mut opened = false;
+    for (i, r, cover) in matching {
+        opened |= r.effect != Mode::Ask || cover != Cover::Protected;
         let r_rank = match r.effect {
             Mode::Deny => 4,
             Mode::Allow if r.approved => 3,
@@ -538,7 +683,7 @@ fn best<'a>(matching: impl Iterator<Item = (usize, &'a Rule)>) -> Verdict {
             verdict = Verdict { mode: r.effect, rule: Some(i) };
         }
     }
-    verdict
+    if opened { verdict } else { Verdict { mode: Mode::Deny, rule: None } }
 }
 
 #[cfg(test)]
@@ -866,6 +1011,9 @@ pub(super) mod tests {
         assert!(approval("exec_command", "exec", Some("web-1")).as_rule().is_none());
         assert!(approval("exec_command", "exec", Some("web-1")).as_rule_for_an_hour().is_none());
         assert!(approval("gitops", "patch", Some("app")).as_rule().is_none());
+        // A GitOps action has its own verb: the rule pins the action and the object.
+        assert!(approval("gitops", "sync", Some("app")).as_rule().is_some());
+        assert!(approval("gitops", "refresh", None).as_rule().is_none());
         // A rule could not pin the patch body or the replica count.
         assert!(approval("patch_resource", "patch", Some("web")).as_rule().is_none());
         assert!(approval("scale", "scale", Some("web")).as_rule_for_an_hour().is_none());
@@ -886,6 +1034,93 @@ pub(super) mod tests {
         // Approving a dry run must not allow the real write.
         let dry = Approval { dry_run: true, ..approval("delete_resource", "delete", Some("web")) };
         assert!(dry.as_rule().is_none() && dry.as_rule_for_an_hour().is_none());
+    }
+
+    #[test]
+    fn approving_a_sync_allows_that_sync_only() {
+        let approval = Approval {
+            id: 1,
+            agent_id: "a".into(),
+            agent: "a".into(),
+            tool: "gitops".into(),
+            summary: String::new(),
+            access: access("hub", "sync", "applications.argoproj.io", Some("argocd"), Some("web")),
+            dry_run: false,
+        };
+        let ask = rule(Mode::Ask, &["patch", "sync"], &["*"], &["*"], &["*"]);
+        let p = Policy { rules: vec![ask, approval.as_rule().unwrap()], ..Policy::default() };
+        let d = |verb: &str, name: &str| {
+            p.decide(&access("hub", verb, "applications.argoproj.io", Some("argocd"), Some(name))).mode
+        };
+        assert_eq!(d("sync", "web"), Mode::Allow);
+        assert_eq!(d("sync", "api"), Mode::Ask);
+        // Not a patch of its spec (target revision, destination).
+        assert_eq!(d("patch", "web"), Mode::Ask);
+    }
+
+    #[test]
+    fn gitops_verbs_are_added_to_rules_naming_patch_once() {
+        let mut p = Policy {
+            rules: vec![
+                rule(Mode::Allow, &["get", "patch"], &["*"], &["*"], &["*"]),
+                rule(Mode::Ask, &["Patch", "sync"], &["*"], &["*"], &["*"]),
+                rule(Mode::Deny, &["*"], &["secrets"], &["*"], &["*"]),
+                rule(Mode::Allow, &["restart"], &["*"], &["*"], &["*"]),
+            ],
+            ..Policy::default()
+        };
+        assert!(p.add_gitops_verbs());
+        assert_eq!(p.rules[0].verbs, ["get", "patch", "refresh", "sync", "suspend"]);
+        assert_eq!(p.rules[1].verbs, ["Patch", "sync", "refresh", "suspend"]);
+        assert_eq!(p.rules[2].verbs, ["*"]);
+        assert_eq!(p.rules[3].verbs, ["restart"]);
+        // Run again, it would put back a verb taken out by hand: it runs once, by version.
+        p.rules[1].verbs.retain(|v| v != "refresh");
+        assert!(p.add_gitops_verbs());
+        assert!(!p.add_gitops_verbs());
+    }
+
+    #[test]
+    fn protected_contexts_only_make_rules_stricter() {
+        let protect = |effect| rule(effect, &["delete"], &["*"], &["*"], &[PROTECTED]);
+        let mut p = Policy {
+            rules: vec![rule(Mode::Allow, &["get", "delete"], &["*"], &["*"], &["*"]), protect(Mode::Ask)],
+            ..Policy::default()
+        };
+        p.set_unprotected(["dev".to_string()]);
+        let d = |p: &Policy, ctx: &str, verb: &str| p.decide(&access(ctx, verb, "pods", Some("ns"), Some("x"))).mode;
+        assert_eq!(d(&p, "dev", "delete"), Mode::Allow);
+        assert_eq!(d(&p, "prod", "delete"), Mode::Ask);
+        assert_eq!(d(&p, "prod", "get"), Mode::Allow);
+        // On its own, an Ask of @protected opens nothing: no rule allowed the request.
+        let alone = Policy { rules: vec![protect(Mode::Ask)], ..Policy::default() };
+        assert_eq!(
+            alone.decide(&access("prod", "delete", "pods", Some("ns"), Some("x"))),
+            Verdict { mode: Mode::Deny, rule: None }
+        );
+        assert!(!alone.context_allowed("prod"));
+        // An Allow of @protected allows nothing.
+        let allow = Policy { rules: vec![protect(Mode::Allow)], ..Policy::default() };
+        assert_eq!(d(&allow, "prod", "delete"), Mode::Deny);
+        assert!(!allow.context_allowed("prod"));
+        // A Deny of everything on @protected: those contexts are never contacted.
+        let mut deny = Policy {
+            rules: vec![
+                rule(Mode::Allow, &["get"], &["*"], &["*"], &["*"]),
+                rule(Mode::Deny, &["*"], &["*"], &["*"], &[" @Protected "]),
+            ],
+            ..Policy::default()
+        };
+        deny.set_unprotected(["dev".to_string()]);
+        assert!(deny.context_allowed("dev"));
+        assert_eq!(deny.context_denied_by("prod"), Some(1));
+        assert_eq!(deny.decide_any_namespace(&access("prod", "list", "pods", None, None)).mode, Mode::Deny);
+        // Not read yet: every context is protected.
+        deny.set_unprotected(Vec::new());
+        assert!(!deny.context_allowed("dev"));
+        // The selector is no context name, for presets keeping the agent's contexts.
+        assert_eq!(p.context_patterns(), ["*"]);
+        assert!(p.names_protected() && !Policy::default().names_protected());
     }
 
     #[test]
@@ -957,9 +1192,25 @@ pub(super) mod tests {
 /// single examples: what a reviewer would otherwise have to check case by case.
 #[cfg(test)]
 pub(crate) mod properties {
-    use super::{Access, Mode, Policy, Rule, Verb};
+    use super::{Access, Mode, PROTECTED, Policy, Rule, Verb};
     use crate::mcp::Approval;
     use proptest::prelude::*;
+
+    /// How strict a decision is: Allow, then Ask, then Deny.
+    fn strictness(mode: Mode) -> u8 {
+        match mode {
+            Mode::Allow => 0,
+            Mode::Ask => 1,
+            Mode::Deny => 2,
+        }
+    }
+
+    /// The policy with these contexts not protected.
+    fn resolved(policy: &Policy, unprotected: &[String]) -> Policy {
+        let mut p = policy.clone();
+        p.set_unprotected(unprotected.iter().cloned());
+        p
+    }
 
     pub(crate) fn pattern() -> impl Strategy<Value = String> {
         prop_oneof![Just("*"), Just("a"), Just("b"), Just("a*"), Just("team-*"), Just("team-a")].prop_map(String::from)
@@ -983,7 +1234,26 @@ pub(crate) mod properties {
     }
 
     pub(crate) fn verb() -> impl Strategy<Value = Verb> {
-        prop_oneof![Just(Verb::Get), Just(Verb::List), Just(Verb::Delete), Just(Verb::Patch), Just(Verb::Exec)]
+        prop_oneof![
+            Just(Verb::Get),
+            Just(Verb::List),
+            Just(Verb::Delete),
+            Just(Verb::Patch),
+            Just(Verb::Exec),
+            Just(Verb::Refresh),
+            Just(Verb::Sync),
+            Just(Verb::Suspend),
+        ]
+    }
+
+    /// Context patterns, `@protected` among them.
+    pub(crate) fn context_patterns() -> impl Strategy<Value = Vec<String>> {
+        prop::collection::vec(prop_oneof![4 => pattern(), 1 => Just(PROTECTED.to_string())], 0..3)
+    }
+
+    /// Contexts that are not protected, for `@protected` (empty: protection unknown).
+    pub(crate) fn unprotected() -> impl Strategy<Value = Vec<String>> {
+        prop::collection::vec(value(), 0..4)
     }
 
     pub(crate) fn rule() -> impl Strategy<Value = Rule> {
@@ -992,7 +1262,7 @@ pub(crate) mod properties {
             prop::collection::vec(prop_oneof![verb().prop_map(|v| v.to_string()), Just("*".to_string())], 0..3),
             patterns(),
             patterns(),
-            patterns(),
+            context_patterns(),
             patterns(),
             any::<bool>(),
         )
@@ -1057,12 +1327,17 @@ pub(crate) mod properties {
         /// same verb, resource and context, same namespace and name unless the approved
         /// request had none.
         #[test]
-        fn an_approval_never_grants_more_than_the_request(a in access(), b in access(), dry_run in any::<bool>()) {
+        fn an_approval_never_grants_more_than_the_request(
+            a in access(),
+            b in access(),
+            dry_run in any::<bool>(),
+            tool in prop_oneof![Just("get_resource"), Just("gitops")],
+        ) {
             let approval = Approval {
                 id: 1,
                 agent_id: "agent".into(),
                 agent: "agent".into(),
-                tool: "get_resource".into(),
+                tool: tool.into(),
                 summary: String::new(),
                 access: a.clone(),
                 dry_run,
@@ -1082,6 +1357,53 @@ pub(crate) mod properties {
                     }
                 }
             }
+        }
+
+        /// Protection that can't be read counts every context as protected: no request is
+        /// then decided less strictly, nor a context opened, than with any protection read.
+        #[test]
+        fn unknown_protection_is_never_less_strict(policy in policy(), a in access(), unprotected in unprotected()) {
+            let known = resolved(&policy, &unprotected);
+            prop_assert!(strictness(policy.decide(&a).mode) >= strictness(known.decide(&a).mode));
+            prop_assert!(
+                strictness(policy.decide_any_namespace(&a).mode) >= strictness(known.decide_any_namespace(&a).mode)
+            );
+            prop_assert!(!policy.context_allowed(&a.context) || known.context_allowed(&a.context));
+        }
+
+        /// `@protected` only makes the rules stricter: a rule naming only it, whatever its
+        /// effect, never decides a request less strictly, nor opens a context.
+        #[test]
+        fn a_protected_rule_never_widens(policy in policy(), extra in rule(), a in access(), unprotected in unprotected()) {
+            let before = resolved(&policy, &unprotected);
+            let mut after = before.clone();
+            after.rules.push(Rule { contexts: vec![PROTECTED.into()], ..extra });
+            prop_assert!(strictness(after.decide(&a).mode) >= strictness(before.decide(&a).mode));
+            prop_assert!(
+                strictness(after.decide_any_namespace(&a).mode) >= strictness(before.decide_any_namespace(&a).mode)
+            );
+            prop_assert!(!after.context_allowed(&a.context) || before.context_allowed(&a.context));
+        }
+
+        /// Rules from before the GitOps verbs, once upgraded, decide a GitOps action as they
+        /// decided `patch` on the same object, and every other request as before. Upgrading
+        /// again changes nothing.
+        #[test]
+        fn upgraded_rules_decide_gitops_actions_as_they_did_patch(
+            policy in policy(),
+            a in access(),
+            unprotected in unprotected(),
+        ) {
+            let mut old = resolved(&policy, &unprotected);
+            for r in &mut old.rules {
+                r.verbs.retain(|v| !Verb::GITOPS.iter().any(|g| v.eq_ignore_ascii_case(g.as_str())));
+            }
+            let mut new = old.clone();
+            new.add_gitops_verbs();
+            prop_assert!(!new.clone().add_gitops_verbs());
+            let verdicts = |p: &Policy, b: &Access| (p.decide(b), p.decide_any_namespace(b));
+            let before = if Verb::GITOPS.contains(&a.verb) { Access { verb: Verb::Patch, ..a.clone() } } else { a.clone() };
+            prop_assert_eq!(verdicts(&new, &a), verdicts(&old, &before));
         }
     }
 }
