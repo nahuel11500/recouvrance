@@ -73,16 +73,17 @@ pub struct Approval {
 impl Approval {
     /// A narrow Allow rule for exactly this request, when a rule can be that narrow.
     /// None for exec (a rule cannot pin the command), patches (the rule would allow any
-    /// patch), scale (it would allow any replica count, 0 too), apply (the
+    /// patch), scale (it would allow any replica count, 0 too), Flux suspend and resume (one
+    /// verb for both: approving a resume would allow suspending), apply (the
     /// rule could not pin the content), a request other than a list with no object name
     /// (the rule would cover every name), a request across all namespaces (the rule would
     /// also cover namespaces no rule allows) and dry runs (a rule cannot be limited to dry
     /// runs, so it would allow the real write).
     pub fn as_rule(&self) -> Option<Rule> {
         let a = &self.access;
-        // A GitOps action has its own verb (`refresh`, `sync`, `suspend`), so its rule
-        // allows that action on that object only.
-        if matches!(a.verb, Verb::Exec | Verb::Patch | Verb::Scale)
+        // A refresh or a sync has its own verb, so its rule allows that action on that
+        // object only.
+        if matches!(a.verb, Verb::Exec | Verb::Patch | Verb::Scale | Verb::Suspend)
             || self.tool == "apply_manifest"
             || self.dry_run
             || (a.verb != Verb::List && a.name.is_none())
@@ -478,7 +479,16 @@ impl Hub {
             let mut cfg = write(&self.config);
             let mut agents = cfg.agents.clone();
             let agent = agents.iter_mut().find(|a| a.id == id).context("unknown agent")?;
+            let allowed_protected = agent.policy.allow_names_protected();
             f(agent);
+            // rules.yaml could not hold it, and it would allow nothing. One already in a
+            // hand-edited agents.json doesn't block other edits.
+            if agent.policy.allow_names_protected() && !allowed_protected {
+                anyhow::bail!(
+                    "`{}` works in Ask and Deny rules only: in an Allow rule it would allow nothing",
+                    super::PROTECTED
+                );
+            }
             // rules.yaml doesn't hold the Enabled switch: only write it when names or rules change.
             if !same_rules(&cfg.agents, &agents) {
                 self.export_rules(&agents)?;
@@ -765,6 +775,22 @@ mod tests {
         ruled.policy.max_rows += 1;
         assert!(!same_rules(std::slice::from_ref(&agent), &[ruled]));
         assert!(!same_rules(std::slice::from_ref(&agent), &[]));
+    }
+
+    /// rules.yaml refuses `@protected` in an Allow rule, so the app never holds one it
+    /// could not write back. Refused before anything is saved: no file is written here.
+    #[test]
+    fn an_allow_rule_naming_protected_contexts_is_not_saved() {
+        use crate::mcp::policy::tests::rule;
+        let protected = |effect| rule(effect, &["delete"], &["pods"], &["*"], &["staging", super::super::PROTECTED]);
+        let hub = Hub::for_test(vec![agent()]);
+        assert!(hub.update_agent("a1", |a| a.policy.rules.push(protected(Mode::Allow))).is_err());
+        assert_eq!(hub.agent("a1").unwrap().policy.rules, Policy::default().rules);
+        // Ask and Deny rules may name it.
+        for effect in [Mode::Ask, Mode::Deny] {
+            let p = Policy { rules: vec![protected(effect)], ..Policy::default() };
+            assert!(!p.allow_names_protected());
+        }
     }
 
     #[test]

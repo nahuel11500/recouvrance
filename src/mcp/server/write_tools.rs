@@ -260,7 +260,8 @@ impl KubeMcp {
         if p.action == "diagnose" {
             return self.argo_diagnose(call, client, kind, &p.context, &p.namespace, &p.name).await;
         }
-        let verb = gitops_verb(&p.action);
+        let verb =
+            gitops_verb(&p.action).ok_or_else(|| call.fail(format!("`{}` has no verb in the rules", p.action)))?;
         let access = access_for(&kind, &p.context, verb, Some(p.namespace.clone()), Some(p.name.clone()));
         if p.action == "sync" {
             call.plan = Some(Plan::Sync {
@@ -311,11 +312,13 @@ impl KubeMcp {
 
 /// The rules' verb for a GitOps action: a refresh deploys nothing, a sync (or a Flux
 /// reconcile) deploys what the repository holds, and suspend and resume stop or restart that.
-fn gitops_verb(action: &str) -> Verb {
+/// None for any other action, so one added later is refused until it is given its verb.
+fn gitops_verb(action: &str) -> Option<Verb> {
     match action {
-        "refresh" | "hard_refresh" => Verb::Refresh,
-        "sync" | "reconcile" => Verb::Sync,
-        _ => Verb::Suspend,
+        "refresh" | "hard_refresh" => Some(Verb::Refresh),
+        "sync" | "reconcile" => Some(Verb::Sync),
+        "suspend" | "resume" => Some(Verb::Suspend),
+        _ => None,
     }
 }
 
@@ -439,5 +442,29 @@ impl KubeMcp {
             planned.push((kind, ns, name, doc));
         }
         Ok((client, planned))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::gitops_verb;
+    use crate::mcp::Verb;
+
+    #[test]
+    fn each_gitops_action_has_its_verb() {
+        let cases = [
+            ("refresh", Verb::Refresh),
+            ("hard_refresh", Verb::Refresh),
+            ("sync", Verb::Sync),
+            ("reconcile", Verb::Sync),
+            ("suspend", Verb::Suspend),
+            ("resume", Verb::Suspend),
+        ];
+        for (action, verb) in cases {
+            assert_eq!(gitops_verb(action), Some(verb), "{action}");
+        }
+        // Never `patch`, and nothing for an action without its own verb.
+        assert_eq!(gitops_verb("diagnose"), None);
+        assert_eq!(gitops_verb("rollback"), None);
     }
 }

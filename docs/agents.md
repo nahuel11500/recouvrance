@@ -57,7 +57,8 @@ agent write while the window shows `read-only`, and on a protected context witho
 to keep agents off a context or from writing, give them *Ask me* or Deny rules for it (or no Allow).
 The context `@protected` stands for the contexts protected in Settings → Contexts, read again at
 each call, so a context protected later (or guessed as production when it appears) is covered
-without editing the rules. It works in Ask and Deny rules only, and only makes requests stricter:
+without editing the rules. It works in Ask and Deny rules only (the Agents page doesn't save an
+Allow rule naming it), and only makes requests stricter:
 an Ask rule covers a request through it only when another rule covers that request too, so it
 never lets an agent ask for, or reach, a context no other rule names. When the protection can't be
 read, every context counts as protected. An Allow rule naming it allows nothing (rules.yaml refuses
@@ -96,7 +97,9 @@ exec (a rule cannot pin the command), patches (nor the patch), scale (nor the
 replica count), `apply_manifest` (nor the content), requests other than lists with no object name
 (e.g. `check_certificates`: the rule would cover every name), requests across all namespaces (the
 rule would also cover namespaces no rule allows), and dry runs (the rule would allow the real write
-too). A GitOps action gets one: its rule allows that action (`sync`, say) on that object only.
+too), and Flux suspend and resume (one `suspend` verb covers both, so approving a resume would also
+allow suspending). A refresh or a sync gets one: its rule allows that action (`sync`, say) on that
+object only.
 
 Before any rule is checked, a call's context must be named by one of the agent's Allow or Ask rules
 (`@protected` names none) and not covered by a Deny of everything (`*` verbs, resources, namespaces

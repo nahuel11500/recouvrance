@@ -397,8 +397,9 @@ fn presets(contexts: &[String]) -> Vec<(&'static str, Vec<Rule>)> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::mcp::Policy;
+    // Not `super::*`: it brings in gpui_kit's `test` macro, which `#[test]` would then name.
+    use super::{ARGO_APPS, presets};
+    use crate::mcp::{Access, Mode, Policy, Verb};
 
     fn access(context: &str, verb: Verb, resource: &str, name: &str) -> Access {
         Access {

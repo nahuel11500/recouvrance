@@ -615,7 +615,9 @@ mod properties {
         Agent { id: format!("id-{name}"), name: name.into(), token_sha256: String::new(), enabled: true, policy }
     }
 
-    /// Rules the file can hold: `@protected` only in ask and deny rules.
+    /// Rules the file can hold, which are those the app saves (`Hub::update_agent` refuses
+    /// the rest, see `the_app_holds_only_rules_the_file_can_write`): `@protected` only in
+    /// ask and deny rules.
     fn writable_policy() -> impl Strategy<Value = Policy> {
         policy().prop_map(|mut p| {
             for r in p.rules.iter_mut().filter(|r| r.effect == Mode::Allow) {
@@ -679,6 +681,14 @@ mod properties {
                 let l = |p: &Policy| (p.max_calls_per_minute, p.max_log_lines, p.max_rows, p.exec_timeout);
                 prop_assert_eq!(l(&a.policy), l(&b.policy));
             }
+        }
+
+        /// The file refuses exactly the rules the app refuses to save (an Allow naming
+        /// `@protected`): an edit in the app can always be written to rules.yaml.
+        #[test]
+        fn the_app_holds_only_rules_the_file_can_write(p in policy()) {
+            let rendered = render(&[agent("ci", p.clone())]);
+            prop_assert_eq!(rendered.is_ok(), !p.allow_names_protected(), "{:?}", rendered.err());
         }
 
         /// A rule is written only when it reads back as the same rule: blank patterns and

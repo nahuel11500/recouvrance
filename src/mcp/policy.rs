@@ -281,6 +281,13 @@ impl Rule {
         self.covers(a, any_namespace, &HashSet::new()) != Cover::No
     }
 
+    /// Whether the verbs name this one (`*` aside), as decisions read them: the upgrade to
+    /// the GitOps verbs reads them the same way, so it gives them only to rules that matched
+    /// `patch`.
+    fn lists_verb(&self, verb: Verb) -> bool {
+        self.verbs.iter().any(|v| v.eq_ignore_ascii_case(verb.as_str()))
+    }
+
     /// Whether the patterns name this context, the [`PROTECTED`] selector aside.
     fn names_context(&self, context: &str) -> bool {
         self.contexts
@@ -306,7 +313,7 @@ impl Rule {
         let matches_any = |patterns: &[String], text: &str| {
             if exact { patterns.iter().any(|p| glob(p.trim(), text)) } else { any_glob(patterns, text) }
         };
-        let verb = self.verbs.iter().any(|v| v == "*" || v.eq_ignore_ascii_case(a.verb.as_str()));
+        let verb = self.verbs.iter().any(|v| v == "*") || self.lists_verb(a.verb);
         let resource = if exact {
             matches_any(&self.resources, &a.resource)
         } else {
@@ -516,6 +523,12 @@ impl Policy {
         self.rules.iter().any(Rule::names_protected)
     }
 
+    /// Whether some Allow rule names [`PROTECTED`]: it would allow nothing there, and
+    /// rules.yaml refuses it, so the app doesn't save one either.
+    pub fn allow_names_protected(&self) -> bool {
+        self.rules.iter().any(|r| r.effect == Mode::Allow && r.names_protected())
+    }
+
     /// The contexts that are not protected, for [`PROTECTED`] in the decisions that follow.
     /// Any other context counts as protected (one the kubeconfig doesn't have, or every one
     /// when the protection can't be read).
@@ -530,11 +543,11 @@ impl Policy {
     pub(super) fn add_gitops_verbs(&mut self) -> bool {
         let mut changed = false;
         for r in &mut self.rules {
-            if !r.verbs.iter().any(|v| v.trim().eq_ignore_ascii_case(Verb::Patch.as_str())) {
+            if !r.lists_verb(Verb::Patch) {
                 continue;
             }
             for verb in Verb::GITOPS {
-                if !r.verbs.iter().any(|v| v.trim().eq_ignore_ascii_case(verb.as_str())) {
+                if !r.lists_verb(verb) {
                     r.verbs.push(verb.to_string());
                     changed = true;
                 }
@@ -1020,6 +1033,9 @@ pub(super) mod tests {
         // A GitOps action has its own verb: the rule pins the action and the object.
         assert!(approval("gitops", "sync", Some("app")).as_rule().is_some());
         assert!(approval("gitops", "refresh", None).as_rule().is_none());
+        // Suspend and resume share a verb: a rule from approving one would allow the other.
+        assert!(approval("gitops", "suspend", Some("app")).as_rule().is_none());
+        assert!(approval("gitops", "suspend", Some("app")).as_rule_for_an_hour().is_none());
         // A rule could not pin the patch body or the replica count.
         assert!(approval("patch_resource", "patch", Some("web")).as_rule().is_none());
         assert!(approval("scale", "scale", Some("web")).as_rule_for_an_hour().is_none());
@@ -1074,10 +1090,13 @@ pub(super) mod tests {
                 rule(Mode::Ask, &["Patch", "sync"], &["*"], &["*"], &["*"]),
                 rule(Mode::Deny, &["*"], &["secrets"], &["*"], &["*"]),
                 rule(Mode::Allow, &["restart"], &["*"], &["*"], &["*"]),
+                // Hand-edited agents.json: ` patch` never matched a request, so it gains nothing.
+                rule(Mode::Allow, &[" patch"], &["*"], &["*"], &["*"]),
             ],
             ..Policy::default()
         };
         assert!(p.add_gitops_verbs());
+        assert_eq!(p.rules[4].verbs, [" patch"]);
         assert_eq!(p.rules[0].verbs, ["get", "patch", "refresh", "sync", "suspend"]);
         assert_eq!(p.rules[1].verbs, ["Patch", "sync", "refresh", "suspend"]);
         assert_eq!(p.rules[2].verbs, ["*"]);
