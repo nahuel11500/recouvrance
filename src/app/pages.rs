@@ -121,12 +121,18 @@ impl AppView {
         let forwards = self.forwards.clone();
         let favorites = self.favorites.clone();
         let clusters = self.clusters.clone();
+        // The kinds its context serves; none known for a context that isn't connected.
+        let kinds: Vec<Kind> = match self.clusters.iter().position(|(n, _)| *n == context) {
+            Some(ix) => self.served_kinds(ix).cloned().collect(),
+            None => Vec::new(),
+        };
         let context_name = context.clone();
         let (own_context, own_client) = (context.clone(), client.clone());
         let own = (context.clone(), client.clone());
         let panel = cx.new(|cx| {
             let mut p = DetailPanel::new(client, context, risky, forwards, favorites, obj, window, cx);
             p.clusters = clusters;
+            p.kinds = kinds;
             p
         });
         cx.subscribe_in(&panel, window, |this, _, ev: &crate::plugins::RunPlugin, window, cx| {

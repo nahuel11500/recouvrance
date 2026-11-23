@@ -57,6 +57,23 @@
   included: probes, usage vs requests/limits, ports, env, mounts), workloads (scheduling, pods, revisions with diffs), services (port-forward, backing
   pods), secrets (masked, referenced by), ingresses, PVCs, namespaces (quotas), nodes, CronJobs,
   and a generic spec/status view for anything else.
+- **Map**: every detail page has a Map tab, what the object is linked to. A pod or workload
+  starts with its tree (Services, the ConfigMaps, Secrets, PVCs and ServiceAccount its pods use,
+  ReplicaSets, pods, nodes). Then, for every kind: its owners and what it owns; the pods a
+  Service, PDB or NetworkPolicy selects, and the PDBs, NetworkPolicies, HPA and Ingresses or
+  HTTPRoutes (through its Services) of a pod or workload; what uses a Secret or ConfigMap (pods
+  and workloads by env, envFrom, volumes and pull Secrets, a ServiceAccount, an Ingress's TLS)
+  and where it comes from (an ExternalSecret, a cert-manager Certificate); a ServiceAccount's
+  Secrets and pods; a PVC's volume, StorageClass and pods; an Ingress's or HTTPRoute's Services
+  with the pods behind them, TLS Secrets, class or Gateways; an HPA's or VPA's target; a
+  binding's role and ServiceAccounts; a node's pods. An operator's custom resource also shows
+  what is labelled with its name (`cnpg.io/cluster`, `app.kubernetes.io/instance`…) and the
+  operator's other resources naming it in their spec (a CloudNativePG Cluster's Backups,
+  ScheduledBackups and Poolers; a generic rule for `cluster`, `…Ref` and `secretName` fields).
+  A kind with nothing else known shows its owners and what it owns, and says so when there is
+  nothing. It is read when the tab opens, in the object's namespace only, from the API server's
+  cache (metadata alone where that is enough), next to what the page already holds; a
+  cluster-scoped object reads nothing more. Each relation shows 50 objects and counts the rest.
 - **Select and copy text** on detail pages, as on a web page: a drag selects (across fields,
   labels, annotations, conditions, events, the History, Compare and Reachability tabs), Ctrl+C (⌘C
   on macOS) or a right-click *Copy* copies it, a double-click selects a word. Text cut short with

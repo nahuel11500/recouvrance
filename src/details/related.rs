@@ -433,32 +433,12 @@ async fn fetch_objects(
     related
 }
 
-/// Does a pod spec use this Secret/ConfigMap (volumes, env, envFrom, pull secrets)?
+/// Does a pod spec use this Secret/ConfigMap (volumes, env, envFrom, pull secrets, optional
+/// ones too)? The same references the Map and the Problems page read (`spec_refs`).
 pub(super) fn references(spec: &serde_json::Value, name: &str, secret: bool) -> bool {
-    let is = |v: Option<&serde_json::Value>| v.and_then(|v| v.as_str()) == Some(name);
-    let volumes = spec["volumes"].as_array().into_iter().flatten();
-    let in_volumes = volumes
-        .clone()
-        .any(|v| if secret { is(v.pointer("/secret/secretName")) } else { is(v.pointer("/configMap/name")) })
-        || volumes
-            .flat_map(|v| v.pointer("/projected/sources").and_then(|s| s.as_array()).into_iter().flatten())
-            .any(|s| if secret { is(s.pointer("/secret/name")) } else { is(s.pointer("/configMap/name")) });
-    let containers = ["containers", "initContainers"].iter().flat_map(|k| spec[*k].as_array().into_iter().flatten());
-    let in_env = containers.clone().any(|c| {
-        c["env"].as_array().into_iter().flatten().any(|e| {
-            if secret {
-                is(e.pointer("/valueFrom/secretKeyRef/name"))
-            } else {
-                is(e.pointer("/valueFrom/configMapKeyRef/name"))
-            }
-        }) || c["envFrom"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .any(|e| if secret { is(e.pointer("/secretRef/name")) } else { is(e.pointer("/configMapRef/name")) })
-    });
-    let in_pull = secret && spec["imagePullSecrets"].as_array().into_iter().flatten().any(|p| is(p.get("name")));
-    in_volumes || in_env || in_pull
+    use crate::problems::references::{Of, spec_refs};
+    let of = if secret { Of::Secret } else { Of::ConfigMap };
+    spec_refs(None, spec, true).iter().any(|t| t.of == of && t.name == name)
 }
 
 #[cfg(test)]

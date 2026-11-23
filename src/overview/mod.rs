@@ -201,7 +201,7 @@ impl Ctx<'_> {
     }
 
     /// A link to an object in another namespace.
-    fn link_in(
+    pub(crate) fn link_in(
         &self,
         text: impl Into<SharedString>,
         kind: &str,
@@ -320,7 +320,7 @@ pub(crate) fn column_cell(width: f32, shrinks: bool) -> Div {
     if shrinks { d.flex_shrink(1.).min_w(px(width / 2.)) } else { d.flex_none() }
 }
 
-fn state_color(text: &str, cx: &App) -> Hsla {
+pub(crate) fn state_color(text: &str, cx: &App) -> Hsla {
     crate::status::tone(text).map_or(cx.theme().muted_foreground, |t| t.color(cx))
 }
 

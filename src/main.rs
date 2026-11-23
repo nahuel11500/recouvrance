@@ -20,6 +20,7 @@ mod history;
 mod json;
 mod k8s;
 mod latest;
+mod map;
 mod mcp;
 mod overview;
 mod paths;

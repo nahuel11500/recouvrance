@@ -24,7 +24,7 @@ use crate::json::nonempty_at as text;
 use crate::k8s::{self, ColumnDef, Kind, Row, Selection};
 
 /// The Gateway API's group, for HTTP routes.
-pub(super) const GATEWAY: &str = "gateway.networking.k8s.io";
+pub(crate) const GATEWAY: &str = "gateway.networking.k8s.io";
 
 /// Kinds checked with the Services they point to (`traffic`), not on their own.
 pub(crate) const WITH_SERVICES: [(&str, &str); 2] = [("networking.k8s.io", "Ingress"), (GATEWAY, "HTTPRoute")];
@@ -49,7 +49,8 @@ pub enum Of {
 }
 
 impl Of {
-    fn kind(self) -> &'static str {
+    /// The kind's name: `ConfigMap`, `PersistentVolumeClaim`.
+    pub fn kind(self) -> &'static str {
         match self {
             Self::ConfigMap => "ConfigMap",
             Self::Secret => "Secret",
@@ -86,6 +87,11 @@ impl Of {
         self != Self::StorageClass
     }
 
+    /// The kind's API group: `storage.k8s.io` for a StorageClass, the core group (`""`) else.
+    pub fn group(self) -> &'static str {
+        if self == Self::StorageClass { "storage.k8s.io" } else { "" }
+    }
+
     /// What a scan says when this kind could not be read.
     fn skipped(self) -> String {
         format!("references to {}", self.plural())
@@ -119,17 +125,24 @@ fn items(v: &Value) -> impl Iterator<Item = &Value> {
 /// too) and of its containers' and init containers' environment. A reference marked
 /// `optional: true` isn't needed.
 pub fn pod_refs(pod: &Value) -> Vec<Target> {
-    let ns = text(pod, "/metadata/namespace");
+    spec_refs(text(pod, "/metadata/namespace"), &pod["spec"], false)
+}
+
+/// The objects a pod spec (a pod's, or a workload's template) names in `namespace`: the
+/// ConfigMaps, Secrets and PVCs of its volumes (projected ones too) and of its containers' and
+/// init containers' environment. Without `all`, what a pod needs to start (`pod_refs`): the
+/// references marked `optional: true` are left out. With `all`, every object it names: the
+/// optional ones too, its image pull Secrets and its ServiceAccount (what the Map shows).
+pub fn spec_refs(namespace: Option<&str>, spec: &Value, all: bool) -> Vec<Target> {
     let mut out = BTreeSet::new();
     let mut add = |of: Of, r: &Value, key: &str| {
         let name = r.get(key).and_then(Value::as_str).filter(|n| !n.is_empty());
         if let Some(name) = name
-            && r.get("optional").and_then(Value::as_bool) != Some(true)
+            && (all || r.get("optional").and_then(Value::as_bool) != Some(true))
         {
-            out.insert(Target { of, namespace: ns.map(String::from), name: name.to_string() });
+            out.insert(Target { of, namespace: namespace.map(String::from), name: name.to_string() });
         }
     };
-    let spec = &pod["spec"];
     for v in items(&spec["volumes"]) {
         add(Of::ConfigMap, &v["configMap"], "name");
         add(Of::Secret, &v["secret"], "secretName");
@@ -147,6 +160,18 @@ pub fn pod_refs(pod: &Value) -> Vec<Target> {
         for e in items(&c["env"]) {
             add(Of::ConfigMap, &e["valueFrom"]["configMapKeyRef"], "name");
             add(Of::Secret, &e["valueFrom"]["secretKeyRef"], "name");
+        }
+    }
+    if all {
+        for p in items(&spec["imagePullSecrets"]) {
+            add(Of::Secret, p, "name");
+        }
+        // `serviceAccount` is the deprecated spelling, still written by some manifests.
+        let account = ["serviceAccountName", "serviceAccount"]
+            .into_iter()
+            .find(|k| spec.get(*k).and_then(Value::as_str).is_some_and(|n| !n.is_empty()));
+        if let Some(key) = account {
+            add(Of::ServiceAccount, spec, key);
         }
     }
     out.into_iter().collect()
@@ -657,6 +682,42 @@ fn scaled_to_zero(service: &Service, scaled: &[Scaled]) -> Option<String> {
         .map(|w| format!("{} {}", w.kind, w.name))
 }
 
+/// What an Ingress sends to and names: its backends' Services (the default backend's first,
+/// each once) and its TLS Secrets.
+pub fn ingress_refs(obj: &Value) -> (Vec<Target>, Vec<Target>) {
+    let Ok(ing) = Ingress::deserialize(obj) else { return Default::default() };
+    let ns = ing.metadata.namespace().map(String::from);
+    let mut services: Vec<Target> = Vec::new();
+    for name in ing.backends().filter_map(|b| b.name.as_deref().filter(|n| !n.is_empty())) {
+        let t = Target { of: Of::Service, namespace: ns.clone(), name: name.to_string() };
+        if !services.contains(&t) {
+            services.push(t);
+        }
+    }
+    (services, ingress_secrets(&ing))
+}
+
+/// The Services an HTTPRoute sends to (other kinds of backend aren't Services), in their
+/// namespace: the route's own unless the backend names another.
+pub fn route_refs(obj: &Value) -> Vec<Target> {
+    Route::deserialize(obj).map(|r| route_services(&r)).unwrap_or_default()
+}
+
+fn route_services(route: &Route) -> Vec<Target> {
+    let ns = route.metadata.namespace();
+    let mut targets = BTreeSet::new();
+    for b in route.spec.rules.iter().flat_map(|r| &r.backend_refs) {
+        let core = b.group.as_deref().unwrap_or_default().is_empty();
+        let service = b.kind.as_deref().unwrap_or("Service") == "Service";
+        let Some(name) = b.name.as_deref().filter(|n| !n.is_empty()) else { continue };
+        if core && service {
+            let namespace = b.namespace.as_deref().filter(|n| !n.is_empty()).or(ns).map(String::from);
+            targets.insert(Target { of: Of::Service, namespace, name: name.to_string() });
+        }
+    }
+    targets.into_iter().collect()
+}
+
 /// The TLS Secrets an Ingress names.
 fn ingress_secrets(ing: &Ingress) -> Vec<Target> {
     let ns = ing.metadata.namespace().map(String::from);
@@ -709,19 +770,8 @@ fn judge_ingress(ing: &Ingress, services: &Listed<&Service>, secret: impl Fn(&Ta
 /// The Services an HTTPRoute sends to that are missing (other kinds of backend aren't
 /// checked). A backend in a namespace that wasn't listed can't be told.
 fn judge_route(route: &Route, services: &Listed<&Service>) -> Vec<String> {
-    let ns = route.metadata.namespace();
-    let mut targets = BTreeSet::new();
-    for b in route.spec.rules.iter().flat_map(|r| &r.backend_refs) {
-        let core = b.group.as_deref().unwrap_or_default().is_empty();
-        let service = b.kind.as_deref().unwrap_or("Service") == "Service";
-        let Some(name) = b.name.as_deref().filter(|n| !n.is_empty()) else { continue };
-        if core && service {
-            let namespace = b.namespace.as_deref().filter(|n| !n.is_empty()).or(ns).map(String::from);
-            targets.insert(Target { of: Of::Service, namespace, name: name.to_string() });
-        }
-    }
-    let targets: Vec<Target> = targets.into_iter().collect();
-    missing(&targets, ns, |t| services.exists(t)).into_iter().collect()
+    let targets = route_services(route);
+    missing(&targets, route.metadata.namespace(), |t| services.exists(t)).into_iter().collect()
 }
 
 /// Services by namespace and name.
