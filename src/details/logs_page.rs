@@ -71,7 +71,7 @@ impl LogsPage {
                 if shown.await.is_none() || this.update(cx, Self::resume).is_err() {
                     break;
                 }
-                exec.timer(std::time::Duration::from_millis(500)).await;
+                exec.timer(Duration::from_millis(500)).await;
             }
         });
         let mut this = Self {
