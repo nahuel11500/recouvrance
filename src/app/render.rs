@@ -13,11 +13,13 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use super::{
-    AppView, CloseTab, EscapeBack, FocusFilter, GoAssistant, GoBack, GoCluster, GoForward, GoHelm, GoProblems,
-    GoSettings, GoWorkloads, NewTab, NewWindow, NextTab, OpenPalette, OpenSelected, PrevTab, RefreshPage, Route,
-    RowCopyName, RowDelete, RowEvents, RowFavorite, RowLogs, RowOpen, RowOpenTab, RowRestart, RowRun, RowScale,
-    RowShell, RowYaml, ShowShortcuts, ToggleAssistant, ToggleSidebar, ZoomIn, ZoomOut, ZoomReset, open_main_window,
-    set_theme,
+    AppView, CloseTab, CloseWindow, EscapeBack, FocusFilter, GoAssistant, GoBack, GoCluster, GoForward, GoHelm,
+    GoProblems, GoSettings, GoWorkloads, MinimizeWindow, NewTab, NextTab, OpenAccess, OpenAgentActivity, OpenAgents,
+    OpenApiRequests, OpenApply, OpenArgo, OpenContexts, OpenHelmInstall, OpenPalette, OpenSelected, OpenTerminal,
+    OpenTimeline, OpenUpgradeCheck, PrevTab, RefreshPage, Route, RowCopyName, RowDelete, RowEvents, RowFavorite,
+    RowLogs, RowOpen, RowOpenTab, RowRestart, RowRun, RowScale, RowShell, RowYaml, ShowAbout, ShowShortcuts,
+    ToggleAssistant, ToggleSidebar, ToggleTheme, ToggleWriteMode, ZoomIn, ZoomOut, ZoomReset, ZoomWindow, set_theme,
+    with_keys,
 };
 use crate::favorites::FavObject;
 
@@ -83,6 +85,12 @@ impl Render for AppView {
 }
 
 impl AppView {
+    /// Settings, on its About section.
+    pub(super) fn show_about(&mut self, cx: &mut Context<Self>) {
+        self.settings_view.update(cx, crate::ui::settings_view::SettingsView::show_about);
+        self.navigate(Route::Settings, cx);
+    }
+
     /// Keep keyboard focus somewhere useful: when the focused element went away
     /// (e.g. the table after opening a row), the list gets it back, or the app
     /// itself so Esc, Ctrl+K and the rest keep working.
@@ -128,7 +136,7 @@ impl AppView {
                     .ghost()
                     .small()
                     .icon(if self.sidebar_hidden { Lucide::PanelLeftOpen } else { Lucide::PanelLeftClose })
-                    .tooltip("Show/hide the sidebar (Ctrl+B)")
+                    .tooltip(with_keys("Show/hide the sidebar ({secondary-b})"))
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.sidebar_hidden = !this.sidebar_hidden;
                         cx.notify();
@@ -168,7 +176,7 @@ impl AppView {
                         .ghost()
                         .small()
                         .icon(Lucide::RefreshCw)
-                        .tooltip("Refresh (F5)")
+                        .tooltip(with_keys("Refresh ({f5|secondary-r})"))
                         .on_click(cx.listener(|this, _, window, cx| this.refresh_page(window, cx))),
                 )
             })
@@ -187,7 +195,15 @@ impl AppView {
                     .text_color(theme.muted_foreground)
                     .child(Icon::new(Lucide::Search).size_4())
                     .child(div().flex_1().child("Jump to anything…"))
-                    .child(div().text_xs().px_1().rounded_sm().border_1().border_color(theme.border).child("Ctrl K"))
+                    .child(
+                        div()
+                            .text_xs()
+                            .px_1()
+                            .rounded_sm()
+                            .border_1()
+                            .border_color(theme.border)
+                            .child(with_keys("{secondary-k}")),
+                    )
                     .on_click(cx.listener(|this, _, window, cx| this.open_palette(window, cx))),
             )
             .child(write_mode_button(cx))
@@ -197,7 +213,7 @@ impl AppView {
                     .small()
                     .icon(Lucide::Sparkles)
                     .selected(self.docked_assistant().is_some())
-                    .tooltip("Ask the assistant about what is on screen (Ctrl+J)")
+                    .tooltip(with_keys("Ask the assistant about what is on screen ({secondary-j})"))
                     .on_click(cx.listener(|this, _, window, cx| this.toggle_assistant(window, cx))),
             )
             .child(
@@ -229,10 +245,15 @@ impl AppView {
                     .ghost()
                     .small()
                     .icon(if cx.theme().is_dark() { IconName::Sun } else { IconName::Moon })
-                    .on_click(|_, window, cx| {
-                        let mode = if cx.theme().is_dark() { ThemeMode::Light } else { ThemeMode::Dark };
-                        set_theme(mode, Some(window), cx);
-                    }),
+                    .on_click(|_, window, cx| toggle_theme(window, cx)),
+            )
+            .child(
+                Button::new("shortcuts")
+                    .ghost()
+                    .small()
+                    .icon(Lucide::Keyboard)
+                    .tooltip(with_keys("Keyboard shortcuts ({?})"))
+                    .on_click(|_, window, cx| super::shortcuts::open_panel(window, cx)),
             )
             .child(
                 Button::new("version")
@@ -240,10 +261,7 @@ impl AppView {
                     .xsmall()
                     .label(concat!("v", env!("CARGO_PKG_VERSION")))
                     .tooltip("About Recouvrance")
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.settings_view.update(cx, crate::ui::settings_view::SettingsView::show_about);
-                        this.navigate(Route::Settings, cx);
-                    })),
+                    .on_click(cx.listener(|this, _, _, cx| this.show_about(cx))),
             )
     }
 
@@ -411,10 +429,14 @@ impl AppView {
 
     /// The window's keyboard actions.
     fn with_actions(&self, app: Stateful<Div>, cx: &mut Context<Self>) -> Stateful<Div> {
+        // New window, Quit and the other app-wide actions are handled without a window (`menus`).
         app.on_action(cx.listener(|this, _: &OpenPalette, window, cx| this.open_palette(window, cx)))
-            .on_action(|_: &NewWindow, _, cx| open_main_window(cx))
             .on_action(cx.listener(|this, _: &NewTab, window, cx| this.new_tab(None, window, cx)))
-            .on_action(cx.listener(|this, _: &CloseTab, window, cx| this.close_tab(this.active_tab, window, cx)))
+            .on_action(cx.listener(|this, _: &CloseTab, window, cx| this.close_tab_or_window(window, cx)))
+            .on_action(|_: &CloseWindow, window, _| window.remove_window())
+            .on_action(|_: &MinimizeWindow, window, _| window.minimize_window())
+            .on_action(|_: &ZoomWindow, window, _| window.zoom_window())
+            .on_action(cx.listener(|this, _: &ShowAbout, _, cx| this.show_about(cx)))
             .on_action(cx.listener(|this, _: &NextTab, window, cx| {
                 let n = this.tabs.len();
                 this.switch_tab((this.active_tab + 1) % n, window, cx);
@@ -454,6 +476,25 @@ impl AppView {
             }))
             .on_action(cx.listener(|this, _: &GoForward, _, cx| this.go(1, cx)))
             .on_action(|_: &ShowShortcuts, window, cx| super::shortcuts::open_panel(window, cx))
+            // Pages and commands the palette lists without a key (see `commands::COMMANDS`).
+            .on_action(cx.listener(|this, _: &OpenArgo, window, cx| this.open_argo(window, cx)))
+            .on_action(cx.listener(|this, _: &OpenTimeline, window, cx| this.open_timeline(window, cx)))
+            .on_action(cx.listener(|this, _: &OpenAccess, window, cx| this.open_access(window, cx)))
+            .on_action(cx.listener(|this, _: &OpenUpgradeCheck, window, cx| this.open_upgrade_check(window, cx)))
+            .on_action(cx.listener(|this, _: &OpenAgents, _, cx| this.navigate(Route::Agents, cx)))
+            .on_action(cx.listener(|this, _: &OpenAgentActivity, _, cx| {
+                this.agents.update(cx, crate::agents::AgentsView::show_activity);
+                this.navigate(Route::Agents, cx);
+            }))
+            .on_action(cx.listener(|this, _: &OpenContexts, _, cx| this.navigate(Route::Contexts, cx)))
+            .on_action(cx.listener(|this, _: &OpenTerminal, window, cx| this.open_terminal(window, cx)))
+            .on_action(cx.listener(|this, _: &OpenApply, window, cx| this.open_apply(window, cx)))
+            .on_action(cx.listener(|this, _: &OpenHelmInstall, window, cx| this.open_helm_install(window, cx)))
+            .on_action(cx.listener(|this, _: &OpenApiRequests, window, cx| {
+                this.open_settings_section(crate::ui::settings_view::Section::Requests, window, cx);
+            }))
+            .on_action(|_: &ToggleWriteMode, window, cx| toggle_write_mode(window, cx))
+            .on_action(|_: &ToggleTheme, window, cx| toggle_theme(window, cx))
             .on_action(cx.listener(|this, _: &GoProblems, window, cx| this.open_problems(window, cx)))
             .on_action(cx.listener(|this, _: &GoCluster, window, cx| this.open_cluster(window, cx)))
             .on_action(cx.listener(|this, _: &GoWorkloads, window, cx| this.open_workloads(window, cx)))
@@ -508,27 +549,35 @@ fn write_mode_button(cx: &App) -> Button {
         } else {
             "Click to enable write actions"
         })
-        .on_click(|_, window, cx| {
-            if crate::details::writes_enabled(cx) {
-                crate::details::set_writes(false, cx);
+        .on_click(|_, window, cx| toggle_write_mode(window, cx))
+}
+
+/// Back to read-only at once, or writes on once confirmed: the badge and the palette do the same.
+fn toggle_write_mode(window: &mut Window, cx: &mut App) {
+    if crate::details::writes_enabled(cx) {
+        crate::details::set_writes(false, cx);
+        cx.refresh_windows();
+        return;
+    }
+    window.open_alert_dialog(cx, |alert, _, _| {
+        alert
+            .title("Enable write actions?")
+            .description(
+                "Scale, restart, delete, YAML edits, shells and plugins become available, using your own \
+                 kubeconfig credentials. Every action asks for confirmation. Agents are not affected: their \
+                 access stays defined by their rules.",
+            )
+            .show_cancel(true)
+            .ok_text("Enable writes")
+            .on_ok(|_, _, cx| {
+                crate::details::set_writes(true, cx);
                 cx.refresh_windows();
-                return;
-            }
-            window.open_alert_dialog(cx, |alert, _, _| {
-                alert
-                    .title("Enable write actions?")
-                    .description(
-                        "Scale, restart, delete, YAML edits, shells and plugins become available, using your own \
-                         kubeconfig credentials. Every action asks for confirmation. Agents are not affected: their \
-                         access stays defined by their rules.",
-                    )
-                    .show_cancel(true)
-                    .ok_text("Enable writes")
-                    .on_ok(|_, _, cx| {
-                        crate::details::set_writes(true, cx);
-                        cx.refresh_windows();
-                        true
-                    })
-            });
-        })
+                true
+            })
+    });
+}
+
+fn toggle_theme(window: &mut Window, cx: &mut App) {
+    let mode = if cx.theme().is_dark() { ThemeMode::Light } else { ThemeMode::Dark };
+    set_theme(mode, Some(window), cx);
 }

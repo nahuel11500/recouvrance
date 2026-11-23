@@ -7,12 +7,17 @@ Claude Code (your subscription, no API key); an Anthropic API key works too if y
 the same agent as your Claude Code connection (below), so one set of rules, approvals and activity
 log covers both. **Stop** ends a question that is still running, and with it a request of its own
 still waiting for your approval; with an API key, a request that gets no answer for 10 minutes fails.
+With an API key, each request marks the tool definitions, the instructions and the conversation so
+far for Anthropic's prompt cache, so each step of an answer reads what the step before it sent from
+the cache, sooner and at a fraction of the price. When Claude declines a question, the chat says so
+with the reason the API gives, and the question is dropped from the conversation; ask it another way.
 
 ## Agents (MCP)
 
 While the app runs, it serves MCP on `http://127.0.0.1:47070/mcp` (`recouvrance serve` runs it
 without the window; there nobody can approve, so a call an *Ask me* rule covers is refused at once
-with "needs approval in the Recouvrance window": run the app, or add an Allow rule). A list where
+with "needs approval in the Recouvrance window": run the app, or add the request under `approved` in
+rules.yaml, since an Allow rule doesn't win over an Ask rule). A list where
 some rows ask and others are allowed (some namespaces, or some names) is not refused: when it is not
 approved (or cannot be), it shows only the allowed rows, and a rejection is still logged. Approving
 it shows the rows of every Ask rule the list meets (`find_problems` asks to list pods: approving
@@ -55,6 +60,18 @@ effect means Deny, and a missing list means `*` in a Deny or Ask, none in an All
 every object (kind, namespace/name) and the YAML that will be applied, a Secret's values masked; the
 activity log keeps each object with a hash of that YAML, and the objects already applied when a call
 is cut off.
+Before asking, Recouvrance works out what the call will change, and the banner shows it under the
+request: for `scale`, the replicas now and after; for `patch_resource`, `set_image` and
+`apply_manifest`, each field that changes with its value now and after, then the diff, from a
+server-side dry run of the same request (it changes nothing; a dry run the server refuses is said,
+and so is a field another manager owns, on which `apply_manifest` fails); for a `gitops` `sync`, the
+revision deployed and the one it moves to, auto-sync, what is out of sync, and what is no longer in
+git (left in place: the sync Recouvrance starts doesn't prune); for `delete_resource`, what goes with
+the object (a Deployment's ReplicaSets and pods, everything in a namespace, every object of a CRD's
+kind; a Job's pods stay). A Secret's values never show, only which changed. It takes 5 seconds at
+most: past that, or when it fails, the banner says the preview isn't available, and the request is
+asked all the same. Calls an Allow rule lets through are not worked out. The activity log keeps what
+the banner showed with the call.
 The *Always allow this* and *Allow for 1h* offers are left out where no rule can be that narrow:
 exec (a rule cannot pin the command), patches and GitOps actions (nor the patch), scale (nor the
 replica count), `apply_manifest` (nor the content), requests other than lists with no object name
@@ -77,13 +94,25 @@ place, and switching agent access off, disabling the agent or taking away its dr
 evictions that remain (the node stays cordoned). Its reply counts every pod it could not evict but
 names only those an Allow rule lets the agent list.
 
+A refusal tells the agent what it can do about it. One a Deny rule decided (or a context a Deny of
+everything covers) is *final*: no rule added undoes it, so the agent shouldn't retry. One no rule
+covers is *grantable*: the refusal gives the narrowest rule that would allow the call, as rules.yaml
+writes it (`restart deployments.apps/web -n team-a --context staging`), to add under allow or ask.
+Agent access switched off and a disabled agent are final too: only you change them. The activity
+log keeps the reason alone. `check_access` answers the same without making the calls: for each
+request an agent plans (context, verb, kind, namespace, name, up to 20), allowed, needs approval or
+denied, with the rule that decides and what you could grant. It reads only the context's resource
+types (discovery), and only on a context the rules name, so an agent can say up front which calls
+will wait for you.
+
 Tools, by what they do:
 
-- **Read:** `my_permissions`, `list_contexts`, `list_resource_types`, `list_resources`, `get_resource`,
+- **Read:** `my_permissions`, `check_access`, `list_contexts`, `list_resource_types`, `list_resources`, `get_resource`,
   `describe_resource`, `search`, `get_events`, `find_problems`, `check_certificates`, `check_reachability`, `top_pods`,
-  `top_nodes`, `usage_history`, `get_logs`, `workload_logs`, `get_changes`, `rollout_history`, `rollout_status`,
-  `list_helm_releases`, `helm_history`, `helm_get_values`, `diff_manifest`, `explain_resource`,
-  `can_i`, `cluster_version`, `upgrade_check`, `wait_for`, `list_port_forwards`, `browse_files`, `get_metrics`.
+  `top_nodes`, `usage_history`, `get_logs`, `workload_logs`, `get_changes`, `recent_changes`,
+  `rollout_history`, `rollout_status`, `list_helm_releases`, `helm_history`, `helm_get_values`,
+  `diff_manifest`, `explain_resource`, `can_i`, `cluster_version`, `upgrade_check`, `wait_for`,
+  `list_port_forwards`, `browse_files`, `get_metrics`.
 - **Change:** `scale`, `rollout_restart`, `rollout_undo`, `rollout_pause`, `rollout_resume`,
   `set_image`, `patch_resource`, `apply_manifest`, `delete_resource`, `trigger_cronjob`,
   `cordon_node`, `uncordon_node`, `drain_node`, `gitops`, `exec_command`, `debug_pod`,
@@ -129,6 +158,18 @@ obvious verb:
   changes the app recorded while it watched the object come too, with source `Recorded` (see the
   Timeline in [features](features.md)): those of this object (its uid), not of one deleted before
   under the same name. A Secret's recorded changes say which keys changed, never their values.
+- **Recent changes:** `recent_changes` is the Timeline page for agents: the changes the app
+  recorded on a context from `since` on (a duration such as `30m`, `2h` or `3d`, or a time such
+  as `2026-11-22T02:40:00Z`; an hour by default), in one `namespace` or all, with the cluster's
+  events mixed in as on the page (`events`: `warnings`, the default, `all` or `none`), newest
+  first, at most `limit` rows (50 by default, 200 at most). `diffs: true` adds each change's
+  changed lines, when its record kept them. The records are the file the app keeps, so they come
+  without a request, and while the cluster doesn't answer (the events then fail alone, said in
+  the reply). It never asks for approval: a change shows only where an Allow rule gives `get` on
+  its object, an event only where one gives `list` on events, and what it leaves out is counted
+  (`get_changes` asks, for one object); `my_permissions` says so. The reply says how far back the
+  records go and that only what the window watched is recorded (`recouvrance serve` records
+  nothing itself).
 - **Reachability:** `check_reachability` follows the path a request takes to a Service, an Ingress
   or an HTTPRoute and names the first step that breaks, with the `kubectl` command to see it (the
   Reachability tab's checks). It needs `get` on the object, then reads what the path goes through
@@ -188,6 +229,8 @@ in the assistant, a `claude -p` killed), the banner goes at once; when its sessi
 seconds. A click on the banner after that changes nothing. As with the kill switch, a call whose agent
 stopped waiting makes no change after that (a drain stops before its next eviction). The log says
 whether a request was refused, left unanswered, given up by the agent or cut off by the kill switch.
+A session ends when its client closes it or after an hour unused, never while its agent still waits
+for one of its calls, however long that takes.
 
 The Activity page groups calls by task: one agent session, split where the agent paused for more than
 10 minutes. Each group says what it touched (contexts, namespaces, objects); repeated calls of a tool on
