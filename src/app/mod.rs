@@ -483,9 +483,9 @@ pub struct AppView {
     /// The set of contexts picked (`settings::session_set`), whose session this window saves;
     /// empty when none is saved (not connected yet, or contexts given by a developer hook).
     session_key: Vec<String>,
-    /// This is the first window, and its first connect has not finished: that one reopens
-    /// where its set of contexts was left.
-    restore: bool,
+    /// Whether a connect reopens where its set of contexts was left: the first window's first
+    /// set, until a connect to it reaches every cluster (see `session::Restore`).
+    restore: session::Restore,
     /// This view, by which `session::SessionOwners` knows the window that saves a set.
     view_id: EntityId,
     /// Where the window was last, not maximized: what is saved while it is maximized.
@@ -741,7 +741,7 @@ impl AppView {
             connecting: false,
             _connect: None,
             session_key: Vec::new(),
-            restore: first_window,
+            restore: if first_window { session::Restore::FirstConnect } else { session::Restore::Off },
             view_id: cx.entity_id(),
             windowed: None,
             _save_session: None,

@@ -24,6 +24,7 @@ impl AppView {
             });
             self.session_key = crate::settings::session_set(&contexts);
         }
+        self.restore.connecting(&self.session_key);
         let connected = contexts.clone();
         self.ctx_picker.update(cx, |p, cx| p.set_connected(connected, cx));
         let ctx_name = primary.clone();
@@ -166,10 +167,14 @@ impl AppView {
                         this.recording =
                             crate::timeline::start_watches(&this.clusters, &this.kinds, &this.kind_clusters);
                         this.set_namespaces(namespaces, window, cx);
-                        // The first window's first connect reopens where this set was left:
-                        // its namespaces before the list starts, so the list starts once.
-                        let reopened =
-                            if std::mem::take(&mut this.restore) { this.restore_session(window, cx) } else { None };
+                        // The first window's first set reopens where it was left, again until a
+                        // connect reaches every cluster: its namespaces before the list starts,
+                        // so the list starts once.
+                        let reopened = if this.restore.finished(&this.session_key, !errors.is_empty()) {
+                            this.restore_session(window, cx)
+                        } else {
+                            None
+                        };
                         this.restart_watch(cx);
                         // After the list, whose rows its first count waits for.
                         this.problems.start(this.clusters.clone(), this.cluster_kinds(), cx);
