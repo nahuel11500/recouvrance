@@ -7,9 +7,9 @@ use crate::details::DetailPanel;
 use crate::k8s;
 
 impl AppView {
-    /// QA crawler: every resource type, by kubectl name.
+    /// QA crawler: every resource type the sidebar lists, by kubectl name.
     pub fn qa_kinds(&self) -> Vec<String> {
-        self.kinds.iter().map(k8s::Kind::kubectl_name).collect()
+        self.kinds.iter().filter(|k| k8s::in_sidebar(k)).map(k8s::Kind::kubectl_name).collect()
     }
 
     pub fn qa_select(&mut self, name: &str, cx: &mut Context<Self>) {

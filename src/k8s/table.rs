@@ -30,8 +30,9 @@ pub(super) struct ServerTable {
     pub(super) metadata: ListMeta,
 }
 
-/// Watch frames send `null` for fields a list response omits.
-pub(super) fn null_default<'de, D, T>(d: D) -> std::result::Result<T, D::Error>
+/// A `null` read as the field's default: watch frames send it for fields a list response omits,
+/// and a lean read of an object takes it like a missing field.
+pub(crate) fn null_default<'de, D, T>(d: D) -> std::result::Result<T, D::Error>
 where
     D: serde::Deserializer<'de>,
     T: Default + Deserialize<'de>,
@@ -335,7 +336,7 @@ pub(super) fn snapshot(rows: &HashMap<String, Arc<Row>>) -> Vec<Arc<Row>> {
 pub(super) const PAGE_SIZE: u32 = 2000;
 
 /// A watch that hears nothing (not even a bookmark) for this long is reconnected.
-const WATCH_IDLE: std::time::Duration = std::time::Duration::from_secs(120);
+pub(super) const WATCH_IDLE: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// List in Table form, a page at a time: the server never builds one giant
 /// response and we never hold one in memory.
@@ -562,7 +563,8 @@ fn cells_row(row: ServerRow, namespace: Option<&str>, age: Option<usize>) -> Opt
     }))
 }
 
-/// kubectl's age ("45s", "2m3s", "5h", "3d4h", "2y") in seconds.
+/// kubectl's age ("45s", "2m3s", "5h", "3d4h", "2y") in seconds; None past what `i64` holds
+/// (agents type durations too: `recent_changes`'s `since`).
 pub(crate) fn age_seconds(age: &str) -> Option<i64> {
     let (mut total, mut num) = (0i64, 0i64);
     let mut digits = false;
@@ -583,7 +585,7 @@ pub(crate) fn age_seconds(age: &str) -> Option<i64> {
         if !digits {
             return None;
         }
-        total += num * unit;
+        total = total.checked_add(num.checked_mul(unit)?)?;
         (num, digits) = (0, false);
     }
     (!digits && total > 0 || age == "0s").then_some(total)
@@ -669,7 +671,7 @@ impl Pause {
 const SNAPSHOT_EVERY: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// While paused, how often to check whether the list is shown again.
-const PAUSED_POLL: std::time::Duration = std::time::Duration::from_millis(500);
+pub(super) const PAUSED_POLL: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// When the rows changed since the last snapshot, and when that was sent.
 #[derive(Default)]
@@ -1242,6 +1244,10 @@ mod age_tests {
         assert_eq!(a(""), None);
         assert_eq!(a("5"), None);
         assert_eq!(a("h5"), None);
+        // Too big for seconds in an `i64`: none, not an overflow.
+        assert_eq!(a("999999999999y"), None);
+        assert_eq!(a("9223372036854775807s1s"), None);
+        assert_eq!(a("9223372036854775807s"), Some(i64::MAX));
     }
 }
 

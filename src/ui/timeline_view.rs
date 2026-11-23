@@ -3,7 +3,7 @@
 //! then watched (`k8s::watch_events`). A change's diff is worked out when its row is picked.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures::{FutureExt as _, StreamExt as _};
 use gpui_kit::assets::IconName as Lucide;
@@ -66,15 +66,7 @@ impl Entry {
     fn summary(&self) -> String {
         match self {
             Self::Change(_, r) => r.summary.clone(),
-            Self::Event(_, e) => {
-                let l = &e.line;
-                let count = match (l.count, e.events) {
-                    (_, n) if n > 1 => format!(" (×{}, {n} events)", l.count),
-                    (c, _) if c > 1 => format!(" (×{c})"),
-                    _ => String::new(),
-                };
-                format!("{} {}: {}{count}", l.kind, l.reason, l.message)
-            }
+            Self::Event(_, e) => e.summary(),
         }
     }
 
@@ -183,22 +175,71 @@ impl Source {
     fn new(context: Arc<str>, namespace: Option<String>, rows: Vec<Entry>) -> Self {
         Self { context, namespace, rows, kept: 0, total: 0, since: None, error: None, loading: true }
     }
+}
 
-    /// What a line about it names: its context, and its namespace when read on its own.
-    fn place(&self) -> String {
-        match &self.namespace {
-            Some(ns) => format!("{}/{ns}", self.context),
-            None => self.context.to_string(),
+/// How often the events' rows may change: as often as the overview pages refresh (each change
+/// costs a sort and a filter of every row). Read each time, so a change in Settings counts.
+fn refresh_every() -> Duration {
+    crate::settings::secs(crate::settings::get().overview_refresh)
+}
+
+/// While some watch hasn't sent its first rows, the page is rebuilt at most this often.
+const LOADING_GAP: Duration = Duration::from_millis(250);
+
+/// The sources' clusters, in order, each with its sources: a cluster's namespaces read one by
+/// one make one line, not one each.
+fn by_cluster(sources: &[Source]) -> Vec<(&str, Vec<&Source>)> {
+    let mut out: Vec<(&str, Vec<&Source>)> = Vec::new();
+    for s in sources {
+        match out.iter_mut().find(|(c, _)| *c == &*s.context) {
+            Some((_, of)) => of.push(s),
+            None => out.push((&*s.context, vec![s])),
         }
     }
+    out
+}
 
-    /// What its rows cover, when the cluster keeps more events there than are held.
-    fn coverage(&self) -> Option<String> {
-        (self.kept < self.total).then(|| {
-            let since = self.since.map_or_default(|t| format!(", from the last {}", k8s::age(t)));
-            format!("{}: the newest {} of {} events{since}", self.place(), self.kept, self.total)
+/// What the rows cover, one line for each cluster that keeps more events than are held: how
+/// many of how many, and since when none is left out (the latest point any of its reads was
+/// cut at).
+fn coverage_lines(sources: &[Source]) -> Vec<String> {
+    by_cluster(sources)
+        .into_iter()
+        .filter_map(|(context, of)| {
+            let (kept, total) = of.iter().fold((0, 0), |(k, t), s| (k + s.kept, t + s.total));
+            let since = of.iter().filter(|s| s.kept < s.total).filter_map(|s| s.since).max();
+            (kept < total).then(|| {
+                let since = since.map_or_default(|t| format!(", from the last {}", k8s::age(t)));
+                format!("{context}: the newest {kept} of {total} events{since}")
+            })
         })
+        .collect()
+}
+
+/// The events that could not be read, one line for each cluster and error: the same failure
+/// in many of its namespaces is said once, with how many.
+fn error_lines(sources: &[Source]) -> Vec<String> {
+    let mut out = Vec::new();
+    for (context, of) in by_cluster(sources) {
+        let mut errors: Vec<(&str, Vec<&str>)> = Vec::new();
+        for s in &of {
+            let Some(e) = s.error.as_deref() else { continue };
+            let ns = s.namespace.as_deref().unwrap_or_default();
+            match errors.iter_mut().find(|(other, _)| *other == e) {
+                Some((_, namespaces)) => namespaces.push(ns),
+                None => errors.push((e, vec![ns])),
+            }
+        }
+        for (e, namespaces) in errors {
+            let place = match namespaces.as_slice() {
+                [""] => context.to_string(),
+                [ns] => format!("{context}/{ns}"),
+                many => format!("{context} ({})", crate::plural::count(many.len(), "namespace")),
+            };
+            out.push(format!("{place}: events: {e}"));
+        }
     }
+    out
 }
 
 pub struct TimelineView {
@@ -336,9 +377,6 @@ impl TimelineView {
             return;
         }
         let normal = self.events_shown == Events::All;
-        // The rows change as often as the overview pages refresh: each change costs a sort and
-        // a filter of every row.
-        let every = crate::settings::secs(crate::settings::get().overview_refresh);
         let (mut guards, mut streams) = (Vec::new(), Vec::new());
         for (ctx, client, namespaces) in &self.scope {
             let (context, cap): (Arc<str>, _) = (ctx.as_str().into(), cap_per_read(namespaces.len()));
@@ -349,16 +387,34 @@ impl TimelineView {
                     .filter(|_| keep)
                     .map_or_default(|s| s.rows.clone());
                 self.sources.push(Source::new(context.clone(), ns.clone(), rows));
-                let (guard, rx) =
-                    k8s::watch_events(client.clone(), ns.clone(), normal, cap, every, self.events_pause.clone());
+                let (guard, rx) = k8s::watch_events(
+                    client.clone(),
+                    ns.clone(),
+                    normal,
+                    cap,
+                    refresh_every,
+                    self.events_pause.clone(),
+                );
                 guards.push(guard);
                 streams.push(rx.map(move |msg| (ix, msg)));
             }
         }
         let mut sent = futures::stream::select_all(streams);
         let task = cx.spawn(async move |this, cx| {
+            let mut rebuilt: Option<Instant> = None;
             while let Some(first) = sent.next().await {
-                // What already waits goes in the same update: one sort and filter of the rows.
+                // Each source sends at most once per refresh, but a cluster's namespaces read one
+                // by one are as many sources: the page waits for the others, and is rebuilt at
+                // most once per refresh (or per `LOADING_GAP` while some haven't sent yet).
+                if let Some(at) = rebuilt {
+                    let loading = this.update(cx, |this, _| this.events_loading()).unwrap_or(false);
+                    let gap = if loading { LOADING_GAP } else { refresh_every() };
+                    let wait = gap.saturating_sub(at.elapsed());
+                    if !wait.is_zero() {
+                        cx.background_executor().timer(wait).await;
+                    }
+                }
+                // What waits goes in the same update: one sort and filter of the rows.
                 let mut batch = vec![first];
                 while let Some(Some(msg)) = sent.next().now_or_never() {
                     batch.push(msg);
@@ -366,6 +422,7 @@ impl TimelineView {
                 if this.update(cx, |this, cx| this.on_events(batch, cx)).is_err() {
                     break;
                 }
+                rebuilt = Some(Instant::now());
             }
         });
         self.watches = Some((guards, task));
@@ -643,11 +700,8 @@ impl Render for TimelineView {
         let picked = self.picked.clone();
         // Events that could not be read, by cluster (the others are shown), and what is shown
         // where a cluster keeps more events than are held.
-        let errors = (self.sources.iter())
-            .filter_map(|s| s.error.as_ref().map(|e| format!("{}: events: {e}", s.place())))
-            .map(|e| div().text_xs().text_color(theme.danger).child(e));
-        let coverage =
-            self.sources.iter().filter_map(Source::coverage).map(|c| div().text_xs().text_color(muted).child(c));
+        let errors = error_lines(&self.sources).into_iter().map(|e| div().text_xs().text_color(theme.danger).child(e));
+        let coverage = coverage_lines(&self.sources).into_iter().map(|c| div().text_xs().text_color(muted).child(c));
         v_flex()
             .size_full()
             .p_4()
@@ -679,7 +733,7 @@ mod tests {
     // Not `super::*`: gpui_kit's `test` attribute would come with it.
     use std::sync::Arc;
 
-    use super::{Entry, Events, Source, cap_per_read, merged, shown};
+    use super::{Entry, Events, Source, cap_per_read, coverage_lines, error_lines, merged, shown};
     use crate::k8s::{ClusterEvent, EventLine};
     use crate::timeline::{Record, What};
     use crate::ui::page_filter::PageFilter as Filter;
@@ -766,18 +820,63 @@ mod tests {
         assert_eq!(cap_per_read(usize::MAX), 1);
     }
 
+    /// A source of `context`, in `namespace` (all when None), holding `kept` of `total` events
+    /// back to `ago` seconds.
+    fn source(context: &str, namespace: Option<&str>, kept: usize, total: usize, ago: i64) -> Source {
+        let mut s = Source::new(context.into(), namespace.map(String::from), Vec::new());
+        (s.kept, s.total) = (kept, total);
+        s.since = Some(jiff::Timestamp::now() - jiff::SignedDuration::from_secs(ago));
+        s
+    }
+
     /// Fewer events held than the cluster keeps: the page says how many of how many, and how
-    /// far back they go. All of them: nothing to say.
+    /// far back none is left out, one line a cluster however many of its namespaces are read
+    /// one by one. All of them: nothing to say.
     #[test]
     fn what_the_events_cover() {
-        let mut s = Source::new("prod".into(), None, Vec::new());
-        (s.kept, s.total) = (3, 3);
-        assert_eq!(s.coverage(), None);
-        (s.kept, s.total, s.since) = (2, 5, Some(jiff::Timestamp::now() - jiff::SignedDuration::from_secs(600)));
-        assert_eq!(s.coverage().as_deref(), Some("prod: the newest 2 of 5 events, from the last 10m"));
-        s.namespace = Some("shop".into());
-        s.since = None;
-        assert_eq!(s.coverage().as_deref(), Some("prod/shop: the newest 2 of 5 events"));
+        assert!(coverage_lines(&[source("prod", None, 3, 3, 600)]).is_empty());
+        let cut = coverage_lines(&[source("prod", None, 2, 5, 600)]);
+        assert_eq!(cut, ["prod: the newest 2 of 5 events, from the last 10m"]);
+        let mut no_time = source("prod", None, 2, 5, 0);
+        no_time.since = None;
+        assert_eq!(coverage_lines(&[no_time]), ["prod: the newest 2 of 5 events"]);
+        // Three namespaces of prod, one cut 10 minutes back, one an hour back, one whole; and
+        // staging, whole.
+        let sources = [
+            source("prod", Some("a"), 10, 40, 600),
+            source("prod", Some("b"), 10, 10, 7200),
+            source("staging", None, 4, 4, 60),
+            source("prod", Some("c"), 10, 20, 3600),
+        ];
+        assert_eq!(coverage_lines(&sources), ["prod: the newest 30 of 70 events, from the last 10m"]);
+    }
+
+    /// One failure in many namespaces of a cluster is one line; another failure, or another
+    /// cluster's, has its own.
+    #[test]
+    fn failures_one_line_a_cluster_and_error() {
+        let failed = |context: &str, namespace: Option<&str>, e: &str| {
+            let mut s = source(context, namespace, 0, 0, 0);
+            s.error = Some(e.into());
+            s
+        };
+        let sources = [
+            failed("prod", Some("a"), "forbidden"),
+            failed("prod", Some("b"), "forbidden"),
+            source("prod", Some("c"), 1, 1, 0),
+            failed("prod", Some("d"), "timed out"),
+            failed("staging", None, "forbidden"),
+            failed("dev", Some("x"), "forbidden"),
+        ];
+        assert_eq!(
+            error_lines(&sources),
+            [
+                "prod (2 namespaces): events: forbidden",
+                "prod/d: events: timed out",
+                "staging: events: forbidden",
+                "dev/x: events: forbidden",
+            ]
+        );
     }
 
     #[test]

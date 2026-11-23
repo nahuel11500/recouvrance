@@ -81,9 +81,10 @@ Tools, by what they do:
 
 - **Read:** `my_permissions`, `list_contexts`, `list_resource_types`, `list_resources`, `get_resource`,
   `describe_resource`, `search`, `get_events`, `find_problems`, `check_certificates`, `check_reachability`, `top_pods`,
-  `top_nodes`, `usage_history`, `get_logs`, `workload_logs`, `get_changes`, `rollout_history`, `rollout_status`,
-  `list_helm_releases`, `helm_history`, `helm_get_values`, `diff_manifest`, `explain_resource`,
-  `can_i`, `cluster_version`, `upgrade_check`, `wait_for`, `list_port_forwards`, `browse_files`, `get_metrics`.
+  `top_nodes`, `usage_history`, `get_logs`, `workload_logs`, `get_changes`, `recent_changes`,
+  `rollout_history`, `rollout_status`, `list_helm_releases`, `helm_history`, `helm_get_values`,
+  `diff_manifest`, `explain_resource`, `can_i`, `cluster_version`, `upgrade_check`, `wait_for`,
+  `list_port_forwards`, `browse_files`, `get_metrics`.
 - **Change:** `scale`, `rollout_restart`, `rollout_undo`, `rollout_pause`, `rollout_resume`,
   `set_image`, `patch_resource`, `apply_manifest`, `delete_resource`, `trigger_cronjob`,
   `cordon_node`, `uncordon_node`, `drain_node`, `gitops`, `exec_command`, `debug_pod`,
@@ -129,6 +130,19 @@ obvious verb:
   changes the app recorded while it watched the object come too, with source `Recorded` (see the
   Timeline in [features](features.md)): those of this object (its uid), not of one deleted before
   under the same name. A Secret's recorded changes say which keys changed, never their values.
+- **Recent changes:** `recent_changes` is the Timeline page for agents: the changes the app
+  recorded on a context from `since` on (a duration such as `30m`, `2h` or `3d`, or a time such
+  as `2026-11-22T02:40:00Z`; an hour by default), in one `namespace` or all, with the cluster's
+  events mixed in as on the page (`events`: `warnings`, the default, `all` or `none`), newest
+  first, at most `limit` rows (50 by default, 200 at most). `diffs: true` adds each change's
+  changed lines, when its record kept them. The records are the file the app keeps, so they come
+  without a request, and while the cluster doesn't answer (the events then fail alone, said in
+  the reply). It never asks for approval: a change shows only where an Allow rule gives `get` on
+  its object, an event only where one gives `list` on events, and what it leaves out is counted
+  (`get_changes` asks, for one object); `my_permissions` says so. The reply says how far back the
+  records go and that only what the window watched is recorded (`recouvrance serve` records
+  nothing itself). Of the events, the newest 20,000 are read, as the Timeline holds them; when
+  the cluster keeps more and older ones fall in the range asked, the reply says so.
 - **Reachability:** `check_reachability` follows the path a request takes to a Service, an Ingress
   or an HTTPRoute and names the first step that breaks, with the `kubectl` command to see it (the
   Reachability tab's checks). It needs `get` on the object, then reads what the path goes through
@@ -188,6 +202,8 @@ in the assistant, a `claude -p` killed), the banner goes at once; when its sessi
 seconds. A click on the banner after that changes nothing. As with the kill switch, a call whose agent
 stopped waiting makes no change after that (a drain stops before its next eviction). The log says
 whether a request was refused, left unanswered, given up by the agent or cut off by the kill switch.
+A session ends when its client closes it or after an hour unused, never while its agent still waits
+for one of its calls, however long that takes.
 
 The Activity page groups calls by task: one agent session, split where the agent paused for more than
 10 minutes. Each group says what it touched (contexts, namespaces, objects); repeated calls of a tool on

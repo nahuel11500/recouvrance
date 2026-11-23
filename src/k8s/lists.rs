@@ -29,10 +29,27 @@ pub async fn list_lean<T>(client: Client, ar: ApiResource, namespace: Option<Str
 where
     T: serde::de::DeserializeOwned + Send + 'static,
 {
+    list_lean_by(client, ar, namespace, None).await
+}
+
+/// `list_lean` of the objects a label selector picks (every one when None).
+async fn list_lean_by<T>(
+    client: Client,
+    ar: ApiResource,
+    namespace: Option<String>,
+    labels: Option<String>,
+) -> Result<Vec<T>>
+where
+    T: serde::de::DeserializeOwned + Send + 'static,
+{
     run_abortable(async move {
         let url = DynamicObject::url_path(&ar, namespace.as_deref());
+        let mut lp = ListParams::default();
+        if let Some(labels) = &labels {
+            lp = lp.labels(labels);
+        }
         let mut out = Vec::new();
-        each_lean_page(&client, &url, ListParams::default(), |page: Vec<T>| out.extend(page)).await?;
+        each_lean_page(&client, &url, lp, |page: Vec<T>| out.extend(page)).await?;
         Ok(out)
     })
     .await
@@ -68,11 +85,28 @@ pub async fn list_lean_cached<T>(client: Client, ar: ApiResource, namespace: Opt
 where
     T: serde::de::DeserializeOwned + Send + 'static,
 {
-    let (c, ar2, ns) = (client.clone(), ar.clone(), namespace.clone());
+    list_lean_cached_by(client, ar, namespace, None).await
+}
+
+/// `list_lean_cached` of the objects a label selector picks (every one when None).
+pub async fn list_lean_cached_by<T>(
+    client: Client,
+    ar: ApiResource,
+    namespace: Option<String>,
+    labels: Option<String>,
+) -> Result<Vec<T>>
+where
+    T: serde::de::DeserializeOwned + Send + 'static,
+{
+    let (c, ar2, ns, selector) = (client.clone(), ar.clone(), namespace.clone(), labels.clone());
     let whole = run_abortable(async move {
         use tokio_util::compat::FuturesAsyncReadCompatExt as _;
         let url = DynamicObject::url_path(&ar2, ns.as_deref());
-        let path = format!("{url}?resourceVersion=0&resourceVersionMatch=NotOlderThan");
+        let mut path = format!("{url}?resourceVersion=0&resourceVersionMatch=NotOlderThan");
+        if let Some(selector) = &selector {
+            path.push_str("&labelSelector=");
+            path.push_str(&super::url_escape(selector));
+        }
         let body = c.request_stream(http::Request::get(&path).body(Vec::new())?).await?;
         let list: LeanList<T> = parse_streamed(Idle::new(body.compat(), LIST_IDLE)).await?;
         anyhow::ensure!(list.metadata.continue_.as_ref().is_none_or(String::is_empty), "the API server paged it");
@@ -81,7 +115,7 @@ where
     .await;
     match whole {
         Ok(items) => Ok(items),
-        Err(_) => list_lean(client, ar, namespace).await,
+        Err(_) => list_lean_by(client, ar, namespace, labels).await,
     }
 }
 

@@ -50,9 +50,11 @@ folder to keep your settings untouched. Give it another MCP port too
 take 47070 from the Recouvrance you have open.
 
 **Smoke checks**: `RECOUVRANCE_SMOKE=<context> cargo run --features dev` lists types and watches
-pods; add `RECOUVRANCE_LISTTIME=1`, `RECOUVRANCE_PROBLEMS=1`, `RECOUVRANCE_EVENTS=<seconds>` (the
-Timeline's "All events" on every namespace for that long, then what it cost), or dry runs such as
-`RECOUVRANCE_NODESHELLDRY=<node>` (see `src/dev/smoke.rs`).
+pods; add `RECOUVRANCE_LISTTIME=1`, `RECOUVRANCE_PROBLEMS=1` (the Problems scan's time and, on
+Linux, the process's peak memory; `RECOUVRANCE_PROBLEMS=kinds` runs each kind's check alone, with
+its own peak), `RECOUVRANCE_EVENTS=<seconds>` (the Timeline's "All events" on every namespace for
+that long, then what it cost), or dry runs such as `RECOUVRANCE_NODESHELLDRY=<node>` (see
+`src/dev/smoke.rs`).
 
 **README screenshots** live on the `media` branch, so `main` stays small. Take them on a throwaway
 kind cluster with demo workloads, never a real one (names of clusters, namespaces and objects show).

@@ -4,6 +4,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result, anyhow};
@@ -16,22 +17,14 @@ use kube::{Client, Resource as _};
 use serde::Deserialize;
 
 use super::pods::{ClusterEvent, LeanEvent, cluster_event, grouped};
-use super::table::{Backoff, resumable, truncate};
-use super::{Pause, TaskGuard, api_status, lists, short_error, spawn_guarded};
+use super::table::{Applied, Backoff, PAUSED_POLL, WATCH_IDLE, resumable, truncate};
+use super::{Pause, TaskGuard, api_status, lists, run_abortable, short_error, spawn_guarded};
 
 /// Events held for one cluster, the newest: its namespaces read one by one share them.
 pub const EVENTS_KEPT: usize = 20_000;
 
 /// Events read per request: one request brings every Warning of most clusters.
 const EVENTS_PAGE: u32 = 5000;
-
-/// A watch that hears nothing for this long is opened again from where it was: a connection
-/// that died without a word (sleep, VPN) says nothing either. Events have no watch cache by
-/// default, so the API server sends no bookmarks on a quiet watch.
-const WATCH_IDLE: Duration = Duration::from_secs(120);
-
-/// While the page is off screen, how often to look whether it is shown again.
-const PAUSED_POLL: Duration = Duration::from_millis(500);
 
 /// Once the page is shown again, how long the watch has to bring what changed meanwhile
 /// before the rows go.
@@ -55,25 +48,39 @@ pub struct EventRows {
     pub since: Option<jiff::Timestamp>,
 }
 
+/// The events of `namespace` (every namespace when None) read once, for an agent: Warnings
+/// only unless `normal`, every page listed, the newest `EVENTS_KEPT` held, as the Timeline
+/// holds them. The rows say how many they are of how many. Dropping the future stops it.
+pub async fn recent_events(client: Client, namespace: Option<String>, normal: bool) -> Result<EventRows> {
+    run_abortable(async move {
+        let url = Event::url_path(&(), namespace.as_deref());
+        let (mut held, _) = list_events(&client, &url, normal, EVENTS_KEPT).await?;
+        Ok(held.rows())
+    })
+    .await
+}
+
 /// Follow the events of `namespace` (every namespace when None), Warnings only unless
 /// `normal`: every page listed once, the newest `cap` held, then a watch from the list's
-/// resourceVersion keeps them current. The rows go once listed, then at most every `every`
-/// while they change. A watch whose resourceVersion is too old (410 Gone) lists again. While
-/// `pause` is set (the page off screen), nothing is read and no watch is open: once it is
-/// cleared, the watch goes on from where it was, with what changed meanwhile. A refused list
-/// (403) stops it; a refused watch lists again every `every` instead. Other failures are tried
+/// resourceVersion keeps them current. The rows go once listed, then at most every `every()`
+/// while they change (read each time: the setting can change meanwhile). A watch whose
+/// resourceVersion is too old (410 Gone) lists again. While `pause` is set (the page off
+/// screen), nothing is read and no watch is open: once it is cleared, the watch goes on from
+/// where it was, with what changed meanwhile. A refused list (403) stops it; a refused watch
+/// lists again every `every()` instead, and is never asked again. Other failures are tried
 /// again, less and less often. Dropping the guard stops it.
 pub fn watch_events(
     client: Client,
     namespace: Option<String>,
     normal: bool,
     cap: usize,
-    every: Duration,
+    every: impl Fn() -> Duration + Send + Sync + 'static,
     pause: Pause,
 ) -> (TaskGuard, mpsc::UnboundedReceiver<EventsMsg>) {
     let (tx, rx) = mpsc::unbounded();
     let url = Event::url_path(&(), namespace.as_deref());
-    let follow = Follow { client, url, normal, cap, every, tx, pause };
+    let every = Box::new(every);
+    let follow = Follow { client, url, normal, cap, every, tx, pause, watch_refused: AtomicBool::new(false) };
     let guard = spawn_guarded(async move {
         let mut backoff = Backoff::default();
         loop {
@@ -106,15 +113,22 @@ struct Follow {
     url: String,
     normal: bool,
     cap: usize,
-    every: Duration,
+    /// How long between two sends of the rows.
+    every: Box<dyn Fn() -> Duration + Send + Sync>,
     tx: mpsc::UnboundedSender<EventsMsg>,
     pause: Pause,
+    /// The watch was refused (403): from then on the events are only listed, even after a
+    /// list fails, so the API server isn't asked (and doesn't log) the same refusal again.
+    watch_refused: AtomicBool,
 }
 
 impl Follow {
     /// One list, then the watch from it: Ok once its resourceVersion is too old (list again)
-    /// or nobody takes the rows any more. A refused watch lists again every `every`.
+    /// or nobody takes the rows any more. A refused watch lists again every `every()`.
     async fn run(&self, progress: &mut bool) -> Result<()> {
+        if self.watch_refused.load(Ordering::Relaxed) {
+            return self.list_each().await;
+        }
         if !self.shown().await {
             return Ok(());
         }
@@ -142,8 +156,9 @@ impl Follow {
                 Ok(reader) => reader,
                 Err(kube::Error::Api(status)) if status.code == 410 => return Ok(()),
                 // Allowed to list the events but not to watch them (RBAC grants the two apart):
-                // they are listed again every `every`, as the page did before it watched them.
+                // they are listed again every `every()`, as the page did before it watched them.
                 Err(kube::Error::Api(status)) if status.code == 403 => {
+                    self.watch_refused.store(true, Ordering::Relaxed);
                     drop(held);
                     return self.list_each().await;
                 }
@@ -201,12 +216,12 @@ impl Follow {
         }
     }
 
-    /// Without the right to watch: every `every`, while the page is on screen, the events are
-    /// listed again and their rows sent. The watch isn't asked again, which the API server
+    /// Without the right to watch: every `every()`, while the page is on screen, the events
+    /// are listed again and their rows sent. The watch isn't asked again, which the API server
     /// would refuse and log each time.
     async fn list_each(&self) -> Result<()> {
         loop {
-            tokio::time::sleep(self.every).await;
+            tokio::time::sleep((self.every)()).await;
             if !self.shown().await {
                 return Ok(());
             }
@@ -247,7 +262,7 @@ impl Rows {
         if !self.dirty || follow.pause.is_paused() {
             return None;
         }
-        let due = self.sent.map(|sent| sent + follow.every).max(self.not_before);
+        let due = self.sent.map(|sent| sent + (follow.every)()).max(self.not_before);
         Some(due.map_or_default(|due| due.saturating_duration_since(Instant::now())))
     }
 
@@ -380,15 +395,6 @@ impl Held {
     }
 }
 
-/// What one line of a watch did.
-#[derive(Debug, PartialEq, Eq)]
-enum Applied {
-    Changed,
-    Unchanged,
-    /// 410 Gone: the resourceVersion is too old, list again.
-    Relist,
-}
-
 /// A line of a watch, its object kept as written until its type says how to read it.
 #[derive(Deserialize)]
 struct Frame {
@@ -469,6 +475,8 @@ mod tests {
         watches: VecDeque<(Vec<String>, bool)>,
         /// Watches are refused (403): the user may list events, not watch them.
         no_watch: bool,
+        /// Lists still to fail (500).
+        fail_lists: usize,
         asked: Vec<String>,
     }
 
@@ -509,6 +517,10 @@ mod tests {
 
         fn refuse_watches(&self) {
             self.stored.lock().unwrap().no_watch = true;
+        }
+
+        fn fail_lists(&self, n: usize) {
+            self.stored.lock().unwrap().fail_lists = n;
         }
 
         fn asked(&self) -> Vec<String> {
@@ -625,6 +637,12 @@ mod tests {
                 let body = watch_body(lines, ends, Open(self.open.clone()));
                 return std::future::ready(Ok(http::Response::new(body)));
             }
+            if stored.fail_lists > 0 {
+                stored.fail_lists -= 1;
+                let failed = json!({"kind": "Status", "apiVersion": "v1", "status": "Failure", "reason": "InternalError",
+                    "code": 500, "message": "etcd timed out"});
+                return std::future::ready(Ok(json_body(500, &failed)));
+            }
             let selector = param("fieldSelector").unwrap_or_default();
             let warnings_only = selector == "type%3DWarning";
             let uid = selector.strip_prefix("involvedObject.uid%3D");
@@ -695,7 +713,7 @@ mod tests {
         pause: &Pause,
     ) -> (crate::k8s::TaskGuard, mpsc::UnboundedReceiver<EventsMsg>) {
         let client = kube::Client::new(cluster.clone(), "default");
-        super::watch_events(client, None, normal, 100, Duration::ZERO, pause.clone())
+        super::watch_events(client, None, normal, 100, || Duration::ZERO, pause.clone())
     }
 
     /// After one list, the watch from its resourceVersion brings each change: an event added,
@@ -773,7 +791,8 @@ mod tests {
     }
 
     /// Allowed to list the events but not to watch them: they are listed again every `every`,
-    /// with what changed and no error, but not while off screen; the watch isn't asked again.
+    /// with what changed and no error, but not while off screen; the watch isn't asked again,
+    /// not even after a list failed.
     #[tokio::test(flavor = "multi_thread")]
     async fn without_the_right_to_watch_they_are_listed_again() {
         let cluster = Events::new(0, 500);
@@ -781,11 +800,29 @@ mod tests {
         cluster.refuse_watches();
         let (client, pause) = (kube::Client::new(cluster.clone(), "default"), Pause::default());
         let every = Duration::from_millis(200);
-        let (_watch, mut rx) = super::watch_events(client, None, false, 100, every, pause.clone());
+        let (_watch, mut rx) = super::watch_events(client, None, false, 100, move || every, pause.clone());
         assert_eq!(names(&until(&mut rx, |_| true).await), ["a"]);
         cluster.add(warning("shop", "b", 20, 1, "6"));
         assert_eq!(names(&until(&mut rx, |r| r.rows.len() == 2).await), ["b", "a"]);
         assert!(cluster.lists() >= 2, "{:?}", cluster.asked());
+        assert_eq!(cluster.watches_asked().len(), 1, "{:?}", cluster.asked());
+        // A list fails: it is said, then listed again, still without asking for the watch.
+        cluster.fail_lists(1);
+        cluster.add(warning("shop", "c", 30, 1, "7"));
+        let mut failed = false;
+        let rows = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                match rx.next().await.expect("the watch stopped") {
+                    EventsMsg::Rows(r) if r.rows.len() == 3 => return r,
+                    EventsMsg::Rows(_) => {}
+                    EventsMsg::Error(_) => failed = true,
+                }
+            }
+        })
+        .await
+        .expect("the rows never came");
+        assert_eq!(names(&rows), ["c", "b", "a"]);
+        assert!(failed, "the failed list is said");
         assert_eq!(cluster.watches_asked().len(), 1, "{:?}", cluster.asked());
         pause.set(true);
         // A list already started ends.
