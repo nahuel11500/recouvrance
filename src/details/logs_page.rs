@@ -53,7 +53,7 @@ impl LogsPage {
             loop {
                 let exec = cx.background_executor().clone();
                 let shown = crate::app::wait_visible_or_away(&this, cx, &exec, |page: &mut Self, cx| page.pause(cx));
-                if shown.await.is_none() || this.update(cx, |this, cx| this.resume(cx)).is_err() {
+                if shown.await.is_none() || this.update(cx, Self::resume).is_err() {
                     break;
                 }
                 exec.timer(std::time::Duration::from_millis(500)).await;
@@ -118,7 +118,7 @@ impl LogsPage {
                 .collect::<Vec<_>>()
                 .await
         };
-        self.find.spawn_in(window, cx, work, |this, found, window, cx| this.show_pods(found, window, cx));
+        self.find.spawn_in(window, cx, work, Self::show_pods);
         cx.notify();
     }
 
