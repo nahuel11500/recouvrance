@@ -1073,6 +1073,7 @@ pub(super) mod tests {
             preview: None,
             access: access("hub", "sync", "applications.argoproj.io", Some("argocd"), Some("web")),
             dry_run: false,
+            deadline: std::time::Instant::now(),
         };
         let ask = rule(Mode::Ask, &["patch", "sync"], &["*"], &["*"], &["*"]);
         let p = Policy { rules: vec![ask, approval.as_rule().unwrap()], ..Policy::default() };
