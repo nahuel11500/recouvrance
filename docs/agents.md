@@ -162,7 +162,7 @@ Tools, by what they do:
   `top_nodes`, `usage_history`, `get_logs`, `workload_logs`, `get_changes`, `recent_changes`,
   `rollout_history`, `rollout_status`, `list_helm_releases`, `helm_history`, `helm_get_values`,
   `diff_manifest`, `explain_resource`, `can_i`, `cluster_version`, `upgrade_check`, `wait_for`,
-  `list_port_forwards`, `browse_files`, `get_metrics`.
+  `list_port_forwards`, `browse_files`, `get_metrics`, `argocd_apps`.
 - **Change:** `scale`, `rollout_restart`, `rollout_undo`, `rollout_pause`, `rollout_resume`,
   `set_image`, `patch_resource`, `apply_manifest`, `delete_resource`, `trigger_cronjob`,
   `cordon_node`, `uncordon_node`, `drain_node`, `gitops`, `exec_command`, `debug_pod`,
@@ -204,6 +204,29 @@ tools' definitions. What some of them need beyond the obvious verb:
 - **Logs of a workload:** `workload_logs` merges the logs of a workload's or Service's pods (the
   newest 20) in time order, each line prefixed with its pod. It needs `get` on the workload; pods
   whose logs the rules don't allow are left out and counted.
+- **Argo CD, from the hub to the destination:** `argocd_apps` lists Applications like the Argo CD
+  page: for each, its hub (the context Argo CD runs in), project, sync, health, auto-sync, last
+  operation, revision, where it deploys (the kubeconfig context that reaches its destination,
+  marked when the agent's rules don't open it) and the app of apps that made it, those needing a
+  look first with Argo CD's message. Filters: `problems_only` (a failed sync, an error, Degraded
+  or Missing, a sync running, or out of sync with auto-sync on; out of sync with auto-sync off is
+  how an Application synced by hand waits, not a problem), `out_of_sync`, `project`,
+  `destination` (a context) and `dest_namespace`. It reads the hub in `context`, else the hubs
+  ticked in Settings → Contexts, else those the window or an agent's calls found serving
+  Applications, and only among the contexts the rules name: no other context is asked whether it
+  runs Argo CD. It needs `list` on `applications.argoproj.io` on the hub and shows the rows the
+  rules allow; without `context` it never asks for approval and names the hubs only an Ask rule
+  covers. The list is the one the Argo CD page reads (kept 30 s, one per hub).
+  `describe_resource` and `get_changes` name the Application that deployed an object, from its
+  tracking id (`argocd.argoproj.io/tracking-id`, Argo CD's annotation tracking) or else its
+  `app.kubernetes.io/instance` label (label tracking; Helm sets it too, so it counts only when
+  the Application is found tracking the object), with its hub, sync, health and the object's own
+  state in it; `get_changes` adds the Application's deployments. That Application is read on the
+  same hubs, only where an Allow rule gives `get` on it (or `list`, to find it in another
+  namespace or by label), and nothing is read for an object that names none. `wait_for` waits for
+  an Application's `sync=Synced`, `health=Healthy` or `operation=Succeeded`, met only once no
+  operation runs (until then they are from before it); it returns at once with Argo CD's message
+  when the last operation failed.
 - **Argo CD diagnosis:** `gitops` with `action: diagnose` on an Application changes nothing and
   needs `get` on it (not `refresh` or `sync`; the activity log doesn't count it as a change). It returns the
   diagnosis of the Application's page: a deletion held by a finalizer, a sync running for long,

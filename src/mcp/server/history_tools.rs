@@ -51,7 +51,7 @@ pub struct RecentParams {
 #[tool_router(router = history_tools, vis = "pub(super)")]
 impl KubeMcp {
     #[tool(
-        description = "What changed on an object, newest first, each with its source, what changed and a short diff: the revisions of the workload that rolls it out (a pod's: its owner's), of the Helm release that installed it (values masked), an Argo CD Application's deployments, which field managers last wrote which fields and when (managedFields), its events, and the changes Recouvrance recorded while it watched the object (source Recorded: ConfigMaps, Services, scale changes... that the cluster keeps no history of; a Secret's values never, only which keys changed). Needs get on the object; a pod's owner needs get, the Helm revisions list on secrets, the events list on events.",
+        description = "What changed on an object, newest first, each with its source, what changed and a short diff: the revisions of the workload that rolls it out (a pod's: its owner's), of the Helm release that installed it (values masked), an Argo CD Application's deployments (of the Application that deployed the object too, read on its hub where your Allow rules let you, and named with its sync and health), which field managers last wrote which fields and when (managedFields), its events, and the changes Recouvrance recorded while it watched the object (source Recorded: ConfigMaps, Services, scale changes... that the cluster keeps no history of; a Secret's values never, only which keys changed). Needs get on the object; a pod's owner needs get, the Helm revisions list on secrets, the events list on events.",
         annotations(read_only_hint = true)
     )]
     async fn get_changes(
@@ -77,6 +77,14 @@ impl KubeMcp {
         let mut errors = fetched.errors;
         let subject = format!("{} {}", kind.ar.kind, p.name);
         let mut lists = vec![fetched.changes, history::own_changes(&kind, &value)];
+        // The deployments of the Application that deployed it, as the History tab shows them
+        // (an Application's own are in `own_changes`).
+        let managed = self.managed_by(&call, &p.context, &kind, &value).await;
+        if let Some(app) = managed.as_ref().and_then(|m| m.app.as_ref())
+            && !kind.is("argoproj.io", "Application")
+        {
+            lists.push(history::argo_changes(app));
+        }
         // What the app recorded while it watched this object (this one: by its uid).
         crate::timeline::opened(&p.context).await;
         let uid = value.pointer("/metadata/uid").and_then(|v| v.as_str()).unwrap_or_default();
@@ -107,7 +115,11 @@ impl KubeMcp {
         }
         let changes = history::merge(lists);
         let limit = p.limit.unwrap_or(30).clamp(1, 200) as usize;
-        call.finish(Ok(history::report(&subject, &changes, &errors, limit)))
+        let mut text = history::report(&subject, &changes, &errors, limit);
+        if let Some(managed) = managed {
+            text.push_str(&managed.text);
+        }
+        call.finish(Ok(text))
     }
 
     #[tool(
