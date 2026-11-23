@@ -929,8 +929,15 @@ mod tests {
     /// could not write back. Refused before anything is saved: no file is written here.
     #[test]
     fn an_allow_rule_naming_protected_contexts_is_not_saved() {
-        use crate::mcp::policy::tests::rule;
-        let protected = |effect| rule(effect, &["delete"], &["pods"], &["*"], &["staging", super::super::PROTECTED]);
+        let protected = |effect| Rule {
+            effect,
+            verbs: vec!["delete".into()],
+            resources: vec!["pods".into()],
+            namespaces: vec!["*".into()],
+            contexts: vec!["staging".into(), super::super::PROTECTED.into()],
+            names: vec!["*".into()],
+            ..Rule::default()
+        };
         let hub = Hub::for_test(vec![agent()]);
         assert!(hub.update_agent("a1", |a| a.policy.rules.push(protected(Mode::Allow))).is_err());
         assert_eq!(hub.agent("a1").unwrap().policy.rules, Policy::default().rules);
