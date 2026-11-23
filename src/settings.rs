@@ -360,6 +360,10 @@ pub struct Settings {
     /// Contexts Argo CD's Applications are read from. Empty: found on their own, among the
     /// connected clusters first, then the kubeconfig's other contexts.
     pub argocd_contexts: Vec<String>,
+    /// The Argo CD API server of a hub context (`https://argocd.example.com`), to read Argo
+    /// CD's own diff from. None set: that diff is off, nothing is sent to Argo CD.
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty", deserialize_with = "string_entries")]
+    pub argocd_servers: std::collections::BTreeMap<String, String>,
     /// Which kubeconfig file keeps a context name that several files have: the first one
     /// seen. The others' contexts are `name@file`, whatever order the files are read in.
     #[serde(deserialize_with = "string_entries")]
@@ -591,6 +595,7 @@ impl Default for Settings {
             clusters: Default::default(),
             kubeconfig_folders: Vec::new(),
             argocd_contexts: Vec::new(),
+            argocd_servers: Default::default(),
             context_files: Default::default(),
             open_browser_on_forward: true,
             recent_forwards: Vec::new(),

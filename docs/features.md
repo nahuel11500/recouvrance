@@ -283,6 +283,14 @@
   Secret's values never are. The field managers that wrote the object since the last sync are
   named too (with server-side apply that is all there is). A destination that isn't connected
   is said; open it to connect.
+- **Argo CD's own diff** (off until set up): with the hub context's Argo CD server set in
+  Settings → Per cluster, an Application's page offers *Show Argo CD's diff*: what a sync would
+  change, as Argo CD renders it from git (Helm and Kustomize applied), against the live objects.
+  Each resource that differs (changed, created by the sync, or no longer in git) is shown as a
+  diff from live to git, the first ones open and the others a click away; hooks are left out and
+  Secret values are hidden. It is one read-only request to that server, sent on the click, with
+  the argocd CLI's login to it or a read-only token set in Settings (see
+  [configuration](configuration.md#argo-cds-diff-argocd_servers)).
 - **Assistant beside any page** (Ctrl+J, ⌘J on macOS, or the sparkles button in the top bar): the
   window's assistant chat opens on the right of the page shown, the same chat as on its own page (the
   expand button opens it there). It is told what is on screen, as its header shows: the
