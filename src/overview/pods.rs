@@ -697,8 +697,7 @@ fn pod_columns(namespaced: bool) -> Vec<(&'static str, f32, PodSort)> {
 /// up. Names (namespace, pod, node) give up width in a narrow window, down to half of theirs and
 /// cut with an ellipsis; the other columns keep theirs.
 fn pod_cell(title: &str, width: f32) -> Div {
-    let d = div().w(px(width)).overflow_hidden().text_ellipsis().whitespace_nowrap();
-    if shrinks(title) { d.flex_shrink(1.).min_w(px(width / 2.)) } else { d.flex_none() }
+    super::column_cell(width, shrinks(title))
 }
 
 /// The columns that shrink: names, which an ellipsis still leaves recognizable.

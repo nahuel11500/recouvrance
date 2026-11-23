@@ -59,6 +59,11 @@ separate lean list of the pods, read again every minute (or ten times as long as
 that is longer). On a cluster with about 20,800 pods, the first rows show after 0.7 s and all of
 them after 1.4 s ([measured](COMPARISON.md#measured)).
 
+The Problems scan reads the big kinds from their cells too (`list_light`). What its checks need
+of whole objects (Services, Ingresses and HTTP routes, the pods a Service selects, the workloads of
+a namespace with an idle Service, external-secrets.io's objects) is parsed as each list streams in,
+keeping only the fields the checks use; of the workloads, only those scaled to 0 are kept.
+
 ## Safety model
 
 - **Read-only by default.** Write actions ask to enable write mode first.

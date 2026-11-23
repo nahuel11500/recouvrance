@@ -26,6 +26,7 @@ mod workloads;
 
 use crate::json::{arr_at as arr, i64_at as n, str_at as s};
 use access::{binding_page, role_page, service_account_page};
+pub(crate) use argo::ArgoResources;
 pub(crate) use config::*;
 pub(crate) use network::same_parent;
 use network::{gateway, ingress, netpol, route, service};
@@ -180,6 +181,8 @@ pub struct Ctx<'a> {
     pub pod_order: PodOrder,
     /// The Argo CD Applications that deploy the object, or into the namespace.
     pub argo: &'a k8s::argo::Lookup,
+    /// An Application's resources table.
+    pub argo_resources: &'a ArgoResources,
 }
 
 impl Ctx<'_> {
@@ -305,6 +308,14 @@ fn row() -> Div {
     h_flex().flex_wrap().items_start().gap_x_8().gap_y_4()
 }
 
+/// A table's cell, on one line, as wide in its header as in its rows so they line up. One
+/// that shrinks (a name, still recognizable cut with an ellipsis) gives up width in a narrow
+/// window, down to half of it; the others keep theirs.
+pub(crate) fn column_cell(width: f32, shrinks: bool) -> Div {
+    let d = div().w(px(width)).overflow_hidden().text_ellipsis().whitespace_nowrap();
+    if shrinks { d.flex_shrink(1.).min_w(px(width / 2.)) } else { d.flex_none() }
+}
+
 fn state_color(text: &str, cx: &App) -> Hsla {
     crate::status::tone(text).map_or(cx.theme().muted_foreground, |t| t.color(cx))
 }
@@ -341,9 +352,10 @@ fn lists_pods(kind: &Kind) -> bool {
         || ((kind.ar.group == "apps" || kind.is("batch", "Job")) && !kind.is("batch", "CronJob"))
 }
 
-/// Pages that can hold hundreds of rows (a node's pods, a ConfigMap's keys, a CRD's fields)
-/// are drawn as a list, so only the items on screen are laid out: the sections above, one
-/// item per row, then the conditions. The number of rows, or None for other pages.
+/// Pages that can hold hundreds of rows (a node's pods, a ConfigMap's keys, a CRD's fields,
+/// an Application's resources) are drawn as a list, so only the items on screen are laid
+/// out: the sections above, one item per row, then what comes below (`bottom`). The number of
+/// rows, or None for other pages.
 pub fn list_rows(ctx: &Ctx) -> Option<usize> {
     let kind = ctx.kind;
     if lists_pods(kind) {
@@ -352,6 +364,8 @@ pub fn list_rows(ctx: &Ctx) -> Option<usize> {
         Some(ctx.obj.get("data").and_then(Value::as_object).map_or(0, serde_json::Map::len))
     } else if kind.is("apiextensions.k8s.io", "CustomResourceDefinition") {
         Some(ctx.schema_rows.len())
+    } else if kind.is("argoproj.io", "Application") {
+        Some(ctx.argo_resources.shown())
     } else {
         None
     }
@@ -362,7 +376,7 @@ pub fn item(ctx: &Ctx, ix: usize, cx: &App) -> AnyElement {
     let body = match ix {
         0 => top(ctx, cx).into_any_element(),
         ix if ix <= rows => list_row(ctx, ix - 1, cx),
-        _ => conditions(ctx.obj, cx),
+        _ => bottom(ctx, cx),
     };
     div().px_2().when(ix > rows, Styled::pb_8).child(body).into_any_element()
 }
@@ -375,6 +389,8 @@ fn list_row(ctx: &Ctx, i: usize, cx: &App) -> AnyElement {
         secret_entry(ctx, i, cx)
     } else if kind.is("apiextensions.k8s.io", "CustomResourceDefinition") {
         ctx.schema_rows.get(i).map_or_else(|| div().into_any_element(), |r| schema_row(r, cx))
+    } else if kind.is("argoproj.io", "Application") {
+        argo::resource_row(ctx, i, cx)
     } else {
         ctx.related.pod_rows.get(i).map_or_else(|| div().into_any_element(), |r| pod_row(ctx, r, cx))
     }
@@ -383,10 +399,10 @@ fn list_row(ctx: &Ctx, i: usize, cx: &App) -> AnyElement {
 /// The whole page in one scroll, for where it is not a list (next to the data editor).
 pub fn render(ctx: &Ctx, cx: &App) -> AnyElement {
     let rows = (0..list_rows(ctx).unwrap_or(0)).map(|i| list_row(ctx, i, cx));
-    scroll(top(ctx, cx).children(rows).child(conditions(ctx.obj, cx)), "overview")
+    scroll(top(ctx, cx).children(rows).child(bottom(ctx, cx)), "overview")
 }
 
-/// Everything above the conditions.
+/// Everything above the list's rows.
 fn top(ctx: &Ctx, cx: &App) -> Div {
     let kind = ctx.kind;
     let mut root = v_flex().gap_1().child(references_card(ctx, cx));
@@ -448,21 +464,34 @@ fn top(ctx: &Ctx, cx: &App) -> Div {
             .child(service(ctx, cx))
             .child(heading_for("Pods behind this Service", ctx.related, "pods", cx))
             .child(pods_table(ctx, cx));
+    } else if kind.is("argoproj.io", "Application") {
+        // Its resources come next, a row of the list each; its spec and status below them.
+        root = root
+            .children(argo::destination(ctx, cx))
+            .children(argo::diagnosis(ctx, cx))
+            .child(argo::resources_table(ctx, cx));
     } else {
         if kind.is(crate::external_secrets::GROUP, "ExternalSecret") {
             root = root.child(external_secret_page(ctx, cx));
         }
-        if kind.is("argoproj.io", "Application") {
-            root = root.children(argo::destination(ctx, cx)).children(argo::diagnosis(ctx, cx));
-        }
         // Anything else (CRDs especially): spec and status as readable fields.
-        root = root.child(generic_section("Spec", ctx.obj.get("spec"), cx)).child(generic_section(
-            "Status",
-            ctx.obj.get("status"),
-            cx,
-        ));
+        root = root.child(spec_and_status(ctx.obj, cx));
     }
     root
+}
+
+/// Everything below the list's rows: an Application's spec and status (under its
+/// resources), then the conditions.
+fn bottom(ctx: &Ctx, cx: &App) -> AnyElement {
+    if !ctx.kind.is("argoproj.io", "Application") {
+        return conditions(ctx.obj, cx);
+    }
+    v_flex().child(spec_and_status(ctx.obj, cx)).child(conditions(ctx.obj, cx)).into_any_element()
+}
+
+/// Spec and status as readable fields, for kinds without a page of their own.
+fn spec_and_status(obj: &Value, cx: &App) -> Div {
+    v_flex().child(generic_section("Spec", obj.get("spec"), cx)).child(generic_section("Status", obj.get("status"), cx))
 }
 
 fn scroll(content: Div, id: &'static str) -> AnyElement {

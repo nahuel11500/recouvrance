@@ -245,22 +245,7 @@ impl AppView {
     /// Record which page this window shows, and whether the window is hidden (see
     /// `wait_visible`). The list pauses at once when it leaves the screen.
     pub(super) fn mark_visible(&mut self, cx: &mut Context<Self>) {
-        let page = match self.route() {
-            Route::Detail(e) => Some(e.entity_id()),
-            Route::Workloads(e) => Some(e.entity_id()),
-            Route::Cluster(e) => Some(e.entity_id()),
-            Route::Problems(e) => Some(e.entity_id()),
-            Route::Timeline(e) => Some(e.entity_id()),
-            Route::Access(e) => Some(e.entity_id()),
-            Route::HelmInstall(e) => Some(e.entity_id()),
-            Route::Assistant(e) => Some(e.entity_id()),
-            Route::Helm(e) => Some(e.entity_id()),
-            Route::HelmRelease(e) => Some(e.entity_id()),
-            Route::Argo(e) => Some(e.entity_id()),
-            Route::Terminal(e) => Some(e.entity_id()),
-            Route::Apply(e) => Some(e.entity_id()),
-            Route::Resources(_) | Route::Contexts | Route::Settings | Route::Agents => None,
-        };
+        let page = self.route().page();
         self.list_pause.set(!self.list_on_screen());
         let (me, hidden) = (cx.entity_id(), self.window_hidden);
         let visible = cx.default_global::<VisiblePages>();
