@@ -27,6 +27,7 @@ use crate::ui::palette::Palette;
 use crate::ui::settings_view::SettingsView;
 
 mod chrome;
+pub(crate) mod commands;
 mod contexts;
 #[cfg(feature = "dev")]
 mod demo;
@@ -48,9 +49,7 @@ mod view_cache;
 mod watch;
 
 pub use menus::init as init_menus;
-#[cfg(test)]
-pub(crate) use shortcuts::unbound_keys;
-pub(crate) use shortcuts::with_keys;
+pub(crate) use shortcuts::{key_cap, shortcut_rows, with_keys};
 use sidebar::section_icon;
 pub(crate) use theme::*;
 
@@ -294,7 +293,20 @@ gpui_kit::actions!(
         GoHelm,
         GoAssistant,
         GoSettings,
-        ToggleAssistant
+        ToggleAssistant,
+        OpenArgo,
+        OpenTimeline,
+        OpenAccess,
+        OpenUpgradeCheck,
+        OpenAgents,
+        OpenAgentActivity,
+        OpenContexts,
+        OpenTerminal,
+        OpenApply,
+        OpenHelmInstall,
+        OpenApiRequests,
+        ToggleWriteMode,
+        ToggleTheme
     ]
 );
 
