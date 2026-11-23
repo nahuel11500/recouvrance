@@ -21,6 +21,7 @@ use crate::status::Tone;
 
 pub mod diagnosis;
 pub mod ops;
+pub mod server;
 
 /// The annotation Argo CD puts on what it deploys.
 pub const TRACKING_ID: &str = "argocd.argoproj.io/tracking-id";

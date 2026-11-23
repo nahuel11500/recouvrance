@@ -179,6 +179,9 @@ pub struct DetailPanel {
     schema_rows: Vec<crate::overview::SchemaRow>,
     /// An Application's resources table, worked out when it is read rather than on every frame.
     argo_resources: crate::overview::ArgoResources,
+    /// An Application's diff as Argo CD renders it from git (read on a click), and its read.
+    argo_git: crate::overview::ArgoGitDiff,
+    argo_git_load: crate::latest::Latest,
     /// Inline editor of a ConfigMap's or Secret's values.
     data_editor: Option<Entity<crate::ui::data_edit::DataEditor>>,
     /// Show metadata.managedFields in the YAML (hidden by default).
@@ -293,6 +296,8 @@ impl DetailPanel {
             argo_load: Default::default(),
             schema_rows: Vec::new(),
             argo_resources: Default::default(),
+            argo_git: Default::default(),
+            argo_git_load: Default::default(),
             data_editor: None,
             show_managed: false,
             field_docs: None,
@@ -980,6 +985,8 @@ impl DetailPanel {
             pod_order: self.pod_order,
             argo: &self.argo,
             argo_resources: &self.argo_resources,
+            argo_git: &self.argo_git,
+            context: &self.context,
         }
     }
 

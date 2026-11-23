@@ -18,6 +18,7 @@ Recouvrance reads your kubeconfig like `kubectl` does and keeps its own settings
 | `~/.config/recouvrance/favorites.json`, `columns.json`, `custom-columns.json`, `column-widths.json` | Favorites, saved views, column choices and widths |
 | `~/.config/recouvrance/theme`, `zoom` | Light or dark choice (absent: follow the desktop), UI zoom (0.7 to 2.0) |
 | `~/.config/recouvrance/anthropic-key` | The assistant's Anthropic API key, when saved in Settings (mode 0600; `ANTHROPIC_API_KEY` is used otherwise) |
+| `~/.config/recouvrance/argocd-tokens.json` | Read-only Argo CD API tokens set in Settings → Per cluster, by context (mode 0600; see [Argo CD's diff](#argo-cds-diff-argocd_servers)) |
 | `~/.config/recouvrance/main-agent` | The built-in assistant's agent id and token (mode 0600) |
 | `~/.local/share/recouvrance/audit.jsonl` | Agent activity log |
 | `~/.local/share/recouvrance/timeline/<context>-<hash>.jsonl` | Changes recorded per context (mode 0600, see [Timeline](#timeline)) |
@@ -80,6 +81,7 @@ context already shown as `name@file` keeps that name when `name` is freed.
 | `protect_unset` | `false` | Set when the protection choices could not be read: contexts not listed in `protection` are protected instead of guessed. *Guess them again* in Settings → Contexts turns it off |
 | `prometheus` | found automatically | `{ "ctx": "monitoring/prometheus:9090" }` (see below) |
 | `clusters` | | Per-cluster settings (below) |
+| `argocd_servers` | `{}` | `{ "argocd-hub": "https://argocd.example.com" }`: the Argo CD API server of a hub context, to read Argo CD's own diff from (see below). None: off. An entry that doesn't read is dropped. Settings → Per cluster |
 | `argocd_contexts` | `[]` | `["argocd-hub"]`: the contexts Argo CD's Applications are read from (see below). Empty: found on their own. A value that doesn't read is empty. Settings → Contexts, *Argo CD* |
 | `extra_namespaces` | | Namespaces added by hand, per context |
 | `metrics_enabled` | true | Read metrics-server and Prometheus at all |
@@ -191,6 +193,28 @@ on and it is asked (its login may run); if it serves Applications, it is kept he
 ```
 
 Only the named contexts are asked then (their login may run). Connecting the hub as well works too.
+
+### Argo CD's diff (`argocd_servers`)
+
+An Application's page can show what a sync would change, as Argo CD renders it from git: set the
+Argo CD API server of the hub context in Settings → Per cluster (`https://argocd.example.com`,
+with a path when Argo CD is served under one). Plain `http://` is only taken for this machine (a
+port-forward to argocd-server), so a token never crosses the network in clear.
+
+*Show Argo CD's diff* then sends one request, `GET /api/v1/applications/{name}/managed-resources`,
+to that server only, and only on that click. It logs in with, in this order:
+
+- the token set in Settings → Per cluster (kept in `argocd-tokens.json`, mode 0600, never shown
+  again; *Forget* removes it). A project role or local account limited to `applications, get` is
+  enough;
+- the argocd CLI's login to that server: the token `argocd login` saved in its config file
+  (`$ARGOCD_CONFIG_DIR/config`, else `~/.argocd/config` when that folder exists, else
+  `~/.config/argocd/config`). Recouvrance only reads it; when it has expired, run
+  `argocd login <server> --sso` again. The CLI's `--core` and port-forward modes have no address
+  to ask.
+
+Errors never show the token. Secret values are masked by Recouvrance itself, whatever Argo CD
+sends (its own masking leaked predicted Secret states before 3.2.12, 3.3.10 and 3.4.2).
 
 ## rules.yaml
 

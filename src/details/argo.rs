@@ -547,6 +547,27 @@ impl DetailPanel {
         self.argo_resources.alone = !self.argo_resources.alone;
         cx.notify();
     }
+
+    /// Read this Application's diff from its Argo CD's API server: one GET, read-only, sent
+    /// only on this click. A click again replaces the read running.
+    pub fn load_argo_git_diff(&mut self, cx: &mut Context<Self>) {
+        let Some(ns) = self.obj.namespace.clone() else { return };
+        self.argo_git.loading = true;
+        let read = k8s::argo::server::git_diff(self.context.clone(), ns, self.obj.name.clone());
+        self.argo_git_load.spawn(cx, read, |this, read, cx| {
+            this.argo_git.set(read);
+            cx.notify();
+        });
+        cx.notify();
+    }
+
+    /// Show or hide the diff of the resource at `i` in Argo CD's diff.
+    pub fn toggle_argo_git(&mut self, i: usize, cx: &mut Context<Self>) {
+        if !self.argo_git.open.remove(&i) {
+            self.argo_git.open.insert(i);
+        }
+        cx.notify();
+    }
 }
 
 #[cfg(test)]
