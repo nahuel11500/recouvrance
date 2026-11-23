@@ -4,6 +4,7 @@
 use anyhow::Result;
 use k8s_openapi::api::core::v1::Pod;
 use kube::Client;
+use kube::Resource as _;
 use kube::api::{DynamicObject, GetParams};
 use kube::core::Request;
 use kube::discovery::ApiResource;
@@ -18,7 +19,7 @@ pub struct LogPod {
     pub namespace: String,
     /// Running now: past the limit of pods followed, these go first.
     pub running: bool,
-    /// Its creationTimestamp as written (RFC 3339 sorts as text): the newest go first.
+    /// Its `creationTimestamp` as written (RFC 3339 sorts as text): the newest go first.
     pub created: String,
     /// Its containers, the default one first (`pod_containers`).
     pub containers: Vec<String>,

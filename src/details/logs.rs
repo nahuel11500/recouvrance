@@ -30,7 +30,7 @@ const MSG_BATCH: usize = 1024;
 /// The pods whose logs a page follows: all of them, or past the limit the running ones
 /// first, newest first.
 pub(super) fn followed_pods(pods: &[serde_json::Value]) -> Vec<&serde_json::Value> {
-    follow_first(pods.iter().collect(), |p| {
+    follow_first(pods.iter().collect(), |p: &&serde_json::Value| {
         let running = p.pointer("/status/phase").and_then(|v| v.as_str()) == Some("Running");
         let created = p.pointer("/metadata/creationTimestamp").and_then(|v| v.as_str()).unwrap_or_default();
         (running, created.to_string())

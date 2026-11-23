@@ -273,7 +273,9 @@ fn gather<P: Clone>(found: Vec<Found<P>>, at: impl Fn(&P) -> (&str, &str)) -> Ga
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::collections::{BTreeSet, HashSet};
+
+    use super::{Found, Gathered, LogPod, MAX_LOG_PODS, gather, rows_to_read};
 
     fn pod(name: &str, running: bool, created: &str) -> LogPod {
         LogPod {
