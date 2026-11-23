@@ -41,22 +41,22 @@ pub(super) struct Entry {
 impl Entry {
     /// The palette line for this object; `clusters` names the connected clusters.
     pub(super) fn item(&self, clusters: &[String]) -> PaletteItem {
-        PaletteItem {
-            label: self.name.clone(),
-            detail: format!(
+        PaletteItem::new(
+            self.name.clone(),
+            format!(
                 "{}{}{}",
                 self.label,
                 self.namespace.as_ref().map_or_default(|n| format!(" · {n}")),
                 on_cluster(clusters, self.ctx)
             ),
-            icon: self.icon,
-            target: Target::Object {
+            self.icon,
+            Target::Object {
                 ctx: self.ctx,
                 kind: self.kind.clone(),
                 name: self.name.clone(),
                 namespace: self.namespace.clone(),
             },
-        }
+        )
     }
 }
 

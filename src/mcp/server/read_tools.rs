@@ -1,5 +1,7 @@
 //! MCP tools that read: contexts, types, resources, events, describe, top, search, logs, certificates, reachability, problems, usage history.
 
+use std::collections::HashMap;
+
 use http::request::Parts;
 use rmcp::handler::server::tool::Extension;
 use rmcp::handler::server::wrapper::Parameters;
@@ -8,13 +10,14 @@ use serde_json::json;
 
 use super::logs_tools::{containers_note, log_containers};
 use super::{
-    CertParams, ContextParam, EventsParams, HistoryParams, KubeMcp, ListParams, LogsParams, MAX_LOG_BYTES,
-    ObjectParams, ProblemsParams, ReachParams, SearchParams, TopParams, access_for, describe, dry_run_tools,
-    format_table, get_named, is_secret_object, list_verdict, problem_visible, require_ns, visible,
+    CertParams, CheckAccessParams, ContextParam, EventsParams, HistoryParams, KubeMcp, ListParams, LogsParams,
+    MAX_LOG_BYTES, ObjectParams, PlannedRequest, ProblemsParams, ReachParams, SearchParams, TopParams, access_for,
+    access_verdict, context_refusal, describe, dry_run_tools, format_table, get_named, is_secret_object, list_verdict,
+    problem_visible, require_ns, visible,
 };
 use crate::k8s;
 use crate::k8s::{Kind, ObjectRef};
-use crate::mcp::{Mode, Policy, Verb};
+use crate::mcp::{Mode, PROTECTED, Policy, Verb};
 use crate::reachability;
 
 #[tool_router(router = read_tools, vis = "pub(super)")]
@@ -27,6 +30,42 @@ impl KubeMcp {
         let call = self.begin(&parts, "my_permissions", json!({}))?;
         let out = permissions(call.policy(), dry_run_tools());
         call.finish(Ok(out))
+    }
+
+    #[tool(
+        description = "Check calls you plan against your rules without making them: for each request (context, verb, kind, namespace, name), whether it is allowed, needs the user's approval or is denied, the rule that decides, and for a denial whether it is final (a Deny rule) or the rule the user could add. Use it before a task that needs several calls, to tell the user up front what to approve or grant. The verb is the rules' verb, not the tool: set_image, rollout_undo, rollout_pause, rollout_resume and patch_resource need patch; rollout_restart restart; apply_manifest apply on each object; trigger_cronjob get on the CronJob and apply on its Job; cordon_node, uncordon_node and drain_node drain on the node; exec_command, debug_pod and browse_files exec on the pod; port_forward forward; get_logs logs; gitops refresh (refresh, hard_refresh), sync (sync, reconcile) or suspend (suspend, resume) on the object, and get for diagnose.",
+        annotations(read_only_hint = true)
+    )]
+    async fn check_access(
+        &self,
+        Extension(parts): Extension<Parts>,
+        Parameters(p): Parameters<CheckAccessParams>,
+    ) -> Result<String, String> {
+        let call = self.begin(&parts, "check_access", json!({"requests": &p.requests}))?;
+        if p.requests.is_empty() || p.requests.len() > MAX_CHECKS {
+            return Err(call.fail(format!("pass 1 to {MAX_CHECKS} requests")));
+        }
+        let headless = self.hub.headless();
+        // A context that doesn't answer is tried once per call, and fails only its own requests.
+        let mut unreachable: HashMap<String, String> = HashMap::new();
+        let (mut allowed, mut ask, mut denied) = (0, 0, 0);
+        let mut lines = Vec::new();
+        for (i, r) in p.requests.iter().enumerate() {
+            let line = match self.check_one(call.policy(), r, headless, &mut unreachable).await {
+                Ok((mode, line)) => {
+                    match mode {
+                        Mode::Allow => allowed += 1,
+                        Mode::Ask => ask += 1,
+                        Mode::Deny => denied += 1,
+                    }
+                    line
+                }
+                Err(e) => format!("{}: could not check: {e}", planned(r)),
+            };
+            lines.push(format!("{}. {line}", i + 1));
+        }
+        lines.push(format!("\n{allowed} allowed, {ask} needing approval, {denied} denied."));
+        call.finish(Ok(lines.join("\n")))
     }
 
     #[tool(description = "List the Kubernetes contexts (clusters) you may access.", annotations(read_only_hint = true))]
@@ -807,6 +846,69 @@ impl KubeMcp {
     }
 }
 
+/// Most requests one `check_access` call checks.
+const MAX_CHECKS: usize = 20;
+
+/// A planned request as the agent wrote it, for a line that could not be checked.
+fn planned(r: &PlannedRequest) -> String {
+    let mut s = format!("{} {}", r.verb, r.kind);
+    if let Some(n) = &r.name {
+        s.push_str(&format!(" {n}"));
+    }
+    if let Some(ns) = &r.namespace {
+        s.push_str(&format!(" -n {ns}"));
+    }
+    s.push_str(&format!(" --context {}", r.context));
+    s
+}
+
+impl KubeMcp {
+    /// One `check_access` request: its verdict and line. Only discovery reaches the cluster,
+    /// and only for a context the rules name (others are never contacted).
+    async fn check_one(
+        &self,
+        policy: &Policy,
+        r: &PlannedRequest,
+        headless: bool,
+        unreachable: &mut HashMap<String, String>,
+    ) -> Result<(Mode, String), String> {
+        let verb: Verb = r.verb.trim().to_lowercase().parse()?;
+        if let Some(ns) = &r.namespace {
+            k8s::names::validate_namespace(ns)?;
+        }
+        if let Some(name) = &r.name {
+            k8s::names::validate_name(name)?;
+        }
+        if !policy.context_allowed(&r.context) {
+            let (reason, hint) = context_refusal(policy, &r.context);
+            return Ok((Mode::Deny, format!("{}: denied, {reason}. {hint}", planned(r))));
+        }
+        if let Some(e) = unreachable.get(&r.context) {
+            return Err(e.clone());
+        }
+        let kinds = match self.hub.client(&r.context).await {
+            Ok((_, kinds)) => kinds,
+            Err(e) => {
+                let e = k8s::error_chain(&e);
+                unreachable.insert(r.context.clone(), e.clone());
+                return Err(e);
+            }
+        };
+        let kind = match k8s::find_kind(&kinds, &r.kind) {
+            Some(kind) => kind.clone(),
+            // Maybe a CRD installed since the context was discovered.
+            None => self.find_kind(&r.context, &r.kind).await.map_err(|e| k8s::error_chain(&e))?.1,
+        };
+        if kind.namespaced && r.name.is_some() && r.namespace.is_none() {
+            return Err(format!("{} is namespaced: pass `namespace`", kind.ar.kind));
+        }
+        let access = access_for(&kind, &r.context, verb, r.namespace.clone(), r.name.clone());
+        let any_namespace = kind.namespaced && access.namespace.is_none();
+        let (mode, text) = access_verdict(policy, &access, any_namespace, headless);
+        Ok((mode, format!("{}: {text}", describe(&access))))
+    }
+}
+
 /// What `my_permissions` tells an agent: its rules, its limits, and the tools that take
 /// `dry_run` (read from their definitions, so a new one is named too).
 fn permissions(p: &Policy, dry_run: &[String]) -> String {
@@ -843,11 +945,21 @@ fn permissions(p: &Policy, dry_run: &[String]) -> String {
         let accept = crate::plural::pick(dry_run.len(), "accepts", "accept");
         out.push_str(&format!("\n{names} {accept} dry_run=true: prefer it first."));
     }
+    if p.names_protected() {
+        out.push_str(&format!(
+            "\nThe context {PROTECTED} stands for the contexts the user protects in Recouvrance: on those, such a rule \
+             asks or denies; it never allows anything by itself."
+        ));
+    }
     // An agent waiting for a banner that never comes, or taking a short list for all there is.
     out.push_str(&format!(
         "\n{NEVER_ASKS} never asks for approval: it shows the changes and events your Allow rules let you read \
          (get on each object, list on events) and counts the rest."
     ));
+    out.push_str(
+        "\ncheck_access tells, for the calls you plan, whether each is allowed, needs approval or is denied, \
+         and what the user could grant.",
+    );
     out
 }
 
@@ -982,9 +1094,11 @@ mod tests {
             .map(|t| t.name.to_string())
             .collect();
         assert_eq!(named, take);
-        // Every change but exec_command, drain_node, gitops and the port-forward tools (docs/agents.md).
-        assert_eq!(take.len(), 13, "{take:?}");
+        // Every change but exec_command, drain_node and the port-forward tools (docs/agents.md);
+        // gitops's is Argo CD's own dry run of a sync or a rollback.
+        assert_eq!(take.len(), 14, "{take:?}");
         assert!(take.contains("set_image") && take.contains("cordon_node") && take.contains("debug_pod"), "{take:?}");
+        assert!(take.contains("gitops"), "{take:?}");
     }
 
     /// `my_permissions` says which tool never asks, by the name of a tool that only reads.
