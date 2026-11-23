@@ -228,6 +228,7 @@ impl AppView {
     pub(super) fn render_approvals(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let cx: &App = cx;
         let theme = cx.theme();
+        let now = std::time::Instant::now();
         v_flex().children(self.approvals.iter().map(|a| {
             let (deny, approve) = (a.id, a.id);
             let hub = self.hub.clone();
@@ -297,6 +298,10 @@ impl AppView {
                         });
                     d.child(hour).child(always)
                 })
+                // An unanswered request is refused: say when.
+                .child(
+                    div().flex_none().text_xs().text_color(theme.muted_foreground).child(refused_in(a.time_left(now))),
+                )
                 .child(
                     Button::new(("deny", a.id as usize))
                         .small()
@@ -312,6 +317,13 @@ impl AppView {
                 )
         }))
     }
+}
+
+/// How long an approval still waits, in its banner: "refused in 1:42". Rounded up, so it
+/// never says 0:00 while the request still waits.
+fn refused_in(left: std::time::Duration) -> String {
+    let secs = left.as_millis().div_ceil(1000);
+    format!("refused in {}:{:02}", secs / 60, secs % 60)
 }
 
 /// What an approval's call will change, under its request: each object with the fields that
@@ -440,5 +452,44 @@ impl AppView {
                         ),
                 ),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use proptest::prelude::*;
+
+    use super::refused_in;
+
+    /// The seconds a countdown text shows.
+    fn shown(text: &str) -> u64 {
+        let (min, sec) = text.strip_prefix("refused in ").unwrap().split_once(':').unwrap();
+        assert_eq!(sec.len(), 2, "{text}");
+        min.parse::<u64>().unwrap() * 60 + sec.parse::<u64>().unwrap()
+    }
+
+    #[test]
+    fn the_countdown_reads_as_minutes_and_seconds() {
+        assert_eq!(refused_in(Duration::from_secs(120)), "refused in 2:00");
+        assert_eq!(refused_in(Duration::from_millis(101_200)), "refused in 1:42");
+        assert_eq!(refused_in(Duration::from_secs(59)), "refused in 0:59");
+        assert_eq!(refused_in(Duration::from_millis(300)), "refused in 0:01");
+        assert_eq!(refused_in(Duration::ZERO), "refused in 0:00");
+    }
+
+    proptest! {
+        /// The countdown shows the time left rounded up to the second: never 0:00 while
+        /// the request waits, never more than a second over, and it never goes up as time
+        /// passes.
+        #[test]
+        fn the_countdown_rounds_up_and_only_goes_down(a in 0u64..=180_000, b in 0u64..=180_000) {
+            let (early, late) = (a.max(b), a.min(b));
+            let s = shown(&refused_in(Duration::from_millis(early)));
+            prop_assert!(s * 1000 >= early && s * 1000 < early + 1000);
+            prop_assert!(shown(&refused_in(Duration::from_millis(late))) <= s);
+            prop_assert_eq!(s == 0, early == 0);
+        }
     }
 }

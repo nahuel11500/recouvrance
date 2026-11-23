@@ -614,6 +614,7 @@ impl KubeMcp {
                 preview: call.preview.clone(),
                 access: access.clone(),
                 dry_run: call.args.get("dry_run").and_then(serde_json::Value::as_bool).unwrap_or(false),
+                deadline: Instant::now(),
             };
             let answer = self.hub.request_approval(request, call.gone.wait()).await;
             // Access may have been switched off, or the rules changed, while the request waited.
