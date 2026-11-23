@@ -3,6 +3,8 @@
 //! of an object's page.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::future::Future;
+use std::time::Duration;
 
 use futures::StreamExt as _;
 use gpui_kit::component::{ActiveTheme as _, v_flex};
@@ -24,8 +26,15 @@ pub struct LogTarget {
     pub created: Option<jiff::Timestamp>,
 }
 
-/// Rows read at once while finding their pods.
+/// Rows of one cluster read at once while finding their pods.
 const READS_AT_ONCE: usize = 8;
+
+/// How long reading one row may take. The client waits minutes for a stalled API server;
+/// past this, the row is reported and its cluster's other rows go on.
+const READ_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// What a row's pods gave: its pods, or what failed.
+type RowPods = Result<Vec<LogPod>, String>;
 
 /// Errors shown one by one; past this many, the rest are counted.
 const ERRORS_SHOWN: usize = 5;
@@ -36,8 +45,14 @@ pub struct LogsPage {
     targets: Vec<LogTarget>,
     rows_left_out: usize,
     logs: Option<Entity<LogsView>>,
-    /// Their pods are being found (when opened, and after F5).
-    finding: bool,
+    /// Each row's pods as last read (by index in `targets`); None until its cluster answers.
+    /// After F5, a cluster's old pods stay until its rows are read again.
+    found: Vec<Option<RowPods>>,
+    /// The contexts whose rows are being read (when opened, and after F5).
+    waiting: Vec<String>,
+    /// The pods followed now, by context, namespace, name and containers: a cluster's
+    /// answer that changes none of them does not restart the streams.
+    followed: Vec<(String, String, String, Vec<String>)>,
     /// What failed, each cluster's own: one cluster's error never hides another's pods.
     errors: Vec<String>,
     find: crate::latest::Latest,
@@ -64,7 +79,9 @@ impl LogsPage {
             targets,
             rows_left_out,
             logs: None,
-            finding: false,
+            found: Vec::new(),
+            waiting: Vec::new(),
+            followed: Vec::new(),
             errors: Vec::new(),
             find: Default::default(),
             _visible: visible,
@@ -96,50 +113,71 @@ impl LogsPage {
         }
     }
 
-    /// Read each row's pods, a few rows at a time; the newest search replaces a running one.
+    /// Read each row's pods, each cluster on its own, and show each cluster's as soon as its
+    /// rows are read: a cluster that does not answer never holds back another's pods. The
+    /// newest search replaces (and stops) a running one.
     fn find_pods(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.finding = true;
-        let (pods_rows, kind, targets) = (self.kind.is("", "Pod"), self.kind.clone(), self.targets.clone());
-        let work = async move {
-            futures::stream::iter(targets)
-                .map(|t| {
-                    let kind = kind.clone();
-                    async move {
-                        let (client, ns, name) = (t.client.clone(), t.namespace.clone(), t.name.clone());
-                        let pods = if pods_rows {
-                            k8s::log_pod(client, ns, name).await.map(|p| vec![p])
-                        } else {
-                            k8s::log_pods_of(client, kind, ns, name).await
-                        };
-                        (t, pods.map_err(|e| k8s::short_error(&e)))
-                    }
-                })
-                .buffered(READS_AT_ONCE)
-                .collect::<Vec<_>>()
-                .await
+        let (pods_rows, kind) = (self.kind.is("", "Pod"), self.kind.clone());
+        self.found.resize(self.targets.len(), None);
+        self.waiting = contexts_of(&self.targets, |t| t.context.as_str());
+        // The first answer of a new search restarts the streams (F5 reconnects them).
+        self.followed.clear();
+        let rows: Vec<(usize, LogTarget)> = self.targets.iter().cloned().enumerate().collect();
+        let exec = cx.background_executor().clone();
+        let read = move |(_, t): &(usize, LogTarget)| {
+            let (client, kind, ns, name) = (t.client.clone(), kind.clone(), t.namespace.clone(), t.name.clone());
+            async move {
+                let pods = if pods_rows {
+                    k8s::log_pod(client, ns, name).await.map(|p| vec![p])
+                } else {
+                    k8s::log_pods_of(client, kind, ns, name).await
+                };
+                pods.map_err(|e| k8s::short_error(&e))
+            }
         };
-        self.find.spawn_in(window, cx, work, Self::show_pods);
+        let parts = find_by_context(rows, |(_, t)| t.context.clone(), read, move || exec.timer(READ_TIMEOUT));
+        self.find.spawn_each_in(window, cx, parts, Self::context_read);
         cx.notify();
     }
 
-    fn show_pods(
-        &mut self,
-        found: Vec<(LogTarget, Result<Vec<LogPod>, String>)>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.finding = false;
-        let found: Vec<Found<PodPlace>> = found
-            .into_iter()
-            .map(|(t, pods)| {
-                let row = format!("{}/{}", t.namespace, t.name);
-                Found { place: PodPlace { context: t.context, client: t.client, ns: t.namespace }, row, pods }
+    /// A cluster's rows are read: keep their pods and show what is known so far.
+    fn context_read(&mut self, part: Vec<((usize, LogTarget), RowPods)>, window: &mut Window, cx: &mut Context<Self>) {
+        for ((ix, t), pods) in part {
+            self.waiting.retain(|c| *c != t.context);
+            if let Some(slot) = self.found.get_mut(ix) {
+                *slot = Some(pods);
+            }
+        }
+        self.show_pods(window, cx);
+    }
+
+    fn show_pods(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let found: Vec<Found<PodPlace>> = self
+            .targets
+            .iter()
+            .zip(&self.found)
+            .filter_map(|(t, pods)| {
+                let place = PodPlace { context: t.context.clone(), client: t.client.clone(), ns: t.namespace.clone() };
+                Some(Found { place, row: format!("{}/{}", t.namespace, t.name), pods: pods.clone()? })
             })
             .collect();
         let Gathered { pods, left_out, errors } = gather(found, |p| (p.context.as_str(), p.ns.as_str()));
         self.errors = errors;
         let pods: Vec<PlacedPod> =
             pods.into_iter().map(|(place, p)| PlacedPod { place, name: p.name, containers: p.containers }).collect();
+        let followed: Vec<(String, String, String, Vec<String>)> = pods
+            .iter()
+            .map(|p| (p.place.context.clone(), p.place.ns.clone(), p.name.clone(), p.containers.clone()))
+            .collect();
+        if let Some(logs) = self.logs.as_ref().filter(|_| followed == self.followed) {
+            logs.update(cx, |l, cx| {
+                l.left_out = left_out;
+                cx.notify();
+            });
+            cx.notify();
+            return;
+        }
+        self.followed = followed;
         if pods.is_empty() {
             self.logs = None;
         } else if let Some(logs) = &self.logs {
@@ -171,7 +209,8 @@ impl Render for LogsPage {
         let theme = cx.theme();
         let (muted, danger) = (theme.muted_foreground, theme.danger);
         let extra = self.errors.len().saturating_sub(ERRORS_SHOWN);
-        let body = match (&self.logs, self.finding) {
+        let finding = !self.waiting.is_empty();
+        let body = match (&self.logs, finding) {
             (Some(logs), _) => logs.clone().into_any_element(),
             (None, true) => div().text_sm().text_color(muted).child("Finding their pods…").into_any_element(),
             (None, false) => div().text_sm().text_color(muted).child("No pods found").into_any_element(),
@@ -190,6 +229,10 @@ impl Render for LogsPage {
                             "{} left out: the pods of {MAX_LOG_PODS} rows at most are read",
                             crate::plural::count(self.rows_left_out, "checked row")
                         )))
+                    })
+                    .when(finding && self.logs.is_some(), |d| {
+                        let on = self.waiting.join(", ");
+                        d.child(div().text_xs().text_color(muted).child(format!("Finding pods on {on}…")))
                     })
                     .children(
                         self.errors
@@ -217,6 +260,63 @@ fn rows_to_read<T>(pods: bool, mut rows: Vec<T>, created: impl Fn(&T) -> Option<
         rows.truncate(MAX_LOG_PODS);
     }
     (rows, left_out)
+}
+
+/// The contexts of `rows`, each once, in their order.
+fn contexts_of<T>(rows: &[T], context: impl Fn(&T) -> &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for r in rows {
+        let c = context(r);
+        if !out.iter().any(|o| o == c) {
+            out.push(c.to_string());
+        }
+    }
+    out
+}
+
+/// The rows' pods, a cluster at a time: each context's rows are read on their own (at most
+/// `READS_AT_ONCE` at once, in their order), and its results come as one part as soon as
+/// they are all in. A cluster that does not answer holds back none of the others; a read
+/// still running when `timeout` ends is reported as not answering.
+fn find_by_context<T, F, W>(
+    rows: Vec<T>,
+    context: impl Fn(&T) -> String,
+    read: impl Fn(&T) -> F + Clone,
+    timeout: impl Fn() -> W + Clone,
+) -> impl futures::Stream<Item = Vec<(T, RowPods)>>
+where
+    F: Future<Output = RowPods>,
+    W: Future<Output = ()>,
+{
+    let mut by_context: Vec<(String, Vec<T>)> = Vec::new();
+    for r in rows {
+        let c = context(&r);
+        match by_context.iter_mut().find(|(k, _)| *k == c) {
+            Some((_, list)) => list.push(r),
+            None => by_context.push((c, vec![r])),
+        }
+    }
+    let contexts = by_context.len();
+    futures::stream::iter(by_context)
+        .map(move |(_, rows)| {
+            let (read, timeout) = (read.clone(), timeout.clone());
+            futures::stream::iter(rows)
+                .map(move |r| {
+                    let (pods, late) = (read(&r), timeout());
+                    async move {
+                        let pods = match futures::future::select(Box::pin(pods), Box::pin(late)).await {
+                            futures::future::Either::Left((pods, _)) => pods,
+                            futures::future::Either::Right(_) => {
+                                Err(format!("no answer in {}s", READ_TIMEOUT.as_secs()))
+                            }
+                        };
+                        (r, pods)
+                    }
+                })
+                .buffered(READS_AT_ONCE)
+                .collect::<Vec<_>>()
+        })
+        .buffer_unordered(contexts.max(1))
 }
 
 /// What reading one row gave: where it is, its name (`namespace/name`) and its pods.
@@ -275,7 +375,9 @@ fn gather<P: Clone>(found: Vec<Found<P>>, at: impl Fn(&P) -> (&str, &str)) -> Ga
 mod tests {
     use std::collections::{BTreeSet, HashSet};
 
-    use super::{Found, Gathered, LogPod, MAX_LOG_PODS, gather, rows_to_read};
+    use futures::StreamExt as _;
+
+    use super::{Found, Gathered, LogPod, MAX_LOG_PODS, RowPods, find_by_context, gather, rows_to_read};
 
     fn pod(name: &str, running: bool, created: &str) -> LogPod {
         LogPod {
@@ -374,6 +476,38 @@ mod tests {
                 proptest::prop_assert!(g.errors.iter().any(|e| e.starts_with(&prefix)));
             }
         }
+    }
+
+    /// A cluster that never answers holds back none of another's pods: those come first,
+    /// whole; its own rows end in an error once their reads time out.
+    #[test]
+    fn a_cluster_that_never_answers_holds_back_no_other() {
+        let rows: Vec<(&str, &str)> =
+            (0..20).map(|i| if i % 2 == 0 { ("us", "stuck") } else { ("eu", "web") }).collect();
+        let read = |(context, name): &(&str, &str)| {
+            let pods: Option<RowPods> =
+                (*context == "eu").then(|| Ok(vec![pod(&format!("{name}-1"), true, "2026-11-20T10:00:00Z")]));
+            async move {
+                match pods {
+                    Some(p) => p,
+                    None => futures::future::pending().await,
+                }
+            }
+        };
+        // No timeout: the stuck cluster's rows never end, and the other's still come.
+        let mut parts =
+            std::pin::pin!(find_by_context(rows.clone(), |r| r.0.to_string(), read, futures::future::pending::<()>));
+        let first = futures::executor::block_on(parts.next()).unwrap();
+        assert_eq!(first.len(), 10);
+        assert!(first.iter().all(|((c, _), pods)| *c == "eu" && pods.is_ok()));
+        // With a timeout, the stuck cluster's rows end in an error.
+        let all: Vec<_> =
+            futures::executor::block_on(find_by_context(rows, |r| r.0.to_string(), read, || async {}).collect());
+        let stuck: Vec<&RowPods> = all.iter().flatten().filter(|((c, _), _)| *c == "us").map(|(_, p)| p).collect();
+        assert_eq!(stuck.len(), 10);
+        assert!(stuck.iter().all(|p| matches!(p, Err(e) if e.starts_with("no answer"))));
+        let eu = all.iter().flatten().filter(|((c, _), p)| *c == "eu" && p.is_ok()).count();
+        assert_eq!(eu, 10);
     }
 
     /// A few rows are all read in their order; past the limit, the newest pods, or the first

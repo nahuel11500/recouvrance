@@ -10,7 +10,7 @@ use kube::core::Request;
 use kube::discovery::ApiResource;
 use serde::{Deserialize, Serialize};
 
-use super::{Kind, ar_of, lists, pod_containers, pod_selection, run};
+use super::{Kind, ar_of, lists, pod_containers, pod_selection, run_abortable};
 
 /// A pod as the logs of checked rows follow it.
 #[derive(Clone, Debug, PartialEq)]
@@ -117,7 +117,7 @@ async fn get_lean<T>(client: Client, ar: ApiResource, ns: String, name: String) 
 where
     T: serde::de::DeserializeOwned + Send + 'static,
 {
-    run(async move {
+    run_abortable(async move {
         let request =
             Request::new(DynamicObject::url_path(&ar, Some(ns.as_str()))).get(&name, &GetParams::default())?;
         Ok(client.request::<T>(request).await?)

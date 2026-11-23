@@ -511,6 +511,20 @@ pub(crate) fn same_reads(
         })
 }
 
+/// Where each stream reads: pod `ix` at its own place. On an object's page (`places` empty)
+/// every pod is at `home`. With places, a pod without one is never read at `home`: that
+/// could read another cluster's pod of the same name.
+pub(crate) fn stream_plan<P: Clone>(
+    home: &P,
+    places: &[P],
+    reads: Vec<(String, Option<String>)>,
+) -> Vec<(P, String, Option<String>)> {
+    if places.is_empty() {
+        return reads.into_iter().map(|(pod, container)| (home.clone(), pod, container)).collect();
+    }
+    places.iter().zip(reads).map(|(at, (pod, container))| (at.clone(), pod, container)).collect()
+}
+
 /// Where a stream of a view of pods from several places reads: its context, namespace, pod
 /// and the container read (None when the API server picks it).
 pub(crate) struct Source<'a> {
@@ -562,7 +576,7 @@ pub(crate) enum StreamState {
 }
 
 /// What the status line says about the streams (None when they all flow).
-pub(crate) fn stream_status(pods: &[String], states: &[StreamState]) -> Option<String> {
+pub(crate) fn stream_status<S: AsRef<str>>(names: &[S], shorten: bool, states: &[StreamState]) -> Option<String> {
     if let [state] = states {
         return match state {
             StreamState::Connecting => Some("Connecting…".into()),
@@ -575,7 +589,12 @@ pub(crate) fn stream_status(pods: &[String], states: &[StreamState]) -> Option<S
     if !states.is_empty() && states.iter().all(|s| *s == StreamState::Connecting) {
         return Some("Connecting…".into());
     }
-    let short = |i: usize| pods.get(i).map_or_default(|p| p.rsplit('-').next().unwrap_or(p).to_string());
+    let short = |i: usize| {
+        names.get(i).map_or_default(|n| {
+            let n = n.as_ref();
+            if shorten { n.rsplit('-').next().unwrap_or(n).to_string() } else { n.to_string() }
+        })
+    };
     let group = |label: &str, pick: &dyn Fn(&StreamState) -> Option<String>| {
         let names: Vec<String> =
             states.iter().enumerate().filter_map(|(i, s)| pick(s).map(|n| n + &short(i))).collect();
@@ -822,16 +841,42 @@ mod tests {
     fn stream_statuses() {
         let pods: Vec<String> = ["web-a1", "web-b2", "web-c3"].map(String::from).to_vec();
         let one = &pods[..1];
-        assert_eq!(stream_status(one, &[Live]), None);
-        assert_eq!(stream_status(one, &[Ended]).as_deref(), Some("Stream ended"));
-        assert_eq!(stream_status(one, &[Reconnecting("EOF".into())]).as_deref(), Some("Reconnecting… (EOF)"));
+        assert_eq!(stream_status(one, true, &[Live]), None);
+        assert_eq!(stream_status(one, true, &[Ended]).as_deref(), Some("Stream ended"));
+        assert_eq!(stream_status(one, true, &[Reconnecting("EOF".into())]).as_deref(), Some("Reconnecting… (EOF)"));
         use StreamState::*;
-        assert_eq!(stream_status(&pods, &[Connecting, Connecting, Connecting]).as_deref(), Some("Connecting…"));
-        assert_eq!(stream_status(&pods, &[Live, Live, Live]), None);
+        assert_eq!(stream_status(&pods, true, &[Connecting, Connecting, Connecting]).as_deref(), Some("Connecting…"));
+        assert_eq!(stream_status(&pods, true, &[Live, Live, Live]), None);
         assert_eq!(
-            stream_status(&pods, &[Reconnecting("x".into()), Ended, Failed("gone".into())]).as_deref(),
+            stream_status(&pods, true, &[Reconnecting("x".into()), Ended, Failed("gone".into())]).as_deref(),
             Some("1 reconnecting (a1) · 1 ended (b2) · 1 failed (gone: c3)")
         );
+        // Pods from several places are named by their whole tag: the same pod on two
+        // clusters, one refusing to give its logs, says which.
+        let tags = ["eu: web-0/app", "us: web-0/app"];
+        assert_eq!(
+            stream_status(&tags, false, &[Live, Failed("forbidden".into())]).as_deref(),
+            Some("1 failed (forbidden: us: web-0/app)")
+        );
+    }
+
+    /// Each stream reads its own pod's cluster and namespace, even when pods of the same
+    /// name are on two clusters or in two namespaces; a pod with no place is never read on
+    /// the page's own cluster.
+    #[test]
+    fn each_stream_reads_its_own_place() {
+        let read = |pod: &str| (pod.to_string(), Some("app".to_string()));
+        let places = [("eu", "shop"), ("us", "shop"), ("eu", "ingress")];
+        let plan = stream_plan(&("home", "default"), &places, vec![read("web-0"), read("web-0"), read("web-0")]);
+        let at: Vec<(&str, &str)> = plan.iter().map(|(p, _, _)| *p).collect();
+        assert_eq!(at, places);
+        assert!(plan.iter().all(|(_, pod, c)| pod == "web-0" && c.as_deref() == Some("app")));
+        let extra = stream_plan(&("home", "default"), &places[..1], vec![read("web-0"), read("web-1")]);
+        assert_eq!(extra.len(), 1);
+        assert_eq!(extra[0].0, ("eu", "shop"));
+        // An object's page: every pod in its own namespace.
+        let page = stream_plan(&("home", "default"), &[], vec![read("web-0"), read("web-1")]);
+        assert!(page.iter().all(|(p, _, _)| *p == ("home", "default")));
     }
 
     #[test]

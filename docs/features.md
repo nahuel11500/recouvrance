@@ -119,8 +119,9 @@
   selection bar. One page merges their pods' lines in time order, each tagged with its pod and
   container (and its namespace or context when they differ), with the same filters, find, Since,
   Follow and container picker. It reads at most 50 rows and follows at most 50 pods (running and
-  newest first), and says how many were left out; a cluster that fails is named and the others'
-  pods still show. F5 finds their pods again.
+  newest first), and says how many were left out. Each cluster's pods show as soon as its rows are
+  read: a cluster that fails, or does not answer within 15 seconds, is named and never holds back the
+  others' pods. F5 finds their pods again.
 - **Shell** (exec with a real terminal), **node shell** (privileged pod, deleted when its shell
   ends or its page goes away) and **port-forward** for pods and services; forwards are remembered
   and restored with one click. Shells and attach need write mode (they run commands in the

@@ -261,14 +261,6 @@ impl LogsView {
         self.tags = tags.into_iter().map(Into::into).collect();
     }
 
-    /// The cluster and namespace of pod `ix`.
-    fn place(&self, ix: usize) -> (Client, String) {
-        match self.places.get(ix) {
-            Some(p) => (p.client.clone(), p.ns.clone()),
-            None => (self.client.clone(), self.ns.clone()),
-        }
-    }
-
     fn build(
         client: Client,
         ns: String,
@@ -466,8 +458,9 @@ impl LogsView {
         self.update_tags();
         let mut receivers = Vec::new();
         // The chosen container from each pod that has it; the others show their default one.
-        for (ix, (pod, container)) in self.reads().into_iter().enumerate() {
-            let (client, ns) = self.place(ix);
+        let home = (self.client.clone(), self.ns.clone());
+        let places: Vec<(Client, String)> = self.places.iter().map(|p| (p.client.clone(), p.ns.clone())).collect();
+        for (ix, ((client, ns), pod, container)) in stream_plan(&home, &places, self.reads()).into_iter().enumerate() {
             let (guard, rx) = k8s::stream_logs(client, ns, pod, container, self.previous, self.since);
             self.streams.push(guard);
             receivers.push(rx.map(move |m| (ix, m)).boxed());
@@ -823,15 +816,24 @@ impl LogsView {
         out
     }
 
+    /// The streams' state; pods from several places are named by their whole tag, so a
+    /// failing cluster is told apart from another with pods of the same name.
+    fn streams_status(&self) -> Option<String> {
+        if self.places.is_empty() {
+            stream_status(&self.pods, true, &self.pod_states)
+        } else {
+            stream_status(&self.tags, false, &self.pod_states)
+        }
+    }
+
     /// The status line: pods left out, the streams' state and a container list error.
     fn status_text(&self) -> Option<SharedString> {
         let followed = self.pods.len();
         let capped = (self.left_out > 0).then(|| format!("Following {followed} of {} pods", followed + self.left_out));
-        let parts: Vec<String> =
-            [capped, stream_status(&self.pods, &self.pod_states), self.status.as_ref().map(ToString::to_string)]
-                .into_iter()
-                .flatten()
-                .collect();
+        let parts: Vec<String> = [capped, self.streams_status(), self.status.as_ref().map(ToString::to_string)]
+            .into_iter()
+            .flatten()
+            .collect();
         (!parts.is_empty()).then(|| parts.join(" · ").into())
     }
 }
