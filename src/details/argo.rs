@@ -237,7 +237,7 @@ fn confirm_operation(t: Target, action: ArgoAction, app: &Value, done: Done, win
     let cmd = t.command(&patch_args(&Target::kind_name(), &t.name, &patch));
     let (title, note) = match &op {
         Op::Rollback { id, .. } => {
-            let to = ops::rollback_target(app, *id).map(ops::deployment_label).unwrap_or_default();
+            let to = ops::rollback_target(app, *id).map_or_default(ops::deployment_label);
             (format!("Roll back Application {} to {to}?", t.name), ROLLBACK_NOTE)
         }
         _ => (format!("Terminate the operation of Application {}?", t.name), TERMINATE_NOTE),
@@ -391,8 +391,8 @@ fn confirm_sync(t: Target, app: &Value, done: Done, window: &mut Window, cx: &mu
         alert
             .title(title.clone())
             .description(SYNC_NOTE)
-            .when_some(picker, |a, p| a.child(p))
-            .when_some(too_many, |a, n| a.child(n))
+            .when_some(picker, ParentElement::child)
+            .when_some(too_many, ParentElement::child)
             .child(options)
             .child(confirm_with(&cmd, guard.as_ref(), &run_as, cx))
             .confirm_buttons(if c.dry_run { "Dry run" } else { "Sync" }, deletes, guard.as_ref())
