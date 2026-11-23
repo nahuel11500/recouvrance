@@ -1037,7 +1037,7 @@ pub(super) mod tests {
         assert!(approval("exec_command", "exec", Some("web-1")).as_rule_for_an_hour().is_none());
         assert!(approval("gitops", "patch", Some("app")).as_rule().is_none());
         // A GitOps action has its own verb: the rule pins the action and the object.
-        assert!(approval("gitops", "sync", Some("app")).as_rule().is_some());
+        assert!(approval("gitops", "refresh", Some("app")).as_rule().is_some());
         assert!(approval("gitops", "refresh", None).as_rule().is_none());
         // Suspend and resume share a verb: a rule from approving one would allow the other.
         assert!(approval("gitops", "suspend", Some("app")).as_rule().is_none());
@@ -1062,34 +1062,71 @@ pub(super) mod tests {
         // Approving a dry run must not allow the real write.
         let dry = Approval { dry_run: true, ..approval("delete_resource", "delete", Some("web")) };
         assert!(dry.as_rule().is_none() && dry.as_rule_for_an_hour().is_none());
-        // Approving a prune, a rollback or a terminate must not allow every sync of the object.
+        // Approving an Argo CD sync, rollback or terminate must not allow every other one.
         let once = Approval { once_only: true, ..approval("gitops", "sync", Some("app")) };
         assert!(once.as_rule().is_none() && once.as_rule_for_an_hour().is_none());
     }
 
+    /// An Argo CD sync's rule would cover every prune, rollback and terminate of the
+    /// Application (one `sync` verb), so approving any of them makes no rule; a refresh and a
+    /// Flux reconcile deploy nothing beyond themselves and keep theirs.
     #[test]
-    fn approving_a_sync_allows_that_sync_only() {
-        let approval = Approval {
-            id: 1,
-            agent_id: "a".into(),
-            agent: "a".into(),
-            tool: "gitops".into(),
-            summary: String::new(),
-            detail: None,
-            preview: None,
-            access: access("hub", "sync", "applications.argoproj.io", Some("argocd"), Some("web")),
-            dry_run: false,
-            once_only: false,
-            deadline: std::time::Instant::now(),
+    fn only_a_refresh_or_a_reconcile_becomes_a_rule() {
+        let approval = |action: &str, verb: &str, resource: &str, extra: &serde_json::Value| {
+            let mut args = serde_json::json!({"action": action});
+            if let (Some(args), Some(extra)) = (args.as_object_mut(), extra.as_object()) {
+                args.extend(extra.clone());
+            }
+            Approval {
+                id: 1,
+                agent_id: "a".into(),
+                agent: "a".into(),
+                tool: "gitops".into(),
+                summary: String::new(),
+                detail: None,
+                preview: None,
+                access: access("hub", verb, resource, Some("argocd"), Some("web")),
+                dry_run: false,
+                once_only: Approval::only_once("gitops", &args),
+                deadline: std::time::Instant::now(),
+            }
         };
-        let ask = rule(Mode::Ask, &["patch", "sync"], &["*"], &["*"], &["*"]);
-        let p = Policy { rules: vec![ask, approval.as_rule().unwrap()], ..Policy::default() };
-        let d = |verb: &str, name: &str| {
-            p.decide(&access("hub", verb, "applications.argoproj.io", Some("argocd"), Some(name))).mode
+        let app = "applications.argoproj.io";
+        let none = serde_json::json!({});
+        let argo = [
+            approval("sync", "sync", app, &none),
+            approval("sync", "sync", app, &serde_json::json!({"prune": true})),
+            approval("sync", "sync", app, &serde_json::json!({"resources": [{"kind": "ConfigMap", "name": "a"}]})),
+            approval("terminate", "sync", app, &none),
+            approval("rollback", "sync", app, &serde_json::json!({"deployment_id": 3})),
+        ];
+        for a in &argo {
+            assert!(a.as_rule().is_none() && a.as_rule_for_an_hour().is_none());
+        }
+        // Whatever approving a plain sync leaves behind, the next prune, rollback or
+        // terminate of the Application (all `sync`) still asks.
+        let mut rules = vec![rule(Mode::Ask, &["patch", "refresh", "sync"], &["*"], &["*"], &["*"])];
+        rules.extend(argo[0].as_rule());
+        rules.extend(argo[0].as_rule_for_an_hour());
+        let p = Policy { rules, ..Policy::default() };
+        assert_eq!(p.decide(&access("hub", "sync", app, Some("argocd"), Some("web"))).mode, Mode::Ask);
+
+        let refresh = approval("refresh", "refresh", app, &none);
+        let hard = approval("hard_refresh", "refresh", app, &none);
+        let reconcile = approval("reconcile", "sync", "kustomizations.kustomize.toolkit.fluxcd.io", &none);
+        assert!(hard.as_rule().is_some() && reconcile.as_rule().is_some());
+        let p = Policy {
+            rules: vec![
+                rule(Mode::Ask, &["patch", "refresh", "sync"], &["*"], &["*"], &["*"]),
+                refresh.as_rule().unwrap(),
+            ],
+            ..Policy::default()
         };
-        assert_eq!(d("sync", "web"), Mode::Allow);
-        assert_eq!(d("sync", "api"), Mode::Ask);
-        // Not a patch of its spec (target revision, destination).
+        let d = |verb: &str, name: &str| p.decide(&access("hub", verb, app, Some("argocd"), Some(name))).mode;
+        assert_eq!(d("refresh", "web"), Mode::Allow);
+        assert_eq!(d("refresh", "api"), Mode::Ask);
+        // Not a sync, nor a patch of its spec (target revision, destination).
+        assert_eq!(d("sync", "web"), Mode::Ask);
         assert_eq!(d("patch", "web"), Mode::Ask);
     }
 
