@@ -964,7 +964,7 @@ mod tests {
     #[test]
     fn search_terms_narrow_the_calls() {
         let scale = serde_json::json!({"context": "prod-eu", "kind": "deployments", "namespace": "shop", "name": "web", "replicas": 0});
-        let calls = vec![
+        let calls = [
             from(Some("claude-code 2.1.3"), call(30, "scale", scale, Decision::Allowed)),
             from(Some("codex 0.40"), exec(20, "rabbitmqctl status")),
             call(10, "list_contexts", serde_json::Value::Null, Decision::Allowed),
