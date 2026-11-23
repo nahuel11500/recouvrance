@@ -132,7 +132,9 @@ pub fn pod_refs(pod: &Value) -> Vec<Target> {
 /// ConfigMaps, Secrets and PVCs of its volumes (projected ones too) and of its containers' and
 /// init containers' environment. Without `all`, what a pod needs to start (`pod_refs`): the
 /// references marked `optional: true` are left out. With `all`, every object it names: the
-/// optional ones too, its image pull Secrets and its ServiceAccount (what the Map shows).
+/// optional ones too, its image pull Secrets and its ServiceAccount (what the Map shows), but
+/// not the `kube-api-access-*` volume the API server adds to every pod (its token and the
+/// cluster's `kube-root-ca.crt`): nothing the manifest asked for.
 pub fn spec_refs(namespace: Option<&str>, spec: &Value, all: bool) -> Vec<Target> {
     let mut out = BTreeSet::new();
     let mut add = |of: Of, r: &Value, key: &str| {
@@ -144,6 +146,9 @@ pub fn spec_refs(namespace: Option<&str>, spec: &Value, all: bool) -> Vec<Target
         }
     };
     for v in items(&spec["volumes"]) {
+        if all && v["name"].as_str().is_some_and(|n| n.starts_with("kube-api-access-")) {
+            continue;
+        }
         add(Of::ConfigMap, &v["configMap"], "name");
         add(Of::Secret, &v["secret"], "secretName");
         add(Of::Claim, &v["persistentVolumeClaim"], "claimName");

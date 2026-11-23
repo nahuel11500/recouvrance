@@ -1,5 +1,8 @@
 //! The Map tab of every detail page (`crate::map`): a pod's or workload's tree, then what the
-//! object is linked to, read when the tab opens.
+//! object is linked to. Read when the tab opens and worked out off the UI thread; drawing only
+//! draws.
+
+use std::sync::Arc;
 
 use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::component::{ActiveTheme as _, Icon, h_flex, v_flex};
@@ -7,16 +10,23 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use super::DetailPanel;
-use crate::map::{self, Item, Lists};
+use crate::map::{self, Item, Lists, Section};
 use crate::overview::Ctx;
 use crate::ui::selectable::selectable;
 
-/// What the tab read when it was last opened.
+/// What the tab read when it was last opened, and the relations worked out from it.
 #[derive(Default)]
 pub(super) struct MapState {
-    lists: Option<Lists>,
+    /// The tab was opened: its relations follow the page's reloads.
+    opened: bool,
+    lists: Option<Arc<Lists>>,
     loading: bool,
     load: crate::latest::Latest,
+    /// The relations, from `lists` and the page's `Related` as last loaded.
+    sections: Option<Arc<Vec<Section>>>,
+    /// `sections` are being worked out again.
+    computing: bool,
+    compute: crate::latest::Latest,
 }
 
 impl MapState {
@@ -31,10 +41,33 @@ impl DetailPanel {
     pub(super) fn load_map(&mut self, cx: &mut Context<Self>) {
         let Some(obj) = self.object.clone() else { return };
         let work = map::load(self.client.clone(), self.obj.kind.clone(), obj, self.kinds.clone());
+        self.map.opened = true;
         self.map.loading = true;
         self.map.load.spawn(cx, work, |this, lists, cx| {
-            this.map.lists = Some(lists);
+            this.map.lists = Some(Arc::new(lists));
             this.map.loading = false;
+            this.recompute_map(cx);
+            cx.notify();
+        });
+    }
+
+    /// Work the relations out again, off the UI thread, once the tab has read its lists and
+    /// the page has loaded what it holds: when either arrives.
+    pub(super) fn recompute_map(&mut self, cx: &mut Context<Self>) {
+        if !self.map.opened {
+            return;
+        }
+        let (Some(obj), Some(known), Some(lists)) =
+            (self.object.clone(), self.related.map.clone(), self.map.lists.clone())
+        else {
+            return;
+        };
+        let (kind, kinds) = (self.obj.kind.clone(), self.kinds.clone());
+        let work = cx.background_executor().spawn(async move { map::sections(&kind, &obj, &known, &lists, &kinds) });
+        self.map.computing = true;
+        self.map.compute.spawn(cx, work, |this, sections, cx| {
+            this.map.sections = Some(Arc::new(sections));
+            this.map.computing = false;
             cx.notify();
         });
     }
@@ -50,17 +83,35 @@ impl DetailPanel {
         if tree {
             col = col.children(crate::overview::relation_rows(&ctx, cx));
         }
-        let sections = map::sections(kind, obj, &self.related, self.map.lists.as_ref());
         let note = |text: String, color: Hsla| div().py_1().text_xs().text_color(color).child(selectable(text));
-        if self.map.loading {
+        let known = self.related.map.as_deref();
+        // Running: the page's first load, the tab's reads, or the relations being worked out.
+        let running = known.is_none() || self.map.lists.is_none() || self.map.loading || self.map.computing;
+        if running {
             col = col.child(note("Reading what links to it…".into(), muted));
         }
-        if let Some(lists) = &self.map.lists
-            && !lists.errors.is_empty()
-        {
-            col = col.child(note(format!("Not fully known: {}", lists.errors.join(" · ")), theme.danger));
+        // What could not be read, by the page or by the tab: the Map isn't the whole story.
+        let errors: Vec<String> = known
+            .map_or_default(|k| k.errors.clone())
+            .into_iter()
+            .chain(self.map.lists.iter().flat_map(|l| l.errors.clone()))
+            .collect();
+        if !errors.is_empty() {
+            col = col.child(note(format!("Not fully known: {}", errors.join(" · ")), theme.danger));
         }
-        for section in &sections {
+        let partial = self.map.lists.as_ref().map(|l| l.partial.join(" · ")).filter(|p| !p.is_empty());
+        let partial_shown = partial.is_some();
+        col = col.when_some(partial, |d, p| d.child(note(format!("Read in part: {p}"), muted)));
+        // The kinds served decide which operators' resources are read (a Secret's Certificates,
+        // a custom resource's siblings, HTTPRoutes): unknown on a context not connected.
+        if self.kinds.is_empty() && self.obj.namespace.is_some() && !map::only_owners(kind) {
+            col = col.child(note(
+                "This cluster's kinds aren't known yet: operators' resources are not looked for.".into(),
+                muted,
+            ));
+        }
+        let sections: &[Section] = self.map.sections.as_deref().map_or(&[], Vec::as_slice);
+        for (s, section) in sections.iter().enumerate() {
             col = col.child(
                 div()
                     .pt_4()
@@ -69,18 +120,27 @@ impl DetailPanel {
                     .font_weight(FontWeight::SEMIBOLD)
                     .child(selectable(section.rel.label().to_string())),
             );
-            for item in &section.items {
-                col = col.child(item_row(&ctx, item, 0, cx));
-                col = col.children(item.under.iter().map(|p| item_row(&ctx, p, 1, cx)));
+            for (i, item) in section.items.iter().enumerate() {
+                let id = format!("map-{s}-{i}");
+                col = col.child(item_row(&ctx, item, 0, &id, cx));
+                col = col.children(
+                    item.under.iter().enumerate().map(|(j, p)| item_row(&ctx, p, 1, &format!("{id}-{j}"), cx)),
+                );
+                if item.more_under > 0 {
+                    col = col.child(note(format!("and {} more", item.more_under), muted).pl(px(44.)));
+                }
             }
             if section.more > 0 {
                 col = col.child(note(format!("and {} more", section.more), muted).pl(px(22.)));
             }
         }
-        if sections.is_empty() && !self.map.loading {
+        // "Nothing" only when everything was read and worked out, and nothing failed.
+        if sections.is_empty() && !running && errors.is_empty() && !partial_shown {
             let what = format!("{} {}", kind.ar.kind, self.obj.name);
             let said = if tree {
                 format!("Nothing else found that links to {what}: no owner, PDB, NetworkPolicy, HPA or Ingress.")
+            } else if map::only_owners(kind) {
+                format!("Only owners are known for this kind, and {what} has none.")
             } else {
                 format!("{what} has no owner, and nothing found that it owns or that refers to it.")
             };
@@ -110,7 +170,8 @@ fn icon_of(kind: &str) -> Lucide {
 }
 
 /// One object: its kind, a link to it (with its namespace when not the page's), and its note.
-fn item_row(ctx: &Ctx, item: &Item, depth: usize, cx: &App) -> AnyElement {
+/// `id` is its place on the tab: one object can be linked twice (a pod behind two Services).
+fn item_row(ctx: &Ctx, item: &Item, depth: usize, id: &str, cx: &App) -> AnyElement {
     let theme = cx.theme();
     let shown = match &item.namespace {
         Some(ns) if Some(ns) != ctx.ns().as_ref() => format!("{ns}/{}", item.name),
@@ -136,7 +197,7 @@ fn item_row(ctx: &Ctx, item: &Item, depth: usize, cx: &App) -> AnyElement {
                 .text_color(theme.muted_foreground)
                 .child(selectable(item.kind.clone())),
         )
-        .child(ctx.link_in(shown, &item.link_kind(), &item.name, item.namespace.clone(), cx))
+        .child(ctx.link_with_id(id.to_string(), shown, &item.link_kind(), &item.name, item.namespace.clone(), cx))
         .when_some(item.note.clone(), |d, n| d.child(div().text_xs().text_color(note_color).child(selectable(n))))
         .into_any_element()
 }

@@ -735,10 +735,12 @@ impl DetailPanel {
                     related.node_stats = this.update(cx, |this, _| this.related.node_stats.clone()).ok().flatten();
                 }
                 let indexed = obj.clone();
+                let mapped = kind.clone();
                 let mut related = exec
                     .spawn(async move {
                         let mut related = related;
                         related.index(&indexed);
+                        related.map = Some(std::sync::Arc::new(crate::map::Known::of(&mapped, &related)));
                         related
                     })
                     .await;
@@ -792,6 +794,7 @@ impl DetailPanel {
                     // A thousand pods take a while to free: not on the UI thread.
                     let old = std::mem::replace(&mut this.related, related);
                     cx.background_executor().spawn(async move { drop(old) }).detach();
+                    this.recompute_map(cx);
                     #[cfg(feature = "dev")]
                     if std::env::var("RECOUVRANCE_COMPARE").is_ok() && this.compare_rev.is_none() {
                         let mut revs: Vec<(i64, String)> = this
