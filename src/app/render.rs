@@ -181,29 +181,7 @@ impl AppView {
                 )
             })
             .child(
-                h_flex()
-                    .id("palette-trigger")
-                    .gap_2()
-                    .h(px(28.))
-                    .w(px(240.))
-                    .px_3()
-                    .rounded_md()
-                    .bg(theme.secondary)
-                    .cursor_pointer()
-                    .hover(|s| s.bg(theme.list_hover))
-                    .text_sm()
-                    .text_color(theme.muted_foreground)
-                    .child(Icon::new(Lucide::Search).size_4())
-                    .child(div().flex_1().child("Jump to anything…"))
-                    .child(
-                        div()
-                            .text_xs()
-                            .px_1()
-                            .rounded_sm()
-                            .border_1()
-                            .border_color(theme.border)
-                            .child(with_keys("{secondary-k}")),
-                    )
+                search_field(&theme, with_keys("{secondary-k}"))
                     .on_click(cx.listener(|this, _, window, cx| this.open_palette(window, cx))),
             )
             .child(write_mode_button(cx))
@@ -538,6 +516,48 @@ impl AppView {
     }
 }
 
+/// The narrowest the search field gets: its icon and its shortcut hint whole ("Ctrl+K" is the
+/// longest), with the placeholder cut to nothing.
+const SEARCH_MIN: f32 = 120.;
+
+/// The top bar's button that opens the palette. When the bar runs out of room it shrinks before
+/// the buttons beside it: its placeholder is cut first, down to `SEARCH_MIN`, where the hint still
+/// fits. The hint never shrinks, and the field's content can always shrink to fit its width, so
+/// the hint can't run past the field's edge under the write-mode badge. It did when the field
+/// kept a fixed 240px its content was wider than.
+fn search_field(theme: &Theme, hint: String) -> Stateful<Div> {
+    h_flex()
+        .id("palette-trigger")
+        .debug_selector(|| "search-field".into())
+        .gap_2()
+        .h(px(28.))
+        .w(px(240.))
+        .min_w(px(SEARCH_MIN))
+        .px_3()
+        .rounded_md()
+        .bg(theme.secondary)
+        .cursor_pointer()
+        .hover(|s| s.bg(theme.list_hover))
+        .text_sm()
+        .text_color(theme.muted_foreground)
+        .child(Icon::new(Lucide::Search).size_4().flex_shrink_0())
+        .child(
+            div().flex_1().min_w_0().overflow_hidden().text_ellipsis().whitespace_nowrap().child("Jump to anything…"),
+        )
+        .child(
+            div()
+                .debug_selector(|| "search-hint".into())
+                .flex_shrink_0()
+                .whitespace_nowrap()
+                .text_xs()
+                .px_1()
+                .rounded_sm()
+                .border_1()
+                .border_color(theme.border)
+                .child(hint),
+        )
+}
+
 /// Read-only or writes on; turning writes on asks first.
 fn write_mode_button(cx: &App) -> Button {
     let writes = crate::details::writes_enabled(cx);
@@ -581,4 +601,59 @@ fn toggle_write_mode(window: &mut Window, cx: &mut App) {
 fn toggle_theme(window: &mut Window, cx: &mut App) {
     let mode = if cx.theme().is_dark() { ThemeMode::Light } else { ThemeMode::Dark };
     set_theme(mode, Some(window), cx);
+}
+
+#[cfg(all(test, feature = "dev"))]
+mod layout_tests {
+    use gpui_kit::component::{ActiveTheme as _, h_flex};
+    use gpui_kit::*;
+
+    use super::{SEARCH_MIN, search_field, write_mode_button};
+
+    /// The search field and the write-mode badge as the top bar lays them out, `width` wide.
+    struct Bar {
+        width: f32,
+        hint: &'static str,
+    }
+
+    impl Render for Bar {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let theme = cx.theme().clone();
+            h_flex()
+                .w(px(self.width))
+                .gap_2()
+                .child(search_field(&theme, self.hint.to_string()))
+                .child(div().debug_selector(|| "write-badge".into()).child(write_mode_button(cx)))
+        }
+    }
+
+    /// Where the field, its hint and the badge are drawn in a bar `width` wide.
+    fn drawn(cx: &mut TestAppContext, width: f32, hint: &'static str) -> [Bounds<Pixels>; 3] {
+        let (_, cx) = cx.add_window_view(|_, _| Bar { width, hint });
+        cx.update(|window, cx| drop(window.draw(cx)));
+        ["search-field", "search-hint", "write-badge"]
+            .map(|name| cx.debug_bounds(name).unwrap_or_else(|| panic!("{name} is drawn")))
+    }
+
+    #[gpui_kit::test]
+    fn the_badge_never_covers_the_search_hint(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            cx.set_global(crate::details::WriteMode(true));
+        });
+        // Linux's hint and macOS's (#899), from a bar with no room to spare to one with plenty.
+        for hint in ["Ctrl+K", "⌘K"] {
+            for width in [150., 200., 240., 280., 320., 360., 600.] {
+                let [field, hint_box, badge] = drawn(cx, width, hint);
+                let at = format!("{hint} in {width}px");
+                assert!(
+                    hint_box.left() >= field.left() && hint_box.right() <= field.right(),
+                    "{at}: the hint {hint_box:?} runs out of the field {field:?}"
+                );
+                assert!(badge.left() >= field.right(), "{at}: the badge {badge:?} starts inside the field {field:?}");
+                assert!(!hint_box.intersects(&badge), "{at}: the badge {badge:?} covers the hint {hint_box:?}");
+                assert!(f32::from(field.size.width) >= SEARCH_MIN - 0.5, "{at}: the field is {field:?}");
+            }
+        }
+    }
 }
