@@ -876,7 +876,7 @@ mod tests {
             })
             .unwrap();
         assert!(asked.deadline >= before + APPROVAL_TIMEOUT && asked.deadline <= after + APPROVAL_TIMEOUT);
-        assert!(asked.time_left(before) <= APPROVAL_TIMEOUT);
+        assert!(asked.time_left(after) <= APPROVAL_TIMEOUT);
         assert_eq!(asked.time_left(asked.deadline + Duration::from_secs(5)), Duration::ZERO);
         wait.abort();
     }
