@@ -264,11 +264,13 @@
   long the API server took to start answering (p50, p95, slowest) and, for answers that end,
   until their last byte was read (p50, p95); and how much each kind received per minute over
   the last hour, counted decompressed as the bodies arrive. The time to the last byte includes
-  Recouvrance's own parsing when that sets the pace. Watches, logs and shells are streams that
-  run until closed: bytes only, and none for shells and port-forwards, whose data goes over the
-  upgraded connection. Below, the 10 heaviest requests, one per kind (cluster, method and path,
-  its names replaced by `{namespace}` and `{name}`), with their bytes and both times. A stream
-  is listed once it ends. Nothing leaves the machine.
+  Recouvrance's own parsing when that sets the pace. Watches, logs, shells, attach and
+  port-forwards are streams that run until closed: bytes only. A shell's, an attach's or a
+  port-forward's data goes over the upgraded connection, and counts as it is read: what came
+  back through it, not what was sent. Below, the 10 heaviest requests, one per kind (cluster,
+  method and path, its names replaced by `{namespace}` and `{name}`), with their bytes and both
+  times. A stream is listed once it ends: a port-forward, each connection on its own. Nothing
+  leaves the machine.
 - **What's new and updates**: the first start after an update shows the release notes of every
   version since the one run before (the version's own notes when that one is unknown), once.
   They are the changelog built into the app: nothing is fetched. Settings → About shows them again,
