@@ -16,7 +16,8 @@ use crate::problems::shared::{self, Ask, Found, Fresh, Scope};
 /// The longest the first count waits for the list on screen to show its rows.
 const FIRST_COUNT_WAIT: Duration = Duration::from_secs(15);
 
-/// How often a count that waits checks whether it may start.
+/// How often a count that waits checks whether it may start, and the least time between two
+/// counts.
 const WAIT_POLL: Duration = Duration::from_millis(500);
 
 /// How long the badge waits at most for a scan's findings before looking again.
@@ -64,18 +65,20 @@ impl ProblemBadge {
                 else {
                     break;
                 };
-                let may = may_count(hidden, first.then(|| (shown, started.elapsed())));
-                if may {
-                    first = false;
-                    for (scope, client, kinds) in &scopes {
-                        // Not waited for: the counts follow the scan as its checks finish.
-                        let _ = shared::ensure(scope, Fresh::Paced, || Ask {
-                            client: client.clone(),
-                            kinds: kinds.clone(),
-                            lane: Lane::Background,
-                            record: true,
-                        });
-                    }
+                if !may_count(hidden, first.then(|| (shown, started.elapsed()))) {
+                    // Nothing counted either: a hidden window's badge isn't seen.
+                    cx.background_executor().timer(WAIT_POLL).await;
+                    continue;
+                }
+                first = false;
+                for (scope, client, kinds) in &scopes {
+                    // Not waited for: the counts follow the scan as its checks finish.
+                    let _ = shared::ensure(scope, Fresh::Paced, || Ask {
+                        client: client.clone(),
+                        kinds: kinds.clone(),
+                        lane: Lane::Background,
+                        record: true,
+                    });
                 }
                 let found: Vec<(&Scope, Option<Arc<Found>>)> =
                     scopes.iter().map(|(scope, ..)| (scope, shared::latest(scope))).collect();
@@ -91,14 +94,16 @@ impl ProblemBadge {
                 {
                     break;
                 }
-                // Until some findings change, or the next scan is due.
-                let wait = match tally.due {
-                    _ if !may => WAIT_POLL,
-                    Some(due) => due.saturating_duration_since(Instant::now()).max(WAIT_POLL),
-                    None => LOOK_AGAIN,
-                };
-                let timer = cx.background_executor().timer(wait);
+                // Until some findings change, or the next scan is due. Once it is due, a scan
+                // runs, and each of its checks is a change.
+                let now = Instant::now();
+                let wait =
+                    tally.due.filter(|due| *due > now).map_or(LOOK_AGAIN, |due| due.saturating_duration_since(now));
+                let timer = cx.background_executor().timer(wait.max(WAIT_POLL));
                 futures::future::select(Box::pin(changes.changed()), Box::pin(timer)).await;
+                // One count every `WAIT_POLL` at most: a scan read namespace by namespace has
+                // thousands of checks, each a change.
+                cx.background_executor().timer(WAIT_POLL).await;
             }
         }));
     }

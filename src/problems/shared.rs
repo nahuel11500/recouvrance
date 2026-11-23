@@ -138,6 +138,14 @@ impl Found {
         }
         (!all.is_empty()).then(|| all.join(", "))
     }
+
+    /// Whether every check read all it lists, the alerts aside (a narrower scan reads them
+    /// the same way): only then do these findings stand for a narrower scope. A scan of the
+    /// whole cluster refused its cluster-wide lists says nothing of a namespace that may be
+    /// read, and a list that timed out cluster-wide may work in one namespace.
+    fn read_all(&self) -> bool {
+        self.parts.values().all(|p| p.skipped.is_empty())
+    }
 }
 
 /// Whether a check's finding belongs in `namespaces` (all when empty), as a scan of those
@@ -224,27 +232,40 @@ pub fn changes() -> tokio::sync::watch::Receiver<u64> {
     CHANGES.subscribe()
 }
 
+/// Whether the findings kept for `key` may stand for `scope`: its own, or those of a scope
+/// that covers it and read everything it lists (`Found::read_all`).
+fn serves(key: &Scope, found: &Found, scope: &Scope) -> bool {
+    key == scope || (key.covers(scope) && found.read_all())
+}
+
+/// Whether `scope`'s findings may stand for the narrower scopes it covers: not scanned yet,
+/// or every check read all it lists. The page scans a namespace on its own otherwise.
+pub fn may_cover(scope: &Scope) -> bool {
+    lock().get(scope).is_none_or(|e| e.found.read_all())
+}
+
 /// The latest findings for `scope`: its own, or those of a scope that covers it (the cluster
-/// scanned whole) when they are more recent. None before any scan started. Read them with
-/// `scope.namespaces`.
+/// scanned whole) when they are more recent and read everything. None before any scan
+/// started. Read them with `scope.namespaces`.
 pub fn latest(scope: &Scope) -> Option<Arc<Found>> {
     let scans = lock();
     (scans.iter())
-        .filter(|(key, _)| key.covers(scope))
+        .filter(|(key, e)| serves(key, &e.found, scope))
         .max_by_key(|(key, e)| (e.found.done.map(|d| d.ended), *key == scope))
         .map(|(_, e)| e.found.clone())
 }
 
 /// Make sure the findings for `scope` are `fresh`: nothing to do when the latest are (its own
-/// or a covering scope's), else the scan running is the one to wait for, else a scan starts
-/// with what `ask` gives. Returns what to wait for, if anything. A scan runs to its end even
-/// when nobody waits any more, and its findings are kept for the next one to ask.
+/// or those of a covering scope that read everything), else the scan running is the one to
+/// wait for, else a scan starts with what `ask` gives. Returns what to wait for, if anything.
+/// A scan runs to its end even when nobody waits any more, and its findings are kept for the
+/// next one to ask.
 pub fn ensure(scope: &Scope, fresh: Fresh, ask: impl FnOnce() -> Ask) -> Option<Waiter> {
     let now = Instant::now();
     let mut scans = lock();
     scans.retain(|_, e| e.scan.is_some() || now.saturating_duration_since(e.asked) < FORGET_AFTER);
     let mut running = None;
-    for (key, entry) in scans.iter_mut().filter(|(key, _)| key.covers(scope)) {
+    for (key, entry) in scans.iter_mut().filter(|(key, e)| serves(key, &e.found, scope)) {
         entry.asked = now;
         if entry.found.done.is_some_and(|d| fresh.met_by(d, now)) {
             return None;
@@ -266,7 +287,7 @@ pub fn ensure(scope: &Scope, fresh: Fresh, ask: impl FnOnce() -> Ask) -> Option<
     Arc::make_mut(&mut entry.found).running = Some(now);
     drop(scans);
     changed();
-    let finish = Finish { scope: scope.clone(), started: now, checks: None, done: Some(done) };
+    let finish = Finish { scope: scope.clone(), started: now, checks: None, ended: false, done: Some(done) };
     let scan = run(scope.clone(), client, kinds, record, finish);
     match lane {
         Lane::Background => k8s::spawn_detached(k8s::lane::background(scan)),
@@ -318,16 +339,23 @@ async fn run(scope: Scope, client: Client, kinds: Vec<Kind>, record: bool, mut f
         update(&scope, |found| found.alerts = Some(alerts));
     };
     futures::join!(checks, alerts);
+    finish.ended = true;
     drop(finish);
 }
 
+/// The part that says a scan stopped half way: no check has this name.
+const STOPPED: &str = "\u{0}stopped";
+
 /// Ends a scan, also one stopped half way (a panic): its findings get their time, a check
-/// the scan no longer has is dropped, and whoever waits is woken.
+/// the scan no longer has is dropped, and whoever waits is woken. A scan stopped half way
+/// says so in what could not be read, so it is never taken for an all-clear.
 struct Finish {
     scope: Scope,
     started: Instant,
     /// The scan's checks, once known.
     checks: Option<HashSet<Arc<str>>>,
+    /// Every check ran to its end.
+    ended: bool,
     done: Option<futures::channel::oneshot::Sender<()>>,
 }
 
@@ -337,7 +365,12 @@ impl Drop for Finish {
             let mut scans = lock();
             if let Some(entry) = scans.get_mut(&self.scope) {
                 let found = Arc::make_mut(&mut entry.found);
-                if let Some(checks) = &self.checks {
+                if !self.ended {
+                    // The checks it didn't get to keep their last findings, if any.
+                    let skipped = vec!["the rest (the scan stopped)".to_string()];
+                    let part = Part { order: usize::MAX, problems: Vec::new(), skipped };
+                    found.parts.insert(Arc::from(STOPPED), Arc::new(part));
+                } else if let Some(checks) = &self.checks {
                     found.parts.retain(|name, _| checks.contains(name));
                 }
                 found.done = Some(Done { started: self.started, ended: Instant::now() });
@@ -474,9 +507,11 @@ mod tests {
         assert_eq!(Found::default().skipped(), None);
     }
 
-    /// A cluster with one node `NotReady`; records the paths it was asked for.
+    /// A cluster with one node `NotReady`; records the paths it was asked for. With `.1`, a
+    /// user who may not list Pods cluster-wide but may in namespace `shop`, where there are
+    /// none.
     #[derive(Clone, Default)]
-    struct Cluster(Arc<Mutex<Vec<String>>>);
+    struct Cluster(Arc<Mutex<Vec<String>>>, bool);
 
     impl Cluster {
         fn asked(&self, path: &str) -> usize {
@@ -500,6 +535,13 @@ mod tests {
                 let row = serde_json::json!({"cells": ["n1", "NotReady"], "object": {"metadata": {"name": "n1", "uid": "n1"}}});
                 let defs = [serde_json::json!({"name": "Name"}), serde_json::json!({"name": "Status"})];
                 (200, serde_json::json!({"kind": "Table", "columnDefinitions": defs, "rows": [row]}))
+            } else if self.1 && path == "/api/v1/pods" {
+                let status = serde_json::json!({"kind": "Status", "apiVersion": "v1", "status": "Failure",
+                    "reason": "Forbidden", "message": "pods is forbidden", "code": 403});
+                (403, status)
+            } else if self.1 && path == "/api/v1/namespaces/shop/pods" {
+                let defs = [serde_json::json!({"name": "Name"}), serde_json::json!({"name": "Status"})];
+                (200, serde_json::json!({"kind": "Table", "columnDefinitions": defs, "rows": []}))
             } else {
                 (404, serde_json::json!({"kind": "Status", "apiVersion": "v1", "status": "Failure", "code": 404}))
             };
@@ -545,5 +587,55 @@ mod tests {
         assert_eq!(cluster.asked("/api/v1/nodes"), 2);
         // Another cluster's scope is its own.
         assert!(latest(&scope("shared-test-other", &[])).is_none());
+    }
+
+    /// A user who may not list Pods cluster-wide but may read `shop`: the whole cluster's
+    /// scan says nothing of `shop`, which is scanned on its own.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_scan_that_could_not_read_stands_for_no_narrower_scope() {
+        let cluster = Cluster(Arc::default(), true);
+        let client = Client::new(cluster.clone(), "default");
+        let pod = Kind::fake("", "Pod");
+        let asks = || Ask { client: client.clone(), kinds: vec![pod.clone()], lane: Lane::Background, record: false };
+        let whole = scope("shared-test-forbidden", &[]);
+        let found = fresh(&whole, Fresh::Paced, &asks).await.unwrap();
+        assert!(!found.read_all() && found.skipped().unwrap().contains("Pod"), "{:?}", found.skipped());
+        assert!(!may_cover(&whole));
+        let shop = scope("shared-test-forbidden", &["shop"]);
+        assert!(latest(&shop).is_none(), "not shown from the whole cluster's scan");
+        let found = fresh(&shop, Fresh::Paced, &asks).await.unwrap();
+        assert!(found.read_all(), "{:?}", found.skipped());
+        assert_eq!(cluster.asked("/api/v1/namespaces/shop/pods"), 1);
+        // Its own findings stand, though the whole cluster's are more recent.
+        fresh(&whole, Fresh::Since(Instant::now()), &asks).await;
+        assert!(ensure(&shop, Fresh::Paced, &asks).is_none());
+        assert!(latest(&shop).unwrap().read_all());
+        assert_eq!(cluster.asked("/api/v1/namespaces/shop/pods"), 1);
+        // With full rights, the whole cluster's scan stands for `shop`.
+        let open = Cluster::default();
+        let whole = scope("shared-test-open", &[]);
+        fresh(&whole, Fresh::Paced, ask(&open)).await;
+        assert!(may_cover(&whole));
+        assert!(ensure(&scope("shared-test-open", &["shop"]), Fresh::Paced, ask(&open)).is_none());
+    }
+
+    #[test]
+    fn a_scan_stopped_half_way_is_no_all_clear() {
+        let s = scope("shared-test-stopped", &[]);
+        lock().insert(s.clone(), Entry { found: Arc::default(), scan: None, asked: Instant::now() });
+        let finish = |ended| Finish {
+            scope: s.clone(),
+            started: Instant::now(),
+            checks: Some(HashSet::new()),
+            ended,
+            done: None,
+        };
+        drop(finish(false));
+        let found = latest(&s).unwrap();
+        assert!(found.done.is_some() && !found.read_all());
+        assert_eq!(found.skipped().unwrap(), "the rest (the scan stopped)");
+        // The next scan run to its end drops the note.
+        drop(finish(true));
+        assert_eq!(latest(&s).unwrap().skipped(), None);
     }
 }

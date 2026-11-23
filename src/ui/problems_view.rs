@@ -31,21 +31,33 @@ const POLL: Duration = Duration::from_millis(500);
 /// What the page says while nothing was scanned yet.
 const CHECKING: &str = "Checking nodes, workloads, pods, jobs, services, ingresses, volumes, references and deletions…";
 
-/// A cluster the page shows: the scope scanned, and the namespaces shown from it.
+/// A cluster the page shows: the namespaces picked, and the scope the window's badge scans.
 struct Watched {
     context: String,
     client: Client,
     /// The kinds it serves: the others would fail with a 404.
     kinds: Vec<Kind>,
-    scope: shared::Scope,
+    /// What the page shows.
+    picked: shared::Scope,
+    /// What the badge scans (`Scope::home`).
+    home: shared::Scope,
     /// Empty: all of the scope.
     namespaces: Vec<String>,
 }
 
+impl Watched {
+    /// The scope to scan now: see `scope_for`.
+    fn scope(&self) -> shared::Scope {
+        scope_for(&self.home, &self.picked, shared::may_cover(&self.home))
+    }
+}
+
 /// The scope a page scans to show `picked`: the one the window's badge scans (`home`) when it
-/// covers them, so they share their scans, else `picked` alone.
-fn scope_for(home: shared::Scope, picked: shared::Scope) -> shared::Scope {
-    if home.covers(&picked) { home } else { picked }
+/// covers them and its findings may stand for them (`may_cover`: it read everything), so they
+/// share their scans, else `picked` alone. A user who may not list cluster-wide still gets
+/// the namespace picked.
+fn scope_for(home: &shared::Scope, picked: &shared::Scope, may_cover: bool) -> shared::Scope {
+    if home == picked || (may_cover && home.covers(picked)) { home.clone() } else { picked.clone() }
 }
 
 /// The clusters of `clusters` the page shows: one where none of the namespaces chosen is
@@ -56,9 +68,9 @@ fn watched(clusters: &crate::ui::Scope, kinds: &HashMap<String, Vec<Kind>>) -> V
         .map(|(ctx, client, ns)| {
             // `[None]`: the whole cluster; otherwise those namespaces.
             let namespaces: Vec<String> = ns.iter().flatten().cloned().collect();
-            let scope = scope_for(shared::Scope::home(ctx), shared::Scope::new(ctx, namespaces.clone()));
+            let (home, picked) = (shared::Scope::home(ctx), shared::Scope::new(ctx, namespaces.clone()));
             let kinds = kinds.get(ctx).cloned().unwrap_or_default();
-            Watched { context: ctx.clone(), client: client.clone(), kinds, scope, namespaces }
+            Watched { context: ctx.clone(), client: client.clone(), kinds, picked, home, namespaces }
         })
         .collect()
 }
@@ -149,7 +161,7 @@ impl ProblemsView {
     }
 
     /// Scan again now (F5), keeping the rows, the filter and the severity picked. A scan
-    /// running is the one waited for.
+    /// running started before: it is waited for, then another one runs.
     pub fn refresh(&mut self, cx: &mut Context<Self>) {
         self.reload(true, cx);
         cx.notify();
@@ -168,15 +180,22 @@ impl ProblemsView {
                 if !crate::app::wait_visible(&this, cx, &exec).await {
                     break;
                 }
-                let fresh = wanted.take().map_or(Fresh::Paced, Fresh::Since);
+                let fresh = wanted.map_or(Fresh::Paced, Fresh::Since);
+                let mut scanning = false;
                 for s in watched.iter() {
                     // Not waited for: the rows follow the scan as its checks finish.
-                    let _ = shared::ensure(&s.scope, fresh, || Ask {
+                    let scan = shared::ensure(&s.scope(), fresh, || Ask {
                         client: s.client.clone(),
                         kinds: s.kinds.clone(),
                         lane: Lane::Foreground,
                         record: true,
                     });
+                    scanning |= scan.is_some();
+                }
+                // A Refresh stands until every cluster's findings come from a scan started
+                // after it: one running already started before, so another one follows it.
+                if !scanning {
+                    wanted = None;
                 }
                 let Ok(due) = this.update(cx, |this, cx| {
                     let due = this.show();
@@ -185,10 +204,15 @@ impl ProblemsView {
                 }) else {
                     break;
                 };
-                // Until some findings change, or the next scan is due.
-                let wait = due.map_or(LOOK_AGAIN, |due| due.saturating_duration_since(Instant::now())).max(POLL);
-                let timer = cx.background_executor().timer(wait);
+                // Until some findings change, or the next scan is due. Once it is due, a scan
+                // runs, and each of its checks is a change.
+                let now = Instant::now();
+                let wait = due.filter(|due| *due > now).map_or(LOOK_AGAIN, |due| due.saturating_duration_since(now));
+                let timer = cx.background_executor().timer(wait.max(POLL));
                 futures::future::select(Box::pin(changes.changed()), Box::pin(timer)).await;
+                // One look every `POLL` at most: a scan read namespace by namespace has
+                // thousands of checks, each a change, and every look sorts every problem.
+                cx.background_executor().timer(POLL).await;
             }
         }));
     }
@@ -196,7 +220,7 @@ impl ProblemsView {
     /// Read each cluster's latest findings; when the next scan is due. The rows are made
     /// again only when the findings changed.
     fn show(&mut self) -> Option<Instant> {
-        let latest: Vec<Option<Arc<Found>>> = self.watched.iter().map(|s| shared::latest(&s.scope)).collect();
+        let latest: Vec<Option<Arc<Found>>> = self.watched.iter().map(|s| shared::latest(&s.picked)).collect();
         let done: Vec<shared::Done> = latest.iter().filter_map(|f| f.as_ref()?.done).collect();
         let due = done.iter().map(|d| d.due()).min();
         let same = latest.len() == self.shown_from.len()
@@ -208,7 +232,8 @@ impl ProblemsView {
             return due;
         }
         self.complete = done.len() == latest.len();
-        self.scanned = done.iter().map(|d| d.ended).min();
+        // From when the scan started: its first checks read the cluster then.
+        self.scanned = done.iter().map(|d| d.started).min();
         self.updating = latest.iter().flatten().any(|f| f.running.is_some());
         let results: Vec<(String, Vec<Problem>, Option<String>)> = (self.watched.iter().zip(&latest))
             .filter_map(|(s, f)| {
@@ -554,11 +579,15 @@ mod tests {
         use crate::problems::shared::Scope;
         let scope = |ns: &[&str]| Scope::new("prod", ns.iter().map(ToString::to_string));
         // A cluster read whole: every namespace picked comes from its scan.
-        assert_eq!(super::scope_for(scope(&[]), scope(&[])), scope(&[]));
-        assert_eq!(super::scope_for(scope(&[]), scope(&["shop"])), scope(&[]));
+        assert_eq!(super::scope_for(&scope(&[]), &scope(&[]), true), scope(&[]));
+        assert_eq!(super::scope_for(&scope(&[]), &scope(&["shop"]), true), scope(&[]));
         // Accessible namespaces set: those among them too, another one on its own.
-        assert_eq!(super::scope_for(scope(&["a", "b"]), scope(&["a"])), scope(&["a", "b"]));
-        assert_eq!(super::scope_for(scope(&["a", "b"]), scope(&["c"])), scope(&["c"]));
+        assert_eq!(super::scope_for(&scope(&["a", "b"]), &scope(&["a"]), true), scope(&["a", "b"]));
+        assert_eq!(super::scope_for(&scope(&["a", "b"]), &scope(&["c"]), true), scope(&["c"]));
+        // A scan of the whole cluster that could not read everything (a user who may not
+        // list cluster-wide): the namespace picked is scanned on its own.
+        assert_eq!(super::scope_for(&scope(&[]), &scope(&["shop"]), false), scope(&["shop"]));
+        assert_eq!(super::scope_for(&scope(&[]), &scope(&[]), false), scope(&[]));
     }
 
     #[test]

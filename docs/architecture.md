@@ -15,8 +15,9 @@ Recouvrance is one Rust binary: a [gpui](https://github.com/zed-industries/zed) 
   sleeps. X11 sees a covered window only without a compositor, and Wayland compositors without the
   xdg-shell `suspended` state never report a window hidden. The list then holds its rows back
   (a first list that completes meanwhile says so only with them) and stops its metrics, and the
-  sidebar's problem count starts no scan (while every window is hidden, none runs). Watches, log streams and shells keep going, so a window shown
-  again is current at once. A window shown on another monitor, not focused, keeps updating.
+  sidebar's problem count starts no scan (an agent's `find_problems` still does when its
+  findings are too old). Watches, log streams and shells keep going, so a window shown again is
+  current at once. A window shown on another monitor, not focused, keeps updating.
 - The page on screen gets the API servers first. Background work (the problem count, a hidden
   list) takes at most 8 of the 32 slots that requests by namespace share (`k8s::lane`). Each
   request takes its slot in the lane of that moment, so a list that comes on screen while it loads
@@ -70,7 +71,9 @@ One scan runs per cluster and scope (`problems::shared`), whoever asks: the side
 window, the Problems page and the agents' `find_problems` read its latest findings, kept check by
 check as each finishes, and wait for the scan running rather than start another. A scan is due
 eight times as long as the last one took after it ended (2 minutes at least); a page scoped to some
-namespaces reads them from the cluster's scan when it covers them.
+namespaces reads them from the cluster's scan when it covers them and could read everything; a
+user who may not list cluster-wide gets those namespaces scanned on their own. A scan stopped half
+way says so, and is never taken for an all-clear.
 
 ## Safety model
 

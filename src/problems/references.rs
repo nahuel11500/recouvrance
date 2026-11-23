@@ -811,30 +811,39 @@ async fn unserved(client: &Client, kind: &Kind, services: &[Service], namespace:
     };
     // Collected first, and each future owns what it reads: closures over references held
     // across an await would make the scan's future not `Send` for the agents' server.
-    let unready = selecting
+    let candidates: Vec<(usize, String, Option<String>)> = selecting
         .into_iter()
         .filter(|(i, _)| !ready.contains(&services[*i].metadata.key()))
-        .filter_map(|(i, selector)| Some((i, services[i].metadata.namespace()?.to_string(), selector)));
+        .filter_map(|(i, selector)| Some((i, services[i].metadata.namespace()?.to_string(), selector)))
+        .collect();
     // A Service judged lately and unchanged since keeps its verdict: on a big cluster most of
     // them are the same idle Services scan after scan, a pod list each.
     let now = Instant::now();
     let mut known: Vec<(usize, Option<(Severity, String)>)> = Vec::new();
-    let unready: Vec<(usize, String, Option<String>)> = {
+    let mut unready: Vec<(usize, String, Option<String>)> = Vec::new();
+    // Kept as selecting no pod because a workload is scaled to 0: it stands only while one
+    // still is, as the namespace's workloads say (one list a namespace, not one a Service).
+    let mut scaled_kept: Vec<(usize, String, Option<String>)> = Vec::new();
+    {
         let kept = verdicts();
-        unready
-            .filter(|(i, _, _)| {
-                let reused = services[*i].metadata.version().and_then(|(uid, version)| {
-                    kept.get(uid).filter(|k| reusable(k, version, now)).map(|k| k.verdict.clone())
-                });
-                if let Some(verdict) = reused {
-                    known.push((*i, verdict));
-                    false
-                } else {
-                    true
-                }
-            })
-            .collect()
-    };
+        for (i, ns, selector) in candidates {
+            let reused = services[i].metadata.version().and_then(|(uid, version)| {
+                kept.get(uid).filter(|k| reusable(k, version, now)).map(|k| k.verdict.clone())
+            });
+            match reused {
+                Some((Severity::Info, _)) => scaled_kept.push((i, ns, selector)),
+                Some(verdict) => known.push((i, Some(verdict))),
+                None => unready.push((i, ns, selector)),
+            }
+        }
+    }
+    let mut workloads = workloads_in(client, scaled_kept.iter().map(|(_, ns, _)| ns.clone()).collect()).await;
+    for (i, ns, selector) in scaled_kept {
+        match workloads.get(&ns).and_then(|w| scaled_to_zero(&services[i], w)) {
+            Some(w) => known.push((i, judge_service(&[], Some(w.as_str())))),
+            None => unready.push((i, ns, selector)),
+        }
+    }
     let listed: Vec<(usize, anyhow::Result<Vec<SelectedPod>>)> = futures::stream::iter(unready)
         .map(|(i, ns, selector)| {
             let client = client.clone();
@@ -851,18 +860,9 @@ async fn unserved(client: &Client, kind: &Kind, services: &[Service], namespace:
         .iter()
         .filter(|(_, pods)| pods.as_ref().is_ok_and(|p| !p.iter().any(SelectedPod::live)))
         .map(|(i, _)| services[*i].metadata.key().0)
+        .filter(|ns| !workloads.contains_key(ns))
         .collect();
-    let workloads: HashMap<String, Vec<Scaled>> = futures::stream::iter(idle)
-        .map(|ns| {
-            let client = client.clone();
-            async move {
-                let scaled = workloads_of(client, &ns).await;
-                (ns, scaled)
-            }
-        })
-        .buffer_unordered(HELD_PARALLEL)
-        .collect()
-        .await;
+    workloads.extend(workloads_in(client, idle).await);
     let mut failed = None;
     let mut judged = Vec::new();
     for (i, pods) in listed {
@@ -876,8 +876,10 @@ async fn unserved(client: &Client, kind: &Kind, services: &[Service], namespace:
         let svc = &services[i];
         let scaled = workloads.get(&svc.metadata.key().0).and_then(|w| scaled_to_zero(svc, w));
         let verdict = judge_service(&pods, scaled.as_deref());
-        if let Some((uid, version)) = svc.metadata.version() {
-            judged.push((uid.to_string(), Verdict { version: version.to_string(), at: now, verdict: verdict.clone() }));
+        // "A ready pod after all" is not kept: the Endpoints lagged, and the pods may go
+        // unready by the next scan.
+        if let (Some((uid, version)), Some(kept)) = (svc.metadata.version(), &verdict) {
+            judged.push((uid.to_string(), Verdict { version: version.to_string(), at: now, verdict: kept.clone() }));
         }
         known.push((i, verdict));
     }
@@ -897,16 +899,32 @@ async fn unserved(client: &Client, kind: &Kind, services: &[Service], namespace:
     out
 }
 
-/// A Service's verdict on its pods (None: one is ready after all), as judged at `at` for its
-/// resourceVersion `version`.
+/// The workloads scaled to 0 in each of `namespaces`.
+async fn workloads_in(client: &Client, namespaces: BTreeSet<String>) -> HashMap<String, Vec<Scaled>> {
+    futures::stream::iter(namespaces)
+        .map(|ns| {
+            let client = client.clone();
+            async move {
+                let scaled = workloads_of(client, &ns).await;
+                (ns, scaled)
+            }
+        })
+        .buffer_unordered(HELD_PARALLEL)
+        .collect()
+        .await
+}
+
+/// A Service's verdict on its pods, as judged at `at` for its resourceVersion `version`.
+/// Only a problem is kept: a Service with a ready pod is judged again each time.
 struct Verdict {
     version: String,
     at: Instant,
-    verdict: Option<(Severity, String)>,
+    verdict: (Severity, String),
 }
 
-/// How long a Service's verdict is kept at most: the pods it selects and the workloads scaled
-/// to 0 can change without the Service.
+/// How long a Service's verdict is kept at most: the pods it selects can change without the
+/// Service. One that selects no pod because a workload is scaled to 0 keeps it only while
+/// that workload still is.
 const VERDICT_KEPT: Duration = Duration::from_secs(10 * 60);
 
 /// The verdicts of the Services judged lately, by uid (unique across clusters too).
@@ -1336,15 +1354,21 @@ mod tests {
     /// namespace `app`, whole as an API server sends them (managedFields, annotations,
     /// status, `null`s), so the lean reads skip what they don't use; records the paths it was
     /// asked for. Each cluster has uids of its own, as real ones do (Services' verdicts are
-    /// kept by uid); `.2` is the resourceVersion of its objects.
+    /// kept by uid); `.2` is the resourceVersion of its objects; `.3` scales the Deployment
+    /// `idle` up to 1.
     #[derive(Clone)]
-    struct Cluster(std::sync::Arc<Mutex<Vec<String>>>, u64, std::sync::Arc<std::sync::atomic::AtomicU64>);
+    struct Cluster(
+        std::sync::Arc<Mutex<Vec<String>>>,
+        u64,
+        std::sync::Arc<std::sync::atomic::AtomicU64>,
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+    );
 
     impl Default for Cluster {
         fn default() -> Self {
             static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            Self(std::sync::Arc::default(), id, std::sync::Arc::new(4711.into()))
+            Self(std::sync::Arc::default(), id, std::sync::Arc::new(4711.into()), std::sync::Arc::default())
         }
     }
 
@@ -1400,7 +1424,8 @@ mod tests {
                 }
                 "/api/v1/namespaces/app/pods" => list(vec![]),
                 "/apis/apps/v1/namespaces/app/deployments" => list(vec![json!({"metadata": meta("idle"),
-                    "spec": {"replicas": 0, "selector": {"matchLabels": {"app": "idle"}}, "strategy": {"type": "RollingUpdate"},
+                    "spec": {"replicas": u8::from(self.3.load(std::sync::atomic::Ordering::Relaxed)),
+                        "selector": {"matchLabels": {"app": "idle"}}, "strategy": {"type": "RollingUpdate"},
                         "template": {"metadata": {"creationTimestamp": null, "labels": {"app": "idle"}},
                             "spec": {"containers": [{"name": "main", "image": "busybox:1.37", "resources": {}}]}}},
                     "status": {"observedGeneration": 3, "conditions": [{"type": "Available", "status": "True"}]}})]),
@@ -1494,15 +1519,23 @@ mod tests {
         let first = verdicts(traffic(client.clone(), &service, None, None, Some("app".into())).await);
         assert_eq!(first.len(), 3);
         assert_eq!((asked("/pods"), asked("/deployments")), (3, 1));
-        // Nothing changed: the same verdicts, and no pod or workload listed again.
+        // Nothing changed: the same verdicts, and no pod listed again. The Service kept as
+        // selecting no pod because `idle` is scaled to 0 checks that it still is: the
+        // namespace's workloads, listed once.
         let second = verdicts(traffic(client.clone(), &service, None, None, Some("app".into())).await);
         assert_eq!(second, first);
-        assert_eq!((asked("/pods"), asked("/deployments")), (3, 1));
+        assert_eq!((asked("/pods"), asked("/deployments")), (3, 2));
+        // `idle` scaled up, its Service unchanged: no longer a minor finding, its pods listed.
+        cluster.3.store(true, std::sync::atomic::Ordering::Relaxed);
+        let third = verdicts(traffic(client.clone(), &service, None, None, Some("app".into())).await);
+        let idle = third.iter().find(|(name, ..)| name == "idle").unwrap();
+        assert_eq!((idle.1, idle.2.as_str()), (Severity::Warning, "selects no pod"));
+        assert_eq!((asked("/pods"), asked("/deployments")), (4, 3));
         // The Services changed: their pods are listed again.
         cluster.2.store(4712, std::sync::atomic::Ordering::Relaxed);
-        let third = verdicts(traffic(client, &service, None, None, Some("app".into())).await);
-        assert_eq!(third, first);
-        assert_eq!((asked("/pods"), asked("/deployments")), (6, 2));
+        let fourth = verdicts(traffic(client, &service, None, None, Some("app".into())).await);
+        assert_eq!(fourth, third);
+        assert_eq!((asked("/pods"), asked("/deployments")), (7, 4));
     }
 
     proptest! {
@@ -1515,7 +1548,7 @@ mod tests {
             age in 0u64..2_000,
         ) {
             let at = Instant::now();
-            let verdict = Verdict { version: kept.into(), at, verdict: Some((Severity::Warning, "selects no pod".into())) };
+            let verdict = Verdict { version: kept.into(), at, verdict: (Severity::Warning, "selects no pod".into()) };
             let later = at + Duration::from_secs(age);
             prop_assert_eq!(reusable(&verdict, now, later), kept == now && Duration::from_secs(age) < VERDICT_KEPT);
         }
