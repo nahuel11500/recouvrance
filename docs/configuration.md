@@ -241,7 +241,10 @@ of 0.3.0 such an agent keeps its rules, and its section is written to the file. 
 verbs, GitOps actions were checked as `patch`: on the first start of the version that added them,
 every rule that names `patch` gets `refresh`, `sync` and `suspend`, and the file is written again,
 once. A verb you take out of a rule after that stays out. If the file changed on disk meanwhile, it
-is not written over: the load fails with the reason, and your edit is loaded (and upgraded) next.
+is not written over: the load fails with the reason, and your edit is loaded (and upgraded) next. If
+the file can't be written (read-only, or managed by another tool), its rules are still loaded,
+upgraded the same way, and the Agents page says why it wasn't written; each load upgrades them again
+until it is.
 
 Each section is for the agent with that name, so agent names are unique: creating a second agent
 with a taken name is refused, and if two agents already share a name the file is neither loaded nor

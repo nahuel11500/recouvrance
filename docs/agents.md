@@ -124,9 +124,10 @@ replica count), `apply_manifest` (nor the content), requests other than lists wi
 (e.g. `check_certificates`: the rule would cover every name), requests across all namespaces (the
 rule would also cover namespaces no rule allows), and dry runs (the rule would allow the real write
 too), and Flux suspend and resume (one `suspend` verb covers both, so approving a resume would also
-allow suspending). A refresh or a sync gets one: its rule allows that action (`sync`, say) on that
-object only. An Argo CD sync with prune, a rollback or a terminate doesn't: their `sync` rule would
-allow any other sync, prune or rollback of the Application, beyond what the banner showed.
+allow suspending), and an Argo CD sync, terminate or rollback (one `sync` verb covers them all, and
+a rule cannot pin a prune, the `resources` synced or a rollback's deployment: approving a plain sync
+would let a later prune delete objects nobody was shown). A refresh or a Flux reconcile gets one:
+its rule allows that action on that object only.
 
 Before any rule is checked, a call's context must be named by one of the agent's Allow or Ask rules
 (`@protected` names none) and not covered by a Deny of everything (`*` verbs, resources, namespaces

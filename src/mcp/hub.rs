@@ -83,9 +83,8 @@ pub struct Approval {
     pub access: Access,
     /// A dry run: approving it must not turn into a rule for real writes.
     pub dry_run: bool,
-    /// What was approved is narrower than any rule for it: an Argo CD prune (held to the
-    /// resources the banner listed), rollback (to the deployment it named) or terminate,
-    /// whose `sync` verb would also allow any other sync, prune or rollback of the object.
+    /// What was approved is narrower than any rule for it: an Argo CD sync, terminate or
+    /// rollback (see [`Approval::only_once`]).
     pub once_only: bool,
     /// When the request is refused unanswered. Set by [`Hub::request_approval`]; the banner
     /// counts down to it.
@@ -98,6 +97,16 @@ impl Approval {
         self.deadline.saturating_duration_since(now)
     }
 
+    /// Whether approving the `gitops` call with these arguments must not become a rule: an
+    /// Argo CD sync, terminate or rollback. One `sync` verb covers them all, and a rule
+    /// cannot pin a prune, the `resources` synced or a rollback's deployment. Approving a
+    /// plain sync would then let a prune delete objects nobody was shown, or a rollback go
+    /// anywhere, without asking. A refresh and a Flux reconcile deploy nothing more than
+    /// themselves, so they keep their rule.
+    pub fn only_once(tool: &str, args: &serde_json::Value) -> bool {
+        tool == "gitops" && matches!(args["action"].as_str(), Some("sync" | "terminate" | "rollback"))
+    }
+
     /// A narrow Allow rule for exactly this request, when a rule can be that narrow.
     /// None for exec (a rule cannot pin the command), patches (the rule would allow any
     /// patch), scale (it would allow any replica count, 0 too), Flux suspend and resume (one
@@ -105,12 +114,12 @@ impl Approval {
     /// rule could not pin the content), a request other than a list with no object name
     /// (the rule would cover every name), a request across all namespaces (the rule would
     /// also cover namespaces no rule allows) and dry runs (a rule cannot be limited to dry
-    /// runs, so it would allow the real write), and an Argo CD prune, rollback or terminate
-    /// (the `sync` verb would allow every other sync of the object).
+    /// runs, so it would allow the real write), and an Argo CD sync, rollback or terminate
+    /// (the `sync` verb would allow every prune and rollback of the object).
     pub fn as_rule(&self) -> Option<Rule> {
         let a = &self.access;
-        // A refresh or a sync has its own verb, so its rule allows that action on that
-        // object only.
+        // A refresh or a Flux reconcile has its own verb, so its rule allows that action on
+        // that object only.
         if matches!(a.verb, Verb::Exec | Verb::Patch | Verb::Scale | Verb::Suspend)
             || self.tool == "apply_manifest"
             || self.dry_run
@@ -290,6 +299,8 @@ impl Hub {
     pub fn apply_rules_file(&self) -> Result<bool> {
         let path = rules_file::path();
         self.rules_file_present.store(path.exists(), Ordering::Relaxed);
+        // Said on the Agents page when the rules loaded but the file couldn't be upgraded.
+        let mut warning = None;
         {
             // Read and apply under the config lock: an edit in the app, which writes the file
             // under it, can't land between the two and leave the file and the rules in force
@@ -325,23 +336,36 @@ impl Hub {
             // Rules saved by an older version are upgraded, and the file written, once: see
             // `rules_file::apply_upgrading`.
             let mut agents = cfg.agents.clone();
+            let mut upgraded = true;
             if rules_file::apply_upgrading(&file, &mut agents, cfg.version)? {
                 let mut seen = lock(&self.rules_text);
                 match rules_file::export_over(&path, &agents, seen.as_deref()) {
                     Ok(text) => *seen = Some(text),
-                    Err(e) => {
+                    // Your edit is loaded next, and upgraded then.
+                    Err(e) if rules_file::changed_on_disk(&e) => {
                         let e = e.context("rules.yaml could not be upgraded for this version");
                         *lock(&self.rules_error) = Some(format!("{e:#}"));
                         drop((seen, cfg));
                         self.emit(HubEvent::AgentSeen);
                         return Err(e);
                     }
+                    // A file that can't be written (read-only, managed elsewhere) still holds
+                    // the rules: they are applied upgraded, as the file means them, and the
+                    // version stays so that every load upgrades them again until it is written.
+                    // Refusing the load would keep older rules in force, new denies left out.
+                    Err(e) => {
+                        let e = e.context("rules.yaml could not be written for this version; its rules are in force");
+                        warning = Some(format!("{e:#}"));
+                        upgraded = false;
+                    }
                 }
             }
             cfg.agents = agents;
-            cfg.version = CONFIG_VERSION;
+            if upgraded {
+                cfg.version = CONFIG_VERSION;
+            }
         }
-        *lock(&self.rules_error) = None;
+        *lock(&self.rules_error) = warning;
         self.save()?;
         self.emit(HubEvent::AgentSeen);
         Ok(true)

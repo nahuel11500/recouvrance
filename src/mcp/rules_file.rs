@@ -369,12 +369,30 @@ pub fn render(agents: &[super::Agent]) -> Result<String> {
     Ok(format!("{HEADER}\n{}", crate::yaml::to_string(&RulesFile { agents })?))
 }
 
+/// Why [`export_over`] refused to write: the file changed on disk since it was loaded.
+#[derive(Debug)]
+pub struct ChangedOnDisk;
+
+impl std::fmt::Display for ChangedOnDisk {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("rules.yaml changed on disk since it was loaded: it is being reloaded, make this change again")
+    }
+}
+
+impl std::error::Error for ChangedOnDisk {}
+
+/// Whether `e`, from [`export_over`], is the file having changed on disk, rather than a
+/// failed write (a read-only file, a folder you can't write to).
+pub fn changed_on_disk(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<ChangedOnDisk>().is_some()
+}
+
 /// Write the file at `path` for these agents, over `seen`: the text last loaded or written.
-/// Refused when the file changed since (an edit of yours not loaded yet would be lost; it
-/// is loaded next). Returns the text written.
+/// Refused with [`ChangedOnDisk`] when the file changed since (an edit of yours not loaded
+/// yet would be lost; it is loaded next). Returns the text written.
 pub fn export_over(path: &Path, agents: &[super::Agent], seen: Option<&str>) -> Result<String> {
     if read(path)?.as_deref() != seen {
-        bail!("rules.yaml changed on disk since it was loaded: it is being reloaded, make this change again");
+        return Err(ChangedOnDisk.into());
     }
     let text = render(agents)?;
     crate::private_files::write_atomic(path, text.as_bytes())?;
@@ -844,6 +862,32 @@ mod properties {
         let mut again = vec![agent("ci", Policy::default())];
         assert!(!apply_upgrading(&check(&written).unwrap(), &mut again, CONFIG_VERSION).unwrap());
         assert_eq!(again[0].policy.rules, agents[0].policy.rules);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// An upgrade that can't be written (a read-only folder) is told apart from an edit on
+    /// disk: the first is applied in memory all the same, the second waits for the edit.
+    #[cfg(unix)]
+    #[test]
+    fn an_unwritable_file_is_not_an_edit_on_disk() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = crate::mcp::test_dir();
+        let path = dir.join("rules.yaml");
+        let old = "agents:\n  ci:\n    allow: [\"patch applications.argoproj.io\"]\n";
+        std::fs::write(&path, old).unwrap();
+        let agents = vec![agent("ci", Policy::default())];
+        std::fs::write(&path, "# yours\n").unwrap();
+        let edited = export_over(&path, &agents, Some(old)).unwrap_err();
+        assert!(changed_on_disk(&edited) && changed_on_disk(&edited.context("upgrading")));
+        std::fs::write(&path, old).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let written = export_over(&path, &agents, Some(old));
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // Root writes anyway: nothing to check then.
+        if let Err(e) = written {
+            assert!(!changed_on_disk(&e), "{e:#}");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), old);
+        }
         std::fs::remove_dir_all(dir).unwrap();
     }
 
