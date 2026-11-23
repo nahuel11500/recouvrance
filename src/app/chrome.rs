@@ -37,7 +37,8 @@ impl AppView {
             let detail = format!("saved view · {}", v.kind.split('.').next().unwrap_or_default());
             items.push(PaletteItem::new(v.name.clone(), detail, Lucide::Bookmark, Target::View(v.clone())));
         }
-        for k in &self.kinds {
+        // The types the sidebar lists, not the noise discovery keeps for lookups.
+        for k in self.kinds.iter().filter(|k| k8s::in_sidebar(k)) {
             items.push(PaletteItem::new(
                 k.label.clone(),
                 format!("{} · {}", k.kubectl_name(), k.section),

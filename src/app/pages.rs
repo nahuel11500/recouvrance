@@ -7,6 +7,7 @@ use gpui_kit::*;
 use super::{AppView, Route};
 use crate::details::{DetailPanel, OpenObject};
 use crate::k8s;
+use crate::k8s::argo::diagnosis::{self, Res};
 use crate::k8s::{Kind, ObjectRef};
 use crate::ui::helm::{HelmList, HelmRelease, OpenRelease};
 
@@ -122,6 +123,7 @@ impl AppView {
         let clusters = self.clusters.clone();
         let context_name = context.clone();
         let (own_context, own_client) = (context.clone(), client.clone());
+        let own = (context.clone(), client.clone());
         let panel = cx.new(|cx| {
             let mut p = DetailPanel::new(client, context, risky, forwards, favorites, obj, window, cx);
             p.clusters = clusters;
@@ -169,37 +171,66 @@ impl AppView {
             this.show_detail_on(ev.context.clone(), ev.client.clone(), ev.obj.clone(), window, cx);
         })
         .detach();
-        cx.subscribe_in(&panel, window, |this, _, ev: &crate::details::OpenNamespace, window, cx| {
-            this.open_namespace_on(ev.context.clone(), ev.namespace.clone(), window, cx);
+        cx.subscribe_in(&panel, window, move |this, asker, ev: &crate::details::OpenOn, window, cx| {
+            this.open_on(ev.context.clone(), ev.res.clone(), Some(own.clone()), asker.entity_id(), window, cx);
         })
         .detach();
         self.navigate(Route::Detail(panel), cx);
     }
 
-    /// Open a namespace on a context: on a connected one like any link, else after
-    /// connecting to it (an Application's destination is often not connected).
-    fn open_namespace_on(&mut self, context: String, namespace: String, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(ctx) = self.clusters.iter().position(|(n, _)| *n == context) {
-            self.namespace_open.cancel();
-            self.open_object_in(ctx, "namespaces", namespace, None, window, cx);
+    /// Open an object on a context, connected or not: where an Argo CD Application deploys,
+    /// and what it deploys there. Its kind is the one that context serves, at the version
+    /// Argo CD applied when it is served: from its kinds found when it connected, else (not
+    /// connected, or not among them) from its group discovered there. A connected context's
+    /// page opens at once; another's once connected to it, unless `own` (the asking page's
+    /// context and client) is that one, and only while `asker`, the page that asked, is still
+    /// the one shown.
+    fn open_on(
+        &mut self,
+        context: String,
+        res: Res,
+        own: Option<(String, kube::Client)>,
+        asker: EntityId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let at = self.clusters.iter().position(|(n, _)| *n == context);
+        if let Some(ix) = at
+            && let Some(kind) = diagnosis::known_kind(self.served_kinds(ix), &res)
+        {
+            self.context_open.cancel();
+            self.show_detail_in(ix, res.object(kind), window, cx);
             return;
         }
-        let kind = k8s::find_kind(&self.kinds, "namespaces").cloned().unwrap_or_else(|| Kind {
-            ar: k8s::ar_of::<k8s_openapi::api::core::v1::Namespace>(),
-            namespaced: false,
-            section: "Cluster",
-            label: "Namespaces".into(),
-        });
-        let obj = ObjectRef { kind, name: namespace, namespace: None, uid: String::new() };
-        window.push_notification(Notification::info(format!("Connecting to {context}…")), cx);
-        // A later click replaces this one: its page does not open over the newer one.
-        let connect = k8s::connect(context.clone());
-        self.namespace_open.spawn_in(window, cx, connect, move |this, client, window, cx| match client {
-            Ok(client) => this.show_detail_with(context, client, obj, window, cx),
-            Err(e) => window.push_notification(
-                Notification::error(format!("Could not connect to {context}: {}", k8s::short_error(&e))),
-                cx,
-            ),
+        let client = match at {
+            Some(ix) => self.clusters.get(ix).map(|(_, client)| client.clone()),
+            None => own.filter(|(c, _)| *c == context).map(|(_, client)| client),
+        };
+        if client.is_none() {
+            window.push_notification(Notification::info(format!("Connecting to {context}…")), cx);
+        }
+        let on = context.clone();
+        let work = async move {
+            let client = match client {
+                Some(client) => client,
+                None => k8s::connect(on.clone())
+                    .await
+                    .map_err(|e| format!("Could not connect to {on}: {}", k8s::short_error(&e)))?,
+            };
+            let kind = diagnosis::kind_on(client.clone(), on.clone(), res.clone())
+                .await
+                .map_err(|e| format!("Could not open {} on {on}: {}", res.label(), k8s::short_error(&e)))?;
+            Ok::<_, String>((client, res.object(kind)))
+        };
+        // A later click replaces this one: its page does not open over the newer one. Nor
+        // over a page the user went to meanwhile (a link, the sidebar, Back): a connect can
+        // wait for a login in the browser.
+        self.context_open.spawn_in(window, cx, work, move |this, opened, window, cx| match opened {
+            Ok((client, obj)) if this.route().page() == Some(asker) => {
+                this.show_detail_on(context, client, obj, window, cx);
+            }
+            Ok(_) => {}
+            Err(e) => window.push_notification(Notification::error(e), cx),
         });
     }
 
@@ -216,8 +247,8 @@ impl AppView {
             this.show_detail_on(ev.context.clone(), ev.client.clone(), ev.obj.clone(), window, cx);
         })
         .detach();
-        cx.subscribe_in(page, window, |this, _, ev: &crate::details::OpenNamespace, window, cx| {
-            this.open_namespace_on(ev.context.clone(), ev.namespace.clone(), window, cx);
+        cx.subscribe_in(page, window, |this, page, ev: &crate::details::OpenOn, window, cx| {
+            this.open_on(ev.context.clone(), ev.res.clone(), None, page.entity_id(), window, cx);
         })
         .detach();
     }
@@ -362,7 +393,9 @@ impl AppView {
                 OnScreen::Object { kind: "Helm release".into(), namespace: Some(namespace), name, context }
             }
             Route::Problems(_) => OnScreen::Page("the Problems page (what is broken)"),
-            Route::Timeline(_) => OnScreen::Page("the Timeline page (recent changes and events)"),
+            Route::Timeline(_) => {
+                OnScreen::Page("the Timeline page (recent changes and events: recent_changes reads them)")
+            }
             Route::Workloads(_) => OnScreen::Page("the Workloads overview"),
             Route::Cluster(_) => OnScreen::Page("the Cluster overview"),
             Route::Helm(_) => OnScreen::Page("the list of Helm releases"),

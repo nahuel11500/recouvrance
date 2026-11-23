@@ -30,8 +30,9 @@ pub(super) struct ServerTable {
     pub(super) metadata: ListMeta,
 }
 
-/// Watch frames send `null` for fields a list response omits.
-pub(super) fn null_default<'de, D, T>(d: D) -> std::result::Result<T, D::Error>
+/// A `null` read as the field's default: watch frames send it for fields a list response omits,
+/// and a lean read of an object takes it like a missing field.
+pub(crate) fn null_default<'de, D, T>(d: D) -> std::result::Result<T, D::Error>
 where
     D: serde::Deserializer<'de>,
     T: Default + Deserialize<'de>,
@@ -562,7 +563,8 @@ fn cells_row(row: ServerRow, namespace: Option<&str>, age: Option<usize>) -> Opt
     }))
 }
 
-/// kubectl's age ("45s", "2m3s", "5h", "3d4h", "2y") in seconds.
+/// kubectl's age ("45s", "2m3s", "5h", "3d4h", "2y") in seconds; None past what `i64` holds
+/// (agents type durations too: `recent_changes`'s `since`).
 pub(crate) fn age_seconds(age: &str) -> Option<i64> {
     let (mut total, mut num) = (0i64, 0i64);
     let mut digits = false;
@@ -583,7 +585,7 @@ pub(crate) fn age_seconds(age: &str) -> Option<i64> {
         if !digits {
             return None;
         }
-        total += num * unit;
+        total = total.checked_add(num.checked_mul(unit)?)?;
         (num, digits) = (0, false);
     }
     (!digits && total > 0 || age == "0s").then_some(total)
@@ -1242,6 +1244,10 @@ mod age_tests {
         assert_eq!(a(""), None);
         assert_eq!(a("5"), None);
         assert_eq!(a("h5"), None);
+        // Too big for seconds in an `i64`: none, not an overflow.
+        assert_eq!(a("999999999999y"), None);
+        assert_eq!(a("9223372036854775807s1s"), None);
+        assert_eq!(a("9223372036854775807s"), Some(i64::MAX));
     }
 }
 

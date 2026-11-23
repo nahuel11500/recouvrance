@@ -19,6 +19,8 @@ impl AppView {
             filter: self.filter.read(cx).value().to_string(),
             namespaces: self.namespaces.clone(),
             kind: self.kind.clone(),
+            // Opened already: its page is in the history.
+            open: None,
         }
     }
 
@@ -47,6 +49,10 @@ impl AppView {
             self.restart_watch(cx);
         }
         self.apply_route(cx);
+        // A tab reopened on an overview builds it now that it is shown.
+        if let Some(page) = t.open {
+            self.open_overview(page, window, cx);
+        }
     }
 
     /// A new tab showing the current page (Ctrl+T), or `route` when given.
@@ -96,6 +102,7 @@ impl AppView {
             if ix < self.active_tab {
                 self.active_tab -= 1;
             }
+            self.session_changed(cx);
             cx.notify();
         }
     }
@@ -238,22 +245,7 @@ impl AppView {
     /// Record which page this window shows, and whether the window is hidden (see
     /// `wait_visible`). The list pauses at once when it leaves the screen.
     pub(super) fn mark_visible(&mut self, cx: &mut Context<Self>) {
-        let page = match self.route() {
-            Route::Detail(e) => Some(e.entity_id()),
-            Route::Workloads(e) => Some(e.entity_id()),
-            Route::Cluster(e) => Some(e.entity_id()),
-            Route::Problems(e) => Some(e.entity_id()),
-            Route::Timeline(e) => Some(e.entity_id()),
-            Route::Access(e) => Some(e.entity_id()),
-            Route::HelmInstall(e) => Some(e.entity_id()),
-            Route::Assistant(e) => Some(e.entity_id()),
-            Route::Helm(e) => Some(e.entity_id()),
-            Route::HelmRelease(e) => Some(e.entity_id()),
-            Route::Argo(e) => Some(e.entity_id()),
-            Route::Terminal(e) => Some(e.entity_id()),
-            Route::Apply(e) => Some(e.entity_id()),
-            Route::Resources(_) | Route::Contexts | Route::Settings | Route::Agents => None,
-        };
+        let page = self.route().page();
         self.list_pause.set(!self.list_on_screen());
         let (me, hidden) = (cx.entity_id(), self.window_hidden);
         let visible = cx.default_global::<VisiblePages>();
@@ -280,6 +272,7 @@ impl AppView {
             self.kind = Some(kind);
             self.restart_watch(cx);
         }
+        self.session_changed(cx);
         cx.notify();
     }
 }

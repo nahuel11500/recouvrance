@@ -40,6 +40,7 @@ mod pages;
 mod problem_badge;
 mod render;
 mod search_index;
+mod session;
 mod shortcuts;
 mod sidebar;
 mod table_page;
@@ -85,6 +86,26 @@ impl Route {
     fn is_resources(&self) -> bool {
         matches!(self, Self::Resources(_) | Self::Detail(_))
     }
+
+    /// The page shown, for the routes that are one.
+    fn page(&self) -> Option<EntityId> {
+        match self {
+            Self::Detail(e) => Some(e.entity_id()),
+            Self::Workloads(e) => Some(e.entity_id()),
+            Self::Cluster(e) => Some(e.entity_id()),
+            Self::Problems(e) => Some(e.entity_id()),
+            Self::Timeline(e) => Some(e.entity_id()),
+            Self::Access(e) => Some(e.entity_id()),
+            Self::HelmInstall(e) => Some(e.entity_id()),
+            Self::Assistant(e) => Some(e.entity_id()),
+            Self::Helm(e) => Some(e.entity_id()),
+            Self::HelmRelease(e) => Some(e.entity_id()),
+            Self::Argo(e) => Some(e.entity_id()),
+            Self::Terminal(e) => Some(e.entity_id()),
+            Self::Apply(e) => Some(e.entity_id()),
+            Self::Resources(_) | Self::Contexts | Self::Settings | Self::Agents => None,
+        }
+    }
 }
 
 /// A tab: its own back/forward history, filter and namespaces. The active tab's
@@ -97,6 +118,9 @@ struct TabState {
     namespaces: Vec<String>,
     /// The resource type its list shows.
     kind: Option<Kind>,
+    /// The overview it opens when first shown: a tab reopened on one (see `session`) builds
+    /// its page only then.
+    open: Option<overviews::Overview>,
 }
 
 /// The page each window shows, and the windows hidden as the desktop reports it (see
@@ -182,13 +206,19 @@ impl Global for SharedHub {}
 /// Open a main window: at startup, with Ctrl+Shift+N (⇧⌘N), and on macOS from the Dock or the
 /// menu bar when none is open.
 pub fn open_main_window(cx: &mut App) -> Option<Entity<AppView>> {
-    let bounds = Bounds::centered(None, size(px(1500.), px(920.)), cx);
+    use crate::settings::{WINDOW_MIN, WINDOW_SIZE};
+    // The first window opens where the app was left; the others at the default size, centered.
+    let bounds = if cx.has_global::<session::FirstWindowOpened>() {
+        WindowBounds::Windowed(Bounds::centered(None, size(px(WINDOW_SIZE.0), px(WINDOW_SIZE.1)), cx))
+    } else {
+        session::first_window_bounds(cx)
+    };
     // The app draws its own title bar (GNOME on Wayland has no server-side
     // decorations): dragging, window controls and resize borders.
     let options = WindowOptions {
-        window_bounds: Some(WindowBounds::Windowed(bounds)),
+        window_bounds: Some(bounds),
         window_decorations: Some(WindowDecorations::Client),
-        window_min_size: Some(size(px(900.), px(560.))),
+        window_min_size: Some(size(px(WINDOW_MIN.0), px(WINDOW_MIN.1))),
         app_id: Some("recouvrance".into()),
         ..TitleBar::window_options()
     };
@@ -395,8 +425,9 @@ pub struct AppView {
     skip_select: Option<usize>,
     /// The contexts and namespace each Workloads or Problems page was built for.
     page_scopes: HashMap<EntityId, (Vec<String>, Vec<String>)>,
-    /// Connecting to a context to open a namespace there (an Application's destination).
-    namespace_open: crate::latest::Latest,
+    /// Opening an object on a context that isn't connected, or whose kind is looked up there
+    /// (where an Argo CD Application deploys, and what it deploys there).
+    context_open: crate::latest::Latest,
     /// Selected namespaces; empty means all.
     namespaces: Vec<String>,
     filter: Entity<InputState>,
@@ -441,6 +472,15 @@ pub struct AppView {
     /// A connect is in flight (`_connect` stays set once it is done).
     connecting: bool,
     _connect: Option<Task<()>>,
+    /// The set of contexts picked (`settings::session_set`), whose session this window saves;
+    /// empty when none is saved (not connected yet, or contexts given by a developer hook).
+    session_key: Vec<String>,
+    /// This is the first window, and its first connect has not finished: that one reopens
+    /// where its set of contexts was left.
+    restore: bool,
+    /// The save waiting for changes to stop (see `session_changed`), and the window's.
+    _save_session: Option<Task<()>>,
+    _save_window: Option<Task<()>>,
     _kubeconfig_watch: Option<Task<()>>,
     _subs: Vec<Subscription>,
 }
@@ -490,6 +530,7 @@ impl AppView {
                         cx.notify();
                     });
                     this.follow_selection(cx);
+                    this.session_changed(cx);
                 }
                 // A filter that was used (Enter, or leaving the field) goes into the history.
                 InputEvent::PressEnter { .. } | InputEvent::Blur => {
@@ -581,7 +622,16 @@ impl AppView {
             cx.observe_window_visibility(window, |this, visibility, _, cx| {
                 this.set_window_hidden(!visibility.is_visible(), cx);
             }),
+            cx.observe_window_bounds(window, |this, window, cx| this.window_moved(window, cx)),
+            // Where the window is left is saved as it closes, and as the app quits.
+            cx.on_release(|this, cx| this.save_session_now(cx)),
+            cx.on_app_quit(|this, cx| {
+                this.save_session_now(cx);
+                async {}
+            }),
         ];
+        let first_window = !cx.has_global::<session::FirstWindowOpened>();
+        cx.set_global(session::FirstWindowOpened);
 
         // One agent hub and MCP server for the whole app, shared by its windows.
         if !cx.has_global::<SharedHub>() {
@@ -645,7 +695,7 @@ impl AppView {
             ns_open: false,
             skip_select: None,
             page_scopes: HashMap::new(),
-            namespace_open: Default::default(),
+            context_open: Default::default(),
             sidebar_hidden: false,
             assistant: None,
             assistant_docked: false,
@@ -676,6 +726,10 @@ impl AppView {
             metrics: None,
             connecting: false,
             _connect: None,
+            session_key: Vec::new(),
+            restore: first_window,
+            _save_session: None,
+            _save_window: None,
             _kubeconfig_watch: None,
             tabs: vec![TabState::default()],
             active_tab: 0,

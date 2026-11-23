@@ -27,7 +27,7 @@ pub(super) enum Overview {
 
 impl Overview {
     /// The overview a route shows, with its page.
-    fn of(route: &Route) -> Option<(Self, EntityId)> {
+    pub(super) fn of(route: &Route) -> Option<(Self, EntityId)> {
         Some(match route {
             Route::Cluster(p) => (Self::Cluster, p.entity_id()),
             Route::Workloads(p) => (Self::Workloads, p.entity_id()),
@@ -78,7 +78,7 @@ impl AppView {
 
     /// Show an overview: the one in history when it was built for what is picked now, else
     /// a new one. Not connected: the cluster switcher opens instead.
-    fn open_overview(&mut self, which: Overview, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn open_overview(&mut self, which: Overview, window: &mut Window, cx: &mut Context<Self>) {
         if self.clusters.is_empty() {
             self.ctx_open = true;
             cx.notify();

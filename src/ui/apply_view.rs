@@ -518,7 +518,7 @@ struct Doc {
 fn resolve_kind(kinds: &[Kind], doc: &serde_json::Value) -> Result<Kind, String> {
     let api_version = doc["apiVersion"].as_str().unwrap_or_default();
     let kind_name = doc["kind"].as_str().unwrap_or_default();
-    if let Some(k) = kinds.iter().find(|k| k.ar.api_version == api_version && k.ar.kind == kind_name) {
+    if let Some(k) = k8s::manifest_kind(kinds, api_version, kind_name) {
         return Ok(k.clone());
     }
     let hint = kinds
