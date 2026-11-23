@@ -91,7 +91,7 @@ fn own_card(ctx: &Ctx, app: &Summary, cx: &App) -> Div {
         .when_some(app.health_message.as_ref(), |d, m| {
             d.child(div().text_sm().text_color(theme.muted_foreground).child(selectable(m.clone())))
         })
-        .when(!app.history.is_empty(), |d| d.child(history(app, "argo-own-rollback", &roll_back, cx)))
+        .when(!app.history.is_empty(), |d| d.child(history(app, ("argo-own-rollback", 0), &roll_back, cx)))
 }
 
 fn app_card(ctx: &Ctx, ix: usize, found: &Found, full: bool, cx: &App) -> Div {
