@@ -23,10 +23,35 @@ approved (or cannot be), it shows only the allowed rows, and a rejection is stil
 it shows the rows of every Ask rule the list meets (`find_problems` asks to list pods: approving
 it shows other kinds' findings only where an Allow rule covers them). Rules changed while a call waits for approval
 apply to it: it is checked again once approved, and `apply_manifest` checks each object again before
-applying it (an object whose rule turned into *Ask me* needs its own approval). In **Agents**, click **Connect Claude Code**: it registers the server in your
-Claude Code (`claude mcp add --scope user recouvrance …`). There is one agent, "Claude", with its rules;
-*Several agents…* gives other tools their own token and rules if you ever need that. Tokens are
-stored hashed (the assistant's copy is in a 0600 file).
+applying it (an object whose rule turned into *Ask me* needs its own approval).
+
+### Connecting your tools
+
+In **Agents**, click **Connect Claude Code**: it registers the server in your Claude Code
+(`claude mcp add --scope user recouvrance …`). For another tool, pick it under *Connect* on the
+agent's page and copy its config, or its command where it has one:
+
+| Tool | Where it goes |
+|---|---|
+| Codex | `~/.codex/config.toml` |
+| Cursor | `~/.cursor/mcp.json` |
+| VS Code | `~/.copilot/mcp-config.json`, the file its Copilot agent reads (and Copilot CLI) |
+| Gemini CLI | `~/.gemini/settings.json`, or the `gemini mcp add` command |
+| Zed | its settings file (*zed: open settings file*) |
+
+Each holds the server's URL and the agent's token; *Copy token* copies the token alone, for any other
+MCP client. The page shows the token masked: copying puts it on the clipboard and nowhere else. A
+call can wait 2 minutes for your approval, then `wait_for` and `rollout_status` can wait 5 more, so
+the configs give a tool call 10 minutes where the tool has that setting: Codex and Zed stop one after
+60 s by default, Gemini CLI after 10 minutes; Cursor and VS Code have no such setting. Codex also asks
+before each tool that changes something, then the agent's rules apply as well:
+`default_tools_approval_mode = "approve"` in its entry leaves that to the rules.
+
+There is one agent, "Claude", with its rules, and all these tools can share it; *Several agents…*
+gives each tool its own token and rules if you ever need that. Tokens are stored hashed, but the main
+agent's is also kept for the assistant (in a 0600 file), so its configs can be copied at any time;
+another agent's can be copied only right after it is created or given a **New token** (which cuts off
+the tools that used the old one).
 
 ## Rules
 
@@ -35,16 +60,36 @@ Each agent has rules, like Kubernetes RBAC with an effect:
 | Field | Example |
 |---|---|
 | Effect | Allow · Ask me · Deny |
-| Verbs | get, list, logs, reveal (Secret values), exec, scale, restart, patch, apply, delete, drain, * |
+| Verbs | get, list, logs, reveal (Secret values), exec, scale, restart, patch, refresh, sync, suspend, apply, delete, drain, forward, * |
 | Resources | `pods`, `deployments`, `*.cert-manager.io`, `*` |
 | Namespaces | `team-a`, `team-*`, `*` (also covers cluster-scoped objects) |
-| Contexts | `eu-*`, `staging` |
+| Contexts | `eu-*`, `staging`, `@protected` (Ask and Deny rules) |
 | Names | `web-*`, `*` |
+
+`refresh`, `sync` and `suspend` are the GitOps actions of the `gitops` tool: `refresh` an Argo CD
+Application's refresh and hard refresh (git is read again, nothing is deployed), `sync` an Argo CD
+sync, terminate or rollback, or a Flux reconcile (what git holds is deployed), `suspend` a Flux suspend or resume. They are
+not `patch`, so a rule can let an agent refresh freely and ask before a sync, and a rule that allows
+syncing an Application doesn't allow patching its spec. Rules saved by a version before these
+verbs checked GitOps actions as `patch`: on the first start of this version, every rule that
+names `patch` gets the three verbs, once (and rules.yaml is written again), so what it allowed,
+asked or denied it still does. Take `refresh` out of an Ask rule afterwards to let refreshes
+through.
 
 Write mode and protected contexts are for you in the window: an agent's calls don't check them,
 only its rules (with the rate limit and the kill switch below). An Allow rule for a write lets the
 agent write while the window shows `read-only`, and on a protected context without its name typed or a wait;
 to keep agents off a context or from writing, give them *Ask me* or Deny rules for it (or no Allow).
+The context `@protected` stands for the contexts protected in Settings → Contexts, read again at
+each call, so a context protected later (or guessed as production when it appears) is covered
+without editing the rules. It works in Ask and Deny rules only (the Agents page doesn't save an
+Allow rule naming it), and only makes requests stricter:
+an Ask rule covers a request through it only when another rule covers that request too, so it
+never lets an agent ask for, or reach, a context no other rule names. When the protection can't be
+read, every context counts as protected. An Allow rule naming it allows nothing (rules.yaml refuses
+it). The preset *Ask for writes on protected contexts* allows writes and asks for them on
+`@protected`; *GitOps* reads, allows refreshing Argo CD Applications, asks before syncs,
+reconciles and suspends, and denies deleting Applications.
 
 **Deny wins, then Ask me, then Allow; anything no rule matches is denied.** A Deny limited to some
 names hides those objects from lists rather than refusing the whole list. Patching, applying or
@@ -65,22 +110,27 @@ request: for `scale`, the replicas now and after; for `patch_resource`, `set_ima
 `apply_manifest`, each field that changes with its value now and after, then the diff, from a
 server-side dry run of the same request (it changes nothing; a dry run the server refuses is said,
 and so is a field another manager owns, on which `apply_manifest` fails); for a `gitops` `sync`, the
-revision deployed and the one it moves to, auto-sync, what is out of sync, and what is no longer in
-git (left in place: the sync Recouvrance starts doesn't prune); for `delete_resource`, what goes with
+revision deployed and the one it moves to, auto-sync, what is out of sync (of the `resources`
+named, when some are), and what is no longer in git (left in place unless `prune`, then deleted);
+for a `rollback`, the deployment it goes to; for `delete_resource`, what goes with
 the object (a Deployment's ReplicaSets and pods, everything in a namespace, every object of a CRD's
 kind; a Job's pods stay). A Secret's values never show, only which changed. It takes 5 seconds at
 most: past that, or when it fails, the banner says the preview isn't available, and the request is
 asked all the same. Calls an Allow rule lets through are not worked out. The activity log keeps what
 the banner showed with the call.
 The *Always allow this* and *Allow for 1h* offers are left out where no rule can be that narrow:
-exec (a rule cannot pin the command), patches and GitOps actions (nor the patch), scale (nor the
+exec (a rule cannot pin the command), patches (nor the patch), scale (nor the
 replica count), `apply_manifest` (nor the content), requests other than lists with no object name
 (e.g. `check_certificates`: the rule would cover every name), requests across all namespaces (the
 rule would also cover namespaces no rule allows), and dry runs (the rule would allow the real write
-too).
+too), and Flux suspend and resume (one `suspend` verb covers both, so approving a resume would also
+allow suspending). A refresh or a sync gets one: its rule allows that action (`sync`, say) on that
+object only. An Argo CD sync with prune, a rollback or a terminate doesn't: their `sync` rule would
+allow any other sync, prune or rollback of the Application, beyond what the banner showed.
 
 Before any rule is checked, a call's context must be named by one of the agent's Allow or Ask rules
-and not covered by a Deny of everything (`*` verbs, resources, namespaces and names): other contexts
+(`@protected` names none) and not covered by a Deny of everything (`*` verbs, resources, namespaces
+and names, on that context or on `@protected` when it is protected): other contexts
 are never contacted, nor listed to the agent. Calls follow the kubeconfig as it is now: a context
 removed from it is refused, and one pointed at another cluster or user is connected again. The names
 a call passes are validated: a namespace or
@@ -124,9 +174,24 @@ change something, `debug_pod`, `port_forward` and `browse_files` only add (`dest
 `trigger_cronjob` doesn't say so: the Job it starts runs the CronJob's own code, which may delete
 or overwrite data.
 
-Every change supports `dry_run` except `exec_command`, `drain_node`, `gitops` and the port-forward
-tools; `my_permissions` names them, from the tools' definitions. What some of them need beyond the
-obvious verb:
+Every change supports `dry_run` except `exec_command`, `drain_node` and the port-forward tools
+(`gitops` takes it for an Argo CD `sync` or `rollback` only); `my_permissions` names them, from the
+tools' definitions. What some of them need beyond the obvious verb:
+
+- **Argo CD sync, terminate and rollback:** `gitops` on an Application, authorized as `sync` on
+  it. `sync` takes `resources` (sync those alone; hooks run only when the whole Application
+  syncs), `prune` (delete what is no longer in git; the approval banner and the reply name what
+  it deletes, and a sync that would delete more than the banner listed is refused) and `dry_run`
+  (Argo CD's own dry run: nothing is applied, and the reply waits up to 30 s for what Argo CD
+  would do). `terminate` stops the operation running, like `argocd app terminate-op`, also on an
+  Application being deleted (a stuck sync holds its deletion). `rollback` goes back to a
+  deployment of `status.history` (`deployment_id`, or the one before the newest, which the
+  approval banner names and which is the one sent), like `argocd app rollback`: the deployment's
+  revision and source applied again, without hooks and without prune. As argocd-server does,
+  nothing starts while another operation runs or the Application is being deleted, and a
+  rollback is refused while auto-sync is on. The Application is read right before the write,
+  which carries the version read: a change meanwhile refuses it (a terminate is tried again, as
+  argocd-server does).
 
 - **Custom and external metrics:** `get_metrics` reads `custom.metrics.k8s.io` and
   `external.metrics.k8s.io`, what an HPA or KEDA gets from prometheus-adapter, like
@@ -140,7 +205,7 @@ obvious verb:
   newest 20) in time order, each line prefixed with its pod. It needs `get` on the workload; pods
   whose logs the rules don't allow are left out and counted.
 - **Argo CD diagnosis:** `gitops` with `action: diagnose` on an Application changes nothing and
-  needs `get` on it (not `patch`; the activity log doesn't count it as a change). It returns the
+  needs `get` on it (not `refresh` or `sync`; the activity log doesn't count it as a change). It returns the
   diagnosis of the Application's page: a deletion held by a finalizer, a sync running for long,
   a failed sync (each object and why), a sync loop with the `ignoreDifferences` that would stop
   it, what is out of sync, and the fields that differ between what was last applied and the
@@ -204,9 +269,16 @@ obvious verb:
 - **Helm:** the Helm tools read the Secrets Helm keeps releases in, so the rules on `secrets`
   decide: `list` for releases and history, `get` on `sh.helm.release.v1.<name>.v<revision>` for
   values, whose secret-looking keys are masked unless `reveal` is allowed.
+- **Apply:** `apply_manifest` applies a manifest's CRDs first, then its other objects in order. An
+  object of a type a CRD of the same manifest defines is authorized as that CRD says, and applied
+  once the API server serves the type (it waits up to 20 seconds); a dry run can't check it, as
+  the CRD isn't created, and says so. A type whose CRD an earlier call applied, or whose API group
+  version the app hasn't seen, is looked up in that group version at once; a new type in a group
+  version already known waits for discovery to run again, at most once a minute.
 - **Diff:** `diff_manifest` shows what `apply_manifest` would change, object by object, from a
   server-side dry run. It needs `get` on each object, changes nothing, masks Secret values unless
-  `reveal` is allowed, and says when the apply would hit a field-manager conflict.
+  `reveal` is allowed, and says when the apply would hit a field-manager conflict. An object whose
+  CRD is only in the manifest is shown as created, not checked by the server.
 - **About the cluster:** `explain_resource` (field docs, CRDs included) and `cluster_version` read
   no objects; `can_i` asks the API server what the kubeconfig user may do (the agent's own rules are
   `my_permissions`).
@@ -228,7 +300,12 @@ version the MCP client gives (`claude-code 2.1.3`); the in-app assistant shows a
 a label the client chooses, not a check. A call that returned Secret values unmasked, which a `reveal`
 rule allows, says which (`Secret shop/db`, `Helm values shop/web revision 3`). At 10 MiB the log moves to
 `audit.jsonl.1`, replacing the older one. If the log cannot be written, the Activity page says so. A
-kill switch cuts all agent access at once. A request nobody answers within 2 minutes is refused. An
+kill switch cuts all agent access at once. A request nobody answers within 2 minutes is refused: its
+banner counts down to that. So that it is seen with the window behind others or minimized, every
+window's title says how many requests wait, each window asks for attention (it flashes in the
+taskbar on X11 and bounces the Dock icon on macOS, not on Wayland) and one desktop
+notification is sent (with `notify-send` on Linux, in Notification Center on macOS, where it comes
+from Script Editor and needs that app's notifications allowed). An
 approval also ends when the agent stops waiting for it. When it cancels the call or hangs up (**Stop**
 in the assistant, a `claude -p` killed), the banner goes at once; when its session ends, within
 seconds. A click on the banner after that changes nothing. As with the kill switch, a call whose agent
@@ -246,7 +323,8 @@ calls, calls that showed Secret values, context, agent or text. The search box a
 term must match. It shows the latest 300 calls; "Show older"
 goes further back, and then reads the log on disk. A call counts as a write when its tool may change
 something (the changes above, and `browse_files` with `debug: true`), but not a dry run nor `gitops`'s
-`diagnose`; each group counts its writes.
+`diagnose`; each group counts its writes. A `gitops` dry run counts: it writes the Application's
+operation, which blocks any other sync until Argo CD is done with it.
 
 > These rules govern what agents do *through Recouvrance*. An agent with shell access can still run
 > `kubectl` with your kubeconfig, so block `kubectl`/`helm` in its own permissions if Recouvrance

@@ -102,7 +102,7 @@ impl Res {
         self.group.is_empty() && self.kind == "Secret"
     }
 
-    fn same(&self, other: &Self) -> bool {
+    pub(crate) fn same(&self, other: &Self) -> bool {
         (&self.group, &self.kind, &self.namespace, &self.name)
             == (&other.group, &other.kind, &other.namespace, &other.name)
     }
@@ -532,7 +532,8 @@ fn stuck(app: &Value, now: Timestamp) -> Option<Finding> {
         objects,
         more,
         hint: "A hook Job that never ends, or a resource that never becomes healthy, keeps the sync running: fix it, \
-               or terminate the sync in Argo CD (`argocd app terminate-op`)."
+               or terminate the sync (Terminate on the Application's page, `gitops` `terminate`, or \
+               `argocd app terminate-op`)."
             .into(),
     })
 }

@@ -34,14 +34,23 @@ pub struct Config {
     /// Global kill switch: when false every agent call is refused.
     pub enabled: bool,
     pub agents: Vec<Agent>,
-    /// 0 (missing) when saved before 0.3.0, which created agents without a section in
-    /// rules.yaml: see [`Hub::apply_rules_file`](super::Hub::apply_rules_file).
+    /// Which rules the saved ones are, upgraded once on load (see
+    /// [`Hub::apply_rules_file`](super::Hub::apply_rules_file)): 0 (missing) when saved
+    /// before 0.3.0, which created agents without a section in rules.yaml; 1 before the
+    /// GitOps verbs.
     #[serde(default)]
     pub version: u32,
 }
 
-/// agents.json's current `version`: rules.yaml names every agent.
-pub(super) const CONFIG_VERSION: u32 = 1;
+/// agents.json's `version` from which rules.yaml names every agent.
+pub(super) const SECTIONS_VERSION: u32 = 1;
+
+/// agents.json's `version` from which rules check GitOps actions with their own verbs
+/// (`refresh`, `sync`, `suspend`); before, they were `patch`.
+pub(super) const GITOPS_VERBS_VERSION: u32 = 2;
+
+/// agents.json's current `version`.
+pub(super) const CONFIG_VERSION: u32 = GITOPS_VERBS_VERSION;
 
 impl Default for Config {
     fn default() -> Self {

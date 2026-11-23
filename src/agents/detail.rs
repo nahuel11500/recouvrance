@@ -1,56 +1,137 @@
 //! An agent's page: token, connection, rules, limits.
 
 use gpui_kit::assets::IconName as Lucide;
-use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::switch::Switch;
-use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, h_flex, v_flex};
+use gpui_kit::component::{ActiveTheme as _, Icon, Selectable as _, Sizable as _, h_flex, v_flex};
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use super::AgentsView;
+use super::clients::{self, Client};
 use crate::mcp::{Agent, Policy, Rule};
 
 impl AgentsView {
-    pub(super) fn render_token(&self, agent: &Agent, cx: &mut Context<Self>) -> Option<impl IntoElement> {
-        let (_, token) = self.fresh_token.as_ref().filter(|(id, _)| *id == agent.id)?;
+    /// The token a copied config carries: the one just made, else the main agent's saved
+    /// one. Other agents' tokens are kept only hashed.
+    fn connect_token(&mut self, agent_id: &str) -> Option<String> {
+        if let Some((id, token)) = &self.fresh_token
+            && id == agent_id
+        {
+            return Some(token.clone());
+        }
+        let token = crate::assistant::main_token(&self.hub, agent_id);
+        if token.is_none() {
+            self.error = Some(
+                "Recouvrance has no copy of this agent's token: New token makes one (the old one stops working)."
+                    .into(),
+            );
+        }
+        token
+    }
+
+    /// Put a client's config or command (`Some((client, index))`), or the token alone, on
+    /// the clipboard. That is the only place the token goes: the page shows it masked.
+    fn copy_connect(&mut self, agent_id: &str, snippet: Option<(Client, usize)>, cx: &mut Context<Self>) {
+        let Some(token) = self.connect_token(agent_id) else {
+            cx.notify();
+            return;
+        };
+        let text = if let Some((client, ix)) = snippet {
+            let url = clients::server_url(self.hub.port());
+            let Some(snippet) = client.snippets(&url, &token).into_iter().nth(ix) else { return };
+            snippet.text
+        } else {
+            token
+        };
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
+    }
+
+    /// How to connect a client as this agent: pick it, then copy its config or command.
+    fn render_connect(&self, agent: &Agent, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
-        let port = self.hub.port();
-        let cmd = format!(
-            "claude mcp add --transport http recouvrance http://127.0.0.1:{port}/mcp --header \"Authorization: Bearer {token}\""
+        let (blue, secondary, muted) = (theme.blue, theme.secondary, theme.muted_foreground);
+        let mono = theme.mono_font_family.clone();
+        let fresh = self.fresh_token.as_ref().is_some_and(|(id, _)| *id == agent.id);
+        let main = crate::assistant::is_main_agent(&self.hub, &agent.id);
+        if !fresh && !main {
+            return div()
+                .text_sm()
+                .text_color(muted)
+                .child("Recouvrance keeps only a hash of this agent's token: New token makes one to copy into your tool (the old one stops working).")
+                .into_any_element();
+        }
+        let picked = self.connect_client;
+        let picker = h_flex().gap_1().flex_wrap().child(div().mr_1().text_sm().child("Connect a tool:")).children(
+            Client::ALL.into_iter().enumerate().map(|(i, client)| {
+                let on = picked == Some(client);
+                Button::new(("connect-client", i))
+                    .xsmall()
+                    .label(client.label())
+                    .selected(on)
+                    .when(on, ButtonVariants::primary)
+                    .when(!on, ButtonVariants::ghost)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.connect_client = if on { None } else { Some(client) };
+                        cx.notify();
+                    }))
+            }),
         );
-        let copy = cmd.clone();
-        Some(
+        let url = clients::server_url(self.hub.port());
+        let snippets: Vec<_> = picked
+            .into_iter()
+            .flat_map(|client| client.snippets(&url, clients::MASKED_TOKEN).into_iter().map(move |s| (client, s)))
+            .collect();
+        let last = snippets.len().saturating_sub(1);
+        let blocks = snippets.into_iter().enumerate().map(|(ix, (client, snippet))| {
+            let id = agent.id.clone();
             v_flex()
-                .gap_2()
-                .p_3()
-                .rounded_md()
-                .border_1()
-                .border_color(theme.blue)
+                .gap_1()
+                .child(div().text_xs().text_color(muted).child(snippet.hint))
+                .child(div().p_2().rounded_md().bg(secondary).font_family(mono.clone()).text_xs().child(snippet.text))
                 .child(
-                    div()
-                        .text_sm()
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .child("Connect your agent: run this once. The token is shown only now."),
+                    h_flex()
+                        .gap_2()
+                        .child(
+                            Button::new(("connect-copy", ix))
+                                .small()
+                                .icon(Lucide::Copy)
+                                .label(if snippet.command { "Copy command" } else { "Copy config" })
+                                .on_click(
+                                    cx.listener(move |this, _, _, cx| this.copy_connect(&id, Some((client, ix)), cx)),
+                                ),
+                        )
+                        .when(ix == last, |d| {
+                            let id = agent.id.clone();
+                            d.child(
+                                Button::new("connect-copy-token")
+                                    .small()
+                                    .ghost()
+                                    .label("Copy token")
+                                    .tooltip("The token alone, for another MCP client")
+                                    .on_click(cx.listener(move |this, _, _, cx| this.copy_connect(&id, None, cx))),
+                            )
+                        }),
                 )
-                .child(
-                    div()
-                        .p_2()
-                        .rounded_md()
-                        .bg(theme.secondary)
-                        .font_family(theme.mono_font_family.clone())
-                        .text_xs()
-                        .child(cmd),
-                )
-                .child(
-                    h_flex().child(
-                        Button::new("copy")
-                            .small()
-                            .icon(Lucide::Copy)
-                            .label("Copy command")
-                            .on_click(move |_, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(copy.clone()))),
-                    ),
-                ),
-        )
+        });
+        let notice = match (fresh, main) {
+            (true, false) => Some("Copy the new token into your tool now: it can't be copied later."),
+            (true, true) => Some("New token: reconnect the tools that used the old one."),
+            _ => None,
+        };
+        v_flex()
+            .gap_2()
+            .when_some(notice, |d, notice| {
+                d.p_3()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(blue)
+                    .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).child(notice))
+            })
+            .child(picker)
+            .children(blocks)
+            .into_any_element()
     }
 
     pub(super) fn render_detail(&self, agent: &Agent, cx: &mut Context<Self>) -> impl IntoElement {
@@ -162,6 +243,7 @@ impl AgentsView {
                                         let saved = crate::assistant::token_rotated(&this.hub, &id, &token);
                                         this.report(saved.map_err(anyhow::Error::from));
                                         this.fresh_token = Some((id.clone(), token));
+                                        this.connect_client = this.connect_client.or(Some(Client::ClaudeCode));
                                     }
                                     cx.notify();
                                 }
@@ -188,7 +270,8 @@ impl AgentsView {
                             })),
                     ),
             )
-            .children(self.render_token(agent, cx))
+            .child(section("Connect"))
+            .child(self.render_connect(agent, cx))
             .child(section("Access rules"))
             .child(div().text_sm().text_color(muted).child(
                 "Each request is checked against every rule: Deny wins, then Ask me, then Allow. Anything no rule matches is denied. \

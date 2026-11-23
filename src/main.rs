@@ -39,6 +39,7 @@ mod taints;
 mod templates;
 mod timeline;
 mod ui;
+mod updates;
 mod upgrade;
 mod yaml;
 

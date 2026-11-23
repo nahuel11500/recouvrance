@@ -51,39 +51,52 @@ pub fn save_api_key(key: &str) -> std::io::Result<()> {
 /// The main agent (created read-only, never Secrets, the first time) and its token.
 /// It is the agent named "Claude" only: another agent's token is never rotated for it.
 pub fn main_agent(hub: &Hub) -> Result<(String, String)> {
-    let existing = main_agent_id(hub);
-    let saved =
-        read_secret("main-agent").and_then(|s| s.split_once(' ').map(|(id, t)| (id.to_string(), t.to_string())));
-    match (existing, saved) {
-        // The saved token is used only while it is still this agent's ("New token" replaces it).
-        (Some(id), Some((sid, token))) if id == sid && hub.agent_by_token(&token).is_some_and(|a| a.id == id) => {
-            Ok((id, token))
-        }
-        (Some(id), _) => {
-            // The token is only stored hashed: issue a new one (Connect Claude Code updates it there).
-            let token = hub.rotate_token(&id)?;
-            save_main_token(&id, &token)?;
-            Ok((id, token))
-        }
-        (None, _) => {
-            let (agent, token) = hub.create_agent(AGENT_NAME.into())?;
-            hub.update_agent(&agent.id, |a| {
-                a.policy.rules[0].contexts = vec!["*".into()];
-                a.policy.rules[0].note = "Read everything (allow more below)".into();
-            })?;
-            save_main_token(&agent.id, &token)?;
-            Ok((agent.id, token))
-        }
+    let Some(id) = main_agent_id(hub) else {
+        let (agent, token) = hub.create_agent(AGENT_NAME.into())?;
+        hub.update_agent(&agent.id, |a| {
+            a.policy.rules[0].contexts = vec!["*".into()];
+            a.policy.rules[0].note = "Read everything (allow more below)".into();
+        })?;
+        save_main_token(&agent.id, &token)?;
+        return Ok((agent.id, token));
+    };
+    if let Some(token) = saved_token(hub, &id) {
+        return Ok((id, token));
     }
+    // The token is only stored hashed: issue a new one (Connect Claude Code updates it there).
+    let token = hub.rotate_token(&id)?;
+    save_main_token(&id, &token)?;
+    Ok((id, token))
 }
 
 fn main_agent_id(hub: &Hub) -> Option<String> {
     hub.config().agents.iter().find(|a| a.name == AGENT_NAME).map(|a| a.id.clone())
 }
 
+/// Whether `id` is the main agent: the one whose token Recouvrance keeps.
+pub fn is_main_agent(hub: &Hub, id: &str) -> bool {
+    main_agent_id(hub).as_deref() == Some(id)
+}
+
+/// The main agent's token, for a client's config: the saved one while it still works,
+/// never a new one, which would cut off the clients connected with the old.
+pub fn main_token(hub: &Hub, id: &str) -> Option<String> {
+    if !is_main_agent(hub, id) {
+        return None;
+    }
+    saved_token(hub, id)
+}
+
+/// The saved token, while it is still this agent's ("New token" replaces it).
+fn saved_token(hub: &Hub, id: &str) -> Option<String> {
+    let saved = read_secret("main-agent")?;
+    let (saved_id, token) = saved.split_once(' ')?;
+    (saved_id == id && hub.agent_by_token(token).is_some_and(|a| a.id == id)).then(|| token.to_string())
+}
+
 /// After "New token" on the Agents page: the main agent's new token is the one the assistant uses.
 pub fn token_rotated(hub: &Hub, id: &str, token: &str) -> std::io::Result<()> {
-    if main_agent_id(hub).as_deref() != Some(id) {
+    if !is_main_agent(hub, id) {
         return Ok(());
     }
     save_main_token(id, token)

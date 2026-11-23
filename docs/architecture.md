@@ -37,7 +37,7 @@ Recouvrance is one Rust binary: a [gpui](https://github.com/zed-industries/zed) 
 | `src/mcp/` | The agent hub (agents, rules, approvals, audit) and the MCP server with its tools and prompts |
 | `src/agents/` | The Agents page |
 | `src/ui/` | Other pages and widgets: settings, Helm, apply, cluster and workloads overviews, terminal, pickers |
-| `src/diagnose.rs`, `rbac.rs`, `schema.rs`, `prom.rs`, `problems.rs`, `certs.rs` | Logic without UI, unit-tested |
+| `src/diagnose.rs`, `rbac.rs`, `schema.rs`, `prom.rs`, `problems.rs`, `certs.rs`, `updates.rs` | Logic without UI, unit-tested |
 | `src/dev/` | Developer tools (feature `dev`): the off-screen snapshot harness and live smoke checks |
 
 ## How lists stay fast
@@ -54,10 +54,13 @@ are **watched**. A list of a namespaced kind in every namespace comes in up to t
    in, with managedFields and the rest skipped (`list_whole`). It replaces the rows of step 2.
 
 Rows keep only the metadata they need; full objects are fetched only when a custom column needs
-them. Responses are gzip-compressed. The usage bars read the pods' requests and limits from a
-separate lean list of the pods, read again every minute (or ten times as long as a read takes, when
-that is longer). On a cluster with about 20,800 pods, the first rows show after 0.7 s and all of
-them after 1.4 s ([measured](COMPARISON.md#measured)).
+them. Responses are gzip-compressed. The usage bars and the cluster overview take the pods'
+requests and limits from one list of the pods, then follow them with a watch
+(`src/k8s/pod_requests.rs`). The API server can't send less than whole pods (about 300 MB of JSON
+for 20,800 pods), so each pod is kept only as the sums `podspec` makes of it, and pods that come,
+go or are resized in place change them without another list. A page off screen for 5 minutes
+stops its watch and lists again once back. On a cluster with about 20,800 pods, the first rows
+show after 0.7 s and all of them after 1.4 s ([measured](COMPARISON.md#measured)).
 
 The Problems scan reads the big kinds from their cells too (`list_light`). What its checks need
 of whole objects (Services, Ingresses and HTTP routes, the pods a Service selects, the workloads of
@@ -73,7 +76,8 @@ keeping only the fields the checks use; of the workloads, only those scaled to 0
 - Actions your **RBAC** forbids are disabled (`SelfSubjectAccessReview`).
 - **Agents** go through the hub: rules (deny, ask, allow), approvals (which show what a write will
   change, worked out with a server dry run), a rate limit, an audit log and a kill switch. Write mode
-  and protected contexts don't apply to them: only their rules do.
+  and protected contexts don't apply to them: only their rules do (an Ask or Deny rule can name
+  `@protected`).
 - **Login commands keep their secrets.** kube's error for a failed exec plugin holds its whole
   command line and its output; each client replaces it, when it is built and on every request
   (a token refresh runs the plugin again), by the program's file name, taken from the kubeconfig,
