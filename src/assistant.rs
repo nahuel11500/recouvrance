@@ -353,7 +353,7 @@ impl Mcp {
         let url = format!("http://127.0.0.1:{port}/mcp");
         let auth = format!("Bearer {token}");
         let headers = [("authorization", auth.as_str()), ("accept", "application/json, text/event-stream")];
-        let init = json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-03-26", "capabilities": {}, "clientInfo": {"name": "recouvrance-assistant", "version": "1"}}});
+        let init = json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-03-26", "capabilities": {}, "clientInfo": {"name": "recouvrance-assistant", "version": env!("CARGO_PKG_VERSION")}}});
         let (h, _) = post(&url, &headers, &init).await.context("Recouvrance's MCP server (is agent access on?)")?;
         let session = h.get("mcp-session-id").and_then(|v| v.to_str().ok()).unwrap_or_default().to_string();
         let mcp = Self { url, token, session };
@@ -522,6 +522,15 @@ fn code_dirs() -> Vec<PathBuf> {
     crate::settings::get().assistant_repos.iter().map(|r| crate::paths::expand(r)).filter(|p| p.is_dir()).collect()
 }
 
+/// The MCP config `claude -p` gets: Recouvrance's server, with the agent's token and a label
+/// that tells the assistant's calls from those of your own Claude Code in the activity log.
+fn mcp_config(port: u16, token: &str) -> Value {
+    let mut headers = serde_json::Map::new();
+    headers.insert("Authorization".into(), format!("Bearer {token}").into());
+    headers.insert(crate::mcp::server::CLIENT_HEADER.into(), "assistant".into());
+    json!({"mcpServers": {"recouvrance": {"type": "http", "url": format!("http://127.0.0.1:{port}/mcp"), "headers": headers}}})
+}
+
 /// The `claude -p` arguments. The question comes last, after `--`, so one starting with `-`
 /// is never read as an option.
 fn claude_args(
@@ -582,8 +591,11 @@ async fn ask_claude_code(
             Some(w) => w.clone(),
             None => Arc::new(PrivateDir::create().context("creating the assistant's private directory")?),
         };
-        let cfg = json!({"mcpServers": {"recouvrance": {"type": "http", "url": format!("http://127.0.0.1:{port}/mcp"), "headers": {"Authorization": format!("Bearer {token}")}}}});
-        let cfg_file = TempFile::create(work.path().join(format!("mcp-{}.json", uuid::Uuid::new_v4().simple())), cfg.to_string().as_bytes())?;
+        let cfg = mcp_config(port, &token);
+        let cfg_file = TempFile::create(
+            work.path().join(format!("mcp-{}.json", uuid::Uuid::new_v4().simple())),
+            cfg.to_string().as_bytes(),
+        )?;
         let mut cmd = tokio::process::Command::new(&bin);
         cmd.current_dir(work.path())
             .args(claude_args(&question, cfg_file.path(), &scope, &model, conv.session.as_deref(), &code_dirs()))
@@ -620,9 +632,16 @@ async fn ask_claude_code(
                         match b["type"].as_str() {
                             Some("text") => on_step(Step::Text(b["text"].as_str().unwrap_or_default().to_string())),
                             Some("tool_use") => {
-                                let name = b["name"].as_str().unwrap_or_default().trim_start_matches("mcp__recouvrance__").to_string();
+                                let name = b["name"]
+                                    .as_str()
+                                    .unwrap_or_default()
+                                    .trim_start_matches("mcp__recouvrance__")
+                                    .to_string();
                                 on_step(Step::Running { name: name.clone(), args: b["input"].to_string() });
-                                pending.insert(b["id"].as_str().unwrap_or_default().to_string(), (name, b["input"].to_string()));
+                                pending.insert(
+                                    b["id"].as_str().unwrap_or_default().to_string(),
+                                    (name, b["input"].to_string()),
+                                );
                             }
                             _ => {}
                         }
@@ -635,7 +654,9 @@ async fn ask_claude_code(
                         }
                         let result = match &b["content"] {
                             Value::String(s) => s.clone(),
-                            Value::Array(parts) => parts.iter().filter_map(|p| p["text"].as_str()).collect::<Vec<_>>().join("\n"),
+                            Value::Array(parts) => {
+                                parts.iter().filter_map(|p| p["text"].as_str()).collect::<Vec<_>>().join("\n")
+                            }
                             other => other.to_string(),
                         };
                         if let Some((name, args)) = pending.remove(b["tool_use_id"].as_str().unwrap_or_default()) {
@@ -643,7 +664,9 @@ async fn ask_claude_code(
                         }
                     }
                 }
-                Some("result") if ev["is_error"] == true => error = Some(ev["result"].as_str().unwrap_or("Claude Code failed").to_string()),
+                Some("result") if ev["is_error"] == true => {
+                    error = Some(ev["result"].as_str().unwrap_or("Claude Code failed").to_string());
+                }
                 _ => {}
             }
         }
@@ -850,6 +873,17 @@ fn reply_content(resp: &Value) -> Vec<Value> {
 mod tests {
     use serde_json::{Value, json};
     use std::path::PathBuf;
+
+    /// Claude Code, run as the assistant, sends the label the activity log names it by, with
+    /// the agent's token.
+    #[test]
+    fn the_assistant_s_claude_code_labels_its_calls() {
+        let cfg = super::mcp_config(47070, "tok");
+        let server = &cfg["mcpServers"]["recouvrance"];
+        assert_eq!(server["url"], "http://127.0.0.1:47070/mcp");
+        assert_eq!(server["headers"]["Authorization"], "Bearer tok");
+        assert_eq!(server["headers"][crate::mcp::server::CLIENT_HEADER], "assistant");
+    }
 
     #[test]
     fn cut_off_tool_calls_are_dropped() {

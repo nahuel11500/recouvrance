@@ -837,7 +837,8 @@ fn an_agent_cordons_a_node_with_its_drain_rule() {
 }
 
 /// Helm releases are read from their Secrets: denied by a Deny on secrets, listed with the
-/// chart otherwise, and their secret-looking values masked unless the agent may reveal.
+/// chart otherwise, and their secret-looking values masked unless the agent may reveal. The
+/// activity log names the client of each call, and the calls that showed Secret values.
 #[test]
 #[ignore = "needs a kind cluster: RECOUVRANCE_E2E_CONTEXT"]
 fn an_agent_reads_helm_releases_by_its_secret_rules() {
@@ -868,10 +869,27 @@ fn an_agent_reads_helm_releases_by_its_secret_rules() {
             let values = json!({"context": ctx, "namespace": NS, "name": release});
             let out = mcp.call("helm_get_values", values.clone()).await;
             assert!(out.contains("db.local") && !out.contains("hunter2"), "{out}");
+            // The activity log names the client, and says when values were shown: not yet.
+            let last = |tool: &'static str| {
+                let logged = hub.recent_audit(1, |e| e.agent_id == agent.id && e.tool == tool);
+                logged.into_iter().next().context("the call is logged")
+            };
+            let masked = last("helm_get_values")?;
+            assert_eq!(masked.client.as_deref(), Some(concat!("recouvrance-assistant ", env!("CARGO_PKG_VERSION"))));
+            assert!(masked.revealed.is_empty(), "{:?}", masked.revealed);
+            let get = json!({"context": ctx, "kind": "secrets", "namespace": NS, "name": name});
+            let out = mcp.call("get_resource", get.clone()).await;
+            assert!(out.contains(name), "{out}");
+            assert!(last("get_resource")?.revealed.is_empty());
+
             let reveal = rules_file::parse_rule(Mode::Allow, "reveal secrets -n default")?;
             hub.update_agent(&agent.id, |a| a.policy.rules.push(reveal))?;
             let out = mcp.call("helm_get_values", values).await;
             assert!(out.contains("hunter2"), "{out}");
+            assert_eq!(last("helm_get_values")?.revealed, [format!("Helm values {NS}/{release} revision 1")]);
+            let out = mcp.call("get_resource", get).await;
+            assert!(out.contains(name), "{out}");
+            assert_eq!(last("get_resource")?.revealed, [format!("Secret {NS}/{name}")]);
             Ok(())
         };
         let result: Result<()> = checked.await;
