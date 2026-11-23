@@ -300,7 +300,8 @@ pub struct WarningReason {
 /// time, so every Warning is read, `EVENTS_PAGE` at a time like the Timeline's: kube-apiserver
 /// keeps no cache of events by default, so each page is a read of etcd, smaller than the whole
 /// list. Each page is added up as it streams in: only the reasons are ever held, however many
-/// events the cluster keeps.
+/// events the cluster keeps. A `continue` token that expired midway (410 Gone, etcd compacted
+/// meanwhile) starts the read over once, from a fresh list.
 pub async fn warning_reasons(
     client: Client,
     namespace: Option<String>,
@@ -308,7 +309,12 @@ pub async fn warning_reasons(
 ) -> Result<Vec<WarningReason>> {
     let url = Event::url_path(&(), namespace.as_deref());
     let lp = ListParams::default().fields("type=Warning").limit(EVENTS_PAGE);
-    let tally = lists::fold_lean_pages(client, url, lp, ByReason::since(since), ByReason::add).await?;
+    let read =
+        || lists::fold_lean_pages(client.clone(), url.clone(), lp.clone(), ByReason::since(since), ByReason::add);
+    let tally = match read().await {
+        Err(e) if api_status(&e) == Some(410) => read().await?,
+        tally => tally?,
+    };
     Ok(tally.sorted())
 }
 
@@ -1018,11 +1024,13 @@ mod tests {
         per_namespace: usize,
         page: usize,
         asked: Arc<Mutex<Vec<String>>>,
+        /// How many of the next requests with a `continue` token find it expired (410 Gone).
+        expire: Arc<Mutex<usize>>,
     }
 
     impl Events {
         fn new(per_namespace: usize, page: usize) -> Self {
-            Self { per_namespace, page, asked: Arc::default() }
+            Self { per_namespace, page, asked: Arc::default(), expire: Arc::default() }
         }
 
         fn asked(&self) -> Vec<String> {
@@ -1048,6 +1056,17 @@ mod tests {
             let uid = selector.strip_prefix("involvedObject.uid%3D");
             let limit = param("limit").and_then(|l| l.parse().ok()).unwrap_or(usize::MAX).min(self.page);
             let from: usize = param("continue").and_then(|c| c.parse().ok()).unwrap_or(0);
+            if param("continue").is_some() {
+                let mut expire = self.expire.lock().unwrap();
+                if *expire > 0 {
+                    *expire -= 1;
+                    let gone = serde_json::json!({"kind": "Status", "apiVersion": "v1", "status": "Failure",
+                        "message": "The provided continue parameter is too old", "reason": "Expired", "code": 410});
+                    let response =
+                        http::Response::builder().status(410).body(gone.to_string().into_bytes().into()).unwrap();
+                    return std::future::ready(Ok(response));
+                }
+            }
             let one = path.strip_prefix("/api/v1/namespaces/").and_then(|p| p.strip_suffix("/events"));
             // In key order: by namespace, then by name.
             let stored: Vec<(String, usize, bool)> = ('a'..='z')
@@ -1192,6 +1211,24 @@ mod tests {
         let recent = super::warning_reasons(client, Some("z".into()), since).await.unwrap();
         assert_eq!(recent.iter().map(|w| w.count).collect::<Vec<_>>(), [100]);
         assert!(cluster.asked().last().unwrap().starts_with("/api/v1/namespaces/z/events?"));
+    }
+
+    /// A `continue` token that expired midway starts the read over once, from a fresh list:
+    /// the Warnings are counted once, not the first pages twice. Expired again, it fails.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn warnings_read_again_once_when_a_page_expired() {
+        let cluster = Events::new(200, usize::MAX);
+        *cluster.expire.lock().unwrap() = 1;
+        let client = kube::Client::new(cluster.clone(), "default");
+        let all = super::warning_reasons(client.clone(), None, first_event()).await.unwrap();
+        assert_eq!(all.iter().map(|w| w.count).collect::<Vec<_>>(), [26 * 200]);
+        // The first page, its expired next one, then both pages again.
+        let asked = cluster.asked();
+        assert_eq!(asked.len(), 4, "{asked:?}");
+        assert!(!asked[2].contains("continue="), "{asked:?}");
+        *cluster.expire.lock().unwrap() = 2;
+        let failed = super::warning_reasons(client, None, first_event()).await;
+        assert_eq!(failed.err().and_then(|e| crate::k8s::api_status(&e)), Some(410));
     }
 
     proptest! {
