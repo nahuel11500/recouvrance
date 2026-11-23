@@ -220,14 +220,16 @@
   Argo CD panel) reads the Application first and lists its resources out of sync, all ticked:
   untick some to sync only the others (hooks run only when all are synced; past 200 the whole
   Application syncs). *Prune*, off by default, names exactly what it deletes (out of sync and no
-  longer in git, of the resources ticked); *Dry run* applies nothing, and what Argo CD would do is
-  shown when it ends (waited for up to 30 s). *Terminate* stops the operation running, as
-  `argocd app terminate-op` does. *Roll back…* on a past deployment (the Application's page, the
+  longer in git, of the resources ticked), and a sync that would now delete more is refused;
+  *Dry run* applies nothing, and what Argo CD would do is shown when it ends (waited for up to
+  30 s). *Terminate* stops the operation running, as `argocd app terminate-op` does, also when it
+  holds the Application's deletion. *Roll back…* on a past deployment (the Application's page, the
   Argo CD panel, the row menu for the previous one) applies that deployment's revision and
-  sources again, without hooks or prune, as `argocd app rollback` does; with auto-sync on it is
-  disabled, since Argo CD refuses it (revert in git instead). Like argocd-server, nothing starts
-  while another operation runs, and the write carries the version of the Application just read,
-  so a change meanwhile refuses it. Each dialog shows the `kubectl patch` it sends; write mode,
+  sources again, without hooks or prune, as `argocd app rollback` does: the deployment the dialog
+  names is the one sent, even if another lands meanwhile. With auto-sync on it is disabled, since
+  Argo CD refuses it (revert in git instead). Like argocd-server, nothing starts while another
+  operation runs or the Application is being deleted, and the write carries the version of the
+  Application just read, so a change meanwhile refuses it. Each dialog shows the `kubectl patch` it sends; write mode,
   the hub's protection and *Run as* apply.
 - **Argo CD resources**: an Application's page lists what Argo CD tracks for it
   (`status.resources`) as a table: kind, namespace/name, sync, health, whether it is a hook, and

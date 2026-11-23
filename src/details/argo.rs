@@ -223,11 +223,17 @@ fn confirm_refresh(t: Target, hard: bool, done: Done, window: &mut Window, cx: &
 /// what Argo CD would refuse is said instead.
 fn confirm_operation(t: Target, action: ArgoAction, app: &Value, done: Done, window: &mut Window, cx: &mut App) {
     let Some(op) = action.op() else { return };
-    if let Some(why) = ops::refusal(app, &op) {
-        let msg = format!("{} Application {}: Argo CD would refuse it: {why}.", action.label(), t.name);
-        window.push_notification(Notification::error(msg), cx);
-        return;
-    }
+    // A rollback to "the one before the newest" goes to the deployment named here, even if
+    // another lands while the dialog is open.
+    let checked = ops::refusal(app, &op).map_or_else(|| ops::pinned(app, &op), Err);
+    let op = match checked {
+        Ok(op) => op,
+        Err(why) => {
+            let msg = format!("{} Application {}: Argo CD would refuse it: {why}.", action.label(), t.name);
+            window.push_notification(Notification::error(msg), cx);
+            return;
+        }
+    };
     if action == ArgoAction::Sync {
         confirm_sync(t, app, done, window, cx);
         return;
@@ -283,7 +289,7 @@ impl SyncChoice {
         } else {
             offered.iter().zip(&self.picked).filter(|(_, p)| **p).map(|(r, _)| r.clone()).collect()
         };
-        SyncRequest { resources, prune: self.prune, dry_run: self.dry_run }
+        SyncRequest { resources, prune: self.prune, dry_run: self.dry_run, prune_shown: None }
     }
 
     /// Resources were offered and none is ticked: there is nothing to sync.
@@ -307,14 +313,10 @@ fn confirm_sync(t: Target, app: &Value, done: Done, window: &mut Window, cx: &mu
     let title = format!("Sync Application {}?", t.name);
     window.open_alert_dialog(cx, move |alert, _, cx| {
         let (t, guard, run_as, done) = (t.clone(), guard.clone(), run_as.clone(), done.clone());
-        let (offered, choice_ok) = (offered.clone(), choice.clone());
+        let (offered, choice_ok, to_prune_ok) = (offered.clone(), choice.clone(), to_prune.clone());
         let c = choice.read(cx).clone();
         let req = c.request(&offered);
-        let gone: Vec<Res> = to_prune
-            .iter()
-            .filter(|r| req.resources.is_empty() || req.resources.iter().any(|p| p.same(r)))
-            .cloned()
-            .collect();
+        let gone = ops::reached(&to_prune, &req.resources);
         let cmd = t.command(&patch_args(&Target::kind_name(), &t.name, &ops::sync_patch(&req)));
         let theme = cx.theme();
         let muted = theme.muted_foreground;
@@ -408,7 +410,10 @@ fn confirm_sync(t: Target, app: &Value, done: Done, window: &mut Window, cx: &mu
                 if !super::writes_still_on(window, cx) {
                     return true;
                 }
-                let write = t.operation(run_as.client(&t.hub.client, cx), Op::Sync(c.request(&offered)));
+                // Prune deletes no more than the list shown: if git changed since, it is refused.
+                let mut req = c.request(&offered);
+                req.prune_shown = Some(ops::reached(&to_prune_ok, &req.resources));
+                let write = t.operation(run_as.client(&t.hub.client, cx), Op::Sync(req));
                 send("Sync", write, t.hub.context.clone(), done.clone(), window, cx);
                 true
             })

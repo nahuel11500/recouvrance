@@ -250,21 +250,23 @@ impl KubeMcp {
         if p.action == "diagnose" {
             return self.argo_diagnose(call, client, kind, &p.context, &p.namespace, &p.name).await;
         }
-        let op = argo_op(&p);
-        // What a prune deletes is part of what is approved: read before asking, never shown
-        // to the agent before its rules allow the call (a failed read just says nothing).
-        if let Some(Op::Sync(req)) = &op
-            && req.prune
-            && let Ok(app) = super::get_named(&client, &kind, Some(p.namespace.as_str()), &p.name, false).await
-        {
-            let gone = ops::pruned(&app, &req.resources);
-            call.approval_detail = Some(if gone.is_empty() {
-                "prune: nothing to delete".to_string()
-            } else {
-                format!("prune deletes {}: {}", gone.len(), ops::named(&gone))
-            });
-        }
+        let mut op = argo_op(&p);
         let access = access_for(&kind, &p.context, Verb::Patch, Some(p.namespace.clone()), Some(p.name.clone()));
+        // What a prune deletes, and the deployment a rollback goes to, are part of what is
+        // approved: read before asking, and what is sent is held to what was shown. Never
+        // shown to the agent before its rules allow the call (a failed read says nothing).
+        // A prune is read only when the user will be asked; a rollback is pinned unless denied.
+        self.reload_rules(&mut call);
+        let mode = call.policy().decide(&access).mode;
+        let asks = mode == Mode::Ask && !self.hub.headless();
+        let prunes = matches!(&op, Some(Op::Sync(req)) if req.prune && asks);
+        let rollback = matches!(op, Some(Op::Rollback { id: None, .. })) && mode != Mode::Deny;
+        if (prunes || rollback)
+            && let Ok(app) = super::get_named(&client, &kind, Some(p.namespace.as_str()), &p.name, false).await
+            && let Some(o) = op.as_mut()
+        {
+            call.approval_detail = approval_detail(&app, o);
+        }
         self.authorize(&mut call, &access).await?;
         self.recheck(&mut call, &access)?;
         let (ns, name) = (Some(p.namespace), p.name);
@@ -320,6 +322,33 @@ fn gitops_option_misuse(p: &GitOpsParams) -> Option<String> {
     None
 }
 
+/// What the approval banner adds for `op` on the Application `app` as read before asking,
+/// and `op` held to it: a prune's list (it may delete no more), or the deployment a rollback
+/// to the one before the newest goes to (named by its id from then on).
+fn approval_detail(app: &serde_json::Value, op: &mut Op) -> Option<String> {
+    match op {
+        Op::Sync(req) if req.prune => {
+            let gone = ops::pruned(app, &req.resources);
+            let verb = if req.dry_run { "would delete" } else { "deletes" };
+            let detail = if gone.is_empty() {
+                "prune: nothing to delete".to_string()
+            } else {
+                format!("prune {verb} {}: {}", gone.len(), ops::named(&gone))
+            };
+            req.prune_shown = Some(gone);
+            Some(detail)
+        }
+        Op::Rollback { .. } => {
+            // Nothing to go back to: left as it is, refused once authorized.
+            *op = ops::pinned(app, op).ok()?;
+            let Op::Rollback { id, .. } = op else { return None };
+            let entry = ops::rollback_target(app, *id).ok()?;
+            Some(format!("rollback to {}", ops::deployment_label(entry)))
+        }
+        _ => None,
+    }
+}
+
 /// The Argo CD operation a `gitops` action writes, for those that write one.
 fn argo_op(p: &GitOpsParams) -> Option<Op> {
     let dry_run = p.dry_run.unwrap_or(false);
@@ -337,7 +366,7 @@ fn argo_op(p: &GitOpsParams) -> Option<Op> {
                     version: String::new(),
                 })
                 .collect();
-            Some(Op::Sync(SyncRequest { resources, prune: p.prune.unwrap_or(false), dry_run }))
+            Some(Op::Sync(SyncRequest { resources, prune: p.prune.unwrap_or(false), dry_run, prune_shown: None }))
         }
         "rollback" => Some(Op::Rollback { id: p.deployment_id, dry_run }),
         "terminate" => Some(Op::Terminate),
@@ -465,5 +494,58 @@ impl KubeMcp {
             planned.push((kind, ns, name, doc));
         }
         Ok((client, planned))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Op, Res, SyncRequest, approval_detail, ops};
+    use serde_json::json;
+
+    fn app() -> serde_json::Value {
+        let source = json!({"repoURL": "https://git.example/r", "path": "web"});
+        json!({
+            "metadata": {"name": "web", "namespace": "argocd", "resourceVersion": "7"},
+            "status": {
+                "resources": [
+                    {"kind": "ConfigMap", "namespace": "shop", "name": "old", "status": "OutOfSync", "requiresPruning": true}
+                ],
+                "history": [
+                    {"id": 1, "revision": "a".repeat(40), "source": source},
+                    {"id": 2, "revision": "b".repeat(40), "source": source}
+                ]
+            }
+        })
+    }
+
+    #[test]
+    fn the_rollback_approved_is_the_one_sent() {
+        let mut op = Op::Rollback { id: None, dry_run: false };
+        let detail = approval_detail(&app(), &mut op).unwrap();
+        assert_eq!(detail, format!("rollback to deployment 1 ({})", "a".repeat(8)));
+        // Sent by its id: a deployment landing after the approval changes nothing.
+        assert_eq!(op, Op::Rollback { id: Some(1), dry_run: false });
+        let mut later = app();
+        later["status"]["history"].as_array_mut().unwrap().push(json!({"id": 3, "revision": "c".repeat(40),
+            "source": {"repoURL": "https://git.example/r", "path": "web"}}));
+        assert_eq!(ops::patch(&later, &op).unwrap()["operation"]["sync"]["revision"], "a".repeat(40));
+    }
+
+    #[test]
+    fn the_prune_approved_bounds_what_is_deleted() {
+        let mut op = Op::Sync(SyncRequest { prune: true, ..Default::default() });
+        assert_eq!(approval_detail(&app(), &mut op).unwrap(), "prune deletes 1: ConfigMap shop/old");
+        let Op::Sync(req) = &op else { unreachable!() };
+        let shown: Vec<String> = req.prune_shown.iter().flatten().map(Res::label).collect();
+        assert_eq!(shown, ["ConfigMap shop/old"]);
+        // Git drops another resource after the approval: the sync is refused.
+        let mut later = app();
+        later["status"]["resources"].as_array_mut().unwrap().push(
+            json!({"kind": "ConfigMap", "namespace": "shop", "name": "more", "status": "OutOfSync", "requiresPruning": true}),
+        );
+        assert!(ops::patch(&later, &op).unwrap_err().contains("ConfigMap shop/more"));
+        // A dry run deletes nothing: said so.
+        let mut dry = Op::Sync(SyncRequest { prune: true, dry_run: true, ..Default::default() });
+        assert!(approval_detail(&app(), &mut dry).unwrap().starts_with("prune would delete 1"));
     }
 }

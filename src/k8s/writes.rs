@@ -490,6 +490,8 @@ pub async fn argo_refresh(client: Client, kind: Kind, ns: Option<String>, name: 
 
 /// How long a dry run's result is waited for before saying where it will show.
 const DRY_RUN_WAIT_SECS: u32 = 30;
+/// How many times a terminate is sent when the Application keeps changing under it.
+const TERMINATE_ATTEMPTS: u32 = 10;
 
 /// Start an Argo CD operation on an Application: a sync (with its options), a rollback, or
 /// terminating the one running. The Application is read first, and refused as argocd-server
@@ -506,13 +508,23 @@ pub async fn argo_operation(
     use super::argo::ops::{self, Op};
     run(async move {
         let api = dyn_api(client, &kind, ns.as_deref());
-        let app = serde_json::to_value(api.get(&name).await?)?;
-        let patch = ops::patch(&app, &op).map_err(|why| anyhow::anyhow!("Argo CD would refuse it: {why}"))?;
-        let after = match api.patch(&name, &patch_params(false), &kube::api::Patch::Merge(patch)).await {
-            Err(kube::Error::Api(e)) if e.code == 409 => {
-                anyhow::bail!("the Application changed while it was sent; nothing was started, try again")
+        // A terminate is tried again on a conflict, as argocd-server does: the controller
+        // updates the Application often while a sync runs, which is when it is used, and the
+        // operation is checked again on each read. A sync or a rollback is not: a change in
+        // between (an operation started, auto-sync turned on) must refuse it.
+        let attempts = if op == Op::Terminate { TERMINATE_ATTEMPTS } else { 1 };
+        let mut attempt = 0;
+        let (app, after) = loop {
+            attempt += 1;
+            let app = serde_json::to_value(api.get(&name).await?)?;
+            let patch = ops::patch(&app, &op).map_err(|why| anyhow::anyhow!("Argo CD would refuse it: {why}"))?;
+            match api.patch(&name, &patch_params(false), &kube::api::Patch::Merge(patch)).await {
+                Err(kube::Error::Api(e)) if e.code == 409 && attempt < attempts => {}
+                Err(kube::Error::Api(e)) if e.code == 409 => {
+                    anyhow::bail!("the Application changed while it was sent; nothing was started, try again")
+                }
+                after => break (app, serde_json::to_value(after?)?),
             }
-            after => serde_json::to_value(after?)?,
         };
         // An Application kind with a status subresource would drop the change silently.
         let phase = after.pointer("/status/operationState/phase").and_then(serde_json::Value::as_str);

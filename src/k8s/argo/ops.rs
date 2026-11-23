@@ -27,6 +27,9 @@ pub struct SyncRequest {
     pub prune: bool,
     /// Argo CD applies nothing and reports what it would do.
     pub dry_run: bool,
+    /// What prune deletes, as shown to whoever confirmed the sync: if git changed since and
+    /// it would now delete more, the sync is refused. None when nothing was shown.
+    pub prune_shown: Option<Vec<Res>>,
 }
 
 /// What can be written to an Application's operation.
@@ -68,11 +71,14 @@ pub fn out_of_sync(app: &Value) -> Vec<Res> {
 /// What a sync with prune deletes: every resource to prune, or those of `picked` when the
 /// sync is of some resources only (Argo CD prunes nothing else then).
 pub fn pruned(app: &Value, picked: &[Res]) -> Vec<Res> {
-    resources(app)
-        .filter(|r| to_prune(r))
-        .filter_map(Res::of)
-        .filter(|r| picked.is_empty() || picked.iter().any(|p| p.same(r)))
-        .collect()
+    let all: Vec<Res> = resources(app).filter(|r| to_prune(r)).filter_map(Res::of).collect();
+    reached(&all, picked)
+}
+
+/// Of `all`, those a sync of `picked` reaches: every one when the sync is of the whole
+/// Application (`picked` empty).
+pub fn reached(all: &[Res], picked: &[Res]) -> Vec<Res> {
+    all.iter().filter(|r| picked.is_empty() || picked.iter().any(|p| p.same(r))).cloned().collect()
 }
 
 /// The merge patch that starts a sync (also shown as the kubectl equivalent). With no option,
@@ -169,14 +175,15 @@ pub fn rollback_patch(app: &Value, entry: &Value, dry_run: bool) -> Value {
 
 /// Why argocd-server would refuse `op` on the Application as read now, if it would.
 pub fn refusal(app: &Value, op: &Op) -> Option<String> {
-    if app.pointer("/metadata/deletionTimestamp").is_some_and(|t| !t.is_null()) {
-        return Some("the Application is being deleted".into());
-    }
+    let deleting = app.pointer("/metadata/deletionTimestamp").is_some_and(|t| !t.is_null());
     match op {
+        // Allowed while the Application is being deleted: Argo CD finalizes a deletion only
+        // once no operation is set, so a stuck sync holding it is ended this way.
         Op::Terminate => {
             let state = app.pointer("/status/operationState").is_some_and(|s| !s.is_null());
             if in_progress(app) && state { None } else { Some("no operation is in progress".to_string()) }
         }
+        _ if deleting => Some("the Application is being deleted".into()),
         _ if in_progress(app) => {
             Some("another operation is already in progress: wait for it to end, or terminate it".into())
         }
@@ -184,7 +191,10 @@ pub fn refusal(app: &Value, op: &Op) -> Option<String> {
             let known: Vec<Res> = resources(app).filter_map(Res::of).collect();
             let unknown: Vec<String> =
                 req.resources.iter().filter(|r| !known.iter().any(|k| k.same(r))).map(Res::label).collect();
-            (!unknown.is_empty()).then(|| format!("not resources of the Application: {}", unknown.join(", ")))
+            if !unknown.is_empty() {
+                return Some(format!("not resources of the Application: {}", unknown.join(", ")));
+            }
+            pruned_more(app, req)
         }
         Op::Rollback { id, .. } => {
             if auto_sync(app) {
@@ -208,6 +218,32 @@ pub fn refusal(app: &Value, op: &Op) -> Option<String> {
                 )
             }
         }
+    }
+}
+
+/// Why a sync with prune would delete more than the list confirmed: git changed since it
+/// was shown. A dry run deletes nothing, so it goes ahead.
+fn pruned_more(app: &Value, req: &SyncRequest) -> Option<String> {
+    let shown = req.prune_shown.as_ref().filter(|_| req.prune && !req.dry_run)?;
+    let more: Vec<Res> = pruned(app, &req.resources).into_iter().filter(|r| !shown.iter().any(|s| s.same(r))).collect();
+    (!more.is_empty()).then(|| {
+        format!(
+            "what prune deletes changed since it was shown (it would also delete {}): confirm the sync again",
+            named(&more)
+        )
+    })
+}
+
+/// `op` with the deployment a rollback goes to named by its id, as resolved on `app`: what
+/// was shown and confirmed is what runs, even if a deployment lands meanwhile. Other
+/// operations are returned as they are.
+pub fn pinned(app: &Value, op: &Op) -> Result<Op, String> {
+    match op {
+        Op::Rollback { id: None, dry_run } => {
+            let id = rollback_target(app, None)?["id"].as_i64().ok_or("that deployment has no id")?;
+            Ok(Op::Rollback { id: Some(id), dry_run: *dry_run })
+        }
+        _ => Ok(op.clone()),
     }
 }
 
@@ -352,6 +388,7 @@ mod tests {
             resources: vec![Res { group: "apps".into(), ..res("Deployment", "web") }, res("ConfigMap", "old")],
             prune: true,
             dry_run: true,
+            prune_shown: None,
         };
         let p = patch(&app(), &Op::Sync(req)).unwrap();
         let sync = &p["operation"]["sync"];
@@ -462,6 +499,51 @@ mod tests {
         let mut a = app();
         a["metadata"]["deletionTimestamp"] = json!("2025-01-01T00:00:00Z");
         assert!(patch(&a, &Op::Sync(SyncRequest::default())).unwrap_err().contains("deleted"));
+        assert!(patch(&a, &Op::Rollback { id: None, dry_run: false }).unwrap_err().contains("deleted"));
+        // A sync stuck on it holds the deletion: terminating it is the way out, as with argocd-server.
+        a["operation"] = json!({"sync": {}});
+        a["status"]["operationState"] = json!({"phase": "Running"});
+        assert!(patch(&a, &Op::Sync(SyncRequest::default())).is_err());
+        let p = patch(&a, &Op::Terminate).unwrap();
+        assert_eq!(p["status"]["operationState"], json!({"phase": "Terminating"}));
+    }
+
+    #[test]
+    fn a_rollback_confirmed_goes_where_it_was_shown_to_go() {
+        let op = pinned(&app(), &Op::Rollback { id: None, dry_run: false }).unwrap();
+        assert_eq!(op, Op::Rollback { id: Some(2), dry_run: false });
+        let Op::Rollback { id, .. } = op else { unreachable!() };
+        let shown = deployment_label(rollback_target(&app(), id).unwrap());
+        assert_eq!(shown, format!("deployment 2 ({})", "b".repeat(8)));
+        // A deployment lands before the write: the one shown is still the one written.
+        let mut later = app();
+        later["status"]["history"].as_array_mut().unwrap().push(json!({"id": 4, "revision": "d".repeat(40),
+            "source": {"repoURL": "https://git.example/r", "path": "web"}}));
+        assert_eq!(patch(&later, &op).unwrap()["operation"]["sync"]["revision"], "b".repeat(40));
+        let unpinned = Op::Rollback { id: None, dry_run: false };
+        assert_eq!(patch(&later, &unpinned).unwrap()["operation"]["sync"]["revision"], "c".repeat(40));
+        // Other operations are left as they are; nothing to go back to stays refused.
+        assert_eq!(pinned(&app(), &Op::Terminate), Ok(Op::Terminate));
+        let mut one = app();
+        one["status"]["history"] = json!([{"id": 1, "revision": "x", "source": {"repoURL": "x"}}]);
+        assert!(pinned(&one, &unpinned).is_err());
+    }
+
+    #[test]
+    fn prune_never_deletes_more_than_was_shown() {
+        let shown = vec![res("ConfigMap", "old")];
+        let req = SyncRequest { prune: true, prune_shown: Some(shown.clone()), ..Default::default() };
+        // Git dropped `gone` too since the list was shown: refused, naming it.
+        let why = patch(&app(), &Op::Sync(req.clone())).unwrap_err();
+        assert!(why.contains("ConfigMap shop/gone") && why.contains("confirm"), "{why}");
+        // Less than was shown, a dry run, or nothing shown: it goes ahead.
+        let both = vec![res("ConfigMap", "old"), res("ConfigMap", "gone"), res("ConfigMap", "x")];
+        assert!(patch(&app(), &Op::Sync(SyncRequest { prune_shown: Some(both), ..req.clone() })).is_ok());
+        assert!(patch(&app(), &Op::Sync(SyncRequest { dry_run: true, ..req.clone() })).is_ok());
+        assert!(patch(&app(), &Op::Sync(SyncRequest { prune_shown: None, ..req.clone() })).is_ok());
+        // A sync of `old` alone deletes only it.
+        let only = SyncRequest { resources: shown, ..req };
+        assert!(patch(&app(), &Op::Sync(only)).is_ok());
     }
 
     #[test]
@@ -499,7 +581,7 @@ mod tests {
                 prop_assert!(picked.is_empty() || picked.iter().any(|p| p.same(g)));
                 prop_assert!(g.name == "old" || g.name == "gone");
             }
-            let req = SyncRequest { resources: picked.clone(), prune: true, dry_run: false };
+            let req = SyncRequest { resources: picked.clone(), prune: true, dry_run: false, prune_shown: Some(gone.clone()) };
             let p = patch(&a, &Op::Sync(req)).unwrap();
             let sent = p["operation"]["sync"]["resources"].as_array().map_or(0, Vec::len);
             prop_assert_eq!(sent, picked.len());

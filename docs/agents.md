@@ -107,14 +107,17 @@ tools' definitions. What some of them need beyond the obvious verb:
 - **Argo CD sync, terminate and rollback:** `gitops` on an Application, authorized as `patch` on
   it. `sync` takes `resources` (sync those alone; hooks run only when the whole Application
   syncs), `prune` (delete what is no longer in git; the approval banner and the reply name what
-  it deletes) and `dry_run` (Argo CD's own dry run: nothing is applied, and the reply waits up to
-  30 s for what Argo CD would do). `terminate` stops the operation running, like
-  `argocd app terminate-op`. `rollback` goes back to a deployment of `status.history`
-  (`deployment_id`, or the one before the newest), like `argocd app rollback`: the deployment's
+  it deletes, and a sync that would delete more than the banner listed is refused) and `dry_run`
+  (Argo CD's own dry run: nothing is applied, and the reply waits up to 30 s for what Argo CD
+  would do). `terminate` stops the operation running, like `argocd app terminate-op`, also on an
+  Application being deleted (a stuck sync holds its deletion). `rollback` goes back to a
+  deployment of `status.history` (`deployment_id`, or the one before the newest, which the
+  approval banner names and which is the one sent), like `argocd app rollback`: the deployment's
   revision and source applied again, without hooks and without prune. As argocd-server does,
-  nothing starts while another operation runs, and a rollback is refused while auto-sync is on.
-  The Application is read right before the write, which carries the version read: a change
-  meanwhile refuses it.
+  nothing starts while another operation runs or the Application is being deleted, and a
+  rollback is refused while auto-sync is on. The Application is read right before the write,
+  which carries the version read: a change meanwhile refuses it (a terminate is tried again, as
+  argocd-server does).
 
 - **Custom and external metrics:** `get_metrics` reads `custom.metrics.k8s.io` and
   `external.metrics.k8s.io`, what an HPA or KEDA gets from prometheus-adapter, like
@@ -226,7 +229,8 @@ the same target fold into one line, and any line opens to its full arguments and
 writes, denied or failed calls, context, agent or text. It shows the latest 300 calls; "Show older"
 goes further back, and then reads the log on disk. A call counts as a write when its tool may change
 something (the changes above, and `browse_files` with `debug: true`), but not a dry run nor `gitops`'s
-`diagnose`; each group counts its writes.
+`diagnose`; each group counts its writes. A `gitops` dry run counts: it writes the Application's
+operation, which blocks any other sync until Argo CD is done with it.
 
 > These rules govern what agents do *through Recouvrance*. An agent with shell access can still run
 > `kubectl` with your kubeconfig, so block `kubectl`/`helm` in its own permissions if Recouvrance
