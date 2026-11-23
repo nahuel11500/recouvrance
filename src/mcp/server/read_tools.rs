@@ -710,7 +710,7 @@ impl KubeMcp {
             None => Fresh::Paced,
         };
         let ask =
-            || shared::Ask { client: client.clone(), kinds: kinds.clone(), lane: Lane::Foreground, record: false };
+            || shared::Ask { client: client.clone(), kinds: kinds.to_vec(), lane: Lane::Foreground, record: false };
         let found = shared::fresh(&scope, fresh, ask).await.unwrap_or_default();
         let skipped = found.skipped().map(|s| format!("Not checked, could not read {s}."));
         let scanned = found.done.map(|d| {

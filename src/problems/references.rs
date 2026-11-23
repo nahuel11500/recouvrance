@@ -405,8 +405,9 @@ impl Meta {
 
     /// Its (uid, resourceVersion), when it has both.
     fn version(&self) -> Option<(&str, &str)> {
-        let set = |s: Option<&str>| s.filter(|s| !s.is_empty());
-        Some((set(self.uid.as_deref())?, set(self.resource_version.as_deref())?))
+        let uid = self.uid.as_deref().filter(|s| !s.is_empty())?;
+        let version = self.resource_version.as_deref().filter(|s| !s.is_empty())?;
+        Some((uid, version))
     }
 }
 
