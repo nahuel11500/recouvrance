@@ -492,11 +492,13 @@ impl AppView {
         cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
         let fav_kinds = self.favorites.read(cx).kinds().to_vec();
+        // The noise discovery keeps for lookups is never listed, even when searched for.
         let matches = |k: &Kind| {
-            query.is_empty()
-                || k.label.to_lowercase().contains(query)
-                || k.ar.kind.to_lowercase().contains(query)
-                || k.ar.group.to_lowercase().contains(query)
+            k8s::in_sidebar(k)
+                && (query.is_empty()
+                    || k.label.to_lowercase().contains(query)
+                    || k.ar.kind.to_lowercase().contains(query)
+                    || k.ar.group.to_lowercase().contains(query))
         };
         // How many types each section shows, and the sections folded (all open while searching).
         let mut counts: HashMap<&str, usize> = HashMap::new();

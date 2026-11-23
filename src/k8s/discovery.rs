@@ -15,6 +15,8 @@ use super::run;
 pub struct Kind {
     pub ar: ApiResource,
     pub namespaced: bool,
+    /// Where the sidebar lists it (`SECTIONS`); `HIDDEN_SECTION` for a kind discovered that
+    /// the sidebar leaves out.
     pub section: &'static str,
     pub label: String,
 }
@@ -107,6 +109,15 @@ pub fn sidebar_rank(k: &Kind) -> usize {
 }
 
 pub const CUSTOM_SECTION: &str = "Custom resources";
+
+/// The section of the kinds the sidebar leaves out as noise (`is_noise`). Discovery keeps
+/// them all the same: a manifest, a link or an agent can still name one.
+pub const HIDDEN_SECTION: &str = "Hidden";
+
+/// Whether the sidebar lists a kind (and the palette, which offers the same types).
+pub fn in_sidebar(k: &Kind) -> bool {
+    k.section != HIDDEN_SECTION
+}
 
 /// Sidebar sections, in order.
 pub const SECTIONS: [&str; 12] = [
@@ -271,34 +282,33 @@ pub async fn discover(client: Client) -> Result<Vec<Kind>> {
             Ok(d) => d.groups().flat_map(kube::discovery::ApiGroup::resources_by_stability).collect(),
             Err(_) => discover_by_group(&client).await?,
         };
-        let mut known: Vec<Kind> = Vec::new();
-        let mut custom: Vec<Kind> = Vec::new();
-        for (ar, caps) in resources {
-            if !listable(&caps) || ar.plural.contains('/') {
-                continue;
-            }
-            let kind = kind_of(ar, caps.scope == Scope::Namespaced);
-            // Old events.k8s.io duplicates and metrics are noise in a sidebar.
-            if sidebar_rank(&kind) == usize::MAX && is_noise(&kind.ar) {
-                continue;
-            }
-            if is_custom(&kind) {
-                custom.push(kind);
-            } else {
-                known.push(kind);
-            }
-        }
-        known.extend(custom);
-        sort_for_sidebar(&mut known);
-        Ok(known)
+        Ok(kinds_of(resources))
     })
     .await
 }
 
-/// A kind discovery found, with its sidebar section and label: a built-in's from `KNOWN`.
+/// The listable types of `resources`, each in its sidebar section, in sidebar order. The
+/// noise is kept, in `HIDDEN_SECTION` after all the others: Apply and the agents look types
+/// up in this list (a manifest may hold a `FlowSchema`), and a lookup by name still finds the
+/// shown kind first (the core Events before events.k8s.io's).
+fn kinds_of(resources: Vec<(ApiResource, ApiCapabilities)>) -> Vec<Kind> {
+    let mut kinds: Vec<Kind> = Vec::new();
+    for (ar, caps) in resources {
+        if !listable(&caps) || ar.plural.contains('/') {
+            continue;
+        }
+        kinds.push(kind_of(ar, caps.scope == Scope::Namespaced));
+    }
+    sort_for_sidebar(&mut kinds);
+    kinds
+}
+
+/// A kind discovery found, with its sidebar section and label: a built-in's from `KNOWN`,
+/// the noise (old events.k8s.io duplicates, metrics, flow control) in `HIDDEN_SECTION`.
 pub fn kind_of(ar: ApiResource, namespaced: bool) -> Kind {
     match KNOWN.iter().find(|(_, g, k, _)| *g == ar.group && *k == ar.kind) {
         Some((section, _, _, label)) => Kind { ar, namespaced, section, label: label.to_string() },
+        None if is_noise(&ar) => Kind { label: ar.kind.clone(), ar, namespaced, section: HIDDEN_SECTION },
         // Remaining built-in APIs are cluster plumbing, not custom resources
         // (some CRD groups end in .k8s.io too: those are mapped above).
         None if is_builtin_group(&ar.group) && crd_section(&ar.group) == CUSTOM_SECTION => {
@@ -391,6 +401,9 @@ pub(crate) fn is_builtin_group(group: &str) -> bool {
     !group.contains('.') || group.ends_with(".k8s.io")
 }
 
+/// What the sidebar leaves out (`HIDDEN_SECTION`): events.k8s.io's copy of the core Events,
+/// metrics (not stored objects), API priority and fairness, and the old `Endpoints`,
+/// `ComponentStatus` and `Binding`.
 pub(super) fn is_noise(ar: &ApiResource) -> bool {
     matches!(ar.group.as_str(), "events.k8s.io" | "metrics.k8s.io" | "flowcontrol.apiserver.k8s.io")
         || matches!(ar.kind.as_str(), "ComponentStatus" | "Binding" | "Endpoints")
@@ -444,6 +457,11 @@ pub fn find_kind<'a>(kinds: &'a [Kind], query: &str) -> Option<&'a Kind> {
     // Prefer core and well-known kinds when a name is ambiguous (`svc` is the Service, not
     // Knative's): sidebar order alone puts a custom resource first when its section is earlier.
     kinds.iter().filter(|k| !is_custom(k)).find(matches).or_else(|| kinds.iter().find(matches))
+}
+
+/// The discovered kind a manifest's object names with its `apiVersion` and `kind`.
+pub fn manifest_kind<'a>(kinds: &'a [Kind], api_version: &str, kind: &str) -> Option<&'a Kind> {
+    kinds.iter().find(|k| k.ar.api_version == api_version && k.ar.kind == kind)
 }
 
 #[cfg(test)]
@@ -544,5 +562,144 @@ mod section_tests {
         assert_eq!(shown(&csr), ("Administration", "CertificateSigningRequest".into(), false));
         assert_eq!(shown(&found("cert-manager.io", "Certificate")), ("Configuration", "Certificate".into(), true));
         assert_eq!(shown(&found("widgets.example.com", "Widget")), (super::CUSTOM_SECTION, "Widget".into(), true));
+    }
+}
+
+#[cfg(test)]
+mod noise_tests {
+    use kube::discovery::{ApiCapabilities, ApiResource, Scope};
+    use proptest::prelude::*;
+
+    use super::{Kind, find_kind, in_sidebar, is_custom, is_noise, kinds_of, listable, manifest_kind};
+
+    /// A type as discovery reports it at v1; `listable` when it may be listed and watched.
+    fn res(group: &str, kind: &str, plural: &str, namespaced: bool, listable: bool) -> (ApiResource, ApiCapabilities) {
+        let ar = ApiResource {
+            group: group.into(),
+            version: "v1".into(),
+            api_version: if group.is_empty() { "v1".into() } else { format!("{group}/v1") },
+            kind: kind.into(),
+            plural: plural.into(),
+        };
+        let verbs: &[&str] = if listable { &["create", "get", "list", "watch"] } else { &["create"] };
+        let scope = if namespaced { Scope::Namespaced } else { Scope::Cluster };
+        (
+            ar,
+            ApiCapabilities {
+                scope,
+                subresources: vec![],
+                operations: verbs.iter().map(ToString::to_string).collect(),
+            },
+        )
+    }
+
+    /// What a lookup found, to compare: its group and kind.
+    fn id(k: &Kind) -> (&str, &str) {
+        (k.ar.group.as_str(), k.ar.kind.as_str())
+    }
+
+    /// kwok's release manifest holds a `FlowSchema` and a `PriorityLevelConfiguration`: Apply
+    /// and the agents find them, like the core `Endpoints` and events.k8s.io's Events, and the
+    /// sidebar lists none of them.
+    #[test]
+    fn the_sidebar_leaves_out_types_apply_and_agents_still_find() {
+        let flow = "flowcontrol.apiserver.k8s.io";
+        let kinds = kinds_of(vec![
+            res(flow, "FlowSchema", "flowschemas", false, true),
+            res(flow, "PriorityLevelConfiguration", "prioritylevelconfigurations", false, true),
+            res("events.k8s.io", "Event", "events", true, true),
+            res("", "Endpoints", "endpoints", true, true),
+            res("", "Event", "events", true, true),
+            res("", "Pod", "pods", true, true),
+            res("", "Binding", "bindings", true, false),
+        ]);
+        let order: Vec<(&str, bool)> = kinds.iter().map(|k| (k.ar.kind.as_str(), in_sidebar(k))).collect();
+        assert_eq!(
+            order,
+            [
+                ("Event", true),
+                ("Pod", true),
+                ("Endpoints", false),
+                ("Event", false),
+                ("FlowSchema", false),
+                ("PriorityLevelConfiguration", false),
+            ]
+        );
+        let schema = manifest_kind(&kinds, "flowcontrol.apiserver.k8s.io/v1", "FlowSchema").expect("FlowSchema");
+        assert!(!schema.namespaced);
+        assert!(manifest_kind(&kinds, "flowcontrol.apiserver.k8s.io/v1", "PriorityLevelConfiguration").is_some());
+        assert!(manifest_kind(&kinds, "v1", "Endpoints").is_some());
+        assert!(manifest_kind(&kinds, "events.k8s.io/v1", "Event").is_some());
+        // The names agents and links use, like kubectl's.
+        assert_eq!(find_kind(&kinds, "flowschemas").map(|k| k.ar.group.as_str()), Some(flow));
+        assert_eq!(find_kind(&kinds, "endpoints").map(|k| k.ar.kind.as_str()), Some("Endpoints"));
+        assert_eq!(find_kind(&kinds, "events.events.k8s.io").map(|k| k.ar.group.as_str()), Some("events.k8s.io"));
+        // A name both groups serve is the kind the sidebar shows.
+        assert_eq!(find_kind(&kinds, "events").map(|k| k.ar.group.as_str()), Some(""));
+    }
+
+    /// Types a cluster may serve, each kind once per group as discovery keeps them, in any
+    /// order: noise and not, built-in and custom, listable or not.
+    fn served() -> impl Strategy<Value = Vec<(ApiResource, ApiCapabilities)>> {
+        let groups: &'static [&str] = &[
+            "",
+            "apps",
+            "networking.k8s.io",
+            "events.k8s.io",
+            "metrics.k8s.io",
+            "flowcontrol.apiserver.k8s.io",
+            "cert-manager.io",
+            "example.com",
+        ];
+        let kinds: &'static [(&str, &str)] = &[
+            ("Pod", "pods"),
+            ("Event", "events"),
+            ("Ingress", "ingresses"),
+            ("Endpoints", "endpoints"),
+            ("Binding", "bindings"),
+            ("FlowSchema", "flowschemas"),
+            ("PriorityLevelConfiguration", "prioritylevelconfigurations"),
+            ("Certificate", "certificates"),
+            ("Widget", "widgets"),
+        ];
+        let key = (prop::sample::select(groups), prop::sample::select(kinds));
+        prop::collection::btree_map(key, (any::<bool>(), any::<bool>()), 0..24)
+            .prop_map(|served| {
+                served
+                    .into_iter()
+                    .map(|((group, (kind, plural)), (namespaced, listable))| {
+                        res(group, kind, plural, namespaced, listable)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .prop_shuffle()
+    }
+
+    proptest! {
+        /// Whatever a cluster serves, every type that can be listed resolves from a manifest
+        /// (`apiVersion` and `kind`) and, in a named group, from its kubectl name. The sidebar
+        /// lists what it did before discovery kept the noise, ahead of the noise, and a name
+        /// typed finds a type it lists before one it leaves out.
+        #[test]
+        fn every_listable_type_resolves_and_the_sidebar_keeps_out_the_noise(served in served()) {
+            let kinds = kinds_of(served.clone());
+            let wanted: Vec<&ApiResource> = served.iter().filter(|(_, caps)| listable(caps)).map(|(ar, _)| ar).collect();
+            prop_assert_eq!(kinds.len(), wanted.len());
+            for ar in wanted {
+                let expected = Some((ar.group.as_str(), ar.kind.as_str()));
+                prop_assert_eq!(manifest_kind(&kinds, &ar.api_version, &ar.kind).map(id), expected);
+                if !ar.group.is_empty() {
+                    prop_assert_eq!(find_kind(&kinds, &format!("{}.{}", ar.plural, ar.group)).map(id), expected);
+                }
+            }
+            for k in &kinds {
+                prop_assert_eq!(in_sidebar(k), !is_noise(&k.ar), "{}", k.key());
+            }
+            prop_assert!(kinds.windows(2).all(|w| in_sidebar(&w[0]) || !in_sidebar(&w[1])), "noise among shown types");
+            for k in kinds.iter().filter(|k| in_sidebar(k) && !is_custom(k)) {
+                let found = find_kind(&kinds, &k.ar.plural);
+                prop_assert!(found.is_some_and(in_sidebar), "{} found {:?}", k.ar.plural, found.map(Kind::key));
+            }
+        }
     }
 }
