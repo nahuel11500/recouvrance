@@ -52,6 +52,10 @@ pods; add `RECOUVRANCE_LISTTIME=1`, `RECOUVRANCE_PROBLEMS=1` (the Problems scan'
 Linux, the process's peak memory; `RECOUVRANCE_PROBLEMS=kinds` runs each kind's check alone, with
 its own peak), or dry runs such as `RECOUVRANCE_NODESHELLDRY=<node>` (see `src/dev/smoke.rs`).
 
+**Timings**: `RECOUVRANCE_TIMINGS=1` prints to stderr every 10 seconds where the time went (frames,
+table filtering, watch batches, the assistant's API requests) and, for the assistant with an API
+key, its input tokens: uncached, written to the prompt cache and read from it.
+
 **README screenshots** live on the `media` branch, so `main` stays small. Take them on a throwaway
 kind cluster with demo workloads, never a real one (names of clusters, namespaces and objects show).
 Use a scratch `XDG_CONFIG_HOME` and `XDG_DATA_HOME` too, so your settings and agent activity stay out
