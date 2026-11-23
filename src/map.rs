@@ -389,11 +389,16 @@ struct LeanMeta {
     owner_references: Vec<Value>,
 }
 
+/// A listed object: its metadata, its spec, and a ServiceAccount's Secrets (outside its spec).
 #[derive(Deserialize, Serialize, Default)]
-#[serde(default)]
+#[serde(default, rename_all = "camelCase")]
 struct Lean {
     metadata: LeanMeta,
     spec: Value,
+    #[serde(skip_serializing_if = "Value::is_null")]
+    secrets: Value,
+    #[serde(skip_serializing_if = "Value::is_null")]
+    image_pull_secrets: Value,
 }
 
 /// A backend's pod: its names and labels, and its phase.
