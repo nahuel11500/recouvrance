@@ -37,7 +37,7 @@ Recouvrance is one Rust binary: a [gpui](https://github.com/zed-industries/zed) 
 | `src/mcp/` | The agent hub (agents, rules, approvals, audit) and the MCP server with its tools and prompts |
 | `src/agents/` | The Agents page |
 | `src/ui/` | Other pages and widgets: settings, Helm, apply, cluster and workloads overviews, terminal, pickers |
-| `src/diagnose.rs`, `rbac.rs`, `schema.rs`, `prom.rs`, `problems.rs`, `certs.rs` | Logic without UI, unit-tested |
+| `src/diagnose.rs`, `rbac.rs`, `schema.rs`, `prom.rs`, `problems.rs`, `certs.rs`, `updates.rs` | Logic without UI, unit-tested |
 | `src/dev/` | Developer tools (feature `dev`): the off-screen snapshot harness and live smoke checks |
 
 ## How lists stay fast

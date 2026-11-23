@@ -224,7 +224,11 @@ pub fn open_main_window(cx: &mut App) -> Option<Entity<AppView>> {
         ..TitleBar::window_options()
     };
     match open_window(options, cx, |window, cx| cx.new(|cx| AppView::new(window, cx))) {
-        Ok((_, view)) => Some(view),
+        Ok((window, view)) => {
+            // After an update, its release notes, once: the next window finds them seen.
+            crate::ui::whats_new::show_once(window, cx);
+            Some(view)
+        }
         Err(e) => {
             eprintln!("could not open a window: {e:#}");
             None

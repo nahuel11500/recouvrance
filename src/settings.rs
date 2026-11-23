@@ -386,6 +386,11 @@ pub struct Settings {
     pub sidebar_width: f32,
     /// The sidebar's sections folded (by name: "Workloads", "Custom resources"...).
     pub sidebar_folded: Vec<String>,
+    /// The newest version whose release notes were shown (What's new, see `crate::updates`).
+    /// None in a file from before What's new; a new install starts with the version running
+    /// (see `load_from`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_seen_version: Option<String>,
     /// Where each set of contexts was left, the newest first (see `Session`).
     #[serde(deserialize_with = "session_entries")]
     pub sessions: Vec<Session>,
@@ -596,9 +601,18 @@ impl Default for Settings {
             timeline: TimelineSettings::default(),
             sidebar_width: SIDEBAR_WIDTH,
             sidebar_folded: Vec::new(),
+            last_seen_version: None,
             sessions: Vec::new(),
             window: None,
         }
+    }
+}
+
+impl Settings {
+    /// A new install's settings: the defaults, with the version running already seen, since
+    /// What's new is for updates.
+    fn new_install() -> Self {
+        Self { last_seen_version: Some(crate::updates::VERSION.to_string()), ..Self::default() }
     }
 }
 
@@ -627,11 +641,11 @@ fn load() -> Settings {
 }
 
 /// The settings at `p`, or the defaults and why when the file exists but can't be read
-/// (permissions, a folder): then the file is left as it is.
+/// (permissions, a folder): then the file is left as it is. No file is a new install.
 fn load_from(p: &Path) -> (Settings, Option<String>) {
     let bytes = match std::fs::read(p) {
         Ok(bytes) => bytes,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (Settings::default(), None),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (Settings::new_install(), None),
         Err(e) => return (Settings::default(), Some(format!("{}: {e}", p.display()))),
     };
     let (mut settings, error, lost) = from_bytes(&bytes);
@@ -1309,6 +1323,26 @@ mod tests {
         std::fs::remove_dir_all(d).unwrap();
     }
 
+    /// What's new is for updates: a new install has seen the version it starts with, a file
+    /// from before What's new has seen none (so this version's notes show once).
+    #[test]
+    fn a_new_install_has_seen_its_version_and_an_older_file_none() {
+        let d = scratch();
+        let (s, error) = load_from(&d.join("settings.json"));
+        assert_eq!(error, None);
+        assert_eq!(s.last_seen_version.as_deref(), Some(crate::updates::VERSION));
+        let s: Settings = serde_json::from_str(r#"{"metrics_refresh": 7}"#).unwrap();
+        assert_eq!(s.last_seen_version, None);
+        assert!(!serde_json::to_string(&s).unwrap().contains("last_seen_version"), "not written while unknown");
+        // One that doesn't read is unknown too, and costs nothing else.
+        let (s, _, lost) = super::from_bytes(br#"{"last_seen_version": 9, "metrics_refresh": 7}"#);
+        assert!(!lost);
+        assert_eq!((s.last_seen_version, s.metrics_refresh), (None, 7));
+        let s: Settings = serde_json::from_str(r#"{"last_seen_version": "0.9.0"}"#).unwrap();
+        assert_eq!(s.last_seen_version.as_deref(), Some("0.9.0"));
+        std::fs::remove_dir_all(d).unwrap();
+    }
+
     #[test]
     fn sessions_and_a_window_that_do_not_read_cost_nothing_else() {
         // Never an error: the file is not kept aside, and every other setting stays.
@@ -1514,7 +1548,13 @@ mod properties {
             refresh in 1..1000u64,
             spoiled in prop::collection::btree_map(0..40usize, bad(), 0..4),
         ) {
-            let good = Settings { protection: protection.clone(), metrics_refresh: refresh, ..Settings::default() };
+            // The version seen is written only when set: set, so it can be spoiled too.
+            let good = Settings {
+                protection: protection.clone(),
+                metrics_refresh: refresh,
+                last_seen_version: Some("0.9.0".into()),
+                ..Settings::default()
+            };
             let Value::Object(mut fields) = serde_json::to_value(&good).unwrap() else { unreachable!() };
             let keys: Vec<String> = fields.keys().filter(|k| *k != "protection").cloned().collect();
             let mut hit = std::collections::HashSet::new();
