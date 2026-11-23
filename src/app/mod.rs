@@ -27,6 +27,7 @@ use crate::ui::palette::Palette;
 use crate::ui::settings_view::SettingsView;
 
 mod chrome;
+pub(crate) mod commands;
 mod contexts;
 #[cfg(feature = "dev")]
 mod demo;
@@ -48,9 +49,7 @@ mod view_cache;
 mod watch;
 
 pub use menus::init as init_menus;
-#[cfg(test)]
-pub(crate) use shortcuts::unbound_keys;
-pub(crate) use shortcuts::with_keys;
+pub(crate) use shortcuts::{key_cap, shortcut_rows, with_keys};
 use sidebar::section_icon;
 pub(crate) use theme::*;
 
@@ -224,7 +223,11 @@ pub fn open_main_window(cx: &mut App) -> Option<Entity<AppView>> {
         ..TitleBar::window_options()
     };
     match open_window(options, cx, |window, cx| cx.new(|cx| AppView::new(window, cx))) {
-        Ok((_, view)) => Some(view),
+        Ok((window, view)) => {
+            // After an update, its release notes, once: the next window finds them seen.
+            crate::ui::whats_new::show_once(window, cx);
+            Some(view)
+        }
         Err(e) => {
             eprintln!("could not open a window: {e:#}");
             None
@@ -290,7 +293,20 @@ gpui_kit::actions!(
         GoHelm,
         GoAssistant,
         GoSettings,
-        ToggleAssistant
+        ToggleAssistant,
+        OpenArgo,
+        OpenTimeline,
+        OpenAccess,
+        OpenUpgradeCheck,
+        OpenAgents,
+        OpenAgentActivity,
+        OpenContexts,
+        OpenTerminal,
+        OpenApply,
+        OpenHelmInstall,
+        OpenApiRequests,
+        ToggleWriteMode,
+        ToggleTheme
     ]
 );
 

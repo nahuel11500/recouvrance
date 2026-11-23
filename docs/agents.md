@@ -23,10 +23,35 @@ approved (or cannot be), it shows only the allowed rows, and a rejection is stil
 it shows the rows of every Ask rule the list meets (`find_problems` asks to list pods: approving
 it shows other kinds' findings only where an Allow rule covers them). Rules changed while a call waits for approval
 apply to it: it is checked again once approved, and `apply_manifest` checks each object again before
-applying it (an object whose rule turned into *Ask me* needs its own approval). In **Agents**, click **Connect Claude Code**: it registers the server in your
-Claude Code (`claude mcp add --scope user recouvrance …`). There is one agent, "Claude", with its rules;
-*Several agents…* gives other tools their own token and rules if you ever need that. Tokens are
-stored hashed (the assistant's copy is in a 0600 file).
+applying it (an object whose rule turned into *Ask me* needs its own approval).
+
+### Connecting your tools
+
+In **Agents**, click **Connect Claude Code**: it registers the server in your Claude Code
+(`claude mcp add --scope user recouvrance …`). For another tool, pick it under *Connect* on the
+agent's page and copy its config, or its command where it has one:
+
+| Tool | Where it goes |
+|---|---|
+| Codex | `~/.codex/config.toml` |
+| Cursor | `~/.cursor/mcp.json` |
+| VS Code | `~/.copilot/mcp-config.json`, the file its Copilot agent reads (and Copilot CLI) |
+| Gemini CLI | `~/.gemini/settings.json`, or the `gemini mcp add` command |
+| Zed | its settings file (*zed: open settings file*) |
+
+Each holds the server's URL and the agent's token; *Copy token* copies the token alone, for any other
+MCP client. The page shows the token masked: copying puts it on the clipboard and nowhere else. A
+call can wait 2 minutes for your approval, then `wait_for` and `rollout_status` can wait 5 more, so
+the configs give a tool call 10 minutes where the tool has that setting: Codex and Zed stop one after
+60 s by default, Gemini CLI after 10 minutes; Cursor and VS Code have no such setting. Codex also asks
+before each tool that changes something, then the agent's rules apply as well:
+`default_tools_approval_mode = "approve"` in its entry leaves that to the rules.
+
+There is one agent, "Claude", with its rules, and all these tools can share it; *Several agents…*
+gives each tool its own token and rules if you ever need that. Tokens are stored hashed, but the main
+agent's is also kept for the assistant (in a 0600 file), so its configs can be copied at any time;
+another agent's can be copied only right after it is created or given a **New token** (which cuts off
+the tools that used the old one).
 
 ## Rules
 
@@ -204,9 +229,16 @@ obvious verb:
 - **Helm:** the Helm tools read the Secrets Helm keeps releases in, so the rules on `secrets`
   decide: `list` for releases and history, `get` on `sh.helm.release.v1.<name>.v<revision>` for
   values, whose secret-looking keys are masked unless `reveal` is allowed.
+- **Apply:** `apply_manifest` applies a manifest's CRDs first, then its other objects in order. An
+  object of a type a CRD of the same manifest defines is authorized as that CRD says, and applied
+  once the API server serves the type (it waits up to 20 seconds); a dry run can't check it, as
+  the CRD isn't created, and says so. A type whose CRD an earlier call applied, or whose API group
+  version the app hasn't seen, is looked up in that group version at once; a new type in a group
+  version already known waits for discovery to run again, at most once a minute.
 - **Diff:** `diff_manifest` shows what `apply_manifest` would change, object by object, from a
   server-side dry run. It needs `get` on each object, changes nothing, masks Secret values unless
-  `reveal` is allowed, and says when the apply would hit a field-manager conflict.
+  `reveal` is allowed, and says when the apply would hit a field-manager conflict. An object whose
+  CRD is only in the manifest is shown as created, not checked by the server.
 - **About the cluster:** `explain_resource` (field docs, CRDs included) and `cluster_version` read
   no objects; `can_i` asks the API server what the kubeconfig user may do (the agent's own rules are
   `my_permissions`).
