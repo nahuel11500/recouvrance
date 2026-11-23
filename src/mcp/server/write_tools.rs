@@ -409,7 +409,7 @@ impl KubeMcp {
                 kind = self.hub.new_kind(context, &api_version, &kind_name).await;
             }
             let Some(kind) = kind else {
-                let hint = unknown_hint(&kinds, &kind_name);
+                let hint = unknown_hint(&kinds, &api_version, &kind_name);
                 return Err(call
                     .finish(Err(anyhow::anyhow!("unknown type {api_version} {kind_name}{hint}")))
                     .unwrap_err());
@@ -465,11 +465,15 @@ fn crds_first(docs: &mut [serde_json::Value]) {
 }
 
 /// What to do about a type discovery doesn't have: the `apiVersion` the cluster serves that
-/// kind at, if it does, or when discovery runs again.
-fn unknown_hint(kinds: &[Kind], kind_name: &str) -> String {
-    match kinds.iter().find(|k| k.ar.kind == kind_name) {
-        Some(k) => format!(" (did you mean apiVersion: {}?)", k.ar.api_version),
-        None => " (a CRD installed outside apply_manifest in the last minute is found when discovery runs again, at most a minute later)".to_string(),
+/// kind at, if it does. Otherwise, in a group version discovered, when discovery runs again;
+/// a group version it hadn't was just asked of the API server (`Hub::new_kind`).
+fn unknown_hint(kinds: &[Kind], api_version: &str, kind_name: &str) -> String {
+    if let Some(k) = kinds.iter().find(|k| k.ar.kind == kind_name) {
+        format!(" (did you mean apiVersion: {}?)", k.ar.api_version)
+    } else if kinds.iter().any(|k| k.ar.api_version == api_version) {
+        " (a CRD installed outside apply_manifest in the last minute is found when discovery runs again, at most a minute later)".to_string()
+    } else {
+        " (the API server serves no such type)".to_string()
     }
 }
 
@@ -495,7 +499,10 @@ mod tests {
     #[test]
     fn an_unknown_type_says_what_to_do() {
         let kinds = vec![Kind::fake("apps", "Deployment")];
-        assert_eq!(unknown_hint(&kinds, "Deployment"), " (did you mean apiVersion: apps/v1?)");
-        assert!(unknown_hint(&kinds, "Stage").contains("discovery runs again"));
+        assert_eq!(unknown_hint(&kinds, "apps/v2", "Deployment"), " (did you mean apiVersion: apps/v1?)");
+        // A new kind in a group version discovered waits for the next discovery.
+        assert!(unknown_hint(&kinds, "apps/v1", "Stage").contains("discovery runs again"));
+        // A group version discovery didn't have was asked of the API server just now.
+        assert_eq!(unknown_hint(&kinds, "kwok.x-k8s.io/v1alpha1", "Stage"), " (the API server serves no such type)");
     }
 }
