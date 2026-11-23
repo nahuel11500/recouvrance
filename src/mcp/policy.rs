@@ -430,8 +430,15 @@ impl Policy {
     /// Whether some non-expired Allow or Ask rule names this context, and no Deny of
     /// everything covers it: checked before connecting.
     pub fn context_allowed(&self, context: &str) -> bool {
+        self.context_denied_by(context).is_none()
+            && self.rules.iter().any(|r| r.effect != Mode::Deny && !r.expired() && any_glob(&r.contexts, context))
+    }
+
+    /// The non-expired Deny of everything (`*` verbs, resources, namespaces and names) that
+    /// covers this context, if one does: no rule added can open the context then.
+    pub fn context_denied_by(&self, context: &str) -> Option<usize> {
         let all = |patterns: &[String]| patterns.iter().any(|p| p.trim() == "*");
-        let denied = self.rules.iter().any(|r| {
+        self.rules.iter().position(|r| {
             r.effect == Mode::Deny
                 && !r.expired()
                 && all(&r.verbs)
@@ -439,8 +446,7 @@ impl Policy {
                 && all(&r.namespaces)
                 && all(&r.names)
                 && any_glob(&r.contexts, context)
-        });
-        !denied && self.rules.iter().any(|r| r.effect != Mode::Deny && !r.expired() && any_glob(&r.contexts, context))
+        })
     }
 
     /// Turn pre-rules settings into rules, once.
@@ -666,8 +672,11 @@ pub(super) mod tests {
             agent: "a".into(),
             tool: "list_resources".into(),
             summary: String::new(),
+            detail: None,
+            preview: None,
             access: pods.clone(),
             dry_run: false,
+            deadline: std::time::Instant::now(),
         };
         let p = Policy { rules: vec![approval.as_rule().unwrap()], ..Policy::default() };
         assert_eq!(p.decide(&pods).mode, Mode::Allow);
@@ -802,8 +811,11 @@ pub(super) mod tests {
             agent: "a".into(),
             tool: "rollout_restart".into(),
             summary: String::new(),
+            detail: None,
+            preview: None,
             access: access("c1", "restart", "deployments.apps", Some("team"), Some("web")),
             dry_run: false,
+            deadline: std::time::Instant::now(),
         };
         // It wins over the Ask rule that asked, for exactly this request.
         let ask = rule(Mode::Ask, &["restart"], &["*"], &["*"], &["*"]);
@@ -854,8 +866,11 @@ pub(super) mod tests {
             agent: "a".into(),
             tool: tool.into(),
             summary: String::new(),
+            detail: None,
+            preview: None,
             access: access("c1", verb, "pods", Some("team"), name),
             dry_run: false,
+            deadline: std::time::Instant::now(),
         };
         assert!(approval("exec_command", "exec", Some("web-1")).as_rule().is_none());
         assert!(approval("exec_command", "exec", Some("web-1")).as_rule_for_an_hour().is_none());
@@ -1058,8 +1073,11 @@ pub(crate) mod properties {
                 agent: "agent".into(),
                 tool: "get_resource".into(),
                 summary: String::new(),
+                detail: None,
+                preview: None,
                 access: a.clone(),
                 dry_run,
+                deadline: std::time::Instant::now(),
             };
             for rule in [approval.as_rule(), approval.as_rule_for_an_hour()].into_iter().flatten() {
                 if rule.matches(&b, false) {

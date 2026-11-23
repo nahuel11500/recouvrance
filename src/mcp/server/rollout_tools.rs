@@ -10,6 +10,7 @@ use serde_json::json;
 use super::{KubeMcp, access_for, get_named};
 use crate::k8s::{self, rollouts};
 use crate::mcp::Verb;
+use crate::mcp::preview::Plan;
 
 #[derive(Deserialize, schemars::JsonSchema)]
 pub struct RolloutParams {
@@ -105,6 +106,14 @@ impl KubeMcp {
         let mut call = self.begin(&parts, "set_image", args)?;
         let (client, kind) = self.kind(&call, &p.context, &p.kind).await?;
         let access = access_for(&kind, &p.context, Verb::Patch, Some(p.namespace.clone()), Some(p.name.clone()));
+        call.plan = Some(Plan::Image {
+            client: client.clone(),
+            kind: kind.clone(),
+            ns: p.namespace.clone(),
+            name: p.name.clone(),
+            container: p.container.clone(),
+            image: p.image.clone(),
+        });
         self.authorize(&mut call, &access).await?;
         let value = match get_named(&client, &kind, Some(&p.namespace), &p.name, false).await {
             Ok(v) => v,

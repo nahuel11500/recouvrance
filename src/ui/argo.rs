@@ -15,9 +15,11 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use kube::Client;
 
-use crate::details::{ArgoAction, OpenNamespace, OpenOnContext, confirm_argo_action};
+use crate::details::{ArgoAction, OpenOn, OpenOnContext, confirm_argo_action};
+use crate::k8s::argo::diagnosis::Res;
 use crate::k8s::argo::{self, Fleet, FleetApp, Summary};
 use crate::k8s::{self, ObjectRef};
+use crate::overview::column_cell as column;
 use crate::status::Tone;
 
 // MARK: Grouping
@@ -234,16 +236,9 @@ impl Rows {
 /// Column widths.
 const NAME: f32 = 340.;
 const INDENT: f32 = 16.;
-/// The space kept for a row's menu, so no column draws under it.
+/// The space kept for a row's menu, so no column draws under it. The header keeps that room
+/// too, so its columns shrink like the rows' in a narrow window (`column`).
 const MENU: f32 = 24.;
-
-/// A column, the same in the header and the rows so they line up. In a narrow window the wide
-/// columns give up width (down to half of it, their text cut with an ellipsis); the short ones
-/// keep theirs. Both shrink alike: the header keeps room for the menu, as the rows do.
-fn column(w: f32, shrinks: bool) -> Div {
-    let d = div().w(px(w)).overflow_hidden().text_ellipsis().whitespace_nowrap();
-    if shrinks { d.flex_shrink(1.).min_w(px(w / 2.)) } else { d.flex_none() }
-}
 
 pub struct ArgoView {
     clusters: Vec<(String, Client)>,
@@ -271,7 +266,7 @@ pub struct ArgoView {
 }
 
 impl EventEmitter<OpenOnContext> for ArgoView {}
-impl EventEmitter<OpenNamespace> for ArgoView {}
+impl EventEmitter<OpenOn> for ArgoView {}
 
 impl ArgoView {
     pub fn new(clusters: Vec<(String, Client)>, window: &mut Window, cx: &mut Context<Self>) -> Self {
@@ -487,7 +482,7 @@ impl ArgoView {
     fn open_destination(&mut self, k: &Key, cx: &mut Context<Self>) {
         let Some(a) = self.find(k) else { return };
         let Some(context) = a.on.clone().filter(|_| !a.dest.namespace.is_empty()) else { return };
-        let ev = OpenNamespace { context, namespace: a.dest.namespace.clone() };
+        let ev = OpenOn { context, res: Res::namespace(&a.dest.namespace) };
         cx.emit(ev);
     }
 
@@ -612,6 +607,7 @@ impl ArgoView {
             .child(div().w(px(MENU)).flex_none().child(row_menu(
                 &k,
                 a.on.is_some() && !a.dest.namespace.is_empty(),
+                Offers::of(app),
                 view,
             )))
             .into_any_element()
@@ -725,9 +721,26 @@ fn picker(
     )
 }
 
-/// A row's menu: open it or where it deploys, refresh, hard refresh, sync. Its actions find the
-/// Application again by its key: the list may have been read again since it was drawn.
-fn row_menu(k: &Key, has_destination: bool, view: WeakEntity<ArgoView>) -> impl IntoElement {
+/// What a row's menu offers beyond Refresh and Sync, from the Application as listed. Its
+/// dialog reads the Application again and says what Argo CD would refuse.
+#[derive(Clone, Copy)]
+struct Offers {
+    /// An operation runs: it can be terminated.
+    terminate: bool,
+    /// Auto-sync is off and a deployment precedes the newest: Argo CD allows a rollback.
+    roll_back: bool,
+}
+
+impl Offers {
+    fn of(app: &Summary) -> Self {
+        Self { terminate: app.in_progress, roll_back: !app.automated && app.history.len() >= 2 }
+    }
+}
+
+/// A row's menu: open it or where it deploys, refresh, hard refresh, sync, terminate, roll
+/// back. Its actions find the Application again by its key: the list may have been read again
+/// since it was drawn.
+fn row_menu(k: &Key, has_destination: bool, offers: Offers, view: WeakEntity<ArgoView>) -> impl IntoElement {
     let k = k.clone();
     let id = SharedString::from(format!("argo-menu-{}-{}-{}", k.0, k.1, k.2));
     Button::new(id).xsmall().ghost().icon(Lucide::Ellipsis).dropdown_menu(move |menu: PopupMenu, _, _| {
@@ -762,6 +775,18 @@ fn row_menu(k: &Key, has_destination: bool, view: WeakEntity<ArgoView>) -> impl 
                 PopupMenuItem::new("Hard refresh…").icon(Lucide::RefreshCcwDot).on_click(act(ArgoAction::HardRefresh)),
             )
             .item(PopupMenuItem::new("Sync…").icon(Lucide::GitBranch).on_click(act(ArgoAction::Sync)))
+            .item(
+                PopupMenuItem::new("Terminate…")
+                    .icon(Lucide::CircleStop)
+                    .disabled(!offers.terminate)
+                    .on_click(act(ArgoAction::Terminate)),
+            )
+            .item(
+                PopupMenuItem::new("Roll back to the previous deployment…")
+                    .icon(Lucide::Undo2)
+                    .disabled(!offers.roll_back)
+                    .on_click(act(ArgoAction::Rollback(None))),
+            )
     })
 }
 

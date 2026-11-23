@@ -38,12 +38,17 @@ pub fn run(ctx: String) {
             println!();
             return;
         }
-        if std::env::var("RECOUVRANCE_PROBLEMS").is_ok() {
+        if let Ok(how) = std::env::var("RECOUVRANCE_PROBLEMS") {
             let kinds = k8s::discover(client.clone()).await.unwrap();
+            if how == "kinds" {
+                problems_by_kind(&client, &kinds).await;
+                return;
+            }
             let t = std::time::Instant::now();
             let scan = problems::scan_partial(client.clone(), &kinds, None, None).await;
             let p = &scan.problems;
             println!("{} problems in {:?}", p.len(), t.elapsed());
+            println!("peak memory {} MB (VmHWM)", mb(memory("VmHWM")));
             if let Some(skipped) = scan.skipped_text() {
                 println!("could not read {skipped}");
             }
@@ -274,4 +279,50 @@ fn print_memory() {
     for line in status.lines().filter(|l| l.starts_with("VmHWM") || l.starts_with("VmRSS")) {
         println!("{line}");
     }
+}
+
+/// Each check of the Problems scan alone, one after the other (`RECOUVRANCE_PROBLEMS=kinds`):
+/// its time, and the process's peak resident memory while it ran, with what it held before.
+/// The memory is Linux's: the peak is reset to what is held before each check.
+async fn problems_by_kind(client: &kube::Client, kinds: &[k8s::Kind]) {
+    let with_services = |k: &k8s::Kind| problems::WITH_SERVICES.iter().any(|(g, n)| k.is(g, n));
+    for (group, name) in problems::CHECKED {
+        let Some(kind) = kinds.iter().find(|k| k.is(group, name)) else { continue };
+        // Checked with the Services they point to.
+        if with_services(kind) {
+            continue;
+        }
+        let mut checked = vec![kind.clone()];
+        if kind.is("", "Service") {
+            checked.extend(kinds.iter().filter(|k| with_services(k)).cloned());
+        }
+        // What the check before freed goes back to the system after a moment.
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        let _ = std::fs::write("/proc/self/clear_refs", "5");
+        let before = memory("VmRSS");
+        let t = std::time::Instant::now();
+        let scan = problems::scan_partial(client.clone(), &checked, None, None).await;
+        println!(
+            "{name}: {} problems in {:?}, peak {} MB from {} MB",
+            scan.problems.len(),
+            t.elapsed(),
+            mb(memory("VmHWM")),
+            mb(before)
+        );
+        if let Some(skipped) = scan.skipped_text() {
+            println!("  could not read {skipped}");
+        }
+    }
+}
+
+/// A memory figure of this process in MB, from /proc/self/status (`VmHWM`: its peak, `VmRSS`:
+/// now); None off Linux.
+fn memory(field: &str) -> Option<u64> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    let kb = status.lines().find_map(|l| l.strip_prefix(field)?.strip_prefix(':'))?;
+    Some(kb.trim().trim_end_matches("kB").trim().parse::<u64>().ok()? / 1024)
+}
+
+fn mb(v: Option<u64>) -> String {
+    v.map_or_else(|| "?".into(), |v| v.to_string())
 }

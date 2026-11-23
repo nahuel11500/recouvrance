@@ -128,6 +128,11 @@ impl ClusterOverview {
         Self { summaries: None, clusters: shown, upgrade_shown: false, upgrade: None, _task: task }
     }
 
+    /// Show the Upgrade check tab (the palette's Upgrade check).
+    pub fn show_upgrade_check(&mut self, cx: &mut Context<Self>) {
+        self.select_tab(1, cx);
+    }
+
     /// Show the overview (0) or the Upgrade check (1), which checks when first shown.
     fn select_tab(&mut self, ix: usize, cx: &mut Context<Self>) {
         self.upgrade_shown = ix == 1;

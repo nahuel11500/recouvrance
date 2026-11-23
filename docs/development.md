@@ -48,11 +48,16 @@ settings untouched. Give it another MCP port too (`{"port": 47199, "version": 1}
 have open.
 
 **Smoke checks**: `RECOUVRANCE_SMOKE=<context> cargo run --features dev` lists types and watches
-pods; add `RECOUVRANCE_LISTTIME=1`, `RECOUVRANCE_PROBLEMS=1`, or dry runs such as
-`RECOUVRANCE_NODESHELLDRY=<node>` (see `src/dev/smoke.rs`). `RECOUVRANCE_PODRES=<seconds>` reads the
-usage bars' requests and limits of every pod for that long, and `RECOUVRANCE_CLUSTERLOAD=<rounds>`
-loads the cluster overview that many times in a row; both then print what their requests read (as
-Settings → API requests counts it) and the peak memory (`VmHWM`).
+pods; add `RECOUVRANCE_LISTTIME=1`, `RECOUVRANCE_PROBLEMS=1` (the Problems scan's time and, on
+Linux, the process's peak memory; `RECOUVRANCE_PROBLEMS=kinds` runs each kind's check alone, with
+its own peak), or dry runs such as `RECOUVRANCE_NODESHELLDRY=<node>` (see `src/dev/smoke.rs`).
+`RECOUVRANCE_PODRES=<seconds>` reads the usage bars' requests and limits of every pod for that long,
+and `RECOUVRANCE_CLUSTERLOAD=<rounds>` loads the cluster overview that many times in a row; both then
+print what their requests read (as Settings → API requests counts it) and the peak memory (`VmHWM`).
+
+**Timings**: `RECOUVRANCE_TIMINGS=1` prints to stderr every 10 seconds where the time went (frames,
+table filtering, watch batches, the assistant's API requests) and, for the assistant with an API
+key, its input tokens: uncached, written to the prompt cache and read from it.
 
 **README screenshots** live on the `media` branch, so `main` stays small. Take them on a throwaway
 kind cluster with demo workloads, never a real one (names of clusters, namespaces and objects show).

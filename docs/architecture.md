@@ -29,7 +29,7 @@ Recouvrance is one Rust binary: a [gpui](https://github.com/zed-industries/zed) 
 | Path | What |
 |---|---|
 | `src/main.rs` | Entry point: the window, `serve` (headless MCP), `agent-create` |
-| `src/app/` | The main window: contexts, sidebar, resource list page, tabs and history, theme |
+| `src/app/` | The main window: contexts, sidebar, resource list page, tabs and history, theme, key bindings and the macOS menu bar |
 | `src/table/` | The resource table (server-side columns, usage bars, links) and its filter language |
 | `src/details/` | A detail page: tabs, actions and their confirmations, logs, compare, related data |
 | `src/overview/` | The Overview tab, per kind: pods, workloads, nodes, networking, configuration, RBAC |
@@ -37,7 +37,7 @@ Recouvrance is one Rust binary: a [gpui](https://github.com/zed-industries/zed) 
 | `src/mcp/` | The agent hub (agents, rules, approvals, audit) and the MCP server with its tools and prompts |
 | `src/agents/` | The Agents page |
 | `src/ui/` | Other pages and widgets: settings, Helm, apply, cluster and workloads overviews, terminal, pickers |
-| `src/diagnose.rs`, `rbac.rs`, `schema.rs`, `prom.rs`, `problems.rs`, `certs.rs` | Logic without UI, unit-tested |
+| `src/diagnose.rs`, `rbac.rs`, `schema.rs`, `prom.rs`, `problems.rs`, `certs.rs`, `updates.rs` | Logic without UI, unit-tested |
 | `src/dev/` | Developer tools (feature `dev`): the off-screen snapshot harness and live smoke checks |
 
 ## How lists stay fast
@@ -62,6 +62,11 @@ go or are resized in place change them without another list. A page off screen f
 stops its watch and lists again once back. On a cluster with about 20,800 pods, the first rows
 show after 0.7 s and all of them after 1.4 s ([measured](COMPARISON.md#measured)).
 
+The Problems scan reads the big kinds from their cells too (`list_light`). What its checks need
+of whole objects (Services, Ingresses and HTTP routes, the pods a Service selects, the workloads of
+a namespace with an idle Service, external-secrets.io's objects) is parsed as each list streams in,
+keeping only the fields the checks use; of the workloads, only those scaled to 0 are kept.
+
 ## Safety model
 
 - **Read-only by default.** Write actions ask to enable write mode first.
@@ -69,8 +74,9 @@ show after 0.7 s and all of them after 1.4 s ([measured](COMPARISON.md#measured)
   a **server dry run** first.
 - **Protected contexts** require typing the context name.
 - Actions your **RBAC** forbids are disabled (`SelfSubjectAccessReview`).
-- **Agents** go through the hub: rules (deny, ask, allow), approvals, a rate limit, an audit log and
-  a kill switch. Write mode and protected contexts don't apply to them: only their rules do.
+- **Agents** go through the hub: rules (deny, ask, allow), approvals (which show what a write will
+  change, worked out with a server dry run), a rate limit, an audit log and a kill switch. Write mode
+  and protected contexts don't apply to them: only their rules do.
 - **Login commands keep their secrets.** kube's error for a failed exec plugin holds its whole
   command line and its output; each client replaces it, when it is built and on every request
   (a token refresh runs the plugin again), by the program's file name, taken from the kubeconfig,
@@ -78,3 +84,13 @@ show after 0.7 s and all of them after 1.4 s ([measured](COMPARISON.md#measured)
   last line the plugin wrote to stderr is added when the kubeconfig sets `interactiveMode: Never`:
   kube keeps stderr only then, and otherwise the plugin writes to the terminal Recouvrance was
   started from. Pages, agents and the audit log only ever get that.
+- **Kubeconfig errors keep their secrets too.** The YAML parser's error for a kubeconfig shows
+  the lines around where it failed and can quote a value: a token, a client key, a login
+  command's arguments. Kubeconfig files are read through `k8s::read_kubeconfig_file`, pasted
+  text through `parse_kubeconfig`: their error says the file, line and column, and why in words
+  of their own.
+- **Proxy passwords stay out of errors.** kube's error for a proxy it can't use prints the proxy's
+  URL whole, user and password included. The client's build error puts that URL back without
+  them, scheme or not (`user:password@host:1080` from `HTTPS_PROXY` reads as a URL to kube, not
+  to a text), and leaves out the user and password of any other URL in its text, as of one in the
+  login plugin's stderr line (`k8s::login`).
