@@ -176,6 +176,20 @@ pub struct ClusterEvent {
     pub events: usize,
 }
 
+impl ClusterEvent {
+    /// What the Timeline says of it (the page and the agents' `recent_changes`):
+    /// `Warning BackOff: restarting (×3)`, and how many events it stands for when several.
+    pub fn summary(&self) -> String {
+        let l = &self.line;
+        let count = match (l.count, self.events) {
+            (_, n) if n > 1 => format!(" (×{}, {n} events)", l.count),
+            (c, _) if c > 1 => format!(" (×{c})"),
+            _ => String::new(),
+        };
+        format!("{} {}: {}{count}", l.kind, l.reason, l.message)
+    }
+}
+
 /// The events of one object with the same type and reason as one: the latest one's message
 /// and time, their counts added up, in the order each was first met. A pod that can't be
 /// scheduled gets a new Event each time the message changes (`0/12 nodes are available…`),

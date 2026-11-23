@@ -65,15 +65,7 @@ impl Entry {
     fn summary(&self) -> String {
         match self {
             Self::Change(_, r) => r.summary.clone(),
-            Self::Event(_, e) => {
-                let l = &e.line;
-                let count = match (l.count, e.events) {
-                    (_, n) if n > 1 => format!(" (×{}, {n} events)", l.count),
-                    (c, _) if c > 1 => format!(" (×{c})"),
-                    _ => String::new(),
-                };
-                format!("{} {}: {}{count}", l.kind, l.reason, l.message)
-            }
+            Self::Event(_, e) => e.summary(),
         }
     }
 

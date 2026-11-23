@@ -12,8 +12,9 @@ use gpui_kit::*;
 
 use crate::settings::{self, ConfirmStyle, DeleteConfirm, InitialView, Startup};
 
-#[derive(Clone, Copy, PartialEq)]
-enum Section {
+/// A section of the page, picked on its left.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Section {
     General,
     Contexts,
     Clusters,
@@ -80,6 +81,17 @@ pub struct SettingsView {
     _saves: std::collections::HashMap<EntityId, Task<()>>,
     /// Redraws API requests every 2 s while it is shown.
     _ticker: Task<()>,
+    /// What About's Check for updates found, and its request (sent only on a click).
+    update_check: Option<UpdateCheck>,
+    update_task: crate::latest::Latest,
+}
+
+/// What Check for updates found.
+enum UpdateCheck {
+    Checking,
+    /// The version of the latest release.
+    Found(String),
+    Failed(String),
 }
 
 impl SettingsView {
@@ -172,6 +184,7 @@ impl SettingsView {
             Some("appearance") => Section::Appearance,
             Some("general") => Section::General,
             Some("assistant") => Section::Assistant,
+            Some("about") => Section::About,
             _ => Section::General,
         };
         let mut this = Self {
@@ -209,6 +222,8 @@ impl SettingsView {
                     }
                 }
             }),
+            update_check: None,
+            update_task: Default::default(),
         };
         // Another window may have changed a setting meanwhile.
         this._subs.push(cx.observe_window_activation(window, |this, window, cx| {
@@ -381,6 +396,21 @@ impl SettingsView {
 
     pub fn set_kinds(&mut self, kinds: Vec<crate::k8s::Kind>) {
         self.kinds = kinds;
+    }
+
+    /// Every section: its name and icon, in the page's order.
+    pub fn sections() -> &'static [(Section, &'static str, Lucide)] {
+        &SECTIONS
+    }
+
+    /// Show `section`, with its fields read again.
+    pub fn show(&mut self, section: Section, window: &mut Window, cx: &mut Context<Self>) {
+        self.section = section;
+        if matches!(section, Section::Clusters | Section::Contexts) {
+            self.sync_clusters(window, cx);
+        }
+        self.reload_fields(window, cx);
+        cx.notify();
     }
 
     /// Open on the General section (where deletes are configured).
@@ -876,7 +906,7 @@ impl SettingsView {
             ))
             .child(Self::row(
                 "Zoom",
-                "Also Ctrl + / Ctrl - / Ctrl 0.",
+                &crate::app::with_keys("Also {secondary-=} / {secondary--} / {secondary-0}."),
                 h_flex()
                     .gap_2()
                     .child(
@@ -1150,62 +1180,169 @@ impl SettingsView {
             .into_any_element()
     }
 
+    /// The shortcut list of the `?` panel, then where the commands without a key are.
     fn shortcuts_section(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let theme = cx.theme().clone();
-        let keys = [
-            ("Ctrl K", "Command palette: resources, pages, objects across clusters"),
-            ("Ctrl F  or  /", "Filter the current table"),
-            ("Esc", "Back from a detail page"),
-            ("↑ ↓  then  Enter", "Move in a table, open the row"),
-            ("Ctrl Shift N", "New window (shares agents and settings)"),
-            ("Ctrl T / Ctrl W", "New tab / close tab (right-click a row: open in new tab)"),
-            ("Ctrl Tab / Ctrl Shift Tab", "Next / previous tab"),
-            ("Ctrl B", "Hide or show the sidebar"),
-            ("F5  or  Ctrl R", "Refresh the page"),
-            ("Alt ← / Alt →", "Back / forward"),
-            ("Ctrl + / Ctrl - / Ctrl 0", "Zoom in / out / reset"),
-            ("Right-click a row", "Open, logs, shell, YAML, events, run, scale, restart, delete"),
-            ("Ctrl Shift V", "Paste in a shell"),
-            ("Double-click a context", "Connect to just that context"),
-        ];
         v_flex()
-            .children(keys.into_iter().map(|(k, what)| {
-                h_flex()
-                    .gap_4()
-                    .py_2()
-                    .border_b_1()
-                    .border_color(theme.border)
-                    .child(
-                        div().w(px(220.)).child(
-                            div()
-                                .px_2()
-                                .py_0p5()
-                                .rounded_md()
-                                .bg(theme.secondary)
-                                .text_xs()
-                                .font_family(theme.mono_font_family.clone())
-                                .child(k),
-                        ),
-                    )
-                    .child(div().text_sm().child(what))
-            }))
+            .gap_3()
+            .child(div().text_sm().text_color(cx.theme().muted_foreground).child(crate::app::with_keys(
+                "Every command, with a key or without, is in the command palette ({secondary-k}). Single keys \
+                 (?, g, j, k) work when no text field or terminal has focus.",
+            )))
+            .child(crate::app::shortcut_rows(cx))
             .into_any_element()
     }
 
     fn about_section(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        use crate::updates::{self, VERSION};
         let theme = cx.theme().clone();
         let muted = theme.muted_foreground;
         let _ = window;
+        let latest = match &self.update_check {
+            Some(UpdateCheck::Found(v)) => Some(v.as_str()),
+            _ => None,
+        };
+        let install = updates::install();
+        let advice = install.advice(latest);
+        let found = self.update_check.as_ref().map(|check| {
+            let line = h_flex().gap_2().text_sm();
+            match check {
+                UpdateCheck::Checking => line.text_color(muted).child("Asking GitHub for the latest release…"),
+                UpdateCheck::Failed(e) => line.text_color(theme.danger).child(format!("Could not check: {e}")),
+                UpdateCheck::Found(v) if updates::is_newer(v, VERSION) => {
+                    let page = updates::release_page(v);
+                    line.child(Icon::new(Lucide::CircleArrowUp).size_4().text_color(theme.success))
+                        .child(format!("Recouvrance {v} is out."))
+                        .child(
+                            Button::new("about-release")
+                                .xsmall()
+                                .ghost()
+                                .icon(Lucide::ExternalLink)
+                                .label("Release notes")
+                                .on_click(move |_, _, _| crate::forwards::open_url(&page)),
+                        )
+                }
+                UpdateCheck::Found(v) if updates::is_newer(VERSION, v) => {
+                    line.text_color(muted).child(format!("This build is newer than the latest release, {v}."))
+                }
+                UpdateCheck::Found(_) => line
+                    .child(Icon::new(Lucide::CircleCheck).size_4().text_color(theme.success))
+                    .child("This is the latest version."),
+            }
+        });
+        let command = advice.command.map(|cmd| {
+            let copy = cmd.clone();
+            h_flex()
+                .gap_1()
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .px_2()
+                        .py_1()
+                        .rounded_md()
+                        .bg(theme.secondary)
+                        .font_family(theme.mono_font_family.clone())
+                        .text_xs()
+                        .child(super::selectable::selectable(cmd)),
+                )
+                .child(
+                    Button::new("about-copy")
+                        .xsmall()
+                        .ghost()
+                        .icon(Lucide::Copy)
+                        .tooltip("Copy the command")
+                        .on_click(move |_, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(copy.clone()))),
+                )
+        });
+        let installed = match &install.path {
+            Some(path) => format!("{}: {}", advice.installed, path.display()),
+            None => format!("{}.", advice.installed),
+        };
         v_flex()
             .gap_2()
-            .child(h_flex().gap_2().child(super::logo(px(40.))).child(div().text_2xl().font_weight(FontWeight::BOLD).child("Recouvrance")))
-            .child(div().text_sm().text_color(muted).child(format!("Version {}", env!("CARGO_PKG_VERSION"))))
-            .child(div().text_sm().child("A native Kubernetes client in Rust (gpui), with a local MCP server for AI agents."))
-            .child(div().text_sm().text_color(muted).child(
-                "Installed with the install script: update with recouvrance-update. Releases: github.com/nahuel11500/recouvrance/releases",
-            ))
-            .child(div().pt_3().text_xs().text_color(muted).child("Settings: ~/.config/recouvrance/ · Agent activity: ~/.local/share/recouvrance/audit.jsonl"))
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(super::logo(px(40.)))
+                    .child(div().text_2xl().font_weight(FontWeight::BOLD).child("Recouvrance")),
+            )
+            .child(div().text_sm().text_color(muted).child(format!("Version {VERSION}")))
+            .child(
+                div()
+                    .text_sm()
+                    .child("A native Kubernetes client in Rust (gpui), with a local MCP server for AI agents."),
+            )
+            .child(
+                h_flex()
+                    .pt_2()
+                    .gap_2()
+                    .when(updates::own_notes().is_some(), |d| {
+                        d.child(
+                            Button::new("about-whats-new")
+                                .small()
+                                .outline()
+                                .icon(Lucide::Sparkles)
+                                .label(format!("What's new in {VERSION}"))
+                                .on_click(|_, window, cx| super::whats_new::open_own(window, cx)),
+                        )
+                    })
+                    .child(
+                        Button::new("about-check")
+                            .small()
+                            .outline()
+                            .icon(Lucide::RefreshCw)
+                            .label("Check for updates")
+                            .loading(matches!(self.update_check, Some(UpdateCheck::Checking)))
+                            .on_click(cx.listener(|this, _, _, cx| this.check_updates(cx))),
+                    )
+                    .child(
+                        Button::new("about-releases")
+                            .small()
+                            .ghost()
+                            .icon(Lucide::ExternalLink)
+                            .label("Releases")
+                            .on_click(|_, _, _| crate::forwards::open_url(updates::RELEASES)),
+                    ),
+            )
+            .children(found)
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(muted)
+                    .child("Check for updates asks GitHub for the latest release, only when you click it."),
+            )
+            .child(
+                v_flex()
+                    .gap_1()
+                    .pt_4()
+                    .child(div().text_sm().font_weight(FontWeight::MEDIUM).child("Updating"))
+                    .child(div().text_sm().text_color(muted).child(installed))
+                    .child(div().text_sm().child(advice.how))
+                    .children(command)
+                    .child(div().text_sm().child("Then restart Recouvrance.")),
+            )
+            .child(
+                div()
+                    .pt_3()
+                    .text_xs()
+                    .text_color(muted)
+                    .child("Settings: ~/.config/recouvrance/ · Agent activity: ~/.local/share/recouvrance/audit.jsonl"),
+            )
             .into_any_element()
+    }
+
+    /// Ask GitHub for the latest release: the one request About sends, and only on a click.
+    fn check_updates(&mut self, cx: &mut Context<Self>) {
+        self.update_check = Some(UpdateCheck::Checking);
+        cx.notify();
+        let request = crate::k8s::run(crate::updates::latest_release());
+        self.update_task.spawn(cx, request, |this, found, cx| {
+            this.update_check = Some(match found {
+                Ok(version) => UpdateCheck::Found(version),
+                Err(e) => UpdateCheck::Failed(format!("{e:#}")),
+            });
+            cx.notify();
+        });
     }
 }
 
@@ -1239,14 +1376,7 @@ impl Render for SettingsView {
                             .cursor_pointer()
                             .when(on, |d| d.bg(theme.list_active))
                             .hover(|s| s.bg(theme.list_hover))
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.section = sec;
-                                if matches!(sec, Section::Clusters | Section::Contexts) {
-                                    this.sync_clusters(window, cx);
-                                }
-                                this.reload_fields(window, cx);
-                                cx.notify();
-                            }))
+                            .on_click(cx.listener(move |this, _, window, cx| this.show(sec, window, cx)))
                             .child(Icon::new(*icon).size_4().text_color(theme.muted_foreground))
                             .child(*label)
                     })),

@@ -6,7 +6,7 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use kube::Client;
 use kube::api::{Api, DynamicObject, ListParams};
 
-use super::{Kind, ar_of, list_values, run, spawn_detached};
+use super::{Kind, ar_of, list_values, run, run_abortable, spawn_detached};
 
 pub(super) fn dyn_api(client: Client, kind: &Kind, ns: Option<&str>) -> Api<DynamicObject> {
     match (kind.namespaced, ns) {
@@ -38,6 +38,16 @@ pub async fn scale(
             kind.ar.kind,
             crate::plural::count(now, "replica")
         ))
+    })
+    .await
+}
+
+/// The replicas a workload asks for now, from its scale subresource: what `scale` changes.
+/// Dropping the future stops the request.
+pub async fn replicas(client: Client, kind: Kind, ns: Option<String>, name: String) -> Result<Option<i32>> {
+    run_abortable(async move {
+        let api = dyn_api(client, &kind, ns.as_deref());
+        Ok(api.get_scale(&name).await?.spec.and_then(|s| s.replicas))
     })
     .await
 }
@@ -77,6 +87,24 @@ pub async fn merge_patch(
         let obj = api.patch(&name, &patch_params(dry_run), &kube::api::Patch::Merge(patch)).await?;
         let version = obj.metadata.resource_version.map_or_default(|v| format!(" (resourceVersion {v})"));
         Ok(format!("{}{} {name} patched{version}", if dry_run { "[dry run] " } else { "" }, kind.ar.kind))
+    })
+    .await
+}
+
+/// A server-side dry run of a patch of one object: the object as the server would have it
+/// after. Nothing is changed, and dropping the future stops the request. The object may hold
+/// Secret values: the caller decides what of it to show.
+pub async fn dry_run_patch(
+    client: Client,
+    kind: Kind,
+    ns: Option<String>,
+    name: String,
+    patch: kube::api::Patch<serde_json::Value>,
+) -> Result<serde_json::Value> {
+    run_abortable(async move {
+        let api = dyn_api(client, &kind, ns.as_deref());
+        let obj = api.patch(&name, &patch_params(true), &patch).await?;
+        Ok(serde_json::to_value(obj)?)
     })
     .await
 }

@@ -15,7 +15,7 @@ use kube::Api;
 use kube::api::{DeleteParams, Patch, PatchParams, PostParams};
 use serde_json::json;
 
-use crate::k8s::{self, gate};
+use crate::k8s::{self, gate, meter};
 use crate::mcp::{self, Mode, Verb, rules_file};
 
 const NS: &str = "default";
@@ -27,6 +27,12 @@ fn context() -> String {
 /// Run a test body on the app's runtime, as the app does.
 fn run(body: impl Future<Output = Result<()>> + Send + 'static) {
     futures::executor::block_on(k8s::run(body)).unwrap();
+}
+
+/// What Settings → API requests counts as received from `ctx` by requests of `class` so far.
+fn received(ctx: &str, class: meter::Class) -> u64 {
+    let read = meter::snapshot(meter::now_minute());
+    read.classes.iter().filter(|(c, k, _)| c == ctx && *k == class).map(|(_, _, s)| s.bytes).sum()
 }
 
 fn config_map(name: &str) -> ConfigMap {
@@ -122,7 +128,9 @@ fn write_mode_off_refuses_the_ui_s_writes() {
 
 /// An agent's rules decide on the real cluster through the MCP server: a delete its rules
 /// don't allow is refused and the object stays; the kill switch refuses even reads; with a
-/// delete rule, the same call deletes (so the refusals above are not a broken setup).
+/// delete rule, the same call deletes (so the refusals above are not a broken setup). A
+/// refusal says whether it is final, or the rule that would allow the call, and that rule,
+/// added, does; `check_access` says the same without making the call.
 #[test]
 #[ignore = "needs a kind cluster: RECOUVRANCE_E2E_CONTEXT"]
 fn an_agent_gets_only_what_its_rules_allow() {
@@ -141,10 +149,27 @@ fn an_agent_gets_only_what_its_rules_allow() {
         let out = client.call("delete_resource", delete.clone()).await;
         assert!(out.contains("Denied"), "{out}");
         assert!(truth.get_opt(name).await?.is_some(), "a denied delete reached the cluster");
+        let grant = format!("delete configmaps/{name} -n {NS} --context {ctx}");
+        assert!(out.contains("Grantable") && out.contains(&format!("`{grant}` under allow")), "{out}");
         let out = client
             .call("get_resource", json!({"context": ctx, "kind": "secrets", "namespace": "kube-system", "name": "x"}))
             .await;
-        assert!(out.contains("Denied"), "{out}");
+        assert!(out.contains("Denied") && out.contains("Final"), "{out}");
+        let planned = json!({"requests": [
+            {"context": ctx, "verb": "delete", "kind": "cm", "namespace": NS, "name": name},
+            {"context": ctx, "verb": "get", "kind": "secrets", "namespace": "kube-system", "name": "x"},
+            {"context": ctx, "verb": "list", "kind": "pods"},
+            {"context": "e2e-no-such-context", "verb": "get", "kind": "pods"},
+        ]});
+        let out = client.call("check_access", planned.clone()).await;
+        assert!(
+            out.contains(&format!("1. delete configmaps {name} -n {NS} --context {ctx}: denied. Grantable")),
+            "{out}"
+        );
+        assert!(out.contains("2. get secrets x -n kube-system") && out.contains("denied by rule #2"), "{out}");
+        assert!(out.contains("3. list pods (all namespaces / cluster)") && out.contains("allowed by rule #1"), "{out}");
+        assert!(out.contains("4. get pods --context e2e-no-such-context: could not check"), "{out}");
+        assert!(out.contains("1 allowed, 0 needing approval, 2 denied."), "{out}");
 
         hub.set_agents_enabled(false)?;
         let out = client.call("get_resource", get.clone()).await;
@@ -153,8 +178,11 @@ fn an_agent_gets_only_what_its_rules_allow() {
         let out = client.call("get_resource", get).await;
         assert!(out.contains(name), "{out}");
 
-        let allow = rules_file::parse_rule(Mode::Allow, "delete configmaps/e2e-* -n default")?;
+        // The rule the refusal named is enough.
+        let allow = rules_file::parse_rule(Mode::Allow, &grant)?;
         hub.update_agent(&agent.id, |a| a.policy.rules.push(allow))?;
+        let out = client.call("check_access", planned).await;
+        assert!(out.contains(&format!("{name} -n {NS} --context {ctx}: allowed by rule #3")), "{out}");
         let out = client.call("delete_resource", delete).await;
         assert!(!out.contains("Denied"), "{out}");
         for _ in 0..50 {
@@ -259,6 +287,72 @@ fn an_approval_ends_when_its_agent_stops_waiting() {
         assert!(!out.contains("Rejected") && !out.contains("Denied"), "{out}");
         let data = truth.get(name).await?.data.unwrap_or_default();
         assert_eq!(data.get("a").map(String::as_str), Some("2"), "{out}");
+        truth.delete(name, &DeleteParams::default()).await?;
+        Ok(())
+    });
+}
+
+/// An agent's patch that an Ask rule covers shows, before it is approved, what it will
+/// change: the field with its value now and after, and the diff, from a dry run that changes
+/// nothing. The activity log keeps it with the call.
+#[test]
+#[ignore = "needs a kind cluster: RECOUVRANCE_E2E_CONTEXT"]
+fn an_approval_shows_what_a_patch_will_change() {
+    use futures::StreamExt as _;
+    use std::time::Duration;
+
+    run(async {
+        let ctx = context();
+        let truth: Api<ConfigMap> = Api::namespaced(k8s::connect_for_agents(ctx.clone()).await?, NS);
+        let name = "e2e-preview";
+        let _ = truth.delete(name, &DeleteParams::default()).await;
+        truth.create(&PostParams::default(), &config_map(name)).await?;
+
+        let (hub, agent, token, _server) = agent(&["get,list *"], &[]).await?;
+        let ask = rules_file::parse_rule(Mode::Ask, &format!("patch configmaps/{name} -n {NS}"))?;
+        hub.update_agent(&agent.id, |a| a.policy.rules.push(ask))?;
+        // A window to approve in.
+        hub.set_headless(false);
+        let mut events = hub.subscribe();
+        let client = crate::assistant::Mcp::connect(hub.port(), token).await?;
+        let patch =
+            json!({"context": ctx, "kind": "configmaps", "namespace": NS, "name": name, "patch": {"data": {"a": "2"}}});
+        let approve = async {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+            loop {
+                let event = match tokio::time::timeout_at(deadline, events.next()).await {
+                    Ok(Some(event)) => event,
+                    Ok(None) => bail!("the hub stopped sending events"),
+                    Err(_) => bail!("no approval asked for within 60 s"),
+                };
+                if let mcp::HubEvent::ApprovalRequested(a) = &*event {
+                    // Asked for once the dry run is done: the object is still as it was.
+                    let data = truth.get(name).await?.data.unwrap_or_default();
+                    hub.resolve_approval(a.id, true);
+                    return anyhow::Ok((a.preview.clone(), data));
+                }
+            }
+        };
+        let (out, approved) = tokio::join!(client.call("patch_resource", patch), approve);
+        let (preview, before) = approved?;
+        let preview = preview.context("the approval shows no preview")?;
+        assert_eq!(before.get("a").map(String::as_str), Some("1"), "the dry run changed the object");
+        let text = preview.text();
+        assert!(text.contains(&format!("ConfigMap {NS}/{name}: changed")), "{text}");
+        assert!(text.contains("data.a: 1 → 2"), "{text}");
+        let added = preview
+            .sections
+            .iter()
+            .flat_map(|s| &s.diff)
+            .any(|l| matches!(l, crate::history::DiffLine::Added(t) if t.contains("a:") && t.contains('2')));
+        assert!(added, "{text}");
+        assert!(!out.contains("Rejected") && !out.contains("Denied"), "{out}");
+        let data = truth.get(name).await?.data.unwrap_or_default();
+        assert_eq!(data.get("a").map(String::as_str), Some("2"), "{out}");
+        // The log keeps what the approval showed.
+        let logged = hub.recent_audit(5, |e| e.agent_id == agent.id && e.tool == "patch_resource");
+        let change = logged.first().and_then(|e| e.change.clone()).unwrap_or_default();
+        assert!(change.contains("data.a: 1 → 2"), "{change}");
         truth.delete(name, &DeleteParams::default()).await?;
         Ok(())
     });
@@ -415,6 +509,8 @@ fn shells_and_attach_reach_the_container() {
     }
 
     run(async {
+        let ctx = context();
+        let streamed = || received(&ctx, meter::Class::Stream);
         let client = k8s::connect_for_agents(context()).await?;
         let pods: Api<Pod> = Api::namespaced(client.clone(), NS);
         let name = "e2e-shell";
@@ -445,11 +541,15 @@ fn shells_and_attach_reach_the_container() {
         };
         let checked = async {
             running.await?;
+            let before = streamed();
             let mut shell = k8s::exec_shell(client.clone(), NS.into(), name.into(), None);
             let _ = shell.input.unbounded_send(ExecInput::Resize { cols: 80, rows: 24 });
             let _ = shell.input.unbounded_send(ExecInput::Bytes(b"echo $((20+22))-answered\n".to_vec()));
             let text = read_until(&mut shell, "42-answered").await;
             assert!(text.contains("42-answered"), "{text}");
+            // What the shell printed came over its upgraded connection, and counts as received.
+            let counted = streamed().saturating_sub(before);
+            assert!(counted >= text.len() as u64, "{counted} bytes counted for {} printed", text.len());
             let _ = shell.input.unbounded_send(ExecInput::Bytes(b"exit\n".to_vec()));
             let text = read_until(&mut shell, "[exit:").await;
             assert!(text.contains("[exit: Session ended]"), "{text}");
@@ -488,6 +588,14 @@ fn shells_and_attach_reach_the_container() {
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             }
             assert_eq!(left(&ps), 0, "the closed shell is still running:\n{ps}");
+
+            // A command's output counts as it is read, whether it is kept or not.
+            let before = streamed();
+            let zeros = vec!["head".into(), "-c".into(), "300000".into(), "/dev/zero".into()];
+            let out = k8s::exec_capture(client.clone(), NS.into(), name.into(), None, zeros, 30, 1024).await?;
+            assert!(out.contains("[truncated]"), "{out}");
+            let counted = streamed().saturating_sub(before);
+            assert!(counted >= 300_000, "{counted} bytes counted for 300000 printed");
             Ok(())
         };
         let result: Result<()> = checked.await;
@@ -669,8 +777,12 @@ fn an_agent_s_port_forward_follows_its_rules() {
             hub.update_agent(&agent.id, |a| a.policy.rules.push(allow))?;
             let out = client.call("port_forward", args).await;
             let port = hub.forwards().first().map(|f| f.local).with_context(|| format!("no forward: {out}"))?;
+            let before = received(&ctx, meter::Class::Stream);
             let page = fetch(port).await?;
             assert!(page.contains("forwarded-ok"), "{page}");
+            // The page came back through the forward's tunnel, and counts as received.
+            let counted = received(&ctx, meter::Class::Stream).saturating_sub(before);
+            assert!(counted >= page.len() as u64, "{counted} bytes counted for {} forwarded", page.len());
 
             hub.set_agents_enabled(false)?;
             assert!(hub.forwards().is_empty(), "the kill switch stops agents' forwards");
@@ -813,10 +925,13 @@ fn an_agent_reads_a_workload_s_logs() {
             let (hub, agent, token, _server) = agent(&["get,list,logs *"], &[]).await?;
             let mcp = crate::assistant::Mcp::connect(hub.port(), token).await?;
             let args = json!({"context": ctx, "kind": "deployments", "namespace": NS, "name": name, "grep": "tick"});
+            let before = received(&ctx, meter::Class::Logs);
             let out = mcp.call("workload_logs", args.clone()).await;
             let ticks = out.lines().filter(|l| l.contains("tick-"));
             let prefixes: std::collections::HashSet<&str> = ticks.filter_map(|l| l.split(']').next()).collect();
             assert_eq!(prefixes.len(), 2, "{out}");
+            // The logs read count as received, as their bodies are read.
+            assert!(received(&ctx, meter::Class::Logs) > before, "no log bytes counted");
             assert!(out.contains("logs of container main (the default), not of helper"), "{out}");
             let pod = pods.list(&kube::api::ListParams::default().labels(&format!("app={name}"))).await?.items;
             let pod = pod.first().and_then(|p| p.metadata.name.clone()).unwrap_or_default();
@@ -895,27 +1010,36 @@ fn an_agent_pauses_and_sets_an_image() {
 }
 
 /// `diff_manifest` shows what an apply would change, with get rules only, and changes nothing.
+/// A type the sidebar leaves out (a `FlowSchema`, which kwok's manifest holds) is planned like
+/// any other: `apply_manifest` resolves types the same way.
 #[test]
 #[ignore = "needs a kind cluster: RECOUVRANCE_E2E_CONTEXT"]
 fn an_agent_diffs_a_manifest_without_changing_anything() {
+    use k8s_openapi::api::flowcontrol::v1::FlowSchema;
+
     run(async {
         let ctx = context();
-        let truth: Api<ConfigMap> = Api::namespaced(k8s::connect_for_agents(ctx.clone()).await?, NS);
-        let (name, new) = ("e2e-diff", "e2e-diff-new");
+        let client = k8s::connect_for_agents(ctx.clone()).await?;
+        let truth: Api<ConfigMap> = Api::namespaced(client.clone(), NS);
+        let flows: Api<FlowSchema> = Api::all(client);
+        let (name, new, flow) = ("e2e-diff", "e2e-diff-new", "e2e-diff-flow");
         for n in [name, new] {
             let _ = truth.delete(n, &DeleteParams::default()).await;
         }
+        let _ = flows.delete(flow, &DeleteParams::default()).await;
         truth.create(&PostParams::default(), &config_map(name)).await?;
         let checked = async {
             let (hub, _agent, token, _server) = agent(&["get,list *"], &[]).await?;
             let mcp = crate::assistant::Mcp::connect(hub.port(), token).await?;
             let manifest = format!(
-                "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: {name}\n  namespace: {NS}\ndata:\n  a: \"2\"\n---\napiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: {new}\n  namespace: {NS}\ndata:\n  b: \"1\"\n"
+                "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: {name}\n  namespace: {NS}\ndata:\n  a: \"2\"\n---\napiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: {new}\n  namespace: {NS}\ndata:\n  b: \"1\"\n---\napiVersion: flowcontrol.apiserver.k8s.io/v1\nkind: FlowSchema\nmetadata:\n  name: {flow}\nspec:\n  priorityLevelConfiguration:\n    name: global-default\n"
             );
             let out = mcp.call("diff_manifest", json!({"context": ctx, "manifest": manifest})).await;
             assert!(out.contains("-  a: '1'") || out.contains("-  a: \"1\""), "{out}");
             assert!(out.contains(&format!("ConfigMap {NS}/{new}: created")), "{out}");
+            assert!(out.contains(&format!("FlowSchema {flow}: created")), "{out}");
             assert!(truth.get_opt(new).await?.is_none(), "a diff created an object");
+            assert!(flows.get_opt(flow).await?.is_none(), "a diff created a FlowSchema");
             let a = truth.get(name).await?.data.and_then(|d| d.get("a").cloned());
             assert_eq!(a.as_deref(), Some("1"), "a diff changed an object");
             Ok(())
@@ -1117,6 +1241,74 @@ fn an_agent_checks_why_a_service_does_not_answer() {
     });
 }
 
+/// The Problems scan reads every kind of a real cluster, the objects it lists whole (Services,
+/// Ingresses...) parsed lean from what the API server sends: none is skipped. The pods of a
+/// label selector, read lean from the API server's cache, are those the selector picks.
+#[test]
+#[ignore = "needs a kind cluster: RECOUVRANCE_E2E_CONTEXT"]
+fn the_problems_scan_reads_a_real_cluster() {
+    use k8s_openapi::api::core::v1::{Pod, Service};
+    use k8s_openapi::api::networking::v1::Ingress;
+
+    run(async {
+        let client = k8s::connect_for_agents(context()).await?;
+        let pods: Api<Pod> = Api::namespaced(client.clone(), NS);
+        let services: Api<Service> = Api::namespaced(client.clone(), NS);
+        let ingresses: Api<Ingress> = Api::namespaced(client.clone(), NS);
+        let name = "e2e-scan";
+        let _ = pods.delete(name, &DeleteParams::default().grace_period(0)).await;
+        let _ = services.delete(name, &DeleteParams::default()).await;
+        let _ = ingresses.delete(name, &DeleteParams::default()).await;
+        let pod = json!({
+            "metadata": {"name": name, "namespace": NS, "labels": {"app": name, "tier": "a"}},
+            "spec": {"containers": [{"name": "main", "image": "busybox:1.37", "command": ["sleep", "3600"]}]},
+        });
+        let svc = json!({
+            "metadata": {"name": name, "namespace": NS},
+            "spec": {"selector": {"app": name}, "ports": [{"name": "http", "port": 80, "targetPort": "http"}]},
+        });
+        let ing = json!({
+            "metadata": {"name": name, "namespace": NS},
+            "spec": {
+                "defaultBackend": {"service": {"name": name, "port": {"name": "http"}}},
+                "tls": [{"hosts": ["e2e.example"], "secretName": "e2e-scan-tls"}],
+                "rules": [{"host": "e2e.example", "http": {"paths": [{"path": "/", "pathType": "Prefix",
+                    "backend": {"service": {"name": name, "port": {"number": 80}}}}]}}],
+            },
+        });
+        pods.create(&PostParams::default(), &serde_json::from_value(pod)?).await?;
+        services.create(&PostParams::default(), &serde_json::from_value(svc)?).await?;
+        ingresses.create(&PostParams::default(), &serde_json::from_value(ing)?).await?;
+        let checked = async {
+            // Escaped into the request, with the operators a Service's selector can't have.
+            let selector = format!("app in ({name},e2e-other),tier=a,!e2e-absent");
+            let mut found = Vec::new();
+            // The cache catches up with the create in a moment.
+            for _ in 0..20 {
+                let ar = k8s::ar_of::<Pod>();
+                let read = Some(selector.clone());
+                found = k8s::lists::list_lean_cached_by::<serde_json::Value>(client.clone(), ar, Some(NS.into()), read)
+                    .await?;
+                if !found.is_empty() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+            let names: Vec<&str> = found.iter().filter_map(|p| p.pointer("/metadata/name")?.as_str()).collect();
+            assert_eq!(names, [name]);
+            let kinds = k8s::discover(client.clone()).await?;
+            let scan = crate::problems::scan_partial(client.clone(), &kinds, None, None).await;
+            assert!(scan.skipped.is_empty(), "{:?}", scan.skipped_text());
+            Ok(())
+        };
+        let result: Result<()> = checked.await;
+        let _ = pods.delete(name, &DeleteParams::default().grace_period(0)).await;
+        let _ = services.delete(name, &DeleteParams::default()).await;
+        let _ = ingresses.delete(name, &DeleteParams::default()).await;
+        result
+    });
+}
+
 /// The Files tab reads a container through exec, so write mode gates it like a shell: off,
 /// the UI's client refuses the listing; on, `/etc` lists, and names with spaces, newlines
 /// and non-UTF-8 bytes come back whole, a file previews and a search finds it, with
@@ -1194,7 +1386,8 @@ fn the_files_tab_reads_a_container() {
 
 /// The timeline records what a list's watch sees change, from the metadata alone: a label
 /// set by someone (and who), then the deletion. The agents' `get_changes` returns the record
-/// with its source.
+/// with its source, and `recent_changes` among the namespace's changes, with its events read
+/// from the cluster; rules that keep the agent from reading ConfigMaps leave it out, counted.
 #[test]
 #[ignore = "needs a kind cluster: RECOUVRANCE_E2E_CONTEXT"]
 fn the_timeline_records_what_a_watch_sees_change() {
@@ -1248,11 +1441,20 @@ fn the_timeline_records_what_a_watch_sees_change() {
             let diff = found[0].diff.as_ref().map_or_default(|d| d.short(5));
             assert!(diff.contains("tier: front"), "{diff}");
 
-            let (hub, _agent, token, _server) = agent(&["get,list *"], &[]).await?;
+            let (hub, agent, token, _server) = agent(&["get,list *"], &[]).await?;
             let mcp = crate::assistant::Mcp::connect(hub.port(), token).await?;
             let target = json!({"context": ctx, "kind": "configmaps", "namespace": NS, "name": name});
             let out = mcp.call("get_changes", target).await;
             assert!(out.contains("Recorded  ConfigMap e2e-timeline: labels changed: tier by e2e-editor"), "{out}");
+
+            let recent = json!({"context": ctx, "namespace": NS});
+            let out = mcp.call("recent_changes", recent.clone()).await;
+            let line = "Recorded  ConfigMap default/e2e-timeline: labels changed: tier by e2e-editor";
+            assert!(out.contains(line) && !out.contains("Could not read events"), "{out}");
+            let deny = rules_file::parse_rule(Mode::Deny, "get configmaps")?;
+            hub.update_agent(&agent.id, |a| a.policy.rules.push(deny))?;
+            let out = mcp.call("recent_changes", recent).await;
+            assert!(!out.contains(name) && out.contains("Left out, not allowed by your rules: "), "{out}");
 
             cms.delete(name, &DeleteParams::default()).await?;
             for _ in 0..60 {

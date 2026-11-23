@@ -305,6 +305,8 @@ impl Render for ProblemsView {
         let (crit, warn, info) = (count(Severity::Critical), count(Severity::Warning), count(Severity::Info));
         // A count picks its severity alone; picked again, every severity.
         let only = self.only;
+        // The count is text in `color`: its tint stays light enough for it to read.
+        let fill = crate::app::STATUS_FILL;
         let pill = |n: usize, label: &str, color: Hsla, severity: Severity, cx: &mut Context<Self>| {
             let picked = only == Some(severity);
             h_flex()
@@ -313,11 +315,11 @@ impl Render for ProblemsView {
                 .px_3()
                 .py_1()
                 .rounded_md()
-                .bg(color.opacity(if picked { 0.25 } else { 0.1 }))
+                .bg(color.opacity(if picked { fill } else { 0.1 }))
                 .border_1()
                 .border_color(if picked { color } else { color.opacity(0.) })
                 .cursor_pointer()
-                .hover(|s| s.bg(color.opacity(0.2)))
+                .hover(|s| s.bg(color.opacity(fill)))
                 .child(div().font_weight(FontWeight::BOLD).text_color(color).child(n.to_string()))
                 .child(div().text_sm().child(label.to_string()))
                 .on_click(cx.listener(move |this, _, _, cx| {
