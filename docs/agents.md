@@ -292,8 +292,13 @@ tools' definitions. What some of them need beyond the obvious verb:
 Prompts (slash commands in Claude Code: `/mcp__recouvrance__troubleshoot` …): `troubleshoot`, `rightsize`,
 `cert-audit`, `cluster-health`. They chain the tools above into a read-only workflow.
 
-Every call is logged with its decision and rule, and appended to
-`~/.local/share/recouvrance/audit.jsonl` (the folder is 0700, the file 0600). At 10 MiB the log moves to
+Every call is logged with its decision and rule, the client it came from, and the Secrets whose values
+it returned, and appended to
+`~/.local/share/recouvrance/audit.jsonl` (the folder is 0700, the file 0600). The client is the name and
+version the MCP client gives (`claude-code 2.1.3`); the in-app assistant shows as
+`recouvrance-assistant` with an API key, and as `assistant via claude-code …` through Claude Code. It is
+a label the client chooses, not a check. A call that returned Secret values unmasked, which a `reveal`
+rule allows, says which (`Secret shop/db`, `Helm values shop/web revision 3`). At 10 MiB the log moves to
 `audit.jsonl.1`, replacing the older one. If the log cannot be written, the Activity page says so. A
 kill switch cuts all agent access at once. A request nobody answers within 2 minutes is refused: its
 banner counts down to that. So that it is seen with the window behind others or minimized, every
@@ -309,10 +314,13 @@ whether a request was refused, left unanswered, given up by the agent or cut off
 A session ends when its client closes it or after an hour unused, never while its agent still waits
 for one of its calls, however long that takes.
 
-The Activity page groups calls by task: one agent session, split where the agent paused for more than
-10 minutes. Each group says what it touched (contexts, namespaces, objects); repeated calls of a tool on
-the same target fold into one line, and any line opens to its full arguments and result. Filter by
-writes, denied or failed calls, context, agent or text. It shows the latest 300 calls; "Show older"
+The Activity page groups calls by task: one session of one client, split where the agent paused for
+more than 10 minutes. Each group names its client and says what it touched (contexts, namespaces,
+objects) and how many of its calls showed Secret values; repeated calls of a tool on the same target fold
+into one line, and any line opens to its full arguments and result. Filter by writes, denied or failed
+calls, calls that showed Secret values, context, agent or text. The search box also takes terms:
+`client:`, `tool:`, `ctx:`, `ns:` and `kind:` (part of the value), `is:write` and `is:reveal`; every
+term must match. It shows the latest 300 calls; "Show older"
 goes further back, and then reads the log on disk. A call counts as a write when its tool may change
 something (the changes above, and `browse_files` with `debug: true`), but not a dry run nor `gitops`'s
 `diagnose`; each group counts its writes. A `gitops` dry run counts: it writes the Application's

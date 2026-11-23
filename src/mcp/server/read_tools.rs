@@ -221,6 +221,9 @@ impl KubeMcp {
         };
         // Masking follows what came back, not only what was asked for.
         let secret = kind.is("", "Secret") || is_secret_object(&value);
+        if secret && reveal {
+            call.revealing(format!("Secret {}/{}", p.namespace.as_deref().unwrap_or_default(), p.name));
+        }
         call.finish(k8s::to_yaml(&value, secret, reveal))
     }
 
