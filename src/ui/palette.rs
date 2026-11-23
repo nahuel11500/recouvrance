@@ -86,23 +86,38 @@ pub struct Palette {
 
 impl EventEmitter<PaletteEvent> for Palette {}
 
-/// How well a lowercase `query` matches a row: a substring of its label, detail or other words
-/// ranks first, earliest best; else the query's letters in order in the label alone, consecutive
-/// ones ranking higher. Letters spread over the detail match nearly anything (`fraud` finds
-/// `PodCertificateRequest`), so they don't count.
+/// How well a lowercase `query` matches a row. Three bands, best first: the whole query as a
+/// substring of its label, detail or other words, earliest best; for a query of several words,
+/// each word somewhere in that text (`web prod` finds the `web` Deployment in prod, a name and a
+/// cluster find it on that cluster), earliest best; for one word, its letters in order in the
+/// label alone, consecutive ones ranking higher. Letters spread over the detail match nearly
+/// anything (`fraud` finds `PodCertificateRequest`), so they don't count.
 fn score(query: &str, row: &Row) -> Option<i64> {
+    // Far apart, so a row of one band always ranks above every row of the next.
+    const WHOLE: i64 = 2_000_000;
+    const WORDS: i64 = 1_000_000;
     if query.is_empty() {
         return Some(0);
     }
     let text = row.text.as_str();
+    let len = text.len() as i64;
     if let Some(pos) = text.find(query) {
-        return Some(1000 - pos as i64 - text.len() as i64 / 10);
+        return Some(WHOLE - pos as i64 - len / 10);
+    }
+    let mut words = query.split_whitespace().peekable();
+    let first = words.next()?;
+    if words.peek().is_some() {
+        let mut at = text.find(first)? as i64;
+        for word in words {
+            at += text.find(word)? as i64;
+        }
+        return Some(WORDS - at - len / 10);
     }
     let label = &text[..row.label_end];
     let mut score = 0i64;
     let mut last = None;
     let mut chars = label.char_indices();
-    for q in query.chars() {
+    for q in first.chars() {
         let (i, _) = chars.find(|(_, c)| *c == q)?;
         if last.is_some_and(|l: usize| i == l + 1) {
             score += 5;
@@ -376,6 +391,28 @@ mod tests {
         assert_eq!(score("fraud", &certs), None);
         assert!(score("security", &certs).is_some());
         assert!(score("pcr", &row("PodCertificateRequests", "")).is_some());
+    }
+
+    /// Several words narrow the list: each must be in the row, in any order, so a name and a
+    /// namespace or a cluster find one object among many of the same name.
+    #[test]
+    fn words_combine() {
+        let prod = row("web", "Deployments · prod");
+        assert!(score("web prod", &prod).is_some());
+        assert!(score("prod  web", &prod).is_some());
+        assert_eq!(score("web prod", &row("web", "Deployments · staging")), None);
+        // A name and a cluster: with several clusters connected, the detail ends with the cluster.
+        let on_b = row("web", "Deployments · prod · cluster-b");
+        let on_a = row("web", "Deployments · prod · cluster-a");
+        assert!(score("web cluster-b", &on_b).is_some());
+        assert_eq!(score("web cluster-b", &on_a), None);
+        // The whole query as one substring ranks above words found apart.
+        let whole = row("web prod", "Deployments · x");
+        assert!(score("web prod", &whole).unwrap() > score("web prod", &prod).unwrap());
+        // Scattered letters still match no detail, and a one-word query is unchanged.
+        let certs = row("PodCertificateRequests", "podcertificaterequests.certificates.k8s.io · Security");
+        assert_eq!(score("fraud", &certs), None);
+        assert_eq!(score("fraud security", &certs), None);
     }
 
     /// The commands without a key are found by their name and by the words people search for.

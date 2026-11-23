@@ -332,7 +332,9 @@ types, pages, contexts and objects across the connected clusters, and runs every
 key or without: Upgrade check, API requests, Agent activity, My access, write mode, the theme,
 each Settings section and each saved view. It knows other words for them too (`rbac` finds My
 access, `deprecated` the Upgrade check, `audit` Agent activity) and shows each command's key. A
-word of the detail line finds an object; letters spread out only match its name.
+word of the detail line finds an object, and words combine: `web prod` finds `web` in the prod
+namespace, and a name with a cluster's name finds it on that cluster. Letters spread out only
+match its name.
 
 The keyboard shortcuts, as `?` (or the keyboard button of the top bar) and Settings → Shortcuts
 list them; the palette, that list and this table are all made from one list of commands:
@@ -344,8 +346,8 @@ list them; the palette, that list and this table are all made from one list of c
 | Ctrl+Shift+N | ⇧⌘N | New window | Anywhere |
 | Ctrl+T | ⌘T | New tab: right-click a row to open it in one | Anywhere |
 | Ctrl+W | ⌘W | Close tab | Anywhere |
-| Ctrl+Tab | ⌃Tab | Next tab | Anywhere |
-| Ctrl+Shift+Tab | ⌃⇧Tab | Previous tab | Anywhere |
+| Ctrl+Tab or Ctrl+PageDown | ⌃Tab or ⌃PageDown | Next tab | Anywhere |
+| Ctrl+Shift+Tab or Ctrl+PageUp | ⌃⇧Tab or ⌃PageUp | Previous tab | Anywhere |
 | Ctrl+B | ⌘B | Hide or show the sidebar | Anywhere |
 | F5 or Ctrl+R | F5 or ⌘R | Refresh: in a terminal, F5 goes to the program | Anywhere |
 | Alt+← | ⌘[ | Back | Anywhere |

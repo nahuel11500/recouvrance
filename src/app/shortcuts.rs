@@ -181,7 +181,7 @@ fn describe(binding: &KeyBinding) -> (String, &'static str, Option<String>) {
 
 #[cfg(test)]
 mod tests {
-    use gpui_kit::{Action, KeyBinding, KeyContext, Keymap, Keystroke};
+    use gpui_kit::{Action, KeyBinding, KeyContext, KeybindingKeystroke, Keymap, Keystroke};
     use proptest::prelude::*;
 
     use super::{actions_of, describe, keys_in, with_keys_on};
@@ -270,21 +270,38 @@ mod tests {
         }
     }
 
-    /// Every key the window binds is in the list, so `?` and Settings → Shortcuts show them all;
-    /// only the keys every Mac app has are left to its menu bar.
+    /// Every key the window binds is in the list, so `?` and Settings → Shortcuts show them all.
+    /// Left out: the keys every Mac app has, which its menu bar shows (⌘Q, ⌘, for Settings, ⌘/
+    /// for this list), and Zoom in's other spellings of the same key (`+` is Shift and `=`).
     #[test]
-    fn every_bound_action_is_listed() {
+    fn every_bound_key_is_listed() {
         let menu_bar_only = ["Quit", "CloseWindow", "MinimizeWindow", "HideApp", "HideOtherApps"];
+        let parse = |keys: &str| -> Vec<Keystroke> {
+            keys.split(' ').map(|k| Keystroke::parse(k).expect("a key the lists name")).collect()
+        };
         for mac in [false, true] {
-            let listed: Vec<&str> =
-                COMMANDS.iter().flat_map(|c| keys_in(c.keys, mac)).flat_map(|k| actions_of(&k, mac)).collect();
+            let unlisted: &[&str] =
+                if mac { &["cmd-,", "cmd-/", "cmd-+", "cmd-shift-="] } else { &["ctrl-+", "ctrl-shift-="] };
+            let unlisted: Vec<Vec<Keystroke>> = unlisted.iter().map(|k| parse(k)).collect();
+            let listed: Vec<Vec<Keystroke>> =
+                COMMANDS.iter().flat_map(|c| keys_in(c.keys, mac)).map(|k| parse(&k)).collect();
             for binding in key_bindings_on(mac) {
                 let name = binding.action().name();
                 let short = name.rsplit("::").next().unwrap_or(name);
                 if short == "NoAction" || menu_bar_only.contains(&short) {
                     continue;
                 }
-                assert!(listed.contains(&name), "{name} is bound but no command lists it (macOS: {mac})");
+                let strokes: Vec<&Keystroke> = binding.keystrokes().iter().map(KeybindingKeystroke::inner).collect();
+                let is =
+                    |seq: &Vec<Keystroke>| seq.len() == strokes.len() && seq.iter().zip(&strokes).all(|(a, b)| a == *b);
+                if unlisted.iter().any(is) {
+                    continue;
+                }
+                assert!(
+                    listed.iter().any(is),
+                    "{} runs {name} but no command lists it (macOS: {mac})",
+                    describe(&binding).0
+                );
             }
         }
     }
@@ -301,6 +318,19 @@ mod tests {
         names.sort_unstable();
         names.dedup();
         assert_eq!(names.len(), COMMANDS.len(), "two commands share a name");
+    }
+
+    /// Every command's action has a handler on the window, so picking one in the palette never
+    /// does nothing. The window's handlers all read `_: &Action,`.
+    #[test]
+    fn every_command_action_is_handled() {
+        let render = include_str!("render.rs");
+        for c in COMMANDS {
+            let Some(action) = c.action else { continue };
+            let name = action().name();
+            let short = name.rsplit("::").next().unwrap_or(name);
+            assert!(render.contains(&format!("_: &{short},")), "{}: the window doesn't handle {name}", c.name);
+        }
     }
 
     /// Linux keeps the keys it had.

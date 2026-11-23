@@ -127,8 +127,10 @@ pub(crate) const COMMANDS: &[Command] = &[
     Command::new("New tab", "right-click a row to open it in one", Lucide::Plus, run::<NewTab>)
         .keys("{secondary-t}", Scope::Anywhere),
     Command::new("Close tab", "", Lucide::X, run::<CloseTab>).keys("{secondary-w}", Scope::Anywhere),
-    Command::new("Next tab", "", Lucide::ChevronRight, run::<NextTab>).keys("{ctrl-tab}", Scope::Anywhere),
-    Command::new("Previous tab", "", Lucide::ChevronLeft, run::<PrevTab>).keys("{ctrl-shift-tab}", Scope::Anywhere),
+    Command::new("Next tab", "", Lucide::ChevronRight, run::<NextTab>)
+        .keys("{ctrl-tab} or {ctrl-pagedown}", Scope::Anywhere),
+    Command::new("Previous tab", "", Lucide::ChevronLeft, run::<PrevTab>)
+        .keys("{ctrl-shift-tab} or {ctrl-pageup}", Scope::Anywhere),
     Command::new("Hide or show the sidebar", "", Lucide::PanelLeftClose, run::<ToggleSidebar>)
         .keys("{secondary-b}", Scope::Anywhere),
     Command::new("Refresh", "in a terminal, F5 goes to the program", Lucide::RefreshCw, run::<RefreshPage>)
