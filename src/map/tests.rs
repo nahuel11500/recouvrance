@@ -25,7 +25,7 @@ fn shown(sections: &[Section]) -> Vec<(&'static str, Vec<String>)> {
 }
 
 fn names(sections: &[Section], rel: Rel) -> Vec<String> {
-    shown(sections).into_iter().find(|(l, _)| *l == rel.label()).map(|(_, i)| i).unwrap_or_default()
+    shown(sections).into_iter().find(|(l, _)| *l == rel.label()).map_or_default(|(_, i)| i)
 }
 
 fn meta(ns: &str, name: &str) -> Value {
@@ -81,7 +81,7 @@ fn a_pod_spec_uses_secrets_and_config_maps_every_way() {
     assert!(needed.contains(&"db".to_string()) && needed.contains(&"certs".to_string()));
 }
 
-/// A Secret's Map: its owner (an ExternalSecret, said once though it also names the Secret),
+/// A Secret's Map: its owner (an `ExternalSecret`, said once though it also names the Secret),
 /// the workloads and pods that read it, the ServiceAccount and the Ingress (TLS) that name it,
 /// and the Certificate that issued it.
 #[test]
@@ -166,8 +166,8 @@ fn a_custom_resource_with_only_owners() {
     assert!(wants(&widget, &cluster_wide, &[]).is_empty());
 }
 
-/// A CloudNativePG Cluster: the pods, PVCs, Services and Secrets it owns, a Secret labelled
-/// with its name, and the Backups, ScheduledBackup and Pooler naming it in `spec.cluster`.
+/// A `CloudNativePG` Cluster: the pods, PVCs, Services and Secrets it owns, a Secret labelled
+/// with its name, and the Backups, `ScheduledBackup` and Pooler naming it in `spec.cluster`.
 #[test]
 fn a_cnpg_cluster_s_map() {
     let cluster = kind(CNPG, "Cluster");
@@ -271,11 +271,13 @@ fn a_deployment_s_map_beside_its_tree() {
         "selector": { "matchLabels": { "app": "web" } },
         "template": { "metadata": { "labels": { "app": "web" } }, "spec": { "containers": [] } },
     } });
-    let mut related = Related::default();
-    related.services = vec![
-        json!({ "metadata": meta("shop", "web"), "spec": { "selector": { "app": "web" } } }),
-        json!({ "metadata": meta("shop", "db"), "spec": { "selector": { "app": "db" } } }),
-    ];
+    let related = Related {
+        services: vec![
+            json!({ "metadata": meta("shop", "web"), "spec": { "selector": { "app": "web" } } }),
+            json!({ "metadata": meta("shop", "db"), "spec": { "selector": { "app": "db" } } }),
+        ],
+        ..Default::default()
+    };
     let ingress = |name: &str, svc: &str| json!({ "metadata": meta("shop", name), "spec": { "defaultBackend": { "service": { "name": svc } } } });
     let lists = Lists::default()
         .with("policy", "PodDisruptionBudget", vec![
@@ -300,21 +302,25 @@ fn a_deployment_s_map_beside_its_tree() {
 #[test]
 fn long_relations_are_capped() {
     let node = json!({ "metadata": { "name": "n1", "uid": "n1" } });
-    let mut related = Related::default();
-    related.pods = (0..SHOWN_AT_MOST + 7).map(|i| json!({ "metadata": meta("shop", &format!("p{i:03}")) })).collect();
+    let related = Related {
+        pods: (0..SHOWN_AT_MOST + 7).map(|i| json!({ "metadata": meta("shop", &format!("p{i:03}")) })).collect(),
+        ..Default::default()
+    };
     let map = sections(&kind("", "Node"), &node, &related, None);
     assert_eq!(map.len(), 1);
     assert_eq!((map[0].rel, map[0].items.len(), map[0].more), (Rel::Runs, SHOWN_AT_MOST, 7));
     assert!(wants(&kind("", "Node"), &node, &[]).is_empty(), "a cluster-scoped object reads nothing more");
 }
 
-/// A Service's Map: the pods it selects (held by the page), and the Ingresses and HTTPRoutes
+/// A Service's Map: the pods it selects (held by the page), and the Ingresses and `HTTPRoutes`
 /// sending to it.
 #[test]
 fn a_service_s_map() {
     let svc = json!({ "metadata": { "namespace": "shop", "name": "web", "uid": "s1" }, "spec": { "selector": { "app": "web" } } });
-    let mut related = Related::default();
-    related.pods = vec![json!({ "metadata": meta("shop", "web-1"), "status": { "phase": "Running" } })];
+    let related = Related {
+        pods: vec![json!({ "metadata": meta("shop", "web-1"), "status": { "phase": "Running" } })],
+        ..Default::default()
+    };
     let route =
         json!({ "metadata": meta("shop", "web"), "spec": { "rules": [{ "backendRefs": [{ "name": "web" }] }] } });
     let lists = Lists::default().with(refs::GATEWAY, "HTTPRoute", vec![route]);

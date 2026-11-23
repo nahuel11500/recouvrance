@@ -7,8 +7,8 @@
 //!   ServiceAccount a pod spec names, an Ingress's or HTTPRoute's Services and TLS Secrets;
 //! - an HPA's or VPA's target, a PVC's volume and class, a binding's role and accounts;
 //! - operators' objects: what is labelled with an instance's name (`INSTANCE_LABELS`), and
-//!   custom resources naming another object in their spec, by known rules (`RULES`, CloudNativePG
-//!   first) or the generic one (`names_in_spec`).
+//!   custom resources naming another object in their spec, by known rules (`RULES`,
+//!   `CloudNativePG` first) or the generic one (`names_in_spec`).
 //!
 //! It is read only when the tab opens (`load`): in the object's namespace, from the API
 //! server's cache (`resourceVersion=0`), lean (metadata alone where that is enough), next to
@@ -40,7 +40,7 @@ const BACKENDS_READ: usize = 10;
 /// Kinds of an operator's group read to find what points to one of its objects.
 const GROUP_KINDS_READ: usize = 12;
 
-/// CloudNativePG's API group.
+/// `CloudNativePG`'s API group.
 const CNPG: &str = "postgresql.cnpg.io";
 
 /// How one object relates to the one shown, in the order the tab lists them.
@@ -96,7 +96,7 @@ pub struct Item {
     pub namespace: Option<String>,
     pub name: String,
     pub note: Option<String>,
-    pub under: Vec<Item>,
+    pub under: Vec<Self>,
 }
 
 impl Item {
@@ -155,7 +155,7 @@ enum At {
     Path(&'static str),
     /// A reference at this path (`name`, and `kind` when it has one, which must be `to`'s).
     Ref(&'static str),
-    /// The Secret an ExternalSecret writes (`external_secrets::target_of`).
+    /// The Secret an `ExternalSecret` writes (`external_secrets::target_of`).
     ExternalSecretTarget,
 }
 
@@ -170,7 +170,7 @@ const CNPG_CLUSTER: (&str, &str) = (CNPG, "Cluster");
 const SECRET: (&str, &str) = ("", "Secret");
 const ES: &str = crate::external_secrets::GROUP;
 
-/// Known operators' references, as data. CloudNativePG first: what works on a Cluster names
+/// Known operators' references, as data. `CloudNativePG` first: what works on a Cluster names
 /// it in `spec.cluster.name`.
 const RULES: &[Rule] = &[
     Rule { from: (CNPG, "Backup"), to: CNPG_CLUSTER, at: At::Path("/spec/cluster/name") },
@@ -205,7 +205,7 @@ impl Rule {
 }
 
 /// Labels whose value is an operator instance's name, and the kind of that instance (None:
-/// any custom resource). CloudNativePG's first.
+/// any custom resource). `CloudNativePG`'s first.
 const INSTANCE_LABELS: &[(&str, Option<(&str, &str)>)] = &[
     ("cnpg.io/cluster", Some(CNPG_CLUSTER)),
     ("clickhouse.altinity.com/chi", Some(("clickhouse.altinity.com", "ClickHouseInstallation"))),
@@ -506,7 +506,7 @@ pub async fn load(client: Client, kind: Kind, obj: Value, kinds: Vec<Kind>) -> L
 /// The relations, grouped and in `Rel` order, each object once (under its first relation),
 /// sorted by kind and name, capped at `SHOWN_AT_MOST`.
 fn sections_of(mut found: Vec<(Rel, Item)>) -> Vec<Section> {
-    found.sort_by(|a, b| a.0.cmp(&b.0));
+    found.sort_by_key(|f| f.0);
     let mut seen = BTreeSet::new();
     let mut by: BTreeMap<Rel, Vec<Item>> = BTreeMap::new();
     for (rel, item) in found {
@@ -846,7 +846,7 @@ fn backend(t: &Target, lists: &Lists) -> Item {
     item
 }
 
-/// The Ingresses and HTTPRoutes read that send to one of `services` (in `ns`).
+/// The Ingresses and `HTTPRoutes` read that send to one of `services` (in `ns`).
 fn traffic_to(services: &BTreeSet<&str>, ns: Option<&str>, lists: &Lists, add: &mut dyn FnMut(Rel, Item)) {
     if services.is_empty() {
         return;

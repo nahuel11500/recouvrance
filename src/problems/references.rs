@@ -700,7 +700,7 @@ pub fn ingress_refs(obj: &Value) -> (Vec<Target>, Vec<Target>) {
 /// The Services an HTTPRoute sends to (other kinds of backend aren't Services), in their
 /// namespace: the route's own unless the backend names another.
 pub fn route_refs(obj: &Value) -> Vec<Target> {
-    Route::deserialize(obj).map(|r| route_services(&r)).unwrap_or_default()
+    Route::deserialize(obj).map_or_default(|r| route_services(&r))
 }
 
 fn route_services(route: &Route) -> Vec<Target> {
