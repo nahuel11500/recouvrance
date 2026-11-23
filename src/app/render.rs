@@ -14,10 +14,12 @@ use gpui_kit::*;
 
 use super::{
     AppView, CloseTab, CloseWindow, EscapeBack, FocusFilter, GoAssistant, GoBack, GoCluster, GoForward, GoHelm,
-    GoProblems, GoSettings, GoWorkloads, MinimizeWindow, NewTab, NextTab, OpenPalette, OpenSelected, PrevTab,
-    RefreshPage, Route, RowCopyName, RowDelete, RowEvents, RowFavorite, RowLogs, RowOpen, RowOpenTab, RowRestart,
-    RowRun, RowScale, RowShell, RowYaml, ShowAbout, ShowShortcuts, ToggleAssistant, ToggleSidebar, ZoomIn, ZoomOut,
-    ZoomReset, ZoomWindow, set_theme, with_keys,
+    GoProblems, GoSettings, GoWorkloads, MinimizeWindow, NewTab, NextTab, OpenAccess, OpenAgentActivity, OpenAgents,
+    OpenApiRequests, OpenApply, OpenArgo, OpenContexts, OpenHelmInstall, OpenPalette, OpenSelected, OpenTerminal,
+    OpenTimeline, OpenUpgradeCheck, PrevTab, RefreshPage, Route, RowCopyName, RowDelete, RowEvents, RowFavorite,
+    RowLogs, RowOpen, RowOpenTab, RowRestart, RowRun, RowScale, RowShell, RowYaml, ShowAbout, ShowShortcuts,
+    ToggleAssistant, ToggleSidebar, ToggleTheme, ToggleWriteMode, ZoomIn, ZoomOut, ZoomReset, ZoomWindow, set_theme,
+    with_keys,
 };
 use crate::favorites::FavObject;
 
@@ -243,10 +245,15 @@ impl AppView {
                     .ghost()
                     .small()
                     .icon(if cx.theme().is_dark() { IconName::Sun } else { IconName::Moon })
-                    .on_click(|_, window, cx| {
-                        let mode = if cx.theme().is_dark() { ThemeMode::Light } else { ThemeMode::Dark };
-                        set_theme(mode, Some(window), cx);
-                    }),
+                    .on_click(|_, window, cx| toggle_theme(window, cx)),
+            )
+            .child(
+                Button::new("shortcuts")
+                    .ghost()
+                    .small()
+                    .icon(Lucide::Keyboard)
+                    .tooltip(with_keys("Keyboard shortcuts ({?})"))
+                    .on_click(|_, window, cx| super::shortcuts::open_panel(window, cx)),
             )
             .child(
                 Button::new("version")
@@ -469,6 +476,25 @@ impl AppView {
             }))
             .on_action(cx.listener(|this, _: &GoForward, _, cx| this.go(1, cx)))
             .on_action(|_: &ShowShortcuts, window, cx| super::shortcuts::open_panel(window, cx))
+            // Pages and commands the palette lists without a key (see `commands::COMMANDS`).
+            .on_action(cx.listener(|this, _: &OpenArgo, window, cx| this.open_argo(window, cx)))
+            .on_action(cx.listener(|this, _: &OpenTimeline, window, cx| this.open_timeline(window, cx)))
+            .on_action(cx.listener(|this, _: &OpenAccess, window, cx| this.open_access(window, cx)))
+            .on_action(cx.listener(|this, _: &OpenUpgradeCheck, window, cx| this.open_upgrade_check(window, cx)))
+            .on_action(cx.listener(|this, _: &OpenAgents, _, cx| this.navigate(Route::Agents, cx)))
+            .on_action(cx.listener(|this, _: &OpenAgentActivity, _, cx| {
+                this.agents.update(cx, crate::agents::AgentsView::show_activity);
+                this.navigate(Route::Agents, cx);
+            }))
+            .on_action(cx.listener(|this, _: &OpenContexts, _, cx| this.navigate(Route::Contexts, cx)))
+            .on_action(cx.listener(|this, _: &OpenTerminal, window, cx| this.open_terminal(window, cx)))
+            .on_action(cx.listener(|this, _: &OpenApply, window, cx| this.open_apply(window, cx)))
+            .on_action(cx.listener(|this, _: &OpenHelmInstall, window, cx| this.open_helm_install(window, cx)))
+            .on_action(cx.listener(|this, _: &OpenApiRequests, window, cx| {
+                this.open_settings_section(crate::ui::settings_view::Section::Requests, window, cx);
+            }))
+            .on_action(|_: &ToggleWriteMode, window, cx| toggle_write_mode(window, cx))
+            .on_action(|_: &ToggleTheme, window, cx| toggle_theme(window, cx))
             .on_action(cx.listener(|this, _: &GoProblems, window, cx| this.open_problems(window, cx)))
             .on_action(cx.listener(|this, _: &GoCluster, window, cx| this.open_cluster(window, cx)))
             .on_action(cx.listener(|this, _: &GoWorkloads, window, cx| this.open_workloads(window, cx)))
@@ -523,27 +549,35 @@ fn write_mode_button(cx: &App) -> Button {
         } else {
             "Click to enable write actions"
         })
-        .on_click(|_, window, cx| {
-            if crate::details::writes_enabled(cx) {
-                crate::details::set_writes(false, cx);
+        .on_click(|_, window, cx| toggle_write_mode(window, cx))
+}
+
+/// Back to read-only at once, or writes on once confirmed: the badge and the palette do the same.
+fn toggle_write_mode(window: &mut Window, cx: &mut App) {
+    if crate::details::writes_enabled(cx) {
+        crate::details::set_writes(false, cx);
+        cx.refresh_windows();
+        return;
+    }
+    window.open_alert_dialog(cx, |alert, _, _| {
+        alert
+            .title("Enable write actions?")
+            .description(
+                "Scale, restart, delete, YAML edits, shells and plugins become available, using your own \
+                 kubeconfig credentials. Every action asks for confirmation. Agents are not affected: their \
+                 access stays defined by their rules.",
+            )
+            .show_cancel(true)
+            .ok_text("Enable writes")
+            .on_ok(|_, _, cx| {
+                crate::details::set_writes(true, cx);
                 cx.refresh_windows();
-                return;
-            }
-            window.open_alert_dialog(cx, |alert, _, _| {
-                alert
-                    .title("Enable write actions?")
-                    .description(
-                        "Scale, restart, delete, YAML edits, shells and plugins become available, using your own \
-                         kubeconfig credentials. Every action asks for confirmation. Agents are not affected: their \
-                         access stays defined by their rules.",
-                    )
-                    .show_cancel(true)
-                    .ok_text("Enable writes")
-                    .on_ok(|_, _, cx| {
-                        crate::details::set_writes(true, cx);
-                        cx.refresh_windows();
-                        true
-                    })
-            });
-        })
+                true
+            })
+    });
+}
+
+fn toggle_theme(window: &mut Window, cx: &mut App) {
+    let mode = if cx.theme().is_dark() { ThemeMode::Light } else { ThemeMode::Dark };
+    set_theme(mode, Some(window), cx);
 }

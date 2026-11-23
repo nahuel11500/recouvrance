@@ -37,7 +37,7 @@ Recouvrance is one Rust binary: a [gpui](https://github.com/zed-industries/zed) 
 | `src/mcp/` | The agent hub (agents, rules, approvals, audit) and the MCP server with its tools and prompts |
 | `src/agents/` | The Agents page |
 | `src/ui/` | Other pages and widgets: settings, Helm, apply, cluster and workloads overviews, terminal, pickers |
-| `src/diagnose.rs`, `rbac.rs`, `schema.rs`, `prom.rs`, `problems.rs`, `certs.rs` | Logic without UI, unit-tested |
+| `src/diagnose.rs`, `rbac.rs`, `schema.rs`, `prom.rs`, `problems.rs`, `certs.rs`, `updates.rs` | Logic without UI, unit-tested |
 | `src/dev/` | Developer tools (feature `dev`): the off-screen snapshot harness and live smoke checks |
 
 ## How lists stay fast
@@ -71,8 +71,10 @@ keeping only the fields the checks use; of the workloads, only those scaled to 0
   a **server dry run** first.
 - **Protected contexts** require typing the context name.
 - Actions your **RBAC** forbids are disabled (`SelfSubjectAccessReview`).
-- **Agents** go through the hub: rules (deny, ask, allow), approvals, a rate limit, an audit log and
-  a kill switch. Write mode and protected contexts don't apply to them: only their rules do (an Ask or Deny rule can name `@protected`).
+- **Agents** go through the hub: rules (deny, ask, allow), approvals (which show what a write will
+  change, worked out with a server dry run), a rate limit, an audit log and a kill switch. Write mode
+  and protected contexts don't apply to them: only their rules do (an Ask or Deny rule can name
+  `@protected`).
 - **Login commands keep their secrets.** kube's error for a failed exec plugin holds its whole
   command line and its output; each client replaces it, when it is built and on every request
   (a token refresh runs the plugin again), by the program's file name, taken from the kubeconfig,
