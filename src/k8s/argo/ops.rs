@@ -581,7 +581,7 @@ mod tests {
                 prop_assert!(picked.is_empty() || picked.iter().any(|p| p.same(g)));
                 prop_assert!(g.name == "old" || g.name == "gone");
             }
-            let req = SyncRequest { resources: picked.clone(), prune: true, dry_run: false, prune_shown: Some(gone.clone()) };
+            let req = SyncRequest { resources: picked.clone(), prune: true, dry_run: false, prune_shown: Some(gone) };
             let p = patch(&a, &Op::Sync(req)).unwrap();
             let sent = p["operation"]["sync"]["resources"].as_array().map_or(0, Vec::len);
             prop_assert_eq!(sent, picked.len());
