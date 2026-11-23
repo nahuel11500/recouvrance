@@ -320,16 +320,18 @@ mod tests {
         assert_eq!(names.len(), COMMANDS.len(), "two commands share a name");
     }
 
-    /// Every command's action has a handler on the window, so picking one in the palette never
-    /// does nothing. The window's handlers all read `_: &Action,`.
+    /// Every command's action has a handler, on the window or the app (New window, which the
+    /// menu bar runs too), so picking one in the palette never does nothing. The handlers all
+    /// read `_: &Action,`.
     #[test]
     fn every_command_action_is_handled() {
-        let render = include_str!("render.rs");
+        let handlers = [include_str!("render.rs"), include_str!("menus.rs")];
         for c in COMMANDS {
             let Some(action) = c.action else { continue };
             let name = action().name();
             let short = name.rsplit("::").next().unwrap_or(name);
-            assert!(render.contains(&format!("_: &{short},")), "{}: the window doesn't handle {name}", c.name);
+            let pattern = format!("_: &{short},");
+            assert!(handlers.iter().any(|h| h.contains(&pattern)), "{}: nothing handles {name}", c.name);
         }
     }
 
