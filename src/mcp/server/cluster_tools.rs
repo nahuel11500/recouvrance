@@ -261,10 +261,12 @@ fn argo_condition(condition: &str) -> Option<(&'static str, &str)> {
 fn argo_met(obj: &Value, field: &str, want: &str) -> Result<Option<bool>, String> {
     let text = |p: &str| obj.pointer(p).and_then(Value::as_str).filter(|s| !s.is_empty());
     let phase = text(OPERATION_PHASE);
-    let running = k8s::argo::ops::in_progress(obj) || matches!(phase, Some("Running" | "Terminating"));
+    let started = matches!(phase, Some("Running" | "Terminating"));
+    let running = k8s::argo::ops::in_progress(obj) || started;
     let is = |v: Option<&str>| v.is_some_and(|v| v.eq_ignore_ascii_case(want));
     if running {
-        return Ok(Some(field == OPERATION_PHASE && is(phase)));
+        // A sync asked for and not started yet still shows the phase of the one before.
+        return Ok(Some(field == OPERATION_PHASE && started && is(phase)));
     }
     let value = text(field);
     if is(value) {
