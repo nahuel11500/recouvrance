@@ -3,6 +3,8 @@
 
 mod references;
 
+pub(crate) use references::WITH_SERVICES;
+
 use kube::Client;
 
 use crate::k8s::{self, ColumnDef, Kind, Row};
@@ -377,7 +379,7 @@ pub async fn scan_partial(client: Client, kinds: &[Kind], namespace: Option<Stri
     let jobs = CHECKED
         .iter()
         // Checked with the Services they point to.
-        .filter(|kind| !references::WITH_SERVICES.contains(kind))
+        .filter(|kind| !WITH_SERVICES.contains(kind))
         .filter_map(|(g, k)| kinds.iter().find(|x| x.is(g, k)).cloned())
         .map(|kind| {
             let (client, ns, label) = (client.clone(), namespace.clone(), kind.label.clone());
