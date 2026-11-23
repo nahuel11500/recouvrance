@@ -50,7 +50,8 @@ fn wait_secs_or_longest<'de, D: Deserializer<'de>>(d: D) -> Result<u64, D::Error
 /// Any value: the strings it lists, in order; nothing when it isn't a list.
 fn string_list<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
     let raw = serde_json::Value::deserialize(d)?;
-    Ok(raw.as_array().map(|l| l.iter().filter_map(|v| Some(v.as_str()?.to_string())).collect()).unwrap_or_default())
+    let Some(list) = raw.as_array() else { return Ok(Vec::new()) };
+    Ok(list.iter().filter_map(|v| Some(v.as_str()?.to_string())).collect())
 }
 
 /// Any value: its string entries; nothing when it isn't an object.
@@ -74,7 +75,7 @@ fn session_entries<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<Session>, D::E
 }
 
 fn sessions_from(raw: &serde_json::Value) -> Vec<Session> {
-    let entries = raw.as_array().map(Vec::as_slice).unwrap_or_default();
+    let entries = raw.as_array().map_or(&[][..], Vec::as_slice);
     let mut sessions: Vec<Session> = Vec::new();
     for entry in entries.iter().filter(|e| e.is_object()) {
         // Every field of a session reads whatever it holds (see `Session`).
@@ -236,7 +237,7 @@ pub enum SavedPage {
 /// `tabs` entry by entry: one that isn't an object is dropped, the others read field by field.
 fn tab_entries<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<SavedTab>, D::Error> {
     let raw = serde_json::Value::deserialize(d)?;
-    let entries = raw.as_array().map(Vec::as_slice).unwrap_or_default();
+    let entries = raw.as_array().map_or(&[][..], Vec::as_slice);
     Ok(entries.iter().filter(|e| e.is_object()).filter_map(|e| serde_json::from_value(e.clone()).ok()).collect())
 }
 
