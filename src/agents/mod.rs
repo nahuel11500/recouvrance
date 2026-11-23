@@ -191,6 +191,25 @@ impl AgentsView {
         this
     }
 
+    /// Show every agent's activity (the palette's Agent activity). The agent list shows too, so
+    /// a click on an agent goes back to it. Rules as code stays open while it has unsaved edits,
+    /// saying why the activity isn't shown; closing it shows the activity.
+    pub fn show_activity(&mut self, cx: &mut Context<Self>) {
+        let unsaved = self.code.as_ref().is_some_and(|(editor, loaded)| {
+            let text = editor.read(cx).value().to_string();
+            text != *loaded
+        });
+        if unsaved {
+            self.code_message =
+                Some((false, "Unsaved edits: save them, then close Rules as code to see the activity".into()));
+        } else {
+            self.code = None;
+        }
+        self.all_activity = true;
+        self.advanced = true;
+        cx.notify();
+    }
+
     fn report<T>(&mut self, result: Result<T>) -> Option<T> {
         match result {
             Ok(v) => Some(v),
@@ -452,6 +471,10 @@ impl AgentsView {
                     .tooltip("Most people need one connection. Several agents give separate tokens and rules to different tools.")
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.advanced = !this.advanced;
+                        // One agent has no list to leave All activity by: show its settings.
+                        if !this.advanced {
+                            this.all_activity = false;
+                        }
                         cx.notify();
                     })),
             )

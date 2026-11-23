@@ -122,7 +122,9 @@ fn write_mode_off_refuses_the_ui_s_writes() {
 
 /// An agent's rules decide on the real cluster through the MCP server: a delete its rules
 /// don't allow is refused and the object stays; the kill switch refuses even reads; with a
-/// delete rule, the same call deletes (so the refusals above are not a broken setup).
+/// delete rule, the same call deletes (so the refusals above are not a broken setup). A
+/// refusal says whether it is final, or the rule that would allow the call, and that rule,
+/// added, does; `check_access` says the same without making the call.
 #[test]
 #[ignore = "needs a kind cluster: RECOUVRANCE_E2E_CONTEXT"]
 fn an_agent_gets_only_what_its_rules_allow() {
@@ -141,10 +143,27 @@ fn an_agent_gets_only_what_its_rules_allow() {
         let out = client.call("delete_resource", delete.clone()).await;
         assert!(out.contains("Denied"), "{out}");
         assert!(truth.get_opt(name).await?.is_some(), "a denied delete reached the cluster");
+        let grant = format!("delete configmaps/{name} -n {NS} --context {ctx}");
+        assert!(out.contains("Grantable") && out.contains(&format!("`{grant}` under allow")), "{out}");
         let out = client
             .call("get_resource", json!({"context": ctx, "kind": "secrets", "namespace": "kube-system", "name": "x"}))
             .await;
-        assert!(out.contains("Denied"), "{out}");
+        assert!(out.contains("Denied") && out.contains("Final"), "{out}");
+        let planned = json!({"requests": [
+            {"context": ctx, "verb": "delete", "kind": "cm", "namespace": NS, "name": name},
+            {"context": ctx, "verb": "get", "kind": "secrets", "namespace": "kube-system", "name": "x"},
+            {"context": ctx, "verb": "list", "kind": "pods"},
+            {"context": "e2e-no-such-context", "verb": "get", "kind": "pods"},
+        ]});
+        let out = client.call("check_access", planned.clone()).await;
+        assert!(
+            out.contains(&format!("1. delete configmaps {name} -n {NS} --context {ctx}: denied. Grantable")),
+            "{out}"
+        );
+        assert!(out.contains("2. get secrets x -n kube-system") && out.contains("denied by rule #2"), "{out}");
+        assert!(out.contains("3. list pods (all namespaces / cluster)") && out.contains("allowed by rule #1"), "{out}");
+        assert!(out.contains("4. get pods --context e2e-no-such-context: could not check"), "{out}");
+        assert!(out.contains("1 allowed, 0 needing approval, 2 denied."), "{out}");
 
         hub.set_agents_enabled(false)?;
         let out = client.call("get_resource", get.clone()).await;
@@ -153,8 +172,11 @@ fn an_agent_gets_only_what_its_rules_allow() {
         let out = client.call("get_resource", get).await;
         assert!(out.contains(name), "{out}");
 
-        let allow = rules_file::parse_rule(Mode::Allow, "delete configmaps/e2e-* -n default")?;
+        // The rule the refusal named is enough.
+        let allow = rules_file::parse_rule(Mode::Allow, &grant)?;
         hub.update_agent(&agent.id, |a| a.policy.rules.push(allow))?;
+        let out = client.call("check_access", planned).await;
+        assert!(out.contains(&format!("{name} -n {NS} --context {ctx}: allowed by rule #3")), "{out}");
         let out = client.call("delete_resource", delete).await;
         assert!(!out.contains("Denied"), "{out}");
         for _ in 0..50 {
@@ -259,6 +281,72 @@ fn an_approval_ends_when_its_agent_stops_waiting() {
         assert!(!out.contains("Rejected") && !out.contains("Denied"), "{out}");
         let data = truth.get(name).await?.data.unwrap_or_default();
         assert_eq!(data.get("a").map(String::as_str), Some("2"), "{out}");
+        truth.delete(name, &DeleteParams::default()).await?;
+        Ok(())
+    });
+}
+
+/// An agent's patch that an Ask rule covers shows, before it is approved, what it will
+/// change: the field with its value now and after, and the diff, from a dry run that changes
+/// nothing. The activity log keeps it with the call.
+#[test]
+#[ignore = "needs a kind cluster: RECOUVRANCE_E2E_CONTEXT"]
+fn an_approval_shows_what_a_patch_will_change() {
+    use futures::StreamExt as _;
+    use std::time::Duration;
+
+    run(async {
+        let ctx = context();
+        let truth: Api<ConfigMap> = Api::namespaced(k8s::connect_for_agents(ctx.clone()).await?, NS);
+        let name = "e2e-preview";
+        let _ = truth.delete(name, &DeleteParams::default()).await;
+        truth.create(&PostParams::default(), &config_map(name)).await?;
+
+        let (hub, agent, token, _server) = agent(&["get,list *"], &[]).await?;
+        let ask = rules_file::parse_rule(Mode::Ask, &format!("patch configmaps/{name} -n {NS}"))?;
+        hub.update_agent(&agent.id, |a| a.policy.rules.push(ask))?;
+        // A window to approve in.
+        hub.set_headless(false);
+        let mut events = hub.subscribe();
+        let client = crate::assistant::Mcp::connect(hub.port(), token).await?;
+        let patch =
+            json!({"context": ctx, "kind": "configmaps", "namespace": NS, "name": name, "patch": {"data": {"a": "2"}}});
+        let approve = async {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+            loop {
+                let event = match tokio::time::timeout_at(deadline, events.next()).await {
+                    Ok(Some(event)) => event,
+                    Ok(None) => bail!("the hub stopped sending events"),
+                    Err(_) => bail!("no approval asked for within 60 s"),
+                };
+                if let mcp::HubEvent::ApprovalRequested(a) = &*event {
+                    // Asked for once the dry run is done: the object is still as it was.
+                    let data = truth.get(name).await?.data.unwrap_or_default();
+                    hub.resolve_approval(a.id, true);
+                    return anyhow::Ok((a.preview.clone(), data));
+                }
+            }
+        };
+        let (out, approved) = tokio::join!(client.call("patch_resource", patch), approve);
+        let (preview, before) = approved?;
+        let preview = preview.context("the approval shows no preview")?;
+        assert_eq!(before.get("a").map(String::as_str), Some("1"), "the dry run changed the object");
+        let text = preview.text();
+        assert!(text.contains(&format!("ConfigMap {NS}/{name}: changed")), "{text}");
+        assert!(text.contains("data.a: 1 → 2"), "{text}");
+        let added = preview
+            .sections
+            .iter()
+            .flat_map(|s| &s.diff)
+            .any(|l| matches!(l, crate::history::DiffLine::Added(t) if t.contains("a:") && t.contains('2')));
+        assert!(added, "{text}");
+        assert!(!out.contains("Rejected") && !out.contains("Denied"), "{out}");
+        let data = truth.get(name).await?.data.unwrap_or_default();
+        assert_eq!(data.get("a").map(String::as_str), Some("2"), "{out}");
+        // The log keeps what the approval showed.
+        let logged = hub.recent_audit(5, |e| e.agent_id == agent.id && e.tool == "patch_resource");
+        let change = logged.first().and_then(|e| e.change.clone()).unwrap_or_default();
+        assert!(change.contains("data.a: 1 → 2"), "{change}");
         truth.delete(name, &DeleteParams::default()).await?;
         Ok(())
     });

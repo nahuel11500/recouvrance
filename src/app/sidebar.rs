@@ -59,10 +59,12 @@ impl AppView {
     /// recent, which a click opens into the list.
     pub(super) fn render_forwards(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
+        // The sidebar is navy in both themes: status on it takes the bright colors.
+        let status = super::bright_status();
         let (muted, danger, success, border, hover) = (
             theme.sidebar_foreground.opacity(0.62),
-            theme.danger,
-            theme.success,
+            status.danger,
+            status.success,
             theme.sidebar_border,
             theme.sidebar_accent.opacity(0.6),
         );
@@ -362,9 +364,12 @@ impl AppView {
     /// count), the timeline, overviews, Helm and Argo CD; those whose name has `query`.
     fn page_links(&self, query: &str, colors: Colors, cx: &mut Context<Self>) -> [Stateful<Div>; 8] {
         let route = self.route();
-        let (danger, warning) = (cx.theme().danger, cx.theme().warning);
+        // The sidebar is navy in both themes: status on it takes the bright colors, and a
+        // badge's count the sidebar's own color (white reads at 2.2:1 on the bright amber).
+        let (status, hull) = (super::bright_status(), cx.theme().sidebar);
+        let (danger, warning) = (status.danger, status.warning);
         let badge = |n: usize, color: Hsla| {
-            div().px_1p5().rounded_full().text_xs().bg(color).text_color(white()).child(n.to_string())
+            div().px_1p5().rounded_full().text_xs().bg(color).text_color(hull).child(n.to_string())
         };
         let pending = self.approvals.len();
         let nav_row = |id, icon, label, on| nav_row(id, icon, label, on, query, colors);
