@@ -347,8 +347,7 @@ impl AppView {
                                 .icon(Lucide::Plus)
                                 .label("Add a kubeconfig")
                                 .on_click(cx.listener(|this, _, _, cx| {
-                                    this.settings_view
-                                        .update(cx, crate::ui::settings_view::SettingsView::show_kubeconfig);
+                                    this.settings_view.update(cx, SettingsView::show_kubeconfig);
                                     this.navigate(Route::Settings, cx);
                                 })),
                         )
