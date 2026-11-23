@@ -278,7 +278,12 @@ Prompts (slash commands in Claude Code: `/mcp__recouvrance__troubleshoot` …): 
 Every call is logged with its decision and rule, and appended to
 `~/.local/share/recouvrance/audit.jsonl` (the folder is 0700, the file 0600). At 10 MiB the log moves to
 `audit.jsonl.1`, replacing the older one. If the log cannot be written, the Activity page says so. A
-kill switch cuts all agent access at once. A request nobody answers within 2 minutes is refused. An
+kill switch cuts all agent access at once. A request nobody answers within 2 minutes is refused: its
+banner counts down to that. So that it is seen with the window behind others or minimized, every
+window's title says how many requests wait, each window asks for attention (it flashes in the
+taskbar on X11 and bounces the Dock icon on macOS, not on Wayland) and one desktop
+notification is sent (with `notify-send` on Linux, in Notification Center on macOS, where it comes
+from Script Editor and needs that app's notifications allowed). An
 approval also ends when the agent stops waiting for it. When it cancels the call or hangs up (**Stop**
 in the assistant, a `claude -p` killed), the banner goes at once; when its session ends, within
 seconds. A click on the banner after that changes nothing. As with the kill switch, a call whose agent

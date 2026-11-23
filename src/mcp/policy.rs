@@ -834,6 +834,7 @@ pub(super) mod tests {
             preview: None,
             access: pods.clone(),
             dry_run: false,
+            deadline: std::time::Instant::now(),
         };
         let p = Policy { rules: vec![approval.as_rule().unwrap()], ..Policy::default() };
         assert_eq!(p.decide(&pods).mode, Mode::Allow);
@@ -972,6 +973,7 @@ pub(super) mod tests {
             preview: None,
             access: access("c1", "restart", "deployments.apps", Some("team"), Some("web")),
             dry_run: false,
+            deadline: std::time::Instant::now(),
         };
         // It wins over the Ask rule that asked, for exactly this request.
         let ask = rule(Mode::Ask, &["restart"], &["*"], &["*"], &["*"]);
@@ -1026,6 +1028,7 @@ pub(super) mod tests {
             preview: None,
             access: access("c1", verb, "pods", Some("team"), name),
             dry_run: false,
+            deadline: std::time::Instant::now(),
         };
         assert!(approval("exec_command", "exec", Some("web-1")).as_rule().is_none());
         assert!(approval("exec_command", "exec", Some("web-1")).as_rule_for_an_hour().is_none());
@@ -1370,6 +1373,7 @@ pub(crate) mod properties {
                 preview: None,
                 access: a.clone(),
                 dry_run,
+                deadline: std::time::Instant::now(),
             };
             for rule in [approval.as_rule(), approval.as_rule_for_an_hour()].into_iter().flatten() {
                 if rule.matches(&b, false) {

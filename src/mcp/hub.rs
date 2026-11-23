@@ -83,9 +83,17 @@ pub struct Approval {
     pub access: Access,
     /// A dry run: approving it must not turn into a rule for real writes.
     pub dry_run: bool,
+    /// When the request is refused unanswered. Set by [`Hub::request_approval`]; the banner
+    /// counts down to it.
+    pub deadline: Instant,
 }
 
 impl Approval {
+    /// How long the request still waits for an answer.
+    pub fn time_left(&self, now: Instant) -> Duration {
+        self.deadline.saturating_duration_since(now)
+    }
+
     /// A narrow Allow rule for exactly this request, when a rule can be that narrow.
     /// None for exec (a rule cannot pin the command), patches (the rule would allow any
     /// patch), scale (it would allow any replica count, 0 too), Flux suspend and resume (one
@@ -645,6 +653,9 @@ impl Hub {
         }
         let id = self.next_approval.fetch_add(1, Ordering::SeqCst);
         request.id = id;
+        // One deadline for the banner's countdown and the refusal, so they agree.
+        let deadline = Instant::now() + APPROVAL_TIMEOUT;
+        request.deadline = deadline;
         let (tx, rx) = oneshot::channel();
         lock(&self.approvals).insert(id, tx);
         let _pending = Pending { hub: self, id };
@@ -654,7 +665,7 @@ impl Hub {
             biased;
             () = gone => Answer::Abandoned,
             answer = rx => answer.unwrap_or(Answer::Rejected),
-            () = tokio::time::sleep(APPROVAL_TIMEOUT) => Answer::TimedOut,
+            () = tokio::time::sleep_until(deadline.into()) => Answer::TimedOut,
         }
     }
 
@@ -1002,6 +1013,7 @@ mod tests {
             preview: None,
             access,
             dry_run: false,
+            deadline: Instant::now(),
         };
         tokio::spawn(async move { hub.request_approval(request, gone).await })
     }
@@ -1043,6 +1055,28 @@ mod tests {
         hub.resolve_approval(1, true);
         assert!(lock(&hub.approvals).is_empty());
         assert!(approval_events(&mut events).is_empty());
+    }
+
+    /// The banner counts down to the moment the hub refuses the request: the deadline it
+    /// carries is the timeout's, not the placeholder its caller gave.
+    #[tokio::test]
+    async fn a_request_carries_the_deadline_it_is_refused_at() {
+        let hub = Hub::for_test(vec![agent()]);
+        let mut events = hub.subscribe();
+        let before = Instant::now();
+        let wait = ask(&hub, std::future::pending());
+        until_pending(&hub, 1).await;
+        let after = Instant::now();
+        let asked = std::iter::from_fn(|| events.try_recv().ok())
+            .find_map(|e| match &*e {
+                HubEvent::ApprovalRequested(a) => Some(a.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert!(asked.deadline >= before + APPROVAL_TIMEOUT && asked.deadline <= after + APPROVAL_TIMEOUT);
+        assert!(asked.time_left(after) <= APPROVAL_TIMEOUT);
+        assert_eq!(asked.time_left(asked.deadline + Duration::from_secs(5)), Duration::ZERO);
+        wait.abort();
     }
 
     /// A call dropped while it waits takes its request with it: no banner is left to approve.
