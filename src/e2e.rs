@@ -15,7 +15,7 @@ use kube::Api;
 use kube::api::{DeleteParams, Patch, PatchParams, PostParams};
 use serde_json::json;
 
-use crate::k8s::{self, gate};
+use crate::k8s::{self, gate, meter};
 use crate::mcp::{self, Mode, Verb, rules_file};
 
 const NS: &str = "default";
@@ -27,6 +27,12 @@ fn context() -> String {
 /// Run a test body on the app's runtime, as the app does.
 fn run(body: impl Future<Output = Result<()>> + Send + 'static) {
     futures::executor::block_on(k8s::run(body)).unwrap();
+}
+
+/// What Settings → API requests counts as received from `ctx` by requests of `class` so far.
+fn received(ctx: &str, class: meter::Class) -> u64 {
+    let read = meter::snapshot(meter::now_minute());
+    read.classes.iter().filter(|(c, k, _)| c == ctx && *k == class).map(|(_, _, s)| s.bytes).sum()
 }
 
 fn config_map(name: &str) -> ConfigMap {
@@ -122,7 +128,9 @@ fn write_mode_off_refuses_the_ui_s_writes() {
 
 /// An agent's rules decide on the real cluster through the MCP server: a delete its rules
 /// don't allow is refused and the object stays; the kill switch refuses even reads; with a
-/// delete rule, the same call deletes (so the refusals above are not a broken setup).
+/// delete rule, the same call deletes (so the refusals above are not a broken setup). A
+/// refusal says whether it is final, or the rule that would allow the call, and that rule,
+/// added, does; `check_access` says the same without making the call.
 #[test]
 #[ignore = "needs a kind cluster: RECOUVRANCE_E2E_CONTEXT"]
 fn an_agent_gets_only_what_its_rules_allow() {
@@ -141,10 +149,27 @@ fn an_agent_gets_only_what_its_rules_allow() {
         let out = client.call("delete_resource", delete.clone()).await;
         assert!(out.contains("Denied"), "{out}");
         assert!(truth.get_opt(name).await?.is_some(), "a denied delete reached the cluster");
+        let grant = format!("delete configmaps/{name} -n {NS} --context {ctx}");
+        assert!(out.contains("Grantable") && out.contains(&format!("`{grant}` under allow")), "{out}");
         let out = client
             .call("get_resource", json!({"context": ctx, "kind": "secrets", "namespace": "kube-system", "name": "x"}))
             .await;
-        assert!(out.contains("Denied"), "{out}");
+        assert!(out.contains("Denied") && out.contains("Final"), "{out}");
+        let planned = json!({"requests": [
+            {"context": ctx, "verb": "delete", "kind": "cm", "namespace": NS, "name": name},
+            {"context": ctx, "verb": "get", "kind": "secrets", "namespace": "kube-system", "name": "x"},
+            {"context": ctx, "verb": "list", "kind": "pods"},
+            {"context": "e2e-no-such-context", "verb": "get", "kind": "pods"},
+        ]});
+        let out = client.call("check_access", planned.clone()).await;
+        assert!(
+            out.contains(&format!("1. delete configmaps {name} -n {NS} --context {ctx}: denied. Grantable")),
+            "{out}"
+        );
+        assert!(out.contains("2. get secrets x -n kube-system") && out.contains("denied by rule #2"), "{out}");
+        assert!(out.contains("3. list pods (all namespaces / cluster)") && out.contains("allowed by rule #1"), "{out}");
+        assert!(out.contains("4. get pods --context e2e-no-such-context: could not check"), "{out}");
+        assert!(out.contains("1 allowed, 0 needing approval, 2 denied."), "{out}");
 
         hub.set_agents_enabled(false)?;
         let out = client.call("get_resource", get.clone()).await;
@@ -153,8 +178,11 @@ fn an_agent_gets_only_what_its_rules_allow() {
         let out = client.call("get_resource", get).await;
         assert!(out.contains(name), "{out}");
 
-        let allow = rules_file::parse_rule(Mode::Allow, "delete configmaps/e2e-* -n default")?;
+        // The rule the refusal named is enough.
+        let allow = rules_file::parse_rule(Mode::Allow, &grant)?;
         hub.update_agent(&agent.id, |a| a.policy.rules.push(allow))?;
+        let out = client.call("check_access", planned).await;
+        assert!(out.contains(&format!("{name} -n {NS} --context {ctx}: allowed by rule #3")), "{out}");
         let out = client.call("delete_resource", delete).await;
         assert!(!out.contains("Denied"), "{out}");
         for _ in 0..50 {
@@ -259,6 +287,72 @@ fn an_approval_ends_when_its_agent_stops_waiting() {
         assert!(!out.contains("Rejected") && !out.contains("Denied"), "{out}");
         let data = truth.get(name).await?.data.unwrap_or_default();
         assert_eq!(data.get("a").map(String::as_str), Some("2"), "{out}");
+        truth.delete(name, &DeleteParams::default()).await?;
+        Ok(())
+    });
+}
+
+/// An agent's patch that an Ask rule covers shows, before it is approved, what it will
+/// change: the field with its value now and after, and the diff, from a dry run that changes
+/// nothing. The activity log keeps it with the call.
+#[test]
+#[ignore = "needs a kind cluster: RECOUVRANCE_E2E_CONTEXT"]
+fn an_approval_shows_what_a_patch_will_change() {
+    use futures::StreamExt as _;
+    use std::time::Duration;
+
+    run(async {
+        let ctx = context();
+        let truth: Api<ConfigMap> = Api::namespaced(k8s::connect_for_agents(ctx.clone()).await?, NS);
+        let name = "e2e-preview";
+        let _ = truth.delete(name, &DeleteParams::default()).await;
+        truth.create(&PostParams::default(), &config_map(name)).await?;
+
+        let (hub, agent, token, _server) = agent(&["get,list *"], &[]).await?;
+        let ask = rules_file::parse_rule(Mode::Ask, &format!("patch configmaps/{name} -n {NS}"))?;
+        hub.update_agent(&agent.id, |a| a.policy.rules.push(ask))?;
+        // A window to approve in.
+        hub.set_headless(false);
+        let mut events = hub.subscribe();
+        let client = crate::assistant::Mcp::connect(hub.port(), token).await?;
+        let patch =
+            json!({"context": ctx, "kind": "configmaps", "namespace": NS, "name": name, "patch": {"data": {"a": "2"}}});
+        let approve = async {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+            loop {
+                let event = match tokio::time::timeout_at(deadline, events.next()).await {
+                    Ok(Some(event)) => event,
+                    Ok(None) => bail!("the hub stopped sending events"),
+                    Err(_) => bail!("no approval asked for within 60 s"),
+                };
+                if let mcp::HubEvent::ApprovalRequested(a) = &*event {
+                    // Asked for once the dry run is done: the object is still as it was.
+                    let data = truth.get(name).await?.data.unwrap_or_default();
+                    hub.resolve_approval(a.id, true);
+                    return anyhow::Ok((a.preview.clone(), data));
+                }
+            }
+        };
+        let (out, approved) = tokio::join!(client.call("patch_resource", patch), approve);
+        let (preview, before) = approved?;
+        let preview = preview.context("the approval shows no preview")?;
+        assert_eq!(before.get("a").map(String::as_str), Some("1"), "the dry run changed the object");
+        let text = preview.text();
+        assert!(text.contains(&format!("ConfigMap {NS}/{name}: changed")), "{text}");
+        assert!(text.contains("data.a: 1 → 2"), "{text}");
+        let added = preview
+            .sections
+            .iter()
+            .flat_map(|s| &s.diff)
+            .any(|l| matches!(l, crate::history::DiffLine::Added(t) if t.contains("a:") && t.contains('2')));
+        assert!(added, "{text}");
+        assert!(!out.contains("Rejected") && !out.contains("Denied"), "{out}");
+        let data = truth.get(name).await?.data.unwrap_or_default();
+        assert_eq!(data.get("a").map(String::as_str), Some("2"), "{out}");
+        // The log keeps what the approval showed.
+        let logged = hub.recent_audit(5, |e| e.agent_id == agent.id && e.tool == "patch_resource");
+        let change = logged.first().and_then(|e| e.change.clone()).unwrap_or_default();
+        assert!(change.contains("data.a: 1 → 2"), "{change}");
         truth.delete(name, &DeleteParams::default()).await?;
         Ok(())
     });
@@ -415,6 +509,8 @@ fn shells_and_attach_reach_the_container() {
     }
 
     run(async {
+        let ctx = context();
+        let streamed = || received(&ctx, meter::Class::Stream);
         let client = k8s::connect_for_agents(context()).await?;
         let pods: Api<Pod> = Api::namespaced(client.clone(), NS);
         let name = "e2e-shell";
@@ -445,11 +541,15 @@ fn shells_and_attach_reach_the_container() {
         };
         let checked = async {
             running.await?;
+            let before = streamed();
             let mut shell = k8s::exec_shell(client.clone(), NS.into(), name.into(), None);
             let _ = shell.input.unbounded_send(ExecInput::Resize { cols: 80, rows: 24 });
             let _ = shell.input.unbounded_send(ExecInput::Bytes(b"echo $((20+22))-answered\n".to_vec()));
             let text = read_until(&mut shell, "42-answered").await;
             assert!(text.contains("42-answered"), "{text}");
+            // What the shell printed came over its upgraded connection, and counts as received.
+            let counted = streamed().saturating_sub(before);
+            assert!(counted >= text.len() as u64, "{counted} bytes counted for {} printed", text.len());
             let _ = shell.input.unbounded_send(ExecInput::Bytes(b"exit\n".to_vec()));
             let text = read_until(&mut shell, "[exit:").await;
             assert!(text.contains("[exit: Session ended]"), "{text}");
@@ -488,6 +588,14 @@ fn shells_and_attach_reach_the_container() {
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             }
             assert_eq!(left(&ps), 0, "the closed shell is still running:\n{ps}");
+
+            // A command's output counts as it is read, whether it is kept or not.
+            let before = streamed();
+            let zeros = vec!["head".into(), "-c".into(), "300000".into(), "/dev/zero".into()];
+            let out = k8s::exec_capture(client.clone(), NS.into(), name.into(), None, zeros, 30, 1024).await?;
+            assert!(out.contains("[truncated]"), "{out}");
+            let counted = streamed().saturating_sub(before);
+            assert!(counted >= 300_000, "{counted} bytes counted for 300000 printed");
             Ok(())
         };
         let result: Result<()> = checked.await;
@@ -669,8 +777,12 @@ fn an_agent_s_port_forward_follows_its_rules() {
             hub.update_agent(&agent.id, |a| a.policy.rules.push(allow))?;
             let out = client.call("port_forward", args).await;
             let port = hub.forwards().first().map(|f| f.local).with_context(|| format!("no forward: {out}"))?;
+            let before = received(&ctx, meter::Class::Stream);
             let page = fetch(port).await?;
             assert!(page.contains("forwarded-ok"), "{page}");
+            // The page came back through the forward's tunnel, and counts as received.
+            let counted = received(&ctx, meter::Class::Stream).saturating_sub(before);
+            assert!(counted >= page.len() as u64, "{counted} bytes counted for {} forwarded", page.len());
 
             hub.set_agents_enabled(false)?;
             assert!(hub.forwards().is_empty(), "the kill switch stops agents' forwards");
@@ -813,10 +925,13 @@ fn an_agent_reads_a_workload_s_logs() {
             let (hub, agent, token, _server) = agent(&["get,list,logs *"], &[]).await?;
             let mcp = crate::assistant::Mcp::connect(hub.port(), token).await?;
             let args = json!({"context": ctx, "kind": "deployments", "namespace": NS, "name": name, "grep": "tick"});
+            let before = received(&ctx, meter::Class::Logs);
             let out = mcp.call("workload_logs", args.clone()).await;
             let ticks = out.lines().filter(|l| l.contains("tick-"));
             let prefixes: std::collections::HashSet<&str> = ticks.filter_map(|l| l.split(']').next()).collect();
             assert_eq!(prefixes.len(), 2, "{out}");
+            // The logs read count as received, as their bodies are read.
+            assert!(received(&ctx, meter::Class::Logs) > before, "no log bytes counted");
             assert!(out.contains("logs of container main (the default), not of helper"), "{out}");
             let pod = pods.list(&kube::api::ListParams::default().labels(&format!("app={name}"))).await?.items;
             let pod = pod.first().and_then(|p| p.metadata.name.clone()).unwrap_or_default();
@@ -931,6 +1046,69 @@ fn an_agent_diffs_a_manifest_without_changing_anything() {
         };
         let result: Result<()> = checked.await;
         truth.delete(name, &DeleteParams::default()).await?;
+        result
+    });
+}
+
+/// Custom resources applied right after their CRD (#839): in the same manifest, even listed
+/// before it, and in the call right after a CRD applied alone, they are applied once the API
+/// server serves their type, not refused as unknown until discovery runs again a minute later.
+#[test]
+#[ignore = "needs a kind cluster: RECOUVRANCE_E2E_CONTEXT"]
+fn an_agent_applies_custom_resources_right_after_their_crd() {
+    use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition;
+
+    fn crd(plural: &str, kind: &str) -> String {
+        let singular = kind.to_lowercase();
+        format!(
+            "apiVersion: apiextensions.k8s.io/v1\nkind: CustomResourceDefinition\nmetadata:\n  name: {plural}.e2e.recouvrance.dev\nspec:\n  group: e2e.recouvrance.dev\n  scope: Namespaced\n  names:\n    kind: {kind}\n    plural: {plural}\n    singular: {singular}\n  versions:\n  - name: v1\n    served: true\n    storage: true\n    schema:\n      openAPIV3Schema:\n        type: object\n        x-kubernetes-preserve-unknown-fields: true\n"
+        )
+    }
+    fn object(kind: &str, name: &str) -> String {
+        format!(
+            "apiVersion: e2e.recouvrance.dev/v1\nkind: {kind}\nmetadata:\n  name: {name}\n  namespace: {NS}\nspec:\n  size: 1\n"
+        )
+    }
+
+    run(async {
+        let ctx = context();
+        let crds: Api<CustomResourceDefinition> = Api::all(k8s::connect_for_agents(ctx.clone()).await?);
+        let names = ["e2ewidgets.e2e.recouvrance.dev", "e2egadgets.e2e.recouvrance.dev"];
+        for n in names {
+            let _ = crds.delete(n, &DeleteParams::default()).await;
+            for _ in 0..60 {
+                if crds.get_opt(n).await?.is_none() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+        }
+        let checked = async {
+            let (hub, _agent, token, _server) = agent(&["get,list,apply *"], &[]).await?;
+            let mcp = crate::assistant::Mcp::connect(hub.port(), token).await?;
+            // One manifest, the object before its CRD. Discovery first runs in this call,
+            // before the CRD exists.
+            let manifest = format!("{}---\n{}", object("E2eWidget", "one"), crd("e2ewidgets", "E2eWidget"));
+            let dry = mcp.call("apply_manifest", json!({"context": ctx, "manifest": manifest, "dry_run": true})).await;
+            assert!(dry.contains("E2eWidget one not checked"), "{dry}");
+            assert!(crds.get_opt(names[0]).await?.is_none(), "a dry run created a CRD");
+            let out = mcp.call("apply_manifest", json!({"context": ctx, "manifest": manifest})).await;
+            assert!(out.contains("E2eWidget one applied"), "{out}");
+            // A CRD alone, then its object in the very next call.
+            let out =
+                mcp.call("apply_manifest", json!({"context": ctx, "manifest": crd("e2egadgets", "E2eGadget")})).await;
+            assert!(out.contains(&format!("CustomResourceDefinition {} applied", names[1])), "{out}");
+            let out = mcp.call("apply_manifest", json!({"context": ctx, "manifest": object("E2eGadget", "two")})).await;
+            assert!(out.contains("E2eGadget two applied"), "{out}");
+            let target = json!({"context": ctx, "kind": "e2egadgets", "namespace": NS, "name": "two"});
+            let out = mcp.call("get_resource", target).await;
+            assert!(out.contains("size"), "{out}");
+            Ok(())
+        };
+        let result: Result<()> = checked.await;
+        for n in names {
+            let _ = crds.delete(n, &DeleteParams::default()).await;
+        }
         result
     });
 }
@@ -1357,6 +1535,74 @@ fn the_timeline_records_what_a_watch_sees_change() {
     });
 }
 
+/// The usage bars' requests and limits (and the cluster overview's pod totals) come from one
+/// list of the pods, then a watch: a pod created shows with its own, a resize in place changes
+/// them, and a deleted pod goes, without another list.
+#[test]
+#[ignore = "needs a kind cluster: RECOUVRANCE_E2E_CONTEXT"]
+fn usage_bar_requests_follow_pods_by_a_watch() {
+    use k8s_openapi::api::core::v1::Pod;
+
+    /// Wait until the requests and limits read for pod `name` are `want`: None once it is gone.
+    async fn read_until(rx: &mut k8s::PodRequestsRx, name: &str, want: Option<k8s::PodResources>) -> Result<()> {
+        let seen = |read: &Option<Result<k8s::PodRequests, String>>| {
+            let pod = read.as_ref().and_then(|r| r.as_ref().ok()).map(|r| r.pods.get(NS, name).map(|p| p.resources));
+            pod == Some(want)
+        };
+        let waited = tokio::time::timeout(std::time::Duration::from_secs(90), rx.wait_for(seen)).await;
+        if waited.is_ok_and(|read| read.is_ok()) {
+            return Ok(());
+        }
+        let last = rx.borrow().clone().map(|read| read.map(|r| r.pods.get(NS, name).map(|p| p.resources)));
+        bail!("{name}: wanted {want:?}, last read {last:?}")
+    }
+
+    run(async {
+        const NAME: &str = "e2e-requests";
+        let client = k8s::connect_for_agents(context()).await?;
+        let pods: Api<Pod> = Api::namespaced(client.clone(), NS);
+        let _ = pods.delete(NAME, &DeleteParams::default().grace_period(0)).await;
+        pod_gone(&pods, NAME).await?;
+        let (_watch, mut rx) =
+            k8s::watch_pod_resources(client.clone(), Some(NS.into()), k8s::Pause::default(), k8s::Pause::default());
+        let checked = async {
+            read_until(&mut rx, NAME, None).await?;
+            let pod = serde_json::from_value(json!({
+                "metadata": {"name": NAME, "namespace": NS},
+                "spec": {"terminationGracePeriodSeconds": 0, "containers": [{
+                    "name": "main", "image": "busybox:1.37", "command": ["sleep", "3600"],
+                    "resources": {"requests": {"cpu": "50m", "memory": "32Mi"},
+                        "limits": {"cpu": "100m", "memory": "64Mi"}},
+                }]},
+            }))?;
+            pods.create(&PostParams::default(), &pod).await?;
+            let mi = 1024.0 * 1024.0;
+            let mut want =
+                k8s::PodResources { cpu: (Some(50.0), Some(100.0)), mem: (Some(32.0 * mi), Some(64.0 * mi)) };
+            read_until(&mut rx, NAME, Some(want)).await?;
+
+            // Resized in place, through the `resize` subresource of Kubernetes 1.33 and later.
+            let resize = json!({"spec": {"containers": [
+                {"name": "main", "resources": {"requests": {"cpu": "60m"}, "limits": {"cpu": "120m"}}},
+            ]}});
+            match pods.patch_subresource("resize", NAME, &PatchParams::default(), &Patch::Strategic(resize)).await {
+                Ok(_) => {
+                    want.cpu = (Some(60.0), Some(120.0));
+                    read_until(&mut rx, NAME, Some(want)).await?;
+                }
+                Err(kube::Error::Api(status)) if status.code == 404 => eprintln!("no in-place resize on this cluster"),
+                Err(e) => return Err(e.into()),
+            }
+
+            pods.delete(NAME, &DeleteParams::default().grace_period(0)).await?;
+            read_until(&mut rx, NAME, None).await
+        };
+        let result: Result<()> = checked.await;
+        let _ = pods.delete(NAME, &DeleteParams::default().grace_period(0)).await;
+        result
+    });
+}
+
 /// A container without a shell (`pause`, a scratch image like distroless) is read through a
 /// debug container: exec finds no shell, the debug container added shares its processes, and
 /// its files read through `/proc/<pid>/root`, a mounted volume and absolute symlinks included.
@@ -1715,6 +1961,190 @@ fn the_timeline_s_events_come_through_their_watch() {
         let result: Result<()> = checked.await;
         for reason in ["e2efirst", "e2esecond"] {
             let _ = truth.delete(&format!("{object}.{reason}"), &DeleteParams::default()).await;
+        }
+        result
+    });
+}
+
+/// Argo CD's Application kind as its CRD serves it (no status subresource), for the gitops
+/// test: kind runs no Argo CD. True when this test installed it (and removes it after).
+async fn application_crd(client: kube::Client) -> Result<bool> {
+    use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition;
+    let crds: Api<CustomResourceDefinition> = Api::all(client);
+    let name = "applications.argoproj.io";
+    let installed = crds.get_opt(name).await?.is_none();
+    if installed {
+        let crd = serde_json::from_value(json!({
+            "metadata": {"name": name},
+            "spec": {
+                "group": "argoproj.io",
+                "names": {"kind": "Application", "listKind": "ApplicationList", "plural": "applications", "singular": "application"},
+                "scope": "Namespaced",
+                "versions": [{"name": "v1alpha1", "served": true, "storage": true,
+                    "schema": {"openAPIV3Schema": {"type": "object", "x-kubernetes-preserve-unknown-fields": true}}}],
+            },
+        }))?;
+        crds.create(&PostParams::default(), &crd).await?;
+    }
+    for _ in 0..60 {
+        let crd = crds.get(name).await?;
+        let conditions = crd.status.and_then(|s| s.conditions).unwrap_or_default();
+        if conditions.iter().any(|c| c.type_ == "Established" && c.status == "True") {
+            return Ok(installed);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    bail!("the Application CRD was not established")
+}
+
+/// An agent syncs an Argo CD Application with options, terminates the operation and rolls
+/// back, under its rules; what each writes to the Application is what argocd-server would
+/// (the test plays Argo CD's controller). Nothing starts while an operation runs, a rollback
+/// is refused while auto-sync is on, and the window's client refuses it all with write mode off.
+#[test]
+#[ignore = "needs a kind cluster: RECOUVRANCE_E2E_CONTEXT"]
+fn an_agent_syncs_terminates_and_rolls_back_an_argo_cd_application() {
+    use kube::api::DynamicObject;
+
+    run(async {
+        let ctx = context();
+        let admin = k8s::connect_for_agents(ctx.clone()).await?;
+        let installed = application_crd(admin.clone()).await?;
+        let kind = k8s::argo::application_kind();
+        let apps: Api<DynamicObject> = Api::namespaced_with(admin.clone(), NS, &kind.ar);
+        let name = "e2e-argo";
+        let _ = apps.delete(name, &DeleteParams::default()).await;
+        let source = json!({"repoURL": "https://git.example/apps", "path": "web", "targetRevision": "HEAD"});
+        let (first, second) = ("1".repeat(40), "2".repeat(40));
+        let app = json!({
+            "apiVersion": "argoproj.io/v1alpha1", "kind": "Application",
+            "metadata": {"name": name, "namespace": NS},
+            "spec": {"project": "default", "source": source,
+                "destination": {"server": "https://kubernetes.default.svc", "namespace": NS}},
+            "status": {
+                "sync": {"status": "OutOfSync"},
+                "resources": [
+                    {"group": "apps", "version": "v1", "kind": "Deployment", "namespace": NS, "name": "web", "status": "OutOfSync"},
+                    {"version": "v1", "kind": "ConfigMap", "namespace": NS, "name": "old", "status": "OutOfSync", "requiresPruning": true},
+                    {"version": "v1", "kind": "ConfigMap", "namespace": NS, "name": "kept", "status": "Synced"},
+                ],
+                "history": [
+                    {"id": 1, "revision": first, "deployedAt": "2025-01-01T00:00:00Z", "source": source},
+                    {"id": 2, "revision": second, "deployedAt": "2025-01-02T00:00:00Z", "source": source},
+                ],
+            },
+        });
+        apps.create(&PostParams::default(), &serde_json::from_value(app)?).await?;
+        // The Application as stored, and a merge patch of it: what Argo CD's controller does.
+        let api = &apps;
+        let read = move || async move { anyhow::Ok(serde_json::to_value(api.get(name).await?)?) };
+        let set = move |patch: serde_json::Value| async move {
+            api.patch(name, &PatchParams::default(), &Patch::Merge(patch)).await?;
+            anyhow::Ok(())
+        };
+        let checked = async {
+            let (hub, agent, token, _server) = agent(&["get,list *"], &[]).await?;
+            let client = crate::assistant::Mcp::connect(hub.port(), token).await?;
+            let target = json!({"context": ctx, "kind": "applications", "namespace": NS, "name": name});
+            let with = |extra: serde_json::Value| {
+                let mut args = target.clone();
+                for (k, v) in extra.as_object().into_iter().flatten() {
+                    args[k] = v.clone();
+                }
+                args
+            };
+
+            // Without a sync rule, nothing is written (a sync is not a patch).
+            let out = client.call("gitops", with(json!({"action": "sync"}))).await;
+            assert!(out.contains("Denied"), "{out}");
+            assert!(read().await?.get("operation").is_none());
+            let allow = rules_file::parse_rule(Mode::Allow, "sync applications/e2e-* -n default")?;
+            hub.update_agent(&agent.id, |a| a.policy.rules.push(allow))?;
+
+            // A sync of two resources with prune: it names what prune deletes.
+            let picked = json!([
+                {"group": "apps", "kind": "Deployment", "namespace": NS, "name": "web"},
+                {"kind": "ConfigMap", "namespace": NS, "name": "old"},
+            ]);
+            let out = client.call("gitops", with(json!({"action": "sync", "resources": picked, "prune": true}))).await;
+            assert!(out.contains("prune deletes ConfigMap default/old"), "{out}");
+            let op = read().await?["operation"].clone();
+            assert_eq!(op["initiatedBy"]["username"], "recouvrance", "{op}");
+            assert_eq!(op["sync"]["prune"], true, "{op}");
+            assert_eq!(op["sync"]["syncStrategy"], json!({"hook": {}}), "{op}");
+            assert_eq!(op["sync"]["resources"], picked, "{op}");
+
+            // Nothing else starts while it runs; it can be terminated.
+            let out = client.call("gitops", with(json!({"action": "sync"}))).await;
+            assert!(out.contains("in progress"), "{out}");
+            assert_eq!(read().await?["operation"], op);
+            set(json!({"status": {"operationState": {"phase": "Running", "operation": op}}})).await?;
+            let out = client.call("gitops", with(json!({"action": "terminate"}))).await;
+            assert!(out.contains("Terminating"), "{out}");
+            assert_eq!(read().await?.pointer("/status/operationState/phase"), Some(&json!("Terminating")));
+
+            // Argo CD ends it; a rollback goes to the deployment before the newest.
+            set(json!({"operation": null, "status": {"operationState": {"phase": "Failed"}}})).await?;
+            let out = client.call("gitops", with(json!({"action": "rollback"}))).await;
+            assert!(out.contains("Rollback to deployment 1"), "{out}");
+            let sync = read().await?["operation"]["sync"].clone();
+            assert_eq!(sync["revision"], first, "{sync}");
+            assert_eq!(sync["source"], source, "{sync}");
+            assert_eq!(sync["syncStrategy"], json!({"apply": {}}), "{sync}");
+            assert!(sync.get("prune").is_none(), "{sync}");
+
+            // With auto-sync on, Argo CD refuses a rollback: so is it here.
+            set(json!({"operation": null, "spec": {"syncPolicy": {"automated": {}}}})).await?;
+            let out = client.call("gitops", with(json!({"action": "rollback", "deployment_id": 1}))).await;
+            assert!(out.contains("auto-sync is on"), "{out}");
+            assert!(read().await?.get("operation").is_none());
+            set(json!({"spec": {"syncPolicy": null}})).await?;
+
+            // A dry run: its result comes back once Argo CD (here, the test) is done.
+            let call = client.call("gitops", with(json!({"action": "sync", "dry_run": true})));
+            let controller = async {
+                for _ in 0..50 {
+                    let app = read().await?;
+                    if app.pointer("/operation/sync/dryRun") == Some(&json!(true)) {
+                        return set(json!({"operation": null, "status": {"operationState": {
+                            "phase": "Succeeded", "message": "successfully synced (all tasks run)",
+                            "operation": app["operation"],
+                            "syncResult": {"resources": [{"kind": "ConfigMap", "namespace": NS, "name": "old",
+                                "status": "Pruned", "message": "pruned (dry run)"}]},
+                        }}}))
+                        .await;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                }
+                bail!("no dry run was written")
+            };
+            let (out, simulated) = futures::join!(call, controller);
+            simulated?;
+            assert!(out.contains("Dry run Succeeded") && out.contains("Pruned: pruned (dry run)"), "{out}");
+            assert!(read().await?.get("operation").is_none());
+
+            // The window's client: write mode off refuses it when it is sent.
+            gate::set_ui_writes(false);
+            let ui = k8s::connect(ctx.clone()).await?;
+            let refused = k8s::argo_operation(
+                ui,
+                k8s::argo::application_kind(),
+                Some(NS.into()),
+                name.into(),
+                k8s::argo::ops::Op::Sync(k8s::argo::ops::SyncRequest::default()),
+            )
+            .await;
+            let err = format!("{:#}", refused.expect_err("write mode is off"));
+            assert!(err.contains(gate::WRITES_OFF), "{err}");
+            assert!(read().await?.get("operation").is_none(), "the refused sync reached the cluster");
+            Ok(())
+        };
+        let result: Result<()> = checked.await;
+        let _ = apps.delete(name, &DeleteParams::default()).await;
+        if installed {
+            use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition;
+            let crds: Api<CustomResourceDefinition> = Api::all(admin);
+            let _ = crds.delete("applications.argoproj.io", &DeleteParams::default()).await;
         }
         result
     });

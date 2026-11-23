@@ -102,7 +102,7 @@ impl Res {
         self.group.is_empty() && self.kind == "Secret"
     }
 
-    fn same(&self, other: &Self) -> bool {
+    pub(crate) fn same(&self, other: &Self) -> bool {
         (&self.group, &self.kind, &self.namespace, &self.name)
             == (&other.group, &other.kind, &other.namespace, &other.name)
     }
@@ -309,7 +309,7 @@ impl Diagnosis {
             d.looping = looping(app, &differing);
             d.findings.push(loop_finding(&lp, &d.looping));
         }
-        if let Some(f) = out_of_sync_finding(&out_of_sync, live, automated, d.moved.as_ref()) {
+        if let Some(f) = out_of_sync_finding(sync_effects(app, live), automated, d.moved.as_ref()) {
             d.findings.push(f);
         }
         let mut seen = BTreeSet::new();
@@ -532,7 +532,8 @@ fn stuck(app: &Value, now: Timestamp) -> Option<Finding> {
         objects,
         more,
         hint: "A hook Job that never ends, or a resource that never becomes healthy, keeps the sync running: fix it, \
-               or terminate the sync in Argo CD (`argocd app terminate-op`)."
+               or terminate the sync (Terminate on the Application's page, `gitops` `terminate`, or \
+               `argocd app terminate-op`)."
             .into(),
     })
 }
@@ -731,31 +732,60 @@ fn loop_finding(lp: &SyncLoop, looping: &[Res]) -> Finding {
     }
 }
 
-/// What is out of sync, each object said as missing or differing only when it is known to be
-/// gone or there (see [`there`]).
+/// What a sync does to one out-of-sync resource of an Application.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SyncEffect {
+    /// In git, not in the cluster yet: created.
+    Create,
+    /// In both, different: updated.
+    Update,
+    /// In the cluster, no longer in git: deleted only by a sync that prunes.
+    Prune,
+    /// Out of sync, and whether it is in the cluster isn't known (see [`there`]).
+    Unknown,
+}
+
+/// The out-of-sync resources of `app` and what a sync does to each, an object said missing or
+/// differing only when it is known to be gone or there (`live`, else Argo CD's status).
+pub fn sync_effects(app: &Value, live: &[Drift]) -> Vec<(Res, SyncEffect)> {
+    arr(app, "/status/resources")
+        .iter()
+        .filter(|r| r["status"] == "OutOfSync")
+        .filter_map(|r| {
+            // The resources table says the same of the same resources (`argo::to_prune`).
+            let effect = if super::to_prune(r) {
+                SyncEffect::Prune
+            } else {
+                match there(r, live) {
+                    Some(false) => SyncEffect::Create,
+                    Some(true) => SyncEffect::Update,
+                    None => SyncEffect::Unknown,
+                }
+            };
+            Some((Res::of(r)?, effect))
+        })
+        .collect()
+}
+
+/// What is out of sync (see [`sync_effects`]).
 fn out_of_sync_finding(
-    resources: &[&Value],
-    live: &[Drift],
+    effects: Vec<(Res, SyncEffect)>,
     automated: bool,
     moved: Option<&(String, String)>,
 ) -> Option<Finding> {
-    if resources.is_empty() {
+    if effects.is_empty() {
         return None;
     }
-    let objects: Vec<(Res, String)> = resources
-        .iter()
-        .filter_map(|r| {
-            // The resources table says the same of the same resources (`argo::to_prune`).
-            let what = if super::to_prune(r) {
-                "in the cluster, no longer in git: a sync with prune deletes it"
-            } else {
-                match there(r, live) {
-                    Some(false) => "in git, not in the cluster yet",
-                    Some(true) => "differs from git",
-                    None => "out of sync with git (its live object wasn't read)",
-                }
+    let objects: Vec<(Res, String)> = effects
+        .into_iter()
+        .map(|(r, effect)| {
+            let what = match effect {
+                SyncEffect::Prune => "in the cluster, no longer in git: a sync with prune deletes it",
+                SyncEffect::Create => "in git, not in the cluster yet",
+                SyncEffect::Update => "differs from git",
+                SyncEffect::Unknown => "out of sync with git (its live object wasn't read)",
             };
-            Some((Res::of(r)?, what.to_string()))
+            (r, what.to_string())
         })
         .collect();
     let n = objects.len();

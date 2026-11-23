@@ -3,17 +3,16 @@
 use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::notification::Notification;
-use gpui_kit::component::{
-    ActiveTheme as _, Disableable as _, Icon, Sizable as _, ThemeMode, WindowExt as _, h_flex, v_flex,
-};
+use gpui_kit::component::{ActiveTheme as _, Disableable as _, Icon, Sizable as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use super::search_index::{Entry, SEARCH_KINDS, on_cluster};
-use super::{AppView, Route, open_main_window, section_icon, set_theme, set_zoom, with_keys, zoom};
+use super::{AppView, Route, section_icon, set_zoom, zoom};
 use crate::k8s;
 use crate::k8s::Kind;
 use crate::ui::palette::{Item as PaletteItem, Palette, PaletteEvent, Target};
+use crate::ui::settings_view::SettingsView;
 
 impl AppView {
     pub(super) fn zoom_by(&mut self, delta: Option<f32>, window: &mut Window, cx: &mut Context<Self>) {
@@ -24,68 +23,42 @@ impl AppView {
     }
 
     pub(super) fn open_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let mut items = Vec::new();
-        for (label, page, icon) in [
-            ("Cluster overview", "cluster", Lucide::Server),
-            ("Workloads overview", "workloads", Lucide::LayoutDashboard),
-            ("Helm releases", "helm", Lucide::Ship),
-            ("Argo CD Applications", "argo", Lucide::GitFork),
-            ("Agents", "agents", Lucide::Bot),
-            ("Contexts", "contexts", Lucide::Server),
-            ("Settings", "settings", Lucide::Settings),
-            ("Terminal (kubectl on this context)", "terminal", Lucide::SquareTerminal),
-            ("Create / apply YAML", "apply", Lucide::Plus),
-            ("Problems (what is broken)", "problems", Lucide::TriangleAlert),
-            ("Timeline (what changed, across clusters)", "timeline", Lucide::ClockArrowDown),
-            ("My access (RBAC in this namespace)", "access", Lucide::KeyRound),
-            ("Install a Helm chart", "helm-install", Lucide::Download),
-            ("Assistant (ask your clusters)", "assistant", Lucide::Sparkles),
-            ("New window ({secondary-shift-n})", "new-window", Lucide::AppWindow),
-            ("Zoom in ({secondary-=})", "zoom-in", Lucide::ZoomIn),
-            ("Zoom out ({secondary--})", "zoom-out", Lucide::ZoomOut),
-            ("Reset zoom ({secondary-0})", "zoom-reset", Lucide::Search),
-            ("Toggle dark / light theme", "theme", Lucide::Moon),
-        ] {
-            let label = with_keys(label);
-            items.push(PaletteItem { label, detail: "page".into(), icon, target: Target::Page(page) });
+        // Commands first (pages, keys, toggles), then each Settings section and saved view.
+        let mut items: Vec<PaletteItem> = super::commands::palette_items().collect();
+        for (section, name, icon) in SettingsView::sections() {
+            items.push(PaletteItem::new(
+                format!("Settings → {name}"),
+                String::new(),
+                *icon,
+                Target::Settings(*section),
+            ));
+        }
+        for v in self.favorites.read(cx).views() {
+            let detail = format!("saved view · {}", v.kind.split('.').next().unwrap_or_default());
+            items.push(PaletteItem::new(v.name.clone(), detail, Lucide::Bookmark, Target::View(v.clone())));
         }
         // The types the sidebar lists, not the noise discovery keeps for lookups.
         for k in self.kinds.iter().filter(|k| k8s::in_sidebar(k)) {
-            items.push(PaletteItem {
-                label: k.label.clone(),
-                detail: format!("{} · {}", k.kubectl_name(), k.section),
-                icon: section_icon(k.section),
-                target: Target::Kind(k.clone()),
-            });
+            items.push(PaletteItem::new(
+                k.label.clone(),
+                format!("{} · {}", k.kubectl_name(), k.section),
+                section_icon(k.section),
+                Target::Kind(k.clone()),
+            ));
         }
         for c in &self.all_contexts {
-            items.push(PaletteItem {
-                label: c.clone(),
-                detail: "switch context".into(),
-                icon: Lucide::Ship,
-                target: Target::Context(c.clone()),
-            });
+            items.push(PaletteItem::new(c.clone(), "switch context".into(), Lucide::Ship, Target::Context(c.clone())));
         }
         // With several clusters, objects say which one they are on.
         let names: std::rc::Rc<Vec<String>> = std::rc::Rc::new(self.clusters.iter().map(|(c, _)| c.clone()).collect());
         for o in self.favorites.read(cx).objects() {
             if let Some(ctx) = self.clusters.iter().position(|(c, _)| *c == o.context) {
-                items.push(PaletteItem {
-                    label: o.name.clone(),
-                    detail: format!(
-                        "★ {} · {}{}",
-                        o.kind,
-                        o.namespace.clone().unwrap_or_default(),
-                        on_cluster(&names, ctx)
-                    ),
-                    icon: Lucide::Star,
-                    target: Target::Object {
-                        ctx,
-                        kind: o.kind.clone(),
-                        name: o.name.clone(),
-                        namespace: o.namespace.clone(),
-                    },
-                });
+                items.push(PaletteItem::new(
+                    o.name.clone(),
+                    format!("★ {} · {}{}", o.kind, o.namespace.clone().unwrap_or_default(), on_cluster(&names, ctx)),
+                    Lucide::Star,
+                    Target::Object { ctx, kind: o.kind.clone(), name: o.name.clone(), namespace: o.namespace.clone() },
+                ));
             }
         }
         // Objects of the current table.
@@ -93,22 +66,22 @@ impl AppView {
             let t = self.table.read(cx).delegate();
             for ix in 0..t.rows_count_visible().min(5000) {
                 let (Some(row), Some(ctx)) = (t.row(ix), t.row_context(ix)) else { continue };
-                items.push(PaletteItem {
-                    label: row.name.clone(),
-                    detail: format!(
+                items.push(PaletteItem::new(
+                    row.name.clone(),
+                    format!(
                         "{} · {}{}",
                         kind.label,
                         row.namespace.clone().unwrap_or_default(),
                         on_cluster(&names, ctx)
                     ),
-                    icon: section_icon(kind.section),
-                    target: Target::Object {
+                    section_icon(kind.section),
+                    Target::Object {
                         ctx,
                         kind: kind.kubectl_name(),
                         name: row.name.clone(),
                         namespace: row.namespace.clone(),
                     },
-                });
+                ));
             }
         }
         items.extend(self.search_index.entries().iter().map(|e| e.item(&names)));
@@ -166,30 +139,10 @@ impl AppView {
             if let PaletteEvent::Pick(target) = ev {
                 match target.clone() {
                     Target::Kind(k) => this.select_kind(k, cx),
-                    Target::Page("workloads") => this.open_workloads(window, cx),
-                    Target::Page("helm") => this.open_helm(window, cx),
-                    Target::Page("argo") => this.open_argo(window, cx),
-                    Target::Page("cluster") => this.open_cluster(window, cx),
-                    Target::Page("settings") => this.navigate(Route::Settings, cx),
-                    Target::Page("terminal") => this.open_terminal(window, cx),
-                    Target::Page("apply") => this.open_apply(window, cx),
-                    Target::Page("new-window") => {
-                        open_main_window(cx);
-                    }
-                    Target::Page("problems") => this.open_problems(window, cx),
-                    Target::Page("timeline") => this.open_timeline(window, cx),
-                    Target::Page("access") => this.open_access(window, cx),
-                    Target::Page("helm-install") => this.open_helm_install(window, cx),
-                    Target::Page("assistant") => this.open_assistant(window, cx),
-                    Target::Page("zoom-in") => this.zoom_by(Some(0.1), window, cx),
-                    Target::Page("zoom-out") => this.zoom_by(Some(-0.1), window, cx),
-                    Target::Page("zoom-reset") => this.zoom_by(None, window, cx),
-                    Target::Page("theme") => {
-                        let mode = if cx.theme().is_dark() { ThemeMode::Light } else { ThemeMode::Dark };
-                        set_theme(mode, Some(window), cx);
-                    }
-                    Target::Page("agents") => this.navigate(Route::Agents, cx),
-                    Target::Page(_) => this.navigate(Route::Contexts, cx),
+                    // Run as if its keys were pressed, with the window focused again.
+                    Target::Action(action) => window.dispatch_action(action(), cx),
+                    Target::Settings(section) => this.open_settings_section(section, window, cx),
+                    Target::View(view) => this.apply_view(&view, window, cx),
                     Target::Context(c) => this.connect_many(vec![c], window, cx),
                     Target::Object { .. } if this.clusters.iter().map(|(c, _)| c).ne(opened_on.iter()) => {
                         window.push_notification(
@@ -226,7 +179,9 @@ impl AppView {
     }
 
     pub(super) fn render_approvals(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let cx: &App = cx;
         let theme = cx.theme();
+        let now = std::time::Instant::now();
         v_flex().children(self.approvals.iter().map(|a| {
             let (deny, approve) = (a.id, a.id);
             let hub = self.hub.clone();
@@ -245,15 +200,20 @@ impl AppView {
                         .min_w_0()
                         .text_sm()
                         .child(format!("{} wants to run {}: ", a.agent, a.tool))
-                        // Patches and manifests are shown whole: what is approved is what runs.
+                        // Patches and manifests are shown whole: what is approved is what runs. What
+                        // the call will change comes right under the request, a manifest's YAML after.
                         .child(
-                            div()
+                            v_flex()
                                 .id(("approval-summary", a.id as usize))
-                                .max_h(px(240.))
+                                .max_h(px(300.))
                                 .overflow_y_scroll()
+                                .overflow_x_hidden()
+                                .gap_1()
                                 .font_family(theme.mono_font_family.clone())
                                 .text_xs()
-                                .child(a.summary.clone()),
+                                .child(a.summary.clone())
+                                .when_some(a.preview.as_ref(), |d, p| d.child(preview_block(p, cx)))
+                                .when_some(a.detail.clone(), ParentElement::child),
                         ),
                 )
                 // Only offered when a rule can cover exactly this request (not exec, for one).
@@ -291,6 +251,10 @@ impl AppView {
                         });
                     d.child(hour).child(always)
                 })
+                // An unanswered request is refused: say when.
+                .child(
+                    div().flex_none().text_xs().text_color(theme.muted_foreground).child(refused_in(a.time_left(now))),
+                )
                 .child(
                     Button::new(("deny", a.id as usize))
                         .small()
@@ -306,7 +270,35 @@ impl AppView {
                 )
         }))
     }
+}
 
+/// How long an approval still waits, in its banner: "refused in 1:42". Rounded up, so it
+/// never says 0:00 while the request still waits.
+fn refused_in(left: std::time::Duration) -> String {
+    let secs = left.as_millis().div_ceil(1000);
+    format!("refused in {}:{:02}", secs / 60, secs % 60)
+}
+
+/// What an approval's call will change, under its request: each object with the fields that
+/// change and its diff, or why there is no preview.
+fn preview_block(p: &crate::mcp::Preview, cx: &App) -> AnyElement {
+    let theme = cx.theme();
+    v_flex()
+        .gap_1()
+        .child(div().font_weight(FontWeight::SEMIBOLD).child("What will change"))
+        .when_some(p.note.clone(), |d, note| d.child(div().text_color(theme.muted_foreground).child(note)))
+        .children(p.sections.iter().map(|s| {
+            v_flex()
+                .gap_0p5()
+                .child(div().font_weight(FontWeight::SEMIBOLD).child(s.title.clone()))
+                .children(s.lines.iter().map(|line| div().pl_2().child(line.clone())))
+                .when_some(s.note.clone(), |d, note| d.child(div().pl_2().text_color(theme.danger).child(note)))
+                .when(!s.diff.is_empty(), |d| d.child(crate::details::diff_block(&s.diff, cx)))
+        }))
+        .into_any_element()
+}
+
+impl AppView {
     pub(super) fn toggle_context(&mut self, context: String, cx: &mut Context<Self>) {
         if !self.picked.remove(&context) {
             self.picked.insert(context);
@@ -395,8 +387,7 @@ impl AppView {
                                 .icon(Lucide::Plus)
                                 .label("Add a kubeconfig")
                                 .on_click(cx.listener(|this, _, _, cx| {
-                                    this.settings_view
-                                        .update(cx, crate::ui::settings_view::SettingsView::show_kubeconfig);
+                                    this.settings_view.update(cx, SettingsView::show_kubeconfig);
                                     this.navigate(Route::Settings, cx);
                                 })),
                         )
@@ -413,5 +404,44 @@ impl AppView {
                         ),
                 ),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use proptest::prelude::*;
+
+    use super::refused_in;
+
+    /// The seconds a countdown text shows.
+    fn shown(text: &str) -> u64 {
+        let (min, sec) = text.strip_prefix("refused in ").unwrap().split_once(':').unwrap();
+        assert_eq!(sec.len(), 2, "{text}");
+        min.parse::<u64>().unwrap() * 60 + sec.parse::<u64>().unwrap()
+    }
+
+    #[test]
+    fn the_countdown_reads_as_minutes_and_seconds() {
+        assert_eq!(refused_in(Duration::from_secs(120)), "refused in 2:00");
+        assert_eq!(refused_in(Duration::from_millis(101_200)), "refused in 1:42");
+        assert_eq!(refused_in(Duration::from_secs(59)), "refused in 0:59");
+        assert_eq!(refused_in(Duration::from_millis(300)), "refused in 0:01");
+        assert_eq!(refused_in(Duration::ZERO), "refused in 0:00");
+    }
+
+    proptest! {
+        /// The countdown shows the time left rounded up to the second: never 0:00 while
+        /// the request waits, never more than a second over, and it never goes up as time
+        /// passes.
+        #[test]
+        fn the_countdown_rounds_up_and_only_goes_down(a in 0u64..=180_000, b in 0u64..=180_000) {
+            let (early, late) = (a.max(b), a.min(b));
+            let s = shown(&refused_in(Duration::from_millis(early)));
+            prop_assert!(s * 1000 >= early && s * 1000 < early + 1000);
+            prop_assert!(shown(&refused_in(Duration::from_millis(late))) <= s);
+            prop_assert_eq!(s == 0, early == 0);
+        }
     }
 }

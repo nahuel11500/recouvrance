@@ -14,14 +14,16 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use crate::k8s;
-use crate::mcp::{Agent, Hub, Mode, Policy, Rule, Verb, any_glob, grants_write};
+use crate::mcp::{Agent, Hub, Mode, Policy, Rule, Verb, any_glob, grants_write, is_protected_selector};
 
 mod activity;
+mod clients;
 mod code;
 mod detail;
 mod rules;
 
 use activity::Activity;
+use clients::Client;
 
 pub struct AgentsView {
     /// Show every agent's activity instead of one agent's settings.
@@ -34,8 +36,12 @@ pub struct AgentsView {
     protected: Vec<String>,
     contexts_error: Option<String>,
     selected: Option<String>,
-    /// Token shown once after creating or rotating, per agent id.
+    /// The last token made (a new agent, or "New token") and its agent's id. Tokens are kept
+    /// hashed, so besides the main agent's (saved for the assistant) it is the only one a
+    /// client's config can be copied with.
     fresh_token: Option<(String, String)>,
+    /// The client whose config the agent's page shows (None: just the list of clients).
+    connect_client: Option<Client>,
     /// Show several agents (a list on the left); otherwise the one main agent.
     advanced: bool,
     /// Whether your Claude Code has Recouvrance's MCP server registered (None: checking).
@@ -172,6 +178,7 @@ impl AgentsView {
             contexts_error: None,
             selected: None,
             fresh_token: None,
+            connect_client: None,
             new_name,
             editor: None,
             tester,
@@ -189,6 +196,25 @@ impl AgentsView {
             this.all_activity = true;
         }
         this
+    }
+
+    /// Show every agent's activity (the palette's Agent activity). The agent list shows too, so
+    /// a click on an agent goes back to it. Rules as code stays open while it has unsaved edits,
+    /// saying why the activity isn't shown; closing it shows the activity.
+    pub fn show_activity(&mut self, cx: &mut Context<Self>) {
+        let unsaved = self.code.as_ref().is_some_and(|(editor, loaded)| {
+            let text = editor.read(cx).value().to_string();
+            text != *loaded
+        });
+        if unsaved {
+            self.code_message =
+                Some((false, "Unsaved edits: save them, then close Rules as code to see the activity".into()));
+        } else {
+            self.code = None;
+        }
+        self.all_activity = true;
+        self.advanced = true;
+        cx.notify();
     }
 
     fn report<T>(&mut self, result: Result<T>) -> Option<T> {
@@ -209,6 +235,7 @@ impl AgentsView {
         if let Some((agent, token)) = self.report(self.hub.create_agent(name)) {
             self.new_name.update(cx, |s, cx| s.set_value("", window, cx));
             self.fresh_token = Some((agent.id.clone(), token));
+            self.connect_client = self.connect_client.or(Some(Client::ClaudeCode));
             self.select(agent.id, window, cx);
         }
         cx.notify();
@@ -352,9 +379,26 @@ impl AgentsView {
         }
     }
 
-    /// Contexts in kubeconfig matched by a rule's patterns.
-    fn matched_contexts(&self, patterns: &[String]) -> Vec<String> {
-        self.contexts.iter().filter(|c| any_glob(patterns, c)).cloned().collect()
+    /// Contexts in kubeconfig a rule covers: those its patterns match, and the protected ones
+    /// for `@protected` in an Ask or Deny rule.
+    fn matched_contexts(&self, rule: &Rule) -> Vec<String> {
+        let protected = rule.effect != Mode::Allow && rule.contexts.iter().any(|p| is_protected_selector(p));
+        let globs: Vec<String> = rule.contexts.iter().filter(|p| !is_protected_selector(p)).cloned().collect();
+        self.contexts
+            .iter()
+            .filter(|c| any_glob(&globs, c) || (protected && self.protected.contains(*c)))
+            .cloned()
+            .collect()
+    }
+
+    /// The rules as they decide an agent's calls now: `@protected` resolved with the
+    /// protection last read, for the access tester.
+    fn resolved(&self, policy: &Policy) -> Policy {
+        let mut policy = policy.clone();
+        if policy.names_protected() {
+            policy.set_unprotected(self.contexts.iter().filter(|c| !self.protected.contains(*c)).cloned());
+        }
+        policy
     }
 
     // MARK: Rendering
@@ -452,6 +496,10 @@ impl AgentsView {
                     .tooltip("Most people need one connection. Several agents give separate tokens and rules to different tools.")
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.advanced = !this.advanced;
+                        // One agent has no list to leave All activity by: show its settings.
+                        if !this.advanced {
+                            this.all_activity = false;
+                        }
                         cx.notify();
                     })),
             )
@@ -605,7 +653,7 @@ impl Render for AgentsView {
                                      what needs your approval, and what is never allowed. Every call is logged.",
                                 ))
                                 .child(step("1", "Create an agent", "Name it on the left (e.g. claude-code). It starts read-only on the contexts you pick, never Secrets."))
-                                .child(step("2", "Connect your tool", "Copy the `claude mcp add …` command shown once with its token (or the URL and token for any MCP client)."))
+                                .child(step("2", "Connect your tool", "Copy its config from the agent's page: Claude Code, Codex, Cursor, VS Code, Gemini CLI or Zed, or the token alone for any MCP client."))
                                 .child(step("3", "Tune its rules", "Allow, ask me, or deny per verb, resource, namespace, context and name. Approvals pop up here, with \"allow for 1h\" or \"always\"."))
                                 .child(step("4", "Watch what it does", "Activity shows every call, its decision and the rule that decided, grouped by task."))
                                 .into_any_element()

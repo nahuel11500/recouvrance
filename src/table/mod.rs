@@ -57,8 +57,8 @@ pub struct ResourceTable {
     usage: Option<HashMap<usize, UsageIndex>>,
     /// How old each context's usage is, for the CPU and Memory headers' tooltip.
     freshness: HashMap<usize, k8s::Freshness>,
-    /// Pods' requests and limits by context, namespace and name, for their usage bars.
-    resources: HashMap<usize, HashMap<String, HashMap<String, k8s::PodResources>>>,
+    /// Pods' requests and limits by context (then namespace and name), for their usage bars.
+    resources: HashMap<usize, Arc<k8s::PodAllocs>>,
     /// When several namespaces are selected, rows outside them are hidden.
     ns_filter: Option<std::collections::HashSet<String>>,
     /// Allocatable per context and node, for usage bars.
@@ -417,18 +417,15 @@ impl ResourceTable {
         }
     }
 
-    /// Pods' requests and limits, for the usage bars.
-    pub fn set_resources(&mut self, ctx: usize, resources: k8s::PodResourcesMap) {
-        let mut index: HashMap<String, HashMap<String, k8s::PodResources>> = HashMap::new();
-        for ((ns, name), r) in resources {
-            index.entry(ns).or_default().insert(name, r);
-        }
-        self.resources.insert(ctx, index);
+    /// Pods' requests and limits, for the usage bars: kept as they come (built off the UI
+    /// thread, shared with the watch that keeps them).
+    pub fn set_resources(&mut self, ctx: usize, pods: Arc<k8s::PodAllocs>) {
+        self.resources.insert(ctx, pods);
     }
 
     fn resources_of(&self, ctx: usize, row: &Row) -> Option<k8s::PodResources> {
         let ns = row.namespace.as_deref().unwrap_or_default();
-        self.resources.get(&ctx)?.get(ns)?.get(row.name.as_str()).copied()
+        Some(self.resources.get(&ctx)?.get(ns, &row.name)?.resources)
     }
 
     fn usage_of(&self, ctx: usize, row: &Row) -> Option<(f64, f64)> {

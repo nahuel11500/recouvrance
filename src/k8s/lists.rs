@@ -11,7 +11,7 @@ use serde::Deserialize;
 use super::{api_status, run_abortable, short_error};
 
 /// Items per page for `list_lean`: the server never builds one giant response.
-const LEAN_PAGE: u32 = 500;
+pub(super) const LEAN_PAGE: u32 = 500;
 
 #[derive(Deserialize)]
 #[serde(bound = "T: serde::de::DeserializeOwned")]

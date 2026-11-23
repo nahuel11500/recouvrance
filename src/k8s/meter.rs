@@ -1,10 +1,14 @@
 //! How long API requests take and how much they bring, by cluster and by kind of request, for
 //! Settings → API requests: every client goes through `MeterLayer`, which times each request
 //! until its response starts, then counts its body's bytes as they arrive and times it to its
-//! last byte (`Counted`).
+//! last byte (`Counted`). A shell's, an attach's or a port-forward's data goes over the
+//! upgraded connection instead, which kube keeps to itself: the meter hands the stream to the
+//! code that opens it (`opening`), whose readers count what they receive (`Tally`).
 
+use std::cell::Cell;
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
+use std::io;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError};
@@ -14,6 +18,7 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use bytes::Buf as _;
 use hyper::body::{Body as HttpBody, Frame, SizeHint};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 /// What a request does, from its method and path.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
@@ -540,6 +545,125 @@ impl<B: HttpBody> Drop for Counted<B> {
     }
 }
 
+tokio::task_local! {
+    /// Where the meter puts a stream it saw open, for `opening` to take.
+    static OPENING: Cell<Option<Arc<Opened>>>;
+}
+
+/// Runs `open`, which opens a stream through a metered client (kube's `exec`, `attach` or
+/// `portforward`), and gives what it opened with the stream's `Tally`. kube keeps the upgraded
+/// connection to itself and hands back only the stream's pipes, so the meter, which sees the
+/// upgrade's request, hands the stream over through a task-local: kube's `Buffer` polls a
+/// request's future in the task that sent it, the one `open` runs in. The tally counts
+/// nothing when no stream opened.
+pub async fn opening<F: Future>(open: F) -> (F::Output, Tally) {
+    OPENING
+        .scope(Cell::new(None), async {
+            let opened = open.await;
+            (opened, Tally(OPENING.with(Cell::take)))
+        })
+        .await
+}
+
+/// One stream that opened: its cluster's stream flow and what it received.
+struct Opened {
+    flow: Arc<Flow>,
+    /// The flow's resets when the stream opened.
+    resets: u64,
+    /// What its readers received so far, all of them (an exec's stdout and stderr).
+    bytes: AtomicU64,
+    /// Taken when its end is recorded.
+    sent: Option<Sent>,
+}
+
+impl Opened {
+    fn new(flow: Arc<Flow>, sent: Sent) -> Self {
+        let resets = flow.resets.load(Ordering::Relaxed);
+        Self { flow, resets, bytes: AtomicU64::new(0), sent: Some(sent) }
+    }
+
+    /// Adds `n` bytes received, here and to the flow: atomics only, no lock or allocation.
+    fn add(&self, n: u64) {
+        self.bytes.fetch_add(n, Ordering::Relaxed);
+        self.flow.add(now_minute(), n);
+    }
+}
+
+impl Drop for Opened {
+    fn drop(&mut self) {
+        // The stream ended: every reader and the tally are dropped (the shell closed, the
+        // connection through the forward ended). Listed by what it received, without a time to
+        // its last byte.
+        let bytes = *self.bytes.get_mut();
+        if let Some(sent) = self.sent.take() {
+            self.flow.end(sent, self.resets, bytes, None);
+        }
+    }
+}
+
+/// What a stream opened by an upgrade receives: an exec, an attach or one connection through a
+/// port-forward. Its readers (`count`) add their bytes to its cluster's stream flow as they
+/// read them, and it is listed among the heaviest once they and the tally are dropped.
+pub struct Tally(Option<Arc<Opened>>);
+
+impl Tally {
+    /// `inner` (the stream's stdout or stderr, a port-forward's connection) with what is read
+    /// from it counted in this tally.
+    pub fn count<T>(&self, inner: T) -> Received<T> {
+        Received { inner, opened: self.0.clone() }
+    }
+}
+
+/// A stream's reader whose reads count as received (`Tally::count`). Writes pass through
+/// uncounted: the meter counts what the clusters send, as it does for requests' bodies.
+pub struct Received<T> {
+    inner: T,
+    opened: Option<Arc<Opened>>,
+}
+
+impl<T: AsyncRead + Unpin> AsyncRead for Received<T> {
+    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+        let this = &mut *self;
+        // What the buffer already held is not this read's: `read_exact` reads into one buffer
+        // until it is full.
+        let before = buf.filled().len();
+        let polled = Pin::new(&mut this.inner).poll_read(cx, buf);
+        if let (Poll::Ready(Ok(())), Some(opened)) = (&polled, &this.opened) {
+            let n = buf.filled().len().saturating_sub(before) as u64;
+            if n > 0 {
+                opened.add(n);
+            }
+        }
+        polled
+    }
+}
+
+impl<T: AsyncWrite + Unpin> AsyncWrite for Received<T> {
+    fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write_vectored(cx, bufs)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
 /// One cluster's requests of one class: what their headers said, under the lock, and what
 /// their bodies bring after.
 struct Entry {
@@ -615,7 +739,7 @@ fn record(context: String, class: Class, took: Duration, failed: bool) -> Arc<Fl
 
 /// Times every request of a cluster's client until its response starts (headers): a watch
 /// or a log stream counts as open there. Then its body counts the bytes it brings and when
-/// its last byte came (`Counted`).
+/// its last byte came (`Counted`); a stream opened by an upgrade is handed to `opening`.
 #[derive(Clone)]
 pub struct MeterLayer {
     pub context: String,
@@ -664,6 +788,13 @@ where
                 Err(_) => true,
             };
             let flow = record(context, class, headers, failed);
+            if class == Class::Stream && !failed {
+                // Outside `opening` (a shell's hang-up), nothing reads what it receives.
+                let _ = OPENING.try_with(|slot| {
+                    let sent = Sent { method: method.clone(), path: path.clone(), start, headers };
+                    slot.set(Some(Arc::new(Opened::new(flow.clone(), sent))));
+                });
+            }
             result.map(|resp| resp.map(|body| Counted::new(body, flow, Sent { method, path, start, headers })))
         })
     }
@@ -671,9 +802,11 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeMap, HashMap, HashSet};
+    use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+    use std::pin::Pin;
     use std::sync::Arc;
     use std::sync::atomic::Ordering;
+    use std::task::{Context, Poll};
     use std::time::Instant;
 
     use bytes::Bytes;
@@ -682,10 +815,11 @@ mod tests {
     use http_body_util::{BodyExt as _, Empty, Full, StreamBody};
     use hyper::body::{Body as HttpBody, Frame};
     use proptest::prelude::*;
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _, ReadBuf};
 
     use super::{
-        Class, Counted, Duration, Flow, HEAVIEST, Heavy, Latency, Sent, Stats, WINDOW, list_heavy, path_pattern,
-        per_minute,
+        Class, Counted, Duration, Flow, HEAVIEST, Heavy, Latency, MeterLayer, Opened, Sent, Stats, Tally, WINDOW,
+        list_heavy, now_minute, opening, path_pattern, per_minute, snapshot,
     };
 
     proptest! {
@@ -813,6 +947,197 @@ mod tests {
             prop_assert!(!pattern.split('/').any(|p| p == ns || p == name), "{pattern}");
             prop_assert_eq!(pattern.split('/').count(), path.split('/').count());
         }
+
+        /// Whatever the chunks a stream's pipes hand out, the size of the reads and how many
+        /// readers share the stream (an exec's stdout and stderr): every byte read counts once,
+        /// in the stream and in its cluster's flow.
+        #[test]
+        fn a_stream_counts_every_byte_read_once(
+            chunks in proptest::collection::vec(proptest::collection::vec(any::<u8>(), 1..64), 0..20),
+            read in 1usize..100,
+            readers in 1usize..4,
+        ) {
+            let flow = Arc::new(Flow::new("shop".into(), Class::Stream));
+            let tally = opened_stream(&flow, "/api/v1/namespaces/shop/pods/web-1/exec");
+            let total: usize = chunks.iter().map(Vec::len).sum();
+            for _ in 0..readers {
+                let mut reader = tally.count(Pipe(chunks.iter().cloned().collect()));
+                let mut buf = vec![0u8; read];
+                let mut read_back = Vec::new();
+                block_on(async {
+                    // `read_exact` fills one buffer over several reads, then plain reads to the end.
+                    let mut left = total;
+                    while left >= read {
+                        reader.read_exact(&mut buf).await.unwrap();
+                        read_back.extend_from_slice(&buf);
+                        left -= read;
+                    }
+                    reader.read_to_end(&mut read_back).await.unwrap();
+                });
+                prop_assert_eq!(read_back, chunks.concat());
+            }
+            let expected = (total * readers) as u64;
+            prop_assert_eq!(flow.total.load(Ordering::Relaxed), expected);
+            prop_assert_eq!(tally.0.as_ref().map(|o| o.bytes.load(Ordering::Relaxed)), Some(expected));
+        }
+    }
+
+    /// Hands out `chunks` a read at a time, as a pipe does: a read smaller than a chunk takes
+    /// the start of it.
+    struct Pipe(VecDeque<Vec<u8>>);
+
+    impl tokio::io::AsyncRead for Pipe {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            if let Some(chunk) = self.0.front_mut() {
+                let n = chunk.len().min(buf.remaining());
+                buf.put_slice(&chunk[..n]);
+                chunk.drain(..n);
+                if chunk.is_empty() {
+                    self.0.pop_front();
+                }
+            }
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// A stream to `path` on `flow`'s cluster, as the meter hands it over when it opens.
+    fn opened_stream(flow: &Arc<Flow>, path: &str) -> Tally {
+        let sent =
+            Sent { method: Method::GET, path: path.into(), start: Instant::now(), headers: Duration::from_millis(5) };
+        Tally(Some(Arc::new(Opened::new(flow.clone(), sent))))
+    }
+
+    #[test]
+    fn a_stream_counts_what_its_readers_receive_and_is_listed_when_it_ends() {
+        let flow = Arc::new(Flow::new("shop".into(), Class::Stream));
+        let tally = opened_stream(&flow, "/api/v1/namespaces/shop/pods/web-1/exec");
+        // An exec's stdout and stderr.
+        let (mut stdout, mut stderr) = (tally.count(&b"hello"[..]), tally.count(&b"oops\n"[..]));
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        block_on(async {
+            stdout.read_to_end(&mut out).await.unwrap();
+            stderr.read_to_end(&mut err).await.unwrap();
+        });
+        assert_eq!((out.as_slice(), err.as_slice()), (&b"hello"[..], &b"oops\n"[..]));
+        assert_eq!(flow.total.load(Ordering::Relaxed), 10);
+        assert_eq!(flow.recent(now_minute()).map(|m| m.1).sum::<u64>(), 10, "in this minute");
+        drop((stdout, stderr));
+        assert!(ends(&flow).1.is_empty(), "not listed while the code that opened it holds it");
+        drop(tally);
+        let (timed, heaviest) = ends(&flow);
+        assert_eq!(timed, 0, "a stream has no time to its last byte");
+        assert_eq!((heaviest.len(), heaviest[0].bytes, heaviest[0].last_byte), (1, 10, None));
+        assert_eq!(heaviest[0].path, "/api/v1/namespaces/{namespace}/pods/{name}/exec");
+    }
+
+    /// A port-forward's connection, copied both ways as `forward` does: what comes back from
+    /// the pod counts, what is sent to it does not.
+    #[tokio::test]
+    async fn a_port_forward_counts_what_comes_back() {
+        let flow = Arc::new(Flow::new("shop".into(), Class::Stream));
+        let tally = opened_stream(&flow, "/api/v1/namespaces/shop/pods/web-1/portforward");
+        // The program connected to the local port and its socket; the tunnel and the pod.
+        let (mut program, mut socket) = tokio::io::duplex(1024);
+        let (tunnel, mut pod) = tokio::io::duplex(1024);
+        let mut upstream = tally.count(tunnel);
+        let copying = tokio::spawn(async move { tokio::io::copy_bidirectional(&mut socket, &mut upstream).await });
+        program.write_all(b"ping").await.unwrap();
+        let mut asked = [0u8; 4];
+        pod.read_exact(&mut asked).await.unwrap();
+        pod.write_all(b"pong!").await.unwrap();
+        let mut answer = [0u8; 5];
+        program.read_exact(&mut answer).await.unwrap();
+        assert_eq!((&asked, &answer), (b"ping", b"pong!"));
+        assert_eq!(flow.total.load(Ordering::Relaxed), 5, "only what came back");
+        drop((program, pod));
+        assert_eq!(copying.await.unwrap().unwrap(), (4, 5));
+        drop(tally);
+        let (_, heaviest) = ends(&flow);
+        assert_eq!((heaviest.len(), heaviest[0].bytes, heaviest[0].last_byte), (1, 5, None));
+        assert_eq!(heaviest[0].path, "/api/v1/namespaces/{namespace}/pods/{name}/portforward");
+    }
+
+    #[test]
+    fn a_stream_open_across_a_reset_records_no_end() {
+        // Reset while a shell runs: what it received before counts no more, so its end would
+        // list more than was received.
+        let flow = Arc::new(Flow::new("shop".into(), Class::Stream));
+        let tally = opened_stream(&flow, "/api/v1/namespaces/shop/pods/web-1/exec");
+        let mut stdout = tally.count(&b"abc"[..]);
+        block_on(async {
+            stdout.read_exact(&mut [0u8; 1]).await.unwrap();
+            flow.reset();
+            stdout.read_to_end(&mut Vec::new()).await.unwrap();
+        });
+        assert_eq!(flow.total.load(Ordering::Relaxed), 2, "the bytes after the reset count");
+        drop((stdout, tally));
+        assert!(ends(&flow).1.is_empty(), "no heaviest entry");
+    }
+
+    /// Answers every request with `status` and no body: a server that upgrades nothing.
+    struct Answers(http::StatusCode);
+
+    impl tower::Service<http::Request<kube::client::Body>> for Answers {
+        type Response = http::Response<Empty<Bytes>>;
+        type Error = std::convert::Infallible;
+        type Future = std::future::Ready<Result<Self::Response, Self::Error>>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, _req: http::Request<kube::client::Body>) -> Self::Future {
+            let mut res = http::Response::new(Empty::new());
+            *res.status_mut() = self.0;
+            std::future::ready(Ok(res))
+        }
+    }
+
+    /// kube keeps an upgraded connection to itself: the meter hands the stream to `opening`
+    /// through kube's client (its `Buffer` polls a request in the task that sent it), and what
+    /// the stream receives counts on its cluster. Only a stream that opened is handed over.
+    #[tokio::test]
+    async fn the_meter_hands_a_stream_to_the_code_that_opens_it() {
+        use k8s_openapi::api::core::v1::Pod;
+        use kube::api::{Api, AttachParams};
+        use tower::Layer as _;
+
+        let pods = |context: &str, status| {
+            let client = kube::Client::new(MeterLayer { context: context.into() }.layer(Answers(status)), "default");
+            Api::<Pod>::namespaced(client, "shop")
+        };
+        let switching = pods("handed-over", http::StatusCode::SWITCHING_PROTOCOLS);
+        // The server switches to nothing: kube gives up once the meter saw the stream open.
+        let (opened, tally) = opening(switching.exec("web-1", ["sh"], &AttachParams::default())).await;
+        assert!(opened.is_err());
+        let flow = tally.0.as_ref().expect("the stream is handed over").flow.clone();
+        assert_eq!((flow.context.as_str(), flow.class), ("handed-over", Class::Stream));
+        let mut out = Vec::new();
+        tally.count(&b"abc"[..]).read_to_end(&mut out).await.unwrap();
+        drop(tally);
+        let read = snapshot(now_minute());
+        let stats = read.classes.iter().find(|(c, k, _)| c == "handed-over" && *k == Class::Stream);
+        assert_eq!(stats.map(|(_, _, s)| (s.count, s.bytes)), Some((1, 3)));
+        let (_, heaviest) = ends(&flow);
+        assert_eq!(heaviest.len(), 1);
+        assert_eq!(
+            (heaviest[0].path.as_str(), heaviest[0].bytes),
+            ("/api/v1/namespaces/{namespace}/pods/{name}/exec", 3)
+        );
+
+        // A read, or a stream refused, hands nothing over: what is read through it is not counted.
+        let (_, tally) = opening(switching.get("web-1")).await;
+        assert!(tally.0.is_none());
+        let refused = pods("refused", http::StatusCode::FORBIDDEN);
+        let (opened, tally) = opening(refused.exec("web-1", ["sh"], &AttachParams::default())).await;
+        assert!(opened.is_err() && tally.0.is_none());
+        let mut out = Vec::new();
+        tally.count(&b"abc"[..]).read_to_end(&mut out).await.unwrap();
+        assert_eq!(out, b"abc");
     }
 
     fn heavy(path: &str, bytes: u64) -> Heavy {
