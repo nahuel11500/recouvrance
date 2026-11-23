@@ -606,7 +606,11 @@ fn toggle_theme(window: &mut Window, cx: &mut App) {
 #[cfg(all(test, feature = "dev"))]
 mod layout_tests {
     use gpui_kit::component::{ActiveTheme as _, h_flex};
-    use gpui_kit::*;
+    // Not `gpui_kit::*`: its `test` macro would shadow the `#[test]` that `#[gpui_kit::test]` expands to.
+    use gpui_kit::{
+        Bounds, Context, InteractiveElement as _, IntoElement, ParentElement as _, Pixels, Render, Styled as _,
+        TestAppContext, Window, div, px,
+    };
 
     use super::{SEARCH_MIN, search_field, write_mode_button};
 
