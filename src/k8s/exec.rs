@@ -7,7 +7,7 @@ use k8s_openapi::api::core::v1::Pod;
 use kube::Client;
 use kube::api::Api;
 
-use super::{TaskGuard, format_bytes, gate, private_kubeconfig, run, spawn_guarded};
+use super::{TaskGuard, format_bytes, gate, meter, private_kubeconfig, run, spawn_guarded};
 
 pub enum ExecInput {
     Bytes(Vec<u8>),
@@ -106,7 +106,9 @@ pub fn exec_shell(client: Client, ns: String, pod: String, container: Option<Str
             ap = ap.container(c);
         }
         let id = uuid::Uuid::new_v4().simple().to_string();
-        let mut proc = match api.exec(&pod, shell_command(&id), &ap).await {
+        // What the shell prints counts in Settings → API requests.
+        let (opened, tally) = meter::opening(api.exec(&pod, shell_command(&id), &ap)).await;
+        let mut proc = match opened {
             Ok(p) => p,
             Err(e) => {
                 let why = refused(&api, &pod, container.as_deref(), "exec", e).await;
@@ -123,7 +125,7 @@ pub fn exec_shell(client: Client, ns: String, pod: String, container: Option<Str
         };
         let status = proc.take_status();
         tokio::select! {
-            () = forward_output(stdout, out.clone(), false) => {}
+            () = forward_output(tally.count(stdout), out.clone(), false) => {}
             () = forward_input(keys, Some(stdin), Some(resize)) => {}
         }
         let status = match status {
@@ -475,12 +477,14 @@ pub(super) async fn exec_to(
     if let Some(c) = container.clone() {
         ap = ap.container(c);
     }
-    let mut proc = match api.exec(&pod, command, &ap).await {
+    // What the command prints counts in Settings → API requests, kept or not.
+    let (opened, tally) = meter::opening(api.exec(&pod, command, &ap)).await;
+    let mut proc = match opened {
         Ok(p) => p,
         Err(e) => return Err(anyhow!(refused(&api, &pod, container.as_deref(), "exec", e).await)),
     };
-    let stdout = proc.stdout().context("no stdout")?;
-    let stderr = proc.stderr().context("no stderr")?;
+    let stdout = tally.count(proc.stdout().context("no stdout")?);
+    let stderr = tally.count(proc.stderr().context("no stderr")?);
     // A write error is kept for later: a command that fails at once closes its stdin
     // ("broken pipe"), and what it said on stderr is the better message.
     let writer = async {
@@ -639,12 +643,14 @@ pub async fn exec_capture(
         if let Some(c) = container.clone() {
             ap = ap.container(c);
         }
-        let mut proc = match api.exec(&pod, command, &ap).await {
+        // What the command prints counts in Settings → API requests, kept or not.
+        let (opened, tally) = meter::opening(api.exec(&pod, command, &ap)).await;
+        let mut proc = match opened {
             Ok(p) => p,
             Err(e) => return Err(anyhow!(refused(&api, &pod, container.as_deref(), "exec", e).await)),
         };
-        let stdout = proc.stdout().context("no stdout")?;
-        let stderr = proc.stderr().context("no stderr")?;
+        let stdout = tally.count(proc.stdout().context("no stdout")?);
+        let stderr = tally.count(proc.stderr().context("no stderr")?);
         let status = proc.take_status();
         let work = async {
             // Capped while reading: a chatty command cannot fill memory before the timeout.
@@ -871,7 +877,9 @@ pub fn attach_container(client: Client, ns: String, pod: String, container: Opti
         if let Some(name) = name.clone() {
             ap = ap.container(name);
         }
-        let mut proc = match api.attach(&pod, &ap).await {
+        // What the process prints counts in Settings → API requests.
+        let (opened, tally) = meter::opening(api.attach(&pod, &ap)).await;
+        let mut proc = match opened {
             Ok(p) => p,
             Err(e) => {
                 let why = refused(&api, &pod, name.as_deref(), "attach", e).await;
@@ -885,8 +893,8 @@ pub fn attach_container(client: Client, ns: String, pod: String, container: Opti
         );
         let _ = out.unbounded_send(ExecOutput::Data(note.into_bytes()));
         // Without a tty, output uses bare newlines.
-        let stdout = proc.stdout().map(|s| forward_output(s, out.clone(), !tty));
-        let stderr = proc.stderr().map(|s| forward_output(s, out.clone(), !tty));
+        let stdout = proc.stdout().map(|s| forward_output(tally.count(s), out.clone(), !tty));
+        let stderr = proc.stderr().map(|s| forward_output(tally.count(s), out.clone(), !tty));
         let readers = async move {
             match (stdout, stderr) {
                 (Some(a), Some(b)) => {

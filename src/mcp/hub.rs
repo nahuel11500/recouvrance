@@ -16,6 +16,7 @@ use super::config::{
     Agent, CONFIG_VERSION, Config, config_lock_path, hash_token, load_config, new_token, same_rules, take_lock,
 };
 use super::policy::{Access, Mode, Policy, Rule, Verb};
+use super::preview::Preview;
 use super::{lock, read, rules_file, write};
 use crate::k8s::{self, Kind};
 
@@ -36,8 +37,9 @@ pub(crate) const SERVE_WAIT: Duration = Duration::from_secs(20);
 /// How often a lookup asks again while it waits.
 const SERVE_POLL: Duration = Duration::from_millis(500);
 
-/// How long a request waits for the user's answer.
-const APPROVAL_TIMEOUT: Duration = Duration::from_secs(120);
+/// How long a request waits for the user's answer. The configs the Agents page copies
+/// give clients a tool timeout longer than this.
+pub const APPROVAL_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// How a request for approval ended.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -65,11 +67,17 @@ impl Answer {
 }
 
 pub struct Approval {
+    /// Set by [`Hub::request_approval`].
     pub id: u64,
     pub agent_id: String,
     pub agent: String,
     pub tool: String,
+    /// The request, its key arguments and the rule that asks.
     pub summary: String,
+    /// More than the arguments show, said after the preview: a manifest's objects and YAML.
+    pub detail: Option<String>,
+    /// What the call will change, worked out before asking (none for calls without one).
+    pub preview: Option<Preview>,
     /// The exact request, to turn into a rule ("always allow this").
     pub access: Access,
     /// A dry run: approving it must not turn into a rule for real writes.
@@ -599,36 +607,21 @@ impl Hub {
 
     // Approvals
 
-    /// Ask the user in the UI. Anything but [`Answer::Approved`] refuses the call; with
-    /// no window to ask in, the request is refused at once. The request ends when `gone`
-    /// does (the agent stopped waiting for the answer). However it ends, even with this
-    /// future dropped, it leaves the hub and its banner goes: an answer given after that
-    /// changes nothing.
-    pub async fn request_approval(
-        &self,
-        agent: &Agent,
-        tool: &str,
-        summary: String,
-        access: Access,
-        dry_run: bool,
-        gone: impl Future<Output = ()>,
-    ) -> Answer {
+    /// Ask the user in the UI, giving the request its id. Anything but [`Answer::Approved`]
+    /// refuses the call; with no window to ask in, the request is refused at once. The
+    /// request ends when `gone` does (the agent stopped waiting for the answer). However it
+    /// ends, even with this future dropped, it leaves the hub and its banner goes: an answer
+    /// given after that changes nothing.
+    pub async fn request_approval(&self, mut request: Approval, gone: impl Future<Output = ()>) -> Answer {
         if self.headless() {
             return Answer::Rejected;
         }
         let id = self.next_approval.fetch_add(1, Ordering::SeqCst);
+        request.id = id;
         let (tx, rx) = oneshot::channel();
         lock(&self.approvals).insert(id, tx);
         let _pending = Pending { hub: self, id };
-        self.emit(HubEvent::ApprovalRequested(Arc::new(Approval {
-            id,
-            agent_id: agent.id.clone(),
-            agent: agent.name.clone(),
-            tool: tool.to_string(),
-            summary,
-            access,
-            dry_run,
-        })));
+        self.emit(HubEvent::ApprovalRequested(Arc::new(request)));
         tokio::select! {
             // The agent gone first: an Approve clicked as it hung up must not run the call.
             biased;
@@ -949,9 +942,18 @@ mod tests {
             name: Some("cfg".into()),
             cluster_scoped: false,
         };
-        tokio::spawn(async move {
-            hub.request_approval(&agent(), "patch_resource", "patch".into(), access, false, gone).await
-        })
+        let request = Approval {
+            id: 0,
+            agent_id: agent().id,
+            agent: agent().name,
+            tool: "patch_resource".into(),
+            summary: "patch".into(),
+            detail: None,
+            preview: None,
+            access,
+            dry_run: false,
+        };
+        tokio::spawn(async move { hub.request_approval(request, gone).await })
     }
 
     /// Lets the request's task run until request `id` waits in the hub.

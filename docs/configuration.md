@@ -68,7 +68,9 @@ context already shown as `name@file` keeps that name when `name` is freed.
 | Key | Default | What |
 |---|---|---|
 | `startup` | `"reconnect"` | Reconnect to the last contexts (`reconnect`) or open the context picker (`ask`) |
-| `initial_view` | `"pods"` | First page after connecting: `pods`, `workloads`, `cluster` |
+| `initial_view` | `"pods"` | First page after connecting: `pods`, `workloads`, `cluster`. A set of contexts with a saved session (`sessions`) reopens on its own page instead |
+| `sessions` | | Remembered by the app: where each set of contexts was left, newest first, 20 kept: `{ "contexts": ["prod"], "tabs": [{ "page": "list", "kind": "deployments.apps", "namespaces": ["team-a"], "filter": "web" }], "active_tab": 0, "filters": { "pods": "api" } }`. `page` is `list`, `workloads`, `cluster`, `problems`, `timeline`, `helm` or `argo`; `kind` is the kubectl name. The first window reopens the session of the contexts it connects to. A value that doesn't read takes its default, an entry that doesn't read is dropped, and a type, namespace or page the clusters no longer have falls back to the default; none of it ever stops the file from loading |
+| `window` | | Remembered by the app: `{ "x": 80, "y": 40, "width": 1500, "height": 920, "maximized": false }`, where the first window opens (centered when that is out of reach of every display). One that doesn't read opens at 1500×920, centered |
 | `metrics_refresh`, `detail_refresh`, `overview_refresh` | 15, 5, 30 | Seconds between refreshes. `metrics_refresh` is the shortest wait between reads of metrics-server: the pods and nodes lists read it again when its next sample is due (up to twice its interval or 5 minutes later), and every `metrics_refresh` when its timestamps say nothing; detail pages refresh their related objects and usage every `metrics_refresh`. A page that isn't on screen refreshes nothing: one in the back/forward history, or any page of a window hidden as the desktop reports it (minimized, on another workspace, or on macOS fully covered by other windows; Wayland compositors without the `suspended` state never report it) |
 | `log_tail_lines`, `log_timestamps` | 1000, true | Log viewer |
 | `kubeconfigs`, `kubeconfig_folders` | | Extra kubeconfig files and watched folders (see above) |
@@ -97,6 +99,7 @@ context already shown as `name@file` keeps that name when `name` is freed.
 | `delete_confirm_kinds` | by kind | `{ "Pod": "off", "Cluster.postgresql.cnpg.io": "type" }`: what deleting asks per kind, a custom resource with its group (see [features](features.md)). A value that doesn't read asks for the name |
 | `namespace_visits` | | Remembered by the app: namespaces chosen per context, with a visit count and the last visit time. The namespace picker shows the five most frequent first (visits weigh half as much after a week without one); 30 kept per context. Older files' `recent_namespaces` are turned into visits once |
 | `last_contexts`, `recent_contexts` | | Remembered by the app |
+| `last_seen_version` | the version installed | Remembered by the app: the newest version whose release notes were shown (What's new, once after an update). A new install starts with its own version; a file without the key, from before What's new, shows the running version's notes once. Never set back by a downgrade. While `settings.json` can't be read, What's new doesn't show |
 | `timeline` | | What the timeline records and keeps (see [Timeline](#timeline)) |
 
 ### Timeline

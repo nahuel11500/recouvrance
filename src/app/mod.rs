@@ -27,6 +27,7 @@ use crate::ui::palette::Palette;
 use crate::ui::settings_view::SettingsView;
 
 mod chrome;
+pub(crate) mod commands;
 mod contexts;
 #[cfg(feature = "dev")]
 mod demo;
@@ -39,6 +40,7 @@ mod pages;
 mod problem_badge;
 mod render;
 mod search_index;
+mod session;
 mod shortcuts;
 mod sidebar;
 mod table_page;
@@ -47,9 +49,7 @@ mod view_cache;
 mod watch;
 
 pub use menus::init as init_menus;
-#[cfg(test)]
-pub(crate) use shortcuts::unbound_keys;
-pub(crate) use shortcuts::with_keys;
+pub(crate) use shortcuts::{key_cap, shortcut_rows, with_keys};
 use sidebar::section_icon;
 pub(crate) use theme::*;
 
@@ -118,6 +118,9 @@ struct TabState {
     namespaces: Vec<String>,
     /// The resource type its list shows.
     kind: Option<Kind>,
+    /// The overview it opens when first shown: a tab reopened on one (see `session`) builds
+    /// its page only then.
+    open: Option<overviews::Overview>,
 }
 
 /// The page each window shows, and the windows hidden as the desktop reports it (see
@@ -203,18 +206,28 @@ impl Global for SharedHub {}
 /// Open a main window: at startup, with Ctrl+Shift+N (⇧⌘N), and on macOS from the Dock or the
 /// menu bar when none is open.
 pub fn open_main_window(cx: &mut App) -> Option<Entity<AppView>> {
-    let bounds = Bounds::centered(None, size(px(1500.), px(920.)), cx);
+    use crate::settings::{WINDOW_MIN, WINDOW_SIZE};
+    // The first window opens where the app was left; the others at the default size, centered.
+    let bounds = if cx.has_global::<session::FirstWindowOpened>() {
+        WindowBounds::Windowed(Bounds::centered(None, size(px(WINDOW_SIZE.0), px(WINDOW_SIZE.1)), cx))
+    } else {
+        session::first_window_bounds(cx)
+    };
     // The app draws its own title bar (GNOME on Wayland has no server-side
     // decorations): dragging, window controls and resize borders.
     let options = WindowOptions {
-        window_bounds: Some(WindowBounds::Windowed(bounds)),
+        window_bounds: Some(bounds),
         window_decorations: Some(WindowDecorations::Client),
-        window_min_size: Some(size(px(900.), px(560.))),
+        window_min_size: Some(size(px(WINDOW_MIN.0), px(WINDOW_MIN.1))),
         app_id: Some("recouvrance".into()),
         ..TitleBar::window_options()
     };
     match open_window(options, cx, |window, cx| cx.new(|cx| AppView::new(window, cx))) {
-        Ok((_, view)) => Some(view),
+        Ok((window, view)) => {
+            // After an update, its release notes, once: the next window finds them seen.
+            crate::ui::whats_new::show_once(window, cx);
+            Some(view)
+        }
         Err(e) => {
             eprintln!("could not open a window: {e:#}");
             None
@@ -280,7 +293,20 @@ gpui_kit::actions!(
         GoHelm,
         GoAssistant,
         GoSettings,
-        ToggleAssistant
+        ToggleAssistant,
+        OpenArgo,
+        OpenTimeline,
+        OpenAccess,
+        OpenUpgradeCheck,
+        OpenAgents,
+        OpenAgentActivity,
+        OpenContexts,
+        OpenTerminal,
+        OpenApply,
+        OpenHelmInstall,
+        OpenApiRequests,
+        ToggleWriteMode,
+        ToggleTheme
     ]
 );
 
@@ -450,6 +476,15 @@ pub struct AppView {
     /// A connect is in flight (`_connect` stays set once it is done).
     connecting: bool,
     _connect: Option<Task<()>>,
+    /// The set of contexts picked (`settings::session_set`), whose session this window saves;
+    /// empty when none is saved (not connected yet, or contexts given by a developer hook).
+    session_key: Vec<String>,
+    /// This is the first window, and its first connect has not finished: that one reopens
+    /// where its set of contexts was left.
+    restore: bool,
+    /// The save waiting for changes to stop (see `session_changed`), and the window's.
+    _save_session: Option<Task<()>>,
+    _save_window: Option<Task<()>>,
     _kubeconfig_watch: Option<Task<()>>,
     _subs: Vec<Subscription>,
 }
@@ -499,6 +534,7 @@ impl AppView {
                         cx.notify();
                     });
                     this.follow_selection(cx);
+                    this.session_changed(cx);
                 }
                 // A filter that was used (Enter, or leaving the field) goes into the history.
                 InputEvent::PressEnter { .. } | InputEvent::Blur => {
@@ -590,7 +626,16 @@ impl AppView {
             cx.observe_window_visibility(window, |this, visibility, _, cx| {
                 this.set_window_hidden(!visibility.is_visible(), cx);
             }),
+            cx.observe_window_bounds(window, |this, window, cx| this.window_moved(window, cx)),
+            // Where the window is left is saved as it closes, and as the app quits.
+            cx.on_release(|this, cx| this.save_session_now(cx)),
+            cx.on_app_quit(|this, cx| {
+                this.save_session_now(cx);
+                async {}
+            }),
         ];
+        let first_window = !cx.has_global::<session::FirstWindowOpened>();
+        cx.set_global(session::FirstWindowOpened);
 
         // One agent hub and MCP server for the whole app, shared by its windows.
         if !cx.has_global::<SharedHub>() {
@@ -685,6 +730,10 @@ impl AppView {
             metrics: None,
             connecting: false,
             _connect: None,
+            session_key: Vec::new(),
+            restore: first_window,
+            _save_session: None,
+            _save_window: None,
             _kubeconfig_watch: None,
             tabs: vec![TabState::default()],
             active_tab: 0,
@@ -715,7 +764,12 @@ impl AppView {
         match ev {
             HubEvent::ApprovalRequested(a) => {
                 self.approvals.push(a.clone());
-                notify_desktop(&format!("{} asks to run {}", a.agent, a.tool), &a.summary);
+                // The request, then what it will change (the notification keeps the first lines).
+                let body = match &a.preview {
+                    Some(p) => format!("{}\n{}", a.summary, p.text()),
+                    None => a.summary.clone(),
+                };
+                notify_desktop(&format!("{} asks to run {}", a.agent, a.tool), &body);
             }
             HubEvent::ApprovalResolved(id) => self.approvals.retain(|a| a.id != *id),
             HubEvent::ServerStatus(status) => {

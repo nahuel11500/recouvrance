@@ -10,6 +10,14 @@
   `HTTPS_PROXY`, with a scheme other than `http`, `https` or `socks5`, or none) is named by its
   scheme, host and port, never its user and password; neither shows for any other URL in a
   connection error.
+- **Reopens where you left off**: each set of contexts keeps its tabs (the list or overview each
+  shows, its resource type, namespaces and filter) and each type's filter, and the window keeps
+  its place, size and whether it was maximized. On launch the first window reopens there once its
+  contexts connect: with one namespace picked last time, a big cluster lists and watches only that
+  namespace at launch instead of every pod. A resource type, namespace or page the clusters no longer have falls back to the default; a
+  detail page reopens on the list or overview it was opened from; a window that would be out of
+  reach (a display unplugged) is centered. A window opened later starts fresh, and write mode is
+  always off at launch.
 - **Sidebar**: the filter at its top finds pages and resource types (by name, kind or API group).
   Pages, saved views, favorites and types scroll together; a section folds with a click on its
   name (kept for next time) and says how many types it holds. Port forwards fold into one row at
@@ -256,12 +264,22 @@
   long the API server took to start answering (p50, p95, slowest) and, for answers that end,
   until their last byte was read (p50, p95); and how much each kind received per minute over
   the last hour, counted decompressed as the bodies arrive. The time to the last byte includes
-  Recouvrance's own parsing when that sets the pace. Watches, logs and shells are streams that
-  run until closed: bytes only, and none for shells and port-forwards, whose data goes over the
-  upgraded connection. Below, the 10 heaviest requests, one per kind (cluster, method and path,
-  its names replaced by `{namespace}` and `{name}`), with their bytes and both times. A stream
-  is listed once it ends. Nothing leaves the machine.
-- **Favorites** and **saved views** (type + namespaces + filter, bookmark button), back/forward history, light and dark themes.
+  Recouvrance's own parsing when that sets the pace. Watches, logs, shells, attach and
+  port-forwards are streams that run until closed: bytes only. A shell's, an attach's or a
+  port-forward's data goes over the upgraded connection, and counts as it is read: what came
+  back through it, not what was sent. Below, the 10 heaviest requests, one per kind (cluster,
+  method and path, its names replaced by `{namespace}` and `{name}`), with their bytes and both
+  times. A stream is listed once it ends: a port-forward, each connection on its own. Nothing
+  leaves the machine.
+- **What's new and updates**: the first start after an update shows the release notes of every
+  version since the one run before (the version's own notes when that one is unknown), once.
+  They are the changelog built into the app: nothing is fetched. Settings → About shows them again,
+  says how the copy you run was installed (the install script, the `.deb`, the AppImage, or a
+  tarball or source build, with its path) and how to update it, with the command to copy.
+  *Check for updates* there asks GitHub for the latest release, only when clicked, and says
+  whether it is newer.
+- **Favorites** and **saved views** (type + namespaces + filter, bookmark button), back/forward history, light and dark themes
+  whose status colors, badges and status buttons read at WCAG AA contrast (4.5:1) on what they are drawn on.
 - **Instant back**: the last 8 lists (up to 10,000 rows in all) are kept, so going back to one
   shows it at once, marked "Updating…", while a fresh list loads and replaces it in one go.
 - **Bulk actions**: check rows, then restart, scale, delete or copy names. Scaling needs the number
@@ -342,22 +360,49 @@
   two files are kept apart as `name@file`. A file that fails to parse is reported by its path, line
   and column, never by what it holds there.
 
-| Linux | macOS | Action |
-|---|---|---|
-| Ctrl+K | ⌘K | Command palette: resources, pages, contexts, objects |
-| Ctrl+Shift+N | ⇧⌘N | New window |
-| Ctrl+T / Ctrl+W / Ctrl+Tab | ⌘T / ⌘W / ⌃Tab | New tab / close tab / next tab |
-| Ctrl+B / F5 | ⌘B / F5 | Hide the sidebar / refresh (in a terminal, F5 goes to the program) |
-| Alt+← / Alt+→ | ⌘[ / ⌘] | Back / forward (Esc also goes back from a detail page) |
-| Ctrl+= / Ctrl+- / Ctrl+0 | ⌘= / ⌘- / ⌘0 | Zoom in / zoom out / reset the zoom |
-| Ctrl+F or / | ⌘F or / | Filter the current table: `web` · `!Running` · `app=web` · `tier!=db` · `l:app` · `ns:team-*` · `/^api-\d+/` · `status:Running` · `restarts>3` · `cpu>200m` (all terms must match) |
-| j / k / Enter | j / k / Return | Move the selection in a table / open the selected row |
-| g then p / o / w / h / i / s | g then p / o / w / h / i / s | Go to Problems / Cluster overview / Workloads overview / Helm / Assistant / Settings |
-| Ctrl+J | ⌘J | Show or hide the assistant beside the page: it is told what is on screen |
-| ? | ? | List the keyboard shortcuts |
-| Right-click a row | Right-click a row | Open, logs, shell, YAML, events, copy name, favorite |
+The **command palette** (Ctrl+K, ⌘K on macOS, or the search box of the top bar) finds resource
+types, pages, contexts and objects across the connected clusters, and runs every command, with a
+key or without: Upgrade check, API requests, Agent activity, My access, write mode, the theme,
+each Settings section and each saved view. It knows other words for them too (`rbac` finds My
+access, `deprecated` the Upgrade check, `audit` Agent activity) and shows each command's key. A
+word of the detail line finds an object, and words combine: `web prod` finds `web` in the prod
+namespace, and a name with a cluster's name finds it on that cluster. Letters spread out only
+match its name.
 
-Single keys (?, g, j, k) work when no text field or terminal has focus; `?` lists every shortcut.
+The keyboard shortcuts, as `?` (or the keyboard button of the top bar) and Settings → Shortcuts
+list them; the palette, that list and this table are all made from one list of commands:
+
+| Linux | macOS | Command | Where |
+|---|---|---|---|
+| Ctrl+K | ⌘K | Command palette: resources, pages, contexts, objects and every command | Anywhere |
+| ? | ? | Keyboard shortcuts: this list | Outside text fields |
+| Ctrl+Shift+N | ⇧⌘N | New window | Anywhere |
+| Ctrl+T | ⌘T | New tab: right-click a row to open it in one | Anywhere |
+| Ctrl+W | ⌘W | Close tab | Anywhere |
+| Ctrl+Tab or Ctrl+PageDown | ⌃Tab or ⌃PageDown | Next tab | Anywhere |
+| Ctrl+Shift+Tab or Ctrl+PageUp | ⌃⇧Tab or ⌃PageUp | Previous tab | Anywhere |
+| Ctrl+B | ⌘B | Hide or show the sidebar | Anywhere |
+| F5 or Ctrl+R | F5 or ⌘R | Refresh: in a terminal, F5 goes to the program | Anywhere |
+| Alt+← | ⌘[ | Back | Anywhere |
+| Alt+→ | ⌘] | Forward | Anywhere |
+| Esc | Esc | Back to the list | On a detail page |
+| Ctrl+= | ⌘= | Zoom in | Anywhere |
+| Ctrl+- | ⌘- | Zoom out | Anywhere |
+| Ctrl+0 | ⌘0 | Reset the zoom | Anywhere |
+| Ctrl+F or / | ⌘F or / | Filter the table: `web` · `!Running` · `app=web` · `tier!=db` · `l:app` · `ns:team-*` · `/^api-\d+/` · `status:Running` · `restarts>3` · `cpu>200m` (all terms must match) | In a table |
+| j / k / Enter | j / k / Return | Move the selection, open the selected row | In a table |
+| Right-click a row | Right-click a row | Row menu: open, logs, shell, YAML, events, copy name, favorite | In a table |
+| g then p | g then p | Problems: what is broken, across the clusters | Outside text fields |
+| g then o | g then o | Cluster overview: nodes, capacity and versions | Outside text fields |
+| g then w | g then w | Workloads overview | Outside text fields |
+| g then h | g then h | Helm releases | Outside text fields |
+| g then i | g then i | Assistant: ask your clusters | Outside text fields |
+| g then s | g then s | Settings | Outside text fields |
+| Ctrl+J | ⌘J | Assistant beside the page: it is told what is on screen | Anywhere |
+| Ctrl+Shift+V | ⌘V | Paste in a shell | In a shell |
+| Double-click a context | Double-click a context | Connect to just that context | On the Contexts page |
+
+Single keys (?, g, j, k) work when no text field or terminal has focus.
 
 On macOS, ⌘ takes Ctrl's place, so Ctrl keys reach the shell in a terminal (Ctrl+Tab still
 switches tabs), and the menu bar has the keys every Mac app has: ⌘, opens Settings, ⌘Q quits, ⌘W
