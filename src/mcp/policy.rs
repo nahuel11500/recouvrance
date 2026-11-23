@@ -834,6 +834,7 @@ pub(super) mod tests {
             preview: None,
             access: pods.clone(),
             dry_run: false,
+            once_only: false,
             deadline: std::time::Instant::now(),
         };
         let p = Policy { rules: vec![approval.as_rule().unwrap()], ..Policy::default() };
@@ -973,6 +974,7 @@ pub(super) mod tests {
             preview: None,
             access: access("c1", "restart", "deployments.apps", Some("team"), Some("web")),
             dry_run: false,
+            once_only: false,
             deadline: std::time::Instant::now(),
         };
         // It wins over the Ask rule that asked, for exactly this request.
@@ -1028,6 +1030,7 @@ pub(super) mod tests {
             preview: None,
             access: access("c1", verb, "pods", Some("team"), name),
             dry_run: false,
+            once_only: false,
             deadline: std::time::Instant::now(),
         };
         assert!(approval("exec_command", "exec", Some("web-1")).as_rule().is_none());
@@ -1059,6 +1062,9 @@ pub(super) mod tests {
         // Approving a dry run must not allow the real write.
         let dry = Approval { dry_run: true, ..approval("delete_resource", "delete", Some("web")) };
         assert!(dry.as_rule().is_none() && dry.as_rule_for_an_hour().is_none());
+        // Approving a prune, a rollback or a terminate must not allow every sync of the object.
+        let once = Approval { once_only: true, ..approval("gitops", "sync", Some("app")) };
+        assert!(once.as_rule().is_none() && once.as_rule_for_an_hour().is_none());
     }
 
     #[test]
@@ -1073,6 +1079,7 @@ pub(super) mod tests {
             preview: None,
             access: access("hub", "sync", "applications.argoproj.io", Some("argocd"), Some("web")),
             dry_run: false,
+            once_only: false,
             deadline: std::time::Instant::now(),
         };
         let ask = rule(Mode::Ask, &["patch", "sync"], &["*"], &["*"], &["*"]);
@@ -1374,6 +1381,7 @@ pub(crate) mod properties {
                 preview: None,
                 access: a.clone(),
                 dry_run,
+                once_only: false,
                 deadline: std::time::Instant::now(),
             };
             for rule in [approval.as_rule(), approval.as_rule_for_an_hour()].into_iter().flatten() {

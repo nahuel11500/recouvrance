@@ -16,6 +16,7 @@ use std::sync::Arc;
 use crate::k8s;
 use crate::k8s::Kind;
 use crate::k8s::argo::diagnosis::{self, Diagnosis, DriftRead, MayRead, Res};
+use crate::k8s::argo::ops::{self, Op, SyncRequest};
 use crate::mcp::preview::Plan;
 use crate::mcp::{Mode, Policy, Verb};
 
@@ -260,7 +261,7 @@ impl KubeMcp {
     }
 
     #[tool(
-        description = "GitOps actions: Flux `reconcile` (like `flux reconcile`), `suspend`, `resume`; Argo CD Application `refresh`, `hard_refresh` (renders its manifests again, without Argo CD's cache) or `sync`. Each needs its own verb on the object, not `patch`: `refresh` (refresh, hard_refresh), `sync` (Argo CD sync, Flux reconcile) or `suspend` (Flux suspend and resume). Argo CD `diagnose` changes nothing (authorized as `get`): why the Application drifts, keeps syncing (a sync loop, with the `ignoreDifferences` that would stop it), failed (hook, admission, missing CRD...) or is stuck (a long sync, a finalizer holding its deletion), and for each out-of-sync resource the fields that differ between what was last applied and the live object on its destination, with who wrote them since the last sync. The destination's objects are read only where your rules allow `get`.",
+        description = "GitOps actions: Flux `reconcile` (like `flux reconcile`), `suspend`, `resume`; Argo CD Application `refresh`, `hard_refresh` (renders its manifests again, without Argo CD's cache), `sync` (optionally of some `resources` only, with `prune`, or a `dry_run` whose result is returned), `terminate` (stops the operation running, like `argocd app terminate-op`) or `rollback` (to a deployment of its history, like `argocd app rollback`; refused while auto-sync is on), each authorized by its own verb on the object, not `patch`: `refresh` (refresh, hard_refresh), `sync` (Argo CD sync, terminate and rollback, Flux reconcile) or `suspend` (Flux suspend and resume). Like argocd-server, nothing starts while another operation runs. Argo CD `diagnose` changes nothing (authorized as `get`): why the Application drifts, keeps syncing (a sync loop, with the `ignoreDifferences` that would stop it), failed (hook, admission, missing CRD...) or is stuck (a long sync, a finalizer holding its deletion), and for each out-of-sync resource the fields that differ between what was last applied and the live object on its destination, with who wrote them since the last sync. The destination's objects are read only where your rules allow `get`.",
         annotations(read_only_hint = false)
     )]
     async fn gitops(
@@ -268,48 +269,78 @@ impl KubeMcp {
         Extension(parts): Extension<Parts>,
         Parameters(p): Parameters<GitOpsParams>,
     ) -> Result<String, String> {
-        let args =
-            json!({"context": p.context, "kind": p.kind, "namespace": p.namespace, "name": p.name, "action": p.action});
+        let resources: Option<Vec<serde_json::Value>> = p.resources.as_ref().map(|rs| {
+            rs.iter()
+                .map(|r| json!({"group": r.group, "kind": r.kind, "namespace": r.namespace, "name": r.name}))
+                .collect()
+        });
+        let args = json!({"context": p.context, "kind": p.kind, "namespace": p.namespace, "name": p.name,
+            "action": p.action, "resources": resources, "prune": p.prune, "dry_run": p.dry_run,
+            "deployment_id": p.deployment_id});
         let mut call = self.begin(&parts, "gitops", args)?;
         let (client, kind) = self.kind(&call, &p.context, &p.kind).await?;
         let flux = kind.ar.group.ends_with(".toolkit.fluxcd.io");
         let argo = kind.is("argoproj.io", "Application");
         let ok = match p.action.as_str() {
             "reconcile" | "suspend" | "resume" => flux,
-            "refresh" | "hard_refresh" | "sync" | "diagnose" => argo,
+            "refresh" | "hard_refresh" | "sync" | "terminate" | "rollback" | "diagnose" => argo,
             _ => false,
         };
         if !ok {
             return call.finish(Err(anyhow::anyhow!(
-                "`{}` does not apply to {} (Flux: reconcile/suspend/resume; Argo CD applications: refresh/hard_refresh/sync/diagnose)",
+                "`{}` does not apply to {} (Flux: reconcile/suspend/resume; Argo CD applications: refresh/hard_refresh/sync/terminate/rollback/diagnose)",
                 p.action,
                 kind.ar.kind
             )));
+        }
+        if let Some(why) = gitops_option_misuse(&p) {
+            return Err(call.fail(why));
         }
         if p.action == "diagnose" {
             return self.argo_diagnose(call, client, kind, &p.context, &p.namespace, &p.name).await;
         }
         let verb =
             gitops_verb(&p.action).ok_or_else(|| call.fail(format!("`{}` has no verb in the rules", p.action)))?;
+        let mut op = argo_op(&p);
         let access = access_for(&kind, &p.context, verb, Some(p.namespace.clone()), Some(p.name.clone()));
-        if p.action == "sync" {
+        // What a prune deletes, and the deployment a rollback goes to, are part of what is
+        // approved: read before asking, and what is sent is held to what was shown. Never
+        // shown to the agent before its rules allow the call (a failed read says nothing).
+        // A prune is read only when the user will be asked; a rollback is pinned unless denied.
+        self.reload_rules(&mut call);
+        let mode = call.policy().decide(&access).mode;
+        let asks = mode == Mode::Ask && !self.hub.headless();
+        let prunes = matches!(&op, Some(Op::Sync(req)) if req.prune && asks);
+        let rollback = matches!(op, Some(Op::Rollback { id: None, .. })) && mode != Mode::Deny;
+        let mut read = None;
+        if (prunes || rollback)
+            && let Ok(app) = super::get_named(&client, &kind, Some(p.namespace.as_str()), &p.name, false).await
+            && let Some(o) = op.as_mut()
+        {
+            call.approval_detail = approval_detail(&app, o);
+            read = Some(app);
+        }
+        // The banner's preview of a sync: of the Application just read, when it was.
+        if let Some(Op::Sync(req)) = &op {
             call.plan = Some(Plan::Sync {
                 client: client.clone(),
                 kind: kind.clone(),
                 ns: p.namespace.clone(),
                 name: p.name.clone(),
+                req: req.clone(),
+                app: read,
             });
         }
         self.authorize(&mut call, &access).await?;
         self.recheck(&mut call, &access)?;
         let (ns, name) = (Some(p.namespace), p.name);
-        call.finish(match p.action.as_str() {
-            "reconcile" => k8s::flux_reconcile(client, kind, ns, name).await,
-            "suspend" => k8s::merge_patch(client, kind, ns, name, json!({"spec": {"suspend": true}}), false).await,
-            "resume" => k8s::merge_patch(client, kind, ns, name, json!({"spec": {"suspend": false}}), false).await,
-            "refresh" => k8s::argo_refresh(client, kind, ns, name, false).await,
-            "hard_refresh" => k8s::argo_refresh(client, kind, ns, name, true).await,
-            _ => k8s::argo_sync(client, kind, ns, name).await,
+        call.finish(match (p.action.as_str(), op) {
+            (_, Some(op)) => k8s::argo_operation(client, kind, ns, name, op).await,
+            ("reconcile", _) => k8s::flux_reconcile(client, kind, ns, name).await,
+            ("suspend", _) => k8s::merge_patch(client, kind, ns, name, json!({"spec": {"suspend": true}}), false).await,
+            ("resume", _) => k8s::merge_patch(client, kind, ns, name, json!({"spec": {"suspend": false}}), false).await,
+            ("hard_refresh", _) => k8s::argo_refresh(client, kind, ns, name, true).await,
+            _ => k8s::argo_refresh(client, kind, ns, name, false).await,
         })
     }
 
@@ -340,13 +371,88 @@ impl KubeMcp {
 }
 
 /// The rules' verb for a GitOps action: a refresh deploys nothing, a sync (or a Flux
-/// reconcile) deploys what the repository holds, and suspend and resume stop or restart that.
+/// reconcile) deploys what the repository holds (a rollback an earlier deployment of it, and
+/// a terminate stops one), and suspend and resume stop or restart that.
 /// None for any other action, so one added later is refused until it is given its verb.
 fn gitops_verb(action: &str) -> Option<Verb> {
     match action {
         "refresh" | "hard_refresh" => Some(Verb::Refresh),
-        "sync" | "reconcile" => Some(Verb::Sync),
+        "sync" | "reconcile" | "terminate" | "rollback" => Some(Verb::Sync),
         "suspend" | "resume" => Some(Verb::Suspend),
+        _ => None,
+    }
+}
+
+/// An option given to a `gitops` action that doesn't take it: said, not ignored, so an agent
+/// never believes it got a dry run or a partial sync it did not.
+fn gitops_option_misuse(p: &GitOpsParams) -> Option<String> {
+    let action = p.action.as_str();
+    if p.resources.is_some() && action != "sync" {
+        return Some("`resources` applies to `sync` only".into());
+    }
+    if p.resources.as_ref().is_some_and(Vec::is_empty) {
+        return Some("`resources` is empty: omit it to sync the whole Application".into());
+    }
+    if p.prune == Some(true) && action != "sync" {
+        return Some("`prune` applies to `sync` only (a rollback never prunes)".into());
+    }
+    if p.dry_run == Some(true) && !matches!(action, "sync" | "rollback") {
+        return Some(format!("`{action}` has no dry run: `dry_run` applies to `sync` and `rollback`"));
+    }
+    if p.deployment_id.is_some() && action != "rollback" {
+        return Some("`deployment_id` applies to `rollback` only".into());
+    }
+    None
+}
+
+/// What the approval banner adds for `op` on the Application `app` as read before asking,
+/// and `op` held to it: a prune's list (it may delete no more), or the deployment a rollback
+/// to the one before the newest goes to (named by its id from then on).
+fn approval_detail(app: &serde_json::Value, op: &mut Op) -> Option<String> {
+    match op {
+        Op::Sync(req) if req.prune => {
+            let gone = ops::pruned(app, &req.resources);
+            let verb = if req.dry_run { "would delete" } else { "deletes" };
+            let detail = if gone.is_empty() {
+                "prune: nothing to delete".to_string()
+            } else {
+                format!("prune {verb} {}: {}", gone.len(), ops::named(&gone))
+            };
+            req.prune_shown = Some(gone);
+            Some(detail)
+        }
+        Op::Rollback { .. } => {
+            // Nothing to go back to: left as it is, refused once authorized.
+            *op = ops::pinned(app, op).ok()?;
+            let Op::Rollback { id, .. } = op else { return None };
+            let entry = ops::rollback_target(app, *id).ok()?;
+            Some(format!("rollback to {}", ops::deployment_label(entry)))
+        }
+        _ => None,
+    }
+}
+
+/// The Argo CD operation a `gitops` action writes, for those that write one.
+fn argo_op(p: &GitOpsParams) -> Option<Op> {
+    let dry_run = p.dry_run.unwrap_or(false);
+    match p.action.as_str() {
+        "sync" => {
+            let resources = p
+                .resources
+                .iter()
+                .flatten()
+                .map(|r| Res {
+                    group: r.group.clone().unwrap_or_default(),
+                    kind: r.kind.clone(),
+                    namespace: r.namespace.clone().unwrap_or_default(),
+                    name: r.name.clone(),
+                    version: String::new(),
+                })
+                .collect();
+            Some(Op::Sync(SyncRequest { resources, prune: p.prune.unwrap_or(false), dry_run, prune_shown: None }))
+        }
+        "rollback" => Some(Op::Rollback { id: p.deployment_id, dry_run }),
+        "terminate" => Some(Op::Terminate),
         _ => None,
     }
 }
@@ -529,7 +635,7 @@ fn unknown_hint(kinds: &[Kind], api_version: &str, kind_name: &str) -> String {
 mod tests {
     use serde_json::json;
 
-    use super::{crds_first, gitops_verb, unknown_hint};
+    use super::{Op, Res, SyncRequest, approval_detail, crds_first, gitops_verb, ops, unknown_hint};
     use crate::k8s::Kind;
     use crate::mcp::Verb;
 
@@ -564,12 +670,61 @@ mod tests {
             ("reconcile", Verb::Sync),
             ("suspend", Verb::Suspend),
             ("resume", Verb::Suspend),
+            ("terminate", Verb::Sync),
+            ("rollback", Verb::Sync),
         ];
         for (action, verb) in cases {
             assert_eq!(gitops_verb(action), Some(verb), "{action}");
         }
         // Never `patch`, and nothing for an action without its own verb.
         assert_eq!(gitops_verb("diagnose"), None);
-        assert_eq!(gitops_verb("rollback"), None);
+        assert_eq!(gitops_verb("delete"), None);
+    }
+
+    fn app() -> serde_json::Value {
+        let source = json!({"repoURL": "https://git.example/r", "path": "web"});
+        json!({
+            "metadata": {"name": "web", "namespace": "argocd", "resourceVersion": "7"},
+            "status": {
+                "resources": [
+                    {"kind": "ConfigMap", "namespace": "shop", "name": "old", "status": "OutOfSync", "requiresPruning": true}
+                ],
+                "history": [
+                    {"id": 1, "revision": "a".repeat(40), "source": source},
+                    {"id": 2, "revision": "b".repeat(40), "source": source}
+                ]
+            }
+        })
+    }
+
+    #[test]
+    fn the_rollback_approved_is_the_one_sent() {
+        let mut op = Op::Rollback { id: None, dry_run: false };
+        let detail = approval_detail(&app(), &mut op).unwrap();
+        assert_eq!(detail, format!("rollback to deployment 1 ({})", "a".repeat(8)));
+        // Sent by its id: a deployment landing after the approval changes nothing.
+        assert_eq!(op, Op::Rollback { id: Some(1), dry_run: false });
+        let mut later = app();
+        later["status"]["history"].as_array_mut().unwrap().push(json!({"id": 3, "revision": "c".repeat(40),
+            "source": {"repoURL": "https://git.example/r", "path": "web"}}));
+        assert_eq!(ops::patch(&later, &op).unwrap()["operation"]["sync"]["revision"], "a".repeat(40));
+    }
+
+    #[test]
+    fn the_prune_approved_bounds_what_is_deleted() {
+        let mut op = Op::Sync(SyncRequest { prune: true, ..Default::default() });
+        assert_eq!(approval_detail(&app(), &mut op).unwrap(), "prune deletes 1: ConfigMap shop/old");
+        let Op::Sync(req) = &op else { unreachable!() };
+        let shown: Vec<String> = req.prune_shown.iter().flatten().map(Res::label).collect();
+        assert_eq!(shown, ["ConfigMap shop/old"]);
+        // Git drops another resource after the approval: the sync is refused.
+        let mut later = app();
+        later["status"]["resources"].as_array_mut().unwrap().push(
+            json!({"kind": "ConfigMap", "namespace": "shop", "name": "more", "status": "OutOfSync", "requiresPruning": true}),
+        );
+        assert!(ops::patch(&later, &op).unwrap_err().contains("ConfigMap shop/more"));
+        // A dry run deletes nothing: said so.
+        let mut dry = Op::Sync(SyncRequest { prune: true, dry_run: true, ..Default::default() });
+        assert!(approval_detail(&app(), &mut dry).unwrap().starts_with("prune would delete 1"));
     }
 }

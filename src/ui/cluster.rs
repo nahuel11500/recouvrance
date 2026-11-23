@@ -70,18 +70,26 @@ impl ClusterOverview {
     pub fn new(clusters: Vec<(String, Client)>, cx: &mut Context<Self>) -> Self {
         let shown = clusters.clone();
         let task = cx.spawn(async move |this, cx| {
+            // Each cluster's pods, listed once and then followed by a watch while this page
+            // lives, rather than listed whole at every refresh. Set while the page is away: a
+            // long absence stops the watch until it is back.
+            let away = k8s::Pause::default();
+            let mut pods: Vec<PodFeed> = clusters.iter().map(|(_, c)| PodFeed::start(c.clone(), &away)).collect();
             loop {
                 let exec = cx.background_executor().clone();
+                away.set(true);
                 if !crate::app::wait_visible(&this, cx, &exec).await {
                     break;
                 }
+                away.set(false);
                 let started = std::time::Instant::now();
                 // The numbers as soon as the API servers answer; the charts when Prometheus
                 // does (on a big cluster it takes several times longer).
                 let (this2, mut cx2) = (this.clone(), cx.clone());
                 let numbers = async {
-                    let mut summaries =
-                        futures::future::join_all(clusters.iter().map(|(ctx, c)| load(ctx.clone(), c.clone()))).await;
+                    let loads =
+                        clusters.iter().zip(pods.iter_mut()).map(|((ctx, c), p)| load(ctx.clone(), c.clone(), p));
+                    let mut summaries = futures::future::join_all(loads).await;
                     this2.update(&mut cx2, |this, cx| {
                         // Keep the charts shown until the new ones come.
                         for (new, old) in summaries.iter_mut().zip(this.summaries.iter_mut().flatten()) {
@@ -190,19 +198,6 @@ struct CondLite {
     status: String,
 }
 
-#[derive(Deserialize, Default)]
-#[serde(default)]
-struct PodLite {
-    spec: k8s::podspec::LeanSpec,
-    status: PodStatusLite,
-}
-
-#[derive(Deserialize, Default)]
-#[serde(default)]
-struct PodStatusLite {
-    phase: String,
-}
-
 /// metrics.k8s.io lists: usage per node, or per pod container.
 #[derive(Deserialize, Default)]
 #[serde(default)]
@@ -262,22 +257,47 @@ fn add_nodes(s: &mut Summary, nodes: &[NodeLite]) {
     s.kubelet_versions = versions;
 }
 
-/// Pods into the summary: how many run, and what running or pending ones request.
-fn add_pods(s: &mut Summary, pods: &[PodLite]) {
-    s.pods_total = pods.len();
-    for p in pods {
-        let phase = p.status.phase.as_str();
-        if phase == "Running" {
-            s.pods_running += 1;
-        }
-        if phase == "Running" || phase == "Pending" {
-            let spec = &p.spec;
-            // As the scheduler counts: sidecars and init containers too, plus overhead.
-            let scheduled = |r: &str| spec.effective(r, k8s::podspec::Count::Scheduled);
-            s.cpu.1 += scheduled("cpu").request;
-            s.mem.1 += scheduled("memory").request;
-            s.gpus.1 +=
-                spec.resource_names().iter().filter(|r| r.ends_with("/gpu")).map(|r| scheduled(r).limit).sum::<f64>();
+/// Pods into the summary: how many run, and what running or pending ones request (as the
+/// scheduler counts it: sidecars and init containers too, plus overhead).
+fn add_pods(s: &mut Summary, pods: &k8s::PodTotals) {
+    s.pods_total = pods.pods;
+    s.pods_running = pods.running;
+    s.cpu.1 = pods.cpu;
+    s.mem.1 = pods.memory;
+    s.gpus.1 = pods.gpus;
+}
+
+/// One cluster's pods while the overview lives: listed once, then followed by a watch (see
+/// `k8s::watch_pod_resources`), so a refresh doesn't list every whole pod again.
+struct PodFeed {
+    _watch: k8s::TaskGuard,
+    rx: k8s::PodRequestsRx,
+    /// Lists again now, after a failed list.
+    retry: std::sync::Arc<tokio::sync::Notify>,
+}
+
+impl PodFeed {
+    /// Its watch stops when the page has been `away` for a while, and lists again once back.
+    fn start(client: Client, away: &k8s::Pause) -> Self {
+        let retry = std::sync::Arc::new(tokio::sync::Notify::new());
+        let (watch, rx) =
+            k8s::watch_pod_resources_retrying(client, None, away.clone(), k8s::Pause::default(), retry.clone());
+        Self { _watch: watch, rx, retry }
+    }
+
+    /// The pods' totals as last read, once there is a read: "forbidden" or "failed: …" when
+    /// the list failed. Then the pods are listed again at once, as the refresh did before they
+    /// were watched, so they are back at the next refresh once the cluster answers.
+    async fn totals(&mut self) -> Result<k8s::PodTotals, String> {
+        let read = self.rx.wait_for(Option::is_some).await;
+        let Ok(read) = read else { return Err("failed: stopped".into()) };
+        match &*read {
+            Some(Ok(pods)) => Ok(pods.totals),
+            Some(Err(e)) => {
+                self.retry.notify_one();
+                Err(e.clone())
+            }
+            None => Err("failed: stopped".into()),
         }
     }
 }
@@ -291,20 +311,28 @@ async fn metrics(on: bool, client: Client, path: &'static str) -> Option<Result<
     Some(k8s::run(async move { Ok(client.request(http::Request::get(path).body(Vec::new())?).await?) }).await)
 }
 
-/// The cluster overview's load, for the dev smoke run's timings.
+/// The cluster overview's load, `rounds` times in a row as its refreshes do (without the wait
+/// between them), for the dev smoke run: each round's time and what it read.
 #[cfg(feature = "dev")]
-pub async fn debug_load(context: String, client: Client) -> usize {
-    let t = std::time::Instant::now();
-    let numbers = async {
-        let s = load(context.clone(), client.clone()).await;
-        println!("cluster overview numbers: {:?}", t.elapsed());
-        s
-    };
-    let charts = async {
-        usage(&context, client.clone()).await;
-        println!("cluster overview charts: {:?}", t.elapsed());
-    };
-    futures::join!(numbers, charts).0.pods_running
+pub async fn debug_load(context: String, client: Client, rounds: usize) -> usize {
+    let mut pods = PodFeed::start(client.clone(), &k8s::Pause::default());
+    let mut running = 0;
+    for round in 1..=rounds.max(1) {
+        let (t, before) = (std::time::Instant::now(), crate::dev::smoke::bytes_read(&context));
+        let numbers = async {
+            let s = load(context.clone(), client.clone(), &mut pods).await;
+            println!("cluster overview numbers: {:?}", t.elapsed());
+            s
+        };
+        let charts = async {
+            usage(&context, client.clone()).await;
+            println!("cluster overview charts: {:?}", t.elapsed());
+        };
+        running = futures::join!(numbers, charts).0.pods_running;
+        let read = crate::dev::smoke::bytes_read(&context).saturating_sub(before) as f64 / 1e6;
+        println!("cluster overview round {round}: {:?}, {read:.1} MB read", t.elapsed());
+    }
+    running
 }
 
 /// CPU and memory over the chosen range, and GPUs, from Prometheus (when there is one).
@@ -322,8 +350,8 @@ async fn usage(context: &str, client: Client) -> Usage {
 }
 
 /// Everything but the charts, all at once: one request after the other, a big cluster took
-/// over 30 s.
-async fn load(context: String, client: Client) -> Summary {
+/// over 30 s. The pods come from their feed, which lists them only the first time.
+async fn load(context: String, client: Client, feed: &mut PodFeed) -> Summary {
     let on = crate::settings::metrics_on(&context);
     let c = client.clone();
     let version = k8s::run(async move {
@@ -333,7 +361,7 @@ async fn load(context: String, client: Client) -> Summary {
     let (version, nodes, pods, namespaces, node_metrics, pod_metrics) = futures::join!(
         version,
         k8s::lists::list_lean::<NodeLite>(client.clone(), k8s::ar_of::<core::Node>(), None),
-        k8s::lists::list_lean_cached::<PodLite>(client.clone(), k8s::ar_of::<core::Pod>(), None),
+        feed.totals(),
         k8s::namespaces(client.clone()),
         metrics(on, client.clone(), "/apis/metrics.k8s.io/v1beta1/nodes"),
         metrics(on, client.clone(), "/apis/metrics.k8s.io/v1beta1/pods"),
@@ -345,7 +373,8 @@ async fn load(context: String, client: Client) -> Summary {
 struct Answers {
     version: Result<String>,
     nodes: Result<Vec<NodeLite>>,
-    pods: Result<Vec<PodLite>>,
+    /// Their totals, or why the pods could not be listed ("forbidden", "failed: …").
+    pods: Result<k8s::PodTotals, String>,
     namespaces: Result<Vec<String>>,
     /// None when metrics are off.
     node_metrics: Option<Result<MetricsList>>,
@@ -373,7 +402,7 @@ fn summarize(context: String, a: Answers) -> Summary {
             add_pods(&mut s, &pods);
             s.pods_known = true;
         }
-        Err(e) => s.errors.push(failed("Pods", &e)),
+        Err(e) => s.errors.push(format!("Pods: {e}")),
     }
     match a.namespaces {
         Ok(n) => s.namespaces = Some(n.len()),
@@ -838,7 +867,13 @@ impl ClusterOverview {
 
 #[cfg(test)]
 mod tests {
-    use super::{Answers, MetricsList, NodeLite, PodLite, Summary, add_nodes, add_pods, summarize};
+    use super::{Answers, MetricsList, NodeLite, Summary, add_nodes, add_pods, summarize};
+    use crate::k8s::{PodAllocs, PodTotals};
+
+    /// The pods' totals as the overview's feed reads them from a list's `items`.
+    fn totals(items: serde_json::Value) -> PodTotals {
+        PodAllocs::from_items(&items).totals()
+    }
 
     fn forbidden() -> anyhow::Error {
         kube::Error::Api(kube::core::Status::failure("nodes is forbidden", "Forbidden").with_code(403).boxed()).into()
@@ -847,9 +882,7 @@ mod tests {
     #[test]
     fn one_part_failing_keeps_the_others() {
         // A namespace-scoped user: nodes and namespaces refused, pods listed, no metrics-server.
-        let pods: Vec<PodLite> =
-            serde_json::from_value(serde_json::json!([{"spec": {"containers": [{}]}, "status": {"phase": "Running"}}]))
-                .unwrap();
+        let pods = totals(serde_json::json!([{"spec": {"containers": [{}]}, "status": {"phase": "Running"}}]));
         let s = summarize(
             "c".into(),
             Answers {
@@ -873,13 +906,14 @@ mod tests {
             Answers {
                 version: Err(anyhow::anyhow!("connection refused")),
                 nodes: Err(anyhow::anyhow!("connection refused")),
-                pods: Err(anyhow::anyhow!("connection refused")),
+                pods: Err("failed: connection refused".into()),
                 namespaces: Err(anyhow::anyhow!("connection refused")),
                 node_metrics: None,
                 pod_metrics: Some(Ok(MetricsList::default())),
             },
         );
         assert_eq!(s.error.as_deref(), Some("Version: failed: connection refused"));
+        assert!(s.errors.iter().any(|e| e == "Pods: failed: connection refused"), "{:?}", s.errors);
     }
 
     /// metrics-server down: the rest is shown, and why usage is missing is said (#742).
@@ -891,7 +925,7 @@ mod tests {
         let answers = |code: u16| Answers {
             version: Ok("v1.33.1".into()),
             nodes: Ok(Vec::new()),
-            pods: Ok(Vec::new()),
+            pods: Ok(PodTotals::default()),
             namespaces: Ok(Vec::new()),
             node_metrics: Some(Err(refused(code))),
             pod_metrics: Some(Err(refused(code))),
@@ -919,13 +953,13 @@ mod tests {
                 "allocatable": {"cpu": "2", "memory": "4Gi"}}}
         ]))
         .unwrap();
-        let pods: Vec<PodLite> = serde_json::from_value(serde_json::json!([
-            {"spec": {"containers": [{"resources": {"requests": {"cpu": "500m", "memory": "1Gi"},
-                "limits": {"nvidia.com/gpu": "1"}}}]}, "status": {"phase": "Running"}},
-            {"spec": {"containers": [{"resources": {"requests": {"cpu": "1"}}}]}, "status": {"phase": "Succeeded"}},
-            {"spec": {"containers": [{}]}, "status": {"phase": "Pending"}}
-        ]))
-        .unwrap();
+        let pods = totals(serde_json::json!([
+            {"metadata": {"name": "gpu"}, "status": {"phase": "Running"}, "spec": {"containers": [{"resources": {
+                "requests": {"cpu": "500m", "memory": "1Gi"}, "limits": {"nvidia.com/gpu": "1"}}}]}},
+            {"metadata": {"name": "done"}, "status": {"phase": "Succeeded"},
+                "spec": {"containers": [{"resources": {"requests": {"cpu": "1"}}}]}},
+            {"metadata": {"name": "new"}, "spec": {"containers": [{}]}, "status": {"phase": "Pending"}}
+        ]));
         let mut s = Summary::default();
         add_nodes(&mut s, &nodes);
         add_pods(&mut s, &pods);
@@ -944,20 +978,19 @@ mod tests {
 
     #[test]
     fn requests_count_sidecars_init_containers_and_overhead() {
-        let pods: Vec<PodLite> = serde_json::from_value(serde_json::json!([
+        let pods = totals(serde_json::json!([
             // A mesh sidecar adds to the app; overhead adds on top.
-            {"spec": {
+            {"metadata": {"name": "mesh"}, "spec": {
                 "initContainers": [{"restartPolicy": "Always", "resources": {"requests": {"cpu": "100m", "memory": "128Mi"}}}],
                 "containers": [{"resources": {"requests": {"cpu": "500m", "memory": "1Gi"}}}],
                 "overhead": {"cpu": "50m"}},
              "status": {"phase": "Running"}},
             // A big init container sets the pod's request.
-            {"spec": {
+            {"metadata": {"name": "migrate"}, "spec": {
                 "initContainers": [{"resources": {"requests": {"cpu": "2"}}}],
                 "containers": [{"resources": {"requests": {"cpu": "250m"}}}]},
              "status": {"phase": "Pending"}}
-        ]))
-        .unwrap();
+        ]));
         let mut s = Summary::default();
         add_pods(&mut s, &pods);
         assert_eq!(s.cpu.1, 650.0 + 2000.0);

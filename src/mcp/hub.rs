@@ -83,6 +83,10 @@ pub struct Approval {
     pub access: Access,
     /// A dry run: approving it must not turn into a rule for real writes.
     pub dry_run: bool,
+    /// What was approved is narrower than any rule for it: an Argo CD prune (held to the
+    /// resources the banner listed), rollback (to the deployment it named) or terminate,
+    /// whose `sync` verb would also allow any other sync, prune or rollback of the object.
+    pub once_only: bool,
     /// When the request is refused unanswered. Set by [`Hub::request_approval`]; the banner
     /// counts down to it.
     pub deadline: Instant,
@@ -101,7 +105,8 @@ impl Approval {
     /// rule could not pin the content), a request other than a list with no object name
     /// (the rule would cover every name), a request across all namespaces (the rule would
     /// also cover namespaces no rule allows) and dry runs (a rule cannot be limited to dry
-    /// runs, so it would allow the real write).
+    /// runs, so it would allow the real write), and an Argo CD prune, rollback or terminate
+    /// (the `sync` verb would allow every other sync of the object).
     pub fn as_rule(&self) -> Option<Rule> {
         let a = &self.access;
         // A refresh or a sync has its own verb, so its rule allows that action on that
@@ -109,6 +114,7 @@ impl Approval {
         if matches!(a.verb, Verb::Exec | Verb::Patch | Verb::Scale | Verb::Suspend)
             || self.tool == "apply_manifest"
             || self.dry_run
+            || self.once_only
             || (a.verb != Verb::List && a.name.is_none())
             || (a.namespace.is_none() && !a.cluster_scoped)
         {
@@ -1013,6 +1019,7 @@ mod tests {
             preview: None,
             access,
             dry_run: false,
+            once_only: false,
             deadline: Instant::now(),
         };
         tokio::spawn(async move { hub.request_approval(request, gone).await })
