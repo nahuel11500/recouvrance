@@ -23,8 +23,9 @@ use crate::k8s::{self, Kind};
 /// Discovery runs again for an unknown kind (a CRD installed since) at most this often.
 const REDISCOVER_EVERY: Duration = Duration::from_secs(60);
 
-/// How long a request waits for the user's answer.
-const APPROVAL_TIMEOUT: Duration = Duration::from_secs(120);
+/// How long a request waits for the user's answer. The configs the Agents page copies
+/// give clients a tool timeout longer than this.
+pub const APPROVAL_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// How a request for approval ended.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
