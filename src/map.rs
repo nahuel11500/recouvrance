@@ -295,8 +295,16 @@ fn has_rules(kind: &Kind) -> bool {
     let own = matches!(
         (kind.ar.group.as_str(), kind.ar.kind.as_str()),
         ("batch", "CronJob")
-            | ("", "Secret" | "ConfigMap" | "ServiceAccount" | "PersistentVolumeClaim" | "PersistentVolume")
-            | ("", "Service" | "Node")
+            | (
+                "",
+                "Secret"
+                    | "ConfigMap"
+                    | "ServiceAccount"
+                    | "PersistentVolumeClaim"
+                    | "PersistentVolume"
+                    | "Service"
+                    | "Node"
+            )
             | ("networking.k8s.io", "Ingress" | "NetworkPolicy")
             | ("autoscaling", "HorizontalPodAutoscaler")
             | ("autoscaling.k8s.io", "VerticalPodAutoscaler")
@@ -641,7 +649,7 @@ impl Known {
                 .collect();
         }
         if kind.is("", "Pod") {
-            known.netpols = related.netpols.clone();
+            known.netpols.clone_from(&related.netpols);
             if known.netpols.is_none() {
                 errors.push("NetworkPolicies: could not be read".into());
             }

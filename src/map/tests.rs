@@ -590,7 +590,7 @@ fn a_listed_object_keeps_what_the_rules_read() {
     );
 }
 
-/// An API server that refuses Ingresses and doesn't serve HTTPRoutes, for `load`.
+/// An API server that refuses Ingresses and doesn't serve `HTTPRoutes`, for `load`.
 #[derive(Clone)]
 struct Refusing;
 
