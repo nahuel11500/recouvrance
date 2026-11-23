@@ -26,7 +26,7 @@ mod workloads;
 
 use crate::json::{arr_at as arr, i64_at as n, str_at as s};
 use access::{binding_page, role_page, service_account_page};
-pub(crate) use argo::ArgoResources;
+pub(crate) use argo::{ArgoGitDiff, ArgoResources};
 pub(crate) use config::*;
 pub(crate) use network::same_parent;
 use network::{gateway, ingress, netpol, route, service};
@@ -183,6 +183,10 @@ pub struct Ctx<'a> {
     pub argo: &'a k8s::argo::Lookup,
     /// An Application's resources table.
     pub argo_resources: &'a ArgoResources,
+    /// An Application's diff as Argo CD renders it from git, once asked for.
+    pub argo_git: &'a ArgoGitDiff,
+    /// The context the object is read on (for an Application, its Argo CD's).
+    pub context: &'a str,
 }
 
 impl Ctx<'_> {
@@ -469,6 +473,7 @@ fn top(ctx: &Ctx, cx: &App) -> Div {
         root = root
             .children(argo::destination(ctx, cx))
             .children(argo::diagnosis(ctx, cx))
+            .child(argo::git_diff(ctx, cx))
             .child(argo::resources_table(ctx, cx));
     } else {
         if kind.is(crate::external_secrets::GROUP, "ExternalSecret") {
