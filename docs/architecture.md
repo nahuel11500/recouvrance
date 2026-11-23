@@ -15,7 +15,7 @@ Recouvrance is one Rust binary: a [gpui](https://github.com/zed-industries/zed) 
   sleeps. X11 sees a covered window only without a compositor, and Wayland compositors without the
   xdg-shell `suspended` state never report a window hidden. The list then holds its rows back
   (a first list that completes meanwhile says so only with them) and stops its metrics, and the
-  sidebar's problem count waits. Watches, log streams and shells keep going, so a window shown
+  sidebar's problem count starts no scan (while every window is hidden, none runs). Watches, log streams and shells keep going, so a window shown
   again is current at once. A window shown on another monitor, not focused, keeps updating.
 - The page on screen gets the API servers first. Background work (the problem count, a hidden
   list) takes at most 8 of the 32 slots that requests by namespace share (`k8s::lane`). Each
@@ -62,7 +62,15 @@ them after 1.4 s ([measured](COMPARISON.md#measured)).
 The Problems scan reads the big kinds from their cells too (`list_light`). What its checks need
 of whole objects (Services, Ingresses and HTTP routes, the pods a Service selects, the workloads of
 a namespace with an idle Service, external-secrets.io's objects) is parsed as each list streams in,
-keeping only the fields the checks use; of the workloads, only those scaled to 0 are kept.
+keeping only the fields the checks use; of the workloads, only those scaled to 0 are kept. A
+Service's verdict is kept by its uid and resourceVersion for 10 minutes, so the same idle Services
+don't cost a pod list each on every scan.
+
+One scan runs per cluster and scope (`problems::shared`), whoever asks: the sidebar badge of each
+window, the Problems page and the agents' `find_problems` read its latest findings, kept check by
+check as each finishes, and wait for the scan running rather than start another. A scan is due
+eight times as long as the last one took after it ended (2 minutes at least); a page scoped to some
+namespaces reads them from the cluster's scan when it covers them.
 
 ## Safety model
 

@@ -118,6 +118,11 @@ Tools, by what they do:
   `cordon_node`, `uncordon_node`, `drain_node`, `gitops`, `exec_command`, `debug_pod`,
   `port_forward`, `stop_port_forward`.
 
+`find_problems` answers from the Problems scan the app shares with its windows (the sidebar count,
+the Problems page) while that scan is recent, 2 minutes or more on a big cluster, and says how old
+it is; otherwise it runs one, which the windows then show too. `max_age_seconds` sets the oldest
+answer it takes: 0 scans again, to check a fix. Its findings still go through the agent's rules.
+
 Each tool tells the agent's client whether it only reads (`readOnlyHint`): the tools under **Read**
 say so, except `browse_files`, which may add a debug container; the changes don't. Of those that may
 change something, `debug_pod`, `port_forward` and `browse_files` only add (`destructiveHint: false`).

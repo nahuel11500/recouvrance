@@ -1,6 +1,7 @@
 //! MCP tools that read: contexts, types, resources, events, describe, top, search, logs, certificates, reachability, problems, usage history.
 
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 use http::request::Parts;
 use rmcp::handler::server::tool::Extension;
@@ -16,8 +17,10 @@ use super::{
     problem_visible, require_ns, visible,
 };
 use crate::k8s;
+use crate::k8s::lane::Lane;
 use crate::k8s::{Kind, ObjectRef};
 use crate::mcp::{Mode, Policy, Verb};
+use crate::problems::shared::{self, Fresh};
 use crate::reachability;
 
 #[tool_router(router = read_tools, vis = "pub(super)")]
@@ -679,7 +682,7 @@ impl KubeMcp {
     }
 
     #[tool(
-        description = "What is broken: crash-looping or pending pods, unavailable Deployments/StatefulSets/DaemonSets, NotReady nodes and nodes a taint keeps pods off because something is wrong (an agent not ready, being removed), failed Jobs, pending PVCs, ExternalSecrets and secret stores that fail to sync, Services that select no pod or no ready one, references to objects that don't exist (a pod's ConfigMaps, Secrets and PVCs, a workload's ServiceAccount, a pending PVC's StorageClass, an Ingress's Services, ports and TLS Secrets, an HTTPRoute's Services), objects stuck deleting (Namespaces, PVs, Argo CD Applications too) with the finalizers holding them, and alerts firing in the cluster's Prometheus (not silenced). Worst first. Start here when asked to troubleshoot.",
+        description = "What is broken: crash-looping or pending pods, unavailable Deployments/StatefulSets/DaemonSets, NotReady nodes and nodes a taint keeps pods off because something is wrong (an agent not ready, being removed), failed Jobs, pending PVCs, ExternalSecrets and secret stores that fail to sync, Services that select no pod or no ready one, references to objects that don't exist (a pod's ConfigMaps, Secrets and PVCs, a workload's ServiceAccount, a pending PVC's StorageClass, an Ingress's Services, ports and TLS Secrets, an HTTPRoute's Services), objects stuck deleting (Namespaces, PVs, Argo CD Applications too) with the finalizers holding them, and alerts firing in the cluster's Prometheus (not silenced). Worst first. Start here when asked to troubleshoot. Answers from the app's latest scan of the cluster while it is recent, and says how old it is; after a fix, pass max_age_seconds: 0 to check it on a new scan.",
         annotations(read_only_hint = true)
     )]
     async fn find_problems(
@@ -687,7 +690,8 @@ impl KubeMcp {
         Extension(parts): Extension<Parts>,
         Parameters(p): Parameters<ProblemsParams>,
     ) -> Result<String, String> {
-        let args = json!({"context": p.context, "namespace": p.namespace, "include_minor": p.include_minor});
+        let args = json!({"context": p.context, "namespace": p.namespace, "include_minor": p.include_minor,
+            "max_age_seconds": p.max_age_seconds});
         let mut call = self.begin(&parts, "find_problems", args)?;
         let (client, pods) = self.kind(&call, &p.context, "pods").await?;
         let access = access_for(&pods, &p.context, Verb::List, p.namespace.clone(), None);
@@ -696,17 +700,26 @@ impl KubeMcp {
             Ok((_, kinds)) => kinds,
             Err(e) => return call.finish(Err(e)),
         };
-        // A kind that can't be listed is named, and doesn't hide what the others found.
-        let (mut scan, alerts) = futures::join!(
-            crate::problems::scan_partial(client.clone(), &kinds, p.namespace.clone(), None),
-            crate::alerts::active(&p.context, client)
-        );
-        // Firing alerts too, like the Problems page; each one shown only if its object is.
-        crate::alerts::add(&mut scan, &alerts, p.namespace.as_slice());
-        let skipped = scan.skipped_text().map(|s| format!("Not checked, could not read {s}."));
+        // The app's latest scan while it is recent enough (the sidebar badge's, the Problems
+        // page's, another agent's), else a new one they share. A kind that can't be listed is
+        // named, and doesn't hide what the others found. Firing alerts too, like the Problems
+        // page; each one shown only if its object is.
+        let scope = shared::Scope::new(&p.context, p.namespace.clone());
+        let fresh = match p.max_age_seconds {
+            Some(secs) => Instant::now().checked_sub(Duration::from_secs(secs)).map_or(Fresh::Paced, Fresh::Since),
+            None => Fresh::Paced,
+        };
+        let ask =
+            || shared::Ask { client: client.clone(), kinds: kinds.clone(), lane: Lane::Foreground, record: false };
+        let found = shared::fresh(&scope, fresh, ask).await.unwrap_or_default();
+        let skipped = found.skipped().map(|s| format!("Not checked, could not read {s}."));
+        let scanned = found.done.map(|d| {
+            let ago = i64::try_from(d.started.elapsed().as_secs()).unwrap_or(i64::MAX);
+            format!("From a scan started {} ago; max_age_seconds: 0 scans again.", k8s::duration_text(ago))
+        });
         let minor = p.include_minor.unwrap_or(false);
-        let table: Vec<Vec<String>> = scan
-            .problems
+        let table: Vec<Vec<String>> = found
+            .problems(p.namespace.as_slice())
             .into_iter()
             .filter(|x| minor || x.severity != crate::problems::Severity::Info)
             .filter(|x| {
@@ -733,7 +746,7 @@ impl KubeMcp {
         } else {
             format_table(&["SEVERITY", "KIND", "NAMESPACE", "NAME", "PROBLEM", "AGE"], &table)
         };
-        if let Some(note) = skipped {
+        for note in [skipped, scanned].into_iter().flatten() {
             out = format!("{out}\n{note}");
         }
         call.finish(Ok(out))
