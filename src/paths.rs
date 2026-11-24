@@ -79,7 +79,6 @@ mod tests {
     fn shown_paths_are_the_ones_in_use() {
         assert_eq!(shown_config("rules.yaml"), tilde(&config_dir().join("rules.yaml")));
         assert_eq!(shown_data("audit.jsonl"), tilde(&data_dir().join("audit.jsonl")));
-        assert!(shown_config("").ends_with("recouvrance/"), "{}", shown_config(""));
     }
 
     /// The folders move with `XDG_CONFIG_HOME` and `XDG_DATA_HOME`: code names them with

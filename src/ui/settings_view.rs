@@ -1706,8 +1706,8 @@ impl SettingsView {
                     .child(div().text_sm().child("Then restart Recouvrance.")),
             )
             .child(div().pt_3().text_xs().text_color(muted).child(format!(
-                "Settings: {} · Agent activity: {}",
-                crate::paths::shown_config(""),
+                "Settings: {}/ · Agent activity: {}",
+                crate::paths::tilde(&crate::paths::config_dir()),
                 crate::paths::shown_data("audit.jsonl")
             )))
             .into_any_element()
