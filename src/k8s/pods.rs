@@ -148,9 +148,9 @@ fn event_line(e: LeanEvent) -> EventLine {
 fn event_first(e: &LeanEvent) -> Option<jiff::Timestamp> {
     e.first_timestamp
         .as_ref()
-        .map(|t| t.0)
-        .or_else(|| e.event_time.as_ref().map(|t| t.0))
-        .or_else(|| e.metadata.creation_timestamp.as_ref().map(|t| t.0))
+        .and_then(|t| super::timestamp(t.0))
+        .or_else(|| e.event_time.as_ref().and_then(|t| super::timestamp(t.0)))
+        .or_else(|| e.metadata.creation_timestamp.as_ref().and_then(|t| super::timestamp(t.0)))
 }
 
 /// The component that reported an event: the new field, else the old one.
@@ -275,10 +275,10 @@ fn event_last(e: &LeanEvent) -> Option<jiff::Timestamp> {
     e.series
         .as_ref()
         .and_then(|s| s.last_observed_time.as_ref())
-        .map(|t| t.0)
-        .or_else(|| e.last_timestamp.as_ref().map(|t| t.0))
-        .or_else(|| e.event_time.as_ref().map(|t| t.0))
-        .or_else(|| e.metadata.creation_timestamp.as_ref().map(|t| t.0))
+        .and_then(|t| super::timestamp(t.0))
+        .or_else(|| e.last_timestamp.as_ref().and_then(|t| super::timestamp(t.0)))
+        .or_else(|| e.event_time.as_ref().and_then(|t| super::timestamp(t.0)))
+        .or_else(|| e.metadata.creation_timestamp.as_ref().and_then(|t| super::timestamp(t.0)))
 }
 
 /// How many times an event happened, its `series` included.
@@ -495,7 +495,7 @@ fn stream_params(
         tail_lines,
         since_seconds,
         // Whole seconds (the server's precision): lines of that second come again and are skipped.
-        since_time: resume.and_then(|t| jiff::Timestamp::from_second(t.as_second()).ok()),
+        since_time: resume.and_then(|t| k8s_openapi::jiff::Timestamp::from_second(t.as_second()).ok()),
         // RFC3339 prefix on every line, for the time column and histogram.
         timestamps: true,
         ..Default::default()
@@ -1321,7 +1321,7 @@ mod tests {
         // Resuming asks from the whole second of the last line, without a tail.
         let resume: jiff::Timestamp = "2024-01-01T00:00:05.75Z".parse().unwrap();
         let lp = super::stream_params(None, false, Some(60), Some(resume));
-        assert_eq!(lp.since_time.map(jiff::Timestamp::as_second), Some(resume.as_second()));
+        assert_eq!(lp.since_time.map(k8s_openapi::jiff::Timestamp::as_second), Some(resume.as_second()));
         assert_eq!((lp.tail_lines, lp.since_seconds, lp.follow), (None, None, true));
         assert_eq!(super::reconnect_delay(1).as_secs(), 1);
         assert_eq!(super::reconnect_delay(3).as_secs(), 4);
