@@ -826,9 +826,16 @@ pub fn load_json<T: serde::de::DeserializeOwned + Default>(path: &Path) -> T {
 }
 
 /// Move a file that does not read to `<name>.bad-<unix time>`, so the next save does
-/// not overwrite it. Says where it went, or why it could not be moved.
+/// not overwrite it. Says where it went, or why it could not be moved. A symlinked file
+/// (a dotfiles repo) is moved aside where it is and the link left in place, so the next
+/// save writes through the link instead of a regular file over it.
 pub fn keep_aside(path: &Path) -> String {
     let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    let path = match crate::private_files::through_links(path) {
+        Ok(p) => p,
+        Err(e) => return format!("could not keep it: {e}"),
+    };
+    let path = path.as_path();
     let mut bad = path.as_os_str().to_owned();
     bad.push(format!(".bad-{secs}"));
     match std::fs::rename(path, &bad) {
@@ -1461,6 +1468,28 @@ mod tests {
         // Missing: defaults, nothing created.
         let v: Vec<String> = load_json(&d.join("missing.json"));
         assert!(v.is_empty());
+        std::fs::remove_dir_all(d).unwrap();
+    }
+
+    /// A symlinked file that doesn't read is kept aside where it is, the link left in place:
+    /// the next save writes through the link, which stays one.
+    #[test]
+    fn a_symlinked_bad_file_keeps_its_link() {
+        let d = scratch();
+        let repo = d.join("dotfiles");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::write(repo.join("settings.json"), b"{ not json").unwrap();
+        let p = d.join("settings.json");
+        std::os::unix::fs::symlink("dotfiles/settings.json", &p).unwrap();
+        let v: std::collections::HashMap<String, i32> = load_json(&p);
+        assert!(v.is_empty());
+        let backups: Vec<_> = std::fs::read_dir(&repo).unwrap().filter_map(Result::ok).collect();
+        assert_eq!(backups.len(), 1);
+        assert!(backups[0].file_name().to_string_lossy().starts_with("settings.json.bad-"));
+        assert_eq!(std::fs::read(backups[0].path()).unwrap(), b"{ not json");
+        crate::private_files::write_atomic(&p, b"{}").unwrap();
+        assert!(std::fs::symlink_metadata(&p).unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::read(repo.join("settings.json")).unwrap(), b"{}");
         std::fs::remove_dir_all(d).unwrap();
     }
 

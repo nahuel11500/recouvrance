@@ -24,8 +24,11 @@ Recouvrance reads your kubeconfig like `kubectl` does and keeps its own settings
 | `~/.local/share/recouvrance/audit.jsonl` | Agent activity log |
 | `~/.local/share/recouvrance/timeline/<context>-<hash>.jsonl` | Changes recorded per context (mode 0600, see [Timeline](#timeline)) |
 
-A JSON file that can't be read is kept aside as `<name>.bad-<time>` so the next save doesn't
-overwrite it. In `settings.json`, only the keys that don't read get their default; the others,
+Any of these files can be a symlink (into a dotfiles repo, with stow or home-manager): the app
+writes through the link, replacing the file it leads to, and the link stays a link.
+
+A JSON file that can't be read is kept aside as `<name>.bad-<time>` (next to the file a symlink
+leads to) so the next save doesn't overwrite it. In `settings.json`, only the keys that don't read get their default; the others,
 such as `protection`, are kept; a `protection` entry that isn't `true` or `false` counts as
 protected, a `delete_confirm_kinds` entry that doesn't read asks for the name, and a
 `confirm_style` that doesn't read asks for names typed (so does every confirmation while

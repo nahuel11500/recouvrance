@@ -27,7 +27,7 @@ Site: [nahuelcanavy.com/recouvrance](https://nahuelcanavy.com/recouvrance/)
   find and filters (a workload's, or the checked rows' across namespaces and clusters), shell, attach, a file browser and file copy, port-forwards, YAML with field docs and schema forms,
   Helm, Flux and Argo CD actions, several clusters at once, tabs and windows.
 - **Tells you what is wrong**: a Problems page across clusters, a diagnosis on every broken pod or
-  workload, firing alerts, stuck deletions, CronJobs that stopped running, ExternalSecrets that fail to sync, usage history from
+  workload, firing alerts, stuck deletions, CronJobs that stopped running, ExternalSecrets that fail to sync, certificates failing to renew or about to expire, usage history from
   Prometheus or VictoriaMetrics, certificate expiry, and the Argo CD Application behind an object.
 - **Safe by default**: read-only until you enable writes; writes are confirmed with their
   `kubectl` equivalent (deletes ask as you set per kind), and YAML edits and applies are checked

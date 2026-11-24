@@ -57,6 +57,7 @@ pub(crate) use exec::*;
 pub(crate) use follow::{Follow, Followed, Keep, follow};
 pub(crate) use forward::*;
 pub(crate) use log_pods::*;
+pub(crate) use login::userinfo_end;
 pub(crate) use metrics::*;
 pub(crate) use pod_requests::*;
 pub(crate) use pods::*;
