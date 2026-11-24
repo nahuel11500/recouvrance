@@ -48,6 +48,15 @@ settings untouched. Give it another MCP port too (`{"port": 47199, "version": 1}
 `$XDG_CONFIG_HOME/recouvrance/agents.json`), so it doesn't take 47070 from the Recouvrance you
 have open.
 
+`RECOUVRANCE_BACKTIME=pods,deployments[,rounds]` in a snapshot run lists the first kind, then the
+second, then goes back to the first, `rounds` times (2 by default). Each return prints when its rows
+showed and when it was live, the requests it sent (as Settings → API requests counts them) and the
+process's resident memory (Linux):
+
+```sh
+RECOUVRANCE_CONTEXT=kind-dev RECOUVRANCE_BACKTIME=pods,deployments,3 cargo run --features dev -- --snapshot out.png 8
+```
+
 **Smoke checks**: `RECOUVRANCE_SMOKE=<context> cargo run --features dev` lists types and watches
 pods; add `RECOUVRANCE_LISTTIME=1`, `RECOUVRANCE_PROBLEMS=1` (the Problems scan's time and, on
 Linux, the process's peak memory; `RECOUVRANCE_PROBLEMS=kinds` runs each kind's check alone, with
