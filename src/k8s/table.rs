@@ -952,18 +952,15 @@ pub(super) async fn watch_once(
         }
         // The list on screen wants the metadata of rows listed from their cells: the whole
         // list in one response from the cache, as `list_fast` gets it.
-        _ if fast && pause.wants_metadata() => match list_whole(client, url, tap).await {
-            Ok(listed) => {
-                let _ = tx.unbounded_send(TableMsg::Columns(Arc::new(listed.0.clone())));
-                listed
-            }
-            Err(_) => {
-                let listed =
-                    list_paged_with(client, url, ListParams::default(), extras, tap, None, |_, _, _| {}).await?;
-                let _ = tx.unbounded_send(TableMsg::Columns(Arc::new(listed.0.clone())));
-                listed
-            }
-        },
+        _ if fast && pause.wants_metadata() => {
+            let listed = match list_whole(client, url, tap).await {
+                Ok(listed) => listed,
+                // An API server that can't serve it from its cache: page through it.
+                Err(_) => list_paged_with(client, url, ListParams::default(), extras, tap, None, |_, _, _| {}).await?,
+            };
+            let _ = tx.unbounded_send(TableMsg::Columns(Arc::new(listed.0.clone())));
+            listed
+        }
         FirstList::Pages => {
             // Show rows as pages arrive; big clusters take tens of seconds to list.
             let mut sent_columns = false;
