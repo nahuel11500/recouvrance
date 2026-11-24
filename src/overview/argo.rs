@@ -548,6 +548,7 @@ fn changed_resource(ctx: &Ctx, state: &ArgoGitDiff, i: usize, r: &server::Resour
                         .xsmall()
                         .ghost()
                         .icon(if open { Lucide::ChevronDown } else { Lucide::ChevronRight })
+                        .accessibility_label(if open { "Hide the diff" } else { "Show the diff" })
                         .on_click(move |_, _, cx| {
                             let _ = panel.update(cx, |p, cx| p.toggle_argo_git(i, cx));
                         }),

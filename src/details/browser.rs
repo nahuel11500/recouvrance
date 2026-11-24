@@ -660,6 +660,7 @@ impl FileBrowser {
                     .xsmall()
                     .ghost()
                     .icon(Lucide::ArrowUp)
+                    .accessibility_label("Parent folder")
                     .tooltip("Parent folder")
                     .disabled(at_root)
                     .on_click(cx.listener(move |this, _, window, cx| {
@@ -684,6 +685,7 @@ impl FileBrowser {
                     .xsmall()
                     .ghost()
                     .icon(Lucide::RefreshCw)
+                    .accessibility_label("List this folder again")
                     .tooltip("List this folder again")
                     .on_click(cx.listener(move |this, _, window, cx| {
                         let dir = refresh.clone();
@@ -695,6 +697,7 @@ impl FileBrowser {
                     .xsmall()
                     .ghost()
                     .icon(Lucide::Download)
+                    .accessibility_label("Download this folder")
                     .tooltip("Download this folder to ~/Downloads, as a .tar")
                     .on_click(cx.listener(move |this, _, window, cx| this.download(here.clone(), true, window, cx))),
             )
@@ -875,13 +878,15 @@ impl FileBrowser {
             }
             Debug::Failed(e) => {
                 let key = self.key();
-                let again = Button::new("files-debug-again").xsmall().outline().icon(Lucide::RotateCw);
-                let again = again.label("Look for a debug container again").on_click(cx.listener(
-                    move |this, _, window, cx| {
-                        let key = key.clone();
-                        this.guarded(move |this, window, cx| this.look_for_debug(key, window, cx), window, cx);
-                    },
-                ));
+                let again = Button::new("files-debug-again")
+                    .xsmall()
+                    .outline()
+                    .icon(Lucide::RotateCw)
+                    .label("Look for a debug container again");
+                let again = again.on_click(cx.listener(move |this, _, window, cx| {
+                    let key = key.clone();
+                    this.guarded(move |this, window, cx| this.look_for_debug(key, window, cx), window, cx);
+                }));
                 v_flex()
                     .gap_2()
                     .child(note("Reading it through a debug container failed:"))
@@ -1039,7 +1044,14 @@ impl FileBrowser {
                                     .on_click(download),
                             )
                         })
-                        .child(Button::new("files-preview-close").xsmall().ghost().icon(Lucide::X).on_click(close)),
+                        .child(
+                            Button::new("files-preview-close")
+                                .xsmall()
+                                .ghost()
+                                .icon(Lucide::X)
+                                .accessibility_label("Close the preview")
+                                .on_click(close),
+                        ),
                 )
                 .when_some(facts, |d, f| d.child(div().text_xs().text_color(theme.muted_foreground).child(f)))
                 .child(div().flex_1().min_h_0().flex().flex_col().child(body))

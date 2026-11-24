@@ -14,6 +14,7 @@ use super::{AppView, Route};
 use crate::favorites::{Favorite, Favorites, SavedView};
 use crate::k8s;
 use crate::k8s::Kind;
+use crate::ui::a11y::Control as _;
 
 /// Buttons on the navy sidebar: light text, a slightly lighter hull on hover.
 fn on_hull(cx: &App) -> ButtonCustomVariant {
@@ -158,6 +159,7 @@ impl AppView {
                                 .xsmall()
                                 .custom(on_hull(cx))
                                 .icon(Lucide::ExternalLink)
+                                .accessibility_label("Open in the browser")
                                 .tooltip(format!("Open {url}"))
                                 .on_click(move |_, _, _| crate::forwards::open_url(&url)),
                         )
@@ -167,6 +169,7 @@ impl AppView {
                             .xsmall()
                             .custom(on_hull(cx))
                             .icon(Lucide::X)
+                            .accessibility_label("Stop the port-forward")
                             .on_click(move |_, _, cx| forwards.update(cx, |f, cx| f.stop(id, cx))),
                     )
             }))
@@ -206,6 +209,7 @@ impl AppView {
                             .xsmall()
                             .custom(on_hull(cx))
                             .icon(Lucide::X)
+                            .accessibility_label("Stop the agent's port-forward")
                             .tooltip("Stop the agent's port-forward")
                             .on_click(move |_, _, _| {
                                 hub.stop_forwards(|x| x.id == id);
@@ -242,6 +246,7 @@ impl AppView {
                             .xsmall()
                             .custom(on_hull(cx))
                             .icon(Lucide::Play)
+                            .accessibility_label("Forward again")
                             .tooltip("Forward again")
                             .on_click(cx.listener(move |this, _, _, cx| this.start_saved_forward(start.clone(), cx))),
                     )
@@ -250,6 +255,7 @@ impl AppView {
                             .xsmall()
                             .custom(on_hull(cx))
                             .icon(Lucide::X)
+                            .accessibility_label("Forget this port-forward")
                             .tooltip("Forget it")
                             .on_click(cx.listener(move |_, _, _, cx| {
                                 crate::forwards::forget(&forget);
@@ -311,13 +317,17 @@ impl AppView {
     fn sidebar_header(&self, cx: &mut Context<Self>) -> Div {
         let context = match self.clusters.len() {
             0 if self.connecting => {
-                format!("Connecting to {}…", self.context.clone().unwrap_or_default())
+                format!("Connecting to {}…", k8s::short_names::short_name(self.context.as_deref().unwrap_or_default()))
             }
             0 => "Not connected".into(),
-            1 => self.clusters[0].0.clone(),
+            1 => k8s::short_names::short_name(&self.clusters[0].0),
             n => format!("{n} contexts"),
         };
-        let names: Vec<&str> = self.clusters.iter().map(|c| c.0.as_str()).collect();
+        // The full names, which the label shortens.
+        let mut names: Vec<&str> = self.clusters.iter().map(|c| c.0.as_str()).collect();
+        if names.is_empty() && self.connecting {
+            names.extend(self.context.as_deref());
+        }
         let tip = SharedString::from(if names.is_empty() {
             "Manage contexts".to_string()
         } else {
@@ -338,6 +348,8 @@ impl AppView {
                     .text_ellipsis()
                     .whitespace_nowrap()
                     .cursor_pointer()
+                    .control(Role::Button, "Manage contexts", cx.theme().sidebar_primary)
+                    .aria_description(context.clone())
                     .on_click(cx.listener(|this, _, _, cx| this.navigate(Route::Contexts, cx)))
                     .tooltip(move |w, cx| component::tooltip::Tooltip::new(tip.clone()).build(w, cx))
                     .child(context),
@@ -347,6 +359,8 @@ impl AppView {
                     .xsmall()
                     .custom(on_hull(cx))
                     .icon(Lucide::ArrowLeft)
+                    .accessibility_label("Back")
+                    .tooltip(super::with_keys("Back ({alt-left|cmd-[})"))
                     .disabled(self.pos == 0)
                     .on_click(cx.listener(|this, _, _, cx| this.go(-1, cx))),
             )
@@ -355,6 +369,8 @@ impl AppView {
                     .xsmall()
                     .custom(on_hull(cx))
                     .icon(Lucide::ArrowRight)
+                    .accessibility_label("Forward")
+                    .tooltip(super::with_keys("Forward ({alt-right|cmd-]})"))
                     .disabled(self.pos + 1 >= self.history.len())
                     .on_click(cx.listener(|this, _, _, cx| this.go(1, cx))),
             )
@@ -371,7 +387,7 @@ impl AppView {
         let badge = |n: usize, color: Hsla| {
             div().px_1p5().rounded_full().text_xs().bg(color).text_color(hull).child(n.to_string())
         };
-        let pending = self.approvals.len();
+        let pending = self.approvals.read(cx).waiting_count();
         let nav_row = |id, icon, label, on| nav_row(id, icon, label, on, query, colors);
         [
             nav_row("nav-agents", Lucide::Bot, "Agents", route.is_agents())
@@ -574,6 +590,8 @@ impl AppView {
                         .text_color(colors.fg)
                         .cursor_pointer()
                         .hover(|s| s.bg(colors.active_bg.opacity(0.6)))
+                        .control(Role::Button, group.clone(), colors.brass)
+                        .aria_expanded(open)
                         .on_click(cx.listener(move |this, _, _, cx| {
                             if !this.expanded_groups.remove(&g) {
                                 this.expanded_groups.insert(g.clone());
@@ -619,6 +637,8 @@ impl AppView {
             .when(foldable, |d| {
                 d.cursor_pointer()
                     .hover(|s| s.bg(colors.active_bg.opacity(0.6)))
+                    .control(Role::Button, section, colors.brass)
+                    .aria_expanded(!shut)
                     .child(
                         Icon::new(if shut { IconName::ChevronRight } else { IconName::ChevronDown })
                             .size_3()
@@ -699,9 +719,12 @@ fn nav_row(
     query: &str,
     colors: Colors,
 ) -> Stateful<Div> {
+    // A row the filter hides is no tab stop either: gpui still registers a hidden element's focus.
+    let shown = label.to_lowercase().contains(query);
     h_flex()
         .id(id)
-        .when(!label.to_lowercase().contains(query), Styled::hidden)
+        .when(!shown, Styled::hidden)
+        .when(shown, |d| d.control(Role::Link, label, colors.brass).aria_selected(on))
         .gap_2()
         .px_2()
         .py_1()
@@ -743,10 +766,15 @@ fn kind_row(
         .border_color(if is_selected { colors.brass } else { transparent_black() })
         .when(is_selected, |d| d.bg(colors.active_bg))
         .hover(|s| s.bg(colors.active_bg.opacity(0.6)))
+        .control(Role::Link, label.clone(), colors.brass)
+        .aria_selected(is_selected)
         .child(div().flex_1().min_w_0().overflow_hidden().text_ellipsis().whitespace_nowrap().child(label))
         .child(
+            // Named for screen readers; the keyboard stars the type on screen with `*`.
             div()
                 .id(SharedString::from(format!("star-{group}")))
+                .role(Role::Button)
+                .aria_label(if starred { "Remove from favorites" } else { "Add to favorites" })
                 .when(!starred, |d| d.opacity(0.).group_hover(group.clone(), |s| s.opacity(0.5)))
                 .on_click(move |_, _, cx| {
                     cx.stop_propagation();
@@ -780,6 +808,8 @@ fn two_line_row(
         .text_sm()
         .cursor_pointer()
         .hover(|s| s.bg(colors.active_bg.opacity(0.6)))
+        .control(Role::Link, title.clone(), colors.brass)
+        .aria_description(detail.clone())
         .child(
             v_flex()
                 .flex_1()
@@ -790,6 +820,8 @@ fn two_line_row(
         .child(
             div()
                 .id(remove_id)
+                .role(Role::Button)
+                .aria_label("Remove")
                 .opacity(0.)
                 .group_hover(id.0, |s| s.opacity(0.6))
                 .on_click(move |_, _, cx| {

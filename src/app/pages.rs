@@ -50,6 +50,11 @@ impl AppView {
         self.page_scopes.insert(page, scope);
     }
 
+    /// Whether a page was built for the contexts connected now, whatever its namespaces.
+    pub(super) fn clusters_match(&self, page: EntityId) -> bool {
+        self.page_scopes.get(&page).is_some_and(|(clusters, _)| self.clusters.iter().map(|(c, _)| c).eq(clusters))
+    }
+
     /// Whether a page was built for the contexts and namespaces shown now.
     pub(super) fn scope_matches(&self, page: EntityId) -> bool {
         self.page_scopes.get(&page) == Some(&self.page_scope())
@@ -238,6 +243,21 @@ impl AppView {
             Ok(_) => {}
             Err(e) => window.push_notification(Notification::error(e), cx),
         });
+    }
+
+    /// Open an Argo CD Application on its hub from the Problems page: with the client the hub
+    /// was found with, else connected anew (released with the page).
+    pub(super) fn follow_hub_links(
+        &mut self,
+        page: &Entity<crate::ui::problems_view::ProblemsView>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        cx.subscribe_in(page, window, |this, page, ev: &crate::details::OpenOn, window, cx| {
+            let own = k8s::argo::known_client(&ev.context).map(|client| (ev.context.clone(), client));
+            this.open_on(ev.context.clone(), ev.res.clone(), own, page.entity_id(), window, cx);
+        })
+        .detach();
     }
 
     /// Open an Application (on Argo CD's cluster) or where it deploys, from the Argo CD page

@@ -14,7 +14,8 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use kube::Client;
 
-use crate::details::OpenObject;
+use crate::details::{OpenObject, OpenOn};
+use crate::k8s::argo::diagnosis::Res;
 use crate::k8s::lane::Lane;
 use crate::k8s::{self, Kind};
 use crate::problems::shared::{self, Ask, Found, Fresh};
@@ -29,7 +30,8 @@ const LOOK_AGAIN: Duration = Duration::from_secs(30);
 const POLL: Duration = Duration::from_millis(500);
 
 /// What the page says while nothing was scanned yet.
-const CHECKING: &str = "Checking nodes, workloads, pods, jobs, services, ingresses, volumes, references and deletions…";
+const CHECKING: &str =
+    "Checking nodes, workloads, pods, jobs, services, ingresses, volumes, references, deletions and Argo CD…";
 
 /// A cluster the page shows: the namespaces picked, and the scope the window's badge scans.
 struct Watched {
@@ -110,6 +112,7 @@ pub struct ProblemsView {
 }
 
 impl EventEmitter<OpenObject> for ProblemsView {}
+impl EventEmitter<OpenOn> for ProblemsView {}
 
 impl ProblemsView {
     pub fn new(
@@ -276,13 +279,27 @@ impl ProblemsView {
             namespace: p.namespace.clone(),
             context: Some(ctx.clone()),
         };
+        // An Argo CD Application opens on its hub, which may not be connected.
+        let on_hub = p.on_hub.as_ref().map(|hub| OpenOn {
+            context: hub.context.clone(),
+            res: Res {
+                group: "argoproj.io".into(),
+                kind: "Application".into(),
+                namespace: hub.namespace.clone(),
+                name: p.name.clone(),
+                version: "v1alpha1".into(),
+            },
+        });
         cells(&theme, multi.then_some(ctx.as_str()), p, color)
             .id(("problem", i))
             // An alert about no object in particular has nothing to open.
             .when(!p.kind.is_empty(), |d| {
-                d.cursor_pointer()
-                    .hover(|s| s.bg(theme.list_hover))
-                    .on_click(cx.listener(move |_, _, _, cx| cx.emit(ev.clone())))
+                d.cursor_pointer().hover(|s| s.bg(theme.list_hover)).on_click(cx.listener(move |_, _, _, cx| {
+                    match &on_hub {
+                        Some(on) => cx.emit(on.clone()),
+                        None => cx.emit(ev.clone()),
+                    }
+                }))
             })
             .into_any_element()
     }
@@ -307,7 +324,19 @@ fn cells(theme: &component::Theme, context: Option<&str>, p: &Problem, color: Hs
         .border_color(theme.border)
         .child(div().size(px(8.)).flex_shrink_0().rounded_full().bg(color))
         .when_some(context, |d, ctx| {
-            d.child(side(150., 70.).text_sm().text_color(theme.muted_foreground).child(ctx.to_string()))
+            // The short name, as everywhere on screen; a shortened one shows in full on hover.
+            let short = k8s::short_names::short_name(ctx);
+            let cell = side(150., 70.).text_sm().text_color(theme.muted_foreground);
+            if short == ctx {
+                d.child(cell.child(short))
+            } else {
+                let full = SharedString::from(ctx.to_string());
+                d.child(
+                    cell.id("problem-context")
+                        .tooltip(move |w, cx| component::tooltip::Tooltip::new(full.clone()).build(w, cx))
+                        .child(short),
+                )
+            }
         })
         .child(side(160., 80.).text_xs().text_color(theme.muted_foreground).child(p.label.clone()))
         .child(
@@ -542,6 +571,7 @@ mod tests {
             name: name.into(),
             reason: reason.into(),
             age: None,
+            on_hub: None,
         };
         let alert = p(Severity::Warning, "Pod alert", "pods", "monitoring", "prom-0", "NodeMemoryMajorPagesFaults");
         let svc = p(Severity::Warning, "Service", "services", "monitoring", "nginx", "selects no pod");
@@ -613,6 +643,7 @@ mod tests {
             name: name.into(),
             reason: "CrashLoopBackOff".into(),
             age: None,
+            on_hub: None,
         };
         let (found, errors) = super::merge(vec![
             ("one".into(), vec![problem(Severity::Warning, "w")], Some("Nodes (forbidden)".into())),
@@ -649,6 +680,7 @@ mod layout_tests {
                 name: "fraud-check-b668cf779-k6km9".into(),
                 reason: "0 of 1 replicas available".into(),
                 age: None,
+                on_hub: None,
             };
             let ctx = self.several.then_some("kind-staging");
             div().w(px(self.width)).child(super::cells(&theme, ctx, &p, theme.warning))

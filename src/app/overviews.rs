@@ -96,9 +96,13 @@ impl AppView {
             cx.notify();
             return;
         }
+        // An unscoped one was built for the clusters connected then: one that joined after
+        // the first rows (see `reach`) is missing from it.
         let existing = which.reused().then(|| {
             self.history.iter().find(|r| {
-                Overview::of(r).is_some_and(|(w, id)| w == which && (!which.scoped() || self.scope_matches(id)))
+                Overview::of(r).is_some_and(|(w, id)| {
+                    w == which && if which.scoped() { self.scope_matches(id) } else { self.clusters_match(id) }
+                })
             })
         });
         let route = match existing.flatten() {
@@ -109,7 +113,7 @@ impl AppView {
     }
 
     /// A new overview page for what is picked now, its links wired to the window.
-    fn build_overview(&mut self, which: Overview, window: &mut Window, cx: &mut Context<Self>) -> Route {
+    pub(super) fn build_overview(&mut self, which: Overview, window: &mut Window, cx: &mut Context<Self>) -> Route {
         let (clusters, scope, namespaces) = (self.clusters.clone(), self.namespace_scope(), self.namespaces.clone());
         let route = match which {
             Overview::Cluster => {
@@ -126,6 +130,7 @@ impl AppView {
                 let kinds = self.cluster_kinds();
                 let page = cx.new(|cx| ProblemsView::new(scope, kinds, namespaces, window, cx));
                 self.follow_links(&page, window, cx);
+                self.follow_hub_links(&page, window, cx);
                 Route::Problems(page)
             }
             Overview::Timeline => {
@@ -145,9 +150,8 @@ impl AppView {
                 Route::Argo(page)
             }
         };
-        if which.scoped()
-            && let Some((_, id)) = Overview::of(&route)
-        {
+        // Every one: a scoped one by its clusters and namespaces, the others by their clusters.
+        if let Some((_, id)) = Overview::of(&route) {
             self.remember_scope(id);
         }
         route

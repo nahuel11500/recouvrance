@@ -63,9 +63,16 @@ impl TableDelegate for ResourceTable {
         }
         let name = self.header(col).to_string();
         let bars = matches!(col, Col::Cpu | Col::Memory) && (self.capacity.is_some() || self.pods);
-        let width = self.widths.get(&name).copied().unwrap_or_else(|| default_width(col, &name, self.nodes, bars));
+        let shape = if self.nodes {
+            Shape::Nodes
+        } else if self.pods {
+            Shape::Pods
+        } else {
+            Shape::Other
+        };
+        let width = self.widths.get(&name).copied().unwrap_or_else(|| default_width(col, &name, shape, bars));
         // Room for the usage bars: widths saved before they existed were 90.
-        let width = if bars { width.max(170.) } else { width };
+        let width = if bars { width.max(bar_min(shape)) } else { width };
         // Not `.sort()`: the table's own control shows a two-way arrow on every column.
         // `render_th` sorts on a click and shows one arrow, on the sorted column only.
         Column::new(format!("c{col_ix}"), name).width(px(width * crate::app::zoom(cx))).movable(!self.is_fixed(col))
@@ -370,12 +377,21 @@ impl TableDelegate for ResourceTable {
         if col == Col::Context {
             let dot: Hsla =
                 crate::settings::context_color(&cell).map_or(theme.muted_foreground.opacity(0.4), |c| rgb(c).into());
-            return h_flex()
+            // The short name on screen (and to sort by), the full one on hover and in `context:` filters.
+            let short = k8s::short_names::short_name(&cell);
+            let full = (short != *cell).then(|| SharedString::from(cell.into_owned()));
+            let drawn = h_flex()
                 .gap_2()
                 .overflow_hidden()
                 .child(div().size(px(8.)).flex_shrink_0().rounded_full().bg(dot))
-                .child(div().overflow_hidden().text_ellipsis().whitespace_nowrap().child(cell.into_owned()))
-                .into_any_element();
+                .child(div().overflow_hidden().text_ellipsis().whitespace_nowrap().child(short));
+            return match full {
+                Some(full) => drawn
+                    .id(SharedString::from(format!("cx-{ctx}-{}-{col_ix}", row.uid)))
+                    .tooltip(move |w, cx| component::tooltip::Tooltip::new(full.clone()).build(w, cx))
+                    .into_any_element(),
+                None => drawn.into_any_element(),
+            };
         }
         let mut color = None;
         let mut weight = None;
@@ -638,17 +654,45 @@ fn ready_total(cell: &str) -> Option<usize> {
     cell.split_once('/')?.1.parse().ok()
 }
 
+/// The narrowest a usage bar column gets: its figure, a gap and a bar still worth reading.
+/// A node's cell also shows a 34 px percentage, so it needs more than a pod's.
+fn bar_min(shape: Shape) -> f32 {
+    if shape == Shape::Pods { 140. } else { 170. }
+}
+
+/// The padding `DataTable::small()` puts inside every cell, left and right, within the column
+/// width (`Size::Small.table_cell_padding()`).
+#[cfg(test)]
+const CELL_PADDING: f32 = 12.;
+
+/// The kind a table lists, as far as its default widths go.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Shape {
+    Pods,
+    Nodes,
+    Other,
+}
+
 /// A column's width (at zoom 1) before the user resizes it.
-fn default_width(col: Col, name: &str, nodes: bool, bars: bool) -> f32 {
+fn default_width(col: Col, name: &str, shape: Shape, bars: bool) -> f32 {
+    let pods = shape == Shape::Pods;
     match (col, name) {
+        // Pods: Name gives up a little so Status, Restarts and Age fit the default window.
+        (_, "Name") if pods => 300.,
         (_, "Name") => 340.,
         (_, "Message") => 640.,
         (_, "Object") => 320.,
         (_, "Last Seen" | "Type") => 90.,
         (Col::Namespace | Col::Context, _) => 170.,
+        (Col::Cpu | Col::Memory, _) if bars && pods => 150.,
         (Col::Cpu | Col::Memory, _) if bars => 190.,
         // kubectl's words ("NotReady,SchedulingDisabled") and then the trouble taints.
-        (_, "Status") if nodes => 230.,
+        (_, "Status") if shape == Shape::Nodes => 230.,
+        // The words people open the pods list for: "CrashLoopBackOff", "ContainerCreating".
+        (_, "Status") if pods => 160.,
+        // One 8 px dot a container, then the count: four containers (an app and its sidecars).
+        (_, "Ready") if pods => 85.,
+        (_, "Age") if pods => 70.,
         (_, "Age" | "Ready" | "Restarts" | "Status" | "CPU" | "Memory") => 90.,
         _ => 150.,
     }
@@ -656,16 +700,77 @@ fn default_width(col: Col, name: &str, nodes: bool, bars: bool) -> f32 {
 
 #[cfg(test)]
 mod width_tests {
-    use super::{Col, default_width};
+    use super::{CELL_PADDING, Col, Shape, bar_min, default_width};
+
+    /// About 7.5 px a character at 14 px, after the 13 px status dot and the cell's padding.
+    fn needed(text: &str) -> f32 {
+        text.chars().count() as f32 * 7.5 + 13. + CELL_PADDING
+    }
+
+    #[test]
+    fn pod_ready_fits_four_containers() {
+        // Per container an 8 px dot and a 4 px gap, then 4 px before the "4/4" count in
+        // extra-small text (about 7 px a character).
+        let containers = 4.;
+        let content = containers * (8. + 4.) + 4. + 3. * 7.;
+        let ready = default_width(Col::Cell(1), "Ready", Shape::Pods, false);
+        assert!(ready >= content + CELL_PADDING, "{ready}");
+    }
+
+    #[test]
+    fn node_bars_keep_room_for_the_percentage() {
+        // A node's bar cell: a 56 px figure, a 34 px percentage, two 8 px gaps and a bar.
+        let fixed = 56. + 34. + 2. * 8. + CELL_PADDING;
+        assert!(bar_min(Shape::Nodes) - fixed >= 50.);
+        assert!(bar_min(Shape::Pods) <= bar_min(Shape::Nodes));
+    }
 
     #[test]
     fn node_status_fits_kubectl_words() {
-        // About 7.5 px a character at 14 px, after the 13 px status dot.
-        let needed = |text: &str| text.chars().count() as f32 * 7.5 + 13.;
-        let node = default_width(Col::Cell(1), "Status", true, false);
+        let node = default_width(Col::Cell(1), "Status", Shape::Nodes, false);
         assert!(node >= needed("NotReady,SchedulingDisabled"), "{node}");
         // Other kinds keep a narrow Status ("Running", "Bound").
-        assert!(default_width(Col::Cell(1), "Status", false, false) < node);
+        assert!(default_width(Col::Cell(1), "Status", Shape::Other, false) < node);
+    }
+
+    #[test]
+    fn pod_status_fits_kubectl_words() {
+        let status = default_width(Col::Cell(2), "Status", Shape::Pods, false);
+        for word in [
+            "CrashLoopBackOff",
+            "ImagePullBackOff",
+            "ContainerCreating",
+            "PodInitializing",
+            "ErrImagePull",
+            "Terminating",
+        ] {
+            assert!(status >= needed(word), "{word}: {status}");
+        }
+    }
+
+    #[test]
+    fn pods_table_fits_the_default_window() {
+        // kubectl's pod columns with every namespace shown, the checkbox and the usage bars,
+        // in the order `insert_usage_cols` puts them.
+        let cols = [
+            (Col::Namespace, "Namespace"),
+            (Col::Cell(0), "Name"),
+            (Col::Cell(1), "Ready"),
+            (Col::Cell(2), "Status"),
+            (Col::Cell(3), "Restarts"),
+            (Col::Age(4), "Age"),
+            (Col::Cpu, "CPU"),
+            (Col::Memory, "Memory"),
+        ];
+        let bars = |col: Col| matches!(col, Col::Cpu | Col::Memory);
+        let total: f32 =
+            36. + cols.iter().map(|(col, name)| default_width(*col, name, Shape::Pods, bars(*col))).sum::<f32>();
+        // The page beside the default sidebar, less a scrollbar.
+        let room = crate::settings::WINDOW_SIZE.0 - crate::settings::SIDEBAR_WIDTH - 16.;
+        assert!(total <= room, "{total} > {room}");
+        for col in [Col::Cpu, Col::Memory] {
+            assert!(default_width(col, "", Shape::Pods, true) >= bar_min(Shape::Pods));
+        }
     }
 }
 

@@ -16,7 +16,7 @@ use crate::details::DetailPanel;
 use crate::favorites::{ColumnPrefs, Favorites};
 use crate::forwards::Forwards;
 use crate::k8s::{self, Kind, TaskGuard};
-use crate::mcp::{self, Approval, Hub, HubEvent};
+use crate::mcp::{self, Hub, HubEvent};
 use crate::table::ResourceTable;
 use crate::ui::cluster::ClusterOverview;
 use crate::ui::ctx_picker::{ContextEvent, ContextPicker};
@@ -25,9 +25,13 @@ use crate::ui::helm::{HelmList, HelmRelease};
 use crate::ui::ns_picker::{NamespacePicked, NamespacePicker, NamespacesChanged};
 use crate::ui::palette::Palette;
 use crate::ui::settings_view::SettingsView;
+use banners::ApprovalStrip;
 
+mod banners;
 mod chrome;
 pub(crate) mod commands;
+pub(crate) mod conn;
+mod connect_view;
 mod contexts;
 #[cfg(feature = "dev")]
 mod demo;
@@ -40,6 +44,7 @@ mod overviews;
 mod pages;
 mod pinned;
 mod problem_badge;
+mod reach;
 mod render;
 mod search_index;
 mod session;
@@ -421,7 +426,8 @@ pub struct AppView {
     /// The tab strip's sideways scroll.
     tab_scroll: ScrollHandle,
     agents: Entity<AgentsView>,
-    approvals: Vec<Arc<Approval>>,
+    /// The approval banners: those waiting, and those that just went, kept a moment.
+    approvals: Entity<ApprovalStrip>,
     /// Redraws the banner's countdown each second while a request waits.
     countdown: Option<Task<()>>,
     /// How many requests the window title last said were waiting.
@@ -505,6 +511,11 @@ pub struct AppView {
     table: Entity<TableState<ResourceTable>>,
     /// Contexts that failed to connect, until the next connect.
     connect_errors: Option<SharedString>,
+    /// Each context of the set that can't show rows: connecting, or why it failed.
+    conn: conn::ConnStates,
+    /// What the bar above the list says of the connect besides each context's state (a
+    /// namespace list that failed, the kubeconfig that can't be read).
+    connect_notes: Option<SharedString>,
     watch: Option<watch::ListWatch>,
     metrics: Option<Vec<(TaskGuard, Task<()>)>>,
     /// The timeline's own watches (`timeline.kinds`), while connected.
@@ -512,6 +523,16 @@ pub struct AppView {
     /// A connect is in flight (`_connect` stays set once it is done).
     connecting: bool,
     _connect: Option<Task<()>>,
+    /// The Pods lists the connect started before discovery answered, until the list's watch
+    /// takes them over (see `reach::EarlyList`).
+    early: Option<reach::EarlyLists>,
+    /// A cluster joined after the first rows (see `reach`): the session's tabs were reopened
+    /// without what only it has, so the session is not saved over until every cluster of the
+    /// set is in (`joined_whole`) or the next connect.
+    joined_late: bool,
+    /// The tabs as a connect that left clusters connecting ended with: once they have all
+    /// joined, the session is reopened whole only if the user didn't change them since.
+    partial_tabs: Option<(Vec<crate::settings::SavedTab>, usize)>,
     /// The set of contexts picked (`settings::session_set`), whose session this window saves;
     /// empty when none is saved (not connected yet, or contexts given by a developer hook).
     session_key: Vec<String>,
@@ -575,6 +596,7 @@ impl AppView {
                         t.delegate_mut().set_filter(text);
                         cx.notify();
                     });
+                    this.labels_for_filter(cx);
                     this.follow_selection(cx);
                     this.session_changed(cx);
                 }
@@ -692,6 +714,7 @@ impl AppView {
         // Subscribe first: the agents view reads the last status, later ones arrive here.
         let mut hub_rx = hub.subscribe();
         let agents = cx.new(|cx| AgentsView::new(hub.clone(), window, cx));
+        let approvals = cx.new(|_| ApprovalStrip::new(hub.clone()));
         let hub_events = cx.spawn_in(window, async move |this, cx| {
             while let Some(ev) = hub_rx.next().await {
                 let alive = this.update_in(cx, |this, window, cx| this.on_hub_event(&ev, window, cx));
@@ -710,6 +733,7 @@ impl AppView {
         window.focus(&focus, cx);
         table.update(cx, |t, _| t.delegate_mut().app_focus = Some(focus.clone()));
         let settings_view = cx.new(|cx| SettingsView::new(hub.clone(), window, cx));
+        k8s::short_names::set_contexts(&contexts);
         let mut this = Self {
             settings_view,
             terminals: HashMap::new(),
@@ -729,7 +753,7 @@ impl AppView {
             }],
             pos: 0,
             agents,
-            approvals: Vec::new(),
+            approvals,
             countdown: None,
             title_waiting: None,
             _hub_events: hub_events,
@@ -774,11 +798,16 @@ impl AppView {
             forwards_open: false,
             table,
             // A kubeconfig that can't be read shows where connect errors do.
+            connect_notes: status.clone(),
             connect_errors: status,
+            conn: conn::ConnStates::default(),
             watch: None,
             metrics: None,
             connecting: false,
             _connect: None,
+            early: None,
+            joined_late: false,
+            partial_tabs: None,
             session_key: Vec::new(),
             restore: if first_window { session::Restore::FirstConnect } else { session::Restore::Off },
             view_id: cx.entity_id(),
@@ -809,14 +838,15 @@ impl AppView {
         }
         this.watch_kubeconfigs(window, cx);
         // The window has a name in task switchers and for screen readers.
-        this.show_waiting(window);
+        this.show_waiting(window, cx);
         this
     }
 
     fn on_hub_event(&mut self, ev: &HubEvent, window: &mut Window, cx: &mut Context<Self>) {
         match ev {
             HubEvent::ApprovalRequested(a) => {
-                self.approvals.push(a.clone());
+                let request = a.clone();
+                self.approvals.update(cx, |s, cx| s.requested(request, cx));
                 // Every window flashes in the taskbar or bounces the Dock (nothing happens to
                 // the one in front): an approval nobody sees is refused after 2 minutes.
                 window.request_attention();
@@ -831,17 +861,17 @@ impl AppView {
                     notify_desktop(&format!("{} asks to run {}", a.agent, a.tool), &body);
                 }
             }
-            HubEvent::ApprovalResolved(id) => self.approvals.retain(|a| a.id != *id),
+            HubEvent::ApprovalResolved(id) => self.approvals.update(cx, |s, cx| s.resolved(*id, cx)),
             HubEvent::ServerStatus(status) => {
                 let status = status.clone();
                 self.agents.update(cx, |v, cx| {
-                    v.server_status = status;
+                    v.set_server_status(status, cx);
                     cx.notify();
                 });
             }
             HubEvent::Audit(_) | HubEvent::AgentSeen | HubEvent::Forwards => {}
         }
-        self.show_waiting(window);
+        self.show_waiting(window, cx);
         // The agents screen shows live activity and connection state.
         self.agents.update(cx, |_, cx| cx.notify());
         cx.notify();
@@ -849,8 +879,8 @@ impl AppView {
 
     /// The window title says how many requests wait, so a window behind others or in a
     /// task switcher shows it. Set only when the count changes.
-    fn show_waiting(&mut self, window: &mut Window) {
-        let waiting = self.approvals.len();
+    fn show_waiting(&mut self, window: &mut Window, cx: &App) {
+        let waiting = self.approvals.read(cx).waiting_count();
         if self.title_waiting != Some(waiting) {
             self.title_waiting = Some(waiting);
             window.set_window_title(&window_title(waiting));
@@ -867,12 +897,12 @@ impl AppView {
             loop {
                 cx.background_executor().timer(std::time::Duration::from_secs(1)).await;
                 let waiting = this.update(cx, |this, cx| {
-                    if this.approvals.is_empty() {
+                    if this.approvals.read(cx).waiting_count() == 0 {
                         this.countdown = None;
                         return false;
                     }
                     if !this.window_hidden {
-                        cx.notify();
+                        this.approvals.update(cx, |_, cx| cx.notify());
                     }
                     true
                 });

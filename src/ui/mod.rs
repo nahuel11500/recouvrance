@@ -1,6 +1,7 @@
 //! Pages and widgets that are not the main window's own: settings, agents' helpers,
 //! pickers, terminal, Helm, Argo CD, apply, cluster and workloads overviews.
 
+pub mod a11y;
 pub mod access_view;
 pub mod api_requests;
 pub mod apply_view;

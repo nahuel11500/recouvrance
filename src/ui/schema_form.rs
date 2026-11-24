@@ -573,6 +573,7 @@ impl Render for SchemaForm {
                             .xsmall()
                             .ghost()
                             .icon(Lucide::RefreshCw)
+                            .accessibility_label("Read the document again")
                             .tooltip("Read the document under the cursor again")
                             .on_click(cx.listener(|this, _, w, cx| this.reload(w, cx))),
                     )

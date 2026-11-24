@@ -27,6 +27,7 @@ mod workloads;
 
 use crate::json::{arr_at as arr, i64_at as n, str_at as s};
 use access::{binding_page, role_page, service_account_page};
+pub(crate) use alerts::AlertRule;
 pub(crate) use argo::{ArgoGitDiff, ArgoResources};
 pub(crate) use config::*;
 pub(crate) use network::same_parent;
@@ -229,6 +230,8 @@ pub struct Ctx<'a> {
     pub argo_resources: &'a ArgoResources,
     /// An Application's diff as Argo CD renders it from git, once asked for.
     pub argo_git: &'a ArgoGitDiff,
+    /// The alert whose rule is shown, and its read.
+    pub alert_rule: &'a AlertRule,
     /// The context the object is read on (for an Application, its Argo CD's).
     pub context: &'a str,
 }
@@ -886,7 +889,7 @@ mod tests {
     fn pods_are_indexed_with_their_usage_and_requests() {
         let pod = json!({
             "metadata": {"name": "web-1", "namespace": "shop"},
-            "spec": {"containers": [{"name": "app", "resources": {"requests": {"cpu": "250m"}}}]},
+            "spec": {"nodeName": "n1", "containers": [{"name": "app", "resources": {"requests": {"cpu": "250m"}}}]},
             "status": {"phase": "Running"}
         });
         let stats = json!({"pods": [{
