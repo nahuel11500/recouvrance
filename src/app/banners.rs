@@ -20,7 +20,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gpui_kit::assets::IconName as Lucide;
-use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::button::Button;
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::{ActiveTheme as _, Disableable as _, Icon, Sizable as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
@@ -160,24 +160,22 @@ pub enum Choice {
     Always,
 }
 
+/// Sends a request's answer: its id, and whether it is approved.
+type SendAnswer = dyn Fn(&Hub, u64, bool);
+
 /// The approval banners of a window.
 pub struct ApprovalStrip {
     banners: Banners<Arc<Approval>>,
     hub: Arc<Hub>,
     /// Sends an answer (the hub; a test records them).
-    answer: Rc<dyn Fn(&Hub, u64, bool)>,
+    answer: Rc<SendAnswer>,
     /// Wakes when a banner that went is to be taken away, or one turns its buttons on.
     wake: Option<Task<()>>,
 }
 
 impl ApprovalStrip {
     pub fn new(hub: Arc<Hub>) -> Self {
-        Self {
-            banners: Banners::default(),
-            hub,
-            answer: Rc::new(|hub, id, yes| hub.resolve_approval(id, yes)),
-            wake: None,
-        }
+        Self { banners: Banners::default(), hub, answer: Rc::new(Hub::resolve_approval), wake: None }
     }
 
     /// The clock: the executor's, so tests can move it.
@@ -501,6 +499,9 @@ mod view_tests {
     use super::{ARM, ApprovalStrip, LINGER};
     use crate::mcp::{Approval, Hub};
 
+    /// The answers sent: the request's id, and whether it was approved.
+    type Answers = Rc<RefCell<Vec<(u64, bool)>>>;
+
     fn approval(id: u64) -> Arc<Approval> {
         Arc::new(Approval {
             id,
@@ -518,9 +519,7 @@ mod view_tests {
     }
 
     /// The banners in a window, with the answers they send.
-    fn strip(
-        cx: &mut TestAppContext,
-    ) -> (Entity<ApprovalStrip>, Rc<RefCell<Vec<(u64, bool)>>>, &mut VisualTestContext) {
+    fn strip(cx: &mut TestAppContext) -> (Entity<ApprovalStrip>, Answers, &mut VisualTestContext) {
         cx.update(gpui_kit::init);
         let answers = Rc::new(RefCell::new(Vec::new()));
         let sent = answers.clone();
