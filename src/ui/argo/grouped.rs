@@ -154,7 +154,7 @@ pub(super) fn flip(selected: &mut HashSet<Key>, keys: Vec<Key>) {
 /// that the filter keeps (their index, in order), and how many picked it hides.
 pub(super) fn split_picks(listed: &[(usize, Key)], keeps: &[bool], selected: &HashSet<Key>) -> (Vec<usize>, usize) {
     let (mut shown, mut hidden) = (Vec::new(), 0);
-    for (i, k) in listed.iter().filter(|(_, k)| selected.contains(k)) {
+    for (i, _) in listed.iter().filter(|(_, k)| selected.contains(k)) {
         if keeps.get(*i).copied().unwrap_or(false) {
             shown.push(*i);
         } else {

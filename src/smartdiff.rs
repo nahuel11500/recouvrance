@@ -666,11 +666,11 @@ fn classify(key: &ObjectKey, b: &Value, a: &Value, renames: &Renames) -> (Found,
     for leaf in leaves(b, a).into_iter().flat_map(|l| split_data(key, l)) {
         let in_template = in_pod_template(&leaf.path);
         if let Some((fact, digest_too)) = image_leaf(&leaf) {
+            template_fact |= in_template;
+            add(fact, Some(&leaf), &mut facts);
             if digest_too {
                 noise.push(Noise { rule: rules::DIGEST, path: leaf.path, own_line: false });
             }
-            template_fact |= in_template;
-            add(fact, Some(&leaf), &mut facts);
             continue;
         }
         if let Some(rule) = rules::noise_of(key, &leaf, renames) {
@@ -714,7 +714,7 @@ impl Found {
 
     /// Add `fact`, read from `leaf`: once, its hash folding in every leaf it was read from.
     fn add(&mut self, fact: Fact, leaf: Option<&Leaf>) {
-        use std::hash::{Hash as _, Hasher as _};
+        use std::hash::Hasher as _;
         let mut h = std::collections::hash_map::DefaultHasher::new();
         if let Some(l) = leaf {
             hash_value(l.before.as_ref(), &mut h);
