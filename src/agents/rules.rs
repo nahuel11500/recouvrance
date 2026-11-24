@@ -267,6 +267,8 @@ impl AgentsView {
         };
         let verdict =
             (!context.is_empty() && !resource.is_empty()).then(|| self.resolved(&agent.policy).decide(&access));
+        // The MCP server refuses writes to a read-only context before the rules decide.
+        let read_only = t.verb.is_write() && crate::settings::is_read_only(&context);
         let verbs = h_flex().flex_wrap().gap_1().children(Verb::ALL.into_iter().enumerate().map(|(i, verb)| {
             Button::new(("test-verb", i))
                 .xsmall()
@@ -297,6 +299,17 @@ impl AgentsView {
                     .text_sm()
                     .text_color(theme.muted_foreground)
                     .child("Fill in a context and a resource to test."),
+                Some(_) if read_only => div().child(
+                    h_flex()
+                        .gap_2()
+                        .text_sm()
+                        .child(div().font_weight(FontWeight::SEMIBOLD).text_color(theme.danger).child("Denied"))
+                        .child(
+                            div()
+                                .text_color(theme.muted_foreground)
+                                .child("the context is read-only (Settings → Contexts), whatever the rules say"),
+                        ),
+                ),
                 Some(v) => {
                     let (color, word) = match v.mode {
                         Mode::Allow => (theme.success, "Allowed"),

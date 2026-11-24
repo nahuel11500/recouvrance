@@ -1324,8 +1324,9 @@ fn sync_body(mut body: Value, req: &super::ops::SyncRequest) -> Value {
 }
 
 /// Ask Argo CD for `action` on the Application `namespace/name`, by its API, with the
-/// server's login as the config has it now (`current`). Refused while write mode is off,
-/// checked as it is sent, as the UI's other writes are. A sync reads the Application right
+/// server's login as the config has it now (`current`). Refused while write mode is off, or
+/// the server (or a hub context tied to it) is set read-only, checked as it is sent, as the
+/// UI's other writes are. A sync reads the Application right
 /// before it is sent and is refused as argocd-server would refuse it (an operation running),
 /// or when prune would now delete more than was shown.
 pub async fn act(endpoint: Arc<Endpoint>, namespace: String, name: String, action: Action) -> Result<String, String> {
@@ -1358,8 +1359,17 @@ pub async fn act_read(
             }
             read = Some((app, op));
         }
-        if !crate::k8s::gate::ui_writes() {
-            return Ok(Err(crate::k8s::gate::WRITES_OFF.to_string()));
+        // A hub context tied to this server (Settings → Per cluster) is the same Argo CD:
+        // its read-only setting counts, though the write goes through the API. Else the
+        // server's name, as its protection is keyed.
+        let server_name = endpoint.name();
+        let servers = crate::settings::with(|s| s.argocd_servers.clone());
+        let read_only =
+            server::read_only_context(&servers, &endpoint.server.base, &server_name, crate::settings::is_read_only);
+        if let Some(why) = read_only
+            .map_or_else(|| crate::k8s::gate::refusal(&server_name), |c| Some(crate::k8s::gate::read_only_refusal(&c)))
+        {
+            return Ok(Err(why));
         }
         let (method, path, body) = request(&action, &namespace, &name);
         let sent = conn.call(method, &path, body.as_ref()).await;
