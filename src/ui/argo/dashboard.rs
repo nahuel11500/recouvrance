@@ -814,6 +814,16 @@ impl ArgoView {
             })
     }
 
+    /// "journal": the sync journal of the Application shown, every operation seen of it, even
+    /// those Argo CD's history no longer has.
+    fn journal_link(&self, id: &'static str, d: &Dashboard, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
+        let name = d.current()?.2.clone();
+        Some(
+            link(id, "journal", cx)
+                .on_click(cx.listener(move |this, _, window, cx| this.open_journal(Some(name.clone()), window, cx))),
+        )
+    }
+
     fn last_sync_card(&self, d: &Dashboard, c: &Cards, cx: &mut Context<Self>) -> Div {
         let theme = cx.theme().clone();
         let muted = theme.muted_foreground;
@@ -850,11 +860,20 @@ impl ArgoView {
             )
         });
         let steps = (!s.steps.is_empty()).then(|| self.toggle_link("steps", "steps", "steps", d, cx));
+        let journal = self.journal_link("argo-dash-journal-sync", d, cx);
         card("Last sync", Some(s.tone), cx)
             .child(div().text_xl().font_weight(FontWeight::BOLD).text_color(s.tone.color(cx)).child(s.phase.clone()))
             .when_some(s.message.clone(), |v, m| v.child(div().text_xs().child(selectable(m))))
             .children(progress)
-            .child(h_flex().gap_2().text_xs().text_color(muted).child(selectable(facts.join(" · "))).children(steps))
+            .child(
+                h_flex()
+                    .gap_2()
+                    .text_xs()
+                    .text_color(muted)
+                    .child(selectable(facts.join(" · ")))
+                    .children(steps)
+                    .children(journal),
+            )
             .when(d.is_open("steps"), |v| {
                 v.children(s.steps.iter().map(|st| {
                     v_flex()
@@ -957,6 +976,7 @@ impl ArgoView {
         let h = &c.history;
         let tone = if h.dots.last().is_some_and(|dot| !dot.ok) { Some(Tone::Bad) } else { None };
         let open = self.toggle_link("history", "history", "open", d, cx);
+        let journal = self.journal_link("argo-dash-journal-history", d, cx);
         card("History", tone, cx)
             .when(h.dots.is_empty(), |v| v.child(div().text_sm().text_color(muted).child("No deployment yet.")))
             .child(h_flex().gap_1().children(
@@ -970,7 +990,8 @@ impl ArgoView {
                     .text_xs()
                     .text_color(muted)
                     .child(format!("{} succeeded, {} failed", h.succeeded, h.failed))
-                    .when(!h.dots.is_empty(), |row| row.child(open)),
+                    .when(!h.dots.is_empty(), |row| row.child(open))
+                    .children(journal),
             )
             .when(d.is_open("history") && h.entries.len() > 1, |v| {
                 v.child(
@@ -1291,7 +1312,7 @@ fn card(title: &str, tone: Option<Tone>, cx: &App) -> Div {
 }
 
 /// A status in its tone, boxed.
-fn chip(text: &str, tone: Tone, cx: &App) -> Div {
+pub(super) fn chip(text: &str, tone: Tone, cx: &App) -> Div {
     let color = tone.color(cx);
     div().flex_none().px_1p5().rounded_md().text_xs().text_color(color).bg(color.opacity(0.12)).child(text.to_string())
 }

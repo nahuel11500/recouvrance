@@ -528,6 +528,9 @@ fn sync_section(app: &Value, req: &SyncRequest) -> Section {
     if req.dry_run {
         lines.push("dry run: Argo CD applies nothing and says what it would do".into());
     }
+    if req.apply {
+        lines.push("without hooks (migrations and other hooks are skipped)".into());
+    }
     let mut effects = diagnosis::sync_effects(app, &[]);
     if !req.resources.is_empty() {
         effects.retain(|(r, _)| req.resources.iter().any(|p| p.same(r)));
@@ -840,6 +843,9 @@ mod tests {
         let dry = sync_section(&app, &SyncRequest { dry_run: true, ..req }).lines;
         assert!(dry.iter().any(|l| l.starts_with("dry run:")), "{dry:?}");
         assert!(dry.iter().any(|l| l.ends_with("would be deleted (prune)")), "{dry:?}");
+        let apply = sync_section(&app, &SyncRequest { apply: true, ..SyncRequest::default() }).lines;
+        assert!(apply.iter().any(|l| l == "without hooks (migrations and other hooks are skipped)"), "{apply:?}");
+        assert!(!dry.iter().any(|l| l.starts_with("without hooks")), "{dry:?}");
         let s = sync_section(&app, &SyncRequest::default());
         assert_eq!(s.title, "Application argocd/shop-workload: sync");
         assert_eq!(

@@ -261,7 +261,7 @@ impl KubeMcp {
     }
 
     #[tool(
-        description = "GitOps actions: Flux `reconcile` (like `flux reconcile`), `suspend`, `resume`; Argo CD Application `refresh`, `hard_refresh` (renders its manifests again, without Argo CD's cache), `sync` (optionally of some `resources` only, with `prune`, or a `dry_run` whose result is returned), `terminate` (stops the operation running, like `argocd app terminate-op`) or `rollback` (to a deployment of its history, like `argocd app rollback`; refused while auto-sync is on), each authorized by its own verb on the object, not `patch`: `refresh` (refresh, hard_refresh), `sync` (Argo CD sync, terminate and rollback, Flux reconcile) or `suspend` (Flux suspend and resume). Like argocd-server, nothing starts while another operation runs. Argo CD `diagnose` changes nothing (authorized as `get`): why the Application drifts, keeps syncing (a sync loop, with the `ignoreDifferences` that would stop it), failed (hook, admission, missing CRD...) or is stuck (a long sync, a finalizer holding its deletion), and for each out-of-sync resource the fields that differ between what was last applied and the live object on its destination, with who wrote them since the last sync. The destination's objects are read only where your rules allow `get`.",
+        description = "GitOps actions: Flux `reconcile` (like `flux reconcile`), `suspend`, `resume`; Argo CD Application `refresh`, `hard_refresh` (renders its manifests again, without Argo CD's cache), `sync` (optionally of some `resources` only, with `prune`, without hooks (`hooks: false`), or a `dry_run` whose result is returned; to sync several Applications, call it once for each: each is decided by your rules and approved on its own), `terminate` (stops the operation running, like `argocd app terminate-op`) or `rollback` (to a deployment of its history, like `argocd app rollback`; refused while auto-sync is on), each authorized by its own verb on the object, not `patch`: `refresh` (refresh, hard_refresh), `sync` (Argo CD sync, terminate and rollback, Flux reconcile) or `suspend` (Flux suspend and resume). Like argocd-server, nothing starts while another operation runs. Argo CD `diagnose` changes nothing (authorized as `get`): why the Application drifts, keeps syncing (a sync loop, with the `ignoreDifferences` that would stop it), failed (hook, admission, missing CRD...) or is stuck (a long sync, a finalizer holding its deletion), and for each out-of-sync resource the fields that differ between what was last applied and the live object on its destination, with who wrote them since the last sync. The destination's objects are read only where your rules allow `get`.",
         annotations(read_only_hint = false)
     )]
     async fn gitops(
@@ -276,7 +276,7 @@ impl KubeMcp {
         });
         let args = json!({"context": p.context, "kind": p.kind, "namespace": p.namespace, "name": p.name,
             "action": p.action, "resources": resources, "prune": p.prune, "dry_run": p.dry_run,
-            "deployment_id": p.deployment_id});
+            "deployment_id": p.deployment_id, "hooks": p.hooks});
         let mut call = self.begin(&parts, "gitops", args)?;
         let (client, kind) = self.kind(&call, &p.context, &p.kind).await?;
         let flux = kind.ar.group.ends_with(".toolkit.fluxcd.io");
@@ -453,6 +453,9 @@ fn gitops_option_misuse(p: &GitOpsParams) -> Option<String> {
     if p.deployment_id.is_some() && action != "rollback" {
         return Some("`deployment_id` applies to `rollback` only".into());
     }
+    if p.hooks.is_some() && action != "sync" {
+        return Some("`hooks` applies to `sync` only (a rollback never runs hooks)".into());
+    }
     None
 }
 
@@ -500,7 +503,14 @@ fn argo_op(p: &GitOpsParams) -> Option<Op> {
                     version: String::new(),
                 })
                 .collect();
-            Some(Op::Sync(SyncRequest { resources, prune: p.prune.unwrap_or(false), dry_run, prune_shown: None }))
+            Some(Op::Sync(SyncRequest {
+                resources,
+                prune: p.prune.unwrap_or(false),
+                dry_run,
+                apply: p.hooks == Some(false),
+                revision: None,
+                prune_shown: None,
+            }))
         }
         "rollback" => Some(Op::Rollback { id: p.deployment_id, dry_run }),
         "terminate" => Some(Op::Terminate),
@@ -710,6 +720,33 @@ mod tests {
         assert!(unknown_hint(&kinds, "apps/v1", "Stage").contains("discovery runs again"));
         // A group version discovery didn't have was asked of the API server just now.
         assert_eq!(unknown_hint(&kinds, "kwok.x-k8s.io/v1alpha1", "Stage"), " (the API server serves no such type)");
+    }
+
+    fn gitops(args: serde_json::Value) -> super::GitOpsParams {
+        let mut all = json!({"context": "hub", "kind": "applications", "namespace": "argocd", "name": "web"});
+        for (k, v) in args.as_object().into_iter().flatten() {
+            all[k] = v.clone();
+        }
+        serde_json::from_value(all).unwrap()
+    }
+
+    /// `hooks: false` syncs without hooks (the apply strategy); omitted or true, with them.
+    /// Given to another action, it is refused rather than ignored.
+    #[test]
+    fn a_sync_without_hooks_is_asked_with_hooks_false() {
+        let op = |args| super::argo_op(&gitops(args));
+        let Some(Op::Sync(req)) = op(json!({"action": "sync", "hooks": false})) else { panic!("a sync") };
+        assert!(req.apply);
+        for args in [json!({"action": "sync"}), json!({"action": "sync", "hooks": true})] {
+            let Some(Op::Sync(req)) = op(args) else { panic!("a sync") };
+            assert!(!req.apply);
+        }
+        let misuse = |args| super::gitops_option_misuse(&gitops(args));
+        assert_eq!(misuse(json!({"action": "sync", "hooks": false})), None);
+        for action in ["rollback", "terminate", "refresh"] {
+            let why = misuse(json!({"action": action, "hooks": false})).unwrap();
+            assert!(why.contains("`hooks` applies to `sync` only"), "{why}");
+        }
     }
 
     #[test]

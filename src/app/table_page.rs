@@ -506,11 +506,11 @@ impl AppView {
         });
         cx.spawn_in(window, async move |_, cx| {
             let jobs = targets.into_iter().map(|(_, client, r)| {
-                let (kind, ns, name, uid) = (kind.clone(), r.namespace.clone(), r.name.clone(), r.uid.clone());
+                let (kind, ns, name) = (kind.clone(), r.namespace.clone(), r.name.clone());
                 async move {
                     match action {
                         // Only the object that was checked, not one re-created under its name.
-                        "Delete" => k8s::delete(client, kind, ns, name.clone(), Some(uid), false, None).await,
+                        "Delete" => k8s::delete_row(client, kind, r).await,
                         "Scale" => k8s::scale(client, kind, ns, name.clone(), count, false).await,
                         _ => k8s::rollout_restart(client, kind, ns, name.clone(), false).await,
                     }

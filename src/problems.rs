@@ -1,6 +1,8 @@
 //! "What is broken?": problems found from kubectl's own tables (cheap even on
 //! very large clusters), for the Problems page and the `find_problems` MCP tool.
 
+pub mod argo_apps;
+pub(crate) mod cronjobs;
 pub(crate) mod references;
 pub mod shared;
 
@@ -29,6 +31,16 @@ pub struct Problem {
     pub name: String,
     pub reason: String,
     pub age: Option<jiff::Timestamp>,
+    /// An Argo CD Application is shown under the cluster and namespace it deploys to, but
+    /// lives on its hub: there, and in this namespace.
+    pub on_hub: Option<OnHub>,
+}
+
+/// Where an Argo CD Application found by a scan lives: its hub, and its own namespace there.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OnHub {
+    pub context: String,
+    pub namespace: String,
 }
 
 fn cell<'a>(defs: &[ColumnDef], row: &'a Row, name: &str) -> &'a str {
@@ -153,11 +165,13 @@ pub fn judge(kind: &Kind, defs: &[ColumnDef], row: &Row) -> Option<(Severity, St
 }
 
 /// Kinds checked, in display order. Namespaces, PersistentVolumes and Argo CD Applications
-/// only for deletions stuck; a kind the cluster doesn't serve is left out. The
-/// external-secrets.io ones are judged from their objects (`external_secrets::problems`).
-/// Services, Ingresses and HTTP routes for what they point to that is missing, together
+/// only for deletions stuck (Applications that need attention are checked on their hub, under
+/// the cluster they deploy to: `argo_apps`); a kind the cluster doesn't serve is left out. The
+/// external-secrets.io ones are judged from their objects (`external_secrets::problems`), and
+/// CronJobs too, for when they last ran and succeeded (`cronjobs::problems`). Services,
+/// Ingresses and HTTP routes for what they point to that is missing, together
 /// (`references::traffic`).
-pub const CHECKED: [(&str, &str); 16] = [
+pub const CHECKED: [(&str, &str); 17] = [
     ("", "Node"),
     ("", "Namespace"),
     ("apps", "Deployment"),
@@ -165,6 +179,7 @@ pub const CHECKED: [(&str, &str); 16] = [
     ("apps", "DaemonSet"),
     ("", "Pod"),
     ("batch", "Job"),
+    ("batch", "CronJob"),
     ("", "Service"),
     ("networking.k8s.io", "Ingress"),
     (references::GATEWAY, "HTTPRoute"),
@@ -316,6 +331,7 @@ async fn scan_kind(
         name,
         reason,
         age,
+        on_hub: None,
     };
     // One namespace: its own object, not every namespace.
     if let Some(ns) = namespace.as_deref().filter(|_| kind.is("", "Namespace")) {
@@ -416,6 +432,8 @@ fn kind_jobs(
                     crate::external_secrets::problems(client, &kind, ns)
                         .await
                         .map(|problems| Scan { problems, skipped: Vec::new() })
+                } else if kind.is("batch", "CronJob") {
+                    cronjobs::problems(client, &kind, ns).await.map(|problems| Scan { problems, skipped: Vec::new() })
                 } else if kind.is("", "Service") {
                     Ok(references::traffic(client, &kind, ingress.as_ref(), route.as_ref(), ns, judged_since).await)
                 } else {
@@ -477,8 +495,19 @@ async fn run_all(jobs: Vec<Job>) -> Scan {
     out
 }
 
-/// Problems in a cluster (or one namespace), worst first, at once: the developer checks and
-/// the end-to-end tests. The app scans through `shared`, which shows each check as it finishes.
+/// Problems in the whole cluster of `context`, worst first, at once, with the Argo CD
+/// Applications that deploy to it as the app's scans check them: what the developer checks
+/// time before a release. The app scans through `shared`, which shows each check as it
+/// finishes.
+#[cfg(feature = "dev")]
+pub async fn scan_with_argo(client: Client, kinds: &[Kind], context: &str) -> Scan {
+    let mut jobs = kind_jobs(&client, kinds, None, None, None);
+    jobs.push(argo_apps::job(context, &client, kinds, &[]));
+    run_all(jobs).await
+}
+
+/// Problems in a cluster (or one namespace), worst first, at once, without the Argo CD
+/// Applications read on hubs: the end-to-end tests.
 #[cfg(feature = "dev")]
 pub async fn scan_partial(client: Client, kinds: &[Kind], namespace: Option<String>, context: Option<&str>) -> Scan {
     run_all(kind_jobs(&client, kinds, namespace.as_deref(), context, None)).await

@@ -249,6 +249,44 @@ impl Cascade {
     }
 }
 
+/// Delete the object a listed row shows, and only it. A row listed from its cells alone
+/// (`Row::is_partial`, a big list in every namespace) has no uid: the object's is read
+/// first and kept only when the object is not newer than the row (`listed_as`), so one
+/// re-created under its name since the list is left alone, as with a uid.
+pub async fn delete_row(client: Client, kind: Kind, row: std::sync::Arc<super::Row>) -> Result<String> {
+    let uid = if row.is_partial() {
+        let (c, k, r) = (client.clone(), kind.clone(), row.clone());
+        run(async move {
+            let meta = dyn_api(c, &k, r.namespace.as_deref()).get_metadata(&r.name).await?.metadata;
+            let created = meta.creation_timestamp.and_then(|t| super::timestamp(t.0));
+            if !listed_as(created, r.created) {
+                anyhow::bail!("it was re-created since the list was read; refresh and try again");
+            }
+            Ok(meta.uid)
+        })
+        .await?
+    } else {
+        Some(row.uid.clone())
+    };
+    delete(client, kind, row.namespace.clone(), row.name.clone(), uid, false, None).await
+}
+
+/// How far this machine's clock may run behind the API server's: a row's creation time read
+/// from its Age (`cells_row`) is this machine's now less the server's count.
+const CLOCK_SKEW: jiff::SignedDuration = jiff::SignedDuration::from_secs(30);
+
+/// Whether an object created at `created` is the one a row listed from its cells shows, its
+/// creation read from its Age as `listed`. kubectl's Age rounds down, so `listed` is never
+/// before the object's creation (give or take `CLOCK_SKEW`); an object re-created after the
+/// list is newer than the list, so newer than `listed` too. Unknown times can't tell them apart: the
+/// object is taken as the one listed, as before rows had a uid.
+fn listed_as(created: Option<jiff::Timestamp>, listed: Option<jiff::Timestamp>) -> bool {
+    match (created, listed) {
+        (Some(created), Some(listed)) => created <= listed.checked_add(CLOCK_SKEW).unwrap_or(listed),
+        _ => true,
+    }
+}
+
 /// "Only if it is still this object", when its real uid is known (rows of a fast first load
 /// have a stand-in: namespace/name).
 fn preconditions(uid: Option<String>) -> Option<kube::api::Preconditions> {
@@ -723,6 +761,31 @@ pub async fn argo_operation(
     name: String,
     op: super::argo::ops::Op,
 ) -> Result<String> {
+    argo_operation_with(client, kind, ns, name, op, true).await.map(|(said, _)| said)
+}
+
+/// [`argo_operation`], returning once the operation is written: a dry run's result is not
+/// waited for (a grouped sync follows each Application's operation itself). Also gives when
+/// the Application's last operation started, as read right before the write: the one written
+/// is a later one.
+pub async fn argo_start(
+    client: Client,
+    kind: Kind,
+    ns: Option<String>,
+    name: String,
+    op: super::argo::ops::Op,
+) -> Result<(String, Option<String>)> {
+    argo_operation_with(client, kind, ns, name, op, false).await
+}
+
+async fn argo_operation_with(
+    client: Client,
+    kind: Kind,
+    ns: Option<String>,
+    name: String,
+    op: super::argo::ops::Op,
+    wait_dry_run: bool,
+) -> Result<(String, Option<String>)> {
     use super::argo::ops::{self, Op};
     run(async move {
         let api = dyn_api(client, &kind, ns.as_deref());
@@ -750,21 +813,22 @@ pub async fn argo_operation(
             anyhow::bail!("the operation was not terminated: this Application kind keeps its status apart");
         }
         let mut out = ops::started(&app, &op, &name);
-        if op.dry_run() {
+        let before = super::argo::grouped_sync::started_at(&app);
+        if op.dry_run() && wait_dry_run {
             for _ in 0..DRY_RUN_WAIT_SECS {
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                 let now = serde_json::to_value(api.get(&name).await?)?;
                 if let Some(result) = ops::dry_run_result(&now) {
                     out.push('\n');
                     out.push_str(&result);
-                    return Ok(out);
+                    return Ok((out, before));
                 }
             }
             out.push_str(&format!(
                 "\nStill running after {DRY_RUN_WAIT_SECS} s: its result will show as the last sync (status.operationState)."
             ));
         }
-        Ok(out)
+        Ok((out, before))
     })
     .await
 }
@@ -1228,5 +1292,52 @@ mod tests {
         // Only an orphan delete says what it left.
         assert_eq!(Cascade::Orphan.outcome(), ", what it owns kept");
         assert_eq!(Cascade::Background.outcome(), "");
+    }
+}
+
+#[cfg(test)]
+mod listed_properties {
+    use proptest::prelude::*;
+
+    use super::{CLOCK_SKEW, listed_as};
+
+    /// kubectl's Age, rounded down the way it says it: seconds up to 2 minutes, then
+    /// minutes, hours and days.
+    fn shown_age(secs: i64) -> i64 {
+        let unit = if secs < 120 {
+            1
+        } else if secs < 10_800 {
+            60
+        } else if secs < 172_800 {
+            3600
+        } else {
+            86_400
+        };
+        secs - secs.rem_euclid(unit)
+    }
+
+    proptest! {
+        /// For every age, clock skew within `CLOCK_SKEW` and re-creation after the list: the
+        /// object listed is taken as itself, and one re-created under its name at least a
+        /// minute after its creation is not.
+        #[test]
+        fn a_delete_finds_the_object_listed_and_no_other(
+            age in 0i64..5 * 365 * 86_400,
+            skew in -CLOCK_SKEW.as_secs()..=CLOCK_SKEW.as_secs(),
+            later in 1i64..30 * 86_400,
+        ) {
+            let server_now = jiff::Timestamp::from_second(1_800_000_000).unwrap();
+            let created = server_now - jiff::SignedDuration::from_secs(age);
+            // This machine's now, less the Age the server counted (see `cells_row`).
+            let listed = server_now + jiff::SignedDuration::from_secs(skew - shown_age(age));
+            prop_assert!(listed_as(Some(created), Some(listed)));
+            let recreated = server_now + jiff::SignedDuration::from_secs(later);
+            if age >= 60 {
+                prop_assert!(!listed_as(Some(recreated), Some(listed)));
+            }
+            // Without a time to compare, as before rows had a uid.
+            prop_assert!(listed_as(Some(recreated), None));
+            prop_assert!(listed_as(None, Some(listed)));
+        }
     }
 }
