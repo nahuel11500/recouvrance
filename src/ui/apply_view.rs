@@ -761,10 +761,12 @@ fn explain(msg: &str) -> String {
 
 /// Start $VISUAL/$EDITOR on a file; terminal editors open in a terminal window.
 fn launch_editor(path: &std::path::Path) -> Result<(), String> {
-    let editor = std::env::var("VISUAL").or_else(|_| std::env::var("EDITOR")).unwrap_or_else(|_| "xdg-open".into());
+    let editor =
+        std::env::var("VISUAL").or_else(|_| std::env::var("EDITOR")).unwrap_or_else(|_| crate::forwards::OPENER.into());
     let mut parts = editor.split_whitespace().map(String::from).collect::<Vec<_>>();
     let bin = parts.first().cloned().unwrap_or_default();
-    let base = std::path::Path::new(&bin).file_name().map_or_default(|s| s.to_string_lossy().to_string());
+    // The stem: `code.cmd` and `notepad.exe` on Windows.
+    let base = std::path::Path::new(&bin).file_stem().map_or_default(|s| s.to_string_lossy().to_string());
     let gui = matches!(
         base.as_str(),
         "code"
@@ -779,6 +781,10 @@ fn launch_editor(path: &std::path::Path) -> Result<(), String> {
             | "zeditor"
             | "gvim"
             | "xdg-open"
+            | "open"
+            | "explorer"
+            | "notepad"
+            | "notepad++"
             | "mousepad"
             | "pluma"
             | "xed"
@@ -891,7 +897,9 @@ impl Render for ApplyView {
                         .tooltip(crate::paths::tilde(&crate::templates::folder()))
                         .on_click(|_, _, _| {
                             if let Ok(dir) = crate::templates::ensure_folder() {
-                                crate::forwards::spawn_reaped(std::process::Command::new("xdg-open").arg(dir));
+                                crate::forwards::spawn_reaped(
+                                    std::process::Command::new(crate::forwards::OPENER).arg(dir),
+                                );
                             }
                         }),
                 ),

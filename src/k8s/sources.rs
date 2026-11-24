@@ -344,8 +344,9 @@ mod tests {
             super::settings_path(std::path::Path::new("team.yaml")),
             crate::paths::tilde(&cwd.join("team.yaml"))
         );
+        #[cfg(unix)]
         assert_eq!(super::settings_path(std::path::Path::new("/etc/k")), "/etc/k");
-        let home = std::path::PathBuf::from(std::env::var_os("HOME").unwrap());
+        let home = crate::paths::home();
         assert_eq!(super::settings_path(&home.join(".kube/a")), "~/.kube/a");
     }
 }

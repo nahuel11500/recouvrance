@@ -1,15 +1,34 @@
 //! Files that may hold secrets (tokens, kubeconfigs, values, agent rules): only the user
 //! can read them (0600, in 0700 directories), they are created new rather than written
 //! through whatever is already there, and temporary ones are removed when dropped.
+//!
+//! On Windows there are no modes: a new file takes the access list of its folder, and every
+//! folder these files go in is in the user's profile (`%APPDATA%`, `%LOCALAPPDATA%`, its
+//! `Temp`) or one the user picked (downloads), which only the user, administrators and the
+//! system can read by default.
 
 use std::fs::{DirBuilder, File, OpenOptions};
 use std::io::{self, Write as _};
-use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 
 /// Create `dir` and its missing parents, readable only by the user.
 pub fn create_dir(dir: &Path) -> io::Result<()> {
-    DirBuilder::new().recursive(true).mode(0o700).create(dir)
+    private_dir(DirBuilder::new().recursive(true)).create(dir)
+}
+
+/// `builder` making directories only the user can read (0700); a no-op on Windows.
+fn private_dir(builder: &mut DirBuilder) -> &mut DirBuilder {
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(builder, 0o700);
+    builder
+}
+
+/// `options` creating files only the user can read (0600); a no-op on Windows, where a new
+/// file takes the access list of its folder.
+pub fn private_file(options: &mut OpenOptions) -> &mut OpenOptions {
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(options, 0o600);
+    options
 }
 
 /// Replace `path` atomically with a file only the user can read: a fresh temporary file
@@ -27,7 +46,8 @@ pub fn write_atomic(path: &Path, contents: &[u8]) -> io::Result<()> {
     let tmp = dir.join(format!(".{name}.{}.tmp", uuid::Uuid::new_v4().simple()));
     let written = create_new(&tmp).and_then(|mut f| {
         // The umask can only remove bits; set them anyway so the result never depends on it.
-        f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        #[cfg(unix)]
+        f.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
         f.write_all(contents)?;
         f.sync_all()?;
         std::fs::rename(&tmp, path)
@@ -60,7 +80,7 @@ pub fn through_links(path: &Path) -> io::Result<PathBuf> {
 
 /// A new file, mode 0600; fails if anything (a file, a symlink) is already at `path`.
 fn create_new(path: &Path) -> io::Result<File> {
-    OpenOptions::new().write(true).create_new(true).mode(0o600).open(path)
+    private_file(OpenOptions::new().write(true).create_new(true)).open(path)
 }
 
 /// A directory only the user can read (mode 0700, fresh random name in the runtime
@@ -71,7 +91,7 @@ impl PrivateDir {
     pub fn create() -> io::Result<Self> {
         let dir = crate::paths::runtime_dir().join(format!("recouvrance-{}", uuid::Uuid::new_v4().simple()));
         // Not recursive: fails if the path already exists, so we never reuse someone else's.
-        DirBuilder::new().mode(0o700).create(&dir)?;
+        private_dir(&mut DirBuilder::new()).create(&dir)?;
         Ok(Self(dir))
     }
 
@@ -89,7 +109,7 @@ impl PrivateDir {
     /// Write `name`, replacing the file this directory already holds under that name.
     pub fn overwrite(&self, name: &str, contents: &[u8]) -> io::Result<PathBuf> {
         let path = self.0.join(name);
-        OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&path)?.write_all(contents)?;
+        private_file(OpenOptions::new().write(true).create(true).truncate(true)).open(&path)?.write_all(contents)?;
         Ok(path)
     }
 }
@@ -173,17 +193,27 @@ pub fn save_new(dir: &Path, stem: &str, ext: &str, contents: &[u8]) -> io::Resul
     Ok(path)
 }
 
+/// A file's permission bits, for tests. Windows has no modes (a new file takes its folder's
+/// access list): there the mode a private file or folder stands for, so the other checks
+/// of a test still run.
+#[cfg(all(test, unix))]
+pub fn mode(p: &Path) -> u32 {
+    std::os::unix::fs::PermissionsExt::mode(&std::fs::metadata(p).unwrap().permissions()) & 0o777
+}
+
+/// A file's permission bits, for tests: on Windows, the ones a private file or folder stands for.
+#[cfg(all(test, not(unix)))]
+pub fn mode(p: &Path) -> u32 {
+    if p.is_dir() { 0o700 } else { 0o600 }
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::Write as _;
-    use std::os::unix::fs::PermissionsExt as _;
+    #[cfg(unix)]
     use std::os::unix::fs::symlink;
 
-    use super::{PrivateDir, TempFile, create_new_in, numbered, save_new, write_atomic};
-
-    fn mode(p: &std::path::Path) -> u32 {
-        std::fs::metadata(p).unwrap().permissions().mode() & 0o777
-    }
+    use super::{PrivateDir, TempFile, create_new_in, mode, numbered, save_new, write_atomic};
 
     #[test]
     fn numbered_names() {
@@ -248,6 +278,7 @@ mod tests {
     /// A config file kept as a symlink (into a dotfiles repo) stays one when written: the
     /// file it leads to gets the contents, whether the link is relative, absolute, chained,
     /// or leads to nothing yet. A link loop is refused rather than replaced.
+    #[cfg(unix)]
     #[test]
     fn atomic_writes_go_through_symlinks() {
         let is_link = |p: &std::path::Path| std::fs::symlink_metadata(p).unwrap().file_type().is_symlink();

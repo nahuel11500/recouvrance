@@ -230,6 +230,9 @@ impl Install {
     }
 }
 
+/// The updater the install script puts next to the binary (`.exe` on Windows).
+const UPDATER: &str = if cfg!(windows) { "recouvrance-update.exe" } else { "recouvrance-update" };
+
 /// How the binary at `exe` was installed. `appimage` and `appdir` are what an `AppImage`'s
 /// runtime sets (`APPIMAGE`, `APPDIR`), and `exists` says whether a file is there.
 fn detect(
@@ -246,7 +249,7 @@ fn detect(
         return Install { method: Method::AppImage, path: Some(image) };
     }
     let method = match exe {
-        Some(exe) if exe.parent().is_some_and(|dir| exists(&dir.join("recouvrance-update"))) => Method::Script,
+        Some(exe) if exe.parent().is_some_and(|dir| exists(&dir.join(UPDATER))) => Method::Script,
         // A binary copied to /usr/bin by hand, or another distribution's package, is not the .deb.
         Some(exe) if exe.starts_with("/usr/bin") && exists(Path::new(DPKG_RECORD)) => Method::Deb,
         _ => Method::Other,
@@ -398,7 +401,8 @@ mod tests {
     #[test]
     fn the_install_method_follows_where_the_binary_is() {
         let cargo_bin = Path::new("/home/u/.cargo/bin/recouvrance");
-        let updater = ["/home/u/.cargo/bin/recouvrance-update"];
+        let script = format!("/home/u/.cargo/bin/{}", super::UPDATER);
+        let updater = [script.as_str()];
         assert_eq!(detect(Some(cargo_bin), None, None, among(&updater)).method, Method::Script);
         // `cargo install` puts it in the same folder, without the updater.
         let built = detect(Some(cargo_bin), None, None, among(&[]));

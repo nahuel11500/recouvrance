@@ -82,9 +82,17 @@ pub fn tls_covers(tls_hosts: &[&str], host: &str) -> bool {
 }
 
 pub fn open_url(url: &str) {
-    let opener = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
-    spawn_reaped(std::process::Command::new(opener).arg(url).stdin(std::process::Stdio::null()));
+    spawn_reaped(std::process::Command::new(OPENER).arg(url).stdin(std::process::Stdio::null()));
 }
+
+/// The program that opens a URL, file or folder with the user's default application.
+pub const OPENER: &str = if cfg!(target_os = "macos") {
+    "open"
+} else if cfg!(windows) {
+    "explorer"
+} else {
+    "xdg-open"
+};
 
 /// Start a helper program without waiting for it, reaped in the background so it never
 /// lingers as a zombie process.

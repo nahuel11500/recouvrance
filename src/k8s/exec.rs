@@ -776,7 +776,9 @@ pub fn local_shell(
             Ok(p) => p,
             Err(e) => return fail(format!("pty: {e}")),
         };
-        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
+        // Windows has no `SHELL`: PowerShell, which every supported version has.
+        let fallback = if cfg!(windows) { "powershell.exe" } else { "/bin/bash" };
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| fallback.into());
         // A plugin runs its command, then waits so its output stays readable.
         let mut cmd = match &command {
             Some(c) => {
@@ -795,7 +797,8 @@ pub fn local_shell(
         cmd.env("KUBECONFIG", kubeconfig.path());
         cmd.env("RECOUVRANCE_CONTEXT", &context);
         cmd.env("TERM", "xterm-256color");
-        if let Some(home) = std::env::var_os("HOME") {
+        let home = crate::paths::home();
+        if !home.as_os_str().is_empty() {
             cmd.cwd(home);
         }
         let child = match pair.slave.spawn_command(cmd) {

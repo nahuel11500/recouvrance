@@ -1,20 +1,27 @@
-//! Where Recouvrance keeps its files, following the XDG base directories.
+//! Where Recouvrance keeps its files, following the XDG base directories. On Windows, without
+//! the XDG variables, in the user's profile: `%APPDATA%` and `%LOCALAPPDATA%`.
 
 use std::path::{Path, PathBuf};
 
-/// The user's home directory (empty when `HOME` is not set).
+/// The user's home directory: `HOME`, on Windows `USERPROFILE` when `HOME` is not set (empty
+/// when neither is).
 pub fn home() -> PathBuf {
-    std::env::var_os("HOME").map_or_default(PathBuf::from)
+    let home = std::env::var_os("HOME").filter(|h| !h.is_empty());
+    #[cfg(windows)]
+    let home = home.or_else(|| std::env::var_os("USERPROFILE"));
+    home.map_or_default(PathBuf::from)
 }
 
-/// `$XDG_CONFIG_HOME/recouvrance`, by default `~/.config/recouvrance`.
+/// `$XDG_CONFIG_HOME/recouvrance`, by default `~/.config/recouvrance` (`%APPDATA%\recouvrance`
+/// on Windows).
 pub fn config_dir() -> PathBuf {
-    xdg("XDG_CONFIG_HOME", ".config").join("recouvrance")
+    xdg("XDG_CONFIG_HOME", "APPDATA", ".config").join("recouvrance")
 }
 
-/// `$XDG_DATA_HOME/recouvrance`, by default `~/.local/share/recouvrance`.
+/// `$XDG_DATA_HOME/recouvrance`, by default `~/.local/share/recouvrance`
+/// (`%LOCALAPPDATA%\recouvrance` on Windows).
 pub fn data_dir() -> PathBuf {
-    xdg("XDG_DATA_HOME", ".local/share").join("recouvrance")
+    xdg("XDG_DATA_HOME", "LOCALAPPDATA", ".local/share").join("recouvrance")
 }
 
 /// Where short-lived private files go: `$XDG_RUNTIME_DIR` (a per-user tmpfs) when it is a
@@ -68,15 +75,26 @@ pub fn tilde(p: &Path) -> String {
 
 fn tilde_in(p: &Path, home: &Path) -> String {
     match p.strip_prefix(home) {
-        Ok(rest) if !home.as_os_str().is_empty() => format!("~/{}", rest.display()),
+        // Joined with `/` on every system, the way `expand` reads it back.
+        Ok(rest) if !home.as_os_str().is_empty() => {
+            let parts: Vec<_> = rest.components().map(|c| c.as_os_str().to_string_lossy()).collect();
+            format!("~/{}", parts.join("/"))
+        }
         _ => p.display().to_string(),
     }
 }
 
 /// An XDG base directory: the variable when it holds an absolute path (the spec says to
-/// ignore a relative one), else `fallback` under the home directory.
-fn xdg(var: &str, fallback: &str) -> PathBuf {
-    std::env::var_os(var).map(PathBuf::from).filter(|p| p.is_absolute()).unwrap_or_else(|| home().join(fallback))
+/// ignore a relative one), on Windows then the profile folder `windows_var` names, else
+/// `fallback` under the home directory.
+fn xdg(var: &str, windows_var: &str, fallback: &str) -> PathBuf {
+    let absolute = |var: &str| std::env::var_os(var).map(PathBuf::from).filter(|p| p.is_absolute());
+    let dir = absolute(var);
+    #[cfg(windows)]
+    let dir = dir.or_else(|| absolute(windows_var));
+    #[cfg(not(windows))]
+    let _ = windows_var;
+    dir.unwrap_or_else(|| home().join(fallback))
 }
 
 #[cfg(test)]
@@ -91,6 +109,7 @@ mod tests {
         assert_eq!(shown_data("audit.jsonl"), tilde(&data_dir().join("audit.jsonl")));
         let home = Path::new("/home/me");
         // Outside the home folder (an XDG variable set elsewhere): the path as it is.
+        #[cfg(unix)]
         assert_eq!(shown(Path::new("/srv/cfg/recouvrance"), home, "rules.yaml"), "/srv/cfg/recouvrance/rules.yaml");
         // Under it: with `~/`, whatever the folder.
         assert_eq!(
@@ -102,7 +121,7 @@ mod tests {
             "~/scratch/data/recouvrance/timeline"
         );
         // No home folder known: never `~/`.
-        assert_eq!(shown(Path::new("/srv/cfg"), Path::new(""), "x"), "/srv/cfg/x");
+        assert!(!shown(Path::new("/srv/cfg"), Path::new(""), "x").starts_with('~'));
     }
 
     /// The code of a line as far as this check goes: None for a comment line or one marked

@@ -1473,6 +1473,7 @@ mod tests {
 
     /// A symlinked file that doesn't read is kept aside where it is, the link left in place:
     /// the next save writes through the link, which stays one.
+    #[cfg(unix)]
     #[test]
     fn a_symlinked_bad_file_keeps_its_link() {
         let d = scratch();

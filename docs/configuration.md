@@ -4,6 +4,11 @@ Recouvrance reads your kubeconfig like `kubectl` does and keeps its own settings
 `~/.config/recouvrance` (`$XDG_CONFIG_HOME/recouvrance`). Everything below can be changed in
 **Settings**; the files are plain JSON or YAML if you prefer editing them.
 
+On Windows, without the XDG variables, the settings are in `%APPDATA%\recouvrance` and the data
+(timeline, agent log) in `%LOCALAPPDATA%\recouvrance`. Windows has no file modes: the files said
+to be mode 0600 below are private because these folders, in your profile, are readable only by you
+(and administrators), and new files take their folder's access list.
+
 ## Files
 
 | Path | What |

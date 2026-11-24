@@ -1,8 +1,8 @@
 name: CI
 
 # Pull requests get the quick checks and the end-to-end run on a kind cluster (the write
-# guards). Pushes to main, release tags and manual runs get everything: macOS, the minimum
-# Rust version, docs and release builds.
+# guards). Pushes to main, release tags and manual runs get everything: macOS, Windows, the
+# minimum Rust version, docs and release builds.
 on:
   pull_request:
   push:
@@ -76,6 +76,20 @@ jobs:
     name: Tests (macOS)
     if: github.event_name != 'pull_request'
     runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: ci
+      - run: cargo test --locked --profile ci --features dev
+
+  test-windows:
+    name: Tests (Windows)
+    if: github.event_name != 'pull_request'
+    runs-on: windows-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
@@ -192,6 +206,8 @@ jobs:
           # Cross-built on Apple Silicon, like the release.
           - os: macos-latest
             target: x86_64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -208,13 +224,13 @@ jobs:
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: recouvrance-${{ matrix.target }}
-          path: target/${{ matrix.target }}/release/recouvrance
+          path: target/${{ matrix.target }}/release/recouvrance${{ runner.os == 'Windows' && '.exe' || '' }}
 
   # One required check for branch protection, whatever ran.
   ci-ok:
     name: CI result
     if: always()
-    needs: [quick, check, test-macos, msrv, docs, e2e, build]
+    needs: [quick, check, test-macos, test-windows, msrv, docs, e2e, build]
     runs-on: ubuntu-latest
     steps:
       - name: All required jobs passed or were skipped

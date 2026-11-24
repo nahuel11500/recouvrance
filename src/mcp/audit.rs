@@ -64,7 +64,6 @@ pub(super) fn audit_path() -> PathBuf {
 /// Append one line, first moving a full log to `<name>.1` (replacing the older one).
 pub(super) fn append_audit(path: &std::path::Path, line: &str) -> std::io::Result<()> {
     use std::io::Write as _;
-    use std::os::unix::fs::OpenOptionsExt as _;
     if let Some(dir) = path.parent() {
         crate::private_files::create_dir(dir)?;
     }
@@ -73,7 +72,7 @@ pub(super) fn append_audit(path: &std::path::Path, line: &str) -> std::io::Resul
         old.push(".1");
         std::fs::rename(path, old)?;
     }
-    let mut f = std::fs::OpenOptions::new().append(true).create(true).mode(0o600).open(path)?;
+    let mut f = crate::private_files::private_file(std::fs::OpenOptions::new().append(true).create(true)).open(path)?;
     writeln!(f, "{line}")
 }
 
@@ -155,7 +154,6 @@ mod tests {
 
     #[test]
     fn audit_log_rotates_and_reads_its_tail() {
-        use std::os::unix::fs::PermissionsExt as _;
         let dir = temp_dir();
         let path = dir.join("logs").join("audit.jsonl");
         for i in 0..3 {
@@ -163,7 +161,7 @@ mod tests {
         }
         let tail = load_audit_tail(&path);
         assert_eq!(tail.iter().map(|e| e.tool.as_str()).collect::<Vec<_>>(), ["t0", "t1", "t2"]);
-        let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let mode = crate::private_files::mode;
         assert_eq!(mode(&path), 0o600);
         assert_eq!(mode(&dir.join("logs")), 0o700);
         // A full log moves aside and a new one starts.

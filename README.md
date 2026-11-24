@@ -76,8 +76,15 @@ curl --proto '=https' --tlsv1.2 -LsSf https://github.com/nahuel11500/recouvrance
 recouvrance-update      # later: installs the latest release
 ```
 
+Windows (x86_64), in PowerShell (new: [#1016](https://github.com/nahuel11500/recouvrance/issues/1016)
+lists what doesn't work there yet):
+
+```powershell
+powershell -ExecutionPolicy Bypass -c "irm https://github.com/nahuel11500/recouvrance/releases/latest/download/recouvrance-installer.ps1 | iex"
+```
+
 Or download from the [latest release](https://github.com/nahuel11500/recouvrance/releases/latest):
-a tarball for each platform, or for x86_64 Linux only a `.deb` (Debian, Ubuntu) and an AppImage.
+a tarball for each platform (a zip for Windows), or for x86_64 Linux only a `.deb` (Debian, Ubuntu) and an AppImage.
 From source with Rust: `cargo install --locked --git https://github.com/nahuel11500/recouvrance` (on Linux, the libraries listed in
 [development](docs/development.md#build) first). Whichever way you installed it, Settings → About
 says how to update it.

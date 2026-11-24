@@ -283,12 +283,28 @@ fn run_failed(command: &str, out: &std::process::Output) -> String {
 
 /// How the command ended: "exit 1", or "signal 9" when it was killed.
 fn ended(status: std::process::ExitStatus) -> String {
-    use std::os::unix::process::ExitStatusExt as _;
-    match (status.code(), status.signal()) {
+    #[cfg(unix)]
+    let signal = std::os::unix::process::ExitStatusExt::signal(&status);
+    // Windows has no signals: a process always ends with a code.
+    #[cfg(not(unix))]
+    let signal: Option<i32> = None;
+    match (status.code(), signal) {
         (Some(code), _) => format!("exit {code}"),
         (None, Some(signal)) => format!("signal {signal}"),
         (None, None) => status.to_string(),
     }
+}
+
+/// A process that ended with exit `code`, for tests.
+#[cfg(all(test, unix))]
+fn exited(code: i32) -> std::process::ExitStatus {
+    std::os::unix::process::ExitStatusExt::from_raw(code << 8)
+}
+
+/// A process that ended with exit `code`, for tests.
+#[cfg(all(test, windows))]
+fn exited(code: i32) -> std::process::ExitStatus {
+    std::os::windows::process::ExitStatusExt::from_raw(code.cast_unsigned())
 }
 
 /// The last line of `stderr` with text in it, as plain text without the user and password of a
@@ -327,18 +343,14 @@ fn plain(line: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::os::unix::process::ExitStatusExt as _;
-    use std::process::{Command, ExitStatus, Output};
+    use std::process::{Command, Output};
 
     use super::*;
 
     /// A failed login command as kube reports it: its command line as text, then what it printed.
     fn failed_run(cmd: String, code: i32, stdout: &str, stderr: &str) -> AuthError {
-        let out = Output {
-            status: ExitStatus::from_raw(code << 8),
-            stdout: stdout.as_bytes().to_vec(),
-            stderr: stderr.as_bytes().to_vec(),
-        };
+        let out =
+            Output { status: exited(code), stdout: stdout.as_bytes().to_vec(), stderr: stderr.as_bytes().to_vec() };
         AuthError::AuthExecRun { cmd, out: Box::new(out) }
     }
 
@@ -377,10 +389,13 @@ mod tests {
         // Nothing on stderr, killed: said by how it ended.
         let mut quiet = failed_run(kubelogin(), 2, "s3cr3t-out", " \n");
         assert_eq!(by_kubelogin(&quiet).as_deref(), Some("the login command `kubelogin` failed (exit 2)"));
-        if let AuthError::AuthExecRun { out, .. } = &mut quiet {
-            out.status = ExitStatus::from_raw(9);
+        #[cfg(unix)]
+        {
+            if let AuthError::AuthExecRun { out, .. } = &mut quiet {
+                out.status = std::os::unix::process::ExitStatusExt::from_raw(9);
+            }
+            assert_eq!(by_kubelogin(&quiet).as_deref(), Some("the login command `kubelogin` failed (signal 9)"));
         }
-        assert_eq!(by_kubelogin(&quiet).as_deref(), Some("the login command `kubelogin` failed (signal 9)"));
         // A long last line is cut.
         let long = failed_run(kubelogin(), 1, "", &"x".repeat(500));
         let said = by_kubelogin(&long).unwrap();
@@ -643,8 +658,9 @@ mod tests {
 /// Whatever a failed login command was given and printed, what is said of it.
 #[cfg(test)]
 mod properties {
-    use std::os::unix::process::{CommandExt as _, ExitStatusExt as _};
-    use std::process::{Command, ExitStatus, Output};
+    #[cfg(unix)]
+    use std::os::unix::process::CommandExt as _;
+    use std::process::{Command, Output};
 
     use kube::config::{AuthInfo, ExecConfig};
     use proptest::prelude::*;
@@ -659,7 +675,7 @@ mod properties {
     fn say(path: &str, cmd: &Command, code: i32, stdout: Vec<u8>, stderr: Vec<u8>) -> String {
         let exec = ExecConfig { command: Some(path.into()), ..Default::default() };
         let auth = AuthInfo { exec: Some(exec), ..Default::default() };
-        let out = Output { status: ExitStatus::from_raw(code << 8), stdout, stderr };
+        let out = Output { status: super::exited(code), stdout, stderr };
         failure(&AuthError::AuthExecRun { cmd: format!("{cmd:?}"), out: Box::new(out) }, program(&auth).as_deref())
             .unwrap()
     }
@@ -698,9 +714,12 @@ mod properties {
             if let Some(cwd) = &cwd {
                 cmd.current_dir(format!("{SECRET}{cwd}"));
             }
+            #[cfg(unix)]
             if let Some(arg0) = &arg0 {
                 cmd.arg0(format!("{SECRET}{arg0}"));
             }
+            #[cfg(not(unix))]
+            let _ = arg0;
             let stdout = format!("{SECRET}{stdout}").into_bytes();
             let said = say(&path, &cmd, code, stdout, stderr.join("\n").into_bytes());
             prop_assert!(!said.contains(SECRET), "{said}\nfrom {cmd:?}");
