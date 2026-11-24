@@ -90,6 +90,9 @@ pub struct Related {
     pub allocated: std::collections::HashMap<String, (f64, f64)>,
     /// The pods table's rows, worked out once from `pods` and `usage`.
     pub pod_rows: Vec<PodRow>,
+    /// What the Map tab uses of the rest, taken once it is loaded, off the UI thread (None
+    /// until the page's first load).
+    pub map: Option<std::sync::Arc<crate::map::Known>>,
 }
 
 impl Related {
@@ -201,8 +204,22 @@ impl Ctx<'_> {
     }
 
     /// A link to an object in another namespace.
-    fn link_in(
+    pub(crate) fn link_in(
         &self,
+        text: impl Into<SharedString>,
+        kind: &str,
+        name: &str,
+        ns: Option<String>,
+        cx: &App,
+    ) -> Stateful<Div> {
+        self.link_with_id(format!("link-{kind}-{name}"), text, kind, name, ns, cx)
+    }
+
+    /// `link_in` with its element id, for a page that can link one object twice (a pod behind
+    /// two Services on the Map).
+    pub(crate) fn link_with_id(
+        &self,
+        id: String,
         text: impl Into<SharedString>,
         kind: &str,
         name: &str,
@@ -212,7 +229,7 @@ impl Ctx<'_> {
         let (kind, name, panel) = (kind.to_string(), name.to_string(), self.panel.clone());
         let text: SharedString = text.into();
         div()
-            .id(SharedString::from(format!("link-{kind}-{name}")))
+            .id(SharedString::from(id))
             .text_color(cx.theme().blue)
             .cursor_pointer()
             .hover(Styled::underline)
@@ -320,7 +337,7 @@ pub(crate) fn column_cell(width: f32, shrinks: bool) -> Div {
     if shrinks { d.flex_shrink(1.).min_w(px(width / 2.)) } else { d.flex_none() }
 }
 
-fn state_color(text: &str, cx: &App) -> Hsla {
+pub(crate) fn state_color(text: &str, cx: &App) -> Hsla {
     crate::status::tone(text).map_or(cx.theme().muted_foreground, |t| t.color(cx))
 }
 

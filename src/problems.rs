@@ -1,7 +1,7 @@
 //! "What is broken?": problems found from kubectl's own tables (cheap even on
 //! very large clusters), for the Problems page and the `find_problems` MCP tool.
 
-mod references;
+pub(crate) mod references;
 pub mod shared;
 
 pub(crate) use references::WITH_SERVICES;

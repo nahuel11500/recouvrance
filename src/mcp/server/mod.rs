@@ -29,6 +29,7 @@ use crate::k8s::{self, Kind, TaskGuard};
 
 pub(crate) use gone::Gone;
 
+mod argo_tools;
 mod cluster_tools;
 mod diff_tools;
 mod file_tools;
@@ -1204,6 +1205,7 @@ impl KubeMcp {
             + Self::cluster_tools()
             + Self::file_tools()
             + Self::metrics_tools()
+            + Self::argo_tools()
     }
 }
 
