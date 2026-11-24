@@ -686,7 +686,7 @@ impl Hub {
             match written {
                 Ok(()) => *lock(&self.audit_error) = None,
                 Err(e) => {
-                    let msg = format!("cannot write {}: {e}", audit_path().display());
+                    let msg = format!("cannot write {}: {e}", crate::paths::tilde(&audit_path()));
                     eprintln!("audit log: {msg}");
                     *lock(&self.audit_error) = Some(msg);
                 }
