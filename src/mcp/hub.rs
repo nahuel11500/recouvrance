@@ -726,6 +726,13 @@ impl Hub {
         Ok((client, kinds))
     }
 
+    /// Whether the context is connected for agents and its kinds discovered: reading it
+    /// starts no connection or login. No request.
+    pub fn ready(&self, context: &str) -> bool {
+        let cluster = lock(&self.clients).get(context).cloned();
+        cluster.is_some_and(|c| c.client.initialized() && lock(&c.kinds).is_some())
+    }
+
     /// The contexts connected for agents whose discovered kinds hold `group`/`kind`, sorted.
     /// No request: a context not connected yet is not among them.
     pub fn contexts_serving(&self, group: &str, kind: &str) -> Vec<String> {

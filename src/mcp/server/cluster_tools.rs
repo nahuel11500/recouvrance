@@ -175,7 +175,7 @@ impl KubeMcp {
     }
 
     #[tool(
-        description = "Wait until an object meets a condition (Ready, Available, Complete, `phase=Running`) or is deleted, like `kubectl wait`. For an Argo CD Application (on its hub): `sync=Synced`, `health=Healthy` or `operation=Succeeded`, met only once no operation runs; it returns at once with Argo CD's message when its last operation failed.",
+        description = "Wait until an object meets a condition (Ready, Available, Complete, `phase=Running`) or is deleted, like `kubectl wait`. For an Argo CD Application (on its hub): `sync=Synced`, `health=Healthy` or `operation=Succeeded`, met only once no operation runs; a sync or operation wait returns at once with Argo CD's message when its last operation failed on the revision it targets now (or auto-sync is off).",
         annotations(read_only_hint = true)
     )]
     async fn wait_for(
@@ -255,9 +255,12 @@ fn argo_condition(condition: &str) -> Option<(&'static str, &str)> {
 
 /// Whether an Application's `field` reads `want`. While an operation runs, its sync and health
 /// are those from before it, so nothing is met until it ends (but `operation=Running`). Once
-/// its last operation failed, a sync won't start again on its own (auto-sync doesn't retry a
-/// revision that failed): that is an Err with Argo CD's message, unless what was waited for
-/// is already there.
+/// its last operation failed on the revision it targets now, a sync won't start again on its
+/// own (auto-sync doesn't retry a revision that failed, and its retries run within that
+/// operation): that is an Err with Argo CD's message, unless what was waited for is already
+/// there. A failure on an older revision with auto-sync on is not final: Argo CD syncs the new
+/// one once it sees it. Health can change without a sync, so a failed sync never ends a
+/// `health=` wait.
 fn argo_met(obj: &Value, field: &str, want: &str) -> Result<Option<bool>, String> {
     let text = |p: &str| obj.pointer(p).and_then(Value::as_str).filter(|s| !s.is_empty());
     let phase = text(OPERATION_PHASE);
@@ -272,12 +275,39 @@ fn argo_met(obj: &Value, field: &str, want: &str) -> Result<Option<bool>, String
     if is(value) {
         return Ok(Some(true));
     }
-    if let Some(failed @ ("Failed" | "Error")) = phase {
+    let final_failure = field != "/status/health/status"
+        && (!k8s::argo::auto_sync(obj) || failed_revision(obj) == target_revision(obj));
+    if let Some(failed @ ("Failed" | "Error")) = phase
+        && final_failure
+    {
         let at = text("/status/operationState/finishedAt").map_or_default(|t| format!(" at {t}"));
         let message = text("/status/operationState/message").map_or_default(|m| format!(": {m}"));
         return Err(format!("its last operation ended {failed}{at}{message}"));
     }
     Ok(value.map(|_| false))
+}
+
+/// A revision of an Application's status, one source (`revision`) or several (`revisions`).
+fn revision_at(obj: &Value, at: &str) -> Option<String> {
+    let at = obj.pointer(at)?;
+    if let Some(rev) = at.get("revision").and_then(Value::as_str).filter(|r| !r.is_empty()) {
+        return Some(rev.to_string());
+    }
+    let revs: Vec<&str> = at.get("revisions")?.as_array()?.iter().filter_map(Value::as_str).collect();
+    (!revs.is_empty()).then(|| revs.join(","))
+}
+
+/// The revision the last operation synced, or None when it doesn't say (then it is taken
+/// for the one targeted: the failure stays final, as before).
+fn failed_revision(obj: &Value) -> Option<String> {
+    revision_at(obj, "/status/operationState/syncResult")
+        .or_else(|| revision_at(obj, "/status/operationState/operation/sync"))
+        .or_else(|| target_revision(obj))
+}
+
+/// The revision the Application targets now.
+fn target_revision(obj: &Value) -> Option<String> {
+    revision_at(obj, "/status/sync")
 }
 
 /// `kubectl explain` style text.
@@ -363,14 +393,41 @@ mod tests {
     #[test]
     fn a_failed_sync_ends_the_wait_with_argo_cds_message() {
         let failed = app("OutOfSync", "Healthy", Some("Failed"), false);
-        for condition in ["sync=Synced", "operation=Succeeded", "health=Degraded"] {
+        for condition in ["sync=Synced", "operation=Succeeded"] {
             let err = condition_met(&failed, condition).expect_err(condition);
             assert!(err.contains("ended Failed at 2026-11-23T10:00:00Z: one or more objects failed"), "{err}");
         }
+        // Health can change without a sync: a failed sync doesn't end its wait.
+        assert_eq!(condition_met(&failed, "health=Degraded"), Ok(Some(false)));
         assert_eq!(condition_met(&failed, "operation=Failed"), Ok(Some(true)));
         assert_eq!(condition_met(&failed, "health=Healthy"), Ok(Some(true)));
         assert!(condition_met(&app("OutOfSync", "Healthy", Some("Error"), false), "sync=Synced").is_err());
         // A new sync running after it: wait for that one.
         assert_eq!(condition_met(&app("OutOfSync", "Healthy", Some("Failed"), true), "sync=Synced"), Ok(Some(false)));
+    }
+
+    /// A fix pushed to git after a failed sync: with auto-sync on, Argo CD syncs the new
+    /// revision once it sees it, so the old failure doesn't end the wait. On the same
+    /// revision, or with auto-sync off, it does.
+    #[test]
+    fn a_failure_on_an_older_revision_is_not_final_with_auto_sync() {
+        let at = |failed: &str, target: &str, automated: bool| {
+            let mut app = app("OutOfSync", "Healthy", Some("Failed"), false);
+            app["status"]["sync"]["revision"] = json!(target);
+            app["status"]["operationState"]["syncResult"] = json!({"revision": failed});
+            if automated {
+                app["spec"] = json!({"syncPolicy": {"automated": {}}});
+            }
+            app
+        };
+        assert_eq!(condition_met(&at("aaa", "bbb", true), "sync=Synced"), Ok(Some(false)));
+        assert_eq!(condition_met(&at("aaa", "bbb", true), "operation=Succeeded"), Ok(Some(false)));
+        assert!(condition_met(&at("aaa", "aaa", true), "sync=Synced").is_err());
+        assert!(condition_met(&at("aaa", "bbb", false), "sync=Synced").is_err());
+        // Several sources: their revisions together.
+        let mut multi = at("", "", true);
+        multi["status"]["sync"] = json!({"status": "OutOfSync", "revisions": ["a", "c"]});
+        multi["status"]["operationState"]["syncResult"] = json!({"revisions": ["a", "b"]});
+        assert_eq!(condition_met(&multi, "sync=Synced"), Ok(Some(false)));
     }
 }
