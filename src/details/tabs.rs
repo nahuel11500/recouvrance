@@ -612,7 +612,7 @@ impl Render for DetailPanel {
                                     .icon(Lucide::Copy)
                                     .accessibility_label("Copy the name")
                                     .on_click(move |_, _, cx| {
-                                        cx.write_to_clipboard(ClipboardItem::new_string(full_name.clone()))
+                                        cx.write_to_clipboard(ClipboardItem::new_string(full_name.clone()));
                                     }),
                             )
                             .when_some(created, |d, t| {

@@ -5,7 +5,7 @@
 //! [`Control::control`]. gpui builds the accessibility tree only while a screen reader
 //! asks for it, so the names cost nothing otherwise.
 
-use gpui_kit::{Hsla, InteractiveElement, MouseButton, Role, SharedString, StatefulInteractiveElement, Styled as _};
+use gpui_kit::{Hsla, MouseButton, Role, SharedString, StatefulInteractiveElement, Styled as _};
 
 /// A clickable row or card that the keyboard and screen readers can use.
 pub trait Control: StatefulInteractiveElement + Sized {
