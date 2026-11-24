@@ -188,7 +188,7 @@ fn header(ctx: &Ctx, ix: usize, found: &Found, cx: &App) -> Div {
                 .icon(Lucide::ExternalLink)
                 .label(short_url(&url))
                 .tooltip(url.clone())
-                .on_click(move |_, _, _| crate::forwards::open_url(&url))
+                .on_click(move |_, window, cx| crate::forwards::open_url(&url, window, cx))
         }))
         .child(Button::new(("argo-refresh", ix)).xsmall().ghost().icon(Lucide::RefreshCw).label("Refresh").on_click(
             move |_, window, cx| {

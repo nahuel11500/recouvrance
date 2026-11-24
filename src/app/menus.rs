@@ -23,8 +23,12 @@ pub fn init(cx: &mut App) {
     cx.on_action(|_: &HideApp, cx| cx.hide());
     cx.on_action(|_: &HideOtherApps, cx| cx.hide_other_apps());
     cx.on_action(|_: &ShowAllApps, cx| cx.unhide_other_apps());
-    cx.on_action(|_: &OpenHelp, _| crate::forwards::open_url(HELP_URL));
-    cx.on_action(|_: &ReportIssue, _| crate::forwards::open_url(ISSUES_URL));
+    cx.on_action(|_: &OpenHelp, cx| {
+        crate::forwards::open_web_link(HELP_URL, cx);
+    });
+    cx.on_action(|_: &ReportIssue, cx| {
+        crate::forwards::open_web_link(ISSUES_URL, cx);
+    });
     // A window handles these itself. With none open (macOS keeps running then), one opens.
     cx.on_action(|_: &ShowAbout, cx| in_new_window(cx, AppView::show_about));
     cx.on_action(|_: &GoSettings, cx| in_new_window(cx, |app, cx| app.navigate(Route::Settings, cx)));
