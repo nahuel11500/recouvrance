@@ -350,10 +350,10 @@ pub async fn resource_slices(client: Client, node: String) -> Vec<serde_json::Va
 pub fn pods_allocated(pods: &[serde_json::Value], resource: &str) -> (f64, f64) {
     let (mut req, mut lim) = (0.0, 0.0);
     for p in pods {
-        if matches!(p.pointer("/status/phase").and_then(|v| v.as_str()), Some("Succeeded" | "Failed")) {
-            continue;
-        }
-        if p.pointer("/spec/nodeName").and_then(|v| v.as_str()).is_none_or(str::is_empty) {
+        let phase = p.pointer("/status/phase").and_then(|v| v.as_str());
+        let unbound = p.pointer("/spec/nodeName").and_then(|v| v.as_str()).is_none_or(str::is_empty);
+        // Pending with no node: like `pod_requests`, what it asks for is not reserved.
+        if matches!(phase, Some("Succeeded" | "Failed")) || (phase == Some("Pending") && unbound) {
             continue;
         }
         let e = podspec::of_value(p, resource, podspec::Count::Scheduled);
