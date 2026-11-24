@@ -183,14 +183,26 @@ fn rule_block(ctx: &Ctx, a: &Alert, cx: &App) -> Div {
         .children(annotations)
         .children(rule.error.as_ref().map(|e| note(format!("Its last evaluation failed: {e}"), theme.danger)))
         .children(detail.chart.as_ref().map(|chart| {
-            let charted = (chart.expr != rule.query).then(|| {
-                note(format!("Charted: {}, without the comparison, for this alert's series.", chart.expr), muted)
-            });
+            // Only when something was cut: comments and outer parentheses taken off are not.
+            let how = match (chart.cut.set_op, chart.cut.comparison.is_some()) {
+                (Some(op), true) => Some(format!("the part before {op}, without the comparison")),
+                (Some(op), false) => Some(format!("the part before {op}")),
+                (None, true) => Some("without the comparison".to_string()),
+                (None, false) => None,
+            };
+            let charted =
+                how.map(|how| note(format!("Charted: {}, {how}, for this alert's series.", chart.expr), muted));
             let body = match &chart.series {
                 Err(e) => note(format!("No chart: {e}"), muted),
-                Ok(series) if series.is_empty() => {
-                    note("No points for this alert's series in the last 3 hours.".into(), muted)
-                }
+                Ok(series) if series.is_empty() && !chart.matched_on.is_empty() => note(
+                    format!(
+                        "No points in the last 3 hours for the series with this alert's labels ({}). A label the \
+                         alert source adds, such as an external label, would match none of them.",
+                        chart.matched_on.join(", ")
+                    ),
+                    muted,
+                ),
+                Ok(series) if series.is_empty() => note("No points in the last 3 hours.".into(), muted),
                 Ok(series) => {
                     let word = chart.threshold.as_ref().map_or_default(|(op, _)| format!("threshold {op}"));
                     let spec = ChartSpec {

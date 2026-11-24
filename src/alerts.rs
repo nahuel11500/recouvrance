@@ -34,7 +34,7 @@ pub struct Alert {
 /// `pod`, which on kube-state-metrics' alerts can name the exporter's own pod. `service` comes
 /// last: every series scraped through a Service carries its name (kube-state-metrics' own on a
 /// crash-looping pod's alert), so it names the object only when nothing else does
-/// (`TargetDown`).
+/// (`TargetDown`), and only with the scrape's `job` (see `Alert::object`).
 const OBJECT_LABELS: [(&str, &str, &str); 11] = [
     ("deployment", "deployments.apps", "Deployment"),
     ("statefulset", "statefulsets.apps", "StatefulSet"),
@@ -73,7 +73,23 @@ impl Alert {
 
     /// What it is about: (kubectl kind, kind, name), from its labels.
     pub fn object(&self) -> Option<(&'static str, &'static str, &str)> {
-        OBJECT_LABELS.iter().find_map(|(label, kubectl, kind)| Some((*kubectl, *kind, self.label(label)?)))
+        OBJECT_LABELS.iter().find_map(|(label, kubectl, kind)| {
+            // Many rules set a fixed `service` label to route their alerts (a pager service, a
+            // team): it names a Service only on a scrape target's series, which carry `job`.
+            if *label == "service" && self.label("job").is_none() {
+                return None;
+            }
+            Some((*kubectl, *kind, self.label(label)?))
+        })
+    }
+
+    /// The namespace of what it is about. ingress-nginx's series carry the controller's
+    /// `namespace`, and the Ingress's as `exported_namespace`.
+    pub fn object_namespace(&self) -> Option<&str> {
+        match self.object() {
+            Some((_, "Ingress", _)) => self.label("exported_namespace").or_else(|| self.namespace()),
+            _ => self.namespace(),
+        }
     }
 
     /// The host of its `instance` label, without the port: a node's name or address for
@@ -459,7 +475,7 @@ pub fn problems(alerts: &[Alert], namespaces: &[String]) -> Vec<Problem> {
     // (worst severity, how many, summary, firing since)
     let mut groups: BTreeMap<Key, (Severity, usize, &str, Option<jiff::Timestamp>)> = BTreeMap::new();
     for a in alerts.iter().filter(|a| a.is_problem()) {
-        let ns = a.namespace();
+        let ns = a.object_namespace();
         if !namespaces.is_empty() && !ns.is_some_and(|ns| namespaces.iter().any(|n| n == ns)) {
             continue;
         }
@@ -590,7 +606,7 @@ pub fn about(alerts: &[Alert], focus: &Focus) -> Vec<Alert> {
             Focus::Namespace(ns) => a.namespace() == Some(ns.as_str()),
             Focus::Objects { namespace, objects, hosts } => {
                 a.object().is_some_and(|(kubectl, _, name)| {
-                    (kubectl == "nodes" || a.namespace() == namespace.as_deref())
+                    (kubectl == "nodes" || a.object_namespace() == namespace.as_deref())
                         && objects.iter().any(|(k, n)| *k == kubectl && n == name)
                 }) || a.instance_host().is_some_and(|h| hosts.iter().any(|n| n == h))
             }
@@ -709,8 +725,12 @@ pub struct Detail {
 pub struct Chart {
     /// What is drawn: the left side of the comparison, or the whole expression.
     pub expr: String,
+    /// How `expr` was cut from the rule's expression.
+    pub cut: Cut,
     /// The comparison and its number ("> 0.9"), drawn as a line.
     pub threshold: Option<(String, f64)>,
+    /// The alert's labels the series are kept to; empty when every series is drawn.
+    pub matched_on: Vec<String>,
     /// The points, or why they could not be read.
     pub series: Result<crate::prom::Series, String>,
 }
@@ -727,13 +747,18 @@ pub async fn detail(context: String, client: Client, alert: Alert) -> Result<Det
         .ok_or("no Prometheus found")?;
     let rules = rules(&context, client.clone(), &target).await?;
     let Some(rule) = rule_for(&rules, &alert).cloned() else { return Ok(Detail { rule: None, chart: None }) };
-    let (expr, threshold) = chart_expr(&rule.query);
+    let (expr, cut) = chart_expr(&rule.query);
     let query = series_query(&expr, &alert, &rule);
+    let matched_on = own_labels(&alert, &rule).into_iter().map(|(k, _)| k.clone()).collect();
     let step = (CHART_MINUTES * 60 / 120).max(15);
     let series = crate::prom::range(client, target, query, CHART_MINUTES, step).await.map_err(|e| k8s::short_error(&e));
-    let chart = Chart { expr, threshold: threshold.map(|(op, n)| (op.to_string(), n)), series };
+    let threshold = cut.threshold().map(|(op, n)| (op.to_string(), n));
+    let chart = Chart { expr, cut, threshold, matched_on, series };
     Ok(Detail { rule: Some(rule), chart: Some(chart) })
 }
+
+/// Set operators: they bind looser than comparisons.
+const SET_OPS: [&str; 3] = ["and", "or", "unless"];
 
 /// Comparison operators, longest first so `>=` is not read as `>`.
 const COMPARISONS: [&str; 6] = ["==", "!=", ">=", "<=", ">", "<"];
@@ -801,14 +826,31 @@ fn number(side: &str) -> Option<f64> {
     strip_parens(side).parse::<f64>().ok().filter(|n| n.is_finite())
 }
 
+/// How a rule's expression was cut to be charted.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Cut {
+    /// The comparison taken out, and its number when the other side is one.
+    pub comparison: Option<(&'static str, Option<f64>)>,
+    /// The set operator (`and`, `or`, `unless`) the expression was cut at.
+    pub set_op: Option<&'static str>,
+}
+
+impl Cut {
+    /// The comparison and its number, when the other side is one: a line on the chart.
+    pub fn threshold(self) -> Option<(&'static str, f64)> {
+        let (op, n) = self.comparison?;
+        Some((op, n?))
+    }
+}
+
 /// What a chart of a rule draws: the left side of its comparison (the comparison keeps only
 /// the points past the threshold, so the whole expression draws nothing below it), and the
 /// threshold when the other side is a number. `a > 1 and b` is cut at `and` first, which
 /// binds looser. The whole expression when there is no comparison (`absent(…)`).
-pub fn chart_expr(query: &str) -> (String, Option<(&'static str, f64)>) {
+pub fn chart_expr(query: &str) -> (String, Cut) {
     let clean = without_comments(query);
-    let (expr, threshold) = split_comparison(&clean);
-    (expr.to_string(), threshold)
+    let (expr, cut) = split_comparison(&clean);
+    (expr.to_string(), cut)
 }
 
 /// The expression without its `# …` comments (outside strings), which run to the line's end.
@@ -841,14 +883,14 @@ fn without_comments(query: &str) -> String {
 }
 
 /// `chart_expr` on an expression without comments.
-fn split_comparison(query: &str) -> (&str, Option<(&'static str, f64)>) {
+fn split_comparison(query: &str) -> (&str, Cut) {
     let query = strip_parens(query);
     let mut end = query.len();
     let mut comparison: Option<(usize, &'static str)> = None;
     top_level(query, |at, rest| {
         let word = rest.find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == ':')).unwrap_or(rest.len());
         if word > 0 {
-            if matches!(&rest[..word], "and" | "or" | "unless") {
+            if SET_OPS.contains(&&rest[..word]) {
                 end = at;
                 return None;
             }
@@ -862,9 +904,19 @@ fn split_comparison(query: &str) -> (&str, Option<(&'static str, f64)>) {
         }
         Some(0)
     });
-    let Some((at, op)) = comparison.filter(|(at, _)| *at < end) else { return (strip_parens(&query[..end]), None) };
+    let set_op =
+        (end < query.len()).then(|| SET_OPS.into_iter().find(|w| query[end..].starts_with(w)).unwrap_or("and"));
+    let Some((at, op)) = comparison.filter(|(at, _)| *at < end) else {
+        let part = strip_parens(&query[..end]);
+        // `(a > 1) and b`: the comparison is inside the parentheses taken off; look again.
+        if part.len() < query.len() {
+            let (expr, inner) = split_comparison(part);
+            return (expr, Cut { comparison: inner.comparison, set_op: set_op.or(inner.set_op) });
+        }
+        return (part, Cut { comparison: None, set_op });
+    };
     let (left, right) = (strip_parens(&query[..at]), strip_parens(&query[at + op.len()..end]));
-    match (number(left), number(right)) {
+    let (expr, comparison) = match (number(left), number(right)) {
         // `0.9 < x`: the number on the left, so x is drawn against it, the comparison turned.
         (Some(n), None) => {
             let turned = match op {
@@ -874,10 +926,11 @@ fn split_comparison(query: &str) -> (&str, Option<(&'static str, f64)>) {
                 "<=" => ">=",
                 same => same,
             };
-            (right, Some((turned, n)))
+            (right, (turned, Some(n)))
         }
-        (_, n) => (left, n.map(|n| (op, n))),
-    }
+        (_, n) => (left, (op, n)),
+    };
+    (expr, Cut { comparison: Some(comparison), set_op })
 }
 
 /// A `PromQL` string literal holding `value`.
@@ -905,15 +958,24 @@ fn plain_label(name: &str) -> bool {
         && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
-/// `expr` kept to the alert's own series: the alert's labels, without the rule's (added to
-/// the alert, not on the series), matched with `and on(…)` against a one-sample vector that
-/// carries them. Without such labels, `expr` itself.
-fn series_query(expr: &str, alert: &Alert, rule: &Rule) -> String {
-    let own: Vec<(&String, &String)> = alert
+/// Labels the alert source adds to every alert, never on the expression's series: vmalert's
+/// `alertgroup` (unless it runs with `-disableAlertgroupLabel`).
+const SOURCE_LABELS: [&str; 2] = ["alertname", "alertgroup"];
+
+/// The alert's labels that come from its series: without the rule's (added to the alert,
+/// not on the series) and the alert source's.
+fn own_labels<'a>(alert: &'a Alert, rule: &Rule) -> Vec<(&'a String, &'a String)> {
+    alert
         .labels
         .iter()
-        .filter(|(k, _)| k.as_str() != "alertname" && !rule.labels.contains_key(*k) && plain_label(k))
-        .collect();
+        .filter(|(k, _)| !SOURCE_LABELS.contains(&k.as_str()) && !rule.labels.contains_key(*k) && plain_label(k))
+        .collect()
+}
+
+/// `expr` kept to the alert's own series: its `own_labels`, matched with `and on(…)` against
+/// a one-sample vector that carries them. Without such labels, `expr` itself.
+fn series_query(expr: &str, alert: &Alert, rule: &Rule) -> String {
+    let own = own_labels(alert, rule);
     if own.is_empty() {
         return expr.to_string();
     }
@@ -1199,6 +1261,34 @@ mod tests {
     }
 
     #[test]
+    fn a_rules_service_label_is_not_a_service() {
+        // A fixed `service` label set by the rule to route the alert, on a namespace's alert.
+        let routed = alert(&[("alertname", "QuotaAlmostFull"), ("namespace", "shop"), ("service", "payments")]);
+        assert_eq!(routed.object(), None);
+        let rows = problems(&[routed], &[]);
+        assert_eq!((rows[0].kind.as_str(), rows[0].name.as_str()), ("namespaces", "shop"));
+    }
+
+    #[test]
+    fn ingress_nginx_alerts_open_the_ingress_in_its_namespace() {
+        // ingress-nginx's series: the controller's namespace, the Ingress's as `exported_namespace`.
+        let a = alert(&[
+            ("alertname", "IngressErrors"),
+            ("ingress", "shop"),
+            ("namespace", "ingress-nginx"),
+            ("exported_namespace", "web"),
+        ]);
+        let rows = problems(std::slice::from_ref(&a), &[]);
+        assert_eq!((rows[0].namespace.as_deref(), rows[0].name.as_str()), (Some("web"), "shop"));
+        let ing = named("shop", Some("web"), &[], Value::Null);
+        let page = focus(&kind("networking.k8s.io", "Ingress"), &ing, &[]).unwrap();
+        assert_eq!(about(&[a], &page).len(), 1);
+        // kube-state-metrics' series carry the Ingress's own namespace.
+        let ksm = alert(&[("ingress", "shop"), ("namespace", "web")]);
+        assert_eq!(ksm.object_namespace(), Some("web"));
+    }
+
+    #[test]
     fn a_nodes_page_shows_the_alerts_of_its_exporters() {
         let node = serde_json::json!({"metadata": {"name": "worker-1"}, "status": {"addresses": [
             {"type": "InternalIP", "address": "10.0.0.7"}, {"type": "Hostname", "address": "worker-1"}
@@ -1264,6 +1354,15 @@ mod tests {
 
     #[test]
     fn charts_the_left_side_of_the_comparison() {
+        // What is drawn and the threshold.
+        fn split_comparison(q: &str) -> (&str, Option<(&'static str, f64)>) {
+            let (expr, cut) = super::split_comparison(q);
+            (expr, cut.threshold())
+        }
+        fn chart_expr(q: &str) -> (String, Option<(&'static str, f64)>) {
+            let (expr, cut) = super::chart_expr(q);
+            (expr, cut.threshold())
+        }
         assert_eq!(split_comparison("max_over_time(x[5m]) >= 1"), ("max_over_time(x[5m])", Some((">=", 1.0))));
         // Matchers, strings and subqueries inside are not comparisons.
         assert_eq!(
@@ -1284,6 +1383,22 @@ mod tests {
         assert_eq!(split_comparison("(a) > (b)"), ("a", None));
         assert_eq!(split_comparison("absent(up{job=\"x\"})"), ("absent(up{job=\"x\"})", None));
         assert_eq!(split_comparison("a unless b"), ("a", None));
+        // A comparison inside the parentheses of the part kept before `and`/`unless`.
+        assert_eq!(split_comparison("(a > 1) and b"), ("a", Some((">", 1.0))));
+        assert_eq!(split_comparison("(rate(x[5m]) > 0.1) and on(pod) y"), ("rate(x[5m])", Some((">", 0.1))));
+        assert_eq!(split_comparison("(a / b < 0.1) unless z"), ("a / b", Some(("<", 0.1))));
+    }
+
+    #[test]
+    fn says_how_the_expression_was_cut() {
+        let cut = |q| chart_expr(q).1;
+        assert_eq!(cut("a > 1"), Cut { comparison: Some((">", Some(1.0))), set_op: None });
+        assert_eq!(cut("a > b"), Cut { comparison: Some((">", None)), set_op: None });
+        // Only comments and parentheses taken off: nothing was cut.
+        assert_eq!(cut("(absent(x)) # note"), Cut::default());
+        assert_eq!(cut("a unless b"), Cut { comparison: None, set_op: Some("unless") });
+        assert_eq!(cut("a or b > 1"), Cut { comparison: None, set_op: Some("or") });
+        assert_eq!(cut("(a > 1) and b"), Cut { comparison: Some((">", Some(1.0))), set_op: Some("and") });
     }
 
     #[test]
@@ -1303,6 +1418,10 @@ mod tests {
         );
         // Only the rule's labels: the expression as it is.
         assert_eq!(series_query("x", &alert(&[("alertname", "A"), ("severity", "warning")]), &rule), "x");
+        // vmalert adds `alertgroup` to every alert: no series carries it.
+        let vm = alert(&[("alertname", "A"), ("alertgroup", "k8s"), ("severity", "warning"), ("pod", "p")]);
+        assert_eq!(series_query("x", &vm, &rule), r#"(x) and on(pod) label_replace(vector(1), "pod", "p", "", "")"#);
+        assert_eq!(own_labels(&vm, &rule).len(), 1);
     }
 
     /// What a `PromQL` double-quoted string literal holds, or None when it is not one.
@@ -1407,9 +1526,9 @@ mod tests {
                 _ => format!("({name}{sel} - {name}) * 100"),
             };
             let comment = comment.map_or_default(|c| format!(" # {c}\n"));
-            let (expr, threshold) = chart_expr(&format!("{left} {op} {n}{comment}"));
+            let (expr, cut) = chart_expr(&format!("{left} {op} {n}{comment}"));
             prop_assert_eq!(expr, left);
-            prop_assert_eq!(threshold, Some((op, n)));
+            prop_assert_eq!(cut.threshold(), Some((op, n)));
         }
     }
 }
