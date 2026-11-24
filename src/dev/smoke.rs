@@ -44,6 +44,10 @@ pub fn run(ctx: String) {
                 problems_by_kind(&client, &kinds).await;
                 return;
             }
+            if how == "twice" {
+                problems_twice(&client, &kinds).await;
+                return;
+            }
             let t = std::time::Instant::now();
             let scan = problems::scan_partial(client.clone(), &kinds, None, None).await;
             let p = &scan.problems;
@@ -351,6 +355,26 @@ async fn problems_by_kind(client: &kube::Client, kinds: &[k8s::Kind]) {
         if let Some(skipped) = scan.skipped_text() {
             println!("  could not read {skipped}");
         }
+    }
+}
+
+/// Two Problems scans one after the other (`RECOUVRANCE_PROBLEMS=twice`): each one's time,
+/// and the requests it sent and the bytes it received, from the API requests meter. The
+/// second shows what a scan costs when the one before can be reused.
+async fn problems_twice(client: &kube::Client, kinds: &[k8s::Kind]) {
+    for run in ["first", "second"] {
+        k8s::meter::reset();
+        let t = std::time::Instant::now();
+        let scan = problems::scan_partial(client.clone(), kinds, None, None).await;
+        let took = t.elapsed();
+        let snapshot = k8s::meter::snapshot(k8s::meter::now_minute());
+        let requests: u64 = snapshot.classes.iter().map(|(_, _, s)| s.count).sum();
+        let bytes: u64 = snapshot.classes.iter().map(|(_, _, s)| s.bytes).sum();
+        println!(
+            "{run} scan: {} problems in {took:?}, {requests} requests, {} MB received",
+            scan.problems.len(),
+            bytes / 1_000_000
+        );
     }
 }
 
