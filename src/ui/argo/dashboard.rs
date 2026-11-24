@@ -81,7 +81,7 @@ pub(super) struct Dashboard {
     /// Reads it again while a sync runs, once the page is shown.
     tick: Option<Task<()>>,
     /// The parts unfolded: "why", "steps", "diff", "history", "pods", "problems",
-    /// "why-<resource>".
+    /// `"why-<resource>"`.
     open: HashSet<String>,
     /// Made-up environments and their cards (the developer tools' example): nothing is read.
     example: Option<Vec<(String, Arc<Cards>)>>,
