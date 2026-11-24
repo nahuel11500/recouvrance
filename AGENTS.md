@@ -2,10 +2,14 @@
 
 ## Building
 
-- **Don't build unless you have to.** CI is free and runs clippy and the tests on every PR, so
-  it is the check: run `cargo fmt --all` (no build), push, and read CI's log if it fails. Read
-  the code instead of compiling to find out. Build locally only when CI's log is not enough,
-  and then run the narrowest command (one test, or clippy alone).
+- **Don't build unless you have to.** CI is free and runs the tests on every PR, so it is the
+  check for them: read the code instead of compiling to find out, and build locally only when
+  CI's log is not enough, with the narrowest command (one test).
+- **Push through the pre-push hook.** Once per checkout: `git config core.hooksPath scripts/hooks`.
+  Before each push it runs what CI fails on most: `cargo fmt --check`, `typos`, `cargo deny`,
+  then clippy (with and without `dev`) in the main checkout's target dir, one at a time across
+  worktrees and on half the cores. Fix what it reports before pushing; `--no-verify` is only for
+  a push that changes no Rust code.
 - **Use at most half the machine's cores.** Set the job count on every cargo command
   that compiles (build, run, test, clippy, check, doc):
 
