@@ -176,7 +176,7 @@ impl AppView {
     pub(super) fn refresh_page(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         match self.route().clone() {
             Route::Resources(_) => {
-                self.restart_watch(cx);
+                self.reload_watch(cx);
                 return;
             }
             Route::Problems(p) => p.update(cx, ProblemsView::refresh),
