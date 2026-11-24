@@ -80,6 +80,14 @@ impl AppView {
         self.put_filter(text.to_string(), window, cx);
     }
 
+    /// Stop the problem badge's counts: their scans would hide the requests of the page on
+    /// screen (see `RECOUVRANCE_REQUESTS`).
+    #[cfg(feature = "dev")]
+    pub fn demo_stop_badge(&mut self, cx: &mut Context<Self>) {
+        self.problems.clear();
+        cx.notify();
+    }
+
     /// Check the first `n` rows, then optionally open a bulk confirmation (never confirmed).
     #[cfg(feature = "dev")]
     pub fn demo_mark(&mut self, n: usize, bulk: Option<&'static str>, window: &mut Window, cx: &mut Context<Self>) {

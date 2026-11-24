@@ -56,7 +56,9 @@
 - **Detail pages** for pods (per-container tabs, native sidecars, init and debug containers
   included: probes, usage vs requests/limits, ports, env, mounts), workloads (scheduling, pods, revisions with diffs), services (port-forward, backing
   pods), secrets (masked, referenced by), ingresses, PVCs, namespaces (quotas), nodes, CronJobs,
-  and a generic spec/status view for anything else.
+  and a generic spec/status view for anything else. A page follows its object and its pods with
+  watches: a change shows about a second after it happens, nothing is read again while nothing
+  changes, and an object deleted then created again under its name is followed.
 - **Map**: every detail page has a Map tab, what the object is linked to. A pod or workload
   starts with its tree (Services, the ConfigMaps, Secrets, PVCs and ServiceAccount its pods use,
   not the `kube-api-access-*` volume every pod gets; ReplicaSets, pods, nodes). Then, for every
@@ -531,8 +533,8 @@
   *Refresh*/*Hard refresh*/*Sync*/*Terminate*/*Roll back*, create/apply YAML (a server dry run first, then a confirmation listing each
   object's kind, namespace and name). YAML edits on a detail page save only that object: a changed
   kind, API group, namespace or name is refused, and so are masked Secret values. Every
-  confirmation shows the equivalent `kubectl` command. A page whose object is deleted says so and
-  stops polling.
+  confirmation shows the equivalent `kubectl` command. A page whose object is deleted says so, and
+  shows the one created again under its name, if one is.
 - **Run as** (Settings → Contexts → *Run as*): set a user (and groups) a
   context's writes may run as, like `kubectl --as`. Write confirmations then show a *Run as
   `<identity>`* checkbox, off each time; checked, that one action runs as the identity and the
