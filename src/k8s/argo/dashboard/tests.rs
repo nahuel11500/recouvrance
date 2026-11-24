@@ -312,8 +312,8 @@ fn one_repository_at_several_tags_is_no_change() {
     assert!(image_changes(&both, Some(&both)).iter().all(|i| i.from.is_none()));
     // One of them moved to a tag not there before: that one changed.
     let now = ["r.example/a/worker:1".to_string(), "r.example/a/worker:3".into()];
-    let from: Vec<(&str, Option<&str>)> =
-        image_changes(&now, Some(&both)).iter().map(|i| (i.tag.as_str(), i.from.as_deref())).collect();
+    let images = image_changes(&now, Some(&both));
+    let from: Vec<(&str, Option<&str>)> = images.iter().map(|i| (i.tag.as_str(), i.from.as_deref())).collect();
     assert_eq!(from, [("1", None), ("3", Some("1"))]);
 }
 

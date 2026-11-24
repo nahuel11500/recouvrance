@@ -355,9 +355,10 @@ impl ArgoView {
                     .map(|k| {
                         let found = self.find(k);
                         let tone = found.map_or(Tone::Done, |a| argo::attention(&a.app));
-                        let label = match found {
-                            Some(a) if sourced => format!("{} · {}", k.2, a.source.label()),
-                            _ => k.2.clone(),
+                        let label = if let Some(a) = found.filter(|_| sourced) {
+                            format!("{} · {}", k.2, a.source.label())
+                        } else {
+                            k.2.clone()
                         };
                         (label, tone)
                     })
