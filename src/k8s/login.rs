@@ -91,7 +91,7 @@ pub fn build_error(e: kube::Error, program: Option<&str>) -> anyhow::Error {
     if let Some(said) = failure(&e, program) {
         return LoginFailed(said).into();
     }
-    let e = anyhow::Error::from(proxy_host_only(e));
+    let e = proxy_host_only(e);
     // Any other URL in what it says. `{e:?}` says the same texts as `{e:#}`.
     match without_userinfo(&format!("{e:#}")) {
         Cow::Owned(said) => anyhow::Error::msg(said),
@@ -99,33 +99,62 @@ pub fn build_error(e: kube::Error, program: Option<&str>) -> anyhow::Error {
     }
 }
 
-/// kube's error for a proxy it can't use, its URL without user and password; any other error
-/// as it is.
-fn proxy_host_only(e: kube::Error) -> kube::Error {
+/// kube's error for a proxy it can't use, its URL without user and password (in kube's words,
+/// with only the scheme when the host can't be told from the password); any other error as it
+/// is.
+fn proxy_host_only(e: kube::Error) -> anyhow::Error {
     use kube::Error::{ProxyProtocolDisabled, ProxyProtocolUnsupported};
     match e {
-        ProxyProtocolUnsupported { proxy_url } => {
-            ProxyProtocolUnsupported { proxy_url: Box::new(host_only(*proxy_url)) }
-        }
-        ProxyProtocolDisabled { proxy_url, protocol_feature } => {
-            ProxyProtocolDisabled { proxy_url: Box::new(host_only(*proxy_url)), protocol_feature }
-        }
-        e => e,
+        ProxyProtocolUnsupported { proxy_url } => match host_only(*proxy_url) {
+            Ok(url) => ProxyProtocolUnsupported { proxy_url: Box::new(url) }.into(),
+            Err(shown) => anyhow::anyhow!("configured proxy {shown} uses an unsupported protocol"),
+        },
+        ProxyProtocolDisabled { proxy_url, protocol_feature } => match host_only(*proxy_url) {
+            Ok(url) => ProxyProtocolDisabled { proxy_url: Box::new(url), protocol_feature }.into(),
+            Err(shown) => {
+                anyhow::anyhow!("configured proxy {shown} requires the disabled feature {protocol_feature:?}")
+            }
+        },
+        e => e.into(),
     }
 }
 
 /// `uri` without the user and password before its host: `socks5h://user:password@host:1080/`
-/// gives `socks5h://host:1080/`, `user:password@host:1080` gives `host:1080`.
-fn host_only(uri: http::Uri) -> http::Uri {
-    let Some((_, host)) = uri.authority().and_then(|a| a.as_str().rsplit_once('@')) else {
-        return uri;
+/// gives `socks5h://host:1080/`, `user:password@host:1080` gives `host:1080`. When the host
+/// can't be told apart from the password, the text to show in the URL's place instead: its
+/// scheme alone (`socks5h://…`).
+///
+/// `uri` is what kube read from the kubeconfig or `HTTPS_PROXY`, where the password may hold an
+/// unescaped `/`, `?` or `#` (#889). `http::Uri` ends the authority there, so the `@` before the
+/// host is in its path or query, or gone with the fragment it drops. A proxy's URL has no path
+/// or query: everything up to the last `@` of the whole text goes. With a `#`, what is left is
+/// a cut password that reads as a host (`user:pass` from `user:pass#word@host:1080`, `word`
+/// from `user:p@word#x@host:1080`); its port is no number, or it has none after a user: only
+/// the scheme is shown then. (A password of digits up to its `#`, `user:1234#x@host`, reads as
+/// a host and port of its own: nothing tells it from one.)
+fn host_only(uri: http::Uri) -> Result<http::Uri, String> {
+    let hidden = |uri: &http::Uri| uri.scheme_str().map_or_else(|| "…".to_owned(), |s| format!("{s}://…"));
+    let text = uri.to_string();
+    let rest = text.split_once("://").map_or(text.as_str(), |(_, rest)| rest);
+    let Some((_, host)) = rest.rsplit_once('@') else {
+        return match uri.authority().and_then(port_is_number) {
+            Some(false) => Err(hidden(&uri)),
+            _ => Ok(uri),
+        };
     };
-    // A host that doesn't read on its own (`u[@h]:1`) goes too, and the URL with it: better
-    // than the password.
-    let host = host.parse::<http::uri::Authority>().ok();
-    let mut parts = uri.into_parts();
-    parts.authority = host;
-    http::Uri::from_parts(parts).unwrap_or_default()
+    let again = uri.scheme_str().map_or_else(|| host.to_owned(), |s| format!("{s}://{host}"));
+    match again.parse::<http::Uri>() {
+        // A host that doesn't read on its own (`u[@h]:1`) goes too: better than the password.
+        Ok(shown) if shown.authority().and_then(port_is_number) == Some(true) => Ok(shown),
+        _ => Err(hidden(&uri)),
+    }
+}
+
+/// Whether the port after `authority`'s host is a number; `None` without one.
+fn port_is_number(authority: &http::uri::Authority) -> Option<bool> {
+    let text = authority.as_str();
+    let host_end = text.rfind('@').map_or(0, |at| at + 1) + authority.host().len();
+    text[host_end..].strip_prefix(':').map(|port| port.parse::<u16>().is_ok())
 }
 
 /// `text` without the user and password of any URL in it: after each `://`, everything up to
@@ -511,6 +540,14 @@ mod tests {
             ("alice:s3cr3t@proxy.corp:3128", "proxy.corp:3128"),
             ("socks4://alice:s3%40cr3t@[::1]:1080/x?y", "socks4://[::1]:1080/x?y"),
             ("socks5h://alice@proxy.corp:1080", "socks5h://proxy.corp:1080/"),
+            // An unescaped `/`, `?` or `#` in the password, where `http::Uri` ends the authority
+            // (#889): the `@` before the host is in the path or query, or gone with the fragment.
+            ("socks5h://alice:s3/cr3t@proxy.corp:1080", "socks5h://proxy.corp:1080/"),
+            ("socks5h://alice:s3?cr3t@proxy.corp:1080", "socks5h://proxy.corp:1080/"),
+            ("socks5h://alice:s3cr3t#2024@proxy.corp:1080", "socks5h://…"),
+            ("socks5h://alice:s3@cr3t#2024@proxy.corp:1080", "socks5h://…"),
+            // Without a port after a user, the host may be the end of a password cut at a `#`.
+            ("socks5h://alice@proxy.corp", "socks5h://…"),
         ];
         for (url, shown) in cases {
             let e = kube::Error::ProxyProtocolUnsupported { proxy_url: Box::new(url.parse().unwrap()) };
@@ -527,6 +564,11 @@ mod tests {
         let built =
             build_error(kube::Error::ProxyProtocolDisabled { proxy_url, protocol_feature: "kube/socks5" }, None);
         let said = r#"configured proxy socks5://proxy.corp:1080/ requires the disabled feature "kube/socks5""#;
+        assert_eq!(format!("{built:#}"), said);
+        let proxy_url = Box::new("socks5://alice:s3cr3t#x@proxy.corp:1080".parse().unwrap());
+        let built =
+            build_error(kube::Error::ProxyProtocolDisabled { proxy_url, protocol_feature: "kube/socks5" }, None);
+        let said = r#"configured proxy socks5://… requires the disabled feature "kube/socks5""#;
         assert_eq!(format!("{built:#}"), said);
         // Another error that prints a URL: its user and password go, the rest is said.
         let other =
@@ -690,16 +732,18 @@ mod url_properties {
         }
 
         /// Whatever a proxy's URL holds, with a scheme or without, the error of building a client
-        /// with it names the proxy by its host and port, never its user and password, however it
-        /// is printed (#859).
+        /// with it never shows its user and password, however it is printed (#859), even with an
+        /// unescaped `/`, `?` or `#` in the password (#889). It names the proxy by its host and
+        /// port, but by its scheme alone when a `#` in the password cut the URL short.
         #[test]
         fn a_proxy_never_shows_its_user_and_password(
             scheme in proptest::option::of("[a-z][a-z0-9+.-]{0,8}"),
             user in "[a-zA-Z0-9._~!$&'()*+,;=-]{0,8}",
-            password in proptest::option::of("[a-zA-Z0-9._~!$&'()*+,;=%:@-]{0,8}"),
+            password in proptest::option::of("[a-zA-Z0-9._~!$&'()*+,;=%:@/?#-]{0,8}"),
             host in "[a-z0-9][a-z0-9.-]{0,15}|\\[[0-9a-f:]{2,12}\\]",
             port in any::<u16>(),
         ) {
+            let cut = password.as_deref().is_some_and(|p| p.contains('#'));
             let userinfo =
                 password.map_or_else(|| format!("{SECRET}{user}"), |p| format!("{SECRET}{user}:{SECRET}{p}"));
             let at = format!("{host}:{port}");
@@ -709,11 +753,12 @@ mod url_properties {
             let built = build_error(kube::Error::ProxyProtocolUnsupported { proxy_url: Box::new(proxy_url) }, None);
             for said in [format!("{built:#}"), format!("{built:?}"), format!("{built:#?}")] {
                 prop_assert!(!said.contains(SECRET), "{said}\nfrom {url}");
-                prop_assert!(said.contains(&at), "{said}\nfrom {url}");
+                prop_assert!(cut || said.contains(&at), "{said}\nfrom {url}");
             }
             if let Some(scheme) = &scheme {
                 let said = format!("{built:#}");
-                prop_assert!(said.contains(&format!("{scheme}://{at}")), "{said}\nfrom {url}");
+                let shown = if cut { format!("{scheme}://") } else { format!("{scheme}://{at}") };
+                prop_assert!(said.contains(&shown), "{said}\nfrom {url}");
             }
         }
     }

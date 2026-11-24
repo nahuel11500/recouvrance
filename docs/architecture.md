@@ -139,5 +139,7 @@ is read every `detail_refresh`.
 - **Proxy passwords stay out of errors.** kube's error for a proxy it can't use prints the proxy's
   URL whole, user and password included. The client's build error puts that URL back without
   them, scheme or not (`user:password@host:1080` from `HTTPS_PROXY` reads as a URL to kube, not
-  to a text), and leaves out the user and password of any other URL in its text, as of one in the
+  to a text), whatever the password holds: a proxy's URL has no path or query, so everything up
+  to its last `@` goes, and a host left by a `#` that cut it short (a port that is no number, or
+  none after a user) is not shown, only the scheme. It leaves out the user and password of any other URL in its text, as of one in the
   login plugin's stderr line (`k8s::login`).
