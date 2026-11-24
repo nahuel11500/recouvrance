@@ -463,10 +463,7 @@ impl KubeMcp {
             Err(e) => return call.finish(Err(e)),
         };
         let q = p.query.to_lowercase();
-        let mut rows = Vec::new();
-        // The kinds that couldn't be listed, with why: the agent must not read them as empty.
-        let (mut searched, mut failed) = (0, Vec::new());
-        for name in [
+        let searched: Vec<Kind> = [
             "deployments",
             "statefulsets",
             "daemonsets",
@@ -478,13 +475,21 @@ impl KubeMcp {
             "pods",
             "namespaces",
             "nodes",
-        ] {
-            let Some(kind) = k8s::find_kind(&kinds, name).cloned() else { continue };
-            if list_verdict(call.policy(), &kind, &p.context) == Mode::Deny {
-                continue;
-            }
-            searched += 1;
-            let names = match k8s::list_names(client.clone(), kind.ar.clone(), None).await {
+        ]
+        .into_iter()
+        .filter_map(|name| k8s::find_kind(&kinds, name).cloned())
+        .filter(|kind| list_verdict(call.policy(), kind, &p.context) != Mode::Deny)
+        .collect();
+        // All at once: the search takes about as long as its slowest list, not their sum. The
+        // per-namespace requests of big lists share one bounded pool (see `list_light`).
+        let lists =
+            futures::future::join_all(searched.iter().map(|kind| k8s::search_names(client.clone(), kind.clone())))
+                .await;
+        let mut rows = Vec::new();
+        // The kinds that couldn't be listed, with why: the agent must not read them as empty.
+        let mut failed = Vec::new();
+        for (kind, names) in searched.iter().zip(lists) {
+            let names = match names {
                 Ok(names) => names,
                 Err(e) => {
                     failed.push(format!("{} ({e:#})", kind.kubectl_name()));
@@ -496,14 +501,14 @@ impl KubeMcp {
                     continue;
                 }
                 // Search asks nobody: only what a rule allows outright.
-                if !call.may_see(&access_for(&kind, &p.context, Verb::List, ns.clone(), Some(obj.clone()))) {
+                if !call.may_see(&access_for(kind, &p.context, Verb::List, ns.clone(), Some(obj.clone()))) {
                     continue;
                 }
                 rows.push(vec![kind.kubectl_name(), ns.unwrap_or_default(), obj]);
             }
         }
         rows.truncate(call.policy().max_rows as usize);
-        if searched > 0 && failed.len() == searched {
+        if !searched.is_empty() && failed.len() == searched.len() {
             return call.finish(Err(anyhow::anyhow!("couldn't search: {}", failed.join("; "))));
         }
         let mut out = if rows.is_empty() {
