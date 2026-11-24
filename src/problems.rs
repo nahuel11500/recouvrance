@@ -490,8 +490,19 @@ async fn run_all(jobs: Vec<Job>) -> Scan {
     out
 }
 
-/// Problems in a cluster (or one namespace), worst first, at once: the developer checks and
-/// the end-to-end tests. The app scans through `shared`, which shows each check as it finishes.
+/// Problems in the whole cluster of `context`, worst first, at once, with the Argo CD
+/// Applications that deploy to it as the app's scans check them: what the developer checks
+/// time before a release. The app scans through `shared`, which shows each check as it
+/// finishes.
+#[cfg(feature = "dev")]
+pub async fn scan_with_argo(client: Client, kinds: &[Kind], context: &str) -> Scan {
+    let mut jobs = kind_jobs(&client, kinds, None, None, None);
+    jobs.push(argo_apps::job(context, &client, kinds, &[]));
+    run_all(jobs).await
+}
+
+/// Problems in a cluster (or one namespace), worst first, at once, without the Argo CD
+/// Applications read on hubs: the end-to-end tests.
 #[cfg(feature = "dev")]
 pub async fn scan_partial(client: Client, kinds: &[Kind], namespace: Option<String>, context: Option<&str>) -> Scan {
     run_all(kind_jobs(&client, kinds, namespace.as_deref(), context, None)).await

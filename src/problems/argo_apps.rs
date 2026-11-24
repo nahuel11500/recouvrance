@@ -7,6 +7,7 @@ use kube::Client;
 use super::{OnHub, Problem, Scan, Severity};
 use crate::k8s;
 use crate::k8s::argo::{self, LeanApp};
+use crate::status::Tone;
 
 /// What a row says the kind is.
 pub const LABEL: &str = "Argo CD Application";
@@ -16,6 +17,23 @@ const MESSAGE_CHARS: usize = 200;
 
 /// The check's name among a scan's checks.
 pub const CHECK: &str = "Argo CD Applications";
+
+/// What a row's reason ends with when the Application's hub is another cluster.
+pub fn hub_note(hub: &str) -> String {
+    format!(" (Argo CD on {hub})")
+}
+
+/// Where an Application lives, for an agent to read it there: "Argo CD Application
+/// argocd/web on hub".
+pub fn location(on: &OnHub, name: &str) -> String {
+    format!("{LABEL} {}/{name} on {}", on.namespace, on.context)
+}
+
+/// The hub a skipped entry of this check names ("Argo CD Applications on hub (forbidden)").
+pub fn skipped_hub(entry: &str) -> Option<&str> {
+    let rest = entry.strip_prefix(CHECK)?.strip_prefix(" on ")?;
+    Some(rest.split_once(" (").map_or(rest, |(hub, _)| hub))
+}
 
 /// "what: message", the message on one line and cut to `MESSAGE_CHARS`.
 fn with_message(what: &str, message: Option<&str>) -> String {
@@ -49,14 +67,16 @@ pub fn judge(app: &LeanApp, now: jiff::Timestamp) -> Option<(Severity, String)> 
     };
     let health = status.health.as_ref();
     let message = health.and_then(|h| h.message.as_deref());
-    match health.and_then(|h| h.status.as_deref()) {
-        Some("Degraded") => add(Severity::Critical, with_message("Degraded", message)),
-        Some("Missing") if app.automated() => add(Severity::Warning, with_message("Missing", message)),
-        _ => {}
+    // The Argo CD page's rule, so the two can't disagree on Missing.
+    if let Some(state) = health.and_then(|h| h.status.as_deref())
+        && argo::listed_health_tone(state, app.automated()) == Tone::Bad
+    {
+        let severity = if state == "Degraded" { Severity::Critical } else { Severity::Warning };
+        add(severity, with_message(state, message));
     }
     if let Some(op) = &status.operation {
         let phase = op.phase.as_deref().unwrap_or_default();
-        if argo::operation_tone(phase) == crate::status::Tone::Bad {
+        if argo::operation_tone(phase) == Tone::Bad {
             add(Severity::Warning, with_message("last sync failed", op.message.as_deref()));
         } else if matches!(phase, "Running" | "Terminating") {
             let started = op.started.as_deref().and_then(|t| t.parse::<jiff::Timestamp>().ok());
@@ -87,7 +107,7 @@ fn found_on(apps: &[LeanApp], hub: &str, context: &str, namespaces: &[String], n
             let (severity, mut reason) = judge(a, now)?;
             // The row is under the cluster it deploys to: say where Argo CD is when elsewhere.
             if hub != context {
-                reason.push_str(&format!(" (Argo CD on {hub})"));
+                reason.push_str(&hub_note(hub));
             }
             Some(Problem {
                 severity,
@@ -114,10 +134,21 @@ pub async fn scan(context: String, client: Client, serves: bool, namespaces: Vec
     for (hub, list) in hubs.iter().zip(lists) {
         match list {
             Ok(apps) => scan.problems.extend(found_on(&apps, &hub.context, &context, &namespaces, now)),
+            // Access to some namespaces of a cluster with Argo CD's CRDs: not an Argo CD of
+            // the user's, not a check that failed.
+            Err(e) if hub.context == context && k8s::api_status(&e) == Some(403) => {}
             Err(e) => scan.skipped.push((format!("{CHECK} on {}", hub.context), e)),
         }
     }
     scan
+}
+
+/// The check as a job of a scan of `context`, whose `kinds` say whether it serves
+/// Applications itself.
+pub fn job(context: &str, client: &Client, kinds: &[k8s::Kind], namespaces: &[String]) -> super::Job {
+    use futures::FutureExt as _;
+    let serves = kinds.iter().any(|k| k.is("argoproj.io", "Application"));
+    (CHECK.to_string(), scan(context.to_string(), client.clone(), serves, namespaces.to_vec()).boxed())
 }
 
 #[cfg(test)]
@@ -212,6 +243,15 @@ mod tests {
         assert_eq!(judge(&app(&v), now), None);
         // Not looked at yet.
         assert_eq!(judge(&app(&json!({"metadata": {"name": "new"}, "spec": {}})), now), None);
+    }
+
+    #[test]
+    fn skipped_entries_name_their_hub() {
+        assert_eq!(skipped_hub("Argo CD Applications on hub-1 (failed: did not answer (x))"), Some("hub-1"));
+        assert_eq!(skipped_hub("Argo CD Applications on hub-1"), Some("hub-1"));
+        assert_eq!(skipped_hub("Pods (forbidden)"), None);
+        let on = OnHub { context: "hub".into(), namespace: "argocd".into() };
+        assert_eq!(location(&on, "web"), "Argo CD Application argocd/web on hub");
     }
 
     #[test]

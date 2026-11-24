@@ -242,9 +242,13 @@
   a row opens the Application's page on its hub, which needn't be connected; the reason names the
   hub when it is another cluster. The hubs read are the cluster scanned when it serves Argo CD,
   and those found this session by the Argo CD page or an object's Argo CD section (only the ones
-  set in Settings, when some are): a scan in the background never logs in to another context. Each
-  hub's Applications are read lean, from the API server's cache, at most once a minute for every
-  cluster scanned.
+  set in Settings, when some are): a scan in the background asks no other context, and so never
+  starts a login for a context not logged in this session (one logged in may refresh its
+  credentials as it would anywhere else in the app). Each hub's Applications are read lean, from
+  the API server's cache, at most once a minute for every cluster scanned; a hub that doesn't
+  answer within 20 seconds is named as not checked, and that answer serves every cluster's scan
+  for the minute, so it doesn't hold back what the others found. A cluster whose Applications you
+  may not list (access to some namespaces only) shows no Argo CD line.
 - **ExternalSecrets**: ExternalSecrets that fail to sync and secret stores not Ready show on the
   Problems page; a Secret made by an ExternalSecret shows where it comes from (the ExternalSecret,
   its store, last refresh, Ready), and an ExternalSecret's page links its store and target Secret.

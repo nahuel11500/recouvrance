@@ -855,33 +855,64 @@ impl LeanApp {
     }
 }
 
-type LeanLists = HashMap<String, (Instant, Arc<Vec<LeanApp>>)>;
+/// What a failed list is kept as: the API's status code, if it answered one (so a refusal
+/// still reads "forbidden"), and the message.
+type LeanFailure = (Option<u16>, String);
 
-/// Each hub's Applications as the Problems scans read them, with when they were listed.
+type LeanLists = HashMap<String, (Instant, Result<Arc<Vec<LeanApp>>, LeanFailure>)>;
+
+/// Each hub's Applications as the Problems scans read them, or why they could not be, with
+/// when they were listed.
 static LEAN_LISTS: LazyLock<Mutex<LeanLists>> = LazyLock::new(Default::default);
 
-/// Every Application on a hub as the Problems scans read them: lean, from the API server's
-/// cache (`resourceVersion=0`, no read of etcd), shared by the scans of every cluster within
-/// `LEAN_TTL`.
-pub async fn lean_applications(hub: &Hub) -> Result<Arc<Vec<LeanApp>>> {
-    static LISTING: LazyLock<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> = LazyLock::new(Default::default);
-    let cached = || {
-        let lists = LEAN_LISTS.lock().unwrap_or_else(PoisonError::into_inner);
-        lists.get(&hub.context).filter(|(at, _)| at.elapsed() < LEAN_TTL).map(|(_, l)| l.clone())
-    };
-    let lock = LISTING.lock().unwrap_or_else(PoisonError::into_inner).entry(hub.context.clone()).or_default().clone();
-    // Scans of several clusters asking together wait for one list.
-    let _one = lock.lock().await;
-    if let Some(list) = cached() {
-        return Ok(list);
+/// How long the Problems scans wait for a hub's Applications. A hub that went dark would
+/// otherwise hold every cluster's scan for the connect deadline and the paged retry after it.
+const LEAN_DEADLINE: Duration = Duration::from_secs(20);
+
+fn lean_failure(e: &anyhow::Error) -> LeanFailure {
+    (super::api_status(e), super::short_error(e))
+}
+
+/// A kept failure as an error the problem scans can name ("forbidden", "failed: ...").
+fn lean_error((code, message): &LeanFailure) -> anyhow::Error {
+    match code {
+        Some(code) => kube::Error::Api(kube::core::Status::failure(message, "").with_code(*code).boxed()).into(),
+        None => anyhow::anyhow!("{message}"),
     }
-    let list: Vec<LeanApp> = super::lists::list_lean_cached(hub.client.clone(), application_kind().ar, None).await?;
-    let list = Arc::new(list);
-    LEAN_LISTS
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .insert(hub.context.clone(), (Instant::now(), list.clone()));
-    Ok(list)
+}
+
+/// Every Application on a hub as the Problems scans read them: lean, from the API server's
+/// cache (`resourceVersion=0`, no read of etcd), within `LEAN_DEADLINE`, shared by the scans
+/// of every cluster within `LEAN_TTL`. A failure is kept as long, so the scans of the other
+/// clusters don't each wait for the hub again.
+pub async fn lean_applications(hub: &Hub) -> Result<Arc<Vec<LeanApp>>> {
+    let client = hub.client.clone();
+    let list = super::run_abortable(async move {
+        let list = super::lists::list_lean_cached(client, application_kind().ar, None);
+        match tokio::time::timeout(LEAN_DEADLINE, list).await {
+            Ok(list) => list,
+            Err(_) => anyhow::bail!("Argo CD's cluster did not answer within {}s", LEAN_DEADLINE.as_secs()),
+        }
+    });
+    lean_or_kept(&hub.context, list).await
+}
+
+/// The hub's list kept within `LEAN_TTL`, failed or not; else `list`'s answer, kept. Scans
+/// asking together wait for one list.
+async fn lean_or_kept(hub: &str, list: impl Future<Output = Result<Vec<LeanApp>>>) -> Result<Arc<Vec<LeanApp>>> {
+    static LISTING: LazyLock<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> = LazyLock::new(Default::default);
+    let kept = || {
+        let lists = LEAN_LISTS.lock().unwrap_or_else(PoisonError::into_inner);
+        lists.get(hub).filter(|(at, _)| at.elapsed() < LEAN_TTL).map(|(_, l)| l.clone())
+    };
+    let lock = LISTING.lock().unwrap_or_else(PoisonError::into_inner).entry(hub.to_string()).or_default().clone();
+    let _one = lock.lock().await;
+    if let Some(answer) = kept() {
+        return answer.map_err(|f| lean_error(&f));
+    }
+    let answer = list.await.map(Arc::new).map_err(|e| lean_failure(&e));
+    LEAN_LISTS.lock().unwrap_or_else(PoisonError::into_inner).insert(hub.to_string(), (Instant::now(), answer.clone()));
+    answer.map_err(|f| lean_error(&f))
 }
 
 /// The client a hub was found with this session (see `hubs`), if any.
@@ -893,7 +924,8 @@ pub fn known_client(context: &str) -> Option<Client> {
 /// The hubs the Problems scan of `context` reads: those found this session (by the Argo CD
 /// page or an object's Argo CD section), and `context` itself when it `serves` Applications,
 /// read with its own `client`. Only those set in Settings, when some are. No other context is
-/// asked: a scan in the background never runs a login, nor reaches a cluster nobody opened.
+/// asked: a scan in the background never starts a login for a context not logged in this
+/// session, nor reaches a cluster nobody opened.
 /// One context per Argo CD, so an Application is never counted twice.
 pub fn problem_hubs(context: &str, client: &Client, serves: bool) -> Vec<Hub> {
     let mut found: Vec<Hub> = {
@@ -1450,6 +1482,39 @@ pub fn add_api(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// A hub that failed is answered from the kept failure within `LEAN_TTL`, without asking
+    /// it again, and a refusal still reads "forbidden". After the TTL it is asked again.
+    #[test]
+    fn a_failed_hub_list_is_kept() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let asked = AtomicUsize::new(0);
+        let refused = || async {
+            asked.fetch_add(1, Ordering::SeqCst);
+            let status = kube::core::Status::failure("applications is forbidden", "Forbidden").with_code(403);
+            Err::<Vec<LeanApp>, anyhow::Error>(kube::Error::Api(status.boxed()).into())
+        };
+        let hub = "a-failed-hub-list-is-kept";
+        futures::executor::block_on(async {
+            for _ in 0..3 {
+                let e = lean_or_kept(hub, refused()).await.unwrap_err();
+                assert_eq!(crate::k8s::lists::load_error(&e), "forbidden");
+            }
+            assert_eq!(asked.load(Ordering::SeqCst), 1);
+            // Kept longer than the TTL: asked again, and a list is kept the same way.
+            let old = Instant::now().checked_sub(LEAN_TTL + Duration::from_secs(1)).unwrap();
+            LEAN_LISTS.lock().unwrap().get_mut(hub).unwrap().0 = old;
+            let one = || async {
+                asked.fetch_add(1, Ordering::SeqCst);
+                Ok(vec![LeanApp::default()])
+            };
+            assert_eq!(lean_or_kept(hub, one()).await.unwrap().len(), 1);
+            assert_eq!(lean_or_kept(hub, refused()).await.unwrap().len(), 1);
+            assert_eq!(asked.load(Ordering::SeqCst), 2);
+        });
+        let e = lean_error(&(None, "did not answer".into()));
+        assert_eq!(crate::k8s::lists::load_error(&e), "failed: did not answer");
+    }
 
     fn endpoint(url: &str) -> Arc<api::Endpoint> {
         Arc::new(api::Endpoint {
