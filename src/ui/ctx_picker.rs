@@ -332,9 +332,10 @@ impl Render for ContextPicker {
         if query.is_empty() {
             let favorites = self.favorites.read(cx).contexts().to_vec();
             let (starred, first, other) = order(&self.all, &favorites, &crate::settings::get().recent_contexts);
+            let sections = other.is_some() && !first.is_empty();
             if !starred.is_empty() {
                 rows.push(div().px_2().pt_1().text_xs().text_color(muted).child("Favorites").into_any_element());
-            } else if !sets.is_empty() && !(other.is_some() && !first.is_empty()) {
+            } else if !sets.is_empty() && !sections {
                 // Under the sets, the contexts need a header of their own ("Recent" when shown).
                 rows.push(div().px_2().pt_2().text_xs().text_color(muted).child("Contexts").into_any_element());
             }
@@ -342,7 +343,6 @@ impl Render for ContextPicker {
                 rows.push(self.row(i, c, cx));
             }
             let at = starred.len();
-            let sections = other.is_some() && !first.is_empty();
             if sections {
                 rows.push(div().px_2().pt_1().text_xs().text_color(muted).child("Recent").into_any_element());
             } else if !starred.is_empty() {
