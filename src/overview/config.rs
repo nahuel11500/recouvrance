@@ -378,6 +378,7 @@ pub(super) fn pvc(ctx: &Ctx, cx: &App) -> Div {
             .pt_4()
             .child(field("Status", div().text_color(state_color(&phase, cx)).child(selectable(phase.clone())), cx))
             .child(field("Capacity", s(obj, "/status/capacity/storage").unwrap_or("-").to_string(), cx))
+            .children(volume_usage(ctx, cx))
             .child(field("Requested", s(obj, "/spec/resources/requests/storage").unwrap_or("-").to_string(), cx))
             .child(field("Access modes", modes.join(", "), cx))
             .child(field(
@@ -399,6 +400,41 @@ pub(super) fn pvc(ctx: &Ctx, cx: &App) -> Div {
                 cx,
             )),
     )
+}
+
+/// How full the claim is, from the kubelet of a node running a pod that mounts it: used (and
+/// its share), free and inodes. Only a mounted volume is measured, so the page says so.
+fn volume_usage(ctx: &Ctx, cx: &App) -> Vec<Div> {
+    use crate::volumes::{CRITICAL_FROM, FULL_FROM, OnPage, percent};
+    let theme = cx.theme();
+    let stats = ctx.related.node_stats.as_deref();
+    let usage = match crate::volumes::on_page(ctx.obj, &ctx.related.pods, stats) {
+        OnPage::NotMounted => {
+            let note = div().text_color(theme.muted_foreground).child(selectable("not mounted"));
+            return vec![field("Used", note, cx)];
+        }
+        // Not read yet, or the kubelet can't be asked (no nodes/proxy).
+        OnPage::Unread => return vec![field("Used", "-", cx)],
+        OnPage::Read(usage) => usage,
+    };
+    let color = |ratio: Option<f64>| match ratio {
+        Some(r) if r >= CRITICAL_FROM => theme.danger,
+        Some(r) if r >= FULL_FROM => theme.warning,
+        _ => theme.foreground,
+    };
+    let share = |ratio: Option<f64>| ratio.map_or_else(String::new, |r| format!(" ({})", percent(r)));
+    let bytes = usage.bytes_ratio();
+    let used = format!("{}{}", k8s::format_bytes(usage.used), share(bytes));
+    let mut out = vec![
+        field("Used", div().text_color(color(bytes)).child(selectable(used)), cx),
+        field("Free", k8s::format_bytes(usage.available), cx),
+    ];
+    if let Some((used, total)) = usage.inodes {
+        let inodes = usage.inodes_ratio();
+        let text = format!("{used:.0} of {total:.0}{}", share(inodes));
+        out.push(field("Inodes used", div().text_color(color(inodes)).child(selectable(text)), cx));
+    }
+    out
 }
 
 pub(super) fn namespace(ctx: &Ctx, cx: &App) -> Div {
