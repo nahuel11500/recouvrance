@@ -318,7 +318,7 @@ impl Fact {
     }
 
     /// Summary order: images first, then pod templates, replicas, env, keys, resources, fields.
-    fn rank(&self) -> u8 {
+    pub fn rank(&self) -> u8 {
         match self {
             Self::Image { .. } => 0,
             Self::Digest { .. } => 1,
