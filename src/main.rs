@@ -101,6 +101,8 @@ fn main() {
         // After the keys: the macOS menu bar shows the keys bound when it is set.
         app::init_menus(cx);
         plugins::reload(cx);
+        // Every window shares one store of favorites, read once here.
+        let _ = favorites::shared(cx);
         app::load_zoom(cx);
         let mode = app::initial_theme(cx);
         app::apply_theme(mode, None, cx);

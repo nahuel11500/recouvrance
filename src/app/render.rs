@@ -18,10 +18,10 @@ use super::{
     OpenApiRequests, OpenApply, OpenArgo, OpenContexts, OpenHelmInstall, OpenPalette, OpenSelected, OpenTerminal,
     OpenTimeline, OpenUpgradeCheck, PrevTab, RefreshPage, Route, RowCopyName, RowDelete, RowEvents, RowFavorite,
     RowLogs, RowOpen, RowOpenTab, RowRestart, RowRun, RowScale, RowShell, RowYaml, ShowAbout, ShowShortcuts,
-    ToggleAssistant, ToggleSidebar, ToggleTheme, ToggleWriteMode, ZoomIn, ZoomOut, ZoomReset, ZoomWindow, set_theme,
-    with_keys,
+    ToggleAssistant, ToggleFavorite, ToggleSidebar, ToggleTheme, ToggleWriteMode, ZoomIn, ZoomOut, ZoomReset,
+    ZoomWindow, set_theme, with_keys,
 };
-use crate::favorites::FavObject;
+use crate::favorites::Favorite;
 
 impl Render for AppView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -501,18 +501,15 @@ impl AppView {
             .on_action(cx.listener(|this, _: &RowFavorite, _, cx| {
                 let (Some((ctx, row)), Some(kind)) = (this.row_object(cx), this.kind.clone()) else { return };
                 let Some(context) = this.clusters.get(ctx).map(|c| c.0.clone()) else { return };
-                let fav = FavObject {
-                    context,
-                    kind: kind.kubectl_name(),
-                    namespace: row.namespace.clone(),
-                    name: row.name.clone(),
-                };
+                // An Argo CD Application's row stars the Application, as its page does.
+                let fav = Favorite::for_object(&context, &kind, row.namespace.clone(), row.name.clone());
                 this.favorites.update(cx, |f, cx| {
-                    if !f.has_object(&fav) {
-                        f.toggle_object(fav, cx);
+                    if !f.has(&fav) {
+                        f.toggle(fav, cx);
                     }
                 });
             }))
+            .on_action(cx.listener(|this, _: &ToggleFavorite, window, cx| this.toggle_shown_favorite(window, cx)))
     }
 }
 
