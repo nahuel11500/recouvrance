@@ -71,6 +71,11 @@ impl LiveList {
         keep_watched(&mut self.rows, &self.listing);
     }
 
+    /// Rows held across the clusters.
+    pub fn row_count(&self) -> usize {
+        self.rows.iter().map(Vec::len).sum()
+    }
+
     /// Whether some cluster is still listing.
     pub fn is_loading(&self) -> bool {
         !self.listing.is_empty()
