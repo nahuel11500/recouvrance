@@ -37,7 +37,7 @@ impl KubeMcp {
     }
 
     #[tool(
-        description = "Check calls you plan against your rules without making them: for each request (context, verb, kind, namespace, name), whether it is allowed, needs the user's approval or is denied, the rule that decides, and for a denial whether it is final (a Deny rule) or the rule the user could add. Use it before a task that needs several calls, to tell the user up front what to approve or grant. The verb is the rules' verb, not the tool: set_image, rollout_undo, rollout_pause, rollout_resume and patch_resource need patch; rollout_restart restart; apply_manifest apply on each object; trigger_cronjob get on the CronJob and apply on its Job; cordon_node, uncordon_node and drain_node drain on the node; exec_command, debug_pod and browse_files exec on the pod; port_forward forward; get_logs logs; gitops refresh (refresh, hard_refresh), sync (sync, reconcile, terminate, rollback) or suspend (suspend, resume) on the object, and get for diagnose; argocd_apps list on applications.argoproj.io on the hub.",
+        description = "Check calls you plan against your rules without making them: for each request (context, verb, kind, namespace, name), whether it is allowed, needs the user's approval or is denied, the rule that decides, and for a denial whether it is final (a Deny rule) or the rule the user could add. Use it before a task that needs several calls, to tell the user up front what to approve or grant. The verb is the rules' verb, not the tool: set_image, rollout_undo, rollout_pause, rollout_resume and patch_resource need patch; rollout_restart restart; apply_manifest apply on each object; trigger_cronjob get on the CronJob and apply on its Job; cordon_node, uncordon_node and drain_node drain on the node; evict_pod delete on the pod; refresh_external_secret refresh on the ExternalSecret; exec_command, debug_pod and browse_files exec on the pod; port_forward forward; get_logs logs; gitops refresh (refresh, hard_refresh), sync (sync, reconcile, terminate, rollback) or suspend (suspend, resume) on the object, and get for diagnose; argocd_apps list on applications.argoproj.io on the hub.",
         annotations(read_only_hint = true)
     )]
     async fn check_access(
@@ -1134,7 +1134,7 @@ mod tests {
         assert_eq!(named, take);
         // Every change but exec_command, drain_node and the port-forward tools (docs/agents.md);
         // gitops's is Argo CD's own dry run of a sync or a rollback.
-        assert_eq!(take.len(), 14, "{take:?}");
+        assert_eq!(take.len(), 16, "{take:?}");
         assert!(take.contains("set_image") && take.contains("cordon_node") && take.contains("debug_pod"), "{take:?}");
         assert!(take.contains("gitops"), "{take:?}");
     }

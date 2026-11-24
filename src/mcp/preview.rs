@@ -22,7 +22,7 @@ use crate::history::{self, DiffLine};
 use crate::json::{arr_at, nonempty_at, str_at};
 use crate::k8s::argo::ops::SyncRequest;
 use crate::k8s::argo::{self, diagnosis};
-use crate::k8s::{self, Kind, ObjectRef, rollouts};
+use crate::k8s::{self, Cascade, Kind, ObjectRef, rollouts};
 use crate::plural;
 
 /// How long working out a preview may take: past that, the approval is asked for without it.
@@ -174,8 +174,10 @@ pub(crate) enum Plan {
     /// `gitops` `sync` of an Argo CD Application, with its options; `app` when it was read
     /// already (to bind what a prune deletes to what is shown), so it isn't read twice.
     Sync { client: Client, kind: Kind, ns: String, name: String, req: SyncRequest, app: Option<Value> },
-    /// `delete_resource`: the object, and what goes with it.
-    Delete { client: Client, kind: Kind, ns: Option<String>, name: String },
+    /// `delete_resource`: the object, and what goes with it (or stays, with `cascade`).
+    Delete { client: Client, kind: Kind, ns: Option<String>, name: String, cascade: Option<Cascade> },
+    /// `evict_pod`: not a plain delete, a budget may refuse it.
+    Evict { kind: Kind, ns: String, name: String },
 }
 
 /// What `plan` will change, worked out in [`TIMEOUT`] at most: what fails, or takes longer,
@@ -229,7 +231,23 @@ async fn work_out(plan: &Plan) -> Preview {
                 Err(e) => unread(&object_label(kind, Some(ns.as_str()), name), &e),
             }
         }
-        Plan::Delete { client, kind, ns, name } => deleted(client, kind, ns.as_deref(), name).await,
+        Plan::Delete { client, kind, ns, name, cascade } => deleted(client, kind, ns.as_deref(), name, *cascade).await,
+        Plan::Evict { kind, ns, name } => {
+            Preview::of(vec![evict_section(&object_label(kind, Some(ns.as_str()), name))])
+        }
+    }
+}
+
+/// `evict_pod` of the pod `label`: the API server decides with its budgets when it is sent.
+fn evict_section(label: &str) -> Section {
+    Section {
+        title: format!("{label}: evicted"),
+        lines: vec![
+            "through the Eviction API, as a drain does".to_string(),
+            "refused if a PodDisruptionBudget would be broken".to_string(),
+        ],
+        note: None,
+        diff: Vec::new(),
     }
 }
 
@@ -552,7 +570,7 @@ fn target_revision(app: &Value) -> Option<String> {
 }
 
 /// `delete_resource`: the object, and what goes with it (see [`delete_section`]).
-async fn deleted(client: &Client, kind: &Kind, ns: Option<&str>, name: &str) -> Preview {
+async fn deleted(client: &Client, kind: &Kind, ns: Option<&str>, name: &str, cascade: Option<Cascade>) -> Preview {
     let label = object_label(kind, ns, name);
     let obj = match super::server::get_named(client, kind, ns, name, false).await {
         Ok(v) => v,
@@ -566,7 +584,7 @@ async fn deleted(client: &Client, kind: &Kind, ns: Option<&str>, name: &str) -> 
         Some(ns) if kind.namespaced => dependents(client, kind, ns, &obj).await,
         _ => Ok(Vec::new()),
     };
-    let mut section = delete_section(kind, &label, &obj, found.as_deref().unwrap_or_default());
+    let mut section = delete_section(kind, &label, &obj, found.as_deref().unwrap_or_default(), cascade);
     if let Err(e) = &found {
         section.lines.push(format!("what it owns could not be read: {}", k8s::short_error(e)));
     }
@@ -628,27 +646,44 @@ fn owned(uid: &str, lists: &[(&'static str, Vec<Value>)]) -> Vec<(&'static str, 
 
 /// `delete_resource` of `obj`: it goes once its finalizers are done, and what it owns
 /// (`owned`) goes with it, but a Job's pods: deleted through the API, a Job leaves them (the
-/// API orphans them unless told otherwise). A namespace takes everything in it, a CRD every
-/// object of its kind, a StatefulSet its claims when its retention policy says so.
-fn delete_section(kind: &Kind, label: &str, obj: &Value, owned: &[(&'static str, Vec<String>)]) -> Section {
+/// API orphans them unless told otherwise). An orphan `cascade` leaves what it owns, and a
+/// background or foreground one takes a Job's pods too. A namespace takes everything in it
+/// and a CRD every object of its kind, whatever the cascade; a StatefulSet takes its claims
+/// when its retention policy says so, unless orphaned.
+fn delete_section(
+    kind: &Kind,
+    label: &str,
+    obj: &Value,
+    owned: &[(&'static str, Vec<String>)],
+    cascade: Option<Cascade>,
+) -> Section {
     let mut lines = Vec::new();
     let finalizers: Vec<&str> = arr_at(obj, "/metadata/finalizers").iter().filter_map(Value::as_str).collect();
     if !finalizers.is_empty() {
         lines.push(format!("it stays until its finalizers are done: {}", finalizers.join(", ")));
     }
-    let orphans = kind.is("batch", "Job");
+    let orphans = match cascade {
+        Some(c) => c == Cascade::Orphan,
+        None => kind.is("batch", "Job"),
+    };
     lines.push(if kind.is("", "Namespace") {
         "everything in the namespace goes with it".to_string()
     } else if kind.is("apiextensions.k8s.io", "CustomResourceDefinition") {
         let of = nonempty_at(obj, "/spec/names/kind").unwrap_or("its kind's");
         format!("every {of} object goes with it, in every namespace")
+    } else if cascade == Some(Cascade::Orphan) {
+        "what it owns stays, without an owner (cascade: orphan)".to_string()
     } else if orphans {
         "its pods stay: a Job deleted through the API leaves them".to_string()
+    } else if cascade == Some(Cascade::Foreground) {
+        "anything it owns goes first, then it (cascade: foreground)".to_string()
     } else {
         "anything it owns goes with it".to_string()
     });
     if kind.is("apps", "StatefulSet") {
-        let claims = str_at(obj, "/spec/persistentVolumeClaimRetentionPolicy/whenDeleted") == Some("Delete");
+        // Orphaned, the claims lose their owner like the pods and stay.
+        let claims =
+            str_at(obj, "/spec/persistentVolumeClaimRetentionPolicy/whenDeleted") == Some("Delete") && !orphans;
         lines.push(
             if claims {
                 "its PersistentVolumeClaims go too (retention policy: Delete)"
@@ -860,7 +895,7 @@ mod tests {
             found,
             [("ReplicaSet", vec!["web-1".to_string()]), ("Pod", vec!["web-1-a".into(), "web-1-b".into()])]
         );
-        let s = delete_section(&Kind::fake("apps", "Deployment"), "Deployment shop/web", &dep, &found);
+        let s = delete_section(&Kind::fake("apps", "Deployment"), "Deployment shop/web", &dep, &found, None);
         assert_eq!(s.title, "Deployment shop/web: deleted");
         assert_eq!(
             s.lines,
@@ -873,25 +908,65 @@ mod tests {
         // The API leaves a Job's pods.
         let job = json!({"metadata": {"name": "backup", "uid": "j1"}});
         let pods = vec![json!({"name": "backup-x", "uid": "p", "ownerReferences": [{"uid": "j1"}]})];
-        let s = delete_section(&Kind::fake("batch", "Job"), "Job shop/backup", &job, &owned("j1", &[("Pod", pods)]));
+        let job_pods = owned("j1", &[("Pod", pods)]);
+        let s = delete_section(&Kind::fake("batch", "Job"), "Job shop/backup", &job, &job_pods, None);
         assert_eq!(s.lines, ["its pods stay: a Job deleted through the API leaves them", "left: 1 Pod (backup-x)"]);
+        // Asked for, a cascade decides: a Job's pods go, a Deployment's stay.
+        let s =
+            delete_section(&Kind::fake("batch", "Job"), "Job shop/backup", &job, &job_pods, Some(Cascade::Background));
+        assert_eq!(s.lines, ["anything it owns goes with it", "goes with it: 1 Pod (backup-x)"]);
+        let s = delete_section(
+            &Kind::fake("apps", "Deployment"),
+            "Deployment shop/web",
+            &dep,
+            &found,
+            Some(Cascade::Orphan),
+        );
+        assert_eq!(
+            s.lines,
+            [
+                "it stays until its finalizers are done: example.com/keep",
+                "what it owns stays, without an owner (cascade: orphan)",
+                "left: 1 ReplicaSet (web-1), 2 Pods (web-1-a, web-1-b)",
+            ]
+        );
         // A namespace, a CRD, a StatefulSet that deletes its claims.
         let mut ns = Kind::fake("", "Namespace");
         ns.namespaced = false;
-        let s = delete_section(&ns, "Namespace shop", &json!({"metadata": {"name": "shop"}}), &[]);
+        let s = delete_section(&ns, "Namespace shop", &json!({"metadata": {"name": "shop"}}), &[], None);
+        assert_eq!(s.lines, ["everything in the namespace goes with it"]);
+        // Orphaning doesn't keep what a namespace holds.
+        let s =
+            delete_section(&ns, "Namespace shop", &json!({"metadata": {"name": "shop"}}), &[], Some(Cascade::Orphan));
         assert_eq!(s.lines, ["everything in the namespace goes with it"]);
         let mut crd = Kind::fake("apiextensions.k8s.io", "CustomResourceDefinition");
         crd.namespaced = false;
         let widgets = json!({"spec": {"names": {"kind": "Widget"}}});
-        let s = delete_section(&crd, "CustomResourceDefinition widgets.example.com", &widgets, &[]);
+        let s = delete_section(&crd, "CustomResourceDefinition widgets.example.com", &widgets, &[], None);
         assert_eq!(s.lines, ["every Widget object goes with it, in every namespace"]);
         let sts = json!({"spec": {"persistentVolumeClaimRetentionPolicy": {"whenDeleted": "Delete"}}});
-        let s = delete_section(&Kind::fake("apps", "StatefulSet"), "StatefulSet shop/db", &sts, &[]);
+        let s = delete_section(&Kind::fake("apps", "StatefulSet"), "StatefulSet shop/db", &sts, &[], None);
         assert_eq!(
             s.lines,
             ["anything it owns goes with it", "its PersistentVolumeClaims go too (retention policy: Delete)"]
         );
+        let s =
+            delete_section(&Kind::fake("apps", "StatefulSet"), "StatefulSet shop/db", &sts, &[], Some(Cascade::Orphan));
+        assert_eq!(
+            s.lines,
+            ["what it owns stays, without an owner (cascade: orphan)", "its PersistentVolumeClaims stay"]
+        );
         assert_eq!(few(&["a", "b", "c", "d", "e"].map(String::from)), "a, b, c, +2");
+    }
+
+    #[test]
+    fn an_eviction_is_not_shown_as_a_delete() {
+        let s = evict_section("Pod shop/web-1");
+        assert_eq!(s.title, "Pod shop/web-1: evicted");
+        assert_eq!(
+            s.lines,
+            ["through the Eviction API, as a drain does", "refused if a PodDisruptionBudget would be broken"]
+        );
     }
 
     #[test]

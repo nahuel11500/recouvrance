@@ -614,6 +614,15 @@ impl DetailPanel {
                 let exec =
                     k8s::can_i(client.clone(), kind.clone(), "create", ns.clone(), Some(name.clone()), Some("exec"));
                 checks.push(("exec", exec));
+                let evict = k8s::can_i(
+                    client.clone(),
+                    kind.clone(),
+                    "create",
+                    ns.clone(),
+                    Some(name.clone()),
+                    Some("eviction"),
+                );
+                checks.push(("evict", evict));
                 // A container that isn't running is read from a copy of the pod, deleted after.
                 checks.push(("copy", k8s::can_i(client.clone(), kind.clone(), "create", ns.clone(), None, None)));
                 checks
