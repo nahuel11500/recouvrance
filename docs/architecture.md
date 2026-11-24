@@ -79,6 +79,11 @@ go or are resized in place change them without another list. A page off screen f
 stops its watch and lists again once back. On a cluster with about 20,800 pods, the first rows
 show after 0.7 s and all of them after 1.4 s ([measured](COMPARISON.md#measured)).
 
+The agents' `list_resources`, `get_events` and `search` across every namespace with no selector,
+and the search box's name index, read the same way (`list_light`): a small list with its objects'
+metadata, a big one from its cells in the API server's cache, one namespace at a time. `search`
+lists its kinds at once rather than one after the other.
+
 The Problems scan reads the big kinds from their cells too (`list_light`). What its checks need
 of whole objects (Services, Ingresses and HTTP routes, the pods a Service selects, the workloads of
 a namespace with an idle Service, external-secrets.io's objects) is parsed as each list streams in,

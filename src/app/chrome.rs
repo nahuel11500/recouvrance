@@ -103,7 +103,7 @@ impl AppView {
                     let cluster = cluster.clone();
                     let task = cx.spawn(async move |this, cx| {
                         // A list that fails is said, not taken for an empty one.
-                        let (found, failed) = match k8s::list_names(client, kind.ar.clone(), None).await {
+                        let (found, failed) = match k8s::search_names(client, kind.clone()).await {
                             Ok(found) => (found, None),
                             Err(_) => (Vec::new(), Some(format!("{} on {cluster}", kind.kubectl_name()))),
                         };
