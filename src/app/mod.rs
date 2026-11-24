@@ -25,7 +25,9 @@ use crate::ui::helm::{HelmList, HelmRelease};
 use crate::ui::ns_picker::{NamespacePicked, NamespacePicker, NamespacesChanged};
 use crate::ui::palette::Palette;
 use crate::ui::settings_view::SettingsView;
+use banners::Banners;
 
+mod banners;
 mod chrome;
 pub(crate) mod commands;
 mod contexts;
@@ -421,7 +423,8 @@ pub struct AppView {
     /// The tab strip's sideways scroll.
     tab_scroll: ScrollHandle,
     agents: Entity<AgentsView>,
-    approvals: Vec<Arc<Approval>>,
+    /// The approval banners: those waiting, and those that just went, kept a moment.
+    approvals: Banners<Arc<Approval>>,
     /// Redraws the banner's countdown each second while a request waits.
     countdown: Option<Task<()>>,
     /// How many requests the window title last said were waiting.
@@ -729,7 +732,7 @@ impl AppView {
             }],
             pos: 0,
             agents,
-            approvals: Vec::new(),
+            approvals: Banners::default(),
             countdown: None,
             title_waiting: None,
             _hub_events: hub_events,
@@ -816,7 +819,8 @@ impl AppView {
     fn on_hub_event(&mut self, ev: &HubEvent, window: &mut Window, cx: &mut Context<Self>) {
         match ev {
             HubEvent::ApprovalRequested(a) => {
-                self.approvals.push(a.clone());
+                self.approvals.push(a.id, a.clone(), std::time::Instant::now());
+                self.redraw_when_armed(cx);
                 // Every window flashes in the taskbar or bounces the Dock (nothing happens to
                 // the one in front): an approval nobody sees is refused after 2 minutes.
                 window.request_attention();
@@ -831,7 +835,7 @@ impl AppView {
                     notify_desktop(&format!("{} asks to run {}", a.agent, a.tool), &body);
                 }
             }
-            HubEvent::ApprovalResolved(id) => self.approvals.retain(|a| a.id != *id),
+            HubEvent::ApprovalResolved(id) => self.approval_gone(*id, cx),
             HubEvent::ServerStatus(status) => {
                 let status = status.clone();
                 self.agents.update(cx, |v, cx| {
@@ -850,7 +854,7 @@ impl AppView {
     /// The window title says how many requests wait, so a window behind others or in a
     /// task switcher shows it. Set only when the count changes.
     fn show_waiting(&mut self, window: &mut Window) {
-        let waiting = self.approvals.len();
+        let waiting = self.approvals.waiting_count();
         if self.title_waiting != Some(waiting) {
             self.title_waiting = Some(waiting);
             window.set_window_title(&window_title(waiting));
@@ -867,7 +871,7 @@ impl AppView {
             loop {
                 cx.background_executor().timer(std::time::Duration::from_secs(1)).await;
                 let waiting = this.update(cx, |this, cx| {
-                    if this.approvals.is_empty() {
+                    if this.approvals.waiting_count() == 0 {
                         this.countdown = None;
                         return false;
                     }
@@ -881,6 +885,34 @@ impl AppView {
                 }
             }
         }));
+    }
+
+    /// Request `id` no longer waits: its banner stays in place, inert, for a moment, then
+    /// goes (see `banners`), so a click aimed at it doesn't land on the page moving up.
+    fn approval_gone(&mut self, id: u64, cx: &mut Context<Self>) {
+        self.approvals.resolve(id, std::time::Instant::now());
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(banners::LINGER + std::time::Duration::from_millis(20)).await;
+            let _ = this.update(cx, |this, cx| {
+                if this.approvals.drop_gone(id, std::time::Instant::now()) {
+                    this.redraw_when_armed(cx);
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Draw the banners again when one that just showed or moved takes clicks, so its
+    /// buttons turn on.
+    fn redraw_when_armed(&mut self, cx: &mut Context<Self>) {
+        let now = std::time::Instant::now();
+        let Some(at) = self.approvals.next_armed(now) else { return };
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(at - now).await;
+            let _ = this.update(cx, |_, cx| cx.notify());
+        })
+        .detach();
     }
 
     fn route(&self) -> &Route {

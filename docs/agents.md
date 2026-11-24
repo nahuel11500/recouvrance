@@ -344,7 +344,11 @@ notification is sent (with `notify-send` on Linux, in Notification Center on mac
 from Script Editor and needs that app's notifications allowed). An
 approval also ends when the agent stops waiting for it. When it cancels the call or hangs up (**Stop**
 in the assistant, a `claude -p` killed), the banner goes at once; when its session ends, within
-seconds. A click on the banner after that changes nothing. As with the kill switch, a call whose agent
+seconds. A click on the banner after that changes nothing. A banner that goes (answered, refused or
+given up) stays in place a moment, faded with its buttons off, before the page moves up into its
+space, so a click aimed at its Approve doesn't land on the page; a banner that just showed, or moved
+up because one above it went, takes no click for half a second. Banners are drawn above dialogs: an
+open dialog doesn't keep you from answering. As with the kill switch, a call whose agent
 stopped waiting makes no change after that (a drain stops before its next eviction). The log says
 whether a request was refused, left unanswered, given up by the agent or cut off by the kill switch.
 A session ends when its client closes it or after an hour unused, never while its agent still waits

@@ -182,21 +182,38 @@ impl AppView {
         )
     }
 
+    /// The approval banners, under the title bar. They are drawn above dialogs (an open Save
+    /// view or Delete dialog must not take the clicks meant for Approve) and under menus.
+    /// A banner that went stays a moment, inert, and one that just showed or moved takes no
+    /// click for a moment (see `banners`): a click never lands on what moved under it.
     pub(super) fn render_approvals(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let view = cx.entity().downgrade();
         let cx: &App = cx;
         let theme = cx.theme();
         let now = std::time::Instant::now();
-        v_flex().children(self.approvals.iter().map(|a| {
-            let (deny, approve) = (a.id, a.id);
+        let rows = self.approvals.shown().map(|(a, waiting)| {
+            let id = a.id;
+            let clickable = self.approvals.takes_clicks(id, now);
+            // Checked again at the click: the banner may have gone or moved since it was drawn.
+            let takes_click = {
+                let view = view.clone();
+                move |cx: &App| {
+                    view.upgrade().is_some_and(|v| v.read(cx).approvals.takes_clicks(id, std::time::Instant::now()))
+                }
+            };
             let hub = self.hub.clone();
             let hub2 = self.hub.clone();
             h_flex()
+                .id(("approval", id as usize))
+                // Clicks on the banner itself never reach what is under it (a dialog's backdrop).
+                .occlude()
                 .gap_3()
                 .px_3()
                 .py_2()
                 .bg(theme.warning.opacity(0.15))
                 .border_b_1()
                 .border_color(theme.warning)
+                .when(!waiting, |d| d.opacity(0.5))
                 .child(Icon::new(Lucide::Bot).size_4())
                 .child(
                     div()
@@ -208,7 +225,7 @@ impl AppView {
                         // the call will change comes right under the request, a manifest's YAML after.
                         .child(
                             v_flex()
-                                .id(("approval-summary", a.id as usize))
+                                .id(("approval-summary", id as usize))
                                 .max_h(px(300.))
                                 .overflow_y_scroll()
                                 .overflow_x_hidden()
@@ -222,11 +239,18 @@ impl AppView {
                 )
                 // Only offered when a rule can cover exactly this request (not exec, for one).
                 .when(a.as_rule().is_some(), |d| {
-                    let (hub, approval) = (self.hub.clone(), a.clone());
+                    let (hub, approval, armed) = (self.hub.clone(), a.clone(), takes_click.clone());
                     // A request that no longer waits (its agent gone, or timed out) adds no rule:
                     // the click only beat its banner's removal.
-                    let hour = Button::new(("hour", a.id as usize)).small().ghost().label("Allow for 1h").on_click(
-                        move |_, window, cx| {
+                    let hour = Button::new(("hour", id as usize))
+                        .small()
+                        .ghost()
+                        .label("Allow for 1h")
+                        .disabled(!clickable)
+                        .on_click(move |_, window, cx| {
+                            if !armed(cx) {
+                                return;
+                            }
                             if hub.approval_pending(approval.id)
                                 && let Some(rule) = approval.as_rule_for_an_hour()
                                 && let Err(e) =
@@ -235,15 +259,18 @@ impl AppView {
                                 window.push_notification(Notification::error(format!("Rule not saved: {e:#}")), cx);
                             }
                             hub.resolve_approval(approval.id, true);
-                        },
-                    );
-                    let (hub, approval) = (self.hub.clone(), a.clone());
-                    let always = Button::new(("always", a.id as usize))
+                        });
+                    let (hub, approval, armed) = (self.hub.clone(), a.clone(), takes_click.clone());
+                    let always = Button::new(("always", id as usize))
                         .small()
                         .ghost()
                         .label("Always allow this")
                         .tooltip("Approve, and add a rule allowing exactly this request from now on")
+                        .disabled(!clickable)
                         .on_click(move |_, window, cx| {
+                            if !armed(cx) {
+                                return;
+                            }
                             if hub.approval_pending(approval.id)
                                 && let Some(rule) = approval.as_rule()
                                 && let Err(e) =
@@ -255,26 +282,42 @@ impl AppView {
                         });
                     d.child(hour).child(always)
                 })
-                // An unanswered request is refused: say when.
+                // An unanswered request is refused: say when. One that went says so while it lingers.
+                .child(div().flex_none().text_xs().text_color(theme.muted_foreground).child(if waiting {
+                    refused_in(a.time_left(now))
+                } else {
+                    "no longer waiting".into()
+                }))
+                .child({
+                    let takes_click = takes_click.clone();
+                    Button::new(("deny", id as usize)).small().label("Deny").disabled(!clickable).on_click(
+                        move |_, _, cx| {
+                            if takes_click(cx) {
+                                hub.resolve_approval(id, false);
+                            }
+                        },
+                    )
+                })
                 .child(
-                    div().flex_none().text_xs().text_color(theme.muted_foreground).child(refused_in(a.time_left(now))),
-                )
-                .child(
-                    Button::new(("deny", a.id as usize))
-                        .small()
-                        .label("Deny")
-                        .on_click(move |_, _, _| hub.resolve_approval(deny, false)),
-                )
-                .child(
-                    Button::new(("approve", a.id as usize))
+                    Button::new(("approve", id as usize))
                         .small()
                         .primary()
                         .label("Approve")
-                        .on_click(move |_, _, _| hub2.resolve_approval(approve, true)),
+                        .disabled(!clickable)
+                        .on_click(move |_, _, cx| {
+                            if takes_click(cx) {
+                                hub2.resolve_approval(id, true);
+                            }
+                        }),
                 )
-        }))
+        });
+        // Drawn after the rest of the window (dialogs included), in its place in the layout.
+        deferred(v_flex().children(rows)).with_priority(APPROVAL_PRIORITY)
     }
 }
+
+/// Above dialogs (10 and up, one per open dialog), under menus and popovers (100).
+const APPROVAL_PRIORITY: usize = 50;
 
 /// How long an approval still waits, in its banner: "refused in 1:42". Rounded up, so it
 /// never says 0:00 while the request still waits.
