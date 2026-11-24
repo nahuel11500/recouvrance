@@ -185,10 +185,8 @@ mod tests {
                 all.iter().filter(|c| !answered.contains(*c) && seen.insert(c.as_str())).collect();
             prop_assert_eq!(shown, expected);
             for (c, s) in states.iter() {
-                match last.get(c) {
-                    Some(w) => prop_assert_eq!(s, &Conn::Failed(w.clone().into())),
-                    None => prop_assert_eq!(s, &Conn::Connecting),
-                }
+                let expected = last.get(c).map_or(Conn::Connecting, |w| Conn::Failed(w.clone().into()));
+                prop_assert_eq!(s, &expected);
             }
         }
     }
