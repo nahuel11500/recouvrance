@@ -303,8 +303,16 @@ pub fn pod(pod: &Value, events: &[Ev], crash_logs: Option<&(String, String)>) ->
     out
 }
 
-/// Findings for a Deployment, StatefulSet, DaemonSet or Job, plus its worst pod's.
-pub fn workload(obj: &Value, pods: &[Value]) -> Vec<Finding> {
+/// Findings for a Deployment, `StatefulSet`, `DaemonSet` or Job: its own, where the failure
+/// comes from (`cause`), then its worst pod's. `revisions` are its `ReplicaSets` or
+/// `ControllerRevisions` (`k8s::rollouts::revisions`); `crash` is the last output of a pod's
+/// crashed container, as (pod, (container, text)), shown when that pod is the worst.
+pub fn workload(
+    obj: &Value,
+    pods: &[Value],
+    revisions: &[Value],
+    crash: Option<(&str, &(String, String))>,
+) -> Vec<Finding> {
     let mut out = Vec::new();
     for c in obj.pointer("/status/conditions").and_then(Value::as_array).into_iter().flatten() {
         let (t, st, reason) = (s(c, "/type"), s(c, "/status"), s(c, "/reason"));
@@ -353,21 +361,187 @@ pub fn workload(obj: &Value, pods: &[Value]) -> Vec<Finding> {
             hint: "See why below.".into(),
         });
     }
-    // The pod with the worst problem explains most workload outages. Pods being
-    // deleted (old ones of a rollout) are left out: they only say "Being deleted".
-    if let Some((name, findings)) = pods
-        .iter()
-        .filter(|p| p.pointer("/metadata/deletionTimestamp").is_none())
-        .map(|p| (s(p, "/metadata/name"), pod(p, &[], None)))
-        .filter(|(_, f)| !f.is_empty())
-        .min_by_key(|(_, f)| (f[0].level, std::cmp::Reverse(f.iter().filter(|x| x.level == f[0].level).count())))
-    {
+    let judged = judged(pods);
+    out.extend(cause(&judged, revisions));
+    if let Some(i) = worst(&judged) {
+        let (p, findings) = &judged[i];
+        let name = s(p, "/metadata/name");
+        // The crash output was read for the worst pod of an earlier turn: only its own.
+        let findings = match crash {
+            Some((pod_name, logs)) if pod_name == name => pod(p, &[], Some(logs)),
+            _ => findings.clone(),
+        };
         out.extend(findings.into_iter().map(|mut f| {
             f.title = format!("Pod {name}: {}", f.title);
             f
         }));
     }
     out
+}
+
+/// A workload's pods with their findings. Pods being deleted (old ones of a rollout) are left
+/// out: they only say "Being deleted".
+fn judged(pods: &[Value]) -> Vec<(&Value, Vec<Finding>)> {
+    pods.iter().filter(|p| p.pointer("/metadata/deletionTimestamp").is_none()).map(|p| (p, pod(p, &[], None))).collect()
+}
+
+/// The pod with the worst problem, which explains most workload outages: the worst level,
+/// then the most findings at that level.
+fn worst(judged: &[(&Value, Vec<Finding>)]) -> Option<usize> {
+    judged
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, f))| !f.is_empty())
+        .min_by_key(|(_, (_, f))| (f[0].level, std::cmp::Reverse(f.iter().filter(|x| x.level == f[0].level).count())))
+        .map(|(i, _)| i)
+}
+
+/// The pod a workload's diagnosis explains (`workload`), to read its crash output.
+pub fn worst_pod(pods: &[Value]) -> Option<&Value> {
+    let judged = judged(pods);
+    worst(&judged).map(|i| judged[i].0)
+}
+
+/// The container whose output explains a pod's crash: the first that exited with an error,
+/// and whether to read its previous run (it restarted since) rather than its current one.
+pub fn crashed_container(pod: &Value) -> Option<(String, bool)> {
+    let failed = |c: &&Value| {
+        let code = |p: &str| c.pointer(p).and_then(Value::as_i64).unwrap_or(0);
+        code("/lastState/terminated/exitCode") != 0 || code("/state/terminated/exitCode") != 0
+    };
+    pod.pointer("/status/containerStatuses")
+        .and_then(Value::as_array)
+        .and_then(|cs| cs.iter().find(failed))
+        .and_then(|c| Some((c["name"].as_str()?.to_string(), c.pointer("/state/terminated").is_none())))
+}
+
+/// Ready, or finished well (a Job's pod).
+fn ready(pod: &Value) -> bool {
+    s(pod, "/status/phase") == "Succeeded"
+        || pod
+            .pointer("/status/conditions")
+            .and_then(Value::as_array)
+            .is_some_and(|c| c.iter().any(|c| c["type"] == "Ready" && c["status"] == "True"))
+}
+
+/// The revision a pod belongs to, by its `pod-template-hash` label (a Deployment's
+/// `ReplicaSet` is named `<deployment>-<hash>`) or `controller-revision-hash` (a
+/// `StatefulSet`'s pods carry the `ControllerRevision`'s name, a `DaemonSet`'s only its hash).
+fn revision_of<'a>(pod: &Value, revisions: &'a [Value]) -> Option<&'a Value> {
+    let labels = pod.pointer("/metadata/labels")?;
+    let key = labels.get("pod-template-hash").or_else(|| labels.get("controller-revision-hash"))?.as_str()?;
+    if key.is_empty() {
+        return None;
+    }
+    revisions.iter().find(|r| {
+        let name = s(r, "/metadata/name");
+        name == key || name.strip_suffix(key).is_some_and(|rest| rest.ends_with('-'))
+    })
+}
+
+/// Where a workload's failure comes from, when its pods tell: one node (only pods there fail,
+/// while pods of the same revision are ready elsewhere), the new revision (only its pods fail,
+/// while the previous one's are ready), or the app (pods of old and new revisions fail, or
+/// every pod fails, on several nodes). Nothing when they don't tell, such as one failing pod
+/// and no other.
+fn cause(judged: &[(&Value, Vec<Finding>)], revisions: &[Value]) -> Option<Finding> {
+    use crate::k8s::rollouts::number;
+    use crate::plural::{count, pick};
+    use std::collections::BTreeSet;
+    let failing: Vec<&Value> = judged.iter().filter(|(_, f)| !f.is_empty()).map(|(p, _)| *p).collect();
+    if failing.is_empty() {
+        return None;
+    }
+    let fine: Vec<&Value> = judged.iter().filter(|(p, f)| f.is_empty() && ready(p)).map(|(p, _)| *p).collect();
+    fn node(p: &Value) -> &str {
+        s(p, "/spec/nodeName")
+    }
+    // A pod's revision number; None when it is not known (a Job's pods have none).
+    let rev = |p: &Value| revision_of(p, revisions).map(number).filter(|n| *n > 0);
+    // An unscheduled pod is on no node: it says nothing about one.
+    let nodes: BTreeSet<&str> = failing.iter().map(|p| node(p)).filter(|n| !n.is_empty()).collect();
+    let failing_revs: BTreeSet<Option<i64>> = failing.iter().map(|p| rev(p)).collect();
+    // The node: the same pods are ready on other nodes.
+    if nodes.len() == 1
+        && failing.iter().all(|p| !node(p).is_empty())
+        && let Some(only) = nodes.first()
+    {
+        let elsewhere = fine.iter().filter(|p| node(p) != *only && failing_revs.contains(&rev(p))).count();
+        if elsewhere > 0 {
+            return Some(Finding {
+                level: Level::Warning,
+                title: format!("Only pods on node {only} fail"),
+                detail: format!(
+                    "{} on {only}; {} of the same revision {} ready on other nodes.",
+                    count(failing.len(), "failing pod"),
+                    count(elsewhere, "pod"),
+                    pick(elsewhere, "is", "are"),
+                ),
+                hint: "Look at the node's page: its pressure conditions, taints and events. Cordon and drain it if it is broken.".into(),
+            });
+        }
+    }
+    let newest = revisions.iter().map(number).max().filter(|n| *n > 0);
+    if let Some(newest) = newest
+        && !failing_revs.contains(&None)
+    {
+        // The new revision: only its pods fail, while older ones still serve.
+        let old: BTreeSet<i64> = fine.iter().filter_map(|p| rev(p)).filter(|n| *n < newest).collect();
+        let old_ready = fine.iter().filter(|p| rev(p).is_some_and(|n| n < newest)).count();
+        if failing_revs.len() == 1
+            && failing_revs.contains(&Some(newest))
+            && let Some(&previous) = old.last()
+        {
+            let of_old = if old.len() == 1 { format!("revision {previous}") } else { "earlier revisions".into() };
+            let mut detail = format!(
+                "{} {} of revision {newest}; {} of {of_old} {} ready.",
+                count(failing.len(), "failing pod"),
+                pick(failing.len(), "is", "are all"),
+                count(old_ready, "pod"),
+                pick(old_ready, "is", "are"),
+            );
+            let images =
+                |n: i64| revisions.iter().find(|r| number(r) == n).map_or_default(crate::k8s::rollouts::images);
+            let before = images(previous);
+            let changed: Vec<String> = images(newest).into_iter().filter(|i| !before.contains(i)).collect();
+            if !changed.is_empty() {
+                detail.push_str(&format!(" Revision {newest} runs {}.", changed.join(", ")));
+            }
+            return Some(Finding {
+                level: Level::Warning,
+                title: format!("The new revision ({newest}) fails"),
+                detail,
+                hint: format!(
+                    "Roll back to revision {previous} from Revisions, or fix what revision {newest} changed."
+                ),
+            });
+        }
+        // The app: pods of older revisions fail too, on several nodes.
+        if failing_revs.len() > 1 && nodes.len() > 1 {
+            let numbers: Vec<String> = failing_revs.iter().flatten().map(i64::to_string).collect();
+            return Some(Finding {
+                level: Level::Warning,
+                title: "Old and new revisions fail".into(),
+                detail: format!(
+                    "{} of revisions {}, on {}.",
+                    count(failing.len(), "failing pod"),
+                    numbers.join(", "),
+                    count(nodes.len(), "node"),
+                ),
+                hint: "Not the new revision nor one node: look at the app's configuration and what it depends on (a database, a Secret, another service).".into(),
+            });
+        }
+    }
+    // Every pod fails, on several nodes: not a node, and no ready pod to set a revision against.
+    if fine.is_empty() && nodes.len() > 1 {
+        return Some(Finding {
+            level: Level::Warning,
+            title: format!("Every pod fails, on {}", count(nodes.len(), "node")),
+            detail: String::new(),
+            hint: "Not one node: the app, its configuration or something it depends on. If it began with the last rollout, roll back from Revisions.".into(),
+        });
+    }
+    None
 }
 
 fn capital(s: &str) -> String {
@@ -426,7 +600,7 @@ mod tests {
         }]}});
         assert!(pod(&p, &[], None).is_empty());
         let d = json!({"spec": {"replicas": 2}, "status": {"readyReplicas": 2}});
-        assert!(workload(&d, &[p]).is_empty());
+        assert!(workload(&d, &[p], &[], None).is_empty());
     }
 
     #[test]
@@ -440,11 +614,11 @@ mod tests {
             "containerStatuses": [{"name": "a", "restartCount": 5, "ready": false,
                 "state": {"waiting": {"reason": "CrashLoopBackOff"}}}]}});
         let d = json!({"spec": {"replicas": 3}, "status": {"readyReplicas": 3}});
-        let f = workload(&d, &[unready.clone(), deleting.clone(), crashing]);
+        let f = workload(&d, &[unready.clone(), deleting.clone(), crashing], &[], None);
         assert!(f[0].title.starts_with("Pod crash: "), "{f:?}");
         assert!(f.iter().all(|x| !x.title.starts_with("Pod old") && !x.title.starts_with("Pod slow")));
         // Only the pod being deleted has a problem: nothing from it.
-        let f = workload(&d, &[deleting, unready]);
+        let f = workload(&d, &[deleting, unready], &[], None);
         assert!(f[0].title.starts_with("Pod slow: "), "{f:?}");
     }
 
@@ -485,5 +659,183 @@ mod tests {
         let f = pod(&p, &[], None);
         let titles: Vec<&str> = f.iter().map(|x| x.title.as_str()).collect();
         assert_eq!(titles, ["Evicted"]);
+    }
+
+    /// A Deployment's pod of the `ReplicaSet` `web-<hash>` on `node`: crash-looping, ready, or
+    /// starting (neither).
+    fn wpod(name: &str, node: &str, hash: &str, state: &str) -> Value {
+        let (phase, ready, status) = match state {
+            "crash" => (
+                "Running",
+                "False",
+                json!({"name": "app", "restartCount": 4, "ready": false,
+                    "state": {"waiting": {"reason": "CrashLoopBackOff"}},
+                    "lastState": {"terminated": {"exitCode": 1, "reason": "Error"}}}),
+            ),
+            "ready" => {
+                ("Running", "True", json!({"name": "app", "restartCount": 0, "ready": true, "state": {"running": {}}}))
+            }
+            _ => (
+                "Pending",
+                "False",
+                json!({"name": "app", "restartCount": 0, "ready": false,
+                    "state": {"waiting": {"reason": "ContainerCreating"}}}),
+            ),
+        };
+        json!({"metadata": {"name": name, "labels": {"app": "web", "pod-template-hash": hash}},
+            "spec": {"nodeName": node},
+            "status": {"phase": phase, "conditions": [{"type": "Ready", "status": ready}],
+                "containerStatuses": [status]}})
+    }
+
+    fn rs(hash: &str, n: i64, image: &str) -> Value {
+        json!({"metadata": {"name": format!("web-{hash}"),
+                "annotations": {"deployment.kubernetes.io/revision": n.to_string()}},
+            "spec": {"template": {"spec": {"containers": [{"name": "app", "image": image}]}}}})
+    }
+
+    fn revs() -> Vec<Value> {
+        vec![rs("aaa", 11, "app:1.4"), rs("bbb", 12, "app:1.5")]
+    }
+
+    fn cause_of(pods: &[Value], revisions: &[Value]) -> Option<Finding> {
+        cause(&judged(pods), revisions)
+    }
+
+    #[test]
+    fn the_new_revision_fails_while_the_old_one_is_ready() {
+        let pods = [
+            wpod("web-aaa-1", "n1", "aaa", "ready"),
+            wpod("web-aaa-2", "n2", "aaa", "ready"),
+            wpod("web-bbb-1", "n1", "bbb", "crash"),
+            wpod("web-bbb-2", "n2", "bbb", "crash"),
+        ];
+        let f = cause_of(&pods, &revs()).expect("a cause");
+        assert_eq!(f.title, "The new revision (12) fails");
+        assert_eq!(
+            f.detail,
+            "2 failing pods are all of revision 12; 2 pods of revision 11 are ready. Revision 12 runs app=app:1.5."
+        );
+        assert!(f.hint.contains("Roll back to revision 11"), "{f:?}");
+        // Shown before the worst pod's findings, after the workload's own.
+        let d = json!({"spec": {"replicas": 2}, "status": {"readyReplicas": 0}});
+        let all = workload(&d, &pods, &revs(), None);
+        let titles: Vec<&str> = all.iter().map(|x| x.title.as_str()).collect();
+        assert_eq!(
+            titles[..3],
+            ["0 of 2 replicas ready", "The new revision (12) fails", "Pod web-bbb-1: Container app is crash-looping"]
+        );
+    }
+
+    #[test]
+    fn only_the_pods_on_one_node_fail() {
+        let pods = [
+            wpod("web-bbb-1", "n1", "bbb", "crash"),
+            wpod("web-bbb-2", "n1", "bbb", "crash"),
+            wpod("web-bbb-3", "n2", "bbb", "ready"),
+        ];
+        let f = cause_of(&pods, &revs()).expect("a cause");
+        assert_eq!(f.title, "Only pods on node n1 fail");
+        assert_eq!(f.detail, "2 failing pods on n1; 1 pod of the same revision is ready on other nodes.");
+        // A Job's pods have no revision: a pod that finished on another node counts.
+        let mut done = wpod("job-2", "n2", "", "ready");
+        done["status"] = json!({"phase": "Succeeded", "containerStatuses": [{"name": "app", "restartCount": 0,
+            "state": {"terminated": {"exitCode": 0, "reason": "Completed"}}}]});
+        let f = cause_of(&[wpod("job-1", "n1", "", "crash"), done], &[]).expect("a cause");
+        assert_eq!(f.title, "Only pods on node n1 fail");
+        // Ready pods elsewhere are only of the old revision: that is the new revision, not the node.
+        let pods = [wpod("web-bbb-1", "n1", "bbb", "crash"), wpod("web-aaa-1", "n2", "aaa", "ready")];
+        assert_eq!(cause_of(&pods, &revs()).expect("a cause").title, "The new revision (12) fails");
+    }
+
+    #[test]
+    fn every_revision_or_every_pod_fails() {
+        let pods = [wpod("web-aaa-1", "n1", "aaa", "crash"), wpod("web-bbb-1", "n2", "bbb", "crash")];
+        let f = cause_of(&pods, &revs()).expect("a cause");
+        assert_eq!(f.title, "Old and new revisions fail");
+        assert_eq!(f.detail, "2 failing pods of revisions 11, 12, on 2 nodes.");
+        let pods = [wpod("web-bbb-1", "n1", "bbb", "crash"), wpod("web-bbb-2", "n2", "bbb", "crash")];
+        assert_eq!(cause_of(&pods, &revs()).expect("a cause").title, "Every pod fails, on 2 nodes");
+    }
+
+    #[test]
+    fn no_cause_when_the_pods_do_not_tell() {
+        // One failing pod and nothing to set it against; pods still starting say nothing.
+        let pods = [wpod("web-bbb-1", "n1", "bbb", "crash"), wpod("web-bbb-2", "n2", "bbb", "starting")];
+        assert!(cause_of(&pods, &revs()).is_none());
+        // Healthy: nothing.
+        let pods = [wpod("web-bbb-1", "n1", "bbb", "ready"), wpod("web-bbb-2", "n2", "bbb", "ready")];
+        assert!(cause_of(&pods, &revs()).is_none());
+    }
+
+    #[test]
+    fn pods_find_their_revision_whatever_the_workload() {
+        // A StatefulSet's pods carry the ControllerRevision's name, a DaemonSet's its hash.
+        let cr = |name: &str| json!({"metadata": {"name": name}});
+        let revisions = [cr("db-5d8f"), cr("agent-6c7b")];
+        let labelled = |l: Value| json!({"metadata": {"labels": l}});
+        let of = |l: Value| revision_of(&labelled(l), &revisions).map(|r| s(r, "/metadata/name").to_string());
+        assert_eq!(of(json!({"controller-revision-hash": "db-5d8f"})).as_deref(), Some("db-5d8f"));
+        assert_eq!(of(json!({"controller-revision-hash": "6c7b"})).as_deref(), Some("agent-6c7b"));
+        // A hash that only ends a name, without the dash, is another revision.
+        assert_eq!(of(json!({"controller-revision-hash": "c7b"})), None);
+        assert_eq!(of(json!({"controller-revision-hash": ""})), None);
+    }
+
+    #[test]
+    fn the_crash_output_is_the_worst_pod_s() {
+        let pods = [wpod("web-bbb-1", "n1", "bbb", "crash"), wpod("web-bbb-2", "n2", "bbb", "starting")];
+        assert_eq!(worst_pod(&pods).map(|p| s(p, "/metadata/name")), Some("web-bbb-1"));
+        assert_eq!(crashed_container(&pods[0]), Some(("app".to_string(), true)));
+        assert_eq!(crashed_container(&pods[1]), None);
+        let d = json!({"spec": {"replicas": 2}, "status": {"readyReplicas": 0}});
+        let logs = ("app".to_string(), "boot\npanic: no DATABASE_URL\n".to_string());
+        let f = workload(&d, &pods, &revs(), Some(("web-bbb-1", &logs)));
+        assert!(
+            f.iter().any(|x| x.title.starts_with("Pod web-bbb-1") && x.detail.contains("panic: no DATABASE_URL")),
+            "{f:?}"
+        );
+        // Read for a pod that is no longer the worst: not shown under another one.
+        let f = workload(&d, &pods, &revs(), Some(("web-bbb-9", &logs)));
+        assert!(f.iter().all(|x| !x.detail.contains("DATABASE_URL")), "{f:?}");
+    }
+
+    use proptest::prelude::*;
+
+    proptest! {
+        /// Whatever the pods, a cause is only named with its evidence: a node when every failing
+        /// pod runs there and one of the same revision is ready elsewhere, the new revision when
+        /// only its pods fail and an older one's is ready, old and new when both fail, and every
+        /// pod when none is ready.
+        #[test]
+        fn a_cause_is_named_only_with_its_evidence(
+            spec in prop::collection::vec((0..4usize, 0..2usize, 0..3usize), 0..8)
+        ) {
+            let nodes = ["n1", "n2", "n3", ""];
+            let hashes = ["aaa", "bbb"];
+            let states = ["crash", "ready", "starting"];
+            let pods: Vec<Value> = spec
+                .iter()
+                .enumerate()
+                .map(|(i, (n, h, st))| wpod(&format!("web-{i}"), nodes[*n], hashes[*h], states[*st]))
+                .collect();
+            // A pod starting on no node is not scheduled: it fails too.
+            let failing: Vec<&(usize, usize, usize)> = spec.iter().filter(|p| p.2 == 0 || (p.2 == 2 && p.0 == 3)).collect();
+            let ready: Vec<&(usize, usize, usize)> = spec.iter().filter(|p| p.2 == 1).collect();
+            let Some(f) = cause_of(&pods, &revs()) else { return Ok(()) };
+            prop_assert!(!failing.is_empty());
+            if let Some(node) = f.title.strip_prefix("Only pods on node ").and_then(|t| t.strip_suffix(" fail")) {
+                prop_assert!(failing.iter().all(|p| nodes[p.0] == node));
+                prop_assert!(ready.iter().any(|p| nodes[p.0] != node && failing.iter().any(|q| q.1 == p.1)));
+            } else if f.title == "The new revision (12) fails" {
+                prop_assert!(failing.iter().all(|p| p.1 == 1));
+                prop_assert!(ready.iter().any(|p| p.1 == 0));
+            } else if f.title == "Old and new revisions fail" {
+                prop_assert!(failing.iter().any(|p| p.1 == 0) && failing.iter().any(|p| p.1 == 1));
+            } else {
+                prop_assert!(f.title.starts_with("Every pod fails"), "{f:?}");
+                prop_assert!(ready.is_empty());
+            }
+        }
     }
 }

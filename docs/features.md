@@ -522,7 +522,11 @@
   user and cluster names and the server URL (`prod`, `prd`, `production`, `live`, `admin`, `root`),
   so new production contexts are protected too. Set both in Settings → Contexts.
 - **Diagnosis** on pods and workloads: why it is broken (crash output and exit code, scheduling,
-  image pulls, probes, volumes) and what to try.
+  image pulls, probes, volumes) and what to try. On a workload's page it also says where the
+  failure comes from, from its pods' revisions and nodes: the new revision (only its pods fail,
+  the previous one's are ready), one node (only pods there fail, the same revision is ready
+  elsewhere) or the app (old and new revisions fail, or every pod fails on several nodes); and it
+  shows the worst pod's crash output (one log read, only when a container crashed).
 - **Rollback** of Deployments, StatefulSets and DaemonSets to any revision, with the diff and a
   server dry run first; **attach** to a container's process; **file copy** in and out of containers
   (both ways it runs commands in the container, so it needs write mode, like a shell);

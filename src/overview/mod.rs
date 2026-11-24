@@ -72,6 +72,9 @@ pub struct Related {
     pub events: Vec<(String, String, String, i32)>,
     /// Last lines of a crash-looping container's previous run: (container, text).
     pub crash_logs: Option<(String, String)>,
+    /// On a workload's page, the pod `crash_logs` are of: the one its diagnosis explained when
+    /// they were read.
+    pub crash_pod: Option<String>,
     /// The `ExternalSecret` a Secret comes from, when one owns it.
     pub external_secret: Option<Value>,
     /// Where an Argo CD Application deploys, and the context that reaches it (a connected
@@ -130,6 +133,7 @@ impl Related {
             std::mem::swap(&mut self.local_volumes, &mut read.local_volumes);
             std::mem::swap(&mut self.events, &mut read.events);
             std::mem::swap(&mut self.crash_logs, &mut read.crash_logs);
+            std::mem::swap(&mut self.crash_pod, &mut read.crash_pod);
             std::mem::swap(&mut self.external_secret, &mut read.external_secret);
             std::mem::swap(&mut self.argo_destination, &mut read.argo_destination);
             std::mem::swap(&mut self.argo_drift, &mut read.argo_drift);
@@ -628,7 +632,8 @@ fn diagnosis(ctx: &Ctx, cx: &App) -> Option<Div> {
             ctx.related.events.iter().map(|(t, r, m, c)| (t.as_str(), r.as_str(), m.as_str(), *c)).collect();
         crate::diagnose::pod(ctx.obj, &ev, ctx.related.crash_logs.as_ref())
     } else if ctx.kind.ar.group == "apps" || ctx.kind.is("batch", "Job") {
-        crate::diagnose::workload(ctx.obj, &ctx.related.pods)
+        let crash = ctx.related.crash_pod.as_deref().zip(ctx.related.crash_logs.as_ref());
+        crate::diagnose::workload(ctx.obj, &ctx.related.pods, &ctx.related.revisions, crash)
     } else {
         return None;
     };
