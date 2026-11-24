@@ -196,6 +196,39 @@ pub(super) fn comparable_yaml(v: &serde_json::Value, mask: bool) -> String {
     crate::history::diff_text(&v)
 }
 
+/// What a write will change: each object with the fields that change and its diff, or why
+/// there is no preview. The approval banner shows an agent's, a confirmation the window's.
+pub(crate) fn preview_block(p: &crate::mcp::Preview, cx: &App) -> AnyElement {
+    let theme = cx.theme();
+    v_flex()
+        .gap_1()
+        .child(div().font_weight(FontWeight::SEMIBOLD).child("What will change"))
+        .when_some(p.note.clone(), |d, note| d.child(div().text_color(theme.muted_foreground).child(note)))
+        .children(p.sections.iter().map(|s| {
+            v_flex()
+                .gap_0p5()
+                .child(div().font_weight(FontWeight::SEMIBOLD).child(s.title.clone()))
+                .children(s.lines.iter().map(|line| div().pl_2().child(line.clone())))
+                .when_some(s.note.clone(), |d, note| d.child(div().pl_2().text_color(theme.danger).child(note)))
+                .when(!s.diff.is_empty(), |d| d.child(diff_block(&s.diff, cx)))
+        }))
+        .into_any_element()
+}
+
+/// [`preview_block`] in a confirmation: scrolled past `max_h`, in the code font like the
+/// approval banner's.
+pub(crate) fn preview_scroll(id: &'static str, p: &crate::mcp::Preview, cx: &App) -> AnyElement {
+    v_flex()
+        .id(id)
+        .max_h(px(320.))
+        .overflow_y_scroll()
+        .overflow_x_hidden()
+        .font_family(cx.theme().mono_font_family.clone())
+        .text_xs()
+        .child(preview_block(p, cx))
+        .into_any_element()
+}
+
 /// A diff as the Compare and History tabs show it: removed lines in red, added ones in
 /// green, a mark where unchanged lines are left out.
 pub(crate) fn diff_block(lines: &[DiffLine], cx: &App) -> AnyElement {

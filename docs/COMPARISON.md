@@ -27,9 +27,9 @@ welcome: open an issue or a pull request.
 | Ephemeral debug containers | ✓ custom image, profiles | ✓ image, profile and spec in a dialog | ✓ with a target container | ✓ with a Pod Security "restricted" fallback |
 | Node shell | ✓ | ✓ | ✓ | ✓ (privileged pod, confirmed, cleaned up) |
 | Port-forward | ✓ saved, follows replacement pods | ✓ (listen address, SOCKS5) | ✓ Service forwards reconnect to new pods | ✓ remembered and restorable, follows replacement pods; listen address, https, open in browser; through the kubeconfig's `proxy-url` (SOCKS5 or HTTP) |
-| Edit YAML | ✓ warns of changes made meanwhile; shows the JSON patch | ✓ | ✓ dry run; YAML errors on their line; diff before saving; warns of changes made meanwhile | ✓ validated by a server dry run first; errors on their line; field docs and forms from the cluster's schema |
+| Edit YAML | ✓ warns of changes made meanwhile; shows the JSON patch | ✓ | ✓ dry run; YAML errors on their line; diff before saving; warns of changes made meanwhile | ✓ validated by a server dry run first, diff before saving; warns of changes made meanwhile and keeps your edits on the latest; errors on their line; field docs and forms from the cluster's schema |
 | Edit ConfigMap/Secret values | ✓ | ✓ | ✓ without the YAML editor; ConfigMap `binaryData` too | ✓ as key/value rows; Secret forms (Opaque, registry, TLS, basic auth) |
-| Create / apply YAML | ✓ | ✓ | ✓ forms for common kinds; load from a URL | ✓ multi-document, dry run; templates, files, URLs, `$EDITOR` |
+| Create / apply YAML | ✓ | ✓ | ✓ forms for common kinds; load from a URL | ✓ multi-document, dry run, diff per object before applying; templates, files, URLs, `$EDITOR` |
 | Compare objects | ✓ across clusters or namespaces | – | – | ✓ across clusters or objects; revision diffs |
 | History of changes | workload revisions; Helm release history | Deployment revisions (its ReplicaSets); Helm revisions | workload revision history; Helm release revisions (plugin) | ✓ per object: revisions, Helm, Argo CD deployments, field managers, events; a Timeline recorded across clusters |
 | Scale / restart / delete / cordon / drain / run CronJob | ✓ plus bulk actions, across clusters | ✓ | ✓ plus bulk delete and scale, evict | ✓ plus bulk actions, force delete, finalizer removal |

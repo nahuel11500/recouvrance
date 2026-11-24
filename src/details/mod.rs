@@ -33,11 +33,12 @@ mod map;
 mod reachability;
 mod related;
 mod tabs;
+mod yaml_edit;
 
 pub(crate) use actions::*;
 pub(crate) use argo::{ArgoAction, OpenOn, OpenOnContext, confirm_api_action, confirm_argo_action};
 use browser::FileBrowser;
-pub(crate) use compare::diff_block;
+pub(crate) use compare::{diff_block, preview_block, preview_scroll};
 pub(crate) use guard::*;
 use history::HistoryState;
 pub(crate) use logs::*;
@@ -156,6 +157,12 @@ pub struct DetailPanel {
     object_started: Option<std::time::Instant>,
     /// YAML last put in the editor, to tell user edits from stale content.
     yaml_text: String,
+    /// The object that text was made from: Save sends the edit as of its version, and a
+    /// newer live object means it changed on the cluster while it was edited.
+    yaml_base: Option<serde_json::Value>,
+    /// What changed on the cluster since the edit started, shown under that warning once
+    /// asked for (worked out again when the object changes, not on every frame).
+    yaml_compare: Option<crate::mcp::preview::Section>,
     related: Related,
     pub(crate) compare_rev: Option<String>,
     reveal_secrets: bool,
@@ -439,6 +446,8 @@ impl DetailPanel {
             object: None,
             object_started: None,
             yaml_text: String::new(),
+            yaml_base: None,
+            yaml_compare: None,
             related: Related::default(),
             compare_rev: None,
             reveal_secrets: false,
@@ -1198,6 +1207,7 @@ impl DetailPanel {
 
     fn refresh_yaml(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(value) = &self.object else { return };
+        let base = value.clone();
         let mut value = value.clone();
         if !self.show_managed
             && let Some(m) = value.get_mut("metadata").and_then(|m| m.as_object_mut())
@@ -1208,6 +1218,8 @@ impl DetailPanel {
             Ok(text) => {
                 self.yaml_error = None;
                 self.yaml_text.clone_from(&text);
+                self.yaml_base = Some(base);
+                self.yaml_compare = None;
                 self.yaml.update(cx, |s, cx| s.set_value(text, window, cx));
             }
             Err(e) => self.yaml_error = Some(format!("{e:#}").into()),
@@ -1279,6 +1291,9 @@ impl DetailPanel {
             }
         }
         self.object = Some(value);
+        if self.yaml_compare.is_some() {
+            self.yaml_compare = self.meanwhile_section();
+        }
         // Its field managers, an Application's deployments: kept current in the History tab.
         self.merge_history();
         true

@@ -322,6 +322,7 @@ impl DetailPanel {
                         )),
                 )
             })
+            .children(self.render_changed_meanwhile(cx))
             .child(
                 h_flex()
                     .flex_1()
