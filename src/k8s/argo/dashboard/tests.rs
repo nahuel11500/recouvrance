@@ -4,9 +4,9 @@ use serde_json::{Value, json};
 
 use super::example::{self, ENVIRONMENTS};
 use super::{
-    Cards, DiffSummary, Image, diff_from_git, diff_from_status, history, image_changes, last_sync, managed_path,
-    problems_from_status, problems_from_tree, remember, revision_path, source_images, split_image, state, tree_path,
-    versions, who,
+    Cards, DiffSummary, Image, Read, deployed, diff_from_git, diff_from_status, history, image_changes, last_sync,
+    managed_path, problems_from_status, problems_from_tree, remember, revision_path, source_images, split_image, state,
+    tree_path, versions, who,
 };
 use crate::status::Tone;
 
@@ -144,7 +144,7 @@ fn the_state_says_a_failed_or_running_sync_over_the_comparison() {
 
 #[test]
 fn problems_are_grouped_by_workload_from_the_tree() {
-    let p = problems_from_tree(&example::tree("example-prod", now()));
+    let p = problems_from_tree(&app("example-prod"), &example::tree("example-prod", now()));
     let rows: Vec<_> =
         p.rows.iter().map(|r| (r.status.as_str(), r.res.kind.as_str(), r.res.name.as_str(), r.pods)).collect();
     assert_eq!(
@@ -162,7 +162,7 @@ fn problems_are_grouped_by_workload_from_the_tree() {
     assert_eq!(p.rows[0].since, Some(Timestamp::from_second(now().as_second() - 12 * 60).unwrap()));
     assert!(p.rows[0].why.as_deref().is_some_and(|w| w.contains("back-off")));
     assert!(p.rows[1].why.as_deref().is_some_and(|w| w.starts_with("No metric")));
-    let fine = problems_from_tree(&example::tree("example-staging", now()));
+    let fine = problems_from_tree(&app("example-staging"), &example::tree("example-staging", now()));
     assert!(fine.rows.is_empty() && fine.troubled == 0 && fine.pods.len() == 12);
 }
 
@@ -174,7 +174,7 @@ fn a_pod_running_but_not_ready_is_in_trouble() {
         {"kind": "Pod", "name": "q", "namespace": "n", "uid": "q",
             "info": [{"name": "Status Reason", "value": "Completed"}], "health": {"status": "Healthy"}},
     ]});
-    let p = problems_from_tree(&tree);
+    let p = problems_from_tree(&json!({}), &tree);
     assert_eq!(p.rows.len(), 1);
     assert_eq!(
         (p.rows[0].status.as_str(), p.rows[0].res.name.as_str(), p.rows[0].pods),
@@ -261,6 +261,100 @@ fn every_example_makes_its_cards() {
     assert_eq!(prod.diff.total(), 3);
 }
 
+/// The tree holds only live objects: what auto-sync should have deployed and isn't live is
+/// said from the status, Missing, whether the status says so or only that it's out of sync.
+#[test]
+fn what_is_missing_is_a_problem_with_a_tree() {
+    let mut staging = app("example-staging");
+    let resources = staging["status"]["resources"].as_array_mut().unwrap();
+    resources.push(json!({"kind": "Service", "namespace": "shop", "name": "metrics", "status": "OutOfSync",
+        "health": {"status": "Missing"}}));
+    // Argo CD 3: no health in the status, out of sync, not in the tree.
+    resources.push(json!({"kind": "ConfigMap", "namespace": "shop", "name": "flags", "status": "OutOfSync"}));
+    // Out of sync but live: it differs, it isn't missing.
+    resources.push(json!({"group": "apps", "kind": "Deployment", "namespace": "shop", "name": "api",
+        "status": "OutOfSync"}));
+    // To prune: no longer in git, not missing.
+    resources.push(json!({"kind": "ConfigMap", "namespace": "shop", "name": "old", "status": "OutOfSync",
+        "requiresPruning": true}));
+    let tree = example::tree("example-staging", now());
+    let p = problems_from_tree(&staging, &tree);
+    let rows: Vec<(&str, &str)> = p.rows.iter().map(|r| (r.status.as_str(), r.res.name.as_str())).collect();
+    assert_eq!(rows, [("Missing", "flags"), ("Missing", "metrics")]);
+    assert!(p.rows.iter().all(|r| r.tone == Tone::Bad && r.why.is_some()));
+    // Synced by hand, what isn't deployed yet is expected.
+    staging["spec"]["syncPolicy"] = json!({});
+    assert!(problems_from_tree(&staging, &tree).rows.is_empty());
+}
+
+/// Argo CD 3 keeps no health in the status: with no tree, finding nothing isn't "nothing
+/// wrong" unless the Application is Healthy.
+#[test]
+fn a_status_without_health_says_nothing_either_way() {
+    let mut prod = app("example-prod");
+    for r in prod["status"]["resources"].as_array_mut().unwrap() {
+        r.as_object_mut().unwrap().remove("health");
+    }
+    assert!(problems_from_status(&prod).rows.is_empty());
+    let read = |app: Value| Read { app, tree: None, diff: None, commits: Vec::new(), note: Some("no server".into()) };
+    let cards = Cards::of(read(prod), None, now());
+    assert!(cards.problems.rows.is_empty() && !cards.clean_is_known(), "Degraded, nothing found: unknown");
+    let cards = Cards::of(read(app("example-staging")), None, now());
+    assert!(cards.clean_is_known(), "Healthy");
+    let cards = Cards::of(example::read("example-prod", now()), None, now());
+    assert!(cards.clean_is_known(), "from the tree");
+}
+
+#[test]
+fn one_repository_at_several_tags_is_no_change() {
+    let both = ["r.example/a/worker:1".to_string(), "r.example/a/worker:2".into()];
+    // Two components on one image at two tags, both there before: nothing changed.
+    assert!(image_changes(&both, Some(&both)).iter().all(|i| i.from.is_none()));
+    // One of them moved to a tag not there before: that one changed.
+    let now = ["r.example/a/worker:1".to_string(), "r.example/a/worker:3".into()];
+    let from: Vec<(&str, Option<&str>)> =
+        image_changes(&now, Some(&both)).iter().map(|i| (i.tag.as_str(), i.from.as_deref())).collect();
+    assert_eq!(from, [("1", None), ("3", Some("1"))]);
+}
+
+#[test]
+fn deployed_names_each_source_with_its_revision() {
+    let mut a = app("example-staging");
+    a["status"]["history"] = json!([{
+        "id": 4,
+        "revisions": ["abc123", "", "1.2.0"],
+        "sources": [
+            {"repoURL": "https://git.example.com/a.git"},
+            {"repoURL": "https://git.example.com/b.git"},
+            {"repoURL": "https://charts.example.com", "chart": "web"},
+        ],
+    }]);
+    let (sources, version) = deployed(&a);
+    let got: Vec<(Option<usize>, &str, Option<&str>)> =
+        sources.iter().map(|d| (d.index, d.revision.as_str(), d.chart.as_deref())).collect();
+    // A source without a revision is left out; the others keep their index.
+    assert_eq!(got, [(Some(0), "abc123", None), (Some(2), "1.2.0", Some("web"))]);
+    assert_eq!(version, Some(4));
+    // Nothing deployed yet: the revision compared with git.
+    let mut fresh = app("example-staging");
+    fresh["status"]["history"] = json!([]);
+    let (sources, version) = deployed(&fresh);
+    assert_eq!((sources.len(), version), (1, None));
+    assert_eq!(sources[0].repo, "https://git.example.com/shop/deploy.git");
+}
+
+#[test]
+fn a_terminating_sync_is_syncing_and_no_comparison_is_unknown() {
+    let mut a = app("example-staging");
+    a["status"]["operationState"]["phase"] = json!("Terminating");
+    assert_eq!(state(&a, None).sync, "Syncing");
+    let mut a = app("example-staging");
+    a["status"].as_object_mut().unwrap().remove("sync");
+    let s = state(&a, None);
+    assert_eq!(s.sync, "Unknown");
+    assert_ne!(s.tone, Tone::Good);
+}
+
 proptest! {
     /// Whatever the tree holds, every pod is counted once, and those in trouble are counted
     /// in exactly one row.
@@ -282,7 +376,7 @@ proptest! {
             }
             nodes.push(pod);
         }
-        let p = problems_from_tree(&json!({"nodes": nodes}));
+        let p = problems_from_tree(&json!({}), &json!({"nodes": nodes}));
         let in_trouble = pods.iter().filter(|(_, r)| matches!(*r, 1 | 2)).count();
         prop_assert_eq!(p.pods.len(), pods.len());
         prop_assert_eq!(p.troubled, in_trouble);

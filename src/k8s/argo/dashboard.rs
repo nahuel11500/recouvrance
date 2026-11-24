@@ -154,14 +154,22 @@ pub fn split_image(image: &str) -> (String, String) {
 }
 
 /// Each image of `current`, by component, with its tag in `previous` (the images of the
-/// deployment before) when the same repository had another tag there.
+/// deployment before) when the same repository was there at other tags only.
 pub fn image_changes(current: &[String], previous: Option<&[String]>) -> Vec<Image> {
-    let before: HashMap<String, String> = previous.unwrap_or_default().iter().map(|i| split_image(i)).collect();
+    // A repository may run at several tags at once (two components of one image): each tag of
+    // it before. A tag that was there is no change; otherwise the change is from the first.
+    let mut before: HashMap<String, Vec<String>> = HashMap::new();
+    for (repo, tag) in previous.unwrap_or_default().iter().map(|i| split_image(i)) {
+        let tags = before.entry(repo).or_default();
+        if !tags.contains(&tag) {
+            tags.push(tag);
+        }
+    }
     let mut out: Vec<Image> = current
         .iter()
         .map(|i| {
             let (repo, tag) = split_image(i);
-            let from = before.get(&repo).filter(|t| **t != tag).cloned();
+            let from = before.get(&repo).filter(|tags| !tags.contains(&tag)).and_then(|tags| tags.first().cloned());
             let component = repo.rsplit('/').next().unwrap_or(&repo).to_string();
             Image { component, repo, tag, from }
         })
@@ -430,10 +438,11 @@ fn rank(t: Tone) -> u8 {
     }
 }
 
-/// What is in trouble in a resource tree: one row per workload whose pods are (pods grouped
-/// under the object at the top of their owners), then the other objects Degraded or Missing.
-/// The worst first.
-pub fn problems_from_tree(tree: &Value) -> Problems {
+/// What is in trouble in the resource tree of `app`: one row per workload whose pods are (pods
+/// grouped under the object at the top of their owners), then the other objects Degraded. The
+/// tree holds only live objects: what is missing comes from the Application's status (see
+/// [`missing_rows`]). The worst first.
+pub fn problems_from_tree(app: &Value, tree: &Value) -> Problems {
     let nodes = arr(tree, "/nodes");
     let by_uid: HashMap<&str, &Value> = nodes.iter().filter_map(|n| Some((s(n, "/uid")?, n))).collect();
     // The object at the top of a node's owners (itself when it has none known).
@@ -494,7 +503,7 @@ pub fn problems_from_tree(tree: &Value) -> Problems {
     }
     let mut tops_done: Vec<String> = groups.iter().filter(|(_, g)| !g.1.is_empty()).map(|(k, _)| k.clone()).collect();
     for n in nodes.iter().filter(|n| s(n, "/kind") != Some("Pod")) {
-        let Some(health @ ("Degraded" | "Missing")) = s(n, "/health/status") else { continue };
+        let Some(health @ "Degraded") = s(n, "/health/status") else { continue };
         let key = top(n);
         if tops_done.contains(&key) {
             continue;
@@ -510,8 +519,38 @@ pub fn problems_from_tree(tree: &Value) -> Problems {
             why: s(n, "/health/message").map(String::from),
         });
     }
+    let live: Vec<Res> = nodes.iter().map(res_of_node).collect();
+    let missing = missing_rows(app, |r| live.iter().any(|l| l.same(r)));
+    let shown: Vec<Res> = out.rows.iter().map(|p| p.res.clone()).collect();
+    out.rows.extend(missing.into_iter().filter(|m| !shown.iter().any(|s| s.same(&m.res))));
     sort_problems(&mut out.rows);
     out
+}
+
+/// The resources of `app` that should be live and aren't, when auto-sync is on (synced by
+/// hand, what is not deployed yet is expected): those its status says Missing, and those out
+/// of sync that `is_live` doesn't know (not to prune, not a hook).
+pub fn missing_rows(app: &Value, is_live: impl Fn(&Res) -> bool) -> Vec<Problem> {
+    if !super::auto_sync(app) {
+        return Vec::new();
+    }
+    arr(app, "/status/resources")
+        .iter()
+        .filter(|r| r["hook"] != true && !super::to_prune(r))
+        .filter_map(|r| {
+            let res = Res::of(r)?;
+            let missing =
+                s(r, "/health/status") == Some("Missing") || (s(r, "/status") == Some("OutOfSync") && !is_live(&res));
+            missing.then(|| Problem {
+                status: "Missing".into(),
+                tone: Tone::Bad,
+                why: Some(s(r, "/health/message").unwrap_or("In git, not in the cluster.").to_string()),
+                res,
+                pods: None,
+                since: None,
+            })
+        })
+        .collect()
 }
 
 fn sort_problems(rows: &mut [Problem]) {
@@ -788,11 +827,18 @@ pub struct Cards {
 }
 
 impl Cards {
+    /// Whether finding no problem means there is none: the resource tree was read, or the
+    /// Application is Healthy. From a status without health per resource (Argo CD 3 keeps it
+    /// in the tree), finding nothing says nothing.
+    pub fn clean_is_known(&self) -> bool {
+        self.problems.from_tree || self.summary.health == "Healthy"
+    }
+
     /// The cards of what was read, at `now`; `seen`: the images seen under the deployment before.
     pub fn of(read: Read, seen: Option<&[String]>, now: Timestamp) -> Self {
         let app = &read.app;
         let tree = read.tree.as_ref().and_then(|t| t.as_ref().ok());
-        let problems = tree.map_or_else(|| problems_from_status(app), problems_from_tree);
+        let problems = tree.map_or_else(|| problems_from_status(app), |t| problems_from_tree(app, t));
         let diff = match &read.diff {
             Some(Ok(d)) => diff_from_git(d),
             _ => diff_from_status(app),

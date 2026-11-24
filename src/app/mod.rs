@@ -163,6 +163,18 @@ pub fn is_current(page: EntityId, cx: &App) -> bool {
     cx.try_global::<VisiblePages>().is_some_and(|v| v.current(page))
 }
 
+/// Put `page` on screen, or take it off: for view tests of pages that wait to be shown.
+#[cfg(all(test, feature = "dev"))]
+pub fn show_for_test(cx: &mut App, page: EntityId, shown: bool) {
+    let window: EntityId = 999_999u64.into();
+    let visible = cx.default_global::<VisiblePages>();
+    if shown {
+        visible.pages.insert(window, page);
+    } else {
+        visible.pages.remove(&window);
+    }
+}
+
 /// Wait until this page is on screen; false once it is gone.
 pub async fn wait_visible<T: 'static, C: AppContext>(
     this: &WeakEntity<T>,

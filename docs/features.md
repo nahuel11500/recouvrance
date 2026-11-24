@@ -286,8 +286,10 @@
   context's (the server's name typed, or a wait). Settings → Argo CD lists the servers, says how
   each logs in, tests one (who the token is, Argo CD's version, how many Applications it may
   read), turns one off, and never shows a token.
-- **Argo CD Application dashboard**: a row's click, or a service's heading, opens the dashboard of
-  that service: a tab per environment (each of its Applications, with a dot in its color), *Updated
+- **Argo CD Application dashboard**: a row's click, or a click on a service heading's name, opens
+  the dashboard of that service (the heading's chevron folds it): a tab per environment (each of
+  its Applications, with a dot in its color; with its Argo CD's name too when two share a name or
+  several Argo CDs are read), *Updated
   at* and *Refresh*, and cards. *State*: the sync in big (*Synced*, *OutOfSync*, *Sync Failed* or
   *Syncing*), the health, the resources Degraded (`worker Degraded +1`) and *Why?* (the diagnosis
   below), the card tinted green, amber or red. *Versions*: a chip per component's image (the
@@ -299,8 +301,11 @@
   deployed with its commit's message, author and time (a chart's version has none). *Problems*:
   from the resource tree, one row per workload whose pods are in trouble (`CrashLoopBackOff`,
   `Pending`, `ContainerCreating`, *Not ready*...), with how many of its pods, since when and *why*
-  (Argo CD's health message), then other objects Degraded (an autoscaler with no metric); the
-  pod count and *all pods* (the destination namespace on its context, else the tree's pods).
+  (Argo CD's health message), then other objects Degraded (an autoscaler with no metric), then,
+  with auto-sync on, what should be live and isn't (*Missing*, from the Application's status:
+  the tree holds only live objects); the pod count and *all pods* (the destination namespace on
+  its context, else the tree's pods). *Nothing wrong.* is said only from the tree or of a Healthy
+  Application; from a status without health per resource (Argo CD 3) it says *No detail* and why.
   *Last sync*: phase, message, duration, who, when and its steps (each resource's result and a
   hook's phase), progress live while it runs. *Sync diff*: how many resources a sync would change
   (`~ changed, + added, – pruned`, with names) and *show* for Argo CD's diff, or *Nothing to sync*.
@@ -309,9 +314,11 @@
   `managed-resources` and `revisions/<rev>/metadata`, a commit kept once read) for an Application
   read that way; on the hub for one read there, with the tree, the diff and the commits from the
   Argo CD server set for that context (without one, problems and diff come from the Application's
-  status). It is read again when its row changes (the stream, the hubs' next read), every 3 s
-  while a sync runs, and on *Refresh*; a newer read replaces the one running, and leaving the tab
-  or the page stops it. The cards are worked out off the UI thread.
+  status). It is read again when its row changes (the stream, the hubs' next read; a change
+  during a read is read once that read ends), 3 s after a read that found a sync running (when
+  the page is hidden, once it shows again), and on *Refresh*. Leaving the tab or the page stops
+  the read running; the page shown again reads the tab anew. The cards are worked out off the UI
+  thread.
 - **Argo CD sync, terminate and roll back**: *Sync* (the Application's page, its row menu, the
   Argo CD panel) reads the Application first and lists its resources out of sync, all ticked:
   untick some to sync only the others (hooks run only when all are synced; past 200 the whole

@@ -47,11 +47,14 @@ pub(super) struct Dashboard {
     /// The Application's row when it was read: a change of it reads it again.
     read_for: Option<(Key, argo::Summary)>,
     loading: bool,
+    /// Its row changed while a read ran: read it again when that one ends.
+    dirty: bool,
     updated: Option<Timestamp>,
     load: crate::latest::Latest,
-    /// Reads it again while a sync runs.
-    tick: crate::latest::Latest,
-    /// The parts unfolded: "why", "steps", "diff", "history", "pods", "problems", "why-<i>".
+    /// Reads it again while a sync runs, once the page is shown.
+    tick: Option<Task<()>>,
+    /// The parts unfolded: "why", "steps", "diff", "history", "pods", "problems",
+    /// "why-<resource>".
     open: HashSet<String>,
     /// Made-up environments and their cards (the developer tools' example): nothing is read.
     example: Option<Vec<(String, Arc<Cards>)>>,
@@ -66,9 +69,10 @@ impl Dashboard {
             cards: None,
             read_for: None,
             loading: false,
+            dirty: false,
             updated: None,
             load: Default::default(),
-            tick: Default::default(),
+            tick: None,
             open: HashSet::new(),
             example: None,
         }
@@ -90,6 +94,53 @@ impl Dashboard {
     fn is_open(&self, part: &str) -> bool {
         self.open.contains(part)
     }
+
+    /// Take the result of a read of the tab `k`, done at `now`: kept unless another tab is
+    /// shown by then (`Stale`). What follows: a read again when its row changed meanwhile
+    /// (`Reload`), one in a few seconds while a sync runs (`Tick`), or nothing.
+    fn take_read(&mut self, k: Key, cards: Result<Arc<Cards>, String>, now: Timestamp) -> Next {
+        if self.current() != Some(&k) {
+            return Next::Stale;
+        }
+        let running =
+            cards.as_ref().is_ok_and(|c| c.summary.in_progress || c.last_sync.as_ref().is_some_and(|s| s.running));
+        self.loading = false;
+        self.updated = Some(now);
+        self.cards = Some((k, cards));
+        if std::mem::take(&mut self.dirty) {
+            Next::Reload
+        } else if running {
+            Next::Tick
+        } else {
+            Next::Rest
+        }
+    }
+}
+
+/// What follows a read of the dashboard (see `Dashboard::take_read`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Next {
+    Stale,
+    Reload,
+    Tick,
+    Rest,
+}
+
+/// Run `then` on the view `after` this long, once its page is on screen: a hidden page waits
+/// until it shows again (nothing is read for a page no one sees), instead of skipping it for
+/// good. Dropping the task drops it.
+fn when_shown<V: 'static>(
+    cx: &mut Context<V>,
+    after: Duration,
+    then: impl FnOnce(&mut V, &mut Context<V>) + 'static,
+) -> Task<()> {
+    cx.spawn(async move |this, cx| {
+        let exec = cx.background_executor().clone();
+        exec.timer(after).await;
+        if crate::app::wait_visible(&this, cx, &exec).await {
+            let _ = this.update(cx, then);
+        }
+    })
 }
 
 impl ArgoView {
@@ -130,7 +181,8 @@ impl ArgoView {
         }
         d.tab = tab;
         d.open.clear();
-        d.tick.cancel();
+        d.tick = None;
+        d.dirty = false;
         self.load_dashboard(cx);
         cx.notify();
     }
@@ -153,6 +205,8 @@ impl ArgoView {
         let Some(a) = self.find(&k).cloned() else {
             if let Some(d) = &mut self.dashboard {
                 d.load.cancel();
+                d.tick = None;
+                (d.loading, d.dirty) = (false, false);
                 d.cards = Some((k, Err("This Application is no longer listed.".into())));
             }
             cx.notify();
@@ -174,29 +228,36 @@ impl ArgoView {
             Ok::<_, String>(Arc::new(cards.await))
         };
         let Some(d) = &mut self.dashboard else { return };
-        d.loading = true;
+        (d.loading, d.dirty) = (true, false);
+        d.tick = None;
         d.read_for = Some((k.clone(), a.app));
         d.load.spawn(cx, work, move |this, cards: Result<Arc<Cards>, String>, cx| {
-            let Some(d) = &mut this.dashboard else { return };
-            if d.current() != Some(&k) {
-                return;
-            }
-            let running =
-                cards.as_ref().is_ok_and(|c| c.summary.in_progress || c.last_sync.as_ref().is_some_and(|s| s.running));
-            d.loading = false;
-            d.updated = Some(Timestamp::now());
-            d.cards = Some((k, cards));
-            if running {
-                // A sync running: its steps move without its row changing.
-                let timer = cx.background_executor().timer(RUNNING_EVERY);
-                d.tick.spawn(cx, timer, |this, (), cx| {
-                    if crate::app::is_visible(cx.entity_id(), cx) {
-                        this.load_dashboard(cx);
-                    }
-                });
-            }
-            cx.notify();
+            this.dashboard_read(k, cards, cx);
         });
+        cx.notify();
+    }
+
+    /// A read of the tab `k` ended: show it, unless another tab is shown by then; read it again
+    /// when its row changed meanwhile, or in a few seconds while a sync runs.
+    fn dashboard_read(&mut self, k: Key, cards: Result<Arc<Cards>, String>, cx: &mut Context<Self>) {
+        let Some(d) = &mut self.dashboard else { return };
+        let next = d.take_read(k, cards, Timestamp::now());
+        cx.notify();
+        match next {
+            Next::Stale | Next::Rest => {}
+            Next::Reload => self.load_dashboard(cx),
+            // A sync running: its steps move without its row changing.
+            Next::Tick => d.tick = Some(when_shown(cx, RUNNING_EVERY, Self::load_dashboard)),
+        }
+    }
+
+    /// The page is no longer shown: the read running is dropped, and the tab is read again once
+    /// the page shows (its next rows).
+    pub(super) fn dashboard_hidden(&mut self, cx: &mut Context<Self>) {
+        let Some(d) = self.dashboard.as_mut().filter(|d| d.example.is_none()) else { return };
+        d.load.cancel();
+        (d.loading, d.dirty) = (false, false);
+        d.read_for = None;
         cx.notify();
     }
 
@@ -206,9 +267,18 @@ impl ArgoView {
         let Some(k) = d.current().cloned() else { return };
         let now = self.find(&k).map(|a| a.app.clone());
         let before = d.read_for.as_ref().filter(|(rk, _)| *rk == k).map(|(_, s)| s.clone());
-        if now.is_some() && now != before {
-            self.load_dashboard(cx);
+        if now.is_none() || now == before {
+            return;
         }
+        // A read is running: it ends first (a busy Application changes more often than three
+        // requests take), then the tab is read again.
+        if d.loading {
+            if let Some(d) = &mut self.dashboard {
+                d.dirty = true;
+            }
+            return;
+        }
+        self.load_dashboard(cx);
     }
 
     /// The made-up example of the developer tools: three environments, nothing read.
@@ -275,14 +345,24 @@ impl ArgoView {
             });
         let tabs: Vec<(String, Tone)> = match &d.example {
             Some(tabs) => tabs.iter().map(|(n, c)| (n.clone(), c.state.tone)).collect(),
-            None => d
-                .members
-                .iter()
-                .map(|k| {
-                    let tone = self.find(k).map_or(Tone::Done, |a| argo::attention(&a.app));
-                    (k.2.clone(), tone)
-                })
-                .collect(),
+            None => {
+                // Two of the same name (another namespace or Argo CD), or several sources: each
+                // says where it is read.
+                let clash = d.members.iter().any(|k| d.members.iter().filter(|o| o.2 == k.2).count() > 1);
+                let sourced = clash || self.several_sources();
+                d.members
+                    .iter()
+                    .map(|k| {
+                        let found = self.find(k);
+                        let tone = found.map_or(Tone::Done, |a| argo::attention(&a.app));
+                        let label = match found {
+                            Some(a) if sourced => format!("{} · {}", k.2, a.source.label()),
+                            _ => k.2.clone(),
+                        };
+                        (label, tone)
+                    })
+                    .collect()
+            }
         };
         let view = cx.entity().downgrade();
         let tab_bar = TabBar::new(SharedString::from(format!("argo-dash-tabs-{}-{}", tabs.len(), d.tab)))
@@ -355,7 +435,10 @@ impl ArgoView {
         card("State", Some(s.tone), cx)
             .child(div().text_2xl().font_weight(FontWeight::BOLD).text_color(sync_tone.color(cx)).child(s.sync.clone()))
             .child(
-                div().text_sm().text_color(argo::health_tone(&s.health).color(cx)).child(selectable(s.health.clone())),
+                div()
+                    .text_sm()
+                    .text_color(argo::listed_health_tone(&s.health, c.summary.automated).color(cx))
+                    .child(selectable(s.health.clone())),
             )
             .when_some(s.health_message.clone(), |v, m| {
                 v.child(div().text_xs().text_color(theme.muted_foreground).child(selectable(m)))
@@ -473,17 +556,27 @@ impl ArgoView {
     fn problems_card(&self, d: &Dashboard, c: &Cards, cx: &mut Context<Self>) -> Div {
         let p = &c.problems;
         let theme = cx.theme().clone();
+        // Nothing found is only good news when the tree was read or the Application is
+        // Healthy: from a status without health, nothing found says nothing.
+        let known_clean = c.clean_is_known();
         let tone = if p.rows.iter().any(|r| r.tone == Tone::Bad) {
             Tone::Bad
-        } else if p.rows.is_empty() {
+        } else if p.rows.is_empty() && known_clean {
             Tone::Good
+        } else if p.rows.is_empty() {
+            Tone::Done
         } else {
             Tone::Busy
         };
+        let no_detail = (p.rows.is_empty() && !known_clean).then(|| {
+            let why = c.tree_error.clone().or_else(|| c.note.clone()).unwrap_or_else(|| {
+                "Argo CD keeps no health per resource in the Application, and its resource tree wasn't read".into()
+            });
+            format!("No detail: {why}.")
+        });
         let all = d.is_open("problems");
         let shown = if all { p.rows.len() } else { p.rows.len().min(PROBLEMS_SHOWN) };
-        let rows: Vec<Div> =
-            p.rows.iter().take(shown).enumerate().map(|(i, r)| self.problem_row(d, i, r, cx)).collect();
+        let rows: Vec<Div> = p.rows.iter().take(shown).map(|r| self.problem_row(d, r, cx)).collect();
         let more = p.rows.len() - shown;
         let k = d.current().cloned();
         let reaches =
@@ -498,7 +591,12 @@ impl ArgoView {
             self.toggle_link("pods", "pods", "all pods", d, cx)
         };
         card("Problems", Some(tone), cx)
-            .when(p.rows.is_empty(), |v| v.child(div().text_sm().text_color(theme.success).child("Nothing wrong.")))
+            .when(p.rows.is_empty() && known_clean, |v| {
+                v.child(div().text_sm().text_color(theme.success).child("Nothing wrong."))
+            })
+            .when_some(no_detail.clone(), |v, text| {
+                v.child(div().text_sm().text_color(theme.muted_foreground).child(selectable(text)))
+            })
             .children(rows)
             .when(more > 0, |v| v.child(self.toggle_link("more", "problems", &format!("+{more} more"), d, cx)))
             .when(p.from_tree, |v| {
@@ -511,7 +609,7 @@ impl ArgoView {
                         .when(!p.pods.is_empty(), |h| h.child(all_pods)),
                 )
             })
-            .when(!p.from_tree, |v| {
+            .when(!p.from_tree && no_detail.is_none(), |v| {
                 let why = c.tree_error.clone().unwrap_or_else(|| {
                     "From the Application's status: its pods are in Argo CD's resource tree.".into()
                 });
@@ -528,9 +626,10 @@ impl ArgoView {
             })
     }
 
-    fn problem_row(&self, d: &Dashboard, i: usize, r: &Problem, cx: &mut Context<Self>) -> Div {
+    fn problem_row(&self, d: &Dashboard, r: &Problem, cx: &mut Context<Self>) -> Div {
         let theme = cx.theme().clone();
-        let part = format!("why-{i}");
+        // Keyed by the resource: the rows may move when the tab is read again.
+        let part = format!("why-{}", r.res.label());
         let open = d.is_open(&part);
         let why = r.why.is_some().then(|| self.toggle_link(&part, &part, "why", d, cx));
         let mut facts = vec![r.res.kind.clone()];
@@ -851,4 +950,85 @@ fn link(id: impl Into<ElementId>, text: &str, cx: &App) -> Stateful<Div> {
         .cursor_pointer()
         .hover(Styled::underline)
         .child(text.to_string())
+}
+
+// View tests need the toolkit's test support, which the `dev` feature turns on.
+#[cfg(all(test, feature = "dev"))]
+mod tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use gpui_kit::{AppContext as _, Context, Task, TestAppContext};
+    use jiff::Timestamp;
+
+    use super::{Dashboard, Next, when_shown};
+    use crate::k8s::argo::dashboard::{Cards, example};
+
+    fn key(name: &str) -> super::Key {
+        ("argocd.example.com".into(), "argocd".into(), name.into())
+    }
+
+    fn cards(env: &str) -> Arc<Cards> {
+        let now = Timestamp::now();
+        Arc::new(Cards::of(example::read(env, now), None, now))
+    }
+
+    /// A read of a tab left before it ended is dropped; the tab shown keeps its own.
+    #[test]
+    fn a_read_of_another_tab_is_dropped() {
+        let mut d = Dashboard::new("shop".into(), vec![key("example-staging"), key("example-prod")], 1);
+        d.loading = true;
+        assert_eq!(d.take_read(key("example-staging"), Ok(cards("example-staging")), Timestamp::now()), Next::Stale);
+        assert!(d.shown().is_none() && d.loading, "nothing shown, the tab's own read still runs");
+        assert_eq!(d.take_read(key("example-prod"), Ok(cards("example-prod")), Timestamp::now()), Next::Rest);
+        assert!(d.shown().is_some_and(|c| c.is_ok_and(|c| c.summary.name == "example-prod")));
+        assert!(!d.loading);
+    }
+
+    /// A row that changed during a read reads again once it ends; a sync running ticks.
+    #[test]
+    fn what_follows_a_read() {
+        let mut d = Dashboard::new("shop".into(), vec![key("example-staging")], 0);
+        d.dirty = true;
+        assert_eq!(d.take_read(key("example-staging"), Ok(cards("example-staging")), Timestamp::now()), Next::Reload);
+        assert!(!d.dirty);
+        let mut running = (*cards("example-staging")).clone();
+        running.summary.in_progress = true;
+        assert_eq!(d.take_read(key("example-staging"), Ok(Arc::new(running)), Timestamp::now()), Next::Tick);
+        assert_eq!(d.take_read(key("example-staging"), Err("down".into()), Timestamp::now()), Next::Rest);
+    }
+
+    #[derive(Default)]
+    struct Page {
+        reads: usize,
+        tick: Option<Task<()>>,
+    }
+
+    impl Page {
+        fn read(&mut self, _: &mut Context<Self>) {
+            self.reads += 1;
+        }
+    }
+
+    /// The re-read while a sync runs waits for a hidden page to show, rather than being lost.
+    #[gpui_kit::test]
+    fn a_tick_waits_for_the_page_to_show(cx: &mut TestAppContext) {
+        let page = cx.new(|_| Page::default());
+        page.update(cx, |p, cx| p.tick = Some(when_shown(cx, Duration::from_secs(3), Page::read)));
+        cx.executor().advance_clock(Duration::from_secs(10));
+        cx.run_until_parked();
+        assert_eq!(page.read_with(cx, |p, _| p.reads), 0, "hidden: not read");
+        let id = page.entity_id();
+        cx.update(|cx| crate::app::show_for_test(cx, id, true));
+        cx.executor().advance_clock(Duration::from_secs(1));
+        cx.run_until_parked();
+        assert_eq!(page.read_with(cx, |p, _| p.reads), 1, "shown: read once");
+        // Dropped before its time: nothing.
+        page.update(cx, |p, cx| p.tick = Some(when_shown(cx, Duration::from_secs(3), Page::read)));
+        page.update(cx, |p, _| p.tick = None);
+        cx.executor().advance_clock(Duration::from_secs(5));
+        cx.run_until_parked();
+        assert_eq!(page.read_with(cx, |p, _| p.reads), 1);
+        cx.update(|cx| crate::app::show_for_test(cx, id, false));
+    }
 }

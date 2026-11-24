@@ -543,7 +543,13 @@ impl ArgoView {
                     let relogged = exec.spawn(async { api::config_stamp() }).await != stamp;
                     if !shown || relogged || api::generation() != generation {
                         // Hidden, or the servers changed: the feeds stop unless another page holds them.
-                        let _ = this.update(cx, |this, _| this.watches.clear());
+                        // Hidden, the dashboard's read stops too; it reads again once shown.
+                        let _ = this.update(cx, |this, cx| {
+                            this.watches.clear();
+                            if !shown {
+                                this.dashboard_hidden(cx);
+                            }
+                        });
                         break;
                     }
                     let now = api::changes();
