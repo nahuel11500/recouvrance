@@ -23,6 +23,13 @@
   or `#`; by its scheme alone when its text holds a `#`, or when the host can't be told from the
   password. Neither shows for any other URL in a connection error, unless its password holds an
   unescaped `/`, `?` or `#` (#1000).
+- **Context sets**: tick contexts in the context picker, then *Save as set…* and name them (for
+  example "prod" for every production region). The sets come first in the picker, on the
+  Contexts page and in the palette (Ctrl+K, type the set's name or `set`); one click connects
+  all of a set's contexts, in the order saved (the primary context then stays the primary). A context no longer
+  in the kubeconfig is left out ("2 of 3 contexts"), and a set with a protected context shows
+  the lock. Saving under a name already taken replaces that set; the × on a set's row forgets
+  it. A set reopens where it was left, like any set of contexts connected together (`sessions`).
 - **Short context names**: a context named after its cloud cluster shows the cluster's name
   (`arn:aws:eks:<region>:<account>:cluster/<name>` and `gke_<project>_<zone>_<name>` show
   `<name>`) in the top bar, the sidebar, the context picker, the Contexts page, the connecting
