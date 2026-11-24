@@ -236,7 +236,7 @@ impl AppView {
                         None => (None, theme.muted_foreground, None),
                     };
                     // A shortened name shows in full on hover, above why it can't connect.
-                    let short = crate::k8s::short_names::short_name(ctx);
+                    let short = k8s::short_names::short_name(ctx);
                     let tip = match (short != *ctx, why) {
                         (true, Some(why)) => Some(SharedString::from(format!("{ctx}\n{why}"))),
                         (true, None) => Some(SharedString::from(ctx.clone())),

@@ -311,13 +311,10 @@ impl AppView {
     fn sidebar_header(&self, cx: &mut Context<Self>) -> Div {
         let context = match self.clusters.len() {
             0 if self.connecting => {
-                format!(
-                    "Connecting to {}…",
-                    crate::k8s::short_names::short_name(self.context.as_deref().unwrap_or_default())
-                )
+                format!("Connecting to {}…", k8s::short_names::short_name(self.context.as_deref().unwrap_or_default()))
             }
             0 => "Not connected".into(),
-            1 => crate::k8s::short_names::short_name(&self.clusters[0].0),
+            1 => k8s::short_names::short_name(&self.clusters[0].0),
             n => format!("{n} contexts"),
         };
         // The full names, which the label shortens.
