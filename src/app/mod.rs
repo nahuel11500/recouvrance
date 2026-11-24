@@ -841,7 +841,7 @@ impl AppView {
             HubEvent::ServerStatus(status) => {
                 let status = status.clone();
                 self.agents.update(cx, |v, cx| {
-                    v.server_status = status;
+                    v.set_server_status(status, cx);
                     cx.notify();
                 });
             }

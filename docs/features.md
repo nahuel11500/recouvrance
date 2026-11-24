@@ -8,8 +8,10 @@
   from. A plugin that cannot start, often because it is not on the `PATH` the app was started
   with, is reported with its name. A proxy the app can't use (the kubeconfig's `proxy-url`, or
   `HTTPS_PROXY`, with a scheme other than `http`, `https` or `socks5`, or none) is named by its
-  scheme, host and port, never its user and password; neither shows for any other URL in a
-  connection error.
+  scheme, host and port, never its user and password, even a password with an unescaped `/`, `?`
+  or `#`; by its scheme alone when its text holds a `#`, or when the host can't be told from the
+  password. Neither shows for any other URL in a connection error, unless its password holds an
+  unescaped `/`, `?` or `#` (#1000).
 - **Reopens where you left off**: each set of contexts keeps its tabs (the list or overview each
   shows, its resource type, namespaces and filter) and each type's filter, and the window keeps
   its place, size and whether it was maximized. On launch the first window reopens there once its

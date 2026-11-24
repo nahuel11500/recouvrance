@@ -28,7 +28,15 @@ applying it (an object whose rule turned into *Ask me* needs its own approval).
 ### Connecting your tools
 
 In **Agents**, click **Connect Claude Code**: it registers the server in your Claude Code
-(`claude mcp add --scope user recouvrance …`). For another tool, pick it under *Connect* on the
+(`claude mcp add --scope user recouvrance …`). The page says *Connected to Claude Code* only when
+that entry is an http server at the port this server listens on, with the token of an agent that is
+on. After **New token**, a port change, or an entry left by another Recouvrance, it says what is
+wrong ("Claude Code points at port 47070, not 47199", "Claude Code has an old token") and **Update
+Claude Code** registers it again; while a port changed in Settings waits for a restart, it says to
+restart instead. When the entry can't be judged (Claude Code shows the token masked, or prints a
+format Recouvrance doesn't read), it says *Registered in Claude Code*. The page checks again when it
+is shown (not more than once in 10 seconds unless something changed), after **New token** and when
+the server starts listening on another port. For another tool, pick it under *Connect* on the
 agent's page and copy its config, or its command where it has one:
 
 | Tool | Where it goes |
@@ -238,10 +246,23 @@ tools' definitions. What some of them need beyond the obvious verb:
   the Application is found tracking the object), with its hub, sync, health and the object's own
   state in it; `get_changes` adds the Application's deployments. That Application is read on the
   same hubs, only where an Allow rule gives `get` on it (or `list`, to find it in another
-  namespace or by label), and nothing is read for an object that names none. `wait_for` waits for
-  an Application's `sync=Synced`, `health=Healthy` or `operation=Succeeded`, met only once no
-  operation runs (until then they are from before it); it returns at once with Argo CD's message
-  when the last operation failed.
+  namespace or by label), and nothing is read for an object that names none. A label alone
+  reads only hubs already connected for agents: it never connects to one. The hubs are read
+  together, each bounded in time (10 s to connect, 30 s to read). A hub that can't be reached,
+  whose credentials are refused or whose login command fails is left alone 5 minutes (said for
+  a tracking id, quiet for a label): a connected hub whose token expired runs its login once,
+  then not again until then. A hub that is only slow, or that refuses the read, is asked again
+  on the next call. An Application of the same name on another hub counts only if it deploys to
+  the object's cluster or tracks the object; several that fit as well are named as unclear. One
+  whose destination is an Argo CD cluster name matching no context is taken, said unsure, when
+  it is the only one of that name; the hubs not read are said whenever the one named is not
+  sure. `wait_for` waits for an Application's `sync=Synced`, `health=Healthy` or
+  `operation=Succeeded`, met only once no operation runs (until then they are from before it);
+  a `sync=` or `operation=` wait returns at once with Argo CD's message when the last operation
+  failed on the revision the Application targets now (or auto-sync is off). A failure on an
+  older revision with auto-sync on waits for the next sync. After a push to git, refresh the
+  Application (`gitops` `refresh`) before waiting: until Argo CD has seen the new commit, the
+  revision it targets is still the one that failed, and the wait ends at once.
 - **Argo CD diagnosis:** `gitops` with `action: diagnose` on an Application changes nothing and
   needs `get` on it (not `refresh` or `sync`; the activity log doesn't count it as a change). It returns the
   diagnosis of the Application's page: a deletion held by a finalizer, a sync running for long,
