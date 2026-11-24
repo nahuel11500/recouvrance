@@ -167,7 +167,8 @@ pub async fn strategic_patch(
 
 /// Delete one object. With `uid`, only that object: one re-created under the same name since
 /// the user picked it (a pod replaced by its ReplicaSet, a list that was out of date) is left
-/// alone, the server refusing with a conflict.
+/// alone, the server refusing with a conflict. `cascade` says what happens to what it owns;
+/// None leaves it to the kind's default.
 pub async fn delete(
     client: Client,
     kind: Kind,
@@ -175,14 +176,77 @@ pub async fn delete(
     name: String,
     uid: Option<String>,
     dry_run: bool,
+    cascade: Option<Cascade>,
 ) -> Result<String> {
     run(async move {
         let api = dyn_api(client, &kind, ns.as_deref());
-        let dp = kube::api::DeleteParams { dry_run, preconditions: preconditions(uid), ..Default::default() };
+        let dp = kube::api::DeleteParams {
+            dry_run,
+            preconditions: preconditions(uid),
+            propagation_policy: cascade.map(Cascade::policy),
+            ..Default::default()
+        };
         api.delete(&name, &dp).await?;
-        Ok(format!("{}{} {name} deleted", if dry_run { "[dry run] " } else { "" }, kind.ar.kind))
+        Ok(format!(
+            "{}{} {name} deleted{}",
+            if dry_run { "[dry run] " } else { "" },
+            kind.ar.kind,
+            cascade.map_or("", Cascade::outcome)
+        ))
     })
     .await
+}
+
+/// What a delete does with the objects the deleted one owns (its ReplicaSets, pods, Jobs),
+/// like kubectl's `--cascade`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Cascade {
+    /// They are deleted after it, by the garbage collector (kubectl's default).
+    Background,
+    /// They are deleted first; it goes once they are gone.
+    Foreground,
+    /// They stay, without an owner: how a StatefulSet's volume claim templates or a
+    /// workload's selector are changed without stopping its pods.
+    Orphan,
+}
+
+impl Cascade {
+    pub const ALL: [Self; 3] = [Self::Background, Self::Foreground, Self::Orphan];
+
+    /// `background`, `foreground` or `orphan`, as kubectl's `--cascade` takes them.
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|c| c.as_str().eq_ignore_ascii_case(s.trim()))
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Background => "background",
+            Self::Foreground => "foreground",
+            Self::Orphan => "orphan",
+        }
+    }
+
+    /// The kubectl flag that asks for it.
+    pub fn flag(self) -> String {
+        format!("--cascade={}", self.as_str())
+    }
+
+    const fn policy(self) -> kube::api::PropagationPolicy {
+        match self {
+            Self::Background => kube::api::PropagationPolicy::Background,
+            Self::Foreground => kube::api::PropagationPolicy::Foreground,
+            Self::Orphan => kube::api::PropagationPolicy::Orphan,
+        }
+    }
+
+    /// What a delete's message adds: only the cascades that differ from the usual.
+    const fn outcome(self) -> &'static str {
+        match self {
+            Self::Background => "",
+            Self::Foreground => " (what it owns first)",
+            Self::Orphan => ", what it owns kept",
+        }
+    }
 }
 
 /// "Only if it is still this object", when its real uid is known (rows of a fast first load
@@ -200,19 +264,29 @@ pub fn is_not_found(e: &anyhow::Error) -> bool {
 /// How long controllers get to run their finalizers before "Remove finalizers" clears them.
 pub const FINALIZER_GRACE_SECS: u64 = 10;
 
-/// Delete with options: `force` skips the grace period (`--grace-period=0 --force`).
-/// `strip_finalizers` clears finalizers only when the delete leaves the object stuck
-/// terminating (already before, or still after `FINALIZER_GRACE_SECS`), so controllers that
-/// can still clean up get the chance to.
+/// How [`delete_with`] deletes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DeleteOptions {
+    /// Skip the grace period (`--grace-period=0 --force`).
+    pub force: bool,
+    /// Clear finalizers when the delete leaves the object stuck terminating.
+    pub strip_finalizers: bool,
+    /// What happens to what it owns; None is the kind's default (background when forced).
+    pub cascade: Option<Cascade>,
+}
+
+/// Delete with options (see [`DeleteOptions`]). Finalizers are cleared only when the delete
+/// leaves the object stuck terminating (already before, or still after
+/// `FINALIZER_GRACE_SECS`), so controllers that can still clean up get the chance to.
 pub async fn delete_with(
     client: Client,
     kind: Kind,
     ns: Option<String>,
     name: String,
     uid: Option<String>,
-    force: bool,
-    strip_finalizers: bool,
+    opts: DeleteOptions,
 ) -> Result<String> {
+    let DeleteOptions { force, strip_finalizers, cascade } = opts;
     run(async move {
         let api = dyn_api(client, &kind, ns.as_deref());
         let mut dp = if force {
@@ -224,6 +298,9 @@ pub async fn delete_with(
         } else {
             kube::api::DeleteParams::default()
         };
+        if let Some(c) = cascade {
+            dp.propagation_policy = Some(c.policy());
+        }
         dp.preconditions = preconditions(uid);
         let was_stuck = strip_finalizers && stuck_terminating(api.get_opt(&name).await?.as_ref());
         api.delete(&name, &dp).await?;
@@ -253,9 +330,10 @@ pub async fn delete_with(
             }
         }
         Ok(format!(
-            "{} {name} deleted{}{}",
+            "{} {name} deleted{}{}{}",
             kind.ar.kind,
             if force { " (forced)" } else { "" },
+            cascade.map_or("", Cascade::outcome),
             if stripped { ", finalizers removed" } else { "" }
         ))
     })
@@ -267,6 +345,88 @@ fn stuck_terminating(o: Option<&DynamicObject>) -> bool {
     o.is_some_and(|o| {
         o.metadata.deletion_timestamp.is_some() && o.metadata.finalizers.as_ref().is_some_and(|f| !f.is_empty())
     })
+}
+
+/// Evict one pod through the Eviction API, as a drain does for each of its pods: unlike a
+/// delete, the API server refuses it when a PodDisruptionBudget would be broken, and the
+/// error then names that budget. With `uid`, only that pod (see [`delete`]).
+pub async fn evict(client: Client, ns: String, name: String, uid: Option<String>, dry_run: bool) -> Result<String> {
+    run(async move {
+        let api: Api<Pod> = Api::namespaced(client, &ns);
+        let ep = kube::api::EvictParams {
+            delete_options: Some(kube::api::DeleteParams { preconditions: preconditions(uid), ..Default::default() }),
+            post_options: kube::api::PostParams { dry_run, ..Default::default() },
+        };
+        if let Err(e) = api.evict(&name, &ep).await {
+            // The budget's refusal alone: kube's error would show only the generic message.
+            let said = match &e {
+                kube::Error::Api(s) => eviction_refusal(s),
+                _ => None,
+            };
+            return Err(said.map_or_else(|| e.into(), anyhow::Error::msg));
+        }
+        Ok(format!("{}Pod {name} evicted", if dry_run { "[dry run] " } else { "" }))
+    })
+    .await
+}
+
+/// Why the API server refused an eviction for a PodDisruptionBudget, naming the budget: a 429
+/// whose causes say which (`The disruption budget web needs 2 healthy pods and has 2
+/// currently`). None for any other error, a 429 of API throttling too.
+pub fn eviction_refusal(s: &kube::core::Status) -> Option<String> {
+    let causes = s.details.as_ref().map_or_default(|d| d.causes.as_slice());
+    let budget_cause = causes.iter().any(|c| c.reason == "DisruptionBudget");
+    if s.code != 429 || !(budget_cause || s.message.contains("disruption budget")) {
+        return None;
+    }
+    let said: Vec<String> = causes
+        .iter()
+        .filter(|c| c.reason == "DisruptionBudget" && !c.message.is_empty())
+        .map(|c| {
+            let budget = c.message.strip_prefix("The disruption budget ").and_then(|m| m.split_whitespace().next());
+            match budget {
+                Some(b) => format!("PodDisruptionBudget {b} refuses it: {}", c.message.trim()),
+                None => c.message.trim().to_string(),
+            }
+        })
+        .collect();
+    if said.is_empty() {
+        // An older API server, or one that says no more: its own message.
+        return Some(format!("refused by a PodDisruptionBudget: {}", s.message.trim()));
+    }
+    Some(said.join("; "))
+}
+
+/// An eviction's error as said to people: the budget that refused it when there is one.
+fn eviction_error(e: &kube::Error) -> String {
+    match e {
+        kube::Error::Api(s) => eviction_refusal(s).unwrap_or_else(|| e.to_string()),
+        _ => e.to_string(),
+    }
+}
+
+/// The annotation the External Secrets Operator watches to fetch an `ExternalSecret` from its
+/// store now instead of at its next `refreshInterval`.
+pub const FORCE_SYNC: &str = "force-sync";
+
+/// Ask the External Secrets Operator to fetch an `ExternalSecret` again now, as its docs say:
+/// `kubectl annotate externalsecret <name> force-sync=$(date +%s) --overwrite`. A new value
+/// each time, so a second refresh is a change the operator sees too.
+pub async fn force_sync_external_secret(
+    client: Client,
+    kind: Kind,
+    ns: Option<String>,
+    name: String,
+    dry_run: bool,
+) -> Result<String> {
+    let now = jiff::Timestamp::now().as_second().to_string();
+    let patch = serde_json::json!({"metadata": {"annotations": {FORCE_SYNC: now}}});
+    merge_patch(client, kind.clone(), ns, name.clone(), patch, dry_run).await?;
+    Ok(format!(
+        "{}{} {name}: refresh asked; the operator fetches it from its store now",
+        if dry_run { "[dry run] " } else { "" },
+        kind.ar.kind
+    ))
 }
 
 /// Add an ephemeral debug container to a pod (like `kubectl debug -it --target`)
@@ -786,7 +946,7 @@ pub async fn drain_report(
             let api: Api<Pod> = Api::namespaced(client.clone(), &ns);
             match api.evict(&name, &Default::default()).await {
                 Ok(_) => out.evicted += 1,
-                Err(e) => out.refused.push((ns, name, e.to_string())),
+                Err(e) => out.refused.push((ns, name, eviction_error(&e))),
             }
         }
         Ok(out)
@@ -966,5 +1126,65 @@ mod tests {
         assert!(!stuck_terminating(Some(&obj(true, Some(vec![])))));
         assert!(!stuck_terminating(Some(&obj(true, None))));
         assert!(!stuck_terminating(None));
+    }
+
+    /// The status the API server sends when a budget refuses an eviction.
+    fn refused(code: u16, message: &str, causes: &[(&str, &str)]) -> kube::core::Status {
+        serde_json::from_value(serde_json::json!({
+            "status": "Failure",
+            "code": code,
+            "reason": "TooManyRequests",
+            "message": message,
+            "details": {"causes": causes.iter().map(|(r, m)| serde_json::json!({"reason": r, "message": m})).collect::<Vec<_>>()},
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn an_eviction_refusal_names_its_budget() {
+        let generic = "Cannot evict pod as it would violate the pod's disruption budget.";
+        let s = refused(
+            429,
+            generic,
+            &[("DisruptionBudget", "The disruption budget web needs 2 healthy pods and has 2 currently")],
+        );
+        assert_eq!(
+            eviction_refusal(&s).as_deref(),
+            Some(
+                "PodDisruptionBudget web refuses it: The disruption budget web needs 2 healthy pods and has 2 currently"
+            )
+        );
+        // No cause to read: the server's own words, still said as a budget's refusal.
+        let s = refused(429, generic, &[]);
+        assert_eq!(
+            eviction_refusal(&s).as_deref(),
+            Some(format!("refused by a PodDisruptionBudget: {generic}").as_str())
+        );
+        // API throttling is a 429 too, and not a budget's.
+        assert_eq!(eviction_refusal(&refused(429, "too many requests, please try again later", &[])), None);
+        assert_eq!(eviction_refusal(&refused(404, "pods \"web\" not found", &[])), None);
+        let e = kube::Error::Api(
+            refused(
+                429,
+                generic,
+                &[("DisruptionBudget", "The disruption budget db needs 1 healthy pods and has 1 currently")],
+            )
+            .boxed(),
+        );
+        assert!(eviction_error(&e).starts_with("PodDisruptionBudget db refuses it"), "{}", eviction_error(&e));
+    }
+
+    #[test]
+    fn cascades_read_as_kubectl_writes_them() {
+        for c in Cascade::ALL {
+            assert_eq!(Cascade::parse(c.as_str()), Some(c));
+            assert_eq!(Cascade::parse(&c.as_str().to_uppercase()), Some(c));
+        }
+        assert_eq!(Cascade::Orphan.flag(), "--cascade=orphan");
+        assert_eq!(Cascade::parse("true"), None);
+        assert_eq!(Cascade::parse(""), None);
+        // Only an orphan delete says what it left.
+        assert_eq!(Cascade::Orphan.outcome(), ", what it owns kept");
+        assert_eq!(Cascade::Background.outcome(), "");
     }
 }

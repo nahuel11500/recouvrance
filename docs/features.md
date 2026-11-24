@@ -534,9 +534,14 @@
   type them as before.
 - **Write mode** (off by default): click the `read-only` badge to enable scale, restart, delete
   (confirmed as set per kind), YAML edits (validated by a server dry run first), cordon/uncordon nodes,
-  debug pods with an ephemeral container (falls back to a Pod Security "restricted" profile), run a CronJob now, suspend/resume (CronJobs, Flux, Argo CronWorkflows), drain nodes, force delete
+  debug pods with an ephemeral container (falls back to a Pod Security "restricted" profile), *Evict* a
+  pod (through the Eviction API, like a drain: refused when a PodDisruptionBudget would be broken,
+  and the refusal names the budget), run a CronJob now, suspend/resume (CronJobs, Flux, Argo CronWorkflows), drain nodes, force delete
   or remove finalizers (only once the delete leaves it stuck terminating: it already was, or still is
-  after 10 seconds), Flux *Reconcile*, Argo CD
+  after 10 seconds), delete a Deployment, StatefulSet, DaemonSet, ReplicaSet or CronJob and keep
+  what it owns (a *Keep its pods* box in its Delete dialog, `kubectl delete --cascade=orphan`: how a StatefulSet's volume claim
+  templates or a selector are changed without stopping its pods), an ExternalSecret's *Force
+  refresh* (its `force-sync` annotation: the operator fetches it from its store now), Flux *Reconcile*, Argo CD
   *Refresh*/*Hard refresh*/*Sync*/*Terminate*/*Roll back*, create/apply YAML (a server dry run first, then a confirmation
   showing what each object changes against the cluster: created, changed with its diff, or no change). YAML edits on a detail
   page save only that object: a changed kind, API group, namespace or name is refused, and so are masked Secret values. The
@@ -552,8 +557,8 @@
   `kubectl` line shows `--as`. A protected context still asks for its confirmation (a wait or its name). Reads go as you; write mode and
   the identity are checked again when each request is sent (an identity changed meanwhile sends
   nothing). Actions disabled because your RBAC forbids them stay enabled when the context has an
-  identity. Covered: scale, restart, rollback, delete (force, finalizers), YAML save, the values
-  editor, Apply, cordon/uncordon, drain, CronJob run, suspend/resume, Flux reconcile, Argo CD
+  identity. Covered: scale, restart, rollback, delete (force, finalizers, orphan), YAML save, the values
+  editor, Apply, cordon/uncordon, drain, evict, ExternalSecret refresh, CronJob run, suspend/resume, Flux reconcile, Argo CD
   refresh/sync/terminate/rollback, role bindings. Not covered: Helm, bulk delete from tables, plugins, shells, debug,
   node shell, file copy and ServiceAccount kubeconfigs. Agents never run as it.
 - **Plugins**: your own commands on resources (`~/.config/recouvrance/plugins.yaml`):

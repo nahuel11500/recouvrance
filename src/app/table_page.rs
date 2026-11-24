@@ -510,7 +510,7 @@ impl AppView {
                 async move {
                     match action {
                         // Only the object that was checked, not one re-created under its name.
-                        "Delete" => k8s::delete(client, kind, ns, name.clone(), Some(uid), false).await,
+                        "Delete" => k8s::delete(client, kind, ns, name.clone(), Some(uid), false, None).await,
                         "Scale" => k8s::scale(client, kind, ns, name.clone(), count, false).await,
                         _ => k8s::rollout_restart(client, kind, ns, name.clone(), false).await,
                     }

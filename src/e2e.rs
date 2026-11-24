@@ -2440,3 +2440,305 @@ fn an_agent_follows_an_argo_cd_application_to_what_it_deployed() {
         result
     });
 }
+
+/// Wait until `get` finds nothing, for a minute at most.
+async fn until_gone<F, Fut, T>(what: &str, get: F) -> Result<()>
+where
+    F: Fn() -> Fut,
+    Fut: Future<Output = kube::Result<Option<T>>>,
+{
+    for _ in 0..60 {
+        if get().await?.is_none() {
+            return Ok(());
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+    bail!("{what} is still there")
+}
+
+/// An orphan delete keeps what the object owns: an agent's `delete_resource` with
+/// `cascade: orphan` (its delete rule needed, an unknown cascade refused) deletes a Deployment
+/// and leaves its ReplicaSet, now without an owner; the window's delete with the same option
+/// then deletes that ReplicaSet and leaves its pod.
+#[test]
+#[ignore = "needs a kind cluster: RECOUVRANCE_E2E_CONTEXT"]
+fn an_orphan_delete_keeps_what_the_object_owns() {
+    use k8s_openapi::api::apps::v1::{Deployment, ReplicaSet};
+    use k8s_openapi::api::core::v1::Pod;
+
+    run(async {
+        let ctx = context();
+        let truth = k8s::connect_for_agents(ctx.clone()).await?;
+        let deps: Api<Deployment> = Api::namespaced(truth.clone(), NS);
+        let sets: Api<ReplicaSet> = Api::namespaced(truth.clone(), NS);
+        let pods: Api<Pod> = Api::namespaced(truth.clone(), NS);
+        let name = "e2e-orphan";
+        let selector = kube::api::ListParams::default().labels(&format!("app={name}"));
+        let clean = || async {
+            let _ = deps.delete(name, &DeleteParams::background()).await;
+            let _ = sets.delete_collection(&DeleteParams::background(), &selector).await;
+            let _ = pods.delete_collection(&DeleteParams::default().grace_period(0), &selector).await;
+        };
+        clean().await;
+        until_gone("the Deployment", || deps.get_opt(name)).await?;
+        let dep = json!({
+            "metadata": {"name": name, "namespace": NS},
+            "spec": {"replicas": 1, "selector": {"matchLabels": {"app": name}}, "template": {
+                "metadata": {"labels": {"app": name}},
+                "spec": {"terminationGracePeriodSeconds": 0, "containers": [{"name": "main", "image": "busybox:1.37", "command": ["sh", "-c", "sleep 3600"]}]},
+            }},
+        });
+        deps.create(&PostParams::default(), &serde_json::from_value(dep)?).await?;
+        let checked = async {
+            // Its ReplicaSet and pod, once the controllers made them.
+            let mut owned = None;
+            for _ in 0..60 {
+                let rs = sets.list(&selector).await?.items.into_iter().next();
+                let pod = pods.list(&selector).await?.items.into_iter().next();
+                if let (Some(rs), Some(pod)) = (rs, pod) {
+                    owned = Some((rs, pod));
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+            let (rs, pod) = owned.context("the Deployment made no ReplicaSet and pod")?;
+            let (rs_name, pod_name) =
+                (rs.metadata.name.clone().unwrap_or_default(), pod.metadata.name.unwrap_or_default());
+
+            let (hub, agent, token, _server) = agent(&["get,list *"], &[]).await?;
+            let mcp = crate::assistant::Mcp::connect(hub.port(), token).await?;
+            let delete =
+                json!({"context": ctx, "kind": "deployments", "namespace": NS, "name": name, "cascade": "orphan"});
+            let out = mcp.call("delete_resource", delete.clone()).await;
+            assert!(out.contains("Denied"), "{out}");
+            let allow = rules_file::parse_rule(Mode::Allow, "delete deployments/e2e-* -n default")?;
+            hub.update_agent(&agent.id, |a| a.policy.rules.push(allow))?;
+            let mut unknown = delete.clone();
+            unknown["cascade"] = json!("keep");
+            let out = mcp.call("delete_resource", unknown).await;
+            assert!(out.contains("unknown cascade `keep`"), "{out}");
+            assert!(deps.get_opt(name).await?.is_some(), "a delete with an unknown cascade was sent");
+            let out = mcp.call("delete_resource", delete).await;
+            assert!(out.contains("deleted, what it owns kept"), "{out}");
+            until_gone("the orphaned Deployment", || deps.get_opt(name)).await?;
+            // The garbage collector takes the owner off its ReplicaSet, and leaves it.
+            let mut freed = false;
+            for _ in 0..60 {
+                let rs = sets.get_opt(&rs_name).await?.context("the orphaned ReplicaSet was deleted")?;
+                if rs.metadata.owner_references.unwrap_or_default().is_empty() {
+                    freed = true;
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+            assert!(freed, "the ReplicaSet kept its owner");
+            assert!(pods.get_opt(&pod_name).await?.is_some(), "the pod went with its Deployment");
+
+            // The window's delete, through write mode, orphans the pod the same way.
+            gate::set_ui_writes(true);
+            let ui = k8s::connect(ctx.clone()).await?;
+            let kind =
+                k8s::Kind { ar: k8s::ar_of::<ReplicaSet>(), namespaced: true, section: "", label: "ReplicaSet".into() };
+            let opts = k8s::DeleteOptions { cascade: Some(k8s::Cascade::Orphan), ..Default::default() };
+            let uid = rs.metadata.uid.clone();
+            let deleted = k8s::delete_with(ui, kind, Some(NS.into()), rs_name.clone(), uid, opts).await;
+            gate::set_ui_writes(false);
+            assert!(deleted?.contains("what it owns kept"));
+            until_gone("the orphaned ReplicaSet", || sets.get_opt(&rs_name)).await?;
+            for _ in 0..30 {
+                let pod = pods.get_opt(&pod_name).await?.context("the pod went with its ReplicaSet")?;
+                if pod.metadata.owner_references.unwrap_or_default().is_empty() {
+                    assert!(pod.metadata.deletion_timestamp.is_none(), "the orphaned pod is being deleted");
+                    return Ok(());
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+            bail!("the pod kept its owner")
+        };
+        let result: Result<()> = checked.await;
+        gate::set_ui_writes(false);
+        clean().await;
+        result
+    });
+}
+
+/// An eviction respects PodDisruptionBudgets: an agent's `evict_pod` (dry run or not) and the
+/// window's Evict are refused while a budget allows no disruption, the refusal naming it, and
+/// the pod stays. Without the budget the same eviction goes through.
+#[test]
+#[ignore = "needs a kind cluster: RECOUVRANCE_E2E_CONTEXT"]
+fn an_eviction_a_budget_forbids_is_refused() {
+    use k8s_openapi::api::core::v1::Pod;
+    use k8s_openapi::api::policy::v1::PodDisruptionBudget;
+
+    run(async {
+        let ctx = context();
+        let truth = k8s::connect_for_agents(ctx.clone()).await?;
+        let pods: Api<Pod> = Api::namespaced(truth.clone(), NS);
+        let pdbs: Api<PodDisruptionBudget> = Api::namespaced(truth.clone(), NS);
+        let name = "e2e-evict";
+        let _ = pdbs.delete(name, &DeleteParams::default()).await;
+        let _ = pods.delete(name, &DeleteParams::default().grace_period(0)).await;
+        until_gone("the pod", || pods.get_opt(name)).await?;
+        until_gone("the budget", || pdbs.get_opt(name)).await?;
+        let pod = json!({
+            "metadata": {"name": name, "namespace": NS, "labels": {"app": name}},
+            "spec": {"terminationGracePeriodSeconds": 0, "containers": [{"name": "main", "image": "busybox:1.37", "command": ["sh", "-c", "sleep 3600"]}]},
+        });
+        pods.create(&PostParams::default(), &serde_json::from_value(pod)?).await?;
+        // A pod still pending is evicted whatever its budget says: wait until it runs.
+        let mut running = false;
+        for _ in 0..120 {
+            let phase = pods.get(name).await?.status.and_then(|s| s.phase);
+            if phase.as_deref() == Some("Running") {
+                running = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+        anyhow::ensure!(running, "{name} did not start");
+        // Its only pod must stay: no disruption allowed.
+        let pdb = json!({
+            "metadata": {"name": name, "namespace": NS},
+            "spec": {"minAvailable": 1, "selector": {"matchLabels": {"app": name}}},
+        });
+        pdbs.create(&PostParams::default(), &serde_json::from_value(pdb)?).await?;
+        let checked = async {
+            let (hub, _agent, token, _server) =
+                agent(&["get,list *", &format!("delete pods/{name} -n {NS}")], &[]).await?;
+            let mcp = crate::assistant::Mcp::connect(hub.port(), token).await?;
+            let evict = json!({"context": ctx, "namespace": NS, "pod": name});
+            let mut dry = evict.clone();
+            dry["dry_run"] = json!(true);
+            let refusal = format!("PodDisruptionBudget {name} refuses it");
+            for args in [dry.clone(), evict.clone()] {
+                let out = mcp.call("evict_pod", args).await;
+                assert!(out.contains(&refusal), "{out}");
+            }
+            gate::set_ui_writes(true);
+            let ui = k8s::connect(ctx.clone()).await?;
+            let refused = k8s::evict(ui.clone(), NS.into(), name.into(), None, false).await;
+            gate::set_ui_writes(false);
+            let err = format!("{:#}", refused.expect_err("an eviction its budget forbids went through"));
+            assert!(err.contains(&refusal), "{err}");
+            let pod = pods.get_opt(name).await?.context("a refused eviction deleted the pod")?;
+            assert!(pod.metadata.deletion_timestamp.is_none(), "a refused eviction deleted the pod");
+
+            // Without the budget, the same eviction goes through; a dry run first changes nothing.
+            pdbs.delete(name, &DeleteParams::default()).await?;
+            until_gone("the budget", || pdbs.get_opt(name)).await?;
+            let out = mcp.call("evict_pod", dry).await;
+            assert!(out.contains(&format!("[dry run] Pod {name} evicted")), "{out}");
+            let pod = pods.get_opt(name).await?.context("a dry run evicted the pod")?;
+            assert!(pod.metadata.deletion_timestamp.is_none(), "a dry run evicted the pod");
+            let out = mcp.call("evict_pod", evict).await;
+            assert!(out.contains(&format!("Pod {name} evicted")) && !out.contains("dry run"), "{out}");
+            until_gone("the evicted pod", || pods.get_opt(name)).await
+        };
+        let result: Result<()> = checked.await;
+        gate::set_ui_writes(false);
+        let _ = pdbs.delete(name, &DeleteParams::default()).await;
+        let _ = pods.delete(name, &DeleteParams::default().grace_period(0)).await;
+        result
+    });
+}
+
+/// An ExternalSecret's refresh sets the annotation the operator watches, through write mode in
+/// the window and under the `refresh` verb for an agent; a dry run sets nothing. A stand-in CRD
+/// of the operator's group is enough: what the operator then does is its own.
+#[test]
+#[ignore = "needs a kind cluster: RECOUVRANCE_E2E_CONTEXT"]
+fn an_external_secret_refresh_sets_its_force_sync() {
+    use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition;
+    use kube::api::{ApiResource, DynamicObject, GroupVersionKind};
+
+    run(async {
+        let ctx = context();
+        let truth = k8s::connect_for_agents(ctx.clone()).await?;
+        let crds: Api<CustomResourceDefinition> = Api::all(truth.clone());
+        let crd_name = "externalsecrets.external-secrets.io";
+        // A cluster that runs the operator keeps its own CRD.
+        if crds.get_opt(crd_name).await?.is_some_and(|c| {
+            c.metadata.labels.unwrap_or_default().get("app.kubernetes.io/managed-by").map(String::as_str)
+                != Some("recouvrance-e2e")
+        }) {
+            bail!("{crd_name} exists and isn't this test's: run it on a cluster without the operator");
+        }
+        let crd = json!({
+            "metadata": {"name": crd_name, "labels": {"app.kubernetes.io/managed-by": "recouvrance-e2e"}},
+            "spec": {"group": "external-secrets.io", "scope": "Namespaced",
+                "names": {"kind": "ExternalSecret", "plural": "externalsecrets", "singular": "externalsecret"},
+                "versions": [{"name": "v1", "served": true, "storage": true,
+                    "schema": {"openAPIV3Schema": {"type": "object", "x-kubernetes-preserve-unknown-fields": true}}}]},
+        });
+        if crds.get_opt(crd_name).await?.is_none() {
+            crds.create(&PostParams::default(), &serde_json::from_value(crd)?).await?;
+        }
+        let ar = ApiResource::from_gvk_with_plural(
+            &GroupVersionKind::gvk("external-secrets.io", "v1", "ExternalSecret"),
+            "externalsecrets",
+        );
+        let secrets: Api<DynamicObject> = Api::namespaced_with(truth.clone(), NS, &ar);
+        let name = "e2e-refresh";
+        let object: DynamicObject = serde_json::from_value(json!({
+            "apiVersion": "external-secrets.io/v1", "kind": "ExternalSecret",
+            "metadata": {"name": name, "namespace": NS}, "spec": {"refreshInterval": "1h"},
+        }))?;
+        // The new kind is served a moment after the CRD is created.
+        let mut created = Err(anyhow::anyhow!("not tried"));
+        for _ in 0..30 {
+            let _ = secrets.delete(name, &DeleteParams::default()).await;
+            created = secrets.create(&PostParams::default(), &object).await.map_err(anyhow::Error::from);
+            if created.is_ok() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+        created?;
+        let checked = async {
+            let forced = || async {
+                let obj = secrets.get(name).await?;
+                Ok::<_, anyhow::Error>(obj.metadata.annotations.unwrap_or_default().get(k8s::FORCE_SYNC).cloned())
+            };
+            let (hub, agent, token, _server) = agent(&["get,list *"], &[]).await?;
+            let mcp = crate::assistant::Mcp::connect(hub.port(), token).await?;
+            let refresh = json!({"context": ctx, "namespace": NS, "name": name});
+            let out = mcp.call("refresh_external_secret", refresh.clone()).await;
+            assert!(out.contains("Denied"), "{out}");
+            let allow = rules_file::parse_rule(Mode::Allow, &format!("refresh {crd_name}/{name} -n {NS}"))?;
+            hub.update_agent(&agent.id, |a| a.policy.rules.push(allow))?;
+            let mut dry = refresh.clone();
+            dry["dry_run"] = json!(true);
+            let out = mcp.call("refresh_external_secret", dry).await;
+            assert!(out.contains("[dry run] ExternalSecret"), "{out}");
+            assert_eq!(forced().await?, None, "a dry run set the annotation");
+            let out = mcp.call("refresh_external_secret", refresh).await;
+            assert!(out.contains("refresh asked"), "{out}");
+            let first = forced().await?.context("the agent's refresh set no annotation")?;
+            assert!(first.parse::<i64>().is_ok(), "{first}");
+
+            // In the window: refused while write mode is off.
+            let ui = k8s::connect(ctx.clone()).await?;
+            let kinds = k8s::discover(ui.clone()).await?;
+            let kind = k8s::find_kind(&kinds, crd_name).context("the ExternalSecret kind")?.clone();
+            gate::set_ui_writes(false);
+            let off =
+                k8s::force_sync_external_secret(ui.clone(), kind.clone(), Some(NS.into()), name.into(), false).await;
+            assert!(format!("{:#}", off.expect_err("a refresh with write mode off")).contains(gate::WRITES_OFF));
+            // A second later, so the value is new and the operator sees a change.
+            tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+            gate::set_ui_writes(true);
+            let on = k8s::force_sync_external_secret(ui, kind, Some(NS.into()), name.into(), false).await;
+            gate::set_ui_writes(false);
+            on?;
+            let second = forced().await?.context("the window's refresh set no annotation")?;
+            assert_ne!(first, second, "a second refresh kept the same value");
+            Ok(())
+        };
+        let result: Result<()> = checked.await;
+        gate::set_ui_writes(false);
+        let _ = secrets.delete(name, &DeleteParams::default()).await;
+        let _ = crds.delete(crd_name, &DeleteParams::default()).await;
+        result
+    });
+}
