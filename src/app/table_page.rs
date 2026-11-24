@@ -120,7 +120,7 @@ impl AppView {
         };
         Popover::new("filter-popover")
             .anchor(Anchor::TopLeft)
-            .trigger(Button::new("filter-menu").small().ghost().icon(Lucide::ClockArrowDown).tooltip("Recent and saved filters"))
+            .trigger(Button::new("filter-menu").small().ghost().icon(Lucide::ClockArrowDown).accessibility_label("Recent and saved filters").tooltip("Recent and saved filters"))
             .child(
                 v_flex()
                     .w(px(420.))
@@ -145,7 +145,7 @@ impl AppView {
                         h_flex()
                             .gap_1()
                             .child(div().flex_1().min_w_0().child(item(SharedString::from(format!("saved-{i}")), f.clone(), cx)))
-                            .child(Button::new(("rm-search", i)).xsmall().ghost().icon(Lucide::X).on_click(cx.listener(move |_, _, _, cx| {
+                            .child(Button::new(("rm-search", i)).xsmall().ghost().icon(Lucide::X).accessibility_label("Remove this saved filter").on_click(cx.listener(move |_, _, _, cx| {
                                 let f = f2.clone();
                                 crate::settings::update(|s| s.saved_searches.retain(|x| *x != f));
                                 cx.notify();
@@ -170,7 +170,14 @@ impl AppView {
         let custom = self.column_prefs.custom(&kind_name);
         Popover::new("columns-popover")
             .anchor(Anchor::TopRight)
-            .trigger(Button::new("columns").small().ghost().icon(Lucide::Columns3).tooltip("Columns"))
+            .trigger(
+                Button::new("columns")
+                    .small()
+                    .ghost()
+                    .icon(Lucide::Columns3)
+                    .accessibility_label("Columns")
+                    .tooltip("Columns"),
+            )
             .child(
                 v_flex()
                     .w(px(280.))
@@ -213,12 +220,17 @@ impl AppView {
                                     .text_color(cx.theme().muted_foreground)
                                     .child(p),
                             )
-                            .child(Button::new(("rm-col", i)).xsmall().ghost().icon(Lucide::X).on_click(cx.listener(
-                                move |this, _, _, cx| {
-                                    this.column_prefs.remove_custom(&k, &h2);
-                                    this.restart_watch(cx);
-                                },
-                            )))
+                            .child(
+                                Button::new(("rm-col", i))
+                                    .xsmall()
+                                    .ghost()
+                                    .icon(Lucide::X)
+                                    .accessibility_label("Remove this column")
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.column_prefs.remove_custom(&k, &h2);
+                                        this.restart_watch(cx);
+                                    })),
+                            )
                     }))
                     .child(Input::new(&self.col_header).small())
                     .child(Input::new(&self.col_path).small())
@@ -312,14 +324,18 @@ impl AppView {
                     )
                 })
                 .child(
-                    Button::new("sel-clear").ghost().small().icon(IconName::Close).tooltip("Clear selection").on_click(
-                        cx.listener(|this, _, _, cx| {
+                    Button::new("sel-clear")
+                        .ghost()
+                        .small()
+                        .icon(IconName::Close)
+                        .accessibility_label("Clear selection")
+                        .tooltip("Clear selection")
+                        .on_click(cx.listener(|this, _, _, cx| {
                             this.table.update(cx, |t, cx| {
                                 t.delegate_mut().marked.clear();
                                 cx.notify();
                             });
-                        }),
-                    ),
+                        })),
                 )
                 .into_any_element(),
         )
@@ -506,11 +522,11 @@ impl AppView {
         });
         cx.spawn_in(window, async move |_, cx| {
             let jobs = targets.into_iter().map(|(_, client, r)| {
-                let (kind, ns, name, uid) = (kind.clone(), r.namespace.clone(), r.name.clone(), r.uid.clone());
+                let (kind, ns, name) = (kind.clone(), r.namespace.clone(), r.name.clone());
                 async move {
                     match action {
                         // Only the object that was checked, not one re-created under its name.
-                        "Delete" => k8s::delete(client, kind, ns, name.clone(), Some(uid), false).await,
+                        "Delete" => k8s::delete_row(client, kind, r).await,
                         "Scale" => k8s::scale(client, kind, ns, name.clone(), count, false).await,
                         _ => k8s::rollout_restart(client, kind, ns, name.clone(), false).await,
                     }

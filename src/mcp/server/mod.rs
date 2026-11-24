@@ -1083,6 +1083,30 @@ pub struct DeleteParams {
     pub name: String,
     pub namespace: Option<String>,
     pub dry_run: Option<bool>,
+    #[schemars(
+        description = "what happens to the objects it owns, like kubectl's --cascade: \"background\" (deleted after it), \"foreground\" (deleted first) or \"orphan\" (kept, e.g. a StatefulSet's pods while it is re-created with other volumeClaimTemplates); omit for the kind's default"
+    )]
+    pub cascade: Option<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct EvictParams {
+    pub context: String,
+    pub namespace: String,
+    pub pod: String,
+    #[schemars(
+        description = "validate on the server without evicting (a PodDisruptionBudget that refuses still says so)"
+    )]
+    pub dry_run: Option<bool>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct RefreshExternalSecretParams {
+    pub context: String,
+    pub namespace: String,
+    #[schemars(description = "the ExternalSecret's name")]
+    pub name: String,
+    pub dry_run: Option<bool>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -2043,7 +2067,7 @@ mod tests {
             assert!(call_writes(tool, &json!({"dry_run": null})), "{tool}");
         }
         // A dry run changes nothing, but `gitops`'s: Argo CD's own writes the operation.
-        assert_eq!(dry_run_tools().len(), 14, "{:?}", dry_run_tools());
+        assert_eq!(dry_run_tools().len(), 16, "{:?}", dry_run_tools());
         for tool in dry_run_tools() {
             assert_eq!(call_writes(tool, &json!({"dry_run": true})), tool == "gitops", "{tool}");
         }

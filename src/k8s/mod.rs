@@ -42,6 +42,7 @@ pub(crate) mod podspec;
 mod retry;
 pub(crate) mod rollouts;
 mod run_as;
+pub(crate) mod short_names;
 mod sources;
 mod table;
 pub(crate) mod topolvm;
@@ -204,6 +205,11 @@ pub fn short_error(e: &anyhow::Error) -> String {
 /// kube's `ServiceError` and the request around it.
 pub fn error_chain(e: &anyhow::Error) -> String {
     login::login_failure(e.as_ref()).unwrap_or_else(|| format!("{e:#}"))
+}
+
+/// Whether `e`, or an error behind it, is a context's login command that failed.
+pub fn login_failed(e: &anyhow::Error) -> bool {
+    login::login_failure(e.as_ref()).is_some()
 }
 
 /// The HTTP status of an API error (403 forbidden, 404 not found…), if it is one.

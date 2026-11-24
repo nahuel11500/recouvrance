@@ -115,6 +115,14 @@ impl Restore {
         }
         true
     }
+
+    /// The clusters a partial connect to `set` left connecting all joined it, and none
+    /// failed: the connect is whole after all. Whether its session is reopened again, from
+    /// what was saved: when it waited for a whole connect, and the tabs are `unchanged`
+    /// since the partial one (the user's own changes are kept, not replaced).
+    pub(super) fn whole(&mut self, set: &[String], unchanged: bool) -> bool {
+        self.finished(set, false) && unchanged
+    }
 }
 
 /// A tab reopened on a type of an API group that didn't answer: it shows the default list,
@@ -163,7 +171,7 @@ impl AppView {
         let mut restored = restored(&saved, &self.kinds, &known, self.kind.as_ref(), &self.skipped_groups)?;
         self.kind_filters.restore(restored.filters);
         let shown = std::mem::take(&mut restored.tabs[restored.active]);
-        self.kept = Kept { tab: shown.kept.clone(), filters: restored.kept_filters };
+        self.kept_session = Kept { tab: shown.kept.clone(), filters: restored.kept_filters };
         self.tabs = restored.tabs;
         self.active_tab = restored.active;
         self.history = shown.history;
@@ -183,32 +191,62 @@ impl AppView {
     }
 
     /// Where this window is now on its set of contexts; none when it may not be saved (see
-    /// `SaveGate`; a cluster failed when `connect_errors` is set: it didn't answer, or its
-    /// namespaces didn't list).
+    /// `SaveGate`; a cluster failed when `connect_partial`: it didn't answer, or its
+    /// namespaces didn't list, or it joined after the first rows).
     fn session_snapshot(&self, cx: &App) -> Option<Session> {
         let gate = SaveGate {
             has_set: !self.session_key.is_empty(),
             connecting: self.connecting,
             connected: !self.clusters.is_empty(),
-            failed: self.connect_errors.is_some(),
+            failed: self.connect_partial(),
             owns: cx.try_global::<SessionOwners>().is_some_and(|o| o.owns(&self.session_key, self.view_id)),
         };
         if !gate.saves() {
             return None;
         }
         let shown = self.tab_snapshot(cx);
-        let tabs = (0..self.tabs.len())
-            .map(|i| saved_tab(if i == self.active_tab { &shown } else { &self.tabs[i] }))
-            .collect();
+        let tabs = self.saved_tabs(&shown);
         let by_key: HashMap<String, String> = self.kinds.iter().map(|k| (k.key(), k.kubectl_name())).collect();
         let mut filters: BTreeMap<String, String> = (self.kind_filters.all(&shown.filter).into_iter())
             .filter_map(|(key, text)| Some((by_key.get(&key)?.clone(), text)))
             .collect();
         // Those of types in groups that didn't answer, as saved, unless set again since.
-        for (name, text) in &self.kept.filters {
+        for (name, text) in &self.kept_session.filters {
             filters.entry(name.clone()).or_insert_with(|| text.clone());
         }
         Some(Session { contexts: self.session_key.clone(), tabs, active_tab: self.active_tab, filters })
+    }
+
+    /// The tabs as they would be saved, the one shown as `shown` (`tab_snapshot`).
+    fn saved_tabs(&self, shown: &TabState) -> Vec<SavedTab> {
+        (0..self.tabs.len()).map(|i| saved_tab(if i == self.active_tab { shown } else { &self.tabs[i] })).collect()
+    }
+
+    /// The tabs as they are now, to tell later whether the user changed them.
+    pub(super) fn tabs_now(&self, cx: &App) -> (Vec<SavedTab>, usize) {
+        (self.saved_tabs(&self.tab_snapshot(cx)), self.active_tab)
+    }
+
+    /// Every cluster left connecting by the last connect has joined, and none failed: the
+    /// set is whole after all, and its session is saved again. When the connect reopened it
+    /// without what only the late clusters have, it is reopened again from what was saved,
+    /// unless the user changed the tabs meanwhile: theirs are kept then.
+    pub(super) fn joined_whole(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.joined_late {
+            return;
+        }
+        let unchanged = self.partial_tabs.take().is_some_and(|tabs| tabs == self.tabs_now(cx));
+        self.joined_late = false;
+        let owner_before = cx.try_global::<SessionOwners>().and_then(|o| o.owner(&self.session_key));
+        let reopened =
+            if self.restore.whole(&self.session_key, unchanged) { self.restore_session(window, cx) } else { None };
+        if let Some(page) = reopened {
+            self.restart_watch(cx);
+            if let Some(page) = overview(page) {
+                self.open_overview(page, window, cx);
+            }
+        }
+        self.settle_session(owner_before, reopened.is_some(), cx);
     }
 
     /// Save where this window is now, at once (the window closes, the app quits, another set
@@ -230,11 +268,17 @@ impl AppView {
         }
     }
 
+    /// Whether the last connect left out part of the set: a cluster failed or is still
+    /// connecting (`connect_errors`), or one joined after the first rows (`joined_late`).
+    fn connect_partial(&self) -> bool {
+        self.connect_errors.is_some() || self.joined_late
+    }
+
     /// The connect has finished: which window saves its set from now on (see
     /// `SessionOwners::settle`). When it is this one, the set is saved once things settle: a
     /// set connected for the first time is kept even if nothing changes before the app quits.
     pub(super) fn settle_session(&mut self, before: Option<EntityId>, reopened: bool, cx: &mut Context<Self>) {
-        let failed = self.connect_errors.is_some();
+        let failed = self.connect_partial();
         let owns =
             cx.default_global::<SessionOwners>().settle(&self.session_key, self.view_id, before, reopened, failed);
         if owns && !failed {
@@ -249,7 +293,7 @@ impl AppView {
         if self.session_key.is_empty() || self.connecting {
             return;
         }
-        if self.connect_errors.is_none() {
+        if !self.connect_partial() {
             cx.default_global::<SessionOwners>().take(&self.session_key, self.view_id);
         }
         // Replacing the task cancels the wait before: one save per burst of changes.
@@ -731,6 +775,50 @@ mod tests {
         restore.connecting(&set);
         assert!(restore.finished(&set, false));
         assert!(owners.settle(&set, window, None, true, false));
+        assert!(gate(&owners, false).saves());
+    }
+
+    /// A cluster always a few seconds behind the others joins after the first rows on every
+    /// launch. Once it is in and none failed, the set saves again: else it would never be
+    /// saved, nor a set connected for the first time saved at all.
+    #[test]
+    fn a_set_whole_after_a_late_join_saves_again() {
+        let window: EntityId = 1u64.into();
+        let set = v(&["hub", "prod"]);
+        let gate = |owners: &SessionOwners, failed: bool| SaveGate {
+            has_set: true,
+            connecting: false,
+            connected: true,
+            failed,
+            owns: owners.owns(&set, window),
+        };
+        let waiting = v(&["prod"]);
+        // The first rows, "prod" still connecting: partial, nothing saved.
+        let mut owners = SessionOwners::default();
+        let mut restore = Restore::FirstConnect;
+        restore.connecting(&set);
+        assert!(super::super::reach::connect_status(&[], &waiting).is_some());
+        assert!(restore.finished(&set, true));
+        assert!(!owners.settle(&set, window, None, true, true));
+        assert!(!gate(&owners, true).saves());
+        // "prod" joins, none failed: whole. Nothing changed since, so the session is reopened
+        // again, whole, for the last time, and saved from then on.
+        assert!(super::super::reach::connect_status(&[], &[]).is_none());
+        assert!(restore.whole(&set, true));
+        assert_eq!(restore, Restore::Off);
+        assert!(owners.settle(&set, window, None, true, false));
+        assert!(gate(&owners, false).saves());
+        // The user changed the tabs meanwhile: theirs are kept (not reopened), and saved.
+        let (mut owners, mut restore) = (SessionOwners::default(), Restore::Pending(set.clone()));
+        assert!(!restore.whole(&set, false));
+        assert_eq!(restore, Restore::Off);
+        assert!(owners.settle(&set, window, None, false, false));
+        assert!(gate(&owners, false).saves());
+        // A set connected for the first time, or by a window that doesn't reopen: nothing to
+        // reopen, saved once whole.
+        let (mut owners, mut restore) = (SessionOwners::default(), Restore::Off);
+        assert!(!restore.whole(&set, true));
+        assert!(owners.settle(&set, window, None, false, false));
         assert!(gate(&owners, false).saves());
     }
 }

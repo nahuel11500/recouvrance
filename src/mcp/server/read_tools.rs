@@ -20,6 +20,7 @@ use crate::k8s;
 use crate::k8s::lane::Lane;
 use crate::k8s::{Kind, ObjectRef};
 use crate::mcp::{Mode, PROTECTED, Policy, Verb};
+use crate::problems::argo_apps;
 use crate::problems::shared::{self, Fresh};
 use crate::reachability;
 
@@ -36,7 +37,7 @@ impl KubeMcp {
     }
 
     #[tool(
-        description = "Check calls you plan against your rules without making them: for each request (context, verb, kind, namespace, name), whether it is allowed, needs the user's approval or is denied, the rule that decides, and for a denial whether it is final (a Deny rule) or the rule the user could add. Use it before a task that needs several calls, to tell the user up front what to approve or grant. The verb is the rules' verb, not the tool: set_image, rollout_undo, rollout_pause, rollout_resume and patch_resource need patch; rollout_restart restart; apply_manifest apply on each object; trigger_cronjob get on the CronJob and apply on its Job; cordon_node, uncordon_node and drain_node drain on the node; exec_command, debug_pod and browse_files exec on the pod; port_forward forward; get_logs logs; gitops refresh (refresh, hard_refresh), sync (sync, reconcile, terminate, rollback) or suspend (suspend, resume) on the object, and get for diagnose; argocd_apps list on applications.argoproj.io on the hub.",
+        description = "Check calls you plan against your rules without making them: for each request (context, verb, kind, namespace, name), whether it is allowed, needs the user's approval or is denied, the rule that decides, and for a denial whether it is final (a Deny rule) or the rule the user could add. Use it before a task that needs several calls, to tell the user up front what to approve or grant. The verb is the rules' verb, not the tool: set_image, rollout_undo, rollout_pause, rollout_resume and patch_resource need patch; rollout_restart restart; apply_manifest apply on each object; trigger_cronjob get on the CronJob and apply on its Job; cordon_node, uncordon_node and drain_node drain on the node; evict_pod delete on the pod; refresh_external_secret refresh on the ExternalSecret; exec_command, debug_pod and browse_files exec on the pod; port_forward forward; get_logs logs; gitops refresh (refresh, hard_refresh), sync (sync, reconcile, terminate, rollback) or suspend (suspend, resume) on the object, and get for diagnose; argocd_apps list on applications.argoproj.io on the hub.",
         annotations(read_only_hint = true)
     )]
     async fn check_access(
@@ -462,10 +463,7 @@ impl KubeMcp {
             Err(e) => return call.finish(Err(e)),
         };
         let q = p.query.to_lowercase();
-        let mut rows = Vec::new();
-        // The kinds that couldn't be listed, with why: the agent must not read them as empty.
-        let (mut searched, mut failed) = (0, Vec::new());
-        for name in [
+        let searched: Vec<Kind> = [
             "deployments",
             "statefulsets",
             "daemonsets",
@@ -477,13 +475,21 @@ impl KubeMcp {
             "pods",
             "namespaces",
             "nodes",
-        ] {
-            let Some(kind) = k8s::find_kind(&kinds, name).cloned() else { continue };
-            if list_verdict(call.policy(), &kind, &p.context) == Mode::Deny {
-                continue;
-            }
-            searched += 1;
-            let names = match k8s::list_names(client.clone(), kind.ar.clone(), None).await {
+        ]
+        .into_iter()
+        .filter_map(|name| k8s::find_kind(&kinds, name).cloned())
+        .filter(|kind| list_verdict(call.policy(), kind, &p.context) != Mode::Deny)
+        .collect();
+        // All at once: the search takes about as long as its slowest list, not their sum. The
+        // per-namespace requests of big lists share one bounded pool (see `list_light`).
+        let lists =
+            futures::future::join_all(searched.iter().map(|kind| k8s::search_names(client.clone(), kind.clone())))
+                .await;
+        let mut rows = Vec::new();
+        // The kinds that couldn't be listed, with why: the agent must not read them as empty.
+        let mut failed = Vec::new();
+        for (kind, names) in searched.iter().zip(lists) {
+            let names = match names {
                 Ok(names) => names,
                 Err(e) => {
                     failed.push(format!("{} ({e:#})", kind.kubectl_name()));
@@ -495,14 +501,14 @@ impl KubeMcp {
                     continue;
                 }
                 // Search asks nobody: only what a rule allows outright.
-                if !call.may_see(&access_for(&kind, &p.context, Verb::List, ns.clone(), Some(obj.clone()))) {
+                if !call.may_see(&access_for(kind, &p.context, Verb::List, ns.clone(), Some(obj.clone()))) {
                     continue;
                 }
                 rows.push(vec![kind.kubectl_name(), ns.unwrap_or_default(), obj]);
             }
         }
         rows.truncate(call.policy().max_rows as usize);
-        if searched > 0 && failed.len() == searched {
+        if !searched.is_empty() && failed.len() == searched.len() {
             return call.finish(Err(anyhow::anyhow!("couldn't search: {}", failed.join("; "))));
         }
         let mut out = if rows.is_empty() {
@@ -689,7 +695,7 @@ impl KubeMcp {
     }
 
     #[tool(
-        description = "What is broken: crash-looping or pending pods, unavailable Deployments/StatefulSets/DaemonSets, NotReady nodes and nodes a taint keeps pods off because something is wrong (an agent not ready, being removed), failed Jobs, CronJobs that stopped running or whose runs keep failing, pending PVCs, ExternalSecrets and secret stores that fail to sync, Services that select no pod or no ready one, references to objects that don't exist (a pod's ConfigMaps, Secrets and PVCs, a workload's ServiceAccount, a pending PVC's StorageClass, an Ingress's Services, ports and TLS Secrets, an HTTPRoute's Services), objects stuck deleting (Namespaces, PVs, Argo CD Applications too) with the finalizers holding them, and alerts firing in the cluster's Prometheus (not silenced). Worst first. Start here when asked to troubleshoot. Answers from the app's latest scan of the cluster while it is recent, and says how old it is; after a fix, pass max_age_seconds: 0 to check it on a new scan.",
+        description = "What is broken: crash-looping or pending pods, unavailable Deployments/StatefulSets/DaemonSets, NotReady nodes and nodes a taint keeps pods off because something is wrong (an agent not ready, being removed), failed Jobs, CronJobs that stopped running or whose runs keep failing, pending PVCs, PVCs over 90% of their space or inodes (from the cluster's Prometheus), ExternalSecrets and secret stores that fail to sync, Services that select no pod or no ready one, references to objects that don't exist (a pod's ConfigMaps, Secrets and PVCs, a workload's ServiceAccount, a pending PVC's StorageClass, an Ingress's Services, ports and TLS Secrets, an HTTPRoute's Services), objects stuck deleting (Namespaces, PVs, Argo CD Applications too) with the finalizers holding them, Argo CD Applications deploying to the cluster that need attention (Degraded, a failed sync, an *Error condition, a sync running for more than 10 minutes, Missing with auto-sync on; listed under the namespace they deploy to, the PROBLEM naming the Application's own namespace and hub to read it with, and shown when your rules let you list Applications there), and alerts firing in the cluster's Prometheus (not silenced). Worst first. Start here when asked to troubleshoot. Answers from the app's latest scan of the cluster while it is recent, and says how old it is; after a fix, pass max_age_seconds: 0 to check it on a new scan.",
         annotations(read_only_hint = true)
     )]
     async fn find_problems(
@@ -718,7 +724,10 @@ impl KubeMcp {
         };
         let ask = || shared::Ask { client: client.clone(), kinds: kinds.to_vec(), record: false };
         let found = shared::fresh(&scope, fresh, Lane::Foreground, ask).await.unwrap_or_default();
-        let skipped = found.skipped().map(|s| format!("Not checked, could not read {s}."));
+        // A hub the agent's rules don't open is not named to it.
+        let skipped = found
+            .skipped_where(|s| argo_apps::skipped_hub(s).is_none_or(|hub| call.policy().context_allowed(hub)))
+            .map(|s| format!("Not checked, could not read {s}."));
         let scanned = found.done.map(|d| {
             let ago = i64::try_from(d.started.elapsed().as_secs()).unwrap_or(i64::MAX);
             format!("From a scan started {} ago; max_age_seconds: 0 scans again.", k8s::duration_text(ago))
@@ -729,7 +738,14 @@ impl KubeMcp {
             .into_iter()
             .filter(|x| minor || x.severity != crate::problems::Severity::Info)
             .filter(|x| {
-                // Only what this agent may see.
+                // Only what this agent may see. An Argo CD Application is read on its hub: the
+                // rules for Applications there decide.
+                if let Some(hub) = &x.on_hub {
+                    let app = k8s::argo::application_kind();
+                    let a =
+                        access_for(&app, &hub.context, Verb::List, Some(hub.namespace.clone()), Some(x.name.clone()));
+                    return problem_visible(call.policy(), call.approved_rules(), false, &a);
+                }
                 k8s::find_kind(&kinds, &x.kind).is_some_and(|k| {
                     let a = access_for(k, &p.context, Verb::List, x.namespace.clone(), Some(x.name.clone()));
                     problem_visible(call.policy(), call.approved_rules(), k.is("", "Pod"), &a)
@@ -737,12 +753,20 @@ impl KubeMcp {
             })
             .take(200)
             .map(|x| {
+                // An Application is listed under where it deploys: say where it lives, to read it.
+                let reason = match &x.on_hub {
+                    Some(on) => {
+                        let reason = x.reason.strip_suffix(&argo_apps::hub_note(&on.context)).unwrap_or(&x.reason);
+                        format!("{reason} ({})", argo_apps::location(on, &x.name))
+                    }
+                    None => x.reason,
+                };
                 vec![
                     format!("{:?}", x.severity).to_uppercase(),
                     x.label,
                     x.namespace.unwrap_or_default(),
                     x.name,
-                    x.reason,
+                    reason,
                     x.age.map_or_default(k8s::age),
                 ]
             })
@@ -1115,7 +1139,7 @@ mod tests {
         assert_eq!(named, take);
         // Every change but exec_command, drain_node and the port-forward tools (docs/agents.md);
         // gitops's is Argo CD's own dry run of a sync or a rollback.
-        assert_eq!(take.len(), 14, "{take:?}");
+        assert_eq!(take.len(), 16, "{take:?}");
         assert!(take.contains("set_image") && take.contains("cordon_node") && take.contains("debug_pod"), "{take:?}");
         assert!(take.contains("gitops"), "{take:?}");
     }

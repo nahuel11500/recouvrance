@@ -44,6 +44,7 @@ mod timeline;
 mod ui;
 mod updates;
 mod upgrade;
+mod volumes;
 mod yaml;
 
 // Many threads allocate large, short-lived lists (huge clusters); mimalloc
@@ -63,7 +64,7 @@ Usage:
   recouvrance --version                    Print the version
   recouvrance --help                       Print this help
 
-Settings live in ~/.config/recouvrance; see
+Settings live in {config}; see
 https://github.com/nahuel11500/recouvrance/blob/main/docs/configuration.md
 "
 );
@@ -80,7 +81,7 @@ fn main() {
         // `Recouvrance agent-create <name> [context...]` prints the agent's token once.
         Some("agent-create") => return agent_create(&args[2..]),
         Some("--version" | "-V") => return println!("recouvrance {}", env!("CARGO_PKG_VERSION")),
-        Some("--help" | "-h") => return print!("{HELP}"),
+        Some("--help" | "-h") => return print!("{}", HELP.replace("{config}", &paths::tilde(&paths::config_dir()))),
         _ => {}
     }
     #[cfg(feature = "dev")]

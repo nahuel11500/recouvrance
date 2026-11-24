@@ -22,12 +22,12 @@ impl AppView {
             kind: self.kind.clone(),
             // Opened already: its page is in the history.
             open: None,
-            kept: self.kept.tab.clone(),
+            kept: self.kept_session.tab.clone(),
         }
     }
 
     pub(super) fn load_tab(&mut self, t: TabState, window: &mut Window, cx: &mut Context<Self>) {
-        self.kept.tab = t.kept;
+        self.kept_session.tab = t.kept;
         self.history = t.history;
         self.pos = t.pos.min(self.history.len().saturating_sub(1));
         // Set the namespaces and the kind first, then restart the watch once: restarting in
@@ -205,6 +205,7 @@ impl AppView {
                             .xsmall()
                             .ghost()
                             .icon(IconName::Close)
+                            .accessibility_label("Close tab")
                             .tooltip(with_keys("Close tab ({secondary-w})"))
                             .on_click(cx.listener(move |this, _, w, cx| {
                                 this.close_tab(i, w, cx);
@@ -218,6 +219,7 @@ impl AppView {
                     .xsmall()
                     .ghost()
                     .icon(Lucide::Plus)
+                    .accessibility_label("New tab")
                     .tooltip(with_keys("New tab ({secondary-t})"))
                     .on_click(cx.listener(|this, _, w, cx| this.new_tab(None, w, cx))),
             );
@@ -271,9 +273,13 @@ impl AppView {
 
     pub(super) fn apply_route(&mut self, cx: &mut Context<Self>) {
         self.mark_visible(cx);
-        // Protection may have changed in Settings since the page was last shown.
+        // Protection may have changed in Settings since the page was last shown, and
+        // Claude Code's entry outside the app.
         if self.route().is_agents() {
-            self.agents.update(cx, |a, _| a.refresh_contexts());
+            self.agents.update(cx, |a, cx| {
+                a.refresh_contexts();
+                a.check_claude(false, cx);
+            });
         }
         if let Route::Resources(Some(kind)) = self.route().clone()
             && self.kind.as_ref().map(Kind::key) != Some(kind.key())

@@ -1,9 +1,9 @@
-//! Window chrome: context picker page, approvals, context strip, command palette, zoom.
+//! Window chrome: context picker page, context strip, command palette, zoom.
 
 use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::notification::Notification;
-use gpui_kit::component::{ActiveTheme as _, Disableable as _, Icon, Sizable as _, WindowExt as _, h_flex, v_flex};
+use gpui_kit::component::{ActiveTheme as _, Disableable as _, Icon, WindowExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
@@ -11,6 +11,7 @@ use super::search_index::{Entry, SEARCH_KINDS, on_cluster};
 use super::{AppView, Route, section_icon, set_zoom, zoom};
 use crate::k8s;
 use crate::k8s::Kind;
+use crate::ui::a11y::Control as _;
 use crate::ui::palette::{Item as PaletteItem, Palette, PaletteEvent, Target};
 use crate::ui::settings_view::SettingsView;
 
@@ -48,6 +49,17 @@ impl AppView {
         }
         for c in &self.all_contexts {
             items.push(PaletteItem::new(c.clone(), "switch context".into(), Lucide::Ship, Target::Context(c.clone())));
+        }
+        // Each context set with a context left in the kubeconfig: picking it connects them all.
+        for set in crate::settings::context_sets() {
+            let contexts = set.available(&self.all_contexts);
+            if contexts.is_empty() {
+                continue;
+            }
+            let detail = format!("context set · {}", contexts.join(", "));
+            let mut item = PaletteItem::new(set.name, detail, Lucide::Layers, Target::ContextSet(contexts));
+            item.also = "set workspace group connect";
+            items.push(item);
         }
         // With several clusters, objects say which one they are on.
         let names: std::rc::Rc<Vec<String>> = std::rc::Rc::new(self.clusters.iter().map(|(c, _)| c.clone()).collect());
@@ -103,7 +115,7 @@ impl AppView {
                     let cluster = cluster.clone();
                     let task = cx.spawn(async move |this, cx| {
                         // A list that fails is said, not taken for an empty one.
-                        let (found, failed) = match k8s::list_names(client, kind.ar.clone(), None).await {
+                        let (found, failed) = match k8s::search_names(client, kind.clone()).await {
                             Ok(found) => (found, None),
                             Err(_) => (Vec::new(), Some(format!("{} on {cluster}", kind.kubectl_name()))),
                         };
@@ -147,6 +159,11 @@ impl AppView {
                     Target::Settings(section) => this.open_settings_section(section, window, cx),
                     Target::View(view) => this.apply_view(&view, window, cx),
                     Target::Context(c) => this.connect_many(vec![c], window, cx),
+                    Target::ContextSet(contexts) => {
+                        // As the picker does, so its ticks match what connects.
+                        this.picked = contexts.iter().cloned().collect();
+                        this.connect_many(contexts, window, cx);
+                    }
                     Target::Favorite(f) => this.open_favorite(f, true, window, cx),
                     Target::Object { .. } if this.clusters.iter().map(|(c, _)| c).ne(opened_on.iter()) => {
                         window.push_notification(
@@ -181,104 +198,11 @@ impl AppView {
                 .into_any_element(),
         )
     }
-
-    pub(super) fn render_approvals(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let cx: &App = cx;
-        let theme = cx.theme();
-        let now = std::time::Instant::now();
-        v_flex().children(self.approvals.iter().map(|a| {
-            let (deny, approve) = (a.id, a.id);
-            let hub = self.hub.clone();
-            let hub2 = self.hub.clone();
-            h_flex()
-                .gap_3()
-                .px_3()
-                .py_2()
-                .bg(theme.warning.opacity(0.15))
-                .border_b_1()
-                .border_color(theme.warning)
-                .child(Icon::new(Lucide::Bot).size_4())
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .text_sm()
-                        .child(format!("{} wants to run {}: ", a.agent, a.tool))
-                        // Patches and manifests are shown whole: what is approved is what runs. What
-                        // the call will change comes right under the request, a manifest's YAML after.
-                        .child(
-                            v_flex()
-                                .id(("approval-summary", a.id as usize))
-                                .max_h(px(300.))
-                                .overflow_y_scroll()
-                                .overflow_x_hidden()
-                                .gap_1()
-                                .font_family(theme.mono_font_family.clone())
-                                .text_xs()
-                                .child(a.summary.clone())
-                                .when_some(a.preview.as_ref(), |d, p| d.child(crate::details::preview_block(p, cx)))
-                                .when_some(a.detail.clone(), ParentElement::child),
-                        ),
-                )
-                // Only offered when a rule can cover exactly this request (not exec, for one).
-                .when(a.as_rule().is_some(), |d| {
-                    let (hub, approval) = (self.hub.clone(), a.clone());
-                    // A request that no longer waits (its agent gone, or timed out) adds no rule:
-                    // the click only beat its banner's removal.
-                    let hour = Button::new(("hour", a.id as usize)).small().ghost().label("Allow for 1h").on_click(
-                        move |_, window, cx| {
-                            if hub.approval_pending(approval.id)
-                                && let Some(rule) = approval.as_rule_for_an_hour()
-                                && let Err(e) =
-                                    hub.update_agent(&approval.agent_id, |agent| agent.policy.rules.push(rule))
-                            {
-                                window.push_notification(Notification::error(format!("Rule not saved: {e:#}")), cx);
-                            }
-                            hub.resolve_approval(approval.id, true);
-                        },
-                    );
-                    let (hub, approval) = (self.hub.clone(), a.clone());
-                    let always = Button::new(("always", a.id as usize))
-                        .small()
-                        .ghost()
-                        .label("Always allow this")
-                        .tooltip("Approve, and add a rule allowing exactly this request from now on")
-                        .on_click(move |_, window, cx| {
-                            if hub.approval_pending(approval.id)
-                                && let Some(rule) = approval.as_rule()
-                                && let Err(e) =
-                                    hub.update_agent(&approval.agent_id, |agent| agent.policy.rules.push(rule))
-                            {
-                                window.push_notification(Notification::error(format!("Rule not saved: {e:#}")), cx);
-                            }
-                            hub.resolve_approval(approval.id, true);
-                        });
-                    d.child(hour).child(always)
-                })
-                // An unanswered request is refused: say when.
-                .child(
-                    div().flex_none().text_xs().text_color(theme.muted_foreground).child(refused_in(a.time_left(now))),
-                )
-                .child(
-                    Button::new(("deny", a.id as usize))
-                        .small()
-                        .label("Deny")
-                        .on_click(move |_, _, _| hub.resolve_approval(deny, false)),
-                )
-                .child(
-                    Button::new(("approve", a.id as usize))
-                        .small()
-                        .primary()
-                        .label("Approve")
-                        .on_click(move |_, _, _| hub2.resolve_approval(approve, true)),
-                )
-        }))
-    }
 }
 
 /// How long an approval still waits, in its banner: "refused in 1:42". Rounded up, so it
 /// never says 0:00 while the request still waits.
-fn refused_in(left: std::time::Duration) -> String {
+pub(super) fn refused_in(left: std::time::Duration) -> String {
     let secs = left.as_millis().div_ceil(1000);
     format!("refused in {}:{:02}", secs / 60, secs % 60)
 }
@@ -295,6 +219,33 @@ impl AppView {
         // Keep the kubeconfig order so the primary context is predictable.
         let contexts: Vec<String> = self.all_contexts.iter().filter(|c| self.picked.contains(*c)).cloned().collect();
         self.connect_many(contexts, window, cx);
+    }
+
+    /// The context sets (saved from the top bar's picker), one button each that connects the
+    /// set's contexts the kubeconfig still has. None when there is no set.
+    fn context_set_buttons(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let sets = crate::settings::context_sets();
+        if sets.is_empty() {
+            return None;
+        }
+        let buttons = sets.into_iter().enumerate().map(|(i, set)| {
+            let contexts = set.available(&self.all_contexts);
+            Button::new(("ctx-set-button", i))
+                .outline()
+                .icon(Lucide::Layers)
+                .label(set.name)
+                .tooltip(if contexts.is_empty() {
+                    "None of its contexts is in the kubeconfig".to_string()
+                } else {
+                    contexts.join(", ")
+                })
+                .disabled(contexts.is_empty())
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.picked = contexts.iter().cloned().collect();
+                    this.connect_many(contexts.clone(), window, cx);
+                }))
+        });
+        Some(h_flex().flex_wrap().gap_2().children(buttons).into_any_element())
     }
 
     pub(super) fn render_contexts(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -315,11 +266,27 @@ impl AppView {
                         .text_color(theme.muted_foreground)
                         .child("Select one or more contexts to get started"),
                 )
+                .children(self.context_set_buttons(cx))
                 .child(h_flex().flex_wrap().gap_2().children(self.all_contexts.iter().enumerate().map(|(i, ctx)| {
                     let name = ctx.clone();
                     let risky = crate::settings::is_protected(ctx);
                     let accent: Hsla = crate::settings::context_color(ctx).map_or(theme.blue, |c| rgb(c).into());
                     let picked = self.picked.contains(ctx);
+                    // A context of the set still connecting or that failed says so (and why).
+                    let (state, state_color, why) = match self.conn.get(ctx) {
+                        Some(super::conn::Conn::Connecting) => (Some("connecting…"), theme.muted_foreground, None),
+                        Some(super::conn::Conn::Failed(why)) => {
+                            (Some("can't connect"), theme.danger, Some(why.clone()))
+                        }
+                        None => (None, theme.muted_foreground, None),
+                    };
+                    // A shortened name shows in full on hover, above why it can't connect.
+                    let short = k8s::short_names::short_name(ctx);
+                    let tip = match (short != *ctx, why) {
+                        (true, Some(why)) => Some(SharedString::from(format!("{ctx}\n{why}"))),
+                        (true, None) => Some(SharedString::from(ctx.clone())),
+                        (false, why) => why,
+                    };
                     h_flex()
                         .id(("ctx-card", i))
                         .w(px(290.))
@@ -331,6 +298,16 @@ impl AppView {
                         .when(picked, |d| d.bg(theme.blue.opacity(0.08)))
                         .cursor_pointer()
                         .hover(|s| s.bg(theme.list_hover))
+                        // A checkbox to screen readers: Space or Enter picks it, as a click does.
+                        .control(Role::CheckBox, ctx.clone(), theme.ring)
+                        .aria_toggled(if picked { Toggled::True } else { Toggled::False })
+                        .aria_description(
+                            [Some(if risky { "protected" } else { "context" }), state]
+                                .into_iter()
+                                .flatten()
+                                .collect::<Vec<_>>()
+                                .join(", "),
+                        )
                         .on_click(cx.listener(move |this, ev: &ClickEvent, window, cx| {
                             // Double click connects to just this one.
                             if ev.click_count() >= 2 {
@@ -351,15 +328,23 @@ impl AppView {
                                         .overflow_hidden()
                                         .text_ellipsis()
                                         .whitespace_nowrap()
-                                        .child(ctx.clone()),
+                                        .child(short),
                                 )
                                 .child(
-                                    div()
+                                    h_flex()
+                                        .gap_2()
                                         .text_xs()
-                                        .text_color(if risky { theme.warning } else { theme.muted_foreground })
-                                        .child(if risky { "protected" } else { "context" }),
+                                        .child(
+                                            div()
+                                                .text_color(if risky { theme.warning } else { theme.muted_foreground })
+                                                .child(if risky { "protected" } else { "context" }),
+                                        )
+                                        .when_some(state, |d, s| d.child(div().text_color(state_color).child(s))),
                                 ),
                         )
+                        .when_some(tip, |d, tip| {
+                            d.tooltip(move |w, cx| component::tooltip::Tooltip::new(tip.clone()).build(w, cx))
+                        })
                 })))
                 .child(
                     h_flex()
