@@ -1064,7 +1064,7 @@ impl ArgoView {
             .on_click(flip)
             .child(
                 div().w(px(20.)).flex_none().child(
-                    component::Icon::new(if collapsed { Lucide::ChevronRight } else { Lucide::ChevronDown })
+                    Icon::new(if collapsed { Lucide::ChevronRight } else { Lucide::ChevronDown })
                         .size_4()
                         .text_color(muted),
                 ),
@@ -1563,7 +1563,7 @@ mod tests {
         let mut a = app("OutOfSync", "Progressing", None, "shop");
         a.automated = true;
         a.labels = vec![("env".into(), "Prod".into()), ("team".into(), "web".into())];
-        let keeps = |f: Filter| f.keeps(&a, "prod", "web");
+        let keeps = |f: Filter| f.keeps(&a, "prod", "web", false);
         assert!(keeps(Filter { sync: Some("OutOfSync".into()), ..Default::default() }));
         assert!(!keeps(Filter { sync: Some("Synced".into()), ..Default::default() }));
         assert!(!keeps(Filter { health: Some("Healthy".into()), ..Default::default() }));
