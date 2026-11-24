@@ -537,12 +537,13 @@ struct TemplateMeta {
     labels: Option<serde_json::Map<String, Value>>,
 }
 
-/// A workload with the labels of the pods it runs, or would run when scaled to 0 (`zero`).
+/// A workload with the labels of the pods it runs (`replicas` of them), or would run when
+/// scaled to 0.
 struct Template {
     kind: &'static str,
     namespace: Option<String>,
     name: String,
-    zero: bool,
+    replicas: i64,
     labels: serde_json::Map<String, Value>,
 }
 
@@ -554,7 +555,8 @@ impl Workload {
             kind,
             namespace: self.metadata.namespace().map(String::from),
             name: self.metadata.name().unwrap_or_default().to_string(),
-            zero: self.spec.replicas == Some(0),
+            // Unset is 1, as the API server defaults it.
+            replicas: self.spec.replicas.unwrap_or(1),
             labels: self.spec.template.metadata.labels?,
         })
     }
@@ -694,7 +696,7 @@ fn scaled_to_zero(service: &Service, workloads: &[Template]) -> Option<String> {
     let selector = serde_json::json!({ "matchLabels": selector });
     workloads
         .iter()
-        .find(|w| w.zero && w.namespace.as_deref() == ns && k8s::selector_matches(&selector, &w.labels))
+        .find(|w| w.replicas == 0 && w.namespace.as_deref() == ns && k8s::selector_matches(&selector, &w.labels))
         .map(|w| format!("{} {}", w.kind, w.name))
 }
 
@@ -709,8 +711,12 @@ struct Role {
     /// The labels the template doesn't set, as the Service wants them: "spilo-role=replica".
     wanted: String,
     /// The workload's pods that carry those labels (with another value), as a label selector:
-    /// only when some do is the Service idle by design. A label no pod has is a typo.
+    /// only when they do is the Service idle by design. A label no pod has is a typo.
     carried: String,
+    /// The workload's replicas: each should carry the labels once the operator gave it its
+    /// role. Fewer that do means a pod still lacks its role (pending, crashing), maybe the one
+    /// the Service waits for.
+    replicas: i64,
 }
 
 impl Role {
@@ -718,17 +724,37 @@ impl Role {
     fn verdict(&self) -> (Severity, String) {
         (Severity::Info, format!("selects no pod (no pod of {} has {})", self.workload, self.wanted))
     }
+
+    /// Whether the Service is idle by design, given the workload's pods listed by `carried`:
+    /// every replica has a role, none the one it wants.
+    fn holds(&self, carried: &[SelectedPod]) -> bool {
+        let live = carried.iter().filter(|p| p.live()).count();
+        live > 0 && i64::try_from(live).is_ok_and(|n| n >= self.replicas)
+    }
 }
+
+/// Labels Kubernetes' own controllers set on the pods they make, not in the template: a
+/// Service pinned to one of them (a rollout's `pod-template-hash`) breaks on the next rollout,
+/// and that is no operator's role.
+const CONTROLLER_LABELS: [&str; 4] = [
+    "pod-template-hash",
+    "controller-revision-hash",
+    "statefulset.kubernetes.io/pod-name",
+    "apps.kubernetes.io/pod-index",
+];
 
 /// The running workload a Service picks pods of by a role (see `Role`): its selector agrees
 /// with the workload's template on every label the template sets (one at least), and asks for
-/// others the template doesn't set.
+/// others the template doesn't set, none of them a label Kubernetes sets itself.
 fn runtime_role(service: &Service, workloads: &[Template]) -> Option<Role> {
     let ns = service.metadata.namespace();
     let selector = service.spec.selector.as_ref()?.as_object()?;
-    workloads.iter().filter(|w| !w.zero && w.namespace.as_deref() == ns).find_map(|w| {
+    workloads.iter().filter(|w| w.replicas != 0 && w.namespace.as_deref() == ns).find_map(|w| {
         let (set, unset): (Vec<_>, Vec<_>) = selector.iter().partition(|(k, _)| w.labels.contains_key(*k));
         if set.is_empty() || unset.is_empty() || set.iter().any(|(k, v)| w.labels.get(*k) != Some(*v)) {
+            return None;
+        }
+        if unset.iter().any(|(k, _)| CONTROLLER_LABELS.contains(&k.as_str())) {
             return None;
         }
         let match_labels: serde_json::Map<String, Value> =
@@ -739,7 +765,8 @@ fn runtime_role(service: &Service, workloads: &[Template]) -> Option<Role> {
         let Selection::Labels(carried) = k8s::label_selection(Some(&carried), false) else { return None };
         let wanted: Vec<String> =
             unset.iter().map(|(k, v)| format!("{k}={}", v.as_str().unwrap_or_default())).collect();
-        Some(Role { workload: format!("{} {}", w.kind, w.name), wanted: wanted.join(","), carried })
+        let workload = format!("{} {}", w.kind, w.name);
+        Some(Role { workload, wanted: wanted.join(","), carried, replicas: w.replicas })
     })
 }
 
@@ -882,17 +909,6 @@ async fn workloads_of(client: Client, ns: &str) -> Vec<Template> {
     templates
 }
 
-/// Whether a Service idle on purpose still is, by the namespace's `workloads` alone: its
-/// verdict `kept` is what it would be judged now. A role is not checked on the pods again:
-/// they had it when the verdict was made, and the Service hasn't changed since.
-fn still_idle(service: &Service, workloads: &[Template], kept: &(Severity, String)) -> bool {
-    let now = match scaled_to_zero(service, workloads) {
-        Some(w) => judge_service(&[], Some(w.as_str())),
-        None => runtime_role(service, workloads).map(|r| r.verdict()),
-    };
-    now.as_ref() == Some(kept)
-}
-
 /// Services (with a selector) without a ready endpoint: their pods say whether they select
 /// none or none is ready. One pod list a Service (by its selector), and the workloads of a
 /// namespace listed once, only where a Service selects no pod. A Service unchanged since it
@@ -941,30 +957,30 @@ async fn unserved(
     let now = Instant::now();
     let mut known: Vec<(usize, Option<(Severity, String)>)> = Vec::new();
     let mut unready: Vec<(usize, String, Option<String>)> = Vec::new();
-    // Kept as idle on purpose (a workload scaled to 0, a role no pod has): it stands only
-    // while the namespace's workloads still say so (one list a namespace, not one a Service).
-    let mut idle_kept: Vec<(usize, String, Option<String>, Found)> = Vec::new();
+    // Kept as selecting no pod because a workload is scaled to 0: it stands only while one
+    // still is, as the namespace's workloads say (one list a namespace, not one a Service).
+    // A role no pod has is kept as a warning is: it depends on pods, not on the workloads.
+    let mut scaled_kept: Vec<(usize, String, Option<String>)> = Vec::new();
     {
         let kept = verdicts();
         for (i, ns, selector) in candidates {
             let reused = services[i].metadata.version().and_then(|(uid, version)| {
                 kept.get(uid)
                     .filter(|k| reusable(k, version, now) && judged_since.is_none_or(|since| k.at >= since))
-                    .map(|k| k.verdict.clone())
+                    .map(|k| (k.scaled, k.verdict.clone()))
             });
             match reused {
-                Some(verdict @ (Severity::Info, _)) => idle_kept.push((i, ns, selector, verdict)),
-                Some(verdict) => known.push((i, Some(verdict))),
+                Some((true, _)) => scaled_kept.push((i, ns, selector)),
+                Some((false, verdict)) => known.push((i, Some(verdict))),
                 None => unready.push((i, ns, selector)),
             }
         }
     }
-    let mut workloads = workloads_in(client, idle_kept.iter().map(|(_, ns, _, _)| ns.clone()).collect()).await;
-    for (i, ns, selector, verdict) in idle_kept {
-        if workloads.get(&ns).is_some_and(|w| still_idle(&services[i], w, &verdict)) {
-            known.push((i, Some(verdict)));
-        } else {
-            unready.push((i, ns, selector));
+    let mut workloads = workloads_in(client, scaled_kept.iter().map(|(_, ns, _)| ns.clone()).collect()).await;
+    for (i, ns, selector) in scaled_kept {
+        match workloads.get(&ns).and_then(|w| scaled_to_zero(&services[i], w)) {
+            Some(w) => known.push((i, judge_service(&[], Some(w.as_str())))),
+            None => unready.push((i, ns, selector)),
         }
     }
     let listed: Vec<(usize, anyhow::Result<Vec<SelectedPod>>)> = futures::stream::iter(unready)
@@ -987,8 +1003,8 @@ async fn unserved(
         .collect();
     workloads.extend(workloads_in(client, idle).await);
     // A Service that selects no pod but a role of a running workload's pods: idle on purpose
-    // when some of those pods carry the role's label with another value. One more pod list
-    // for each, kept with the verdict like the first.
+    // when its pods carry the role's label with another value, as many as its replicas. One
+    // more pod list for each, kept with the verdict like the first.
     let roles: Vec<(usize, String, Role)> = listed
         .iter()
         .filter(|(_, pods)| pods.as_ref().is_ok_and(|p| !p.iter().any(SelectedPod::live)))
@@ -1010,7 +1026,7 @@ async fn unserved(
                 let pod = k8s::ar_of::<core::Pod>();
                 let carried = Some(role.carried.clone());
                 let pods = k8s::lists::list_lean_cached_by::<SelectedPod>(client, pod, Some(ns), carried).await;
-                pods.is_ok_and(|p| p.iter().any(SelectedPod::live)).then_some((i, role))
+                pods.is_ok_and(|p| role.holds(&p)).then_some((i, role))
             }
         })
         .buffer_unordered(HELD_PARALLEL)
@@ -1028,16 +1044,20 @@ async fn unserved(
             }
         };
         let svc = &services[i];
-        let verdict = if let Some(role) = roles.get(&i) {
-            Some(role.verdict())
+        let (verdict, scaled) = if let Some(role) = roles.get(&i) {
+            (Some(role.verdict()), false)
         } else {
             let scaled = workloads.get(&svc.metadata.key().0).and_then(|w| scaled_to_zero(svc, w));
-            judge_service(&pods, scaled.as_deref())
+            let verdict = judge_service(&pods, scaled.as_deref());
+            // Only "selects no pod" leans on the workload scaled to 0.
+            let leans = scaled.is_some() && verdict.as_ref().is_some_and(|(s, _)| *s == Severity::Info);
+            (verdict, leans)
         };
         // "A ready pod after all" is not kept: the Endpoints lagged, and the pods may go
         // unready by the next scan.
         if let (Some((uid, version)), Some(kept)) = (svc.metadata.version(), &verdict) {
-            judged.push((uid.to_string(), Verdict { version: version.to_string(), at: now, verdict: kept.clone() }));
+            let version = version.to_string();
+            judged.push((uid.to_string(), Verdict { version, at: now, verdict: kept.clone(), scaled }));
         }
         known.push((i, verdict));
     }
@@ -1072,20 +1092,19 @@ async fn workloads_in(client: &Client, namespaces: BTreeSet<String>) -> HashMap<
         .await
 }
 
-/// What a Service is found to be: its severity and reason.
-type Found = (Severity, String);
-
 /// A Service's verdict on its pods, as judged at `at` for its resourceVersion `version`.
 /// Only a problem is kept: a Service with a ready pod is judged again each time.
 struct Verdict {
     version: String,
     at: Instant,
     verdict: (Severity, String),
+    /// It selects no pod because a workload is scaled to 0: it stands only while one still is.
+    scaled: bool,
 }
 
 /// How long a Service's verdict is kept at most: the pods it selects can change without the
-/// Service. One that selects no pod on purpose (a workload scaled to 0, a role no pod has)
-/// keeps it only while the workloads still say so.
+/// Service. One that selects no pod because a workload is scaled to 0 keeps it only while
+/// that workload still is.
 const VERDICT_KEPT: Duration = Duration::from_secs(10 * 60);
 
 /// The verdicts of the Services judged lately, by uid (unique across clusters too).
@@ -1388,25 +1407,131 @@ mod tests {
         let unrelated = service_selecting(json!({"role": "replica"}));
         assert_eq!(runtime_role(&unrelated, &templates("app", 1, template.clone())), None);
         assert_eq!(runtime_role(&service_selecting(template.clone()), &templates("app", 1, template)), None);
+        // A label Kubernetes' controllers set (a rollout's hash, a StatefulSet pod's name): the
+        // Service is pinned to pods that go away, not to a role.
+        let web = json!({"app": "web"});
+        for key in CONTROLLER_LABELS {
+            let mut selector = web.clone();
+            selector[key] = json!("x");
+            let pinned = service_selecting(selector);
+            assert_eq!(runtime_role(&pinned, &templates("app", 1, web.clone())), None, "{key}");
+        }
     }
 
-    /// A verdict kept as idle on purpose stands only while the workloads still say the same.
+    /// A role no pod has is by design only while every replica has a role: a pod pending or
+    /// crashing before the operator labels it may be the one the Service waits for.
     #[test]
-    fn an_idle_verdict_is_kept_while_its_reason_holds() {
-        let template = json!({"app": "db"});
+    fn a_role_holds_while_every_replica_has_one() {
         let repl = service_selecting(json!({"app": "db", "role": "replica"}));
-        let running = templates("app", 1, template.clone());
-        let role = runtime_role(&repl, &running).unwrap().verdict();
-        assert!(still_idle(&repl, &running, &role));
-        // Scaled to 0 since: another reason, judged again.
-        let scaled = templates("app", 0, template.clone());
-        assert!(!still_idle(&repl, &scaled, &role));
-        // The template sets the role now: judged again.
-        assert!(!still_idle(&repl, &templates("app", 1, json!({"app": "db", "role": "primary"})), &role));
-        let web = service_selecting(template);
-        let zero = judge_service(&[], Some("StatefulSet db")).unwrap();
-        assert!(still_idle(&web, &scaled, &zero));
-        assert!(!still_idle(&web, &running, &zero));
+        let role = |replicas| runtime_role(&repl, &templates("app", replicas, json!({"app": "db"}))).unwrap();
+        let pod = |phase: &str| lean::<SelectedPod>(json!({"metadata": {"name": "db-0"}, "status": {"phase": phase}}));
+        assert!(role(1).holds(&[pod("Running")]));
+        assert!(role(2).holds(&[pod("Running"), pod("Pending")]));
+        // Scaled to 2, the new pod not labeled yet; no pod with a role; one that ran out.
+        assert!(!role(2).holds(&[pod("Running")]));
+        assert!(!role(1).holds(&[]));
+        assert!(!role(1).holds(&[pod("Failed")]));
+        // An unset replica count is 1.
+        let unset = json!({"metadata": {"name": "db", "namespace": "app"},
+            "spec": {"template": {"metadata": {"labels": {"app": "db"}}}}});
+        let unset: Vec<Template> = lean::<Workload>(unset).template("StatefulSet").into_iter().collect();
+        assert!(runtime_role(&repl, &unset).unwrap().holds(&[pod("Running")]));
+    }
+
+    /// A namespace `db` with a Postgres operator's cluster of `.2` instances, one labeled with
+    /// its role (the primary), and the replica Service, which selects no pod. Records the
+    /// paths it was asked for.
+    #[derive(Clone)]
+    struct Postgres(std::sync::Arc<Mutex<Vec<String>>>, u64, i64);
+
+    impl Postgres {
+        fn new(instances: i64) -> Self {
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            Self(std::sync::Arc::default(), NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed), instances)
+        }
+
+        fn asked(&self, end: &str) -> usize {
+            self.0.lock().unwrap().iter().filter(|p| p.ends_with(end)).count()
+        }
+    }
+
+    impl tower::Service<http::Request<kube::client::Body>> for Postgres {
+        type Response = http::Response<http_body_util::Full<bytes::Bytes>>;
+        type Error = std::convert::Infallible;
+        type Future = std::future::Ready<Result<Self::Response, Self::Error>>;
+
+        fn poll_ready(&mut self, _: &mut std::task::Context<'_>) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, req: http::Request<kube::client::Body>) -> Self::Future {
+            let path = req.uri().path().to_string();
+            let query = req.uri().query().unwrap_or_default().replace("%3D", "=").replace("%2C", ",");
+            self.0.lock().unwrap().push(path.clone());
+            let meta = |name: &str, labels: Value| {
+                json!({"name": name, "namespace": "db", "uid": format!("uid-pg-{}-{name}", self.1),
+                    "creationTimestamp": "2026-01-01T00:00:00Z",
+                    "resourceVersion": "1", "labels": labels})
+            };
+            let list = |items: Vec<Value>| json!({"kind": "List", "apiVersion": "v1", "metadata": {"resourceVersion": "1"}, "items": items});
+            let labels = json!({"application": "spilo", "cluster-name": "db"});
+            let body = match path.as_str() {
+                "/api/v1/namespaces/db/services" => list(vec![json!({"metadata": meta("db-repl", json!({})),
+                    "spec": {"selector": {"application": "spilo", "cluster-name": "db", "spilo-role": "replica"}}})]),
+                "/api/v1/namespaces/db/endpoints" => {
+                    json!({"kind": "Table", "columnDefinitions": [{"name": "Name"}, {"name": "Endpoints"}, {"name": "Age"}],
+                        "rows": [{"cells": ["db-repl", "<none>", "1d"],
+                            "object": {"metadata": {"name": "db-repl", "namespace": "db", "uid": "db-repl"}}}]})
+                }
+                "/api/v1/namespaces/db/pods" if query.contains("spilo-role=replica") => list(vec![]),
+                "/api/v1/namespaces/db/pods" => list(vec![json!({
+                    "metadata": meta("db-0", json!({"application": "spilo", "cluster-name": "db", "spilo-role": "master"})),
+                    "status": {"phase": "Running"}})]),
+                "/apis/apps/v1/namespaces/db/statefulsets" => {
+                    list(vec![json!({"metadata": meta("db", labels.clone()),
+                    "spec": {"replicas": self.2, "template": {"metadata": {"labels": labels}}}})])
+                }
+                "/apis/apps/v1/namespaces/db/deployments" => list(vec![]),
+                _ => {
+                    json!({"kind": "Status", "apiVersion": "v1", "status": "Failure", "code": 404, "reason": "NotFound"})
+                }
+            };
+            let code = if body["kind"] == "Status" { 404 } else { 200 };
+            let response = http::Response::builder().status(code).body(body.to_string().into_bytes().into()).unwrap();
+            std::future::ready(Ok(response))
+        }
+    }
+
+    /// The replica Service of a one-instance Postgres cluster is minor, and its verdict is kept
+    /// as a warning's is: the next scans send no request for it, not even a workload list.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_kept_role_verdict_costs_no_request() {
+        let cluster = Postgres::new(1);
+        let client = Client::new(cluster.clone(), "default");
+        let service = kind("", "Service");
+        let found = |scan: Scan| -> Vec<(String, Severity, String)> {
+            scan.problems.into_iter().map(|p| (p.name, p.severity, p.reason)).collect()
+        };
+        let minor = [(
+            "db-repl".to_string(),
+            Severity::Info,
+            "selects no pod (no pod of StatefulSet db has spilo-role=replica)".to_string(),
+        )];
+        let first = found(traffic(client.clone(), &service, None, None, Some("db".into()), None).await);
+        assert_eq!(first, minor);
+        // Its pods, then the workload's pods with a role; the workloads once.
+        let counts = || (cluster.asked("/pods"), cluster.asked("/statefulsets"), cluster.asked("/deployments"));
+        assert_eq!(counts(), (2, 1, 1));
+        for _ in 0..3 {
+            let again = found(traffic(client.clone(), &service, None, None, Some("db".into()), None).await);
+            assert_eq!(again, minor);
+            assert_eq!(counts(), (2, 1, 1));
+        }
+        // Scaled to 2, the new pod without its role yet: the replica may be the one missing.
+        let cluster = Postgres::new(2);
+        let client = Client::new(cluster.clone(), "default");
+        let scan = found(traffic(client, &service, None, None, Some("db".into()), None).await);
+        assert_eq!(scan, [("db-repl".to_string(), Severity::Warning, "selects no pod".to_string())]);
     }
 
     /// Labels among `keys`, each with one of two values.
@@ -1819,7 +1944,8 @@ mod tests {
             age in 0u64..2_000,
         ) {
             let at = Instant::now();
-            let verdict = Verdict { version: kept.into(), at, verdict: (Severity::Warning, "selects no pod".into()) };
+            let verdict =
+                Verdict { version: kept.into(), at, verdict: (Severity::Warning, "selects no pod".into()), scaled: false };
             let later = at + Duration::from_secs(age);
             prop_assert_eq!(reusable(&verdict, now, later), kept == now && Duration::from_secs(age) < VERDICT_KEPT);
         }

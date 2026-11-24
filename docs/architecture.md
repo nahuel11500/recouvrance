@@ -82,7 +82,7 @@ show after 0.7 s and all of them after 1.4 s ([measured](COMPARISON.md#measured)
 The Problems scan reads the big kinds from their cells too (`list_light`). What its checks need
 of whole objects (Services, Ingresses and HTTP routes, the pods a Service selects, the workloads of
 a namespace with an idle Service, external-secrets.io's objects) is parsed as each list streams in,
-keeping only the fields the checks use; of the workloads, only their pod templates' labels are kept. A
+keeping only the fields the checks use; of the workloads, only their replicas and pod templates' labels are kept. A
 Service's verdict is kept by its uid and resourceVersion for 10 minutes, so the same idle Services
 don't cost a pod list each on every scan. A scan asked for findings from a given time on (Refresh,
 an agent's `max_age_seconds`) judges again the Services judged before it.
