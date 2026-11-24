@@ -337,7 +337,7 @@ fn update(scope: &Scope, change: impl FnOnce(&mut Found)) {
 async fn run(scope: Scope, ask: Ask, judged_since: Option<Instant>, mut finish: Finish) {
     let Ask { client, kinds, record } = ask;
     let context = record.then_some(scope.context.as_str());
-    let jobs = super::jobs(&client, &kinds, &scope.namespaces, context, judged_since);
+    let jobs = super::jobs(&client, &kinds, &scope.namespaces, (context, Some(scope.context.as_str())), judged_since);
     finish.checks = Some(jobs.iter().map(|(name, _)| Arc::from(name.as_str())).collect());
     let checks = async {
         let mut running: futures::stream::FuturesUnordered<_> = (jobs.into_iter().enumerate())

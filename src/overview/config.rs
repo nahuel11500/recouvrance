@@ -129,6 +129,85 @@ pub(super) fn external_secret_page(ctx: &Ctx, cx: &App) -> Div {
     v_flex().child(fields)
 }
 
+/// A cert-manager Certificate's page: its Secret and issuer, when it ends and is renewed,
+/// what fails (as the Problems scan judges it), and its last CertificateRequest. Its own
+/// conditions are listed at the bottom, as every page's.
+pub(super) fn certificate_page(ctx: &Ctx, cx: &App) -> Div {
+    use crate::cert_manager::{self as cm, GROUP};
+    let obj = ctx.obj;
+    let theme = cx.theme();
+    let now = jiff::Timestamp::now();
+    let date =
+        |t: Option<jiff::Timestamp>| t.map_or_else(|| "-".into(), |t| t.strftime("%Y-%m-%d %H:%M UTC").to_string());
+    let cert = cm::of_value(obj).unwrap_or_default();
+    let mut fields = row().pt_4();
+    if let Some(secret) = cert.spec.secret_name.as_deref().filter(|n| !n.is_empty()) {
+        fields = fields.child(field("Secret", ctx.link(secret.to_string(), "secrets", secret, cx), cx));
+    }
+    if let Some(name) = s(obj, "/spec/issuerRef/name") {
+        let kind = s(obj, "/spec/issuerRef/kind").filter(|k| !k.is_empty()).unwrap_or("Issuer");
+        let text = format!("{kind}: {name}");
+        // An external issuer's kind (another group) has no page here to open.
+        let issuer: AnyElement = if s(obj, "/spec/issuerRef/group").is_none_or(|g| g.is_empty() || g == GROUP) {
+            let ns = if kind == "ClusterIssuer" { None } else { ctx.ns() };
+            ctx.link_in(text, &format!("{}s.{GROUP}", kind.to_lowercase()), name, ns, cx).into_any_element()
+        } else {
+            selectable(text).into_any_element()
+        };
+        fields = fields.child(field("Issuer", issuer, cx));
+    }
+    let not_after = cm::time(cert.status.not_after.as_deref());
+    let ends = match not_after {
+        Some(t) if t <= now => format!("{} ({})", date(Some(t)), expired(Some(t), now)),
+        Some(t) => format!("{} (in {})", date(Some(t)), crate::certs::days_text(crate::certs::days_left(t, now))),
+        None => "-".into(),
+    };
+    fields = fields
+        .child(field("Valid from", date(cm::time(cert.status.not_before.as_deref())), cx))
+        .child(field("Valid until", ends, cx))
+        .child(field("Renewal", date(cm::time(cert.status.renewal_time.as_deref())), cx));
+    if let Some(n) = cert.status.failed_issuance_attempts.filter(|n| *n > 0) {
+        let last = cm::time(cert.status.last_failure_time.as_deref())
+            .map_or_default(|t| format!(", last {} ago", k8s::age(t)));
+        fields = fields.child(field("Failed attempts", format!("{n}{last}"), cx));
+    }
+    let mut page = v_flex().child(fields);
+    if let Some((severity, reason)) = cm::judge(&cert, now) {
+        let color = if severity == crate::problems::Severity::Critical { theme.danger } else { theme.warning };
+        page = page.child(
+            h_flex()
+                .mt_3()
+                .gap_2()
+                .items_start()
+                .child(Icon::new(Lucide::TriangleAlert).text_color(color))
+                .child(div().text_sm().text_color(color).child(selectable(reason))),
+        );
+    }
+    let request = ctx.related.cert_request.as_ref();
+    if request.is_some() || ctx.related.errors.contains_key("cert_request") {
+        page = page.child(super::heading_for("Last CertificateRequest", ctx.related, "cert_request", cx));
+    }
+    if let Some(r) = request {
+        let link = ctx.link(r.name.clone(), &format!("certificaterequests.{GROUP}"), &r.name, cx);
+        let created = r.created.map_or_else(|| "-".into(), |t| format!("{} ago", k8s::age(t)));
+        let (state, color) = match (&r.failed, r.ready.as_deref()) {
+            (Some(why), _) => {
+                let when = r.failure_time.map_or_default(|t| format!(" {} ago", k8s::age(t)));
+                (format!("failed{when}: {why}"), theme.danger)
+            }
+            (None, Some("True")) => ("issued".to_string(), theme.success),
+            (None, _) => ("pending".to_string(), theme.muted_foreground),
+        };
+        let mut request_fields = row().child(field("Name", link, cx)).child(field("Created", created, cx));
+        if let Some(rev) = r.revision {
+            request_fields = request_fields.child(field("Revision", rev.to_string(), cx));
+        }
+        let state = div().text_color(color).child(selectable(state));
+        page = page.child(request_fields.child(field("State", state, cx).max_w(px(480.))));
+    }
+    page
+}
+
 /// An `ExternalSecret`'s store (a link), refresh interval and last sync, in a row.
 fn sync_fields(ctx: &Ctx, es: &Value, cx: &App) -> Div {
     let mut fields = row().pt_4();

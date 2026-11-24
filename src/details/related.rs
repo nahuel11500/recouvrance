@@ -327,6 +327,12 @@ async fn fetch_objects(
         related.rbac = Some(k8s::rbac_snapshot(client, None).await);
         return related;
     }
+    if kind.is(crate::cert_manager::GROUP, "Certificate") {
+        // Why it fails to be issued: its last request says it.
+        let request = crate::cert_manager::last_request(client, obj).await;
+        related.cert_request = related.noted("cert_request", request);
+        return related;
+    }
     if kind.is("batch", "CronJob") {
         let uid = obj.pointer("/metadata/uid").and_then(|v| v.as_str()).unwrap_or_default().to_string();
         let jobs = k8s::list_values(client, k8s::ar_of::<batch::Job>(), Some(ns), None).await;

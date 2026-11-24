@@ -77,6 +77,8 @@ pub struct Related {
     pub crash_pod: Option<String>,
     /// The `ExternalSecret` a Secret comes from, when one owns it.
     pub external_secret: Option<Value>,
+    /// A cert-manager Certificate's last CertificateRequest, when it has one.
+    pub cert_request: Option<crate::cert_manager::LastRequest>,
     /// Where an Argo CD Application deploys, and the context that reaches it (a connected
     /// one first).
     pub argo_destination: Option<(k8s::argo::Destination, Option<String>)>,
@@ -135,6 +137,7 @@ impl Related {
             std::mem::swap(&mut self.crash_logs, &mut read.crash_logs);
             std::mem::swap(&mut self.crash_pod, &mut read.crash_pod);
             std::mem::swap(&mut self.external_secret, &mut read.external_secret);
+            std::mem::swap(&mut self.cert_request, &mut read.cert_request);
             std::mem::swap(&mut self.argo_destination, &mut read.argo_destination);
             std::mem::swap(&mut self.argo_drift, &mut read.argo_drift);
             std::mem::swap(&mut self.rbac, &mut read.rbac);
@@ -536,6 +539,8 @@ fn top(ctx: &Ctx, cx: &App) -> Div {
     } else {
         if kind.is(crate::external_secrets::GROUP, "ExternalSecret") {
             root = root.child(external_secret_page(ctx, cx));
+        } else if kind.is(crate::cert_manager::GROUP, "Certificate") {
+            root = root.child(certificate_page(ctx, cx));
         }
         // Anything else (CRDs especially): spec and status as readable fields.
         root = root.child(spec_and_status(ctx.obj, cx));

@@ -2,6 +2,7 @@ mod agents;
 mod alerts;
 mod app;
 mod assistant;
+mod cert_manager;
 mod certs;
 mod cron;
 mod details;
