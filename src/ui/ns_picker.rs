@@ -464,7 +464,7 @@ mod tests {
     use super::{Rows, to_add};
 
     fn names(v: &[&str]) -> Vec<String> {
-        v.iter().map(|s| s.to_string()).collect()
+        v.iter().map(ToString::to_string).collect()
     }
 
     /// Favorites come first, then frequent, then all: the keyboard walks them in that order, and

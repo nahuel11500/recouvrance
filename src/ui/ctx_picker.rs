@@ -292,7 +292,7 @@ mod tests {
             prop_assert_eq!(other.is_none(), short);
             prop_assert!(starred.iter().all(|c| favorites.contains(c)));
             prop_assert!(all.iter().filter(|c| favorites.contains(c)).all(|c| starred.contains(c)));
-            let mut shown = starred.clone();
+            let mut shown = starred;
             shown.extend(first.clone());
             shown.extend(other.unwrap_or_default());
             let mut sorted = shown.clone();

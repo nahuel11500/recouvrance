@@ -344,7 +344,7 @@ pub struct ColumnPrefs {
 }
 
 /// Write JSON atomically (creating the directory); failures are reported on stderr.
-fn save_json(path: &std::path::Path, value: &impl Serialize) {
+fn save_json(path: &Path, value: &impl Serialize) {
     let written = serde_json::to_vec_pretty(value)
         .map_err(std::io::Error::other)
         .and_then(|json| crate::private_files::write_atomic(path, &json));
@@ -425,7 +425,7 @@ mod tests {
     }
 
     fn names(v: &[&str]) -> Vec<String> {
-        v.iter().map(|s| s.to_string()).collect()
+        v.iter().map(ToString::to_string).collect()
     }
 
     /// A file of an older version (kinds, objects and views only) reads as it was.

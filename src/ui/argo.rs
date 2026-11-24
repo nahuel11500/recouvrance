@@ -1033,7 +1033,7 @@ mod tests {
         let ix = |s: Vec<Shown>| s.into_iter().map(|s| s.ix).collect::<Vec<_>>();
         assert_eq!(ix(favorites_first(shown.clone(), |i| i == 5)), [4, 5, 0, 1, 2, 3]);
         assert_eq!(ix(favorites_first(shown.clone(), |i| i == 3 || i == 1)), [0, 1, 2, 3, 4, 5]);
-        assert_eq!(ix(favorites_first(shown.clone(), |_| false)), [0, 1, 2, 3, 4, 5]);
+        assert_eq!(ix(favorites_first(shown, |_| false)), [0, 1, 2, 3, 4, 5]);
     }
 }
 

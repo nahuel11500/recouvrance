@@ -199,7 +199,7 @@ mod tests {
     use crate::favorites::{FavApp, FavNamespace, FavObject, Favorite};
 
     fn names(v: &[&str]) -> Vec<String> {
-        v.iter().map(|s| s.to_string()).collect()
+        v.iter().map(ToString::to_string).collect()
     }
 
     /// A favorite on a context that isn't connected is opened by connecting it; one whose
