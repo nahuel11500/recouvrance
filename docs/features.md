@@ -245,7 +245,9 @@
   on `/metrics`) is named, and the rest is still checked.
 - **References to missing objects**: the Problems page lists what points to something that
   doesn't exist, on the object that points to it: a Service that selects no pod (minor when its
-  Deployment or StatefulSet is scaled to 0) or no ready one, an Ingress whose backend Service,
+  Deployment or StatefulSet is scaled to 0, or when it picks pods of a running one by a role
+  label the operator sets on them and no pod has that role now while every pod has another, as
+  a Postgres replica Service with one instance) or no ready one, an Ingress whose backend Service,
   its port or a TLS Secret is missing, an HTTPRoute whose backend Service is missing (when the
   cluster serves the Gateway API). A pod stuck creating, a workload short of ready replicas or a
   pending PVC says which ConfigMap, Secret, PVC, ServiceAccount or StorageClass it waits on
