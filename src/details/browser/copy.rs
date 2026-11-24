@@ -258,7 +258,7 @@ impl FileBrowser {
             return None;
         }
         let theme = cx.theme().clone();
-        let ends = copy.ends.to_zoned(jiff::tz::TimeZone::system()).strftime("%H:%M").to_string();
+        let ends = copy.ends.to_zoned_datetime(jiff::tz::TimeZone::system()).strftime("%H:%M").to_string();
         Some(
             h_flex()
                 .gap_2()

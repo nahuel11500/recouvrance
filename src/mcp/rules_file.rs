@@ -158,7 +158,7 @@ fn parse_time(v: &str) -> Result<jiff::Timestamp> {
     }
     let date: jiff::civil::Date =
         v.parse().with_context(|| format!("`{v}` is not a date (2026-11-01) or time (2026-11-01T12:00Z)"))?;
-    Ok(date.to_zoned(jiff::tz::TimeZone::UTC)?.timestamp())
+    Ok(date.to_zoned_datetime(jiff::tz::TimeZone::UTC)?.timestamp())
 }
 
 /// The rule as a string (inverse of `parse_rule`).
