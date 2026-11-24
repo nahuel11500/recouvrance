@@ -5,7 +5,8 @@
 //! the dashboard of its service, a tab per environment (see `dashboard`); its menu opens its
 //! page on Argo CD's cluster (or in Argo CD's web UI, when read by the API), refreshes or
 //! syncs it. Applications picked together (`grouped`) are diffed at once, the same change in
-//! several of them shown once.
+//! several of them shown once, or synced at once (`sync`). Every operation seen is kept in a
+//! local journal (`journal`).
 //!
 //! A hub's Applications are read again at the refresh rate; an API server's are kept live
 //! from Argo CD's stream (see `k8s::argo::api`). Both stop while no window shows the page.
@@ -36,6 +37,8 @@ use crate::status::Tone;
 
 mod dashboard;
 mod grouped;
+mod journal;
+mod sync;
 
 // MARK: Grouping
 
@@ -484,6 +487,12 @@ pub struct ArgoView {
     keeps: Vec<bool>,
     /// The grouped diff of the Applications picked, shown instead of the list while open.
     grouped: Option<grouped::GroupedDiff>,
+    /// The sync of the Applications picked, shown instead of the list while open (and kept,
+    /// hidden, while it runs).
+    sync: Option<sync::GroupedSync>,
+    /// The sync journal, shown over the rest while open; the Application words to filter it by.
+    journal: Option<journal::JournalPage>,
+    journal_search: Entity<InputState>,
     _subs: Vec<Subscription>,
 }
 
@@ -498,7 +507,14 @@ impl ArgoView {
         cx: &mut Context<Self>,
     ) -> Self {
         let search = cx.new(|cx| InputState::new(window, cx).placeholder("Search Applications, or key=value…"));
+        let journal_search = cx.new(|cx| InputState::new(window, cx).placeholder("Application…"));
         let subs = vec![
+            cx.subscribe(&journal_search, |this, state, ev: &InputEvent, cx| {
+                if matches!(ev, InputEvent::Change) {
+                    let text = state.read(cx).value().to_string();
+                    this.journal_typed(&text, cx);
+                }
+            }),
             cx.subscribe(&search, |this, state, ev: &InputEvent, cx| {
                 if matches!(ev, InputEvent::Change) {
                     this.filter.query = state.read(cx).value().to_lowercase();
@@ -603,6 +619,9 @@ impl ArgoView {
             picked_hidden: 0,
             keeps: Vec::new(),
             grouped: None,
+            sync: None,
+            journal: None,
+            journal_search,
             _subs: subs,
         }
     }
@@ -1441,6 +1460,12 @@ fn row_menu(
 
 impl Render for ArgoView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.journal.is_some() {
+            return v_flex().size_full().p_2().child(self.journal_view(cx));
+        }
+        if self.sync.as_ref().is_some_and(|g| g.shown) {
+            return v_flex().size_full().p_2().child(self.sync_view(cx));
+        }
         if self.grouped.is_some() {
             return v_flex().size_full().p_2().child(self.grouped_view(cx));
         }

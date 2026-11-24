@@ -16,8 +16,9 @@ use gpui_kit::*;
 /// The confirmation one dialog asks for, besides its own fields.
 #[derive(Clone)]
 pub enum Guard {
-    /// A protected context's name, typed in `input`.
-    Type { input: Entity<InputState>, context: String },
+    /// A protected context's name (or the text asked for), typed in `input`; `prompt` says
+    /// what to type.
+    Type { input: Entity<InputState>, context: String, prompt: String },
     /// A wait before the button works.
     Wait(Rc<Wait>),
 }
@@ -76,7 +77,18 @@ impl Guard {
 
     fn typed(context: &str, window: &mut Window, cx: &mut App) -> Self {
         let input = cx.new(|cx| InputState::new(window, cx).placeholder(context.to_string()));
-        Self::Type { input, context: context.to_string() }
+        let prompt = format!("{context} is protected. Type its name to confirm:");
+        Self::Type { input, context: context.to_string(), prompt }
+    }
+
+    /// What a write to many objects at once asks for, wherever they are: `text` typed (their
+    /// count), `prompt` saying so, or the wait set in Settings → General.
+    pub fn typed_text(text: &str, prompt: String, window: &mut Window, cx: &mut App) -> Self {
+        if let Some(secs) = crate::settings::confirm_wait() {
+            return Self::wait(secs, Vec::new(), cx);
+        }
+        let input = cx.new(|cx| InputState::new(window, cx).placeholder(text.to_string()));
+        Self::Type { input, context: text.to_string(), prompt }
     }
 
     /// A wait of `secs`, whose countdown redraws each second while the guard lives.
@@ -103,7 +115,7 @@ impl Guard {
     /// Whether the button may run now: the name typed, or the wait over.
     pub fn ok(&self, cx: &App) -> bool {
         match self {
-            Self::Type { input, context } => typed_matches(&input.read(cx).value(), context),
+            Self::Type { input, context, .. } => typed_matches(&input.read(cx).value(), context),
             Self::Wait(w) => w.over_at(Instant::now()),
         }
     }
@@ -121,14 +133,9 @@ impl Guard {
     pub fn render(&self, cx: &App) -> AnyElement {
         let warning = cx.theme().warning;
         match self {
-            Self::Type { input, context } => v_flex()
+            Self::Type { input, prompt, .. } => v_flex()
                 .gap_2()
-                .child(
-                    div()
-                        .text_sm()
-                        .text_color(warning)
-                        .child(format!("{context} is protected. Type its name to confirm:")),
-                )
+                .child(div().text_sm().text_color(warning).child(prompt.clone()))
                 .child(Input::new(input))
                 .into_any_element(),
             Self::Wait(w) => match w.protected.as_slice() {
