@@ -70,6 +70,22 @@ jobs:
       - name: Tests
         run: cargo test --locked --profile ci --features dev
 
+  # Windows on every pull request, compiled only (tests and all targets, no linking): code
+  # that builds on Unix alone shows here rather than on main. Its own cache, also saved by
+  # main, so a pull request starts warm.
+  check-windows:
+    name: Check (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: check
+      - run: cargo check --locked --profile ci --all-targets --features dev
+
   # ---- Full run (main, tags, manual) ----
 
   test-macos:
@@ -230,7 +246,7 @@ jobs:
   ci-ok:
     name: CI result
     if: always()
-    needs: [quick, check, test-macos, test-windows, msrv, docs, e2e, build]
+    needs: [quick, check, check-windows, test-macos, test-windows, msrv, docs, e2e, build]
     runs-on: ubuntu-latest
     steps:
       - name: All required jobs passed or were skipped

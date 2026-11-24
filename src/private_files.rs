@@ -2,10 +2,10 @@
 //! can read them (0600, in 0700 directories), they are created new rather than written
 //! through whatever is already there, and temporary ones are removed when dropped.
 //!
-//! On Windows there are no modes: a new file takes the access list of its folder, and every
-//! folder these files go in is in the user's profile (`%APPDATA%`, `%LOCALAPPDATA%`, its
-//! `Temp`) or one the user picked (downloads), which only the user, administrators and the
-//! system can read by default.
+//! On Windows there are no modes: a new file takes the access list of its folder. Every folder
+//! these files go in is `%LOCALAPPDATA%\recouvrance` (config, data and temporary files, see
+//! `paths`), which only the user, administrators and the system can read by default, or one the
+//! user picked (downloads).
 
 use std::fs::{DirBuilder, File, OpenOptions};
 use std::io::{self, Write as _};

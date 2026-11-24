@@ -76,8 +76,12 @@ curl --proto '=https' --tlsv1.2 -LsSf https://github.com/nahuel11500/recouvrance
 recouvrance-update      # later: installs the latest release
 ```
 
-Windows (x86_64), in PowerShell (new: [#1016](https://github.com/nahuel11500/recouvrance/issues/1016)
-lists what doesn't work there yet):
+Windows (x86_64) is a preview: it is built and unit-tested in CI but not yet tried end to end, and
+the link below works from the first release that includes Windows. What is still missing:
+[#1018](https://github.com/nahuel11500/recouvrance/issues/1018) (approval notifications),
+[#1019](https://github.com/nahuel11500/recouvrance/issues/1019) (a console window opens with the app),
+[#1020](https://github.com/nahuel11500/recouvrance/issues/1020) (plugins need `sh`),
+[#1021](https://github.com/nahuel11500/recouvrance/issues/1021) (an end-to-end pass). In PowerShell:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -c "irm https://github.com/nahuel11500/recouvrance/releases/latest/download/recouvrance-installer.ps1 | iex"

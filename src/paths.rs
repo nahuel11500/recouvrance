@@ -1,5 +1,6 @@
 //! Where Recouvrance keeps its files, following the XDG base directories. On Windows, without
-//! the XDG variables, in the user's profile: `%APPDATA%` and `%LOCALAPPDATA%`.
+//! the XDG variables, in `%LOCALAPPDATA%\recouvrance`: the local profile folder, which only the
+//! user can read and which never syncs to a profile server as Roaming `%APPDATA%` does.
 
 use std::path::{Path, PathBuf};
 
@@ -12,25 +13,34 @@ pub fn home() -> PathBuf {
     home.map_or_default(PathBuf::from)
 }
 
-/// `$XDG_CONFIG_HOME/recouvrance`, by default `~/.config/recouvrance` (`%APPDATA%\recouvrance`
-/// on Windows).
+/// `$XDG_CONFIG_HOME/recouvrance`, by default `~/.config/recouvrance`
+/// (`%LOCALAPPDATA%\recouvrance\config` on Windows).
 pub fn config_dir() -> PathBuf {
-    xdg("XDG_CONFIG_HOME", "APPDATA", ".config").join("recouvrance")
+    xdg("XDG_CONFIG_HOME", ".config", "config")
 }
 
 /// `$XDG_DATA_HOME/recouvrance`, by default `~/.local/share/recouvrance`
-/// (`%LOCALAPPDATA%\recouvrance` on Windows).
+/// (`%LOCALAPPDATA%\recouvrance\data` on Windows).
 pub fn data_dir() -> PathBuf {
-    xdg("XDG_DATA_HOME", "LOCALAPPDATA", ".local/share").join("recouvrance")
+    xdg("XDG_DATA_HOME", ".local/share", "data")
 }
 
 /// Where short-lived private files go: `$XDG_RUNTIME_DIR` (a per-user tmpfs) when it is a
-/// real directory, the system temporary directory otherwise.
+/// real directory, else the system temporary directory, on Windows
+/// `%LOCALAPPDATA%\recouvrance\tmp`: `%TMP%` can be a folder other users read (`C:\Temp`).
 pub fn runtime_dir() -> PathBuf {
-    std::env::var_os("XDG_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .filter(|p| p.is_absolute() && p.is_dir())
-        .unwrap_or_else(std::env::temp_dir)
+    let xdg = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from).filter(|p| p.is_absolute() && p.is_dir());
+    xdg.unwrap_or_else(|| {
+        if cfg!(windows) {
+            let dir = windows_dir("tmp");
+            // Created here, once, so the files and folders made in it have a parent. When it
+            // can't be, making them fails: never a fall back to a shared folder.
+            let _ = crate::private_files::create_dir(&dir);
+            dir
+        } else {
+            std::env::temp_dir()
+        }
+    })
 }
 
 /// `~/Downloads`, where saved logs, files and kubeconfigs go.
@@ -84,17 +94,22 @@ fn tilde_in(p: &Path, home: &Path) -> String {
     }
 }
 
-/// An XDG base directory: the variable when it holds an absolute path (the spec says to
-/// ignore a relative one), on Windows then the profile folder `windows_var` names, else
-/// `fallback` under the home directory.
-fn xdg(var: &str, windows_var: &str, fallback: &str) -> PathBuf {
-    let absolute = |var: &str| std::env::var_os(var).map(PathBuf::from).filter(|p| p.is_absolute());
-    let dir = absolute(var);
-    #[cfg(windows)]
-    let dir = dir.or_else(|| absolute(windows_var));
-    #[cfg(not(windows))]
-    let _ = windows_var;
-    dir.unwrap_or_else(|| home().join(fallback))
+/// Recouvrance's folder in an XDG base directory: under the variable when it holds an absolute
+/// path (the spec says to ignore a relative one), else under `fallback` in the home directory;
+/// on Windows, without the variable, `windows` in `%LOCALAPPDATA%\recouvrance`.
+fn xdg(var: &str, fallback: &str, windows: &str) -> PathBuf {
+    match std::env::var_os(var).map(PathBuf::from).filter(|p| p.is_absolute()) {
+        Some(dir) => dir.join("recouvrance"),
+        None if cfg!(windows) => windows_dir(windows),
+        None => home().join(fallback).join("recouvrance"),
+    }
+}
+
+/// `%LOCALAPPDATA%\recouvrance\<name>`, or under `AppData\Local` in the home folder when the
+/// variable is not an absolute path.
+fn windows_dir(name: &str) -> PathBuf {
+    let local = std::env::var_os("LOCALAPPDATA").map(PathBuf::from).filter(|p| p.is_absolute());
+    local.unwrap_or_else(|| home().join("AppData").join("Local")).join("recouvrance").join(name)
 }
 
 #[cfg(test)]
@@ -121,6 +136,8 @@ mod tests {
             "~/scratch/data/recouvrance/timeline"
         );
         // No home folder known: never `~/`.
+        #[cfg(unix)]
+        assert_eq!(shown(Path::new("/srv/cfg"), Path::new(""), "x"), "/srv/cfg/x");
         assert!(!shown(Path::new("/srv/cfg"), Path::new(""), "x").starts_with('~'));
     }
 
