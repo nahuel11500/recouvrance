@@ -174,7 +174,7 @@ impl AppView {
             // Agents' forwards: who opened them, until when; stopped like the others.
             .children(agents.into_iter().map(|f| {
                 let (id, hub) = (f.id, self.hub.clone());
-                let until = f.until.to_zoned(jiff::tz::TimeZone::system()).strftime("%H:%M");
+                let until = f.until.to_zoned_datetime(jiff::tz::TimeZone::system()).strftime("%H:%M");
                 let detail = f
                     .error
                     .clone()

@@ -209,6 +209,12 @@ pub fn api_status(e: &anyhow::Error) -> Option<u16> {
     })
 }
 
+/// A time from k8s-openapi, which is still on jiff 0.2, as this crate's `jiff::Timestamp`.
+/// Nanoseconds carry over unchanged; `None` only past the range both versions share.
+pub fn timestamp(t: k8s_openapi::jiff::Timestamp) -> Option<jiff::Timestamp> {
+    jiff::Timestamp::from_nanosecond(t.as_nanosecond()).ok()
+}
+
 /// How long ago `t` was, as kubectl's AGE column says it: "45s", "3m", "5h", "3d", "2y".
 pub fn age(t: jiff::Timestamp) -> String {
     duration_text(jiff::Timestamp::now().as_second() - t.as_second())
