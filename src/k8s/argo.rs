@@ -167,15 +167,26 @@ fn same_cluster(a: &ContextTarget, b: &ContextTarget) -> bool {
 /// A destination given by name matches the context's name or its kubeconfig cluster's name
 /// (Argo CD's own cluster names are in Secrets, which are not read).
 pub fn targets_cluster(app: &Value, hub: &ContextTarget, here: &ContextTarget) -> bool {
-    deploys_to(app, hub, here) == Some(true)
+    app_deploys_to(app, hub, here) == Some(true)
+}
+
+/// `targets_cluster` for a destination's `server` and `name` as written.
+pub fn deploys_to(server: Option<&str>, name: Option<&str>, hub: &ContextTarget, here: &ContextTarget) -> bool {
+    destination_is(server, name, hub, here) == Some(true)
 }
 
 /// [`targets_cluster`], None when it can't be told: a destination named neither `in-cluster`
 /// nor as the context or its kubeconfig cluster may be the name of an Argo CD cluster Secret
 /// for this very cluster.
-pub fn deploys_to(app: &Value, hub: &ContextTarget, here: &ContextTarget) -> Option<bool> {
-    let dest = |p: &str| app.pointer(p).and_then(Value::as_str).filter(|s| !s.is_empty());
-    match (dest("/spec/destination/server"), dest("/spec/destination/name")) {
+pub fn app_deploys_to(app: &Value, hub: &ContextTarget, here: &ContextTarget) -> Option<bool> {
+    let dest = |p: &str| app.pointer(p).and_then(Value::as_str);
+    destination_is(dest("/spec/destination/server"), dest("/spec/destination/name"), hub, here)
+}
+
+/// Whether the destination `server` / `name` is the cluster of `here`; None when it can't be
+/// told (see [`app_deploys_to`]).
+fn destination_is(server: Option<&str>, name: Option<&str>, hub: &ContextTarget, here: &ContextTarget) -> Option<bool> {
+    match (server.filter(|s| !s.is_empty()), name.filter(|s| !s.is_empty())) {
         (Some(s), _) if server_key(s) == server_key(IN_CLUSTER) => Some(same_cluster(hub, here)),
         (Some(s), _) => Some(same_server(Some(s), here.server.as_deref())),
         (None, Some("in-cluster")) => Some(same_cluster(hub, here)),
@@ -345,8 +356,12 @@ const HISTORY: usize = 5;
 /// Whether auto-sync is on: `syncPolicy.automated` set, and not turned off with
 /// `enabled: false` (newer Argo CD).
 pub fn auto_sync(app: &Value) -> bool {
-    app.pointer("/spec/syncPolicy/automated")
-        .is_some_and(|a| a.is_object() && a.get("enabled").and_then(Value::as_bool) != Some(false))
+    automated_on(app.pointer("/spec/syncPolicy/automated"))
+}
+
+/// Whether `syncPolicy.automated`, as written, turns auto-sync on.
+pub fn automated_on(automated: Option<&Value>) -> bool {
+    automated.is_some_and(|a| a.is_object() && a.get("enabled").and_then(Value::as_bool) != Some(false))
 }
 
 impl Summary {
@@ -782,6 +797,216 @@ pub async fn applications(hub: &Hub) -> Result<Arc<Vec<Value>>> {
     let list = Arc::new(list);
     LISTS.lock().unwrap_or_else(PoisonError::into_inner).insert(hub.context.clone(), (Instant::now(), list.clone()));
     Ok(list)
+}
+
+// MARK: For the Problems scan
+
+/// A hub's Applications are listed for the Problems scans at most this often, however many
+/// clusters are scanned.
+const LEAN_TTL: Duration = Duration::from_secs(60);
+
+/// What the Problems scan reads of an Application: the rest of each one is skipped while the
+/// list is parsed, never held.
+#[derive(Clone, Debug, Default, serde::Deserialize)]
+#[serde(default)]
+pub struct LeanApp {
+    pub metadata: LeanAppMeta,
+    pub spec: LeanAppSpec,
+    pub status: Option<LeanAppStatus>,
+}
+
+#[derive(Clone, Debug, Default, serde::Deserialize)]
+#[serde(default)]
+pub struct LeanAppMeta {
+    pub name: String,
+    pub namespace: String,
+    #[serde(rename = "creationTimestamp")]
+    pub created: Option<String>,
+    #[serde(rename = "deletionTimestamp")]
+    pub deleted: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, serde::Deserialize)]
+#[serde(default)]
+pub struct LeanAppSpec {
+    pub destination: Option<LeanDestination>,
+    #[serde(rename = "syncPolicy")]
+    pub sync_policy: Option<LeanSyncPolicy>,
+}
+
+#[derive(Clone, Debug, Default, serde::Deserialize)]
+#[serde(default)]
+pub struct LeanDestination {
+    pub server: Option<String>,
+    pub name: Option<String>,
+    pub namespace: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, serde::Deserialize)]
+#[serde(default)]
+pub struct LeanSyncPolicy {
+    pub automated: Option<Value>,
+}
+
+#[derive(Clone, Debug, Default, serde::Deserialize)]
+#[serde(default)]
+pub struct LeanAppStatus {
+    pub health: Option<LeanHealth>,
+    #[serde(rename = "operationState")]
+    pub operation: Option<LeanOperation>,
+    pub conditions: Option<Vec<LeanCondition>>,
+}
+
+#[derive(Clone, Debug, Default, serde::Deserialize)]
+#[serde(default)]
+pub struct LeanHealth {
+    pub status: Option<String>,
+    pub message: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, serde::Deserialize)]
+#[serde(default)]
+pub struct LeanOperation {
+    pub phase: Option<String>,
+    pub message: Option<String>,
+    #[serde(rename = "startedAt")]
+    pub started: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, serde::Deserialize)]
+#[serde(default)]
+pub struct LeanCondition {
+    #[serde(rename = "type")]
+    pub kind: Option<String>,
+    pub message: Option<String>,
+}
+
+impl LeanApp {
+    /// Whether auto-sync is on (see `auto_sync`).
+    pub fn automated(&self) -> bool {
+        automated_on(self.spec.sync_policy.as_ref().and_then(|p| p.automated.as_ref()))
+    }
+
+    /// Whether it deploys to the cluster of the context `here` (see `targets_cluster`).
+    pub fn deploys_to(&self, hub: &ContextTarget, here: &ContextTarget) -> bool {
+        let dest = self.spec.destination.as_ref();
+        deploys_to(dest.and_then(|d| d.server.as_deref()), dest.and_then(|d| d.name.as_deref()), hub, here)
+    }
+
+    /// The namespace it deploys into, if it names one.
+    pub fn dest_namespace(&self) -> Option<&str> {
+        self.spec.destination.as_ref()?.namespace.as_deref().filter(|n| !n.is_empty())
+    }
+}
+
+/// What a failed list is kept as: the API's status code, if it answered one (so a refusal
+/// still reads "forbidden"), and the message.
+type LeanFailure = (Option<u16>, String);
+
+type LeanLists = HashMap<String, (Instant, Result<Arc<Vec<LeanApp>>, LeanFailure>)>;
+
+/// Each hub's Applications as the Problems scans read them, or why they could not be, with
+/// when they were listed.
+static LEAN_LISTS: LazyLock<Mutex<LeanLists>> = LazyLock::new(Default::default);
+
+/// How long the Problems scans wait for a hub's Applications. A hub that went dark would
+/// otherwise hold every cluster's scan for the connect deadline and the paged retry after it.
+const LEAN_DEADLINE: Duration = Duration::from_secs(20);
+
+fn lean_failure(e: &anyhow::Error) -> LeanFailure {
+    (super::api_status(e), super::short_error(e))
+}
+
+/// A kept failure as an error the problem scans can name ("forbidden", "failed: ...").
+fn lean_error((code, message): &LeanFailure) -> anyhow::Error {
+    match code {
+        Some(code) => kube::Error::Api(kube::core::Status::failure(message, "").with_code(*code).boxed()).into(),
+        None => anyhow::anyhow!("{message}"),
+    }
+}
+
+/// Every Application on a hub as the Problems scans read them: lean, from the API server's
+/// cache (`resourceVersion=0`, no read of etcd), within `LEAN_DEADLINE`, shared by the scans
+/// of every cluster within `LEAN_TTL`. A failure is kept as long, so the scans of the other
+/// clusters don't each wait for the hub again.
+pub async fn lean_applications(hub: &Hub) -> Result<Arc<Vec<LeanApp>>> {
+    let client = hub.client.clone();
+    let list = super::run_abortable(async move {
+        let list = super::lists::list_lean_cached(client, application_kind().ar, None);
+        match tokio::time::timeout(LEAN_DEADLINE, list).await {
+            Ok(list) => list,
+            Err(_) => anyhow::bail!("Argo CD's cluster did not answer within {}s", LEAN_DEADLINE.as_secs()),
+        }
+    });
+    lean_or_kept(&hub.context, list).await
+}
+
+/// The hub's list kept within `LEAN_TTL`, failed or not; else `list`'s answer, kept. Scans
+/// asking together wait for one list.
+async fn lean_or_kept(hub: &str, list: impl Future<Output = Result<Vec<LeanApp>>>) -> Result<Arc<Vec<LeanApp>>> {
+    static LISTING: LazyLock<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> = LazyLock::new(Default::default);
+    let kept = || {
+        let lists = LEAN_LISTS.lock().unwrap_or_else(PoisonError::into_inner);
+        lists.get(hub).filter(|(at, _)| at.elapsed() < LEAN_TTL).map(|(_, l)| l.clone())
+    };
+    let lock = LISTING.lock().unwrap_or_else(PoisonError::into_inner).entry(hub.to_string()).or_default().clone();
+    let _one = lock.lock().await;
+    if let Some(answer) = kept() {
+        return answer.map_err(|f| lean_error(&f));
+    }
+    let answer = list.await.map(Arc::new).map_err(|e| lean_failure(&e));
+    LEAN_LISTS.lock().unwrap_or_else(PoisonError::into_inner).insert(hub.to_string(), (Instant::now(), answer.clone()));
+    answer.map_err(|f| lean_error(&f))
+}
+
+/// The client a hub was found with this session (see `hubs`), if any.
+pub fn known_client(context: &str) -> Option<Client> {
+    let probes = PROBES.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some(Probe::Serves(client)) = probes.get(context) { Some(client.clone()) } else { None }
+}
+
+/// The hubs the Problems scan of `context` reads: those found this session (by the Argo CD
+/// page or an object's Argo CD section), and `context` itself when it `serves` Applications,
+/// read with its own `client`. Only those set in Settings, when some are. No other context is
+/// asked: a scan in the background never starts a login for a context not logged in this
+/// session, nor reaches a cluster nobody opened.
+/// One context per Argo CD, so an Application is never counted twice.
+pub fn problem_hubs(context: &str, client: &Client, serves: bool) -> Vec<Hub> {
+    let mut found: Vec<Hub> = {
+        let probes = PROBES.lock().unwrap_or_else(PoisonError::into_inner);
+        (probes.iter())
+            .filter(|(c, _)| c.as_str() != context)
+            .filter_map(|(c, p)| {
+                if let Probe::Serves(client) = p {
+                    Some(Hub { context: c.clone(), client: client.clone() })
+                } else {
+                    None
+                }
+            })
+            .collect()
+    };
+    if serves || known_client(context).is_some() {
+        found.push(Hub { context: context.to_string(), client: client.clone() });
+    }
+    let (chosen, servers) = crate::settings::with(|s| (s.argocd_contexts.clone(), s.argocd_servers.clone()));
+    if !chosen.is_empty() {
+        found.retain(|h| chosen.contains(&h.context));
+    }
+    if found.is_empty() {
+        return found;
+    }
+    // The cluster scanned first, with its own client.
+    found.sort_by_cached_key(|h| (h.context != context, h.context.clone()));
+    let targets = targets();
+    let (mut instances, mut clusters) = (std::collections::HashSet::new(), Vec::<ContextTarget>::new());
+    found.retain(|h| {
+        let t = target(&targets, &h.context);
+        let new = !clusters.iter().any(|c| same_cluster(c, &t))
+            && instances.insert(grouping::hub_instance(&h.context, &servers));
+        clusters.push(t);
+        new
+    });
+    found
 }
 
 async fn get_application(hub: &Hub, ns: &str, name: &str) -> Result<Value> {
@@ -1308,6 +1533,39 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// A hub that failed is answered from the kept failure within `LEAN_TTL`, without asking
+    /// it again, and a refusal still reads "forbidden". After the TTL it is asked again.
+    #[test]
+    fn a_failed_hub_list_is_kept() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let asked = AtomicUsize::new(0);
+        let refused = || async {
+            asked.fetch_add(1, Ordering::SeqCst);
+            let status = kube::core::Status::failure("applications is forbidden", "Forbidden").with_code(403);
+            Err::<Vec<LeanApp>, anyhow::Error>(kube::Error::Api(status.boxed()).into())
+        };
+        let hub = "a-failed-hub-list-is-kept";
+        futures::executor::block_on(async {
+            for _ in 0..3 {
+                let e = lean_or_kept(hub, refused()).await.unwrap_err();
+                assert_eq!(crate::k8s::lists::load_error(&e), "forbidden");
+            }
+            assert_eq!(asked.load(Ordering::SeqCst), 1);
+            // Kept longer than the TTL: asked again, and a list is kept the same way.
+            let old = Instant::now().checked_sub(LEAN_TTL + Duration::from_secs(1)).unwrap();
+            LEAN_LISTS.lock().unwrap().get_mut(hub).unwrap().0 = old;
+            let one = || async {
+                asked.fetch_add(1, Ordering::SeqCst);
+                Ok(vec![LeanApp::default()])
+            };
+            assert_eq!(lean_or_kept(hub, one()).await.unwrap().len(), 1);
+            assert_eq!(lean_or_kept(hub, refused()).await.unwrap().len(), 1);
+            assert_eq!(asked.load(Ordering::SeqCst), 2);
+        });
+        let e = lean_error(&(None, "did not answer".into()));
+        assert_eq!(crate::k8s::lists::load_error(&e), "failed: did not answer");
+    }
+
     fn endpoint(url: &str) -> Arc<api::Endpoint> {
         Arc::new(api::Endpoint {
             server: server::Server::parse(url).unwrap(),
@@ -1501,11 +1759,11 @@ mod tests {
         assert!(!targets_cluster(&to(json!({"name": "staging"})), &hub, &prod));
         assert!(!targets_cluster(&json!({}), &hub, &prod));
         // A name of Argo CD's own (a cluster Secret's) can't be told from another cluster's.
-        assert_eq!(deploys_to(&to(json!({"name": "staging"})), &hub, &prod), None);
-        assert_eq!(deploys_to(&to(json!({"name": "prod"})), &hub, &prod), Some(true));
-        assert_eq!(deploys_to(&to(json!({"name": "in-cluster"})), &hub, &prod), Some(false));
-        assert_eq!(deploys_to(&to(json!({"server": "https://other.example"})), &hub, &prod), Some(false));
-        assert_eq!(deploys_to(&json!({}), &hub, &prod), Some(false));
+        assert_eq!(app_deploys_to(&to(json!({"name": "staging"})), &hub, &prod), None);
+        assert_eq!(app_deploys_to(&to(json!({"name": "prod"})), &hub, &prod), Some(true));
+        assert_eq!(app_deploys_to(&to(json!({"name": "in-cluster"})), &hub, &prod), Some(false));
+        assert_eq!(app_deploys_to(&to(json!({"server": "https://other.example"})), &hub, &prod), Some(false));
+        assert_eq!(app_deploys_to(&json!({}), &hub, &prod), Some(false));
     }
 
     #[test]

@@ -177,7 +177,7 @@ impl KubeMcp {
             };
             let hub_target = argo::target(&targets, hub);
             for app in apps {
-                let here = argo::deploys_to(&app, &hub_target, &here);
+                let here = argo::app_deploys_to(&app, &hub_target, &here);
                 let tracks = argo::resource_of(&app, &key.group, &key.kind, &key.namespace, &key.name).is_some();
                 found.push(Candidate { hub: hub.clone(), app, here, tracks });
             }
@@ -399,7 +399,7 @@ struct Candidate {
     hub: String,
     app: Value,
     /// It deploys to the object's cluster; None when that can't be told (a destination named
-    /// as an Argo CD cluster Secret is, see `argo::deploys_to`).
+    /// as an Argo CD cluster Secret is, see `argo::app_deploys_to`).
     here: Option<bool>,
     /// Its `status.resources` lists the object.
     tracks: bool,

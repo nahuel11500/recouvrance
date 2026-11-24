@@ -131,12 +131,19 @@ impl Found {
     /// What could not be read, as "Pods (forbidden), Alerts (failed: …)"; None when
     /// everything was.
     pub fn skipped(&self) -> Option<String> {
+        self.skipped_where(|_| true)
+    }
+
+    /// `skipped` of the entries `keep` keeps ("Pods (forbidden)"): an agent is told only of
+    /// what its rules let it see.
+    pub fn skipped_where(&self, keep: impl Fn(&str) -> bool) -> Option<String> {
         let mut parts: Vec<&Part> = self.parts.values().map(AsRef::as_ref).collect();
         parts.sort_by_key(|p| p.order);
         let mut all: Vec<String> = parts.iter().flat_map(|p| p.skipped.iter().cloned()).collect();
         if let Some(alerts) = &self.alerts {
             all.extend(Scan { problems: Vec::new(), skipped: crate::alerts::skipped(alerts) }.skipped_parts());
         }
+        all.retain(|s| keep(s));
         (!all.is_empty()).then(|| all.join(", "))
     }
 
@@ -337,7 +344,9 @@ fn update(scope: &Scope, change: impl FnOnce(&mut Found)) {
 async fn run(scope: Scope, ask: Ask, judged_since: Option<Instant>, mut finish: Finish) {
     let Ask { client, kinds, record } = ask;
     let context = record.then_some(scope.context.as_str());
-    let jobs = super::jobs(&client, &kinds, &scope.namespaces, context, judged_since);
+    let mut jobs = super::jobs(&client, &kinds, &scope.namespaces, context, judged_since);
+    // Argo CD Applications deploying here, read on their hubs (no request when none is known).
+    jobs.push(super::argo_apps::job(&scope.context, &client, &kinds, &scope.namespaces));
     finish.checks = Some(jobs.iter().map(|(name, _)| Arc::from(name.as_str())).collect());
     let checks = async {
         let mut running: futures::stream::FuturesUnordered<_> = (jobs.into_iter().enumerate())
@@ -426,6 +435,7 @@ mod tests {
             name: name.into(),
             reason: "broken".into(),
             age: None,
+            on_hub: None,
         }
     }
 

@@ -66,9 +66,11 @@ requests start again, and after that many seconds the run prints the requests an
 kind, the heaviest requests, and the process's memory (`VmRSS`, `VmHWM`).
 
 **Smoke checks**: `RECOUVRANCE_SMOKE=<context> cargo run --features dev` lists types and watches
-pods; add `RECOUVRANCE_LISTTIME=1`, `RECOUVRANCE_PROBLEMS=1` (the Problems scan's time and, on
-Linux, the process's peak memory; `RECOUVRANCE_PROBLEMS=kinds` runs each kind's check alone, with
-its own peak; `RECOUVRANCE_PROBLEMS=twice` runs two scans in a row, each with its time, requests and
+pods in every namespace: when the list is complete and live (`listed at=`), it prints what the
+requests read so far and the peak memory (Linux); add `RECOUVRANCE_LISTTIME=1`, `RECOUVRANCE_PROBLEMS=1` (the Problems scan's time and, on
+Linux, the process's peak memory, the Argo CD Applications deploying there included;
+`RECOUVRANCE_PROBLEMS=kinds` runs each kind's check alone, then the Argo CD one, each with its own
+peak; `RECOUVRANCE_PROBLEMS=twice` runs two scans in a row, each with its time, requests and
 bytes), `RECOUVRANCE_EVENTS=<seconds>` (the Timeline's "All events" on every namespace for
 that long, then what it cost), or dry runs such as `RECOUVRANCE_NODESHELLDRY=<node>` (see
 `src/dev/smoke.rs`).
