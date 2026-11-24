@@ -45,6 +45,8 @@ const MAX_EVENT: usize = 32 * 1024 * 1024;
 const HISTORY: usize = 5;
 /// Projects asked one by one for their sync windows, at most, when they can't be listed.
 const MAX_PROJECTS: usize = 50;
+/// How often the projects' sync windows are read again while a feed follows its stream.
+const PROJECTS_EVERY: Duration = Duration::from_secs(5 * 60);
 
 /// The fields of an Application the page reads; the rest is not sent (`fields`).
 const APP_FIELDS: [&str; 20] = [
@@ -96,6 +98,8 @@ pub struct Endpoint {
     pub login: Result<(Token, Login), String>,
     /// Read on the Argo CD page (Settings → Argo CD turns it off).
     pub on: bool,
+    /// A token is set for it in Settings, expired or not (it can be forgotten).
+    pub settings_token: bool,
 }
 
 impl Endpoint {
@@ -117,6 +121,19 @@ impl Endpoint {
     fn conn(&self) -> Result<Conn, String> {
         let (token, _) = self.login.clone()?;
         Ok(Conn { server: self.server.clone(), token, insecure: self.insecure })
+    }
+
+    /// What its feed is kept under: its address, and a hash of its login and settings, so a
+    /// new login (`argocd login` again, a token set) starts a new feed. Never the token.
+    fn feed_key(&self) -> String {
+        use std::hash::{Hash as _, Hasher as _};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        match &self.login {
+            Ok((t, how)) => (&t.0, how.text()).hash(&mut h),
+            Err(e) => e.hash(&mut h),
+        }
+        self.insecure.hash(&mut h);
+        format!("{}#{:x}", self.server.base, h.finish())
     }
 }
 
@@ -195,15 +212,20 @@ fn login_of(settings: Option<&str>, cli: Option<&str>, name: &str, now: i64) -> 
 /// The servers from the CLI's config (`cli`: its text, or why it couldn't be read; None:
 /// there is none), the addresses set in Settings and their tokens (or why the tokens file
 /// couldn't be read: then none of them is used), less those turned off. One endpoint per
-/// server: the CLI's current context first, then the first context naming it.
+/// server: the CLI's current context first, then the first context naming it. When the
+/// settings (`settings_ok`) couldn't be read, which servers are off is unknown: all are.
 fn endpoints_from(
     cli: Option<Result<String, String>>,
     settings: &[String],
     tokens: Result<BTreeMap<String, String>, String>,
     off: &[String],
+    settings_ok: bool,
     now: i64,
 ) -> Endpoints {
     let mut out = Endpoints::default();
+    if !settings_ok {
+        out.errors.push("settings.json can't be read: the Argo CD servers are off until it can".into());
+    }
     let mut cli_tokens: HashMap<String, Option<String>> = HashMap::new();
     let mut entries = match cli {
         Some(Ok(text)) => cli_entries(&text).unwrap_or_else(|e| {
@@ -236,6 +258,7 @@ fn endpoints_from(
             insecure: e.insecure,
             login: Err(String::new()),
             on: true,
+            settings_token: false,
         });
     }
     for text in settings {
@@ -249,6 +272,7 @@ fn endpoints_from(
                     insecure: false,
                     login: Err(String::new()),
                     on: true,
+                    settings_token: false,
                 }),
             },
             Err(e) => out.errors.push(format!("Settings → Argo CD: {e}")),
@@ -262,7 +286,8 @@ fn endpoints_from(
             // Not knowing which token Settings has, none is used: not even the CLI's.
             Err(e) => Err(format!("The Argo CD tokens file can't be read ({e}): set the token again")),
         };
-        x.on = !off.contains(&x.server.base);
+        x.on = settings_ok && !off.contains(&x.server.base);
+        x.settings_token = tokens.as_ref().is_ok_and(|t| t.get(&x.server.base).is_some_and(|t| !t.trim().is_empty()));
     }
     out
 }
@@ -314,7 +339,17 @@ pub fn endpoints() -> Endpoints {
         Err(e) => Some(Err(format!("{}: {e}", path.display()))),
     };
     let (settings, off) = crate::settings::with(|s| (s.argocd_api_servers.clone(), s.argocd_api_off.clone()));
-    endpoints_from(cli, &settings, read_tokens(), &off, jiff::Timestamp::now().as_second())
+    let settings_ok = crate::settings::load_error().is_none();
+    endpoints_from(cli, &settings, read_tokens(), &off, settings_ok, jiff::Timestamp::now().as_second())
+}
+
+/// When the argocd CLI's config and the tokens file last changed (and their sizes): a page
+/// compares it each second, to notice a new `argocd login` without being told.
+pub fn config_stamp() -> Vec<Option<(std::time::SystemTime, u64)>> {
+    [server::cli_config_path(), tokens_path()]
+        .iter()
+        .map(|p| std::fs::metadata(p).ok().and_then(|m| Some((m.modified().ok()?, m.len()))))
+        .collect()
 }
 
 // MARK: HTTP
@@ -380,7 +415,20 @@ impl rustls::client::danger::ServerCertVerifier for AnyCertificate {
     }
 }
 
+/// The client for servers whose certificate is checked, or not (`insecure`): made once, its
+/// connections kept for the next requests (each server's own).
 fn http_client(insecure: bool) -> anyhow::Result<HttpClient> {
+    static CLIENTS: LazyLock<Mutex<HashMap<bool, HttpClient>>> = LazyLock::new(Default::default);
+    let mut clients = CLIENTS.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some(c) = clients.get(&insecure) {
+        return Ok(c.clone());
+    }
+    let client = build_client(insecure)?;
+    clients.insert(insecure, client.clone());
+    Ok(client)
+}
+
+fn build_client(insecure: bool) -> anyhow::Result<HttpClient> {
     let mut http = hyper_util::client::legacy::connect::HttpConnector::new();
     http.enforce_http(false);
     http.set_connect_timeout(Some(CONNECT_TIMEOUT));
@@ -465,19 +513,20 @@ impl Conn {
         self.call(http::Method::GET, path, None).await
     }
 
-    /// Open the application stream after `resource_version`: its body, read as it comes,
-    /// with the client that holds its connection.
-    async fn stream(&self, resource_version: Option<&str>) -> Result<(HttpClient, hyper::body::Incoming), Failure> {
+    /// Open the application stream: its body, read as it comes. Argo CD subscribes it to
+    /// every change, then sends each Application as ADDED, then the changes: nothing is
+    /// missed from the moment it is open. Its answer may wait for the first event.
+    async fn stream(&self) -> Result<hyper::body::Incoming, Failure> {
         let fail = |status: Option<u16>, text: String| Failure { status, text: scrub(&text, &self.token.0) };
         let client = http_client(self.insecure).map_err(|e| fail(None, format!("{e:#}")))?;
-        let url = format!("{}{}", self.server.base, stream_path(resource_version));
+        let url = format!("{}{}", self.server.base, stream_path());
         let req = http::Request::get(&url)
             .header("user-agent", "recouvrance")
             .header("accept", "text/event-stream")
             .header("authorization", format!("Bearer {}", self.token.0))
             .body(Full::new(Bytes::new()))
             .map_err(|e| fail(None, e.to_string()))?;
-        let resp = tokio::time::timeout(server::TIMEOUT, client.request(req))
+        let resp = tokio::time::timeout(IDLE, client.request(req))
             .await
             .map_err(|_| fail(None, format!("Argo CD at {} did not open its stream", self.server.name())))?
             .map_err(|e| {
@@ -492,7 +541,7 @@ impl Conn {
             };
             return Err(fail(Some(parts.status.as_u16()), server::refusal(parts.status, &text, &self.server)));
         }
-        Ok((client, body))
+        Ok(body)
     }
 }
 
@@ -505,9 +554,8 @@ fn list_path() -> String {
     format!("/api/v1/applications?fields=metadata.resourceVersion,{}", fields("items."))
 }
 
-fn stream_path(resource_version: Option<&str>) -> String {
-    let after = resource_version.map_or_default(|rv| format!("resourceVersion={}&", encode(rv)));
-    format!("/api/v1/stream/applications?{after}fields=result.type,{}", fields("result.application."))
+fn stream_path() -> String {
+    format!("/api/v1/stream/applications?fields=result.type,{}", fields("result.application."))
 }
 
 fn app_path(namespace: &str, name: &str) -> String {
@@ -641,6 +689,9 @@ pub(super) enum Event {
 #[derive(Default)]
 pub(super) struct Sse {
     buf: Vec<u8>,
+    /// The start of `buf` known to hold no line break: a long line coming in many reads is
+    /// scanned once, not again on each.
+    scanned: usize,
     data: String,
     has_data: bool,
 }
@@ -650,9 +701,11 @@ impl Sse {
         self.buf.extend_from_slice(bytes);
         let mut out = Vec::new();
         let mut start = 0;
-        while let Some(end) = self.buf[start..].iter().position(|b| *b == b'\n').map(|i| start + i) {
+        let mut from = self.scanned;
+        while let Some(end) = self.buf[from..].iter().position(|b| *b == b'\n').map(|i| from + i) {
             let line = String::from_utf8_lossy(&self.buf[start..end]).into_owned();
             start = end + 1;
+            from = start;
             let line = line.strip_suffix('\r').unwrap_or(&line);
             if line.is_empty() {
                 if std::mem::take(&mut self.has_data) {
@@ -678,6 +731,7 @@ impl Sse {
             }
         }
         self.buf.drain(..start);
+        self.scanned = self.buf.len();
         if self.buf.len() + self.data.len() > MAX_EVENT {
             return Err(format!("an event of the stream is larger than {} MB", MAX_EVENT / (1024 * 1024)));
         }
@@ -801,9 +855,10 @@ impl Drop for Watch {
     }
 }
 
-/// Hold the feed of `endpoint`, starting it if none runs.
+/// Hold the feed of `endpoint`, starting it if none runs. Feeds are kept by server, login
+/// and config generation: a new login or a change in Settings starts a new one.
 pub fn watch(endpoint: &Endpoint) -> Watch {
-    let key = format!("{}#{}", endpoint.server.base, generation());
+    let key = format!("{}#{}", endpoint.feed_key(), generation());
     let mut feeds = FEEDS.lock().unwrap_or_else(PoisonError::into_inner);
     let feed = feeds.entry(key.clone()).or_insert_with(|| {
         let state = Arc::new(Mutex::new(FeedState::default()));
@@ -818,8 +873,16 @@ fn lock(state: &Mutex<FeedState>) -> std::sync::MutexGuard<'_, FeedState> {
     state.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// A server's feed: list, read the sync windows, follow the stream; again after a backoff
-/// when it ends. A refused login stops it until the config changes.
+/// How a round of a feed ended.
+enum Ended {
+    /// The stream ended or went silent, as streams do: opened again, nothing to show.
+    Routine(String),
+    /// The list or the stream failed: said on the page.
+    Failed(Failure),
+}
+
+/// A server's feed: open the stream, list, follow; again after a backoff when it ends. A
+/// refused login stops it until the login or the config changes.
 async fn feed(endpoint: Endpoint, state: Arc<Mutex<FeedState>>) {
     let conn = match endpoint.conn() {
         Ok(c) => c,
@@ -832,14 +895,23 @@ async fn feed(endpoint: Endpoint, state: Arc<Mutex<FeedState>>) {
     let mut backoff = BACKOFF;
     loop {
         let started = Instant::now();
-        let failure = follow(&conn, &state).await;
-        {
+        let ended = follow(&conn, &state).await;
+        let refused = {
             let mut s = lock(&state);
             s.live = false;
-            s.error = Some(failure.text.clone());
-        }
+            match ended {
+                Ended::Routine(_) => {
+                    s.error = None;
+                    false
+                }
+                Ended::Failed(f) => {
+                    s.error = Some(f.text);
+                    f.status == Some(401)
+                }
+            }
+        };
         changed();
-        if matches!(failure.status, Some(401)) {
+        if refused {
             return;
         }
         if started.elapsed() >= STEADY {
@@ -850,14 +922,79 @@ async fn feed(endpoint: Endpoint, state: Arc<Mutex<FeedState>>) {
     }
 }
 
-/// One round: list, read the windows, then follow the stream until it ends. What ended it.
-async fn follow(conn: &Conn, state: &Mutex<FeedState>) -> Failure {
+/// The list, with the changes the stream sent while it was read applied after it, in their
+/// order: those older than what the list has are left (`apply`), a deletion removes.
+pub(super) fn settle(listed: Apps, sent: Vec<Event>) -> Apps {
+    let mut apps = listed;
+    for event in sent {
+        apply(&mut apps, event);
+    }
+    apps
+}
+
+/// What the stream's reader passes on: events, or how the stream ended.
+type Batch = Result<Vec<Event>, Ended>;
+
+/// Read the stream and pass its events on, in order, until it ends.
+async fn read_stream(conn: Conn, state: Arc<Mutex<FeedState>>, out: tokio::sync::mpsc::Sender<Batch>) {
+    let mut body = match conn.stream().await {
+        Ok(body) => body,
+        Err(f) => {
+            let _ = out.send(Err(Ended::Failed(f))).await;
+            return;
+        }
+    };
+    lock(&state).live = true;
+    changed();
+    let mut sse = Sse::default();
+    let routine = |text: &str| Ended::Routine(text.to_string());
+    let failed = |text: String| Ended::Failed(Failure { status: None, text: scrub(&text, &conn.token.0) });
+    let ended = loop {
+        let frame = match tokio::time::timeout(IDLE, body.frame()).await {
+            Err(_) => break routine("the stream was silent for 15 min"),
+            Ok(None) => break routine("the stream ended"),
+            Ok(Some(Err(e))) => break routine(&format!("the stream broke: {e}")),
+            Ok(Some(Ok(frame))) => frame,
+        };
+        let Some(data) = frame.data_ref() else { continue };
+        let events = match sse.push(data) {
+            Ok(events) => events,
+            Err(e) => break failed(e),
+        };
+        let mut batch = Vec::with_capacity(events.len());
+        let mut bad = None;
+        for data in events {
+            match parse_event(&data) {
+                Ok(Some(event)) => batch.push(event),
+                Ok(None) => {}
+                Err(e) => {
+                    bad = Some(e);
+                    break;
+                }
+            }
+        }
+        if !batch.is_empty() && out.send(Ok(batch)).await.is_err() {
+            return;
+        }
+        if let Some(e) = bad {
+            break failed(e);
+        }
+    };
+    let _ = out.send(Err(ended)).await;
+}
+
+/// One round: open the stream first, so every change from then on is in it; list; apply what
+/// the stream sent meanwhile over the list; then follow the stream. The sync windows are read
+/// beside it, again every `PROJECTS_EVERY`. What ended it.
+async fn follow(conn: &Conn, state: &Arc<Mutex<FeedState>>) -> Ended {
+    // Changes pile up here while the list is read (bounded: the stream waits when it's full).
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Batch>(1024);
+    let _stream = crate::k8s::spawn_guarded(read_stream(conn.clone(), state.clone(), tx));
     let list = match conn.get(&list_path()).await {
         Ok(v) => v,
-        Err(f) => return f,
+        Err(f) => return Ended::Failed(f),
     };
-    let version = list.pointer("/metadata/resourceVersion").and_then(Value::as_str).map(String::from);
-    let apps: Apps = list
+    let listed: Apps = list
         .get("items")
         .and_then(Value::as_array)
         .into_iter()
@@ -867,89 +1004,82 @@ async fn follow(conn: &Conn, state: &Mutex<FeedState>) -> Failure {
         .map(|a| (a.key(), Arc::new(a)))
         .collect();
     drop(list);
-    let projects: Vec<String> = {
-        let mut p: Vec<String> = apps.values().map(|a| a.summary.project.clone()).collect();
-        p.sort();
-        p.dedup();
-        p
-    };
+    let mut sent = Vec::new();
+    while let Ok(batch) = rx.try_recv() {
+        match batch {
+            Ok(events) => sent.extend(events),
+            Err(ended) => return ended,
+        }
+    }
     {
         let mut s = lock(state);
-        s.apps = apps;
+        s.apps = settle(listed, sent);
         s.listed = true;
         s.error = None;
     }
     changed();
-    let windows = read_windows(conn, projects).await;
-    lock(state).projects = Some(windows.map(Arc::new));
-    changed();
-    let (_client, mut body) = match conn.stream(version.as_deref()).await {
-        Ok(open) => open,
-        Err(f) => return f,
-    };
-    lock(state).live = true;
-    changed();
-    let mut sse = Sse::default();
-    let ended = |text: String| Failure { status: None, text: scrub(&text, &conn.token.0) };
+    let _windows = crate::k8s::spawn_guarded(keep_windows(conn.clone(), state.clone()));
     loop {
-        let frame = match tokio::time::timeout(IDLE, body.frame()).await {
-            Err(_) => return ended("the stream was silent for 15 min: opened again".into()),
-            Ok(None) => return ended("the stream ended: opened again".into()),
-            Ok(Some(Err(e))) => return ended(format!("the stream broke: {e}")),
-            Ok(Some(Ok(frame))) => frame,
-        };
-        let Some(data) = frame.data_ref() else { continue };
-        let events = match sse.push(data) {
-            Ok(events) => events,
-            Err(e) => return ended(e),
-        };
-        if events.is_empty() {
-            continue;
-        }
-        let mut s = lock(state);
-        for data in events {
-            match parse_event(&data) {
-                Ok(Some(event)) => apply(&mut s.apps, event),
-                Ok(None) => {}
-                Err(e) => return ended(e),
+        match rx.recv().await {
+            Some(Ok(events)) => {
+                let mut s = lock(state);
+                for event in events {
+                    apply(&mut s.apps, event);
+                }
+                drop(s);
+                changed();
             }
+            Some(Err(ended)) => return ended,
+            None => return Ended::Routine("the stream ended".into()),
         }
-        drop(s);
+    }
+}
+
+/// Read the projects' sync windows now and every `PROJECTS_EVERY` while the feed follows.
+async fn keep_windows(conn: Conn, state: Arc<Mutex<FeedState>>) {
+    loop {
+        let projects: Vec<String> = {
+            let s = lock(&state);
+            let mut p: Vec<String> = s.apps.values().map(|a| a.summary.project.clone()).collect();
+            p.sort();
+            p.dedup();
+            p
+        };
+        let windows = read_windows(&conn, projects).await;
+        lock(&state).projects = Some(windows.map(Arc::new));
         changed();
+        tokio::time::sleep(PROJECTS_EVERY).await;
     }
 }
 
 /// Each project's sync windows: one list of the projects, else (when this login may not
-/// list them) each project of the Applications asked for its own windows.
+/// list them) each project of the Applications read on its own (`spec.syncWindows`).
 async fn read_windows(conn: &Conn, projects: Vec<String>) -> Result<BTreeMap<String, Vec<SyncWindow>>, String> {
-    let listed = match conn.get("/api/v1/projects").await {
-        Ok(v) => v,
-        Err(listing) => {
-            let mut out = BTreeMap::new();
-            for p in projects.iter().take(MAX_PROJECTS) {
-                let path = format!("/api/v1/projects/{}/syncwindows", encode(p));
-                match conn.get(&path).await {
-                    Ok(v) => {
-                        out.insert(p.clone(), windows::windows_of(&v));
-                    }
-                    Err(f) => {
-                        return Err(format!("its projects' sync windows can't be read: {} ({})", f.text, listing.text));
-                    }
-                }
-            }
-            if projects.len() > MAX_PROJECTS {
-                return Err(format!("its projects can't be listed, and there are more than {MAX_PROJECTS}"));
-            }
-            return Ok(out);
+    let listing = match conn.get("/api/v1/projects").await {
+        Ok(listed) => {
+            return Ok(listed
+                .get("items")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|p| Some((p.pointer("/metadata/name")?.as_str()?.to_string(), windows::windows_of(p))))
+                .collect());
         }
+        Err(f) => f,
     };
-    Ok(listed
-        .get("items")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|p| Some((p.pointer("/metadata/name")?.as_str()?.to_string(), windows::windows_of(p))))
-        .collect())
+    if projects.len() > MAX_PROJECTS {
+        return Err(format!("its projects can't be listed ({}), and there are more than {MAX_PROJECTS}", listing.text));
+    }
+    let mut out = BTreeMap::new();
+    for p in projects {
+        match conn.get(&format!("/api/v1/projects/{}", encode(&p))).await {
+            Ok(v) => {
+                out.insert(p, windows::windows_of(&v));
+            }
+            Err(f) => return Err(format!("its projects' sync windows can't be read: {} ({})", f.text, listing.text)),
+        }
+    }
+    Ok(out)
 }
 
 // MARK: One-off requests
@@ -985,10 +1115,21 @@ async fn check(conn: &Conn) -> Result<String, Failure> {
     Ok(format!("Logged in as {who}, Argo CD {version}: {} readable", crate::plural::count(n, "Application")))
 }
 
+/// The server at `base` as the config says now: a write goes with the login set now, and not
+/// at all to a server removed or turned off since the page was drawn.
+fn current(base: &str) -> Result<Endpoint, String> {
+    let found = endpoints().list.into_iter().find(|e| e.server.base == base);
+    match found {
+        Some(e) if e.on => Ok(e),
+        Some(_) => Err(format!("{base} is turned off in Settings → Argo CD")),
+        None => Err(format!("{base} is no longer an Argo CD server set or logged in to")),
+    }
+}
+
 /// The Application `namespace/name` as Argo CD has it now, whole (for a confirmation).
 pub async fn read_app(endpoint: Arc<Endpoint>, namespace: String, name: String) -> Result<Value, String> {
     let read = crate::k8s::run_abortable(async move {
-        let conn = match endpoint.conn() {
+        let conn = match current(&endpoint.server.base).and_then(|e| e.conn()) {
             Ok(c) => c,
             Err(e) => return Ok(Err(e)),
         };
@@ -1012,35 +1153,41 @@ pub enum Action {
     },
 }
 
-/// Ask Argo CD for `action` on the Application `namespace/name`, by its API. Refused while
-/// write mode is off, checked as it is sent, as the UI's other writes are.
+/// The request argocd-server's routes take for `action` on the Application `namespace/name`:
+/// method, path and query, body.
+pub(super) fn request(action: &Action, namespace: &str, name: &str) -> (http::Method, String, Option<Value>) {
+    let app = format!("/api/v1/applications/{}", encode(name));
+    let ns = encode(namespace);
+    let body = json!({"name": name, "appNamespace": namespace});
+    match action {
+        Action::Refresh { hard } => {
+            let mode = if *hard { "hard" } else { "normal" };
+            (http::Method::GET, format!("{app}?appNamespace={ns}&refresh={mode}"), None)
+        }
+        Action::Sync => (http::Method::POST, format!("{app}/sync"), Some(body)),
+        Action::Terminate => (http::Method::DELETE, format!("{app}/operation?appNamespace={ns}"), None),
+        Action::Rollback { id } => {
+            let mut body = body;
+            body["id"] = json!(id);
+            (http::Method::POST, format!("{app}/rollback"), Some(body))
+        }
+    }
+}
+
+/// Ask Argo CD for `action` on the Application `namespace/name`, by its API, with the
+/// server's login as the config has it now (`current`). Refused while write mode is off,
+/// checked as it is sent, as the UI's other writes are.
 pub async fn act(endpoint: Arc<Endpoint>, namespace: String, name: String, action: Action) -> Result<String, String> {
     let write = crate::k8s::run_abortable(async move {
-        if !crate::k8s::gate::ui_writes() {
-            return Ok(Err(crate::k8s::gate::WRITES_OFF.to_string()));
-        }
-        let conn = match endpoint.conn() {
+        let conn = match current(&endpoint.server.base).and_then(|e| e.conn()) {
             Ok(c) => c,
             Err(e) => return Ok(Err(e)),
         };
-        let app = format!("/api/v1/applications/{}", encode(&name));
-        let ns = encode(&namespace);
-        let body = json!({"name": name, "appNamespace": namespace});
-        let sent = match &action {
-            Action::Refresh { hard } => {
-                let mode = if *hard { "hard" } else { "normal" };
-                conn.get(&format!("{app}?appNamespace={ns}&refresh={mode}")).await
-            }
-            Action::Sync => conn.call(http::Method::POST, &format!("{app}/sync"), Some(&body)).await,
-            Action::Terminate => {
-                conn.call(http::Method::DELETE, &format!("{app}/operation?appNamespace={ns}"), None).await
-            }
-            Action::Rollback { id } => {
-                let mut body = body.clone();
-                body["id"] = json!(id);
-                conn.call(http::Method::PUT, &format!("{app}/rollback"), Some(&body)).await
-            }
-        };
+        if !crate::k8s::gate::ui_writes() {
+            return Ok(Err(crate::k8s::gate::WRITES_OFF.to_string()));
+        }
+        let (method, path, body) = request(&action, &namespace, &name);
+        let sent = conn.call(method, &path, body.as_ref()).await;
         Ok(sent
             .map(|_| match &action {
                 Action::Refresh { hard: false } => format!("Argo CD refreshes {name}"),
@@ -1056,7 +1203,9 @@ pub async fn act(endpoint: Arc<Endpoint>, namespace: String, name: String, actio
 
 #[cfg(test)]
 mod tests {
-    use super::{Event, Sse, apply, endpoints_from, lean, list_path, parse_event, stream_path};
+    use super::{
+        Action, Event, Sse, apply, endpoints_from, lean, list_path, parse_event, request, settle, stream_path,
+    };
     use crate::k8s::argo::server::Login;
     use base64::Engine as _;
     use serde_json::{Value, json};
@@ -1113,7 +1262,7 @@ users:
 
     #[test]
     fn the_cli_config_gives_one_server_per_address() {
-        let e = endpoints_from(Some(Ok(CLI.into())), &[], Ok(BTreeMap::new()), &[], 100);
+        let e = endpoints_from(Some(Ok(CLI.into())), &[], Ok(BTreeMap::new()), &[], true, 100);
         let bases: Vec<&str> = e.list.iter().map(|x| x.server.base.as_str()).collect();
         // The current context first; core mode has no API server.
         assert_eq!(
@@ -1132,7 +1281,7 @@ users:
 
     #[test]
     fn no_token_is_ever_printed() {
-        let e = endpoints_from(Some(Ok(CLI.into())), &[], Ok(BTreeMap::new()), &[], 100);
+        let e = endpoints_from(Some(Ok(CLI.into())), &[], Ok(BTreeMap::new()), &[], true, 100);
         let shown = format!("{e:?}");
         for secret in ["dev-token-secret", "prod-token-secret", "prod-again-token-secret"] {
             assert!(!shown.contains(secret), "{shown}");
@@ -1147,7 +1296,7 @@ users:
         tokens.insert("https://extra.example.com".to_string(), jwt(50));
         let settings = ["argocd.example.com".to_string(), "https://extra.example.com/".into(), "ftp://x".into()];
         let off = ["http://localhost:8080".to_string()];
-        let e = endpoints_from(Some(Ok(CLI.into())), &settings, Ok(tokens), &off, 100);
+        let e = endpoints_from(Some(Ok(CLI.into())), &settings, Ok(tokens), &off, true, 100);
         let prod = &e.list[0];
         assert!(prod.in_settings && prod.cli_context.is_some());
         assert!(matches!(&prod.login, Ok((_, Login::Settings))));
@@ -1155,19 +1304,54 @@ users:
         assert!(extra.login.as_ref().is_err_and(|why| why.contains("expired")));
         assert!(!e.list.iter().find(|x| x.server.base == "http://localhost:8080").unwrap().on);
         assert!(e.errors.iter().any(|x| x.starts_with("Settings")));
+        // A token set here, even expired, can be forgotten; the CLI's alone can't.
+        assert!(prod.settings_token && extra.settings_token);
+        assert!(!e.list.iter().find(|x| x.server.base.contains("argocd-dev")).unwrap().settings_token);
     }
 
     #[test]
     fn config_that_does_not_read_fails_closed() {
         // A CLI config that doesn't parse gives no server, and says so.
-        let e = endpoints_from(Some(Ok("contexts: [".into())), &[], Ok(BTreeMap::new()), &[], 100);
+        let e = endpoints_from(Some(Ok("contexts: [".into())), &[], Ok(BTreeMap::new()), &[], true, 100);
         assert!(e.list.is_empty() && e.errors.len() == 1);
-        let e = endpoints_from(Some(Err("permission denied".into())), &[], Ok(BTreeMap::new()), &[], 100);
+        let e = endpoints_from(Some(Err("permission denied".into())), &[], Ok(BTreeMap::new()), &[], true, 100);
         assert!(e.list.is_empty() && e.errors[0].contains("permission denied"));
         // A tokens file that doesn't read: no token is used, not even the CLI's.
-        let e = endpoints_from(Some(Ok(CLI.into())), &[], Err("bad json".into()), &[], 100);
+        let e = endpoints_from(Some(Ok(CLI.into())), &[], Err("bad json".into()), &[], true, 100);
         assert!(e.list.iter().all(|x| x.login.is_err()));
-        assert_eq!(endpoints_from(None, &[], Ok(BTreeMap::new()), &[], 100).list.len(), 0);
+        assert_eq!(endpoints_from(None, &[], Ok(BTreeMap::new()), &[], true, 100).list.len(), 0);
+        // settings.json unreadable: which servers are off is unknown, so all are.
+        let e = endpoints_from(Some(Ok(CLI.into())), &[], Ok(BTreeMap::new()), &[], false, 100);
+        assert!(!e.list.is_empty() && e.list.iter().all(|x| !x.on));
+        assert!(e.errors.iter().any(|x| x.contains("settings.json")));
+    }
+
+    #[test]
+    fn each_action_is_the_request_argo_cd_routes() {
+        let req = |a: Action| {
+            let (m, path, body) = request(&a, "team a", "web");
+            (m.to_string(), path, body)
+        };
+        let get = |path: &str| ("GET".to_string(), path.to_string(), None);
+        assert_eq!(
+            req(Action::Refresh { hard: false }),
+            get("/api/v1/applications/web?appNamespace=team%20a&refresh=normal")
+        );
+        assert_eq!(
+            req(Action::Refresh { hard: true }),
+            get("/api/v1/applications/web?appNamespace=team%20a&refresh=hard")
+        );
+        let body = json!({"name": "web", "appNamespace": "team a"});
+        assert_eq!(req(Action::Sync), ("POST".into(), "/api/v1/applications/web/sync".into(), Some(body)));
+        assert_eq!(
+            req(Action::Terminate),
+            ("DELETE".into(), "/api/v1/applications/web/operation?appNamespace=team%20a".into(), None)
+        );
+        let body = json!({"name": "web", "appNamespace": "team a", "id": 7});
+        assert_eq!(
+            req(Action::Rollback { id: 7 }),
+            ("POST".into(), "/api/v1/applications/web/rollback".into(), Some(body))
+        );
     }
 
     #[test]
@@ -1178,8 +1362,9 @@ users:
             "{list}"
         );
         assert!(list.contains("items.status.health") && !list.contains("status.resources"), "{list}");
-        let stream = stream_path(Some("123"));
-        assert!(stream.starts_with("/api/v1/stream/applications?resourceVersion=123&fields=result.type,"), "{stream}");
+        // No resource version: Argo CD then sends every Application first, after subscribing.
+        let stream = stream_path();
+        assert!(stream.starts_with("/api/v1/stream/applications?fields=result.type,"), "{stream}");
         assert!(stream.contains("result.application.status.sync"), "{stream}");
     }
 
@@ -1268,5 +1453,35 @@ users:
                 .is_err_and(|e| e.contains("permission denied"))
         );
         assert!(parse_event("not json").is_err());
+    }
+
+    #[test]
+    fn changes_sent_while_listing_land_over_the_list() {
+        // The stream is open before the list is read: what it sent meanwhile is applied after
+        // the list, in order, the newer of the two winning.
+        let up = |a: Value| Event::Upsert(Box::new(super::ApiApp::of(&a)));
+        let listed: super::Apps = [app("web", "6", json!({})), app("api", "5", json!({})), app("old", "3", json!({}))]
+            .iter()
+            .map(|a| {
+                let a = super::ApiApp::of(a);
+                (a.key(), std::sync::Arc::new(a))
+            })
+            .collect();
+        let mut newer = app("web", "7", json!({}));
+        newer["status"]["health"]["status"] = json!("Degraded");
+        let sent = vec![
+            // The stream's first ADDED of an Application, older than the list's: left.
+            up(app("api", "4", json!({}))),
+            up(newer),
+            Event::Deleted { namespace: "argocd".into(), name: "old".into() },
+            // Added and deleted while listing: gone.
+            up(app("tmp", "8", json!({}))),
+            Event::Deleted { namespace: "argocd".into(), name: "tmp".into() },
+        ];
+        let apps = settle(listed, sent);
+        let key = |n: &str| ("argocd".to_string(), n.to_string());
+        assert_eq!(apps.len(), 2);
+        assert_eq!(apps[&key("web")].summary.health, "Degraded");
+        assert_eq!(apps[&key("api")].value.pointer("/metadata/resourceVersion"), Some(&json!("5")));
     }
 }

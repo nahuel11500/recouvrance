@@ -242,17 +242,25 @@ tokens file that doesn't read gives no token at all (not even the CLI's), each s
 Argo CD and above the list. An expired token is said before anything is sent. Errors never show a
 token, and a token is only sent to its server, over https, without following redirects.
 
-Each server is listed once (`GET /api/v1/applications`, with `fields` so only what the page
-shows is sent), then followed on `/api/v1/stream/applications` (server-sent events), from the
-list's resource version. A stream that ends, breaks or stays silent 15 minutes is opened again
-after a backoff of 1 s doubling to 60 s (back to 1 s once one stayed open a minute), listing
-again first; a refused login stops until the config changes. The page holds the feeds while a
+Each server's application stream (`/api/v1/stream/applications`, server-sent events, with
+`fields` so only what the page shows is sent) is opened first: Argo CD subscribes it to every
+change before anything else. Then the Applications are listed (`GET /api/v1/applications`, with
+`fields`), and what the stream sent meanwhile is applied over the list in order, the newer of the
+two winning (by resource version) and a deletion removing: nothing changed between the list and
+the stream is lost. A stream that ends, breaks or stays silent 15 minutes is opened again after a
+backoff of 1 s doubling to 60 s (back to 1 s once one stayed open a minute), listing again; that
+is routine and not shown as an error, while a list or a stream that can't be opened is. A refused
+login stops until the login or the config changes: a new `argocd login`, or a token set in
+Settings, is noticed within a second while the page is shown. The page holds the feeds while a
 window shows it, shared by every window, and lets them go when none does. Only the fields shown
 are kept, so memory stays small however many Applications there are. The projects' sync windows
-are read with one `GET /api/v1/projects` (or `GET /api/v1/projects/{name}/syncwindows` for each
-project, up to 50, when they can't be listed). Reading needs `applications, get` and
-`projects, get`; the row menu's actions need what Argo CD's own UI would (`applications, sync`
-and so on).
+are read beside the stream, and again every 5 minutes: one `GET /api/v1/projects`, or, when they
+can't be listed, `GET /api/v1/projects/{name}` (its `spec.syncWindows`) for each project of the
+Applications, up to 50. Reading needs `applications, get` and `projects, get`; the row menu's
+actions need what Argo CD's own UI would (`applications, sync` and so on). An action is sent with
+the server's login as the config has it then, and not at all to a server removed or turned off
+since the list was drawn. When settings.json can't be read, every server is off (which were
+turned off is unknown).
 
 An Application read by the API and by its hub is the same one when the hub's Argo CD server set
 in Settings → Per cluster (`argocd_servers`) is that API server, and its namespace and name are

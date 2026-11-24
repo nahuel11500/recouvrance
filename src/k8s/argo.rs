@@ -1057,7 +1057,7 @@ pub struct Fleet {
 
 impl Fleet {
     /// When the next sync of `a` can start, from `now`, under its project's sync windows.
-    pub fn next_sync(&self, a: &FleetApp, now: jiff::Timestamp) -> windows::NextSync {
+    pub fn next_sync(&self, a: &FleetApp, plan: &mut windows::Planner) -> windows::NextSync {
         let all = match self.projects.get(&a.instance) {
             None => return windows::NextSync::Unknown("its project's sync windows are not read yet".into()),
             Some(Err(e)) => return windows::NextSync::Unknown(e.clone()),
@@ -1070,7 +1070,7 @@ impl Fleet {
         let applying: Vec<&windows::SyncWindow> =
             all.iter().filter(|w| w.applies(&s.name, &s.dest_namespace, &s.dest_server, &s.dest_name)).collect();
         // Auto-sync is held by every window; a manual sync goes through those that allow it.
-        windows::next_sync(&applying, !s.automated, now)
+        plan.next_sync(&applying, !s.automated)
     }
 }
 
@@ -1087,15 +1087,23 @@ async fn read_fleet(connected: Vec<(String, Client)>) -> Fleet {
     let hubs = hubs(connected).await;
     let targets = targets();
     let servers = crate::settings::with(|s| s.argocd_servers.clone());
-    let lists =
-        futures::future::join_all(hubs.found.iter().map(|hub| async move { (hub, applications(hub).await) })).await;
+    let lists = futures::future::join_all(
+        hubs.found.iter().map(|hub| async move { (hub, futures::join!(applications(hub), projects(hub))) }),
+    )
+    .await;
     let mut fleet = Fleet {
         errors: hubs.failed.iter().map(|(c, e)| format!("{c}: {e}")).collect(),
         hubs: hubs.found.iter().map(|h| h.context.clone()).collect(),
         not_asked: hubs.not_asked.clone(),
         ..Default::default()
     };
-    for (hub, list) in lists {
+    let mut instances = std::collections::HashSet::new();
+    for (hub, (list, project_windows)) in lists {
+        let instance = grouping::hub_instance(&hub.context, &servers);
+        // Two contexts of one Argo CD (the same server set for both): read once.
+        if !instances.insert(instance.clone()) {
+            continue;
+        }
         let list = match list {
             Ok(list) => list,
             Err(e) => {
@@ -1104,8 +1112,7 @@ async fn read_fleet(connected: Vec<(String, Client)>) -> Fleet {
             }
         };
         let hub_target = target(&targets, &hub.context);
-        let instance = grouping::hub_instance(&hub.context, &servers);
-        fleet.projects.insert(instance.clone(), projects(hub).await);
+        fleet.projects.insert(instance.clone(), project_windows);
         let base = fleet.apps.len();
         for (app, parent) in list.iter().zip(parents(list.as_slice())) {
             let dest = destination(app, &hub_target, &targets);
@@ -1137,7 +1144,8 @@ fn project_kind() -> ApiResource {
 /// How long a hub's projects (their sync windows) are kept before being listed again.
 const PROJECTS_TTL: Duration = Duration::from_secs(300);
 
-/// A hub's projects' sync windows: one list, kept `PROJECTS_TTL`.
+/// A hub's projects' sync windows: one list, kept `PROJECTS_TTL`. When this login may not
+/// list them across namespaces, those of Argo CD's own namespace (where projects live).
 async fn projects(hub: &Hub) -> Result<ProjectWindows, String> {
     type Kept = HashMap<String, (Instant, Result<ProjectWindows, String>)>;
     static KEPT: LazyLock<Mutex<Kept>> = LazyLock::new(Default::default);
@@ -1150,8 +1158,14 @@ async fn projects(hub: &Hub) -> Result<ProjectWindows, String> {
     if let Some(kept) = kept {
         return kept;
     }
-    let read = super::list_values(hub.client.clone(), project_kind(), None, None)
-        .await
+    let all = super::list_values(hub.client.clone(), project_kind(), None, None).await;
+    let listed = match all {
+        Err(e) if super::api_status(&e) == Some(403) => {
+            super::list_values(hub.client.clone(), project_kind(), Some(DEFAULT_NAMESPACE.into()), None).await
+        }
+        other => other,
+    };
+    let read = listed
         .map(|list| {
             let by_name: std::collections::BTreeMap<String, Vec<windows::SyncWindow>> = list
                 .iter()
@@ -1172,9 +1186,15 @@ pub struct ApiRead {
 
 /// Add the Applications read by Argo CD's API to `fleet` (its hubs' already in). One already
 /// there (the same Argo CD, namespace and name: `grouping::merge_plan`) is shown once, as
-/// read on its hub. `targets` are the kubeconfig's contexts, `connected` those connected.
-pub fn add_api(fleet: &mut Fleet, reads: Vec<ApiRead>, targets: &[ContextTarget], connected: &[String]) {
-    let servers = crate::settings::with(|s| s.argocd_servers.clone());
+/// read on its hub. `targets` are the kubeconfig's contexts, `connected` those connected,
+/// `servers` each hub context's Argo CD server (`argocd_servers`).
+pub fn add_api(
+    fleet: &mut Fleet,
+    reads: Vec<ApiRead>,
+    targets: &[ContextTarget],
+    connected: &[String],
+    servers: &std::collections::BTreeMap<String, String>,
+) {
     for read in reads {
         let endpoint = read.endpoint;
         let instance = endpoint.instance();
@@ -1183,8 +1203,12 @@ pub fn add_api(fleet: &mut Fleet, reads: Vec<ApiRead>, targets: &[ContextTarget]
         if let Some(e) = read.state.error.as_ref().filter(|_| !read.state.live) {
             fleet.errors.push(format!("{name}: {e}"));
         }
-        if let Some(p) = read.state.projects {
-            fleet.projects.insert(instance.clone(), p);
+        // The hub's windows, when read, stay: the API's failing doesn't hide them.
+        match (read.state.projects, fleet.projects.get(&instance)) {
+            (Some(Err(_)), Some(Ok(_))) | (None, _) => {}
+            (Some(p), _) => {
+                fleet.projects.insert(instance.clone(), p);
+            }
         }
         // Its own cluster (`in-cluster`) is that of the hub whose Argo CD server it is, if set.
         let hub = servers
@@ -1227,6 +1251,89 @@ pub fn add_api(fleet: &mut Fleet, reads: Vec<ApiRead>, targets: &[ContextTarget]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn endpoint(url: &str) -> Arc<api::Endpoint> {
+        Arc::new(api::Endpoint {
+            server: server::Server::parse(url).unwrap(),
+            cli_context: None,
+            in_settings: true,
+            insecure: false,
+            login: Err("no login in tests".into()),
+            on: true,
+            settings_token: false,
+        })
+    }
+
+    fn api_app(ns: &str, name: &str, tracked_by: Option<&str>) -> Arc<api::ApiApp> {
+        let mut v = json!({"metadata": {"name": name, "namespace": ns}, "spec": {"project": "shop"}});
+        if let Some(parent) = tracked_by {
+            v["metadata"]["annotations"] =
+                json!({TRACKING_ID: format!("{parent}:argoproj.io/Application:{ns}/{name}")});
+        }
+        Arc::new(api::ApiApp { summary: Summary::of(&v), value: v })
+    }
+
+    fn fleet_app(source: &Arc<api::Endpoint>, app: &api::ApiApp) -> FleetApp {
+        FleetApp {
+            source: Source::Api(source.clone()),
+            instance: source.instance(),
+            app: app.summary.clone(),
+            dest: Destination::default(),
+            on: None,
+            parent: None,
+        }
+    }
+
+    #[test]
+    fn applications_read_twice_show_once_under_the_right_parent() {
+        let server = endpoint("https://argocd.example.com");
+        let instance = server.instance();
+        // Already there (as read on its hub): root, with its windows read.
+        let mut fleet = Fleet::default();
+        fleet.apps.push(fleet_app(&server, &api_app("argocd", "root", None)));
+        fleet.projects.insert(instance.clone(), Ok(Arc::new(std::collections::BTreeMap::new())));
+        let mut state = api::FeedState::default();
+        for a in [
+            api_app("argocd", "root", None),
+            api_app("argocd", "child", Some("root")),
+            api_app("argocd", "leaf", Some("child")),
+        ] {
+            state.apps.insert((a.summary.namespace.clone(), a.summary.name.clone()), a);
+        }
+        // The API's windows failed: the hub's stay.
+        state.projects = Some(Err("forbidden".into()));
+        let read = ApiRead { endpoint: server, state };
+        add_api(&mut fleet, vec![read], &[], &[], &Default::default());
+        let names: Vec<&str> = fleet.apps.iter().map(|a| a.app.name.as_str()).collect();
+        assert_eq!(names, ["root", "child", "leaf"]);
+        // child's parent is the root already there; leaf's is child, added.
+        assert_eq!(fleet.apps[1].parent, Some(0));
+        assert_eq!(fleet.apps[2].parent, Some(1));
+        assert!(fleet.projects[&instance].is_ok());
+    }
+
+    #[test]
+    fn the_next_sync_of_an_application_is_manual_when_auto_sync_is_off() {
+        let server = endpoint("https://argocd.example.com");
+        let mut fleet = Fleet::default();
+        let nightly = windows::SyncWindow::of(&json!({"kind": "allow", "schedule": "0 22 * * *", "duration": "1h",
+            "applications": ["*"], "manualSync": true}));
+        let projects: std::collections::BTreeMap<String, Vec<windows::SyncWindow>> =
+            [("shop".to_string(), vec![nightly])].into_iter().collect();
+        fleet.projects.insert(server.instance(), Ok(Arc::new(projects)));
+        let mut by_hand = fleet_app(&server, &api_app("argocd", "web", None));
+        let mut auto = by_hand.clone();
+        auto.app.automated = true;
+        by_hand.app.automated = false;
+        let now: jiff::Timestamp = "2026-11-24T10:00:00Z".parse().unwrap();
+        let mut plan = windows::Planner::new(now);
+        // A manual sync goes through the window's manualSync; auto-sync waits for it to open.
+        assert_eq!(fleet.next_sync(&by_hand, &mut plan), windows::NextSync::Now);
+        assert_eq!(fleet.next_sync(&auto, &mut plan), windows::NextSync::At("2026-11-24T22:00:00Z".parse().unwrap()));
+        // Another project, unread: unknown.
+        auto.app.project = "other".into();
+        assert!(matches!(fleet.next_sync(&auto, &mut plan), windows::NextSync::Unknown(_)));
+    }
 
     fn ctx(name: &str, server: &str, exec: Option<&str>) -> ContextTarget {
         ContextTarget {

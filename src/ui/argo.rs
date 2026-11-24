@@ -25,7 +25,7 @@ use kube::Client;
 use crate::details::{ArgoAction, OpenOn, OpenOnContext, confirm_api_action, confirm_argo_action};
 use crate::k8s::argo::diagnosis::Res;
 use crate::k8s::argo::grouping::{self, AppKey};
-use crate::k8s::argo::windows::NextSync;
+use crate::k8s::argo::windows::{NextSync, Planner};
 use crate::k8s::argo::{self, ApiRead, Fleet, FleetApp, Source, Summary, api};
 use crate::k8s::{self, ObjectRef};
 use crate::overview::column_cell as column;
@@ -294,7 +294,8 @@ struct Rows {
 }
 
 impl Rows {
-    fn new(fleet: Fleet, label_key: &str, now: jiff::Timestamp) -> Self {
+    fn new(fleet: Fleet, label_key: &str, plan: &mut Planner) -> Self {
+        let now = plan.now();
         let apps = &fleet.apps;
         let parents: Vec<Option<usize>> = apps.iter().map(|a| a.parent).collect();
         let labels_of: Vec<String> = apps.iter().map(|a| a.source.label()).collect();
@@ -340,7 +341,7 @@ impl Rows {
         for (_, members) in &mut services {
             members.sort_by(|a, b| cmp(*a, *b));
         }
-        let next = apps.iter().map(|a| fleet.next_sync(a, now)).collect();
+        let next = apps.iter().map(|a| fleet.next_sync(a, plan)).collect();
         Self {
             fleet,
             order,
@@ -393,7 +394,9 @@ const RECOMPUTE: Duration = Duration::from_secs(60);
 pub struct ArgoView {
     clusters: Vec<(String, Client)>,
     /// The hubs' Applications, as last read; None before the first read ends.
-    hub: Option<Fleet>,
+    hub: Option<Arc<Fleet>>,
+    /// When each Application can sync next, kept for a minute (see `rebuild`).
+    plan: Arc<Mutex<Planner>>,
     /// When the hubs' read shown started: an older one finishing later never replaces it.
     hub_started: Option<Instant>,
     /// The API servers' feeds this page holds while it is shown.
@@ -464,6 +467,7 @@ impl ArgoView {
                     break;
                 }
                 let generation = api::generation();
+                let stamp = exec.spawn(async { api::config_stamp() }).await;
                 let endpoints = exec.spawn(async { api::endpoints() }).await;
                 let watches: Vec<api::Watch> = endpoints.list.iter().filter(|e| e.on).map(api::watch).collect();
                 let held = this.update(cx, |this, cx| {
@@ -478,7 +482,9 @@ impl ArgoView {
                 loop {
                     exec.timer(TICK).await;
                     let Ok(shown) = this.update(cx, |_, cx| crate::app::is_visible(cx.entity_id(), cx)) else { return };
-                    if !shown || api::generation() != generation {
+                    // A new `argocd login`, or a token set: read the servers again.
+                    let relogged = exec.spawn(async { api::config_stamp() }).await != stamp;
+                    if !shown || relogged || api::generation() != generation {
                         // Hidden, or the servers changed: the feeds stop unless another page holds them.
                         let _ = this.update(cx, |this, _| this.watches.clear());
                         break;
@@ -494,6 +500,7 @@ impl ArgoView {
         Self {
             clusters,
             hub: None,
+            plan: Arc::new(Mutex::new(Planner::new(jiff::Timestamp::UNIX_EPOCH))),
             hub_started: None,
             watches: Vec::new(),
             config_errors: Vec::new(),
@@ -522,7 +529,7 @@ impl ArgoView {
             return;
         }
         self.hub_started = Some(started);
-        self.hub = Some(fleet);
+        self.hub = Some(Arc::new(fleet));
         self.rebuild(cx);
     }
 
@@ -537,11 +544,12 @@ impl ArgoView {
         let hub = self.hub.clone();
         let connected: Vec<String> = self.clusters.iter().map(|(n, _)| n.clone()).collect();
         let config_errors = self.config_errors.clone();
-        let label_key = crate::settings::with(|s| s.argocd_group_label.clone());
+        let (label_key, servers) = crate::settings::with(|s| (s.argocd_group_label.clone(), s.argocd_servers.clone()));
+        let plan = self.plan.clone();
         let exec = cx.background_executor().clone();
         let work = async move {
             exec.spawn(async move {
-                let mut fleet = hub.unwrap_or_default();
+                let mut fleet = hub.map(|h| (*h).clone()).unwrap_or_default();
                 let reads = feeds
                     .into_iter()
                     .map(|(endpoint, state)| ApiRead {
@@ -549,9 +557,16 @@ impl ArgoView {
                         state: state.lock().unwrap_or_else(PoisonError::into_inner).clone(),
                     })
                     .collect();
-                argo::add_api(&mut fleet, reads, &argo::targets(), &connected);
+                argo::add_api(&mut fleet, reads, &argo::targets(), &connected, &servers);
                 fleet.errors.extend(config_errors);
-                Rows::new(fleet, &label_key, jiff::Timestamp::now())
+                // When each can sync next is worked out anew each minute; in between, the
+                // answers kept are reused (the same windows give the same answer).
+                let mut plan = plan.lock().unwrap_or_else(PoisonError::into_inner);
+                let now = jiff::Timestamp::now();
+                if now.as_second() - plan.now().as_second() >= RECOMPUTE.as_secs() as i64 {
+                    *plan = Planner::new(now);
+                }
+                Rows::new(fleet, &label_key, &mut plan)
             })
             .await
         };

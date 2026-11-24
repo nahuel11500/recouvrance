@@ -8,6 +8,7 @@
 //! the day of week does, unless one of them is `*`: then both must.
 
 use jiff::ToSpan as _;
+use jiff::ZonedDateTime;
 use jiff::civil::Date;
 
 /// A schedule, read once.
@@ -119,8 +120,9 @@ impl Cron {
 
     /// The first time it fires strictly after `after`, in `after`'s time zone. A time a
     /// clock change skips fires when the clock reaches it again (as jiff resolves the gap);
-    /// None when it never fires within five years (`0 0 30 2 *`).
-    pub fn next_after(&self, after: &jiff::Zoned) -> Option<jiff::Zoned> {
+    /// None when it never fires within five years (`0 0 30 2 *`). It jumps to the next month,
+    /// hour and minute the schedule names rather than stepping through the minutes.
+    pub fn next_after(&self, after: &ZonedDateTime) -> Option<ZonedDateTime> {
         let tz = after.time_zone().clone();
         let start = after.datetime();
         let mut t = start.date().at(start.hour(), start.minute(), 0, 0).checked_add(1.minute()).ok()?;
@@ -129,29 +131,91 @@ impl Cron {
             if t.year() > last_year {
                 return None;
             }
-            if self.months & (1 << t.month()) == 0 {
-                t = t.date().first_of_month().checked_add(1.month()).ok()?.at(0, 0, 0, 0);
+            let d = t.date();
+            if u64::from(self.months) & (1 << t.month()) == 0 {
+                t = match first_from(u64::from(self.months), t.month() + 1, 12) {
+                    Some(m) => Date::new(d.year(), m, 1).ok()?.at(0, 0, 0, 0),
+                    None => Date::new(d.year().checked_add(1)?, 1, 1).ok()?.at(0, 0, 0, 0),
+                };
                 continue;
             }
-            if !self.day_matches(t.date()) {
-                t = t.date().tomorrow().ok()?.at(0, 0, 0, 0);
+            if !self.day_matches(d) {
+                t = d.tomorrow().ok()?.at(0, 0, 0, 0);
                 continue;
             }
-            if self.hours & (1 << t.hour()) == 0 {
-                t = t.date().at(t.hour(), 0, 0, 0).checked_add(1.hour()).ok()?;
+            let Some(h) = first_from(u64::from(self.hours), t.hour(), 23) else {
+                t = d.tomorrow().ok()?.at(0, 0, 0, 0);
+                continue;
+            };
+            if h != t.hour() {
+                t = d.at(h, 0, 0, 0);
                 continue;
             }
-            if self.minutes & (1 << t.minute()) == 0 {
-                t = t.checked_add(1.minute()).ok()?;
+            let Some(m) = first_from(self.minutes, t.minute(), 59) else {
+                t = d.at(h, 0, 0, 0).checked_add(1.hour()).ok()?;
                 continue;
-            }
-            let at = tz.to_zoned(t).ok()?;
+            };
+            let at = tz.to_zoned_datetime(d.at(h, m, 0, 0)).ok()?;
             if at.timestamp() > after.timestamp() {
                 return Some(at);
             }
-            t = t.checked_add(1.minute()).ok()?;
+            t = d.at(h, m, 0, 0).checked_add(1.minute()).ok()?;
         }
     }
+
+    /// The last time it fired strictly before `before`, in `before`'s time zone: as
+    /// `next_after`, going back (up to five years).
+    pub fn prev_before(&self, before: &ZonedDateTime) -> Option<ZonedDateTime> {
+        let tz = before.time_zone().clone();
+        let start = before.datetime();
+        let mut t = start.date().at(start.hour(), start.minute(), 0, 0);
+        let first_year = start.year().saturating_sub(YEARS_AHEAD);
+        loop {
+            if t.year() < first_year {
+                return None;
+            }
+            let d = t.date();
+            let day_end = |d: Date| d.at(23, 59, 0, 0);
+            if u64::from(self.months) & (1 << t.month()) == 0 {
+                t = match last_from(u64::from(self.months), t.month() - 1, 1) {
+                    Some(m) => day_end(Date::new(d.year(), m, 1).ok()?.last_of_month()),
+                    None => day_end(Date::new(d.year().checked_sub(1)?, 12, 31).ok()?),
+                };
+                continue;
+            }
+            if !self.day_matches(d) {
+                t = day_end(d.yesterday().ok()?);
+                continue;
+            }
+            let Some(h) = last_from(u64::from(self.hours), t.hour(), 0) else {
+                t = day_end(d.yesterday().ok()?);
+                continue;
+            };
+            if h != t.hour() {
+                t = d.at(h, 59, 0, 0);
+                continue;
+            }
+            let Some(m) = last_from(self.minutes, t.minute(), 0) else {
+                t = if h == 0 { day_end(d.yesterday().ok()?) } else { d.at(h - 1, 59, 0, 0) };
+                continue;
+            };
+            let at = tz.to_zoned_datetime(d.at(h, m, 0, 0)).ok()?;
+            if at.timestamp() < before.timestamp() {
+                return Some(at);
+            }
+            t = d.at(h, m, 0, 0).checked_sub(1.minute()).ok()?;
+        }
+    }
+}
+
+/// The lowest value of `bits` from `from` up to `to`.
+fn first_from(bits: u64, from: i8, to: i8) -> Option<i8> {
+    (from.max(0)..=to).find(|v| bits & (1 << v) != 0)
+}
+
+/// The highest value of `bits` from `from` down to `to`.
+fn last_from(bits: u64, from: i8, to: i8) -> Option<i8> {
+    (to..=from).rev().find(|v| bits & (1 << v) != 0)
 }
 
 #[cfg(test)]
@@ -161,8 +225,56 @@ mod tests {
     use jiff::tz::TimeZone;
 
     fn next(cron: &str, from: jiff::civil::DateTime) -> Option<jiff::civil::DateTime> {
-        let at = TimeZone::UTC.to_zoned(from).unwrap();
+        let at = TimeZone::UTC.to_zoned_datetime(from).unwrap();
         Cron::parse(cron).unwrap().next_after(&at).map(|z| z.datetime())
+    }
+
+    fn prev(cron: &str, from: jiff::civil::DateTime) -> Option<jiff::civil::DateTime> {
+        let at = TimeZone::UTC.to_zoned_datetime(from).unwrap();
+        Cron::parse(cron).unwrap().prev_before(&at).map(|z| z.datetime())
+    }
+
+    #[test]
+    fn the_last_time_it_fired_reads_back() {
+        let from = date(2026, 11, 24).at(10, 30, 0, 0); // a Tuesday
+        // Strictly before: 10:30 itself doesn't count.
+        assert_eq!(prev("* * * * *", from), Some(date(2026, 11, 24).at(10, 29, 0, 0)));
+        assert_eq!(prev("0 22 * * *", from), Some(date(2026, 11, 23).at(22, 0, 0, 0)));
+        assert_eq!(prev("*/15 * * * *", from), Some(date(2026, 11, 24).at(10, 15, 0, 0)));
+        assert_eq!(prev("0 9 * * MON-FRI", date(2026, 11, 30).at(8, 0, 0, 0)), Some(date(2026, 11, 27).at(9, 0, 0, 0)));
+        assert_eq!(prev("0 0 1 jan *", from), Some(date(2026, 1, 1).at(0, 0, 0, 0)));
+        assert_eq!(prev("30 4 31 * *", from), Some(date(2026, 10, 31).at(4, 30, 0, 0)));
+        assert_eq!(prev("0 0 30 2 *", from), None);
+        // Going forward then back lands where it started, for any schedule.
+        for cron in ["* * * * *", "5 */3 * * *", "0 9 * * 1-5", "0 0 1,15 * *", "@monthly"] {
+            let at = TimeZone::UTC.to_zoned_datetime(from).unwrap();
+            let c = Cron::parse(cron).unwrap();
+            let next = c.next_after(&at).unwrap();
+            let back = c.prev_before(&next).unwrap();
+            assert!(back.timestamp() <= at.timestamp(), "{cron}");
+            assert_eq!(c.next_after(&back).unwrap().timestamp(), next.timestamp(), "{cron}");
+        }
+    }
+
+    #[test]
+    fn a_clock_change_moves_the_time_it_fires() {
+        // Europe/Paris springs forward at 02:00 on 2026-03-29: 02:00 is 03:00 that day.
+        let Ok(paris) = TimeZone::get("Europe/Paris") else {
+            eprintln!("no time zone database: skipped");
+            return;
+        };
+        let c = Cron::parse("0 2 * * *").unwrap();
+        let at = paris.to_zoned_datetime(date(2026, 3, 28).at(12, 0, 0, 0)).unwrap();
+        let next = c.next_after(&at).unwrap();
+        assert_eq!(next.timestamp(), "2026-03-29T01:00:00Z".parse::<jiff::Timestamp>().unwrap());
+        let after = c.next_after(&next).unwrap();
+        assert_eq!(after.timestamp(), "2026-03-30T00:00:00Z".parse::<jiff::Timestamp>().unwrap());
+        // 09:00 in Paris is 08:00 UTC before the change and 07:00 after.
+        let nine = Cron::parse("0 9 * * *").unwrap();
+        let before = paris.to_zoned_datetime(date(2026, 3, 28).at(0, 0, 0, 0)).unwrap();
+        assert_eq!(nine.next_after(&before).unwrap().timestamp().to_string(), "2026-03-28T08:00:00Z");
+        let after = paris.to_zoned_datetime(date(2026, 3, 29).at(4, 0, 0, 0)).unwrap();
+        assert_eq!(nine.next_after(&after).unwrap().timestamp().to_string(), "2026-03-29T07:00:00Z");
     }
 
     #[test]

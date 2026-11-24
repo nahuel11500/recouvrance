@@ -270,10 +270,13 @@
 - **Argo CD by its API**: Applications are read from Argo CD's own API, with the argocd CLI's
   login (`argocd login`, its contexts, servers and tokens; `--insecure`, `--plaintext` to this
   machine and `--grpc-web-root-path` are honoured, `--core` contexts have no server) or a token
-  set in Settings → Argo CD. One list (`GET /api/v1/applications`, only the fields the page shows),
-  then Argo CD's application stream keeps them live, opened again with a backoff (1 s doubling to
-  60 s) when it ends: nothing is polled, and nothing is read while no window shows the page. The
-  sync windows come from one list of the projects (or each project's, when they can't be listed).
+  set in Settings → Argo CD. Argo CD's application stream is opened first, then one list (`GET
+  /api/v1/applications`, only the fields the page shows), what the stream sent meanwhile applied
+  over it: no change is lost between the two. The stream keeps them live, opened again with a
+  backoff (1 s doubling to 60 s) when it ends: nothing is polled, and nothing is read while no
+  window shows the page. The sync windows come from one list of the projects, read again every 5
+  minutes (or each project, when they can't be listed). *Next sync* is worked out once a minute,
+  once for each set of windows.
   A row's click opens the Application in Argo CD's web UI; its menu's *Refresh*, *Hard refresh*,
   *Sync* (of the whole Application, with its own sync options), *Terminate* and *Roll back* go
   through the same API, need write mode when they are sent, and are confirmed like a protected

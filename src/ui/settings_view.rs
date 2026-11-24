@@ -86,6 +86,8 @@ pub struct SettingsView {
     /// Each server's connection test, by address: running (None), or what it found.
     argo_api_tests: std::collections::HashMap<String, Option<Result<String, String>>>,
     _argo_api_test_tasks: std::collections::HashMap<String, Task<()>>,
+    /// Reads the servers off the UI thread.
+    argo_api_read: crate::latest::Latest,
     /// A server to add: its address, and a token (never shown back).
     argo_api_url: Entity<InputState>,
     argo_api_token: Entity<InputState>,
@@ -249,6 +251,7 @@ impl SettingsView {
             argo_api: Default::default(),
             argo_api_tests: Default::default(),
             _argo_api_test_tasks: Default::default(),
+            argo_api_read: Default::default(),
             argo_api_url,
             argo_api_token,
             argo_api_error: None,
@@ -282,20 +285,25 @@ impl SettingsView {
         }));
         this.sync_clusters(window, cx);
         if this.section == Section::ArgoCd {
-            this.reload_argo_api();
+            this.reload_argo_api(cx);
         }
         this
     }
 
-    /// Read the Argo CD API servers again (the argocd CLI's config, the tokens file).
-    fn reload_argo_api(&mut self) {
-        self.argo_api = crate::k8s::argo::api::endpoints();
+    /// Read the Argo CD API servers again (the argocd CLI's config, the tokens file), off the
+    /// UI thread; a read again replaces the one running.
+    fn reload_argo_api(&mut self, cx: &mut Context<Self>) {
+        let read = cx.background_executor().spawn(async { crate::k8s::argo::api::endpoints() });
+        self.argo_api_read.spawn(cx, read, |this, found, cx| {
+            this.argo_api = found;
+            cx.notify();
+        });
     }
 
     /// The servers changed: the Argo CD page reads them anew, and this list too.
     fn argo_api_changed(&mut self, cx: &mut Context<Self>) {
         crate::k8s::argo::api::reload();
-        self.reload_argo_api();
+        self.reload_argo_api(cx);
         cx.notify();
     }
 
@@ -615,7 +623,7 @@ impl SettingsView {
             self.sync_clusters(window, cx);
         }
         if section == Section::ArgoCd {
-            self.reload_argo_api();
+            self.reload_argo_api(cx);
         }
         self.reload_fields(window, cx);
         cx.notify();
@@ -1095,7 +1103,8 @@ impl SettingsView {
                         Some(Err(why)) => (why.clone(), theme.danger),
                     });
                     let (b_on, b_test, b_rm) = (base.clone(), e.clone(), base.clone());
-                    let settings_token = matches!(&e.login, Ok((_, crate::k8s::argo::server::Login::Settings)));
+                    // A token set here, expired or not, can be forgotten (the CLI's is used then).
+                    let settings_token = e.settings_token;
                     let b_forget = base.clone();
                     v_flex()
                         .gap_1()

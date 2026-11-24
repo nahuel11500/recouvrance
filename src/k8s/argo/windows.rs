@@ -10,6 +10,9 @@
 //! windows, none being open blocks it (a manual sync goes when one of them has `manualSync`);
 //! else it can sync.
 
+use std::collections::HashMap;
+use std::sync::Arc;
+
 use jiff::Timestamp;
 use jiff::tz::TimeZone;
 use serde_json::Value;
@@ -18,11 +21,11 @@ use crate::cron::Cron;
 
 /// How far ahead the next time an Application can sync is looked for.
 pub const HORIZON_DAYS: i64 = 8;
-/// The most openings of one window worked out (a window opening every minute).
-const MAX_OPENINGS: usize = 20_000;
+/// The most times asked of a window's schedule (see `openings`).
+const MAX_STEPS: usize = 50_000;
 
 /// One sync window of a project.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct SyncWindow {
     /// `allow`; anything else is read as `deny`, the stricter.
     pub allow: bool,
@@ -154,6 +157,7 @@ impl NextSync {
 }
 
 /// When a window is open, as `[start, end)` in seconds, sorted and merged.
+#[derive(Debug)]
 struct Openings {
     allow: bool,
     manual_sync: bool,
@@ -167,6 +171,11 @@ impl Openings {
     }
 }
 
+/// When `w` is open from `from` to `to` (seconds). Each step asks the schedule for one
+/// time: the first opening from `from`, then the last one before it closes (a later opening
+/// keeps it open longer), then the first one after: openings inside a span are jumped over,
+/// so a window opening every minute for a day costs a few steps per day, not one per minute.
+/// At most `MAX_STEPS`, then it says so.
 fn openings(w: &SyncWindow, from: i64, to: i64) -> Result<Openings, String> {
     let cron = Cron::parse(&w.schedule).map_err(|e| format!("sync window schedule: {e}"))?;
     let duration =
@@ -175,70 +184,137 @@ fn openings(w: &SyncWindow, from: i64, to: i64) -> Result<Openings, String> {
         "" | "UTC" | "Etc/UTC" => TimeZone::UTC,
         name => TimeZone::get(name).map_err(|_| format!("sync window time zone `{name}` is unknown"))?,
     };
-    let start = Timestamp::from_second(from - duration).map_err(|e| e.to_string())?.to_zoned(tz);
+    let zoned = |t: i64| Timestamp::from_second(t).map(|t| t.to_zoned_datetime(tz.clone())).map_err(|e| e.to_string());
+    let too_many = || format!("sync window `{}` opens too often to work out", w.schedule);
     let mut spans: Vec<(i64, i64)> = Vec::new();
-    let mut at = start;
-    while let Some(next) = cron.next_after(&at) {
-        let s = next.timestamp().as_second();
-        if s > to || spans.len() >= MAX_OPENINGS {
+    let mut steps = 0usize;
+    // The first opening still open at `from`, or after it.
+    let mut at = zoned(from - duration)?;
+    while let Some(first) = cron.next_after(&at) {
+        let start = first.timestamp().as_second();
+        if start > to {
             break;
         }
-        match spans.last_mut() {
-            Some(last) if s <= last.1 => last.1 = last.1.max(s + duration),
-            _ => spans.push((s, s + duration)),
+        let mut end = start + duration;
+        while end <= to {
+            steps += 1;
+            if steps > MAX_STEPS {
+                return Err(too_many());
+            }
+            match cron.prev_before(&zoned(end)?).map(|p| p.timestamp().as_second() + duration) {
+                Some(later) if later > end => end = later,
+                _ => break,
+            }
         }
-        at = next;
+        match spans.last_mut() {
+            Some(last) if start <= last.1 => last.1 = last.1.max(end),
+            _ => spans.push((start, end)),
+        }
+        if end > to {
+            break;
+        }
+        steps += 1;
+        if steps > MAX_STEPS {
+            return Err(too_many());
+        }
+        // Every opening before `end` is in the span: the next starts at `end` or after.
+        at = zoned(end - 1)?;
     }
     Ok(Openings { allow: w.allow, manual_sync: w.manual_sync, spans })
 }
 
 /// Whether a sync can start at `t`, by Argo CD's rule (see the module).
-fn can_sync(all: &[Openings], manual: bool, t: i64) -> bool {
-    let open: Vec<&Openings> = all.iter().filter(|o| o.open_at(t)).collect();
-    let denies: Vec<&&Openings> = open.iter().filter(|o| !o.allow).collect();
+fn can_sync(all: &[Arc<Openings>], manual: bool, t: i64) -> bool {
+    let open: Vec<&Arc<Openings>> = all.iter().filter(|o| o.open_at(t)).collect();
+    let denies: Vec<&&Arc<Openings>> = open.iter().filter(|o| !o.allow).collect();
     if !denies.is_empty() {
         return manual && denies.iter().all(|o| o.manual_sync);
     }
     if open.iter().any(|o| o.allow) {
         return true;
     }
-    let allows: Vec<&Openings> = all.iter().filter(|o| o.allow).collect();
+    let allows: Vec<&Arc<Openings>> = all.iter().filter(|o| o.allow).collect();
     if !allows.is_empty() {
         return manual && allows.iter().any(|o| o.manual_sync);
     }
     true
 }
 
-/// When a sync can start next, from `now`, under the windows that apply to the Application:
-/// a manual one (`manual`), or one auto-sync starts. Looked for within `HORIZON_DAYS`.
-pub fn next_sync(windows: &[&SyncWindow], manual: bool, now: Timestamp) -> NextSync {
-    if windows.is_empty() {
-        return NextSync::NoWindow;
+/// Works out when Applications can sync next, as of one moment: each window's openings once,
+/// and each answer once per set of windows and kind of sync, however many Applications share
+/// them. Made anew when that moment is too old (the page does each minute); a project's
+/// windows changing are other windows, so they are worked out anew.
+pub struct Planner {
+    now: Timestamp,
+    openings: HashMap<SyncWindow, Result<Arc<Openings>, String>>,
+    answers: HashMap<(Vec<SyncWindow>, bool), NextSync>,
+}
+
+impl Planner {
+    pub fn new(now: Timestamp) -> Self {
+        Self { now, openings: HashMap::new(), answers: HashMap::new() }
     }
-    let from = now.as_second();
-    let to = from + HORIZON_DAYS * 86_400;
-    let all: Vec<Openings> = match windows.iter().map(|w| openings(w, from, to)).collect() {
-        Ok(all) => all,
-        Err(e) => return NextSync::Unknown(e),
-    };
+
+    /// The moment its answers are for.
+    pub fn now(&self) -> Timestamp {
+        self.now
+    }
+
+    /// When a sync can start next under `windows` (those that apply to the Application): a
+    /// manual one (`manual`), or one auto-sync starts. Looked for within `HORIZON_DAYS`.
+    pub fn next_sync(&mut self, windows: &[&SyncWindow], manual: bool) -> NextSync {
+        if windows.is_empty() {
+            return NextSync::NoWindow;
+        }
+        let key = (windows.iter().map(|w| (*w).clone()).collect::<Vec<_>>(), manual);
+        if let Some(known) = self.answers.get(&key) {
+            return known.clone();
+        }
+        let from = self.now.as_second();
+        let to = from + HORIZON_DAYS * 86_400;
+        let mut all = Vec::with_capacity(windows.len());
+        let mut failed = None;
+        for w in windows {
+            let o = self.openings.entry((*w).clone()).or_insert_with(|| openings(w, from, to).map(Arc::new));
+            match o {
+                Ok(o) => all.push(o.clone()),
+                Err(e) => failed = Some(e.clone()),
+            }
+        }
+        let next = match failed {
+            Some(e) => NextSync::Unknown(e),
+            None => earliest(&all, manual, from, to),
+        };
+        self.answers.insert(key, next.clone());
+        next
+    }
+}
+
+/// The first time from `from` to `to` a sync can start.
+fn earliest(all: &[Arc<Openings>], manual: bool, from: i64, to: i64) -> NextSync {
+    if can_sync(all, manual, from) {
+        return NextSync::Now;
+    }
     // Whether it can sync only changes where a window opens or closes.
     let mut times: Vec<i64> =
         all.iter().flat_map(|o| o.spans.iter().flat_map(|(s, e)| [*s, *e])).filter(|t| *t > from && *t <= to).collect();
     times.sort_unstable();
     times.dedup();
-    if can_sync(&all, manual, from) {
-        return NextSync::Now;
-    }
     times
         .into_iter()
-        .find(|t| can_sync(&all, manual, *t))
+        .find(|t| can_sync(all, manual, *t))
         .and_then(|t| Timestamp::from_second(t).ok())
         .map_or(NextSync::NotSoon, NextSync::At)
 }
 
+/// When a sync can start next, from `now`, under `windows` (see `Planner::next_sync`).
+pub fn next_sync(windows: &[&SyncWindow], manual: bool, now: Timestamp) -> NextSync {
+    Planner::new(now).next_sync(windows, manual)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{NextSync, SyncWindow, duration_secs, next_sync, windows_of};
+    use super::{NextSync, Planner, SyncWindow, duration_secs, next_sync, openings, windows_of};
     use jiff::Timestamp;
     use serde_json::json;
 
@@ -333,5 +409,50 @@ mod tests {
         // A window naming nothing applies to nothing.
         assert!(!w[3].applies("web", "prod", "https://prod.example", "prod"));
         assert_eq!(windows_of(&json!({"windows": [{"kind": "deny"}]})).len(), 1);
+    }
+
+    #[test]
+    fn a_window_opening_every_minute_is_worked_out_in_few_steps() {
+        // Open for 1000 hours from every minute: one span, not one step per minute.
+        let always = window("deny", "* * * * *", "1000h");
+        let now = at("2026-11-24T10:00:00Z").as_second();
+        let o = openings(&always, now, now + 8 * 86_400).unwrap();
+        assert_eq!(o.spans.len(), 1);
+        assert!(o.spans[0].0 <= now && o.spans[0].1 > now + 8 * 86_400);
+        assert_eq!(next_sync(&[&always], false, at("2026-11-24T10:00:00Z")), NextSync::NotSoon);
+        // Every other minute for one minute: separate spans, each closed.
+        let blink = window("deny", "*/2 * * * *", "1m");
+        let o = openings(&blink, now, now + 3600).unwrap();
+        assert_eq!(o.spans.len(), 31);
+        assert!(o.spans.iter().all(|(s, e)| e - s == 60));
+        assert_eq!(next_sync(&[&blink], false, at("2026-11-24T10:00:30Z")), NextSync::At(at("2026-11-24T10:01:00Z")));
+    }
+
+    #[test]
+    fn a_window_follows_its_time_zone_across_a_clock_change() {
+        if jiff::tz::TimeZone::get("Europe/Paris").is_err() {
+            eprintln!("no time zone database: skipped");
+            return;
+        }
+        let mut nine = window("allow", "0 9 * * *", "1h");
+        nine.time_zone = "Europe/Paris".into();
+        // 09:00 in Paris: 08:00 UTC before 2026-03-29, 07:00 after.
+        assert_eq!(next_sync(&[&nine], false, at("2026-03-28T00:00:00Z")), NextSync::At(at("2026-03-28T08:00:00Z")));
+        assert_eq!(next_sync(&[&nine], false, at("2026-03-29T00:00:00Z")), NextSync::At(at("2026-03-29T07:00:00Z")));
+        assert_eq!(next_sync(&[&nine], false, at("2026-03-29T07:30:00Z")), NextSync::Now);
+    }
+
+    #[test]
+    fn a_planner_answers_once_per_set_of_windows() {
+        let nightly = window("allow", "0 22 * * *", "1h");
+        let mut plan = Planner::new(at("2026-11-24T10:00:00Z"));
+        let first = plan.next_sync(&[&nightly], false);
+        assert_eq!(first, NextSync::At(at("2026-11-24T22:00:00Z")));
+        assert_eq!(plan.next_sync(&[&nightly], false), first);
+        assert_eq!((plan.openings.len(), plan.answers.len()), (1, 1));
+        // A manual sync is another question; the window's openings are reused.
+        plan.next_sync(&[&nightly], true);
+        assert_eq!((plan.openings.len(), plan.answers.len()), (1, 2));
+        assert_eq!(plan.next_sync(&[], false), NextSync::NoWindow);
     }
 }
