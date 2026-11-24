@@ -256,10 +256,11 @@ impl AppView {
         let protected = names.iter().any(|n| crate::settings::is_protected(n));
         let label = match names.len() {
             0 => "Choose a cluster".to_string(),
-            1 => names[0].clone(),
+            1 => crate::k8s::short_names::short_name(&names[0]),
             n => format!("{n} clusters"),
         };
-        Button::new("ctx-trigger").outline().child(
+        // The full names, which the label shortens or counts.
+        Button::new("ctx-trigger").outline().when(!names.is_empty(), |b| b.tooltip(names.join("\n"))).child(
             h_flex()
                 .gap_2()
                 .child(

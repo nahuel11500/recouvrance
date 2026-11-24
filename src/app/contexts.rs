@@ -404,6 +404,7 @@ impl AppView {
         let removed = self.all_contexts.iter().filter(|n| !names.contains(n)).count();
         self.picked.retain(|c| names.contains(c));
         self.all_contexts.clone_from(&names);
+        crate::k8s::short_names::set_contexts(&names);
         self.ctx_picker.update(cx, |p, cx| p.set_all(names, cx));
         self.settings_view.update(cx, |s, cx| s.sync_clusters(window, cx));
         self.agents.update(cx, |a, _| a.refresh_contexts());

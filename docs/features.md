@@ -23,6 +23,13 @@
   or `#`; by its scheme alone when its text holds a `#`, or when the host can't be told from the
   password. Neither shows for any other URL in a connection error, unless its password holds an
   unescaped `/`, `?` or `#` (#1000).
+- **Short context names**: a context named after its cloud cluster shows the cluster's name
+  (`arn:aws:eks:<region>:<account>:cluster/<name>` and `gke_<project>_<zone>_<name>` show
+  `<name>`) in the top bar, the sidebar, the context picker, the Contexts page and the Context
+  column. When two would read the same, the region is added, then the account or project; a
+  short name never reads as another context's name. The full name shows on hover, and the
+  picker's search finds either. Settings, protection, agent rules, kubectl lines and the agents'
+  answers keep the full name.
 - **Reopens where you left off**: each set of contexts keeps its tabs (the list or overview each
   shows, its resource type, namespaces and filter) and each type's filter, and the window keeps
   its place, size and whether it was maximized. On launch the first window reopens there once its
