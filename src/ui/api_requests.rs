@@ -113,7 +113,7 @@ fn share(errors: u64, count: u64) -> String {
 
 fn minute_label(minute: i64) -> String {
     jiff::Timestamp::from_second(minute * 60)
-        .map_or_default(|t| t.to_zoned(jiff::tz::TimeZone::system()).strftime("%H:%M").to_string())
+        .map_or_default(|t| t.to_zoned_datetime(jiff::tz::TimeZone::system()).strftime("%H:%M").to_string())
 }
 
 pub fn render(cx: &App) -> AnyElement {

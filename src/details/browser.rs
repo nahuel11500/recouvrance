@@ -735,7 +735,7 @@ impl FileBrowser {
         }
         let modified = jiff::Timestamp::from_second(e.modified).map_or_else(
             |_| String::new(),
-            |t| t.to_zoned(jiff::tz::TimeZone::system()).strftime("%Y-%m-%d %H:%M").to_string(),
+            |t| t.to_zoned_datetime(jiff::tz::TimeZone::system()).strftime("%Y-%m-%d %H:%M").to_string(),
         );
         h_flex()
             .id(("file", ix))

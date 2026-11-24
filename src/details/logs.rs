@@ -785,7 +785,7 @@ impl LogsView {
             self.dated = false;
             return div().into_any_element();
         };
-        let dated = needs_date(*first, *last, &tz, jiff::Timestamp::now().to_zoned(tz.clone()).date());
+        let dated = needs_date(*first, *last, &tz, jiff::Timestamp::now().to_zoned_datetime(tz.clone()).date());
         let max = buckets.iter().map(|b| b.0).max().unwrap_or(1).max(1) as f32;
         let theme = cx.theme();
         let fmt = |t: jiff::Timestamp| log_time(t, dated, &tz);
@@ -1080,12 +1080,12 @@ fn needs_date(
     tz: &jiff::tz::TimeZone,
     today: jiff::civil::Date,
 ) -> bool {
-    first.to_zoned(tz.clone()).date() != today || last.to_zoned(tz.clone()).date() != today
+    first.to_zoned_datetime(tz.clone()).date() != today || last.to_zoned_datetime(tz.clone()).date() != today
 }
 
 /// A log line's time: `09:33:20`, or `Nov 15 09:33:20` when the lines span other days.
 fn log_time(t: jiff::Timestamp, dated: bool, tz: &jiff::tz::TimeZone) -> String {
-    t.to_zoned(tz.clone()).strftime(if dated { "%b %d %H:%M:%S" } else { "%H:%M:%S" }).to_string()
+    t.to_zoned_datetime(tz.clone()).strftime(if dated { "%b %d %H:%M:%S" } else { "%H:%M:%S" }).to_string()
 }
 
 #[cfg(test)]
