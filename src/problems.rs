@@ -1,6 +1,7 @@
 //! "What is broken?": problems found from kubectl's own tables (cheap even on
 //! very large clusters), for the Problems page and the `find_problems` MCP tool.
 
+pub(crate) mod cronjobs;
 pub(crate) mod references;
 pub mod shared;
 
@@ -154,10 +155,10 @@ pub fn judge(kind: &Kind, defs: &[ColumnDef], row: &Row) -> Option<(Severity, St
 
 /// Kinds checked, in display order. Namespaces, PersistentVolumes and Argo CD Applications
 /// only for deletions stuck; a kind the cluster doesn't serve is left out. The
-/// external-secrets.io ones are judged from their objects (`external_secrets::problems`).
-/// Services, Ingresses and HTTP routes for what they point to that is missing, together
+/// external-secrets.io ones are judged from their objects (`external_secrets::problems`), and
+/// CronJobs too, for when they last ran and succeeded (`cronjobs::problems`). Services, Ingresses and HTTP routes for what they point to that is missing, together
 /// (`references::traffic`).
-pub const CHECKED: [(&str, &str); 16] = [
+pub const CHECKED: [(&str, &str); 17] = [
     ("", "Node"),
     ("", "Namespace"),
     ("apps", "Deployment"),
@@ -165,6 +166,7 @@ pub const CHECKED: [(&str, &str); 16] = [
     ("apps", "DaemonSet"),
     ("", "Pod"),
     ("batch", "Job"),
+    ("batch", "CronJob"),
     ("", "Service"),
     ("networking.k8s.io", "Ingress"),
     (references::GATEWAY, "HTTPRoute"),
@@ -416,6 +418,8 @@ fn kind_jobs(
                     crate::external_secrets::problems(client, &kind, ns)
                         .await
                         .map(|problems| Scan { problems, skipped: Vec::new() })
+                } else if kind.is("batch", "CronJob") {
+                    cronjobs::problems(client, &kind, ns).await.map(|problems| Scan { problems, skipped: Vec::new() })
                 } else if kind.is("", "Service") {
                     Ok(references::traffic(client, &kind, ingress.as_ref(), route.as_ref(), ns, judged_since).await)
                 } else {
