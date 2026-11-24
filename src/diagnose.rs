@@ -471,8 +471,7 @@ fn cause(judged: &[(&Value, Vec<Finding>)], revisions: &[Value]) -> Option<Findi
     use crate::k8s::rollouts::number;
     use crate::plural::{count, pick};
     use std::collections::BTreeSet;
-    let (failing, others): (Vec<&(&Value, Vec<Finding>)>, Vec<_>) =
-        judged.iter().partition(|(p, f)| self::failing(p, f));
+    let (failing, others): (Vec<&(&Value, Vec<Finding>)>, Vec<_>) = judged.iter().partition(|(p, f)| failing(p, f));
     let failing: Vec<&Value> = failing.into_iter().map(|(p, _)| *p).collect();
     if failing.is_empty() {
         return None;
