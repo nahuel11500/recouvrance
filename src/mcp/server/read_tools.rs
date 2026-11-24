@@ -20,6 +20,7 @@ use crate::k8s;
 use crate::k8s::lane::Lane;
 use crate::k8s::{Kind, ObjectRef};
 use crate::mcp::{Mode, PROTECTED, Policy, Verb};
+use crate::problems::argo_apps;
 use crate::problems::shared::{self, Fresh};
 use crate::reachability;
 
@@ -689,7 +690,7 @@ impl KubeMcp {
     }
 
     #[tool(
-        description = "What is broken: crash-looping or pending pods, unavailable Deployments/StatefulSets/DaemonSets, NotReady nodes and nodes a taint keeps pods off because something is wrong (an agent not ready, being removed), failed Jobs, CronJobs that stopped running or whose runs keep failing, pending PVCs, ExternalSecrets and secret stores that fail to sync, Services that select no pod or no ready one, references to objects that don't exist (a pod's ConfigMaps, Secrets and PVCs, a workload's ServiceAccount, a pending PVC's StorageClass, an Ingress's Services, ports and TLS Secrets, an HTTPRoute's Services), objects stuck deleting (Namespaces, PVs, Argo CD Applications too) with the finalizers holding them, and alerts firing in the cluster's Prometheus (not silenced). Worst first. Start here when asked to troubleshoot. Answers from the app's latest scan of the cluster while it is recent, and says how old it is; after a fix, pass max_age_seconds: 0 to check it on a new scan.",
+        description = "What is broken: crash-looping or pending pods, unavailable Deployments/StatefulSets/DaemonSets, NotReady nodes and nodes a taint keeps pods off because something is wrong (an agent not ready, being removed), failed Jobs, CronJobs that stopped running or whose runs keep failing, pending PVCs, ExternalSecrets and secret stores that fail to sync, Services that select no pod or no ready one, references to objects that don't exist (a pod's ConfigMaps, Secrets and PVCs, a workload's ServiceAccount, a pending PVC's StorageClass, an Ingress's Services, ports and TLS Secrets, an HTTPRoute's Services), objects stuck deleting (Namespaces, PVs, Argo CD Applications too) with the finalizers holding them, Argo CD Applications deploying to the cluster that need attention (Degraded, a failed sync, an *Error condition, a sync running for more than 10 minutes, Missing with auto-sync on; listed under the namespace they deploy to, the PROBLEM naming the Application's own namespace and hub to read it with, and shown when your rules let you list Applications there), and alerts firing in the cluster's Prometheus (not silenced). Worst first. Start here when asked to troubleshoot. Answers from the app's latest scan of the cluster while it is recent, and says how old it is; after a fix, pass max_age_seconds: 0 to check it on a new scan.",
         annotations(read_only_hint = true)
     )]
     async fn find_problems(
@@ -718,7 +719,10 @@ impl KubeMcp {
         };
         let ask = || shared::Ask { client: client.clone(), kinds: kinds.to_vec(), record: false };
         let found = shared::fresh(&scope, fresh, Lane::Foreground, ask).await.unwrap_or_default();
-        let skipped = found.skipped().map(|s| format!("Not checked, could not read {s}."));
+        // A hub the agent's rules don't open is not named to it.
+        let skipped = found
+            .skipped_where(|s| argo_apps::skipped_hub(s).is_none_or(|hub| call.policy().context_allowed(hub)))
+            .map(|s| format!("Not checked, could not read {s}."));
         let scanned = found.done.map(|d| {
             let ago = i64::try_from(d.started.elapsed().as_secs()).unwrap_or(i64::MAX);
             format!("From a scan started {} ago; max_age_seconds: 0 scans again.", k8s::duration_text(ago))
@@ -729,7 +733,14 @@ impl KubeMcp {
             .into_iter()
             .filter(|x| minor || x.severity != crate::problems::Severity::Info)
             .filter(|x| {
-                // Only what this agent may see.
+                // Only what this agent may see. An Argo CD Application is read on its hub: the
+                // rules for Applications there decide.
+                if let Some(hub) = &x.on_hub {
+                    let app = k8s::argo::application_kind();
+                    let a =
+                        access_for(&app, &hub.context, Verb::List, Some(hub.namespace.clone()), Some(x.name.clone()));
+                    return problem_visible(call.policy(), call.approved_rules(), false, &a);
+                }
                 k8s::find_kind(&kinds, &x.kind).is_some_and(|k| {
                     let a = access_for(k, &p.context, Verb::List, x.namespace.clone(), Some(x.name.clone()));
                     problem_visible(call.policy(), call.approved_rules(), k.is("", "Pod"), &a)
@@ -737,12 +748,20 @@ impl KubeMcp {
             })
             .take(200)
             .map(|x| {
+                // An Application is listed under where it deploys: say where it lives, to read it.
+                let reason = match &x.on_hub {
+                    Some(on) => {
+                        let reason = x.reason.strip_suffix(&argo_apps::hub_note(&on.context)).unwrap_or(&x.reason);
+                        format!("{reason} ({})", argo_apps::location(on, &x.name))
+                    }
+                    None => x.reason,
+                };
                 vec![
                     format!("{:?}", x.severity).to_uppercase(),
                     x.label,
                     x.namespace.unwrap_or_default(),
                     x.name,
-                    x.reason,
+                    reason,
                     x.age.map_or_default(k8s::age),
                 ]
             })
