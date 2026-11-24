@@ -6,6 +6,8 @@ pub mod shared;
 
 pub(crate) use references::WITH_SERVICES;
 
+use std::time::Instant;
+
 use kube::Client;
 
 use crate::k8s::{self, ColumnDef, Kind, Row};
@@ -384,8 +386,15 @@ pub type Job = (String, futures::future::BoxFuture<'static, Scan>);
 
 /// The checks of a scan of a cluster (or one namespace), one a kind: a kind refused (403)
 /// does not hide the others. `context`: the app's own scans name it, for the timeline (see
-/// `scan_kind`).
-fn kind_jobs(client: &Client, kinds: &[Kind], namespace: Option<&str>, context: Option<&str>) -> Vec<Job> {
+/// `scan_kind`). `judged_since`: no Service keeps a verdict judged before (see
+/// `references::traffic`).
+fn kind_jobs(
+    client: &Client,
+    kinds: &[Kind],
+    namespace: Option<&str>,
+    context: Option<&str>,
+    judged_since: Option<Instant>,
+) -> Vec<Job> {
     use futures::FutureExt as _;
     let with_services = references::with_services(kinds);
     CHECKED
@@ -408,7 +417,7 @@ fn kind_jobs(client: &Client, kinds: &[Kind], namespace: Option<&str>, context: 
                         .await
                         .map(|problems| Scan { problems, skipped: Vec::new() })
                 } else if kind.is("", "Service") {
-                    Ok(references::traffic(client, &kind, ingress.as_ref(), route.as_ref(), ns).await)
+                    Ok(references::traffic(client, &kind, ingress.as_ref(), route.as_ref(), ns, judged_since).await)
                 } else {
                     scan_kind(client, kind, ns, context).await
                 };
@@ -423,16 +432,22 @@ fn kind_jobs(client: &Client, kinds: &[Kind], namespace: Option<&str>, context: 
 /// cluster-wide; the whole cluster when `namespaces` is empty. Cluster-scoped kinds (Nodes)
 /// are read once, namespaced ones in each namespace, and a Namespace in itself. Each check
 /// runs on its own, so that what it finds can be shown as soon as it finishes.
-pub fn jobs(client: &Client, kinds: &[Kind], namespaces: &[String], context: Option<&str>) -> Vec<Job> {
+pub fn jobs(
+    client: &Client,
+    kinds: &[Kind],
+    namespaces: &[String],
+    context: Option<&str>,
+    judged_since: Option<Instant>,
+) -> Vec<Job> {
     use futures::FutureExt as _;
     if namespaces.is_empty() {
-        return kind_jobs(client, kinds, None, context);
+        return kind_jobs(client, kinds, None, context, judged_since);
     }
     let (cluster, namespaced): (Vec<Kind>, Vec<Kind>) =
         kinds.iter().cloned().partition(|k| !k.namespaced && !k.is("", "Namespace"));
-    let mut out = kind_jobs(client, &cluster, None, context);
+    let mut out = kind_jobs(client, &cluster, None, context, judged_since);
     for ns in namespaces {
-        out.extend(kind_jobs(client, &namespaced, Some(ns), context).into_iter().map(|(name, job)| {
+        out.extend(kind_jobs(client, &namespaced, Some(ns), context, judged_since).into_iter().map(|(name, job)| {
             let ns = ns.clone();
             let job = job.map(move |mut scan| {
                 for (kind, _) in &mut scan.skipped {
@@ -466,7 +481,7 @@ async fn run_all(jobs: Vec<Job>) -> Scan {
 /// the end-to-end tests. The app scans through `shared`, which shows each check as it finishes.
 #[cfg(feature = "dev")]
 pub async fn scan_partial(client: Client, kinds: &[Kind], namespace: Option<String>, context: Option<&str>) -> Scan {
-    run_all(kind_jobs(&client, kinds, namespace.as_deref(), context)).await
+    run_all(kind_jobs(&client, kinds, namespace.as_deref(), context, None)).await
 }
 
 #[cfg(test)]
@@ -629,7 +644,7 @@ mod tests {
         let mut node = kind("", "Node");
         node.namespaced = false;
         let kinds = [node, kind("", "Pod")];
-        let scan = run_all(jobs(&client, &kinds, &["a".into(), "b".into()], None)).await;
+        let scan = run_all(jobs(&client, &kinds, &["a".into(), "b".into()], None, None)).await;
         let found: Vec<(&str, Option<&str>)> =
             scan.problems.iter().map(|p| (p.name.as_str(), p.namespace.as_deref())).collect();
         assert_eq!(found, [("n1", None), ("p1", Some("a"))]);
@@ -825,7 +840,7 @@ mod tests {
         app.ar.api_version = "argoproj.io/v1alpha1".into();
         let mut ns = kind("", "Namespace");
         ns.namespaced = false;
-        let scan = run_all(jobs(&client, &[ns, app], &["argocd".into()], None)).await;
+        let scan = run_all(jobs(&client, &[ns, app], &["argocd".into()], None, None)).await;
         assert!(scan.skipped.is_empty(), "{:?}", scan.skipped_text());
         let found: Vec<(&str, &str)> = scan.problems.iter().map(|p| (p.name.as_str(), p.reason.as_str())).collect();
         assert_eq!(

@@ -46,18 +46,22 @@ struct Watched {
 }
 
 impl Watched {
-    /// The scope to scan now: see `scope_for`.
-    fn scope(&self) -> shared::Scope {
-        scope_for(&self.home, &self.picked, shared::may_cover(&self.home))
+    /// The scope to scan now for findings `fresh`: see `scope_for`.
+    fn scope(&self, fresh: Fresh) -> shared::Scope {
+        let scanned = shared::latest(&self.home).is_some() && shared::may_cover(&self.home);
+        scope_for(&self.home, &self.picked, fresh, scanned)
     }
 }
 
-/// The scope a page scans to show `picked`: the one the window's badge scans (`home`) when it
-/// covers them and its findings may stand for them (`may_cover`: it read everything), so they
-/// share their scans, else `picked` alone. A user who may not list cluster-wide still gets
-/// the namespace picked.
-fn scope_for(home: &shared::Scope, picked: &shared::Scope, may_cover: bool) -> shared::Scope {
-    if home == picked || (may_cover && home.covers(picked)) { home.clone() } else { picked.clone() }
+/// The scope a page scans to show `picked`. The one the window's badge scans (`home`) when it
+/// covers them, the badge already scans it (`scanned`: it has findings, and they may stand for
+/// `picked` as they read everything) and the page only keeps up with it (`Fresh::Paced`): the
+/// page and the badge then share their scans. Else `picked` alone: Refresh, or a page opened
+/// before the badge's first scan, lists only the namespaces picked, not the whole cluster. A
+/// user who may not list cluster-wide still gets the namespace picked.
+fn scope_for(home: &shared::Scope, picked: &shared::Scope, fresh: Fresh, scanned: bool) -> shared::Scope {
+    let share = scanned && matches!(fresh, Fresh::Paced) && home.covers(picked);
+    if home == picked || share { home.clone() } else { picked.clone() }
 }
 
 /// The clusters of `clusters` the page shows: one where none of the namespaces chosen is
@@ -184,10 +188,10 @@ impl ProblemsView {
                 let mut scanning = false;
                 for s in watched.iter() {
                     // Not waited for: the rows follow the scan as its checks finish.
-                    let scan = shared::ensure(&s.scope(), fresh, || Ask {
+                    // In the foreground: a badge's scan the page waits for is raised to it.
+                    let scan = shared::ensure(&s.scope(fresh), fresh, Lane::Foreground, || Ask {
                         client: s.client.clone(),
                         kinds: s.kinds.clone(),
-                        lane: Lane::Foreground,
                         record: true,
                     });
                     scanning |= scan.is_some();
@@ -576,18 +580,27 @@ mod tests {
 
     #[test]
     fn the_page_shares_the_badge_s_scan_when_it_covers_the_namespaces() {
-        use crate::problems::shared::Scope;
+        use crate::problems::shared::{Fresh, Scope};
         let scope = |ns: &[&str]| Scope::new("prod", ns.iter().map(ToString::to_string));
-        // A cluster read whole: every namespace picked comes from its scan.
-        assert_eq!(super::scope_for(&scope(&[]), &scope(&[]), true), scope(&[]));
-        assert_eq!(super::scope_for(&scope(&[]), &scope(&["shop"]), true), scope(&[]));
+        let paced = |home: &[&str], picked: &[&str], scanned| {
+            super::scope_for(&scope(home), &scope(picked), Fresh::Paced, scanned)
+        };
+        // A cluster the badge scans whole: every namespace picked comes from its scan.
+        assert_eq!(paced(&[], &[], true), scope(&[]));
+        assert_eq!(paced(&[], &["shop"], true), scope(&[]));
         // Accessible namespaces set: those among them too, another one on its own.
-        assert_eq!(super::scope_for(&scope(&["a", "b"]), &scope(&["a"]), true), scope(&["a", "b"]));
-        assert_eq!(super::scope_for(&scope(&["a", "b"]), &scope(&["c"]), true), scope(&["c"]));
-        // A scan of the whole cluster that could not read everything (a user who may not
-        // list cluster-wide): the namespace picked is scanned on its own.
-        assert_eq!(super::scope_for(&scope(&[]), &scope(&["shop"]), false), scope(&["shop"]));
-        assert_eq!(super::scope_for(&scope(&[]), &scope(&[]), false), scope(&[]));
+        assert_eq!(paced(&["a", "b"], &["a"], true), scope(&["a", "b"]));
+        assert_eq!(paced(&["a", "b"], &["c"], true), scope(&["c"]));
+        // Nothing scanned yet, or a scan of the whole cluster that could not read everything
+        // (a user who may not list cluster-wide): the namespace picked is scanned on its own,
+        // not the whole cluster.
+        assert_eq!(paced(&[], &["shop"], false), scope(&["shop"]));
+        assert_eq!(paced(&[], &[], false), scope(&[]));
+        // Refresh on a namespace lists that namespace, not the whole cluster; on the whole
+        // cluster, the whole cluster.
+        let refresh = Fresh::Since(std::time::Instant::now());
+        assert_eq!(super::scope_for(&scope(&[]), &scope(&["shop"]), refresh, true), scope(&["shop"]));
+        assert_eq!(super::scope_for(&scope(&[]), &scope(&[]), refresh, true), scope(&[]));
     }
 
     #[test]

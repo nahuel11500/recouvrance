@@ -840,8 +840,17 @@ async fn workloads_of(client: Client, ns: &str) -> Vec<Scaled> {
 /// Services (with a selector) without a ready endpoint: their pods say whether they select
 /// none or none is ready. One pod list a Service (by its selector), and the workloads of a
 /// namespace listed once, only where a Service selects no pod. A Service unchanged since it
-/// was judged in the last `VERDICT_KEPT` keeps its verdict, and nothing is listed for it.
-async fn unserved(client: &Client, kind: &Kind, services: &[Service], namespace: Option<String>) -> Scan {
+/// was judged in the last `VERDICT_KEPT` keeps its verdict, and nothing is listed for it,
+/// unless it was judged before `judged_since`: Refresh, or an agent checking a fix with
+/// `max_age_seconds: 0`, judges it again (pods fixed through their Deployment leave the
+/// Service unchanged).
+async fn unserved(
+    client: &Client,
+    kind: &Kind,
+    services: &[Service],
+    namespace: Option<String>,
+    judged_since: Option<Instant>,
+) -> Scan {
     let mut out = Scan::default();
     // By their index in `services`, with the label selector their pods are listed by.
     let selecting: Vec<(usize, Option<String>)> = services
@@ -883,7 +892,9 @@ async fn unserved(client: &Client, kind: &Kind, services: &[Service], namespace:
         let kept = verdicts();
         for (i, ns, selector) in candidates {
             let reused = services[i].metadata.version().and_then(|(uid, version)| {
-                kept.get(uid).filter(|k| reusable(k, version, now)).map(|k| k.verdict.clone())
+                kept.get(uid)
+                    .filter(|k| reusable(k, version, now) && judged_since.is_none_or(|since| k.at >= since))
+                    .map(|k| k.verdict.clone())
             });
             match reused {
                 Some((Severity::Info, _)) => scaled_kept.push((i, ns, selector)),
@@ -1026,13 +1037,14 @@ pub(super) fn with_services(kinds: &[Kind]) -> (Option<Kind>, Option<Kind>) {
 /// Services that select no pod or no ready one, and Ingresses and HTTP routes whose Services
 /// (or TLS Secrets) are missing, in `namespace` or the whole cluster. A kind the cluster
 /// doesn't serve (`ingress`, `route` None) is left out, and one that can't be read is
-/// skipped alone.
+/// skipped alone. `judged_since`: a Service judged before keeps no verdict (see `unserved`).
 pub(super) async fn traffic(
     client: Client,
     service: &Kind,
     ingress: Option<&Kind>,
     route: Option<&Kind>,
     namespace: Option<String>,
+    judged_since: Option<Instant>,
 ) -> Scan {
     let (services, ingress_list, route_list) = futures::join!(
         list_all::<Service>(client.clone(), Some(service.clone()), namespace.clone()),
@@ -1062,7 +1074,7 @@ pub(super) async fn traffic(
         }
     };
     let (service_scan, ingress_scan) =
-        futures::join!(unserved(&client, service, &services, namespace.clone()), ingress_scan);
+        futures::join!(unserved(&client, service, &services, namespace.clone(), judged_since), ingress_scan);
     out.absorb(service_scan);
     out.absorb(ingress_scan);
     match (route, route_list) {
@@ -1522,7 +1534,7 @@ mod tests {
         let client = Client::new(cluster.clone(), "default");
         let (service, ingress) = (kind("", "Service"), kind("networking.k8s.io", "Ingress"));
         let route = kind(GATEWAY, "HTTPRoute");
-        let scan = traffic(client, &service, Some(&ingress), Some(&route), Some("app".into())).await;
+        let scan = traffic(client, &service, Some(&ingress), Some(&route), Some("app".into()), None).await;
         assert!(scan.skipped.is_empty(), "{:?}", scan.skipped_text());
         let mut found: Vec<(String, String, Severity, String)> =
             scan.problems.into_iter().map(|p| (p.label, p.name, p.severity, p.reason)).collect();
@@ -1553,7 +1565,7 @@ mod tests {
         let client = Client::new(Cluster::default(), "default");
         let service = kind("", "Service");
         let ingress = kind("networking.k8s.io", "Ingress");
-        let scan = traffic(client, &service, Some(&ingress), None, Some("app".into())).await;
+        let scan = traffic(client, &service, Some(&ingress), None, Some("app".into()), None).await;
         assert!(scan.skipped.is_empty(), "{:?}", scan.skipped_text());
         assert!(scan.problems.iter().all(|p| p.label != "HTTPRoute"));
         assert_eq!(scan.problems.len(), 4);
@@ -1571,26 +1583,36 @@ mod tests {
             found.sort();
             found
         };
-        let first = verdicts(traffic(client.clone(), &service, None, None, Some("app".into())).await);
+        let first = verdicts(traffic(client.clone(), &service, None, None, Some("app".into()), None).await);
         assert_eq!(first.len(), 3);
         assert_eq!((asked("/pods"), asked("/deployments")), (3, 1));
         // Nothing changed: the same verdicts, and no pod listed again. The Service kept as
         // selecting no pod because `idle` is scaled to 0 checks that it still is: the
         // namespace's workloads, listed once.
-        let second = verdicts(traffic(client.clone(), &service, None, None, Some("app".into())).await);
+        let second = verdicts(traffic(client.clone(), &service, None, None, Some("app".into()), None).await);
         assert_eq!(second, first);
         assert_eq!((asked("/pods"), asked("/deployments")), (3, 2));
         // `idle` scaled up, its Service unchanged: no longer a minor finding, its pods listed.
         cluster.3.store(true, std::sync::atomic::Ordering::Relaxed);
-        let third = verdicts(traffic(client.clone(), &service, None, None, Some("app".into())).await);
+        let third = verdicts(traffic(client.clone(), &service, None, None, Some("app".into()), None).await);
         let idle = third.iter().find(|(name, ..)| name == "idle").unwrap();
         assert_eq!((idle.1, idle.2.as_str()), (Severity::Warning, "selects no pod"));
         assert_eq!((asked("/pods"), asked("/deployments")), (4, 3));
         // The Services changed: their pods are listed again.
         cluster.2.store(4712, std::sync::atomic::Ordering::Relaxed);
-        let fourth = verdicts(traffic(client, &service, None, None, Some("app".into())).await);
+        let fourth = verdicts(traffic(client.clone(), &service, None, None, Some("app".into()), None).await);
         assert_eq!(fourth, third);
         assert_eq!((asked("/pods"), asked("/deployments")), (7, 4));
+        // Refresh, or an agent checking a fix: every Service is judged again, as the first
+        // time after a change, though none changed.
+        let now = Some(Instant::now());
+        let fifth = verdicts(traffic(client.clone(), &service, None, None, Some("app".into()), now).await);
+        assert_eq!(fifth, fourth);
+        assert_eq!((asked("/pods"), asked("/deployments")), (10, 5));
+        // Verdicts made since then stand.
+        let sixth = verdicts(traffic(client, &service, None, None, Some("app".into()), now).await);
+        assert_eq!(sixth, fifth);
+        assert_eq!(asked("/pods"), 10, "no pod listed again");
     }
 
     proptest! {

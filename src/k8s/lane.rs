@@ -3,9 +3,11 @@
 //! the slots it shares with the page, so the page never waits behind it.
 
 use std::future::Future;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::Result;
-use tokio::sync::{Semaphore, SemaphorePermit};
+use tokio::sync::{Notify, Semaphore, SemaphorePermit};
 
 /// Which lane work goes in.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -18,26 +20,67 @@ pub enum Lane {
 }
 
 tokio::task_local! {
-    /// The lane of the work running, when `background` set one.
-    static LANE: Lane;
+    /// The lane of the work running, when a `Raisable` set one. The tasks
+    /// it starts share it, so raising it moves them all.
+    static LANE: Arc<State>;
 }
 
-impl Lane {
-    /// The lane of the work running now: foreground unless inside `background`.
-    pub fn current() -> Self {
-        LANE.try_with(|lane| *lane).unwrap_or_default()
+/// A lane that can be raised to the foreground while its work runs.
+#[derive(Debug)]
+struct State {
+    background: AtomicBool,
+    /// Wakes the requests waiting for a background slot when the lane is raised.
+    raised: Notify,
+}
+
+impl State {
+    fn lane(&self) -> Lane {
+        if self.background.load(Ordering::Acquire) { Lane::Background } else { Lane::Foreground }
     }
 }
 
-/// Run `work` in the background lane, and the tasks it starts with `k8s::run`.
-pub async fn background<F: Future>(work: F) -> F::Output {
-    LANE.scope(Lane::Background, work).await
+impl Lane {
+    /// The lane of the work running now: foreground unless inside the `run` of a
+    /// `Raisable` not raised yet.
+    pub fn current() -> Self {
+        LANE.try_with(|state| state.lane()).unwrap_or_default()
+    }
+}
+
+/// The lane of some work, which can be raised to the foreground while it runs: a scan the
+/// badge started in the background that the page on screen then waits for. The requests
+/// sent after go in the foreground, and those waiting for a background slot stop waiting.
+#[derive(Clone, Debug)]
+pub struct Raisable(Arc<State>);
+
+impl Raisable {
+    pub fn new(lane: Lane) -> Self {
+        Self(Arc::new(State { background: AtomicBool::new(lane == Lane::Background), raised: Notify::new() }))
+    }
+
+    /// Run `work` in this lane, and the tasks it starts with `k8s::run`.
+    pub fn run<F: Future>(&self, work: F) -> impl Future<Output = F::Output> + use<F> {
+        LANE.scope(self.0.clone(), work)
+    }
+
+    /// Move the work to the foreground, from now on.
+    pub fn raise(&self) {
+        if self.0.background.swap(false, Ordering::AcqRel) {
+            self.0.raised.notify_waiters();
+        }
+    }
+
+    #[cfg(test)]
+    pub fn lane(&self) -> Lane {
+        self.0.lane()
+    }
 }
 
 /// `work` in the lane of the work running now, for a task it starts: a task-local doesn't
-/// follow a spawned task on its own.
+/// follow a spawned task on its own. The task shares the lane, so a raise reaches it too.
 pub(super) fn carry<F: Future>(work: F) -> impl Future<Output = F::Output> {
-    LANE.scope(Lane::current(), work)
+    let state = LANE.try_with(Arc::clone).unwrap_or_else(|_| Raisable::new(Lane::Foreground).0);
+    LANE.scope(state, work)
 }
 
 /// Requests at once, shared by the two lanes. Background work first takes a slot of its
@@ -62,10 +105,32 @@ impl Slots {
     /// Wait for a slot in `lane`.
     pub(super) async fn acquire(&self, lane: Lane) -> Result<Slot<'_>> {
         let background = match lane {
-            Lane::Background => Some(self.background.acquire().await?),
+            Lane::Background => self.background_slot().await?,
             Lane::Foreground => None,
         };
         Ok(Slot { _all: self.all.acquire().await?, _background: background })
+    }
+
+    /// A slot of the background lane; none when the work's lane is raised meanwhile, so a
+    /// request already waiting behind background work goes in the foreground.
+    async fn background_slot(&self) -> Result<Option<SemaphorePermit<'_>>> {
+        let state = match LANE.try_with(Arc::clone) {
+            Ok(state) if state.lane() == Lane::Background => state,
+            // Work in no raisable lane: a hidden list says background on its own.
+            _ => return Ok(Some(self.background.acquire().await?)),
+        };
+        let raised = state.raised.notified();
+        tokio::pin!(raised);
+        // Listen before looking again, so a raise in between is not missed.
+        raised.as_mut().enable();
+        if state.lane() == Lane::Foreground {
+            return Ok(None);
+        }
+        tokio::select! {
+            biased;
+            permit = self.background.acquire() => Ok(Some(permit?)),
+            () = raised => Ok(None),
+        }
     }
 }
 
@@ -74,7 +139,7 @@ mod tests {
     use futures::FutureExt as _;
     use proptest::prelude::*;
 
-    use super::{Lane, Slot, Slots, background};
+    use super::{Lane, Raisable, Slot, Slots};
 
     /// A slot if one is free now; None when it would wait.
     fn take(slots: &Slots, lane: Lane) -> Option<Slot<'_>> {
@@ -100,11 +165,43 @@ mod tests {
     }
 
     #[test]
+    fn a_raised_lane_stops_waiting_for_background_slots() {
+        let slots = Slots::new(4, 1);
+        let lane = Raisable::new(Lane::Background);
+        futures::executor::block_on(lane.run(async {
+            let held = slots.acquire(Lane::current()).await.unwrap();
+            let mut next = std::pin::pin!(slots.acquire(Lane::current()));
+            assert!(futures::poll!(next.as_mut()).is_pending(), "the background lane is full");
+            lane.raise();
+            assert_eq!(Lane::current(), Lane::Foreground);
+            let next = next.await.unwrap();
+            assert!(next._background.is_none(), "the waiting request took a foreground slot");
+            let more: Vec<Slot<'_>> = (0..2).filter_map(|_| take(&slots, Lane::current())).collect();
+            assert_eq!(more.len(), 2, "and so do the requests after it");
+            drop((held, next, more));
+        }));
+        assert_eq!(lane.lane(), Lane::Foreground);
+    }
+
+    #[test]
+    fn a_raise_reaches_the_tasks_the_work_started() {
+        let lane = Raisable::new(Lane::Background);
+        let seen = futures::executor::block_on(lane.run(async {
+            let before = crate::k8s::run(async { Ok(Lane::current()) }).await.unwrap();
+            lane.raise();
+            let after = crate::k8s::run(async { Ok(Lane::current()) }).await.unwrap();
+            (before, after)
+        }));
+        assert_eq!(seen, (Lane::Background, Lane::Foreground));
+    }
+
+    #[test]
     fn the_lane_follows_work_onto_the_runtime() {
         let lane = || crate::k8s::run(async { Ok(Lane::current()) });
         assert_eq!(futures::executor::block_on(lane()).unwrap(), Lane::Foreground);
-        assert_eq!(futures::executor::block_on(background(lane())).unwrap(), Lane::Background);
-        assert_eq!(Lane::current(), Lane::Foreground, "only inside `background`");
+        let background = Raisable::new(Lane::Background);
+        assert_eq!(futures::executor::block_on(background.run(lane())).unwrap(), Lane::Background);
+        assert_eq!(Lane::current(), Lane::Foreground, "only inside `run`");
     }
 
     proptest! {

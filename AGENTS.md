@@ -66,6 +66,18 @@ an agent has used the app end to end and found nothing blocking:
   Problems, Apply, Settings, the agents' MCP server.
 - Against real clusters, only read. Writes, shells and deletes are tried on a kind cluster (or
   on another cluster only when the user says so).
+- Measure speed in this pass only, never in CI or per PR. Read-only, on the biggest cluster at
+  hand, compare the new build with the last tag (build it after, in the same checkout and target
+  folder: `git switch --detach <last tag>`, so no dependency is built again):
+  - the Problems scan: `RECOUVRANCE_SMOKE=<context> RECOUVRANCE_PROBLEMS=twice` prints two scans
+    in a row with their time, requests and MB (the second shows what the kept Service verdicts
+    save); on a tag without `twice`, run `RECOUVRANCE_PROBLEMS=1` twice;
+  - requests per minute in Settings → API requests after 10 minutes with the Problems page on
+    screen, with one window, then with a second window on the same context;
+  - two `find_problems` calls within 2 minutes: the second answers from the first's scan and
+    sends no list.
+
+  Put the numbers in the release PR, and file an issue for any that got worse.
 - File an issue for each bug found, with what was done and a snapshot; don't fix them in the
   same pass. Then say whether the release can go, and which issues block it.
 

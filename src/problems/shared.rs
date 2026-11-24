@@ -14,7 +14,8 @@ use kube::Client;
 
 use super::{Problem, Scan, Severity};
 use crate::alerts::Alerts;
-use crate::k8s::{self, Kind, lane::Lane};
+use crate::k8s::lane::{Lane, Raisable};
+use crate::k8s::{self, Kind};
 
 /// What a scan reads: a cluster, and the namespaces it reads there, sorted (none: the whole
 /// cluster).
@@ -193,8 +194,6 @@ pub struct Ask {
     pub client: Client,
     /// The kinds the cluster serves: the others would fail with a 404.
     pub kinds: Vec<Kind>,
-    /// The badge's scans go in the background lane, so the page on screen gets the API first.
-    pub lane: Lane,
     /// The app's own scans feed the timeline with the lists they read; an agent's don't.
     pub record: bool,
 }
@@ -202,10 +201,17 @@ pub struct Ask {
 /// The end of a scan, to wait for.
 pub type Waiter = Shared<BoxFuture<'static, ()>>;
 
+/// A scan running: its end, and its lane, raised when someone in the foreground waits for it.
+#[derive(Clone)]
+struct Running {
+    waiter: Waiter,
+    lane: Raisable,
+}
+
 struct Entry {
     found: Arc<Found>,
     /// The scan running.
-    scan: Option<Waiter>,
+    scan: Option<Running>,
     /// When it was last asked for.
     asked: Instant,
 }
@@ -260,11 +266,15 @@ pub fn latest(scope: &Scope) -> Option<Arc<Found>> {
 /// wait for, else a scan starts with what `ask` gives. Returns what to wait for, if anything.
 /// A scan runs to its end even when nobody waits any more, and its findings are kept for the
 /// next one to ask.
-pub fn ensure(scope: &Scope, fresh: Fresh, ask: impl FnOnce() -> Ask) -> Option<Waiter> {
+///
+/// `lane` is the asker's: the badge's scans go in the background, so the page on screen gets
+/// the API first. A foreground asker who joins a background scan raises it to the
+/// foreground, so the page, Refresh or an agent never waits at the badge's pace.
+pub fn ensure(scope: &Scope, fresh: Fresh, lane: Lane, ask: impl FnOnce() -> Ask) -> Option<Waiter> {
     let now = Instant::now();
     let mut scans = lock();
     scans.retain(|_, e| e.scan.is_some() || now.saturating_duration_since(e.asked) < FORGET_AFTER);
-    let mut running = None;
+    let mut running: Option<Running> = None;
     for (key, entry) in scans.iter_mut().filter(|(key, e)| serves(key, &e.found, scope)) {
         entry.asked = now;
         if entry.found.done.is_some_and(|d| fresh.met_by(d, now)) {
@@ -276,31 +286,37 @@ pub fn ensure(scope: &Scope, fresh: Fresh, ask: impl FnOnce() -> Ask) -> Option<
             running = Some(scan.clone());
         }
     }
-    if running.is_some() {
-        return running;
+    if let Some(scan) = running {
+        if lane == Lane::Foreground {
+            scan.lane.raise();
+        }
+        return Some(scan.waiter);
     }
-    let Ask { client, kinds, lane, record } = ask();
+    let ask = ask();
     let (done, ended) = futures::channel::oneshot::channel::<()>();
     let waiter: Waiter = ended.map(|_| ()).boxed().shared();
+    let lane = Raisable::new(lane);
     let entry = scans.entry(scope.clone()).or_insert_with(|| Entry { found: Arc::default(), scan: None, asked: now });
-    entry.scan = Some(waiter.clone());
+    entry.scan = Some(Running { waiter: waiter.clone(), lane: lane.clone() });
     Arc::make_mut(&mut entry.found).running = Some(now);
     drop(scans);
     changed();
+    // Findings from `at` on (Refresh, an agent checking a fix): no Service keeps a verdict
+    // judged before.
+    let judged_since = match fresh {
+        Fresh::Since(at) => Some(at),
+        Fresh::Paced => None,
+    };
     let finish = Finish { scope: scope.clone(), started: now, checks: None, ended: false, done: Some(done) };
-    let scan = run(scope.clone(), client, kinds, record, finish);
-    match lane {
-        Lane::Background => k8s::spawn_detached(k8s::lane::background(scan)),
-        Lane::Foreground => k8s::spawn_detached(scan),
-    }
+    k8s::spawn_detached(lane.run(run(scope.clone(), ask, judged_since, finish)));
     Some(waiter)
 }
 
 /// Findings for `scope` that are `fresh`: the latest when they are, else those of the scan
 /// running or of a new one. A scan that started too early for `Since` is waited for, then
 /// another one runs.
-pub async fn fresh(scope: &Scope, fresh: Fresh, ask: impl Fn() -> Ask) -> Option<Arc<Found>> {
-    while let Some(scan) = ensure(scope, fresh, &ask) {
+pub async fn fresh(scope: &Scope, fresh: Fresh, lane: Lane, ask: impl Fn() -> Ask) -> Option<Arc<Found>> {
+    while let Some(scan) = ensure(scope, fresh, lane, &ask) {
         scan.await;
     }
     latest(scope)
@@ -318,9 +334,10 @@ fn update(scope: &Scope, change: impl FnOnce(&mut Found)) {
 }
 
 /// A scan: each check's findings replace its last ones as soon as it finishes.
-async fn run(scope: Scope, client: Client, kinds: Vec<Kind>, record: bool, mut finish: Finish) {
+async fn run(scope: Scope, ask: Ask, judged_since: Option<Instant>, mut finish: Finish) {
+    let Ask { client, kinds, record } = ask;
     let context = record.then_some(scope.context.as_str());
-    let jobs = super::jobs(&client, &kinds, &scope.namespaces, context);
+    let jobs = super::jobs(&client, &kinds, &scope.namespaces, context, judged_since);
     finish.checks = Some(jobs.iter().map(|(name, _)| Arc::from(name.as_str())).collect());
     let checks = async {
         let mut running: futures::stream::FuturesUnordered<_> = (jobs.into_iter().enumerate())
@@ -554,7 +571,7 @@ mod tests {
         let client = Client::new(cluster.clone(), "default");
         let mut node = Kind::fake("", "Node");
         node.namespaced = false;
-        move || Ask { client: client.clone(), kinds: vec![node.clone()], lane: Lane::Background, record: false }
+        move || Ask { client: client.clone(), kinds: vec![node.clone()], record: false }
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -563,9 +580,9 @@ mod tests {
         let whole = scope("shared-test-one-scan", &[]);
         // The badge, the page and an agent ask at once: one scan.
         let (a, b, c) = futures::join!(
-            fresh(&whole, Fresh::Paced, ask(&cluster)),
-            fresh(&whole, Fresh::Paced, ask(&cluster)),
-            fresh(&whole, Fresh::Since(Instant::now()), ask(&cluster)),
+            fresh(&whole, Fresh::Paced, Lane::Background, ask(&cluster)),
+            fresh(&whole, Fresh::Paced, Lane::Background, ask(&cluster)),
+            fresh(&whole, Fresh::Since(Instant::now()), Lane::Background, ask(&cluster)),
         );
         assert_eq!(cluster.asked("/api/v1/nodes"), 1);
         for found in [a, b, c] {
@@ -575,15 +592,15 @@ mod tests {
             assert_eq!(names, ["n1"]);
         }
         // Paced: the findings stand, nothing is asked again.
-        assert!(ensure(&whole, Fresh::Paced, ask(&cluster)).is_none());
+        assert!(ensure(&whole, Fresh::Paced, Lane::Background, ask(&cluster)).is_none());
         // One namespace of the cluster: shown from the whole cluster's scan.
         let one = scope("shared-test-one-scan", &["shop"]);
-        assert!(ensure(&one, Fresh::Paced, ask(&cluster)).is_none());
+        assert!(ensure(&one, Fresh::Paced, Lane::Background, ask(&cluster)).is_none());
         let found = latest(&one).unwrap();
         assert_eq!(found.problems(&one.namespaces).len(), 1, "nodes belong to every namespace");
         assert_eq!(cluster.asked("/api/v1/nodes"), 1);
         // Refresh: a new scan.
-        fresh(&whole, Fresh::Since(Instant::now()), ask(&cluster)).await;
+        fresh(&whole, Fresh::Since(Instant::now()), Lane::Background, ask(&cluster)).await;
         assert_eq!(cluster.asked("/api/v1/nodes"), 2);
         // Another cluster's scope is its own.
         assert!(latest(&scope("shared-test-other", &[])).is_none());
@@ -596,27 +613,27 @@ mod tests {
         let cluster = Cluster(Arc::default(), true);
         let client = Client::new(cluster.clone(), "default");
         let pod = Kind::fake("", "Pod");
-        let asks = || Ask { client: client.clone(), kinds: vec![pod.clone()], lane: Lane::Background, record: false };
+        let asks = || Ask { client: client.clone(), kinds: vec![pod.clone()], record: false };
         let whole = scope("shared-test-forbidden", &[]);
-        let found = fresh(&whole, Fresh::Paced, &asks).await.unwrap();
+        let found = fresh(&whole, Fresh::Paced, Lane::Background, &asks).await.unwrap();
         assert!(!found.read_all() && found.skipped().unwrap().contains("Pod"), "{:?}", found.skipped());
         assert!(!may_cover(&whole));
         let shop = scope("shared-test-forbidden", &["shop"]);
         assert!(latest(&shop).is_none(), "not shown from the whole cluster's scan");
-        let found = fresh(&shop, Fresh::Paced, &asks).await.unwrap();
+        let found = fresh(&shop, Fresh::Paced, Lane::Background, &asks).await.unwrap();
         assert!(found.read_all(), "{:?}", found.skipped());
         assert_eq!(cluster.asked("/api/v1/namespaces/shop/pods"), 1);
         // Its own findings stand, though the whole cluster's are more recent.
-        fresh(&whole, Fresh::Since(Instant::now()), &asks).await;
-        assert!(ensure(&shop, Fresh::Paced, asks).is_none());
+        fresh(&whole, Fresh::Since(Instant::now()), Lane::Background, &asks).await;
+        assert!(ensure(&shop, Fresh::Paced, Lane::Background, asks).is_none());
         assert!(latest(&shop).unwrap().read_all());
         assert_eq!(cluster.asked("/api/v1/namespaces/shop/pods"), 1);
         // With full rights, the whole cluster's scan stands for `shop`.
         let open = Cluster::default();
         let whole = scope("shared-test-open", &[]);
-        fresh(&whole, Fresh::Paced, ask(&open)).await;
+        fresh(&whole, Fresh::Paced, Lane::Background, ask(&open)).await;
         assert!(may_cover(&whole));
-        assert!(ensure(&scope("shared-test-open", &["shop"]), Fresh::Paced, ask(&open)).is_none());
+        assert!(ensure(&scope("shared-test-open", &["shop"]), Fresh::Paced, Lane::Background, ask(&open)).is_none());
     }
 
     #[test]
@@ -637,5 +654,29 @@ mod tests {
         // The next scan run to its end drops the note.
         drop(finish(true));
         assert_eq!(latest(&s).unwrap().skipped(), None);
+    }
+
+    /// The badge's scan runs in the background; the page, Refresh or an agent who then waits
+    /// for it raises it, so they don't wait at the badge's pace. Another background asker
+    /// leaves it where it is.
+    #[test]
+    fn a_foreground_asker_raises_the_background_scan_it_joins() {
+        let s = scope("shared-test-raise", &[]);
+        let lane = Raisable::new(Lane::Background);
+        let waiter: Waiter = futures::future::pending().boxed().shared();
+        let scan = Some(Running { waiter, lane: lane.clone() });
+        lock().insert(s.clone(), Entry { found: Arc::default(), scan, asked: Instant::now() });
+        let no_new_scan = || -> Ask { unreachable!("a scan is running") };
+        assert!(ensure(&s, Fresh::Paced, Lane::Background, no_new_scan).is_some());
+        assert_eq!(lane.lane(), Lane::Background, "a second badge leaves it in the background");
+        assert!(ensure(&s, Fresh::Since(Instant::now()), Lane::Foreground, no_new_scan).is_some());
+        assert_eq!(lane.lane(), Lane::Foreground, "the page waits for it in the foreground");
+        // A narrower scope waiting for it raises it too.
+        let lane = Raisable::new(Lane::Background);
+        lock().get_mut(&s).unwrap().scan.as_mut().unwrap().lane = lane.clone();
+        let one = scope("shared-test-raise", &["shop"]);
+        assert!(ensure(&one, Fresh::Paced, Lane::Foreground, no_new_scan).is_some());
+        assert_eq!(lane.lane(), Lane::Foreground);
+        lock().remove(&s);
     }
 }

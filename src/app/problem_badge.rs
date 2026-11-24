@@ -73,10 +73,9 @@ impl ProblemBadge {
                 first = false;
                 for (scope, client, kinds) in &scopes {
                     // Not waited for: the counts follow the scan as its checks finish.
-                    let _ = shared::ensure(scope, Fresh::Paced, || Ask {
+                    let _ = shared::ensure(scope, Fresh::Paced, Lane::Background, || Ask {
                         client: client.clone(),
                         kinds: kinds.clone(),
-                        lane: Lane::Background,
                         record: true,
                     });
                 }

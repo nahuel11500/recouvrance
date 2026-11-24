@@ -716,9 +716,8 @@ impl KubeMcp {
             Some(secs) => Instant::now().checked_sub(Duration::from_secs(secs)).map_or(Fresh::Paced, Fresh::Since),
             None => Fresh::Paced,
         };
-        let ask =
-            || shared::Ask { client: client.clone(), kinds: kinds.to_vec(), lane: Lane::Foreground, record: false };
-        let found = shared::fresh(&scope, fresh, ask).await.unwrap_or_default();
+        let ask = || shared::Ask { client: client.clone(), kinds: kinds.to_vec(), record: false };
+        let found = shared::fresh(&scope, fresh, Lane::Foreground, ask).await.unwrap_or_default();
         let skipped = found.skipped().map(|s| format!("Not checked, could not read {s}."));
         let scanned = found.done.map(|d| {
             let ago = i64::try_from(d.started.elapsed().as_secs()).unwrap_or(i64::MAX);

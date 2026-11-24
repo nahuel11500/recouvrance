@@ -1265,10 +1265,18 @@ fn an_agent_finds_a_pod_s_missing_config_map() {
             let line = out.lines().find(|l| l.contains(name)).with_context(|| out.clone())?;
             assert!(line.contains("missing ConfigMap e2e-missing-config"), "{out}");
             assert!(!line.contains("e2e-optional-config"), "{out}");
-            // Asked again by default: the scan just made answers, and says how old it is.
+            // Asked again by default a few seconds later: the scan just made answers, and says
+            // how old it is. A new scan would say it started 0s ago.
+            let pause = 3;
+            tokio::time::sleep(std::time::Duration::from_secs(pause)).await;
             let again = mcp.call("find_problems", json!({"context": ctx, "namespace": NS})).await;
             assert!(again.lines().any(|l| l.contains(name)), "{again}");
-            assert!(again.contains("From a scan started"), "{again}");
+            let age = again
+                .split_once("From a scan started ")
+                .and_then(|(_, rest)| rest.split_once(" ago"))
+                .and_then(|(age, _)| k8s::age_seconds(age))
+                .with_context(|| again.clone())?;
+            assert!(age >= i64::try_from(pause)?, "the scan made with max_age_seconds: 0 answers: {again}");
             Ok(())
         };
         let result: Result<()> = checked.await;
