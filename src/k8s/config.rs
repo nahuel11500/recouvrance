@@ -217,7 +217,23 @@ fn read_kubeconfig() -> Result<(Kubeconfig, bool)> {
 /// never what the file holds (see `unquoted`): it reaches pages, agents and the audit log. Read
 /// kubeconfig files with this, not `Kubeconfig::read_from`.
 pub(super) fn read_kubeconfig_file(path: &std::path::Path) -> Result<Kubeconfig> {
-    Kubeconfig::read_from(path).map_err(|e| anyhow!("{}: {}", tilde(path), unquoted(e)))
+    let file = || tilde(path);
+    // kube reads a file that starts with a UTF-16 byte order mark two bytes at a time and panics
+    // on an odd last byte (#890): such a file in a kubeconfig folder crashed the app.
+    let bytes = std::fs::read(path).map_err(|e| anyhow!("{}: {e}", file()))?;
+    if odd_utf16(&bytes) {
+        return Err(anyhow!("{}: not valid UTF-16 (a byte order mark, then an odd number of bytes)", file()));
+    }
+    // kube reads the file again, and it may have changed since: its panic is an error too.
+    std::panic::catch_unwind(|| Kubeconfig::read_from(path))
+        .map_err(|_| anyhow!("{}: kube failed reading it", file()))?
+        .map_err(|e| anyhow!("{}: {}", file(), unquoted(e)))
+}
+
+/// Whether `bytes` start with a UTF-16 byte order mark (little or big endian) and are of an odd
+/// length, which kube's `read_from` panics on.
+fn odd_utf16(bytes: &[u8]) -> bool {
+    matches!(bytes, [0xFF, 0xFE, ..] | [0xFE, 0xFF, ..]) && bytes.len() % 2 == 1
 }
 
 /// Kubeconfig text pasted in Settings, read as `read_kubeconfig_file` reads a file.
@@ -1142,6 +1158,35 @@ echo '{"apiVersion":"client.authentication.k8s.io/v1","kind":"ExecCredential","s
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// A file that starts with a UTF-16 byte order mark and has an odd number of bytes made kube
+    /// panic, and the app with it (#890): it is said not to read, naming the file. An even one
+    /// reads as before.
+    #[test]
+    fn an_odd_utf16_file_fails_without_a_crash() {
+        let dir = crate::mcp::test_dir();
+        let path = dir.join("config");
+        let file = crate::paths::tilde(&path);
+        let utf16 = |mark: [u8; 2], big: bool| {
+            let text = "apiVersion: v1\nkind: Config\ncurrent-context: c\n";
+            let units = text.encode_utf16().flat_map(|u| if big { u.to_be_bytes() } else { u.to_le_bytes() });
+            mark.into_iter().chain(units).collect::<Vec<u8>>()
+        };
+        for (mark, big) in [([0xFF, 0xFE], false), ([0xFE, 0xFF], true)] {
+            let mut bytes = utf16(mark, big);
+            std::fs::write(&path, &bytes).unwrap();
+            let kc = super::read_kubeconfig_file(&path).unwrap();
+            assert_eq!(kc.current_context.as_deref(), Some("c"));
+            bytes.push(b'x');
+            std::fs::write(&path, &bytes).unwrap();
+            let e = super::read_kubeconfig_file(&path).unwrap_err();
+            assert_eq!(
+                e.to_string(),
+                format!("{file}: not valid UTF-16 (a byte order mark, then an odd number of bytes)")
+            );
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     /// A proxy kube can't use, by its scheme or for having none (an `HTTPS_PROXY` that curl
     /// reads as http): the error of building the client names it by its host and port, never
     /// its user and password, however it is printed (#859).
@@ -1563,6 +1608,35 @@ current-context: x
             }
             if let Err(e) = super::parse_kubeconfig(&text) {
                 prop_assert!(!format!("{e:#}").contains(SECRET), "{e:#}\nfrom\n{text}");
+            }
+        }
+
+        /// Whatever bytes a kubeconfig file holds after a byte order mark or none, it is read or
+        /// said not to read, naming the file: never a panic, which crashed the app on a UTF-16
+        /// mark followed by an odd number of bytes (#890).
+        #[test]
+        fn any_file_reads_or_fails_without_a_crash(
+            mark in prop_oneof![
+                Just(&[0u8; 0][..]),
+                Just(&[0xFF, 0xFE][..]),
+                Just(&[0xFE, 0xFF][..]),
+                Just(&[0xEF, 0xBB, 0xBF][..]),
+            ],
+            body in prop::collection::vec(any::<u8>(), 0..64),
+        ) {
+            /// The test's folder, removed when the case ends, failed or not.
+            struct Folder(std::path::PathBuf);
+            impl Drop for Folder {
+                fn drop(&mut self) {
+                    let _ = std::fs::remove_dir_all(&self.0);
+                }
+            }
+            let dir = Folder(crate::mcp::test_dir());
+            let path = dir.0.join("config");
+            std::fs::write(&path, [mark, &body[..]].concat()).unwrap();
+            if let Err(e) = super::read_kubeconfig_file(&path) {
+                let file = crate::paths::tilde(&path);
+                prop_assert!(e.to_string().starts_with(&format!("{file}: ")), "{e}");
             }
         }
     }

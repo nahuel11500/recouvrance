@@ -141,7 +141,8 @@ is read every `detail_refresh`.
   the lines around where it failed and can quote a value: a token, a client key, a login
   command's arguments. Kubeconfig files are read through `k8s::read_kubeconfig_file`, pasted
   text through `parse_kubeconfig`: their error says the file, line and column, and why in words
-  of their own.
+  of their own. A file that starts with a UTF-16 byte order mark and has an odd number of bytes,
+  which kube's reader panics on, is an error of that file too, not a crash.
 - **Proxy passwords stay out of errors.** kube's error for a proxy it can't use prints the proxy's
   URL whole, user and password included. The client's build error puts that URL back as its
   scheme, host and port alone, scheme or not (`user:password@host:1080` from `HTTPS_PROXY` reads
