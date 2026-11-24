@@ -128,7 +128,7 @@ pub fn with_policy(app: &Value, mut patch: Value) -> Value {
 /// (`status.sync.revision`), for an Application of one source with auto-sync off (with it on,
 /// argocd-server refuses another revision than its target). None otherwise.
 pub fn shown_revision(app: &Value) -> Option<String> {
-    if super::auto_sync(app) || app.pointer("/spec/sources").and_then(Value::as_array).is_some_and(|s| !s.is_empty()) {
+    if auto_sync(app) || app.pointer("/spec/sources").and_then(Value::as_array).is_some_and(|s| !s.is_empty()) {
         return None;
     }
     app.pointer("/status/sync/revision").and_then(Value::as_str).filter(|r| !r.is_empty()).map(String::from)

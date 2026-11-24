@@ -363,7 +363,9 @@ pub fn observe(instance: &str, app: &Value) {
 /// phase. The same print is the same state, so the record isn't built again.
 fn quick_print(instance: &str, app: &Value) -> Option<(OpId, u64)> {
     let state = app.pointer("/status/operationState").filter(|s| s.is_object())?;
-    let s = |v: &Value, k: &str| v.get(k).and_then(Value::as_str).unwrap_or_default();
+    fn s<'a>(v: &'a Value, k: &str) -> &'a str {
+        v.get(k).and_then(Value::as_str).unwrap_or_default()
+    }
     let started = state.get("startedAt").and_then(Value::as_str).filter(|s| !s.is_empty())?;
     let name = app.pointer("/metadata/name").and_then(Value::as_str).filter(|s| !s.is_empty())?;
     let namespace = app
