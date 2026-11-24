@@ -886,7 +886,7 @@ mod tests {
     fn pods_are_indexed_with_their_usage_and_requests() {
         let pod = json!({
             "metadata": {"name": "web-1", "namespace": "shop"},
-            "spec": {"containers": [{"name": "app", "resources": {"requests": {"cpu": "250m"}}}]},
+            "spec": {"nodeName": "n1", "containers": [{"name": "app", "resources": {"requests": {"cpu": "250m"}}}]},
             "status": {"phase": "Running"}
         });
         let stats = json!({"pods": [{

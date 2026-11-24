@@ -150,6 +150,7 @@ mod whole {
             name: text(obj, "/metadata/name")?.to_string(),
             reason,
             age: created(obj),
+            on_hub: None,
         })
     }
 }

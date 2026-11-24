@@ -59,6 +59,14 @@ process's resident memory (Linux):
 RECOUVRANCE_CONTEXT=kind-dev RECOUVRANCE_BACKTIME=pods,deployments,3 cargo run --features dev -- --snapshot out.png 8
 ```
 
+`RECOUVRANCE_FIRSTROWS=1` prints to stderr, from the moment a connect starts, when each cluster's
+first rows reach the table and when its list is complete. With a context that can't be reached
+among the ones connected, it shows whether the others' rows wait for it:
+
+```sh
+RECOUVRANCE_CONTEXT=kind-dev,unreachable RECOUVRANCE_FIRSTROWS=1 cargo run --features dev -- --snapshot out.png 40
+```
+
 `RECOUVRANCE_REQUESTS=<seconds>` counts what the page on screen asks of the API server: once the
 other variables have set it up (a detail page opened with `RECOUVRANCE_SELECT`, say), the problem
 badge stops counting (its scans would hide the page's requests), the counts of Settings → API
@@ -68,8 +76,9 @@ kind, the heaviest requests, and the process's memory (`VmRSS`, `VmHWM`).
 **Smoke checks**: `RECOUVRANCE_SMOKE=<context> cargo run --features dev` lists types and watches
 pods in every namespace: when the list is complete and live (`listed at=`), it prints what the
 requests read so far and the peak memory (Linux); add `RECOUVRANCE_LISTTIME=1`, `RECOUVRANCE_PROBLEMS=1` (the Problems scan's time and, on
-Linux, the process's peak memory; `RECOUVRANCE_PROBLEMS=kinds` runs each kind's check alone, with
-its own peak; `RECOUVRANCE_PROBLEMS=twice` runs two scans in a row, each with its time, requests and
+Linux, the process's peak memory, the Argo CD Applications deploying there included;
+`RECOUVRANCE_PROBLEMS=kinds` runs each kind's check alone, then the Argo CD one, each with its own
+peak; `RECOUVRANCE_PROBLEMS=twice` runs two scans in a row, each with its time, requests and
 bytes), `RECOUVRANCE_EVENTS=<seconds>` (the Timeline's "All events" on every namespace for
 that long, then what it cost), or dry runs such as `RECOUVRANCE_NODESHELLDRY=<node>` (see
 `src/dev/smoke.rs`).

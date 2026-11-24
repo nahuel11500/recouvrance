@@ -114,7 +114,7 @@ pub fn agent_token(hub: &Hub) -> Result<String> {
 pub async fn connect_claude_code(hub: Arc<Hub>) -> Result<String> {
     let bin = claude_code().context("Claude Code is not installed (claude.com/claude-code)")?;
     let token = agent_token(&hub)?;
-    let url = format!("http://127.0.0.1:{}/mcp", hub.port());
+    let url = format!("http://127.0.0.1:{}/mcp", listening_port(&hub));
     run(async move {
         // Replace our entry if it is there already.
         let _ =
@@ -142,15 +142,118 @@ pub async fn connect_claude_code(hub: Arc<Hub>) -> Result<String> {
     .await
 }
 
-/// Whether your Claude Code has the "recouvrance" MCP server registered.
-pub async fn claude_code_connected() -> bool {
-    let Some(bin) = claude_code() else { return false };
+/// What your Claude Code's "recouvrance" entry means for this Recouvrance.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ClaudeCodeEntry {
+    /// It reaches this server, with the token of one of its agents that is on.
+    Connected,
+    /// There is none (or Claude Code could not be asked).
+    Missing,
+    /// There is one, but what `claude mcp get` printed can't be judged (a masked token, a
+    /// format this version doesn't know): neither connected nor wrong.
+    Unknown,
+    /// There is one, but its calls would not reach this server or be let in: why.
+    Stale(String),
+}
+
+/// The port this server listens on now, else the one it will use (agents.json): a port
+/// changed in Settings only takes effect on the next start.
+pub fn listening_port(hub: &Hub) -> u16 {
+    match hub.server_status() {
+        Some(Ok(port)) => port,
+        _ => hub.port(),
+    }
+}
+
+/// Your Claude Code's "recouvrance" entry, set against the port this server listens on and
+/// its agents' tokens: an entry of that name is not enough, it may point at another
+/// Recouvrance or hold an old token (after New token).
+pub async fn claude_code_entry(hub: Arc<Hub>) -> ClaudeCodeEntry {
+    let Some(bin) = claude_code() else { return ClaudeCodeEntry::Missing };
     run(async move {
         let out = tokio::process::Command::new(&bin).args(["mcp", "get", "recouvrance"]).output().await?;
-        Ok(out.status.success())
+        if !out.status.success() {
+            return Ok(ClaudeCodeEntry::Missing);
+        }
+        let text = String::from_utf8_lossy(&out.stdout);
+        Ok(judge_claude_code_entry(&text, listening_port(&hub), |t| hub.agent_by_token(t).map(|a| a.enabled)))
     })
     .await
-    .unwrap_or(false)
+    .unwrap_or(ClaudeCodeEntry::Missing)
+}
+
+/// Judge the output of `claude mcp get recouvrance`: an http entry whose URL is this
+/// server's (`http://127.0.0.1:<port>/mcp`, or localhost) and whose bearer token is an
+/// agent's (`agent`: whether that agent is on; None for a token no agent has).
+fn judge_claude_code_entry(out: &str, port: u16, agent: impl Fn(&str) -> Option<bool>) -> ClaudeCodeEntry {
+    // `Name: value` lines, the name in any case.
+    let field = |name: &str| {
+        out.lines().find_map(|l| {
+            let (k, v) = l.trim().split_once(':')?;
+            k.trim().eq_ignore_ascii_case(name).then(|| v.trim()).filter(|v| !v.is_empty())
+        })
+    };
+    let (kind, url) = (field("Type"), field("URL"));
+    if kind.is_none() && url.is_none() && field("Command").is_none() {
+        // Not a format this version reads: say nothing rather than something wrong.
+        return ClaudeCodeEntry::Unknown;
+    }
+    if let Some(kind) = kind
+        && !kind.eq_ignore_ascii_case("http")
+    {
+        return ClaudeCodeEntry::Stale(format!("Claude Code's entry is a {kind} server, not this one"));
+    }
+    let Some(url) = url else {
+        return ClaudeCodeEntry::Stale("Claude Code's entry has no URL".into());
+    };
+    match url_port(url) {
+        Some(p) if p == port => {}
+        Some(p) => return ClaudeCodeEntry::Stale(format!("Claude Code points at port {p}, not {port}")),
+        None => return ClaudeCodeEntry::Stale(format!("Claude Code points at {}", url_origin(url))),
+    }
+    let bearer = field("Authorization").map(|v| match v.split_once(' ') {
+        Some((scheme, t)) if scheme.eq_ignore_ascii_case("bearer") => t.trim(),
+        _ => v,
+    });
+    match bearer {
+        None => ClaudeCodeEntry::Stale("Claude Code's entry has no token".into()),
+        // A masked or cut token can't be checked: it may well be the right one.
+        Some(t) if !looks_like_token(t) => ClaudeCodeEntry::Unknown,
+        Some(t) => match agent(t) {
+            Some(true) => ClaudeCodeEntry::Connected,
+            Some(false) => ClaudeCodeEntry::Stale("Claude Code's agent is switched off".into()),
+            None => ClaudeCodeEntry::Stale("Claude Code has an old token".into()),
+        },
+    }
+}
+
+/// Whether `t` is a whole token as this server makes them (`kv_` and 64 hex digits), not
+/// one shown masked (`kv_ab…`, `kv_****`).
+fn looks_like_token(t: &str) -> bool {
+    t.strip_prefix("kv_").is_some_and(|h| h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
+/// The port of a URL of this machine's MCP server (`http://127.0.0.1:47070/mcp`); None for
+/// another host or path.
+fn url_port(url: &str) -> Option<u16> {
+    let rest = url.strip_prefix("http://")?;
+    let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
+    if path.trim_end_matches('/') != "mcp" {
+        return None;
+    }
+    let (host, port) = authority.rsplit_once(':')?;
+    if !matches!(host, "127.0.0.1" | "localhost" | "[::1]") {
+        return None;
+    }
+    port.parse().ok()
+}
+
+/// A URL's scheme, host and port only: its path, query and any credentials are not shown.
+fn url_origin(url: &str) -> String {
+    let (scheme, rest) = url.split_once("://").unwrap_or(("", url));
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    if scheme.is_empty() { host.to_string() } else { format!("{scheme}://{host}") }
 }
 
 // MARK: HTTP
@@ -873,6 +976,55 @@ fn reply_content(resp: &Value) -> Vec<Value> {
 mod tests {
     use serde_json::{Value, json};
     use std::path::PathBuf;
+
+    /// Claude Code's entry counts as connected only when it reaches this server's port with
+    /// the token of an agent that is on: an entry of that name alone is not enough. What
+    /// can't be read (a masked token, another format) is neither connected nor wrong.
+    #[test]
+    fn a_claude_code_entry_must_point_here_with_a_current_token() {
+        use super::ClaudeCodeEntry::{Connected, Stale, Unknown};
+        let (current, off, old) =
+            (format!("kv_{}", "a".repeat(64)), format!("kv_{}", "b".repeat(64)), format!("kv_{}", "c".repeat(64)));
+        let entry = |url: &str, header: &str| {
+            format!(
+                "recouvrance:\n  Scope: User config (available in all your projects)\n  Status: ✔ Connected\n  Type: http\n  URL: {url}\n  Headers:\n    {header}\n\nTo remove this server, run: claude mcp remove recouvrance -s user\n"
+            )
+        };
+        let bearer = |t: &str| format!("Authorization: Bearer {t}");
+        let agent = |t: &str| match t {
+            t if t == current => Some(true),
+            t if t == off => Some(false),
+            _ => None,
+        };
+        let judge = |out: &str| super::judge_claude_code_entry(out, 47199, agent);
+        let here = "http://127.0.0.1:47199/mcp";
+        assert_eq!(judge(&entry(here, &bearer(&current))), Connected);
+        assert_eq!(judge(&entry("http://localhost:47199/mcp/", &bearer(&current))), Connected);
+        // The header's name and scheme in any case.
+        assert_eq!(judge(&entry(here, &format!("authorization: bearer {current}"))), Connected);
+        // Another Recouvrance's port.
+        assert_eq!(
+            judge(&entry("http://127.0.0.1:47070/mcp", &bearer(&current))),
+            Stale("Claude Code points at port 47070, not 47199".into())
+        );
+        // The token from before New token, and an agent switched off.
+        assert_eq!(judge(&entry(here, &bearer(&old))), Stale("Claude Code has an old token".into()));
+        assert_eq!(judge(&entry(here, &bearer(&off))), Stale("Claude Code's agent is switched off".into()));
+        // Another host: only its scheme, host and port are shown.
+        assert_eq!(
+            judge(&entry("https://user:pw@example.com:47199/mcp?key=s3cret", &bearer(&current))),
+            Stale("Claude Code points at https://example.com:47199".into())
+        );
+        assert!(matches!(judge(&format!("recouvrance:\n  Type: http\n  URL: {here}\n")), Stale(_)));
+        assert!(matches!(judge("recouvrance:\n  Type: stdio\n  Command: npx\n"), Stale(_)));
+        assert!(matches!(judge(&format!("recouvrance:\n  Type: sse\n  URL: {here}\n")), Stale(_)));
+        // A masked token may be the right one: unknown, not "old".
+        for masked in ["kv_****", "kv_aaaa…", "kv_aaaa...", "***", &current[..20]] {
+            assert_eq!(judge(&entry(here, &bearer(masked))), Unknown, "{masked}");
+        }
+        // A format this version doesn't read.
+        assert_eq!(judge("recouvrance:\n  Transport → http://127.0.0.1:47199/mcp\n"), Unknown);
+    }
 
     /// Claude Code, run as the assistant, sends the label the activity log names it by, with
     /// the agent's token.

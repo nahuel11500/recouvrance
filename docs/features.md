@@ -1,6 +1,13 @@
 # Features
 
-- **Contexts**: pick one or several on launch; tables merge clusters with a Context column. When a
+- **Contexts**: pick one or several on launch; tables merge clusters with a Context column. Each
+  context connects on its own: the first rows show once one cluster has answered and the others
+  have had 2 more seconds, so a cluster that can't be reached, or a login waiting in the browser,
+  doesn't hold back the others' rows. A cluster still connecting is said above the list and joins
+  it when it answers, and the page on screen then (a Cluster or Argo CD overview is built again);
+  one that fails shows its own error. Once every cluster is in, the set's session is saved again
+  (and reopened whole if it was reopened without them and nothing changed since). The Pods list starts with the connect,
+  alongside the cluster's discovery and namespace list, when it is the list shown first. When a
   context's login command (its kubeconfig exec plugin) fails, the app says which program failed and
   its exit code: never its arguments, environment or output, where a client secret or a token can
   be. It adds the last line the plugin wrote to stderr when the kubeconfig sets
@@ -8,8 +15,10 @@
   from. A plugin that cannot start, often because it is not on the `PATH` the app was started
   with, is reported with its name. A proxy the app can't use (the kubeconfig's `proxy-url`, or
   `HTTPS_PROXY`, with a scheme other than `http`, `https` or `socks5`, or none) is named by its
-  scheme, host and port, never its user and password; neither shows for any other URL in a
-  connection error.
+  scheme, host and port, never its user and password, even a password with an unescaped `/`, `?`
+  or `#`; by its scheme alone when its text holds a `#`, or when the host can't be told from the
+  password. Neither shows for any other URL in a connection error, unless its password holds an
+  unescaped `/`, `?` or `#` (#1000).
 - **Reopens where you left off**: each set of contexts keeps its tabs (the list or overview each
   shows, its resource type, namespaces and filter) and each type's filter, and the window keeps
   its place, size and whether it was maximized. On launch the first window reopens there once its
@@ -18,8 +27,8 @@
   detail page reopens on the list or overview it was opened from; a window that would be out of
   reach (a display unplugged) is centered. A window opened later starts fresh, and write mode is
   always off at launch. While a cluster of the set doesn't answer, or its namespaces don't list
-  (said above the list), nothing is saved for that set: what only that cluster has would read
-  as gone; connecting that set again once every cluster answers reopens it from what was saved.
+  (said above the list), or joins after the first rows, nothing is saved for that set: what only
+  that cluster has would read as gone; connecting that set again once every cluster answers reopens it from what was saved.
   A set connected for the first time is saved once connected. With two windows on one set, the
   one that reopened it saves it, until something is changed in the other.
 - **Sidebar**: the filter at its top finds pages and resource types (by name, kind or API group).
@@ -197,7 +206,7 @@
 - **RBAC-aware**: actions your Kubernetes RBAC forbids are disabled; *My access* shows a can-i
   matrix for the namespace, and says when the cluster (webhook or cloud IAM authorizer) may allow
   more than it lists.
-- **Problems**: one list of what is broken across clusters (crash loops, pending pods, unavailable workloads, NotReady nodes, nodes such a taint keeps pods off for more than 5 minutes after they started, failed jobs, CronJobs that stopped running (the second run their schedule and time zone call for since the last one hasn't started, `startingDeadlineSeconds` added) or whose last 3 runs or more didn't succeed (suspended ones are left out), pending volumes, and alerts firing in the cluster's Prometheus that nobody silenced). Click a count (critical, warnings, minor) to show that severity alone; the filter box takes text and `ns:`, `kind:` (`kind:alert`, `kind:service`) and `ctx:` terms, as the Timeline's. One scan per cluster serves the page, the sidebar count of every window and the agents' `find_problems`: a cluster is scanned again every 2 minutes (eight times as long as a scan takes, when that is longer), a hidden window starts no scan, though an agent's `find_problems` still scans when the latest findings are too old. The page opens on the latest findings at once and says how old they are; during a scan each check's new findings show as soon as it finishes, and Refresh asks for a scan started after it (a scan already running is waited for, then another one runs). A Service with no ready endpoint is looked into once, then again when it changes, after 10 minutes, or (when it selects no pod because a workload is scaled to 0) once that workload is scaled up. The first count waits for the list on screen. A scan started by the sidebar reads at most 8 of the 32 namespaces read at once, so the page on screen always has the others; once the page, Refresh or an agent waits for it, it reads in the foreground. A page scoped to some namespaces shows them from the sidebar's scan of the cluster when there is one; Refresh there scans only those namespaces. Refresh and an agent's `max_age_seconds: 0` judge every Service again. The sidebar count's tooltip says how old it is, and how often it comes.
+- **Problems**: one list of what is broken across clusters (crash loops, pending pods, unavailable workloads, NotReady nodes, nodes such a taint keeps pods off for more than 5 minutes after they started, failed jobs, CronJobs that stopped running (the second run their schedule and time zone call for since the last one hasn't started, `startingDeadlineSeconds` added) or whose last 3 runs or more didn't succeed (suspended ones are left out), pending volumes, Argo CD Applications that need attention, and alerts firing in the cluster's Prometheus that nobody silenced). Click a count (critical, warnings, minor) to show that severity alone; the filter box takes text and `ns:`, `kind:` (`kind:alert`, `kind:service`) and `ctx:` terms, as the Timeline's. One scan per cluster serves the page, the sidebar count of every window and the agents' `find_problems`: a cluster is scanned again every 2 minutes (eight times as long as a scan takes, when that is longer), a hidden window starts no scan, though an agent's `find_problems` still scans when the latest findings are too old. The page opens on the latest findings at once and says how old they are; during a scan each check's new findings show as soon as it finishes, and Refresh asks for a scan started after it (a scan already running is waited for, then another one runs). A Service with no ready endpoint is looked into once, then again when it changes, after 10 minutes, or (when it selects no pod because a workload is scaled to 0) once that workload is scaled up. The first count waits for the list on screen. A scan started by the sidebar reads at most 8 of the 32 namespaces read at once, so the page on screen always has the others; once the page, Refresh or an agent waits for it, it reads in the foreground. A page scoped to some namespaces shows them from the sidebar's scan of the cluster when there is one; Refresh there scans only those namespaces. Refresh and an agent's `max_age_seconds: 0` judge every Service again. The sidebar count's tooltip says how old it is, and how often it comes.
 - **Alerts where you look**: a namespace's page lists the alerts labeled with it, and a pod's, workload's, volume's or node's page the alerts about it (a pod's include its workload's, a workload's its pods'), with severity, summary, how long, runbook link, and silenced or inhibited ones muted when an Alertmanager is found.
 - **Upgrade check** (Cluster overview → *Upgrade check*): per cluster, what needs action before it
   moves to a newer minor version (the next one by default; the arrows pick another), most urgent first:
@@ -233,6 +242,22 @@
   Namespaces, Argo CD Applications) whose deletion has waited more than 10 minutes, with the
   finalizers holding them (for a Namespace, the resources left); their Delete dialog offers to
   remove the finalizers.
+- **Argo CD Applications that need attention**: the Problems page lists, under the cluster and
+  namespace they deploy to, the Applications that are Degraded (critical), whose last sync failed,
+  that report an error condition (`ComparisonError`, `SyncError`, `InvalidSpecError`...), whose
+  sync has run for more than 10 minutes, or that have resources Missing with auto-sync on
+  (warnings). An Application synced by hand is never listed for being out of sync, nor for what it
+  has not deployed yet (Missing). They count in the sidebar badge, `find_problems` reports them, and
+  a row opens the Application's page on its hub, which needn't be connected; the reason names the
+  hub when it is another cluster. The hubs read are the cluster scanned when it serves Argo CD,
+  and those found this session by the Argo CD page or an object's Argo CD section (only the ones
+  set in Settings, when some are): a scan in the background asks no other context, and so never
+  starts a login for a context not logged in this session (one logged in may refresh its
+  credentials as it would anywhere else in the app). Each hub's Applications are read lean, from
+  the API server's cache, at most once a minute for every cluster scanned; a hub that doesn't
+  answer within 20 seconds is named as not checked, and that answer serves every cluster's scan
+  for the minute, so it doesn't hold back what the others found. A cluster whose Applications you
+  may not list (access to some namespaces only) shows no Argo CD line.
 - **ExternalSecrets**: ExternalSecrets that fail to sync and secret stores not Ready show on the
   Problems page; a Secret made by an ExternalSecret shows where it comes from (the ExternalSecret,
   its store, last refresh, Ready), and an ExternalSecret's page links its store and target Secret.
@@ -509,7 +534,7 @@
   clusters and namespaces picked, and the object whose page is open (with its context), or the
   list with its filter and the row selected, or the page (Problems, Timeline, overviews, Helm,
   Argo CD). A page's *Investigate* asks it beside the page when it is open there.
-- **Overviews**: cluster capacity and health, workloads status, Helm releases (values masked; install from your repos, roll back and uninstall through your `helm` CLI).
+- **Overviews**: cluster capacity and health (requested is what the pods bound to a node hold there; pending pods no node took are said apart, with what they ask for), workloads status, Helm releases (values masked; install from your repos, roll back and uninstall through your `helm` CLI).
 - **API requests** (Settings → API requests): per cluster, how many requests of each kind
   (discovery, lists, watches, metrics, logs, shells, writes) were made and how many failed; how
   long the API server took to start answering (p50, p95, slowest) and, for answers that end,
@@ -582,9 +607,15 @@
   type them as before.
 - **Write mode** (off by default): click the `read-only` badge to enable scale, restart, delete
   (confirmed as set per kind), YAML edits (validated by a server dry run first), cordon/uncordon nodes,
-  debug pods with an ephemeral container (falls back to a Pod Security "restricted" profile), run a CronJob now, suspend/resume (CronJobs, Flux, Argo CronWorkflows), drain nodes, force delete
+  debug pods with an ephemeral container (falls back to a Pod Security "restricted" profile), *Evict* a
+  pod (through the Eviction API, like a drain: refused when a PodDisruptionBudget would be broken,
+  and the refusal names the budget), run a CronJob now, suspend/resume (CronJobs, Flux, Argo CronWorkflows), drain nodes, force delete
   or remove finalizers (only once the delete leaves it stuck terminating: it already was, or still is
-  after 10 seconds), Flux *Reconcile*, Argo CD
+  after 10 seconds), delete a Deployment, StatefulSet, DaemonSet, ReplicaSet or CronJob and keep
+  what it owns (a *Keep ... (orphan them)* box in its Delete dialog, such as *Keep its ReplicaSets and pods* for a
+  Deployment; `kubectl delete --cascade=orphan`: how a StatefulSet's volume claim templates or a selector are changed
+  without stopping its pods; not together with removing finalizers, which would delete what it keeps), an ExternalSecret's *Force
+  refresh* (its `force-sync` annotation: the operator fetches it from its store now), Flux *Reconcile*, Argo CD
   *Refresh*/*Hard refresh*/*Sync*/*Terminate*/*Roll back*, create/apply YAML (a server dry run first, then a confirmation
   showing what each object changes against the cluster: created, changed with its diff, or no change). YAML edits on a detail
   page save only that object: a changed kind, API group, namespace or name is refused, and so are masked Secret values. The
@@ -600,8 +631,8 @@
   `kubectl` line shows `--as`. A protected context still asks for its confirmation (a wait or its name). Reads go as you; write mode and
   the identity are checked again when each request is sent (an identity changed meanwhile sends
   nothing). Actions disabled because your RBAC forbids them stay enabled when the context has an
-  identity. Covered: scale, restart, rollback, delete (force, finalizers), YAML save, the values
-  editor, Apply, cordon/uncordon, drain, CronJob run, suspend/resume, Flux reconcile, Argo CD
+  identity. Covered: scale, restart, rollback, delete (force, finalizers, orphan), YAML save, the values
+  editor, Apply, cordon/uncordon, drain, evict, ExternalSecret refresh, CronJob run, suspend/resume, Flux reconcile, Argo CD
   refresh/sync/terminate/rollback, role bindings. Not covered: Helm, bulk delete from tables, plugins, shells, debug,
   node shell, file copy and ServiceAccount kubeconfigs. Agents never run as it.
 - **Plugins**: your own commands on resources (`~/.config/recouvrance/plugins.yaml`):

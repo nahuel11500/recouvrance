@@ -88,6 +88,7 @@ impl LeanObject {
             name: self.metadata.name.clone()?,
             reason,
             age: self.metadata.creation_timestamp.as_deref().and_then(|t| t.parse().ok()),
+            on_hub: None,
         })
     }
 }

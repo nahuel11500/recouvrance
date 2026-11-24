@@ -12,7 +12,12 @@ yanked = "deny"
 # Also listed, with reasons and an expiry, in osv-scanner.toml (for OSV-Scanner and Scorecard):
 # - instant, paste, rustls-pemfile, rustybuzz, ttf-parser, zbus_names, zvariant,
 #   zvariant_derive: deep in the GUI toolkit and platform stacks, waiting on upstream.
+# - chrono (https://rustsec.org/advisories/RUSTSEC-2026-0543): unmaintained, not a
+#   vulnerability; we use jiff, chrono comes in through gpui, rmcp and schemars.
 unmaintained = "workspace"
+# Unsound code is checked in every crate, not only direct dependencies (the default): OSV and
+# Scorecard count it wherever it is, and a fixed version is usually a lockfile update away.
+unsound = "all"
 
 [licenses]
 version = 2

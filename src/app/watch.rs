@@ -105,6 +105,8 @@ impl AppView {
     }
 
     fn switch_watch(&mut self, fresh: bool, cx: &mut Context<Self>) {
+        // The lists a connect started early go to the first list after it, or nowhere.
+        let early = self.early.take();
         let left_key = self.view_key.clone();
         self.keep_view(cx);
         let left = self.leave_list(cx);
@@ -140,13 +142,8 @@ impl AppView {
                 }
             })
             .collect();
-        let key = format!(
-            "{}|{}|{:?}|{:?}",
-            names.join(","),
-            kind.key(),
-            watched,
-            self.column_prefs.custom(&kind.kubectl_name())
-        );
+        let custom = self.column_prefs.custom(&kind.kubectl_name());
+        let key = list_key(&names, &kind, &watched, &custom);
         let metrics_on: Vec<bool> = self.clusters.iter().map(|(c, _)| crate::settings::metrics_on(c)).collect();
         let kept = self.keep_left(left_key, left, Some(&key), fresh, cx);
         if fresh {
@@ -255,9 +252,12 @@ impl AppView {
             });
         }
         let restored = kept.is_some();
+        // The connect's early lists, when this is the list they started.
+        let mut early = early.filter(|e| !restored && e.matches(&kind, &custom));
         let (mut watch, pause) = kept.take().unwrap_or_else(|| {
             let watch = ListWatch { tasks: Vec::new(), resources: Vec::new(), metrics_on: metrics_on.clone() };
-            (watch, k8s::Pause::default())
+            // Theirs, so they pause and go on with the others.
+            (watch, early.as_ref().map_or_else(k8s::Pause::default, super::reach::EarlyLists::pause))
         });
         let mut metrics = Vec::new();
         // Set while the list isn't on screen (another page, a hidden window): watches hold
@@ -275,16 +275,20 @@ impl AppView {
                 // usage bars' read of whole pods waits for them, the list gets the API first.
                 let rows_due = k8s::Pause::default();
                 rows_due.set(progressive);
-                let (guard, rx) = k8s::watch_table_paused(
-                    client.clone(),
-                    kind.clone(),
-                    ns.clone(),
-                    Arc::new(self.column_prefs.custom(&kind.kubectl_name())),
-                    pause.clone(),
-                    progressive,
-                    // The timeline records what this list sees change (no request added).
-                    crate::timeline::tap(&ctx_name, &kind, ns.clone()),
-                );
+                // Started with the connect, alongside discovery: its rows may be in already.
+                let started = early.as_mut().and_then(|e| e.take(&ctx_name, ns.as_deref()));
+                let (guard, rx) = started.unwrap_or_else(|| {
+                    k8s::watch_table_paused(
+                        client.clone(),
+                        kind.clone(),
+                        ns.clone(),
+                        Arc::new(custom.clone()),
+                        pause.clone(),
+                        progressive,
+                        // The timeline records what this list sees change (no request added).
+                        crate::timeline::tap(&ctx_name, &kind, ns.clone()),
+                    )
+                });
                 let (shown, rows_in) = (pause.clone(), rows_due.clone());
                 let task = cx.spawn(async move |this, cx| follow_table(this, cx, id, ix, rx, shown, rows_in).await);
                 watch.tasks.push((guard, task));
@@ -429,7 +433,11 @@ impl AppView {
             let table = self.table.read(cx);
             if table.delegate().columns_count(cx) > 0 { table.delegate().defs() } else { Arc::default() }
         };
+        #[cfg(feature = "dev")]
+        let listed = matches!(msg, TableMsg::Listed);
         let up = self.list.apply(ctx, &name, msg, &shown);
+        #[cfg(feature = "dev")]
+        crate::dev::first_rows::seen(&name, up.rows, listed);
         if let Some(columns) = up.columns {
             self.table.update(cx, |t, cx| {
                 t.delegate_mut().update_columns(columns);
@@ -452,6 +460,17 @@ impl AppView {
         }
         cx.notify();
     }
+}
+
+/// What a list is kept and cached under: its clusters, kind, what each cluster watches
+/// (`cluster_namespace`) and its custom columns.
+pub(super) fn list_key(
+    names: &[String],
+    kind: &k8s::Kind,
+    watched: &[Option<Option<String>>],
+    custom: &[(String, String)],
+) -> String {
+    format!("{}|{}|{:?}|{:?}", names.join(","), kind.key(), watched, custom)
 }
 
 /// The newest value already waiting in a channel (older ones are stale).

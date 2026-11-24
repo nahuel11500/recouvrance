@@ -348,7 +348,10 @@ impl AssistantView {
                     }))),
             )
             .children(self.setup_error.clone().map(|e| div().text_sm().text_color(theme.danger).child(e)))
-            .child(div().text_xs().text_color(muted).child("Stored in ~/.config/recouvrance/anthropic-key (readable only by you). ANTHROPIC_API_KEY works too."))
+            .child(div().text_xs().text_color(muted).child(format!(
+                "Stored in {} (readable only by you). ANTHROPIC_API_KEY works too.",
+                crate::paths::shown_config("anthropic-key")
+            )))
             .into_any_element()
     }
 }
