@@ -314,9 +314,11 @@ mod tests {
             Some("2026-11-21T01:05:00Z"),
         );
         assert!(reason(&job, "2026-11-23T01:01:01Z").unwrap().ends_with("(Europe/Paris)"));
-        // spec.timeZone wins over the prefix.
+        // spec.timeZone wins over the prefix: in UTC, 02:00 is an hour later.
         job.spec.time_zone = Some("UTC".into());
+        job.status.last_schedule_time = Some("2026-11-21T02:00:00Z".into());
         assert_eq!(reason(&job, "2026-11-23T01:01:01Z"), None);
+        assert!(reason(&job, "2026-11-23T02:01:01Z").unwrap().ends_with("`0 2 * * *` (UTC)"));
     }
 
     #[test]
