@@ -466,7 +466,7 @@ async fn fetch_objects(
 
 /// Does a pod spec use this Secret/ConfigMap (volumes, env, envFrom, pull secrets, optional
 /// ones too)? The same references the Map and the Problems page read (`spec_refs`).
-pub(super) fn references(spec: &serde_json::Value, name: &str, secret: bool) -> bool {
+pub(super) fn references(spec: &Value, name: &str, secret: bool) -> bool {
     use crate::problems::references::{Of, spec_refs};
     let of = if secret { Of::Secret } else { Of::ConfigMap };
     spec_refs(None, spec, true).iter().any(|t| t.of == of && t.name == name)

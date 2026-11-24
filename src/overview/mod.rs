@@ -96,7 +96,7 @@ pub struct Related {
     pub pod_rows: Vec<PodRow>,
     /// What the Map tab uses of the rest, taken once it is loaded, off the UI thread (None
     /// until the page's first load).
-    pub map: Option<std::sync::Arc<crate::map::Known>>,
+    pub map: Option<Arc<crate::map::Known>>,
 }
 
 impl Related {
