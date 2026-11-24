@@ -556,12 +556,18 @@ impl Policy {
         changed
     }
 
+    /// Whether a rule names `refresh`, `sync` or `suspend` (not by `*`): rules that do were
+    /// written for the GitOps verbs, whatever version they say.
+    pub(super) fn names_gitops_verb(&self) -> bool {
+        self.rules.iter().any(|r| Verb::GITOPS.into_iter().any(|v| r.lists_verb(v)))
+    }
+
     /// The rules and limits as JSON, for "Copy rules": with the `version` of the rules, so
     /// that a later version pasting them reads them as they were meant (see [`Policy::pasted`]).
     pub fn copied(&self) -> serde_json::Result<String> {
         let mut json = serde_json::to_value(self)?;
         if let Some(fields) = json.as_object_mut() {
-            fields.insert("version".into(), super::config::CONFIG_VERSION.into());
+            fields.insert("version".into(), super::rules_file::FILE_VERSION.into());
         }
         serde_json::to_string_pretty(&json)
     }
@@ -570,7 +576,10 @@ impl Policy {
     /// No pasted rule counts as approved: it would win over every Ask rule while looking
     /// like any other Allow. Rules copied before the GitOps verbs (no `version`, from an
     /// older clipboard or a note) get them as agents.json's and rules.yaml's do, so a rule
-    /// that denied or asked for `patch` still covers a sync.
+    /// that denied or asked for `patch` still covers a sync. Rules that name one of them
+    /// without a `version` (written by hand, or by a build that copied none) are read as
+    /// current: before the GitOps verbs no rule could name them, and adding them would
+    /// widen an Allow the writer narrowed.
     pub fn pasted(text: &str) -> Option<Self> {
         let json: serde_json::Value = serde_json::from_str(text).ok()?;
         let version = json.get("version").and_then(serde_json::Value::as_u64).unwrap_or(0);
@@ -581,7 +590,7 @@ impl Policy {
         for r in &mut p.rules {
             r.approved = false;
         }
-        if version < u64::from(super::config::GITOPS_VERBS_VERSION) {
+        if version < u64::from(super::config::GITOPS_VERBS_VERSION) && !p.names_gitops_verb() {
             p.add_gitops_verbs();
         }
         Some(p)
@@ -1053,6 +1062,12 @@ pub(super) mod tests {
         let mut now = Policy::pasted(&text).unwrap();
         now.rules[1].verbs.retain(|v| v != "sync");
         let pasted = Policy::pasted(&now.copied().unwrap()).unwrap();
+        assert_eq!(pasted.rules, now.rules);
+        assert_eq!(pasted.decide(&sync).mode, Mode::Allow);
+        // Without a version but naming a GitOps verb: written for them, read as written.
+        let mut json: serde_json::Value = serde_json::from_str(&now.copied().unwrap()).unwrap();
+        json.as_object_mut().unwrap().remove("version");
+        let pasted = Policy::pasted(&json.to_string()).unwrap();
         assert_eq!(pasted.rules, now.rules);
         assert_eq!(pasted.decide(&sync).mode, Mode::Allow);
     }
