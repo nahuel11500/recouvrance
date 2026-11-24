@@ -23,7 +23,9 @@ use crate::details::ArgoAction;
 use crate::k8s;
 use crate::k8s::argo::dashboard::{self, Cards, Commit, Problem};
 use crate::k8s::argo::diagnosis::{Res, span_text};
+use crate::k8s::argo::sync_diff::{self, Entry};
 use crate::k8s::argo::{self, Source, api, short_revision};
+use crate::smartdiff::{self, ObjectKey, ResourceChange, SmartDiff};
 use crate::status::Tone;
 use crate::ui::selectable::selectable;
 
@@ -35,6 +37,31 @@ const RUNNING_EVERY: Duration = Duration::from_secs(3);
 const PROBLEMS_SHOWN: usize = 5;
 /// Names listed per kind of change in the Sync diff card.
 const NAMES_SHOWN: usize = 4;
+/// Lines of one resource's diff shown, at most.
+const DIFF_LINES: usize = 400;
+/// Lines of a summary shown, at most.
+const GROUPS_SHOWN: usize = 50;
+/// Resources listed, at most.
+const ROWS_SHOWN: usize = 200;
+
+/// A read of the manifests' diff of two deployments.
+type DiffRead = std::pin::Pin<Box<dyn Future<Output = Result<Arc<SmartDiff>, String>>>>;
+
+/// Two deployments of the history compared (by id, the older first).
+struct Compare {
+    from: i64,
+    to: i64,
+    /// What their sources asked for; None while worked out.
+    sources: Option<Arc<SmartDiff>>,
+    /// What Argo CD renders at their revisions; None while read.
+    manifests: Option<Result<Arc<SmartDiff>, String>>,
+    /// What to know about how they are rendered (a source with no revision recorded).
+    notes: Vec<String>,
+    /// Noise shown.
+    noise: bool,
+    /// The resources whose diff is unfolded.
+    open: HashSet<ObjectKey>,
+}
 
 /// The dashboard open on the page.
 pub(super) struct Dashboard {
@@ -58,6 +85,14 @@ pub(super) struct Dashboard {
     open: HashSet<String>,
     /// Made-up environments and their cards (the developer tools' example): nothing is read.
     example: Option<Vec<(String, Arc<Cards>)>>,
+    /// A deployment picked, waiting for a second to compare it with.
+    picked: Option<i64>,
+    /// The two deployments compared.
+    compare: Option<Compare>,
+    /// Their sources' diff, worked out off the UI thread.
+    sources_load: crate::latest::Latest,
+    /// Their manifests, read when the comparison opens.
+    manifests_load: crate::latest::Latest,
 }
 
 impl Dashboard {
@@ -75,7 +110,25 @@ impl Dashboard {
             tick: None,
             open: HashSet::new(),
             example: None,
+            picked: None,
+            compare: None,
+            sources_load: Default::default(),
+            manifests_load: Default::default(),
         }
+    }
+
+    /// Close the comparison, its reads dropped.
+    fn close_compare(&mut self) {
+        self.compare = None;
+        self.picked = None;
+        self.sources_load.cancel();
+        self.manifests_load.cancel();
+    }
+
+    /// The comparison of `from` and `to`, when it is the one open (a result for another is
+    /// left).
+    fn comparing(&mut self, from: i64, to: i64) -> Option<&mut Compare> {
+        self.compare.as_mut().filter(|c| (c.from, c.to) == (from, to))
     }
 
     fn current(&self) -> Option<&Key> {
@@ -181,6 +234,7 @@ impl ArgoView {
         }
         d.tab = tab;
         d.open.clear();
+        d.close_compare();
         d.tick = None;
         d.dirty = false;
         self.load_dashboard(cx);
@@ -279,6 +333,97 @@ impl ArgoView {
             return;
         }
         self.load_dashboard(cx);
+    }
+
+    /// The read of the manifests rendered at the deployments `from` and `to` of the tab shown:
+    /// by Argo CD's API, or from the Argo CD server set for its hub.
+    fn manifests_read(&self, spec: u64, from: &Entry, to: &Entry) -> DiffRead {
+        let fail = |why: &str| -> DiffRead {
+            let why = why.to_string();
+            Box::pin(async move { Err(why) })
+        };
+        let Some(d) = &self.dashboard else { return fail("No dashboard open.") };
+        if d.example.is_some() {
+            return fail("A made-up example: no manifests are rendered.");
+        }
+        let (Some(rf), Some(rt)) = (from.revision.clone(), to.revision.clone()) else {
+            return fail("A deployment compared has no revision recorded: its manifests can't be rendered.");
+        };
+        let Some(a) = d.current().and_then(|k| self.find(k)) else {
+            return fail("This Application is no longer listed.");
+        };
+        let (ns, name) = (a.app.namespace.clone(), a.app.name.clone());
+        match &a.source {
+            Source::Hub(hub) => Box::pin(sync_diff::read_hub(hub.context.clone(), ns, name, spec, rf, rt)),
+            Source::Api(endpoint) => Box::pin(api::manifests_diff(endpoint.clone(), ns, name, spec, rf, rt)),
+        }
+    }
+
+    /// Compare the deployments `from` and `to` (ids, the older first) of the tab shown: their
+    /// sources, and their manifests read now (each revision's kept once read). Both are worked
+    /// out off the UI thread; a newer comparison replaces this one's reads.
+    fn open_compare(&mut self, from: i64, to: i64, cx: &mut Context<Self>) {
+        let Some(Ok(cards)) = self.dashboard.as_ref().and_then(Dashboard::shown) else { return };
+        let entry = |id: i64| cards.history.entries.iter().find(|e| e.id == id).cloned();
+        let (Some(a), Some(b)) = (entry(from), entry(to)) else { return };
+        // Rendered with the Application's sources now: only when they have the shape they had.
+        let spec = cards.history.spec;
+        let (manifests, notes): (DiffRead, Vec<String>) = match sync_diff::plan(spec, &a, &b) {
+            Ok(notes) => (self.manifests_read(spec.hash, &a, &b), notes),
+            Err(why) => (Box::pin(async move { Err(why) }), Vec::new()),
+        };
+        let Some(d) = &mut self.dashboard else { return };
+        d.picked = None;
+        d.compare =
+            Some(Compare { from, to, sources: None, manifests: None, notes, noise: false, open: HashSet::new() });
+        let sources = cx.background_executor().spawn(async move {
+            let diff = smartdiff::compare_values(&a.sources, &b.sources);
+            diff.prepare();
+            Arc::new(diff)
+        });
+        d.sources_load.spawn(cx, sources, move |this: &mut Self, diff, cx| {
+            if let Some(c) = this.dashboard.as_mut().and_then(|d| d.comparing(from, to)) {
+                c.sources = Some(diff);
+                cx.notify();
+            }
+        });
+        d.manifests_load.spawn(cx, manifests, move |this: &mut Self, diff, cx| {
+            if let Some(c) = this.dashboard.as_mut().and_then(|d| d.comparing(from, to)) {
+                c.manifests = Some(diff);
+                cx.notify();
+            }
+        });
+        cx.notify();
+    }
+
+    /// The diff of a deployment against the one before: opened, or closed when it is open.
+    fn toggle_compare(&mut self, from: i64, to: i64, cx: &mut Context<Self>) {
+        let Some(d) = &mut self.dashboard else { return };
+        if d.comparing(from, to).is_some() {
+            d.close_compare();
+            cx.notify();
+        } else {
+            self.open_compare(from, to, cx);
+        }
+    }
+
+    /// Pick a deployment to compare: the second picked opens the comparison of the two.
+    fn pick(&mut self, id: i64, cx: &mut Context<Self>) {
+        let Some(d) = &mut self.dashboard else { return };
+        let picked = d.picked;
+        match picked {
+            Some(p) if p == id => d.picked = None,
+            Some(p) => return self.open_compare(p.min(id), p.max(id), cx),
+            None => d.picked = Some(id),
+        }
+        cx.notify();
+    }
+
+    fn update_compare(&mut self, cx: &mut Context<Self>, f: impl FnOnce(&mut Compare)) {
+        if let Some(c) = self.dashboard.as_mut().and_then(|d| d.compare.as_mut()) {
+            f(c);
+        }
+        cx.notify();
     }
 
     /// The made-up example of the developer tools: three environments, nothing read.
@@ -408,6 +553,7 @@ impl ArgoView {
                     .child(self.diff_card(d, c, cx))
                     .child(self.history_card(d, c, cx)),
             )
+            .when_some(d.compare.as_ref(), |v, cmp| v.child(self.compare_view(cmp, cx)))
             .into_any_element()
     }
 
@@ -826,8 +972,22 @@ impl ArgoView {
                     .child(format!("{} succeeded, {} failed", h.succeeded, h.failed))
                     .when(!h.dots.is_empty(), |row| row.child(open)),
             )
+            .when(d.is_open("history") && h.entries.len() > 1, |v| {
+                v.child(
+                    div()
+                        .text_xs()
+                        .text_color(muted)
+                        .child("diff: what changed since the deployment before; pick two to compare them."),
+                )
+            })
             .when(d.is_open("history"), |v| {
                 v.children(h.dots.iter().rev().map(|dot| {
+                    // The deployment before this one, to diff against.
+                    let before = dot.id.and_then(|id| {
+                        let i = h.entries.iter().position(|e| e.id == id)?;
+                        Some((h.entries.get(i.checked_sub(1)?)?.id, id))
+                    });
+                    let pickable = dot.id.filter(|id| h.entries.iter().any(|e| e.id == *id));
                     let mut parts = vec![match dot.id {
                         Some(id) => format!("#{id}"),
                         None => "failed sync".to_string(),
@@ -841,14 +1001,210 @@ impl ArgoView {
                     if let Some(by) = &dot.by {
                         parts.push(format!("by {by}"));
                     }
+                    let shown = |from: i64, to: i64| d.compare.as_ref().is_some_and(|c| (c.from, c.to) == (from, to));
                     h_flex()
                         .gap_1p5()
                         .text_xs()
                         .child(div().size(px(7.)).rounded_full().bg(if dot.ok { theme.success } else { theme.danger }))
-                        .child(selectable(parts.join(" · ")))
+                        .child(div().flex_1().min_w_0().child(selectable(parts.join(" · "))))
+                        .when_some(before, |row, (from, to)| {
+                            let label = if shown(from, to) { "hide diff" } else { "diff" };
+                            row.child(
+                                link(("argo-dash-hdiff", to.unsigned_abs() as usize), label, cx)
+                                    .on_click(cx.listener(move |this, _, _, cx| this.toggle_compare(from, to, cx))),
+                            )
+                        })
+                        .when_some(pickable, |row, id| {
+                            let label = if d.picked == Some(id) { "picked" } else { "pick" };
+                            row.child(
+                                link(("argo-dash-pick", id.unsigned_abs() as usize), label, cx)
+                                    .on_click(cx.listener(move |this, _, _, cx| this.pick(id, cx))),
+                            )
+                        })
                 }))
             })
     }
+}
+
+impl ArgoView {
+    /// Two deployments compared, full width under the cards: what their sources asked for, then
+    /// what Argo CD renders at their revisions (summary first, noise folded, each resource's
+    /// diff unfolded on a click).
+    fn compare_view(&self, c: &Compare, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme().clone();
+        let muted = theme.muted_foreground;
+        let heading =
+            |text: &str| div().text_xs().font_weight(FontWeight::SEMIBOLD).text_color(muted).child(text.to_uppercase());
+        let note = |text: &str| div().text_xs().text_color(muted).child(selectable(text.to_string()));
+        let sources = match &c.sources {
+            None => note("Comparing…").into_any_element(),
+            Some(s) => match s.resources.first() {
+                None => note("Same sources: same revisions, values and parameters.").into_any_element(),
+                Some(r) => v_flex()
+                    .gap_1()
+                    .children(s.groups.iter().map(|g| div().text_sm().child(selectable(g.text()))))
+                    .child(lines_block(r.lines(false), cx))
+                    .into_any_element(),
+            },
+        };
+        let manifests = match &c.manifests {
+            None => note("Reading the manifests Argo CD renders at both revisions…").into_any_element(),
+            Some(Err(e)) => div().text_xs().text_color(theme.danger).child(selectable(e.clone())).into_any_element(),
+            Some(Ok(m)) => self.manifests_view(c, m, cx),
+        };
+        v_flex()
+            .gap_2()
+            .p_3()
+            .rounded_lg()
+            .border_1()
+            .border_color(theme.border)
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(format!("Deployment #{} → #{}", c.from, c.to)),
+                    )
+                    .child(link("argo-dash-compare-close", "close", cx).on_click(cx.listener(|this, _, _, cx| {
+                        if let Some(d) = &mut this.dashboard {
+                            d.close_compare();
+                        }
+                        cx.notify();
+                    }))),
+            )
+            .child(heading("Sources"))
+            .child(sources)
+            .child(heading("Rendered manifests"))
+            .children(c.notes.iter().map(String::as_str).map(note))
+            .child(manifests)
+            .into_any_element()
+    }
+
+    /// The manifests' smart diff: the summary (each change once, with where), the noise hidden
+    /// and counted, then a row per resource that unfolds its diff.
+    fn manifests_view(&self, c: &Compare, m: &SmartDiff, cx: &mut Context<Self>) -> AnyElement {
+        let muted = cx.theme().muted_foreground;
+        let noise = m.noise();
+        let empty = if m.is_empty() {
+            Some("Same rendered manifests at both revisions.")
+        } else if m.groups.is_empty() {
+            Some("Only noise changed.")
+        } else {
+            None
+        };
+        let by_rule: Vec<String> = m.noise_by_rule().iter().take(4).map(|(r, n)| format!("{r} {n}")).collect();
+        let noise_line = format!(
+            "{} {} ({})",
+            crate::plural::count(noise, "noise change"),
+            if c.noise { "shown" } else { "hidden" },
+            by_rule.join(", ")
+        );
+        let rows: Vec<&ResourceChange> = m.resources.iter().filter(|r| c.noise || !r.facts.is_empty()).collect();
+        let more_rows = rows.len().saturating_sub(ROWS_SHOWN);
+        let more_groups = m.groups.len().saturating_sub(GROUPS_SHOWN);
+        let changed = m.resources.iter().filter(|r| !r.facts.is_empty()).count();
+        let counts = format!(
+            "{} changed, {} the same or noise only",
+            crate::plural::count(changed, "resource"),
+            m.unchanged + m.resources.len() - changed
+        );
+        v_flex()
+            .gap_1()
+            .child(div().text_xs().text_color(muted).child(
+                "Argo CD renders both from the Application's sources as they are now, at each deployment's \
+                 revision: a change of its own parameters shows under Sources.",
+            ))
+            .children(empty.map(|e| div().text_sm().text_color(muted).child(e)))
+            .children(m.groups.iter().take(GROUPS_SHOWN).map(|g| {
+                h_flex()
+                    .gap_2()
+                    .child(div().text_sm().child(selectable(g.text())))
+                    .child(div().text_xs().text_color(muted).child(selectable(names(&g.resources))))
+            }))
+            .when(more_groups > 0, |v| {
+                v.child(
+                    div()
+                        .text_xs()
+                        .text_color(muted)
+                        .child(format!("… {} more", crate::plural::count(more_groups, "change"))),
+                )
+            })
+            .when(!m.is_empty(), |v| v.child(div().text_xs().text_color(muted).child(counts)))
+            .when(noise > 0, |v| {
+                v.child(
+                    h_flex().gap_2().text_xs().text_color(muted).child(selectable(noise_line)).child(
+                        link("argo-dash-noise", if c.noise { "hide" } else { "show" }, cx)
+                            .on_click(cx.listener(|this, _, _, cx| this.update_compare(cx, |c| c.noise = !c.noise))),
+                    ),
+                )
+            })
+            .children(rows.into_iter().take(ROWS_SHOWN).enumerate().map(|(i, r)| {
+                let open = c.open.contains(&r.key);
+                let key = r.key.clone();
+                let mut what: Vec<String> = r.facts.iter().take(3).map(smartdiff::Fact::text).collect();
+                if r.facts.len() > 3 {
+                    what.push(format!("+{} more", r.facts.len() - 3));
+                }
+                if r.facts.is_empty() {
+                    what.push(format!("noise only ({})", r.noise.len()));
+                }
+                let label = format!("{} {}", if open { "▾" } else { "▸" }, r.key.label());
+                v_flex()
+                    .gap_0p5()
+                    .child(
+                        h_flex()
+                            .gap_1p5()
+                            .text_xs()
+                            .child(link(("argo-dash-res", i), &label, cx).on_click(cx.listener(
+                                move |this, _, _, cx| {
+                                    let key = key.clone();
+                                    this.update_compare(cx, move |c| {
+                                        if !c.open.remove(&key) {
+                                            c.open.insert(key);
+                                        }
+                                    });
+                                },
+                            )))
+                            .child(div().text_color(muted).child(selectable(what.join("; ")))),
+                    )
+                    .when(open, |v| v.child(lines_block(r.lines(c.noise), cx)))
+            }))
+            .when(more_rows > 0, |v| {
+                v.child(
+                    div()
+                        .text_xs()
+                        .text_color(muted)
+                        .child(format!("… {} more", crate::plural::count(more_rows, "resource"))),
+                )
+            })
+            .into_any_element()
+    }
+}
+
+/// Some resources by kind and name, the first few.
+fn names(keys: &[ObjectKey]) -> String {
+    let mut out: Vec<String> = keys.iter().take(NAMES_SHOWN).map(|k| format!("{} {}", k.kind, k.name)).collect();
+    if keys.len() > NAMES_SHOWN {
+        out.push(format!("+{} more", keys.len() - NAMES_SHOWN));
+    }
+    out.join(", ")
+}
+
+/// A diff's lines, at most `DIFF_LINES`, then how many more.
+fn lines_block(lines: &[crate::history::DiffLine], cx: &App) -> Div {
+    let muted = cx.theme().muted_foreground;
+    if lines.is_empty() {
+        return v_flex().child(div().text_xs().text_color(muted).child("No line differs once noise is hidden."));
+    }
+    let more = lines.len().saturating_sub(DIFF_LINES);
+    v_flex()
+        .gap_0p5()
+        .child(crate::details::diff_block(&lines[..lines.len().min(DIFF_LINES)], cx))
+        .when(more > 0, |v| {
+            v.child(div().text_xs().text_color(muted).child(format!("… {} more", crate::plural::count(more, "line"))))
+        })
 }
 
 /// The In cluster card: the commit each source deploys.

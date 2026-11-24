@@ -26,6 +26,7 @@ pub mod diagnosis;
 pub mod grouping;
 pub mod ops;
 pub mod server;
+pub mod sync_diff;
 pub mod windows;
 
 /// The annotation Argo CD puts on what it deploys.

@@ -748,6 +748,10 @@ pub struct History {
     pub dots: Vec<Dot>,
     pub succeeded: usize,
     pub failed: usize,
+    /// Every deployment of the history, oldest first, as compared (see `sync_diff`).
+    pub entries: Vec<super::sync_diff::Entry>,
+    /// The Application's sources now: what any revision is rendered with.
+    pub spec: super::sync_diff::Spec,
 }
 
 pub fn history(app: &Value, n: usize) -> History {
@@ -786,7 +790,13 @@ pub fn history(app: &Value, n: usize) -> History {
     }
     let dots: Vec<Dot> = dots[dots.len().saturating_sub(n)..].to_vec();
     let failed = dots.iter().filter(|d| !d.ok).count();
-    History { succeeded: dots.len() - failed, failed, dots }
+    History {
+        succeeded: dots.len() - failed,
+        failed,
+        dots,
+        entries: super::sync_diff::entries(app),
+        spec: super::sync_diff::Spec::of(app),
+    }
 }
 
 // MARK: Cards

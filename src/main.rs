@@ -35,6 +35,7 @@ mod rbac;
 mod reachability;
 mod schema;
 mod settings;
+mod smartdiff;
 mod status;
 mod table;
 mod taints;

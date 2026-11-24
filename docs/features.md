@@ -319,6 +319,42 @@
   the page is hidden, once it shows again), and on *Refresh*. Leaving the tab or the page stops
   the read running; the page shown again reads the tab anew. The cards are worked out off the UI
   thread.
+- **What changed between two syncs**: in the History card's list, *diff* on a deployment compares
+  it with the one before, and *pick* on two deployments compares them; the comparison opens under
+  the cards. *Sources*: what each deployment asked for, from Argo CD's history (the revision
+  deployed, Helm values — `valuesObject` wins over the values text, as in Argo CD —, parameters
+  and value files, kustomize images and patches, a plugin's env), shown like Helm's values diff
+  (only changed lines, folded context, `-`/`+`) under a summary. Nothing there is masked: Helm
+  values, parameters and a plugin's env show as the Application holds them. *Rendered manifests*:
+  what Argo CD renders at each deployment's revision (`GET
+  /api/v1/applications/<name>/manifests?revision=`, or `sourcePositions`/`revisions` pairs for
+  several sources), from the Application's sources as they are now (a change of its own
+  parameters shows under *Sources*). A deployment made from another shape of sources (one source
+  then several, another count) or an Application with a source hydrator can't be rendered as it
+  was: the comparison says so rather than compare; a source with no revision recorded is said
+  (rendered at its target revision now). For an Application read on its hub, they come from the
+  Argo CD server set for that context (without one, it says so). Both are read by a smart diff:
+  a summary first (`image web 1.15.0 → 1.16.0`, `replicas 3 → 5`, `env FOO added`, `config key
+  app.yaml changed`, `2 resources added`), each change once with the resources it is in (one
+  image bump in 12 Deployments is one line; the first 50 changes and 200 resources listed); then
+  noise folded away and counted (`12 noise changes hidden (checksum annotation 6, chart label
+  6)`, *show* to see it): `checksum/*` annotations, `helm.sh/chart`, `chart` and
+  `app.kubernetes.io/version` labels, `pod-template-hash` and `controller-revision-hash`, an
+  image's digest when its tag changed too (a digest alone is said: *digest changed*), timestamps
+  in the object's own metadata, the status, the field managers, the last-applied annotation and
+  what the API server sets. A tag is never noise, however much it looks like a hash or a date, nor
+  is a timestamp in a pod template (`restartedAt`), env or data. A ConfigMap or Secret kustomize
+  regenerated under a new name (its 10-character content hash) is the same one (*renamed a → b*),
+  not one pruned and one added, and references to it that changed only by that rename are noise.
+  A pod template where only noise changed says *pod template changed (pods restart)* with the
+  keys (over Argo CD's API a Secret's values are hidden, so a `checksum/secret` annotation may be
+  all that tells it changed). Then a row per resource that unfolds its diff. A Secret's values
+  are never shown: only *Secret key X changed*, added or removed (also in a `List`; Argo CD hides
+  them in what it renders, so there only keys added or removed show). Only Secrets are masked: a
+  value that looks like a password in another kind is shown. Read on demand, when a comparison
+  opens, off the UI thread (Argo CD may take up to 2 minutes to render); each revision's manifests
+  are kept once read, under the Application's sources as they are now (the last 16, 64 MB at
+  most), and a newer comparison or another tab drops the read running.
 - **Argo CD sync, terminate and roll back**: *Sync* (the Application's page, its row menu, the
   Argo CD panel) reads the Application first and lists its resources out of sync, all ticked:
   untick some to sync only the others (hooks run only when all are synced; past 200 the whole
