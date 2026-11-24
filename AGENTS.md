@@ -75,7 +75,10 @@ an agent has used the app end to end and found nothing blocking:
   with `RECOUVRANCE_SMOKE`, the Problems scan with `RECOUVRANCE_PROBLEMS=1`, the Workloads
   overview with `RECOUVRANCE_DASH=1`, going back to a list with
   `RECOUVRANCE_BACKTIME=pods,deployments`, the whole app's memory with `--snapshot` and RSS
-  sampling; see [docs/development.md](docs/development.md)). Also, for the shared Problems scan:
+  sampling; see [docs/development.md](docs/development.md)). Also, for the first rows after a
+  connect, `RECOUVRANCE_FIRSTROWS=1` with one context, then the same plus a context that can't be
+  reached (on a tag without it, cherry-pick the commit that added it onto the tag). For the
+  shared Problems scan:
   - `RECOUVRANCE_PROBLEMS=twice` prints two scans in a row with their time, requests and MB (the
     second shows what the kept Service verdicts save); on a tag without `twice`, run `=1` twice;
   - requests per minute in Settings → API requests after 10 minutes with the Problems page on

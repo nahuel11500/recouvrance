@@ -50,6 +50,11 @@ impl AppView {
         self.page_scopes.insert(page, scope);
     }
 
+    /// Whether a page was built for the contexts connected now, whatever its namespaces.
+    pub(super) fn clusters_match(&self, page: EntityId) -> bool {
+        self.page_scopes.get(&page).is_some_and(|(clusters, _)| self.clusters.iter().map(|(c, _)| c).eq(clusters))
+    }
+
     /// Whether a page was built for the contexts and namespaces shown now.
     pub(super) fn scope_matches(&self, page: EntityId) -> bool {
         self.page_scopes.get(&page) == Some(&self.page_scope())

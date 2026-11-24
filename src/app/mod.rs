@@ -42,6 +42,7 @@ mod overviews;
 mod pages;
 mod pinned;
 mod problem_badge;
+mod reach;
 mod render;
 mod search_index;
 mod session;
@@ -515,6 +516,16 @@ pub struct AppView {
     /// A connect is in flight (`_connect` stays set once it is done).
     connecting: bool,
     _connect: Option<Task<()>>,
+    /// The Pods lists the connect started before discovery answered, until the list's watch
+    /// takes them over (see `reach::EarlyList`).
+    early: Option<reach::EarlyLists>,
+    /// A cluster joined after the first rows (see `reach`): the session's tabs were reopened
+    /// without what only it has, so the session is not saved over until every cluster of the
+    /// set is in (`joined_whole`) or the next connect.
+    joined_late: bool,
+    /// The tabs as a connect that left clusters connecting ended with: once they have all
+    /// joined, the session is reopened whole only if the user didn't change them since.
+    partial_tabs: Option<(Vec<crate::settings::SavedTab>, usize)>,
     /// The set of contexts picked (`settings::session_set`), whose session this window saves;
     /// empty when none is saved (not connected yet, or contexts given by a developer hook).
     session_key: Vec<String>,
@@ -784,6 +795,9 @@ impl AppView {
             metrics: None,
             connecting: false,
             _connect: None,
+            early: None,
+            joined_late: false,
+            partial_tabs: None,
             session_key: Vec::new(),
             restore: if first_window { session::Restore::FirstConnect } else { session::Restore::Off },
             view_id: cx.entity_id(),

@@ -1,6 +1,13 @@
 # Features
 
-- **Contexts**: pick one or several on launch; tables merge clusters with a Context column. When a
+- **Contexts**: pick one or several on launch; tables merge clusters with a Context column. Each
+  context connects on its own: the first rows show once one cluster has answered and the others
+  have had 2 more seconds, so a cluster that can't be reached, or a login waiting in the browser,
+  doesn't hold back the others' rows. A cluster still connecting is said above the list and joins
+  it when it answers, and the page on screen then (a Cluster or Argo CD overview is built again);
+  one that fails shows its own error. Once every cluster is in, the set's session is saved again
+  (and reopened whole if it was reopened without them and nothing changed since). The Pods list starts with the connect,
+  alongside the cluster's discovery and namespace list, when it is the list shown first. When a
   context's login command (its kubeconfig exec plugin) fails, the app says which program failed and
   its exit code: never its arguments, environment or output, where a client secret or a token can
   be. It adds the last line the plugin wrote to stderr when the kubeconfig sets
@@ -20,8 +27,8 @@
   detail page reopens on the list or overview it was opened from; a window that would be out of
   reach (a display unplugged) is centered. A window opened later starts fresh, and write mode is
   always off at launch. While a cluster of the set doesn't answer, or its namespaces don't list
-  (said above the list), nothing is saved for that set: what only that cluster has would read
-  as gone; connecting that set again once every cluster answers reopens it from what was saved.
+  (said above the list), or joins after the first rows, nothing is saved for that set: what only
+  that cluster has would read as gone; connecting that set again once every cluster answers reopens it from what was saved.
   A set connected for the first time is saved once connected. With two windows on one set, the
   one that reopened it saves it, until something is changed in the other.
 - **Sidebar**: the filter at its top finds pages and resource types (by name, kind or API group).
