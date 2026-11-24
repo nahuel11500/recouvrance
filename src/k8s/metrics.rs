@@ -345,15 +345,16 @@ pub async fn resource_slices(client: Client, node: String) -> Vec<serde_json::Va
 }
 
 /// Sum of pod requests and limits for one resource, the way the scheduler counts them
-/// ([`podspec::effective`]); a container without a limit counts 0. Finished pods are left out,
-/// and so are pods no node took yet: they reserve nothing.
+/// ([`podspec::effective`]); a container without a limit counts 0. Only pods bound to a node and
+/// not finished (Succeeded, Failed) count, the same rule as the cluster overview's totals
+/// (`pod_requests`). A node's page lists its pods by `spec.nodeName` already, so the node check
+/// is defensive there.
 pub fn pods_allocated(pods: &[serde_json::Value], resource: &str) -> (f64, f64) {
     let (mut req, mut lim) = (0.0, 0.0);
     for p in pods {
         let phase = p.pointer("/status/phase").and_then(|v| v.as_str());
         let unbound = p.pointer("/spec/nodeName").and_then(|v| v.as_str()).is_none_or(str::is_empty);
-        // Pending with no node: like `pod_requests`, what it asks for is not reserved.
-        if matches!(phase, Some("Succeeded" | "Failed")) || (phase == Some("Pending") && unbound) {
+        if matches!(phase, Some("Succeeded" | "Failed")) || unbound {
             continue;
         }
         let e = podspec::of_value(p, resource, podspec::Count::Scheduled);

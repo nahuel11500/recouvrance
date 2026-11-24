@@ -25,27 +25,50 @@ use super::metrics::{pod_resources, retry_wait, wait_unpaused};
 use super::table::{Applied, Backoff, RawEvent, WATCH_IDLE, resumable};
 use super::{Pause, PodResources, TaskGuard, ar_of, lists, podspec, spawn_guarded};
 
-/// A pod's phase, as far as the totals go: running pods and pending ones bound to a node hold
-/// what they request on it; pending ones no node took yet hold nothing.
+/// A pod's phase, as far as the totals go: a pod bound to a node that hasn't finished holds what
+/// it requests there; one no node took yet holds nothing. The same rule as
+/// [`super::metrics::pods_allocated`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum PodPhase {
-    /// Pending with no node yet: what it requests waits for room, nothing is reserved.
-    Unscheduled,
-    /// Pending on its node (pulling images, init containers running).
-    Pending,
+    /// No node yet: what it requests waits for room, nothing is reserved.
+    Unscheduled(Unbound),
+    /// On its node, not running (pending there, or a phase not known yet).
+    OnNode,
     Running,
-    /// Finished, or not known yet.
+    /// Succeeded or Failed.
     #[default]
-    Other,
+    Finished,
+}
+
+/// Why a pod has no node yet.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Unbound {
+    /// Held back on purpose by `schedulingGates`: not waiting for room.
+    Gated,
+    /// The scheduler tried and no node can take it (`PodScheduled=False`, `Unschedulable`).
+    Unschedulable,
+    /// Not placed yet.
+    Waiting,
 }
 
 impl PodPhase {
-    fn of(phase: &str, node: &str) -> Self {
-        match phase {
-            "Pending" if node.is_empty() => Self::Unscheduled,
-            "Pending" => Self::Pending,
+    fn of(pod: &LeanPod) -> Self {
+        match pod.status.phase.as_str() {
+            "Succeeded" | "Failed" => Self::Finished,
+            _ if pod.spec.node_name.is_empty() => Self::Unscheduled(if !pod.spec.scheduling_gates.is_empty() {
+                Unbound::Gated
+            } else if pod
+                .status
+                .conditions
+                .iter()
+                .any(|c| c.type_ == "PodScheduled" && c.status == "False" && c.reason == "Unschedulable")
+            {
+                Unbound::Unschedulable
+            } else {
+                Unbound::Waiting
+            }),
             "Running" => Self::Running,
-            _ => Self::Other,
+            _ => Self::OnNode,
         }
     }
 }
@@ -72,7 +95,7 @@ impl PodAlloc {
             spec.resource_names().iter().filter(|r| r.ends_with("/gpu")).map(|r| scheduled(r).limit).sum::<f64>();
         Self {
             resources: pod_resources(spec),
-            phase: PodPhase::of(&pod.status.phase, &pod.spec.node_name),
+            phase: PodPhase::of(pod),
             cpu: scheduled("cpu").request,
             memory: scheduled("memory").request,
             gpus,
@@ -94,24 +117,27 @@ impl PodAllocs {
     }
 
     /// How many pods there are and run, what the ones on a node request (as the scheduler
-    /// counts them against its allocatable), and what the ones no node took yet ask for.
+    /// counts them against its allocatable), and what the ones waiting for a node ask for.
     pub fn totals(&self) -> PodTotals {
         let mut totals = PodTotals::default();
         for pod in self.by_namespace.values().flat_map(|pods| pods.values()) {
             totals.pods += 1;
             totals.running += usize::from(pod.phase == PodPhase::Running);
             match pod.phase {
-                PodPhase::Running | PodPhase::Pending => {
+                PodPhase::Running | PodPhase::OnNode => {
                     totals.cpu += pod.cpu;
                     totals.memory += pod.memory;
                     totals.gpus += pod.gpus;
                 }
-                PodPhase::Unscheduled => {
+                PodPhase::Unscheduled(Unbound::Gated) => totals.gated += 1,
+                PodPhase::Unscheduled(why) => {
                     totals.unscheduled += 1;
+                    totals.unschedulable += usize::from(why == Unbound::Unschedulable);
                     totals.unscheduled_cpu += pod.cpu;
                     totals.unscheduled_memory += pod.memory;
+                    totals.unscheduled_gpus += pod.gpus;
                 }
-                PodPhase::Other => {}
+                PodPhase::Finished => {}
             }
         }
         totals
@@ -164,9 +190,10 @@ impl PodAllocs {
     }
 }
 
-/// Pods counted, and what the ones bound to a node (running, or pending there) request: CPU in
-/// millicores, memory in bytes, and the GPUs they hold. Pending pods no node took yet reserve
-/// nothing: they are counted apart, as demand waiting for room.
+/// Pods counted, and what the ones bound to a node (and not finished) request: CPU in
+/// millicores, memory in bytes, and the GPUs they hold. Pods no node took yet reserve nothing:
+/// they are counted apart, as demand waiting for room, and those held by scheduling gates apart
+/// again.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct PodTotals {
     pub pods: usize,
@@ -174,10 +201,16 @@ pub struct PodTotals {
     pub cpu: f64,
     pub memory: f64,
     pub gpus: f64,
-    /// Pending pods with no node yet, and the CPU and memory they ask for.
+    /// Pods with no node yet (scheduling gates aside), and the CPU, memory and GPUs they ask
+    /// for.
     pub unscheduled: usize,
     pub unscheduled_cpu: f64,
     pub unscheduled_memory: f64,
+    pub unscheduled_gpus: f64,
+    /// Of `unscheduled`, the ones the scheduler said no node can take (`Unschedulable`).
+    pub unschedulable: usize,
+    /// Pods held back by `schedulingGates`: no node yet, on purpose.
+    pub gated: usize,
 }
 
 /// What a watch of the pods' requests and limits read last.
@@ -216,6 +249,16 @@ struct LeanMeta {
 #[serde(default)]
 struct LeanStatus {
     phase: String,
+    conditions: Vec<LeanCondition>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct LeanCondition {
+    #[serde(rename = "type")]
+    type_: String,
+    status: String,
+    reason: String,
 }
 
 /// A pod list read straight into sums: each pod is parsed lean, kept as its `PodAlloc`, then
@@ -637,7 +680,7 @@ mod tests {
             // The same name in another namespace stays apart.
             pod("staging", "web", "2", "100m", "64Mi", "Pending"),
             pod("shop", "job", "3", "1", "1Gi", "Succeeded"),
-            {"metadata": {"name": "mesh", "namespace": "shop"}, "status": {"phase": "Running"}, "spec": {
+            {"metadata": {"name": "mesh", "namespace": "shop"}, "status": {"phase": "Running"}, "spec": {"nodeName": "n1",
                 "initContainers": [{"restartPolicy": "Always", "resources": {"requests": {"cpu": "50m"}}},
                     {"resources": {"requests": {"cpu": "2"}}}],
                 "containers": [{"resources": {"requests": {"cpu": "100m"}, "limits": {"nvidia.com/gpu": "1"}}}],
@@ -669,6 +712,59 @@ mod tests {
         // No pods at all.
         let empty: AllocList = serde_json::from_str(r#"{"items": null, "metadata": {}}"#).unwrap();
         assert_eq!(empty.items.totals().pods, 0);
+    }
+
+    /// The overview's totals and a node page's sums (`pods_allocated`) count the same pods:
+    /// bound to a node and not finished, whatever the phase says otherwise.
+    #[test]
+    fn totals_and_a_node_page_count_the_same_pods() {
+        let mut items = Vec::new();
+        for (i, phase) in ["Pending", "Running", "Succeeded", "Failed", "Unknown", ""].into_iter().enumerate() {
+            for bound in [true, false] {
+                let mut p = pod("a", &format!("p{i}-{bound}"), "1", &format!("{}m", 100 << i), "64Mi", phase);
+                if !bound {
+                    p["spec"].as_object_mut().unwrap().remove("nodeName");
+                }
+                items.push(p);
+            }
+        }
+        let totals = PodAllocs::from_items(&Value::Array(items.clone())).totals();
+        let (cpu, _) = crate::k8s::metrics::pods_allocated(&items, "cpu");
+        assert_eq!(totals.cpu, cpu);
+        // Pending, Running, Unknown and no phase, on a node.
+        assert_eq!(cpu, f64::from(100 + 200 + 1600 + 3200));
+        assert_eq!(totals.unscheduled, 4);
+    }
+
+    #[test]
+    fn why_a_pod_has_no_node() {
+        let base = |extra: Value| {
+            let mut p = pod("a", "p", "1", "1", "1Gi", "Pending");
+            p["spec"].as_object_mut().unwrap().remove("nodeName");
+            json_merge(&mut p, extra);
+            p
+        };
+        let gated = base(json!({"spec": {"schedulingGates": [{"name": "example.com/quota"}]}}));
+        let refused = base(json!({"status": {"conditions": [
+            {"type": "PodScheduled", "status": "False", "reason": "Unschedulable"}]}}));
+        let mut gpu = base(json!({}));
+        gpu["spec"]["containers"][0]["resources"]["limits"]["nvidia.com/gpu"] = json!("2");
+        let totals = PodAllocs::from_items(&json!([gated, refused, gpu])).totals();
+        assert_eq!((totals.gated, totals.unscheduled, totals.unschedulable), (1, 2, 1));
+        // The gated pod waits on purpose: its request is not counted as waiting for room.
+        assert_eq!((totals.unscheduled_cpu, totals.unscheduled_gpus), (2000.0, 2.0));
+        assert_eq!(totals.cpu, 0.0);
+    }
+
+    fn json_merge(into: &mut Value, from: Value) {
+        match (into, from) {
+            (Value::Object(a), Value::Object(b)) => {
+                for (k, v) in b {
+                    json_merge(a.entry(k).or_insert(Value::Null), v);
+                }
+            }
+            (a, b) => *a = b,
+        }
     }
 
     #[test]
@@ -858,7 +954,7 @@ mod watch_tests {
 
     fn pod(ns: &str, name: &str, rv: &str, cpu: &str) -> Value {
         json!({"metadata": {"name": name, "namespace": ns, "resourceVersion": rv},
-            "spec": {"containers": [{"name": "app", "resources": {"requests": {"cpu": cpu}, "limits": {"cpu": cpu}}}]},
+            "spec": {"nodeName": "n1", "containers": [{"name": "app", "resources": {"requests": {"cpu": cpu}, "limits": {"cpu": cpu}}}]},
             "status": {"phase": "Running"}})
     }
 
