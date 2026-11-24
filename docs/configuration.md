@@ -321,6 +321,7 @@ kubeconfig stays in the file and the sidebar says so; remove it there with its c
 Agent rules as code, in the spirit of Claude Code's allow/ask/deny lists:
 
 ```yaml
+version: 2
 agents:
   Claude:
     allow:
@@ -362,10 +363,18 @@ While the file exists, an agent it doesn't name has no rules, so everything it a
 removing an agent's section takes its access away. Deleting an agent on the Agents page removes its
 section too. Before 0.3.0 a new agent got no section until its rules were edited: on the first start
 of 0.3.0 such an agent keeps its rules, and its section is written to the file. Before the GitOps
-verbs, GitOps actions were checked as `patch`: on the first start of the version that added them,
-every rule that names `patch` gets `refresh`, `sync` and `suspend`, and the file is written again,
-once. A verb you take out of a rule after that stays out. If the file changed on disk meanwhile, it
-is not written over: the load fails with the reason, and your edit is loaded (and upgraded) next.
+verbs, GitOps actions were checked as `patch`. `version: 2` at the top says the file's rules use
+them. A file without it (written before them, restored from git, copied from another machine, or
+given with no agents.json) is read as written before them, whatever agents.json says: every rule
+that names `patch` gets `refresh`, `sync` and `suspend` when it is loaded, and the file is written
+again with `version: 2`, once (even when no rule changed). A verb you take out of a rule after that
+stays out. A file without `version` whose rules name `refresh`, `sync` or `suspend` is not loaded
+(the rules in force stay, and the Agents page says to add `version: 2` at the top): no rule could
+name them before, so it was written for them, and upgrading it would give back a verb taken out.
+Write `version: 2` in a file you write by hand, or its `patch` rules cover GitOps actions too. A
+file with a higher `version`, written by a newer Recouvrance, is not loaded either. If the file
+changed on disk meanwhile, it is not written over: the load fails with the reason, and your edit is
+loaded (and upgraded, if it has no `version` either) next.
 
 Each section is for the agent with that name, so agent names are unique: creating a second agent
 with a taken name is refused, and if two agents already share a name the file is neither loaded nor

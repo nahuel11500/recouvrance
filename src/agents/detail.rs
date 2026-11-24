@@ -200,7 +200,7 @@ impl AgentsView {
                                 let id = agent_id.clone();
                                 move |this, _, _, cx| {
                                     if let Some(a) = this.hub.agent(&id)
-                                        && let Ok(json) = serde_json::to_string_pretty(&a.policy)
+                                        && let Ok(json) = a.policy.copied()
                                     {
                                         cx.write_to_clipboard(ClipboardItem::new_string(json));
                                     }
