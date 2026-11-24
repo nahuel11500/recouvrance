@@ -19,6 +19,7 @@ Recouvrance reads your kubeconfig like `kubectl` does and keeps its own settings
 | `~/.config/recouvrance/theme`, `zoom` | Light or dark choice (absent: follow the desktop), UI zoom (0.7 to 2.0) |
 | `~/.config/recouvrance/anthropic-key` | The assistant's Anthropic API key, when saved in Settings (mode 0600; `ANTHROPIC_API_KEY` is used otherwise) |
 | `~/.config/recouvrance/argocd-tokens.json` | Read-only Argo CD API tokens set in Settings → Per cluster, by context (mode 0600; see [Argo CD's diff](#argo-cds-diff-argocd_servers)) |
+| `~/.config/recouvrance/argocd-api-tokens.json` | Argo CD API tokens set in Settings → Argo CD, by server address (mode 0600; see [Argo CD by its API](#argo-cd-by-its-api-argocd_api_servers)) |
 | `~/.config/recouvrance/main-agent` | The built-in assistant's agent id and token (mode 0600) |
 | `~/.local/share/recouvrance/audit.jsonl` | Agent activity log |
 | `~/.local/share/recouvrance/timeline/<context>-<hash>.jsonl` | Changes recorded per context (mode 0600, see [Timeline](#timeline)) |
@@ -82,6 +83,9 @@ context already shown as `name@file` keeps that name when `name` is freed.
 | `prometheus` | found automatically | `{ "ctx": "monitoring/prometheus:9090" }` (see below) |
 | `clusters` | | Per-cluster settings (below) |
 | `argocd_servers` | `{}` | `{ "argocd-hub": "https://argocd.example.com" }`: the Argo CD API server of a hub context, to read Argo CD's own diff from (see below). None: off. An entry that doesn't read is dropped. Settings → Per cluster |
+| `argocd_api_servers` | `[]` | `["https://argocd.example.com"]`: Argo CD API servers read on the Argo CD page, besides the argocd CLI's (see below). Settings → Argo CD |
+| `argocd_api_off` | `[]` | Argo CD API servers (their address) not read, whether set here or the argocd CLI's. Settings → Argo CD, the switch of each |
+| `argocd_group_label` | `""` | `"app.kubernetes.io/part-of"`: the label whose value names an Application's service on the Argo CD page grouped by service. Empty: its name without the environment in it. Settings → Argo CD |
 | `argocd_contexts` | `[]` | `["argocd-hub"]`: the contexts Argo CD's Applications are read from (see below). Empty: found on their own. A value that doesn't read is empty. Settings → Contexts, *Argo CD* |
 | `extra_namespaces` | | Namespaces added by hand, per context |
 | `metrics_enabled` | true | Read metrics-server and Prometheus at all |
@@ -218,6 +222,50 @@ to that server only, and only on that click. It logs in with, in this order:
 
 Errors never show the token. Secret values are masked by Recouvrance itself, whatever Argo CD
 sends (its own masking leaked predicted Secret states before 3.2.12, 3.3.10 and 3.4.2).
+
+### Argo CD by its API (`argocd_api_servers`)
+
+The Argo CD page also reads Argo CD by its own API, for when you may use Argo CD but not the
+cluster it runs on. Its servers are:
+
+- those the argocd CLI is logged in to: each context of its config file (found as above) with a
+  token, one per server, the current context's first. Its `--insecure` (the certificate is not
+  checked), `--plaintext` (taken only for this machine, as above) and `--grpc-web-root-path`
+  (Argo CD served under a path) are honoured; `--grpc-web` makes no difference to the REST API;
+  a `--core` context has no server;
+- those added in Settings → Argo CD: an address, and a token kept in `argocd-api-tokens.json`
+  (mode 0600, never shown again; *Forget token* removes it). A token set here wins over the CLI's
+  for the same server.
+
+A config that can't be read fails closed: a CLI config that doesn't parse gives no server, and a
+tokens file that doesn't read gives no token at all (not even the CLI's), each said in Settings →
+Argo CD and above the list. An expired token is said before anything is sent. Errors never show a
+token, and a token is only sent to its server, over https, without following redirects.
+
+Each server's application stream (`/api/v1/stream/applications`, server-sent events, with
+`fields` so only what the page shows is sent) is opened first: Argo CD subscribes it to every
+change before anything else. Then the Applications are listed (`GET /api/v1/applications`, with
+`fields`), and what the stream sent meanwhile is applied over the list in order, the newer of the
+two winning (by resource version) and a deletion removing: nothing changed between the list and
+the stream is lost. A stream that ends, breaks or stays silent 15 minutes is opened again after a
+backoff of 1 s doubling to 60 s (back to 1 s once one stayed open a minute), listing again; that
+is routine and not shown as an error, while a list or a stream that can't be opened is. A refused
+login stops until the login or the config changes: a new `argocd login`, or a token set in
+Settings, is noticed within a second while the page is shown. The page holds the feeds while a
+window shows it, shared by every window, and lets them go when none does. Only the fields shown
+are kept, so memory stays small however many Applications there are. The projects' sync windows
+are read beside the stream, and again every 5 minutes: one `GET /api/v1/projects`, or, when they
+can't be listed, `GET /api/v1/projects/{name}` (its `spec.syncWindows`) for each project of the
+Applications, up to 50. Reading needs `applications, get` and `projects, get`; the row menu's
+actions need what Argo CD's own UI would (`applications, sync` and so on). An action is sent with
+the server's login as the config has it then, and not at all to a server removed or turned off
+since the list was drawn. When settings.json can't be read, every server is off (which were
+turned off is unknown).
+
+An Application read by the API and by its hub is the same one when the hub's Argo CD server set
+in Settings → Per cluster (`argocd_servers`) is that API server, and its namespace and name are
+the same: it shows once, as read on the hub (whose page it opens). Without that setting, the two
+are kept apart.
 
 ## favorites.json
 

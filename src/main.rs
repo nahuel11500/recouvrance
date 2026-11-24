@@ -3,6 +3,7 @@ mod alerts;
 mod app;
 mod assistant;
 mod certs;
+mod cron;
 mod details;
 #[cfg(feature = "dev")]
 mod dev;

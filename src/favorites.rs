@@ -54,9 +54,11 @@ pub fn hub_alias(context: &str) -> String {
     format!("context:{context}")
 }
 
-/// The Argo CD instance of hub context `context`, as the Argo CD page keys it.
+/// The Argo CD instance of hub context `context`, as the Argo CD page keys it: its Argo CD
+/// server's when one is set for it (Settings → Per cluster), else its alias.
 pub fn hub_instance(context: &str) -> String {
-    hub_alias(context)
+    let servers = crate::settings::with(|s| s.argocd_servers.clone());
+    crate::k8s::argo::grouping::hub_instance(context, &servers)
 }
 
 impl FavApp {
@@ -247,7 +249,7 @@ fn from_bytes(bytes: &[u8]) -> Option<(Stored, bool)> {
     );
     for o in objects.extract_if(.., |o| o.kind == "applications.argoproj.io" && o.namespace.is_some()) {
         let app = FavApp {
-            argocd: hub_instance(&o.context),
+            argocd: hub_alias(&o.context),
             namespace: o.namespace.unwrap_or_default(),
             name: o.name,
             context: Some(o.context),
