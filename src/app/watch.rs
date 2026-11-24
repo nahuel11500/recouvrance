@@ -253,7 +253,7 @@ impl AppView {
         }
         let restored = kept.is_some();
         // The connect's early lists, when this is the list they started.
-        let mut early = early.filter(|e| !restored && e.matches(&kind, &custom, progressive));
+        let mut early = early.filter(|e| !restored && e.matches(&kind, &custom));
         let (mut watch, pause) = kept.take().unwrap_or_else(|| {
             let watch = ListWatch { tasks: Vec::new(), resources: Vec::new(), metrics_on: metrics_on.clone() };
             // Theirs, so they pause and go on with the others.

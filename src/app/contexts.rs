@@ -81,6 +81,7 @@ impl AppView {
         let early = self.early_list(&contexts);
         self.early = None;
         self.joined_late = false;
+        self.partial_tabs = None;
 
         self._connect = Some(cx.spawn_in(window, async move |this, cx| {
             // Each cluster on its own: connect, then discovery and namespaces together.
@@ -263,6 +264,10 @@ impl AppView {
                                 this.open_favorite(favorite, false, window, cx);
                             }
                         }
+                        // Where the user starts from while clusters are still connecting.
+                        if !waiting.is_empty() {
+                            this.partial_tabs = Some(this.tabs_now(cx));
+                        }
                         true
                     }
                     Err(e) => {
@@ -292,7 +297,7 @@ impl AppView {
                 let alive = this.update_in(cx, |this, window, cx| {
                     waiting.retain(|c| *c != contexts[ix]);
                     match r {
-                        Ok(r) if r.kinds.is_ok() => this.join_late(r, early.clone(), &mut errors, cx),
+                        Ok(r) if r.kinds.is_ok() => this.join_late(r, early.clone(), &mut errors, window, cx),
                         Ok(r) => {
                             if let Err(e) = &r.kinds {
                                 errors.push(format!("{}: {}", r.ctx, k8s::error_chain(e)));
@@ -301,6 +306,10 @@ impl AppView {
                         Err(e) => errors.push(e),
                     }
                     this.connect_errors = reach::connect_status(&errors, &waiting);
+                    // The last one in and none failed: the connect is whole after all.
+                    if waiting.is_empty() && errors.is_empty() {
+                        this.joined_whole(window, cx);
+                    }
                     // The favorite waiting for this context (it says so when it failed).
                     if this.after_connect.as_ref().is_some_and(|f| f.context() == Some(contexts[ix].as_str()))
                         && let Some(favorite) = this.after_connect.take()

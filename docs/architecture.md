@@ -73,7 +73,8 @@ re-created under the same name since the list).
 A connect doesn't wait for its slowest cluster (`src/app/reach.rs`). Each context connects on its
 own, reading its discovery and its namespace list together; the first rows come once one cluster
 has answered and the others have had 2 more seconds, and a cluster that answers later joins the
-list then. When the list shown first is the Pods of every namespace, it starts as soon as each
+list then, and the page on screen. The session isn't saved while part of the set is missing: once
+the last cluster is in and none failed, it is saved again. When the list shown first is the Pods of every namespace, it starts as soon as each
 client is built, alongside discovery, and the list takes it over.
 
 Rows keep only the metadata they need; full objects are fetched only when a custom column needs

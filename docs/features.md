@@ -4,7 +4,9 @@
   context connects on its own: the first rows show once one cluster has answered and the others
   have had 2 more seconds, so a cluster that can't be reached, or a login waiting in the browser,
   doesn't hold back the others' rows. A cluster still connecting is said above the list and joins
-  it when it answers; one that fails shows its own error. The Pods list starts with the connect,
+  it when it answers, and the page on screen then (a Cluster or Argo CD overview is built again);
+  one that fails shows its own error. Once every cluster is in, the set's session is saved again
+  (and reopened whole if it was reopened without them and nothing changed since). The Pods list starts with the connect,
   alongside the cluster's discovery and namespace list, when it is the list shown first. When a
   context's login command (its kubeconfig exec plugin) fails, the app says which program failed and
   its exit code: never its arguments, environment or output, where a client secret or a token can

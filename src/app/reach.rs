@@ -17,6 +17,7 @@ use kube::Client;
 use kube::discovery::ApiResource;
 
 use super::contexts::{add_kinds, cluster_namespace, listed_namespaces};
+use super::overviews::Overview;
 use super::{AppView, dev_var};
 use crate::k8s::{self, Kind, TableMsg};
 use crate::settings::{InitialView, SavedPage, SavedTab};
@@ -140,10 +141,12 @@ pub(super) struct EarlyLists {
 }
 
 impl EarlyLists {
-    /// Whether they are the list about to start: the same kind and columns, listed the same
-    /// way. Their pause is then the list's, so they pause and go on with it.
-    pub(super) fn matches(&self, kind: &Kind, extras: &[(String, String)], pages: bool) -> bool {
-        self.of.kind.key() == kind.key() && self.of.extras.as_slice() == extras && self.of.pages == pages
+    /// Whether they are the list about to start: the same kind and columns. How they list
+    /// their first rows (`pages`) only changes how those show: a list judged otherwise
+    /// takes them over all the same rather than list every cluster again. Their pause is
+    /// then the list's, so they pause and go on with it.
+    pub(super) fn matches(&self, kind: &Kind, extras: &[(String, String)]) -> bool {
+        self.of.kind.key() == kind.key() && self.of.extras.as_slice() == extras
     }
 
     pub(super) fn pause(&self) -> k8s::Pause {
@@ -202,13 +205,14 @@ impl AppView {
 
     /// A cluster that answered after the first rows joins: its kinds, namespaces, timeline
     /// watches and its rows in the list. The others' watches are listed again (the list's
-    /// clusters changed), the Problems badge counts it too. Its early list (`early_of`) is
-    /// taken over when the list shown is still the Pods.
+    /// clusters changed), the Problems badge counts it too, and the page on screen shows it.
+    /// Its early list (`early_of`) is taken over when the list shown is still the Pods.
     pub(super) fn join_late(
         &mut self,
         reached: Reached,
         early_of: Option<EarlyList>,
         errors: &mut Vec<String>,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let Reached { ctx, client, kinds, namespaces, early } = reached;
@@ -248,8 +252,20 @@ impl AppView {
             self.early = Some(EarlyLists { of, lists: HashMap::from([(ctx, list)]) });
         }
         self.restart_watch(cx);
+        // The lists left, the one just left among them, watch the clusters before this one
+        // joined: no list shows them again. Dropped now rather than kept streaming until the
+        // sweep, and the one just left shares its pause with the list started early.
+        self.kept.clear();
         self.problems.start(self.clusters.clone(), self.cluster_kinds(), cx);
         self.update_assistant_scope(cx);
+        // The page on screen: a Workloads, Problems, Helm or Timeline page lists it too, a
+        // Cluster or Argo CD overview, built for the clusters before, is built again.
+        self.rescope_page(cx);
+        if let Some((which @ (Overview::Cluster | Overview::Argo), _)) = Overview::of(self.route()) {
+            let route = self.build_overview(which, window, cx);
+            self.history[self.pos] = route;
+            self.apply_route(cx);
+        }
     }
 }
 

@@ -517,8 +517,12 @@ pub struct AppView {
     /// takes them over (see `reach::EarlyList`).
     early: Option<reach::EarlyLists>,
     /// A cluster joined after the first rows (see `reach`): the session's tabs were reopened
-    /// without what only it has, so the session is not saved over until the next connect.
+    /// without what only it has, so the session is not saved over until every cluster of the
+    /// set is in (`joined_whole`) or the next connect.
     joined_late: bool,
+    /// The tabs as a connect that left clusters connecting ended with: once they have all
+    /// joined, the session is reopened whole only if the user didn't change them since.
+    partial_tabs: Option<(Vec<crate::settings::SavedTab>, usize)>,
     /// The set of contexts picked (`settings::session_set`), whose session this window saves;
     /// empty when none is saved (not connected yet, or contexts given by a developer hook).
     session_key: Vec<String>,
@@ -789,6 +793,7 @@ impl AppView {
             _connect: None,
             early: None,
             joined_late: false,
+            partial_tabs: None,
             session_key: Vec::new(),
             restore: if first_window { session::Restore::FirstConnect } else { session::Restore::Off },
             view_id: cx.entity_id(),
