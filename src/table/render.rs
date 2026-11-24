@@ -72,7 +72,7 @@ impl TableDelegate for ResourceTable {
         };
         let width = self.widths.get(&name).copied().unwrap_or_else(|| default_width(col, &name, shape, bars));
         // Room for the usage bars: widths saved before they existed were 90.
-        let width = if bars { width.max(BAR_MIN) } else { width };
+        let width = if bars { width.max(bar_min(shape)) } else { width };
         // Not `.sort()`: the table's own control shows a two-way arrow on every column.
         // `render_th` sorts on a click and shows one arrow, on the sorted column only.
         Column::new(format!("c{col_ix}"), name).width(px(width * crate::app::zoom(cx))).movable(!self.is_fixed(col))
@@ -646,7 +646,15 @@ fn ready_total(cell: &str) -> Option<usize> {
 }
 
 /// The narrowest a usage bar column gets: its figure, a gap and a bar still worth reading.
-const BAR_MIN: f32 = 140.;
+/// A node's cell also shows a 34 px percentage, so it needs more than a pod's.
+fn bar_min(shape: Shape) -> f32 {
+    if shape == Shape::Pods { 140. } else { 170. }
+}
+
+/// The padding `DataTable::small()` puts inside every cell, left and right, within the column
+/// width (`Size::Small.table_cell_padding()`).
+#[cfg(test)]
+const CELL_PADDING: f32 = 12.;
 
 /// The kind a table lists, as far as its default widths go.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -661,7 +669,7 @@ fn default_width(col: Col, name: &str, shape: Shape, bars: bool) -> f32 {
     let pods = shape == Shape::Pods;
     match (col, name) {
         // Pods: Name gives up a little so Status, Restarts and Age fit the default window.
-        (_, "Name") if pods => 310.,
+        (_, "Name") if pods => 300.,
         (_, "Name") => 340.,
         (_, "Message") => 640.,
         (_, "Object") => 320.,
@@ -672,8 +680,10 @@ fn default_width(col: Col, name: &str, shape: Shape, bars: bool) -> f32 {
         // kubectl's words ("NotReady,SchedulingDisabled") and then the trouble taints.
         (_, "Status") if shape == Shape::Nodes => 230.,
         // The words people open the pods list for: "CrashLoopBackOff", "ContainerCreating".
-        (_, "Status") if pods => 150.,
-        (_, "Ready" | "Age") if pods => 70.,
+        (_, "Status") if pods => 160.,
+        // One 8 px dot a container, then the count: four containers (an app and its sidecars).
+        (_, "Ready") if pods => 85.,
+        (_, "Age") if pods => 70.,
         (_, "Age" | "Ready" | "Restarts" | "Status" | "CPU" | "Memory") => 90.,
         _ => 150.,
     }
@@ -681,11 +691,29 @@ fn default_width(col: Col, name: &str, shape: Shape, bars: bool) -> f32 {
 
 #[cfg(test)]
 mod width_tests {
-    use super::{BAR_MIN, Col, Shape, default_width};
+    use super::{CELL_PADDING, Col, Shape, bar_min, default_width};
 
-    /// About 7.5 px a character at 14 px, after the 13 px status dot.
+    /// About 7.5 px a character at 14 px, after the 13 px status dot and the cell's padding.
     fn needed(text: &str) -> f32 {
-        text.chars().count() as f32 * 7.5 + 13.
+        text.chars().count() as f32 * 7.5 + 13. + CELL_PADDING
+    }
+
+    #[test]
+    fn pod_ready_fits_four_containers() {
+        // Per container an 8 px dot and a 4 px gap, then 4 px before the "4/4" count in
+        // extra-small text (about 7 px a character).
+        let containers = 4.;
+        let content = containers * (8. + 4.) + 4. + 3. * 7.;
+        let ready = default_width(Col::Cell(1), "Ready", Shape::Pods, false);
+        assert!(ready >= content + CELL_PADDING, "{ready}");
+    }
+
+    #[test]
+    fn node_bars_keep_room_for_the_percentage() {
+        // A node's bar cell: a 56 px figure, a 34 px percentage, two 8 px gaps and a bar.
+        let fixed = 56. + 34. + 2. * 8. + CELL_PADDING;
+        assert!(bar_min(Shape::Nodes) - fixed >= 50.);
+        assert!(bar_min(Shape::Pods) <= bar_min(Shape::Nodes));
     }
 
     #[test]
@@ -732,7 +760,7 @@ mod width_tests {
         let room = crate::settings::WINDOW_SIZE.0 - crate::settings::SIDEBAR_WIDTH - 16.;
         assert!(total <= room, "{total} > {room}");
         for col in [Col::Cpu, Col::Memory] {
-            assert!(default_width(col, "", Shape::Pods, true) >= BAR_MIN);
+            assert!(default_width(col, "", Shape::Pods, true) >= bar_min(Shape::Pods));
         }
     }
 }
