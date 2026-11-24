@@ -463,6 +463,7 @@ impl Render for AssistantView {
                                         .small()
                                         .ghost()
                                         .icon(Lucide::Maximize2)
+                                        .accessibility_label("Open the assistant's page")
                                         .tooltip("Open the assistant's page")
                                         .on_click(cx.listener(|_, _, _, cx| cx.emit(DockEvent::Expand))),
                                 )
@@ -471,6 +472,7 @@ impl Render for AssistantView {
                                         .small()
                                         .ghost()
                                         .icon(Lucide::X)
+                                        .accessibility_label("Hide the assistant")
                                         .tooltip(crate::app::with_keys("Hide the assistant ({secondary-j})"))
                                         .on_click(cx.listener(|_, _, _, cx| cx.emit(DockEvent::Close))),
                                 )

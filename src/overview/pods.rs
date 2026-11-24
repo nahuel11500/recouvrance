@@ -258,6 +258,7 @@ fn forward_buttons(ctx: &Ctx, port: u16, name: Option<&str>) -> Div {
                 .xsmall()
                 .ghost()
                 .icon(Lucide::Settings2)
+                .accessibility_label("Forward with options")
                 .tooltip("Forward with options: local port, address, https, open in browser")
                 .on_click(forward(true)),
         )

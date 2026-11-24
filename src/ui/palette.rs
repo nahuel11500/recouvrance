@@ -259,6 +259,8 @@ impl Render for Palette {
                     .bg(theme.background)
                     .shadow_lg()
                     .overflow_hidden()
+                    .role(Role::Dialog)
+                    .aria_label("Command palette")
                     .capture_key_down(cx.listener(Self::on_key))
                     .on_click(|_, _, cx| cx.stop_propagation())
                     .child(
@@ -276,6 +278,8 @@ impl Render for Palette {
                             .overflow_y_scroll()
                             .track_scroll(&self.scroll)
                             .p_1()
+                            .role(Role::ListBox)
+                            .aria_label("Results")
                             .when(matches.is_empty(), |d| {
                                 d.child(div().p_3().text_sm().text_color(theme.muted_foreground).child("No matches"))
                             })
@@ -283,6 +287,12 @@ impl Render for Palette {
                                 let target = item.target.clone();
                                 h_flex()
                                     .id(("palette-item", i))
+                                    // The arrows move the highlight while focus stays in the
+                                    // field, so the items are options, not tab stops.
+                                    .role(Role::ListBoxOption)
+                                    .aria_label(item.label.clone())
+                                    .aria_description(item.detail.clone())
+                                    .aria_selected(i == selected)
                                     .gap_2()
                                     .px_2()
                                     .py_1()

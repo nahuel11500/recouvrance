@@ -11,6 +11,7 @@ use super::search_index::{Entry, SEARCH_KINDS, on_cluster};
 use super::{AppView, Route, section_icon, set_zoom, zoom};
 use crate::k8s;
 use crate::k8s::Kind;
+use crate::ui::a11y::Control as _;
 use crate::ui::palette::{Item as PaletteItem, Palette, PaletteEvent, Target};
 use crate::ui::settings_view::SettingsView;
 
@@ -253,6 +254,16 @@ impl AppView {
                         .when(picked, |d| d.bg(theme.blue.opacity(0.08)))
                         .cursor_pointer()
                         .hover(|s| s.bg(theme.list_hover))
+                        // A checkbox to screen readers: Space or Enter picks it, as a click does.
+                        .control(Role::CheckBox, ctx.clone(), theme.ring)
+                        .aria_toggled(if picked { Toggled::True } else { Toggled::False })
+                        .aria_description(
+                            [Some(if risky { "protected" } else { "context" }), state]
+                                .into_iter()
+                                .flatten()
+                                .collect::<Vec<_>>()
+                                .join(", "),
+                        )
                         .on_click(cx.listener(move |this, ev: &ClickEvent, window, cx| {
                             // Double click connects to just this one.
                             if ev.click_count() >= 2 {
