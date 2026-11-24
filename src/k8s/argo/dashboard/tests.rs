@@ -145,7 +145,7 @@ fn the_state_says_a_failed_or_running_sync_over_the_comparison() {
 #[test]
 fn problems_are_grouped_by_workload_from_the_tree() {
     let p = problems_from_tree(&example::tree("example-prod", now()));
-    let rows: Vec<(&str, &str, &str, Option<(usize, usize)>)> =
+    let rows: Vec<_> =
         p.rows.iter().map(|r| (r.status.as_str(), r.res.kind.as_str(), r.res.name.as_str(), r.pods)).collect();
     assert_eq!(
         rows,

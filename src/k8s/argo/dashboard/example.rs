@@ -123,7 +123,7 @@ pub fn app(env: &str, now: Timestamp) -> Value {
             "startedAt": started,
             "finishedAt": finished,
             "operation": {"initiatedBy": by, "sync": {}},
-            "syncResult": {"revision": last_revision.clone(), "resources": resources},
+            "syncResult": {"revision": last_revision, "resources": resources},
         })
     };
     let policy = if prod { json!({}) } else { json!({"automated": {"prune": true}}) };

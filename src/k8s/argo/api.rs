@@ -1145,7 +1145,7 @@ pub async fn dashboard(
     name: String,
 ) -> Result<super::dashboard::Read, String> {
     let read = crate::k8s::run_abortable(async move {
-        let found = current(&endpoint.server.base).and_then(|e| Ok((e.conn()?, e.login.clone()?.1)));
+        let found = current(&endpoint.server.base).and_then(|e| Ok((e.conn()?, e.login?.1)));
         let (conn, how) = match found {
             Ok(found) => found,
             Err(e) => return Ok(Err(e)),

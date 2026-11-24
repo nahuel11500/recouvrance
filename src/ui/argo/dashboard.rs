@@ -22,7 +22,7 @@ use super::{ArgoView, Key, key};
 use crate::details::ArgoAction;
 use crate::k8s;
 use crate::k8s::argo::dashboard::{self, Cards, Commit, Problem};
-use crate::k8s::argo::diagnosis::span_text;
+use crate::k8s::argo::diagnosis::{Res, span_text};
 use crate::k8s::argo::{self, Source, api, short_revision};
 use crate::status::Tone;
 use crate::ui::selectable::selectable;
@@ -175,7 +175,7 @@ impl ArgoView {
         };
         let Some(d) = &mut self.dashboard else { return };
         d.loading = true;
-        d.read_for = Some((k.clone(), a.app.clone()));
+        d.read_for = Some((k.clone(), a.app));
         d.load.spawn(cx, work, move |this, cards: Result<Arc<Cards>, String>, cx| {
             let Some(d) = &mut this.dashboard else { return };
             if d.current() != Some(&k) {
@@ -189,7 +189,7 @@ impl ArgoView {
             if running {
                 // A sync running: its steps move without its row changing.
                 let timer = cx.background_executor().timer(RUNNING_EVERY);
-                d.tick.spawn(cx, timer, |this, _, cx| {
+                d.tick.spawn(cx, timer, |this, (), cx| {
                     if crate::app::is_visible(cx.entity_id(), cx) {
                         this.load_dashboard(cx);
                     }
@@ -489,7 +489,6 @@ impl ArgoView {
         let reaches =
             k.as_ref().and_then(|k| self.find(k)).is_some_and(|a| a.on.is_some() && !a.dest.namespace.is_empty());
         let all_pods = if reaches {
-            let k = k.clone();
             link("argo-dash-all-pods", "all pods", cx).on_click(cx.listener(move |this, _, _, cx| {
                 if let Some(k) = &k {
                     this.open_destination(k, cx);
@@ -647,7 +646,7 @@ impl ArgoView {
                 .child(div().text_sm().child("Nothing to sync: the cluster matches git."))
                 .children(error.map(|e| div().text_xs().text_color(muted).child(selectable(e))));
         }
-        let names = |sign: &str, list: &[k8s::argo::diagnosis::Res]| {
+        let names = |sign: &str, list: &[Res]| {
             (!list.is_empty()).then(|| {
                 let mut shown: Vec<String> = list.iter().take(NAMES_SHOWN).map(|r| r.name.clone()).collect();
                 if list.len() > NAMES_SHOWN {
@@ -656,7 +655,7 @@ impl ArgoView {
                 format!("{sign} {}", shown.join(", "))
             })
         };
-        let changed: Vec<k8s::argo::diagnosis::Res> = diff.changed.iter().chain(&diff.unknown).cloned().collect();
+        let changed: Vec<Res> = diff.changed.iter().chain(&diff.unknown).cloned().collect();
         let lines: Vec<String> = [names("~", &changed[..]), names("+", &diff.added[..]), names("–", &diff.pruned[..])]
             .into_iter()
             .flatten()

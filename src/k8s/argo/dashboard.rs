@@ -314,15 +314,14 @@ pub struct Deployed {
 /// From the newest deployment of the history, else the revision(s) compared with git.
 pub fn deployed(app: &Value) -> (Vec<Deployed>, Option<i64>) {
     let last = arr(app, "/status/history").last();
-    let (holder, sources): (&Value, Vec<&Value>) = match last {
-        Some(h) => (h, sources_of(h)),
-        None => {
-            let spec = match app.pointer("/spec/source").filter(|v| v.is_object()) {
-                Some(one) => vec![one],
-                None => arr(app, "/spec/sources").iter().collect(),
-            };
-            (app.pointer("/status/sync").unwrap_or(&Value::Null), spec)
-        }
+    let (holder, sources): (&Value, Vec<&Value>) = if let Some(h) = last {
+        (h, sources_of(h))
+    } else {
+        let spec = match app.pointer("/spec/source").filter(|v| v.is_object()) {
+            Some(one) => vec![one],
+            None => arr(app, "/spec/sources").iter().collect(),
+        };
+        (app.pointer("/status/sync").unwrap_or(&Value::Null), spec)
     };
     let one = |source: Option<&Value>, revision: &str, index: Option<usize>| Deployed {
         index,
@@ -418,6 +417,9 @@ pub fn pod_state(node: &Value) -> (String, Tone) {
     }
 }
 
+/// The pods under one object: how many, and those in trouble with their state.
+type Group<'a> = (usize, Vec<(&'a Value, String, Tone)>);
+
 /// How bad a tone is: the higher, the worse.
 fn rank(t: Tone) -> u8 {
     match t {
@@ -448,7 +450,7 @@ pub fn problems_from_tree(tree: &Value) -> Problems {
     };
     let mut out = Problems { from_tree: true, ..Default::default() };
     // By top: (the top's node, its pods, those in trouble with their state).
-    let mut groups: BTreeMap<String, (usize, Vec<(&Value, String, Tone)>)> = BTreeMap::new();
+    let mut groups: BTreeMap<String, Group<'_>> = BTreeMap::new();
     for n in nodes.iter().filter(|n| s(n, "/kind") == Some("Pod") && s(n, "/group").unwrap_or("").is_empty()) {
         let (status, tone) = pod_state(n);
         let trouble = matches!(tone, Tone::Bad | Tone::Busy);
