@@ -1,6 +1,7 @@
 //! The write guards against a real cluster: write mode, the agents' rules and the kill
 //! switch, end to end through the real clients and the MCP server. These are the guarantees
-//! people rely on most, and unit tests stop short of the API server.
+//! people rely on most, and unit tests stop short of the API server. So are the watches that
+//! keep pages current, whose selectors and bookmarks only a real API server answers.
 //!
 //! Ignored unless asked for: CI's kind job runs them with
 //! `RECOUVRANCE_E2E_CONTEXT=kind-recouvrance cargo test --features dev -- --ignored --test-threads 1 e2e::`
@@ -1549,6 +1550,98 @@ fn the_timeline_records_what_a_watch_sees_change() {
         };
         let result: Result<()> = checked.await;
         let _ = cms.delete(name, &DeleteParams::default()).await;
+        result
+    });
+}
+
+/// The objects a follow sends, once `done` says they are what the test waits for (a minute at
+/// most).
+async fn followed_until(
+    rx: &mut futures::channel::mpsc::UnboundedReceiver<k8s::Followed>,
+    done: impl Fn(&[serde_json::Value]) -> bool,
+) -> Result<Vec<serde_json::Value>> {
+    use futures::StreamExt as _;
+    let wait = async {
+        while let Some(msg) = rx.next().await {
+            if let k8s::Followed::Objects(objects) = msg
+                && done(objects.as_slice())
+            {
+                return Ok(objects.to_vec());
+            }
+        }
+        bail!("the follow ended")
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(60), wait).await.context("never sent")?
+}
+
+/// A detail page follows its object with a watch on its name, and its pods with a watch on
+/// their labels, as a real API server serves them (field and label selectors, bookmarks,
+/// deletions): a change shows with no read asked, a deletion says so, and the object created
+/// again under its name is followed.
+#[test]
+#[ignore = "needs a kind cluster: RECOUVRANCE_E2E_CONTEXT"]
+fn a_detail_page_s_watches_follow_its_object_and_pods() {
+    run(async {
+        let ctx = context();
+        let truth = k8s::connect_for_agents(ctx.clone()).await?;
+        let cms: Api<ConfigMap> = Api::namespaced(truth.clone(), NS);
+        let pods: Api<k8s_openapi::api::core::v1::Pod> = Api::namespaced(truth, NS);
+        let (name, pod) = ("e2e-follow", "e2e-follow-pod");
+        let _ = cms.delete(name, &DeleteParams::default()).await;
+        let _ = pods.delete(pod, &DeleteParams::default().grace_period(0)).await;
+        let checked = async {
+            // Reads only, as the window's client: write mode stays off.
+            let ui = k8s::connect(ctx.clone()).await?;
+            cms.create(&PostParams::default(), &config_map(name)).await?;
+            let what = k8s::Follow::object(
+                k8s::ar_of::<ConfigMap>(),
+                Some(NS.into()),
+                name,
+                std::time::Duration::from_secs(5),
+            );
+            let (_object, mut rx) = k8s::follow(ui.clone(), what, k8s::Pause::default());
+            let value =
+                |objects: &[serde_json::Value]| objects.first().and_then(|o| o["data"]["a"].as_str()).map(String::from);
+            let first = followed_until(&mut rx, |o| value(o).as_deref() == Some("1")).await?;
+            // As the page shows it: typed, with its managed fields.
+            assert_eq!(first[0]["kind"], "ConfigMap");
+            assert!(first[0].pointer("/metadata/managedFields").is_some(), "{:#}", first[0]);
+            let uid = first[0]["metadata"]["uid"].as_str().unwrap_or_default().to_string();
+            cms.patch(name, &PatchParams::default(), &Patch::Merge(json!({"data": {"a": "2"}}))).await?;
+            followed_until(&mut rx, |o| value(o).as_deref() == Some("2")).await?;
+            cms.delete(name, &DeleteParams::default()).await?;
+            followed_until(&mut rx, <[serde_json::Value]>::is_empty).await?;
+            cms.create(&PostParams::default(), &config_map(name)).await?;
+            let again = followed_until(&mut rx, |o| !o.is_empty()).await?;
+            assert_ne!(again[0]["metadata"]["uid"].as_str(), Some(uid.as_str()), "the same object came back");
+
+            let follow = k8s::Follow {
+                ar: k8s::ar_of::<k8s_openapi::api::core::v1::Pod>(),
+                namespace: Some(NS.into()),
+                labels: Some("e2e=follow".into()),
+                fields: None,
+                keep: None,
+                managed: false,
+                cached: true,
+                every: std::time::Duration::ZERO,
+                poll: std::time::Duration::from_secs(15),
+            };
+            let (_pods, mut rx) = k8s::follow(ui, follow, k8s::Pause::default());
+            followed_until(&mut rx, <[serde_json::Value]>::is_empty).await?;
+            let labelled = serde_json::from_value(json!({
+                "metadata": {"name": pod, "namespace": NS, "labels": {"e2e": "follow"}},
+                "spec": {"containers": [{"name": "main", "image": "busybox:1.37", "command": ["sleep", "3600"]}]},
+            }))?;
+            pods.create(&PostParams::default(), &labelled).await?;
+            let shown = followed_until(&mut rx, |o| o.iter().any(|p| p["metadata"]["name"] == pod)).await?;
+            assert!(shown[0].pointer("/metadata/managedFields").is_none(), "a page's pods keep no managed fields");
+            pods.delete(pod, &DeleteParams::default().grace_period(0)).await?;
+            followed_until(&mut rx, <[serde_json::Value]>::is_empty).await?;
+            Ok(())
+        };
+        let result: Result<()> = checked.await;
+        let _ = cms.delete(name, &DeleteParams::default()).await;
+        let _ = pods.delete(pod, &DeleteParams::default().grace_period(0)).await;
         result
     });
 }

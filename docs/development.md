@@ -48,6 +48,12 @@ settings untouched. Give it another MCP port too (`{"port": 47199, "version": 1}
 `$XDG_CONFIG_HOME/recouvrance/agents.json`), so it doesn't take 47070 from the Recouvrance you
 have open.
 
+`RECOUVRANCE_REQUESTS=<seconds>` counts what the page on screen asks of the API server: once the
+other variables have set it up (a detail page opened with `RECOUVRANCE_SELECT`, say), the problem
+badge stops counting (its scans would hide the page's requests), the counts of Settings → API
+requests start again, and after that many seconds the run prints the requests and bytes of each
+kind, the heaviest requests, and the process's memory (`VmRSS`, `VmHWM`).
+
 **Smoke checks**: `RECOUVRANCE_SMOKE=<context> cargo run --features dev` lists types and watches
 pods; add `RECOUVRANCE_LISTTIME=1`, `RECOUVRANCE_PROBLEMS=1` (the Problems scan's time and, on
 Linux, the process's peak memory; `RECOUVRANCE_PROBLEMS=kinds` runs each kind's check alone, with
