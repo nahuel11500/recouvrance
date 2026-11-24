@@ -460,32 +460,44 @@ async fn follow_table(
     shown: k8s::Pause,
     rows_in: k8s::Pause,
 ) {
-    let mut held = Vec::new();
+    let mut held = Held::default();
     while wait_list_shown(&this, &shown, id, cx).await {
-        if held.is_empty() {
+        if held.0.is_empty() {
             let Some(msg) = rx.next().await else { break };
-            held.push(msg);
+            held.0.push(msg);
         }
         // Everything already waiting goes in one update: only its last rows count.
         while let Ok(msg) = rx.try_recv() {
-            held.push(msg);
+            held.0.push(msg);
         }
-        if held.iter().any(|m| matches!(m, TableMsg::Rows(_) | TableMsg::Listed)) {
+        if held.0.iter().any(|m| matches!(m, TableMsg::Rows(_) | TableMsg::Listed)) {
             rows_in.set(false);
         }
-        let batch = std::mem::take(&mut held);
-        let back = this.update(cx, |this, cx| {
-            if this.watch_id != id {
-                return Some(batch);
+        let applied = this.update(cx, |this, cx| {
+            if let Some(batch) = held.release(this.watch_id == id) {
+                this.on_table_msgs(ix, batch, cx);
             }
-            this.on_table_msgs(ix, batch, cx);
-            None
         });
-        match back {
-            Err(_) => break,
-            Ok(Some(batch)) => held = batch,
-            Ok(None) => {}
+        if applied.is_err() {
+            break;
         }
+    }
+}
+
+/// The messages of one list's watch not applied yet, oldest first.
+struct Held<M>(Vec<M>);
+
+impl<M> Default for Held<M> {
+    fn default() -> Self {
+        Self(Vec::new())
+    }
+}
+
+impl<M> Held<M> {
+    /// All of them, in the order they came, when their list is the current one; otherwise
+    /// they stay held (another list is on screen: they must not reach its table).
+    fn release(&mut self, current: bool) -> Option<Vec<M>> {
+        current.then(|| std::mem::take(&mut self.0))
     }
 }
 
@@ -505,5 +517,23 @@ async fn wait_list_shown(this: &WeakEntity<AppView>, pause: &k8s::Pause, id: u64
                 cx.background_executor().timer(std::time::Duration::from_millis(500)).await;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Held;
+
+    #[test]
+    fn held_messages_wait_for_their_list_and_keep_their_order() {
+        let mut held = Held::default();
+        held.0.extend([1, 2]);
+        // Another list is on screen: nothing reaches the table, nothing is lost.
+        assert_eq!(held.release(false), None);
+        held.0.push(3);
+        assert_eq!(held.release(false), None);
+        // Back on screen: everything, oldest first, once.
+        assert_eq!(held.release(true), Some(vec![1, 2, 3]));
+        assert_eq!(held.release(true), Some(vec![]));
     }
 }

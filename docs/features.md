@@ -469,7 +469,7 @@
   favorites, kept in `favorites.json`.
 - **Saved views** (type + namespaces + filter, bookmark button), back/forward history, light and dark themes
   whose status colors, badges and status buttons read at WCAG AA contrast (4.5:1) on what they are drawn on.
-- **Instant back**: the last 4 lists left (up to 60,000 rows in all, for 10 minutes) keep their
+- **Instant back**: the last 4 lists left in a window (up to 60,000 rows in all, for 5 minutes) keep their
   watches, paused like a hidden page's, so going back to one (by kind, tab or namespace) shows its
   rows at once, current within half a second, without listing it again. *Refresh* lists it again.
   Other lists seen recently (the last 8, up to 10,000 rows in all) show at once, marked

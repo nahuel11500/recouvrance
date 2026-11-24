@@ -6,11 +6,14 @@ use std::time::{Duration, Instant};
 
 /// Lists kept at most.
 pub(super) const MAX_LISTS: usize = 4;
-/// Rows kept across all of them: each watch holds its rows (about 1 KB each).
+/// Rows kept across all of them, in one window: each watch holds its rows (about 1 KB each).
+/// Counted when a list is left: what its watch adds while it is kept comes on top.
 pub(super) const MAX_ROWS: usize = 60_000;
 /// How long a list is kept after it was left: its watch's events cost little, but a list
-/// not seen for this long is unlikely to be the next one.
-pub(super) const KEPT_FOR: Duration = Duration::from_secs(10 * 60);
+/// not seen for this long is unlikely to be the next one. As long as a pods list's watch
+/// of their requests and limits goes on off screen: kept longer, it would come back
+/// without them and list every pod again for them.
+pub(super) const KEPT_FOR: Duration = crate::k8s::LINGER;
 
 struct Entry<T> {
     key: String,

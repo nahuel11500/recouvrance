@@ -69,8 +69,11 @@ an agent has used the app end to end and found nothing blocking:
 - Measure speed against the last release, once per release rather than per PR: build the last
   tag the same way, then run both builds alternately on the same cluster, read-only (pods list
   with `RECOUVRANCE_SMOKE`, the Problems scan with `RECOUVRANCE_PROBLEMS=1`, the Workloads
-  overview with `RECOUVRANCE_DASH=1`, the whole app's memory with `--snapshot` and RSS sampling;
-  see [docs/development.md](docs/development.md)). Post the before/after numbers on the release PR.
+  overview with `RECOUVRANCE_DASH=1`, going back to a list with
+  `RECOUVRANCE_BACKTIME=pods,deployments`, the whole app's memory with `--snapshot` and RSS
+  sampling; see [docs/development.md](docs/development.md)). A hook the last tag doesn't have yet
+  has no "before" build that once: cherry-pick the commit that added it onto the tag, or post the
+  new numbers alone as the baseline. Post the before/after numbers on the release PR.
   A clear regression is a bug like any other: file it, and say whether it blocks.
 - File an issue for each bug found, with what was done and a snapshot; don't fix them in the
   same pass. Then say whether the release can go, and which issues block it.

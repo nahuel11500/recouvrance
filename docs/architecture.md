@@ -18,7 +18,8 @@ Recouvrance is one Rust binary: a [gpui](https://github.com/zed-industries/zed) 
   sidebar's problem count waits. Watches, log streams and shells keep going, so a window shown
   again is current at once. A window shown on another monitor, not focused, keeps updating.
 - A list left for another kind, tab or namespace keeps its watches the same way (`app::kept_lists`:
-  the last 4, up to 60,000 rows in all, for 10 minutes, the least recently left dropped first), so
+  the last 4 of each window, up to 60,000 rows in all as counted when each was left, for 5 minutes,
+  as long as the pods' requests watch lingers off screen; the least recently left dropped first), so
   going back to it shows current rows without a list request. Its tasks carry the id of their list
   and touch the table only while it is the one on screen.
 - The page on screen gets the API servers first. Background work (the problem count, a hidden
