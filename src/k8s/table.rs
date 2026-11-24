@@ -201,10 +201,15 @@ pub enum TableMsg {
 
 pub(super) const TABLE_ACCEPT: &str = "application/json;as=Table;g=meta.k8s.io;v=v1,application/json";
 
-pub(super) fn with_table_format(mut req: http::Request<Vec<u8>>, full: bool) -> Result<http::Request<Vec<u8>>> {
+pub(super) fn with_table_format(req: http::Request<Vec<u8>>, full: bool) -> Result<http::Request<Vec<u8>>> {
+    with_table_include(req, if full { "Object" } else { "Metadata" })
+}
+
+/// A request for kubectl's table, its rows with their objects as `include` says: `Object`,
+/// `Metadata`, or `None` (cells alone).
+fn with_table_include(mut req: http::Request<Vec<u8>>, include: &str) -> Result<http::Request<Vec<u8>>> {
     let uri = req.uri().to_string();
     let sep = if uri.contains('?') { '&' } else { '?' };
-    let include = if full { "Object" } else { "Metadata" };
     *req.uri_mut() = format!("{uri}{sep}includeObject={include}").parse()?;
     req.headers_mut().insert(http::header::ACCEPT, http::HeaderValue::from_static(TABLE_ACCEPT));
     Ok(req)
@@ -533,15 +538,21 @@ async fn list_whole(client: &Client, url: &str, tap: Option<&Tap>) -> Result<(Ve
     Ok((table.column_definitions, rows, table.metadata.resource_version.unwrap_or_default()))
 }
 
-/// Every row of `url` from its cells alone, in one request from the API server's cache;
-/// `namespace` is the one `url` is in, if any.
-async fn cells_list(client: &Client, url: &str, namespace: Option<&str>) -> Result<Vec<Arc<Row>>> {
+/// Every row of `url` from its cells alone, in one request from the API server's cache, with
+/// the table's columns; `namespace` is the one `url` is in, if any.
+async fn cells_list(client: &Client, url: &str, namespace: Option<&str>) -> Result<(Vec<ColumnDef>, Vec<Arc<Row>>)> {
     let path = format!("{url}?includeObject=None&resourceVersion=0&resourceVersionMatch=NotOlderThan");
     let mut req = http::Request::get(&path).body(Vec::new())?;
     req.headers_mut().insert(http::header::ACCEPT, http::HeaderValue::from_static(TABLE_ACCEPT));
     let page: ServerTable = lists::request_idle(client, req).await?;
+    Ok(cells_rows(page, namespace))
+}
+
+/// A table's columns and its rows from their cells alone (`includeObject=None`).
+fn cells_rows(page: ServerTable, namespace: Option<&str>) -> (Vec<ColumnDef>, Vec<Arc<Row>>) {
     let age = page.column_definitions.iter().position(|d| d.name == "Age");
-    Ok(page.rows.into_iter().filter_map(|r| cells_row(r, namespace, age)).collect())
+    let rows = page.rows.into_iter().filter_map(|r| cells_row(r, namespace, age)).collect();
+    (page.column_definitions, rows)
 }
 
 /// A row from its cells alone (`includeObject=None`): the name is the first cell, and
@@ -623,17 +634,8 @@ pub async fn list_light(
             return Ok((defs, rows));
         }
         let rows = match (&ns, kind.namespaced) {
-            // In the lane of whoever asked: the problem badge's count goes in the background.
-            (None, true) if with_namespaces => match cells_by_namespace(&client, &url, &Lane::current).await {
-                Ok(rows) => rows,
-                // One namespace refused or stalled doesn't fail the kind: the whole list has
-                // every namespace's rows (with their objects' metadata, so more bytes).
-                Err(_) => match list_whole(&client, &url, None).await {
-                    Ok(listed) => listed.1,
-                    Err(_) => list_paged(&client, &url, ListParams::default()).await?.1,
-                },
-            },
-            (None, true) => cells_list(&client, &url, None).await?,
+            (None, true) if with_namespaces => rows_by_namespace(&client, &url).await?,
+            (None, true) => cells_list(&client, &url, None).await?.1,
             // One namespace, or a cluster-scoped kind: it pages with its metadata as usual.
             _ => list_paged(&client, &url, ListParams::default()).await?.1,
         };
@@ -644,6 +646,52 @@ pub async fn list_light(
 
 /// `list_light` lists a kind with its objects' metadata when it has at most this many.
 const LIGHT_PROBE: u32 = 1000;
+
+/// Every namespace's rows of a big list, each with its namespace: from their cells, one
+/// namespace at a time (`cells_by_namespace`), in the lane of whoever asked (the problem
+/// badge's count goes in the background). One namespace refused or stalled doesn't fail the
+/// kind: the whole list has every namespace's rows (with their objects' metadata, so more
+/// bytes).
+async fn rows_by_namespace(client: &Client, url: &str) -> Result<Vec<Arc<Row>>> {
+    match cells_by_namespace(client, url, &Lane::current).await {
+        Ok(rows) => Ok(rows),
+        Err(_) => match list_whole(client, url, None).await {
+            Ok(listed) => Ok(listed.1),
+            Err(_) => Ok(list_paged(client, url, ListParams::default()).await?.1),
+        },
+    }
+}
+
+/// Rows of a kind from kubectl's cells alone, for counts that read nothing else (the Workloads
+/// overview): never the objects' metadata, most of a list's bytes even for a few hundred
+/// objects. Rows are `is_partial`. One request, from the API server's cache; rows of every
+/// namespace come without theirs. `named_over`: rows need their namespace when there are more
+/// than that many; a list of every namespace is then read one namespace at a time
+/// (`rows_by_namespace`) unless its first page (at most `LIGHT_PROBE` rows) holds all of it.
+pub async fn list_cells(
+    client: Client,
+    kind: Kind,
+    namespace: Option<String>,
+    named_over: Option<usize>,
+) -> Result<(Vec<ColumnDef>, Vec<Arc<Row>>)> {
+    run(async move {
+        let ns = if kind.namespaced { namespace } else { None };
+        let url = DynamicObject::url_path(&kind.ar, ns.as_deref());
+        let Some(over) = named_over.filter(|_| ns.is_none() && kind.namespaced) else {
+            return cells_list(&client, &url, ns.as_deref()).await;
+        };
+        // A first page that holds every row has at most `over` of them: no namespace needed.
+        let probe = u32::try_from(over).unwrap_or(u32::MAX).clamp(1, LIGHT_PROBE);
+        let lp = ListParams::default().limit(probe);
+        let page: ServerTable =
+            lists::request_idle(&client, with_table_include(Request::new(&url).list(&lp)?, "None")?).await?;
+        if page.metadata.continue_.as_ref().is_none_or(String::is_empty) {
+            return Ok(cells_rows(page, None));
+        }
+        Ok((page.column_definitions, rows_by_namespace(&client, &url).await?))
+    })
+    .await
+}
 
 /// Holds back a watch's snapshots while its list is hidden: events still apply (the
 /// watch stays current), and the rows are sent once it is shown again (with `Listed`, when
@@ -1115,7 +1163,10 @@ pub async fn list_table(
     .await
 }
 
-/// Labels of every object matching a selector, from metadata only (no data/spec).
+/// Labels of every object matching a selector, from metadata only (no data/spec), read from
+/// the API server's cache (`resourceVersion=0`): a moment old at worst, and lighter on the
+/// server, which picks them from memory rather than from etcd, where a label selector means
+/// reading every object of the kind (every Secret of the cluster, for Helm's).
 pub async fn list_labels(
     client: Client,
     ar: ApiResource,
@@ -1127,7 +1178,7 @@ pub async fn list_labels(
             Some(ns) => Api::namespaced_with(client, ns, &ar),
             None => Api::all_with(client, &ar),
         };
-        let list = api.list_metadata(&ListParams::default().labels(&selector)).await?;
+        let list = api.list_metadata(&ListParams::default().labels(&selector).match_any()).await?;
         Ok(list.items.into_iter().map(|o| (o.metadata.namespace, o.metadata.labels.unwrap_or_default())).collect())
     })
     .await
@@ -1404,16 +1455,26 @@ mod fast_list_tests {
     use crate::k8s::Kind;
 
     /// Three pods in namespaces `a` and `b`, whose first page holds one: a big list. Its list
-    /// of namespaces waits for a permit of `gate`, and it refuses watches.
+    /// of namespaces waits for a permit of `gate`, and it refuses watches. Records the requests
+    /// it was sent.
     #[derive(Clone)]
     struct Big {
         gate: Arc<Semaphore>,
+        asked: Arc<std::sync::Mutex<Vec<String>>>,
     }
 
     impl Big {
         /// With the gate open.
         fn open() -> Self {
-            Self { gate: Arc::new(Semaphore::new(1)) }
+            Self::with_gate(1)
+        }
+
+        fn with_gate(permits: usize) -> Self {
+            Self { gate: Arc::new(Semaphore::new(permits)), asked: Arc::default() }
+        }
+
+        fn asked(&self) -> Vec<String> {
+            self.asked.lock().unwrap().clone()
         }
     }
 
@@ -1428,6 +1489,7 @@ mod fast_list_tests {
 
         fn call(&mut self, req: http::Request<kube::client::Body>) -> Self::Future {
             let (path, query) = (req.uri().path(), req.uri().query().unwrap_or_default());
+            self.asked.lock().unwrap().push(format!("{path}?{query}"));
             let table = |rows: Vec<Value>, more: &str| {
                 json!({"kind": "Table", "apiVersion": "meta.k8s.io/v1",
                     "metadata": {"resourceVersion": "7", "continue": more},
@@ -1520,7 +1582,7 @@ mod fast_list_tests {
     /// would make the first page pass for the whole list, and keep it as such.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_list_left_as_it_loads_says_it_is_listed_only_with_its_rows() {
-        let (pause, big) = (Pause::default(), Big { gate: Arc::new(Semaphore::new(0)) });
+        let (pause, big) = (Pause::default(), Big::with_gate(0));
         let gate = big.gate.clone();
         let (_watch, mut rx) = watch(big, &pause);
         // The first page shows; every namespace's rows wait at the gate.
@@ -1547,5 +1609,34 @@ mod fast_list_tests {
         // Asked as each request takes its slot, not once for all: a hidden list that comes on
         // screen while it loads takes the page's slots for the namespaces left.
         assert_eq!(asked.load(Ordering::Relaxed), 2);
+    }
+
+    /// Counts read kubectl's cells alone, never an object's metadata: a list of every namespace
+    /// in one request to the cache; with rows that need their namespace, a first page and,
+    /// as it doesn't hold the whole list, every namespace's rows; one namespace's, from it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn counts_read_cells_alone() {
+        let big = Big::open();
+        let client = kube::Client::new(big.clone(), "default");
+        let rows = |listed: (Vec<super::ColumnDef>, Vec<Arc<super::Row>>)| {
+            let mut rows: Vec<(Option<String>, String)> =
+                listed.1.iter().map(|r| (r.namespace.clone(), r.name.clone())).collect();
+            rows.sort();
+            rows
+        };
+        let row = |ns: Option<&str>, name: &str| (ns.map(String::from), name.to_string());
+        let pod = Kind::fake("", "Pod");
+        let all = super::list_cells(client.clone(), pod.clone(), None, None).await.unwrap();
+        assert_eq!(all.0.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(), ["Name", "Status"]);
+        assert_eq!(rows(all), [row(None, "api"), row(None, "db"), row(None, "web")]);
+        let named = super::list_cells(client.clone(), pod.clone(), None, Some(4000)).await.unwrap();
+        assert_eq!(rows(named), [row(Some("a"), "api"), row(Some("a"), "web"), row(Some("b"), "db")]);
+        let one = super::list_cells(client, pod, Some("b".into()), Some(4000)).await.unwrap();
+        assert_eq!(rows(one), [row(Some("b"), "db")]);
+        let asked = big.asked();
+        // One request; a first page, the namespaces, then each one's rows; one namespace's.
+        assert_eq!(asked.len(), 1 + 4 + 1, "{asked:?}");
+        assert!(asked.iter().all(|q| q.contains("includeObject=None")), "{asked:?}");
+        assert!(asked[0].contains("resourceVersion=0") && asked[5].starts_with("/api/v1/namespaces/b/pods?"));
     }
 }

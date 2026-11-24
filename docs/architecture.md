@@ -67,6 +67,15 @@ of whole objects (Services, Ingresses and HTTP routes, the pods a Service select
 a namespace with an idle Service, external-secrets.io's objects) is parsed as each list streams in,
 keeping only the fields the checks use; of the workloads, only those scaled to 0 are kept.
 
+The Workloads overview counts each kind from kubectl's cells alone, with no object metadata at all
+(`list_cells`), in one request from the cache. The pods card works differently, as it needs each
+pod's namespace past 4,000 pods: it reads a first page of at most 1,000 rows (paged, so etcd serves
+it), and past that one namespace at a time from the cache. It reads pods whole only up to 4,000 of
+them, for their restarts and limits, parsed lean; HPAs, Disruption Budgets and Helm's current
+revisions come lean from the cache too. kube-apiserver keeps no cache of events by default, so the
+Warning events are read 5,000 at a time and added up by reason as each page streams in
+(`warning_reasons`): only the reasons are held, however many events the cluster keeps.
+
 ## Safety model
 
 - **Read-only by default.** Write actions ask to enable write mode first.
