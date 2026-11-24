@@ -78,7 +78,7 @@ impl Render for AppView {
             .text_color(cx.theme().foreground)
             .children(self.context_strip())
             .child(TitleBar::new().child(self.render_toolbar(cx)))
-            .child(self.render_approvals(cx))
+            .child(self.approvals.clone())
             .child(div().flex_1().min_h_0().child(body))
             .children(self.palette.clone())
     }

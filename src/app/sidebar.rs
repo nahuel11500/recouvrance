@@ -371,7 +371,7 @@ impl AppView {
         let badge = |n: usize, color: Hsla| {
             div().px_1p5().rounded_full().text_xs().bg(color).text_color(hull).child(n.to_string())
         };
-        let pending = self.approvals.len();
+        let pending = self.approvals.read(cx).waiting_count();
         let nav_row = |id, icon, label, on| nav_row(id, icon, label, on, query, colors);
         [
             nav_row("nav-agents", Lucide::Bot, "Agents", route.is_agents())

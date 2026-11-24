@@ -244,6 +244,8 @@ impl AgentsView {
                                         this.report(saved.map_err(anyhow::Error::from));
                                         this.fresh_token = Some((id.clone(), token));
                                         this.connect_client = this.connect_client.or(Some(Client::ClaudeCode));
+                                        // Claude Code may hold the old token now.
+                                        this.check_claude(true, cx);
                                     }
                                     cx.notify();
                                 }

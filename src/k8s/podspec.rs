@@ -142,6 +142,10 @@ pub struct LeanSpec {
     pub init_containers: Vec<LeanContainer>,
     pub overhead: HashMap<String, String>,
     pub resources: LeanResources,
+    /// The node the pod is bound to; empty while no node took it.
+    pub node_name: String,
+    /// Gates holding the pod back from scheduling; only how many there are is read.
+    pub scheduling_gates: Vec<serde::de::IgnoredAny>,
 }
 
 #[derive(Deserialize, Default, Clone)]

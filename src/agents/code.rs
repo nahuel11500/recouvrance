@@ -46,7 +46,7 @@ impl AgentsView {
             Ok(()) => {
                 self.code = Some((editor.clone(), text));
                 self.code_message =
-                    Some((true, format!("Saved {} and applied", crate::mcp::rules_file::path().display())));
+                    Some((true, format!("Saved {} and applied", crate::paths::tilde(&crate::mcp::rules_file::path()))));
                 if let Some(id) = self.selected.clone() {
                     self.select(id, window, cx);
                 }
@@ -85,7 +85,7 @@ impl AgentsView {
                 h_flex()
                     .gap_2()
                     .child(div().text_lg().font_weight(FontWeight::BOLD).child("Rules as code"))
-                    .child(div().text_sm().text_color(theme.muted_foreground).child(crate::mcp::rules_file::path().display().to_string()))
+                    .child(div().text_sm().text_color(theme.muted_foreground).child(crate::paths::tilde(&crate::mcp::rules_file::path())))
                     .child(div().flex_1())
                     .when(!exists, |d| d.child(div().text_sm().text_color(theme.muted_foreground).child("Not created yet: saving creates it")))
                     .child(
