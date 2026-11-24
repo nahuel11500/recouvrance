@@ -375,6 +375,10 @@ Write `version: 2` in a file you write by hand, or its `patch` rules cover GitOp
 file with a higher `version`, written by a newer Recouvrance, is not loaded either. If the file
 changed on disk meanwhile, it is not written over: the load fails with the reason, and your edit is
 loaded (and upgraded, if it has no `version` either) next.
+If the folder of the file can't be written (managed by another tool), its rules are still loaded,
+upgraded the same way, and the Agents page says why the file wasn't written; while it has no
+`version`, each load upgrades it again, until it is written. Edits on the Agents page try to write
+it too, and fail with the reason rather than being undone at the next load.
 
 Each section is for the agent with that name, so agent names are unique: creating a second agent
 with a taken name is refused, and if two agents already share a name the file is neither loaded nor
