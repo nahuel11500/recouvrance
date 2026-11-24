@@ -269,11 +269,11 @@ fn a_diff_is_kept_by_application_and_version() {
 fn an_answer_with_or_without_modified() {
     let changed = res("", "ConfigMap", "a", "c", Some(config("a", "c", "info")), Some(config("a", "c", "debug")));
     // No item says: the states tell.
-    let d = AppDiff::of(&json!({"items": [changed.clone()]}));
+    let d = AppDiff::of(&json!({"items": [&changed]}));
     assert_eq!(d.diff.groups.len(), 1);
     // One says it differs: another without it is in sync, whatever its states.
     let other = res("", "ConfigMap", "a", "d", Some(config("a", "d", "info")), Some(config("a", "d", "warn")));
-    let d = AppDiff::of(&json!({"items": [modified(changed.clone()), other]}));
+    let d = AppDiff::of(&json!({"items": [modified(changed), other]}));
     assert_eq!(regroup(&[Some(&d.diff)], false).len(), 1, "only c");
     assert_eq!(d.same, 1);
     // Said modified, but the same once normalized: not in sync, not noise only, said.

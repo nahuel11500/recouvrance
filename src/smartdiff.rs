@@ -721,13 +721,12 @@ impl Found {
             hash_value(l.after.as_ref(), &mut h);
         }
         let leaf_hash = if leaf.is_some() { h.finish() } else { 0 };
-        match self.seen.get(&fact) {
-            Some(&i) => self.digests[i] = self.digests[i].rotate_left(5) ^ leaf_hash,
-            None => {
-                self.seen.insert(fact.clone(), self.facts.len());
-                self.facts.push(fact);
-                self.digests.push(leaf_hash);
-            }
+        if let Some(&i) = self.seen.get(&fact) {
+            self.digests[i] = self.digests[i].rotate_left(5) ^ leaf_hash;
+        } else {
+            self.seen.insert(fact.clone(), self.facts.len());
+            self.facts.push(fact);
+            self.digests.push(leaf_hash);
         }
     }
 }
