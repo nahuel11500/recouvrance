@@ -3,7 +3,7 @@
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::notification::Notification;
-use gpui_kit::component::{ActiveTheme as _, WindowExt as _, h_flex, v_flex};
+use gpui_kit::component::{ActiveTheme as _, Disableable as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
@@ -608,6 +608,10 @@ impl DetailPanel {
                                     "Remove finalizers"
                                 })
                                 .checked(strip)
+                                // Clearing them would also clear the garbage collector's
+                                // `orphan`, which then deletes what the user asked to keep.
+                                .disabled(orphan)
+                                .when(orphan, |c| c.tooltip("Not with an orphan delete: it would delete what it keeps"))
                                 .on_click(move |v: &bool, _, cx| {
                                     let v = *v;
                                     o2.update(cx, |o, cx| {
@@ -628,6 +632,10 @@ impl DetailPanel {
                                 Checkbox::new("del-orphan")
                                     .label(format!("Keep {owns} (orphan them)"))
                                     .checked(orphan)
+                                    .disabled(strip)
+                                    .when(strip, |c| {
+                                        c.tooltip("Not while removing finalizers: it would delete what it keeps")
+                                    })
                                     .on_click(move |v: &bool, _, cx| {
                                         let v = *v;
                                         o3.update(cx, |o, cx| {

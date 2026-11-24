@@ -2459,12 +2459,15 @@ where
 /// An orphan delete keeps what the object owns: an agent's `delete_resource` with
 /// `cascade: orphan` (its delete rule needed, an unknown cascade refused) deletes a Deployment
 /// and leaves its ReplicaSet, now without an owner; the window's delete with the same option
-/// then deletes that ReplicaSet and leaves its pod.
+/// then deletes that ReplicaSet, held by a finalizer of its own that it removes, and leaves
+/// its pod.
 #[test]
 #[ignore = "needs a kind cluster: RECOUVRANCE_E2E_CONTEXT"]
 fn an_orphan_delete_keeps_what_the_object_owns() {
     use k8s_openapi::api::apps::v1::{Deployment, ReplicaSet};
     use k8s_openapi::api::core::v1::Pod;
+    /// A finalizer no controller removes.
+    const HOLD: &str = "e2e.recouvrance.dev/hold";
 
     run(async {
         let ctx = context();
@@ -2476,6 +2479,11 @@ fn an_orphan_delete_keeps_what_the_object_owns() {
         let selector = kube::api::ListParams::default().labels(&format!("app={name}"));
         let clean = || async {
             let _ = deps.delete(name, &DeleteParams::background()).await;
+            // A ReplicaSet a failed run left held by `HOLD`.
+            for rs in sets.list(&selector).await.map(|l| l.items).unwrap_or_default() {
+                let free = Patch::Merge(json!({"metadata": {"finalizers": null}}));
+                let _ = sets.patch(&rs.metadata.name.unwrap_or_default(), &PatchParams::default(), &free).await;
+            }
             let _ = sets.delete_collection(&DeleteParams::background(), &selector).await;
             let _ = pods.delete_collection(&DeleteParams::default().grace_period(0), &selector).await;
         };
@@ -2539,11 +2547,20 @@ fn an_orphan_delete_keeps_what_the_object_owns() {
             let ui = k8s::connect(ctx.clone()).await?;
             let kind =
                 k8s::Kind { ar: k8s::ar_of::<ReplicaSet>(), namespaced: true, section: "", label: "ReplicaSet".into() };
-            let opts = k8s::DeleteOptions { cascade: Some(k8s::Cascade::Orphan), ..Default::default() };
+            // A finalizer of its own keeps it terminating: removing finalizers must still leave
+            // the garbage collector's `orphan`, or the pod would be deleted after all.
+            let hold = Patch::Merge(json!({"metadata": {"finalizers": [HOLD]}}));
+            sets.patch(&rs_name, &PatchParams::default(), &hold).await?;
+            let opts = k8s::DeleteOptions {
+                cascade: Some(k8s::Cascade::Orphan),
+                strip_finalizers: true,
+                ..Default::default()
+            };
             let uid = rs.metadata.uid.clone();
             let deleted = k8s::delete_with(ui, kind, Some(NS.into()), rs_name.clone(), uid, opts).await;
             gate::set_ui_writes(false);
-            assert!(deleted?.contains("what it owns kept"));
+            let deleted = deleted?;
+            assert!(deleted.contains("what it owns kept, finalizers removed"), "{deleted}");
             until_gone("the orphaned ReplicaSet", || sets.get_opt(&rs_name)).await?;
             for _ in 0..30 {
                 let pod = pods.get_opt(&pod_name).await?.context("the pod went with its ReplicaSet")?;

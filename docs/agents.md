@@ -287,8 +287,8 @@ tools' definitions. What some of them need beyond the obvious verb:
   keeps what the object owns (a workload's pods; the approval banner says they stay), `foreground`
   deletes that first, `background` after; a value it doesn't know is refused, not sent as the
   default. `evict_pod` evicts one pod through the Eviction API, as `drain_node` does for each pod:
-  it needs `delete` on the pod, and a PodDisruptionBudget that would be broken refuses it, the
-  reply naming the budget.
+  it needs `delete` on the pod (the approval banner says it is an eviction a budget may refuse),
+  and a PodDisruptionBudget that would be broken refuses it, the reply naming the budget.
 - **ExternalSecrets:** `refresh_external_secret` sets an ExternalSecret's `force-sync` annotation,
   so the External Secrets Operator fetches it from its store now (after a secret was rotated). It
   needs the `refresh` verb on `externalsecrets.external-secrets.io`, the verb of an Argo CD refresh:

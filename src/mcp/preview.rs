@@ -176,6 +176,8 @@ pub(crate) enum Plan {
     Sync { client: Client, kind: Kind, ns: String, name: String, req: SyncRequest, app: Option<Value> },
     /// `delete_resource`: the object, and what goes with it (or stays, with `cascade`).
     Delete { client: Client, kind: Kind, ns: Option<String>, name: String, cascade: Option<Cascade> },
+    /// `evict_pod`: not a plain delete, a budget may refuse it.
+    Evict { kind: Kind, ns: String, name: String },
 }
 
 /// What `plan` will change, worked out in [`TIMEOUT`] at most: what fails, or takes longer,
@@ -230,6 +232,22 @@ async fn work_out(plan: &Plan) -> Preview {
             }
         }
         Plan::Delete { client, kind, ns, name, cascade } => deleted(client, kind, ns.as_deref(), name, *cascade).await,
+        Plan::Evict { kind, ns, name } => {
+            Preview::of(vec![evict_section(&object_label(kind, Some(ns.as_str()), name))])
+        }
+    }
+}
+
+/// `evict_pod` of the pod `label`: the API server decides with its budgets when it is sent.
+fn evict_section(label: &str) -> Section {
+    Section {
+        title: format!("{label}: evicted"),
+        lines: vec![
+            "through the Eviction API, as a drain does".to_string(),
+            "refused if a PodDisruptionBudget would be broken".to_string(),
+        ],
+        note: None,
+        diff: Vec::new(),
     }
 }
 
@@ -933,6 +951,16 @@ mod tests {
             ["what it owns stays, without an owner (cascade: orphan)", "its PersistentVolumeClaims stay"]
         );
         assert_eq!(few(&["a", "b", "c", "d", "e"].map(String::from)), "a, b, c, +2");
+    }
+
+    #[test]
+    fn an_eviction_is_not_shown_as_a_delete() {
+        let s = evict_section("Pod shop/web-1");
+        assert_eq!(s.title, "Pod shop/web-1: evicted");
+        assert_eq!(
+            s.lines,
+            ["through the Eviction API, as a drain does", "refused if a PodDisruptionBudget would be broken"]
+        );
     }
 
     #[test]

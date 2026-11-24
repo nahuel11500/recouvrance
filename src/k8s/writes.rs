@@ -269,7 +269,8 @@ pub const FINALIZER_GRACE_SECS: u64 = 10;
 pub struct DeleteOptions {
     /// Skip the grace period (`--grace-period=0 --force`).
     pub force: bool,
-    /// Clear finalizers when the delete leaves the object stuck terminating.
+    /// Clear finalizers when the delete leaves the object stuck terminating. With a
+    /// `cascade`, the garbage collector's own (`orphan`, `foregroundDeletion`) stay.
     pub strip_finalizers: bool,
     /// What happens to what it owns; None is the kind's default (background when forced).
     pub cascade: Option<Cascade>,
@@ -317,14 +318,29 @@ pub async fn delete_with(
                 waited += step;
                 current = api.get_opt(&name).await?;
             }
-            if stuck_terminating(current.as_ref()) {
-                let patch = serde_json::json!({"metadata": {"finalizers": null}});
+            // A few tries: the garbage collector may take its own finalizer off in between.
+            for attempt in 1..=3 {
+                let Some(o) = current.as_ref().filter(|o| stuck_terminating(Some(*o))) else { break };
+                let had = o.metadata.finalizers.as_deref().unwrap_or_default();
+                let kept = finalizers_kept(had, cascade);
+                if kept.len() == had.len() {
+                    // Only the garbage collector's are left: it removes them itself.
+                    break;
+                }
+                // Kept ones are written back as a list, so only onto the list that was read.
+                let patch = if kept.is_empty() {
+                    serde_json::json!({"metadata": {"finalizers": null}})
+                } else {
+                    serde_json::json!({"metadata": {"finalizers": kept, "resourceVersion": o.metadata.resource_version}})
+                };
                 match api.patch(&name, &patch_params(false), &kube::api::Patch::Merge(&patch)).await {
                     // Its finalizers completed in between.
-                    Err(kube::Error::Api(e)) if e.code == 404 => {}
+                    Err(kube::Error::Api(e)) if e.code == 404 => break,
+                    Err(kube::Error::Api(e)) if e.code == 409 && attempt < 3 => current = api.get_opt(&name).await?,
                     r => {
                         r?;
                         stripped = true;
+                        break;
                     }
                 }
             }
@@ -338,6 +354,20 @@ pub async fn delete_with(
         ))
     })
     .await
+}
+
+/// The garbage collector's own finalizers, put on by a delete's cascade: `orphan` takes the
+/// owner off what it owns before the object goes, `foregroundDeletion` deletes those first.
+const GC_FINALIZERS: [&str; 2] = ["orphan", "foregroundDeletion"];
+
+/// The finalizers "Remove finalizers" leaves on an object. With a cascade asked for, the
+/// garbage collector's stay: without `orphan`, the object would go while what it owns still
+/// points to it, and the collector would then delete those, the very pods the user kept.
+fn finalizers_kept(finalizers: &[String], cascade: Option<Cascade>) -> Vec<String> {
+    if cascade.is_none() {
+        return Vec::new();
+    }
+    finalizers.iter().filter(|f| GC_FINALIZERS.contains(&f.as_str())).cloned().collect()
 }
 
 /// Deleted, but kept by finalizers.
@@ -1172,6 +1202,18 @@ mod tests {
             .boxed(),
         );
         assert!(eviction_error(&e).starts_with("PodDisruptionBudget db refuses it"), "{}", eviction_error(&e));
+    }
+
+    #[test]
+    fn removing_finalizers_keeps_the_garbage_collectors_for_a_cascade() {
+        let list = |l: &[&str]| l.iter().map(ToString::to_string).collect::<Vec<_>>();
+        let had = list(&["example.com/cleanup", "orphan", "foregroundDeletion", "kubernetes"]);
+        // An orphan delete keeps `orphan`, or what it owns would be deleted after all.
+        assert_eq!(finalizers_kept(&had, Some(Cascade::Orphan)), list(&["orphan", "foregroundDeletion"]));
+        assert_eq!(finalizers_kept(&had, Some(Cascade::Foreground)), list(&["orphan", "foregroundDeletion"]));
+        assert!(finalizers_kept(&list(&["example.com/cleanup"]), Some(Cascade::Orphan)).is_empty());
+        // No cascade asked for: all of them go, as the dialog's kubectl line says.
+        assert!(finalizers_kept(&had, None).is_empty());
     }
 
     #[test]

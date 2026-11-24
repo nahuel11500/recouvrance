@@ -394,13 +394,7 @@ impl KubeMcp {
         let (client, kind) = self.kind(&call, &p.context, "pods").await?;
         // Evicting is deleting the pod, as a drain's evictions are checked.
         let access = access_for(&kind, &p.context, Verb::Delete, Some(p.namespace.clone()), Some(p.pod.clone()));
-        call.plan = Some(Plan::Delete {
-            client: client.clone(),
-            kind,
-            ns: Some(p.namespace.clone()),
-            name: p.pod.clone(),
-            cascade: None,
-        });
+        call.plan = Some(Plan::Evict { kind, ns: p.namespace.clone(), name: p.pod.clone() });
         self.authorize(&mut call, &access).await?;
         self.recheck(&mut call, &access)?;
         call.finish(k8s::evict(client, p.namespace, p.pod, None, p.dry_run.unwrap_or(false)).await)
