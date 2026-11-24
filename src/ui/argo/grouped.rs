@@ -321,7 +321,7 @@ impl ArgoView {
                 Button::new("argo-journal")
                     .small()
                     .ghost()
-                    .icon(Lucide::History)
+                    .icon(Lucide::ScrollText)
                     .label("Sync journal")
                     .on_click(cx.listener(|this, _, window, cx| this.open_journal(None, window, cx))),
             )
