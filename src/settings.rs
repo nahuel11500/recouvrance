@@ -843,7 +843,7 @@ pub fn protected_contexts(contexts: &crate::k8s::Contexts) -> Vec<String> {
 }
 
 /// The kubeconfig's contexts that are not protected (see [`is_protected`]), for agent rules
-/// naming `@protected`. None when the kubeconfig can't be read: every context then counts
+/// naming `@protected`. Empty when the kubeconfig can't be read: every context then counts
 /// as protected.
 pub fn unprotected_contexts() -> Vec<String> {
     let Ok(contexts) = crate::k8s::load_contexts() else { return Vec::new() };
