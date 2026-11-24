@@ -16,7 +16,7 @@ use crate::details::DetailPanel;
 use crate::favorites::{ColumnPrefs, Favorites};
 use crate::forwards::Forwards;
 use crate::k8s::{self, Kind, TaskGuard};
-use crate::mcp::{self, Approval, Hub, HubEvent};
+use crate::mcp::{self, Hub, HubEvent};
 use crate::table::ResourceTable;
 use crate::ui::cluster::ClusterOverview;
 use crate::ui::ctx_picker::{ContextEvent, ContextPicker};
@@ -25,7 +25,7 @@ use crate::ui::helm::{HelmList, HelmRelease};
 use crate::ui::ns_picker::{NamespacePicked, NamespacePicker, NamespacesChanged};
 use crate::ui::palette::Palette;
 use crate::ui::settings_view::SettingsView;
-use banners::Banners;
+use banners::ApprovalStrip;
 
 mod banners;
 mod chrome;
@@ -424,7 +424,7 @@ pub struct AppView {
     tab_scroll: ScrollHandle,
     agents: Entity<AgentsView>,
     /// The approval banners: those waiting, and those that just went, kept a moment.
-    approvals: Banners<Arc<Approval>>,
+    approvals: Entity<ApprovalStrip>,
     /// Redraws the banner's countdown each second while a request waits.
     countdown: Option<Task<()>>,
     /// How many requests the window title last said were waiting.
@@ -696,6 +696,7 @@ impl AppView {
         // Subscribe first: the agents view reads the last status, later ones arrive here.
         let mut hub_rx = hub.subscribe();
         let agents = cx.new(|cx| AgentsView::new(hub.clone(), window, cx));
+        let approvals = cx.new(|_| ApprovalStrip::new(hub.clone()));
         let hub_events = cx.spawn_in(window, async move |this, cx| {
             while let Some(ev) = hub_rx.next().await {
                 let alive = this.update_in(cx, |this, window, cx| this.on_hub_event(&ev, window, cx));
@@ -733,7 +734,7 @@ impl AppView {
             }],
             pos: 0,
             agents,
-            approvals: Banners::default(),
+            approvals,
             countdown: None,
             title_waiting: None,
             _hub_events: hub_events,
@@ -813,15 +814,15 @@ impl AppView {
         }
         this.watch_kubeconfigs(window, cx);
         // The window has a name in task switchers and for screen readers.
-        this.show_waiting(window);
+        this.show_waiting(window, cx);
         this
     }
 
     fn on_hub_event(&mut self, ev: &HubEvent, window: &mut Window, cx: &mut Context<Self>) {
         match ev {
             HubEvent::ApprovalRequested(a) => {
-                self.approvals.push(a.id, a.clone(), std::time::Instant::now());
-                self.redraw_when_armed(cx);
+                let request = a.clone();
+                self.approvals.update(cx, |s, cx| s.requested(request, cx));
                 // Every window flashes in the taskbar or bounces the Dock (nothing happens to
                 // the one in front): an approval nobody sees is refused after 2 minutes.
                 window.request_attention();
@@ -836,7 +837,7 @@ impl AppView {
                     notify_desktop(&format!("{} asks to run {}", a.agent, a.tool), &body);
                 }
             }
-            HubEvent::ApprovalResolved(id) => self.approval_gone(*id, cx),
+            HubEvent::ApprovalResolved(id) => self.approvals.update(cx, |s, cx| s.resolved(*id, cx)),
             HubEvent::ServerStatus(status) => {
                 let status = status.clone();
                 self.agents.update(cx, |v, cx| {
@@ -846,7 +847,7 @@ impl AppView {
             }
             HubEvent::Audit(_) | HubEvent::AgentSeen | HubEvent::Forwards => {}
         }
-        self.show_waiting(window);
+        self.show_waiting(window, cx);
         // The agents screen shows live activity and connection state.
         self.agents.update(cx, |_, cx| cx.notify());
         cx.notify();
@@ -854,8 +855,8 @@ impl AppView {
 
     /// The window title says how many requests wait, so a window behind others or in a
     /// task switcher shows it. Set only when the count changes.
-    fn show_waiting(&mut self, window: &mut Window) {
-        let waiting = self.approvals.waiting_count();
+    fn show_waiting(&mut self, window: &mut Window, cx: &App) {
+        let waiting = self.approvals.read(cx).waiting_count();
         if self.title_waiting != Some(waiting) {
             self.title_waiting = Some(waiting);
             window.set_window_title(&window_title(waiting));
@@ -872,12 +873,12 @@ impl AppView {
             loop {
                 cx.background_executor().timer(std::time::Duration::from_secs(1)).await;
                 let waiting = this.update(cx, |this, cx| {
-                    if this.approvals.waiting_count() == 0 {
+                    if this.approvals.read(cx).waiting_count() == 0 {
                         this.countdown = None;
                         return false;
                     }
                     if !this.window_hidden {
-                        cx.notify();
+                        this.approvals.update(cx, |_, cx| cx.notify());
                     }
                     true
                 });
@@ -886,34 +887,6 @@ impl AppView {
                 }
             }
         }));
-    }
-
-    /// Request `id` no longer waits: its banner stays in place, inert, for a moment, then
-    /// goes (see `banners`), so a click aimed at it doesn't land on the page moving up.
-    fn approval_gone(&mut self, id: u64, cx: &mut Context<Self>) {
-        self.approvals.resolve(id, std::time::Instant::now());
-        cx.spawn(async move |this, cx| {
-            cx.background_executor().timer(banners::LINGER + std::time::Duration::from_millis(20)).await;
-            let _ = this.update(cx, |this, cx| {
-                if this.approvals.drop_gone(id, std::time::Instant::now()) {
-                    this.redraw_when_armed(cx);
-                    cx.notify();
-                }
-            });
-        })
-        .detach();
-    }
-
-    /// Draw the banners again when one that just showed or moved takes clicks, so its
-    /// buttons turn on.
-    fn redraw_when_armed(&mut self, cx: &mut Context<Self>) {
-        let now = std::time::Instant::now();
-        let Some(at) = self.approvals.next_armed(now) else { return };
-        cx.spawn(async move |this, cx| {
-            cx.background_executor().timer(at - now).await;
-            let _ = this.update(cx, |_, cx| cx.notify());
-        })
-        .detach();
     }
 
     fn route(&self) -> &Route {
