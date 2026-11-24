@@ -267,9 +267,13 @@ impl AppView {
 
     pub(super) fn apply_route(&mut self, cx: &mut Context<Self>) {
         self.mark_visible(cx);
-        // Protection may have changed in Settings since the page was last shown.
+        // Protection may have changed in Settings since the page was last shown, and
+        // Claude Code's entry outside the app.
         if self.route().is_agents() {
-            self.agents.update(cx, |a, _| a.refresh_contexts());
+            self.agents.update(cx, |a, cx| {
+                a.refresh_contexts();
+                a.check_claude(false, cx);
+            });
         }
         if let Route::Resources(Some(kind)) = self.route().clone()
             && self.kind.as_ref().map(Kind::key) != Some(kind.key())
