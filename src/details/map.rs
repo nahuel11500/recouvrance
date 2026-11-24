@@ -27,6 +27,10 @@ pub(super) struct MapState {
     /// `sections` are being worked out again.
     computing: bool,
     compute: crate::latest::Latest,
+    /// The page has read what it links to once: what the Map takes from it can be worked out.
+    page_read: bool,
+    /// Works out what the Map takes from the page (`map::Known`) off the UI thread.
+    known: crate::latest::Latest,
 }
 
 impl MapState {
@@ -43,9 +47,43 @@ impl DetailPanel {
         let work = map::load(self.client.clone(), self.obj.kind.clone(), obj, self.kinds.clone());
         self.map.opened = true;
         self.map.loading = true;
+        self.refresh_map_known(cx);
         self.map.load.spawn(cx, work, |this, lists, cx| {
             this.map.lists = Some(Arc::new(lists));
             this.map.loading = false;
+            this.recompute_map(cx);
+            cx.notify();
+        });
+    }
+
+    /// The page read what it links to (Services, Jobs, what uses a Secret…): what the Map takes
+    /// from it is worked out again.
+    pub(super) fn map_page_read(&mut self, cx: &mut Context<Self>) {
+        self.map.page_read = true;
+        self.refresh_map_known(cx);
+    }
+
+    /// Work out again, off the UI thread, what the Map takes from the page (its pods, from their
+    /// watch, and what it links to, from its reads), once the tab was opened and the page has
+    /// read what it links to; then the relations.
+    pub(super) fn refresh_map_known(&mut self, cx: &mut Context<Self>) {
+        if !self.map.opened || !self.map.page_read {
+            return;
+        }
+        let r = &self.related;
+        let snapshot = crate::overview::Related {
+            pods: r.pods.clone(),
+            services: r.services.clone(),
+            extra: r.extra.clone(),
+            referenced_by: r.referenced_by.clone(),
+            netpols: r.netpols.clone(),
+            errors: r.errors.clone(),
+            ..Default::default()
+        };
+        let kind = self.obj.kind.clone();
+        let work = cx.background_executor().spawn(async move { map::Known::of(&kind, &snapshot) });
+        self.map.known.spawn(cx, work, |this, known, cx| {
+            this.related.map = Some(Arc::new(known));
             this.recompute_map(cx);
             cx.notify();
         });

@@ -1,5 +1,8 @@
 //! Detail page for one object: overview, containers, revisions, logs, YAML, history, events, files, shell.
 
+use std::sync::Arc;
+
+use futures::StreamExt as _;
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::input::EditorState;
 use gpui_kit::component::notification::Notification;
@@ -32,14 +35,14 @@ mod related;
 mod tabs;
 
 pub(crate) use actions::*;
-pub(crate) use argo::{ArgoAction, OpenOn, OpenOnContext, confirm_argo_action};
+pub(crate) use argo::{ArgoAction, OpenOn, OpenOnContext, confirm_api_action, confirm_argo_action};
 use browser::FileBrowser;
 pub(crate) use compare::diff_block;
 pub(crate) use guard::*;
 use history::HistoryState;
 pub(crate) use logs::*;
 pub(crate) use logs_page::{LogTarget, LogsPage};
-use related::{container_history_for, container_names, fetch_related, gpu_history_for, history_for};
+use related::{PodsOf, container_history_for, container_names, fetch_related, gpu_history_for, history_for, pods_of};
 use tabs::error_box;
 pub(crate) use tabs::{heading_name, heading_path};
 
@@ -212,18 +215,163 @@ pub struct DetailPanel {
     pub(crate) kinds: Vec<k8s::Kind>,
     compare: CompareState,
     history: HistoryState,
-    /// The related polling and RBAC check run (started on the first read that worked).
+    /// The page's pods, followed by a watch (`follow_pods`).
+    pods_watch: PodsFollow,
+    /// Works out the pods table's rows off the UI thread: the latest wins.
+    pods_index: crate::latest::Latest,
+    /// The related reads and the RBAC check run (started on the first read that worked).
     loops_started: bool,
-    /// The live refresh runs (started once; it also retries a first read that failed).
+    /// The object's watch runs (started once; it also retries a first read that failed).
     live_started: bool,
     /// A row-menu action waiting for the object's first load (its dialog reads it).
     pending_action: Option<String>,
-    /// The object is gone from the cluster (a read answered 404): polling stopped.
+    /// The object is gone from the cluster (its watch saw it deleted, or a read answered 404).
     deleted: bool,
     _tasks: Vec<Task<()>>,
     /// The node shell's end and the data editor's save: replaced when another opens.
     _shell_sub: Option<Subscription>,
     _data_editor_sub: Option<Subscription>,
+}
+
+/// The page's pods as their watch follows them (`follow_pods`).
+#[derive(Default)]
+struct PodsFollow {
+    /// What picks them: None before the object is read, `Some(None)` for a page without pods.
+    of: Option<Option<PodsOf>>,
+    /// Their first list came (or failed): the related reads, which read their usage, may start.
+    known: bool,
+    /// Counts the sets of pods shown: the related reads read what the page links to again when
+    /// it moves.
+    seen: u64,
+    /// The watch and what shows its pods; dropping it stops both.
+    _watch: Option<Task<()>>,
+}
+
+/// The longest the related reads wait for the pods' first list, whose usage they read.
+const PODS_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// What the page links to (Services, revisions, events…) is read again after this many turns
+/// of the related reads (`metrics_refresh` each) when nothing changed.
+const LINKS_EVERY: u32 = 4;
+
+/// How often a page's watches look where it is (shown, its window hidden, in history).
+const PLACE_EVERY: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Where a page is, for the watches that follow what it shows.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Place {
+    /// On screen.
+    Shown,
+    /// Its window's page, the window hidden: the watches go on, holding back what they send.
+    Hidden,
+    /// In the back/forward history: the watches stop, and start again when it is shown.
+    Away,
+}
+
+/// Where the page is now; None once it is gone.
+fn place<T: 'static, C: AppContext>(this: &WeakEntity<T>, cx: &mut C) -> Option<Place> {
+    this.update(cx, |_, cx| {
+        let page = cx.entity_id();
+        if crate::app::is_visible(page, cx) {
+            Place::Shown
+        } else if crate::app::is_current(page, cx) {
+            Place::Hidden
+        } else {
+            Place::Away
+        }
+    })
+    .ok()
+}
+
+/// What a page's watch has next for it.
+enum Next<M> {
+    Msg(M),
+    /// The watch ended: it was refused.
+    Ended,
+    /// The page went into the back/forward history: its watch stops.
+    Away,
+    /// The page is gone.
+    Gone,
+}
+
+/// The next message of a page's watch, while the page is its window's page: the watch is
+/// paused while that window is hidden. Where the page is, is looked at every `PLACE_EVERY` and
+/// before each message.
+async fn next_while_current<T: 'static, C: AppContext, M>(
+    this: &WeakEntity<T>,
+    cx: &mut C,
+    exec: &BackgroundExecutor,
+    rx: &mut futures::channel::mpsc::UnboundedReceiver<M>,
+    pause: &k8s::Pause,
+) -> Next<M> {
+    loop {
+        match place(this, cx) {
+            None => return Next::Gone,
+            Some(Place::Away) => return Next::Away,
+            Some(place) => pause.set(place == Place::Hidden),
+        }
+        match futures::future::select(rx.next(), exec.timer(PLACE_EVERY)).await {
+            futures::future::Either::Left((Some(msg), _)) => return Next::Msg(msg),
+            futures::future::Either::Left((None, _)) => return Next::Ended,
+            futures::future::Either::Right(_) => {}
+        }
+    }
+}
+
+/// Read the object every `detail_refresh` while the page is shown, as before it was watched:
+/// where it can't be. Stops once it is deleted, or the page is gone.
+async fn poll_object<C: AppContext>(
+    this: &WeakEntity<DetailPanel>,
+    cx: &mut C,
+    exec: &BackgroundExecutor,
+    client: Client,
+    obj: ObjectRef,
+) {
+    loop {
+        exec.timer(crate::settings::secs(crate::settings::get().detail_refresh)).await;
+        match crate::app::wait_visible_or_away(this, cx, exec, DetailPanel::put_away).await {
+            None => return,
+            Some(true) => {
+                let _ = this.update(cx, DetailPanel::resume_logs_if_shown);
+            }
+            Some(false) => {}
+        }
+        let started = std::time::Instant::now();
+        let shown = match k8s::get_object_opts(client.clone(), obj.clone(), true).await {
+            Ok(value) => this.update_in(cx, |this, window, cx| this.object_seen(value, started, window, cx)),
+            // Deleted: say so and stop asking.
+            Err(e) if k8s::is_not_found(&e) => {
+                let _ = this.update(cx, DetailPanel::object_gone);
+                return;
+            }
+            Err(_) => Ok(()),
+        };
+        if shown.is_err() {
+            return;
+        }
+    }
+}
+
+/// What the objects a page links to were last read for: the object's version and its pods'
+/// (`PodsFollow::seen`), and when.
+struct LinksRead {
+    version: String,
+    pods: u64,
+    at: std::time::Instant,
+}
+
+/// The object's version, by which the related reads see it changed.
+fn version_of(obj: &serde_json::Value) -> String {
+    obj.pointer("/metadata/resourceVersion").and_then(|v| v.as_str()).unwrap_or_default().to_string()
+}
+
+/// Whether to read what a page links to again: never read, the object or its pods changed
+/// since, or the last read is `every` old. What changes alone (a new Service, an edited
+/// ConfigMap) shows in that long at most.
+fn links_due(last: Option<&LinksRead>, now: &LinksRead, every: std::time::Duration) -> bool {
+    last.is_none_or(|last| {
+        last.version != now.version || last.pods != now.pods || now.at.duration_since(last.at) >= every
+    })
 }
 
 #[derive(Default)]
@@ -246,6 +394,12 @@ impl DetailPanel {
     /// The object shown, with its context.
     pub fn subject(&self) -> (String, ObjectRef) {
         (self.context.clone(), self.obj.clone())
+    }
+
+    /// The object shown as a favorite (an Argo CD Application by its instance).
+    pub fn favorite(&self) -> crate::favorites::Favorite {
+        let o = &self.obj;
+        crate::favorites::Favorite::for_object(&self.context, &o.kind, o.namespace.clone(), o.name.clone())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -321,6 +475,8 @@ impl DetailPanel {
             kinds: Vec::new(),
             compare: CompareState::default(),
             history: HistoryState::default(),
+            pods_watch: PodsFollow::default(),
+            pods_index: Default::default(),
             loops_started: false,
             live_started: false,
             pending_action: None,
@@ -553,8 +709,8 @@ impl DetailPanel {
         }
     }
 
-    /// Read the object once; the first success also starts the page's polling loops, a
-    /// failure the live refresh (which retries).
+    /// Read the object once; the first success also starts the page's watches and reads, a
+    /// failure the object's watch (which retries).
     fn load_object(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.refresh_object(false, window, cx);
     }
@@ -576,6 +732,8 @@ impl DetailPanel {
                         this.refresh_yaml(window, cx);
                     }
                     this.start_loops(window, cx);
+                    // A selector saved from the YAML picks other pods at once.
+                    this.follow_pods(window, cx);
                     this.check_tab_if_waiting(cx);
                     if let Some(action) = this.pending_action.take() {
                         this.quick_action(&action, window, cx);
@@ -584,10 +742,10 @@ impl DetailPanel {
                 Err(e) => {
                     if k8s::is_not_found(&e) {
                         this.deleted = true;
-                    } else {
-                        // A timeout or a 5xx: keep trying, the page starts when a read works.
-                        this.start_live(window, cx);
                     }
+                    // Gone, a timeout or a 5xx: the object's watch follows its name (and tries
+                    // again), and the page starts once it reads one, one created again included.
+                    this.start_live(window, cx);
                     if let Some(action) = this.pending_action.take() {
                         window.push_notification(
                             Notification::error(format!(
@@ -615,10 +773,12 @@ impl DetailPanel {
         self._tasks.push(task);
     }
 
-    /// Once the object has been read: the related polling, the RBAC check and the live refresh.
+    /// Once the object has been read: its pods' watch, the related reads, the RBAC check, and
+    /// the watch that follows the object.
     fn start_loops(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.loops_started {
             self.loops_started = true;
+            self.follow_pods(window, cx);
             self.load_related(window, cx);
             self.check_access(cx);
             self.start_argo(cx);
@@ -626,81 +786,262 @@ impl DetailPanel {
         self.start_live(window, cx);
     }
 
-    /// Re-read the object every 5s so status, conditions and YAML stay current (once).
+    /// Follow the object with a watch on it alone (once): status, conditions and YAML change
+    /// about a second after the cluster does, and nothing is asked while nothing changes. The
+    /// watch runs while the page is its window's page, holding back what it sends while that
+    /// window is hidden; it stops when the page goes into history, and starts again (with a
+    /// list) when it is shown. Where the object can't be watched (a role that only grants
+    /// `get`), it is read every `detail_refresh` instead.
     fn start_live(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.live_started {
             return;
         }
         self.live_started = true;
         let (client, obj) = (self.client.clone(), self.obj.clone());
+        let poll = crate::settings::secs(crate::settings::get().detail_refresh);
+        let follow = k8s::Follow::object(obj.kind.ar.clone(), obj.namespace.clone(), &obj.name, poll);
         let task = cx.spawn_in(window, async move |this, cx| {
+            let exec = cx.background_executor().clone();
             loop {
-                cx.background_executor().timer(crate::settings::secs(crate::settings::get().detail_refresh)).await;
-                // Off screen (in history, or its window hidden): wait to be shown again. On each
-                // turn it spends in history, log streams stop too; a hidden window keeps them,
-                // like its shells, until Back puts the page in history.
-                let exec = cx.background_executor().clone();
-                let waited = crate::app::wait_visible_or_away(&this, cx, &exec, |this, cx| {
-                    if let Some(l) = &this.logs {
-                        l.update(cx, |l, _| l.pause());
-                    }
-                    // A node shell pod nobody is connected to is not left running.
-                    if this.node_shell.is_some() && !this.terminal.as_ref().is_some_and(|t| t.read(cx).connected()) {
-                        this.end_node_shell(cx);
-                    }
-                })
-                .await;
-                match waited {
-                    None => break,
+                // In history: no watch, and on each turn there, no log streams. A hidden window
+                // keeps them, like its shells, until Back puts the page in history.
+                match crate::app::wait_visible_or_away(&this, cx, &exec, Self::put_away).await {
+                    None => return,
                     Some(true) => {
-                        let _ = this.update(cx, |this, cx| {
-                            if this.tab == DetailTab::Logs
-                                && let Some(l) = &this.logs
-                            {
-                                l.update(cx, LogsView::resume);
-                            }
-                        });
+                        let _ = this.update(cx, Self::resume_logs_if_shown);
                     }
                     Some(false) => {}
                 }
-                let started = std::time::Instant::now();
-                let value = match k8s::get_object_opts(client.clone(), obj.clone(), true).await {
-                    Ok(v) => v,
-                    // Deleted: say so and stop asking.
-                    Err(e) if k8s::is_not_found(&e) => {
-                        let _ = this.update(cx, |this, cx| {
-                            this.deleted = true;
-                            cx.notify();
-                        });
-                        break;
-                    }
-                    Err(_) => continue,
-                };
-                let alive = this.update_in(cx, |this, window, cx| {
-                    this.deleted = false;
-                    let changed = this.object.as_ref() != Some(&value);
-                    if !changed || !this.set_object(value, started, cx) {
+                let pause = k8s::Pause::default();
+                let (watch, mut rx) = k8s::follow(client.clone(), follow.clone(), pause.clone());
+                let refused = loop {
+                    let read = match next_while_current(&this, cx, &exec, &mut rx, &pause).await {
+                        Next::Msg(k8s::Followed::Objects(objects)) => {
+                            this.update_in(cx, |this, window, cx| match objects.first() {
+                                Some(value) => this.object_seen(value.clone(), std::time::Instant::now(), window, cx),
+                                None => this.object_gone(cx),
+                            })
+                        }
+                        // Tried again: the last state stays shown meanwhile.
+                        Next::Msg(k8s::Followed::Error(_)) => Ok(()),
+                        Next::Msg(k8s::Followed::Refused(_)) | Next::Ended => break true,
+                        Next::Away => break false,
+                        Next::Gone => return,
+                    };
+                    if read.is_err() {
                         return;
                     }
-                    this.pod_containers_read(window, cx);
-                    // Don't overwrite what the user is editing.
-                    if this.yaml.read(cx).value().as_ref() == this.yaml_text {
-                        this.refresh_yaml(window, cx);
-                    }
-                    // The first read failed: this one starts the page.
-                    this.start_loops(window, cx);
-                    this.check_tab_if_waiting(cx);
-                    cx.notify();
-                });
-                if alive.is_err() {
-                    break;
+                };
+                drop(watch);
+                if refused {
+                    poll_object(&this, cx, &exec, client.clone(), obj.clone()).await;
+                    return;
                 }
             }
         });
         self.keep_task(task);
     }
 
-    /// Fetch what the overview links to, then refresh usage every 15s.
+    /// A read of the object, from its watch (or its timer): shown unless older than the one
+    /// shown. The first that works starts the page.
+    fn object_seen(
+        &mut self,
+        value: serde_json::Value,
+        started: std::time::Instant,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let was_deleted = std::mem::replace(&mut self.deleted, false);
+        let changed = self.object.as_ref() != Some(&value);
+        if !changed || !self.set_object(value, started, cx) {
+            if was_deleted {
+                cx.notify();
+            }
+            return;
+        }
+        self.pod_containers_read(window, cx);
+        // Don't overwrite what the user is editing.
+        if self.yaml.read(cx).value().as_ref() == self.yaml_text {
+            self.refresh_yaml(window, cx);
+        }
+        // The first read failed: this one starts the page.
+        self.start_loops(window, cx);
+        self.check_tab_if_waiting(cx);
+        // A Service's or a PDB's selector can change, and its pods with it.
+        self.follow_pods(window, cx);
+        cx.notify();
+    }
+
+    /// The object is gone from the cluster: its watch saw it deleted, or none has its name. The
+    /// watch goes on: one created again under its name is shown.
+    fn object_gone(&mut self, cx: &mut Context<Self>) {
+        if !std::mem::replace(&mut self.deleted, true) {
+            cx.notify();
+        }
+    }
+
+    /// On each turn the page spends in the back/forward history: its log streams stop, and a
+    /// node shell pod nobody is connected to is not left running.
+    fn put_away(&mut self, cx: &mut Context<Self>) {
+        if let Some(l) = &self.logs {
+            l.update(cx, |l, _| l.pause());
+        }
+        if self.node_shell.is_some() && !self.terminal.as_ref().is_some_and(|t| t.read(cx).connected()) {
+            self.end_node_shell(cx);
+        }
+    }
+
+    /// Follow the page's pods with a watch on what picks them (`related::pods_of`), started
+    /// again when that changes (a Service's selector edited): they come and go on the page about
+    /// a second after the cluster, instead of being listed again at each turn. Like the
+    /// object's, the watch stops while the page is in history, and starts again when it is shown.
+    fn follow_pods(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(obj) = &self.object else { return };
+        let of = pods_of(&self.obj.kind, self.obj.namespace.as_deref(), obj);
+        if self.pods_watch.of.as_ref() == Some(&of) {
+            return;
+        }
+        let first = self.pods_watch.of.is_none();
+        self.pods_watch.of = Some(of.clone());
+        // The pods of what picked them before stop coming.
+        self.pods_watch._watch = None;
+        let Some(of) = of else {
+            // Nothing picks pods (a selector emptied): none to show.
+            self.pods_watch.known = true;
+            if !first {
+                self.related.errors.remove("pods");
+                self.set_pods(Arc::default(), window, cx);
+            }
+            return;
+        };
+        self.pods_watch.known = false;
+        let (client, follow) = (self.client.clone(), of.follow());
+        let task = cx.spawn_in(window, async move |this, cx| {
+            let exec = cx.background_executor().clone();
+            loop {
+                if !crate::app::wait_visible(&this, cx, &exec).await {
+                    return;
+                }
+                let pause = k8s::Pause::default();
+                let (_watch, mut rx) = k8s::follow(client.clone(), follow.clone(), pause.clone());
+                loop {
+                    let msg = match next_while_current(&this, cx, &exec, &mut rx, &pause).await {
+                        Next::Msg(msg) => msg,
+                        // Refused (said on the page), or the page is gone: nothing more to follow.
+                        Next::Ended | Next::Gone => return,
+                        Next::Away => break,
+                    };
+                    if this.update_in(cx, |this, window, cx| this.pods_followed(msg, window, cx)).is_err() {
+                        return;
+                    }
+                }
+            }
+        });
+        self.pods_watch._watch = Some(task);
+    }
+
+    /// What the pods' watch says: the pods now, or why they could not be read, said next to
+    /// their heading (the last pods stay meanwhile).
+    fn pods_followed(&mut self, msg: k8s::Followed, window: &mut Window, cx: &mut Context<Self>) {
+        match msg {
+            k8s::Followed::Objects(pods) => {
+                self.related.errors.remove("pods");
+                self.set_pods(pods, window, cx);
+            }
+            k8s::Followed::Error(why) => {
+                self.related.errors.insert("pods", why);
+            }
+            k8s::Followed::Refused(why) => {
+                self.related.errors.insert("pods", why);
+                self.set_pods(Arc::default(), window, cx);
+            }
+        }
+        self.pods_watch.known = true;
+        cx.notify();
+    }
+
+    /// Show these pods: workload logs follow them, and their rows are worked out again.
+    fn set_pods(&mut self, pods: Arc<Vec<serde_json::Value>>, window: &mut Window, cx: &mut Context<Self>) {
+        self.pods_watch.seen += 1;
+        let old = std::mem::replace(&mut self.related.pods, pods);
+        // A thousand pods take a while to free: not on the UI thread.
+        cx.background_executor().spawn(async move { drop(old) }).detach();
+        self.follow_logs(window, cx);
+        self.reindex_pods(cx);
+        // The Map lists the pods its page holds.
+        self.refresh_map_known(cx);
+    }
+
+    /// Workload logs follow its pods (up to a limit), as they come and go; a pod page has its own.
+    fn follow_logs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.obj.kind.is("", "Pod") || self.obj.namespace.is_none() {
+            return;
+        }
+        let followed = followed_pods(&self.related.pods);
+        let left_out = self.related.pods.len() - followed.len();
+        let names: Vec<(String, Vec<String>)> = followed
+            .into_iter()
+            .filter_map(|p| {
+                let name = p.pointer("/metadata/name").and_then(|v| v.as_str())?;
+                Some((name.to_string(), k8s::pod_containers(p)))
+            })
+            .collect();
+        if names.is_empty() {
+            return;
+        }
+        match &self.logs {
+            None => {
+                let (client, ns) = (self.client.clone(), self.obj.namespace.clone().unwrap_or_default());
+                self.logs = Some(cx.new(|cx| {
+                    let mut logs = LogsView::new(client, ns, names, window, cx);
+                    logs.left_out = left_out;
+                    logs
+                }));
+                self.resume_logs_if_shown(cx);
+            }
+            Some(logs) => logs.update(cx, |l, cx| {
+                l.left_out = left_out;
+                l.set_pods(names, window, cx);
+                cx.notify();
+            }),
+        }
+    }
+
+    /// Work out the pods table's rows and a node's requests and limits again, off the UI
+    /// thread, from the pods and their usage now: the latest wins.
+    fn reindex_pods(&mut self, cx: &mut Context<Self>) {
+        if self.related.pods.is_empty() {
+            // Nothing to work out (a page without a pods table, or none left), and no copy of
+            // the usage to make: a pod's page reads its whole namespace's.
+            self.pods_index.cancel();
+            self.related.allocated.clear();
+            if !self.related.pod_rows.is_empty() {
+                let old = std::mem::take(&mut self.related.pod_rows);
+                cx.background_executor().spawn(async move { drop(old) }).detach();
+            }
+            return;
+        }
+        let (pods, usage, stats) =
+            (self.related.pods.clone(), self.related.usage.clone(), self.related.node_stats.clone());
+        let allocatable =
+            self.object.as_ref().and_then(|o| o.pointer("/status/allocatable")).and_then(|a| a.as_object()).cloned();
+        let work = cx
+            .background_executor()
+            .spawn(async move { crate::overview::pods_index(&pods, &usage, stats.as_deref(), allocatable.as_ref()) });
+        self.pods_index.spawn(cx, work, |this, (rows, allocated), cx| {
+            let old = std::mem::replace(&mut this.related.pod_rows, rows);
+            cx.background_executor().spawn(async move { drop(old) }).detach();
+            crate::overview::sort_pod_rows(&mut this.related.pod_rows, this.pod_order);
+            this.related.allocated = allocated;
+            cx.notify();
+        });
+    }
+
+    /// Read what the overview shows next to the object, then again every `metrics_refresh`
+    /// while the page is shown: the usage (metrics-server, the kubelet) and the charts and
+    /// alerts (Prometheus) each time, and what it links to (Services, revisions, events…) when
+    /// the object or its pods changed since, or every `LINKS_EVERY` turns. Its pods come from
+    /// their watch (`follow_pods`).
     fn load_related(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.object.is_none() {
             return;
@@ -711,90 +1052,67 @@ impl DetailPanel {
         let context = self.context.clone();
         let wants_history =
             kind.is("", "Pod") || kind.ar.group == "apps" || kind.is("batch", "Job") || kind.is("", "Node");
-        // Workload logs follow its pods (one namespace); a pod page has its own.
-        let pods_logs = !kind.is("", "Pod") && ns.is_some();
         let task = cx.spawn_in(window, async move |this, cx| {
             // How often metrics-server measures, learnt over the reads, for the usage's age.
             let mut cadence = k8s::Cadence::default();
+            // What the objects the page links to were last read for.
+            let mut links: Option<LinksRead> = None;
             loop {
                 let exec = cx.background_executor().clone();
                 if !crate::app::wait_visible(&this, cx, &exec).await {
                     break;
                 }
-                // The object as the live refresh last saw it (status, node, crashes move on).
-                // Nothing more to follow once the object is deleted.
-                let Ok(Some(obj)) = this.update(cx, |this, _| this.object.clone().filter(|_| !this.deleted)) else {
+                // The usage is read for the pods the page lists: wait for their first list (a
+                // little).
+                let waiting = std::time::Instant::now();
+                while this.update(cx, |this, _| !this.pods_watch.known).unwrap_or(false)
+                    && waiting.elapsed() < PODS_WAIT
+                {
+                    exec.timer(std::time::Duration::from_millis(100)).await;
+                }
+                let every = crate::settings::secs(crate::settings::get().metrics_refresh);
+                // The object as its watch last saw it, and the pods as theirs did. Nothing to
+                // read while it is deleted: it may come back under its name.
+                let Ok((obj, pods, seen, clusters)) = this.update(cx, |this, _| {
+                    let obj = this.object.clone().filter(|_| !this.deleted);
+                    (obj, this.related.pods.clone(), this.pods_watch.seen, this.clusters.clone())
+                }) else {
                     break;
                 };
-                // Where an Application deploys is shown on a connected context first, and its
-                // resources are read there.
-                let clusters = this.update(cx, |this, _| this.clusters.clone()).unwrap_or_default();
-                let mut related = fetch_related(client.clone(), &context, &kind, ns.clone(), &obj, clusters).await;
+                let Some(obj) = obj else {
+                    exec.timer(every).await;
+                    continue;
+                };
+                let read = LinksRead { version: version_of(&obj), pods: seen, at: std::time::Instant::now() };
+                let again = links_due(links.as_ref(), &read, every * LINKS_EVERY);
+                let mut related =
+                    fetch_related(client.clone(), &context, &kind, ns.clone(), &obj, clusters, &pods, again).await;
+                if again {
+                    links = Some(read);
+                }
                 // A kubelet too slow this time keeps what it said last.
                 if related.node_stats.is_none() {
                     related.node_stats = this.update(cx, |this, _| this.related.node_stats.clone()).ok().flatten();
                 }
-                let indexed = obj.clone();
-                let mapped = kind.clone();
-                let mut related = exec
-                    .spawn(async move {
-                        let mut related = related;
-                        related.index(&indexed);
-                        related.map = Some(std::sync::Arc::new(crate::map::Known::of(&mapped, &related)));
-                        related
-                    })
-                    .await;
                 if let Some(read) = related.usage_read {
                     // The page reads more than usage: it keeps its own pace, and only learns
                     // how often metrics-server measures.
-                    cadence.next(&read, crate::settings::secs(crate::settings::get().metrics_refresh));
+                    cadence.next(&read, every);
                     related.usage_fresh = k8s::Freshness::new(&read, cadence.every());
                 }
                 // Prometheus can be slow: show the rest first, keeping the previous charts.
-                let pods_for_history = if wants_history { related.pods.clone() } else { Vec::new() };
-                let focus = crate::alerts::focus(&kind, &obj, &related.pods);
-                related.alerts =
-                    this.update(cx, |this, _| std::mem::take(&mut this.related.alerts)).unwrap_or_default();
-                related.alerts_note = this.update(cx, |this, _| this.related.alerts_note.take()).ok().flatten();
-                related.history = this.update(cx, |this, _| this.related.history.take()).ok().flatten();
-                related.gpu = this.update(cx, |this, _| this.related.gpu.take()).ok().flatten();
-                related.container_history =
-                    this.update(cx, |this, _| std::mem::take(&mut this.related.container_history)).unwrap_or_default();
-                let ok = this.update_in(cx, |this, window, cx| {
-                    // Workload logs follow its pods (up to a limit), as they come and go.
-                    let followed = followed_pods(&related.pods);
-                    let left_out = related.pods.len() - followed.len();
-                    let names: Vec<(String, Vec<String>)> = followed
-                        .into_iter()
-                        .filter_map(|p| {
-                            let name = p.pointer("/metadata/name").and_then(|v| v.as_str())?;
-                            Some((name.to_string(), k8s::pod_containers(p)))
-                        })
-                        .collect();
-                    if pods_logs && !names.is_empty() {
-                        match &this.logs {
-                            None => {
-                                let (client, ns) =
-                                    (this.client.clone(), this.obj.namespace.clone().unwrap_or_default());
-                                this.logs = Some(cx.new(|cx| {
-                                    let mut logs = LogsView::new(client, ns, names, window, cx);
-                                    logs.left_out = left_out;
-                                    logs
-                                }));
-                                this.resume_logs_if_shown(cx);
-                            }
-                            Some(logs) => logs.update(cx, |l, cx| {
-                                l.left_out = left_out;
-                                l.set_pods(names, window, cx);
-                                cx.notify();
-                            }),
-                        }
-                    }
-                    crate::overview::sort_pod_rows(&mut related.pod_rows, this.pod_order);
-                    // A thousand pods take a while to free: not on the UI thread.
-                    let old = std::mem::replace(&mut this.related, related);
+                let pods_for_history = if wants_history { pods.clone() } else { Arc::default() };
+                let focus = crate::alerts::focus(&kind, &obj, &pods);
+                let ok = this.update(cx, |this, cx| {
+                    let old = this.related.take_reads(related, again);
+                    // What it replaced can be big (every Role of the cluster): not freed on the UI thread.
                     cx.background_executor().spawn(async move { drop(old) }).detach();
-                    this.recompute_map(cx);
+                    // The pods' rows, with their new usage.
+                    this.reindex_pods(cx);
+                    if again {
+                        // What the Map draws from the page changed with what it links to.
+                        this.map_page_read(cx);
+                    }
                     #[cfg(feature = "dev")]
                     if std::env::var("RECOUVRANCE_COMPARE").is_ok() && this.compare_rev.is_none() {
                         let mut revs: Vec<(i64, String)> = this
@@ -1084,8 +1402,30 @@ impl Drop for DetailPanel {
 
 #[cfg(test)]
 mod tests {
-    use super::{DetailTab, new_uid, own_pod_logs, stale_read, tab_named};
+    use super::{DetailTab, LinksRead, links_due, new_uid, own_pod_logs, stale_read, tab_named, version_of};
     use serde_json::json;
+
+    /// What a page links to is read again when the object or its pods changed, and otherwise
+    /// once in a while (a new Service changes neither): never at every turn for nothing.
+    #[test]
+    fn links_are_read_again_when_something_changed_or_after_a_while() {
+        let start = std::time::Instant::now();
+        let read = |version: &str, pods: u64, secs: u64| LinksRead {
+            version: version.to_string(),
+            pods,
+            at: start + std::time::Duration::from_secs(secs),
+        };
+        let every = std::time::Duration::from_secs(60);
+        assert!(links_due(None, &read("5", 0, 0), every));
+        let last = read("5", 1, 0);
+        assert!(!links_due(Some(&last), &read("5", 1, 15), every));
+        assert!(!links_due(Some(&last), &read("5", 1, 59), every));
+        // The object changed, its pods did, or a minute went by.
+        assert!(links_due(Some(&last), &read("6", 1, 15), every));
+        assert!(links_due(Some(&last), &read("5", 2, 15), every));
+        assert!(links_due(Some(&last), &read("5", 1, 60), every));
+        assert_eq!(version_of(&json!({"metadata": {"resourceVersion": "42"}})), "42");
+    }
 
     #[test]
     fn a_debug_shell_has_its_own_tab() {

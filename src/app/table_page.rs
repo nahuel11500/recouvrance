@@ -572,7 +572,7 @@ impl AppView {
         let Some(kind) = self.kind.clone() else { return };
         use std::io::Write as _;
         let csv = self.table.read(cx).delegate().to_csv();
-        let stamp = jiff::Zoned::now().strftime("%Y%m%d-%H%M%S").to_string();
+        let stamp = jiff::ZonedDateTime::now().strftime("%Y%m%d-%H%M%S").to_string();
         let name = format!("{}-{stamp}.csv", kind.ar.plural);
         // Private and never over an earlier export.
         let r = crate::private_files::create_new_in(&crate::paths::downloads_dir(), &name)

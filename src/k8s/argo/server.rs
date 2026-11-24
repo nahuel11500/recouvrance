@@ -12,10 +12,8 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use anyhow::{Context as _, Result, anyhow, bail};
+use anyhow::{Result, anyhow};
 use base64::Engine as _;
-use bytes::Bytes;
-use http_body_util::{BodyExt as _, Full};
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -25,8 +23,8 @@ use crate::history::DiffLine;
 /// Where the tokens set in Settings are kept, by context (mode 0600).
 const TOKENS_FILE: &str = "argocd-tokens.json";
 /// The largest answer read: an Application with thousands of resources sends three states each.
-const MAX_BYTES: usize = 64 * 1024 * 1024;
-const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+pub(super) const MAX_BYTES: usize = 64 * 1024 * 1024;
+pub(super) const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 /// Resources whose diff is shown, at most; the others are counted.
 const MAX_RESOURCES: usize = 200;
 /// Lines of one resource's diff shown, at most.
@@ -88,7 +86,7 @@ impl Server {
 }
 
 /// The host (lowercase) and port of `host[:port]`, the port of the scheme when none is said.
-fn host_port(authority: &str, https: bool) -> Option<(String, u16)> {
+pub(super) fn host_port(authority: &str, https: bool) -> Option<(String, u16)> {
     let authority: http::uri::Authority = authority.parse().ok()?;
     let host = authority.host().to_ascii_lowercase();
     if host.is_empty() {
@@ -166,7 +164,7 @@ pub fn save_token(context: &str, token: &str) -> std::io::Result<()> {
 
 /// The argocd CLI's config file: `$ARGOCD_CONFIG_DIR/config`, else `~/.argocd/config` when
 /// that folder exists (the CLI's older place), else `$XDG_CONFIG_HOME/argocd/config`.
-fn cli_config_path() -> PathBuf {
+pub(super) fn cli_config_path() -> PathBuf {
     if let Some(dir) = std::env::var_os("ARGOCD_CONFIG_DIR").filter(|d| !d.is_empty()) {
         return PathBuf::from(dir).join("config");
     }
@@ -180,37 +178,44 @@ fn cli_config_path() -> PathBuf {
     config.join("argocd").join("config")
 }
 
+/// The argocd CLI's config file (`argocd login` writes it).
 #[derive(Deserialize, Default)]
 #[serde(default, rename_all = "kebab-case")]
-struct CliConfig {
-    current_context: String,
-    contexts: Vec<CliContext>,
-    servers: Vec<CliServer>,
-    users: Vec<CliUser>,
+pub(super) struct CliConfig {
+    pub current_context: String,
+    pub contexts: Vec<CliContext>,
+    pub servers: Vec<CliServer>,
+    pub users: Vec<CliUser>,
 }
 
 #[derive(Deserialize, Default)]
 #[serde(default)]
-struct CliContext {
-    name: String,
-    server: String,
-    user: String,
+pub(super) struct CliContext {
+    pub name: String,
+    pub server: String,
+    pub user: String,
 }
 
 #[derive(Deserialize, Default)]
 #[serde(default, rename_all = "kebab-case")]
-struct CliServer {
-    server: String,
-    plain_text: bool,
+pub(super) struct CliServer {
+    /// `host[:port]`, without a scheme.
+    pub server: String,
+    /// `--plaintext`: http, no TLS.
+    pub plain_text: bool,
+    /// `--insecure`: the server's certificate is not checked.
+    pub insecure: bool,
+    /// `--grpc-web-root-path`: Argo CD is served under this path.
+    pub grpc_web_root_path: String,
     /// `--core`: the CLI talks to the Kubernetes API, there is no API server to ask.
-    core: bool,
+    pub core: bool,
 }
 
 #[derive(Deserialize, Default)]
 #[serde(default, rename_all = "kebab-case")]
-struct CliUser {
-    name: String,
-    auth_token: String,
+pub(super) struct CliUser {
+    pub name: String,
+    pub auth_token: String,
 }
 
 /// The token the argocd CLI saved for `server` in its config `text`: the current context's
@@ -235,7 +240,7 @@ fn cli_token(text: &str, server: &Server) -> Option<String> {
 
 /// Whether a JWT's `exp` is past at `now` (seconds). A token that isn't a JWT, or has no
 /// `exp`, is left for the server to judge.
-fn expired(token: &str, now: i64) -> bool {
+pub(super) fn expired(token: &str, now: i64) -> bool {
     let Some(payload) = token.split('.').nth(1) else { return false };
     let Ok(bytes) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(payload.trim_end_matches('=')) else {
         return false;
@@ -264,15 +269,43 @@ fn login(context: &str, server: &Server) -> Result<(String, Login), String> {
     }
 }
 
+/// The Argo CD server set for the hub `context`, the token to send it and where that comes
+/// from; or why there is none to ask. Reads files: call it off the UI thread.
+pub(super) fn login_for(context: &str) -> Result<(Server, String, Login), String> {
+    let server = match server_of(context) {
+        Some(Ok(server)) => server,
+        Some(Err(e)) => return Err(e),
+        None => return Err(format!("No Argo CD server is set for {context} in Settings")),
+    };
+    let (token, how) = login(context, &server)?;
+    Ok((server, token, how))
+}
+
+/// GET `path` (of Argo CD's API) on `server` with `token`; errors never hold the token.
+pub(super) async fn get_path(server: &Server, token: &str, path: &str) -> Result<Value, String> {
+    get_path_within(server, token, path, TIMEOUT).await
+}
+
+/// The same, waiting up to `timeout` for the answer.
+pub(super) async fn get_path_within(
+    server: &Server,
+    token: &str,
+    path: &str,
+    timeout: std::time::Duration,
+) -> Result<Value, String> {
+    let url = format!("{}{path}", server.base);
+    super::api::send_within(http::Method::GET, url, token, None, false, server, timeout).await.map_err(|f| f.text)
+}
+
 /// `text` with every copy of `token` replaced: an error never shows it, whatever echoed it.
-fn scrub(text: &str, token: &str) -> String {
+pub(super) fn scrub(text: &str, token: &str) -> String {
     if token.is_empty() { text.to_string() } else { text.replace(token, "[token]") }
 }
 
 // MARK: Request
 
 /// A path segment or query value, percent-encoded but for the characters names use.
-fn encode(s: &str) -> String {
+pub(super) fn encode(s: &str) -> String {
     use std::fmt::Write as _;
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
@@ -291,7 +324,7 @@ fn managed_resources_url(server: &Server, namespace: &str, name: &str) -> String
 }
 
 /// What Argo CD answered when it wasn't a success, said plainly.
-fn refusal(status: http::StatusCode, body: &str, server: &Server) -> String {
+pub(super) fn refusal(status: http::StatusCode, body: &str, server: &Server) -> String {
     let said = serde_json::from_str::<Value>(body)
         .ok()
         .and_then(|v| v.get("message").or_else(|| v.get("error")).and_then(Value::as_str).map(str::to_string))
@@ -311,32 +344,9 @@ fn refusal(status: http::StatusCode, body: &str, server: &Server) -> String {
 }
 
 /// GET `url` with the token, at most `MAX_BYTES`; redirects are not followed, so the token
-/// never goes to another address.
+/// never goes to another address (see `api::send`).
 async fn get(url: String, token: String, server: Server) -> Result<Value> {
-    let fetch = async move {
-        let https =
-            hyper_rustls::HttpsConnectorBuilder::new().with_native_roots()?.https_or_http().enable_http1().build();
-        let client: hyper_util::client::legacy::Client<_, Full<Bytes>> =
-            hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new()).build(https);
-        let req = http::Request::get(&url)
-            .header("user-agent", "recouvrance")
-            .header("accept", "application/json")
-            .header("authorization", format!("Bearer {token}"))
-            .body(Full::new(Bytes::new()))?;
-        let resp = client.request(req).await.with_context(|| format!("can't reach Argo CD at {}", server.name()))?;
-        let (parts, body) = resp.into_parts();
-        let too_big = || anyhow!("Argo CD's answer is larger than {} MB", MAX_BYTES / (1024 * 1024));
-        let bytes = http_body_util::Limited::new(body, MAX_BYTES)
-            .collect()
-            .await
-            .map_err(|e| if e.is::<http_body_util::LengthLimitError>() { too_big() } else { anyhow!(e) })?
-            .to_bytes();
-        if !parts.status.is_success() {
-            bail!("{}", refusal(parts.status, &String::from_utf8_lossy(&bytes), &server));
-        }
-        serde_json::from_slice(&bytes).context("Argo CD's answer isn't JSON: is this its API server's address?")
-    };
-    tokio::time::timeout(TIMEOUT, fetch).await.map_err(|_| anyhow!("Argo CD did not answer within 30 s"))?
+    super::api::send(http::Method::GET, url, &token, None, false, &server).await.map_err(|f| anyhow!(f.text))
 }
 
 // MARK: Diff
@@ -449,7 +459,7 @@ fn mask_secret_pair(live: &mut Value, target: &mut Value) {
 
 /// Argo CD's managed resources (its answer) as diffs from live to git: each resource that
 /// differs, a Secret's values masked.
-fn diffs(body: &Value, server: String, login: Login) -> GitDiff {
+pub(super) fn diffs(body: &Value, server: String, login: Login) -> GitDiff {
     let items = body.get("items").and_then(Value::as_array).map_or(&[][..], Vec::as_slice);
     let mut out = GitDiff { server, login, changed: Vec::new(), more: 0, same: 0, hooks: 0 };
     for item in items {

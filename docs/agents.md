@@ -74,7 +74,11 @@ syncing an Application doesn't allow patching its spec. Rules saved by a version
 verbs checked GitOps actions as `patch`: on the first start of this version, every rule that
 names `patch` gets the three verbs, once (and rules.yaml is written again), so what it allowed,
 asked or denied it still does. Take `refresh` out of an Ask rule afterwards to let refreshes
-through.
+through. rules.yaml says which rules it holds (`version: 2`), so a file without it is upgraded
+whenever it is loaded (restored from git, copied from another machine, or given with no
+agents.json), and so are rules copied with *Copy rules* by an older version and pasted. A file
+without it whose rules name `refresh`, `sync` or `suspend` was written for them: it is not loaded
+until `version: 2` is added at its top (pasted rules that name them are taken as they are).
 
 Write mode and protected contexts are for you in the window: an agent's calls don't check them,
 only its rules (with the rate limit and the kill switch below). An Allow rule for a write lets the
@@ -101,7 +105,9 @@ run) and offer **Always allow this** to add a narrow rule; it wins over the Ask 
 the same request is not asked again (until you edit the rule). It covers that kind only, not another
 API group's kind with the same plural, and its names and contexts match case included. The rule editor marks such rules
 "approved", and rules pasted with *Paste rules* never count as approved. In a pasted rule, a missing
-effect means Deny, and a missing list means `*` in a Deny or Ask, none in an Allow. For `apply_manifest` the banner lists
+effect means Deny, and a missing list means `*` in a Deny or Ask, none in an Allow; rules copied
+without a `version` (by a version before the GitOps verbs) get them where they name `patch`, unless
+one names `refresh`, `sync` or `suspend` already. For `apply_manifest` the banner lists
 every object (kind, namespace/name) and the YAML that will be applied, a Secret's values masked; the
 activity log keeps each object with a hash of that YAML, and the objects already applied when a call
 is cut off.
@@ -124,9 +130,10 @@ replica count), `apply_manifest` (nor the content), requests other than lists wi
 (e.g. `check_certificates`: the rule would cover every name), requests across all namespaces (the
 rule would also cover namespaces no rule allows), and dry runs (the rule would allow the real write
 too), and Flux suspend and resume (one `suspend` verb covers both, so approving a resume would also
-allow suspending). A refresh or a sync gets one: its rule allows that action (`sync`, say) on that
-object only. An Argo CD sync with prune, a rollback or a terminate doesn't: their `sync` rule would
-allow any other sync, prune or rollback of the Application, beyond what the banner showed.
+allow suspending), and an Argo CD sync, terminate or rollback (one `sync` verb covers them all, and
+a rule cannot pin a prune, the `resources` synced or a rollback's deployment: approving a plain sync
+would let a later prune delete objects nobody was shown). A refresh or a Flux reconcile gets one:
+its rule allows that action on that object only.
 
 Before any rule is checked, a call's context must be named by one of the agent's Allow or Ask rules
 (`@protected` names none) and not covered by a Deny of everything (`*` verbs, resources, namespaces

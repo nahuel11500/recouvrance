@@ -22,6 +22,7 @@ mod exec;
 #[cfg(feature = "dev")]
 pub(crate) mod experiments;
 pub(crate) mod files;
+mod follow;
 mod forward;
 pub(crate) mod gate;
 pub(crate) mod lane;
@@ -49,6 +50,7 @@ pub(crate) use cadence::{Cadence, Freshness, Reading};
 pub(crate) use config::*;
 pub(crate) use discovery::*;
 pub(crate) use exec::*;
+pub(crate) use follow::{Follow, Followed, Keep, follow};
 pub(crate) use forward::*;
 pub(crate) use log_pods::*;
 pub(crate) use metrics::*;
@@ -207,6 +209,12 @@ pub fn api_status(e: &anyhow::Error) -> Option<u16> {
         Some(kube::Error::Api(status)) => Some(status.code),
         _ => None,
     })
+}
+
+/// A time from k8s-openapi, which is still on jiff 0.2, as this crate's `jiff::Timestamp`.
+/// Nanoseconds carry over unchanged; `None` only past the range both versions share.
+pub fn timestamp(t: k8s_openapi::jiff::Timestamp) -> Option<jiff::Timestamp> {
+    jiff::Timestamp::from_nanosecond(t.as_nanosecond()).ok()
 }
 
 /// How long ago `t` was, as kubectl's AGE column says it: "45s", "3m", "5h", "3d", "2y".

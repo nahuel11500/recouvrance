@@ -11,7 +11,6 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use super::{DetailPanel, DetailTab, container_names, writes_enabled};
-use crate::favorites::FavObject;
 use crate::k8s;
 use crate::ui::selectable::{copy_menu, selectable};
 
@@ -580,13 +579,8 @@ impl Render for DetailPanel {
                             .gap_2()
                             .child(heading_name(self.obj.namespace.as_deref(), &self.obj.name, cx))
                             .child({
-                                let fav = FavObject {
-                                    context: self.context.clone(),
-                                    kind: self.obj.kind.kubectl_name(),
-                                    namespace: self.obj.namespace.clone(),
-                                    name: self.obj.name.clone(),
-                                };
-                                let starred = self.favorites.read(cx).has_object(&fav);
+                                let fav = self.favorite();
+                                let starred = self.favorites.read(cx).has(&fav);
                                 let favs = self.favorites.clone();
                                 Button::new("star")
                                     .xsmall()
@@ -596,7 +590,12 @@ impl Render for DetailPanel {
                                     } else {
                                         Icon::new(Lucide::Star)
                                     })
-                                    .on_click(move |_, _, cx| favs.update(cx, |f, cx| f.toggle_object(fav.clone(), cx)))
+                                    .tooltip(crate::app::with_keys(if starred {
+                                        "Remove from favorites ({*})"
+                                    } else {
+                                        "Add to favorites ({*})"
+                                    }))
+                                    .on_click(move |_, _, cx| favs.update(cx, |f, cx| f.toggle(fav.clone(), cx)))
                             })
                             .child(Button::new("copy-name").xsmall().ghost().icon(Lucide::Copy).on_click(
                                 move |_, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(full_name.clone())),

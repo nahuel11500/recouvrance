@@ -556,16 +556,42 @@ impl Policy {
         changed
     }
 
+    /// Whether a rule names `refresh`, `sync` or `suspend` (not by `*`): rules that do were
+    /// written for the GitOps verbs, whatever version they say.
+    pub(super) fn names_gitops_verb(&self) -> bool {
+        self.rules.iter().any(|r| Verb::GITOPS.into_iter().any(|v| r.lists_verb(v)))
+    }
+
+    /// The rules and limits as JSON, for "Copy rules": with the `version` of the rules, so
+    /// that a later version pasting them reads them as they were meant (see [`Policy::pasted`]).
+    pub fn copied(&self) -> serde_json::Result<String> {
+        let mut json = serde_json::to_value(self)?;
+        if let Some(fields) = json.as_object_mut() {
+            fields.insert("version".into(), super::rules_file::FILE_VERSION.into());
+        }
+        serde_json::to_string_pretty(&json)
+    }
+
     /// Rules pasted as JSON ("Copy rules" on another agent), None when there are none.
     /// No pasted rule counts as approved: it would win over every Ask rule while looking
-    /// like any other Allow.
+    /// like any other Allow. Rules copied before the GitOps verbs (no `version`, from an
+    /// older clipboard or a note) get them as agents.json's and rules.yaml's do, so a rule
+    /// that denied or asked for `patch` still covers a sync. Rules that name one of them
+    /// without a `version` (written by hand, or by a build that copied none) are read as
+    /// current: before the GitOps verbs no rule could name them, and adding them would
+    /// widen an Allow the writer narrowed.
     pub fn pasted(text: &str) -> Option<Self> {
-        let mut p: Self = serde_json::from_str(text).ok()?;
+        let json: serde_json::Value = serde_json::from_str(text).ok()?;
+        let version = json.get("version").and_then(serde_json::Value::as_u64).unwrap_or(0);
+        let mut p: Self = serde_json::from_value(json).ok()?;
         if p.rules.is_empty() {
             return None;
         }
         for r in &mut p.rules {
             r.approved = false;
+        }
+        if version < u64::from(super::config::GITOPS_VERBS_VERSION) && !p.names_gitops_verb() {
+            p.add_gitops_verbs();
         }
         Some(p)
     }
@@ -1018,6 +1044,34 @@ pub(super) mod tests {
         assert!(Policy::pasted(r#"{"rules": []}"#).is_none() && Policy::pasted("not json").is_none());
     }
 
+    /// Rules copied by a version before the GitOps verbs decide a sync as they decided
+    /// `patch`; rules copied now paste as copied.
+    #[test]
+    fn pasted_rules_from_before_the_gitops_verbs_are_upgraded() {
+        let old = Policy {
+            rules: vec![
+                rule(Mode::Allow, &["*"], &["*"], &["*"], &["*"]),
+                rule(Mode::Deny, &["patch"], &["*"], &["*"], &["prod"]),
+            ],
+            ..Policy::default()
+        };
+        let sync = access("prod", "sync", "applications.argoproj.io", Some("argocd"), Some("web"));
+        let text = serde_json::to_string(&old).unwrap();
+        assert_eq!(Policy::pasted(&text).unwrap().decide(&sync).mode, Mode::Deny);
+        // Copied now, with the version: a verb taken out stays out.
+        let mut now = Policy::pasted(&text).unwrap();
+        now.rules[1].verbs.retain(|v| v != "sync");
+        let pasted = Policy::pasted(&now.copied().unwrap()).unwrap();
+        assert_eq!(pasted.rules, now.rules);
+        assert_eq!(pasted.decide(&sync).mode, Mode::Allow);
+        // Without a version but naming a GitOps verb: written for them, read as written.
+        let mut json: serde_json::Value = serde_json::from_str(&now.copied().unwrap()).unwrap();
+        json.as_object_mut().unwrap().remove("version");
+        let pasted = Policy::pasted(&json.to_string()).unwrap();
+        assert_eq!(pasted.rules, now.rules);
+        assert_eq!(pasted.decide(&sync).mode, Mode::Allow);
+    }
+
     #[test]
     fn approvals_that_cannot_be_narrow_make_no_rule() {
         let approval = |tool: &str, verb: &str, name: Option<&str>| Approval {
@@ -1037,7 +1091,7 @@ pub(super) mod tests {
         assert!(approval("exec_command", "exec", Some("web-1")).as_rule_for_an_hour().is_none());
         assert!(approval("gitops", "patch", Some("app")).as_rule().is_none());
         // A GitOps action has its own verb: the rule pins the action and the object.
-        assert!(approval("gitops", "sync", Some("app")).as_rule().is_some());
+        assert!(approval("gitops", "refresh", Some("app")).as_rule().is_some());
         assert!(approval("gitops", "refresh", None).as_rule().is_none());
         // Suspend and resume share a verb: a rule from approving one would allow the other.
         assert!(approval("gitops", "suspend", Some("app")).as_rule().is_none());
@@ -1062,34 +1116,86 @@ pub(super) mod tests {
         // Approving a dry run must not allow the real write.
         let dry = Approval { dry_run: true, ..approval("delete_resource", "delete", Some("web")) };
         assert!(dry.as_rule().is_none() && dry.as_rule_for_an_hour().is_none());
-        // Approving a prune, a rollback or a terminate must not allow every sync of the object.
+        // Approving an Argo CD sync, rollback or terminate must not allow every other one.
         let once = Approval { once_only: true, ..approval("gitops", "sync", Some("app")) };
         assert!(once.as_rule().is_none() && once.as_rule_for_an_hour().is_none());
     }
 
+    /// An Argo CD sync's rule would cover every prune, rollback and terminate of the
+    /// Application (one `sync` verb), so approving any of them makes no rule; a refresh and a
+    /// Flux reconcile deploy nothing beyond themselves and keep theirs.
     #[test]
-    fn approving_a_sync_allows_that_sync_only() {
-        let approval = Approval {
-            id: 1,
-            agent_id: "a".into(),
-            agent: "a".into(),
-            tool: "gitops".into(),
-            summary: String::new(),
-            detail: None,
-            preview: None,
-            access: access("hub", "sync", "applications.argoproj.io", Some("argocd"), Some("web")),
-            dry_run: false,
+    fn only_a_refresh_or_a_reconcile_becomes_a_rule() {
+        let approval = |action: &str, verb: &str, resource: &str, extra: &serde_json::Value| {
+            let mut args = serde_json::json!({"action": action});
+            if let (Some(args), Some(extra)) = (args.as_object_mut(), extra.as_object()) {
+                args.extend(extra.clone());
+            }
+            Approval {
+                id: 1,
+                agent_id: "a".into(),
+                agent: "a".into(),
+                tool: "gitops".into(),
+                summary: String::new(),
+                detail: None,
+                preview: None,
+                access: access("hub", verb, resource, Some("argocd"), Some("web")),
+                dry_run: false,
+                once_only: Approval::only_once("gitops", &args),
+                deadline: std::time::Instant::now(),
+            }
+        };
+        let app = "applications.argoproj.io";
+        let none = serde_json::json!({});
+        let argo = [
+            approval("sync", "sync", app, &none),
+            approval("sync", "sync", app, &serde_json::json!({"prune": true})),
+            approval("sync", "sync", app, &serde_json::json!({"resources": [{"kind": "ConfigMap", "name": "a"}]})),
+            approval("terminate", "sync", app, &none),
+            approval("rollback", "sync", app, &serde_json::json!({"deployment_id": 3})),
+        ];
+        for a in &argo {
+            assert!(a.as_rule().is_none() && a.as_rule_for_an_hour().is_none());
+        }
+        // Whatever tool asked and whatever the banner's flag says: `sync` on an Application
+        // never becomes a rule.
+        let other = Approval { tool: "another_tool".into(), once_only: false, ..approval("sync", "sync", app, &none) };
+        assert!(other.as_rule().is_none() && other.as_rule_for_an_hour().is_none());
+        let aliased = Approval {
+            tool: "another_tool".into(),
             once_only: false,
-            deadline: std::time::Instant::now(),
+            access: Access {
+                resource: "applications".into(),
+                resource_aliases: vec!["Applications.argoproj.io".into()],
+                ..access("hub", "sync", app, Some("argocd"), Some("web"))
+            },
+            ..approval("sync", "sync", app, &none)
         };
-        let ask = rule(Mode::Ask, &["patch", "sync"], &["*"], &["*"], &["*"]);
-        let p = Policy { rules: vec![ask, approval.as_rule().unwrap()], ..Policy::default() };
-        let d = |verb: &str, name: &str| {
-            p.decide(&access("hub", verb, "applications.argoproj.io", Some("argocd"), Some(name))).mode
+        assert!(aliased.as_rule().is_none());
+        // Whatever approving a plain sync leaves behind, the next prune, rollback or
+        // terminate of the Application (all `sync`) still asks.
+        let mut rules = vec![rule(Mode::Ask, &["patch", "refresh", "sync"], &["*"], &["*"], &["*"])];
+        rules.extend(argo[0].as_rule());
+        rules.extend(argo[0].as_rule_for_an_hour());
+        let p = Policy { rules, ..Policy::default() };
+        assert_eq!(p.decide(&access("hub", "sync", app, Some("argocd"), Some("web"))).mode, Mode::Ask);
+
+        let refresh = approval("refresh", "refresh", app, &none);
+        let hard = approval("hard_refresh", "refresh", app, &none);
+        let reconcile = approval("reconcile", "sync", "kustomizations.kustomize.toolkit.fluxcd.io", &none);
+        assert!(hard.as_rule().is_some() && reconcile.as_rule().is_some());
+        let p = Policy {
+            rules: vec![
+                rule(Mode::Ask, &["patch", "refresh", "sync"], &["*"], &["*"], &["*"]),
+                refresh.as_rule().unwrap(),
+            ],
+            ..Policy::default()
         };
-        assert_eq!(d("sync", "web"), Mode::Allow);
-        assert_eq!(d("sync", "api"), Mode::Ask);
-        // Not a patch of its spec (target revision, destination).
+        let d = |verb: &str, name: &str| p.decide(&access("hub", verb, app, Some("argocd"), Some(name))).mode;
+        assert_eq!(d("refresh", "web"), Mode::Allow);
+        assert_eq!(d("refresh", "api"), Mode::Ask);
+        // Not a sync, nor a patch of its spec (target revision, destination).
+        assert_eq!(d("sync", "web"), Mode::Ask);
         assert_eq!(d("patch", "web"), Mode::Ask);
     }
 

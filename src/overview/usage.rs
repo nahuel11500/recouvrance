@@ -153,7 +153,7 @@ pub fn usage_chart(data: &crate::prom::Series, spec: ChartSpec, cx: &App) -> Div
     let time_fmt = if minutes > 1440 { "%a %H:%M" } else { "%H:%M" };
     let label = move |t: i64| {
         jiff::Timestamp::from_second(t)
-            .map_or_default(|t| t.to_zoned(jiff::tz::TimeZone::system()).strftime(time_fmt).to_string())
+            .map_or_default(|t| t.to_zoned_datetime(jiff::tz::TimeZone::system()).strftime(time_fmt).to_string())
     };
     let max = data.iter().map(|p| p.1).fold(0.0, f64::max);
     // Scale to usage and request; a far-away limit would flatten the curve.
