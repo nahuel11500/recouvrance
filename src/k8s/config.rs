@@ -217,7 +217,23 @@ fn read_kubeconfig() -> Result<(Kubeconfig, bool)> {
 /// never what the file holds (see `unquoted`): it reaches pages, agents and the audit log. Read
 /// kubeconfig files with this, not `Kubeconfig::read_from`.
 pub(super) fn read_kubeconfig_file(path: &std::path::Path) -> Result<Kubeconfig> {
-    Kubeconfig::read_from(path).map_err(|e| anyhow!("{}: {}", tilde(path), unquoted(e)))
+    let file = || tilde(path);
+    // kube reads a file that starts with a UTF-16 byte order mark two bytes at a time and panics
+    // on an odd last byte (#890): such a file in a kubeconfig folder crashed the app.
+    let bytes = std::fs::read(path).map_err(|e| anyhow!("{}: {e}", file()))?;
+    if odd_utf16(&bytes) {
+        return Err(anyhow!("{}: not valid UTF-16 (a byte order mark, then an odd number of bytes)", file()));
+    }
+    // kube reads the file again, and it may have changed since: its panic is an error too.
+    std::panic::catch_unwind(|| Kubeconfig::read_from(path))
+        .map_err(|_| anyhow!("{}: kube failed reading it", file()))?
+        .map_err(|e| anyhow!("{}: {}", file(), unquoted(e)))
+}
+
+/// Whether `bytes` start with a UTF-16 byte order mark (little or big endian) and are of an odd
+/// length, which kube's `read_from` panics on.
+fn odd_utf16(bytes: &[u8]) -> bool {
+    matches!(bytes, [0xFF, 0xFE, ..] | [0xFE, 0xFF, ..]) && bytes.len() % 2 == 1
 }
 
 /// Kubeconfig text pasted in Settings, read as `read_kubeconfig_file` reads a file.
@@ -490,20 +506,40 @@ async fn connect_with(context: String, gated: bool) -> Result<Client> {
             Some(cmd) => Some(exec_lock(cmd).lock_owned().await),
             None => None,
         };
+        let proxy_cut = proxy_text(&kc, &context).is_some_and(|text| text.contains('#'));
         let opts = KubeConfigOptions { context: Some(context.clone()), ..Default::default() };
         let config =
             Config::from_custom_kubeconfig(kc, &opts).await.with_context(|| format!("loading context {context}"))?;
         // The exec plugin runs as a blocking process here (a browser login can take minutes):
         // off the shared runtime's few threads, so other clusters keep streaming meanwhile.
-        tokio::task::spawn_blocking(move || client(config, context, gated)).await.context("building the client")?
+        tokio::task::spawn_blocking(move || client(config, context, gated, proxy_cut))
+            .await
+            .context("building the client")?
     })
     .await
 }
 
+/// The proxy's text, as written, that kube reads for `context`: its cluster's `proxy-url`, else
+/// `HTTPS_PROXY`, else `https_proxy` (the first that isn't empty). kube keeps it as an
+/// `http::Uri`, which drops what follows a `#`: only this text tells that a password was cut
+/// there (see `login::build_error`).
+fn proxy_text(kc: &Kubeconfig, context: &str) -> Option<String> {
+    let cluster = kc.contexts.iter().find(|c| c.name == context)?.context.as_ref().map(|c| &c.cluster);
+    let from_kubeconfig = cluster
+        .and_then(|name| kc.clusters.iter().find(|k| &k.name == name))
+        .and_then(|k| k.cluster.as_ref())
+        .and_then(|k| k.proxy_url.clone());
+    [from_kubeconfig, std::env::var("HTTPS_PROXY").ok(), std::env::var("https_proxy").ok()]
+        .into_iter()
+        .flatten()
+        .find(|text| !text.is_empty())
+}
+
 /// A context's client from its config, with the app's layers. Runs the exec plugin, if any:
 /// when it fails, here or on a later request, the error says its program and its error only
-/// (`login`), not its command line or output.
-fn client(mut config: Config, context: String, gated: bool) -> Result<Client> {
+/// (`login`), not its command line or output. `proxy_cut`: the proxy's text holds a `#` (see
+/// `proxy_text`).
+fn client(mut config: Config, context: String, gated: bool, proxy_cut: bool) -> Result<Client> {
     // kube's retry sends a 503 again for about three minutes: an aggregated API that is down
     // (metrics-server) held pages that long. `retry` only waits when the server says when.
     config.default_retry = false;
@@ -516,8 +552,8 @@ fn client(mut config: Config, context: String, gated: bool) -> Result<Client> {
     // kube's error for a failed login command names its program among its arguments, or not at
     // all (when it could not be started): it is named from the kubeconfig instead.
     let program = login::program(&config.auth_info);
-    let builder =
-        kube::client::ClientBuilder::try_from(config).map_err(|e| login::build_error(e, program.as_deref()))?;
+    let builder = kube::client::ClientBuilder::try_from(config)
+        .map_err(|e| login::build_error(e, program.as_deref(), proxy_cut))?;
     // Right around kube's own layers, where a failed token refresh comes out: the app's layers
     // and every caller only see it said by `login`.
     let builder = builder
@@ -972,7 +1008,7 @@ mod tests {
             }
         });
         let config = kube::Config::new(format!("http://{addr}").parse().unwrap());
-        let client = super::client(config, "test".into(), false).unwrap();
+        let client = super::client(config, "test".into(), false, false).unwrap();
         let read =
             client.request_text(http::Request::get("/apis/metrics.k8s.io/v1beta1/nodes").body(Vec::new()).unwrap());
         let answer = tokio::time::timeout(std::time::Duration::from_secs(5), read).await;
@@ -1005,7 +1041,7 @@ mod tests {
             }
         });
         let config = kube::Config::new(format!("http://{addr}").parse().unwrap());
-        let client = super::client(config, "gzip-test".into(), false).unwrap();
+        let client = super::client(config, "gzip-test".into(), false, false).unwrap();
         let get = http::Request::get("/api/v1/namespaces/shop/configmaps/big").body(Vec::new()).unwrap();
         let read = tokio::time::timeout(std::time::Duration::from_secs(5), client.request_text(get)).await;
         assert_eq!(read.expect("the answer should come at once").unwrap(), text);
@@ -1052,7 +1088,7 @@ mod tests {
         let script = "echo \"token: $LOGIN_ENV\"; echo 'warning: no cached token' >&2; \
                       echo 'error: refresh token expired' >&2; exit 3";
         let mark = std::env::temp_dir().join("recouvrance-login-unused");
-        let Err(e) = super::client(login_by(script, &mark), "test".into(), false) else {
+        let Err(e) = super::client(login_by(script, &mark), "test".into(), false, false) else {
             panic!("the login command fails");
         };
         assert_eq!(crate::k8s::short_error(&e), LOGIN_FAILED);
@@ -1068,7 +1104,7 @@ mod tests {
         let script = r#"if [ -e "$MARK" ]; then echo "$LOGIN_ENV"; echo 'error: refresh token expired' >&2; exit 3; fi
 touch "$MARK"
 echo '{"apiVersion":"client.authentication.k8s.io/v1","kind":"ExecCredential","status":{"token":"s3cr3t-token","expirationTimestamp":"2020-01-01T00:00:00Z"}}'"#;
-        let client = super::client(login_by(script, &mark), "test".into(), false).unwrap();
+        let client = super::client(login_by(script, &mark), "test".into(), false, false).unwrap();
         let read = client.request_text(http::Request::get("/version").body(Vec::new()).unwrap()).await;
         let _ = std::fs::remove_file(mark);
         let e = read.expect_err("the token refresh fails");
@@ -1083,7 +1119,7 @@ echo '{"apiVersion":"client.authentication.k8s.io/v1","kind":"ExecCredential","s
     async fn a_login_command_that_is_not_there_is_named() {
         let mut config = login_by("exit 0", &std::env::temp_dir().join("recouvrance-login-unused"));
         config.auth_info.exec.as_mut().unwrap().command = Some("/nonexistent/recouvrance-login".into());
-        let Err(e) = super::client(config, "test".into(), false) else {
+        let Err(e) = super::client(config, "test".into(), false, false) else {
             panic!("the login command is not there");
         };
         let said = crate::k8s::short_error(&e);
@@ -1122,6 +1158,35 @@ echo '{"apiVersion":"client.authentication.k8s.io/v1","kind":"ExecCredential","s
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// A file that starts with a UTF-16 byte order mark and has an odd number of bytes made kube
+    /// panic, and the app with it (#890): it is said not to read, naming the file. An even one
+    /// reads as before.
+    #[test]
+    fn an_odd_utf16_file_fails_without_a_crash() {
+        let dir = crate::mcp::test_dir();
+        let path = dir.join("config");
+        let file = crate::paths::tilde(&path);
+        let utf16 = |mark: [u8; 2], big: bool| {
+            let text = "apiVersion: v1\nkind: Config\ncurrent-context: c\n";
+            let units = text.encode_utf16().flat_map(|u| if big { u.to_be_bytes() } else { u.to_le_bytes() });
+            mark.into_iter().chain(units).collect::<Vec<u8>>()
+        };
+        for (mark, big) in [([0xFF, 0xFE], false), ([0xFE, 0xFF], true)] {
+            let mut bytes = utf16(mark, big);
+            std::fs::write(&path, &bytes).unwrap();
+            let kc = super::read_kubeconfig_file(&path).unwrap();
+            assert_eq!(kc.current_context.as_deref(), Some("c"));
+            bytes.push(b'x');
+            std::fs::write(&path, &bytes).unwrap();
+            let e = super::read_kubeconfig_file(&path).unwrap_err();
+            assert_eq!(
+                e.to_string(),
+                format!("{file}: not valid UTF-16 (a byte order mark, then an odd number of bytes)")
+            );
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     /// A proxy kube can't use, by its scheme or for having none (an `HTTPS_PROXY` that curl
     /// reads as http): the error of building the client names it by its host and port, never
     /// its user and password, however it is printed (#859).
@@ -1137,12 +1202,41 @@ echo '{"apiVersion":"client.authentication.k8s.io/v1","kind":"ExecCredential","s
             // kube's own error prints the URL whole.
             let Err(raw) = kube::Client::try_from(config.clone()) else { panic!("kube uses {url}") };
             assert!(raw.to_string().contains("user:secret@"), "{raw}");
-            let Err(e) = super::client(config, "test".into(), false) else { panic!("kube uses {url}") };
+            let Err(e) = super::client(config, "test".into(), false, false) else { panic!("kube uses {url}") };
             assert_eq!(crate::k8s::short_error(&e), format!("configured proxy {shown} uses an unsupported protocol"));
             for said in [crate::k8s::error_chain(&e), format!("{e:#}"), format!("{e:?}"), format!("{e:#?}")] {
                 assert!(!said.contains("secret") && !said.contains("user:"), "{said}");
                 assert!(said.contains("proxy.corp:"), "{said}");
             }
+        }
+    }
+
+    /// A password of digits up to an unescaped `#` reads as a port in the URL kube keeps
+    /// (`user:1234`): the proxy's text, as written in the kubeconfig, tells that it was cut, and
+    /// only the scheme is shown then (#889).
+    #[test]
+    fn a_proxy_password_cut_at_a_hash_stays_out_of_the_connect_error() {
+        let url = "socks5h://user:1234#secret@proxy.corp:1080";
+        let kc = Kubeconfig::from_yaml(&format!(
+            "clusters: [{{name: c, cluster: {{server: https://127.0.0.1:1, proxy-url: '{url}'}}}}]\n\
+             contexts: [{{name: ctx, context: {{cluster: c}}}}]\n"
+        ))
+        .unwrap();
+        // The kubeconfig's text comes before `HTTPS_PROXY`.
+        let text = super::proxy_text(&kc, "ctx");
+        assert_eq!(text.as_deref(), Some(url));
+        let connect = |cut: bool| {
+            let mut config = kube::Config::new("https://127.0.0.1:1".parse().unwrap());
+            config.proxy_url = Some(url.parse().unwrap());
+            let Err(e) = super::client(config, "test".into(), false, cut) else { panic!("kube uses {url}") };
+            e
+        };
+        // From the URL kube keeps alone, the password reads as a port.
+        assert!(format!("{:#}", connect(false)).contains("user:1234"));
+        let e = connect(text.is_some_and(|t| t.contains('#')));
+        assert_eq!(crate::k8s::short_error(&e), "configured proxy socks5h://… uses an unsupported protocol");
+        for said in [crate::k8s::error_chain(&e), format!("{e:#}"), format!("{e:?}"), format!("{e:#?}")] {
+            assert!(!said.contains("1234") && !said.contains("user"), "{said}");
         }
     }
 
@@ -1514,6 +1608,35 @@ current-context: x
             }
             if let Err(e) = super::parse_kubeconfig(&text) {
                 prop_assert!(!format!("{e:#}").contains(SECRET), "{e:#}\nfrom\n{text}");
+            }
+        }
+
+        /// Whatever bytes a kubeconfig file holds after a byte order mark or none, it is read or
+        /// said not to read, naming the file: never a panic, which crashed the app on a UTF-16
+        /// mark followed by an odd number of bytes (#890).
+        #[test]
+        fn any_file_reads_or_fails_without_a_crash(
+            mark in prop_oneof![
+                Just(&[0u8; 0][..]),
+                Just(&[0xFF, 0xFE][..]),
+                Just(&[0xFE, 0xFF][..]),
+                Just(&[0xEF, 0xBB, 0xBF][..]),
+            ],
+            body in prop::collection::vec(any::<u8>(), 0..64),
+        ) {
+            /// The test's folder, removed when the case ends, failed or not.
+            struct Folder(std::path::PathBuf);
+            impl Drop for Folder {
+                fn drop(&mut self) {
+                    let _ = std::fs::remove_dir_all(&self.0);
+                }
+            }
+            let dir = Folder(crate::mcp::test_dir());
+            let path = dir.0.join("config");
+            std::fs::write(&path, [mark, &body[..]].concat()).unwrap();
+            if let Err(e) = super::read_kubeconfig_file(&path) {
+                let file = crate::paths::tilde(&path);
+                prop_assert!(e.to_string().starts_with(&format!("{file}: ")), "{e}");
             }
         }
     }

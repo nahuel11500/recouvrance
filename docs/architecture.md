@@ -70,6 +70,13 @@ managedFields and the rest skipped (`list_whole`), and so does a list the Timeli
 from such a row reads the object's uid first, and leaves alone an object newer than the row (one
 re-created under the same name since the list).
 
+A connect doesn't wait for its slowest cluster (`src/app/reach.rs`). Each context connects on its
+own, reading its discovery and its namespace list together; the first rows come once one cluster
+has answered and the others have had 2 more seconds, and a cluster that answers later joins the
+list then, and the page on screen. The session isn't saved while part of the set is missing: once
+the last cluster is in and none failed, it is saved again. When the list shown first is the Pods of every namespace, it starts as soon as each
+client is built, alongside discovery, and the list takes it over.
+
 Rows keep only the metadata they need; full objects are fetched only when a custom column needs
 them. Responses are gzip-compressed. The usage bars and the cluster overview take the pods'
 requests and limits from one list of the pods, then follow them with a watch
@@ -78,6 +85,11 @@ for 20,800 pods), so each pod is kept only as the sums `podspec` makes of it, an
 go or are resized in place change them without another list. A page off screen for 5 minutes
 stops its watch and lists again once back. On a cluster with about 20,800 pods, the first rows
 show after 0.7 s and all of them after 1.4 s ([measured](COMPARISON.md#measured)).
+
+The agents' `list_resources`, `get_events` and `search` across every namespace with no selector,
+and the search box's name index, read the same way (`list_light`): a small list with its objects'
+metadata, a big one from its cells in the API server's cache, one namespace at a time. `search`
+lists its kinds at once rather than one after the other.
 
 The Problems scan reads the big kinds from their cells too (`list_light`). What its checks need
 of whole objects (Services, Ingresses and HTTP routes, the pods a Service selects, the workloads of
@@ -141,9 +153,18 @@ is read every `detail_refresh`.
   the lines around where it failed and can quote a value: a token, a client key, a login
   command's arguments. Kubeconfig files are read through `k8s::read_kubeconfig_file`, pasted
   text through `parse_kubeconfig`: their error says the file, line and column, and why in words
-  of their own.
+  of their own. A file that starts with a UTF-16 byte order mark and has an odd number of bytes,
+  which kube's reader panics on, is an error of that file too, not a crash.
 - **Proxy passwords stay out of errors.** kube's error for a proxy it can't use prints the proxy's
-  URL whole, user and password included. The client's build error puts that URL back without
-  them, scheme or not (`user:password@host:1080` from `HTTPS_PROXY` reads as a URL to kube, not
-  to a text), and leaves out the user and password of any other URL in its text, as of one in the
-  login plugin's stderr line (`k8s::login`).
+  URL whole, user and password included. The client's build error puts that URL back as its
+  scheme, host and port alone, scheme or not (`user:password@host:1080` from `HTTPS_PROXY` reads
+  as a URL to kube, not to a text), whatever the password holds: a proxy's URL has no path or
+  query, so everything up to the last `@` goes, and everything after the host. kube keeps the
+  URL as an `http::Uri`, which drops what follows a `#`: the password left before it can read
+  as a host and port. So when the proxy's text, as kube reads it (the cluster's `proxy-url`,
+  else `HTTPS_PROXY`, else `https_proxy`), holds a `#`, only the scheme is shown. From the
+  `Uri` alone, a URL with a scheme is shown by its scheme too when its port is no number, when
+  it has a user and no port, or a path or query and no user. The build error also leaves out
+  the user and password of any other URL in its text, as of one in the login plugin's stderr
+  line (`k8s::login`), but there a password with an unescaped `/`, `?` or `#` still shows
+  (#1000).

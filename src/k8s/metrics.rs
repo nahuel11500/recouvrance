@@ -345,11 +345,16 @@ pub async fn resource_slices(client: Client, node: String) -> Vec<serde_json::Va
 }
 
 /// Sum of pod requests and limits for one resource, the way the scheduler counts them
-/// ([`podspec::effective`]); a container without a limit counts 0. Finished pods are left out.
+/// ([`podspec::effective`]); a container without a limit counts 0. Only pods bound to a node and
+/// not finished (Succeeded, Failed) count, the same rule as the cluster overview's totals
+/// (`pod_requests`). A node's page lists its pods by `spec.nodeName` already, so the node check
+/// is defensive there.
 pub fn pods_allocated(pods: &[serde_json::Value], resource: &str) -> (f64, f64) {
     let (mut req, mut lim) = (0.0, 0.0);
     for p in pods {
-        if matches!(p.pointer("/status/phase").and_then(|v| v.as_str()), Some("Succeeded" | "Failed")) {
+        let phase = p.pointer("/status/phase").and_then(|v| v.as_str());
+        let unbound = p.pointer("/spec/nodeName").and_then(|v| v.as_str()).is_none_or(str::is_empty);
+        if matches!(phase, Some("Succeeded" | "Failed")) || unbound {
             continue;
         }
         let e = podspec::of_value(p, resource, podspec::Count::Scheduled);
@@ -512,10 +517,15 @@ mod resources_tests {
     #[test]
     fn pods_allocated_counts_like_the_scheduler() {
         let pod = serde_json::json!({"spec": {
+            "nodeName": "n1",
             "initContainers": [{"resources": {"requests": {"cpu": "2"}}}],
             "containers": [{"resources": {"requests": {"cpu": "500m"}}}],
         }});
-        let done = serde_json::json!({"status": {"phase": "Succeeded"}, "spec": {"containers": [{"resources": {"requests": {"cpu": "1"}}}]}});
-        assert_eq!(pods_allocated(&[pod, done], "cpu"), (2000.0, 0.0));
+        let done = serde_json::json!({"status": {"phase": "Succeeded"},
+            "spec": {"nodeName": "n1", "containers": [{"resources": {"requests": {"cpu": "1"}}}]}});
+        // No node took it: nothing is reserved for it.
+        let waiting = serde_json::json!({"status": {"phase": "Pending"},
+            "spec": {"containers": [{"resources": {"requests": {"cpu": "4"}}}]}});
+        assert_eq!(pods_allocated(&[pod, done, waiting], "cpu"), (2000.0, 0.0));
     }
 }

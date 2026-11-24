@@ -37,7 +37,7 @@ impl KubeMcp {
     }
 
     #[tool(
-        description = "Check calls you plan against your rules without making them: for each request (context, verb, kind, namespace, name), whether it is allowed, needs the user's approval or is denied, the rule that decides, and for a denial whether it is final (a Deny rule) or the rule the user could add. Use it before a task that needs several calls, to tell the user up front what to approve or grant. The verb is the rules' verb, not the tool: set_image, rollout_undo, rollout_pause, rollout_resume and patch_resource need patch; rollout_restart restart; apply_manifest apply on each object; trigger_cronjob get on the CronJob and apply on its Job; cordon_node, uncordon_node and drain_node drain on the node; exec_command, debug_pod and browse_files exec on the pod; port_forward forward; get_logs logs; gitops refresh (refresh, hard_refresh), sync (sync, reconcile, terminate, rollback) or suspend (suspend, resume) on the object, and get for diagnose; argocd_apps list on applications.argoproj.io on the hub.",
+        description = "Check calls you plan against your rules without making them: for each request (context, verb, kind, namespace, name), whether it is allowed, needs the user's approval or is denied, the rule that decides, and for a denial whether it is final (a Deny rule) or the rule the user could add. Use it before a task that needs several calls, to tell the user up front what to approve or grant. The verb is the rules' verb, not the tool: set_image, rollout_undo, rollout_pause, rollout_resume and patch_resource need patch; rollout_restart restart; apply_manifest apply on each object; trigger_cronjob get on the CronJob and apply on its Job; cordon_node, uncordon_node and drain_node drain on the node; evict_pod delete on the pod; refresh_external_secret refresh on the ExternalSecret; exec_command, debug_pod and browse_files exec on the pod; port_forward forward; get_logs logs; gitops refresh (refresh, hard_refresh), sync (sync, reconcile, terminate, rollback) or suspend (suspend, resume) on the object, and get for diagnose; argocd_apps list on applications.argoproj.io on the hub.",
         annotations(read_only_hint = true)
     )]
     async fn check_access(
@@ -463,10 +463,7 @@ impl KubeMcp {
             Err(e) => return call.finish(Err(e)),
         };
         let q = p.query.to_lowercase();
-        let mut rows = Vec::new();
-        // The kinds that couldn't be listed, with why: the agent must not read them as empty.
-        let (mut searched, mut failed) = (0, Vec::new());
-        for name in [
+        let searched: Vec<Kind> = [
             "deployments",
             "statefulsets",
             "daemonsets",
@@ -478,13 +475,21 @@ impl KubeMcp {
             "pods",
             "namespaces",
             "nodes",
-        ] {
-            let Some(kind) = k8s::find_kind(&kinds, name).cloned() else { continue };
-            if list_verdict(call.policy(), &kind, &p.context) == Mode::Deny {
-                continue;
-            }
-            searched += 1;
-            let names = match k8s::list_names(client.clone(), kind.ar.clone(), None).await {
+        ]
+        .into_iter()
+        .filter_map(|name| k8s::find_kind(&kinds, name).cloned())
+        .filter(|kind| list_verdict(call.policy(), kind, &p.context) != Mode::Deny)
+        .collect();
+        // All at once: the search takes about as long as its slowest list, not their sum. The
+        // per-namespace requests of big lists share one bounded pool (see `list_light`).
+        let lists =
+            futures::future::join_all(searched.iter().map(|kind| k8s::search_names(client.clone(), kind.clone())))
+                .await;
+        let mut rows = Vec::new();
+        // The kinds that couldn't be listed, with why: the agent must not read them as empty.
+        let mut failed = Vec::new();
+        for (kind, names) in searched.iter().zip(lists) {
+            let names = match names {
                 Ok(names) => names,
                 Err(e) => {
                     failed.push(format!("{} ({e:#})", kind.kubectl_name()));
@@ -496,14 +501,14 @@ impl KubeMcp {
                     continue;
                 }
                 // Search asks nobody: only what a rule allows outright.
-                if !call.may_see(&access_for(&kind, &p.context, Verb::List, ns.clone(), Some(obj.clone()))) {
+                if !call.may_see(&access_for(kind, &p.context, Verb::List, ns.clone(), Some(obj.clone()))) {
                     continue;
                 }
                 rows.push(vec![kind.kubectl_name(), ns.unwrap_or_default(), obj]);
             }
         }
         rows.truncate(call.policy().max_rows as usize);
-        if searched > 0 && failed.len() == searched {
+        if !searched.is_empty() && failed.len() == searched.len() {
             return call.finish(Err(anyhow::anyhow!("couldn't search: {}", failed.join("; "))));
         }
         let mut out = if rows.is_empty() {
@@ -1134,7 +1139,7 @@ mod tests {
         assert_eq!(named, take);
         // Every change but exec_command, drain_node and the port-forward tools (docs/agents.md);
         // gitops's is Argo CD's own dry run of a sync or a rollback.
-        assert_eq!(take.len(), 14, "{take:?}");
+        assert_eq!(take.len(), 16, "{take:?}");
         assert!(take.contains("set_image") && take.contains("cordon_node") && take.contains("debug_pod"), "{take:?}");
         assert!(take.contains("gitops"), "{take:?}");
     }

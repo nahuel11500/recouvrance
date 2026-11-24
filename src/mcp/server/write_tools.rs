@@ -7,9 +7,9 @@ use rmcp::{tool, tool_router};
 use serde_json::json;
 
 use super::{
-    ApplyParams, DENIED_BY_RULE, DeleteParams, DrainParams, ExecParams, GitOpsParams, KubeMcp, PatchParams,
-    RestartParams, ScaleParams, access_for, denied_namespaces, denies_eviction, manifest_objects, manifest_summary,
-    require_ns,
+    ApplyParams, DENIED_BY_RULE, DeleteParams, DrainParams, EvictParams, ExecParams, GitOpsParams, KubeMcp,
+    PatchParams, RefreshExternalSecretParams, RestartParams, ScaleParams, access_for, denied_namespaces,
+    denies_eviction, manifest_objects, manifest_summary, require_ns,
 };
 use std::sync::Arc;
 
@@ -345,7 +345,7 @@ impl KubeMcp {
     }
 
     #[tool(
-        description = "Delete one object, like `kubectl delete`. Supports dry_run.",
+        description = "Delete one object, like `kubectl delete`. `cascade` is kubectl's `--cascade`: `orphan` keeps what it owns (a workload's pods), `foreground` deletes that first. Supports dry_run.",
         annotations(read_only_hint = false)
     )]
     pub(super) async fn delete_resource(
@@ -353,8 +353,18 @@ impl KubeMcp {
         Extension(parts): Extension<Parts>,
         Parameters(p): Parameters<DeleteParams>,
     ) -> Result<String, String> {
-        let args = json!({"context": p.context, "kind": p.kind, "namespace": p.namespace, "name": p.name, "dry_run": p.dry_run});
+        let args = json!({"context": p.context, "kind": p.kind, "namespace": p.namespace, "name": p.name, "dry_run": p.dry_run, "cascade": p.cascade});
         let mut call = self.begin(&parts, "delete_resource", args)?;
+        // A cascade it can't read is refused, never sent as the default: that would delete
+        // the pods the agent meant to keep.
+        let cascade = p
+            .cascade
+            .as_deref()
+            .map(|c| {
+                k8s::Cascade::parse(c)
+                    .ok_or_else(|| call.fail(format!("unknown cascade `{c}`: use background, foreground or orphan")))
+            })
+            .transpose()?;
         let (client, kind) = self.kind(&call, &p.context, &p.kind).await?;
         require_ns(&call, &kind, p.namespace.as_deref())?;
         let access = access_for(&kind, &p.context, Verb::Delete, p.namespace.clone(), Some(p.name.clone()));
@@ -363,10 +373,51 @@ impl KubeMcp {
             kind: kind.clone(),
             ns: p.namespace.clone().filter(|_| kind.namespaced),
             name: p.name.clone(),
+            cascade,
         });
         self.authorize(&mut call, &access).await?;
         self.recheck(&mut call, &access)?;
-        call.finish(k8s::delete(client, kind, p.namespace, p.name, None, p.dry_run.unwrap_or(false)).await)
+        call.finish(k8s::delete(client, kind, p.namespace, p.name, None, p.dry_run.unwrap_or(false), cascade).await)
+    }
+
+    #[tool(
+        description = "Evict one pod through the Eviction API, as `kubectl drain` does for each pod: unlike `delete_resource`, refused when a PodDisruptionBudget would be broken, and the refusal names that budget. Needs `delete` on the pod. Supports dry_run.",
+        annotations(read_only_hint = false)
+    )]
+    async fn evict_pod(
+        &self,
+        Extension(parts): Extension<Parts>,
+        Parameters(p): Parameters<EvictParams>,
+    ) -> Result<String, String> {
+        let args = json!({"context": p.context, "namespace": p.namespace, "pod": p.pod, "dry_run": p.dry_run});
+        let mut call = self.begin(&parts, "evict_pod", args)?;
+        let (client, kind) = self.kind(&call, &p.context, "pods").await?;
+        // Evicting is deleting the pod, as a drain's evictions are checked.
+        let access = access_for(&kind, &p.context, Verb::Delete, Some(p.namespace.clone()), Some(p.pod.clone()));
+        call.plan = Some(Plan::Evict { kind, ns: p.namespace.clone(), name: p.pod.clone() });
+        self.authorize(&mut call, &access).await?;
+        self.recheck(&mut call, &access)?;
+        call.finish(k8s::evict(client, p.namespace, p.pod, None, p.dry_run.unwrap_or(false)).await)
+    }
+
+    #[tool(
+        description = "Make the External Secrets Operator fetch an ExternalSecret from its store now instead of at its next refreshInterval (after a secret was rotated), like `kubectl annotate externalsecret <name> force-sync=$(date +%s) --overwrite`. Authorized as `refresh` on the ExternalSecret. Supports dry_run.",
+        annotations(read_only_hint = false)
+    )]
+    async fn refresh_external_secret(
+        &self,
+        Extension(parts): Extension<Parts>,
+        Parameters(p): Parameters<RefreshExternalSecretParams>,
+    ) -> Result<String, String> {
+        let args = json!({"context": p.context, "namespace": p.namespace, "name": p.name, "dry_run": p.dry_run});
+        let mut call = self.begin(&parts, "refresh_external_secret", args)?;
+        let query = format!("externalsecrets.{}", crate::external_secrets::GROUP);
+        let (client, kind) = self.kind(&call, &p.context, &query).await?;
+        let access = access_for(&kind, &p.context, Verb::Refresh, Some(p.namespace.clone()), Some(p.name.clone()));
+        self.authorize(&mut call, &access).await?;
+        self.recheck(&mut call, &access)?;
+        let dry_run = p.dry_run.unwrap_or(false);
+        call.finish(k8s::force_sync_external_secret(client, kind, Some(p.namespace), p.name, dry_run).await)
     }
 }
 

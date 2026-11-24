@@ -1,6 +1,13 @@
 # Features
 
-- **Contexts**: pick one or several on launch; tables merge clusters with a Context column. When a
+- **Contexts**: pick one or several on launch; tables merge clusters with a Context column. Each
+  context connects on its own: the first rows show once one cluster has answered and the others
+  have had 2 more seconds, so a cluster that can't be reached, or a login waiting in the browser,
+  doesn't hold back the others' rows. A cluster still connecting is said above the list and joins
+  it when it answers, and the page on screen then (a Cluster or Argo CD overview is built again);
+  one that fails shows its own error. Once every cluster is in, the set's session is saved again
+  (and reopened whole if it was reopened without them and nothing changed since). The Pods list starts with the connect,
+  alongside the cluster's discovery and namespace list, when it is the list shown first. When a
   context's login command (its kubeconfig exec plugin) fails, the app says which program failed and
   its exit code: never its arguments, environment or output, where a client secret or a token can
   be. It adds the last line the plugin wrote to stderr when the kubeconfig sets
@@ -8,8 +15,10 @@
   from. A plugin that cannot start, often because it is not on the `PATH` the app was started
   with, is reported with its name. A proxy the app can't use (the kubeconfig's `proxy-url`, or
   `HTTPS_PROXY`, with a scheme other than `http`, `https` or `socks5`, or none) is named by its
-  scheme, host and port, never its user and password; neither shows for any other URL in a
-  connection error.
+  scheme, host and port, never its user and password, even a password with an unescaped `/`, `?`
+  or `#`; by its scheme alone when its text holds a `#`, or when the host can't be told from the
+  password. Neither shows for any other URL in a connection error, unless its password holds an
+  unescaped `/`, `?` or `#` (#1000).
 - **Reopens where you left off**: each set of contexts keeps its tabs (the list or overview each
   shows, its resource type, namespaces and filter) and each type's filter, and the window keeps
   its place, size and whether it was maximized. On launch the first window reopens there once its
@@ -18,8 +27,8 @@
   detail page reopens on the list or overview it was opened from; a window that would be out of
   reach (a display unplugged) is centered. A window opened later starts fresh, and write mode is
   always off at launch. While a cluster of the set doesn't answer, or its namespaces don't list
-  (said above the list), nothing is saved for that set: what only that cluster has would read
-  as gone; connecting that set again once every cluster answers reopens it from what was saved.
+  (said above the list), or joins after the first rows, nothing is saved for that set: what only
+  that cluster has would read as gone; connecting that set again once every cluster answers reopens it from what was saved.
   A set connected for the first time is saved once connected. With two windows on one set, the
   one that reopened it saves it, until something is changed in the other.
 - **Sidebar**: the filter at its top finds pages and resource types (by name, kind or API group).
@@ -533,7 +542,7 @@
   clusters and namespaces picked, and the object whose page is open (with its context), or the
   list with its filter and the row selected, or the page (Problems, Timeline, overviews, Helm,
   Argo CD). A page's *Investigate* asks it beside the page when it is open there.
-- **Overviews**: cluster capacity and health, workloads status, Helm releases (values masked; install from your repos, roll back and uninstall through your `helm` CLI).
+- **Overviews**: cluster capacity and health (requested is what the pods bound to a node hold there; pending pods no node took are said apart, with what they ask for), workloads status, Helm releases (values masked; install from your repos, roll back and uninstall through your `helm` CLI).
 - **API requests** (Settings → API requests): per cluster, how many requests of each kind
   (discovery, lists, watches, metrics, logs, shells, writes) were made and how many failed; how
   long the API server took to start answering (p50, p95, slowest) and, for answers that end,
@@ -606,9 +615,15 @@
   type them as before.
 - **Write mode** (off by default): click the `read-only` badge to enable scale, restart, delete
   (confirmed as set per kind), YAML edits (validated by a server dry run first), cordon/uncordon nodes,
-  debug pods with an ephemeral container (falls back to a Pod Security "restricted" profile), run a CronJob now, suspend/resume (CronJobs, Flux, Argo CronWorkflows), drain nodes, force delete
+  debug pods with an ephemeral container (falls back to a Pod Security "restricted" profile), *Evict* a
+  pod (through the Eviction API, like a drain: refused when a PodDisruptionBudget would be broken,
+  and the refusal names the budget), run a CronJob now, suspend/resume (CronJobs, Flux, Argo CronWorkflows), drain nodes, force delete
   or remove finalizers (only once the delete leaves it stuck terminating: it already was, or still is
-  after 10 seconds), Flux *Reconcile*, Argo CD
+  after 10 seconds), delete a Deployment, StatefulSet, DaemonSet, ReplicaSet or CronJob and keep
+  what it owns (a *Keep ... (orphan them)* box in its Delete dialog, such as *Keep its ReplicaSets and pods* for a
+  Deployment; `kubectl delete --cascade=orphan`: how a StatefulSet's volume claim templates or a selector are changed
+  without stopping its pods; not together with removing finalizers, which would delete what it keeps), an ExternalSecret's *Force
+  refresh* (its `force-sync` annotation: the operator fetches it from its store now), Flux *Reconcile*, Argo CD
   *Refresh*/*Hard refresh*/*Sync*/*Terminate*/*Roll back*, create/apply YAML (a server dry run first, then a confirmation
   showing what each object changes against the cluster: created, changed with its diff, or no change). YAML edits on a detail
   page save only that object: a changed kind, API group, namespace or name is refused, and so are masked Secret values. The
@@ -624,8 +639,8 @@
   `kubectl` line shows `--as`. A protected context still asks for its confirmation (a wait or its name). Reads go as you; write mode and
   the identity are checked again when each request is sent (an identity changed meanwhile sends
   nothing). Actions disabled because your RBAC forbids them stay enabled when the context has an
-  identity. Covered: scale, restart, rollback, delete (force, finalizers), YAML save, the values
-  editor, Apply, cordon/uncordon, drain, CronJob run, suspend/resume, Flux reconcile, Argo CD
+  identity. Covered: scale, restart, rollback, delete (force, finalizers, orphan), YAML save, the values
+  editor, Apply, cordon/uncordon, drain, evict, ExternalSecret refresh, CronJob run, suspend/resume, Flux reconcile, Argo CD
   refresh/sync/terminate/rollback, role bindings. Not covered: Helm, bulk delete from tables, plugins, shells, debug,
   node shell, file copy and ServiceAccount kubeconfigs. Agents never run as it.
 - **Plugins**: your own commands on resources (`~/.config/recouvrance/plugins.yaml`):
