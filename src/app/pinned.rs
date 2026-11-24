@@ -139,31 +139,25 @@ impl AppView {
                 // Set after `connect_many`, which drops one left by an earlier connect.
                 self.after_connect = Some(favorite);
             }
-            Favorite::Application(app) => match at {
-                Some(ix) => {
-                    let obj = ObjectRef {
-                        kind: k8s::argo::application_kind(),
-                        name: app.name,
-                        namespace: Some(app.namespace),
-                        uid: String::new(),
-                    };
+            Favorite::Application(app) => {
+                let kind = k8s::argo::application_kind();
+                if let Some(ix) = at {
+                    let obj = ObjectRef { kind, name: app.name, namespace: Some(app.namespace), uid: String::new() };
                     self.show_detail_in(ix, obj, window, cx);
+                } else {
+                    self.open_elsewhere(context, Ok(kind), app.name, Some(app.namespace), window, cx);
                 }
-                None => {
-                    let kind = Ok(k8s::argo::application_kind());
-                    self.open_elsewhere(context, kind, app.name, Some(app.namespace), window, cx);
+            }
+            Favorite::Object(o) => {
+                let Some(ix) = at else {
+                    // Its kind as that context serves it: looked up there once connected.
+                    return self.open_elsewhere(context, Err(o.kind), o.name, o.namespace, window, cx);
+                };
+                if k8s::find_kind(&self.kinds, &o.kind).is_none() {
+                    return warn(format!("{title}: {} is not served on {context}", o.kind), window, cx);
                 }
-            },
-            Favorite::Object(o) => match at {
-                Some(ix) => {
-                    if k8s::find_kind(&self.kinds, &o.kind).is_none() {
-                        return warn(format!("{title}: {} is not served on {context}", o.kind), window, cx);
-                    }
-                    self.open_object_in(ix, &o.kind, o.name, o.namespace, window, cx);
-                }
-                // Its kind as that context serves it: looked up there once connected.
-                None => self.open_elsewhere(context, Err(o.kind), o.name, o.namespace, window, cx),
-            },
+                self.open_object_in(ix, &o.kind, o.name, o.namespace, window, cx);
+            }
         }
     }
 
