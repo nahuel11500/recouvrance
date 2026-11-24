@@ -73,7 +73,7 @@ context already shown as `name@file` keeps that name when `name` is freed.
 | `initial_view` | `"pods"` | First page after connecting: `pods`, `workloads`, `cluster`. A set of contexts with a saved session (`sessions`) reopens on its own page instead |
 | `sessions` | | Remembered by the app: where each set of contexts was left, newest first, 20 kept: `{ "contexts": ["prod"], "tabs": [{ "page": "list", "kind": "deployments.apps", "namespaces": ["team-a"], "filter": "web" }], "active_tab": 0, "filters": { "pods": "api" } }`. `page` is `list`, `workloads`, `cluster`, `problems`, `timeline`, `helm` or `argo`; `kind` is the kubectl name. The first window reopens the session of the contexts it connects to; a connect where one of them fails (it doesn't answer, or its namespaces don't list) saves nothing over it, and the next connect to that set that reaches them all reopens it again. A value that doesn't read takes its default, an entry that doesn't read is dropped, and a type, namespace or page the clusters no longer have falls back to the default; none of it ever stops the file from loading |
 | `window` | | Remembered by the app: `{ "x": 80, "y": 40, "width": 1500, "height": 920, "maximized": false }`, where the first window opens (centered when that is out of reach of every display). One that doesn't read opens at 1500×920, centered |
-| `metrics_refresh`, `detail_refresh`, `overview_refresh` | 15, 5, 30 | Seconds between refreshes. `metrics_refresh` is the shortest wait between reads of metrics-server: the pods and nodes lists read it again when its next sample is due (up to twice its interval or 5 minutes later), and every `metrics_refresh` when its timestamps say nothing; detail pages refresh their related objects and usage every `metrics_refresh`. The cluster overview's refresh doesn't list the pods again: it lists them once, then follows them with a watch. A page that isn't on screen refreshes nothing: one in the back/forward history, or any page of a window hidden as the desktop reports it (minimized, on another workspace, or on macOS fully covered by other windows; Wayland compositors without the `suspended` state never report it). Its watch of the pods' requests stops after 5 minutes off screen |
+| `metrics_refresh`, `detail_refresh`, `overview_refresh` | 15, 5, 30 | Seconds between refreshes. `metrics_refresh` is the shortest wait between reads of metrics-server: the pods and nodes lists read it again when its next sample is due (up to twice its interval or 5 minutes later), and every `metrics_refresh` when its timestamps say nothing. Detail pages follow their object and its pods with watches; they read usage, charts and alerts every `metrics_refresh`, and what they link to (Services, revisions, events…) when the object or its pods change, or every 4 × `metrics_refresh`. `detail_refresh` is how often a detail page reads an object it can't watch (a role that only grants `get`). The cluster overview's refresh doesn't list the pods again: it lists them once, then follows them with a watch. A page that isn't on screen refreshes nothing: one in the back/forward history, or any page of a window hidden as the desktop reports it (minimized, on another workspace, or on macOS fully covered by other windows; Wayland compositors without the `suspended` state never report it). The cluster overview's watch of the pods' requests stops after 5 minutes off screen |
 | `log_tail_lines`, `log_timestamps` | 1000, true | Log viewer |
 | `kubeconfigs`, `kubeconfig_folders` | | Extra kubeconfig files and watched folders (see above) |
 | `context_files` | | `{ "prod": "~/.kube/team-a.yaml" }`: the file each context name belongs to, so a name several files share stays with the first one, and the `name@file` names the others get stay with theirs (see above); filled in on its own |
@@ -321,6 +321,7 @@ kubeconfig stays in the file and the sidebar says so; remove it there with its c
 Agent rules as code, in the spirit of Claude Code's allow/ask/deny lists:
 
 ```yaml
+version: 2
 agents:
   Claude:
     allow:
@@ -362,10 +363,22 @@ While the file exists, an agent it doesn't name has no rules, so everything it a
 removing an agent's section takes its access away. Deleting an agent on the Agents page removes its
 section too. Before 0.3.0 a new agent got no section until its rules were edited: on the first start
 of 0.3.0 such an agent keeps its rules, and its section is written to the file. Before the GitOps
-verbs, GitOps actions were checked as `patch`: on the first start of the version that added them,
-every rule that names `patch` gets `refresh`, `sync` and `suspend`, and the file is written again,
-once. A verb you take out of a rule after that stays out. If the file changed on disk meanwhile, it
-is not written over: the load fails with the reason, and your edit is loaded (and upgraded) next.
+verbs, GitOps actions were checked as `patch`. `version: 2` at the top says the file's rules use
+them. A file without it (written before them, restored from git, copied from another machine, or
+given with no agents.json) is read as written before them, whatever agents.json says: every rule
+that names `patch` gets `refresh`, `sync` and `suspend` when it is loaded, and the file is written
+again with `version: 2`, once (even when no rule changed). A verb you take out of a rule after that
+stays out. A file without `version` whose rules name `refresh`, `sync` or `suspend` is not loaded
+(the rules in force stay, and the Agents page says to add `version: 2` at the top): no rule could
+name them before, so it was written for them, and upgrading it would give back a verb taken out.
+Write `version: 2` in a file you write by hand, or its `patch` rules cover GitOps actions too. A
+file with a higher `version`, written by a newer Recouvrance, is not loaded either. If the file
+changed on disk meanwhile, it is not written over: the load fails with the reason, and your edit is
+loaded (and upgraded, if it has no `version` either) next.
+If the folder of the file can't be written (managed by another tool), its rules are still loaded,
+upgraded the same way, and the Agents page says why the file wasn't written; while it has no
+`version`, each load upgrades it again, until it is written. Edits on the Agents page try to write
+it too, and fail with the reason rather than being undone at the next load.
 
 Each section is for the agent with that name, so agent names are unique: creating a second agent
 with a taken name is refused, and if two agents already share a name the file is neither loaded nor

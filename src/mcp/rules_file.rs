@@ -2,6 +2,7 @@
 //! `permissions.allow / ask / deny`, with kubectl-like rule strings:
 //!
 //! ```yaml
+//! version: 2
 //! agents:
 //!   Claude:
 //!     allow:
@@ -20,6 +21,9 @@
 //! lists are comma-separated, `*` globs work everywhere, an omitted part means `*`, and `-`
 //! is an empty list (the rule matches nothing until you fill it in). In ask and deny rules,
 //! the context `@protected` stands for the contexts protected in Settings → Contexts.
+//! `version` says which rules the file holds: one without it was written before the GitOps
+//! verbs, and is read as such (see [`apply_upgrading`]), unless a rule names one of them:
+//! the file is then refused, since it can't say which it is (see [`check`]).
 //! When the file exists it is the source of truth: Recouvrance reloads it when it changes,
 //! and edits on the Agents page are written back to it (its comments are not kept).
 
@@ -41,9 +45,19 @@ pub fn path() -> PathBuf {
 #[derive(Serialize, Deserialize, Default, Debug)]
 #[serde(deny_unknown_fields)]
 pub struct RulesFile {
+    /// Which rules the file holds, [`FILE_VERSION`] when this version wrote it. Missing (0)
+    /// or older, its rules are upgraded when loaded, whatever agents.json says: the file
+    /// may be older than agents.json (restored, copied from another machine, or given with
+    /// no agents.json at all).
+    #[serde(default)]
+    pub version: u32,
     #[serde(default)]
     pub agents: BTreeMap<String, AgentRules>,
 }
+
+/// The `version` every rules.yaml written now says: its rules check GitOps actions with
+/// their own verbs.
+pub const FILE_VERSION: u32 = GITOPS_VERBS_VERSION;
 
 #[derive(Serialize, Deserialize, Default, Debug, Clone)]
 #[serde(deny_unknown_fields)]
@@ -308,17 +322,23 @@ pub fn apply_file(file: &RulesFile, agents: &mut Vec<super::Agent>, keep_unnamed
     Ok(())
 }
 
-/// [`apply_file`] for agents.json saved at `version`, upgrading what that version left out:
-/// before 0.3.0 (`SECTIONS_VERSION`) an agent created then had no section until its rules
-/// were edited, so it keeps its rules; before the GitOps verbs (`GITOPS_VERBS_VERSION`)
-/// every rule that names `patch` gets them ([`Policy::add_gitops_verbs`]). Whether the file
-/// must be written again to hold that, once: later loads read it as written.
+/// [`apply_file`], upgrading what older rules left out. With agents.json saved before 0.3.0
+/// (`version` below `SECTIONS_VERSION`) an agent created then had no section until its
+/// rules were edited, so it keeps its rules. Rules from before the GitOps verbs
+/// (`GITOPS_VERBS_VERSION`) get them where they name `patch` ([`Policy::add_gitops_verbs`]):
+/// a section when the file's own `version` is older, whatever agents.json's says (the file
+/// can be older than it), and the rules an unnamed agent keeps when agents.json's is.
+/// Whether the file must be written again to hold that, once: it is then written with
+/// [`FILE_VERSION`], and later loads read it as written. A file older than [`FILE_VERSION`]
+/// is always written again, even when no rule changed, so it is not upgraded on every load.
 pub fn apply_upgrading(file: &RulesFile, agents: &mut Vec<super::Agent>, version: u32) -> Result<bool> {
     let keep_unnamed = version < SECTIONS_VERSION;
     apply_file(file, agents, keep_unnamed)?;
-    let mut rewrite = keep_unnamed && agents.iter().any(|a| !file.agents.contains_key(&a.name));
-    if version < GITOPS_VERBS_VERSION {
-        for agent in agents.iter_mut() {
+    let mut rewrite =
+        file.version < FILE_VERSION || (keep_unnamed && agents.iter().any(|a| !file.agents.contains_key(&a.name)));
+    for agent in agents.iter_mut() {
+        let saved_at = if file.agents.contains_key(&agent.name) { file.version } else { version };
+        if saved_at < GITOPS_VERBS_VERSION {
             rewrite |= agent.policy.add_gitops_verbs();
         }
     }
@@ -334,16 +354,35 @@ pub fn read(path: &Path) -> Result<Option<String>> {
 }
 
 /// Parse and validate the file's text: every rule is checked before anything is applied.
+/// Refused too, so the rules in force stay: a file from a newer version (its rules may mean
+/// what this one can't read), and one older than the GitOps verbs (no `version`) whose
+/// rules name one of them. Before them no rule could, so such a file was written for them
+/// (by a version that wrote no `version`, or by hand): upgrading it would add `sync` back to
+/// an Allow rule it was taken out of.
 pub fn check(text: &str) -> Result<RulesFile> {
     let file: RulesFile = crate::yaml::from_str(text).context("rules.yaml")?;
+    if file.version > FILE_VERSION {
+        bail!(
+            "rules.yaml says `version: {}`: it was written by a newer Recouvrance (this one reads up to {FILE_VERSION})",
+            file.version
+        );
+    }
     for (name, rules) in &file.agents {
-        apply(rules, &mut Policy::default()).with_context(|| format!("agent `{name}`"))?;
+        let mut policy = Policy::default();
+        apply(rules, &mut policy).with_context(|| format!("agent `{name}`"))?;
+        if file.version < GITOPS_VERBS_VERSION && policy.names_gitops_verb() {
+            bail!(
+                "agent `{name}` names refresh, sync or suspend in a file without a version: add `version: {FILE_VERSION}` at the top: this file uses the GitOps verbs"
+            );
+        }
     }
     Ok(file)
 }
 
 pub const HEADER: &str = "# Recouvrance agent rules. Deny wins, then ask, then allow; anything no rule matches is denied.\n\
 # `approved` holds requests you approved in the app: they win over ask, not over deny.\n\
+# `version: 2`: rules written for this version. A file without it is read as written before the\n\
+# GitOps verbs: rules that name patch get refresh, sync and suspend too (one naming them is refused).\n\
 # A rule: VERBS RESOURCES[/NAMES] [-n NAMESPACES] [--context CONTEXTS] [until 2026-11-01]\n\
 # Lists are comma-separated and * globs work everywhere; an omitted part means *, and - means none.\n\
 # Verbs: get list logs reveal exec scale restart patch refresh sync suspend apply delete drain forward (or *).\n\
@@ -366,15 +405,33 @@ pub fn render(agents: &[super::Agent]) -> Result<String> {
         .iter()
         .map(|a| Ok((a.name.clone(), from_policy(&a.policy).with_context(|| format!("agent `{}`", a.name))?)))
         .collect::<Result<_>>()?;
-    Ok(format!("{HEADER}\n{}", crate::yaml::to_string(&RulesFile { agents })?))
+    Ok(format!("{HEADER}\n{}", crate::yaml::to_string(&RulesFile { version: FILE_VERSION, agents })?))
+}
+
+/// Why [`export_over`] refused to write: the file changed on disk since it was loaded.
+#[derive(Debug)]
+pub struct ChangedOnDisk;
+
+impl std::fmt::Display for ChangedOnDisk {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("rules.yaml changed on disk since it was loaded: it is being reloaded, make this change again")
+    }
+}
+
+impl std::error::Error for ChangedOnDisk {}
+
+/// Whether `e`, from [`export_over`], is the file having changed on disk, rather than a
+/// failed write (in a folder you can't write to: a read-only file in a writable one is replaced).
+pub fn changed_on_disk(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<ChangedOnDisk>().is_some()
 }
 
 /// Write the file at `path` for these agents, over `seen`: the text last loaded or written.
-/// Refused when the file changed since (an edit of yours not loaded yet would be lost; it
-/// is loaded next). Returns the text written.
+/// Refused with [`ChangedOnDisk`] when the file changed since (an edit of yours not loaded
+/// yet would be lost; it is loaded next). Returns the text written.
 pub fn export_over(path: &Path, agents: &[super::Agent], seen: Option<&str>) -> Result<String> {
     if read(path)?.as_deref() != seen {
-        bail!("rules.yaml changed on disk since it was loaded: it is being reloaded, make this change again");
+        return Err(ChangedOnDisk.into());
     }
     let text = render(agents)?;
     crate::private_files::write_atomic(path, text.as_bytes())?;
@@ -627,6 +684,13 @@ mod properties {
         })
     }
 
+    /// A file as written before it had a `version`.
+    fn without_version(text: &str) -> String {
+        let marker = format!("\nversion: {FILE_VERSION}\n");
+        assert!(text.contains(&marker), "{text}");
+        text.replacen(&marker, "\n", 1)
+    }
+
     /// The same request with `patch` for a GitOps verb: what rules from before the GitOps
     /// verbs checked.
     fn as_before_gitops_verbs(a: &Access) -> Access {
@@ -775,24 +839,27 @@ mod properties {
 
         /// A file from before the GitOps verbs, loaded by this version, decides a GitOps
         /// action as it decided `patch` on the object, and every other request as before; it
-        /// is written again only when a rule changed. Written back, it loads as written from
-        /// then on: a verb taken out of a rule afterwards stays out.
+        /// is written again (with its version). Written back, it loads as written from
+        /// then on: a verb taken out of a rule afterwards stays out. The file's own `version`
+        /// decides, whatever agents.json's is: a file without it, loaded after agents.json was
+        /// upgraded (restored from git, copied, or with no agents.json), is upgraded all the same.
         #[test]
         fn an_old_file_upgrades_once(
             policy in writable_policy(),
             requests in prop::collection::vec(access(), 1..16),
-            version in 0..GITOPS_VERBS_VERSION,
+            version in 0..=CONFIG_VERSION,
         ) {
             let mut old = policy;
             for r in &mut old.rules {
                 r.verbs.retain(|v| !matches!(v.parse::<Verb>(), Ok(v) if Verb::GITOPS.contains(&v)));
             }
-            let text = render(&[agent("ci", old.clone())]).unwrap();
+            let text = without_version(&render(&[agent("ci", old.clone())]).unwrap());
             let mut agents = vec![agent("ci", Policy::default())];
             let rewrite = apply_upgrading(&check(&text).unwrap(), &mut agents, version).unwrap();
             let upgraded = agents[0].policy.clone();
-            let names_patch = old.rules.iter().any(|r| r.verbs.iter().any(|v| v == "patch"));
-            prop_assert_eq!(rewrite, names_patch, "{}", text);
+            // Written again with its version even when no rule changed, so the next load
+            // doesn't upgrade it again.
+            prop_assert!(rewrite, "{}", text);
             for a in &requests {
                 let before = as_before_gitops_verbs(a);
                 prop_assert_eq!(upgraded.decide(a).mode, old.decide(&before).mode, "{:?}", a);
@@ -804,9 +871,45 @@ mod properties {
                 r.verbs.retain(|v| v != "refresh");
             }
             let text = render(&[agent("ci", edited.clone())]).unwrap();
+            prop_assert_eq!(check(&text).unwrap().version, FILE_VERSION);
             let mut again = vec![agent("ci", Policy::default())];
-            prop_assert!(!apply_upgrading(&check(&text).unwrap(), &mut again, CONFIG_VERSION).unwrap());
+            prop_assert!(!apply_upgrading(&check(&text).unwrap(), &mut again, version).unwrap());
             same_decisions(&edited, &again[0].policy, &requests)?;
+        }
+
+        /// A file older than the GitOps verbs (no `version`, or an older one) whose rules name
+        /// one of them, in any section, is refused rather than upgraded: it was written for
+        /// them, and adding the others to its `patch` rules would widen what it allows. With
+        /// the version it loads as written, upgraded in nothing.
+        #[test]
+        fn an_old_file_naming_a_gitops_verb_is_refused(
+            policy in writable_policy(),
+            extra in rule(),
+            gitops in 0..3usize,
+            section in 0..4usize,
+            version in 0..GITOPS_VERBS_VERSION,
+            requests in prop::collection::vec(access(), 1..16),
+        ) {
+            let mut policy = policy;
+            let effect = [Mode::Allow, Mode::Allow, Mode::Ask, Mode::Deny][section];
+            let mut extra = Rule { effect, approved: section == 1, ..extra };
+            if effect == Mode::Allow {
+                extra.contexts.retain(|c| !is_protected_selector(c));
+            }
+            extra.verbs.push(Verb::GITOPS[gitops].to_string());
+            policy.rules.push(extra);
+            let text = render(&[agent("ci", policy.clone())]).unwrap();
+            let marker = format!("\nversion: {FILE_VERSION}\n");
+            let old = if version == 0 {
+                without_version(&text)
+            } else {
+                text.replacen(&marker, &format!("\nversion: {version}\n"), 1)
+            };
+            let err = check(&old).err().ok_or_else(|| TestCaseError::fail(format!("loaded: {old}")))?;
+            prop_assert!(format!("{err:#}").contains(&format!("add `version: {FILE_VERSION}`")), "{:#}", err);
+            let mut agents = vec![agent("ci", Policy::default())];
+            prop_assert!(!apply_upgrading(&check(&text).unwrap(), &mut agents, version).unwrap());
+            same_decisions(&policy, &agents[0].policy, &requests)?;
         }
 
         /// A verb the rules don't know (a typo such as `refrsh`), or `@protected` in an allow
@@ -823,8 +926,31 @@ mod properties {
         }
     }
 
+    /// A file from a newer version is refused: its rules may mean what this one can't read.
+    #[test]
+    fn a_file_from_a_newer_version_is_refused() {
+        let text = format!("version: {}\nagents:\n  ci:\n    allow: [\"get *\"]\n", FILE_VERSION + 1);
+        let err = check(&text).unwrap_err();
+        assert!(format!("{err:#}").contains("newer Recouvrance"), "{err:#}");
+        assert!(check(&format!("version: {FILE_VERSION}\nagents: {{}}\n")).is_ok());
+    }
+
+    /// The header written in the file, the docs and the module's example say the version
+    /// the file is written with.
+    #[test]
+    fn the_header_and_the_docs_say_the_file_version() {
+        let line = format!("`version: {FILE_VERSION}`");
+        assert!(HEADER.contains(&line), "{HEADER}");
+        let yaml = format!("\nversion: {FILE_VERSION}\nagents:\n");
+        let docs = include_str!("../../docs/configuration.md");
+        assert!(docs.contains(&yaml) && docs.contains(&line));
+        assert!(include_str!("../../docs/agents.md").contains(&line));
+        assert!(include_str!("rules_file.rs").contains(&format!("//! version: {FILE_VERSION}\n")));
+    }
+
     /// The upgrade written back never overwrites an edit saved on disk since the file was
-    /// read: it is refused, and the edit is loaded next (and upgraded then).
+    /// read: it is refused, and the edit is loaded next (and upgraded then, when it has no
+    /// version either).
     #[test]
     fn an_upgrade_never_overwrites_an_edit_on_disk() {
         let dir = crate::mcp::test_dir();
@@ -834,10 +960,20 @@ mod properties {
         let mut agents = vec![agent("ci", Policy::default())];
         assert!(apply_upgrading(&check(old).unwrap(), &mut agents, SECTIONS_VERSION).unwrap());
         assert_eq!(agents[0].policy.rules[0].verbs, ["patch", "refresh", "sync", "suspend"]);
-        let yours = "agents:\n  ci:\n    ask: [\"sync applications.argoproj.io\"]\n";
+        let yours = "agents:\n  ci:\n    ask: [\"patch applications.argoproj.io\"]\n";
         std::fs::write(&path, yours).unwrap();
         assert!(export_over(&path, &agents, Some(old)).is_err());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), yours);
+        // The edit, loaded next with agents.json already upgraded, is upgraded and written once.
+        let mut edited = vec![agent("ci", Policy::default())];
+        assert!(apply_upgrading(&check(yours).unwrap(), &mut edited, CONFIG_VERSION).unwrap());
+        assert_eq!(edited[0].policy.rules[0].effect, Mode::Ask);
+        assert_eq!(edited[0].policy.rules[0].verbs, ["patch", "refresh", "sync", "suspend"]);
+        let written = export_over(&path, &edited, Some(yours)).unwrap();
+        assert!(written.contains(&format!("\nversion: {FILE_VERSION}\n")), "{written}");
+        let mut again = vec![agent("ci", Policy::default())];
+        assert!(!apply_upgrading(&check(&written).unwrap(), &mut again, CONFIG_VERSION).unwrap());
+        assert_eq!(again[0].policy.rules, edited[0].policy.rules);
         // Unchanged since it was read, the file is written once, and then read as written.
         std::fs::write(&path, old).unwrap();
         let written = export_over(&path, &agents, Some(old)).unwrap();
@@ -845,6 +981,40 @@ mod properties {
         assert!(!apply_upgrading(&check(&written).unwrap(), &mut again, CONFIG_VERSION).unwrap());
         assert_eq!(again[0].policy.rules, agents[0].policy.rules);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// An upgrade that can't be written (its folder is read-only) is told apart from an edit on
+    /// disk: the first is applied in memory all the same, the second waits for the edit.
+    #[cfg(unix)]
+    #[test]
+    fn an_unwritable_file_is_not_an_edit_on_disk() {
+        use std::os::unix::fs::PermissionsExt as _;
+        /// Gives the folder its permissions back and removes it, whatever the test does.
+        struct Writable(PathBuf);
+        impl Drop for Writable {
+            fn drop(&mut self) {
+                let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let dir = crate::mcp::test_dir();
+        let _guard = Writable(dir.clone());
+        let path = dir.join("rules.yaml");
+        let old = "agents:\n  ci:\n    allow: [\"patch applications.argoproj.io\"]\n";
+        std::fs::write(&path, old).unwrap();
+        let agents = vec![agent("ci", Policy::default())];
+        std::fs::write(&path, "# yours\n").unwrap();
+        let edited = export_over(&path, &agents, Some(old)).unwrap_err();
+        assert!(changed_on_disk(&edited) && changed_on_disk(&edited.context("upgrading")));
+        std::fs::write(&path, old).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        // Root writes anyway: nothing to check then.
+        if std::fs::write(dir.join("probe"), "").is_ok() {
+            return;
+        }
+        let e = export_over(&path, &agents, Some(old)).unwrap_err();
+        assert!(!changed_on_disk(&e), "{e:#}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), old);
     }
 
     /// An edit saved in an editor and not loaded yet is never overwritten by an edit made

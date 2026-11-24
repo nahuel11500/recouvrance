@@ -442,7 +442,9 @@ fn a_pod_s_network_policies() {
 fn long_relations_are_capped() {
     let node = json!({ "metadata": { "name": "n1", "uid": "n1" } });
     let related = Related {
-        pods: (0..SHOWN_AT_MOST + 7).map(|i| json!({ "metadata": meta("shop", &format!("p{i:03}")) })).collect(),
+        pods: std::sync::Arc::new(
+            (0..SHOWN_AT_MOST + 7).map(|i| json!({ "metadata": meta("shop", &format!("p{i:03}")) })).collect(),
+        ),
         ..Default::default()
     };
     let map = map_of(&kind("", "Node"), &node, &related, &none());
@@ -457,7 +459,7 @@ fn long_relations_are_capped() {
 fn a_service_s_map() {
     let svc = json!({ "metadata": { "namespace": "shop", "name": "web", "uid": "s1" }, "spec": { "selector": { "app": "web" } } });
     let related = Related {
-        pods: vec![json!({ "metadata": meta("shop", "web-1"), "status": { "phase": "Running" } })],
+        pods: std::sync::Arc::new(vec![json!({ "metadata": meta("shop", "web-1"), "status": { "phase": "Running" } })]),
         ..Default::default()
     };
     let route =
@@ -474,7 +476,8 @@ fn a_service_s_map() {
 fn a_service_account_s_map() {
     let sa = json!({ "metadata": { "namespace": "shop", "name": "runner", "uid": "a1" },
         "secrets": [{ "name": "runner-token" }], "imagePullSecrets": [{ "name": "registry" }] });
-    let related = Related { pods: vec![json!({ "metadata": meta("shop", "web-1") })], ..Default::default() };
+    let related =
+        Related { pods: std::sync::Arc::new(vec![json!({ "metadata": meta("shop", "web-1") })]), ..Default::default() };
     let workload = |name: &str, account: &str| json!({ "metadata": meta("shop", name), "spec": { "template": { "spec": { "serviceAccountName": account } } } });
     let cron = json!({ "metadata": meta("shop", "report"),
         "spec": { "jobTemplate": { "spec": { "template": { "spec": { "serviceAccount": "runner" } } } } } });
@@ -494,7 +497,8 @@ fn a_service_account_s_map() {
 fn a_claim_and_its_volume() {
     let pvc = json!({ "metadata": { "namespace": "db", "name": "data", "uid": "c1" },
         "spec": { "volumeName": "pv-1", "storageClassName": "fast" } });
-    let related = Related { pods: vec![json!({ "metadata": meta("db", "pg-1") })], ..Default::default() };
+    let related =
+        Related { pods: std::sync::Arc::new(vec![json!({ "metadata": meta("db", "pg-1") })]), ..Default::default() };
     let map = map_of(&kind("", "PersistentVolumeClaim"), &pvc, &related, &none());
     let uses: Vec<(&str, Option<&str>)> =
         map[0].items.iter().map(|i| (i.kind.as_str(), i.namespace.as_deref())).collect();

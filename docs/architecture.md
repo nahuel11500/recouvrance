@@ -81,6 +81,18 @@ revisions come lean from the cache too. kube-apiserver keeps no cache of events 
 Warning events are read 5,000 at a time and added up by reason as each page streams in
 (`warning_reasons`): only the reasons are held, however many events the cluster keeps.
 
+A detail page follows its object the same way (`k8s::follow`): a list, then a watch, with a field
+selector on its name, which the API server serves from its watch cache. The pods it lists are
+followed by their label or field selector (a node's by `spec.nodeName`), whole but without their
+managedFields. A change shows about a second after it happens, and an idle page asks nothing for
+them but a watch opened again every few minutes. Its watches stop while the page is in the
+back/forward history and hold back what they send while its window is hidden. Usage
+(metrics-server, the kubelet) and the charts and alerts (Prometheus) are read every
+`metrics_refresh`; what the page links to (Services, revisions, events…) again when the object or
+its pods change, and at least every four turns. An object that can't be watched but can be
+listed is listed every `detail_refresh`; one that can only be read (a role that only grants `get`)
+is read every `detail_refresh`.
+
 ## Safety model
 
 - **Read-only by default.** Write actions ask to enable write mode first.
