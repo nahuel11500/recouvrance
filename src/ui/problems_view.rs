@@ -324,7 +324,19 @@ fn cells(theme: &component::Theme, context: Option<&str>, p: &Problem, color: Hs
         .border_color(theme.border)
         .child(div().size(px(8.)).flex_shrink_0().rounded_full().bg(color))
         .when_some(context, |d, ctx| {
-            d.child(side(150., 70.).text_sm().text_color(theme.muted_foreground).child(ctx.to_string()))
+            // The short name, as everywhere on screen; a shortened one shows in full on hover.
+            let short = k8s::short_names::short_name(ctx);
+            let cell = side(150., 70.).text_sm().text_color(theme.muted_foreground);
+            if short == ctx {
+                d.child(cell.child(short))
+            } else {
+                let full = SharedString::from(ctx.to_string());
+                d.child(
+                    cell.id("problem-context")
+                        .tooltip(move |w, cx| component::tooltip::Tooltip::new(full.clone()).build(w, cx))
+                        .child(short),
+                )
+            }
         })
         .child(side(160., 80.).text_xs().text_color(theme.muted_foreground).child(p.label.clone()))
         .child(

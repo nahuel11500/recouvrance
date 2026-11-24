@@ -70,6 +70,13 @@ managedFields and the rest skipped (`list_whole`), and so does a list the Timeli
 from such a row reads the object's uid first, and leaves alone an object newer than the row (one
 re-created under the same name since the list).
 
+A connect doesn't wait for its slowest cluster (`src/app/reach.rs`). Each context connects on its
+own, reading its discovery and its namespace list together; the first rows come once one cluster
+has answered and the others have had 2 more seconds, and a cluster that answers later joins the
+list then, and the page on screen. The session isn't saved while part of the set is missing: once
+the last cluster is in and none failed, it is saved again. When the list shown first is the Pods of every namespace, it starts as soon as each
+client is built, alongside discovery, and the list takes it over.
+
 Rows keep only the metadata they need; full objects are fetched only when a custom column needs
 them. Responses are gzip-compressed. The usage bars and the cluster overview take the pods'
 requests and limits from one list of the pods, then follow them with a watch
@@ -79,10 +86,15 @@ go or are resized in place change them without another list. A page off screen f
 stops its watch and lists again once back. On a cluster with about 20,800 pods, the first rows
 show after 0.7 s and all of them after 1.4 s ([measured](COMPARISON.md#measured)).
 
+The agents' `list_resources`, `get_events` and `search` across every namespace with no selector,
+and the search box's name index, read the same way (`list_light`): a small list with its objects'
+metadata, a big one from its cells in the API server's cache, one namespace at a time. `search`
+lists its kinds at once rather than one after the other.
+
 The Problems scan reads the big kinds from their cells too (`list_light`). What its checks need
 of whole objects (Services, Ingresses and HTTP routes, the pods a Service selects, the workloads of
 a namespace with an idle Service, external-secrets.io's objects) is parsed as each list streams in,
-keeping only the fields the checks use; of the workloads, only those scaled to 0 are kept. A
+keeping only the fields the checks use; of the workloads, only their replicas and pod templates' labels are kept. A
 Service's verdict is kept by its uid and resourceVersion for 10 minutes, so the same idle Services
 don't cost a pod list each on every scan. A scan asked for findings from a given time on (Refresh,
 an agent's `max_age_seconds`) judges again the Services judged before it.

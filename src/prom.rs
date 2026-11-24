@@ -151,15 +151,7 @@ pub async fn range_by(
             ("step", &step_secs.to_string()),
         ]);
         q.insert(0, '?');
-        let text = match proxy_path(&target)? {
-            Some(path) => {
-                let req = http::Request::get(format!("{path}/api/v1/query_range{q}")).body(Vec::new())?;
-                client.request_text(req).await?
-            }
-            None => {
-                crate::assistant::get_url(format!("{}/api/v1/query_range{q}", target.trim_end_matches('/'))).await?
-            }
-        };
+        let text = get_text(client, &target, format!("/api/v1/query_range{q}")).await?;
         let v: serde_json::Value = serde_json::from_str(&text)?;
         if v["status"] != "success" {
             bail!("prometheus: {}", v["error"].as_str().unwrap_or("query failed"));
@@ -177,6 +169,55 @@ pub async fn range_by(
         Ok(points.into_iter().map(|(k, p)| (k, sum_series(p))).collect())
     })
     .await
+}
+
+/// How long an instant query may take: a scan waits for it.
+const INSTANT_WAIT: Duration = Duration::from_secs(10);
+
+/// One series of an instant query: its labels and its value.
+pub type Sample = (BTreeMap<String, String>, f64);
+
+/// An instant query (`/api/v1/query`): each series' labels and value now.
+pub async fn instant(client: Client, target: String, promql: String) -> Result<Vec<Sample>> {
+    run(async move {
+        let q = form_urlencoded(&[("query", &promql)]);
+        let read = get_text(client, &target, format!("/api/v1/query?{q}"));
+        let text = tokio::time::timeout(INSTANT_WAIT, read).await.map_err(|_| anyhow::anyhow!("timed out"))??;
+        parse_vector(&text)
+    })
+    .await
+}
+
+/// GET `path` (with its query) from the target, through the API server or straight.
+pub(crate) async fn get_text(client: Client, target: &str, path: String) -> Result<String> {
+    match proxy_path(target)? {
+        Some(base) => {
+            let req = http::Request::get(format!("{base}{path}")).body(Vec::new())?;
+            Ok(client.request_text(req).await?)
+        }
+        None => crate::assistant::get_url(format!("{}{path}", target.trim_end_matches('/'))).await,
+    }
+}
+
+/// An instant query's answer, when it is a vector.
+fn parse_vector(text: &str) -> Result<Vec<Sample>> {
+    let v: serde_json::Value = serde_json::from_str(text)?;
+    if v["status"] != "success" {
+        bail!("prometheus: {}", v["error"].as_str().unwrap_or("query failed"));
+    }
+    Ok(v["data"]["result"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|r| {
+            let labels = r["metric"]
+                .as_object()?
+                .iter()
+                .filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_string())))
+                .collect();
+            Some((labels, r["value"][1].as_str()?.parse().ok()?))
+        })
+        .collect())
 }
 
 /// CPU (millicores) and memory (bytes) of each container of a pod over the last `minutes`.
@@ -417,6 +458,21 @@ mod target_tests {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn reads_an_instant_vector() {
+        let text = r#"{"status":"success","data":{"resultType":"vector","result":[
+            {"metric":{"namespace":"a","persistentvolumeclaim":"data"},"value":[1700000000.1,"0.93"]},
+            {"metric":{},"value":[1700000000.1,"1"]},
+            {"metric":{"namespace":"b"},"value":[1700000000.1,"not a number"]}
+        ]}}"#;
+        let v = super::parse_vector(text).unwrap();
+        assert_eq!(v.len(), 2);
+        assert_eq!((v[0].0["persistentvolumeclaim"].as_str(), v[0].1), ("data", 0.93));
+        assert!(v[1].0.is_empty());
+        let failed = super::parse_vector(r#"{"status":"error","error":"bad query"}"#).unwrap_err();
+        assert_eq!(failed.to_string(), "prometheus: bad query");
+    }
+
     #[test]
     fn usage_queries_pick_the_containers_asked() {
         let (cpu, mem) = super::usage_queries(r#"node="n1","#, 30);

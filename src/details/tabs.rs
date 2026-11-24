@@ -199,6 +199,7 @@ impl DetailPanel {
                                 .xsmall()
                                 .ghost()
                                 .icon(Lucide::Settings2)
+                                .accessibility_label("Forward with options")
                                 .tooltip("Forward with options: local port, address, https, open in browser")
                                 .on_click(
                                     cx.listener(move |this, _, w, cx| this.pf_options_dialog(opts.clone(), w, cx)),
@@ -559,6 +560,7 @@ impl Render for DetailPanel {
                     .small()
                     .ghost()
                     .icon(Lucide::FileDown)
+                    .accessibility_label("Save the YAML")
                     .tooltip("Save the YAML to ~/Downloads (Secret values stay masked unless revealed)")
                     .on_click(cx.listener(|this, _, window, cx| this.download_yaml(window, cx))),
             )
@@ -591,6 +593,11 @@ impl Render for DetailPanel {
                                     } else {
                                         Icon::new(Lucide::Star)
                                     })
+                                    .accessibility_label(if starred {
+                                        "Remove from favorites"
+                                    } else {
+                                        "Add to favorites"
+                                    })
                                     .tooltip(crate::app::with_keys(if starred {
                                         "Remove from favorites ({*})"
                                     } else {
@@ -598,9 +605,16 @@ impl Render for DetailPanel {
                                     }))
                                     .on_click(move |_, _, cx| favs.update(cx, |f, cx| f.toggle(fav.clone(), cx)))
                             })
-                            .child(Button::new("copy-name").xsmall().ghost().icon(Lucide::Copy).on_click(
-                                move |_, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(full_name.clone())),
-                            ))
+                            .child(
+                                Button::new("copy-name")
+                                    .xsmall()
+                                    .ghost()
+                                    .icon(Lucide::Copy)
+                                    .accessibility_label("Copy the name")
+                                    .on_click(move |_, _, cx| {
+                                        cx.write_to_clipboard(ClipboardItem::new_string(full_name.clone()));
+                                    }),
+                            )
                             .when_some(created, |d, t| {
                                 d.child(
                                     h_flex()

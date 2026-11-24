@@ -63,12 +63,17 @@ impl ResourceTable {
         let visible = std::mem::take(&mut self.visible);
         let rows = &self.rows;
         let unit = unit_of(&normalized(self.header(col)));
+        // Contexts sort by the name shown: a long cloud id would order them by region and account.
+        let shown: Vec<String> = match col {
+            Col::Context => self.contexts.iter().map(String::as_str).map(crate::k8s::short_names::short_name).collect(),
+            _ => Vec::new(),
+        };
         let key = |i: usize| -> SortKey<'_> {
             let r = &rows[i];
             let ctx = self.row_ctx[i];
             match col {
                 Col::Check => SortKey::Num(if self.is_marked(ctx, &r.uid) { 0.0 } else { 1.0 }),
-                Col::Context => SortKey::Text(self.contexts.get(ctx).map_or_default(String::as_str)),
+                Col::Context => SortKey::Text(shown.get(ctx).map_or_default(String::as_str)),
                 Col::Namespace => SortKey::Text(r.namespace.as_deref().unwrap_or_default()),
                 Col::Cpu => SortKey::Num(self.usage_of(ctx, r).map_or(-1.0, |u| u.0)),
                 Col::Memory => SortKey::Num(self.usage_of(ctx, r).map_or(-1.0, |u| u.1)),

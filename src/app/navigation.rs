@@ -201,6 +201,7 @@ impl AppView {
                             .xsmall()
                             .ghost()
                             .icon(IconName::Close)
+                            .accessibility_label("Close tab")
                             .tooltip(with_keys("Close tab ({secondary-w})"))
                             .on_click(cx.listener(move |this, _, w, cx| {
                                 this.close_tab(i, w, cx);
@@ -214,6 +215,7 @@ impl AppView {
                     .xsmall()
                     .ghost()
                     .icon(Lucide::Plus)
+                    .accessibility_label("New tab")
                     .tooltip(with_keys("New tab ({secondary-t})"))
                     .on_click(cx.listener(|this, _, w, cx| this.new_tab(None, w, cx))),
             );

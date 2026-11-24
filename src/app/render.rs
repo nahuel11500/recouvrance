@@ -22,6 +22,7 @@ use super::{
     ZoomWindow, set_theme, with_keys,
 };
 use crate::favorites::Favorite;
+use crate::ui::a11y::Control as _;
 
 impl Render for AppView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -136,6 +137,7 @@ impl AppView {
                     .ghost()
                     .small()
                     .icon(if self.sidebar_hidden { Lucide::PanelLeftOpen } else { Lucide::PanelLeftClose })
+                    .accessibility_label(if self.sidebar_hidden { "Show the sidebar" } else { "Hide the sidebar" })
                     .tooltip(with_keys("Show/hide the sidebar ({secondary-b})"))
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.sidebar_hidden = !this.sidebar_hidden;
@@ -176,6 +178,7 @@ impl AppView {
                         .ghost()
                         .small()
                         .icon(Lucide::RefreshCw)
+                        .accessibility_label("Refresh")
                         .tooltip(with_keys("Refresh ({f5|secondary-r})"))
                         .on_click(cx.listener(|this, _, window, cx| this.refresh_page(window, cx))),
                 )
@@ -190,6 +193,7 @@ impl AppView {
                     .ghost()
                     .small()
                     .icon(Lucide::Sparkles)
+                    .accessibility_label("Ask the assistant about what is on screen")
                     .selected(self.docked_assistant().is_some())
                     .tooltip(with_keys("Ask the assistant about what is on screen ({secondary-j})"))
                     .on_click(cx.listener(|this, _, window, cx| this.toggle_assistant(window, cx))),
@@ -199,6 +203,7 @@ impl AppView {
                     .ghost()
                     .small()
                     .icon(Lucide::Plus)
+                    .accessibility_label("Create / apply YAML")
                     .tooltip("Create / apply YAML")
                     .on_click(cx.listener(|this, _, window, cx| this.open_apply(window, cx))),
             )
@@ -207,6 +212,7 @@ impl AppView {
                     .ghost()
                     .small()
                     .icon(Lucide::SquareTerminal)
+                    .accessibility_label("Terminal")
                     .tooltip("Terminal (kubectl set to this context)")
                     .on_click(cx.listener(|this, _, window, cx| this.open_terminal(window, cx))),
             )
@@ -215,6 +221,7 @@ impl AppView {
                     .ghost()
                     .small()
                     .icon(Lucide::Settings)
+                    .accessibility_label("Settings")
                     .tooltip("Settings")
                     .on_click(cx.listener(|this, _, _, cx| this.navigate(Route::Settings, cx))),
             )
@@ -223,6 +230,8 @@ impl AppView {
                     .ghost()
                     .small()
                     .icon(if cx.theme().is_dark() { IconName::Sun } else { IconName::Moon })
+                    .accessibility_label(theme_toggle_name(cx.theme().is_dark()))
+                    .tooltip(theme_toggle_name(cx.theme().is_dark()))
                     .on_click(|_, window, cx| toggle_theme(window, cx)),
             )
             .child(
@@ -230,6 +239,7 @@ impl AppView {
                     .ghost()
                     .small()
                     .icon(Lucide::Keyboard)
+                    .accessibility_label("Keyboard shortcuts")
                     .tooltip(with_keys("Keyboard shortcuts ({?})"))
                     .on_click(|_, window, cx| super::shortcuts::open_panel(window, cx)),
             )
@@ -245,16 +255,22 @@ impl AppView {
 
     /// The cluster picker's button: a dot per cluster, a lock when one is protected.
     fn ctx_trigger(&self, theme: &Theme) -> Button {
-        let names: Vec<String> = self.clusters.iter().map(|c| c.0.clone()).collect();
+        // While none of the set is connected, the set it is connecting to (or failed to).
+        let names: Vec<String> = if self.clusters.is_empty() {
+            self.conn.iter().map(|(c, _)| c.clone()).collect()
+        } else {
+            self.clusters.iter().map(|c| c.0.clone()).collect()
+        };
         let dots: Vec<Hsla> =
             names.iter().map(|n| crate::settings::context_color(n).map_or(theme.blue, |c| rgb(c).into())).collect();
         let protected = names.iter().any(|n| crate::settings::is_protected(n));
         let label = match names.len() {
             0 => "Choose a cluster".to_string(),
-            1 => names[0].clone(),
+            1 => crate::k8s::short_names::short_name(&names[0]),
             n => format!("{n} clusters"),
         };
-        Button::new("ctx-trigger").outline().child(
+        // The full names, which the label shortens or counts.
+        Button::new("ctx-trigger").outline().when(!names.is_empty(), |b| b.tooltip(names.join("\n"))).child(
             h_flex()
                 .gap_2()
                 .child(
@@ -306,7 +322,7 @@ impl AppView {
     }
 
     /// The resource list: its bar (kind, count, filter, actions), status and table.
-    fn render_list(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_list(&self, cx: &mut Context<Self>) -> AnyElement {
         let (total, shown) = {
             let t = self.table.read(cx).delegate();
             (t.total(), t.rows_count_visible())
@@ -352,6 +368,7 @@ impl AppView {
                     .ghost()
                     .small()
                     .icon(Lucide::RefreshCw)
+                    .accessibility_label("Reload the list")
                     .tooltip("Reload the list")
                     // Lists again, as F5 does: `restart_watch` would bring the kept list back.
                     .on_click(cx.listener(|this, _, _, cx| this.reload_watch(cx))),
@@ -361,6 +378,7 @@ impl AppView {
                     .ghost()
                     .small()
                     .icon(Lucide::FileSpreadsheet)
+                    .accessibility_label("Export the rows shown to CSV")
                     .tooltip("Export the rows shown to CSV (~/Downloads)")
                     .on_click(cx.listener(|this, _, window, cx| this.export_csv(window, cx))),
             )
@@ -373,20 +391,27 @@ impl AppView {
                     .on_click(cx.listener(|this, _, window, cx| this.save_view_dialog(window, cx))),
             )
             .child(self.render_columns_menu(cx));
+        // None of the set connected yet: each context's state, not an empty table.
+        if self.nothing_connected() {
+            return v_flex().size_full().child(view_bar).child(self.render_connect(cx)).into_any_element();
+        }
+        let banner = self.render_conn_banner(cx);
         v_flex()
             .size_full()
             .child(view_bar)
+            .children(banner)
             .when_some(self.status_line(), |d, s| {
                 d.child(div().px_3().py_1().text_sm().text_color(cx.theme().muted_foreground).child(s))
             })
             .children(self.render_selection_bar(cx))
             // Row presses are recorded by the table itself (see `ResourceTable::render_tr`).
             .child(div().flex_1().min_h_0().child(DataTable::new(&self.table).small().stripe(false).bordered(false)))
+            .into_any_element()
     }
 
     fn render_content(&self, cx: &mut Context<Self>) -> AnyElement {
         match self.route() {
-            Route::Resources(_) => self.render_list(cx).into_any_element(),
+            Route::Resources(_) => self.render_list(cx),
             Route::Detail(d) => d.clone().into_any_element(),
             Route::Workloads(d) => d.clone().into_any_element(),
             Route::Cluster(d) => d.clone().into_any_element(),
@@ -536,6 +561,8 @@ fn search_field(theme: &Theme, hint: String) -> Stateful<Div> {
         .bg(theme.secondary)
         .cursor_pointer()
         .hover(|s| s.bg(theme.list_hover))
+        .control(Role::Button, "Jump to anything", theme.ring)
+        .aria_keyshortcuts(hint.clone())
         .text_sm()
         .text_color(theme.muted_foreground)
         .child(Icon::new(Lucide::Search).size_4().flex_shrink_0())
@@ -594,6 +621,11 @@ fn toggle_write_mode(window: &mut Window, cx: &mut App) {
                 true
             })
     });
+}
+
+/// What the theme button does, from the theme on screen.
+fn theme_toggle_name(dark: bool) -> &'static str {
+    if dark { "Switch to the light theme" } else { "Switch to the dark theme" }
 }
 
 fn toggle_theme(window: &mut Window, cx: &mut App) {

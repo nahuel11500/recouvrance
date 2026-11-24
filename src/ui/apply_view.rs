@@ -888,7 +888,7 @@ impl Render for ApplyView {
                         .ghost()
                         .icon(Lucide::FolderOpen)
                         .label("Your templates folder")
-                        .tooltip(crate::templates::folder().display().to_string())
+                        .tooltip(crate::paths::tilde(&crate::templates::folder()))
                         .on_click(|_, _, _| {
                             if let Ok(dir) = crate::templates::ensure_folder() {
                                 crate::forwards::spawn_reaped(std::process::Command::new("xdg-open").arg(dir));

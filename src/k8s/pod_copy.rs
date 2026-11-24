@@ -323,7 +323,8 @@ async fn remove(copy: PodCopy) -> Result<()> {
 async fn remove_named(client: &Client, ns: &str, name: &str, uid: Option<String>) -> Result<()> {
     let mut tries = 0;
     loop {
-        let deleted = super::delete(client.clone(), pod_kind(), Some(ns.into()), name.into(), uid.clone(), false).await;
+        let deleted =
+            super::delete(client.clone(), pod_kind(), Some(ns.into()), name.into(), uid.clone(), false, None).await;
         match deleted {
             Err(e) if transient(&e) && tries < 4 => {
                 tries += 1;

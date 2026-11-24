@@ -582,21 +582,31 @@ async fn cells_list(client: &Client, url: &str, namespace: Option<&str>) -> Resu
 /// A table's columns and its rows from their cells alone (`includeObject=None`).
 fn cells_rows(page: ServerTable, namespace: Option<&str>) -> (Vec<ColumnDef>, Vec<Arc<Row>>) {
     let column = |name: &str| page.column_definitions.iter().position(|d| d.name == name);
-    let (age, status) = (column("Age"), column("Status"));
-    let rows = page.rows.into_iter().filter_map(|r| cells_row(r, namespace, age, status)).collect();
+    // The name is the Name column: first in most tables, but last in the core Events one,
+    // whose first column is Last Seen.
+    let columns = Columns { name: column("Name").unwrap_or(0), age: column("Age"), status: column("Status") };
+    let rows = page.rows.into_iter().filter_map(|r| cells_row(r, namespace, &columns)).collect();
     (page.column_definitions, rows)
 }
 
-/// A row from its cells alone (`includeObject=None`): the name is the first cell, and
+/// Where a table's Name, Age and Status cells are, for `cells_row`.
+struct Columns {
+    name: usize,
+    age: Option<usize>,
+    status: Option<usize>,
+}
+
+/// A row from its cells alone (`includeObject=None`): the name is its Name cell, and
 /// namespace/name stands in for the uid until an event or a list with the metadata brings
 /// it. Its creation time is read from its Age (kubectl rounds it down), and a Status of
 /// `Terminating` (a pod's) says it is being deleted.
-fn cells_row(row: ServerRow, namespace: Option<&str>, age: Option<usize>, status: Option<usize>) -> Option<Arc<Row>> {
-    let name = row.cells.first()?.as_str()?.to_string();
-    let created = age
+fn cells_row(row: ServerRow, namespace: Option<&str>, columns: &Columns) -> Option<Arc<Row>> {
+    let name = row.cells.get(columns.name)?.as_str()?.to_string();
+    let created = columns
+        .age
         .and_then(|i| row.cells.get(i)?.as_str().and_then(age_seconds))
         .and_then(|s| jiff::Timestamp::now().checked_sub(jiff::SignedDuration::from_secs(s)).ok());
-    let deleting = status.and_then(|i| row.cells.get(i)?.as_str()) == Some("Terminating");
+    let deleting = columns.status.and_then(|i| row.cells.get(i)?.as_str()) == Some("Terminating");
     Some(Arc::new(Row {
         uid: format!("{}/{name}", namespace.unwrap_or_default()),
         name,
@@ -1253,7 +1263,12 @@ pub(super) fn truncate(s: &str, max: usize) -> &str {
     }
 }
 
-/// One-shot list in Table form, for agents.
+/// One-shot list in Table form, for agents. A namespaced kind in every namespace with no
+/// selector reads like the window's checks (`list_light`): a small list with its objects'
+/// metadata, a big one from kubectl's cells in the API server's cache, one namespace at a
+/// time (rows `is_partial`). Paging every object's metadata from etcd, as the other lists
+/// do, is 160 MB and 8 to 17 s for the pods of a cluster with 23k of them, to show the
+/// first `max_rows`.
 pub async fn list_table(
     client: Client,
     kind: Kind,
@@ -1261,6 +1276,9 @@ pub async fn list_table(
     label_selector: Option<String>,
     field_selector: Option<String>,
 ) -> Result<(Vec<ColumnDef>, Vec<Arc<Row>>)> {
+    if kind.namespaced && namespace.is_none() && label_selector.is_none() && field_selector.is_none() {
+        return list_light(client, kind, None, true, None).await;
+    }
     run(async move {
         let ns = if kind.namespaced { namespace.as_deref() } else { None };
         let url = DynamicObject::url_path(&kind.ar, ns);
@@ -1296,6 +1314,20 @@ pub async fn list_labels(
         Ok(list.items.into_iter().map(|o| (o.metadata.namespace, o.metadata.labels.unwrap_or_default())).collect())
     })
     .await
+}
+
+/// Names (and namespaces) of every object of a kind in every namespace, for a search (the
+/// agents' `search`, the window's search box): from kubectl's cells in the API server's
+/// cache once the list is big, never one unpaged read of every object's metadata from etcd
+/// (on a cluster with 23k pods, 160 MB against 6 MB). A namespaced kind goes through
+/// `list_light`, so each row keeps its namespace; a cluster-scoped one is one request.
+pub async fn search_names(client: Client, kind: Kind) -> Result<Vec<(Option<String>, String)>> {
+    let (_, rows) = if kind.namespaced {
+        list_light(client, kind, None, true, None).await?
+    } else {
+        list_cells(client, kind, None, None).await?
+    };
+    Ok(rows.iter().map(|r| (r.namespace.clone(), r.name.clone())).collect())
 }
 
 /// Names (and namespaces) of every object of a kind, in `namespace` or everywhere,
@@ -1897,5 +1929,45 @@ mod fast_list_tests {
         assert_eq!(asked.len(), 1 + 4 + 1, "{asked:?}");
         assert!(asked.iter().all(|q| q.contains("includeObject=None")), "{asked:?}");
         assert!(asked[0].contains("resourceVersion=0") && asked[5].starts_with("/api/v1/namespaces/b/pods?"));
+    }
+
+    /// Agents' lists of every namespace and searches read like the window's checks: a first
+    /// page, then each namespace's cells from the API server's cache. Never every pod's
+    /// metadata, paged from etcd (`continue=`) or whole: on a big cluster that is 160 MB to
+    /// show the first rows. A selector, which the cells don't take, keeps the paged list.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn agents_wide_reads_come_from_cells() {
+        let big = Big::open();
+        let client = kube::Client::new(big.clone(), "default");
+        let pod = Kind::fake("", "Pod");
+        let named = |ns: &str, name: &str| (Some(ns.to_string()), name.to_string());
+        let want = [named("a", "api"), named("a", "web"), named("b", "db")];
+        let (_, rows) = super::list_table(client.clone(), pod.clone(), None, None, None).await.unwrap();
+        let listed: Vec<_> = rows.iter().map(|r| (r.namespace.clone(), r.name.clone())).collect();
+        assert_eq!(listed, want);
+        assert!(rows.iter().all(|r| r.is_partial()));
+        assert_eq!(super::search_names(client.clone(), pod.clone()).await.unwrap(), want);
+        let asked = big.asked();
+        assert!(!asked.iter().any(|q| q.contains("continue=")), "{asked:?}");
+        assert!(!asked_for_metadata(&big), "{asked:?}");
+        let (_, rows) = super::list_table(client, pod, None, Some("app=web".into()), None).await.unwrap();
+        assert!(rows.iter().all(|r| !r.is_partial()));
+        assert!(big.asked().iter().any(|q| q.contains("continue=")));
+    }
+
+    /// A row from its cells takes its name from the Name column, wherever it is: the core
+    /// Events table puts it last, after Last Seen (rules would else be checked against "5m").
+    #[test]
+    fn a_row_from_its_cells_is_named_by_its_name_column() {
+        let page: super::ServerTable = serde_json::from_str(
+            &json!({
+                "columnDefinitions": [{"name": "Last Seen"}, {"name": "Type"}, {"name": "Name"}],
+                "rows": [{"cells": ["5m", "Warning", "web.17f3"]}]})
+            .to_string(),
+        )
+        .unwrap();
+        let (_, rows) = super::cells_rows(page, Some("a"));
+        assert_eq!(rows[0].name, "web.17f3");
+        assert_eq!(rows[0].uid, "a/web.17f3");
     }
 }

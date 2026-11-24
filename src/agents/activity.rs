@@ -726,11 +726,12 @@ impl AgentsView {
                     })
                     .child(div().text_lg().font_weight(FontWeight::BOLD).child("Agent activity")),
             )
-            .child(div().text_sm().text_color(theme.muted_foreground).child(
+            .child(div().text_sm().text_color(theme.muted_foreground).child(format!(
                 "Every call, newest first, grouped by task (one client's session, or calls less than 10 minutes apart). \
                  Repeats on the same target fold into one line: click to expand. Search takes client:, tool:, ctx:, \
-                 ns: and kind: terms, is:write and is:reveal. Also saved to ~/.local/share/recouvrance/audit.jsonl.",
-            ))
+                 ns: and kind: terms, is:write and is:reveal. Also saved to {}.",
+                crate::paths::shown_data("audit.jsonl")
+            )))
             .children(audit_error)
             .child(
                 h_flex()

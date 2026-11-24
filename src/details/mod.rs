@@ -197,6 +197,9 @@ pub struct DetailPanel {
     /// An Application's diff as Argo CD renders it from git (read on a click), and its read.
     argo_git: crate::overview::ArgoGitDiff,
     argo_git_load: crate::latest::Latest,
+    /// The alert whose rule is shown on the overview (read on a click), and its read.
+    alert_rule: crate::overview::AlertRule,
+    alert_rule_load: crate::latest::Latest,
     /// Inline editor of a ConfigMap's or Secret's values.
     data_editor: Option<Entity<crate::ui::data_edit::DataEditor>>,
     /// Show metadata.managedFields in the YAML (hidden by default).
@@ -469,6 +472,8 @@ impl DetailPanel {
             argo_resources: Default::default(),
             argo_git: Default::default(),
             argo_git_load: Default::default(),
+            alert_rule: Default::default(),
+            alert_rule_load: Default::default(),
             data_editor: None,
             show_managed: false,
             field_docs: None,
@@ -614,6 +619,15 @@ impl DetailPanel {
                 let exec =
                     k8s::can_i(client.clone(), kind.clone(), "create", ns.clone(), Some(name.clone()), Some("exec"));
                 checks.push(("exec", exec));
+                let evict = k8s::can_i(
+                    client.clone(),
+                    kind.clone(),
+                    "create",
+                    ns.clone(),
+                    Some(name.clone()),
+                    Some("eviction"),
+                );
+                checks.push(("evict", evict));
                 // A container that isn't running is read from a copy of the pod, deleted after.
                 checks.push(("copy", k8s::can_i(client.clone(), kind.clone(), "create", ns.clone(), None, None)));
                 checks
@@ -680,6 +694,26 @@ impl DetailPanel {
             });
         });
         self.keep_task(task);
+        cx.notify();
+    }
+
+    /// Show the rule of the alert with these labels and a chart of it, or hide it when it is
+    /// the one shown. Read on this click only (the rules are kept a few minutes); a click on
+    /// another alert replaces the read running.
+    pub fn toggle_alert_rule(&mut self, labels: std::collections::BTreeMap<String, String>, cx: &mut Context<Self>) {
+        if self.alert_rule.open.as_ref() == Some(&labels) {
+            self.alert_rule = Default::default();
+            self.alert_rule_load.cancel();
+            cx.notify();
+            return;
+        }
+        let Some(alert) = self.related.alerts.iter().find(|a| a.labels == labels).cloned() else { return };
+        self.alert_rule = crate::overview::AlertRule { open: Some(labels), read: None };
+        let read = crate::alerts::detail(self.context.clone(), self.client.clone(), alert);
+        self.alert_rule_load.spawn(cx, read, |this, read, cx| {
+            this.alert_rule.read = Some(read);
+            cx.notify();
+        });
         cx.notify();
     }
 
@@ -1341,6 +1375,7 @@ impl DetailPanel {
             argo: &self.argo,
             argo_resources: &self.argo_resources,
             argo_git: &self.argo_git,
+            alert_rule: &self.alert_rule,
             context: &self.context,
         }
     }
