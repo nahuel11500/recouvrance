@@ -14,6 +14,8 @@ impl AppView {
     /// Connect to one or more contexts; tables merge them with a Context column.
     pub(super) fn connect_many(&mut self, contexts: Vec<String>, window: &mut Window, cx: &mut Context<Self>) {
         let Some(primary) = contexts.first().cloned() else { return };
+        #[cfg(feature = "dev")]
+        crate::dev::first_rows::connecting(&contexts);
         // Where the contexts connected until now were left, before it is reset below.
         self.leave_session(cx);
         if dev_var("RECOUVRANCE_CONTEXT").is_none() {

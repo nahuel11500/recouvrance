@@ -429,7 +429,11 @@ impl AppView {
             let table = self.table.read(cx);
             if table.delegate().columns_count(cx) > 0 { table.delegate().defs() } else { Arc::default() }
         };
+        #[cfg(feature = "dev")]
+        let listed = matches!(msg, TableMsg::Listed);
         let up = self.list.apply(ctx, &name, msg, &shown);
+        #[cfg(feature = "dev")]
+        crate::dev::first_rows::seen(&name, up.rows, listed);
         if let Some(columns) = up.columns {
             self.table.update(cx, |t, cx| {
                 t.delegate_mut().update_columns(columns);
