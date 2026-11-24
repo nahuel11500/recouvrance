@@ -110,7 +110,7 @@ pub(super) async fn fetch_related(
 ) -> Related {
     let objects = async {
         if links {
-            fetch_objects(client.clone(), context, kind, ns.clone(), obj, clusters).await
+            fetch_objects(client.clone(), context, kind, ns.clone(), obj, clusters, pods).await
         } else {
             Related::default()
         }
@@ -262,6 +262,7 @@ async fn fetch_objects(
     ns: Option<String>,
     obj: &Value,
     clusters: Vec<(String, Client)>,
+    pods: &[Value],
 ) -> Related {
     use k8s_openapi::api::{apps::v1 as apps, batch::v1 as batch, core::v1 as core};
     let mut related = Related::default();
@@ -401,16 +402,7 @@ async fn fetch_objects(
         related.events =
             related.noted("events", events).into_iter().map(|e| (e.kind, e.reason, e.message, e.count)).collect();
         // A container that failed: its previous run if it restarted, else its current one.
-        let failed = |c: &&Value| {
-            let code = |p: &str| c.pointer(p).and_then(Value::as_i64).unwrap_or(0);
-            code("/lastState/terminated/exitCode") != 0 || code("/state/terminated/exitCode") != 0
-        };
-        let crashing = obj
-            .pointer("/status/containerStatuses")
-            .and_then(|c| c.as_array())
-            .and_then(|cs| cs.iter().find(failed))
-            .and_then(|c| Some((c["name"].as_str()?.to_string(), c.pointer("/state/terminated").is_none())));
-        if let Some((container, previous)) = crashing
+        if let Some((container, previous)) = crate::diagnose::crashed_container(obj)
             && let Ok(text) =
                 k8s::logs_text(client.clone(), ns.clone(), name, Some(container.clone()), 30, None, previous).await
         {
@@ -419,15 +411,37 @@ async fn fetch_objects(
         let services = k8s::list_values(client, k8s::ar_of::<core::Service>(), Some(ns), None).await;
         related.services = related.noted("services", services);
     } else if kind.ar.group == "apps" || kind.is("batch", "Job") {
-        // Only a workload that selects pods has Services and revisions to show.
-        if matches!(k8s::pod_selection(kind, obj), k8s::Selection::Labels(_)) {
-            let services =
-                k8s::list_values(client.clone(), k8s::ar_of::<core::Service>(), Some(ns.clone()), None).await;
-            related.services = related.noted("services", services);
-            if kind.is("apps", "StatefulSet") || kind.is("apps", "DaemonSet") || kind.is("apps", "Deployment") {
-                let revisions = k8s::rollouts::revisions(client, kind, ns, obj).await;
-                related.revisions = related.noted("revisions", revisions);
+        // The crash output of the pod the diagnosis explains, as a pod's page shows it: one
+        // read, and only when that pod has a crashed container.
+        let crashed = crate::diagnose::worst_pod(pods).and_then(|p| {
+            let (container, previous) = crate::diagnose::crashed_container(p)?;
+            Some((p.pointer("/metadata/name")?.as_str()?.to_string(), container, previous))
+        });
+        let crash = {
+            let (client, ns) = (client.clone(), ns.clone());
+            async move {
+                let (pod, container, previous) = crashed?;
+                let text =
+                    k8s::logs_text(client, ns, pod.clone(), Some(container.clone()), 30, None, previous).await.ok()?;
+                Some((pod, (container, text)))
             }
+        };
+        let links = async {
+            // Only a workload that selects pods has Services and revisions to show.
+            if matches!(k8s::pod_selection(kind, obj), k8s::Selection::Labels(_)) {
+                let services =
+                    k8s::list_values(client.clone(), k8s::ar_of::<core::Service>(), Some(ns.clone()), None).await;
+                related.services = related.noted("services", services);
+                if kind.is("apps", "StatefulSet") || kind.is("apps", "DaemonSet") || kind.is("apps", "Deployment") {
+                    let revisions = k8s::rollouts::revisions(client, kind, ns, obj).await;
+                    related.revisions = related.noted("revisions", revisions);
+                }
+            }
+        };
+        let (crash, ()) = futures::join!(crash, links);
+        if let Some((pod, logs)) = crash {
+            related.crash_logs = Some(logs);
+            related.crash_pod = Some(pod);
         }
     } else if kind.is("", "Secret") || kind.is("", "ConfigMap") {
         // Who mounts or reads this object, by scanning workloads in the namespace.
