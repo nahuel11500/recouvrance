@@ -983,6 +983,28 @@ mod properties {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// A rules.yaml kept as a symlink into another folder (a dotfiles repo), loaded without a
+    /// version, gets its upgrade written where the link leads, and stays a link.
+    #[cfg(unix)]
+    #[test]
+    fn an_upgrade_keeps_a_symlinked_file_a_link() {
+        let dir = crate::mcp::test_dir();
+        let repo = dir.join("dotfiles");
+        std::fs::create_dir_all(&repo).unwrap();
+        let old = "agents:\n  ci:\n    allow: [\"patch applications.argoproj.io\"]\n";
+        std::fs::write(repo.join("rules.yaml"), old).unwrap();
+        let path = dir.join("rules.yaml");
+        std::os::unix::fs::symlink("dotfiles/rules.yaml", &path).unwrap();
+        let text = read(&path).unwrap().unwrap();
+        let mut agents = vec![agent("ci", Policy::default())];
+        assert!(apply_upgrading(&check(&text).unwrap(), &mut agents, CONFIG_VERSION).unwrap());
+        let written = export_over(&path, &agents, Some(&text)).unwrap();
+        assert!(std::fs::symlink_metadata(&path).unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::read_to_string(repo.join("rules.yaml")).unwrap(), written);
+        assert!(written.contains(&format!("\nversion: {FILE_VERSION}\n")), "{written}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     /// An upgrade that can't be written (its folder is read-only) is told apart from an edit on
     /// disk: the first is applied in memory all the same, the second waits for the edit.
     #[cfg(unix)]
