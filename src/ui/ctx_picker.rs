@@ -11,6 +11,8 @@ use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
+use crate::app::conn::{Conn, ConnStates};
+
 pub enum ContextEvent {
     /// Connect to these contexts (replacing the current ones).
     Connect(Vec<String>),
@@ -21,6 +23,8 @@ pub enum ContextEvent {
 pub struct ContextPicker {
     pub all: Vec<String>,
     pub connected: Vec<String>,
+    /// The contexts of the set that can't show rows yet: connecting, or why they failed.
+    states: ConnStates,
     picked: BTreeSet<String>,
     search: Entity<InputState>,
     favorites: Entity<crate::favorites::Favorites>,
@@ -45,12 +49,25 @@ impl ContextPicker {
             }),
             cx.observe(&favorites, |_, _, cx| cx.notify()),
         ];
-        Self { all, connected: Vec::new(), picked: BTreeSet::new(), search, favorites, _subs: subs }
+        Self {
+            all,
+            connected: Vec::new(),
+            states: ConnStates::default(),
+            picked: BTreeSet::new(),
+            search,
+            favorites,
+            _subs: subs,
+        }
     }
 
     pub fn set_connected(&mut self, connected: Vec<String>, cx: &mut Context<Self>) {
         self.picked = connected.iter().cloned().collect();
         self.connected = connected;
+        cx.notify();
+    }
+
+    pub fn set_states(&mut self, states: ConnStates, cx: &mut Context<Self>) {
+        self.states = states;
         cx.notify();
     }
 
@@ -67,6 +84,8 @@ impl ContextPicker {
             crate::settings::context_color(name).map_or(theme.muted_foreground.opacity(0.4), |c| rgb(c).into());
         let protected = crate::settings::is_protected(name);
         let connected = self.connected.iter().any(|c| c == name);
+        // In the set, but not (yet) connected: say so instead of "connected".
+        let state = self.states.get(name).cloned();
         let (n1, n2) = (name.to_string(), name.to_string());
         let favorite = crate::favorites::Favorite::Context(name.to_string());
         let starred = self.favorites.read(cx).has(&favorite);
@@ -121,7 +140,20 @@ impl ContextPicker {
                     .child(name.to_string()),
             )
             .when(protected, |d| d.child(Icon::new(Lucide::Lock).size_3p5().text_color(theme.warning)))
-            .when(connected, |d| d.child(div().text_xs().text_color(theme.blue).child("connected")))
+            .when(connected, |d| match state {
+                None => d.child(div().text_xs().text_color(theme.blue).child("connected")),
+                Some(Conn::Connecting) => {
+                    d.child(div().text_xs().text_color(theme.muted_foreground).child("connecting…"))
+                }
+                Some(Conn::Failed(why)) => d.child(
+                    div()
+                        .id(SharedString::from(format!("ctx-failed-{i}-{name}")))
+                        .text_xs()
+                        .text_color(theme.danger)
+                        .child("can't connect")
+                        .tooltip(move |w, cx| component::tooltip::Tooltip::new(why.clone()).build(w, cx)),
+                ),
+            })
             .child(star)
             // A click on the row switches to just this context.
             .on_click(cx.listener(move |_, _, _, cx| cx.emit(ContextEvent::Connect(vec![n2.clone()]))))
