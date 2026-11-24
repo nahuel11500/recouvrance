@@ -15,8 +15,19 @@ Recouvrance is one Rust binary: a [gpui](https://github.com/zed-industries/zed) 
   sleeps. X11 sees a covered window only without a compositor, and Wayland compositors without the
   xdg-shell `suspended` state never report a window hidden. The list then holds its rows back
   (a first list that completes meanwhile says so only with them) and stops its metrics, and the
-  sidebar's problem count waits. Watches, log streams and shells keep going, so a window shown
-  again is current at once. A window shown on another monitor, not focused, keeps updating.
+  sidebar's problem count starts no scan (an agent's `find_problems` still does when its
+  findings are too old). Watches, log streams and shells keep going, so a window shown again is
+  current at once. A window shown on another monitor, not focused, keeps updating.
+- A list left for another kind, tab or namespace keeps its watches the same way (`app::kept_lists`:
+  the last 4 of each window, up to 60,000 rows in all as counted when each was left, for 5 minutes,
+  as long as the pods' requests watch lingers off screen; the least recently left dropped first), so
+  going back to it shows current rows without a list request. Its tasks carry the id of their list
+  and touch the table only while it is the one on screen.
+- The Timeline's events are listed once, then watched (`k8s::watch_events`); only the newest
+  20,000 of a cluster are held. Their watch is the exception to the rule above: it closes while
+  the page is off screen, and once the page is shown again it goes on from where it was, bringing
+  what changed meanwhile, or lists again when etcd no longer has that far back. Where the user
+  may list events but not watch them, they are listed again at each overview refresh.
 - The page on screen gets the API servers first. Background work (the problem count, a hidden
   list) takes at most 8 of the 32 slots that requests by namespace share (`k8s::lane`). Each
   request takes its slot in the lane of that moment, so a list that comes on screen while it loads
@@ -65,7 +76,21 @@ show after 0.7 s and all of them after 1.4 s ([measured](COMPARISON.md#measured)
 The Problems scan reads the big kinds from their cells too (`list_light`). What its checks need
 of whole objects (Services, Ingresses and HTTP routes, the pods a Service selects, the workloads of
 a namespace with an idle Service, external-secrets.io's objects) is parsed as each list streams in,
-keeping only the fields the checks use; of the workloads, only those scaled to 0 are kept.
+keeping only the fields the checks use; of the workloads, only those scaled to 0 are kept. A
+Service's verdict is kept by its uid and resourceVersion for 10 minutes, so the same idle Services
+don't cost a pod list each on every scan. A scan asked for findings from a given time on (Refresh,
+an agent's `max_age_seconds`) judges again the Services judged before it.
+
+One scan runs per cluster and scope (`problems::shared`), whoever asks: the sidebar badge of each
+window, the Problems page and the agents' `find_problems` read its latest findings, kept check by
+check as each finishes, and wait for the scan running rather than start another. A scan is due
+eight times as long as the last one took after it ended (2 minutes at least); a page scoped to some
+namespaces reads them from the cluster's scan when there is one that covers them and could read
+everything, but scans only those namespaces for a Refresh or before the cluster's first scan; a
+user who may not list cluster-wide gets those namespaces scanned on their own. The sidebar's scans
+run in the background lane; one the page, Refresh or an agent waits for is raised to the
+foreground (`lane::Raisable`), its requests waiting for a background slot included. A scan
+stopped half way says so, and is never taken for an all-clear.
 
 The Workloads overview counts each kind from kubectl's cells alone, with no object metadata at all
 (`list_cells`), in one request from the cache. The pods card works differently, as it needs each

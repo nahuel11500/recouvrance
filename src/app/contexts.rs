@@ -41,6 +41,8 @@ impl AppView {
         self.clusters.clear();
         self.kinds.clear();
         self.watch = None;
+        // Kept lists watch the old clusters.
+        self.kept.clear();
         self.metrics = None;
         self.recording = Vec::new();
         // Watch errors name the old clusters, and would hide "Connecting…" and new failures.

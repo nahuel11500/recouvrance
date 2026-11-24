@@ -116,8 +116,12 @@
   ControllerRevisions, Endpoints, EndpointSlices and Leases are never recorded: they change all the
   time and their history is told elsewhere (a pod's by its owner's revisions and its events). The
   **Timeline** page (sidebar, or `Timeline` in the palette) lists the connected clusters' changes
-  newest first with their events interleaved (Warnings only by default, all, or none; every one
-  the cluster still keeps, an hour's worth by default; the events of one object with the same
+  newest first with their events interleaved (Warnings only by default, all, or none; those the
+  cluster still keeps, an hour's worth by default, read once and then kept current by a watch, so
+  a refresh brings only what changed (read again at each overview refresh where they may be
+  listed but not watched); the newest 20,000 of a cluster are held, shared by its
+  namespaces when they are read one by one, and the page says how many it shows of how many and
+  how far back they go when the cluster keeps more; the events of one object with the same
   reason make one row, with their count); shows the namespaces
   picked in the namespace picker only (cluster-scoped objects such as Nodes too when none is
   picked), and filters by cluster, and `ns:`, `kind:`, `ctx:` and text in its filter box; a row picked shows its diff,
@@ -193,7 +197,7 @@
 - **RBAC-aware**: actions your Kubernetes RBAC forbids are disabled; *My access* shows a can-i
   matrix for the namespace, and says when the cluster (webhook or cloud IAM authorizer) may allow
   more than it lists.
-- **Problems**: one list of what is broken across clusters (crash loops, pending pods, unavailable workloads, NotReady nodes, nodes such a taint keeps pods off for more than 5 minutes after they started, failed jobs, pending volumes, and alerts firing in the cluster's Prometheus that nobody silenced). Click a count (critical, warnings, minor) to show that severity alone; the filter box takes text and `ns:`, `kind:` (`kind:alert`, `kind:service`) and `ctx:` terms, as the Timeline's. The sidebar counts them in the background, again every 2 minutes (eight times as long as a count takes, when that is longer): the first count waits for the list on screen, and counting pauses while the window is hidden. A count reads at most 8 of the 32 namespaces read at once, so the page on screen always has the others; on a big cluster it then takes up to four times as long as the Problems page's scan, and comes that much less often. Its tooltip says how old the count is, and how often it comes.
+- **Problems**: one list of what is broken across clusters (crash loops, pending pods, unavailable workloads, NotReady nodes, nodes such a taint keeps pods off for more than 5 minutes after they started, failed jobs, pending volumes, and alerts firing in the cluster's Prometheus that nobody silenced). Click a count (critical, warnings, minor) to show that severity alone; the filter box takes text and `ns:`, `kind:` (`kind:alert`, `kind:service`) and `ctx:` terms, as the Timeline's. One scan per cluster serves the page, the sidebar count of every window and the agents' `find_problems`: a cluster is scanned again every 2 minutes (eight times as long as a scan takes, when that is longer), a hidden window starts no scan, though an agent's `find_problems` still scans when the latest findings are too old. The page opens on the latest findings at once and says how old they are; during a scan each check's new findings show as soon as it finishes, and Refresh asks for a scan started after it (a scan already running is waited for, then another one runs). A Service with no ready endpoint is looked into once, then again when it changes, after 10 minutes, or (when it selects no pod because a workload is scaled to 0) once that workload is scaled up. The first count waits for the list on screen. A scan started by the sidebar reads at most 8 of the 32 namespaces read at once, so the page on screen always has the others; once the page, Refresh or an agent waits for it, it reads in the foreground. A page scoped to some namespaces shows them from the sidebar's scan of the cluster when there is one; Refresh there scans only those namespaces. Refresh and an agent's `max_age_seconds: 0` judge every Service again. The sidebar count's tooltip says how old it is, and how often it comes.
 - **Alerts where you look**: a namespace's page lists the alerts labeled with it, and a pod's, workload's, volume's or node's page the alerts about it (a pod's include its workload's, a workload's its pods'), with severity, summary, how long, runbook link, and silenced or inhibited ones muted when an Alertmanager is found.
 - **Upgrade check** (Cluster overview → *Upgrade check*): per cluster, what needs action before it
   moves to a newer minor version (the next one by default; the arrows pick another), most urgent first:
@@ -352,11 +356,44 @@
   keys (over Argo CD's API a Secret's values are hidden, so a `checksum/secret` annotation may be
   all that tells it changed). Then a row per resource that unfolds its diff. A Secret's values
   are never shown: only *Secret key X changed*, added or removed (also in a `List`; Argo CD hides
-  them in what it renders, so there only keys added or removed show). Only Secrets are masked: a
+  them in what it renders with runs of `+`, one length per value, so a value is said changed
+  only when its run differs). Only Secrets are masked: a
   value that looks like a password in another kind is shown. Read on demand, when a comparison
   opens, off the UI thread (Argo CD may take up to 2 minutes to render); each revision's manifests
   are kept once read, under the Application's sources as they are now (the last 16, 64 MB at
   most), and a newer comparison or another tab drops the read running.
+- **Argo CD grouped diff**: on the Argo CD page, pick Applications with the checkbox of their
+  row, a group at a time (the checkbox of a service's heading; *Pick the group* in an app of
+  apps' menu, for it and those under it), or *Pick all filtered*; picks are kept by Argo CD,
+  namespace and name across reads of the list, and *Clear* drops them. An action on the picks
+  works on those the filter keeps: the others are counted (*12 picked (3 hidden by the
+  filter)*), never acted on. *Diff selected* reads what a sync of each would change now: Argo
+  CD's own diff (`GET /api/v1/applications/{name}/managed-resources`: the live state against the
+  predicted one, else the target state; hooks left out, as Argo CD usually does already), read
+  with the smart diff above (noise folded, Secrets masked). A resource Argo CD says differs where
+  the smart diff finds no change is said, never taken as in sync. An Application Argo CD couldn't
+  compare with git (a `ComparisonError`, `InvalidSpecError`... condition, or a sync status
+  Unknown) is not read: it is listed with why. Then the changes are grouped across Applications:
+  an image, digest, replicas, env var or pod template change is one line wherever it is (`image
+  web 1.15 → 1.16 (12)`); a change of a resource's own (a ConfigMap's key, a field, a resource
+  added or pruned) is one line for the resources of the same group, kind and name with the same
+  values (`ConfigMap app-config key LOG_LEVEL changed (12)`; to two values, a line each, *one of 2
+  different values*; a core ConfigMap kustomize regenerated by its name without the hash; a kind
+  of another group with a core kind's name says its group, `Service.serving.knative.dev`). A
+  summary on top (`3 changes in 12 environments: …`); each line says the Applications it is in
+  (*in all 12*, or *in 2 of 12:* and which), images first, the change in the most Applications
+  first; a click unfolds each Application's resources and their diff (worked out when read, off
+  the UI thread). *N noise changes hidden* (*show* adds the noise by rule, and in the lines). Then
+  the Applications with nothing to sync, with only noise, those Argo CD says differ with no change
+  shown, those it couldn't compare and those that could not be read, the same error once with its
+  Applications (one failing never hides the others). Reads run 6 at a time, off the UI thread,
+  and the lines are regrouped as reads end, at most every 150 ms (*Read 5 of 12…*); at most 300
+  Applications are read at once (the others are counted), 100 changes, 20 Applications per
+  change and 10 resources per Application are listed. Each Application's diff is kept a minute
+  by its resourceVersion (64 MB at most), so diffing the same picks again reads only those that
+  changed; *Read again* reads them all anew; *Applications* (back) drops the reads running. An
+  Application read on its hub is read from the Argo CD server set for that context (without one,
+  it says so). Read-only.
 - **Argo CD sync, terminate and roll back**: *Sync* (the Application's page, its row menu, the
   Argo CD panel) reads the Application first and lists its resources out of sync, all ticked:
   untick some to sync only the others (hooks run only when all are synced; past 200 the whole
@@ -471,8 +508,11 @@
   favorites, kept in `favorites.json`.
 - **Saved views** (type + namespaces + filter, bookmark button), back/forward history, light and dark themes
   whose status colors, badges and status buttons read at WCAG AA contrast (4.5:1) on what they are drawn on.
-- **Instant back**: the last 8 lists (up to 10,000 rows in all) are kept, so going back to one
-  shows it at once, marked "Updating…", while a fresh list loads and replaces it in one go.
+- **Instant back**: the last 4 lists left in a window (up to 60,000 rows in all, for 5 minutes) keep their
+  watches, paused like a hidden page's, so going back to one (by kind, tab or namespace) shows its
+  rows at once, current within half a second, without listing it again. *Refresh* lists it again.
+  Other lists seen recently (the last 8, up to 10,000 rows in all) show at once, marked
+  "Updating…", while a fresh list loads and replaces it in one go.
 - **Bulk actions**: check rows, then read their logs together, restart, scale, delete or copy names. Scaling needs the number
   of objects typed (the replica count is never suggested), deleting asks as set for the kind (see
   below), and each protected context among them needs its name typed (or a wait); rows from several contexts
@@ -497,9 +537,13 @@
   debug pods with an ephemeral container (falls back to a Pod Security "restricted" profile), run a CronJob now, suspend/resume (CronJobs, Flux, Argo CronWorkflows), drain nodes, force delete
   or remove finalizers (only once the delete leaves it stuck terminating: it already was, or still is
   after 10 seconds), Flux *Reconcile*, Argo CD
-  *Refresh*/*Hard refresh*/*Sync*/*Terminate*/*Roll back*, create/apply YAML (a server dry run first, then a confirmation listing each
-  object's kind, namespace and name). YAML edits on a detail page save only that object: a changed
-  kind, API group, namespace or name is refused, and so are masked Secret values. Every
+  *Refresh*/*Hard refresh*/*Sync*/*Terminate*/*Roll back*, create/apply YAML (a server dry run first, then a confirmation
+  showing what each object changes against the cluster: created, changed with its diff, or no change). YAML edits on a detail
+  page save only that object: a changed kind, API group, namespace or name is refused, and so are masked Secret values. The
+  confirmation shows the diff of the dry run, and the save is sent as of the version the edit started from: when the object
+  changes on the cluster meanwhile (an HPA, a controller, Argo CD), a warning over the editor says who changed it, and
+  offers *Compare*, *Keep my edits on the latest* (your changes made on the object as it is now) and *Reload*, instead of
+  undoing that change. Secret values never show in these diffs. Every
   confirmation shows the equivalent `kubectl` command. A page whose object is deleted says so, and
   shows the one created again under its name, if one is.
 - **Run as** (Settings → Contexts → *Run as*): set a user (and groups) a
