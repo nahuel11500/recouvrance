@@ -35,7 +35,7 @@ fn each_read_is_the_path_argo_cd_routes() {
 
 #[test]
 fn an_image_splits_into_its_repository_and_tag() {
-    let split = |i: &str| split_image(i);
+    let split = split_image;
     assert_eq!(split("registry.example.com/shop/api:1.5.0"), ("registry.example.com/shop/api".into(), "1.5.0".into()));
     // A registry's port is not a tag.
     assert_eq!(split("registry:5000/team/web"), ("registry:5000/team/web".into(), "latest".into()));
