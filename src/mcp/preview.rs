@@ -92,7 +92,7 @@ pub struct Section {
 
 impl Preview {
     /// These sections, within `DIFF_LINES` lines of diff in all.
-    fn of(mut sections: Vec<Section>) -> Self {
+    pub(crate) fn of(mut sections: Vec<Section>) -> Self {
         let mut left = DIFF_LINES;
         for s in &mut sections {
             if s.diff.len() > left {
@@ -139,7 +139,7 @@ impl Preview {
 
 impl Section {
     /// An object whose preview failed, and why (said as a warning).
-    fn failed(label: &str, why: impl std::fmt::Display) -> Self {
+    pub(crate) fn failed(label: &str, why: impl std::fmt::Display) -> Self {
         Self { title: label.to_string(), note: Some(why.to_string()), ..Self::default() }
     }
 }
@@ -234,7 +234,7 @@ async fn work_out(plan: &Plan) -> Preview {
 }
 
 /// `Deployment shop/web`, `ClusterRole reader`.
-fn object_label(kind: &Kind, ns: Option<&str>, name: &str) -> String {
+pub(crate) fn object_label(kind: &Kind, ns: Option<&str>, name: &str) -> String {
     match ns {
         Some(ns) if kind.namespaced => format!("{} {ns}/{name}", kind.ar.kind),
         _ => format!("{} {name}", kind.ar.kind),

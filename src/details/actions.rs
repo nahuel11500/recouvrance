@@ -662,52 +662,101 @@ impl DetailPanel {
             );
             return;
         }
+        // Known already: the server would refuse it, and the warning above the editor says
+        // what to do.
+        if self.changed_meanwhile() {
+            let msg = super::yaml_edit::refused_as_stale(&self.obj.kind.ar.kind, &self.obj.name);
+            window.push_notification(Notification::error(msg), cx);
+            return;
+        }
+        // Sent as of the version the edit started from, the dry run and the save alike: a
+        // change on the cluster meanwhile makes the server refuse it instead of undoing it.
+        let base = self.yaml_base.clone();
+        let version = base.as_ref().and_then(k8s::edit::resource_version).map(str::to_string);
         let (client, kind, ns) = (self.client.clone(), self.obj.kind.clone(), self.obj.namespace.clone());
-        let check = k8s::replace(client, kind, ns, obj.clone(), true);
+        let check = k8s::edit::save_edit(client, kind, ns, obj.clone(), version.clone(), true);
+        let label = crate::mcp::preview::object_label(&self.obj.kind, self.obj.namespace.as_deref(), &self.obj.name);
+        let secret = self.obj.kind.is("", "Secret");
         let panel = cx.entity().downgrade();
         let cmd = self.kubectl_for("Save");
         let guard = self.protection(window, cx);
         let run_as = RunAs::offer(&self.context, cx);
         let context = self.context.clone();
-        let task = cx.spawn_in(window, async move |_, cx| {
+        let task = cx.spawn_in(window, async move |this, cx| {
             let result = check.await;
-            let _ = cx.update(|window, cx| match result {
+            let _ = this.update_in(cx, |this, window, cx| match result {
+                Err(e) if k8s::edit::is_conflict(&e) => {
+                    let msg = super::yaml_edit::refused_as_stale(&this.obj.kind.ar.kind, &this.obj.name);
+                    window.push_notification(Notification::error(msg), cx);
+                    // The newer object brings up the warning, with what changed.
+                    this.refresh_object(false, window, cx);
+                }
                 Err(e) if !refused_but_can_run_as(&e, &context) => {
                     window.push_notification(Notification::error(format!("The server rejected the change: {e:#}")), cx);
                 }
                 _ if !writes_still_on(window, cx) => {}
-                result => window.open_alert_dialog(cx, move |alert, _, cx| {
-                    let (panel, obj, guard, run_as) = (panel.clone(), obj.clone(), guard.clone(), run_as.clone());
-                    let description = match &result {
-                        Ok(_) => "The server accepted them in a dry run. Save them now?".to_string(),
-                        Err(e) => format!(
-                            "The server refused them to you in a dry run ({}): turn on Run as to save them as that identity.",
-                            k8s::short_error(e)
-                        ),
-                    };
-                    alert
-                        .title("Apply YAML changes?")
-                        .description(description)
-                        .child(confirm_with(&cmd, guard.as_ref(), &run_as, cx))
-                        .confirm_buttons("Save", false, guard.as_ref())
-                        .on_ok(move |_, window, cx| {
-                            if !guard_ok(guard.as_ref(), cx) {
-                                return false;
-                            }
-                            if !writes_still_on(window, cx) {
-                                return true;
-                            }
-                            let obj = obj.clone();
-                            let _ = panel.update(cx, |this, cx| {
-                                let (c, k, ns) =
-                                    (run_as.client(&this.client, cx), this.obj.kind.clone(), this.obj.namespace.clone());
-                                // Saved: the editor shows the server's version again, which
-                                // the live refresh then keeps current.
-                                this.run_write_then("Save", k8s::replace(c, k, ns, obj, false), true, window, cx);
-                            });
-                            true
-                        })
-                }),
+                result => {
+                    // What the save does, from the version it is sent as to what the dry run
+                    // returned. A dry run refused to you has nothing to show.
+                    let preview = result.as_ref().ok().map(|after| {
+                        crate::mcp::Preview::of(vec![crate::mcp::preview::object_section(
+                            &label,
+                            base.as_ref(),
+                            after,
+                            secret,
+                        )])
+                    });
+                    window.open_alert_dialog(cx, move |alert, _, cx| {
+                        let (panel, obj, guard, run_as) = (panel.clone(), obj.clone(), guard.clone(), run_as.clone());
+                        let version = version.clone();
+                        let label = label.clone();
+                        let description = match &result {
+                            Ok(_) => "The server accepted them in a dry run. Save them now?".to_string(),
+                            Err(e) => format!(
+                                "The server refused them to you in a dry run ({}): turn on Run as to save them as that identity.",
+                                k8s::short_error(e)
+                            ),
+                        };
+                        alert
+                            .title("Apply YAML changes?")
+                            .description(description)
+                            .child(preview.as_ref().map_or_else(
+                                || div().into_any_element(),
+                                |p| super::preview_scroll("yaml-save-diff", p, cx),
+                            ))
+                            .child(confirm_with(&cmd, guard.as_ref(), &run_as, cx))
+                            .confirm_buttons("Save", false, guard.as_ref())
+                            .on_ok(move |_, window, cx| {
+                                if !guard_ok(guard.as_ref(), cx) {
+                                    return false;
+                                }
+                                if !writes_still_on(window, cx) {
+                                    return true;
+                                }
+                                let (obj, version, label) = (obj.clone(), version.clone(), label.clone());
+                                let _ = panel.update(cx, |this, cx| {
+                                    let (c, k, ns) =
+                                        (run_as.client(&this.client, cx), this.obj.kind.clone(), this.obj.namespace.clone());
+                                    let (kind, name) = (k.ar.kind.clone(), this.obj.name.clone());
+                                    let save = k8s::edit::save_edit(c, k, ns, obj, version, false);
+                                    let saved = async move {
+                                        match save.await {
+                                            Ok(_) => Ok(format!("{label} updated")),
+                                            Err(e) if k8s::edit::is_conflict(&e) => {
+                                                Err(anyhow::anyhow!(super::yaml_edit::refused_as_stale(&kind, &name)))
+                                            }
+                                            Err(e) => Err(e),
+                                        }
+                                    };
+                                    // Saved: the editor shows the server's version again, which
+                                    // the live refresh then keeps current. Refused: the
+                                    // re-read brings up the warning over the edit, kept.
+                                    this.run_write_then("Save", saved, true, window, cx);
+                                });
+                                true
+                            })
+                    });
+                }
             });
         });
         self.keep_task(task);

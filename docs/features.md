@@ -585,9 +585,13 @@
   debug pods with an ephemeral container (falls back to a Pod Security "restricted" profile), run a CronJob now, suspend/resume (CronJobs, Flux, Argo CronWorkflows), drain nodes, force delete
   or remove finalizers (only once the delete leaves it stuck terminating: it already was, or still is
   after 10 seconds), Flux *Reconcile*, Argo CD
-  *Refresh*/*Hard refresh*/*Sync*/*Terminate*/*Roll back*, create/apply YAML (a server dry run first, then a confirmation listing each
-  object's kind, namespace and name). YAML edits on a detail page save only that object: a changed
-  kind, API group, namespace or name is refused, and so are masked Secret values. Every
+  *Refresh*/*Hard refresh*/*Sync*/*Terminate*/*Roll back*, create/apply YAML (a server dry run first, then a confirmation
+  showing what each object changes against the cluster: created, changed with its diff, or no change). YAML edits on a detail
+  page save only that object: a changed kind, API group, namespace or name is refused, and so are masked Secret values. The
+  confirmation shows the diff of the dry run, and the save is sent as of the version the edit started from: when the object
+  changes on the cluster meanwhile (an HPA, a controller, Argo CD), a warning over the editor says who changed it, and
+  offers *Compare*, *Keep my edits on the latest* (your changes made on the object as it is now) and *Reload*, instead of
+  undoing that change. Secret values never show in these diffs. Every
   confirmation shows the equivalent `kubectl` command. A page whose object is deleted says so, and
   shows the one created again under its name, if one is.
 - **Run as** (Settings → Contexts → *Run as*): set a user (and groups) a
