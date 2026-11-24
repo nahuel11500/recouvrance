@@ -283,8 +283,18 @@ pub(super) fn login_for(context: &str) -> Result<(Server, String, Login), String
 
 /// GET `path` (of Argo CD's API) on `server` with `token`; errors never hold the token.
 pub(super) async fn get_path(server: &Server, token: &str, path: &str) -> Result<Value, String> {
+    get_path_within(server, token, path, TIMEOUT).await
+}
+
+/// The same, waiting up to `timeout` for the answer.
+pub(super) async fn get_path_within(
+    server: &Server,
+    token: &str,
+    path: &str,
+    timeout: std::time::Duration,
+) -> Result<Value, String> {
     let url = format!("{}{path}", server.base);
-    super::api::send(http::Method::GET, url, token, None, false, server).await.map_err(|f| f.text)
+    super::api::send_within(http::Method::GET, url, token, None, false, server, timeout).await.map_err(|f| f.text)
 }
 
 /// `text` with every copy of `token` replaced: an error never shows it, whatever echoed it.

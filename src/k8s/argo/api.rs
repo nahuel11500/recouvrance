@@ -461,6 +461,19 @@ pub(super) async fn send(
     insecure: bool,
     server: &Server,
 ) -> Result<Value, Failure> {
+    send_within(method, url, token, body, insecure, server, server::TIMEOUT).await
+}
+
+/// The same, waiting up to `timeout` for the whole answer.
+pub(super) async fn send_within(
+    method: http::Method,
+    url: String,
+    token: &str,
+    body: Option<&Value>,
+    insecure: bool,
+    server: &Server,
+    timeout: Duration,
+) -> Result<Value, Failure> {
     let fail = |status: Option<u16>, text: String| Failure { status, text: scrub(&text, token) };
     let fetch = async {
         let client = http_client(insecure).map_err(|e| fail(None, format!("{e:#}")))?;
@@ -497,9 +510,11 @@ pub(super) async fn send(
         serde_json::from_slice(&bytes)
             .map_err(|_| fail(None, "Argo CD's answer isn't JSON: is this its API server's address?".into()))
     };
-    match tokio::time::timeout(server::TIMEOUT, fetch).await {
+    match tokio::time::timeout(timeout, fetch).await {
         Ok(result) => result,
-        Err(_) => Err(fail(None, format!("Argo CD at {} did not answer within 30 s", server.name()))),
+        Err(_) => {
+            Err(fail(None, format!("Argo CD at {} did not answer within {} s", server.name(), timeout.as_secs())))
+        }
     }
 }
 
@@ -511,6 +526,12 @@ impl Conn {
 
     async fn get(&self, path: &str) -> Result<Value, Failure> {
         self.call(http::Method::GET, path, None).await
+    }
+
+    /// A GET that may take up to `timeout` (Argo CD rendering manifests).
+    async fn get_within(&self, path: &str, timeout: Duration) -> Result<Value, Failure> {
+        let url = format!("{}{path}", self.server.base);
+        send_within(http::Method::GET, url, &self.token.0, None, self.insecure, &self.server, timeout).await
     }
 
     /// Open the application stream: its body, read as it comes. Argo CD subscribes it to
@@ -1162,6 +1183,33 @@ pub async fn dashboard(
         let diff_of = |v: &Value| server::diffs(v, shown.clone(), how);
         let base = conn.server.base.clone();
         Ok(Ok(super::dashboard::extras(&base, &namespace, &name, app, get, diff_of).await))
+    });
+    read.await.unwrap_or_else(|e| Err(format!("{e:#}")))
+}
+
+/// The smart diff of the manifests Argo CD renders for the Application `namespace/name` at
+/// two revisions, read by the API with the server's login as the config has it now (each
+/// revision's kept once read). Read-only.
+pub async fn manifests_diff(
+    endpoint: Arc<Endpoint>,
+    namespace: String,
+    name: String,
+    spec: u64,
+    from: super::sync_diff::Revision,
+    to: super::sync_diff::Revision,
+) -> Result<Arc<crate::smartdiff::SmartDiff>, String> {
+    use super::sync_diff::{RENDER_TIMEOUT, Target};
+    let read = crate::k8s::run_abortable(async move {
+        let conn = match current(&endpoint.server.base).and_then(|e| e.conn()) {
+            Ok(c) => c,
+            Err(e) => return Ok(Err(e)),
+        };
+        let get = |path: String| {
+            let conn = conn.clone();
+            async move { conn.get_within(&path, RENDER_TIMEOUT).await.map_err(|f| f.text) }
+        };
+        let target = Target { server: conn.server.base.clone(), namespace, name, spec };
+        Ok(super::sync_diff::manifests_diff(target, from, to, get).await)
     });
     read.await.unwrap_or_else(|e| Err(format!("{e:#}")))
 }
