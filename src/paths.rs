@@ -121,7 +121,7 @@ mod tests {
         if code.starts_with("//") || code.contains("allow-default-path") {
             return None;
         }
-        let cut = code.match_indices("//").map(|(i, _)| i).find(|&i| code[..i].matches('"').count() % 2 == 0);
+        let cut = code.match_indices("//").map(|(i, _)| i).find(|&i| code[..i].matches('"').count().is_multiple_of(2));
         Some(cut.map_or(code, |i| &code[..i]))
     }
 
@@ -171,6 +171,6 @@ mod tests {
         assert_eq!(tilde(&p), "~/x/y.yaml");
         assert_eq!(expand("~/x/y.yaml"), p);
         assert_eq!(expand("/etc/x"), std::path::PathBuf::from("/etc/x"));
-        assert_eq!(tilde(std::path::Path::new("/etc/x")), "/etc/x");
+        assert_eq!(tilde(Path::new("/etc/x")), "/etc/x");
     }
 }
