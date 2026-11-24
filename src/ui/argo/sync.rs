@@ -117,6 +117,9 @@ pub(super) struct GroupedSync {
     follow: Option<Task<()>>,
 }
 
+/// An Application followed: its row, where it is read, and when the operation before the one sent started.
+type Follow = (usize, Target, Option<String>);
+
 impl GroupedSync {
     /// Sent, and some of it is still going.
     pub(super) fn running(&self) -> bool {
@@ -141,7 +144,7 @@ impl GroupedSync {
 
     /// The Applications to follow now (sent, not ended), whether some are still sent, and
     /// whether the page is shown.
-    fn to_follow(&self) -> (Vec<(usize, Target, Option<String>)>, bool, bool) {
+    fn to_follow(&self) -> (Vec<Follow>, bool, bool) {
         let follow = self
             .rows
             .iter()
