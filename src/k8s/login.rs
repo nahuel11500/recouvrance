@@ -387,10 +387,11 @@ mod tests {
         let unnamed = "the login command failed (exit 1): error: oidc: refresh token expired";
         assert_eq!(login_failure(&e).as_deref(), Some(unnamed));
         // Nothing on stderr, killed: said by how it ended.
-        let mut quiet = failed_run(kubelogin(), 2, "s3cr3t-out", " \n");
+        let quiet = failed_run(kubelogin(), 2, "s3cr3t-out", " \n");
         assert_eq!(by_kubelogin(&quiet).as_deref(), Some("the login command `kubelogin` failed (exit 2)"));
         #[cfg(unix)]
         {
+            let mut quiet = quiet;
             if let AuthError::AuthExecRun { out, .. } = &mut quiet {
                 out.status = std::os::unix::process::ExitStatusExt::from_raw(9);
             }

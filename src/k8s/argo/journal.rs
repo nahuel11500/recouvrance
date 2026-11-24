@@ -635,7 +635,7 @@ mod tests {
         let mut j = Journal::open(path.clone(), 0);
         let first = record_of("i", &app("Succeeded", "2026-01-01T00:00:00Z", json!([])), 1).unwrap();
         j.append(&first).unwrap();
-        std::fs::OpenOptions::new().append(true).open(&path).unwrap().set_len(MAX_BYTES).unwrap();
+        std::fs::OpenOptions::new().write(true).open(&path).unwrap().set_len(MAX_BYTES).unwrap();
         let second = record_of("i", &app("Failed", "2026-01-02T00:00:00Z", json!([])), 2).unwrap();
         j.append(&second).unwrap();
         assert_eq!(std::fs::metadata(older(&path)).unwrap().len(), MAX_BYTES);

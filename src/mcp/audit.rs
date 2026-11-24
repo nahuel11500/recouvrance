@@ -165,7 +165,7 @@ mod tests {
         assert_eq!(mode(&path), 0o600);
         assert_eq!(mode(&dir.join("logs")), 0o700);
         // A full log moves aside and a new one starts.
-        let f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        let f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
         f.set_len(MAX_AUDIT_BYTES).unwrap();
         append_audit(&path, &serde_json::to_string(&entry("new")).unwrap()).unwrap();
         assert_eq!(load_audit_tail(&path).len(), 1);
