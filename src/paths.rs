@@ -98,8 +98,8 @@ mod tests {
             "~/.config/recouvrance/audit.jsonl"
         );
         assert_eq!(
-            shown(Path::new("/home/me/scratch/data/recouvrance"), home, "timeline/"),
-            "~/scratch/data/recouvrance/timeline/"
+            shown(Path::new("/home/me/scratch/data/recouvrance"), home, "timeline"),
+            "~/scratch/data/recouvrance/timeline"
         );
         // No home folder known: never `~/`.
         assert_eq!(shown(Path::new("/srv/cfg"), Path::new(""), "x"), "/srv/cfg/x");

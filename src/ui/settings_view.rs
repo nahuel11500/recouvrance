@@ -1366,8 +1366,8 @@ impl SettingsView {
             .child(div().pb_2().text_sm().text_color(cx.theme().muted_foreground).child(format!(
                 "While a cluster is connected, changes to what the lists and the Problems scan watch are recorded \
                  (pods, events and ReplicaSets excepted), with no request added. Kept on disk per context in \
-                 {}; a Secret's values never, only which keys changed.",
-                crate::paths::shown_data("timeline/")
+                 {}/; a Secret's values never, only which keys changed.",
+                crate::paths::shown_data("timeline")
             )))
             .child(Self::row(
                 "Record changes",
