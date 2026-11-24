@@ -319,7 +319,7 @@ async fn aggregated(client: &Client) -> kube::Result<(Vec<(ApiResource, ApiCapab
 }
 
 /// The resources of aggregated discovery's groups, every version (Gateway API prefers v1, but
-/// TCPRoute is only in v1alpha2), each kind at its most stable one; and the groups with a
+/// `TCPRoute` is only in v1alpha2), each kind at its most stable one; and the groups with a
 /// version marked stale: the API server could not reach its APIService, so the kinds listed
 /// for it (the last ones known, or none) may not be all.
 fn from_aggregated(
