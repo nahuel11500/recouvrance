@@ -317,8 +317,11 @@ fn a_secret_never_shows_its_values() {
     for value in ["first-old", "first-new", "kept", "added-value", "dropped"] {
         assert!(!all.contains(value), "{value} shown:\n{all}");
     }
-    // Argo CD's own masks (runs of `+`) say nothing about a change.
-    let d = compare(&objects([secret(json!({"a": "++++++"}))]), &objects([secret(json!({"a": "++++++++"}))]));
+    // Argo CD's own masks (runs of `+`): the same run is the same value, another length another.
+    let masked = |runs: &str| objects([secret(json!({"a": runs}))]);
+    let d = compare(&masked("++++++++"), &masked("++++++++++++"));
+    assert_eq!(texts(&d), ["Secret key a changed"]);
+    let d = compare(&masked("++++++++"), &masked("++++++++"));
     assert!(d.groups.is_empty(), "{:?}", texts(&d));
 }
 

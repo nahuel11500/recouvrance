@@ -475,10 +475,11 @@ pub struct ArgoView {
     check: crate::latest::Latest,
     /// The dashboard of a service, shown instead of the list while it is open.
     dashboard: Option<dashboard::Dashboard>,
-    /// The Applications picked, by Argo CD, namespace and name (see `grouped`), and how many
-    /// of them are listed.
+    /// The Applications picked, by Argo CD, namespace and name (see `grouped`); how many of
+    /// them the filter keeps, and how many it hides.
     selected: HashSet<Key>,
     picked: usize,
+    picked_hidden: usize,
     /// Which Applications (by index in the rows) the filter keeps.
     keeps: Vec<bool>,
     /// The grouped diff of the Applications picked, shown instead of the list while open.
@@ -599,6 +600,7 @@ impl ArgoView {
             dashboard: None,
             selected: HashSet::new(),
             picked: 0,
+            picked_hidden: 0,
             keeps: Vec::new(),
             grouped: None,
             _subs: subs,
@@ -764,7 +766,7 @@ impl ArgoView {
             self.starred.clear();
             self.starred_count = 0;
             self.keeps.clear();
-            self.picked = 0;
+            (self.picked, self.picked_hidden) = (0, 0);
             return;
         };
         let apps = &rows.fleet.apps;

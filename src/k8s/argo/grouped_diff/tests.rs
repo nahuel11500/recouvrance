@@ -7,7 +7,8 @@ use std::task::{Context, Poll};
 use futures::StreamExt as _;
 use serde_json::{Value, json};
 
-use super::{AppDiff, PARALLEL, cached, read_all, regroup, sides, summary};
+use super::{AppDiff, PARALLEL, cached, errors_by_text, kind_text, not_compared, read_all, regroup, sides, summary};
+use crate::k8s::argo::Summary;
 use crate::smartdiff::SmartDiff;
 
 /// One of Argo CD's managed resources, its states as the JSON text it sends.
@@ -41,6 +42,12 @@ fn env(ns: &str, tag: &str, replicas: i64) -> AppDiff {
     ]}))
 }
 
+/// The same, Argo CD saying it differs.
+fn modified(mut item: Value) -> Value {
+    item["modified"] = json!(true);
+    item
+}
+
 fn texts(groups: &[super::Cross]) -> Vec<&str> {
     groups.iter().map(|g| g.text.as_str()).collect()
 }
@@ -52,22 +59,22 @@ fn apps(groups: &[super::Cross], text: &str) -> Vec<usize> {
 #[test]
 fn managed_resources_give_the_live_and_desired_sides() {
     let body = json!({"items": [
-        res("apps", "Deployment", "shop", "web", Some(deploy("shop", "1.15", 3)), Some(deploy("shop", "1.16", 3))),
+        modified(res("apps", "Deployment", "shop", "web", Some(deploy("shop", "1.15", 3)), Some(deploy("shop", "1.16", 3)))),
         // Created by the sync, pruned by it, the same, a hook, one with no name.
-        res("", "Service", "shop", "web", None, Some(json!({"apiVersion": "v1", "kind": "Service"}))),
-        res("", "ConfigMap", "shop", "old", Some(config("shop", "old", "info")), None),
+        modified(res("", "Service", "shop", "web", None, Some(json!({"apiVersion": "v1", "kind": "Service"})))),
+        modified(res("", "ConfigMap", "shop", "old", Some(config("shop", "old", "info")), None)),
         {"group": "", "kind": "ConfigMap", "namespace": "shop", "name": "same", "modified": false,
             "normalizedLiveState": "{}", "predictedLiveState": "{}"},
         {"kind": "Job", "name": "migrate", "hook": true, "targetState": "{}"},
         {"kind": "ConfigMap", "name": "", "targetState": "{}"},
     ]});
-    let (live, desired, same, hooks) = sides(&body);
+    let s = sides(&body);
     let labels = |o: &crate::smartdiff::Objects| o.keys().map(crate::smartdiff::ObjectKey::label).collect::<Vec<_>>();
-    assert_eq!(labels(&live), ["ConfigMap shop/old", "Deployment shop/web"]);
-    assert_eq!(labels(&desired), ["Service shop/web", "Deployment shop/web"]);
-    assert_eq!((same, hooks), (1, 1));
+    assert_eq!(labels(&s.live), ["ConfigMap shop/old", "Deployment shop/web"]);
+    assert_eq!(labels(&s.desired), ["Service shop/web", "Deployment shop/web"]);
+    assert_eq!((s.same, s.hooks, s.modified.len()), (1, 1, 3));
     // The status is left out: Argo CD doesn't sync it.
-    assert!(live.values().all(|o| o.get("status").is_none()));
+    assert!(s.live.values().all(|o| o.get("status").is_none()));
     // Without the normalized and predicted states, the plain ones.
     let plain = json!({"items": [{"group": "", "kind": "ConfigMap", "namespace": "a", "name": "c",
         "liveState": config("a", "c", "info").to_string(), "targetState": config("a", "c", "debug").to_string()}]});
@@ -232,7 +239,7 @@ fn a_diff_is_kept_by_application_and_version() {
         Ok::<_, String>(Arc::new(AppDiff::default()))
     };
     let key = |v: &str| ("argocd.example.com".to_string(), "argocd".to_string(), "kept-web".to_string(), v.to_string());
-    let run = |k, f| futures::executor::block_on(cached(k, f));
+    let run = |k, f| futures::executor::block_on(cached(k, false, f));
     run(key("10"), read()).unwrap();
     run(key("10"), read()).unwrap();
     assert_eq!(reads.load(Ordering::SeqCst), 1, "the same version is kept");
@@ -242,9 +249,100 @@ fn a_diff_is_kept_by_application_and_version() {
     run(key(""), read()).unwrap();
     run(key(""), read()).unwrap();
     assert_eq!(reads.load(Ordering::SeqCst), 5, "no version known: always read");
+    // Read again: whatever is kept, and kept anew.
+    futures::executor::block_on(cached(key("10"), true, read())).unwrap();
+    assert_eq!(reads.load(Ordering::SeqCst), 6);
+    run(key("10"), read()).unwrap();
+    assert_eq!(reads.load(Ordering::SeqCst), 6);
     // A failed read isn't kept.
-    let failed = futures::executor::block_on(cached(key("12"), async { Err::<Arc<AppDiff>, _>("down".to_string()) }));
+    let failed =
+        futures::executor::block_on(cached(key("12"), false, async { Err::<Arc<AppDiff>, _>("down".to_string()) }));
     assert!(failed.is_err());
     run(key("12"), read()).unwrap();
-    assert_eq!(reads.load(Ordering::SeqCst), 6);
+    assert_eq!(reads.load(Ordering::SeqCst), 7);
+}
+
+/// `modified` is left out when false: once one item has it, one without it is in sync; with
+/// none (an older Argo CD), the states tell. Argo CD saying a resource differs is never taken
+/// as in sync, even when the diff shows nothing.
+#[test]
+fn an_answer_with_or_without_modified() {
+    let changed = res("", "ConfigMap", "a", "c", Some(config("a", "c", "info")), Some(config("a", "c", "debug")));
+    // No item says: the states tell.
+    let d = AppDiff::of(&json!({"items": [changed.clone()]}));
+    assert_eq!(d.diff.groups.len(), 1);
+    // One says it differs: another without it is in sync, whatever its states.
+    let other = res("", "ConfigMap", "a", "d", Some(config("a", "d", "info")), Some(config("a", "d", "warn")));
+    let d = AppDiff::of(&json!({"items": [modified(changed.clone()), other]}));
+    assert_eq!(regroup(&[Some(&d.diff)], false).len(), 1, "only c");
+    assert_eq!(d.same, 1);
+    // Said modified, but the same once normalized: not in sync, not noise only, said.
+    let same = config("a", "e", "info");
+    let d = AppDiff::of(&json!({"items": [modified(res("", "ConfigMap", "a", "e", Some(same.clone()), Some(same)))]}));
+    assert!(!d.in_sync() && !d.noise_only());
+    assert_eq!(d.unexplained.iter().map(crate::smartdiff::ObjectKey::label).collect::<Vec<_>>(), ["ConfigMap a/e"]);
+}
+
+fn summary_of(sync: &str, conditions: &[(&str, &str)]) -> Summary {
+    Summary {
+        sync: sync.into(),
+        conditions: conditions.iter().map(|(t, m)| ((*t).to_string(), (*m).to_string())).collect(),
+        ..Default::default()
+    }
+}
+
+/// An Application Argo CD couldn't compare is said so, not read as everything pruned.
+#[test]
+fn an_application_argo_cd_could_not_compare_is_said() {
+    let why = not_compared(&summary_of("OutOfSync", &[("ComparisonError", "repository not found")])).unwrap();
+    assert_eq!(why, "ComparisonError: repository not found");
+    assert!(not_compared(&summary_of("Synced", &[("InvalidSpecError", "no destination")])).is_some());
+    assert!(not_compared(&summary_of("Unknown", &[])).unwrap().contains("Unknown"));
+    // A failed sync or a warning doesn't stop the comparison.
+    assert_eq!(not_compared(&summary_of("OutOfSync", &[("SyncError", "x"), ("OrphanedResourceWarning", "y")])), None);
+    assert_eq!(not_compared(&summary_of("Synced", &[])), None);
+}
+
+/// The same key changed to other values in other Applications is a line each, said.
+#[test]
+fn the_same_key_to_different_values_is_not_one_change() {
+    let level = |ns: &str, to: &str| {
+        AppDiff::of(&json!({"items": [res("", "ConfigMap", ns, "app-config",
+            Some(config(ns, "app-config", "info")), Some(config(ns, "app-config", to)))]}))
+    };
+    let (a, b, c) = (level("a", "debug"), level("b", "warn"), level("c", "debug"));
+    let groups = regroup(&[Some(&a.diff), Some(&b.diff), Some(&c.diff)], false);
+    assert_eq!(
+        texts(&groups),
+        [
+            "ConfigMap app-config key LOG_LEVEL changed (one of 2 different values)",
+            "ConfigMap app-config key LOG_LEVEL changed (one of 2 different values)"
+        ]
+    );
+    assert_eq!(groups[0].apps.iter().map(|(a, _)| *a).collect::<Vec<_>>(), [0, 2], "the one in the most first");
+    assert_ne!(groups[0].key, groups[1].key);
+}
+
+/// Only a core ConfigMap is named by its stem; another group's kind of the same name is not,
+/// and says its group.
+#[test]
+fn a_configmap_of_another_group_is_not_folded_by_its_stem() {
+    let cm = |name: &str, level: &str| {
+        json!({"apiVersion": "example.com/v1", "kind": "ConfigMap", "metadata": {"name": name, "namespace": "a"},
+            "data": {"LOG_LEVEL": level}})
+    };
+    let name = "app-config-bbbbbbbbbb";
+    let d = AppDiff::of(&json!({"items": [res("example.com", "ConfigMap", "a", name, Some(cm(name, "info")),
+        Some(cm(name, "debug")))]}));
+    let groups = regroup(&[Some(&d.diff)], false);
+    assert_eq!(texts(&groups), ["ConfigMap.example.com app-config-bbbbbbbbbb: data.LOG_LEVEL: info → debug"]);
+    assert_eq!(kind_text("", "Service"), "Service");
+    assert_eq!(kind_text("serving.knative.dev", "Service"), "Service.serving.knative.dev");
+    assert_eq!(kind_text("apps", "Deployment"), "Deployment");
+}
+
+#[test]
+fn the_same_error_is_said_once_with_its_applications() {
+    let errors = [(0, "forbidden"), (1, "timeout"), (2, "forbidden"), (3, "forbidden")];
+    assert_eq!(errors_by_text(errors), [("forbidden".to_string(), vec![0, 2, 3]), ("timeout".to_string(), vec![1])]);
 }
