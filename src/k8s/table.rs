@@ -189,7 +189,8 @@ pub enum TableMsg {
     Columns(Arc<Vec<ColumnDef>>),
     Rows(Vec<Arc<Row>>),
     /// The rows sent last hold every row of the initial list, some from their cells alone
-    /// (see `cells_by_namespace`): `Listed` follows once they have their objects' metadata.
+    /// (see `cells_by_namespace`): `Listed` follows once they have their objects' metadata
+    /// (only when they are wanted: see `list_fast`).
     AllRows,
     /// The initial list is complete, and the rows sent right before hold all of it (rows
     /// before those were partial pages). A paused watch sends both once it is unpaused.
@@ -401,33 +402,37 @@ const BACKGROUND_PARALLEL: usize = 8;
 static FAST_SLOTS: Slots = Slots::new(FAST_PARALLEL, BACKGROUND_PARALLEL);
 
 /// A big list's rows without their objects, one namespace at a time, many at once, from the
-/// API server's cache. The objects' metadata (managedFields above all) is most of a list's
-/// bytes: on a cluster with 23k pods, 160 MB against 6 MB, so this shows the whole list in
-/// about 2 s where the full one takes 8 to 10 s over a laptop's link. Rows have no uid,
-/// labels or creation time (they come with the full list, which replaces them). Each request
-/// takes its slot in the lane `lane` says at that moment: a hidden list that comes on screen
-/// while it loads takes the page's slots for the namespaces left.
-async fn cells_by_namespace(client: &Client, url: &str, lane: &(dyn Fn() -> Lane + Sync)) -> Result<Vec<Arc<Row>>> {
+/// API server's cache, each at least as new as resourceVersion `at` ("0": any). The objects'
+/// metadata (managedFields above all) is most of a list's bytes: on a cluster with 23k pods,
+/// 160 MB against 6 MB, so this shows the whole list in about 2 s where the full one takes
+/// 8 to 10 s over a laptop's link. Rows have no uid, labels or exact creation time (see
+/// `cells_row`). Each request takes its slot in the lane `lane` says at that moment: a
+/// hidden list that comes on screen while it loads takes the page's slots for the
+/// namespaces left.
+async fn cells_by_namespace(
+    client: &Client,
+    url: &str,
+    at: &str,
+    lane: &(dyn Fn() -> Lane + Sync),
+) -> Result<Vec<Arc<Row>>> {
     let (prefix, resource) = url.rsplit_once('/').ok_or_else(|| anyhow!("unexpected path {url}"))?;
     let mut req = http::Request::get("/api/v1/namespaces?includeObject=None").body(Vec::new())?;
     req.headers_mut().insert(http::header::ACCEPT, http::HeaderValue::from_static(TABLE_ACCEPT));
     let namespaces: ServerTable = lists::request_idle(client, req).await?;
     let names: Vec<String> =
         namespaces.rows.iter().filter_map(|r| r.cells.first()?.as_str().map(String::from)).collect();
+    let at = super::url_escape(if at.is_empty() { "0" } else { at });
     let jobs = names.into_iter().map(|ns| {
         let client = client.clone();
         let path = format!(
-            "{prefix}/namespaces/{ns}/{resource}?includeObject=None&resourceVersion=0&resourceVersionMatch=NotOlderThan"
+            "{prefix}/namespaces/{ns}/{resource}?includeObject=None&resourceVersion={at}&resourceVersionMatch=NotOlderThan"
         );
         async move {
             let _slot = FAST_SLOTS.acquire(lane()).await?;
             let mut req = http::Request::get(&path).body(Vec::new())?;
             req.headers_mut().insert(http::header::ACCEPT, http::HeaderValue::from_static(TABLE_ACCEPT));
             let page: ServerTable = lists::request_idle(&client, req).await?;
-            let age = page.column_definitions.iter().position(|d| d.name == "Age");
-            Ok::<_, anyhow::Error>(
-                page.rows.into_iter().filter_map(|r| cells_row(r, Some(&ns), age)).collect::<Vec<_>>(),
-            )
+            Ok::<_, anyhow::Error>(cells_rows(page, Some(&ns)).1)
         }
     });
     let pages: Vec<Result<Vec<Arc<Row>>>> = futures::stream::iter(jobs).buffer_unordered(FAST_PARALLEL).collect().await;
@@ -439,23 +444,32 @@ async fn cells_by_namespace(client: &Client, url: &str, lane: &(dyn Fn() -> Lane
     Ok(rows)
 }
 
-/// The first list of a namespaced kind in every namespace, shown as soon as it can be: its
-/// first page (2000 rows) at once; when more follow, every namespace's rows without their
-/// objects (`cells_by_namespace`: about 2 s for 23k pods over a laptop's link), then
-/// `AllRows`; then the whole list with its objects' metadata in one response from the API
-/// server's cache, parsed as it streams in (about half the time of paging through it).
+/// The first list of a namespaced kind in every namespace, shown as soon as it can be (when
+/// `show`): its first page (2000 rows) at once; when more follow, every namespace's rows
+/// without their objects (`cells_by_namespace`: about 2 s for 23k pods over a laptop's
+/// link), at least as new as the first page. With `lean`, the list ends there: its version
+/// is the first page's, so the watch that follows replays every change since, and each
+/// event brings its row's uid and labels (see `apply_event`). The objects' metadata of the
+/// whole list is 160 MB on that cluster, which the API server builds and sends again for
+/// rows already on screen. Without (a tap records the list, or a filter on labels wants
+/// them), the rows are shown, then `AllRows`, then the whole list with its objects'
+/// metadata comes in one response from the API server's cache, parsed as it streams in.
 async fn list_fast(
     client: &Client,
     url: &str,
     tx: &mpsc::UnboundedSender<TableMsg>,
     pause: &Pause,
     tap: Option<&Tap>,
+    show: bool,
+    lean: bool,
 ) -> Result<(Vec<ColumnDef>, Vec<Arc<Row>>, String)> {
     let lp = ListParams::default().limit(PAGE_SIZE);
     let page: ServerTable =
         lists::request_idle(client, with_table_format(Request::new(url).list(&lp)?, false)?).await?;
     let defs = page.column_definitions.clone();
-    let _ = tx.unbounded_send(TableMsg::Columns(Arc::new(defs.clone())));
+    if show {
+        let _ = tx.unbounded_send(TableMsg::Columns(Arc::new(defs.clone())));
+    }
     let more = page.metadata.continue_.as_ref().is_some_and(|c| !c.is_empty());
     let version = page.metadata.resource_version.clone().unwrap_or_default();
     let mut rows: Vec<Arc<Row>> =
@@ -464,15 +478,18 @@ async fn list_fast(
     if !more {
         return Ok((defs, rows, version));
     }
-    if !pause.is_paused() {
-        let _ = tx.unbounded_send(TableMsg::Rows(rows));
+    if show && !pause.is_paused() {
+        let _ = tx.unbounded_send(TableMsg::Rows(rows.clone()));
     }
     // A failure here only means waiting for the whole list.
-    if let Ok(cells) = cells_by_namespace(client, url, &|| pause.lane()).await
-        && !pause.is_paused()
-    {
-        let _ = tx.unbounded_send(TableMsg::Rows(cells));
-        let _ = tx.unbounded_send(TableMsg::AllRows);
+    if let Ok(cells) = cells_by_namespace(client, url, &version, &|| pause.lane()).await {
+        if lean {
+            return Ok((defs, with_cells(rows, cells), version));
+        }
+        if show && !pause.is_paused() {
+            let _ = tx.unbounded_send(TableMsg::Rows(cells));
+            let _ = tx.unbounded_send(TableMsg::AllRows);
+        }
     }
     match list_whole(client, url, tap).await {
         Ok(listed) => Ok(listed),
@@ -481,6 +498,20 @@ async fn list_fast(
             list_paged_with(client, url, ListParams::default(), &Extras::default(), tap, None, |_, _, _| {}).await
         }
     }
+}
+
+/// A big list from its first page's rows, with their metadata, and every namespace's rows
+/// from their cells (newer): a row of the first page stays as it is, the watch bringing what
+/// changed since; one listed only by its cells comes from them. Sorted by namespace and name.
+fn with_cells(first: Vec<Arc<Row>>, cells: Vec<Arc<Row>>) -> Vec<Arc<Row>> {
+    let listed: std::collections::HashSet<(Option<&str>, &str)> =
+        first.iter().map(|r| (r.namespace.as_deref(), r.name.as_str())).collect();
+    let others: Vec<Arc<Row>> =
+        cells.into_iter().filter(|r| !listed.contains(&(r.namespace.as_deref(), r.name.as_str()))).collect();
+    let mut rows = first;
+    rows.extend(others);
+    rows.sort_by(|a, b| (&a.namespace, &a.name).cmp(&(&b.namespace, &b.name)));
+    rows
 }
 
 /// A Table whose rows' objects are parsed lean while reading (managedFields and the rest
@@ -550,25 +581,29 @@ async fn cells_list(client: &Client, url: &str, namespace: Option<&str>) -> Resu
 
 /// A table's columns and its rows from their cells alone (`includeObject=None`).
 fn cells_rows(page: ServerTable, namespace: Option<&str>) -> (Vec<ColumnDef>, Vec<Arc<Row>>) {
-    let age = page.column_definitions.iter().position(|d| d.name == "Age");
-    let rows = page.rows.into_iter().filter_map(|r| cells_row(r, namespace, age)).collect();
+    let column = |name: &str| page.column_definitions.iter().position(|d| d.name == name);
+    let (age, status) = (column("Age"), column("Status"));
+    let rows = page.rows.into_iter().filter_map(|r| cells_row(r, namespace, age, status)).collect();
     (page.column_definitions, rows)
 }
 
 /// A row from its cells alone (`includeObject=None`): the name is the first cell, and
-/// namespace/name stands in for the uid until the full list brings it.
-fn cells_row(row: ServerRow, namespace: Option<&str>, age: Option<usize>) -> Option<Arc<Row>> {
+/// namespace/name stands in for the uid until an event or a list with the metadata brings
+/// it. Its creation time is read from its Age (kubectl rounds it down), and a Status of
+/// `Terminating` (a pod's) says it is being deleted.
+fn cells_row(row: ServerRow, namespace: Option<&str>, age: Option<usize>, status: Option<usize>) -> Option<Arc<Row>> {
     let name = row.cells.first()?.as_str()?.to_string();
     let created = age
         .and_then(|i| row.cells.get(i)?.as_str().and_then(age_seconds))
         .and_then(|s| jiff::Timestamp::now().checked_sub(jiff::SignedDuration::from_secs(s)).ok());
+    let deleting = status.and_then(|i| row.cells.get(i)?.as_str()) == Some("Terminating");
     Some(Arc::new(Row {
         uid: format!("{}/{name}", namespace.unwrap_or_default()),
         name,
         namespace: namespace.map(String::from),
         created,
         cells: row.cells.iter().map(cell_text).collect(),
-        deleting: false,
+        deleting,
         deleted_at: None,
         labels: "".into(),
     }))
@@ -653,7 +688,7 @@ const LIGHT_PROBE: u32 = 1000;
 /// kind: the whole list has every namespace's rows (with their objects' metadata, so more
 /// bytes).
 async fn rows_by_namespace(client: &Client, url: &str) -> Result<Vec<Arc<Row>>> {
-    match cells_by_namespace(client, url, &Lane::current).await {
+    match cells_by_namespace(client, url, "0", &Lane::current).await {
         Ok(rows) => Ok(rows),
         Err(_) => match list_whole(client, url, None).await {
             Ok(listed) => Ok(listed.1),
@@ -695,17 +730,33 @@ pub async fn list_cells(
 
 /// Holds back a watch's snapshots while its list is hidden: events still apply (the
 /// watch stays current), and the rows are sent once it is shown again (with `Listed`, when
-/// the first list completed meanwhile).
+/// the first list completed meanwhile). It also carries what the list on screen asks of a
+/// table watch: every row's metadata (see `want_metadata`).
 #[derive(Clone, Default)]
-pub struct Pause(Arc<std::sync::atomic::AtomicBool>);
+pub struct Pause {
+    paused: Arc<std::sync::atomic::AtomicBool>,
+    metadata: Arc<std::sync::atomic::AtomicBool>,
+}
 
 impl Pause {
     pub fn set(&self, paused: bool) {
-        self.0.store(paused, std::sync::atomic::Ordering::Relaxed);
+        self.paused.store(paused, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn is_paused(&self) -> bool {
-        self.0.load(std::sync::atomic::Ordering::Relaxed)
+        self.paused.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Every row needs its object's metadata from now on (a filter on labels). A big list
+    /// finishes from kubectl's cells alone (`list_fast`), its rows without labels or uid
+    /// until an event brings them: its watch lists again with the metadata, keeping the
+    /// rows on screen until then. It stays asked for the watch's life.
+    pub fn want_metadata(&self) {
+        self.metadata.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn wants_metadata(&self) -> bool {
+        self.metadata.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// The lane of the list's requests now: a hidden list makes way for what is on screen.
@@ -794,13 +845,15 @@ pub fn watch_table_paused(
         let url = DynamicObject::url_path(&kind.ar, ns);
         // In every namespace of a namespaced kind, a big list can show early by namespace.
         let by_namespace = kind.namespaced && ns.is_none();
-        let mut first = if pages { FirstList::Pages { by_namespace } } else { FirstList::Whole };
+        let mut first = if pages { FirstList::Pages } else { FirstList::Whole };
         let mut backoff = Backoff::default();
         loop {
             // Whether this round's watch got events: only then does the wait start over. A
             // list alone doesn't count, or a watch that keeps failing would relist every second.
             let mut progress = false;
-            let result = watch_once(&client, &url, &tx, &extras, tap.as_ref(), &mut first, &pause, &mut progress).await;
+            let result =
+                watch_once(&client, &url, by_namespace, &tx, &extras, tap.as_ref(), &mut first, &pause, &mut progress)
+                    .await;
             if let Err(e) = &result {
                 if api_status(e) == Some(403) {
                     let _ = tx.unbounded_send(TableMsg::Forbidden(short_error(e)));
@@ -845,9 +898,9 @@ impl Backoff {
 /// Where a watch is with its first list.
 #[derive(Clone, Copy, PartialEq)]
 pub(super) enum FirstList {
-    /// Not listed yet: show pages as they arrive (and, `by_namespace`, a big list's rows
-    /// without objects as soon as they are in: see `cells_by_namespace`).
-    Pages { by_namespace: bool },
+    /// Not listed yet: show pages as they arrive (and, in every namespace, a big list's rows
+    /// without objects as soon as they are in: see `list_fast`).
+    Pages,
     /// Not listed yet, rows from before on screen: send the list whole.
     Whole,
     /// Listed, but `Listed` not sent yet: it goes right after the rows, which a paused watch
@@ -867,6 +920,7 @@ pub(super) enum FirstList {
 pub(super) async fn watch_once(
     client: &Client,
     url: &str,
+    by_namespace: bool,
     tx: &mpsc::UnboundedSender<TableMsg>,
     extras: &Extras,
     tap: Option<&Tap>,
@@ -882,13 +936,35 @@ pub(super) async fn watch_once(
     if let Some(tap) = tap {
         tap.begin_list();
     }
+    // A namespaced kind in every namespace, no custom columns: the fast way (see
+    // `list_fast`) when the list turns out big.
+    let fast = by_namespace && extras.is_empty() && !full;
+    // Its rows may end from their cells alone, unless the timeline records the list (it needs
+    // every object) or the list on screen wants every row's labels.
+    let lean = tap.is_none() && !pause.wants_metadata();
     let (_, list_rows, version) = match *first {
-        // A namespaced kind in every namespace, no custom columns: the fast way (see
-        // `list_fast`) when the list turns out big.
-        FirstList::Pages { by_namespace: true } if extras.is_empty() && !full => {
-            list_fast(client, url, tx, pause, tap).await?
+        FirstList::Pages if fast => list_fast(client, url, tx, pause, tap, true, lean).await?,
+        // Rows from before on screen, or a relist: the new list replaces them whole.
+        _ if fast && lean => {
+            let listed = list_fast(client, url, tx, pause, tap, false, true).await?;
+            let _ = tx.unbounded_send(TableMsg::Columns(Arc::new(listed.0.clone())));
+            listed
         }
-        FirstList::Pages { .. } => {
+        // The list on screen wants the metadata of rows listed from their cells: the whole
+        // list in one response from the cache, as `list_fast` gets it.
+        _ if fast && pause.wants_metadata() => match list_whole(client, url, tap).await {
+            Ok(listed) => {
+                let _ = tx.unbounded_send(TableMsg::Columns(Arc::new(listed.0.clone())));
+                listed
+            }
+            Err(_) => {
+                let listed =
+                    list_paged_with(client, url, ListParams::default(), extras, tap, None, |_, _, _| {}).await?;
+                let _ = tx.unbounded_send(TableMsg::Columns(Arc::new(listed.0.clone())));
+                listed
+            }
+        },
+        FirstList::Pages => {
             // Show rows as pages arrive; big clusters take tens of seconds to list.
             let mut sent_columns = false;
             let listed =
@@ -921,6 +997,10 @@ pub(super) async fn watch_once(
         tap.end_list();
     }
     let mut rows: HashMap<String, Arc<Row>> = list_rows.into_iter().map(|r| (r.uid.clone(), r)).collect();
+    // Rows listed from their cells alone, until the list on screen wants their metadata:
+    // checked at each reconnect and every `PAUSED_POLL`.
+    let mut partial = rows.values().any(|r| r.is_partial());
+    let mut check_at = tokio::time::Instant::now() + PAUSED_POLL;
     // `Listed` goes with the first rows sent: at once, or when a paused list is unpaused.
     if *first != FirstList::Done {
         *first = FirstList::Unsent;
@@ -937,6 +1017,10 @@ pub(super) async fn watch_once(
     > = futures::stream::FuturesUnordered::new();
 
     loop {
+        if partial && wants_relist(&rows, pause, &mut partial) {
+            *progress = true;
+            return Ok(());
+        }
         let wp = WatchParams::default().timeout(290);
         let req = with_table_format(request.watch(&wp, &version)?, watch_full)?;
         let reader = match client.request_stream(req).await {
@@ -962,6 +1046,8 @@ pub(super) async fn watch_once(
             let due = nodes.as_ref().and_then(NodeSpecs::next_due);
             let next = tokio::select! {
                 lines = chunks.next() => Some(lines),
+                // A quiet watch still looks whether the metadata is wanted (see below).
+                () = tokio::time::sleep_until(check_at), if partial => None,
                 () = async {
                     match flush {
                         Some(wait) => tokio::time::sleep(wait).await,
@@ -1018,12 +1104,32 @@ pub(super) async fn watch_once(
                 }
                 None => {}
             }
+            // Here rather than in its own branch above: on a busy cluster events never let
+            // a timer win.
+            if partial && tokio::time::Instant::now() >= check_at {
+                check_at = tokio::time::Instant::now() + PAUSED_POLL;
+                if wants_relist(&rows, pause, &mut partial) {
+                    *progress = true;
+                    return Ok(());
+                }
+            }
             snaps.flush(&rows, tx, pause, first)?;
         }
         if cut {
             tokio::time::sleep(backoff.next()).await;
         }
     }
+}
+
+/// Whether the watch must list again because the list on screen wants every row's metadata
+/// and some rows came from their cells alone. `partial` turns false once none is left (each
+/// event brings its row's metadata), so the check stops.
+fn wants_relist(rows: &HashMap<String, Arc<Row>>, pause: &Pause, partial: &mut bool) -> bool {
+    if !pause.wants_metadata() {
+        return false;
+    }
+    *partial = rows.values().any(|r| r.is_partial());
+    *partial
 }
 
 /// Whether a failed watch request can go on from its resourceVersion: the connection or the
@@ -1081,6 +1187,11 @@ pub(super) fn apply_event(
                 if let (Some(tap), Some(obj)) = (tap, &row.object) {
                     tap.event(&event.type_, obj);
                 }
+                // A row listed from its cells alone stands in for this object under its
+                // namespace/name (see `list_fast`): the event replaces it, or removes it.
+                if let Some(stand_in) = meta.as_ref().and_then(stand_in_of) {
+                    changed |= rows.remove(&stand_in).is_some();
+                }
                 if event.type_ == "DELETED" {
                     if let Some(uid) = meta.as_ref().and_then(|m| m.uid.as_ref()) {
                         if let Some(nodes) = nodes.as_deref_mut() {
@@ -1123,6 +1234,12 @@ pub(super) fn apply_event(
         }
         _ => Ok(Applied::Unchanged),
     }
+}
+
+/// The key a row listed from its cells alone has for this object: namespace/name (see
+/// `cells_row`). None for a cluster-scoped object, never listed that way.
+fn stand_in_of(meta: &LeanMeta) -> Option<String> {
+    Some(format!("{}/{}", meta.namespace.as_deref()?, meta.name.as_deref()?))
 }
 
 #[derive(Deserialize)]
@@ -1204,7 +1321,7 @@ pub async fn list_names(
 
 #[cfg(test)]
 mod watch_tests {
-    use super::{Applied, Arc, Extras, HashMap, Row, apply_event, resumable};
+    use super::{Applied, Arc, Extras, HashMap, Row, apply_event, resumable, with_cells};
 
     #[test]
     fn watch_resumes_after_server_and_connection_failures() {
@@ -1277,6 +1394,114 @@ mod watch_tests {
         // A bookmark without a version keeps ours.
         apply_event(r#"{"type":"BOOKMARK","object":{}}"#, &mut rows, &mut version, &extras, None, None).unwrap();
         assert_eq!(version, "42");
+    }
+
+    /// A row as a list brings it: with its object's uid, or (`uid: None`) from its cells
+    /// alone, namespace/name standing in.
+    fn listed(name: &str, uid: Option<&str>, status: &str) -> Arc<Row> {
+        Arc::new(Row {
+            uid: uid.map_or_else(|| format!("default/{name}"), String::from),
+            name: name.into(),
+            namespace: Some("default".into()),
+            created: None,
+            cells: vec![name.into(), status.into()],
+            labels: "".into(),
+            deleting: false,
+            deleted_at: None,
+        })
+    }
+
+    #[test]
+    fn events_replace_the_rows_listed_from_their_cells() {
+        let mut rows: HashMap<String, Arc<Row>> = with_cells(
+            vec![listed("api", Some("u1"), "Running")],
+            vec![listed("api", None, "Running"), listed("web", None, "Pending"), listed("db", None, "Running")],
+        )
+        .into_iter()
+        .map(|r| (r.uid.clone(), r))
+        .collect();
+        // The first page's row stays as it is; the others stand in under namespace/name.
+        let mut keys: Vec<&str> = rows.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["default/db", "default/web", "u1"]);
+        let (mut version, extras) = ("1".to_string(), Extras::default());
+        let mut apply = |line: &str, rows: &mut HashMap<String, Arc<Row>>| {
+            apply_event(line, rows, &mut version, &extras, None, None).unwrap()
+        };
+        assert_eq!(apply(&frame("MODIFIED", "u2", "web", "5", "Running"), &mut rows), Applied::Changed);
+        assert!(!rows.contains_key("default/web"));
+        assert_eq!(rows["u2"].cells, ["web", "Running"]);
+        assert_eq!(apply(&frame("DELETED", "u3", "db", "6", "Running"), &mut rows), Applied::Changed);
+        assert!(!rows.contains_key("default/db"));
+        assert_eq!(rows.len(), 2);
+    }
+
+    /// What happened to the pods `p0`…`p3` of namespace `default`, one change per
+    /// resourceVersion: each pod by name, its uid and status.
+    type Pods = std::collections::BTreeMap<String, (String, String)>;
+
+    proptest::proptest! {
+        /// For every history of creations, changes, deletions and re-creations: a list made of
+        /// a first page at version `x` (with uids) and every pod's cells at a later version
+        /// `y`, then the watch from `x`, ends with every pod as it is, by name, status and
+        /// (once an event brought it) uid, and no pod gone.
+        #[test]
+        fn a_list_finished_from_cells_ends_as_the_pods_are(
+            initial in proptest::collection::vec(proptest::bool::ANY, 4),
+            ops in proptest::collection::vec((0u8..3, 0u8..4), 0..24),
+            page in 0usize..5,
+            x_at in 0usize..25,
+            y_after in 0usize..25,
+        ) {
+            let mut pods = Pods::new();
+            for (i, present) in initial.iter().enumerate() {
+                if *present {
+                    pods.insert(format!("p{i}"), (format!("u-p{i}"), "s0".to_string()));
+                }
+            }
+            // Every state, after each change, and the watch frames of the changes.
+            let mut states = vec![pods.clone()];
+            let mut frames = Vec::new();
+            for (i, (op, name)) in ops.iter().enumerate() {
+                let (name, status, rv) = (format!("p{name}"), format!("s{}", i + 1), (i + 2).to_string());
+                match (*op, pods.get(&name).cloned()) {
+                    (0, None) => {
+                        let uid = format!("u{i}");
+                        frames.push(frame("ADDED", &uid, &name, &rv, &status));
+                        pods.insert(name, (uid, status));
+                    }
+                    (0 | 1, Some((uid, _))) => {
+                        frames.push(frame("MODIFIED", &uid, &name, &rv, &status));
+                        pods.insert(name, (uid, status));
+                    }
+                    (2, Some((uid, old))) => {
+                        frames.push(frame("DELETED", &uid, &name, &rv, &old));
+                        pods.remove(&name);
+                    }
+                    _ => continue,
+                }
+                states.push(pods.clone());
+            }
+            let x = x_at.min(frames.len());
+            let y = (x + y_after).min(frames.len());
+            let first: Vec<Arc<Row>> =
+                states[x].iter().take(page).map(|(n, (uid, s))| listed(n, Some(uid.as_str()), s)).collect();
+            let cells: Vec<Arc<Row>> = states[y].iter().map(|(n, (_, s))| listed(n, None, s)).collect();
+            let mut rows: HashMap<String, Arc<Row>> =
+                with_cells(first, cells).into_iter().map(|r| (r.uid.clone(), r)).collect();
+            let (mut version, extras) = (String::new(), Extras::default());
+            for line in &frames[x..] {
+                apply_event(line, &mut rows, &mut version, &extras, None, None).unwrap();
+            }
+            let mut got: Vec<(String, String)> =
+                rows.values().map(|r| (r.name.clone(), r.cells[1].clone())).collect();
+            got.sort();
+            let want: Vec<(String, String)> = pods.iter().map(|(n, (_, s))| (n.clone(), s.clone())).collect();
+            proptest::prop_assert_eq!(got, want);
+            for r in rows.values().filter(|r| !r.is_partial()) {
+                proptest::prop_assert_eq!(&r.uid, &pods[&r.name].0);
+            }
+        }
     }
 }
 
@@ -1538,6 +1763,9 @@ mod fast_list_tests {
             while let Some(msg) = rx.next().await {
                 sent.push(match msg {
                     TableMsg::Columns(_) => "columns".to_string(),
+                    TableMsg::Rows(rows) if rows.iter().any(|r| r.is_partial()) => {
+                        format!("rows {} from cells", rows.len())
+                    }
                     TableMsg::Rows(rows) => format!("rows {}", rows.len()),
                     TableMsg::AllRows => "all rows".to_string(),
                     TableMsg::Listed => "listed".to_string(),
@@ -1556,15 +1784,36 @@ mod fast_list_tests {
 
     /// The end of what a list sends once it is shown: the whole list, then `Listed`.
     fn listed_with_its_rows(sent: &[String]) -> bool {
-        sent.ends_with(&["rows 3".to_string(), "listed".to_string()])
+        sent.len() >= 2 && sent[sent.len() - 2].starts_with("rows 3") && sent.last().is_some_and(|s| s == "listed")
+    }
+
+    /// Whether `big` was asked for the whole list with its objects' metadata.
+    fn asked_for_metadata(big: &Big) -> bool {
+        big.asked().iter().any(|q| q.starts_with("/api/v1/pods?") && q.contains("includeObject=Metadata&"))
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn a_big_list_says_when_every_row_is_shown() {
         {
-            // The first page, every namespace's rows from their cells, then the whole list.
-            let (_watch, mut rx) = watch(Big::open(), &Pause::default());
-            assert_eq!(until(&mut rx, "listed").await, ["columns", "rows 1", "rows 3", "all rows", "rows 3", "listed"]);
+            // The first page, then every namespace's rows from their cells, at least as new as
+            // the first page: the list ends there, without the metadata of every pod.
+            let big = Big::open();
+            let (_watch, mut rx) = watch(big.clone(), &Pause::default());
+            assert_eq!(until(&mut rx, "listed").await, ["columns", "rows 1", "rows 3 from cells", "listed"]);
+            assert!(!asked_for_metadata(&big), "{:?}", big.asked());
+            let by_namespace: Vec<String> =
+                big.asked().into_iter().filter(|q| q.starts_with("/api/v1/namespaces/")).collect();
+            assert_eq!(by_namespace.len(), 2);
+            assert!(by_namespace.iter().all(|q| q.contains("resourceVersion=7&")), "{by_namespace:?}");
+        }
+        {
+            // A filter on labels from the start: the whole list follows, with the metadata.
+            let (big, pause) = (Big::open(), Pause::default());
+            pause.want_metadata();
+            let (_watch, mut rx) = watch(big.clone(), &pause);
+            let sent = until(&mut rx, "listed").await;
+            assert_eq!(sent, ["columns", "rows 1", "rows 3 from cells", "all rows", "rows 3", "listed"]);
+            assert!(asked_for_metadata(&big));
         }
         // Hidden, it shows nothing, so it never says every row is shown, nor that it is listed
         // (then its watch is refused); shown, it sends the whole list, then `Listed`.
@@ -1575,6 +1824,19 @@ mod fast_list_tests {
         pause.set(false);
         let sent = until(&mut rx, "listed").await;
         assert!(listed_with_its_rows(&sent), "{sent:?}");
+    }
+
+    /// A filter on labels typed once the list finished from cells: the watch lists again with
+    /// the metadata (here when its refused watch is tried again), and its rows get their uids.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rows_from_cells_get_their_metadata_once_wanted() {
+        let (big, pause) = (Big::open(), Pause::default());
+        let (_watch, mut rx) = watch(big.clone(), &pause);
+        assert_eq!(until(&mut rx, "listed").await, ["columns", "rows 1", "rows 3 from cells", "listed"]);
+        pause.want_metadata();
+        let sent = until(&mut rx, "rows 3").await;
+        assert!(sent.ends_with(&["columns".to_string(), "rows 3".to_string()]), "{sent:?}");
+        assert!(asked_for_metadata(&big));
     }
 
     /// A list left as it loads (another page, a hidden window) pauses at once, while the app
@@ -1604,7 +1866,7 @@ mod fast_list_tests {
             asked.fetch_add(1, Ordering::Relaxed);
             Lane::Foreground
         };
-        let rows = cells_by_namespace(&client, "/api/v1/pods", &lane).await.unwrap();
+        let rows = cells_by_namespace(&client, "/api/v1/pods", "0", &lane).await.unwrap();
         assert_eq!(rows.len(), 3);
         // Asked as each request takes its slot, not once for all: a hidden list that comes on
         // screen while it loads takes the page's slots for the namespaces left.

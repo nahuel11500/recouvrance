@@ -127,6 +127,58 @@ fn write_mode_off_refuses_the_ui_s_writes() {
     });
 }
 
+/// A row of a big list in every namespace comes from its cells alone, without a uid: the
+/// table's delete reads the object's and deletes only the object listed. One newer than
+/// the row (re-created under its name since the list) stays; the one listed goes.
+#[test]
+#[ignore = "needs a kind cluster: RECOUVRANCE_E2E_CONTEXT"]
+fn a_row_without_its_uid_deletes_only_the_object_listed() {
+    run(async {
+        let ui = k8s::connect(context()).await?;
+        let truth: Api<ConfigMap> = Api::namespaced(k8s::connect_for_agents(context()).await?, NS);
+        let name = "e2e-delete-row";
+        let _ = truth.delete(name, &DeleteParams::default()).await;
+        truth.create(&PostParams::default(), &config_map(name)).await?;
+        let kinds = k8s::discover(ui.clone()).await?;
+        let kind = k8s::find_kind(&kinds, "configmaps").cloned().context("no configmaps")?;
+        // As `cells_row` builds it: namespace/name for a uid, the creation time from the Age.
+        let row = |listed: jiff::Timestamp| {
+            Arc::new(k8s::Row {
+                uid: format!("{NS}/{name}"),
+                name: name.into(),
+                namespace: Some(NS.into()),
+                created: Some(listed),
+                cells: vec![name.into()],
+                labels: "".into(),
+                deleting: false,
+                deleted_at: None,
+            })
+        };
+        gate::set_ui_writes(true);
+        let checked = async {
+            // Listed ten minutes ago: the object there now was made after, so it isn't that one.
+            let ago = jiff::Timestamp::now() - jiff::SignedDuration::from_mins(10);
+            let refused = k8s::delete_row(ui.clone(), kind.clone(), row(ago)).await;
+            let err = format!("{:#}", refused.expect_err("a delete of an object newer than the row"));
+            assert!(err.contains("re-created"), "{err}");
+            assert!(truth.get_opt(name).await?.is_some(), "the newer object was deleted");
+            // Listed now: it is the one, and it goes.
+            k8s::delete_row(ui.clone(), kind.clone(), row(jiff::Timestamp::now())).await?;
+            for _ in 0..50 {
+                if truth.get_opt(name).await?.is_none() {
+                    return Ok(());
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            bail!("the object listed was not deleted")
+        };
+        let result: Result<()> = checked.await;
+        gate::set_ui_writes(false);
+        let _ = truth.delete(name, &DeleteParams::default()).await;
+        result
+    });
+}
+
 /// An agent's rules decide on the real cluster through the MCP server: a delete its rules
 /// don't allow is refused and the object stays; the kill switch refuses even reads; with a
 /// delete rule, the same call deletes (so the refusals above are not a broken setup). A
