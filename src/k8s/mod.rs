@@ -17,6 +17,7 @@ pub(crate) mod argo;
 mod cadence;
 mod config;
 mod discovery;
+pub(crate) mod edit;
 mod events;
 mod exec;
 #[cfg(feature = "dev")]
