@@ -2,11 +2,14 @@
 
 use std::collections::{HashMap, HashSet};
 
+use futures::StreamExt as _;
+use futures::stream::FuturesUnordered;
+
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::notification::Notification;
 use gpui_kit::*;
 
-use super::{AppView, Route, TabState, dev_var};
+use super::{AppView, Route, TabState, dev_var, reach};
 use crate::k8s;
 use crate::k8s::Kind;
 
@@ -14,6 +17,8 @@ impl AppView {
     /// Connect to one or more contexts; tables merge them with a Context column.
     pub(super) fn connect_many(&mut self, contexts: Vec<String>, window: &mut Window, cx: &mut Context<Self>) {
         let Some(primary) = contexts.first().cloned() else { return };
+        #[cfg(feature = "dev")]
+        crate::dev::first_rows::connecting(&contexts);
         // Where the contexts connected until now were left, before it is reset below.
         self.leave_session(cx);
         if dev_var("RECOUVRANCE_CONTEXT").is_none() {
@@ -63,8 +68,11 @@ impl AppView {
         self.page_scopes.clear();
         // The palette's object index points at the old clusters.
         self.search_index.clear();
-        self.list.notice = Some(format!("Connecting to {}…", contexts.join(", ")).into());
+        // Each context says it is connecting where the list goes (see `render_connect`).
         self.connect_errors = None;
+        self.connect_notes = None;
+        self.conn = super::conn::ConnStates::connecting(&contexts);
+        self.conn_changed(cx);
         self.connecting = true;
         self.table.update(cx, |t, cx| {
             t.delegate_mut().reset(false, Vec::new(), None, Default::default());
@@ -72,23 +80,59 @@ impl AppView {
         });
         cx.notify();
 
+        // The Pods list, when it is the one shown first, starts with each client.
+        let early = self.early_list(&contexts);
+        self.early = None;
+        self.joined_late = false;
+        self.partial_tabs = None;
+
         self._connect = Some(cx.spawn_in(window, async move |this, cx| {
-            let connects = contexts.iter().map(|c| k8s::connect(c.clone()));
-            let results = futures::future::join_all(connects).await;
+            // Each cluster on its own: connect, then discovery and namespaces together.
+            let executor = cx.background_executor().clone();
+            let mut pending: FuturesUnordered<_> = (contexts.iter().cloned().enumerate())
+                .map(|(ix, ctx)| {
+                    let early = early.clone();
+                    async move { (ix, reach::reach(ctx, early).await) }
+                })
+                .collect();
+            // A cluster that is slow, unreachable or waiting on a login doesn't hold back the
+            // others' rows: it joins when it answers (below).
+            let mut wave = reach::first_wave(
+                &mut pending,
+                |(_, r): &(usize, Result<reach::Reached, String>)| reach::answered(r),
+                || executor.timer(reach::LATE_AFTER),
+            )
+            .await;
+            // In the order the contexts were given: the first one's client is the main one.
+            wave.sort_by_key(|(ix, _)| *ix);
+            // How each one went, before its result is taken apart below.
+            let settled: Vec<(String, Option<String>)> =
+                wave.iter().map(|(ix, r)| (contexts[*ix].clone(), reach::failure(&contexts[*ix], r))).collect();
+            let done: HashSet<usize> = wave.iter().map(|(ix, _)| *ix).collect();
+            let mut waiting: Vec<String> =
+                (contexts.iter().enumerate()).filter(|(ix, _)| !done.contains(ix)).map(|(_, c)| c.clone()).collect();
             let mut clusters = Vec::new();
+            let mut discovered = Vec::new();
+            let mut listed = Vec::new();
+            let mut early_lists = HashMap::new();
             let mut errors = Vec::new();
-            for (ctx, r) in contexts.iter().zip(results) {
+            for (_, r) in wave {
                 match r {
-                    Ok(client) => clusters.push((ctx.clone(), client)),
-                    Err(e) => errors.push(format!("{ctx}: {}", k8s::error_chain(&e))),
+                    Ok(r) => {
+                        if let Some(list) = r.early {
+                            early_lists.insert(r.ctx.clone(), list);
+                        }
+                        clusters.push((r.ctx, r.client));
+                        discovered.push(r.kinds);
+                        listed.push(r.namespaces);
+                    }
+                    Err(e) => errors.push(e),
                 }
             }
             let result = async {
                 let (_, client) = clusters.first().cloned().ok_or_else(|| anyhow::anyhow!(errors.join("; ")))?;
                 // Connecting does not reach the server: discovery is the first request, and
                 // an unreachable cluster fails there.
-                let discovered =
-                    futures::future::join_all(clusters.iter().map(|(_, c)| k8s::discover(c.clone()))).await;
                 let names: Vec<&str> = clusters.iter().map(|(n, _)| n.as_str()).collect();
                 let (mut kinds, kind_clusters) = merge_kinds(&names, discovered, &mut errors);
                 if kinds.is_empty() {
@@ -96,24 +140,14 @@ impl AppView {
                 }
                 // Built-in sections first, then custom resources by group.
                 k8s::sort_for_sidebar(&mut kinds);
-                // Namespace listing may be forbidden; that is not fatal. All clusters at once,
-                // skipping those whose discovery failed: they would only wait out the timeout again.
+                // Namespaces of the clusters whose discovery answered: on the others, listing
+                // them failed the same way, already reported.
                 let reached: HashSet<usize> = kind_clusters.values().flatten().copied().collect();
-                let listed =
-                    clusters.iter().enumerate().filter(|(ix, _)| reached.contains(ix)).map(|(_, (name, c))| {
-                        // Accessible namespaces set for this cluster replace the listing.
-                        let accessible = crate::settings::cluster(name).namespaces;
-                        let (name, c) = (name.clone(), c.clone());
-                        async move {
-                            if accessible.is_empty() {
-                                listed_namespaces(&name, k8s::namespaces(c).await)
-                            } else {
-                                Ok(accessible)
-                            }
-                        }
-                    });
                 let mut namespaces: Vec<String> = Vec::new();
-                for listed in futures::future::join_all(listed).await {
+                for (ix, listed) in listed.into_iter().enumerate() {
+                    if !reached.contains(&ix) {
+                        continue;
+                    }
                     match listed {
                         Ok(names) => namespaces.extend(names),
                         Err(e) => errors.push(e),
@@ -124,19 +158,23 @@ impl AppView {
                 anyhow::Ok((client, kinds, kind_clusters, namespaces))
             }
             .await;
-            let _ = this.update_in(cx, |this, window, cx| {
+            let applied = this.update_in(cx, |this, window, cx| {
                 if this.context.as_deref() != Some(primary.as_str()) {
-                    return; // the user switched again meanwhile
+                    return false; // the user switched again meanwhile
                 }
                 this.connecting = false;
-                match result {
+                for (ctx, failure) in &settled {
+                    this.conn.settle(ctx, failure.as_deref());
+                }
+                let connected = match result {
                     Ok((client, kinds, kind_clusters, namespaces)) => {
                         // Who saved this set before: what this connect does below is no change
                         // of the user's (see `session::SessionOwners`).
                         let owner_before =
                             (cx.try_global::<super::session::SessionOwners>()).and_then(|o| o.owner(&this.session_key));
                         this.kind_clusters = kind_clusters;
-                        this.connect_errors = (!errors.is_empty()).then(|| errors.join("; ").into());
+                        this.connect_errors = reach::connect_status(&errors, &waiting);
+                        this.connect_notes = super::conn::notes(&errors, &this.conn);
                         // The first context may have failed: namespace visits and the ones added
                         // by hand belong to the cluster that is first now.
                         if let Some((first, _)) = clusters.first() {
@@ -182,11 +220,14 @@ impl AppView {
                         // The first window's first set reopens where it was left, again until a
                         // connect reaches every cluster: its namespaces before the list starts,
                         // so the list starts once.
-                        let reopened = if this.restore.finished(&this.session_key, !errors.is_empty()) {
+                        let partial = !errors.is_empty() || !waiting.is_empty();
+                        let reopened = if this.restore.finished(&this.session_key, partial) {
                             this.restore_session(window, cx)
                         } else {
                             None
                         };
+                        // The Pods lists started with the connect, for the list to take over.
+                        this.early = early.clone().map(|of| reach::EarlyLists { of, lists: early_lists });
                         this.restart_watch(cx);
                         // After the list, whose rows its first count waits for.
                         this.problems.start(this.clusters.clone(), this.cluster_kinds(), cx);
@@ -224,14 +265,28 @@ impl AppView {
                             _ => {}
                         }
                         this.settle_session(owner_before, restored, cx);
-                        // A favorite on a context that wasn't connected opens now (once).
+                        // A favorite on a context that wasn't connected opens now (once), or
+                        // when its context joins if it is still connecting.
                         if let Some(favorite) = this.after_connect.take() {
-                            this.open_favorite(favorite, false, window, cx);
+                            if favorite.context().is_some_and(|c| waiting.iter().any(|w| w == c)) {
+                                this.after_connect = Some(favorite);
+                            } else {
+                                this.open_favorite(favorite, false, window, cx);
+                            }
                         }
+                        // Where the user starts from while clusters are still connecting.
+                        if !waiting.is_empty() {
+                            this.partial_tabs = Some(this.tabs_now(cx));
+                        }
+                        true
                     }
                     Err(e) => {
                         this.list.notice = None;
                         this.connect_errors = Some(format!("{e:#}").into());
+                        // Each context says why it failed where the list goes; one that has
+                        // no reason of its own (it served no API) takes the connect's.
+                        this.conn.give_up(&contexts, &k8s::short_error(&e));
+                        this.connect_notes = None;
                         if let Some(favorite) = this.after_connect.take() {
                             window.push_notification(
                                 Notification::warning(format!(
@@ -242,11 +297,62 @@ impl AppView {
                                 cx,
                             );
                         }
+                        false
                     }
-                }
+                };
+                this.conn_changed(cx);
                 cx.notify();
+                connected
             });
+            if !matches!(applied, Ok(true)) {
+                return;
+            }
+            // Clusters that answer after the first rows join them, each when it does.
+            while let Some((ix, r)) = pending.next().await {
+                let alive = this.update_in(cx, |this, window, cx| {
+                    waiting.retain(|c| *c != contexts[ix]);
+                    this.conn.settle(&contexts[ix], reach::failure(&contexts[ix], &r).as_deref());
+                    match r {
+                        Ok(r) if r.kinds.is_ok() => this.join_late(r, early.clone(), &mut errors, window, cx),
+                        Ok(r) => {
+                            if let Err(e) = &r.kinds {
+                                errors.push(format!("{}: {}", r.ctx, k8s::error_chain(e)));
+                            }
+                        }
+                        Err(e) => errors.push(e),
+                    }
+                    this.connect_errors = reach::connect_status(&errors, &waiting);
+                    this.connect_notes = super::conn::notes(&errors, &this.conn);
+                    this.conn_changed(cx);
+                    // The last one in and none failed: the connect is whole after all.
+                    if waiting.is_empty() && errors.is_empty() {
+                        this.joined_whole(window, cx);
+                    }
+                    // The favorite waiting for this context (it says so when it failed).
+                    if this.after_connect.as_ref().is_some_and(|f| f.context() == Some(contexts[ix].as_str()))
+                        && let Some(favorite) = this.after_connect.take()
+                    {
+                        this.open_favorite(favorite, false, window, cx);
+                    }
+                    cx.notify();
+                });
+                if alive.is_err() {
+                    break;
+                }
+            }
         }));
+    }
+
+    /// The context picker marks each context of the set as it stands now.
+    pub(super) fn conn_changed(&mut self, cx: &mut Context<Self>) {
+        let states = self.conn.clone();
+        self.ctx_picker.update(cx, |p, cx| p.set_states(states, cx));
+    }
+
+    /// Connect to the set again: its contexts that failed, with those that answered.
+    pub(super) fn retry_connect(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let set = self.ctx_picker.read(cx).connected.clone();
+        self.connect_many(set, window, cx);
     }
 
     pub(super) fn set_namespaces(&mut self, namespaces: Vec<String>, _: &mut Window, cx: &mut Context<Self>) {
@@ -394,7 +500,7 @@ fn served_by<'a>(
 /// allowed to list them is an answer: they are picked by hand there. A timeout or a server
 /// error is not: the namespaces picked there may still exist, and the connect counts as
 /// partial (a session is not saved over, see `session`).
-fn listed_namespaces(ctx: &str, listed: Result<Vec<String>>) -> Result<Vec<String>, String> {
+pub(super) fn listed_namespaces(ctx: &str, listed: Result<Vec<String>>) -> Result<Vec<String>, String> {
     match listed {
         Ok(names) => Ok(names),
         Err(e) if k8s::api_status(&e) == Some(403) => Ok(Vec::new()),
@@ -419,15 +525,26 @@ fn merge_kinds(
                 continue;
             }
         };
-        for k in found {
-            let entry = kind_clusters.entry(k.key()).or_default();
-            if entry.is_empty() {
-                kinds.push(k);
-            }
-            entry.push(ix);
-        }
+        add_kinds(&mut kinds, &mut kind_clusters, ix, found);
     }
     (kinds, kind_clusters)
+}
+
+/// The kinds the cluster at `ix` serves added to `kinds`, and where each exists: a cluster
+/// that joins after the others (see `reach`) as `merge_kinds` adds each one.
+pub(super) fn add_kinds(
+    kinds: &mut Vec<Kind>,
+    kind_clusters: &mut HashMap<String, Vec<usize>>,
+    ix: usize,
+    found: Vec<Kind>,
+) {
+    for k in found {
+        let entry = kind_clusters.entry(k.key()).or_default();
+        if entry.is_empty() {
+            kinds.push(k);
+        }
+        entry.push(ix);
+    }
 }
 
 /// Lists in a history that name a kind none of the clusters serve show `fallback` instead.
@@ -674,10 +791,33 @@ mod tests {
 /// The namespaces Helm reads on a cluster, for every choice and accessible list.
 #[cfg(test)]
 mod properties {
-    use super::cluster_namespaces;
+    use super::{Kind, add_kinds, cluster_namespaces, merge_kinds};
     use proptest::prelude::*;
 
     proptest! {
+        /// A cluster that answers after the first rows adds its kinds, and where each one
+        /// exists, as if it had answered with the others: the kinds a list or a scan asks a
+        /// cluster for don't depend on when it connected.
+        #[test]
+        fn a_late_cluster_merges_like_the_others(
+            lists in prop::collection::vec(prop::collection::vec(0usize..6, 0..5), 1..4),
+        ) {
+            const KINDS: [&str; 6] = ["Pod", "Service", "Secret", "Job", "Lease", "Node"];
+            let found: Vec<Vec<Kind>> =
+                lists.iter().map(|l| l.iter().map(|&i| Kind::fake("", KINDS[i])).collect()).collect();
+            let names: Vec<String> = (0..found.len()).map(|i| format!("c{i}")).collect();
+            let names: Vec<&str> = names.iter().map(String::as_str).collect();
+            let (all, all_where) = merge_kinds(&names, found.iter().cloned().map(Ok).collect(), &mut Vec::new());
+            let last = found.len() - 1;
+            let (mut kinds, mut where_) =
+                merge_kinds(&names[..last], found[..last].iter().cloned().map(Ok).collect(), &mut Vec::new());
+            add_kinds(&mut kinds, &mut where_, last, found[last].clone());
+            let keys = |kinds: &[Kind]| kinds.iter().map(Kind::key).collect::<Vec<_>>();
+            prop_assert_eq!(keys(&kinds), keys(&all));
+            prop_assert_eq!(where_, all_where);
+        }
+
+
         /// Namespaces chosen are never widened to all of them, and a cluster with a list
         /// of accessible namespaces is never read cluster-wide.
         #[test]

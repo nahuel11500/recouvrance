@@ -30,6 +30,8 @@ use banners::ApprovalStrip;
 mod banners;
 mod chrome;
 pub(crate) mod commands;
+pub(crate) mod conn;
+mod connect_view;
 mod contexts;
 #[cfg(feature = "dev")]
 mod demo;
@@ -42,6 +44,7 @@ mod overviews;
 mod pages;
 mod pinned;
 mod problem_badge;
+mod reach;
 mod render;
 mod search_index;
 mod session;
@@ -508,6 +511,11 @@ pub struct AppView {
     table: Entity<TableState<ResourceTable>>,
     /// Contexts that failed to connect, until the next connect.
     connect_errors: Option<SharedString>,
+    /// Each context of the set that can't show rows: connecting, or why it failed.
+    conn: conn::ConnStates,
+    /// What the bar above the list says of the connect besides each context's state (a
+    /// namespace list that failed, the kubeconfig that can't be read).
+    connect_notes: Option<SharedString>,
     watch: Option<watch::ListWatch>,
     metrics: Option<Vec<(TaskGuard, Task<()>)>>,
     /// The timeline's own watches (`timeline.kinds`), while connected.
@@ -515,6 +523,16 @@ pub struct AppView {
     /// A connect is in flight (`_connect` stays set once it is done).
     connecting: bool,
     _connect: Option<Task<()>>,
+    /// The Pods lists the connect started before discovery answered, until the list's watch
+    /// takes them over (see `reach::EarlyList`).
+    early: Option<reach::EarlyLists>,
+    /// A cluster joined after the first rows (see `reach`): the session's tabs were reopened
+    /// without what only it has, so the session is not saved over until every cluster of the
+    /// set is in (`joined_whole`) or the next connect.
+    joined_late: bool,
+    /// The tabs as a connect that left clusters connecting ended with: once they have all
+    /// joined, the session is reopened whole only if the user didn't change them since.
+    partial_tabs: Option<(Vec<crate::settings::SavedTab>, usize)>,
     /// The set of contexts picked (`settings::session_set`), whose session this window saves;
     /// empty when none is saved (not connected yet, or contexts given by a developer hook).
     session_key: Vec<String>,
@@ -779,11 +797,16 @@ impl AppView {
             forwards_open: false,
             table,
             // A kubeconfig that can't be read shows where connect errors do.
+            connect_notes: status.clone(),
             connect_errors: status,
+            conn: conn::ConnStates::default(),
             watch: None,
             metrics: None,
             connecting: false,
             _connect: None,
+            early: None,
+            joined_late: false,
+            partial_tabs: None,
             session_key: Vec::new(),
             restore: if first_window { session::Restore::FirstConnect } else { session::Restore::Off },
             view_id: cx.entity_id(),

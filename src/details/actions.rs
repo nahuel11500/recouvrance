@@ -3,7 +3,7 @@
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::notification::Notification;
-use gpui_kit::component::{ActiveTheme as _, WindowExt as _, h_flex, v_flex};
+use gpui_kit::component::{ActiveTheme as _, Disableable as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
@@ -137,6 +137,15 @@ impl DetailPanel {
             "Unfinalize" => patch(serde_json::json!({"metadata": {"finalizers": null}})),
             "Save" => format!("replace -f {}", shell_word(&format!("{}.yaml", self.obj.name))),
             "Debug" => format!("debug -it {name} --image=busybox:1.37"),
+            // kubectl evicts only inside a drain: the API call itself.
+            "Evict" => {
+                let ns = self.obj.namespace.as_deref().unwrap_or_default();
+                let body = serde_json::json!({"apiVersion": "policy/v1", "kind": "Eviction",
+                    "metadata": {"name": self.obj.name, "namespace": ns}});
+                let path = format!("/api/v1/namespaces/{ns}/pods/{}/eviction", self.obj.name);
+                format!("create --raw {} -f - <<< {}", shell_word(&path), k8s::shell_quote(&body.to_string()))
+            }
+            "Force refresh" => format!("annotate {kind} {name} --overwrite {}=$(date +%s)", k8s::FORCE_SYNC),
             other => format!("{} {kind}/{name}", other.to_lowercase()),
         };
         kubectl(&self.context, self.obj.namespace.as_deref(), &args)
@@ -144,7 +153,7 @@ impl DetailPanel {
 
     /// The uid of the object on screen: a delete hits that object, not one re-created under
     /// its name since.
-    fn shown_uid(&self) -> Option<String> {
+    pub(super) fn shown_uid(&self) -> Option<String> {
         let uid = self.object.as_ref()?.pointer("/metadata/uid")?.as_str()?;
         Some(uid.to_string())
     }
@@ -540,7 +549,7 @@ impl DetailPanel {
             let (c, k, ns, n) =
                 (self.client.clone(), self.obj.kind.clone(), self.obj.namespace.clone(), self.obj.name.clone());
             let uid = self.shown_uid();
-            self.run_write("Delete", k8s::delete_with(c, k, ns, n, uid, false, false), window, cx);
+            self.run_write("Delete", k8s::delete_with(c, k, ns, n, uid, k8s::DeleteOptions::default()), window, cx);
             return;
         }
         let input = cx.new(|cx| InputState::new(window, cx).placeholder(self.obj.name.clone()));
@@ -548,7 +557,9 @@ impl DetailPanel {
         let (name, context) = (self.obj.name.clone(), self.context.clone());
         let ar = self.obj.kind.ar.clone();
         let label = self.obj.kind.label.clone();
-        let opts = cx.new(|_| (false, false));
+        let opts = cx.new(|_| (false, false, false));
+        // What a workload owns can be kept, like `kubectl delete --cascade=orphan`.
+        let owns = owned_label(&self.obj.kind);
         let base = self.kubectl_for("Delete");
         let unfinalize = self.kubectl_for("Unfinalize");
         // The object shown now: the refresh may swap in one re-created under its name while
@@ -557,13 +568,16 @@ impl DetailPanel {
         window.open_alert_dialog(cx, move |alert, _, cx| {
             let (input, panel, name, guard, uid, run_as) =
                 (input.clone(), panel.clone(), name.clone(), guard.clone(), uid.clone(), run_as.clone());
-            let (force, strip) = *opts.read(cx);
+            let (force, strip, orphan) = *opts.read(cx);
             let mut cmd = if force { format!("{base} --grace-period=0 --force") } else { base.clone() };
+            if orphan {
+                cmd = format!("{cmd} {}", k8s::Cascade::Orphan.flag());
+            }
             // Delete first; finalizers are cleared only when it then stays, stuck terminating.
             if strip {
                 cmd = format!("{cmd} --timeout={}s || {unfinalize}", k8s::FINALIZER_GRACE_SECS);
             }
-            let (o1, o2) = (opts.clone(), opts.clone());
+            let (o1, o2, o3) = (opts.clone(), opts.clone(), opts.clone());
             alert
                 .title(format!("Delete {} {name}?", ar.kind))
                 .description(if typed {
@@ -594,6 +608,10 @@ impl DetailPanel {
                                     "Remove finalizers"
                                 })
                                 .checked(strip)
+                                // Clearing them would also clear the garbage collector's
+                                // `orphan`, which then deletes what the user asked to keep.
+                                .disabled(orphan)
+                                .when(orphan, |c| c.tooltip("Not with an orphan delete: it would delete what it keeps"))
                                 .on_click(move |v: &bool, _, cx| {
                                     let v = *v;
                                     o2.update(cx, |o, cx| {
@@ -608,6 +626,31 @@ impl DetailPanel {
                                 "Finalizers let controllers clean up (volumes, cloud resources, dependents): \
                                  removing them can leave those behind for good.",
                             ))
+                        })
+                        .when_some(owns, |d, owns| {
+                            d.child(
+                                Checkbox::new("del-orphan")
+                                    .label(format!("Keep {owns} (orphan them)"))
+                                    .checked(orphan)
+                                    .disabled(strip)
+                                    .when(strip, |c| {
+                                        c.tooltip("Not while removing finalizers: it would delete what it keeps")
+                                    })
+                                    .on_click(move |v: &bool, _, cx| {
+                                        let v = *v;
+                                        o3.update(cx, |o, cx| {
+                                            o.2 = v;
+                                            cx.notify();
+                                        });
+                                        cx.refresh_windows();
+                                    }),
+                            )
+                            .when(orphan, |d| {
+                                d.child(div().text_sm().text_color(cx.theme().muted_foreground).child(
+                                    "They keep running without an owner. A new one with the same selector \
+                                     adopts them: how immutable fields are changed without stopping the pods.",
+                                ))
+                            })
                         }),
                 )
                 .child(confirm_with(&cmd, guard.as_ref(), &run_as, cx))
@@ -625,7 +668,9 @@ impl DetailPanel {
                             this.obj.name.clone(),
                         );
                         let uid = uid.clone();
-                        this.run_write("Delete", k8s::delete_with(c, k, ns, n, uid, force, strip), window, cx);
+                        let cascade = orphan.then_some(k8s::Cascade::Orphan);
+                        let opts = k8s::DeleteOptions { force, strip_finalizers: strip, cascade };
+                        this.run_write("Delete", k8s::delete_with(c, k, ns, n, uid, opts), window, cx);
                     });
                     true
                 })
@@ -927,6 +972,18 @@ pub fn confirm_with(cmd: &str, guard: Option<&Guard>, run_as: &RunAs, cx: &App) 
         })
         .when_some(guard, |d, guard| d.child(guard.render(cx)))
         .into_any_element()
+}
+
+/// What deleting an object of `kind` takes with it and an orphan delete keeps, said for its
+/// checkbox: the workloads, whose pods are what people want to keep. None for other kinds, and
+/// for a Job, which the API already deletes without its pods.
+pub(crate) fn owned_label(kind: &k8s::Kind) -> Option<&'static str> {
+    match (kind.ar.group.as_str(), kind.ar.kind.as_str()) {
+        ("apps", "Deployment") => Some("its ReplicaSets and pods"),
+        ("apps", "StatefulSet" | "DaemonSet" | "ReplicaSet") => Some("its pods"),
+        ("batch", "CronJob") => Some("its Jobs and their pods"),
+        _ => None,
+    }
 }
 
 /// "Change what deleting asks…": a link under delete dialogs to their setting.

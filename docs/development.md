@@ -59,6 +59,14 @@ process's resident memory (Linux):
 RECOUVRANCE_CONTEXT=kind-dev RECOUVRANCE_BACKTIME=pods,deployments,3 cargo run --features dev -- --snapshot out.png 8
 ```
 
+`RECOUVRANCE_FIRSTROWS=1` prints to stderr, from the moment a connect starts, when each cluster's
+first rows reach the table and when its list is complete. With a context that can't be reached
+among the ones connected, it shows whether the others' rows wait for it:
+
+```sh
+RECOUVRANCE_CONTEXT=kind-dev,unreachable RECOUVRANCE_FIRSTROWS=1 cargo run --features dev -- --snapshot out.png 40
+```
+
 `RECOUVRANCE_REQUESTS=<seconds>` counts what the page on screen asks of the API server: once the
 other variables have set it up (a detail page opened with `RECOUVRANCE_SELECT`, say), the problem
 badge stops counting (its scans would hide the page's requests), the counts of Settings → API

@@ -245,7 +245,12 @@ impl AppView {
 
     /// The cluster picker's button: a dot per cluster, a lock when one is protected.
     fn ctx_trigger(&self, theme: &Theme) -> Button {
-        let names: Vec<String> = self.clusters.iter().map(|c| c.0.clone()).collect();
+        // While none of the set is connected, the set it is connecting to (or failed to).
+        let names: Vec<String> = if self.clusters.is_empty() {
+            self.conn.iter().map(|(c, _)| c.clone()).collect()
+        } else {
+            self.clusters.iter().map(|c| c.0.clone()).collect()
+        };
         let dots: Vec<Hsla> =
             names.iter().map(|n| crate::settings::context_color(n).map_or(theme.blue, |c| rgb(c).into())).collect();
         let protected = names.iter().any(|n| crate::settings::is_protected(n));
@@ -306,7 +311,7 @@ impl AppView {
     }
 
     /// The resource list: its bar (kind, count, filter, actions), status and table.
-    fn render_list(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_list(&self, cx: &mut Context<Self>) -> AnyElement {
         let (total, shown) = {
             let t = self.table.read(cx).delegate();
             (t.total(), t.rows_count_visible())
@@ -373,20 +378,27 @@ impl AppView {
                     .on_click(cx.listener(|this, _, window, cx| this.save_view_dialog(window, cx))),
             )
             .child(self.render_columns_menu(cx));
+        // None of the set connected yet: each context's state, not an empty table.
+        if self.nothing_connected() {
+            return v_flex().size_full().child(view_bar).child(self.render_connect(cx)).into_any_element();
+        }
+        let banner = self.render_conn_banner(cx);
         v_flex()
             .size_full()
             .child(view_bar)
+            .children(banner)
             .when_some(self.status_line(), |d, s| {
                 d.child(div().px_3().py_1().text_sm().text_color(cx.theme().muted_foreground).child(s))
             })
             .children(self.render_selection_bar(cx))
             // Row presses are recorded by the table itself (see `ResourceTable::render_tr`).
             .child(div().flex_1().min_h_0().child(DataTable::new(&self.table).small().stripe(false).bordered(false)))
+            .into_any_element()
     }
 
     fn render_content(&self, cx: &mut Context<Self>) -> AnyElement {
         match self.route() {
-            Route::Resources(_) => self.render_list(cx).into_any_element(),
+            Route::Resources(_) => self.render_list(cx),
             Route::Detail(d) => d.clone().into_any_element(),
             Route::Workloads(d) => d.clone().into_any_element(),
             Route::Cluster(d) => d.clone().into_any_element(),

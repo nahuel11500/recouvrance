@@ -1,6 +1,17 @@
 # Features
 
-- **Contexts**: pick one or several on launch; tables merge clusters with a Context column. When a
+- **Contexts**: pick one or several on launch; tables merge clusters with a Context column. Each
+  context connects on its own: the first rows show once one cluster has answered and the others
+  have had 2 more seconds, so a cluster that can't be reached, or a login waiting in the browser,
+  doesn't hold back the others' rows. Until one of the set answers, the list's place shows each
+  context as "Connecting…" or "Can't connect: <why>" (never an empty "No resources"), with Retry
+  and Choose contexts; once others show rows, those still connecting or failed get a line each
+  above the list. The context picker and the Contexts page mark them too ("connecting…", "can't
+  connect" with the reason in a tooltip). A cluster still connecting joins the list when it
+  answers, and the page on screen then (a Cluster or Argo CD overview is built again). Retry
+  connects to the whole set again. Once every cluster is in, the set's session is saved again
+  (and reopened whole if it was reopened without them and nothing changed since). The Pods list starts with the connect,
+  alongside the cluster's discovery and namespace list, when it is the list shown first. When a
   context's login command (its kubeconfig exec plugin) fails, the app says which program failed and
   its exit code: never its arguments, environment or output, where a client secret or a token can
   be. It adds the last line the plugin wrote to stderr when the kubeconfig sets
@@ -20,8 +31,8 @@
   detail page reopens on the list or overview it was opened from; a window that would be out of
   reach (a display unplugged) is centered. A window opened later starts fresh, and write mode is
   always off at launch. While a cluster of the set doesn't answer, or its namespaces don't list
-  (said above the list), nothing is saved for that set: what only that cluster has would read
-  as gone; connecting that set again once every cluster answers reopens it from what was saved.
+  (said above the list), or joins after the first rows, nothing is saved for that set: what only
+  that cluster has would read as gone; connecting that set again once every cluster answers reopens it from what was saved.
   A set connected for the first time is saved once connected. With two windows on one set, the
   one that reopened it saves it, until something is changed in the other.
 - **Sidebar**: the filter at its top finds pages and resource types (by name, kind or API group).
@@ -233,6 +244,14 @@
   pending PVC says which ConfigMap, Secret, PVC, ServiceAccount or StorageClass it waits on
   (`optional: true` references aren't needed, and a running pod needs none any more). Kinds that
   can't be read are named, not reported missing.
+- **Volumes filling up**: a PVC's page shows its used and free space and its inodes, as the
+  kubelet of a node running a pod that mounts it measures them (read for the page shown; it needs
+  `nodes/proxy`, and a PVC no running pod mounts says "not mounted"). The Problems page lists the
+  PVCs over 90% of their space or inodes (critical from 97%), from one query to the cluster's
+  Prometheus per scan (`kubelet_volume_stats_*`), nothing more asked of the API server; a PVC its
+  own firing alert (such as `KubePersistentVolumeFillingUp`) already names, or one whose alert is
+  silenced, isn't listed twice. Without Prometheus there is nothing to list; one that doesn't
+  answer is named as not checked.
 - **Stuck deletions**: the Problems page lists objects (pods, workloads, Jobs, PVCs, PVs,
   Namespaces, Argo CD Applications) whose deletion has waited more than 10 minutes, with the
   finalizers holding them (for a Namespace, the resources left); their Delete dialog offers to
@@ -602,9 +621,15 @@
   type them as before.
 - **Write mode** (off by default): click the `read-only` badge to enable scale, restart, delete
   (confirmed as set per kind), YAML edits (validated by a server dry run first), cordon/uncordon nodes,
-  debug pods with an ephemeral container (falls back to a Pod Security "restricted" profile), run a CronJob now, suspend/resume (CronJobs, Flux, Argo CronWorkflows), drain nodes, force delete
+  debug pods with an ephemeral container (falls back to a Pod Security "restricted" profile), *Evict* a
+  pod (through the Eviction API, like a drain: refused when a PodDisruptionBudget would be broken,
+  and the refusal names the budget), run a CronJob now, suspend/resume (CronJobs, Flux, Argo CronWorkflows), drain nodes, force delete
   or remove finalizers (only once the delete leaves it stuck terminating: it already was, or still is
-  after 10 seconds), Flux *Reconcile*, Argo CD
+  after 10 seconds), delete a Deployment, StatefulSet, DaemonSet, ReplicaSet or CronJob and keep
+  what it owns (a *Keep ... (orphan them)* box in its Delete dialog, such as *Keep its ReplicaSets and pods* for a
+  Deployment; `kubectl delete --cascade=orphan`: how a StatefulSet's volume claim templates or a selector are changed
+  without stopping its pods; not together with removing finalizers, which would delete what it keeps), an ExternalSecret's *Force
+  refresh* (its `force-sync` annotation: the operator fetches it from its store now), Flux *Reconcile*, Argo CD
   *Refresh*/*Hard refresh*/*Sync*/*Terminate*/*Roll back*, create/apply YAML (a server dry run first, then a confirmation
   showing what each object changes against the cluster: created, changed with its diff, or no change). YAML edits on a detail
   page save only that object: a changed kind, API group, namespace or name is refused, and so are masked Secret values. The
@@ -620,8 +645,8 @@
   `kubectl` line shows `--as`. A protected context still asks for its confirmation (a wait or its name). Reads go as you; write mode and
   the identity are checked again when each request is sent (an identity changed meanwhile sends
   nothing). Actions disabled because your RBAC forbids them stay enabled when the context has an
-  identity. Covered: scale, restart, rollback, delete (force, finalizers), YAML save, the values
-  editor, Apply, cordon/uncordon, drain, CronJob run, suspend/resume, Flux reconcile, Argo CD
+  identity. Covered: scale, restart, rollback, delete (force, finalizers, orphan), YAML save, the values
+  editor, Apply, cordon/uncordon, drain, evict, ExternalSecret refresh, CronJob run, suspend/resume, Flux reconcile, Argo CD
   refresh/sync/terminate/rollback, role bindings. Not covered: Helm, bulk delete from tables, plugins, shells, debug,
   node shell, file copy and ServiceAccount kubeconfigs. Agents never run as it.
 - **Plugins**: your own commands on resources (`~/.config/recouvrance/plugins.yaml`):

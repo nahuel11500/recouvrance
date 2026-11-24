@@ -47,6 +47,7 @@ impl DetailPanel {
         let is_argo = k.is("argoproj.io", "Application");
         let argo_busy = is_argo && self.object.as_ref().is_some_and(k8s::argo::ops::in_progress);
         let is_pod = k.is("", "Pod");
+        let is_external_secret = k.is(crate::external_secrets::GROUP, "ExternalSecret");
         let plugins = crate::plugins::for_kind(&k.kubectl_name(), &k.ar.plural, cx);
         // Actions your RBAC does not allow are disabled (checked like `kubectl auth can-i`).
         let denied = self.denied.clone();
@@ -60,6 +61,7 @@ impl DetailPanel {
                 b.disabled(true).tooltip(match verb {
                     "run" => "Your RBAC does not allow creating Jobs here",
                     "drain" => "Your RBAC does not allow evicting pods",
+                    "evict" => "Your RBAC does not allow evicting this pod",
                     "debug" => "Your RBAC does not allow adding debug containers",
                     "nodeshell" => "Your RBAC does not allow creating pods in kube-system",
                     "delete" => "Your RBAC does not allow deleting this",
@@ -103,6 +105,21 @@ impl DetailPanel {
             })
             .when(is_pod, |d| {
                 d.child(gate(Button::new("act-debug"), "debug").small().ghost().icon(Lucide::Bug).label("Debug").on_click(cx.listener(|this, _, w, cx| this.confirm_debug(w, cx))))
+                .child(gate(Button::new("act-evict"), "evict").small().ghost().icon(Lucide::LogOut).label("Evict").on_click(cx.listener(|this, _, w, cx| {
+                    let title = format!("Evict pod {}?", this.obj.name);
+                    this.confirm_action(title, "Deletes the pod through the Eviction API, as a drain does: refused when a PodDisruptionBudget would be broken. Its controller, if any, starts a new one.", "Evict", |p, client| {
+                        // This pod, not one re-created under its name since it was shown.
+                        Box::pin(k8s::evict(client, p.obj.namespace.clone().unwrap_or_default(), p.obj.name.clone(), p.shown_uid(), false))
+                    }, w, cx);
+                })))
+            })
+            .when(is_external_secret, |d| {
+                d.child(gate(Button::new("act-es-refresh"), "patch").small().ghost().icon(Lucide::RefreshCw).label("Force refresh").on_click(cx.listener(|this, _, w, cx| {
+                    let title = format!("Refresh ExternalSecret {} now?", this.obj.name);
+                    this.confirm_action(title, "Asks the External Secrets Operator to fetch it from its store now (its force-sync annotation); the Secret it writes is updated if the value changed.", "Force refresh", |p, client| {
+                        Box::pin(k8s::force_sync_external_secret(client, p.obj.kind.clone(), p.obj.namespace.clone(), p.obj.name.clone(), false))
+                    }, w, cx);
+                })))
             })
             .when(is_flux, |d| {
                 d.child(
@@ -266,5 +283,5 @@ impl DetailPanel {
 /// Whether the confirmation of the actions checked with `verb` offers to run as another
 /// identity. Shells (debug, node shell) never do, nor a ServiceAccount's kubeconfig.
 fn can_run_as(verb: &str) -> bool {
-    matches!(verb, "patch" | "delete" | "run" | "drain" | "create")
+    matches!(verb, "patch" | "delete" | "run" | "drain" | "evict" | "create")
 }
