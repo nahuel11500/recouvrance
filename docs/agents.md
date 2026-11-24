@@ -74,7 +74,11 @@ syncing an Application doesn't allow patching its spec. Rules saved by a version
 verbs checked GitOps actions as `patch`: on the first start of this version, every rule that
 names `patch` gets the three verbs, once (and rules.yaml is written again), so what it allowed,
 asked or denied it still does. Take `refresh` out of an Ask rule afterwards to let refreshes
-through.
+through. rules.yaml says which rules it holds (`version: 2`), so a file without it is upgraded
+whenever it is loaded (restored from git, copied from another machine, or given with no
+agents.json), and so are rules copied with *Copy rules* by an older version and pasted. A file
+without it whose rules name `refresh`, `sync` or `suspend` was written for them: it is not loaded
+until `version: 2` is added at its top (pasted rules that name them are taken as they are).
 
 Write mode and protected contexts are for you in the window: an agent's calls don't check them,
 only its rules (with the rate limit and the kill switch below). An Allow rule for a write lets the
@@ -101,7 +105,9 @@ run) and offer **Always allow this** to add a narrow rule; it wins over the Ask 
 the same request is not asked again (until you edit the rule). It covers that kind only, not another
 API group's kind with the same plural, and its names and contexts match case included. The rule editor marks such rules
 "approved", and rules pasted with *Paste rules* never count as approved. In a pasted rule, a missing
-effect means Deny, and a missing list means `*` in a Deny or Ask, none in an Allow. For `apply_manifest` the banner lists
+effect means Deny, and a missing list means `*` in a Deny or Ask, none in an Allow; rules copied
+without a `version` (by a version before the GitOps verbs) get them where they name `patch`, unless
+one names `refresh`, `sync` or `suspend` already. For `apply_manifest` the banner lists
 every object (kind, namespace/name) and the YAML that will be applied, a Secret's values masked; the
 activity log keeps each object with a hash of that YAML, and the objects already applied when a call
 is cut off.
@@ -124,9 +130,10 @@ replica count), `apply_manifest` (nor the content), requests other than lists wi
 (e.g. `check_certificates`: the rule would cover every name), requests across all namespaces (the
 rule would also cover namespaces no rule allows), and dry runs (the rule would allow the real write
 too), and Flux suspend and resume (one `suspend` verb covers both, so approving a resume would also
-allow suspending). A refresh or a sync gets one: its rule allows that action (`sync`, say) on that
-object only. An Argo CD sync with prune, a rollback or a terminate doesn't: their `sync` rule would
-allow any other sync, prune or rollback of the Application, beyond what the banner showed.
+allow suspending), and an Argo CD sync, terminate or rollback (one `sync` verb covers them all, and
+a rule cannot pin a prune, the `resources` synced or a rollback's deployment: approving a plain sync
+would let a later prune delete objects nobody was shown). A refresh or a Flux reconcile gets one:
+its rule allows that action on that object only.
 
 Before any rule is checked, a call's context must be named by one of the agent's Allow or Ask rules
 (`@protected` names none) and not covered by a Deny of everything (`*` verbs, resources, namespaces
@@ -162,7 +169,7 @@ Tools, by what they do:
   `top_nodes`, `usage_history`, `get_logs`, `workload_logs`, `get_changes`, `recent_changes`,
   `rollout_history`, `rollout_status`, `list_helm_releases`, `helm_history`, `helm_get_values`,
   `diff_manifest`, `explain_resource`, `can_i`, `cluster_version`, `upgrade_check`, `wait_for`,
-  `list_port_forwards`, `browse_files`, `get_metrics`.
+  `list_port_forwards`, `browse_files`, `get_metrics`, `argocd_apps`.
 - **Change:** `scale`, `rollout_restart`, `rollout_undo`, `rollout_pause`, `rollout_resume`,
   `set_image`, `patch_resource`, `apply_manifest`, `delete_resource`, `trigger_cronjob`,
   `cordon_node`, `uncordon_node`, `drain_node`, `gitops`, `exec_command`, `debug_pod`,
@@ -204,6 +211,29 @@ tools' definitions. What some of them need beyond the obvious verb:
 - **Logs of a workload:** `workload_logs` merges the logs of a workload's or Service's pods (the
   newest 20) in time order, each line prefixed with its pod. It needs `get` on the workload; pods
   whose logs the rules don't allow are left out and counted.
+- **Argo CD, from the hub to the destination:** `argocd_apps` lists Applications like the Argo CD
+  page: for each, its hub (the context Argo CD runs in), project, sync, health, auto-sync, last
+  operation, revision, where it deploys (the kubeconfig context that reaches its destination,
+  marked when the agent's rules don't open it) and the app of apps that made it, those needing a
+  look first with Argo CD's message. Filters: `problems_only` (a failed sync, an error, Degraded
+  or Missing, a sync running, or out of sync with auto-sync on; out of sync with auto-sync off is
+  how an Application synced by hand waits, not a problem), `out_of_sync`, `project`,
+  `destination` (a context) and `dest_namespace`. It reads the hub in `context`, else the hubs
+  ticked in Settings → Contexts, else those the window or an agent's calls found serving
+  Applications, and only among the contexts the rules name: no other context is asked whether it
+  runs Argo CD. It needs `list` on `applications.argoproj.io` on the hub and shows the rows the
+  rules allow; without `context` it never asks for approval and names the hubs only an Ask rule
+  covers. The list is the one the Argo CD page reads (kept 30 s, one per hub).
+  `describe_resource` and `get_changes` name the Application that deployed an object, from its
+  tracking id (`argocd.argoproj.io/tracking-id`, Argo CD's annotation tracking) or else its
+  `app.kubernetes.io/instance` label (label tracking; Helm sets it too, so it counts only when
+  the Application is found tracking the object), with its hub, sync, health and the object's own
+  state in it; `get_changes` adds the Application's deployments. That Application is read on the
+  same hubs, only where an Allow rule gives `get` on it (or `list`, to find it in another
+  namespace or by label), and nothing is read for an object that names none. `wait_for` waits for
+  an Application's `sync=Synced`, `health=Healthy` or `operation=Succeeded`, met only once no
+  operation runs (until then they are from before it); it returns at once with Argo CD's message
+  when the last operation failed.
 - **Argo CD diagnosis:** `gitops` with `action: diagnose` on an Application changes nothing and
   needs `get` on it (not `refresh` or `sync`; the activity log doesn't count it as a change). It returns the
   diagnosis of the Application's page: a deletion held by a finalizer, a sync running for long,
@@ -293,8 +323,13 @@ tools' definitions. What some of them need beyond the obvious verb:
 Prompts (slash commands in Claude Code: `/mcp__recouvrance__troubleshoot` …): `troubleshoot`, `rightsize`,
 `cert-audit`, `cluster-health`. They chain the tools above into a read-only workflow.
 
-Every call is logged with its decision and rule, and appended to
-`~/.local/share/recouvrance/audit.jsonl` (the folder is 0700, the file 0600). At 10 MiB the log moves to
+Every call is logged with its decision and rule, the client it came from, and the Secrets whose values
+it returned, and appended to
+`~/.local/share/recouvrance/audit.jsonl` (the folder is 0700, the file 0600). The client is the name and
+version the MCP client gives (`claude-code 2.1.3`); the in-app assistant shows as
+`recouvrance-assistant` with an API key, and as `assistant via claude-code …` through Claude Code. It is
+a label the client chooses, not a check. A call that returned Secret values unmasked, which a `reveal`
+rule allows, says which (`Secret shop/db`, `Helm values shop/web revision 3`). At 10 MiB the log moves to
 `audit.jsonl.1`, replacing the older one. If the log cannot be written, the Activity page says so. A
 kill switch cuts all agent access at once. A request nobody answers within 2 minutes is refused: its
 banner counts down to that. So that it is seen with the window behind others or minimized, every
@@ -310,10 +345,13 @@ whether a request was refused, left unanswered, given up by the agent or cut off
 A session ends when its client closes it or after an hour unused, never while its agent still waits
 for one of its calls, however long that takes.
 
-The Activity page groups calls by task: one agent session, split where the agent paused for more than
-10 minutes. Each group says what it touched (contexts, namespaces, objects); repeated calls of a tool on
-the same target fold into one line, and any line opens to its full arguments and result. Filter by
-writes, denied or failed calls, context, agent or text. It shows the latest 300 calls; "Show older"
+The Activity page groups calls by task: one session of one client, split where the agent paused for
+more than 10 minutes. Each group names its client and says what it touched (contexts, namespaces,
+objects) and how many of its calls showed Secret values; repeated calls of a tool on the same target fold
+into one line, and any line opens to its full arguments and result. Filter by writes, denied or failed
+calls, calls that showed Secret values, context, agent or text. The search box also takes terms:
+`client:`, `tool:`, `ctx:`, `ns:` and `kind:` (part of the value), `is:write` and `is:reveal`; every
+term must match. It shows the latest 300 calls; "Show older"
 goes further back, and then reads the log on disk. A call counts as a write when its tool may change
 something (the changes above, and `browse_files` with `debug: true`), but not a dry run nor `gitops`'s
 `diagnose`; each group counts its writes. A `gitops` dry run counts: it writes the Application's

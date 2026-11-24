@@ -37,6 +37,7 @@ mod menus;
 mod navigation;
 mod overviews;
 mod pages;
+mod pinned;
 mod problem_badge;
 mod render;
 mod search_index;
@@ -75,6 +76,8 @@ enum Route {
     Settings,
     Terminal(Entity<crate::ui::terminal::TerminalView>),
     Apply(Entity<crate::ui::apply_view::ApplyView>),
+    /// The logs of the checked rows.
+    Logs(Entity<crate::details::LogsPage>),
     Agents,
 }
 
@@ -103,6 +106,7 @@ impl Route {
             Self::Argo(e) => Some(e.entity_id()),
             Self::Terminal(e) => Some(e.entity_id()),
             Self::Apply(e) => Some(e.entity_id()),
+            Self::Logs(e) => Some(e.entity_id()),
             Self::Resources(_) | Self::Contexts | Self::Settings | Self::Agents => None,
         }
     }
@@ -157,6 +161,18 @@ pub fn is_visible(page: EntityId, cx: &App) -> bool {
 /// in the back/forward history).
 pub fn is_current(page: EntityId, cx: &App) -> bool {
     cx.try_global::<VisiblePages>().is_some_and(|v| v.current(page))
+}
+
+/// Put `page` on screen, or take it off: for view tests of pages that wait to be shown.
+#[cfg(all(test, feature = "dev"))]
+pub fn show_for_test(cx: &mut App, page: EntityId, shown: bool) {
+    let window: EntityId = 999_999u64.into();
+    let visible = cx.default_global::<VisiblePages>();
+    if shown {
+        visible.pages.insert(window, page);
+    } else {
+        visible.pages.remove(&window);
+    }
 }
 
 /// Wait until this page is on screen; false once it is gone.
@@ -306,7 +322,8 @@ gpui_kit::actions!(
         OpenHelmInstall,
         OpenApiRequests,
         ToggleWriteMode,
-        ToggleTheme
+        ToggleTheme,
+        ToggleFavorite
     ]
 );
 
@@ -374,6 +391,7 @@ fn key_bindings_on(mac: bool) -> Vec<KeyBinding> {
         KeyBinding::new("g h", GoHelm, Some(shortcuts::OUTSIDE_TEXT)),
         KeyBinding::new("g i", GoAssistant, Some(shortcuts::OUTSIDE_TEXT)),
         KeyBinding::new("g s", GoSettings, Some(shortcuts::OUTSIDE_TEXT)),
+        KeyBinding::new("*", ToggleFavorite, Some(shortcuts::OUTSIDE_TEXT)),
         KeyBinding::new("j", base::actions::SelectDown, Some(shortcuts::TABLE_OUTSIDE_TEXT)),
         KeyBinding::new("k", base::actions::SelectUp, Some(shortcuts::TABLE_OUTSIDE_TEXT)),
     ]);
@@ -436,6 +454,9 @@ pub struct AppView {
     /// Opening an object on a context that isn't connected, or whose kind is looked up there
     /// (where an Argo CD Application deploys, and what it deploys there).
     context_open: crate::latest::Latest,
+    /// A favorite to open once the connect under way is done (it is on a context that wasn't
+    /// connected); any other connect drops it.
+    after_connect: Option<crate::favorites::Favorite>,
     /// Selected namespaces; empty means all.
     namespaces: Vec<String>,
     filter: Entity<InputState>,
@@ -483,9 +504,13 @@ pub struct AppView {
     /// The set of contexts picked (`settings::session_set`), whose session this window saves;
     /// empty when none is saved (not connected yet, or contexts given by a developer hook).
     session_key: Vec<String>,
-    /// This is the first window, and its first connect has not finished: that one reopens
-    /// where its set of contexts was left.
-    restore: bool,
+    /// Whether a connect reopens where its set of contexts was left: the first window's first
+    /// set, until a connect to it reaches every cluster (see `session::Restore`).
+    restore: session::Restore,
+    /// This view, by which `session::SessionOwners` knows the window that saves a set.
+    view_id: EntityId,
+    /// Where the window was last, not maximized: what is saved while it is maximized.
+    windowed: Option<crate::settings::WindowPlace>,
     /// The save waiting for changes to stop (see `session_changed`), and the window's.
     _save_session: Option<Task<()>>,
     _save_window: Option<Task<()>>,
@@ -499,8 +524,10 @@ impl AppView {
             Ok(c) => (c.names, dev_var("RECOUVRANCE_CONTEXT").or(c.current), None),
             Err(e) => (Vec::new(), None, Some(format!("{e:#}").into())),
         };
-        let ns_picker = cx.new(|cx| NamespacePicker::new(window, cx));
-        let ctx_picker = cx.new(|cx| ContextPicker::new(contexts.clone(), window, cx));
+        // One store for every window: a window never saves over the stars of another.
+        let favorites = crate::favorites::shared(cx);
+        let ns_picker = cx.new(|cx| NamespacePicker::new(favorites.clone(), window, cx));
+        let ctx_picker = cx.new(|cx| ContextPicker::new(contexts.clone(), favorites.clone(), window, cx));
         let col_header = cx.new(|cx| InputState::new(window, cx).placeholder("Header, e.g. Image"));
         let col_path = cx.new(|cx| InputState::new(window, cx).placeholder(".spec.containers[*].image"));
         let filter = cx.new(|cx| {
@@ -632,7 +659,7 @@ impl AppView {
             }),
             cx.observe_window_bounds(window, |this, window, cx| this.window_moved(window, cx)),
             // Where the window is left is saved as it closes, and as the app quits.
-            cx.on_release(|this, cx| this.save_session_now(cx)),
+            cx.on_release(Self::leave_session),
             cx.on_app_quit(|this, cx| {
                 this.save_session_now(cx);
                 async {}
@@ -667,7 +694,6 @@ impl AppView {
         let mut subs = subs;
         subs.push(cx.observe(&forwards, |_, _, cx| cx.notify()));
 
-        let favorites = cx.new(|_| Favorites::load());
         subs.push(cx.observe(&favorites, |_, _, cx| cx.notify()));
         let focus = cx.focus_handle();
         window.focus(&focus, cx);
@@ -706,6 +732,7 @@ impl AppView {
             skip_select: None,
             page_scopes: HashMap::new(),
             context_open: Default::default(),
+            after_connect: None,
             sidebar_hidden: false,
             assistant: None,
             assistant_docked: false,
@@ -737,7 +764,9 @@ impl AppView {
             connecting: false,
             _connect: None,
             session_key: Vec::new(),
-            restore: first_window,
+            restore: if first_window { session::Restore::FirstConnect } else { session::Restore::Off },
+            view_id: cx.entity_id(),
+            windowed: None,
             _save_session: None,
             _save_window: None,
             _kubeconfig_watch: None,

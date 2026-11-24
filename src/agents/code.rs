@@ -105,6 +105,8 @@ impl AgentsView {
             .when_some(self.code_message.clone().or_else(|| self.hub.rules_error().map(|e| (false, e))), |d, (ok, m)| {
                 d.child(div().text_sm().text_color(if ok { theme.success } else { theme.danger }).child(m))
             })
+            // The file's rules are in force, but it could not be written with its upgrade.
+            .when_some(self.hub.rules_warning(), |d, m| d.child(div().text_sm().text_color(theme.warning).child(m)))
             .child(div().flex_1().min_h_0().border_1().border_color(theme.border).rounded_md().child(CodeEditor::new(editor).h_full()))
             .into_any_element()
     }

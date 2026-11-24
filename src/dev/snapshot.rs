@@ -158,6 +158,7 @@ pub fn run(path: &str, wait: Duration) -> Result<()> {
             Ok("delete") => Some("Delete"),
             Ok("restart") => Some("Restart"),
             Ok("scale") => Some("Scale"),
+            Ok("logs") => Some("Logs"),
             _ => None,
         };
         cx.update_window(window.into(), |_, window, cx| app_view.update(cx, |v, cx| v.demo_mark(n, bulk, window, cx)))?;
@@ -352,6 +353,15 @@ drwxr-xr-x 1 root root 4096 Oct 15 \x1b[1;34m.\x1b[0m\r\n\
         cx.update(|cx| app_view.update(cx, |v, cx| v.demo_terminal(demo.as_bytes(), cx)));
         pump(&mut cx, Duration::from_secs(1));
     }
+    // RECOUVRANCE_REQUESTS=<seconds>: what the page on screen (a detail page opened with
+    // RECOUVRANCE_SELECT, say) asks of the API server in that long. The problem badge stops
+    // counting first: its scans would hide the page's requests.
+    if let Some(secs) = std::env::var("RECOUVRANCE_REQUESTS").ok().and_then(|s| s.parse::<u64>().ok()) {
+        cx.update(|cx| app_view.update(cx, crate::app::AppView::demo_stop_badge));
+        crate::k8s::meter::reset();
+        pump(&mut cx, Duration::from_secs(secs));
+        print_requests(secs);
+    }
     draw_twice(&mut cx, window.into())?;
     cx.capture_screenshot(window.into())?.save(path)?;
     // RECOUVRANCE_FRAMES_END=<n>: time n full redraws of what is on screen at the end.
@@ -380,6 +390,38 @@ drwxr-xr-x 1 root root 4096 Oct 15 \x1b[1;34m.\x1b[0m\r\n\
         crate::dev::usage::print();
     }
     Ok(())
+}
+
+/// The requests counted since the meter's reset `secs` seconds ago, by kind and summed over
+/// the clusters (none is named), the heaviest ones, then the memory used (Linux).
+fn print_requests(secs: u64) {
+    use crate::k8s::meter;
+    let snap = meter::snapshot(meter::now_minute());
+    let mut kinds: std::collections::BTreeMap<meter::Class, (u64, u64)> = std::collections::BTreeMap::new();
+    for (_, class, stats) in &snap.classes {
+        let sums = kinds.entry(*class).or_default();
+        sums.0 += stats.count;
+        sums.1 += stats.bytes;
+    }
+    let minutes = secs.max(1) as f64 / 60.0;
+    eprintln!("requests over {secs} s:");
+    for (class, (count, bytes)) in kinds {
+        eprintln!(
+            "  {:<20} {count:>7} requests ({:>7.1}/min) {bytes:>12} bytes ({:>10.0}/min)",
+            class.label(),
+            count as f64 / minutes,
+            bytes as f64 / minutes
+        );
+    }
+    eprintln!("heaviest requests:");
+    for h in &snap.heaviest {
+        eprintln!("  {:>12} bytes  {:<20} {} {}", h.bytes, h.class.label(), h.method, h.path);
+    }
+    // The kernel's count of what the process holds now, and at most.
+    let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+    for line in status.lines().filter(|l| l.starts_with("VmRSS") || l.starts_with("VmHWM")) {
+        eprintln!("{line}");
+    }
 }
 
 /// Two frames: some views size themselves from the previous frame's layout.

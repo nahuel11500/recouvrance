@@ -29,6 +29,7 @@ use crate::k8s::{self, Kind, TaskGuard};
 
 pub(crate) use gone::Gone;
 
+mod argo_tools;
 mod cluster_tools;
 mod diff_tools;
 mod file_tools;
@@ -48,6 +49,42 @@ mod write_tools;
 /// Set by the auth middleware for every authenticated request.
 #[derive(Clone)]
 struct AgentId(String);
+
+/// The MCP client a tool call comes from, as [`client_label`] names it: set by `call_tool`
+/// for the tools to read in their request's HTTP parts.
+#[derive(Clone)]
+struct ClientName(String);
+
+/// The header the in-app assistant adds to the MCP config it gives Claude Code, so its calls
+/// are told from those of your own Claude Code (same client, same agent). A label only.
+pub(crate) const CLIENT_HEADER: &str = "x-recouvrance-client";
+
+/// Longest client name or version kept: they come from the client, and end up in a log line
+/// and on the Activity page.
+const MAX_CLIENT_CHARS: usize = 64;
+
+/// How the activity log names a call's client: its `clientInfo` name and version (from
+/// `initialize`, or from each request's metadata in a stateless session), with the in-app
+/// assistant's own label when it adds one (`assistant via claude-code 2.1.3`). Control
+/// characters are dropped and each part is capped. None when the client gave no name.
+fn client_label(info: Option<&rmcp::model::Implementation>, header: Option<&str>) -> Option<String> {
+    let clean = |s: &str| -> String {
+        let s: String = s.chars().filter(|c| !c.is_control()).collect();
+        let s = s.trim();
+        match s.char_indices().nth(MAX_CLIENT_CHARS) {
+            Some((i, _)) => format!("{}…", &s[..i]),
+            None => s.to_string(),
+        }
+    };
+    let name = info.map(|i| clean(&i.name)).filter(|n| !n.is_empty());
+    let version = info.map_or_default(|i| clean(&i.version));
+    let client = name.map(|n| if version.is_empty() { n } else { format!("{n} {version}") });
+    let label = header.map(clean).filter(|l| !l.is_empty());
+    match (label, client) {
+        (Some(label), Some(client)) => Some(format!("{label} via {client}")),
+        (label, client) => label.or(client),
+    }
+}
 
 #[derive(Clone)]
 pub struct KubeMcp {
@@ -71,6 +108,10 @@ struct Call {
     /// (the rules may be read again, and renumbered, before the call ends).
     rule: Option<String>,
     session: Option<String>,
+    /// The MCP client it came from (`client_label`).
+    client: Option<String>,
+    /// What the call's answer shows Secret values of (`revealing`): logged when it succeeds.
+    revealed: Vec<String>,
     /// More for the approval banner than the arguments show (a manifest's objects).
     approval_detail: Option<String>,
     /// How to work out what the call will change, should it wait for an approval.
@@ -94,7 +135,15 @@ impl Call {
         self.rule = rule.map(|i| self.rule_label(Some(i)));
     }
 
+    /// Note that the call's answer shows `what`'s Secret values (unmasked, as a `reveal` rule
+    /// allows), for the activity log.
+    fn revealing(&mut self, what: String) {
+        self.revealed.push(what);
+    }
+
     fn record(&self, decision: Decision, detail: String, result_bytes: usize) {
+        // A refused or failed call returned no values, whatever it was about to show.
+        let returned = matches!(decision, Decision::Allowed | Decision::Approved);
         self.hub.record(AuditEntry {
             time: jiff::Timestamp::now(),
             agent_id: self.agent.id.clone(),
@@ -107,6 +156,8 @@ impl Call {
             result_bytes,
             session: self.session.clone(),
             change: self.preview.as_ref().map(Preview::text),
+            client: self.client.clone(),
+            revealed: if returned { self.revealed.clone() } else { Vec::new() },
         });
     }
 
@@ -482,6 +533,7 @@ impl KubeMcp {
         let id = parts.extensions.get::<AgentId>().map(|a| a.0.clone()).ok_or("unauthenticated")?;
         let agent = self.hub.agent_for_calls(&id).ok_or("unknown agent")?;
         let session = parts.headers.get("mcp-session-id").and_then(|v| v.to_str().ok()).map(String::from);
+        let client = parts.extensions.get::<ClientName>().map(|c| c.0.clone());
         let invalid = validate_args(&args).err();
         let context = args.get("context").and_then(|v| v.as_str()).map(String::from);
         let call = Call {
@@ -495,6 +547,8 @@ impl KubeMcp {
             approved_rules: Vec::new(),
             rule: None,
             session,
+            client,
+            revealed: Vec::new(),
             approval_detail: None,
             plan: None,
             preview: None,
@@ -617,9 +671,7 @@ impl KubeMcp {
                 preview: call.preview.clone(),
                 access: access.clone(),
                 dry_run: call.args.get("dry_run").and_then(serde_json::Value::as_bool).unwrap_or(false),
-                once_only: call.tool == "gitops"
-                    && (matches!(call.args["action"].as_str(), Some("rollback" | "terminate"))
-                        || call.args["prune"].as_bool() == Some(true)),
+                once_only: Approval::only_once(call.tool, &call.args),
                 deadline: Instant::now(),
             };
             let answer = self.hub.request_approval(request, call.gone.wait()).await;
@@ -1147,6 +1199,7 @@ impl KubeMcp {
             + Self::cluster_tools()
             + Self::file_tools()
             + Self::metrics_tools()
+            + Self::argo_tools()
     }
 }
 
@@ -1170,10 +1223,17 @@ impl ServerHandler for KubeMcp {
         mut context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<CallToolResponse, rmcp::ErrorData> {
         // The tools read the request's HTTP parts (`begin`): rmcp's token for this request
-        // joins its connection's there, so the call knows when its agent stops waiting.
+        // joins its connection's there, so the call knows when its agent stops waiting. The
+        // client is read there too: rmcp knows it from the session's `initialize`, or from the
+        // request itself in a stateless session, where no session id groups the calls.
+        let info = context.client_info();
         if let Some(parts) = context.extensions.get_mut::<Parts>() {
             let gone = parts.extensions.remove::<Gone>().unwrap_or_default();
             parts.extensions.insert(Gone { request: Some(context.ct.clone()), ..gone });
+            let header = parts.headers.get(CLIENT_HEADER).and_then(|v| v.to_str().ok());
+            if let Some(client) = client_label(info.as_ref(), header) {
+                parts.extensions.insert(ClientName(client));
+            }
         }
         Self::tools().call(ToolCallContext::new(self, request, context)).await
     }
@@ -1730,6 +1790,8 @@ mod tests {
             approved_rules: Vec::new(),
             rule: None,
             session: None,
+            client: None,
+            revealed: Vec::new(),
             approval_detail: None,
             plan: None,
             preview: None,
@@ -1991,5 +2053,30 @@ mod tests {
             let dry_run = t.input_schema.get("properties").and_then(|p| p.get("dry_run"));
             assert!(dry_run.is_none(), "{} only reads but takes dry_run", t.name);
         }
+    }
+
+    /// A call's client is named by its `clientInfo`, the assistant's label first when it
+    /// adds one; what the client sent is cleaned and capped before it reaches the log.
+    #[test]
+    fn a_client_is_named_by_what_it_sent() {
+        use rmcp::model::Implementation;
+        assert_eq!(
+            client_label(Some(&Implementation::new("claude-code", "2.1.3")), None).as_deref(),
+            Some("claude-code 2.1.3")
+        );
+        assert_eq!(
+            client_label(Some(&Implementation::new("claude-code", "2.1.3")), Some("assistant")).as_deref(),
+            Some("assistant via claude-code 2.1.3")
+        );
+        assert_eq!(client_label(Some(&Implementation::new("codex", "")), None).as_deref(), Some("codex"));
+        assert_eq!(client_label(None, Some("assistant")).as_deref(), Some("assistant"));
+        // Nothing said, or only blanks: no client.
+        assert_eq!(client_label(None, None), None);
+        assert_eq!(client_label(Some(&Implementation::new(" \n", "1")), Some("")), None);
+        // Control characters can't break the log's lines or the page, and a long name is cut.
+        let odd = client_label(Some(&Implementation::new("evil\nname\u{1b}[31m", "1\r")), None).unwrap();
+        assert_eq!(odd, "evilname[31m 1");
+        let long = client_label(Some(&Implementation::new("x".repeat(500), "9".repeat(500))), None).unwrap();
+        assert!(long.chars().count() <= 2 * (MAX_CLIENT_CHARS + 1) + 1, "{long}");
     }
 }

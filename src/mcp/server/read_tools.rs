@@ -33,7 +33,7 @@ impl KubeMcp {
     }
 
     #[tool(
-        description = "Check calls you plan against your rules without making them: for each request (context, verb, kind, namespace, name), whether it is allowed, needs the user's approval or is denied, the rule that decides, and for a denial whether it is final (a Deny rule) or the rule the user could add. Use it before a task that needs several calls, to tell the user up front what to approve or grant. The verb is the rules' verb, not the tool: set_image, rollout_undo, rollout_pause, rollout_resume and patch_resource need patch; rollout_restart restart; apply_manifest apply on each object; trigger_cronjob get on the CronJob and apply on its Job; cordon_node, uncordon_node and drain_node drain on the node; exec_command, debug_pod and browse_files exec on the pod; port_forward forward; get_logs logs; gitops refresh (refresh, hard_refresh), sync (sync, reconcile) or suspend (suspend, resume) on the object, and get for diagnose.",
+        description = "Check calls you plan against your rules without making them: for each request (context, verb, kind, namespace, name), whether it is allowed, needs the user's approval or is denied, the rule that decides, and for a denial whether it is final (a Deny rule) or the rule the user could add. Use it before a task that needs several calls, to tell the user up front what to approve or grant. The verb is the rules' verb, not the tool: set_image, rollout_undo, rollout_pause, rollout_resume and patch_resource need patch; rollout_restart restart; apply_manifest apply on each object; trigger_cronjob get on the CronJob and apply on its Job; cordon_node, uncordon_node and drain_node drain on the node; exec_command, debug_pod and browse_files exec on the pod; port_forward forward; get_logs logs; gitops refresh (refresh, hard_refresh), sync (sync, reconcile, terminate, rollback) or suspend (suspend, resume) on the object, and get for diagnose; argocd_apps list on applications.argoproj.io on the hub.",
         annotations(read_only_hint = true)
     )]
     async fn check_access(
@@ -221,6 +221,9 @@ impl KubeMcp {
         };
         // Masking follows what came back, not only what was asked for.
         let secret = kind.is("", "Secret") || is_secret_object(&value);
+        if secret && reveal {
+            call.revealing(format!("Secret {}/{}", p.namespace.as_deref().unwrap_or_default(), p.name));
+        }
         call.finish(k8s::to_yaml(&value, secret, reveal))
     }
 
@@ -280,7 +283,7 @@ impl KubeMcp {
     }
 
     #[tool(
-        description = "Describe one object like `kubectl describe`: key fields, conditions, recent events, and for workloads/services the pods behind it with their status and restarts. Start here when investigating a problem.",
+        description = "Describe one object like `kubectl describe`: key fields, conditions, recent events, for workloads/services the pods behind it with their status and restarts, and the Argo CD Application that deployed it (by its tracking id or instance label; its sync and health read on its hub where your Allow rules let you). Start here when investigating a problem.",
         annotations(read_only_hint = true)
     )]
     async fn describe_resource(
@@ -333,6 +336,10 @@ impl KubeMcp {
                     c["message"].as_str().unwrap_or("")
                 ));
             }
+        }
+        // The Application that deployed it: what to sync, and where its state is.
+        if let Some(managed) = self.managed_by(&call, &p.context, &kind, &value).await {
+            out.push_str(&managed.text);
         }
         if kind.is("", "Pod") {
             out.push_str(&container_lines(&value));

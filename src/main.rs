@@ -3,6 +3,7 @@ mod alerts;
 mod app;
 mod assistant;
 mod certs;
+mod cron;
 mod details;
 #[cfg(feature = "dev")]
 mod dev;
@@ -20,6 +21,7 @@ mod history;
 mod json;
 mod k8s;
 mod latest;
+mod map;
 mod mcp;
 mod overview;
 mod paths;
@@ -33,6 +35,7 @@ mod rbac;
 mod reachability;
 mod schema;
 mod settings;
+mod smartdiff;
 mod status;
 mod table;
 mod taints;
@@ -99,6 +102,8 @@ fn main() {
         // After the keys: the macOS menu bar shows the keys bound when it is set.
         app::init_menus(cx);
         plugins::reload(cx);
+        // Every window shares one store of favorites, read once here.
+        let _ = favorites::shared(cx);
         app::load_zoom(cx);
         let mode = app::initial_theme(cx);
         app::apply_theme(mode, None, cx);
@@ -131,7 +136,16 @@ fn serve() {
         while let Some(ev) = events.next().await {
             match &*ev {
                 mcp::HubEvent::Audit(e) => {
-                    eprintln!("{} {:?} {} {} {}ms {}", e.agent, e.decision, e.tool, e.args, e.duration_ms, e.detail);
+                    let client = e.client.as_ref().map_or_default(|c| format!(" ({c})"));
+                    let revealed = if e.revealed.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" [shown: {}]", e.revealed.join(", "))
+                    };
+                    eprintln!(
+                        "{}{client} {:?} {} {} {}ms {}{revealed}",
+                        e.agent, e.decision, e.tool, e.args, e.duration_ms, e.detail
+                    );
                 }
                 mcp::HubEvent::ServerStatus(Err(e)) => {
                     if *e != last_error {

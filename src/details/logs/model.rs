@@ -511,6 +511,59 @@ pub(crate) fn same_reads(
         })
 }
 
+/// Where each stream reads: pod `ix` at its own place. On an object's page (`places` empty)
+/// every pod is at `home`. With places, a pod without one is never read at `home`: that
+/// could read another cluster's pod of the same name.
+pub(crate) fn stream_plan<P: Clone>(
+    home: &P,
+    places: &[P],
+    reads: Vec<(String, Option<String>)>,
+) -> Vec<(P, String, Option<String>)> {
+    if places.is_empty() {
+        return reads.into_iter().map(|(pod, container)| (home.clone(), pod, container)).collect();
+    }
+    places.iter().zip(reads).map(|(at, (pod, container))| (at.clone(), pod, container)).collect()
+}
+
+/// Where a stream of a view of pods from several places reads: its context, namespace, pod
+/// and the container read (None when the API server picks it).
+pub(crate) struct Source<'a> {
+    pub(crate) context: &'a str,
+    pub(crate) namespace: &'a str,
+    pub(crate) pod: &'a str,
+    pub(crate) container: Option<&'a str>,
+}
+
+/// What each line says it comes from, in a view of pods from several places: the context
+/// when they are on several (`prod: `), the namespace when they are in several, then the pod
+/// and the container read: `prod: shop/web-1/app`. Two pods of the same name on two clusters
+/// never read the same.
+pub(crate) fn source_tags(sources: &[Source<'_>]) -> Vec<String> {
+    let first = sources.first();
+    let contexts = sources.iter().any(|s| first.is_some_and(|f| f.context != s.context));
+    let namespaces = sources.iter().any(|s| first.is_some_and(|f| f.namespace != s.namespace));
+    sources
+        .iter()
+        .map(|s| {
+            let mut tag = String::new();
+            if contexts {
+                tag.push_str(s.context);
+                tag.push_str(": ");
+            }
+            if namespaces {
+                tag.push_str(s.namespace);
+                tag.push('/');
+            }
+            tag.push_str(s.pod);
+            if let Some(c) = s.container {
+                tag.push('/');
+                tag.push_str(c);
+            }
+            tag
+        })
+        .collect()
+}
+
 /// Where one pod's stream is.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum StreamState {
@@ -523,7 +576,7 @@ pub(crate) enum StreamState {
 }
 
 /// What the status line says about the streams (None when they all flow).
-pub(crate) fn stream_status(pods: &[String], states: &[StreamState]) -> Option<String> {
+pub(crate) fn stream_status<S: AsRef<str>>(names: &[S], shorten: bool, states: &[StreamState]) -> Option<String> {
     if let [state] = states {
         return match state {
             StreamState::Connecting => Some("Connecting…".into()),
@@ -536,7 +589,12 @@ pub(crate) fn stream_status(pods: &[String], states: &[StreamState]) -> Option<S
     if !states.is_empty() && states.iter().all(|s| *s == StreamState::Connecting) {
         return Some("Connecting…".into());
     }
-    let short = |i: usize| pods.get(i).map_or_default(|p| p.rsplit('-').next().unwrap_or(p).to_string());
+    let short = |i: usize| {
+        names.get(i).map_or_default(|n| {
+            let n = n.as_ref();
+            if shorten { n.rsplit('-').next().unwrap_or(n).to_string() } else { n.to_string() }
+        })
+    };
     let group = |label: &str, pick: &dyn Fn(&StreamState) -> Option<String>| {
         let names: Vec<String> =
             states.iter().enumerate().filter_map(|(i, s)| pick(s).map(|n| n + &short(i))).collect();
@@ -783,19 +841,85 @@ mod tests {
     fn stream_statuses() {
         let pods: Vec<String> = ["web-a1", "web-b2", "web-c3"].map(String::from).to_vec();
         let one = &pods[..1];
-        assert_eq!(stream_status(one, &[Live]), None);
-        assert_eq!(stream_status(one, &[Ended]).as_deref(), Some("Stream ended"));
-        assert_eq!(stream_status(one, &[Reconnecting("EOF".into())]).as_deref(), Some("Reconnecting… (EOF)"));
+        assert_eq!(stream_status(one, true, &[Live]), None);
+        assert_eq!(stream_status(one, true, &[Ended]).as_deref(), Some("Stream ended"));
+        assert_eq!(stream_status(one, true, &[Reconnecting("EOF".into())]).as_deref(), Some("Reconnecting… (EOF)"));
         use StreamState::*;
-        assert_eq!(stream_status(&pods, &[Connecting, Connecting, Connecting]).as_deref(), Some("Connecting…"));
-        assert_eq!(stream_status(&pods, &[Live, Live, Live]), None);
+        assert_eq!(stream_status(&pods, true, &[Connecting, Connecting, Connecting]).as_deref(), Some("Connecting…"));
+        assert_eq!(stream_status(&pods, true, &[Live, Live, Live]), None);
         assert_eq!(
-            stream_status(&pods, &[Reconnecting("x".into()), Ended, Failed("gone".into())]).as_deref(),
+            stream_status(&pods, true, &[Reconnecting("x".into()), Ended, Failed("gone".into())]).as_deref(),
             Some("1 reconnecting (a1) · 1 ended (b2) · 1 failed (gone: c3)")
+        );
+        // Pods from several places are named by their whole tag: the same pod on two
+        // clusters, one refusing to give its logs, says which.
+        let tags = ["eu: web-0/app", "us: web-0/app"];
+        assert_eq!(
+            stream_status(&tags, false, &[Live, Failed("forbidden".into())]).as_deref(),
+            Some("1 failed (forbidden: us: web-0/app)")
         );
     }
 
+    /// Each stream reads its own pod's cluster and namespace, even when pods of the same
+    /// name are on two clusters or in two namespaces; a pod with no place is never read on
+    /// the page's own cluster.
+    #[test]
+    fn each_stream_reads_its_own_place() {
+        let read = |pod: &str| (pod.to_string(), Some("app".to_string()));
+        let places = [("eu", "shop"), ("us", "shop"), ("eu", "ingress")];
+        let plan = stream_plan(&("home", "default"), &places, vec![read("web-0"), read("web-0"), read("web-0")]);
+        let at: Vec<(&str, &str)> = plan.iter().map(|(p, _, _)| *p).collect();
+        assert_eq!(at, places);
+        assert!(plan.iter().all(|(_, pod, c)| pod == "web-0" && c.as_deref() == Some("app")));
+        let extra = stream_plan(&("home", "default"), &places[..1], vec![read("web-0"), read("web-1")]);
+        assert_eq!(extra.len(), 1);
+        assert_eq!(extra[0].0, ("eu", "shop"));
+        // An object's page: every pod in its own namespace.
+        let page = stream_plan(&("home", "default"), &[], vec![read("web-0"), read("web-1")]);
+        assert!(page.iter().all(|(p, _, _)| *p == ("home", "default")));
+    }
+
+    #[test]
+    fn lines_say_where_they_come_from() {
+        let src = |context, namespace, pod, container| Source { context, namespace, pod, container };
+        // One cluster, one namespace: the pod and its container.
+        let one = [src("prod", "shop", "web-1", Some("app")), src("prod", "shop", "api-2", None)];
+        assert_eq!(source_tags(&one), ["web-1/app", "api-2"]);
+        // Several namespaces: each says its own.
+        let ns = [src("prod", "shop", "web-1", Some("app")), src("prod", "ingress", "nginx-1", Some("controller"))];
+        assert_eq!(source_tags(&ns), ["shop/web-1/app", "ingress/nginx-1/controller"]);
+        // The same app in two regions: the context tells them apart.
+        let two = [src("eu", "shop", "web-1", Some("app")), src("us", "shop", "web-1", Some("app"))];
+        assert_eq!(source_tags(&two), ["eu: web-1/app", "us: web-1/app"]);
+        assert!(source_tags(&[]).is_empty());
+    }
+
     proptest::proptest! {
+        /// Pods that are not the same (by context, namespace and name) never carry the same
+        /// tag, whatever the context names: lines from two clusters are never mixed up.
+        #[test]
+        fn pods_in_different_places_have_different_tags(
+            pods in proptest::collection::vec(
+                (".{0,6}", "[a-z0-9-]{1,4}", "[a-z0-9-]{1,4}", proptest::option::of("[a-z0-9-]{1,3}")),
+                1..12,
+            )
+        ) {
+            let sources: Vec<Source<'_>> = pods
+                .iter()
+                .map(|(c, n, p, k)| Source { context: c, namespace: n, pod: p, container: k.as_deref() })
+                .collect();
+            let tags = source_tags(&sources);
+            proptest::prop_assert_eq!(tags.len(), pods.len());
+            for i in 0..pods.len() {
+                for j in 0..i {
+                    let (a, b) = (&pods[i], &pods[j]);
+                    if (&a.0, &a.1, &a.2) != (&b.0, &b.1, &b.2) {
+                        proptest::prop_assert_ne!(&tags[i], &tags[j]);
+                    }
+                }
+            }
+        }
+
         /// Taking the ready messages together changes nothing a pod shows: its lines stay in
         /// order and whole, and its state is its last message's.
         #[test]

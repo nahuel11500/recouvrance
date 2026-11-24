@@ -24,7 +24,7 @@ use super::{Pause, TaskGuard, api_status, lists, run_abortable, short_error, spa
 pub const EVENTS_KEPT: usize = 20_000;
 
 /// Events read per request: one request brings every Warning of most clusters.
-const EVENTS_PAGE: u32 = 5000;
+pub(super) const EVENTS_PAGE: u32 = 5000;
 
 /// Once the page is shown again, how long the watch has to bring what changed meanwhile
 /// before the rows go.

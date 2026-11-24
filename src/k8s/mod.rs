@@ -23,10 +23,12 @@ mod exec;
 #[cfg(feature = "dev")]
 pub(crate) mod experiments;
 pub(crate) mod files;
+mod follow;
 mod forward;
 pub(crate) mod gate;
 pub(crate) mod lane;
 pub(crate) mod lists;
+mod log_pods;
 mod login;
 pub(crate) mod meter;
 mod metrics;
@@ -50,7 +52,9 @@ pub(crate) use config::*;
 pub(crate) use discovery::*;
 pub(crate) use events::*;
 pub(crate) use exec::*;
+pub(crate) use follow::{Follow, Followed, Keep, follow};
 pub(crate) use forward::*;
+pub(crate) use log_pods::*;
 pub(crate) use metrics::*;
 pub(crate) use pod_requests::*;
 pub(crate) use pods::*;
@@ -209,6 +213,12 @@ pub fn api_status(e: &anyhow::Error) -> Option<u16> {
     })
 }
 
+/// A time from k8s-openapi, which is still on jiff 0.2, as this crate's `jiff::Timestamp`.
+/// Nanoseconds carry over unchanged; `None` only past the range both versions share.
+pub fn timestamp(t: k8s_openapi::jiff::Timestamp) -> Option<jiff::Timestamp> {
+    jiff::Timestamp::from_nanosecond(t.as_nanosecond()).ok()
+}
+
 /// How long ago `t` was, as kubectl's AGE column says it: "45s", "3m", "5h", "3d", "2y".
 pub fn age(t: jiff::Timestamp) -> String {
     duration_text(jiff::Timestamp::now().as_second() - t.as_second())
@@ -355,6 +365,25 @@ pub fn pod_selection(kind: &Kind, obj: &serde_json::Value) -> Selection {
     label_selection(obj.pointer("/spec/selector"), false)
 }
 
+/// Whether `obj` (a Service, PDB, NetworkPolicy or workload) selects a pod with these labels,
+/// by the same rules as `pod_selection`: for objects listed already, without asking the
+/// API server.
+pub fn pod_selected(kind: &Kind, obj: &serde_json::Value, labels: &serde_json::Map<String, serde_json::Value>) -> bool {
+    match pod_selection(kind, obj) {
+        Selection::Nothing => false,
+        Selection::Everything => true,
+        Selection::Labels(_) if kind.is("", "Service") => {
+            let selector = serde_json::json!({ "matchLabels": obj.pointer("/spec/selector") });
+            selector_matches(&selector, labels)
+        }
+        Selection::Labels(_) => {
+            let path =
+                if kind.is("networking.k8s.io", "NetworkPolicy") { "/spec/podSelector" } else { "/spec/selector" };
+            obj.pointer(path).is_some_and(|s| selector_matches(s, labels))
+        }
+    }
+}
+
 /// The pods a Service's `spec.selector` picks (`pod_selection`), from the selector alone: for
 /// a Service read without the rest of its object.
 pub fn service_selection(selector: Option<&serde_json::Value>) -> Selection {
@@ -436,6 +465,31 @@ mod selector_tests {
         let deploy = kind("apps", "Deployment");
         let odd = json!({"spec": {"selector": {"matchLabels": {"app": "web"}, "matchExpressions": [{"key": "x", "operator": "Gt", "values": ["1"]}]}}});
         assert_eq!(pod_selection(&deploy, &odd), Selection::Nothing);
+    }
+
+    /// `pod_selected` on a pod's labels agrees with `pod_selection`: an empty Service selector
+    /// picks nothing, an empty PDB or NetworkPolicy selector everything, an unknown operator
+    /// nothing.
+    #[test]
+    fn a_listed_object_selects_a_pod_as_the_server_would() {
+        use super::{Kind, pod_selected};
+        use serde_json::json;
+        let kind = Kind::fake;
+        let labels = json!({"app": "web", "tier": "a"});
+        let labels = labels.as_object().unwrap();
+        let svc = kind("", "Service");
+        assert!(pod_selected(&svc, &json!({"spec": {"selector": {"app": "web"}}}), labels));
+        assert!(!pod_selected(&svc, &json!({"spec": {"selector": {"app": "db"}}}), labels));
+        assert!(!pod_selected(&svc, &json!({"spec": {"selector": {}}}), labels));
+        let pdb = kind("policy", "PodDisruptionBudget");
+        assert!(pod_selected(&pdb, &json!({"spec": {"selector": {}}}), labels));
+        assert!(!pod_selected(&pdb, &json!({"spec": {}}), labels));
+        let netpol = kind("networking.k8s.io", "NetworkPolicy");
+        let tier = json!({"spec": {"podSelector": {"matchExpressions": [{"key": "tier", "operator": "In", "values": ["a"]}]}}});
+        assert!(pod_selected(&netpol, &tier, labels));
+        let deploy = kind("apps", "Deployment");
+        let odd = json!({"spec": {"selector": {"matchLabels": {"app": "web"}, "matchExpressions": [{"key": "x", "operator": "Gt", "values": ["1"]}]}}});
+        assert!(!pod_selected(&deploy, &odd, labels));
     }
 }
 
