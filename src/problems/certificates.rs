@@ -426,12 +426,8 @@ mod tests {
             if end <= 0 {
                 prop_assert_eq!(judged.map(|j| j.0), Some(Severity::Critical));
             } else {
-                if end >= SOON || end >= lifetime / 3 {
-                    prop_assert_eq!(judged, None);
-                }
-                if end < SOON.min(lifetime / 3) {
-                    prop_assert!(judged.is_some());
-                }
+                // Flagged exactly when less than both are left.
+                prop_assert_eq!(judged.is_some(), end < SOON.min(lifetime / 3));
             }
         }
     }
