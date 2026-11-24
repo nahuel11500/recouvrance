@@ -343,27 +343,26 @@ impl ArgoView {
                         .on_click(cx.listener(move |this, _, _, cx| this.open(&k, cx))),
                 )
             });
-        let tabs: Vec<(String, Tone)> = match &d.example {
-            Some(tabs) => tabs.iter().map(|(n, c)| (n.clone(), c.state.tone)).collect(),
-            None => {
-                // Two of the same name (another namespace or Argo CD), or several sources: each
-                // says where it is read.
-                let clash = d.members.iter().any(|k| d.members.iter().filter(|o| o.2 == k.2).count() > 1);
-                let sourced = clash || self.several_sources();
-                d.members
-                    .iter()
-                    .map(|k| {
-                        let found = self.find(k);
-                        let tone = found.map_or(Tone::Done, |a| argo::attention(&a.app));
-                        let label = if let Some(a) = found.filter(|_| sourced) {
-                            format!("{} · {}", k.2, a.source.label())
-                        } else {
-                            k.2.clone()
-                        };
-                        (label, tone)
-                    })
-                    .collect()
-            }
+        let tabs: Vec<(String, Tone)> = if let Some(tabs) = &d.example {
+            tabs.iter().map(|(n, c)| (n.clone(), c.state.tone)).collect()
+        } else {
+            // Two of the same name (another namespace or Argo CD), or several sources: each
+            // says where it is read.
+            let clash = d.members.iter().any(|k| d.members.iter().filter(|o| o.2 == k.2).count() > 1);
+            let sourced = clash || self.several_sources();
+            d.members
+                .iter()
+                .map(|k| {
+                    let found = self.find(k);
+                    let tone = found.map_or(Tone::Done, |a| argo::attention(&a.app));
+                    let label = if let Some(a) = found.filter(|_| sourced) {
+                        format!("{} · {}", k.2, a.source.label())
+                    } else {
+                        k.2.clone()
+                    };
+                    (label, tone)
+                })
+                .collect()
         };
         let view = cx.entity().downgrade();
         let tab_bar = TabBar::new(SharedString::from(format!("argo-dash-tabs-{}-{}", tabs.len(), d.tab)))
