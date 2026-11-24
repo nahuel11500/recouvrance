@@ -32,7 +32,7 @@ fn config(ns: &str, name: &str, level: &str) -> Value {
 }
 
 /// An environment where a sync takes web from 1.15 to `tag`, its replicas from 3 to
-/// `replicas`, and LOG_LEVEL from info to debug.
+/// `replicas`, and `LOG_LEVEL` from info to debug.
 fn env(ns: &str, tag: &str, replicas: i64) -> AppDiff {
     AppDiff::of(&json!({"items": [
         res("apps", "Deployment", ns, "web", Some(deploy(ns, "1.15", 3)), Some(deploy(ns, tag, replicas))),
@@ -62,7 +62,7 @@ fn managed_resources_give_the_live_and_desired_sides() {
         {"kind": "ConfigMap", "name": "", "targetState": "{}"},
     ]});
     let (live, desired, same, hooks) = sides(&body);
-    let labels = |o: &crate::smartdiff::Objects| o.keys().map(|k| k.label()).collect::<Vec<_>>();
+    let labels = |o: &crate::smartdiff::Objects| o.keys().map(crate::smartdiff::ObjectKey::label).collect::<Vec<_>>();
     assert_eq!(labels(&live), ["ConfigMap shop/old", "Deployment shop/web"]);
     assert_eq!(labels(&desired), ["Service shop/web", "Deployment shop/web"]);
     assert_eq!((same, hooks), (1, 1));
@@ -72,7 +72,10 @@ fn managed_resources_give_the_live_and_desired_sides() {
     let plain = json!({"items": [{"group": "", "kind": "ConfigMap", "namespace": "a", "name": "c",
         "liveState": config("a", "c", "info").to_string(), "targetState": config("a", "c", "debug").to_string()}]});
     let d = AppDiff::of(&plain);
-    assert_eq!(d.diff.groups.iter().map(|g| g.text()).collect::<Vec<_>>(), ["config key LOG_LEVEL changed"]);
+    assert_eq!(
+        d.diff.groups.iter().map(crate::smartdiff::Group::text).collect::<Vec<_>>(),
+        ["config key LOG_LEVEL changed"]
+    );
     assert!(AppDiff::of(&json!({})).in_sync(), "no items: nothing to sync");
 }
 
@@ -84,7 +87,7 @@ fn a_secrets_values_never_show() {
     };
     let body = json!({"items": [res("", "Secret", "a", "db", Some(secret("czNjcjN0")), Some(secret("bjN3")))]});
     let d = AppDiff::of(&body);
-    let lines: String = d.diff.resources.iter().flat_map(|r| r.lines(true)).map(|l| format!("{l:?}")).collect();
+    let lines = format!("{:?}", d.diff.resources.iter().map(|r| r.lines(true)).collect::<Vec<_>>());
     assert!(!lines.contains("czNjcjN0") && !lines.contains("bjN3"), "{lines}");
     let groups = regroup(&[Some(&d.diff)], false);
     assert_eq!(texts(&groups), ["Secret db key password changed"]);

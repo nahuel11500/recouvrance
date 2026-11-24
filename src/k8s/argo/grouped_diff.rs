@@ -143,7 +143,9 @@ pub async fn read_hub(context: String, namespace: String, name: String) -> Resul
 /// Which diff: the Argo CD instance, the Application's namespace and name, and its
 /// resourceVersion when read.
 pub type CacheKey = (String, String, String, String);
-static KEPT_DIFFS: LazyLock<Mutex<VecDeque<(CacheKey, Arc<AppDiff>)>>> = LazyLock::new(Default::default);
+/// The diffs kept, the last read last.
+type Kept = VecDeque<(CacheKey, Arc<AppDiff>)>;
+static KEPT_DIFFS: LazyLock<Mutex<Kept>> = LazyLock::new(Default::default);
 
 fn kept(key: &CacheKey) -> Option<Arc<AppDiff>> {
     let all = KEPT_DIFFS.lock().unwrap_or_else(PoisonError::into_inner);
