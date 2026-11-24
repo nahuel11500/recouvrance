@@ -733,6 +733,7 @@ impl AppView {
         window.focus(&focus, cx);
         table.update(cx, |t, _| t.delegate_mut().app_focus = Some(focus.clone()));
         let settings_view = cx.new(|cx| SettingsView::new(hub.clone(), window, cx));
+        k8s::short_names::set_contexts(&contexts);
         let mut this = Self {
             settings_view,
             terminals: HashMap::new(),

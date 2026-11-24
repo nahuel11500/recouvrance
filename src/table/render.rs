@@ -377,12 +377,21 @@ impl TableDelegate for ResourceTable {
         if col == Col::Context {
             let dot: Hsla =
                 crate::settings::context_color(&cell).map_or(theme.muted_foreground.opacity(0.4), |c| rgb(c).into());
-            return h_flex()
+            // The short name on screen (and to sort by), the full one on hover and in `context:` filters.
+            let short = k8s::short_names::short_name(&cell);
+            let full = (short != *cell).then(|| SharedString::from(cell.into_owned()));
+            let drawn = h_flex()
                 .gap_2()
                 .overflow_hidden()
                 .child(div().size(px(8.)).flex_shrink_0().rounded_full().bg(dot))
-                .child(div().overflow_hidden().text_ellipsis().whitespace_nowrap().child(cell.into_owned()))
-                .into_any_element();
+                .child(div().overflow_hidden().text_ellipsis().whitespace_nowrap().child(short));
+            return match full {
+                Some(full) => drawn
+                    .id(SharedString::from(format!("cx-{ctx}-{}-{col_ix}", row.uid)))
+                    .tooltip(move |w, cx| component::tooltip::Tooltip::new(full.clone()).build(w, cx))
+                    .into_any_element(),
+                None => drawn.into_any_element(),
+            };
         }
         let mut color = None;
         let mut weight = None;

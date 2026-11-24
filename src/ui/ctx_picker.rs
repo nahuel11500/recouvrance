@@ -90,6 +90,9 @@ impl ContextPicker {
         let favorite = crate::favorites::Favorite::Context(name.to_string());
         let starred = self.favorites.read(cx).has(&favorite);
         let group = SharedString::from(format!("ctx-row-{i}-{name}"));
+        // A shortened name shows in full on hover.
+        let short = crate::k8s::short_names::short_name(name);
+        let full = (short != name).then(|| SharedString::from(name.to_string()));
         let favorites = self.favorites.clone();
         let star = div()
             .id(SharedString::from(format!("ctx-star-{i}-{name}")))
@@ -131,13 +134,17 @@ impl ContextPicker {
             .child(div().size(px(10.)).flex_shrink_0().rounded_full().bg(color))
             .child(
                 div()
+                    .id(SharedString::from(format!("ctx-name-{i}-{name}")))
                     .flex_1()
                     .min_w_0()
                     .text_sm()
                     .overflow_hidden()
                     .text_ellipsis()
                     .whitespace_nowrap()
-                    .child(name.to_string()),
+                    .when_some(full, |d, full| {
+                        d.tooltip(move |w, cx| component::tooltip::Tooltip::new(full.clone()).build(w, cx))
+                    })
+                    .child(short),
             )
             .when(protected, |d| d.child(Icon::new(Lucide::Lock).size_3p5().text_color(theme.warning)))
             .when(connected, |d| match state {
@@ -197,7 +204,16 @@ impl Render for ContextPicker {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let query = self.search.read(cx).value().to_lowercase();
         let muted = cx.theme().muted_foreground;
-        let matching: Vec<String> = self.all.iter().filter(|c| c.to_lowercase().contains(&query)).cloned().collect();
+        // The search finds a context by its full name or by the shorter one it shows.
+        let matching: Vec<String> = self
+            .all
+            .iter()
+            .filter(|c| {
+                c.to_lowercase().contains(&query)
+                    || crate::k8s::short_names::short_name(c).to_lowercase().contains(&query)
+            })
+            .cloned()
+            .collect();
         let picked: Vec<String> = self.picked.iter().cloned().collect();
         let changed = picked != {
             let mut c = self.connected.clone();
