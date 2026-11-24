@@ -20,6 +20,8 @@ pub enum Target {
     /// A favorite, on any context (it is connected first when it isn't).
     Favorite(crate::favorites::Favorite),
     Context(String),
+    /// A context set: its contexts the kubeconfig has, connected together.
+    ContextSet(Vec<String>),
     Object {
         ctx: usize,
         kind: String,

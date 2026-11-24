@@ -50,6 +50,17 @@ impl AppView {
         for c in &self.all_contexts {
             items.push(PaletteItem::new(c.clone(), "switch context".into(), Lucide::Ship, Target::Context(c.clone())));
         }
+        // Each context set with a context left in the kubeconfig: picking it connects them all.
+        for set in crate::settings::context_sets() {
+            let contexts = set.available(&self.all_contexts);
+            if contexts.is_empty() {
+                continue;
+            }
+            let detail = format!("context set · {}", contexts.join(", "));
+            let mut item = PaletteItem::new(set.name, detail, Lucide::Layers, Target::ContextSet(contexts));
+            item.also = "set workspace group connect";
+            items.push(item);
+        }
         // With several clusters, objects say which one they are on.
         let names: std::rc::Rc<Vec<String>> = std::rc::Rc::new(self.clusters.iter().map(|(c, _)| c.clone()).collect());
         // Every favorite, on any context: picking one opens it where it points (see
@@ -148,6 +159,11 @@ impl AppView {
                     Target::Settings(section) => this.open_settings_section(section, window, cx),
                     Target::View(view) => this.apply_view(&view, window, cx),
                     Target::Context(c) => this.connect_many(vec![c], window, cx),
+                    Target::ContextSet(contexts) => {
+                        // As the picker does, so its ticks match what connects.
+                        this.picked = contexts.iter().cloned().collect();
+                        this.connect_many(contexts, window, cx);
+                    }
                     Target::Favorite(f) => this.open_favorite(f, true, window, cx),
                     Target::Object { .. } if this.clusters.iter().map(|(c, _)| c).ne(opened_on.iter()) => {
                         window.push_notification(
@@ -205,6 +221,33 @@ impl AppView {
         self.connect_many(contexts, window, cx);
     }
 
+    /// The context sets (saved from the top bar's picker), one button each that connects the
+    /// set's contexts the kubeconfig still has. None when there is no set.
+    fn context_set_buttons(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let sets = crate::settings::context_sets();
+        if sets.is_empty() {
+            return None;
+        }
+        let buttons = sets.into_iter().enumerate().map(|(i, set)| {
+            let contexts = set.available(&self.all_contexts);
+            Button::new(("ctx-set-button", i))
+                .outline()
+                .icon(Lucide::Layers)
+                .label(set.name)
+                .tooltip(if contexts.is_empty() {
+                    "None of its contexts is in the kubeconfig".to_string()
+                } else {
+                    contexts.join(", ")
+                })
+                .disabled(contexts.is_empty())
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.picked = contexts.iter().cloned().collect();
+                    this.connect_many(contexts.clone(), window, cx);
+                }))
+        });
+        Some(h_flex().flex_wrap().gap_2().children(buttons).into_any_element())
+    }
+
     pub(super) fn render_contexts(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
         v_flex().size_full().items_center().justify_center().child(
@@ -223,6 +266,7 @@ impl AppView {
                         .text_color(theme.muted_foreground)
                         .child("Select one or more contexts to get started"),
                 )
+                .children(self.context_set_buttons(cx))
                 .child(h_flex().flex_wrap().gap_2().children(self.all_contexts.iter().enumerate().map(|(i, ctx)| {
                     let name = ctx.clone();
                     let risky = crate::settings::is_protected(ctx);
