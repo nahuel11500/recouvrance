@@ -47,6 +47,14 @@ fn exit_meaning(code: i64) -> &'static str {
     }
 }
 
+const NOT_SCHEDULED: &str = "Not scheduled";
+
+/// Whether a finding is a crash of `container`, the one its crash output goes under: a
+/// crash loop or a failed exit ("Cannot pull the image of container x" has no space after).
+fn about_crash(f: &Finding, container: &str) -> bool {
+    f.level == Level::Critical && f.title.to_lowercase().contains(&format!("container {container} "))
+}
+
 /// Findings for a pod, worst first. `crash_logs` are the last lines of the
 /// previous run of a crashing container, as (container, text).
 pub fn pod(pod: &Value, events: &[Ev], crash_logs: Option<&(String, String)>) -> Vec<Finding> {
@@ -119,7 +127,7 @@ pub fn pod(pod: &Value, events: &[Ev], crash_logs: Option<&(String, String)>) ->
         } else {
             "The scheduler cannot place it yet."
         };
-        out.push(Finding { level: Level::Critical, title: "Not scheduled".into(), detail: msg, hint: hint.into() });
+        out.push(Finding { level: Level::Critical, title: NOT_SCHEDULED.into(), detail: msg, hint: hint.into() });
     }
     for (c, init) in statuses(pod) {
         let name = s(c, "/name");
@@ -289,9 +297,7 @@ pub fn pod(pod: &Value, events: &[Ev], crash_logs: Option<&(String, String)>) ->
         }
     }
     if let Some((container, text)) = crash_logs
-        && let Some(f) = out
-            .iter_mut()
-            .find(|f| f.title.to_lowercase().contains(&format!("container {container} ")) && f.level == Level::Critical)
+        && let Some(f) = out.iter_mut().find(|f| about_crash(f, container))
     {
         let tail: Vec<&str> = text.lines().rev().filter(|l| !l.trim().is_empty()).take(6).collect();
         if !tail.is_empty() {
@@ -402,17 +408,34 @@ pub fn worst_pod(pods: &[Value]) -> Option<&Value> {
     worst(&judged).map(|i| judged[i].0)
 }
 
-/// The container whose output explains a pod's crash: the first that exited with an error,
-/// and whether to read its previous run (it restarted since) rather than its current one.
-pub fn crashed_container(pod: &Value) -> Option<(String, bool)> {
-    let failed = |c: &&Value| {
-        let code = |p: &str| c.pointer(p).and_then(Value::as_i64).unwrap_or(0);
-        code("/lastState/terminated/exitCode") != 0 || code("/state/terminated/exitCode") != 0
+/// The container whose output explains a pod's crash, and whether to read its previous run
+/// (it restarted since) rather than its current one: the first whose crash the pod's findings
+/// name. None when no finding would show the output, so no log read is wasted on a sidecar
+/// that failed once long ago.
+pub fn crashed_container(p: &Value) -> Option<(String, bool)> {
+    let findings = pod(p, &[], None);
+    statuses(p).find_map(|(c, _)| {
+        let name = c["name"].as_str()?;
+        let now = c.pointer("/state/terminated").is_some();
+        let ran = now || c.pointer("/lastState/terminated").is_some();
+        (ran && findings.iter().any(|f| about_crash(f, name))).then(|| (name.to_string(), !now))
+    })
+}
+
+/// Whether a pod fails, rather than being slow: a crash, a failed exit, an image or create
+/// error, an eviction, or a container back to not ready after a failed run (between two
+/// crash-loop backoffs). A pod still starting, warming up behind its readiness probe or
+/// waiting for room on a node is neither failing nor fine: every rollout and scale-up has
+/// those, and a capacity shortage is not the revision's fault.
+fn failing(p: &Value, findings: &[Finding]) -> bool {
+    let restarted_after_error = || {
+        !ready(p)
+            && statuses(p).any(|(c, _)| {
+                c["restartCount"].as_i64().unwrap_or(0) > 0
+                    && c.pointer("/lastState/terminated/exitCode").and_then(Value::as_i64).unwrap_or(0) != 0
+            })
     };
-    pod.pointer("/status/containerStatuses")
-        .and_then(Value::as_array)
-        .and_then(|cs| cs.iter().find(failed))
-        .and_then(|c| Some((c["name"].as_str()?.to_string(), c.pointer("/state/terminated").is_none())))
+    findings.iter().any(|f| f.level == Level::Critical && f.title != NOT_SCHEDULED) || restarted_after_error()
 }
 
 /// Ready, or finished well (a Job's pod).
@@ -443,16 +466,19 @@ fn revision_of<'a>(pod: &Value, revisions: &'a [Value]) -> Option<&'a Value> {
 /// while pods of the same revision are ready elsewhere), the new revision (only its pods fail,
 /// while the previous one's are ready), or the app (pods of old and new revisions fail, or
 /// every pod fails, on several nodes). Nothing when they don't tell, such as one failing pod
-/// and no other.
+/// and no other, or pods only starting (`failing`).
 fn cause(judged: &[(&Value, Vec<Finding>)], revisions: &[Value]) -> Option<Finding> {
     use crate::k8s::rollouts::number;
     use crate::plural::{count, pick};
     use std::collections::BTreeSet;
-    let failing: Vec<&Value> = judged.iter().filter(|(_, f)| !f.is_empty()).map(|(p, _)| *p).collect();
+    let (failing, others): (Vec<&(&Value, Vec<Finding>)>, Vec<_>) =
+        judged.iter().partition(|(p, f)| self::failing(p, f));
+    let failing: Vec<&Value> = failing.into_iter().map(|(p, _)| *p).collect();
     if failing.is_empty() {
         return None;
     }
-    let fine: Vec<&Value> = judged.iter().filter(|(p, f)| f.is_empty() && ready(p)).map(|(p, _)| *p).collect();
+    // Serving: ready, whatever warning it has (a restart for memory long ago).
+    let fine: Vec<&Value> = others.iter().map(|(p, _)| *p).filter(|p| ready(p)).collect();
     fn node(p: &Value) -> &str {
         s(p, "/spec/nodeName")
     }
@@ -533,7 +559,8 @@ fn cause(judged: &[(&Value, Vec<Finding>)], revisions: &[Value]) -> Option<Findi
         }
     }
     // Every pod fails, on several nodes: not a node, and no ready pod to set a revision against.
-    if fine.is_empty() && nodes.len() > 1 {
+    // A pod still starting may yet be fine: then it is not every pod.
+    if others.is_empty() && nodes.len() > 1 {
         return Some(Finding {
             level: Level::Warning,
             title: format!("Every pod fails, on {}", count(nodes.len(), "node")),
@@ -661,8 +688,9 @@ mod tests {
         assert_eq!(titles, ["Evicted"]);
     }
 
-    /// A Deployment's pod of the `ReplicaSet` `web-<hash>` on `node`: crash-looping, ready, or
-    /// starting (neither).
+    /// A Deployment's pod of the `ReplicaSet` `web-<hash>` on `node`: crash-looping, running
+    /// again between two crash-loop backoffs (`rerun`), ready, warming up behind its readiness
+    /// probe, or starting (Pending; not scheduled when `node` is empty).
     fn wpod(name: &str, node: &str, hash: &str, state: &str) -> Value {
         let (phase, ready, status) = match state {
             "crash" => (
@@ -672,9 +700,20 @@ mod tests {
                     "state": {"waiting": {"reason": "CrashLoopBackOff"}},
                     "lastState": {"terminated": {"exitCode": 1, "reason": "Error"}}}),
             ),
+            "rerun" => (
+                "Running",
+                "False",
+                json!({"name": "app", "restartCount": 4, "ready": false, "state": {"running": {}},
+                    "lastState": {"terminated": {"exitCode": 1, "reason": "Error"}}}),
+            ),
             "ready" => {
                 ("Running", "True", json!({"name": "app", "restartCount": 0, "ready": true, "state": {"running": {}}}))
             }
+            "warming" => (
+                "Running",
+                "False",
+                json!({"name": "app", "restartCount": 0, "ready": false, "state": {"running": {}}}),
+            ),
             _ => (
                 "Pending",
                 "False",
@@ -769,6 +808,72 @@ mod tests {
     }
 
     #[test]
+    fn pods_starting_or_waiting_for_room_are_not_failing() {
+        // A rolling update: the new revision's pod warms up while the old one's serve.
+        let pods = [
+            wpod("web-aaa-1", "n1", "aaa", "ready"),
+            wpod("web-aaa-2", "n2", "aaa", "ready"),
+            wpod("web-bbb-1", "n1", "bbb", "warming"),
+        ];
+        assert!(cause_of(&pods, &revs()).is_none());
+        // A scale-up: a new pod warms up on n1 while the others are ready on n2.
+        let pods = [wpod("web-bbb-1", "n2", "bbb", "ready"), wpod("web-bbb-2", "n1", "bbb", "warming")];
+        assert!(cause_of(&pods, &revs()).is_none());
+        // A new Deployment whose pods all warm up.
+        let pods = [
+            wpod("web-bbb-1", "n1", "bbb", "warming"),
+            wpod("web-bbb-2", "n2", "bbb", "warming"),
+            wpod("web-bbb-3", "n3", "bbb", "warming"),
+        ];
+        assert!(cause_of(&pods, &revs()).is_none());
+        // A surge with no room for the new pod: a capacity shortage, not the new revision.
+        let pods = [wpod("web-aaa-1", "n1", "aaa", "ready"), wpod("web-bbb-1", "", "bbb", "starting")];
+        assert!(cause_of(&pods, &revs()).is_none());
+        // Two crash, a third is still starting: not every pod.
+        let pods = [
+            wpod("web-bbb-1", "n1", "bbb", "crash"),
+            wpod("web-bbb-2", "n2", "bbb", "crash"),
+            wpod("web-bbb-3", "n3", "bbb", "warming"),
+        ];
+        assert!(cause_of(&pods, &revs()).is_none());
+    }
+
+    #[test]
+    fn a_crash_loop_between_two_backoffs_still_fails() {
+        let pods = [
+            wpod("web-aaa-1", "n1", "aaa", "ready"),
+            wpod("web-bbb-1", "n1", "bbb", "rerun"),
+            wpod("web-bbb-2", "n2", "bbb", "crash"),
+        ];
+        assert_eq!(cause_of(&pods, &revs()).expect("a cause").title, "The new revision (12) fails");
+    }
+
+    #[test]
+    fn the_crash_output_read_is_the_container_that_crashes() {
+        // A sidecar that failed once long ago, then the app crash-looping: the app's output.
+        let p = json!({"metadata": {"name": "web-1"}, "status": {"phase": "Running", "containerStatuses": [
+            {"name": "proxy", "restartCount": 1, "ready": true, "state": {"running": {}},
+                "lastState": {"terminated": {"exitCode": 2, "reason": "Error"}}},
+            {"name": "app", "restartCount": 4, "ready": false,
+                "state": {"waiting": {"reason": "CrashLoopBackOff"}},
+                "lastState": {"terminated": {"exitCode": 1, "reason": "Error"}}}]}});
+        assert_eq!(crashed_container(&p), Some(("app".to_string(), true)));
+        // Only the sidecar's old failure, nothing shown for it: no read.
+        let p = json!({"metadata": {"name": "web-1"}, "status": {"phase": "Running", "containerStatuses": [
+            {"name": "proxy", "restartCount": 1, "ready": true, "state": {"running": {}},
+                "lastState": {"terminated": {"exitCode": 2, "reason": "Error"}}}]}});
+        assert_eq!(crashed_container(&p), None);
+        // A Job's container that exited with an error: its current run.
+        let p = json!({"metadata": {"name": "job-1"}, "status": {"phase": "Failed", "containerStatuses": [
+            {"name": "task", "restartCount": 0, "ready": false,
+                "state": {"terminated": {"exitCode": 1, "reason": "Error"}}}]}});
+        assert_eq!(crashed_container(&p), Some(("task".to_string(), false)));
+        // A warming pod is the worst of a rollout with nothing else wrong: no read either.
+        let pods = [wpod("web-aaa-1", "n1", "aaa", "ready"), wpod("web-bbb-1", "n1", "bbb", "warming")];
+        assert_eq!(worst_pod(&pods).and_then(crashed_container), None);
+    }
+
+    #[test]
     fn pods_find_their_revision_whatever_the_workload() {
         // A StatefulSet's pods carry the ControllerRevision's name, a DaemonSet's its hash.
         let cr = |name: &str| json!({"metadata": {"name": name}});
@@ -806,21 +911,22 @@ mod tests {
         /// Whatever the pods, a cause is only named with its evidence: a node when every failing
         /// pod runs there and one of the same revision is ready elsewhere, the new revision when
         /// only its pods fail and an older one's is ready, old and new when both fail, and every
-        /// pod when none is ready.
+        /// pod when every pod fails. Pods only warming up, starting or waiting for room never
+        /// make a cause.
         #[test]
         fn a_cause_is_named_only_with_its_evidence(
-            spec in prop::collection::vec((0..4usize, 0..2usize, 0..3usize), 0..8)
+            spec in prop::collection::vec((0..4usize, 0..2usize, 0..5usize), 0..8)
         ) {
             let nodes = ["n1", "n2", "n3", ""];
             let hashes = ["aaa", "bbb"];
-            let states = ["crash", "ready", "starting"];
+            let states = ["crash", "ready", "starting", "warming", "rerun"];
             let pods: Vec<Value> = spec
                 .iter()
                 .enumerate()
                 .map(|(i, (n, h, st))| wpod(&format!("web-{i}"), nodes[*n], hashes[*h], states[*st]))
                 .collect();
-            // A pod starting on no node is not scheduled: it fails too.
-            let failing: Vec<&(usize, usize, usize)> = spec.iter().filter(|p| p.2 == 0 || (p.2 == 2 && p.0 == 3)).collect();
+            // Only a crash fails: a pod warming up, starting or not scheduled does not.
+            let failing: Vec<&(usize, usize, usize)> = spec.iter().filter(|p| p.2 == 0 || p.2 == 4).collect();
             let ready: Vec<&(usize, usize, usize)> = spec.iter().filter(|p| p.2 == 1).collect();
             let Some(f) = cause_of(&pods, &revs()) else { return Ok(()) };
             prop_assert!(!failing.is_empty());
@@ -834,7 +940,7 @@ mod tests {
                 prop_assert!(failing.iter().any(|p| p.1 == 0) && failing.iter().any(|p| p.1 == 1));
             } else {
                 prop_assert!(f.title.starts_with("Every pod fails"), "{f:?}");
-                prop_assert!(ready.is_empty());
+                prop_assert_eq!(failing.len(), spec.len());
             }
         }
     }

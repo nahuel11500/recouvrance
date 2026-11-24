@@ -525,8 +525,11 @@
   image pulls, probes, volumes) and what to try. On a workload's page it also says where the
   failure comes from, from its pods' revisions and nodes: the new revision (only its pods fail,
   the previous one's are ready), one node (only pods there fail, the same revision is ready
-  elsewhere) or the app (old and new revisions fail, or every pod fails on several nodes); and it
-  shows the worst pod's crash output (one log read, only when a container crashed).
+  elsewhere) or the app (old and new revisions fail, or every pod fails on several nodes). A pod
+  fails when it crashes, exits with an error, cannot pull or create a container, or is evicted; a
+  pod still starting, warming up behind its readiness probe or waiting for room on a node does not
+  count, so a rollout or scale-up in progress names no cause. It also shows the worst pod's crash
+  output (one log read, only when a container of that pod crashed).
 - **Rollback** of Deployments, StatefulSets and DaemonSets to any revision, with the diff and a
   server dry run first; **attach** to a container's process; **file copy** in and out of containers
   (both ways it runs commands in the container, so it needs write mode, like a shell);
