@@ -44,6 +44,10 @@ pub fn run(ctx: String) {
                 problems_by_kind(&client, &kinds).await;
                 return;
             }
+            if how == "twice" {
+                problems_twice(&client, &kinds).await;
+                return;
+            }
             let t = std::time::Instant::now();
             let scan = problems::scan_partial(client.clone(), &kinds, None, None).await;
             let p = &scan.problems;
@@ -188,6 +192,35 @@ pub fn run(ctx: String) {
             println!("peak {} MB, now {} MB", mb(memory("VmHWM")), mb(memory("VmRSS")));
             return;
         }
+        // RECOUVRANCE_EVENTS=<seconds>: the Timeline's "All events" on every namespace for that
+        // long, each time it gets them, then what it cost (requests, bytes, peak memory).
+        if let Some(secs) = std::env::var("RECOUVRANCE_EVENTS").ok().and_then(|s| s.parse::<u64>().ok()) {
+            let start = std::time::Instant::now();
+            let end = start + std::time::Duration::from_secs(secs);
+            let every = || crate::settings::secs(crate::settings::get().overview_refresh);
+            // Listed once, then watched: the rows come again when they changed, at most every
+            // refresh interval.
+            let (_watch, mut rx) =
+                k8s::watch_events(client.clone(), None, true, k8s::EVENTS_KEPT, every, k8s::Pause::default());
+            while std::time::Instant::now() < end {
+                match futures::FutureExt::now_or_never(rx.next()) {
+                    Some(Some(k8s::EventsMsg::Rows(r))) => println!(
+                        "events: {} rows, the newest {} of {} events, at {}s",
+                        r.rows.len(),
+                        r.kept,
+                        r.total,
+                        start.elapsed().as_secs()
+                    ),
+                    Some(Some(k8s::EventsMsg::Error(e))) => {
+                        println!("events: ERROR {e} at {}s", start.elapsed().as_secs());
+                    }
+                    Some(None) => break,
+                    None => std::thread::sleep(std::time::Duration::from_millis(100)),
+                }
+            }
+            crate::dev::usage::print();
+            return;
+        }
         // RECOUVRANCE_EDIT=ns/deploy: YAML round trip + server-side dry-run replace.
         if let Ok(target) = std::env::var("RECOUVRANCE_EDIT") {
             let (ns, name) = target.split_once('/').unwrap();
@@ -322,6 +355,26 @@ async fn problems_by_kind(client: &kube::Client, kinds: &[k8s::Kind]) {
         if let Some(skipped) = scan.skipped_text() {
             println!("  could not read {skipped}");
         }
+    }
+}
+
+/// Two Problems scans one after the other (`RECOUVRANCE_PROBLEMS=twice`): each one's time,
+/// and the requests it sent and the bytes it received, from the API requests meter. The
+/// second shows what a scan costs when the one before can be reused.
+async fn problems_twice(client: &kube::Client, kinds: &[k8s::Kind]) {
+    for run in ["first", "second"] {
+        k8s::meter::reset();
+        let t = std::time::Instant::now();
+        let scan = problems::scan_partial(client.clone(), kinds, None, None).await;
+        let took = t.elapsed();
+        let snapshot = k8s::meter::snapshot(k8s::meter::now_minute());
+        let requests: u64 = snapshot.classes.iter().map(|(_, _, s)| s.count).sum();
+        let bytes: u64 = snapshot.classes.iter().map(|(_, _, s)| s.bytes).sum();
+        println!(
+            "{run} scan: {} problems in {took:?}, {requests} requests, {} MB received",
+            scan.problems.len(),
+            bytes / 1_000_000
+        );
     }
 }
 

@@ -987,6 +987,10 @@ pub struct ProblemsParams {
     pub namespace: Option<String>,
     #[schemars(description = "Include minor findings (restarts, cordoned nodes). Default false")]
     pub include_minor: Option<bool>,
+    #[schemars(
+        description = "Oldest findings to accept, in seconds: 0 scans now (after a fix, to check it). By default the app's latest scan while it is recent (2 minutes or more on a big cluster)"
+    )]
+    pub max_age_seconds: Option<u64>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]

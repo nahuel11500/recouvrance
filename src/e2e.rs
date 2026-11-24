@@ -1255,7 +1255,9 @@ fn an_agent_finds_a_pod_s_missing_config_map() {
             let mcp = crate::assistant::Mcp::connect(hub.port(), token).await?;
             let mut out = String::new();
             for _ in 0..90 {
-                out = mcp.call("find_problems", json!({"context": ctx, "namespace": NS})).await;
+                // A new scan each time: the pod's state changes meanwhile.
+                let args = json!({"context": ctx, "namespace": NS, "max_age_seconds": 0});
+                out = mcp.call("find_problems", args).await;
                 if out.lines().any(|l| l.contains(name) && l.contains("missing ConfigMap e2e-missing-config")) {
                     break;
                 }
@@ -1264,6 +1266,18 @@ fn an_agent_finds_a_pod_s_missing_config_map() {
             let line = out.lines().find(|l| l.contains(name)).with_context(|| out.clone())?;
             assert!(line.contains("missing ConfigMap e2e-missing-config"), "{out}");
             assert!(!line.contains("e2e-optional-config"), "{out}");
+            // Asked again by default a few seconds later: the scan just made answers, and says
+            // how old it is. A new scan would say it started 0s ago.
+            let pause = 3;
+            tokio::time::sleep(std::time::Duration::from_secs(pause)).await;
+            let again = mcp.call("find_problems", json!({"context": ctx, "namespace": NS})).await;
+            assert!(again.lines().any(|l| l.contains(name)), "{again}");
+            let age = again
+                .split_once("From a scan started ")
+                .and_then(|(_, rest)| rest.split_once(" ago"))
+                .and_then(|(age, _)| k8s::age_seconds(age))
+                .with_context(|| again.clone())?;
+            assert!(age >= i64::try_from(pause)?, "the scan made with max_age_seconds: 0 answers: {again}");
             Ok(())
         };
         let result: Result<()> = checked.await;
@@ -2005,6 +2019,74 @@ fn a_stopped_container_is_read_from_a_copy_of_its_pod() {
         }
         let _ = pods.delete(NAME, &DeleteParams::default().grace_period(0)).await;
         let _ = maps.delete(CONFIG, &DeleteParams::default()).await;
+        result
+    });
+}
+
+/// The rows of a watch of events until `ok` holds for them (30 s at most).
+async fn rows_until(
+    rx: &mut futures::channel::mpsc::UnboundedReceiver<k8s::EventsMsg>,
+    ok: impl Fn(&k8s::EventRows) -> bool,
+) -> Result<()> {
+    use futures::StreamExt as _;
+    let rows = async {
+        while let Some(msg) = rx.next().await {
+            match msg {
+                k8s::EventsMsg::Rows(rows) if ok(&rows) => return Ok(()),
+                k8s::EventsMsg::Rows(_) => {}
+                k8s::EventsMsg::Error(e) => bail!("events: {e}"),
+            }
+        }
+        bail!("the watch of events stopped")
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(30), rows).await.context("the rows never came")?
+}
+
+/// The Timeline's events on a real API server, which keeps events without a watch cache:
+/// listed once, then a new Warning and a deleted one come through the watch from the list's
+/// resourceVersion. Nothing is written through the app: the test makes the events itself.
+#[test]
+#[ignore = "needs a kind cluster: RECOUVRANCE_E2E_CONTEXT"]
+fn the_timeline_s_events_come_through_their_watch() {
+    run(async {
+        use k8s_openapi::api::core::v1::Event;
+        let truth: Api<Event> = Api::namespaced(k8s::connect_for_agents(context()).await?, NS);
+        let tag = uuid::Uuid::new_v4().simple().to_string();
+        let object = format!("e2e-timeline-{tag}");
+        let warning = |reason: &str| -> Result<Event> {
+            let now = jiff::Timestamp::now().to_string();
+            Ok(serde_json::from_value(json!({
+                "metadata": {"name": format!("{object}.{}", reason.to_lowercase()), "namespace": NS},
+                "involvedObject": {"kind": "ConfigMap", "namespace": NS, "name": object},
+                "type": "Warning", "reason": reason, "message": "from the e2e test", "count": 1,
+                "firstTimestamp": now, "lastTimestamp": now, "source": {"component": "e2e"},
+            }))?)
+        };
+        let has = |rows: &k8s::EventRows, reason: &str| {
+            rows.rows.iter().any(|e| e.object_name == object && e.line.reason == reason)
+        };
+        truth.create(&PostParams::default(), &warning("E2eFirst")?).await?;
+        let checked = async {
+            let ui = k8s::connect(context()).await?;
+            let (_watch, mut rx) = k8s::watch_events(
+                ui,
+                Some(NS.into()),
+                false,
+                k8s::EVENTS_KEPT,
+                || std::time::Duration::ZERO,
+                k8s::Pause::default(),
+            );
+            rows_until(&mut rx, |r| has(r, "E2eFirst")).await.context("listed")?;
+            truth.create(&PostParams::default(), &warning("E2eSecond")?).await?;
+            rows_until(&mut rx, |r| has(r, "E2eFirst") && has(r, "E2eSecond")).await.context("added")?;
+            truth.delete(&format!("{object}.e2efirst"), &DeleteParams::default()).await?;
+            rows_until(&mut rx, |r| !has(r, "E2eFirst") && has(r, "E2eSecond")).await.context("deleted")?;
+            Ok(())
+        };
+        let result: Result<()> = checked.await;
+        for reason in ["e2efirst", "e2esecond"] {
+            let _ = truth.delete(&format!("{object}.{reason}"), &DeleteParams::default()).await;
+        }
         result
     });
 }
