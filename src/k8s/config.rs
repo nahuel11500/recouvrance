@@ -226,7 +226,7 @@ pub(super) fn read_kubeconfig_file(path: &std::path::Path) -> Result<Kubeconfig>
     }
     // kube reads the file again, and it may have changed since: its panic is an error too.
     std::panic::catch_unwind(|| Kubeconfig::read_from(path))
-        .map_err(|_| anyhow!("{}: it could not be read (it may have changed while it was read)", file()))?
+        .map_err(|_| anyhow!("{}: kube failed reading it", file()))?
         .map_err(|e| anyhow!("{}: {}", file(), unquoted(e)))
 }
 
@@ -1575,11 +1575,17 @@ current-context: x
             ],
             body in prop::collection::vec(any::<u8>(), 0..64),
         ) {
-            let path = std::env::temp_dir().join(format!("recouvrance-test-{}", uuid::Uuid::new_v4().simple()));
+            /// The test's folder, removed when the case ends, failed or not.
+            struct Folder(std::path::PathBuf);
+            impl Drop for Folder {
+                fn drop(&mut self) {
+                    let _ = std::fs::remove_dir_all(&self.0);
+                }
+            }
+            let dir = Folder(crate::mcp::test_dir());
+            let path = dir.0.join("config");
             std::fs::write(&path, [mark, &body[..]].concat()).unwrap();
-            let read = super::read_kubeconfig_file(&path);
-            std::fs::remove_file(&path).unwrap();
-            if let Err(e) = read {
+            if let Err(e) = super::read_kubeconfig_file(&path) {
                 let file = crate::paths::tilde(&path);
                 prop_assert!(e.to_string().starts_with(&format!("{file}: ")), "{e}");
             }
