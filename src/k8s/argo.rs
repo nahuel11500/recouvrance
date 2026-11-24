@@ -41,9 +41,9 @@ const IN_CLUSTER: &str = "https://kubernetes.default.svc";
 /// Where Argo CD keeps its Applications by default (a tracking id without `<ns>_`).
 pub const DEFAULT_NAMESPACE: &str = "argocd";
 /// A context that did not answer is left alone this long before it is tried again.
-const RETRY: Duration = Duration::from_secs(300);
+pub(crate) const RETRY: Duration = Duration::from_secs(300);
 /// The longest wait for a context to connect, then to answer whether it serves Applications.
-const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 /// A hub's Applications are listed at most this often, however many pages ask.
 const LIST_TTL: Duration = Duration::from_secs(30);
 /// Contexts probed at the same time.
@@ -167,18 +167,32 @@ fn same_cluster(a: &ContextTarget, b: &ContextTarget) -> bool {
 /// A destination given by name matches the context's name or its kubeconfig cluster's name
 /// (Argo CD's own cluster names are in Secrets, which are not read).
 pub fn targets_cluster(app: &Value, hub: &ContextTarget, here: &ContextTarget) -> bool {
-    let dest = |p: &str| app.pointer(p).and_then(Value::as_str);
-    deploys_to(dest("/spec/destination/server"), dest("/spec/destination/name"), hub, here)
+    app_deploys_to(app, hub, here) == Some(true)
 }
 
 /// `targets_cluster` for a destination's `server` and `name` as written.
 pub fn deploys_to(server: Option<&str>, name: Option<&str>, hub: &ContextTarget, here: &ContextTarget) -> bool {
+    destination_is(server, name, hub, here) == Some(true)
+}
+
+/// [`targets_cluster`], None when it can't be told: a destination named neither `in-cluster`
+/// nor as the context or its kubeconfig cluster may be the name of an Argo CD cluster Secret
+/// for this very cluster.
+pub fn app_deploys_to(app: &Value, hub: &ContextTarget, here: &ContextTarget) -> Option<bool> {
+    let dest = |p: &str| app.pointer(p).and_then(Value::as_str);
+    destination_is(dest("/spec/destination/server"), dest("/spec/destination/name"), hub, here)
+}
+
+/// Whether the destination `server` / `name` is the cluster of `here`; None when it can't be
+/// told (see [`app_deploys_to`]).
+fn destination_is(server: Option<&str>, name: Option<&str>, hub: &ContextTarget, here: &ContextTarget) -> Option<bool> {
     match (server.filter(|s| !s.is_empty()), name.filter(|s| !s.is_empty())) {
-        (Some(s), _) if server_key(s) == server_key(IN_CLUSTER) => same_cluster(hub, here),
-        (Some(s), _) => same_server(Some(s), here.server.as_deref()),
-        (None, Some("in-cluster")) => same_cluster(hub, here),
-        (None, Some(n)) => n == here.name || n == here.cluster,
-        (None, None) => false,
+        (Some(s), _) if server_key(s) == server_key(IN_CLUSTER) => Some(same_cluster(hub, here)),
+        (Some(s), _) => Some(same_server(Some(s), here.server.as_deref())),
+        (None, Some("in-cluster")) => Some(same_cluster(hub, here)),
+        (None, Some(n)) if n == here.name || n == here.cluster => Some(true),
+        (None, Some(_)) => None,
+        (None, None) => Some(false),
     }
 }
 
@@ -706,6 +720,34 @@ pub fn known_hubs() -> Vec<String> {
         probes.iter().filter(|(_, p)| matches!(p, Probe::Serves(_))).map(|(c, _)| c.clone()).collect();
     hubs.sort();
     hubs
+}
+
+/// The contexts an agent's read failed to reach, why, and when: left alone `RETRY`, as the
+/// probes are, so a hub that is down doesn't make every agent call wait for it again.
+static UNREACHED: LazyLock<Mutex<HashMap<String, (String, Instant)>>> = LazyLock::new(Default::default);
+
+/// Say an agent's read could not reach `context`.
+pub fn note_unreached(context: &str, why: String) {
+    UNREACHED.lock().unwrap_or_else(PoisonError::into_inner).insert(context.to_string(), (why, Instant::now()));
+}
+
+/// Say an agent's read reached `context`.
+pub fn note_reached(context: &str) {
+    UNREACHED.lock().unwrap_or_else(PoisonError::into_inner).remove(context);
+}
+
+/// Why `context` is not asked again yet: an agent's read failed to reach it less than
+/// `RETRY` before `now`, or (with `probes`) so did a probe of the window's pages.
+pub fn recent_failure(context: &str, probes: bool, now: Instant) -> Option<String> {
+    let fresh = |at: &Instant| now.saturating_duration_since(*at) < RETRY;
+    if probes
+        && let Some(Probe::Failed(why, at)) = PROBES.lock().unwrap_or_else(PoisonError::into_inner).get(context)
+        && fresh(at)
+    {
+        return Some(why.clone());
+    }
+    let unreached = UNREACHED.lock().unwrap_or_else(PoisonError::into_inner);
+    unreached.get(context).filter(|(_, at)| fresh(at)).map(|(why, _)| why.clone())
 }
 
 /// Ask one context whether it serves Applications, now (its login may run): Ok(true) when it
@@ -1650,6 +1692,26 @@ mod tests {
         assert!(tracking_of("apps", "Deployment", &json!({"metadata": {"name": "web"}})).is_none());
     }
 
+    /// A context an agent's read could not reach is not asked again for `RETRY`, then is.
+    #[test]
+    fn a_hub_that_failed_recently_is_not_asked_again() {
+        let hub = "unreached-test-hub";
+        assert_eq!(recent_failure(hub, true, Instant::now()), None);
+        note_unreached(hub, "did not answer".into());
+        assert_eq!(recent_failure(hub, false, Instant::now()).as_deref(), Some("did not answer"));
+        assert_eq!(recent_failure(hub, true, Instant::now() + RETRY), None, "asked again once RETRY is over");
+        note_reached(hub);
+        assert_eq!(recent_failure(hub, true, Instant::now()), None);
+        // A probe of the window's that failed counts too, when asked for.
+        let probed = "probe-failed-test-hub";
+        PROBES
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(probed.into(), Probe::Failed("timed out".into(), Instant::now()));
+        assert_eq!(recent_failure(probed, true, Instant::now()).as_deref(), Some("timed out"));
+        assert_eq!(recent_failure(probed, false, Instant::now()), None);
+    }
+
     #[test]
     fn an_object_names_its_application_by_tracking_id_else_by_label() {
         let obj = |annotation: Option<&str>, label: Option<&str>| {
@@ -1696,6 +1758,12 @@ mod tests {
         assert!(targets_cluster(&to(json!({"name": "prod-cluster"})), &hub, &prod));
         assert!(!targets_cluster(&to(json!({"name": "staging"})), &hub, &prod));
         assert!(!targets_cluster(&json!({}), &hub, &prod));
+        // A name of Argo CD's own (a cluster Secret's) can't be told from another cluster's.
+        assert_eq!(app_deploys_to(&to(json!({"name": "staging"})), &hub, &prod), None);
+        assert_eq!(app_deploys_to(&to(json!({"name": "prod"})), &hub, &prod), Some(true));
+        assert_eq!(app_deploys_to(&to(json!({"name": "in-cluster"})), &hub, &prod), Some(false));
+        assert_eq!(app_deploys_to(&to(json!({"server": "https://other.example"})), &hub, &prod), Some(false));
+        assert_eq!(app_deploys_to(&json!({}), &hub, &prod), Some(false));
     }
 
     #[test]

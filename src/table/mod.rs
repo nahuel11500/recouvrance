@@ -368,7 +368,7 @@ impl ResourceTable {
         self.set_usage(ctx, pod_like, fresh)
     }
 
-    /// Pod usage from metrics-server; adds CPU and Memory columns after Status.
+    /// Pod usage from metrics-server; adds CPU and Memory columns (see `insert_usage_cols`).
     pub fn set_usage(&mut self, ctx: usize, usage: k8s::PodUsage, fresh: k8s::Freshness) -> bool {
         self.freshness.insert(ctx, fresh);
         let added = self.usage.is_none();
@@ -404,10 +404,14 @@ impl ResourceTable {
         }
         let wants = |name: &str| self.visible_cols.as_ref().is_none_or(|v| v.iter().any(|c| c == name));
         let (cpu, mem) = (wants("CPU"), wants("Memory"));
-        let at = self
-            .cols
+        // Pods keep kubectl's Ready, Status, Restarts and Age together in front of the bars,
+        // so they fit on screen first. Nodes show theirs after Status.
+        let after: &[&str] = if self.pods { &["Age", "Restarts", "Status"] } else { &["Status"] };
+        let at = after
             .iter()
-            .position(|c| matches!(c, Col::Cell(i) if self.defs[*i].name == "Status"))
+            .find_map(|name| {
+                self.cols.iter().position(|c| matches!(c, Col::Cell(i) | Col::Age(i) if self.defs[*i].name == *name))
+            })
             .map_or(self.cols.len(), |i| i + 1);
         if mem {
             self.cols.insert(at, Col::Memory);
@@ -713,5 +717,35 @@ mod table_tests {
         assert_eq!(shown(&mut t, "status:running"), 2);
         assert_eq!(shown(&mut t, "namespace:team-a"), 2);
         assert_eq!(shown(&mut t, "error:timeout"), 0, "not a column: text search");
+    }
+
+    #[test]
+    fn pod_usage_comes_after_kubectl_columns() {
+        let fresh = || crate::k8s::Freshness { measured: None, every: None };
+        let pod_defs = || {
+            Arc::new(vec![
+                def("Name", 0),
+                def("Ready", 0),
+                def("Status", 0),
+                def("Restarts", 0),
+                def("Age", 0),
+                def("IP", 1),
+                def("Node", 1),
+            ])
+        };
+        let mut t = ResourceTable::new();
+        t.pods = true;
+        t.set_columns(pod_defs());
+        t.set_usage(0, Default::default(), fresh());
+        assert_eq!(t.headers(), ["", "Name", "Ready", "Status", "Restarts", "Age", "CPU", "Memory", "Node"]);
+        // Columns that come after the usage (a relist) put it at the same place.
+        t.set_columns(pod_defs());
+        assert_eq!(t.headers(), ["", "Name", "Ready", "Status", "Restarts", "Age", "CPU", "Memory", "Node"]);
+        // Nodes keep theirs after Status.
+        let mut t = ResourceTable::new();
+        t.nodes = true;
+        t.set_columns(Arc::new(vec![def("Name", 0), def("Status", 0), def("Roles", 0), def("Age", 0)]));
+        t.set_node_usage(0, Default::default(), fresh());
+        assert_eq!(t.headers(), ["", "Name", "Status", "CPU", "Memory", "Roles", "Age"]);
     }
 }

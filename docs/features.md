@@ -15,8 +15,10 @@
   from. A plugin that cannot start, often because it is not on the `PATH` the app was started
   with, is reported with its name. A proxy the app can't use (the kubeconfig's `proxy-url`, or
   `HTTPS_PROXY`, with a scheme other than `http`, `https` or `socks5`, or none) is named by its
-  scheme, host and port, never its user and password; neither shows for any other URL in a
-  connection error.
+  scheme, host and port, never its user and password, even a password with an unescaped `/`, `?`
+  or `#`; by its scheme alone when its text holds a `#`, or when the host can't be told from the
+  password. Neither shows for any other URL in a connection error, unless its password holds an
+  unescaped `/`, `?` or `#` (#1000).
 - **Reopens where you left off**: each set of contexts keeps its tabs (the list or overview each
   shows, its resource type, namespaces and filter) and each type's filter, and the window keeps
   its place, size and whether it was maximized. On launch the first window reopens there once its
@@ -532,7 +534,7 @@
   clusters and namespaces picked, and the object whose page is open (with its context), or the
   list with its filter and the row selected, or the page (Problems, Timeline, overviews, Helm,
   Argo CD). A page's *Investigate* asks it beside the page when it is open there.
-- **Overviews**: cluster capacity and health, workloads status, Helm releases (values masked; install from your repos, roll back and uninstall through your `helm` CLI).
+- **Overviews**: cluster capacity and health (requested is what the pods bound to a node hold there; pending pods no node took are said apart, with what they ask for), workloads status, Helm releases (values masked; install from your repos, roll back and uninstall through your `helm` CLI).
 - **API requests** (Settings → API requests): per cluster, how many requests of each kind
   (discovery, lists, watches, metrics, logs, shells, writes) were made and how many failed; how
   long the API server took to start answering (p50, p95, slowest) and, for answers that end,
