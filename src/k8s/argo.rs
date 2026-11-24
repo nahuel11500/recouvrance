@@ -24,7 +24,9 @@ pub mod api;
 pub mod dashboard;
 pub mod diagnosis;
 pub mod grouped_diff;
+pub mod grouped_sync;
 pub mod grouping;
+pub mod journal;
 pub mod ops;
 pub mod server;
 pub mod sync_diff;
@@ -1096,6 +1098,12 @@ pub struct Fleet {
 impl Fleet {
     /// When the next sync of `a` can start, from `now`, under its project's sync windows.
     pub fn next_sync(&self, a: &FleetApp, plan: &mut windows::Planner) -> windows::NextSync {
+        // Auto-sync is held by every window; a manual sync goes through those that allow it.
+        self.sync_window(a, plan, !a.app.automated)
+    }
+
+    /// When a sync of `a` asked by hand (`manual`), or one auto-sync starts, can start next.
+    pub fn sync_window(&self, a: &FleetApp, plan: &mut windows::Planner, manual: bool) -> windows::NextSync {
         let all = match self.projects.get(&a.instance) {
             None => return windows::NextSync::Unknown("its project's sync windows are not read yet".into()),
             Some(Err(e)) => return windows::NextSync::Unknown(e.clone()),
@@ -1107,8 +1115,7 @@ impl Fleet {
         let s = &a.app;
         let applying: Vec<&windows::SyncWindow> =
             all.iter().filter(|w| w.applies(&s.name, &s.dest_namespace, &s.dest_server, &s.dest_name)).collect();
-        // Auto-sync is held by every window; a manual sync goes through those that allow it.
-        plan.next_sync(&applying, !s.automated)
+        plan.next_sync(&applying, manual)
     }
 }
 
@@ -1153,6 +1160,7 @@ async fn read_fleet(connected: Vec<(String, Client)>) -> Fleet {
         fleet.projects.insert(instance.clone(), project_windows);
         let base = fleet.apps.len();
         for (app, parent) in list.iter().zip(parents(list.as_slice())) {
+            journal::observe(&instance, app);
             let dest = destination(app, &hub_target, &targets);
             let on = dest.context(&names).map(String::from);
             fleet.apps.push(FleetApp {

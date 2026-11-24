@@ -12,7 +12,7 @@ use kube::{Api, Client, api::ListParams};
 use serde_json::Value;
 
 use crate::k8s::{self, Kind};
-use crate::problems::{Problem, Scan, Severity};
+use crate::problems::{Problem, Severity};
 
 /// One alert, as Prometheus reports it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -493,28 +493,17 @@ pub fn problems(alerts: &[Alert], namespaces: &[String]) -> Vec<Problem> {
         .collect()
 }
 
-/// A cluster's problems (see `problems::scan_namespaces`) with its firing alerts in the same
-/// namespaces; alerts that could not be read are noted like a kind.
-pub async fn scan(context: &str, client: Client, kinds: &[Kind], namespaces: &[String]) -> Scan {
-    let (mut scan, alerts) = futures::join!(
-        crate::problems::scan_namespaces(client.clone(), kinds, namespaces, Some(context)),
-        active(context, client)
-    );
-    add(&mut scan, &alerts, namespaces);
-    scan
-}
-
-/// Add the alerts in `namespaces` (all when empty) to a scan, keeping it worst first.
-pub fn add(scan: &mut Scan, alerts: &Alerts, namespaces: &[String]) {
-    scan.problems.extend(problems(&alerts.list, namespaces));
+/// What a Problems scan notes it could not read of the alerts, like a kind: the alerts
+/// themselves, or which of them are silenced.
+pub fn skipped(alerts: &Alerts) -> Vec<(String, anyhow::Error)> {
+    let mut out = Vec::new();
     if let Some(e) = alerts.error() {
-        scan.skipped.push(("Alerts".into(), e));
+        out.push(("Alerts".into(), e));
     }
     if let Some(e) = &alerts.silences_error {
-        scan.skipped.push(("Alertmanager silences".into(), anyhow::anyhow!("{e}")));
+        out.push(("Alertmanager silences".into(), anyhow::anyhow!("{e}")));
     }
-    scan.problems
-        .sort_by(|a, b| a.severity.cmp(&b.severity).then(a.namespace.cmp(&b.namespace)).then(a.name.cmp(&b.name)));
+    out
 }
 
 /// What a detail page shows alerts for.
@@ -591,6 +580,7 @@ pub fn about(alerts: &[Alert], focus: &Focus) -> Vec<Alert> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::problems::Scan;
     use proptest::prelude::*;
 
     fn alert(labels: &[(&str, &str)]) -> Alert {
@@ -714,8 +704,7 @@ mod tests {
     fn unknown_silences_are_named_and_retried_soon() {
         let list = vec![alert(&[("alertname", "A"), ("namespace", "shop"), ("severity", "warning")])];
         let alerts = Alerts { list, error: None, silences_error: Some("timed out".into()) };
-        let mut scan = Scan::default();
-        add(&mut scan, &alerts, &[]);
+        let scan = Scan { problems: problems(&alerts.list, &[]), skipped: skipped(&alerts) };
         // Still counted (as before), but the page says the silences are unknown.
         assert_eq!(scan.problems.len(), 1);
         assert_eq!(scan.skipped_text().unwrap(), "Alertmanager silences (failed: timed out)");

@@ -17,6 +17,8 @@ pub(crate) mod argo;
 mod cadence;
 mod config;
 mod discovery;
+pub(crate) mod edit;
+mod events;
 mod exec;
 #[cfg(feature = "dev")]
 #[cfg(feature = "dev")]
@@ -49,6 +51,7 @@ pub(crate) use access::*;
 pub(crate) use cadence::{Cadence, Freshness, Reading};
 pub(crate) use config::*;
 pub(crate) use discovery::*;
+pub(crate) use events::*;
 pub(crate) use exec::*;
 pub(crate) use follow::{Follow, Followed, Keep, follow};
 pub(crate) use forward::*;

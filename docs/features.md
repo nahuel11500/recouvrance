@@ -116,8 +116,12 @@
   ControllerRevisions, Endpoints, EndpointSlices and Leases are never recorded: they change all the
   time and their history is told elsewhere (a pod's by its owner's revisions and its events). The
   **Timeline** page (sidebar, or `Timeline` in the palette) lists the connected clusters' changes
-  newest first with their events interleaved (Warnings only by default, all, or none; every one
-  the cluster still keeps, an hour's worth by default; the events of one object with the same
+  newest first with their events interleaved (Warnings only by default, all, or none; those the
+  cluster still keeps, an hour's worth by default, read once and then kept current by a watch, so
+  a refresh brings only what changed (read again at each overview refresh where they may be
+  listed but not watched); the newest 20,000 of a cluster are held, shared by its
+  namespaces when they are read one by one, and the page says how many it shows of how many and
+  how far back they go when the cluster keeps more; the events of one object with the same
   reason make one row, with their count); shows the namespaces
   picked in the namespace picker only (cluster-scoped objects such as Nodes too when none is
   picked), and filters by cluster, and `ns:`, `kind:`, `ctx:` and text in its filter box; a row picked shows its diff,
@@ -193,7 +197,7 @@
 - **RBAC-aware**: actions your Kubernetes RBAC forbids are disabled; *My access* shows a can-i
   matrix for the namespace, and says when the cluster (webhook or cloud IAM authorizer) may allow
   more than it lists.
-- **Problems**: one list of what is broken across clusters (crash loops, pending pods, unavailable workloads, NotReady nodes, nodes such a taint keeps pods off for more than 5 minutes after they started, failed jobs, pending volumes, and alerts firing in the cluster's Prometheus that nobody silenced). Click a count (critical, warnings, minor) to show that severity alone; the filter box takes text and `ns:`, `kind:` (`kind:alert`, `kind:service`) and `ctx:` terms, as the Timeline's. The sidebar counts them in the background, again every 2 minutes (eight times as long as a count takes, when that is longer): the first count waits for the list on screen, and counting pauses while the window is hidden. A count reads at most 8 of the 32 namespaces read at once, so the page on screen always has the others; on a big cluster it then takes up to four times as long as the Problems page's scan, and comes that much less often. Its tooltip says how old the count is, and how often it comes.
+- **Problems**: one list of what is broken across clusters (crash loops, pending pods, unavailable workloads, NotReady nodes, nodes such a taint keeps pods off for more than 5 minutes after they started, failed jobs, CronJobs that stopped running (the second run their schedule and time zone call for since the last one hasn't started, `startingDeadlineSeconds` added) or whose last 3 runs or more didn't succeed (suspended ones are left out), pending volumes, and alerts firing in the cluster's Prometheus that nobody silenced). Click a count (critical, warnings, minor) to show that severity alone; the filter box takes text and `ns:`, `kind:` (`kind:alert`, `kind:service`) and `ctx:` terms, as the Timeline's. One scan per cluster serves the page, the sidebar count of every window and the agents' `find_problems`: a cluster is scanned again every 2 minutes (eight times as long as a scan takes, when that is longer), a hidden window starts no scan, though an agent's `find_problems` still scans when the latest findings are too old. The page opens on the latest findings at once and says how old they are; during a scan each check's new findings show as soon as it finishes, and Refresh asks for a scan started after it (a scan already running is waited for, then another one runs). A Service with no ready endpoint is looked into once, then again when it changes, after 10 minutes, or (when it selects no pod because a workload is scaled to 0) once that workload is scaled up. The first count waits for the list on screen. A scan started by the sidebar reads at most 8 of the 32 namespaces read at once, so the page on screen always has the others; once the page, Refresh or an agent waits for it, it reads in the foreground. A page scoped to some namespaces shows them from the sidebar's scan of the cluster when there is one; Refresh there scans only those namespaces. Refresh and an agent's `max_age_seconds: 0` judge every Service again. The sidebar count's tooltip says how old it is, and how often it comes.
 - **Alerts where you look**: a namespace's page lists the alerts labeled with it, and a pod's, workload's, volume's or node's page the alerts about it (a pod's include its workload's, a workload's its pods'), with severity, summary, how long, runbook link, and silenced or inhibited ones muted when an Alertmanager is found.
 - **Upgrade check** (Cluster overview → *Upgrade check*): per cluster, what needs action before it
   moves to a newer minor version (the next one by default; the arrows pick another), most urgent first:
@@ -390,6 +394,54 @@
   changed; *Read again* reads them all anew; *Applications* (back) drops the reads running. An
   Application read on its hub is read from the Argo CD server set for that context (without one,
   it says so). Read-only.
+- **Argo CD grouped sync**: *Sync selected…* (next to *Diff selected*, or *Sync these…* on the
+  grouped diff) opens the sync of the Applications picked that the filter keeps (those it hides
+  are counted, never synced; 300 at most). Each is read first, 4 at a time, the way it was read
+  (on its hub, or by Argo CD's API): one already syncing, being deleted, or whose sync windows
+  deny a manual sync now (*can sync in 2h*) is left out, saying why; auto-sync on is said, not a
+  reason. On a hub, an Application whose sync windows aren't known (its project can't be read)
+  is warned about: if a window denies a sync now, Argo CD's controller holds the sync until it
+  opens (by the API, argocd-server refuses it and says so). Windows are worked out again as of
+  the moment *Sync…* is clicked. Options: *With hooks* (Argo CD's hook strategy, its own Sync:
+  PreSync, Sync and PostSync hooks run) or *Without hooks* (the apply strategy: only the
+  manifests are applied, a secret refresh or a migration hook is skipped; for a simple change);
+  *Prune*, off by default, lists under each Application every resource it deletes (its managed
+  resources that require pruning), and a sync is refused if Argo CD's last comparison then
+  shows more to prune; *Dry run* applies nothing. With auto-sync off and one source, the sync is
+  pinned to the revision Argo CD compared (`status.sync.revision`, shown on the row), so git
+  moving on can't bring other changes; otherwise it goes to the target revision. As argocd-server
+  does, the Application's sync options and retry policy go with the operation, and prune and dry
+  run are always said (false too, so Argo CD's manual sync defaults don't fill them). *Read
+  what a sync of each would change* shows the grouped diff, whose summary then shows above.
+  *Sync…* asks for the count of Applications typed (or the wait set in Settings → General),
+  names them, and lists everything prune deletes; the syncs are then sent 4 at a time, write mode
+  checked as each is sent (on a hub through its window client and the write gate; by the API,
+  checked by the request). Each Application is read every 2 s (every 10 s while the page is
+  hidden or more than 50 run) until its operation ends, at most 30 min: its phase (*Waiting*
+  until Argo CD starts the operation after the one read right before the write, so an auto-sync
+  in between is not taken for it), message and resources done (`3 of 5 done`, a bar),
+  *Terminate* while it waits or runs (confirmed like a protected context), then *Done: 10
+  succeeded, 2 failed*, each failure with Argo CD's message. Leaving the page while it runs only hides it:
+  the selection bar shows *Sync of 12 Applications: 3 running* to show it again. Agents sync
+  several Applications by calling `gitops` `sync` once for each (each decided by their rules and
+  approved like a single sync; `hooks: false` syncs without hooks).
+- **Argo CD sync journal**: every operation the app sees (in an Argo CD API server's stream, a
+  hub's list, a dashboard, a grouped sync) is kept on this machine: the Application,
+  its Argo CD, revision(s), phase, message, who started it, when it started and ended, dry run
+  and strategy, and each resource's result (kind, namespace, name, status, message, hook phase
+  and type). These are stored as Argo CD says them, for 30 days: operation and step messages
+  (which may quote what a resource or hook printed) and the usernames of who started each.
+  One JSON line per state of an operation, a state seen again not written again (a cheap
+  check of its phase, end, message and each step's status comes first), at most 256 KB (past
+  that, step messages are left out, then the last steps), in `argocd-sync-journal.jsonl` in
+  the data directory (`~/.local/share/recouvrance`, mode 0600); past 25 MB it moves to `.1`, so
+  50 MB at most, and what is older than 30 days is left out. Each resource's result is asked
+  of the stream only, never of the list of every Application.
+  *Sync journal* (the selection bar, the sync page, *journal* on a dashboard's Last sync and
+  History cards for that Application) lists them newest first, filtered by Application, phase,
+  who and since when; a click shows an operation's message and steps, even after Argo CD's
+  history dropped it. A line that doesn't read is skipped and counted (*2 lines of the journal
+  could not be read and were skipped*), never breaking the rest.
 - **Argo CD sync, terminate and roll back**: *Sync* (the Application's page, its row menu, the
   Argo CD panel) reads the Application first and lists its resources out of sync, all ticked:
   untick some to sync only the others (hooks run only when all are synced; past 200 the whole
@@ -504,8 +556,11 @@
   favorites, kept in `favorites.json`.
 - **Saved views** (type + namespaces + filter, bookmark button), back/forward history, light and dark themes
   whose status colors, badges and status buttons read at WCAG AA contrast (4.5:1) on what they are drawn on.
-- **Instant back**: the last 8 lists (up to 10,000 rows in all) are kept, so going back to one
-  shows it at once, marked "Updating…", while a fresh list loads and replaces it in one go.
+- **Instant back**: the last 4 lists left in a window (up to 60,000 rows in all, for 5 minutes) keep their
+  watches, paused like a hidden page's, so going back to one (by kind, tab or namespace) shows its
+  rows at once, current within half a second, without listing it again. *Refresh* lists it again.
+  Other lists seen recently (the last 8, up to 10,000 rows in all) show at once, marked
+  "Updating…", while a fresh list loads and replaces it in one go.
 - **Bulk actions**: check rows, then read their logs together, restart, scale, delete or copy names. Scaling needs the number
   of objects typed (the replica count is never suggested), deleting asks as set for the kind (see
   below), and each protected context among them needs its name typed (or a wait); rows from several contexts
@@ -530,9 +585,13 @@
   debug pods with an ephemeral container (falls back to a Pod Security "restricted" profile), run a CronJob now, suspend/resume (CronJobs, Flux, Argo CronWorkflows), drain nodes, force delete
   or remove finalizers (only once the delete leaves it stuck terminating: it already was, or still is
   after 10 seconds), Flux *Reconcile*, Argo CD
-  *Refresh*/*Hard refresh*/*Sync*/*Terminate*/*Roll back*, create/apply YAML (a server dry run first, then a confirmation listing each
-  object's kind, namespace and name). YAML edits on a detail page save only that object: a changed
-  kind, API group, namespace or name is refused, and so are masked Secret values. Every
+  *Refresh*/*Hard refresh*/*Sync*/*Terminate*/*Roll back*, create/apply YAML (a server dry run first, then a confirmation
+  showing what each object changes against the cluster: created, changed with its diff, or no change). YAML edits on a detail
+  page save only that object: a changed kind, API group, namespace or name is refused, and so are masked Secret values. The
+  confirmation shows the diff of the dry run, and the save is sent as of the version the edit started from: when the object
+  changes on the cluster meanwhile (an HPA, a controller, Argo CD), a warning over the editor says who changed it, and
+  offers *Compare*, *Keep my edits on the latest* (your changes made on the object as it is now) and *Reload*, instead of
+  undoing that change. Secret values never show in these diffs. Every
   confirmation shows the equivalent `kubectl` command. A page whose object is deleted says so, and
   shows the one created again under its name, if one is.
 - **Run as** (Settings → Contexts → *Run as*): set a user (and groups) a
@@ -555,7 +614,14 @@
   user and cluster names and the server URL (`prod`, `prd`, `production`, `live`, `admin`, `root`),
   so new production contexts are protected too. Set both in Settings → Contexts.
 - **Diagnosis** on pods and workloads: why it is broken (crash output and exit code, scheduling,
-  image pulls, probes, volumes) and what to try.
+  image pulls, probes, volumes) and what to try. On a workload's page it also says where the
+  failure comes from, from its pods' revisions and nodes: the new revision (only its pods fail,
+  the previous one's are ready), one node (only pods there fail, the same revision is ready
+  elsewhere) or the app (old and new revisions fail, or every pod fails on several nodes). A pod
+  fails when it crashes, exits with an error, cannot pull or create a container, or is evicted; a
+  pod still starting, warming up behind its readiness probe or waiting for room on a node does not
+  count, so a rollout or scale-up in progress names no cause. It also shows the worst pod's crash
+  output (one log read, only when a container of that pod crashed).
 - **Rollback** of Deployments, StatefulSets and DaemonSets to any revision, with the diff and a
   server dry run first; **attach** to a container's process; **file copy** in and out of containers
   (both ways it runs commands in the container, so it needs write mode, like a shell);

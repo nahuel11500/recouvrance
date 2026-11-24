@@ -219,6 +219,11 @@ impl AppView {
                     page.update(cx, crate::ui::access_view::AccessView::ask_who);
                 }
             }
+            other if other.starts_with("timeline:") => {
+                if let Route::Timeline(page) = self.route().clone() {
+                    page.update(cx, |p, cx| p.demo_events(&other["timeline:".len()..], cx));
+                }
+            }
             other if other.starts_with("apply:") => {
                 let Route::Apply(page) = self.route().clone() else { return };
                 let arg = &other[6..];

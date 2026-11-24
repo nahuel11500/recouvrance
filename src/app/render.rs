@@ -353,7 +353,8 @@ impl AppView {
                     .small()
                     .icon(Lucide::RefreshCw)
                     .tooltip("Reload the list")
-                    .on_click(cx.listener(|this, _, _, cx| this.restart_watch(cx))),
+                    // Lists again, as F5 does: `restart_watch` would bring the kept list back.
+                    .on_click(cx.listener(|this, _, _, cx| this.reload_watch(cx))),
             )
             .child(
                 Button::new("export-csv")

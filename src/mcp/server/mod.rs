@@ -987,6 +987,10 @@ pub struct ProblemsParams {
     pub namespace: Option<String>,
     #[schemars(description = "Include minor findings (restarts, cordoned nodes). Default false")]
     pub include_minor: Option<bool>,
+    #[schemars(
+        description = "Oldest findings to accept, in seconds: 0 scans now (after a fix, to check it). By default the app's latest scan while it is recent (2 minutes or more on a big cluster)"
+    )]
+    pub max_age_seconds: Option<u64>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -1030,6 +1034,10 @@ pub struct GitOpsParams {
         description = "rollback only: the id of the deployment in status.history to go back to; omit for the one before the newest. Argo CD refuses a rollback while auto-sync is on"
     )]
     pub deployment_id: Option<i64>,
+    #[schemars(
+        description = "sync only: false syncs without hooks (Argo CD's apply strategy: PreSync, Sync and PostSync hooks such as a migration or a secret refresh are skipped); omit or true to run them, as Argo CD's Sync does"
+    )]
+    pub hooks: Option<bool>,
 }
 
 /// A resource of an Argo CD Application, as its `status.resources` names it.

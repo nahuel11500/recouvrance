@@ -31,6 +31,7 @@ pub(crate) mod commands;
 mod contexts;
 #[cfg(feature = "dev")]
 mod demo;
+mod kept_lists;
 mod kind_filters;
 mod live_list;
 mod menus;
@@ -485,6 +486,16 @@ pub struct AppView {
     /// What the list on screen is (clusters, kind, namespace, custom columns), to keep it
     /// in `views` when another list replaces it.
     view_key: Option<String>,
+    /// Lists left recently with their watches still going, by view key (see `kept_lists`).
+    kept: kept_lists::KeptLists<watch::KeptList>,
+    /// Drops the kept lists left too long ago, while `kept_sweeping`.
+    kept_sweep: Option<Task<()>>,
+    kept_sweeping: bool,
+    /// The list whose watches may touch the table: the one on screen. A kept list's tasks
+    /// carry the id they started with, and wait while it isn't this one.
+    watch_id: u64,
+    /// The last id given to a list.
+    watch_seq: u64,
     kinds: Vec<Kind>,
     kind: Option<Kind>,
     namespace: Option<String>,
@@ -494,7 +505,7 @@ pub struct AppView {
     table: Entity<TableState<ResourceTable>>,
     /// Contexts that failed to connect, until the next connect.
     connect_errors: Option<SharedString>,
-    watch: Option<Vec<(TaskGuard, Task<()>)>>,
+    watch: Option<watch::ListWatch>,
     metrics: Option<Vec<(TaskGuard, Task<()>)>>,
     /// The timeline's own watches (`timeline.kinds`), while connected.
     recording: Vec<TaskGuard>,
@@ -751,6 +762,11 @@ impl AppView {
             list_pause: k8s::Pause::default(),
             window_hidden: false,
             view_key: None,
+            kept: Default::default(),
+            kept_sweep: None,
+            kept_sweeping: false,
+            watch_id: 0,
+            watch_seq: 0,
             kinds: Vec::new(),
             kind: None,
             namespace: None,
