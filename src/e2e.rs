@@ -2643,7 +2643,7 @@ fn an_eviction_a_budget_forbids_is_refused() {
     });
 }
 
-/// An ExternalSecret's refresh sets the annotation the operator watches, through write mode in
+/// An `ExternalSecret`'s refresh sets the annotation the operator watches, through write mode in
 /// the window and under the `refresh` verb for an agent; a dry run sets nothing. A stand-in CRD
 /// of the operator's group is enough: what the operator then does is its own.
 #[test]
