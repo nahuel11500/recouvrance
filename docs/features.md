@@ -25,11 +25,13 @@
   unescaped `/`, `?` or `#` (#1000).
 - **Short context names**: a context named after its cloud cluster shows the cluster's name
   (`arn:aws:eks:<region>:<account>:cluster/<name>` and `gke_<project>_<zone>_<name>` show
-  `<name>`) in the top bar, the sidebar, the context picker, the Contexts page and the Context
-  column. When two would read the same, the region is added, then the account or project; a
-  short name never reads as another context's name. The full name shows on hover, and the
-  picker's search finds either. Settings, protection, agent rules, kubectl lines and the agents'
-  answers keep the full name.
+  `<name>`) in the top bar, the sidebar, the context picker, the Contexts page, the connecting
+  and can't-connect lines, the Problems page and the Context column. When two would read the
+  same, the region is added, then the account or project; a short name never reads as another
+  context's name. The full name shows on hover. The picker's search finds either; the Problems
+  filter matches the full name, which holds the short one. The Context column sorts by the
+  short name, and its `context:` filter term compares the full name. Settings, protection, agent
+  rules, kubectl lines, copied text and the agents' answers keep the full name.
 - **Reopens where you left off**: each set of contexts keeps its tabs (the list or overview each
   shows, its resource type, namespaces and filter) and each type's filter, and the window keeps
   its place, size and whether it was maximized. On launch the first window reopens there once its

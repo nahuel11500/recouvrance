@@ -377,7 +377,7 @@ impl TableDelegate for ResourceTable {
         if col == Col::Context {
             let dot: Hsla =
                 crate::settings::context_color(&cell).map_or(theme.muted_foreground.opacity(0.4), |c| rgb(c).into());
-            // The short name on screen, the full one on hover; sorting and filters keep the full one.
+            // The short name on screen (and to sort by), the full one on hover and in `context:` filters.
             let short = k8s::short_names::short_name(&cell);
             let full = (short != *cell).then(|| SharedString::from(cell.into_owned()));
             let drawn = h_flex()
