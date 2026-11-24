@@ -2,6 +2,7 @@
 //! very large clusters), for the Problems page and the `find_problems` MCP tool.
 
 pub mod argo_apps;
+pub(crate) mod certificates;
 pub(crate) mod cronjobs;
 pub(crate) mod references;
 pub mod shared;
@@ -170,8 +171,9 @@ pub fn judge(kind: &Kind, defs: &[ColumnDef], row: &Row) -> Option<(Severity, St
 /// external-secrets.io ones are judged from their objects (`external_secrets::problems`), and
 /// CronJobs too, for when they last ran and succeeded (`cronjobs::problems`). Services,
 /// Ingresses and HTTP routes for what they point to that is missing, together
-/// (`references::traffic`).
-pub const CHECKED: [(&str, &str); 17] = [
+/// (`references::traffic`). cert-manager Certificates and TLS Secrets for certificates that
+/// fail to renew or end soon (`certificates`).
+pub const CHECKED: [(&str, &str); 19] = [
     ("", "Node"),
     ("", "Namespace"),
     ("apps", "Deployment"),
@@ -189,6 +191,8 @@ pub const CHECKED: [(&str, &str); 17] = [
     (crate::external_secrets::GROUP, "ClusterSecretStore"),
     (crate::external_secrets::GROUP, "SecretStore"),
     (crate::external_secrets::GROUP, "ExternalSecret"),
+    (crate::cert_manager::GROUP, "Certificate"),
+    ("", "Secret"),
 ];
 
 /// A scan that went as far as it could: the problems found, and the kinds it could
@@ -402,17 +406,19 @@ pub type Job = (String, futures::future::BoxFuture<'static, Scan>);
 
 /// The checks of a scan of a cluster (or one namespace), one a kind: a kind refused (403)
 /// does not hide the others. `context`: the app's own scans name it, for the timeline (see
-/// `scan_kind`). `judged_since`: no Service keeps a verdict judged before (see
-/// `references::traffic`).
+/// `scan_kind`). `cluster`: the context scanned, when reads may be kept between scans (see
+/// `certificates::tls_secrets`). `judged_since`: no Service keeps a verdict judged before (see
+/// `references::traffic`), and no read made before is reused.
 fn kind_jobs(
     client: &Client,
     kinds: &[Kind],
     namespace: Option<&str>,
-    context: Option<&str>,
+    (context, cluster): (Option<&str>, Option<&str>),
     judged_since: Option<Instant>,
 ) -> Vec<Job> {
     use futures::FutureExt as _;
     let with_services = references::with_services(kinds);
+    let certificate = kinds.iter().find(|k| k.is(crate::cert_manager::GROUP, "Certificate")).cloned();
     CHECKED
         .iter()
         // Checked with the Services they point to.
@@ -423,6 +429,8 @@ fn kind_jobs(
             // Owned: a future borrowing `kinds` here would not be `Send` for the agents' server.
             let (ingress, route) = with_services.clone();
             let context = context.map(String::from);
+            let cluster = cluster.map(String::from);
+            let certificate = certificate.clone();
             let name = match &ns {
                 Some(ns) => format!("{label} in {ns}"),
                 None => label.clone(),
@@ -434,6 +442,14 @@ fn kind_jobs(
                         .map(|problems| Scan { problems, skipped: Vec::new() })
                 } else if kind.is("batch", "CronJob") {
                     cronjobs::problems(client, &kind, ns).await.map(|problems| Scan { problems, skipped: Vec::new() })
+                } else if kind.is(crate::cert_manager::GROUP, "Certificate") {
+                    certificates::certificates(client, &kind, ns)
+                        .await
+                        .map(|problems| Scan { problems, skipped: Vec::new() })
+                } else if kind.is("", "Secret") {
+                    certificates::tls_secrets(client, &kind, certificate.as_ref(), ns, cluster.as_deref(), judged_since)
+                        .await
+                        .map(|problems| Scan { problems, skipped: Vec::new() })
                 } else if kind.is("", "Service") {
                     Ok(references::traffic(client, &kind, ingress.as_ref(), route.as_ref(), ns, judged_since).await)
                 } else {
@@ -449,23 +465,24 @@ fn kind_jobs(
 /// The checks of a scan of the namespaces a user may read, for a cluster that may not list
 /// cluster-wide; the whole cluster when `namespaces` is empty. Cluster-scoped kinds (Nodes)
 /// are read once, namespaced ones in each namespace, and a Namespace in itself. Each check
-/// runs on its own, so that what it finds can be shown as soon as it finishes.
+/// runs on its own, so that what it finds can be shown as soon as it finishes. `names`:
+/// (`context`, `cluster`), as `kind_jobs` takes them.
 pub fn jobs(
     client: &Client,
     kinds: &[Kind],
     namespaces: &[String],
-    context: Option<&str>,
+    names: (Option<&str>, Option<&str>),
     judged_since: Option<Instant>,
 ) -> Vec<Job> {
     use futures::FutureExt as _;
     if namespaces.is_empty() {
-        return kind_jobs(client, kinds, None, context, judged_since);
+        return kind_jobs(client, kinds, None, names, judged_since);
     }
-    let (cluster, namespaced): (Vec<Kind>, Vec<Kind>) =
+    let (cluster_wide, namespaced): (Vec<Kind>, Vec<Kind>) =
         kinds.iter().cloned().partition(|k| !k.namespaced && !k.is("", "Namespace"));
-    let mut out = kind_jobs(client, &cluster, None, context, judged_since);
+    let mut out = kind_jobs(client, &cluster_wide, None, names, judged_since);
     for ns in namespaces {
-        out.extend(kind_jobs(client, &namespaced, Some(ns), context, judged_since).into_iter().map(|(name, job)| {
+        out.extend(kind_jobs(client, &namespaced, Some(ns), names, judged_since).into_iter().map(|(name, job)| {
             let ns = ns.clone();
             let job = job.map(move |mut scan| {
                 for (kind, _) in &mut scan.skipped {
@@ -501,7 +518,7 @@ async fn run_all(jobs: Vec<Job>) -> Scan {
 /// finishes.
 #[cfg(feature = "dev")]
 pub async fn scan_with_argo(client: Client, kinds: &[Kind], context: &str) -> Scan {
-    let mut jobs = kind_jobs(&client, kinds, None, None, None);
+    let mut jobs = kind_jobs(&client, kinds, None, (None, None), None);
     jobs.push(argo_apps::job(context, &client, kinds, &[]));
     run_all(jobs).await
 }
@@ -510,7 +527,7 @@ pub async fn scan_with_argo(client: Client, kinds: &[Kind], context: &str) -> Sc
 /// Applications read on hubs: the end-to-end tests.
 #[cfg(feature = "dev")]
 pub async fn scan_partial(client: Client, kinds: &[Kind], namespace: Option<String>, context: Option<&str>) -> Scan {
-    run_all(kind_jobs(&client, kinds, namespace.as_deref(), context, None)).await
+    run_all(kind_jobs(&client, kinds, namespace.as_deref(), (context, None), None)).await
 }
 
 #[cfg(test)]
@@ -673,7 +690,7 @@ mod tests {
         let mut node = kind("", "Node");
         node.namespaced = false;
         let kinds = [node, kind("", "Pod")];
-        let scan = run_all(jobs(&client, &kinds, &["a".into(), "b".into()], None, None)).await;
+        let scan = run_all(jobs(&client, &kinds, &["a".into(), "b".into()], (None, None), None)).await;
         let found: Vec<(&str, Option<&str>)> =
             scan.problems.iter().map(|p| (p.name.as_str(), p.namespace.as_deref())).collect();
         assert_eq!(found, [("n1", None), ("p1", Some("a"))]);
@@ -869,7 +886,7 @@ mod tests {
         app.ar.api_version = "argoproj.io/v1alpha1".into();
         let mut ns = kind("", "Namespace");
         ns.namespaced = false;
-        let scan = run_all(jobs(&client, &[ns, app], &["argocd".into()], None, None)).await;
+        let scan = run_all(jobs(&client, &[ns, app], &["argocd".into()], (None, None), None)).await;
         assert!(scan.skipped.is_empty(), "{:?}", scan.skipped_text());
         let found: Vec<(&str, &str)> = scan.problems.iter().map(|p| (p.name.as_str(), p.reason.as_str())).collect();
         assert_eq!(

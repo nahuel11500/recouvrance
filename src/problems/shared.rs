@@ -365,7 +365,8 @@ async fn run(scope: Scope, ask: Ask, judged_since: Option<Instant>, mut finish: 
     let Ask { client, kinds, record } = ask;
     let context = record.then_some(scope.context.as_str());
     let pvcs = kinds.iter().any(|k| k.is("", "PersistentVolumeClaim"));
-    let mut jobs = super::jobs(&client, &kinds, &scope.namespaces, context, judged_since);
+    let mut jobs =
+        super::jobs(&client, &kinds, &scope.namespaces, (context, Some(scope.context.as_str())), judged_since);
     // Argo CD Applications deploying here, read on their hubs (no request when none is known).
     jobs.push(super::argo_apps::job(&scope.context, &client, &kinds, &scope.namespaces));
     finish.checks = Some(jobs.iter().map(|(name, _)| Arc::from(name.as_str())).collect());
