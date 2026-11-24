@@ -512,7 +512,8 @@ impl AppView {
             Ok(c) => (c.names, dev_var("RECOUVRANCE_CONTEXT").or(c.current), None),
             Err(e) => (Vec::new(), None, Some(format!("{e:#}").into())),
         };
-        let favorites = cx.new(|_| Favorites::load());
+        // One store for every window: a window never saves over the stars of another.
+        let favorites = crate::favorites::shared(cx);
         let ns_picker = cx.new(|cx| NamespacePicker::new(favorites.clone(), window, cx));
         let ctx_picker = cx.new(|cx| ContextPicker::new(contexts.clone(), favorites.clone(), window, cx));
         let col_header = cx.new(|cx| InputState::new(window, cx).placeholder("Header, e.g. Image"));

@@ -198,16 +198,13 @@ fn key(a: &FleetApp) -> Key {
 /// Whether `a` is a favorite: by the names its Argo CD instance is known by (here its hub
 /// context; see `crate::favorites::FavApp`), its namespace and name.
 fn is_favorite(favorites: &crate::favorites::Favorites, a: &FleetApp) -> bool {
-    favorites.has_app(&[a.hub.context.as_str()], &a.app.namespace, &a.app.name)
+    favorites.has(&favorite(a))
 }
 
-/// The favorite to star or unstar for `a`.
+/// The favorite to star or unstar for `a`: by its instance and the hub it is read on.
 fn favorite(a: &FleetApp) -> crate::favorites::Favorite {
-    crate::favorites::Favorite::Application(crate::favorites::FavApp {
-        argocd: a.hub.context.clone(),
-        namespace: a.app.namespace.clone(),
-        name: a.app.name.clone(),
-    })
+    let kind = argo::application_kind();
+    crate::favorites::Favorite::for_object(&a.hub.context, &kind, Some(a.app.namespace.clone()), a.app.name.clone())
 }
 
 // MARK: Rows

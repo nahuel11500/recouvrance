@@ -235,7 +235,7 @@ impl AppView {
                                 Notification::warning(format!(
                                     "{} not opened: {} did not connect",
                                     favorite.title(),
-                                    favorite.context()
+                                    favorite.context().unwrap_or("its context")
                                 )),
                                 cx,
                             );

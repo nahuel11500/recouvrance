@@ -1,5 +1,10 @@
-//! Favorites from the window's side: opening one where it points (connecting its context
-//! first when it isn't), saying when its target is gone, and starring what is shown.
+//! Favorites from the window's side: opening one where it points, saying when its target is
+//! gone, and starring what is shown.
+//!
+//! Opening never replaces the contexts connected: a context favorite connects that context
+//! (as picking it does); an object or Application on a context that isn't connected opens its
+//! page with a client of its own, as the Argo CD page opens Applications; a namespace of a
+//! context that isn't connected adds that context to those connected, then picks it.
 
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::notification::Notification;
@@ -14,12 +19,14 @@ use crate::k8s::{self, ObjectRef};
 pub(super) enum Standing {
     /// Its context is connected (and a namespace is there).
     Here,
-    /// Its context isn't connected: opening it connects it first (an Application opens on
-    /// Argo CD's cluster without connecting it).
+    /// Its context isn't connected: an object or Application opens on it without connecting
+    /// it, a namespace adds it to the contexts connected.
     Elsewhere,
+    /// An Application known only by its Argo CD API server: it opens on the Argo CD page.
+    ArgoApi,
     /// Its context is no longer in the kubeconfig.
     ContextGone,
-    /// A namespace its connected context doesn't have.
+    /// A namespace its connected contexts don't list (it may be one they can't list).
     NamespaceGone,
 }
 
@@ -29,16 +36,22 @@ impl Standing {
         match self {
             Self::Here => None,
             Self::Elsewhere => Some("not connected"),
+            Self::ArgoApi => Some("through Argo CD's API"),
             Self::ContextGone => Some("context gone from the kubeconfig"),
-            Self::NamespaceGone => Some("namespace not found"),
+            Self::NamespaceGone => Some("namespace not listed"),
         }
+    }
+
+    /// Whether its target is gone or may be: the sidebar dims it.
+    pub(super) fn gone(self) -> bool {
+        matches!(self, Self::ContextGone | Self::NamespaceGone)
     }
 }
 
 /// Where `favorite` stands, given the contexts of the kubeconfig (`all`), those connected and
-/// the namespaces they have (`namespaces`, listed or added by hand).
+/// the namespaces they list (`namespaces`, listed or added by hand).
 pub(super) fn standing(favorite: &Favorite, all: &[String], connected: &[String], namespaces: &[String]) -> Standing {
-    let context = favorite.context();
+    let Some(context) = favorite.context() else { return Standing::ArgoApi };
     if !all.iter().any(|c| c == context) {
         return Standing::ContextGone;
     }
@@ -51,21 +64,31 @@ pub(super) fn standing(favorite: &Favorite, all: &[String], connected: &[String]
     }
 }
 
+/// The contexts connected once `context` is added to `connected` (at the end, once).
+pub(super) fn with_context(connected: &[String], context: &str) -> Vec<String> {
+    let mut all = connected.to_vec();
+    if !all.iter().any(|c| c == context) {
+        all.push(context.to_string());
+    }
+    all
+}
+
 impl AppView {
     fn connected_names(&self) -> Vec<String> {
         self.clusters.iter().map(|(c, _)| c.clone()).collect()
     }
 
-    /// Where `favorite` stands now (see `standing`).
-    pub(super) fn favorite_standing(&self, favorite: &Favorite, cx: &App) -> Standing {
-        let known = self.ns_picker.read(cx).known().to_vec();
-        standing(favorite, &self.all_contexts, &self.connected_names(), &known)
+    /// Where each of `favorites` stands now (see `standing`), worked out with one read of the
+    /// namespaces known.
+    pub(super) fn favorite_standings(&self, favorites: &[Favorite], cx: &App) -> Vec<Standing> {
+        let connected = self.connected_names();
+        let known = self.ns_picker.read(cx).known();
+        favorites.iter().map(|f| standing(f, &self.all_contexts, &connected, known)).collect()
     }
 
-    /// Open a favorite where it points: a context connects alone, a namespace is picked, an
-    /// object or Application opens its page. On a context that isn't connected, `connect`
-    /// connects it first and opens it then (an Application opens on Argo CD's cluster without
-    /// replacing the contexts connected). A target that is gone is said, never silently skipped.
+    /// Open a favorite where it points (see the module's comment). A target that is gone is
+    /// said, never silently skipped. `connect` is false once a connect made for it is done:
+    /// it isn't connected again.
     pub(super) fn open_favorite(
         &mut self,
         favorite: Favorite,
@@ -73,19 +96,22 @@ impl AppView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let context = favorite.context().to_string();
         let title = favorite.title();
         let warn = |text: String, window: &mut Window, cx: &mut Context<Self>| {
             window.push_notification(Notification::warning(text), cx);
         };
-        match self.favorite_standing(&favorite, cx) {
-            Standing::ContextGone => {
-                return warn(format!("{title}: the context {context} is no longer in the kubeconfig"), window, cx);
-            }
-            Standing::NamespaceGone => {
-                return warn(format!("The namespace {title} is not on {context} any more"), window, cx);
-            }
-            Standing::Elsewhere | Standing::Here => {}
+        let standing = self.favorite_standings(std::slice::from_ref(&favorite), cx)[0];
+        let Some(context) = favorite.context().map(String::from) else {
+            // Read through Argo CD's API only: the Argo CD page lists it, its favorites first.
+            window.push_notification(
+                Notification::info(format!("{title} is read through Argo CD's API: it is on the Argo CD page")),
+                cx,
+            );
+            self.open_argo(window, cx);
+            return;
+        };
+        if standing == Standing::ContextGone {
+            return warn(format!("{title}: the context {context} is no longer in the kubeconfig"), window, cx);
         }
         let at = self.clusters.iter().position(|(c, _)| *c == context);
         match favorite {
@@ -95,49 +121,90 @@ impl AppView {
                     self.connect_many(vec![c], window, cx);
                 }
             }
-            Favorite::Application(app) => {
-                let obj = ObjectRef {
-                    kind: k8s::argo::application_kind(),
-                    name: app.name,
-                    namespace: Some(app.namespace),
-                    uid: String::new(),
-                };
-                if let Some(ix) = at {
-                    self.show_detail_in(ix, obj, window, cx);
-                    return;
+            Favorite::Namespace(n) if at.is_some() => {
+                // Not listed may still be there (no right to list namespaces): picked anyway.
+                if standing == Standing::NamespaceGone {
+                    warn(format!("The namespace {title} is not listed on {context}"), window, cx);
                 }
-                // Argo CD's cluster is often not one of those connected: its page opens with a
-                // client of its own, as from the Argo CD page.
-                window.push_notification(Notification::info(format!("Connecting to {context}…")), cx);
-                let on = context.clone();
-                let work = async move {
-                    k8s::connect(on.clone())
-                        .await
-                        .map_err(|e| format!("Could not connect to {on}: {}", k8s::short_error(&e)))
-                };
-                self.context_open.spawn_in(window, cx, work, move |this, client, window, cx| match client {
-                    Ok(client) => this.show_detail_on(context, client, obj, window, cx),
-                    Err(e) => window.push_notification(Notification::error(e), cx),
-                });
+                self.pick_namespace(n.namespace, cx);
             }
-            favorite if at.is_none() => {
+            favorite @ Favorite::Namespace(_) => {
                 if !connect {
                     return warn(format!("{title}: {context} is not connected"), window, cx);
                 }
-                self.picked = std::collections::BTreeSet::from([context.clone()]);
-                self.connect_many(vec![context], window, cx);
+                // Added to the contexts connected, not in their place.
+                let contexts = with_context(&self.connected_names(), &context);
+                self.picked = contexts.iter().cloned().collect();
+                self.connect_many(contexts, window, cx);
                 // Set after `connect_many`, which drops one left by an earlier connect.
                 self.after_connect = Some(favorite);
             }
-            Favorite::Namespace(n) => self.pick_namespace(n.namespace, cx),
-            Favorite::Object(o) => {
-                let Some(ix) = at else { return };
-                if k8s::find_kind(&self.kinds, &o.kind).is_none() {
-                    return warn(format!("{title}: {} is not served on {context}", o.kind), window, cx);
+            Favorite::Application(app) => match at {
+                Some(ix) => {
+                    let obj = ObjectRef {
+                        kind: k8s::argo::application_kind(),
+                        name: app.name,
+                        namespace: Some(app.namespace),
+                        uid: String::new(),
+                    };
+                    self.show_detail_in(ix, obj, window, cx);
                 }
-                self.open_object_in(ix, &o.kind, o.name, o.namespace, window, cx);
-            }
+                None => {
+                    let kind = Ok(k8s::argo::application_kind());
+                    self.open_elsewhere(context, kind, app.name, Some(app.namespace), window, cx);
+                }
+            },
+            Favorite::Object(o) => match at {
+                Some(ix) => {
+                    if k8s::find_kind(&self.kinds, &o.kind).is_none() {
+                        return warn(format!("{title}: {} is not served on {context}", o.kind), window, cx);
+                    }
+                    self.open_object_in(ix, &o.kind, o.name, o.namespace, window, cx);
+                }
+                // Its kind as that context serves it: looked up there once connected.
+                None => self.open_elsewhere(context, Err(o.kind), o.name, o.namespace, window, cx),
+            },
         }
+    }
+
+    /// Open an object on `context`, which isn't connected, with a client of its own: the
+    /// contexts connected stay as they are. Its kind is `Ok` when known, else (`Err`, a kubectl
+    /// name) looked up there first. Its page opens only while the page the click was on is
+    /// still shown.
+    fn open_elsewhere(
+        &mut self,
+        context: String,
+        kind: Result<k8s::Kind, String>,
+        name: String,
+        namespace: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        window.push_notification(Notification::info(format!("Connecting to {context}…")), cx);
+        let asker = self.route().page();
+        let on = context.clone();
+        let work = async move {
+            let client = k8s::connect(on.clone())
+                .await
+                .map_err(|e| format!("Could not connect to {on}: {}", k8s::short_error(&e)))?;
+            let kind = match kind {
+                Ok(kind) => kind,
+                Err(wanted) => {
+                    let kinds = k8s::discover(client.clone())
+                        .await
+                        .map_err(|e| format!("Could not list the kinds of {on}: {}", k8s::short_error(&e)))?;
+                    k8s::find_kind(&kinds, &wanted).cloned().ok_or_else(|| format!("{wanted} is not served on {on}"))?
+                }
+            };
+            let namespace = if kind.namespaced { namespace } else { None };
+            Ok::<_, String>((client, ObjectRef { kind, name, namespace, uid: String::new() }))
+        };
+        // A later click replaces this one, and a page the user went to meanwhile stays.
+        self.context_open.spawn_in(window, cx, work, move |this, opened, window, cx| match opened {
+            Ok((client, obj)) if this.route().page() == asker => this.show_detail_on(context, client, obj, window, cx),
+            Ok(_) => {}
+            Err(e) => window.push_notification(Notification::error(e), cx),
+        });
     }
 
     /// Show only namespace `ns`, as a click in the picker does.
@@ -150,13 +217,14 @@ impl AppView {
         self.set_selected_namespaces(vec![ns], cx);
     }
 
-    /// Star or unstar what is shown: the object or Application of a detail page, the selected
-    /// row of a list, else the one namespace picked (on every context connected).
+    /// Star or unstar what is shown: the object or Application of a detail page; on a list,
+    /// its selected row, else the one namespace picked (on every context connected). Other
+    /// pages have nothing to star this way (an Application has its star on the Argo CD page).
     pub(super) fn toggle_shown_favorite(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let shown = match self.route() {
-            Route::Detail(panel) => Some(panel.read(cx).favorite()),
-            Route::Resources(_) => self.selected_row_favorite(cx),
-            _ => None,
+        let (shown, on_list) = match self.route() {
+            Route::Detail(panel) => (Some(panel.read(cx).favorite()), false),
+            Route::Resources(_) => (self.selected_row_favorite(cx), true),
+            _ => (None, false),
         };
         if let Some(favorite) = shown {
             let on = !self.favorites.read(cx).has(&favorite);
@@ -166,8 +234,12 @@ impl AppView {
             window.push_notification(Notification::info(text), cx);
             return;
         }
-        let Some(ns) = self.namespace.clone() else {
-            let text = "Nothing to star here: open an object, select a row or pick one namespace";
+        let Some(ns) = self.namespace.clone().filter(|_| on_list) else {
+            let text = if on_list {
+                "Nothing to star here: select a row or pick one namespace"
+            } else {
+                "Nothing to star here: open an object, or star a row with its star"
+            };
             window.push_notification(Notification::info(text), cx);
             return;
         };
@@ -195,15 +267,16 @@ impl AppView {
 
 #[cfg(test)]
 mod tests {
-    use super::{Standing, standing};
+    use super::{Standing, standing, with_context};
     use crate::favorites::{FavApp, FavNamespace, FavObject, Favorite};
 
     fn names(v: &[&str]) -> Vec<String> {
         v.iter().map(ToString::to_string).collect()
     }
 
-    /// A favorite on a context that isn't connected is opened by connecting it; one whose
-    /// context left the kubeconfig, or whose namespace isn't there, says so.
+    /// A favorite on a context that isn't connected opens without replacing those connected;
+    /// one whose context left the kubeconfig, or whose namespace isn't listed, says so; an
+    /// Application known only by its API server is never taken for a kubeconfig context.
     #[test]
     fn a_favorite_says_where_it_stands() {
         let all = names(&["prod", "staging", "hub"]);
@@ -219,11 +292,18 @@ mod tests {
         assert_eq!(at(&Favorite::Context("staging".into())), Standing::Elsewhere);
         assert_eq!(at(&Favorite::Context("prod".into())), Standing::Here);
         assert_eq!(at(&Favorite::Context("old".into())), Standing::ContextGone);
-        let app = |hub: &str| {
-            Favorite::Application(FavApp { argocd: hub.into(), namespace: "argocd".into(), name: "shop".into() })
+        let app = |argocd: &str, hub: Option<&str>| {
+            Favorite::Application(FavApp {
+                argocd: argocd.into(),
+                namespace: "argocd".into(),
+                name: "shop".into(),
+                context: hub.map(Into::into),
+            })
         };
-        assert_eq!(at(&app("hub")), Standing::Elsewhere);
-        assert_eq!(at(&app("old-hub")), Standing::ContextGone);
+        assert_eq!(at(&app("context:hub", None)), Standing::Elsewhere);
+        assert_eq!(at(&app("https://argocd.example.com", Some("hub"))), Standing::Elsewhere);
+        assert_eq!(at(&app("context:old-hub", None)), Standing::ContextGone);
+        assert_eq!(at(&app("https://argocd.example.com", None)), Standing::ArgoApi);
         let obj = |c: &str| {
             Favorite::Object(FavObject {
                 context: c.into(),
@@ -235,7 +315,8 @@ mod tests {
         assert_eq!(at(&obj("prod")), Standing::Here);
         assert_eq!(at(&obj("staging")), Standing::Elsewhere);
         assert!(Standing::Here.note().is_none());
-        assert!(Standing::ContextGone.note().is_some());
+        assert!(Standing::ContextGone.note().is_some() && Standing::ContextGone.gone());
+        assert!(!Standing::ArgoApi.gone());
     }
 
     /// With nothing connected (the app just started), every favorite still in the kubeconfig
@@ -245,5 +326,13 @@ mod tests {
         let all = names(&["prod"]);
         let f = Favorite::Namespace(FavNamespace { context: "prod".into(), namespace: "web".into() });
         assert_eq!(standing(&f, &all, &[], &[]), Standing::Elsewhere);
+    }
+
+    /// A namespace of another context adds that context to those connected, once, after them.
+    #[test]
+    fn a_namespace_elsewhere_adds_its_context() {
+        assert_eq!(with_context(&names(&["prod", "dev"]), "staging"), names(&["prod", "dev", "staging"]));
+        assert_eq!(with_context(&names(&["prod", "dev"]), "dev"), names(&["prod", "dev"]));
+        assert_eq!(with_context(&[], "dev"), names(&["dev"]));
     }
 }

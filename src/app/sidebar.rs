@@ -10,7 +10,6 @@ use gpui_kit::component::{ActiveTheme as _, Disableable as _, Icon, IconName, Si
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use super::pinned::Standing;
 use super::{AppView, Route};
 use crate::favorites::{Favorite, Favorites, SavedView};
 use crate::k8s;
@@ -465,8 +464,8 @@ impl AppView {
                 .into_any_element(),
             );
         }
-        for (i, f) in favorites.into_iter().enumerate() {
-            let standing = self.favorite_standing(&f, cx);
+        let standings = self.favorite_standings(&favorites, cx);
+        for (i, (f, standing)) in favorites.into_iter().zip(standings).enumerate() {
             let detail = match standing.note() {
                 Some(note) => format!("{} · {note}", f.what()),
                 None => f.what(),
@@ -475,7 +474,7 @@ impl AppView {
             let remove = move |cx: &mut App| favs.update(cx, |favs, cx| favs.toggle(fav.clone(), cx));
             let row = two_line_row(("fav-obj", i), ("unfav", i), f.title(), detail, colors, remove);
             rows.push(
-                row.when(matches!(standing, Standing::ContextGone | Standing::NamespaceGone), |d| d.opacity(0.6))
+                row.when(standing.gone(), |d| d.opacity(0.6))
                     .on_click(cx.listener(move |this, _, window, cx| this.open_favorite(f.clone(), true, window, cx)))
                     .into_any_element(),
             );

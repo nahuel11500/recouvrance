@@ -178,7 +178,7 @@ pub(crate) const COMMANDS: &[Command] = &[
         .also("preferences options"),
     Command::new(
         "Add to or remove from favorites",
-        "the object or Application shown, the selected row, else the one namespace picked",
+        "the object or Application shown; on a list, the selected row, else the one namespace picked",
         Lucide::Star,
         run::<ToggleFavorite>,
     )

@@ -53,8 +53,10 @@ impl AppView {
         let names: std::rc::Rc<Vec<String>> = std::rc::Rc::new(self.clusters.iter().map(|(c, _)| c.clone()).collect());
         // Every favorite, on any context: picking one opens it where it points (see
         // `open_favorite`); `favorite` finds them all.
-        for f in self.favorites.read(cx).all() {
-            let detail = match self.favorite_standing(&f, cx).note() {
+        let favorites = self.favorites.read(cx).all();
+        let standings = self.favorite_standings(&favorites, cx);
+        for (f, standing) in favorites.into_iter().zip(standings) {
+            let detail = match standing.note() {
                 Some(note) => format!("★ {} · {note}", f.what()),
                 None => format!("★ {}", f.what()),
             };

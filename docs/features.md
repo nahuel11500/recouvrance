@@ -346,20 +346,27 @@
   Argo CD Applications (on each row of the Argo CD page and on an Application's page), objects
   (on a detail page, or *Add to favorites* in a row's menu) and resource types (in the sidebar).
   `*` (outside text fields), or *Add to or remove from favorites* in the palette, stars or unstars
-  what is shown: the object or Application of a detail page, else the selected row of a list,
-  else the one namespace picked. Favorites come first where they are picked: the context picker
-  lists favorite contexts first; the namespace picker lists first the favorite namespaces of the
-  contexts connected (of each of them when several are combined; the star then marks the
-  namespace on each); the Argo CD page sorts the trees holding a favorite first and its
-  *Favorites* toggle keeps only them. The sidebar's *Favorites* section lists them all, on any
-  context, and so does the palette (type `favorite` to list them): a click opens a context alone,
-  picks a namespace, or opens an object's or Application's page. One on a context that isn't
-  connected connects that context first (an Application opens on Argo CD's cluster without
-  replacing the contexts connected); one whose target is gone says so (a context no longer in the
-  kubeconfig, a namespace its context doesn't have, a type the cluster doesn't serve) and an object
-  deleted since shows its page's *deleted* state. An Application is the same favorite whichever
-  source shows it: it is keyed by its Argo CD instance, namespace and name (see
-  [configuration](configuration.md#favoritesjson)). Kept in `favorites.json`.
+  what is shown: the object or Application of a detail page; on a list, its selected row, else
+  the one namespace picked. Other pages have nothing to star this way (the Argo CD page has a
+  star on each row). Favorites come first where they are picked: the context picker lists
+  favorite contexts first; the namespace picker lists first the favorite namespaces of the
+  contexts connected; the Argo CD page sorts the trees holding a favorite first and its
+  *Favorites* toggle keeps only them. With several contexts combined, the namespace picker shows
+  one row a namespace: its star is lit when the namespace is a favorite on any of them, starring
+  marks it on each, and unstarring removes it from each (favorites of contexts not connected are
+  left as they are). The sidebar's *Favorites* section lists them all, on any context, and so
+  does the palette (type `favorite` to list them). A click never replaces the contexts
+  connected, unless it is a context's: a context connects alone, as picking it does; a namespace
+  is picked, its context added to those connected first when it isn't one of them; an object or
+  Application opens its page, on a context that isn't connected with a client of its own, as the
+  Argo CD page opens Applications (a page the user went to while it connects stays on screen); an
+  Application read only through Argo CD's API opens the Argo CD page. One whose target is gone
+  says so: a context no longer in the kubeconfig, a type the cluster doesn't serve, an object
+  deleted since (its page's *Deleted from the cluster*); a namespace its contexts don't list is
+  picked all the same, with a warning, as a user who may not list namespaces can still use one.
+  An Application is the same favorite whichever way it is read (see
+  [configuration](configuration.md#favoritesjson)). Every window shows and changes the same
+  favorites, kept in `favorites.json`.
 - **Saved views** (type + namespaces + filter, bookmark button), back/forward history, light and dark themes
   whose status colors, badges and status buttons read at WCAG AA contrast (4.5:1) on what they are drawn on.
 - **Instant back**: the last 8 lists (up to 10,000 rows in all) are kept, so going back to one
@@ -480,7 +487,7 @@ list them; the palette, that list and this table are all made from one list of c
 | g then h | g then h | Helm releases | Outside text fields |
 | g then i | g then i | Assistant: ask your clusters | Outside text fields |
 | g then s | g then s | Settings | Outside text fields |
-| * | * | Add to or remove from favorites: the object or Application shown, the selected row, else the one namespace picked | Outside text fields |
+| * | * | Add to or remove from favorites: the object or Application shown; on a list, the selected row, else the one namespace picked | Outside text fields |
 | Ctrl+J | ⌘J | Assistant beside the page: it is told what is on screen | Anywhere |
 | Ctrl+Shift+V | ⌘V | Paste in a shell | In a shell |
 | Double-click a context | Double-click a context | Connect to just that context | On the Contexts page |

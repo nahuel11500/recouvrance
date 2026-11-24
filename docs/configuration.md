@@ -221,13 +221,17 @@ sends (its own masking leaked predicted Secret states before 3.2.12, 3.3.10 and 
 
 ## favorites.json
 
-Every favorite and saved view, in one file the app writes when a star changes:
+Every favorite and saved view, in one file the app writes when a star changes. Every window
+shares the same favorites, so one never saves over another's:
 
 ```json
 {
   "contexts": ["prod"],
   "namespaces": [{"context": "prod", "namespace": "shop"}],
-  "applications": [{"argocd": "hub", "namespace": "argocd", "name": "shop-prod"}],
+  "applications": [
+    {"argocd": "context:hub", "namespace": "argocd", "name": "shop-prod", "context": "hub"},
+    {"argocd": "https://argocd.example.com", "namespace": "argocd", "name": "shop-dev"}
+  ],
   "objects": [{"context": "prod", "kind": "deployments.apps", "namespace": "shop", "name": "api"}],
   "kinds": ["pods", "certificates.cert-manager.io"],
   "views": [{"name": "Shop pods", "kind": "pods", "namespaces": ["shop"], "filter": "!Running"}]
@@ -243,19 +247,26 @@ Every favorite and saved view, in one file the app writes when a star changes:
 | `kinds` | kubectl name | Starred resource types in the sidebar |
 | `views` | name | Saved table views |
 
-An Application's `argocd` is the Argo CD instance it belongs to, named by the kubeconfig context
-Argo CD runs on (its hub, the context its page opens on). A source that reads Argo CD through its
-API names the instance by its server address when it doesn't know that context, and matches a
-favorite on either name when it knows both, so a star holds whichever source shows the
-Application. An Application starred from a table of Applications or its page is kept here, not
-under `objects`.
+An Application's `argocd` is its Argo CD instance, as the Argo CD page keys it: the Argo CD
+server's address (scheme and host in lowercase, without a default port) when Argo CD is read
+through its API or its hub context has its server set (Settings → Per cluster), else
+`context:<hub context>`. `context` is the hub context it was starred on, when read from one:
+`context:<context>` is another name of the same instance, and its page opens on that context.
+An Application is one favorite through any of these names: starred through one, it shows as
+starred and is unstarred through the other, every entry naming it removed. One known only by an
+API server (no `context`) opens the Argo CD page. An Application starred from its page or a table
+of Applications is kept here, not under `objects`; one an older version kept under `objects`
+moves here when the file is read.
 
 Loading keeps every entry that reads and drops the others, one by one: an entry of the wrong
-shape, with a field missing or empty, or a list that isn't one costs only itself; keys the app
-doesn't know are ignored; an entry listed twice is kept once (a view, by its first name). Only a
-file that isn't a JSON object is kept aside as `favorites.json.bad-<time>`, and the app starts
-with no favorites. A favorite whose context is gone from the kubeconfig stays in the file and the
-sidebar says so; remove it there with its cross.
+shape, with a field missing or empty, or a list that isn't one costs only itself; an entry listed
+twice is kept once (a view, by its first name). When an entry was dropped, the file as it was is
+copied to `favorites.json.bad-<time>` before the first save writes it without them. Keys the app
+doesn't know (a newer version's) are written back as they were. A file that isn't a JSON object
+is kept aside as `favorites.json.bad-<time>`, and the app starts with no favorites. A file that
+exists but can't be read (permissions, say) is left alone: the app starts with no favorites and
+saves none until it is restarted with a readable file. A favorite whose context is gone from the
+kubeconfig stays in the file and the sidebar says so; remove it there with its cross.
 
 ## rules.yaml
 
