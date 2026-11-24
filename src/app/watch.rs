@@ -162,19 +162,16 @@ impl AppView {
             self.views.get(&key).filter(|v| v.rows.len() == self.clusters.len()).cloned()
         };
         self.view_key = Some(key);
-        let (mut kept, kept_columns) = match kept {
-            Some(k) => {
-                // Its tasks answer to the id they started with.
-                self.watch_id = k.id;
-                self.list = k.list;
-                (Some((k.watch, k.pause)), Some(k.columns))
-            }
-            None => {
-                // Wait only for the clusters watched: the others never report.
-                self.list =
-                    LiveList::start(self.clusters.len(), (0..self.clusters.len()).filter(|&ix| watched[ix].is_some()));
-                (None, None)
-            }
+        let (mut kept, kept_columns) = if let Some(k) = kept {
+            // Its tasks answer to the id they started with.
+            self.watch_id = k.id;
+            self.list = k.list;
+            (Some((k.watch, k.pause)), Some(k.columns))
+        } else {
+            // Wait only for the clusters watched: the others never report.
+            self.list =
+                LiveList::start(self.clusters.len(), (0..self.clusters.len()).filter(|&ix| watched[ix].is_some()));
+            (None, None)
         };
         let loading = self.list.is_loading();
         let is_pod = kind.is("", "Pod");
