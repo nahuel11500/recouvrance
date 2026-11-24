@@ -1636,7 +1636,7 @@ impl SettingsView {
                                 .ghost()
                                 .icon(Lucide::ExternalLink)
                                 .label("Release notes")
-                                .on_click(move |_, _, _| crate::forwards::open_url(&page)),
+                                .on_click(move |_, window, cx| crate::forwards::open_url(&page, window, cx)),
                         )
                 }
                 UpdateCheck::Found(v) if updates::is_newer(VERSION, v) => {
@@ -1720,7 +1720,7 @@ impl SettingsView {
                             .ghost()
                             .icon(Lucide::ExternalLink)
                             .label("Releases")
-                            .on_click(|_, _, _| crate::forwards::open_url(updates::RELEASES)),
+                            .on_click(|_, window, cx| crate::forwards::open_url(updates::RELEASES, window, cx)),
                     ),
             )
             .children(found)

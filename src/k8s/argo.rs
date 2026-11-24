@@ -403,6 +403,9 @@ impl Summary {
             .into_iter()
             .flatten()
             .filter_map(Value::as_str)
+            // Set by annotations in the manifests: only web links are kept, never a file,
+            // share or another program's scheme for the desktop to launch.
+            .filter(|u| crate::forwards::is_web_link(u))
             .map(String::from)
             .collect();
         Self {
@@ -1828,7 +1831,7 @@ mod tests {
                     {"revisions": [sha, "2.0.0"], "deployedAt": "2025-02-01T00:00:00Z", "initiatedBy": {"username": "ana"}}
                 ],
                 "conditions": [{"type": "SyncError", "message": "boom"}],
-                "summary": {"externalURLs": ["https://web.example"]},
+                "summary": {"externalURLs": ["https://web.example", "\\\\host@SSL\\x\\evil.exe", "search-ms:query=x", "file:///etc/passwd"]},
                 "resources": [{"group": "apps", "kind": "Deployment", "namespace": "shop", "name": "web", "status": "Synced", "health": {"status": "Healthy"}}]
             }
         });
@@ -1840,6 +1843,7 @@ mod tests {
         assert_eq!(s.history[1].by.as_deref(), Some("auto-sync"));
         assert_eq!(s.operation.as_ref().map(|o| o.0.as_str()), Some("Failed"));
         assert_eq!(s.conditions, [("SyncError".to_string(), "boom".to_string())]);
+        // Only the web link: the share, the search and the file are never offered.
         assert_eq!(s.urls, ["https://web.example"]);
         assert!(s.deleting.is_some());
         assert_eq!(s.own, Some(("Synced".into(), "Healthy".into(), None)));

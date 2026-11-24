@@ -905,7 +905,9 @@ impl ArgoView {
                 let ev = OpenOnContext { context: hub.context.clone(), client: hub.client.clone(), obj };
                 cx.emit(ev);
             }
-            Source::Api(endpoint) => crate::forwards::open_url(&endpoint.web_url(&a.app.namespace, &a.app.name)),
+            Source::Api(endpoint) => {
+                crate::forwards::open_web_link(&endpoint.web_url(&a.app.namespace, &a.app.name), cx);
+            }
         }
     }
 
