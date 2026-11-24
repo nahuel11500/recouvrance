@@ -13,6 +13,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use crate::settings::{self, ConfirmStyle, DeleteConfirm, InitialView, Startup};
+use crate::ui::a11y::Control as _;
 
 /// A section of the page, picked on its left.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -707,6 +708,7 @@ impl SettingsView {
                             .small()
                             .ghost()
                             .icon(Lucide::X)
+                            .accessibility_label("Use the default for this kind")
                             .tooltip("Use the default for this kind")
                             .on_click(move |_, _, cx| {
                                 settings::update(|s| {
@@ -1292,6 +1294,7 @@ impl SettingsView {
                             .small()
                             .outline()
                             .icon(Lucide::ZoomOut)
+                            .accessibility_label("Zoom out")
                             .on_click(|_, w, cx| crate::app::set_zoom(crate::app::zoom(cx) - 0.1, w, cx)),
                     )
                     .child(
@@ -1302,6 +1305,7 @@ impl SettingsView {
                             .small()
                             .outline()
                             .icon(Lucide::ZoomIn)
+                            .accessibility_label("Zoom in")
                             .on_click(|_, w, cx| crate::app::set_zoom(crate::app::zoom(cx) + 0.1, w, cx)),
                     )
                     .child(
@@ -1634,6 +1638,7 @@ impl SettingsView {
                         .xsmall()
                         .ghost()
                         .icon(Lucide::Copy)
+                        .accessibility_label("Copy the command")
                         .tooltip("Copy the command")
                         .on_click(move |_, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(copy.clone()))),
                 )
@@ -1738,6 +1743,9 @@ impl Render for SettingsView {
             .bg(theme.background)
             .child(
                 v_flex()
+                    .id("settings-sections")
+                    .role(Role::TabList)
+                    .aria_label("Settings sections")
                     .w(px(220.))
                     .h_full()
                     .p_3()
@@ -1758,6 +1766,8 @@ impl Render for SettingsView {
                             .cursor_pointer()
                             .when(on, |d| d.bg(theme.list_active))
                             .hover(|s| s.bg(theme.list_hover))
+                            .control(Role::Tab, *label, theme.ring)
+                            .aria_selected(on)
                             .on_click(cx.listener(move |this, _, window, cx| this.show(sec, window, cx)))
                             .child(Icon::new(*icon).size_4().text_color(theme.muted_foreground))
                             .child(*label)

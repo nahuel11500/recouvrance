@@ -184,6 +184,7 @@ pub(super) fn secret_entry(ctx: &Ctx, i: usize, cx: &App) -> AnyElement {
                 .xsmall()
                 .ghost()
                 .icon(Lucide::Copy)
+                .accessibility_label("Copy the value")
                 .tooltip("Copy the value")
                 .on_click(move |_, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(decoded.clone()))),
         )

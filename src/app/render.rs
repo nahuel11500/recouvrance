@@ -22,6 +22,7 @@ use super::{
     ZoomWindow, set_theme, with_keys,
 };
 use crate::favorites::Favorite;
+use crate::ui::a11y::Control as _;
 
 impl Render for AppView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -136,6 +137,7 @@ impl AppView {
                     .ghost()
                     .small()
                     .icon(if self.sidebar_hidden { Lucide::PanelLeftOpen } else { Lucide::PanelLeftClose })
+                    .accessibility_label(if self.sidebar_hidden { "Show the sidebar" } else { "Hide the sidebar" })
                     .tooltip(with_keys("Show/hide the sidebar ({secondary-b})"))
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.sidebar_hidden = !this.sidebar_hidden;
@@ -176,6 +178,7 @@ impl AppView {
                         .ghost()
                         .small()
                         .icon(Lucide::RefreshCw)
+                        .accessibility_label("Refresh")
                         .tooltip(with_keys("Refresh ({f5|secondary-r})"))
                         .on_click(cx.listener(|this, _, window, cx| this.refresh_page(window, cx))),
                 )
@@ -190,6 +193,7 @@ impl AppView {
                     .ghost()
                     .small()
                     .icon(Lucide::Sparkles)
+                    .accessibility_label("Ask the assistant about what is on screen")
                     .selected(self.docked_assistant().is_some())
                     .tooltip(with_keys("Ask the assistant about what is on screen ({secondary-j})"))
                     .on_click(cx.listener(|this, _, window, cx| this.toggle_assistant(window, cx))),
@@ -199,6 +203,7 @@ impl AppView {
                     .ghost()
                     .small()
                     .icon(Lucide::Plus)
+                    .accessibility_label("Create / apply YAML")
                     .tooltip("Create / apply YAML")
                     .on_click(cx.listener(|this, _, window, cx| this.open_apply(window, cx))),
             )
@@ -207,6 +212,7 @@ impl AppView {
                     .ghost()
                     .small()
                     .icon(Lucide::SquareTerminal)
+                    .accessibility_label("Terminal")
                     .tooltip("Terminal (kubectl set to this context)")
                     .on_click(cx.listener(|this, _, window, cx| this.open_terminal(window, cx))),
             )
@@ -215,6 +221,7 @@ impl AppView {
                     .ghost()
                     .small()
                     .icon(Lucide::Settings)
+                    .accessibility_label("Settings")
                     .tooltip("Settings")
                     .on_click(cx.listener(|this, _, _, cx| this.navigate(Route::Settings, cx))),
             )
@@ -223,6 +230,8 @@ impl AppView {
                     .ghost()
                     .small()
                     .icon(if cx.theme().is_dark() { IconName::Sun } else { IconName::Moon })
+                    .accessibility_label(theme_toggle_name(cx.theme().is_dark()))
+                    .tooltip(theme_toggle_name(cx.theme().is_dark()))
                     .on_click(|_, window, cx| toggle_theme(window, cx)),
             )
             .child(
@@ -230,6 +239,7 @@ impl AppView {
                     .ghost()
                     .small()
                     .icon(Lucide::Keyboard)
+                    .accessibility_label("Keyboard shortcuts")
                     .tooltip(with_keys("Keyboard shortcuts ({?})"))
                     .on_click(|_, window, cx| super::shortcuts::open_panel(window, cx)),
             )
@@ -358,6 +368,7 @@ impl AppView {
                     .ghost()
                     .small()
                     .icon(Lucide::RefreshCw)
+                    .accessibility_label("Reload the list")
                     .tooltip("Reload the list")
                     // Lists again, as F5 does: `restart_watch` would bring the kept list back.
                     .on_click(cx.listener(|this, _, _, cx| this.reload_watch(cx))),
@@ -367,6 +378,7 @@ impl AppView {
                     .ghost()
                     .small()
                     .icon(Lucide::FileSpreadsheet)
+                    .accessibility_label("Export the rows shown to CSV")
                     .tooltip("Export the rows shown to CSV (~/Downloads)")
                     .on_click(cx.listener(|this, _, window, cx| this.export_csv(window, cx))),
             )
@@ -549,6 +561,8 @@ fn search_field(theme: &Theme, hint: String) -> Stateful<Div> {
         .bg(theme.secondary)
         .cursor_pointer()
         .hover(|s| s.bg(theme.list_hover))
+        .control(Role::Button, "Jump to anything", theme.ring)
+        .aria_keyshortcuts(hint.clone())
         .text_sm()
         .text_color(theme.muted_foreground)
         .child(Icon::new(Lucide::Search).size_4().flex_shrink_0())
@@ -607,6 +621,11 @@ fn toggle_write_mode(window: &mut Window, cx: &mut App) {
                 true
             })
     });
+}
+
+/// What the theme button does, from the theme on screen.
+fn theme_toggle_name(dark: bool) -> &'static str {
+    if dark { "Switch to the light theme" } else { "Switch to the dark theme" }
 }
 
 fn toggle_theme(window: &mut Window, cx: &mut App) {

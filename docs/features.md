@@ -758,6 +758,13 @@ list them; the palette, that list and this table are all made from one list of c
 
 Single keys (?, *, g, j, k) work when no text field or terminal has focus.
 
+Tab and Shift+Tab move the focus through the top bar, the sidebar (pages, sections, resource
+types, saved views and favorites), the cards of the Contexts page and the sections of Settings;
+Enter or Space opens what has focus, and a tint shows where it is. Screen readers (Orca,
+VoiceOver) read each of them by name, the buttons that show only an icon included, along with
+the page or section picked, the sections folded and the contexts ticked. The palette's results
+are a list, with the highlighted one marked as selected.
+
 On macOS, ⌘ takes Ctrl's place, so Ctrl keys reach the shell in a terminal (Ctrl+Tab still
 switches tabs), and the menu bar has the keys every Mac app has: ⌘, opens Settings, ⌘Q quits, ⌘W
 closes the tab or, at the last tab, the window, ⇧⌘W closes the window, ⌘M minimizes, ⌘H hides,

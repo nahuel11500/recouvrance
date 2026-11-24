@@ -255,6 +255,11 @@ impl KubeconfigSources {
                         .xsmall()
                         .ghost()
                         .icon(Lucide::X)
+                        .accessibility_label(if src.kind == SourceKind::Added {
+                            "Delete this pasted kubeconfig"
+                        } else {
+                            "Stop using"
+                        })
                         .tooltip(if src.kind == SourceKind::Added {
                             "Delete this pasted kubeconfig"
                         } else {

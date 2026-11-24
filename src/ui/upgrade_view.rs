@@ -176,6 +176,7 @@ impl UpgradeView {
                     .xsmall()
                     .ghost()
                     .icon(Lucide::ChevronLeft)
+                    .accessibility_label("Older version")
                     .disabled(at_lowest || !idle)
                     .on_click(cx.listener(move |this, _, _, cx| this.step_target(ci, -1, cx))),
             )
@@ -185,6 +186,7 @@ impl UpgradeView {
                     .xsmall()
                     .ghost()
                     .icon(Lucide::ChevronRight)
+                    .accessibility_label("Newer version")
                     .disabled(check.target.is_none() || !idle)
                     .on_click(cx.listener(move |this, _, _, cx| this.step_target(ci, 1, cx))),
             )

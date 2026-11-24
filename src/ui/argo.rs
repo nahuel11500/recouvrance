@@ -985,6 +985,7 @@ impl ArgoView {
                 .xsmall()
                 .ghost()
                 .icon(if collapsed { Lucide::ChevronRight } else { Lucide::ChevronDown })
+                .accessibility_label(if collapsed { "Open the group" } else { "Fold the group" })
                 .on_click(move |_, _, cx| {
                     let _ = view.update(cx, |this, cx| this.toggle_group(k.clone(), cx));
                 })
@@ -1385,77 +1386,81 @@ fn row_menu(
 ) -> impl IntoElement {
     let k = k.clone();
     let id = SharedString::from(format!("argo-menu-{}-{}-{}", k.0, k.1, k.2));
-    Button::new(id).xsmall().ghost().icon(Lucide::Ellipsis).dropdown_menu(move |menu: PopupMenu, _, _| {
-        let open = {
-            let (view, k) = (view.clone(), k.clone());
-            move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
-                let _ = view.update(cx, |this, cx| this.open(&k, cx));
-            }
-        };
-        let board = {
-            let (view, k) = (view.clone(), k.clone());
-            move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
-                let _ = view.update(cx, |this, cx| this.open_dashboard(&k, cx));
-            }
-        };
-        let destination = {
-            let (view, k) = (view.clone(), k.clone());
-            move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
-                let _ = view.update(cx, |this, cx| this.open_destination(&k, cx));
-            }
-        };
-        let pick_group = {
-            let view = view.clone();
-            move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
-                if let Some(ix) = group {
-                    let _ = view.update(cx, |this, cx| this.pick_group(ix, false, cx));
+    Button::new(id).xsmall().ghost().icon(Lucide::Ellipsis).accessibility_label("More actions").dropdown_menu(
+        move |menu: PopupMenu, _, _| {
+            let open = {
+                let (view, k) = (view.clone(), k.clone());
+                move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
+                    let _ = view.update(cx, |this, cx| this.open(&k, cx));
                 }
-            }
-        };
-        let act = |action: ArgoAction| {
-            let (view, k) = (view.clone(), k.clone());
-            move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
-                let _ = view.update(cx, |this, cx| this.act(&k, action, window, cx));
-            }
-        };
-        let open_item = if by_api {
-            PopupMenuItem::new("Open in Argo CD").icon(Lucide::ExternalLink)
-        } else {
-            PopupMenuItem::new("Open").icon(Lucide::PanelRightOpen)
-        };
-        let menu = menu
-            .item(PopupMenuItem::new("Dashboard").icon(Lucide::LayoutDashboard).on_click(board))
-            .item(open_item.on_click(open))
-            .item(
-                PopupMenuItem::new("Open destination namespace")
-                    .icon(Lucide::FolderOpen)
-                    .disabled(!has_destination)
-                    .on_click(destination),
-            );
-        let menu = if group.is_some() {
-            menu.item(PopupMenuItem::new("Pick the group").icon(Lucide::ListChecks).on_click(pick_group))
-        } else {
-            menu
-        };
-        menu.separator()
-            .item(PopupMenuItem::new("Refresh…").icon(Lucide::RefreshCw).on_click(act(ArgoAction::Refresh)))
-            .item(
-                PopupMenuItem::new("Hard refresh…").icon(Lucide::RefreshCcwDot).on_click(act(ArgoAction::HardRefresh)),
-            )
-            .item(PopupMenuItem::new("Sync…").icon(Lucide::GitBranch).on_click(act(ArgoAction::Sync)))
-            .item(
-                PopupMenuItem::new("Terminate…")
-                    .icon(Lucide::CircleStop)
-                    .disabled(!offers.terminate)
-                    .on_click(act(ArgoAction::Terminate)),
-            )
-            .item(
-                PopupMenuItem::new("Roll back to the previous deployment…")
-                    .icon(Lucide::Undo2)
-                    .disabled(!offers.roll_back)
-                    .on_click(act(ArgoAction::Rollback(None))),
-            )
-    })
+            };
+            let board = {
+                let (view, k) = (view.clone(), k.clone());
+                move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
+                    let _ = view.update(cx, |this, cx| this.open_dashboard(&k, cx));
+                }
+            };
+            let destination = {
+                let (view, k) = (view.clone(), k.clone());
+                move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
+                    let _ = view.update(cx, |this, cx| this.open_destination(&k, cx));
+                }
+            };
+            let pick_group = {
+                let view = view.clone();
+                move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
+                    if let Some(ix) = group {
+                        let _ = view.update(cx, |this, cx| this.pick_group(ix, false, cx));
+                    }
+                }
+            };
+            let act = |action: ArgoAction| {
+                let (view, k) = (view.clone(), k.clone());
+                move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
+                    let _ = view.update(cx, |this, cx| this.act(&k, action, window, cx));
+                }
+            };
+            let open_item = if by_api {
+                PopupMenuItem::new("Open in Argo CD").icon(Lucide::ExternalLink)
+            } else {
+                PopupMenuItem::new("Open").icon(Lucide::PanelRightOpen)
+            };
+            let menu = menu
+                .item(PopupMenuItem::new("Dashboard").icon(Lucide::LayoutDashboard).on_click(board))
+                .item(open_item.on_click(open))
+                .item(
+                    PopupMenuItem::new("Open destination namespace")
+                        .icon(Lucide::FolderOpen)
+                        .disabled(!has_destination)
+                        .on_click(destination),
+                );
+            let menu = if group.is_some() {
+                menu.item(PopupMenuItem::new("Pick the group").icon(Lucide::ListChecks).on_click(pick_group))
+            } else {
+                menu
+            };
+            menu.separator()
+                .item(PopupMenuItem::new("Refresh…").icon(Lucide::RefreshCw).on_click(act(ArgoAction::Refresh)))
+                .item(
+                    PopupMenuItem::new("Hard refresh…")
+                        .icon(Lucide::RefreshCcwDot)
+                        .on_click(act(ArgoAction::HardRefresh)),
+                )
+                .item(PopupMenuItem::new("Sync…").icon(Lucide::GitBranch).on_click(act(ArgoAction::Sync)))
+                .item(
+                    PopupMenuItem::new("Terminate…")
+                        .icon(Lucide::CircleStop)
+                        .disabled(!offers.terminate)
+                        .on_click(act(ArgoAction::Terminate)),
+                )
+                .item(
+                    PopupMenuItem::new("Roll back to the previous deployment…")
+                        .icon(Lucide::Undo2)
+                        .disabled(!offers.roll_back)
+                        .on_click(act(ArgoAction::Rollback(None))),
+                )
+        },
+    )
 }
 
 impl Render for ArgoView {

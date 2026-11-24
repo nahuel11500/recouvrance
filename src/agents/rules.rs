@@ -117,6 +117,11 @@ impl AgentsView {
                             .xsmall()
                             .ghost()
                             .icon(Lucide::Timer)
+                            .accessibility_label(if rule.expires.is_some() {
+                                "Make permanent"
+                            } else {
+                                "Expire in 1 hour"
+                            })
                             .tooltip(if rule.expires.is_some() { "Make permanent" } else { "Expire in 1 hour" })
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.update_rule(
@@ -131,32 +136,42 @@ impl AgentsView {
                                 );
                             })),
                     )
-                    .child(Button::new(("dup-rule", ix)).xsmall().ghost().icon(Lucide::Copy).on_click(cx.listener(
-                        move |this, _, window, cx| {
-                            this.edit_rules(
-                                |rules| {
-                                    if let Some(r) = rules.get(ix).cloned() {
-                                        rules.insert(ix + 1, r);
-                                    }
-                                },
-                                window,
-                                cx,
-                            );
-                        },
-                    )))
-                    .child(Button::new(("del-rule", ix)).xsmall().ghost().icon(Lucide::Trash).on_click(cx.listener(
-                        move |this, _, window, cx| {
-                            this.edit_rules(
-                                |rules| {
-                                    if ix < rules.len() {
-                                        rules.remove(ix);
-                                    }
-                                },
-                                window,
-                                cx,
-                            );
-                        },
-                    ))),
+                    .child(
+                        Button::new(("dup-rule", ix))
+                            .xsmall()
+                            .ghost()
+                            .icon(Lucide::Copy)
+                            .accessibility_label("Duplicate this rule")
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.edit_rules(
+                                    |rules| {
+                                        if let Some(r) = rules.get(ix).cloned() {
+                                            rules.insert(ix + 1, r);
+                                        }
+                                    },
+                                    window,
+                                    cx,
+                                );
+                            })),
+                    )
+                    .child(
+                        Button::new(("del-rule", ix))
+                            .xsmall()
+                            .ghost()
+                            .icon(Lucide::Trash)
+                            .accessibility_label("Delete this rule")
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.edit_rules(
+                                    |rules| {
+                                        if ix < rules.len() {
+                                            rules.remove(ix);
+                                        }
+                                    },
+                                    window,
+                                    cx,
+                                );
+                            })),
+                    ),
             )
             .child(h_flex().gap_2().child(label("Verbs")).child(verbs))
             .child(

@@ -904,6 +904,7 @@ impl Render for LogsView {
                             .small()
                             .ghost()
                             .icon(assets::IconName::Copy)
+                            .accessibility_label("Copy the shown lines")
                             .tooltip("Copy the shown lines")
                             .on_click(cx.listener(|this, _, _, cx| {
                                 cx.write_to_clipboard(ClipboardItem::new_string(this.shown_text()));
@@ -914,6 +915,7 @@ impl Render for LogsView {
                             .small()
                             .ghost()
                             .icon(assets::IconName::Download)
+                            .accessibility_label("Save the shown lines")
                             .tooltip("Save the shown lines to ~/Downloads")
                             .on_click(cx.listener(|this, _, window, cx| {
                                 let note = match this.save_to_downloads() {
@@ -1001,6 +1003,7 @@ impl Render for LogsView {
                             .xsmall()
                             .ghost()
                             .icon(Lucide::ChevronUp)
+                            .accessibility_label("Previous match")
                             .tooltip("Previous match (Shift+Enter)")
                             .on_click(cx.listener(|this, _, _, cx| this.step_find(-1, cx))),
                     )
@@ -1009,6 +1012,7 @@ impl Render for LogsView {
                             .xsmall()
                             .ghost()
                             .icon(Lucide::ChevronDown)
+                            .accessibility_label("Next match")
                             .tooltip("Next match (Enter)")
                             .on_click(cx.listener(|this, _, _, cx| this.step_find(1, cx))),
                     )
