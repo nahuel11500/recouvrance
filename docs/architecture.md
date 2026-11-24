@@ -143,9 +143,15 @@ is read every `detail_refresh`.
   text through `parse_kubeconfig`: their error says the file, line and column, and why in words
   of their own.
 - **Proxy passwords stay out of errors.** kube's error for a proxy it can't use prints the proxy's
-  URL whole, user and password included. The client's build error puts that URL back without
-  them, scheme or not (`user:password@host:1080` from `HTTPS_PROXY` reads as a URL to kube, not
-  to a text), whatever the password holds: a proxy's URL has no path or query, so everything up
-  to its last `@` goes, and a host left by a `#` that cut it short (a port that is no number, or
-  none after a user) is not shown, only the scheme. It leaves out the user and password of any other URL in its text, as of one in the
-  login plugin's stderr line (`k8s::login`).
+  URL whole, user and password included. The client's build error puts that URL back as its
+  scheme, host and port alone, scheme or not (`user:password@host:1080` from `HTTPS_PROXY` reads
+  as a URL to kube, not to a text), whatever the password holds: a proxy's URL has no path or
+  query, so everything up to the last `@` goes, and everything after the host. kube keeps the
+  URL as an `http::Uri`, which drops what follows a `#`: the password left before it can read
+  as a host and port. So when the proxy's text, as kube reads it (the cluster's `proxy-url`,
+  else `HTTPS_PROXY`, else `https_proxy`), holds a `#`, only the scheme is shown. From the
+  `Uri` alone, a URL with a scheme is shown by its scheme too when its port is no number, when
+  it has a user and no port, or a path or query and no user. The build error also leaves out
+  the user and password of any other URL in its text, as of one in the login plugin's stderr
+  line (`k8s::login`), but there a password with an unescaped `/`, `?` or `#` still shows
+  (#1000).
