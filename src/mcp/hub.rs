@@ -212,8 +212,8 @@ impl Hub {
         }
         for agent in &mut config.agents {
             agent.policy.migrate();
-            // Saved before the GitOps verbs: rules.yaml, when it exists, is upgraded the same
-            // way when it is loaded (`apply_rules_file`), which then sets the version.
+            // Saved before the GitOps verbs. rules.yaml, when it exists, says itself whether
+            // its rules are that old (`rules_file::apply_upgrading`).
             if config.version < GITOPS_VERBS_VERSION {
                 agent.policy.add_gitops_verbs();
             }
@@ -288,7 +288,12 @@ impl Hub {
     /// Load rules.yaml into the agents (creating agents it names). A broken file
     /// changes nothing: the error is kept for the Agents page.
     pub fn apply_rules_file(&self) -> Result<bool> {
-        let path = rules_file::path();
+        self.apply_rules_file_in(&crate::paths::config_dir())
+    }
+
+    /// [`apply_rules_file`](Self::apply_rules_file) with rules.yaml and agents.json in `dir`.
+    fn apply_rules_file_in(&self, dir: &std::path::Path) -> Result<bool> {
+        let path = dir.join("rules.yaml");
         self.rules_file_present.store(path.exists(), Ordering::Relaxed);
         {
             // Read and apply under the config lock: an edit in the app, which writes the file
@@ -342,7 +347,7 @@ impl Hub {
             cfg.version = CONFIG_VERSION;
         }
         *lock(&self.rules_error) = None;
-        self.save()?;
+        self.save_in(dir)?;
         self.emit(HubEvent::AgentSeen);
         Ok(true)
     }
@@ -420,9 +425,12 @@ impl Hub {
     }
 
     fn save(&self) -> Result<()> {
+        self.save_in(&crate::paths::config_dir())
+    }
+
+    fn save_in(&self, dir: &std::path::Path) -> Result<()> {
         let json = serde_json::to_vec_pretty(&*read(&self.config))?;
-        crate::private_files::write_atomic(&crate::paths::config_dir().join("agents.json"), &json)
-            .context("saving agents.json")
+        crate::private_files::write_atomic(&dir.join("agents.json"), &json).context("saving agents.json")
     }
 
     /// The port-forwards agents have open.
@@ -977,6 +985,42 @@ mod tests {
             let p = Policy { rules: vec![protected(effect)], ..Policy::default() };
             assert!(!p.allow_names_protected());
         }
+    }
+
+    /// A rules.yaml from before the GitOps verbs, given with no agents.json (so the config is
+    /// the default one, at the current version), is upgraded all the same: an Argo CD sync
+    /// is asked as the `patch` it was checked as, not allowed by a wider Allow. Written
+    /// again with its `version`, it then loads as written.
+    #[test]
+    fn an_old_rules_file_without_agents_json_is_upgraded() {
+        let dir = crate::mcp::test_dir();
+        let old = "agents:\n  ci:\n    allow: [\"* * -n team-a\"]\n    ask: [\"patch,delete *\"]\n";
+        std::fs::write(dir.join("rules.yaml"), old).unwrap();
+        let hub = Hub::for_test(Vec::new());
+        assert_eq!(hub.config().version, CONFIG_VERSION);
+        assert!(hub.apply_rules_file_in(&dir).unwrap());
+        let sync = |verb| Access {
+            context: "hub".into(),
+            verb,
+            resource: "applications.argoproj.io".into(),
+            namespace: Some("team-a".into()),
+            name: Some("web".into()),
+            ..Access::default()
+        };
+        let ci = || hub.config().agents.into_iter().find(|a| a.name == "ci").unwrap();
+        for verb in [Verb::Patch, Verb::Refresh, Verb::Sync, Verb::Suspend] {
+            assert_eq!(ci().policy.decide(&sync(verb)).mode, Mode::Ask, "{verb}");
+        }
+        let written = std::fs::read_to_string(dir.join("rules.yaml")).unwrap();
+        assert!(written.contains(&format!("\nversion: {}\n", rules_file::FILE_VERSION)), "{written}");
+        // Loaded again, as written: a verb taken out by hand stays out.
+        let edited = written.replace("patch,delete,refresh,sync,suspend", "patch,delete,sync,suspend");
+        assert_ne!(edited, written);
+        std::fs::write(dir.join("rules.yaml"), &edited).unwrap();
+        assert!(hub.apply_rules_file_in(&dir).unwrap());
+        assert_eq!(std::fs::read_to_string(dir.join("rules.yaml")).unwrap(), edited);
+        assert_eq!(ci().policy.decide(&sync(Verb::Refresh)).mode, Mode::Allow);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
