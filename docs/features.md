@@ -508,8 +508,11 @@
   favorites, kept in `favorites.json`.
 - **Saved views** (type + namespaces + filter, bookmark button), back/forward history, light and dark themes
   whose status colors, badges and status buttons read at WCAG AA contrast (4.5:1) on what they are drawn on.
-- **Instant back**: the last 8 lists (up to 10,000 rows in all) are kept, so going back to one
-  shows it at once, marked "Updating…", while a fresh list loads and replaces it in one go.
+- **Instant back**: the last 4 lists left in a window (up to 60,000 rows in all, for 5 minutes) keep their
+  watches, paused like a hidden page's, so going back to one (by kind, tab or namespace) shows its
+  rows at once, current within half a second, without listing it again. *Refresh* lists it again.
+  Other lists seen recently (the last 8, up to 10,000 rows in all) show at once, marked
+  "Updating…", while a fresh list loads and replaces it in one go.
 - **Bulk actions**: check rows, then read their logs together, restart, scale, delete or copy names. Scaling needs the number
   of objects typed (the replica count is never suggested), deleting asks as set for the kind (see
   below), and each protected context among them needs its name typed (or a wait); rows from several contexts
@@ -534,9 +537,13 @@
   debug pods with an ephemeral container (falls back to a Pod Security "restricted" profile), run a CronJob now, suspend/resume (CronJobs, Flux, Argo CronWorkflows), drain nodes, force delete
   or remove finalizers (only once the delete leaves it stuck terminating: it already was, or still is
   after 10 seconds), Flux *Reconcile*, Argo CD
-  *Refresh*/*Hard refresh*/*Sync*/*Terminate*/*Roll back*, create/apply YAML (a server dry run first, then a confirmation listing each
-  object's kind, namespace and name). YAML edits on a detail page save only that object: a changed
-  kind, API group, namespace or name is refused, and so are masked Secret values. Every
+  *Refresh*/*Hard refresh*/*Sync*/*Terminate*/*Roll back*, create/apply YAML (a server dry run first, then a confirmation
+  showing what each object changes against the cluster: created, changed with its diff, or no change). YAML edits on a detail
+  page save only that object: a changed kind, API group, namespace or name is refused, and so are masked Secret values. The
+  confirmation shows the diff of the dry run, and the save is sent as of the version the edit started from: when the object
+  changes on the cluster meanwhile (an HPA, a controller, Argo CD), a warning over the editor says who changed it, and
+  offers *Compare*, *Keep my edits on the latest* (your changes made on the object as it is now) and *Reload*, instead of
+  undoing that change. Secret values never show in these diffs. Every
   confirmation shows the equivalent `kubectl` command. A page whose object is deleted says so, and
   shows the one created again under its name, if one is.
 - **Run as** (Settings → Contexts → *Run as*): set a user (and groups) a
@@ -559,7 +566,14 @@
   user and cluster names and the server URL (`prod`, `prd`, `production`, `live`, `admin`, `root`),
   so new production contexts are protected too. Set both in Settings → Contexts.
 - **Diagnosis** on pods and workloads: why it is broken (crash output and exit code, scheduling,
-  image pulls, probes, volumes) and what to try.
+  image pulls, probes, volumes) and what to try. On a workload's page it also says where the
+  failure comes from, from its pods' revisions and nodes: the new revision (only its pods fail,
+  the previous one's are ready), one node (only pods there fail, the same revision is ready
+  elsewhere) or the app (old and new revisions fail, or every pod fails on several nodes). A pod
+  fails when it crashes, exits with an error, cannot pull or create a container, or is evicted; a
+  pod still starting, warming up behind its readiness probe or waiting for room on a node does not
+  count, so a rollout or scale-up in progress names no cause. It also shows the worst pod's crash
+  output (one log read, only when a container of that pod crashed).
 - **Rollback** of Deployments, StatefulSets and DaemonSets to any revision, with the diff and a
   server dry run first; **attach** to a container's process; **file copy** in and out of containers
   (both ways it runs commands in the container, so it needs write mode, like a shell);

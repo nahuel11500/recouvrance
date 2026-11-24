@@ -18,6 +18,11 @@ Recouvrance is one Rust binary: a [gpui](https://github.com/zed-industries/zed) 
   sidebar's problem count starts no scan (an agent's `find_problems` still does when its
   findings are too old). Watches, log streams and shells keep going, so a window shown again is
   current at once. A window shown on another monitor, not focused, keeps updating.
+- A list left for another kind, tab or namespace keeps its watches the same way (`app::kept_lists`:
+  the last 4 of each window, up to 60,000 rows in all as counted when each was left, for 5 minutes,
+  as long as the pods' requests watch lingers off screen; the least recently left dropped first), so
+  going back to it shows current rows without a list request. Its tasks carry the id of their list
+  and touch the table only while it is the one on screen.
 - The Timeline's events are listed once, then watched (`k8s::watch_events`); only the newest
   20,000 of a cluster are held. Their watch is the exception to the rule above: it closes while
   the page is off screen, and once the page is shown again it goes on from where it was, bringing

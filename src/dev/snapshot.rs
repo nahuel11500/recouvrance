@@ -112,6 +112,12 @@ pub fn run(path: &str, wait: Duration) -> Result<()> {
         }
         eprintln!("QA done: {problems} problem(s)");
     }
+    // RECOUVRANCE_BACKTIME=<kind>,<other>[,<rounds>]: list <kind>, then <other>, then go back
+    // to <kind>, `rounds` times (2 by default): how long the list takes to show rows and to be
+    // live again, and what going back sent (as Settings → API requests counts it).
+    if let Ok(spec) = std::env::var("RECOUVRANCE_BACKTIME") {
+        back_time(&mut cx, &app_view, &pump, &spec);
+    }
     // RECOUVRANCE_KIND=<kind>: list that resource type first.
     if let Ok(kind) = std::env::var("RECOUVRANCE_KIND") {
         cx.update(|cx| app_view.update(cx, |a, cx| a.qa_select(&kind, cx)));
@@ -390,6 +396,79 @@ drwxr-xr-x 1 root root 4096 Oct 15 \x1b[1;34m.\x1b[0m\r\n\
         crate::dev::usage::print();
     }
     Ok(())
+}
+
+/// `RECOUVRANCE_BACKTIME`: switch between two lists and time each return to the first.
+fn back_time(
+    cx: &mut HeadlessAppContext,
+    app_view: &Entity<crate::app::AppView>,
+    pump: &dyn Fn(&mut HeadlessAppContext, Duration),
+    spec: &str,
+) {
+    let mut parts = spec.split(',');
+    let (Some(kind), Some(other)) = (parts.next(), parts.next()) else {
+        eprintln!("RECOUVRANCE_BACKTIME: give two kinds, as pods,deployments");
+        return;
+    };
+    let rounds: u32 = parts.next().and_then(|r| r.parse().ok()).unwrap_or(2);
+    let first = time_list(cx, app_view, pump, kind);
+    eprintln!("first {kind}: {}", describe(first));
+    for round in 1..=rounds {
+        let away = time_list(cx, app_view, pump, other);
+        eprintln!("round {round}: {other}: {}", describe(away));
+        crate::k8s::meter::reset();
+        let back = time_list(cx, app_view, pump, kind);
+        // Requests a moment after the list is live count too (a relist behind old rows).
+        pump(cx, Duration::from_secs(1));
+        let seen = crate::k8s::meter::snapshot(crate::k8s::meter::now_minute());
+        let requests: u64 = seen.classes.iter().map(|(_, _, s)| s.count).sum();
+        let bytes: u64 = seen.classes.iter().map(|(_, _, s)| s.bytes).sum();
+        eprintln!(
+            "round {round}: back to {kind}: {}, {requests} requests, {:.1} MB read, RSS {} MB",
+            describe(back),
+            bytes as f64 / 1e6,
+            rss_mb().map_or_else(|| "?".into(), |m| m.to_string())
+        );
+        for (context, class, stats) in &seen.classes {
+            eprintln!("  {context}: {}: {} requests", class.label(), stats.count);
+        }
+    }
+}
+
+/// Pick `kind` and wait (a minute at most) for its list: when rows were on screen, and when
+/// it was live (no cluster still listing).
+fn time_list(
+    cx: &mut HeadlessAppContext,
+    app_view: &Entity<crate::app::AppView>,
+    pump: &dyn Fn(&mut HeadlessAppContext, Duration),
+    kind: &str,
+) -> (Option<Duration>, Option<Duration>) {
+    cx.update(|cx| app_view.update(cx, |a, cx| a.qa_select(kind, cx)));
+    let start = Instant::now();
+    let mut rows_at = None;
+    while start.elapsed() < Duration::from_secs(60) {
+        let (rows, listing, _) = cx.update(|cx| app_view.read(cx).qa_list(cx));
+        if rows > 0 && rows_at.is_none() {
+            rows_at = Some(start.elapsed());
+        }
+        if !listing {
+            return (rows_at, Some(start.elapsed()));
+        }
+        pump(cx, Duration::from_millis(10));
+    }
+    (rows_at, None)
+}
+
+fn describe((rows, live): (Option<Duration>, Option<Duration>)) -> String {
+    let ms = |d: Option<Duration>| d.map_or_else(|| "never".into(), |d| format!("{} ms", d.as_millis()));
+    format!("rows at {}, live at {}", ms(rows), ms(live))
+}
+
+/// This process's resident memory in MB (Linux), as `VmRSS` says it.
+fn rss_mb() -> Option<u64> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    let kb = status.lines().find_map(|l| l.strip_prefix("VmRSS:"))?;
+    Some(kb.trim().trim_end_matches("kB").trim().parse::<u64>().ok()? / 1024)
 }
 
 /// The requests counted since the meter's reset `secs` seconds ago, by kind and summed over
