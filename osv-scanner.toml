@@ -43,3 +43,8 @@ reason = "zvariant is unmaintained (not a vulnerability); Linux D-Bus support be
 id = "RUSTSEC-2026-0372"
 ignoreUntil = 2027-04-21
 reason = "zvariant_derive is unmaintained (not a vulnerability); Linux D-Bus support behind the UI toolkit's accessibility, portals and keyring"
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0543"
+ignoreUntil = 2027-05-24
+reason = "chrono is unmaintained (not a vulnerability); we use jiff, chrono comes in through gpui (the UI toolkit), rmcp and schemars, waiting on upstream"
