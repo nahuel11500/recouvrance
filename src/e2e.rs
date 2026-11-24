@@ -2480,7 +2480,7 @@ fn an_orphan_delete_keeps_what_the_object_owns() {
         let clean = || async {
             let _ = deps.delete(name, &DeleteParams::background()).await;
             // A ReplicaSet a failed run left held by `HOLD`.
-            for rs in sets.list(&selector).await.map(|l| l.items).unwrap_or_default() {
+            for rs in sets.list(&selector).await.map_or_default(|l| l.items) {
                 let free = Patch::Merge(json!({"metadata": {"finalizers": null}}));
                 let _ = sets.patch(&rs.metadata.name.unwrap_or_default(), &PatchParams::default(), &free).await;
             }
