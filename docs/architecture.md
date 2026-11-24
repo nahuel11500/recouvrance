@@ -70,6 +70,12 @@ managedFields and the rest skipped (`list_whole`), and so does a list the Timeli
 from such a row reads the object's uid first, and leaves alone an object newer than the row (one
 re-created under the same name since the list).
 
+A connect doesn't wait for its slowest cluster (`src/app/reach.rs`). Each context connects on its
+own, reading its discovery and its namespace list together; the first rows come once one cluster
+has answered and the others have had 2 more seconds, and a cluster that answers later joins the
+list then. When the list shown first is the Pods of every namespace, it starts as soon as each
+client is built, alongside discovery, and the list takes it over.
+
 Rows keep only the metadata they need; full objects are fetched only when a custom column needs
 them. Responses are gzip-compressed. The usage bars and the cluster overview take the pods'
 requests and limits from one list of the pods, then follow them with a watch

@@ -161,14 +161,14 @@ impl AppView {
     }
 
     /// Where this window is now on its set of contexts; none when it may not be saved (see
-    /// `SaveGate`; a cluster failed when `connect_errors` is set: it didn't answer, or its
-    /// namespaces didn't list).
+    /// `SaveGate`; a cluster failed when `connect_partial`: it didn't answer, or its
+    /// namespaces didn't list, or it joined after the first rows).
     fn session_snapshot(&self, cx: &App) -> Option<Session> {
         let gate = SaveGate {
             has_set: !self.session_key.is_empty(),
             connecting: self.connecting,
             connected: !self.clusters.is_empty(),
-            failed: self.connect_errors.is_some(),
+            failed: self.connect_partial(),
             owns: cx.try_global::<SessionOwners>().is_some_and(|o| o.owns(&self.session_key, self.view_id)),
         };
         if !gate.saves() {
@@ -204,11 +204,17 @@ impl AppView {
         }
     }
 
+    /// Whether the last connect left out part of the set: a cluster failed or is still
+    /// connecting (`connect_errors`), or one joined after the first rows (`joined_late`).
+    fn connect_partial(&self) -> bool {
+        self.connect_errors.is_some() || self.joined_late
+    }
+
     /// The connect has finished: which window saves its set from now on (see
     /// `SessionOwners::settle`). When it is this one, the set is saved once things settle: a
     /// set connected for the first time is kept even if nothing changes before the app quits.
     pub(super) fn settle_session(&mut self, before: Option<EntityId>, reopened: bool, cx: &mut Context<Self>) {
-        let failed = self.connect_errors.is_some();
+        let failed = self.connect_partial();
         let owns =
             cx.default_global::<SessionOwners>().settle(&self.session_key, self.view_id, before, reopened, failed);
         if owns && !failed {
@@ -223,7 +229,7 @@ impl AppView {
         if self.session_key.is_empty() || self.connecting {
             return;
         }
-        if self.connect_errors.is_none() {
+        if !self.connect_partial() {
             cx.default_global::<SessionOwners>().take(&self.session_key, self.view_id);
         }
         // Replacing the task cancels the wait before: one save per burst of changes.
