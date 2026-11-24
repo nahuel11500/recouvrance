@@ -510,6 +510,11 @@ impl ResourceTable {
         self.recompute();
     }
 
+    /// Whether the filter reads rows' labels.
+    pub fn filter_reads_labels(&self) -> bool {
+        self.parsed.reads_labels()
+    }
+
     pub fn row(&self, visible_ix: usize) -> Option<&Arc<Row>> {
         self.visible.get(visible_ix).map(|&i| &self.rows[i])
     }

@@ -578,6 +578,7 @@ impl AppView {
                         t.delegate_mut().set_filter(text);
                         cx.notify();
                     });
+                    this.labels_for_filter(cx);
                     this.follow_selection(cx);
                     this.session_changed(cx);
                 }
