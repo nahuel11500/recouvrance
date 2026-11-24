@@ -55,6 +55,9 @@ its own peak), or dry runs such as `RECOUVRANCE_NODESHELLDRY=<node>` (see `src/d
 `RECOUVRANCE_PODRES=<seconds>` reads the usage bars' requests and limits of every pod for that long,
 and `RECOUVRANCE_CLUSTERLOAD=<rounds>` loads the cluster overview that many times in a row; both then
 print what their requests read (as Settings → API requests counts it) and the peak memory (`VmHWM`).
+`RECOUVRANCE_DASH=<runs>` loads the Workloads overview that many times in a row: each part as it
+arrives with its counts, then each load's requests and bytes received (the heaviest requests too)
+and the peak memory (Linux).
 
 **Timings**: `RECOUVRANCE_TIMINGS=1` prints to stderr every 10 seconds where the time went (frames,
 table filtering, watch batches, the assistant's API requests) and, for the assistant with an API
