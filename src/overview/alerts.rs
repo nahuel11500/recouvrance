@@ -113,7 +113,7 @@ fn alert_row(ctx: &Ctx, i: usize, a: &Alert, cx: &App) -> Div {
                         .text_color(theme.blue)
                         .cursor_pointer()
                         .hover(Styled::underline)
-                        .on_click(move |_, _, _| crate::forwards::open_url(&url))
+                        .on_click(move |_, window, cx| crate::forwards::open_url(&url, window, cx))
                         .child("Runbook")
                 }))
                 .child(

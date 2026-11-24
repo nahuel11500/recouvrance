@@ -307,8 +307,8 @@ impl TableDelegate for ResourceTable {
                                             .cursor_pointer()
                                             .hover(Styled::underline)
                                             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                                            .on_click(move |_, _, cx| {
-                                                crate::forwards::open_url(&url);
+                                            .on_click(move |_, window, cx| {
+                                                crate::forwards::open_url(&url, window, cx);
                                                 cx.stop_propagation();
                                             })
                                     })

@@ -404,9 +404,7 @@ impl Render for AssistantView {
                                     .selectable(true)
                                     // Model output is untrusted: only web links open.
                                     .on_link_click(|url, _, _, cx| {
-                                        if is_web_link(url) {
-                                            cx.open_url(url);
-                                        }
+                                        crate::forwards::open_web_link(url, cx);
                                     }),
                                 ),
                             );
@@ -592,12 +590,6 @@ fn tool_detail(args: &str) -> String {
     parts.join(" · ")
 }
 
-/// http(s) only: no file://, custom schemes or anything else the desktop would launch.
-fn is_web_link(url: &str) -> bool {
-    let url = url.trim_start().to_ascii_lowercase();
-    url.starts_with("https://") || url.starts_with("http://")
-}
-
 #[cfg(test)]
 mod tests {
     #[test]
@@ -613,14 +605,5 @@ mod tests {
         assert_eq!(super::tool_detail(r#"{"contexts":["a","b"],"query":"web"}"#), "query: web · a, b");
         assert_eq!(super::tool_detail("not json"), "not json");
         assert_eq!(super::tool_detail("{}"), "");
-    }
-
-    #[test]
-    fn only_web_links_open() {
-        assert!(super::is_web_link("https://kubernetes.io/docs"));
-        assert!(super::is_web_link("HTTP://example.com"));
-        for bad in ["file:///etc/passwd", "javascript:alert(1)", "ssh://host", "vscode://x", "/tmp/x", ""] {
-            assert!(!super::is_web_link(bad), "{bad}");
-        }
     }
 }

@@ -53,9 +53,9 @@ fn open(notes: &[Notes], window: &mut Window, cx: &mut App) {
                         TextView::markdown("whats-new", text.clone())
                             .selectable(true)
                             // The changelog's links lead to its pull requests on GitHub.
-                            .on_link_click(|url, _, _, _| {
+                            .on_link_click(|url, _, _, cx| {
                                 if url.starts_with("https://") {
-                                    crate::forwards::open_url(url);
+                                    crate::forwards::open_web_link(url, cx);
                                 }
                             }),
                     )
@@ -66,7 +66,7 @@ fn open(notes: &[Notes], window: &mut Window, cx: &mut App) {
                                 .ghost()
                                 .icon(Lucide::ExternalLink)
                                 .label("All release notes")
-                                .on_click(|_, _, _| crate::forwards::open_url(updates::RELEASES)),
+                                .on_click(|_, window, cx| crate::forwards::open_url(updates::RELEASES, window, cx)),
                         ),
                     ),
             )

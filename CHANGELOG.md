@@ -5,6 +5,89 @@ and versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.11.0](https://github.com/nahuel11500/recouvrance/compare/v0.10.0...v0.11.0) - 2026-11-24
+
+### Added
+
+- *(settings)* A read-only setting per context (#1006)
+- *(problems)* Certificates failing to renew or about to expire (#980)
+- *(app)* Keyboard focus and screen-reader names for the app's controls (#1014)
+- *(app)* Context sets connect a named group of contexts in one click (#1012)
+- *(alerts)* A firing alert shows its rule (#1010)
+- *(app)* Short display names for long context names, the full name on hover (#1008)
+- *(app)* Connecting and can't-connect states per context (#1004)
+- *(storage)* PVC usage on the PVC page, and PVCs filling up on Problems (#1001)
+- *(actions)* Orphan delete, evict and ExternalSecret refresh (#978)
+- *(problems)* Argo CD Applications that need attention show on Problems and the badge (#974)
+- *(argo)* Sync several Applications at once, with or without hooks, and keep a sync journal (#968)
+- *(problems)* CronJobs that stopped running (#973)
+- *(diagnose)* Say whether it is the new revision, the node or the app (#962)
+- *(details)* A diff before saving YAML, and a warning when the object changed meanwhile (#964)
+- *(argo)* Diff several Applications at once, the same change across environments shown once (#958)
+- *(argo)* What changed between two syncs, with the noise folded away (#953)
+- *(argo)* An Application dashboard per environment (#951)
+- *(app)* Favorite namespaces, Argo CD Applications, objects and contexts in one place (#949)
+- *(argo)* Connect to Argo CD by its API, and list Applications with filters, groups and sync windows (#948)
+- *(details)* Every resource has a Map tab (#939)
+- *(mcp)* Argo CD tools that follow an Application from its hub to its destination (#935)
+- *(argo)* Argo CD's own diff through the argocd CLI login or an opt-in read-only token (#928)
+- *(logs)* Logs of the checked rows across namespaces and clusters (#925)
+- *(agents)* The audit log records the client and Secret reveals, with filters (#922)
+- *(agents)* Rules tell an Argo CD sync and refresh from a patch (#923)
+- *(argo)* Sync with prune preview, dry run and chosen resources, terminate a sync, roll back (#913)
+- *(agents)* Approvals reach you when the window is hidden, macOS included (#919)
+- *(agents)* Copyable configs for Codex, Cursor, VS Code, Gemini CLI and Zed (#879)
+- *(settings)* API requests counts the bytes of shells, attach and port-forwards (#876)
+- *(app)* One command list behind the palette, the ? panel and Settings -> Shortcuts (#908)
+- *(app)* What's new after an update, and how to update for each install (#895)
+- *(agents)* The approval banner shows what will change, and the audit log keeps it (#882)
+- *(mcp)* Refusals name the rule that would allow the call, and a check_access tool (#911)
+- *(app)* Reopen where you left off (#906)
+- *(argo)* The Application page lists its resources (#880)
+- *(mcp)* A recent_changes tool gives agents the Timeline (#881)
+- *(app)* Cmd shortcuts, Cmd+Q and a menu bar on macOS (#899)
+
+### Documentation
+
+- Backticks around a bare <resource> in a doc comment (#1022)
+
+### Fixed
+
+- *(links)* Open only http(s) links, through the platform's opener (#1025)
+- *(discovery)* Name the add-on api groups that didn't answer, and keep saved tabs on their types (#996)
+- *(login)* A URL password with an unescaped /, ? or # no longer shows in error texts (#1015)
+- *(config)* Write symlinked config files through the link (#983)
+- *(problems)* Services that select no pod by design are not problems (#1002)
+- *(table)* The pods table fits the default window (#991)
+- *(ui)* Name the config and data folders in use (#988)
+- *(overview)* Requested counts only pods bound to a node (#985)
+- *(approvals)* A click never lands on what moved under a banner, and dialogs don't block it (#995)
+- *(agents)* Say Claude Code is connected only when its entry reaches this server (#984)
+- *(login)* A proxy password with an unescaped /, ? or # no longer shows in the connect error (#986)
+- *(config)* A kubeconfig file with a UTF-16 byte order mark and an odd length no longer crashes the app (#989)
+- *(mcp)* An object's argo cd application is read without waiting on hubs that are down (#966)
+- *(agents)* Approving an argo cd sync makes no rule, and an unwritable rules.yaml still loads (#933)
+- *(agents)* Rules.yaml says its own version, so an old file is upgraded whatever agents.json says (#947)
+- *(app)* The writes-on badge no longer covers the search field's shortcut hint (#937)
+- *(app)* A partial connect or a second window doesn't save over a session (#916)
+- *(mcp)* A custom resource applied right after its CRD is known at once (#914)
+- *(theme)* Light-theme status colors reach WCAG AA, with a contrast test (#894)
+- *(mcp)* Apply_manifest accepts FlowSchemas (#888)
+
+### Performance
+
+- *(mcp)* Agents' wide list_resources and search read from the API server's cache (#997)
+- *(app)* Each cluster connects on its own, and the first list starts alongside discovery (#998)
+- *(lists)* Big lists finish from the cells list alone (#976)
+- *(lists)* Recently used lists keep their watches (#960)
+- *(problems)* One scan per cluster, shared by the badge, the page, every window and agents (#926)
+- *(timeline)* "All events" stops re-reading every event at each refresh (#886)
+- *(details)* Detail pages follow their object with watches instead of polling (#896)
+- *(overview)* The Workloads overview reads only the fields it shows (#885)
+- *(metrics)* Usage bars and the cluster overview stop re-reading every whole pod (#883)
+- *(assistant)* Cache the tool definitions and system prompt, and show refusals (#874)
+- *(problems)* The scan's memory stays close to a list's (#884)
+
 ## [0.10.0](https://github.com/nahuel11500/recouvrance/compare/v0.9.0...v0.10.0) - 2026-11-22
 
 ### Added
