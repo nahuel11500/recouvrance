@@ -641,7 +641,9 @@
 - **Logs**: find (regex, match case, next/previous) on top of the filter (`!word` excludes).
 - **Tables**: column expressions in the filter (`status:Running restarts>3 cpu>200m age<1h`), hidden
   columns included (`ip:10.4.2.17`), filter history and saved searches, links from cells to the
-  objects they name, click a namespace to filter, CSV export, tabs.
+  objects they name, click a namespace to filter, CSV export, tabs. A big list in every namespace
+  is read without its objects' labels; a filter on labels (`app=web`) loads them once, and the bar
+  says "Loading labels…" meanwhile.
 - **Port-forwards** with options: local port, listen address, https, open in the browser; they follow
   replacement pods.
 - **Per-cluster settings**: Prometheus or VictoriaMetrics endpoint, node shell image, accessible
