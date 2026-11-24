@@ -175,6 +175,11 @@ Tools, by what they do:
   `cordon_node`, `uncordon_node`, `drain_node`, `gitops`, `exec_command`, `debug_pod`,
   `port_forward`, `stop_port_forward`.
 
+`find_problems` answers from the Problems scan the app shares with its windows (the sidebar count,
+the Problems page) while that scan is recent, 2 minutes or more on a big cluster, and says how old
+it is; otherwise it runs one, which the windows then show too. `max_age_seconds` sets the oldest
+answer it takes: 0 scans again, to check a fix. Its findings still go through the agent's rules.
+
 Each tool tells the agent's client whether it only reads (`readOnlyHint`): the tools under **Read**
 say so, except `browse_files`, which may add a debug container; the changes don't. Of those that may
 change something, `debug_pod`, `port_forward` and `browse_files` only add (`destructiveHint: false`).
@@ -264,7 +269,8 @@ tools' definitions. What some of them need beyond the obvious verb:
   its object, an event only where one gives `list` on events, and what it leaves out is counted
   (`get_changes` asks, for one object); `my_permissions` says so. The reply says how far back the
   records go and that only what the window watched is recorded (`recouvrance serve` records
-  nothing itself).
+  nothing itself). Of the events, the newest 20,000 are read, as the Timeline holds them; when
+  the cluster keeps more and older ones fall in the range asked, the reply says so.
 - **Reachability:** `check_reachability` follows the path a request takes to a Service, an Ingress
   or an HTTPRoute and names the first step that breaks, with the `kubectl` command to see it (the
   Reachability tab's checks). It needs `get` on the object, then reads what the path goes through

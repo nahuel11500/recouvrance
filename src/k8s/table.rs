@@ -719,7 +719,7 @@ impl Pause {
 const SNAPSHOT_EVERY: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// While paused, how often to check whether the list is shown again.
-const PAUSED_POLL: std::time::Duration = std::time::Duration::from_millis(500);
+pub(super) const PAUSED_POLL: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// When the rows changed since the last snapshot, and when that was sent.
 #[derive(Default)]

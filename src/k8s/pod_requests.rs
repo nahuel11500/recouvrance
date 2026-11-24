@@ -344,7 +344,8 @@ const SEND_AWAY_EVERY: Duration = Duration::from_secs(30);
 
 /// How long the watch goes on while its page is off screen. Back sooner, the pods are current
 /// at once; later, they are listed again (watching every pod has a cost too: its events).
-const LINGER: Duration = Duration::from_secs(5 * 60);
+/// A kept pods list is kept as long (`app::kept_lists::KEPT_FOR`), so it comes back with them.
+pub(crate) const LINGER: Duration = Duration::from_secs(5 * 60);
 
 /// How often the watch looks at its page and its reader when no event comes.
 const TICK: Duration = Duration::from_secs(1);

@@ -4,7 +4,8 @@
 //! mapped to a kubeconfig context and when it can sync next. Opening one, or a service, shows
 //! the dashboard of its service, a tab per environment (see `dashboard`); its menu opens its
 //! page on Argo CD's cluster (or in Argo CD's web UI, when read by the API), refreshes or
-//! syncs it.
+//! syncs it. Applications picked together (`grouped`) are diffed at once, the same change in
+//! several of them shown once.
 //!
 //! A hub's Applications are read again at the refresh rate; an API server's are kept live
 //! from Argo CD's stream (see `k8s::argo::api`). Both stop while no window shows the page.
@@ -16,6 +17,7 @@ use std::time::{Duration, Instant};
 
 use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::component::button::{Button, ButtonVariants};
+use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::{ActiveTheme as _, Disableable as _, Icon, Sizable as _, h_flex, v_flex};
@@ -33,6 +35,7 @@ use crate::overview::column_cell as column;
 use crate::status::Tone;
 
 mod dashboard;
+mod grouped;
 
 // MARK: Grouping
 
@@ -472,6 +475,15 @@ pub struct ArgoView {
     check: crate::latest::Latest,
     /// The dashboard of a service, shown instead of the list while it is open.
     dashboard: Option<dashboard::Dashboard>,
+    /// The Applications picked, by Argo CD, namespace and name (see `grouped`); how many of
+    /// them the filter keeps, and how many it hides.
+    selected: HashSet<Key>,
+    picked: usize,
+    picked_hidden: usize,
+    /// Which Applications (by index in the rows) the filter keeps.
+    keeps: Vec<bool>,
+    /// The grouped diff of the Applications picked, shown instead of the list while open.
+    grouped: Option<grouped::GroupedDiff>,
     _subs: Vec<Subscription>,
 }
 
@@ -586,6 +598,11 @@ impl ArgoView {
             check_note: None,
             check: Default::default(),
             dashboard: None,
+            selected: HashSet::new(),
+            picked: 0,
+            picked_hidden: 0,
+            keeps: Vec::new(),
+            grouped: None,
             _subs: subs,
         }
     }
@@ -748,6 +765,8 @@ impl ArgoView {
             self.kept = 0;
             self.starred.clear();
             self.starred_count = 0;
+            self.keeps.clear();
+            (self.picked, self.picked_hidden) = (0, 0);
             return;
         };
         let apps = &rows.fleet.apps;
@@ -780,6 +799,8 @@ impl ArgoView {
             Line::App(s) => starred[s.ix],
             Line::Service(g) => rows.services[*g].1.iter().any(|&i| starred[i]),
         });
+        self.keeps = keeps;
+        self.recount_picked();
     }
 
     fn change_filter(&mut self, change: impl FnOnce(&mut Filter), cx: &mut Context<Self>) {
@@ -914,6 +935,12 @@ impl ArgoView {
         let grouped = self.group_by == GroupBy::Parent && rows.children[s.ix] > 0;
         let collapsed = self.collapsed.contains(&k);
         let starred = self.starred.get(s.ix).copied().unwrap_or_default();
+        let pick = {
+            let (view, k) = (view.clone(), k.clone());
+            Checkbox::new(("argo-pick", i)).checked(self.selected.contains(&k)).on_click(move |_: &bool, _, cx| {
+                let _ = view.update(cx, |this, cx| this.toggle_pick(k.clone(), cx));
+            })
+        };
         let star = {
             let (view, k) = (view.clone(), k.clone());
             div()
@@ -972,7 +999,7 @@ impl ArgoView {
             .on_click(open)
             .child(
                 h_flex()
-                    .w(px((NAME - indent - 24.).max(120.)))
+                    .w(px((NAME - indent - 48.).max(120.)))
                     .flex_none()
                     .gap_1p5()
                     .overflow_hidden()
@@ -1030,6 +1057,7 @@ impl ArgoView {
             .border_color(theme.border)
             .hover(|s| s.bg(theme.list_hover))
             .when(s.context_only, |d| d.opacity(0.55))
+            .child(div().w(px(20.)).flex_none().child(pick))
             .child(div().w(px(indent)).flex_none())
             .child(div().w(px(20.)).flex_none().when(grouped, |d| d.child(toggle)))
             .child(opener)
@@ -1038,6 +1066,7 @@ impl ArgoView {
                 matches!(a.source, Source::Api(_)),
                 a.on.is_some() && !a.dest.namespace.is_empty(),
                 Offers::of(app),
+                grouped.then_some(s.ix),
                 view,
             )))
             .into_any_element()
@@ -1056,6 +1085,14 @@ impl ArgoView {
                 let service = service.clone();
                 let _ = view.update(cx, |this, cx| this.toggle_service(service, cx));
             }
+        };
+        let pick = {
+            let view = view.clone();
+            Checkbox::new(("argo-pick-service", i)).checked(self.group_picked(g, true)).on_click(
+                move |_: &bool, _, cx| {
+                    let _ = view.update(cx, |this, cx| this.pick_group(g, true, cx));
+                },
+            )
         };
         let open = move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
             let _ = view.update(cx, |this, cx| this.open_service(g, cx));
@@ -1077,6 +1114,7 @@ impl ArgoView {
             .border_color(theme.border)
             .bg(theme.muted)
             .cursor_pointer()
+            .child(div().w(px(20.)).flex_none().child(pick))
             .child(
                 div().id(("argo-service-fold", i)).w(px(20.)).flex_none().on_click(flip).child(
                     Icon::new(if collapsed { Lucide::ChevronRight } else { Lucide::ChevronDown })
@@ -1111,7 +1149,7 @@ impl ArgoView {
             .text_color(cx.theme().muted_foreground)
             .border_b_1()
             .border_color(cx.theme().border)
-            .child(div().w(px(NAME + 4.)).flex_none().child("Application"))
+            .child(div().w(px(NAME + 4.)).flex_none().pl(px(24.)).child("Application"))
             .child(cell(130., true, "Project"))
             .child(cell(90., false, "Sync"))
             .child(cell(100., false, "Health"))
@@ -1315,13 +1353,15 @@ impl Offers {
 }
 
 /// A row's menu: open it (in Argo CD's web UI when read by its API) or where it deploys,
-/// refresh, hard refresh, sync, terminate, roll back. Its actions find the Application
-/// again by its key: the list may have been read again since it was drawn.
+/// pick it with the Applications under it (`group`: its index, when it made some), refresh,
+/// hard refresh, sync, terminate, roll back. Its actions find the Application again by its
+/// key: the list may have been read again since it was drawn.
 fn row_menu(
     k: &Key,
     by_api: bool,
     has_destination: bool,
     offers: Offers,
+    group: Option<usize>,
     view: WeakEntity<ArgoView>,
 ) -> impl IntoElement {
     let k = k.clone();
@@ -1345,6 +1385,14 @@ fn row_menu(
                 let _ = view.update(cx, |this, cx| this.open_destination(&k, cx));
             }
         };
+        let pick_group = {
+            let view = view.clone();
+            move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
+                if let Some(ix) = group {
+                    let _ = view.update(cx, |this, cx| this.pick_group(ix, false, cx));
+                }
+            }
+        };
         let act = |action: ArgoAction| {
             let (view, k) = (view.clone(), k.clone());
             move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
@@ -1356,15 +1404,21 @@ fn row_menu(
         } else {
             PopupMenuItem::new("Open").icon(Lucide::PanelRightOpen)
         };
-        menu.item(PopupMenuItem::new("Dashboard").icon(Lucide::LayoutDashboard).on_click(board))
+        let menu = menu
+            .item(PopupMenuItem::new("Dashboard").icon(Lucide::LayoutDashboard).on_click(board))
             .item(open_item.on_click(open))
             .item(
                 PopupMenuItem::new("Open destination namespace")
                     .icon(Lucide::FolderOpen)
                     .disabled(!has_destination)
                     .on_click(destination),
-            )
-            .separator()
+            );
+        let menu = if group.is_some() {
+            menu.item(PopupMenuItem::new("Pick the group").icon(Lucide::ListChecks).on_click(pick_group))
+        } else {
+            menu
+        };
+        menu.separator()
             .item(PopupMenuItem::new("Refresh…").icon(Lucide::RefreshCw).on_click(act(ArgoAction::Refresh)))
             .item(
                 PopupMenuItem::new("Hard refresh…").icon(Lucide::RefreshCcwDot).on_click(act(ArgoAction::HardRefresh)),
@@ -1387,6 +1441,9 @@ fn row_menu(
 
 impl Render for ArgoView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.grouped.is_some() {
+            return v_flex().size_full().p_2().child(self.grouped_view(cx));
+        }
         if self.dashboard.is_some() {
             return v_flex().size_full().p_2().child(self.dashboard_view(cx));
         }
@@ -1405,6 +1462,7 @@ impl Render for ArgoView {
                 v_flex()
                     .size_full()
                     .child(div().px_2().pb_2().text_sm().child(summary))
+                    .child(div().pb_1().child(self.selection_bar(cx)))
                     .child(self.header(cx))
                     .child(
                         // Only the rows on screen are laid out: a hub can hold hundreds of Applications.

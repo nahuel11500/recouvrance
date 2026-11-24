@@ -61,20 +61,21 @@ where
 /// The objects at `url` that `lp` selects, parsed into `T` (only the wanted fields are ever
 /// held), a page of `lp.limit` items at a time (`LEAN_PAGE` when unset), each page given to
 /// `page` as soon as it is read: a caller keeps only what it needs of them. Every page is
-/// read, to the last `continue` token. For work already on the runtime (`run`).
+/// read, to the last `continue` token; the list's resourceVersion (to watch from) comes back.
+/// For work already on the runtime (`run`).
 pub(super) async fn each_lean_page<T: serde::de::DeserializeOwned>(
     client: &Client,
     url: &str,
     mut lp: ListParams,
     mut page: impl FnMut(Vec<T>),
-) -> Result<()> {
+) -> Result<String> {
     lp.limit = lp.limit.or(Some(LEAN_PAGE));
     loop {
         let list: LeanList<T> = request_idle(client, Request::new(url).list(&lp)?).await?;
         page(list.items);
         match list.metadata.continue_.filter(|c| !c.is_empty()) {
             Some(token) => lp.continue_token = Some(token),
-            None => return Ok(()),
+            None => return Ok(list.metadata.resource_version.unwrap_or_default()),
         }
     }
 }
