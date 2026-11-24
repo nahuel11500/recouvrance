@@ -26,7 +26,7 @@ use crate::k8s::{self, Kind, ObjectRef};
 use crate::status::Tone;
 
 /// A sync still running after this long is stuck.
-const STUCK_AFTER: i64 = 10 * 60;
+pub(crate) const STUCK_AFTER: i64 = 10 * 60;
 /// An Application still there this long after its deletion was asked is held.
 const DELETE_STUCK_AFTER: i64 = 5 * 60;
 /// This many syncs of the same revision in `LOOP_WINDOW` make a loop...
