@@ -738,16 +738,19 @@ mod tests {
 
     #[test]
     fn why_a_pod_has_no_node() {
-        let base = |extra: Value| {
-            let mut p = pod("a", "p", "1", "1", "1Gi", "Pending");
+        let base = |name: &str, extra: Value| {
+            let mut p = pod("a", name, "1", "1", "1Gi", "Pending");
             p["spec"].as_object_mut().unwrap().remove("nodeName");
             json_merge(&mut p, extra);
             p
         };
-        let gated = base(json!({"spec": {"schedulingGates": [{"name": "example.com/quota"}]}}));
-        let refused = base(json!({"status": {"conditions": [
-            {"type": "PodScheduled", "status": "False", "reason": "Unschedulable"}]}}));
-        let mut gpu = base(json!({}));
+        let gated = base("gated", json!({"spec": {"schedulingGates": [{"name": "example.com/quota"}]}}));
+        let refused = base(
+            "refused",
+            json!({"status": {"conditions": [
+            {"type": "PodScheduled", "status": "False", "reason": "Unschedulable"}]}}),
+        );
+        let mut gpu = base("gpu", json!({}));
         gpu["spec"]["containers"][0]["resources"]["limits"]["nvidia.com/gpu"] = json!("2");
         let totals = PodAllocs::from_items(&json!([gated, refused, gpu])).totals();
         assert_eq!((totals.gated, totals.unscheduled, totals.unschedulable), (1, 2, 1));
