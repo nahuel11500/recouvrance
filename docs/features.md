@@ -241,19 +241,48 @@
   ticked in Settings → Contexts (*Argo CD*; see
   [configuration](configuration.md#argo-cd-hub-argocd_contexts)).
 - **Argo CD page** (sidebar → *Argo CD*): every Application of every context that serves Argo
-  CD, read with one list per Argo CD cluster: name, project, sync, health, revision, destination
+  CD, read with one list per Argo CD cluster, and of every Argo CD API server the argocd CLI is
+  logged in to or set in Settings → Argo CD (no kubeconfig for Argo CD's cluster needed: see
+  [configuration](configuration.md#argo-cd-by-its-api-argocd_api_servers)): name, project, sync, health, revision, destination
   (the kubeconfig context whose API server is the Application's `destination.server`, and its
-  namespace), auto-sync, last sync and its result. Applications sit under the app of apps that
-  made them (its tracking id, the parent listing them among its resources, or the instance
-  label), with how many they hold and how many of those are red; groups fold. Filters: out of
-  sync, Degraded, failed sync (any of those picked), project, destination context, and a search.
+  namespace), auto-sync, the next time it can sync, last sync and its result. *Next sync* reads
+  its project's sync windows (`allow` and `deny`, their cron schedule, duration and time zone, the
+  windows applying by name, namespace or cluster): *no window*, *now*, *in 5h*, or *not within 8
+  days*; auto-sync is held by every window that applies, a manual sync goes through those with
+  `manualSync`. Applications sit under the app of apps that made them (its tracking id, the parent
+  listing them among its resources, or the instance label), with how many they hold and how many
+  of those are red; or, grouped by service, under a heading per service with its environments
+  (the value of a label chosen in Settings → Argo CD, else the name without its environment:
+  `shop-prod`, `shop-staging` and `shop-prod-eu` are `shop`), how many are synced and red; or not
+  grouped. Groups fold. Filters: out of sync, Degraded, failed sync (any of those picked),
+  project, destination context, sync status, health, auto-sync, labels (picked from those the
+  Applications have, all required), and a search, each word in turn, where `key=value` is a label
+  (`key=` any value of it). An Application read both from its hub and by Argo CD's API (the hub's
+  Argo CD server set in Settings → Per cluster is that API server) shows once, as read on its hub:
+  the same Argo CD, namespace and name.
   Red is for a failed sync, an error Argo CD reports or Degraded health: an Application with
   auto-sync off that is out of sync (a `*-workload` one synced by hand) is not red. A click opens
   the Application's page, which links to its destination namespace (connecting to that context
   when it isn't); the row menu also opens the destination and asks for *Refresh*, *Hard refresh*,
   *Sync*, *Terminate* (while an operation runs) or *Roll back to the previous deployment* (auto-sync
-  off) (write mode and the Argo CD cluster's protection apply). An Argo CD cluster that can't be
-  read is named above the list; the others are shown.
+  off) (write mode and the Argo CD cluster's protection apply). An Argo CD cluster or server that
+  can't be read is named above the list; the others are shown.
+- **Argo CD by its API**: Applications are read from Argo CD's own API, with the argocd CLI's
+  login (`argocd login`, its contexts, servers and tokens; `--insecure`, `--plaintext` to this
+  machine and `--grpc-web-root-path` are honoured, `--core` contexts have no server) or a token
+  set in Settings → Argo CD. Argo CD's application stream is opened first, then one list (`GET
+  /api/v1/applications`, only the fields the page shows), what the stream sent meanwhile applied
+  over it: no change is lost between the two. The stream keeps them live, opened again with a
+  backoff (1 s doubling to 60 s) when it ends: nothing is polled, and nothing is read while no
+  window shows the page. The sync windows come from one list of the projects, read again every 5
+  minutes (or each project, when they can't be listed). *Next sync* is worked out once a minute,
+  once for each set of windows.
+  A row's click opens the Application in Argo CD's web UI; its menu's *Refresh*, *Hard refresh*,
+  *Sync* (of the whole Application, with its own sync options), *Terminate* and *Roll back* go
+  through the same API, need write mode when they are sent, and are confirmed like a protected
+  context's (the server's name typed, or a wait). Settings → Argo CD lists the servers, says how
+  each logs in, tests one (who the token is, Argo CD's version, how many Applications it may
+  read), turns one off, and never shows a token.
 - **Argo CD sync, terminate and roll back**: *Sync* (the Application's page, its row menu, the
   Argo CD panel) reads the Application first and lists its resources out of sync, all ticked:
   untick some to sync only the others (hooks run only when all are synced; past 200 the whole
