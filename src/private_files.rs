@@ -15,7 +15,12 @@ pub fn create_dir(dir: &Path) -> io::Result<()> {
 /// Replace `path` atomically with a file only the user can read: a fresh temporary file
 /// next to it (never one someone else prepared, or left over with looser permissions),
 /// written, flushed, then renamed over it. A crash never leaves half a file.
+///
+/// A symlink at `path` (a dotfiles repo, stow, home-manager) is written through: the file
+/// it leads to is replaced, next to itself, and the link stays a link. Renaming over the
+/// link would turn it into a regular file, and later edits where it pointed wouldn't be read.
 pub fn write_atomic(path: &Path, contents: &[u8]) -> io::Result<()> {
+    let path = &through_links(path)?;
     let dir = path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
     create_dir(dir)?;
     let name = path.file_name().ok_or_else(|| io::Error::other("no file name"))?.to_string_lossy();
@@ -31,6 +36,26 @@ pub fn write_atomic(path: &Path, contents: &[u8]) -> io::Result<()> {
         let _ = std::fs::remove_file(&tmp);
     }
     written
+}
+
+/// Where `path` leads once its symlinks are followed (a relative target from the link's
+/// folder), or `path` itself when it is not a link. A link to nothing yet leads to where
+/// its target would be, so writing creates the target and keeps the link.
+pub fn through_links(path: &Path) -> io::Result<PathBuf> {
+    let mut at = path.to_path_buf();
+    // As many links as Linux follows before ELOOP.
+    for _ in 0..40 {
+        match std::fs::symlink_metadata(&at) {
+            Ok(m) if m.file_type().is_symlink() => {
+                let target = std::fs::read_link(&at)?;
+                // An absolute target replaces the folder when joined.
+                at = at.parent().map_or_else(|| target.clone(), |dir| dir.join(&target));
+            }
+            Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
+            _ => return Ok(at),
+        }
+    }
+    Err(io::Error::other(format!("{}: too many levels of symbolic links", path.display())))
 }
 
 /// A new file, mode 0600; fails if anything (a file, a symlink) is already at `path`.
@@ -152,6 +177,7 @@ pub fn save_new(dir: &Path, stem: &str, ext: &str, contents: &[u8]) -> io::Resul
 mod tests {
     use std::io::Write as _;
     use std::os::unix::fs::PermissionsExt as _;
+    use std::os::unix::fs::symlink;
 
     use super::{PrivateDir, TempFile, create_new_in, numbered, save_new, write_atomic};
 
@@ -217,5 +243,51 @@ mod tests {
         assert_eq!(mode(p.parent().unwrap()), 0o700);
         // No temporary file left behind.
         assert_eq!(std::fs::read_dir(p.parent().unwrap()).unwrap().count(), 1);
+    }
+
+    /// A config file kept as a symlink (into a dotfiles repo) stays one when written: the
+    /// file it leads to gets the contents, whether the link is relative, absolute, chained,
+    /// or leads to nothing yet. A link loop is refused rather than replaced.
+    #[test]
+    fn atomic_writes_go_through_symlinks() {
+        let is_link = |p: &std::path::Path| std::fs::symlink_metadata(p).unwrap().file_type().is_symlink();
+        let dir = PrivateDir::create().unwrap();
+        let (config, repo) = (dir.path().join("config"), dir.path().join("dotfiles"));
+        std::fs::create_dir_all(&config).unwrap();
+        std::fs::create_dir_all(&repo).unwrap();
+        let target = repo.join("rules.yaml");
+        std::fs::write(&target, b"old").unwrap();
+        let cases = [
+            (config.join("relative.yaml"), std::path::PathBuf::from("../dotfiles/rules.yaml")),
+            (config.join("absolute.yaml"), target.clone()),
+        ];
+        for (link, to) in &cases {
+            symlink(to, link).unwrap();
+            write_atomic(link, link.to_string_lossy().as_bytes()).unwrap();
+            assert!(is_link(link), "{}", link.display());
+            assert_eq!(std::fs::read(&target).unwrap(), link.to_string_lossy().as_bytes());
+            assert_eq!(mode(&target), 0o600);
+        }
+        // A link to a link.
+        let chained = config.join("chained.yaml");
+        symlink("absolute.yaml", &chained).unwrap();
+        write_atomic(&chained, b"chained").unwrap();
+        assert!(is_link(&chained) && is_link(&config.join("absolute.yaml")));
+        assert_eq!(std::fs::read(&target).unwrap(), b"chained");
+        // A link whose target isn't there yet: the target is created.
+        let dangling = config.join("new.json");
+        symlink("../dotfiles/new.json", &dangling).unwrap();
+        write_atomic(&dangling, b"{}").unwrap();
+        assert!(is_link(&dangling));
+        assert_eq!(std::fs::read(repo.join("new.json")).unwrap(), b"{}");
+        // No temporary file left in either folder.
+        assert_eq!(std::fs::read_dir(&repo).unwrap().count(), 2);
+        assert_eq!(std::fs::read_dir(&config).unwrap().count(), 4);
+        // A loop is refused, and left as it was.
+        let (a, b) = (config.join("a"), config.join("b"));
+        symlink("b", &a).unwrap();
+        symlink("a", &b).unwrap();
+        assert!(write_atomic(&a, b"x").is_err());
+        assert!(is_link(&a) && is_link(&b));
     }
 }

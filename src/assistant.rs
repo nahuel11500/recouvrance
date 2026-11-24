@@ -251,8 +251,9 @@ fn url_port(url: &str) -> Option<u16> {
 /// A URL's scheme, host and port only: its path, query and any credentials are not shown.
 fn url_origin(url: &str) -> String {
     let (scheme, rest) = url.split_once("://").unwrap_or(("", url));
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
-    let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    // Past the user and password first: they may hold a `/`, `?` or `#` (#1000).
+    let rest = crate::k8s::userinfo_end(rest).map_or(rest, |end| &rest[end..]);
+    let host = rest.split(['/', '?', '#']).next().unwrap_or("");
     if scheme.is_empty() { host.to_string() } else { format!("{scheme}://{host}") }
 }
 
@@ -1015,6 +1016,17 @@ mod tests {
             judge(&entry("https://user:pw@example.com:47199/mcp?key=s3cret", &bearer(&current))),
             Stale("Claude Code points at https://example.com:47199".into())
         );
+        // Even with a `/`, `?` or `#` in the password (#1000).
+        for url in [
+            "https://user:p/w@example.com:47199/mcp",
+            "https://user:p?w@example.com:47199",
+            "https://user:p#w@example.com:47199",
+        ] {
+            assert_eq!(
+                judge(&entry(url, &bearer(&current))),
+                Stale("Claude Code points at https://example.com:47199".into())
+            );
+        }
         assert!(matches!(judge(&format!("recouvrance:\n  Type: http\n  URL: {here}\n")), Stale(_)));
         assert!(matches!(judge("recouvrance:\n  Type: stdio\n  Command: npx\n"), Stale(_)));
         assert!(matches!(judge(&format!("recouvrance:\n  Type: sse\n  URL: {here}\n")), Stale(_)));
