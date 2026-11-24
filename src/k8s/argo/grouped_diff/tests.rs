@@ -226,9 +226,10 @@ fn reads_run_a_few_at_a_time_and_one_failing_spares_the_others() {
 #[test]
 fn a_diff_is_kept_by_application_and_version() {
     let reads = AtomicUsize::new(0);
-    let read = || {
+    // Counted when it runs: a read kept is never awaited.
+    let read = || async {
         reads.fetch_add(1, Ordering::SeqCst);
-        async { Ok::<_, String>(Arc::new(AppDiff::default())) }
+        Ok::<_, String>(Arc::new(AppDiff::default()))
     };
     let key = |v: &str| ("argocd.example.com".to_string(), "argocd".to_string(), "kept-web".to_string(), v.to_string());
     let run = |k, f| futures::executor::block_on(cached(k, f));
