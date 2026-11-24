@@ -403,7 +403,7 @@ fn state(item: &Value, key: &str) -> Value {
 }
 
 /// The fields a diff shows: not the status (Argo CD doesn't sync it) nor the field managers.
-fn cleaned(mut v: Value) -> Value {
+pub(super) fn cleaned(mut v: Value) -> Value {
     if let Some(o) = v.as_object_mut() {
         o.remove("status");
     }

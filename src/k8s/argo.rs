@@ -23,6 +23,7 @@ use crate::status::Tone;
 pub mod api;
 pub mod dashboard;
 pub mod diagnosis;
+pub mod grouped_diff;
 pub mod grouping;
 pub mod ops;
 pub mod server;
@@ -1039,6 +1040,13 @@ pub struct FleetApp {
     pub on: Option<String>,
     /// The Application that made it (an app of apps), as an index in the fleet.
     pub parent: Option<usize>,
+    /// Its resourceVersion when read (empty when unknown): what its diff is kept under.
+    pub version: String,
+}
+
+/// An Application's resourceVersion, empty when it has none.
+fn resource_version(app: &Value) -> String {
+    app.pointer("/metadata/resourceVersion").and_then(Value::as_str).unwrap_or_default().to_string()
 }
 
 /// Every Application of every hub, and why some hubs could not be read.
@@ -1126,6 +1134,7 @@ async fn read_fleet(connected: Vec<(String, Client)>) -> Fleet {
                 dest,
                 on,
                 parent: parent.map(|p| base + p),
+                version: resource_version(app),
             });
         }
     }
@@ -1244,6 +1253,7 @@ pub fn add_api(
                 dest,
                 on,
                 parent: parent.map(|p| index(plan[p])),
+                version: resource_version(&a.value),
             });
         }
     }
@@ -1283,6 +1293,7 @@ mod tests {
             dest: Destination::default(),
             on: None,
             parent: None,
+            version: String::new(),
         }
     }
 

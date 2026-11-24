@@ -11,7 +11,7 @@ use kube::api::{Api, ListParams, LogParams};
 use kube::{Client, Resource as _};
 use serde::Deserialize;
 
-use super::{ObjectRef, TaskGuard, age, api_status, lists, names, run, run_abortable, short_error, spawn_guarded};
+use super::{ObjectRef, TaskGuard, age, api_status, lists, names, run, short_error, spawn_guarded};
 
 pub async fn logs_text(
     client: Client,
@@ -47,6 +47,7 @@ const MAX_LINE_BYTES: usize = 64 << 10;
 /// Marks a line that was cut at `MAX_LINE_BYTES`.
 const CUT_MARK: &str = " …[line cut]";
 
+#[derive(Clone)]
 pub struct EventLine {
     /// The Event object's own namespace and name.
     pub namespace: Option<String>,
@@ -95,8 +96,8 @@ pub async fn events_for(client: Client, obj: ObjectRef) -> Result<Vec<EventLine>
 /// skipped while parsing, never held. A cluster can keep tens of thousands of events.
 #[derive(Default, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
-struct LeanEvent {
-    metadata: LeanEventMeta,
+pub(super) struct LeanEvent {
+    pub(super) metadata: LeanEventMeta,
     involved_object: EventObject,
     #[serde(rename = "type")]
     type_: Option<String>,
@@ -113,10 +114,12 @@ struct LeanEvent {
 
 #[derive(Default, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
-struct LeanEventMeta {
+pub(super) struct LeanEventMeta {
     name: Option<String>,
     namespace: Option<String>,
     creation_timestamp: Option<Time>,
+    /// Where a watch goes on from (a bookmark has nothing else).
+    pub(super) resource_version: Option<String>,
 }
 
 /// The object an event is about.
@@ -165,6 +168,7 @@ fn event_source(e: &LeanEvent) -> String {
 
 /// An event of a cluster, with the object it is about: the events of one object with the
 /// same type and reason as one (see `grouped`).
+#[derive(Clone)]
 pub struct ClusterEvent {
     /// The latest of them, its count their counts added up.
     pub line: EventLine,
@@ -191,7 +195,8 @@ impl ClusterEvent {
 }
 
 /// The events of one object with the same type and reason as one: the latest one's message
-/// and time, their counts added up, in the order each was first met. A pod that can't be
+/// and time (of two at the same second, the one named last: the same one whatever the order
+/// they come in), their counts added up, in the order each was first met. A pod that can't be
 /// scheduled gets a new Event each time the message changes (`0/12 nodes are available…`),
 /// and dozens of them would bury everything else.
 pub fn grouped(events: impl IntoIterator<Item = ClusterEvent>) -> Vec<ClusterEvent> {
@@ -214,7 +219,7 @@ pub fn grouped(events: impl IntoIterator<Item = ClusterEvent>) -> Vec<ClusterEve
                     (Some(a), Some(b)) => Some(a.min(b)),
                     (a, b) => a.or(b),
                 };
-                if e.line.last > g.line.last {
+                if (e.line.last, &e.line.name) > (g.line.last, &g.line.name) {
                     g.line = e.line;
                 }
                 g.line.count = count;
@@ -230,35 +235,8 @@ pub fn grouped(events: impl IntoIterator<Item = ClusterEvent>) -> Vec<ClusterEve
     out
 }
 
-/// Events read per request: one request brings every Warning of most clusters.
-const EVENTS_PAGE: u32 = 5000;
-
-/// The events of a cluster (or one namespace): its Warnings, or every event when `normal`.
-/// Every page is read: the API server lists events by namespace and name, never by time, so
-/// stopping after the first page would leave out the namespaces late in the alphabet. Each
-/// page is made into rows as it comes, so only what they show is held. Those of one object
-/// with the same type and reason come as one (`grouped`). Dropping the future stops it.
-pub async fn recent_events(client: Client, namespace: Option<String>, normal: bool) -> Result<Vec<ClusterEvent>> {
-    run_abortable(async move {
-        let url = Event::url_path(&(), namespace.as_deref());
-        let mut lp = ListParams::default().limit(EVENTS_PAGE);
-        // Every event in one list, not a list per type: the API server goes through all the
-        // events it stores either way, a selector only filters what it sends.
-        if !normal {
-            lp = lp.fields("type=Warning");
-        }
-        let mut events = Vec::new();
-        lists::each_lean_page(&client, &url, lp, |page: Vec<LeanEvent>| {
-            events.extend(page.into_iter().map(cluster_event));
-        })
-        .await?;
-        Ok(grouped(events))
-    })
-    .await
-}
-
 /// An event with the object it is about, as one of a cluster's.
-fn cluster_event(mut e: LeanEvent) -> ClusterEvent {
+pub(super) fn cluster_event(mut e: LeanEvent) -> ClusterEvent {
     let object = std::mem::take(&mut e.involved_object);
     ClusterEvent {
         line: event_line(e),
@@ -297,7 +275,7 @@ pub struct WarningReason {
 
 /// The Warning events of a cluster (or of one namespace) that last happened at `since` or
 /// later, added up by reason, the most frequent first. The API server can't pick events by
-/// time, so every Warning is read, `EVENTS_PAGE` at a time like the Timeline's: kube-apiserver
+/// time, so every Warning is read, `events::EVENTS_PAGE` at a time like the Timeline's: kube-apiserver
 /// keeps no cache of events by default, so each page is a read of etcd, smaller than the whole
 /// list. Each page is added up as it streams in: only the reasons are ever held, however many
 /// events the cluster keeps. A `continue` token that expired midway (410 Gone, etcd compacted
@@ -308,7 +286,7 @@ pub async fn warning_reasons(
     since: jiff::Timestamp,
 ) -> Result<Vec<WarningReason>> {
     let url = Event::url_path(&(), namespace.as_deref());
-    let lp = ListParams::default().fields("type=Warning").limit(EVENTS_PAGE);
+    let lp = ListParams::default().fields("type=Warning").limit(super::events::EVENTS_PAGE);
     let read =
         || lists::fold_lean_pages(client.clone(), url.clone(), lp.clone(), ByReason::since(since), ByReason::add);
     let tally = match read().await {
@@ -917,7 +895,7 @@ mod counts_tests {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeSet, HashMap};
+    use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
 
     use futures::StreamExt as _;
@@ -1103,82 +1081,6 @@ mod tests {
                 serde_json::json!({"kind": "EventList", "apiVersion": "v1", "metadata": metadata, "items": items});
             let response = http::Response::builder().status(200).body(body.to_string().into_bytes().into()).unwrap();
             std::future::ready(Ok(response))
-        }
-    }
-
-    /// More Warnings than one page holds, over namespaces a to z: those of every namespace come
-    /// back, z's too, though the API server lists them by namespace and the first page ends
-    /// before z.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn every_page_of_warnings_is_read() {
-        let cluster = Events::new(200, usize::MAX);
-        let events = super::recent_events(kube::Client::new(cluster.clone(), "default"), None, false).await.unwrap();
-        let namespaces: BTreeSet<&str> = events.iter().filter_map(|e| e.object_namespace.as_deref()).collect();
-        assert_eq!(namespaces.len(), 26, "{namespaces:?}");
-        assert_eq!(events.len(), 26 * 200);
-        assert!(events.iter().all(|e| e.line.kind == "Warning" && e.line.source == "kubelet"));
-        // 5,200 Warnings: two pages, both of Warnings only.
-        let asked = cluster.asked();
-        assert_eq!(asked.len(), 2, "{asked:?}");
-        assert!(asked.iter().all(|q| q.starts_with("/api/v1/events?") && q.contains("fieldSelector=type%3DWarning")));
-    }
-
-    /// With Normal events shown too, every event of every namespace, in one list; for one
-    /// namespace, its own.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn every_event_when_normal_ones_are_shown_too() {
-        let cluster = Events::new(200, usize::MAX);
-        let client = kube::Client::new(cluster.clone(), "default");
-        let events = super::recent_events(client.clone(), None, true).await.unwrap();
-        assert_eq!(events.len(), 26 * 200 * 2);
-        let in_z = |kind: &str| {
-            events.iter().filter(|e| e.object_namespace.as_deref() == Some("z") && e.line.kind == kind).count()
-        };
-        assert_eq!((in_z("Warning"), in_z("Normal")), (200, 200));
-        // 10,400 events: three pages, with no type asked for.
-        let asked = cluster.asked();
-        assert_eq!(asked.len(), 3, "{asked:?}");
-        assert!(asked.iter().all(|q| !q.contains("fieldSelector")), "{asked:?}");
-        let events = super::recent_events(client, Some("z".into()), false).await.unwrap();
-        assert_eq!(events.len(), 200);
-        assert!(events.iter().all(|e| e.object_namespace.as_deref() == Some("z")));
-        assert!(cluster.asked().last().unwrap().starts_with("/api/v1/namespaces/z/events?"));
-    }
-
-    /// An object's events are read the same lean way, by its uid, newest first.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn an_object_s_events_newest_first() {
-        let cluster = Events::new(3, usize::MAX);
-        let kind = crate::k8s::Kind::fake("", "Pod");
-        let pod = super::ObjectRef { kind, name: "web-1".into(), namespace: Some("z".into()), uid: "z-1".into() };
-        let lines = super::events_for(kube::Client::new(cluster.clone(), "default"), pod).await.unwrap();
-        let read: Vec<(&str, &str)> = lines.iter().map(|l| (l.kind.as_str(), l.name.as_str())).collect();
-        assert_eq!(read, [("Warning", "web-00001.Warning"), ("Normal", "web-00001.Normal")]);
-        let asked = cluster.asked();
-        assert_eq!(asked.len(), 1, "{asked:?}");
-        assert!(asked[0].starts_with("/api/v1/namespaces/z/events?") && asked[0].contains("involvedObject.uid%3Dz-1"));
-    }
-
-    proptest! {
-        #![proptest_config(ProptestConfig::with_cases(48))]
-        /// Every event the API server keeps is read once, however few it sends a page: none
-        /// left out, none twice, and no request more than its pages.
-        #[test]
-        fn every_event_is_read_once(per_namespace in 0usize..8, page in 1usize..60, normal in any::<bool>()) {
-            let cluster = Events::new(per_namespace, page);
-            let client = cluster.clone();
-            let events = futures::executor::block_on(crate::k8s::run(async move {
-                super::recent_events(kube::Client::new(client, "default"), None, normal).await
-            }))
-            .unwrap();
-            let stored = 26 * per_namespace * (1 + usize::from(normal));
-            // Each event is about its own pod, so each is a row of its own.
-            prop_assert_eq!(events.len(), stored);
-            prop_assert_eq!(events.iter().map(|e| e.events).sum::<usize>(), stored);
-            prop_assert!(normal || events.iter().all(|e| e.line.kind == "Warning"));
-            let namespaces: BTreeSet<&str> = events.iter().filter_map(|e| e.object_namespace.as_deref()).collect();
-            prop_assert_eq!(namespaces.len(), if per_namespace == 0 { 0 } else { 26 });
-            prop_assert_eq!(cluster.asked().len(), stored.div_ceil(page).max(1));
         }
     }
 

@@ -318,7 +318,7 @@ impl Fact {
     }
 
     /// Summary order: images first, then pod templates, replicas, env, keys, resources, fields.
-    fn rank(&self) -> u8 {
+    pub fn rank(&self) -> u8 {
         match self {
             Self::Image { .. } => 0,
             Self::Digest { .. } => 1,
@@ -477,14 +477,10 @@ const MASK_CHANGED: &str = "•••••• (changed)";
 const SECRET_FIELDS: [&str; 2] = ["data", "stringData"];
 const LAST_APPLIED: &str = "/metadata/annotations/kubectl.kubernetes.io~1last-applied-configuration";
 
-/// Argo CD hides a Secret's values in what it renders with runs of `+`: two of them say
-/// nothing about whether the values are the same.
-fn hidden_by_argo(v: &Value) -> bool {
-    v.as_str().is_some_and(|s| !s.is_empty() && s.bytes().all(|b| b == b'+'))
-}
-
 /// Mask both sides of a Secret: the keys stay, a value that changed reads as changed, none is
-/// shown; `kubectl apply`'s copy of them is masked the same way.
+/// shown; `kubectl apply`'s copy of them is masked the same way. Argo CD hides a Secret's
+/// values with runs of `+`, the same run for the same value and runs of other lengths for
+/// other values: they are compared as they are, the same only when identical.
 fn masked_secret(before: &Value, after: &Value) -> (Value, Value) {
     let (mut b, mut a) = (before.clone(), after.clone());
     let mask = |x: &mut Value, same: bool| *x = Value::String((if same { MASK } else { MASK_CHANGED }).into());
@@ -493,7 +489,7 @@ fn masked_secret(before: &Value, after: &Value) -> (Value, Value) {
         if let Some(data) = a.get_mut(f).and_then(Value::as_object_mut) {
             for (k, x) in data.iter_mut() {
                 let was = old.and_then(|o| o.get(k));
-                let same = was == Some(&*x) || (was.is_some_and(hidden_by_argo) && hidden_by_argo(x));
+                let same = was == Some(&*x);
                 mask(x, same);
             }
         }
@@ -532,6 +528,10 @@ pub struct ResourceChange {
     /// What changed, each once.
     pub facts: Vec<Fact>,
     pub noise: Vec<Noise>,
+    /// For each fact, a hash of the whole values it was read from (before and after, a
+    /// Secret's masked): two facts without their values (a long value, a ConfigMap's key) are
+    /// the same change only when these are equal.
+    digests: Vec<u64>,
     /// Both sides, a Secret's values masked.
     before: Value,
     after: Value,
@@ -540,8 +540,31 @@ pub struct ResourceChange {
 }
 
 impl ResourceChange {
+    /// Facts read from no value (each digest 0).
+    #[cfg(test)]
     fn new(key: ObjectKey, facts: Vec<Fact>, noise: Vec<Noise>, before: Value, after: Value) -> Self {
-        Self { key, facts, noise, before, after, lines: Default::default() }
+        let digests = vec![0; facts.len()];
+        Self { key, facts, noise, digests, before, after, lines: Default::default() }
+    }
+
+    fn of_found(key: ObjectKey, found: Found, noise: Vec<Noise>, before: Value, after: Value) -> Self {
+        let Found { facts, digests, .. } = found;
+        Self { key, facts, noise, digests, before, after, lines: Default::default() }
+    }
+
+    /// The hash of the values the fact at `i` (of `facts`) was read from; 0 for one read from
+    /// none (a resource added, pruned or renamed).
+    pub fn digest(&self, i: usize) -> u64 {
+        self.digests.get(i).copied().unwrap_or_default()
+    }
+
+    /// How many bytes its lines take, about (once worked out).
+    pub fn lines_bytes(&self) -> usize {
+        let text = |l: &DiffLine| match l {
+            DiffLine::Gap => 0,
+            DiffLine::Same(t) | DiffLine::Removed(t) | DiffLine::Added(t) => t.len(),
+        };
+        self.lines.iter().filter_map(OnceLock::get).flatten().map(|l| text(l) + 32).sum()
     }
 
     /// The diff's lines (only changed lines and some context, `-`/`+`), the noise left out
@@ -635,24 +658,19 @@ fn in_pod_template(path: &[Seg]) -> bool {
 /// regenerated in the same diff, the only generated names folded as noise. When nothing but
 /// noise changed in a pod template, that is a fact: its pods restart (over Argo CD's API a
 /// Secret's values are hidden, so a `checksum/secret` annotation may be all that says it).
-fn classify(key: &ObjectKey, b: &Value, a: &Value, renames: &Renames) -> (Vec<Fact>, Vec<Noise>) {
-    let mut facts: Vec<Fact> = Vec::new();
-    let mut seen: BTreeSet<Fact> = BTreeSet::new();
+fn classify(key: &ObjectKey, b: &Value, a: &Value, renames: &Renames) -> (Found, Vec<Noise>) {
+    let mut facts = Found::default();
     let mut noise = Vec::new();
     let mut template_fact = false;
-    let mut add = |fact: Fact, facts: &mut Vec<Fact>| {
-        if seen.insert(fact.clone()) {
-            facts.push(fact);
-        }
-    };
+    let add = |fact: Fact, leaf: Option<&Leaf>, facts: &mut Found| facts.add(fact, leaf);
     for leaf in leaves(b, a).into_iter().flat_map(|l| split_data(key, l)) {
         let in_template = in_pod_template(&leaf.path);
         if let Some((fact, digest_too)) = image_leaf(&leaf) {
+            template_fact |= in_template;
+            add(fact, Some(&leaf), &mut facts);
             if digest_too {
                 noise.push(Noise { rule: rules::DIGEST, path: leaf.path, own_line: false });
             }
-            template_fact |= in_template;
-            add(fact, &mut facts);
             continue;
         }
         if let Some(rule) = rules::noise_of(key, &leaf, renames) {
@@ -660,7 +678,7 @@ fn classify(key: &ObjectKey, b: &Value, a: &Value, renames: &Renames) -> (Vec<Fa
             continue;
         }
         template_fact |= in_template;
-        add(fact_of(key, &leaf, b, a), &mut facts);
+        add(fact_of(key, &leaf, b, a), Some(&leaf), &mut facts);
     }
     if !template_fact {
         let keys: BTreeSet<String> = noise
@@ -673,10 +691,71 @@ fn classify(key: &ObjectKey, b: &Value, a: &Value, renames: &Renames) -> (Vec<Fa
             for n in noise.iter_mut().filter(|n| in_pod_template(&n.path)) {
                 n.own_line = false;
             }
-            add(Fact::PodTemplate { keys: keys.into_iter().collect::<Vec<_>>().join(", ") }, &mut facts);
+            add(Fact::PodTemplate { keys: keys.into_iter().collect::<Vec<_>>().join(", ") }, None, &mut facts);
         }
     }
     (facts, noise)
+}
+
+/// The facts of a resource, each once, with the hash of the values each was read from.
+#[derive(Default)]
+struct Found {
+    facts: Vec<Fact>,
+    digests: Vec<u64>,
+    seen: BTreeMap<Fact, usize>,
+}
+
+impl Found {
+    fn of(fact: Fact) -> Self {
+        let mut f = Self::default();
+        f.add(fact, None);
+        f
+    }
+
+    /// Add `fact`, read from `leaf`: once, its hash folding in every leaf it was read from.
+    fn add(&mut self, fact: Fact, leaf: Option<&Leaf>) {
+        use std::hash::Hasher as _;
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        if let Some(l) = leaf {
+            hash_value(l.before.as_ref(), &mut h);
+            hash_value(l.after.as_ref(), &mut h);
+        }
+        let leaf_hash = if leaf.is_some() { h.finish() } else { 0 };
+        if let Some(&i) = self.seen.get(&fact) {
+            self.digests[i] = self.digests[i].rotate_left(5) ^ leaf_hash;
+        } else {
+            self.seen.insert(fact.clone(), self.facts.len());
+            self.facts.push(fact);
+            self.digests.push(leaf_hash);
+        }
+    }
+}
+
+/// Hash a value whatever the order of its keys (an object's are hashed sorted).
+fn hash_value(v: Option<&Value>, h: &mut impl std::hash::Hasher) {
+    use std::hash::Hash as _;
+    match v {
+        None => 0u8.hash(h),
+        Some(Value::Null) => 1u8.hash(h),
+        Some(Value::Bool(b)) => (2u8, b).hash(h),
+        Some(Value::Number(n)) => (3u8, n.to_string()).hash(h),
+        Some(Value::String(s)) => (4u8, s).hash(h),
+        Some(Value::Array(items)) => {
+            (5u8, items.len()).hash(h);
+            for i in items {
+                hash_value(Some(i), h);
+            }
+        }
+        Some(Value::Object(m)) => {
+            (6u8, m.len()).hash(h);
+            let mut keys: Vec<&String> = m.keys().collect();
+            keys.sort();
+            for k in keys {
+                k.hash(h);
+                hash_value(m.get(k), h);
+            }
+        }
+    }
 }
 
 /// What changed in `key` from `before` to `after` (either may be missing); None when nothing.
@@ -697,14 +776,14 @@ fn diff_resource(
     }
     let (facts, noise) = match (b.is_null(), a.is_null()) {
         (true, true) => return None,
-        (true, false) => (vec![Fact::Added], Vec::new()),
-        (false, true) => (vec![Fact::Pruned], Vec::new()),
+        (true, false) => (Found::of(Fact::Added), Vec::new()),
+        (false, true) => (Found::of(Fact::Pruned), Vec::new()),
         _ => classify(key, &b, &a, renames),
     };
-    if facts.is_empty() && noise.is_empty() {
+    if facts.facts.is_empty() && noise.is_empty() {
         return None;
     }
-    Some(ResourceChange::new(key.clone(), facts, noise, b, a))
+    Some(ResourceChange::of_found(key.clone(), facts, noise, b, a))
 }
 
 /// The same fact in several resources.
@@ -833,6 +912,7 @@ pub fn compare(before: &Objects, after: &Objects) -> SmartDiff {
         match (found, old) {
             (Some(mut r), Some(o)) => {
                 r.facts.insert(0, Fact::Renamed { from: o.name.clone(), to: k.name.clone() });
+                r.digests.insert(0, 0);
                 resources.push(r);
             }
             (Some(r), None) => resources.push(r),

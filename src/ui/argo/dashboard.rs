@@ -1193,7 +1193,7 @@ fn names(keys: &[ObjectKey]) -> String {
 }
 
 /// A diff's lines, at most `DIFF_LINES`, then how many more.
-fn lines_block(lines: &[crate::history::DiffLine], cx: &App) -> Div {
+pub(super) fn lines_block(lines: &[crate::history::DiffLine], cx: &App) -> Div {
     let muted = cx.theme().muted_foreground;
     if lines.is_empty() {
         return v_flex().child(div().text_xs().text_color(muted).child("No line differs once noise is hidden."));
@@ -1297,7 +1297,7 @@ fn chip(text: &str, tone: Tone, cx: &App) -> Div {
 }
 
 /// A word that does something when clicked.
-fn link(id: impl Into<ElementId>, text: &str, cx: &App) -> Stateful<Div> {
+pub(super) fn link(id: impl Into<ElementId>, text: &str, cx: &App) -> Stateful<Div> {
     div()
         .id(id)
         .flex_none()
