@@ -89,6 +89,27 @@ fn sessions_from(raw: &serde_json::Value) -> Vec<Session> {
     sessions
 }
 
+/// `context_sets` entry by entry: an entry that isn't an object, has no name or no context
+/// is dropped alone; a name already taken keeps its first set. Never fails, so a hand edit
+/// here costs no other setting.
+fn context_set_entries<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<ContextSet>, D::Error> {
+    let raw = serde_json::Value::deserialize(d)?;
+    Ok(context_sets_from(&raw))
+}
+
+fn context_sets_from(raw: &serde_json::Value) -> Vec<ContextSet> {
+    let entries = raw.as_array().map_or(&[][..], Vec::as_slice);
+    let mut sets: Vec<ContextSet> = Vec::new();
+    for entry in entries.iter().filter(|e| e.is_object()) {
+        let Ok(set) = serde_json::from_value::<ContextSet>(entry.clone()) else { continue };
+        let Some(set) = ContextSet::new(&set.name, &set.contexts) else { continue };
+        if !sets.iter().any(|x| x.name == set.name) {
+            sets.push(set);
+        }
+    }
+    sets
+}
+
 /// `window`: none when it doesn't read or can't be a window (the default place then).
 fn window_or_none<'de, D: Deserializer<'de>>(d: D) -> Result<Option<WindowPlace>, D::Error> {
     let raw = serde_json::Value::deserialize(d)?;
@@ -181,6 +202,45 @@ pub const SESSIONS_KEPT: usize = 20;
 /// The window's size to start with, and the smallest it can be (logical pixels).
 pub const WINDOW_SIZE: (f32, f32) = (1500., 920.);
 pub const WINDOW_MIN: (f32, f32) = (900., 560.);
+
+/// A named group of contexts, connected together in one click from the context picker or
+/// the palette. Each field reads whatever the file holds, so a set never fails to load.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
+#[serde(default)]
+pub struct ContextSet {
+    /// Trimmed, never empty, one set per name.
+    #[serde(deserialize_with = "or_default")]
+    pub name: String,
+    /// In the order they connect (the first is the primary), without repeats or empty names.
+    #[serde(deserialize_with = "string_list")]
+    pub contexts: Vec<String>,
+}
+
+impl ContextSet {
+    /// A set named `name` of `contexts`, in their order, without repeats or empty names. None
+    /// when the name is blank or no context is left.
+    pub fn new(name: &str, contexts: &[String]) -> Option<Self> {
+        let name = name.trim();
+        let mut kept: Vec<String> = Vec::new();
+        for c in contexts.iter().filter(|c| !c.is_empty()) {
+            if !kept.contains(c) {
+                kept.push(c.clone());
+            }
+        }
+        (!name.is_empty() && !kept.is_empty()).then(|| Self { name: name.to_string(), contexts: kept })
+    }
+
+    /// Its contexts the kubeconfig still has, in order: connecting a context that is gone
+    /// would only fail.
+    pub fn available(&self, all: &[String]) -> Vec<String> {
+        self.contexts.iter().filter(|c| all.contains(c)).cloned().collect()
+    }
+
+    /// Whether `connected` is this set, in any order.
+    pub fn is(&self, connected: &[String]) -> bool {
+        session_set(&self.contexts) == session_set(connected)
+    }
+}
 
 /// Where a window was left on a set of contexts: the first window that connects to that set
 /// reopens there. Each field reads whatever the file holds (a value that doesn't read takes
@@ -413,6 +473,9 @@ pub struct Settings {
     /// Where the window was left (read with `window_place`).
     #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "window_or_none")]
     pub window: Option<WindowPlace>,
+    /// Named groups of contexts, in the order they were first saved (see `ContextSet`).
+    #[serde(skip_serializing_if = "Vec::is_empty", deserialize_with = "context_set_entries")]
+    pub context_sets: Vec<ContextSet>,
 }
 
 /// The timeline: changes recorded while the app watches (see `crate::timeline`).
@@ -624,6 +687,7 @@ impl Default for Settings {
             last_seen_version: None,
             sessions: Vec::new(),
             window: None,
+            context_sets: Vec::new(),
         }
     }
 }
@@ -953,6 +1017,30 @@ fn keep_session(list: &mut Vec<Session>, session: Session) {
     list.retain(|x| x.contexts != session.contexts);
     list.insert(0, session);
     list.truncate(SESSIONS_KEPT);
+}
+
+/// The context sets, in the order they were first saved.
+pub fn context_sets() -> Vec<ContextSet> {
+    with(|s| s.context_sets.clone())
+}
+
+/// Save `set`, in place of the set of the same name.
+pub fn save_context_set(set: ContextSet) {
+    update(|s| put_context_set(&mut s.context_sets, set));
+}
+
+/// Forget the set named `name`.
+pub fn delete_context_set(name: &str) {
+    update(|s| s.context_sets.retain(|x| x.name != name));
+}
+
+/// `set` in place of the one of the same name, else at the end: a set saved again keeps
+/// its place in the picker.
+fn put_context_set(list: &mut Vec<ContextSet>, set: ContextSet) {
+    match list.iter_mut().find(|x| x.name == set.name) {
+        Some(old) => *old = set,
+        None => list.push(set),
+    }
 }
 
 /// Where the window was left, when that reads (see `WindowPlace::usable`).
@@ -1514,6 +1602,7 @@ mod properties {
             "width",
             "height",
             "maximized",
+            "name",
             "other",
         ]);
         let leaf = prop_oneof![
@@ -1663,6 +1752,55 @@ mod properties {
                 prop_assert!([w.x, w.y, w.width, w.height].iter().all(|n| n.is_finite()));
                 prop_assert!(w.width >= super::WINDOW_MIN.0 && w.height >= super::WINDOW_MIN.1);
             }
+        }
+
+        /// Whatever `context_sets` holds, the file reads without an error and the other
+        /// settings stay; each set read has a trimmed name of its own and contexts without
+        /// repeats or empty names.
+        #[test]
+        fn context_sets_never_break_loading(sets in junk(), protection in protection()) {
+            let text = json!({"context_sets": sets, "protection": protection, "metrics_refresh": 7});
+            let (read, error, lost) = from_bytes(&serde_json::to_vec(&text).unwrap());
+            prop_assert!(error.is_none(), "{error:?}");
+            prop_assert!(!lost);
+            prop_assert_eq!(read.metrics_refresh, 7);
+            prop_assert_eq!(&read.protection, &protection);
+            let mut names = std::collections::HashSet::new();
+            for set in &read.context_sets {
+                prop_assert!(!set.name.is_empty() && set.name.trim() == set.name);
+                prop_assert!(names.insert(set.name.clone()), "{} twice", set.name);
+                prop_assert!(!set.contexts.is_empty());
+                prop_assert!(set.contexts.iter().all(|c| !c.is_empty()));
+                let mut seen = std::collections::HashSet::new();
+                prop_assert!(set.contexts.iter().all(|c| seen.insert(c)));
+            }
+        }
+
+        /// Sets saved are read back as they were, their contexts in the order saved; saving
+        /// one again by name replaces it in place.
+        #[test]
+        fn context_sets_read_back_as_saved(
+            saves in prop::collection::vec(("[a-c]", prop::collection::vec("[a-e]", 1..4)), 1..12),
+        ) {
+            let mut list: Vec<super::ContextSet> = Vec::new();
+            for (name, contexts) in &saves {
+                let set = super::ContextSet::new(name, contexts).unwrap();
+                let before: Vec<String> = list.iter().map(|x| x.name.clone()).collect();
+                super::put_context_set(&mut list, set.clone());
+                let after: Vec<String> = list.iter().map(|x| x.name.clone()).collect();
+                if before.contains(name) {
+                    prop_assert_eq!(&before, &after);
+                } else {
+                    prop_assert_eq!(&after[..before.len()], &before[..]);
+                    prop_assert_eq!(after.len(), before.len() + 1);
+                }
+                prop_assert_eq!(list.iter().find(|x| &x.name == name), Some(&set));
+                prop_assert_eq!(set.contexts.first(), contexts.first());
+            }
+            let saved = Settings { context_sets: list.clone(), ..Settings::default() };
+            let (read, error, _) = from_bytes(&serde_json::to_vec(&saved).unwrap());
+            prop_assert!(error.is_none());
+            prop_assert_eq!(read.context_sets, list);
         }
 
         /// Sessions and a window place saved are read back as they were.
