@@ -22,10 +22,12 @@ impl AppView {
             kind: self.kind.clone(),
             // Opened already: its page is in the history.
             open: None,
+            kept: self.kept_session.tab.clone(),
         }
     }
 
     pub(super) fn load_tab(&mut self, t: TabState, window: &mut Window, cx: &mut Context<Self>) {
+        self.kept_session.tab = t.kept;
         self.history = t.history;
         self.pos = t.pos.min(self.history.len().saturating_sub(1));
         // Set the namespaces and the kind first, then restart the watch once: restarting in
@@ -63,6 +65,8 @@ impl AppView {
         let mut fresh = snap.clone();
         fresh.history = vec![route];
         fresh.pos = 0;
+        // A new tab, saved as it is.
+        fresh.kept = None;
         self.tabs[self.active_tab] = snap;
         self.tabs.insert(self.active_tab + 1, TabState::default());
         self.active_tab += 1;

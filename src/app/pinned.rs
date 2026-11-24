@@ -184,10 +184,12 @@ impl AppView {
             let kind = match kind {
                 Ok(kind) => kind,
                 Err(wanted) => {
-                    let kinds = k8s::discover(client.clone())
+                    let found = k8s::discover_all(client.clone())
                         .await
                         .map_err(|e| format!("Could not list the kinds of {on}: {}", k8s::short_error(&e)))?;
-                    k8s::find_kind(&kinds, &wanted).cloned().ok_or_else(|| format!("{wanted} is not served on {on}"))?
+                    k8s::find_kind(&found.kinds, &wanted).cloned().ok_or_else(|| {
+                        format!("{wanted} is not served on {on}{}", k8s::maybe_skipped(&found.skipped))
+                    })?
                 }
             };
             let namespace = if kind.namespaced { namespace } else { None };

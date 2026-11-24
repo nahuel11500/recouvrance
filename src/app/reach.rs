@@ -35,6 +35,8 @@ pub(super) struct Reached {
     pub ctx: String,
     pub client: Client,
     pub kinds: Result<Vec<Kind>>,
+    /// The add-on API groups its discovery couldn't read (`k8s::SkippedGroup`).
+    pub skipped: Vec<k8s::SkippedGroup>,
     /// The namespaces listed, or the accessible ones set for the cluster; what failed else.
     pub namespaces: Result<Vec<String>, String>,
     /// The Pods list started with the connect (`EarlyList`).
@@ -72,8 +74,12 @@ pub(super) async fn reach(ctx: String, early: Option<EarlyList>) -> Result<Reach
             if accessible.is_empty() { listed_namespaces(&name, k8s::namespaces(c).await) } else { Ok(accessible) }
         }
     };
-    let (kinds, namespaces) = futures::join!(k8s::discover(client.clone()), namespaces);
-    Ok(Reached { ctx, client, kinds, namespaces, early })
+    let (found, namespaces) = futures::join!(k8s::discover_all(client.clone()), namespaces);
+    let (kinds, skipped) = match found {
+        Ok(d) => (Ok(d.kinds), d.skipped),
+        Err(e) => (Err(e), Vec::new()),
+    };
+    Ok(Reached { ctx, client, kinds, skipped, namespaces, early })
 }
 
 /// The connects done once one of them `answered` and the others had until `late` ends (or
@@ -225,8 +231,12 @@ impl AppView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Reached { ctx, client, kinds, namespaces, early } = reached;
+        let Reached { ctx, client, kinds, skipped, namespaces, early } = reached;
         let Ok(found) = kinds else { return };
+        if !skipped.is_empty() {
+            self.skipped_groups.extend(skipped.iter().map(|s| s.group.clone()));
+            self.skipped.push((ctx.clone(), skipped));
+        }
         let ix = self.clusters.len();
         add_kinds(&mut self.kinds, &mut self.kind_clusters, ix, found);
         k8s::sort_for_sidebar(&mut self.kinds);

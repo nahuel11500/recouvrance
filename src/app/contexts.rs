@@ -21,6 +21,9 @@ impl AppView {
         crate::dev::first_rows::connecting(&contexts);
         // Where the contexts connected until now were left, before it is reset below.
         self.leave_session(cx);
+        // What was kept of that set's session (types of groups that didn't answer) is not
+        // this one's. Its own set again keeps it: those groups may still not answer.
+        let set_before = self.session_key.clone();
         if dev_var("RECOUVRANCE_CONTEXT").is_none() {
             let remembered = contexts.clone();
             crate::settings::update(|s| {
@@ -28,6 +31,12 @@ impl AppView {
                 s.last_contexts = remembered;
             });
             self.session_key = crate::settings::session_set(&contexts);
+        }
+        if self.session_key != set_before || self.session_key.is_empty() {
+            self.kept_session = super::session::Kept::default();
+            for tab in &mut self.tabs {
+                tab.kept = None;
+            }
         }
         self.restore.connecting(&self.session_key);
         let connected = contexts.clone();
@@ -73,6 +82,8 @@ impl AppView {
         self.connect_notes = None;
         self.conn = super::conn::ConnStates::connecting(&contexts);
         self.conn_changed(cx);
+        self.skipped.clear();
+        self.skipped_groups.clear();
         self.connecting = true;
         self.table.update(cx, |t, cx| {
             t.delegate_mut().reset(false, Vec::new(), None, Default::default());
@@ -116,11 +127,16 @@ impl AppView {
             let mut listed = Vec::new();
             let mut early_lists = HashMap::new();
             let mut errors = Vec::new();
+            // The add-on groups each cluster skipped (by cluster, only those that skipped some).
+            let mut skipped: Vec<(String, Vec<k8s::SkippedGroup>)> = Vec::new();
             for (_, r) in wave {
                 match r {
                     Ok(r) => {
                         if let Some(list) = r.early {
                             early_lists.insert(r.ctx.clone(), list);
+                        }
+                        if !r.skipped.is_empty() {
+                            skipped.push((r.ctx.clone(), r.skipped));
                         }
                         clusters.push((r.ctx, r.client));
                         discovered.push(r.kinds);
@@ -155,7 +171,7 @@ impl AppView {
                 }
                 namespaces.sort();
                 namespaces.dedup();
-                anyhow::Ok((client, kinds, kind_clusters, namespaces))
+                anyhow::Ok((client, kinds, kind_clusters, namespaces, skipped))
             }
             .await;
             let applied = this.update_in(cx, |this, window, cx| {
@@ -167,7 +183,7 @@ impl AppView {
                     this.conn.settle(ctx, failure.as_deref());
                 }
                 let connected = match result {
-                    Ok((client, kinds, kind_clusters, namespaces)) => {
+                    Ok((client, kinds, kind_clusters, namespaces, skipped)) => {
                         // Who saved this set before: what this connect does below is no change
                         // of the user's (see `session::SessionOwners`).
                         let owner_before =
@@ -175,6 +191,11 @@ impl AppView {
                         this.kind_clusters = kind_clusters;
                         this.connect_errors = reach::connect_status(&errors, &waiting);
                         this.connect_notes = super::conn::notes(&errors, &this.conn);
+                        // Told, not counted as a failed connect: an APIService down for good
+                        // (metrics-server) would else stop the session from ever being saved.
+                        // The session keeps what it saved for those groups' types instead.
+                        this.skipped_groups = skipped.iter().flat_map(|(_, s)| s).map(|s| s.group.clone()).collect();
+                        this.skipped = skipped;
                         // The first context may have failed: namespace visits and the ones added
                         // by hand belong to the cluster that is first now.
                         if let Some((first, _)) = clusters.first() {
@@ -194,18 +215,28 @@ impl AppView {
                         }
                         this.clusters = clusters;
                         let keep = this.kind.as_ref().map(Kind::key);
+                        // A tab on a type of a group that didn't answer shows the default list,
+                        // but is saved as it was until it is changed (as `restore_session` does).
+                        let unread_before = (this.kind.as_ref())
+                            .is_some_and(|k| super::session::unread(k, &kinds, &this.skipped_groups))
+                            .then(|| this.tab_snapshot(cx));
                         let wanted = dev_var("RECOUVRANCE_KIND").and_then(|q| k8s::find_kind(&kinds, &q).cloned());
                         this.kind = wanted
                             .or_else(|| keep.and_then(|key| kinds.iter().find(|k| k.key() == key).cloned()))
                             .or_else(|| kinds.iter().find(|k| k.is("", "Pod")).cloned());
                         // Back must not return to a list the new clusters don't have.
                         served_lists(&mut this.history, &kinds, this.kind.as_ref());
+                        if let Some(before) = unread_before {
+                            // The box shows the new kind's filter, the old one's kept for it.
+                            this.sync_kind_filter(window, cx);
+                            this.kept_session.tab = Some(super::session::KeptTab::of(&before, &this.tab_snapshot(cx)));
+                        }
                         // Other tabs keep a kind and namespaces only where the new clusters have them.
                         let active = this.active_tab;
                         let fallback = this.kind.clone();
                         for (i, tab) in this.tabs.iter_mut().enumerate() {
                             if i != active {
-                                served_tab(tab, &kinds, &namespaces, fallback.as_ref());
+                                served_or_kept(tab, &kinds, &namespaces, fallback.as_ref(), &this.skipped_groups);
                             }
                         }
                         this.settings_view.update(cx, |s, _| s.set_kinds(kinds.clone()));
@@ -531,6 +562,23 @@ fn merge_kinds(
     (kinds, kind_clusters)
 }
 
+/// What the status line says of the add-on APIs that couldn't be read: their types may be
+/// missing from the sidebar (or listed as last known), for now, not gone. Each is named with
+/// its cluster whenever more than one is `connected`, even when only one skipped some.
+pub(super) fn skipped_notice(skipped: &[(String, Vec<k8s::SkippedGroup>)], connected: usize) -> Option<SharedString> {
+    if skipped.is_empty() {
+        return None;
+    }
+    let parts: Vec<String> = (skipped.iter())
+        .map(|(name, groups)| {
+            let groups = k8s::describe_skipped(groups);
+            if connected > 1 { format!("{name}: {groups}") } else { groups }
+        })
+        .collect();
+    let parts = parts.join("; ");
+    Some(format!("Add-on APIs that couldn't be read, their types may be missing or out of date: {parts}").into())
+}
+
 /// The kinds the cluster at `ix` serves added to `kinds`, and where each exists: a cluster
 /// that joins after the others (see `reach`) as `merge_kinds` adds each one.
 pub(super) fn add_kinds(
@@ -566,6 +614,22 @@ fn served_tab(tab: &mut TabState, kinds: &[Kind], namespaces: &[String], fallbac
         tab.kind.take().and_then(|k| kinds.iter().find(|x| x.key() == k.key()).cloned()).or_else(|| fallback.cloned());
     served_lists(&mut tab.history, kinds, tab.kind.as_ref());
     tab.namespaces.retain(|ns| namespaces.contains(ns));
+}
+
+/// `served_tab`, but a tab on a type of a group in `skipped` (it didn't answer discovery) is
+/// kept to be saved as it was, until it is changed.
+fn served_or_kept(
+    tab: &mut TabState,
+    kinds: &[Kind],
+    namespaces: &[String],
+    fallback: Option<&Kind>,
+    skipped: &HashSet<String>,
+) {
+    let before = (tab.kind.as_ref()).is_some_and(|k| super::session::unread(k, kinds, skipped)).then(|| tab.clone());
+    served_tab(tab, kinds, namespaces, fallback);
+    if let Some(before) = before {
+        tab.kept = Some(super::session::KeptTab::of(&before, tab));
+    }
 }
 
 /// Every list joined, or nothing when one of them is empty (that cluster may list all).
@@ -623,12 +687,68 @@ fn one_namespace(wanted: &[String], previous: &[String], accessible: &[String]) 
 mod tests {
     use super::{
         Kind, Route, TabState, all_restricted, cluster_namespace, cluster_namespaces, kinds_per_cluster,
-        listed_namespaces, merge_kinds, one_namespace, served_by, served_lists, served_tab,
+        listed_namespaces, merge_kinds, one_namespace, served_by, served_lists, served_or_kept, served_tab,
+        skipped_notice,
     };
+    use std::collections::HashSet;
+
     use crate::k8s::argo::diagnosis::{Res, known_kind};
 
     fn kind(k: &str) -> Kind {
         Kind::fake("", k)
+    }
+
+    /// The groups a cluster skipped are told, with the cluster's name whenever several are
+    /// connected, even when only one of them skipped some.
+    #[test]
+    fn skipped_groups_are_told_by_cluster() {
+        use crate::k8s::SkippedGroup;
+        let argo = SkippedGroup { group: "argoproj.io".into(), error: "argoproj.io/v1alpha1: 503".into() };
+        let skipped = vec![("staging".to_string(), vec![argo])];
+        // One cluster connected: no name needed.
+        let notice = skipped_notice(&skipped, 1).unwrap();
+        assert!(notice.contains("argoproj.io (argoproj.io/v1alpha1: 503)"), "{notice}");
+        assert!(!notice.contains("staging:"), "{notice}");
+        // prod and staging connected, only staging skipped: staging is named.
+        let notice = skipped_notice(&skipped, 2).unwrap();
+        assert!(notice.contains("staging: argoproj.io"), "{notice}");
+        assert!(!notice.contains("prod"), "{notice}");
+        // Both skipped: each named.
+        let two = [skipped[0].clone(), ("prod".to_string(), skipped[0].1.clone())];
+        let notice = skipped_notice(&two, 2).unwrap();
+        assert!(notice.contains("staging: argoproj.io") && notice.contains("prod: argoproj.io"), "{notice}");
+        assert!(skipped_notice(&[], 2).is_none());
+    }
+
+    /// A live tab on a type of a group that stops answering (a reconnect of the same set, no
+    /// restore) shows the default list but is saved as it was, until it is changed; a type
+    /// gone from a group that did answer falls back as before.
+    #[test]
+    fn a_live_tab_on_a_type_of_a_group_that_stopped_answering_is_kept() {
+        let pods = kind("Pod");
+        let apps = Kind::fake("argoproj.io", "Application");
+        let certs = Kind::fake("cert-manager.io", "Certificate");
+        let skipped: HashSet<String> = ["argoproj.io".to_string()].into();
+        let on = |k: &Kind| TabState {
+            history: vec![Route::Resources(Some(k.clone()))],
+            kind: Some(k.clone()),
+            namespaces: vec!["argocd".into()],
+            filter: "prod".into(),
+            ..Default::default()
+        };
+        let mut tab = on(&apps);
+        let saved = super::super::session::saved_tab(&tab);
+        served_or_kept(&mut tab, std::slice::from_ref(&pods), &["argocd".to_string()], Some(&pods), &skipped);
+        assert_eq!(tab.kind.as_ref().map(Kind::key), Some(pods.key()), "shown on the default list");
+        assert_eq!(super::super::session::saved_tab(&tab), saved, "saved as it was");
+        // Changed since: saved as it is now.
+        let mut changed = tab.clone();
+        changed.namespaces.clear();
+        assert_ne!(super::super::session::saved_tab(&changed), saved);
+        // A group that answered: gone, nothing kept.
+        let mut gone = on(&certs);
+        served_or_kept(&mut gone, std::slice::from_ref(&pods), &["argocd".to_string()], Some(&pods), &skipped);
+        assert!(gone.kept.is_none());
     }
 
     #[test]

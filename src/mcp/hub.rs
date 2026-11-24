@@ -177,6 +177,9 @@ struct Cluster {
     discovering: tokio::sync::Mutex<()>,
     /// The kinds of CRDs applied through the hub, and when, that a lookup has not found yet.
     new_kinds: Mutex<Vec<(Kind, Instant)>>,
+    /// The add-on API groups the last discovery couldn't read: a type missing from `kinds`
+    /// may be one of theirs.
+    skipped: Mutex<Vec<k8s::SkippedGroup>>,
 }
 
 /// Shared between the MCP server (tokio) and the UI (gpui).
@@ -774,9 +777,16 @@ impl Hub {
         if let Some((kinds, _)) = &*lock(&cluster.kinds) {
             return Ok((client, kinds.clone()));
         }
-        let kinds = Arc::new(k8s::discover(client.clone()).await?);
+        let found = k8s::discover_all(client.clone()).await?;
+        *lock(&cluster.skipped) = found.skipped;
+        let kinds = Arc::new(found.kinds);
         *lock(&cluster.kinds) = Some((kinds.clone(), Instant::now()));
         Ok((client, kinds))
+    }
+
+    /// The add-on API groups `context`'s last discovery couldn't read (none before one ran).
+    pub fn skipped_groups(&self, context: &str) -> Vec<k8s::SkippedGroup> {
+        self.cluster(context).map_or_default(|c| lock(&c.skipped).clone())
     }
 
     /// Whether the context is connected for agents and its kinds discovered: getting its
@@ -815,8 +825,9 @@ impl Hub {
         if !rediscovery_due(last, Instant::now()) {
             return None;
         }
-        if let Ok(kinds) = k8s::discover(client).await {
-            let kinds = Arc::new(kinds);
+        if let Ok(found) = k8s::discover_all(client).await {
+            *lock(&cluster.skipped) = found.skipped;
+            let kinds = Arc::new(found.kinds);
             *lock(&cluster.kinds) = Some((kinds.clone(), Instant::now()));
             Some(kinds)
         } else {
