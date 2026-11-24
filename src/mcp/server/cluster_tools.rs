@@ -175,7 +175,7 @@ impl KubeMcp {
     }
 
     #[tool(
-        description = "Wait until an object meets a condition (Ready, Available, Complete, `phase=Running`) or is deleted, like `kubectl wait`. For an Argo CD Application (on its hub): `sync=Synced`, `health=Healthy` or `operation=Succeeded`, met only once no operation runs; a sync or operation wait returns at once with Argo CD's message when its last operation failed on the revision it targets now (or auto-sync is off).",
+        description = "Wait until an object meets a condition (Ready, Available, Complete, `phase=Running`) or is deleted, like `kubectl wait`. For an Argo CD Application (on its hub): `sync=Synced`, `health=Healthy` or `operation=Succeeded`, met only once no operation runs; a sync or operation wait returns at once with Argo CD's message when its last operation failed on the revision it targets now (or auto-sync is off). After a push to git, refresh the Application (gitops `refresh`) first: until Argo CD has seen the new commit, it still targets the revision that failed.",
         annotations(read_only_hint = true)
     )]
     async fn wait_for(
@@ -282,7 +282,10 @@ fn argo_met(obj: &Value, field: &str, want: &str) -> Result<Option<bool>, String
     {
         let at = text("/status/operationState/finishedAt").map_or_default(|t| format!(" at {t}"));
         let message = text("/status/operationState/message").map_or_default(|m| format!(": {m}"));
-        return Err(format!("its last operation ended {failed}{at}{message}"));
+        return Err(format!(
+            "its last operation ended {failed}{at}{message}. If a fix was pushed to git since, refresh the \
+             Application (gitops `refresh`) and wait again: Argo CD may not have seen the new commit yet"
+        ));
     }
     Ok(value.map(|_| false))
 }
@@ -396,6 +399,8 @@ mod tests {
         for condition in ["sync=Synced", "operation=Succeeded"] {
             let err = condition_met(&failed, condition).expect_err(condition);
             assert!(err.contains("ended Failed at 2026-11-23T10:00:00Z: one or more objects failed"), "{err}");
+            // A push Argo CD hasn't seen yet looks the same: the agent is told to refresh first.
+            assert!(err.contains("refresh the Application (gitops `refresh`) and wait again"), "{err}");
         }
         // Health can change without a sync: a failed sync doesn't end its wait.
         assert_eq!(condition_met(&failed, "health=Degraded"), Ok(Some(false)));

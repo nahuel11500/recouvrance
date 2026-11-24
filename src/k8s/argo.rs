@@ -41,7 +41,7 @@ const IN_CLUSTER: &str = "https://kubernetes.default.svc";
 /// Where Argo CD keeps its Applications by default (a tracking id without `<ns>_`).
 pub const DEFAULT_NAMESPACE: &str = "argocd";
 /// A context that did not answer is left alone this long before it is tried again.
-const RETRY: Duration = Duration::from_secs(300);
+pub(crate) const RETRY: Duration = Duration::from_secs(300);
 /// The longest wait for a context to connect, then to answer whether it serves Applications.
 pub(crate) const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 /// A hub's Applications are listed at most this often, however many pages ask.
@@ -167,13 +167,21 @@ fn same_cluster(a: &ContextTarget, b: &ContextTarget) -> bool {
 /// A destination given by name matches the context's name or its kubeconfig cluster's name
 /// (Argo CD's own cluster names are in Secrets, which are not read).
 pub fn targets_cluster(app: &Value, hub: &ContextTarget, here: &ContextTarget) -> bool {
+    deploys_to(app, hub, here) == Some(true)
+}
+
+/// [`targets_cluster`], None when it can't be told: a destination named neither `in-cluster`
+/// nor as the context or its kubeconfig cluster may be the name of an Argo CD cluster Secret
+/// for this very cluster.
+pub fn deploys_to(app: &Value, hub: &ContextTarget, here: &ContextTarget) -> Option<bool> {
     let dest = |p: &str| app.pointer(p).and_then(Value::as_str).filter(|s| !s.is_empty());
     match (dest("/spec/destination/server"), dest("/spec/destination/name")) {
-        (Some(s), _) if server_key(s) == server_key(IN_CLUSTER) => same_cluster(hub, here),
-        (Some(s), _) => same_server(Some(s), here.server.as_deref()),
-        (None, Some("in-cluster")) => same_cluster(hub, here),
-        (None, Some(n)) => n == here.name || n == here.cluster,
-        (None, None) => false,
+        (Some(s), _) if server_key(s) == server_key(IN_CLUSTER) => Some(same_cluster(hub, here)),
+        (Some(s), _) => Some(same_server(Some(s), here.server.as_deref())),
+        (None, Some("in-cluster")) => Some(same_cluster(hub, here)),
+        (None, Some(n)) if n == here.name || n == here.cluster => Some(true),
+        (None, Some(_)) => None,
+        (None, None) => Some(false),
     }
 }
 
@@ -1492,6 +1500,12 @@ mod tests {
         assert!(targets_cluster(&to(json!({"name": "prod-cluster"})), &hub, &prod));
         assert!(!targets_cluster(&to(json!({"name": "staging"})), &hub, &prod));
         assert!(!targets_cluster(&json!({}), &hub, &prod));
+        // A name of Argo CD's own (a cluster Secret's) can't be told from another cluster's.
+        assert_eq!(deploys_to(&to(json!({"name": "staging"})), &hub, &prod), None);
+        assert_eq!(deploys_to(&to(json!({"name": "prod"})), &hub, &prod), Some(true));
+        assert_eq!(deploys_to(&to(json!({"name": "in-cluster"})), &hub, &prod), Some(false));
+        assert_eq!(deploys_to(&to(json!({"server": "https://other.example"})), &hub, &prod), Some(false));
+        assert_eq!(deploys_to(&json!({}), &hub, &prod), Some(false));
     }
 
     #[test]

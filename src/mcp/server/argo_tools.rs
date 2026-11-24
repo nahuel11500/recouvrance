@@ -7,6 +7,8 @@
 //! found serving Applications, and only those the agent's rules name: no other context is
 //! ever asked whether it runs Argo CD.
 
+use std::time::{Duration, Instant};
+
 use http::request::Parts;
 use rmcp::handler::server::tool::Extension;
 use rmcp::handler::server::wrapper::Parameters;
@@ -48,7 +50,7 @@ const NO_HUB: &str = "No Argo CD hub is known that your rules name. Pass `contex
 const MAX_MESSAGE_CHARS: usize = 300;
 
 /// The longest wait for a hub's Applications once connected (a list of thousands is slow).
-const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[tool_router(router = argo_tools, vis = "pub(super)")]
 impl KubeMcp {
@@ -150,8 +152,18 @@ impl KubeMcp {
         let hubs = self.agent_hubs(call.policy());
         let targets = argo::targets();
         let here = argo::target(&targets, here);
-        // All hubs at once, each bounded in time: one that is down doesn't hold the others.
-        let reads = futures::future::join_all(hubs.iter().map(|hub| self.read_hub(call.policy(), hub, &by))).await;
+        let policy = call.policy();
+        let reads = read_hubs(
+            &hubs,
+            &by,
+            |hub| self.hub.ready(hub),
+            HUB_BOUND,
+            |hub: String| {
+                let by = &by;
+                async move { self.manager_on(policy, &hub, by).await }
+            },
+        )
+        .await;
         let mut notes = Vec::new();
         let mut found = Vec::new();
         for (hub, read) in hubs.iter().zip(reads) {
@@ -165,7 +177,7 @@ impl KubeMcp {
             };
             let hub_target = argo::target(&targets, hub);
             for app in apps {
-                let here = argo::targets_cluster(&app, &hub_target, &here);
+                let here = argo::deploys_to(&app, &hub_target, &here);
                 let tracks = argo::resource_of(&app, &key.group, &key.kind, &key.namespace, &key.name).is_some();
                 found.push(Candidate { hub: hub.clone(), app, here, tracks });
             }
@@ -173,54 +185,139 @@ impl KubeMcp {
         let picked = pick(&by, found);
         let text = managed_text(&by, &picked, &key, &hubs, &notes)?;
         let app = match picked {
-            Pick::One(_, app) => Some(app),
+            Pick::One { app, .. } => Some(app),
             _ => None,
         };
         Some(Managed { text, app })
     }
 
-    /// What one hub says of `by`: None when it is not asked (a label alone never connects to a
-    /// hub, nor asks one that failed recently), Err with a line saying why it said nothing.
-    async fn read_hub(&self, policy: &Policy, hub: &str, by: &TrackedBy) -> Option<Result<Vec<Value>, String>> {
-        let ready = self.hub.ready(hub);
-        // A hub connected for agents is judged by the agents' reads alone: the window's probe
-        // may have failed for its own reasons.
-        let failed = argo::recent_failure(hub, !ready, std::time::Instant::now());
-        match plan(by, ready, failed) {
-            Plan::Quiet => None,
-            Plan::Skip(why) => {
-                Some(Err(format!("{hub}: not asked again yet, it failed less than 5 minutes ago: {why}")))
-            }
-            Plan::Read => Some(self.manager_on(policy, hub, by).await),
-        }
-    }
-
     /// The Applications on `hub` that `by` may name, as far as the agent's Allow rules let it
     /// read them; Err with a line saying why the hub said nothing. The connection and the read
-    /// are each bounded in time; a hub that can't be reached is not asked again for a while.
+    /// are each bounded in time. A hub that can't be reached, or whose login fails, is not
+    /// asked again for `RETRY`: its login command doesn't run again on every call.
     async fn manager_on(&self, policy: &Policy, hub: &str, by: &TrackedBy) -> Result<Vec<Value>, String> {
-        let unreached = |why: String| {
-            argo::note_unreached(hub, why.clone());
-            format!("{hub}: {why}")
+        let said = |failed: NotRead| {
+            if failed.unreached {
+                argo::note_unreached(hub, failed.why.clone());
+            }
+            format!("{hub}: {}", failed.why)
         };
-        let (client, kinds) = match tokio::time::timeout(argo::PROBE_TIMEOUT, self.hub.client(hub)).await {
-            Ok(Ok(connected)) => connected,
-            Ok(Err(e)) => return Err(unreached(k8s::short_error(&e))),
-            Err(_) => return Err(unreached("did not answer".into())),
-        };
-        argo::note_reached(hub);
+        let (client, kinds) = self.connect(hub).await.map_err(said)?;
         if !kinds.iter().any(|k| k.is("argoproj.io", "Application")) {
             return Ok(Vec::new());
         }
         match tokio::time::timeout(READ_TIMEOUT, managers_on(policy, hub, client, by)).await {
-            Ok(read) => read,
-            Err(_) => Err(unreached("did not answer".into())),
+            Ok(Ok(apps)) => {
+                argo::note_reached(hub);
+                Ok(apps)
+            }
+            Ok(Err(failed)) => Err(said(failed)),
+            // Connected, so reached: slow, not down. Its list goes on and is kept for the next call.
+            Err(_) => Err(format!(
+                "{hub}: slow, it did not answer within {} s (asked again on the next call)",
+                READ_TIMEOUT.as_secs()
+            )),
+        }
+    }
+
+    /// The hub's client and kinds for agents, waited for at most `PROBE_TIMEOUT`. The
+    /// connection and discovery run in a task of their own: one that ends later still fills
+    /// the hub's connection for the next call (and says the hub reached).
+    async fn connect(&self, hub: &str) -> Result<(kube::Client, std::sync::Arc<Vec<Kind>>), NotRead> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let (shared, context) = (self.hub.clone(), hub.to_string());
+        k8s::spawn_detached(async move {
+            // A hub connected already makes no request here: that says nothing of it.
+            let was_ready = shared.ready(&context);
+            let connected = shared.client(&context).await;
+            if connected.is_ok() && !was_ready {
+                argo::note_reached(&context);
+            }
+            let _ = tx.send(connected);
+        });
+        match tokio::time::timeout(argo::PROBE_TIMEOUT, rx).await {
+            Ok(Ok(Ok(connected))) => Ok(connected),
+            Ok(Ok(Err(e))) => Err(NotRead::of(&e)),
+            Ok(Err(_)) | Err(_) => Err(NotRead { why: "did not answer".into(), unreached: true }),
         }
     }
 }
 
+/// The longest wait for one hub in `managed_by`, connection and read: beyond what
+/// `manager_on` bounds itself, so that no hub holds the others' answers longer.
+const HUB_BOUND: Duration = Duration::from_secs(argo::PROBE_TIMEOUT.as_secs() + READ_TIMEOUT.as_secs() + 5);
+
+/// What each hub says of `by`, all read at once: None when it is not asked (`plan`), Err with a
+/// line saying why it said nothing. Each read is cut at `bound`, so a hub that hangs holds the
+/// others' answers no longer than that.
+async fn read_hubs<F, Fut>(
+    hubs: &[String],
+    by: &TrackedBy,
+    ready: impl Fn(&str) -> bool,
+    bound: Duration,
+    read: F,
+) -> Vec<Option<Result<Vec<Value>, String>>>
+where
+    F: Fn(String) -> Fut,
+    Fut: Future<Output = Result<Vec<Value>, String>>,
+{
+    let now = Instant::now();
+    let reads = hubs.iter().map(|hub| {
+        let ready = ready(hub);
+        // A hub connected for agents is judged by the agents' reads alone: the window's probe
+        // may have failed for its own reasons.
+        let planned = plan(by, ready, argo::recent_failure(hub, !ready, now));
+        let read = &read;
+        async move {
+            match planned {
+                Plan::Quiet => None,
+                Plan::Skip(why) => Some(Err(skipped_note(hub, &why))),
+                Plan::Read => Some(
+                    tokio::time::timeout(bound, read(hub.clone()))
+                        .await
+                        .unwrap_or_else(|_| Err(format!("{hub}: did not answer"))),
+                ),
+            }
+        }
+    });
+    futures::future::join_all(reads).await
+}
+
+/// What is said of a hub left alone since it failed.
+fn skipped_note(hub: &str, why: &str) -> String {
+    let retry = crate::plural::count(argo::RETRY.as_secs().div_ceil(60), "minute");
+    format!("{hub}: not asked again yet, it failed less than {retry} ago: {why}")
+}
+
+/// Why a hub said nothing, and whether it is because it can't be reached now.
+#[derive(Debug, PartialEq, Eq)]
+struct NotRead {
+    why: String,
+    /// Not reached: no answer, or its login refused or failing. It is left alone for `RETRY`.
+    unreached: bool,
+}
+
+impl NotRead {
+    fn of(e: &anyhow::Error) -> Self {
+        Self { why: k8s::short_error(e), unreached: unreachable_by(e) }
+    }
+
+    /// A refusal of the agent's own rules: the hub answered nothing because it wasn't asked.
+    fn refused(why: String) -> Self {
+        Self { why, unreached: false }
+    }
+}
+
+/// Whether a read error says the hub can't be reached now: no answer at all (a connection,
+/// TLS or timeout failure: no API status), its credentials refused (401) or its login command
+/// failing. Asking it again would wait again, or run the login again (a browser may open). A
+/// refusal (403), an object not found (404) or another answer of the API server is not.
+fn unreachable_by(e: &anyhow::Error) -> bool {
+    k8s::login_failed(e) || matches!(k8s::api_status(e), None | Some(401))
+}
+
 /// `manager_on`'s reads, once connected to the hub.
-async fn managers_on(policy: &Policy, hub: &str, client: kube::Client, by: &TrackedBy) -> Result<Vec<Value>, String> {
+async fn managers_on(policy: &Policy, hub: &str, client: kube::Client, by: &TrackedBy) -> Result<Vec<Value>, NotRead> {
     let kind = argo::application_kind();
     let allowed = |verb: Verb, ns: &str, name: &str| {
         policy.decide(&access_for(&kind, hub, verb, Some(ns.into()), Some(name.into()))).mode == Mode::Allow
@@ -234,10 +331,10 @@ async fn managers_on(policy: &Policy, hub: &str, client: kube::Client, by: &Trac
                     // Argo CD may keep its Applications in another namespace: list them.
                     Err(e) if t.app_ns.is_none() && matches!(k8s::api_status(&e), Some(403 | 404)) => {}
                     Err(e) if k8s::is_not_found(&e) => return Ok(Vec::new()),
-                    Err(e) => return Err(format!("{hub}: {}", k8s::short_error(&e))),
+                    Err(e) => return Err(NotRead::of(&e)),
                 }
             } else if t.app_ns.is_some() {
-                return Err(format!("{hub}: your rules don't let you read Application {ns}/{}", t.app));
+                return Err(NotRead::refused(format!("your rules don't let you read Application {ns}/{}", t.app)));
             }
             t.app.as_str()
         }
@@ -245,11 +342,19 @@ async fn managers_on(policy: &Policy, hub: &str, client: kube::Client, by: &Trac
     };
     let list_access = access_for(&kind, hub, Verb::List, None, None);
     if list_reach(policy, &list_access) != Mode::Allow {
-        return Err(format!("{hub}: your rules don't let you list applications.argoproj.io"));
+        return Err(NotRead::refused("your rules don't let you list applications.argoproj.io".into()));
     }
-    let list = argo::applications(&argo::Hub { context: hub.to_string(), client })
-        .await
-        .map_err(|e| format!("{hub}: {}", k8s::short_error(&e)))?;
+    // In a task of its own: a list cut by `READ_TIMEOUT` still ends, and is kept for the next
+    // call (and the window's Argo CD page).
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let target = argo::Hub { context: hub.to_string(), client };
+    k8s::spawn_detached(async move {
+        let _ = tx.send(argo::applications(&target).await);
+    });
+    let list = match rx.await {
+        Ok(listed) => listed.map_err(|e| NotRead::of(&e))?,
+        Err(_) => return Err(NotRead { why: "did not answer".into(), unreached: true }),
+    };
     Ok(list
         .iter()
         .filter(|a| a.pointer("/metadata/name").and_then(Value::as_str) == Some(name))
@@ -293,15 +398,32 @@ fn plan(by: &TrackedBy, ready: bool, failed: Option<String>) -> Plan {
 struct Candidate {
     hub: String,
     app: Value,
-    /// It deploys to the object's cluster.
-    here: bool,
+    /// It deploys to the object's cluster; None when that can't be told (a destination named
+    /// as an Argo CD cluster Secret is, see `argo::deploys_to`).
+    here: Option<bool>,
     /// Its `status.resources` lists the object.
     tracks: bool,
 }
 
+/// How surely an Application picked deployed the object.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Fit {
+    /// It deploys to the object's cluster and tracks the object.
+    Both,
+    /// It does one of the two.
+    One,
+    /// It does neither surely: the only one of that name found, its destination named as an
+    /// Argo CD cluster that matches no context.
+    Unsure,
+}
+
 /// Which Application deployed the object.
 enum Pick {
-    One(String, Value),
+    One {
+        hub: String,
+        app: Value,
+        fit: Fit,
+    },
     /// Several fit as well: the hub and name of each.
     Several(Vec<String>),
     /// Found by name, but none deploys to this cluster or tracks the object: the hub and
@@ -312,26 +434,39 @@ enum Pick {
 
 /// The Application that deployed the object among those named for it. A tracking id names an
 /// Application by name only, and another hub may have one of the same name deploying
-/// elsewhere: it must deploy to this cluster or track the object. A label is only a hint: it
-/// must do both. One that does both wins over one that does one.
+/// elsewhere: it must deploy to this cluster or track the object, or else be the only one
+/// whose destination can't be told (`Fit::Unsure`). A label is only a hint: it must do both.
+/// One that does both wins over one that does one.
 fn pick(by: &TrackedBy, found: Vec<Candidate>) -> Pick {
     let name = |c: &Candidate| {
         let field = |p: &str| c.app.pointer(p).and_then(Value::as_str).unwrap_or_default().to_string();
         format!("{} {}/{}", c.hub, field("/metadata/namespace"), field("/metadata/name"))
     };
+    let here = |c: &Candidate| c.here == Some(true);
     let fits = |c: &Candidate| match by {
-        TrackedBy::Id(_) => c.here || c.tracks,
-        TrackedBy::Label(_) => c.here && c.tracks,
+        TrackedBy::Id(_) => here(c) || c.tracks,
+        TrackedBy::Label(_) => here(c) && c.tracks,
     };
     let (mut fit, rest): (Vec<Candidate>, Vec<Candidate>) = found.into_iter().partition(fits);
-    let rank = |c: &Candidate| u8::from(c.here) + u8::from(c.tracks);
+    let rank = |c: &Candidate| u8::from(here(c)) + u8::from(c.tracks);
     let Some(best) = fit.iter().map(rank).max() else {
-        return if rest.is_empty() { Pick::NotFound } else { Pick::Elsewhere(rest.iter().map(name).collect()) };
+        let (mut unsure, elsewhere): (Vec<Candidate>, Vec<Candidate>) =
+            rest.into_iter().partition(|c| c.here.is_none());
+        return match (by, unsure.len()) {
+            (TrackedBy::Id(_), 1) => {
+                let c = unsure.remove(0);
+                Pick::One { hub: c.hub, app: c.app, fit: Fit::Unsure }
+            }
+            (TrackedBy::Id(_), 2..) => Pick::Several(unsure.iter().map(name).collect()),
+            _ if unsure.is_empty() && elsewhere.is_empty() => Pick::NotFound,
+            _ => Pick::Elsewhere(unsure.iter().chain(&elsewhere).map(name).collect()),
+        };
     };
     fit.retain(|c| rank(c) == best);
     if fit.len() == 1 {
         let c = fit.remove(0);
-        return Pick::One(c.hub, c.app);
+        let fit = if best == 2 { Fit::Both } else { Fit::One };
+        return Pick::One { hub: c.hub, app: c.app, fit };
     }
     Pick::Several(fit.iter().map(name).collect())
 }
@@ -548,8 +683,8 @@ fn managed_text(by: &TrackedBy, found: &Pick, key: &ObjectKey, hubs: &[String], 
     };
     let lead = format!("Argo CD: managed by Application {named} ({how})");
     let not_read = if notes.is_empty() { String::new() } else { format!(" Not read: {}.", notes.join("; ")) };
-    let (hub, app) = match (found, by) {
-        (Pick::One(hub, app), _) => (hub, app),
+    let (hub, app, fit) = match (found, by) {
+        (Pick::One { hub, app, fit }, _) => (hub, app, *fit),
         (Pick::Several(apps), _) => {
             return Some(format!(
                 "{lead}: several fit, which one is unclear: {}.{not_read} Read them with argocd_apps.\n",
@@ -591,6 +726,17 @@ fn managed_text(by: &TrackedBy, found: &Pick, key: &ObjectKey, hubs: &[String], 
     if let Some((sync, health, _)) = &s.own {
         let health = if health.is_empty() { String::new() } else { format!(", {health}") };
         out.push_str(&format!(" This object in it: {sync}{health}."));
+    }
+    if fit == Fit::Unsure {
+        let dest = app.pointer("/spec/destination/name").and_then(Value::as_str).unwrap_or_default();
+        out.push_str(&format!(
+            " Unsure: it deploys to Argo CD cluster `{dest}`, which matches no context here, and doesn't list this \
+             object; it is the only Application of that name found."
+        ));
+    }
+    // Another hub not read may have held a surer one.
+    if fit != Fit::Both && !not_read.is_empty() {
+        out.push_str(&not_read);
     }
     out.push_str(&format!(
         " Act on it with gitops or wait_for: context {hub}, kind applications, namespace {}, name {}.\n",
@@ -734,7 +880,7 @@ mod tests {
         let by = TrackedBy::Id(argo::parse_tracking("web-workload:apps/Deployment:web/web").unwrap());
         let mut found = app("web-workload", "OutOfSync", "Healthy", false, json!({"server": "https://prod.example"}));
         found["status"]["resources"] = json!([{"group": "apps", "kind": "Deployment", "namespace": "web", "name": "web", "status": "OutOfSync", "health": {"status": "Healthy"}}]);
-        let one = Pick::One("hub".into(), found);
+        let one = Pick::One { hub: "hub".into(), app: found, fit: Fit::Both };
         let text = managed_text(&by, &one, &key(), &["hub".into()], &[]).unwrap();
         assert!(text.starts_with("Argo CD: managed by Application argocd/web-workload on hub hub"), "{text}");
         assert!(text.contains("OutOfSync, Healthy, auto-sync off, revision aaaaaaaa."), "{text}");
@@ -765,8 +911,140 @@ mod tests {
         assert!(text.contains("argocd/web-workload on hub hub (its app.kubernetes.io/instance label"), "{text}");
     }
 
+    /// A hub left alone since it failed, and an Application found on another: the reply names
+    /// the one found, and says the hub not read when the pick isn't sure (that hub may hold a
+    /// surer one), not when it is.
+    #[test]
+    fn a_hub_not_read_is_said_beside_an_application_found_unless_it_is_sure() {
+        let by = TrackedBy::Id(argo::parse_tracking("web-workload:apps/Deployment:web/web").unwrap());
+        let skipped = [skipped_note("hub-b", "did not answer")];
+        let found = || app("web-workload", "Synced", "Healthy", true, json!({"server": "https://prod.example"}));
+        let hubs = ["hub-a".to_string(), "hub-b".to_string()];
+        for (fit, said) in [(Fit::One, true), (Fit::Unsure, true), (Fit::Both, false)] {
+            let one = Pick::One { hub: "hub-a".into(), app: found(), fit };
+            let text = managed_text(&by, &one, &key(), &hubs, &skipped).unwrap();
+            assert!(text.starts_with("Argo CD: managed by Application argocd/web-workload on hub hub-a"), "{text}");
+            let note = "Not read: hub-b: not asked again yet, it failed less than 5 minutes ago: did not answer.";
+            assert_eq!(text.contains(note), said, "{fit:?}: {text}");
+            assert!(text.ends_with("name web-workload.\n"), "{text}");
+        }
+        let unsure = Pick::One {
+            hub: "hub-a".into(),
+            app: app("web-workload", "Synced", "Healthy", true, json!({"name": "prod-eu"})),
+            fit: Fit::Unsure,
+        };
+        let text = managed_text(&by, &unsure, &key(), &hubs, &[]).unwrap();
+        assert!(text.contains("Unsure: it deploys to Argo CD cluster `prod-eu`, which matches no context"), "{text}");
+    }
+
+    /// The wait said is `RETRY`'s, not a number written apart from it.
+    #[test]
+    fn the_note_of_a_hub_left_alone_says_retry() {
+        let minutes = argo::RETRY.as_secs().div_ceil(60);
+        let note = skipped_note("hub", "did not answer");
+        assert!(note.contains(&format!("less than {minutes} minute")), "{note}");
+        assert_eq!(note, "hub: not asked again yet, it failed less than 5 minutes ago: did not answer");
+    }
+
     fn candidate(hub: &str, here: bool, tracks: bool) -> Candidate {
-        Candidate { hub: hub.into(), app: app("web", "Synced", "Healthy", true, json!({})), here, tracks }
+        Candidate { hub: hub.into(), app: app("web", "Synced", "Healthy", true, json!({})), here: Some(here), tracks }
+    }
+
+    /// A candidate whose destination can't be told (named as an Argo CD cluster Secret).
+    fn unsure(hub: &str) -> Candidate {
+        Candidate { here: None, ..candidate(hub, false, false) }
+    }
+
+    /// A tracking id's Application whose destination can't be told is taken when it is the
+    /// only one so (said unsure), never over one that fits, and never for a label.
+    #[test]
+    fn a_lone_application_whose_destination_cant_be_told_is_taken_unsure() {
+        let id = TrackedBy::Id(argo::parse_tracking("web:apps/Deployment:web/web").unwrap());
+        let fit_of = |p: Pick| match p {
+            Pick::One { hub, fit, .. } => Some((hub, fit)),
+            _ => None,
+        };
+        assert_eq!(fit_of(pick(&id, vec![unsure("hub")])), Some(("hub".into(), Fit::Unsure)));
+        assert_eq!(
+            fit_of(pick(&id, vec![unsure("hub"), candidate("other", false, false)])),
+            Some(("hub".into(), Fit::Unsure))
+        );
+        assert_eq!(
+            fit_of(pick(&id, vec![unsure("hub"), candidate("prod", true, false)])),
+            Some(("prod".into(), Fit::One))
+        );
+        assert_eq!(fit_of(pick(&id, vec![candidate("prod", true, true)])), Some(("prod".into(), Fit::Both)));
+        assert!(matches!(pick(&id, vec![unsure("a"), unsure("b")]), Pick::Several(n) if n.len() == 2));
+        let label = TrackedBy::Label("web".into());
+        assert!(matches!(pick(&label, vec![unsure("hub")]), Pick::Elsewhere(_)));
+    }
+
+    /// Unreached (left alone for `RETRY`): no answer, credentials refused, a login failing.
+    /// Answered (asked again): a refusal, not found, any other status of the API server.
+    #[test]
+    fn only_a_hub_that_cant_be_reached_is_left_alone() {
+        let status = |code: u16| -> anyhow::Error {
+            kube::Error::Api(kube::core::Status::failure("no", "").with_code(code).boxed()).into()
+        };
+        assert!(unreachable_by(&anyhow::anyhow!("error trying to connect: tcp connect error: Connection refused")));
+        assert!(unreachable_by(&status(401)));
+        let login: anyhow::Error = kube::Error::Auth(kube::client::AuthError::AuthExecStart(std::io::Error::other(
+            "No such file or directory",
+        )))
+        .into();
+        assert!(unreachable_by(&login));
+        assert!(NotRead::of(&login).unreached);
+        for code in [403, 404, 409, 429, 500, 503] {
+            assert!(!unreachable_by(&status(code)), "{code}");
+        }
+        assert!(!NotRead::refused("your rules don't let you list applications.argoproj.io".into()).unreached);
+    }
+
+    /// The hubs read together: one left alone since it failed is said for a tracking id and
+    /// quiet for a label; one that hangs is cut at the bound without holding the others'
+    /// answers; a label reads no hub that isn't connected.
+    #[tokio::test]
+    async fn hubs_are_read_together_and_one_that_hangs_holds_none() {
+        let id = TrackedBy::Id(argo::parse_tracking("web:apps/Deployment:web/web").unwrap());
+        let label = TrackedBy::Label("web".into());
+        argo::note_unreached("read-hubs-down", "did not answer".into());
+        let hubs: Vec<String> =
+            ["read-hubs-down", "read-hubs-hangs", "read-hubs-ok", "read-hubs-cold"].map(String::from).to_vec();
+        let ready = |h: &str| h != "read-hubs-cold";
+        let asked = std::sync::Mutex::new(Vec::new());
+        let read = |hub: String| {
+            asked.lock().unwrap().push(hub.clone());
+            async move {
+                if hub == "read-hubs-hangs" {
+                    std::future::pending::<()>().await;
+                }
+                Ok::<_, String>(vec![json!({"metadata": {"name": "web"}})])
+            }
+        };
+        let bound = Duration::from_millis(300);
+        let started = Instant::now();
+        let reads = read_hubs(&hubs, &id, ready, bound, read).await;
+        assert!(started.elapsed() < bound * 5, "{:?}", started.elapsed());
+        assert_eq!(
+            reads[0],
+            Some(Err("read-hubs-down: not asked again yet, it failed less than 5 minutes ago: did not answer".into()))
+        );
+        assert_eq!(reads[1], Some(Err("read-hubs-hangs: did not answer".into())));
+        assert_eq!(reads[2].as_ref().map(|r| r.as_ref().map(Vec::len)), Some(Ok(1)));
+        // A tracking id may connect to a hub not connected yet.
+        assert!(matches!(reads[3], Some(Ok(_))));
+        assert_eq!(*asked.lock().unwrap(), ["read-hubs-hangs", "read-hubs-ok", "read-hubs-cold"]);
+        // A label: the hub left alone says nothing, and the one not connected isn't asked.
+        asked.lock().unwrap().clear();
+        let reads = read_hubs(&hubs, &label, ready, bound, read).await;
+        assert_eq!(reads[0], None);
+        assert_eq!(reads[3], None);
+        assert_eq!(*asked.lock().unwrap(), ["read-hubs-hangs", "read-hubs-ok"]);
+        // What reaches the reply: the hub left alone for a tracking id, nothing for a label.
+        let notes = [skipped_note("read-hubs-down", "did not answer")];
+        let text = managed_text(&id, &Pick::NotFound, &key(), &hubs, &notes).unwrap();
+        assert!(text.contains("not found on the hubs read. Not read: read-hubs-down: not asked again yet"), "{text}");
+        assert_eq!(managed_text(&label, &Pick::NotFound, &key(), &hubs, &[]), None);
     }
 
     /// A tracking id names an Application by name only: one of the same name on another hub
@@ -776,7 +1054,7 @@ mod tests {
     fn the_manager_must_deploy_here_or_track_the_object() {
         let id = TrackedBy::Id(argo::parse_tracking("web:apps/Deployment:web/web").unwrap());
         let hub_of = |p: Pick| match p {
-            Pick::One(hub, _) => hub,
+            Pick::One { hub, .. } => hub,
             _ => String::new(),
         };
         assert!(matches!(pick(&id, vec![]), Pick::NotFound));
