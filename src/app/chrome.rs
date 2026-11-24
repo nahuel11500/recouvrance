@@ -216,7 +216,7 @@ impl AppView {
                                 .font_family(theme.mono_font_family.clone())
                                 .text_xs()
                                 .child(a.summary.clone())
-                                .when_some(a.preview.as_ref(), |d, p| d.child(preview_block(p, cx)))
+                                .when_some(a.preview.as_ref(), |d, p| d.child(crate::details::preview_block(p, cx)))
                                 .when_some(a.detail.clone(), ParentElement::child),
                         ),
                 )
@@ -281,25 +281,6 @@ impl AppView {
 fn refused_in(left: std::time::Duration) -> String {
     let secs = left.as_millis().div_ceil(1000);
     format!("refused in {}:{:02}", secs / 60, secs % 60)
-}
-
-/// What an approval's call will change, under its request: each object with the fields that
-/// change and its diff, or why there is no preview.
-fn preview_block(p: &crate::mcp::Preview, cx: &App) -> AnyElement {
-    let theme = cx.theme();
-    v_flex()
-        .gap_1()
-        .child(div().font_weight(FontWeight::SEMIBOLD).child("What will change"))
-        .when_some(p.note.clone(), |d, note| d.child(div().text_color(theme.muted_foreground).child(note)))
-        .children(p.sections.iter().map(|s| {
-            v_flex()
-                .gap_0p5()
-                .child(div().font_weight(FontWeight::SEMIBOLD).child(s.title.clone()))
-                .children(s.lines.iter().map(|line| div().pl_2().child(line.clone())))
-                .when_some(s.note.clone(), |d, note| d.child(div().pl_2().text_color(theme.danger).child(note)))
-                .when(!s.diff.is_empty(), |d| d.child(crate::details::diff_block(&s.diff, cx)))
-        }))
-        .into_any_element()
 }
 
 impl AppView {

@@ -8,7 +8,7 @@ mod config;
 pub mod forwards;
 mod hub;
 mod policy;
-mod preview;
+pub(crate) mod preview;
 pub mod rules_file;
 pub mod server;
 

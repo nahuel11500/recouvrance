@@ -411,6 +411,66 @@ fn an_approval_shows_what_a_patch_will_change() {
     });
 }
 
+/// A YAML save from the window is sent as of the version the edit started from: a change
+/// made on the cluster meanwhile makes the server refuse it (its dry run too, and with the
+/// text's own resourceVersion removed), and that change stays. The edit moved onto the latest
+/// version then saves, and both changes are kept.
+#[test]
+#[ignore = "needs a kind cluster: RECOUVRANCE_E2E_CONTEXT"]
+fn a_yaml_save_over_a_newer_object_is_refused() {
+    use crate::k8s::edit;
+
+    run(async {
+        let ctx = context();
+        let client = k8s::connect(ctx.clone()).await?;
+        let truth: Api<ConfigMap> = Api::namespaced(k8s::connect_for_agents(ctx).await?, NS);
+        let name = "e2e-yaml-save";
+        let _ = truth.delete(name, &DeleteParams::default()).await;
+        truth.create(&PostParams::default(), &config_map(name)).await?;
+        let kinds = k8s::discover(client.clone()).await?;
+        let kind = k8s::find_kind(&kinds, "configmaps").cloned().context("no configmaps")?;
+        let obj =
+            k8s::ObjectRef { kind: kind.clone(), name: name.into(), namespace: Some(NS.into()), uid: String::new() };
+        let ns = Some(NS.to_string());
+
+        // The editor's copy, edited, while someone else writes to the object.
+        let base = k8s::get_object_opts(client.clone(), obj.clone(), true).await?;
+        let version = edit::resource_version(&base).map(str::to_string);
+        let mut edited = base.clone();
+        edited["data"]["b"] = json!("edited");
+        let mut bare = edited.clone();
+        bare["metadata"].as_object_mut().context("metadata")?.remove("resourceVersion");
+        truth.patch(name, &PatchParams::default(), &Patch::Merge(json!({"data": {"a": "meanwhile"}}))).await?;
+
+        gate::set_ui_writes(true);
+        let dry =
+            edit::save_edit(client.clone(), kind.clone(), ns.clone(), edited.clone(), version.clone(), true).await;
+        let saved =
+            edit::save_edit(client.clone(), kind.clone(), ns.clone(), edited.clone(), version.clone(), false).await;
+        let saved_bare = edit::save_edit(client.clone(), kind.clone(), ns.clone(), bare, version, false).await;
+        gate::set_ui_writes(false);
+        for refused in [&dry, &saved, &saved_bare] {
+            assert!(refused.as_ref().is_err_and(edit::is_conflict), "not refused as stale: {refused:?}");
+        }
+        let data = truth.get(name).await?.data.unwrap_or_default();
+        assert_eq!(data.get("a").map(String::as_str), Some("meanwhile"), "the change made meanwhile was undone");
+        assert!(!data.contains_key("b"), "the stale edit was saved");
+
+        let live = k8s::get_object_opts(client.clone(), obj, true).await?;
+        let merged = edit::rebase(&base, &edited, &live);
+        let version = edit::resource_version(&live).map(str::to_string);
+        gate::set_ui_writes(true);
+        let saved = edit::save_edit(client, kind, ns, merged, version, false).await;
+        gate::set_ui_writes(false);
+        saved?;
+        let data = truth.get(name).await?.data.unwrap_or_default();
+        assert_eq!(data.get("a").map(String::as_str), Some("meanwhile"));
+        assert_eq!(data.get("b").map(String::as_str), Some("edited"));
+        truth.delete(name, &DeleteParams::default()).await?;
+        Ok(())
+    });
+}
+
 /// Turning agent access off while an agent's drain runs stops it before the next
 /// eviction; so does turning write mode off during a drain started in the app.
 #[test]
