@@ -35,7 +35,7 @@ pub struct ForwardInfo {
 impl ForwardInfo {
     /// `127.0.0.1:8080 → pod/web:80 -n shop --context prod (agent claude, until 14:02)`.
     pub fn describe(&self) -> String {
-        let until = self.until.to_zoned(jiff::tz::TimeZone::system()).strftime("%H:%M");
+        let until = self.until.to_zoned_datetime(jiff::tz::TimeZone::system()).strftime("%H:%M");
         format!(
             "127.0.0.1:{} → {}:{} -n {} --context {} (id {}, until {until})",
             self.local, self.target, self.remote, self.namespace, self.context, self.id

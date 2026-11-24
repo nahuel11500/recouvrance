@@ -139,7 +139,8 @@ impl AppView {
                 Route::Helm(page)
             }
             Overview::Argo => {
-                let page = cx.new(|cx| ArgoView::new(clusters, window, cx));
+                let favorites = self.favorites.clone();
+                let page = cx.new(|cx| ArgoView::new(clusters, favorites, window, cx));
                 self.subscribe_argo(&page, window, cx);
                 Route::Argo(page)
             }

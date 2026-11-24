@@ -364,6 +364,18 @@ pub struct Settings {
     /// CD's own diff from. None set: that diff is off, nothing is sent to Argo CD.
     #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty", deserialize_with = "string_entries")]
     pub argocd_servers: std::collections::BTreeMap<String, String>,
+    /// Argo CD API servers read on the Argo CD page with no kubeconfig for their cluster,
+    /// added in Settings → Argo CD (`https://argocd.example.com`); their tokens are kept in
+    /// `argocd-api-tokens.json`. The argocd CLI's servers are read too.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub argocd_api_servers: Vec<String>,
+    /// Argo CD API servers not read (their address), whether set here or the argocd CLI's.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub argocd_api_off: Vec<String>,
+    /// The label whose value names an Application's service on the Argo CD page, to group
+    /// its environments. Empty: its name without the environment in it.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub argocd_group_label: String,
     /// Which kubeconfig file keeps a context name that several files have: the first one
     /// seen. The others' contexts are `name@file`, whatever order the files are read in.
     #[serde(deserialize_with = "string_entries")]
@@ -596,6 +608,9 @@ impl Default for Settings {
             kubeconfig_folders: Vec::new(),
             argocd_contexts: Vec::new(),
             argocd_servers: Default::default(),
+            argocd_api_servers: Vec::new(),
+            argocd_api_off: Vec::new(),
+            argocd_group_label: String::new(),
             context_files: Default::default(),
             open_browser_on_forward: true,
             recent_forwards: Vec::new(),

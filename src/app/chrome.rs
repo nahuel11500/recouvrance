@@ -51,15 +51,18 @@ impl AppView {
         }
         // With several clusters, objects say which one they are on.
         let names: std::rc::Rc<Vec<String>> = std::rc::Rc::new(self.clusters.iter().map(|(c, _)| c.clone()).collect());
-        for o in self.favorites.read(cx).objects() {
-            if let Some(ctx) = self.clusters.iter().position(|(c, _)| *c == o.context) {
-                items.push(PaletteItem::new(
-                    o.name.clone(),
-                    format!("★ {} · {}{}", o.kind, o.namespace.clone().unwrap_or_default(), on_cluster(&names, ctx)),
-                    Lucide::Star,
-                    Target::Object { ctx, kind: o.kind.clone(), name: o.name.clone(), namespace: o.namespace.clone() },
-                ));
-            }
+        // Every favorite, on any context: picking one opens it where it points (see
+        // `open_favorite`); `favorite` finds them all.
+        let favorites = self.favorites.read(cx).all();
+        let standings = self.favorite_standings(&favorites, cx);
+        for (f, standing) in favorites.into_iter().zip(standings) {
+            let detail = match standing.note() {
+                Some(note) => format!("★ {} · {note}", f.what()),
+                None => format!("★ {}", f.what()),
+            };
+            let mut item = PaletteItem::new(f.title(), detail, Lucide::Star, Target::Favorite(f));
+            item.also = "favorite favourite starred";
+            items.push(item);
         }
         // Objects of the current table.
         if let Some(kind) = &self.kind {
@@ -144,6 +147,7 @@ impl AppView {
                     Target::Settings(section) => this.open_settings_section(section, window, cx),
                     Target::View(view) => this.apply_view(&view, window, cx),
                     Target::Context(c) => this.connect_many(vec![c], window, cx),
+                    Target::Favorite(f) => this.open_favorite(f, true, window, cx),
                     Target::Object { .. } if this.clusters.iter().map(|(c, _)| c).ne(opened_on.iter()) => {
                         window.push_notification(
                             Notification::warning(

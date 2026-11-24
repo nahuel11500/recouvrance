@@ -341,7 +341,7 @@ mod tests {
         use app::{
             CloseTab, EscapeBack, FocusFilter, GoAssistant, GoBack, GoCluster, GoForward, GoHelm, GoProblems,
             GoSettings, GoWorkloads, NewTab, NewWindow, NextTab, OpenPalette, OpenSelected, PrevTab, RefreshPage,
-            ShowShortcuts, ToggleAssistant, ToggleSidebar, ZoomIn, ZoomOut, ZoomReset,
+            ShowShortcuts, ToggleAssistant, ToggleFavorite, ToggleSidebar, ZoomIn, ZoomOut, ZoomReset,
         };
         use gpui_kit::NoAction;
         use gpui_kit::base::actions::{SelectDown, SelectUp};
@@ -377,6 +377,7 @@ mod tests {
             KeyBinding::new("g h", GoHelm, Some(super::OUTSIDE_TEXT)),
             KeyBinding::new("g i", GoAssistant, Some(super::OUTSIDE_TEXT)),
             KeyBinding::new("g s", GoSettings, Some(super::OUTSIDE_TEXT)),
+            KeyBinding::new("*", ToggleFavorite, Some(super::OUTSIDE_TEXT)),
             KeyBinding::new("j", SelectDown, Some(super::TABLE_OUTSIDE_TEXT)),
             KeyBinding::new("k", SelectUp, Some(super::TABLE_OUTSIDE_TEXT)),
         ];
@@ -455,7 +456,7 @@ mod tests {
     fn single_keys_act_outside_text_fields_only() {
         for mac in [false, true] {
             let found = |keys: &str, contexts: &[&str]| bindings(keys, contexts, mac);
-            for keys in ["?", "g p", "g o", "g w", "g h", "g i", "g s"] {
+            for keys in ["?", "*", "g p", "g o", "g w", "g h", "g i", "g s"] {
                 assert_eq!(found(keys, &["App"]).0, 1, "{keys} on a page");
                 assert_eq!(found(keys, &["App", "DataTable"]).0, 1, "{keys} on a table");
                 assert_eq!(found(keys, &["App", "Input"]), (0, false), "{keys} in a filter box");

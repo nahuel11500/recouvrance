@@ -27,9 +27,14 @@ impl AppView {
         self.restore.connecting(&self.session_key);
         let connected = contexts.clone();
         self.ctx_picker.update(cx, |p, cx| p.set_connected(connected, cx));
-        let ctx_name = primary.clone();
-        self.ns_picker.update(cx, |p, _| p.context = ctx_name);
+        let (ctx_name, all) = (primary.clone(), contexts.clone());
+        self.ns_picker.update(cx, |p, _| {
+            p.context = ctx_name;
+            p.contexts = all;
+        });
         self.context = Some(primary.clone());
+        // A favorite waiting for another connect is not opened on this one.
+        self.after_connect = None;
         // Keep the list on screen while the table still has its columns (reset below).
         self.keep_view(cx);
         self.client = None;
@@ -135,7 +140,12 @@ impl AppView {
                         if let Some((first, _)) = clusters.first() {
                             let first = first.clone();
                             this.context = Some(first.clone());
-                            this.ns_picker.update(cx, |p, _| p.context = first);
+                            // Favorite namespaces: those of the clusters that answered.
+                            let connected: Vec<String> = clusters.iter().map(|(c, _)| c.clone()).collect();
+                            this.ns_picker.update(cx, |p, _| {
+                                p.context = first;
+                                p.contexts = connected;
+                            });
                         }
                         this.client = Some(client);
                         // Copies of pods left behind by a run of the app that was killed.
@@ -212,10 +222,24 @@ impl AppView {
                             _ => {}
                         }
                         this.settle_session(owner_before, restored, cx);
+                        // A favorite on a context that wasn't connected opens now (once).
+                        if let Some(favorite) = this.after_connect.take() {
+                            this.open_favorite(favorite, false, window, cx);
+                        }
                     }
                     Err(e) => {
                         this.list.notice = None;
                         this.connect_errors = Some(format!("{e:#}").into());
+                        if let Some(favorite) = this.after_connect.take() {
+                            window.push_notification(
+                                Notification::warning(format!(
+                                    "{} not opened: {} did not connect",
+                                    favorite.title(),
+                                    favorite.context().unwrap_or("its context")
+                                )),
+                                cx,
+                            );
+                        }
                     }
                 }
                 cx.notify();

@@ -32,7 +32,7 @@ mod related;
 mod tabs;
 
 pub(crate) use actions::*;
-pub(crate) use argo::{ArgoAction, OpenOn, OpenOnContext, confirm_argo_action};
+pub(crate) use argo::{ArgoAction, OpenOn, OpenOnContext, confirm_api_action, confirm_argo_action};
 use browser::FileBrowser;
 pub(crate) use compare::diff_block;
 pub(crate) use guard::*;
@@ -246,6 +246,12 @@ impl DetailPanel {
     /// The object shown, with its context.
     pub fn subject(&self) -> (String, ObjectRef) {
         (self.context.clone(), self.obj.clone())
+    }
+
+    /// The object shown as a favorite (an Argo CD Application by its instance).
+    pub fn favorite(&self) -> crate::favorites::Favorite {
+        let o = &self.obj;
+        crate::favorites::Favorite::for_object(&self.context, &o.kind, o.namespace.clone(), o.name.clone())
     }
 
     #[allow(clippy::too_many_arguments)]

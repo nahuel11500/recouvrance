@@ -104,11 +104,11 @@ impl DetailPanel {
         // Picking a source none of the changes have would show nothing.
         let only = self.history.only.filter(|s| self.history.merged.iter().any(|c| c.source == *s));
         let subject = format!("{} {}", self.obj.kind.ar.kind, self.obj.name);
-        let today = jiff::Timestamp::now().to_zoned(jiff::tz::TimeZone::system()).date();
+        let today = jiff::Timestamp::now().to_zoned_datetime(jiff::tz::TimeZone::system()).date();
         let mut list = v_flex().id("history-list").flex_1().min_h_0().overflow_y_scroll().px_2();
         let mut last_day = None;
         for (i, c) in self.history.merged.iter().enumerate().filter(|(_, c)| only.is_none_or(|s| c.source == s)) {
-            let day = c.time.map(|t| t.to_zoned(jiff::tz::TimeZone::system()).date());
+            let day = c.time.map(|t| t.to_zoned_datetime(jiff::tz::TimeZone::system()).date());
             if last_day != Some(day) {
                 last_day = Some(day);
                 list = list.child(
@@ -328,7 +328,8 @@ fn change_row(
     let color = if c.warning { theme.warning } else { color };
     let (title, body) = title_and_body(c, subject);
     let when = c.time.map_or_default(|t| format!("{} ago", k8s::age(t)));
-    let exact = c.time.map(|t| t.to_zoned(jiff::tz::TimeZone::system()).strftime("%Y-%m-%d %H:%M:%S").to_string());
+    let exact =
+        c.time.map(|t| t.to_zoned_datetime(jiff::tz::TimeZone::system()).strftime("%Y-%m-%d %H:%M:%S").to_string());
     let body = match c.source {
         _ if body.is_empty() => None,
         Source::Fields => Some(field_chips(body, cx)),

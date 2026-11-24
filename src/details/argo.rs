@@ -3,6 +3,7 @@
 //! cluster's client. The Argo CD page asks the same of its rows through `confirm_argo_action`.
 
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Instant;
 
 use gpui_kit::component::checkbox::Checkbox;
@@ -13,6 +14,7 @@ use gpui_kit::*;
 use serde_json::Value;
 
 use super::{ConfirmButtons as _, DetailPanel, Guard, RunAs, WriteFuture, confirm_with, guard_ok, kubectl, shell_word};
+use crate::k8s::argo::api;
 use crate::k8s::argo::diagnosis::Res;
 use crate::k8s::argo::ops::{self, Op, SyncRequest};
 use crate::k8s::argo::{Hub, Lookup};
@@ -266,6 +268,126 @@ fn confirm_operation(t: Target, action: ArgoAction, app: &Value, done: Done, win
                 }
                 let write = t.operation(run_as.client(&t.hub.client, cx), op.clone());
                 send(label, write, t.hub.context.clone(), done.clone(), window, cx);
+                true
+            })
+    });
+}
+
+/// Confirm, then run `action` on the Application `ns/name` read from the Argo CD API server
+/// `endpoint`, through that API: write mode applies when it is sent, as to any write, and
+/// the confirmation is a protected context's (the name typed, or a wait), named after the
+/// server. A sync, a terminate or a rollback reads the Application first, and what Argo CD
+/// would refuse is said instead. A sync here is of the whole Application, with its own sync
+/// options. What it changes comes back on the page's stream.
+pub(crate) fn confirm_api_action(
+    endpoint: &Arc<api::Endpoint>,
+    ns: &str,
+    name: &str,
+    action: ArgoAction,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    if !super::ensure_writes(window, cx) {
+        return;
+    }
+    let (endpoint, ns, name) = (endpoint.clone(), ns.to_string(), name.to_string());
+    if !action.reads_first() {
+        confirm_api(endpoint, ns, name, action, &Value::Null, window, cx);
+        return;
+    }
+    let read = api::read_app(endpoint.clone(), ns.clone(), name.clone());
+    window
+        .spawn(cx, async move |cx| {
+            let result = read.await;
+            let _ = cx.update(|window, cx| match result {
+                Ok(app) => confirm_api(endpoint, ns, name, action, &app, window, cx),
+                Err(e) => window.push_notification(
+                    Notification::error(format!("{} failed: the Application could not be read: {e}", action.label())),
+                    cx,
+                ),
+            });
+        })
+        .detach();
+}
+
+/// The dialog of an action by the API, on the Application `app` as just read (null for a
+/// refresh, which reads nothing first).
+fn confirm_api(
+    endpoint: Arc<api::Endpoint>,
+    ns: String,
+    name: String,
+    action: ArgoAction,
+    app: &Value,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let refused = |why: String, window: &mut Window, cx: &mut App| {
+        let msg = format!("{} Application {name}: Argo CD would refuse it: {why}.", action.label());
+        window.push_notification(Notification::error(msg), cx);
+    };
+    let checked = action.op().map(|op| ops::refusal(app, &op).map_or_else(|| ops::pinned(app, &op), Err));
+    let call = match (action, checked) {
+        (_, Some(Err(why))) => return refused(why, window, cx),
+        (ArgoAction::Refresh, _) => api::Action::Refresh { hard: false },
+        (ArgoAction::HardRefresh, _) => api::Action::Refresh { hard: true },
+        (ArgoAction::Sync, _) => api::Action::Sync,
+        (ArgoAction::Terminate, _) => api::Action::Terminate,
+        (ArgoAction::Rollback(_), Some(Ok(Op::Rollback { id: Some(id), .. }))) => api::Action::Rollback { id },
+        (ArgoAction::Rollback(_), _) => return refused("that deployment has no id".into(), window, cx),
+    };
+    let label = action.label();
+    let note = match action {
+        ArgoAction::Refresh => REFRESH_NOTE,
+        ArgoAction::HardRefresh => HARD_REFRESH_NOTE,
+        ArgoAction::Sync => SYNC_NOTE,
+        ArgoAction::Terminate => TERMINATE_NOTE,
+        ArgoAction::Rollback(_) => ROLLBACK_NOTE,
+    };
+    let title = match &call {
+        api::Action::Rollback { id } => {
+            let to = ops::rollback_target(app, Some(*id)).map_or_default(ops::deployment_label);
+            format!("Roll back Application {name} to {to}?")
+        }
+        api::Action::Terminate => format!("Terminate the operation of Application {name}?"),
+        _ => format!("{label} Application {name}?"),
+    };
+    let server_name = endpoint.name();
+    let target = shell_word(&format!("{ns}/{name}"));
+    let args = match &call {
+        api::Action::Refresh { hard: false } => format!("get {target} --refresh"),
+        api::Action::Refresh { hard: true } => format!("get {target} --hard-refresh"),
+        api::Action::Sync => format!("sync {target}"),
+        api::Action::Terminate => format!("terminate-op {target}"),
+        api::Action::Rollback { id } => format!("rollback {target} {id}"),
+    };
+    let cmd = format!("argocd app {args} --server {}", shell_word(&server_name));
+    let guard = Guard::protected(&server_name, window, cx);
+    window.open_alert_dialog(cx, move |alert, _, cx| {
+        let (endpoint, ns, name, call, guard) =
+            (endpoint.clone(), ns.clone(), name.clone(), call.clone(), guard.clone());
+        alert
+            .title(title.clone())
+            .description(note)
+            .child(confirm_with(&cmd, guard.as_ref(), &RunAs::default(), cx))
+            .confirm_buttons(label, false, guard.as_ref())
+            .on_ok(move |_, window, cx| {
+                if !guard_ok(guard.as_ref(), cx) {
+                    return false;
+                }
+                // Asked with write mode on, but it may have been turned off since.
+                if !super::writes_still_on(window, cx) {
+                    return true;
+                }
+                let write = api::act(endpoint.clone(), ns.clone(), name.clone(), call.clone());
+                window
+                    .spawn(cx, async move |cx| {
+                        let result = write.await;
+                        let _ = cx.update(|window, cx| match result {
+                            Ok(msg) => window.push_notification(Notification::success(msg), cx),
+                            Err(e) => window.push_notification(Notification::error(format!("{label} failed: {e}")), cx),
+                        });
+                    })
+                    .detach();
                 true
             })
     });
