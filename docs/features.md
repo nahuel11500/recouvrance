@@ -238,6 +238,14 @@
   pending PVC says which ConfigMap, Secret, PVC, ServiceAccount or StorageClass it waits on
   (`optional: true` references aren't needed, and a running pod needs none any more). Kinds that
   can't be read are named, not reported missing.
+- **Volumes filling up**: a PVC's page shows its used and free space and its inodes, as the
+  kubelet of a node running a pod that mounts it measures them (read for the page shown; it needs
+  `nodes/proxy`, and a PVC no running pod mounts says "not mounted"). The Problems page lists the
+  PVCs over 90% of their space or inodes (critical from 97%), from one query to the cluster's
+  Prometheus per scan (`kubelet_volume_stats_*`), nothing more asked of the API server; a PVC its
+  own firing alert (such as `KubePersistentVolumeFillingUp`) already names, or one whose alert is
+  silenced, isn't listed twice. Without Prometheus there is nothing to list; one that doesn't
+  answer is named as not checked.
 - **Stuck deletions**: the Problems page lists objects (pods, workloads, Jobs, PVCs, PVs,
   Namespaces, Argo CD Applications) whose deletion has waited more than 10 minutes, with the
   finalizers holding them (for a Namespace, the resources left); their Delete dialog offers to

@@ -118,7 +118,7 @@ pub(super) async fn fetch_related(
     let (mut related, usage, stats) = futures::join!(
         objects,
         usage_of(client.clone(), context, kind, ns.as_deref(), obj, pods),
-        kubelet_stats(client.clone(), kind, obj),
+        kubelet_stats(client.clone(), kind, obj, pods),
     );
     if let Some((usage, read)) = usage {
         (related.usage, related.usage_read) = (usage, Some(read));
@@ -146,13 +146,17 @@ async fn usage_of(
     k8s::container_usage_read(client, ns, selector).await.ok()
 }
 
-/// The kubelet's stats for a node's page, or a pod's node (its ephemeral storage). A busy kubelet
-/// can take tens of seconds: read alongside the rest, not before the usage and the other sections.
-async fn kubelet_stats(client: Client, kind: &k8s::Kind, obj: &Value) -> Option<Value> {
+/// The kubelet's stats for a node's page, a pod's node (its ephemeral storage), or a PVC's: the
+/// node of a running pod that mounts it measures how full it is. A busy kubelet can take tens of
+/// seconds: read alongside the rest, not before the usage and the other sections.
+async fn kubelet_stats(client: Client, kind: &k8s::Kind, obj: &Value, pods: &[Value]) -> Option<Value> {
     let node = if kind.is("", "Node") {
         obj.pointer("/metadata/name")
     } else if kind.is("", "Pod") {
         obj.pointer("/spec/nodeName")
+    } else if kind.is("", "PersistentVolumeClaim") {
+        // Its pods are those that mount it (`pods_of`).
+        pods.iter().filter(|p| crate::volumes::running(p)).find_map(|p| p.pointer("/spec/nodeName"))
     } else {
         None
     };
