@@ -32,6 +32,11 @@ updates:
     # actions move with `dist selfupdate` / `dist generate` instead.
     exclude-paths:
       - .github/workflows/release.yml
+    ignore:
+      # v2.6.0's image can't be pulled from ghcr.io (its manifests are gone):
+      # https://github.com/ossf/scorecard-action/issues/1752. A later release is picked up.
+      - dependency-name: ossf/scorecard-action
+        versions: ["2.6.0"]
     groups:
       actions:
         patterns: ["*"]

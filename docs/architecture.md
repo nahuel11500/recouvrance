@@ -54,15 +54,21 @@ Recouvrance is one Rust binary: a [gpui](https://github.com/zed-industries/zed) 
 ## How lists stay fast
 
 Lists use the API server's **Table** format (`kubectl get`'s columns, computed server-side), then
-are **watched**. A list of a namespaced kind in every namespace comes in up to three steps
-(`list_fast` in `src/k8s/table.rs`):
+are **watched**. A list of a namespaced kind in every namespace comes in two steps (`list_fast` in
+`src/k8s/table.rs`):
 
 1. Its first page (2,000 rows), shown at once.
-2. When more follow, every namespace's rows without their objects, read from the API server's cache,
-   32 namespaces at a time (`cells_by_namespace`): about 6 MB instead of 160 MB for 20,000 pods.
-   These rows have no uid, labels or creation time yet.
-3. The whole list with its objects' metadata, in one response from the cache, parsed as it streams
-   in, with managedFields and the rest skipped (`list_whole`). It replaces the rows of step 2.
+2. When more follow, every namespace's rows without their objects, read from the API server's cache
+   at least as new as the first page, 32 namespaces at a time (`cells_by_namespace`): about 6 MB
+   instead of 160 MB for 20,000 pods. These rows have no uid or labels, and a creation time read
+   from their Age. The list is complete there: its watch starts from the first page's version, so
+   it replays every change since, and each event gives its row its uid and labels.
+
+The metadata of every row is downloaded only when something needs it: a filter on labels makes the
+watch list again with it, in one response from the cache parsed as it streams in, with
+managedFields and the rest skipped (`list_whole`), and so does a list the Timeline records. A delete
+from such a row reads the object's uid first, and leaves alone an object newer than the row (one
+re-created under the same name since the list).
 
 Rows keep only the metadata they need; full objects are fetched only when a custom column needs
 them. Responses are gzip-compressed. The usage bars and the cluster overview take the pods'
