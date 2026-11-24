@@ -160,7 +160,7 @@ mod tests {
         /// No edit keeps the live object as it is; an edit of an unchanged object is the edit.
         #[test]
         fn a_rebase_keeps_what_the_edit_did_not_touch(base in object(), edited in object(), live in object()) {
-            prop_assert_eq!(rebase(&base, &base, &live), live.clone());
+            prop_assert_eq!(rebase(&base, &base, &live), live);
             prop_assert_eq!(rebase(&base, &edited, &base), edited);
         }
     }

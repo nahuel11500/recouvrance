@@ -617,7 +617,7 @@ async fn dry_run_diff(
     ns: Option<String>,
     name: &str,
     doc: serde_json::Value,
-) -> anyhow::Result<(String, Section)> {
+) -> Result<(String, Section)> {
     let label = preview::object_label(&kind, ns.as_deref(), name);
     let (secret, said) = (kind.is("", "Secret"), format!("[dry run] {} {name} applied", kind.ar.kind));
     let obj = k8s::ObjectRef { kind: kind.clone(), name: name.to_string(), namespace: ns.clone(), uid: String::new() };
