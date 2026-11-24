@@ -227,6 +227,14 @@ impl AppView {
                     let risky = crate::settings::is_protected(ctx);
                     let accent: Hsla = crate::settings::context_color(ctx).map_or(theme.blue, |c| rgb(c).into());
                     let picked = self.picked.contains(ctx);
+                    // A context of the set still connecting or that failed says so (and why).
+                    let (state, state_color, why) = match self.conn.get(ctx) {
+                        Some(super::conn::Conn::Connecting) => (Some("connecting…"), theme.muted_foreground, None),
+                        Some(super::conn::Conn::Failed(why)) => {
+                            (Some("can't connect"), theme.danger, Some(why.clone()))
+                        }
+                        None => (None, theme.muted_foreground, None),
+                    };
                     h_flex()
                         .id(("ctx-card", i))
                         .w(px(290.))
@@ -261,12 +269,20 @@ impl AppView {
                                         .child(ctx.clone()),
                                 )
                                 .child(
-                                    div()
+                                    h_flex()
+                                        .gap_2()
                                         .text_xs()
-                                        .text_color(if risky { theme.warning } else { theme.muted_foreground })
-                                        .child(if risky { "protected" } else { "context" }),
+                                        .child(
+                                            div()
+                                                .text_color(if risky { theme.warning } else { theme.muted_foreground })
+                                                .child(if risky { "protected" } else { "context" }),
+                                        )
+                                        .when_some(state, |d, s| d.child(div().text_color(state_color).child(s))),
                                 ),
                         )
+                        .when_some(why, |d, why| {
+                            d.tooltip(move |w, cx| component::tooltip::Tooltip::new(why.clone()).build(w, cx))
+                        })
                 })))
                 .child(
                     h_flex()

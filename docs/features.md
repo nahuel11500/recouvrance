@@ -3,9 +3,13 @@
 - **Contexts**: pick one or several on launch; tables merge clusters with a Context column. Each
   context connects on its own: the first rows show once one cluster has answered and the others
   have had 2 more seconds, so a cluster that can't be reached, or a login waiting in the browser,
-  doesn't hold back the others' rows. A cluster still connecting is said above the list and joins
-  it when it answers, and the page on screen then (a Cluster or Argo CD overview is built again);
-  one that fails shows its own error. Once every cluster is in, the set's session is saved again
+  doesn't hold back the others' rows. Until one of the set answers, the list's place shows each
+  context as "Connecting…" or "Can't connect: <why>" (never an empty "No resources"), with Retry
+  and Choose contexts; once others show rows, those still connecting or failed get a line each
+  above the list. The context picker and the Contexts page mark them too ("connecting…", "can't
+  connect" with the reason in a tooltip). A cluster still connecting joins the list when it
+  answers, and the page on screen then (a Cluster or Argo CD overview is built again). Retry
+  connects to the whole set again. Once every cluster is in, the set's session is saved again
   (and reopened whole if it was reopened without them and nothing changed since). The Pods list starts with the connect,
   alongside the cluster's discovery and namespace list, when it is the list shown first. When a
   context's login command (its kubeconfig exec plugin) fails, the app says which program failed and
