@@ -1136,6 +1136,36 @@ pub async fn read_app(endpoint: Arc<Endpoint>, namespace: String, name: String) 
     read.await.unwrap_or_else(|e| Err(format!("{e:#}")))
 }
 
+/// The dashboard of the Application `namespace/name`, read by the API with the server's login
+/// as the config has it now: the Application whole, then its resource tree and managed
+/// resources together, then the commits it deploys (each kept once read). Read-only.
+pub async fn dashboard(
+    endpoint: Arc<Endpoint>,
+    namespace: String,
+    name: String,
+) -> Result<super::dashboard::Read, String> {
+    let read = crate::k8s::run_abortable(async move {
+        let found = current(&endpoint.server.base).and_then(|e| Ok((e.conn()?, e.login.clone()?.1)));
+        let (conn, how) = match found {
+            Ok(found) => found,
+            Err(e) => return Ok(Err(e)),
+        };
+        let app = match conn.get(&app_path(&namespace, &name)).await {
+            Ok(app) => app,
+            Err(f) => return Ok(Err(f.text)),
+        };
+        let shown = conn.server.name();
+        let get = |path: String| {
+            let conn = conn.clone();
+            async move { conn.get(&path).await.map_err(|f| f.text) }
+        };
+        let diff_of = |v: &Value| server::diffs(v, shown.clone(), how);
+        let base = conn.server.base.clone();
+        Ok(Ok(super::dashboard::extras(&base, &namespace, &name, app, get, diff_of).await))
+    });
+    read.await.unwrap_or_else(|e| Err(format!("{e:#}")))
+}
+
 /// What can be asked of an Application by the API.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Action {

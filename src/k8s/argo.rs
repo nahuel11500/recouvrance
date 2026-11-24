@@ -21,6 +21,7 @@ use super::{ContextTarget, Kind, ObjectRef};
 use crate::status::Tone;
 
 pub mod api;
+pub mod dashboard;
 pub mod diagnosis;
 pub mod grouping;
 pub mod ops;

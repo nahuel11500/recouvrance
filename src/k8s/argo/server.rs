@@ -269,6 +269,24 @@ fn login(context: &str, server: &Server) -> Result<(String, Login), String> {
     }
 }
 
+/// The Argo CD server set for the hub `context`, the token to send it and where that comes
+/// from; or why there is none to ask. Reads files: call it off the UI thread.
+pub(super) fn login_for(context: &str) -> Result<(Server, String, Login), String> {
+    let server = match server_of(context) {
+        Some(Ok(server)) => server,
+        Some(Err(e)) => return Err(e),
+        None => return Err(format!("No Argo CD server is set for {context} in Settings")),
+    };
+    let (token, how) = login(context, &server)?;
+    Ok((server, token, how))
+}
+
+/// GET `path` (of Argo CD's API) on `server` with `token`; errors never hold the token.
+pub(super) async fn get_path(server: &Server, token: &str, path: &str) -> Result<Value, String> {
+    let url = format!("{}{path}", server.base);
+    super::api::send(http::Method::GET, url, token, None, false, server).await.map_err(|f| f.text)
+}
+
 /// `text` with every copy of `token` replaced: an error never shows it, whatever echoed it.
 pub(super) fn scrub(text: &str, token: &str) -> String {
     if token.is_empty() { text.to_string() } else { text.replace(token, "[token]") }
@@ -431,7 +449,7 @@ fn mask_secret_pair(live: &mut Value, target: &mut Value) {
 
 /// Argo CD's managed resources (its answer) as diffs from live to git: each resource that
 /// differs, a Secret's values masked.
-fn diffs(body: &Value, server: String, login: Login) -> GitDiff {
+pub(super) fn diffs(body: &Value, server: String, login: Login) -> GitDiff {
     let items = body.get("items").and_then(Value::as_array).map_or(&[][..], Vec::as_slice);
     let mut out = GitDiff { server, login, changed: Vec::new(), more: 0, same: 0, hooks: 0 };
     for item in items {
