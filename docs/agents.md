@@ -230,10 +230,16 @@ tools' definitions. What some of them need beyond the obvious verb:
   the Application is found tracking the object), with its hub, sync, health and the object's own
   state in it; `get_changes` adds the Application's deployments. That Application is read on the
   same hubs, only where an Allow rule gives `get` on it (or `list`, to find it in another
-  namespace or by label), and nothing is read for an object that names none. `wait_for` waits for
-  an Application's `sync=Synced`, `health=Healthy` or `operation=Succeeded`, met only once no
-  operation runs (until then they are from before it); it returns at once with Argo CD's message
-  when the last operation failed.
+  namespace or by label), and nothing is read for an object that names none. A label alone
+  reads only hubs already connected for agents, never connecting or logging in to one; the hubs
+  are read together, each bounded in time, and one that failed is left alone 5 minutes (said for
+  a tracking id). An Application of the same name on another hub counts only if it deploys to
+  the object's cluster or tracks the object; several that fit as well are named as unclear.
+  `wait_for` waits for an Application's `sync=Synced`, `health=Healthy` or
+  `operation=Succeeded`, met only once no operation runs (until then they are from before it);
+  a `sync=` or `operation=` wait returns at once with Argo CD's message when the last operation
+  failed on the revision the Application targets now (or auto-sync is off). A failure on an
+  older revision with auto-sync on waits for the next sync.
 - **Argo CD diagnosis:** `gitops` with `action: diagnose` on an Application changes nothing and
   needs `get` on it (not `refresh` or `sync`; the activity log doesn't count it as a change). It returns the
   diagnosis of the Application's page: a deletion held by a finalizer, a sync running for long,

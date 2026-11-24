@@ -41,7 +41,7 @@ pub const DEFAULT_NAMESPACE: &str = "argocd";
 /// A context that did not answer is left alone this long before it is tried again.
 const RETRY: Duration = Duration::from_secs(300);
 /// The longest wait for a context to connect, then to answer whether it serves Applications.
-const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 /// A hub's Applications are listed at most this often, however many pages ask.
 const LIST_TTL: Duration = Duration::from_secs(30);
 /// Contexts probed at the same time.
@@ -695,6 +695,34 @@ pub fn known_hubs() -> Vec<String> {
         probes.iter().filter(|(_, p)| matches!(p, Probe::Serves(_))).map(|(c, _)| c.clone()).collect();
     hubs.sort();
     hubs
+}
+
+/// The contexts an agent's read failed to reach, why, and when: left alone `RETRY`, as the
+/// probes are, so a hub that is down doesn't make every agent call wait for it again.
+static UNREACHED: LazyLock<Mutex<HashMap<String, (String, Instant)>>> = LazyLock::new(Default::default);
+
+/// Say an agent's read could not reach `context`.
+pub fn note_unreached(context: &str, why: String) {
+    UNREACHED.lock().unwrap_or_else(PoisonError::into_inner).insert(context.to_string(), (why, Instant::now()));
+}
+
+/// Say an agent's read reached `context`.
+pub fn note_reached(context: &str) {
+    UNREACHED.lock().unwrap_or_else(PoisonError::into_inner).remove(context);
+}
+
+/// Why `context` is not asked again yet: an agent's read failed to reach it less than
+/// `RETRY` before `now`, or (with `probes`) so did a probe of the window's pages.
+pub fn recent_failure(context: &str, probes: bool, now: Instant) -> Option<String> {
+    let fresh = |at: &Instant| now.saturating_duration_since(*at) < RETRY;
+    if probes
+        && let Some(Probe::Failed(why, at)) = PROBES.lock().unwrap_or_else(PoisonError::into_inner).get(context)
+        && fresh(at)
+    {
+        return Some(why.clone());
+    }
+    let unreached = UNREACHED.lock().unwrap_or_else(PoisonError::into_inner);
+    unreached.get(context).filter(|(_, at)| fresh(at)).map(|(why, _)| why.clone())
 }
 
 /// Ask one context whether it serves Applications, now (its login may run): Ok(true) when it
@@ -1388,6 +1416,26 @@ mod tests {
         assert!(tracking_of("apps", "Deployment", &obj("web-copy")).is_none());
         assert!(tracking_of("apps", "StatefulSet", &obj("web")).is_none());
         assert!(tracking_of("apps", "Deployment", &json!({"metadata": {"name": "web"}})).is_none());
+    }
+
+    /// A context an agent's read could not reach is not asked again for `RETRY`, then is.
+    #[test]
+    fn a_hub_that_failed_recently_is_not_asked_again() {
+        let hub = "unreached-test-hub";
+        assert_eq!(recent_failure(hub, true, Instant::now()), None);
+        note_unreached(hub, "did not answer".into());
+        assert_eq!(recent_failure(hub, false, Instant::now()).as_deref(), Some("did not answer"));
+        assert_eq!(recent_failure(hub, true, Instant::now() + RETRY), None, "asked again once RETRY is over");
+        note_reached(hub);
+        assert_eq!(recent_failure(hub, true, Instant::now()), None);
+        // A probe of the window's that failed counts too, when asked for.
+        let probed = "probe-failed-test-hub";
+        PROBES
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(probed.into(), Probe::Failed("timed out".into(), Instant::now()));
+        assert_eq!(recent_failure(probed, true, Instant::now()).as_deref(), Some("timed out"));
+        assert_eq!(recent_failure(probed, false, Instant::now()), None);
     }
 
     #[test]
