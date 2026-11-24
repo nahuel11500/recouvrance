@@ -15,6 +15,7 @@ use kube::Client;
 
 use crate::details::ConfirmButtons as _;
 use crate::k8s::{self, Kind};
+use crate::mcp::preview::{self, Section};
 use crate::ui::data_edit::{DataEditor, DataSaved};
 
 const HEADER: &str = "# Paste one or more YAML documents, pick a template, open or drop a file, then Dry run and Apply (server-side apply).\n";
@@ -372,7 +373,8 @@ impl ApplyView {
         self.busy = true;
         self.results.clear();
         self._task = Some(cx.spawn_in(window, async move |this, cx| {
-            let (results, forbidden) = apply_docs_counted(client, kinds, default_ns, docs.clone(), true).await;
+            let (results, forbidden, sections) =
+                apply_docs_counted(client, kinds, default_ns, docs.clone(), true, true).await;
             let _ = this.update_in(cx, |this, window, cx| {
                 this.busy = false;
                 let failed = results.iter().filter(|p| !p.ok).count();
@@ -382,16 +384,24 @@ impl ApplyView {
                 this.results = results;
                 this.mark(window, cx);
                 if (failed == 0 || refused) && crate::details::writes_still_on(window, cx) {
-                    this.confirm_apply(docs, refused, window, cx);
+                    this.confirm_apply(docs, refused, crate::mcp::Preview::of(sections), window, cx);
                 }
             });
         }));
         cx.notify();
     }
 
-    /// What will be applied, object by object, then the real apply once confirmed.
-    /// `refused`: the dry run was refused to you, and only runs as the context's identity.
-    fn confirm_apply(&mut self, docs: Vec<Doc>, refused: bool, window: &mut Window, cx: &mut Context<Self>) {
+    /// What will be applied, object by object with what the dry run changes in it (`diff`),
+    /// then the real apply once confirmed. `refused`: the dry run was refused to you, and
+    /// only runs as the context's identity: the objects are only listed.
+    fn confirm_apply(
+        &mut self,
+        docs: Vec<Doc>,
+        refused: bool,
+        diff: crate::mcp::Preview,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let default_ns = self.namespace.as_deref();
         let mut uses_page_ns = false;
         let objects: Vec<String> = docs
@@ -422,18 +432,25 @@ impl ApplyView {
                 .description(if refused {
                     "The server refused them to you in a dry run (see the results): turn on Run as to apply them as that identity. Server-side apply creates or updates each object:"
                 } else {
-                    "The server dry run passed. Server-side apply creates or updates each object:"
+                    "The server dry run passed. Server-side apply creates or updates each object, against what is on the cluster now:"
                 })
-                .child(
-                    v_flex().gap_0p5().max_h(px(220.)).overflow_hidden().children(
-                        objects
-                            .iter()
-                            .take(20)
-                            .cloned()
-                            .chain((n > 20).then(|| format!("…and {} more", n - 20)))
-                            .map(|o| div().text_sm().font_family(mono.clone()).text_color(muted).child(o)),
-                    ),
-                )
+                .child(if refused {
+                    v_flex()
+                        .gap_0p5()
+                        .max_h(px(220.))
+                        .overflow_hidden()
+                        .children(
+                            objects
+                                .iter()
+                                .take(20)
+                                .cloned()
+                                .chain((n > 20).then(|| format!("…and {} more", n - 20)))
+                                .map(|o| div().text_sm().font_family(mono.clone()).text_color(muted).child(o)),
+                        )
+                        .into_any_element()
+                } else {
+                    crate::details::preview_scroll("apply-diff", &diff, cx)
+                })
                 .child(crate::details::confirm_with(&cmd, guard.as_ref(), &run_as, cx))
                 .confirm_buttons("Apply", false, guard.as_ref())
                 .on_ok(move |_, window, cx| {
@@ -544,18 +561,20 @@ async fn apply_docs(
     docs: Vec<Doc>,
     dry_run: bool,
 ) -> Vec<Problem> {
-    apply_docs_counted(client, kinds, default_ns, docs, dry_run).await.0
+    apply_docs_counted(client, kinds, default_ns, docs, dry_run, false).await.0
 }
 
-/// [`apply_docs`], with how many objects the server refused as forbidden.
+/// [`apply_docs`], with how many objects the server refused as forbidden and, for a dry run
+/// with `diff` (before the confirmation), what each object accepted changes.
 async fn apply_docs_counted(
     client: Client,
     kinds: Vec<Kind>,
     default_ns: Option<String>,
     docs: Vec<Doc>,
     dry_run: bool,
-) -> (Vec<Problem>, usize) {
-    let (mut results, mut forbidden) = (Vec::new(), 0);
+    diff: bool,
+) -> (Vec<Problem>, usize, Vec<Section>) {
+    let (mut results, mut forbidden, mut sections) = (Vec::new(), 0, Vec::new());
     for Doc { start: base, body, value: doc } in docs {
         let kind_name = doc["kind"].as_str().unwrap_or_default().to_string();
         let name = doc.pointer("/metadata/name").and_then(|v| v.as_str()).unwrap_or("?").to_string();
@@ -567,7 +586,15 @@ async fn apply_docs_counted(
             }
         };
         let ns = target_ns(&doc, kind.namespaced, default_ns.as_deref());
-        match k8s::apply(client.clone(), kind, ns, doc, dry_run).await {
+        let sent = if dry_run && diff {
+            dry_run_diff(client.clone(), kind, ns, &name, doc).await.map(|(msg, section)| {
+                sections.push(section);
+                msg
+            })
+        } else {
+            k8s::apply(client.clone(), kind, ns, doc, dry_run).await
+        };
+        match sent {
             Ok(msg) => results.push(Problem { ok: true, text: msg, line: None }),
             Err(e) => {
                 forbidden += usize::from(k8s::api_status(&e) == Some(403));
@@ -579,7 +606,31 @@ async fn apply_docs_counted(
             }
         }
     }
-    (results, forbidden)
+    (results, forbidden, sections)
+}
+
+/// A dry run of applying `doc`, and what it changes in the object as it is now (read at the
+/// same time). A Secret's values are never shown.
+async fn dry_run_diff(
+    client: Client,
+    kind: Kind,
+    ns: Option<String>,
+    name: &str,
+    doc: serde_json::Value,
+) -> anyhow::Result<(String, Section)> {
+    let label = preview::object_label(&kind, ns.as_deref(), name);
+    let (secret, said) = (kind.is("", "Secret"), format!("[dry run] {} {name} applied", kind.ar.kind));
+    let obj = k8s::ObjectRef { kind: kind.clone(), name: name.to_string(), namespace: ns.clone(), uid: String::new() };
+    let live = k8s::get_object(client.clone(), obj);
+    let after = k8s::apply_value(client, kind, ns, doc, true, false);
+    let (live, after) = futures::join!(live, after);
+    let after = after?;
+    let section = match live {
+        Ok(live) => preview::object_section(&label, Some(&live), &after, secret),
+        Err(e) if k8s::is_not_found(&e) => preview::object_section(&label, None, &after, secret),
+        Err(e) => Section::failed(&label, format!("not compared: reading it failed: {}", k8s::short_error(&e))),
+    };
+    Ok((said, section))
 }
 
 /// YAML is loaded over https only; plain http just from this machine.
