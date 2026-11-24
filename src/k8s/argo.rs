@@ -6,6 +6,7 @@
 //! terminate through `argo_operation` (built by `ops`), with the hub's UI client, so the
 //! write gate applies to them like to any write.
 
+use std::borrow::Borrow;
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 use std::time::{Duration, Instant};
@@ -19,9 +20,12 @@ use serde_json::Value;
 use super::{ContextTarget, Kind, ObjectRef};
 use crate::status::Tone;
 
+pub mod api;
 pub mod diagnosis;
+pub mod grouping;
 pub mod ops;
 pub mod server;
+pub mod windows;
 
 /// The annotation Argo CD puts on what it deploys.
 pub const TRACKING_ID: &str = "argocd.argoproj.io/tracking-id";
@@ -294,6 +298,12 @@ pub struct Summary {
     pub deleting: Option<String>,
     /// This object's own (sync, health, health message) in it, on an object's page.
     pub own: Option<(String, String, Option<String>)>,
+    /// Its labels, sorted by key.
+    pub labels: Vec<(String, String)>,
+    /// Its destination as written: the server URL, the cluster name, the namespace.
+    pub dest_server: String,
+    pub dest_name: String,
+    pub dest_namespace: String,
 }
 
 /// A revision as shown: a git sha cut to 8 characters, anything else (a chart version) whole.
@@ -383,6 +393,16 @@ impl Summary {
             urls,
             deleting: s("/metadata/deletionTimestamp"),
             own: None,
+            labels: app
+                .pointer("/metadata/labels")
+                .and_then(Value::as_object)
+                .into_iter()
+                .flatten()
+                .filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_string())))
+                .collect(),
+            dest_server: s("/spec/destination/server").unwrap_or_default(),
+            dest_name: s("/spec/destination/name").unwrap_or_default(),
+            dest_namespace: s("/spec/destination/namespace").unwrap_or_default(),
         }
     }
 
@@ -940,12 +960,13 @@ pub async fn destination_of(app: Value, hub: String, connected: Vec<String>) -> 
 /// The Application that made each one (an app of apps), as an index in `apps` (one hub's):
 /// the one its tracking id names, else the one listing it among its resources, else the one
 /// its instance label names (label tracking), when only one has that name.
-pub fn parents(apps: &[Value]) -> Vec<Option<usize>> {
+pub fn parents<V: Borrow<Value>>(apps: &[V]) -> Vec<Option<usize>> {
     fn meta<'a>(app: &'a Value, field: &str) -> &'a str {
         app.get("metadata").and_then(|m| m.get(field)).and_then(Value::as_str).unwrap_or_default()
     }
     let mut by_key: HashMap<(&str, &str), usize> = HashMap::new();
     let mut by_name: HashMap<&str, Vec<usize>> = HashMap::new();
+    let apps: Vec<&Value> = apps.iter().map(|a| <V as Borrow<Value>>::borrow(a)).collect();
     for (i, a) in apps.iter().enumerate() {
         by_key.insert((meta(a, "namespace"), meta(a, "name")), i);
         by_name.entry(meta(a, "name")).or_default().push(i);
@@ -984,10 +1005,32 @@ pub fn parents(apps: &[Value]) -> Vec<Option<usize>> {
         .collect()
 }
 
+/// Where an Application of the page was read: on a hub's Kubernetes API, or Argo CD's own.
+#[derive(Clone)]
+pub enum Source {
+    Hub(Hub),
+    Api(Arc<api::Endpoint>),
+}
+
+impl Source {
+    /// The hub context, or the API server's name.
+    pub fn label(&self) -> String {
+        match self {
+            Self::Hub(h) => h.context.clone(),
+            Self::Api(e) => e.name(),
+        }
+    }
+}
+
+/// Each project's sync windows, by project name.
+pub type ProjectWindows = Arc<std::collections::BTreeMap<String, Vec<windows::SyncWindow>>>;
+
 /// One Application of the Applications page.
 #[derive(Clone)]
 pub struct FleetApp {
-    pub hub: Hub,
+    pub source: Source,
+    /// Its Argo CD, the same whichever way it is read (see `grouping::hub_instance`).
+    pub instance: String,
     pub app: Summary,
     pub dest: Destination,
     /// The context its destination is shown on (a connected one first), if any reaches it.
@@ -1006,6 +1049,29 @@ pub struct Fleet {
     pub hubs: Vec<String>,
     /// With no hub: the contexts not asked because their login may prompt, likeliest first.
     pub not_asked: Vec<String>,
+    /// The Argo CD API servers read (see `api`), by name.
+    pub servers: Vec<String>,
+    /// Each Argo CD's projects' sync windows (by `instance`), or why they couldn't be read.
+    pub projects: HashMap<String, Result<ProjectWindows, String>>,
+}
+
+impl Fleet {
+    /// When the next sync of `a` can start, from `now`, under its project's sync windows.
+    pub fn next_sync(&self, a: &FleetApp, now: jiff::Timestamp) -> windows::NextSync {
+        let all = match self.projects.get(&a.instance) {
+            None => return windows::NextSync::Unknown("its project's sync windows are not read yet".into()),
+            Some(Err(e)) => return windows::NextSync::Unknown(e.clone()),
+            Some(Ok(projects)) => match projects.get(&a.app.project) {
+                Some(w) => w,
+                None => return windows::NextSync::Unknown(format!("project {} can't be read", a.app.project)),
+            },
+        };
+        let s = &a.app;
+        let applying: Vec<&windows::SyncWindow> =
+            all.iter().filter(|w| w.applies(&s.name, &s.dest_namespace, &s.dest_server, &s.dest_name)).collect();
+        // Auto-sync is held by every window; a manual sync goes through those that allow it.
+        windows::next_sync(&applying, !s.automated, now)
+    }
 }
 
 /// Every Application, read with one list per hub (kept `LIST_TTL`, shared with the pages'
@@ -1020,6 +1086,7 @@ async fn read_fleet(connected: Vec<(String, Client)>) -> Fleet {
     let names: Vec<String> = connected.iter().map(|(n, _)| n.clone()).collect();
     let hubs = hubs(connected).await;
     let targets = targets();
+    let servers = crate::settings::with(|s| s.argocd_servers.clone());
     let lists =
         futures::future::join_all(hubs.found.iter().map(|hub| async move { (hub, applications(hub).await) })).await;
     let mut fleet = Fleet {
@@ -1037,12 +1104,15 @@ async fn read_fleet(connected: Vec<(String, Client)>) -> Fleet {
             }
         };
         let hub_target = target(&targets, &hub.context);
+        let instance = grouping::hub_instance(&hub.context, &servers);
+        fleet.projects.insert(instance.clone(), projects(hub).await);
         let base = fleet.apps.len();
-        for (app, parent) in list.iter().zip(parents(&list)) {
+        for (app, parent) in list.iter().zip(parents(list.as_slice())) {
             let dest = destination(app, &hub_target, &targets);
             let on = dest.context(&names).map(String::from);
             fleet.apps.push(FleetApp {
-                hub: hub.clone(),
+                source: Source::Hub(hub.clone()),
+                instance: instance.clone(),
                 app: Summary::of(app),
                 dest,
                 on,
@@ -1051,6 +1121,106 @@ async fn read_fleet(connected: Vec<(String, Client)>) -> Fleet {
         }
     }
     fleet
+}
+
+/// Argo CD's projects kind.
+fn project_kind() -> ApiResource {
+    ApiResource {
+        group: "argoproj.io".into(),
+        version: "v1alpha1".into(),
+        api_version: "argoproj.io/v1alpha1".into(),
+        kind: "AppProject".into(),
+        plural: "appprojects".into(),
+    }
+}
+
+/// How long a hub's projects (their sync windows) are kept before being listed again.
+const PROJECTS_TTL: Duration = Duration::from_secs(300);
+
+/// A hub's projects' sync windows: one list, kept `PROJECTS_TTL`.
+async fn projects(hub: &Hub) -> Result<ProjectWindows, String> {
+    type Kept = HashMap<String, (Instant, Result<ProjectWindows, String>)>;
+    static KEPT: LazyLock<Mutex<Kept>> = LazyLock::new(Default::default);
+    let kept = KEPT
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get(&hub.context)
+        .filter(|(at, _)| at.elapsed() < PROJECTS_TTL)
+        .map(|(_, kept)| kept.clone());
+    if let Some(kept) = kept {
+        return kept;
+    }
+    let read = super::list_values(hub.client.clone(), project_kind(), None, None)
+        .await
+        .map(|list| {
+            let by_name: std::collections::BTreeMap<String, Vec<windows::SyncWindow>> = list
+                .iter()
+                .filter_map(|p| Some((p.pointer("/metadata/name")?.as_str()?.to_string(), windows::windows_of(p))))
+                .collect();
+            Arc::new(by_name)
+        })
+        .map_err(|e| format!("its projects can't be read: {}", super::lists::load_error(&e)));
+    KEPT.lock().unwrap_or_else(PoisonError::into_inner).insert(hub.context.clone(), (Instant::now(), read.clone()));
+    read
+}
+
+/// What a page has read of one Argo CD API server.
+pub struct ApiRead {
+    pub endpoint: Arc<api::Endpoint>,
+    pub state: api::FeedState,
+}
+
+/// Add the Applications read by Argo CD's API to `fleet` (its hubs' already in). One already
+/// there (the same Argo CD, namespace and name: `grouping::merge_plan`) is shown once, as
+/// read on its hub. `targets` are the kubeconfig's contexts, `connected` those connected.
+pub fn add_api(fleet: &mut Fleet, reads: Vec<ApiRead>, targets: &[ContextTarget], connected: &[String]) {
+    let servers = crate::settings::with(|s| s.argocd_servers.clone());
+    for read in reads {
+        let endpoint = read.endpoint;
+        let instance = endpoint.instance();
+        let name = endpoint.name();
+        fleet.servers.push(name.clone());
+        if let Some(e) = read.state.error.as_ref().filter(|_| !read.state.live) {
+            fleet.errors.push(format!("{name}: {e}"));
+        }
+        if let Some(p) = read.state.projects {
+            fleet.projects.insert(instance.clone(), p);
+        }
+        // Its own cluster (`in-cluster`) is that of the hub whose Argo CD server it is, if set.
+        let hub = servers
+            .iter()
+            .find(|(_, text)| server::Server::parse(text).is_ok_and(|s| s.base == endpoint.server.base))
+            .map_or_else(ContextTarget::default, |(c, _)| target(targets, c));
+        let mut apps: Vec<&Arc<api::ApiApp>> = read.state.apps.values().collect();
+        apps.sort_by(|a, b| (&a.summary.namespace, &a.summary.name).cmp(&(&b.summary.namespace, &b.summary.name)));
+        let values: Vec<&Value> = apps.iter().map(|a| &a.value).collect();
+        let parents = parents(values.as_slice());
+        let present: Vec<grouping::AppKey> =
+            fleet.apps.iter().map(|a| (a.instance.clone(), a.app.namespace.clone(), a.app.name.clone())).collect();
+        let keys: Vec<grouping::AppKey> =
+            apps.iter().map(|a| (instance.clone(), a.summary.namespace.clone(), a.summary.name.clone())).collect();
+        let plan = grouping::merge_plan(&present, &keys);
+        let base = fleet.apps.len();
+        let index = |r: Result<usize, usize>| match r {
+            Ok(i) => base + i,
+            Err(j) => j,
+        };
+        for ((a, parent), placed) in apps.iter().zip(&parents).zip(&plan) {
+            if placed.is_err() {
+                continue;
+            }
+            let dest = destination(&a.value, &hub, targets);
+            let on = dest.context(connected).map(String::from);
+            fleet.apps.push(FleetApp {
+                source: Source::Api(endpoint.clone()),
+                instance: instance.clone(),
+                app: a.summary.clone(),
+                dest,
+                on,
+                parent: parent.map(|p| index(plan[p])),
+            });
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1290,11 +1460,11 @@ mod tests {
             app("team", "team-app", tracked("team_team-root:argoproj.io/Application:team/team-app"), &[]),
             app("team", "team-root", json!({}), &[]),
         ];
-        assert_eq!(parents(&apps), [None, Some(0), Some(0), Some(0), None, None, Some(7), None]);
+        assert_eq!(parents(apps.as_slice()), [None, Some(0), Some(0), Some(0), None, None, Some(7), None]);
         // The parent's namespace isn't `argocd`: found by its name when only one has it.
         let mut moved = apps;
         moved[0]["metadata"]["namespace"] = json!("gitops");
-        assert_eq!(parents(&moved)[1], Some(0));
+        assert_eq!(parents(moved.as_slice())[1], Some(0));
     }
 
     #[test]

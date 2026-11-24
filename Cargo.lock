@@ -5814,6 +5814,7 @@ dependencies = [
  "proptest",
  "regex",
  "rmcp",
+ "rustls",
  "schemars",
  "serde",
  "serde-saphyr 2.1.1",
