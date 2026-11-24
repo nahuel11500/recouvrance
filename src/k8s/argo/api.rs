@@ -1214,6 +1214,27 @@ pub async fn manifests_diff(
     read.await.unwrap_or_else(|e| Err(format!("{e:#}")))
 }
 
+/// What a sync of the Application `namespace/name` would change now (its managed resources,
+/// as a smart diff), read by the API with the server's login as the config has it now. The
+/// diff is worked out in the same task, off the UI thread. Read-only.
+pub async fn sync_preview(
+    endpoint: Arc<Endpoint>,
+    namespace: String,
+    name: String,
+) -> Result<Arc<super::grouped_diff::AppDiff>, String> {
+    let read = crate::k8s::run_abortable(async move {
+        let conn = match current(&endpoint.server.base).and_then(|e| e.conn()) {
+            Ok(c) => c,
+            Err(e) => return Ok(Err(e)),
+        };
+        Ok(match conn.get(&super::dashboard::managed_path(&namespace, &name)).await {
+            Ok(body) => super::grouped_diff::of_managed(body).await,
+            Err(f) => Err(f.text),
+        })
+    });
+    read.await.unwrap_or_else(|e| Err(format!("{e:#}")))
+}
+
 /// What can be asked of an Application by the API.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Action {
