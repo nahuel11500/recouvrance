@@ -25,17 +25,20 @@ mod forward_options;
 mod guard;
 mod history;
 mod logs;
+mod logs_page;
+mod map;
 mod reachability;
 mod related;
 mod tabs;
 
 pub(crate) use actions::*;
-pub(crate) use argo::{ArgoAction, OpenOn, OpenOnContext, confirm_argo_action};
+pub(crate) use argo::{ArgoAction, OpenOn, OpenOnContext, confirm_api_action, confirm_argo_action};
 use browser::FileBrowser;
 pub(crate) use compare::diff_block;
 pub(crate) use guard::*;
 use history::HistoryState;
 pub(crate) use logs::*;
+pub(crate) use logs_page::{LogTarget, LogsPage};
 use related::{container_history_for, container_names, fetch_related, gpu_history_for, history_for};
 use tabs::error_box;
 pub(crate) use tabs::{heading_name, heading_path};
@@ -170,6 +173,8 @@ pub struct DetailPanel {
     events_load: crate::latest::Latest,
     /// The Reachability tab's check, and its test from this machine.
     reach: reachability::Reach,
+    /// What the Map tab read when it was last opened.
+    map: map::MapState,
     /// The Argo CD Applications that deploy the object or into the namespace, when the read
     /// shown started, and a read made at once (after a Sync).
     argo: k8s::argo::Lookup,
@@ -179,6 +184,9 @@ pub struct DetailPanel {
     schema_rows: Vec<crate::overview::SchemaRow>,
     /// An Application's resources table, worked out when it is read rather than on every frame.
     argo_resources: crate::overview::ArgoResources,
+    /// An Application's diff as Argo CD renders it from git (read on a click), and its read.
+    argo_git: crate::overview::ArgoGitDiff,
+    argo_git_load: crate::latest::Latest,
     /// Inline editor of a ConfigMap's or Secret's values.
     data_editor: Option<Entity<crate::ui::data_edit::DataEditor>>,
     /// Show metadata.managedFields in the YAML (hidden by default).
@@ -200,6 +208,8 @@ pub struct DetailPanel {
     favorites: Entity<Favorites>,
     /// Every connected cluster (for Compare).
     pub(crate) clusters: Vec<(String, Client)>,
+    /// The kinds this page's context serves (the Map reads an operator's kinds only when served).
+    pub(crate) kinds: Vec<k8s::Kind>,
     compare: CompareState,
     history: HistoryState,
     /// The related polling and RBAC check run (started on the first read that worked).
@@ -236,6 +246,12 @@ impl DetailPanel {
     /// The object shown, with its context.
     pub fn subject(&self) -> (String, ObjectRef) {
         (self.context.clone(), self.obj.clone())
+    }
+
+    /// The object shown as a favorite (an Argo CD Application by its instance).
+    pub fn favorite(&self) -> crate::favorites::Favorite {
+        let o = &self.obj;
+        crate::favorites::Favorite::for_object(&self.context, &o.kind, o.namespace.clone(), o.name.clone())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -288,11 +304,14 @@ impl DetailPanel {
             object_read: Default::default(),
             events_load: Default::default(),
             reach: Default::default(),
+            map: Default::default(),
             argo: Default::default(),
             argo_started: None,
             argo_load: Default::default(),
             schema_rows: Vec::new(),
             argo_resources: Default::default(),
+            argo_git: Default::default(),
+            argo_git_load: Default::default(),
             data_editor: None,
             show_managed: false,
             field_docs: None,
@@ -305,6 +324,7 @@ impl DetailPanel {
             forwards,
             favorites,
             clusters: Vec::new(),
+            kinds: Vec::new(),
             compare: CompareState::default(),
             history: HistoryState::default(),
             loops_started: false,
@@ -516,16 +536,26 @@ impl DetailPanel {
     pub fn select_tab_named(&mut self, name: &str, cx: &mut Context<Self>) {
         self.tab = tab_named(name);
         self.resume_logs_if_shown(cx);
-        if self.tab == DetailTab::Reachability {
-            self.check_reachability(cx);
-        }
+        self.tab_opened(cx);
         cx.notify();
     }
 
-    /// The Reachability tab shown before the object was read is checked once it is.
-    fn check_reachability_if_waiting(&mut self, cx: &mut Context<Self>) {
+    /// A tab that reads when it is opened reads again: the cluster moves on.
+    fn tab_opened(&mut self, cx: &mut Context<Self>) {
+        match self.tab {
+            DetailTab::Reachability => self.check_reachability(cx),
+            DetailTab::Map => self.load_map(cx),
+            _ => {}
+        }
+    }
+
+    /// The Reachability or Map tab shown before the object was read is read once it is.
+    fn check_tab_if_waiting(&mut self, cx: &mut Context<Self>) {
         if self.tab == DetailTab::Reachability && self.reach.unchecked() {
             self.check_reachability(cx);
+        }
+        if self.tab == DetailTab::Map && self.map.unread() {
+            self.load_map(cx);
         }
     }
 
@@ -552,7 +582,7 @@ impl DetailPanel {
                         this.refresh_yaml(window, cx);
                     }
                     this.start_loops(window, cx);
-                    this.check_reachability_if_waiting(cx);
+                    this.check_tab_if_waiting(cx);
                     if let Some(action) = this.pending_action.take() {
                         this.quick_action(&action, window, cx);
                     }
@@ -665,7 +695,7 @@ impl DetailPanel {
                     }
                     // The first read failed: this one starts the page.
                     this.start_loops(window, cx);
-                    this.check_reachability_if_waiting(cx);
+                    this.check_tab_if_waiting(cx);
                     cx.notify();
                 });
                 if alive.is_err() {
@@ -711,10 +741,12 @@ impl DetailPanel {
                     related.node_stats = this.update(cx, |this, _| this.related.node_stats.clone()).ok().flatten();
                 }
                 let indexed = obj.clone();
+                let mapped = kind.clone();
                 let mut related = exec
                     .spawn(async move {
                         let mut related = related;
                         related.index(&indexed);
+                        related.map = Some(std::sync::Arc::new(crate::map::Known::of(&mapped, &related)));
                         related
                     })
                     .await;
@@ -768,6 +800,7 @@ impl DetailPanel {
                     // A thousand pods take a while to free: not on the UI thread.
                     let old = std::mem::replace(&mut this.related, related);
                     cx.background_executor().spawn(async move { drop(old) }).detach();
+                    this.recompute_map(cx);
                     #[cfg(feature = "dev")]
                     if std::env::var("RECOUVRANCE_COMPARE").is_ok() && this.compare_rev.is_none() {
                         let mut revs: Vec<(i64, String)> = this
@@ -980,6 +1013,8 @@ impl DetailPanel {
             pod_order: self.pod_order,
             argo: &self.argo,
             argo_resources: &self.argo_resources,
+            argo_git: &self.argo_git,
+            context: &self.context,
         }
     }
 

@@ -837,7 +837,8 @@ fn an_agent_cordons_a_node_with_its_drain_rule() {
 }
 
 /// Helm releases are read from their Secrets: denied by a Deny on secrets, listed with the
-/// chart otherwise, and their secret-looking values masked unless the agent may reveal.
+/// chart otherwise, and their secret-looking values masked unless the agent may reveal. The
+/// activity log names the client of each call, and the calls that showed Secret values.
 #[test]
 #[ignore = "needs a kind cluster: RECOUVRANCE_E2E_CONTEXT"]
 fn an_agent_reads_helm_releases_by_its_secret_rules() {
@@ -868,10 +869,27 @@ fn an_agent_reads_helm_releases_by_its_secret_rules() {
             let values = json!({"context": ctx, "namespace": NS, "name": release});
             let out = mcp.call("helm_get_values", values.clone()).await;
             assert!(out.contains("db.local") && !out.contains("hunter2"), "{out}");
+            // The activity log names the client, and says when values were shown: not yet.
+            let last = |tool: &'static str| {
+                let logged = hub.recent_audit(1, |e| e.agent_id == agent.id && e.tool == tool);
+                logged.into_iter().next().context("the call is logged")
+            };
+            let masked = last("helm_get_values")?;
+            assert_eq!(masked.client.as_deref(), Some(concat!("recouvrance-assistant ", env!("CARGO_PKG_VERSION"))));
+            assert!(masked.revealed.is_empty(), "{:?}", masked.revealed);
+            let get = json!({"context": ctx, "kind": "secrets", "namespace": NS, "name": name});
+            let out = mcp.call("get_resource", get.clone()).await;
+            assert!(out.contains(name), "{out}");
+            assert!(last("get_resource")?.revealed.is_empty());
+
             let reveal = rules_file::parse_rule(Mode::Allow, "reveal secrets -n default")?;
             hub.update_agent(&agent.id, |a| a.policy.rules.push(reveal))?;
             let out = mcp.call("helm_get_values", values).await;
             assert!(out.contains("hunter2"), "{out}");
+            assert_eq!(last("helm_get_values")?.revealed, [format!("Helm values {NS}/{release} revision 1")]);
+            let out = mcp.call("get_resource", get).await;
+            assert!(out.contains(name), "{out}");
+            assert_eq!(last("get_resource")?.revealed, [format!("Secret {NS}/{name}")]);
             Ok(())
         };
         let result: Result<()> = checked.await;
@@ -2073,6 +2091,112 @@ fn an_agent_syncs_terminates_and_rolls_back_an_argo_cd_application() {
         };
         let result: Result<()> = checked.await;
         let _ = apps.delete(name, &DeleteParams::default()).await;
+        if installed {
+            use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition;
+            let crds: Api<CustomResourceDefinition> = Api::all(admin);
+            let _ = crds.delete("applications.argoproj.io", &DeleteParams::default()).await;
+        }
+        result
+    });
+}
+
+/// An agent follows an Argo CD Application from its hub to its destination: `argocd_apps`
+/// lists it with the context it deploys to, `describe_resource` and `get_changes` on an object
+/// it deployed name it (by its tracking id), and `wait_for` waits for its sync and returns at
+/// once when its sync failed. Rows the rules don't allow stay out. Only reads.
+#[test]
+#[ignore = "needs a kind cluster: RECOUVRANCE_E2E_CONTEXT"]
+fn an_agent_follows_an_argo_cd_application_to_what_it_deployed() {
+    use kube::api::DynamicObject;
+
+    run(async {
+        let ctx = context();
+        let admin = k8s::connect_for_agents(ctx.clone()).await?;
+        let installed = application_crd(admin.clone()).await?;
+        let kind = k8s::argo::application_kind();
+        let apps: Api<DynamicObject> = Api::namespaced_with(admin.clone(), NS, &kind.ar);
+        let maps: Api<ConfigMap> = Api::namespaced(admin.clone(), NS);
+        let (name, hidden, cm) = ("e2e-argo-read", "e2e-argo-hidden", "e2e-argo-read-cm");
+        for app in [name, hidden] {
+            let _ = apps.delete(app, &DeleteParams::default()).await;
+        }
+        let _ = maps.delete(cm, &DeleteParams::default()).await;
+        let app = |app: &str| {
+            json!({
+                "apiVersion": "argoproj.io/v1alpha1", "kind": "Application",
+                "metadata": {"name": app, "namespace": NS},
+                "spec": {"project": "e2e", "destination": {"server": "https://kubernetes.default.svc", "namespace": NS}},
+                "status": {
+                    "sync": {"status": "OutOfSync", "revision": "3".repeat(40)},
+                    "health": {"status": "Healthy"},
+                    "resources": [{"version": "v1", "kind": "ConfigMap", "namespace": NS, "name": cm, "status": "OutOfSync"}],
+                    "history": [{"id": 1, "revision": "3".repeat(40), "deployedAt": "2025-01-01T00:00:00Z"}],
+                },
+            })
+        };
+        for a in [name, hidden] {
+            apps.create(&PostParams::default(), &serde_json::from_value(app(a))?).await?;
+        }
+        let mut map = config_map(cm);
+        map.metadata.annotations =
+            Some([(k8s::argo::TRACKING_ID.to_string(), format!("{NS}_{name}:/ConfigMap:{NS}/{cm}"))].into());
+        maps.create(&PostParams::default(), &map).await?;
+        let set = |patch: serde_json::Value| {
+            let apps = apps.clone();
+            async move {
+                apps.patch(name, &PatchParams::default(), &Patch::Merge(patch)).await?;
+                anyhow::Ok(())
+            }
+        };
+        let checked = async {
+            let deny = format!("get,list applications.argoproj.io/{hidden} -n {NS}");
+            let (hub, _agent, token, _server) = agent(&["get,list *"], &[deny.as_str()]).await?;
+            let client = crate::assistant::Mcp::connect(hub.port(), token).await?;
+
+            // The hub's Applications, with where each deploys; the one denied stays out.
+            let out = client.call("argocd_apps", json!({"context": ctx})).await;
+            assert!(out.contains(&format!("{NS}/{name}")), "{out}");
+            assert!(out.contains(&format!("{ctx} / {NS}")), "{out}");
+            assert!(!out.contains(hidden), "{out}");
+            assert!(out.contains("1 Application your rules don't let you list left out"), "{out}");
+            // Out of sync with auto-sync off is not a problem; without `context`, the hub found is read.
+            let out = client.call("argocd_apps", json!({"problems_only": true})).await;
+            assert!(out.contains("No Applications found."), "{out}");
+
+            // The object it deployed names it, with its state, and its deployments.
+            let target = json!({"context": ctx, "kind": "configmaps", "namespace": NS, "name": cm});
+            let out = client.call("describe_resource", target.clone()).await;
+            assert!(out.contains(&format!("managed by Application {NS}/{name} on hub {ctx}")), "{out}");
+            assert!(out.contains("This object in it: OutOfSync"), "{out}");
+            let out = client.call("get_changes", target).await;
+            assert!(out.contains(&format!("Deployment 1 · Application {name}")), "{out}");
+
+            // Its sync, once no operation runs; a failed sync ends the wait at once.
+            let wait = |condition: &str| {
+                json!({"context": ctx, "kind": "applications", "namespace": NS, "name": name,
+                    "condition": condition, "timeout_seconds": 20})
+            };
+            set(json!({"status": {"sync": {"status": "Synced"}}})).await?;
+            let out = client.call("wait_for", wait("sync=Synced")).await;
+            assert!(out.contains("sync=Synced") && !out.contains("timed out"), "{out}");
+            set(json!({"status": {"sync": {"status": "OutOfSync"},
+                "operationState": {"phase": "Failed", "message": "e2e: one or more objects failed to apply"}}}))
+            .await?;
+            let started = std::time::Instant::now();
+            let out = client.call("wait_for", wait("sync=Synced")).await;
+            assert!(out.contains("ended Failed: e2e: one or more objects failed to apply"), "{out}");
+            assert!(started.elapsed() < std::time::Duration::from_secs(15), "it waited for the timeout");
+            let on_map = json!({"context": ctx, "kind": "configmaps", "namespace": NS, "name": cm,
+                "condition": "sync=Synced"});
+            let out = client.call("wait_for", on_map).await;
+            assert!(out.contains("a condition of Argo CD Applications"), "{out}");
+            Ok(())
+        };
+        let result: Result<()> = checked.await;
+        for app in [name, hidden] {
+            let _ = apps.delete(app, &DeleteParams::default()).await;
+        }
+        let _ = maps.delete(cm, &DeleteParams::default()).await;
         if installed {
             use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition;
             let crds: Api<CustomResourceDefinition> = Api::all(admin);

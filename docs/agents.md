@@ -162,7 +162,7 @@ Tools, by what they do:
   `top_nodes`, `usage_history`, `get_logs`, `workload_logs`, `get_changes`, `recent_changes`,
   `rollout_history`, `rollout_status`, `list_helm_releases`, `helm_history`, `helm_get_values`,
   `diff_manifest`, `explain_resource`, `can_i`, `cluster_version`, `upgrade_check`, `wait_for`,
-  `list_port_forwards`, `browse_files`, `get_metrics`.
+  `list_port_forwards`, `browse_files`, `get_metrics`, `argocd_apps`.
 - **Change:** `scale`, `rollout_restart`, `rollout_undo`, `rollout_pause`, `rollout_resume`,
   `set_image`, `patch_resource`, `apply_manifest`, `delete_resource`, `trigger_cronjob`,
   `cordon_node`, `uncordon_node`, `drain_node`, `gitops`, `exec_command`, `debug_pod`,
@@ -204,6 +204,29 @@ tools' definitions. What some of them need beyond the obvious verb:
 - **Logs of a workload:** `workload_logs` merges the logs of a workload's or Service's pods (the
   newest 20) in time order, each line prefixed with its pod. It needs `get` on the workload; pods
   whose logs the rules don't allow are left out and counted.
+- **Argo CD, from the hub to the destination:** `argocd_apps` lists Applications like the Argo CD
+  page: for each, its hub (the context Argo CD runs in), project, sync, health, auto-sync, last
+  operation, revision, where it deploys (the kubeconfig context that reaches its destination,
+  marked when the agent's rules don't open it) and the app of apps that made it, those needing a
+  look first with Argo CD's message. Filters: `problems_only` (a failed sync, an error, Degraded
+  or Missing, a sync running, or out of sync with auto-sync on; out of sync with auto-sync off is
+  how an Application synced by hand waits, not a problem), `out_of_sync`, `project`,
+  `destination` (a context) and `dest_namespace`. It reads the hub in `context`, else the hubs
+  ticked in Settings → Contexts, else those the window or an agent's calls found serving
+  Applications, and only among the contexts the rules name: no other context is asked whether it
+  runs Argo CD. It needs `list` on `applications.argoproj.io` on the hub and shows the rows the
+  rules allow; without `context` it never asks for approval and names the hubs only an Ask rule
+  covers. The list is the one the Argo CD page reads (kept 30 s, one per hub).
+  `describe_resource` and `get_changes` name the Application that deployed an object, from its
+  tracking id (`argocd.argoproj.io/tracking-id`, Argo CD's annotation tracking) or else its
+  `app.kubernetes.io/instance` label (label tracking; Helm sets it too, so it counts only when
+  the Application is found tracking the object), with its hub, sync, health and the object's own
+  state in it; `get_changes` adds the Application's deployments. That Application is read on the
+  same hubs, only where an Allow rule gives `get` on it (or `list`, to find it in another
+  namespace or by label), and nothing is read for an object that names none. `wait_for` waits for
+  an Application's `sync=Synced`, `health=Healthy` or `operation=Succeeded`, met only once no
+  operation runs (until then they are from before it); it returns at once with Argo CD's message
+  when the last operation failed.
 - **Argo CD diagnosis:** `gitops` with `action: diagnose` on an Application changes nothing and
   needs `get` on it (not `refresh` or `sync`; the activity log doesn't count it as a change). It returns the
   diagnosis of the Application's page: a deletion held by a finalizer, a sync running for long,
@@ -292,8 +315,13 @@ tools' definitions. What some of them need beyond the obvious verb:
 Prompts (slash commands in Claude Code: `/mcp__recouvrance__troubleshoot` …): `troubleshoot`, `rightsize`,
 `cert-audit`, `cluster-health`. They chain the tools above into a read-only workflow.
 
-Every call is logged with its decision and rule, and appended to
-`~/.local/share/recouvrance/audit.jsonl` (the folder is 0700, the file 0600). At 10 MiB the log moves to
+Every call is logged with its decision and rule, the client it came from, and the Secrets whose values
+it returned, and appended to
+`~/.local/share/recouvrance/audit.jsonl` (the folder is 0700, the file 0600). The client is the name and
+version the MCP client gives (`claude-code 2.1.3`); the in-app assistant shows as
+`recouvrance-assistant` with an API key, and as `assistant via claude-code …` through Claude Code. It is
+a label the client chooses, not a check. A call that returned Secret values unmasked, which a `reveal`
+rule allows, says which (`Secret shop/db`, `Helm values shop/web revision 3`). At 10 MiB the log moves to
 `audit.jsonl.1`, replacing the older one. If the log cannot be written, the Activity page says so. A
 kill switch cuts all agent access at once. A request nobody answers within 2 minutes is refused: its
 banner counts down to that. So that it is seen with the window behind others or minimized, every
@@ -309,10 +337,13 @@ whether a request was refused, left unanswered, given up by the agent or cut off
 A session ends when its client closes it or after an hour unused, never while its agent still waits
 for one of its calls, however long that takes.
 
-The Activity page groups calls by task: one agent session, split where the agent paused for more than
-10 minutes. Each group says what it touched (contexts, namespaces, objects); repeated calls of a tool on
-the same target fold into one line, and any line opens to its full arguments and result. Filter by
-writes, denied or failed calls, context, agent or text. It shows the latest 300 calls; "Show older"
+The Activity page groups calls by task: one session of one client, split where the agent paused for
+more than 10 minutes. Each group names its client and says what it touched (contexts, namespaces,
+objects) and how many of its calls showed Secret values; repeated calls of a tool on the same target fold
+into one line, and any line opens to its full arguments and result. Filter by writes, denied or failed
+calls, calls that showed Secret values, context, agent or text. The search box also takes terms:
+`client:`, `tool:`, `ctx:`, `ns:` and `kind:` (part of the value), `is:write` and `is:reveal`; every
+term must match. It shows the latest 300 calls; "Show older"
 goes further back, and then reads the log on disk. A call counts as a write when its tool may change
 something (the changes above, and `browse_files` with `debug: true`), but not a dry run nor `gitops`'s
 `diagnose`; each group counts its writes. A `gitops` dry run counts: it writes the Application's

@@ -41,6 +41,26 @@ impl Latest {
         }));
     }
 
+    /// The same, for a load that gives its results a part at a time (each cluster's, say):
+    /// each part is applied as it comes, until the stream ends or another load starts.
+    pub fn spawn_each_in<V: 'static, T: 'static>(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<V>,
+        parts: impl futures::Stream<Item = T> + 'static,
+        mut apply: impl FnMut(&mut V, T, &mut Window, &mut Context<V>) + 'static,
+    ) {
+        use futures::StreamExt as _;
+        self.0 = Some(cx.spawn_in(window, async move |this, cx| {
+            let mut parts = std::pin::pin!(parts);
+            while let Some(part) = parts.next().await {
+                if this.update_in(cx, |view, window, cx| apply(view, part, window, cx)).is_err() {
+                    break;
+                }
+            }
+        }));
+    }
+
     /// Drop the running load: its result will not be applied.
     pub fn cancel(&mut self) {
         self.0 = None;

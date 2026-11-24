@@ -11,7 +11,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use super::{AppView, Route};
-use crate::favorites::{FavObject, Favorites, SavedView};
+use crate::favorites::{Favorite, Favorites, SavedView};
 use crate::k8s;
 use crate::k8s::Kind;
 
@@ -173,7 +173,7 @@ impl AppView {
             // Agents' forwards: who opened them, until when; stopped like the others.
             .children(agents.into_iter().map(|f| {
                 let (id, hub) = (f.id, self.hub.clone());
-                let until = f.until.to_zoned(jiff::tz::TimeZone::system()).strftime("%H:%M");
+                let until = f.until.to_zoned_datetime(jiff::tz::TimeZone::system()).strftime("%H:%M");
                 let detail = f
                     .error
                     .clone()
@@ -436,11 +436,13 @@ impl AppView {
         rows
     }
 
-    /// Starred kinds, then starred objects on the connected clusters.
+    /// Starred kinds, then the other favorites (contexts, namespaces, Argo CD Applications,
+    /// objects), on any context: one on a context that isn't connected connects it when
+    /// clicked, and one whose target is gone says so.
     fn favorite_rows(&self, selected: Option<&str>, colors: Colors, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let fav_kinds: Vec<String> = self.favorites.read(cx).kinds().to_vec();
-        let fav_objects: Vec<FavObject> = self.favorites.read(cx).objects().to_vec();
-        if fav_kinds.is_empty() && fav_objects.is_empty() {
+        let favorites: Vec<Favorite> = self.favorites.read(cx).all();
+        if fav_kinds.is_empty() && favorites.is_empty() {
             return Vec::new();
         }
         let mut rows = vec![section_header("Favorites".into(), Lucide::Star, colors).into_any_element()];
@@ -462,20 +464,18 @@ impl AppView {
                 .into_any_element(),
             );
         }
-        for (i, o) in fav_objects.into_iter().enumerate() {
-            let Some(ctx) = self.clusters.iter().position(|(c, _)| *c == o.context) else { continue };
-            let detail = format!(
-                "{} · {}",
-                o.kind.split('.').next().unwrap_or_default(),
-                o.namespace.clone().unwrap_or_default()
-            );
-            let (favs, fav) = (self.favorites.clone(), o.clone());
-            let remove = move |cx: &mut App| favs.update(cx, |f, cx| f.toggle_object(fav.clone(), cx));
+        let standings = self.favorite_standings(&favorites, cx);
+        for (i, (f, standing)) in favorites.into_iter().zip(standings).enumerate() {
+            let detail = match standing.note() {
+                Some(note) => format!("{} · {note}", f.what()),
+                None => f.what(),
+            };
+            let (favs, fav) = (self.favorites.clone(), f.clone());
+            let remove = move |cx: &mut App| favs.update(cx, |favs, cx| favs.toggle(fav.clone(), cx));
+            let row = two_line_row(("fav-obj", i), ("unfav", i), f.title(), detail, colors, remove);
             rows.push(
-                two_line_row(("fav-obj", i), ("unfav", i), o.name.clone(), detail, colors, remove)
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.open_object_in(ctx, &o.kind, o.name.clone(), o.namespace.clone(), window, cx);
-                    }))
+                row.when(standing.gone(), |d| d.opacity(0.6))
+                    .on_click(cx.listener(move |this, _, window, cx| this.open_favorite(f.clone(), true, window, cx)))
                     .into_any_element(),
             );
         }

@@ -192,8 +192,9 @@ pub(super) fn scheduling(obj: &Value, spec: &str, cx: &App) -> AnyElement {
     v_flex().child(heading("Scheduling")).child(col).into_any_element()
 }
 
-/// Map tab: what this workload is made of and what it touches, as a tree.
-pub fn relations(ctx: &Ctx, cx: &App) -> AnyElement {
+/// The Map tab's tree of a pod or workload (`map::has_tree`): what it is made of and what it
+/// touches. The rest of the Map (owners, PDBs, HPAs, Ingresses…) is drawn under it.
+pub fn relation_rows(ctx: &Ctx, cx: &App) -> Vec<AnyElement> {
     let obj = ctx.obj;
     let theme = cx.theme().clone();
     let is_pod = ctx.kind.is("", "Pod");
@@ -254,7 +255,8 @@ pub fn relations(ctx: &Ctx, cx: &App) -> AnyElement {
         ));
     }
 
-    // Config the pods read.
+    // What the pods use: ConfigMaps, Secrets, PVCs and the ServiceAccount, as the Problems
+    // page reads them.
     let mut seen = std::collections::BTreeSet::new();
     let mut config = |kind: &str, plural: &str, name: Option<&str>, icon: Lucide, rows: &mut Vec<AnyElement>| {
         if let Some(name) = name.filter(|n| !n.is_empty())
@@ -263,62 +265,18 @@ pub fn relations(ctx: &Ctx, cx: &App) -> AnyElement {
             rows.push(node(1, icon, kind, ctx.link(name.to_string(), plural, name, cx).into_any_element(), None));
         }
     };
-    for v in arr(obj, &format!("{spec}/volumes")) {
-        config(
-            "ConfigMap",
-            "configmaps",
-            v.pointer("/configMap/name").and_then(Value::as_str),
-            Lucide::FileText,
-            &mut rows,
-        );
-        config(
-            "Secret",
-            "secrets",
-            v.pointer("/secret/secretName").and_then(Value::as_str),
-            Lucide::KeyRound,
-            &mut rows,
-        );
-        config(
-            "PVC",
-            "persistentvolumeclaims",
-            v.pointer("/persistentVolumeClaim/claimName").and_then(Value::as_str),
-            Lucide::Database,
-            &mut rows,
-        );
-    }
-    for c in arr(obj, &format!("{spec}/containers")).iter().chain(arr(obj, &format!("{spec}/initContainers"))) {
-        for e in c["envFrom"].as_array().into_iter().flatten() {
-            config(
-                "ConfigMap",
-                "configmaps",
-                e.pointer("/configMapRef/name").and_then(Value::as_str),
-                Lucide::FileText,
-                &mut rows,
-            );
-            config(
-                "Secret",
-                "secrets",
-                e.pointer("/secretRef/name").and_then(Value::as_str),
-                Lucide::KeyRound,
-                &mut rows,
-            );
-        }
-        for e in c["env"].as_array().into_iter().flatten() {
-            config(
-                "ConfigMap",
-                "configmaps",
-                e.pointer("/valueFrom/configMapKeyRef/name").and_then(Value::as_str),
-                Lucide::FileText,
-                &mut rows,
-            );
-            config(
-                "Secret",
-                "secrets",
-                e.pointer("/valueFrom/secretKeyRef/name").and_then(Value::as_str),
-                Lucide::KeyRound,
-                &mut rows,
-            );
-        }
+    let namespace = ctx.ns();
+    let pod_spec = obj.pointer(spec).unwrap_or(&Value::Null);
+    for t in crate::problems::references::spec_refs(namespace.as_deref(), pod_spec, true) {
+        use crate::problems::references::Of;
+        let (kind, plural, icon) = match t.of {
+            Of::ConfigMap => ("ConfigMap", "configmaps", Lucide::FileText),
+            Of::Secret => ("Secret", "secrets", Lucide::KeyRound),
+            Of::Claim => ("PVC", "persistentvolumeclaims", Lucide::Database),
+            Of::ServiceAccount => ("ServiceAccount", "serviceaccounts", Lucide::Users),
+            Of::StorageClass | Of::Service => continue,
+        };
+        config(kind, plural, Some(t.name.as_str()), icon, &mut rows);
     }
     // StatefulSet volume claim templates.
     for t in arr(obj, "/spec/volumeClaimTemplates") {
@@ -385,7 +343,7 @@ pub fn relations(ctx: &Ctx, cx: &App) -> AnyElement {
         }
     }
     let notes = load_notes(ctx.related, &["pods", "services", "revisions"], cx);
-    scroll(v_flex().pt_2().children(notes).children(rows), "relations")
+    notes.map(IntoElement::into_any_element).into_iter().chain(rows).collect()
 }
 
 /// Pod template of a ReplicaSet as YAML, without the per-revision hash label.

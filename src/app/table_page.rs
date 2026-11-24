@@ -13,7 +13,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use kube::Client;
 
-use super::AppView;
+use super::{AppView, Route};
 use crate::details::ConfirmButtons as _;
 use crate::favorites::SavedView;
 use crate::k8s;
@@ -270,6 +270,17 @@ impl AppView {
                         cx.write_to_clipboard(ClipboardItem::new_string(names.join("\n")));
                     }),
                 ))
+                .when(acts.contains(&"logs"), |d| {
+                    d.child(
+                        Button::new("sel-logs")
+                            .ghost()
+                            .small()
+                            .icon(Lucide::ScrollText)
+                            .label("Logs")
+                            .tooltip("Their logs together, in time order")
+                            .on_click(cx.listener(|this, _, w, cx| this.open_checked_logs(w, cx))),
+                    )
+                })
                 .when(acts.contains(&"scale"), |d| {
                     d.child(
                         Button::new("sel-scale")
@@ -312,6 +323,34 @@ impl AppView {
                 )
                 .into_any_element(),
         )
+    }
+
+    /// The logs of the checked rows shown (pods, or the pods of workloads and Services), on
+    /// every cluster they are on, merged on one page. Reading logs changes nothing: no write
+    /// mode is needed.
+    pub(super) fn open_checked_logs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(kind) = self.kind.clone().filter(k8s::has_pod_logs) else { return };
+        // Only the checked rows shown: the filter may hide some that were checked before.
+        let rows = self.table.read(cx).delegate().marked_visible_rows();
+        if rows.is_empty() {
+            window.push_notification(Notification::info("No checked rows are shown: clear the filter first"), cx);
+            return;
+        }
+        let targets: Vec<crate::details::LogTarget> = rows
+            .into_iter()
+            .filter_map(|(ctx, r)| {
+                let (context, client) = self.clusters.get(ctx)?;
+                Some(crate::details::LogTarget {
+                    context: context.clone(),
+                    client: client.clone(),
+                    namespace: r.namespace.clone()?,
+                    name: r.name.clone(),
+                    created: r.created,
+                })
+            })
+            .collect();
+        let page = cx.new(|cx| crate::details::LogsPage::new(kind, targets, window, cx));
+        self.navigate(Route::Logs(page), cx);
     }
 
     /// Restart or delete every checked row, after one confirmation that lists them.
@@ -533,7 +572,7 @@ impl AppView {
         let Some(kind) = self.kind.clone() else { return };
         use std::io::Write as _;
         let csv = self.table.read(cx).delegate().to_csv();
-        let stamp = jiff::Zoned::now().strftime("%Y%m%d-%H%M%S").to_string();
+        let stamp = jiff::ZonedDateTime::now().strftime("%Y%m%d-%H%M%S").to_string();
         let name = format!("{}-{stamp}.csv", kind.ar.plural);
         // Private and never over an earlier export.
         let r = crate::private_files::create_new_in(&crate::paths::downloads_dir(), &name)

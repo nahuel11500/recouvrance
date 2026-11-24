@@ -726,6 +726,20 @@ impl Hub {
         Ok((client, kinds))
     }
 
+    /// The contexts connected for agents whose discovered kinds hold `group`/`kind`, sorted.
+    /// No request: a context not connected yet is not among them.
+    pub fn contexts_serving(&self, group: &str, kind: &str) -> Vec<String> {
+        let clusters: Vec<(String, Arc<Cluster>)> =
+            lock(&self.clients).iter().map(|(n, c)| (n.clone(), c.clone())).collect();
+        let mut out: Vec<String> = clusters
+            .into_iter()
+            .filter(|(_, c)| lock(&c.kinds).as_ref().is_some_and(|(kinds, _)| kinds.iter().any(|k| k.is(group, kind))))
+            .map(|(n, _)| n)
+            .collect();
+        out.sort();
+        out
+    }
+
     /// Discover again (a CRD may have been installed since), at most once a minute per
     /// context. None when it ran too recently or failed.
     pub async fn rediscover(&self, context: &str) -> Option<Arc<Vec<Kind>>> {

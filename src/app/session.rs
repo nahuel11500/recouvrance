@@ -3,7 +3,10 @@
 //! connects to that set reopens them. The window keeps its place and size.
 //!
 //! Saved a moment after each change and when the window closes or the app quits, never while
-//! connecting: a launch whose reconnect fails keeps what was saved.
+//! connecting: a launch whose reconnect fails keeps what was saved. Nor after a connect that
+//! reached only some of the clusters, or could not list one's namespaces: the types and
+//! namespaces only that one has would read as gone, and be saved so. With two windows on one
+//! set, only one saves it (`SessionOwners`).
 
 use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
@@ -23,6 +26,111 @@ const SAVE_AFTER: Duration = Duration::from_secs(2);
 pub(super) struct FirstWindowOpened;
 
 impl Global for FirstWindowOpened {}
+
+/// Which window saves each set of contexts (by `settings::session_set`). Two windows on one
+/// set would else save over each other, the last to quit winning. The one that reopened the
+/// set, or connected to it first, saves it, until the user changes something in another.
+#[derive(Default)]
+pub(super) struct SessionOwners(HashMap<Vec<String>, EntityId>);
+
+impl Global for SessionOwners {}
+
+impl SessionOwners {
+    pub(super) fn owner(&self, set: &[String]) -> Option<EntityId> {
+        self.0.get(set).copied()
+    }
+
+    fn owns(&self, set: &[String], window: EntityId) -> bool {
+        self.owner(set) == Some(window)
+    }
+
+    fn take(&mut self, set: &[String], window: EntityId) {
+        if !set.is_empty() {
+            self.0.insert(set.to_vec(), window);
+        }
+    }
+
+    /// The window leaves the set: closed, or connected to another.
+    fn leave(&mut self, set: &[String], window: EntityId) {
+        if self.owns(set, window) {
+            self.0.remove(set);
+        }
+    }
+
+    /// After `window` connected to `set`: it saves the set when it reopened it or no other
+    /// window did before (`before`). What the connect itself changed doesn't count, and a
+    /// connect where a cluster `failed` changes nothing: that window can't save the set, and
+    /// must not stop a healthy one from saving it. Whether `window` saves the set now.
+    fn settle(
+        &mut self,
+        set: &[String],
+        window: EntityId,
+        before: Option<EntityId>,
+        reopened: bool,
+        failed: bool,
+    ) -> bool {
+        if !failed {
+            let owner = if reopened { window } else { before.unwrap_or(window) };
+            self.take(set, owner);
+        }
+        self.owns(set, window)
+    }
+}
+
+/// Whether a connect reopens where its set of contexts was left. Only the first window does,
+/// for the first set it connects to; it stays to do until a connect to that set reaches every
+/// cluster. A connect where one failed reopens what it can, but its types, namespaces and
+/// filters only the failed cluster has fall back to the defaults: once the set connects in
+/// full, it is reopened again from what was saved, not carried on from the reduced tabs.
+#[derive(Debug, PartialEq)]
+pub(super) enum Restore {
+    Off,
+    /// The first window, before its first connect.
+    FirstConnect,
+    /// The set to reopen (`settings::session_set`).
+    Pending(Vec<String>),
+}
+
+impl Restore {
+    /// A connect to `set` starts: the first one is the set to reopen.
+    pub(super) fn connecting(&mut self, set: &[String]) {
+        if *self == Self::FirstConnect {
+            *self = if set.is_empty() { Self::Off } else { Self::Pending(set.to_vec()) };
+        }
+    }
+
+    /// The connect to `set` finished, with a cluster `failed` or not: whether it reopens the
+    /// set's session. One that reached every cluster is the last to.
+    pub(super) fn finished(&mut self, set: &[String], failed: bool) -> bool {
+        let Self::Pending(pending) = self else { return false };
+        if pending.as_slice() != set {
+            return false;
+        }
+        if !failed {
+            *self = Self::Off;
+        }
+        true
+    }
+}
+
+/// What a window's session may be saved by. None of it is saved without a set of contexts,
+/// while connecting or not connected (a failed or unfinished connect never overwrites what
+/// was saved), after a connect where a cluster `failed` (what only it has would read as
+/// gone), or by a window that doesn't `own` the set (see `SessionOwners`).
+#[derive(Clone, Copy)]
+struct SaveGate {
+    has_set: bool,
+    connecting: bool,
+    connected: bool,
+    failed: bool,
+    owns: bool,
+}
+
+impl SaveGate {
+    fn saves(self) -> bool {
+        self.has_set && !self.connecting && self.connected && !self.failed && self.owns
+    }
+}
 
 impl AppView {
     /// The tabs, namespaces and filters saved for the contexts just connected, put in place
@@ -52,10 +160,18 @@ impl AppView {
         Some(shown.open.map_or(SavedPage::List, saved_page))
     }
 
-    /// Where this window is now on its set of contexts; none while it is connecting or not
-    /// connected, so a failed or unfinished connect never overwrites what was saved.
+    /// Where this window is now on its set of contexts; none when it may not be saved (see
+    /// `SaveGate`; a cluster failed when `connect_errors` is set: it didn't answer, or its
+    /// namespaces didn't list).
     fn session_snapshot(&self, cx: &App) -> Option<Session> {
-        if self.session_key.is_empty() || self.connecting || self.clusters.is_empty() {
+        let gate = SaveGate {
+            has_set: !self.session_key.is_empty(),
+            connecting: self.connecting,
+            connected: !self.clusters.is_empty(),
+            failed: self.connect_errors.is_some(),
+            owns: cx.try_global::<SessionOwners>().is_some_and(|o| o.owns(&self.session_key, self.view_id)),
+        };
+        if !gate.saves() {
             return None;
         }
         let shown = self.tab_snapshot(cx);
@@ -78,11 +194,37 @@ impl AppView {
         }
     }
 
+    /// Leave the set of contexts connected: save where this window is on it, and let another
+    /// window on it save it from now on.
+    pub(super) fn leave_session(&mut self, cx: &mut App) {
+        self.save_session_now(cx);
+        let set = std::mem::take(&mut self.session_key);
+        if cx.has_global::<SessionOwners>() {
+            cx.global_mut::<SessionOwners>().leave(&set, self.view_id);
+        }
+    }
+
+    /// The connect has finished: which window saves its set from now on (see
+    /// `SessionOwners::settle`). When it is this one, the set is saved once things settle: a
+    /// set connected for the first time is kept even if nothing changes before the app quits.
+    pub(super) fn settle_session(&mut self, before: Option<EntityId>, reopened: bool, cx: &mut Context<Self>) {
+        let failed = self.connect_errors.is_some();
+        let owns =
+            cx.default_global::<SessionOwners>().settle(&self.session_key, self.view_id, before, reopened, failed);
+        if owns && !failed {
+            self.session_changed(cx);
+        }
+    }
+
     /// Something saved changed: save it once changes stop for a moment. The file is written
-    /// off the UI thread.
+    /// off the UI thread. The user changed it here: this window saves its set from now on,
+    /// unless a cluster failed in its connect (it can't save, and another window may).
     pub(super) fn session_changed(&mut self, cx: &mut Context<Self>) {
         if self.session_key.is_empty() || self.connecting {
             return;
+        }
+        if self.connect_errors.is_none() {
+            cx.default_global::<SessionOwners>().take(&self.session_key, self.view_id);
         }
         // Replacing the task cancels the wait before: one save per burst of changes.
         self._save_session = Some(cx.spawn(async move |this, cx| {
@@ -93,10 +235,24 @@ impl AppView {
     }
 
     /// The window moved, was resized or maximized: remember where, once it stops.
+    ///
+    /// The bounds are read once it stops, not as it moves: on X11 the new size of a window
+    /// being maximized can come before its maximized state (the desktop picks the order, and
+    /// gpui reports a change of state alone to no one), so the size reported first reads as
+    /// a windowed place the size of the screen.
     pub(super) fn window_moved(&mut self, window: &Window, cx: &mut Context<Self>) {
-        let place = place_of(window.window_bounds());
-        self._save_window = Some(cx.spawn(async move |_, cx| {
+        self._save_window = Some(cx.spawn_in(window, async move |this, cx| {
             cx.background_executor().timer(SAVE_AFTER).await;
+            let Ok(place) = this.update_in(cx, |this, window, _| {
+                // Maximized before this window was ever windowed: the place saved last time.
+                let place = place_of(window.window_bounds(), this.windowed.or_else(crate::settings::window_place));
+                if !place.maximized {
+                    this.windowed = Some(place);
+                }
+                place
+            }) else {
+                return;
+            };
             cx.background_spawn(async move { crate::settings::save_window(place) }).await;
         }));
     }
@@ -132,11 +288,15 @@ fn on_a_display(place: &WindowPlace, displays: &[Bounds<Pixels>]) -> bool {
     })
 }
 
-/// The window's place to save: its restore size when maximized or fullscreen.
-fn place_of(bounds: WindowBounds) -> WindowPlace {
+/// The window's place to save. Maximized or fullscreen, it keeps the place it had `windowed`:
+/// X11 gives the screen's size there, not the size to restore (Wayland gives that one).
+fn place_of(bounds: WindowBounds, windowed: Option<WindowPlace>) -> WindowPlace {
     let (b, maximized) = match bounds {
         WindowBounds::Windowed(b) => (b, false),
-        WindowBounds::Maximized(b) | WindowBounds::Fullscreen(b) => (b, true),
+        WindowBounds::Maximized(b) | WindowBounds::Fullscreen(b) => match windowed {
+            Some(place) => return WindowPlace { maximized: true, ..place },
+            None => (b, true),
+        },
     };
     WindowPlace {
         x: f32::from(b.origin.x),
@@ -244,11 +404,11 @@ pub(super) fn filters_to_save(
 mod tests {
     use std::collections::{BTreeMap, HashMap};
 
-    use gpui_kit::{Bounds, WindowBounds, point, px, size};
+    use gpui_kit::{Bounds, EntityId, WindowBounds, point, px, size};
 
     use super::{
-        Kind, Overview, Route, SavedPage, SavedTab, Session, TabState, WindowPlace, filters_to_save, on_a_display,
-        place_of, restored, saved_tab,
+        Kind, Overview, Restore, Route, SaveGate, SavedPage, SavedTab, Session, SessionOwners, TabState, WindowPlace,
+        filters_to_save, on_a_display, place_of, restored, saved_tab,
     };
 
     fn kind(group: &str, k: &str) -> Kind {
@@ -362,10 +522,123 @@ mod tests {
     #[test]
     fn a_maximized_window_saves_its_restore_size() {
         let b = Bounds { origin: point(px(10.), px(20.)), size: size(px(1200.), px(800.)) };
-        assert_eq!(place_of(WindowBounds::Windowed(b)), place(10., 20., 1200., 800.));
-        let max = place_of(WindowBounds::Maximized(b));
+        let before = place(50., 60., 1000., 700.);
+        assert_eq!(place_of(WindowBounds::Windowed(b), Some(before)), place(10., 20., 1200., 800.));
+        // X11 reports the screen's size when maximized: the place it had windowed is kept.
+        let screen = Bounds { origin: point(px(0.), px(0.)), size: size(px(1920.), px(1080.)) };
+        for bounds in [WindowBounds::Maximized(screen), WindowBounds::Fullscreen(screen)] {
+            assert_eq!(place_of(bounds, Some(before)), WindowPlace { maximized: true, ..before });
+        }
+        // Never windowed, nothing saved: what the desktop gives.
+        let max = place_of(WindowBounds::Maximized(b), None);
         assert!(max.maximized);
         assert_eq!(WindowPlace { maximized: false, ..max }, place(10., 20., 1200., 800.));
-        assert!(place_of(WindowBounds::Fullscreen(b)).maximized);
+    }
+
+    #[test]
+    fn one_window_saves_each_set_of_contexts() {
+        let (first, second): (EntityId, EntityId) = (1u64.into(), 2u64.into());
+        let (set, other) = (v(&["hub", "prod"]), v(&["dev"]));
+        let mut owners = SessionOwners::default();
+        // The first window reopens the set; a second one connects to it and starts fresh:
+        // its own connect (the overview it opens at start) doesn't make it the one saving.
+        assert!(owners.settle(&set, first, None, true, false));
+        owners.take(&set, second);
+        assert!(!owners.settle(&set, second, Some(first), false, false));
+        assert_eq!(owners.owner(&set), Some(first));
+        // The user changes something in the second: it saves the set from now on.
+        owners.take(&set, second);
+        assert!(owners.owns(&set, second) && !owners.owns(&set, first));
+        // The first leaving doesn't free what it no longer saves; the second leaving does.
+        owners.leave(&set, first);
+        assert_eq!(owners.owner(&set), Some(second));
+        owners.leave(&set, second);
+        assert_eq!(owners.owner(&set), None);
+        // A set nobody saved: the window connecting to it saves it, even with nothing reopened.
+        assert!(owners.settle(&other, second, None, false, false));
+        assert_eq!(owners.owner(&other), Some(second));
+        // No set (contexts given by a developer hook): nothing is saved.
+        owners.take(&[], first);
+        assert_eq!(owners.owner(&[]), None);
+    }
+
+    #[test]
+    fn a_session_is_saved_only_when_every_condition_holds() {
+        let ok = SaveGate { has_set: true, connecting: false, connected: true, failed: false, owns: true };
+        assert!(ok.saves());
+        for gate in [
+            SaveGate { has_set: false, ..ok },
+            SaveGate { connecting: true, ..ok },
+            SaveGate { connected: false, ..ok },
+            // A cluster didn't answer: what only it has would be saved as gone.
+            SaveGate { failed: true, ..ok },
+            SaveGate { owns: false, ..ok },
+        ] {
+            assert!(!gate.saves());
+        }
+    }
+
+    #[test]
+    fn a_set_is_reopened_until_it_connects_in_full() {
+        let (set, other) = (v(&["hub", "prod"]), v(&["dev"]));
+        // A window that isn't the first never reopens.
+        let mut off = Restore::Off;
+        off.connecting(&set);
+        assert!(!off.finished(&set, false));
+        // The first connect is the set to reopen: it reopens what it can while a cluster
+        // fails, and stays to do.
+        let mut restore = Restore::FirstConnect;
+        restore.connecting(&set);
+        assert!(restore.finished(&set, true));
+        assert_eq!(restore, Restore::Pending(set.clone()));
+        // Another set connected meanwhile is not reopened, and doesn't end it.
+        restore.connecting(&other);
+        assert!(!restore.finished(&other, false));
+        // The set connects in full: reopened from what was saved, for the last time.
+        restore.connecting(&set);
+        assert!(restore.finished(&set, false));
+        assert_eq!(restore, Restore::Off);
+        assert!(!restore.finished(&set, false));
+        // No set (contexts given by a developer hook): nothing to reopen.
+        let mut none = Restore::FirstConnect;
+        none.connecting(&[]);
+        assert_eq!(none, Restore::Off);
+    }
+
+    /// #915: a launch where one cluster of the set doesn't answer, then a reconnect of the
+    /// same set that reaches it. The reduced tabs of the first connect are never saved, nor
+    /// can that window take the set from a healthy one; the reconnect reopens what was saved.
+    #[test]
+    fn a_partial_connect_never_saves_and_the_full_one_reopens() {
+        let (window, other): (EntityId, EntityId) = (1u64.into(), 2u64.into());
+        let set = v(&["hub", "prod"]);
+        let mut owners = SessionOwners::default();
+        let mut restore = Restore::FirstConnect;
+        let gate = |owners: &SessionOwners, failed: bool| SaveGate {
+            has_set: true,
+            connecting: false,
+            connected: true,
+            failed,
+            owns: owners.owns(&set, window),
+        };
+        // A healthy window has the set.
+        owners.settle(&set, other, None, false, false);
+        // The partial connect: it reopens what it can, but takes nothing and saves nothing.
+        restore.connecting(&set);
+        assert!(restore.finished(&set, true));
+        assert!(!owners.settle(&set, window, Some(other), true, true));
+        assert_eq!(owners.owner(&set), Some(other));
+        assert!(!gate(&owners, true).saves());
+        // Nor once the healthy one closed and nobody saves the set: it doesn't take it, and
+        // even owning it, a failed connect saves nothing.
+        owners.leave(&set, other);
+        assert!(!owners.settle(&set, window, None, true, true));
+        owners.take(&set, window);
+        assert!(!gate(&owners, true).saves());
+        // The full reconnect: reopened from the file, then this window saves the set.
+        restore.connecting(&set);
+        assert!(restore.finished(&set, false));
+        assert!(owners.settle(&set, window, None, true, false));
+        assert!(gate(&owners, false).saves());
     }
 }
