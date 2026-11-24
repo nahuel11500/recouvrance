@@ -126,6 +126,8 @@ struct TabState {
     /// The overview it opens when first shown: a tab reopened on one (see `session`) builds
     /// its page only then.
     open: Option<overviews::Overview>,
+    /// Reopened on a type of an API group that didn't answer: saved as it was until changed.
+    kept: Option<session::KeptTab>,
 }
 
 /// The page each window shows, and the windows hidden as the desktop reports it (see
@@ -505,6 +507,12 @@ pub struct AppView {
     table: Entity<TableState<ResourceTable>>,
     /// Contexts that failed to connect, until the next connect.
     connect_errors: Option<SharedString>,
+    /// The add-on API groups a connected cluster couldn't read (`k8s::SkippedGroup`), and
+    /// what the status line says of them, until the next connect.
+    skipped_groups: HashSet<String>,
+    skipped_notice: Option<SharedString>,
+    /// What the session saved for those groups' types, kept to be saved again.
+    kept: session::Kept,
     watch: Option<watch::ListWatch>,
     metrics: Option<Vec<(TaskGuard, Task<()>)>>,
     /// The timeline's own watches (`timeline.kinds`), while connected.
@@ -775,6 +783,9 @@ impl AppView {
             table,
             // A kubeconfig that can't be read shows where connect errors do.
             connect_errors: status,
+            skipped_groups: HashSet::new(),
+            skipped_notice: None,
+            kept: session::Kept::default(),
             watch: None,
             metrics: None,
             connecting: false,

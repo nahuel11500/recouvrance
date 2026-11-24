@@ -373,9 +373,14 @@ impl AppView {
         }
     }
 
-    /// What the bar above the list says: what failed (contexts, watches), then progress.
+    /// What the bar above the list says: what failed (contexts, add-on APIs, watches), then
+    /// progress.
     pub(super) fn status_line(&self) -> Option<SharedString> {
-        self.list.status_line(self.connect_errors.as_ref())
+        let failed: Option<SharedString> = match (&self.connect_errors, &self.skipped_notice) {
+            (Some(errors), Some(skipped)) => Some(format!("{errors}; {skipped}").into()),
+            (errors, skipped) => errors.clone().or_else(|| skipped.clone()),
+        };
+        self.list.status_line(failed.as_ref())
     }
 
     /// Keep the list on screen in `views` (if it was complete), before another replaces it.

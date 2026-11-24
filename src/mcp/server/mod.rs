@@ -771,7 +771,11 @@ impl KubeMcp {
         // Maybe a CRD installed since the first call.
         match self.hub.rediscover(context).await.and_then(|kinds| k8s::find_kind(&kinds, query).cloned()) {
             Some(kind) => Ok((client, kind)),
-            None => Err(anyhow::anyhow!("unknown resource type {query:?}")),
+            // A type of a group that didn't answer is not said to be unknown without a word.
+            None => Err(anyhow::anyhow!(
+                "unknown resource type {query:?}{}",
+                k8s::maybe_skipped(&self.hub.skipped_groups(context))
+            )),
         }
     }
 }

@@ -20,6 +20,9 @@
   always off at launch. While a cluster of the set doesn't answer, or its namespaces don't list
   (said above the list), nothing is saved for that set: what only that cluster has would read
   as gone; connecting that set again once every cluster answers reopens it from what was saved.
+  An add-on API that doesn't answer (an APIService down, such as Argo CD's or metrics-server's)
+  is named above the list and its types left out of the sidebar; a tab or filter saved on one of
+  its types shows the default list meanwhile, but is saved as it was until you change that tab.
   A set connected for the first time is saved once connected. With two windows on one set, the
   one that reopened it saves it, until something is changed in the other.
 - **Sidebar**: the filter at its top finds pages and resource types (by name, kind or API group).

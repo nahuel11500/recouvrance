@@ -7,7 +7,8 @@ use futures::StreamExt as _;
 use k8s_openapi::api::core::v1::Namespace;
 use kube::Client;
 use kube::api::{Api, ListParams};
-use kube::discovery::{ApiCapabilities, ApiResource, Discovery, Scope, verbs};
+use kube::core::discovery::v2::APIGroupDiscovery;
+use kube::discovery::{ApiCapabilities, ApiResource, Scope, verbs};
 
 use super::run;
 
@@ -274,17 +275,105 @@ pub fn sort_for_sidebar(kinds: &mut [Kind]) {
     });
 }
 
+/// An add-on API group discovery could not read: its APIService is down, or its discovery
+/// failed. Its kinds are missing from what was found, not gone from the cluster.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SkippedGroup {
+    pub group: String,
+    /// Why, with the group version that failed.
+    pub error: String,
+}
+
+/// What discovery found: the kinds, and the groups it had to leave out.
+#[derive(Clone, Debug, Default)]
+pub struct Discovered {
+    pub kinds: Vec<Kind>,
+    pub skipped: Vec<SkippedGroup>,
+}
+
+/// The kinds a cluster serves; the groups that didn't answer are left out (see
+/// [`discover_all`] to know which).
 pub async fn discover(client: Client) -> Result<Vec<Kind>> {
+    discover_all(client).await.map(|d| d.kinds)
+}
+
+/// The kinds a cluster serves, and the add-on groups that didn't answer: a group whose
+/// APIService is down is left out, as kubectl does, and named, so that its kinds read as
+/// unreadable for now rather than as gone.
+pub async fn discover_all(client: Client) -> Result<Discovered> {
     run(async move {
-        let resources = match Discovery::new(client.clone()).run_aggregated().await {
-            // Every version, not only the preferred one: Gateway API prefers v1, but TCPRoute
-            // is only in v1alpha2.
-            Ok(d) => d.groups().flat_map(kube::discovery::ApiGroup::resources_by_stability).collect(),
+        let (resources, skipped) = match aggregated(&client).await {
+            Ok(found) => found,
             Err(_) => discover_by_group(&client).await?,
         };
-        Ok(kinds_of(resources))
+        Ok(Discovered { kinds: kinds_of(resources), skipped })
     })
     .await
+}
+
+/// Aggregated discovery (Kubernetes 1.26 and later): two requests for every group.
+async fn aggregated(client: &Client) -> kube::Result<(Vec<(ApiResource, ApiCapabilities)>, Vec<SkippedGroup>)> {
+    let apis = client.list_api_groups_aggregated().await?;
+    let core = client.list_core_api_versions_aggregated().await?;
+    Ok(from_aggregated(core.items.into_iter().take(1).chain(apis.items)))
+}
+
+/// The resources of aggregated discovery's groups, every version (Gateway API prefers v1, but
+/// TCPRoute is only in v1alpha2), each kind at its most stable one; and the groups with a
+/// version marked stale: the API server could not reach its APIService, so the kinds listed
+/// for it (the last ones known, or none) may not be all.
+fn from_aggregated(
+    groups: impl IntoIterator<Item = APIGroupDiscovery>,
+) -> (Vec<(ApiResource, ApiCapabilities)>, Vec<SkippedGroup>) {
+    let mut resources = Vec::new();
+    let mut skipped: Vec<SkippedGroup> = Vec::new();
+    for g in groups {
+        let group = g.metadata.and_then(|m| m.name).unwrap_or_default();
+        for v in g.versions {
+            let version = v.version.unwrap_or_default();
+            let api_version = if group.is_empty() { version.clone() } else { format!("{group}/{version}") };
+            if v.freshness.as_deref() == Some("Stale") && !skipped.iter().any(|s| s.group == group) {
+                let error = format!("{api_version}: stale, its API service is not available");
+                skipped.push(SkippedGroup { group: group.clone(), error });
+            }
+            for r in v.resources {
+                let ar = ApiResource {
+                    group: group.clone(),
+                    version: version.clone(),
+                    api_version: api_version.clone(),
+                    kind: r.response_kind.and_then(|k| k.kind).unwrap_or_default(),
+                    plural: r.resource.unwrap_or_default(),
+                };
+                let scope = if r.scope.as_deref() == Some("Namespaced") { Scope::Namespaced } else { Scope::Cluster };
+                resources.push((ar, ApiCapabilities { scope, subresources: Vec::new(), operations: r.verbs }));
+            }
+        }
+    }
+    (most_stable(resources), skipped)
+}
+
+/// The groups that didn't answer, for a message: `argoproj.io (why), metrics.k8s.io (why)`.
+pub fn describe_skipped(skipped: &[SkippedGroup]) -> String {
+    let named: Vec<String> = skipped.iter().map(|s| format!("{} ({})", group_name(&s.group), s.error)).collect();
+    named.join(", ")
+}
+
+/// A group's name as people write it: the core group has none.
+fn group_name(group: &str) -> &str {
+    if group.is_empty() { "core" } else { group }
+}
+
+/// Added to "unknown type" when some groups didn't answer: the type may be one of theirs.
+pub fn maybe_skipped(skipped: &[SkippedGroup]) -> String {
+    if skipped.is_empty() {
+        return String::new();
+    }
+    format!("; it may belong to an API group that couldn't be read: {}", describe_skipped(skipped))
+}
+
+/// The group of a kind saved by its kubectl name (`pods`, `applications.argoproj.io`).
+pub fn group_of_name(name: &str) -> &str {
+    name.split_once('.').map_or("", |(_, group)| group)
 }
 
 /// The listable types of `resources`, each in its sidebar section, in sidebar order. The
@@ -321,10 +410,10 @@ pub fn kind_of(ar: ApiResource, namespaced: bool) -> Kind {
 /// Discovery for clusters without aggregated discovery (before 1.26, or turned off): every
 /// version of each group, side by side, each kind kept at its most stable version. A group
 /// that does not answer (an APIService that is down, like metrics.k8s.io) is left out, as
-/// kubectl does, instead of failing them all; one with built-in kinds the sidebar lists
-/// (Pods, Deployments…) is asked again, then fails discovery rather than leaving them out
-/// without a word.
-async fn discover_by_group(client: &Client) -> Result<Vec<(ApiResource, ApiCapabilities)>> {
+/// kubectl does, instead of failing them all, and returned among the skipped; one with
+/// built-in kinds the sidebar lists (Pods, Deployments…) is asked again, then fails
+/// discovery rather than leaving them out.
+async fn discover_by_group(client: &Client) -> Result<(Vec<(ApiResource, ApiCapabilities)>, Vec<SkippedGroup>)> {
     let mut gvs = vec![kube::core::GroupVersion::gv("", "v1")];
     for g in client.list_api_groups().await?.groups {
         gvs.extend(g.versions.iter().map(|v| kube::core::GroupVersion::gv(&g.name, &v.version)));
@@ -338,17 +427,24 @@ async fn discover_by_group(client: &Client) -> Result<Vec<(ApiResource, ApiCapab
         }
     }
     // Once more for the ones that matter (a timeout, too many requests).
-    let (retry, skipped): (Vec<_>, Vec<_>) = failed.into_iter().partition(|(gv, _)| required(&gv.group));
-    let skipped = skipped.into_iter().next().map(|(_, e)| e);
+    let (retry, optional): (Vec<_>, Vec<_>) = failed.into_iter().partition(|(gv, _)| required(&gv.group));
     for (gv, g) in pinned_groups(client, retry.into_iter().map(|(gv, _)| gv).collect()).await {
         match g {
             Ok(g) => resources.extend(g.recommended_resources()),
             Err(e) => return Err(anyhow::Error::from(e).context(format!("discovery of {} failed", gv.api_version()))),
         }
     }
-    match skipped {
+    let mut skipped: Vec<SkippedGroup> = Vec::new();
+    let mut first_error = None;
+    for (gv, e) in optional {
+        if !skipped.iter().any(|s| s.group == gv.group) {
+            skipped.push(SkippedGroup { group: gv.group.clone(), error: format!("{}: {e}", gv.api_version()) });
+        }
+        first_error.get_or_insert(e);
+    }
+    match first_error {
         Some(e) if resources.is_empty() => Err(e.into()),
-        _ => Ok(most_stable(resources)),
+        _ => Ok((most_stable(resources), skipped)),
     }
 }
 
@@ -534,6 +630,45 @@ mod required_tests {
         assert!(!required("custom.metrics.k8s.io"));
         assert!(!required("cert-manager.io"));
         assert!(!required("projectcalico.org"));
+    }
+}
+
+#[cfg(test)]
+mod aggregated_tests {
+    use super::{SkippedGroup, from_aggregated, group_of_name, kinds_of};
+
+    /// A group whose APIService is down comes back stale, with the kinds last known or none:
+    /// it is named among the skipped, once, and the groups that answered are all there.
+    #[test]
+    fn a_stale_group_is_named_not_dropped() {
+        let list: kube::core::discovery::v2::APIGroupDiscoveryList = serde_json::from_value(serde_json::json!({
+            "items": [
+                {"metadata": {"name": "apps"}, "versions": [{"version": "v1", "freshness": "Current", "resources": [
+                    {"resource": "deployments", "responseKind": {"kind": "Deployment"}, "scope": "Namespaced",
+                     "verbs": ["get", "list", "watch"]}]}]},
+                {"metadata": {"name": "metrics.k8s.io"}, "versions": [{"version": "v1beta1", "freshness": "Stale"}]},
+                {"metadata": {"name": "argoproj.io"}, "versions": [
+                    {"version": "v1alpha1", "freshness": "Stale", "resources": [
+                        {"resource": "applications", "responseKind": {"kind": "Application"}, "scope": "Namespaced",
+                         "verbs": ["get", "list", "watch"]}]},
+                    {"version": "v1beta1", "freshness": "Stale"}]},
+            ]
+        }))
+        .unwrap();
+        let (resources, skipped) = from_aggregated(list.items);
+        let kinds = kinds_of(resources);
+        assert!(kinds.iter().any(|k| k.is("apps", "Deployment")));
+        assert!(kinds.iter().any(|k| k.is("argoproj.io", "Application")), "the kinds last known are kept");
+        let groups: Vec<&str> = skipped.iter().map(|s: &SkippedGroup| s.group.as_str()).collect();
+        assert_eq!(groups, ["metrics.k8s.io", "argoproj.io"]);
+        assert!(skipped[0].error.contains("metrics.k8s.io/v1beta1"), "{}", skipped[0].error);
+    }
+
+    #[test]
+    fn a_saved_name_gives_its_group() {
+        assert_eq!(group_of_name("pods"), "");
+        assert_eq!(group_of_name("deployments.apps"), "apps");
+        assert_eq!(group_of_name("applications.argoproj.io"), "argoproj.io");
     }
 }
 

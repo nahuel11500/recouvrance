@@ -7,8 +7,12 @@
 //! reached only some of the clusters, or could not list one's namespaces: the types and
 //! namespaces only that one has would read as gone, and be saved so. With two windows on one
 //! set, only one saves it (`SessionOwners`).
+//!
+//! A tab or filter whose type belongs to an add-on API group that didn't answer discovery
+//! (its APIService down: `k8s::SkippedGroup`) is not gone either: the tab shows the default
+//! list meanwhile, and is saved as it was until it is changed (`KeptTab`).
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::Duration;
 
 use gpui_kit::*;
@@ -113,6 +117,23 @@ impl Restore {
     }
 }
 
+/// A tab reopened on a type of an API group that didn't answer: it shows the default list,
+/// and is saved as it was (`saved`) as long as it still is as reopened (`shown`).
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct KeptTab {
+    saved: SavedTab,
+    shown: SavedTab,
+}
+
+/// What this window keeps of its set's session for API groups that didn't answer: the
+/// active tab's `KeptTab` (the others' are in their `TabState`), and the saved filters of
+/// types of those groups, by kubectl name.
+#[derive(Default)]
+pub(super) struct Kept {
+    pub(super) tab: Option<KeptTab>,
+    filters: BTreeMap<String, String>,
+}
+
 /// What a window's session may be saved by. None of it is saved without a set of contexts,
 /// while connecting or not connected (a failed or unfinished connect never overwrites what
 /// was saved), after a connect where a cluster `failed` (what only it has would read as
@@ -139,9 +160,10 @@ impl AppView {
     pub(super) fn restore_session(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Option<SavedPage> {
         let saved = crate::settings::session(&self.session_key)?;
         let known = self.ns_picker.read(cx).known().to_vec();
-        let mut restored = restored(&saved, &self.kinds, &known, self.kind.as_ref())?;
+        let mut restored = restored(&saved, &self.kinds, &known, self.kind.as_ref(), &self.skipped_groups)?;
         self.kind_filters.restore(restored.filters);
         let shown = std::mem::take(&mut restored.tabs[restored.active]);
+        self.kept = Kept { tab: shown.kept.clone(), filters: restored.kept_filters };
         self.tabs = restored.tabs;
         self.active_tab = restored.active;
         self.history = shown.history;
@@ -179,9 +201,13 @@ impl AppView {
             .map(|i| saved_tab(if i == self.active_tab { &shown } else { &self.tabs[i] }))
             .collect();
         let by_key: HashMap<String, String> = self.kinds.iter().map(|k| (k.key(), k.kubectl_name())).collect();
-        let filters = (self.kind_filters.all(&shown.filter).into_iter())
+        let mut filters: BTreeMap<String, String> = (self.kind_filters.all(&shown.filter).into_iter())
             .filter_map(|(key, text)| Some((by_key.get(&key)?.clone(), text)))
             .collect();
+        // Those of types in groups that didn't answer, as saved, unless set again since.
+        for (name, text) in &self.kept.filters {
+            filters.entry(name.clone()).or_insert_with(|| text.clone());
+        }
         Some(Session { contexts: self.session_key.clone(), tabs, active_tab: self.active_tab, filters })
     }
 
@@ -314,34 +340,61 @@ struct Restored {
     active: usize,
     /// Each type's filter, by `Kind::key`.
     filters: HashMap<String, String>,
+    /// The filters of types in groups that didn't answer, by kubectl name, kept as saved.
+    kept_filters: BTreeMap<String, String>,
 }
 
 /// The tabs of `saved` on the clusters connected now: a resource type they don't serve shows
 /// `fallback` (its filter dropped, as it was typed for another), a namespace not in `known` is
-/// dropped, a page that doesn't read is the list. None when nothing was saved.
-fn restored(saved: &Session, kinds: &[Kind], known: &[String], fallback: Option<&Kind>) -> Option<Restored> {
+/// dropped, a page that doesn't read is the list. A type of a group in `skipped` (it didn't
+/// answer discovery) is not gone: its tab shows `fallback` too, but is kept to be saved as it
+/// was, and so is its filter. None when nothing was saved.
+fn restored(
+    saved: &Session,
+    kinds: &[Kind],
+    known: &[String],
+    fallback: Option<&Kind>,
+    skipped: &HashSet<String>,
+) -> Option<Restored> {
     let named = |name: &str| kinds.iter().find(|k| k.kubectl_name() == name);
+    let unread = |name: &str| named(name).is_none() && skipped.contains(crate::k8s::group_of_name(name));
     let tabs: Vec<TabState> = (saved.tabs.iter())
         .map(|t| {
             let own = t.kind.as_deref().and_then(named);
             let kind = own.or(fallback).cloned();
-            TabState {
+            let mut tab = TabState {
                 history: vec![Route::Resources(kind.clone())],
                 pos: 0,
                 filter: if own.is_some() { t.filter.clone() } else { String::new() },
                 namespaces: t.namespaces.iter().filter(|ns| known.contains(ns)).cloned().collect(),
                 kind,
                 open: overview(t.page),
+                kept: None,
+            };
+            if t.kind.as_deref().is_some_and(unread) {
+                tab.kept = Some(KeptTab { saved: t.clone(), shown: saved_tab(&tab) });
             }
+            tab
         })
         .collect();
     let active = saved.active_tab.min(tabs.len().checked_sub(1)?);
     let filters = (saved.filters.iter()).filter_map(|(name, text)| Some((named(name)?.key(), text.clone()))).collect();
-    Some(Restored { tabs, active, filters })
+    let kept_filters = (saved.filters.iter()).filter(|(name, _)| unread(name)).map(|(n, t)| (n.clone(), t.clone()));
+    Some(Restored { tabs, active, filters, kept_filters: kept_filters.collect() })
 }
 
-/// A tab as it is saved: the page it shows, or the list or overview it went to it from.
+/// A tab as it is saved: as it was reopened when its type's group didn't answer and nothing
+/// changed in it since (see `KeptTab`), else as it is.
 fn saved_tab(t: &TabState) -> SavedTab {
+    let now = tab_now(t);
+    match &t.kept {
+        Some(kept) if kept.shown == now => kept.saved.clone(),
+        _ => now,
+    }
+}
+
+/// A tab as it is now: the page it shows, or the list or overview it went to it from.
+fn tab_now(t: &TabState) -> SavedTab {
     let page = t.open.map_or_else(
         || {
             (t.history.iter().take(t.pos + 1).rev())
@@ -402,7 +455,7 @@ pub(super) fn filters_to_save(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeMap, HashMap};
+    use std::collections::{BTreeMap, HashMap, HashSet};
 
     use gpui_kit::{Bounds, EntityId, WindowBounds, point, px, size};
 
@@ -438,7 +491,7 @@ mod tests {
                 .into(),
         };
         let kinds = [pods.clone(), deploys.clone()];
-        let r = restored(&saved, &kinds, &v(&["team-a", "team-b"]), Some(&pods)).unwrap();
+        let r = restored(&saved, &kinds, &v(&["team-a", "team-b"]), Some(&pods), &HashSet::new()).unwrap();
         assert_eq!(r.active, 1, "the last tab when the one saved is past the end");
         let [first, second] = &r.tabs[..] else { panic!("two tabs") };
         assert_eq!(first.kind.as_ref().map(Kind::key), Some(deploys.key()));
@@ -449,7 +502,7 @@ mod tests {
         assert_eq!(r.filters.len(), 1);
         assert_eq!(r.filters[&deploys.key()], "web");
         // Nothing saved: nothing to reopen.
-        assert!(restored(&Session::default(), &kinds, &[], Some(&pods)).is_none());
+        assert!(restored(&Session::default(), &kinds, &[], Some(&pods), &HashSet::new()).is_none());
     }
 
     #[test]
@@ -462,6 +515,7 @@ mod tests {
             namespaces: v(&["team-a"]),
             kind: Some(pods),
             open: None,
+            kept: None,
         };
         let saved = saved_tab(&t);
         assert_eq!(saved, tab(SavedPage::List, "pods", &["team-a"], "api"));
@@ -483,9 +537,47 @@ mod tests {
             tab(SavedPage::Helm, "pods", &["team-a", "team-b"], "x"),
         ];
         let saved = Session { contexts: v(&["a", "b"]), tabs: tabs.clone(), active_tab: 1, ..Session::default() };
-        let r = restored(&saved, &kinds, &v(&["team-a", "team-b"]), Some(&pods)).unwrap();
+        let r = restored(&saved, &kinds, &v(&["team-a", "team-b"]), Some(&pods), &HashSet::new()).unwrap();
         let again: Vec<SavedTab> = r.tabs.iter().map(saved_tab).collect();
         assert_eq!(again, tabs);
+    }
+
+    /// A tab or filter on a type of an API group that didn't answer discovery (its APIService
+    /// down at launch) is not gone: the tab shows the default list, and both are saved as they
+    /// were, until the tab is changed. A type whose group did answer is gone, as before.
+    #[test]
+    fn a_type_of_a_group_that_did_not_answer_is_kept_as_saved() {
+        let pods = kind("", "Pod");
+        let kinds = [pods.clone()];
+        let apps = tab(SavedPage::Argo, "applications.argoproj.io", &["argocd"], "prod");
+        let gone = tab(SavedPage::List, "certificates.cert-manager.io", &[], "expired");
+        let saved = Session {
+            contexts: v(&["hub"]),
+            tabs: vec![apps.clone(), gone],
+            active_tab: 0,
+            filters: [
+                ("applications.argoproj.io".to_string(), "prod".to_string()),
+                ("certificates.cert-manager.io".into(), "x".into()),
+            ]
+            .into(),
+        };
+        let skipped: HashSet<String> = ["argoproj.io".to_string()].into();
+        let r = restored(&saved, &kinds, &v(&["argocd"]), Some(&pods), &skipped).unwrap();
+        let [first, second] = &r.tabs[..] else { panic!("two tabs") };
+        assert_eq!(first.kind.as_ref().map(Kind::key), Some(pods.key()), "shown on the default list");
+        assert_eq!(first.filter, "");
+        assert_eq!(saved_tab(first), apps, "saved as it was");
+        assert!(second.kept.is_none());
+        assert_eq!(saved_tab(second), tab(SavedPage::List, "pods", &[], ""), "a type gone for good");
+        assert_eq!(r.kept_filters, BTreeMap::from([("applications.argoproj.io".to_string(), "prod".to_string())]));
+        assert!(r.filters.is_empty());
+        // Changed since: saved as it is now.
+        let mut changed = first.clone();
+        changed.filter = "web".into();
+        assert_eq!(saved_tab(&changed), tab(SavedPage::Argo, "pods", &["argocd"], "web"));
+        // Every group answered: nothing kept.
+        let r = restored(&saved, &kinds, &v(&["argocd"]), Some(&pods), &HashSet::new()).unwrap();
+        assert!(r.tabs.iter().all(|t| t.kept.is_none()) && r.kept_filters.is_empty());
     }
 
     #[test]

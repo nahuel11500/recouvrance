@@ -16,6 +16,9 @@ impl AppView {
         let Some(primary) = contexts.first().cloned() else { return };
         // Where the contexts connected until now were left, before it is reset below.
         self.leave_session(cx);
+        // What was kept of that set's session (types of groups that didn't answer) is not
+        // this one's. Its own set again keeps it: those groups may still not answer.
+        let set_before = self.session_key.clone();
         if dev_var("RECOUVRANCE_CONTEXT").is_none() {
             let remembered = contexts.clone();
             crate::settings::update(|s| {
@@ -23,6 +26,12 @@ impl AppView {
                 s.last_contexts = remembered;
             });
             self.session_key = crate::settings::session_set(&contexts);
+        }
+        if self.session_key != set_before || self.session_key.is_empty() {
+            self.kept = super::session::Kept::default();
+            for tab in &mut self.tabs {
+                tab.kept = None;
+            }
         }
         self.restore.connecting(&self.session_key);
         let connected = contexts.clone();
@@ -65,6 +74,8 @@ impl AppView {
         self.search_index.clear();
         self.list.notice = Some(format!("Connecting to {}…", contexts.join(", ")).into());
         self.connect_errors = None;
+        self.skipped_notice = None;
+        self.skipped_groups.clear();
         self.connecting = true;
         self.table.update(cx, |t, cx| {
             t.delegate_mut().reset(false, Vec::new(), None, Default::default());
@@ -88,8 +99,9 @@ impl AppView {
                 // Connecting does not reach the server: discovery is the first request, and
                 // an unreachable cluster fails there.
                 let discovered =
-                    futures::future::join_all(clusters.iter().map(|(_, c)| k8s::discover(c.clone()))).await;
+                    futures::future::join_all(clusters.iter().map(|(_, c)| k8s::discover_all(c.clone()))).await;
                 let names: Vec<&str> = clusters.iter().map(|(n, _)| n.as_str()).collect();
+                let (discovered, skipped) = split_skipped(&names, discovered);
                 let (mut kinds, kind_clusters) = merge_kinds(&names, discovered, &mut errors);
                 if kinds.is_empty() {
                     anyhow::bail!("discovery failed on every cluster: {}", errors.join("; "));
@@ -121,7 +133,7 @@ impl AppView {
                 }
                 namespaces.sort();
                 namespaces.dedup();
-                anyhow::Ok((client, kinds, kind_clusters, namespaces))
+                anyhow::Ok((client, kinds, kind_clusters, namespaces, skipped))
             }
             .await;
             let _ = this.update_in(cx, |this, window, cx| {
@@ -130,13 +142,18 @@ impl AppView {
                 }
                 this.connecting = false;
                 match result {
-                    Ok((client, kinds, kind_clusters, namespaces)) => {
+                    Ok((client, kinds, kind_clusters, namespaces, skipped)) => {
                         // Who saved this set before: what this connect does below is no change
                         // of the user's (see `session::SessionOwners`).
                         let owner_before =
                             (cx.try_global::<super::session::SessionOwners>()).and_then(|o| o.owner(&this.session_key));
                         this.kind_clusters = kind_clusters;
                         this.connect_errors = (!errors.is_empty()).then(|| errors.join("; ").into());
+                        // Told, not counted as a failed connect: an APIService down for good
+                        // (metrics-server) would else stop the session from ever being saved.
+                        // The session keeps what it saved for those groups' types instead.
+                        this.skipped_notice = skipped_notice(&skipped);
+                        this.skipped_groups = skipped.into_iter().flat_map(|(_, s)| s).map(|s| s.group).collect();
                         // The first context may have failed: namespace visits and the ones added
                         // by hand belong to the cluster that is first now.
                         if let Some((first, _)) = clusters.first() {
@@ -430,6 +447,42 @@ fn merge_kinds(
     (kinds, kind_clusters)
 }
 
+/// Each cluster's kinds, and the add-on groups each one skipped (by cluster name, only those
+/// that skipped some).
+fn split_skipped(
+    names: &[&str],
+    discovered: Vec<Result<k8s::Discovered>>,
+) -> (Vec<Result<Vec<Kind>>>, Vec<(String, Vec<k8s::SkippedGroup>)>) {
+    let mut skipped = Vec::new();
+    let kinds = (names.iter().zip(discovered))
+        .map(|(name, found)| {
+            found.map(|d| {
+                if !d.skipped.is_empty() {
+                    skipped.push((name.to_string(), d.skipped));
+                }
+                d.kinds
+            })
+        })
+        .collect();
+    (kinds, skipped)
+}
+
+/// What the status line says of the add-on APIs that couldn't be read: their types are
+/// missing from the sidebar for now, not gone.
+fn skipped_notice(skipped: &[(String, Vec<k8s::SkippedGroup>)]) -> Option<SharedString> {
+    if skipped.is_empty() {
+        return None;
+    }
+    let one = skipped.len() == 1;
+    let parts: Vec<String> = (skipped.iter())
+        .map(|(name, groups)| {
+            let groups = k8s::describe_skipped(groups);
+            if one { groups } else { format!("{name}: {groups}") }
+        })
+        .collect();
+    Some(format!("Add-on APIs that couldn't be read, their types left out: {}", parts.join("; ")).into())
+}
+
 /// Lists in a history that name a kind none of the clusters serve show `fallback` instead.
 fn served_lists(history: &mut [Route], kinds: &[Kind], fallback: Option<&Kind>) {
     for route in history {
@@ -505,12 +558,36 @@ fn one_namespace(wanted: &[String], previous: &[String], accessible: &[String]) 
 mod tests {
     use super::{
         Kind, Route, TabState, all_restricted, cluster_namespace, cluster_namespaces, kinds_per_cluster,
-        listed_namespaces, merge_kinds, one_namespace, served_by, served_lists, served_tab,
+        listed_namespaces, merge_kinds, one_namespace, served_by, served_lists, served_tab, skipped_notice,
+        split_skipped,
     };
     use crate::k8s::argo::diagnosis::{Res, known_kind};
 
     fn kind(k: &str) -> Kind {
         Kind::fake("", k)
+    }
+
+    /// The groups a cluster skipped are told, by cluster when there are several; a cluster
+    /// that skipped none adds nothing, and one that failed is left to the connect errors.
+    #[test]
+    fn skipped_groups_are_told_by_cluster() {
+        use crate::k8s::{Discovered, SkippedGroup};
+        let argo = SkippedGroup { group: "argoproj.io".into(), error: "argoproj.io/v1alpha1: 503".into() };
+        let found = vec![
+            Ok(Discovered { kinds: vec![kind("Pod")], skipped: vec![argo] }),
+            Ok(Discovered { kinds: vec![kind("Pod")], skipped: Vec::new() }),
+            Err(anyhow::anyhow!("down")),
+        ];
+        let (kinds, skipped) = split_skipped(&["hub", "spoke", "down"], found);
+        assert_eq!(kinds.len(), 3);
+        assert!(kinds[2].is_err());
+        assert_eq!(skipped.len(), 1);
+        let notice = skipped_notice(&skipped).unwrap();
+        assert!(notice.contains("argoproj.io (argoproj.io/v1alpha1: 503)"), "{notice}");
+        assert!(!notice.contains("hub:"), "one cluster: not named");
+        let two = [skipped[0].clone(), ("spoke".to_string(), skipped[0].1.clone())];
+        assert!(skipped_notice(&two).unwrap().contains("hub: argoproj.io"));
+        assert!(skipped_notice(&[]).is_none());
     }
 
     #[test]
