@@ -74,7 +74,11 @@ syncing an Application doesn't allow patching its spec. Rules saved by a version
 verbs checked GitOps actions as `patch`: on the first start of this version, every rule that
 names `patch` gets the three verbs, once (and rules.yaml is written again), so what it allowed,
 asked or denied it still does. Take `refresh` out of an Ask rule afterwards to let refreshes
-through.
+through. rules.yaml says which rules it holds (`version: 2`), so a file without it is upgraded
+whenever it is loaded (restored from git, copied from another machine, or given with no
+agents.json), and so are rules copied with *Copy rules* by an older version and pasted. A file
+without it whose rules name `refresh`, `sync` or `suspend` was written for them: it is not loaded
+until `version: 2` is added at its top (pasted rules that name them are taken as they are).
 
 Write mode and protected contexts are for you in the window: an agent's calls don't check them,
 only its rules (with the rate limit and the kill switch below). An Allow rule for a write lets the
@@ -101,7 +105,9 @@ run) and offer **Always allow this** to add a narrow rule; it wins over the Ask 
 the same request is not asked again (until you edit the rule). It covers that kind only, not another
 API group's kind with the same plural, and its names and contexts match case included. The rule editor marks such rules
 "approved", and rules pasted with *Paste rules* never count as approved. In a pasted rule, a missing
-effect means Deny, and a missing list means `*` in a Deny or Ask, none in an Allow. For `apply_manifest` the banner lists
+effect means Deny, and a missing list means `*` in a Deny or Ask, none in an Allow; rules copied
+without a `version` (by a version before the GitOps verbs) get them where they name `patch`, unless
+one names `refresh`, `sync` or `suspend` already. For `apply_manifest` the banner lists
 every object (kind, namespace/name) and the YAML that will be applied, a Secret's values masked; the
 activity log keeps each object with a hash of that YAML, and the objects already applied when a call
 is cut off.
@@ -163,7 +169,7 @@ Tools, by what they do:
   `top_nodes`, `usage_history`, `get_logs`, `workload_logs`, `get_changes`, `recent_changes`,
   `rollout_history`, `rollout_status`, `list_helm_releases`, `helm_history`, `helm_get_values`,
   `diff_manifest`, `explain_resource`, `can_i`, `cluster_version`, `upgrade_check`, `wait_for`,
-  `list_port_forwards`, `browse_files`, `get_metrics`.
+  `list_port_forwards`, `browse_files`, `get_metrics`, `argocd_apps`.
 - **Change:** `scale`, `rollout_restart`, `rollout_undo`, `rollout_pause`, `rollout_resume`,
   `set_image`, `patch_resource`, `apply_manifest`, `delete_resource`, `trigger_cronjob`,
   `cordon_node`, `uncordon_node`, `drain_node`, `gitops`, `exec_command`, `debug_pod`,
@@ -205,6 +211,29 @@ tools' definitions. What some of them need beyond the obvious verb:
 - **Logs of a workload:** `workload_logs` merges the logs of a workload's or Service's pods (the
   newest 20) in time order, each line prefixed with its pod. It needs `get` on the workload; pods
   whose logs the rules don't allow are left out and counted.
+- **Argo CD, from the hub to the destination:** `argocd_apps` lists Applications like the Argo CD
+  page: for each, its hub (the context Argo CD runs in), project, sync, health, auto-sync, last
+  operation, revision, where it deploys (the kubeconfig context that reaches its destination,
+  marked when the agent's rules don't open it) and the app of apps that made it, those needing a
+  look first with Argo CD's message. Filters: `problems_only` (a failed sync, an error, Degraded
+  or Missing, a sync running, or out of sync with auto-sync on; out of sync with auto-sync off is
+  how an Application synced by hand waits, not a problem), `out_of_sync`, `project`,
+  `destination` (a context) and `dest_namespace`. It reads the hub in `context`, else the hubs
+  ticked in Settings → Contexts, else those the window or an agent's calls found serving
+  Applications, and only among the contexts the rules name: no other context is asked whether it
+  runs Argo CD. It needs `list` on `applications.argoproj.io` on the hub and shows the rows the
+  rules allow; without `context` it never asks for approval and names the hubs only an Ask rule
+  covers. The list is the one the Argo CD page reads (kept 30 s, one per hub).
+  `describe_resource` and `get_changes` name the Application that deployed an object, from its
+  tracking id (`argocd.argoproj.io/tracking-id`, Argo CD's annotation tracking) or else its
+  `app.kubernetes.io/instance` label (label tracking; Helm sets it too, so it counts only when
+  the Application is found tracking the object), with its hub, sync, health and the object's own
+  state in it; `get_changes` adds the Application's deployments. That Application is read on the
+  same hubs, only where an Allow rule gives `get` on it (or `list`, to find it in another
+  namespace or by label), and nothing is read for an object that names none. `wait_for` waits for
+  an Application's `sync=Synced`, `health=Healthy` or `operation=Succeeded`, met only once no
+  operation runs (until then they are from before it); it returns at once with Argo CD's message
+  when the last operation failed.
 - **Argo CD diagnosis:** `gitops` with `action: diagnose` on an Application changes nothing and
   needs `get` on it (not `refresh` or `sync`; the activity log doesn't count it as a change). It returns the
   diagnosis of the Application's page: a deletion held by a finalizer, a sync running for long,

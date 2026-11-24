@@ -352,14 +352,14 @@ pub(super) fn items(groups: &[Group], open: &HashSet<String>) -> Vec<Item> {
 }
 
 fn fmt_time(t: jiff::Timestamp) -> String {
-    t.to_zoned(jiff::tz::TimeZone::system()).strftime("%H:%M:%S").to_string()
+    t.to_zoned_datetime(jiff::tz::TimeZone::system()).strftime("%H:%M:%S").to_string()
 }
 
 /// "14:02:11", or "Oct 20 14:02" for another day.
 fn fmt_day_time(t: jiff::Timestamp) -> String {
     let tz = jiff::tz::TimeZone::system();
-    let z = t.to_zoned(tz.clone());
-    if z.date() == jiff::Timestamp::now().to_zoned(tz).date() {
+    let z = t.to_zoned_datetime(tz.clone());
+    if z.date() == jiff::Timestamp::now().to_zoned_datetime(tz).date() {
         z.strftime("%H:%M:%S").to_string()
     } else {
         z.strftime("%b %d %H:%M").to_string()
@@ -521,7 +521,7 @@ fn render_item(item: &Item, ix: usize, view: &WeakEntity<AgentsView>, cx: &App) 
             })
             .child(div().text_color(muted).child(format!(
                 "{} · {}ms · {} bytes returned{}{}",
-                call.time.to_zoned(jiff::tz::TimeZone::system()).strftime("%Y-%m-%d %H:%M:%S"),
+                call.time.to_zoned_datetime(jiff::tz::TimeZone::system()).strftime("%Y-%m-%d %H:%M:%S"),
                 call.duration_ms,
                 call.result_bytes,
                 call.client.as_ref().map_or_default(|c| format!(" · {c}")),

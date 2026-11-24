@@ -13,8 +13,8 @@ use super::audit::{
     AuditEntry, AuditStats, MAX_AUDIT_IN_MEMORY, append_audit, audit_path, load_audit_tail, read_audit,
 };
 use super::config::{
-    Agent, CONFIG_VERSION, Config, GITOPS_VERBS_VERSION, config_lock_path, hash_token, load_config, new_token,
-    same_rules, take_lock,
+    Agent, CONFIG_VERSION, Config, GITOPS_VERBS_VERSION, SECTIONS_VERSION, config_lock_path, hash_token, load_config,
+    new_token, same_rules, take_lock,
 };
 use super::policy::{Access, Mode, Policy, Rule, Verb};
 use super::preview::Preview;
@@ -115,12 +115,15 @@ impl Approval {
     /// (the rule would cover every name), a request across all namespaces (the rule would
     /// also cover namespaces no rule allows) and dry runs (a rule cannot be limited to dry
     /// runs, so it would allow the real write), and an Argo CD sync, rollback or terminate
-    /// (the `sync` verb would allow every prune and rollback of the object).
+    /// (the `sync` verb would allow every prune and rollback of the object): `sync` on an
+    /// Application makes no rule whatever the tool or [`once_only`](Self::once_only) say.
     pub fn as_rule(&self) -> Option<Rule> {
         let a = &self.access;
+        let argo_app = |r: &String| r.eq_ignore_ascii_case("applications.argoproj.io");
         // A refresh or a Flux reconcile has its own verb, so its rule allows that action on
         // that object only.
         if matches!(a.verb, Verb::Exec | Verb::Patch | Verb::Scale | Verb::Suspend)
+            || (a.verb == Verb::Sync && (argo_app(&a.resource) || a.resource_aliases.iter().any(argo_app)))
             || self.tool == "apply_manifest"
             || self.dry_run
             || self.once_only
@@ -198,6 +201,10 @@ pub struct Hub {
     server_status: Mutex<Option<Result<u16, String>>>,
     /// rules.yaml: its last load error, and the text last loaded or written (None: no file).
     rules_error: Mutex<Option<String>>,
+    /// Why rules.yaml, loaded and in force, could not be written with its upgrade. Kept apart
+    /// from `rules_error`: edits on the Agents page still try to write the file (and say why
+    /// they can't), rather than being skipped and undone at the next load.
+    rules_warning: Mutex<Option<String>>,
     rules_text: Mutex<Option<String>>,
     /// The lock on agents.lock while the app or `serve` runs (see [`Hub::claim_config`]).
     config_lock: Mutex<Option<std::fs::File>>,
@@ -205,6 +212,8 @@ pub struct Hub {
     config_error: Option<String>,
     /// Port-forwards agents opened.
     forwards: super::forwards::AgentForwards,
+    /// The folder of agents.json and rules.yaml (another one in tests).
+    dir: std::path::PathBuf,
 }
 
 impl Hub {
@@ -221,8 +230,8 @@ impl Hub {
         }
         for agent in &mut config.agents {
             agent.policy.migrate();
-            // Saved before the GitOps verbs: rules.yaml, when it exists, is upgraded the same
-            // way when it is loaded (`apply_rules_file`), which then sets the version.
+            // Saved before the GitOps verbs. rules.yaml, when it exists, says itself whether
+            // its rules are that old (`rules_file::apply_upgrading`).
             if config.version < GITOPS_VERBS_VERSION {
                 agent.policy.add_gitops_verbs();
             }
@@ -252,10 +261,12 @@ impl Hub {
             rules_file_present: AtomicBool::new(rules_file_present),
             recent_calls: Mutex::default(),
             rules_error: Mutex::default(),
+            rules_warning: Mutex::default(),
             rules_text: Mutex::default(),
             config_lock: Mutex::default(),
             config_error,
             forwards: super::forwards::AgentForwards::default(),
+            dir: crate::paths::config_dir(),
         }
     }
 
@@ -264,6 +275,14 @@ impl Hub {
     #[cfg(test)]
     pub(crate) fn for_test(agents: Vec<Agent>) -> Arc<Self> {
         Arc::new(Self::new(Config { agents, ..Config::default() }, VecDeque::new(), None, false))
+    }
+
+    /// [`for_test`](Self::for_test) with agents.json and rules.yaml in `dir`.
+    #[cfg(test)]
+    fn for_test_in(agents: Vec<Agent>, dir: &std::path::Path) -> Arc<Self> {
+        let mut hub = Self::new(Config { agents, ..Config::default() }, VecDeque::new(), None, false);
+        hub.dir = dir.to_path_buf();
+        Arc::new(hub)
     }
 
     /// Why agents.json could not be read at start, if it couldn't.
@@ -294,13 +313,19 @@ impl Hub {
         lock(&self.rules_error).clone()
     }
 
+    /// Why rules.yaml, whose rules are in force, could not be written with its upgrade.
+    pub fn rules_warning(&self) -> Option<String> {
+        lock(&self.rules_warning).clone()
+    }
+
     /// Load rules.yaml into the agents (creating agents it names). A broken file
     /// changes nothing: the error is kept for the Agents page.
     pub fn apply_rules_file(&self) -> Result<bool> {
-        let path = rules_file::path();
+        let path = self.dir.join("rules.yaml");
         self.rules_file_present.store(path.exists(), Ordering::Relaxed);
         // Said on the Agents page when the rules loaded but the file couldn't be upgraded.
         let mut warning = None;
+        *lock(&self.rules_warning) = None;
         {
             // Read and apply under the config lock: an edit in the app, which writes the file
             // under it, can't land between the two and leave the file and the rules in force
@@ -336,7 +361,10 @@ impl Hub {
             // Rules saved by an older version are upgraded, and the file written, once: see
             // `rules_file::apply_upgrading`.
             let mut agents = cfg.agents.clone();
-            let mut upgraded = true;
+            // The file's own `version` decides whether its rules are upgraded, so agents.json's
+            // is the current one from now on, but while sections it should have gained (agents
+            // from before 0.3.0) are not written yet, it stays below that.
+            let mut version = CONFIG_VERSION;
             if rules_file::apply_upgrading(&file, &mut agents, cfg.version)? {
                 let mut seen = lock(&self.rules_text);
                 match rules_file::export_over(&path, &agents, seen.as_deref()) {
@@ -349,23 +377,25 @@ impl Hub {
                         self.emit(HubEvent::AgentSeen);
                         return Err(e);
                     }
-                    // A file that can't be written (read-only, managed elsewhere) still holds
-                    // the rules: they are applied upgraded, as the file means them, and the
-                    // version stays so that every load upgrades them again until it is written.
-                    // Refusing the load would keep older rules in force, new denies left out.
+                    // A file in a folder that can't be written (managed by another tool) still
+                    // holds the rules: they are applied upgraded, as the file means them, and
+                    // the file, still without its `version`, is upgraded again at each load
+                    // until it is written. Refusing the load would keep older rules in force,
+                    // new denies left out. Edits on the Agents page try the write and fail.
                     Err(e) => {
                         let e = e.context("rules.yaml could not be written for this version; its rules are in force");
                         warning = Some(format!("{e:#}"));
-                        upgraded = false;
+                        if cfg.version < SECTIONS_VERSION {
+                            version = cfg.version;
+                        }
                     }
                 }
             }
             cfg.agents = agents;
-            if upgraded {
-                cfg.version = CONFIG_VERSION;
-            }
+            cfg.version = version;
         }
-        *lock(&self.rules_error) = warning;
+        *lock(&self.rules_error) = None;
+        *lock(&self.rules_warning) = warning;
         self.save()?;
         self.emit(HubEvent::AgentSeen);
         Ok(true)
@@ -374,7 +404,7 @@ impl Hub {
     /// Save new rules.yaml text from the app: validated first, then written and applied.
     pub fn save_rules_text(&self, text: &str) -> Result<()> {
         rules_file::check(text)?;
-        crate::private_files::write_atomic(&rules_file::path(), text.as_bytes())?;
+        crate::private_files::write_atomic(&self.dir.join("rules.yaml"), text.as_bytes())?;
         self.apply_rules_file().map(|_| ())
     }
 
@@ -437,16 +467,15 @@ impl Hub {
             return Ok(());
         }
         let mut seen = lock(&self.rules_text);
-        let text =
-            rules_file::export_over(&rules_file::path(), agents, seen.as_deref()).context("rules.yaml not updated")?;
+        let text = rules_file::export_over(&self.dir.join("rules.yaml"), agents, seen.as_deref())
+            .context("rules.yaml not updated")?;
         *seen = Some(text);
         Ok(())
     }
 
     fn save(&self) -> Result<()> {
         let json = serde_json::to_vec_pretty(&*read(&self.config))?;
-        crate::private_files::write_atomic(&crate::paths::config_dir().join("agents.json"), &json)
-            .context("saving agents.json")
+        crate::private_files::write_atomic(&self.dir.join("agents.json"), &json).context("saving agents.json")
     }
 
     /// The port-forwards agents have open.
@@ -750,6 +779,20 @@ impl Hub {
         Ok((client, kinds))
     }
 
+    /// The contexts connected for agents whose discovered kinds hold `group`/`kind`, sorted.
+    /// No request: a context not connected yet is not among them.
+    pub fn contexts_serving(&self, group: &str, kind: &str) -> Vec<String> {
+        let clusters: Vec<(String, Arc<Cluster>)> =
+            lock(&self.clients).iter().map(|(n, c)| (n.clone(), c.clone())).collect();
+        let mut out: Vec<String> = clusters
+            .into_iter()
+            .filter(|(_, c)| lock(&c.kinds).as_ref().is_some_and(|(kinds, _)| kinds.iter().any(|k| k.is(group, kind))))
+            .map(|(n, _)| n)
+            .collect();
+        out.sort();
+        out
+    }
+
     /// Discover again (a CRD may have been installed since), at most once a minute per
     /// context. None when it ran too recently or failed.
     pub async fn rediscover(&self, context: &str) -> Option<Arc<Vec<Kind>>> {
@@ -987,6 +1030,89 @@ mod tests {
             let p = Policy { rules: vec![protected(effect)], ..Policy::default() };
             assert!(!p.allow_names_protected());
         }
+    }
+
+    /// A rules.yaml from before the GitOps verbs, given with no agents.json (so the config is
+    /// the default one, at the current version), is upgraded all the same: an Argo CD sync
+    /// is asked as the `patch` it was checked as, not allowed by a wider Allow. Written
+    /// again with its `version`, it then loads as written.
+    #[test]
+    fn an_old_rules_file_without_agents_json_is_upgraded() {
+        let dir = crate::mcp::test_dir();
+        let old = "agents:\n  ci:\n    allow: [\"* * -n team-a\"]\n    ask: [\"patch,delete *\"]\n";
+        std::fs::write(dir.join("rules.yaml"), old).unwrap();
+        let hub = Hub::for_test_in(Vec::new(), &dir);
+        assert_eq!(hub.config().version, CONFIG_VERSION);
+        assert!(hub.apply_rules_file().unwrap());
+        let sync = |verb| Access {
+            context: "hub".into(),
+            verb,
+            resource: "applications.argoproj.io".into(),
+            namespace: Some("team-a".into()),
+            name: Some("web".into()),
+            ..Access::default()
+        };
+        let ci = || hub.config().agents.into_iter().find(|a| a.name == "ci").unwrap();
+        for verb in [Verb::Patch, Verb::Refresh, Verb::Sync, Verb::Suspend] {
+            assert_eq!(ci().policy.decide(&sync(verb)).mode, Mode::Ask, "{verb}");
+        }
+        let written = std::fs::read_to_string(dir.join("rules.yaml")).unwrap();
+        assert!(written.contains(&format!("\nversion: {}\n", rules_file::FILE_VERSION)), "{written}");
+        // Loaded again, as written: a verb taken out by hand stays out.
+        let edited = written.replace("patch,delete,refresh,sync,suspend", "patch,delete,sync,suspend");
+        assert_ne!(edited, written);
+        std::fs::write(dir.join("rules.yaml"), &edited).unwrap();
+        assert!(hub.apply_rules_file().unwrap());
+        assert_eq!(std::fs::read_to_string(dir.join("rules.yaml")).unwrap(), edited);
+        assert_eq!(ci().policy.decide(&sync(Verb::Refresh)).mode, Mode::Allow);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A rules.yaml whose upgrade can't be written (its folder is read-only) is in force,
+    /// upgraded, with a warning that doesn't stop edits from trying the file: a Deny added
+    /// on the Agents page then fails with the write error, rather than being kept in
+    /// agents.json only and undone at the next load.
+    #[cfg(unix)]
+    #[test]
+    fn an_edit_never_vanishes_when_the_upgrade_could_not_be_written() {
+        use std::os::unix::fs::PermissionsExt as _;
+        /// Gives the folder its permissions back, whatever the test does.
+        struct Writable(std::path::PathBuf);
+        impl Drop for Writable {
+            fn drop(&mut self) {
+                let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let dir = crate::mcp::test_dir();
+        let guard = Writable(dir.clone());
+        let old = "agents:\n  ci:\n    ask: [\"patch *\"]\n";
+        std::fs::write(dir.join("rules.yaml"), old).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        // Root writes anyway: nothing to check then.
+        if std::fs::write(dir.join("probe"), "").is_ok() {
+            return;
+        }
+        let hub = Hub::for_test_in(Vec::new(), &dir);
+        // agents.json can't be saved in that folder either; the rules are in force all the same.
+        let _ = hub.apply_rules_file();
+        assert_eq!(hub.rules_error(), None);
+        assert!(hub.rules_warning().is_some_and(|w| w.contains("could not be written")));
+        let ci = || hub.config().agents.into_iter().find(|a| a.name == "ci").unwrap();
+        assert_eq!(ci().policy.rules[0].verbs, ["patch", "refresh", "sync", "suspend"]);
+        let deny = rules_file::parse_rule(Mode::Deny, "delete pods").unwrap();
+        let edit = hub.update_agent(&ci().id, |a| a.policy.rules.push(deny.clone()));
+        assert!(edit.is_err());
+        assert!(!ci().policy.rules.contains(&deny));
+        assert_eq!(std::fs::read_to_string(dir.join("rules.yaml")).unwrap(), old);
+        // Writable again: the next load writes the upgrade, and the edit is written too.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(hub.apply_rules_file().unwrap());
+        assert_eq!(hub.rules_warning(), None);
+        hub.update_agent(&ci().id, |a| a.policy.rules.push(deny.clone())).unwrap();
+        assert!(hub.apply_rules_file().unwrap());
+        assert!(ci().policy.rules.contains(&deny));
+        drop(guard);
     }
 
     #[test]

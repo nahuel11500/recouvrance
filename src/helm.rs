@@ -14,7 +14,7 @@ use serde_json::Value;
 use crate::k8s;
 
 /// Helm's Secrets of current revisions (not the whole history).
-const CURRENT: &str = "owner=helm,status!=superseded";
+pub(crate) const CURRENT: &str = "owner=helm,status!=superseded";
 /// Releases read per request while the list fills in.
 const FILL_PAGE: u32 = 100;
 
@@ -126,7 +126,7 @@ pub(crate) fn stub(meta: &ObjectMeta) -> Option<Release> {
     let updated = label("modifiedAt")
         .and_then(|t| t.parse().ok())
         .and_then(|t| jiff::Timestamp::from_second(t).ok())
-        .or_else(|| meta.creation_timestamp.as_ref().map(|t| t.0));
+        .or_else(|| meta.creation_timestamp.as_ref().and_then(|t| k8s::timestamp(t.0)));
     Some(Release {
         context: String::new(),
         name,

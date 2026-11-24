@@ -405,7 +405,7 @@ pub(crate) async fn sweep(client: Client, namespaces: Vec<String>, max_age: jiff
     for pod in pods {
         let meta = pod.metadata;
         let (Some(ns), Some(name), Some(uid)) = (meta.namespace, meta.name, meta.uid) else { continue };
-        let created = meta.creation_timestamp.map(|t| t.0);
+        let created = meta.creation_timestamp.and_then(|t| super::timestamp(t.0));
         if name.starts_with(NAME_PREFIX) && created.is_some_and(|t| older(t, now, max_age)) {
             let removed = remove_named(&client, &ns, &name, Some(uid.clone())).await;
             live().remove(&uid);

@@ -24,7 +24,7 @@ Site: [nahuelcanavy.com/recouvrance](https://nahuelcanavy.com/recouvrance/)
 - **Native and fast**: Rust and gpui, no web view. Server-side tables keep clusters with tens of
   thousands of pods in a few hundred megabytes.
 - **Everything in one place**: live tables for every type (CRDs included), logs across pods with
-  find and filters, shell, attach, a file browser and file copy, port-forwards, YAML with field docs and schema forms,
+  find and filters (a workload's, or the checked rows' across namespaces and clusters), shell, attach, a file browser and file copy, port-forwards, YAML with field docs and schema forms,
   Helm, Flux and Argo CD actions, several clusters at once, tabs and windows.
 - **Tells you what is wrong**: a Problems page across clusters, a diagnosis on every broken pod or
   workload, firing alerts, stuck deletions, ExternalSecrets that fail to sync, usage history from
@@ -126,7 +126,7 @@ what you can check for yourself:
 
 - **No telemetry.** The app talks to your clusters, to the Prometheus or VictoriaMetrics you point
   it at, to the Anthropic API only if you use the assistant, to an https URL you load in
-  *Create / apply*, and to GitHub when you click *Check for updates* in Settings → About (one
+  *Create / apply*, to the Argo CD API server you set in Settings when you ask for its diff, and to GitHub when you click *Check for updates* in Settings → About (one
   unauthenticated request for the latest release). Nothing else, and no analytics. The release
   notes shown after an update come with the app.
 - **Safe by default.** Read-only until you turn writes on. Writes show their `kubectl`

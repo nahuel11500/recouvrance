@@ -15,9 +15,11 @@ Recouvrance reads your kubeconfig like `kubectl` does and keeps its own settings
 | `~/.config/recouvrance/plugins.yaml` | Your commands on resources |
 | `~/.config/recouvrance/kubeconfigs/*.yaml` | Kubeconfigs pasted in Settings (mode 0600) |
 | `~/.config/recouvrance/templates/*.yaml` | Your templates for **Create / apply** |
-| `~/.config/recouvrance/favorites.json`, `columns.json`, `custom-columns.json`, `column-widths.json` | Favorites, saved views, column choices and widths |
+| `~/.config/recouvrance/favorites.json`, `columns.json`, `custom-columns.json`, `column-widths.json` | Favorites and saved views (see [favorites.json](#favoritesjson)), column choices and widths |
 | `~/.config/recouvrance/theme`, `zoom` | Light or dark choice (absent: follow the desktop), UI zoom (0.7 to 2.0) |
 | `~/.config/recouvrance/anthropic-key` | The assistant's Anthropic API key, when saved in Settings (mode 0600; `ANTHROPIC_API_KEY` is used otherwise) |
+| `~/.config/recouvrance/argocd-tokens.json` | Read-only Argo CD API tokens set in Settings → Per cluster, by context (mode 0600; see [Argo CD's diff](#argo-cds-diff-argocd_servers)) |
+| `~/.config/recouvrance/argocd-api-tokens.json` | Argo CD API tokens set in Settings → Argo CD, by server address (mode 0600; see [Argo CD by its API](#argo-cd-by-its-api-argocd_api_servers)) |
 | `~/.config/recouvrance/main-agent` | The built-in assistant's agent id and token (mode 0600) |
 | `~/.local/share/recouvrance/audit.jsonl` | Agent activity log |
 | `~/.local/share/recouvrance/timeline/<context>-<hash>.jsonl` | Changes recorded per context (mode 0600, see [Timeline](#timeline)) |
@@ -69,7 +71,7 @@ context already shown as `name@file` keeps that name when `name` is freed.
 |---|---|---|
 | `startup` | `"reconnect"` | Reconnect to the last contexts (`reconnect`) or open the context picker (`ask`) |
 | `initial_view` | `"pods"` | First page after connecting: `pods`, `workloads`, `cluster`. A set of contexts with a saved session (`sessions`) reopens on its own page instead |
-| `sessions` | | Remembered by the app: where each set of contexts was left, newest first, 20 kept: `{ "contexts": ["prod"], "tabs": [{ "page": "list", "kind": "deployments.apps", "namespaces": ["team-a"], "filter": "web" }], "active_tab": 0, "filters": { "pods": "api" } }`. `page` is `list`, `workloads`, `cluster`, `problems`, `timeline`, `helm` or `argo`; `kind` is the kubectl name. The first window reopens the session of the contexts it connects to. A value that doesn't read takes its default, an entry that doesn't read is dropped, and a type, namespace or page the clusters no longer have falls back to the default; none of it ever stops the file from loading |
+| `sessions` | | Remembered by the app: where each set of contexts was left, newest first, 20 kept: `{ "contexts": ["prod"], "tabs": [{ "page": "list", "kind": "deployments.apps", "namespaces": ["team-a"], "filter": "web" }], "active_tab": 0, "filters": { "pods": "api" } }`. `page` is `list`, `workloads`, `cluster`, `problems`, `timeline`, `helm` or `argo`; `kind` is the kubectl name. The first window reopens the session of the contexts it connects to; a connect where one of them fails (it doesn't answer, or its namespaces don't list) saves nothing over it, and the next connect to that set that reaches them all reopens it again. A value that doesn't read takes its default, an entry that doesn't read is dropped, and a type, namespace or page the clusters no longer have falls back to the default; none of it ever stops the file from loading |
 | `window` | | Remembered by the app: `{ "x": 80, "y": 40, "width": 1500, "height": 920, "maximized": false }`, where the first window opens (centered when that is out of reach of every display). One that doesn't read opens at 1500×920, centered |
 | `metrics_refresh`, `detail_refresh`, `overview_refresh` | 15, 5, 30 | Seconds between refreshes. `metrics_refresh` is the shortest wait between reads of metrics-server: the pods and nodes lists read it again when its next sample is due (up to twice its interval or 5 minutes later), and every `metrics_refresh` when its timestamps say nothing; detail pages refresh their related objects and usage every `metrics_refresh`. The cluster overview's refresh doesn't list the pods again: it lists them once, then follows them with a watch. A page that isn't on screen refreshes nothing: one in the back/forward history, or any page of a window hidden as the desktop reports it (minimized, on another workspace, or on macOS fully covered by other windows; Wayland compositors without the `suspended` state never report it). Its watch of the pods' requests stops after 5 minutes off screen |
 | `log_tail_lines`, `log_timestamps` | 1000, true | Log viewer |
@@ -80,6 +82,10 @@ context already shown as `name@file` keeps that name when `name` is freed.
 | `protect_unset` | `false` | Set when the protection choices could not be read: contexts not listed in `protection` are protected instead of guessed. *Guess them again* in Settings → Contexts turns it off |
 | `prometheus` | found automatically | `{ "ctx": "monitoring/prometheus:9090" }` (see below) |
 | `clusters` | | Per-cluster settings (below) |
+| `argocd_servers` | `{}` | `{ "argocd-hub": "https://argocd.example.com" }`: the Argo CD API server of a hub context, to read Argo CD's own diff from (see below). None: off. An entry that doesn't read is dropped. Settings → Per cluster |
+| `argocd_api_servers` | `[]` | `["https://argocd.example.com"]`: Argo CD API servers read on the Argo CD page, besides the argocd CLI's (see below). Settings → Argo CD |
+| `argocd_api_off` | `[]` | Argo CD API servers (their address) not read, whether set here or the argocd CLI's. Settings → Argo CD, the switch of each |
+| `argocd_group_label` | `""` | `"app.kubernetes.io/part-of"`: the label whose value names an Application's service on the Argo CD page grouped by service. Empty: its name without the environment in it. Settings → Argo CD |
 | `argocd_contexts` | `[]` | `["argocd-hub"]`: the contexts Argo CD's Applications are read from (see below). Empty: found on their own. A value that doesn't read is empty. Settings → Contexts, *Argo CD* |
 | `extra_namespaces` | | Namespaces added by hand, per context |
 | `metrics_enabled` | true | Read metrics-server and Prometheus at all |
@@ -191,12 +197,131 @@ on and it is asked (its login may run); if it serves Applications, it is kept he
 ```
 
 Only the named contexts are asked then (their login may run). Connecting the hub as well works too.
+Agents read Argo CD (`argocd_apps`, and the Application named by `describe_resource` and
+`get_changes`) on these contexts too, else on the hubs already found, among the contexts their
+rules name (see [agents](agents.md)).
+
+### Argo CD's diff (`argocd_servers`)
+
+An Application's page can show what a sync would change, as Argo CD renders it from git: set the
+Argo CD API server of the hub context in Settings → Per cluster (`https://argocd.example.com`,
+with a path when Argo CD is served under one). Plain `http://` is only taken for this machine (a
+port-forward to argocd-server), so a token never crosses the network in clear.
+
+*Show Argo CD's diff* then sends one request, `GET /api/v1/applications/{name}/managed-resources`,
+to that server only, and only on that click. It logs in with, in this order:
+
+- the token set in Settings → Per cluster (kept in `argocd-tokens.json`, mode 0600, never shown
+  again; *Forget* removes it). A project role or local account limited to `applications, get` is
+  enough;
+- the argocd CLI's login to that server: the token `argocd login` saved in its config file
+  (`$ARGOCD_CONFIG_DIR/config`, else `~/.argocd/config` when that folder exists, else
+  `~/.config/argocd/config`). Recouvrance only reads it; when it has expired, run
+  `argocd login <server> --sso` again. The CLI's `--core` and port-forward modes have no address
+  to ask.
+
+Errors never show the token. Secret values are masked by Recouvrance itself, whatever Argo CD
+sends (its own masking leaked predicted Secret states before 3.2.12, 3.3.10 and 3.4.2).
+
+### Argo CD by its API (`argocd_api_servers`)
+
+The Argo CD page also reads Argo CD by its own API, for when you may use Argo CD but not the
+cluster it runs on. Its servers are:
+
+- those the argocd CLI is logged in to: each context of its config file (found as above) with a
+  token, one per server, the current context's first. Its `--insecure` (the certificate is not
+  checked), `--plaintext` (taken only for this machine, as above) and `--grpc-web-root-path`
+  (Argo CD served under a path) are honoured; `--grpc-web` makes no difference to the REST API;
+  a `--core` context has no server;
+- those added in Settings → Argo CD: an address, and a token kept in `argocd-api-tokens.json`
+  (mode 0600, never shown again; *Forget token* removes it). A token set here wins over the CLI's
+  for the same server.
+
+A config that can't be read fails closed: a CLI config that doesn't parse gives no server, and a
+tokens file that doesn't read gives no token at all (not even the CLI's), each said in Settings →
+Argo CD and above the list. An expired token is said before anything is sent. Errors never show a
+token, and a token is only sent to its server, over https, without following redirects.
+
+Each server's application stream (`/api/v1/stream/applications`, server-sent events, with
+`fields` so only what the page shows is sent) is opened first: Argo CD subscribes it to every
+change before anything else. Then the Applications are listed (`GET /api/v1/applications`, with
+`fields`), and what the stream sent meanwhile is applied over the list in order, the newer of the
+two winning (by resource version) and a deletion removing: nothing changed between the list and
+the stream is lost. A stream that ends, breaks or stays silent 15 minutes is opened again after a
+backoff of 1 s doubling to 60 s (back to 1 s once one stayed open a minute), listing again; that
+is routine and not shown as an error, while a list or a stream that can't be opened is. A refused
+login stops until the login or the config changes: a new `argocd login`, or a token set in
+Settings, is noticed within a second while the page is shown. The page holds the feeds while a
+window shows it, shared by every window, and lets them go when none does. Only the fields shown
+are kept, so memory stays small however many Applications there are. The projects' sync windows
+are read beside the stream, and again every 5 minutes: one `GET /api/v1/projects`, or, when they
+can't be listed, `GET /api/v1/projects/{name}` (its `spec.syncWindows`) for each project of the
+Applications, up to 50. Reading needs `applications, get` and `projects, get`; the row menu's
+actions need what Argo CD's own UI would (`applications, sync` and so on). An action is sent with
+the server's login as the config has it then, and not at all to a server removed or turned off
+since the list was drawn. When settings.json can't be read, every server is off (which were
+turned off is unknown).
+
+An Application read by the API and by its hub is the same one when the hub's Argo CD server set
+in Settings → Per cluster (`argocd_servers`) is that API server, and its namespace and name are
+the same: it shows once, as read on the hub (whose page it opens). Without that setting, the two
+are kept apart.
+
+## favorites.json
+
+Every favorite and saved view, in one file the app writes when a star changes. Every window
+shares the same favorites, so one never saves over another's:
+
+```json
+{
+  "contexts": ["prod"],
+  "namespaces": [{"context": "prod", "namespace": "shop"}],
+  "applications": [
+    {"argocd": "context:hub", "namespace": "argocd", "name": "shop-prod", "context": "hub"},
+    {"argocd": "https://argocd.example.com", "namespace": "argocd", "name": "shop-dev"}
+  ],
+  "objects": [{"context": "prod", "kind": "deployments.apps", "namespace": "shop", "name": "api"}],
+  "kinds": ["pods", "certificates.cert-manager.io"],
+  "views": [{"name": "Shop pods", "kind": "pods", "namespaces": ["shop"], "filter": "!Running"}]
+}
+```
+
+| Key | Keyed by | What |
+|---|---|---|
+| `contexts` | context name | Favorite contexts, first in the context picker |
+| `namespaces` | context + namespace | Favorite namespaces, first in the namespace picker while their context is connected |
+| `applications` | Argo CD instance + namespace + name | Favorite Argo CD Applications |
+| `objects` | context + kind (kubectl name, `plural.group`) + namespace (`null` for cluster-scoped) + name | Favorite objects |
+| `kinds` | kubectl name | Starred resource types in the sidebar |
+| `views` | name | Saved table views |
+
+An Application's `argocd` is its Argo CD instance, as the Argo CD page keys it: the Argo CD
+server's address (scheme and host in lowercase, without a default port) when Argo CD is read
+through its API or its hub context has its server set (Settings → Per cluster), else
+`context:<hub context>`. `context` is the hub context it was starred on, when read from one:
+`context:<context>` is another name of the same instance, and its page opens on that context.
+An Application is one favorite through any of these names: starred through one, it shows as
+starred and is unstarred through the other, every entry naming it removed. One known only by an
+API server (no `context`) opens the Argo CD page. An Application starred from its page or a table
+of Applications is kept here, not under `objects`; one an older version kept under `objects`
+moves here when the file is read.
+
+Loading keeps every entry that reads and drops the others, one by one: an entry of the wrong
+shape, with a field missing or empty, or a list that isn't one costs only itself; an entry listed
+twice is kept once (a view, by its first name). When an entry was dropped, the file as it was is
+copied to `favorites.json.bad-<time>` before the first save writes it without them. Keys the app
+doesn't know (a newer version's) are written back as they were. A file that isn't a JSON object
+is kept aside as `favorites.json.bad-<time>`, and the app starts with no favorites. A file that
+exists but can't be read (permissions, say) is left alone: the app starts with no favorites and
+saves none until it is restarted with a readable file. A favorite whose context is gone from the
+kubeconfig stays in the file and the sidebar says so; remove it there with its cross.
 
 ## rules.yaml
 
 Agent rules as code, in the spirit of Claude Code's allow/ask/deny lists:
 
 ```yaml
+version: 2
 agents:
   Claude:
     allow:
@@ -238,13 +363,22 @@ While the file exists, an agent it doesn't name has no rules, so everything it a
 removing an agent's section takes its access away. Deleting an agent on the Agents page removes its
 section too. Before 0.3.0 a new agent got no section until its rules were edited: on the first start
 of 0.3.0 such an agent keeps its rules, and its section is written to the file. Before the GitOps
-verbs, GitOps actions were checked as `patch`: on the first start of the version that added them,
-every rule that names `patch` gets `refresh`, `sync` and `suspend`, and the file is written again,
-once. A verb you take out of a rule after that stays out. If the file changed on disk meanwhile, it
-is not written over: the load fails with the reason, and your edit is loaded (and upgraded) next. If
-the file can't be written (read-only, or managed by another tool), its rules are still loaded,
-upgraded the same way, and the Agents page says why it wasn't written; each load upgrades them again
-until it is.
+verbs, GitOps actions were checked as `patch`. `version: 2` at the top says the file's rules use
+them. A file without it (written before them, restored from git, copied from another machine, or
+given with no agents.json) is read as written before them, whatever agents.json says: every rule
+that names `patch` gets `refresh`, `sync` and `suspend` when it is loaded, and the file is written
+again with `version: 2`, once (even when no rule changed). A verb you take out of a rule after that
+stays out. A file without `version` whose rules name `refresh`, `sync` or `suspend` is not loaded
+(the rules in force stay, and the Agents page says to add `version: 2` at the top): no rule could
+name them before, so it was written for them, and upgrading it would give back a verb taken out.
+Write `version: 2` in a file you write by hand, or its `patch` rules cover GitOps actions too. A
+file with a higher `version`, written by a newer Recouvrance, is not loaded either. If the file
+changed on disk meanwhile, it is not written over: the load fails with the reason, and your edit is
+loaded (and upgraded, if it has no `version` either) next.
+If the folder of the file can't be written (managed by another tool), its rules are still loaded,
+upgraded the same way, and the Agents page says why the file wasn't written; while it has no
+`version`, each load upgrades it again, until it is written. Edits on the Agents page try to write
+it too, and fail with the reason rather than being undone at the next load.
 
 Each section is for the agent with that name, so agent names are unique: creating a second agent
 with a taken name is refused, and if two agents already share a name the file is neither loaded nor

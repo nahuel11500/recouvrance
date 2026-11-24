@@ -17,6 +17,8 @@ pub enum Target {
     Settings(crate::ui::settings_view::Section),
     /// A saved view of a table.
     View(crate::favorites::SavedView),
+    /// A favorite, on any context (it is connected first when it isn't).
+    Favorite(crate::favorites::Favorite),
     Context(String),
     Object {
         ctx: usize,
