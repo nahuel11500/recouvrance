@@ -2009,6 +2009,74 @@ fn a_stopped_container_is_read_from_a_copy_of_its_pod() {
     });
 }
 
+/// The rows of a watch of events until `ok` holds for them (30 s at most).
+async fn rows_until(
+    rx: &mut futures::channel::mpsc::UnboundedReceiver<k8s::EventsMsg>,
+    ok: impl Fn(&k8s::EventRows) -> bool,
+) -> Result<()> {
+    use futures::StreamExt as _;
+    let rows = async {
+        while let Some(msg) = rx.next().await {
+            match msg {
+                k8s::EventsMsg::Rows(rows) if ok(&rows) => return Ok(()),
+                k8s::EventsMsg::Rows(_) => {}
+                k8s::EventsMsg::Error(e) => bail!("events: {e}"),
+            }
+        }
+        bail!("the watch of events stopped")
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(30), rows).await.context("the rows never came")?
+}
+
+/// The Timeline's events on a real API server, which keeps events without a watch cache:
+/// listed once, then a new Warning and a deleted one come through the watch from the list's
+/// resourceVersion. Nothing is written through the app: the test makes the events itself.
+#[test]
+#[ignore = "needs a kind cluster: RECOUVRANCE_E2E_CONTEXT"]
+fn the_timeline_s_events_come_through_their_watch() {
+    run(async {
+        use k8s_openapi::api::core::v1::Event;
+        let truth: Api<Event> = Api::namespaced(k8s::connect_for_agents(context()).await?, NS);
+        let tag = uuid::Uuid::new_v4().simple().to_string();
+        let object = format!("e2e-timeline-{tag}");
+        let warning = |reason: &str| -> Result<Event> {
+            let now = jiff::Timestamp::now().to_string();
+            Ok(serde_json::from_value(json!({
+                "metadata": {"name": format!("{object}.{}", reason.to_lowercase()), "namespace": NS},
+                "involvedObject": {"kind": "ConfigMap", "namespace": NS, "name": object},
+                "type": "Warning", "reason": reason, "message": "from the e2e test", "count": 1,
+                "firstTimestamp": now, "lastTimestamp": now, "source": {"component": "e2e"},
+            }))?)
+        };
+        let has = |rows: &k8s::EventRows, reason: &str| {
+            rows.rows.iter().any(|e| e.object_name == object && e.line.reason == reason)
+        };
+        truth.create(&PostParams::default(), &warning("E2eFirst")?).await?;
+        let checked = async {
+            let ui = k8s::connect(context()).await?;
+            let (_watch, mut rx) = k8s::watch_events(
+                ui,
+                Some(NS.into()),
+                false,
+                k8s::EVENTS_KEPT,
+                || std::time::Duration::ZERO,
+                k8s::Pause::default(),
+            );
+            rows_until(&mut rx, |r| has(r, "E2eFirst")).await.context("listed")?;
+            truth.create(&PostParams::default(), &warning("E2eSecond")?).await?;
+            rows_until(&mut rx, |r| has(r, "E2eFirst") && has(r, "E2eSecond")).await.context("added")?;
+            truth.delete(&format!("{object}.e2efirst"), &DeleteParams::default()).await?;
+            rows_until(&mut rx, |r| !has(r, "E2eFirst") && has(r, "E2eSecond")).await.context("deleted")?;
+            Ok(())
+        };
+        let result: Result<()> = checked.await;
+        for reason in ["e2efirst", "e2esecond"] {
+            let _ = truth.delete(&format!("{object}.{reason}"), &DeleteParams::default()).await;
+        }
+        result
+    });
+}
+
 /// Argo CD's Application kind as its CRD serves it (no status subresource), for the gitops
 /// test: kind runs no Argo CD. True when this test installed it (and removes it after).
 async fn application_crd(client: kube::Client) -> Result<bool> {

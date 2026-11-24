@@ -17,6 +17,11 @@ Recouvrance is one Rust binary: a [gpui](https://github.com/zed-industries/zed) 
   (a first list that completes meanwhile says so only with them) and stops its metrics, and the
   sidebar's problem count waits. Watches, log streams and shells keep going, so a window shown
   again is current at once. A window shown on another monitor, not focused, keeps updating.
+- The Timeline's events are listed once, then watched (`k8s::watch_events`); only the newest
+  20,000 of a cluster are held. Their watch is the exception to the rule above: it closes while
+  the page is off screen, and once the page is shown again it goes on from where it was, bringing
+  what changed meanwhile, or lists again when etcd no longer has that far back. Where the user
+  may list events but not watch them, they are listed again at each overview refresh.
 - The page on screen gets the API servers first. Background work (the problem count, a hidden
   list) takes at most 8 of the 32 slots that requests by namespace share (`k8s::lane`). Each
   request takes its slot in the lane of that moment, so a list that comes on screen while it loads

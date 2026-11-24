@@ -264,7 +264,8 @@ tools' definitions. What some of them need beyond the obvious verb:
   its object, an event only where one gives `list` on events, and what it leaves out is counted
   (`get_changes` asks, for one object); `my_permissions` says so. The reply says how far back the
   records go and that only what the window watched is recorded (`recouvrance serve` records
-  nothing itself).
+  nothing itself). Of the events, the newest 20,000 are read, as the Timeline holds them; when
+  the cluster keeps more and older ones fall in the range asked, the reply says so.
 - **Reachability:** `check_reachability` follows the path a request takes to a Service, an Ingress
   or an HTTPRoute and names the first step that breaks, with the `kubectl` command to see it (the
   Reachability tab's checks). It needs `get` on the object, then reads what the path goes through

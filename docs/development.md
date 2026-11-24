@@ -40,13 +40,15 @@ RECOUVRANCE_TAB=logs cargo run --features dev -- --snapshot out.png 8
 
 Useful variables: `RECOUVRANCE_PAGE` (`apply`, `settings`, `cluster`, `access`, `assistant-dock`…),
 `RECOUVRANCE_FILTER`, `RECOUVRANCE_ACT` (comma-separated hooks, see `src/app/demo.rs` and
-`src/details/demo.rs`; `page:argo,argo-example` shows the Argo CD dashboard on a made-up example,
-no real data), `RECOUVRANCE_INPUT` (`click:x,y;key:enter;wait:2`; `shot:name.png` saves a frame next
-to the snapshot, for recordings), `RECOUVRANCE_WRITES=1`,
-`RECOUVRANCE_DARK=1`, `RECOUVRANCE_ZOOM`. Point `XDG_CONFIG_HOME` at a scratch folder to keep your
-settings untouched. Give it another MCP port too (`{"port": 47199, "version": 1}` in
-`$XDG_CONFIG_HOME/recouvrance/agents.json`), so it doesn't take 47070 from the Recouvrance you
-have open.
+`src/details/demo.rs`; `timeline:all` shows every event on the Timeline, `page:argo,argo-example`
+shows the Argo CD dashboard on a made-up example, no real data), `RECOUVRANCE_INPUT`
+(`click:x,y;key:enter;wait:2`; `shot:name.png` saves a frame next to the snapshot, for
+recordings), `RECOUVRANCE_WRITES=1`, `RECOUVRANCE_DARK=1`, `RECOUVRANCE_ZOOM`, and
+`RECOUVRANCE_METER=1`, which prints at the end what the run cost: each cluster's API requests and
+bytes by kind, the heaviest requests, and the peak memory. Point `XDG_CONFIG_HOME` at a scratch
+folder to keep your settings untouched. Give it another MCP port too
+(`{"port": 47199, "version": 1}` in `$XDG_CONFIG_HOME/recouvrance/agents.json`), so it doesn't
+take 47070 from the Recouvrance you have open.
 
 `RECOUVRANCE_REQUESTS=<seconds>` counts what the page on screen asks of the API server: once the
 other variables have set it up (a detail page opened with `RECOUVRANCE_SELECT`, say), the problem
@@ -57,7 +59,9 @@ kind, the heaviest requests, and the process's memory (`VmRSS`, `VmHWM`).
 **Smoke checks**: `RECOUVRANCE_SMOKE=<context> cargo run --features dev` lists types and watches
 pods; add `RECOUVRANCE_LISTTIME=1`, `RECOUVRANCE_PROBLEMS=1` (the Problems scan's time and, on
 Linux, the process's peak memory; `RECOUVRANCE_PROBLEMS=kinds` runs each kind's check alone, with
-its own peak), or dry runs such as `RECOUVRANCE_NODESHELLDRY=<node>` (see `src/dev/smoke.rs`).
+its own peak), `RECOUVRANCE_EVENTS=<seconds>` (the Timeline's "All events" on every namespace for
+that long, then what it cost), or dry runs such as `RECOUVRANCE_NODESHELLDRY=<node>` (see
+`src/dev/smoke.rs`).
 `RECOUVRANCE_PODRES=<seconds>` reads the usage bars' requests and limits of every pod for that long,
 and `RECOUVRANCE_CLUSTERLOAD=<rounds>` loads the cluster overview that many times in a row; both then
 print what their requests read (as Settings → API requests counts it) and the peak memory (`VmHWM`).

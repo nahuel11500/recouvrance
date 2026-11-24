@@ -168,7 +168,11 @@ impl KubeMcp {
                     Err(e) => Err(e),
                 };
                 match read {
-                    Ok(events) => {
+                    Ok(read) => {
+                        // Only the newest are held, as on the Timeline page: said when some
+                        // older than them would have been in the range asked.
+                        events_note = events_cut(&read, since);
+                        let events = read.rows.into_iter().map(Arc::unwrap_or_clone).collect();
                         let (events, hidden) = readable_events(call.policy(), &p.context, ns, since, events);
                         event_rows = events.iter().map(event_row).collect();
                         hidden_events = hidden;
@@ -401,6 +405,20 @@ fn recent_text(heading: &str, rows: &[Change], limit: usize, notes: &[String]) -
     out
 }
 
+/// What the events read leave out of the range asked, when the cluster keeps more than are
+/// held: older ones of the range may be missing. None when they reach back far enough.
+fn events_cut(read: &k8s::EventRows, since: jiff::Timestamp) -> Option<String> {
+    let oldest = read.since?;
+    (read.kept < read.total && oldest > since).then(|| {
+        format!(
+            "Events: only the newest {} of the {} the cluster keeps were read, back to {}; older ones are left out.",
+            read.kept,
+            read.total,
+            history::when(oldest)
+        )
+    })
+}
+
 /// The events left out when the rules allow listing none of them.
 const EVENTS_DENIED: &str = "events: not allowed by your rules (list on events)";
 
@@ -437,11 +455,11 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        EVENTS_DENIED, EventsShown, access_for, coverage, event_row, events_hidden, events_kind, heading, left_out,
-        may_list, parse_since, readable_events, readable_records, recent_text, record_row,
+        EVENTS_DENIED, EventsShown, access_for, coverage, event_row, events_cut, events_hidden, events_kind, heading,
+        left_out, may_list, parse_since, readable_events, readable_records, recent_text, record_row,
     };
     use crate::history;
-    use crate::k8s::{ClusterEvent, EventLine, Kind};
+    use crate::k8s::{ClusterEvent, EventLine, EventRows, Kind};
     use crate::mcp::policy::properties::{policy as any_policy, value};
     use crate::mcp::{Mode, Policy, Verb, rules_file};
     use crate::timeline::{Record, What};
@@ -458,6 +476,18 @@ mod tests {
 
     fn at(secs: i64) -> jiff::Timestamp {
         jiff::Timestamp::from_second(1_700_000_000 + secs).unwrap()
+    }
+
+    /// Fewer events read than the cluster keeps: the reply says so when older ones of the
+    /// range asked may be missing, not when those read reach back before it.
+    #[test]
+    fn events_cut_short_are_said() {
+        let read = |kept, total, oldest| EventRows { rows: Vec::new(), kept, total, since: Some(at(oldest)) };
+        assert_eq!(events_cut(&read(5, 5, 100), at(0)), None, "all of them");
+        assert_eq!(events_cut(&read(5, 9, -10), at(0)), None, "they reach back before the range");
+        let note = events_cut(&read(5, 9, 100), at(0)).unwrap();
+        assert!(note.starts_with("Events: only the newest 5 of the 9 the cluster keeps were read, back to "), "{note}");
+        assert!(note.ends_with("; older ones are left out."), "{note}");
     }
 
     fn record(resource: &str, kind: &str, namespace: Option<&str>, name: &str, secs: i64) -> Arc<Record> {
