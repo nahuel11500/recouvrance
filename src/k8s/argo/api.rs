@@ -284,13 +284,10 @@ fn read_tokens() -> Result<BTreeMap<String, String>, String> {
 /// Keep `token` for the server at `base` (empty: forget it), readable only by the user. A
 /// tokens file that doesn't read is kept aside first, as other config is.
 pub fn save_token(base: &str, token: &str) -> std::io::Result<()> {
-    let mut tokens = match read_tokens() {
-        Ok(t) => t,
-        Err(_) => {
-            crate::settings::keep_aside(&tokens_path());
-            BTreeMap::new()
-        }
-    };
+    let mut tokens = read_tokens().unwrap_or_else(|_| {
+        crate::settings::keep_aside(&tokens_path());
+        BTreeMap::new()
+    });
     let token = token.trim();
     if token.is_empty() {
         tokens.remove(base);
@@ -743,7 +740,7 @@ pub(super) fn apply(apps: &mut Apps, event: Event) {
 pub struct FeedState {
     pub apps: Apps,
     /// Each project's sync windows, once read; or why they couldn't be.
-    pub projects: Option<Result<Arc<BTreeMap<String, Vec<SyncWindow>>>, String>>,
+    pub projects: Option<Result<super::ProjectWindows, String>>,
     /// Why the last read or stream failed (never the token).
     pub error: Option<String>,
     /// Listed at least once.

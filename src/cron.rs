@@ -8,7 +8,7 @@
 //! the day of week does, unless one of them is `*`: then both must.
 
 use jiff::ToSpan as _;
-use jiff::civil::{Date, DateTime};
+use jiff::civil::Date;
 
 /// A schedule, read once.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -115,14 +115,6 @@ impl Cron {
         let dom = self.days & (1 << d.day()) != 0;
         let dow = self.weekdays & (1 << d.weekday().to_sunday_zero_offset()) != 0;
         if self.days_star || self.weekdays_star { dom && dow } else { dom || dow }
-    }
-
-    /// Whether it fires at this minute (seconds are ignored).
-    pub fn matches(&self, t: DateTime) -> bool {
-        self.months & (1 << t.month()) != 0
-            && self.day_matches(t.date())
-            && self.hours & (1 << t.hour()) != 0
-            && self.minutes & (1 << t.minute()) != 0
     }
 
     /// The first time it fires strictly after `after`, in `after`'s time zone. A time a

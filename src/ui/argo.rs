@@ -342,6 +342,7 @@ impl Rows {
         }
         let next = apps.iter().map(|a| fleet.next_sync(a, now)).collect();
         Self {
+            fleet,
             order,
             flat,
             parents,
@@ -357,7 +358,6 @@ impl Rows {
             services,
             next,
             now,
-            fleet,
         }
     }
 }
@@ -486,7 +486,7 @@ impl ArgoView {
                     let now = api::changes();
                     if now != seen || built.elapsed() >= RECOMPUTE {
                         (seen, built) = (now, Instant::now());
-                        let _ = this.update(cx, |this, cx| this.rebuild(cx));
+                        let _ = this.update(cx, Self::rebuild);
                     }
                 }
             }
@@ -954,7 +954,7 @@ impl ArgoView {
             .on_click(flip)
             .child(
                 div().w(px(20.)).flex_none().child(
-                    gpui_kit::component::Icon::new(if collapsed { Lucide::ChevronRight } else { Lucide::ChevronDown })
+                    component::Icon::new(if collapsed { Lucide::ChevronRight } else { Lucide::ChevronDown })
                         .size_4()
                         .text_color(muted),
                 ),

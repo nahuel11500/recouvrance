@@ -150,8 +150,7 @@ impl SettingsView {
         let argo_api_url = field(String::new(), "https://argocd.example.com", window, cx);
         let argo_api_token =
             cx.new(|cx| InputState::new(window, cx).masked(true).placeholder("token (argocd account generate-token)"));
-        let argo_group_label =
-            field(s.argocd_group_label.clone(), "none: the name without its environment", window, cx);
+        let argo_group_label = field(s.argocd_group_label, "none: the name without its environment", window, cx);
 
         let mut subs = Vec::new();
         let number = |input: &Entity<InputState>, apply: fn(&mut settings::Settings, u64), cx: &mut Context<Self>| {
@@ -321,7 +320,7 @@ impl SettingsView {
             cx.notify();
             return;
         }
-        let base = server.base.clone();
+        let base = server.base;
         settings::update(|s| {
             let listed = s.argocd_api_servers.iter().any(|t| Server::parse(t).is_ok_and(|x| x.base == base));
             if !listed {
@@ -1153,7 +1152,7 @@ impl SettingsView {
                                         })),
                                 ),
                         )
-                        .child(div().text_xs().text_color(muted).child(base.clone()))
+                        .child(div().text_xs().text_color(muted).child(base))
                         .child(div().text_xs().text_color(login.1).child(login.0))
                         .children(test.map(|(text, color)| div().text_xs().text_color(color).child(text)))
                         .into_any_element()
