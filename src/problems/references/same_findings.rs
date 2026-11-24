@@ -365,7 +365,7 @@ proptest! {
             return Ok(());
         }
         let old = whole::scaled_to_zero(&svc, &workloads);
-        let scaled: Vec<Scaled> = workloads.iter().filter_map(|(kind, w)| lean::<Workload>(w).scaled(kind)).collect();
+        let scaled: Vec<Template> = workloads.iter().filter_map(|(kind, w)| lean::<Workload>(w).template(kind)).collect();
         prop_assert_eq!(scaled_to_zero(&lean(&svc), &scaled), old);
     }
 }
