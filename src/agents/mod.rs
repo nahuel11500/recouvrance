@@ -51,6 +51,10 @@ pub struct AgentsView {
     claude_connected: Option<ClaudeCodeEntry>,
     claude_check: Latest,
     claude_connecting: bool,
+    /// When the last check finished, and whether something changed since that it may not
+    /// have seen (the server's status): a page shown again soon after checks again only then.
+    claude_checked_at: Option<std::time::Instant>,
+    claude_dirty: bool,
     /// The rules.yaml editor ("Rules as code"), and the text it was loaded with.
     code: Option<(Entity<EditorState>, String)>,
     code_message: Option<(bool, String)>,
@@ -176,6 +180,8 @@ impl AgentsView {
             claude_connected: None,
             claude_check: Latest::default(),
             claude_connecting: false,
+            claude_checked_at: None,
+            claude_dirty: false,
             code: None,
             code_message: None,
             all_activity: false,
@@ -197,7 +203,7 @@ impl AgentsView {
         if let Some(id) = selected {
             this.select(id, window, cx);
         }
-        this.check_claude(cx);
+        this.check_claude(true, cx);
         #[cfg(feature = "dev")]
         if std::env::var("RECOUVRANCE_ALL_ACTIVITY").is_ok() {
             this.all_activity = true;
@@ -410,17 +416,45 @@ impl AgentsView {
 
     // MARK: Rendering
 
-    /// Check Claude Code's entry again: when the page is shown, and after the port or the
-    /// main agent's token changed. While a connection runs, its own result is the answer.
-    pub fn check_claude(&mut self, cx: &mut Context<Self>) {
+    /// Check Claude Code's entry again (`claude mcp get`, which also calls the server): when
+    /// the page is shown, unless a check finished less than 10 s ago and nothing changed
+    /// since, and always (`force`) after the port or the main agent's token changed. While a
+    /// connection runs, its own result is the answer.
+    pub fn check_claude(&mut self, force: bool, cx: &mut Context<Self>) {
+        const RECENT: std::time::Duration = std::time::Duration::from_secs(10);
         if self.claude_connecting {
+            return;
+        }
+        if !force && !self.claude_dirty && self.claude_checked_at.is_some_and(|t| t.elapsed() < RECENT) {
             return;
         }
         let hub = self.hub.clone();
         self.claude_check.spawn(cx, crate::assistant::claude_code_entry(hub), |this, entry, cx| {
             this.claude_connected = Some(entry);
+            this.claude_checked_at = Some(std::time::Instant::now());
+            this.claude_dirty = false;
             cx.notify();
         });
+    }
+
+    /// The MCP server's status changed. A new listening port is checked against Claude
+    /// Code's entry at once; anything else (the server waiting for a busy port says so
+    /// every few seconds) only on the next showing of the page.
+    pub fn set_server_status(&mut self, status: Result<u16, String>, cx: &mut Context<Self>) {
+        if status == self.server_status {
+            return;
+        }
+        let new_port = match (&self.server_status, &status) {
+            (Ok(old), Ok(new)) => old != new,
+            (_, Ok(_)) => true,
+            _ => false,
+        };
+        self.server_status = status;
+        if new_port {
+            self.check_claude(true, cx);
+        } else {
+            self.claude_dirty = true;
+        }
     }
 
     fn connect_claude(&mut self, cx: &mut Context<Self>) {
@@ -437,6 +471,8 @@ impl AgentsView {
             }
             this.claude_connected = Some(entry);
             this.claude_connecting = false;
+            this.claude_checked_at = Some(std::time::Instant::now());
+            this.claude_dirty = false;
             cx.notify();
         });
         cx.notify();
@@ -468,6 +504,18 @@ impl AgentsView {
             .child(div().flex_1())
             .child({
                 let installed = crate::assistant::claude_code().is_some();
+                // A port changed in Settings is used from the next start: an entry updated now
+                // would point at the port about to be left.
+                let restart_to = match &self.server_status {
+                    Ok(listening) if *listening != self.hub.port() => Some(self.hub.port()),
+                    _ => None,
+                };
+                let reconnect = Button::new("cc-reconnect")
+                    .xsmall()
+                    .ghost()
+                    .label("Reconnect")
+                    .tooltip("Register Recouvrance's MCP server in Claude Code again, with the token Recouvrance keeps for it")
+                    .on_click(cx.listener(|this, _, _, cx| this.connect_claude(cx)));
                 match &self.claude_connected {
                     _ if !installed => div().text_sm().text_color(theme.muted_foreground).child("Claude Code not found").into_any_element(),
                     None => div().text_sm().text_color(theme.muted_foreground).child("Checking Claude Code…").into_any_element(),
@@ -475,14 +523,23 @@ impl AgentsView {
                         .gap_1()
                         .child(Icon::new(Lucide::CircleCheck).size_4().text_color(theme.success))
                         .child(div().text_sm().child("Connected to Claude Code"))
-                        .child(Button::new("cc-reconnect").xsmall().ghost().label("Reconnect").tooltip("Register Recouvrance's MCP server in Claude Code again (new token)").on_click(cx.listener(|this, _, _, cx| this.connect_claude(cx))))
+                        .child(reconnect)
+                        .into_any_element(),
+                    // What `claude mcp get` printed can't be judged (a masked token...).
+                    Some(ClaudeCodeEntry::Unknown) => h_flex()
+                        .gap_1()
+                        .child(div().text_sm().text_color(theme.muted_foreground).child("Registered in Claude Code"))
+                        .child(reconnect)
                         .into_any_element(),
                     // An entry that would not reach this server: say why, and offer to update it.
                     Some(ClaudeCodeEntry::Stale(why)) => h_flex()
                         .gap_1()
                         .child(Icon::new(Lucide::TriangleAlert).size_4().text_color(theme.warning))
                         .child(div().text_sm().child(why.clone()))
-                        .child(
+                        .when_some(restart_to, |d, port| {
+                            d.child(div().text_sm().text_color(theme.muted_foreground).child(format!("Restart Recouvrance to use port {port}")))
+                        })
+                        .when(restart_to.is_none(), |d| d.child(
                             Button::new("cc-update")
                                 .small()
                                 .primary()
@@ -490,7 +547,7 @@ impl AgentsView {
                                 .label("Update Claude Code")
                                 .tooltip("Register this server's URL and token in Claude Code, in place of the old entry")
                                 .on_click(cx.listener(|this, _, _, cx| this.connect_claude(cx))),
-                        )
+                        ))
                         .into_any_element(),
                     Some(ClaudeCodeEntry::Missing) => Button::new("cc-connect")
                         .small()

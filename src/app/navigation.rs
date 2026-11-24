@@ -272,7 +272,7 @@ impl AppView {
         if self.route().is_agents() {
             self.agents.update(cx, |a, cx| {
                 a.refresh_contexts();
-                a.check_claude(cx);
+                a.check_claude(false, cx);
             });
         }
         if let Route::Resources(Some(kind)) = self.route().clone()

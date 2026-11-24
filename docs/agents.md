@@ -29,9 +29,14 @@ applying it (an object whose rule turned into *Ask me* needs its own approval).
 
 In **Agents**, click **Connect Claude Code**: it registers the server in your Claude Code
 (`claude mcp add --scope user recouvrance …`). The page says *Connected to Claude Code* only when
-that entry points at this server's port with a token it takes: after **New token**, a port change, or
-an entry left by another Recouvrance, it says what is wrong ("Claude Code points at port 47070",
-"Claude Code has an old token") and **Update Claude Code** registers it again. For another tool, pick it under *Connect* on the
+that entry is an http server at the port this server listens on, with the token of an agent that is
+on. After **New token**, a port change, or an entry left by another Recouvrance, it says what is
+wrong ("Claude Code points at port 47070, not 47199", "Claude Code has an old token") and **Update
+Claude Code** registers it again; while a port changed in Settings waits for a restart, it says to
+restart instead. When the entry can't be judged (Claude Code shows the token masked, or prints a
+format Recouvrance doesn't read), it says *Registered in Claude Code*. The page checks again when it
+is shown (not more than once in 10 seconds unless something changed), after **New token** and when
+the server starts listening on another port. For another tool, pick it under *Connect* on the
 agent's page and copy its config, or its command where it has one:
 
 | Tool | Where it goes |
