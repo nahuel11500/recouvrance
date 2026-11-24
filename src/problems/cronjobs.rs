@@ -98,17 +98,18 @@ pub fn judge(job: &LeanCronJob, now: Timestamp) -> Option<(Severity, String)> {
     let last_run = time(job.status.last_schedule_time.as_deref());
     let tz = match zone {
         None => TimeZone::UTC,
-        Some(name) => match TimeZone::get(name) {
-            Ok(tz) => tz,
-            // The controller can't place its runs either, and never starts one. This
-            // machine's time zone list may differ from the cluster's: only say so when it
-            // never ran.
-            Err(_) => {
+        Some(name) => {
+            if let Ok(tz) = TimeZone::get(name) {
+                tz
+            } else {
+                // The controller can't place its runs either, and never starts one. This
+                // machine's time zone list may differ from the cluster's: only say so when
+                // it never ran.
                 let old = created.is_some_and(|c| now.as_second() - c.as_second() > 3600);
                 return (last_run.is_none() && old)
                     .then(|| (Severity::Warning, format!("never ran: its time zone `{name}` is unknown")));
             }
-        },
+        }
     };
     let schedule = match zone {
         Some(z) => format!("`{fields}` ({z})"),
