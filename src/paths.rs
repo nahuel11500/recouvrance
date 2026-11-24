@@ -44,6 +44,18 @@ pub fn expand(p: &str) -> PathBuf {
     }
 }
 
+/// A file or folder of the config directory as the texts name it: `~/.config/recouvrance/x`,
+/// or where `XDG_CONFIG_HOME` puts it. A text never names the default folder itself.
+pub fn shown_config(rest: &str) -> String {
+    tilde(&config_dir().join(rest))
+}
+
+/// A file or folder of the data directory as the texts name it:
+/// `~/.local/share/recouvrance/x`, or where `XDG_DATA_HOME` puts it.
+pub fn shown_data(rest: &str) -> String {
+    tilde(&data_dir().join(rest))
+}
+
 /// `/home/me/x` as `~/x`, the way paths are kept in settings.
 pub fn tilde(p: &Path) -> String {
     let home = home();
@@ -61,7 +73,40 @@ fn xdg(var: &str, fallback: &str) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::{expand, home, tilde};
+    use super::{config_dir, data_dir, expand, home, shown_config, shown_data, tilde};
+
+    #[test]
+    fn shown_paths_are_the_ones_in_use() {
+        assert_eq!(shown_config("rules.yaml"), tilde(&config_dir().join("rules.yaml")));
+        assert_eq!(shown_data("audit.jsonl"), tilde(&data_dir().join("audit.jsonl")));
+        assert!(shown_config("").ends_with("recouvrance/"), "{}", shown_config(""));
+    }
+
+    /// The folders move with `XDG_CONFIG_HOME` and `XDG_DATA_HOME`: code names them with
+    /// `shown_config` / `shown_data`, never with the defaults written out (#903). Comments may.
+    #[test]
+    fn no_code_names_the_default_folders() {
+        fn walk(dir: &std::path::Path, found: &mut Vec<String>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    walk(&path, found);
+                } else if path.extension().is_some_and(|e| e == "rs") && !path.ends_with("paths.rs") {
+                    let text = std::fs::read_to_string(&path).unwrap();
+                    for (i, line) in text.lines().enumerate() {
+                        let code = line.trim_start();
+                        let defaults = [concat!("~/.con", "fig/recouvrance"), concat!(".local/", "share/recouvrance")];
+                        if !code.starts_with("//") && defaults.iter().any(|d| code.contains(d)) {
+                            found.push(format!("{}:{}", path.display(), i + 1));
+                        }
+                    }
+                }
+            }
+        }
+        let mut found = Vec::new();
+        walk(&std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"), &mut found);
+        assert!(found.is_empty(), "default folders written out: {found:?}");
+    }
 
     #[test]
     fn tilde_and_expand_round_trip() {

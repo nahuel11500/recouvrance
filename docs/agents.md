@@ -330,7 +330,7 @@ Prompts (slash commands in Claude Code: `/mcp__recouvrance__troubleshoot` …): 
 
 Every call is logged with its decision and rule, the client it came from, and the Secrets whose values
 it returned, and appended to
-`~/.local/share/recouvrance/audit.jsonl` (the folder is 0700, the file 0600). The client is the name and
+`~/.local/share/recouvrance/audit.jsonl` (`$XDG_DATA_HOME/recouvrance/audit.jsonl` when it is set; the Activity page and Settings name the one in use; the folder is 0700, the file 0600). The client is the name and
 version the MCP client gives (`claude-code 2.1.3`); the in-app assistant shows as
 `recouvrance-assistant` with an API key, and as `assistant via claude-code …` through Claude Code. It is
 a label the client chooses, not a check. A call that returned Secret values unmasked, which a `reveal`
