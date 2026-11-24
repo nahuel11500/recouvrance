@@ -404,7 +404,7 @@ fn kind_jobs(
 ) -> Vec<Job> {
     use futures::FutureExt as _;
     let with_services = references::with_services(kinds);
-    let with_cert_manager = kinds.iter().any(|k| k.is(crate::cert_manager::GROUP, "Certificate"));
+    let certificate = kinds.iter().find(|k| k.is(crate::cert_manager::GROUP, "Certificate")).cloned();
     CHECKED
         .iter()
         // Checked with the Services they point to.
@@ -416,6 +416,7 @@ fn kind_jobs(
             let (ingress, route) = with_services.clone();
             let context = context.map(String::from);
             let cluster = cluster.map(String::from);
+            let certificate = certificate.clone();
             let name = match &ns {
                 Some(ns) => format!("{label} in {ns}"),
                 None => label.clone(),
@@ -432,7 +433,7 @@ fn kind_jobs(
                         .await
                         .map(|problems| Scan { problems, skipped: Vec::new() })
                 } else if kind.is("", "Secret") {
-                    certificates::tls_secrets(client, &kind, ns, cluster.as_deref(), judged_since, with_cert_manager)
+                    certificates::tls_secrets(client, &kind, certificate.as_ref(), ns, cluster.as_deref(), judged_since)
                         .await
                         .map(|problems| Scan { problems, skipped: Vec::new() })
                 } else if kind.is("", "Service") {

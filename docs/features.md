@@ -238,12 +238,17 @@
   its store, last refresh, Ready), and an ExternalSecret's page links its store and target Secret.
 - **Certificates**: the Problems page shows cert-manager Certificates that expired, that have not
   been Ready for 10 minutes, or whose renewal is more than an hour late (from their own
-  `renewalTime`, so short-lived certificates are judged fairly), critical with 3 days left or less;
-  and `kubernetes.io/tls` Secrets whose certificate expired, is not valid yet, or ends within 14
-  days and a third of its lifetime. Secrets a Certificate issued are judged by that Certificate.
-  The Secrets are listed from the API server's cache with only `tls.crt` read (the keys are
-  skipped while parsing), at most every 10 minutes per cluster; a user who may not list Secrets
-  only gets the Certificates. A Certificate's page shows its Secret, issuer, validity, renewal
+  `renewalTime`, so short-lived certificates are judged fairly), critical with less than 3 days
+  left; and `kubernetes.io/tls` Secrets whose certificate expired (critical, a warning once it
+  expired more than 30 days ago: most likely a leftover), is not valid yet, or ends within 14
+  days and a third of its lifetime. A Secret whose `cert-manager.io/certificate-name` Certificate
+  exists in its namespace is judged by that Certificate; one whose Certificate was deleted (or
+  that was copied elsewhere) is judged itself, since nothing renews it. The Secrets are listed
+  from the API server's cache with only `tls.crt` read (the keys are skipped while parsing),
+  with the names of the Certificates beside them, at most every 10 minutes per cluster and
+  namespace scanned; Refresh and an agent's `max_age_seconds: 0` read them again. A user who may
+  not list Secrets only gets the Certificates, and the refused list is tried again at most every
+  10 minutes too. A Certificate's page shows its Secret, issuer, validity, renewal
   time, failed attempts, why it fails, and its last CertificateRequest (failed, issued or
   pending, and why).
 - **Argo CD panel**: a namespace's page shows the Applications deploying into it, and an object's

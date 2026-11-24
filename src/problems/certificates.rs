@@ -4,10 +4,11 @@
 //!
 //! The Secrets are listed from the API server's cache, `type=kubernetes.io/tls` only, and
 //! each one's certificate is read as the list is parsed: its two dates are kept, its key is
-//! skipped. Certificates change rarely, so that list is read again at most every
-//! `SECRETS_EVERY` per cluster and namespace.
+//! skipped. Certificates change rarely, so that list (with the names of the Certificates
+//! beside it, or a refusal) is read again at most every `SECRETS_EVERY` per cluster and
+//! namespace.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -45,6 +46,10 @@ pub async fn certificates(client: Client, kind: &Kind, namespace: Option<String>
 /// How long a read of the TLS Secrets stands.
 const SECRETS_EVERY: Duration = Duration::from_secs(600);
 
+/// A certificate that expired longer ago than this is most likely left over (an old copy, a
+/// chart's self-signed one nothing serves any more): a warning, not critical.
+const LONG_EXPIRED: i64 = 30 * 86400;
+
 /// A window at most this long before its end counts as ending soon, for a certificate that
 /// lives long enough (see `judge_tls`).
 const SOON: i64 = 14 * 86400;
@@ -62,9 +67,30 @@ struct TlsCert {
     namespace: Option<String>,
     name: String,
     created: Option<Timestamp>,
-    /// A cert-manager Certificate issued it: that Certificate is judged instead.
-    managed: bool,
+    /// The cert-manager Certificate that issued it, from its annotation. Judged instead of
+    /// the Secret only while it exists: cert-manager keeps the Secret of a deleted one, and
+    /// a copied Secret keeps the annotation.
+    certificate: Option<String>,
     validity: Validity,
+}
+
+/// A read of a namespace's (or cluster's) TLS Secrets.
+#[derive(Default)]
+struct TlsRead {
+    certs: Vec<TlsCert>,
+    /// The Certificates there are, by namespace and name; None when cert-manager isn't
+    /// served or they could not be listed, and then every Secret is judged itself.
+    issuers: Option<Issuers>,
+}
+
+/// Certificate names by namespace.
+type Issuers = HashMap<Option<String>, HashSet<String>>;
+
+/// A Certificate's name, the only thing read of it beside the Secrets.
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct CertificateName {
+    metadata: cert_manager::Meta,
 }
 
 #[derive(Deserialize, Default)]
@@ -110,7 +136,8 @@ fn leaf<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Validity>, D::Error> {
     }))
 }
 
-/// Judge a Secret's certificate at `now`. Expired is critical. Not valid yet (more than 5
+/// Judge a Secret's certificate at `now`. Expired is critical, a warning once more than
+/// `LONG_EXPIRED` ago. Not valid yet (more than 5
 /// minutes ahead: a clock skew) is a warning. Ending soon is a warning once less than
 /// `SOON`, or a third of its lifetime, is left: whatever renews a certificate (cert-manager
 /// at two thirds) has done it by then, so a short-lived one renewed on time is never
@@ -118,7 +145,9 @@ fn leaf<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Validity>, D::Error> {
 pub fn judge_tls(v: Validity, now: Timestamp) -> Option<(Severity, String)> {
     let end = v.not_after?;
     if end <= now {
-        return Some((Severity::Critical, format!("certificate expired {}", crate::certs::ago_text(end, now))));
+        let severity =
+            if now.as_second() - end.as_second() > LONG_EXPIRED { Severity::Warning } else { Severity::Critical };
+        return Some((severity, format!("certificate expired {}", crate::certs::ago_text(end, now))));
     }
     if let Some(start) = v.not_before.filter(|t| t.as_second() - now.as_second() > 300) {
         return Some((
@@ -137,75 +166,99 @@ pub fn judge_tls(v: Validity, now: Timestamp) -> Option<(Severity, String)> {
     Some((severity, format!("certificate expires in {}", crate::certs::days_text(crate::certs::days_left(end, now)))))
 }
 
-type Reads = HashMap<(String, Option<String>), (Instant, Arc<Vec<TlsCert>>)>;
+type Reads = HashMap<(String, Option<String>), (Instant, Arc<TlsRead>)>;
 
 /// The last read of each cluster's (and namespace's) TLS Secrets.
 static READS: LazyLock<Mutex<Reads>> = LazyLock::new(Default::default);
 
 /// The TLS Secrets of `namespace`, from a read less than `SECRETS_EVERY` old (and made since
-/// `judged_since`) of `cluster` when there is one, else listed again.
+/// `judged_since`) of `cluster` when there is one, else listed again with the names of the
+/// Certificates beside them (`certificate`: their kind, when the cluster serves it). A user
+/// who may not list Secrets gets an empty read, kept as long: the refused list is not sent
+/// again every scan.
 async fn tls_certs(
     client: Client,
     kind: &Kind,
+    certificate: Option<&Kind>,
     namespace: Option<String>,
     cluster: Option<&str>,
     judged_since: Option<Instant>,
-) -> anyhow::Result<Arc<Vec<TlsCert>>> {
+) -> anyhow::Result<Arc<TlsRead>> {
     let key = cluster.map(|c| (c.to_string(), namespace.clone()));
     if let Some(key) = &key {
         let reads = READS.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some((at, certs)) = reads.get(key)
+        if let Some((at, read)) = reads.get(key)
             && at.elapsed() < SECRETS_EVERY
             && judged_since.is_none_or(|since| *at >= since)
         {
-            return Ok(certs.clone());
+            return Ok(read.clone());
         }
     }
     let at = Instant::now();
     let fields = "type=kubernetes.io/tls".to_string();
-    let items =
-        k8s::lists::list_lean_cached_fields::<LeanTlsSecret>(client, kind.ar.clone(), namespace, fields).await?;
-    let certs: Arc<Vec<TlsCert>> = Arc::new(
-        items
-            .into_iter()
-            .filter_map(|s| {
-                Some(TlsCert {
-                    name: s.metadata.name?,
-                    namespace: s.metadata.namespace,
-                    created: time(s.metadata.creation_timestamp.as_deref()),
-                    managed: s.metadata.annotations.certificate.is_some_and(|c| !c.is_empty()),
-                    validity: s.data.crt?,
-                })
-            })
-            .collect(),
+    let secrets = k8s::lists::list_lean_cached_fields::<LeanTlsSecret>(
+        client.clone(),
+        kind.ar.clone(),
+        namespace.clone(),
+        fields,
     );
+    let ar = certificate.map(|k| k.ar.clone());
+    let names = async move {
+        // Not listed (refused or failed): every Secret is judged itself.
+        let items = k8s::lists::list_lean_cached::<CertificateName>(client, ar?, namespace).await.ok()?;
+        let mut issuers: Issuers = HashMap::new();
+        for c in items {
+            if let Some(name) = c.metadata.name {
+                issuers.entry(c.metadata.namespace).or_default().insert(name);
+            }
+        }
+        Some(issuers)
+    };
+    let (secrets, issuers) = futures::join!(secrets, names);
+    let read = match secrets {
+        Ok(items) => TlsRead {
+            certs: items
+                .into_iter()
+                .filter_map(|s| {
+                    Some(TlsCert {
+                        name: s.metadata.name?,
+                        namespace: s.metadata.namespace,
+                        created: time(s.metadata.creation_timestamp.as_deref()),
+                        certificate: s.metadata.annotations.certificate.filter(|c| !c.is_empty()),
+                        validity: s.data.crt?,
+                    })
+                })
+                .collect(),
+            issuers,
+        },
+        Err(e) if k8s::api_status(&e) == Some(403) => TlsRead::default(),
+        Err(e) => return Err(e),
+    };
+    let read = Arc::new(read);
     if let Some(key) = key {
         let mut reads = READS.lock().unwrap_or_else(PoisonError::into_inner);
         // Reads too old to serve go: scopes nobody scans any more are not kept.
         reads.retain(|_, (at, _)| at.elapsed() < SECRETS_EVERY);
-        reads.insert(key, (at, certs.clone()));
+        reads.insert(key, (at, read.clone()));
     }
-    Ok(certs)
+    Ok(read)
 }
 
 /// The TLS Secrets of `namespace` (every one when None) whose certificate expired or ends
-/// soon. Those a cert-manager Certificate issued are left to it when the cluster serves
-/// Certificates (`with_cert_manager`). A user who may not list Secrets gets nothing, not a
-/// skipped check: many may not, and the scan would never read as complete for them.
+/// soon. Those issued by a cert-manager Certificate that still exists are left to it
+/// (`certificate`: the Certificate kind, when the cluster serves it). A user who may not list
+/// Secrets gets nothing, not a skipped check: many may not, and the scan would never read as
+/// complete for them.
 pub async fn tls_secrets(
     client: Client,
     kind: &Kind,
+    certificate: Option<&Kind>,
     namespace: Option<String>,
     cluster: Option<&str>,
     judged_since: Option<Instant>,
-    with_cert_manager: bool,
 ) -> anyhow::Result<Vec<Problem>> {
-    let certs = match tls_certs(client, kind, namespace, cluster, judged_since).await {
-        Ok(certs) => certs,
-        Err(e) if k8s::api_status(&e) == Some(403) => return Ok(Vec::new()),
-        Err(e) => return Err(e),
-    };
-    Ok(flagged(&certs, with_cert_manager, Timestamp::now())
+    let read = tls_certs(client, kind, certificate, namespace, cluster, judged_since).await?;
+    Ok(flagged(&read, Timestamp::now())
         .map(|(c, severity, reason)| Problem {
             severity,
             kind: kind.kubectl_name(),
@@ -218,14 +271,14 @@ pub async fn tls_secrets(
         .collect())
 }
 
-/// The certificates `judge_tls` flags at `now`, but those a cert-manager Certificate issued
-/// when the cluster serves Certificates: that Certificate says more (why it isn't renewed).
-fn flagged(
-    certs: &[TlsCert],
-    with_cert_manager: bool,
-    now: Timestamp,
-) -> impl Iterator<Item = (&TlsCert, Severity, String)> {
-    certs.iter().filter(move |c| !(with_cert_manager && c.managed)).filter_map(move |c| {
+/// The certificates `judge_tls` flags at `now`, but those a Certificate that exists issued:
+/// that Certificate says more (why it isn't renewed).
+fn flagged(read: &TlsRead, now: Timestamp) -> impl Iterator<Item = (&TlsCert, Severity, String)> {
+    let issued = |c: &TlsCert| {
+        let (Some(issuers), Some(name)) = (&read.issuers, &c.certificate) else { return false };
+        issuers.get(&c.namespace).is_some_and(|names| names.contains(name))
+    };
+    read.certs.iter().filter(move |c| !issued(c)).filter_map(move |c| {
         let (severity, reason) = judge_tls(c.validity, now)?;
         Some((c, severity, reason))
     })
@@ -264,6 +317,8 @@ mod tests {
             judge_tls(validity(-91 * DAY, -3 * 3600), now()),
             Some((Severity::Critical, "certificate expired less than a day ago".into()))
         );
+        // Expired long ago: most likely left over, a warning.
+        assert_eq!(judge_tls(validity(-400 * DAY, -40 * DAY), now()).map(|j| j.0), Some(Severity::Warning));
         // A day-long certificate half way: renewed in time by whatever issues it.
         assert_eq!(judge_tls(validity(-12 * 3600, 12 * 3600), now()), None);
         assert!(
@@ -401,21 +456,49 @@ mod tests {
         assert_eq!(scan.problems.len(), 1);
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_refused_secrets_list_is_kept_as_long_as_a_read() {
+        let cluster = Cluster(Arc::default(), true);
+        let client = Client::new(cluster.clone(), "default");
+        let names = (None, Some("certificates-refused-test"));
+        for _ in 0..2 {
+            let scan = super::super::run_all(super::super::jobs(&client, &kinds(), &[], names, None)).await;
+            assert!(scan.skipped.is_empty(), "{:?}", scan.skipped_text());
+        }
+        let count = cluster.0.lock().unwrap().iter().filter(|a| a.starts_with("/api/v1/secrets")).count();
+        assert_eq!(count, 1);
+    }
+
     #[test]
-    fn a_secret_a_certificate_issued_is_left_to_it() {
+    fn a_secret_is_left_only_to_a_certificate_that_exists() {
         let soon = Validity { not_before: ts(-80 * DAY), not_after: ts(10 * DAY) };
-        let cert = |managed| TlsCert { namespace: None, name: "x".into(), created: None, managed, validity: soon };
-        let certs = [cert(true), cert(false)];
-        let names = |with_cert_manager| {
-            flagged(&certs, with_cert_manager, now()).map(|(c, ..)| c.managed).collect::<Vec<bool>>()
+        let cert = |ns: &str, name: &str, issued_by: Option<&str>| TlsCert {
+            namespace: Some(ns.into()),
+            name: name.into(),
+            created: None,
+            certificate: issued_by.map(String::from),
+            validity: soon,
         };
-        assert_eq!(names(true), Vec::from([false]));
-        // A cluster without cert-manager: the annotation alone says nothing.
-        assert_eq!(names(false), Vec::from([true, false]));
+        let certs = vec![
+            cert("a", "web-tls", Some("web")),
+            // Its Certificate was deleted (or it was copied): nothing renews it.
+            cert("a", "orphan-tls", Some("deleted")),
+            // A Certificate of that name, but in another namespace.
+            cert("b", "copy-tls", Some("web")),
+            cert("a", "manual", None),
+        ];
+        let issuers: Issuers = HashMap::from([(Some("a".to_string()), HashSet::from(["web".to_string()]))]);
+        let names = |issuers: Option<Issuers>| {
+            let read = TlsRead { certs: certs.clone(), issuers };
+            flagged(&read, now()).map(|(c, ..)| c.name.clone()).collect::<Vec<String>>()
+        };
+        assert_eq!(names(Some(issuers)), ["orphan-tls", "copy-tls", "manual"]);
+        // No cert-manager, or its Certificates could not be listed: every Secret is judged.
+        assert_eq!(names(None), ["web-tls", "orphan-tls", "copy-tls", "manual"]);
     }
 
     proptest! {
-        /// Expired is critical; more than `SOON` left is never flagged; a certificate is
+        /// Expired is critical (a warning once long ago); more than `SOON` left is never flagged; a certificate is
         /// flagged ending soon only once less than a third of its lifetime is left, so one
         /// renewed at two thirds of its life never is.
         #[test]
@@ -424,7 +507,8 @@ mod tests {
             let end = start + lifetime;
             let judged = judge_tls(validity(start, end), now());
             if end <= 0 {
-                prop_assert_eq!(judged.map(|j| j.0), Some(Severity::Critical));
+                let severity = if -end > LONG_EXPIRED { Severity::Warning } else { Severity::Critical };
+                prop_assert_eq!(judged.map(|j| j.0), Some(severity));
             } else {
                 // Flagged exactly when less than both are left.
                 prop_assert_eq!(judged.is_some(), end < SOON.min(lifetime / 3));
