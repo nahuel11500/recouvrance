@@ -144,8 +144,9 @@ so it works wherever `kubectl` does. The service is found automatically; to choo
 Alerts are read from the same endpoint (`/api/v1/alerts`, every 30 seconds at most per cluster).
 VictoriaMetrics answers there only when vmselect or vmsingle runs with `-vmalert.proxyURL`. Silences
 come from an Alertmanager service found the same way (a service named `*alertmanager*`, port 9093);
-without one, firing alerts show without silence information. With `metrics_enabled` off, neither
-is read.
+without one, firing alerts show without silence information. An alert's **Rule** reads the alerting
+rules (`/api/v1/rules?type=alert`, kept 5 minutes) and one range query for its chart, only when
+clicked. With `metrics_enabled` off, none of these is read.
 
 ### Per cluster (`clusters`)
 

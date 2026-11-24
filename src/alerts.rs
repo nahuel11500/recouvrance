@@ -30,17 +30,23 @@ pub struct Alert {
 }
 
 /// Labels naming what an alert is about, most specific first: (label, kubectl kind, kind).
-/// `job_name`, not `job`: `job` is the scrape job. Workloads come before `pod`, which on
-/// kube-state-metrics' alerts can name the exporter's own pod.
-const OBJECT_LABELS: [(&str, &str, &str); 8] = [
+/// `job_name`, not `job`: `job` is the scrape job. Workloads, HPAs and Ingresses come before
+/// `pod`, which on kube-state-metrics' alerts can name the exporter's own pod. `service` comes
+/// last: every series scraped through a Service carries its name (kube-state-metrics' own on a
+/// crash-looping pod's alert), so it names the object only when nothing else does
+/// (`TargetDown`).
+const OBJECT_LABELS: [(&str, &str, &str); 11] = [
     ("deployment", "deployments.apps", "Deployment"),
     ("statefulset", "statefulsets.apps", "StatefulSet"),
     ("daemonset", "daemonsets.apps", "DaemonSet"),
     ("job_name", "jobs.batch", "Job"),
     ("cronjob", "cronjobs.batch", "CronJob"),
+    ("horizontalpodautoscaler", "horizontalpodautoscalers.autoscaling", "HorizontalPodAutoscaler"),
+    ("ingress", "ingresses.networking.k8s.io", "Ingress"),
     ("persistentvolumeclaim", "persistentvolumeclaims", "PersistentVolumeClaim"),
     ("pod", "pods", "Pod"),
     ("node", "nodes", "Node"),
+    ("service", "services", "Service"),
 ];
 
 impl Alert {
@@ -68,6 +74,22 @@ impl Alert {
     /// What it is about: (kubectl kind, kind, name), from its labels.
     pub fn object(&self) -> Option<(&'static str, &'static str, &str)> {
         OBJECT_LABELS.iter().find_map(|(label, kubectl, kind)| Some((*kubectl, *kind, self.label(label)?)))
+    }
+
+    /// The host of its `instance` label, without the port: a node's name or address for
+    /// exporters on the host network (node-exporter), whose alerts are about that node.
+    fn instance_host(&self) -> Option<&str> {
+        let instance = self.label("instance")?;
+        let host = match instance.strip_prefix('[') {
+            // [IPv6]:port
+            Some(rest) => rest.split_once(']').map_or(rest, |(h, _)| h),
+            None => match instance.rsplit_once(':') {
+                // A bare IPv6 address has several colons and no port.
+                Some((h, port)) if !h.contains(':') && port.bytes().all(|b| b.is_ascii_digit()) => h,
+                _ => instance,
+            },
+        };
+        Some(host).filter(|h| !h.is_empty())
     }
 
     /// Firing and not silenced: someone should look.
@@ -502,8 +524,10 @@ pub fn skipped(alerts: &Alerts) -> Vec<(String, anyhow::Error)> {
 pub enum Focus {
     /// Every alert labeled with this namespace.
     Namespace(String),
-    /// Alerts about these objects: (kubectl kind, name), in `namespace` (None: nodes).
-    Objects { namespace: Option<String>, objects: Vec<(&'static str, String)> },
+    /// Alerts about these objects: (kubectl kind, name), in `namespace` (None: nodes). On a
+    /// node's page, `hosts` are its name and addresses: alerts whose `instance` is one of them
+    /// are about the node too (node-exporter's, which name the exporter's pod).
+    Objects { namespace: Option<String>, objects: Vec<(&'static str, String)>, hosts: Vec<String> },
 }
 
 fn kubectl_kind(kind: &str) -> Option<&'static str> {
@@ -540,6 +564,14 @@ pub fn focus(kind: &Kind, obj: &Value, pods: &[Value]) -> Option<Focus> {
         .find(|(_, kubectl, k)| kind.ar.kind == *k && kubectl.split_once('.').map_or("", |(_, g)| g) == kind.ar.group)
         .map(|(_, kubectl, _)| *kubectl)?;
     let namespace = obj.pointer("/metadata/namespace").and_then(Value::as_str).map(String::from);
+    let mut hosts = Vec::new();
+    if kind.is("", "Node") {
+        hosts.push(name.clone());
+        let addresses = obj.pointer("/status/addresses").and_then(Value::as_array).into_iter().flatten();
+        hosts.extend(addresses.filter_map(|a| a["address"].as_str()).map(String::from));
+        hosts.sort();
+        hosts.dedup();
+    }
     let mut objects = vec![(kubectl, name)];
     if kind.is("", "Pod") {
         objects.extend(pod_owners(obj));
@@ -547,7 +579,7 @@ pub fn focus(kind: &Kind, obj: &Value, pods: &[Value]) -> Option<Focus> {
         let names = pods.iter().filter_map(|p| p.pointer("/metadata/name").and_then(Value::as_str));
         objects.extend(names.map(|n| ("pods", n.to_string())));
     }
-    Some(Focus::Objects { namespace, objects })
+    Some(Focus::Objects { namespace, objects, hosts })
 }
 
 /// The alerts a page shows, worst first: firing before pending, silenced last.
@@ -556,16 +588,341 @@ pub fn about(alerts: &[Alert], focus: &Focus) -> Vec<Alert> {
         .iter()
         .filter(|a| match focus {
             Focus::Namespace(ns) => a.namespace() == Some(ns.as_str()),
-            Focus::Objects { namespace, objects } => a.object().is_some_and(|(kubectl, _, name)| {
-                (kubectl == "nodes" || a.namespace() == namespace.as_deref())
-                    && objects.iter().any(|(k, n)| *k == kubectl && n == name)
-            }),
+            Focus::Objects { namespace, objects, hosts } => {
+                a.object().is_some_and(|(kubectl, _, name)| {
+                    (kubectl == "nodes" || a.namespace() == namespace.as_deref())
+                        && objects.iter().any(|(k, n)| *k == kubectl && n == name)
+                }) || a.instance_host().is_some_and(|h| hosts.iter().any(|n| n == h))
+            }
         })
         .cloned()
         .collect();
     let rank = |a: &Alert| (a.muted.is_some(), !a.firing, a.severity());
     shown.sort_by(|a, b| rank(a).cmp(&rank(b)).then_with(|| a.name().cmp(b.name())));
     shown
+}
+
+/// An alerting rule, as Prometheus' `/api/v1/rules` gives it (vmalert answers the same).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Rule {
+    pub name: String,
+    /// Its `PromQL` expression.
+    pub query: String,
+    /// How long the expression must hold before the alert fires, in seconds.
+    pub for_secs: u64,
+    pub labels: BTreeMap<String, String>,
+    pub annotations: BTreeMap<String, String>,
+    /// Why its last evaluation failed, when it did: the alert may be stale.
+    pub error: Option<String>,
+}
+
+/// The alerting rules, without their alerts (Prometheus 2.49+; older ones send them too).
+const RULES_PATH: &str = "/api/v1/rules?type=alert&exclude_alerts=true";
+
+/// The alerting rules of a `/api/v1/rules` answer; None when the answer is not that.
+fn parse_rules(text: &str) -> Option<Vec<Rule>> {
+    let v: Value = serde_json::from_str(text).ok()?;
+    if v["status"] != "success" {
+        return None;
+    }
+    let groups = v.pointer("/data/groups")?.as_array()?;
+    let rules = groups.iter().flat_map(|g| g["rules"].as_array().into_iter().flatten());
+    Some(
+        rules
+            .filter(|r| r["type"].as_str().is_none_or(|t| t == "alerting"))
+            .filter_map(|r| {
+                let error = r["lastError"].as_str().map(str::trim).filter(|e| !e.is_empty()).map(String::from);
+                Some(Rule {
+                    name: r["name"].as_str()?.to_string(),
+                    query: r["query"].as_str()?.trim().to_string(),
+                    // Seconds: a float in Prometheus, an integer in vmalert.
+                    for_secs: r["duration"].as_f64().filter(|d| d.is_finite() && *d > 0.0).map_or(0, |d| d as u64),
+                    labels: labels_of(&r["labels"]),
+                    annotations: labels_of(&r["annotations"]),
+                    error,
+                })
+            })
+            .collect(),
+    )
+}
+
+/// The rule an alert comes from: its name, and the rule's labels on the alert (a rule's
+/// labels are added to every alert it fires). Several rules can share a name (one per
+/// severity): the one with the most labels matching. Templated values (`{{ $value }}`) can't
+/// be compared and are left out.
+pub fn rule_for<'a>(rules: &'a [Rule], alert: &Alert) -> Option<&'a Rule> {
+    rules
+        .iter()
+        .filter(|r| r.name == alert.name())
+        .filter_map(|r| {
+            let fixed = r.labels.iter().filter(|(_, v)| !v.contains("{{"));
+            let mut matched = 0;
+            for (k, v) in fixed {
+                if alert.labels.get(k) != Some(v) {
+                    return None;
+                }
+                matched += 1;
+            }
+            Some((matched, r))
+        })
+        // `max_by_key` keeps the last of the best: reversed, that is the first.
+        .rev()
+        .max_by_key(|(matched, _)| *matched)
+        .map(|(_, r)| r)
+}
+
+/// The rules read per (context, Prometheus): they change with a deploy, not every minute.
+type RulesCache = HashMap<(String, String), (Instant, Arc<Vec<Rule>>)>;
+
+static RULES: LazyLock<Mutex<RulesCache>> = LazyLock::new(Default::default);
+
+/// How long rules read are used before they are read again.
+const RULES_FRESH: Duration = Duration::from_secs(300);
+
+/// The cluster's alerting rules, read at most every `RULES_FRESH`, or why they could not be.
+async fn rules(context: &str, client: Client, target: &str) -> Result<Arc<Vec<Rule>>, String> {
+    let key = (context.to_string(), target.to_string());
+    let kept = RULES.lock().unwrap().get(&key).filter(|(at, _)| at.elapsed() < RULES_FRESH).map(|(_, r)| r.clone());
+    if let Some(rules) = kept {
+        return Ok(rules);
+    }
+    let text = match get(context, client, target, RULES_PATH).await {
+        Ok(text) => text,
+        Err(e) if unsupported(&e) => return Err("this Prometheus doesn't serve its rules".into()),
+        Err(e) => return Err(k8s::short_error(&e)),
+    };
+    let rules = Arc::new(parse_rules(&text).ok_or("the rules API gave something else")?);
+    RULES.lock().unwrap().insert(key, (Instant::now(), rules.clone()));
+    Ok(rules)
+}
+
+/// What a click on an alert shows: its rule and a chart of it.
+#[derive(Clone, Debug)]
+pub struct Detail {
+    /// None: no rule of that name and labels (deleted since, or another Prometheus's).
+    pub rule: Option<Rule>,
+    pub chart: Option<Chart>,
+}
+
+/// The rule's expression over the last `CHART_MINUTES`, for this alert's series.
+#[derive(Clone, Debug)]
+pub struct Chart {
+    /// What is drawn: the left side of the comparison, or the whole expression.
+    pub expr: String,
+    /// The comparison and its number ("> 0.9"), drawn as a line.
+    pub threshold: Option<(String, f64)>,
+    /// The points, or why they could not be read.
+    pub series: Result<crate::prom::Series, String>,
+}
+
+/// How far back the chart goes.
+pub const CHART_MINUTES: i64 = 180;
+
+/// An alert's rule and its chart: one read of the rules (kept a few minutes), then one range
+/// query, both only on a click.
+pub async fn detail(context: String, client: Client, alert: Alert) -> Result<Detail, String> {
+    let target = crate::prom::target(&context, client.clone())
+        .await
+        .map_err(|e| k8s::short_error(&e))?
+        .ok_or("no Prometheus found")?;
+    let rules = rules(&context, client.clone(), &target).await?;
+    let Some(rule) = rule_for(&rules, &alert).cloned() else { return Ok(Detail { rule: None, chart: None }) };
+    let (expr, threshold) = chart_expr(&rule.query);
+    let query = series_query(&expr, &alert, &rule);
+    let step = (CHART_MINUTES * 60 / 120).max(15);
+    let series = crate::prom::range(client, target, query, CHART_MINUTES, step).await.map_err(|e| k8s::short_error(&e));
+    let chart = Chart { expr, threshold: threshold.map(|(op, n)| (op.to_string(), n)), series };
+    Ok(Detail { rule: Some(rule), chart: Some(chart) })
+}
+
+/// Comparison operators, longest first so `>=` is not read as `>`.
+const COMPARISONS: [&str; 6] = ["==", "!=", ">=", "<=", ">", "<"];
+
+/// The byte ranges of an expression's top level: what is outside parentheses, brackets,
+/// braces and strings (comments are taken out before). Calls `f(at, rest)` at each such
+/// position; `f` returns how many bytes it took (0 for one character), or None to stop.
+fn top_level(expr: &str, mut f: impl FnMut(usize, &str) -> Option<usize>) {
+    let bytes = expr.as_bytes();
+    let (mut i, mut depth, mut quote): (usize, i32, Option<u8>) = (0, 0, None);
+    while i < bytes.len() {
+        let b = bytes[i];
+        if let Some(q) = quote {
+            if b == b'\\' && q != b'`' {
+                i += 1;
+            } else if b == q {
+                quote = None;
+            }
+            i += 1;
+            continue;
+        }
+        match b {
+            b'"' | b'\'' | b'`' => quote = Some(b),
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth -= 1,
+            _ if depth == 0 => match f(i, &expr[i..]) {
+                None => return,
+                Some(0) => {}
+                Some(n) => {
+                    i += n;
+                    continue;
+                }
+            },
+            _ => {}
+        }
+        // Multi-byte characters only appear inside strings and comments, or as one whole
+        // character here: step over all of it.
+        i += expr[i..].chars().next().map_or(1, char::len_utf8);
+    }
+}
+
+/// The expression without parentheses around all of it.
+fn strip_parens(mut expr: &str) -> &str {
+    loop {
+        expr = expr.trim();
+        let Some(inner) = expr.strip_prefix('(').and_then(|e| e.strip_suffix(')')) else { return expr };
+        // `(a) > (b)` starts and ends with them, but they are not one pair: something of it
+        // is at the top level.
+        let mut one_pair = true;
+        top_level(expr, |_, _| {
+            one_pair = false;
+            None
+        });
+        if !one_pair {
+            return expr;
+        }
+        expr = inner;
+    }
+}
+
+/// A number, as a threshold is written (`0.9`, `1e9`, `(5)`, `bool 0`).
+fn number(side: &str) -> Option<f64> {
+    let side = strip_parens(side);
+    let side = side.strip_prefix("bool").filter(|s| s.starts_with(char::is_whitespace)).unwrap_or(side);
+    strip_parens(side).parse::<f64>().ok().filter(|n| n.is_finite())
+}
+
+/// What a chart of a rule draws: the left side of its comparison (the comparison keeps only
+/// the points past the threshold, so the whole expression draws nothing below it), and the
+/// threshold when the other side is a number. `a > 1 and b` is cut at `and` first, which
+/// binds looser. The whole expression when there is no comparison (`absent(…)`).
+pub fn chart_expr(query: &str) -> (String, Option<(&'static str, f64)>) {
+    let clean = without_comments(query);
+    let (expr, threshold) = split_comparison(&clean);
+    (expr.to_string(), threshold)
+}
+
+/// The expression without its `# …` comments (outside strings), which run to the line's end.
+fn without_comments(query: &str) -> String {
+    let mut out = String::with_capacity(query.len());
+    let (mut quote, mut escaped, mut comment) = (None, false, false);
+    for c in query.chars() {
+        if comment {
+            if c != '\n' {
+                continue;
+            }
+            comment = false;
+        } else if let Some(q) = quote {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' && q != '`' {
+                escaped = true;
+            } else if c == q {
+                quote = None;
+            }
+        } else if matches!(c, '"' | '\'' | '`') {
+            quote = Some(c);
+        } else if c == '#' {
+            comment = true;
+            continue;
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// `chart_expr` on an expression without comments.
+fn split_comparison(query: &str) -> (&str, Option<(&'static str, f64)>) {
+    let query = strip_parens(query);
+    let mut end = query.len();
+    let mut comparison: Option<(usize, &'static str)> = None;
+    top_level(query, |at, rest| {
+        let word = rest.find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == ':')).unwrap_or(rest.len());
+        if word > 0 {
+            if matches!(&rest[..word], "and" | "or" | "unless") {
+                end = at;
+                return None;
+            }
+            return Some(word);
+        }
+        if comparison.is_none()
+            && let Some(op) = COMPARISONS.iter().find(|op| rest.starts_with(**op))
+        {
+            comparison = Some((at, *op));
+            return Some(op.len());
+        }
+        Some(0)
+    });
+    let Some((at, op)) = comparison.filter(|(at, _)| *at < end) else { return (strip_parens(&query[..end]), None) };
+    let (left, right) = (strip_parens(&query[..at]), strip_parens(&query[at + op.len()..end]));
+    match (number(left), number(right)) {
+        // `0.9 < x`: the number on the left, so x is drawn against it, the comparison turned.
+        (Some(n), None) => {
+            let turned = match op {
+                ">" => "<",
+                "<" => ">",
+                ">=" => "<=",
+                "<=" => ">=",
+                same => same,
+            };
+            (right, Some((turned, n)))
+        }
+        (_, n) => (left, n.map(|n| (op, n))),
+    }
+}
+
+/// A `PromQL` string literal holding `value`.
+fn string_literal(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('"');
+    for c in value.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// A label name `PromQL` takes as it is.
+fn plain_label(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars.next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// `expr` kept to the alert's own series: the alert's labels, without the rule's (added to
+/// the alert, not on the series), matched with `and on(…)` against a one-sample vector that
+/// carries them. Without such labels, `expr` itself.
+fn series_query(expr: &str, alert: &Alert, rule: &Rule) -> String {
+    let own: Vec<(&String, &String)> = alert
+        .labels
+        .iter()
+        .filter(|(k, _)| k.as_str() != "alertname" && !rule.labels.contains_key(*k) && plain_label(k))
+        .collect();
+    if own.is_empty() {
+        return expr.to_string();
+    }
+    // `label_replace` reads `$1` in its replacement: `$$` is a plain `$`.
+    let one = own.iter().fold("vector(1)".to_string(), |v, (k, val)| {
+        format!(r#"label_replace({v}, "{k}", {}, "", "")"#, string_literal(&val.replace('$', "$$")))
+    });
+    let names = own.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>().join(", ");
+    format!("({expr}) and on({names}) {one}")
 }
 
 #[cfg(test)]
@@ -820,6 +1177,155 @@ mod tests {
         assert_eq!(names, ["D", "C", "B", "A"]);
     }
 
+    #[test]
+    fn more_labels_open_their_object() {
+        // kube-state-metrics' alerts carry its own pod (and Service): the HPA is what it is about.
+        let hpa = alert(&[("alertname", "KubeHpaMaxedOut"), ("horizontalpodautoscaler", "web"), ("pod", "ksm-0")]);
+        assert_eq!(hpa.object(), Some(("horizontalpodautoscalers.autoscaling", "HorizontalPodAutoscaler", "web")));
+        let ing = alert(&[("ingress", "shop"), ("pod", "ksm-0"), ("service", "ksm")]);
+        assert_eq!(ing.object(), Some(("ingresses.networking.k8s.io", "Ingress", "shop")));
+        // A crash-looping pod's alert names kube-state-metrics' Service too: the pod wins.
+        let crash = alert(&[("alertname", "KubePodCrashLooping"), ("pod", "web-1"), ("service", "ksm")]);
+        assert_eq!(crash.object(), Some(("pods", "Pod", "web-1")));
+        // Nothing else named: the Service whose targets are down.
+        let down = alert(&[("alertname", "TargetDown"), ("job", "api"), ("namespace", "shop"), ("service", "api")]);
+        assert_eq!(down.object(), Some(("services", "Service", "api")));
+        // A Service's page shows it.
+        let svc = named("api", Some("shop"), &[], Value::Null);
+        let page = focus(&kind("", "Service"), &svc, &[]).unwrap();
+        assert_eq!(about(std::slice::from_ref(&down), &page).len(), 1);
+        let ing_page = focus(&kind("networking.k8s.io", "Ingress"), &svc, &[]).unwrap();
+        assert!(about(&[down], &ing_page).is_empty());
+    }
+
+    #[test]
+    fn a_nodes_page_shows_the_alerts_of_its_exporters() {
+        let node = serde_json::json!({"metadata": {"name": "worker-1"}, "status": {"addresses": [
+            {"type": "InternalIP", "address": "10.0.0.7"}, {"type": "Hostname", "address": "worker-1"}
+        ]}});
+        let page = focus(&kind("", "Node"), &node, &[]).unwrap();
+        // node-exporter runs on the host network: its instance is the node's address, its pod
+        // label the exporter's.
+        let by_ip =
+            alert(&[("alertname", "NodeFilesystemAlmostOutOfSpace"), ("instance", "10.0.0.7:9100"), ("pod", "ne-x")]);
+        let by_name = alert(&[("alertname", "NodeClockNotSynchronising"), ("instance", "worker-1:9100")]);
+        let other = alert(&[("alertname", "NodeFilesystemAlmostOutOfSpace"), ("instance", "10.0.0.70:9100")]);
+        let pod_ip = alert(&[("alertname", "KubePodCrashLooping"), ("instance", "10.0.0.71:8080"), ("pod", "web-1")]);
+        let shown = about(&[by_ip, by_name, other, pod_ip], &page);
+        let names: Vec<&str> = shown.iter().map(Alert::name).collect();
+        assert_eq!(names, ["NodeClockNotSynchronising", "NodeFilesystemAlmostOutOfSpace"]);
+        // Other pages don't match by instance.
+        let pod = named("ne-y", Some("monitoring"), &[], Value::Null);
+        let page = focus(&kind("", "Pod"), &pod, &[]).unwrap();
+        assert!(about(&[alert(&[("instance", "10.0.0.7:9100")])], &page).is_empty());
+    }
+
+    #[test]
+    fn instance_hosts() {
+        let host = |i: &str| alert(&[("instance", i)]).instance_host().map(String::from);
+        assert_eq!(host("10.0.0.7:9100").as_deref(), Some("10.0.0.7"));
+        assert_eq!(host("worker-1").as_deref(), Some("worker-1"));
+        assert_eq!(host("[fd00::7]:9100").as_deref(), Some("fd00::7"));
+        assert_eq!(host("fd00::7").as_deref(), Some("fd00::7"));
+        assert_eq!(host(":9100"), None);
+        assert_eq!(alert(&[]).instance_host(), None);
+    }
+
+    #[test]
+    fn reads_alerting_rules() {
+        let text = r#"{"status":"success","data":{"groups":[{"name":"k8s","rules":[
+            {"type":"alerting","name":"KubePodCrashLooping","query":"max_over_time(x[5m]) >= 1","duration":900,
+             "labels":{"severity":"warning"},"annotations":{"summary":"Pod is crash looping."},"health":"ok","lastError":""},
+            {"type":"recording","name":"job:x:sum","query":"sum(x)"},
+            {"type":"alerting","name":"Broken","query":"y > 1","duration":0,"health":"err","lastError":"many-to-many matching"}
+        ]},{"name":"vm","rules":[
+            {"type":"alerting","name":"KubePodCrashLooping","query":"z > 0","duration":60.5,"labels":{"severity":"critical"}}
+        ]}]}}"#;
+        let rules = parse_rules(text).unwrap();
+        assert_eq!(rules.len(), 3, "recording rules are left out");
+        assert_eq!((rules[0].for_secs, rules[0].error.as_deref()), (900, None));
+        assert_eq!(rules[0].annotations["summary"], "Pod is crash looping.");
+        assert_eq!((rules[1].for_secs, rules[1].error.as_deref()), (0, Some("many-to-many matching")));
+        assert_eq!(rules[2].for_secs, 60);
+        assert!(parse_rules(r#"{"status":"error","error":"x"}"#).is_none());
+        assert!(parse_rules("<html>").is_none());
+        // The rule of the same name whose labels the alert carries.
+        let critical = alert(&[("alertname", "KubePodCrashLooping"), ("severity", "critical"), ("pod", "p")]);
+        assert_eq!(rule_for(&rules, &critical).map(|r| r.query.as_str()), Some("z > 0"));
+        let warning = alert(&[("alertname", "KubePodCrashLooping"), ("severity", "warning")]);
+        assert_eq!(rule_for(&rules, &warning).map(|r| r.query.as_str()), Some("max_over_time(x[5m]) >= 1"));
+        assert!(rule_for(&rules, &alert(&[("alertname", "KubePodCrashLooping"), ("severity", "info")])).is_none());
+        assert!(rule_for(&rules, &alert(&[("alertname", "Other")])).is_none());
+        // A templated label can't be compared: it doesn't keep the rule from matching.
+        let mut templated = rules[1].clone();
+        templated.labels.insert("severity".into(), "{{ $labels.level }}".into());
+        assert!(rule_for(&[templated], &alert(&[("alertname", "Broken"), ("severity", "warning")])).is_some());
+    }
+
+    #[test]
+    fn charts_the_left_side_of_the_comparison() {
+        assert_eq!(split_comparison("max_over_time(x[5m]) >= 1"), ("max_over_time(x[5m])", Some((">=", 1.0))));
+        // Matchers, strings and subqueries inside are not comparisons.
+        assert_eq!(
+            split_comparison(r#"rate(x{code=~"5..",path!="/a>b"}[5m:1m]) / rate(x[5m]) > 0.05"#),
+            (r#"rate(x{code=~"5..",path!="/a>b"}[5m:1m]) / rate(x[5m])"#, Some((">", 0.05)))
+        );
+        // `and` binds looser than the comparison; the other side isn't a number.
+        assert_eq!(
+            split_comparison("(a - b) / c > on(pod) group_left d\nand\nchanges(e[1h]) > 0"),
+            ("(a - b) / c", None)
+        );
+        assert_eq!(split_comparison("kube_band > bool (5)"), ("kube_band", Some((">", 5.0))));
+        // The number on the left: the comparison is turned.
+        assert_eq!(split_comparison("0.9 < free / size"), ("free / size", Some((">", 0.9))));
+        // Parentheses around everything, comments.
+        assert_eq!(chart_expr("(up == 0) # down, (x > 1)\n"), ("up".to_string(), Some(("==", 0.0))));
+        assert_eq!(chart_expr("x{a=\"#\"} > 1 # y"), ("x{a=\"#\"}".to_string(), Some((">", 1.0))));
+        assert_eq!(split_comparison("(a) > (b)"), ("a", None));
+        assert_eq!(split_comparison("absent(up{job=\"x\"})"), ("absent(up{job=\"x\"})", None));
+        assert_eq!(split_comparison("a unless b"), ("a", None));
+    }
+
+    #[test]
+    fn the_chart_keeps_the_alerts_own_series() {
+        let rule = Rule {
+            name: "A".into(),
+            query: "x > 1".into(),
+            for_secs: 0,
+            labels: BTreeMap::from([("severity".into(), "warning".into())]),
+            annotations: BTreeMap::new(),
+            error: None,
+        };
+        let a = alert(&[("alertname", "A"), ("severity", "warning"), ("pod", r#"we"b$1"#), ("namespace", "shop")]);
+        assert_eq!(
+            series_query("x", &a, &rule),
+            r#"(x) and on(namespace, pod) label_replace(label_replace(vector(1), "namespace", "shop", "", ""), "pod", "we\"b$$1", "", "")"#
+        );
+        // Only the rule's labels: the expression as it is.
+        assert_eq!(series_query("x", &alert(&[("alertname", "A"), ("severity", "warning")]), &rule), "x");
+    }
+
+    /// What a `PromQL` double-quoted string literal holds, or None when it is not one.
+    fn read_literal(text: &str) -> Option<String> {
+        let inner = text.strip_prefix('"')?.strip_suffix('"')?;
+        let mut out = String::new();
+        let mut chars = inner.chars();
+        while let Some(c) = chars.next() {
+            match c {
+                '"' => return None,
+                '\\' => out.push(match chars.next()? {
+                    'n' => '\n',
+                    'r' => '\r',
+                    't' => '\t',
+                    c @ ('\\' | '"') => c,
+                    _ => return None,
+                }),
+                c => out.push(c),
+            }
+        }
+        Some(out)
+    }
+
     fn any_alert() -> impl Strategy<Value = Alert> {
         let opt = |values: &'static [&'static str]| prop::option::of(prop::sample::select(values));
         (
@@ -874,6 +1380,36 @@ mod tests {
                 .count();
             prop_assert!(rows.len() <= in_scope);
             prop_assert_eq!(rows.is_empty(), in_scope == 0);
+        }
+
+        /// Any label value goes into the chart's query as a string literal holding exactly it.
+        #[test]
+        fn label_values_are_quoted(value in any::<String>()) {
+            prop_assert_eq!(read_literal(&string_literal(&value)), Some(value));
+        }
+
+        /// The chart draws the comparison's left side, whatever its matchers, strings,
+        /// parentheses and comments hold, against the number on the right.
+        #[test]
+        fn the_left_side_of_any_comparison(
+            name in "m_[a-z_]{0,6}",
+            value in r#"[a-z0-9 <>=!()#\[\]{}'`]{0,8}"#,
+            shape in 0..4usize,
+            op in prop::sample::select(&COMPARISONS[..]),
+            n in -1e6..1e6f64,
+            comment in prop::option::of("[a-z <>=()]{0,8}"),
+        ) {
+            let sel = format!("{{l={}}}", string_literal(&value));
+            let left = match shape {
+                0 => format!("{name}{sel}"),
+                1 => format!("rate({name}{sel}[5m])"),
+                2 => format!("sum by (l) ({name}{sel}) / {name}"),
+                _ => format!("({name}{sel} - {name}) * 100"),
+            };
+            let comment = comment.map_or_default(|c| format!(" # {c}\n"));
+            let (expr, threshold) = chart_expr(&format!("{left} {op} {n}{comment}"));
+            prop_assert_eq!(expr, left);
+            prop_assert_eq!(threshold, Some((op, n)));
         }
     }
 }
