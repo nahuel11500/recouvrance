@@ -212,7 +212,7 @@ fn mute(alerts: &mut [Alert], held: &[Held]) {
 
 /// The alert endpoint is not served there (a VictoriaMetrics without vmalert, something
 /// else on the port): no alerts to show rather than a failure to report.
-fn unsupported(e: &anyhow::Error) -> bool {
+pub(crate) fn unsupported(e: &anyhow::Error) -> bool {
     if matches!(k8s::api_status(e), Some(400 | 404 | 405 | 501)) {
         return true;
     }
@@ -237,7 +237,7 @@ async fn get(context: &str, client: Client, target: &str, path: &str) -> Result<
         let (started, mut task) = running.filter(|(started, _)| reuse(started.elapsed())).unwrap_or_else(|| {
             let (_, target, path) = key.clone();
             let task = tokio::spawn(async move {
-                tokio::time::timeout(LIMIT, get_now(client, target, path))
+                tokio::time::timeout(LIMIT, crate::prom::get_text(client, &target, path))
                     .await
                     .map_err(|_| anyhow::anyhow!("timed out"))?
             });
@@ -257,16 +257,6 @@ async fn get(context: &str, client: Client, target: &str, path: &str) -> Result<
 /// at `LIMIT`) or its answer is recent enough to show.
 fn reuse(age: Duration) -> bool {
     age < LIMIT + FRESH
-}
-
-async fn get_now(client: Client, target: String, path: String) -> Result<String> {
-    match crate::prom::proxy_path(&target)? {
-        Some(base) => {
-            let req = http::Request::get(format!("{base}{path}")).body(Vec::new())?;
-            Ok(client.request_text(req).await?)
-        }
-        None => crate::assistant::get_url(format!("{}{path}", target.trim_end_matches('/'))).await,
-    }
 }
 
 /// How long a read waits for an answer: the Problems page waits for it.

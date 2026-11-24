@@ -16,6 +16,7 @@ use super::{Problem, Scan, Severity};
 use crate::alerts::Alerts;
 use crate::k8s::lane::{Lane, Raisable};
 use crate::k8s::{self, Kind};
+use crate::volumes::Volumes;
 
 /// What a scan reads: a cluster, and the namespaces it reads there, sorted (none: the whole
 /// cluster).
@@ -81,6 +82,8 @@ pub struct Found {
     parts: BTreeMap<Arc<str>, Arc<Part>>,
     /// The cluster's alerts, as the last scan read them.
     alerts: Option<Arc<Alerts>>,
+    /// The PVCs filling up, from the cluster's Prometheus, as the last scan read them.
+    volumes: Option<Arc<Volumes>>,
     /// The last scan run to its end.
     pub done: Option<Done>,
     /// When the scan running now started.
@@ -92,7 +95,7 @@ impl Found {
     #[cfg(test)]
     pub fn of(problems: Vec<Problem>, skipped: Vec<String>, done: Option<Done>) -> Self {
         let part = Arc::new(Part { order: 0, problems, skipped });
-        Self { parts: BTreeMap::from([(Arc::from("all"), part)]), alerts: None, done, running: None }
+        Self { parts: BTreeMap::from([(Arc::from("all"), part)]), alerts: None, volumes: None, done, running: None }
     }
 
     /// The findings of the checks in `namespaces` (all when empty).
@@ -100,23 +103,37 @@ impl Found {
         self.parts.values().flat_map(|p| &p.problems).filter(move |p| within(p, namespaces))
     }
 
-    /// The firing alerts in `namespaces` (all, cluster-wide ones too, when empty).
-    fn alert_problems(&self, namespaces: &[String]) -> Vec<Problem> {
-        self.alerts.as_ref().map_or_default(|a| crate::alerts::problems(&a.list, namespaces))
+    /// What Prometheus says in `namespaces` (all, cluster-wide alerts too, when empty): the
+    /// firing alerts, and the PVCs filling up that no firing alert names already (one that
+    /// is silenced included: someone chose not to hear of it).
+    fn prometheus_problems(&self, namespaces: &[String]) -> Vec<Problem> {
+        let alerts = self.alerts.as_deref().map_or_default(|a| a.list.as_slice());
+        let mut out = crate::alerts::problems(alerts, namespaces);
+        if let Some(volumes) = &self.volumes {
+            let alerted = |ns: &str, claim: &str| {
+                alerts.iter().any(|a| {
+                    a.firing
+                        && a.namespace() == Some(ns)
+                        && a.object().is_some_and(|(kind, _, name)| kind == "persistentvolumeclaims" && name == claim)
+                })
+            };
+            out.extend(crate::volumes::problems(&volumes.filling, namespaces, alerted));
+        }
+        out
     }
 
     /// What was found in `namespaces` (the whole scope when empty), alerts included, worst
     /// first.
     pub fn problems(&self, namespaces: &[String]) -> Vec<Problem> {
         let mut out: Vec<Problem> = self.objects(namespaces).cloned().collect();
-        out.extend(self.alert_problems(namespaces));
+        out.extend(self.prometheus_problems(namespaces));
         super::sort(&mut out);
         out
     }
 
     /// (critical, warnings) in `namespaces`, as `problems` lists them.
     pub fn counts(&self, namespaces: &[String]) -> (usize, usize) {
-        let alerts = self.alert_problems(namespaces);
+        let alerts = self.prometheus_problems(namespaces);
         let mut counts = (0, 0);
         for p in self.objects(namespaces).chain(&alerts) {
             match p.severity {
@@ -142,6 +159,9 @@ impl Found {
         let mut all: Vec<String> = parts.iter().flat_map(|p| p.skipped.iter().cloned()).collect();
         if let Some(alerts) = &self.alerts {
             all.extend(Scan { problems: Vec::new(), skipped: crate::alerts::skipped(alerts) }.skipped_parts());
+        }
+        if let Some(e) = self.volumes.as_ref().and_then(|v| v.error.as_ref()) {
+            all.push(format!("Volume usage ({e})"));
         }
         all.retain(|s| keep(s));
         (!all.is_empty()).then(|| all.join(", "))
@@ -344,6 +364,7 @@ fn update(scope: &Scope, change: impl FnOnce(&mut Found)) {
 async fn run(scope: Scope, ask: Ask, judged_since: Option<Instant>, mut finish: Finish) {
     let Ask { client, kinds, record } = ask;
     let context = record.then_some(scope.context.as_str());
+    let pvcs = kinds.iter().any(|k| k.is("", "PersistentVolumeClaim"));
     let mut jobs = super::jobs(&client, &kinds, &scope.namespaces, context, judged_since);
     // Argo CD Applications deploying here, read on their hubs (no request when none is known).
     jobs.push(super::argo_apps::job(&scope.context, &client, &kinds, &scope.namespaces));
@@ -364,7 +385,14 @@ async fn run(scope: Scope, ask: Ask, judged_since: Option<Instant>, mut finish: 
         let alerts = crate::alerts::active(&scope.context, client.clone()).await;
         update(&scope, |found| found.alerts = Some(alerts));
     };
-    futures::join!(checks, alerts);
+    // One instant query to Prometheus, whatever the cluster's size: no list from the API server.
+    let volumes = async {
+        if pvcs {
+            let volumes = crate::volumes::read(&scope.context, client.clone()).await;
+            update(&scope, |found| found.volumes = Some(volumes));
+        }
+    };
+    futures::join!(checks, alerts, volumes);
     finish.ended = true;
     drop(finish);
 }
@@ -532,6 +560,57 @@ mod tests {
         found.parts.insert(Arc::from("Jobs"), part(2, "Jobs (failed: timeout)"));
         assert_eq!(found.skipped().unwrap(), "Pods (forbidden), Jobs (failed: timeout)");
         assert_eq!(Found::default().skipped(), None);
+    }
+
+    #[test]
+    fn a_pvc_filling_up_is_listed_once_next_to_its_alert() {
+        use crate::alerts::Alert;
+        use crate::volumes::Filling;
+        let alert = |claim: &str, muted: Option<&'static str>| Alert {
+            labels: [
+                ("alertname", "KubePersistentVolumeFillingUp"),
+                ("namespace", "x"),
+                ("severity", "warning"),
+                ("persistentvolumeclaim", claim),
+            ]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect(),
+            firing: true,
+            muted,
+            summary: String::new(),
+            description: String::new(),
+            runbook: None,
+            since: None,
+        };
+        let filling = |ns: &str, claim: &str| Filling {
+            namespace: ns.into(),
+            claim: claim.into(),
+            bytes: Some(0.95),
+            inodes: None,
+        };
+        let mut found = found(Vec::new());
+        let mut alerts = Alerts::default();
+        alerts.list.extend([alert("data", None), alert("quiet", Some("silenced"))]);
+        found.alerts = Some(Arc::new(alerts));
+        found.volumes = Some(Arc::new(Volumes {
+            filling: vec![filling("x", "data"), filling("x", "quiet"), filling("x", "logs"), filling("y", "data")],
+            error: None,
+        }));
+        let listed: Vec<String> = found
+            .problems(&[])
+            .iter()
+            .map(|p| format!("{} {}/{}", p.label, p.namespace.as_deref().unwrap_or_default(), p.name))
+            .collect();
+        // Its alert says it, and a silenced one keeps it quiet; the others come from the usage.
+        assert_eq!(
+            listed,
+            ["PersistentVolumeClaim alert x/data", "PersistentVolumeClaim x/logs", "PersistentVolumeClaim y/data",]
+        );
+        assert_eq!(found.counts(&[]), (0, 3));
+        assert_eq!(found.problems(&["y".into()]).len(), 1);
+        found.volumes = Some(Arc::new(Volumes { filling: Vec::new(), error: Some("failed: timed out".into()) }));
+        assert_eq!(found.skipped().unwrap(), "Volume usage (failed: timed out)");
     }
 
     /// A cluster with one node `NotReady`; records the paths it was asked for. With `.1`, a

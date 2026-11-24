@@ -179,8 +179,8 @@ Tools, by what they do:
   `diff_manifest`, `explain_resource`, `can_i`, `cluster_version`, `upgrade_check`, `wait_for`,
   `list_port_forwards`, `browse_files`, `get_metrics`, `argocd_apps`.
 - **Change:** `scale`, `rollout_restart`, `rollout_undo`, `rollout_pause`, `rollout_resume`,
-  `set_image`, `patch_resource`, `apply_manifest`, `delete_resource`, `trigger_cronjob`,
-  `cordon_node`, `uncordon_node`, `drain_node`, `gitops`, `exec_command`, `debug_pod`,
+  `set_image`, `patch_resource`, `apply_manifest`, `delete_resource`, `evict_pod`, `trigger_cronjob`,
+  `cordon_node`, `uncordon_node`, `drain_node`, `gitops`, `refresh_external_secret`, `exec_command`, `debug_pod`,
   `port_forward`, `stop_port_forward`.
 
 `find_problems` answers from the Problems scan the app shares with its windows (the sidebar count,
@@ -307,6 +307,16 @@ tools' definitions. What some of them need beyond the obvious verb:
   access ends.
 - **Nodes:** `cordon_node` and `uncordon_node` need the `drain` verb on the node; `top_nodes`
   needs `list` on nodes and metrics-server.
+- **Deletes and evictions:** `delete_resource` takes `cascade`, kubectl's `--cascade`: `orphan`
+  keeps what the object owns (a workload's pods; the approval banner says they stay), `foreground`
+  deletes that first, `background` after; a value it doesn't know is refused, not sent as the
+  default. `evict_pod` evicts one pod through the Eviction API, as `drain_node` does for each pod:
+  it needs `delete` on the pod (the approval banner says it is an eviction a budget may refuse),
+  and a PodDisruptionBudget that would be broken refuses it, the reply naming the budget.
+- **ExternalSecrets:** `refresh_external_secret` sets an ExternalSecret's `force-sync` annotation,
+  so the External Secrets Operator fetches it from its store now (after a secret was rotated). It
+  needs the `refresh` verb on `externalsecrets.external-secrets.io`, the verb of an Argo CD refresh:
+  like one, it deploys nothing of its own.
 - **Jobs and debugging:** `trigger_cronjob` needs `get` on the CronJob and `apply` on the Job it
   creates, named `<cronjob>-manual-<number>` (so `jobs/nightly-manual-*` can be allowed).
   `debug_pod` needs `exec` on the pod: it adds an ephemeral container (busybox by default) that the
