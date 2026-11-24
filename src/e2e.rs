@@ -2193,6 +2193,153 @@ fn an_agent_syncs_terminates_and_rolls_back_an_argo_cd_application() {
     });
 }
 
+/// A grouped sync, as the Argo CD page sends it with the window's client: each Application is
+/// read and checked, a dry run writes to each an operation that asks Argo CD to apply nothing
+/// (and changes nothing else), a sync without hooks with prune writes each one's operation,
+/// one already syncing is refused, and with write mode off none is written. The test plays
+/// Argo CD's controller.
+#[test]
+#[ignore = "needs a kind cluster: RECOUVRANCE_E2E_CONTEXT"]
+fn a_grouped_sync_writes_each_application_s_operation() {
+    use futures::StreamExt as _;
+    use k8s::argo::grouped_sync::{self, Options, Target};
+    use kube::api::DynamicObject;
+
+    run(async {
+        let ctx = context();
+        let admin = k8s::connect_for_agents(ctx.clone()).await?;
+        let installed = application_crd(admin.clone()).await?;
+        let kind = k8s::argo::application_kind();
+        let apps: Api<DynamicObject> = Api::namespaced_with(admin.clone(), NS, &kind.ar);
+        let names = ["e2e-group-a", "e2e-group-b", "e2e-group-c"];
+        let before = "2026-01-01T00:00:00Z";
+        for name in names {
+            let _ = apps.delete(name, &DeleteParams::default()).await;
+        }
+        for name in names {
+            let app = json!({
+                "apiVersion": "argoproj.io/v1alpha1", "kind": "Application",
+                "metadata": {"name": name, "namespace": NS},
+                "spec": {"project": "default",
+                    "source": {"repoURL": "https://git.example/apps", "path": name, "targetRevision": "HEAD"},
+                    "destination": {"server": "https://kubernetes.default.svc", "namespace": NS}},
+                "status": {
+                    "sync": {"status": "OutOfSync"},
+                    "resources": [
+                        {"group": "apps", "version": "v1", "kind": "Deployment", "namespace": NS, "name": name, "status": "OutOfSync"},
+                        {"version": "v1", "kind": "ConfigMap", "namespace": NS, "name": format!("{name}-old"), "status": "OutOfSync", "requiresPruning": true},
+                    ],
+                    "operationState": {"phase": "Succeeded", "startedAt": before},
+                },
+            });
+            apps.create(&PostParams::default(), &serde_json::from_value(app)?).await?;
+        }
+        let api = &apps;
+        let read = move |name: &'static str| async move { anyhow::Ok(serde_json::to_value(api.get(name).await?)?) };
+        let set = move |name: &'static str, patch: serde_json::Value| async move {
+            api.patch(name, &PatchParams::default(), &Patch::Merge(patch)).await?;
+            anyhow::Ok(())
+        };
+        let hub = k8s::argo::Hub { context: ctx.clone(), client: k8s::connect(ctx.clone()).await? };
+        let target = |name: &str| Target {
+            source: k8s::argo::Source::Hub(hub.clone()),
+            instance: ctx.clone(),
+            namespace: NS.into(),
+            name: name.into(),
+        };
+        let checked = async {
+            gate::set_ui_writes(true);
+            // Each is read and checked as the page does: what prune would delete is listed.
+            let mut pruned = Vec::new();
+            for name in names {
+                let app = target(name).read().await.map_err(anyhow::Error::msg)?;
+                let c = grouped_sync::check(&app, &k8s::argo::windows::NextSync::NoWindow, jiff::Timestamp::now());
+                assert_eq!(c.refused, None, "{name}");
+                assert_eq!(c.before.as_deref(), Some(before));
+                assert_eq!(c.pruned.iter().map(|r| r.name.clone()).collect::<Vec<_>>(), [format!("{name}-old")]);
+                pruned.push(c.pruned);
+            }
+            let jobs = |opts: Options| -> Vec<(Target, k8s::argo::ops::SyncRequest)> {
+                names.iter().zip(&pruned).map(|(n, p)| (target(n), opts.request(p))).collect()
+            };
+            let send = |opts: Options| grouped_sync::send_all(jobs(opts)).collect::<Vec<_>>();
+
+            // A dry run: each Application's operation asks Argo CD to apply nothing; nothing else is written.
+            let sent = send(Options { dry_run: true, ..Default::default() }).await;
+            assert_eq!(sent.len(), names.len());
+            assert!(sent.iter().all(|(_, r)| r.is_ok()), "{sent:?}");
+            for name in names {
+                let app = read(name).await?;
+                let op = &app["operation"];
+                assert_eq!(op["sync"]["dryRun"], true, "{op}");
+                assert_eq!(op["sync"]["syncStrategy"], json!({"hook": {}}), "{op}");
+                assert!(op["sync"].get("prune").is_none(), "{op}");
+                assert_eq!(app["status"]["sync"]["status"], "OutOfSync", "a dry run changes nothing else");
+                assert_eq!(app["spec"]["source"]["path"], name, "a dry run changes nothing else");
+                // Argo CD ends the dry run.
+                set(name, json!({"operation": null, "status": {"operationState": {"phase": "Succeeded", "startedAt": before}}}))
+                    .await?;
+            }
+
+            // Without hooks, with prune: each one's operation says so, started by Recouvrance.
+            let opts = Options { hooks: false, prune: true, dry_run: false };
+            let sent = send(opts).await;
+            assert!(sent.iter().all(|(_, r)| r.as_ref().is_ok_and(|m| m.contains("without hooks"))), "{sent:?}");
+            for name in names {
+                let op = read(name).await?["operation"].clone();
+                assert_eq!(op["sync"]["syncStrategy"], json!({"apply": {}}), "{op}");
+                assert_eq!(op["sync"]["prune"], true, "{op}");
+                assert!(op["sync"].get("dryRun").is_none(), "{op}");
+                assert_eq!(op["initiatedBy"]["username"], "recouvrance", "{op}");
+            }
+
+            // While they run, a second sync of them is refused, and nothing is overwritten.
+            let again = send(opts).await;
+            assert!(again.iter().all(|(_, r)| r.as_ref().is_err_and(|e| e.contains("in progress"))), "{again:?}");
+            let app = target(names[0]).read().await.map_err(anyhow::Error::msg)?;
+            let c = grouped_sync::check(&app, &k8s::argo::windows::NextSync::NoWindow, jiff::Timestamp::now());
+            assert!(c.refused.is_some_and(|why| why.contains("already running")));
+
+            // Argo CD starts the first: its progress is read from its operation state.
+            set(
+                names[0],
+                json!({"status": {"operationState": {"phase": "Running", "startedAt": "2026-01-02T00:00:00Z",
+                    "syncResult": {"resources": [{"kind": "ConfigMap", "namespace": NS, "name": "x", "status": "Synced"},
+                        {"group": "apps", "kind": "Deployment", "namespace": NS, "name": names[0]}]}}}}),
+            )
+            .await?;
+            let p = grouped_sync::progress(&read(names[0]).await?, Some(before));
+            assert_eq!((p.phase.as_str(), p.done, p.total, p.ended), ("Running", 1, 2, false));
+
+            // Write mode off: none is written.
+            for name in names {
+                set(name, json!({"operation": null})).await?;
+            }
+            gate::set_ui_writes(false);
+            let refused = send(opts).await;
+            assert!(
+                refused.iter().all(|(_, r)| r.as_ref().is_err_and(|e| e.contains(gate::WRITES_OFF))),
+                "{refused:?}"
+            );
+            for name in names {
+                assert!(read(name).await?.get("operation").is_none(), "the refused sync reached {name}");
+            }
+            Ok(())
+        };
+        let result: Result<()> = checked.await;
+        gate::set_ui_writes(false);
+        for name in names {
+            let _ = apps.delete(name, &DeleteParams::default()).await;
+        }
+        if installed {
+            use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition;
+            let crds: Api<CustomResourceDefinition> = Api::all(admin);
+            let _ = crds.delete("applications.argoproj.io", &DeleteParams::default()).await;
+        }
+        result
+    });
+}
+
 /// An agent follows an Argo CD Application from its hub to its destination: `argocd_apps`
 /// lists it with the context it deploys to, `describe_resource` and `get_changes` on an object
 /// it deployed name it (by its tracking id), and `wait_for` waits for its sync and returns at

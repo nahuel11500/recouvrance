@@ -49,7 +49,7 @@ const MAX_PROJECTS: usize = 50;
 const PROJECTS_EVERY: Duration = Duration::from_secs(5 * 60);
 
 /// The fields of an Application the page reads; the rest is not sent (`fields`).
-const APP_FIELDS: [&str; 20] = [
+const APP_FIELDS: [&str; 26] = [
     "metadata.name",
     "metadata.namespace",
     "metadata.labels",
@@ -66,6 +66,13 @@ const APP_FIELDS: [&str; 20] = [
     "status.operationState.message",
     "status.operationState.startedAt",
     "status.operationState.finishedAt",
+    // For the sync journal: who started it, how, at which revision, and each resource's result.
+    "status.operationState.operation.initiatedBy",
+    "status.operationState.operation.sync.dryRun",
+    "status.operationState.operation.sync.syncStrategy",
+    "status.operationState.syncResult.revision",
+    "status.operationState.syncResult.revisions",
+    "status.operationState.syncResult.resources",
     "status.history",
     "status.conditions",
     "status.summary",
@@ -760,9 +767,16 @@ impl Sse {
     }
 }
 
-/// One event of the stream: `{"result": {"type": "ADDED", "application": {...}}}`. None for
-/// one this doesn't use; an error the stream sends is an error.
+/// One event of the stream, as `parse_event_seen` reads it, the Application shown to nothing.
+#[cfg(test)]
 pub(super) fn parse_event(data: &str) -> Result<Option<Event>, String> {
+    parse_event_seen(data, |_| {})
+}
+
+/// One event of the stream: `{"result": {"type": "ADDED", "application": {...}}}`. None for
+/// one this doesn't use; an error the stream sends is an error. Each Application added or
+/// changed is shown to `seen` whole, as sent (the sync journal keeps its operation).
+fn parse_event_seen(data: &str, seen: impl FnOnce(&Value)) -> Result<Option<Event>, String> {
     let v: Value = serde_json::from_str(data).map_err(|e| format!("an event of the stream isn't JSON: {e}"))?;
     if let Some(e) = v.get("error").filter(|e| !e.is_null()) {
         let said = e.get("message").and_then(Value::as_str).unwrap_or("an error");
@@ -775,7 +789,10 @@ pub(super) fn parse_event(data: &str) -> Result<Option<Event>, String> {
         return Ok(None);
     }
     Ok(match result.get("type").and_then(Value::as_str) {
-        Some("ADDED" | "MODIFIED") => Some(Event::Upsert(Box::new(ApiApp::of(app)))),
+        Some("ADDED" | "MODIFIED") => {
+            seen(app);
+            Some(Event::Upsert(Box::new(ApiApp::of(app))))
+        }
         Some("DELETED") => {
             let ns = app.pointer("/metadata/namespace").and_then(Value::as_str).filter(|s| !s.is_empty());
             Some(Event::Deleted { namespace: ns.unwrap_or(DEFAULT_NAMESPACE).to_string(), name: name.to_string() })
@@ -967,6 +984,7 @@ async fn read_stream(conn: Conn, state: Arc<Mutex<FeedState>>, out: tokio::sync:
     };
     lock(&state).live = true;
     changed();
+    let instance = super::grouping::server_instance(&conn.server.base);
     let mut sse = Sse::default();
     let failed = |text: String| Ended::Failed(Failure { status: None, text: scrub(&text, &conn.token.0) });
     let ended = loop {
@@ -983,7 +1001,7 @@ async fn read_stream(conn: Conn, state: Arc<Mutex<FeedState>>, out: tokio::sync:
         let mut batch = Vec::with_capacity(events.len());
         let mut bad = None;
         for data in events {
-            match parse_event(&data) {
+            match parse_event_seen(&data, |app| super::journal::observe(&instance, app)) {
                 Ok(Some(event)) => batch.push(event),
                 Ok(None) => {}
                 Err(e) => {
@@ -1013,11 +1031,13 @@ async fn follow(conn: &Conn, state: &Arc<Mutex<FeedState>>) -> Ended {
         Ok(v) => v,
         Err(f) => return Ended::Failed(f),
     };
+    let instance = super::grouping::server_instance(&conn.server.base);
     let listed: Apps = list
         .get("items")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
+        .inspect(|app| super::journal::observe(&instance, app))
         .map(ApiApp::of)
         .filter(|a| !a.summary.name.is_empty())
         .map(|a| (a.key(), Arc::new(a)))
@@ -1152,7 +1172,11 @@ pub async fn read_app(endpoint: Arc<Endpoint>, namespace: String, name: String) 
             Ok(c) => c,
             Err(e) => return Ok(Err(e)),
         };
-        Ok(conn.get(&app_path(&namespace, &name)).await.map_err(|f| f.text))
+        let app = conn.get(&app_path(&namespace, &name)).await.map_err(|f| f.text);
+        if let Ok(app) = &app {
+            super::journal::observe(&super::grouping::server_instance(&conn.server.base), app);
+        }
+        Ok(app)
     });
     read.await.unwrap_or_else(|e| Err(format!("{e:#}")))
 }
@@ -1175,6 +1199,7 @@ pub async fn dashboard(
             Ok(app) => app,
             Err(f) => return Ok(Err(f.text)),
         };
+        super::journal::observe(&super::grouping::server_instance(&conn.server.base), &app);
         let shown = conn.server.name();
         let get = |path: String| {
             let conn = conn.clone();
@@ -1241,8 +1266,8 @@ pub enum Action {
     Refresh {
         hard: bool,
     },
-    /// A sync of the whole Application, with its own sync options.
-    Sync,
+    /// A sync with the options asked for (the whole Application, hooks included, with none).
+    Sync(super::ops::SyncRequest),
     Terminate,
     /// Back to the deployment of its history with this id.
     Rollback {
@@ -1261,7 +1286,7 @@ pub(super) fn request(action: &Action, namespace: &str, name: &str) -> (http::Me
             let mode = if *hard { "hard" } else { "normal" };
             (http::Method::GET, format!("{app}?appNamespace={ns}&refresh={mode}"), None)
         }
-        Action::Sync => (http::Method::POST, format!("{app}/sync"), Some(body)),
+        Action::Sync(req) => (http::Method::POST, format!("{app}/sync"), Some(sync_body(body, req))),
         Action::Terminate => (http::Method::DELETE, format!("{app}/operation?appNamespace={ns}"), None),
         Action::Rollback { id } => {
             let mut body = body;
@@ -1271,15 +1296,45 @@ pub(super) fn request(action: &Action, namespace: &str, name: &str) -> (http::Me
     }
 }
 
+/// The body of a sync request (argocd-server's `ApplicationSyncRequest`): the Application, its
+/// strategy (hook, or apply: without hooks), and prune, dry run and resources when asked.
+fn sync_body(mut body: Value, req: &super::ops::SyncRequest) -> Value {
+    body["strategy"] = super::ops::strategy(req);
+    if req.prune {
+        body["prune"] = json!(true);
+    }
+    if req.dry_run {
+        body["dryRun"] = json!(true);
+    }
+    if !req.resources.is_empty() {
+        body["resources"] = Value::Array(req.resources.iter().map(super::ops::resource_entry).collect());
+    }
+    body
+}
+
 /// Ask Argo CD for `action` on the Application `namespace/name`, by its API, with the
 /// server's login as the config has it now (`current`). Refused while write mode is off,
-/// checked as it is sent, as the UI's other writes are.
+/// checked as it is sent, as the UI's other writes are. A sync reads the Application right
+/// before it is sent and is refused as argocd-server would refuse it (an operation running),
+/// or when prune would now delete more than was shown.
 pub async fn act(endpoint: Arc<Endpoint>, namespace: String, name: String, action: Action) -> Result<String, String> {
     let write = crate::k8s::run_abortable(async move {
         let conn = match current(&endpoint.server.base).and_then(|e| e.conn()) {
             Ok(c) => c,
             Err(e) => return Ok(Err(e)),
         };
+        let mut read = None;
+        if let Action::Sync(req) = &action {
+            let app = match conn.get(&app_path(&namespace, &name)).await {
+                Ok(app) => app,
+                Err(f) => return Ok(Err(format!("the Application could not be read: {}", f.text))),
+            };
+            let op = super::ops::Op::Sync(req.clone());
+            if let Some(why) = super::ops::refusal(&app, &op) {
+                return Ok(Err(format!("Argo CD would refuse it: {why}")));
+            }
+            read = Some((app, op));
+        }
         if !crate::k8s::gate::ui_writes() {
             return Ok(Err(crate::k8s::gate::WRITES_OFF.to_string()));
         }
@@ -1289,7 +1344,10 @@ pub async fn act(endpoint: Arc<Endpoint>, namespace: String, name: String, actio
             .map(|_| match &action {
                 Action::Refresh { hard: false } => format!("Argo CD refreshes {name}"),
                 Action::Refresh { hard: true } => format!("Argo CD hard-refreshes {name}"),
-                Action::Sync => format!("Sync of {name} started"),
+                Action::Sync(_) => match &read {
+                    Some((app, op)) => super::ops::started(app, op, &name),
+                    None => format!("Sync of {name} started"),
+                },
                 Action::Terminate => format!("The operation of {name} is terminating"),
                 Action::Rollback { id } => format!("Rollback of {name} to deployment {id} started"),
             })
@@ -1303,6 +1361,8 @@ mod tests {
     use super::{
         Action, Event, Sse, apply, endpoints_from, lean, list_path, parse_event, request, settle, stream_path,
     };
+    use crate::k8s::argo::diagnosis::Res;
+    use crate::k8s::argo::ops::SyncRequest;
     use crate::k8s::argo::server::Login;
     use base64::Engine as _;
     use serde_json::{Value, json};
@@ -1438,8 +1498,9 @@ users:
             req(Action::Refresh { hard: true }),
             get("/api/v1/applications/web?appNamespace=team%20a&refresh=hard")
         );
-        let body = json!({"name": "web", "appNamespace": "team a"});
-        assert_eq!(req(Action::Sync), ("POST".into(), "/api/v1/applications/web/sync".into(), Some(body)));
+        let body = json!({"name": "web", "appNamespace": "team a", "strategy": {"hook": {}}});
+        let sync = |r: SyncRequest| req(Action::Sync(r));
+        assert_eq!(sync(SyncRequest::default()), ("POST".into(), "/api/v1/applications/web/sync".into(), Some(body)));
         assert_eq!(
             req(Action::Terminate),
             ("DELETE".into(), "/api/v1/applications/web/operation?appNamespace=team%20a".into(), None)
@@ -1448,6 +1509,38 @@ users:
         assert_eq!(
             req(Action::Rollback { id: 7 }),
             ("POST".into(), "/api/v1/applications/web/rollback".into(), Some(body))
+        );
+    }
+
+    /// Each option of a sync is in its request: the strategy (hook, or apply without hooks),
+    /// prune, dry run and the resources picked; none is sent when not asked.
+    #[test]
+    fn a_sync_request_carries_each_option() {
+        let body = |r: SyncRequest| request(&Action::Sync(r), "argocd", "web").2.unwrap();
+        let plain = body(SyncRequest::default());
+        assert!(plain.get("prune").is_none() && plain.get("dryRun").is_none() && plain.get("resources").is_none());
+        assert_eq!(body(SyncRequest { apply: true, ..Default::default() })["strategy"], json!({"apply": {}}));
+        let all = body(SyncRequest {
+            resources: vec![
+                Res {
+                    group: "apps".into(),
+                    kind: "Deployment".into(),
+                    namespace: "shop".into(),
+                    name: "web".into(),
+                    ..Default::default()
+                },
+                Res { kind: "Namespace".into(), name: "shop".into(), ..Default::default() },
+            ],
+            prune: true,
+            dry_run: true,
+            apply: false,
+            prune_shown: None,
+        });
+        assert_eq!(all["strategy"], json!({"hook": {}}));
+        assert_eq!((all["prune"].clone(), all["dryRun"].clone()), (json!(true), json!(true)));
+        assert_eq!(
+            all["resources"],
+            json!([{"group": "apps", "kind": "Deployment", "namespace": "shop", "name": "web"}, {"kind": "Namespace", "name": "shop"}])
         );
     }
 
@@ -1463,6 +1556,8 @@ users:
         let stream = stream_path();
         assert!(stream.starts_with("/api/v1/stream/applications?fields=result.type,"), "{stream}");
         assert!(stream.contains("result.application.status.sync"), "{stream}");
+        // What the sync journal keeps of an operation comes with it.
+        assert!(stream.contains("result.application.status.operationState.syncResult.resources"), "{stream}");
     }
 
     fn app(name: &str, rv: &str, extra: Value) -> Value {

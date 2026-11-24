@@ -330,7 +330,7 @@ fn confirm_api(
         (_, Some(Err(why))) => return refused(why, window, cx),
         (ArgoAction::Refresh, _) => api::Action::Refresh { hard: false },
         (ArgoAction::HardRefresh, _) => api::Action::Refresh { hard: true },
-        (ArgoAction::Sync, _) => api::Action::Sync,
+        (ArgoAction::Sync, _) => api::Action::Sync(SyncRequest::default()),
         (ArgoAction::Terminate, _) => api::Action::Terminate,
         (ArgoAction::Rollback(_), Some(Ok(Op::Rollback { id: Some(id), .. }))) => api::Action::Rollback { id },
         (ArgoAction::Rollback(_), _) => return refused("that deployment has no id".into(), window, cx),
@@ -356,7 +356,7 @@ fn confirm_api(
     let args = match &call {
         api::Action::Refresh { hard: false } => format!("get {target} --refresh"),
         api::Action::Refresh { hard: true } => format!("get {target} --hard-refresh"),
-        api::Action::Sync => format!("sync {target}"),
+        api::Action::Sync(_) => format!("sync {target}"),
         api::Action::Terminate => format!("terminate-op {target}"),
         api::Action::Rollback { id } => format!("rollback {target} {id}"),
     };
@@ -411,7 +411,7 @@ impl SyncChoice {
         } else {
             offered.iter().zip(&self.picked).filter(|(_, p)| **p).map(|(r, _)| r.clone()).collect()
         };
-        SyncRequest { resources, prune: self.prune, dry_run: self.dry_run, prune_shown: None }
+        SyncRequest { resources, prune: self.prune, dry_run: self.dry_run, ..Default::default() }
     }
 
     /// Resources were offered and none is ticked: there is nothing to sync.

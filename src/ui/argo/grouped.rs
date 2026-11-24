@@ -84,6 +84,23 @@ pub(super) struct GroupedDiff {
 }
 
 impl GroupedDiff {
+    /// The Applications it is of, in order.
+    pub(super) fn keys(&self) -> Vec<Key> {
+        self.picked.iter().map(|(k, _)| k.clone()).collect()
+    }
+
+    /// Its summary in a line (for the sync of the same Applications): how far the reads are,
+    /// else the changes, or that a sync would change nothing.
+    pub(super) fn summary_line(&self) -> Option<String> {
+        let n = self.picked.len();
+        if self.done < n {
+            return Some(format!("Reading what a sync of each would change: {} of {n}…", self.done));
+        }
+        let with_changes =
+            (0..self.results.len()).filter_map(|i| self.diff(i)).filter(|d| !d.diff.groups.is_empty()).count();
+        grouped_diff::summary(&self.groups, with_changes).or_else(|| Some("A sync would change nothing.".into()))
+    }
+
     fn diff(&self, i: usize) -> Option<&Arc<AppDiff>> {
         match self.results.get(i)? {
             Some(Outcome::Diff(d)) => Some(d),
@@ -94,7 +111,7 @@ impl GroupedDiff {
 
 /// Each Application's name as shown: its name, and where it is read when two picked have
 /// the same name.
-fn labels(apps: &[FleetApp]) -> Vec<String> {
+pub(super) fn labels(apps: &[FleetApp]) -> Vec<String> {
     let mut count: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
     for a in apps {
         *count.entry(a.app.name.as_str()).or_default() += 1;
@@ -111,7 +128,7 @@ fn labels(apps: &[FleetApp]) -> Vec<String> {
 }
 
 /// The first few of `names`, then how many more.
-fn some(names: impl Iterator<Item = String>, at_most: usize) -> String {
+pub(super) fn some(names: impl Iterator<Item = String>, at_most: usize) -> String {
     let all: Vec<String> = names.collect();
     let mut out: Vec<String> = all.iter().take(at_most).cloned().collect();
     if all.len() > at_most {
@@ -234,14 +251,15 @@ impl ArgoView {
     }
 
     /// Under the toolbar: pick all filtered, and with Applications picked, how many (and how
-    /// many the filter hides), Clear and Diff selected (the place for Sync selected, next).
+    /// many the filter hides), Clear, Diff selected and Sync selected; a sync still running,
+    /// to show again; the sync journal.
     pub(super) fn selection_bar(&self, cx: &mut Context<Self>) -> Div {
         let (n, hidden) = (self.picked, self.picked_hidden);
         let muted = cx.theme().muted_foreground;
         let pick_group_hint = match self.group_by {
             GroupBy::Parent => "Tick an Application, or its menu's Pick the group.",
             GroupBy::Service => "Tick an Application, or a service's heading for all of it.",
-            GroupBy::None => "Tick the Applications to diff together.",
+            GroupBy::None => "Tick the Applications to diff or sync together.",
         };
         let picked = if hidden > 0 {
             format!("{} picked ({hidden} hidden by the filter)", crate::plural::count(n, "Application"))
@@ -280,7 +298,41 @@ impl ArgoView {
                             .disabled(n == 0)
                             .on_click(cx.listener(|this, _, _, cx| this.diff_selected(false, cx))),
                     )
+                    .child(
+                        Button::new("argo-sync-selected")
+                            .small()
+                            .outline()
+                            .icon(Lucide::GitBranch)
+                            .label("Sync selected…")
+                            .disabled(n == 0)
+                            .on_click(cx.listener(|this, _, window, cx| this.sync_selected(window, cx))),
+                    )
             })
+            .children(self.sync.as_ref().filter(|g| !g.shown && g.running()).map(|g| {
+                Button::new("argo-sync-show")
+                    .small()
+                    .ghost()
+                    .icon(Lucide::LoaderCircle)
+                    .label(g.status())
+                    .on_click(cx.listener(|this, _, _, cx| this.show_sync(cx)))
+            }))
+            .child(div().flex_1())
+            .child(
+                Button::new("argo-journal")
+                    .small()
+                    .ghost()
+                    .icon(Lucide::History)
+                    .label("Sync journal")
+                    .on_click(cx.listener(|this, _, window, cx| this.open_journal(None, window, cx))),
+            )
+    }
+
+    /// Show the sync running again.
+    fn show_sync(&mut self, cx: &mut Context<Self>) {
+        if let Some(g) = &mut self.sync {
+            g.shown = true;
+        }
+        cx.notify();
     }
 
     // MARK: Diff
@@ -389,6 +441,18 @@ impl ArgoView {
         });
     }
 
+    /// Sync the Applications of the diff: the sync of the same ones shows again (with this
+    /// diff's summary), else a new one of the Applications picked.
+    fn sync_these(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let keys = self.grouped.as_ref().map(GroupedDiff::keys);
+        if let Some(g) = self.sync.as_mut().filter(|g| Some(g.keys()) == keys || g.running()) {
+            g.shown = true;
+            cx.notify();
+            return;
+        }
+        self.sync_selected(window, cx);
+    }
+
     /// Back to the list; the reads running are dropped. The picks stay.
     fn close_grouped(&mut self, cx: &mut Context<Self>) {
         self.grouped = None;
@@ -457,6 +521,14 @@ impl ArgoView {
             )
             .child(div().flex_1())
             .when(reading, |h| h.child(div().text_xs().text_color(muted).child(format!("Read {} of {n}…", g.done))))
+            .child(
+                Button::new("argo-grouped-sync")
+                    .small()
+                    .outline()
+                    .icon(Lucide::GitBranch)
+                    .label("Sync these…")
+                    .on_click(cx.listener(|this, _, window, cx| this.sync_these(window, cx))),
+            )
             .child(
                 Button::new("argo-grouped-again")
                     .small()

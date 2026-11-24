@@ -27,6 +27,10 @@ pub struct SyncRequest {
     pub prune: bool,
     /// Argo CD applies nothing and reports what it would do.
     pub dry_run: bool,
+    /// Without hooks: Argo CD's apply strategy, which applies the manifests and skips the
+    /// PreSync, Sync and PostSync hooks (a secret refresh, a migration). Off: the hook
+    /// strategy, Argo CD's default, which runs them.
+    pub apply: bool,
     /// What prune deletes, as shown to whoever confirmed the sync: if git changed since and
     /// it would now delete more, the sync is refused. None when nothing was shown.
     pub prune_shown: Option<Vec<Res>>,
@@ -85,7 +89,7 @@ pub fn reached(all: &[Res], picked: &[Res]) -> Vec<Res> {
 /// what Argo CD's Sync button sends: the whole Application, hooks included.
 pub fn sync_patch(req: &SyncRequest) -> Value {
     let mut sync = Map::new();
-    sync.insert("syncStrategy".into(), json!({"hook": {}}));
+    sync.insert("syncStrategy".into(), strategy(req));
     if req.prune {
         sync.insert("prune".into(), json!(true));
     }
@@ -99,8 +103,13 @@ pub fn sync_patch(req: &SyncRequest) -> Value {
     json!({"operation": {"initiatedBy": {"username": INITIATED_BY}, "sync": sync}})
 }
 
+/// The sync strategy of `req`: `{"apply": {}}` without hooks, else `{"hook": {}}`.
+pub fn strategy(req: &SyncRequest) -> Value {
+    if req.apply { json!({"apply": {}}) } else { json!({"hook": {}}) }
+}
+
 /// A resource as `operation.sync.resources` names it (group and namespace left out when empty).
-fn resource_entry(r: &Res) -> Value {
+pub fn resource_entry(r: &Res) -> Value {
     let mut e = Map::new();
     if !r.group.is_empty() {
         e.insert("group".into(), json!(r.group));
@@ -286,6 +295,11 @@ pub fn started(app: &Value, op: &Op, name: &str) -> String {
         Op::Terminate => return format!("Terminating the operation of Application {name}"),
     };
     let mut s = format!("{what} of Application {name} started");
+    if let Op::Sync(req) = op
+        && req.apply
+    {
+        s.push_str(" (without hooks)");
+    }
     if op.dry_run() {
         s.push_str(" (dry run: nothing is applied)");
     }
@@ -388,6 +402,7 @@ mod tests {
             resources: vec![Res { group: "apps".into(), ..res("Deployment", "web") }, res("ConfigMap", "old")],
             prune: true,
             dry_run: true,
+            apply: false,
             prune_shown: None,
         };
         let p = patch(&app(), &Op::Sync(req)).unwrap();
@@ -403,6 +418,15 @@ mod tests {
         );
         // Guarded by the version read: a change meanwhile makes the API server refuse it.
         assert_eq!(p["metadata"]["resourceVersion"], "42");
+    }
+
+    #[test]
+    fn a_sync_without_hooks_is_the_apply_strategy() {
+        let req = SyncRequest { apply: true, ..Default::default() };
+        let p = sync_patch(&req);
+        assert_eq!(p["operation"]["sync"]["syncStrategy"], json!({"apply": {}}));
+        assert!(started(&app(), &Op::Sync(req), "web").contains("without hooks"));
+        assert_eq!(sync_patch(&SyncRequest::default())["operation"]["sync"]["syncStrategy"], json!({"hook": {}}));
     }
 
     #[test]
@@ -581,7 +605,7 @@ mod tests {
                 prop_assert!(picked.is_empty() || picked.iter().any(|p| p.same(g)));
                 prop_assert!(g.name == "old" || g.name == "gone");
             }
-            let req = SyncRequest { resources: picked.clone(), prune: true, dry_run: false, prune_shown: Some(gone) };
+            let req = SyncRequest { resources: picked.clone(), prune: true, prune_shown: Some(gone), ..Default::default() };
             let p = patch(&a, &Op::Sync(req)).unwrap();
             let sent = p["operation"]["sync"]["resources"].as_array().map_or(0, Vec::len);
             prop_assert_eq!(sent, picked.len());
