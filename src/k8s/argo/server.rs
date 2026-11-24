@@ -106,6 +106,24 @@ pub fn server_of(context: &str) -> Option<Result<Server, String>> {
     (!text.trim().is_empty()).then(|| Server::parse(&text))
 }
 
+/// The hub contexts whose Argo CD server (`servers`: `argocd_servers`) is the one at `base`.
+pub fn contexts_of<'a>(servers: &'a BTreeMap<String, String>, base: &'a str) -> impl Iterator<Item = &'a str> {
+    servers.iter().filter(move |(_, text)| Server::parse(text).is_ok_and(|s| s.base == base)).map(|(c, _)| c.as_str())
+}
+
+/// The context whose read-only setting refuses a write sent to the Argo CD server at `base`
+/// (named `name`), if one does: a hub context tied to that server in `servers`, else the
+/// server's name, as its protection is keyed. The hub's setting counts, not the
+/// Application's destination cluster's.
+pub fn read_only_context(
+    servers: &BTreeMap<String, String>,
+    base: &str,
+    name: &str,
+    is_read_only: impl Fn(&str) -> bool,
+) -> Option<String> {
+    contexts_of(servers, base).chain(std::iter::once(name)).find(|c| is_read_only(c)).map(str::to_string)
+}
+
 // MARK: Login
 
 /// What the request logs in with.
@@ -531,11 +549,35 @@ pub async fn git_diff(context: String, namespace: String, name: String) -> Resul
 
 #[cfg(test)]
 mod tests {
-    use super::{Change, Login, Server, cli_token, diffs, expired, managed_resources_url, scrub};
+    use super::{Change, Login, Server, cli_token, diffs, expired, managed_resources_url, read_only_context, scrub};
     use crate::history::DiffLine;
     use base64::Engine as _;
     use proptest::prelude::*;
     use serde_json::{Value, json};
+
+    /// A write sent by Argo CD's API is refused when a hub context tied to that server is
+    /// read-only, though the server's name isn't a context: the API is the hub's Argo CD.
+    #[test]
+    fn a_read_only_hub_refuses_its_servers_writes() {
+        let servers: std::collections::BTreeMap<String, String> = [
+            ("hub".to_string(), "https://ArgoCD.example.com/".to_string()),
+            ("other-hub".to_string(), "other.example.com".to_string()),
+            ("broken".to_string(), "ftp://x".to_string()),
+        ]
+        .into();
+        let base = Server::parse("argocd.example.com").unwrap().base;
+        let check =
+            |base: &str, name: &str, set: &[&str]| read_only_context(&servers, base, name, |c| set.contains(&c));
+        let name = "argocd.example.com";
+        assert_eq!(check(&base, name, &["hub"]), Some("hub".to_string()));
+        // Another hub's setting, or none: writable.
+        assert_eq!(check(&base, name, &["other-hub"]), None);
+        assert_eq!(check(&base, name, &[]), None);
+        // A server tied to no hub: its own name decides.
+        assert_eq!(check(&base, name, &[name]), Some(name.to_string()));
+        let unmapped = Server::parse("third.example.com").unwrap().base;
+        assert_eq!(check(&unmapped, "third.example.com", &["hub"]), None);
+    }
 
     #[test]
     fn a_server_reads_as_its_https_base() {

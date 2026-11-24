@@ -882,8 +882,8 @@ impl SettingsView {
         v_flex()
             .child(div().pb_2().text_sm().text_color(muted).child(
                 "Color a context to recognise it at a glance. Protected contexts ask you to type their name (or to wait, see General → Confirming) before any write. \
-                 Read-only contexts take no write, shell or writing plugin from this window, even with write mode on, and agents can't \
-                 write to them whatever their rules say. \
+                 Read-only contexts take no write, shell, kubectl terminal or writing plugin from this window, even with write mode on, \
+                 and agents can't write to them whatever their rules say. For Argo CD, the hub's setting counts, not the destination's. \
                  Run as: an identity you may impersonate (`kubectl --as`); write confirmations then offer to run that one \
                  action as it, off each time. Never for agents. Argo CD: the contexts Argo CD's Applications are read from; none \
                  ticked, they are found on their own (a context whose login may prompt is only asked once ticked). \

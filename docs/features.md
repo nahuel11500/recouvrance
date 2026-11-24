@@ -647,7 +647,10 @@
 - **Read-only contexts** (Settings → Contexts → *Read-only*): the window never writes to them, even
   with write mode on. Their writes, shells, attach, Helm changes, Argo CD actions and writing
   plugins are refused when sent ("prod-eu is read-only"), and a bulk action on checked rows that
-  include one does nothing and says so. Reads, logs, port-forwards and dry runs still work. Agents
+  include one does nothing and says so. The local kubectl terminal doesn't open on them (its
+  kubectl could write). Reads, logs, port-forwards and dry runs still work. For Argo CD, the
+  hub's setting decides (or the API server's name, when no hub is tied to it), not that of the
+  cluster an Application deploys to: a sync from a writable hub still deploys there. Agents
   can't write to them either, whatever their rules say: the refusal is final, and `check_access`
   and the Agents page's test say so. The context picker marks them `read-only`.
 - **Diagnosis** on pods and workloads: why it is broken (crash output and exit code, scheduling,

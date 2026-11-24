@@ -911,6 +911,36 @@ pub fn set_read_only(context: &str, on: bool) {
     });
 }
 
+/// Follow the read-only choices in settings.json, for `recouvrance serve`: it has no window
+/// to change them, and the app (or a hand edit) changes the file while it runs. Checked every
+/// two seconds, only when the file changed. Nothing is saved.
+pub fn watch_read_only() {
+    let _ = std::thread::spawn(|| {
+        let mut seen = None;
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            let p = path();
+            let modified = std::fs::metadata(&p).and_then(|m| m.modified()).ok();
+            if modified.is_none() || modified == seen {
+                continue;
+            }
+            // A file that can't be read now keeps the choices as they are.
+            if let Ok(bytes) = std::fs::read(&p) {
+                read_only_from(&mut SETTINGS.write().unwrap(), &bytes);
+                seen = modified;
+            }
+        }
+    });
+}
+
+/// Take the read-only choices from the settings file's bytes. Choices that don't read make
+/// every context without one read-only, as when the file is loaded.
+fn read_only_from(s: &mut Settings, bytes: &[u8]) {
+    let (disk, _, _) = from_bytes(bytes);
+    s.read_only = disk.read_only;
+    s.read_only_unset = disk.read_only_unset;
+}
+
 /// Turn the old fixed list into per-context choices, once.
 fn migrate_protection() {
     if with(|s| s.protected_contexts.is_none()) {
@@ -1401,6 +1431,20 @@ mod tests {
         assert!(ro(&set, "other", true) && !ro(&set, "dev", true));
         assert!(super::from_bytes(br#"{"read_only_unset": "x"}"#).0.read_only_unset);
         assert!(!serde_json::to_string(&Settings::default()).unwrap().contains("read_only_unset"));
+    }
+
+    /// `serve` follows the file: a context made read-only there is read-only here, the other
+    /// settings are left alone, and choices that no longer read make every context read-only.
+    #[test]
+    fn read_only_choices_follow_the_file() {
+        let mut s = Settings { metrics_refresh: 9, ..Settings::default() };
+        super::read_only_from(&mut s, br#"{"read_only": {"prod": true}, "metrics_refresh": 3}"#);
+        assert!(super::read_only_in(&s, "prod", false) && !super::read_only_in(&s, "dev", false));
+        assert_eq!(s.metrics_refresh, 9);
+        super::read_only_from(&mut s, br#"{"read_only": {}}"#);
+        assert!(!super::read_only_in(&s, "prod", false));
+        super::read_only_from(&mut s, br#"{"read_only": {"prod": fal"#);
+        assert!(super::read_only_in(&s, "dev", false));
     }
 
     /// What's new is for updates: a new install has seen the version it starts with, a file

@@ -484,6 +484,10 @@ impl AppView {
     /// A local shell with kubectl set to the current context and namespace.
     pub(super) fn open_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some((context, client)) = self.clusters.first().cloned() else { return };
+        // Its kubectl runs outside the window's clients, so their gate can't stop its writes.
+        if !crate::details::not_read_only(&context, window, cx) {
+            return;
+        }
         let ns = self.namespace.clone();
         let term = if let Some(t) = self.terminals.get(&context) {
             t.clone()

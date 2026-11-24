@@ -176,6 +176,13 @@ impl TerminalView {
                 this.connect(window, cx);
             }
         };
+        // The local kubectl shell runs outside the window's clients, so their gate can't stop
+        // its writes: none on a read-only context. A plugin's command was checked when asked.
+        if let Some((context, _)) = self.local.clone().filter(|_| self.command.is_none())
+            && !crate::details::not_read_only(&context, window, cx)
+        {
+            return;
+        }
         let Some(context) = self.guard.clone() else {
             return start(self, window, cx);
         };

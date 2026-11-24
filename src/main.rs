@@ -127,6 +127,8 @@ fn serve() {
         eprintln!("rules.yaml: {e:#}");
     }
     hub.watch_rules_file();
+    // No window here: a context made read-only in the app, or by hand, counts within seconds.
+    settings::watch_read_only();
     let mut events = hub.subscribe();
     let _server = mcp::server::start(hub.clone());
     eprintln!("Recouvrance MCP on http://127.0.0.1:{}/mcp", hub.port());
