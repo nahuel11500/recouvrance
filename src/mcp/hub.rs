@@ -786,7 +786,7 @@ impl Hub {
 
     /// The add-on API groups `context`'s last discovery couldn't read (none before one ran).
     pub fn skipped_groups(&self, context: &str) -> Vec<k8s::SkippedGroup> {
-        self.cluster(context).map(|c| lock(&c.skipped).clone()).unwrap_or_default()
+        self.cluster(context).map_or_default(|c| lock(&c.skipped).clone())
     }
 
     /// Whether the context is connected for agents and its kinds discovered: getting its
