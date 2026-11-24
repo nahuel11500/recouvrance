@@ -95,7 +95,7 @@ impl AppView {
 
     /// Open an object on a context, connected or not (an Argo CD Application on Argo CD's
     /// own cluster): a connected one's page uses its client like any other.
-    fn show_detail_on(
+    pub(super) fn show_detail_on(
         &mut self,
         context: String,
         client: kube::Client,

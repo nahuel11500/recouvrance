@@ -246,7 +246,8 @@
   namespace), auto-sync, last sync and its result. Applications sit under the app of apps that
   made them (its tracking id, the parent listing them among its resources, or the instance
   label), with how many they hold and how many of those are red; groups fold. Filters: out of
-  sync, Degraded, failed sync (any of those picked), project, destination context, and a search.
+  sync, Degraded, failed sync (any of those picked), favorites, project, destination context, and
+  a search. The star on a row makes the Application a favorite: trees holding one come first.
   Red is for a failed sync, an error Argo CD reports or Degraded health: an Application with
   auto-sync off that is out of sync (a `*-workload` one synced by hand) is not red. A click opens
   the Application's page, which links to its destination namespace (connecting to that context
@@ -341,7 +342,25 @@
   tarball or source build, with its path) and how to update it, with the command to copy.
   *Check for updates* there asks GitHub for the latest release, only when clicked, and says
   whether it is newer.
-- **Favorites** and **saved views** (type + namespaces + filter, bookmark button), back/forward history, light and dark themes
+- **Favorites**: star contexts (in the context picker), namespaces (in the namespace picker),
+  Argo CD Applications (on each row of the Argo CD page and on an Application's page), objects
+  (on a detail page, or *Add to favorites* in a row's menu) and resource types (in the sidebar).
+  `*` (outside text fields), or *Add to or remove from favorites* in the palette, stars or unstars
+  what is shown: the object or Application of a detail page, else the selected row of a list,
+  else the one namespace picked. Favorites come first where they are picked: the context picker
+  lists favorite contexts first; the namespace picker lists first the favorite namespaces of the
+  contexts connected (of each of them when several are combined; the star then marks the
+  namespace on each); the Argo CD page sorts the trees holding a favorite first and its
+  *Favorites* toggle keeps only them. The sidebar's *Favorites* section lists them all, on any
+  context, and so does the palette (type `favorite` to list them): a click opens a context alone,
+  picks a namespace, or opens an object's or Application's page. One on a context that isn't
+  connected connects that context first (an Application opens on Argo CD's cluster without
+  replacing the contexts connected); one whose target is gone says so (a context no longer in the
+  kubeconfig, a namespace its context doesn't have, a type the cluster doesn't serve) and an object
+  deleted since shows its page's *deleted* state. An Application is the same favorite whichever
+  source shows it: it is keyed by its Argo CD instance, namespace and name (see
+  [configuration](configuration.md#favoritesjson)). Kept in `favorites.json`.
+- **Saved views** (type + namespaces + filter, bookmark button), back/forward history, light and dark themes
   whose status colors, badges and status buttons read at WCAG AA contrast (4.5:1) on what they are drawn on.
 - **Instant back**: the last 8 lists (up to 10,000 rows in all) are kept, so going back to one
   shows it at once, marked "Updating…", while a fresh list loads and replaces it in one go.
@@ -461,11 +480,12 @@ list them; the palette, that list and this table are all made from one list of c
 | g then h | g then h | Helm releases | Outside text fields |
 | g then i | g then i | Assistant: ask your clusters | Outside text fields |
 | g then s | g then s | Settings | Outside text fields |
+| * | * | Add to or remove from favorites: the object or Application shown, the selected row, else the one namespace picked | Outside text fields |
 | Ctrl+J | ⌘J | Assistant beside the page: it is told what is on screen | Anywhere |
 | Ctrl+Shift+V | ⌘V | Paste in a shell | In a shell |
 | Double-click a context | Double-click a context | Connect to just that context | On the Contexts page |
 
-Single keys (?, g, j, k) work when no text field or terminal has focus.
+Single keys (?, *, g, j, k) work when no text field or terminal has focus.
 
 On macOS, ⌘ takes Ctrl's place, so Ctrl keys reach the shell in a terminal (Ctrl+Tab still
 switches tabs), and the menu bar has the keys every Mac app has: ⌘, opens Settings, ⌘Q quits, ⌘W

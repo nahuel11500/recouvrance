@@ -10,7 +10,7 @@ use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenu, PopupMenuItem};
-use gpui_kit::component::{ActiveTheme as _, Disableable as _, Sizable as _, h_flex, v_flex};
+use gpui_kit::component::{ActiveTheme as _, Disableable as _, Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use kube::Client;
@@ -119,6 +119,20 @@ pub fn shown_rows(
     out
 }
 
+/// `shown` (see `shown_rows`) with the trees holding a favorite first: each top-level
+/// Application moves with all shown under it, and the trees keep their order otherwise.
+pub fn favorites_first(shown: Vec<Shown>, is_favorite: impl Fn(usize) -> bool) -> Vec<Shown> {
+    let mut trees: Vec<Vec<Shown>> = Vec::new();
+    for s in shown {
+        match trees.last_mut() {
+            Some(tree) if s.depth > 0 => tree.push(s),
+            _ => trees.push(vec![s]),
+        }
+    }
+    let trees = crate::favorites::favorites_first(trees, |t| t.iter().any(|s| is_favorite(s.ix)));
+    trees.into_iter().flatten().collect()
+}
+
 // MARK: Filters
 
 /// What the page keeps: an Application in any of the states picked (none picked: all), in
@@ -128,6 +142,8 @@ pub struct Filter {
     pub out_of_sync: bool,
     pub degraded: bool,
     pub failed: bool,
+    /// Only the favorites (see `crate::favorites::FavApp`).
+    pub favorites: bool,
     pub project: Option<String>,
     pub destination: Option<String>,
     /// In lowercase.
@@ -136,14 +152,15 @@ pub struct Filter {
 
 impl Filter {
     /// Whether it keeps `app`, shown on `destination` (see `destination_key`), whose
-    /// searchable text in lowercase is `search`.
-    pub fn keeps(&self, app: &Summary, destination: &str, search: &str) -> bool {
+    /// searchable text in lowercase is `search`, a favorite or not.
+    pub fn keeps(&self, app: &Summary, destination: &str, search: &str, favorite: bool) -> bool {
         let any_state = self.out_of_sync || self.degraded || self.failed;
         let state = !any_state
             || (self.out_of_sync && app.sync == "OutOfSync")
             || (self.degraded && app.health == "Degraded")
             || (self.failed && argo::sync_failed(app));
         state
+            && (favorite || !self.favorites)
             && self.project.as_ref().is_none_or(|p| *p == app.project)
             && self.destination.as_ref().is_none_or(|d| d == destination)
             && search.contains(&self.query)
@@ -176,6 +193,21 @@ type Key = (String, String, String);
 
 fn key(a: &FleetApp) -> Key {
     (a.hub.context.clone(), a.app.namespace.clone(), a.app.name.clone())
+}
+
+/// Whether `a` is a favorite: by the names its Argo CD instance is known by (here its hub
+/// context; see `crate::favorites::FavApp`), its namespace and name.
+fn is_favorite(favorites: &crate::favorites::Favorites, a: &FleetApp) -> bool {
+    favorites.has_app(&[a.hub.context.as_str()], &a.app.namespace, &a.app.name)
+}
+
+/// The favorite to star or unstar for `a`.
+fn favorite(a: &FleetApp) -> crate::favorites::Favorite {
+    crate::favorites::Favorite::Application(crate::favorites::FavApp {
+        argocd: a.hub.context.clone(),
+        namespace: a.app.namespace.clone(),
+        name: a.app.name.clone(),
+    })
 }
 
 // MARK: Rows
@@ -253,6 +285,10 @@ pub struct ArgoView {
     shown: Vec<Shown>,
     /// How many Applications the filter keeps.
     kept: usize,
+    favorites: Entity<crate::favorites::Favorites>,
+    /// Which Applications (by index in the read shown) are favorites, and how many.
+    starred: Vec<bool>,
+    starred_count: usize,
     /// Reads while the page is shown.
     _poll: Task<()>,
     /// A read right after a write.
@@ -269,15 +305,27 @@ impl EventEmitter<OpenOnContext> for ArgoView {}
 impl EventEmitter<OpenOn> for ArgoView {}
 
 impl ArgoView {
-    pub fn new(clusters: Vec<(String, Client)>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        clusters: Vec<(String, Client)>,
+        favorites: Entity<crate::favorites::Favorites>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let search = cx.new(|cx| InputState::new(window, cx).placeholder("Search Applications…"));
-        let subs = vec![cx.subscribe(&search, |this, state, ev: &InputEvent, cx| {
-            if matches!(ev, InputEvent::Change) {
-                this.filter.query = state.read(cx).value().to_lowercase();
-                this.refilter();
+        let subs = vec![
+            cx.subscribe(&search, |this, state, ev: &InputEvent, cx| {
+                if matches!(ev, InputEvent::Change) {
+                    this.filter.query = state.read(cx).value().to_lowercase();
+                    this.refilter(cx);
+                    cx.notify();
+                }
+            }),
+            // A star put here, on an Application's page or in the sidebar.
+            cx.observe(&favorites, |this, _, cx| {
+                this.refilter(cx);
                 cx.notify();
-            }
-        })];
+            }),
+        ];
         let poll = {
             let clusters = clusters.clone();
             cx.spawn(async move |this, cx| {
@@ -304,6 +352,9 @@ impl ArgoView {
             collapsed: HashSet::new(),
             shown: Vec::new(),
             kept: 0,
+            favorites,
+            starred: Vec::new(),
+            starred_count: 0,
             _poll: poll,
             after_write: Default::default(),
             checking: None,
@@ -320,7 +371,7 @@ impl ArgoView {
         }
         self.started = Some(started);
         self.rows = Some(rows);
-        self.refilter();
+        self.refilter(cx);
         cx.notify();
     }
 
@@ -416,26 +467,33 @@ impl ArgoView {
             .into_any_element()
     }
 
-    fn refilter(&mut self) {
+    fn refilter(&mut self, cx: &App) {
         let Some(rows) = &self.rows else {
             self.shown.clear();
             self.kept = 0;
+            self.starred.clear();
+            self.starred_count = 0;
             return;
         };
         let apps = &rows.fleet.apps;
+        let favorites = self.favorites.read(cx);
+        self.starred = apps.iter().map(|a| is_favorite(favorites, a)).collect();
+        self.starred_count = self.starred.iter().filter(|s| **s).count();
         let keeps: Vec<bool> = apps
             .iter()
             .enumerate()
-            .map(|(i, a)| self.filter.keeps(&a.app, destination_key(a), &rows.search[i]))
+            .map(|(i, a)| self.filter.keeps(&a.app, destination_key(a), &rows.search[i], self.starred[i]))
             .collect();
         self.kept = keeps.iter().filter(|k| **k).count();
         let collapsed = &self.collapsed;
-        self.shown = shown_rows(&rows.order, &rows.parents, &keeps, |i| collapsed.contains(&key(&apps[i])));
+        let shown = shown_rows(&rows.order, &rows.parents, &keeps, |i| collapsed.contains(&key(&apps[i])));
+        let starred = &self.starred;
+        self.shown = favorites_first(shown, |i| starred[i]);
     }
 
     fn change_filter(&mut self, change: impl FnOnce(&mut Filter), cx: &mut Context<Self>) {
         change(&mut self.filter);
-        self.refilter();
+        self.refilter(cx);
         cx.notify();
     }
 
@@ -443,8 +501,15 @@ impl ArgoView {
         if !self.collapsed.remove(&k) {
             self.collapsed.insert(k);
         }
-        self.refilter();
+        self.refilter(cx);
         cx.notify();
+    }
+
+    /// Star or unstar the Application (kept in favorites.json; the page sorts again when the
+    /// favorites change).
+    fn toggle_favorite(&mut self, k: &Key, cx: &mut Context<Self>) {
+        let Some(f) = self.find(k).map(favorite) else { return };
+        self.favorites.update(cx, |favs, cx| favs.toggle(f, cx));
     }
 
     /// Fold every app of apps, or unfold them all.
@@ -457,7 +522,7 @@ impl ArgoView {
         } else {
             self.collapsed.clear();
         }
-        self.refilter();
+        self.refilter(cx);
         cx.notify();
     }
 
@@ -514,6 +579,26 @@ impl ArgoView {
         let indent = INDENT * s.depth.min(8) as f32;
         let grouped = rows.children[s.ix] > 0;
         let collapsed = self.collapsed.contains(&k);
+        let starred = self.starred.get(s.ix).copied().unwrap_or_default();
+        let star = {
+            let (view, k) = (view.clone(), k.clone());
+            div()
+                .id(("argo-star", i))
+                .flex_none()
+                .cursor_pointer()
+                .when(!starred, |d| {
+                    d.opacity(0.).group_hover(SharedString::from(format!("argo-row-{i}")), |s| s.opacity(0.5))
+                })
+                .on_click(move |_, _, cx| {
+                    cx.stop_propagation();
+                    let _ = view.update(cx, |this, cx| this.toggle_favorite(&k, cx));
+                })
+                .child(if starred {
+                    Icon::new(component::IconName::StarFill).size_3p5().text_color(yellow())
+                } else {
+                    Icon::new(Lucide::Star).size_3p5()
+                })
+        };
         let toggle = {
             let (view, k) = (view.clone(), k.clone());
             Button::new(("argo-group", i))
@@ -567,7 +652,8 @@ impl ArgoView {
                     .when(rows.failing[s.ix] > 0, |d| {
                         let n = rows.failing[s.ix];
                         d.child(div().flex_none().text_xs().text_color(theme.danger).child(format!("{n} red")))
-                    }),
+                    })
+                    .child(star),
             )
             .child(column(130., true).text_color(muted).child(app.project.clone()))
             .child(
@@ -592,6 +678,7 @@ impl ArgoView {
             .when(self.several_hubs(), |d| d.child(column(150., true).text_color(muted).child(a.hub.context.clone())));
         h_flex()
             .id(("argo-row", i))
+            .group(SharedString::from(format!("argo-row-{i}")))
             .w_full()
             .gap_1()
             .px_2()
@@ -661,6 +748,9 @@ impl ArgoView {
             }))
             .child(toggle("argo-degraded", "Degraded", degraded, self.filter.degraded, |f| f.degraded = !f.degraded))
             .child(toggle("argo-failed", "Failed sync", failed, self.filter.failed, |f| f.failed = !f.failed))
+            .child(toggle("argo-favorites", "Favorites", self.starred_count, self.filter.favorites, |f| {
+                f.favorites = !f.favorites;
+            }))
             .child(picker(
                 "argo-project",
                 "All projects",
@@ -852,7 +942,7 @@ impl Render for ArgoView {
 #[cfg(test)]
 mod tests {
     // Not `super::*`: gpui's own `test` attribute would shadow the standard one.
-    use super::{Filter, Shown, ancestors, shown_rows, tree_order};
+    use super::{Filter, Shown, ancestors, favorites_first, shown_rows, tree_order};
     use crate::k8s::argo::Summary;
 
     fn by_index(a: usize, b: usize) -> std::cmp::Ordering {
@@ -914,7 +1004,7 @@ mod tests {
         let degraded = app("Synced", "Degraded", None, "shop");
         let failed = app("Synced", "Healthy", Some("Failed"), "data");
         let fine = app("Synced", "Healthy", Some("Succeeded"), "data");
-        let keeps = |f: &Filter, a: &Summary| f.keeps(a, "prod", "web shop prod");
+        let keeps = |f: &Filter, a: &Summary| f.keeps(a, "prod", "web shop prod", false);
         assert!([&out_of_sync, &degraded, &failed, &fine].iter().all(|a| keeps(&Filter::default(), a)));
         let problems = Filter { out_of_sync: true, failed: true, ..Default::default() };
         assert!(keeps(&problems, &out_of_sync) && keeps(&problems, &failed));
@@ -925,13 +1015,32 @@ mod tests {
         assert!(!keeps(&elsewhere, &fine));
         let search = |q: &str| Filter { query: q.into(), ..Default::default() };
         assert!(keeps(&search("shop"), &fine) && !keeps(&search("billing"), &fine));
+        // Favorites only: the others go, whatever else is picked.
+        let favorites = Filter { favorites: true, ..Default::default() };
+        assert!(favorites.keeps(&fine, "prod", "web", true));
+        assert!(!favorites.keeps(&fine, "prod", "web", false));
+        assert!(Filter::default().keeps(&fine, "prod", "web", false));
+    }
+
+    /// A favorite's whole tree comes first, its app of apps above it; the others follow in
+    /// their order.
+    #[test]
+    fn favorites_and_their_trees_come_first() {
+        // 0 made 1 and 2; 3 alone; 4 made 5.
+        let parents = [None, Some(0), Some(0), None, None, Some(4)];
+        let order = tree_order(&parents, by_index);
+        let shown = shown_rows(&order, &parents, &[true; 6], |_| false);
+        let ix = |s: Vec<Shown>| s.into_iter().map(|s| s.ix).collect::<Vec<_>>();
+        assert_eq!(ix(favorites_first(shown.clone(), |i| i == 5)), [4, 5, 0, 1, 2, 3]);
+        assert_eq!(ix(favorites_first(shown.clone(), |i| i == 3 || i == 1)), [0, 1, 2, 3, 4, 5]);
+        assert_eq!(ix(favorites_first(shown.clone(), |_| false)), [0, 1, 2, 3, 4, 5]);
     }
 }
 
 /// Rules that hold for any parents, however tangled.
 #[cfg(test)]
 mod properties {
-    use super::{shown_rows, tree_order};
+    use super::{favorites_first, shown_rows, tree_order};
     use proptest::prelude::*;
 
     proptest! {
@@ -950,6 +1059,41 @@ mod properties {
             let all = vec![true; parents.len()];
             let shown: Vec<usize> = shown_rows(&order, &parents, &all, |_| false).into_iter().map(|s| s.ix).collect();
             prop_assert_eq!(shown, order.iter().map(|(i, _)| *i).collect::<Vec<_>>());
+        }
+
+        /// Favorites first moves whole trees: every row stays once, under the same Application,
+        /// and the trees with a favorite come before the others.
+        #[test]
+        fn favorites_first_keeps_every_tree_whole(
+            parents in proptest::collection::vec(proptest::option::of(0usize..12), 0..12),
+            favs in proptest::collection::btree_set(0usize..12, 0..4),
+        ) {
+            let order = tree_order(&parents, |a, b| a.cmp(&b));
+            let shown = shown_rows(&order, &parents, &vec![true; parents.len()], |_| false);
+            let moved = favorites_first(shown.clone(), |i| favs.contains(&i));
+            let mut a: Vec<usize> = shown.iter().map(|s| s.ix).collect();
+            let mut b: Vec<usize> = moved.iter().map(|s| s.ix).collect();
+            a.sort_unstable();
+            b.sort_unstable();
+            prop_assert_eq!(a, b);
+            // Each row still follows the row it followed, except at the top of a tree.
+            for pair in moved.windows(2) {
+                prop_assert!(pair[1].depth <= pair[0].depth + 1);
+            }
+            let trees: Vec<bool> = {
+                let mut out: Vec<bool> = Vec::new();
+                for s in &moved {
+                    let fav = favs.contains(&s.ix);
+                    if s.depth == 0 || out.is_empty() {
+                        out.push(fav);
+                    } else if fav {
+                        *out.last_mut().unwrap() = true;
+                    }
+                }
+                out
+            };
+            let n = trees.iter().take_while(|t| **t).count();
+            prop_assert!(trees[n..].iter().all(|t| !t));
         }
     }
 }

@@ -15,7 +15,7 @@ Recouvrance reads your kubeconfig like `kubectl` does and keeps its own settings
 | `~/.config/recouvrance/plugins.yaml` | Your commands on resources |
 | `~/.config/recouvrance/kubeconfigs/*.yaml` | Kubeconfigs pasted in Settings (mode 0600) |
 | `~/.config/recouvrance/templates/*.yaml` | Your templates for **Create / apply** |
-| `~/.config/recouvrance/favorites.json`, `columns.json`, `custom-columns.json`, `column-widths.json` | Favorites, saved views, column choices and widths |
+| `~/.config/recouvrance/favorites.json`, `columns.json`, `custom-columns.json`, `column-widths.json` | Favorites and saved views (see [favorites.json](#favoritesjson)), column choices and widths |
 | `~/.config/recouvrance/theme`, `zoom` | Light or dark choice (absent: follow the desktop), UI zoom (0.7 to 2.0) |
 | `~/.config/recouvrance/anthropic-key` | The assistant's Anthropic API key, when saved in Settings (mode 0600; `ANTHROPIC_API_KEY` is used otherwise) |
 | `~/.config/recouvrance/argocd-tokens.json` | Read-only Argo CD API tokens set in Settings → Per cluster, by context (mode 0600; see [Argo CD's diff](#argo-cds-diff-argocd_servers)) |
@@ -218,6 +218,44 @@ to that server only, and only on that click. It logs in with, in this order:
 
 Errors never show the token. Secret values are masked by Recouvrance itself, whatever Argo CD
 sends (its own masking leaked predicted Secret states before 3.2.12, 3.3.10 and 3.4.2).
+
+## favorites.json
+
+Every favorite and saved view, in one file the app writes when a star changes:
+
+```json
+{
+  "contexts": ["prod"],
+  "namespaces": [{"context": "prod", "namespace": "shop"}],
+  "applications": [{"argocd": "hub", "namespace": "argocd", "name": "shop-prod"}],
+  "objects": [{"context": "prod", "kind": "deployments.apps", "namespace": "shop", "name": "api"}],
+  "kinds": ["pods", "certificates.cert-manager.io"],
+  "views": [{"name": "Shop pods", "kind": "pods", "namespaces": ["shop"], "filter": "!Running"}]
+}
+```
+
+| Key | Keyed by | What |
+|---|---|---|
+| `contexts` | context name | Favorite contexts, first in the context picker |
+| `namespaces` | context + namespace | Favorite namespaces, first in the namespace picker while their context is connected |
+| `applications` | Argo CD instance + namespace + name | Favorite Argo CD Applications |
+| `objects` | context + kind (kubectl name, `plural.group`) + namespace (`null` for cluster-scoped) + name | Favorite objects |
+| `kinds` | kubectl name | Starred resource types in the sidebar |
+| `views` | name | Saved table views |
+
+An Application's `argocd` is the Argo CD instance it belongs to, named by the kubeconfig context
+Argo CD runs on (its hub, the context its page opens on). A source that reads Argo CD through its
+API names the instance by its server address when it doesn't know that context, and matches a
+favorite on either name when it knows both, so a star holds whichever source shows the
+Application. An Application starred from a table of Applications or its page is kept here, not
+under `objects`.
+
+Loading keeps every entry that reads and drops the others, one by one: an entry of the wrong
+shape, with a field missing or empty, or a list that isn't one costs only itself; keys the app
+doesn't know are ignored; an entry listed twice is kept once (a view, by its first name). Only a
+file that isn't a JSON object is kept aside as `favorites.json.bad-<time>`, and the app starts
+with no favorites. A favorite whose context is gone from the kubeconfig stays in the file and the
+sidebar says so; remove it there with its cross.
 
 ## rules.yaml
 

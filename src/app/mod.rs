@@ -37,6 +37,7 @@ mod menus;
 mod navigation;
 mod overviews;
 mod pages;
+mod pinned;
 mod problem_badge;
 mod render;
 mod search_index;
@@ -309,7 +310,8 @@ gpui_kit::actions!(
         OpenHelmInstall,
         OpenApiRequests,
         ToggleWriteMode,
-        ToggleTheme
+        ToggleTheme,
+        ToggleFavorite
     ]
 );
 
@@ -377,6 +379,7 @@ fn key_bindings_on(mac: bool) -> Vec<KeyBinding> {
         KeyBinding::new("g h", GoHelm, Some(shortcuts::OUTSIDE_TEXT)),
         KeyBinding::new("g i", GoAssistant, Some(shortcuts::OUTSIDE_TEXT)),
         KeyBinding::new("g s", GoSettings, Some(shortcuts::OUTSIDE_TEXT)),
+        KeyBinding::new("*", ToggleFavorite, Some(shortcuts::OUTSIDE_TEXT)),
         KeyBinding::new("j", base::actions::SelectDown, Some(shortcuts::TABLE_OUTSIDE_TEXT)),
         KeyBinding::new("k", base::actions::SelectUp, Some(shortcuts::TABLE_OUTSIDE_TEXT)),
     ]);
@@ -439,6 +442,9 @@ pub struct AppView {
     /// Opening an object on a context that isn't connected, or whose kind is looked up there
     /// (where an Argo CD Application deploys, and what it deploys there).
     context_open: crate::latest::Latest,
+    /// A favorite to open once the connect under way is done (it is on a context that wasn't
+    /// connected); any other connect drops it.
+    after_connect: Option<crate::favorites::Favorite>,
     /// Selected namespaces; empty means all.
     namespaces: Vec<String>,
     filter: Entity<InputState>,
@@ -506,8 +512,9 @@ impl AppView {
             Ok(c) => (c.names, dev_var("RECOUVRANCE_CONTEXT").or(c.current), None),
             Err(e) => (Vec::new(), None, Some(format!("{e:#}").into())),
         };
-        let ns_picker = cx.new(|cx| NamespacePicker::new(window, cx));
-        let ctx_picker = cx.new(|cx| ContextPicker::new(contexts.clone(), window, cx));
+        let favorites = cx.new(|_| Favorites::load());
+        let ns_picker = cx.new(|cx| NamespacePicker::new(favorites.clone(), window, cx));
+        let ctx_picker = cx.new(|cx| ContextPicker::new(contexts.clone(), favorites.clone(), window, cx));
         let col_header = cx.new(|cx| InputState::new(window, cx).placeholder("Header, e.g. Image"));
         let col_path = cx.new(|cx| InputState::new(window, cx).placeholder(".spec.containers[*].image"));
         let filter = cx.new(|cx| {
@@ -674,7 +681,6 @@ impl AppView {
         let mut subs = subs;
         subs.push(cx.observe(&forwards, |_, _, cx| cx.notify()));
 
-        let favorites = cx.new(|_| Favorites::load());
         subs.push(cx.observe(&favorites, |_, _, cx| cx.notify()));
         let focus = cx.focus_handle();
         window.focus(&focus, cx);
@@ -713,6 +719,7 @@ impl AppView {
             skip_select: None,
             page_scopes: HashMap::new(),
             context_open: Default::default(),
+            after_connect: None,
             sidebar_hidden: false,
             assistant: None,
             assistant_docked: false,

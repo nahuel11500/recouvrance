@@ -12,8 +12,8 @@ use super::{
     CloseTab, EscapeBack, FocusFilter, GoAssistant, GoBack, GoCluster, GoForward, GoHelm, GoProblems, GoSettings,
     GoWorkloads, NewTab, NewWindow, NextTab, OpenAccess, OpenAgentActivity, OpenAgents, OpenApiRequests, OpenApply,
     OpenArgo, OpenContexts, OpenHelmInstall, OpenPalette, OpenTerminal, OpenTimeline, OpenUpgradeCheck, PrevTab,
-    RefreshPage, ShowShortcuts, ToggleAssistant, ToggleSidebar, ToggleTheme, ToggleWriteMode, ZoomIn, ZoomOut,
-    ZoomReset,
+    RefreshPage, ShowShortcuts, ToggleAssistant, ToggleFavorite, ToggleSidebar, ToggleTheme, ToggleWriteMode, ZoomIn,
+    ZoomOut, ZoomReset,
 };
 
 /// Where a command's keys act.
@@ -176,6 +176,14 @@ pub(crate) const COMMANDS: &[Command] = &[
     Command::new("Settings", "", Lucide::Settings, run::<GoSettings>)
         .keys("{g s}", Scope::OutsideText)
         .also("preferences options"),
+    Command::new(
+        "Add to or remove from favorites",
+        "the object or Application shown, the selected row, else the one namespace picked",
+        Lucide::Star,
+        run::<ToggleFavorite>,
+    )
+    .keys("{*}", Scope::OutsideText)
+    .also("favourite star pin bookmark unstar"),
     Command::new("Assistant beside the page", "it is told what is on screen", Lucide::Sparkles, run::<ToggleAssistant>)
         .keys("{secondary-j}", Scope::Anywhere)
         .also("chat ai dock"),

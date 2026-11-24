@@ -1,5 +1,5 @@
-//! Context switcher in the top bar: search, recent first, one click to switch,
-//! checkboxes to view several clusters together.
+//! Context switcher in the top bar: search, favorites then recent first, one click to
+//! switch, checkboxes to view several clusters together.
 
 use std::collections::BTreeSet;
 
@@ -23,20 +23,29 @@ pub struct ContextPicker {
     pub connected: Vec<String>,
     picked: BTreeSet<String>,
     search: Entity<InputState>,
+    favorites: Entity<crate::favorites::Favorites>,
     _subs: Vec<Subscription>,
 }
 
 impl EventEmitter<ContextEvent> for ContextPicker {}
 
 impl ContextPicker {
-    pub fn new(all: Vec<String>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        all: Vec<String>,
+        favorites: Entity<crate::favorites::Favorites>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let search = cx.new(|cx| InputState::new(window, cx).placeholder("Search contexts"));
-        let subs = vec![cx.subscribe(&search, |_, _, ev: &InputEvent, cx| {
-            if matches!(ev, InputEvent::Change) {
-                cx.notify();
-            }
-        })];
-        Self { all, connected: Vec::new(), picked: BTreeSet::new(), search, _subs: subs }
+        let subs = vec![
+            cx.subscribe(&search, |_, _, ev: &InputEvent, cx| {
+                if matches!(ev, InputEvent::Change) {
+                    cx.notify();
+                }
+            }),
+            cx.observe(&favorites, |_, _, cx| cx.notify()),
+        ];
+        Self { all, connected: Vec::new(), picked: BTreeSet::new(), search, favorites, _subs: subs }
     }
 
     pub fn set_connected(&mut self, connected: Vec<String>, cx: &mut Context<Self>) {
@@ -59,8 +68,27 @@ impl ContextPicker {
         let protected = crate::settings::is_protected(name);
         let connected = self.connected.iter().any(|c| c == name);
         let (n1, n2) = (name.to_string(), name.to_string());
+        let favorite = crate::favorites::Favorite::Context(name.to_string());
+        let starred = self.favorites.read(cx).has(&favorite);
+        let group = SharedString::from(format!("ctx-row-{i}-{name}"));
+        let favorites = self.favorites.clone();
+        let star = div()
+            .id(SharedString::from(format!("ctx-star-{i}-{name}")))
+            .flex_none()
+            .cursor_pointer()
+            .when(!starred, |d| d.opacity(0.).group_hover(group.clone(), |s| s.opacity(0.5)))
+            .on_click(move |_, _, cx| {
+                cx.stop_propagation();
+                favorites.update(cx, |f, cx| f.toggle(favorite.clone(), cx));
+            })
+            .child(if starred {
+                Icon::new(component::IconName::StarFill).size_3p5().text_color(yellow())
+            } else {
+                Icon::new(Lucide::Star).size_3p5()
+            });
         h_flex()
-            .id(SharedString::from(format!("ctx-row-{i}-{name}")))
+            .id(group.clone())
+            .group(group)
             .gap_2()
             .px_2()
             .py_1p5()
@@ -94,6 +122,7 @@ impl ContextPicker {
             )
             .when(protected, |d| d.child(Icon::new(Lucide::Lock).size_3p5().text_color(theme.warning)))
             .when(connected, |d| d.child(div().text_xs().text_color(theme.blue).child("connected")))
+            .child(star)
             // A click on the row switches to just this context.
             .on_click(cx.listener(move |_, _, _, cx| cx.emit(ContextEvent::Connect(vec![n2.clone()]))))
             .into_any_element()
@@ -105,27 +134,30 @@ const FLAT_LIST_MAX: usize = 12;
 /// How many recent contexts the "Recent" section shows on a longer list.
 const RECENT_MAX: usize = 5;
 
-/// The picker's order with no search. With `FLAT_LIST_MAX` contexts or fewer: one list
-/// (`None` second), recently used first in recent order, then the rest in their usual order.
+/// The picker's order with no search: the favorites (in the order they were starred) in their
+/// own section, then the others. Of those, with `FLAT_LIST_MAX` contexts or fewer: one list
+/// (`None` last), recently used first in recent order, then the rest in their usual order.
 /// With more: up to `RECENT_MAX` recent ones, then the others (`Some`). No context appears
-/// twice, and a recent context that is no longer in `all` is left out.
-fn order(all: &[String], recent: &[String]) -> (Vec<String>, Option<Vec<String>>) {
+/// twice, and a favorite or recent context that is no longer in `all` is left out.
+fn order(all: &[String], favorites: &[String], recent: &[String]) -> (Vec<String>, Vec<String>, Option<Vec<String>>) {
     let short = all.len() <= FLAT_LIST_MAX;
     let mut seen: BTreeSet<&str> = BTreeSet::new();
+    let starred: Vec<String> =
+        favorites.iter().filter(|c| all.contains(*c) && seen.insert(c.as_str())).cloned().collect();
     let first: Vec<String> = recent
         .iter()
         .filter(|c| all.contains(*c) && seen.insert(c.as_str()))
         .take(if short { usize::MAX } else { RECENT_MAX })
         .cloned()
         .collect();
-    let mut shown: BTreeSet<&str> = first.iter().map(String::as_str).collect();
+    let mut shown: BTreeSet<&str> = starred.iter().chain(&first).map(String::as_str).collect();
     let rest: Vec<String> = all.iter().filter(|c| shown.insert(c.as_str())).cloned().collect();
     if short {
         let mut flat = first;
         flat.extend(rest);
-        (flat, None)
+        (starred, flat, None)
     } else {
-        (first, Some(rest))
+        (starred, first, Some(rest))
     }
 }
 
@@ -142,19 +174,29 @@ impl Render for ContextPicker {
         };
         let mut rows: Vec<AnyElement> = Vec::new();
         if query.is_empty() {
-            let (first, other) = order(&self.all, &crate::settings::get().recent_contexts);
+            let favorites = self.favorites.read(cx).contexts().to_vec();
+            let (starred, first, other) = order(&self.all, &favorites, &crate::settings::get().recent_contexts);
+            if !starred.is_empty() {
+                rows.push(div().px_2().pt_1().text_xs().text_color(muted).child("Favorites").into_any_element());
+            }
+            for (i, c) in starred.iter().enumerate() {
+                rows.push(self.row(i, c, cx));
+            }
+            let at = starred.len();
             let sections = other.is_some() && !first.is_empty();
             if sections {
                 rows.push(div().px_2().pt_1().text_xs().text_color(muted).child("Recent").into_any_element());
+            } else if !starred.is_empty() {
+                rows.push(div().px_2().pt_2().text_xs().text_color(muted).child("Other contexts").into_any_element());
             }
             for (i, c) in first.iter().enumerate() {
-                rows.push(self.row(i, c, cx));
+                rows.push(self.row(at + i, c, cx));
             }
             if sections {
                 rows.push(div().px_2().pt_2().text_xs().text_color(muted).child("Other contexts").into_any_element());
             }
             for (i, c) in other.unwrap_or_default().iter().enumerate() {
-                rows.push(self.row(first.len() + i, c, cx));
+                rows.push(self.row(at + first.len() + i, c, cx));
             }
         } else {
             for (i, c) in matching.iter().enumerate() {
@@ -209,15 +251,27 @@ mod tests {
     #[test]
     fn short_list_is_flat_recent_first() {
         let all = names(&[1, 2, 3, 4]);
-        let (list, other) = order(&all, &names(&[3, 9, 1]));
+        let (starred, list, other) = order(&all, &[], &names(&[3, 9, 1]));
+        assert!(starred.is_empty());
         assert_eq!(list, names(&[3, 1, 2, 4]));
+        assert!(other.is_none());
+    }
+
+    /// Favorites come first, in the order starred, and only once; one gone from the kubeconfig
+    /// (not connected, not even listed) is left out.
+    #[test]
+    fn favorites_come_first() {
+        let all = names(&[1, 2, 3, 4]);
+        let (starred, list, other) = order(&all, &names(&[4, 9, 2]), &names(&[2, 3]));
+        assert_eq!(starred, names(&[4, 2]));
+        assert_eq!(list, names(&[3, 1]));
         assert!(other.is_none());
     }
 
     #[test]
     fn long_list_has_sections() {
         let all = names(&(0..20).collect::<Vec<_>>());
-        let (recent, other) = order(&all, &names(&[7, 7, 3, 1, 2, 4, 5]));
+        let (_, recent, other) = order(&all, &[], &names(&[7, 7, 3, 1, 2, 4, 5]));
         assert_eq!(recent, names(&[7, 3, 1, 2, 4]));
         let other = other.unwrap();
         assert_eq!(other.len(), 15);
@@ -228,14 +282,18 @@ mod tests {
         #[test]
         fn every_context_once(
             all in proptest::collection::btree_set(0u8..40, 0..30),
+            favorites in proptest::collection::vec(0u8..50, 0..6),
             recent in proptest::collection::vec(0u8..50, 0..12),
         ) {
             let all = names(&all.into_iter().collect::<Vec<_>>());
-            let recent = names(&recent);
-            let (first, other) = order(&all, &recent);
+            let (favorites, recent) = (names(&favorites), names(&recent));
+            let (starred, first, other) = order(&all, &favorites, &recent);
             let short = all.len() <= FLAT_LIST_MAX;
             prop_assert_eq!(other.is_none(), short);
-            let mut shown = first.clone();
+            prop_assert!(starred.iter().all(|c| favorites.contains(c)));
+            prop_assert!(all.iter().filter(|c| favorites.contains(c)).all(|c| starred.contains(c)));
+            let mut shown = starred.clone();
+            shown.extend(first.clone());
             shown.extend(other.unwrap_or_default());
             let mut sorted = shown.clone();
             sorted.sort();
@@ -243,8 +301,8 @@ mod tests {
             expected.sort();
             prop_assert_eq!(sorted, expected);
             if short {
-                let n = shown.iter().take_while(|c| recent.contains(c)).count();
-                prop_assert!(shown[n..].iter().all(|c| !recent.contains(c)));
+                let n = first.iter().take_while(|c| recent.contains(c)).count();
+                prop_assert!(first[n..].iter().all(|c| !recent.contains(c)));
             } else {
                 prop_assert!(first.len() <= RECENT_MAX);
                 prop_assert!(first.iter().all(|c| recent.contains(c)));
