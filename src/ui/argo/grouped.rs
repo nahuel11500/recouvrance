@@ -442,15 +442,17 @@ impl ArgoView {
     }
 
     /// Sync the Applications of the diff: the sync of the same ones shows again (with this
-    /// diff's summary), else a new one of the Applications picked.
+    /// diff's summary), else a new one of the Applications diffed (not the picks as they are
+    /// now: the filter or the picks may have changed since).
     fn sync_these(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let keys = self.grouped.as_ref().map(GroupedDiff::keys);
-        if let Some(g) = self.sync.as_mut().filter(|g| Some(g.keys()) == keys || g.running()) {
+        let Some(keys) = self.grouped.as_ref().map(GroupedDiff::keys) else { return };
+        if let Some(g) = self.sync.as_mut().filter(|g| g.keys() == keys || g.running()) {
             g.shown = true;
             cx.notify();
             return;
         }
-        self.sync_selected(window, cx);
+        let apps: Vec<FleetApp> = keys.iter().filter_map(|k| self.find(k).cloned()).collect();
+        self.sync_apps(apps, 0, window, cx);
     }
 
     /// Back to the list; the reads running are dropped. The picks stay.

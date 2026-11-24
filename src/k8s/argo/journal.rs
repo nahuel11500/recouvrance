@@ -34,6 +34,9 @@ const MAX_RESOURCES: usize = 2000;
 const MESSAGE_CHARS: usize = 4000;
 /// Operations whose last state is remembered to skip writing it again, at most.
 const REMEMBERED: usize = 100_000;
+/// One line of the journal, at most (an operation of thousands of resources with long
+/// messages is cut to fit).
+const MAX_LINE: usize = 256 * 1024;
 
 /// One resource of an operation's result.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -295,7 +298,7 @@ impl Journal {
         if std::fs::metadata(&self.path).is_ok_and(|m| m.len() >= MAX_BYTES) {
             std::fs::rename(&self.path, older(&self.path))?;
         }
-        let line = serde_json::to_string(r).map_err(std::io::Error::other)?;
+        let line = line_of(r)?;
         let mut f = std::fs::OpenOptions::new().append(true).create(true).mode(0o600).open(&self.path)?;
         writeln!(f, "{line}")?;
         if self.written.len() >= REMEMBERED {
@@ -339,19 +342,65 @@ static SENT: LazyLock<Mutex<HashMap<OpId, u64>>> = LazyLock::new(Default::defaul
 /// this state of it isn't kept yet. Cheap when nothing changed; never waits on the file.
 pub fn observe(instance: &str, app: &Value) {
     let Some(tx) = WRITER.as_ref() else { return };
-    let Some(r) = record_of(instance, app, jiff::Timestamp::now().as_second()) else { return };
-    let print = r.fingerprint();
+    let Some((id, print)) = quick_print(instance, app) else { return };
     {
         let mut sent = SENT.lock().unwrap_or_else(PoisonError::into_inner);
-        if sent.get(&r.id()) == Some(&print) {
+        if sent.get(&id) == Some(&print) {
             return;
         }
         if sent.len() >= REMEMBERED {
             sent.clear();
         }
-        sent.insert(r.id(), print);
+        sent.insert(id, print);
     }
-    let _ = tx.send(r);
+    if let Some(r) = record_of(instance, app, jiff::Timestamp::now().as_second()) {
+        let _ = tx.send(r);
+    }
+}
+
+/// The operation of `app` and a cheap print of its state, read in place (nothing copied but
+/// its id): its phase, when it ended, its message's length, each resource's status and hook
+/// phase. The same print is the same state, so the record isn't built again.
+fn quick_print(instance: &str, app: &Value) -> Option<(OpId, u64)> {
+    let state = app.pointer("/status/operationState").filter(|s| s.is_object())?;
+    let s = |v: &Value, k: &str| v.get(k).and_then(Value::as_str).unwrap_or_default();
+    let started = state.get("startedAt").and_then(Value::as_str).filter(|s| !s.is_empty())?;
+    let name = app.pointer("/metadata/name").and_then(Value::as_str).filter(|s| !s.is_empty())?;
+    let namespace = app
+        .pointer("/metadata/namespace")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(super::DEFAULT_NAMESPACE);
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    (s(state, "phase"), s(state, "finishedAt"), s(state, "message").len()).hash(&mut h);
+    let resources = state.pointer("/syncResult/resources").and_then(Value::as_array).map_or(&[][..], Vec::as_slice);
+    resources.len().hash(&mut h);
+    for r in resources {
+        (s(r, "status"), s(r, "hookPhase")).hash(&mut h);
+    }
+    let id = (instance.to_string(), namespace.to_string(), name.to_string(), started.to_string());
+    Some((id, h.finish()))
+}
+
+/// `r` as one line of at most `MAX_LINE` bytes: past that, its steps' messages are left out,
+/// then its last steps.
+fn line_of(r: &Record) -> std::io::Result<String> {
+    let line = serde_json::to_string(r).map_err(std::io::Error::other)?;
+    if line.len() <= MAX_LINE {
+        return Ok(line);
+    }
+    let mut cut = r.clone();
+    for s in &mut cut.resources {
+        s.message.clear();
+    }
+    loop {
+        let line = serde_json::to_string(&cut).map_err(std::io::Error::other)?;
+        if line.len() <= MAX_LINE || cut.resources.is_empty() {
+            return Ok(line);
+        }
+        let keep = cut.resources.len() * MAX_LINE / line.len();
+        cut.resources.truncate(keep.min(cut.resources.len() - 1));
+    }
 }
 
 // MARK: Reading
@@ -544,6 +593,38 @@ mod tests {
         assert_eq!(loaded.ops[0].last.started, "2026-01-02T00:00:00Z", "newest first");
         assert_eq!((loaded.ops[1].last.phase.as_str(), loaded.ops[1].states), ("Succeeded", 2));
         std::fs::remove_dir_all(d).unwrap();
+    }
+
+    /// An operation of many resources with long messages fits one line: the steps' messages go
+    /// first, then the last steps.
+    #[test]
+    fn a_huge_operation_is_cut_to_one_line() {
+        let long = "x".repeat(MESSAGE_CHARS);
+        let many: Vec<Value> = (0..MAX_RESOURCES)
+            .map(|i| json!({"kind": "ConfigMap", "namespace": "shop", "name": format!("c{i}"), "status": "Synced", "message": long}))
+            .collect();
+        let r = record_of("i", &app("Succeeded", "2026-01-01T00:00:00Z", json!(many)), 1).unwrap();
+        let line = line_of(&r).unwrap();
+        assert!(line.len() <= MAX_LINE, "{}", line.len());
+        let back: Record = serde_json::from_str(&line).unwrap();
+        assert!(back.resources.iter().all(|s| s.message.is_empty()));
+        assert_eq!(back.resources.len(), MAX_RESOURCES, "names alone fit");
+        let small =
+            record_of("i", &app("Succeeded", "2026-01-01T00:00:00Z", json!([res("web", "Synced")])), 1).unwrap();
+        assert_eq!(line_of(&small).unwrap(), serde_json::to_string(&small).unwrap());
+    }
+
+    /// The cheap print moves with the state: a step that ends changes it, the same state
+    /// read again doesn't.
+    #[test]
+    fn the_quick_print_follows_the_state() {
+        let running = app("Running", "2026-01-01T00:00:00Z", json!([res("web", "")]));
+        let (id, a) = quick_print("i", &running).unwrap();
+        assert_eq!(id, ("i".to_string(), "argocd".to_string(), "web".to_string(), "2026-01-01T00:00:00Z".to_string()));
+        assert_eq!(quick_print("i", &running).unwrap().1, a);
+        let synced = app("Running", "2026-01-01T00:00:00Z", json!([res("web", "Synced")]));
+        assert_ne!(quick_print("i", &synced).unwrap().1, a);
+        assert!(quick_print("i", &json!({"metadata": {"name": "web"}})).is_none());
     }
 
     #[test]

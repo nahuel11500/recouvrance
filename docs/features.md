@@ -399,29 +399,44 @@
   are counted, never synced; 300 at most). Each is read first, 4 at a time, the way it was read
   (on its hub, or by Argo CD's API): one already syncing, being deleted, or whose sync windows
   deny a manual sync now (*can sync in 2h*) is left out, saying why; auto-sync on is said, not a
-  reason. Options: *With hooks* (Argo CD's hook strategy, its own Sync: PreSync, Sync and
-  PostSync hooks run) or *Without hooks* (the apply strategy: only the manifests are applied, a
-  secret refresh or a migration hook is skipped; for a simple change); *Prune*, off by default,
-  lists under each Application exactly what it deletes (its managed resources that require
-  pruning), and a sync that would now delete more is refused; *Dry run* applies nothing. *Read
+  reason. On a hub, an Application whose sync windows aren't known (its project can't be read)
+  is warned about: if a window denies a sync now, Argo CD's controller holds the sync until it
+  opens (by the API, argocd-server refuses it and says so). Windows are worked out again as of
+  the moment *Sync…* is clicked. Options: *With hooks* (Argo CD's hook strategy, its own Sync:
+  PreSync, Sync and PostSync hooks run) or *Without hooks* (the apply strategy: only the
+  manifests are applied, a secret refresh or a migration hook is skipped; for a simple change);
+  *Prune*, off by default, lists under each Application every resource it deletes (its managed
+  resources that require pruning), and a sync is refused if Argo CD's last comparison then
+  shows more to prune; *Dry run* applies nothing. With auto-sync off and one source, the sync is
+  pinned to the revision Argo CD compared (`status.sync.revision`, shown on the row), so git
+  moving on can't bring other changes; otherwise it goes to the target revision. As argocd-server
+  does, the Application's sync options and retry policy go with the operation, and prune and dry
+  run are always said (false too, so Argo CD's manual sync defaults don't fill them). *Read
   what a sync of each would change* shows the grouped diff, whose summary then shows above.
   *Sync…* asks for the count of Applications typed (or the wait set in Settings → General),
-  names them, and lists what prune deletes; the syncs are then sent 4 at a time, write mode
+  names them, and lists everything prune deletes; the syncs are then sent 4 at a time, write mode
   checked as each is sent (on a hub through its window client and the write gate; by the API,
-  checked by the request). Each Application is read every 2 s until its operation ends: its
-  phase (*Waiting* until Argo CD starts it), message and resources done (`3 of 5 done`, a bar),
-  *Terminate* while it runs (confirmed like a protected context), then *Done: 10 succeeded, 2
-  failed*, each failure with Argo CD's message. Leaving the page while it runs only hides it:
+  checked by the request). Each Application is read every 2 s (every 10 s while the page is
+  hidden or more than 50 run) until its operation ends, at most 30 min: its phase (*Waiting*
+  until Argo CD starts the operation after the one read right before the write, so an auto-sync
+  in between is not taken for it), message and resources done (`3 of 5 done`, a bar),
+  *Terminate* while it waits or runs (confirmed like a protected context), then *Done: 10
+  succeeded, 2 failed*, each failure with Argo CD's message. Leaving the page while it runs only hides it:
   the selection bar shows *Sync of 12 Applications: 3 running* to show it again. Agents sync
   several Applications by calling `gitops` `sync` once for each (each decided by their rules and
   approved like a single sync; `hooks: false` syncs without hooks).
-- **Argo CD sync journal**: every operation the app sees (in an Argo CD API server's list and
-  stream, a hub's list, a dashboard, a grouped sync) is kept on this machine: the Application,
+- **Argo CD sync journal**: every operation the app sees (in an Argo CD API server's stream, a
+  hub's list, a dashboard, a grouped sync) is kept on this machine: the Application,
   its Argo CD, revision(s), phase, message, who started it, when it started and ended, dry run
   and strategy, and each resource's result (kind, namespace, name, status, message, hook phase
-  and type). One JSON line per state of an operation, a state seen again not written again, in
-  `argocd-sync-journal.jsonl` in the data directory (`~/.local/share/recouvrance`, mode 0600);
-  past 25 MB it moves to `.1`, so 50 MB at most, and what is older than 30 days is left out.
+  and type). These are stored as Argo CD says them, for 30 days: operation and step messages
+  (which may quote what a resource or hook printed) and the usernames of who started each.
+  One JSON line per state of an operation, a state seen again not written again (a cheap
+  check of its phase, end, message and each step's status comes first), at most 256 KB (past
+  that, step messages are left out, then the last steps), in `argocd-sync-journal.jsonl` in
+  the data directory (`~/.local/share/recouvrance`, mode 0600); past 25 MB it moves to `.1`, so
+  50 MB at most, and what is older than 30 days is left out. Each resource's result is asked
+  of the stream only, never of the list of every Application.
   *Sync journal* (the selection bar, the sync page, *journal* on a dashboard's Last sync and
   History cards for that Application) lists them newest first, filtered by Application, phase,
   who and since when; a click shows an operation's message and steps, even after Argo CD's

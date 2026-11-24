@@ -573,17 +573,27 @@ impl Conn {
     }
 }
 
-/// `fields`, each with `prefix` (`items.` for a list, `result.application.` for the stream).
-fn fields(prefix: &str) -> String {
-    APP_FIELDS.iter().map(|f| encode(&format!("{prefix}{f}"))).collect::<Vec<_>>().join(",")
+/// A field asked of the stream only: each resource's result of the last operation, for the
+/// sync journal. The list, which sends every Application at once, leaves it out.
+const STREAM_ONLY: &str = "status.operationState.syncResult.resources";
+
+/// `fields`, each with `prefix` (`items.` for a list, `result.application.` for the stream);
+/// `STREAM_ONLY` only with `stream`.
+fn fields(prefix: &str, stream: bool) -> String {
+    APP_FIELDS
+        .iter()
+        .filter(|f| stream || **f != STREAM_ONLY)
+        .map(|f| encode(&format!("{prefix}{f}")))
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 fn list_path() -> String {
-    format!("/api/v1/applications?fields=metadata.resourceVersion,{}", fields("items."))
+    format!("/api/v1/applications?fields=metadata.resourceVersion,{}", fields("items.", false))
 }
 
 fn stream_path() -> String {
-    format!("/api/v1/stream/applications?fields=result.type,{}", fields("result.application."))
+    format!("/api/v1/stream/applications?fields=result.type,{}", fields("result.application.", true))
 }
 
 fn app_path(namespace: &str, name: &str) -> String {
@@ -1031,13 +1041,13 @@ async fn follow(conn: &Conn, state: &Arc<Mutex<FeedState>>) -> Ended {
         Ok(v) => v,
         Err(f) => return Ended::Failed(f),
     };
-    let instance = super::grouping::server_instance(&conn.server.base);
+    // Not kept in the sync journal from here: the list leaves out each resource's result, and
+    // the stream, open first, sends every Application whole with it.
     let listed: Apps = list
         .get("items")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
-        .inspect(|app| super::journal::observe(&instance, app))
         .map(ApiApp::of)
         .filter(|a| !a.summary.name.is_empty())
         .map(|a| (a.key(), Arc::new(a)))
@@ -1300,11 +1310,12 @@ pub(super) fn request(action: &Action, namespace: &str, name: &str) -> (http::Me
 /// strategy (hook, or apply: without hooks), and prune, dry run and resources when asked.
 fn sync_body(mut body: Value, req: &super::ops::SyncRequest) -> Value {
     body["strategy"] = super::ops::strategy(req);
-    if req.prune {
-        body["prune"] = json!(true);
-    }
-    if req.dry_run {
-        body["dryRun"] = json!(true);
+    // Always said, false too: Argo CD fills what isn't from the Application's own defaults
+    // (`syncPolicy.manualDefaults`), which could prune or dry-run what wasn't asked.
+    body["prune"] = json!(req.prune);
+    body["dryRun"] = json!(req.dry_run);
+    if let Some(rev) = &req.revision {
+        body["revision"] = json!(rev);
     }
     if !req.resources.is_empty() {
         body["resources"] = Value::Array(req.resources.iter().map(super::ops::resource_entry).collect());
@@ -1318,6 +1329,18 @@ fn sync_body(mut body: Value, req: &super::ops::SyncRequest) -> Value {
 /// before it is sent and is refused as argocd-server would refuse it (an operation running),
 /// or when prune would now delete more than was shown.
 pub async fn act(endpoint: Arc<Endpoint>, namespace: String, name: String, action: Action) -> Result<String, String> {
+    act_read(endpoint, namespace, name, action).await.map(|(said, _)| said)
+}
+
+/// [`act`], also giving when the Application's last operation started as read right before a
+/// sync was sent (None for other actions, or when it has none): the operation the sync
+/// starts is a later one.
+pub async fn act_read(
+    endpoint: Arc<Endpoint>,
+    namespace: String,
+    name: String,
+    action: Action,
+) -> Result<(String, Option<String>), String> {
     let write = crate::k8s::run_abortable(async move {
         let conn = match current(&endpoint.server.base).and_then(|e| e.conn()) {
             Ok(c) => c,
@@ -1340,6 +1363,7 @@ pub async fn act(endpoint: Arc<Endpoint>, namespace: String, name: String, actio
         }
         let (method, path, body) = request(&action, &namespace, &name);
         let sent = conn.call(method, &path, body.as_ref()).await;
+        let before = read.as_ref().and_then(|(app, _)| super::grouped_sync::started_at(app));
         Ok(sent
             .map(|_| match &action {
                 Action::Refresh { hard: false } => format!("Argo CD refreshes {name}"),
@@ -1351,6 +1375,7 @@ pub async fn act(endpoint: Arc<Endpoint>, namespace: String, name: String, actio
                 Action::Terminate => format!("The operation of {name} is terminating"),
                 Action::Rollback { id } => format!("Rollback of {name} to deployment {id} started"),
             })
+            .map(|said| (said, before))
             .map_err(|f| f.text))
     });
     write.await.unwrap_or_else(|e| Err(format!("{e:#}")))
@@ -1498,7 +1523,8 @@ users:
             req(Action::Refresh { hard: true }),
             get("/api/v1/applications/web?appNamespace=team%20a&refresh=hard")
         );
-        let body = json!({"name": "web", "appNamespace": "team a", "strategy": {"hook": {}}});
+        let body =
+            json!({"name": "web", "appNamespace": "team a", "strategy": {"hook": {}}, "prune": false, "dryRun": false});
         let sync = |r: SyncRequest| req(Action::Sync(r));
         assert_eq!(sync(SyncRequest::default()), ("POST".into(), "/api/v1/applications/web/sync".into(), Some(body)));
         assert_eq!(
@@ -1518,7 +1544,12 @@ users:
     fn a_sync_request_carries_each_option() {
         let body = |r: SyncRequest| request(&Action::Sync(r), "argocd", "web").2.unwrap();
         let plain = body(SyncRequest::default());
-        assert!(plain.get("prune").is_none() && plain.get("dryRun").is_none() && plain.get("resources").is_none());
+        // Prune and dry run are said even when off: Argo CD would fill them from the
+        // Application's manual sync defaults otherwise.
+        assert_eq!((plain["prune"].clone(), plain["dryRun"].clone()), (json!(false), json!(false)));
+        assert!(plain.get("resources").is_none() && plain.get("revision").is_none());
+        let pinned = body(SyncRequest { revision: Some("abc".into()), ..Default::default() });
+        assert_eq!(pinned["revision"], "abc");
         assert_eq!(body(SyncRequest { apply: true, ..Default::default() })["strategy"], json!({"apply": {}}));
         let all = body(SyncRequest {
             resources: vec![
@@ -1534,6 +1565,7 @@ users:
             prune: true,
             dry_run: true,
             apply: false,
+            revision: None,
             prune_shown: None,
         });
         assert_eq!(all["strategy"], json!({"hook": {}}));
@@ -1558,6 +1590,8 @@ users:
         assert!(stream.contains("result.application.status.sync"), "{stream}");
         // What the sync journal keeps of an operation comes with it.
         assert!(stream.contains("result.application.status.operationState.syncResult.resources"), "{stream}");
+        // Not in the list: it sends every Application at once.
+        assert!(!list.contains("syncResult.resources") && list.contains("syncResult.revision"), "{list}");
     }
 
     fn app(name: &str, rv: &str, extra: Value) -> Value {

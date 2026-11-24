@@ -31,6 +31,10 @@ pub struct SyncRequest {
     /// `PreSync`, `Sync` and `PostSync` hooks (a secret refresh, a migration). Off: the hook
     /// strategy, Argo CD's default, which runs them.
     pub apply: bool,
+    /// The revision to sync to: the one Argo CD compared and showed (so git moving on before
+    /// the sync starts can't bring other changes, or other resources to prune). None: its
+    /// target revision, as it is when the sync starts.
+    pub revision: Option<String>,
     /// What prune deletes, as shown to whoever confirmed the sync: if git changed since and
     /// it would now delete more, the sync is refused. None when nothing was shown.
     pub prune_shown: Option<Vec<Res>>,
@@ -96,11 +100,38 @@ pub fn sync_patch(req: &SyncRequest) -> Value {
     if req.dry_run {
         sync.insert("dryRun".into(), json!(true));
     }
+    if let Some(rev) = &req.revision {
+        sync.insert("revision".into(), json!(rev));
+    }
     if !req.resources.is_empty() {
         let picked = req.resources.iter().map(resource_entry).collect();
         sync.insert("resources".into(), Value::Array(picked));
     }
     json!({"operation": {"initiatedBy": {"username": INITIATED_BY}, "sync": sync}})
+}
+
+/// `patch` (a sync's) with what argocd-server copies from the Application into the operation
+/// it starts: its sync options (`spec.syncPolicy.syncOptions`) and its retry policy
+/// (`spec.syncPolicy.retry`). The controller reads them from the operation only.
+pub fn with_policy(app: &Value, mut patch: Value) -> Value {
+    let present = |v: &&Value| !v.is_null() && v.as_array().is_none_or(|a| !a.is_empty());
+    if let Some(options) = app.pointer("/spec/syncPolicy/syncOptions").filter(present) {
+        patch["operation"]["sync"]["syncOptions"] = options.clone();
+    }
+    if let Some(retry) = app.pointer("/spec/syncPolicy/retry").filter(|r| r.is_object()) {
+        patch["operation"]["retry"] = retry.clone();
+    }
+    patch
+}
+
+/// The revision a sync of `app` is pinned to: the one Argo CD last compared
+/// (`status.sync.revision`), for an Application of one source with auto-sync off (with it on,
+/// argocd-server refuses another revision than its target). None otherwise.
+pub fn shown_revision(app: &Value) -> Option<String> {
+    if super::auto_sync(app) || app.pointer("/spec/sources").and_then(Value::as_array).is_some_and(|s| !s.is_empty()) {
+        return None;
+    }
+    app.pointer("/status/sync/revision").and_then(Value::as_str).filter(|r| !r.is_empty()).map(String::from)
 }
 
 /// The sync strategy of `req`: `{"apply": {}}` without hooks, else `{"hook": {}}`.
@@ -264,7 +295,7 @@ pub fn patch(app: &Value, op: &Op) -> Result<Value, String> {
         return Err(why);
     }
     let mut patch = match op {
-        Op::Sync(req) => sync_patch(req),
+        Op::Sync(req) => with_policy(app, sync_patch(req)),
         Op::Rollback { id, dry_run } => rollback_patch(app, rollback_target(app, *id)?, *dry_run),
         Op::Terminate => terminate_patch(),
     };
@@ -403,6 +434,7 @@ mod tests {
             prune: true,
             dry_run: true,
             apply: false,
+            revision: None,
             prune_shown: None,
         };
         let p = patch(&app(), &Op::Sync(req)).unwrap();
@@ -418,6 +450,38 @@ mod tests {
         );
         // Guarded by the version read: a change meanwhile makes the API server refuse it.
         assert_eq!(p["metadata"]["resourceVersion"], "42");
+    }
+
+    /// argocd-server copies the Application's sync options and retry into the operation; the
+    /// controller reads them from there only, so a sync written here must carry them too.
+    #[test]
+    fn a_sync_keeps_the_application_s_sync_options_and_retry() {
+        let mut a = app();
+        let p = patch(&a, &Op::Sync(SyncRequest::default())).unwrap();
+        assert_eq!(p["operation"]["sync"]["syncOptions"], json!(["CreateNamespace=true"]));
+        assert!(p["operation"].get("retry").is_none());
+        a["spec"]["syncPolicy"]["retry"] = json!({"limit": 5, "backoff": {"duration": "5s"}});
+        let p = patch(&a, &Op::Sync(SyncRequest { apply: true, ..Default::default() })).unwrap();
+        assert_eq!(p["operation"]["retry"], json!({"limit": 5, "backoff": {"duration": "5s"}}));
+        assert_eq!(p["operation"]["sync"]["syncStrategy"], json!({"apply": {}}));
+        a["spec"]["syncPolicy"] = json!({});
+        let p = patch(&a, &Op::Sync(SyncRequest::default())).unwrap();
+        assert!(p["operation"]["sync"].get("syncOptions").is_none());
+    }
+
+    #[test]
+    fn a_sync_is_pinned_to_the_revision_shown_when_it_can_be() {
+        let mut a = app();
+        a["status"]["sync"] = json!({"status": "OutOfSync", "revision": "f".repeat(40)});
+        assert_eq!(shown_revision(&a), Some("f".repeat(40)));
+        let req = SyncRequest { revision: shown_revision(&a), ..Default::default() };
+        assert_eq!(patch(&a, &Op::Sync(req)).unwrap()["operation"]["sync"]["revision"], "f".repeat(40));
+        // Several sources, or auto-sync on: its target revision.
+        let mut multi = a.clone();
+        multi["spec"]["sources"] = json!([{"repoURL": "x"}, {"chart": "c"}]);
+        assert_eq!(shown_revision(&multi), None);
+        a["spec"]["syncPolicy"]["automated"] = json!({});
+        assert_eq!(shown_revision(&a), None);
     }
 
     #[test]

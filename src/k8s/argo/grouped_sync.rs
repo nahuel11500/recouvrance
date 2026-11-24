@@ -43,15 +43,17 @@ impl Default for Options {
 }
 
 impl Options {
-    /// The sync of one whole Application, `pruned` being what prune deletes on it as shown:
-    /// if git changed since and it would delete more, the sync of it is refused.
-    pub fn request(&self, pruned: &[Res]) -> SyncRequest {
+    /// The sync of one whole Application as `checked` found it: what prune deletes on it as
+    /// shown (if Argo CD's comparison then shows more, the sync of it is refused), and the
+    /// revision shown when it can be pinned (so git moving on can't bring more).
+    pub fn request(&self, checked: &Checked) -> SyncRequest {
         SyncRequest {
             resources: Vec::new(),
             prune: self.prune,
             dry_run: self.dry_run,
             apply: !self.hooks,
-            prune_shown: self.prune.then(|| pruned.to_vec()),
+            revision: checked.revision.clone(),
+            prune_shown: self.prune.then(|| checked.pruned.clone()),
         }
     }
 
@@ -76,13 +78,33 @@ pub struct Checked {
     /// What prune would delete on it (when prune is on).
     pub pruned: Vec<Res>,
     pub auto_sync: bool,
-    /// When its last operation started: the sync sent starts another.
+    /// When its last operation started, as read for the page (the sync follows the operation
+    /// after the one read right before it is written).
     pub before: Option<String>,
+    /// The revision Argo CD compared, which the sync is pinned to (one source, auto-sync off).
+    pub revision: Option<String>,
+}
+
+/// When the last operation of `app` started.
+pub fn started_at(app: &Value) -> Option<String> {
+    app.pointer("/status/operationState/startedAt").and_then(Value::as_str).map(String::from)
+}
+
+/// What to say when an Application's sync windows aren't known (`next`): by Argo CD's API,
+/// argocd-server refuses a sync a window denies, and says so; on a hub (`hub`) the operation is
+/// written and Argo CD's controller waits for a window to open, which may take hours.
+pub fn window_warning(next: &NextSync, hub: bool) -> Option<String> {
+    match next {
+        NextSync::Unknown(why) if hub => Some(format!(
+            "its sync windows aren't known ({why}): if one denies a sync now, Argo CD starts it only once it opens"
+        )),
+        _ => None,
+    }
 }
 
 /// Why a manual sync can't start now under the sync windows that apply (`next`, from the
-/// Application's project); None when it can, or when the windows aren't known (Argo CD
-/// decides then, and says so if it refuses).
+/// Application's project); None when it can, or when the windows aren't known (see
+/// [`window_warning`]).
 pub fn window_refusal(next: &NextSync, now: jiff::Timestamp) -> Option<String> {
     match next {
         NextSync::NoWindow | NextSync::Now | NextSync::Unknown(_) => None,
@@ -103,7 +125,8 @@ pub fn check(app: &Value, window: &NextSync, now: jiff::Timestamp) -> Checked {
         refused,
         pruned: ops::pruned(app, &[]),
         auto_sync: super::auto_sync(app),
-        before: app.pointer("/status/operationState/startedAt").and_then(Value::as_str).map(String::from),
+        before: started_at(app),
+        revision: ops::shown_revision(app),
     }
 }
 
@@ -118,6 +141,8 @@ pub struct Target {
 
 /// A request of a grouped sync to one Application.
 pub type Call<T> = Pin<Box<dyn Future<Output = Result<T, String>> + Send>>;
+/// What sending one did: Argo CD's answer and when the operation before it started.
+pub type Sent = Result<(String, Option<String>), String>;
 
 impl Target {
     /// The Application as Argo CD has it now, whole; its operation goes to the sync journal.
@@ -143,8 +168,10 @@ impl Target {
 
     /// Send `op` (a sync or a terminate): on a hub with its window client (the write gate
     /// refuses it while write mode is off), by Argo CD's API with write mode checked as it is
-    /// sent. A dry run's result is not waited for: it is followed like any sync.
-    pub fn send(&self, op: Op) -> Call<String> {
+    /// sent. A dry run's result is not waited for: it is followed like any sync. What Argo CD
+    /// said, and when the Application's last operation started as read right before the write
+    /// (the operation sent is a later one).
+    pub fn send(&self, op: Op) -> Call<(String, Option<String>)> {
         let (ns, name) = (self.namespace.clone(), self.name.clone());
         match &self.source {
             Source::Hub(hub) => {
@@ -161,7 +188,7 @@ impl Target {
                     Op::Terminate => api::Action::Terminate,
                     Op::Rollback { .. } => return Box::pin(async { Err("not part of a grouped sync".to_string()) }),
                 };
-                Box::pin(api::act(endpoint.clone(), ns, name, action))
+                Box::pin(api::act_read(endpoint.clone(), ns, name, action))
             }
         }
     }
@@ -184,7 +211,7 @@ where
 
 /// Send each sync of `jobs`, at most [`PARALLEL`] at a time: each result as it comes, with
 /// the index of its job.
-pub fn send_all(jobs: Vec<(Target, SyncRequest)>) -> impl futures::Stream<Item = (usize, Result<String, String>)> {
+pub fn send_all(jobs: Vec<(Target, SyncRequest)>) -> impl futures::Stream<Item = (usize, Sent)> {
     bounded(jobs.len(), PARALLEL, move |i| {
         let (target, req) = &jobs[i];
         target.send(Op::Sync(req.clone()))
@@ -273,14 +300,42 @@ mod tests {
     fn each_option_is_in_the_request() {
         let pruned =
             vec![Res { kind: "ConfigMap".into(), namespace: "shop".into(), name: "old".into(), ..Default::default() }];
-        let plain = Options::default().request(&pruned);
+        let checked = Checked { pruned: pruned.clone(), ..Default::default() };
+        let plain = Options::default().request(&checked);
         assert_eq!(plain, SyncRequest::default(), "with hooks, no prune, no dry run: Argo CD's own Sync");
-        let r = Options { hooks: false, prune: true, dry_run: true }.request(&pruned);
+        let pinned = Checked { revision: Some("abc".into()), ..checked };
+        let r = Options { hooks: false, prune: true, dry_run: true }.request(&pinned);
         assert!(r.apply && r.prune && r.dry_run && r.resources.is_empty());
         assert_eq!(r.prune_shown, Some(pruned), "prune deletes no more than was shown");
+        assert_eq!(r.revision.as_deref(), Some("abc"), "pinned to the revision shown");
         assert_eq!(ops::sync_patch(&r)["operation"]["sync"]["syncStrategy"], json!({"apply": {}}));
         assert_eq!(Options { hooks: false, prune: true, dry_run: true }.text(), "without hooks, prune, dry run");
         assert_eq!(Options::default().text(), "with hooks");
+    }
+
+    /// An auto-sync that ran between the page's read and the sync's write is not the sync
+    /// sent: the operation followed is the one after the operation read right before the write.
+    #[test]
+    fn an_operation_that_ran_before_the_write_is_not_the_one_sent() {
+        let page_read = "2026-01-01T00:00:00Z";
+        let auto = "2026-01-01T12:00:00Z";
+        let mut a = app();
+        a["operation"] = json!({"sync": {}});
+        a["status"]["operationState"] = json!({"phase": "Succeeded", "startedAt": auto,
+            "finishedAt": "2026-01-01T12:01:00Z", "operation": {"initiatedBy": {"automated": true}}});
+        // Taken from the page's read (stale), the auto-sync would pass for the sync sent.
+        assert_eq!(progress(&a, Some(page_read)).phase, "Succeeded");
+        // From the read right before the write: still waiting for Argo CD to start it.
+        let p = progress(&a, Some(auto));
+        assert_eq!((p.phase.as_str(), p.ended), ("Waiting", false));
+    }
+
+    #[test]
+    fn a_window_not_known_is_said_on_a_hub() {
+        let unknown = NextSync::Unknown("project shop can't be read".into());
+        assert!(window_warning(&unknown, true).unwrap().contains("once it opens"));
+        assert_eq!(window_warning(&unknown, false), None, "argocd-server refuses it, and says so");
+        assert_eq!(window_warning(&NextSync::Now, true), None);
     }
 
     #[test]

@@ -2295,6 +2295,7 @@ fn a_grouped_sync_writes_each_application_s_operation() {
         let apps: Api<DynamicObject> = Api::namespaced_with(admin.clone(), NS, &kind.ar);
         let names = ["e2e-group-a", "e2e-group-b", "e2e-group-c"];
         let before = "2026-01-01T00:00:00Z";
+        let shown = "a".repeat(40);
         for name in names {
             let _ = apps.delete(name, &DeleteParams::default()).await;
         }
@@ -2304,9 +2305,10 @@ fn a_grouped_sync_writes_each_application_s_operation() {
                 "metadata": {"name": name, "namespace": NS},
                 "spec": {"project": "default",
                     "source": {"repoURL": "https://git.example/apps", "path": name, "targetRevision": "HEAD"},
-                    "destination": {"server": "https://kubernetes.default.svc", "namespace": NS}},
+                    "destination": {"server": "https://kubernetes.default.svc", "namespace": NS},
+                    "syncPolicy": {"syncOptions": ["CreateNamespace=true"], "retry": {"limit": 2}}},
                 "status": {
-                    "sync": {"status": "OutOfSync"},
+                    "sync": {"status": "OutOfSync", "revision": shown},
                     "resources": [
                         {"group": "apps", "version": "v1", "kind": "Deployment", "namespace": NS, "name": name, "status": "OutOfSync"},
                         {"version": "v1", "kind": "ConfigMap", "namespace": NS, "name": format!("{name}-old"), "status": "OutOfSync", "requiresPruning": true},
@@ -2332,21 +2334,28 @@ fn a_grouped_sync_writes_each_application_s_operation() {
         let checked = async {
             gate::set_ui_writes(true);
             // Each is read and checked as the page does: what prune would delete is listed.
-            let mut pruned = Vec::new();
+            let mut checks = Vec::new();
             for name in names {
                 let app = target(name).read().await.map_err(anyhow::Error::msg)?;
                 let c = grouped_sync::check(&app, &k8s::argo::windows::NextSync::NoWindow, jiff::Timestamp::now());
                 assert_eq!(c.refused, None, "{name}");
                 assert_eq!(c.before.as_deref(), Some(before));
+                assert_eq!(c.revision.as_deref(), Some(shown.as_str()), "auto-sync off, one source: pinned");
                 assert_eq!(c.pruned.iter().map(|r| r.name.clone()).collect::<Vec<_>>(), [format!("{name}-old")]);
-                pruned.push(c.pruned);
+                checks.push(c);
             }
             let jobs = |opts: Options| -> Vec<(Target, k8s::argo::ops::SyncRequest)> {
-                names.iter().zip(&pruned).map(|(n, p)| (target(n), opts.request(p))).collect()
+                names.iter().zip(&checks).map(|(n, c)| (target(n), opts.request(c))).collect()
             };
             let send = |opts: Options| grouped_sync::send_all(jobs(opts)).collect::<Vec<_>>();
+            let by_name = |sent: &[(usize, grouped_sync::Sent)], name: &str| {
+                let i = names.iter().position(|n| *n == name).unwrap();
+                sent.iter().find(|(k, _)| *k == i).map(|(_, r)| r.clone()).unwrap()
+            };
 
-            // A dry run: each Application's operation asks Argo CD to apply nothing; nothing else is written.
+            // A dry run: each Application's operation asks Argo CD to apply nothing; nothing else
+            // is written. Like argocd-server, it carries the Application's sync options and retry,
+            // and the revision shown.
             let sent = send(Options { dry_run: true, ..Default::default() }).await;
             assert_eq!(sent.len(), names.len());
             assert!(sent.iter().all(|(_, r)| r.is_ok()), "{sent:?}");
@@ -2355,6 +2364,9 @@ fn a_grouped_sync_writes_each_application_s_operation() {
                 let op = &app["operation"];
                 assert_eq!(op["sync"]["dryRun"], true, "{op}");
                 assert_eq!(op["sync"]["syncStrategy"], json!({"hook": {}}), "{op}");
+                assert_eq!(op["sync"]["syncOptions"], json!(["CreateNamespace=true"]), "{op}");
+                assert_eq!(op["retry"], json!({"limit": 2}), "{op}");
+                assert_eq!(op["sync"]["revision"], shown, "{op}");
                 assert!(op["sync"].get("prune").is_none(), "{op}");
                 assert_eq!(app["status"]["sync"]["status"], "OutOfSync", "a dry run changes nothing else");
                 assert_eq!(app["spec"]["source"]["path"], name, "a dry run changes nothing else");
@@ -2363,21 +2375,52 @@ fn a_grouped_sync_writes_each_application_s_operation() {
                     .await?;
             }
 
-            // Without hooks, with prune: each one's operation says so, started by Recouvrance.
+            // Between the page's check and the sync: an auto-sync runs on the second, and git
+            // drops one more resource of the third (Argo CD's comparison now prunes it too).
+            let auto = "2026-01-01T06:00:00Z";
+            set(
+                names[1],
+                json!({"status": {"operationState": {"phase": "Succeeded", "startedAt": auto,
+                "operation": {"initiatedBy": {"automated": true}}}}}),
+            )
+            .await?;
+            let third = names[2];
+            set(third, json!({"status": {"resources": [
+                {"group": "apps", "version": "v1", "kind": "Deployment", "namespace": NS, "name": third, "status": "OutOfSync"},
+                {"version": "v1", "kind": "ConfigMap", "namespace": NS, "name": format!("{third}-old"), "status": "OutOfSync", "requiresPruning": true},
+                {"version": "v1", "kind": "Secret", "namespace": NS, "name": format!("{third}-unshown"), "status": "OutOfSync", "requiresPruning": true},
+            ]}}))
+            .await?;
+
+            // Without hooks, with prune: each one's operation says so, started by Recouvrance; the
+            // third, which would now delete more than was shown, is refused and left alone.
             let opts = Options { hooks: false, prune: true, dry_run: false };
             let sent = send(opts).await;
-            assert!(sent.iter().all(|(_, r)| r.as_ref().is_ok_and(|m| m.contains("without hooks"))), "{sent:?}");
-            for name in names {
+            for &name in &names[..2] {
+                let (said, _) = by_name(&sent, name).map_err(anyhow::Error::msg)?;
+                assert!(said.contains("without hooks"), "{said}");
                 let op = read(name).await?["operation"].clone();
                 assert_eq!(op["sync"]["syncStrategy"], json!({"apply": {}}), "{op}");
                 assert_eq!(op["sync"]["prune"], true, "{op}");
+                assert_eq!(op["sync"]["syncOptions"], json!(["CreateNamespace=true"]), "{op}");
                 assert!(op["sync"].get("dryRun").is_none(), "{op}");
                 assert_eq!(op["initiatedBy"]["username"], "recouvrance", "{op}");
             }
+            let why = by_name(&sent, third).expect_err("prune would delete more than was shown");
+            assert!(why.contains(&format!("Secret {NS}/{third}-unshown")) && why.contains("confirm"), "{why}");
+            assert!(read(third).await?.get("operation").is_none(), "the refused sync reached {third}");
+            // What is followed is the operation after the one read right before the write: the
+            // auto-sync, not the page's stale read.
+            let (_, followed) = by_name(&sent, names[1]).map_err(anyhow::Error::msg)?;
+            assert_eq!(followed.as_deref(), Some(auto));
+            assert_eq!(grouped_sync::progress(&read(names[1]).await?, followed.as_deref()).phase, "Waiting");
 
             // While they run, a second sync of them is refused, and nothing is overwritten.
             let again = send(opts).await;
-            assert!(again.iter().all(|(_, r)| r.as_ref().is_err_and(|e| e.contains("in progress"))), "{again:?}");
+            for &name in &names[..2] {
+                let e = by_name(&again, name).expect_err("in progress");
+                assert!(e.contains("in progress"), "{e}");
+            }
             let app = target(names[0]).read().await.map_err(anyhow::Error::msg)?;
             let c = grouped_sync::check(&app, &k8s::argo::windows::NextSync::NoWindow, jiff::Timestamp::now());
             assert!(c.refused.is_some_and(|why| why.contains("already running")));
@@ -2399,10 +2442,11 @@ fn a_grouped_sync_writes_each_application_s_operation() {
             }
             gate::set_ui_writes(false);
             let refused = send(opts).await;
-            assert!(
-                refused.iter().all(|(_, r)| r.as_ref().is_err_and(|e| e.contains(gate::WRITES_OFF))),
-                "{refused:?}"
-            );
+            for &name in &names[..2] {
+                let e = by_name(&refused, name).expect_err("write mode is off");
+                assert!(e.contains(gate::WRITES_OFF), "{e}");
+            }
+            assert!(by_name(&refused, third).is_err());
             for name in names {
                 assert!(read(name).await?.get("operation").is_none(), "the refused sync reached {name}");
             }

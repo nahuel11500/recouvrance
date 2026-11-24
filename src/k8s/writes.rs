@@ -533,18 +533,20 @@ pub async fn argo_operation(
     name: String,
     op: super::argo::ops::Op,
 ) -> Result<String> {
-    argo_operation_with(client, kind, ns, name, op, true).await
+    argo_operation_with(client, kind, ns, name, op, true).await.map(|(said, _)| said)
 }
 
 /// [`argo_operation`], returning once the operation is written: a dry run's result is not
-/// waited for (a grouped sync follows each Application's operation itself).
+/// waited for (a grouped sync follows each Application's operation itself). Also gives when
+/// the Application's last operation started, as read right before the write: the one written
+/// is a later one.
 pub async fn argo_start(
     client: Client,
     kind: Kind,
     ns: Option<String>,
     name: String,
     op: super::argo::ops::Op,
-) -> Result<String> {
+) -> Result<(String, Option<String>)> {
     argo_operation_with(client, kind, ns, name, op, false).await
 }
 
@@ -555,7 +557,7 @@ async fn argo_operation_with(
     name: String,
     op: super::argo::ops::Op,
     wait_dry_run: bool,
-) -> Result<String> {
+) -> Result<(String, Option<String>)> {
     use super::argo::ops::{self, Op};
     run(async move {
         let api = dyn_api(client, &kind, ns.as_deref());
@@ -583,6 +585,7 @@ async fn argo_operation_with(
             anyhow::bail!("the operation was not terminated: this Application kind keeps its status apart");
         }
         let mut out = ops::started(&app, &op, &name);
+        let before = super::argo::grouped_sync::started_at(&app);
         if op.dry_run() && wait_dry_run {
             for _ in 0..DRY_RUN_WAIT_SECS {
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
@@ -590,14 +593,14 @@ async fn argo_operation_with(
                 if let Some(result) = ops::dry_run_result(&now) {
                     out.push('\n');
                     out.push_str(&result);
-                    return Ok(out);
+                    return Ok((out, before));
                 }
             }
             out.push_str(&format!(
                 "\nStill running after {DRY_RUN_WAIT_SECS} s: its result will show as the last sync (status.operationState)."
             ));
         }
-        Ok(out)
+        Ok((out, before))
     })
     .await
 }

@@ -27,16 +27,21 @@ use super::dashboard::{chip, link};
 use super::grouped::{labels, some};
 use super::{ArgoView, Key, key};
 use crate::details::{ConfirmButtons as _, Guard, confirm_extras, guard_ok};
+use crate::k8s::argo::diagnosis::Res;
 use crate::k8s::argo::grouped_diff::MAX_APPS;
 use crate::k8s::argo::grouped_sync::{self, Checked, Options, PARALLEL, Progress, Target};
 use crate::k8s::argo::operation_tone;
-use crate::k8s::argo::ops::{self, Op, SyncRequest};
+use crate::k8s::argo::ops::{Op, SyncRequest};
 use crate::k8s::argo::windows::{NextSync, Planner};
+use crate::k8s::argo::{FleetApp, Source, short_revision};
 use crate::status::Tone;
 use crate::ui::selectable::selectable;
 
 /// How often the Applications synced are read while their operations run.
 const READ_EVERY: Duration = Duration::from_secs(2);
+/// How often they are read while the page is hidden, or when more than `MANY` run.
+const READ_SLOWLY: Duration = Duration::from_secs(10);
+const MANY: usize = 50;
 /// They are followed this long at most.
 const FOLLOW_FOR: Duration = Duration::from_secs(30 * 60);
 /// Applications named in the confirmation, at most.
@@ -44,12 +49,19 @@ const NAMED: usize = 10;
 const TERMINATE_NOTE: &str =
     "Argo CD stops the operation running, hooks included. What it applied so far stays as it is.";
 
+/// Every one of `res`, named (what prune deletes is never cut short).
+fn all_named(res: &[Res]) -> String {
+    res.iter().map(Res::label).collect::<Vec<_>>().join(", ")
+}
+
 /// One Application of the sync.
 struct Row {
     key: Key,
     label: String,
     /// Its hub context or API server: what a terminate's confirmation names.
     source: String,
+    /// Read on a hub (not by Argo CD's API).
+    hub: bool,
     target: Target,
     /// When a manual sync of it can start, under its project's sync windows.
     window: NextSync,
@@ -59,6 +71,9 @@ struct Row {
     in_sync: bool,
     /// The answer to its sync's request; None while it is sent.
     sent: Option<Result<String, String>>,
+    /// When its last operation started, as read right before its sync was written: the
+    /// operation followed is a later one (an auto-sync in between is not taken for it).
+    before: Option<String>,
     /// How its operation goes, once sent; an error when it couldn't be sent.
     progress: Option<Result<Progress, String>>,
     /// Why the last read while following it failed.
@@ -124,20 +139,18 @@ impl GroupedSync {
         self.rows.iter().any(|r| r.checked.is_none())
     }
 
-    /// The Applications to follow now (sent, not ended), and whether some are still sent.
-    fn to_follow(&self) -> (Vec<(usize, Target, Option<String>)>, bool) {
+    /// The Applications to follow now (sent, not ended), whether some are still sent, and
+    /// whether the page is shown.
+    fn to_follow(&self) -> (Vec<(usize, Target, Option<String>)>, bool, bool) {
         let follow = self
             .rows
             .iter()
             .enumerate()
             .filter(|(_, r)| r.in_sync && matches!(r.sent, Some(Ok(_))) && !r.ended())
-            .map(|(i, r)| {
-                let before = r.checked.as_ref().and_then(|c| c.as_ref().ok()).and_then(|c| c.before.clone());
-                (i, r.target.clone(), before)
-            })
+            .map(|(i, r)| (i, r.target.clone(), r.before.clone()))
             .collect();
         let sending = self.rows.iter().any(|r| r.in_sync && r.sent.is_none());
-        (follow, sending)
+        (follow, sending, self.shown)
     }
 }
 
@@ -145,6 +158,20 @@ impl ArgoView {
     /// Open the sync of the Applications picked that the filter keeps, and read each. A sync
     /// still running is shown again instead.
     pub(super) fn sync_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let apps = self.selected_apps();
+        let hidden = self.picked_hidden;
+        self.sync_apps(apps, hidden, window, cx);
+    }
+
+    /// Open the sync of `apps` (`hidden`: picks the filter hides, counted), and read each. A
+    /// sync still running is shown again instead.
+    pub(super) fn sync_apps(
+        &mut self,
+        mut apps: Vec<FleetApp>,
+        hidden: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if let Some(g) = self.sync.as_mut().filter(|g| g.running()) {
             g.shown = true;
             cx.notify();
@@ -153,7 +180,6 @@ impl ArgoView {
         if !crate::details::ensure_writes(window, cx) {
             return;
         }
-        let mut apps = self.selected_apps();
         let Some(listed) = &self.rows else { return };
         if apps.is_empty() {
             return;
@@ -169,6 +195,7 @@ impl ArgoView {
                 key: key(a),
                 label,
                 source: a.source.label(),
+                hub: matches!(a.source, Source::Hub(_)),
                 target: Target {
                     source: a.source.clone(),
                     instance: a.instance.clone(),
@@ -179,13 +206,14 @@ impl ArgoView {
                 checked: None,
                 in_sync: false,
                 sent: None,
+                before: None,
                 progress: None,
                 note: None,
             })
             .collect();
         self.sync = Some(GroupedSync {
             rows,
-            hidden: self.picked_hidden,
+            hidden,
             left_out,
             opts: Options::default(),
             sent_with: None,
@@ -253,18 +281,43 @@ impl ArgoView {
         (d.keys() == g.keys()).then(|| d.summary_line()).flatten()
     }
 
+    /// Work out each Application's sync windows again as of now, from the list as last read:
+    /// one a window now denies is left out (the page may have stayed open a while).
+    fn recheck_windows(&mut self) {
+        let now = jiff::Timestamp::now();
+        let mut plan = Planner::new(now);
+        let fresh: Vec<Option<NextSync>> = match (&self.sync, &self.rows) {
+            (Some(g), Some(listed)) => {
+                g.rows.iter().map(|r| self.find(&r.key).map(|a| listed.fleet.sync_window(a, &mut plan, true))).collect()
+            }
+            _ => return,
+        };
+        let Some(g) = &mut self.sync else { return };
+        for (r, w) in g.rows.iter_mut().zip(fresh) {
+            if let Some(w) = w {
+                r.window = w;
+            }
+            if let Some(Ok(c)) = &mut r.checked
+                && c.refused.is_none()
+            {
+                c.refused = grouped_sync::window_refusal(&r.window, now);
+            }
+        }
+    }
+
     /// Confirm the sync of the Applications ready (their count typed, or a wait), then send it.
     fn confirm_grouped_sync(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !crate::details::ensure_writes(window, cx) {
             return;
         }
+        self.recheck_windows();
         let Some(g) = &self.sync else { return };
         if g.sent_with.is_some() || g.checking() {
             return;
         }
         let opts = g.opts;
         let jobs: Vec<(usize, SyncRequest)> =
-            g.rows.iter().enumerate().filter_map(|(i, r)| Some((i, opts.request(&r.ready()?.pruned)))).collect();
+            g.rows.iter().enumerate().filter_map(|(i, r)| Some((i, opts.request(r.ready()?)))).collect();
         if jobs.is_empty() {
             return;
         }
@@ -277,12 +330,25 @@ impl ArgoView {
                 .filter_map(|(i, _)| {
                     let r = &g.rows[*i];
                     let c = r.ready()?;
-                    (!c.pruned.is_empty()).then(|| format!("{}: {}", r.label, ops::named(&c.pruned)))
+                    (!c.pruned.is_empty())
+                        .then(|| format!("{} ({}): {}", r.label, c.pruned.len(), all_named(&c.pruned)))
                 })
                 .collect()
         } else {
             Vec::new()
         };
+        let unknown_windows: Vec<String> = jobs
+            .iter()
+            .filter(|(i, _)| grouped_sync::window_warning(&g.rows[*i].window, g.rows[*i].hub).is_some())
+            .map(|(i, _)| g.rows[*i].label.clone())
+            .collect();
+        let windows_note = (!unknown_windows.is_empty()).then(|| {
+            format!(
+                "Sync windows not known for {}: if one denies a sync now, Argo CD's controller holds the sync until \
+                 it opens (Terminate takes it back).",
+                some(unknown_windows.into_iter(), NAMED)
+            )
+        });
         let danger = opts.prune && !opts.dry_run && !deletes.is_empty();
         let mut sources: Vec<String> = jobs.iter().map(|(i, _)| g.rows[*i].source.clone()).collect();
         sources.sort();
@@ -291,7 +357,8 @@ impl ArgoView {
         let view = cx.entity().downgrade();
         let title = if opts.dry_run { format!("Dry run of a sync of {what}?") } else { format!("Sync {what}?") };
         let note = format!(
-            "Argo CD syncs each to its target revision, {}. {}",
+            "Argo CD syncs each to the revision shown (its target revision when it can't be pinned: auto-sync on, \
+             several sources), {}. {}",
             opts.text(),
             if opts.hooks {
                 "Its PreSync, Sync and PostSync hooks run."
@@ -325,12 +392,13 @@ impl ArgoView {
                                 crate::plural::count(left, "Application")
                             )))
                         })
+                        .children(windows_note.clone().map(|t| div().text_xs().text_color(warning).child(t)))
                         .children(prune_text.map(|t| div().text_xs().text_color(warning).child(t)))
                         .when(!deletes.is_empty(), |v| {
                             v.child(
                                 v_flex()
                                     .id("argo-sync-deletes")
-                                    .max_h(px(160.))
+                                    .max_h(px(220.))
                                     .overflow_y_scroll()
                                     .text_xs()
                                     .text_color(warning)
@@ -387,12 +455,18 @@ impl ArgoView {
         cx.notify();
     }
 
-    fn grouped_sent(&mut self, i: usize, result: Result<String, String>, cx: &mut Context<Self>) {
+    fn grouped_sent(&mut self, i: usize, result: grouped_sync::Sent, cx: &mut Context<Self>) {
         if let Some(r) = self.sync.as_mut().and_then(|g| g.rows.get_mut(i)) {
-            if let Err(e) = &result {
-                r.progress = Some(Err(e.clone()));
+            match result {
+                Ok((said, before)) => {
+                    r.before = before;
+                    r.sent = Some(Ok(said));
+                }
+                Err(e) => {
+                    r.progress = Some(Err(e.clone()));
+                    r.sent = Some(Err(e));
+                }
             }
-            r.sent = Some(result);
         }
         cx.notify();
     }
@@ -404,13 +478,16 @@ impl ArgoView {
         g.follow = Some(cx.spawn(async move |this, cx| {
             let start = Instant::now();
             let exec = cx.background_executor().clone();
+            let mut wait = READ_EVERY;
             loop {
-                exec.timer(READ_EVERY).await;
-                let Ok(Some((todo, sending))) =
+                exec.timer(wait).await;
+                let Ok(Some((todo, sending, shown))) =
                     this.update(cx, |this, _| this.sync.as_ref().map(GroupedSync::to_follow))
                 else {
                     return;
                 };
+                // Hidden, or many: read less often (each read is a whole Application).
+                wait = if shown && todo.len() <= MANY { READ_EVERY } else { READ_SLOWLY };
                 if todo.is_empty() && !sending {
                     return;
                 }
@@ -469,7 +546,7 @@ impl ArgoView {
                         .spawn(cx, async move |cx| {
                             let result = send.await;
                             let _ = cx.update(|window, cx| match result {
-                                Ok(msg) => window.push_notification(Notification::success(msg), cx),
+                                Ok((msg, _)) => window.push_notification(Notification::success(msg), cx),
                                 Err(e) => {
                                     window.push_notification(Notification::error(format!("Terminate failed: {e}")), cx);
                                 }
@@ -709,12 +786,18 @@ impl ArgoView {
             if checked.auto_sync {
                 facts.push("auto-sync on".into());
             }
+            if let Some(rev) = &checked.revision {
+                facts.push(format!("revision {}", short_revision(rev)));
+            }
             out = out.child(line(facts.join(" · "), muted));
+            if let Some(warn) = grouped_sync::window_warning(&r.window, r.hub) {
+                out = out.child(line(warn, theme.warning));
+            }
             if opts.prune {
                 let text = if checked.pruned.is_empty() {
                     "Nothing to prune.".to_string()
                 } else {
-                    format!("Prune deletes {}", ops::named(&checked.pruned))
+                    format!("Prune deletes {}", all_named(&checked.pruned))
                 };
                 out = out.child(line(text, if checked.pruned.is_empty() { muted } else { theme.warning }));
             }
@@ -735,7 +818,9 @@ impl ArgoView {
                 .child(chip(&progress.phase, tone, cx))
                 .children(steps.map(|s| div().text_xs().text_color(muted).child(s)))
                 .child(div().flex_1())
-                .when(!progress.ended && progress.phase != "Waiting", |h| {
+                // Waiting too: Argo CD's controller may hold the operation written (a sync
+                // window it waits for), and terminating it is how to take it back.
+                .when(!progress.ended, |h| {
                     h.child(
                         Button::new(("argo-sync-terminate", i))
                             .xsmall()

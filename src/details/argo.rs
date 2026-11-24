@@ -426,6 +426,8 @@ fn confirm_sync(t: Target, app: &Value, done: Done, window: &mut Window, cx: &mu
     let offered = Rc::new(ops::out_of_sync(app));
     let pick = offered.len() <= PICK_MAX;
     let to_prune = Rc::new(ops::pruned(app, &[]));
+    // What the command shown copies from the Application, as the sync written does.
+    let policy = Rc::new(serde_json::json!({"spec": {"syncPolicy": app.pointer("/spec/syncPolicy").cloned()}}));
     let choice = cx.new(|_| SyncChoice {
         picked: if pick { vec![true; offered.len()] } else { Vec::new() },
         ..Default::default()
@@ -439,7 +441,8 @@ fn confirm_sync(t: Target, app: &Value, done: Done, window: &mut Window, cx: &mu
         let c = choice.read(cx).clone();
         let req = c.request(&offered);
         let gone = ops::reached(&to_prune, &req.resources);
-        let cmd = t.command(&patch_args(&Target::kind_name(), &t.name, &ops::sync_patch(&req)));
+        let cmd =
+            t.command(&patch_args(&Target::kind_name(), &t.name, &ops::with_policy(&policy, ops::sync_patch(&req))));
         let theme = cx.theme();
         let muted = theme.muted_foreground;
         let deletes = c.prune && !c.dry_run && !gone.is_empty();

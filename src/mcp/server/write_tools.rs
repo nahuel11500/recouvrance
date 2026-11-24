@@ -457,6 +457,7 @@ fn argo_op(p: &GitOpsParams) -> Option<Op> {
                 prune: p.prune.unwrap_or(false),
                 dry_run,
                 apply: p.hooks == Some(false),
+                revision: None,
                 prune_shown: None,
             }))
         }
@@ -668,6 +669,33 @@ mod tests {
         assert!(unknown_hint(&kinds, "apps/v1", "Stage").contains("discovery runs again"));
         // A group version discovery didn't have was asked of the API server just now.
         assert_eq!(unknown_hint(&kinds, "kwok.x-k8s.io/v1alpha1", "Stage"), " (the API server serves no such type)");
+    }
+
+    fn gitops(args: serde_json::Value) -> super::GitOpsParams {
+        let mut all = json!({"context": "hub", "kind": "applications", "namespace": "argocd", "name": "web"});
+        for (k, v) in args.as_object().into_iter().flatten() {
+            all[k] = v.clone();
+        }
+        serde_json::from_value(all).unwrap()
+    }
+
+    /// `hooks: false` syncs without hooks (the apply strategy); omitted or true, with them.
+    /// Given to another action, it is refused rather than ignored.
+    #[test]
+    fn a_sync_without_hooks_is_asked_with_hooks_false() {
+        let op = |args| super::argo_op(&gitops(args));
+        let Some(Op::Sync(req)) = op(json!({"action": "sync", "hooks": false})) else { panic!("a sync") };
+        assert!(req.apply);
+        for args in [json!({"action": "sync"}), json!({"action": "sync", "hooks": true})] {
+            let Some(Op::Sync(req)) = op(args) else { panic!("a sync") };
+            assert!(!req.apply);
+        }
+        let misuse = |args| super::gitops_option_misuse(&gitops(args));
+        assert_eq!(misuse(json!({"action": "sync", "hooks": false})), None);
+        for action in ["rollback", "terminate", "refresh"] {
+            let why = misuse(json!({"action": action, "hooks": false})).unwrap();
+            assert!(why.contains("`hooks` applies to `sync` only"), "{why}");
+        }
     }
 
     #[test]
