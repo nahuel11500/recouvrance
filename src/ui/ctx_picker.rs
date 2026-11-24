@@ -66,6 +66,7 @@ impl ContextPicker {
         let color: Hsla =
             crate::settings::context_color(name).map_or(theme.muted_foreground.opacity(0.4), |c| rgb(c).into());
         let protected = crate::settings::is_protected(name);
+        let read_only = crate::settings::is_read_only(name);
         let connected = self.connected.iter().any(|c| c == name);
         let (n1, n2) = (name.to_string(), name.to_string());
         let favorite = crate::favorites::Favorite::Context(name.to_string());
@@ -121,6 +122,7 @@ impl ContextPicker {
                     .child(name.to_string()),
             )
             .when(protected, |d| d.child(Icon::new(Lucide::Lock).size_3p5().text_color(theme.warning)))
+            .when(read_only, |d| d.child(div().text_xs().text_color(theme.muted_foreground).child("read-only")))
             .when(connected, |d| d.child(div().text_xs().text_color(theme.blue).child("connected")))
             .child(star)
             // A click on the row switches to just this context.

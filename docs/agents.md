@@ -92,6 +92,9 @@ Write mode and protected contexts are for you in the window: an agent's calls do
 only its rules (with the rate limit and the kill switch below). An Allow rule for a write lets the
 agent write while the window shows `read-only`, and on a protected context without its name typed or a wait;
 to keep agents off a context or from writing, give them *Ask me* or Deny rules for it (or no Allow).
+A context set *Read-only* in Settings → Contexts is the exception: every call with a write verb on
+it (dry runs too) is refused whatever the rules say, with a final refusal, checked again right
+before the change is sent; reads are left to the rules.
 The context `@protected` stands for the contexts protected in Settings → Contexts, read again at
 each call, so a context protected later (or guessed as production when it appears) is covered
 without editing the rules. It works in Ask and Deny rules only (the Agents page doesn't save an

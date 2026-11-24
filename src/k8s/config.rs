@@ -548,6 +548,7 @@ fn client(mut config: Config, context: String, gated: bool, proxy_cut: bool) -> 
     // watches, logs and shells stream after that and are not cut.
     let timeout = tower::timeout::TimeoutLayer::new(REQUEST_TIMEOUT);
     // Outside the timeout, so a request it cuts is counted as failed.
+    let write_gate = gate::WriteGateLayer { context: context.as_str().into() };
     let meter = meter::MeterLayer { context };
     // kube's error for a failed login command names its program among its arguments, or not at
     // all (when it could not be started): it is named from the kubeconfig instead.
@@ -561,7 +562,7 @@ fn client(mut config: Config, context: String, gated: bool, proxy_cut: bool) -> 
         .with_layer(&retry::RetryLayer)
         .with_layer(&timeout)
         .with_layer(&meter);
-    Ok(if gated { builder.with_layer(&gate::WriteGateLayer).build() } else { builder.build() })
+    Ok(if gated { builder.with_layer(&write_gate).build() } else { builder.build() })
 }
 
 /// Where a context points: its kubeconfig cluster's name and server URL, and its user's

@@ -109,6 +109,17 @@ pub fn ensure_writes(window: &mut Window, cx: &mut App) -> bool {
     false
 }
 
+/// Whether the window may write to `context`: not when it is read-only (Settings →
+/// Contexts), whatever write mode says. Says so when it is. The gate refuses such writes
+/// anyway when they are sent; this stops them before a dialog asks for nothing.
+pub fn not_read_only(context: &str, window: &mut Window, cx: &mut App) -> bool {
+    if !crate::settings::is_read_only(context) {
+        return true;
+    }
+    window.push_notification(Notification::error(k8s::gate::read_only_refusal(context)), cx);
+    false
+}
+
 /// Write mode is still on. Checked again after a dry run or a lookup, and when a write is
 /// confirmed: it may have been turned off since the write was asked for. Says so when off.
 pub fn writes_still_on(window: &mut Window, cx: &mut App) -> bool {

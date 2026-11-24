@@ -135,7 +135,8 @@ what you can check for yourself:
   DaemonSets, PersistentVolumes and their claims, and CRDs get the strict confirmation). A
   protected context always gets the strict confirmation: a few seconds' wait by default (the
   confirm button counts down, then works), or the names typed. Write mode and protection are for you in the window:
-  agents are not bound by them, unless their rules name `@protected`. Agents get only what their rules allow (an *Ask me* rule asks you
+  agents are not bound by them, unless their rules name `@protected`. A context set read-only
+  takes no write from the window or from agents, whatever write mode or their rules say. Agents get only what their rules allow (an *Ask me* rule asks you
   first), every call is logged to
   `~/.local/share/recouvrance/audit.jsonl`, and a kill switch cuts them all off.
 - **Verifiable releases.** Every release archive, `.deb` and AppImage has a build provenance

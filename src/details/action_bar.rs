@@ -218,8 +218,10 @@ impl DetailPanel {
                                 "Cordons the node, then evicts its pods (DaemonSet and static pods stay). PodDisruptionBudgets are respected; refused evictions are reported.",
                                 "Drain",
                                 |p, client| {
-                                    // The gate refuses each eviction once write mode is off; stop at the first.
-                                    let off = || (!k8s::gate::ui_writes()).then(|| k8s::gate::WRITES_OFF.to_string());
+                                    // The gate refuses each eviction once write mode is off, or the
+                                    // context made read-only; stop at the first.
+                                    let context = p.context.clone();
+                                    let off = move || k8s::gate::refusal(&context);
                                     Box::pin(k8s::drain(client, p.obj.name.clone(), off))
                                 },
                                 w,

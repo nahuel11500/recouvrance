@@ -375,6 +375,20 @@ impl AppView {
             .into_iter()
             .filter_map(|(ctx, r)| self.clusters.get(ctx).map(|(name, client)| (name.clone(), client.clone(), r)))
             .collect();
+        // Rows of a read-only context would each be refused when sent: say so once instead.
+        let read_only: std::collections::BTreeSet<&str> =
+            targets.iter().map(|t| t.0.as_str()).filter(|c| crate::settings::is_read_only(c)).collect();
+        if !read_only.is_empty() {
+            let names: Vec<&str> = read_only.into_iter().collect();
+            let msg = format!(
+                "{} {} read-only: uncheck {} rows, or change that in Settings → Contexts",
+                names.join(", "),
+                if names.len() == 1 { "is" } else { "are" },
+                if names.len() == 1 { "its" } else { "their" },
+            );
+            window.push_notification(Notification::error(msg), cx);
+            return;
+        }
         let mut protected: Vec<String> =
             targets.iter().map(|t| t.0.clone()).filter(|c| crate::settings::is_protected(c)).collect();
         protected.sort();

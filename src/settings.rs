@@ -7,8 +7,8 @@ use std::sync::{LazyLock, Mutex, OnceLock, RwLock};
 
 use serde::{Deserialize, Deserializer, Serialize};
 
-/// `protection` entry by entry: a value that isn't `true` or `false` (a hand edit) protects
-/// its context, and never costs the other entries theirs.
+/// `protection` (and `read_only`) entry by entry: a value that isn't `true` or `false` (a hand
+/// edit) protects its context (makes it read-only), and never costs the other entries theirs.
 fn protection_entries<'de, D: Deserializer<'de>>(d: D) -> Result<std::collections::BTreeMap<String, bool>, D::Error> {
     let raw = std::collections::BTreeMap::<String, serde_json::Value>::deserialize(d)?;
     Ok(raw.into_iter().map(|(k, v)| (k, v.as_bool().unwrap_or(true))).collect())
@@ -321,6 +321,15 @@ pub struct Settings {
     /// protected instead of guessed, until this is turned off in Settings → Contexts.
     #[serde(skip_serializing_if = "std::ops::Not::not", deserialize_with = "false_or_true")]
     pub protect_unset: bool,
+    /// Contexts the window never writes to, whatever write mode says, and agents never
+    /// write to, whatever their rules say (true), or set back (false). Not set: not
+    /// read-only.
+    #[serde(deserialize_with = "protection_entries")]
+    pub read_only: std::collections::BTreeMap<String, bool>,
+    /// The read-only choices could not be read once: every context without a choice is
+    /// read-only, until this is turned off in Settings → Contexts.
+    #[serde(skip_serializing_if = "std::ops::Not::not", deserialize_with = "false_or_true")]
+    pub read_only_unset: bool,
     /// Prometheus per context as `namespace/service:port` (found automatically when unset).
     pub prometheus: std::collections::HashMap<String, String>,
     /// Range of usage charts, in minutes (last choice).
@@ -589,6 +598,8 @@ impl Default for Settings {
             protected_contexts: None,
             protection: Default::default(),
             protect_unset: false,
+            read_only: Default::default(),
+            read_only_unset: false,
             prometheus: Default::default(),
             usage_range: 60,
             recent_contexts: Vec::new(),
@@ -654,7 +665,7 @@ fn path() -> PathBuf {
 fn load() -> Settings {
     let (settings, error) = load_from(&path());
     if let Some(e) = error {
-        eprintln!("{e}; using defaults, every context not set is protected, and nothing is saved");
+        eprintln!("{e}; using defaults, every context not set is protected and read-only, and nothing is saved");
         let _ = LOAD_ERROR.set(e);
     }
     settings
@@ -681,21 +692,27 @@ fn load_from(p: &Path) -> (Settings, Option<String>) {
 }
 
 /// Settings from the file's bytes: what reads, why the rest didn't, and whether the
-/// protection choices were lost with it.
+/// protection choices were lost with it. Read-only choices lost with it set
+/// `read_only_unset`, so every context without one is read-only.
 fn from_bytes(bytes: &[u8]) -> (Settings, Option<serde_json::Error>, bool) {
     match serde_json::from_slice(bytes) {
         Ok(v) => (v, None, false),
         Err(e) => {
-            let lost = match serde_json::from_slice::<serde_json::Value>(bytes) {
-                Ok(serde_json::Value::Object(fields)) => {
-                    fields.get("protection").is_some_and(|p| !p.is_object())
-                        || fields
-                            .get("protected_contexts")
-                            .is_some_and(|p| serde_json::from_value::<Option<Vec<String>>>(p.clone()).is_err())
-                }
-                _ => true,
+            let fields = match serde_json::from_slice::<serde_json::Value>(bytes) {
+                Ok(serde_json::Value::Object(fields)) => Some(fields),
+                _ => None,
             };
-            (by_field(bytes).unwrap_or_default(), Some(e), lost)
+            let lost = fields.as_ref().is_none_or(|fields| {
+                fields.get("protection").is_some_and(|p| !p.is_object())
+                    || fields
+                        .get("protected_contexts")
+                        .is_some_and(|p| serde_json::from_value::<Option<Vec<String>>>(p.clone()).is_err())
+            });
+            let mut settings: Settings = by_field(bytes).unwrap_or_default();
+            if fields.as_ref().is_none_or(|fields| fields.get("read_only").is_some_and(|r| !r.is_object())) {
+                settings.read_only_unset = true;
+            }
+            (settings, Some(e), lost)
         }
     }
 }
@@ -872,6 +889,25 @@ pub fn set_protected(context: &str, on: bool) {
     migrate_protection();
     update(|s| {
         s.protection.insert(context.to_string(), on);
+    });
+}
+
+/// Whether the window and agents must never write to this context (see
+/// `Settings::read_only`). Every context without a choice is read-only when the choices, or
+/// the settings file, could not be read.
+pub fn is_read_only(context: &str) -> bool {
+    with(|s| read_only_in(s, context, load_error().is_some()))
+}
+
+/// [`is_read_only`] in `s`; `file_lost`: the settings file could not be read.
+fn read_only_in(s: &Settings, context: &str, file_lost: bool) -> bool {
+    s.read_only.get(context).copied().unwrap_or(file_lost || s.read_only_unset)
+}
+
+/// Make a context read-only or not.
+pub fn set_read_only(context: &str, on: bool) {
+    update(|s| {
+        s.read_only.insert(context.to_string(), on);
     });
 }
 
@@ -1352,6 +1388,21 @@ mod tests {
         std::fs::remove_dir_all(d).unwrap();
     }
 
+    /// By default no context is read-only: a new install, and a file from before the setting.
+    /// A settings file that can't be read makes every context without a choice read-only.
+    #[test]
+    fn no_context_is_read_only_unless_set_or_lost() {
+        let ro = super::read_only_in;
+        assert!(!ro(&Settings::new_install(), "prod", false));
+        assert!(!ro(&super::from_bytes(br#"{"protection": {"prod": true}}"#).0, "prod", false));
+        let set = super::from_bytes(br#"{"read_only": {"prod": true, "dev": false}}"#).0;
+        assert!(ro(&set, "prod", false) && !ro(&set, "dev", false) && !ro(&set, "other", false));
+        // The file unreadable: only a context set back stays writable.
+        assert!(ro(&set, "other", true) && !ro(&set, "dev", true));
+        assert!(super::from_bytes(br#"{"read_only_unset": "x"}"#).0.read_only_unset);
+        assert!(!serde_json::to_string(&Settings::default()).unwrap().contains("read_only_unset"));
+    }
+
     /// What's new is for updates: a new install has seen the version it starts with, a file
     /// from before What's new has seen none (so this version's notes show once).
     #[test]
@@ -1574,18 +1625,21 @@ mod properties {
         #[test]
         fn a_bad_field_costs_only_itself(
             protection in protection(),
+            read_only in protection(),
             refresh in 1..1000u64,
             spoiled in prop::collection::btree_map(0..40usize, bad(), 0..4),
         ) {
             // The version seen is written only when set: set, so it can be spoiled too.
             let good = Settings {
                 protection: protection.clone(),
+                read_only: read_only.clone(),
                 metrics_refresh: refresh,
                 last_seen_version: Some("0.9.0".into()),
                 ..Settings::default()
             };
             let Value::Object(mut fields) = serde_json::to_value(&good).unwrap() else { unreachable!() };
-            let keys: Vec<String> = fields.keys().filter(|k| *k != "protection").cloned().collect();
+            let keys: Vec<String> =
+                fields.keys().filter(|k| *k != "protection" && *k != "read_only").cloned().collect();
             let mut hit = std::collections::HashSet::new();
             for (i, v) in &spoiled {
                 let key = &keys[i % keys.len()];
@@ -1595,6 +1649,8 @@ mod properties {
             let (read, _, lost) = from_bytes(&serde_json::to_vec(&fields).unwrap());
             prop_assert!(!lost);
             prop_assert_eq!(&read.protection, &protection);
+            prop_assert_eq!(&read.read_only, &read_only);
+            prop_assert!(!read.read_only_unset);
             let read = serde_json::to_value(&read).unwrap();
             let want = serde_json::to_value(&good).unwrap();
             for key in &keys {
@@ -1723,6 +1779,47 @@ mod properties {
             prop_assert!(from_bytes(truncated).2);
             let replaced = serde_json::to_vec(&json!({"protection": bad})).unwrap();
             prop_assert_eq!(from_bytes(&replaced).2, !bad.is_object());
+        }
+
+        /// Whatever the file holds, a context saved read-only reads read-only: a value that
+        /// isn't true or false makes its context read-only, and when the choices can't be
+        /// read at all (the field, or the file cut short), every context without one is.
+        /// Saved again, it stays so.
+        #[test]
+        fn a_read_only_context_never_reads_writable(
+            read_only in protection(),
+            other in junk(),
+            spoiled in prop::option::of(bad()),
+            cut in prop::option::of(1..200usize),
+            name in "[A-Z]{1,6}",
+        ) {
+            let mut text = json!({"read_only": read_only, "sessions": other, "metrics_refresh": 7});
+            if let Some(bad) = &spoiled {
+                text["read_only"] = bad.clone();
+            }
+            let bytes = serde_json::to_vec(&text).unwrap();
+            let bytes = match cut {
+                Some(cut) => &bytes[..cut.min(bytes.len() - 1)],
+                None => &bytes[..],
+            };
+            let (read, _, _) = from_bytes(bytes);
+            let ro = |s: &Settings, c: &str| super::read_only_in(s, c, false);
+            if cut.is_some() || spoiled.as_ref().is_some_and(|b| !b.is_object()) {
+                prop_assert!(ro(&read, &name), "a context without a choice is writable");
+            } else if let Some(bad) = &spoiled {
+                for k in bad.as_object().into_iter().flat_map(|o| o.keys()) {
+                    prop_assert!(ro(&read, k));
+                }
+            } else {
+                prop_assert!(!ro(&read, &name));
+                for (k, v) in &read_only {
+                    prop_assert_eq!(ro(&read, k), *v);
+                }
+            }
+            let (again, error, _) = from_bytes(&serde_json::to_vec(&read).unwrap());
+            prop_assert!(error.is_none());
+            prop_assert_eq!(&again.read_only, &read.read_only);
+            prop_assert_eq!(again.read_only_unset, read.read_only_unset);
         }
     }
 }

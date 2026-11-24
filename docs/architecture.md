@@ -136,7 +136,8 @@ is read every `detail_refresh`.
 - **Agents** go through the hub: rules (deny, ask, allow), approvals (which show what a write will
   change, worked out with a server dry run), a rate limit, an audit log and a kill switch. Write mode
   and protected contexts don't apply to them: only their rules do (an Ask or Deny rule can name
-  `@protected`).
+  `@protected`). A context set read-only refuses every write, the window's (in the client's write
+  gate, whatever write mode says) and the agents' (in the MCP server, whatever their rules say).
 - **Login commands keep their secrets.** kube's error for a failed exec plugin holds its whole
   command line and its output; each client replaces it, when it is built and on every request
   (a token refresh runs the plugin again), by the program's file name, taken from the kubeconfig,

@@ -179,6 +179,9 @@ impl TerminalView {
         let Some(context) = self.guard.clone() else {
             return start(self, window, cx);
         };
+        if !crate::details::not_read_only(&context, window, cx) {
+            return;
+        }
         // Write mode may have been turned off since the last session: check it every time.
         if !crate::details::ensure_writes(window, cx) {
             return;

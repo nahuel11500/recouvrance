@@ -1324,8 +1324,8 @@ fn sync_body(mut body: Value, req: &super::ops::SyncRequest) -> Value {
 }
 
 /// Ask Argo CD for `action` on the Application `namespace/name`, by its API, with the
-/// server's login as the config has it now (`current`). Refused while write mode is off,
-/// checked as it is sent, as the UI's other writes are. A sync reads the Application right
+/// server's login as the config has it now (`current`). Refused while write mode is off, or
+/// the server is set read-only, checked as it is sent, as the UI's other writes are. A sync reads the Application right
 /// before it is sent and is refused as argocd-server would refuse it (an operation running),
 /// or when prune would now delete more than was shown.
 pub async fn act(endpoint: Arc<Endpoint>, namespace: String, name: String, action: Action) -> Result<String, String> {
@@ -1358,8 +1358,9 @@ pub async fn act_read(
             }
             read = Some((app, op));
         }
-        if !crate::k8s::gate::ui_writes() {
-            return Ok(Err(crate::k8s::gate::WRITES_OFF.to_string()));
+        // Keyed by the server's name, as its protection is.
+        if let Some(why) = crate::k8s::gate::refusal(&endpoint.name()) {
+            return Ok(Err(why));
         }
         let (method, path, body) = request(&action, &namespace, &name);
         let sent = conn.call(method, &path, body.as_ref()).await;

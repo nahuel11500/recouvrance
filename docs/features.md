@@ -644,6 +644,12 @@
   their rules instead). Contexts you have not set are guessed from the context,
   user and cluster names and the server URL (`prod`, `prd`, `production`, `live`, `admin`, `root`),
   so new production contexts are protected too. Set both in Settings → Contexts.
+- **Read-only contexts** (Settings → Contexts → *Read-only*): the window never writes to them, even
+  with write mode on. Their writes, shells, attach, Helm changes, Argo CD actions and writing
+  plugins are refused when sent ("prod-eu is read-only"), and a bulk action on checked rows that
+  include one does nothing and says so. Reads, logs, port-forwards and dry runs still work. Agents
+  can't write to them either, whatever their rules say: the refusal is final, and `check_access`
+  and the Agents page's test say so. The context picker marks them `read-only`.
 - **Diagnosis** on pods and workloads: why it is broken (crash output and exit code, scheduling,
   image pulls, probes, volumes) and what to try. On a workload's page it also says where the
   failure comes from, from its pods' revisions and nodes: the new revision (only its pods fail,
