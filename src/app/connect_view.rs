@@ -22,7 +22,8 @@ impl AppView {
     fn conn_rows(&self, cx: &Context<Self>) -> Vec<AnyElement> {
         let theme = cx.theme();
         (self.conn.iter())
-            .map(|(ctx, state)| {
+            .enumerate()
+            .map(|(i, (ctx, state))| {
                 let (icon, color, said) = match state {
                     Conn::Connecting => (Lucide::LoaderCircle, theme.muted_foreground, "Connecting…".to_string()),
                     Conn::Failed(why) => (Lucide::TriangleAlert, theme.danger, format!("Can't connect: {why}")),
@@ -32,7 +33,7 @@ impl AppView {
                     .items_start()
                     .text_sm()
                     .child(div().pt_0p5().flex_none().child(Icon::new(icon).size_4().text_color(color)))
-                    .child(div().flex_none().font_weight(FontWeight::SEMIBOLD).child(ctx.clone()))
+                    .child(name_cell(i, ctx))
                     .child(div().min_w_0().flex_1().text_color(color).child(selectable(said)))
                     .into_any_element()
             })
@@ -116,4 +117,19 @@ impl AppView {
                 .into_any_element(),
         )
     }
+}
+
+/// A context's name in a connect line: the short name, so a long cloud id doesn't squeeze
+/// why it can't connect, with the full name on hover.
+fn name_cell(i: usize, ctx: &str) -> AnyElement {
+    let short = crate::k8s::short_names::short_name(ctx);
+    let cell = div().flex_none().font_weight(FontWeight::SEMIBOLD);
+    if short == ctx {
+        return cell.child(short).into_any_element();
+    }
+    let full = SharedString::from(ctx.to_string());
+    cell.id(("conn-ctx", i))
+        .tooltip(move |w, cx| component::tooltip::Tooltip::new(full.clone()).build(w, cx))
+        .child(short)
+        .into_any_element()
 }

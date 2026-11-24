@@ -235,6 +235,13 @@ impl AppView {
                         }
                         None => (None, theme.muted_foreground, None),
                     };
+                    // A shortened name shows in full on hover, above why it can't connect.
+                    let short = k8s::short_names::short_name(ctx);
+                    let tip = match (short != *ctx, why) {
+                        (true, Some(why)) => Some(SharedString::from(format!("{ctx}\n{why}"))),
+                        (true, None) => Some(SharedString::from(ctx.clone())),
+                        (false, why) => why,
+                    };
                     h_flex()
                         .id(("ctx-card", i))
                         .w(px(290.))
@@ -266,7 +273,7 @@ impl AppView {
                                         .overflow_hidden()
                                         .text_ellipsis()
                                         .whitespace_nowrap()
-                                        .child(ctx.clone()),
+                                        .child(short),
                                 )
                                 .child(
                                     h_flex()
@@ -280,8 +287,8 @@ impl AppView {
                                         .when_some(state, |d, s| d.child(div().text_color(state_color).child(s))),
                                 ),
                         )
-                        .when_some(why, |d, why| {
-                            d.tooltip(move |w, cx| component::tooltip::Tooltip::new(why.clone()).build(w, cx))
+                        .when_some(tip, |d, tip| {
+                            d.tooltip(move |w, cx| component::tooltip::Tooltip::new(tip.clone()).build(w, cx))
                         })
                 })))
                 .child(
