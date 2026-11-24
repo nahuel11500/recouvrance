@@ -1,8 +1,9 @@
 //! The Argo CD page: every Application of the contexts that serve Argo CD and of the Argo CD
 //! API servers (the argocd CLI's, and those set in Settings → Argo CD), each under the app of
 //! apps that made it or with the other environments of its service, with where it deploys
-//! mapped to a kubeconfig context and when it can sync next. Opening one shows its page on
-//! Argo CD's cluster (or in Argo CD's web UI, when read by the API); its menu refreshes or
+//! mapped to a kubeconfig context and when it can sync next. Opening one, or a service, shows
+//! the dashboard of its service, a tab per environment (see `dashboard`); its menu opens its
+//! page on Argo CD's cluster (or in Argo CD's web UI, when read by the API), refreshes or
 //! syncs it.
 //!
 //! A hub's Applications are read again at the refresh rate; an API server's are kept live
@@ -30,6 +31,8 @@ use crate::k8s::argo::{self, ApiRead, Fleet, FleetApp, Source, Summary, api};
 use crate::k8s::{self, ObjectRef};
 use crate::overview::column_cell as column;
 use crate::status::Tone;
+
+mod dashboard;
 
 // MARK: Grouping
 
@@ -467,6 +470,8 @@ pub struct ArgoView {
     checking: Option<String>,
     check_note: Option<String>,
     check: crate::latest::Latest,
+    /// The dashboard of a service, shown instead of the list while it is open.
+    dashboard: Option<dashboard::Dashboard>,
     _subs: Vec<Subscription>,
 }
 
@@ -538,7 +543,13 @@ impl ArgoView {
                     let relogged = exec.spawn(async { api::config_stamp() }).await != stamp;
                     if !shown || relogged || api::generation() != generation {
                         // Hidden, or the servers changed: the feeds stop unless another page holds them.
-                        let _ = this.update(cx, |this, _| this.watches.clear());
+                        // Hidden, the dashboard's read stops too; it reads again once shown.
+                        let _ = this.update(cx, |this, cx| {
+                            this.watches.clear();
+                            if !shown {
+                                this.dashboard_hidden(cx);
+                            }
+                        });
                         break;
                     }
                     let now = api::changes();
@@ -574,6 +585,7 @@ impl ArgoView {
             checking: None,
             check_note: None,
             check: Default::default(),
+            dashboard: None,
             _subs: subs,
         }
     }
@@ -628,6 +640,7 @@ impl ArgoView {
         self.build.spawn(cx, work, |this, rows, cx| {
             this.rows = Some(rows);
             this.refilter(cx);
+            this.dashboard_changed(cx);
             cx.notify();
         });
     }
@@ -893,7 +906,7 @@ impl ArgoView {
         let k = key(a);
         let view = cx.entity().downgrade();
         let open_key = k.clone();
-        let open = cx.listener(move |this, _, _, cx| this.open(&open_key, cx));
+        let open = cx.listener(move |this, _, _, cx| this.open_dashboard(&open_key, cx));
         let cx: &App = cx;
         let theme = cx.theme();
         let muted = theme.muted_foreground;
@@ -1038,11 +1051,14 @@ impl ArgoView {
         let view = cx.entity().downgrade();
         let collapsed = self.collapsed_services.contains(service);
         let flip = {
-            let service = service.clone();
+            let (service, view) = (service.clone(), view.clone());
             move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
                 let service = service.clone();
                 let _ = view.update(cx, |this, cx| this.toggle_service(service, cx));
             }
+        };
+        let open = move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
+            let _ = view.update(cx, |this, cx| this.open_service(g, cx));
         };
         let cx: &App = cx;
         let theme = cx.theme();
@@ -1061,9 +1077,8 @@ impl ArgoView {
             .border_color(theme.border)
             .bg(theme.muted)
             .cursor_pointer()
-            .on_click(flip)
             .child(
-                div().w(px(20.)).flex_none().child(
+                div().id(("argo-service-fold", i)).w(px(20.)).flex_none().on_click(flip).child(
                     Icon::new(if collapsed { Lucide::ChevronRight } else { Lucide::ChevronDown })
                         .size_4()
                         .text_color(muted),
@@ -1071,10 +1086,12 @@ impl ArgoView {
             )
             .child(
                 h_flex()
+                    .id(("argo-service-open", i))
                     .flex_1()
                     .min_w_0()
                     .gap_2()
                     .overflow_hidden()
+                    .on_click(open)
                     .child(div().size(px(7.)).flex_none().rounded_full().bg(tone.color(cx)))
                     .child(div().font_weight(FontWeight::MEDIUM).whitespace_nowrap().child(service.clone()))
                     .child(div().text_xs().text_color(muted).child(crate::plural::count(members.len(), "Application")))
@@ -1316,6 +1333,12 @@ fn row_menu(
                 let _ = view.update(cx, |this, cx| this.open(&k, cx));
             }
         };
+        let board = {
+            let (view, k) = (view.clone(), k.clone());
+            move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
+                let _ = view.update(cx, |this, cx| this.open_dashboard(&k, cx));
+            }
+        };
         let destination = {
             let (view, k) = (view.clone(), k.clone());
             move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
@@ -1333,7 +1356,8 @@ fn row_menu(
         } else {
             PopupMenuItem::new("Open").icon(Lucide::PanelRightOpen)
         };
-        menu.item(open_item.on_click(open))
+        menu.item(PopupMenuItem::new("Dashboard").icon(Lucide::LayoutDashboard).on_click(board))
+            .item(open_item.on_click(open))
             .item(
                 PopupMenuItem::new("Open destination namespace")
                     .icon(Lucide::FolderOpen)
@@ -1363,6 +1387,9 @@ fn row_menu(
 
 impl Render for ArgoView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.dashboard.is_some() {
+            return v_flex().size_full().p_2().child(self.dashboard_view(cx));
+        }
         let theme = cx.theme().clone();
         let body: AnyElement = match &self.rows {
             None => div().p_4().text_color(theme.muted_foreground).child("Reading Argo CD…").into_any_element(),

@@ -41,6 +41,7 @@ impl AppView {
             "access" => self.open_access(window, cx),
             "apply" => self.open_apply(window, cx),
             "helm" => self.open_helm(window, cx),
+            "argo" => self.open_argo(window, cx),
             "assistant" => self.open_assistant(window, cx),
             "assistant-dock" => self.toggle_assistant(window, cx),
             "settings" => self.navigate(Route::Settings, cx),
@@ -175,6 +176,12 @@ impl AppView {
                 self.ns_picker.update(cx, |p, cx| p.demo_search(&text, window, cx));
             }
             "newtab" => self.new_tab(None, window, cx),
+            // The Argo CD page's dashboard, on a made-up example (no real data).
+            "argo-example" => {
+                if let Route::Argo(page) = self.route().clone() {
+                    page.update(cx, crate::ui::argo::ArgoView::demo_dashboard);
+                }
+            }
             // What's new: this version's notes, or those shown after an update from a version.
             "whats-new" => crate::ui::whats_new::open_own(window, cx),
             other if other.starts_with("whats-new:") => {
