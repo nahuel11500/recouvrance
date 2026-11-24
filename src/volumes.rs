@@ -184,8 +184,11 @@ pub struct Volumes {
 /// of one cluster (two windows, a namespace and the whole cluster) share it meanwhile.
 const FRESH: Duration = Duration::from_secs(30);
 
-/// The last answer of each cluster, by context, and when it came.
-static LAST: LazyLock<Mutex<HashMap<String, (Instant, Arc<Volumes>)>>> = LazyLock::new(Default::default);
+/// An answer, and when it came.
+type Kept = (Instant, Arc<Volumes>);
+
+/// The last answer of each cluster, by context.
+static LAST: LazyLock<Mutex<HashMap<String, Kept>>> = LazyLock::new(Default::default);
 
 /// The claims filling up in the cluster of `context`: one instant query to its Prometheus,
 /// nothing to the API server's lists. Nothing to say without Prometheus (or with metrics off)
