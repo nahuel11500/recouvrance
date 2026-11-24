@@ -2,6 +2,7 @@
 //! `permissions.allow / ask / deny`, with kubectl-like rule strings:
 //!
 //! ```yaml
+//! version: 2
 //! agents:
 //!   Claude:
 //!     allow:
@@ -20,6 +21,8 @@
 //! lists are comma-separated, `*` globs work everywhere, an omitted part means `*`, and `-`
 //! is an empty list (the rule matches nothing until you fill it in). In ask and deny rules,
 //! the context `@protected` stands for the contexts protected in Settings → Contexts.
+//! `version` says which rules the file holds: one without it was written before the GitOps
+//! verbs, and is read as such (see [`apply_upgrading`]).
 //! When the file exists it is the source of truth: Recouvrance reloads it when it changes,
 //! and edits on the Agents page are written back to it (its comments are not kept).
 
@@ -41,9 +44,19 @@ pub fn path() -> PathBuf {
 #[derive(Serialize, Deserialize, Default, Debug)]
 #[serde(deny_unknown_fields)]
 pub struct RulesFile {
+    /// Which rules the file holds, [`FILE_VERSION`] when this version wrote it. Missing (0)
+    /// or older, its rules are upgraded when loaded, whatever agents.json says: the file
+    /// may be older than agents.json (restored, copied from another machine, or given with
+    /// no agents.json at all).
+    #[serde(default)]
+    pub version: u32,
     #[serde(default)]
     pub agents: BTreeMap<String, AgentRules>,
 }
+
+/// The `version` every rules.yaml written now says: its rules check GitOps actions with
+/// their own verbs.
+pub const FILE_VERSION: u32 = GITOPS_VERBS_VERSION;
 
 #[derive(Serialize, Deserialize, Default, Debug, Clone)]
 #[serde(deny_unknown_fields)]
@@ -308,17 +321,21 @@ pub fn apply_file(file: &RulesFile, agents: &mut Vec<super::Agent>, keep_unnamed
     Ok(())
 }
 
-/// [`apply_file`] for agents.json saved at `version`, upgrading what that version left out:
-/// before 0.3.0 (`SECTIONS_VERSION`) an agent created then had no section until its rules
-/// were edited, so it keeps its rules; before the GitOps verbs (`GITOPS_VERBS_VERSION`)
-/// every rule that names `patch` gets them ([`Policy::add_gitops_verbs`]). Whether the file
-/// must be written again to hold that, once: later loads read it as written.
+/// [`apply_file`], upgrading what older rules left out. With agents.json saved before 0.3.0
+/// (`version` below `SECTIONS_VERSION`) an agent created then had no section until its
+/// rules were edited, so it keeps its rules. Rules from before the GitOps verbs
+/// (`GITOPS_VERBS_VERSION`) get them where they name `patch` ([`Policy::add_gitops_verbs`]):
+/// a section when the file's own `version` is older, whatever agents.json's says (the file
+/// can be older than it), and the rules an unnamed agent keeps when agents.json's is.
+/// Whether the file must be written again to hold that, once: it is then written with
+/// [`FILE_VERSION`], and later loads read it as written.
 pub fn apply_upgrading(file: &RulesFile, agents: &mut Vec<super::Agent>, version: u32) -> Result<bool> {
     let keep_unnamed = version < SECTIONS_VERSION;
     apply_file(file, agents, keep_unnamed)?;
     let mut rewrite = keep_unnamed && agents.iter().any(|a| !file.agents.contains_key(&a.name));
-    if version < GITOPS_VERBS_VERSION {
-        for agent in agents.iter_mut() {
+    for agent in agents.iter_mut() {
+        let saved_at = if file.agents.contains_key(&agent.name) { file.version } else { version };
+        if saved_at < GITOPS_VERBS_VERSION {
             rewrite |= agent.policy.add_gitops_verbs();
         }
     }
@@ -344,6 +361,8 @@ pub fn check(text: &str) -> Result<RulesFile> {
 
 pub const HEADER: &str = "# Recouvrance agent rules. Deny wins, then ask, then allow; anything no rule matches is denied.\n\
 # `approved` holds requests you approved in the app: they win over ask, not over deny.\n\
+# `version: 2`: rules written for this version. A file without it is read as written before the\n\
+# GitOps verbs: rules that name patch get refresh, sync and suspend too.\n\
 # A rule: VERBS RESOURCES[/NAMES] [-n NAMESPACES] [--context CONTEXTS] [until 2026-11-01]\n\
 # Lists are comma-separated and * globs work everywhere; an omitted part means *, and - means none.\n\
 # Verbs: get list logs reveal exec scale restart patch refresh sync suspend apply delete drain forward (or *).\n\
@@ -366,7 +385,7 @@ pub fn render(agents: &[super::Agent]) -> Result<String> {
         .iter()
         .map(|a| Ok((a.name.clone(), from_policy(&a.policy).with_context(|| format!("agent `{}`", a.name))?)))
         .collect::<Result<_>>()?;
-    Ok(format!("{HEADER}\n{}", crate::yaml::to_string(&RulesFile { agents })?))
+    Ok(format!("{HEADER}\n{}", crate::yaml::to_string(&RulesFile { version: FILE_VERSION, agents })?))
 }
 
 /// Write the file at `path` for these agents, over `seen`: the text last loaded or written.
@@ -627,6 +646,13 @@ mod properties {
         })
     }
 
+    /// A file as written before it had a `version`.
+    fn without_version(text: &str) -> String {
+        let marker = format!("\nversion: {FILE_VERSION}\n");
+        assert!(text.contains(&marker), "{text}");
+        text.replacen(&marker, "\n", 1)
+    }
+
     /// The same request with `patch` for a GitOps verb: what rules from before the GitOps
     /// verbs checked.
     fn as_before_gitops_verbs(a: &Access) -> Access {
@@ -776,18 +802,20 @@ mod properties {
         /// A file from before the GitOps verbs, loaded by this version, decides a GitOps
         /// action as it decided `patch` on the object, and every other request as before; it
         /// is written again only when a rule changed. Written back, it loads as written from
-        /// then on: a verb taken out of a rule afterwards stays out.
+        /// then on: a verb taken out of a rule afterwards stays out. The file's own `version`
+        /// decides, whatever agents.json's is: a file without it, loaded after agents.json was
+        /// upgraded (restored from git, copied, or with no agents.json), is upgraded all the same.
         #[test]
         fn an_old_file_upgrades_once(
             policy in writable_policy(),
             requests in prop::collection::vec(access(), 1..16),
-            version in 0..GITOPS_VERBS_VERSION,
+            version in 0..=CONFIG_VERSION,
         ) {
             let mut old = policy;
             for r in &mut old.rules {
                 r.verbs.retain(|v| !matches!(v.parse::<Verb>(), Ok(v) if Verb::GITOPS.contains(&v)));
             }
-            let text = render(&[agent("ci", old.clone())]).unwrap();
+            let text = without_version(&render(&[agent("ci", old.clone())]).unwrap());
             let mut agents = vec![agent("ci", Policy::default())];
             let rewrite = apply_upgrading(&check(&text).unwrap(), &mut agents, version).unwrap();
             let upgraded = agents[0].policy.clone();
@@ -804,8 +832,9 @@ mod properties {
                 r.verbs.retain(|v| v != "refresh");
             }
             let text = render(&[agent("ci", edited.clone())]).unwrap();
+            prop_assert_eq!(check(&text).unwrap().version, FILE_VERSION);
             let mut again = vec![agent("ci", Policy::default())];
-            prop_assert!(!apply_upgrading(&check(&text).unwrap(), &mut again, CONFIG_VERSION).unwrap());
+            prop_assert!(!apply_upgrading(&check(&text).unwrap(), &mut again, version).unwrap());
             same_decisions(&edited, &again[0].policy, &requests)?;
         }
 

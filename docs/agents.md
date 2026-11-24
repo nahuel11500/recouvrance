@@ -74,7 +74,9 @@ syncing an Application doesn't allow patching its spec. Rules saved by a version
 verbs checked GitOps actions as `patch`: on the first start of this version, every rule that
 names `patch` gets the three verbs, once (and rules.yaml is written again), so what it allowed,
 asked or denied it still does. Take `refresh` out of an Ask rule afterwards to let refreshes
-through.
+through. rules.yaml says which rules it holds (`version: 2`), so a file without it is upgraded
+whenever it is loaded (restored from git, copied from another machine, or given with no
+agents.json), and so are rules copied with *Copy rules* by an older version and pasted.
 
 Write mode and protected contexts are for you in the window: an agent's calls don't check them,
 only its rules (with the rate limit and the kill switch below). An Allow rule for a write lets the
@@ -101,7 +103,8 @@ run) and offer **Always allow this** to add a narrow rule; it wins over the Ask 
 the same request is not asked again (until you edit the rule). It covers that kind only, not another
 API group's kind with the same plural, and its names and contexts match case included. The rule editor marks such rules
 "approved", and rules pasted with *Paste rules* never count as approved. In a pasted rule, a missing
-effect means Deny, and a missing list means `*` in a Deny or Ask, none in an Allow. For `apply_manifest` the banner lists
+effect means Deny, and a missing list means `*` in a Deny or Ask, none in an Allow; rules copied
+without a `version` (by a version before the GitOps verbs) get them where they name `patch`. For `apply_manifest` the banner lists
 every object (kind, namespace/name) and the YAML that will be applied, a Secret's values masked; the
 activity log keeps each object with a hash of that YAML, and the objects already applied when a call
 is cut off.

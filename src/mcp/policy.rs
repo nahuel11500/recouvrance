@@ -556,16 +556,33 @@ impl Policy {
         changed
     }
 
+    /// The rules and limits as JSON, for "Copy rules": with the `version` of the rules, so
+    /// that a later version pasting them reads them as they were meant (see [`Policy::pasted`]).
+    pub fn copied(&self) -> serde_json::Result<String> {
+        let mut json = serde_json::to_value(self)?;
+        if let Some(fields) = json.as_object_mut() {
+            fields.insert("version".into(), super::config::CONFIG_VERSION.into());
+        }
+        serde_json::to_string_pretty(&json)
+    }
+
     /// Rules pasted as JSON ("Copy rules" on another agent), None when there are none.
     /// No pasted rule counts as approved: it would win over every Ask rule while looking
-    /// like any other Allow.
+    /// like any other Allow. Rules copied before the GitOps verbs (no `version`, from an
+    /// older clipboard or a note) get them as agents.json's and rules.yaml's do, so a rule
+    /// that denied or asked for `patch` still covers a sync.
     pub fn pasted(text: &str) -> Option<Self> {
-        let mut p: Self = serde_json::from_str(text).ok()?;
+        let json: serde_json::Value = serde_json::from_str(text).ok()?;
+        let version = json.get("version").and_then(serde_json::Value::as_u64).unwrap_or(0);
+        let mut p: Self = serde_json::from_value(json).ok()?;
         if p.rules.is_empty() {
             return None;
         }
         for r in &mut p.rules {
             r.approved = false;
+        }
+        if version < u64::from(super::config::GITOPS_VERBS_VERSION) {
+            p.add_gitops_verbs();
         }
         Some(p)
     }
@@ -1016,6 +1033,28 @@ pub(super) mod tests {
         let p = Policy::pasted(&text).unwrap();
         assert!(!p.rules[0].approved);
         assert!(Policy::pasted(r#"{"rules": []}"#).is_none() && Policy::pasted("not json").is_none());
+    }
+
+    /// Rules copied by a version before the GitOps verbs decide a sync as they decided
+    /// `patch`; rules copied now paste as copied.
+    #[test]
+    fn pasted_rules_from_before_the_gitops_verbs_are_upgraded() {
+        let old = Policy {
+            rules: vec![
+                rule(Mode::Allow, &["*"], &["*"], &["*"], &["*"]),
+                rule(Mode::Deny, &["patch"], &["*"], &["*"], &["prod"]),
+            ],
+            ..Policy::default()
+        };
+        let sync = access("prod", "sync", "applications.argoproj.io", Some("argocd"), Some("web"));
+        let text = serde_json::to_string(&old).unwrap();
+        assert_eq!(Policy::pasted(&text).unwrap().decide(&sync).mode, Mode::Deny);
+        // Copied now, with the version: a verb taken out stays out.
+        let mut now = Policy::pasted(&text).unwrap();
+        now.rules[1].verbs.retain(|v| v != "sync");
+        let pasted = Policy::pasted(&now.copied().unwrap()).unwrap();
+        assert_eq!(pasted.rules, now.rules);
+        assert_eq!(pasted.decide(&sync).mode, Mode::Allow);
     }
 
     #[test]
