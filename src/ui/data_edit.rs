@@ -495,6 +495,11 @@ impl Render for DataEditor {
                                     .xsmall()
                                     .ghost()
                                     .icon(if p.revealed { Lucide::EyeOff } else { Lucide::Eye })
+                                    .accessibility_label(if p.revealed {
+                                        "Mask this value"
+                                    } else {
+                                        "Reveal this value"
+                                    })
                                     .tooltip(if p.revealed { "Mask this value" } else { "Reveal this value" })
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         if let Some(p) = this.pairs.get_mut(i) {
@@ -509,6 +514,7 @@ impl Render for DataEditor {
                                 .xsmall()
                                 .ghost()
                                 .icon(Lucide::X)
+                                .accessibility_label("Remove this key")
                                 .tooltip("Remove this key")
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.pairs.remove(i);

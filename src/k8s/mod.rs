@@ -42,6 +42,7 @@ pub(crate) mod podspec;
 mod retry;
 pub(crate) mod rollouts;
 mod run_as;
+pub(crate) mod short_names;
 mod sources;
 mod table;
 pub(crate) mod topolvm;

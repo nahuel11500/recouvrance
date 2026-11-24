@@ -11,6 +11,7 @@ use super::search_index::{Entry, SEARCH_KINDS, on_cluster};
 use super::{AppView, Route, section_icon, set_zoom, zoom};
 use crate::k8s;
 use crate::k8s::Kind;
+use crate::ui::a11y::Control as _;
 use crate::ui::palette::{Item as PaletteItem, Palette, PaletteEvent, Target};
 use crate::ui::settings_view::SettingsView;
 
@@ -48,6 +49,17 @@ impl AppView {
         }
         for c in &self.all_contexts {
             items.push(PaletteItem::new(c.clone(), "switch context".into(), Lucide::Ship, Target::Context(c.clone())));
+        }
+        // Each context set with a context left in the kubeconfig: picking it connects them all.
+        for set in crate::settings::context_sets() {
+            let contexts = set.available(&self.all_contexts);
+            if contexts.is_empty() {
+                continue;
+            }
+            let detail = format!("context set · {}", contexts.join(", "));
+            let mut item = PaletteItem::new(set.name, detail, Lucide::Layers, Target::ContextSet(contexts));
+            item.also = "set workspace group connect";
+            items.push(item);
         }
         // With several clusters, objects say which one they are on.
         let names: std::rc::Rc<Vec<String>> = std::rc::Rc::new(self.clusters.iter().map(|(c, _)| c.clone()).collect());
@@ -103,7 +115,7 @@ impl AppView {
                     let cluster = cluster.clone();
                     let task = cx.spawn(async move |this, cx| {
                         // A list that fails is said, not taken for an empty one.
-                        let (found, failed) = match k8s::list_names(client, kind.ar.clone(), None).await {
+                        let (found, failed) = match k8s::search_names(client, kind.clone()).await {
                             Ok(found) => (found, None),
                             Err(_) => (Vec::new(), Some(format!("{} on {cluster}", kind.kubectl_name()))),
                         };
@@ -147,6 +159,11 @@ impl AppView {
                     Target::Settings(section) => this.open_settings_section(section, window, cx),
                     Target::View(view) => this.apply_view(&view, window, cx),
                     Target::Context(c) => this.connect_many(vec![c], window, cx),
+                    Target::ContextSet(contexts) => {
+                        // As the picker does, so its ticks match what connects.
+                        this.picked = contexts.iter().cloned().collect();
+                        this.connect_many(contexts, window, cx);
+                    }
                     Target::Favorite(f) => this.open_favorite(f, true, window, cx),
                     Target::Object { .. } if this.clusters.iter().map(|(c, _)| c).ne(opened_on.iter()) => {
                         window.push_notification(
@@ -204,6 +221,33 @@ impl AppView {
         self.connect_many(contexts, window, cx);
     }
 
+    /// The context sets (saved from the top bar's picker), one button each that connects the
+    /// set's contexts the kubeconfig still has. None when there is no set.
+    fn context_set_buttons(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let sets = crate::settings::context_sets();
+        if sets.is_empty() {
+            return None;
+        }
+        let buttons = sets.into_iter().enumerate().map(|(i, set)| {
+            let contexts = set.available(&self.all_contexts);
+            Button::new(("ctx-set-button", i))
+                .outline()
+                .icon(Lucide::Layers)
+                .label(set.name)
+                .tooltip(if contexts.is_empty() {
+                    "None of its contexts is in the kubeconfig".to_string()
+                } else {
+                    contexts.join(", ")
+                })
+                .disabled(contexts.is_empty())
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.picked = contexts.iter().cloned().collect();
+                    this.connect_many(contexts.clone(), window, cx);
+                }))
+        });
+        Some(h_flex().flex_wrap().gap_2().children(buttons).into_any_element())
+    }
+
     pub(super) fn render_contexts(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
         v_flex().size_full().items_center().justify_center().child(
@@ -222,11 +266,27 @@ impl AppView {
                         .text_color(theme.muted_foreground)
                         .child("Select one or more contexts to get started"),
                 )
+                .children(self.context_set_buttons(cx))
                 .child(h_flex().flex_wrap().gap_2().children(self.all_contexts.iter().enumerate().map(|(i, ctx)| {
                     let name = ctx.clone();
                     let risky = crate::settings::is_protected(ctx);
                     let accent: Hsla = crate::settings::context_color(ctx).map_or(theme.blue, |c| rgb(c).into());
                     let picked = self.picked.contains(ctx);
+                    // A context of the set still connecting or that failed says so (and why).
+                    let (state, state_color, why) = match self.conn.get(ctx) {
+                        Some(super::conn::Conn::Connecting) => (Some("connecting…"), theme.muted_foreground, None),
+                        Some(super::conn::Conn::Failed(why)) => {
+                            (Some("can't connect"), theme.danger, Some(why.clone()))
+                        }
+                        None => (None, theme.muted_foreground, None),
+                    };
+                    // A shortened name shows in full on hover, above why it can't connect.
+                    let short = k8s::short_names::short_name(ctx);
+                    let tip = match (short != *ctx, why) {
+                        (true, Some(why)) => Some(SharedString::from(format!("{ctx}\n{why}"))),
+                        (true, None) => Some(SharedString::from(ctx.clone())),
+                        (false, why) => why,
+                    };
                     h_flex()
                         .id(("ctx-card", i))
                         .w(px(290.))
@@ -238,6 +298,16 @@ impl AppView {
                         .when(picked, |d| d.bg(theme.blue.opacity(0.08)))
                         .cursor_pointer()
                         .hover(|s| s.bg(theme.list_hover))
+                        // A checkbox to screen readers: Space or Enter picks it, as a click does.
+                        .control(Role::CheckBox, ctx.clone(), theme.ring)
+                        .aria_toggled(if picked { Toggled::True } else { Toggled::False })
+                        .aria_description(
+                            [Some(if risky { "protected" } else { "context" }), state]
+                                .into_iter()
+                                .flatten()
+                                .collect::<Vec<_>>()
+                                .join(", "),
+                        )
                         .on_click(cx.listener(move |this, ev: &ClickEvent, window, cx| {
                             // Double click connects to just this one.
                             if ev.click_count() >= 2 {
@@ -258,15 +328,23 @@ impl AppView {
                                         .overflow_hidden()
                                         .text_ellipsis()
                                         .whitespace_nowrap()
-                                        .child(ctx.clone()),
+                                        .child(short),
                                 )
                                 .child(
-                                    div()
+                                    h_flex()
+                                        .gap_2()
                                         .text_xs()
-                                        .text_color(if risky { theme.warning } else { theme.muted_foreground })
-                                        .child(if risky { "protected" } else { "context" }),
+                                        .child(
+                                            div()
+                                                .text_color(if risky { theme.warning } else { theme.muted_foreground })
+                                                .child(if risky { "protected" } else { "context" }),
+                                        )
+                                        .when_some(state, |d, s| d.child(div().text_color(state_color).child(s))),
                                 ),
                         )
+                        .when_some(tip, |d, tip| {
+                            d.tooltip(move |w, cx| component::tooltip::Tooltip::new(tip.clone()).build(w, cx))
+                        })
                 })))
                 .child(
                     h_flex()

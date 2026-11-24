@@ -107,6 +107,7 @@ context already shown as `name@file` keeps that name when `name` is freed.
 | `delete_confirm_kinds` | by kind | `{ "Pod": "off", "Cluster.postgresql.cnpg.io": "type" }`: what deleting asks per kind, a custom resource with its group (see [features](features.md)). A value that doesn't read asks for the name |
 | `namespace_visits` | | Remembered by the app: namespaces chosen per context, with a visit count and the last visit time. The namespace picker shows the five most frequent first (visits weigh half as much after a week without one); 30 kept per context. Older files' `recent_namespaces` are turned into visits once |
 | `last_contexts`, `recent_contexts` | | Remembered by the app |
+| `context_sets` | | Named groups of contexts, saved from the context picker: `[{ "name": "prod", "contexts": ["prod-eu", "prod-us"] }]`. They connect in that order (the first is the primary). An entry without a name or a context is dropped, a name taken twice keeps its first set, and a value that doesn't read never stops the file from loading |
 | `last_seen_version` | the version installed | Remembered by the app: the newest version whose release notes were shown (What's new, once after an update). A new install starts with its own version; a file without the key, from before What's new, shows the running version's notes once. Never set back by a downgrade. While `settings.json` can't be read, What's new doesn't show |
 | `timeline` | | What the timeline records and keeps (see [Timeline](#timeline)) |
 
@@ -146,8 +147,9 @@ so it works wherever `kubectl` does. The service is found automatically; to choo
 Alerts are read from the same endpoint (`/api/v1/alerts`, every 30 seconds at most per cluster).
 VictoriaMetrics answers there only when vmselect or vmsingle runs with `-vmalert.proxyURL`. Silences
 come from an Alertmanager service found the same way (a service named `*alertmanager*`, port 9093);
-without one, firing alerts show without silence information. With `metrics_enabled` off, neither
-is read.
+without one, firing alerts show without silence information. An alert's **Rule** reads the alerting
+rules (`/api/v1/rules?type=alert`, kept 5 minutes) and one range query for its chart, only when
+clicked. With `metrics_enabled` off, none of these is read.
 
 ### Per cluster (`clusters`)
 

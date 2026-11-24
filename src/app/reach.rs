@@ -46,10 +46,20 @@ pub(super) fn answered(reached: &Result<Reached, String>) -> bool {
     reached.as_ref().is_ok_and(|r| r.kinds.is_ok())
 }
 
+/// Why `ctx` can't show rows, without its name: its connect or its discovery failed. None
+/// when it answered.
+pub(super) fn failure(ctx: &str, reached: &Result<Reached, String>) -> Option<String> {
+    match reached {
+        Ok(r) => r.kinds.as_ref().err().map(k8s::short_error),
+        Err(e) => Some(super::conn::without_name(ctx, e).to_string()),
+    }
+}
+
 /// Connect to `ctx`, then read its discovery and its namespaces at once (neither needs the
 /// other). With `early`, its Pods list starts as soon as the client is built.
 pub(super) async fn reach(ctx: String, early: Option<EarlyList>) -> Result<Reached, String> {
-    let client = k8s::connect(ctx.clone()).await.map_err(|e| format!("{ctx}: {}", k8s::error_chain(&e)))?;
+    // Said short: a timeout or a refused login reads as one, not as kube's chain.
+    let client = k8s::connect(ctx.clone()).await.map_err(|e| format!("{ctx}: {}", k8s::short_error(&e)))?;
     // Accessible namespaces set for this cluster replace the listing.
     let accessible = crate::settings::cluster(&ctx).namespaces;
     // A cluster with them watches one of its namespaces, which the connect decides: not

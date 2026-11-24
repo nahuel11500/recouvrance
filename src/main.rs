@@ -44,6 +44,7 @@ mod timeline;
 mod ui;
 mod updates;
 mod upgrade;
+mod volumes;
 mod yaml;
 
 // Many threads allocate large, short-lived lists (huge clusters); mimalloc

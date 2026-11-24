@@ -193,6 +193,7 @@ fn step_row(i: usize, step: &Step, cx: &mut Context<DetailPanel>) -> Div {
                             .xsmall()
                             .ghost()
                             .icon(Lucide::Copy)
+                            .accessibility_label("Copy the command")
                             .tooltip("Copy the command")
                             .on_click(move |_, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(cmd.clone()))),
                     ),

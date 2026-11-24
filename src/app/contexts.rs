@@ -68,8 +68,11 @@ impl AppView {
         self.page_scopes.clear();
         // The palette's object index points at the old clusters.
         self.search_index.clear();
-        self.list.notice = Some(format!("Connecting to {}…", contexts.join(", ")).into());
+        // Each context says it is connecting where the list goes (see `render_connect`).
         self.connect_errors = None;
+        self.connect_notes = None;
+        self.conn = super::conn::ConnStates::connecting(&contexts);
+        self.conn_changed(cx);
         self.connecting = true;
         self.table.update(cx, |t, cx| {
             t.delegate_mut().reset(false, Vec::new(), None, Default::default());
@@ -102,6 +105,9 @@ impl AppView {
             .await;
             // In the order the contexts were given: the first one's client is the main one.
             wave.sort_by_key(|(ix, _)| *ix);
+            // How each one went, before its result is taken apart below.
+            let settled: Vec<(String, Option<String>)> =
+                wave.iter().map(|(ix, r)| (contexts[*ix].clone(), reach::failure(&contexts[*ix], r))).collect();
             let done: HashSet<usize> = wave.iter().map(|(ix, _)| *ix).collect();
             let mut waiting: Vec<String> =
                 (contexts.iter().enumerate()).filter(|(ix, _)| !done.contains(ix)).map(|(_, c)| c.clone()).collect();
@@ -157,6 +163,9 @@ impl AppView {
                     return false; // the user switched again meanwhile
                 }
                 this.connecting = false;
+                for (ctx, failure) in &settled {
+                    this.conn.settle(ctx, failure.as_deref());
+                }
                 let connected = match result {
                     Ok((client, kinds, kind_clusters, namespaces)) => {
                         // Who saved this set before: what this connect does below is no change
@@ -165,6 +174,7 @@ impl AppView {
                             (cx.try_global::<super::session::SessionOwners>()).and_then(|o| o.owner(&this.session_key));
                         this.kind_clusters = kind_clusters;
                         this.connect_errors = reach::connect_status(&errors, &waiting);
+                        this.connect_notes = super::conn::notes(&errors, &this.conn);
                         // The first context may have failed: namespace visits and the ones added
                         // by hand belong to the cluster that is first now.
                         if let Some((first, _)) = clusters.first() {
@@ -273,6 +283,10 @@ impl AppView {
                     Err(e) => {
                         this.list.notice = None;
                         this.connect_errors = Some(format!("{e:#}").into());
+                        // Each context says why it failed where the list goes; one that has
+                        // no reason of its own (it served no API) takes the connect's.
+                        this.conn.give_up(&contexts, &k8s::short_error(&e));
+                        this.connect_notes = None;
                         if let Some(favorite) = this.after_connect.take() {
                             window.push_notification(
                                 Notification::warning(format!(
@@ -286,6 +300,7 @@ impl AppView {
                         false
                     }
                 };
+                this.conn_changed(cx);
                 cx.notify();
                 connected
             });
@@ -296,6 +311,7 @@ impl AppView {
             while let Some((ix, r)) = pending.next().await {
                 let alive = this.update_in(cx, |this, window, cx| {
                     waiting.retain(|c| *c != contexts[ix]);
+                    this.conn.settle(&contexts[ix], reach::failure(&contexts[ix], &r).as_deref());
                     match r {
                         Ok(r) if r.kinds.is_ok() => this.join_late(r, early.clone(), &mut errors, window, cx),
                         Ok(r) => {
@@ -306,6 +322,8 @@ impl AppView {
                         Err(e) => errors.push(e),
                     }
                     this.connect_errors = reach::connect_status(&errors, &waiting);
+                    this.connect_notes = super::conn::notes(&errors, &this.conn);
+                    this.conn_changed(cx);
                     // The last one in and none failed: the connect is whole after all.
                     if waiting.is_empty() && errors.is_empty() {
                         this.joined_whole(window, cx);
@@ -323,6 +341,18 @@ impl AppView {
                 }
             }
         }));
+    }
+
+    /// The context picker marks each context of the set as it stands now.
+    pub(super) fn conn_changed(&mut self, cx: &mut Context<Self>) {
+        let states = self.conn.clone();
+        self.ctx_picker.update(cx, |p, cx| p.set_states(states, cx));
+    }
+
+    /// Connect to the set again: its contexts that failed, with those that answered.
+    pub(super) fn retry_connect(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let set = self.ctx_picker.read(cx).connected.clone();
+        self.connect_many(set, window, cx);
     }
 
     pub(super) fn set_namespaces(&mut self, namespaces: Vec<String>, _: &mut Window, cx: &mut Context<Self>) {
@@ -374,6 +404,7 @@ impl AppView {
         let removed = self.all_contexts.iter().filter(|n| !names.contains(n)).count();
         self.picked.retain(|c| names.contains(c));
         self.all_contexts.clone_from(&names);
+        k8s::short_names::set_contexts(&names);
         self.ctx_picker.update(cx, |p, cx| p.set_all(names, cx));
         self.settings_view.update(cx, |s, cx| s.sync_clusters(window, cx));
         self.agents.update(cx, |a, _| a.refresh_contexts());

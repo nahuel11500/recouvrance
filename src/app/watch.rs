@@ -394,7 +394,8 @@ impl AppView {
 
     /// What the bar above the list says: what failed (contexts, watches), then progress.
     pub(super) fn status_line(&self) -> Option<SharedString> {
-        self.list.status_line(self.connect_errors.as_ref())
+        // Each context's own failure is said by its line (see `connect_view`), not here.
+        self.list.status_line(self.connect_notes.as_ref())
     }
 
     /// Keep the list on screen in `views` (if it was complete), before another replaces it.

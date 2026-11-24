@@ -3,9 +3,13 @@
 - **Contexts**: pick one or several on launch; tables merge clusters with a Context column. Each
   context connects on its own: the first rows show once one cluster has answered and the others
   have had 2 more seconds, so a cluster that can't be reached, or a login waiting in the browser,
-  doesn't hold back the others' rows. A cluster still connecting is said above the list and joins
-  it when it answers, and the page on screen then (a Cluster or Argo CD overview is built again);
-  one that fails shows its own error. Once every cluster is in, the set's session is saved again
+  doesn't hold back the others' rows. Until one of the set answers, the list's place shows each
+  context as "Connecting…" or "Can't connect: <why>" (never an empty "No resources"), with Retry
+  and Choose contexts; once others show rows, those still connecting or failed get a line each
+  above the list. The context picker and the Contexts page mark them too ("connecting…", "can't
+  connect" with the reason in a tooltip). A cluster still connecting joins the list when it
+  answers, and the page on screen then (a Cluster or Argo CD overview is built again). Retry
+  connects to the whole set again. Once every cluster is in, the set's session is saved again
   (and reopened whole if it was reopened without them and nothing changed since). The Pods list starts with the connect,
   alongside the cluster's discovery and namespace list, when it is the list shown first. When a
   context's login command (its kubeconfig exec plugin) fails, the app says which program failed and
@@ -19,6 +23,22 @@
   or `#`; by its scheme alone when its text holds a `#`, or when the host can't be told from the
   password. Neither shows for any other URL in a connection error, unless its password holds an
   unescaped `/`, `?` or `#` (#1000).
+- **Context sets**: tick contexts in the context picker, then *Save as set…* and name them (for
+  example "prod" for every production region). The sets come first in the picker, on the
+  Contexts page and in the palette (Ctrl+K, type the set's name or `set`); one click connects
+  all of a set's contexts, in the order saved (the primary context then stays the primary). A context no longer
+  in the kubeconfig is left out ("2 of 3 contexts"), and a set with a protected context shows
+  the lock. Saving under a name already taken replaces that set; the × on a set's row forgets
+  it. A set reopens where it was left, like any set of contexts connected together (`sessions`).
+- **Short context names**: a context named after its cloud cluster shows the cluster's name
+  (`arn:aws:eks:<region>:<account>:cluster/<name>` and `gke_<project>_<zone>_<name>` show
+  `<name>`) in the top bar, the sidebar, the context picker, the Contexts page, the connecting
+  and can't-connect lines, the Problems page and the Context column. When two would read the
+  same, the region is added, then the account or project; a short name never reads as another
+  context's name. The full name shows on hover. The picker's search finds either; the Problems
+  filter matches the full name, which holds the short one. The Context column sorts by the
+  short name, and its `context:` filter term compares the full name. Settings, protection, agent
+  rules, kubectl lines, copied text and the agents' answers keep the full name.
 - **Reopens where you left off**: each set of contexts keeps its tabs (the list or overview each
   shows, its resource type, namespaces and filter) and each type's filter, and the window keeps
   its place, size and whether it was maximized. On launch the first window reopens there once its
@@ -207,7 +227,7 @@
   matrix for the namespace, and says when the cluster (webhook or cloud IAM authorizer) may allow
   more than it lists.
 - **Problems**: one list of what is broken across clusters (crash loops, pending pods, unavailable workloads, NotReady nodes, nodes such a taint keeps pods off for more than 5 minutes after they started, failed jobs, CronJobs that stopped running (the second run their schedule and time zone call for since the last one hasn't started, `startingDeadlineSeconds` added) or whose last 3 runs or more didn't succeed (suspended ones are left out), pending volumes, Argo CD Applications that need attention, and alerts firing in the cluster's Prometheus that nobody silenced). Click a count (critical, warnings, minor) to show that severity alone; the filter box takes text and `ns:`, `kind:` (`kind:alert`, `kind:service`) and `ctx:` terms, as the Timeline's. One scan per cluster serves the page, the sidebar count of every window and the agents' `find_problems`: a cluster is scanned again every 2 minutes (eight times as long as a scan takes, when that is longer), a hidden window starts no scan, though an agent's `find_problems` still scans when the latest findings are too old. The page opens on the latest findings at once and says how old they are; during a scan each check's new findings show as soon as it finishes, and Refresh asks for a scan started after it (a scan already running is waited for, then another one runs). A Service with no ready endpoint is looked into once, then again when it changes, after 10 minutes, or (when it selects no pod because a workload is scaled to 0) once that workload is scaled up. The first count waits for the list on screen. A scan started by the sidebar reads at most 8 of the 32 namespaces read at once, so the page on screen always has the others; once the page, Refresh or an agent waits for it, it reads in the foreground. A page scoped to some namespaces shows them from the sidebar's scan of the cluster when there is one; Refresh there scans only those namespaces. Refresh and an agent's `max_age_seconds: 0` judge every Service again. The sidebar count's tooltip says how old it is, and how often it comes.
-- **Alerts where you look**: a namespace's page lists the alerts labeled with it, and a pod's, workload's, volume's or node's page the alerts about it (a pod's include its workload's, a workload's its pods'), with severity, summary, how long, runbook link, and silenced or inhibited ones muted when an Alertmanager is found.
+- **Alerts where you look**: a namespace's page lists the alerts labeled with it, and a pod's, workload's, volume's or node's page the alerts about it (a pod's include its workload's, a workload's its pods'), with severity, summary, how long, runbook link, and silenced or inhibited ones muted when an Alertmanager is found. A Service's, HorizontalPodAutoscaler's or Ingress's page shows those labeled with it (`TargetDown`, `KubeHpaMaxedOut`; a `service` label counts only on a scrape target's alert, with its `job`, since rules often set one to route alerts; an Ingress is looked for in `exported_namespace` when the alert has it, as ingress-nginx's do), and a node's page those whose `instance` is the node's name or address (node-exporter's). **Rule** on an alert shows the rule it comes from, read from Prometheus' rules API on that click: its expression, how long it must hold before firing, its labels and annotations, an error when its last evaluation failed, and a chart of the last 3 hours for that alert's series alone (matched on the alert's labels, without the rule's and vmalert's `alertgroup`). The chart draws the comparison's left side, with the threshold as a line, since the comparison itself drops every point under it.
 - **Upgrade check** (Cluster overview → *Upgrade check*): per cluster, what needs action before it
   moves to a newer minor version (the next one by default; the arrows pick another), most urgent first:
   - *Removed APIs still used*: objects last written in an API version the target no longer serves
@@ -232,12 +252,22 @@
   on `/metrics`) is named, and the rest is still checked.
 - **References to missing objects**: the Problems page lists what points to something that
   doesn't exist, on the object that points to it: a Service that selects no pod (minor when its
-  Deployment or StatefulSet is scaled to 0) or no ready one, an Ingress whose backend Service,
+  Deployment or StatefulSet is scaled to 0, or when it picks pods of a running one by a role
+  label the operator sets on them and no pod has that role now while every pod has another, as
+  a Postgres replica Service with one instance) or no ready one, an Ingress whose backend Service,
   its port or a TLS Secret is missing, an HTTPRoute whose backend Service is missing (when the
   cluster serves the Gateway API). A pod stuck creating, a workload short of ready replicas or a
   pending PVC says which ConfigMap, Secret, PVC, ServiceAccount or StorageClass it waits on
   (`optional: true` references aren't needed, and a running pod needs none any more). Kinds that
   can't be read are named, not reported missing.
+- **Volumes filling up**: a PVC's page shows its used and free space and its inodes, as the
+  kubelet of a node running a pod that mounts it measures them (read for the page shown; it needs
+  `nodes/proxy`, and a PVC no running pod mounts says "not mounted"). The Problems page lists the
+  PVCs over 90% of their space or inodes (critical from 97%), from one query to the cluster's
+  Prometheus per scan (`kubelet_volume_stats_*`), nothing more asked of the API server; a PVC its
+  own firing alert (such as `KubePersistentVolumeFillingUp`) already names, or one whose alert is
+  silenced, isn't listed twice. Without Prometheus there is nothing to list; one that doesn't
+  answer is named as not checked.
 - **Stuck deletions**: the Problems page lists objects (pods, workloads, Jobs, PVCs, PVs,
   Namespaces, Argo CD Applications) whose deletion has waited more than 10 minutes, with the
   finalizers holding them (for a Namespace, the resources left); their Delete dialog offers to
@@ -736,6 +766,13 @@ list them; the palette, that list and this table are all made from one list of c
 | Double-click a context | Double-click a context | Connect to just that context | On the Contexts page |
 
 Single keys (?, *, g, j, k) work when no text field or terminal has focus.
+
+Tab and Shift+Tab move the focus through the top bar, the sidebar (pages, sections, resource
+types, saved views and favorites), the cards of the Contexts page and the sections of Settings;
+Enter or Space opens what has focus, and a tint shows where it is. Screen readers (Orca,
+VoiceOver) read each of them by name, the buttons that show only an icon included, along with
+the page or section picked, the sections folded and the contexts ticked. The palette's results
+are a list, with the highlighted one marked as selected.
 
 On macOS, ⌘ takes Ctrl's place, so Ctrl keys reach the shell in a terminal (Ctrl+Tab still
 switches tabs), and the menu bar has the keys every Mac app has: ⌘, opens Settings, ⌘Q quits, ⌘W

@@ -30,6 +30,8 @@ use banners::ApprovalStrip;
 mod banners;
 mod chrome;
 pub(crate) mod commands;
+pub(crate) mod conn;
+mod connect_view;
 mod contexts;
 #[cfg(feature = "dev")]
 mod demo;
@@ -509,6 +511,11 @@ pub struct AppView {
     table: Entity<TableState<ResourceTable>>,
     /// Contexts that failed to connect, until the next connect.
     connect_errors: Option<SharedString>,
+    /// Each context of the set that can't show rows: connecting, or why it failed.
+    conn: conn::ConnStates,
+    /// What the bar above the list says of the connect besides each context's state (a
+    /// namespace list that failed, the kubeconfig that can't be read).
+    connect_notes: Option<SharedString>,
     watch: Option<watch::ListWatch>,
     metrics: Option<Vec<(TaskGuard, Task<()>)>>,
     /// The timeline's own watches (`timeline.kinds`), while connected.
@@ -726,6 +733,7 @@ impl AppView {
         window.focus(&focus, cx);
         table.update(cx, |t, _| t.delegate_mut().app_focus = Some(focus.clone()));
         let settings_view = cx.new(|cx| SettingsView::new(hub.clone(), window, cx));
+        k8s::short_names::set_contexts(&contexts);
         let mut this = Self {
             settings_view,
             terminals: HashMap::new(),
@@ -790,7 +798,9 @@ impl AppView {
             forwards_open: false,
             table,
             // A kubeconfig that can't be read shows where connect errors do.
+            connect_notes: status.clone(),
             connect_errors: status,
+            conn: conn::ConnStates::default(),
             watch: None,
             metrics: None,
             connecting: false,

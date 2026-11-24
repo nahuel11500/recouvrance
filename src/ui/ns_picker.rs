@@ -335,6 +335,7 @@ impl NamespacePicker {
                             .xsmall()
                             .ghost()
                             .icon(component::IconName::Close)
+                            .accessibility_label("Forget this namespace")
                             .tooltip("Forget this namespace")
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.forget_namespace(&n3, cx);
