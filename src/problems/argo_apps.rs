@@ -155,6 +155,9 @@ mod tests {
         v
     }
 
+    /// A rule's case: its name, the Application, and the verdict wanted.
+    type Case = (&'static str, Value, Option<(Severity, &'static str)>);
+
     #[test]
     fn the_rules() {
         let now = jiff::Timestamp::now();
@@ -163,7 +166,7 @@ mod tests {
         let long = Some(json!({"phase": "Running", "startedAt": ago(25 * 60 + 30)}));
         let short = Some(json!({"phase": "Running", "startedAt": ago(60)}));
         let ok = Some(json!({"phase": "Succeeded"}));
-        let cases: Vec<(&str, Value, Option<(Severity, &str)>)> = vec![
+        let cases: Vec<Case> = vec![
             ("healthy", of(true, "Healthy", ok, &[]), None),
             ("degraded", of(false, "Degraded", None, &[]), Some((Severity::Critical, "Degraded"))),
             ("missing, auto-sync on", of(true, "Missing", None, &[]), Some((Severity::Warning, "Missing"))),
@@ -273,11 +276,12 @@ mod tests {
             v["status"]["sync"] = json!({"status": "OutOfSync"});
             let out_of_sync = judge(&app(&v), now);
             prop_assert_eq!(&out_of_sync, &synced);
-            let fine = health != "Degraded"
-                && !matches!(phase, Some("Failed" | "Error"))
-                && !(matches!(phase, Some("Running" | "Terminating")) && started + 1 >= argo::diagnosis::STUCK_AFTER)
-                && !condition.is_some_and(|c| c.ends_with("Error"));
-            if fine {
+            let failed = matches!(phase, Some("Failed" | "Error"));
+            // A second's leeway: the clock moves between `ago` and `now`.
+            let stuck = matches!(phase, Some("Running" | "Terminating")) && started + 1 >= argo::diagnosis::STUCK_AFTER;
+            let error = condition.is_some_and(|c| c.ends_with("Error"));
+            let troubled = health == "Degraded" || failed || stuck || error;
+            if !troubled {
                 prop_assert_eq!(out_of_sync, None);
             }
         }
