@@ -353,7 +353,7 @@ mod tests {
 
     /// What the client of a context that logs in with kubelogin says of `e`.
     fn by_kubelogin(e: &(dyn std::error::Error + 'static)) -> Option<String> {
-        failure(e, Some("kubelogin"), false)
+        failure(e, Some("kubelogin"))
     }
 
     #[test]
@@ -387,7 +387,7 @@ mod tests {
         assert!(built.downcast_ref::<LoginFailed>().is_some());
         assert_eq!(format!("{built:#}"), SAID);
         assert!(!format!("{built:?}").contains("s3cr3t"), "{built:?}");
-        let sent = kube::Error::Service(scrub(Box::new(expired()), Some("kubelogin"), false));
+        let sent = kube::Error::Service(scrub(Box::new(expired()), Some("kubelogin")));
         let sent = anyhow::Error::from(sent).context("listing pods");
         for e in [&built, &sent] {
             assert_eq!(crate::k8s::short_error(e), SAID);
@@ -426,7 +426,7 @@ mod tests {
     /// client of a context that logs in with kubelogin.
     fn refreshed(e: fn() -> AuthError) -> tower::BoxError {
         use tower::{Layer as _, Service as _};
-        let mut client = LoginErrorLayer::new(Some("kubelogin"), false).layer(Refresh(e));
+        let mut client = LoginErrorLayer::new(Some("kubelogin")).layer(Refresh(e));
         futures::executor::block_on(client.call(())).unwrap_err()
     }
 
@@ -476,7 +476,7 @@ mod tests {
             exec: Some(kube::config::ExecConfig { command: Some(command.into()), ..Default::default() }),
             ..Default::default()
         };
-        assert_eq!(program(&exec("/usr/local/bin/kubelogin")).as_deref(), Some("kubelogin"), false);
+        assert_eq!(program(&exec("/usr/local/bin/kubelogin")).as_deref(), Some("kubelogin"));
         assert_eq!(program(&exec("aws")).as_deref(), Some("aws"));
         // A gcp auth provider runs its `cmd-path`, whatever its folder and its `cmd-args` hold,
         // which kube's text runs together. kube tries it before the exec plugin.
