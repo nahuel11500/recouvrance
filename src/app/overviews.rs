@@ -126,6 +126,7 @@ impl AppView {
                 let kinds = self.cluster_kinds();
                 let page = cx.new(|cx| ProblemsView::new(scope, kinds, namespaces, window, cx));
                 self.follow_links(&page, window, cx);
+                self.follow_hub_links(&page, window, cx);
                 Route::Problems(page)
             }
             Overview::Timeline => {

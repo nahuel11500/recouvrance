@@ -689,7 +689,7 @@ impl KubeMcp {
     }
 
     #[tool(
-        description = "What is broken: crash-looping or pending pods, unavailable Deployments/StatefulSets/DaemonSets, NotReady nodes and nodes a taint keeps pods off because something is wrong (an agent not ready, being removed), failed Jobs, pending PVCs, ExternalSecrets and secret stores that fail to sync, Services that select no pod or no ready one, references to objects that don't exist (a pod's ConfigMaps, Secrets and PVCs, a workload's ServiceAccount, a pending PVC's StorageClass, an Ingress's Services, ports and TLS Secrets, an HTTPRoute's Services), objects stuck deleting (Namespaces, PVs, Argo CD Applications too) with the finalizers holding them, and alerts firing in the cluster's Prometheus (not silenced). Worst first. Start here when asked to troubleshoot. Answers from the app's latest scan of the cluster while it is recent, and says how old it is; after a fix, pass max_age_seconds: 0 to check it on a new scan.",
+        description = "What is broken: crash-looping or pending pods, unavailable Deployments/StatefulSets/DaemonSets, NotReady nodes and nodes a taint keeps pods off because something is wrong (an agent not ready, being removed), failed Jobs, pending PVCs, ExternalSecrets and secret stores that fail to sync, Services that select no pod or no ready one, references to objects that don't exist (a pod's ConfigMaps, Secrets and PVCs, a workload's ServiceAccount, a pending PVC's StorageClass, an Ingress's Services, ports and TLS Secrets, an HTTPRoute's Services), objects stuck deleting (Namespaces, PVs, Argo CD Applications too) with the finalizers holding them, Argo CD Applications deploying to the cluster that need attention (Degraded, a failed sync, an *Error condition, a sync running for more than 10 minutes, Missing with auto-sync on; named under the namespace they deploy to, with the hub they live on, and shown when your rules let you list Applications there), and alerts firing in the cluster's Prometheus (not silenced). Worst first. Start here when asked to troubleshoot. Answers from the app's latest scan of the cluster while it is recent, and says how old it is; after a fix, pass max_age_seconds: 0 to check it on a new scan.",
         annotations(read_only_hint = true)
     )]
     async fn find_problems(
@@ -729,7 +729,14 @@ impl KubeMcp {
             .into_iter()
             .filter(|x| minor || x.severity != crate::problems::Severity::Info)
             .filter(|x| {
-                // Only what this agent may see.
+                // Only what this agent may see. An Argo CD Application is read on its hub: the
+                // rules for Applications there decide.
+                if let Some(hub) = &x.on_hub {
+                    let app = k8s::argo::application_kind();
+                    let a =
+                        access_for(&app, &hub.context, Verb::List, Some(hub.namespace.clone()), Some(x.name.clone()));
+                    return problem_visible(call.policy(), call.approved_rules(), false, &a);
+                }
                 k8s::find_kind(&kinds, &x.kind).is_some_and(|k| {
                     let a = access_for(k, &p.context, Verb::List, x.namespace.clone(), Some(x.name.clone()));
                     problem_visible(call.policy(), call.approved_rules(), k.is("", "Pod"), &a)

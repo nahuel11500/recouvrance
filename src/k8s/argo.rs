@@ -165,8 +165,13 @@ fn same_cluster(a: &ContextTarget, b: &ContextTarget) -> bool {
 /// A destination given by name matches the context's name or its kubeconfig cluster's name
 /// (Argo CD's own cluster names are in Secrets, which are not read).
 pub fn targets_cluster(app: &Value, hub: &ContextTarget, here: &ContextTarget) -> bool {
-    let dest = |p: &str| app.pointer(p).and_then(Value::as_str).filter(|s| !s.is_empty());
-    match (dest("/spec/destination/server"), dest("/spec/destination/name")) {
+    let dest = |p: &str| app.pointer(p).and_then(Value::as_str);
+    deploys_to(dest("/spec/destination/server"), dest("/spec/destination/name"), hub, here)
+}
+
+/// `targets_cluster` for a destination's `server` and `name` as written.
+pub fn deploys_to(server: Option<&str>, name: Option<&str>, hub: &ContextTarget, here: &ContextTarget) -> bool {
+    match (server.filter(|s| !s.is_empty()), name.filter(|s| !s.is_empty())) {
         (Some(s), _) if server_key(s) == server_key(IN_CLUSTER) => same_cluster(hub, here),
         (Some(s), _) => same_server(Some(s), here.server.as_deref()),
         (None, Some("in-cluster")) => same_cluster(hub, here),
@@ -335,8 +340,12 @@ const HISTORY: usize = 5;
 /// Whether auto-sync is on: `syncPolicy.automated` set, and not turned off with
 /// `enabled: false` (newer Argo CD).
 pub fn auto_sync(app: &Value) -> bool {
-    app.pointer("/spec/syncPolicy/automated")
-        .is_some_and(|a| a.is_object() && a.get("enabled").and_then(Value::as_bool) != Some(false))
+    automated_on(app.pointer("/spec/syncPolicy/automated"))
+}
+
+/// Whether `syncPolicy.automated`, as written, turns auto-sync on.
+pub fn automated_on(automated: Option<&Value>) -> bool {
+    automated.is_some_and(|a| a.is_object() && a.get("enabled").and_then(Value::as_bool) != Some(false))
 }
 
 impl Summary {
@@ -744,6 +753,184 @@ pub async fn applications(hub: &Hub) -> Result<Arc<Vec<Value>>> {
     let list = Arc::new(list);
     LISTS.lock().unwrap_or_else(PoisonError::into_inner).insert(hub.context.clone(), (Instant::now(), list.clone()));
     Ok(list)
+}
+
+// MARK: For the Problems scan
+
+/// A hub's Applications are listed for the Problems scans at most this often, however many
+/// clusters are scanned.
+const LEAN_TTL: Duration = Duration::from_secs(60);
+
+/// What the Problems scan reads of an Application: the rest of each one is skipped while the
+/// list is parsed, never held.
+#[derive(Clone, Debug, Default, serde::Deserialize)]
+#[serde(default)]
+pub struct LeanApp {
+    pub metadata: LeanAppMeta,
+    pub spec: LeanAppSpec,
+    pub status: Option<LeanAppStatus>,
+}
+
+#[derive(Clone, Debug, Default, serde::Deserialize)]
+#[serde(default)]
+pub struct LeanAppMeta {
+    pub name: String,
+    pub namespace: String,
+    #[serde(rename = "creationTimestamp")]
+    pub created: Option<String>,
+    #[serde(rename = "deletionTimestamp")]
+    pub deleted: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, serde::Deserialize)]
+#[serde(default)]
+pub struct LeanAppSpec {
+    pub destination: Option<LeanDestination>,
+    #[serde(rename = "syncPolicy")]
+    pub sync_policy: Option<LeanSyncPolicy>,
+}
+
+#[derive(Clone, Debug, Default, serde::Deserialize)]
+#[serde(default)]
+pub struct LeanDestination {
+    pub server: Option<String>,
+    pub name: Option<String>,
+    pub namespace: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, serde::Deserialize)]
+#[serde(default)]
+pub struct LeanSyncPolicy {
+    pub automated: Option<Value>,
+}
+
+#[derive(Clone, Debug, Default, serde::Deserialize)]
+#[serde(default)]
+pub struct LeanAppStatus {
+    pub health: Option<LeanHealth>,
+    #[serde(rename = "operationState")]
+    pub operation: Option<LeanOperation>,
+    pub conditions: Option<Vec<LeanCondition>>,
+}
+
+#[derive(Clone, Debug, Default, serde::Deserialize)]
+#[serde(default)]
+pub struct LeanHealth {
+    pub status: Option<String>,
+    pub message: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, serde::Deserialize)]
+#[serde(default)]
+pub struct LeanOperation {
+    pub phase: Option<String>,
+    pub message: Option<String>,
+    #[serde(rename = "startedAt")]
+    pub started: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, serde::Deserialize)]
+#[serde(default)]
+pub struct LeanCondition {
+    #[serde(rename = "type")]
+    pub kind: Option<String>,
+    pub message: Option<String>,
+}
+
+impl LeanApp {
+    /// Whether auto-sync is on (see `auto_sync`).
+    pub fn automated(&self) -> bool {
+        automated_on(self.spec.sync_policy.as_ref().and_then(|p| p.automated.as_ref()))
+    }
+
+    /// Whether it deploys to the cluster of the context `here` (see `targets_cluster`).
+    pub fn deploys_to(&self, hub: &ContextTarget, here: &ContextTarget) -> bool {
+        let dest = self.spec.destination.as_ref();
+        deploys_to(dest.and_then(|d| d.server.as_deref()), dest.and_then(|d| d.name.as_deref()), hub, here)
+    }
+
+    /// The namespace it deploys into, if it names one.
+    pub fn dest_namespace(&self) -> Option<&str> {
+        self.spec.destination.as_ref()?.namespace.as_deref().filter(|n| !n.is_empty())
+    }
+}
+
+type LeanLists = HashMap<String, (Instant, Arc<Vec<LeanApp>>)>;
+
+/// Each hub's Applications as the Problems scans read them, with when they were listed.
+static LEAN_LISTS: LazyLock<Mutex<LeanLists>> = LazyLock::new(Default::default);
+
+/// Every Application on a hub as the Problems scans read them: lean, from the API server's
+/// cache (`resourceVersion=0`, no read of etcd), shared by the scans of every cluster within
+/// `LEAN_TTL`.
+pub async fn lean_applications(hub: &Hub) -> Result<Arc<Vec<LeanApp>>> {
+    static LISTING: LazyLock<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> = LazyLock::new(Default::default);
+    let cached = || {
+        let lists = LEAN_LISTS.lock().unwrap_or_else(PoisonError::into_inner);
+        lists.get(&hub.context).filter(|(at, _)| at.elapsed() < LEAN_TTL).map(|(_, l)| l.clone())
+    };
+    let lock = LISTING.lock().unwrap_or_else(PoisonError::into_inner).entry(hub.context.clone()).or_default().clone();
+    // Scans of several clusters asking together wait for one list.
+    let _one = lock.lock().await;
+    if let Some(list) = cached() {
+        return Ok(list);
+    }
+    let list: Vec<LeanApp> = super::lists::list_lean_cached(hub.client.clone(), application_kind().ar, None).await?;
+    let list = Arc::new(list);
+    LEAN_LISTS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .insert(hub.context.clone(), (Instant::now(), list.clone()));
+    Ok(list)
+}
+
+/// The client a hub was found with this session (see `hubs`), if any.
+pub fn known_client(context: &str) -> Option<Client> {
+    let probes = PROBES.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some(Probe::Serves(client)) = probes.get(context) { Some(client.clone()) } else { None }
+}
+
+/// The hubs the Problems scan of `context` reads: those found this session (by the Argo CD
+/// page or an object's Argo CD section), and `context` itself when it `serves` Applications,
+/// read with its own `client`. Only those set in Settings, when some are. No other context is
+/// asked: a scan in the background never runs a login, nor reaches a cluster nobody opened.
+/// One context per Argo CD, so an Application is never counted twice.
+pub fn problem_hubs(context: &str, client: &Client, serves: bool) -> Vec<Hub> {
+    let mut found: Vec<Hub> = {
+        let probes = PROBES.lock().unwrap_or_else(PoisonError::into_inner);
+        (probes.iter())
+            .filter(|(c, _)| c.as_str() != context)
+            .filter_map(|(c, p)| {
+                if let Probe::Serves(client) = p {
+                    Some(Hub { context: c.clone(), client: client.clone() })
+                } else {
+                    None
+                }
+            })
+            .collect()
+    };
+    if serves || known_client(context).is_some() {
+        found.push(Hub { context: context.to_string(), client: client.clone() });
+    }
+    let (chosen, servers) = crate::settings::with(|s| (s.argocd_contexts.clone(), s.argocd_servers.clone()));
+    if !chosen.is_empty() {
+        found.retain(|h| chosen.contains(&h.context));
+    }
+    if found.is_empty() {
+        return found;
+    }
+    // The cluster scanned first, with its own client.
+    found.sort_by_cached_key(|h| (h.context != context, h.context.clone()));
+    let targets = targets();
+    let (mut instances, mut clusters) = (std::collections::HashSet::new(), Vec::<ContextTarget>::new());
+    found.retain(|h| {
+        let t = target(&targets, &h.context);
+        let new = !clusters.iter().any(|c| same_cluster(c, &t))
+            && instances.insert(grouping::hub_instance(&h.context, &servers));
+        clusters.push(t);
+        new
+    });
+    found
 }
 
 async fn get_application(hub: &Hub, ns: &str, name: &str) -> Result<Value> {

@@ -337,7 +337,11 @@ fn update(scope: &Scope, change: impl FnOnce(&mut Found)) {
 async fn run(scope: Scope, ask: Ask, judged_since: Option<Instant>, mut finish: Finish) {
     let Ask { client, kinds, record } = ask;
     let context = record.then_some(scope.context.as_str());
-    let jobs = super::jobs(&client, &kinds, &scope.namespaces, context, judged_since);
+    let mut jobs = super::jobs(&client, &kinds, &scope.namespaces, context, judged_since);
+    // Argo CD Applications deploying here, read on their hubs (no request when none is known).
+    let serves = kinds.iter().any(|k| k.is("argoproj.io", "Application"));
+    let argo = super::argo_apps::scan(scope.context.clone(), client.clone(), serves, scope.namespaces.clone());
+    jobs.push((super::argo_apps::CHECK.to_string(), argo.boxed()));
     finish.checks = Some(jobs.iter().map(|(name, _)| Arc::from(name.as_str())).collect());
     let checks = async {
         let mut running: futures::stream::FuturesUnordered<_> = (jobs.into_iter().enumerate())
@@ -426,6 +430,7 @@ mod tests {
             name: name.into(),
             reason: "broken".into(),
             age: None,
+            on_hub: None,
         }
     }
 

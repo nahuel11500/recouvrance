@@ -1,6 +1,7 @@
 //! "What is broken?": problems found from kubectl's own tables (cheap even on
 //! very large clusters), for the Problems page and the `find_problems` MCP tool.
 
+pub mod argo_apps;
 pub(crate) mod references;
 pub mod shared;
 
@@ -29,6 +30,16 @@ pub struct Problem {
     pub name: String,
     pub reason: String,
     pub age: Option<jiff::Timestamp>,
+    /// An Argo CD Application is shown under the cluster and namespace it deploys to, but
+    /// lives on its hub: there, and in this namespace.
+    pub on_hub: Option<OnHub>,
+}
+
+/// Where an Argo CD Application found by a scan lives: its hub, and its own namespace there.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OnHub {
+    pub context: String,
+    pub namespace: String,
 }
 
 fn cell<'a>(defs: &[ColumnDef], row: &'a Row, name: &str) -> &'a str {
@@ -153,7 +164,8 @@ pub fn judge(kind: &Kind, defs: &[ColumnDef], row: &Row) -> Option<(Severity, St
 }
 
 /// Kinds checked, in display order. Namespaces, PersistentVolumes and Argo CD Applications
-/// only for deletions stuck; a kind the cluster doesn't serve is left out. The
+/// only for deletions stuck (Applications that need attention are checked on their hub, under
+/// the cluster they deploy to: `argo_apps`); a kind the cluster doesn't serve is left out. The
 /// external-secrets.io ones are judged from their objects (`external_secrets::problems`).
 /// Services, Ingresses and HTTP routes for what they point to that is missing, together
 /// (`references::traffic`).
@@ -316,6 +328,7 @@ async fn scan_kind(
         name,
         reason,
         age,
+        on_hub: None,
     };
     // One namespace: its own object, not every namespace.
     if let Some(ns) = namespace.as_deref().filter(|_| kind.is("", "Namespace")) {
