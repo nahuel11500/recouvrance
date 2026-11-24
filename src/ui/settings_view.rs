@@ -1503,7 +1503,7 @@ impl SettingsView {
                         div()
                             .text_sm()
                             .font_family(theme.mono_font_family.clone())
-                            .child(crate::plugins::path().display().to_string()),
+                            .child(crate::paths::tilde(&crate::plugins::path())),
                     )
                     .child(
                         Button::new("plugins-reload").small().ghost().icon(Lucide::RefreshCw).label("Reload").on_click(
