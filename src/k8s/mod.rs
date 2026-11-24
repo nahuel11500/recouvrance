@@ -206,6 +206,11 @@ pub fn error_chain(e: &anyhow::Error) -> String {
     login::login_failure(e.as_ref()).unwrap_or_else(|| format!("{e:#}"))
 }
 
+/// Whether `e`, or an error behind it, is a context's login command that failed.
+pub fn login_failed(e: &anyhow::Error) -> bool {
+    login::login_failure(e.as_ref()).is_some()
+}
+
 /// The HTTP status of an API error (403 forbidden, 404 not found…), if it is one.
 pub fn api_status(e: &anyhow::Error) -> Option<u16> {
     e.chain().find_map(|c| match c.downcast_ref::<kube::Error>() {

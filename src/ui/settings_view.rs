@@ -1061,15 +1061,16 @@ impl SettingsView {
             })
             .collect();
         v_flex()
-            .child(div().pb_2().text_sm().text_color(muted).child(
+            .child(div().pb_2().text_sm().text_color(muted).child(format!(
                 "Metrics endpoint: found automatically; or namespace/service:port, with a path for VictoriaMetrics \
                  (vmselect: monitoring/vmselect:8481/select/0/prometheus; single: monitoring/victoria-metrics:8428), or a full http(s) URL. \
                  Accessible namespaces are used when you may not list namespaces: they fill the picker, and the list shows one of them at a time. \
                  Argo CD server: on a context Argo CD runs in, its API server (https://argocd.example.com), to show Argo CD's own \
                  diff on an Application's page. It logs in with the argocd CLI's login to that server, or with a read-only token \
-                 (`applications, get`) kept in ~/.config/recouvrance/argocd-tokens.json, readable only by you. Nothing is sent \
+                 (`applications, get`) kept in {}, readable only by you. Nothing is sent \
                  until you ask for the diff.",
-            ))
+                crate::paths::shown_config("argocd-tokens.json")
+            )))
             .children(rows)
             .into_any_element()
     }
@@ -1168,14 +1169,15 @@ impl SettingsView {
                 })
                 .collect();
         v_flex()
-            .child(div().pb_2().text_sm().text_color(muted).child(
+            .child(div().pb_2().text_sm().text_color(muted).child(format!(
                 "Argo CD read by its own API, with no kubeconfig for the cluster it runs in: the servers the argocd CLI \
                  is logged in to (`argocd login`), and those added here. A token added here is kept in \
-                 ~/.config/recouvrance/argocd-api-tokens.json, readable only by you, and wins over the CLI's; it is \
+                 {}, readable only by you, and wins over the CLI's; it is \
                  never shown, and sent to that server only. A read-only one is enough to list (`applications, get` and \
                  `projects, get`); the Argo CD page's actions need what Argo CD's own UI would. Applications are \
                  listed once, then kept live from Argo CD's stream while the Argo CD page is shown.",
-            ))
+                crate::paths::shown_config("argocd-api-tokens.json")
+            )))
             .children(self.argo_api.errors.iter().map(|e| div().pb_1().text_xs().text_color(theme.danger).child(e.clone())))
             .when(self.argo_api.list.is_empty(), |d| {
                 d.child(div().py_2().text_sm().text_color(muted).child("No Argo CD server: add one below, or run `argocd login`."))
@@ -1361,11 +1363,12 @@ impl SettingsView {
         let number_input = |e: &Entity<InputState>| div().w(px(110.)).child(Input::new(e).small());
         let on = s.timeline.record;
         v_flex()
-            .child(div().pb_2().text_sm().text_color(cx.theme().muted_foreground).child(
+            .child(div().pb_2().text_sm().text_color(cx.theme().muted_foreground).child(format!(
                 "While a cluster is connected, changes to what the lists and the Problems scan watch are recorded \
                  (pods, events and ReplicaSets excepted), with no request added. Kept on disk per context in \
-                 ~/.local/share/recouvrance/timeline/; a Secret's values never, only which keys changed.",
-            ))
+                 {}/; a Secret's values never, only which keys changed.",
+                crate::paths::shown_data("timeline")
+            )))
             .child(Self::row(
                 "Record changes",
                 "Off: nothing more is recorded; what was is still shown.",
@@ -1500,7 +1503,7 @@ impl SettingsView {
                         div()
                             .text_sm()
                             .font_family(theme.mono_font_family.clone())
-                            .child(crate::plugins::path().display().to_string()),
+                            .child(crate::paths::tilde(&crate::plugins::path())),
                     )
                     .child(
                         Button::new("plugins-reload").small().ghost().icon(Lucide::RefreshCw).label("Reload").on_click(
@@ -1702,13 +1705,11 @@ impl SettingsView {
                     .children(command)
                     .child(div().text_sm().child("Then restart Recouvrance.")),
             )
-            .child(
-                div()
-                    .pt_3()
-                    .text_xs()
-                    .text_color(muted)
-                    .child("Settings: ~/.config/recouvrance/ · Agent activity: ~/.local/share/recouvrance/audit.jsonl"),
-            )
+            .child(div().pt_3().text_xs().text_color(muted).child(format!(
+                "Settings: {}/ · Agent activity: {}",
+                crate::paths::tilde(&crate::paths::config_dir()),
+                crate::paths::shown_data("audit.jsonl")
+            )))
             .into_any_element()
     }
 
