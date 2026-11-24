@@ -1491,10 +1491,9 @@ pub fn add_api(
             }
         }
         // Its own cluster (`in-cluster`) is that of the hub whose Argo CD server it is, if set.
-        let hub = servers
-            .iter()
-            .find(|(_, text)| server::Server::parse(text).is_ok_and(|s| s.base == endpoint.server.base))
-            .map_or_else(ContextTarget::default, |(c, _)| target(targets, c));
+        let hub = server::contexts_of(servers, &endpoint.server.base)
+            .next()
+            .map_or_else(ContextTarget::default, |c| target(targets, c));
         let mut apps: Vec<&Arc<api::ApiApp>> = read.state.apps.values().collect();
         apps.sort_by(|a, b| (&a.summary.namespace, &a.summary.name).cmp(&(&b.summary.namespace, &b.summary.name)));
         let values: Vec<&Value> = apps.iter().map(|a| &a.value).collect();

@@ -102,12 +102,18 @@ copy; if one doesn't fit, extend it.
   `spawn_in` replaces (and cancels) the running one, so a slow old result never lands over a
   newer one; `cancel` when the input goes away (a document with no kind, other pods).
 - **Writes from the UI:** every request of the UI's clients passes `k8s::gate::WriteGate`,
-  which refuses writes and shells while write mode is off, at the moment they are sent.
-  `k8s::helm` does the same for install/upgrade/rollback/uninstall. Turn write mode on or off
-  with `details::set_writes`, never by setting the `WriteMode` global alone. The agents' MCP
-  server builds its clients with `connect_for_agents` (no gate: their rules decide).
+  which refuses writes and shells while write mode is off, or always on a context set
+  read-only in Settings → Contexts, at the moment they are sent. A write path outside the
+  gated clients (helm, a plugin, a local kubectl, Argo CD's API) checks
+  `k8s::gate::refusal(context)` right before it sends, not `ui_writes()` alone, and
+  `details::not_read_only` before it asks. Turn write mode on or off with
+  `details::set_writes`, never by setting the `WriteMode` global alone. The agents' MCP
+  server builds its clients with `connect_for_agents` (no gate: their rules decide, except on
+  a read-only context).
 - **Agent writes:** call `recheck` (or `stale_reason`) right before the cluster call. It
-  decides again on the agent's current rules, so changes made while the call waited count.
+  decides again on the agent's current rules, so changes made while the call waited count. A
+  write to a read-only context is refused before the rules decide (`authorize_inner`,
+  `stale_reason` and `stop_check`): a new agent write path goes through them.
 - **A pod's requests and limits: `k8s::podspec`.** `of_value` / `LeanSpec::effective` with
   `Count::Scheduled` (what a node reserves: init containers count) or `Count::Running` (to
   set usage against). `podspec::total` adds them up over pods. It covers sidecars, init

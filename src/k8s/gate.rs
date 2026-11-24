@@ -3,11 +3,14 @@
 //! The UI asks for write mode before a write, but a dialog, a dry run or a file picker can
 //! sit between that check and the request; turning write mode off meanwhile must still stop
 //! it. Every request of the UI's clients passes through [`WriteGate`], which refuses what
-//! changes the cluster (or opens a shell in it) while write mode is off. The agents' clients
-//! have no gate: their own rules decide, write mode is the UI's.
+//! changes the cluster (or opens a shell in it) while write mode is off, or always on a
+//! context set read-only in Settings → Contexts. The agents' clients have no gate: their own
+//! rules decide, write mode is the UI's (the MCP server refuses their writes to a read-only
+//! context itself).
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
 
@@ -24,6 +27,20 @@ pub fn ui_writes() -> bool {
 
 /// The refusal, worded for the error shown where the write was started.
 pub const WRITES_OFF: &str = "write actions are off: turn them on to change the cluster";
+
+/// The refusal of a write to a read-only context, worded like [`WRITES_OFF`].
+pub fn read_only_refusal(context: &str) -> String {
+    format!("{context} is read-only: change it in Settings → Contexts to write to it")
+}
+
+/// Why a write (or a shell) on `context` from the window is refused now, if it is: the
+/// context is read-only, whatever write mode says, or write mode is off.
+pub fn refusal(context: &str) -> Option<String> {
+    if crate::settings::is_read_only(context) {
+        return Some(read_only_refusal(context));
+    }
+    (!ui_writes()).then(|| WRITES_OFF.to_string())
+}
 
 /// Whether a request changes the cluster or opens a shell in it, and so needs write mode.
 /// Reads, watches, logs and port-forwards don't; neither do server-side dry runs, the
@@ -91,20 +108,24 @@ fn is_pod_copy(path: &str) -> bool {
     }
 }
 
-#[derive(Clone, Copy)]
-pub struct WriteGateLayer;
+/// The gate of one context's client: its read-only setting is read for each write.
+#[derive(Clone)]
+pub struct WriteGateLayer {
+    pub context: Arc<str>,
+}
 
 impl<S> tower::Layer<S> for WriteGateLayer {
     type Service = WriteGate<S>;
 
     fn layer(&self, inner: S) -> Self::Service {
-        WriteGate { inner }
+        WriteGate { inner, context: self.context.clone() }
     }
 }
 
 #[derive(Clone)]
 pub struct WriteGate<S> {
     inner: S,
+    context: Arc<str>,
 }
 
 impl<S, B, R> tower::Service<http::Request<B>> for WriteGate<S>
@@ -123,8 +144,11 @@ where
 
     fn call(&mut self, req: http::Request<B>) -> Self::Future {
         let uri = req.uri();
-        if !ui_writes() && needs_writes(req.method(), uri.path(), uri.query().unwrap_or_default()) {
-            return Box::pin(async { Err(WRITES_OFF.into()) });
+        // Reads never look at the settings: only a write pays for the check.
+        if needs_writes(req.method(), uri.path(), uri.query().unwrap_or_default())
+            && let Some(why) = refusal(&self.context)
+        {
+            return Box::pin(async move { Err(why.into()) });
         }
         let fut = self.inner.call(req);
         Box::pin(async move { fut.await.map_err(Into::into) })

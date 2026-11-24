@@ -173,21 +173,21 @@ fn port_is_number(authority: &http::uri::Authority) -> Option<bool> {
 }
 
 /// `text` without the user and password of any URL in it: after each `://`, everything up to
-/// the last `@` before the end of the host and port (a `/`, `?` or `#`, a space, or a character
-/// a URL can't hold unescaped). A text without them comes back as it is.
+/// [`userinfo_end`]. A text without them comes back as it is.
 fn without_userinfo(text: &str) -> Cow<'_, str> {
     let mut said = String::new();
     // How much of `text` is in `said` or left out.
     let mut done = 0;
     for (at, _) in text.match_indices("://") {
         let start = at + "://".len();
-        let rest = &text[start..];
-        let authority = &rest[..rest.find(ends_authority).unwrap_or(rest.len())];
-        // An authority holds no `/`: it ends before the next `://` is over, so `done` never
-        // passes `start`.
-        if let Some(info) = authority.rfind('@') {
+        // In what an earlier URL's user and password reached (`a://b://u@h`): that `@` was the
+        // last before the same end, so nothing is left for this one.
+        if start < done {
+            continue;
+        }
+        if let Some(end) = userinfo_end(&text[start..]) {
             said.push_str(&text[done..start]);
-            done = start + info + 1;
+            done = start + end;
         }
     }
     if done == 0 {
@@ -197,12 +197,21 @@ fn without_userinfo(text: &str) -> Cow<'_, str> {
     Cow::Owned(said)
 }
 
-/// Whether `c` ends a URL's authority (its user, password, host and port): its path, query or
-/// fragment starts, or it is a space or a character a URL can't hold unescaped.
-fn ends_authority(c: char) -> bool {
-    c.is_whitespace()
-        || c.is_control()
-        || matches!(c, '/' | '?' | '#' | '"' | '<' | '>' | '\\' | '^' | '`' | '{' | '|' | '}')
+/// Where the user and password of a URL end in `rest`, the text after its `://`: just past the
+/// last `@` before a space or a character a URL can't hold unescaped; `None` without one.
+///
+/// An `@` past a `/`, `?` or `#` counts too: a password may hold them unescaped (an invalid URL,
+/// but a kubeconfig or a login plugin's config can), and ending the userinfo there would show
+/// the rest of it (#889, #1000). A path or query that holds an `@` (`host/a@b`) loses its start
+/// with them, the safer side.
+pub(crate) fn userinfo_end(rest: &str) -> Option<usize> {
+    let url = &rest[..rest.find(ends_url).unwrap_or(rest.len())];
+    url.rfind('@').map(|at| at + 1)
+}
+
+/// Whether `c` ends a URL in a text: a space, or a character a URL can't hold unescaped.
+fn ends_url(c: char) -> bool {
+    c.is_whitespace() || c.is_control() || matches!(c, '"' | '<' | '>' | '\\' | '^' | '`' | '{' | '|' | '}')
 }
 
 /// Puts [`LoginFailed`] in place of a failed login command's error on every request of a
@@ -516,6 +525,8 @@ mod tests {
         // falls in the password here, and nothing is cut once they are out).
         let said = last_line(b"error: Get https://alice:s3cr3t@issuer.example/token: 401\n");
         assert_eq!(said.as_deref(), Some("error: Get https://issuer.example/token: 401"));
+        let said = last_line(b"error: Get https://alice:s3/cr3t@issuer.example/token: 401\n");
+        assert_eq!(said.as_deref(), Some("error: Get https://issuer.example/token: 401"));
         let long = format!("{} https://alice:s3cr3t-and-more@issuer.example", "x".repeat(175));
         assert_eq!(last_line(long.as_bytes()), Some(format!("{} https://issuer.example", "x".repeat(175))));
     }
@@ -531,14 +542,24 @@ mod tests {
             ),
             // The last `@` ends them; a quote, a space, a line break or the path ends the host.
             (r#"proxy "https://alice:p@ss@[::1]:3128""#, r#"proxy "https://[::1]:3128""#),
-            ("from http://a:b@one to ssh://git@two:22/x?y=z@w", "from http://one to ssh://two:22/x?y=z@w"),
+            ("from http://a:b@one to ssh://git@two:22/x?y=z", "from http://one to ssh://two:22/x?y=z"),
             ("socks5://alice@h\nnext@line", "socks5://h\nnext@line"),
+            // A `/`, `?` or `#` in the password doesn't end it: the last `@` before a space does
+            // (#1000).
+            ("connecting to https://alice:pa/ss@api:6443 failed", "connecting to https://api:6443 failed"),
+            ("connecting to https://alice:pa?ss@api:6443 failed", "connecting to https://api:6443 failed"),
+            ("connecting to https://alice:pa#ss@api:6443 failed", "connecting to https://api:6443 failed"),
+            ("https://alice:p/a?s#s@api:6443/x?y#z", "https://api:6443/x?y#z"),
+            // Two URLs with nothing between them: the last `@` ends both.
+            ("a://b://alice:p/w@api", "a://api"),
+            // An `@` in a path or query takes its start along, the safer side.
+            ("https://example.com/a@b and https://x?y=z@w", "https://b and https://w"),
         ];
         for (text, said) in cases {
             assert_eq!(without_userinfo(text), said);
         }
         // Without a user or password in a URL, the text itself.
-        for text in ["mail alice@example.com about https://example.com/a@b", "a@b://", "x://", ""] {
+        for text in ["mail alice@example.com about https://example.com/a b@c", "a@b://", "x://", ""] {
             assert!(matches!(without_userinfo(text), Cow::Borrowed(t) if t == text), "{text}");
         }
     }
@@ -600,14 +621,19 @@ mod tests {
             build_error(kube::Error::ProxyProtocolDisabled { proxy_url, protocol_feature: "kube/socks5" }, None, false);
         let said = r#"configured proxy socks5://… requires the disabled feature "kube/socks5""#;
         assert_eq!(format!("{built:#}"), said);
-        // Another error that prints a URL: its user and password go, the rest is said.
-        let other =
-            build_error(kube::Error::Service("connecting to https://alice:s3cr3t@api:6443 failed".into()), None, false);
-        let said = format!("{other:#}");
-        assert!(
-            said.starts_with("ServiceError: connecting to https://api:6443 failed") && !said.contains("alice"),
-            "{said}"
-        );
+        // Another error that prints a URL: its user and password go, the rest is said, even with
+        // a `/`, `?` or `#` in the password (#1000).
+        for password in ["s3cr3t", "s3/cr3t", "s3?cr3t", "s3#cr3t"] {
+            let text = format!("connecting to https://alice:{password}@api:6443 failed");
+            let other = build_error(kube::Error::Service(text.into()), None, false);
+            let said = format!("{other:#}");
+            assert!(
+                said.starts_with("ServiceError: connecting to https://api:6443 failed")
+                    && !said.contains("alice")
+                    && !said.contains("cr3t"),
+                "{said}"
+            );
+        }
         // Without one, kube's error as it was.
         let refused = build_error(kube::Error::Service("refused".into()), None, false);
         assert!(matches!(refused.downcast_ref::<kube::Error>(), Some(kube::Error::Service(_))));
@@ -723,6 +749,7 @@ mod url_properties {
             Just(" "),
             Just("a"),
             Just("?"),
+            Just("#"),
             Just("\""),
             Just("["),
             Just("é")
@@ -731,15 +758,15 @@ mod url_properties {
     }
 
     proptest! {
-        /// A URL in a text loses its user and password, whatever they hold and whatever text is
-        /// around it; the rest of the text, the URL's scheme, host, port and path included, stays
+        /// A URL in a text loses its user and password, whatever they hold (an unescaped `/`,
+        /// `?`, `#` or `@` too, #1000) and whatever text is around it; the rest of the text, the URL's scheme, host, port and path included, stays
         /// as it was.
         #[test]
         fn a_url_in_a_text_never_shows_its_user_and_password(
             before in "[^@]{0,20}",
             scheme in "[a-z][a-z0-9+.-]{0,8}",
             user in "[a-zA-Z0-9._~!$&'()*+,;=%-]{0,8}",
-            password in proptest::option::of("[a-zA-Z0-9._~!$&'()*+,;=%:@-]{0,8}"),
+            password in proptest::option::of("[a-zA-Z0-9._~!$&'()*+,;=%:@/?#-]{0,8}"),
             host in "[a-z0-9.-]{1,16}|\\[[0-9a-f:]{2,12}\\]",
             port in proptest::option::of(any::<u16>()),
             path in "([/?#][^@]{0,12})?",
@@ -754,13 +781,23 @@ mod url_properties {
 
         /// Whatever the text, what comes back holds no user or password of a URL: read again,
         /// it comes back the same. A text without both a `://` and an `@` comes back as it is.
+        /// A URL put anywhere in it never shows its password, whatever it holds (`/`, `?`, `#`
+        /// or `@` too, #1000) and whatever comes before or after it.
         #[test]
-        fn nothing_is_left_to_leave_out(text in texts()) {
+        fn nothing_is_left_to_leave_out(
+            text in texts(),
+            (before, after) in (texts(), texts()),
+            password in "[a-zA-Z0-9._~!$&'()*+,;=%:@/?#-]{0,8}",
+        ) {
             let once = without_userinfo(&text).into_owned();
             prop_assert_eq!(without_userinfo(&once), once.as_str());
             if !(text.contains("://") && text.contains('@')) {
                 prop_assert!(matches!(without_userinfo(&text), Cow::Borrowed(t) if t == text), "{text}");
             }
+            let text = format!("{before}https://{SECRET}:{password}@{after}");
+            let said = without_userinfo(&text);
+            prop_assert!(!said.contains(SECRET), "{said}\nfrom {text}");
+            prop_assert_eq!(without_userinfo(&said), said.as_ref());
         }
 
         /// Whatever a proxy's URL holds, with a scheme or without, the error of building a client

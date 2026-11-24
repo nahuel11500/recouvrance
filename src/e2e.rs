@@ -127,6 +127,65 @@ fn write_mode_off_refuses_the_ui_s_writes() {
     });
 }
 
+/// A context set read-only takes no write from the window even with write mode on (the
+/// client, helm), and no write from an agent whose rules allow it (refused as final, and
+/// `check_access` says so); reads and the window's dry runs still go through. Set back, the
+/// same writes land, so the refusals are not a broken setup.
+#[test]
+#[ignore = "needs a kind cluster: RECOUVRANCE_E2E_CONTEXT"]
+fn a_read_only_context_refuses_every_write() {
+    run(async {
+        let ctx = context();
+        let ui: Api<ConfigMap> = Api::namespaced(k8s::connect(ctx.clone()).await?, NS);
+        let truth: Api<ConfigMap> = Api::namespaced(k8s::connect_for_agents(ctx.clone()).await?, NS);
+        let name = "e2e-read-only";
+        let _ = truth.delete(name, &DeleteParams::default()).await;
+        truth.create(&PostParams::default(), &config_map(name)).await?;
+        let (hub, _agent, token, _server) = agent(&["* *"], &[]).await?;
+        let client = crate::assistant::Mcp::connect(hub.port(), token).await?;
+        let patch =
+            json!({"context": ctx, "kind": "configmaps", "namespace": NS, "name": name, "patch": {"data": {"a": "2"}}});
+        let checked = async {
+            crate::settings::set_read_only(&ctx, true);
+            gate::set_ui_writes(true);
+            let refused = ui.delete(name, &DeleteParams::default()).await;
+            let err = format!("{:#}", anyhow::Error::from(refused.expect_err("a write to a read-only context")));
+            assert!(err.contains(&gate::read_only_refusal(&ctx)), "{err}");
+            let helm = k8s::helm(ctx.clone(), vec!["uninstall".into(), "e2e-none".into()]).await;
+            let err = format!("{:#}", helm.expect_err("helm uninstall on a read-only context"));
+            assert!(err.contains(&gate::read_only_refusal(&ctx)), "{err}");
+            ui.create(&PostParams { dry_run: true, ..Default::default() }, &config_map("e2e-read-only-dry")).await?;
+            ui.get(name).await?;
+
+            let out = client.call("patch_resource", patch.clone()).await;
+            assert!(out.contains("Denied") && out.contains("read-only") && out.contains("Final"), "{out}");
+            let planned =
+                json!({"requests": [{"context": ctx, "verb": "delete", "kind": "cm", "namespace": NS, "name": name}]});
+            let out = client.call("check_access", planned).await;
+            assert!(out.contains("read-only") && out.contains("0 allowed"), "{out}");
+            let out = client
+                .call("get_resource", json!({"context": ctx, "kind": "configmaps", "namespace": NS, "name": name}))
+                .await;
+            assert!(out.contains(name) && !out.contains("Denied"), "{out}");
+            let data = truth.get(name).await?.data.unwrap_or_default();
+            assert_eq!(data.get("a").map(String::as_str), Some("1"), "a write reached a read-only context");
+
+            crate::settings::set_read_only(&ctx, false);
+            let out = client.call("patch_resource", patch.clone()).await;
+            assert!(!out.contains("Denied"), "{out}");
+            let data = truth.get(name).await?.data.unwrap_or_default();
+            assert_eq!(data.get("a").map(String::as_str), Some("2"), "{out}");
+            ui.delete(name, &DeleteParams::default()).await?;
+            anyhow::Ok(())
+        };
+        let result = checked.await;
+        crate::settings::set_read_only(&ctx, false);
+        gate::set_ui_writes(false);
+        let _ = truth.delete(name, &DeleteParams::default()).await;
+        result
+    });
+}
+
 /// A row of a big list in every namespace comes from its cells alone, without a uid: the
 /// table's delete reads the object's and deletes only the object listed. One newer than
 /// the row (re-created under its name since the list) stays; the one listed goes.

@@ -27,7 +27,7 @@ Site: [nahuelcanavy.com/recouvrance](https://nahuelcanavy.com/recouvrance/)
   find and filters (a workload's, or the checked rows' across namespaces and clusters), shell, attach, a file browser and file copy, port-forwards, YAML with field docs and schema forms,
   Helm, Flux and Argo CD actions, several clusters at once, tabs and windows.
 - **Tells you what is wrong**: a Problems page across clusters, a diagnosis on every broken pod or
-  workload, firing alerts, stuck deletions, CronJobs that stopped running, ExternalSecrets that fail to sync, usage history from
+  workload, firing alerts, stuck deletions, CronJobs that stopped running, ExternalSecrets that fail to sync, certificates failing to renew or about to expire, usage history from
   Prometheus or VictoriaMetrics, certificate expiry, and the Argo CD Application behind an object.
 - **Safe by default**: read-only until you enable writes; writes are confirmed with their
   `kubectl` equivalent (deletes ask as you set per kind), and YAML edits and applies are checked
@@ -135,7 +135,8 @@ what you can check for yourself:
   DaemonSets, PersistentVolumes and their claims, and CRDs get the strict confirmation). A
   protected context always gets the strict confirmation: a few seconds' wait by default (the
   confirm button counts down, then works), or the names typed. Write mode and protection are for you in the window:
-  agents are not bound by them, unless their rules name `@protected`. Agents get only what their rules allow (an *Ask me* rule asks you
+  agents are not bound by them, unless their rules name `@protected`. A context set read-only
+  takes no write from the window or from agents, whatever write mode or their rules say. Agents get only what their rules allow (an *Ask me* rule asks you
   first), every call is logged to
   `~/.local/share/recouvrance/audit.jsonl`, and a kill switch cuts them all off.
 - **Verifiable releases.** Every release archive, `.deb` and AppImage has a build provenance

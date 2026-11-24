@@ -169,6 +169,7 @@ impl ContextPicker {
         let color: Hsla =
             crate::settings::context_color(name).map_or(theme.muted_foreground.opacity(0.4), |c| rgb(c).into());
         let protected = crate::settings::is_protected(name);
+        let read_only = crate::settings::is_read_only(name);
         let connected = self.connected.iter().any(|c| c == name);
         // In the set, but not (yet) connected: say so instead of "connected".
         let state = self.states.get(name).cloned();
@@ -233,6 +234,7 @@ impl ContextPicker {
                     .child(short),
             )
             .when(protected, |d| d.child(Icon::new(Lucide::Lock).size_3p5().text_color(theme.warning)))
+            .when(read_only, |d| d.child(div().text_xs().text_color(theme.muted_foreground).child("read-only")))
             .when(connected, |d| match state {
                 None => d.child(div().text_xs().text_color(theme.blue).child("connected")),
                 Some(Conn::Connecting) => {

@@ -35,9 +35,9 @@ protected, a `delete_confirm_kinds` entry that doesn't read asks for the name, a
 `settings.json` can't be read). When
 `settings.json` doesn't read as an object at all, or its protection choices can't be read, every
 context without a choice is protected, also after a restart, until you choose *Guess them again* in
-Settings → Contexts. A `settings.json` that exists but can't be
+Settings → Contexts; the same goes for the read-only choices (*Make them writable*). A `settings.json` that exists but can't be
 read (say, owned by root after a run with `sudo`) is left alone: the app starts with the defaults,
-counts every context not set as protected, saves nothing until it is restarted with a readable
+counts every context not set as protected and read-only, saves nothing until it is restarted with a readable
 file, and Settings says why. When `agents.json` can't be read, the app starts with no agents and
 agent access off, and the Agents page says why.
 
@@ -83,6 +83,8 @@ context already shown as `name@file` keeps that name when `name` is freed.
 | `context_colors` | | `{ "prod-eu": "#ef4444" }`: a colored strip per context |
 | `protection` | guessed | `{ "prod-eu": true, "kind-dev": false }`: contexts where writes, shells and plugins need the context name typed (or a wait, see `confirm_style`). Contexts not listed are guessed from the context, user and cluster names and the server URL (`prod`, `prd`, `production`, `live`, `admin`, `root`); a context the kubeconfig doesn't have now, or any context while the kubeconfig can't be read, counts as protected. An older `protected_contexts` list is read once: its contexts become `true` |
 | `protect_unset` | `false` | Set when the protection choices could not be read: contexts not listed in `protection` are protected instead of guessed. *Guess them again* in Settings → Contexts turns it off |
+| `read_only` | | `{ "prod-eu": true }`: contexts the window never writes to, whatever write mode says (writes that aren't dry runs, shells, attach, Helm changes, Argo CD actions and writing plugins are refused when sent; the local kubectl terminal doesn't open), and agents never write to, whatever their rules say (every call with a write verb, dry runs too, is refused as final). Reads, logs, port-forwards and the window's dry runs still work. Argo CD actions follow the hub context tied to the server in `argocd_servers` (else the server's name), not the Application's destination cluster. `recouvrance serve` reads changes to it from the file within seconds. An entry that isn't `true` or `false` counts as read-only; contexts not listed aren't |
+| `read_only_unset` | `false` | Set when the read-only choices could not be read: contexts not listed in `read_only` are read-only. *Make them writable* in Settings → Contexts turns it off |
 | `prometheus` | found automatically | `{ "ctx": "monitoring/prometheus:9090" }` (see below) |
 | `clusters` | | Per-cluster settings (below) |
 | `argocd_servers` | `{}` | `{ "argocd-hub": "https://argocd.example.com" }`: the Argo CD API server of a hub context, to read Argo CD's own diff from (see below). None: off. An entry that doesn't read is dropped. Settings → Per cluster |

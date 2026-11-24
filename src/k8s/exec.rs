@@ -726,10 +726,13 @@ pub fn helm_writes(args: &[String]) -> bool {
 }
 
 /// Run the `helm` CLI against a context and return its output. A command that changes the
-/// cluster needs write mode when it starts, like the UI's other writes.
+/// cluster needs write mode, and a context that isn't read-only, when it starts, like the
+/// UI's other writes.
 pub async fn helm(context: String, args: Vec<String>) -> Result<String> {
-    if helm_writes(&args) && !gate::ui_writes() {
-        anyhow::bail!(gate::WRITES_OFF);
+    if helm_writes(&args)
+        && let Some(why) = gate::refusal(&context)
+    {
+        anyhow::bail!(why);
     }
     run(async move {
         let kubeconfig = private_kubeconfig(&context, None, "helm")?;

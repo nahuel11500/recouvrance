@@ -264,6 +264,22 @@ const USER_STATE: &str = "Final: only the user can change this; don't retry unti
 const DENIED_BY_RULE: &str =
     "Final: a Deny rule decided; don't retry or work around it, and tell the user if the task needs it.";
 
+/// Said after a refusal of a write to a context the user made read-only.
+const READ_ONLY: &str = "Final: the user made this context read-only in Recouvrance (Settings → Contexts), whatever \
+     your rules say; don't retry or work around it, and tell the user if the task needs it.";
+
+/// Whether a request is refused whatever the rules say: it changes the cluster (or runs
+/// something in it; dry runs too) on a context set read-only in Settings → Contexts. Read
+/// again at each check, so a context made read-only while a call waits stops it.
+fn read_only(access: &Access) -> bool {
+    access.verb.is_write() && crate::settings::is_read_only(&access.context)
+}
+
+/// Why [`read_only`] refuses `access`.
+fn read_only_reason(access: &Access) -> String {
+    format!("{} — context {:?} is read-only", describe(access), access.context)
+}
+
 /// What an agent can do about a request the rules deny, so it neither retries nor gives up
 /// without telling the user what to grant. Final when a Deny rule decided: no rule the user
 /// adds undoes it. Grantable when no rule covers the request, with the narrowest rule that
@@ -292,6 +308,9 @@ fn approval_hint(access: &Access) -> String {
 /// kind with none given, and a list an Ask rule covers shows the rows an Allow rule gives
 /// when it isn't approved.
 fn access_verdict(policy: &Policy, access: &Access, any_namespace: bool, headless: bool) -> (Mode, String) {
+    if read_only(access) {
+        return (Mode::Deny, format!("denied: context {:?} is read-only. {READ_ONLY}", access.context));
+    }
     let v = if any_namespace { policy.decide_any_namespace(access) } else { policy.decide(access) };
     let label = rule_label(policy, v.rule);
     let text = match v.mode {
@@ -615,6 +634,9 @@ impl KubeMcp {
             // while what it will change was worked out).
             self.reload_rules(call);
             self.ensure_active(call)?;
+            if read_only(access) {
+                return Err(call.deny_hinted(read_only_reason(access), READ_ONLY));
+            }
             let verdict = decide(call);
             match verdict.mode {
                 Mode::Allow => {
@@ -679,6 +701,10 @@ impl KubeMcp {
             self.reload_rules(call);
             return if answer == Answer::Approved {
                 self.ensure_active(call)?;
+                // Made read-only while the approval waited.
+                if read_only(access) {
+                    return Err(call.deny_hinted(read_only_reason(access), READ_ONLY));
+                }
                 let now = decide(call);
                 if now.mode == Mode::Deny {
                     return Err(call.deny_hinted(
@@ -729,6 +755,9 @@ impl KubeMcp {
         if self.inactive(call).is_some() {
             return USER_STATE.into();
         }
+        if read_only(access) {
+            return READ_ONLY.into();
+        }
         let v = call.policy().decide(access);
         match v.mode {
             Mode::Deny => deny_hint(access, v.rule),
@@ -742,6 +771,9 @@ impl KubeMcp {
         self.reload_rules(call);
         if let Some(reason) = self.inactive(call) {
             return Some(reason.to_string());
+        }
+        if read_only(access) {
+            return Some(read_only_reason(access));
         }
         let rule = stopped_by(call.policy(), access, call.approved)?;
         Some(format!("{} — the rules changed while the call waited ({})", describe(access), call.rule_label(rule)))
@@ -1396,6 +1428,9 @@ pub(crate) fn stop_check(
     move || {
         if let Some(reason) = inactive(&hub, &agent_id, &gone) {
             return Some(reason.to_string());
+        }
+        if read_only(&access) {
+            return Some(read_only_reason(&access));
         }
         let mode = hub.agent_for_calls(&agent_id).map_or(Mode::Deny, |a| a.policy.decide(&access).mode);
         match mode {

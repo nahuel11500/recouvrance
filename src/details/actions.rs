@@ -109,7 +109,7 @@ impl DetailPanel {
 
     /// Write actions are visible always; using one first offers to enable write mode.
     pub(super) fn ensure_writes(&self, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        ensure_writes(window, cx)
+        super::not_read_only(&self.context, window, cx) && ensure_writes(window, cx)
     }
 
     /// The kubectl command equivalent to a write action, shown in confirmations.

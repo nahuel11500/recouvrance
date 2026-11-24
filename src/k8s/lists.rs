@@ -32,15 +32,22 @@ pub async fn list_lean<T>(client: Client, ar: ApiResource, namespace: Option<Str
 where
     T: serde::de::DeserializeOwned + Send + 'static,
 {
-    list_lean_by(client, ar, namespace, None).await
+    list_lean_by(client, ar, namespace, Selectors::default()).await
 }
 
-/// `list_lean` of the objects a label selector picks (every one when None).
+/// What a list picks: a label selector and a field selector (every object when both are None).
+#[derive(Clone, Default)]
+struct Selectors {
+    labels: Option<String>,
+    fields: Option<String>,
+}
+
+/// `list_lean` of the objects `selectors` pick.
 async fn list_lean_by<T>(
     client: Client,
     ar: ApiResource,
     namespace: Option<String>,
-    labels: Option<String>,
+    selectors: Selectors,
 ) -> Result<Vec<T>>
 where
     T: serde::de::DeserializeOwned + Send + 'static,
@@ -48,8 +55,11 @@ where
     run_abortable(async move {
         let url = DynamicObject::url_path(&ar, namespace.as_deref());
         let mut lp = ListParams::default();
-        if let Some(labels) = &labels {
+        if let Some(labels) = &selectors.labels {
             lp = lp.labels(labels);
+        }
+        if let Some(fields) = &selectors.fields {
+            lp = lp.fields(fields);
         }
         let mut out = Vec::new();
         each_lean_page(&client, &url, lp, |page: Vec<T>| out.extend(page)).await?;
@@ -91,6 +101,19 @@ where
     list_lean_cached_by(client, ar, namespace, None).await
 }
 
+/// `list_lean_cached` of the objects a field selector picks (`type=kubernetes.io/tls`).
+pub async fn list_lean_cached_fields<T>(
+    client: Client,
+    ar: ApiResource,
+    namespace: Option<String>,
+    fields: String,
+) -> Result<Vec<T>>
+where
+    T: serde::de::DeserializeOwned + Send + 'static,
+{
+    cached_by(client, ar, namespace, Selectors { labels: None, fields: Some(fields) }).await
+}
+
 /// `list_lean_cached` of the objects a label selector picks (every one when None). Pages
 /// instead when the server will not answer from its cache, unless it refused the list (401,
 /// 403, 404): paging it would be refused the same, one request later.
@@ -103,14 +126,31 @@ pub async fn list_lean_cached_by<T>(
 where
     T: serde::de::DeserializeOwned + Send + 'static,
 {
-    let (c, ar2, ns, selector) = (client.clone(), ar.clone(), namespace.clone(), labels.clone());
+    cached_by(client, ar, namespace, Selectors { labels, fields: None }).await
+}
+
+/// `list_lean_cached` of the objects `selectors` pick.
+async fn cached_by<T>(
+    client: Client,
+    ar: ApiResource,
+    namespace: Option<String>,
+    selectors: Selectors,
+) -> Result<Vec<T>>
+where
+    T: serde::de::DeserializeOwned + Send + 'static,
+{
+    let (c, ar2, ns, picked) = (client.clone(), ar.clone(), namespace.clone(), selectors.clone());
     let whole = run_abortable(async move {
         use tokio_util::compat::FuturesAsyncReadCompatExt as _;
         let url = DynamicObject::url_path(&ar2, ns.as_deref());
         let mut path = format!("{url}?resourceVersion=0&resourceVersionMatch=NotOlderThan");
-        if let Some(selector) = &selector {
+        if let Some(labels) = &picked.labels {
             path.push_str("&labelSelector=");
-            path.push_str(&super::url_escape(selector));
+            path.push_str(&super::url_escape(labels));
+        }
+        if let Some(fields) = &picked.fields {
+            path.push_str("&fieldSelector=");
+            path.push_str(&super::url_escape(fields));
         }
         let body = c.request_stream(http::Request::get(&path).body(Vec::new())?).await?;
         let list: LeanList<T> = parse_streamed(Idle::new(body.compat(), LIST_IDLE)).await?;
@@ -121,7 +161,7 @@ where
     match whole {
         Ok(items) => Ok(items),
         Err(e) if matches!(api_status(&e), Some(401 | 403 | 404)) => Err(e),
-        Err(_) => list_lean_by(client, ar, namespace, labels).await,
+        Err(_) => list_lean_by(client, ar, namespace, selectors).await,
     }
 }
 
