@@ -133,6 +133,28 @@ pub(super) struct KeptTab {
     shown: SavedTab,
 }
 
+impl KeptTab {
+    /// A live tab that was `before` and is now `after`, its type's group having stopped
+    /// answering: saved as it was before, until it changes from how it is now.
+    pub(super) fn of(before: &TabState, after: &TabState) -> Self {
+        Self { saved: saved_tab(before), shown: tab_now(after) }
+    }
+}
+
+/// Whether `kind` is not among `kinds` because its group didn't answer discovery
+/// (`skipped`): not gone, only unreadable for now.
+pub(super) fn unread(kind: &Kind, kinds: &[Kind], skipped: &HashSet<String>) -> bool {
+    skipped.contains(&kind.ar.group) && !kinds.iter().any(|k| k.key() == kind.key())
+}
+
+/// The kubectl name (`applications.argoproj.io`) of a filter kept by `Kind::key`
+/// (`argoproj.io/v1alpha1/applications`), when its group is in `skipped`.
+fn unread_filter_name(key: &str, skipped: &HashSet<String>) -> Option<String> {
+    let (api_version, plural) = key.rsplit_once('/')?;
+    let group = api_version.rsplit_once('/').map_or("", |(g, _)| g);
+    skipped.contains(group).then(|| if group.is_empty() { plural.to_string() } else { format!("{plural}.{group}") })
+}
+
 /// What this window keeps of its set's session for API groups that didn't answer: the
 /// active tab's `KeptTab` (the others' are in their `TabState`), and the saved filters of
 /// types of those groups, by kubectl name.
@@ -207,8 +229,12 @@ impl AppView {
         let shown = self.tab_snapshot(cx);
         let tabs = self.saved_tabs(&shown);
         let by_key: HashMap<String, String> = self.kinds.iter().map(|k| (k.key(), k.kubectl_name())).collect();
+        // A type of a group that didn't answer on this connect keeps the filter typed on it.
         let mut filters: BTreeMap<String, String> = (self.kind_filters.all(&shown.filter).into_iter())
-            .filter_map(|(key, text)| Some((by_key.get(&key)?.clone(), text)))
+            .filter_map(|(key, text)| {
+                let name = by_key.get(&key).cloned().or_else(|| unread_filter_name(&key, &self.skipped_groups))?;
+                Some((name, text))
+            })
             .collect();
         // Those of types in groups that didn't answer, as saved, unless set again since.
         for (name, text) in &self.kept_session.filters {
@@ -429,7 +455,7 @@ fn restored(
 
 /// A tab as it is saved: as it was reopened when its type's group didn't answer and nothing
 /// changed in it since (see `KeptTab`), else as it is.
-fn saved_tab(t: &TabState) -> SavedTab {
+pub(super) fn saved_tab(t: &TabState) -> SavedTab {
     let now = tab_now(t);
     match &t.kept {
         Some(kept) if kept.shown == now => kept.saved.clone(),

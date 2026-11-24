@@ -395,7 +395,7 @@ impl AppView {
     /// What the bar above the list says: what failed (add-on APIs, watches), then progress.
     pub(super) fn status_line(&self) -> Option<SharedString> {
         // Each context's own failure is said by its line (see `connect_view`), not here.
-        let skipped = super::contexts::skipped_notice(&self.skipped);
+        let skipped = super::contexts::skipped_notice(&self.skipped, self.clusters.len());
         let failed: Option<SharedString> = match (&self.connect_notes, skipped) {
             (Some(notes), Some(skipped)) => Some(format!("{notes}; {skipped}").into()),
             (notes, skipped) => notes.clone().or(skipped),

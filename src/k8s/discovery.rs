@@ -1,6 +1,6 @@
 //! API discovery: the resource types a cluster serves and where they go in the sidebar.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use anyhow::Result;
 use futures::StreamExt as _;
@@ -276,7 +276,8 @@ pub fn sort_for_sidebar(kinds: &mut [Kind]) {
 }
 
 /// An add-on API group discovery could not read: its APIService is down, or its discovery
-/// failed. Its kinds are missing from what was found, not gone from the cluster.
+/// failed. Its kinds may be missing from what was found (by group, or aggregated with none
+/// known) or the last ones known (aggregated, marked stale): not gone from the cluster.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SkippedGroup {
     pub group: String,
@@ -434,18 +435,28 @@ async fn discover_by_group(client: &Client) -> Result<(Vec<(ApiResource, ApiCapa
             Err(e) => return Err(anyhow::Error::from(e).context(format!("discovery of {} failed", gv.api_version()))),
         }
     }
-    let mut skipped: Vec<SkippedGroup> = Vec::new();
-    let mut first_error = None;
-    for (gv, e) in optional {
-        if !skipped.iter().any(|s| s.group == gv.group) {
-            skipped.push(SkippedGroup { group: gv.group.clone(), error: format!("{}: {e}", gv.api_version()) });
-        }
-        first_error.get_or_insert(e);
-    }
-    match first_error {
-        Some(e) if resources.is_empty() => Err(e.into()),
+    let answered: HashSet<&str> = resources.iter().map(|(ar, _)| ar.group.as_str()).collect();
+    let skipped = skipped_by_group(&optional, &answered);
+    match optional.into_iter().next() {
+        Some((_, e)) if resources.is_empty() => Err(e.into()),
         _ => Ok((most_stable(resources), skipped)),
     }
+}
+
+/// The groups none of whose versions answered (`failed`), once each, with the first version
+/// that failed and why. A group another version of which answered (in `answered`) is not
+/// skipped: its kinds are there, at that version.
+fn skipped_by_group<E: std::fmt::Display>(
+    failed: &[(kube::core::GroupVersion, E)],
+    answered: &HashSet<&str>,
+) -> Vec<SkippedGroup> {
+    let mut skipped: Vec<SkippedGroup> = Vec::new();
+    for (gv, e) in failed {
+        if !answered.contains(gv.group.as_str()) && !skipped.iter().any(|s| s.group == gv.group) {
+            skipped.push(SkippedGroup { group: gv.group.clone(), error: format!("{}: {e}", gv.api_version()) });
+        }
+    }
+    skipped
 }
 
 /// Each group version's discovery, 16 at a time.
@@ -662,6 +673,29 @@ mod aggregated_tests {
         let groups: Vec<&str> = skipped.iter().map(|s: &SkippedGroup| s.group.as_str()).collect();
         assert_eq!(groups, ["metrics.k8s.io", "argoproj.io"]);
         assert!(skipped[0].error.contains("metrics.k8s.io/v1beta1"), "{}", skipped[0].error);
+    }
+
+    /// By group: a group is skipped only when none of its versions answered, once, with the
+    /// version that failed.
+    #[test]
+    fn a_group_is_skipped_only_when_no_version_answered() {
+        use std::collections::HashSet;
+
+        use kube::core::GroupVersion;
+
+        use super::skipped_by_group;
+        let failed = vec![
+            (GroupVersion::gv("argoproj.io", "v1alpha1"), "503"),
+            (GroupVersion::gv("metrics.k8s.io", "v1beta1"), "503"),
+            (GroupVersion::gv("metrics.k8s.io", "v1beta2"), "503"),
+        ];
+        // argoproj.io answered at another version.
+        let answered: HashSet<&str> = ["", "argoproj.io"].into();
+        let skipped = skipped_by_group(&failed, &answered);
+        assert_eq!(skipped.len(), 1);
+        assert_eq!(skipped[0].group, "metrics.k8s.io");
+        assert_eq!(skipped[0].error, "metrics.k8s.io/v1beta1: 503");
+        assert!(skipped_by_group(&failed[..1], &HashSet::new())[0].error.starts_with("argoproj.io/v1alpha1"));
     }
 
     #[test]
