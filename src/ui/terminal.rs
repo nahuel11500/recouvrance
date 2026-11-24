@@ -323,14 +323,18 @@ impl TerminalView {
         }
     }
 
+    /// Send the clipboard's text to the program, as one paste when it asked for bracketed paste.
+    fn paste(&mut self, cx: &mut Context<Self>) {
+        if let Some(text) = cx.read_from_clipboard().and_then(|c| c.text()) {
+            self.parser.screen_mut().set_scrollback(0);
+            self.send(paste_bytes(&text, self.parser.screen().bracketed_paste()));
+        }
+    }
+
     fn on_key(&mut self, ev: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
         let ks = &ev.keystroke;
-        // Paste with ctrl-shift-v, like most Linux terminals.
-        if ks.modifiers.control && ks.modifiers.shift && ks.key == "v" {
-            if let Some(text) = cx.read_from_clipboard().and_then(|c| c.text()) {
-                self.parser.screen_mut().set_scrollback(0);
-                self.send(paste_bytes(&text, self.parser.screen().bracketed_paste()));
-            }
+        if is_paste(ks, crate::app::MAC) {
+            self.paste(cx);
             cx.stop_propagation();
             return;
         }
@@ -571,6 +575,8 @@ impl Render for TerminalView {
                     .track_focus(&self.focus)
                     .key_context("Terminal")
                     .on_key_down(cx.listener(Self::on_key))
+                    // Edit → Paste in the macOS menu bar.
+                    .on_action(cx.listener(|this, _: &base::input::Paste, _, cx| this.paste(cx)))
                     .on_scroll_wheel(cx.listener(Self::on_scroll))
                     .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| window.focus(&this.focus, cx)))
                     .relative()
@@ -590,6 +596,14 @@ impl Render for TerminalView {
             )
             .into_any_element()
     }
+}
+
+/// Whether a key pastes in a shell: Ctrl+Shift+V, as in most Linux terminals, and on macOS
+/// (`mac`) ⌘V too. Ctrl+V alone goes to the program.
+fn is_paste(ks: &Keystroke, mac: bool) -> bool {
+    let m = &ks.modifiers;
+    let cmd_v = mac && m.platform && !(m.control || m.alt || m.shift);
+    ks.key == "v" && ((m.control && m.shift) || cmd_v)
 }
 
 /// Bytes sent for pasted text: wrapped in ESC[200~ … ESC[201~ when the program asked
@@ -758,7 +772,19 @@ fn vt_color(color: vt100::Color, default: Hsla, dark: bool) -> Hsla {
 
 #[cfg(test)]
 mod tests {
-    use super::{Keystroke, key_bytes, paste_bytes, whole_lines};
+    use super::{Keystroke, is_paste, key_bytes, paste_bytes, whole_lines};
+
+    #[test]
+    fn cmd_v_pastes_on_macos_and_ctrl_v_reaches_the_program() {
+        let paste = |k: &str, mac: bool| is_paste(&Keystroke::parse(k).unwrap(), mac);
+        for mac in [false, true] {
+            assert!(paste("ctrl-shift-v", mac), "Ctrl+Shift+V pastes (macOS: {mac})");
+            assert!(!paste("ctrl-v", mac), "Ctrl+V is the program's (macOS: {mac})");
+            assert!(!paste("cmd-shift-v", mac));
+        }
+        assert!(paste("cmd-v", true), "⌘V pastes on macOS");
+        assert!(!paste("cmd-v", false), "Super+V is the desktop's on Linux");
+    }
 
     #[test]
     fn copy_shortcut_is_not_an_interrupt() {

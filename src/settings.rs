@@ -47,6 +47,54 @@ fn wait_secs_or_longest<'de, D: Deserializer<'de>>(d: D) -> Result<u64, D::Error
     Ok(raw.as_u64().map_or(*CONFIRM_WAIT_RANGE.end(), clamp_wait))
 }
 
+/// Any value: the strings it lists, in order; nothing when it isn't a list.
+fn string_list<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
+    let raw = serde_json::Value::deserialize(d)?;
+    let Some(list) = raw.as_array() else { return Ok(Vec::new()) };
+    Ok(list.iter().filter_map(|v| Some(v.as_str()?.to_string())).collect())
+}
+
+/// Any value: its string entries; nothing when it isn't an object.
+fn string_map<'de, D: Deserializer<'de>>(d: D) -> Result<std::collections::BTreeMap<String, String>, D::Error> {
+    let raw = serde_json::Value::deserialize(d)?;
+    let Some(fields) = raw.as_object() else { return Ok(std::collections::BTreeMap::new()) };
+    Ok(fields.iter().filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_string()))).collect())
+}
+
+/// Any value: what `T` reads from it, else `T`'s default.
+fn or_default<'de, D: Deserializer<'de>, T: serde::de::DeserializeOwned + Default>(d: D) -> Result<T, D::Error> {
+    Ok(serde_json::from_value(serde_json::Value::deserialize(d)?).unwrap_or_default())
+}
+
+/// `sessions` entry by entry: an entry that isn't an object, or names no context, is
+/// dropped; in the others each value that doesn't read takes its default. Never fails, so a
+/// hand edit here costs no other setting.
+fn session_entries<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<Session>, D::Error> {
+    let raw = serde_json::Value::deserialize(d)?;
+    Ok(sessions_from(&raw))
+}
+
+fn sessions_from(raw: &serde_json::Value) -> Vec<Session> {
+    let entries = raw.as_array().map_or(&[][..], Vec::as_slice);
+    let mut sessions: Vec<Session> = Vec::new();
+    for entry in entries.iter().filter(|e| e.is_object()) {
+        // Every field of a session reads whatever it holds (see `Session`).
+        let Ok(mut s) = serde_json::from_value::<Session>(entry.clone()) else { continue };
+        s.contexts = session_set(&s.contexts);
+        if !s.contexts.is_empty() && !sessions.iter().any(|x| x.contexts == s.contexts) {
+            sessions.push(s);
+        }
+    }
+    sessions.truncate(SESSIONS_KEPT);
+    sessions
+}
+
+/// `window`: none when it doesn't read or can't be a window (the default place then).
+fn window_or_none<'de, D: Deserializer<'de>>(d: D) -> Result<Option<WindowPlace>, D::Error> {
+    let raw = serde_json::Value::deserialize(d)?;
+    Ok(serde_json::from_value::<WindowPlace>(raw).ok().and_then(WindowPlace::usable))
+}
+
 /// The seconds a confirmation may wait: at least one, never long enough to be in the way.
 pub const CONFIRM_WAIT_RANGE: std::ops::RangeInclusive<u64> = 1..=30;
 
@@ -125,6 +173,98 @@ pub enum InitialView {
     Pods,
     Workloads,
     Cluster,
+}
+
+/// Sets of contexts that remember where they were left (the newest kept).
+pub const SESSIONS_KEPT: usize = 20;
+
+/// The window's size to start with, and the smallest it can be (logical pixels).
+pub const WINDOW_SIZE: (f32, f32) = (1500., 920.);
+pub const WINDOW_MIN: (f32, f32) = (900., 560.);
+
+/// Where a window was left on a set of contexts: the first window that connects to that set
+/// reopens there. Each field reads whatever the file holds (a value that doesn't read takes
+/// its default), so a session never fails to load and never costs the other settings.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
+#[serde(default)]
+pub struct Session {
+    /// The contexts, sorted and without repeats (`session_set`): the set this is for.
+    #[serde(deserialize_with = "string_list")]
+    pub contexts: Vec<String>,
+    /// Each tab, in order.
+    #[serde(deserialize_with = "tab_entries")]
+    pub tabs: Vec<SavedTab>,
+    /// The tab shown (the last one when there are fewer).
+    #[serde(deserialize_with = "or_default")]
+    pub active_tab: usize,
+    /// The filter typed for each resource type, by kubectl name (`deployments.apps`).
+    #[serde(deserialize_with = "string_map")]
+    pub filters: std::collections::BTreeMap<String, String>,
+}
+
+/// A tab as it was left: its page, its list's resource type, namespaces and filter.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
+#[serde(default)]
+pub struct SavedTab {
+    #[serde(deserialize_with = "or_default")]
+    pub page: SavedPage,
+    /// The resource type its list shows, by kubectl name (`pods`, `certificates.cert-manager.io`):
+    /// the version may change between launches, the name does not.
+    #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "or_default")]
+    pub kind: Option<String>,
+    /// Empty: all.
+    #[serde(deserialize_with = "string_list")]
+    pub namespaces: Vec<String>,
+    #[serde(skip_serializing_if = "String::is_empty", deserialize_with = "or_default")]
+    pub filter: String,
+}
+
+/// The page a tab reopens on: its list, or an overview built from the clusters. Detail pages
+/// and the others (Settings, a shell...) reopen on the list or overview they were opened from.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum SavedPage {
+    #[default]
+    List,
+    Workloads,
+    Cluster,
+    Problems,
+    Timeline,
+    Helm,
+    Argo,
+}
+
+/// `tabs` entry by entry: one that isn't an object is dropped, the others read field by field.
+fn tab_entries<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<SavedTab>, D::Error> {
+    let raw = serde_json::Value::deserialize(d)?;
+    let entries = raw.as_array().map_or(&[][..], Vec::as_slice);
+    Ok(entries.iter().filter(|e| e.is_object()).filter_map(|e| serde_json::from_value(e.clone()).ok()).collect())
+}
+
+/// The window's place and size when it was last moved, and whether it was maximized.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
+pub struct WindowPlace {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+    #[serde(default)]
+    pub maximized: bool,
+}
+
+/// Further than any desktop reaches: a value beyond is a hand edit, not a place.
+const WINDOW_FAR: f32 = 100_000.;
+
+impl WindowPlace {
+    /// The place, at least the window's smallest size; none when a number isn't finite or is
+    /// beyond any desktop.
+    pub fn usable(self) -> Option<Self> {
+        let numbers = [self.x, self.y, self.width, self.height];
+        if numbers.iter().any(|n| !n.is_finite() || n.abs() > WINDOW_FAR) {
+            return None;
+        }
+        Some(Self { width: self.width.max(WINDOW_MIN.0), height: self.height.max(WINDOW_MIN.1), ..self })
+    }
 }
 
 /// A port-forward to bring back next time (pods are found again by service or name).
@@ -220,6 +360,22 @@ pub struct Settings {
     /// Contexts Argo CD's Applications are read from. Empty: found on their own, among the
     /// connected clusters first, then the kubeconfig's other contexts.
     pub argocd_contexts: Vec<String>,
+    /// The Argo CD API server of a hub context (`https://argocd.example.com`), to read Argo
+    /// CD's own diff from. None set: that diff is off, nothing is sent to Argo CD.
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty", deserialize_with = "string_entries")]
+    pub argocd_servers: std::collections::BTreeMap<String, String>,
+    /// Argo CD API servers read on the Argo CD page with no kubeconfig for their cluster,
+    /// added in Settings → Argo CD (`https://argocd.example.com`); their tokens are kept in
+    /// `argocd-api-tokens.json`. The argocd CLI's servers are read too.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub argocd_api_servers: Vec<String>,
+    /// Argo CD API servers not read (their address), whether set here or the argocd CLI's.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub argocd_api_off: Vec<String>,
+    /// The label whose value names an Application's service on the Argo CD page, to group
+    /// its environments. Empty: its name without the environment in it.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub argocd_group_label: String,
     /// Which kubeconfig file keeps a context name that several files have: the first one
     /// seen. The others' contexts are `name@file`, whatever order the files are read in.
     #[serde(deserialize_with = "string_entries")]
@@ -246,6 +402,17 @@ pub struct Settings {
     pub sidebar_width: f32,
     /// The sidebar's sections folded (by name: "Workloads", "Custom resources"...).
     pub sidebar_folded: Vec<String>,
+    /// The newest version whose release notes were shown (What's new, see `crate::updates`).
+    /// None in a file from before What's new; a new install starts with the version running
+    /// (see `load_from`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_seen_version: Option<String>,
+    /// Where each set of contexts was left, the newest first (see `Session`).
+    #[serde(deserialize_with = "session_entries")]
+    pub sessions: Vec<Session>,
+    /// Where the window was left (read with `window_place`).
+    #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "window_or_none")]
+    pub window: Option<WindowPlace>,
 }
 
 /// The timeline: changes recorded while the app watches (see `crate::timeline`).
@@ -440,6 +607,10 @@ impl Default for Settings {
             clusters: Default::default(),
             kubeconfig_folders: Vec::new(),
             argocd_contexts: Vec::new(),
+            argocd_servers: Default::default(),
+            argocd_api_servers: Vec::new(),
+            argocd_api_off: Vec::new(),
+            argocd_group_label: String::new(),
             context_files: Default::default(),
             open_browser_on_forward: true,
             recent_forwards: Vec::new(),
@@ -450,7 +621,18 @@ impl Default for Settings {
             timeline: TimelineSettings::default(),
             sidebar_width: SIDEBAR_WIDTH,
             sidebar_folded: Vec::new(),
+            last_seen_version: None,
+            sessions: Vec::new(),
+            window: None,
         }
+    }
+}
+
+impl Settings {
+    /// A new install's settings: the defaults, with the version running already seen, since
+    /// What's new is for updates.
+    fn new_install() -> Self {
+        Self { last_seen_version: Some(crate::updates::VERSION.to_string()), ..Self::default() }
     }
 }
 
@@ -479,11 +661,11 @@ fn load() -> Settings {
 }
 
 /// The settings at `p`, or the defaults and why when the file exists but can't be read
-/// (permissions, a folder): then the file is left as it is.
+/// (permissions, a folder): then the file is left as it is. No file is a new install.
 fn load_from(p: &Path) -> (Settings, Option<String>) {
     let bytes = match std::fs::read(p) {
         Ok(bytes) => bytes,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (Settings::default(), None),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (Settings::new_install(), None),
         Err(e) => return (Settings::default(), Some(format!("{}: {e}", p.display()))),
     };
     let (mut settings, error, lost) = from_bytes(&bytes);
@@ -660,6 +842,15 @@ pub fn protected_contexts(contexts: &crate::k8s::Contexts) -> Vec<String> {
     with(|s| protected_among(&s.protection, &contexts.names, &contexts.risky))
 }
 
+/// The kubeconfig's contexts that are not protected (see [`is_protected`]), for agent rules
+/// naming `@protected`. None when the kubeconfig can't be read: every context then counts
+/// as protected.
+pub fn unprotected_contexts() -> Vec<String> {
+    let Ok(contexts) = crate::k8s::load_contexts() else { return Vec::new() };
+    let protected: std::collections::HashSet<String> = protected_contexts(&contexts).into_iter().collect();
+    contexts.names.into_iter().filter(|n| !protected.contains(n)).collect()
+}
+
 fn protected_among(
     chosen: &std::collections::BTreeMap<String, bool>,
     names: &[String],
@@ -728,6 +919,54 @@ pub fn push_recent(list: &mut Vec<String>, items: &[String], max: usize) {
         list.insert(0, item.clone());
     }
     list.truncate(max);
+}
+
+/// A set of contexts as sessions are kept by: sorted, without repeats or empty names. The
+/// order they were picked in only says which one is primary.
+pub fn session_set(contexts: &[String]) -> Vec<String> {
+    let mut set: Vec<String> = contexts.iter().filter(|c| !c.is_empty()).cloned().collect();
+    set.sort();
+    set.dedup();
+    set
+}
+
+/// Where this set of contexts was left, if it was.
+pub fn session(contexts: &[String]) -> Option<Session> {
+    let set = session_set(contexts);
+    if set.is_empty() {
+        return None;
+    }
+    with(|s| s.sessions.iter().find(|x| x.contexts == set).cloned())
+}
+
+/// Remember where a set of contexts was left. Nothing is written when it is already so.
+pub fn save_session(mut session: Session) {
+    session.contexts = session_set(&session.contexts);
+    if session.contexts.is_empty() || with(|s| s.sessions.first() == Some(&session)) {
+        return;
+    }
+    update(|s| keep_session(&mut s.sessions, session));
+}
+
+/// `session` first, in place of the one for the same set, the newest `SESSIONS_KEPT` kept.
+fn keep_session(list: &mut Vec<Session>, session: Session) {
+    list.retain(|x| x.contexts != session.contexts);
+    list.insert(0, session);
+    list.truncate(SESSIONS_KEPT);
+}
+
+/// Where the window was left, when that reads (see `WindowPlace::usable`).
+pub fn window_place() -> Option<WindowPlace> {
+    with(|s| s.window.and_then(WindowPlace::usable))
+}
+
+/// Remember where the window is. Nothing is written when it is already there.
+pub fn save_window(place: WindowPlace) {
+    let Some(place) = place.usable() else { return };
+    if with(|s| s.window == Some(place)) {
+        return;
+    }
+    update(|s| s.window = Some(place));
 }
 
 /// A visit counts half as much after a week without one.
@@ -1113,6 +1352,108 @@ mod tests {
         std::fs::remove_dir_all(d).unwrap();
     }
 
+    /// What's new is for updates: a new install has seen the version it starts with, a file
+    /// from before What's new has seen none (so this version's notes show once).
+    #[test]
+    fn a_new_install_has_seen_its_version_and_an_older_file_none() {
+        let d = scratch();
+        let (s, error) = load_from(&d.join("settings.json"));
+        assert_eq!(error, None);
+        assert_eq!(s.last_seen_version.as_deref(), Some(crate::updates::VERSION));
+        let s: Settings = serde_json::from_str(r#"{"metrics_refresh": 7}"#).unwrap();
+        assert_eq!(s.last_seen_version, None);
+        assert!(!serde_json::to_string(&s).unwrap().contains("last_seen_version"), "not written while unknown");
+        // One that doesn't read is unknown too, and costs nothing else.
+        let (s, _, lost) = super::from_bytes(br#"{"last_seen_version": 9, "metrics_refresh": 7}"#);
+        assert!(!lost);
+        assert_eq!((s.last_seen_version, s.metrics_refresh), (None, 7));
+        let s: Settings = serde_json::from_str(r#"{"last_seen_version": "0.9.0"}"#).unwrap();
+        assert_eq!(s.last_seen_version.as_deref(), Some("0.9.0"));
+        std::fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn sessions_and_a_window_that_do_not_read_cost_nothing_else() {
+        // Never an error: the file is not kept aside, and every other setting stays.
+        for (sessions, window) in [
+            (r#""x""#, r#"{"x": "left"}"#),
+            ("[1, null]", "[]"),
+            (r#"{"contexts": ["a"]}"#, r#"{"x": 1e40, "y": 0, "width": 1000, "height": 700}"#),
+        ] {
+            let text = format!(r#"{{"sessions": {sessions}, "window": {window}, "metrics_refresh": 42}}"#);
+            let (s, error, lost) = super::from_bytes(text.as_bytes());
+            assert!(error.is_none() && !lost, "{text}");
+            assert!(s.sessions.is_empty() && s.window.is_none(), "{text}");
+            assert_eq!(s.metrics_refresh, 42);
+        }
+        // Older files have neither.
+        let s: Settings = serde_json::from_str("{}").unwrap();
+        assert!(s.sessions.is_empty() && s.window.is_none());
+        assert!(!serde_json::to_string(&Settings::default()).unwrap().contains("\"window\""));
+    }
+
+    #[test]
+    fn a_session_entry_that_does_not_read_costs_only_itself() {
+        let text = br#"{"sessions": [
+            {"contexts": ["prod", "dev", "prod"], "active_tab": -1, "filters": {"pods": "web", "nodes": 3},
+             "tabs": [{"page": "from-a-newer-version", "kind": "deployments.apps", "namespaces": ["a", 2], "filter": 5},
+                      "not a tab",
+                      {"page": "problems"}]},
+            {"contexts": []},
+            "not a session",
+            {"contexts": ["dev", "prod"], "tabs": [{"page": "helm"}]},
+            {"contexts": ["staging"], "tabs": {"page": "helm"}}
+        ]}"#;
+        let s: Settings = serde_json::from_slice(text).unwrap();
+        let [first, staging] = &s.sessions[..] else { panic!("{:?}", s.sessions) };
+        // Sorted, repeats dropped; the second entry for the same set is dropped too.
+        assert_eq!(first.contexts, ["dev", "prod"]);
+        assert_eq!(first.active_tab, 0);
+        assert_eq!(first.filters, std::collections::BTreeMap::from([("pods".to_string(), "web".to_string())]));
+        let tab = super::SavedTab {
+            page: super::SavedPage::List,
+            kind: Some("deployments.apps".into()),
+            namespaces: vec!["a".into()],
+            filter: String::new(),
+        };
+        let problems = super::SavedTab { page: super::SavedPage::Problems, ..Default::default() };
+        assert_eq!(first.tabs, [tab, problems]);
+        assert_eq!(staging.contexts, ["staging"]);
+        assert!(staging.tabs.is_empty());
+    }
+
+    #[test]
+    fn the_newest_session_comes_first_once_per_set() {
+        let session = |contexts: &[&str], active_tab| super::Session {
+            contexts: super::session_set(&contexts.iter().map(ToString::to_string).collect::<Vec<_>>()),
+            active_tab,
+            ..Default::default()
+        };
+        let mut list = Vec::new();
+        super::keep_session(&mut list, session(&["a", "b"], 0));
+        super::keep_session(&mut list, session(&["c"], 0));
+        // The same set picked in another order replaces the one saved.
+        super::keep_session(&mut list, session(&["b", "a"], 3));
+        assert_eq!(list.len(), 2);
+        assert_eq!((list[0].contexts.clone(), list[0].active_tab), (vec!["a".to_string(), "b".into()], 3));
+        for i in 0..40 {
+            super::keep_session(&mut list, session(&[format!("ctx-{i}").as_str()], 0));
+        }
+        assert_eq!(list.len(), super::SESSIONS_KEPT);
+        assert_eq!(list[0].contexts, ["ctx-39"]);
+    }
+
+    #[test]
+    fn a_window_place_is_at_least_the_smallest_window() {
+        let place = |width, height| super::WindowPlace { x: -40., y: 30., width, height, maximized: true };
+        let p = place(300., 200.).usable().unwrap();
+        assert_eq!((p.x, p.y, p.width, p.height), (-40., 30., super::WINDOW_MIN.0, super::WINDOW_MIN.1));
+        assert!(p.maximized);
+        assert!(place(f32::INFINITY, 900.).usable().is_none());
+        assert!(place(1200., f32::NAN).usable().is_none());
+        assert!(place(1e9, 900.).usable().is_none());
+    }
+
     #[test]
     fn an_older_save_never_overwrites_a_newer_one() {
         let saved = std::sync::Mutex::new(0);
@@ -1157,6 +1498,77 @@ mod properties {
         prop::collection::btree_map("[a-z]{1,6}", any::<bool>(), 0..5)
     }
 
+    /// Any JSON, with the keys sessions and windows have, nested a few levels.
+    fn junk() -> impl Strategy<Value = Value> {
+        let key = prop::sample::select(vec![
+            "contexts",
+            "tabs",
+            "active_tab",
+            "filters",
+            "page",
+            "kind",
+            "namespaces",
+            "filter",
+            "x",
+            "y",
+            "width",
+            "height",
+            "maximized",
+            "other",
+        ]);
+        let leaf = prop_oneof![
+            Just(Value::Null),
+            any::<bool>().prop_map(Value::from),
+            any::<i64>().prop_map(Value::from),
+            any::<f64>().prop_map(|n| json!(n)),
+            "[a-z-]{0,6}".prop_map(Value::from),
+        ];
+        leaf.prop_recursive(4, 48, 6, move |inner| {
+            prop_oneof![
+                prop::collection::vec(inner.clone(), 0..6).prop_map(Value::Array),
+                prop::collection::btree_map(key.clone(), inner, 0..6)
+                    .prop_map(|m| Value::Object(m.into_iter().map(|(k, v)| (k.to_string(), v)).collect())),
+            ]
+        })
+    }
+
+    fn page() -> impl Strategy<Value = super::SavedPage> {
+        use super::SavedPage::{Argo, Cluster, Helm, List, Problems, Timeline, Workloads};
+        prop::sample::select(vec![List, Workloads, Cluster, Problems, Timeline, Helm, Argo])
+    }
+
+    fn tab() -> impl Strategy<Value = super::SavedTab> {
+        let kind =
+            prop::option::of(prop::sample::select(vec!["pods", "deployments.apps", "certificates.cert-manager.io"]));
+        (page(), kind, prop::collection::vec("[a-z]{1,5}", 0..3), "[ -~]{0,8}").prop_map(
+            |(page, kind, namespaces, filter)| super::SavedTab {
+                page,
+                kind: kind.map(String::from),
+                namespaces,
+                filter,
+            },
+        )
+    }
+
+    /// Sessions as the app saves them: one per set of contexts.
+    fn sessions() -> impl Strategy<Value = Vec<super::Session>> {
+        let session = (
+            prop::collection::vec(tab(), 0..4),
+            0..5usize,
+            prop::collection::btree_map("[a-z.]{1,8}", "[ -~]{0,8}", 0..3),
+        );
+        prop::collection::btree_map(prop::collection::btree_set("[a-z]{1,4}", 1..3), session, 0..6).prop_map(|m| {
+            (m.into_iter())
+                .map(|(contexts, (tabs, active_tab, filters))| super::Session {
+                    contexts: contexts.into_iter().collect(),
+                    tabs,
+                    active_tab,
+                    filters,
+                })
+                .collect()
+        })
+    }
+
     proptest! {
         /// Spoiling some fields keeps every other one as it was, protection included.
         #[test]
@@ -1165,7 +1577,13 @@ mod properties {
             refresh in 1..1000u64,
             spoiled in prop::collection::btree_map(0..40usize, bad(), 0..4),
         ) {
-            let good = Settings { protection: protection.clone(), metrics_refresh: refresh, ..Settings::default() };
+            // The version seen is written only when set: set, so it can be spoiled too.
+            let good = Settings {
+                protection: protection.clone(),
+                metrics_refresh: refresh,
+                last_seen_version: Some("0.9.0".into()),
+                ..Settings::default()
+            };
             let Value::Object(mut fields) = serde_json::to_value(&good).unwrap() else { unreachable!() };
             let keys: Vec<String> = fields.keys().filter(|k| *k != "protection").cloned().collect();
             let mut hit = std::collections::HashSet::new();
@@ -1216,6 +1634,70 @@ mod properties {
             if let Some(n) = width.as_f64().filter(|n| super::SIDEBAR_WIDTH_RANGE.contains(&(*n as f32))) {
                 prop_assert_eq!(w, n as f32);
             }
+        }
+
+        /// Whatever `sessions` and `window` hold, the file reads without an error (it is not
+        /// kept aside), the other settings stay, and what is read can be used as is: sessions
+        /// for a set of contexts each, sorted, at most `SESSIONS_KEPT`; a window place with
+        /// finite numbers, at least the smallest window.
+        #[test]
+        fn sessions_and_the_window_never_break_loading(
+            sessions in junk(),
+            window in junk(),
+            protection in protection(),
+        ) {
+            let text = json!({"sessions": sessions, "window": window, "protection": protection, "metrics_refresh": 7});
+            let (read, error, lost) = from_bytes(&serde_json::to_vec(&text).unwrap());
+            prop_assert!(error.is_none(), "{error:?}");
+            prop_assert!(!lost);
+            prop_assert_eq!(read.metrics_refresh, 7);
+            prop_assert_eq!(&read.protection, &protection);
+            prop_assert!(read.sessions.len() <= super::SESSIONS_KEPT);
+            let mut sets = std::collections::HashSet::new();
+            for s in &read.sessions {
+                prop_assert!(!s.contexts.is_empty());
+                prop_assert_eq!(&super::session_set(&s.contexts), &s.contexts);
+                prop_assert!(sets.insert(s.contexts.clone()), "{:?} twice", s.contexts);
+            }
+            if let Some(w) = read.window {
+                prop_assert!([w.x, w.y, w.width, w.height].iter().all(|n| n.is_finite()));
+                prop_assert!(w.width >= super::WINDOW_MIN.0 && w.height >= super::WINDOW_MIN.1);
+            }
+        }
+
+        /// Sessions and a window place saved are read back as they were.
+        #[test]
+        fn sessions_and_the_window_read_back_as_saved(
+            sessions in sessions(),
+            x in -5000i16..5000,
+            y in -5000i16..5000,
+            width in 900i16..8000,
+            height in 560i16..5000,
+            maximized in any::<bool>(),
+        ) {
+            // Whole pixels, as windows are placed.
+            let (x, y, width, height) = (f32::from(x), f32::from(y), f32::from(width), f32::from(height));
+            let window = Some(super::WindowPlace { x, y, width, height, maximized });
+            let saved = Settings { sessions: sessions.clone(), window, ..Settings::default() };
+            let (read, error, _) = from_bytes(&serde_json::to_vec(&saved).unwrap());
+            prop_assert!(error.is_none());
+            prop_assert_eq!(read.sessions, sessions);
+            prop_assert_eq!(read.window, window);
+        }
+
+        /// However sessions are saved, one set of contexts keeps one session, the newest first,
+        /// and no more than `SESSIONS_KEPT` are kept.
+        #[test]
+        fn the_newest_session_is_kept_once(saves in prop::collection::vec(prop::collection::vec("[a-c]", 1..3), 1..40)) {
+            let mut list = Vec::new();
+            for contexts in &saves {
+                let set = super::session_set(contexts);
+                super::keep_session(&mut list, super::Session { contexts: set.clone(), ..Default::default() });
+                prop_assert_eq!(&list[0].contexts, &set);
+            }
+            prop_assert!(list.len() <= super::SESSIONS_KEPT);
+            let mut sets = std::collections::HashSet::new();
+            prop_assert!(list.iter().all(|s| sets.insert(s.contexts.clone())));
         }
 
         /// A protection entry that isn't true or false protects its context and keeps the others.

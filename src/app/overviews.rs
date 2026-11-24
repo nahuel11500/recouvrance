@@ -27,7 +27,7 @@ pub(super) enum Overview {
 
 impl Overview {
     /// The overview a route shows, with its page.
-    fn of(route: &Route) -> Option<(Self, EntityId)> {
+    pub(super) fn of(route: &Route) -> Option<(Self, EntityId)> {
         Some(match route {
             Route::Cluster(p) => (Self::Cluster, p.entity_id()),
             Route::Workloads(p) => (Self::Workloads, p.entity_id()),
@@ -37,6 +37,18 @@ impl Overview {
             Route::Argo(p) => (Self::Argo, p.entity_id()),
             _ => return None,
         })
+    }
+
+    /// Its name in the tab strip and the title bar.
+    pub(super) fn title(self) -> &'static str {
+        match self {
+            Self::Cluster => "Cluster",
+            Self::Workloads => "Workloads",
+            Self::Problems => "Problems",
+            Self::Timeline => "Timeline",
+            Self::Helm => "Helm releases",
+            Self::Argo => "Argo CD",
+        }
     }
 
     /// Whether the page lists the namespaces picked: it is built again for others.
@@ -78,7 +90,7 @@ impl AppView {
 
     /// Show an overview: the one in history when it was built for what is picked now, else
     /// a new one. Not connected: the cluster switcher opens instead.
-    fn open_overview(&mut self, which: Overview, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn open_overview(&mut self, which: Overview, window: &mut Window, cx: &mut Context<Self>) {
         if self.clusters.is_empty() {
             self.ctx_open = true;
             cx.notify();
@@ -127,7 +139,8 @@ impl AppView {
                 Route::Helm(page)
             }
             Overview::Argo => {
-                let page = cx.new(|cx| ArgoView::new(clusters, window, cx));
+                let favorites = self.favorites.clone();
+                let page = cx.new(|cx| ArgoView::new(clusters, favorites, window, cx));
                 self.subscribe_argo(&page, window, cx);
                 Route::Argo(page)
             }
@@ -168,6 +181,7 @@ impl AppView {
             }
             Route::Problems(p) => p.update(cx, ProblemsView::refresh),
             Route::Timeline(p) => p.update(cx, TimelineView::refresh),
+            Route::Logs(p) => p.update(cx, |p, cx| p.refresh(window, cx)),
             route => {
                 let Some((which, _)) = Overview::of(&route) else { return };
                 let fresh = self.build_overview(which, window, cx);

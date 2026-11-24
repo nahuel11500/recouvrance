@@ -40,7 +40,8 @@ RECOUVRANCE_TAB=logs cargo run --features dev -- --snapshot out.png 8
 
 Useful variables: `RECOUVRANCE_PAGE` (`apply`, `settings`, `cluster`, `access`, `assistant-dock`…),
 `RECOUVRANCE_FILTER`, `RECOUVRANCE_ACT` (comma-separated hooks, see `src/app/demo.rs` and
-`src/details/demo.rs`), `RECOUVRANCE_INPUT` (`click:x,y;key:enter;wait:2`; `shot:name.png` saves a frame next
+`src/details/demo.rs`; `page:argo,argo-example` shows the Argo CD dashboard on a made-up example,
+no real data), `RECOUVRANCE_INPUT` (`click:x,y;key:enter;wait:2`; `shot:name.png` saves a frame next
 to the snapshot, for recordings), `RECOUVRANCE_WRITES=1`,
 `RECOUVRANCE_DARK=1`, `RECOUVRANCE_ZOOM`. Point `XDG_CONFIG_HOME` at a scratch folder to keep your
 settings untouched. Give it another MCP port too (`{"port": 47199, "version": 1}` in
@@ -54,8 +55,19 @@ requests start again, and after that many seconds the run prints the requests an
 kind, the heaviest requests, and the process's memory (`VmRSS`, `VmHWM`).
 
 **Smoke checks**: `RECOUVRANCE_SMOKE=<context> cargo run --features dev` lists types and watches
-pods; add `RECOUVRANCE_LISTTIME=1`, `RECOUVRANCE_PROBLEMS=1`, or dry runs such as
-`RECOUVRANCE_NODESHELLDRY=<node>` (see `src/dev/smoke.rs`).
+pods; add `RECOUVRANCE_LISTTIME=1`, `RECOUVRANCE_PROBLEMS=1` (the Problems scan's time and, on
+Linux, the process's peak memory; `RECOUVRANCE_PROBLEMS=kinds` runs each kind's check alone, with
+its own peak), or dry runs such as `RECOUVRANCE_NODESHELLDRY=<node>` (see `src/dev/smoke.rs`).
+`RECOUVRANCE_PODRES=<seconds>` reads the usage bars' requests and limits of every pod for that long,
+and `RECOUVRANCE_CLUSTERLOAD=<rounds>` loads the cluster overview that many times in a row; both then
+print what their requests read (as Settings → API requests counts it) and the peak memory (`VmHWM`).
+`RECOUVRANCE_DASH=<runs>` loads the Workloads overview that many times in a row: each part as it
+arrives with its counts, then each load's requests and bytes received (the heaviest requests too)
+and the peak memory (Linux).
+
+**Timings**: `RECOUVRANCE_TIMINGS=1` prints to stderr every 10 seconds where the time went (frames,
+table filtering, watch batches, the assistant's API requests) and, for the assistant with an API
+key, its input tokens: uncached, written to the prompt cache and read from it.
 
 **README screenshots** live on the `media` branch, so `main` stays small. Take them on a throwaway
 kind cluster with demo workloads, never a real one (names of clusters, namespaces and objects show).

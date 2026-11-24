@@ -28,17 +28,20 @@ mod forward_options;
 mod guard;
 mod history;
 mod logs;
+mod logs_page;
+mod map;
 mod reachability;
 mod related;
 mod tabs;
 
 pub(crate) use actions::*;
-pub(crate) use argo::{ArgoAction, OpenNamespace, OpenOnContext, confirm_argo_action};
+pub(crate) use argo::{ArgoAction, OpenOn, OpenOnContext, confirm_api_action, confirm_argo_action};
 use browser::FileBrowser;
 pub(crate) use compare::diff_block;
 pub(crate) use guard::*;
 use history::HistoryState;
 pub(crate) use logs::*;
+pub(crate) use logs_page::{LogTarget, LogsPage};
 use related::{PodsOf, container_history_for, container_names, fetch_related, gpu_history_for, history_for, pods_of};
 use tabs::error_box;
 pub(crate) use tabs::{heading_name, heading_path};
@@ -173,6 +176,8 @@ pub struct DetailPanel {
     events_load: crate::latest::Latest,
     /// The Reachability tab's check, and its test from this machine.
     reach: reachability::Reach,
+    /// What the Map tab read when it was last opened.
+    map: map::MapState,
     /// The Argo CD Applications that deploy the object or into the namespace, when the read
     /// shown started, and a read made at once (after a Sync).
     argo: k8s::argo::Lookup,
@@ -180,6 +185,11 @@ pub struct DetailPanel {
     argo_load: crate::latest::Latest,
     /// A CRD's spec fields, worked out when it is loaded rather than on every frame.
     schema_rows: Vec<crate::overview::SchemaRow>,
+    /// An Application's resources table, worked out when it is read rather than on every frame.
+    argo_resources: crate::overview::ArgoResources,
+    /// An Application's diff as Argo CD renders it from git (read on a click), and its read.
+    argo_git: crate::overview::ArgoGitDiff,
+    argo_git_load: crate::latest::Latest,
     /// Inline editor of a ConfigMap's or Secret's values.
     data_editor: Option<Entity<crate::ui::data_edit::DataEditor>>,
     /// Show metadata.managedFields in the YAML (hidden by default).
@@ -201,6 +211,8 @@ pub struct DetailPanel {
     favorites: Entity<Favorites>,
     /// Every connected cluster (for Compare).
     pub(crate) clusters: Vec<(String, Client)>,
+    /// The kinds this page's context serves (the Map reads an operator's kinds only when served).
+    pub(crate) kinds: Vec<k8s::Kind>,
     compare: CompareState,
     history: HistoryState,
     /// The page's pods, followed by a watch (`follow_pods`).
@@ -384,6 +396,12 @@ impl DetailPanel {
         (self.context.clone(), self.obj.clone())
     }
 
+    /// The object shown as a favorite (an Argo CD Application by its instance).
+    pub fn favorite(&self) -> crate::favorites::Favorite {
+        let o = &self.obj;
+        crate::favorites::Favorite::for_object(&self.context, &o.kind, o.namespace.clone(), o.name.clone())
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         client: Client,
@@ -434,10 +452,14 @@ impl DetailPanel {
             object_read: Default::default(),
             events_load: Default::default(),
             reach: Default::default(),
+            map: Default::default(),
             argo: Default::default(),
             argo_started: None,
             argo_load: Default::default(),
             schema_rows: Vec::new(),
+            argo_resources: Default::default(),
+            argo_git: Default::default(),
+            argo_git_load: Default::default(),
             data_editor: None,
             show_managed: false,
             field_docs: None,
@@ -450,6 +472,7 @@ impl DetailPanel {
             forwards,
             favorites,
             clusters: Vec::new(),
+            kinds: Vec::new(),
             compare: CompareState::default(),
             history: HistoryState::default(),
             pods_watch: PodsFollow::default(),
@@ -663,16 +686,26 @@ impl DetailPanel {
     pub fn select_tab_named(&mut self, name: &str, cx: &mut Context<Self>) {
         self.tab = tab_named(name);
         self.resume_logs_if_shown(cx);
-        if self.tab == DetailTab::Reachability {
-            self.check_reachability(cx);
-        }
+        self.tab_opened(cx);
         cx.notify();
     }
 
-    /// The Reachability tab shown before the object was read is checked once it is.
-    fn check_reachability_if_waiting(&mut self, cx: &mut Context<Self>) {
+    /// A tab that reads when it is opened reads again: the cluster moves on.
+    fn tab_opened(&mut self, cx: &mut Context<Self>) {
+        match self.tab {
+            DetailTab::Reachability => self.check_reachability(cx),
+            DetailTab::Map => self.load_map(cx),
+            _ => {}
+        }
+    }
+
+    /// The Reachability or Map tab shown before the object was read is read once it is.
+    fn check_tab_if_waiting(&mut self, cx: &mut Context<Self>) {
         if self.tab == DetailTab::Reachability && self.reach.unchecked() {
             self.check_reachability(cx);
+        }
+        if self.tab == DetailTab::Map && self.map.unread() {
+            self.load_map(cx);
         }
     }
 
@@ -701,7 +734,7 @@ impl DetailPanel {
                     this.start_loops(window, cx);
                     // A selector saved from the YAML picks other pods at once.
                     this.follow_pods(window, cx);
-                    this.check_reachability_if_waiting(cx);
+                    this.check_tab_if_waiting(cx);
                     if let Some(action) = this.pending_action.take() {
                         this.quick_action(&action, window, cx);
                     }
@@ -833,7 +866,7 @@ impl DetailPanel {
         }
         // The first read failed: this one starts the page.
         self.start_loops(window, cx);
-        self.check_reachability_if_waiting(cx);
+        self.check_tab_if_waiting(cx);
         // A Service's or a PDB's selector can change, and its pods with it.
         self.follow_pods(window, cx);
         cx.notify();
@@ -935,6 +968,8 @@ impl DetailPanel {
         cx.background_executor().spawn(async move { drop(old) }).detach();
         self.follow_logs(window, cx);
         self.reindex_pods(cx);
+        // The Map lists the pods its page holds.
+        self.refresh_map_known(cx);
     }
 
     /// Workload logs follow its pods (up to a limit), as they come and go; a pod page has its own.
@@ -1074,6 +1109,10 @@ impl DetailPanel {
                     cx.background_executor().spawn(async move { drop(old) }).detach();
                     // The pods' rows, with their new usage.
                     this.reindex_pods(cx);
+                    if again {
+                        // What the Map draws from the page changed with what it links to.
+                        this.map_page_read(cx);
+                    }
                     #[cfg(feature = "dev")]
                     if std::env::var("RECOUVRANCE_COMPARE").is_ok() && this.compare_rev.is_none() {
                         let mut revs: Vec<(i64, String)> = this
@@ -1218,6 +1257,9 @@ impl DetailPanel {
         if self.obj.kind.is("apiextensions.k8s.io", "CustomResourceDefinition") {
             self.schema_rows = crate::overview::crd_rows(&value);
         }
+        if self.obj.kind.is("argoproj.io", "Application") {
+            self.argo_resources.set(&value);
+        }
         // Re-created under the same name (a StatefulSet's pod, say), or opened by name:
         // the events and logs shown are this object's. Logs follow the pod by name, so they
         // restart only for a re-created one, not on a page's first read.
@@ -1282,6 +1324,9 @@ impl DetailPanel {
             schema_rows: &self.schema_rows,
             pod_order: self.pod_order,
             argo: &self.argo,
+            argo_resources: &self.argo_resources,
+            argo_git: &self.argo_git,
+            context: &self.context,
         }
     }
 

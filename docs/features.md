@@ -10,13 +10,29 @@
   `HTTPS_PROXY`, with a scheme other than `http`, `https` or `socks5`, or none) is named by its
   scheme, host and port, never its user and password; neither shows for any other URL in a
   connection error.
+- **Reopens where you left off**: each set of contexts keeps its tabs (the list or overview each
+  shows, its resource type, namespaces and filter) and each type's filter, and the window keeps
+  its place, size and whether it was maximized. On launch the first window reopens there once its
+  contexts connect: with one namespace picked last time, a big cluster lists and watches only that
+  namespace at launch instead of every pod. A resource type, namespace or page the clusters no longer have falls back to the default; a
+  detail page reopens on the list or overview it was opened from; a window that would be out of
+  reach (a display unplugged) is centered. A window opened later starts fresh, and write mode is
+  always off at launch. While a cluster of the set doesn't answer, or its namespaces don't list
+  (said above the list), nothing is saved for that set: what only that cluster has would read
+  as gone; connecting that set again once every cluster answers reopens it from what was saved.
+  A set connected for the first time is saved once connected. With two windows on one set, the
+  one that reopened it saves it, until something is changed in the other.
 - **Sidebar**: the filter at its top finds pages and resource types (by name, kind or API group).
   Pages, saved views, favorites and types scroll together; a section folds with a click on its
   name (kept for next time) and says how many types it holds. Port forwards fold into one row at
   the bottom. Drag its edge to resize it: the width is kept, and a cut name shows whole in a tooltip.
+  It leaves out events.k8s.io's copy of Events, the old Endpoints and API priority and fairness
+  (FlowSchemas); Apply, links and the agents still know them.
 - **Live tables** with kubectl's own columns for every type, including CRDs; CPU/memory from
-  metrics-server; per-type column choice; multi-namespace filter; each type keeps its own filter text (Nodes
-  doesn't show the pod name typed on Pods, and Pods has it back).
+  metrics-server, as bars against each pod's requests and limits (listed once, then kept by a
+  watch: new and resized pods show without listing every pod again); per-type column choice;
+  multi-namespace filter; each type keeps its own filter text (Nodes doesn't show the pod name
+  typed on Pods, and Pods has it back).
 - **Usage timed to metrics-server**: metrics-server measures every `--metric-resolution` (15 s by
   default, often 60 s), so reading it more often returns the same numbers. The pods and nodes
   lists learn the interval from the samples' timestamps and read again just after the next one
@@ -43,10 +59,34 @@
   and a generic spec/status view for anything else. A page follows its object and its pods with
   watches: a change shows about a second after it happens, nothing is read again while nothing
   changes, and an object deleted then created again under its name is followed.
+- **Map**: every detail page has a Map tab, what the object is linked to. A pod or workload
+  starts with its tree (Services, the ConfigMaps, Secrets, PVCs and ServiceAccount its pods use,
+  not the `kube-api-access-*` volume every pod gets; ReplicaSets, pods, nodes). Then, for every
+  kind: its owners and what it owns; the pods a Service, PDB or NetworkPolicy selects, and the
+  PDBs, NetworkPolicies, HPA and Ingresses or HTTPRoutes (through its Services) of a pod or
+  workload; what uses a Secret or ConfigMap (pods and workloads by env, envFrom, volumes and pull
+  Secrets, a ServiceAccount, an Ingress's TLS) and where it comes from (an ExternalSecret, a
+  cert-manager Certificate); a ServiceAccount's Secrets, pods and workloads; a PVC's volume,
+  StorageClass and pods; an Ingress's or HTTPRoute's Services with the pods behind them, TLS
+  Secrets, class or Gateways; an HPA's or VPA's target; a binding's role and ServiceAccounts; a
+  node's pods. An operator's custom resource also shows the operator's other resources naming it
+  in their spec (a CloudNativePG Cluster's Backups, ScheduledBackups, Poolers and Databases by
+  known rules; a generic rule for `cluster`, `clusterName` and `…Ref` fields, where the field
+  says the kind: `clusterRef` a `…Cluster`, `issuerRef` an Issuer, a written `kind` first) and,
+  last, what is labelled with its name (`cnpg.io/cluster` and other operators' labels;
+  `app.kubernetes.io/instance` unless Helm manages the object, where it names the release).
+  Kinds with no rule of their own (a Gateway, a StorageClass, a ClusterRole) say that only
+  owners are known. It is read when the tab opens, in the object's namespace only, from the API
+  server's cache (metadata alone where that is enough; an operator's kind with more than 200
+  objects is not read whole, and the tab says so), next to what the page already holds; a
+  cluster-scoped object reads nothing more. The relations are worked out off the UI thread.
+  Each relation, and the pods behind each Service, shows 50 objects and counts the rest. What
+  could not be read (by the page or the tab) is named, and the tab says "nothing found" only
+  once everything was read.
 - **Select and copy text** on detail pages, as on a web page: a drag selects (across fields,
-  labels, annotations, conditions, events, the History, Compare and Reachability tabs), Ctrl+C or
-  a right-click *Copy* copies it, a double-click selects a word. Text cut short with `…` is
-  selected and copied whole. Links still open on a click; a drag over one selects its text.
+  labels, annotations, conditions, events, the History, Compare and Reachability tabs), Ctrl+C (⌘C
+  on macOS) or a right-click *Copy* copies it, a double-click selects a word. Text cut short with
+  `…` is selected and copied whole. Links still open on a click; a drag over one selects its text.
 - **History**: an object's page has a History tab listing what changed, newest first, from what
   the cluster already keeps (nothing runs in the background; it is read when the tab is first
   opened): a Deployment's ReplicaSets and a StatefulSet's or DaemonSet's ControllerRevisions
@@ -88,7 +128,8 @@
   are never kept, in memory or on disk: only whether each key changed. An object written all the
   time is recorded at most 10 times an hour (the next record says how many were skipped).
   Records are kept on disk per context, 16 MB and 14 days by default (see
-  [configuration](configuration.md#timeline)), so the timeline survives a restart.
+  [configuration](configuration.md#timeline)), so the timeline survives a restart. Agents read
+  it, with its events, through `recent_changes`, under their rules (see [agents](agents.md)).
 - **Reachability**: a tab on Services, Ingresses and HTTPRoutes that follows the path a request
   takes and names the first step that breaks, with the `kubectl` command to see it yourself: the
   Ingress's class and the address its controller gave it (for a route, each Gateway, programmed and
@@ -105,6 +146,14 @@
 - **Usage history** (CPU and memory against requests and limits, over 15 minutes to 7 days; the
   last hour at first) for pods and workloads, from the cluster's Prometheus, found automatically and read through the API server proxy. A workload's charts cover up to 300 of its running or pending pods, and its request and limit lines the same pods; once all its pods have finished (a completed Job), the charts show them without request and limit lines, as they may not have run together.
 - **Logs** across all pods of a workload (up to 50, running and newest first), level filter, time range, timeline histogram.
+- **Logs of the checked rows**: check pods, workloads (Deployments, StatefulSets, DaemonSets,
+  ReplicaSets, Jobs) or Services in any table, merged multi-cluster ones included, then **Logs** in the
+  selection bar. One page merges their pods' lines in time order, each tagged with its pod and
+  container (and its namespace or context when they differ), with the same filters, find, Since,
+  Follow and container picker. It reads at most 50 rows and follows at most 50 pods (running and
+  newest first), and says how many were left out. Each cluster's pods show as soon as its rows are
+  read: a cluster that fails, or does not answer within 15 seconds, is named and never holds back the
+  others' pods. F5 finds their pods again.
 - **Shell** (exec with a real terminal), **node shell** (privileged pod, deleted when its shell
   ends or its page goes away) and **port-forward** for pods and services; forwards are remembered
   and restored with one click. Shells and attach need write mode (they run commands in the
@@ -185,31 +234,161 @@
   its store, last refresh, Ready), and an ExternalSecret's page links its store and target Secret.
 - **Argo CD panel**: a namespace's page shows the Applications deploying into it, and an object's
   page the Application that deployed it (by its tracking id): sync and health, auto-sync,
-  revision, last sync, conditions, the last 5 deployments, a link to the Application, and
-  *Refresh*/*Sync* (write mode and the hub's protection apply). The Applications are read from the
+  revision, last sync, conditions, the last 5 deployments (each but the newest with *Roll
+  back…*), a link to the Application, and *Refresh*/*Sync* (*Terminate* while an operation runs;
+  write mode and the hub's protection apply). The Applications are read from the
   hub, found among the connected clusters, else among other kubeconfig contexts that need no
   separate login; when the hub isn't found, the Argo CD page lists the contexts left out (named
   like a hub first) to ask with one click, and the one that answers is kept. It can also be
   ticked in Settings → Contexts (*Argo CD*; see
   [configuration](configuration.md#argo-cd-hub-argocd_contexts)).
 - **Argo CD page** (sidebar → *Argo CD*): every Application of every context that serves Argo
-  CD, read with one list per Argo CD cluster: name, project, sync, health, revision, destination
+  CD, read with one list per Argo CD cluster, and of every Argo CD API server the argocd CLI is
+  logged in to or set in Settings → Argo CD (no kubeconfig for Argo CD's cluster needed: see
+  [configuration](configuration.md#argo-cd-by-its-api-argocd_api_servers)): name, project, sync, health, revision, destination
   (the kubeconfig context whose API server is the Application's `destination.server`, and its
-  namespace), auto-sync, last sync and its result. Applications sit under the app of apps that
-  made them (its tracking id, the parent listing them among its resources, or the instance
-  label), with how many they hold and how many of those are red; groups fold. Filters: out of
-  sync, Degraded, failed sync (any of those picked), project, destination context, and a search.
+  namespace), auto-sync, the next time it can sync, last sync and its result. *Next sync* reads
+  its project's sync windows (`allow` and `deny`, their cron schedule, duration and time zone, the
+  windows applying by name, namespace or cluster): *no window*, *now*, *in 5h*, or *not within 8
+  days*; auto-sync is held by every window that applies, a manual sync goes through those with
+  `manualSync`. Applications sit under the app of apps that made them (its tracking id, the parent
+  listing them among its resources, or the instance label), with how many they hold and how many
+  of those are red; or, grouped by service, under a heading per service with its environments
+  (the value of a label chosen in Settings → Argo CD, else the name without its environment:
+  `shop-prod`, `shop-staging` and `shop-prod-eu` are `shop`), how many are synced and red; or not
+  grouped. Groups fold. Filters: out of sync, Degraded, failed sync (any of those picked),
+  favorites, project, destination context, sync status, health, auto-sync, labels (picked from those the
+  Applications have, all required), and a search, each word in turn, where `key=value` is a label
+  (`key=` any value of it). An Application read both from its hub and by Argo CD's API (the hub's
+  Argo CD server set in Settings → Per cluster is that API server) shows once, as read on its hub:
+  the same Argo CD, namespace and name. The star on a row makes the Application a favorite
+  (read by its hub or by the API alike): favorites, with the app of apps or service they are in,
+  come first.
   Red is for a failed sync, an error Argo CD reports or Degraded health: an Application with
   auto-sync off that is out of sync (a `*-workload` one synced by hand) is not red. A click opens
-  the Application's page, which links to its destination namespace (connecting to that context
-  when it isn't); the row menu also opens the destination and asks for *Refresh*, *Hard refresh*
-  or *Sync* (write mode and the Argo CD cluster's protection apply). An Argo CD cluster that
+  its service's dashboard (below); the row menu opens the Application's page (which links to its
+  destination namespace, connecting to that context when it isn't) or its destination, and asks
+  for *Refresh*, *Hard refresh*,
+  *Sync*, *Terminate* (while an operation runs) or *Roll back to the previous deployment* (auto-sync
+  off) (write mode and the Argo CD cluster's protection apply). An Argo CD cluster or server that
   can't be read is named above the list; the others are shown.
+- **Argo CD by its API**: Applications are read from Argo CD's own API, with the argocd CLI's
+  login (`argocd login`, its contexts, servers and tokens; `--insecure`, `--plaintext` to this
+  machine and `--grpc-web-root-path` are honoured, `--core` contexts have no server) or a token
+  set in Settings → Argo CD. Argo CD's application stream is opened first, then one list (`GET
+  /api/v1/applications`, only the fields the page shows), what the stream sent meanwhile applied
+  over it: no change is lost between the two. The stream keeps them live, opened again with a
+  backoff (1 s doubling to 60 s) when it ends: nothing is polled, and nothing is read while no
+  window shows the page. The sync windows come from one list of the projects, read again every 5
+  minutes (or each project, when they can't be listed). *Next sync* is worked out once a minute,
+  once for each set of windows.
+  A row's menu opens the Application in Argo CD's web UI; its *Refresh*, *Hard refresh*,
+  *Sync* (of the whole Application, with its own sync options), *Terminate* and *Roll back* go
+  through the same API, need write mode when they are sent, and are confirmed like a protected
+  context's (the server's name typed, or a wait). Settings → Argo CD lists the servers, says how
+  each logs in, tests one (who the token is, Argo CD's version, how many Applications it may
+  read), turns one off, and never shows a token.
+- **Argo CD Application dashboard**: a row's click, or a click on a service heading's name, opens
+  the dashboard of that service (the heading's chevron folds it): a tab per environment (each of
+  its Applications, with a dot in its color; with its Argo CD's name too when two share a name or
+  several Argo CDs are read), *Updated
+  at* and *Refresh*, and cards. *State*: the sync in big (*Synced*, *OutOfSync*, *Sync Failed* or
+  *Syncing*), the health, the resources Degraded (`worker Degraded +1`) and *Why?* (the diagnosis
+  below), the card tinted green, amber or red. *Versions*: a chip per component's image (the
+  repository's last part and its tag), red with `1.4.1 → 1.5.0` when it changed since the
+  deployment before (from the images seen running under it, else those its sources pinned:
+  kustomize images, Helm `*repository`/`*tag` parameters), who released it and when (`autosync`
+  for auto-sync), what ran before, and *Roll back* to the deployment before (auto-sync off, as
+  Argo CD requires; confirmed, write mode applies). *In cluster*: the revision of each source
+  deployed with its commit's message, author and time (a chart's version has none). *Problems*:
+  from the resource tree, one row per workload whose pods are in trouble (`CrashLoopBackOff`,
+  `Pending`, `ContainerCreating`, *Not ready*...), with how many of its pods, since when and *why*
+  (Argo CD's health message), then other objects Degraded (an autoscaler with no metric), then,
+  with auto-sync on, what should be live and isn't (*Missing*, from the Application's status:
+  the tree holds only live objects); the pod count and *all pods* (the destination namespace on
+  its context, else the tree's pods). *Nothing wrong.* is said only from the tree or of a Healthy
+  Application; from a status without health per resource (Argo CD 3) it says *No detail* and why.
+  *Last sync*: phase, message, duration, who, when and its steps (each resource's result and a
+  hook's phase), progress live while it runs. *Sync diff*: how many resources a sync would change
+  (`~ changed, + added, – pruned`, with names) and *show* for Argo CD's diff, or *Nothing to sync*.
+  *History*: the last deployments as dots, a sync that failed after them red, counts and the
+  list. Only the tab shown is read: by Argo CD's API (the Application, `resource-tree`,
+  `managed-resources` and `revisions/<rev>/metadata`, a commit kept once read) for an Application
+  read that way; on the hub for one read there, with the tree, the diff and the commits from the
+  Argo CD server set for that context (without one, problems and diff come from the Application's
+  status). It is read again when its row changes (the stream, the hubs' next read; a change
+  during a read is read once that read ends), 3 s after a read that found a sync running (when
+  the page is hidden, once it shows again), and on *Refresh*. Leaving the tab or the page stops
+  the read running; the page shown again reads the tab anew. The cards are worked out off the UI
+  thread.
+- **What changed between two syncs**: in the History card's list, *diff* on a deployment compares
+  it with the one before, and *pick* on two deployments compares them; the comparison opens under
+  the cards. *Sources*: what each deployment asked for, from Argo CD's history (the revision
+  deployed, Helm values — `valuesObject` wins over the values text, as in Argo CD —, parameters
+  and value files, kustomize images and patches, a plugin's env), shown like Helm's values diff
+  (only changed lines, folded context, `-`/`+`) under a summary. Nothing there is masked: Helm
+  values, parameters and a plugin's env show as the Application holds them. *Rendered manifests*:
+  what Argo CD renders at each deployment's revision (`GET
+  /api/v1/applications/<name>/manifests?revision=`, or `sourcePositions`/`revisions` pairs for
+  several sources), from the Application's sources as they are now (a change of its own
+  parameters shows under *Sources*). A deployment made from another shape of sources (one source
+  then several, another count) or an Application with a source hydrator can't be rendered as it
+  was: the comparison says so rather than compare; a source with no revision recorded is said
+  (rendered at its target revision now). For an Application read on its hub, they come from the
+  Argo CD server set for that context (without one, it says so). Both are read by a smart diff:
+  a summary first (`image web 1.15.0 → 1.16.0`, `replicas 3 → 5`, `env FOO added`, `config key
+  app.yaml changed`, `2 resources added`), each change once with the resources it is in (one
+  image bump in 12 Deployments is one line; the first 50 changes and 200 resources listed); then
+  noise folded away and counted (`12 noise changes hidden (checksum annotation 6, chart label
+  6)`, *show* to see it): `checksum/*` annotations, `helm.sh/chart`, `chart` and
+  `app.kubernetes.io/version` labels, `pod-template-hash` and `controller-revision-hash`, an
+  image's digest when its tag changed too (a digest alone is said: *digest changed*), timestamps
+  in the object's own metadata, the status, the field managers, the last-applied annotation and
+  what the API server sets. A tag is never noise, however much it looks like a hash or a date, nor
+  is a timestamp in a pod template (`restartedAt`), env or data. A ConfigMap or Secret kustomize
+  regenerated under a new name (its 10-character content hash) is the same one (*renamed a → b*),
+  not one pruned and one added, and references to it that changed only by that rename are noise.
+  A pod template where only noise changed says *pod template changed (pods restart)* with the
+  keys (over Argo CD's API a Secret's values are hidden, so a `checksum/secret` annotation may be
+  all that tells it changed). Then a row per resource that unfolds its diff. A Secret's values
+  are never shown: only *Secret key X changed*, added or removed (also in a `List`; Argo CD hides
+  them in what it renders, so there only keys added or removed show). Only Secrets are masked: a
+  value that looks like a password in another kind is shown. Read on demand, when a comparison
+  opens, off the UI thread (Argo CD may take up to 2 minutes to render); each revision's manifests
+  are kept once read, under the Application's sources as they are now (the last 16, 64 MB at
+  most), and a newer comparison or another tab drops the read running.
+- **Argo CD sync, terminate and roll back**: *Sync* (the Application's page, its row menu, the
+  Argo CD panel) reads the Application first and lists its resources out of sync, all ticked:
+  untick some to sync only the others (hooks run only when all are synced; past 200 the whole
+  Application syncs). *Prune*, off by default, names exactly what it deletes (out of sync and no
+  longer in git, of the resources ticked), and a sync that would now delete more is refused;
+  *Dry run* applies nothing, and what Argo CD would do is shown when it ends (waited for up to
+  30 s). *Terminate* stops the operation running, as `argocd app terminate-op` does, also when it
+  holds the Application's deletion. *Roll back…* on a past deployment (the Application's page, the
+  Argo CD panel, the row menu for the previous one) applies that deployment's revision and
+  sources again, without hooks or prune, as `argocd app rollback` does: the deployment the dialog
+  names is the one sent, even if another lands meanwhile. With auto-sync on it is disabled, since
+  Argo CD refuses it (revert in git instead). Like argocd-server, nothing starts while another
+  operation runs or the Application is being deleted, and the write carries the version of the
+  Application just read, so a change meanwhile refuses it. Each dialog shows the `kubectl patch` it sends; write mode,
+  the hub's protection and *Run as* apply.
+- **Argo CD resources**: an Application's page lists what Argo CD tracks for it
+  (`status.resources`) as a table: kind, namespace/name, sync, health, whether it is a hook, and
+  a message (its health message, and *no longer in git* for one out of sync that a sync with
+  prune deletes; not a hook left from the last sync, nor a resource Argo CD couldn't compare).
+  *Out of sync or unhealthy* shows those alone. A row opens the object on the kubeconfig context
+  that reaches the destination, with the kind and version that cluster serves, connecting to
+  it when it isn't connected; when no context reaches it, the rows don't open and the page says
+  so. The rows come from the Application itself, with no request per row, and only those on
+  screen are drawn: an Application with thousands of resources stays fast. When Argo CD keeps
+  no health per resource in the Application (`status.resourceHealthSource: appTree`, the
+  default from Argo CD 3.0 unless `controller.resource.health.persist` is on), the page says so.
 - **Argo CD diagnosis**: an Application's page says what is wrong with it, worst first, each
-  with its objects (opening on the destination's context when it is connected) and what to do:
+  with its objects (opening on the destination's context, connecting to it when it isn't) and
+  what to do:
   - *Being deleted*: the finalizers holding it (what each one waits for) and the resources not
     deleted yet, read live on the destination when it is connected; red after 5 minutes.
-  - *Sync running* for more than 10 minutes: the hook or resource it waits for.
+  - *Sync running* for more than 10 minutes: the hook or resource it waits for (*Terminate* stops it).
   - *Last sync failed*: each object that failed and why, from Argo CD's messages: a hook that
     failed, rejected by admission (a webhook, Pod Security), a webhook that did not answer, a
     kind not served (CRD missing), a namespace that does not exist, a quota, RBAC, the
@@ -231,8 +410,16 @@
   Secret's values never are. The field managers that wrote the object since the last sync are
   named too (with server-side apply that is all there is). A destination that isn't connected
   is said; open it to connect.
-- **Assistant beside any page** (Ctrl+J, or the sparkles button in the top bar): the window's
-  assistant chat opens on the right of the page shown, the same chat as on its own page (the
+- **Argo CD's own diff** (off until set up): with the hub context's Argo CD server set in
+  Settings → Per cluster, an Application's page offers *Show Argo CD's diff*: what a sync would
+  change, as Argo CD renders it from git (Helm and Kustomize applied), against the live objects.
+  Each resource that differs (changed, created by the sync, or no longer in git) is shown as a
+  diff from live to git, the first ones open and the others a click away; hooks are left out and
+  Secret values are hidden. It is one read-only request to that server, sent on the click, with
+  the argocd CLI's login to it or a read-only token set in Settings (see
+  [configuration](configuration.md#argo-cds-diff-argocd_servers)).
+- **Assistant beside any page** (Ctrl+J, ⌘J on macOS, or the sparkles button in the top bar): the
+  window's assistant chat opens on the right of the page shown, the same chat as on its own page (the
   expand button opens it there). It is told what is on screen, as its header shows: the
   clusters and namespaces picked, and the object whose page is open (with its context), or the
   list with its filter and the row selected, or the page (Problems, Timeline, overviews, Helm,
@@ -243,15 +430,50 @@
   long the API server took to start answering (p50, p95, slowest) and, for answers that end,
   until their last byte was read (p50, p95); and how much each kind received per minute over
   the last hour, counted decompressed as the bodies arrive. The time to the last byte includes
-  Recouvrance's own parsing when that sets the pace. Watches, logs and shells are streams that
-  run until closed: bytes only, and none for shells and port-forwards, whose data goes over the
-  upgraded connection. Below, the 10 heaviest requests, one per kind (cluster, method and path,
-  its names replaced by `{namespace}` and `{name}`), with their bytes and both times. A stream
-  is listed once it ends. Nothing leaves the machine.
-- **Favorites** and **saved views** (type + namespaces + filter, bookmark button), back/forward history, light and dark themes.
+  Recouvrance's own parsing when that sets the pace. Watches, logs, shells, attach and
+  port-forwards are streams that run until closed: bytes only. A shell's, an attach's or a
+  port-forward's data goes over the upgraded connection, and counts as it is read: what came
+  back through it, not what was sent. Below, the 10 heaviest requests, one per kind (cluster,
+  method and path, its names replaced by `{namespace}` and `{name}`), with their bytes and both
+  times. A stream is listed once it ends: a port-forward, each connection on its own. Nothing
+  leaves the machine.
+- **What's new and updates**: the first start after an update shows the release notes of every
+  version since the one run before (the version's own notes when that one is unknown), once.
+  They are the changelog built into the app: nothing is fetched. Settings → About shows them again,
+  says how the copy you run was installed (the install script, the `.deb`, the AppImage, or a
+  tarball or source build, with its path) and how to update it, with the command to copy.
+  *Check for updates* there asks GitHub for the latest release, only when clicked, and says
+  whether it is newer.
+- **Favorites**: star contexts (in the context picker), namespaces (in the namespace picker),
+  Argo CD Applications (on each row of the Argo CD page and on an Application's page), objects
+  (on a detail page, or *Add to favorites* in a row's menu) and resource types (in the sidebar).
+  `*` (outside text fields), or *Add to or remove from favorites* in the palette, stars or unstars
+  what is shown: the object or Application of a detail page; on a list, its selected row, else
+  the one namespace picked. Other pages have nothing to star this way (the Argo CD page has a
+  star on each row). Favorites come first where they are picked: the context picker lists
+  favorite contexts first; the namespace picker lists first the favorite namespaces of the
+  contexts connected; the Argo CD page sorts the trees holding a favorite first and its
+  *Favorites* toggle keeps only them. With several contexts combined, the namespace picker shows
+  one row a namespace: its star is lit when the namespace is a favorite on any of them, starring
+  marks it on each, and unstarring removes it from each (favorites of contexts not connected are
+  left as they are). The sidebar's *Favorites* section lists them all, on any context, and so
+  does the palette (type `favorite` to list them). A click never replaces the contexts
+  connected, unless it is a context's: a context connects alone, as picking it does; a namespace
+  is picked, its context added to those connected first when it isn't one of them; an object or
+  Application opens its page, on a context that isn't connected with a client of its own, as the
+  Argo CD page opens Applications (a page the user went to while it connects stays on screen); an
+  Application read only through Argo CD's API opens the Argo CD page. One whose target is gone
+  says so: a context no longer in the kubeconfig, a type the cluster doesn't serve, an object
+  deleted since (its page's *Deleted from the cluster*); a namespace its contexts don't list is
+  picked all the same, with a warning, as a user who may not list namespaces can still use one.
+  An Application is the same favorite whichever way it is read (see
+  [configuration](configuration.md#favoritesjson)). Every window shows and changes the same
+  favorites, kept in `favorites.json`.
+- **Saved views** (type + namespaces + filter, bookmark button), back/forward history, light and dark themes
+  whose status colors, badges and status buttons read at WCAG AA contrast (4.5:1) on what they are drawn on.
 - **Instant back**: the last 8 lists (up to 10,000 rows in all) are kept, so going back to one
   shows it at once, marked "Updating…", while a fresh list loads and replaces it in one go.
-- **Bulk actions**: check rows, then restart, scale, delete or copy names. Scaling needs the number
+- **Bulk actions**: check rows, then read their logs together, restart, scale, delete or copy names. Scaling needs the number
   of objects typed (the replica count is never suggested), deleting asks as set for the kind (see
   below), and each protected context among them needs its name typed (or a wait); rows from several contexts
   show which one they are on.
@@ -275,7 +497,7 @@
   debug pods with an ephemeral container (falls back to a Pod Security "restricted" profile), run a CronJob now, suspend/resume (CronJobs, Flux, Argo CronWorkflows), drain nodes, force delete
   or remove finalizers (only once the delete leaves it stuck terminating: it already was, or still is
   after 10 seconds), Flux *Reconcile*, Argo CD
-  *Refresh*/*Hard refresh*/*Sync*, create/apply YAML (a server dry run first, then a confirmation listing each
+  *Refresh*/*Hard refresh*/*Sync*/*Terminate*/*Roll back*, create/apply YAML (a server dry run first, then a confirmation listing each
   object's kind, namespace and name). YAML edits on a detail page save only that object: a changed
   kind, API group, namespace or name is refused, and so are masked Secret values. Every
   confirmation shows the equivalent `kubectl` command. A page whose object is deleted says so, and
@@ -288,7 +510,7 @@
   nothing). Actions disabled because your RBAC forbids them stay enabled when the context has an
   identity. Covered: scale, restart, rollback, delete (force, finalizers), YAML save, the values
   editor, Apply, cordon/uncordon, drain, CronJob run, suspend/resume, Flux reconcile, Argo CD
-  refresh/sync, role bindings. Not covered: Helm, bulk delete from tables, plugins, shells, debug,
+  refresh/sync/terminate/rollback, role bindings. Not covered: Helm, bulk delete from tables, plugins, shells, debug,
   node shell, file copy and ServiceAccount kubeconfigs. Agents never run as it.
 - **Plugins**: your own commands on resources (`~/.config/recouvrance/plugins.yaml`):
   `$CONTEXT`, `$NAMESPACE`, `$NAME`, `$KIND` are filled in and kubectl points at the cluster; they
@@ -326,21 +548,58 @@
 - **Per-cluster settings**: Prometheus or VictoriaMetrics endpoint, node shell image, accessible
   namespaces (when you may not list them), metrics off, an identity to run as; namespaces can also be added by hand.
 - **Kubeconfig**: extra files and watched folders, reloaded on change; contexts with the same name in
-  two files are kept apart as `name@file`.
+  two files are kept apart as `name@file`. A file that fails to parse is reported by its path, line
+  and column, never by what it holds there.
 
-| Shortcut | Action |
-|---|---|
-| Ctrl+K | Command palette: resources, pages, contexts, objects |
-| Ctrl+Shift+N | New window |
-| Ctrl+T / Ctrl+W / Ctrl+Tab | New tab / close tab / next tab |
-| Ctrl+B / F5 | Hide the sidebar / refresh (in a terminal, F5 goes to the program) |
-| Alt+← / Alt+→ | Back / forward (Esc also goes back from a detail page) |
-| Ctrl+= / Ctrl+- / Ctrl+0 | Zoom in / zoom out / reset the zoom |
-| Ctrl+F or / | Filter the current table: `web` · `!Running` · `app=web` · `tier!=db` · `l:app` · `ns:team-*` · `/^api-\d+/` · `status:Running` · `restarts>3` · `cpu>200m` (all terms must match) |
-| j / k / Enter | Move the selection in a table / open the selected row |
-| g then p / o / w / h / i / s | Go to Problems / Cluster overview / Workloads overview / Helm / Assistant / Settings |
-| Ctrl+J | Show or hide the assistant beside the page: it is told what is on screen |
-| ? | List the keyboard shortcuts |
-| Right-click a row | Open, logs, shell, YAML, events, copy name, favorite |
+The **command palette** (Ctrl+K, ⌘K on macOS, or the search box of the top bar) finds resource
+types, pages, contexts and objects across the connected clusters, and runs every command, with a
+key or without: Upgrade check, API requests, Agent activity, My access, write mode, the theme,
+each Settings section and each saved view. It knows other words for them too (`rbac` finds My
+access, `deprecated` the Upgrade check, `audit` Agent activity) and shows each command's key. A
+word of the detail line finds an object, and words combine: `web prod` finds `web` in the prod
+namespace, and a name with a cluster's name finds it on that cluster. Letters spread out only
+match its name.
 
-Single keys (?, g, j, k) work when no text field or terminal has focus; `?` lists every shortcut.
+The keyboard shortcuts, as `?` (or the keyboard button of the top bar) and Settings → Shortcuts
+list them; the palette, that list and this table are all made from one list of commands:
+
+| Linux | macOS | Command | Where |
+|---|---|---|---|
+| Ctrl+K | ⌘K | Command palette: resources, pages, contexts, objects and every command | Anywhere |
+| ? | ? | Keyboard shortcuts: this list | Outside text fields |
+| Ctrl+Shift+N | ⇧⌘N | New window | Anywhere |
+| Ctrl+T | ⌘T | New tab: right-click a row to open it in one | Anywhere |
+| Ctrl+W | ⌘W | Close tab | Anywhere |
+| Ctrl+Tab or Ctrl+PageDown | ⌃Tab or ⌃PageDown | Next tab | Anywhere |
+| Ctrl+Shift+Tab or Ctrl+PageUp | ⌃⇧Tab or ⌃PageUp | Previous tab | Anywhere |
+| Ctrl+B | ⌘B | Hide or show the sidebar | Anywhere |
+| F5 or Ctrl+R | F5 or ⌘R | Refresh: in a terminal, F5 goes to the program | Anywhere |
+| Alt+← | ⌘[ | Back | Anywhere |
+| Alt+→ | ⌘] | Forward | Anywhere |
+| Esc | Esc | Back to the list | On a detail page |
+| Ctrl+= | ⌘= | Zoom in | Anywhere |
+| Ctrl+- | ⌘- | Zoom out | Anywhere |
+| Ctrl+0 | ⌘0 | Reset the zoom | Anywhere |
+| Ctrl+F or / | ⌘F or / | Filter the table: `web` · `!Running` · `app=web` · `tier!=db` · `l:app` · `ns:team-*` · `/^api-\d+/` · `status:Running` · `restarts>3` · `cpu>200m` (all terms must match) | In a table |
+| j / k / Enter | j / k / Return | Move the selection, open the selected row | In a table |
+| Right-click a row | Right-click a row | Row menu: open, logs, shell, YAML, events, copy name, favorite | In a table |
+| g then p | g then p | Problems: what is broken, across the clusters | Outside text fields |
+| g then o | g then o | Cluster overview: nodes, capacity and versions | Outside text fields |
+| g then w | g then w | Workloads overview | Outside text fields |
+| g then h | g then h | Helm releases | Outside text fields |
+| g then i | g then i | Assistant: ask your clusters | Outside text fields |
+| g then s | g then s | Settings | Outside text fields |
+| * | * | Add to or remove from favorites: the object or Application shown; on a list, the selected row, else the one namespace picked | Outside text fields |
+| Ctrl+J | ⌘J | Assistant beside the page: it is told what is on screen | Anywhere |
+| Ctrl+Shift+V | ⌘V | Paste in a shell | In a shell |
+| Double-click a context | Double-click a context | Connect to just that context | On the Contexts page |
+
+Single keys (?, *, g, j, k) work when no text field or terminal has focus.
+
+On macOS, ⌘ takes Ctrl's place, so Ctrl keys reach the shell in a terminal (Ctrl+Tab still
+switches tabs), and the menu bar has the keys every Mac app has: ⌘, opens Settings, ⌘Q quits, ⌘W
+closes the tab or, at the last tab, the window, ⇧⌘W closes the window, ⌘M minimizes, ⌘H hides,
+⌘R refreshes and ⌘/ lists the shortcuts. Its Edit menu undoes, cuts, copies, pastes and selects
+all in a text field, and copies the text selected on a page; ⌘V pastes in a shell. The app keeps
+running once its last window is closed, as Mac apps do: its Dock icon or File → New Window opens
+one.

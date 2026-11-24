@@ -8,7 +8,8 @@ use gpui_kit::component::{ActiveTheme as _, IconName, Sizable as _, h_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use super::{AppView, Route, TabState, VisiblePages};
+use super::overviews::Overview;
+use super::{AppView, MAC, Route, TabState, VisiblePages, with_keys};
 use crate::k8s::Kind;
 
 impl AppView {
@@ -19,6 +20,8 @@ impl AppView {
             filter: self.filter.read(cx).value().to_string(),
             namespaces: self.namespaces.clone(),
             kind: self.kind.clone(),
+            // Opened already: its page is in the history.
+            open: None,
         }
     }
 
@@ -47,6 +50,10 @@ impl AppView {
             self.restart_watch(cx);
         }
         self.apply_route(cx);
+        // A tab reopened on an overview builds it now that it is shown.
+        if let Some(page) = t.open {
+            self.open_overview(page, window, cx);
+        }
     }
 
     /// A new tab showing the current page (Ctrl+T), or `route` when given.
@@ -72,6 +79,16 @@ impl AppView {
         self.load_tab(next, window, cx);
     }
 
+    /// Close the tab shown (Ctrl+W). ⌘W on macOS closes the window at its last tab, as Mac apps
+    /// do; Linux keeps its last tab.
+    pub(super) fn close_tab_or_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if closes_window(self.tabs.len(), MAC) {
+            window.remove_window();
+        } else {
+            self.close_tab(self.active_tab, window, cx);
+        }
+    }
+
     pub fn close_tab(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         if self.tabs.len() < 2 || ix >= self.tabs.len() {
             return;
@@ -86,6 +103,7 @@ impl AppView {
             if ix < self.active_tab {
                 self.active_tab -= 1;
             }
+            self.session_changed(cx);
             cx.notify();
         }
     }
@@ -95,20 +113,21 @@ impl AppView {
             Route::Resources(Some(k)) => k.label.clone(),
             Route::Resources(None) => "Resources".into(),
             Route::Detail(d) => d.read(cx).title(),
-            Route::Workloads(_) => "Workloads".into(),
-            Route::Cluster(_) => "Cluster".into(),
-            Route::Problems(_) => "Problems".into(),
-            Route::Timeline(_) => "Timeline".into(),
+            Route::Workloads(_)
+            | Route::Cluster(_)
+            | Route::Problems(_)
+            | Route::Timeline(_)
+            | Route::Helm(_)
+            | Route::Argo(_) => Overview::of(route).map_or("", |(o, _)| o.title()).to_string(),
             Route::Access(_) => "My access".into(),
             Route::HelmInstall(_) => "Helm install".into(),
             Route::Assistant(_) => "Assistant".into(),
-            Route::Helm(_) => "Helm releases".into(),
             Route::HelmRelease(_) => "Helm release".into(),
-            Route::Argo(_) => "Argo CD".into(),
             Route::Contexts => "Contexts".into(),
             Route::Settings => "Settings".into(),
             Route::Terminal(_) => "Terminal".into(),
             Route::Apply(_) => "Create / apply".into(),
+            Route::Logs(l) => l.read(cx).title(),
             Route::Agents => "Agents".into(),
         }
     }
@@ -126,6 +145,9 @@ impl AppView {
             .map(|(i, t)| {
                 let (route, kind) = if i == self.active_tab {
                     (Some(self.route()), self.kind.as_ref())
+                } else if let Some(page) = t.open {
+                    // Reopened on an overview built when shown: its history is still the list.
+                    return page.title().to_string();
                 } else {
                     (t.history.get(t.pos), t.kind.as_ref())
                 };
@@ -179,7 +201,7 @@ impl AppView {
                             .xsmall()
                             .ghost()
                             .icon(IconName::Close)
-                            .tooltip("Close tab (Ctrl+W)")
+                            .tooltip(with_keys("Close tab ({secondary-w})"))
                             .on_click(cx.listener(move |this, _, w, cx| {
                                 this.close_tab(i, w, cx);
                                 cx.stop_propagation();
@@ -192,7 +214,7 @@ impl AppView {
                     .xsmall()
                     .ghost()
                     .icon(Lucide::Plus)
-                    .tooltip("New tab (Ctrl+T)")
+                    .tooltip(with_keys("New tab ({secondary-t})"))
                     .on_click(cx.listener(|this, _, w, cx| this.new_tab(None, w, cx))),
             );
         // A plain mouse wheel scrolls the tabs sideways (it has no other axis).
@@ -228,22 +250,7 @@ impl AppView {
     /// Record which page this window shows, and whether the window is hidden (see
     /// `wait_visible`). The list pauses at once when it leaves the screen.
     pub(super) fn mark_visible(&mut self, cx: &mut Context<Self>) {
-        let page = match self.route() {
-            Route::Detail(e) => Some(e.entity_id()),
-            Route::Workloads(e) => Some(e.entity_id()),
-            Route::Cluster(e) => Some(e.entity_id()),
-            Route::Problems(e) => Some(e.entity_id()),
-            Route::Timeline(e) => Some(e.entity_id()),
-            Route::Access(e) => Some(e.entity_id()),
-            Route::HelmInstall(e) => Some(e.entity_id()),
-            Route::Assistant(e) => Some(e.entity_id()),
-            Route::Helm(e) => Some(e.entity_id()),
-            Route::HelmRelease(e) => Some(e.entity_id()),
-            Route::Argo(e) => Some(e.entity_id()),
-            Route::Terminal(e) => Some(e.entity_id()),
-            Route::Apply(e) => Some(e.entity_id()),
-            Route::Resources(_) | Route::Contexts | Route::Settings | Route::Agents => None,
-        };
+        let page = self.route().page();
         self.list_pause.set(!self.list_on_screen());
         let (me, hidden) = (cx.entity_id(), self.window_hidden);
         let visible = cx.default_global::<VisiblePages>();
@@ -270,8 +277,14 @@ impl AppView {
             self.kind = Some(kind);
             self.restart_watch(cx);
         }
+        self.session_changed(cx);
         cx.notify();
     }
+}
+
+/// Whether closing the tab shown closes its window instead: at the last tab, on macOS.
+fn closes_window(tabs: usize, mac: bool) -> bool {
+    mac && tabs < 2
 }
 
 /// The kind a tab shows, when it is not `current`: its route's, else the one it kept.
@@ -286,7 +299,15 @@ fn new_kind(route: &Route, kept: Option<Kind>, current: Option<&Kind>) -> Option
 
 #[cfg(test)]
 mod tests {
-    use super::{Kind, Route, new_kind};
+    use super::{Kind, Route, closes_window, new_kind};
+
+    #[test]
+    fn cmd_w_closes_the_window_at_the_last_tab_on_macos_only() {
+        assert!(closes_window(1, true), "macOS: the last tab's ⌘W closes the window");
+        assert!(!closes_window(2, true), "macOS: with two tabs, ⌘W closes one");
+        assert!(!closes_window(1, false), "Linux keeps its last tab");
+        assert!(!closes_window(3, false));
+    }
 
     fn kind(k: &str) -> Kind {
         Kind::fake("", k)

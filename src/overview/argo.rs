@@ -1,16 +1,22 @@
 //! The Argo CD section: the Application that deployed the object, or those that deploy
-//! into the namespace, as read on Argo CD's cluster.
+//! into the namespace, as read on Argo CD's cluster. On an Application's page, where it
+//! deploys, what is wrong with it, and the table of its resources.
+
+use std::rc::Rc;
 
 use gpui_kit::assets::IconName as Lucide;
-use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::{ActiveTheme as _, Sizable as _, h_flex, v_flex};
+use gpui_kit::component::button::{Button, ButtonVariants};
+use gpui_kit::component::{ActiveTheme as _, Disableable as _, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
+use serde_json::Value;
 
-use super::{Ctx, field, heading, mono, row};
+use super::{Ctx, column_cell, field, heading, mono, row};
+use crate::details::{ArgoAction, DetailPanel, OpenOn};
 use crate::k8s;
 use crate::k8s::argo::diagnosis::{self, Compared, Diagnosis, Drift, Finding, Res};
-use crate::k8s::argo::{self, Found, Summary};
+use crate::k8s::argo::server::{self, GitDiff};
+use crate::k8s::argo::{self, Found, ResourceRow, Summary};
 use crate::status::Tone;
 use crate::ui::selectable::{dragged, selectable};
 
@@ -41,7 +47,7 @@ pub(super) fn section(ctx: &Ctx, cx: &App) -> Option<Div> {
         v_flex()
             .gap_2()
             .child(heading(&title))
-            .when_some(own.as_ref(), |d, app| d.child(own_card(app, cx)))
+            .when_some(own.as_ref(), |d, app| d.child(own_card(ctx, app, cx)))
             .when(deployed_by, |d| d.child(div().text_xs().text_color(muted).child(selectable("Deployed by"))))
             .when_some(lookup.note.as_ref(), |d, note| {
                 d.child(div().text_xs().text_color(muted).child(selectable(note.clone())))
@@ -66,10 +72,15 @@ fn status_row(app: &Summary, cx: &App) -> Div {
         })
 }
 
-/// The Application of the page itself: its status and health message. What is wrong with it
-/// (a failed sync, errors, a deletion held) is under Diagnosis.
-fn own_card(app: &Summary, cx: &App) -> Div {
+/// The Application of the page itself: its status, health message and last deployments (each
+/// but the newest can be rolled back to). What is wrong with it (a failed sync, errors, a
+/// deletion held) is under Diagnosis.
+fn own_card(ctx: &Ctx, app: &Summary, cx: &App) -> Div {
     let theme = cx.theme();
+    let panel = ctx.panel.clone();
+    let roll_back: RollBack = Rc::new(move |id: i64, window: &mut Window, cx: &mut App| {
+        let _ = panel.update(cx, |p, cx| p.confirm_own_argo(ArgoAction::Rollback(Some(id)), window, cx));
+    });
     v_flex()
         .p_2()
         .gap_2()
@@ -81,6 +92,7 @@ fn own_card(app: &Summary, cx: &App) -> Div {
         .when_some(app.health_message.as_ref(), |d, m| {
             d.child(div().text_sm().text_color(theme.muted_foreground).child(selectable(m.clone())))
         })
+        .when(!app.history.is_empty(), |d| d.child(history(app, ("argo-own-rollback", 0), &roll_back, cx)))
 }
 
 fn app_card(ctx: &Ctx, ix: usize, found: &Found, full: bool, cx: &App) -> Div {
@@ -130,14 +142,20 @@ fn app_card(ctx: &Ctx, ix: usize, found: &Found, full: bool, cx: &App) -> Div {
             let color = if ty.ends_with("Warning") { theme.warning } else { theme.danger };
             div().text_sm().text_color(color).child(selectable(format!("{ty}: {message}")))
         }))
-        .when(full && !app.history.is_empty(), |d| d.child(history(app, cx)))
+        .when(full && !app.history.is_empty(), |d| {
+            let panel = ctx.panel.clone();
+            let roll_back: RollBack = Rc::new(move |id: i64, window: &mut Window, cx: &mut App| {
+                let _ = panel.update(cx, |p, cx| p.confirm_argo(ix, ArgoAction::Rollback(Some(id)), window, cx));
+            });
+            d.child(history(app, ("argo-rollback", ix * 16), &roll_back, cx))
+        })
 }
 
 /// The name (opens the Application on its cluster), where it runs, and its actions.
 fn header(ctx: &Ctx, ix: usize, found: &Found, cx: &App) -> Div {
     let app = &found.app;
     let panel = ctx.panel.clone();
-    let (open, refresh, sync) = (panel.clone(), panel.clone(), panel);
+    let (open, refresh, sync, terminate) = (panel.clone(), panel.clone(), panel.clone(), panel);
     h_flex()
         .gap_2()
         .flex_wrap()
@@ -174,14 +192,27 @@ fn header(ctx: &Ctx, ix: usize, found: &Found, cx: &App) -> Div {
         }))
         .child(Button::new(("argo-refresh", ix)).xsmall().ghost().icon(Lucide::RefreshCw).label("Refresh").on_click(
             move |_, window, cx| {
-                let _ = refresh.update(cx, |p, cx| p.confirm_argo(ix, false, window, cx));
+                let _ = refresh.update(cx, |p, cx| p.confirm_argo(ix, ArgoAction::Refresh, window, cx));
             },
         ))
         .child(Button::new(("argo-sync", ix)).xsmall().ghost().icon(Lucide::GitBranch).label("Sync").on_click(
             move |_, window, cx| {
-                let _ = sync.update(cx, |p, cx| p.confirm_argo(ix, true, window, cx));
+                let _ = sync.update(cx, |p, cx| p.confirm_argo(ix, ArgoAction::Sync, window, cx));
             },
         ))
+        // While an operation runs: it can be stopped, as `argocd app terminate-op` does.
+        .when(app.in_progress, |d| {
+            d.child(
+                Button::new(("argo-terminate", ix))
+                    .xsmall()
+                    .ghost()
+                    .icon(Lucide::CircleStop)
+                    .label("Terminate")
+                    .on_click(move |_, window, cx| {
+                        let _ = terminate.update(cx, |p, cx| p.confirm_argo(ix, ArgoAction::Terminate, window, cx));
+                    }),
+            )
+        })
 }
 
 /// An Application's page: where it deploys, its namespace opening on the context that
@@ -200,7 +231,7 @@ pub(super) fn destination(ctx: &Ctx, cx: &App) -> Option<Div> {
                 .child(selectable(argo::destination_text(context, &dest.namespace)))
                 .on_click(move |click, _, cx| {
                     if !dragged(click) {
-                        let _ = panel.update(cx, crate::details::DetailPanel::open_destination);
+                        let _ = panel.update(cx, DetailPanel::open_destination);
                     }
                 })
                 .into_any_element()
@@ -235,11 +266,10 @@ pub(super) fn diagnosis(ctx: &Ctx, cx: &App) -> Option<Div> {
     if d.is_empty() {
         return None;
     }
-    let on = read.and_then(|r| r.context.as_deref());
     let muted = cx.theme().muted_foreground;
     let mut section = v_flex().gap_3().child(heading("Diagnosis"));
     for (ix, f) in d.findings.iter().enumerate() {
-        section = section.child(finding(ctx, ix, f, on, cx));
+        section = section.child(finding(ctx, ix, f, cx));
     }
     match read {
         None if !d.to_read().is_empty() => {
@@ -261,7 +291,7 @@ pub(super) fn diagnosis(ctx: &Ctx, cx: &App) -> Option<Div> {
     Some(section)
 }
 
-fn finding(ctx: &Ctx, ix: usize, f: &Finding, on: Option<&str>, cx: &App) -> Div {
+fn finding(ctx: &Ctx, ix: usize, f: &Finding, cx: &App) -> Div {
     let muted = cx.theme().muted_foreground;
     v_flex()
         .gap_1()
@@ -279,7 +309,10 @@ fn finding(ctx: &Ctx, ix: usize, f: &Finding, on: Option<&str>, cx: &App) -> Div
                 .pl_4()
                 .gap_2()
                 .text_sm()
-                .child(object_link(ctx, format!("argo-diag-{ix}-{j}"), res, on, cx))
+                .child(
+                    object_link(ctx, SharedString::from(format!("argo-diag-{ix}-{j}")), res.label(), res, cx)
+                        .flex_shrink_0(),
+                )
                 .child(div().min_w_0().text_color(muted).child(selectable(what.clone())))
         }))
         .when(f.more > 0, |d| {
@@ -288,29 +321,24 @@ fn finding(ctx: &Ctx, ix: usize, f: &Finding, on: Option<&str>, cx: &App) -> Div
         .child(div().pl_4().text_xs().text_color(muted).child(selectable(f.hint.clone())))
 }
 
-/// An object of the Application, opening on the destination's context when it is connected.
-fn object_link(ctx: &Ctx, id: String, res: &Res, on: Option<&str>, cx: &App) -> AnyElement {
-    let Some(context) = on else { return div().flex_shrink_0().child(selectable(res.label())).into_any_element() };
-    let ev = crate::details::OpenObject {
-        kind: res.kind_query(),
-        name: res.name.clone(),
-        namespace: (!res.namespace.is_empty()).then(|| res.namespace.clone()),
-        context: Some(context.to_string()),
-    };
+/// The context that reaches the Application's destination (a connected one first), where
+/// its objects open. None until that is read, and when no context of the kubeconfig does.
+fn destination_context<'a>(ctx: &Ctx<'a>) -> Option<&'a str> {
+    ctx.related.argo_destination.as_ref().and_then(|(_, on)| on.as_deref())
+}
+
+/// `text`, opening an object of the Application on the context that reaches its destination
+/// (connecting to it when it isn't connected); plain text when no context reaches it.
+fn object_link(ctx: &Ctx, id: impl Into<ElementId>, text: String, res: &Res, cx: &App) -> Stateful<Div> {
+    let link = div().id(id).child(selectable(text));
+    let Some(context) = destination_context(ctx) else { return link };
+    let ev = OpenOn { context: context.to_string(), res: res.clone() };
     let panel = ctx.panel.clone();
-    div()
-        .id(SharedString::from(id))
-        .flex_shrink_0()
-        .text_color(cx.theme().blue)
-        .cursor_pointer()
-        .hover(Styled::underline)
-        .child(selectable(res.label()))
-        .on_click(move |click, _, cx| {
-            if !dragged(click) {
-                let _ = panel.update(cx, |_, cx| cx.emit(ev.clone()));
-            }
-        })
-        .into_any_element()
+    link.text_color(cx.theme().blue).cursor_pointer().hover(Styled::underline).on_click(move |click, _, cx| {
+        if !dragged(click) {
+            let _ = panel.update(cx, |_, cx| cx.emit(ev.clone()));
+        }
+    })
 }
 
 /// The fields that differ on each object read, who wrote it since the last sync, and the
@@ -336,7 +364,7 @@ fn drifts(ctx: &Ctx, d: &Diagnosis, on: Option<&str>, compared: &[&Drift], cx: &
                     h_flex()
                         .gap_2()
                         .text_sm()
-                        .child(object_link(ctx, format!("argo-drift-{i}"), &drift.res, on, cx))
+                        .child(object_link(ctx, ("argo-drift", i), drift.res.label(), &drift.res, cx).flex_shrink_0())
                         .child(
                             div()
                                 .text_xs()
@@ -387,16 +415,326 @@ fn drifts(ctx: &Ctx, d: &Diagnosis, on: Option<&str>, compared: &[&Drift], cx: &
         })
 }
 
+// MARK: Argo CD's diff
+
+/// Lines of diff open at first, about: the first resources' diffs are open, the others one
+/// click away, so a big diff doesn't lay out thousands of lines on every frame.
+const OPEN_LINES: usize = 300;
+
+/// An Application's diff as Argo CD renders it from git, read from its API server on a click.
+#[derive(Default)]
+pub struct ArgoGitDiff {
+    /// A read is running.
+    pub loading: bool,
+    /// The last read, or why it failed (never with the token).
+    pub read: Option<Result<GitDiff, String>>,
+    /// The resources whose diff is shown, by their index in `GitDiff::changed`.
+    pub open: std::collections::HashSet<usize>,
+}
+
+impl ArgoGitDiff {
+    /// Take a read: the first resources' diffs open, up to about `OPEN_LINES` lines (the
+    /// first one always).
+    pub fn set(&mut self, read: Result<GitDiff, String>) {
+        self.loading = false;
+        self.open.clear();
+        if let Ok(d) = &read {
+            let mut lines = 0;
+            for (i, r) in d.changed.iter().enumerate() {
+                lines += r.lines.len();
+                if i > 0 && lines > OPEN_LINES {
+                    break;
+                }
+                self.open.insert(i);
+            }
+        }
+        self.read = Some(read);
+    }
+}
+
+/// Said under the button before Argo CD's diff is read.
+const GIT_DIFF_NOTE: &str = "What a sync would change, as Argo CD renders it from git: one read-only request to \
+    Argo CD's API server, with the argocd CLI's login or the token set in Settings. Secret values are hidden.";
+
+/// An Application's page: Argo CD's own diff, from live to git. Off (one line saying how to
+/// turn it on) until its context's Argo CD server is set in Settings; read on a click.
+pub(super) fn git_diff(ctx: &Ctx, cx: &App) -> Div {
+    let theme = cx.theme();
+    let muted = theme.muted_foreground;
+    let note = |text: String| div().text_xs().text_color(muted).child(selectable(text));
+    let section = v_flex().gap_2().child(heading("Argo CD's diff with git"));
+    let server = match server::server_of(ctx.context) {
+        None => {
+            return section.child(note(format!(
+                "Set the Argo CD server of {} in Settings, Per cluster, to see what a sync would change, as Argo CD \
+                 renders it from git.",
+                ctx.context
+            )));
+        }
+        Some(Err(e)) => {
+            return section.child(
+                div()
+                    .text_sm()
+                    .text_color(theme.danger)
+                    .child(selectable(format!("The Argo CD server set in Settings, Per cluster, doesn't read: {e}"))),
+            );
+        }
+        Some(Ok(server)) => server,
+    };
+    let state = ctx.argo_git;
+    let panel = ctx.panel.clone();
+    let label = match (state.loading, state.read.is_some()) {
+        (true, _) => "Reading…",
+        (false, true) => "Read again",
+        (false, false) => "Show Argo CD's diff",
+    };
+    let button = Button::new("argo-git-diff")
+        .xsmall()
+        .outline()
+        .icon(Lucide::GitCompare)
+        .label(label)
+        .disabled(state.loading)
+        .tooltip(format!("GET {}/api/v1/applications/{{name}}/managed-resources", server.base))
+        .on_click(move |_, _, cx| {
+            let _ = panel.update(cx, DetailPanel::load_argo_git_diff);
+        });
+    let section = section.child(h_flex().gap_2().child(button));
+    match &state.read {
+        None => section.child(note(GIT_DIFF_NOTE.to_string())),
+        Some(Err(e)) => section.child(div().text_sm().text_color(theme.danger).child(selectable(e.clone()))),
+        Some(Ok(d)) => section
+            .child(note(git_diff_summary(d)))
+            .children(d.changed.iter().enumerate().map(|(i, r)| changed_resource(ctx, state, i, r, cx))),
+    }
+}
+
+/// What was read: how many resources differ, from where and with which login.
+fn git_diff_summary(d: &GitDiff) -> String {
+    let differ = d.changed.len() + d.more;
+    let mut text = if differ == 0 {
+        "Nothing differs: a sync would change nothing.".to_string()
+    } else {
+        format!(
+            "{differ} {} from git, {} the same.",
+            crate::plural::pick(differ, "resource differs", "resources differ"),
+            d.same
+        )
+    };
+    if d.hooks > 0 {
+        text.push(' ');
+        text.push_str(crate::plural::pick(d.hooks, "A hook is left out.", "Hooks are left out."));
+    }
+    if d.more > 0 {
+        text.push_str(&format!(" The first {} are shown.", d.changed.len()));
+    }
+    text.push_str(&format!(" Read from {} with {}: - is live, + is git.", d.server, d.login.text()));
+    text
+}
+
+/// A resource that differs: its object (opening on the destination's context), what the sync
+/// does to it, and its diff when open.
+fn changed_resource(ctx: &Ctx, state: &ArgoGitDiff, i: usize, r: &server::ResourceDiff, cx: &App) -> Div {
+    let muted = cx.theme().muted_foreground;
+    let open = state.open.contains(&i);
+    let panel = ctx.panel.clone();
+    v_flex()
+        .gap_1()
+        .child(
+            h_flex()
+                .gap_2()
+                .text_sm()
+                .child(
+                    Button::new(("argo-git-toggle", i))
+                        .xsmall()
+                        .ghost()
+                        .icon(if open { Lucide::ChevronDown } else { Lucide::ChevronRight })
+                        .on_click(move |_, _, cx| {
+                            let _ = panel.update(cx, |p, cx| p.toggle_argo_git(i, cx));
+                        }),
+                )
+                .child(object_link(ctx, ("argo-git-res", i), r.res.label(), &r.res, cx).flex_shrink_0())
+                .child(div().text_xs().text_color(muted).child(selectable(r.change.text()))),
+        )
+        .when(open, |d| d.child(crate::details::diff_block(&r.lines, cx)))
+        .when(open && r.more_lines > 0, |d| {
+            d.child(div().text_xs().text_color(muted).child(selectable(format!("+{} more lines", r.more_lines))))
+        })
+}
+
+// MARK: Resources
+
+/// An Application's resources table, worked out when the Application is read: it can list
+/// thousands, and the rows on screen are drawn again on every frame while the page scrolls.
+#[derive(Default)]
+pub struct ArgoResources {
+    rows: Vec<ResourceRow>,
+    /// The rows out of sync or unhealthy (`ResourceRow::needs_attention`), as indexes in `rows`.
+    attention: Vec<usize>,
+    /// Auto-sync is on: out of sync is then something to look at, not the normal state.
+    automated: bool,
+    /// Argo CD keeps no health per resource in this Application (`argo::keeps_no_health`).
+    no_health: bool,
+    /// The rows out of sync or unhealthy are shown alone. Kept across reads.
+    pub alone: bool,
+}
+
+impl ArgoResources {
+    /// Take the resources of the Application as read now.
+    pub fn set(&mut self, app: &Value) {
+        let rows = argo::resource_rows(app);
+        self.attention = rows.iter().enumerate().filter_map(|(i, r)| r.needs_attention().then_some(i)).collect();
+        self.automated = argo::auto_sync(app);
+        self.no_health = argo::keeps_no_health(app);
+        self.rows = rows;
+    }
+
+    /// Whether the rows out of sync or unhealthy are shown alone: picking them when there are
+    /// none would show nothing.
+    fn attention_alone(&self) -> bool {
+        self.alone && !self.attention.is_empty()
+    }
+
+    /// How many rows are shown.
+    pub fn shown(&self) -> usize {
+        if self.attention_alone() { self.attention.len() } else { self.rows.len() }
+    }
+
+    /// The row shown at `i`.
+    pub fn row(&self, i: usize) -> Option<&ResourceRow> {
+        let ix = if self.attention_alone() { *self.attention.get(i)? } else { i };
+        self.rows.get(ix)
+    }
+}
+
+/// The resources table's columns: header, width, and whether it gives up width in a narrow
+/// window (`column_cell`). The header and every row take their widths from here, so the cells
+/// line up; the message after them takes the room left.
+const COLUMNS: [(&str, f32, bool); 5] =
+    [("Kind", 160., true), ("Name", 340., true), ("Sync", 90., false), ("Health", 100., false), ("Hook", 50., false)];
+/// The message's width, at least.
+const MESSAGE: f32 = 160.;
+
+/// Said in a resource's message when it would be pruned (`requiresPruning`).
+const PRUNE: &str = "no longer in git: a sync with prune deletes it";
+/// Said over the table when no context reaches the destination: its rows open nothing.
+const NO_CONTEXT: &str =
+    "No context of your kubeconfig reaches its destination cluster: its resources can't be opened.";
+/// Said over the table when its Health column is empty for that reason.
+const NO_HEALTH: &str = "Argo CD keeps no health per resource in this Application: from Argo CD 3.0 it does only with \
+    `controller.resource.health.persist` on.";
+
+/// The message of a resources table's row (or its header): the room left, on one line.
+fn message_cell() -> Div {
+    h_flex().flex_1().min_w(px(MESSAGE)).gap_2().overflow_hidden().whitespace_nowrap()
+}
+
+/// An Application's page: the heading of its resources table, a toggle showing those out of
+/// sync or unhealthy alone, why a link or the health is missing, and the columns. Its rows are
+/// items of the page's list (`resource_row`), so only those on screen are laid out.
+pub(super) fn resources_table(ctx: &Ctx, cx: &App) -> Div {
+    let table = ctx.argo_resources;
+    let theme = cx.theme();
+    let muted = theme.muted_foreground;
+    let note = |text: &'static str| div().pb_2().text_xs().text_color(muted).child(selectable(text));
+    let toggle = (!table.attention.is_empty()).then(|| {
+        let panel = ctx.panel.clone();
+        Button::new("argo-attention")
+            .xsmall()
+            .when(table.alone, ButtonVariants::primary)
+            .when(!table.alone, Button::outline)
+            .label(format!("Out of sync or unhealthy ({})", table.attention.len()))
+            .on_click(move |_, _, cx| {
+                let _ = panel.update(cx, DetailPanel::toggle_argo_attention);
+            })
+    });
+    // Read, and no context reaches it (before the read, it isn't known yet).
+    let unreachable = matches!(ctx.related.argo_destination, Some((_, None)));
+    v_flex()
+        .child(heading(&format!("Resources ({})", table.rows.len())))
+        .when_some(toggle, |d, toggle| d.child(h_flex().pb_2().child(toggle)))
+        .when(unreachable && !table.rows.is_empty(), |d| d.child(note(NO_CONTEXT)))
+        .when(table.no_health && !table.rows.is_empty(), |d| d.child(note(NO_HEALTH)))
+        .child(if table.rows.is_empty() {
+            note("Argo CD lists no resources for it.")
+        } else {
+            h_flex()
+                .gap_3()
+                .py_1()
+                .text_xs()
+                .text_color(muted)
+                .border_b_1()
+                .border_color(theme.border)
+                .children(COLUMNS.map(|(title, width, shrinks)| column_cell(width, shrinks).child(title)))
+                .child(message_cell().child("Message"))
+        })
+}
+
+/// A row of an Application's resources table: its object (opening on the destination's
+/// context), its sync and health in their tone, whether it is a hook, and why it would be
+/// pruned or isn't healthy.
+pub(super) fn resource_row(ctx: &Ctx, i: usize, cx: &App) -> AnyElement {
+    let table = ctx.argo_resources;
+    let Some(r) = table.row(i) else { return div().into_any_element() };
+    let theme = cx.theme();
+    let muted = theme.muted_foreground;
+    let [kind, name, sync, health, hook] = COLUMNS.map(|(_, width, shrinks)| column_cell(width, shrinks));
+    let shown_name =
+        if r.res.namespace.is_empty() { r.res.name.clone() } else { format!("{}/{}", r.res.namespace, r.res.name) };
+    let link = object_link(ctx, ("argo-resource", i), shown_name, &r.res, cx);
+    h_flex()
+        .gap_3()
+        .py_1()
+        .text_sm()
+        .border_b_1()
+        .border_color(theme.border)
+        .child(kind.child(r.res.kind.clone()))
+        .child(name.child(link.overflow_hidden().text_ellipsis().whitespace_nowrap()))
+        .child(sync.text_color(argo::sync_tone(&r.sync, table.automated).color(cx)).child(r.sync.clone()))
+        .child(
+            health.text_color(argo::listed_health_tone(&r.health, table.automated).color(cx)).child(r.health.clone()),
+        )
+        .child(hook.text_color(muted).child(if r.hook { "yes" } else { "" }))
+        .child(
+            message_cell()
+                .when(r.prune, |d| d.child(div().flex_none().text_color(theme.warning).child(PRUNE)))
+                .when_some(r.message.clone(), |d, m| {
+                    d.child(div().flex_1().min_w_0().overflow_hidden().text_ellipsis().text_color(muted).child(m))
+                }),
+        )
+        .into_any_element()
+}
+
 /// A link's host, for a button's label.
 fn short_url(url: &str) -> String {
     let rest = url.split_once("://").map_or(url, |(_, r)| r);
     rest.split('/').next().unwrap_or(rest).to_string()
 }
 
-fn history(app: &Summary, cx: &App) -> Div {
+/// Roll an Application back to the deployment with this id (after its confirmation).
+type RollBack = Rc<dyn Fn(i64, &mut Window, &mut App)>;
+
+/// The last deployments, newest first. Each but the newest offers to roll back to it, which
+/// Argo CD allows only with auto-sync off; `id` numbers those buttons.
+fn history(app: &Summary, id: (&'static str, usize), roll_back: &RollBack, cx: &App) -> Div {
     let muted = cx.theme().muted_foreground;
     v_flex().gap_0p5().child(div().text_xs().text_color(muted).child(selectable("Deployed"))).children(
-        app.history.iter().map(|h| {
+        app.history.iter().enumerate().map(|(i, h)| {
+            let button = h.id.filter(|_| i > 0).map(|deployment| {
+                let roll_back = roll_back.clone();
+                Button::new((id.0, id.1 + i))
+                    .xsmall()
+                    .ghost()
+                    .icon(Lucide::Undo2)
+                    .label("Roll back…")
+                    .when(app.automated, |b| {
+                        b.disabled(true)
+                            .tooltip("Auto-sync is on: Argo CD refuses a rollback. Revert the change in git.")
+                    })
+                    .when(!app.automated, |b| {
+                        b.tooltip(format!("Deploy this revision again (deployment {deployment})"))
+                    })
+                    .on_click(move |_, window, cx| roll_back(deployment, window, cx))
+            });
             h_flex()
                 .gap_3()
                 .text_sm()
@@ -405,15 +743,131 @@ fn history(app: &Summary, cx: &App) -> Div {
                 .when_some(h.by.as_ref(), |d, by| {
                     d.child(div().text_color(muted).child(selectable(format!("by {by}"))))
                 })
+                .children(button)
         }),
     )
 }
 
 #[cfg(test)]
 mod tests {
+    use super::{ArgoGitDiff, ArgoResources};
+    use crate::history::DiffLine;
+    use crate::k8s::argo::diagnosis::Res;
+    use crate::k8s::argo::server::{Change, GitDiff, Login, ResourceDiff};
+    use serde_json::json;
+
+    #[test]
+    fn the_first_diffs_open_within_a_budget() {
+        let res = |lines: usize| ResourceDiff {
+            res: Res { kind: "ConfigMap".into(), name: "c".into(), ..Default::default() },
+            change: Change::Modified,
+            lines: vec![DiffLine::Added("x".into()); lines],
+            more_lines: 0,
+        };
+        let read = |sizes: &[usize]| {
+            Ok(GitDiff {
+                server: "argocd.example.com".into(),
+                login: Login::Cli,
+                changed: sizes.iter().map(|n| res(*n)).collect(),
+                more: 0,
+                same: 0,
+                hooks: 0,
+            })
+        };
+        let mut state = ArgoGitDiff { loading: true, ..Default::default() };
+        state.set(read(&[100, 150, 100, 10]));
+        let mut open: Vec<usize> = state.open.iter().copied().collect();
+        open.sort_unstable();
+        assert_eq!(open, [0, 1]);
+        assert!(!state.loading);
+        // The first one opens even when it alone is over the budget.
+        state.set(read(&[1000, 5]));
+        assert_eq!(state.open.iter().copied().collect::<Vec<_>>(), [0]);
+        // A failed read opens nothing, and says why.
+        state.set(Err("refused".into()));
+        assert!(state.open.is_empty());
+        assert_eq!(state.read, Some(Err("refused".into())));
+    }
+
     #[test]
     fn a_url_button_shows_its_host() {
         assert_eq!(super::short_url("https://web.example.com/login?x=1"), "web.example.com");
         assert_eq!(super::short_url("web.example.com"), "web.example.com");
+    }
+
+    fn shown(table: &ArgoResources) -> Vec<String> {
+        (0..table.shown()).filter_map(|i| table.row(i)).map(|r| r.res.name.clone()).collect()
+    }
+
+    #[test]
+    fn the_resources_out_of_sync_or_unhealthy_can_be_shown_alone() {
+        let app = json!({"status": {"resources": [
+            {"kind": "ConfigMap", "namespace": "shop", "name": "a", "status": "Synced"},
+            {"kind": "ConfigMap", "namespace": "shop", "name": "b", "status": "OutOfSync"},
+            {"kind": "ConfigMap", "namespace": "shop", "name": "c", "status": "Synced"},
+            {"group": "apps", "kind": "Deployment", "namespace": "shop", "name": "d", "status": "Synced",
+             "health": {"status": "Degraded"}}
+        ]}});
+        let mut table = ArgoResources::default();
+        table.set(&app);
+        assert_eq!(shown(&table), ["a", "b", "c", "d"]);
+        // It keeps each resource's health: no note over the table.
+        assert!(!table.no_health);
+        table.alone = true;
+        assert_eq!(shown(&table), ["b", "d"]);
+        assert!(table.row(2).is_none());
+        // Read again with nothing wrong: every row, rather than none; the choice is kept. Its
+        // health is now in Argo CD's resource tree, as the Application says.
+        table.set(&json!({"status": {"resourceHealthSource": "appTree", "resources": [
+            {"kind": "ConfigMap", "name": "a", "status": "Synced"}
+        ]}}));
+        assert_eq!(shown(&table), ["a"]);
+        assert!(table.alone);
+        assert!(table.no_health);
+    }
+}
+
+/// Rules that hold for every list of resources.
+#[cfg(test)]
+mod properties {
+    use super::ArgoResources;
+    use proptest::prelude::*;
+    use serde_json::{Value, json};
+
+    proptest! {
+        /// Shown alone, the rows out of sync or unhealthy are all of them and only them, in
+        /// Argo CD's order; with none, every row is shown rather than nothing.
+        #[test]
+        fn rows_shown_alone_are_those_that_need_attention(
+            states in proptest::collection::vec(
+                (any::<bool>(), any::<bool>(), proptest::sample::select(vec!["", "Healthy", "Progressing", "Degraded", "Missing"])),
+                0..30,
+            ),
+            alone in any::<bool>(),
+        ) {
+            let resources: Vec<Value> = states
+                .iter()
+                .enumerate()
+                .map(|(i, (out, prune, health))| json!({
+                    "kind": "ConfigMap",
+                    "name": format!("r{i}"),
+                    "status": if *out { "OutOfSync" } else { "Synced" },
+                    "requiresPruning": prune,
+                    "health": {"status": health},
+                }))
+                .collect();
+            let mut table = ArgoResources::default();
+            table.set(&json!({"status": {"resources": resources}}));
+            table.alone = alone;
+            let shown: Vec<_> = (0..table.shown()).filter_map(|i| table.row(i)).cloned().collect();
+            prop_assert_eq!(shown.len(), table.shown());
+            prop_assert!(table.row(table.shown()).is_none());
+            let wanted: Vec<_> = table.rows.iter().filter(|r| r.needs_attention()).cloned().collect();
+            if alone && !wanted.is_empty() {
+                prop_assert_eq!(shown, wanted);
+            } else {
+                prop_assert_eq!(shown.as_slice(), table.rows.as_slice());
+            }
+        }
     }
 }

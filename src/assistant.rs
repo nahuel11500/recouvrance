@@ -51,39 +51,52 @@ pub fn save_api_key(key: &str) -> std::io::Result<()> {
 /// The main agent (created read-only, never Secrets, the first time) and its token.
 /// It is the agent named "Claude" only: another agent's token is never rotated for it.
 pub fn main_agent(hub: &Hub) -> Result<(String, String)> {
-    let existing = main_agent_id(hub);
-    let saved =
-        read_secret("main-agent").and_then(|s| s.split_once(' ').map(|(id, t)| (id.to_string(), t.to_string())));
-    match (existing, saved) {
-        // The saved token is used only while it is still this agent's ("New token" replaces it).
-        (Some(id), Some((sid, token))) if id == sid && hub.agent_by_token(&token).is_some_and(|a| a.id == id) => {
-            Ok((id, token))
-        }
-        (Some(id), _) => {
-            // The token is only stored hashed: issue a new one (Connect Claude Code updates it there).
-            let token = hub.rotate_token(&id)?;
-            save_main_token(&id, &token)?;
-            Ok((id, token))
-        }
-        (None, _) => {
-            let (agent, token) = hub.create_agent(AGENT_NAME.into())?;
-            hub.update_agent(&agent.id, |a| {
-                a.policy.rules[0].contexts = vec!["*".into()];
-                a.policy.rules[0].note = "Read everything (allow more below)".into();
-            })?;
-            save_main_token(&agent.id, &token)?;
-            Ok((agent.id, token))
-        }
+    let Some(id) = main_agent_id(hub) else {
+        let (agent, token) = hub.create_agent(AGENT_NAME.into())?;
+        hub.update_agent(&agent.id, |a| {
+            a.policy.rules[0].contexts = vec!["*".into()];
+            a.policy.rules[0].note = "Read everything (allow more below)".into();
+        })?;
+        save_main_token(&agent.id, &token)?;
+        return Ok((agent.id, token));
+    };
+    if let Some(token) = saved_token(hub, &id) {
+        return Ok((id, token));
     }
+    // The token is only stored hashed: issue a new one (Connect Claude Code updates it there).
+    let token = hub.rotate_token(&id)?;
+    save_main_token(&id, &token)?;
+    Ok((id, token))
 }
 
 fn main_agent_id(hub: &Hub) -> Option<String> {
     hub.config().agents.iter().find(|a| a.name == AGENT_NAME).map(|a| a.id.clone())
 }
 
+/// Whether `id` is the main agent: the one whose token Recouvrance keeps.
+pub fn is_main_agent(hub: &Hub, id: &str) -> bool {
+    main_agent_id(hub).as_deref() == Some(id)
+}
+
+/// The main agent's token, for a client's config: the saved one while it still works,
+/// never a new one, which would cut off the clients connected with the old.
+pub fn main_token(hub: &Hub, id: &str) -> Option<String> {
+    if !is_main_agent(hub, id) {
+        return None;
+    }
+    saved_token(hub, id)
+}
+
+/// The saved token, while it is still this agent's ("New token" replaces it).
+fn saved_token(hub: &Hub, id: &str) -> Option<String> {
+    let saved = read_secret("main-agent")?;
+    let (saved_id, token) = saved.split_once(' ')?;
+    (saved_id == id && hub.agent_by_token(token).is_some_and(|a| a.id == id)).then(|| token.to_string())
+}
+
 /// After "New token" on the Agents page: the main agent's new token is the one the assistant uses.
 pub fn token_rotated(hub: &Hub, id: &str, token: &str) -> std::io::Result<()> {
-    if main_agent_id(hub).as_deref() != Some(id) {
+    if !is_main_agent(hub, id) {
         return Ok(());
     }
     save_main_token(id, token)
@@ -340,7 +353,7 @@ impl Mcp {
         let url = format!("http://127.0.0.1:{port}/mcp");
         let auth = format!("Bearer {token}");
         let headers = [("authorization", auth.as_str()), ("accept", "application/json, text/event-stream")];
-        let init = json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-03-26", "capabilities": {}, "clientInfo": {"name": "recouvrance-assistant", "version": "1"}}});
+        let init = json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-03-26", "capabilities": {}, "clientInfo": {"name": "recouvrance-assistant", "version": env!("CARGO_PKG_VERSION")}}});
         let (h, _) = post(&url, &headers, &init).await.context("Recouvrance's MCP server (is agent access on?)")?;
         let session = h.get("mcp-session-id").and_then(|v| v.to_str().ok()).unwrap_or_default().to_string();
         let mcp = Self { url, token, session };
@@ -442,7 +455,8 @@ pub fn backend() -> Option<Backend> {
 }
 
 /// One question → Claude, calling Recouvrance's tools until it answers. Dropping the
-/// future stops it, and Claude Code with it.
+/// future stops it, and Claude Code with it. An error (Claude declining included) gives
+/// no new conversation: the chat goes on from the one it had before the question.
 pub async fn ask(
     hub: Arc<Hub>,
     conv: Conversation,
@@ -508,6 +522,15 @@ fn code_dirs() -> Vec<PathBuf> {
     crate::settings::get().assistant_repos.iter().map(|r| crate::paths::expand(r)).filter(|p| p.is_dir()).collect()
 }
 
+/// The MCP config `claude -p` gets: Recouvrance's server, with the agent's token and a label
+/// that tells the assistant's calls from those of your own Claude Code in the activity log.
+fn mcp_config(port: u16, token: &str) -> Value {
+    let mut headers = serde_json::Map::new();
+    headers.insert("Authorization".into(), format!("Bearer {token}").into());
+    headers.insert(crate::mcp::server::CLIENT_HEADER.into(), "assistant".into());
+    json!({"mcpServers": {"recouvrance": {"type": "http", "url": format!("http://127.0.0.1:{port}/mcp"), "headers": headers}}})
+}
+
 /// The `claude -p` arguments. The question comes last, after `--`, so one starting with `-`
 /// is never read as an option.
 fn claude_args(
@@ -568,8 +591,11 @@ async fn ask_claude_code(
             Some(w) => w.clone(),
             None => Arc::new(PrivateDir::create().context("creating the assistant's private directory")?),
         };
-        let cfg = json!({"mcpServers": {"recouvrance": {"type": "http", "url": format!("http://127.0.0.1:{port}/mcp"), "headers": {"Authorization": format!("Bearer {token}")}}}});
-        let cfg_file = TempFile::create(work.path().join(format!("mcp-{}.json", uuid::Uuid::new_v4().simple())), cfg.to_string().as_bytes())?;
+        let cfg = mcp_config(port, &token);
+        let cfg_file = TempFile::create(
+            work.path().join(format!("mcp-{}.json", uuid::Uuid::new_v4().simple())),
+            cfg.to_string().as_bytes(),
+        )?;
         let mut cmd = tokio::process::Command::new(&bin);
         cmd.current_dir(work.path())
             .args(claude_args(&question, cfg_file.path(), &scope, &model, conv.session.as_deref(), &code_dirs()))
@@ -606,9 +632,16 @@ async fn ask_claude_code(
                         match b["type"].as_str() {
                             Some("text") => on_step(Step::Text(b["text"].as_str().unwrap_or_default().to_string())),
                             Some("tool_use") => {
-                                let name = b["name"].as_str().unwrap_or_default().trim_start_matches("mcp__recouvrance__").to_string();
+                                let name = b["name"]
+                                    .as_str()
+                                    .unwrap_or_default()
+                                    .trim_start_matches("mcp__recouvrance__")
+                                    .to_string();
                                 on_step(Step::Running { name: name.clone(), args: b["input"].to_string() });
-                                pending.insert(b["id"].as_str().unwrap_or_default().to_string(), (name, b["input"].to_string()));
+                                pending.insert(
+                                    b["id"].as_str().unwrap_or_default().to_string(),
+                                    (name, b["input"].to_string()),
+                                );
                             }
                             _ => {}
                         }
@@ -621,7 +654,9 @@ async fn ask_claude_code(
                         }
                         let result = match &b["content"] {
                             Value::String(s) => s.clone(),
-                            Value::Array(parts) => parts.iter().filter_map(|p| p["text"].as_str()).collect::<Vec<_>>().join("\n"),
+                            Value::Array(parts) => {
+                                parts.iter().filter_map(|p| p["text"].as_str()).collect::<Vec<_>>().join("\n")
+                            }
                             other => other.to_string(),
                         };
                         if let Some((name, args)) = pending.remove(b["tool_use_id"].as_str().unwrap_or_default()) {
@@ -629,7 +664,9 @@ async fn ask_claude_code(
                         }
                     }
                 }
-                Some("result") if ev["is_error"] == true => error = Some(ev["result"].as_str().unwrap_or("Claude Code failed").to_string()),
+                Some("result") if ev["is_error"] == true => {
+                    error = Some(ev["result"].as_str().unwrap_or("Claude Code failed").to_string());
+                }
                 _ => {}
             }
         }
@@ -660,24 +697,15 @@ async fn ask_api(
     let port = hub.port();
     run_abortable(async move {
         let mcp = Mcp::connect(port, token).await?;
-        let tools: Vec<Value> = mcp
-            .tools()
-            .await?
-            .into_iter()
-            .map(|t| json!({"name": t["name"], "description": t["description"], "input_schema": t["inputSchema"]}))
-            .collect();
-        let system = system_prompt(&scope, &[]);
+        let tools = api_tools(mcp.tools().await?);
+        let system = api_system(&system_prompt(&scope, &[]));
         let mut messages = history;
         messages.push(json!({"role": "user", "content": question}));
         let headers = [("x-api-key", key.as_str()), ("anthropic-version", "2023-06-01")];
+        let url = format!("{}/v1/messages", anthropic_url());
         for _ in 0..MAX_STEPS {
-            let body =
-                json!({"model": model, "max_tokens": 4096, "system": system, "tools": tools, "messages": messages});
-            let api = anthropic_url();
-            let (_, text) = post(&format!("{api}/v1/messages"), &headers, &body).await?;
-            let resp: Value = serde_json::from_str(&text)?;
-            let cut_off = resp["stop_reason"] == "max_tokens";
-            let content = reply_content(&resp);
+            let resp = send(&url, &headers, &request_body(&model, &system, &tools, &messages)).await?;
+            let Reply { content, note } = read_reply(&resp)?;
             if !content.is_empty() {
                 messages.push(json!({"role": "assistant", "content": content}));
             }
@@ -695,8 +723,8 @@ async fn ask_api(
                     _ => {}
                 }
             }
-            if cut_off {
-                on_step(Step::Text("(the reply was cut off)".into()));
+            if let Some(note) = note {
+                on_step(Step::Text(note));
             }
             if results.is_empty() {
                 return Ok(messages);
@@ -709,9 +737,130 @@ async fn ask_api(
     .await
 }
 
+/// One step's request to the Messages API, and its reply.
+async fn send(url: &str, headers: &[(&str, &str)], body: &Value) -> Result<Value> {
+    #[cfg(feature = "dev")]
+    let _t = crate::dev::timing::span("assistant request");
+    let (_, text) = post(url, headers, body).await?;
+    let resp: Value = serde_json::from_str(&text)?;
+    #[cfg(feature = "dev")]
+    count_tokens(&resp["usage"]);
+    Ok(resp)
+}
+
+/// `RECOUVRANCE_TIMINGS`: a reply's input tokens, by how the prompt cache served them. From
+/// the second step of a question on, most of the prompt should be read from the cache.
+#[cfg(feature = "dev")]
+fn count_tokens(usage: &Value) {
+    for (field, name) in [
+        ("input_tokens", "assistant uncached tokens"),
+        ("cache_creation_input_tokens", "assistant cache write tokens"),
+        ("cache_read_input_tokens", "assistant cache read tokens"),
+    ] {
+        if let Some(n) = usage[field].as_u64().filter(|n| *n > 0) {
+            crate::dev::timing::count(name, n);
+        }
+    }
+}
+
+/// A prompt cache breakpoint: the prompt up to it is kept for 5 minutes after its last use.
+/// Writing it costs a quarter more than plain input; a later request that starts with the
+/// same bytes reads it back for a tenth of the price or less, and sooner.
+fn cache_breakpoint() -> Value {
+    json!({"type": "ephemeral"})
+}
+
+/// The MCP server's tools as the Messages API takes them. They come first in the prompt
+/// and are the same at every step of every question, so the last one ends a cached prefix.
+/// Sorted by name: the prefix must be the same bytes whatever order the server lists them in.
+fn api_tools(mcp_tools: Vec<Value>) -> Vec<Value> {
+    let mut tools: Vec<Value> = mcp_tools
+        .into_iter()
+        .map(|t| json!({"name": t["name"], "description": t["description"], "input_schema": t["inputSchema"]}))
+        .collect();
+    tools.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
+    if let Some(last) = tools.last_mut() {
+        last["cache_control"] = cache_breakpoint();
+    }
+    tools
+}
+
+/// The system prompt, after the tools in the prompt, ending a second cached prefix: it is
+/// the same at every step of a question. It names what is on screen, so it can change from
+/// one question to the next; the tools stay cached then, through their own breakpoint.
+fn api_system(prompt: &str) -> Value {
+    json!([{"type": "text", "text": prompt, "cache_control": cache_breakpoint()}])
+}
+
+/// One step's request body. The top-level `cache_control` caches the conversation so far
+/// (the API puts it on the last block), so each step reads the steps before it from the
+/// cache, and so does a new question while the system prompt (what is on screen) stays the
+/// same. With the tools' and the system prompt's, that makes three of the four breakpoints
+/// a request may have.
+fn request_body(model: &str, system: &Value, tools: &[Value], messages: &[Value]) -> Value {
+    json!({
+        "model": model,
+        "max_tokens": 4096,
+        "cache_control": cache_breakpoint(),
+        "system": system,
+        "tools": tools,
+        "messages": messages,
+    })
+}
+
+/// One reply, read for the loop.
+#[derive(Debug)]
+struct Reply {
+    /// The blocks worth keeping (see `reply_content`).
+    content: Vec<Value>,
+    /// Said in the chat after the reply when it stopped some other way than by answering
+    /// or calling tools.
+    note: Option<String>,
+}
+
+/// Reads one reply. A refusal is an error: what the reply wrote before it is not an answer
+/// (the API says to discard it), and an error gives the chat no new conversation, so it goes
+/// on from the one before the question and the next question doesn't send the declined one
+/// again.
+fn read_reply(resp: &Value) -> Result<Reply> {
+    let stop = resp["stop_reason"].as_str();
+    if stop == Some("refusal") {
+        bail!("{}", declined(&resp["stop_details"]));
+    }
+    Ok(Reply { content: reply_content(resp), note: stop_note(stop) })
+}
+
+/// What the chat says when Claude declines: the API's explanation, meant to be shown as is,
+/// or else its category.
+fn declined(details: &Value) -> String {
+    let explanation = details["explanation"].as_str().map(str::trim).filter(|s| !s.is_empty());
+    let category = details["category"].as_str().filter(|s| !s.is_empty());
+    let why = match (explanation, category) {
+        (Some(e), _) => format!(": {}", e.trim_end_matches('.')),
+        (None, Some(c)) => format!(" (category {c})"),
+        (None, None) => String::new(),
+    };
+    format!("Claude declined to answer{why}. The question is dropped from the conversation; ask it another way.")
+}
+
+/// What the chat adds after a reply that stopped some other way than by answering or by
+/// calling tools.
+fn stop_note(stop: Option<&str>) -> Option<String> {
+    match stop {
+        Some("end_turn" | "tool_use") => None,
+        Some("max_tokens") => Some("(the reply was cut off)".into()),
+        // The conversation filled the model's context: the next question would not fit.
+        Some("model_context_window_exceeded") => {
+            Some("(the reply was cut off: this chat is too long for the model, start a new one)".into())
+        }
+        Some(other) => Some(format!("(the reply stopped early: {other})")),
+        None => Some("(the reply stopped early)".into()),
+    }
+}
+
 /// The blocks of an API reply worth keeping. Tool calls count only when the reply stopped
-/// to run them: one cut off (`max_tokens`) may be incomplete, and is neither run nor kept
-/// (a kept call with no result would break every later question).
+/// to run them: one cut off (`max_tokens`, or any other stop) may be incomplete, and is
+/// neither run nor kept (a kept call with no result would break every later question).
 fn reply_content(resp: &Value) -> Vec<Value> {
     let mut content = resp["content"].as_array().cloned().unwrap_or_default();
     if resp["stop_reason"] != "tool_use" {
@@ -722,8 +871,19 @@ fn reply_content(resp: &Value) -> Vec<Value> {
 
 #[cfg(test)]
 mod tests {
-    use serde_json::json;
+    use serde_json::{Value, json};
     use std::path::PathBuf;
+
+    /// Claude Code, run as the assistant, sends the label the activity log names it by, with
+    /// the agent's token.
+    #[test]
+    fn the_assistant_s_claude_code_labels_its_calls() {
+        let cfg = super::mcp_config(47070, "tok");
+        let server = &cfg["mcpServers"]["recouvrance"];
+        assert_eq!(server["url"], "http://127.0.0.1:47070/mcp");
+        assert_eq!(server["headers"]["Authorization"], "Bearer tok");
+        assert_eq!(server["headers"][crate::mcp::server::CLIENT_HEADER], "assistant");
+    }
 
     #[test]
     fn cut_off_tool_calls_are_dropped() {
@@ -733,6 +893,131 @@ mod tests {
         assert_eq!(super::reply_content(&reply("tool_use")), vec![text.clone(), call.clone()]);
         assert_eq!(super::reply_content(&reply("max_tokens")), vec![text.clone()]);
         assert!(super::reply_content(&json!({"stop_reason": "max_tokens", "content": [call]})).is_empty());
+    }
+
+    /// Every `cache_control` in a request: one per breakpoint.
+    fn breakpoints(v: &Value) -> usize {
+        match v {
+            Value::Object(m) => m.iter().map(|(k, v)| usize::from(k == "cache_control") + breakpoints(v)).sum(),
+            Value::Array(a) => a.iter().map(breakpoints).sum(),
+            _ => 0,
+        }
+    }
+
+    fn mcp_tool(name: &str) -> Value {
+        let schema = json!({"type": "object", "properties": {}});
+        json!({"name": name, "description": format!("{name} things"), "inputSchema": schema})
+    }
+
+    /// Each step of a question sends the tools and the system prompt as the same bytes, each
+    /// ending a cached prefix, and caches the conversation: three breakpoints of the four
+    /// allowed, none inside the messages, and the model and its settings as they were.
+    #[test]
+    fn every_step_marks_the_same_prefix_for_the_cache() {
+        let tools = super::api_tools(vec![mcp_tool("scale"), mcp_tool("get_logs"), mcp_tool("list_contexts")]);
+        let system = super::api_system("You are the assistant inside Recouvrance.");
+        let question = json!({"role": "user", "content": "What is broken?"});
+        let call = json!({"role": "assistant", "content": [
+            {"type": "text", "text": "Let me look"},
+            {"type": "tool_use", "id": "t1", "name": "find_problems", "input": {}},
+        ]});
+        let result =
+            json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "none"}]});
+        let first = super::request_body("claude-sonnet-5-5", &system, &tools, std::slice::from_ref(&question));
+        let second = super::request_body("claude-sonnet-5-5", &system, &tools, &[question, call, result]);
+        let ephemeral = json!({"type": "ephemeral"});
+        for body in [&first, &second] {
+            assert_eq!(body["model"], "claude-sonnet-5-5");
+            assert_eq!(body["max_tokens"], 4096);
+            assert_eq!(body["cache_control"], ephemeral);
+            assert_eq!(body["system"][0]["text"], "You are the assistant inside Recouvrance.");
+            assert_eq!(body["system"][0]["cache_control"], ephemeral);
+            let tools = body["tools"].as_array().unwrap();
+            let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
+            assert_eq!(names, ["get_logs", "list_contexts", "scale"]);
+            let marked: Vec<bool> = tools.iter().map(|t| t.get("cache_control").is_some()).collect();
+            assert_eq!(marked, [false, false, true]);
+            assert_eq!(tools[2]["cache_control"], ephemeral);
+            assert_eq!(tools[0]["input_schema"], json!({"type": "object", "properties": {}}));
+            assert_eq!(breakpoints(&body["messages"]), 0);
+            assert_eq!(breakpoints(body), 3);
+        }
+        assert_eq!(first["tools"].to_string(), second["tools"].to_string());
+        assert_eq!(first["system"].to_string(), second["system"].to_string());
+        assert_eq!(second["messages"].as_array().map(Vec::len), Some(3));
+        // No tools: the system prompt still ends a cached prefix.
+        let bare = super::request_body("claude-sonnet-5-5", &system, &super::api_tools(Vec::new()), &[]);
+        assert_eq!(breakpoints(&bare), 2);
+    }
+
+    proptest::proptest! {
+        /// Whatever tools the server lists, in any order: they go out sorted by name, only
+        /// the last one ends a cached prefix, and a request stays within the 4 breakpoints
+        /// the API allows.
+        #[test]
+        fn any_tool_list_stays_within_four_breakpoints(names in proptest::collection::vec("[a-z_]{1,12}", 0..60)) {
+            let tools = super::api_tools(names.iter().map(String::as_str).map(mcp_tool).collect());
+            let question = json!({"role": "user", "content": "q"});
+            let body = super::request_body("m", &super::api_system("s"), &tools, &[question]);
+            proptest::prop_assert!(breakpoints(&body) <= 4);
+            let sent: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
+            let mut sorted: Vec<&str> = names.iter().map(String::as_str).collect();
+            sorted.sort_unstable();
+            proptest::prop_assert_eq!(sent, sorted);
+            let marked: Vec<usize> =
+                tools.iter().enumerate().filter(|(_, t)| t.get("cache_control").is_some()).map(|(i, _)| i).collect();
+            let last: Vec<usize> = tools.len().checked_sub(1).into_iter().collect();
+            proptest::prop_assert_eq!(marked, last);
+        }
+    }
+
+    /// A refusal ends the question with the reason the API gives, and keeps none of what the
+    /// reply wrote before it.
+    #[test]
+    fn a_refusal_says_why_and_keeps_nothing() {
+        let partial = json!([{"type": "text", "text": "Here is how"}]);
+        let declined = |details: Value| {
+            let reply = json!({"stop_reason": "refusal", "stop_details": details, "content": partial});
+            super::read_reply(&reply).unwrap_err().to_string()
+        };
+        let explained = declined(json!({
+            "type": "refusal",
+            "category": "cyber",
+            "explanation": "This request was declined because it could enable cyber harm.",
+        }));
+        assert_eq!(
+            explained,
+            "Claude declined to answer: This request was declined because it could enable cyber harm. \
+             The question is dropped from the conversation; ask it another way."
+        );
+        let category = declined(json!({"type": "refusal", "category": "bio", "explanation": null}));
+        assert!(category.starts_with("Claude declined to answer (category bio). The question"), "{category}");
+        let bare = declined(Value::Null);
+        assert!(bare.starts_with("Claude declined to answer. The question"), "{bare}");
+        for message in [explained, category, bare] {
+            assert!(!message.contains("Here is how"), "{message}");
+        }
+    }
+
+    /// A reply that stops other than by answering or calling tools says so in the chat, and
+    /// keeps its text but not its tool calls.
+    #[test]
+    fn other_stops_are_said_in_the_chat() {
+        let text = json!({"type": "text", "text": "Partly"});
+        let call = json!({"type": "tool_use", "id": "t1", "name": "get_logs", "input": {}});
+        let read = |stop: Value| {
+            let reply =
+                super::read_reply(&json!({"stop_reason": stop, "content": [text.clone(), call.clone()]})).unwrap();
+            (reply.content, reply.note)
+        };
+        assert_eq!(read(json!("tool_use")), (vec![text.clone(), call.clone()], None));
+        assert_eq!(read(json!("end_turn")), (vec![text.clone()], None));
+        assert_eq!(read(json!("max_tokens")), (vec![text.clone()], Some("(the reply was cut off)".into())));
+        let (content, note) = read(json!("model_context_window_exceeded"));
+        assert_eq!(content, vec![text.clone()]);
+        assert!(note.is_some_and(|n| n.contains("start a new one")));
+        assert_eq!(read(json!("pause_turn")).1.as_deref(), Some("(the reply stopped early: pause_turn)"));
+        assert_eq!(read(Value::Null), (vec![text], Some("(the reply stopped early)".into())));
     }
 
     #[test]

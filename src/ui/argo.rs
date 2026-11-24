@@ -1,24 +1,38 @@
-//! The Argo CD page: every Application of the contexts that serve Argo CD, each under the app
-//! of apps that made it, with where it deploys mapped to a kubeconfig context. Opening one
-//! shows its page on Argo CD's cluster; its menu refreshes or syncs it.
+//! The Argo CD page: every Application of the contexts that serve Argo CD and of the Argo CD
+//! API servers (the argocd CLI's, and those set in Settings → Argo CD), each under the app of
+//! apps that made it or with the other environments of its service, with where it deploys
+//! mapped to a kubeconfig context and when it can sync next. Opening one, or a service, shows
+//! the dashboard of its service, a tab per environment (see `dashboard`); its menu opens its
+//! page on Argo CD's cluster (or in Argo CD's web UI, when read by the API), refreshes or
+//! syncs it.
+//!
+//! A hub's Applications are read again at the refresh rate; an API server's are kept live
+//! from Argo CD's stream (see `k8s::argo::api`). Both stop while no window shows the page.
 
 use std::cmp::Ordering;
 use std::collections::HashSet;
-use std::time::Instant;
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::{Duration, Instant};
 
 use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenu, PopupMenuItem};
-use gpui_kit::component::{ActiveTheme as _, Disableable as _, Sizable as _, h_flex, v_flex};
+use gpui_kit::component::{ActiveTheme as _, Disableable as _, Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use kube::Client;
 
-use crate::details::{ArgoAction, OpenNamespace, OpenOnContext, confirm_argo_action};
-use crate::k8s::argo::{self, Fleet, FleetApp, Summary};
+use crate::details::{ArgoAction, OpenOn, OpenOnContext, confirm_api_action, confirm_argo_action};
+use crate::k8s::argo::diagnosis::Res;
+use crate::k8s::argo::grouping::{self, AppKey};
+use crate::k8s::argo::windows::{NextSync, Planner};
+use crate::k8s::argo::{self, ApiRead, Fleet, FleetApp, Source, Summary, api};
 use crate::k8s::{self, ObjectRef};
+use crate::overview::column_cell as column;
 use crate::status::Tone;
+
+mod dashboard;
 
 // MARK: Grouping
 
@@ -117,35 +131,128 @@ pub fn shown_rows(
     out
 }
 
+/// A line of the list: an Application, or the heading of a service's Applications.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Line {
+    App(Shown),
+    /// The service at this index of the services.
+    Service(usize),
+}
+
+/// The lines of the services `groups` (each with its Applications): a service with one
+/// Application is that Application's row; one with several, a heading and its Applications
+/// the filter keeps under it (none when it is collapsed). A service none of whose
+/// Applications is kept is left out.
+pub fn service_lines(groups: &[(String, Vec<usize>)], keeps: &[bool], collapsed: impl Fn(usize) -> bool) -> Vec<Line> {
+    let mut out = Vec::new();
+    for (g, (_, members)) in groups.iter().enumerate() {
+        let kept: Vec<usize> = members.iter().copied().filter(|&i| keeps.get(i).copied().unwrap_or(false)).collect();
+        if kept.is_empty() {
+            continue;
+        }
+        if let [only] = members.as_slice() {
+            out.push(Line::App(Shown { ix: *only, depth: 0, context_only: false }));
+            continue;
+        }
+        out.push(Line::Service(g));
+        if !collapsed(g) {
+            out.extend(kept.into_iter().map(|ix| Line::App(Shown { ix, depth: 1, context_only: false })));
+        }
+    }
+    out
+}
+
+/// `lines` with the groups holding a favorite first: a group is a top-level line (an
+/// Application not under another, or a service's heading) with the lines under it, and moves
+/// whole; the groups keep their order otherwise. `is_favorite` says it of a line (of a
+/// service's heading: whether one of its Applications is, folded or not).
+pub fn favorites_first(lines: Vec<Line>, is_favorite: impl Fn(&Line) -> bool) -> Vec<Line> {
+    let mut groups: Vec<Vec<Line>> = Vec::new();
+    for line in lines {
+        match groups.last_mut() {
+            Some(group) if matches!(line, Line::App(s) if s.depth > 0) => group.push(line),
+            _ => groups.push(vec![line]),
+        }
+    }
+    let groups = crate::favorites::favorites_first(groups, |g| g.iter().any(&is_favorite));
+    groups.into_iter().flatten().collect()
+}
+
+/// How the list groups its Applications.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum GroupBy {
+    /// Under the app of apps that made each.
+    #[default]
+    Parent,
+    /// With the other environments of their service (`grouping::service_of`).
+    Service,
+    /// Not grouped: by name.
+    None,
+}
+
+impl GroupBy {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Parent => "Group: app of apps",
+            Self::Service => "Group: service",
+            Self::None => "Not grouped",
+        }
+    }
+}
+
 // MARK: Filters
 
 /// What the page keeps: an Application in any of the states picked (none picked: all), in
-/// the project and on the destination picked, matching the search.
+/// the project, on the destination, with the sync, health, auto-sync and labels picked,
+/// matching the search.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Filter {
     pub out_of_sync: bool,
     pub degraded: bool,
     pub failed: bool,
+    /// Only the favorites (see `crate::favorites::FavApp`).
+    pub favorites: bool,
     pub project: Option<String>,
     pub destination: Option<String>,
+    pub sync: Option<String>,
+    pub health: Option<String>,
+    pub auto_sync: Option<bool>,
+    /// Labels it must all have.
+    pub labels: Vec<(String, String)>,
     /// In lowercase.
     pub query: String,
 }
 
 impl Filter {
     /// Whether it keeps `app`, shown on `destination` (see `destination_key`), whose
-    /// searchable text in lowercase is `search`.
-    pub fn keeps(&self, app: &Summary, destination: &str, search: &str) -> bool {
+    /// searchable text in lowercase is `search`, a favorite or not.
+    pub fn keeps(&self, app: &Summary, destination: &str, search: &str, favorite: bool) -> bool {
         let any_state = self.out_of_sync || self.degraded || self.failed;
         let state = !any_state
             || (self.out_of_sync && app.sync == "OutOfSync")
             || (self.degraded && app.health == "Degraded")
             || (self.failed && argo::sync_failed(app));
         state
+            && (favorite || !self.favorites)
             && self.project.as_ref().is_none_or(|p| *p == app.project)
             && self.destination.as_ref().is_none_or(|d| d == destination)
-            && search.contains(&self.query)
+            && self.sync.as_ref().is_none_or(|s| *s == app.sync)
+            && self.health.as_ref().is_none_or(|h| *h == app.health)
+            && self.auto_sync.is_none_or(|on| on == app.automated)
+            && self.labels.iter().all(|l| app.labels.contains(l))
+            && query_keeps(&self.query, app, search)
     }
+}
+
+/// Whether each word of the search (in lowercase) is in the searchable text, a word
+/// `key=value` being a label it has instead (`key=` any value of that label).
+pub fn query_keeps(query: &str, app: &Summary, search: &str) -> bool {
+    query.split_whitespace().all(|word| match word.split_once('=') {
+        Some((key, value)) if !key.is_empty() => {
+            app.labels.iter().any(|(k, v)| k.to_lowercase() == key && (value.is_empty() || v.to_lowercase() == value))
+        }
+        _ => search.contains(word),
+    })
 }
 
 /// Where an Application is shown to deploy, and filtered by: its context, else the cluster
@@ -157,31 +264,54 @@ fn destination_key(a: &FleetApp) -> &str {
 /// What the search looks in, in lowercase.
 fn searchable(a: &FleetApp) -> String {
     let app = &a.app;
+    let source = a.source.label();
     let parts = [
         app.name.as_str(),
         &app.namespace,
         &app.project,
         destination_key(a),
         &a.dest.namespace,
-        &a.hub.context,
+        &source,
         app.revision.as_deref().unwrap_or_default(),
     ];
     parts.join(" ").to_lowercase()
 }
 
-/// An Application, the same across reads: its hub, namespace and name.
-type Key = (String, String, String);
+/// An Application, the same across reads and sources: its Argo CD, namespace and name.
+type Key = AppKey;
 
 fn key(a: &FleetApp) -> Key {
-    (a.hub.context.clone(), a.app.namespace.clone(), a.app.name.clone())
+    (a.instance.clone(), a.app.namespace.clone(), a.app.name.clone())
+}
+
+/// `a` as a favorite: by its Argo CD instance (`FleetApp::instance`, the same whichever way
+/// it is read), namespace and name; read on a hub, also by the hub's own name for its Argo CD
+/// (`context:<hub>`), which a star put before the hub's server was set used. Read by the API,
+/// by the server alone.
+fn favorite(a: &FleetApp) -> crate::favorites::Favorite {
+    let context = match &a.source {
+        Source::Hub(hub) => Some(hub.context.clone()),
+        Source::Api(_) => None,
+    };
+    crate::favorites::Favorite::Application(crate::favorites::FavApp {
+        argocd: a.instance.clone(),
+        namespace: a.app.namespace.clone(),
+        name: a.app.name.clone(),
+        context,
+    })
 }
 
 // MARK: Rows
+
+/// Most labels offered to filter by.
+const MAX_LABELS: usize = 500;
 
 /// A read of every Application, with what the page needs worked out once (off the UI thread).
 struct Rows {
     fleet: Fleet,
     order: Vec<(usize, usize)>,
+    /// Every Application by name, for the list not grouped.
+    flat: Vec<usize>,
     parents: Vec<Option<usize>>,
     /// How many Applications each one made, and how many under it are red.
     children: Vec<usize>,
@@ -190,16 +320,29 @@ struct Rows {
     search: Vec<String>,
     projects: Vec<String>,
     destinations: Vec<String>,
+    healths: Vec<String>,
+    /// The labels present (`key`, `value`), to filter by.
+    labels: Vec<(String, String)>,
     /// How many are out of sync, Degraded, and with a failed sync.
     counts: (usize, usize, usize),
+    /// The services, each with its Applications by name.
+    services: Vec<(String, Vec<usize>)>,
+    /// When each can sync next, as of `now`.
+    next: Vec<NextSync>,
+    now: jiff::Timestamp,
 }
 
 impl Rows {
-    fn new(fleet: Fleet) -> Self {
+    fn new(fleet: Fleet, label_key: &str, plan: &mut Planner) -> Self {
+        let now = plan.now();
         let apps = &fleet.apps;
         let parents: Vec<Option<usize>> = apps.iter().map(|a| a.parent).collect();
-        let sort_key = |i: usize| (&apps[i].app.name, &apps[i].hub.context, &apps[i].app.namespace);
-        let order = tree_order(&parents, |a, b| sort_key(a).cmp(&sort_key(b)));
+        let labels_of: Vec<String> = apps.iter().map(|a| a.source.label()).collect();
+        let sort_key = |i: usize| (&apps[i].app.name, &labels_of[i], &apps[i].app.namespace);
+        let cmp = |a: usize, b: usize| sort_key(a).cmp(&sort_key(b));
+        let order = tree_order(&parents, cmp);
+        let mut flat: Vec<usize> = (0..apps.len()).collect();
+        flat.sort_by(|a, b| cmp(*a, *b));
         let tones: Vec<Tone> = apps.iter().map(|a| argo::attention(&a.app)).collect();
         let (mut children, mut failing) = (vec![0; apps.len()], vec![0; apps.len()]);
         for (i, tone) in tones.iter().enumerate() {
@@ -212,12 +355,18 @@ impl Rows {
                 }
             }
         }
-        let mut projects: Vec<String> = apps.iter().map(|a| a.app.project.clone()).collect();
-        projects.sort();
-        projects.dedup();
-        let mut destinations: Vec<String> = apps.iter().map(|a| destination_key(a).to_string()).collect();
-        destinations.sort();
-        destinations.dedup();
+        let sorted = |mut v: Vec<String>| {
+            v.sort();
+            v.dedup();
+            v
+        };
+        let projects = sorted(apps.iter().map(|a| a.app.project.clone()).collect());
+        let destinations = sorted(apps.iter().map(|a| destination_key(a).to_string()).collect());
+        let healths = sorted(apps.iter().map(|a| a.app.health.clone()).collect());
+        let mut labels: Vec<(String, String)> = apps.iter().flat_map(|a| a.app.labels.iter().cloned()).collect();
+        labels.sort();
+        labels.dedup();
+        labels.truncate(MAX_LABELS);
         let count = |f: &dyn Fn(&Summary) -> bool| apps.iter().filter(|a| f(&a.app)).count();
         let counts = (
             count(&|s: &Summary| s.sync == "OutOfSync"),
@@ -225,7 +374,46 @@ impl Rows {
             count(&argo::sync_failed),
         );
         let search = apps.iter().map(searchable).collect();
-        Self { fleet, order, parents, children, failing, tones, search, projects, destinations, counts }
+        let names: Vec<String> =
+            apps.iter().map(|a| grouping::service_of(&a.app.name, &a.app.labels, label_key)).collect();
+        let mut services = grouping::by_service(&names);
+        for (_, members) in &mut services {
+            members.sort_by(|a, b| cmp(*a, *b));
+        }
+        let next = apps.iter().map(|a| fleet.next_sync(a, plan)).collect();
+        Self {
+            fleet,
+            order,
+            flat,
+            parents,
+            children,
+            failing,
+            tones,
+            search,
+            projects,
+            destinations,
+            healths,
+            labels,
+            counts,
+            services,
+            next,
+            now,
+        }
+    }
+}
+
+/// The color of a group: red when one of them is, amber when one is on its way, green when
+/// all are.
+fn group_tone(tones: impl Iterator<Item = Tone>) -> Tone {
+    let tones: Vec<Tone> = tones.collect();
+    if tones.contains(&Tone::Bad) {
+        Tone::Bad
+    } else if tones.contains(&Tone::Busy) {
+        Tone::Busy
+    } else if !tones.is_empty() && tones.iter().all(|t| *t == Tone::Good) {
+        Tone::Good
+    } else {
+        Tone::Done
     }
 }
 
@@ -234,32 +422,47 @@ impl Rows {
 /// Column widths.
 const NAME: f32 = 340.;
 const INDENT: f32 = 16.;
-/// The space kept for a row's menu, so no column draws under it.
+/// The space kept for a row's menu, so no column draws under it. The header keeps that room
+/// too, so its columns shrink like the rows' in a narrow window (`column`).
 const MENU: f32 = 24.;
-
-/// A column, the same in the header and the rows so they line up. In a narrow window the wide
-/// columns give up width (down to half of it, their text cut with an ellipsis); the short ones
-/// keep theirs. Both shrink alike: the header keeps room for the menu, as the rows do.
-fn column(w: f32, shrinks: bool) -> Div {
-    let d = div().w(px(w)).overflow_hidden().text_ellipsis().whitespace_nowrap();
-    if shrinks { d.flex_shrink(1.).min_w(px(w / 2.)) } else { d.flex_none() }
-}
+/// How often the API servers' feeds are looked at for news, and the longest the next sync
+/// times go without being worked out again.
+const TICK: Duration = Duration::from_secs(1);
+const RECOMPUTE: Duration = Duration::from_secs(60);
 
 pub struct ArgoView {
     clusters: Vec<(String, Client)>,
+    /// The hubs' Applications, as last read; None before the first read ends.
+    hub: Option<Arc<Fleet>>,
+    /// When each Application can sync next, kept for a minute (see `rebuild`).
+    plan: Arc<Mutex<Planner>>,
+    /// When the hubs' read shown started: an older one finishing later never replaces it.
+    hub_started: Option<Instant>,
+    /// The API servers' feeds this page holds while it is shown.
+    watches: Vec<api::Watch>,
+    /// What could not be used of the API servers' config.
+    config_errors: Vec<String>,
     rows: Option<Rows>,
-    /// When the read shown started: an older one finishing later never replaces it.
-    started: Option<Instant>,
+    /// Works out the rows off the UI thread; a newer one replaces the one running.
+    build: crate::latest::Latest,
     filter: Filter,
+    group_by: GroupBy,
     search: Entity<InputState>,
-    /// Applications whose children are hidden.
+    /// Applications whose children are hidden, and services whose Applications are.
     collapsed: HashSet<Key>,
-    /// The rows on screen, worked out when the data, the filter or a group changes.
-    shown: Vec<Shown>,
+    collapsed_services: HashSet<String>,
+    /// The lines on screen, worked out when the data, the filter or a group changes.
+    lines: Vec<Line>,
     /// How many Applications the filter keeps.
     kept: usize,
-    /// Reads while the page is shown.
+    favorites: Entity<crate::favorites::Favorites>,
+    /// Which Applications (by index in the rows shown) are favorites, and how many.
+    starred: Vec<bool>,
+    starred_count: usize,
+    /// Reads the hubs while the page is shown.
     _poll: Task<()>,
+    /// Holds the API servers' feeds while the page is shown.
+    _feeds: Task<()>,
     /// A read right after a write.
     after_write: crate::latest::Latest,
     /// With no hub found: the context being asked whether it serves Applications, and what
@@ -267,22 +470,36 @@ pub struct ArgoView {
     checking: Option<String>,
     check_note: Option<String>,
     check: crate::latest::Latest,
+    /// The dashboard of a service, shown instead of the list while it is open.
+    dashboard: Option<dashboard::Dashboard>,
     _subs: Vec<Subscription>,
 }
 
 impl EventEmitter<OpenOnContext> for ArgoView {}
-impl EventEmitter<OpenNamespace> for ArgoView {}
+impl EventEmitter<OpenOn> for ArgoView {}
 
 impl ArgoView {
-    pub fn new(clusters: Vec<(String, Client)>, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let search = cx.new(|cx| InputState::new(window, cx).placeholder("Search Applications…"));
-        let subs = vec![cx.subscribe(&search, |this, state, ev: &InputEvent, cx| {
-            if matches!(ev, InputEvent::Change) {
-                this.filter.query = state.read(cx).value().to_lowercase();
-                this.refilter();
+    pub fn new(
+        clusters: Vec<(String, Client)>,
+        favorites: Entity<crate::favorites::Favorites>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let search = cx.new(|cx| InputState::new(window, cx).placeholder("Search Applications, or key=value…"));
+        let subs = vec![
+            cx.subscribe(&search, |this, state, ev: &InputEvent, cx| {
+                if matches!(ev, InputEvent::Change) {
+                    this.filter.query = state.read(cx).value().to_lowercase();
+                    this.refilter(cx);
+                    cx.notify();
+                }
+            }),
+            // A star put here, on an Application's page or in the sidebar.
+            cx.observe(&favorites, |this, _, cx| {
+                this.refilter(cx);
                 cx.notify();
-            }
-        })];
+            }),
+        ];
         let poll = {
             let clusters = clusters.clone();
             cx.spawn(async move |this, cx| {
@@ -292,48 +509,147 @@ impl ArgoView {
                         break;
                     }
                     let started = Instant::now();
-                    let rows = read(clusters.clone(), &exec).await;
-                    if this.update(cx, |this, cx| this.set_rows(rows, started, cx)).is_err() {
+                    let fleet = argo::fleet(clusters.clone()).await;
+                    if this.update(cx, |this, cx| this.set_hub(fleet, started, cx)).is_err() {
                         break;
                     }
                     exec.timer(crate::settings::secs(crate::settings::get().metrics_refresh)).await;
                 }
             })
         };
+        let feeds = cx.spawn(async move |this, cx| {
+            loop {
+                let exec = cx.background_executor().clone();
+                if !crate::app::wait_visible(&this, cx, &exec).await {
+                    break;
+                }
+                let generation = api::generation();
+                let stamp = exec.spawn(async { api::config_stamp() }).await;
+                let endpoints = exec.spawn(async { api::endpoints() }).await;
+                let watches: Vec<api::Watch> = endpoints.list.iter().filter(|e| e.on).map(api::watch).collect();
+                let held = this.update(cx, |this, cx| {
+                    this.config_errors = endpoints.errors;
+                    this.watches = watches;
+                    this.rebuild(cx);
+                });
+                if held.is_err() {
+                    break;
+                }
+                let (mut seen, mut built) = (api::changes(), Instant::now());
+                loop {
+                    exec.timer(TICK).await;
+                    let Ok(shown) = this.update(cx, |_, cx| crate::app::is_visible(cx.entity_id(), cx)) else { return };
+                    // A new `argocd login`, or a token set: read the servers again.
+                    let relogged = exec.spawn(async { api::config_stamp() }).await != stamp;
+                    if !shown || relogged || api::generation() != generation {
+                        // Hidden, or the servers changed: the feeds stop unless another page holds them.
+                        // Hidden, the dashboard's read stops too; it reads again once shown.
+                        let _ = this.update(cx, |this, cx| {
+                            this.watches.clear();
+                            if !shown {
+                                this.dashboard_hidden(cx);
+                            }
+                        });
+                        break;
+                    }
+                    let now = api::changes();
+                    if now != seen || built.elapsed() >= RECOMPUTE {
+                        (seen, built) = (now, Instant::now());
+                        let _ = this.update(cx, Self::rebuild);
+                    }
+                }
+            }
+        });
         Self {
             clusters,
+            hub: None,
+            plan: Arc::new(Mutex::new(Planner::new(jiff::Timestamp::UNIX_EPOCH))),
+            hub_started: None,
+            watches: Vec::new(),
+            config_errors: Vec::new(),
             rows: None,
-            started: None,
+            build: Default::default(),
             filter: Filter::default(),
+            group_by: GroupBy::default(),
             search,
             collapsed: HashSet::new(),
-            shown: Vec::new(),
+            collapsed_services: HashSet::new(),
+            lines: Vec::new(),
             kept: 0,
+            favorites,
+            starred: Vec::new(),
+            starred_count: 0,
             _poll: poll,
+            _feeds: feeds,
             after_write: Default::default(),
             checking: None,
             check_note: None,
             check: Default::default(),
+            dashboard: None,
             _subs: subs,
         }
     }
 
-    /// Show a read, unless one that started later is shown already.
-    fn set_rows(&mut self, rows: Rows, started: Instant, cx: &mut Context<Self>) {
-        if self.started.is_some_and(|shown| shown > started) {
+    /// Show a read of the hubs, unless one that started later is shown already.
+    fn set_hub(&mut self, fleet: Fleet, started: Instant, cx: &mut Context<Self>) {
+        if self.hub_started.is_some_and(|shown| shown > started) {
             return;
         }
-        self.started = Some(started);
-        self.rows = Some(rows);
-        self.refilter();
-        cx.notify();
+        self.hub_started = Some(started);
+        self.hub = Some(Arc::new(fleet));
+        self.rebuild(cx);
     }
 
-    /// Read again now (after a write).
+    /// Work out the rows again from the hubs' last read and the API servers' feeds, off the
+    /// UI thread. Nothing to show before the hubs are read, unless a server is.
+    fn rebuild(&mut self, cx: &mut Context<Self>) {
+        let feeds: Vec<(Arc<api::Endpoint>, Arc<Mutex<api::FeedState>>)> =
+            self.watches.iter().map(|w| (w.endpoint.clone(), w.state.clone())).collect();
+        if self.hub.is_none() && feeds.is_empty() {
+            return;
+        }
+        let hub = self.hub.clone();
+        let connected: Vec<String> = self.clusters.iter().map(|(n, _)| n.clone()).collect();
+        let config_errors = self.config_errors.clone();
+        let (label_key, servers) = crate::settings::with(|s| (s.argocd_group_label.clone(), s.argocd_servers.clone()));
+        let plan = self.plan.clone();
+        let exec = cx.background_executor().clone();
+        let work = async move {
+            exec.spawn(async move {
+                let mut fleet = hub.map_or_default(|h| (*h).clone());
+                let reads = feeds
+                    .into_iter()
+                    .map(|(endpoint, state)| ApiRead {
+                        endpoint,
+                        state: state.lock().unwrap_or_else(PoisonError::into_inner).clone(),
+                    })
+                    .collect();
+                argo::add_api(&mut fleet, reads, &argo::targets(), &connected, &servers);
+                fleet.errors.extend(config_errors);
+                // When each can sync next is worked out anew each minute; in between, the
+                // answers kept are reused (the same windows give the same answer).
+                let mut plan = plan.lock().unwrap_or_else(PoisonError::into_inner);
+                let now = jiff::Timestamp::now();
+                if now.as_second() - plan.now().as_second() >= RECOMPUTE.as_secs() as i64 {
+                    *plan = Planner::new(now);
+                }
+                Rows::new(fleet, &label_key, &mut plan)
+            })
+            .await
+        };
+        self.build.spawn(cx, work, |this, rows, cx| {
+            this.rows = Some(rows);
+            this.refilter(cx);
+            this.dashboard_changed(cx);
+            cx.notify();
+        });
+    }
+
+    /// Read the hubs again now (after a write).
     fn reload(&mut self, cx: &mut Context<Self>) {
-        let (clusters, exec, started) = (self.clusters.clone(), cx.background_executor().clone(), Instant::now());
-        self.after_write.spawn(cx, async move { read(clusters, &exec).await }, move |this, rows, cx| {
-            this.set_rows(rows, started, cx);
+        let (clusters, started) = (self.clusters.clone(), Instant::now());
+        self.after_write.spawn(cx, argo::fleet(clusters), move |this, fleet, cx| {
+            this.set_hub(fleet, started, cx);
         });
     }
 
@@ -362,16 +678,17 @@ impl ArgoView {
         });
     }
 
-    /// What the page shows when no context serves Applications: why, and the contexts that
-    /// were not asked because their login may prompt, each with a button to ask it.
+    /// What the page shows when no context serves Applications and no Argo CD API server is
+    /// set: why, and the contexts that were not asked because their login may prompt, each
+    /// with a button to ask it.
     fn no_hub(&self, fleet: &Fleet, cx: &mut Context<Self>) -> AnyElement {
         /// The most offered: the likeliest first, the rest are in Settings → Contexts.
         const OFFERED: usize = 12;
         let theme = cx.theme().clone();
         let chosen = crate::settings::with(|s| s.argocd_contexts.clone());
         let intro = if chosen.is_empty() {
-            "No context serves Argo CD's Applications. The connected clusters were asked, and the other contexts \
-             that need no login of their own."
+            "No context serves Argo CD's Applications, and no Argo CD server is logged in to. The connected \
+             clusters were asked, and the other contexts that need no login of their own."
                 .to_string()
         } else {
             format!(
@@ -386,6 +703,10 @@ impl ArgoView {
             .text_sm()
             .text_color(theme.muted_foreground)
             .child(intro)
+            .child(
+                "Without access to Argo CD's cluster, read Argo CD by its API: log in with `argocd login <server>`, \
+                 or add its address and a token in Settings → Argo CD.",
+            )
             .children(fleet.errors.iter().map(|e| div().text_color(theme.danger).child(e.clone())))
             .when(!fleet.not_asked.is_empty(), |d| {
                 d.child(
@@ -421,48 +742,107 @@ impl ArgoView {
             .into_any_element()
     }
 
-    fn refilter(&mut self) {
+    fn refilter(&mut self, cx: &App) {
         let Some(rows) = &self.rows else {
-            self.shown.clear();
+            self.lines.clear();
             self.kept = 0;
+            self.starred.clear();
+            self.starred_count = 0;
             return;
         };
         let apps = &rows.fleet.apps;
+        let favorites = self.favorites.read(cx);
+        self.starred = apps.iter().map(|a| favorites.has(&favorite(a))).collect();
+        self.starred_count = self.starred.iter().filter(|s| **s).count();
+        let starred = &self.starred;
         let keeps: Vec<bool> = apps
             .iter()
             .enumerate()
-            .map(|(i, a)| self.filter.keeps(&a.app, destination_key(a), &rows.search[i]))
+            .map(|(i, a)| self.filter.keeps(&a.app, destination_key(a), &rows.search[i], starred[i]))
             .collect();
         self.kept = keeps.iter().filter(|k| **k).count();
-        let collapsed = &self.collapsed;
-        self.shown = shown_rows(&rows.order, &rows.parents, &keeps, |i| collapsed.contains(&key(&apps[i])));
+        let (collapsed, services) = (&self.collapsed, &self.collapsed_services);
+        let lines = match self.group_by {
+            GroupBy::Parent => shown_rows(&rows.order, &rows.parents, &keeps, |i| collapsed.contains(&key(&apps[i])))
+                .into_iter()
+                .map(Line::App)
+                .collect(),
+            GroupBy::Service => service_lines(&rows.services, &keeps, |g| services.contains(&rows.services[g].0)),
+            GroupBy::None => rows
+                .flat
+                .iter()
+                .filter(|&&i| keeps[i])
+                .map(|&ix| Line::App(Shown { ix, depth: 0, context_only: false }))
+                .collect(),
+        };
+        // Favorites first, in every grouping: with the app of apps or service they are in.
+        self.lines = favorites_first(lines, |line| match line {
+            Line::App(s) => starred[s.ix],
+            Line::Service(g) => rows.services[*g].1.iter().any(|&i| starred[i]),
+        });
     }
 
     fn change_filter(&mut self, change: impl FnOnce(&mut Filter), cx: &mut Context<Self>) {
         change(&mut self.filter);
-        self.refilter();
+        self.refilter(cx);
         cx.notify();
+    }
+
+    fn set_group_by(&mut self, by: GroupBy, cx: &mut Context<Self>) {
+        self.group_by = by;
+        self.refilter(cx);
+        cx.notify();
+    }
+
+    /// Star or unstar the Application (kept in favorites.json; the page sorts again when the
+    /// favorites change). Unstarring removes it under any name of its Argo CD.
+    fn toggle_favorite(&mut self, k: &Key, cx: &mut Context<Self>) {
+        let Some(f) = self.find(k).map(favorite) else { return };
+        self.favorites.update(cx, |favs, cx| favs.toggle(f, cx));
     }
 
     fn toggle_group(&mut self, k: Key, cx: &mut Context<Self>) {
         if !self.collapsed.remove(&k) {
             self.collapsed.insert(k);
         }
-        self.refilter();
+        self.refilter(cx);
         cx.notify();
     }
 
-    /// Fold every app of apps, or unfold them all.
+    fn toggle_service(&mut self, service: String, cx: &mut Context<Self>) {
+        if !self.collapsed_services.remove(&service) {
+            self.collapsed_services.insert(service);
+        }
+        self.refilter(cx);
+        cx.notify();
+    }
+
+    /// Whether some group is folded, the way the list is grouped.
+    fn any_collapsed(&self) -> bool {
+        match self.group_by {
+            GroupBy::Parent => !self.collapsed.is_empty(),
+            GroupBy::Service => !self.collapsed_services.is_empty(),
+            GroupBy::None => false,
+        }
+    }
+
+    /// Fold every group, or unfold them all.
     fn toggle_all(&mut self, cx: &mut Context<Self>) {
-        if self.collapsed.is_empty() {
-            if let Some(rows) = &self.rows {
+        let fold = !self.any_collapsed();
+        match (self.group_by, &self.rows) {
+            (GroupBy::Parent, Some(rows)) if fold => {
                 let apps = &rows.fleet.apps;
                 self.collapsed = (0..apps.len()).filter(|&i| rows.children[i] > 0).map(|i| key(&apps[i])).collect();
             }
-        } else {
-            self.collapsed.clear();
+            (GroupBy::Service, Some(rows)) if fold => {
+                self.collapsed_services =
+                    rows.services.iter().filter(|(_, m)| m.len() > 1).map(|(s, _)| s.clone()).collect();
+            }
+            (GroupBy::Parent, _) => self.collapsed.clear(),
+            (GroupBy::Service, _) => self.collapsed_services.clear(),
+            _ => {}
         }
-        self.refilter();
+        self.refilter(cx);
         cx.notify();
     }
 
@@ -470,39 +850,53 @@ impl ArgoView {
         self.rows.as_ref()?.fleet.apps.iter().find(|a| key(a) == *k)
     }
 
-    /// Open the Application's page, on Argo CD's cluster.
+    /// Open the Application's page, on Argo CD's cluster; one read by the API, in Argo CD's
+    /// web UI.
     fn open(&mut self, k: &Key, cx: &mut Context<Self>) {
         let Some(a) = self.find(k) else { return };
-        let obj = ObjectRef {
-            kind: argo::application_kind(),
-            name: a.app.name.clone(),
-            namespace: Some(a.app.namespace.clone()),
-            uid: String::new(),
-        };
-        let ev = OpenOnContext { context: a.hub.context.clone(), client: a.hub.client.clone(), obj };
-        cx.emit(ev);
+        match &a.source {
+            Source::Hub(hub) => {
+                let obj = ObjectRef {
+                    kind: argo::application_kind(),
+                    name: a.app.name.clone(),
+                    namespace: Some(a.app.namespace.clone()),
+                    uid: String::new(),
+                };
+                let ev = OpenOnContext { context: hub.context.clone(), client: hub.client.clone(), obj };
+                cx.emit(ev);
+            }
+            Source::Api(endpoint) => crate::forwards::open_url(&endpoint.web_url(&a.app.namespace, &a.app.name)),
+        }
     }
 
     /// Open the namespace it deploys into, on the context that reaches its cluster.
     fn open_destination(&mut self, k: &Key, cx: &mut Context<Self>) {
         let Some(a) = self.find(k) else { return };
         let Some(context) = a.on.clone().filter(|_| !a.dest.namespace.is_empty()) else { return };
-        let ev = OpenNamespace { context, namespace: a.dest.namespace.clone() };
+        let ev = OpenOn { context, res: Res::namespace(&a.dest.namespace) };
         cx.emit(ev);
     }
 
-    /// Confirm, then refresh or sync it (write mode and the hub's protection apply).
+    /// Confirm, then refresh or sync it, by the way it was read: the hub's Kubernetes API
+    /// (write mode and the hub's protection apply), or Argo CD's API (write mode applies,
+    /// confirmed as a protected context's).
     fn act(&mut self, k: &Key, action: ArgoAction, window: &mut Window, cx: &mut Context<Self>) {
         let Some(a) = self.find(k).cloned() else { return };
-        let view = cx.entity().downgrade();
-        let done = move |_: &mut Window, cx: &mut App| {
-            let _ = view.update(cx, Self::reload);
-        };
-        confirm_argo_action(&a.hub, &a.app.namespace, &a.app.name, action, done, window, cx);
+        match &a.source {
+            Source::Hub(hub) => {
+                let view = cx.entity().downgrade();
+                let done = move |_: &mut Window, cx: &mut App| {
+                    let _ = view.update(cx, Self::reload);
+                };
+                confirm_argo_action(hub, &a.app.namespace, &a.app.name, action, done, window, cx);
+            }
+            Source::Api(endpoint) => confirm_api_action(endpoint, &a.app.namespace, &a.app.name, action, window, cx),
+        }
     }
 
-    fn several_hubs(&self) -> bool {
-        self.rows.as_ref().is_some_and(|r| r.fleet.hubs.len() > 1)
+    /// Several hubs or servers are read: each row says which.
+    fn several_sources(&self) -> bool {
+        self.rows.as_ref().is_some_and(|r| r.fleet.hubs.len() + r.fleet.servers.len() > 1)
     }
 
     fn row(&self, i: usize, s: Shown, cx: &Context<Self>) -> AnyElement {
@@ -512,13 +906,33 @@ impl ArgoView {
         let k = key(a);
         let view = cx.entity().downgrade();
         let open_key = k.clone();
-        let open = cx.listener(move |this, _, _, cx| this.open(&open_key, cx));
+        let open = cx.listener(move |this, _, _, cx| this.open_dashboard(&open_key, cx));
         let cx: &App = cx;
         let theme = cx.theme();
         let muted = theme.muted_foreground;
         let indent = INDENT * s.depth.min(8) as f32;
-        let grouped = rows.children[s.ix] > 0;
+        let grouped = self.group_by == GroupBy::Parent && rows.children[s.ix] > 0;
         let collapsed = self.collapsed.contains(&k);
+        let starred = self.starred.get(s.ix).copied().unwrap_or_default();
+        let star = {
+            let (view, k) = (view.clone(), k.clone());
+            div()
+                .id(("argo-star", i))
+                .flex_none()
+                .cursor_pointer()
+                .when(!starred, |d| {
+                    d.opacity(0.).group_hover(SharedString::from(format!("argo-row-{i}")), |s| s.opacity(0.5))
+                })
+                .on_click(move |_, _, cx| {
+                    cx.stop_propagation();
+                    let _ = view.update(cx, |this, cx| this.toggle_favorite(&k, cx));
+                })
+                .child(if starred {
+                    Icon::new(component::IconName::StarFill).size_3p5().text_color(yellow())
+                } else {
+                    Icon::new(Lucide::Star).size_3p5()
+                })
+        };
         let toggle = {
             let (view, k) = (view.clone(), k.clone());
             Button::new(("argo-group", i))
@@ -540,6 +954,13 @@ impl ArgoView {
         let destination = match &a.on {
             Some(context) => div().child(argo::destination_text(context, &a.dest.namespace)),
             None => div().text_color(muted).child(argo::destination_text(&a.dest.cluster, &a.dest.namespace)),
+        };
+        let next = &rows.next[s.ix];
+        let next_color = match next {
+            NextSync::Now | NextSync::NoWindow => muted,
+            NextSync::At(_) => theme.warning,
+            NextSync::NotSoon => theme.danger,
+            NextSync::Unknown(_) => muted,
         };
         let opener = h_flex()
             .id(("argo-open", i))
@@ -569,10 +990,11 @@ impl ArgoView {
                     .when(grouped, |d| {
                         d.child(div().flex_none().text_xs().text_color(muted).child(rows.children[s.ix].to_string()))
                     })
-                    .when(rows.failing[s.ix] > 0, |d| {
+                    .when(grouped && rows.failing[s.ix] > 0, |d| {
                         let n = rows.failing[s.ix];
                         d.child(div().flex_none().text_xs().text_color(theme.danger).child(format!("{n} red")))
-                    }),
+                    })
+                    .child(star),
             )
             .child(column(130., true).text_color(muted).child(app.project.clone()))
             .child(
@@ -593,10 +1015,12 @@ impl ArgoView {
             )
             .child(column(260., true).child(destination))
             .child(column(70., false).text_color(muted).child(if app.automated { "On" } else { "Off" }))
+            .child(column(110., true).text_color(next_color).child(next.text(rows.now)))
             .child(column(190., true).children(last_sync))
-            .when(self.several_hubs(), |d| d.child(column(150., true).text_color(muted).child(a.hub.context.clone())));
+            .when(self.several_sources(), |d| d.child(column(150., true).text_color(muted).child(a.source.label())));
         h_flex()
             .id(("argo-row", i))
+            .group(SharedString::from(format!("argo-row-{i}")))
             .w_full()
             .gap_1()
             .px_2()
@@ -611,9 +1035,69 @@ impl ArgoView {
             .child(opener)
             .child(div().w(px(MENU)).flex_none().child(row_menu(
                 &k,
+                matches!(a.source, Source::Api(_)),
                 a.on.is_some() && !a.dest.namespace.is_empty(),
+                Offers::of(app),
                 view,
             )))
+            .into_any_element()
+    }
+
+    /// The heading of a service's Applications: its name, how many there are, how many are
+    /// synced and red, and the worst of their colors.
+    fn service_row(&self, i: usize, g: usize, cx: &Context<Self>) -> AnyElement {
+        let Some(rows) = &self.rows else { return div().into_any_element() };
+        let Some((service, members)) = rows.services.get(g) else { return div().into_any_element() };
+        let view = cx.entity().downgrade();
+        let collapsed = self.collapsed_services.contains(service);
+        let flip = {
+            let (service, view) = (service.clone(), view.clone());
+            move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
+                let service = service.clone();
+                let _ = view.update(cx, |this, cx| this.toggle_service(service, cx));
+            }
+        };
+        let open = move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
+            let _ = view.update(cx, |this, cx| this.open_service(g, cx));
+        };
+        let cx: &App = cx;
+        let theme = cx.theme();
+        let muted = theme.muted_foreground;
+        let tone = group_tone(members.iter().map(|&m| rows.tones[m]));
+        let red = members.iter().filter(|&&m| rows.tones[m] == Tone::Bad).count();
+        let synced = members.iter().filter(|&&m| rows.fleet.apps[m].app.sync == "Synced").count();
+        h_flex()
+            .id(("argo-service", i))
+            .w_full()
+            .gap_1()
+            .px_2()
+            .py_0p5()
+            .text_sm()
+            .border_b_1()
+            .border_color(theme.border)
+            .bg(theme.muted)
+            .cursor_pointer()
+            .child(
+                div().id(("argo-service-fold", i)).w(px(20.)).flex_none().on_click(flip).child(
+                    Icon::new(if collapsed { Lucide::ChevronRight } else { Lucide::ChevronDown })
+                        .size_4()
+                        .text_color(muted),
+                ),
+            )
+            .child(
+                h_flex()
+                    .id(("argo-service-open", i))
+                    .flex_1()
+                    .min_w_0()
+                    .gap_2()
+                    .overflow_hidden()
+                    .on_click(open)
+                    .child(div().size(px(7.)).flex_none().rounded_full().bg(tone.color(cx)))
+                    .child(div().font_weight(FontWeight::MEDIUM).whitespace_nowrap().child(service.clone()))
+                    .child(div().text_xs().text_color(muted).child(crate::plural::count(members.len(), "Application")))
+                    .child(div().text_xs().text_color(muted).child(format!("{synced} synced")))
+                    .when(red > 0, |d| d.child(div().text_xs().text_color(theme.danger).child(format!("{red} red")))),
+            )
             .into_any_element()
     }
 
@@ -634,14 +1118,15 @@ impl ArgoView {
             .child(cell(90., false, "Revision"))
             .child(cell(260., true, "Destination"))
             .child(cell(70., false, "Auto-sync"))
+            .child(cell(110., true, "Next sync"))
             .child(cell(190., true, "Last sync"))
-            .when(self.several_hubs(), |d| d.child(cell(150., true, "Argo CD on")))
+            .when(self.several_sources(), |d| d.child(cell(150., true, "Argo CD")))
             // Where the rows have their menu (after a 4 px gap, the header's are 12): the columns
             // get the same room in both, so they shrink alike.
             .child(div().w(px(MENU - 8.)).flex_none())
     }
 
-    /// The search, the state toggles with their counts, and the project and destination pickers.
+    /// The search, the state toggles with their counts, the pickers, and the grouping.
     fn toolbar(&self, cx: &mut Context<Self>) -> Div {
         let (out_of_sync, degraded, failed) = self.rows.as_ref().map_or((0, 0, 0), |r| r.counts);
         let toggle = |id: &'static str, label: &str, n: usize, on: bool, flip: fn(&mut Filter)| {
@@ -652,47 +1137,71 @@ impl ArgoView {
                 .label(format!("{label} ({n})"))
                 .on_click(cx.listener(move |this, _, _, cx| this.change_filter(flip, cx)))
         };
-        let projects = self.rows.as_ref().map_or_else(Vec::new, |r| r.projects.clone());
-        let destinations = self.rows.as_ref().map_or_else(Vec::new, |r| r.destinations.clone());
+        let list = |f: fn(&Rows) -> &Vec<String>| self.rows.as_ref().map_or_else(Vec::new, |r| f(r).clone());
+        let projects = list(|r| &r.projects);
+        let destinations = list(|r| &r.destinations);
+        let healths = list(|r| &r.healths);
+        let labels = self.rows.as_ref().map_or_else(Vec::new, |r| r.labels.clone());
         let view = cx.entity().downgrade();
-        let collapse_label = if self.collapsed.is_empty() { "Collapse all" } else { "Expand all" };
+        let collapse_label = if self.any_collapsed() { "Expand all" } else { "Collapse all" };
+        let f = &self.filter;
+        let auto_sync = f.auto_sync.map(|on| if on { AUTO_ON } else { AUTO_OFF }.to_string());
         h_flex()
             .gap_2()
             .flex_wrap()
             .child(div().w(px(280.)).child(Input::new(&self.search).small().cleanable(true)))
-            .child(toggle("argo-out-of-sync", "Out of sync", out_of_sync, self.filter.out_of_sync, |f| {
+            .child(toggle("argo-out-of-sync", "Out of sync", out_of_sync, f.out_of_sync, |f| {
                 f.out_of_sync = !f.out_of_sync;
             }))
-            .child(toggle("argo-degraded", "Degraded", degraded, self.filter.degraded, |f| f.degraded = !f.degraded))
-            .child(toggle("argo-failed", "Failed sync", failed, self.filter.failed, |f| f.failed = !f.failed))
-            .child(picker(
-                "argo-project",
-                "All projects",
-                self.filter.project.clone(),
-                projects,
-                view.clone(),
-                |f, v| {
-                    f.project = v;
-                },
-            ))
+            .child(toggle("argo-degraded", "Degraded", degraded, f.degraded, |f| f.degraded = !f.degraded))
+            .child(toggle("argo-failed", "Failed sync", failed, f.failed, |f| f.failed = !f.failed))
+            .child(toggle("argo-favorites", "Favorites", self.starred_count, f.favorites, |f| {
+                f.favorites = !f.favorites;
+            }))
+            .child(picker("argo-project", "All projects", f.project.clone(), projects, view.clone(), |f, v| {
+                f.project = v;
+            }))
             .child(picker(
                 "argo-destination",
                 "All destinations",
-                self.filter.destination.clone(),
+                f.destination.clone(),
                 destinations,
-                view,
+                view.clone(),
                 |f, v| f.destination = v,
             ))
+            .child(picker(
+                "argo-sync",
+                "Any sync",
+                f.sync.clone(),
+                ["Synced", "OutOfSync", "Unknown"].map(String::from).to_vec(),
+                view.clone(),
+                |f, v| f.sync = v,
+            ))
+            .child(picker("argo-health", "Any health", f.health.clone(), healths, view.clone(), |f, v| f.health = v))
+            .child(picker(
+                "argo-auto-sync",
+                "Auto-sync on or off",
+                auto_sync,
+                [AUTO_ON, AUTO_OFF].map(String::from).to_vec(),
+                view.clone(),
+                |f, v| f.auto_sync = v.map(|v| v == AUTO_ON),
+            ))
+            .child(label_picker(f.labels.clone(), labels, view.clone()))
             .child(div().flex_1())
+            .child(group_picker(self.group_by, view))
             .child(
                 Button::new("argo-collapse")
                     .small()
                     .ghost()
                     .label(collapse_label)
+                    .disabled(self.group_by == GroupBy::None)
                     .on_click(cx.listener(|this, _, _, cx| this.toggle_all(cx))),
             )
     }
 }
+
+const AUTO_ON: &str = "Auto-sync on";
+const AUTO_OFF: &str = "Auto-sync off";
 
 /// A button picking one value of a filter (or all of them) from a menu.
 fn picker(
@@ -725,9 +1234,96 @@ fn picker(
     )
 }
 
-/// A row's menu: open it or where it deploys, refresh, hard refresh, sync. Its actions find the
-/// Application again by its key: the list may have been read again since it was drawn.
-fn row_menu(k: &Key, has_destination: bool, view: WeakEntity<ArgoView>) -> impl IntoElement {
+/// The labels to filter by, from those the Applications have: each click adds or removes
+/// one (`key=value` typed in the search does the same).
+fn label_picker(
+    picked: Vec<(String, String)>,
+    present: Vec<(String, String)>,
+    view: WeakEntity<ArgoView>,
+) -> impl IntoElement {
+    let text = match picked.as_slice() {
+        [] => "Any label".to_string(),
+        [(k, v)] => format!("{k}={v}"),
+        many => crate::plural::count(many.len(), "label"),
+    };
+    Button::new("argo-labels").small().outline().label(text).dropdown_menu(move |menu, _, _| {
+        let clear = {
+            let view = view.clone();
+            move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
+                let _ = view.update(cx, |this, cx| this.change_filter(|f| f.labels.clear(), cx));
+            }
+        };
+        let menu = menu
+            .scrollable(true)
+            .max_h(px(420.))
+            .item(PopupMenuItem::new("Any label").checked(picked.is_empty()).on_click(clear));
+        present.iter().fold(menu, |menu, label| {
+            let flip = {
+                let (view, label) = (view.clone(), label.clone());
+                move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
+                    let label = label.clone();
+                    let _ = view.update(cx, |this, cx| {
+                        this.change_filter(
+                            |f| match f.labels.iter().position(|l| *l == label) {
+                                Some(at) => {
+                                    f.labels.remove(at);
+                                }
+                                None => f.labels.push(label),
+                            },
+                            cx,
+                        );
+                    });
+                }
+            };
+            menu.item(
+                PopupMenuItem::new(format!("{}={}", label.0, label.1)).checked(picked.contains(label)).on_click(flip),
+            )
+        })
+    })
+}
+
+/// How the list is grouped: under apps of apps, by service, or not.
+fn group_picker(current: GroupBy, view: WeakEntity<ArgoView>) -> impl IntoElement {
+    Button::new("argo-group-by").small().ghost().icon(Lucide::Layers).label(current.label()).dropdown_menu(
+        move |menu, _, _| {
+            [GroupBy::Parent, GroupBy::Service, GroupBy::None].into_iter().fold(menu, |menu, by| {
+                let view = view.clone();
+                menu.item(PopupMenuItem::new(by.label()).checked(by == current).on_click(
+                    move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
+                        let _ = view.update(cx, |this, cx| this.set_group_by(by, cx));
+                    },
+                ))
+            })
+        },
+    )
+}
+
+/// What a row's menu offers beyond Refresh and Sync, from the Application as listed. Its
+/// dialog reads the Application again and says what Argo CD would refuse.
+#[derive(Clone, Copy)]
+struct Offers {
+    /// An operation runs: it can be terminated.
+    terminate: bool,
+    /// Auto-sync is off and a deployment precedes the newest: Argo CD allows a rollback.
+    roll_back: bool,
+}
+
+impl Offers {
+    fn of(app: &Summary) -> Self {
+        Self { terminate: app.in_progress, roll_back: !app.automated && app.history.len() >= 2 }
+    }
+}
+
+/// A row's menu: open it (in Argo CD's web UI when read by its API) or where it deploys,
+/// refresh, hard refresh, sync, terminate, roll back. Its actions find the Application
+/// again by its key: the list may have been read again since it was drawn.
+fn row_menu(
+    k: &Key,
+    by_api: bool,
+    has_destination: bool,
+    offers: Offers,
+    view: WeakEntity<ArgoView>,
+) -> impl IntoElement {
     let k = k.clone();
     let id = SharedString::from(format!("argo-menu-{}-{}-{}", k.0, k.1, k.2));
     Button::new(id).xsmall().ghost().icon(Lucide::Ellipsis).dropdown_menu(move |menu: PopupMenu, _, _| {
@@ -735,6 +1331,12 @@ fn row_menu(k: &Key, has_destination: bool, view: WeakEntity<ArgoView>) -> impl 
             let (view, k) = (view.clone(), k.clone());
             move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
                 let _ = view.update(cx, |this, cx| this.open(&k, cx));
+            }
+        };
+        let board = {
+            let (view, k) = (view.clone(), k.clone());
+            move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
+                let _ = view.update(cx, |this, cx| this.open_dashboard(&k, cx));
             }
         };
         let destination = {
@@ -749,7 +1351,13 @@ fn row_menu(k: &Key, has_destination: bool, view: WeakEntity<ArgoView>) -> impl 
                 let _ = view.update(cx, |this, cx| this.act(&k, action, window, cx));
             }
         };
-        menu.item(PopupMenuItem::new("Open").icon(Lucide::PanelRightOpen).on_click(open))
+        let open_item = if by_api {
+            PopupMenuItem::new("Open in Argo CD").icon(Lucide::ExternalLink)
+        } else {
+            PopupMenuItem::new("Open").icon(Lucide::PanelRightOpen)
+        };
+        menu.item(PopupMenuItem::new("Dashboard").icon(Lucide::LayoutDashboard).on_click(board))
+            .item(open_item.on_click(open))
             .item(
                 PopupMenuItem::new("Open destination namespace")
                     .icon(Lucide::FolderOpen)
@@ -762,23 +1370,32 @@ fn row_menu(k: &Key, has_destination: bool, view: WeakEntity<ArgoView>) -> impl 
                 PopupMenuItem::new("Hard refresh…").icon(Lucide::RefreshCcwDot).on_click(act(ArgoAction::HardRefresh)),
             )
             .item(PopupMenuItem::new("Sync…").icon(Lucide::GitBranch).on_click(act(ArgoAction::Sync)))
+            .item(
+                PopupMenuItem::new("Terminate…")
+                    .icon(Lucide::CircleStop)
+                    .disabled(!offers.terminate)
+                    .on_click(act(ArgoAction::Terminate)),
+            )
+            .item(
+                PopupMenuItem::new("Roll back to the previous deployment…")
+                    .icon(Lucide::Undo2)
+                    .disabled(!offers.roll_back)
+                    .on_click(act(ArgoAction::Rollback(None))),
+            )
     })
-}
-
-/// Read every Application, then work out the rows off the UI thread.
-async fn read(clusters: Vec<(String, Client)>, exec: &BackgroundExecutor) -> Rows {
-    let fleet = argo::fleet(clusters).await;
-    exec.spawn(async move { Rows::new(fleet) }).await
 }
 
 impl Render for ArgoView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.dashboard.is_some() {
+            return v_flex().size_full().p_2().child(self.dashboard_view(cx));
+        }
         let theme = cx.theme().clone();
         let body: AnyElement = match &self.rows {
             None => div().p_4().text_color(theme.muted_foreground).child("Reading Argo CD…").into_any_element(),
-            Some(rows) if rows.fleet.hubs.is_empty() => self.no_hub(&rows.fleet, cx),
+            Some(rows) if rows.fleet.hubs.is_empty() && rows.fleet.servers.is_empty() => self.no_hub(&rows.fleet, cx),
             Some(rows) => {
-                let count = self.shown.len();
+                let count = self.lines.len();
                 let total = rows.fleet.apps.len();
                 let summary = if self.filter == Filter::default() {
                     crate::plural::count(total, "Application")
@@ -795,7 +1412,14 @@ impl Render for ArgoView {
                             "argo-apps",
                             count,
                             cx.processor(|this, range: std::ops::Range<usize>, _, cx| {
-                                range.filter_map(|i| this.shown.get(i).copied().map(|s| this.row(i, s, cx))).collect()
+                                range
+                                    .filter_map(|i| {
+                                        this.lines.get(i).copied().map(|line| match line {
+                                            Line::App(s) => this.row(i, s, cx),
+                                            Line::Service(g) => this.service_row(i, g, cx),
+                                        })
+                                    })
+                                    .collect()
                             }),
                         )
                         .flex_1()
@@ -816,7 +1440,7 @@ impl Render for ArgoView {
                         .px_2()
                         .text_xs()
                         .text_color(theme.danger)
-                        .child("Some Argo CD clusters could not be read:")
+                        .child("Some Argo CD clusters or servers could not be read:")
                         .children(errors.into_iter().map(|e| div().child(e))),
                 )
             })
@@ -827,8 +1451,9 @@ impl Render for ArgoView {
 #[cfg(test)]
 mod tests {
     // Not `super::*`: gpui's own `test` attribute would shadow the standard one.
-    use super::{Filter, Shown, ancestors, shown_rows, tree_order};
+    use super::{Filter, Line, Shown, ancestors, favorites_first, group_tone, service_lines, shown_rows, tree_order};
     use crate::k8s::argo::Summary;
+    use crate::status::Tone;
 
     fn by_index(a: usize, b: usize) -> std::cmp::Ordering {
         a.cmp(&b)
@@ -873,6 +1498,30 @@ mod tests {
         assert_eq!(ix(shown_rows(&order, &parents, &all, |i| i == 0)), [0, 4]);
     }
 
+    #[test]
+    fn a_service_shows_a_heading_over_its_environments() {
+        let groups =
+            vec![("api".to_string(), vec![1, 3]), ("solo".to_string(), vec![4]), ("web".to_string(), vec![0, 2])];
+        let app = |ix, depth| Line::App(Shown { ix, depth, context_only: false });
+        let all = [true; 5];
+        assert_eq!(
+            service_lines(&groups, &all, |_| false),
+            [Line::Service(0), app(1, 1), app(3, 1), app(4, 0), Line::Service(2), app(0, 1), app(2, 1)]
+        );
+        // Folded: the heading alone. Filtered: only what is kept, and no heading over nothing.
+        assert_eq!(service_lines(&groups, &all, |g| g == 0)[..2], [Line::Service(0), app(4, 0)]);
+        let keeps = [false, false, false, true, false];
+        assert_eq!(service_lines(&groups, &keeps, |_| false), [Line::Service(0), app(3, 1)]);
+    }
+
+    #[test]
+    fn a_group_is_as_red_as_its_worst() {
+        assert_eq!(group_tone([Tone::Good, Tone::Bad, Tone::Busy].into_iter()), Tone::Bad);
+        assert_eq!(group_tone([Tone::Good, Tone::Busy].into_iter()), Tone::Busy);
+        assert_eq!(group_tone([Tone::Good, Tone::Good].into_iter()), Tone::Good);
+        assert_eq!(group_tone([Tone::Good, Tone::Done].into_iter()), Tone::Done);
+    }
+
     fn app(sync: &str, health: &str, phase: Option<&str>, project: &str) -> Summary {
         Summary {
             sync: sync.into(),
@@ -889,7 +1538,7 @@ mod tests {
         let degraded = app("Synced", "Degraded", None, "shop");
         let failed = app("Synced", "Healthy", Some("Failed"), "data");
         let fine = app("Synced", "Healthy", Some("Succeeded"), "data");
-        let keeps = |f: &Filter, a: &Summary| f.keeps(a, "prod", "web shop prod");
+        let keeps = |f: &Filter, a: &Summary| f.keeps(a, "prod", "web shop prod", false);
         assert!([&out_of_sync, &degraded, &failed, &fine].iter().all(|a| keeps(&Filter::default(), a)));
         let problems = Filter { out_of_sync: true, failed: true, ..Default::default() };
         assert!(keeps(&problems, &out_of_sync) && keeps(&problems, &failed));
@@ -900,13 +1549,67 @@ mod tests {
         assert!(!keeps(&elsewhere, &fine));
         let search = |q: &str| Filter { query: q.into(), ..Default::default() };
         assert!(keeps(&search("shop"), &fine) && !keeps(&search("billing"), &fine));
+        // Each word on its own.
+        assert!(keeps(&search("prod web"), &fine) && !keeps(&search("prod billing"), &fine));
+        // Favorites only: the others go, whatever else is picked.
+        let favorites = Filter { favorites: true, ..Default::default() };
+        assert!(favorites.keeps(&fine, "prod", "web", true));
+        assert!(!favorites.keeps(&fine, "prod", "web", false));
+        assert!(Filter::default().keeps(&fine, "prod", "web", false));
+    }
+
+    /// A favorite's whole group comes first: under its app of apps, or its service's heading,
+    /// even folded; the others follow in their order.
+    #[test]
+    fn favorites_and_their_groups_come_first() {
+        // 0 made 1 and 2; 3 alone; 4 made 5.
+        let parents = [None, Some(0), Some(0), None, None, Some(4)];
+        let order = tree_order(&parents, by_index);
+        let shown: Vec<Line> = shown_rows(&order, &parents, &[true; 6], |_| false).into_iter().map(Line::App).collect();
+        let ix = |lines: Vec<Line>| {
+            lines.into_iter().filter_map(|l| if let Line::App(s) = l { Some(s.ix) } else { None }).collect::<Vec<_>>()
+        };
+        let fav = |f: fn(usize) -> bool| move |l: &Line| matches!(l, Line::App(s) if f(s.ix));
+        assert_eq!(ix(favorites_first(shown.clone(), fav(|i| i == 5))), [4, 5, 0, 1, 2, 3]);
+        assert_eq!(ix(favorites_first(shown.clone(), fav(|i| i == 3 || i == 1))), [0, 1, 2, 3, 4, 5]);
+        assert_eq!(ix(favorites_first(shown, fav(|_| false))), [0, 1, 2, 3, 4, 5]);
+        // Services: the heading moves with its Applications.
+        let lines = vec![
+            Line::Service(0),
+            Line::App(Shown { ix: 0, depth: 1, context_only: false }),
+            Line::App(Shown { ix: 1, depth: 0, context_only: false }),
+            Line::Service(1),
+        ];
+        let moved = favorites_first(lines, |l| matches!(l, Line::Service(1)));
+        assert_eq!(moved[0], Line::Service(1));
+        assert_eq!(moved[1], Line::Service(0));
+    }
+
+    #[test]
+    fn sync_health_auto_sync_and_labels_narrow() {
+        let mut a = app("OutOfSync", "Progressing", None, "shop");
+        a.automated = true;
+        a.labels = vec![("env".into(), "Prod".into()), ("team".into(), "web".into())];
+        let keeps = |f: Filter| f.keeps(&a, "prod", "web", false);
+        assert!(keeps(Filter { sync: Some("OutOfSync".into()), ..Default::default() }));
+        assert!(!keeps(Filter { sync: Some("Synced".into()), ..Default::default() }));
+        assert!(!keeps(Filter { health: Some("Healthy".into()), ..Default::default() }));
+        assert!(keeps(Filter { auto_sync: Some(true), ..Default::default() }));
+        assert!(!keeps(Filter { auto_sync: Some(false), ..Default::default() }));
+        let label = |k: &str, v: &str| (k.to_string(), v.to_string());
+        assert!(keeps(Filter { labels: vec![label("env", "Prod"), label("team", "web")], ..Default::default() }));
+        assert!(!keeps(Filter { labels: vec![label("env", "prod")], ..Default::default() }));
+        // Typed in the search, in lowercase: key=value, or key= for any value.
+        let search = |q: &str| Filter { query: q.into(), ..Default::default() };
+        assert!(keeps(search("env=prod")) && keeps(search("team= web")) && keeps(search("env=")));
+        assert!(!keeps(search("env=staging")) && !keeps(search("owner=")));
     }
 }
 
 /// Rules that hold for any parents, however tangled.
 #[cfg(test)]
 mod properties {
-    use super::{shown_rows, tree_order};
+    use super::{Line, favorites_first, service_lines, shown_rows, tree_order};
     use proptest::prelude::*;
 
     proptest! {
@@ -925,6 +1628,54 @@ mod properties {
             let all = vec![true; parents.len()];
             let shown: Vec<usize> = shown_rows(&order, &parents, &all, |_| false).into_iter().map(|s| s.ix).collect();
             prop_assert_eq!(shown, order.iter().map(|(i, _)| *i).collect::<Vec<_>>());
+        }
+
+        /// Favorites first moves whole groups: every line stays once, under the same heading
+        /// or Application, and the groups with a favorite come before the others.
+        #[test]
+        fn favorites_first_keeps_every_group_whole(
+            parents in proptest::collection::vec(proptest::option::of(0usize..12), 0..12),
+            favs in proptest::collection::btree_set(0usize..12, 0..4),
+        ) {
+            let order = tree_order(&parents, |a, b| a.cmp(&b));
+            let shown: Vec<Line> = shown_rows(&order, &parents, &vec![true; parents.len()], |_| false).into_iter().map(Line::App).collect();
+            let is_fav = |l: &Line| matches!(l, Line::App(s) if favs.contains(&s.ix));
+            let moved = favorites_first(shown.clone(), is_fav);
+            let ixs = |lines: &[Line]| {
+                let mut v: Vec<usize> = lines.iter().filter_map(|l| if let Line::App(s) = l { Some(s.ix) } else { None }).collect();
+                v.sort_unstable();
+                v
+            };
+            prop_assert_eq!(ixs(&shown), ixs(&moved));
+            let depth = |l: &Line| if let Line::App(s) = l { s.depth } else { 0 };
+            for pair in moved.windows(2) {
+                prop_assert!(depth(&pair[1]) <= depth(&pair[0]) + 1);
+            }
+            let mut groups: Vec<bool> = Vec::new();
+            for l in &moved {
+                if depth(l) == 0 || groups.is_empty() {
+                    groups.push(is_fav(l));
+                } else if is_fav(l) {
+                    *groups.last_mut().unwrap() = true;
+                }
+            }
+            let n = groups.iter().take_while(|g| **g).count();
+            prop_assert!(groups[n..].iter().all(|g| !g));
+        }
+
+        /// Grouped by service, every Application kept is shown once, and none other.
+        #[test]
+        fn every_kept_application_is_in_its_service_once(
+            services in proptest::collection::vec(0usize..5, 0..20),
+            keeps in proptest::collection::vec(any::<bool>(), 20),
+        ) {
+            let names: Vec<String> = services.iter().map(|s| format!("svc{s}")).collect();
+            let groups = crate::k8s::argo::grouping::by_service(&names);
+            let lines = service_lines(&groups, &keeps[..names.len()], |_| false);
+            let mut shown: Vec<usize> = lines.iter().filter_map(|l| match l { Line::App(s) => Some(s.ix), Line::Service(_) => None }).collect();
+            shown.sort_unstable();
+            let want: Vec<usize> = (0..names.len()).filter(|&i| keeps[i]).collect();
+            prop_assert_eq!(shown, want);
         }
     }
 }

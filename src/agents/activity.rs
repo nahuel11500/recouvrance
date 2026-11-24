@@ -13,8 +13,9 @@ use gpui_kit::*;
 
 use super::AgentsView;
 use crate::mcp::{AuditEntry, Decision, Hub};
+use crate::ui::page_filter::PageFilter;
 
-/// A pause longer than this starts a new group, even within one session.
+/// A pause longer than this starts a new group, even within one session and client.
 const GAP_SECS: i64 = 10 * 60;
 /// Calls shown at first, and added by "Show older".
 const PAGE: usize = 300;
@@ -27,6 +28,68 @@ pub(super) enum Shown {
     All,
     Writes,
     Problems,
+    /// Calls that returned Secret values.
+    Revealed,
+}
+
+/// What the search box asks for: `client:`, `tool:`, `ctx:`, `ns:` and `kind:` terms (part
+/// of the value, ignoring case), `is:write` and `is:reveal`, the rest searched as text in the
+/// tool, agent, client, arguments and result. Every term must match.
+#[derive(Default, Debug, PartialEq, Eq)]
+pub(super) struct Search {
+    client: Vec<String>,
+    tool: Vec<String>,
+    writes: bool,
+    revealed: bool,
+    /// The `ctx:`, `ns:` and `kind:` terms and the text, as the Timeline and Problems boxes
+    /// read them.
+    page: PageFilter,
+}
+
+impl Search {
+    pub(super) fn parse(input: &str) -> Self {
+        let mut s = Self::default();
+        let mut rest = Vec::new();
+        for word in input.split_whitespace() {
+            let lower = word.to_lowercase();
+            match lower.split_once(':') {
+                Some(("client", v)) if !v.is_empty() => s.client.push(v.to_string()),
+                Some(("tool", v)) if !v.is_empty() => s.tool.push(v.to_string()),
+                Some(("is", "write" | "writes")) => s.writes = true,
+                Some(("is", "reveal" | "revealed" | "secret" | "secrets")) => s.revealed = true,
+                _ => rest.push(word),
+            }
+        }
+        s.page = PageFilter::parse(&rest.join(" "));
+        s
+    }
+
+    /// Whether a call matches every term.
+    pub(super) fn matches(&self, e: &AuditEntry) -> bool {
+        use crate::filter_syntax::contains_ci;
+        // Every call of the log, on disk too, goes through here: nothing is allocated for a
+        // term that isn't there.
+        let client = e.client.as_deref().unwrap_or_default();
+        let missed = self.client.iter().any(|c| !contains_ci(client, c))
+            || self.tool.iter().any(|t| !contains_ci(&e.tool, t))
+            || (self.writes && !writes(e))
+            || (self.revealed && e.revealed.is_empty());
+        if missed {
+            return false;
+        }
+        if self.page.is_empty() {
+            return true;
+        }
+        let text = if self.page.text.is_empty() {
+            String::new()
+        } else {
+            let (args, revealed) = (e.args.to_string(), e.revealed.join(" "));
+            [e.tool.as_str(), e.agent.as_str(), client, e.detail.as_str(), args.as_str(), revealed.as_str()].join(" ")
+        };
+        let context = arg(e, "context").unwrap_or_default();
+        let kind = arg(e, "kind").unwrap_or_default();
+        self.page.matches(&context, arg(e, "namespace").as_deref(), &kind, &text)
+    }
 }
 
 /// The All activity page's state.
@@ -56,7 +119,7 @@ impl Activity {
             shown: Shown::All,
             context: None,
             agent: None,
-            search: cx.new(|cx| InputState::new(window, cx).placeholder("Search tools, arguments, results…")),
+            search: cx.new(|cx| InputState::new(window, cx).placeholder("Search, or client: tool: ns: is:write…")),
             limit: PAGE,
             open: HashSet::new(),
             disk: None,
@@ -68,7 +131,7 @@ impl Activity {
     }
 }
 
-/// Calls of one agent with no pause longer than [`GAP_SECS`], in one session.
+/// Calls of one agent with no pause longer than [`GAP_SECS`], in one session, from one client.
 pub(super) struct Group {
     pub runs: Vec<Vec<AuditEntry>>,
 }
@@ -80,14 +143,20 @@ impl Group {
 }
 
 /// Split calls (newest first) into groups, and each group into runs of the same
-/// tool on the same target with the same outcome, all writes or none: a line shows
-/// whether its newest call wrote, so a dry run never joins the real call's run.
+/// tool on the same target with the same outcome, all writes or none, all showing Secret
+/// values or none: a line shows whether its newest call wrote or showed them, so a dry run
+/// never joins the real call's run, nor a masked read one that showed the values.
 pub(super) fn group_calls(entries: Vec<AuditEntry>) -> Vec<Group> {
     let mut groups: Vec<Group> = Vec::new();
     for e in entries {
         let prev = groups.last().and_then(|g| g.runs.last()).and_then(|r| r.last());
+        // The client matters where no session tells calls apart: a stateless client sends
+        // none, and your Claude Code and the assistant may share an agent.
         let same_group = prev.is_some_and(|p| {
-            p.agent_id == e.agent_id && p.session == e.session && p.time.duration_since(e.time).as_secs() <= GAP_SECS
+            p.agent_id == e.agent_id
+                && p.session == e.session
+                && p.client == e.client
+                && p.time.duration_since(e.time).as_secs() <= GAP_SECS
         });
         if !same_group {
             groups.push(Group { runs: vec![vec![e]] });
@@ -95,7 +164,11 @@ pub(super) fn group_calls(entries: Vec<AuditEntry>) -> Vec<Group> {
         }
         let Some(g) = groups.last_mut() else { continue };
         let joins = g.runs.last().and_then(|r| r.last()).is_some_and(|p| {
-            p.tool == e.tool && target(p) == target(&e) && problem(p) == problem(&e) && writes(p) == writes(&e)
+            p.tool == e.tool
+                && target(p) == target(&e)
+                && problem(p) == problem(&e)
+                && writes(p) == writes(&e)
+                && p.revealed.is_empty() == e.revealed.is_empty()
         });
         match g.runs.last_mut() {
             Some(run) if joins => run.push(e),
@@ -171,30 +244,33 @@ pub(super) fn call_text(e: &AuditEntry, with_context: bool) -> String {
     compact_args(&args)
 }
 
-/// Does a call pass the filters? `needle` is lowercase.
-pub(super) fn keep(e: &AuditEntry, shown: Shown, context: Option<&str>, agent: Option<&str>, needle: &str) -> bool {
+/// Does a call pass the filters?
+pub(super) fn keep(e: &AuditEntry, shown: Shown, context: Option<&str>, agent: Option<&str>, search: &Search) -> bool {
     let shown_ok = match shown {
         Shown::All => true,
         Shown::Writes => writes(e),
         Shown::Problems => problem(e),
+        Shown::Revealed => !e.revealed.is_empty(),
     };
     shown_ok
         && agent.is_none_or(|a| e.agent_id == a)
         && context.is_none_or(|c| arg(e, "context").as_deref() == Some(c))
-        && (needle.is_empty()
-            || [&e.tool, &e.agent, &e.detail, &e.args.to_string()].iter().any(|t| t.to_lowercase().contains(needle)))
+        && search.matches(e)
 }
 
 #[derive(Clone)]
 pub(super) enum Item {
     Header {
         agent: String,
+        client: Option<String>,
         session: Option<String>,
         first: jiff::Timestamp,
         last: jiff::Timestamp,
         calls: usize,
         writes: usize,
         problems: usize,
+        /// Calls that returned Secret values.
+        revealed: usize,
         touched: String,
     },
     /// Several calls folded into one line, or a single call.
@@ -236,12 +312,14 @@ pub(super) fn items(groups: &[Group], open: &HashSet<String>) -> Vec<Item> {
         let with_context = contexts.len() > 1;
         out.push(Item::Header {
             agent: newest.agent.clone(),
+            client: newest.client.clone(),
             session: newest.session.clone(),
             first: oldest.time,
             last: newest.time,
             calls: all.len(),
             writes: all.iter().filter(|e| writes(e)).count(),
             problems: all.iter().filter(|e| problem(e)).count(),
+            revealed: all.iter().filter(|e| !e.revealed.is_empty()).count(),
             touched: touched(g),
         });
         for run in &g.runs {
@@ -274,14 +352,14 @@ pub(super) fn items(groups: &[Group], open: &HashSet<String>) -> Vec<Item> {
 }
 
 fn fmt_time(t: jiff::Timestamp) -> String {
-    t.to_zoned(jiff::tz::TimeZone::system()).strftime("%H:%M:%S").to_string()
+    t.to_zoned_datetime(jiff::tz::TimeZone::system()).strftime("%H:%M:%S").to_string()
 }
 
 /// "14:02:11", or "Oct 20 14:02" for another day.
 fn fmt_day_time(t: jiff::Timestamp) -> String {
     let tz = jiff::tz::TimeZone::system();
-    let z = t.to_zoned(tz.clone());
-    if z.date() == jiff::Timestamp::now().to_zoned(tz).date() {
+    let z = t.to_zoned_datetime(tz.clone());
+    if z.date() == jiff::Timestamp::now().to_zoned_datetime(tz).date() {
         z.strftime("%H:%M:%S").to_string()
     } else {
         z.strftime("%b %d %H:%M").to_string()
@@ -334,11 +412,16 @@ fn render_item(item: &Item, ix: usize, view: &WeakEntity<AgentsView>, cx: &App) 
             .child(div().w(px(60.)).flex_shrink_0().text_color(muted).child(fmt_time(e.time)))
             .child(div().w(px(70.)).flex_shrink_0().text_color(color).child(format!("{:?}", e.decision)))
             .child(
-                div()
+                h_flex()
                     .w(px(130.))
                     .flex_shrink_0()
+                    .gap_1()
                     .when(writes(e), |d| d.text_color(theme.warning))
-                    .child(e.tool.clone()),
+                    .child(e.tool.clone())
+                    // It returned Secret values: the detail says which.
+                    .when(!e.revealed.is_empty(), |d| {
+                        d.child(Icon::new(Lucide::Eye).size_3().text_color(theme.warning))
+                    }),
             )
             .child(
                 div()
@@ -373,7 +456,7 @@ fn render_item(item: &Item, ix: usize, view: &WeakEntity<AgentsView>, cx: &App) 
             .child(div().w(px(60.)).flex_shrink_0().text_color(muted).child(format!("{}ms", e.duration_ms)))
     };
     match item {
-        Item::Header { agent, session, first, last, calls, writes, problems, touched } => h_flex()
+        Item::Header { agent, client, session, first, last, calls, writes, problems, revealed, touched } => h_flex()
             .w_full()
             .mt_3()
             .gap_3()
@@ -384,6 +467,7 @@ fn render_item(item: &Item, ix: usize, view: &WeakEntity<AgentsView>, cx: &App) 
             .bg(theme.secondary.opacity(0.6))
             .child(Icon::new(Lucide::MessagesSquare).size_3p5())
             .child(div().font_weight(FontWeight::SEMIBOLD).child(agent.clone()))
+            .when_some(client.clone(), |d, c| d.child(div().text_color(muted).child(c)))
             .when_some(session.clone(), |d, s| {
                 d.child(div().text_color(muted).child(format!("session {}", s.chars().take(8).collect::<String>())))
             })
@@ -394,6 +478,9 @@ fn render_item(item: &Item, ix: usize, view: &WeakEntity<AgentsView>, cx: &App) 
             })
             .when(*problems > 0, |d| {
                 d.child(div().text_color(theme.danger).child(format!("{problems} denied or failed")))
+            })
+            .when(*revealed > 0, |d| {
+                d.child(div().text_color(theme.warning).child(format!("{revealed} showed Secret values")))
             })
             .child(
                 div()
@@ -426,11 +513,18 @@ fn render_item(item: &Item, ix: usize, view: &WeakEntity<AgentsView>, cx: &App) 
             .text_xs()
             .child(serde_json::to_string_pretty(&call.args).unwrap_or_default())
             .when(!call.detail.is_empty(), |d| d.child(div().text_color(muted).child(call.detail.clone())))
+            .when_some(call.change.as_deref(), |d, change| d.child(change_block(change, cx)))
+            .when(!call.revealed.is_empty(), |d| {
+                d.child(
+                    div().text_color(theme.warning).child(format!("Secret values shown: {}", call.revealed.join(", "))),
+                )
+            })
             .child(div().text_color(muted).child(format!(
-                "{} · {}ms · {} bytes returned{}",
-                call.time.to_zoned(jiff::tz::TimeZone::system()).strftime("%Y-%m-%d %H:%M:%S"),
+                "{} · {}ms · {} bytes returned{}{}",
+                call.time.to_zoned_datetime(jiff::tz::TimeZone::system()).strftime("%Y-%m-%d %H:%M:%S"),
                 call.duration_ms,
                 call.result_bytes,
+                call.client.as_ref().map_or_default(|c| format!(" · {c}")),
                 call.session.as_ref().map_or_default(|s| format!(" · session {s}"))
             )))
             .into_any_element(),
@@ -458,6 +552,26 @@ fn render_item(item: &Item, ix: usize, view: &WeakEntity<AgentsView>, cx: &App) 
                 .into_any_element()
         }
     }
+}
+
+/// What a call was to change, as its approval showed it (`Preview::text`): added lines in
+/// green, removed lines and warnings in red.
+fn change_block(text: &str, cx: &App) -> AnyElement {
+    let theme = cx.theme();
+    v_flex()
+        .py_1()
+        .child(div().text_color(theme.muted_foreground).child("What the approval showed:"))
+        .children(text.lines().map(|line| {
+            let color = if line.starts_with("  + ") {
+                theme.success
+            } else if line.starts_with("  - ") || line.starts_with("  ! ") {
+                theme.danger
+            } else {
+                theme.foreground
+            };
+            div().text_color(color).child(line.to_string())
+        }))
+        .into_any_element()
 }
 
 impl AgentsView {
@@ -498,7 +612,6 @@ impl AgentsView {
         let a = &self.activity;
         let needle = a.search.read(cx).value().trim().to_lowercase();
         let (shown, context, agent) = (a.shown, a.context.clone(), a.agent.clone());
-        let filter = |e: &AuditEntry| keep(e, shown, context.as_deref(), agent.as_deref(), &needle);
         let stats = self.hub.audit_stats(|_| false);
         let mut h = std::collections::hash_map::DefaultHasher::new();
         (stats.newest.map(jiff::Timestamp::as_nanosecond), stats.oldest.map(jiff::Timestamp::as_nanosecond))
@@ -511,6 +624,8 @@ impl AgentsView {
         if sig == a.sig {
             return;
         }
+        let search = Search::parse(&needle);
+        let filter = |e: &AuditEntry| keep(e, shown, context.as_deref(), agent.as_deref(), &search);
         let mut entries = self.hub.recent_audit(a.limit, filter);
         let mut total = self.hub.audit_stats(filter).matching;
         if let Some(disk) = &a.disk {
@@ -564,11 +679,16 @@ impl AgentsView {
                 }))
         };
         let shown = a.shown;
-        let shown_chips = [(Shown::All, "All calls"), (Shown::Writes, "Writes"), (Shown::Problems, "Denied or failed")]
-            .into_iter()
-            .map(|(s, label)| {
-                chip(format!("act-shown-{label}").into(), label.into(), shown == s, Box::new(move |a| a.shown = s))
-            });
+        let shown_chips = [
+            (Shown::All, "All calls"),
+            (Shown::Writes, "Writes"),
+            (Shown::Problems, "Denied or failed"),
+            (Shown::Revealed, "Secret values shown"),
+        ]
+        .into_iter()
+        .map(|(s, label)| {
+            chip(format!("act-shown-{label}").into(), label.into(), shown == s, Box::new(move |a| a.shown = s))
+        });
         let context_chips = std::iter::once((None, "All contexts".to_string()))
             .chain(a.contexts.iter().map(|c| (Some(c.clone()), c.clone())))
             .map(|(c, label)| {
@@ -607,8 +727,9 @@ impl AgentsView {
                     .child(div().text_lg().font_weight(FontWeight::BOLD).child("Agent activity")),
             )
             .child(div().text_sm().text_color(theme.muted_foreground).child(
-                "Every call, newest first, grouped by task (a session, or calls less than 10 minutes apart). \
-                 Repeats on the same target fold into one line: click to expand. Also saved to ~/.local/share/recouvrance/audit.jsonl.",
+                "Every call, newest first, grouped by task (one client's session, or calls less than 10 minutes apart). \
+                 Repeats on the same target fold into one line: click to expand. Search takes client:, tool:, ctx:, \
+                 ns: and kind: terms, is:write and is:reveal. Also saved to ~/.local/share/recouvrance/audit.jsonl.",
             ))
             .children(audit_error)
             .child(
@@ -616,7 +737,7 @@ impl AgentsView {
                     .gap_1()
                     .flex_wrap()
                     .children(shown_chips)
-                    .child(div().w(px(220.)).ml_2().child(Input::new(&a.search).small())),
+                    .child(div().w(px(280.)).ml_2().child(Input::new(&a.search).small())),
             )
             .child(h_flex().gap_1().flex_wrap().children(context_chips))
             .children(agent_chips.map(|c| h_flex().gap_1().flex_wrap().children(c)))
@@ -686,7 +807,7 @@ pub(super) fn compact_args(args: &serde_json::Value) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{AuditEntry, Decision, HashSet, Item, Shown, call_text, group_calls, items, keep, touched};
+    use super::{AuditEntry, Decision, HashSet, Item, Search, Shown, call_text, group_calls, items, keep, touched};
 
     fn call(secs: i64, tool: &str, args: serde_json::Value, decision: Decision) -> AuditEntry {
         AuditEntry {
@@ -700,6 +821,9 @@ mod tests {
             duration_ms: 1,
             result_bytes: 0,
             session: None,
+            change: None,
+            client: None,
+            revealed: Vec::new(),
         }
     }
 
@@ -751,10 +875,10 @@ mod tests {
         let logs = call(0, "get_logs", serde_json::json!({"context": "prod", "pod": "p"}), Decision::Allowed);
         assert_eq!(call_text(&logs, false), "pod=p");
         assert_eq!(call_text(&logs, true), "context=prod pod=p");
-        assert!(keep(&e, Shown::Writes, Some("prod"), None, "rabbitmqctl"));
-        assert!(!keep(&e, Shown::Problems, None, None, ""));
-        assert!(!keep(&e, Shown::All, Some("staging"), None, ""));
-        assert!(!keep(&e, Shown::All, None, Some("other-agent"), ""));
+        assert!(keep(&e, Shown::Writes, Some("prod"), None, &Search::parse("rabbitmqctl")));
+        assert!(!keep(&e, Shown::Problems, None, None, &Search::default()));
+        assert!(!keep(&e, Shown::All, Some("staging"), None, &Search::default()));
+        assert!(!keep(&e, Shown::All, None, Some("other-agent"), &Search::default()));
     }
 
     /// Writes are the calls that may have changed something: `set_image` is one (a list of
@@ -771,8 +895,11 @@ mod tests {
             call(20, "apply_manifest", apply, Decision::Allowed),
             call(10, "gitops", diagnose, Decision::Allowed),
         ];
-        let kept: Vec<&str> =
-            calls.iter().filter(|e| keep(e, Shown::Writes, None, None, "")).map(|e| e.tool.as_str()).collect();
+        let kept: Vec<&str> = calls
+            .iter()
+            .filter(|e| keep(e, Shown::Writes, None, None, &Search::default()))
+            .map(|e| e.tool.as_str())
+            .collect();
         assert_eq!(kept, ["set_image"]);
         let lines = items(&group_calls(calls), &HashSet::new());
         let Some(Item::Header { calls: total, writes, .. }) = lines.first() else { panic!("a header first") };
@@ -787,5 +914,78 @@ mod tests {
         let Item::Run { key, .. } = &folded[1] else { panic!("a run") };
         let open: HashSet<String> = [key.clone()].into();
         assert_eq!(items(&groups, &open).len(), 4, "header, the run, its two calls");
+    }
+
+    fn from(client: Option<&str>, mut e: AuditEntry) -> AuditEntry {
+        e.client = client.map(String::from);
+        e
+    }
+
+    /// Without a session (a stateless client), calls of one agent from two clients, your
+    /// Claude Code and the assistant, are two tasks even when they interleave in time.
+    #[test]
+    fn calls_of_two_clients_are_two_tasks() {
+        let code = Some("claude-code 2.1.3");
+        let assistant = Some("assistant via claude-code 2.1.3");
+        let groups =
+            group_calls(vec![from(code, exec(30, "ls")), from(assistant, exec(20, "ls")), from(code, exec(10, "ls"))]);
+        assert_eq!(groups.len(), 3);
+        let lines = items(&group_calls(vec![from(code, exec(30, "ls")), from(code, exec(20, "env"))]), &HashSet::new());
+        let Some(Item::Header { client, .. }) = lines.first() else { panic!("a header first") };
+        assert_eq!(client.as_deref(), code);
+    }
+
+    /// A call that showed Secret values is its own line, counted in its task's header, and
+    /// found by `is:reveal` and the "Secret values shown" filter.
+    #[test]
+    fn calls_that_showed_secret_values_stand_out() {
+        let get = |secs: i64, revealed: &[&str]| {
+            let args = serde_json::json!({"context": "prod", "kind": "secrets", "namespace": "shop", "name": "db"});
+            let mut e = call(secs, "get_resource", args, Decision::Allowed);
+            e.revealed = revealed.iter().map(|r| String::from(*r)).collect();
+            e
+        };
+        let calls = vec![get(30, &["Secret shop/db"]), get(20, &[]), get(10, &[])];
+        let groups = group_calls(calls.clone());
+        assert_eq!(groups[0].runs.iter().map(Vec::len).collect::<Vec<_>>(), [1, 2]);
+        let lines = items(&groups, &HashSet::new());
+        let Some(Item::Header { revealed, .. }) = lines.first() else { panic!("a header first") };
+        assert_eq!(*revealed, 1);
+        for search in [Search::parse("is:reveal"), Search::parse("shop/db")] {
+            let kept = calls.iter().filter(|e| keep(e, Shown::All, None, None, &search)).count();
+            assert_eq!(kept, 1, "{search:?}");
+        }
+        assert_eq!(calls.iter().filter(|e| keep(e, Shown::Revealed, None, None, &Search::default())).count(), 1);
+    }
+
+    /// Each search term narrows the calls: `client:`, `tool:`, `ctx:`, `ns:`, `kind:` match
+    /// part of their value, `is:write` keeps calls that may have changed something, and the
+    /// other words are searched as text, the client included. Every term must match.
+    #[test]
+    fn search_terms_narrow_the_calls() {
+        let scale = serde_json::json!({"context": "prod-eu", "kind": "deployments", "namespace": "shop", "name": "web", "replicas": 0});
+        let calls = [
+            from(Some("claude-code 2.1.3"), call(30, "scale", scale, Decision::Allowed)),
+            from(Some("codex 0.40"), exec(20, "rabbitmqctl status")),
+            call(10, "list_contexts", serde_json::Value::Null, Decision::Allowed),
+        ];
+        let tools = |input: &str| -> Vec<String> {
+            let search = Search::parse(input);
+            calls.iter().filter(|e| keep(e, Shown::All, None, None, &search)).map(|e| e.tool.clone()).collect()
+        };
+        assert_eq!(tools(""), ["scale", "exec_command", "list_contexts"]);
+        assert_eq!(tools("client:claude"), ["scale"]);
+        assert_eq!(tools("client:CODEX"), ["exec_command"]);
+        assert_eq!(tools("tool:exec"), ["exec_command"]);
+        assert_eq!(tools("ctx:prod"), ["scale", "exec_command"]);
+        assert_eq!(tools("ns:shop"), ["scale"]);
+        assert_eq!(tools("kind:deployment"), ["scale"]);
+        assert_eq!(tools("is:write"), ["scale", "exec_command"]);
+        assert_eq!(tools("is:write ns:mq"), ["exec_command"]);
+        assert_eq!(tools("codex rabbitmqctl"), ["exec_command"]);
+        assert_eq!(tools("codex web"), Vec::<&str>::new());
+        // A term with nothing after its colon is text.
+        assert_eq!(tools("client:"), Vec::<&str>::new());
+        assert_eq!(Search::parse("tool:Scale web"), Search::parse("tool:scale WEB"));
     }
 }

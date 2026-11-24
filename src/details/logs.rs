@@ -30,13 +30,18 @@ const MSG_BATCH: usize = 1024;
 /// The pods whose logs a page follows: all of them, or past the limit the running ones
 /// first, newest first.
 pub(super) fn followed_pods(pods: &[serde_json::Value]) -> Vec<&serde_json::Value> {
-    let mut pods: Vec<&serde_json::Value> = pods.iter().collect();
+    follow_first(pods.iter().collect(), |p: &&serde_json::Value| {
+        let running = p.pointer("/status/phase").and_then(|v| v.as_str()) == Some("Running");
+        let created = p.pointer("/metadata/creationTimestamp").and_then(|v| v.as_str()).unwrap_or_default();
+        (running, created.to_string())
+    })
+}
+
+/// `pods` as a page follows them: all of them in their order, or past `MAX_LOG_PODS` the
+/// running ones first, newest first. `key` says whether a pod runs and when it was made
+/// (RFC 3339, which sorts as text).
+pub(super) fn follow_first<T>(mut pods: Vec<T>, key: impl Fn(&T) -> (bool, String)) -> Vec<T> {
     if pods.len() > MAX_LOG_PODS {
-        let key = |p: &serde_json::Value| {
-            let running = p.pointer("/status/phase").and_then(|v| v.as_str()) == Some("Running");
-            let created = p.pointer("/metadata/creationTimestamp").and_then(|v| v.as_str()).unwrap_or_default();
-            (running, created.to_string())
-        };
         pods.sort_by_cached_key(|p| std::cmp::Reverse(key(p)));
         pods.truncate(MAX_LOG_PODS);
     }
@@ -63,12 +68,44 @@ pub(super) const SINCE: [(&str, Option<i64>); 6] = [
     ("24h", Some(86400)),
 ];
 
+/// Where a pod of a view of pods from several places is: its cluster and namespace.
+#[derive(Clone)]
+pub(crate) struct PodPlace {
+    pub(crate) context: String,
+    pub(crate) client: Client,
+    pub(crate) ns: String,
+}
+
+/// A pod to follow in a view of pods from several places (the logs of checked rows): where
+/// it is, its name and its containers, default first.
+#[derive(Clone)]
+pub(crate) struct PlacedPod {
+    pub(crate) place: PodPlace,
+    pub(crate) name: String,
+    pub(crate) containers: Vec<String>,
+}
+
+/// The container picker's first choice in a view of pods from several places: each pod
+/// reads its own default container. Container names never have spaces.
+const EACH_DEFAULT: &str = "Each pod's default";
+
+/// The widest the column of tags gets, and the width of one of its characters.
+const TAG_MAX_WIDTH: f32 = 360.;
+const TAG_CHAR_WIDTH: f32 = 7.2;
+
 pub struct LogsView {
     /// Minimum level shown; None shows every line.
     pub(super) min_level: Option<Level>,
     pub(super) since: Option<i64>,
     pub(super) client: Client,
     pub(super) ns: String,
+    /// Each pod's cluster and namespace when they are not all in `client` and `ns` (the
+    /// logs of checked rows); empty on an object's page.
+    pub(super) places: Vec<PodPlace>,
+    /// With `places`: what each pod's lines say they come from (`source_tags`), and the
+    /// width of their column.
+    pub(super) tags: Vec<SharedString>,
+    tag_width: f32,
     /// One pod or all pods of a workload.
     pub(super) pods: Vec<String>,
     /// Pods past `MAX_LOG_PODS`, not followed; the status line says so.
@@ -125,6 +162,112 @@ impl LogsView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let mut this = Self::build(client, ns, pods, window, cx);
+        // Streams start when the Logs tab is first shown (`resume`).
+        this.load_containers(window, cx);
+        this
+    }
+
+    /// The logs of pods from several namespaces and clusters (the checked rows), `left_out`
+    /// more not followed. Their containers are known: none are listed. Streams start when
+    /// the page is first shown (`resume`). `home` stands in for a place when there are no
+    /// pods.
+    pub(crate) fn of_places(
+        home: PodPlace,
+        pods: Vec<PlacedPod>,
+        left_out: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let mut this = Self::build(home.client, home.ns, Vec::new(), window, cx);
+        this.put_places(pods, left_out, window, cx);
+        this
+    }
+
+    /// Follow other pods from several places (their pods found again); streams restart when
+    /// they were running.
+    pub(crate) fn set_places(
+        &mut self,
+        pods: Vec<PlacedPod>,
+        left_out: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.put_places(pods, left_out, window, cx);
+        // Lines point at pods by index: they belong to the old list.
+        self.buf.clear();
+        self.wrap_list.reset(0);
+        if self.paused {
+            self.recompute_matches(cx);
+        } else {
+            self.restart(cx);
+        }
+    }
+
+    fn put_places(&mut self, pods: Vec<PlacedPod>, left_out: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.left_out = left_out;
+        self.pods = pods.iter().map(|p| p.name.clone()).collect();
+        self.pod_containers = pods.iter().map(|p| p.containers.clone()).collect();
+        self.places = pods.into_iter().map(|p| p.place).collect();
+        self.pod_states = vec![StreamState::Connecting; self.pods.len()];
+        self.buf.set_merge(self.pods.len() > 1);
+        // Every container of the pods, each once: the one picked is read from the pods
+        // that have it, the others read their default one.
+        let mut names: Vec<String> = Vec::new();
+        for c in self.pod_containers.iter().flatten() {
+            if !names.contains(c) {
+                names.push(c.clone());
+            }
+        }
+        if self.container.as_ref().is_some_and(|c| !names.contains(c)) {
+            self.container = None;
+        }
+        let offered: Vec<String> = std::iter::once(EACH_DEFAULT.to_string()).chain(names.iter().cloned()).collect();
+        let current = self.container.clone().unwrap_or_else(|| EACH_DEFAULT.to_string());
+        let picker = if names.len() > 1 {
+            container_select(&offered, Some(current.as_str()), window, cx, |this, name, _, cx| {
+                this.container = (name != EACH_DEFAULT).then_some(name);
+                this.restart(cx);
+            })
+        } else {
+            None
+        };
+        (self.containers, self._containers_sub) = picker.unzip();
+        self.container_names = names;
+        self.update_tags();
+        cx.notify();
+    }
+
+    /// The tags of a view of pods from several places, for the containers read now.
+    fn update_tags(&mut self) {
+        if self.places.is_empty() {
+            return;
+        }
+        let reads = self.reads();
+        let sources: Vec<Source<'_>> = self
+            .places
+            .iter()
+            .zip(&reads)
+            .map(|(place, (pod, container))| Source {
+                context: &place.context,
+                namespace: &place.ns,
+                pod,
+                container: container.as_deref(),
+            })
+            .collect();
+        let tags = source_tags(&sources);
+        let longest = tags.iter().map(|t| t.chars().count()).max().unwrap_or(0);
+        self.tag_width = (longest as f32 * TAG_CHAR_WIDTH + 8.).min(TAG_MAX_WIDTH);
+        self.tags = tags.into_iter().map(Into::into).collect();
+    }
+
+    fn build(
+        client: Client,
+        ns: String,
+        pods: Vec<(String, Vec<String>)>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let (pods, pod_containers): (Vec<String>, Vec<Vec<String>>) = pods.into_iter().unzip();
         let search =
             cx.new(|cx| InputState::new(window, cx).placeholder("Find in logs… (several words; !word excludes)"));
@@ -147,11 +290,14 @@ impl LogsView {
         ];
         let mut buf = LogBuffer::new(MAX_LOG_LINES);
         buf.set_merge(pods.len() > 1);
-        let mut this = Self {
+        Self {
             min_level: None,
             since: None,
             client,
             ns,
+            places: Vec::new(),
+            tags: Vec::new(),
+            tag_width: 0.,
             pod_states: vec![StreamState::Connecting; pods.len()],
             pods,
             left_out: 0,
@@ -183,10 +329,7 @@ impl LogsView {
             _merge: None,
             _subs: subs,
             _load: None,
-        };
-        // Streams start when the Logs tab is first shown (`resume`).
-        this.load_containers(window, cx);
-        this
+        }
     }
 
     /// Stop streaming (lines are kept).
@@ -250,7 +393,9 @@ impl LogsView {
     }
 
     pub(super) fn load_containers(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let fut = k8s::containers(self.client.clone(), self.ns.clone(), self.pods[0].clone());
+        // Pods from several places come with their containers.
+        let Some(first) = self.pods.first().filter(|_| self.places.is_empty()) else { return };
+        let fut = k8s::containers(self.client.clone(), self.ns.clone(), first.clone());
         self._load = Some(cx.spawn_in(window, async move |this, cx| {
             let result = fut.await;
             let _ = this.update_in(cx, |this, window, cx| match result {
@@ -310,11 +455,13 @@ impl LogsView {
         self.reload_containers = self.status.is_some();
         self.pod_states = vec![StreamState::Connecting; self.pods.len()];
         self.streams.clear();
+        self.update_tags();
         let mut receivers = Vec::new();
         // The chosen container from each pod that has it; the others show their default one.
-        for (ix, (pod, container)) in self.reads().into_iter().enumerate() {
-            let (guard, rx) =
-                k8s::stream_logs(self.client.clone(), self.ns.clone(), pod, container, self.previous, self.since);
+        let home = (self.client.clone(), self.ns.clone());
+        let places: Vec<(Client, String)> = self.places.iter().map(|p| (p.client.clone(), p.ns.clone())).collect();
+        for (ix, ((client, ns), pod, container)) in stream_plan(&home, &places, self.reads()).into_iter().enumerate() {
+            let (guard, rx) = k8s::stream_logs(client, ns, pod, container, self.previous, self.since);
             self.streams.push(guard);
             receivers.push(rx.map(move |m| (ix, m)).boxed());
         }
@@ -472,15 +619,13 @@ impl LogsView {
     }
 
     /// Find matches as highlight ranges over `text` (the current hit stronger).
-    pub(super) fn find_highlights(
-        &self,
-        text: &str,
-        row: usize,
-        cx: &App,
-    ) -> Vec<(std::ops::Range<usize>, HighlightStyle)> {
+    pub(super) fn find_highlights(&self, text: &str, row: usize) -> Vec<(std::ops::Range<usize>, HighlightStyle)> {
         let Some(re) = &self.find_re else { return Vec::new() };
         let current = self.buf.hits().get(self.find_cur) == Some(&row);
-        let bg = if current { cx.theme().warning.opacity(0.75) } else { cx.theme().warning.opacity(0.3) };
+        // The bright amber in both themes: the light theme's own is deep, made for text, and
+        // the line's text would not read on it.
+        let amber = crate::app::bright_status().warning;
+        let bg = if current { amber.opacity(0.75) } else { amber.opacity(0.3) };
         re.find_iter(text)
             .filter(|m| !m.is_empty())
             .map(|m| (m.range(), HighlightStyle { background_color: Some(bg), ..Default::default() }))
@@ -492,8 +637,7 @@ impl LogsView {
         let theme = cx.theme();
         let Some(l) = self.buf.shown(i) else { return div().into_any_element() };
         let time = l.time.map_or_default(|t| log_time(t, self.dated, &jiff::tz::TimeZone::system()));
-        let pod = self.pods.get(l.src).map_or_default(String::as_str);
-        let suffix = pod.rsplit('-').next().unwrap_or(pod).to_string();
+        let tag = (self.pods.len() > 1).then(|| self.short_tag(l.src));
         let base = match l.level {
             Some(Level::Error) => Some(theme.danger),
             Some(Level::Warn) => Some(theme.warning),
@@ -513,7 +657,7 @@ impl LogsView {
                 }
                 pos += part.len() + 1;
             }
-            let found = self.find_highlights(line, i, cx);
+            let found = self.find_highlights(line, i);
             SelectableLine::new(
                 ElementId::NamedInteger("log-line".into(), l.id),
                 i as u64,
@@ -523,7 +667,7 @@ impl LogsView {
             .into_any_element()
         } else {
             let colored = base.map(|c| (0..l.text.len(), HighlightStyle { color: Some(c), ..Default::default() }));
-            let found = self.find_highlights(&l.text, i, cx);
+            let found = self.find_highlights(&l.text, i);
             let highlights = merge_highlights(colored.into_iter().collect(), found);
             SelectableLine::new(ElementId::NamedInteger("log-line".into(), l.id), i as u64, l.text.clone(), highlights)
                 .into_any_element()
@@ -537,8 +681,17 @@ impl LogsView {
                 let w = if self.dated { 108. } else { 56. };
                 d.child(div().w(px(w)).flex_shrink_0().text_color(theme.muted_foreground).child(time))
             })
-            .when(self.pods.len() > 1, |d| {
-                d.child(div().w(px(48.)).flex_shrink_0().text_color(pod_color(l.src, cx)).child(suffix))
+            .when_some(tag, |d, (tag, w)| {
+                d.child(
+                    div()
+                        .w(px(w))
+                        .flex_shrink_0()
+                        .overflow_hidden()
+                        .text_ellipsis()
+                        .whitespace_nowrap()
+                        .text_color(pod_color(l.src, cx))
+                        .child(tag),
+                )
             })
             .child(div().when(self.wrap, |d| d.flex_1().min_w_0()).child(text))
             .into_any_element()
@@ -575,6 +728,27 @@ pub(super) fn merge_highlights(
 }
 
 impl LogsView {
+    /// What a row says its line comes from, and the width of that column: the end of the
+    /// pod's name on an object's page, else its tag.
+    fn short_tag(&self, src: usize) -> (SharedString, f32) {
+        if let Some(tag) = self.tags.get(src).filter(|_| !self.places.is_empty()) {
+            return (tag.clone(), self.tag_width);
+        }
+        let pod = self.pods.get(src).map_or_default(String::as_str);
+        (pod.rsplit('-').next().unwrap_or(pod).to_string().into(), 48.)
+    }
+
+    /// Where a line comes from, in full: its pod, or its tag in a view of pods from several
+    /// places.
+    fn full_tag(&self, src: usize) -> &str {
+        if !self.places.is_empty()
+            && let Some(tag) = self.tags.get(src)
+        {
+            return tag.as_ref();
+        }
+        self.pods.get(src).map_or_default(String::as_str)
+    }
+
     /// The lines currently shown (after search and level filters), with time and pod.
     pub(super) fn shown_text(&self) -> String {
         let multi = self.pods.len() > 1;
@@ -582,7 +756,7 @@ impl LogsView {
             .shown_lines()
             .map(|l| {
                 let time = l.time.map_or_default(|t| t.to_string());
-                let pod = self.pods.get(l.src).map_or_default(String::as_str);
+                let pod = self.full_tag(l.src);
                 if multi { format!("{time} {pod} {}", l.text) } else { format!("{time} {}", l.text) }
             })
             .collect::<Vec<_>>()
@@ -592,8 +766,11 @@ impl LogsView {
     pub(super) fn save_to_downloads(&self) -> std::io::Result<std::path::PathBuf> {
         use std::io::Write as _;
         let stamp = jiff::Timestamp::now().strftime("%Y%m%d-%H%M%S");
-        let name =
-            if self.pods.len() == 1 { self.pods[0].clone() } else { format!("{}-{}pods", self.ns, self.pods.len()) };
+        let name = match self.pods.as_slice() {
+            [one] => one.clone(),
+            many if !self.places.is_empty() => format!("logs-{}pods", many.len()),
+            many => format!("{}-{}pods", self.ns, many.len()),
+        };
         // Private (logs often hold tokens) and never over an earlier save.
         let (mut f, path) =
             crate::private_files::create_new_in(&crate::paths::downloads_dir(), &format!("{name}-{stamp}.log"))?;
@@ -608,7 +785,7 @@ impl LogsView {
             self.dated = false;
             return div().into_any_element();
         };
-        let dated = needs_date(*first, *last, &tz, jiff::Timestamp::now().to_zoned(tz.clone()).date());
+        let dated = needs_date(*first, *last, &tz, jiff::Timestamp::now().to_zoned_datetime(tz.clone()).date());
         let max = buckets.iter().map(|b| b.0).max().unwrap_or(1).max(1) as f32;
         let theme = cx.theme();
         let fmt = |t: jiff::Timestamp| log_time(t, dated, &tz);
@@ -639,15 +816,24 @@ impl LogsView {
         out
     }
 
+    /// The streams' state; pods from several places are named by their whole tag, so a
+    /// failing cluster is told apart from another with pods of the same name.
+    fn streams_status(&self) -> Option<String> {
+        if self.places.is_empty() {
+            stream_status(&self.pods, true, &self.pod_states)
+        } else {
+            stream_status(&self.tags, false, &self.pod_states)
+        }
+    }
+
     /// The status line: pods left out, the streams' state and a container list error.
     fn status_text(&self) -> Option<SharedString> {
         let followed = self.pods.len();
         let capped = (self.left_out > 0).then(|| format!("Following {followed} of {} pods", followed + self.left_out));
-        let parts: Vec<String> =
-            [capped, stream_status(&self.pods, &self.pod_states), self.status.as_ref().map(ToString::to_string)]
-                .into_iter()
-                .flatten()
-                .collect();
+        let parts: Vec<String> = [capped, self.streams_status(), self.status.as_ref().map(ToString::to_string)]
+            .into_iter()
+            .flatten()
+            .collect();
         (!parts.is_empty()).then(|| parts.join(" · ").into())
     }
 }
@@ -894,12 +1080,12 @@ fn needs_date(
     tz: &jiff::tz::TimeZone,
     today: jiff::civil::Date,
 ) -> bool {
-    first.to_zoned(tz.clone()).date() != today || last.to_zoned(tz.clone()).date() != today
+    first.to_zoned_datetime(tz.clone()).date() != today || last.to_zoned_datetime(tz.clone()).date() != today
 }
 
 /// A log line's time: `09:33:20`, or `Nov 15 09:33:20` when the lines span other days.
 fn log_time(t: jiff::Timestamp, dated: bool, tz: &jiff::tz::TimeZone) -> String {
-    t.to_zoned(tz.clone()).strftime(if dated { "%b %d %H:%M:%S" } else { "%H:%M:%S" }).to_string()
+    t.to_zoned_datetime(tz.clone()).strftime(if dated { "%b %d %H:%M:%S" } else { "%H:%M:%S" }).to_string()
 }
 
 #[cfg(test)]

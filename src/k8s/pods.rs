@@ -1,6 +1,6 @@
 //! Pod logs, events and containers.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use anyhow::{Result, anyhow};
 use futures::channel::mpsc;
@@ -148,9 +148,9 @@ fn event_line(e: LeanEvent) -> EventLine {
 fn event_first(e: &LeanEvent) -> Option<jiff::Timestamp> {
     e.first_timestamp
         .as_ref()
-        .map(|t| t.0)
-        .or_else(|| e.event_time.as_ref().map(|t| t.0))
-        .or_else(|| e.metadata.creation_timestamp.as_ref().map(|t| t.0))
+        .and_then(|t| super::timestamp(t.0))
+        .or_else(|| e.event_time.as_ref().and_then(|t| super::timestamp(t.0)))
+        .or_else(|| e.metadata.creation_timestamp.as_ref().and_then(|t| super::timestamp(t.0)))
 }
 
 /// The component that reported an event: the new field, else the old one.
@@ -174,6 +174,20 @@ pub struct ClusterEvent {
     pub object_name: String,
     /// How many Event objects it stands for.
     pub events: usize,
+}
+
+impl ClusterEvent {
+    /// What the Timeline says of it (the page and the agents' `recent_changes`):
+    /// `Warning BackOff: restarting (×3)`, and how many events it stands for when several.
+    pub fn summary(&self) -> String {
+        let l = &self.line;
+        let count = match (l.count, self.events) {
+            (_, n) if n > 1 => format!(" (×{}, {n} events)", l.count),
+            (c, _) if c > 1 => format!(" (×{c})"),
+            _ => String::new(),
+        };
+        format!("{} {}: {}{count}", l.kind, l.reason, l.message)
+    }
 }
 
 /// The events of one object with the same type and reason as one: the latest one's message
@@ -261,15 +275,76 @@ fn event_last(e: &LeanEvent) -> Option<jiff::Timestamp> {
     e.series
         .as_ref()
         .and_then(|s| s.last_observed_time.as_ref())
-        .map(|t| t.0)
-        .or_else(|| e.last_timestamp.as_ref().map(|t| t.0))
-        .or_else(|| e.event_time.as_ref().map(|t| t.0))
-        .or_else(|| e.metadata.creation_timestamp.as_ref().map(|t| t.0))
+        .and_then(|t| super::timestamp(t.0))
+        .or_else(|| e.last_timestamp.as_ref().and_then(|t| super::timestamp(t.0)))
+        .or_else(|| e.event_time.as_ref().and_then(|t| super::timestamp(t.0)))
+        .or_else(|| e.metadata.creation_timestamp.as_ref().and_then(|t| super::timestamp(t.0)))
 }
 
 /// How many times an event happened, its `series` included.
 fn event_count(e: &LeanEvent) -> i32 {
     e.series.as_ref().and_then(|s| s.count).unwrap_or(0).max(e.count.unwrap_or(0)).max(1)
+}
+
+/// Warning events of one reason, added up.
+pub struct WarningReason {
+    pub reason: String,
+    /// Their counts added up: each event counts its repeats since it was first seen.
+    pub count: i64,
+    /// When the latest of them last happened.
+    pub last: jiff::Timestamp,
+}
+
+/// The Warning events of a cluster (or of one namespace) that last happened at `since` or
+/// later, added up by reason, the most frequent first. The API server can't pick events by
+/// time, so every Warning is read, `EVENTS_PAGE` at a time like the Timeline's: kube-apiserver
+/// keeps no cache of events by default, so each page is a read of etcd, smaller than the whole
+/// list. Each page is added up as it streams in: only the reasons are ever held, however many
+/// events the cluster keeps. A `continue` token that expired midway (410 Gone, etcd compacted
+/// meanwhile) starts the read over once, from a fresh list.
+pub async fn warning_reasons(
+    client: Client,
+    namespace: Option<String>,
+    since: jiff::Timestamp,
+) -> Result<Vec<WarningReason>> {
+    let url = Event::url_path(&(), namespace.as_deref());
+    let lp = ListParams::default().fields("type=Warning").limit(EVENTS_PAGE);
+    let read =
+        || lists::fold_lean_pages(client.clone(), url.clone(), lp.clone(), ByReason::since(since), ByReason::add);
+    let tally = match read().await {
+        Err(e) if api_status(&e) == Some(410) => read().await?,
+        tally => tally?,
+    };
+    Ok(tally.sorted())
+}
+
+/// Warning events added up by reason as they are read, those last seen before `since` left out.
+struct ByReason {
+    since: jiff::Timestamp,
+    /// Per reason: their counts added up, and when the latest last happened.
+    reasons: BTreeMap<String, (i64, jiff::Timestamp)>,
+}
+
+impl ByReason {
+    fn since(since: jiff::Timestamp) -> Self {
+        Self { since, reasons: BTreeMap::new() }
+    }
+
+    fn add(&mut self, e: LeanEvent) {
+        let Some(last) = event_last(&e).filter(|t| *t >= self.since) else { return };
+        let count = i64::from(event_count(&e));
+        let (sum, latest) = self.reasons.entry(e.reason.unwrap_or_default()).or_insert((0, last));
+        *sum += count;
+        *latest = (*latest).max(last);
+    }
+
+    /// The most frequent first; of as frequent ones, by reason.
+    fn sorted(self) -> Vec<WarningReason> {
+        let mut out: Vec<WarningReason> =
+            self.reasons.into_iter().map(|(reason, (count, last))| WarningReason { reason, count, last }).collect();
+        out.sort_by_key(|w| std::cmp::Reverse(w.count));
+        out
+    }
 }
 
 /// The field selector for an object's events: by uid when it is known, else by kind
@@ -481,7 +556,7 @@ fn stream_params(
         tail_lines,
         since_seconds,
         // Whole seconds (the server's precision): lines of that second come again and are skipped.
-        since_time: resume.and_then(|t| jiff::Timestamp::from_second(t.as_second()).ok()),
+        since_time: resume.and_then(|t| k8s_openapi::jiff::Timestamp::from_second(t.as_second()).ok()),
         // RFC3339 prefix on every line, for the time column and histogram.
         timestamps: true,
         ..Default::default()
@@ -949,11 +1024,13 @@ mod tests {
         per_namespace: usize,
         page: usize,
         asked: Arc<Mutex<Vec<String>>>,
+        /// How many of the next requests with a `continue` token find it expired (410 Gone).
+        expire: Arc<Mutex<usize>>,
     }
 
     impl Events {
         fn new(per_namespace: usize, page: usize) -> Self {
-            Self { per_namespace, page, asked: Arc::default() }
+            Self { per_namespace, page, asked: Arc::default(), expire: Arc::default() }
         }
 
         fn asked(&self) -> Vec<String> {
@@ -979,6 +1056,17 @@ mod tests {
             let uid = selector.strip_prefix("involvedObject.uid%3D");
             let limit = param("limit").and_then(|l| l.parse().ok()).unwrap_or(usize::MAX).min(self.page);
             let from: usize = param("continue").and_then(|c| c.parse().ok()).unwrap_or(0);
+            if param("continue").is_some() {
+                let mut expire = self.expire.lock().unwrap();
+                if *expire > 0 {
+                    *expire -= 1;
+                    let gone = serde_json::json!({"kind": "Status", "apiVersion": "v1", "status": "Failure",
+                        "message": "The provided continue parameter is too old", "reason": "Expired", "code": 410});
+                    let response =
+                        http::Response::builder().status(410).body(gone.to_string().into_bytes().into()).unwrap();
+                    return std::future::ready(Ok(response));
+                }
+            }
             let one = path.strip_prefix("/api/v1/namespaces/").and_then(|p| p.strip_suffix("/events"));
             // In key order: by namespace, then by name.
             let stored: Vec<(String, usize, bool)> = ('a'..='z')
@@ -1091,6 +1179,184 @@ mod tests {
             let namespaces: BTreeSet<&str> = events.iter().filter_map(|e| e.object_namespace.as_deref()).collect();
             prop_assert_eq!(namespaces.len(), if per_namespace == 0 { 0 } else { 26 });
             prop_assert_eq!(cluster.asked().len(), stored.div_ceil(page).max(1));
+        }
+    }
+
+    /// When the `Events` server's first event happened: its Warnings come a second after each
+    /// pod's Normal event, two seconds apart.
+    fn first_event() -> jiff::Timestamp {
+        jiff::Timestamp::from_second(1_767_225_600).unwrap()
+    }
+
+    /// The overview's warnings: every Warning of every namespace added up by reason, a page of
+    /// 5,000 at a time, Warnings only; those last seen before the time asked are left out.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn warnings_are_added_up_by_reason_page_by_page() {
+        let cluster = Events::new(200, usize::MAX);
+        let client = kube::Client::new(cluster.clone(), "default");
+        let all = super::warning_reasons(client.clone(), None, first_event()).await.unwrap();
+        let read: Vec<(&str, i64)> = all.iter().map(|w| (w.reason.as_str(), w.count)).collect();
+        assert_eq!(read, [("BackOff", 26 * 200)]);
+        assert_eq!(all[0].last, first_event() + jiff::SignedDuration::from_secs(2 * 199 + 1));
+        // 5,200 Warnings: two pages.
+        let asked = cluster.asked();
+        assert_eq!(asked.len(), 2, "{asked:?}");
+        let warnings_page = |q: &String| {
+            q.starts_with("/api/v1/events?") && q.contains("fieldSelector=type%3DWarning") && q.contains("limit=5000")
+        };
+        assert!(asked.iter().all(warnings_page), "{asked:?}");
+        // The first 100 pods of each namespace last warned less than 200 s after the first event:
+        // left out.
+        let since = first_event() + jiff::SignedDuration::from_secs(200);
+        let recent = super::warning_reasons(client, Some("z".into()), since).await.unwrap();
+        assert_eq!(recent.iter().map(|w| w.count).collect::<Vec<_>>(), [100]);
+        assert!(cluster.asked().last().unwrap().starts_with("/api/v1/namespaces/z/events?"));
+    }
+
+    /// A `continue` token that expired midway starts the read over once, from a fresh list:
+    /// the Warnings are counted once, not the first pages twice. Expired again, it fails.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn warnings_read_again_once_when_a_page_expired() {
+        let cluster = Events::new(200, usize::MAX);
+        *cluster.expire.lock().unwrap() = 1;
+        let client = kube::Client::new(cluster.clone(), "default");
+        let all = super::warning_reasons(client.clone(), None, first_event()).await.unwrap();
+        assert_eq!(all.iter().map(|w| w.count).collect::<Vec<_>>(), [26 * 200]);
+        // The first page, its expired next one, then both pages again.
+        let asked = cluster.asked();
+        assert_eq!(asked.len(), 4, "{asked:?}");
+        assert!(!asked[2].contains("continue="), "{asked:?}");
+        *cluster.expire.lock().unwrap() = 2;
+        let failed = super::warning_reasons(client, None, first_event()).await;
+        assert_eq!(failed.err().and_then(|e| crate::k8s::api_status(&e)), Some(410));
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(48))]
+        /// Every Warning is counted once, however few events the API server sends a page: none
+        /// left out, none twice, and no request more than its pages.
+        #[test]
+        fn every_warning_is_counted_once(per_namespace in 0usize..8, page in 1usize..60) {
+            let cluster = Events::new(per_namespace, page);
+            let client = cluster.clone();
+            let reasons = futures::executor::block_on(crate::k8s::run(async move {
+                super::warning_reasons(kube::Client::new(client, "default"), None, first_event()).await
+            }))
+            .unwrap();
+            let stored = 26 * per_namespace;
+            let counts: Vec<i64> = reasons.iter().map(|w| w.count).collect();
+            prop_assert_eq!(counts, if stored == 0 { vec![] } else { vec![i64::try_from(stored).unwrap()] });
+            prop_assert_eq!(cluster.asked().len(), stored.div_ceil(page).max(1));
+        }
+    }
+
+    /// Events recorded through events.k8s.io keep their repeats in `series`, their own time
+    /// being the first: they count as the series says, as of when it last happened.
+    #[test]
+    fn warnings_count_event_series() {
+        let now = jiff::Timestamp::now();
+        let two_hours_ago = (now - jiff::SignedDuration::from_secs(7200)).to_string();
+        let e = serde_json::json!({
+            "reason": "FailedScheduling",
+            "eventTime": two_hours_ago,
+            "lastTimestamp": null,
+            "metadata": {"creationTimestamp": two_hours_ago},
+            "series": {"count": 120, "lastObservedTime": now.to_string()},
+        });
+        let mut tally = super::ByReason::since(now - jiff::SignedDuration::from_secs(3600));
+        tally.add(serde_json::from_value(e).unwrap());
+        let read: Vec<(String, i64)> = tally.sorted().into_iter().map(|w| (w.reason, w.count)).collect();
+        assert_eq!(read, [("FailedScheduling".to_string(), 120)]);
+    }
+
+    /// 2026-01-01T03:00:00Z: the events of `whole_event` happen in the three hours before.
+    fn base() -> jiff::Timestamp {
+        jiff::Timestamp::from_second(1_767_236_400).unwrap()
+    }
+
+    /// A Warning as the API server sends it: a reason (or none), counts and times (minutes
+    /// before `base`), each maybe missing or null, and fields the overview never reads.
+    fn whole_event() -> impl Strategy<Value = serde_json::Value> {
+        // None: missing; Some(None): null; Some(Some(m)): m minutes before `base`.
+        let time = || prop::option::of(prop::option::of(0i64..180));
+        let series = prop::option::of((prop::option::of(0i32..200), prop::option::of(0i64..180)));
+        (prop::option::of(0u8..3), prop::option::of(0i32..50), series, time(), time(), prop::option::of(0i64..180))
+            .prop_map(|(reason, count, series, last, event_time, created)| {
+                let at = |m: i64| base() - jiff::SignedDuration::from_mins(m);
+                // `eventTime` and `series.lastObservedTime` are MicroTimes.
+                let micro = |m: i64| format!("{}.000000Z", at(m).to_string().trim_end_matches('Z'));
+                let mut e = serde_json::json!({
+                    "metadata": {"name": "e", "namespace": "shop", "managedFields": [{"manager": "kubelet"}]},
+                    "involvedObject": {"kind": "Pod", "name": "web"},
+                    "type": "Warning",
+                    "message": "something happened",
+                });
+                if let Some(r) = reason {
+                    e["reason"] = format!("R{r}").into();
+                }
+                if let Some(c) = count {
+                    e["count"] = c.into();
+                }
+                if let Some((count, observed)) = series {
+                    e["series"] = serde_json::json!({});
+                    if let Some(c) = count {
+                        e["series"]["count"] = c.into();
+                    }
+                    if let Some(m) = observed {
+                        e["series"]["lastObservedTime"] = micro(m).into();
+                    }
+                }
+                if let Some(t) = last {
+                    e["lastTimestamp"] = t.map(|m| at(m).to_string()).into();
+                }
+                if let Some(t) = event_time {
+                    e["eventTime"] = t.map(micro).into();
+                }
+                if let Some(m) = created {
+                    e["metadata"]["creationTimestamp"] = at(m).to_string().into();
+                }
+                e
+            })
+    }
+
+    /// How the overview added up warnings before it read them lean: from whole events as JSON.
+    fn warnings_of_values(events: &[serde_json::Value], since: jiff::Timestamp) -> Vec<(String, i64, jiff::Timestamp)> {
+        use crate::json::{i64_at, str_or_empty as st, time_at as ts};
+        let n = |e: &serde_json::Value, p: &str| i64_at(e, p).unwrap_or(0);
+        let mut by_reason: std::collections::BTreeMap<String, (i64, jiff::Timestamp)> = Default::default();
+        for e in events {
+            let Some(last) = ts(e, "/series/lastObservedTime")
+                .or_else(|| ts(e, "/lastTimestamp"))
+                .or_else(|| ts(e, "/eventTime"))
+                .or_else(|| ts(e, "/metadata/creationTimestamp"))
+            else {
+                continue;
+            };
+            if last < since {
+                continue;
+            }
+            let w = by_reason.entry(st(e, "/reason").to_string()).or_insert((0, last));
+            w.0 += n(e, "/series/count").max(n(e, "/count")).max(1);
+            w.1 = w.1.max(last);
+        }
+        let mut out: Vec<(String, i64, jiff::Timestamp)> = by_reason.into_iter().map(|(r, (c, l))| (r, c, l)).collect();
+        out.sort_by_key(|w| std::cmp::Reverse(w.1));
+        out
+    }
+
+    proptest! {
+        /// Read lean, warnings add up as they did from whole events: the same reasons, counts
+        /// and last times, in the same order, whichever of their fields are there.
+        #[test]
+        fn warnings_add_up_as_whole_events_did(events in prop::collection::vec(whole_event(), 0..40)) {
+            let since = base() - jiff::SignedDuration::from_mins(60);
+            let mut tally = super::ByReason::since(since);
+            for e in &events {
+                tally.add(serde_json::from_value(e.clone()).unwrap());
+            }
+            let read: Vec<(String, i64, jiff::Timestamp)> =
+                tally.sorted().into_iter().map(|w| (w.reason, w.count, w.last)).collect();
+            prop_assert_eq!(read, warnings_of_values(&events, since));
         }
     }
 
@@ -1307,7 +1573,7 @@ mod tests {
         // Resuming asks from the whole second of the last line, without a tail.
         let resume: jiff::Timestamp = "2024-01-01T00:00:05.75Z".parse().unwrap();
         let lp = super::stream_params(None, false, Some(60), Some(resume));
-        assert_eq!(lp.since_time.map(jiff::Timestamp::as_second), Some(resume.as_second()));
+        assert_eq!(lp.since_time.map(k8s_openapi::jiff::Timestamp::as_second), Some(resume.as_second()));
         assert_eq!((lp.tail_lines, lp.since_seconds, lp.follow), (None, None, true));
         assert_eq!(super::reconnect_delay(1).as_secs(), 1);
         assert_eq!(super::reconnect_delay(3).as_secs(), 4);

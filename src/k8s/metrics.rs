@@ -4,7 +4,6 @@ use std::collections::HashMap;
 
 use anyhow::Result;
 use futures::channel::mpsc;
-use k8s_openapi::api::core::v1::Pod;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use kube::Client;
 use serde::Deserialize;
@@ -95,14 +94,14 @@ pub fn explain_metrics_error(e: anyhow::Error, what: &str) -> anyhow::Error {
 }
 
 /// After a failed poll: wait (doubling up to 5 minutes), then try again.
-async fn retry_wait(failures: &mut u32) {
+pub(super) async fn retry_wait(failures: &mut u32) {
     *failures = failures.saturating_add(1);
     let secs = 15u64.saturating_mul(1 << (*failures - 1).min(5)).min(300);
     tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
 }
 
 /// While the list showing these metrics is hidden, poll nothing.
-async fn wait_unpaused(pause: &Pause) {
+pub(super) async fn wait_unpaused(pause: &Pause) {
     while pause.is_paused() {
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
@@ -255,67 +254,13 @@ pub struct PodResources {
     pub mem: (Option<f64>, Option<f64>),
 }
 
-/// (namespace, pod) -> its requests and limits.
-pub type PodResourcesMap = HashMap<(String, String), PodResources>;
-
-#[derive(serde::Deserialize, Default)]
-#[serde(default)]
-struct LeanPod {
-    metadata: LeanPodMeta,
-    spec: podspec::LeanSpec,
-}
-
-#[derive(serde::Deserialize, Default)]
-#[serde(default)]
-struct LeanPodMeta {
-    name: String,
-    namespace: String,
-}
-
 /// Set against usage: what the running pod is held to (regular init containers are done).
-fn pod_resources(spec: &podspec::LeanSpec) -> PodResources {
+pub(super) fn pod_resources(spec: &podspec::LeanSpec) -> PodResources {
     let of = |r: &str| {
         let e = spec.effective(r, podspec::Count::Running);
         (e.request(), e.limit())
     };
     PodResources { cpu: of("cpu"), mem: of("memory") }
-}
-
-/// The pods' requests and limits, for the usage bars of the pods list: one light list
-/// (only those fields are parsed), again every minute or ten times as long as it took,
-/// for pods that came since. Nothing while `pause` is set, nor before `rows_due` is
-/// cleared: the list's own first rows go first, this list of whole pods is big.
-pub fn watch_pod_resources(
-    client: Client,
-    namespace: Option<String>,
-    pause: Pause,
-    rows_due: Pause,
-) -> (TaskGuard, mpsc::UnboundedReceiver<PodResourcesMap>) {
-    let (tx, rx) = mpsc::unbounded();
-    let guard = spawn_guarded(async move {
-        wait_unpaused(&rows_due).await;
-        let mut failures = 0;
-        loop {
-            wait_unpaused(&pause).await;
-            let started = std::time::Instant::now();
-            let list = lists::list_lean_cached::<LeanPod>(client.clone(), ar_of::<Pod>(), namespace.clone()).await;
-            let Ok(pods) = list else {
-                if tx.is_closed() {
-                    return;
-                }
-                retry_wait(&mut failures).await;
-                continue;
-            };
-            failures = 0;
-            let map: PodResourcesMap =
-                pods.into_iter().map(|p| ((p.metadata.namespace, p.metadata.name), pod_resources(&p.spec))).collect();
-            if tx.unbounded_send(map).is_err() {
-                return;
-            }
-            tokio::time::sleep((started.elapsed() * 10).max(std::time::Duration::from_secs(60))).await;
-        }
-    });
-    (guard, rx)
 }
 
 /// Node usage and allocatable now, from metrics-server and the nodes.

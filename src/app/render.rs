@@ -13,13 +13,15 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use super::{
-    AppView, CloseTab, EscapeBack, FocusFilter, GoAssistant, GoBack, GoCluster, GoForward, GoHelm, GoProblems,
-    GoSettings, GoWorkloads, NewTab, NewWindow, NextTab, OpenPalette, OpenSelected, PrevTab, RefreshPage, Route,
-    RowCopyName, RowDelete, RowEvents, RowFavorite, RowLogs, RowOpen, RowOpenTab, RowRestart, RowRun, RowScale,
-    RowShell, RowYaml, ShowShortcuts, ToggleAssistant, ToggleSidebar, ZoomIn, ZoomOut, ZoomReset, open_main_window,
-    set_theme,
+    AppView, CloseTab, CloseWindow, EscapeBack, FocusFilter, GoAssistant, GoBack, GoCluster, GoForward, GoHelm,
+    GoProblems, GoSettings, GoWorkloads, MinimizeWindow, NewTab, NextTab, OpenAccess, OpenAgentActivity, OpenAgents,
+    OpenApiRequests, OpenApply, OpenArgo, OpenContexts, OpenHelmInstall, OpenPalette, OpenSelected, OpenTerminal,
+    OpenTimeline, OpenUpgradeCheck, PrevTab, RefreshPage, Route, RowCopyName, RowDelete, RowEvents, RowFavorite,
+    RowLogs, RowOpen, RowOpenTab, RowRestart, RowRun, RowScale, RowShell, RowYaml, ShowAbout, ShowShortcuts,
+    ToggleAssistant, ToggleFavorite, ToggleSidebar, ToggleTheme, ToggleWriteMode, ZoomIn, ZoomOut, ZoomReset,
+    ZoomWindow, set_theme, with_keys,
 };
-use crate::favorites::FavObject;
+use crate::favorites::Favorite;
 
 impl Render for AppView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -83,6 +85,12 @@ impl Render for AppView {
 }
 
 impl AppView {
+    /// Settings, on its About section.
+    pub(super) fn show_about(&mut self, cx: &mut Context<Self>) {
+        self.settings_view.update(cx, crate::ui::settings_view::SettingsView::show_about);
+        self.navigate(Route::Settings, cx);
+    }
+
     /// Keep keyboard focus somewhere useful: when the focused element went away
     /// (e.g. the table after opening a row), the list gets it back, or the app
     /// itself so Esc, Ctrl+K and the rest keep working.
@@ -128,7 +136,7 @@ impl AppView {
                     .ghost()
                     .small()
                     .icon(if self.sidebar_hidden { Lucide::PanelLeftOpen } else { Lucide::PanelLeftClose })
-                    .tooltip("Show/hide the sidebar (Ctrl+B)")
+                    .tooltip(with_keys("Show/hide the sidebar ({secondary-b})"))
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.sidebar_hidden = !this.sidebar_hidden;
                         cx.notify();
@@ -168,26 +176,12 @@ impl AppView {
                         .ghost()
                         .small()
                         .icon(Lucide::RefreshCw)
-                        .tooltip("Refresh (F5)")
+                        .tooltip(with_keys("Refresh ({f5|secondary-r})"))
                         .on_click(cx.listener(|this, _, window, cx| this.refresh_page(window, cx))),
                 )
             })
             .child(
-                h_flex()
-                    .id("palette-trigger")
-                    .gap_2()
-                    .h(px(28.))
-                    .w(px(240.))
-                    .px_3()
-                    .rounded_md()
-                    .bg(theme.secondary)
-                    .cursor_pointer()
-                    .hover(|s| s.bg(theme.list_hover))
-                    .text_sm()
-                    .text_color(theme.muted_foreground)
-                    .child(Icon::new(Lucide::Search).size_4())
-                    .child(div().flex_1().child("Jump to anything…"))
-                    .child(div().text_xs().px_1().rounded_sm().border_1().border_color(theme.border).child("Ctrl K"))
+                search_field(&theme, with_keys("{secondary-k}"))
                     .on_click(cx.listener(|this, _, window, cx| this.open_palette(window, cx))),
             )
             .child(write_mode_button(cx))
@@ -197,7 +191,7 @@ impl AppView {
                     .small()
                     .icon(Lucide::Sparkles)
                     .selected(self.docked_assistant().is_some())
-                    .tooltip("Ask the assistant about what is on screen (Ctrl+J)")
+                    .tooltip(with_keys("Ask the assistant about what is on screen ({secondary-j})"))
                     .on_click(cx.listener(|this, _, window, cx| this.toggle_assistant(window, cx))),
             )
             .child(
@@ -229,10 +223,15 @@ impl AppView {
                     .ghost()
                     .small()
                     .icon(if cx.theme().is_dark() { IconName::Sun } else { IconName::Moon })
-                    .on_click(|_, window, cx| {
-                        let mode = if cx.theme().is_dark() { ThemeMode::Light } else { ThemeMode::Dark };
-                        set_theme(mode, Some(window), cx);
-                    }),
+                    .on_click(|_, window, cx| toggle_theme(window, cx)),
+            )
+            .child(
+                Button::new("shortcuts")
+                    .ghost()
+                    .small()
+                    .icon(Lucide::Keyboard)
+                    .tooltip(with_keys("Keyboard shortcuts ({?})"))
+                    .on_click(|_, window, cx| super::shortcuts::open_panel(window, cx)),
             )
             .child(
                 Button::new("version")
@@ -240,10 +239,7 @@ impl AppView {
                     .xsmall()
                     .label(concat!("v", env!("CARGO_PKG_VERSION")))
                     .tooltip("About Recouvrance")
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.settings_view.update(cx, crate::ui::settings_view::SettingsView::show_about);
-                        this.navigate(Route::Settings, cx);
-                    })),
+                    .on_click(cx.listener(|this, _, _, cx| this.show_about(cx))),
             )
     }
 
@@ -404,6 +400,7 @@ impl AppView {
             Route::Contexts => self.render_contexts(cx).into_any_element(),
             Route::Settings => self.settings_view.clone().into_any_element(),
             Route::Apply(a) => a.clone().into_any_element(),
+            Route::Logs(l) => l.clone().into_any_element(),
             Route::Terminal(t) => div().size_full().p_2().child(t.clone()).into_any_element(),
             Route::Agents => self.agents.clone().into_any_element(),
         }
@@ -411,10 +408,14 @@ impl AppView {
 
     /// The window's keyboard actions.
     fn with_actions(&self, app: Stateful<Div>, cx: &mut Context<Self>) -> Stateful<Div> {
+        // New window, Quit and the other app-wide actions are handled without a window (`menus`).
         app.on_action(cx.listener(|this, _: &OpenPalette, window, cx| this.open_palette(window, cx)))
-            .on_action(|_: &NewWindow, _, cx| open_main_window(cx))
             .on_action(cx.listener(|this, _: &NewTab, window, cx| this.new_tab(None, window, cx)))
-            .on_action(cx.listener(|this, _: &CloseTab, window, cx| this.close_tab(this.active_tab, window, cx)))
+            .on_action(cx.listener(|this, _: &CloseTab, window, cx| this.close_tab_or_window(window, cx)))
+            .on_action(|_: &CloseWindow, window, _| window.remove_window())
+            .on_action(|_: &MinimizeWindow, window, _| window.minimize_window())
+            .on_action(|_: &ZoomWindow, window, _| window.zoom_window())
+            .on_action(cx.listener(|this, _: &ShowAbout, _, cx| this.show_about(cx)))
             .on_action(cx.listener(|this, _: &NextTab, window, cx| {
                 let n = this.tabs.len();
                 this.switch_tab((this.active_tab + 1) % n, window, cx);
@@ -448,12 +449,31 @@ impl AppView {
                 }
             }))
             .on_action(cx.listener(|this, _: &EscapeBack, _, cx| {
-                if matches!(this.route(), Route::Detail(_) | Route::HelmRelease(_)) {
+                if matches!(this.route(), Route::Detail(_) | Route::HelmRelease(_) | Route::Logs(_)) {
                     this.go(-1, cx);
                 }
             }))
             .on_action(cx.listener(|this, _: &GoForward, _, cx| this.go(1, cx)))
             .on_action(|_: &ShowShortcuts, window, cx| super::shortcuts::open_panel(window, cx))
+            // Pages and commands the palette lists without a key (see `commands::COMMANDS`).
+            .on_action(cx.listener(|this, _: &OpenArgo, window, cx| this.open_argo(window, cx)))
+            .on_action(cx.listener(|this, _: &OpenTimeline, window, cx| this.open_timeline(window, cx)))
+            .on_action(cx.listener(|this, _: &OpenAccess, window, cx| this.open_access(window, cx)))
+            .on_action(cx.listener(|this, _: &OpenUpgradeCheck, window, cx| this.open_upgrade_check(window, cx)))
+            .on_action(cx.listener(|this, _: &OpenAgents, _, cx| this.navigate(Route::Agents, cx)))
+            .on_action(cx.listener(|this, _: &OpenAgentActivity, _, cx| {
+                this.agents.update(cx, crate::agents::AgentsView::show_activity);
+                this.navigate(Route::Agents, cx);
+            }))
+            .on_action(cx.listener(|this, _: &OpenContexts, _, cx| this.navigate(Route::Contexts, cx)))
+            .on_action(cx.listener(|this, _: &OpenTerminal, window, cx| this.open_terminal(window, cx)))
+            .on_action(cx.listener(|this, _: &OpenApply, window, cx| this.open_apply(window, cx)))
+            .on_action(cx.listener(|this, _: &OpenHelmInstall, window, cx| this.open_helm_install(window, cx)))
+            .on_action(cx.listener(|this, _: &OpenApiRequests, window, cx| {
+                this.open_settings_section(crate::ui::settings_view::Section::Requests, window, cx);
+            }))
+            .on_action(|_: &ToggleWriteMode, window, cx| toggle_write_mode(window, cx))
+            .on_action(|_: &ToggleTheme, window, cx| toggle_theme(window, cx))
             .on_action(cx.listener(|this, _: &GoProblems, window, cx| this.open_problems(window, cx)))
             .on_action(cx.listener(|this, _: &GoCluster, window, cx| this.open_cluster(window, cx)))
             .on_action(cx.listener(|this, _: &GoWorkloads, window, cx| this.open_workloads(window, cx)))
@@ -481,19 +501,58 @@ impl AppView {
             .on_action(cx.listener(|this, _: &RowFavorite, _, cx| {
                 let (Some((ctx, row)), Some(kind)) = (this.row_object(cx), this.kind.clone()) else { return };
                 let Some(context) = this.clusters.get(ctx).map(|c| c.0.clone()) else { return };
-                let fav = FavObject {
-                    context,
-                    kind: kind.kubectl_name(),
-                    namespace: row.namespace.clone(),
-                    name: row.name.clone(),
-                };
+                // An Argo CD Application's row stars the Application, as its page does.
+                let fav = Favorite::for_object(&context, &kind, row.namespace.clone(), row.name.clone());
                 this.favorites.update(cx, |f, cx| {
-                    if !f.has_object(&fav) {
-                        f.toggle_object(fav, cx);
+                    if !f.has(&fav) {
+                        f.toggle(fav, cx);
                     }
                 });
             }))
+            .on_action(cx.listener(|this, _: &ToggleFavorite, window, cx| this.toggle_shown_favorite(window, cx)))
     }
+}
+
+/// The narrowest the search field gets: its icon and its shortcut hint whole ("Ctrl+K" is the
+/// longest), with the placeholder cut to nothing.
+const SEARCH_MIN: f32 = 120.;
+
+/// The top bar's button that opens the palette. When the bar runs out of room it shrinks before
+/// the buttons beside it: its placeholder is cut first, down to `SEARCH_MIN`, where the hint still
+/// fits. The hint never shrinks, and the field's content can always shrink to fit its width, so
+/// the hint can't run past the field's edge under the write-mode badge. It did when the field
+/// kept a fixed 240px its content was wider than.
+fn search_field(theme: &Theme, hint: String) -> Stateful<Div> {
+    h_flex()
+        .id("palette-trigger")
+        .debug_selector(|| "search-field".into())
+        .gap_2()
+        .h(px(28.))
+        .w(px(240.))
+        .min_w(px(SEARCH_MIN))
+        .px_3()
+        .rounded_md()
+        .bg(theme.secondary)
+        .cursor_pointer()
+        .hover(|s| s.bg(theme.list_hover))
+        .text_sm()
+        .text_color(theme.muted_foreground)
+        .child(Icon::new(Lucide::Search).size_4().flex_shrink_0())
+        .child(
+            div().flex_1().min_w_0().overflow_hidden().text_ellipsis().whitespace_nowrap().child("Jump to anything…"),
+        )
+        .child(
+            div()
+                .debug_selector(|| "search-hint".into())
+                .flex_shrink_0()
+                .whitespace_nowrap()
+                .text_xs()
+                .px_1()
+                .rounded_sm()
+                .border_1()
+                .border_color(theme.border)
+                .child(hint),
+        )
 }
 
 /// Read-only or writes on; turning writes on asks first.
@@ -508,27 +567,94 @@ fn write_mode_button(cx: &App) -> Button {
         } else {
             "Click to enable write actions"
         })
-        .on_click(|_, window, cx| {
-            if crate::details::writes_enabled(cx) {
-                crate::details::set_writes(false, cx);
+        .on_click(|_, window, cx| toggle_write_mode(window, cx))
+}
+
+/// Back to read-only at once, or writes on once confirmed: the badge and the palette do the same.
+fn toggle_write_mode(window: &mut Window, cx: &mut App) {
+    if crate::details::writes_enabled(cx) {
+        crate::details::set_writes(false, cx);
+        cx.refresh_windows();
+        return;
+    }
+    window.open_alert_dialog(cx, |alert, _, _| {
+        alert
+            .title("Enable write actions?")
+            .description(
+                "Scale, restart, delete, YAML edits, shells and plugins become available, using your own \
+                 kubeconfig credentials. Every action asks for confirmation. Agents are not affected: their \
+                 access stays defined by their rules.",
+            )
+            .show_cancel(true)
+            .ok_text("Enable writes")
+            .on_ok(|_, _, cx| {
+                crate::details::set_writes(true, cx);
                 cx.refresh_windows();
-                return;
+                true
+            })
+    });
+}
+
+fn toggle_theme(window: &mut Window, cx: &mut App) {
+    let mode = if cx.theme().is_dark() { ThemeMode::Light } else { ThemeMode::Dark };
+    set_theme(mode, Some(window), cx);
+}
+
+#[cfg(all(test, feature = "dev"))]
+mod layout_tests {
+    use gpui_kit::component::{ActiveTheme as _, h_flex};
+    // Not `gpui_kit::*`: its `test` macro would shadow the `#[test]` that `#[gpui_kit::test]` expands to.
+    use gpui_kit::{
+        Bounds, Context, InteractiveElement as _, IntoElement, ParentElement as _, Pixels, Render, Styled as _,
+        TestAppContext, Window, div, px,
+    };
+
+    use super::{SEARCH_MIN, search_field, write_mode_button};
+
+    /// The search field and the write-mode badge as the top bar lays them out, `width` wide.
+    struct Bar {
+        width: f32,
+        hint: &'static str,
+    }
+
+    impl Render for Bar {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let theme = cx.theme().clone();
+            h_flex()
+                .w(px(self.width))
+                .gap_2()
+                .child(search_field(&theme, self.hint.to_string()))
+                .child(div().debug_selector(|| "write-badge".into()).child(write_mode_button(cx)))
+        }
+    }
+
+    /// Where the field, its hint and the badge are drawn in a bar `width` wide.
+    fn drawn(cx: &mut TestAppContext, width: f32, hint: &'static str) -> [Bounds<Pixels>; 3] {
+        let (_, cx) = cx.add_window_view(|_, _| Bar { width, hint });
+        cx.update(|window, cx| drop(window.draw(cx)));
+        ["search-field", "search-hint", "write-badge"]
+            .map(|name| cx.debug_bounds(name).unwrap_or_else(|| panic!("{name} is drawn")))
+    }
+
+    #[gpui_kit::test]
+    fn the_badge_never_covers_the_search_hint(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            cx.set_global(crate::details::WriteMode(true));
+        });
+        // Linux's hint and macOS's (#899), from a bar with no room to spare to one with plenty.
+        for hint in ["Ctrl+K", "⌘K"] {
+            for width in [150., 200., 240., 280., 320., 360., 600.] {
+                let [field, hint_box, badge] = drawn(cx, width, hint);
+                let at = format!("{hint} in {width}px");
+                assert!(
+                    hint_box.left() >= field.left() && hint_box.right() <= field.right(),
+                    "{at}: the hint {hint_box:?} runs out of the field {field:?}"
+                );
+                assert!(badge.left() >= field.right(), "{at}: the badge {badge:?} starts inside the field {field:?}");
+                assert!(!hint_box.intersects(&badge), "{at}: the badge {badge:?} covers the hint {hint_box:?}");
+                assert!(f32::from(field.size.width) >= SEARCH_MIN - 0.5, "{at}: the field is {field:?}");
             }
-            window.open_alert_dialog(cx, |alert, _, _| {
-                alert
-                    .title("Enable write actions?")
-                    .description(
-                        "Scale, restart, delete, YAML edits, shells and plugins become available, using your own \
-                         kubeconfig credentials. Every action asks for confirmation. Agents are not affected: their \
-                         access stays defined by their rules.",
-                    )
-                    .show_cancel(true)
-                    .ok_text("Enable writes")
-                    .on_ok(|_, _, cx| {
-                        crate::details::set_writes(true, cx);
-                        cx.refresh_windows();
-                        true
-                    })
-            });
-        })
+        }
+    }
 }

@@ -66,6 +66,12 @@ an agent has used the app end to end and found nothing blocking:
   Problems, Apply, Settings, the agents' MCP server.
 - Against real clusters, only read. Writes, shells and deletes are tried on a kind cluster (or
   on another cluster only when the user says so).
+- Measure speed against the last release, once per release rather than per PR: build the last
+  tag the same way, then run both builds alternately on the same cluster, read-only (pods list
+  with `RECOUVRANCE_SMOKE`, the Problems scan with `RECOUVRANCE_PROBLEMS=1`, the Workloads
+  overview with `RECOUVRANCE_DASH=1`, the whole app's memory with `--snapshot` and RSS sampling;
+  see [docs/development.md](docs/development.md)). Post the before/after numbers on the release PR.
+  A clear regression is a bug like any other: file it, and say whether it blocks.
 - File an issue for each bug found, with what was done and a snapshot; don't fix them in the
   same pass. Then say whether the release can go, and which issues block it.
 

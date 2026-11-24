@@ -11,7 +11,7 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
 use kube::Client;
 use kube::api::{Api, ListParams};
 
-use super::{TaskGuard, run, spawn_guarded};
+use super::{TaskGuard, meter, run, spawn_guarded};
 
 pub enum ForwardMsg {
     Listening(u16),
@@ -78,8 +78,10 @@ pub fn port_forward(
             connections.spawn(async move {
                 let result = async {
                     let target = current.lock().await.clone();
-                    let mut pf = match api.portforward(&target, &[remote]).await {
-                        Ok(pf) => pf,
+                    // What comes back through the tunnel counts in Settings → API requests.
+                    let (opened, tally) = meter::opening(api.portforward(&target, &[remote])).await;
+                    let (mut pf, tally) = match opened {
+                        Ok(pf) => (pf, tally),
                         Err(first) => {
                             // Find the pod that replaced it, then retry once.
                             let Ok(next) = resolve_forward_pod(client, ns, service, target.clone(), owner).await else {
@@ -90,10 +92,11 @@ pub fn port_forward(
                             }
                             *current.lock().await = next.clone();
                             let _ = tx.unbounded_send(ForwardMsg::Repointed(next.clone()));
-                            api.portforward(&next, &[remote]).await?
+                            let (opened, tally) = meter::opening(api.portforward(&next, &[remote])).await;
+                            (opened?, tally)
                         }
                     };
-                    let mut upstream = pf.take_stream(remote).context("no stream")?;
+                    let mut upstream = tally.count(pf.take_stream(remote).context("no stream")?);
                     // The pod reports why it cannot connect (nothing listens on the port…) here.
                     let error = futures::future::OptionFuture::from(pf.take_error(remote));
                     tokio::select! {

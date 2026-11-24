@@ -29,7 +29,7 @@ Recouvrance is one Rust binary: a [gpui](https://github.com/zed-industries/zed) 
 | Path | What |
 |---|---|
 | `src/main.rs` | Entry point: the window, `serve` (headless MCP), `agent-create` |
-| `src/app/` | The main window: contexts, sidebar, resource list page, tabs and history, theme |
+| `src/app/` | The main window: contexts, sidebar, resource list page, tabs and history, theme, key bindings and the macOS menu bar |
 | `src/table/` | The resource table (server-side columns, usage bars, links) and its filter language |
 | `src/details/` | A detail page: tabs, actions and their confirmations, logs, compare, related data |
 | `src/overview/` | The Overview tab, per kind: pods, workloads, nodes, networking, configuration, RBAC |
@@ -37,7 +37,7 @@ Recouvrance is one Rust binary: a [gpui](https://github.com/zed-industries/zed) 
 | `src/mcp/` | The agent hub (agents, rules, approvals, audit) and the MCP server with its tools and prompts |
 | `src/agents/` | The Agents page |
 | `src/ui/` | Other pages and widgets: settings, Helm, apply, cluster and workloads overviews, terminal, pickers |
-| `src/diagnose.rs`, `rbac.rs`, `schema.rs`, `prom.rs`, `problems.rs`, `certs.rs` | Logic without UI, unit-tested |
+| `src/diagnose.rs`, `rbac.rs`, `schema.rs`, `prom.rs`, `problems.rs`, `certs.rs`, `updates.rs` | Logic without UI, unit-tested |
 | `src/dev/` | Developer tools (feature `dev`): the off-screen snapshot harness and live smoke checks |
 
 ## How lists stay fast
@@ -54,10 +54,27 @@ are **watched**. A list of a namespaced kind in every namespace comes in up to t
    in, with managedFields and the rest skipped (`list_whole`). It replaces the rows of step 2.
 
 Rows keep only the metadata they need; full objects are fetched only when a custom column needs
-them. Responses are gzip-compressed. The usage bars read the pods' requests and limits from a
-separate lean list of the pods, read again every minute (or ten times as long as a read takes, when
-that is longer). On a cluster with about 20,800 pods, the first rows show after 0.7 s and all of
-them after 1.4 s ([measured](COMPARISON.md#measured)).
+them. Responses are gzip-compressed. The usage bars and the cluster overview take the pods'
+requests and limits from one list of the pods, then follow them with a watch
+(`src/k8s/pod_requests.rs`). The API server can't send less than whole pods (about 300 MB of JSON
+for 20,800 pods), so each pod is kept only as the sums `podspec` makes of it, and pods that come,
+go or are resized in place change them without another list. A page off screen for 5 minutes
+stops its watch and lists again once back. On a cluster with about 20,800 pods, the first rows
+show after 0.7 s and all of them after 1.4 s ([measured](COMPARISON.md#measured)).
+
+The Problems scan reads the big kinds from their cells too (`list_light`). What its checks need
+of whole objects (Services, Ingresses and HTTP routes, the pods a Service selects, the workloads of
+a namespace with an idle Service, external-secrets.io's objects) is parsed as each list streams in,
+keeping only the fields the checks use; of the workloads, only those scaled to 0 are kept.
+
+The Workloads overview counts each kind from kubectl's cells alone, with no object metadata at all
+(`list_cells`), in one request from the cache. The pods card works differently, as it needs each
+pod's namespace past 4,000 pods: it reads a first page of at most 1,000 rows (paged, so etcd serves
+it), and past that one namespace at a time from the cache. It reads pods whole only up to 4,000 of
+them, for their restarts and limits, parsed lean; HPAs, Disruption Budgets and Helm's current
+revisions come lean from the cache too. kube-apiserver keeps no cache of events by default, so the
+Warning events are read 5,000 at a time and added up by reason as each page streams in
+(`warning_reasons`): only the reasons are held, however many events the cluster keeps.
 
 A detail page follows its object the same way (`k8s::follow`): a list, then a watch, with a field
 selector on its name, which the API server serves from its watch cache. The pods it lists are
@@ -78,8 +95,10 @@ is read every `detail_refresh`.
   a **server dry run** first.
 - **Protected contexts** require typing the context name.
 - Actions your **RBAC** forbids are disabled (`SelfSubjectAccessReview`).
-- **Agents** go through the hub: rules (deny, ask, allow), approvals, a rate limit, an audit log and
-  a kill switch. Write mode and protected contexts don't apply to them: only their rules do.
+- **Agents** go through the hub: rules (deny, ask, allow), approvals (which show what a write will
+  change, worked out with a server dry run), a rate limit, an audit log and a kill switch. Write mode
+  and protected contexts don't apply to them: only their rules do (an Ask or Deny rule can name
+  `@protected`).
 - **Login commands keep their secrets.** kube's error for a failed exec plugin holds its whole
   command line and its output; each client replaces it, when it is built and on every request
   (a token refresh runs the plugin again), by the program's file name, taken from the kubeconfig,
@@ -87,6 +106,11 @@ is read every `detail_refresh`.
   last line the plugin wrote to stderr is added when the kubeconfig sets `interactiveMode: Never`:
   kube keeps stderr only then, and otherwise the plugin writes to the terminal Recouvrance was
   started from. Pages, agents and the audit log only ever get that.
+- **Kubeconfig errors keep their secrets too.** The YAML parser's error for a kubeconfig shows
+  the lines around where it failed and can quote a value: a token, a client key, a login
+  command's arguments. Kubeconfig files are read through `k8s::read_kubeconfig_file`, pasted
+  text through `parse_kubeconfig`: their error says the file, line and column, and why in words
+  of their own.
 - **Proxy passwords stay out of errors.** kube's error for a proxy it can't use prints the proxy's
   URL whole, user and password included. The client's build error puts that URL back without
   them, scheme or not (`user:password@host:1080` from `HTTPS_PROXY` reads as a URL to kube, not

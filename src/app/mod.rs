@@ -27,17 +27,21 @@ use crate::ui::palette::Palette;
 use crate::ui::settings_view::SettingsView;
 
 mod chrome;
+pub(crate) mod commands;
 mod contexts;
 #[cfg(feature = "dev")]
 mod demo;
 mod kind_filters;
 mod live_list;
+mod menus;
 mod navigation;
 mod overviews;
 mod pages;
+mod pinned;
 mod problem_badge;
 mod render;
 mod search_index;
+mod session;
 mod shortcuts;
 mod sidebar;
 mod table_page;
@@ -45,8 +49,13 @@ mod theme;
 mod view_cache;
 mod watch;
 
+pub use menus::init as init_menus;
+pub(crate) use shortcuts::{key_cap, shortcut_rows, with_keys};
 use sidebar::section_icon;
 pub(crate) use theme::*;
+
+/// macOS takes ⌘ for the app's shortcuts where Linux takes Ctrl, and has a menu bar.
+pub(crate) const MAC: bool = cfg!(target_os = "macos");
 
 /// Where the main area is; kept in a history for back/forward.
 #[derive(Clone)]
@@ -67,6 +76,8 @@ enum Route {
     Settings,
     Terminal(Entity<crate::ui::terminal::TerminalView>),
     Apply(Entity<crate::ui::apply_view::ApplyView>),
+    /// The logs of the checked rows.
+    Logs(Entity<crate::details::LogsPage>),
     Agents,
 }
 
@@ -77,6 +88,27 @@ impl Route {
 
     fn is_resources(&self) -> bool {
         matches!(self, Self::Resources(_) | Self::Detail(_))
+    }
+
+    /// The page shown, for the routes that are one.
+    fn page(&self) -> Option<EntityId> {
+        match self {
+            Self::Detail(e) => Some(e.entity_id()),
+            Self::Workloads(e) => Some(e.entity_id()),
+            Self::Cluster(e) => Some(e.entity_id()),
+            Self::Problems(e) => Some(e.entity_id()),
+            Self::Timeline(e) => Some(e.entity_id()),
+            Self::Access(e) => Some(e.entity_id()),
+            Self::HelmInstall(e) => Some(e.entity_id()),
+            Self::Assistant(e) => Some(e.entity_id()),
+            Self::Helm(e) => Some(e.entity_id()),
+            Self::HelmRelease(e) => Some(e.entity_id()),
+            Self::Argo(e) => Some(e.entity_id()),
+            Self::Terminal(e) => Some(e.entity_id()),
+            Self::Apply(e) => Some(e.entity_id()),
+            Self::Logs(e) => Some(e.entity_id()),
+            Self::Resources(_) | Self::Contexts | Self::Settings | Self::Agents => None,
+        }
     }
 }
 
@@ -90,6 +122,9 @@ struct TabState {
     namespaces: Vec<String>,
     /// The resource type its list shows.
     kind: Option<Kind>,
+    /// The overview it opens when first shown: a tab reopened on one (see `session`) builds
+    /// its page only then.
+    open: Option<overviews::Overview>,
 }
 
 /// The page each window shows, and the windows hidden as the desktop reports it (see
@@ -126,6 +161,18 @@ pub fn is_visible(page: EntityId, cx: &App) -> bool {
 /// in the back/forward history).
 pub fn is_current(page: EntityId, cx: &App) -> bool {
     cx.try_global::<VisiblePages>().is_some_and(|v| v.current(page))
+}
+
+/// Put `page` on screen, or take it off: for view tests of pages that wait to be shown.
+#[cfg(all(test, feature = "dev"))]
+pub fn show_for_test(cx: &mut App, page: EntityId, shown: bool) {
+    let window: EntityId = 999_999u64.into();
+    let visible = cx.default_global::<VisiblePages>();
+    if shown {
+        visible.pages.insert(window, page);
+    } else {
+        visible.pages.remove(&window);
+    }
 }
 
 /// Wait until this page is on screen; false once it is gone.
@@ -172,20 +219,45 @@ struct SharedHub(Arc<Hub>, #[allow(dead_code)] Arc<TaskGuard>);
 
 impl Global for SharedHub {}
 
-/// Open a main window (at startup and with Ctrl+Shift+N).
-pub fn open_main_window(cx: &mut App) {
-    let bounds = Bounds::centered(None, size(px(1500.), px(920.)), cx);
+/// Open a main window: at startup, with Ctrl+Shift+N (⇧⌘N), and on macOS from the Dock or the
+/// menu bar when none is open.
+pub fn open_main_window(cx: &mut App) -> Option<Entity<AppView>> {
+    use crate::settings::{WINDOW_MIN, WINDOW_SIZE};
+    // The first window opens where the app was left; the others at the default size, centered.
+    let bounds = if cx.has_global::<session::FirstWindowOpened>() {
+        WindowBounds::Windowed(Bounds::centered(None, size(px(WINDOW_SIZE.0), px(WINDOW_SIZE.1)), cx))
+    } else {
+        session::first_window_bounds(cx)
+    };
     // The app draws its own title bar (GNOME on Wayland has no server-side
     // decorations): dragging, window controls and resize borders.
     let options = WindowOptions {
-        window_bounds: Some(WindowBounds::Windowed(bounds)),
+        window_bounds: Some(bounds),
         window_decorations: Some(WindowDecorations::Client),
-        window_min_size: Some(size(px(900.), px(560.))),
+        window_min_size: Some(size(px(WINDOW_MIN.0), px(WINDOW_MIN.1))),
         app_id: Some("recouvrance".into()),
         ..TitleBar::window_options()
     };
-    if let Err(e) = open_window(options, cx, |window, cx| cx.new(|cx| AppView::new(window, cx))) {
-        eprintln!("could not open a window: {e:#}");
+    match open_window(options, cx, |window, cx| cx.new(|cx| AppView::new(window, cx))) {
+        Ok((window, view)) => {
+            // After an update, its release notes, once: the next window finds them seen.
+            crate::ui::whats_new::show_once(window, cx);
+            Some(view)
+        }
+        Err(e) => {
+            eprintln!("could not open a window: {e:#}");
+            None
+        }
+    }
+}
+
+/// The Dock icon was clicked with no window shown. macOS keeps the app running when its last
+/// window closes: show a minimized window again, or open one.
+pub fn reopen(cx: &mut App) {
+    if let Some(&handle) = cx.windows().first() {
+        let _ = handle.update(cx, |_, window, _| window.activate_window());
+    } else {
+        open_main_window(cx);
     }
 }
 
@@ -195,6 +267,16 @@ gpui_kit::actions!(
         NewWindow,
         NewTab,
         CloseTab,
+        CloseWindow,
+        MinimizeWindow,
+        ZoomWindow,
+        Quit,
+        HideApp,
+        HideOtherApps,
+        ShowAllApps,
+        ShowAbout,
+        OpenHelp,
+        ReportIssue,
         NextTab,
         PrevTab,
         RowOpenTab,
@@ -227,36 +309,73 @@ gpui_kit::actions!(
         GoHelm,
         GoAssistant,
         GoSettings,
-        ToggleAssistant
+        ToggleAssistant,
+        OpenArgo,
+        OpenTimeline,
+        OpenAccess,
+        OpenUpgradeCheck,
+        OpenAgents,
+        OpenAgentActivity,
+        OpenContexts,
+        OpenTerminal,
+        OpenApply,
+        OpenHelmInstall,
+        OpenApiRequests,
+        ToggleWriteMode,
+        ToggleTheme,
+        ToggleFavorite
     ]
 );
 
 pub fn bind_keys(cx: &mut App) {
-    cx.bind_keys(key_bindings());
+    cx.bind_keys(key_bindings_on(MAC));
 }
 
-fn key_bindings() -> Vec<KeyBinding> {
-    vec![
-        KeyBinding::new("ctrl-k", OpenPalette, None),
-        KeyBinding::new("ctrl-shift-n", NewWindow, None),
-        KeyBinding::new("ctrl-t", NewTab, None),
-        KeyBinding::new("ctrl-w", CloseTab, None),
+/// The app's key bindings on macOS (`mac`) or Linux. A shortcut that takes Ctrl on Linux takes ⌘
+/// on macOS, where Ctrl keys then reach the shell in a terminal; Ctrl+Tab and Ctrl+Page Up/Down
+/// switch tabs on both, as in browsers. macOS also gets the keys every Mac app has (⌘Q, ⌘,, ⌘M…)
+/// and ⌘[ / ⌘] for back and forward instead of Alt+arrows, which move by word in its shells.
+fn key_bindings_on(mac: bool) -> Vec<KeyBinding> {
+    // gpui's `secondary-` (⌘ on macOS, Ctrl elsewhere), spelled out for the platform asked rather
+    // than the one gpui is built for: the macOS keymap can be checked on Linux too.
+    let key = |keys: &str| keys.replace("secondary-", if mac { "cmd-" } else { "ctrl-" });
+    let mut bindings = Vec::new();
+    if mac {
+        // First: the menu bar shows an action's first binding (⌘, for Settings, ⌘/ for the list).
+        bindings.extend([
+            KeyBinding::new("cmd-q", Quit, None),
+            KeyBinding::new("cmd-,", GoSettings, None),
+            KeyBinding::new("cmd-shift-w", CloseWindow, None),
+            KeyBinding::new("cmd-m", MinimizeWindow, None),
+            KeyBinding::new("cmd-h", HideApp, None),
+            KeyBinding::new("cmd-alt-h", HideOtherApps, None),
+            KeyBinding::new("cmd-/", ShowShortcuts, None),
+            KeyBinding::new("cmd-[", GoBack, None),
+            KeyBinding::new("cmd-]", GoForward, None),
+        ]);
+    } else {
+        bindings.extend([KeyBinding::new("alt-left", GoBack, None), KeyBinding::new("alt-right", GoForward, None)]);
+    }
+    bindings.extend([
+        KeyBinding::new(&key("secondary-k"), OpenPalette, None),
+        KeyBinding::new(&key("secondary-shift-n"), NewWindow, None),
+        KeyBinding::new(&key("secondary-t"), NewTab, None),
+        KeyBinding::new(&key("secondary-w"), CloseTab, None),
         KeyBinding::new("ctrl-tab", NextTab, None),
         KeyBinding::new("ctrl-pagedown", NextTab, None),
         KeyBinding::new("ctrl-shift-tab", PrevTab, None),
         KeyBinding::new("ctrl-pageup", PrevTab, None),
-        KeyBinding::new("ctrl-b", ToggleSidebar, None),
-        KeyBinding::new("ctrl-j", ToggleAssistant, None),
+        KeyBinding::new(&key("secondary-b"), ToggleSidebar, None),
+        KeyBinding::new(&key("secondary-j"), ToggleAssistant, None),
+        // Before F5, so the macOS menu bar shows ⌘R for Refresh, as Mac apps do.
+        KeyBinding::new(&key("secondary-r"), RefreshPage, None),
         KeyBinding::new("f5", RefreshPage, None),
-        KeyBinding::new("ctrl-r", RefreshPage, None),
-        KeyBinding::new("ctrl-=", ZoomIn, None),
-        KeyBinding::new("ctrl-+", ZoomIn, None),
-        KeyBinding::new("ctrl-shift-=", ZoomIn, None),
-        KeyBinding::new("ctrl--", ZoomOut, None),
-        KeyBinding::new("ctrl-0", ZoomReset, None),
-        KeyBinding::new("alt-left", GoBack, None),
-        KeyBinding::new("alt-right", GoForward, None),
-        KeyBinding::new("ctrl-f", FocusFilter, Some("App")),
+        KeyBinding::new(&key("secondary-="), ZoomIn, None),
+        KeyBinding::new(&key("secondary-+"), ZoomIn, None),
+        KeyBinding::new(&key("secondary-shift-="), ZoomIn, None),
+        KeyBinding::new(&key("secondary--"), ZoomOut, None),
+        KeyBinding::new(&key("secondary-0"), ZoomReset, None),
+        KeyBinding::new(&key("secondary-f"), FocusFilter, Some("App")),
         // Inputs and dialogs handle Escape themselves (deeper contexts win).
         KeyBinding::new("escape", EscapeBack, Some("App")),
         // Only while the table has focus, so typing "/" elsewhere is untouched.
@@ -272,9 +391,11 @@ fn key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("g h", GoHelm, Some(shortcuts::OUTSIDE_TEXT)),
         KeyBinding::new("g i", GoAssistant, Some(shortcuts::OUTSIDE_TEXT)),
         KeyBinding::new("g s", GoSettings, Some(shortcuts::OUTSIDE_TEXT)),
+        KeyBinding::new("*", ToggleFavorite, Some(shortcuts::OUTSIDE_TEXT)),
         KeyBinding::new("j", base::actions::SelectDown, Some(shortcuts::TABLE_OUTSIDE_TEXT)),
         KeyBinding::new("k", base::actions::SelectUp, Some(shortcuts::TABLE_OUTSIDE_TEXT)),
-    ]
+    ]);
+    bindings
 }
 
 pub struct AppView {
@@ -300,6 +421,10 @@ pub struct AppView {
     tab_scroll: ScrollHandle,
     agents: Entity<AgentsView>,
     approvals: Vec<Arc<Approval>>,
+    /// Redraws the banner's countdown each second while a request waits.
+    countdown: Option<Task<()>>,
+    /// How many requests the window title last said were waiting.
+    title_waiting: Option<usize>,
     forwards: Entity<Forwards>,
     _hub_events: Task<()>,
     /// Contexts ticked on the picker page.
@@ -326,8 +451,12 @@ pub struct AppView {
     skip_select: Option<usize>,
     /// The contexts and namespace each Workloads or Problems page was built for.
     page_scopes: HashMap<EntityId, (Vec<String>, Vec<String>)>,
-    /// Connecting to a context to open a namespace there (an Application's destination).
-    namespace_open: crate::latest::Latest,
+    /// Opening an object on a context that isn't connected, or whose kind is looked up there
+    /// (where an Argo CD Application deploys, and what it deploys there).
+    context_open: crate::latest::Latest,
+    /// A favorite to open once the connect under way is done (it is on a context that wasn't
+    /// connected); any other connect drops it.
+    after_connect: Option<crate::favorites::Favorite>,
     /// Selected namespaces; empty means all.
     namespaces: Vec<String>,
     filter: Entity<InputState>,
@@ -372,6 +501,19 @@ pub struct AppView {
     /// A connect is in flight (`_connect` stays set once it is done).
     connecting: bool,
     _connect: Option<Task<()>>,
+    /// The set of contexts picked (`settings::session_set`), whose session this window saves;
+    /// empty when none is saved (not connected yet, or contexts given by a developer hook).
+    session_key: Vec<String>,
+    /// Whether a connect reopens where its set of contexts was left: the first window's first
+    /// set, until a connect to it reaches every cluster (see `session::Restore`).
+    restore: session::Restore,
+    /// This view, by which `session::SessionOwners` knows the window that saves a set.
+    view_id: EntityId,
+    /// Where the window was last, not maximized: what is saved while it is maximized.
+    windowed: Option<crate::settings::WindowPlace>,
+    /// The save waiting for changes to stop (see `session_changed`), and the window's.
+    _save_session: Option<Task<()>>,
+    _save_window: Option<Task<()>>,
     _kubeconfig_watch: Option<Task<()>>,
     _subs: Vec<Subscription>,
 }
@@ -382,8 +524,10 @@ impl AppView {
             Ok(c) => (c.names, dev_var("RECOUVRANCE_CONTEXT").or(c.current), None),
             Err(e) => (Vec::new(), None, Some(format!("{e:#}").into())),
         };
-        let ns_picker = cx.new(|cx| NamespacePicker::new(window, cx));
-        let ctx_picker = cx.new(|cx| ContextPicker::new(contexts.clone(), window, cx));
+        // One store for every window: a window never saves over the stars of another.
+        let favorites = crate::favorites::shared(cx);
+        let ns_picker = cx.new(|cx| NamespacePicker::new(favorites.clone(), window, cx));
+        let ctx_picker = cx.new(|cx| ContextPicker::new(contexts.clone(), favorites.clone(), window, cx));
         let col_header = cx.new(|cx| InputState::new(window, cx).placeholder("Header, e.g. Image"));
         let col_path = cx.new(|cx| InputState::new(window, cx).placeholder(".spec.containers[*].image"));
         let filter = cx.new(|cx| {
@@ -421,6 +565,7 @@ impl AppView {
                         cx.notify();
                     });
                     this.follow_selection(cx);
+                    this.session_changed(cx);
                 }
                 // A filter that was used (Enter, or leaving the field) goes into the history.
                 InputEvent::PressEnter { .. } | InputEvent::Blur => {
@@ -512,7 +657,16 @@ impl AppView {
             cx.observe_window_visibility(window, |this, visibility, _, cx| {
                 this.set_window_hidden(!visibility.is_visible(), cx);
             }),
+            cx.observe_window_bounds(window, |this, window, cx| this.window_moved(window, cx)),
+            // Where the window is left is saved as it closes, and as the app quits.
+            cx.on_release(Self::leave_session),
+            cx.on_app_quit(|this, cx| {
+                this.save_session_now(cx);
+                async {}
+            }),
         ];
+        let first_window = !cx.has_global::<session::FirstWindowOpened>();
+        cx.set_global(session::FirstWindowOpened);
 
         // One agent hub and MCP server for the whole app, shared by its windows.
         if !cx.has_global::<SharedHub>() {
@@ -527,9 +681,9 @@ impl AppView {
         // Subscribe first: the agents view reads the last status, later ones arrive here.
         let mut hub_rx = hub.subscribe();
         let agents = cx.new(|cx| AgentsView::new(hub.clone(), window, cx));
-        let hub_events = cx.spawn(async move |this, cx| {
+        let hub_events = cx.spawn_in(window, async move |this, cx| {
             while let Some(ev) = hub_rx.next().await {
-                let alive = this.update(cx, |this, cx| this.on_hub_event(&ev, cx));
+                let alive = this.update_in(cx, |this, window, cx| this.on_hub_event(&ev, window, cx));
                 if alive.is_err() {
                     break;
                 }
@@ -540,7 +694,6 @@ impl AppView {
         let mut subs = subs;
         subs.push(cx.observe(&forwards, |_, _, cx| cx.notify()));
 
-        let favorites = cx.new(|_| Favorites::load());
         subs.push(cx.observe(&favorites, |_, _, cx| cx.notify()));
         let focus = cx.focus_handle();
         window.focus(&focus, cx);
@@ -566,6 +719,8 @@ impl AppView {
             pos: 0,
             agents,
             approvals: Vec::new(),
+            countdown: None,
+            title_waiting: None,
             _hub_events: hub_events,
             picked: current.iter().cloned().collect(),
             ns_picker,
@@ -576,7 +731,8 @@ impl AppView {
             ns_open: false,
             skip_select: None,
             page_scopes: HashMap::new(),
-            namespace_open: Default::default(),
+            context_open: Default::default(),
+            after_connect: None,
             sidebar_hidden: false,
             assistant: None,
             assistant_docked: false,
@@ -607,6 +763,12 @@ impl AppView {
             metrics: None,
             connecting: false,
             _connect: None,
+            session_key: Vec::new(),
+            restore: if first_window { session::Restore::FirstConnect } else { session::Restore::Off },
+            view_id: cx.entity_id(),
+            windowed: None,
+            _save_session: None,
+            _save_window: None,
             _kubeconfig_watch: None,
             tabs: vec![TabState::default()],
             active_tab: 0,
@@ -630,14 +792,28 @@ impl AppView {
             _ => this.history = vec![Route::Contexts],
         }
         this.watch_kubeconfigs(window, cx);
+        // The window has a name in task switchers and for screen readers.
+        this.show_waiting(window);
         this
     }
 
-    fn on_hub_event(&mut self, ev: &HubEvent, cx: &mut Context<Self>) {
+    fn on_hub_event(&mut self, ev: &HubEvent, window: &mut Window, cx: &mut Context<Self>) {
         match ev {
             HubEvent::ApprovalRequested(a) => {
                 self.approvals.push(a.clone());
-                notify_desktop(&format!("{} asks to run {}", a.agent, a.tool), &a.summary);
+                // Every window flashes in the taskbar or bounces the Dock (nothing happens to
+                // the one in front): an approval nobody sees is refused after 2 minutes.
+                window.request_attention();
+                self.start_countdown(cx);
+                // Each window hears of the request; one notification is enough.
+                if first_to_notify(cx, a.id) {
+                    // The request, then what it will change (the notification keeps the first lines).
+                    let body = match &a.preview {
+                        Some(p) => format!("{}\n{}", a.summary, p.text()),
+                        None => a.summary.clone(),
+                    };
+                    notify_desktop(&format!("{} asks to run {}", a.agent, a.tool), &body);
+                }
             }
             HubEvent::ApprovalResolved(id) => self.approvals.retain(|a| a.id != *id),
             HubEvent::ServerStatus(status) => {
@@ -649,9 +825,46 @@ impl AppView {
             }
             HubEvent::Audit(_) | HubEvent::AgentSeen | HubEvent::Forwards => {}
         }
+        self.show_waiting(window);
         // The agents screen shows live activity and connection state.
         self.agents.update(cx, |_, cx| cx.notify());
         cx.notify();
+    }
+
+    /// The window title says how many requests wait, so a window behind others or in a
+    /// task switcher shows it. Set only when the count changes.
+    fn show_waiting(&mut self, window: &mut Window) {
+        let waiting = self.approvals.len();
+        if self.title_waiting != Some(waiting) {
+            self.title_waiting = Some(waiting);
+            window.set_window_title(&window_title(waiting));
+        }
+    }
+
+    /// Redraw each second while a request waits, for the banner's "refused in" time; it
+    /// stops with the last request. A hidden window isn't drawn, so it skips the redraw.
+    fn start_countdown(&mut self, cx: &mut Context<Self>) {
+        if self.countdown.is_some() {
+            return;
+        }
+        self.countdown = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(std::time::Duration::from_secs(1)).await;
+                let waiting = this.update(cx, |this, cx| {
+                    if this.approvals.is_empty() {
+                        this.countdown = None;
+                        return false;
+                    }
+                    if !this.window_hidden {
+                        cx.notify();
+                    }
+                    true
+                });
+                if !matches!(waiting, Ok(true)) {
+                    break;
+                }
+            }
+        }));
     }
 
     fn route(&self) -> &Route {
@@ -687,6 +900,30 @@ pub(crate) fn dev_var(name: &str) -> Option<String> {
     }
 }
 
+/// The window title: the app's name, and how many approvals wait while any do.
+fn window_title(waiting: usize) -> String {
+    match waiting {
+        0 => "Recouvrance".into(),
+        1 => "1 approval waiting — Recouvrance".into(),
+        n => format!("{n} approvals waiting — Recouvrance"),
+    }
+}
+
+/// The highest approval id a notification was sent for, across the app's windows.
+struct NotifiedApproval(u64);
+
+impl Global for NotifiedApproval {}
+
+/// Whether this window is the first to hear of approval `id`, and so sends its notification.
+/// Ids only grow, so a later window (or event) for the same request sends nothing.
+fn first_to_notify(cx: &mut App, id: u64) -> bool {
+    if cx.try_global::<NotifiedApproval>().is_some_and(|n| n.0 >= id) {
+        return false;
+    }
+    cx.set_global(NotifiedApproval(id));
+    true
+}
+
 /// Desktop notification (best effort), so approvals are seen while Recouvrance is in the background.
 fn notify_desktop(title: &str, body: &str) {
     // Approval texts can hold a whole manifest; the notification only needs the first lines.
@@ -694,14 +931,46 @@ fn notify_desktop(title: &str, body: &str) {
     if body.chars().count() > 200 {
         body = body.chars().take(200).collect::<String>() + "…";
     }
-    let body = body.as_str();
-    // `--`: a title or body starting with '-' (an agent's text) is never read as an option.
-    crate::forwards::spawn_reaped(
-        std::process::Command::new("notify-send")
-            .args(["--app-name=recouvrance", "--urgency=critical", "--icon=dialog-question", "--", title, body])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null()),
-    );
+    #[cfg(target_os = "macos")]
+    let mut cmd = {
+        let mut cmd = std::process::Command::new("osascript");
+        cmd.args(osascript_args(title, &body));
+        cmd
+    };
+    #[cfg(not(target_os = "macos"))]
+    let mut cmd = {
+        let mut cmd = std::process::Command::new("notify-send");
+        // `--`: a title or body starting with '-' (an agent's text) is never read as an option.
+        cmd.args([
+            "--app-name=recouvrance",
+            "--urgency=critical",
+            "--icon=dialog-question",
+            "--",
+            title,
+            body.as_str(),
+        ]);
+        cmd
+    };
+    crate::forwards::spawn_reaped(cmd.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()));
+}
+
+/// osascript's arguments for a notification on macOS (Notification Center). The agent's text
+/// is never part of the script, where it could run commands (`do shell script`): the script
+/// reads it from its arguments. The fixed first argument ends osascript's options, so a text
+/// starting with '-' is not read as one.
+#[cfg(any(target_os = "macos", test))]
+fn osascript_args<'a>(title: &'a str, body: &'a str) -> [&'a str; 9] {
+    [
+        "-e",
+        "on run argv",
+        "-e",
+        "display notification (item 3 of argv) with title (item 2 of argv)",
+        "-e",
+        "end run",
+        "recouvrance",
+        title,
+        body,
+    ]
 }
 
 /// Close the open dialog and show Settings → General, where what deleting asks is set.
@@ -738,14 +1007,39 @@ mod tests {
     }
 
     #[test]
+    fn the_title_says_how_many_approvals_wait() {
+        assert_eq!(super::window_title(0), "Recouvrance");
+        assert_eq!(super::window_title(1), "1 approval waiting — Recouvrance");
+        assert_eq!(super::window_title(3), "3 approvals waiting — Recouvrance");
+    }
+
+    /// The agent's text reaches osascript only as arguments after a fixed one: it is never
+    /// script source (where `do shell script` would run commands), nor read as an option.
+    #[test]
+    fn a_macos_notification_never_runs_the_agents_text() {
+        let (title, body) = ("-e evil", "\" & do shell script \"touch /tmp/x\" & \"");
+        let args = super::osascript_args(title, body);
+        let (script, rest) = args.split_at(args.len() - 3);
+        assert_eq!(rest, ["recouvrance", title, body]);
+        assert!(script.iter().all(|a| !a.contains("shell") && !a.contains("evil")));
+        // Each statement follows its own -e.
+        let (pairs, odd) = script.as_chunks::<2>();
+        assert!(odd.is_empty());
+        assert!(pairs.iter().all(|[flag, statement]| *flag == "-e" && *statement != "-e"));
+        assert!(script.iter().any(|a| a.contains("item 2 of argv") && a.contains("item 3 of argv")));
+    }
+
+    #[test]
     fn f5_reaches_the_terminal() {
-        let keymap = Keymap::new(super::key_bindings());
-        let f5 = [Keystroke::parse("f5").unwrap()];
-        let app = KeyContext::parse("App").unwrap();
-        let (bindings, _) = keymap.bindings_for_input(&f5, std::slice::from_ref(&app));
-        assert_eq!(bindings.len(), 1);
-        let (bindings, _) = keymap.bindings_for_input(&f5, &[app, KeyContext::parse("Terminal").unwrap()]);
-        assert!(bindings.is_empty());
+        for mac in [false, true] {
+            let keymap = Keymap::new(super::key_bindings_on(mac));
+            let f5 = [Keystroke::parse("f5").unwrap()];
+            let app = KeyContext::parse("App").unwrap();
+            let (bindings, _) = keymap.bindings_for_input(&f5, std::slice::from_ref(&app));
+            assert_eq!(bindings.len(), 1);
+            let (bindings, _) = keymap.bindings_for_input(&f5, &[app, KeyContext::parse("Terminal").unwrap()]);
+            assert!(bindings.is_empty());
+        }
     }
 }
 
@@ -757,7 +1051,20 @@ mod wait_tests {
 
     use gpui_kit::{AppContext as _, Entity, EntityId, TestAppContext};
 
-    use super::{VisiblePages, wait_visible_or_away};
+    use super::{VisiblePages, first_to_notify, wait_visible_or_away};
+
+    /// Every window hears of each approval; only the first to hear sends the notification,
+    /// whichever order the windows hear of the requests in.
+    #[gpui_kit::test]
+    fn one_notification_per_approval_for_all_windows(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            assert!(first_to_notify(cx, 1), "the first window");
+            assert!(!first_to_notify(cx, 1), "a second window, same request");
+            assert!(first_to_notify(cx, 2), "the next request");
+            assert!(!first_to_notify(cx, 1), "a window late with an earlier request");
+            assert!(!first_to_notify(cx, 2));
+        });
+    }
 
     /// A page that counts the turns it spent in the back/forward history.
     #[derive(Default)]

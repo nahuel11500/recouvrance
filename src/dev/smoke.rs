@@ -38,12 +38,17 @@ pub fn run(ctx: String) {
             println!();
             return;
         }
-        if std::env::var("RECOUVRANCE_PROBLEMS").is_ok() {
+        if let Ok(how) = std::env::var("RECOUVRANCE_PROBLEMS") {
             let kinds = k8s::discover(client.clone()).await.unwrap();
+            if how == "kinds" {
+                problems_by_kind(&client, &kinds).await;
+                return;
+            }
             let t = std::time::Instant::now();
             let scan = problems::scan_partial(client.clone(), &kinds, None, None).await;
             let p = &scan.problems;
             println!("{} problems in {:?}", p.len(), t.elapsed());
+            println!("peak memory {} MB (VmHWM)", mb(memory("VmHWM")));
             if let Some(skipped) = scan.skipped_text() {
                 println!("could not read {skipped}");
             }
@@ -116,10 +121,38 @@ pub fn run(ctx: String) {
             println!("plain list: {n} pods in {:?}", t.elapsed());
             return;
         }
-        if std::env::var("RECOUVRANCE_CLUSTERLOAD").is_ok() {
+        // RECOUVRANCE_PODRES=<secs>: the usage bars' requests and limits of every pod, read that
+        // long as the pods list reads them; then what that read, and the memory it took.
+        if let Some(secs) = std::env::var("RECOUVRANCE_PODRES").ok().and_then(|s| s.parse::<u64>().ok()) {
+            let start = std::time::Instant::now();
+            let (_g, mut rx) =
+                k8s::watch_pod_resources(client.clone(), None, k8s::Pause::default(), k8s::Pause::default());
+            while start.elapsed() < std::time::Duration::from_secs(secs) {
+                if !rx.has_changed().unwrap_or(false) {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    continue;
+                }
+                let read = rx.borrow_and_update().clone();
+                let at = start.elapsed().as_secs_f64();
+                match read {
+                    Some(Ok(read)) => println!("pod resources: {} pods at {at:.1}s", read.totals.pods),
+                    Some(Err(e)) => println!("pod resources: {e} at {at:.1}s"),
+                    None => {}
+                }
+            }
+            print_reads(&ctx);
+            print_memory();
+            return;
+        }
+        // RECOUVRANCE_CLUSTERLOAD=<rounds>: the cluster overview's load that many times in a row
+        // (1 when not a number), each round's time and what it read.
+        if let Ok(rounds) = std::env::var("RECOUVRANCE_CLUSTERLOAD") {
             let t = std::time::Instant::now();
-            let running = crate::ui::cluster::debug_load(ctx.clone(), client.clone()).await;
+            let rounds = rounds.parse().unwrap_or(1);
+            let running = crate::ui::cluster::debug_load(ctx.clone(), client.clone(), rounds).await;
             println!("cluster overview load: {:?} running={running}", t.elapsed());
+            print_reads(&ctx);
+            print_memory();
             return;
         }
         if std::env::var("RECOUVRANCE_HELMLOAD").is_ok() {
@@ -141,10 +174,18 @@ pub fn run(ctx: String) {
             println!("helm fill: {n} releases ({r:?}), first page at {first:?}, all at {:?}", t.elapsed());
             return;
         }
-        if std::env::var("RECOUVRANCE_DASH").is_ok() {
-            let t = std::time::Instant::now();
-            let r = crate::ui::dashboard::debug_load(client.clone()).await;
-            println!("dashboard load: {:?} ok={}", t.elapsed(), r);
+        // RECOUVRANCE_DASH=<runs>: the Workloads overview loaded that many times in a row, as
+        // the page refreshes; each load's parts, requests and bytes, then the peak memory.
+        if let Ok(runs) = std::env::var("RECOUVRANCE_DASH") {
+            let runs = runs.parse::<u32>().unwrap_or(1).max(1);
+            for run in 1..=runs {
+                k8s::meter::reset();
+                let t = std::time::Instant::now();
+                let r = crate::ui::dashboard::debug_load(client.clone()).await;
+                println!("dashboard load {run}: {:?} ok={r}", t.elapsed());
+                print_reads(&ctx);
+            }
+            println!("peak {} MB, now {} MB", mb(memory("VmHWM")), mb(memory("VmRSS")));
             return;
         }
         // RECOUVRANCE_EDIT=ns/deploy: YAML round trip + server-side dry-run replace.
@@ -220,4 +261,78 @@ pub fn run(ctx: String) {
             }
         }
     });
+}
+
+/// Bytes this context's requests brought so far, after decompression (Settings → API requests).
+pub fn bytes_read(ctx: &str) -> u64 {
+    let seen = k8s::meter::snapshot(k8s::meter::now_minute());
+    seen.classes.iter().filter(|(c, ..)| c == ctx).map(|(_, _, stats)| stats.bytes).sum()
+}
+
+/// What this context's requests brought since the meter's last reset by kind, as Settings →
+/// API requests shows it, and the heaviest of them with their time to the last byte.
+fn print_reads(ctx: &str) {
+    let seen = k8s::meter::snapshot(k8s::meter::now_minute());
+    for (_, class, stats) in seen.classes.iter().filter(|(c, ..)| c == ctx) {
+        let megabytes = stats.bytes as f64 / 1e6;
+        println!("{}: {} requests ({} failed), {megabytes:.1} MB", class.label(), stats.count, stats.errors);
+    }
+    for heavy in seen.heaviest.iter().filter(|h| h.context == ctx) {
+        let took = heavy.last_byte.map_or_else(|| "-".to_string(), |d| format!("{:.2} s", d.as_secs_f64()));
+        println!("heaviest: {} {} {:.1} MB in {took}", heavy.method, heavy.path, heavy.bytes as f64 / 1e6);
+    }
+}
+
+/// The process's peak and current memory, as Linux counts them.
+fn print_memory() {
+    let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+    for line in status.lines().filter(|l| l.starts_with("VmHWM") || l.starts_with("VmRSS")) {
+        println!("{line}");
+    }
+}
+
+/// Each check of the Problems scan alone, one after the other (`RECOUVRANCE_PROBLEMS=kinds`):
+/// its time, and the process's peak resident memory while it ran, with what it held before.
+/// The memory is Linux's: the peak is reset to what is held before each check.
+async fn problems_by_kind(client: &kube::Client, kinds: &[k8s::Kind]) {
+    let with_services = |k: &k8s::Kind| problems::WITH_SERVICES.iter().any(|(g, n)| k.is(g, n));
+    for (group, name) in problems::CHECKED {
+        let Some(kind) = kinds.iter().find(|k| k.is(group, name)) else { continue };
+        // Checked with the Services they point to.
+        if with_services(kind) {
+            continue;
+        }
+        let mut checked = vec![kind.clone()];
+        if kind.is("", "Service") {
+            checked.extend(kinds.iter().filter(|k| with_services(k)).cloned());
+        }
+        // What the check before freed goes back to the system after a moment.
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        let _ = std::fs::write("/proc/self/clear_refs", "5");
+        let before = memory("VmRSS");
+        let t = std::time::Instant::now();
+        let scan = problems::scan_partial(client.clone(), &checked, None, None).await;
+        println!(
+            "{name}: {} problems in {:?}, peak {} MB from {} MB",
+            scan.problems.len(),
+            t.elapsed(),
+            mb(memory("VmHWM")),
+            mb(before)
+        );
+        if let Some(skipped) = scan.skipped_text() {
+            println!("  could not read {skipped}");
+        }
+    }
+}
+
+/// A memory figure of this process in MB, from /proc/self/status (`VmHWM`: its peak, `VmRSS`:
+/// now); None off Linux.
+fn memory(field: &str) -> Option<u64> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    let kb = status.lines().find_map(|l| l.strip_prefix(field)?.strip_prefix(':'))?;
+    Some(kb.trim().trim_end_matches("kB").trim().parse::<u64>().ok()? / 1024)
+}
+
+fn mb(v: Option<u64>) -> String {
+    v.map_or_else(|| "?".into(), |v| v.to_string())
 }

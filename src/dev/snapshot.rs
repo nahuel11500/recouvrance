@@ -158,6 +158,7 @@ pub fn run(path: &str, wait: Duration) -> Result<()> {
             Ok("delete") => Some("Delete"),
             Ok("restart") => Some("Restart"),
             Ok("scale") => Some("Scale"),
+            Ok("logs") => Some("Logs"),
             _ => None,
         };
         cx.update_window(window.into(), |_, window, cx| app_view.update(cx, |v, cx| v.demo_mark(n, bulk, window, cx)))?;

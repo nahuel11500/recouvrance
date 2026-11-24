@@ -11,7 +11,6 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use super::{DetailPanel, DetailTab, container_names, writes_enabled};
-use crate::favorites::FavObject;
 use crate::k8s;
 use crate::ui::selectable::{copy_menu, selectable};
 
@@ -496,9 +495,8 @@ impl Render for DetailPanel {
         {
             tabs.push(DetailTab::Revisions);
         }
-        if self.obj.kind.ar.group == "apps" || self.obj.kind.is("batch", "Job") || self.obj.kind.is("", "Pod") {
-            tabs.push(DetailTab::Map);
-        }
+        // Every kind has a Map: at least its owners and what it owns.
+        tabs.push(DetailTab::Map);
         if self.logs.is_some() {
             tabs.push(DetailTab::Logs);
         }
@@ -525,10 +523,7 @@ impl Render for DetailPanel {
             DetailTab::Reachability => self.render_reachability(cx),
             DetailTab::Compare => self.render_compare(cx),
             DetailTab::History => self.render_history(cx),
-            DetailTab::Map => match &self.object {
-                Some(v) => crate::overview::relations(&self.ctx(v, cx), cx),
-                None => div().into_any_element(),
-            },
+            DetailTab::Map => self.render_map(cx),
             DetailTab::Revisions => match &self.object {
                 Some(v) => crate::overview::revisions(&self.ctx(v, cx), cx),
                 None => div().into_any_element(),
@@ -584,13 +579,8 @@ impl Render for DetailPanel {
                             .gap_2()
                             .child(heading_name(self.obj.namespace.as_deref(), &self.obj.name, cx))
                             .child({
-                                let fav = FavObject {
-                                    context: self.context.clone(),
-                                    kind: self.obj.kind.kubectl_name(),
-                                    namespace: self.obj.namespace.clone(),
-                                    name: self.obj.name.clone(),
-                                };
-                                let starred = self.favorites.read(cx).has_object(&fav);
+                                let fav = self.favorite();
+                                let starred = self.favorites.read(cx).has(&fav);
                                 let favs = self.favorites.clone();
                                 Button::new("star")
                                     .xsmall()
@@ -600,7 +590,12 @@ impl Render for DetailPanel {
                                     } else {
                                         Icon::new(Lucide::Star)
                                     })
-                                    .on_click(move |_, _, cx| favs.update(cx, |f, cx| f.toggle_object(fav.clone(), cx)))
+                                    .tooltip(crate::app::with_keys(if starred {
+                                        "Remove from favorites ({*})"
+                                    } else {
+                                        "Add to favorites ({*})"
+                                    }))
+                                    .on_click(move |_, _, cx| favs.update(cx, |f, cx| f.toggle(fav.clone(), cx)))
                             })
                             .child(Button::new("copy-name").xsmall().ghost().icon(Lucide::Copy).on_click(
                                 move |_, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(full_name.clone())),
@@ -667,10 +662,7 @@ impl Render for DetailPanel {
                         let _ = view.update(cx, |this, cx| {
                             this.tab = tab;
                             this.resume_logs_if_shown(cx);
-                            // Checked again each time it is opened: the cluster moves on.
-                            if tab == DetailTab::Reachability {
-                                this.check_reachability(cx);
-                            }
+                            this.tab_opened(cx);
                             cx.notify();
                         });
                     }),

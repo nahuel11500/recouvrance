@@ -6,17 +6,21 @@ use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
 use gpui_kit::component::switch::Switch;
-use gpui_kit::component::{ActiveTheme as _, Icon, Selectable as _, Sizable as _, ThemeMode, h_flex, v_flex};
+use gpui_kit::component::{
+    ActiveTheme as _, Disableable as _, Icon, Selectable as _, Sizable as _, ThemeMode, h_flex, v_flex,
+};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use crate::settings::{self, ConfirmStyle, DeleteConfirm, InitialView, Startup};
 
-#[derive(Clone, Copy, PartialEq)]
-enum Section {
+/// A section of the page, picked on its left.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Section {
     General,
     Contexts,
     Clusters,
+    ArgoCd,
     Appearance,
     Refresh,
     Logs,
@@ -30,10 +34,11 @@ enum Section {
     About,
 }
 
-const SECTIONS: [(Section, &str, Lucide); 14] = [
+const SECTIONS: [(Section, &str, Lucide); 15] = [
     (Section::General, "General", Lucide::Settings),
     (Section::Contexts, "Contexts", Lucide::Ship),
     (Section::Clusters, "Per cluster", Lucide::Server),
+    (Section::ArgoCd, "Argo CD", Lucide::GitBranch),
     (Section::Appearance, "Appearance", Lucide::Palette),
     (Section::Refresh, "Refresh rates", Lucide::RefreshCw),
     (Section::Logs, "Log viewer", Lucide::ScrollText),
@@ -70,6 +75,26 @@ pub struct SettingsView {
     cluster_inputs: Vec<(String, Entity<InputState>, Entity<InputState>)>,
     /// Per context: the user and groups writes may run as (`kubectl --as`).
     run_as_inputs: Vec<(String, Entity<InputState>, Entity<InputState>)>,
+    /// Per context: its Argo CD API server, and a token to log in with (never shown back).
+    argo_inputs: Vec<(String, Entity<InputState>, Entity<InputState>)>,
+    /// The contexts with an Argo CD token saved, read when the rows are made.
+    argo_tokens: std::collections::BTreeSet<String>,
+    /// Why the token typed for a context could not be saved.
+    argo_token_error: Option<(String, SharedString)>,
+    /// Settings → Argo CD: the API servers, as last read (the argocd CLI's and those set here).
+    argo_api: crate::k8s::argo::api::Endpoints,
+    /// Each server's connection test, by address: running (None), or what it found.
+    argo_api_tests: std::collections::HashMap<String, Option<Result<String, String>>>,
+    _argo_api_test_tasks: std::collections::HashMap<String, Task<()>>,
+    /// Reads the servers off the UI thread.
+    argo_api_read: crate::latest::Latest,
+    /// A server to add: its address, and a token (never shown back).
+    argo_api_url: Entity<InputState>,
+    argo_api_token: Entity<InputState>,
+    /// Why the server typed could not be added.
+    argo_api_error: Option<SharedString>,
+    /// The label naming an Application's service on the Argo CD page.
+    argo_group_label: Entity<InputState>,
     /// A kind to give its own delete confirmation (Enter adds it).
     delete_kind: Entity<InputState>,
     /// The connected clusters' kinds, to check a kind typed in `delete_kind`.
@@ -80,6 +105,21 @@ pub struct SettingsView {
     _saves: std::collections::HashMap<EntityId, Task<()>>,
     /// Redraws API requests every 2 s while it is shown.
     _ticker: Task<()>,
+    /// What About's Check for updates found, and its request (sent only on a click).
+    update_check: Option<UpdateCheck>,
+    update_task: crate::latest::Latest,
+}
+
+/// The Argo CD token field, empty: one is saved, or the argocd CLI's login is used.
+const TOKEN_SAVED: &str = "token saved (type to replace)";
+const TOKEN_NONE: &str = "token: none, the argocd CLI's login";
+
+/// What Check for updates found.
+enum UpdateCheck {
+    Checking,
+    /// The version of the latest release.
+    Found(String),
+    Failed(String),
 }
 
 impl SettingsView {
@@ -109,6 +149,10 @@ impl SettingsView {
             cx,
         );
         let repos = textarea(s.assistant_repos.join("\n"), "~/code/shop", window, cx);
+        let argo_api_url = field(String::new(), "https://argocd.example.com", window, cx);
+        let argo_api_token =
+            cx.new(|cx| InputState::new(window, cx).masked(true).placeholder("token (argocd account generate-token)"));
+        let argo_group_label = field(s.argocd_group_label, "none: the name without its environment", window, cx);
 
         let mut subs = Vec::new();
         let number = |input: &Entity<InputState>, apply: fn(&mut settings::Settings, u64), cx: &mut Context<Self>| {
@@ -137,6 +181,14 @@ impl SettingsView {
             }
         }));
         subs.push(Self::save_typed(&notes, textarea_text, cx, |v| settings::update(|s| s.assistant_notes = v)));
+        subs.push(Self::save_typed(&argo_group_label, input_text, cx, |v| {
+            settings::update(|s| s.argocd_group_label = v.trim().to_string());
+        }));
+        subs.push(cx.subscribe_in(&argo_api_token, window, |this, _, ev: &InputEvent, window, cx| {
+            if let InputEvent::PressEnter { .. } = ev {
+                this.add_argo_api(window, cx);
+            }
+        }));
         subs.push(Self::save_typed(&repos, textarea_text, cx, |v| {
             settings::update(|s| s.assistant_repos = repo_lines(&v));
         }));
@@ -167,11 +219,13 @@ impl SettingsView {
         let section = match crate::app::dev_var("RECOUVRANCE_SECTION").as_deref() {
             Some("contexts") => Section::Contexts,
             Some("clusters") => Section::Clusters,
+            Some("argocd") => Section::ArgoCd,
             Some("kubeconfig") => Section::Kubeconfig,
             Some("plugins") => Section::Plugins,
             Some("appearance") => Section::Appearance,
             Some("general") => Section::General,
             Some("assistant") => Section::Assistant,
+            Some("about") => Section::About,
             _ => Section::General,
         };
         let mut this = Self {
@@ -191,6 +245,17 @@ impl SettingsView {
             prometheus: Vec::new(),
             cluster_inputs: Vec::new(),
             run_as_inputs: Vec::new(),
+            argo_inputs: Vec::new(),
+            argo_tokens: Default::default(),
+            argo_token_error: None,
+            argo_api: Default::default(),
+            argo_api_tests: Default::default(),
+            _argo_api_test_tasks: Default::default(),
+            argo_api_read: Default::default(),
+            argo_api_url,
+            argo_api_token,
+            argo_api_error: None,
+            argo_group_label,
             delete_kind,
             kinds: Vec::new(),
             hub,
@@ -209,6 +274,8 @@ impl SettingsView {
                     }
                 }
             }),
+            update_check: None,
+            update_task: Default::default(),
         };
         // Another window may have changed a setting meanwhile.
         this._subs.push(cx.observe_window_activation(window, |this, window, cx| {
@@ -217,7 +284,101 @@ impl SettingsView {
             }
         }));
         this.sync_clusters(window, cx);
+        if this.section == Section::ArgoCd {
+            this.reload_argo_api(cx);
+        }
         this
+    }
+
+    /// Read the Argo CD API servers again (the argocd CLI's config, the tokens file), off the
+    /// UI thread; a read again replaces the one running.
+    fn reload_argo_api(&mut self, cx: &mut Context<Self>) {
+        let read = cx.background_executor().spawn(async { crate::k8s::argo::api::endpoints() });
+        self.argo_api_read.spawn(cx, read, |this, found, cx| {
+            this.argo_api = found;
+            cx.notify();
+        });
+    }
+
+    /// The servers changed: the Argo CD page reads them anew, and this list too.
+    fn argo_api_changed(&mut self, cx: &mut Context<Self>) {
+        crate::k8s::argo::api::reload();
+        self.reload_argo_api(cx);
+        cx.notify();
+    }
+
+    /// Add the server typed, with its token (or set the token of one listed): the address
+    /// goes in settings.json, the token in a file only the user can read.
+    fn add_argo_api(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        use crate::k8s::argo::{api, server::Server};
+        let typed = self.argo_api_url.read(cx).value().trim().to_string();
+        let token = self.argo_api_token.read(cx).value().trim().to_string();
+        let server = match Server::parse(&typed) {
+            Ok(s) => s,
+            Err(e) => {
+                self.argo_api_error = Some(e.into());
+                cx.notify();
+                return;
+            }
+        };
+        if !token.is_empty()
+            && let Err(e) = api::save_token(&server.base, &token)
+        {
+            self.argo_api_error = Some(format!("Could not save the token: {e}").into());
+            cx.notify();
+            return;
+        }
+        let base = server.base;
+        settings::update(|s| {
+            let listed = s.argocd_api_servers.iter().any(|t| Server::parse(t).is_ok_and(|x| x.base == base));
+            if !listed {
+                s.argocd_api_servers.push(base.clone());
+            }
+            s.argocd_api_off.retain(|b| *b != base);
+        });
+        self.argo_api_error = None;
+        self.argo_api_url.update(cx, |s, cx| s.set_value("", window, cx));
+        self.argo_api_token.update(cx, |s, cx| s.set_value("", window, cx));
+        self.argo_api_changed(cx);
+    }
+
+    /// Remove a server set here, and forget its token. One the argocd CLI is logged in to
+    /// stays (turned off, it is not read).
+    fn remove_argo_api(&mut self, base: &str, cx: &mut Context<Self>) {
+        use crate::k8s::argo::{api, server::Server};
+        if let Err(e) = api::save_token(base, "") {
+            self.argo_api_error = Some(format!("Could not forget the token: {e}").into());
+        }
+        settings::update(|s| s.argocd_api_servers.retain(|t| !Server::parse(t).is_ok_and(|x| x.base == base)));
+        self.argo_api_changed(cx);
+    }
+
+    /// Read a server on the Argo CD page, or not.
+    fn set_argo_api_on(&mut self, base: &str, on: bool, cx: &mut Context<Self>) {
+        settings::update(|s| {
+            s.argocd_api_off.retain(|b| b != base);
+            if !on {
+                s.argocd_api_off.push(base.to_string());
+            }
+        });
+        self.argo_api_changed(cx);
+    }
+
+    /// Check a server's login: who it logs in as, and what it may read. Read-only.
+    fn test_argo_api(&mut self, endpoint: crate::k8s::argo::api::Endpoint, cx: &mut Context<Self>) {
+        let base = endpoint.server.base.clone();
+        self.argo_api_tests.insert(base.clone(), None);
+        let done = base.clone();
+        let task = cx.spawn(async move |this, cx| {
+            let found = crate::k8s::argo::api::test(endpoint).await;
+            let _ = this.update(cx, |this, cx| {
+                this.argo_api_tests.insert(done, Some(found));
+                cx.notify();
+            });
+        });
+        // A test again replaces (and stops) the one running.
+        self._argo_api_test_tasks.insert(base, task);
+        cx.notify();
     }
 
     /// Save what is typed in `input` once typing pauses, or when the field loses focus:
@@ -271,6 +432,8 @@ impl SettingsView {
         self.cluster_inputs.retain(|(ctx, ..)| names.contains(ctx));
         self.prometheus.retain(|(ctx, _)| names.contains(ctx));
         self.run_as_inputs.retain(|(ctx, ..)| names.contains(ctx));
+        self.argo_inputs.retain(|(ctx, ..)| names.contains(ctx));
+        self.argo_tokens = crate::k8s::argo::server::token_contexts();
         for ctx in &names {
             if !self.cluster_inputs.iter().any(|(c, ..)| c == ctx) {
                 self.add_cluster(ctx.clone(), window, cx);
@@ -331,7 +494,68 @@ impl SettingsView {
                 v.split(',').map(str::trim).filter(|g| !g.is_empty()).map(String::from).collect();
             settings::set_run_as(&c, Some(typed.borrow().clone()));
         }));
-        self.run_as_inputs.push((ctx, user, groups));
+        self.run_as_inputs.push((ctx.clone(), user, groups));
+        self.add_argo_server(ctx, window, cx);
+    }
+
+    /// The Argo CD server of `ctx` (saved as typed), and its token: saved on Enter or when
+    /// the field is left, then cleared, so it is never shown again.
+    fn add_argo_server(&mut self, ctx: String, window: &mut Window, cx: &mut Context<Self>) {
+        let saved = settings::with(|s| s.argocd_servers.get(&ctx).cloned()).unwrap_or_default();
+        let server = Self::field(saved, "Argo CD server: none, its diff is off", window, cx);
+        let c = ctx.clone();
+        self._subs.push(Self::save_typed(&server, input_text, cx, move |v| {
+            let v = v.trim().to_string();
+            settings::update(|s| {
+                if v.is_empty() {
+                    s.argocd_servers.remove(&c);
+                } else {
+                    s.argocd_servers.insert(c.clone(), v);
+                }
+            });
+        }));
+        let placeholder = if self.argo_tokens.contains(&ctx) { TOKEN_SAVED } else { TOKEN_NONE };
+        let token = cx.new(|cx| InputState::new(window, cx).masked(true).placeholder(placeholder));
+        let c = ctx.clone();
+        self._subs.push(cx.subscribe_in(&token, window, move |this, state, ev: &InputEvent, window, cx| {
+            if !matches!(ev, InputEvent::PressEnter { .. } | InputEvent::Blur) {
+                return;
+            }
+            let typed = state.read(cx).value().trim().to_string();
+            if typed.is_empty() {
+                return;
+            }
+            match crate::k8s::argo::server::save_token(&c, &typed) {
+                Ok(()) => {
+                    this.argo_tokens.insert(c.clone());
+                    this.argo_token_error = None;
+                    state.update(cx, |s, cx| {
+                        s.set_value("", window, cx);
+                        s.set_placeholder(TOKEN_SAVED, window, cx);
+                    });
+                }
+                Err(e) => this.argo_token_error = Some((c.clone(), format!("Could not save the token: {e}").into())),
+            }
+            cx.notify();
+        }));
+        self.argo_inputs.push((ctx, server, token));
+    }
+
+    /// Forget the Argo CD token saved for `ctx`: the argocd CLI's login is used again.
+    fn forget_argo_token(&mut self, ctx: &str, window: &mut Window, cx: &mut Context<Self>) {
+        match crate::k8s::argo::server::save_token(ctx, "") {
+            Ok(()) => {
+                self.argo_tokens.remove(ctx);
+                self.argo_token_error = None;
+                if let Some((_, _, token)) = self.argo_inputs.iter().find(|(c, ..)| c == ctx) {
+                    token.update(cx, |s, cx| s.set_placeholder(TOKEN_NONE, window, cx));
+                }
+            }
+            Err(e) => {
+                self.argo_token_error = Some((ctx.to_string(), format!("Could not forget the token: {e}").into()));
+            }
+        }
+        cx.notify();
     }
 
     /// Show the saved values in the fields not being edited: each window has its own fields,
@@ -356,6 +580,10 @@ impl SettingsView {
             fields.push((image.clone(), cs.node_shell_image.unwrap_or_default()));
             fields.push((namespaces.clone(), cs.namespaces.join(", ")));
         }
+        for (ctx, server, _) in &self.argo_inputs {
+            fields.push((server.clone(), s.argocd_servers.get(ctx).cloned().unwrap_or_default()));
+        }
+        fields.push((self.argo_group_label.clone(), s.argocd_group_label.clone()));
         for (ctx, user, groups) in &self.run_as_inputs {
             let saved = s.clusters.get(ctx).and_then(|c| c.run_as.clone()).unwrap_or_default();
             fields.push((user.clone(), saved.user));
@@ -381,6 +609,24 @@ impl SettingsView {
 
     pub fn set_kinds(&mut self, kinds: Vec<crate::k8s::Kind>) {
         self.kinds = kinds;
+    }
+
+    /// Every section: its name and icon, in the page's order.
+    pub fn sections() -> &'static [(Section, &'static str, Lucide)] {
+        &SECTIONS
+    }
+
+    /// Show `section`, with its fields read again.
+    pub fn show(&mut self, section: Section, window: &mut Window, cx: &mut Context<Self>) {
+        self.section = section;
+        if matches!(section, Section::Clusters | Section::Contexts) {
+            self.sync_clusters(window, cx);
+        }
+        if section == Section::ArgoCd {
+            self.reload_argo_api(cx);
+        }
+        self.reload_fields(window, cx);
+        cx.notify();
     }
 
     /// Open on the General section (where deletes are configured).
@@ -503,6 +749,7 @@ impl SettingsView {
             Section::General => self.general_section(cx),
             Section::Contexts => self.contexts_section(cx),
             Section::Clusters => self.clusters_section(cx),
+            Section::ArgoCd => self.argo_section(cx),
             Section::Appearance => self.appearance_section(cx),
             Section::Refresh => self.refresh_section(cx),
             Section::Logs => self.logs_section(cx),
@@ -744,6 +991,10 @@ impl SettingsView {
             .enumerate()
             .map(|(i, (ctx, image, namespaces))| {
                 let prom = self.prometheus.iter().find(|(c, _)| c == ctx).map(|(_, i)| i.clone());
+                let argo = self.argo_inputs.iter().find(|(c, ..)| c == ctx).map(|(_, s, t)| (s.clone(), t.clone()));
+                let has_token = self.argo_tokens.contains(ctx);
+                let token_error = self.argo_token_error.as_ref().filter(|(c, _)| c == ctx).map(|(_, e)| e.clone());
+                let forget = ctx.clone();
                 let off = settings::cluster(ctx).metrics_disabled;
                 let c = ctx.clone();
                 let label =
@@ -789,6 +1040,23 @@ impl SettingsView {
                             .child(label("Accessible namespaces"))
                             .child(div().flex_1().child(Input::new(namespaces).small())),
                     )
+                    .children(argo.map(|(server, token)| {
+                        h_flex()
+                            .gap_2()
+                            .child(label("Argo CD server, token"))
+                            .child(div().flex_1().child(Input::new(&server).small()))
+                            .child(div().flex_1().child(Input::new(&token).small()))
+                            .when(has_token, |d| {
+                                d.child(
+                                    Button::new(("argo-token-forget", i)).xsmall().ghost().label("Forget").on_click(
+                                        cx.listener(move |this, _, window, cx| {
+                                            this.forget_argo_token(&forget, window, cx);
+                                        }),
+                                    ),
+                                )
+                            })
+                    }))
+                    .children(token_error.map(|e| div().text_xs().text_color(theme.danger).child(e)))
                     .into_any_element()
             })
             .collect();
@@ -796,9 +1064,147 @@ impl SettingsView {
             .child(div().pb_2().text_sm().text_color(muted).child(
                 "Metrics endpoint: found automatically; or namespace/service:port, with a path for VictoriaMetrics \
                  (vmselect: monitoring/vmselect:8481/select/0/prometheus; single: monitoring/victoria-metrics:8428), or a full http(s) URL. \
-                 Accessible namespaces are used when you may not list namespaces: they fill the picker, and the list shows one of them at a time.",
+                 Accessible namespaces are used when you may not list namespaces: they fill the picker, and the list shows one of them at a time. \
+                 Argo CD server: on a context Argo CD runs in, its API server (https://argocd.example.com), to show Argo CD's own \
+                 diff on an Application's page. It logs in with the argocd CLI's login to that server, or with a read-only token \
+                 (`applications, get`) kept in ~/.config/recouvrance/argocd-tokens.json, readable only by you. Nothing is sent \
+                 until you ask for the diff.",
             ))
             .children(rows)
+            .into_any_element()
+    }
+
+    /// The Argo CD API servers: those of the argocd CLI and those set here, each with its
+    /// login (never the token), a test of its connection, and on or off; a form to add one;
+    /// the label that groups an Application's environments.
+    fn argo_section(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme().clone();
+        let muted = theme.muted_foreground;
+        let label = |t: &str| div().w(px(170.)).flex_shrink_0().text_sm().text_color(muted).child(t.to_string());
+        let rows: Vec<AnyElement> =
+            self.argo_api
+                .list
+                .iter()
+                .enumerate()
+                .map(|(i, e)| {
+                    let base = e.server.base.clone();
+                    let from = match (&e.cli_context, e.in_settings) {
+                        (Some(c), true) => format!("argocd CLI context {c}, and set here"),
+                        (Some(c), false) => format!("argocd CLI context {c}"),
+                        (None, _) => "set here".to_string(),
+                    };
+                    let login = match &e.login {
+                        Ok((_, how)) => (format!("Logs in with {}", how.text()), muted),
+                        Err(why) => (why.clone(), theme.danger),
+                    };
+                    let test = self.argo_api_tests.get(&base).map(|t| match t {
+                        None => ("Testing…".to_string(), muted),
+                        Some(Ok(found)) => (found.clone(), theme.success),
+                        Some(Err(why)) => (why.clone(), theme.danger),
+                    });
+                    let (b_on, b_test, b_rm) = (base.clone(), e.clone(), base.clone());
+                    // A token set here, expired or not, can be forgotten (the CLI's is used then).
+                    let settings_token = e.settings_token;
+                    let b_forget = base.clone();
+                    v_flex()
+                        .gap_1()
+                        .py_3()
+                        .border_b_1()
+                        .border_color(theme.border)
+                        .child(
+                            h_flex()
+                                .gap_3()
+                                .child(div().text_sm().font_weight(FontWeight::MEDIUM).child(e.name()))
+                                .child(div().text_xs().text_color(muted).child(from))
+                                .when(e.insecure, |d| {
+                                    d.child(div().text_xs().text_color(theme.warning).child("certificate not checked"))
+                                })
+                                .child(div().flex_1())
+                                .child(
+                                    Button::new(("argo-api-test", i))
+                                        .xsmall()
+                                        .outline()
+                                        .label("Test")
+                                        .disabled(e.login.is_err())
+                                        .on_click(
+                                            cx.listener(move |this, _, _, cx| this.test_argo_api(b_test.clone(), cx)),
+                                        ),
+                                )
+                                .when(settings_token, |d| {
+                                    d.child(
+                                        Button::new(("argo-api-forget", i))
+                                            .xsmall()
+                                            .ghost()
+                                            .label("Forget token")
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                if let Err(e) = crate::k8s::argo::api::save_token(&b_forget, "") {
+                                                    this.argo_api_error =
+                                                        Some(format!("Could not forget the token: {e}").into());
+                                                }
+                                                this.argo_api_changed(cx);
+                                            })),
+                                    )
+                                })
+                                .when(e.in_settings, |d| {
+                                    d.child(
+                                        Button::new(("argo-api-remove", i)).xsmall().ghost().label("Remove").on_click(
+                                            cx.listener(move |this, _, _, cx| this.remove_argo_api(&b_rm, cx)),
+                                        ),
+                                    )
+                                })
+                                .child(
+                                    Switch::new(("argo-api-on", i))
+                                        .checked(e.on)
+                                        .label(if e.on { "Read" } else { "Off" })
+                                        .on_click(cx.listener(move |this, v: &bool, _, cx| {
+                                            this.set_argo_api_on(&b_on, *v, cx);
+                                        })),
+                                ),
+                        )
+                        .child(div().text_xs().text_color(muted).child(base))
+                        .child(div().text_xs().text_color(login.1).child(login.0))
+                        .children(test.map(|(text, color)| div().text_xs().text_color(color).child(text)))
+                        .into_any_element()
+                })
+                .collect();
+        v_flex()
+            .child(div().pb_2().text_sm().text_color(muted).child(
+                "Argo CD read by its own API, with no kubeconfig for the cluster it runs in: the servers the argocd CLI \
+                 is logged in to (`argocd login`), and those added here. A token added here is kept in \
+                 ~/.config/recouvrance/argocd-api-tokens.json, readable only by you, and wins over the CLI's; it is \
+                 never shown, and sent to that server only. A read-only one is enough to list (`applications, get` and \
+                 `projects, get`); the Argo CD page's actions need what Argo CD's own UI would. Applications are \
+                 listed once, then kept live from Argo CD's stream while the Argo CD page is shown.",
+            ))
+            .children(self.argo_api.errors.iter().map(|e| div().pb_1().text_xs().text_color(theme.danger).child(e.clone())))
+            .when(self.argo_api.list.is_empty(), |d| {
+                d.child(div().py_2().text_sm().text_color(muted).child("No Argo CD server: add one below, or run `argocd login`."))
+            })
+            .children(rows)
+            .child(
+                h_flex()
+                    .gap_2()
+                    .pt_3()
+                    .child(label("Add a server, or its token"))
+                    .child(div().flex_1().child(Input::new(&self.argo_api_url).small()))
+                    .child(div().flex_1().child(Input::new(&self.argo_api_token).small()))
+                    .child(
+                        Button::new("argo-api-add")
+                            .small()
+                            .outline()
+                            .label("Add")
+                            .on_click(cx.listener(|this, _, window, cx| this.add_argo_api(window, cx))),
+                    ),
+            )
+            .children(self.argo_api_error.clone().map(|e| div().pt_1().text_xs().text_color(theme.danger).child(e)))
+            .child(Self::row(
+                "Group environments by label",
+                "On the Argo CD page grouped by service: Applications with the same value of this label are one \
+                 service (app.kubernetes.io/part-of, say). Without it, or for one without the label, its name \
+                 without the environment in it (shop-prod and shop-staging are shop).",
+                div().w(px(260.)).child(Input::new(&self.argo_group_label).small()),
+                cx,
+            ))
             .into_any_element()
     }
 
@@ -876,7 +1282,7 @@ impl SettingsView {
             ))
             .child(Self::row(
                 "Zoom",
-                "Also Ctrl + / Ctrl - / Ctrl 0.",
+                &crate::app::with_keys("Also {secondary-=} / {secondary--} / {secondary-0}."),
                 h_flex()
                     .gap_2()
                     .child(
@@ -1155,62 +1561,169 @@ impl SettingsView {
             .into_any_element()
     }
 
+    /// The shortcut list of the `?` panel, then where the commands without a key are.
     fn shortcuts_section(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let theme = cx.theme().clone();
-        let keys = [
-            ("Ctrl K", "Command palette: resources, pages, objects across clusters"),
-            ("Ctrl F  or  /", "Filter the current table"),
-            ("Esc", "Back from a detail page"),
-            ("↑ ↓  then  Enter", "Move in a table, open the row"),
-            ("Ctrl Shift N", "New window (shares agents and settings)"),
-            ("Ctrl T / Ctrl W", "New tab / close tab (right-click a row: open in new tab)"),
-            ("Ctrl Tab / Ctrl Shift Tab", "Next / previous tab"),
-            ("Ctrl B", "Hide or show the sidebar"),
-            ("F5  or  Ctrl R", "Refresh the page"),
-            ("Alt ← / Alt →", "Back / forward"),
-            ("Ctrl + / Ctrl - / Ctrl 0", "Zoom in / out / reset"),
-            ("Right-click a row", "Open, logs, shell, YAML, events, run, scale, restart, delete"),
-            ("Ctrl Shift V", "Paste in a shell"),
-            ("Double-click a context", "Connect to just that context"),
-        ];
         v_flex()
-            .children(keys.into_iter().map(|(k, what)| {
-                h_flex()
-                    .gap_4()
-                    .py_2()
-                    .border_b_1()
-                    .border_color(theme.border)
-                    .child(
-                        div().w(px(220.)).child(
-                            div()
-                                .px_2()
-                                .py_0p5()
-                                .rounded_md()
-                                .bg(theme.secondary)
-                                .text_xs()
-                                .font_family(theme.mono_font_family.clone())
-                                .child(k),
-                        ),
-                    )
-                    .child(div().text_sm().child(what))
-            }))
+            .gap_3()
+            .child(div().text_sm().text_color(cx.theme().muted_foreground).child(crate::app::with_keys(
+                "Every command, with a key or without, is in the command palette ({secondary-k}). Single keys \
+                 (?, g, j, k) work when no text field or terminal has focus.",
+            )))
+            .child(crate::app::shortcut_rows(cx))
             .into_any_element()
     }
 
     fn about_section(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        use crate::updates::{self, VERSION};
         let theme = cx.theme().clone();
         let muted = theme.muted_foreground;
         let _ = window;
+        let latest = match &self.update_check {
+            Some(UpdateCheck::Found(v)) => Some(v.as_str()),
+            _ => None,
+        };
+        let install = updates::install();
+        let advice = install.advice(latest);
+        let found = self.update_check.as_ref().map(|check| {
+            let line = h_flex().gap_2().text_sm();
+            match check {
+                UpdateCheck::Checking => line.text_color(muted).child("Asking GitHub for the latest release…"),
+                UpdateCheck::Failed(e) => line.text_color(theme.danger).child(format!("Could not check: {e}")),
+                UpdateCheck::Found(v) if updates::is_newer(v, VERSION) => {
+                    let page = updates::release_page(v);
+                    line.child(Icon::new(Lucide::CircleArrowUp).size_4().text_color(theme.success))
+                        .child(format!("Recouvrance {v} is out."))
+                        .child(
+                            Button::new("about-release")
+                                .xsmall()
+                                .ghost()
+                                .icon(Lucide::ExternalLink)
+                                .label("Release notes")
+                                .on_click(move |_, _, _| crate::forwards::open_url(&page)),
+                        )
+                }
+                UpdateCheck::Found(v) if updates::is_newer(VERSION, v) => {
+                    line.text_color(muted).child(format!("This build is newer than the latest release, {v}."))
+                }
+                UpdateCheck::Found(_) => line
+                    .child(Icon::new(Lucide::CircleCheck).size_4().text_color(theme.success))
+                    .child("This is the latest version."),
+            }
+        });
+        let command = advice.command.map(|cmd| {
+            let copy = cmd.clone();
+            h_flex()
+                .gap_1()
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .px_2()
+                        .py_1()
+                        .rounded_md()
+                        .bg(theme.secondary)
+                        .font_family(theme.mono_font_family.clone())
+                        .text_xs()
+                        .child(super::selectable::selectable(cmd)),
+                )
+                .child(
+                    Button::new("about-copy")
+                        .xsmall()
+                        .ghost()
+                        .icon(Lucide::Copy)
+                        .tooltip("Copy the command")
+                        .on_click(move |_, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(copy.clone()))),
+                )
+        });
+        let installed = match &install.path {
+            Some(path) => format!("{}: {}", advice.installed, path.display()),
+            None => format!("{}.", advice.installed),
+        };
         v_flex()
             .gap_2()
-            .child(h_flex().gap_2().child(super::logo(px(40.))).child(div().text_2xl().font_weight(FontWeight::BOLD).child("Recouvrance")))
-            .child(div().text_sm().text_color(muted).child(format!("Version {}", env!("CARGO_PKG_VERSION"))))
-            .child(div().text_sm().child("A native Kubernetes client in Rust (gpui), with a local MCP server for AI agents."))
-            .child(div().text_sm().text_color(muted).child(
-                "Installed with the install script: update with recouvrance-update. Releases: github.com/nahuel11500/recouvrance/releases",
-            ))
-            .child(div().pt_3().text_xs().text_color(muted).child("Settings: ~/.config/recouvrance/ · Agent activity: ~/.local/share/recouvrance/audit.jsonl"))
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(super::logo(px(40.)))
+                    .child(div().text_2xl().font_weight(FontWeight::BOLD).child("Recouvrance")),
+            )
+            .child(div().text_sm().text_color(muted).child(format!("Version {VERSION}")))
+            .child(
+                div()
+                    .text_sm()
+                    .child("A native Kubernetes client in Rust (gpui), with a local MCP server for AI agents."),
+            )
+            .child(
+                h_flex()
+                    .pt_2()
+                    .gap_2()
+                    .when(updates::own_notes().is_some(), |d| {
+                        d.child(
+                            Button::new("about-whats-new")
+                                .small()
+                                .outline()
+                                .icon(Lucide::Sparkles)
+                                .label(format!("What's new in {VERSION}"))
+                                .on_click(|_, window, cx| super::whats_new::open_own(window, cx)),
+                        )
+                    })
+                    .child(
+                        Button::new("about-check")
+                            .small()
+                            .outline()
+                            .icon(Lucide::RefreshCw)
+                            .label("Check for updates")
+                            .loading(matches!(self.update_check, Some(UpdateCheck::Checking)))
+                            .on_click(cx.listener(|this, _, _, cx| this.check_updates(cx))),
+                    )
+                    .child(
+                        Button::new("about-releases")
+                            .small()
+                            .ghost()
+                            .icon(Lucide::ExternalLink)
+                            .label("Releases")
+                            .on_click(|_, _, _| crate::forwards::open_url(updates::RELEASES)),
+                    ),
+            )
+            .children(found)
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(muted)
+                    .child("Check for updates asks GitHub for the latest release, only when you click it."),
+            )
+            .child(
+                v_flex()
+                    .gap_1()
+                    .pt_4()
+                    .child(div().text_sm().font_weight(FontWeight::MEDIUM).child("Updating"))
+                    .child(div().text_sm().text_color(muted).child(installed))
+                    .child(div().text_sm().child(advice.how))
+                    .children(command)
+                    .child(div().text_sm().child("Then restart Recouvrance.")),
+            )
+            .child(
+                div()
+                    .pt_3()
+                    .text_xs()
+                    .text_color(muted)
+                    .child("Settings: ~/.config/recouvrance/ · Agent activity: ~/.local/share/recouvrance/audit.jsonl"),
+            )
             .into_any_element()
+    }
+
+    /// Ask GitHub for the latest release: the one request About sends, and only on a click.
+    fn check_updates(&mut self, cx: &mut Context<Self>) {
+        self.update_check = Some(UpdateCheck::Checking);
+        cx.notify();
+        let request = crate::k8s::run(crate::updates::latest_release());
+        self.update_task.spawn(cx, request, |this, found, cx| {
+            this.update_check = Some(match found {
+                Ok(version) => UpdateCheck::Found(version),
+                Err(e) => UpdateCheck::Failed(format!("{e:#}")),
+            });
+            cx.notify();
+        });
     }
 }
 
@@ -1244,14 +1757,7 @@ impl Render for SettingsView {
                             .cursor_pointer()
                             .when(on, |d| d.bg(theme.list_active))
                             .hover(|s| s.bg(theme.list_hover))
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.section = sec;
-                                if matches!(sec, Section::Clusters | Section::Contexts) {
-                                    this.sync_clusters(window, cx);
-                                }
-                                this.reload_fields(window, cx);
-                                cx.notify();
-                            }))
+                            .on_click(cx.listener(move |this, _, window, cx| this.show(sec, window, cx)))
                             .child(Icon::new(*icon).size_4().text_color(theme.muted_foreground))
                             .child(*label)
                     })),

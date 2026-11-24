@@ -1,5 +1,5 @@
-//! Multi-namespace picker: a searchable checkbox list, the namespaces you visit
-//! most on this context first.
+//! Multi-namespace picker: a searchable checkbox list, the favorite namespaces of the
+//! connected contexts first, then the ones you visit most on this context.
 
 use std::collections::BTreeSet;
 
@@ -20,8 +20,9 @@ pub struct NamespacePicked;
 /// Frequent namespaces shown above the full list.
 const FREQUENT_SHOWN: usize = 5;
 
-/// What the rows show: frequent, then all matching, then a name to add by hand.
+/// What the rows show: favorites, frequent, then all matching, then a name to add by hand.
 struct Rows {
+    favorites: Vec<String>,
     frequent: Vec<String>,
     all: Vec<String>,
     add: Option<String>,
@@ -29,12 +30,26 @@ struct Rows {
 
 impl Rows {
     fn len(&self) -> usize {
-        self.frequent.len() + self.all.len() + usize::from(self.add.is_some())
+        self.favorites.len() + self.frequent.len() + self.all.len() + usize::from(self.add.is_some())
     }
 
     /// The namespace at keyboard position `ix` (None: the add row).
     fn at(&self, ix: usize) -> Option<&String> {
-        self.frequent.iter().chain(&self.all).nth(ix)
+        self.favorites.iter().chain(&self.frequent).chain(&self.all).nth(ix)
+    }
+
+    /// The section headers above row `ix`: one over favorites and frequent each when shown,
+    /// and one over all namespaces when either is.
+    fn headers_before(&self, ix: usize) -> usize {
+        let (fav, freq) = (self.favorites.len(), self.frequent.len());
+        let mut n = usize::from(fav > 0);
+        if freq > 0 && ix >= fav {
+            n += 1;
+        }
+        if (fav > 0 || freq > 0) && ix >= fav + freq {
+            n += 1;
+        }
+        n
     }
 }
 
@@ -42,6 +57,10 @@ pub struct NamespacePicker {
     all: Vec<String>,
     /// Context whose frequent namespaces are offered first.
     pub context: String,
+    /// Every context connected: their favorite namespaces come first, and the star marks a
+    /// namespace on each of them.
+    pub contexts: Vec<String>,
+    favorites: Entity<crate::favorites::Favorites>,
     pub selected: BTreeSet<String>,
     search: Entity<InputState>,
     /// Row chosen with the arrow keys (Enter picks it).
@@ -54,9 +73,9 @@ impl EventEmitter<NamespacesChanged> for NamespacePicker {}
 impl EventEmitter<NamespacePicked> for NamespacePicker {}
 
 impl NamespacePicker {
-    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(favorites: Entity<crate::favorites::Favorites>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let search = cx.new(|cx| InputState::new(window, cx).placeholder("Search namespaces"));
-        let subs = vec![cx.subscribe(&search, |this, _, ev: &InputEvent, cx| match ev {
+        let mut subs = vec![cx.subscribe(&search, |this, _, ev: &InputEvent, cx| match ev {
             InputEvent::Change => {
                 this.highlight = 0;
                 cx.notify();
@@ -65,9 +84,12 @@ impl NamespacePicker {
             InputEvent::PressEnter { secondary: false, .. } => this.pick_highlighted(false, cx),
             _ => {}
         })];
+        subs.push(cx.observe(&favorites, |_, _, cx| cx.notify()));
         Self {
             all: Vec::new(),
             context: String::new(),
+            contexts: Vec::new(),
+            favorites,
             selected: BTreeSet::new(),
             search,
             highlight: 0,
@@ -89,6 +111,11 @@ impl NamespacePicker {
         self.selected.retain(|ns| all.contains(ns));
         self.all = all;
         cx.notify();
+    }
+
+    /// Every namespace offered: the ones listed and the ones added by hand.
+    pub fn known(&self) -> &[String] {
+        &self.all
     }
 
     /// Add a namespace by hand, remember it for this context, and show it.
@@ -151,13 +178,21 @@ impl NamespacePicker {
         match (rows.at(ix).cloned(), rows.add) {
             (Some(ns), _) if tick => {
                 // Ticked namespaces move to the top: keep the highlight on this one.
-                let in_frequent = ix < rows.frequent.len();
+                let (fav, freq) = (rows.favorites.len(), rows.frequent.len());
+                let section = if ix < fav {
+                    0
+                } else if ix < fav + freq {
+                    1
+                } else {
+                    2
+                };
                 self.toggle(ns.clone(), cx);
                 let rows = self.rows(cx);
-                let found = if in_frequent {
-                    rows.frequent.iter().position(|n| *n == ns)
-                } else {
-                    rows.all.iter().position(|n| *n == ns).map(|i| i + rows.frequent.len())
+                let (fav, freq) = (rows.favorites.len(), rows.frequent.len());
+                let found = match section {
+                    0 => rows.favorites.iter().position(|n| *n == ns),
+                    1 => rows.frequent.iter().position(|n| *n == ns).map(|i| i + fav),
+                    _ => rows.all.iter().position(|n| *n == ns).map(|i| i + fav + freq),
                 };
                 self.highlight = found.unwrap_or(ix);
             }
@@ -181,14 +216,30 @@ impl NamespacePicker {
             _ => return,
         }
         // Children of the list: a header comes before each section.
-        let frequent = self.rows(cx).frequent.len();
-        let headers = match frequent {
-            0 => 0,
-            f if self.highlight < f => 1,
-            _ => 2,
-        };
+        let headers = self.rows(cx).headers_before(self.highlight);
         self.scroll.scroll_to_item(self.highlight + headers);
         cx.stop_propagation();
+        cx.notify();
+    }
+
+    /// Whether `ns` is a favorite on any connected context.
+    fn is_favorite(&self, ns: &str, cx: &App) -> bool {
+        (self.favorites.read(cx).namespaces().iter()).any(|f| f.namespace == ns && self.contexts.contains(&f.context))
+    }
+
+    /// Star `ns` on every connected context, or unstar it on all of them when it is starred on
+    /// one (with several combined, the picker lists them as one).
+    pub fn toggle_favorite(&mut self, ns: &str, cx: &mut Context<Self>) {
+        let on = !self.is_favorite(ns, cx);
+        let list = (self.contexts.iter())
+            .map(|c| {
+                crate::favorites::Favorite::Namespace(crate::favorites::FavNamespace {
+                    context: c.clone(),
+                    namespace: ns.to_string(),
+                })
+            })
+            .collect();
+        self.favorites.update(cx, |f, cx| f.set_all(list, on, cx));
         cx.notify();
     }
 
@@ -200,9 +251,14 @@ impl NamespacePicker {
     fn rows(&self, cx: &App) -> Rows {
         let typed = self.search.read(cx).value().trim().to_string();
         let query = typed.to_lowercase();
+        let favorites: Vec<String> =
+            crate::favorites::favorite_namespaces(&self.all, self.favorites.read(cx).namespaces(), &self.contexts)
+                .into_iter()
+                .filter(|ns| ns.contains(&query))
+                .collect();
         let frequent: Vec<String> = crate::settings::frequent_namespaces(&self.context)
             .into_iter()
-            .filter(|ns| self.all.contains(ns) && ns.contains(&query))
+            .filter(|ns| self.all.contains(ns) && ns.contains(&query) && !favorites.contains(ns))
             .take(FREQUENT_SHOWN)
             .collect();
         // Selected first, then the rest, filtered by the search.
@@ -210,7 +266,7 @@ impl NamespacePicker {
         all.sort_by_key(|ns| !self.selected.contains(ns));
         // A name not in the list can be added by hand (no permission to list namespaces).
         let add = to_add(typed, &self.all);
-        Rows { frequent, all, add }
+        Rows { favorites, frequent, all, add }
     }
 
     /// One row: the checkbox adds to the selection, a click on the name shows only that namespace.
@@ -218,8 +274,31 @@ impl NamespacePicker {
         let theme = cx.theme();
         let (n1, n2) = (ns.to_string(), ns.to_string());
         let checked = self.selected.contains(ns);
+        let starred = self.is_favorite(ns, cx);
+        let star = {
+            let ns = ns.to_string();
+            div()
+                .id(SharedString::from(format!("{id}-star")))
+                .flex_none()
+                .cursor_pointer()
+                .when(!starred, |d| d.opacity(0.).group_hover(id.clone(), |s| s.opacity(0.5)))
+                .tooltip(move |w, cx| {
+                    let text = if starred { "Remove from favorites" } else { "Add to favorites" };
+                    component::tooltip::Tooltip::new(text).build(w, cx)
+                })
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.toggle_favorite(&ns, cx);
+                    cx.stop_propagation();
+                }))
+                .child(if starred {
+                    Icon::new(component::IconName::StarFill).size_3p5().text_color(yellow())
+                } else {
+                    Icon::new(Lucide::Star).size_3p5()
+                })
+        };
         h_flex()
             .id(id.clone())
+            .group(id.clone())
             .gap_2p5()
             .px_2()
             .h(px(34.))
@@ -267,6 +346,7 @@ impl NamespacePicker {
             .when(highlighted, |d| {
                 d.child(Icon::new(Lucide::CornerDownLeft).size_3p5().text_color(theme.muted_foreground))
             })
+            .child(star)
             .on_click(cx.listener(move |this, _, _, cx| this.pick_only(n2.clone(), cx)))
             .into_any_element()
     }
@@ -292,14 +372,23 @@ impl Render for NamespacePicker {
                 .into_any_element()
         };
         let mut items: Vec<AnyElement> = Vec::new();
+        let fav = rows.favorites.len();
+        if fav > 0 {
+            items.push(header("Favorites", Some(Lucide::Star)));
+            for (i, ns) in rows.favorites.iter().enumerate() {
+                items.push(self.row(SharedString::from(format!("ns-fav-{i}")), ns, highlight == i, cx));
+            }
+        }
         if !rows.frequent.is_empty() {
             items.push(header("Frequent", Some(Lucide::TrendingUp)));
             for (i, ns) in rows.frequent.iter().enumerate() {
-                items.push(self.row(SharedString::from(format!("ns-freq-{i}")), ns, highlight == i, cx));
+                items.push(self.row(SharedString::from(format!("ns-freq-{i}")), ns, highlight == fav + i, cx));
             }
+        }
+        if fav > 0 || !rows.frequent.is_empty() {
             items.push(header("All namespaces", None));
         }
-        let offset = rows.frequent.len();
+        let offset = fav + rows.frequent.len();
         for (i, ns) in rows.all.iter().enumerate() {
             items.push(self.row(SharedString::from(format!("ns-{i}")), ns, highlight == offset + i, cx));
         }
@@ -358,13 +447,9 @@ impl Render for NamespacePicker {
             .child(
                 v_flex().id("ns-list").max_h(px(480.)).overflow_y_scroll().track_scroll(&self.scroll).children(items),
             )
-            .child(
-                div()
-                    .px_1()
-                    .text_xs()
-                    .text_color(muted)
-                    .child("Click or Enter shows only one · tick or Ctrl+Enter to combine"),
-            )
+            .child(div().px_1().text_xs().text_color(muted).child(crate::app::with_keys(
+                "Click or {enter} shows only one · tick or {secondary-enter} to combine · the star pins one",
+            )))
     }
 }
 
@@ -376,7 +461,28 @@ fn to_add(typed: String, listed: &[String]) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::to_add;
+    use super::{Rows, to_add};
+
+    fn names(v: &[&str]) -> Vec<String> {
+        v.iter().map(ToString::to_string).collect()
+    }
+
+    /// Favorites come first, then frequent, then all: the keyboard walks them in that order, and
+    /// the list scrolls past one header per section shown.
+    #[test]
+    fn favorites_are_the_first_rows() {
+        let rows =
+            Rows { favorites: names(&["web"]), frequent: names(&["db"]), all: names(&["db", "web", "x"]), add: None };
+        assert_eq!(rows.len(), 5);
+        assert_eq!(rows.at(0).map(String::as_str), Some("web"));
+        assert_eq!(rows.at(1).map(String::as_str), Some("db"));
+        assert_eq!(rows.at(4).map(String::as_str), Some("x"));
+        assert_eq!([0, 1, 2].map(|ix| rows.headers_before(ix)), [1, 2, 3]);
+        let no_favorites = Rows { favorites: vec![], ..rows };
+        assert_eq!([0, 1].map(|ix| no_favorites.headers_before(ix)), [1, 2]);
+        let plain = Rows { favorites: vec![], frequent: vec![], all: names(&["a"]), add: None };
+        assert_eq!(plain.headers_before(0), 0);
+    }
 
     #[test]
     fn only_names_kubernetes_accepts_can_be_added() {

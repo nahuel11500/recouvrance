@@ -113,7 +113,7 @@ fn share(errors: u64, count: u64) -> String {
 
 fn minute_label(minute: i64) -> String {
     jiff::Timestamp::from_second(minute * 60)
-        .map_or_default(|t| t.to_zoned(jiff::tz::TimeZone::system()).strftime("%H:%M").to_string())
+        .map_or_default(|t| t.to_zoned_datetime(jiff::tz::TimeZone::system()).strftime("%H:%M").to_string())
 }
 
 pub fn render(cx: &App) -> AnyElement {
@@ -153,12 +153,13 @@ pub fn render(cx: &App) -> AnyElement {
                 .items_start()
                 .child(div().flex_1().min_w_0().text_sm().text_color(muted).child(
                     "How long the API servers take to answer and how much they send, since Recouvrance started. \
-                     To headers: until the answer starts (watches and log streams count until they open). To last \
-                     byte: until the last byte was read, for answers that end (Recouvrance's own parsing counts \
-                     when it sets the pace). Per minute: data received, decompressed, on average over the last \
-                     hour (or since the first request, if later); shells and port-forwards send theirs over the \
-                     upgraded connection, which is not counted. Failed: an error status, a timeout or no \
-                     connection. p50 and p95: half and 95% of the requests took at most that.",
+                     To headers: until the answer starts (watches, log streams, shells and port-forwards count \
+                     until they open). To last byte: until the last byte was read, for answers that end \
+                     (Recouvrance's own parsing counts when it sets the pace). Per minute: data received, \
+                     decompressed, on average over the last hour (or since the first request, if later); for \
+                     shells, attach and port-forwards, what came back through them, not what was sent. Failed: \
+                     an error status, a timeout or no connection. p50 and p95: half and 95% of the requests took \
+                     at most that.",
                 ))
                 .child(Button::new("meter-reset").small().outline().label("Reset").on_click(|_, window, _| {
                     meter::reset();
@@ -343,8 +344,6 @@ fn class_table(c: &Cluster, now: i64, cx: &App) -> Div {
         } else {
             format!("{} ({})", grouped(s.errors), share(s.errors, s.count))
         };
-        // A shell's or a port-forward's data goes over the upgraded connection: not counted.
-        let rate = if *class == Class::Stream { "—".to_string() } else { human_size(s.bytes_per_minute(now)) };
         h_flex()
             .gap(px(GAP))
             .py_1()
@@ -359,7 +358,7 @@ fn class_table(c: &Cluster, now: i64, cx: &App) -> Div {
             .child(cell(SLOWEST_W, maybe_duration((s.count > 0).then_some(s.headers.slowest))))
             .child(cell(TIME_W, maybe_duration(s.last_byte.percentile(0.5))))
             .child(cell(TIME_W, maybe_duration(s.last_byte.percentile(0.95))))
-            .child(cell(RATE_W, rate))
+            .child(cell(RATE_W, human_size(s.bytes_per_minute(now))))
     }))
 }
 
@@ -391,8 +390,8 @@ fn heaviest(list: &[Heavy], cx: &App) -> Div {
         .child(div().font_weight(FontWeight::SEMIBOLD).child("Heaviest requests"))
         .child(div().text_sm().text_color(muted).child(format!(
             "The {HEAVIEST} heaviest requests since Recouvrance started, one per kind (cluster, method and \
-             path). A stream is listed once it ends. Names in paths read {{namespace}} and {{name}}. To last \
-             byte is — for a stream, or an answer not read to its end."
+             path). A stream is listed once it ends: a port-forward, each connection on its own. Names in paths \
+             read {{namespace}} and {{name}}. To last byte is — for a stream, or an answer not read to its end."
         )))
         .child(v_flex().child(header).children(list.iter().map(|h| {
             let watch = if h.class == Class::Watch { " (watch)" } else { "" };

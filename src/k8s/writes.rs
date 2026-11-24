@@ -6,7 +6,7 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use kube::Client;
 use kube::api::{Api, DynamicObject, ListParams};
 
-use super::{Kind, ar_of, list_values, run, spawn_detached};
+use super::{Kind, ar_of, list_values, run, run_abortable, spawn_detached};
 
 pub(super) fn dyn_api(client: Client, kind: &Kind, ns: Option<&str>) -> Api<DynamicObject> {
     match (kind.namespaced, ns) {
@@ -38,6 +38,16 @@ pub async fn scale(
             kind.ar.kind,
             crate::plural::count(now, "replica")
         ))
+    })
+    .await
+}
+
+/// The replicas a workload asks for now, from its scale subresource: what `scale` changes.
+/// Dropping the future stops the request.
+pub async fn replicas(client: Client, kind: Kind, ns: Option<String>, name: String) -> Result<Option<i32>> {
+    run_abortable(async move {
+        let api = dyn_api(client, &kind, ns.as_deref());
+        Ok(api.get_scale(&name).await?.spec.and_then(|s| s.replicas))
     })
     .await
 }
@@ -77,6 +87,24 @@ pub async fn merge_patch(
         let obj = api.patch(&name, &patch_params(dry_run), &kube::api::Patch::Merge(patch)).await?;
         let version = obj.metadata.resource_version.map_or_default(|v| format!(" (resourceVersion {v})"));
         Ok(format!("{}{} {name} patched{version}", if dry_run { "[dry run] " } else { "" }, kind.ar.kind))
+    })
+    .await
+}
+
+/// A server-side dry run of a patch of one object: the object as the server would have it
+/// after. Nothing is changed, and dropping the future stops the request. The object may hold
+/// Secret values: the caller decides what of it to show.
+pub async fn dry_run_patch(
+    client: Client,
+    kind: Kind,
+    ns: Option<String>,
+    name: String,
+    patch: kube::api::Patch<serde_json::Value>,
+) -> Result<serde_json::Value> {
+    run_abortable(async move {
+        let api = dyn_api(client, &kind, ns.as_deref());
+        let obj = api.patch(&name, &patch_params(true), &patch).await?;
+        Ok(serde_json::to_value(obj)?)
     })
     .await
 }
@@ -488,14 +516,67 @@ pub async fn argo_refresh(client: Client, kind: Kind, ns: Option<String>, name: 
     .await
 }
 
-/// The merge patch that starts an Argo CD sync (also shown as the kubectl equivalent).
-pub fn argo_sync_patch() -> serde_json::Value {
-    serde_json::json!({"operation": {"initiatedBy": {"username": "recouvrance"}, "sync": {"syncStrategy": {"hook": {}}}}})
-}
+/// How long a dry run's result is waited for before saying where it will show.
+const DRY_RUN_WAIT_SECS: u32 = 30;
+/// How many times a terminate is sent when the Application keeps changing under it.
+const TERMINATE_ATTEMPTS: u32 = 10;
 
-/// Start an Argo CD sync of an Application to its target revision.
-pub async fn argo_sync(client: Client, kind: Kind, ns: Option<String>, name: String) -> Result<String> {
-    merge_patch(client, kind, ns, name, argo_sync_patch(), false).await
+/// Start an Argo CD operation on an Application: a sync (with its options), a rollback, or
+/// terminating the one running. The Application is read first, and refused as argocd-server
+/// would refuse it (an operation already running, a rollback with auto-sync on); the patch
+/// carries the version read, so a change meanwhile makes the API server refuse it. A dry run
+/// is waited for, a little while, to say what Argo CD would do.
+pub async fn argo_operation(
+    client: Client,
+    kind: Kind,
+    ns: Option<String>,
+    name: String,
+    op: super::argo::ops::Op,
+) -> Result<String> {
+    use super::argo::ops::{self, Op};
+    run(async move {
+        let api = dyn_api(client, &kind, ns.as_deref());
+        // A terminate is tried again on a conflict, as argocd-server does: the controller
+        // updates the Application often while a sync runs, which is when it is used, and the
+        // operation is checked again on each read. A sync or a rollback is not: a change in
+        // between (an operation started, auto-sync turned on) must refuse it.
+        let attempts = if op == Op::Terminate { TERMINATE_ATTEMPTS } else { 1 };
+        let mut attempt = 0;
+        let (app, after) = loop {
+            attempt += 1;
+            let app = serde_json::to_value(api.get(&name).await?)?;
+            let patch = ops::patch(&app, &op).map_err(|why| anyhow::anyhow!("Argo CD would refuse it: {why}"))?;
+            match api.patch(&name, &patch_params(false), &kube::api::Patch::Merge(patch)).await {
+                Err(kube::Error::Api(e)) if e.code == 409 && attempt < attempts => {}
+                Err(kube::Error::Api(e)) if e.code == 409 => {
+                    anyhow::bail!("the Application changed while it was sent; nothing was started, try again")
+                }
+                after => break (app, serde_json::to_value(after?)?),
+            }
+        };
+        // An Application kind with a status subresource would drop the change silently.
+        let phase = after.pointer("/status/operationState/phase").and_then(serde_json::Value::as_str);
+        if op == Op::Terminate && phase != Some("Terminating") {
+            anyhow::bail!("the operation was not terminated: this Application kind keeps its status apart");
+        }
+        let mut out = ops::started(&app, &op, &name);
+        if op.dry_run() {
+            for _ in 0..DRY_RUN_WAIT_SECS {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                let now = serde_json::to_value(api.get(&name).await?)?;
+                if let Some(result) = ops::dry_run_result(&now) {
+                    out.push('\n');
+                    out.push_str(&result);
+                    return Ok(out);
+                }
+            }
+            out.push_str(&format!(
+                "\nStill running after {DRY_RUN_WAIT_SECS} s: its result will show as the last sync (status.operationState)."
+            ));
+        }
+        Ok(out)
+    })
+    .await
 }
 
 /// Replace an object with an edited version (what `kubectl edit` does).

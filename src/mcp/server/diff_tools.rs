@@ -8,7 +8,8 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::{KubeMcp, access_for};
-use crate::k8s::{self, ObjectRef};
+use crate::k8s;
+use crate::mcp::preview::{CONFLICT, dry_run_apply, without_noise};
 use crate::mcp::{Mode, Verb};
 
 /// What `apply_manifest` takes, without `dry_run`: a diff is always a dry run, and its schema
@@ -21,16 +22,6 @@ pub struct DiffParams {
     #[schemars(description = "namespace for objects that don't set one")]
     pub namespace: Option<String>,
 }
-
-/// Fields the server sets on every write, which a diff would only show as noise.
-const NOISE: [&str; 6] = [
-    "/metadata/managedFields",
-    "/metadata/resourceVersion",
-    "/metadata/generation",
-    "/metadata/uid",
-    "/metadata/creationTimestamp",
-    "/status",
-];
 
 #[tool_router(router = diff_tools, vis = "pub(super)")]
 impl KubeMcp {
@@ -52,55 +43,43 @@ impl KubeMcp {
         }
         let mut out = Vec::new();
         for (kind, ns, name, doc) in planned {
+            let kind = match self.served(&p.context, &kind).await {
+                Ok(Some(k)) => k,
+                // Its CRD comes with the manifest: the server can't check the object yet.
+                Ok(None) => {
+                    let after = k8s::to_yaml(&without_noise(&doc), false, false).unwrap_or_default();
+                    let ns = ns.map_or_default(|n| format!("{n}/"));
+                    let title = format!("{} {ns}{name} (not checked: its CRD is not on the cluster yet)", kind.ar.kind);
+                    out.push(unified(&title, "", &after, true));
+                    continue;
+                }
+                Err(e) => return call.finish(Err(anyhow::anyhow!("{} {name}: {e}", kind.ar.kind))),
+            };
             let reveal = {
                 let a = access_for(&kind, &p.context, Verb::Reveal, ns.clone(), Some(name.clone()));
                 call.policy().decide(&a).mode == Mode::Allow
             };
             let secret = kind.is("", "Secret");
-            let obj = ObjectRef { kind: kind.clone(), name: name.clone(), namespace: ns.clone(), uid: String::new() };
-            let live = match k8s::get_object(client.clone(), obj).await {
-                Ok(v) => Some(v),
-                Err(e) if k8s::is_not_found(&e) => None,
-                Err(e) => return call.finish(Err(e)),
-            };
             // Fields another manager owns make the apply fail: say so, and show the diff a
             // forced apply would make.
-            let mut note = "";
-            let after = match k8s::apply_value(client.clone(), kind.clone(), ns.clone(), doc.clone(), true, false).await
-            {
-                Err(e) if k8s::api_status(&e) == Some(409) => {
-                    note = " (apply_manifest would fail: another field manager owns some of these fields; shown as if forced)";
-                    k8s::apply_value(client.clone(), kind.clone(), ns.clone(), doc, true, true).await
-                }
-                other => other,
-            };
-            let after = match after {
-                Ok(v) => v,
+            let applied = match dry_run_apply(&client, &kind, ns.clone(), &name, doc).await {
+                Ok(a) => a,
                 Err(e) => return call.finish(Err(e.context(format!("{} {name}", kind.ar.kind)))),
             };
+            let note = if applied.conflict { format!(" ({CONFLICT})") } else { String::new() };
             let shown = |v: &Value| k8s::to_yaml(&without_noise(v), secret, reveal).unwrap_or_default();
-            let (before, after) = (live.as_ref().map_or_default(shown), shown(&after));
-            let title = format!("{} {}{name}{note}", kind.ar.kind, ns.map_or_default(|n| format!("{n}/")));
-            out.push(unified(&title, &before, &after, live.is_none()));
+            let (before, after) = (applied.live.as_ref().map_or_default(shown), shown(&applied.after));
+            let at = ns.map_or_default(|n| format!("{n}/"));
+            // The diff of a Secret that exists and changes shows its live values around the
+            // change; one being created shows only what the agent sent.
+            if secret && reveal && applied.live.is_some() && before != after {
+                call.revealing(format!("Secret {at}{name}"));
+            }
+            let title = format!("{} {at}{name}{note}", kind.ar.kind);
+            out.push(unified(&title, &before, &after, applied.live.is_none()));
         }
         call.finish(Ok(out.join("\n")))
     }
-}
-
-/// The object without the server's noise, its keys sorted (the live object and the dry
-/// run's can come in another order).
-fn without_noise(v: &Value) -> Value {
-    let mut v = v.clone();
-    v.sort_all_objects();
-    for path in NOISE {
-        if let Some((parent, key)) = path.rsplit_once('/')
-            && let Some(obj) =
-                (if parent.is_empty() { Some(&mut v) } else { v.pointer_mut(parent) }).and_then(Value::as_object_mut)
-        {
-            obj.remove(key);
-        }
-    }
-    v
 }
 
 /// A unified diff of one object's YAML, or a line saying it doesn't change.
@@ -118,6 +97,16 @@ mod tests {
     use serde_json::json;
 
     use super::{unified, without_noise};
+
+    /// `diff_manifest` says a field manager conflict in the words it used before the approval
+    /// banner shared them.
+    #[test]
+    fn the_conflict_note_reads_as_before() {
+        assert_eq!(
+            format!(" ({})", super::CONFLICT),
+            " (apply_manifest would fail: another field manager owns some of these fields; shown as if forced)"
+        );
+    }
 
     #[test]
     fn noise_goes_and_changes_show() {
