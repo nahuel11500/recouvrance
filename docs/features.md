@@ -509,7 +509,7 @@
   clusters and namespaces picked, and the object whose page is open (with its context), or the
   list with its filter and the row selected, or the page (Problems, Timeline, overviews, Helm,
   Argo CD). A page's *Investigate* asks it beside the page when it is open there.
-- **Overviews**: cluster capacity and health, workloads status, Helm releases (values masked; install from your repos, roll back and uninstall through your `helm` CLI).
+- **Overviews**: cluster capacity and health (requested is what the pods bound to a node hold there; pending pods no node took are said apart, with what they ask for), workloads status, Helm releases (values masked; install from your repos, roll back and uninstall through your `helm` CLI).
 - **API requests** (Settings → API requests): per cluster, how many requests of each kind
   (discovery, lists, watches, metrics, logs, shells, writes) were made and how many failed; how
   long the API server took to start answering (p50, p95, slowest) and, for answers that end,

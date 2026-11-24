@@ -33,9 +33,13 @@ struct Summary {
     pods_running: usize,
     pods_total: usize,
     namespaces: Option<usize>,
-    /// (allocatable, requested, used) in millicores / bytes.
+    /// (allocatable, requested, used) in millicores / bytes. Requested is what the pods bound
+    /// to a node hold there, as the scheduler counts it against allocatable.
     cpu: (f64, f64, f64),
     mem: (f64, f64, f64),
+    /// Pending pods no node took yet, and the CPU (millicores) and memory they ask for: demand
+    /// waiting for room, not part of what is requested.
+    unscheduled: (usize, f64, f64),
     /// Node name and the problems it reports.
     node_issues: Vec<(String, Vec<String>)>,
     /// namespace -> (cpu used, mem used)
@@ -257,14 +261,29 @@ fn add_nodes(s: &mut Summary, nodes: &[NodeLite]) {
     s.kubelet_versions = versions;
 }
 
-/// Pods into the summary: how many run, and what running or pending ones request (as the
-/// scheduler counts it: sidecars and init containers too, plus overhead).
+/// Pods into the summary: how many run, what the ones bound to a node request (as the
+/// scheduler counts it: sidecars and init containers too, plus overhead), and apart, what the
+/// pending ones no node took ask for.
 fn add_pods(s: &mut Summary, pods: &k8s::PodTotals) {
     s.pods_total = pods.pods;
     s.pods_running = pods.running;
     s.cpu.1 = pods.cpu;
     s.mem.1 = pods.memory;
     s.gpus.1 = pods.gpus;
+    s.unscheduled = (pods.unscheduled, pods.unscheduled_cpu, pods.unscheduled_memory);
+}
+
+/// "2 pods wait for a node: they ask for 4 cores and 32Gi of memory…", or None when none does.
+fn unscheduled_note(s: &Summary) -> Option<String> {
+    let (pods, cpu, mem) = s.unscheduled;
+    (s.pods_known && pods > 0).then(|| {
+        let (what, verb) = if pods == 1 { ("pod waits", "it asks") } else { ("pods wait", "they ask") };
+        format!(
+            "{pods} {what} for a node: {verb} for {} and {} of memory, not counted as requested",
+            k8s::format_cores(cpu),
+            k8s::format_bytes(mem)
+        )
+    })
 }
 
 /// One cluster's pods while the overview lives: listed once, then followed by a watch (see
@@ -650,6 +669,9 @@ impl ClusterOverview {
                             )),
                     )
                 })
+                .when_some(unscheduled_note(s), |d, note| {
+                    d.child(div().text_sm().text_color(theme.warning).child(note))
+                })
                 .when_some(s.history.as_ref(), |d, (cpu, mem)| {
                     use crate::overview::{ChartSpec, usage_chart};
                     let minutes = s.chart_minutes;
@@ -867,7 +889,7 @@ impl ClusterOverview {
 
 #[cfg(test)]
 mod tests {
-    use super::{Answers, MetricsList, NodeLite, Summary, add_nodes, add_pods, summarize};
+    use super::{Answers, MetricsList, NodeLite, Summary, add_nodes, add_pods, summarize, unscheduled_note};
     use crate::k8s::{PodAllocs, PodTotals};
 
     /// The pods' totals as the overview's feed reads them from a list's `items`.
@@ -987,6 +1009,7 @@ mod tests {
              "status": {"phase": "Running"}},
             // A big init container sets the pod's request.
             {"metadata": {"name": "migrate"}, "spec": {
+                "nodeName": "n1",
                 "initContainers": [{"resources": {"requests": {"cpu": "2"}}}],
                 "containers": [{"resources": {"requests": {"cpu": "250m"}}}]},
              "status": {"phase": "Pending"}}
@@ -995,5 +1018,42 @@ mod tests {
         add_pods(&mut s, &pods);
         assert_eq!(s.cpu.1, 650.0 + 2000.0);
         assert_eq!(s.mem.1, (128.0 + 1024.0) * 1024.0 * 1024.0);
+    }
+
+    /// Pods no node took reserve nothing: requested stays what the nodes hold, never more than
+    /// they can give, and what the waiting pods ask for is said apart (#900).
+    #[test]
+    fn pods_no_node_took_are_not_requested() {
+        let nodes: Vec<NodeLite> = serde_json::from_value(serde_json::json!([
+            {"metadata": {"name": "n1"}, "spec": {}, "status": {
+                "conditions": [{"type": "Ready", "status": "True"}],
+                "nodeInfo": {"kubeletVersion": "v1.33.1"},
+                "allocatable": {"cpu": "4", "memory": "8Gi"}}}
+        ]))
+        .unwrap();
+        let pods = totals(serde_json::json!([
+            {"metadata": {"name": "web"}, "status": {"phase": "Running"}, "spec": {"nodeName": "n1",
+                "containers": [{"resources": {"requests": {"cpu": "1", "memory": "2Gi"}}}]}},
+            // On its node, pulling its image: it holds its request there.
+            {"metadata": {"name": "pulling"}, "status": {"phase": "Pending"}, "spec": {"nodeName": "n1",
+                "containers": [{"resources": {"requests": {"cpu": "500m", "memory": "1Gi"}}}]}},
+            // No node has room for them.
+            {"metadata": {"name": "big-1"}, "status": {"phase": "Pending"},
+                "spec": {"containers": [{"resources": {"requests": {"cpu": "3", "memory": "16Gi"}}}]}},
+            {"metadata": {"name": "big-2"}, "status": {"phase": "Pending"}, "spec": {"nodeName": "",
+                "containers": [{"resources": {"requests": {"cpu": "1", "memory": "16Gi"}}}]}}
+        ]));
+        let mut s = Summary { pods_known: true, ..Summary::default() };
+        add_nodes(&mut s, &nodes);
+        add_pods(&mut s, &pods);
+        let gi = 1024.0 * 1024.0 * 1024.0;
+        assert_eq!((s.cpu.1, s.mem.1), (1500.0, 3.0 * gi));
+        assert!(s.mem.1 <= s.mem.0);
+        assert_eq!(s.unscheduled, (2, 4000.0, 32.0 * gi));
+        let note = unscheduled_note(&s).unwrap();
+        assert!(note.starts_with("2 pods wait for a node"), "{note}");
+        // None waiting: nothing to say.
+        add_pods(&mut s, &PodTotals::default());
+        assert_eq!(unscheduled_note(&s), None);
     }
 }

@@ -25,10 +25,13 @@ use super::metrics::{pod_resources, retry_wait, wait_unpaused};
 use super::table::{Applied, Backoff, RawEvent, WATCH_IDLE, resumable};
 use super::{Pause, PodResources, TaskGuard, ar_of, lists, podspec, spawn_guarded};
 
-/// A pod's phase, as far as the totals go: running and pending pods hold what they request
-/// on their nodes.
+/// A pod's phase, as far as the totals go: running pods and pending ones bound to a node hold
+/// what they request on it; pending ones no node took yet hold nothing.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum PodPhase {
+    /// Pending with no node yet: what it requests waits for room, nothing is reserved.
+    Unscheduled,
+    /// Pending on its node (pulling images, init containers running).
     Pending,
     Running,
     /// Finished, or not known yet.
@@ -37,8 +40,9 @@ enum PodPhase {
 }
 
 impl PodPhase {
-    fn of(phase: &str) -> Self {
+    fn of(phase: &str, node: &str) -> Self {
         match phase {
+            "Pending" if node.is_empty() => Self::Unscheduled,
             "Pending" => Self::Pending,
             "Running" => Self::Running,
             _ => Self::Other,
@@ -68,7 +72,7 @@ impl PodAlloc {
             spec.resource_names().iter().filter(|r| r.ends_with("/gpu")).map(|r| scheduled(r).limit).sum::<f64>();
         Self {
             resources: pod_resources(spec),
-            phase: PodPhase::of(&pod.status.phase),
+            phase: PodPhase::of(&pod.status.phase, &pod.spec.node_name),
             cpu: scheduled("cpu").request,
             memory: scheduled("memory").request,
             gpus,
@@ -89,16 +93,25 @@ impl PodAllocs {
         self.by_namespace.get(namespace)?.get(name)
     }
 
-    /// How many pods there are and run, and what the running and pending ones request.
+    /// How many pods there are and run, what the ones on a node request (as the scheduler
+    /// counts them against its allocatable), and what the ones no node took yet ask for.
     pub fn totals(&self) -> PodTotals {
         let mut totals = PodTotals::default();
         for pod in self.by_namespace.values().flat_map(|pods| pods.values()) {
             totals.pods += 1;
             totals.running += usize::from(pod.phase == PodPhase::Running);
-            if matches!(pod.phase, PodPhase::Running | PodPhase::Pending) {
-                totals.cpu += pod.cpu;
-                totals.memory += pod.memory;
-                totals.gpus += pod.gpus;
+            match pod.phase {
+                PodPhase::Running | PodPhase::Pending => {
+                    totals.cpu += pod.cpu;
+                    totals.memory += pod.memory;
+                    totals.gpus += pod.gpus;
+                }
+                PodPhase::Unscheduled => {
+                    totals.unscheduled += 1;
+                    totals.unscheduled_cpu += pod.cpu;
+                    totals.unscheduled_memory += pod.memory;
+                }
+                PodPhase::Other => {}
             }
         }
         totals
@@ -151,8 +164,9 @@ impl PodAllocs {
     }
 }
 
-/// Pods counted, and what the running and pending ones request: CPU in millicores, memory in
-/// bytes, and the GPUs they hold.
+/// Pods counted, and what the ones bound to a node (running, or pending there) request: CPU in
+/// millicores, memory in bytes, and the GPUs they hold. Pending pods no node took yet reserve
+/// nothing: they are counted apart, as demand waiting for room.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct PodTotals {
     pub pods: usize,
@@ -160,6 +174,10 @@ pub struct PodTotals {
     pub cpu: f64,
     pub memory: f64,
     pub gpus: f64,
+    /// Pending pods with no node yet, and the CPU and memory they ask for.
+    pub unscheduled: usize,
+    pub unscheduled_cpu: f64,
+    pub unscheduled_memory: f64,
 }
 
 /// What a watch of the pods' requests and limits read last.
@@ -584,13 +602,14 @@ mod tests {
     /// A pod watch's bookmark, as a real API server writes it (an empty `v1.Pod` from Go).
     pub(super) const BOOKMARK: &str = r#"{"type":"BOOKMARK","object":{"kind":"Pod","apiVersion":"v1","metadata":{"resourceVersion":"42","creationTimestamp":null},"spec":{"containers":null},"status":{}}}"#;
 
-    /// A pod with one container requesting `cpu` and `memory`, limited to that memory.
+    /// A pod on node `n1` with one container requesting `cpu` and `memory`, limited to that
+    /// memory.
     fn pod(ns: &str, name: &str, rv: &str, cpu: &str, memory: &str, phase: &str) -> Value {
         json!({
             "kind": "Pod",
             "metadata": {"name": name, "namespace": ns, "resourceVersion": rv, "uid": format!("{ns}-{name}"),
                 "managedFields": [{"manager": "kubelet", "fieldsV1": {"f:status": {}}}]},
-            "spec": {"containers": [{"name": "app", "image": "app:1", "env": [{"name": "A", "value": "1"}],
+            "spec": {"nodeName": "n1", "containers": [{"name": "app", "image": "app:1", "env": [{"name": "A", "value": "1"}],
                 "resources": {"requests": {"cpu": cpu, "memory": memory}, "limits": {"memory": memory}}}]},
             "status": {"phase": phase, "containerStatuses": [{"name": "app", "ready": true}]},
         })
@@ -609,7 +628,11 @@ mod tests {
 
     #[test]
     fn a_list_reads_into_sums() {
+        let mut waiting = pod("shop", "big", "4", "8", "64Gi", "Pending");
+        waiting["spec"].as_object_mut().unwrap().remove("nodeName");
         let list = json!({"kind": "PodList", "metadata": {"resourceVersion": "42"}, "items": [
+            // No node took it: it asks, it holds nothing.
+            waiting,
             pod("shop", "web", "1", "250m", "256Mi", "Running"),
             // The same name in another namespace stays apart.
             pod("staging", "web", "2", "100m", "64Mi", "Pending"),
@@ -633,11 +656,16 @@ mod tests {
         assert_eq!(mesh.resources.cpu.0, Some(160.0));
         assert_eq!(mesh.cpu, 2060.0);
         let totals = pods.totals();
-        assert_eq!((totals.pods, totals.running), (4, 2));
-        // The finished job requests nothing any more.
+        assert_eq!((totals.pods, totals.running), (5, 2));
+        // The finished job requests nothing any more, and the pod no node took reserves
+        // nothing: it is counted apart.
         assert_eq!(totals.cpu, 250.0 + 100.0 + 2060.0);
         assert_eq!(totals.memory, (256.0 + 64.0) * 1024.0 * 1024.0);
         assert_eq!(totals.gpus, 1.0);
+        assert_eq!(
+            (totals.unscheduled, totals.unscheduled_cpu, totals.unscheduled_memory),
+            (1, 8000.0, 64.0 * 1024.0 * 1024.0 * 1024.0)
+        );
         // No pods at all.
         let empty: AllocList = serde_json::from_str(r#"{"items": null, "metadata": {}}"#).unwrap();
         assert_eq!(empty.items.totals().pods, 0);
@@ -647,8 +675,14 @@ mod tests {
     fn watch_events_change_the_pods() {
         let (mut pods, mut version) = (Arc::new(PodAllocs::default()), String::new());
         let mut apply = |line: &str, pods: &mut Arc<PodAllocs>| apply_event(line, pods, &mut version).unwrap();
+        let mut waiting = pod("shop", "web", "4", "100m", "64Mi", "Pending");
+        waiting["spec"].as_object_mut().unwrap().remove("nodeName");
+        assert_eq!(apply(&frame("ADDED", &waiting), &mut pods), Applied::Changed);
+        assert_eq!((pods.totals().cpu, pods.totals().unscheduled_cpu), (0.0, 100.0));
+        // Bound to a node: now it holds its request there.
         let web = pod("shop", "web", "5", "100m", "64Mi", "Pending");
-        assert_eq!(apply(&frame("ADDED", &web), &mut pods), Applied::Changed);
+        assert_eq!(apply(&frame("MODIFIED", &web), &mut pods), Applied::Changed);
+        assert_eq!((pods.totals().cpu, pods.totals().unscheduled), (100.0, 0));
         assert_eq!(pods.totals().running, 0);
         assert_eq!(
             apply(&frame("MODIFIED", &pod("shop", "web", "6", "100m", "64Mi", "Running")), &mut pods),
@@ -751,7 +785,7 @@ mod tests {
         /// the same end state reads; and a reader keeps what it was sent before each change.
         #[test]
         fn followed_pods_are_a_fresh_list(events in proptest::collection::vec(
-            (0..3usize, 0..2usize, 0..3usize, 0..4u32, 0..3usize, any::<bool>()),
+            (0..3usize, 0..2usize, 0..3usize, 0..4u32, 0..4usize, any::<bool>()),
             0..40,
         )) {
             let (mut pods, mut version) = (Arc::new(PodAllocs::default()), String::new());
@@ -761,7 +795,12 @@ mod tests {
                 let rv = (i + 1).to_string();
                 // Whole quantities: their sums are exact in any order.
                 let (cpu, memory) = (format!("{}m", 100 * cpu), format!("{}Mi", 64 * cpu));
-                let mut object = pod(ns, name, &rv, &cpu, &memory, ["Pending", "Running", "Succeeded"][phase]);
+                // The last one: pending, no node took it yet.
+                let mut object =
+                    pod(ns, name, &rv, &cpu, &memory, ["Pending", "Running", "Succeeded", "Pending"][phase]);
+                if phase == 3 {
+                    object["spec"].as_object_mut().unwrap().remove("nodeName");
+                }
                 if sidecar {
                     let resources = json!({"requests": {"cpu": "50m"}, "limits": {"cpu": "50m"}});
                     object["spec"]["initContainers"] = json!([{"restartPolicy": "Always", "resources": resources}]);
