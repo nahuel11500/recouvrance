@@ -13,7 +13,9 @@ use gpui_kit::component::{ActiveTheme as _, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
+use crate::assistant::ClaudeCodeEntry;
 use crate::k8s;
+use crate::latest::Latest;
 use crate::mcp::{Agent, Hub, Mode, Policy, Rule, Verb, any_glob, grants_write, is_protected_selector};
 
 mod activity;
@@ -44,8 +46,11 @@ pub struct AgentsView {
     connect_client: Option<Client>,
     /// Show several agents (a list on the left); otherwise the one main agent.
     advanced: bool,
-    /// Whether your Claude Code has Recouvrance's MCP server registered (None: checking).
-    claude_connected: Option<bool>,
+    /// Whether your Claude Code's entry reaches this server with a current token (None:
+    /// checking), and the check or connection running (a newer one replaces it).
+    claude_connected: Option<ClaudeCodeEntry>,
+    claude_check: Latest,
+    claude_connecting: bool,
     /// The rules.yaml editor ("Rules as code"), and the text it was loaded with.
     code: Option<(Entity<EditorState>, String)>,
     code_message: Option<(bool, String)>,
@@ -169,6 +174,8 @@ impl AgentsView {
             activity,
             advanced,
             claude_connected: None,
+            claude_check: Latest::default(),
+            claude_connecting: false,
             code: None,
             code_message: None,
             all_activity: false,
@@ -403,34 +410,35 @@ impl AgentsView {
 
     // MARK: Rendering
 
-    fn check_claude(&mut self, cx: &mut Context<Self>) {
-        cx.spawn(async move |this, cx| {
-            let ok = crate::assistant::claude_code_connected().await;
-            let _ = this.update(cx, |this, cx| {
-                this.claude_connected = Some(ok);
-                cx.notify();
-            });
-        })
-        .detach();
+    /// Check Claude Code's entry again: when the page is shown, and after the port or the
+    /// main agent's token changed. While a connection runs, its own result is the answer.
+    pub fn check_claude(&mut self, cx: &mut Context<Self>) {
+        if self.claude_connecting {
+            return;
+        }
+        let hub = self.hub.clone();
+        self.claude_check.spawn(cx, crate::assistant::claude_code_entry(hub), |this, entry, cx| {
+            this.claude_connected = Some(entry);
+            cx.notify();
+        });
     }
 
     fn connect_claude(&mut self, cx: &mut Context<Self>) {
         let hub = self.hub.clone();
         self.claude_connected = None;
-        cx.spawn(async move |this, cx| {
-            let r = crate::assistant::connect_claude_code(hub).await;
-            let _ = this.update(cx, |this, cx| {
-                match r {
-                    Ok(_) => this.claude_connected = Some(true),
-                    Err(e) => {
-                        this.claude_connected = Some(false);
-                        this.error = Some(format!("{e:#}").into());
-                    }
-                }
-                cx.notify();
-            });
-        })
-        .detach();
+        self.claude_connecting = true;
+        let work = async move {
+            let r = crate::assistant::connect_claude_code(hub.clone()).await;
+            (r, crate::assistant::claude_code_entry(hub).await)
+        };
+        self.claude_check.spawn(cx, work, |this, (r, entry), cx| {
+            if let Err(e) = r {
+                this.error = Some(format!("{e:#}").into());
+            }
+            this.claude_connected = Some(entry);
+            this.claude_connecting = false;
+            cx.notify();
+        });
         cx.notify();
     }
 
@@ -460,16 +468,31 @@ impl AgentsView {
             .child(div().flex_1())
             .child({
                 let installed = crate::assistant::claude_code().is_some();
-                match self.claude_connected {
+                match &self.claude_connected {
                     _ if !installed => div().text_sm().text_color(theme.muted_foreground).child("Claude Code not found").into_any_element(),
                     None => div().text_sm().text_color(theme.muted_foreground).child("Checking Claude Code…").into_any_element(),
-                    Some(true) => h_flex()
+                    Some(ClaudeCodeEntry::Connected) => h_flex()
                         .gap_1()
                         .child(Icon::new(Lucide::CircleCheck).size_4().text_color(theme.success))
                         .child(div().text_sm().child("Connected to Claude Code"))
                         .child(Button::new("cc-reconnect").xsmall().ghost().label("Reconnect").tooltip("Register Recouvrance's MCP server in Claude Code again (new token)").on_click(cx.listener(|this, _, _, cx| this.connect_claude(cx))))
                         .into_any_element(),
-                    Some(false) => Button::new("cc-connect")
+                    // An entry that would not reach this server: say why, and offer to update it.
+                    Some(ClaudeCodeEntry::Stale(why)) => h_flex()
+                        .gap_1()
+                        .child(Icon::new(Lucide::TriangleAlert).size_4().text_color(theme.warning))
+                        .child(div().text_sm().child(why.clone()))
+                        .child(
+                            Button::new("cc-update")
+                                .small()
+                                .primary()
+                                .icon(Lucide::Plug)
+                                .label("Update Claude Code")
+                                .tooltip("Register this server's URL and token in Claude Code, in place of the old entry")
+                                .on_click(cx.listener(|this, _, _, cx| this.connect_claude(cx))),
+                        )
+                        .into_any_element(),
+                    Some(ClaudeCodeEntry::Missing) => Button::new("cc-connect")
                         .small()
                         .primary()
                         .icon(Lucide::Plug)

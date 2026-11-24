@@ -836,6 +836,8 @@ impl AppView {
                 let status = status.clone();
                 self.agents.update(cx, |v, cx| {
                     v.server_status = status;
+                    // The port may have changed: Claude Code's entry may no longer reach it.
+                    v.check_claude(cx);
                     cx.notify();
                 });
             }

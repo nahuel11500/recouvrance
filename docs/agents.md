@@ -28,7 +28,10 @@ applying it (an object whose rule turned into *Ask me* needs its own approval).
 ### Connecting your tools
 
 In **Agents**, click **Connect Claude Code**: it registers the server in your Claude Code
-(`claude mcp add --scope user recouvrance …`). For another tool, pick it under *Connect* on the
+(`claude mcp add --scope user recouvrance …`). The page says *Connected to Claude Code* only when
+that entry points at this server's port with a token it takes: after **New token**, a port change, or
+an entry left by another Recouvrance, it says what is wrong ("Claude Code points at port 47070",
+"Claude Code has an old token") and **Update Claude Code** registers it again. For another tool, pick it under *Connect* on the
 agent's page and copy its config, or its command where it has one:
 
 | Tool | Where it goes |
