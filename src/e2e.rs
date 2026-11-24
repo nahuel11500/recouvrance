@@ -127,6 +127,58 @@ fn write_mode_off_refuses_the_ui_s_writes() {
     });
 }
 
+/// A row of a big list in every namespace comes from its cells alone, without a uid: the
+/// table's delete reads the object's and deletes only the object listed. One newer than
+/// the row (re-created under its name since the list) stays; the one listed goes.
+#[test]
+#[ignore = "needs a kind cluster: RECOUVRANCE_E2E_CONTEXT"]
+fn a_row_without_its_uid_deletes_only_the_object_listed() {
+    run(async {
+        let ui = k8s::connect(context()).await?;
+        let truth: Api<ConfigMap> = Api::namespaced(k8s::connect_for_agents(context()).await?, NS);
+        let name = "e2e-delete-row";
+        let _ = truth.delete(name, &DeleteParams::default()).await;
+        truth.create(&PostParams::default(), &config_map(name)).await?;
+        let kinds = k8s::discover(ui.clone()).await?;
+        let kind = k8s::find_kind(&kinds, "configmaps").cloned().context("no configmaps")?;
+        // As `cells_row` builds it: namespace/name for a uid, the creation time from the Age.
+        let row = |listed: jiff::Timestamp| {
+            Arc::new(k8s::Row {
+                uid: format!("{NS}/{name}"),
+                name: name.into(),
+                namespace: Some(NS.into()),
+                created: Some(listed),
+                cells: vec![name.into()],
+                labels: "".into(),
+                deleting: false,
+                deleted_at: None,
+            })
+        };
+        gate::set_ui_writes(true);
+        let checked = async {
+            // Listed ten minutes ago: the object there now was made after, so it isn't that one.
+            let ago = jiff::Timestamp::now() - jiff::SignedDuration::from_mins(10);
+            let refused = k8s::delete_row(ui.clone(), kind.clone(), row(ago)).await;
+            let err = format!("{:#}", refused.expect_err("a delete of an object newer than the row"));
+            assert!(err.contains("re-created"), "{err}");
+            assert!(truth.get_opt(name).await?.is_some(), "the newer object was deleted");
+            // Listed now: it is the one, and it goes.
+            k8s::delete_row(ui.clone(), kind.clone(), row(jiff::Timestamp::now())).await?;
+            for _ in 0..50 {
+                if truth.get_opt(name).await?.is_none() {
+                    return Ok(());
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            bail!("the object listed was not deleted")
+        };
+        let result: Result<()> = checked.await;
+        gate::set_ui_writes(false);
+        let _ = truth.delete(name, &DeleteParams::default()).await;
+        result
+    });
+}
+
 /// An agent's rules decide on the real cluster through the MCP server: a delete its rules
 /// don't allow is refused and the object stays; the kill switch refuses even reads; with a
 /// delete rule, the same call deletes (so the refusals above are not a broken setup). A
@@ -354,6 +406,66 @@ fn an_approval_shows_what_a_patch_will_change() {
         let logged = hub.recent_audit(5, |e| e.agent_id == agent.id && e.tool == "patch_resource");
         let change = logged.first().and_then(|e| e.change.clone()).unwrap_or_default();
         assert!(change.contains("data.a: 1 → 2"), "{change}");
+        truth.delete(name, &DeleteParams::default()).await?;
+        Ok(())
+    });
+}
+
+/// A YAML save from the window is sent as of the version the edit started from: a change
+/// made on the cluster meanwhile makes the server refuse it (its dry run too, and with the
+/// text's own resourceVersion removed), and that change stays. The edit moved onto the latest
+/// version then saves, and both changes are kept.
+#[test]
+#[ignore = "needs a kind cluster: RECOUVRANCE_E2E_CONTEXT"]
+fn a_yaml_save_over_a_newer_object_is_refused() {
+    use crate::k8s::edit;
+
+    run(async {
+        let ctx = context();
+        let client = k8s::connect(ctx.clone()).await?;
+        let truth: Api<ConfigMap> = Api::namespaced(k8s::connect_for_agents(ctx).await?, NS);
+        let name = "e2e-yaml-save";
+        let _ = truth.delete(name, &DeleteParams::default()).await;
+        truth.create(&PostParams::default(), &config_map(name)).await?;
+        let kinds = k8s::discover(client.clone()).await?;
+        let kind = k8s::find_kind(&kinds, "configmaps").cloned().context("no configmaps")?;
+        let obj =
+            k8s::ObjectRef { kind: kind.clone(), name: name.into(), namespace: Some(NS.into()), uid: String::new() };
+        let ns = Some(NS.to_string());
+
+        // The editor's copy, edited, while someone else writes to the object.
+        let base = k8s::get_object_opts(client.clone(), obj.clone(), true).await?;
+        let version = edit::resource_version(&base).map(str::to_string);
+        let mut edited = base.clone();
+        edited["data"]["b"] = json!("edited");
+        let mut bare = edited.clone();
+        bare["metadata"].as_object_mut().context("metadata")?.remove("resourceVersion");
+        truth.patch(name, &PatchParams::default(), &Patch::Merge(json!({"data": {"a": "meanwhile"}}))).await?;
+
+        gate::set_ui_writes(true);
+        let dry =
+            edit::save_edit(client.clone(), kind.clone(), ns.clone(), edited.clone(), version.clone(), true).await;
+        let saved =
+            edit::save_edit(client.clone(), kind.clone(), ns.clone(), edited.clone(), version.clone(), false).await;
+        let saved_bare = edit::save_edit(client.clone(), kind.clone(), ns.clone(), bare, version, false).await;
+        gate::set_ui_writes(false);
+        for refused in [&dry, &saved, &saved_bare] {
+            assert!(refused.as_ref().is_err_and(edit::is_conflict), "not refused as stale: {refused:?}");
+        }
+        let data = truth.get(name).await?.data.unwrap_or_default();
+        assert_eq!(data.get("a").map(String::as_str), Some("meanwhile"), "the change made meanwhile was undone");
+        assert!(!data.contains_key("b"), "the stale edit was saved");
+
+        let live = k8s::get_object_opts(client.clone(), obj, true).await?;
+        let merged = edit::rebase(&base, &edited, &live);
+        let version = edit::resource_version(&live).map(str::to_string);
+        gate::set_ui_writes(true);
+        let saved = edit::save_edit(client, kind, ns, merged, version, false).await;
+        gate::set_ui_writes(false);
+        saved?;
+        let data = truth.get(name).await?.data.unwrap_or_default();
+        assert_eq!(data.get("a").map(String::as_str), Some("meanwhile"));
+        assert_eq!(data.get("b").map(String::as_str), Some("edited"));
         truth.delete(name, &DeleteParams::default()).await?;
         Ok(())
     });
@@ -2266,6 +2378,197 @@ fn an_agent_syncs_terminates_and_rolls_back_an_argo_cd_application() {
         };
         let result: Result<()> = checked.await;
         let _ = apps.delete(name, &DeleteParams::default()).await;
+        if installed {
+            use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition;
+            let crds: Api<CustomResourceDefinition> = Api::all(admin);
+            let _ = crds.delete("applications.argoproj.io", &DeleteParams::default()).await;
+        }
+        result
+    });
+}
+
+/// A grouped sync, as the Argo CD page sends it with the window's client: each Application is
+/// read and checked, a dry run writes to each an operation that asks Argo CD to apply nothing
+/// (and changes nothing else), a sync without hooks with prune writes each one's operation,
+/// one already syncing is refused, and with write mode off none is written. The test plays
+/// Argo CD's controller.
+#[test]
+#[ignore = "needs a kind cluster: RECOUVRANCE_E2E_CONTEXT"]
+fn a_grouped_sync_writes_each_application_s_operation() {
+    use futures::StreamExt as _;
+    use k8s::argo::grouped_sync::{self, Options, Target};
+    use kube::api::DynamicObject;
+
+    run(async {
+        let ctx = context();
+        let admin = k8s::connect_for_agents(ctx.clone()).await?;
+        let installed = application_crd(admin.clone()).await?;
+        let kind = k8s::argo::application_kind();
+        let apps: Api<DynamicObject> = Api::namespaced_with(admin.clone(), NS, &kind.ar);
+        let names = ["e2e-group-a", "e2e-group-b", "e2e-group-c"];
+        let before = "2026-01-01T00:00:00Z";
+        let shown = "a".repeat(40);
+        for name in names {
+            let _ = apps.delete(name, &DeleteParams::default()).await;
+        }
+        for name in names {
+            let app = json!({
+                "apiVersion": "argoproj.io/v1alpha1", "kind": "Application",
+                "metadata": {"name": name, "namespace": NS},
+                "spec": {"project": "default",
+                    "source": {"repoURL": "https://git.example/apps", "path": name, "targetRevision": "HEAD"},
+                    "destination": {"server": "https://kubernetes.default.svc", "namespace": NS},
+                    "syncPolicy": {"syncOptions": ["CreateNamespace=true"], "retry": {"limit": 2}}},
+                "status": {
+                    "sync": {"status": "OutOfSync", "revision": shown},
+                    "resources": [
+                        {"group": "apps", "version": "v1", "kind": "Deployment", "namespace": NS, "name": name, "status": "OutOfSync"},
+                        {"version": "v1", "kind": "ConfigMap", "namespace": NS, "name": format!("{name}-old"), "status": "OutOfSync", "requiresPruning": true},
+                    ],
+                    "operationState": {"phase": "Succeeded", "startedAt": before},
+                },
+            });
+            apps.create(&PostParams::default(), &serde_json::from_value(app)?).await?;
+        }
+        let api = &apps;
+        let read = move |name: &'static str| async move { anyhow::Ok(serde_json::to_value(api.get(name).await?)?) };
+        let set = move |name: &'static str, patch: serde_json::Value| async move {
+            api.patch(name, &PatchParams::default(), &Patch::Merge(patch)).await?;
+            anyhow::Ok(())
+        };
+        let hub = k8s::argo::Hub { context: ctx.clone(), client: k8s::connect(ctx.clone()).await? };
+        let target = |name: &str| Target {
+            source: k8s::argo::Source::Hub(hub.clone()),
+            instance: ctx.clone(),
+            namespace: NS.into(),
+            name: name.into(),
+        };
+        let checked = async {
+            gate::set_ui_writes(true);
+            // Each is read and checked as the page does: what prune would delete is listed.
+            let mut checks = Vec::new();
+            for name in names {
+                let app = target(name).read().await.map_err(anyhow::Error::msg)?;
+                let c = grouped_sync::check(&app, &k8s::argo::windows::NextSync::NoWindow, jiff::Timestamp::now());
+                assert_eq!(c.refused, None, "{name}");
+                assert_eq!(c.before.as_deref(), Some(before));
+                assert_eq!(c.revision.as_deref(), Some(shown.as_str()), "auto-sync off, one source: pinned");
+                assert_eq!(c.pruned.iter().map(|r| r.name.clone()).collect::<Vec<_>>(), [format!("{name}-old")]);
+                checks.push(c);
+            }
+            let jobs = |opts: Options| -> Vec<(Target, k8s::argo::ops::SyncRequest)> {
+                names.iter().zip(&checks).map(|(n, c)| (target(n), opts.request(c))).collect()
+            };
+            let send = |opts: Options| grouped_sync::send_all(jobs(opts)).collect::<Vec<_>>();
+            let by_name = |sent: &[(usize, grouped_sync::Sent)], name: &str| {
+                let i = names.iter().position(|n| *n == name).unwrap();
+                sent.iter().find(|(k, _)| *k == i).map(|(_, r)| r.clone()).unwrap()
+            };
+
+            // A dry run: each Application's operation asks Argo CD to apply nothing; nothing else
+            // is written. Like argocd-server, it carries the Application's sync options and retry,
+            // and the revision shown.
+            let sent = send(Options { dry_run: true, ..Default::default() }).await;
+            assert_eq!(sent.len(), names.len());
+            assert!(sent.iter().all(|(_, r)| r.is_ok()), "{sent:?}");
+            for name in names {
+                let app = read(name).await?;
+                let op = &app["operation"];
+                assert_eq!(op["sync"]["dryRun"], true, "{op}");
+                assert_eq!(op["sync"]["syncStrategy"], json!({"hook": {}}), "{op}");
+                assert_eq!(op["sync"]["syncOptions"], json!(["CreateNamespace=true"]), "{op}");
+                assert_eq!(op["retry"], json!({"limit": 2}), "{op}");
+                assert_eq!(op["sync"]["revision"], shown, "{op}");
+                assert!(op["sync"].get("prune").is_none(), "{op}");
+                assert_eq!(app["status"]["sync"]["status"], "OutOfSync", "a dry run changes nothing else");
+                assert_eq!(app["spec"]["source"]["path"], name, "a dry run changes nothing else");
+                // Argo CD ends the dry run.
+                set(name, json!({"operation": null, "status": {"operationState": {"phase": "Succeeded", "startedAt": before}}}))
+                    .await?;
+            }
+
+            // Between the page's check and the sync: an auto-sync runs on the second, and git
+            // drops one more resource of the third (Argo CD's comparison now prunes it too).
+            let auto = "2026-01-01T06:00:00Z";
+            set(
+                names[1],
+                json!({"status": {"operationState": {"phase": "Succeeded", "startedAt": auto,
+                "operation": {"initiatedBy": {"automated": true}}}}}),
+            )
+            .await?;
+            let third = names[2];
+            set(third, json!({"status": {"resources": [
+                {"group": "apps", "version": "v1", "kind": "Deployment", "namespace": NS, "name": third, "status": "OutOfSync"},
+                {"version": "v1", "kind": "ConfigMap", "namespace": NS, "name": format!("{third}-old"), "status": "OutOfSync", "requiresPruning": true},
+                {"version": "v1", "kind": "Secret", "namespace": NS, "name": format!("{third}-unshown"), "status": "OutOfSync", "requiresPruning": true},
+            ]}}))
+            .await?;
+
+            // Without hooks, with prune: each one's operation says so, started by Recouvrance; the
+            // third, which would now delete more than was shown, is refused and left alone.
+            let opts = Options { hooks: false, prune: true, dry_run: false };
+            let sent = send(opts).await;
+            for &name in &names[..2] {
+                let (said, _) = by_name(&sent, name).map_err(anyhow::Error::msg)?;
+                assert!(said.contains("without hooks"), "{said}");
+                let op = read(name).await?["operation"].clone();
+                assert_eq!(op["sync"]["syncStrategy"], json!({"apply": {}}), "{op}");
+                assert_eq!(op["sync"]["prune"], true, "{op}");
+                assert_eq!(op["sync"]["syncOptions"], json!(["CreateNamespace=true"]), "{op}");
+                assert!(op["sync"].get("dryRun").is_none(), "{op}");
+                assert_eq!(op["initiatedBy"]["username"], "recouvrance", "{op}");
+            }
+            let why = by_name(&sent, third).expect_err("prune would delete more than was shown");
+            assert!(why.contains(&format!("Secret {NS}/{third}-unshown")) && why.contains("confirm"), "{why}");
+            assert!(read(third).await?.get("operation").is_none(), "the refused sync reached {third}");
+            // What is followed is the operation after the one read right before the write: the
+            // auto-sync, not the page's stale read.
+            let (_, followed) = by_name(&sent, names[1]).map_err(anyhow::Error::msg)?;
+            assert_eq!(followed.as_deref(), Some(auto));
+            assert_eq!(grouped_sync::progress(&read(names[1]).await?, followed.as_deref()).phase, "Waiting");
+
+            // While they run, a second sync of them is refused, and nothing is overwritten.
+            let again = send(opts).await;
+            for &name in &names[..2] {
+                let e = by_name(&again, name).expect_err("in progress");
+                assert!(e.contains("in progress"), "{e}");
+            }
+            let app = target(names[0]).read().await.map_err(anyhow::Error::msg)?;
+            let c = grouped_sync::check(&app, &k8s::argo::windows::NextSync::NoWindow, jiff::Timestamp::now());
+            assert!(c.refused.is_some_and(|why| why.contains("already running")));
+
+            // Argo CD starts the first: its progress is read from its operation state.
+            set(
+                names[0],
+                json!({"status": {"operationState": {"phase": "Running", "startedAt": "2026-01-02T00:00:00Z",
+                    "syncResult": {"resources": [{"kind": "ConfigMap", "namespace": NS, "name": "x", "status": "Synced"},
+                        {"group": "apps", "kind": "Deployment", "namespace": NS, "name": names[0]}]}}}}),
+            )
+            .await?;
+            let p = grouped_sync::progress(&read(names[0]).await?, Some(before));
+            assert_eq!((p.phase.as_str(), p.done, p.total, p.ended), ("Running", 1, 2, false));
+
+            // Write mode off: none is written.
+            for name in names {
+                set(name, json!({"operation": null})).await?;
+            }
+            gate::set_ui_writes(false);
+            let refused = send(opts).await;
+            for &name in &names[..2] {
+                let e = by_name(&refused, name).expect_err("write mode is off");
+                assert!(e.contains(gate::WRITES_OFF), "{e}");
+            }
+            assert!(by_name(&refused, third).is_err());
+            for name in names {
+                assert!(read(name).await?.get("operation").is_none(), "the refused sync reached {name}");
+            }
+            Ok(())
+        };
+        let result: Result<()> = checked.await;
+        gate::set_ui_writes(false);
+        for name in names {
+            let _ = apps.delete(name, &DeleteParams::default()).await;
+        }
         if installed {
             use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition;
             let crds: Api<CustomResourceDefinition> = Api::all(admin);

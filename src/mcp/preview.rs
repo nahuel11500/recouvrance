@@ -92,7 +92,7 @@ pub struct Section {
 
 impl Preview {
     /// These sections, within `DIFF_LINES` lines of diff in all.
-    fn of(mut sections: Vec<Section>) -> Self {
+    pub(crate) fn of(mut sections: Vec<Section>) -> Self {
         let mut left = DIFF_LINES;
         for s in &mut sections {
             if s.diff.len() > left {
@@ -139,7 +139,7 @@ impl Preview {
 
 impl Section {
     /// An object whose preview failed, and why (said as a warning).
-    fn failed(label: &str, why: impl std::fmt::Display) -> Self {
+    pub(crate) fn failed(label: &str, why: impl std::fmt::Display) -> Self {
         Self { title: label.to_string(), note: Some(why.to_string()), ..Self::default() }
     }
 }
@@ -234,7 +234,7 @@ async fn work_out(plan: &Plan) -> Preview {
 }
 
 /// `Deployment shop/web`, `ClusterRole reader`.
-fn object_label(kind: &Kind, ns: Option<&str>, name: &str) -> String {
+pub(crate) fn object_label(kind: &Kind, ns: Option<&str>, name: &str) -> String {
     match ns {
         Some(ns) if kind.namespaced => format!("{} {ns}/{name}", kind.ar.kind),
         _ => format!("{} {name}", kind.ar.kind),
@@ -509,6 +509,9 @@ fn sync_section(app: &Value, req: &SyncRequest) -> Section {
     lines.push(format!("auto-sync: {}", if s.automated { "on" } else { "off" }));
     if req.dry_run {
         lines.push("dry run: Argo CD applies nothing and says what it would do".into());
+    }
+    if req.apply {
+        lines.push("without hooks (migrations and other hooks are skipped)".into());
     }
     let mut effects = diagnosis::sync_effects(app, &[]);
     if !req.resources.is_empty() {
@@ -805,6 +808,9 @@ mod tests {
         let dry = sync_section(&app, &SyncRequest { dry_run: true, ..req }).lines;
         assert!(dry.iter().any(|l| l.starts_with("dry run:")), "{dry:?}");
         assert!(dry.iter().any(|l| l.ends_with("would be deleted (prune)")), "{dry:?}");
+        let apply = sync_section(&app, &SyncRequest { apply: true, ..SyncRequest::default() }).lines;
+        assert!(apply.iter().any(|l| l == "without hooks (migrations and other hooks are skipped)"), "{apply:?}");
+        assert!(!dry.iter().any(|l| l.starts_with("without hooks")), "{dry:?}");
         let s = sync_section(&app, &SyncRequest::default());
         assert_eq!(s.title, "Application argocd/shop-workload: sync");
         assert_eq!(

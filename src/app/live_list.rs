@@ -31,6 +31,9 @@ pub(super) struct LiveList {
     errors: BTreeMap<usize, SharedString>,
     /// Progress: "Loading…", "Updating… (showing the list from 2h ago)", "Connecting…".
     pub notice: Option<SharedString>,
+    /// A filter on labels waits for rows listed from their cells alone to get their metadata
+    /// (see `k8s::Pause::want_metadata`): said until no such row is left.
+    labels_due: bool,
 }
 
 /// What the table must do after a message, see [`LiveList::apply`].
@@ -71,6 +74,11 @@ impl LiveList {
         keep_watched(&mut self.rows, &self.listing);
     }
 
+    /// Rows held across the clusters.
+    pub fn row_count(&self) -> usize {
+        self.rows.iter().map(Vec::len).sum()
+    }
+
     /// Whether some cluster is still listing.
     pub fn is_loading(&self) -> bool {
         !self.listing.is_empty()
@@ -86,9 +94,23 @@ impl LiveList {
     /// error), then the progress notice. Both show: a failing cluster's rows may be the
     /// old ones the notice warns of.
     pub fn status_line(&self, failed: Option<&SharedString>) -> Option<SharedString> {
-        let parts: Vec<&str> =
-            failed.into_iter().chain(self.errors.values()).chain(&self.notice).map(AsRef::as_ref).collect();
+        let labels = self.labels_due.then_some("Loading labels…");
+        let parts: Vec<&str> = (failed.into_iter().chain(self.errors.values()).chain(&self.notice))
+            .map(AsRef::as_ref)
+            .chain(labels)
+            .collect();
         (!parts.is_empty()).then(|| parts.join("; ").into())
+    }
+
+    /// The filter now reads labels: say they are loading while some rows have none yet
+    /// (listed from their cells alone). Whether it says so.
+    pub fn wait_labels(&mut self) -> bool {
+        self.labels_due = self.has_partial_rows();
+        self.labels_due
+    }
+
+    fn has_partial_rows(&self) -> bool {
+        self.rows.iter().flatten().any(|r| r.is_partial())
     }
 
     /// Every cluster's rows, each with its cluster's index, laid out in `columns`.
@@ -145,6 +167,9 @@ impl LiveList {
                 if let Some(slot) = self.rows.get_mut(ctx) {
                     *slot = rows;
                 }
+                if self.labels_due {
+                    self.labels_due = self.has_partial_rows();
+                }
                 up.rows = true;
             }
             TableMsg::AllRows => {
@@ -165,6 +190,9 @@ impl LiveList {
                 if let Some(slot) = self.rows.get_mut(ctx).filter(|s| !s.is_empty()) {
                     slot.clear();
                     up.rows = true;
+                }
+                if self.labels_due {
+                    self.labels_due = self.has_partial_rows();
                 }
                 up.loaded = self.finish();
                 // Forbidden only when every cluster watched refused, whichever answers last.
@@ -313,6 +341,44 @@ mod tests {
         assert!(!list.rows_shown());
         // Nothing watched: nothing to wait for.
         assert!(LiveList::start(2, []).rows_shown());
+    }
+
+    /// A filter on labels over rows listed from their cells alone says the labels are loading,
+    /// on any cluster, until every cluster's rows have their metadata.
+    #[test]
+    fn labels_load_until_no_row_lacks_them() {
+        let partial = |name: &str| {
+            Arc::new(Row {
+                uid: format!("ns/{name}"),
+                name: name.into(),
+                namespace: Some("ns".into()),
+                created: None,
+                cells: vec![name.into()],
+                labels: "".into(),
+                deleting: false,
+                deleted_at: None,
+            })
+        };
+        let mut list = LiveList::start(2, [0, 1]);
+        list.apply(0, "a", TableMsg::Rows(vec![row("x")]), &[]);
+        list.apply(0, "a", TableMsg::Listed, &[]);
+        assert!(!list.wait_labels(), "every row has its labels");
+        assert_eq!(list.status_line(None).as_deref(), Some("Loading…"));
+        list.apply(1, "b", TableMsg::Rows(vec![partial("y"), row("z")]), &[]);
+        list.apply(1, "b", TableMsg::Listed, &[]);
+        assert!(list.wait_labels());
+        assert_eq!(list.status_line(None).as_deref(), Some("Loading labels…"));
+        // Another cluster's rows don't end it.
+        list.apply(0, "a", TableMsg::Rows(vec![row("x")]), &[]);
+        assert_eq!(list.status_line(None).as_deref(), Some("Loading labels…"));
+        list.apply(1, "b", TableMsg::Rows(vec![row("y"), row("z")]), &[]);
+        assert_eq!(list.status_line(None), None);
+        // Nor does a refusal leave it said.
+        let mut list = LiveList::start(1, [0]);
+        list.apply(0, "a", TableMsg::Rows(vec![partial("y")]), &[]);
+        assert!(list.wait_labels());
+        list.apply(0, "a", TableMsg::Forbidden("403".into()), &[]);
+        assert!(!list.status_line(None).is_some_and(|s| s.contains("labels")));
     }
 
     #[test]

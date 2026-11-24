@@ -18,6 +18,11 @@ Recouvrance is one Rust binary: a [gpui](https://github.com/zed-industries/zed) 
   sidebar's problem count starts no scan (an agent's `find_problems` still does when its
   findings are too old). Watches, log streams and shells keep going, so a window shown again is
   current at once. A window shown on another monitor, not focused, keeps updating.
+- A list left for another kind, tab or namespace keeps its watches the same way (`app::kept_lists`:
+  the last 4 of each window, up to 60,000 rows in all as counted when each was left, for 5 minutes,
+  as long as the pods' requests watch lingers off screen; the least recently left dropped first), so
+  going back to it shows current rows without a list request. Its tasks carry the id of their list
+  and touch the table only while it is the one on screen.
 - The Timeline's events are listed once, then watched (`k8s::watch_events`); only the newest
   20,000 of a cluster are held. Their watch is the exception to the rule above: it closes while
   the page is off screen, and once the page is shown again it goes on from where it was, bringing
@@ -49,15 +54,21 @@ Recouvrance is one Rust binary: a [gpui](https://github.com/zed-industries/zed) 
 ## How lists stay fast
 
 Lists use the API server's **Table** format (`kubectl get`'s columns, computed server-side), then
-are **watched**. A list of a namespaced kind in every namespace comes in up to three steps
-(`list_fast` in `src/k8s/table.rs`):
+are **watched**. A list of a namespaced kind in every namespace comes in two steps (`list_fast` in
+`src/k8s/table.rs`):
 
 1. Its first page (2,000 rows), shown at once.
-2. When more follow, every namespace's rows without their objects, read from the API server's cache,
-   32 namespaces at a time (`cells_by_namespace`): about 6 MB instead of 160 MB for 20,000 pods.
-   These rows have no uid, labels or creation time yet.
-3. The whole list with its objects' metadata, in one response from the cache, parsed as it streams
-   in, with managedFields and the rest skipped (`list_whole`). It replaces the rows of step 2.
+2. When more follow, every namespace's rows without their objects, read from the API server's cache
+   at least as new as the first page, 32 namespaces at a time (`cells_by_namespace`): about 6 MB
+   instead of 160 MB for 20,000 pods. These rows have no uid or labels, and a creation time read
+   from their Age. The list is complete there: its watch starts from the first page's version, so
+   it replays every change since, and each event gives its row its uid and labels.
+
+The metadata of every row is downloaded only when something needs it: a filter on labels makes the
+watch list again with it, in one response from the cache parsed as it streams in, with
+managedFields and the rest skipped (`list_whole`), and so does a list the Timeline records. A delete
+from such a row reads the object's uid first, and leaves alone an object newer than the row (one
+re-created under the same name since the list).
 
 Rows keep only the metadata they need; full objects are fetched only when a custom column needs
 them. Responses are gzip-compressed. The usage bars and the cluster overview take the pods'

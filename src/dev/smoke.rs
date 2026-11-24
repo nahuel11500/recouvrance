@@ -288,7 +288,13 @@ pub fn run(ctx: String) {
                 Some(Some(k8s::TableMsg::Error(e))) => println!("ERROR {e} at={}s", start.elapsed().as_secs()),
                 Some(Some(k8s::TableMsg::Forbidden(e))) => println!("FORBIDDEN {e}"),
                 Some(Some(k8s::TableMsg::AllRows)) => println!("all rows at={}s", start.elapsed().as_secs()),
-                Some(Some(k8s::TableMsg::Listed)) => println!("listed"),
+                // When the list went live, and what it took to get there: the requests and
+                // bytes since connecting, and the peak memory.
+                Some(Some(k8s::TableMsg::Listed)) => {
+                    println!("listed at={:.1}s", start.elapsed().as_secs_f64());
+                    print_reads(&ctx);
+                    print_memory();
+                }
                 Some(None) => break,
                 None => std::thread::sleep(std::time::Duration::from_millis(100)),
             }

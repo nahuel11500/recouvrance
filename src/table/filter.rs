@@ -22,6 +22,12 @@ impl RowFilter {
         self.matches_with(r, &|_: &str| None::<Cow<str>>)
     }
 
+    /// Whether it reads rows' labels (`app=web`, `l:app`): rows listed from their cells
+    /// alone have none until their metadata comes (see `k8s::Pause::want_metadata`).
+    pub fn reads_labels(&self) -> bool {
+        self.terms.iter().any(|(_, t)| matches!(t, Term::Label(..) | Term::LabelNot(..)))
+    }
+
     /// Column names this filter compares (to resolve before matching).
     pub fn has_columns(&self) -> bool {
         self.terms.iter().any(|(_, t)| matches!(t, Term::Column(..)))
