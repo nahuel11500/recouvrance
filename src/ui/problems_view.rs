@@ -1,6 +1,10 @@
-//! Problems page: what is broken across the connected clusters, worst first.
+//! Problems page: what is broken across the connected clusters, worst first. It shows the
+//! scans the sidebar badge, every window and the agents share (`problems::shared`): it opens
+//! on the latest findings at once, and each check's new ones show as soon as it finishes.
 
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -8,23 +12,92 @@ use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
+use kube::Client;
 
 use crate::details::OpenObject;
+use crate::k8s::lane::Lane;
 use crate::k8s::{self, Kind};
-use crate::problems::{self, Problem, Severity};
+use crate::problems::shared::{self, Ask, Found, Fresh};
+use crate::problems::{Problem, Severity};
 use crate::ui::page_filter::PageFilter;
 use crate::ui::page_header::{page_header, scope_text};
+
+/// How long the page waits at most for new findings before looking again.
+const LOOK_AGAIN: Duration = Duration::from_secs(30);
+
+/// The least time between two looks at the findings.
+const POLL: Duration = Duration::from_millis(500);
+
+/// What the page says while nothing was scanned yet.
+const CHECKING: &str = "Checking nodes, workloads, pods, jobs, services, ingresses, volumes, references and deletions…";
+
+/// A cluster the page shows: the namespaces picked, and the scope the window's badge scans.
+struct Watched {
+    context: String,
+    client: Client,
+    /// The kinds it serves: the others would fail with a 404.
+    kinds: Vec<Kind>,
+    /// What the page shows.
+    picked: shared::Scope,
+    /// What the badge scans (`Scope::home`).
+    home: shared::Scope,
+    /// Empty: all of the scope.
+    namespaces: Vec<String>,
+}
+
+impl Watched {
+    /// The scope to scan now for findings `fresh`: see `scope_for`.
+    fn scope(&self, fresh: Fresh) -> shared::Scope {
+        let scanned = shared::latest(&self.home).is_some() && shared::may_cover(&self.home);
+        scope_for(&self.home, &self.picked, fresh, scanned)
+    }
+}
+
+/// The scope a page scans to show `picked`. The one the window's badge scans (`home`) when it
+/// covers them, the badge already scans it (`scanned`: it has findings, and they may stand for
+/// `picked` as they read everything) and the page only keeps up with it (`Fresh::Paced`): the
+/// page and the badge then share their scans. Else `picked` alone: Refresh, or a page opened
+/// before the badge's first scan, lists only the namespaces picked, not the whole cluster. A
+/// user who may not list cluster-wide still gets the namespace picked.
+fn scope_for(home: &shared::Scope, picked: &shared::Scope, fresh: Fresh, scanned: bool) -> shared::Scope {
+    let share = scanned && matches!(fresh, Fresh::Paced) && home.covers(picked);
+    if home == picked || share { home.clone() } else { picked.clone() }
+}
+
+/// The clusters of `clusters` the page shows: one where none of the namespaces chosen is
+/// accessible is left out.
+fn watched(clusters: &crate::ui::Scope, kinds: &HashMap<String, Vec<Kind>>) -> Vec<Watched> {
+    (clusters.iter())
+        .filter(|(_, _, ns)| !ns.is_empty())
+        .map(|(ctx, client, ns)| {
+            // `[None]`: the whole cluster; otherwise those namespaces.
+            let namespaces: Vec<String> = ns.iter().flatten().cloned().collect();
+            let (home, picked) = (shared::Scope::home(ctx), shared::Scope::new(ctx, namespaces.clone()));
+            let kinds = kinds.get(ctx).cloned().unwrap_or_default();
+            Watched { context: ctx.clone(), client: client.clone(), kinds, picked, home, namespaces }
+        })
+        .collect()
+}
 
 pub struct ProblemsView {
     /// Each cluster with the namespaces scanned there.
     clusters: crate::ui::Scope,
-    /// The kinds each cluster serves, by context.
-    kinds: HashMap<String, Vec<Kind>>,
+    /// What is shown of each cluster.
+    watched: Arc<Vec<Watched>>,
+    /// The findings shown, by cluster: what `found` was made from.
+    shown_from: Vec<Option<Arc<Found>>>,
     /// The namespaces chosen, for the header.
     namespaces: Vec<String>,
-    /// (context, problem) once loaded.
+    /// (context, problem) once a check has finished.
     found: Option<Vec<(String, Problem)>>,
     errors: Vec<String>,
+    /// Every cluster scanned to the end at least once: until then, finding nothing means
+    /// nothing yet.
+    complete: bool,
+    /// When the oldest of the findings shown were made.
+    scanned: Option<Instant>,
+    /// A scan of one of the clusters is running.
+    updating: bool,
     /// Hide Info rows (restarts, cordoned nodes).
     show_info: bool,
     /// One severity only, picked with its count.
@@ -53,12 +126,17 @@ impl ProblemsView {
                 cx.notify();
             }
         })];
+        let watched = Arc::new(watched(&clusters, &kinds));
         let mut this = Self {
             clusters,
-            kinds,
+            watched,
+            shown_from: Vec::new(),
             namespaces,
             found: None,
             errors: Vec::new(),
+            complete: false,
+            scanned: None,
+            updating: false,
             show_info: false,
             only: None,
             filter,
@@ -66,11 +144,12 @@ impl ProblemsView {
             _task: None,
             _subs: subs,
         };
-        this.reload(cx);
+        this.reload(false, cx);
         this
     }
 
-    /// Scan other clusters or namespaces (`namespaces`: the ones chosen, for the header).
+    /// Show other clusters or namespaces (`namespaces`: the ones chosen, for the header):
+    /// their latest findings at once.
     pub fn set_scope(
         &mut self,
         clusters: crate::ui::Scope,
@@ -78,53 +157,101 @@ impl ProblemsView {
         namespaces: Vec<String>,
         cx: &mut Context<Self>,
     ) {
-        (self.clusters, self.kinds, self.namespaces, self.found) = (clusters, kinds, namespaces, None);
-        self.errors.clear();
-        self.reload(cx);
+        self.watched = Arc::new(watched(&clusters, &kinds));
+        (self.clusters, self.namespaces) = (clusters, namespaces);
+        self.shown_from.clear();
+        self.reload(false, cx);
         cx.notify();
     }
 
-    /// Scan again now (F5), keeping the filter and the severity picked.
+    /// Scan again now (F5), keeping the rows, the filter and the severity picked. A scan
+    /// running started before: it is waited for, then another one runs.
     pub fn refresh(&mut self, cx: &mut Context<Self>) {
-        self.found = None;
-        self.reload(cx);
+        self.reload(true, cx);
         cx.notify();
     }
 
-    fn reload(&mut self, cx: &mut Context<Self>) {
-        let (clusters, kinds) = (self.clusters.clone(), self.kinds.clone());
+    /// Show the latest findings, then follow them while the page is on screen: a cluster is
+    /// scanned when its findings are due (`shared::every`), or at once for a `refresh`.
+    fn reload(&mut self, refresh: bool, cx: &mut Context<Self>) {
+        self.show();
+        let watched = self.watched.clone();
         self._task = Some(cx.spawn(async move |this, cx| {
+            let mut changes = shared::changes();
+            let mut wanted = refresh.then(Instant::now);
             loop {
                 let exec = cx.background_executor().clone();
                 if !crate::app::wait_visible(&this, cx, &exec).await {
                     break;
                 }
-                // A cluster where none of the namespaces chosen is accessible is left out.
-                let scans = clusters.iter().filter(|(_, _, ns)| !ns.is_empty()).map(|(ctx, c, ns)| {
-                    // `[None]`: the whole cluster; otherwise each namespace, Nodes once.
-                    let ns: Vec<String> = ns.iter().flatten().cloned().collect();
-                    let (ctx, c) = (ctx.clone(), c.clone());
-                    // Only the kinds this cluster serves: the others would fail with a 404.
-                    let kinds = kinds.get(&ctx).cloned().unwrap_or_default();
-                    async move {
-                        let scan = crate::alerts::scan(&ctx, c, &kinds, &ns).await;
-                        (ctx, scan)
-                    }
-                });
-                let (found, errors) = merge(futures::future::join_all(scans).await);
-                if this
-                    .update(cx, |this, cx| {
-                        this.found = Some(found);
-                        this.errors = errors;
-                        cx.notify();
-                    })
-                    .is_err()
-                {
-                    break;
+                let fresh = wanted.map_or(Fresh::Paced, Fresh::Since);
+                let mut scanning = false;
+                for s in watched.iter() {
+                    // Not waited for: the rows follow the scan as its checks finish.
+                    // In the foreground: a badge's scan the page waits for is raised to it.
+                    let scan = shared::ensure(&s.scope(fresh), fresh, Lane::Foreground, || Ask {
+                        client: s.client.clone(),
+                        kinds: s.kinds.clone(),
+                        record: true,
+                    });
+                    scanning |= scan.is_some();
                 }
-                cx.background_executor().timer(crate::settings::secs(crate::settings::get().overview_refresh)).await;
+                // A Refresh stands until every cluster's findings come from a scan started
+                // after it: one running already started before, so another one follows it.
+                if !scanning {
+                    wanted = None;
+                }
+                let Ok(due) = this.update(cx, |this, cx| {
+                    let due = this.show();
+                    cx.notify();
+                    due
+                }) else {
+                    break;
+                };
+                // Until some findings change, or the next scan is due. Once it is due, a scan
+                // runs, and each of its checks is a change.
+                let now = Instant::now();
+                let wait = due.filter(|due| *due > now).map_or(LOOK_AGAIN, |due| due.saturating_duration_since(now));
+                let timer = cx.background_executor().timer(wait.max(POLL));
+                futures::future::select(Box::pin(changes.changed()), Box::pin(timer)).await;
+                // One look every `POLL` at most: a scan read namespace by namespace has
+                // thousands of checks, each a change, and every look sorts every problem.
+                cx.background_executor().timer(POLL).await;
             }
         }));
+    }
+
+    /// Read each cluster's latest findings; when the next scan is due. The rows are made
+    /// again only when the findings changed.
+    fn show(&mut self) -> Option<Instant> {
+        let latest: Vec<Option<Arc<Found>>> = self.watched.iter().map(|s| shared::latest(&s.picked)).collect();
+        let done: Vec<shared::Done> = latest.iter().filter_map(|f| f.as_ref()?.done).collect();
+        let due = done.iter().map(|d| d.due()).min();
+        let same = latest.len() == self.shown_from.len()
+            && latest.iter().zip(&self.shown_from).all(|(a, b)| match (a, b) {
+                (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+                (a, b) => a.is_none() && b.is_none(),
+            });
+        if same && self.found.is_some() {
+            return due;
+        }
+        self.complete = done.len() == latest.len();
+        // From when the scan started: its first checks read the cluster then.
+        self.scanned = done.iter().map(|d| d.started).min();
+        self.updating = latest.iter().flatten().any(|f| f.running.is_some());
+        let results: Vec<(String, Vec<Problem>, Option<String>)> = (self.watched.iter().zip(&latest))
+            .filter_map(|(s, f)| {
+                let f = f.as_ref()?;
+                Some((s.context.clone(), f.problems(&s.namespaces), f.skipped()))
+            })
+            .collect();
+        // Nothing yet: the page says it is checking.
+        let started = self.complete || !results.is_empty();
+        let (found, errors) = merge(results);
+        self.found = started.then_some(found);
+        self.errors = errors;
+        self.shown_from = latest;
+        due
     }
 
     /// Indices in `found` of the problems shown: minor ones only when asked, the severity
@@ -246,25 +373,41 @@ fn keeps(context: &str, p: &Problem, f: &PageFilter, only: Option<Severity>, sho
 }
 
 /// What the page says when nothing is found, and whether it is an all-clear: only when
-/// every cluster and kind could be read.
-fn nothing_found(errors: &[String]) -> (bool, &'static str) {
-    if errors.is_empty() {
+/// every cluster was scanned to the end (`complete`) and every kind could be read.
+fn nothing_found(errors: &[String], complete: bool) -> (bool, &'static str) {
+    if !complete {
+        (false, CHECKING)
+    } else if errors.is_empty() {
         (true, "Nothing broken right now.")
     } else {
         (false, "Nothing broken in what could be read.")
     }
 }
 
+/// How old the findings shown are: "checked 2m ago", "updating" while a scan runs.
+fn status_text(complete: bool, scanned: Option<Duration>, updating: bool) -> Option<String> {
+    let ago = scanned
+        .filter(|_| complete)
+        .map(|d| format!("Checked {} ago", k8s::duration_text(i64::try_from(d.as_secs()).unwrap_or(i64::MAX))));
+    match (ago, updating) {
+        (Some(ago), true) => Some(format!("{ago}, updating…")),
+        (Some(ago), false) => Some(ago),
+        (None, true) => Some("Checking…".into()),
+        (None, false) => None,
+    }
+}
+
 /// Every cluster's problems, worst first, and a line for each cluster with kinds it could
-/// not read: a kind refused is noted, and the others are still shown.
-fn merge(results: Vec<(String, problems::Scan)>) -> (Vec<(String, Problem)>, Vec<String>) {
+/// not read (context, problems, what it could not read): a kind refused is noted, and the
+/// others are still shown.
+fn merge(results: Vec<(String, Vec<Problem>, Option<String>)>) -> (Vec<(String, Problem)>, Vec<String>) {
     let mut found = Vec::new();
     let mut errors = Vec::new();
-    for (ctx, scan) in results {
-        if let Some(skipped) = scan.skipped_text() {
+    for (ctx, problems, skipped) in results {
+        if let Some(skipped) = skipped {
             errors.push(format!("{ctx}: could not read {skipped}"));
         }
-        found.extend(scan.problems.into_iter().map(|p| (ctx.clone(), p)));
+        found.extend(problems.into_iter().map(|p| (ctx.clone(), p)));
     }
     found.sort_by_key(|a| a.1.severity);
     (found, errors)
@@ -273,9 +416,14 @@ fn merge(results: Vec<(String, problems::Scan)>) -> (Vec<(String, Problem)>, Vec
 impl Render for ProblemsView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
+        // Aged when drawn: the findings stay the same between scans.
+        let status = status_text(self.complete, self.scanned.map(|at| at.elapsed()), self.updating);
         let header =
             page_header(Lucide::TriangleAlert, Some(theme.warning), "Problems", scope_text(&self.namespaces), cx)
                 .child(div().flex_1())
+                .when_some(status, |d, status| {
+                    d.child(div().text_sm().text_color(theme.muted_foreground).child(status))
+                })
                 .child(
                     Button::new("show-info")
                         .small()
@@ -295,11 +443,12 @@ impl Render for ProblemsView {
                         .on_click(cx.listener(|this, _, _, cx| this.refresh(cx))),
                 );
         let Some(found) = &self.found else {
-            return v_flex().size_full().p_4().gap_4().child(header).child(
-                div().text_color(theme.muted_foreground).child(
-                    "Checking nodes, workloads, pods, jobs, services, ingresses, volumes, references and deletions…",
-                ),
-            );
+            return v_flex()
+                .size_full()
+                .p_4()
+                .gap_4()
+                .child(header)
+                .child(div().text_color(theme.muted_foreground).child(CHECKING));
         };
         let count = |s: Severity| found.iter().filter(|(_, p)| p.severity == s).count();
         let (crit, warn, info) = (count(Severity::Critical), count(Severity::Warning), count(Severity::Info));
@@ -353,7 +502,7 @@ impl Render for ProblemsView {
                 d.child(div().text_sm().text_color(theme.muted_foreground).child("Nothing matches the filter."))
             })
             .when(crit + warn + if self.show_info { info } else { 0 } == 0 && !filtered, |d| {
-                let (all_clear, text) = nothing_found(&self.errors);
+                let (all_clear, text) = nothing_found(&self.errors, self.complete);
                 if all_clear {
                     d.child(
                         h_flex().gap_2().text_color(theme.success).child(Icon::new(Lucide::CircleCheck)).child(text),
@@ -380,7 +529,7 @@ impl Render for ProblemsView {
 
 #[cfg(test)]
 mod tests {
-    use crate::problems::{Problem, Scan, Severity};
+    use crate::problems::{Problem, Severity};
     use crate::ui::page_filter::PageFilter;
 
     #[test]
@@ -412,10 +561,46 @@ mod tests {
     }
 
     #[test]
-    fn no_all_clear_when_a_scan_failed() {
-        assert_eq!(super::nothing_found(&[]), (true, "Nothing broken right now."));
+    fn no_all_clear_when_a_scan_failed_or_is_not_done() {
+        assert_eq!(super::nothing_found(&[], true), (true, "Nothing broken right now."));
         let errors = ["prod: connection refused".to_string()];
-        assert_eq!(super::nothing_found(&errors), (false, "Nothing broken in what could be read."));
+        assert_eq!(super::nothing_found(&errors, true), (false, "Nothing broken in what could be read."));
+        // A first scan still running: nothing found yet is not an all-clear.
+        assert_eq!(super::nothing_found(&[], false), (false, super::CHECKING));
+    }
+
+    #[test]
+    fn the_page_says_how_old_its_rows_are() {
+        let s = std::time::Duration::from_secs;
+        assert_eq!(super::status_text(true, Some(s(150)), false).unwrap(), "Checked 2m ago");
+        assert_eq!(super::status_text(true, Some(s(5)), true).unwrap(), "Checked 5s ago, updating…");
+        assert_eq!(super::status_text(false, Some(s(5)), true).unwrap(), "Checking…");
+        assert_eq!(super::status_text(false, None, false), None);
+    }
+
+    #[test]
+    fn the_page_shares_the_badge_s_scan_when_it_covers_the_namespaces() {
+        use crate::problems::shared::{Fresh, Scope};
+        let scope = |ns: &[&str]| Scope::new("prod", ns.iter().map(ToString::to_string));
+        let paced = |home: &[&str], picked: &[&str], scanned| {
+            super::scope_for(&scope(home), &scope(picked), Fresh::Paced, scanned)
+        };
+        // A cluster the badge scans whole: every namespace picked comes from its scan.
+        assert_eq!(paced(&[], &[], true), scope(&[]));
+        assert_eq!(paced(&[], &["shop"], true), scope(&[]));
+        // Accessible namespaces set: those among them too, another one on its own.
+        assert_eq!(paced(&["a", "b"], &["a"], true), scope(&["a", "b"]));
+        assert_eq!(paced(&["a", "b"], &["c"], true), scope(&["c"]));
+        // Nothing scanned yet, or a scan of the whole cluster that could not read everything
+        // (a user who may not list cluster-wide): the namespace picked is scanned on its own,
+        // not the whole cluster.
+        assert_eq!(paced(&[], &["shop"], false), scope(&["shop"]));
+        assert_eq!(paced(&[], &[], false), scope(&[]));
+        // Refresh on a namespace lists that namespace, not the whole cluster; on the whole
+        // cluster, the whole cluster.
+        let refresh = Fresh::Since(std::time::Instant::now());
+        assert_eq!(super::scope_for(&scope(&[]), &scope(&["shop"]), refresh, true), scope(&["shop"]));
+        assert_eq!(super::scope_for(&scope(&[]), &scope(&[]), refresh, true), scope(&[]));
     }
 
     #[test]
@@ -429,14 +614,9 @@ mod tests {
             reason: "CrashLoopBackOff".into(),
             age: None,
         };
-        let forbidden: anyhow::Error =
-            kube::Error::Api(kube::core::Status::failure("forbidden", "Forbidden").with_code(403).boxed()).into();
         let (found, errors) = super::merge(vec![
-            (
-                "one".into(),
-                Scan { problems: vec![problem(Severity::Warning, "w")], skipped: vec![("Nodes".into(), forbidden)] },
-            ),
-            ("two".into(), Scan { problems: vec![problem(Severity::Critical, "c")], skipped: Vec::new() }),
+            ("one".into(), vec![problem(Severity::Warning, "w")], Some("Nodes (forbidden)".into())),
+            ("two".into(), vec![problem(Severity::Critical, "c")], None),
         ]);
         let names: Vec<(&str, &str)> = found.iter().map(|(ctx, p)| (ctx.as_str(), p.name.as_str())).collect();
         assert_eq!(names, [("two", "c"), ("one", "w")]);
