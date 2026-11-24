@@ -264,6 +264,8 @@ impl AppView {
         // their snapshots back, metrics stop polling.
         pause.set(!self.list_on_screen());
         self.list_pause = pause.clone();
+        // Before the watches start: with a filter on labels, they list with the metadata.
+        self.labels_for_filter(cx);
         let id = self.watch_id;
         for (ix, ((ctx_name, client), ns)) in self.clusters.clone().into_iter().zip(watched).enumerate() {
             let Some(ns) = ns else { continue };
@@ -370,6 +372,19 @@ impl AppView {
         let moved = self.table.update(cx, crate::table::follow_selection);
         if moved.is_some() {
             self.skip_select = moved;
+        }
+    }
+
+    /// A filter on labels needs every row's labels, which a big list in every namespace
+    /// doesn't download (see `k8s::Pause::want_metadata`): its watches list again with them,
+    /// once for the list's life, and the bar says they load meanwhile.
+    pub(super) fn labels_for_filter(&mut self, cx: &mut Context<Self>) {
+        if self.list_pause.wants_metadata() || !self.table.read(cx).delegate().filter_reads_labels() {
+            return;
+        }
+        self.list_pause.want_metadata();
+        if self.list.wait_labels() {
+            cx.notify();
         }
     }
 

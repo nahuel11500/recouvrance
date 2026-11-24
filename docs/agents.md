@@ -181,7 +181,10 @@ Tools, by what they do:
 `find_problems` answers from the Problems scan the app shares with its windows (the sidebar count,
 the Problems page) while that scan is recent, 2 minutes or more on a big cluster, and says how old
 it is; otherwise it runs one, which the windows then show too. `max_age_seconds` sets the oldest
-answer it takes: 0 scans again, to check a fix. Its findings still go through the agent's rules.
+answer it takes: 0 scans again, to check a fix. Its findings still go through the agent's rules;
+an Argo CD Application that needs attention, listed under the cluster it deploys to with its own
+namespace and hub in the PROBLEM text, is shown when the rules let the agent list Applications on
+its hub, and a hub that could not be read is named only when the rules open that context.
 
 Each tool tells the agent's client whether it only reads (`readOnlyHint`): the tools under **Read**
 say so, except `browse_files`, which may add a debug container; the changes don't. Of those that may

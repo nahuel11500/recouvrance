@@ -41,15 +41,15 @@ pub fn run(ctx: String) {
         if let Ok(how) = std::env::var("RECOUVRANCE_PROBLEMS") {
             let kinds = k8s::discover(client.clone()).await.unwrap();
             if how == "kinds" {
-                problems_by_kind(&client, &kinds).await;
+                problems_by_kind(&client, &kinds, &ctx).await;
                 return;
             }
             if how == "twice" {
-                problems_twice(&client, &kinds).await;
+                problems_twice(&client, &kinds, &ctx).await;
                 return;
             }
             let t = std::time::Instant::now();
-            let scan = problems::scan_partial(client.clone(), &kinds, None, None).await;
+            let scan = problems::scan_with_argo(client.clone(), &kinds, &ctx).await;
             let p = &scan.problems;
             println!("{} problems in {:?}", p.len(), t.elapsed());
             println!("peak memory {} MB (VmHWM)", mb(memory("VmHWM")));
@@ -288,7 +288,13 @@ pub fn run(ctx: String) {
                 Some(Some(k8s::TableMsg::Error(e))) => println!("ERROR {e} at={}s", start.elapsed().as_secs()),
                 Some(Some(k8s::TableMsg::Forbidden(e))) => println!("FORBIDDEN {e}"),
                 Some(Some(k8s::TableMsg::AllRows)) => println!("all rows at={}s", start.elapsed().as_secs()),
-                Some(Some(k8s::TableMsg::Listed)) => println!("listed"),
+                // When the list went live, and what it took to get there: the requests and
+                // bytes since connecting, and the peak memory.
+                Some(Some(k8s::TableMsg::Listed)) => {
+                    println!("listed at={:.1}s", start.elapsed().as_secs_f64());
+                    print_reads(&ctx);
+                    print_memory();
+                }
                 Some(None) => break,
                 None => std::thread::sleep(std::time::Duration::from_millis(100)),
             }
@@ -327,7 +333,7 @@ fn print_memory() {
 /// Each check of the Problems scan alone, one after the other (`RECOUVRANCE_PROBLEMS=kinds`):
 /// its time, and the process's peak resident memory while it ran, with what it held before.
 /// The memory is Linux's: the peak is reset to what is held before each check.
-async fn problems_by_kind(client: &kube::Client, kinds: &[k8s::Kind]) {
+async fn problems_by_kind(client: &kube::Client, kinds: &[k8s::Kind], ctx: &str) {
     let with_services = |k: &k8s::Kind| problems::WITH_SERVICES.iter().any(|(g, n)| k.is(g, n));
     for (group, name) in problems::CHECKED {
         let Some(kind) = kinds.iter().find(|k| k.is(group, name)) else { continue };
@@ -356,16 +362,34 @@ async fn problems_by_kind(client: &kube::Client, kinds: &[k8s::Kind]) {
             println!("  could not read {skipped}");
         }
     }
+    // The Argo CD Applications deploying here, read on the hubs known (this cluster when it
+    // serves them), as the app's scans read them.
+    std::thread::sleep(std::time::Duration::from_secs(1));
+    let _ = std::fs::write("/proc/self/clear_refs", "5");
+    let before = memory("VmRSS");
+    let t = std::time::Instant::now();
+    let (name, job) = problems::argo_apps::job(ctx, client, kinds, &[]);
+    let scan = job.await;
+    println!(
+        "{name}: {} problems in {:?}, peak {} MB from {} MB",
+        scan.problems.len(),
+        t.elapsed(),
+        mb(memory("VmHWM")),
+        mb(before)
+    );
+    if let Some(skipped) = scan.skipped_text() {
+        println!("  could not read {skipped}");
+    }
 }
 
 /// Two Problems scans one after the other (`RECOUVRANCE_PROBLEMS=twice`): each one's time,
 /// and the requests it sent and the bytes it received, from the API requests meter. The
 /// second shows what a scan costs when the one before can be reused.
-async fn problems_twice(client: &kube::Client, kinds: &[k8s::Kind]) {
+async fn problems_twice(client: &kube::Client, kinds: &[k8s::Kind], ctx: &str) {
     for run in ["first", "second"] {
         k8s::meter::reset();
         let t = std::time::Instant::now();
-        let scan = problems::scan_partial(client.clone(), kinds, None, None).await;
+        let scan = problems::scan_with_argo(client.clone(), kinds, ctx).await;
         let took = t.elapsed();
         let snapshot = k8s::meter::snapshot(k8s::meter::now_minute());
         let requests: u64 = snapshot.classes.iter().map(|(_, _, s)| s.count).sum();
