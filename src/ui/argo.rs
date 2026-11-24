@@ -549,7 +549,7 @@ impl ArgoView {
         let exec = cx.background_executor().clone();
         let work = async move {
             exec.spawn(async move {
-                let mut fleet = hub.map(|h| (*h).clone()).unwrap_or_default();
+                let mut fleet = hub.map_or_default(|h| (*h).clone());
                 let reads = feeds
                     .into_iter()
                     .map(|(endpoint, state)| ApiRead {

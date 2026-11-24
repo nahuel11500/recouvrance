@@ -876,7 +876,7 @@ fn lock(state: &Mutex<FeedState>) -> std::sync::MutexGuard<'_, FeedState> {
 /// How a round of a feed ended.
 enum Ended {
     /// The stream ended or went silent, as streams do: opened again, nothing to show.
-    Routine(String),
+    Routine,
     /// The list or the stream failed: said on the page.
     Failed(Failure),
 }
@@ -900,7 +900,7 @@ async fn feed(endpoint: Endpoint, state: Arc<Mutex<FeedState>>) {
             let mut s = lock(&state);
             s.live = false;
             match ended {
-                Ended::Routine(_) => {
+                Ended::Routine => {
                     s.error = None;
                     false
                 }
@@ -947,13 +947,11 @@ async fn read_stream(conn: Conn, state: Arc<Mutex<FeedState>>, out: tokio::sync:
     lock(&state).live = true;
     changed();
     let mut sse = Sse::default();
-    let routine = |text: &str| Ended::Routine(text.to_string());
     let failed = |text: String| Ended::Failed(Failure { status: None, text: scrub(&text, &conn.token.0) });
     let ended = loop {
         let frame = match tokio::time::timeout(IDLE, body.frame()).await {
-            Err(_) => break routine("the stream was silent for 15 min"),
-            Ok(None) => break routine("the stream ended"),
-            Ok(Some(Err(e))) => break routine(&format!("the stream broke: {e}")),
+            // Silent for 15 min, ended, or broken: opened again, as streams are.
+            Err(_) | Ok(None | Some(Err(_))) => break Ended::Routine,
             Ok(Some(Ok(frame))) => frame,
         };
         let Some(data) = frame.data_ref() else { continue };
@@ -1030,7 +1028,7 @@ async fn follow(conn: &Conn, state: &Arc<Mutex<FeedState>>) -> Ended {
                 changed();
             }
             Some(Err(ended)) => return ended,
-            None => return Ended::Routine("the stream ended".into()),
+            None => return Ended::Routine,
         }
     }
 }

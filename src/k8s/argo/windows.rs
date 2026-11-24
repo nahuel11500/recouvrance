@@ -308,6 +308,7 @@ fn earliest(all: &[Arc<Openings>], manual: bool, from: i64, to: i64) -> NextSync
 }
 
 /// When a sync can start next, from `now`, under `windows` (see `Planner::next_sync`).
+#[cfg(test)]
 pub fn next_sync(windows: &[&SyncWindow], manual: bool, now: Timestamp) -> NextSync {
     Planner::new(now).next_sync(windows, manual)
 }

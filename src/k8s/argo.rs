@@ -1319,7 +1319,7 @@ mod tests {
         let nightly = windows::SyncWindow::of(&json!({"kind": "allow", "schedule": "0 22 * * *", "duration": "1h",
             "applications": ["*"], "manualSync": true}));
         let projects: std::collections::BTreeMap<String, Vec<windows::SyncWindow>> =
-            [("shop".to_string(), vec![nightly])].into_iter().collect();
+            std::iter::once(("shop".to_string(), vec![nightly])).collect();
         fleet.projects.insert(server.instance(), Ok(Arc::new(projects)));
         let mut by_hand = fleet_app(&server, &api_app("argocd", "web", None));
         let mut auto = by_hand.clone();
