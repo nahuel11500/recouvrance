@@ -81,9 +81,35 @@ pub fn tls_covers(tls_hosts: &[&str], host: &str) -> bool {
     })
 }
 
-pub fn open_url(url: &str) {
-    let opener = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
-    spawn_reaped(std::process::Command::new(opener).arg(url).stdin(std::process::Stdio::null()));
+/// http(s) only: no `file://`, `search-ms:`, UNC path, custom scheme or anything else the
+/// desktop would launch. Links come from clusters (Argo CD's external URLs, alert runbooks,
+/// Ingress hosts), whose authors are not the user.
+pub fn is_web_link(url: &str) -> bool {
+    let url = url.trim_start().as_bytes();
+    let starts = |prefix: &str| url.get(..prefix.len()).is_some_and(|p| p.eq_ignore_ascii_case(prefix.as_bytes()));
+    starts("https://") || starts("http://")
+}
+
+/// Open a web link in the browser; anything else is refused, and the window says so.
+pub fn open_url(url: &str, window: &mut Window, cx: &mut App) {
+    use gpui_kit::component::WindowExt as _;
+    use gpui_kit::component::notification::Notification;
+    if !open_web_link(url, cx) {
+        let shown: String = url.chars().take(80).collect();
+        window
+            .push_notification(Notification::warning(format!("Not opened: {shown} is not an http or https link")), cx);
+    }
+}
+
+/// Open `url` in the browser when it is a web link (see [`is_web_link`]): whether it was.
+/// For where no window can say why not; the system's own opener (not `xdg-open` or `explorer`
+/// with the URL as an argument) gets it.
+pub fn open_web_link(url: &str, cx: &App) -> bool {
+    let ok = is_web_link(url);
+    if ok {
+        cx.open_url(url.trim());
+    }
+    ok
 }
 
 /// Start a helper program without waiting for it, reaped in the background so it never
@@ -133,7 +159,7 @@ impl Forwards {
                                 if saved.open_browser
                                     && let Some(url) = f.url()
                                 {
-                                    open_url(&url);
+                                    open_web_link(&url, cx);
                                 }
                                 remember(saved);
                             }
@@ -265,6 +291,51 @@ pub fn forget(saved: &SavedForward) {
 
 #[cfg(test)]
 mod tests {
+    /// Only http(s) links open: never a file, a share, a search or another program's scheme,
+    /// whatever case or spaces they come with (Argo CD's external URLs are set by whoever
+    /// writes the manifests).
+    #[test]
+    fn only_web_links_open() {
+        use super::is_web_link;
+        for good in ["https://kubernetes.io/docs", "HTTP://example.com", " Https://x", "http://localhost:8080"] {
+            assert!(is_web_link(good), "{good}");
+        }
+        for bad in [
+            "file:///etc/passwd",
+            r"\\host@SSL\x\evil.exe",
+            "search-ms:query=x&crumb=location:\\\\host",
+            "javascript:alert(1)",
+            "ssh://host",
+            "vscode://x",
+            "/tmp/x",
+            "C:\\Windows\\calc.exe",
+            "https:/x",
+            "httpx://x",
+            "",
+        ] {
+            assert!(!is_web_link(bad), "{bad}");
+        }
+    }
+
+    proptest::proptest! {
+        /// Whatever the text, it opens only when it starts with `http://` or `https://` (any
+        /// case, after spaces).
+        #[test]
+        fn a_link_opens_only_with_a_web_scheme(url in "\\PC{0,40}") {
+            let lower = url.trim_start().to_ascii_lowercase();
+            let web = lower.starts_with("http://") || lower.starts_with("https://");
+            proptest::prop_assert_eq!(super::is_web_link(&url), web);
+        }
+
+        #[test]
+        fn any_scheme_but_http_is_refused(scheme in "[a-zA-Z][a-zA-Z0-9+.-]{0,10}", rest in "\\PC{0,20}") {
+            let lower = scheme.to_ascii_lowercase();
+            proptest::prop_assume!(lower != "http" && lower != "https");
+            let url = format!("{scheme}:{rest}");
+            proptest::prop_assert!(!super::is_web_link(&url), "{}", url);
+        }
+    }
+
     #[test]
     fn host_urls() {
         use super::{host_url, tls_covers};

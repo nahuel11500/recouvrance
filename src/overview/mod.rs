@@ -359,9 +359,9 @@ fn card(cx: &App) -> Div {
 /// `text` in monospace, opening `url` in the browser when there is one.
 fn mono_url(id: impl Into<ElementId>, text: impl Into<SharedString>, url: Option<String>, cx: &App) -> Stateful<Div> {
     mono(text, cx).id(id).when_some(url, |d, url| {
-        d.text_color(cx.theme().blue).cursor_pointer().hover(Styled::underline).on_click(move |click, _, _| {
+        d.text_color(cx.theme().blue).cursor_pointer().hover(Styled::underline).on_click(move |click, window, cx| {
             if !dragged(click) {
-                crate::forwards::open_url(&url);
+                crate::forwards::open_url(&url, window, cx);
             }
         })
     })

@@ -678,8 +678,11 @@ pub fn lean(app: &Value) -> Value {
     if !conditions.is_empty() {
         put(&mut out, &["status", "conditions"], Value::Array(conditions));
     }
-    if let Some(urls) = app.pointer("/status/summary/externalURLs") {
-        put(&mut out, &["status", "summary", "externalURLs"], urls.clone());
+    // Set by annotations in the manifests: only web links are kept.
+    if let Some(urls) = app.pointer("/status/summary/externalURLs").and_then(Value::as_array) {
+        let web: Vec<Value> =
+            urls.iter().filter(|u| u.as_str().is_some_and(crate::forwards::is_web_link)).cloned().collect();
+        put(&mut out, &["status", "summary", "externalURLs"], Value::Array(web));
     }
     out
 }
@@ -1631,6 +1634,10 @@ users:
         let history = kept.pointer("/status/history").and_then(Value::as_array).unwrap();
         assert_eq!(history.iter().map(|h| h["id"].as_i64().unwrap()).collect::<Vec<_>>(), [8, 9, 10, 11, 12]);
         assert!(history[0].get("source").is_none());
+        // External URLs come from the manifests' annotations: only web links are kept.
+        full["status"]["summary"] =
+            json!({"externalURLs": ["https://web.example", "search-ms:query=x", "file:///x", 3]});
+        assert_eq!(lean(&full).pointer("/status/summary/externalURLs"), Some(&json!(["https://web.example"])));
     }
 
     #[test]

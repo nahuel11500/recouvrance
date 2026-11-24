@@ -161,7 +161,7 @@ impl AppView {
                                 .icon(Lucide::ExternalLink)
                                 .accessibility_label("Open in the browser")
                                 .tooltip(format!("Open {url}"))
-                                .on_click(move |_, _, _| crate::forwards::open_url(&url)),
+                                .on_click(move |_, window, cx| crate::forwards::open_url(&url, window, cx)),
                         )
                     })
                     .child(
