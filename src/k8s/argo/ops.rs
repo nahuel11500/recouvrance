@@ -28,7 +28,7 @@ pub struct SyncRequest {
     /// Argo CD applies nothing and reports what it would do.
     pub dry_run: bool,
     /// Without hooks: Argo CD's apply strategy, which applies the manifests and skips the
-    /// PreSync, Sync and PostSync hooks (a secret refresh, a migration). Off: the hook
+    /// `PreSync`, `Sync` and `PostSync` hooks (a secret refresh, a migration). Off: the hook
     /// strategy, Argo CD's default, which runs them.
     pub apply: bool,
     /// What prune deletes, as shown to whoever confirmed the sync: if git changed since and

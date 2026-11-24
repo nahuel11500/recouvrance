@@ -471,7 +471,7 @@ impl ArgoView {
                             let _ = cx.update(|window, cx| match result {
                                 Ok(msg) => window.push_notification(Notification::success(msg), cx),
                                 Err(e) => {
-                                    window.push_notification(Notification::error(format!("Terminate failed: {e}")), cx)
+                                    window.push_notification(Notification::error(format!("Terminate failed: {e}")), cx);
                                 }
                             });
                         })

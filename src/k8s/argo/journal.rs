@@ -126,7 +126,7 @@ impl Record {
     /// The state it holds, whenever it was seen: two equal ones are written once.
     fn fingerprint(&self) -> u64 {
         let mut h = std::collections::hash_map::DefaultHasher::new();
-        Record { seen: 0, ..self.clone() }.hash(&mut h);
+        Self { seen: 0, ..self.clone() }.hash(&mut h);
         h.finish()
     }
 
@@ -390,20 +390,19 @@ pub fn parse(texts: &[&str], now: i64) -> Loaded {
             if now - r.seen > KEEP_DAYS * 86_400 {
                 continue;
             }
-            match by_id.get(&r.id()) {
-                Some(&i) => {
-                    ops[i].states += 1;
-                    ops[i].last = r;
-                }
-                None => {
-                    by_id.insert(r.id(), ops.len());
-                    ops.push(Operation { last: r, states: 1 });
-                }
+            if let Some(&i) = by_id.get(&r.id()) {
+                ops[i].states += 1;
+                ops[i].last = r;
+            } else {
+                by_id.insert(r.id(), ops.len());
+                ops.push(Operation { last: r, states: 1 });
             }
         }
     }
     // Newest first: by when it started, else when it was seen.
-    ops.sort_by_key(|o| std::cmp::Reverse((o.last.started_at().map_or(o.last.seen, |t| t.as_second()), o.last.seen)));
+    ops.sort_by_key(|o| {
+        std::cmp::Reverse((o.last.started_at().map_or(o.last.seen, jiff::Timestamp::as_second), o.last.seen))
+    });
     Loaded { ops, bad }
 }
 
@@ -447,7 +446,7 @@ impl Filter {
         self.app.split_whitespace().all(|w| haystack.contains(w))
             && self.phase.as_ref().is_none_or(|p| *p == r.phase)
             && self.who.as_ref().is_none_or(|w| r.by.as_ref() == Some(w))
-            && self.since.is_none_or(|s| r.started_at().map_or(r.seen, |t| t.as_second()) >= now - s)
+            && self.since.is_none_or(|s| r.started_at().map_or(r.seen, jiff::Timestamp::as_second) >= now - s)
     }
 }
 

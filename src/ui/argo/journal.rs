@@ -57,7 +57,7 @@ fn facts(op: &Operation, now: jiff::Timestamp) -> Vec<String> {
     let mut out = Vec::new();
     if let Some(t) = r.started_at() {
         out.push(format!("started {} ago", k8s::duration_text(now.as_second() - t.as_second())));
-        let end = r.finished_at().map_or(now.as_second(), |f| f.as_second());
+        let end = r.finished_at().map_or(now.as_second(), jiff::Timestamp::as_second);
         let verb = if r.running() { "running for" } else { "took" };
         if r.finished_at().is_some() || r.running() {
             out.push(format!("{verb} {}", span_text(end - t.as_second())));

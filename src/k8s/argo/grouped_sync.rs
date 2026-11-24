@@ -9,7 +9,7 @@
 //! and its progress told from `status.operationState` ([`progress`]).
 //!
 //! Options: with hooks (Argo CD's hook strategy, its default) or without (the apply strategy:
-//! the manifests are applied, PreSync/Sync/PostSync hooks such as a secret refresh or a
+//! the manifests are applied, `PreSync`/`Sync`/`PostSync` hooks such as a secret refresh or a
 //! migration are skipped), prune (off by default; never deleting more than was shown), and
 //! dry run (Argo CD applies nothing and says what it would do).
 
@@ -277,7 +277,7 @@ mod tests {
         assert_eq!(plain, SyncRequest::default(), "with hooks, no prune, no dry run: Argo CD's own Sync");
         let r = Options { hooks: false, prune: true, dry_run: true }.request(&pruned);
         assert!(r.apply && r.prune && r.dry_run && r.resources.is_empty());
-        assert_eq!(r.prune_shown, Some(pruned.clone()), "prune deletes no more than was shown");
+        assert_eq!(r.prune_shown, Some(pruned), "prune deletes no more than was shown");
         assert_eq!(ops::sync_patch(&r)["operation"]["sync"]["syncStrategy"], json!({"apply": {}}));
         assert_eq!(Options { hooks: false, prune: true, dry_run: true }.text(), "without hooks, prune, dry run");
         assert_eq!(Options::default().text(), "with hooks");

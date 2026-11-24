@@ -84,13 +84,11 @@ impl Guard {
     /// What a write to many objects at once asks for, wherever they are: `text` typed (their
     /// count), `prompt` saying so, or the wait set in Settings → General.
     pub fn typed_text(text: &str, prompt: String, window: &mut Window, cx: &mut App) -> Self {
-        match crate::settings::confirm_wait() {
-            Some(secs) => Self::wait(secs, Vec::new(), cx),
-            None => {
-                let input = cx.new(|cx| InputState::new(window, cx).placeholder(text.to_string()));
-                Self::Type { input, context: text.to_string(), prompt }
-            }
+        if let Some(secs) = crate::settings::confirm_wait() {
+            return Self::wait(secs, Vec::new(), cx);
         }
+        let input = cx.new(|cx| InputState::new(window, cx).placeholder(text.to_string()));
+        Self::Type { input, context: text.to_string(), prompt }
     }
 
     /// A wait of `secs`, whose countdown redraws each second while the guard lives.
