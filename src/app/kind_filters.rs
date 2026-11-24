@@ -67,6 +67,7 @@ impl AppView {
             t.delegate_mut().set_filter(text);
             cx.notify();
         });
+        self.labels_for_filter(cx);
         // `set_value` sends no change event: move the highlight here.
         self.follow_selection(cx);
     }
