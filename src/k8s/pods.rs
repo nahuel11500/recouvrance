@@ -277,8 +277,8 @@ fn event_last(e: &LeanEvent) -> Option<jiff::Timestamp> {
         .and_then(|s| s.last_observed_time.as_ref())
         .and_then(|t| super::timestamp(t.0))
         .or_else(|| e.last_timestamp.as_ref().and_then(|t| super::timestamp(t.0)))
-        .or_else(|| e.event_time.as_ref().map(|t| t.0))
-        .or_else(|| e.metadata.creation_timestamp.as_ref().map(|t| t.0))
+        .or_else(|| e.event_time.as_ref().and_then(|t| super::timestamp(t.0)))
+        .or_else(|| e.metadata.creation_timestamp.as_ref().and_then(|t| super::timestamp(t.0)))
 }
 
 /// How many times an event happened, its `series` included.

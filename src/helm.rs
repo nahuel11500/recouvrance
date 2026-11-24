@@ -126,7 +126,7 @@ pub(crate) fn stub(meta: &ObjectMeta) -> Option<Release> {
     let updated = label("modifiedAt")
         .and_then(|t| t.parse().ok())
         .and_then(|t| jiff::Timestamp::from_second(t).ok())
-        .or_else(|| meta.creation_timestamp.as_ref().and_then(|t| crate::k8s::timestamp(t.0)));
+        .or_else(|| meta.creation_timestamp.as_ref().and_then(|t| k8s::timestamp(t.0)));
     Some(Release {
         context: String::new(),
         name,
