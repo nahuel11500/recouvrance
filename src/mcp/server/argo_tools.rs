@@ -732,7 +732,7 @@ fn diff_text(names: &[String], diffs: &[Result<Arc<AppDiff>, String>], notes: &[
             diffs.iter().map(|d| d.as_ref().ok().map(|d| &d.diff)).collect();
         // Each Application's own names (its name, the client it says) replaced before values
         // are compared, as the Argo CD page does.
-        let types = crate::k8s::argo::environments::EnvTypes::default();
+        let types = argo::environments::EnvTypes::default();
         let own: Vec<grouped_diff::Names> =
             names.iter().map(|n| grouped_diff::Names::new([n.clone()], types.client(n).map(String::from))).collect();
         let groups = grouped_diff::regroup(&read, &own, false);

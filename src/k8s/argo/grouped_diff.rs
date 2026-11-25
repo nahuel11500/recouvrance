@@ -496,6 +496,14 @@ pub fn regroup(diffs: &[Option<&SmartDiff>], names: &[Names], noise: bool) -> Ve
     out.into_iter().map(|(_, _, c)| c).collect()
 }
 
+/// Where a change is in one Application and what it says there, sorted, each once.
+fn signature(seen: &[Seen]) -> Vec<(&str, &Fact, u64)> {
+    let mut sig: Vec<(&str, &Fact, u64)> = seen.iter().map(|(n, f, d)| (n.as_str(), f, *d)).collect();
+    sig.sort();
+    sig.dedup();
+    sig
+}
+
 /// The line of a change of a resource's own on a kind (`shaped`: without its values), and the
 /// Applications where it is otherwise than in most.
 fn own_line(shaped: &Fact, kind: &str, places: &Places) -> (String, Vec<usize>) {
@@ -513,12 +521,6 @@ fn own_line(shaped: &Fact, kind: &str, places: &Places) -> (String, Vec<usize>) 
         text.push_str(&format!(" ({} values)", values.len()));
     }
     // Each Application's resources and values: those unlike the most's differ.
-    let signature = |seen: &[Seen]| {
-        let mut sig: Vec<(&str, &Fact, u64)> = seen.iter().map(|(n, f, d)| (n.as_str(), f, *d)).collect();
-        sig.sort();
-        sig.dedup();
-        sig
-    };
     let sigs: Vec<(usize, Vec<(&str, &Fact, u64)>)> = places.iter().map(|(a, (_, s))| (*a, signature(s))).collect();
     let mut count: BTreeMap<&[(&str, &Fact, u64)], usize> = BTreeMap::new();
     for (_, sig) in &sigs {
