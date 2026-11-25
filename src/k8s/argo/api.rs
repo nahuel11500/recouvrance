@@ -31,7 +31,7 @@ use super::windows::{self, SyncWindow};
 use super::{DEFAULT_NAMESPACE, Summary, TRACKING_ID};
 
 mod held;
-pub use held::{Held, held_apps};
+pub use held::held_apps;
 
 /// Where the tokens set in Settings → Argo CD are kept, by server address (mode 0600).
 const TOKENS_FILE: &str = "argocd-api-tokens.json";

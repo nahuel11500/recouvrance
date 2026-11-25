@@ -456,7 +456,7 @@ enum Via {
     /// On a hub context's Kubernetes API (the candidate's `hub`).
     Hub,
     /// By Argo CD's API (the candidate's `hub` is the server's name), with the hub context tied
-    /// to that server in Settings that the agent's rules name, for gitops and wait_for.
+    /// to that server in Settings that the agent's rules name, for `gitops` and `wait_for`.
     Server(Option<String>),
 }
 
@@ -991,7 +991,7 @@ mod tests {
         // Read by Argo CD's API: named by its server, acted on through the hub tied to it, if any.
         let server = "argocd.example.com".to_string();
         let on = |via: Via| Pick::One { hub: server.clone(), via, app: found.clone(), fit: Fit::Both };
-        let text = managed_text(&by, &on(Via::Server(None)), &key(), &[server.clone()], &[]).unwrap();
+        let text = managed_text(&by, &on(Via::Server(None)), &key(), std::slice::from_ref(&server), &[]).unwrap();
         assert!(
             text.starts_with(
                 "Argo CD: managed by Application argocd/web-workload on Argo CD server argocd.example.com"
@@ -1001,7 +1001,8 @@ mod tests {
         assert!(text.contains("This object in it: OutOfSync, Healthy."), "{text}");
         assert!(text.contains("none tied to this server is open to you"), "{text}");
         assert!(!text.contains("context argocd.example.com"), "{text}");
-        let text = managed_text(&by, &on(Via::Server(Some("hub".into()))), &key(), &[server.clone()], &[]).unwrap();
+        let text = managed_text(&by, &on(Via::Server(Some("hub".into()))), &key(), std::slice::from_ref(&server), &[])
+            .unwrap();
         assert!(text.contains("context hub, kind applications, namespace argocd, name web-workload"), "{text}");
         let text = managed_text(&by, &Pick::NotFound, &key(), &[server], &[]).unwrap();
         assert!(text.contains("not found on argocd.example.com."), "{text}");
