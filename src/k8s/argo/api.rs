@@ -1412,7 +1412,7 @@ pub async fn test(endpoint: Endpoint) -> Result<String, String> {
     read.await.unwrap_or_else(|e| Err(format!("{e:#}")))
 }
 
-/// Check a token for `server` before keeping it (Connect to Argo CD…): as [`test`] does.
+/// Check a token for `server` before keeping it (Connect to Argo CD…): as [`test()`](fn@test) does.
 pub async fn check_token(server: Server, token: String, insecure: bool) -> Result<String, String> {
     let read = crate::k8s::run_abortable(async move {
         let conn = Conn { server, token: Token(token), insecure };
