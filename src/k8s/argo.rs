@@ -1692,6 +1692,8 @@ mod tests {
             on: true,
             settings_token: false,
             renewable: false,
+            cli: None,
+            cli_renews: false,
         })
     }
 

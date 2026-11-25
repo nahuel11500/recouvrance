@@ -225,6 +225,8 @@ pub(super) struct CliServer {
     pub insecure: bool,
     /// `--grpc-web-root-path`: Argo CD is served under this path.
     pub grpc_web_root_path: String,
+    /// `--grpc-web`: the CLI speaks gRPC-Web (behind a proxy that only passes HTTP/1).
+    pub grpc_web: bool,
     /// `--core`: the CLI talks to the Kubernetes API, there is no API server to ask.
     pub core: bool,
 }

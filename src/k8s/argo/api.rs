@@ -118,9 +118,64 @@ pub struct Endpoint {
     pub settings_token: bool,
     /// Its token set here came from an SSO sign-in made here, renewed with its refresh token.
     pub renewable: bool,
+    /// How the argocd CLI reaches it, when it comes from the CLI's config.
+    pub cli: Option<CliArgs>,
+    /// Its login is the CLI's, renewed by running the CLI (`argocd` is found).
+    pub cli_renews: bool,
+}
+
+/// How the argocd CLI reaches a server, as its config says: what running it to renew that
+/// server's login passes (never a secret: the CLI reads its own config).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CliArgs {
+    /// `host[:port]`, as the config names it.
+    pub server: String,
+    pub grpc_web: bool,
+    pub root_path: String,
+    pub plaintext: bool,
+    pub insecure: bool,
+}
+
+impl CliArgs {
+    /// `account get-user-info --server <server>` and the flags the config says: a read that
+    /// makes the CLI renew its expired session with its own refresh token.
+    pub fn renew_args(&self) -> Vec<String> {
+        let mut args: Vec<String> = ["account", "get-user-info", "--server", &self.server].map(String::from).into();
+        if self.grpc_web {
+            args.push("--grpc-web".into());
+        }
+        if !self.root_path.is_empty() {
+            args.extend(["--grpc-web-root-path".to_string(), self.root_path.clone()]);
+        }
+        if self.plaintext {
+            args.push("--plaintext".into());
+        }
+        if self.insecure {
+            args.push("--insecure".into());
+        }
+        args
+    }
 }
 
 impl Endpoint {
+    /// How its login is renewed, if it is: with the refresh token kept here, or by running
+    /// the argocd CLI.
+    pub fn renewer(&self) -> Option<super::connect::Renewer> {
+        use super::connect::Renewer;
+        if self.renewable {
+            Some(Renewer::Refresh)
+        } else if self.cli_renews {
+            self.cli.clone().map(Renewer::Cli)
+        } else {
+            None
+        }
+    }
+
+    /// Its login is renewed (see `renewer`): its feed goes on across renewals.
+    pub fn renews_itself(&self) -> bool {
+        self.renewer().is_some()
+    }
+
     /// `argocd.example.com`: how it is named on the page.
     pub fn name(&self) -> String {
         self.server.name()
@@ -154,7 +209,7 @@ impl Endpoint {
         use std::hash::{Hash as _, Hasher as _};
         let mut h = std::collections::hash_map::DefaultHasher::new();
         match &self.login {
-            _ if self.renewable => "renewed here".hash(&mut h),
+            _ if self.renews_itself() => "renewed".hash(&mut h),
             Ok((t, how)) => (&t.0, how.text()).hash(&mut h),
             Err(e) => e.hash(&mut h),
         }
@@ -180,6 +235,7 @@ struct CliEntry {
     server: Result<Server, String>,
     insecure: bool,
     token: Option<String>,
+    args: CliArgs,
 }
 
 /// The server name `argocd login --port-forward` saves: the CLI port-forwards to argocd-server
@@ -230,6 +286,13 @@ fn cli_entries(text: &str, notes: &mut Vec<String>) -> Result<Vec<CliEntry>, Str
             server,
             insecure: s.insecure,
             token,
+            args: CliArgs {
+                server: s.server.trim().to_string(),
+                grpc_web: s.grpc_web,
+                root_path: root.to_string(),
+                plaintext: s.plain_text,
+                insecure: s.insecure,
+            },
         });
     }
     Ok(out)
@@ -307,6 +370,8 @@ fn endpoints_from(
             on: true,
             settings_token: false,
             renewable: false,
+            cli: Some(e.args),
+            cli_renews: false,
         });
     }
     for text in settings {
@@ -322,6 +387,8 @@ fn endpoints_from(
                     on: true,
                     settings_token: false,
                     renewable: false,
+                    cli: None,
+                    cli_renews: false,
                 }),
             },
             Err(e) => out.errors.push(format!("Settings → Argo CD: {e}")),
@@ -355,9 +422,10 @@ fn read_tokens() -> Result<BTreeMap<String, String>, String> {
     }
 }
 
-/// The token set in Settings → Argo CD for the server at `base`, if one is and the file reads.
-fn settings_token(base: &str) -> Option<Token> {
-    read_tokens().ok()?.remove(base).map(|t| t.trim().to_string()).filter(|t| !t.is_empty()).map(Token)
+/// The token `base` logs in with as the config has it now (after a renewal: the token set
+/// here, or the CLI's rewritten), if one is valid.
+fn fresh_token(base: &str) -> Option<Token> {
+    endpoints().list.into_iter().find(|e| e.server.base == base).and_then(|e| e.login.ok()).map(|(t, _)| t)
 }
 
 /// Keep `token` for the server at `base` as set by the user (empty: forget it), readable
@@ -414,6 +482,26 @@ pub fn endpoints() -> Endpoints {
             x.login = Err(super::connect::renewal_note(&name, &x.server.base).unwrap_or_else(|| {
                 format!("The login to {name} has expired: it is renewed while the Argo CD page reads it, or Reconnect")
             }));
+        }
+    }
+    // A login that works: what failed to renew it before is moot.
+    for x in found.list.iter().filter(|x| x.login.is_ok()) {
+        super::connect::login_works(&x.server.base);
+    }
+    // The CLI's own login, renewed by running the CLI when it is found.
+    let candidate = |x: &Endpoint| !x.renewable && x.cli.is_some() && !matches!(x.login, Ok((_, Login::Settings)));
+    if found.list.iter().any(candidate) && super::connect::argocd_binary().is_some() {
+        for x in found.list.iter_mut().filter(|x| candidate(x)) {
+            x.cli_renews = true;
+            if x.login.is_err() {
+                let name = x.name();
+                x.login = Err(super::connect::renewal_note(&name, &x.server.base).unwrap_or_else(|| {
+                    format!(
+                        "The argocd CLI's login to {name} has expired: it is renewed by running the CLI while a page \
+                         reads it, or run `argocd login {name} --sso`"
+                    )
+                }));
+            }
         }
     }
     found
@@ -1033,8 +1121,8 @@ pub fn watch(endpoint: &Endpoint) -> Watch {
         let cell: TokenCell = Arc::new(Mutex::new(token.clone()));
         let task = crate::k8s::spawn_guarded(feed(endpoint.clone(), state.clone(), cell.clone()));
         let renew = endpoint
-            .renewable
-            .then(|| crate::k8s::spawn_guarded(keep_renewed(endpoint.server.base.clone(), cell.clone())));
+            .renewer()
+            .map(|how| crate::k8s::spawn_guarded(keep_renewed(endpoint.server.base.clone(), how, cell.clone())));
         Feed { state, users: 0, token: cell, _task: task, _renew: renew }
     });
     // The login as read now (renewed since the feed started): its next request sends it,
@@ -1062,7 +1150,7 @@ pub fn running(endpoint: &Endpoint) -> Option<Arc<Mutex<FeedState>>> {
 /// Keep the login to `base` renewed while its feed runs: shortly before the token in `cell`
 /// expires (at once when there is none), again after a while when that fails. The new token
 /// goes in `cell`: the feed goes on with it.
-async fn keep_renewed(base: String, cell: TokenCell) {
+async fn keep_renewed(base: String, how: super::connect::Renewer, cell: TokenCell) {
     // After a failure that may pass (the network), tried again from 5 s, doubling to 5 min.
     let mut retry = Duration::from_secs(5);
     loop {
@@ -1070,14 +1158,14 @@ async fn keep_renewed(base: String, cell: TokenCell) {
         let now = jiff::Timestamp::now().as_second();
         let wait = match &before {
             None => Some(0),
-            Some(t) => super::connect::renew_in(server::exp_of(&t.0), now, super::connect::jitter()),
+            Some(t) => how.wait(server::exp_of(&t.0), now, super::connect::jitter()),
         };
         // A token that doesn't expire is not renewed.
         let Some(wait) = wait else { return };
         tokio::time::sleep(Duration::from_secs(wait)).await;
-        match super::connect::renew(base.clone()).await {
+        match super::connect::renew(base.clone(), how.clone()).await {
             Ok(()) => {
-                let after = settings_token(&base);
+                let after = fresh_token(&base);
                 let same = after == before;
                 if after.is_some() {
                     set_token(&cell, after);
@@ -1107,7 +1195,7 @@ fn lock(state: &Mutex<FeedState>) -> std::sync::MutexGuard<'_, FeedState> {
 /// login renewed here says nothing while it is renewed (a reader waits for it), only why it
 /// failed; another says why it has none.
 fn waiting_note(endpoint: &Endpoint, failure: Option<String>) -> Option<String> {
-    if endpoint.renewable {
+    if endpoint.renews_itself() {
         return failure;
     }
     Some(endpoint.login.clone().err().unwrap_or_else(|| format!("No login to {}", endpoint.name())))
@@ -1116,7 +1204,7 @@ fn waiting_note(endpoint: &Endpoint, failure: Option<String>) -> Option<String> 
 /// Whether a login renewed here can be renewed now: it can, and it hasn't failed for good.
 /// Such a server is read even when its token has expired: its feed renews it at once.
 pub fn renews(endpoint: &Endpoint) -> bool {
-    endpoint.renewable && !super::connect::renewal_dead(&endpoint.server.base)
+    endpoint.renews_itself() && !super::connect::renewal_dead(&endpoint.server.base)
 }
 
 /// Whether a reader should hold `endpoint`'s feed: it has a login, or one that renews.
@@ -1153,7 +1241,7 @@ async fn feed(endpoint: Endpoint, state: Arc<Mutex<FeedState>>, cell: TokenCell)
                 changed();
                 said = Some(why);
             }
-            if !endpoint.renewable || super::connect::renewal_dead(&endpoint.server.base) {
+            if !endpoint.renews_itself() || super::connect::renewal_dead(&endpoint.server.base) {
                 return;
             }
             tokio::time::sleep(Duration::from_secs(1)).await;
@@ -1180,13 +1268,11 @@ async fn feed(endpoint: Endpoint, state: Arc<Mutex<FeedState>>, cell: TokenCell)
         };
         changed();
         if refused {
-            if !endpoint.renewable {
-                return;
-            }
+            let Some(how) = endpoint.renewer() else { return };
             // Refused (expired, revoked?): renewing may help, then the feed goes on.
-            match super::connect::renew(endpoint.server.base.clone()).await {
+            match super::connect::renew(endpoint.server.base.clone(), how).await {
                 Ok(()) => {
-                    if let Some(t) = settings_token(&endpoint.server.base) {
+                    if let Some(t) = fresh_token(&endpoint.server.base) {
                         set_token(&cell, Some(t));
                     }
                 }
@@ -1462,10 +1548,11 @@ pub async fn list_once(endpoint: Endpoint, timeout: Duration) -> Result<Vec<Arc<
 /// feed or not: an agent's or a Problems scan's read with the Argo CD page closed).
 async fn current_renewed(base: &str) -> Result<Endpoint, String> {
     let e = current(base)?;
-    if e.login.is_ok() || !renews(&e) {
-        return Ok(e);
-    }
-    let _ = super::connect::renew(base.to_string()).await;
+    let how = match e.renewer() {
+        Some(how) if e.login.is_err() && renews(&e) => how,
+        _ => return Ok(e),
+    };
+    let _ = super::connect::renew(base.to_string(), how).await;
     current(base)
 }
 
@@ -2202,6 +2289,8 @@ users:
             on: true,
             settings_token: true,
             renewable,
+            cli: None,
+            cli_renews: false,
         };
         let first = watch(&endpoint("first", true));
         let renewed = watch(&endpoint("renewed", true));
@@ -2266,11 +2355,57 @@ users:
             on: true,
             settings_token: true,
             renewable,
+            cli: None,
+            cli_renews: false,
         };
         assert!(renews(&endpoint(true)) && readable(&endpoint(true)));
         assert!(!readable(&endpoint(false)));
         assert_eq!(waiting_note(&endpoint(true), None), None);
         assert_eq!(waiting_note(&endpoint(true), Some("refused".into())), Some("refused".into()));
         assert_eq!(waiting_note(&endpoint(false), None), Some("expired".into()));
+    }
+
+    /// The argocd CLI is run to renew a server's login with that server and the flags its
+    /// config says, and never a secret: the CLI reads its own config.
+    #[test]
+    fn the_cli_is_run_with_the_servers_flags_and_no_secret() {
+        let e = endpoints_from(Some(Ok(CLI.into())), &[], Ok(BTreeMap::new()), &[], true, 100);
+        let args = |name: &str| {
+            let x = e.list.iter().find(|x| x.name() == name).unwrap();
+            x.cli.as_ref().unwrap().renew_args().join(" ")
+        };
+        assert_eq!(args("argocd.example.com"), "account get-user-info --server argocd.example.com --grpc-web");
+        assert_eq!(
+            args("argocd-dev.example.com"),
+            "account get-user-info --server argocd-dev.example.com --grpc-web-root-path argo --insecure"
+        );
+        assert_eq!(args("localhost:8080"), "account get-user-info --server localhost:8080 --plaintext");
+        for x in &e.list {
+            let all = x.cli.as_ref().map(super::CliArgs::renew_args).unwrap_or_default().join(" ");
+            assert!(!all.contains("token-secret"), "{all}");
+        }
+    }
+
+    /// A CLI login renewed by running the CLI keeps its feed: the CLI rewriting its config
+    /// with a new token is the same login.
+    #[test]
+    fn a_cli_renewal_keeps_the_feed() {
+        use super::{CliArgs, Endpoint, Token, watch};
+        use crate::k8s::argo::server::Server;
+        let endpoint = |token: &str| Endpoint {
+            server: Server::parse("http://127.0.0.1:9/cli-renewal-test").unwrap(),
+            cli_context: Some("lab".into()),
+            in_settings: false,
+            insecure: false,
+            login: Ok((Token(token.into()), Login::Cli)),
+            on: true,
+            settings_token: false,
+            renewable: false,
+            cli: Some(CliArgs { server: "127.0.0.1:9".into(), plaintext: true, ..CliArgs::default() }),
+            cli_renews: true,
+        };
+        let first = watch(&endpoint("first"));
+        let renewed = watch(&endpoint("renewed"));
+        assert!(std::sync::Arc::ptr_eq(&first.state, &renewed.state), "a CLI renewal started another feed");
     }
 }

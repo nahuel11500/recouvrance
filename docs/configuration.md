@@ -297,7 +297,12 @@ refresh token the provider refuses ends the renewals until *Reconnect*; a networ
 tried again from 5 s, doubling to 5 minutes. It says it is renewing only while it is, and it
 has expired only once renewing failed, with why. Setting or forgetting a token by hand forgets
 the refresh token too. An expired token set here gives way to a valid `argocd login` of the
-same server. *Reconnect* keeps the argocd CLI's `--insecure` for that server.
+same server. A login from the argocd CLI's config is renewed the same way, by
+running the CLI when it is found: `argocd account get-user-info --server <server>` with the
+`--grpc-web`, `--grpc-web-root-path`, `--plaintext` and `--insecure` its config says, right after
+the token expires (the CLI renews only an expired session) and when it is refused. The CLI renews
+with its own refresh token and rewrites its config, which is read again; no secret is passed, and
+its refresh token is never used here. A refusal says to run `argocd login <server> --sso` again. *Reconnect* keeps the argocd CLI's `--insecure` for that server.
 
 A config that can't be read fails closed: a CLI config that doesn't parse gives no server, and a
 tokens file that doesn't read gives no token at all (not even the CLI's), each said in Settings →

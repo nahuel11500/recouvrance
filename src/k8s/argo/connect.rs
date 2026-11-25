@@ -916,11 +916,105 @@ fn renewal_answer(status: u16, body: &[u8], kept: &str) -> Result<Tokens, Failed
     }
 }
 
-/// Renew the login to `base` with the refresh token kept for it, unless one runs, ran just
-/// now, or failed for good. Once started it runs to its end, even when nothing waits for it
-/// any more: the provider may have rotated the refresh token, which must then be kept. The
-/// pages read the servers again (without listing anything again).
-pub async fn renew(base: String) -> Result<(), Failed> {
+/// How a server's login is renewed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Renewer {
+    /// With the refresh token kept here (an SSO sign-in made here).
+    Refresh,
+    /// By running the argocd CLI, which renews its own session with its own refresh token and
+    /// rewrites its config: the CLI's refresh token is never used here (a provider that
+    /// rotates them would leave the CLI's invalid).
+    Cli(super::api::CliArgs),
+}
+
+impl Renewer {
+    /// Seconds to wait before renewing a token expiring at `exp` (see `renew_in`). The CLI
+    /// only renews a session that has expired: it runs right after, jittered too.
+    pub(super) fn wait(&self, exp: Option<i64>, now: i64, jitter: u8) -> Option<u64> {
+        match self {
+            Self::Refresh => renew_in(exp, now, jitter),
+            Self::Cli(_) => {
+                let jitter = i64::from(jitter) % (JITTER + 1);
+                exp.map(|exp| u64::try_from(exp + 1 + jitter - now).unwrap_or(0))
+            }
+        }
+    }
+}
+
+/// A login that works again (a new `argocd login`, say): a renewal that failed before is
+/// forgotten, so the next one is tried.
+pub fn login_works(base: &str) {
+    let mut all = renewals();
+    if all.get(base).is_some_and(|r| !r.running && r.failed.is_some()) {
+        all.remove(base);
+    }
+}
+
+/// The argocd CLI, also where installers put it when PATH misses it (desktop launchers).
+pub fn argocd_binary() -> Option<std::path::PathBuf> {
+    let name = if cfg!(windows) { "argocd.exe" } else { "argocd" };
+    let home = crate::paths::home();
+    std::env::var_os("PATH")
+        .map_or_default(|p| std::env::split_paths(&p).collect::<Vec<_>>())
+        .into_iter()
+        .chain([home.join(".local/bin"), "/usr/local/bin".into(), "/opt/homebrew/bin".into()])
+        .map(|d| d.join(name))
+        .find(|p| p.is_file())
+}
+
+/// The longest wait for the argocd CLI to renew a session.
+const CLI_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Run the argocd CLI to renew its session with the server `args` name: a read
+/// (`account get-user-info`), which renews an expired session with the CLI's own refresh
+/// token and rewrites its config. No secret is passed: the CLI reads its config.
+async fn run_cli(args: &super::api::CliArgs) -> Result<(), Failed> {
+    let relogin = format!("run `argocd login {} --sso` again", args.server);
+    let bin = argocd_binary().ok_or_else(|| Failed::fatal(format!("the argocd CLI isn't found: {relogin}")))?;
+    let mut cmd = crate::process::tokio_command(bin);
+    cmd.args(args.renew_args())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    let out = match tokio::time::timeout(CLI_TIMEOUT, cmd.output()).await {
+        Err(_) => {
+            return Err(Failed::later(format!("the argocd CLI did not answer within {} s", CLI_TIMEOUT.as_secs())));
+        }
+        Ok(Err(e)) => return Err(Failed::later(format!("the argocd CLI could not run: {e}"))),
+        Ok(Ok(out)) => out,
+    };
+    if out.status.success() {
+        return Ok(());
+    }
+    Err(cli_failure(&String::from_utf8_lossy(&out.stderr), &relogin))
+}
+
+/// What the argocd CLI's failure to renew says: its own words (cut short), and whether its
+/// session is dead (refused: sign in again) or the failure may pass (the network).
+fn cli_failure(stderr: &str, relogin: &str) -> Failed {
+    let said: String = stderr
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("no reason given")
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(200)
+        .collect();
+    const DEAD: [&str; 5] = ["Unauthenticated", "invalid_grant", "token is expired", "invalid session", "login"];
+    if DEAD.iter().any(|w| said.contains(w)) {
+        Failed::fatal(format!("the argocd CLI couldn't renew it ({said}): {relogin}"))
+    } else {
+        Failed::later(format!("the argocd CLI couldn't renew it ({said})"))
+    }
+}
+
+/// Renew the login to `base` (`how`), unless one runs, ran just now, or failed for good. Once
+/// started it runs to its end, even when nothing waits for it any more: the provider may have
+/// rotated the refresh token, which must then be kept. The pages read the servers again
+/// (without listing anything again).
+pub async fn renew(base: String, how: Renewer) -> Result<(), Failed> {
     {
         let mut all = renewals();
         match all.get(&base) {
@@ -933,7 +1027,10 @@ pub async fn renew(base: String) -> Result<(), Failed> {
     }
     let (tx, rx) = tokio::sync::oneshot::channel();
     crate::k8s::spawn_detached(async move {
-        let result = renew_now(&base).await;
+        let result = match &how {
+            Renewer::Refresh => renew_now(&base).await,
+            Renewer::Cli(args) => run_cli(args).await,
+        };
         let mut all = renewals();
         // Reconnected meanwhile: its own state stands.
         if all.get(&base).is_some_and(|r| r.running) {
@@ -1384,5 +1481,31 @@ mod tests {
         assert!(other.try_lock().is_ok(), "the lock went with its file");
         drop(other);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn the_cli_renews_right_after_its_session_expires() {
+        use super::Renewer;
+        let cli = Renewer::Cli(crate::k8s::argo::api::CliArgs::default());
+        // The CLI renews only an expired session: 1 s after, jittered up to 10 s more.
+        assert_eq!(cli.wait(Some(1120), 1000, 0), Some(121));
+        assert_eq!(cli.wait(Some(1120), 1000, 10), Some(131));
+        assert_eq!(cli.wait(Some(900), 1000, 0), Some(0));
+        assert_eq!(cli.wait(None, 1000, 0), None);
+        // A refresh token kept here: before.
+        assert_eq!(Renewer::Refresh.wait(Some(1120), 1000, 0), Some(90));
+    }
+
+    #[test]
+    fn a_cli_refused_to_renew_says_to_log_in_again() {
+        use super::cli_failure;
+        let dead = cli_failure(
+            "time=\"x\" level=fatal msg=\"rpc error: code = Unauthenticated desc = invalid session: token is expired\"\n",
+            "run `argocd login a --sso` again",
+        );
+        assert!(dead.fatal && dead.why.contains("argocd login a --sso"), "{dead:?}");
+        let later = cli_failure("dial tcp: lookup a: no such host", "run `argocd login a --sso` again");
+        assert!(!later.fatal && later.why.contains("no such host"), "{later:?}");
+        assert!(!cli_failure("", "x").fatal);
     }
 }
