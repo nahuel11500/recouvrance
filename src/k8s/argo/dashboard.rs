@@ -612,7 +612,7 @@ impl Partial {
         if let Some(t) = self.at {
             how.push(format!("{} ago", crate::k8s::age(t)));
         }
-        let by = self.by.as_ref().map(|b| format!(" by {b}")).unwrap_or_default();
+        let by = self.by.as_ref().map_or_default(|b| format!(" by {b}"));
         format!(
             "{} of {} at {} ({}{by})",
             self.resources,

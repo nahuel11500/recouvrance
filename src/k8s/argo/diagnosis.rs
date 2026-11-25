@@ -273,7 +273,7 @@ fn short(rev: &str) -> String {
 /// `s` with its first letter upper case.
 fn capitalize(s: &str) -> String {
     let mut c = s.chars();
-    c.next().map(|f| f.to_uppercase().chain(c).collect()).unwrap_or_default()
+    c.next().map_or_default(|f| f.to_uppercase().chain(c).collect())
 }
 
 /// Keep the first `SHOWN_OBJECTS` objects, and count the others.
@@ -806,11 +806,10 @@ fn out_of_sync_finding(
         (Some(p), m) => Some(format!(
             "{} since the newest deployment{}; the rest is as that deployment left it.{}",
             capitalize(&p.text()),
-            moved.map(|(d, _)| format!(" ({d})")).unwrap_or_default(),
+            moved.map_or_default(|(d, _)| format!(" ({d})")),
             moved
                 .filter(|(_, target)| *target != p.revision)
-                .map(|(_, target)| format!(" Git is at {target} now."))
-                .unwrap_or_default(),
+                .map_or_default(|(_, target)| format!(" Git is at {target} now.")),
         ))
         .or(m),
         (None, m) => m,

@@ -1286,7 +1286,7 @@ impl ArgoView {
             .children(c.deployed.iter().enumerate().map(|(i, (dep, commit))| deployed_row(i, dep, commit.as_ref(), cx)))
             // The newest deployment isn't all that runs: a selective sync came after it.
             .when_some(c.partial.as_ref(), |card, p| {
-                let rest = c.deployed.first().map(|(d, _)| short_revision(&d.revision)).unwrap_or_default();
+                let rest = c.deployed.first().map_or_default(|(d, _)| short_revision(&d.revision));
                 let mut text = format!("Then {}", p.text());
                 if !rest.is_empty() && rest != p.revision {
                     text.push_str(&format!("; the rest at {rest}"));

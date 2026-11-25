@@ -487,7 +487,7 @@ fn approval_detail(app: &serde_json::Value, op: &mut Op) -> Option<String> {
             *op = ops::pinned(app, op).ok()?;
             let Op::Rollback { id, .. } = op else { return None };
             let entry = ops::rollback_target(app, *id).ok()?;
-            let undoes = rollback_undoes(app).map(|u| format!(". {u}")).unwrap_or_default();
+            let undoes = rollback_undoes(app).map_or_default(|u| format!(". {u}"));
             Some(format!("rollback to {}{undoes}", ops::deployment_label(entry)))
         }
         _ => None,
