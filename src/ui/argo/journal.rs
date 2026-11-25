@@ -64,7 +64,7 @@ impl JournalPage {
     fn summarise_open(&mut self) {
         let ids: Vec<OpId> = self.open.keys().cloned().collect();
         for id in ids {
-            let sum = self.find(&id).map(|o| Arc::new(Summary::of(&o.last.resources))).unwrap_or_default();
+            let sum = self.find(&id).map_or_default(|o| Arc::new(Summary::of(&o.last.resources)));
             self.open.insert(id, sum);
         }
     }
@@ -72,7 +72,7 @@ impl JournalPage {
     /// Unfold the operation `id` (its steps summed up), or fold it.
     fn toggle(&mut self, id: OpId) {
         if self.open.remove(&id).is_none() {
-            let sum = self.find(&id).map(|o| Arc::new(Summary::of(&o.last.resources))).unwrap_or_default();
+            let sum = self.find(&id).map_or_default(|o| Arc::new(Summary::of(&o.last.resources)));
             self.open.insert(id, sum);
         }
     }
