@@ -14,7 +14,7 @@ pub(super) fn connect_failure(e: &(dyn StdError + 'static)) -> Option<String> {
     if !causes.iter().any(|c| is_connect(*c)) {
         return None;
     }
-    let at = causes.iter().find_map(|c| address(*c)).map(|a| format!(" ({a})")).unwrap_or_default();
+    let at = causes.iter().find_map(|c| address(*c)).map_or_default(|a| format!(" ({a})"));
     let said = if let Some(tls) = causes.iter().find_map(|c| tls(*c)) {
         format!("TLS handshake with the API server failed: {tls}")
     } else if causes.iter().any(|c| io_kind(*c) == Some(std::io::ErrorKind::ConnectionRefused)) {
@@ -24,7 +24,7 @@ pub(super) fn connect_failure(e: &(dyn StdError + 'static)) -> Option<String> {
     } else if causes.iter().any(|c| io_kind(*c) == Some(std::io::ErrorKind::TimedOut) || timed_out(*c)) {
         "The cluster did not answer (timed out connecting to the API server)".to_string()
     } else {
-        let root = causes.last().map(ToString::to_string).unwrap_or_default();
+        let root = causes.last().map_or_default(ToString::to_string);
         format!("Can't connect to the API server{at}: {root}")
     };
     Some(super::login::without_userinfo(&said).into_owned())
