@@ -131,9 +131,15 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         tokio::spawn(async move {
-            use tokio::io::AsyncWriteExt as _;
+            use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
             while let Ok((mut socket, _)) = listener.accept().await {
+                // Read the ClientHello and close gracefully: on Windows, dropping a socket with
+                // unread data resets it, and the client sees the reset instead of the reply.
+                let mut buf = [0u8; 4096];
+                let _ = socket.read(&mut buf).await;
                 let _ = socket.write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n").await;
+                let _ = socket.shutdown().await;
+                while matches!(socket.read(&mut buf).await, Ok(n) if n > 0) {}
             }
         });
         let e = client(&format!("https://127.0.0.1:{port}")).apiserver_version().await.unwrap_err();
