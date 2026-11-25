@@ -378,7 +378,8 @@ banner counts down to that. So that it is seen with the window behind others or 
 window's title says how many requests wait, each window asks for attention (it flashes in the
 taskbar on X11 and bounces the Dock icon on macOS, not on Wayland) and one desktop
 notification is sent (with `notify-send` on Linux, in Notification Center on macOS, where it comes
-from Script Editor and needs that app's notifications allowed). An
+from Script Editor and needs that app's notifications allowed, and as a toast on Windows, where it
+comes from Windows PowerShell and follows that app's notification settings). An
 approval also ends when the agent stops waiting for it. When it cancels the call or hangs up (**Stop**
 in the assistant, a `claude -p` killed), the banner goes at once; when its session ends, within
 seconds. A click on the banner after that changes nothing. A banner that goes (answered, refused or
