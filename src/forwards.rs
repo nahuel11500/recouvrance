@@ -112,6 +112,16 @@ pub fn open_web_link(url: &str, cx: &App) -> bool {
     ok
 }
 
+/// The program that opens a file or folder with the user's default application (links go
+/// through [`open_url`], http(s) only).
+pub const OPENER: &str = if cfg!(target_os = "macos") {
+    "open"
+} else if cfg!(windows) {
+    "explorer"
+} else {
+    "xdg-open"
+};
+
 /// Start a helper program without waiting for it, reaped in the background so it never
 /// lingers as a zombie process.
 pub fn spawn_reaped(cmd: &mut std::process::Command) {

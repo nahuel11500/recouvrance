@@ -9,7 +9,6 @@
 
 use std::collections::VecDeque;
 use std::io::{self, Write as _};
-use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -218,7 +217,7 @@ pub fn append(path: &Path, context: &str, lines: &str) -> io::Result<()> {
     if let Some(dir) = path.parent() {
         crate::private_files::create_dir(dir)?;
     }
-    let mut f = std::fs::OpenOptions::new().append(true).create(true).mode(0o600).open(path)?;
+    let mut f = crate::private_files::private_file(std::fs::OpenOptions::new().append(true).create(true)).open(path)?;
     let mut out = String::with_capacity(lines.len() + 64);
     if f.metadata()?.len() == 0 {
         out.push_str(&header_line(context));

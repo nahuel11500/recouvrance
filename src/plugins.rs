@@ -219,6 +219,7 @@ mod tests {
     }
 
     /// Hostile values are data: they are never run, wherever the shorthand stands.
+    #[cfg(unix)]
     #[test]
     fn values_never_run() {
         let evil = "a\"; echo pwned; '$(echo pwned)`echo pwned`";

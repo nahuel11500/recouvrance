@@ -103,8 +103,9 @@ fn locked(path: &std::path::Path) -> bool {
 
 /// Lock `path` (created if missing) for as long as the returned file is open.
 pub(super) fn take_lock(path: &std::path::Path) -> Option<std::fs::File> {
-    use std::os::unix::fs::OpenOptionsExt as _;
-    let file = std::fs::OpenOptions::new().create(true).truncate(false).write(true).mode(0o600).open(path).ok()?;
+    let file = crate::private_files::private_file(std::fs::OpenOptions::new().create(true).truncate(false).write(true))
+        .open(path)
+        .ok()?;
     file.try_lock().ok()?;
     Some(file)
 }

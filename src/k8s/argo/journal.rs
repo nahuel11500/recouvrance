@@ -287,7 +287,6 @@ impl Journal {
     /// full file moves to `.1` first. The file and its directory are the user's alone.
     pub fn append(&mut self, r: &Record) -> std::io::Result<bool> {
         use std::io::Write as _;
-        use std::os::unix::fs::OpenOptionsExt as _;
         let print = r.fingerprint();
         if self.written.get(&r.id()) == Some(&print) {
             return Ok(false);
@@ -299,7 +298,8 @@ impl Journal {
             std::fs::rename(&self.path, older(&self.path))?;
         }
         let line = line_of(r)?;
-        let mut f = std::fs::OpenOptions::new().append(true).create(true).mode(0o600).open(&self.path)?;
+        let mut f = crate::private_files::private_file(std::fs::OpenOptions::new().append(true).create(true))
+            .open(&self.path)?;
         writeln!(f, "{line}")?;
         if self.written.len() >= REMEMBERED {
             self.written.clear();
@@ -571,7 +571,6 @@ mod tests {
     /// knows what it holds after a restart; the file is the user's alone.
     #[test]
     fn states_are_written_once_each() {
-        use std::os::unix::fs::PermissionsExt as _;
         let d = dir();
         let path = d.join("data").join("journal.jsonl");
         let mut j = Journal::open(path.clone(), 0);
@@ -587,7 +586,7 @@ mod tests {
         assert!(again.append(&next).unwrap(), "another operation of the same Application");
         let text = std::fs::read_to_string(&path).unwrap();
         assert_eq!(text.lines().count(), 3);
-        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let mode = crate::private_files::mode;
         assert_eq!(mode(&path), 0o600);
         assert_eq!(mode(&d.join("data")), 0o700);
         let loaded = read(&path, 60).unwrap();
@@ -636,7 +635,7 @@ mod tests {
         let mut j = Journal::open(path.clone(), 0);
         let first = record_of("i", &app("Succeeded", "2026-01-01T00:00:00Z", json!([])), 1).unwrap();
         j.append(&first).unwrap();
-        std::fs::OpenOptions::new().append(true).open(&path).unwrap().set_len(MAX_BYTES).unwrap();
+        std::fs::OpenOptions::new().write(true).open(&path).unwrap().set_len(MAX_BYTES).unwrap();
         let second = record_of("i", &app("Failed", "2026-01-02T00:00:00Z", json!([])), 2).unwrap();
         j.append(&second).unwrap();
         assert_eq!(std::fs::metadata(older(&path)).unwrap().len(), MAX_BYTES);

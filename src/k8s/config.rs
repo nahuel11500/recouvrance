@@ -1125,7 +1125,8 @@ echo '{"apiVersion":"client.authentication.k8s.io/v1","kind":"ExecCredential","s
         };
         let said = crate::k8s::short_error(&e);
         assert!(said.starts_with("the login command `recouvrance-login` could not be started: "), "{said}");
-        assert!(said.contains("os error 2"), "{said}");
+        // ERROR_PATH_NOT_FOUND on Windows, where the folder is missing; ENOENT elsewhere.
+        assert!(said.contains(if cfg!(windows) { "os error 3" } else { "os error 2" }), "{said}");
     }
 
     /// A kubeconfig that fails to parse is said by its file, line and column, and why in words
