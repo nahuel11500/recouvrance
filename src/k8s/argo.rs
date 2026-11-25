@@ -1527,20 +1527,6 @@ pub struct Fleet {
 }
 
 impl Fleet {
-    /// The line above the list: how many Applications (`kept` of them, when filtered), and
-    /// which servers are still being read. Never `0 Applications` while one is.
-    pub fn summary(&self, kept: Option<usize>) -> String {
-        let count = crate::plural::count(self.apps.len(), "Application");
-        let reading = format!("Reading Applications from {}…", self.reading.join(", "));
-        match kept {
-            _ if self.apps.is_empty() && !self.reading.is_empty() => reading,
-            Some(kept) if self.reading.is_empty() => format!("{kept} of {count}"),
-            Some(kept) => format!("{kept} of {count} · {reading}"),
-            None if self.reading.is_empty() => count,
-            None => format!("{count} · {reading}"),
-        }
-    }
-
     /// When the next sync of `a` can start, from `now`, under its project's sync windows.
     pub fn next_sync(&self, a: &FleetApp, plan: &mut windows::Planner) -> windows::NextSync {
         // Auto-sync is held by every window; a manual sync goes through those that allow it.
@@ -1768,24 +1754,14 @@ mod tests {
             from_api(vec![pending, ApiRead { endpoint: two.clone(), state: failed }], &[], &[], &Default::default());
         // The one that failed says why instead.
         assert_eq!(fleet.reading, [one.name()]);
-        assert_eq!(fleet.summary(None), format!("Reading Applications from {}…", one.name()));
-        assert_eq!(fleet.summary(Some(0)), fleet.summary(None));
 
         // One listed, the other still read: both said.
         let mut listed = api::FeedState { listed: true, ..Default::default() };
         let a = api_app("argocd", "web", None);
         listed.apps.insert((a.summary.namespace.clone(), a.summary.name.clone()), a);
         let pending = ApiRead { endpoint: one.clone(), state: api::FeedState::default() };
-        let mut fleet =
-            from_api(vec![ApiRead { endpoint: two, state: listed }, pending], &[], &[], &Default::default());
-        let reading = format!("Reading Applications from {}…", one.name());
-        assert_eq!(fleet.summary(None), format!("1 Application · {reading}"));
-        assert_eq!(fleet.summary(Some(0)), format!("0 of 1 Application · {reading}"));
-
-        // Every list in: the count alone.
-        fleet.reading.clear();
-        assert_eq!(fleet.summary(None), "1 Application");
-        assert_eq!(fleet.summary(Some(1)), "1 of 1 Application");
+        let fleet = from_api(vec![ApiRead { endpoint: two, state: listed }, pending], &[], &[], &Default::default());
+        assert_eq!((fleet.apps.len(), fleet.reading.clone()), (1, vec![one.name()]));
     }
 
     #[test]

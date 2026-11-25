@@ -1318,21 +1318,8 @@ impl Render for ArgoView {
             Some(rows) if rows.fleet.servers.is_empty() => self.no_server(&rows.fleet, cx),
             Some(rows) => {
                 let count = self.lines.len();
-                let total = rows.envs.len();
-                let apps = crate::plural::count(rows.fleet.apps.len(), "Application");
-                let counted = if self.filter == Filter::default() {
-                    format!("{} · {apps}", crate::plural::count(total, "environment"))
-                } else {
-                    format!("{} of {} · {apps}", self.kept, crate::plural::count(total, "environment"))
-                };
-                // Never "0 environments" while a server's first list is read (#1076).
-                let reading = (!rows.fleet.reading.is_empty())
-                    .then(|| format!("Reading Applications from {}…", rows.fleet.reading.join(", ")));
-                let summary = match reading {
-                    Some(reading) if rows.fleet.apps.is_empty() => reading,
-                    Some(reading) => format!("{counted} · {reading}"),
-                    None => counted,
-                };
+                let kept = (self.filter != Filter::default()).then_some(self.kept);
+                let summary = envs::summary(rows.envs.len(), kept, rows.fleet.apps.len(), &rows.fleet.reading);
                 let type_errors = rows.types.errors.clone();
                 v_flex()
                     .size_full()

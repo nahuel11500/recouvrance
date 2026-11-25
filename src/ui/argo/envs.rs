@@ -173,6 +173,22 @@ pub fn environments(
         .collect()
 }
 
+/// The line above the list: how many environments (`kept` of them, when filtered) and
+/// Applications, and which servers' first list is still read (`reading`): never "0
+/// environments" while one is (#1076).
+pub fn summary(envs: usize, kept: Option<usize>, apps: usize, reading: &[String]) -> String {
+    let apps_text = crate::plural::count(apps, "Application");
+    let counted = match kept {
+        None => format!("{} · {apps_text}", crate::plural::count(envs, "environment")),
+        Some(kept) => format!("{kept} of {} · {apps_text}", crate::plural::count(envs, "environment")),
+    };
+    if reading.is_empty() {
+        return counted;
+    }
+    let reading = format!("Reading Applications from {}…", reading.join(", "));
+    if apps == 0 { reading } else { format!("{counted} · {reading}") }
+}
+
 /// Whether a column says nothing for this list: the same value on (nearly) every row.
 pub fn uniform<'a>(values: impl Iterator<Item = &'a str>) -> bool {
     let mut count: HashMap<&str, usize> = HashMap::new();
@@ -441,6 +457,19 @@ mod tests {
         let (l, h) = lines(&listed, &[false, false, false, true], &none, |_| None, |_| false, |_| Tone::Good);
         assert_eq!(l, [Line::Heading(0), Line::Heading(1), Line::Env(3)]);
         assert_eq!(h.iter().map(|h| h.title.as_str()).collect::<Vec<_>>(), ["shop", "acc"]);
+    }
+
+    #[test]
+    fn the_count_never_says_none_while_a_server_is_read() {
+        let one = ["argocd.example.com".to_string()];
+        assert_eq!(summary(0, None, 0, &one), "Reading Applications from argocd.example.com…");
+        assert_eq!(summary(0, Some(0), 0, &one), "Reading Applications from argocd.example.com…");
+        assert_eq!(
+            summary(1, Some(0), 3, &one),
+            "0 of 1 environment · 3 Applications · Reading Applications from argocd.example.com…"
+        );
+        assert_eq!(summary(2, None, 3, &[]), "2 environments · 3 Applications");
+        assert_eq!(summary(2, Some(1), 3, &[]), "1 of 2 environments · 3 Applications");
     }
 
     #[test]
