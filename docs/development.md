@@ -61,6 +61,9 @@ process's resident memory (Linux):
 RECOUVRANCE_CONTEXT=kind-dev RECOUVRANCE_BACKTIME=pods,deployments,3 cargo run --features dev -- --snapshot out.png 8
 ```
 
+`RECOUVRANCE_WINDOWS=2` opens a second window on the same contexts, drawn like the first and put
+on the same `RECOUVRANCE_PAGE`: what a second window costs, its scans shared with the first.
+
 `RECOUVRANCE_FIRSTROWS=1` prints to stderr, from the moment a connect starts, when each cluster's
 first rows reach the table and when its list is complete. With a context that can't be reached
 among the ones connected, it shows whether the others' rows wait for it:
