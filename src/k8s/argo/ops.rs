@@ -602,7 +602,7 @@ mod tests {
         assert_eq!(op, Op::Rollback { id: Some(2), dry_run: false });
         let Op::Rollback { id, .. } = op else { unreachable!() };
         let shown = deployment_label(rollback_target(&app(), id).unwrap());
-        assert_eq!(shown, format!("deployment 2 ({})", "b".repeat(8)));
+        assert_eq!(shown, format!("deployment 2 ({})", "b".repeat(7)));
         // A deployment lands before the write: the one shown is still the one written.
         let mut later = app();
         later["status"]["history"].as_array_mut().unwrap().push(json!({"id": 4, "revision": "d".repeat(40),

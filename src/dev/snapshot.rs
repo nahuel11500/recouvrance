@@ -29,7 +29,15 @@ pub fn run(path: &str, wait: Duration) -> Result<()> {
         crate::app::apply_theme(mode, None, cx);
     });
     let mut app_view = None;
-    let window = cx.open_window(size(px(1500.), px(920.)), |window, cx| {
+    // RECOUVRANCE_SIZE=1000x800: the window's size, to see a page on a narrow window.
+    let (w, h) = std::env::var("RECOUVRANCE_SIZE")
+        .ok()
+        .and_then(|v| {
+            let (w, h) = v.split_once('x')?;
+            Some((w.parse().ok()?, h.parse().ok()?))
+        })
+        .unwrap_or((1500., 920.));
+    let window = cx.open_window(size(px(w), px(h)), |window, cx| {
         let view = cx.new(|cx| crate::app::AppView::new(window, cx));
         app_view = Some(view.clone());
         cx.new(|cx| base::Root::new(view, window, cx))
