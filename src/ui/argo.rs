@@ -923,9 +923,14 @@ impl ArgoView {
         let last_sync = env.last_sync.map(|t| format!("{} ago", k8s::age(t)));
         // The namespace only where it isn't the environment's own name.
         let namespace = if rows.show_namespace && env.namespace != env.name { env.namespace.as_str() } else { "" };
+        // Its workload's main cluster, and how many others it deploys to.
+        let cluster = match env.more_clusters.len() {
+            0 => env.cluster.clone(),
+            n => format!("{} +{n}", env.cluster),
+        };
         let destination = match (rows.show_cluster, namespace.is_empty()) {
-            (true, false) => argo::destination_text(&env.cluster, namespace),
-            (true, true) => env.cluster.clone(),
+            (true, false) => argo::destination_text(&cluster, namespace),
+            (true, true) => cluster,
             (false, _) => namespace.to_string(),
         };
         let opener = h_flex()
