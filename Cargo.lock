@@ -5856,6 +5856,7 @@ dependencies = [
  "serde_json",
  "sha2 0.11.1",
  "similar 3.2.1",
+ "tauri-winrt-notification",
  "tokio",
  "tokio-util",
  "tower",
