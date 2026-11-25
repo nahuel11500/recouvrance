@@ -757,7 +757,13 @@ pub async fn renew(base: String) -> Result<(), String> {
     }
     let result = renew_now(&base).await;
     renewals().insert(base, (std::time::Instant::now(), result.clone().err()));
-    super::api::reload();
+    // Renewed: the token alone changed, and the feeds go on with it. Failed: the pages read
+    // the servers again, to say why.
+    if result.is_ok() {
+        super::api::renewed();
+    } else {
+        super::api::reload();
+    }
     result
 }
 

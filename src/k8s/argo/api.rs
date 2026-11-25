@@ -134,10 +134,13 @@ impl Endpoint {
 
     /// What its feed is kept under: its address, and a hash of its login and settings, so a
     /// new login (`argocd login` again, a token set) starts a new feed. Never the token.
+    /// A login renewed here keeps its feed across renewals: only its token changes, which the
+    /// feed reads from its `TokenCell`.
     fn feed_key(&self) -> String {
         use std::hash::{Hash as _, Hasher as _};
         let mut h = std::collections::hash_map::DefaultHasher::new();
         match &self.login {
+            _ if self.renewable => "renewed here".hash(&mut h),
             Ok((t, how)) => (&t.0, how.text()).hash(&mut h),
             Err(e) => e.hash(&mut h),
         }
@@ -315,6 +318,11 @@ fn read_tokens() -> Result<BTreeMap<String, String>, String> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(BTreeMap::new()),
         Err(e) => Err(format!("{}: {e}", tokens_path().display())),
     }
+}
+
+/// The token set in Settings → Argo CD for the server at `base`, if one is and the file reads.
+fn settings_token(base: &str) -> Option<Token> {
+    read_tokens().ok()?.remove(base).map(|t| t.trim().to_string()).filter(|t| !t.is_empty()).map(Token)
 }
 
 /// Keep `token` for the server at `base` (empty: forget it), readable only by the user. A
@@ -875,9 +883,22 @@ pub struct FeedState {
     pub refused: bool,
 }
 
+/// The token a feed sends, shared with what renews it: a renewal changes it in place, and the
+/// feed's next request uses it. None while there is no valid one.
+type TokenCell = Arc<Mutex<Option<Token>>>;
+
+fn token_in(cell: &TokenCell) -> Option<Token> {
+    cell.lock().unwrap_or_else(PoisonError::into_inner).clone()
+}
+
+fn set_token(cell: &TokenCell, token: Option<Token>) {
+    *cell.lock().unwrap_or_else(PoisonError::into_inner) = token;
+}
+
 struct Feed {
     state: Arc<Mutex<FeedState>>,
     users: usize,
+    token: TokenCell,
     _task: crate::k8s::TaskGuard,
     /// Renews its login before it expires, while a page holds the feed.
     _renew: Option<crate::k8s::TaskGuard>,
@@ -897,6 +918,12 @@ pub fn changes() -> u64 {
 /// The servers' config as last changed in Settings.
 pub fn generation() -> u64 {
     GENERATION.load(Ordering::SeqCst)
+}
+
+/// A login was renewed (its token only): the pages read the servers again, and their feeds go
+/// on with the new token.
+pub(super) fn renewed() {
+    CHANGES.fetch_add(1, Ordering::SeqCst);
 }
 
 /// The servers or their tokens changed: pages watch them again, with the new config.
@@ -934,28 +961,52 @@ impl Drop for Watch {
 pub fn watch(endpoint: &Endpoint) -> Watch {
     let key = format!("{}#{}", endpoint.feed_key(), generation());
     let mut feeds = FEEDS.lock().unwrap_or_else(PoisonError::into_inner);
+    let token = endpoint.login.as_ref().ok().map(|(t, _)| t.clone());
     let feed = feeds.entry(key.clone()).or_insert_with(|| {
         let state = Arc::new(Mutex::new(FeedState::default()));
-        let task = crate::k8s::spawn_guarded(feed(endpoint.clone(), state.clone()));
-        let renew = endpoint.renewable.then(|| {
-            let exp = endpoint.login.as_ref().ok().and_then(|(t, _)| server::exp_of(&t.0));
-            crate::k8s::spawn_guarded(keep_renewed(endpoint.server.base.clone(), endpoint.login.is_err(), exp))
-        });
-        Feed { state, users: 0, _task: task, _renew: renew }
+        let cell: TokenCell = Arc::new(Mutex::new(token.clone()));
+        let task = crate::k8s::spawn_guarded(feed(endpoint.clone(), state.clone(), cell.clone()));
+        let renew = endpoint
+            .renewable
+            .then(|| crate::k8s::spawn_guarded(keep_renewed(endpoint.server.base.clone(), cell.clone())));
+        Feed { state, users: 0, token: cell, _task: task, _renew: renew }
     });
+    // The login as read now (renewed since the feed started): its next request sends it.
+    if token.is_some() {
+        set_token(&feed.token, token);
+    }
     feed.users += 1;
     Watch { endpoint: Arc::new(endpoint.clone()), state: feed.state.clone(), key }
 }
 
-/// Renew the login to `base` shortly before it expires at `exp` (at once when it has
-/// `expired`), again after a while when that fails. Once renewed, the pages read the servers
-/// again and a new feed renews the next one.
-async fn keep_renewed(base: String, expired: bool, exp: Option<i64>) {
-    let wait = if expired { Some(0) } else { super::connect::renew_in(exp, jiff::Timestamp::now().as_second()) };
-    let Some(wait) = wait else { return };
-    tokio::time::sleep(Duration::from_secs(wait)).await;
-    while super::connect::renew(base.clone()).await.is_err() {
-        tokio::time::sleep(Duration::from_secs(60)).await;
+/// Keep the login to `base` renewed while its feed runs: shortly before the token in `cell`
+/// expires (at once when there is none), again after a while when that fails. The new token
+/// goes in `cell`: the feed goes on with it.
+async fn keep_renewed(base: String, cell: TokenCell) {
+    loop {
+        let before = token_in(&cell);
+        let now = jiff::Timestamp::now().as_second();
+        let wait = match &before {
+            None => Some(0),
+            Some(t) => super::connect::renew_in(server::exp_of(&t.0), now),
+        };
+        // A token that doesn't expire is not renewed.
+        let Some(wait) = wait else { return };
+        tokio::time::sleep(Duration::from_secs(wait)).await;
+        match super::connect::renew(base.clone()).await {
+            Ok(()) => {
+                let after = settings_token(&base);
+                let same = after == before;
+                if after.is_some() {
+                    set_token(&cell, after);
+                }
+                // Not renewed this time (one ran just before): wait before looking again.
+                if same {
+                    tokio::time::sleep(Duration::from_secs(20)).await;
+                }
+            }
+            Err(_) => tokio::time::sleep(Duration::from_secs(60)).await,
+        }
     }
 }
 
@@ -971,24 +1022,29 @@ enum Ended {
     Failed(Failure),
 }
 
-/// A server's feed: open the stream, list, follow; again after a backoff when it ends. A
-/// refused login stops it until the login or the config changes.
-async fn feed(endpoint: Endpoint, state: Arc<Mutex<FeedState>>) {
-    let conn = match endpoint.conn() {
-        Ok(c) => c,
-        Err(why) => {
-            let mut s = lock(&state);
-            s.error = Some(why);
-            s.refused = true;
-            drop(s);
-            changed();
-            return;
-        }
-    };
+/// A server's feed: open the stream, list, follow; again after a backoff when it ends, with
+/// the token in `cell` then. A refused login stops it until the login or the config changes;
+/// one renewed here waits for its renewal instead.
+async fn feed(endpoint: Endpoint, state: Arc<Mutex<FeedState>>, cell: TokenCell) {
     let mut backoff = BACKOFF;
     loop {
+        let Some(token) = token_in(&cell) else {
+            let why = endpoint.login.clone().err().unwrap_or_else(|| format!("No login to {}", endpoint.name()));
+            {
+                let mut s = lock(&state);
+                s.error = Some(why);
+                s.refused = true;
+            }
+            changed();
+            if !endpoint.renewable {
+                return;
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            continue;
+        };
+        let conn = Conn { server: endpoint.server.clone(), token, insecure: endpoint.insecure };
         let started = Instant::now();
-        let ended = follow(&conn, &state).await;
+        let ended = follow(&conn, &state, &cell).await;
         let refused = {
             let mut s = lock(&state);
             s.live = false;
@@ -1006,13 +1062,15 @@ async fn feed(endpoint: Endpoint, state: Arc<Mutex<FeedState>>) {
         };
         changed();
         if refused {
-            // Refused before its time (revoked?): renewing may help.
-            if endpoint.renewable {
-                crate::k8s::spawn_detached(async move {
-                    let _ = super::connect::renew(endpoint.server.base.clone()).await;
-                });
+            if !endpoint.renewable {
+                return;
             }
-            return;
+            // Refused before its time (revoked?): renewing may help, then the feed goes on.
+            if super::connect::renew(endpoint.server.base.clone()).await.is_ok()
+                && let Some(t) = settings_token(&endpoint.server.base)
+            {
+                set_token(&cell, Some(t));
+            }
         }
         if started.elapsed() >= STEADY {
             backoff = BACKOFF;
@@ -1085,7 +1143,7 @@ async fn read_stream(conn: Conn, state: Arc<Mutex<FeedState>>, out: tokio::sync:
 /// One round: open the stream first, so every change from then on is in it; list; apply what
 /// the stream sent meanwhile over the list; then follow the stream. The sync windows are read
 /// beside it, again every `PROJECTS_EVERY`. What ended it.
-async fn follow(conn: &Conn, state: &Arc<Mutex<FeedState>>) -> Ended {
+async fn follow(conn: &Conn, state: &Arc<Mutex<FeedState>>, cell: &TokenCell) -> Ended {
     // Changes pile up here while the list is read (bounded: the stream waits when it's full).
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Batch>(1024);
     let _stream = crate::k8s::spawn_guarded(read_stream(conn.clone(), state.clone(), tx));
@@ -1117,9 +1175,10 @@ async fn follow(conn: &Conn, state: &Arc<Mutex<FeedState>>) -> Ended {
         s.apps = settle(listed, sent);
         s.listed = true;
         s.error = None;
+        s.refused = false;
     }
     changed();
-    let _windows = crate::k8s::spawn_guarded(keep_windows(conn.clone(), state.clone()));
+    let _windows = crate::k8s::spawn_guarded(keep_windows(conn.clone(), state.clone(), cell.clone()));
     loop {
         match rx.recv().await {
             Some(Ok(events)) => {
@@ -1137,8 +1196,12 @@ async fn follow(conn: &Conn, state: &Arc<Mutex<FeedState>>) -> Ended {
 }
 
 /// Read the projects' sync windows now and every `PROJECTS_EVERY` while the feed follows.
-async fn keep_windows(conn: Conn, state: Arc<Mutex<FeedState>>) {
+async fn keep_windows(mut conn: Conn, state: Arc<Mutex<FeedState>>, cell: TokenCell) {
     loop {
+        // The token renewed since the round started.
+        if let Some(t) = token_in(&cell) {
+            conn.token = t;
+        }
         let projects: Vec<String> = {
             let s = lock(&state);
             let mut p: Vec<String> = s.apps.values().map(|a| a.summary.project.clone()).collect();
@@ -1784,5 +1847,31 @@ users:
         assert_eq!(apps.len(), 2);
         assert_eq!(apps[&key("web")].summary.health, "Degraded");
         assert_eq!(apps[&key("api")].value.pointer("/metadata/resourceVersion"), Some(&json!("5")));
+    }
+
+    /// A login renewed here keeps its feed: the same feed (nothing listed again) goes on with
+    /// the new token. A new login (a token pasted) starts another one.
+    #[test]
+    fn a_renewal_keeps_the_feed() {
+        use super::{Endpoint, FEEDS, Token, watch};
+        use crate::k8s::argo::server::{Login, Server};
+        let endpoint = |token: &str, renewable: bool| Endpoint {
+            // Nothing listens there: the feed only fails and waits.
+            server: Server::parse("http://127.0.0.1:9/renewal-test").unwrap(),
+            cli_context: None,
+            in_settings: true,
+            insecure: false,
+            login: Ok((Token(token.into()), Login::Settings)),
+            on: true,
+            settings_token: true,
+            renewable,
+        };
+        let first = watch(&endpoint("first", true));
+        let renewed = watch(&endpoint("renewed", true));
+        assert!(std::sync::Arc::ptr_eq(&first.state, &renewed.state), "a renewal started another feed");
+        let sent = FEEDS.lock().unwrap().get(&first.key).and_then(|f| super::token_in(&f.token));
+        assert_eq!(sent, Some(Token("renewed".into())), "the feed goes on with the new token");
+        let pasted = watch(&endpoint("pasted", false));
+        assert!(!std::sync::Arc::ptr_eq(&first.state, &pasted.state), "a new login keeps the old feed");
     }
 }

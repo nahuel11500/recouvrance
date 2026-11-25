@@ -570,11 +570,13 @@ impl ArgoView {
                     // A new `argocd login`, or a token set: read the servers again.
                     let relogged = exec.spawn(async { api::config_stamp() }).await != stamp;
                     if !shown || relogged || api::generation() != generation {
-                        // Hidden, or the servers changed: the feeds stop unless another page holds them.
-                        // Hidden, the dashboard's read stops too; it reads again once shown.
+                        // Hidden: the feeds stop unless another page holds them, and the dashboard's
+                        // read stops too; it reads again once shown. The servers changed: the
+                        // feeds are held until the new ones are, so a feed whose login was only
+                        // renewed goes on (nothing is listed again).
                         let _ = this.update(cx, |this, cx| {
-                            this.watches.clear();
                             if !shown {
+                                this.watches.clear();
                                 this.dashboard_hidden(cx);
                             }
                         });
