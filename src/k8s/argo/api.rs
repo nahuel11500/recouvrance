@@ -30,8 +30,11 @@ use super::server::{self, Login, Server, encode, scrub};
 use super::windows::{self, SyncWindow};
 use super::{DEFAULT_NAMESPACE, Summary, TRACKING_ID};
 
+/// For the end-to-end tests (`e2e`).
+#[cfg(all(test, feature = "dev"))]
+pub(crate) mod fake;
 mod held;
-pub use held::held_apps;
+pub use held::{held_apps, held_states};
 
 /// Where the tokens set in Settings → Argo CD are kept, by server address (mode 0600).
 const TOKENS_FILE: &str = "argocd-api-tokens.json";
@@ -1273,6 +1276,24 @@ pub async fn read_app(endpoint: Arc<Endpoint>, namespace: String, name: String) 
     read.await.unwrap_or_else(|e| Err(format!("{e:#}")))
 }
 
+/// [`read_app`], None when Argo CD has no such Application (it was deleted).
+pub async fn read_app_opt(endpoint: Arc<Endpoint>, namespace: String, name: String) -> Result<Option<Value>, String> {
+    let read = crate::k8s::run_abortable(async move {
+        let conn = match current(&endpoint.server.base).and_then(|e| e.conn()) {
+            Ok(c) => c,
+            Err(e) => return Ok(Err(e)),
+        };
+        Ok(match conn.get(&app_path(&namespace, &name)).await {
+            Ok(app) => Ok(Some(app)),
+            Err(f) if f.status == Some(404) => Ok(None),
+            // argocd-server says an Application it can't find with permission denied, too.
+            Err(f) if f.status == Some(403) && f.text.contains("not found") => Ok(None),
+            Err(f) => Err(f.text),
+        })
+    });
+    read.await.unwrap_or_else(|e| Err(format!("{e:#}")))
+}
+
 /// The dashboard of the Application `namespace/name`, read by the API with the server's login
 /// as the config has it now: the Application whole, then its resource tree and managed
 /// resources together, then the commits it deploys (each kept once read). Read-only.
@@ -1361,9 +1382,11 @@ pub enum Action {
     /// A sync with the options asked for (the whole Application, hooks included, with none).
     Sync(super::ops::SyncRequest),
     Terminate,
-    /// Back to the deployment of its history with this id.
+    /// Back to the deployment of its history with this id; with `dry_run`, Argo CD applies
+    /// nothing and says what it would do.
     Rollback {
         id: i64,
+        dry_run: bool,
     },
 }
 
@@ -1380,9 +1403,12 @@ pub(super) fn request(action: &Action, namespace: &str, name: &str) -> (http::Me
         }
         Action::Sync(req) => (http::Method::POST, format!("{app}/sync"), Some(sync_body(body, req))),
         Action::Terminate => (http::Method::DELETE, format!("{app}/operation?appNamespace={ns}"), None),
-        Action::Rollback { id } => {
+        Action::Rollback { id, dry_run } => {
             let mut body = body;
             body["id"] = json!(id);
+            if *dry_run {
+                body["dryRun"] = json!(true);
+            }
             (http::Method::POST, format!("{app}/rollback"), Some(body))
         }
     }
@@ -1468,10 +1494,121 @@ pub async fn act_read(
                     None => format!("Sync of {name} started"),
                 },
                 Action::Terminate => format!("The operation of {name} is terminating"),
-                Action::Rollback { id } => format!("Rollback of {name} to deployment {id} started"),
+                Action::Rollback { id, .. } => format!("Rollback of {name} to deployment {id} started"),
             })
             .map(|said| (said, before))
             .map_err(|f| f.text))
+    });
+    write.await.unwrap_or_else(|e| Err(format!("{e:#}")))
+}
+
+/// What an agent asks of an Application by the API.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AgentAction {
+    Refresh {
+        hard: bool,
+    },
+    /// A sync, a rollback (its deployment named already, see `ops::pinned`) or a terminate.
+    Op(super::ops::Op),
+}
+
+/// How long an agent's dry run's result is waited for.
+const DRY_RUN_WAIT: Duration = Duration::from_secs(30);
+
+/// Why a write by an agent to `endpoint` is refused whatever its rules say: the server (or a
+/// hub context tied to it) is set read-only. Write mode is the window's: it doesn't gate
+/// agents, whose rules decide.
+pub fn agent_refusal(endpoint: &Endpoint) -> Option<String> {
+    let name = endpoint.name();
+    match read_only(endpoint) {
+        Some(c) => Some(crate::k8s::gate::read_only_refusal(&c)),
+        None if crate::settings::is_read_only(&name) => Some(crate::k8s::gate::read_only_refusal(&name)),
+        None => None,
+    }
+}
+
+/// An agent's `action` on the Application `namespace/name`, by Argo CD's API with the
+/// server's login as the config has it now. The Application is read first and the operation
+/// refused as argocd-server would refuse it (one running, a rollback with auto-sync on, a
+/// prune deleting more than was shown); a read-only server refuses it as it is sent. A dry
+/// run's result is waited for, a while. `stop` decides the agent's rules again right before
+/// the request is sent: what it says stops it.
+pub async fn act_for_agent(
+    endpoint: Arc<Endpoint>,
+    namespace: String,
+    name: String,
+    action: AgentAction,
+    stop: impl Fn() -> Option<String> + Send + 'static,
+) -> Result<String, String> {
+    use super::ops::{self, Op};
+    let write = crate::k8s::run_abortable(async move {
+        let conn = match current(&endpoint.server.base).and_then(|e| e.conn()) {
+            Ok(c) => c,
+            Err(e) => return Ok(Err(e)),
+        };
+        let path = app_path(&namespace, &name);
+        let (sent, op, app) = match action {
+            AgentAction::Refresh { hard } => (Action::Refresh { hard }, None, None),
+            AgentAction::Op(op) => {
+                let app = match conn.get(&path).await {
+                    Ok(app) => app,
+                    Err(f) => return Ok(Err(format!("the Application could not be read: {}", f.text))),
+                };
+                if let Some(why) = ops::refusal(&app, &op) {
+                    return Ok(Err(format!("Argo CD would refuse it: {why}")));
+                }
+                let sent = match &op {
+                    Op::Sync(req) => Action::Sync(req.clone()),
+                    Op::Terminate => Action::Terminate,
+                    Op::Rollback { id, dry_run } => {
+                        let entry = match ops::rollback_target(&app, *id) {
+                            Ok(e) => e,
+                            Err(why) => return Ok(Err(format!("Argo CD would refuse it: {why}"))),
+                        };
+                        let Some(id) = entry["id"].as_i64() else {
+                            return Ok(Err("that deployment has no id".to_string()));
+                        };
+                        Action::Rollback { id, dry_run: *dry_run }
+                    }
+                };
+                (sent, Some(op), Some(app))
+            }
+        };
+        if let Some(why) = agent_refusal(&endpoint).or_else(&stop) {
+            return Ok(Err(why));
+        }
+        let (method, at, body) = request(&sent, &namespace, &name);
+        if let Err(f) = conn.call(method, &at, body.as_ref()).await {
+            return Ok(Err(f.text));
+        }
+        let (Some(op), Some(app)) = (op, app) else {
+            let hard = matches!(sent, Action::Refresh { hard: true });
+            return Ok(Ok(format!("Argo CD {} Application {name}", if hard { "hard-refreshes" } else { "refreshes" })));
+        };
+        let mut out = ops::started(&app, &op, &name);
+        if op.dry_run() {
+            let before = super::grouped_sync::started_at(&app);
+            let deadline = Instant::now() + DRY_RUN_WAIT;
+            loop {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                if let Ok(now) = conn.get(&path).await
+                    && super::grouped_sync::started_at(&now) != before
+                    && let Some(result) = ops::dry_run_result(&now)
+                {
+                    out.push('\n');
+                    out.push_str(&result);
+                    break;
+                }
+                if Instant::now() >= deadline {
+                    out.push_str(&format!(
+                        "\nStill running after {} s: its result will show as the last sync (status.operationState).",
+                        DRY_RUN_WAIT.as_secs()
+                    ));
+                    break;
+                }
+            }
+        }
+        Ok(Ok(out))
     });
     write.await.unwrap_or_else(|e| Err(format!("{e:#}")))
 }
@@ -1636,7 +1773,7 @@ users:
         );
         let body = json!({"name": "web", "appNamespace": "team a", "id": 7});
         assert_eq!(
-            req(Action::Rollback { id: 7 }),
+            req(Action::Rollback { id: 7, dry_run: false }),
             ("POST".into(), "/api/v1/applications/web/rollback".into(), Some(body))
         );
     }

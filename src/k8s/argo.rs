@@ -736,44 +736,6 @@ pub async fn hubs(connected: Vec<(String, Client)>) -> Hubs {
     .unwrap_or_default()
 }
 
-/// The contexts found serving Applications this session (by a page that looked for them),
-/// sorted. No request.
-pub fn known_hubs() -> Vec<String> {
-    let probes = PROBES.lock().unwrap_or_else(PoisonError::into_inner);
-    let mut hubs: Vec<String> =
-        probes.iter().filter(|(_, p)| matches!(p, Probe::Serves(_))).map(|(c, _)| c.clone()).collect();
-    hubs.sort();
-    hubs
-}
-
-/// The contexts an agent's read failed to reach, why, and when: left alone `RETRY`, as the
-/// probes are, so a hub that is down doesn't make every agent call wait for it again.
-static UNREACHED: LazyLock<Mutex<HashMap<String, (String, Instant)>>> = LazyLock::new(Default::default);
-
-/// Say an agent's read could not reach `context`.
-pub fn note_unreached(context: &str, why: String) {
-    UNREACHED.lock().unwrap_or_else(PoisonError::into_inner).insert(context.to_string(), (why, Instant::now()));
-}
-
-/// Say an agent's read reached `context`.
-pub fn note_reached(context: &str) {
-    UNREACHED.lock().unwrap_or_else(PoisonError::into_inner).remove(context);
-}
-
-/// Why `context` is not asked again yet: an agent's read failed to reach it less than
-/// `RETRY` before `now`, or (with `probes`) so did a probe of the window's pages.
-pub fn recent_failure(context: &str, probes: bool, now: Instant) -> Option<String> {
-    let fresh = |at: &Instant| now.saturating_duration_since(*at) < RETRY;
-    if probes
-        && let Some(Probe::Failed(why, at)) = PROBES.lock().unwrap_or_else(PoisonError::into_inner).get(context)
-        && fresh(at)
-    {
-        return Some(why.clone());
-    }
-    let unreached = UNREACHED.lock().unwrap_or_else(PoisonError::into_inner);
-    unreached.get(context).filter(|(_, at)| fresh(at)).map(|(why, _)| why.clone())
-}
-
 // MARK: Reading Applications
 
 type Lists = HashMap<String, (Instant, Arc<Vec<Value>>)>;
@@ -1117,7 +1079,7 @@ pub struct ApiCandidate {
 /// tracks the object), and why some servers said nothing. A label (Helm sets it too) leaves
 /// out at once those that deploy elsewhere. Only the servers `use_server` accepts are read,
 /// with `start` (a feed started when none runs), and the Applications `may_read` lets through
-/// (server name, Application): the others are said.
+/// (their server, the Application): the others are said.
 /// None when no server is set, logged in to or turned on.
 pub async fn api_candidates(
     here: &str,
@@ -1125,7 +1087,7 @@ pub async fn api_candidates(
     obj: (&str, &str, &Value),
     use_server: impl Fn(&str) -> bool,
     start: bool,
-    may_read: impl Fn(&str, &Summary) -> bool,
+    may_read: impl Fn(&api::Endpoint, &Summary) -> bool,
 ) -> Option<(Vec<ApiCandidate>, Vec<String>, Vec<String>)> {
     let (group, kind, obj) = obj;
     let ns = obj.pointer("/metadata/namespace").and_then(Value::as_str).unwrap_or_default();
@@ -1149,7 +1111,7 @@ pub async fn api_candidates(
             Err(e) => notes.push(format!("{server}: {e}")),
             Ok(apps) => {
                 for a in apps {
-                    if may_read(&server, &a.summary) {
+                    if may_read(&h.endpoint, &a.summary) {
                         wanted.push((h.endpoint.clone(), a));
                     } else {
                         let (ns, name) = (&a.summary.namespace, &a.summary.name);
@@ -1572,6 +1534,15 @@ pub fn server_home(
     server::contexts_of(servers, base).next().map_or_else(ContextTarget::default, |c| target(targets, c))
 }
 
+/// The contexts among `targets` that reach the destination of `app`, read from `endpoint`:
+/// its `in-cluster` is the cluster that server runs on, when known (`server_home`).
+pub fn api_contexts(endpoint: &api::Endpoint, app: &Summary, targets: &[ContextTarget]) -> Vec<String> {
+    let servers = crate::settings::with(|s| s.argocd_servers.clone());
+    let home = server_home(&servers, &endpoint.server.base, targets);
+    let (server, name) = (Some(app.dest_server.as_str()), Some(app.dest_name.as_str()));
+    targets.iter().filter(|t| deploys_to(server, name, &home, t)).map(|t| t.name.clone()).collect()
+}
+
 /// What a page has read of one Argo CD API server.
 pub struct ApiRead {
     pub endpoint: Arc<api::Endpoint>,
@@ -1896,26 +1867,6 @@ mod tests {
         assert!(tracking_of("apps", "Deployment", &obj("web-copy")).is_none());
         assert!(tracking_of("apps", "StatefulSet", &obj("web")).is_none());
         assert!(tracking_of("apps", "Deployment", &json!({"metadata": {"name": "web"}})).is_none());
-    }
-
-    /// A context an agent's read could not reach is not asked again for `RETRY`, then is.
-    #[test]
-    fn a_hub_that_failed_recently_is_not_asked_again() {
-        let hub = "unreached-test-hub";
-        assert_eq!(recent_failure(hub, true, Instant::now()), None);
-        note_unreached(hub, "did not answer".into());
-        assert_eq!(recent_failure(hub, false, Instant::now()).as_deref(), Some("did not answer"));
-        assert_eq!(recent_failure(hub, true, Instant::now() + RETRY), None, "asked again once RETRY is over");
-        note_reached(hub);
-        assert_eq!(recent_failure(hub, true, Instant::now()), None);
-        // A probe of the window's that failed counts too, when asked for.
-        let probed = "probe-failed-test-hub";
-        PROBES
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(probed.into(), Probe::Failed("timed out".into(), Instant::now()));
-        assert_eq!(recent_failure(probed, true, Instant::now()).as_deref(), Some("timed out"));
-        assert_eq!(recent_failure(probed, false, Instant::now()), None);
     }
 
     #[test]

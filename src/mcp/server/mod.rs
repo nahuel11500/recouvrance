@@ -268,6 +268,10 @@ const DENIED_BY_RULE: &str =
 const READ_ONLY: &str = "Final: the user made this context read-only in Recouvrance (Settings → Contexts), whatever \
      your rules say; don't retry or work around it, and tell the user if the task needs it.";
 
+/// Said after a refusal of a write to an Argo CD server the user made read-only.
+const READ_ONLY_SERVER: &str = "Final: the user made this Argo CD server read-only in Recouvrance, whatever your \
+     rules say; don't retry or work around it, and tell the user if the task needs it.";
+
 /// Whether a request is refused whatever the rules say: it changes the cluster (or runs
 /// something in it; dry runs too) on a context set read-only in Settings → Contexts. Read
 /// again at each check, so a context made read-only while a call waits stops it.
@@ -358,7 +362,8 @@ fn context_refusal(policy: &Policy, context: &str) -> (String, String) {
 
 /// Arguments that change what a call does, for the approval banner: what the user
 /// approves is what runs. Values come from the (redacted) logged arguments.
-const KEY_ARGS: [&str; 15] = [
+const KEY_ARGS: [&str; 16] = [
+    "server",
     "command",
     "path",
     "patch",
@@ -1043,11 +1048,19 @@ pub struct HistoryParams {
 
 #[derive(Deserialize, schemars::JsonSchema)]
 pub struct GitOpsParams {
-    pub context: String,
+    #[schemars(
+        description = "the kubeconfig context of a Flux object; omit it for an Argo CD Application, found through Argo CD's API"
+    )]
+    pub context: Option<String>,
+    #[schemars(
+        description = "Argo CD only: the server holding the Application, by its name (argocd_apps names it); needed only when several hold one of that name"
+    )]
+    pub server: Option<String>,
     #[schemars(
         description = "A Flux kind (kustomizations, helmreleases, gitrepositories, …) or applications (Argo CD)"
     )]
     pub kind: String,
+    #[schemars(description = "the object's namespace; for an Argo CD Application, the one it is kept in (argocd)")]
     pub namespace: String,
     pub name: String,
     #[schemars(
