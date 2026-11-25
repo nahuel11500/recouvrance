@@ -1073,7 +1073,7 @@ mod tests {
             [("Nothing out of sync: not synced · auto-sync on".to_string(), false)]
         );
         let res = Res { kind: "Deployment".into(), namespace: "shop".into(), name: "web".into(), ..Default::default() };
-        let synced = Checked { out_of_sync: vec![res], ..checked.clone() };
+        let synced = Checked { out_of_sync: vec![res], ..checked };
         assert_eq!(
             checked_lines(&synced, true, without, Some("production")),
             [
