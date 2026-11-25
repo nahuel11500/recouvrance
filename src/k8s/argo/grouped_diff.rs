@@ -501,7 +501,7 @@ pub fn regroup(diffs: &[Option<&SmartDiff>], names: &[Names], noise: bool) -> Ve
 }
 
 /// One Application's changes (`regroup` of it alone), with the fields changed on only one
-/// resource said in one line for that resource instead of one line each: a PrometheusRule
+/// resource said in one line for that resource instead of one line each: a `PrometheusRule`
 /// with 4 rules edited is `PrometheusRule alerts: spec.groups[app].rules[13, 14, 15, 16]
 /// changed: annotations, expr (16 fields)`; its fields are in its row's diff. A field changed
 /// alike on several resources stays one line on their kind, an image or replicas one line.

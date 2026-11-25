@@ -419,7 +419,7 @@ fn labeled(ns: &str, name: &str, team: Option<&str>) -> Value {
 }
 
 /// One Application's diff says a resource's fields in one line for it (they show unfolded,
-/// in its row): a PrometheusRule with two rules edited is one line, not one per field. A
+/// in its row): a `PrometheusRule` with two rules edited is one line, not one per field. A
 /// field alike on several resources stays one line on their kind; a lone field its own line.
 #[test]
 fn one_application_says_a_resource_once_whatever_its_fields() {
@@ -438,7 +438,7 @@ fn one_application_says_a_resource_once_whatever_its_fields() {
         texts(&groups),
         [
             "ConfigMap app-config key LOG_LEVEL changed",
-            "2 Deployments: label team added: a",
+            "2 Deployments: metadata.labels added",
             "PrometheusRule alerts: spec.groups[app].rules[2, 3] changed: annotations, expr (4 fields)",
         ],
         "{:?}",
