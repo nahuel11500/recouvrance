@@ -367,6 +367,15 @@ pub fn known(repo: &str, tag: &str) -> Option<Lookup> {
     (!matches!(lookup, Lookup::Failed(_)) || at.elapsed() < RETRY).then(|| lookup.clone())
 }
 
+/// Keep `commit` as that of `repo` at `tag`, as if its host had said it: the developer tools'
+/// made-up example.
+#[cfg(feature = "dev")]
+pub fn pretend(repo: &str, tag: &str, commit: Commit) {
+    let Some(sha) = sha_of(tag) else { return };
+    let mut cache = CACHE.lock().unwrap_or_else(PoisonError::into_inner);
+    cache.insert((repo.to_string(), sha.to_string()), (Lookup::Found(commit), Instant::now()));
+}
+
 /// The commits of `images` (repository, tag), read from their hosts where not known yet (one
 /// image at a time per host's answer, the hosts asked in order). Each answer is kept.
 pub async fn read(images: Vec<(String, String)>) -> HashMap<(String, String), Lookup> {

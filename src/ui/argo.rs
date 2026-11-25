@@ -569,6 +569,29 @@ impl ArgoView {
         }
         let fleet = argo::from_api(vec![ApiRead { endpoint, state }], &[], &[], &Default::default());
         let types = crate::settings::with(|s| s.argocd_env_types.clone());
+        // Made-up commits for the product's tags that hold one.
+        for (n, v) in argo::environments::example_apps(now).iter().enumerate() {
+            for image in v.pointer("/status/summary/images").and_then(serde_json::Value::as_array).into_iter().flatten()
+            {
+                let Some((repo, tag)) = image.as_str().and_then(|i| i.rsplit_once(':')) else { continue };
+                let Some(sha) = crate::git_host::sha_of(tag) else { continue };
+                let titles =
+                    ["feat(cart): pay in three times", "fix(api): a timeout on slow searches", "chore: bump deps"];
+                crate::git_host::pretend(
+                    repo,
+                    tag,
+                    crate::git_host::Commit {
+                        sha: sha.to_string(),
+                        title: titles[n % titles.len()].to_string(),
+                        author: "Ann Example".into(),
+                        date: Some(
+                            jiff::Timestamp::from_second(now.as_second() - 86_400 * (1 + n as i64 % 5)).unwrap_or(now),
+                        ),
+                        url: format!("https://git.example.com/{repo}/-/commit/{sha}"),
+                    },
+                );
+            }
+        }
         self.example = true;
         self.list_shown = list;
         self.rows = Some(Rows::new(fleet, Arc::new(EnvTypes::parse(&types)), &mut Planner::new(now)));
