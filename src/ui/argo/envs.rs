@@ -63,6 +63,10 @@ pub struct Env {
     /// Where its workload deploys: Argo CD's name of the cluster, and the namespace.
     pub cluster: String,
     pub namespace: String,
+    /// Its workload's destination as the Application writes it (a server URL or a name), and
+    /// the context shown for it, if one reaches it: what the destination's tooltip says.
+    pub dest_written: String,
+    pub on: Option<String>,
     /// The Application of it that runs the most images (its workload), else its root.
     pub main: usize,
     /// What the search looks in, in lowercase: its Applications' names, namespaces, clusters,
@@ -146,6 +150,7 @@ pub fn environments(
             for (i, _) in &members {
                 let a = &apps[*i];
                 search.extend([a.app.name.clone(), a.app.dest_namespace.clone(), a.cluster.clone()]);
+                search.extend(a.on.clone());
             }
             search.extend([root.app.project.clone(), root.server.name()]);
             for (_, i) in &images {
@@ -165,12 +170,33 @@ pub fn environments(
                 last_sync,
                 cluster: apps[main].cluster.clone(),
                 namespace: apps[main].app.dest_namespace.clone(),
+                dest_written: written(&apps[main].app),
+                on: apps[main].on.clone(),
                 main,
                 search: search.join(" ").to_lowercase(),
                 members,
             }
         })
         .collect()
+}
+
+/// The destination cluster as the Application writes it: its server URL, else its name.
+fn written(app: &Summary) -> String {
+    if app.dest_server.is_empty() { app.dest_name.clone() } else { app.dest_server.clone() }
+}
+
+/// What the destination's tooltip says: the cluster as the Application writes it when Argo
+/// CD's name differs from it, and the context that reaches it, or that none does.
+pub fn destination_tip(env: &Env) -> String {
+    let mut lines = Vec::new();
+    if !env.dest_written.is_empty() && env.dest_written != env.cluster {
+        lines.push(env.dest_written.clone());
+    }
+    lines.push(match &env.on {
+        Some(context) => format!("Context: {context}"),
+        None => "No context of your kubeconfig reaches it".to_string(),
+    });
+    lines.join("\n")
 }
 
 /// The line above the list: how many environments (`kept` of them, when filtered) and
@@ -405,6 +431,8 @@ mod tests {
             last_sync: None,
             cluster: String::new(),
             namespace: String::new(),
+            dest_written: String::new(),
+            on: None,
             main: 0,
             search: name.into(),
         }
@@ -519,6 +547,20 @@ mod tests {
         assert_eq!(group_tone([Tone::Good, Tone::Busy].into_iter()), Tone::Busy);
         assert_eq!(group_tone([Tone::Good, Tone::Good].into_iter()), Tone::Good);
         assert_eq!(group_tone([Tone::Good, Tone::Done].into_iter()), Tone::Done);
+    }
+
+    /// #1072: the destination's tooltip gives the URL the Application writes and the context
+    /// that reaches it.
+    #[test]
+    fn the_destination_tip_gives_the_url_and_the_context() {
+        let mut e = env("web", "shop", 0, State::default());
+        e.cluster = "prod".into();
+        e.dest_written = "https://apiserver-prod.example".into();
+        e.on = Some("prod-admin".into());
+        assert_eq!(destination_tip(&e), "https://apiserver-prod.example\nContext: prod-admin");
+        e.dest_written = "prod".into();
+        e.on = None;
+        assert_eq!(destination_tip(&e), "No context of your kubeconfig reaches it");
     }
 }
 
