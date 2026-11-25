@@ -15,6 +15,10 @@ yanked = "deny"
 # - chrono (https://rustsec.org/advisories/RUSTSEC-2026-0543): unmaintained, not a
 #   vulnerability; we use jiff, chrono comes in through gpui, rmcp and schemars.
 unmaintained = "workspace"
+# RUSTSEC-2026-0600 (kube-client): only the `openssl-tls` connector is affected; kube is built
+# with `rustls-tls` alone and no openssl crate is in Cargo.lock. Until kube 5.2.0 is taken
+# (released 2026-11-24, after the 3-day wait for new releases).
+ignore = [{ id = "RUSTSEC-2026-0600", reason = "openssl-tls connector only; we build kube with rustls-tls" }]
 # Unsound code is checked in every crate, not only direct dependencies (the default): OSV and
 # Scorecard count it wherever it is, and a fixed version is usually a lockfile update away.
 unsound = "all"
