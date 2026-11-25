@@ -337,7 +337,18 @@
   argocd CLI is logged in to or set in Settings → Argo CD, read only through Argo CD's API (no
   kubeconfig for Argo CD's cluster needed, and none is asked: see
   [configuration](configuration.md#argo-cd-by-its-api-argocd_api_servers)). With no server, the
-  page says how to add one. An *environment* is a root Application (an app of apps) and the
+  page says how to add one. It opens on an *Overview* of the environments the filters keep
+  (*Environments* shows the list; which one is remembered): counts per environment (synced and
+  healthy, out of sync, Degraded, sync failed, syncing; a click shows them in the list), each
+  type with how many need a look, the environments that need a look (a failed sync, Degraded, a
+  sync running for over 10 minutes, out of sync with auto-sync on), production first; per
+  project, the version each type runs of the product's images (the tag most of its
+  environments run, `prod 1.4.2 · preprod 1.5.0-rc.1 · staging main-77b324b`) and the
+  environments on another tag, named (components on the same tags everywhere on one line); and
+  the last operation of each environment (when, the Application, the
+  result, who started it, the revision). Review environments of other people (the type
+  `review` whose name doesn't hold the login of the Argo CD token as a word) are left out
+  unless asked for. An *environment* is a root Application (an app of apps) and the
   Applications it made (its tracking id, the parent listing them among its resources, or the
   instance label), or an Application on its own; above an app of apps, a *bootstrap* that made
   apps of apps is an environment of its own, and its apps of apps each one. One row per

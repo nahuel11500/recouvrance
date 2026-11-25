@@ -121,6 +121,11 @@ impl Endpoint {
         self.server.name()
     }
 
+    /// Who it is logged in as (see `server::token_user`), when its token says.
+    pub fn user(&self) -> Option<String> {
+        self.login.as_ref().ok().and_then(|(t, _)| server::token_user(&t.0))
+    }
+
     /// The same Argo CD as a hub whose server is this one (see `grouping::hub_instance`).
     pub fn instance(&self) -> String {
         super::grouping::server_instance(&self.server.base)

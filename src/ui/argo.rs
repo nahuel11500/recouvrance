@@ -40,6 +40,7 @@ mod dashboard;
 pub(crate) mod envs;
 mod grouped;
 mod journal;
+mod overview;
 mod sync;
 
 // MARK: Grouping
@@ -108,12 +109,13 @@ fn page_state(
     group_by: GroupBy,
     folded: &HashSet<String>,
     expanded: &HashSet<Key>,
+    list: bool,
 ) -> crate::settings::ArgoPage {
     let mut folded: Vec<String> = folded.iter().cloned().collect();
     folded.sort();
     let mut expanded: Vec<Key> = expanded.iter().cloned().collect();
     expanded.sort();
-    crate::settings::ArgoPage { filter: filter.clone(), group_by, folded, expanded }
+    crate::settings::ArgoPage { filter: filter.clone(), group_by, folded, expanded, list }
 }
 
 // MARK: Rows
@@ -144,6 +146,8 @@ struct Rows {
     /// When each Application can sync next, as of `now`.
     next: Vec<NextSync>,
     now: jiff::Timestamp,
+    /// Who each environment's Argo CD is logged in as (for the overview's reviews).
+    users: Vec<Option<String>>,
 }
 
 impl Rows {
@@ -205,6 +209,7 @@ impl Rows {
         let own_namespace = |e: &Env| if e.namespace.is_empty() || e.namespace == e.name { "" } else { "other" };
         let show_namespace = !envs::uniform(envs.iter().map(own_namespace));
         let next = apps.iter().map(|a| fleet.next_sync(a, plan)).collect();
+        let users = overview::users(apps, &envs);
         Self {
             fleet,
             types,
@@ -221,6 +226,7 @@ impl Rows {
             show_namespace,
             next,
             now,
+            users,
         }
     }
 
@@ -315,6 +321,12 @@ pub struct ArgoView {
     asked: Option<Key>,
     /// Shows a made-up example (the developer tools'): the feeds are not shown.
     example: bool,
+    /// The list is shown, not the overview; the overview counts other people's review
+    /// environments too.
+    list_shown: bool,
+    show_reviews: bool,
+    /// The overview of what the filter keeps, worked out with the lines.
+    overview: Option<overview::Overview>,
     _subs: Vec<Subscription>,
 }
 
@@ -454,6 +466,9 @@ impl ArgoView {
             steps_query: String::new(),
             asked: None,
             example: false,
+            list_shown: page.list,
+            show_reviews: false,
+            overview: None,
             _subs: subs,
         }
     }
@@ -527,7 +542,7 @@ impl ArgoView {
 
     /// Show the made-up environments of the developer tools' example: nothing is read.
     #[cfg(feature = "dev")]
-    pub fn demo_list(&mut self, cx: &mut Context<Self>) {
+    pub fn demo_list(&mut self, list: bool, cx: &mut Context<Self>) {
         let now = jiff::Timestamp::now();
         let endpoint = Arc::new(api::Endpoint {
             server: argo::server::Server::parse("https://argocd.example.com").expect("a valid address"),
@@ -546,6 +561,7 @@ impl ArgoView {
         let fleet = argo::from_api(vec![ApiRead { endpoint, state }], &[], &[], &Default::default());
         let types = crate::settings::with(|s| s.argocd_env_types.clone());
         self.example = true;
+        self.list_shown = list;
         self.rows = Some(Rows::new(fleet, Arc::new(EnvTypes::parse(&types)), &mut Planner::new(now)));
         self.refilter(cx);
         cx.notify();
@@ -578,6 +594,7 @@ impl ArgoView {
             self.starred.clear();
             self.starred_count = 0;
             self.keeps.clear();
+            self.overview = None;
             (self.picked, self.picked_hidden) = (0, 0);
             return;
         };
@@ -613,6 +630,15 @@ impl ArgoView {
         (self.lines, self.headings) = (lines, headings);
         self.env_order = listed.iter().map(|(_, e)| *e).filter(|&e| env_keeps[e]).collect();
         self.keeps = rows.env_of.iter().map(|&e| env_keeps[e]).collect();
+        self.overview = Some(overview::overview(
+            apps,
+            &rows.envs,
+            &env_keeps,
+            &rows.types,
+            &rows.users,
+            self.show_reviews,
+            jiff::Timestamp::now(),
+        ));
         self.env_keeps = env_keeps;
         self.recount_picked();
     }
@@ -640,7 +666,7 @@ impl ArgoView {
             return;
         }
         self.remember = None;
-        let page = page_state(&self.filter, self.group_by, &self.folded, &self.expanded);
+        let page = page_state(&self.filter, self.group_by, &self.folded, &self.expanded, self.list_shown);
         crate::settings::update(|s| s.argocd_page = page);
     }
 
@@ -1389,15 +1415,39 @@ impl Render for ArgoView {
                 let kept = (self.filter != Filter::default()).then_some(self.kept);
                 let summary = envs::summary(rows.envs.len(), kept, rows.fleet.apps.len(), &rows.fleet.reading);
                 let type_errors = rows.types.errors.clone();
-                v_flex()
-                    .size_full()
-                    .child(div().px_2().pb_2().text_sm().child(summary))
+                let tab = |id: &'static str, label: &'static str, list: bool, cx: &mut Context<Self>| {
+                    Button::new(id)
+                        .small()
+                        .when(self.list_shown == list, ButtonVariants::primary)
+                        .when(self.list_shown != list, |b| b.ghost())
+                        .label(label)
+                        .on_click(cx.listener(move |this, _, _, cx| this.show_list(list, cx)))
+                };
+                let top = v_flex()
+                    .child(
+                        h_flex()
+                            .px_2()
+                            .pb_2()
+                            .gap_1()
+                            .child(tab("argo-tab-overview", "Overview", false, cx))
+                            .child(tab("argo-tab-list", "Environments", true, cx))
+                            .child(div().pl_2().text_sm().child(summary)),
+                    )
                     .children((!type_errors.is_empty()).then(|| {
                         div().px_2().pb_2().text_xs().text_color(theme.warning).child(format!(
                             "Environment types that don't read (Settings → Argo CD), left out: {}",
                             type_errors.join("; ")
                         ))
-                    }))
+                    }));
+                if !self.list_shown {
+                    return self.page(
+                        v_flex().size_full().child(top).child(div().flex_1().min_h_0().child(self.overview_view(cx))),
+                        cx,
+                    );
+                }
+                v_flex()
+                    .size_full()
+                    .child(top)
                     .child(div().pb_1().child(self.selection_bar(cx)))
                     .child(self.header(cx))
                     .child(
@@ -1426,6 +1476,21 @@ impl Render for ArgoView {
                     .into_any_element()
             }
         };
+        self.page(body, cx)
+    }
+}
+
+impl ArgoView {
+    /// Show the list (`list`) or the overview, and remember which.
+    fn show_list(&mut self, list: bool, cx: &mut Context<Self>) {
+        self.list_shown = list;
+        self.remember();
+        cx.notify();
+    }
+
+    /// The page around `body`: the toolbar and the servers that could not be read.
+    fn page(&self, body: impl IntoElement, cx: &mut Context<Self>) -> Div {
+        let theme = cx.theme().clone();
         let errors = self.rows.as_ref().map_or_else(Vec::new, |r| r.fleet.errors.clone());
         v_flex()
             .size_full()

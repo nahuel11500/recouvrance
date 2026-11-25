@@ -358,6 +358,8 @@ pub struct ArgoPage {
     pub group_by: crate::ui::argo::envs::GroupBy,
     pub folded: Vec<String>,
     pub expanded: Vec<(String, String, String)>,
+    /// The list is shown, not the overview.
+    pub list: bool,
 }
 
 impl ArgoPage {
@@ -1331,6 +1333,7 @@ mod tests {
             group_by: GroupBy::Project,
             folded: vec!["shop / prod".into()],
             expanded: vec![("https://argocd.example.com".into(), "argocd".into(), "shop-prod-a".into())],
+            list: true,
         };
         let saved = serde_json::to_vec(&Settings { argocd_page: page.clone(), ..Settings::default() }).unwrap();
         let (s, error, _) = super::from_bytes(&saved);
