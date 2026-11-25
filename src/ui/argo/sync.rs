@@ -219,7 +219,7 @@ impl ArgoView {
         &mut self,
         apps: Vec<FleetApp>,
         hidden: usize,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if let Some(g) = self.sync.as_mut().filter(|g| g.running()) {
@@ -227,9 +227,8 @@ impl ArgoView {
             cx.notify();
             return;
         }
-        if !crate::details::ensure_writes(window, cx) {
-            return;
-        }
+        // Opened in read-only mode too: what would be synced, left out, pruned and which hooks
+        // run shows; only Sync… asks to turn writes on.
         self.open_sync(apps, hidden, cx);
     }
 
@@ -409,9 +408,6 @@ impl ArgoView {
 
     /// Confirm the sync of the Applications ready (their count typed, or a wait), then send it.
     fn confirm_grouped_sync(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !crate::details::ensure_writes(window, cx) {
-            return;
-        }
         self.recheck_windows();
         let Some(g) = &self.sync else { return };
         if g.sent_with.is_some() || g.checking() {
@@ -425,6 +421,17 @@ impl ArgoView {
         // Production environments among them: a first click only says so.
         if !g.armed && !g.production().is_empty() {
             self.update_sync(cx, |g| g.armed = true);
+            return;
+        }
+        let mut servers: Vec<String> = jobs.iter().map(|(i, _)| g.rows[*i].source.clone()).collect();
+        servers.sort();
+        servers.dedup();
+        let asked = format!(
+            "{} {}",
+            if g.opts.dry_run { "dry-run a sync of" } else { "sync" },
+            crate::plural::count(jobs.len(), "Application")
+        );
+        if !crate::details::ensure_argo_writes(&asked, &servers.join(", "), window, cx) {
             return;
         }
         let resources: usize = jobs.iter().map(|(_, req)| req.resources.len()).sum();
@@ -456,9 +463,7 @@ impl ArgoView {
             Vec::new()
         };
         let danger = opts.prune && !opts.dry_run && !deletes.is_empty();
-        let mut sources: Vec<String> = jobs.iter().map(|(i, _)| g.rows[*i].source.clone()).collect();
-        sources.sort();
-        sources.dedup();
+        let sources = servers;
         let guard = Guard::typed_text(&n.to_string(), format!("Type {n} to sync {what}:"), window, cx);
         let view = cx.entity().downgrade();
         let title = if opts.dry_run { format!("Dry run of a sync of {what}?") } else { format!("Sync {what}?") };
@@ -644,7 +649,7 @@ impl ArgoView {
     fn terminate_grouped(&mut self, i: usize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(r) = self.sync.as_ref().and_then(|g| g.rows.get(i)) else { return };
         let (target, label, source) = (r.target.clone(), r.label.clone(), r.source.clone());
-        if !crate::details::ensure_writes(window, cx) {
+        if !crate::details::ensure_argo_writes(&format!("terminate the sync of {label}"), &source, window, cx) {
             return;
         }
         let guard = Guard::protected(&source, window, cx);
@@ -858,6 +863,12 @@ impl ArgoView {
                 v.child(div().text_xs().text_color(muted).child(
                     "Each Application is read first: one already syncing, being deleted, or held by a sync window now \
                      is left out, saying why. The syncs are sent four at a time, write mode checked as each is sent.",
+                ))
+            })
+            .when(!sent && !crate::details::writes_enabled(cx), |v| {
+                v.child(div().text_xs().text_color(theme.warning).child(
+                    "Read-only: this shows what the sync would do (and the link below, what it would change). \
+                     Sync… asks to turn writes on for it.",
                 ))
             })
             .when(!production.is_empty(), |v| {

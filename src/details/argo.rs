@@ -293,7 +293,9 @@ pub(crate) fn confirm_api_action(
     cx: &mut App,
 ) {
     let protected = api::read_only(endpoint).unwrap_or_else(|| endpoint.name());
-    if !super::not_read_only(&protected, window, cx) || !super::ensure_writes(window, cx) {
+    let what = format!("{} {name}", action.label().to_lowercase());
+    if !super::not_read_only(&protected, window, cx) || !super::ensure_argo_writes(&what, &endpoint.name(), window, cx)
+    {
         return;
     }
     let (endpoint, ns, name) = (endpoint.clone(), ns.to_string(), name.to_string());
