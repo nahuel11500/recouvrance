@@ -1147,7 +1147,10 @@ mod tests {
         // What reaches the reply: the hub left alone for a tracking id, nothing for a label.
         let notes = [skipped_note("read-hubs-down", "did not answer")];
         let text = managed_text(&id, &Pick::NotFound, &key(), &hubs, &notes).unwrap();
-        assert!(text.contains("not found on the hubs read. Not read: read-hubs-down: not asked again yet"), "{text}");
+        assert!(
+            text.contains("not found on the Argo CDs read. Not read: read-hubs-down: not asked again yet"),
+            "{text}"
+        );
         assert_eq!(managed_text(&label, &Pick::NotFound, &key(), &hubs, &[]), None);
     }
 
