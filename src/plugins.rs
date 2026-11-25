@@ -135,6 +135,48 @@ pub fn env(context: &str, namespace: Option<&str>, name: &str, kind: &str) -> Ve
         .collect()
 }
 
+/// The POSIX `sh` a plugin's command runs with (`sh -c`). Linux and macOS always have one.
+/// Windows doesn't: plugins need Git for Windows' `sh.exe` (or another one on `PATH`), looked
+/// for on `PATH`, then where Git for Windows installs. Plugins are not run with `cmd` or
+/// PowerShell instead: `cmd` expands `%VAR%` before parsing the line, so a value (an object's
+/// name) could run commands, and PowerShell would read plugins.yaml's commands, and the quoting
+/// of the shorthands, differently from every other system.
+#[cfg(not(windows))]
+pub fn shell() -> Result<PathBuf, String> {
+    Ok(PathBuf::from("sh"))
+}
+
+#[cfg(windows)]
+pub fn shell() -> Result<PathBuf, String> {
+    let git_dirs = ["ProgramFiles", "ProgramW6432", "ProgramFiles(x86)"]
+        .into_iter()
+        .filter_map(|v| std::env::var_os(v).map(|d| PathBuf::from(d).join("Git").join("bin")))
+        .chain(std::env::var_os("LOCALAPPDATA").map(|d| PathBuf::from(d).join("Programs").join("Git").join("bin")));
+    find_sh(std::env::var_os("PATH"), git_dirs, |p| p.is_file()).ok_or_else(|| NO_SH.to_string())
+}
+
+/// Why a plugin can't start on Windows without `sh`.
+#[cfg(any(windows, test))]
+const NO_SH: &str = "plugins run with a POSIX sh, which Windows doesn't have: install Git for Windows \
+(it brings sh.exe) or put an sh.exe on PATH";
+
+/// The first `sh.exe` in `path`'s absolute directories, then in `fallbacks`.
+#[cfg(any(windows, test))]
+fn find_sh(
+    path: Option<std::ffi::OsString>,
+    fallbacks: impl IntoIterator<Item = PathBuf>,
+    exists: impl Fn(&std::path::Path) -> bool,
+) -> Option<PathBuf> {
+    path.iter()
+        .flat_map(std::env::split_paths)
+        // A relative entry (`.`, an empty one) would find an sh.exe in whatever folder the app
+        // runs from: only absolute folders count.
+        .filter(|d| d.is_absolute())
+        .chain(fallbacks)
+        .map(|d| d.join("sh.exe"))
+        .find(|p| exists(p))
+}
+
 /// Plugins loaded at startup (and on "Reload" in Settings), with the load error if any.
 #[derive(Default)]
 pub struct Loaded(pub Vec<Plugin>, pub Option<String>);
@@ -216,6 +258,28 @@ mod tests {
         );
         assert_eq!(plugin("echo 'x $KIND'").script(), "echo 'x '\"$RECOUVRANCE_KIND\"''");
         assert_eq!(plugin("echo \\$NAME \"\\$NAME\"").script(), "echo \\$NAME \"\\$NAME\"");
+    }
+
+    #[test]
+    fn sh_is_found_on_path_then_where_git_installs() {
+        let root = std::env::temp_dir();
+        let git = root.join("git").join("bin");
+        let on_path = root.join("tools");
+        let path = std::env::join_paths([root.join("empty"), on_path.clone()]).unwrap();
+        let has = |dirs: Vec<PathBuf>| move |p: &std::path::Path| dirs.iter().any(|d| d.join("sh.exe") == p);
+        assert_eq!(
+            find_sh(Some(path.clone()), [git.clone()], has(vec![on_path.clone(), git.clone()])),
+            Some(on_path.join("sh.exe"))
+        );
+        assert_eq!(find_sh(Some(path.clone()), [git.clone()], has(vec![git.clone()])), Some(git.join("sh.exe")));
+        assert_eq!(find_sh(None, [git.clone()], has(vec![git.clone()])), Some(git.join("sh.exe")));
+        assert_eq!(find_sh(Some(path), [git.clone()], has(vec![])), None);
+        assert!(NO_SH.contains("Git for Windows"));
+        // A relative entry on PATH (the current folder) is never used, even with an sh.exe in it.
+        let relative = std::env::join_paths([PathBuf::from("."), PathBuf::from("tools"), PathBuf::new()]).unwrap();
+        let everywhere = |_: &std::path::Path| true;
+        assert_eq!(find_sh(Some(relative.clone()), [git.clone()], everywhere), Some(git.join("sh.exe")));
+        assert_eq!(find_sh(Some(relative), Vec::new(), everywhere), None);
     }
 
     /// Hostile values are data: they are never run, wherever the shorthand stands.
