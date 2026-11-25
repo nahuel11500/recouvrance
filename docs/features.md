@@ -432,7 +432,12 @@
   kustomize images, Helm `*repository`/`*tag` parameters), who released it and when (`autosync`
   for auto-sync), what ran before, and *Roll back* to the deployment before (auto-sync off, as
   Argo CD requires; confirmed, write mode applies). *In cluster*: the revision of each source
-  deployed with its commit's message, author and time (a chart's version has none). *Problems*:
+  deployed with its commit's message, author and time (a chart's version has none). After a
+  selective sync (some resources only: Argo CD doesn't add it to its history) newer than the
+  newest deployment, a line says it (`Then 9 of 31 resources at ebf7503 (selective sync, 5d ago
+  by jdoe); the rest at e599d6d`), *Last sync* says `selective: 9 of 31 resources`, the *Why?*
+  reasons from it, and *Roll back* (the window's and the agents') says it takes those resources
+  back too. *Problems*:
   from the resource tree, one row per workload whose pods are in trouble (`CrashLoopBackOff`,
   `Pending`, `ContainerCreating`, *Not ready*...), with how many of its pods, since when and *why*
   (Argo CD's health message), then other objects Degraded (an autoscaler with no metric), then,

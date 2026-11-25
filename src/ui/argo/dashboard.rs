@@ -507,6 +507,36 @@ impl ArgoView {
         cx.notify();
     }
 
+    /// The made-up example after a selective sync of the workload (two of its resources, by
+    /// hand, an hour ago), newer than its newest deployment.
+    #[cfg(feature = "dev")]
+    pub fn demo_dashboard_selective(&mut self, cx: &mut Context<Self>) {
+        self.demo_dashboard(cx);
+        let Some(d) = &mut self.dashboard else { return };
+        let now = Timestamp::now();
+        if let Some((_, cards)) = d.example.as_mut().and_then(|t| t.get_mut(0)) {
+            let mut read = dashboard::example::read(dashboard::example::ENVIRONMENTS[1], now);
+            let ago = |m: i64| Timestamp::from_second(now.as_second() - m * 60).unwrap_or(now).to_string();
+            read.app["status"]["operationState"] = serde_json::json!({
+                "phase": "Succeeded",
+                "message": "successfully synced (all tasks run)",
+                "startedAt": ago(61),
+                "finishedAt": ago(60),
+                "operation": {
+                    "initiatedBy": {"username": "jdoe"},
+                    "sync": {"revision": "ebf7503b6f0c4e2a9d8c7b6a5f4e3d2c1b0a9f8e", "syncStrategy": {"apply": {}},
+                             "resources": [{"kind": "Deployment", "name": "api"}, {"kind": "ConfigMap", "name": "api-config"}]},
+                },
+                "syncResult": {"revision": "ebf7503b6f0c4e2a9d8c7b6a5f4e3d2c1b0a9f8e", "resources": [
+                    {"kind": "Deployment", "name": "api", "namespace": "shop", "status": "Synced", "message": "deployment.apps/api configured"},
+                    {"kind": "ConfigMap", "name": "api-config", "namespace": "shop", "status": "Synced", "message": "configured"},
+                ]},
+            });
+            *cards = Arc::new(Cards::of(read, None, now));
+        }
+        cx.notify();
+    }
+
     /// The made-up example after a login expired: the tab shown keeps its last read with why in
     /// one line, and the next one is shown as the Applications list has it.
     #[cfg(feature = "dev")]
@@ -788,6 +818,10 @@ impl ArgoView {
         }
         if let Some(r) = &s.revision {
             facts.push(short_revision(r));
+        }
+        // A selective sync: some resources only, not added to Argo CD's history.
+        if let Some((n, total)) = s.selective {
+            facts.push(format!("selective: {n} of {}", crate::plural::count(total, "resource")));
         }
         let progress = (s.running && !s.steps.is_empty()).then(|| {
             let share = s.done as f32 / s.steps.len() as f32;
@@ -1250,6 +1284,20 @@ impl ArgoView {
                 c.child(div().text_xs().text_color(muted).child(selectable(format!("Before: {}", short_revision(&p)))))
             })
             .children(c.deployed.iter().enumerate().map(|(i, (dep, commit))| deployed_row(i, dep, commit.as_ref(), cx)))
+            // The newest deployment isn't all that runs: a selective sync came after it.
+            .when_some(c.partial.as_ref(), |card, p| {
+                let rest = c.deployed.first().map(|d| short_revision(&d.revision)).unwrap_or_default();
+                let mut text = format!("Then {}", p.text());
+                if !rest.is_empty() && rest != p.revision {
+                    text.push_str(&format!("; the rest at {rest}"));
+                }
+                card.child(
+                    with_tip("argo-dash-partial", format!("{text}.\n{}", p.names.join(", ")))
+                        .text_xs()
+                        .text_color(theme.warning)
+                        .child(selectable(text)),
+                )
+            })
             .when(!released.is_empty() || rollback.is_some(), |c| {
                 c.child(
                     h_flex()
