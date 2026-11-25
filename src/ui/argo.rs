@@ -871,7 +871,14 @@ impl ArgoView {
             .child(div().flex_1().min_w(px(120.)).overflow_hidden().child(images))
             .child(column(90., false).text_color(muted).children(last_sync))
             .when(rows.show_cluster || rows.show_namespace, |d| {
-                d.child(column(220., true).text_color(muted).child(destination))
+                let tip = envs::destination_tip(env);
+                d.child(
+                    column(220., true)
+                        .id(("argo-destination", i))
+                        .text_color(muted)
+                        .child(destination)
+                        .tooltip(move |w, cx| component::tooltip::Tooltip::new(tip.clone()).build(w, cx)),
+                )
             })
             .when(self.several_sources(), |d| d.child(column(150., true).text_color(muted).child(root.server.name())));
         h_flex()
