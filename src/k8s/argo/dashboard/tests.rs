@@ -226,7 +226,7 @@ fn the_last_sync_says_its_steps_and_how_long_it_took() {
 #[test]
 fn the_diff_is_counted_by_kind_of_change() {
     let d = diff_from_git(&example::diff("example-prod"));
-    assert_eq!((d.total(), d.text().as_str()), (3, "~ 1 changed, + 1 added, – 1 pruned"));
+    assert_eq!((d.total(), d.text().as_str()), (7, "~ 5 changed, + 1 added, – 1 pruned"));
     assert!(d.from_argo);
     assert_eq!(diff_from_git(&example::diff("example-staging")).total(), 0);
     // From the status alone: a resource without health may or may not be live, counted changed.
@@ -261,7 +261,7 @@ fn every_example_makes_its_cards() {
     }
     let prod = Cards::of(example::read("example-prod", now()), None, now());
     assert!(!prod.findings.is_empty());
-    assert_eq!(prod.diff.total(), 3);
+    assert_eq!(prod.diff.total(), 7);
 }
 
 /// The tree holds only live objects: what auto-sync should have deployed and isn't live is
@@ -299,7 +299,14 @@ fn a_status_without_health_says_nothing_either_way() {
         r.as_object_mut().unwrap().remove("health");
     }
     assert!(problems_from_status(&prod).rows.is_empty());
-    let read = |app: Value| Read { app, tree: None, diff: None, commits: Vec::new(), note: Some("no server".into()) };
+    let read = |app: Value| Read {
+        app,
+        tree: None,
+        diff: None,
+        managed: None,
+        commits: Vec::new(),
+        note: Some("no server".into()),
+    };
     let cards = Cards::of(read(prod), None, now());
     assert!(cards.problems.rows.is_empty() && !cards.clean_is_known(), "Degraded, nothing found: unknown");
     let cards = Cards::of(read(app("example-staging")), None, now());
@@ -516,4 +523,42 @@ fn only_a_finished_selective_sync_newer_than_the_history_counts() {
     assert_eq!(super::partial(&after_deployment(selective("Succeeded"), 7 * 1440)), None, "older than #14");
     assert!(super::partial(&after_deployment(selective("Failed"), 60)).is_some(), "a failed one may have applied some");
     assert_eq!(last_sync(&after_deployment(selective("Running"), 60)).unwrap().selective, Some((2, 3)));
+}
+
+/// The Sync diff says what changes, images first, each change once with where: a field added
+/// on several resources of a kind is one line per value until grouped by kind; a Secret's
+/// values never show.
+#[test]
+fn the_sync_diff_says_what_changes_images_first() {
+    let cards = Cards::of(example::read("example-prod", now()), None, now());
+    let smart = cards.smart.as_ref().expect("the managed resources were read");
+    let lines: Vec<String> = smart.diff.groups.iter().map(crate::smartdiff::Group::text).collect();
+    assert!(lines[0].starts_with("image api 1.4.1 → 1.5.0"), "{lines:?}");
+    assert!(lines[1].starts_with("image worker 1.4.1 → 1.5.0"), "{lines:?}");
+    assert!(lines.iter().any(|l| l == "Secret key SMTP_HOST changed"), "{lines:?}");
+    assert!(lines.iter().any(|l| l == "1 resource added") && lines.iter().any(|l| l == "1 resource pruned"));
+    let secret = smart.diff.resources.iter().find(|r| r.key.kind == "Secret").unwrap();
+    let text = format!("{:?}", secret.lines(true));
+    assert!(!text.contains("++++"), "a Secret's values are masked: {text}");
+    assert!(Cards::of(example::read("example-staging", now()), None, now()).smart.is_some_and(|s| s.in_sync()));
+}
+
+/// The Sync diff groups as the grouped diff does: one annotation added on three Deployments
+/// is one line, images first.
+#[test]
+fn the_sync_diff_groups_a_field_by_kind() {
+    let cards = Cards::of(example::read("example-prod", now()), None, now());
+    let lines: Vec<&str> = cards.changes.iter().map(|c| c.text.as_str()).collect();
+    assert_eq!(
+        lines,
+        [
+            "image api 1.4.1 → 1.5.0",
+            "image worker 1.4.1 → 1.5.0",
+            "ConfigMap shop-config key CRAWL_BATCH changed",
+            "Secret shop-secrets key SMTP_HOST changed",
+            "Service metrics added",
+            "ConfigMap legacy-flags pruned (with prune)",
+            "3 Deployments: annotation example.io/owner added (3 values)",
+        ]
+    );
 }

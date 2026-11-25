@@ -10,12 +10,13 @@
 //!   differs (`modified`) where the smart diff finds no change is said, never taken as in sync.
 //!   An Application Argo CD couldn't compare with git ([`not_compared`]) is not read: its
 //!   managed resources would read as everything pruned, or nothing to sync.
-//! - **Across Applications** ([`regroup`]): an image, digest, replicas, env var or pod template
-//!   change is the same change wherever it is (one image bump in 12 environments is one line);
-//!   a change of a resource's own (a ConfigMap's key, a field, a resource added or pruned) is
-//!   the same when it is in a resource of the same group, kind and name (namespaces differ
-//!   between environments, and a ConfigMap kustomize regenerated is named by its stem) and its
-//!   values are the same (a key changed to two values is two lines).
+//! - **Across Applications** ([`regroup`]): values are compared with each environment's own
+//!   names (its name, namespace, client) replaced by placeholders ([`Names`]). An image,
+//!   digest, replicas, env var or pod template change is the same change wherever it is (one
+//!   image bump in 12 environments is one line); a change of a resource's own (a ConfigMap's
+//!   key, a field, a resource added or pruned) is one per field and edit on a kind, whatever
+//!   the resources' names (one annotation added on 36 Deployments is one line), the
+//!   environments where it differs said.
 //! - **Reads** ([`read_all`]) run at most [`PARALLEL`] at a time, off the UI thread, each
 //!   Application's error its own. Each diff is kept by Argo CD instance, Application and
 //!   resourceVersion for a short while ([`cached`]: live drift can change the diff without the
@@ -41,8 +42,8 @@ const KEPT: usize = 512;
 const KEPT_BYTES: usize = 64 * 1024 * 1024;
 /// How long a diff is kept: the live objects may drift with the Application unchanged.
 const KEPT_FOR: Duration = Duration::from_secs(60);
-/// Changes named in the summary line, at most.
-const SUMMARY_SHOWN: usize = 6;
+/// Changes named in the summary, at most.
+const SUMMARY_SHOWN: usize = 5;
 
 // MARK: One Application
 
@@ -235,14 +236,98 @@ where
 
 // MARK: Across Applications
 
+/// An environment's own names, replaced by placeholders before two environments' values are
+/// compared: the same rule edit in nine environments is one change even though each one's rule
+/// names its own environment and client. Its names (the environment's, the Application's, its
+/// destination namespace) become `‹env›`, the longest first; the client (what follows the
+/// environment's type in its name: `acme` in `shop-prod-acme`) becomes `‹client›` where it is a
+/// word of its own.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Names {
+    own: Vec<String>,
+    client: Option<String>,
+}
+
+/// Names shorter than this are left alone: they would match inside too many words.
+const MIN_NAME: usize = 3;
+const ENV: &str = "‹env›";
+const CLIENT: &str = "‹client›";
+
+impl Names {
+    pub fn new(own: impl IntoIterator<Item = String>, client: Option<String>) -> Self {
+        // A name inside a placeholder would replace it again.
+        let usable =
+            |n: &String| n.chars().count() >= MIN_NAME && !ENV.contains(n.as_str()) && !CLIENT.contains(n.as_str());
+        let mut own: Vec<String> = own.into_iter().filter(usable).collect();
+        own.sort_by(|a, b| b.len().cmp(&a.len()).then(a.cmp(b)));
+        own.dedup();
+        let client = client.filter(|c| usable(c) && !own.contains(c));
+        Self { own, client }
+    }
+
+    /// `text` with the names replaced.
+    pub fn apply(&self, text: &str) -> String {
+        let mut out = text.to_string();
+        for n in &self.own {
+            if out.contains(n.as_str()) {
+                out = out.replace(n.as_str(), ENV);
+            }
+        }
+        if let Some(c) = &self.client {
+            out = replace_word(&out, c, CLIENT);
+        }
+        out
+    }
+
+    /// `fact` with the names replaced in its values.
+    fn fact(&self, fact: &Fact) -> Fact {
+        let t = |s: &String| self.apply(s);
+        let o = |s: &Option<String>| s.as_ref().map(|s| self.apply(s));
+        match fact {
+            Fact::Image { from_repo, from_tag, to_repo, to_tag } => {
+                Fact::Image { from_repo: t(from_repo), from_tag: t(from_tag), to_repo: t(to_repo), to_tag: t(to_tag) }
+            }
+            Fact::Digest { repo, tag } => Fact::Digest { repo: t(repo), tag: t(tag) },
+            Fact::PodTemplate { keys } => Fact::PodTemplate { keys: t(keys) },
+            Fact::Replicas { from, to } => Fact::Replicas { from: o(from), to: o(to) },
+            Fact::Env { name, edit, from, to } => Fact::Env { name: t(name), edit: *edit, from: o(from), to: o(to) },
+            Fact::ConfigKey { key, edit } => Fact::ConfigKey { key: t(key), edit: *edit },
+            Fact::SecretKey { key, edit } => Fact::SecretKey { key: t(key), edit: *edit },
+            Fact::Renamed { from, to } => Fact::Renamed { from: t(from), to: t(to) },
+            Fact::Field { path, edit, from, to } => {
+                Fact::Field { path: t(path), edit: *edit, from: o(from), to: o(to) }
+            }
+            Fact::Added | Fact::Pruned => fact.clone(),
+        }
+    }
+}
+
+/// `text` with `word` replaced by `with` where neither side of it is a letter or a digit.
+fn replace_word(text: &str, word: &str, with: &str) -> String {
+    let alnum = |c: Option<char>| c.is_some_and(char::is_alphanumeric);
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find(word) {
+        // What precedes: in what is left, else the last of what is written already.
+        let before = if at > 0 { rest[..at].chars().last() } else { out.chars().last() };
+        let after = rest[at + word.len()..].chars().next();
+        out.push_str(&rest[..at]);
+        out.push_str(if alnum(before) || alnum(after) { word } else { with });
+        rest = &rest[at + word.len()..];
+    }
+    out.push_str(rest);
+    out
+}
+
 /// What makes two changes in two Applications the same one.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum CrossKey {
-    /// The same wherever it is: an image, a digest, replicas, an env var, a pod template.
+    /// The same wherever it is: an image, a digest, replicas, an env var, a pod template (its
+    /// values with each environment's names replaced).
     Fact(Fact),
-    /// A change of a resource's own, in a resource of this group, kind and name, from and to
-    /// the same values (their hash).
-    OnResource(Fact, String, String, String, u64),
+    /// A change of a resource's own, the same field with the same edit, on resources of this
+    /// group and kind whatever their names and values (said in the line).
+    OnKind(Fact, String, String),
     /// Noise folded by this rule.
     Noise(&'static str),
 }
@@ -255,6 +340,15 @@ fn own_to_resource(fact: &Fact) -> bool {
     )
 }
 
+/// A fact without its values: what makes it the same field with the same edit.
+fn shape(fact: &Fact) -> Fact {
+    match fact {
+        Fact::Field { path, edit, .. } => Fact::Field { path: path.clone(), edit: *edit, from: None, to: None },
+        Fact::Renamed { .. } => Fact::Renamed { from: String::new(), to: String::new() },
+        f => f.clone(),
+    }
+}
+
 /// A resource's name across environments: a core ConfigMap or Secret kustomize regenerated
 /// is named by its stem.
 fn stable_name(key: &ObjectKey) -> String {
@@ -263,18 +357,6 @@ fn stable_name(key: &ObjectKey) -> String {
         Some(stem) => stem.to_string(),
         None => key.name.clone(),
     }
-}
-
-fn cross_key(fact: &Fact, res: &ObjectKey, digest: u64) -> CrossKey {
-    if !own_to_resource(fact) {
-        return CrossKey::Fact(fact.clone());
-    }
-    // A regeneration's names hold its content's hash: the same regeneration by the stem.
-    let (fact, digest) = match fact {
-        Fact::Renamed { .. } => (Fact::Renamed { from: String::new(), to: String::new() }, 0),
-        f => (f.clone(), digest),
-    };
-    CrossKey::OnResource(fact, res.group.clone(), res.kind.clone(), stable_name(res), digest)
 }
 
 /// Kinds of the core API that other groups name too (Knative's Service...).
@@ -286,24 +368,27 @@ pub fn kind_text(group: &str, kind: &str) -> String {
     if !group.is_empty() && CORE_KINDS.contains(&kind) { format!("{kind}.{group}") } else { kind.to_string() }
 }
 
-/// The line of a change across Applications: `image web 1.15 → 1.16`, `ConfigMap app-config
-/// key LOG_LEVEL changed`, `Deployment worker added`, `Service web: spec.type: A → B`.
-fn cross_text(key: &CrossKey) -> String {
-    match key {
-        CrossKey::Fact(f) => f.text(),
-        CrossKey::OnResource(fact, group, kind, name, _) => {
-            let kind = kind_text(group, kind);
-            match fact {
-                Fact::ConfigKey { key, edit } | Fact::SecretKey { key, edit } => {
-                    format!("{kind} {name} key {key} {}", edit.word())
-                }
-                Fact::Renamed { .. } => format!("{kind} {name} regenerated under a new name"),
-                Fact::Added => format!("{kind} {name} added"),
-                Fact::Pruned => format!("{kind} {name} pruned (with prune)"),
-                f => format!("{kind} {name}: {}", f.text()),
+/// The line of a change of a resource's own: `fact` on the one resource named, or on as many
+/// resources of the kind as there are names.
+fn own_text(fact: &Fact, kind: &str, names: &[&str]) -> String {
+    if let [name] = names {
+        return match fact {
+            Fact::ConfigKey { key, edit } | Fact::SecretKey { key, edit } => {
+                format!("{kind} {name} key {key} {}", edit.word())
             }
-        }
-        CrossKey::Noise(rule) => format!("noise: {rule}"),
+            Fact::Renamed { .. } => format!("{kind} {name} regenerated under a new name"),
+            Fact::Added => format!("{kind} {name} added"),
+            Fact::Pruned => format!("{kind} {name} pruned (with prune)"),
+            f => format!("{kind} {name}: {}", f.text()),
+        };
+    }
+    let many = crate::plural::count(names.len(), kind);
+    match fact {
+        Fact::ConfigKey { key, edit } | Fact::SecretKey { key, edit } => format!("{many}: key {key} {}", edit.word()),
+        Fact::Renamed { .. } => format!("{many} regenerated under new names"),
+        Fact::Added => format!("{many} added"),
+        Fact::Pruned => format!("{many} pruned (with prune)"),
+        f => format!("{many}: {}", f.text()),
     }
 }
 
@@ -316,72 +401,172 @@ pub struct Cross {
     /// Each Application it is in (its index in the diffs given, in order), with the
     /// resources where (their index in that Application's `diff.resources`, in order).
     pub apps: Vec<(usize, Vec<usize>)>,
+    /// The Applications where it is otherwise than in most: on other resources, or to other
+    /// values once their own names are replaced.
+    pub differs: Vec<usize>,
 }
 
+/// Where a change of a resource's own is: the resource's name and the fact with its values
+/// (each environment's names replaced), and the hash of the values it was read from.
+type Seen = (String, Fact, u64);
+/// A change's places in each Application: its resources, and what each says.
+type Places = BTreeMap<usize, (Vec<usize>, Vec<Seen>)>;
+
 /// The changes of `diffs` (one per Application; None for one not read), each once with the
-/// Applications and resources it is in: images first, then pod templates, replicas, env,
-/// keys, resources, fields (the smart diff's order); within each, the one in the most
-/// Applications first, then by text. The same change to different values in different
-/// Applications is a line each, said (`(one of 2 different values)`). With `noise`, the
-/// noise by rule instead.
-pub fn regroup(diffs: &[Option<&SmartDiff>], noise: bool) -> Vec<Cross> {
-    let mut by: BTreeMap<CrossKey, BTreeMap<usize, Vec<usize>>> = BTreeMap::new();
+/// Applications and resources it is in; `names`: each Application's own names (see [`Names`];
+/// one missing is none). Images first, then pod templates, replicas, env, keys, resources,
+/// fields (the smart diff's order); within each, the one in the most Applications first, then
+/// on the most resources, then by text.
+///
+/// An image, replicas or env change is one wherever it is, with the same values once each
+/// environment's names are replaced (the same one to other values is a line each, said: `(one
+/// of 2 different values)`). A change of a resource's own (a field, a key, a resource added)
+/// is one per field and edit on a kind, whatever the resources' names (`36 Deployments:
+/// annotation example.io/role added`), its values shown when they are the same everywhere;
+/// the Applications where it is on other resources or to other values are said (`differs in
+/// 1 environment`). With `noise`, the noise by rule instead.
+pub fn regroup(diffs: &[Option<&SmartDiff>], names: &[Names], noise: bool) -> Vec<Cross> {
+    let none = Names::default();
+    let mut by: BTreeMap<CrossKey, Places> = BTreeMap::new();
     for (app, diff) in diffs.iter().enumerate() {
         let Some(diff) = diff else { continue };
+        let n = names.get(app).unwrap_or(&none);
+        let text = |s: &str| n.apply(s);
         for (r, res) in diff.resources.iter().enumerate() {
-            let keys: Vec<CrossKey> = if noise {
-                res.noise.iter().map(|n| CrossKey::Noise(n.rule)).collect()
+            let found: Vec<(CrossKey, Option<Seen>)> = if noise {
+                res.noise.iter().map(|x| (CrossKey::Noise(x.rule), None)).collect()
             } else {
-                res.facts.iter().enumerate().map(|(i, f)| cross_key(f, &res.key, res.digest(i))).collect()
+                res.facts
+                    .iter()
+                    .enumerate()
+                    .map(|(i, f)| {
+                        let f = n.fact(f);
+                        if !own_to_resource(&f) {
+                            return (CrossKey::Fact(f), None);
+                        }
+                        let key = CrossKey::OnKind(shape(&f), res.key.group.clone(), res.key.kind.clone());
+                        // A regeneration's names hold its content's hash: the same one by its stem.
+                        let f = if matches!(f, Fact::Renamed { .. }) { shape(&f) } else { f };
+                        (key, Some((n.apply(&stable_name(&res.key)), f, res.digest_by(i, &text))))
+                    })
+                    .collect()
             };
-            for k in keys {
-                let at = by.entry(k).or_default().entry(app).or_default();
+            for (k, seen) in found {
+                let (at, all) = by.entry(k).or_default().entry(app).or_default();
                 if at.last() != Some(&r) {
                     at.push(r);
                 }
+                all.extend(seen);
             }
         }
     }
     // How many lines say the same but for their values.
     let mut variants: BTreeMap<String, usize> = BTreeMap::new();
     for k in by.keys() {
-        *variants.entry(cross_text(k)).or_default() += 1;
+        if let CrossKey::Fact(f) = k {
+            *variants.entry(f.text()).or_default() += 1;
+        }
     }
     let rank = |k: &CrossKey| match k {
-        CrossKey::Fact(f) | CrossKey::OnResource(f, ..) => f.rank(),
+        CrossKey::Fact(f) | CrossKey::OnKind(f, ..) => f.rank(),
         CrossKey::Noise(_) => u8::MAX,
     };
-    let mut out: Vec<(u8, Cross)> = by
+    let mut out: Vec<(u8, usize, Cross)> = by
         .into_iter()
-        .map(|(k, apps)| {
-            let mut text = cross_text(&k);
-            if let Some(n) = variants.get(&text).copied().filter(|n| *n > 1) {
-                text.push_str(&format!(" (one of {n} different values)"));
-            }
-            (rank(&k), Cross { key: k, text, apps: apps.into_iter().collect() })
+        .map(|(k, places)| {
+            let resources: usize = places.values().map(|(r, _)| r.len()).sum();
+            let (text, differs) = match &k {
+                CrossKey::Fact(f) => {
+                    let mut text = f.text();
+                    if let Some(n) = variants.get(&text).copied().filter(|n| *n > 1) {
+                        text.push_str(&format!(" (one of {n} different values)"));
+                    }
+                    (text, Vec::new())
+                }
+                CrossKey::OnKind(shaped, group, kind) => own_line(shaped, &kind_text(group, kind), &places),
+                CrossKey::Noise(rule) => (format!("noise: {rule}"), Vec::new()),
+            };
+            let apps = places.into_iter().map(|(a, (r, _))| (a, r)).collect();
+            (rank(&k), resources, Cross { key: k, text, apps, differs })
         })
         .collect();
-    out.sort_by(|(ra, a), (rb, b)| ra.cmp(rb).then(b.apps.len().cmp(&a.apps.len())).then(a.text.cmp(&b.text)));
-    out.into_iter().map(|(_, c)| c).collect()
+    out.sort_by(|(ra, na, a), (rb, nb, b)| {
+        ra.cmp(rb).then(b.apps.len().cmp(&a.apps.len())).then(nb.cmp(na)).then(a.text.cmp(&b.text))
+    });
+    out.into_iter().map(|(_, _, c)| c).collect()
 }
 
-/// The summary line: `3 changes in 12 environments: image web 1.15 → 1.16 (12) · replicas 3 →
-/// 5 (2) · …`, `with_changes` the Applications that have one. None when nothing changes.
-pub fn summary(groups: &[Cross], with_changes: usize) -> Option<String> {
+/// Where a change is in one Application and what it says there (see [`Seen`]).
+type Signature<'a> = Vec<(&'a str, &'a Fact, u64)>;
+
+/// Where a change is in one Application and what it says there, sorted, each once.
+fn signature(seen: &[Seen]) -> Signature<'_> {
+    let mut sig: Signature<'_> = seen.iter().map(|(n, f, d)| (n.as_str(), f, *d)).collect();
+    sig.sort();
+    sig.dedup();
+    sig
+}
+
+/// The line of a change of a resource's own on a kind (`shaped`: without its values), and the
+/// Applications where it is otherwise than in most.
+fn own_line(shaped: &Fact, kind: &str, places: &Places) -> (String, Vec<usize>) {
+    let seen = || places.values().flat_map(|(_, s)| s.iter());
+    let names: BTreeSet<&str> = seen().map(|(n, _, _)| n.as_str()).collect();
+    let values: BTreeSet<(&Fact, u64)> = seen().map(|(_, f, d)| (f, *d)).collect();
+    let fact = match values.first() {
+        Some((f, _)) if values.len() == 1 => (*f).clone(),
+        _ => shaped.clone(),
+    };
+    let names: Vec<&str> = names.into_iter().collect();
+    let mut text = own_text(&fact, kind, &names);
+    // Each Application's resources and values: when most are alike, those unlike them differ.
+    let sigs: Vec<(usize, Signature<'_>)> = places.iter().map(|(a, (_, s))| (*a, signature(s))).collect();
+    let mut count: BTreeMap<&[(&str, &Fact, u64)], usize> = BTreeMap::new();
+    for (_, sig) in &sigs {
+        *count.entry(sig.as_slice()).or_default() += 1;
+    }
+    let differs: Vec<usize> = match count.iter().max_by_key(|(_, n)| **n) {
+        Some((most, n)) if count.len() > 1 && 2 * n > sigs.len() => {
+            sigs.iter().filter(|(_, s)| s.as_slice() != *most).map(|(a, _)| *a).collect()
+        }
+        _ => Vec::new(),
+    };
+    // Values that differ only between those environments are said by them.
+    let valued = !matches!(fact, Fact::Added | Fact::Pruned | Fact::Renamed { .. });
+    if values.len() > 1 && valued && differs.is_empty() {
+        text.push_str(&format!(" ({} values)", values.len()));
+    }
+    if !differs.is_empty() {
+        text.push_str(&format!(" (differs in {})", crate::plural::count(differs.len(), "environment")));
+    }
+    (text, differs)
+}
+
+/// The summary's heading and its first lines: `3 changes in 12 environments`, then the first
+/// [`SUMMARY_SHOWN`] changes (images first) with how many environments each is in, then how
+/// many more. `with_changes`: the Applications that have one. None when nothing changes.
+pub fn summary_lines(groups: &[Cross], with_changes: usize) -> Option<(String, Vec<String>)> {
     if groups.is_empty() {
         return None;
     }
-    let mut parts: Vec<String> =
+    let heading = format!(
+        "{} in {}",
+        crate::plural::count(groups.len(), "change"),
+        crate::plural::count(with_changes, "environment")
+    );
+    let mut lines: Vec<String> =
         groups.iter().take(SUMMARY_SHOWN).map(|g| format!("{} ({})", g.text, g.apps.len())).collect();
     if groups.len() > SUMMARY_SHOWN {
-        parts.push(format!("{} more", groups.len() - SUMMARY_SHOWN));
+        lines.push(format!("{} more", crate::plural::count(groups.len() - SUMMARY_SHOWN, "change")));
     }
-    Some(format!(
-        "{} in {}: {}",
-        crate::plural::count(groups.len(), "change"),
-        crate::plural::count(with_changes, "environment"),
-        parts.join(" · ")
-    ))
+    Some((heading, lines))
+}
+
+/// The summary in a line: `3 changes in 12 environments: image web 1.15 → 1.16 (12) · replicas
+/// 3 → 5 (2) · …`. None when nothing changes.
+pub fn summary(groups: &[Cross], with_changes: usize) -> Option<String> {
+    let (heading, lines) = summary_lines(groups, with_changes)?;
+    Some(format!("{heading}: {}", lines.join(" · ")))
 }
 
 /// The same error said once with the Applications (their index) it is of: the one of the
@@ -396,5 +581,8 @@ pub fn errors_by_text<'a>(errors: impl IntoIterator<Item = (usize, &'a str)>) ->
     out
 }
 
+/// A made-up example, for the developer tools' snapshots and the tests.
+#[cfg(any(test, feature = "dev"))]
+pub mod example;
 #[cfg(test)]
 mod tests;

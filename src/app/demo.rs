@@ -202,6 +202,12 @@ impl AppView {
                     page.update(cx, crate::ui::argo::ArgoView::demo_dashboard_expired);
                 }
             }
+            // The Argo CD page's grouped diff, on a made-up example (no real data).
+            "argo-example-diff" => {
+                if let Route::Argo(page) = self.route().clone() {
+                    page.update(cx, crate::ui::argo::ArgoView::demo_grouped);
+                }
+            }
             // The Argo CD page's sync journal, on a made-up example (no real data).
             "argo-journal-example" => {
                 if let Route::Argo(page) = self.route().clone() {

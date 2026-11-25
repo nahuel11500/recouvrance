@@ -730,7 +730,12 @@ fn diff_text(names: &[String], diffs: &[Result<Arc<AppDiff>, String>], notes: &[
     } else if !names.is_empty() {
         let read: Vec<Option<&crate::smartdiff::SmartDiff>> =
             diffs.iter().map(|d| d.as_ref().ok().map(|d| &d.diff)).collect();
-        let groups = grouped_diff::regroup(&read, false);
+        // Each Application's own names (its name, the client it says) replaced before values
+        // are compared, as the Argo CD page does.
+        let types = argo::environments::EnvTypes::default();
+        let own: Vec<grouped_diff::Names> =
+            names.iter().map(|n| grouped_diff::Names::new([n.clone()], types.client(n).map(String::from))).collect();
+        let groups = grouped_diff::regroup(&read, &own, false);
         let with_changes = diffs.iter().filter(|d| d.as_ref().is_ok_and(|d| !d.diff.groups.is_empty())).count();
         match grouped_diff::summary(&groups, with_changes) {
             Some(s) => out.push_str(&format!("{s}\n")),
@@ -739,6 +744,10 @@ fn diff_text(names: &[String], diffs: &[Result<Arc<AppDiff>, String>], notes: &[
         for g in &groups {
             let apps: Vec<&str> = g.apps.iter().filter_map(|(i, _)| names.get(*i).map(String::as_str)).collect();
             out.push_str(&format!("  {} — in {}\n", g.text, apps.join(", ")));
+            if !g.differs.is_empty() {
+                let odd: Vec<&str> = g.differs.iter().filter_map(|i| names.get(*i).map(String::as_str)).collect();
+                out.push_str(&format!("    otherwise than in the others: {}\n", odd.join(", ")));
+            }
         }
         let in_sync: Vec<&str> = names
             .iter()
@@ -908,6 +917,8 @@ mod tests {
             on: true,
             settings_token: false,
             renewable: false,
+            cli: None,
+            cli_renews: false,
         })
     }
 
