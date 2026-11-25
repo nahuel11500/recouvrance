@@ -444,7 +444,10 @@
   Application; from a status without health per resource (Argo CD 3) it says *No detail* and why.
   *Last sync*: phase, message, duration, who, when and its steps (each resource's result and a
   hook's phase), progress live while it runs. *Sync diff*: how many resources a sync would change
-  (`~ changed, + added, – pruned`, with names) and *show* for Argo CD's diff, or *Nothing to sync*.
+  (`~ changed, + added, – pruned`, with names), what changes (images first, a field alike on
+  several resources one line on their kind, a resource's other fields one line for it:
+  `PrometheusRule alerts: spec.groups[app].rules[13, 14] changed: annotations, expr (8 fields)`,
+  each field in its row's diff) and *show* for Argo CD's diff, or *Nothing to sync*.
   *History*: the last deployments as dots, a sync that failed after them red, counts and the
   list. Only the tab shown is read, by Argo CD's API (the Application, `resource-tree`,
   `managed-resources` and `revisions/<rev>/metadata`, a commit kept once read). It is read again
