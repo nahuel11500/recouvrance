@@ -73,8 +73,11 @@ struct Compare {
 
 /// The dashboard open on the page.
 pub(super) struct Dashboard {
-    service: String,
-    /// The service's Applications, one tab each.
+    /// The environment: its name, type and Argo CD server's name.
+    title: String,
+    kind: String,
+    server: String,
+    /// Its Applications, one section each: its workload first, its root last.
     members: Vec<Key>,
     tab: usize,
     /// The cards last read, and of which Application.
@@ -104,9 +107,11 @@ pub(super) struct Dashboard {
 }
 
 impl Dashboard {
-    fn new(service: String, members: Vec<Key>, tab: usize) -> Self {
+    fn new(title: String, members: Vec<Key>, tab: usize) -> Self {
         Self {
-            service,
+            title,
+            kind: String::new(),
+            server: String::new(),
             members,
             tab,
             cards: None,
@@ -205,17 +210,38 @@ fn when_shown<V: 'static>(
 }
 
 impl ArgoView {
-    /// Open the dashboard of the environment of the Application `k`, on its tab.
+    /// Open the dashboard of the environment of the Application `k`, on its section.
     pub(super) fn open_dashboard(&mut self, k: &Key, cx: &mut Context<Self>) {
         let Some(rows) = &self.rows else { return };
         let apps = &rows.fleet.apps;
         let Some(ix) = apps.iter().position(|a| key(a) == *k) else { return };
         let Some(env) = rows.env_of.get(ix).and_then(|&e| rows.envs.get(e)) else { return };
-        let members: Vec<usize> = env.members.iter().map(|(i, _)| *i).collect();
+        let members = super::envs::section_order(env);
         let tab = members.iter().position(|&m| m == ix).unwrap_or(0);
-        let members = members.iter().map(|&m| key(&apps[m])).collect();
-        self.dashboard = Some(Dashboard::new(env.name.clone(), members, tab));
+        let mut d = Dashboard::new(env.name.clone(), members.iter().map(|&m| key(&apps[m])).collect(), tab);
+        d.kind = rows.types.name(env.kind).to_string();
+        d.server = apps[env.root()].server.name();
+        self.dashboard = Some(d);
         self.load_dashboard(cx);
+    }
+
+    /// Where the environment shown is among those the list keeps (from 0), and how many.
+    fn env_position(&self) -> Option<(usize, usize)> {
+        let rows = self.rows.as_ref()?;
+        let k = self.dashboard.as_ref()?.members.first()?;
+        let ix = rows.fleet.apps.iter().position(|a| key(a) == *k)?;
+        let e = *rows.env_of.get(ix)?;
+        Some((self.env_order.iter().position(|&o| o == e)?, self.env_order.len()))
+    }
+
+    /// Open the environment before (`-1`) or after (`1`) the one shown, in the list's order.
+    fn step_env(&mut self, by: isize, cx: &mut Context<Self>) {
+        let Some((at, n)) = self.env_position() else { return };
+        let Some(to) = at.checked_add_signed(by).filter(|&t| t < n) else { return };
+        let Some(rows) = &self.rows else { return };
+        let Some(env) = rows.envs.get(self.env_order[to]) else { return };
+        let k = key(&rows.fleet.apps[env.main]);
+        self.open_dashboard(&k, cx);
     }
 
     pub(super) fn close_dashboard(&mut self, cx: &mut Context<Self>) {
@@ -422,11 +448,16 @@ impl ArgoView {
     pub fn demo_dashboard(&mut self, cx: &mut Context<Self>) {
         use dashboard::example;
         let now = Timestamp::now();
-        let tabs = example::ENVIRONMENTS
+        // An environment's three Applications, each shown with one of the example's reads.
+        let sections = ["workload", "managed-namespace", "shop-prod-acme (app of apps)"];
+        let tabs = sections
             .iter()
-            .map(|env| (env.to_string(), Arc::new(Cards::of(example::read(env, now), None, now))))
+            .zip([example::ENVIRONMENTS[1], example::ENVIRONMENTS[0], example::ENVIRONMENTS[2]])
+            .map(|(name, env)| (name.to_string(), Arc::new(Cards::of(example::read(env, now), None, now))))
             .collect();
-        let mut d = Dashboard::new("shop (example, no real data)".into(), Vec::new(), 1);
+        let mut d = Dashboard::new("shop-prod-acme (example, no real data)".into(), Vec::new(), 0);
+        d.kind = "prod".into();
+        d.server = "argocd.example.com".into();
         d.example = Some(tabs);
         d.updated = Some(now);
         self.dashboard = Some(d);
@@ -452,18 +483,50 @@ impl ArgoView {
                     .small()
                     .ghost()
                     .icon(Lucide::ArrowLeft)
-                    .label("Applications")
+                    .label("Environments")
                     .on_click(cx.listener(|this, _, _, cx| this.close_dashboard(cx))),
             )
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .truncate()
-                    .text_lg()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child(format!("Argo CD · {}", d.service)),
-            )
+            .child(div().min_w_0().truncate().text_lg().font_weight(FontWeight::SEMIBOLD).child(d.title.clone()))
+            .when(!d.kind.is_empty(), |h| {
+                h.child(
+                    div()
+                        .flex_none()
+                        .px_1p5()
+                        .rounded(px(4.))
+                        .border_1()
+                        .border_color(theme.border)
+                        .text_xs()
+                        .child(d.kind.clone()),
+                )
+            })
+            .when(!d.server.is_empty(), |h| {
+                h.child(div().flex_none().text_xs().text_color(muted).child(d.server.clone()))
+            })
+            .child(div().flex_1())
+            .children(self.env_position().map(|(at, n)| {
+                h_flex()
+                    .flex_none()
+                    .gap_1()
+                    .child(
+                        Button::new("argo-dash-prev")
+                            .small()
+                            .ghost()
+                            .icon(Lucide::ChevronLeft)
+                            .accessibility_label("Previous environment")
+                            .disabled(at == 0)
+                            .on_click(cx.listener(|this, _, _, cx| this.step_env(-1, cx))),
+                    )
+                    .child(div().text_xs().text_color(muted).child(format!("{} / {n}", at + 1)))
+                    .child(
+                        Button::new("argo-dash-next")
+                            .small()
+                            .ghost()
+                            .icon(Lucide::ChevronRight)
+                            .accessibility_label("Next environment")
+                            .disabled(at + 1 >= n)
+                            .on_click(cx.listener(|this, _, _, cx| this.step_env(1, cx))),
+                    )
+            }))
             .children(updated.map(|u| div().flex_none().text_xs().text_color(muted).child(u)))
             .child(
                 Button::new("argo-dash-refresh")
@@ -500,8 +563,10 @@ impl ArgoView {
             .into_any_element()
     }
 
-    /// An entry per environment, on more lines when the window is narrow: its state's dot, its
-    /// name, and where it is read when two would read the same otherwise.
+    /// An entry per Application of the environment (its sections: the workload first, the root
+    /// last), on more lines when the window is narrow: its state's dot, its name under the
+    /// environment's, its sync and health, and where it is read when two would read the same
+    /// otherwise. A click shows its cards.
     fn environments(&self, d: &Dashboard, cx: &mut Context<Self>) -> Div {
         let theme = cx.theme().clone();
         let entries: Vec<(String, Option<String>, Tone)> = if let Some(tabs) = &d.example {
@@ -516,7 +581,19 @@ impl ArgoView {
                 .map(|k| {
                     let found = self.find(k);
                     let tone = found.map_or(Tone::Done, |a| argo::attention(&a.app));
-                    (k.2.clone(), found.filter(|_| sourced).map(|a| a.server.name()), tone)
+                    // Named under the environment (`workload`); its root (named as it) as such.
+                    let root = k.2 == d.title && d.members.len() > 1;
+                    let label = if root {
+                        format!("{} (app of apps)", k.2)
+                    } else {
+                        super::envs::member_label(&d.title, &k.2).to_string()
+                    };
+                    let state = found.map(|a| format!("{} · {}", a.app.sync, a.app.health));
+                    let detail = match (state, found.filter(|_| sourced).map(|a| a.server.name())) {
+                        (Some(s), Some(server)) => Some(format!("{s} · {server}")),
+                        (s, server) => s.or(server),
+                    };
+                    (label, detail, tone)
                 })
                 .collect()
         };
