@@ -587,17 +587,6 @@ pub fn problems_from_status(app: &Value) -> Problems {
 
 // MARK: Last sync
 
-/// One resource of a sync's result.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Step {
-    pub res: Res,
-    /// `Synced`, `SyncFailed`, `Pruned`...; a hook's phase for a hook.
-    pub status: String,
-    pub message: Option<String>,
-    pub hook: bool,
-    pub tone: Tone,
-}
-
 /// The Last sync card.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LastSync {
@@ -609,7 +598,11 @@ pub struct LastSync {
     pub finished: Option<Timestamp>,
     pub by: Option<String>,
     pub revision: Option<String>,
-    pub steps: Vec<Step>,
+    /// Its resources' results, as the sync journal keeps them (those without a kind or a
+    /// name left out).
+    pub steps: Vec<super::journal::Step>,
+    /// Them summed up, the cause first: worked out once per read.
+    pub summary: super::steps::Summary,
     /// Steps done so far (a hook still running isn't).
     pub done: usize,
     pub running: bool,
@@ -627,21 +620,13 @@ impl LastSync {
 pub fn last_sync(app: &Value) -> Option<LastSync> {
     let op = app.pointer("/status/operationState")?;
     let phase = s(op, "/phase")?.to_string();
-    let steps: Vec<Step> = arr(op, "/syncResult/resources")
+    let steps: Vec<super::journal::Step> = arr(op, "/syncResult/resources")
         .iter()
-        .filter_map(|r| {
-            let hook = s(r, "/hookPhase").is_some() || r.get("hookType").is_some_and(|h| !h.is_null());
-            let status = if hook { s(r, "/hookPhase").or(s(r, "/status")) } else { s(r, "/status") };
-            let status = status.unwrap_or_default().to_string();
-            // A hook's phase: Running is on its way, not good yet.
-            let tone = match status.as_str() {
-                "Running" | "Pending" | "" => Tone::Busy,
-                _ => crate::status::tone(&status).unwrap_or(Tone::Done),
-            };
-            Some(Step { res: Res::of(r)?, message: s(r, "/message").map(String::from), hook, tone, status })
-        })
+        .map(super::journal::Step::of)
+        .filter(|st| !st.kind.is_empty() && !st.name.is_empty())
         .collect();
-    let done = steps.iter().filter(|st| !st.status.is_empty() && st.tone != Tone::Busy).count();
+    let summary = super::steps::Summary::of(&steps);
+    let done = summary.done;
     let message = s(op, "/message").map(|m| {
         let line = m.lines().next().unwrap_or_default();
         let cut: String = line.chars().take(MESSAGE_CHARS).collect();
@@ -661,6 +646,7 @@ pub fn last_sync(app: &Value) -> Option<LastSync> {
         by: op.pointer("/operation/initiatedBy").and_then(who),
         revision,
         steps,
+        summary,
         done,
     })
 }

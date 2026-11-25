@@ -511,7 +511,7 @@
   hub's list, a dashboard, a grouped sync) is kept on this machine: the Application,
   its Argo CD, revision(s), phase, message, who started it, when it started and ended, dry run
   and strategy, and each resource's result (kind, namespace, name, status, message, hook phase
-  and type). These are stored as Argo CD says them, for 30 days: operation and step messages
+  and type, sync phase). These are stored as Argo CD says them, for 30 days: operation and step messages
   (which may quote what a resource or hook printed) and the usernames of who started each.
   One JSON line per state of an operation, a state seen again not written again (a cheap
   check of its phase, end, message and each step's status comes first), at most 256 KB (past
@@ -522,7 +522,13 @@
   *Sync journal* (the selection bar, the sync page, *journal* on a dashboard's Last sync and
   History cards for that Application) lists them newest first, filtered by Application, phase,
   who and since when; a click shows an operation's message and steps, even after Argo CD's
-  history dropped it. A line that doesn't read is skipped and counted (*2 lines of the journal
+  history dropped it. The cause comes first: the steps that didn't succeed (failed, running,
+  waiting, skipped), by phase, each with its message and how long it ran as the app saw it,
+  and for a sync running or one that timed out the phase it was in (Argo CD's result doesn't
+  say the wave). The succeeded steps fold into one line (*438 succeeded: 120 ConfigMaps, 60
+  Secrets…*), unfolding by kind, one line per step; a message that only says the step was
+  applied (`configmap/web serverside-applied`) is left out. *Steps: status, kind, name…*
+  filters them. The dashboard's Last sync → steps shows the same. A line that doesn't read is skipped and counted (*2 lines of the journal
   could not be read and were skipped*), never breaking the rest.
 - **Argo CD sync, terminate and roll back**: *Sync* (the Application's page, its row menu, the
   Argo CD panel) reads the Application first and lists its resources out of sync, all ticked:

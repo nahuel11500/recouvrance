@@ -30,6 +30,7 @@ pub mod journal;
 pub mod ops;
 mod revision;
 pub mod server;
+pub mod steps;
 pub mod sync_diff;
 pub mod windows;
 
