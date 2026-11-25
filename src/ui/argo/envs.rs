@@ -21,6 +21,8 @@ pub struct State {
     pub failed: bool,
     /// An operation runs.
     pub running: bool,
+    /// What makes it need a look (`argo::Look`, the rule every count of the page shares).
+    pub look: argo::Look,
 }
 
 impl State {
@@ -32,13 +34,14 @@ impl State {
             s.failed |= argo::sync_failed(a);
             s.running |= a.in_progress
                 || a.operation.as_ref().is_some_and(|(phase, _, _)| argo::operation_tone(phase) == Tone::Busy);
+            s.look = s.look.add(argo::Look::of(a));
         }
         s
     }
 
-    /// Worth a look: out of sync, Degraded or a sync that failed.
-    pub fn needs_look(self) -> bool {
-        self.out_of_sync || self.degraded || self.failed
+    /// Worth a look at `now` (`argo::Look`): out of sync with auto-sync off is not.
+    pub fn needs_look(self, now: jiff::Timestamp) -> bool {
+        self.look.needs_a_look(now)
     }
 }
 
@@ -265,13 +268,20 @@ pub struct Filter {
 }
 
 impl Filter {
-    /// Whether it keeps `env`, of type `kind` (its name), a favorite or not; `labels` are its
-    /// Applications' (a search word `key=value` is one of them).
-    pub fn keeps(&self, env: &Env, kind: &str, favorite: bool, labels: &[&(String, String)]) -> bool {
+    /// Whether it keeps `env`, of type `kind` (its name), a favorite or not, at `now`; `labels`
+    /// are its Applications' (a search word `key=value` is one of them).
+    pub fn keeps(
+        &self,
+        env: &Env,
+        kind: &str,
+        favorite: bool,
+        labels: &[&(String, String)],
+        now: jiff::Timestamp,
+    ) -> bool {
         let s = env.state;
         let any_state = self.needs_look || self.out_of_sync || self.degraded || self.running;
         let state = !any_state
-            || (self.needs_look && s.needs_look())
+            || (self.needs_look && s.needs_look(now))
             || (self.out_of_sync && s.out_of_sync)
             || (self.degraded && (s.degraded || s.failed))
             || (self.running && s.running);
@@ -456,28 +466,34 @@ mod tests {
 
     #[test]
     fn state_filters_add_up_and_the_others_narrow() {
-        let oos = env("shop-prod-a", "shop", 0, State { out_of_sync: true, ..Default::default() });
-        let failed = env("shop-prod-b", "shop", 0, State { failed: true, ..Default::default() });
+        let auto = argo::Look { auto_out_of_sync: true, ..Default::default() };
+        let oos = env("shop-prod-a", "shop", 0, State { out_of_sync: true, look: auto, ..Default::default() });
+        let by_hand = env("shop-prod-c", "shop", 0, State { out_of_sync: true, ..Default::default() });
+        let failed_look = argo::Look { failed: true, ..Default::default() };
+        let failed = env("shop-prod-b", "shop", 0, State { failed: true, look: failed_look, ..Default::default() });
         let running = env("data-acc", "data", 3, State { running: true, ..Default::default() });
         let fine = env("data-prod", "data", 0, State::default());
-        let keeps = |f: &Filter, e: &Env| f.keeps(e, "prod", false, &[]);
-        assert!([&oos, &failed, &running, &fine].iter().all(|e| keeps(&Filter::default(), e)));
+        let now = jiff::Timestamp::UNIX_EPOCH;
+        let keeps = |f: &Filter, e: &Env| f.keeps(e, "prod", false, &[], now);
+        assert!([&oos, &by_hand, &failed, &running, &fine].iter().all(|e| keeps(&Filter::default(), e)));
         let look = Filter { needs_look: true, ..Default::default() };
         assert!(keeps(&look, &oos) && keeps(&look, &failed) && !keeps(&look, &running) && !keeps(&look, &fine));
+        // Out of sync with auto-sync off is how an Application synced by hand waits.
+        assert!(!keeps(&look, &by_hand) && keeps(&Filter { out_of_sync: true, ..Default::default() }, &by_hand));
         let either = Filter { degraded: true, running: true, ..Default::default() };
         assert!(keeps(&either, &failed) && keeps(&either, &running) && !keeps(&either, &oos));
         let shop = Filter { project: Some("shop".into()), ..look };
         assert!(keeps(&shop, &oos) && !keeps(&shop, &running));
-        assert!(!Filter { kind: Some("staging".into()), ..Default::default() }.keeps(&fine, "prod", false, &[]));
-        assert!(!Filter { on_tag: true, ..Default::default() }.keeps(&fine, "prod", false, &[]));
+        assert!(!Filter { kind: Some("staging".into()), ..Default::default() }.keeps(&fine, "prod", false, &[], now));
+        assert!(!Filter { on_tag: true, ..Default::default() }.keeps(&fine, "prod", false, &[], now));
         let favorites = Filter { favorites: true, ..Default::default() };
-        assert!(favorites.keeps(&fine, "prod", true, &[]) && !favorites.keeps(&fine, "prod", false, &[]));
+        assert!(favorites.keeps(&fine, "prod", true, &[], now) && !favorites.keeps(&fine, "prod", false, &[], now));
         let search = |q: &str| Filter { query: q.into(), ..Default::default() };
         assert!(keeps(&search("prod a"), &oos) && !keeps(&search("prod c"), &oos));
         let label = ("team".to_string(), "Web".to_string());
-        assert!(search("team=web").keeps(&fine, "prod", false, &[&label]));
-        assert!(search("team=").keeps(&fine, "prod", false, &[&label]));
-        assert!(!search("team=api").keeps(&fine, "prod", false, &[&label]));
+        assert!(search("team=web").keeps(&fine, "prod", false, &[&label], now));
+        assert!(search("team=").keeps(&fine, "prod", false, &[&label], now));
+        assert!(!search("team=api").keeps(&fine, "prod", false, &[&label], now));
     }
 
     #[test]

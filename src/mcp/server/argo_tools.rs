@@ -33,7 +33,7 @@ pub struct ArgoAppsParams {
     #[schemars(description = "only this Argo CD server, by its name (argocd.example.com); omit for every one")]
     pub server: Option<String>,
     #[schemars(
-        description = "only those that need a look: a failed sync, an error, Degraded or Missing, a sync running, or out of sync with auto-sync on (out of sync with auto-sync off is how an Application synced by hand waits)"
+        description = "only those that need a look, as the Argo CD page's Needs a look: a failed sync, an error, Degraded (or Missing with auto-sync on), a sync running for over 10 minutes, or out of sync with auto-sync on (out of sync or Missing with auto-sync off is how an Application synced by hand waits)"
     )]
     pub problems_only: Option<bool>,
     #[schemars(description = "only those out of sync, auto-sync on or off")]
@@ -525,11 +525,11 @@ impl ObjectKey {
     }
 }
 
-/// What `problems_only` keeps: what the Argo CD page shows red or amber, and Missing health
-/// with auto-sync off too (what it should deploy isn't there). Out of sync alone with
-/// auto-sync off is not kept: an Application synced by hand waits for its sync so.
+/// What `problems_only` keeps: what the Argo CD page's *Needs a look* keeps, by the same rule
+/// (`argo::Look`). Out of sync or Missing with auto-sync off is not kept: an Application
+/// synced by hand waits for its sync so.
 fn needs_a_look(app: &Summary) -> bool {
-    matches!(argo::attention(app), Tone::Bad | Tone::Busy) || app.health == "Missing"
+    argo::Look::of(app).needs_a_look(jiff::Timestamp::now())
 }
 
 fn keeps(p: &ArgoAppsParams, row: &FleetApp) -> bool {
@@ -1037,16 +1037,16 @@ mod tests {
         assert!(!policy("get applications.argoproj.io --context *").may_reach_argo(&[Verb::Sync]));
     }
 
-    /// Out of sync with auto-sync off is how an Application synced by hand waits: not a
-    /// problem. Missing is, auto-sync on or off; so are a failed sync and out of sync with
-    /// auto-sync on.
+    /// Out of sync, or Missing, with auto-sync off is how an Application synced by hand
+    /// waits: not a problem, as on the Argo CD page. A failed sync and out of sync with
+    /// auto-sync on are.
     #[test]
     fn problems_leave_out_what_waits_for_a_sync_by_hand() {
         let fleet = fleet();
         let names = |p: &ArgoAppsParams| -> Vec<&str> {
             fleet.apps.iter().filter(|r| keeps(p, r)).map(|r| r.app.name.as_str()).collect()
         };
-        assert_eq!(names(&ArgoAppsParams { problems_only: Some(true), ..params() }), ["api", "cache", "db"]);
+        assert_eq!(names(&ArgoAppsParams { problems_only: Some(true), ..params() }), ["api", "cache"]);
         assert_eq!(names(&ArgoAppsParams { out_of_sync: Some(true), ..params() }).len(), 4);
         let to_prod =
             ArgoAppsParams { destination: Some("prod".into()), dest_namespace: Some("web".into()), ..params() };

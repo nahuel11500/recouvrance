@@ -332,8 +332,11 @@
   page says how to add one. It opens on an *Overview* of the environments the filters keep
   (*Environments* shows the list; which one is remembered): counts per environment (synced and
   healthy, out of sync, Degraded, sync failed, syncing; a click shows them in the list), each
-  type with how many need a look, the environments that need a look (a failed sync, Degraded, a
-  sync running for over 10 minutes, out of sync with auto-sync on), production first; per
+  type with how many need a look, the environments that need a look (a failed sync, an error Argo
+  CD reports, Degraded or Missing with auto-sync on, a sync running for over 10 minutes, out of
+  sync with auto-sync on: out of sync or Missing with auto-sync off is how an Application synced
+  by hand waits, not a problem; the filter, the headings and the agents' `problems_only` count
+  the same), production first; per
   project, the version each type runs of the product's images (the tag most of its
   environments run, `prod 1.4.2 · preprod 1.5.0-rc.1 · staging main-77b324b`) and the
   environments on another tag, named (components on the same tags everywhere on one line), each
@@ -363,7 +366,7 @@
   (`allow` and `deny`, their cron schedule, duration and time zone, the windows applying by name,
   namespace or cluster): *no window*, *now*, *in 5h*, or *not within 8 days*; auto-sync is held
   by every window that applies, a manual sync goes through those with `manualSync`. Filters:
-  *Needs a look* (out of sync, Degraded or a failed sync), *Out of sync*, *Degraded or failed*,
+  *Needs a look* (as the Overview's), *Out of sync*, *Degraded or failed*,
   *Running* (any of those picked), favorites, project, type (or *On a version tag*: the
   product's images all on a version tag such as `1.4.2` or `26-8-4-<sha>`, not a branch build),
   and a search, each word in turn, in the names, namespaces, clusters, project, server and image

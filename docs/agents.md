@@ -246,9 +246,10 @@ tools' definitions. What some of them need beyond the obvious verb:
   reaches its destination, marked when the agent's rules don't open it), when its next sync can
   start under its project's sync windows, and the app of apps that made it, those needing a look
   first with Argo CD's message. Filters: `server`, `search` (name, namespace, project,
-  destination), `problems_only` (a failed sync, an error, Degraded or Missing, a sync running, or
-  out of sync with auto-sync on; out of sync with auto-sync off is how an Application synced by
-  hand waits, not a problem), `out_of_sync`, `project`, `destination` (a context) and
+  destination), `problems_only` (what the Argo CD page's *Needs a look* keeps: a failed sync, an
+  error, Degraded or Missing with auto-sync on, a sync running for over 10 minutes, or out of
+  sync with auto-sync on; out of sync or Missing with auto-sync off is how an Application synced
+  by hand waits, not a problem), `out_of_sync`, `project`, `destination` (a context) and
   `dest_namespace`; `limit` and `offset` page through a big Argo CD. It shows the rows an Allow
   rule gives `list` on where they deploy, never asks for approval, and counts the others. It
   reads what the servers' feeds hold (no list of its own while a feed runs; one started for an
