@@ -10,7 +10,7 @@ use std::net::SocketAddr;
 /// that failed, a timeout, or else its last cause. None for any other error (the API server's
 /// answer, a login command...). No URL in it keeps its user and password.
 pub(super) fn connect_failure(e: &(dyn StdError + 'static)) -> Option<String> {
-    let causes: Vec<&(dyn StdError + 'static)> = std::iter::successors(Some(e), |c| c.source()).collect();
+    let causes: Vec<&(dyn StdError + 'static)> = std::iter::successors(Some(e), |c| (*c).source()).collect();
     if !causes.iter().any(|c| is_connect(*c)) {
         return None;
     }
