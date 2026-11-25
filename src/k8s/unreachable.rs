@@ -47,10 +47,15 @@ fn address(c: &(dyn StdError + 'static)) -> Option<SocketAddr> {
 }
 
 /// The TLS error of a handshake that failed: tokio-rustls hands it on inside an `io::Error`,
-/// whose `source` skips it.
+/// which the connector may wrap in another, and an `io::Error`'s `source` skips what it holds.
 fn tls(c: &(dyn StdError + 'static)) -> Option<String> {
-    let inner = c.downcast_ref::<std::io::Error>().and_then(|io| io.get_ref()).map(|e| e as &(dyn StdError + 'static));
-    [Some(c), inner].into_iter().flatten().find_map(|e| e.downcast_ref::<rustls::Error>()).map(ToString::to_string)
+    let mut e = c;
+    loop {
+        if let Some(tls) = e.downcast_ref::<rustls::Error>() {
+            return Some(tls.to_string());
+        }
+        e = e.downcast_ref::<std::io::Error>()?.get_ref()?;
+    }
 }
 
 fn io_kind(c: &(dyn StdError + 'static)) -> Option<std::io::ErrorKind> {
@@ -102,6 +107,10 @@ mod tests {
         });
         let e = client(&format!("https://127.0.0.1:{port}")).apiserver_version().await.unwrap_err();
         let said = short_error(&anyhow::Error::from(e));
+        // An io::Error held in another, as a connector may hand it on.
+        let rustls = std::io::Error::new(std::io::ErrorKind::InvalidData, rustls::Error::DecryptError);
+        let wrapped = std::io::Error::other(rustls);
+        assert_eq!(super::tls(&wrapped), Some(rustls::Error::DecryptError.to_string()));
         assert!(said.starts_with("TLS handshake with the API server failed: "), "{said}");
         assert!(!said.contains("client error"), "{said}");
     }
