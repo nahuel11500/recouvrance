@@ -847,6 +847,11 @@ pub fn lean(app: &Value) -> Value {
             urls.iter().filter(|u| u.as_str().is_some_and(crate::forwards::is_web_link)).cloned().collect();
         put(&mut out, &["status", "summary", "externalURLs"], Value::Array(web));
     }
+    // The images it runs: the list's tags, the product's images, the environment's workload.
+    if let Some(images) = app.pointer("/status/summary/images").and_then(Value::as_array) {
+        let images: Vec<Value> = images.iter().filter(|i| i.is_string()).cloned().collect();
+        put(&mut out, &["status", "summary", "images"], Value::Array(images));
+    }
     out
 }
 
@@ -2191,6 +2196,17 @@ users:
         full["status"]["summary"] =
             json!({"externalURLs": ["https://web.example", "search-ms:query=x", "file:///x", 3]});
         assert_eq!(lean(&full).pointer("/status/summary/externalURLs"), Some(&json!(["https://web.example"])));
+        // The images it runs are kept (#1132): the environments, the overview and the
+        // dashboard read them.
+        full["status"]["summary"]["images"] = json!(["registry.example/shop/api:main-0123456", 3]);
+        assert_eq!(
+            lean(&full).pointer("/status/summary/images"),
+            Some(&json!(["registry.example/shop/api:main-0123456"]))
+        );
+        assert_eq!(
+            super::ApiApp::of(&full).value.pointer("/status/summary/images").and_then(Value::as_array).map(Vec::len),
+            Some(1)
+        );
     }
 
     #[test]
