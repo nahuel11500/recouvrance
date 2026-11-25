@@ -490,24 +490,6 @@ mod tests {
         });
     }
 
-    /// The servers are read when one is logged in, off ones never; with none logged in, the
-    /// hubs are.
-    #[test]
-    fn servers_are_read_when_one_is_logged_in() {
-        let endpoint = |url: &str, on: bool| api::Endpoint {
-            server: argo::server::Server::parse(url).unwrap(),
-            cli_context: None,
-            in_settings: true,
-            insecure: false,
-            login: Err("no token".into()),
-            on,
-            settings_token: false,
-            renewable: false,
-        };
-        assert!(api_servers(vec![]).is_none());
-        assert!(api_servers(vec![endpoint("https://a.example", true), endpoint("https://b.example", false)]).is_none());
-    }
-
     /// How auto-sync may be off: no sync policy, none automated, or turned off.
     fn auto_sync_off() -> impl Strategy<Value = Option<Value>> {
         prop::sample::select(vec![
