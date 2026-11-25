@@ -867,7 +867,8 @@ mod tests {
         let mut later = app();
         later["status"]["history"].as_array_mut().unwrap().push(json!({"id": 3, "revision": "c".repeat(40),
             "source": {"repoURL": "https://git.example/r", "path": "web"}}));
-        assert_eq!(ops::patch(&later, &op).unwrap()["operation"]["sync"]["revision"], "a".repeat(40));
+        let Op::Rollback { id, .. } = op else { unreachable!() };
+        assert_eq!(ops::rollback_target(&later, id).unwrap()["revision"], "a".repeat(40));
     }
 
     #[test]
@@ -882,7 +883,7 @@ mod tests {
         later["status"]["resources"].as_array_mut().unwrap().push(
             json!({"kind": "ConfigMap", "namespace": "shop", "name": "more", "status": "OutOfSync", "requiresPruning": true}),
         );
-        assert!(ops::patch(&later, &op).unwrap_err().contains("ConfigMap shop/more"));
+        assert!(ops::refusal(&later, &op).unwrap().contains("ConfigMap shop/more"));
         // A dry run deletes nothing: said so.
         let mut dry = Op::Sync(SyncRequest { prune: true, dry_run: true, ..Default::default() });
         assert!(approval_detail(&app(), &mut dry).unwrap().starts_with("prune would delete 1"));

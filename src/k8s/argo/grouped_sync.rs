@@ -330,7 +330,7 @@ mod tests {
         assert_eq!(r.resources, [web.clone(), pruned[0].clone()], "what is out of sync, and what prune deletes");
         assert_eq!(r.prune_shown, Some(pruned), "prune deletes no more than was shown");
         assert_eq!(r.revision.as_deref(), Some("abc"), "pinned to the revision shown");
-        assert_eq!(ops::sync_patch(&r)["operation"]["sync"]["syncStrategy"], json!({"apply": {}}));
+        assert_eq!(ops::strategy(&r), json!({"apply": {}}));
         let r = Options { hooks: false, prune: false, dry_run: false }.request(&pinned).unwrap();
         assert_eq!(r.resources, [web], "without prune, what is to prune is not named");
         assert_eq!(
