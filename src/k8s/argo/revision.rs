@@ -62,7 +62,7 @@ mod tests {
         fn never_longer(s in "\\PC{0,80}", prefix in "[a-z][a-z0-9.]{0,15}-", sha in hex(40)) {
             let short = short_revision(&s);
             prop_assert!(short.len() <= s.len());
-            prop_assert_eq!(short_revision(&short), short.clone());
+            prop_assert_eq!(short_revision(&short), short);
             let tagged = short_revision(&format!("{prefix}{sha}"));
             prop_assert_eq!(&tagged, &format!("{prefix}{}", &sha[..7]));
             prop_assert!(tagged.len() <= 16 + 1 + 7);
