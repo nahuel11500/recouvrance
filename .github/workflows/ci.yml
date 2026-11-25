@@ -13,9 +13,11 @@ on:
     tags: ["v*"]
   workflow_dispatch:
 
+# A pull request's new push cancels its older run. On main a run is never cancelled: the tests
+# only run there, so each must finish; a newer push waits, and only the newest waiting run is kept.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
