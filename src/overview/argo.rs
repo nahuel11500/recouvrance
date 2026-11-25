@@ -1,6 +1,6 @@
 //! The Argo CD section: the Application that deployed the object, or those that deploy
-//! into the namespace, as read on Argo CD's cluster. On an Application's page, where it
-//! deploys, what is wrong with it, and the table of its resources.
+//! into the namespace, as read by Argo CD's API (or on Argo CD's cluster). On an
+//! Application's page, where it deploys, what is wrong with it, and the table of its resources.
 
 use std::rc::Rc;
 
@@ -173,12 +173,12 @@ fn header(ctx: &Ctx, ix: usize, found: &Found, cx: &App) -> Div {
                     }
                 }),
         )
-        .child(
-            div()
-                .text_xs()
-                .text_color(cx.theme().muted_foreground)
-                .child(selectable(format!("{}/{} on {}", app.namespace, app.name, found.hub.context))),
-        )
+        .child(div().text_xs().text_color(cx.theme().muted_foreground).child(selectable(format!(
+            "{}/{} on {}",
+            app.namespace,
+            app.name,
+            found.source.label()
+        ))))
         .child(div().flex_1())
         .children(app.urls.iter().take(3).enumerate().map(|(i, url)| {
             let url = url.clone();

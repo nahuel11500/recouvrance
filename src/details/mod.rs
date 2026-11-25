@@ -36,7 +36,7 @@ mod tabs;
 mod yaml_edit;
 
 pub(crate) use actions::*;
-pub(crate) use argo::{ArgoAction, OpenOn, OpenOnContext, confirm_api_action, confirm_argo_action};
+pub(crate) use argo::{ArgoAction, OpenOn, OpenOnContext, confirm_api_action};
 use browser::FileBrowser;
 pub(crate) use compare::{diff_block, preview_block, preview_scroll};
 pub(crate) use guard::*;
@@ -107,6 +107,39 @@ pub fn ensure_writes(window: &mut Window, cx: &mut App) -> bool {
             })
     });
     false
+}
+
+/// True when writes are on; otherwise offers to turn them on for an action by Argo CD's API,
+/// saying what it is (`what`: `sync 17 Applications`) and on which Argo CD server: it goes
+/// with the user's Argo CD login, not their kubeconfig. Returns false then.
+pub fn ensure_argo_writes(what: &str, server: &str, window: &mut Window, cx: &mut App) -> bool {
+    if writes_enabled(cx) {
+        return true;
+    }
+    let text = argo_writes_text(what, server);
+    window.open_alert_dialog(cx, move |alert, _, _| {
+        alert
+            .title("Turn writes on for Argo CD?")
+            .description(text.clone())
+            .show_cancel(true)
+            .ok_text("Turn writes on")
+            .on_ok(|_, _, cx| {
+                set_writes(true, cx);
+                cx.refresh_windows();
+                true
+            })
+    });
+    false
+}
+
+/// What the prompt of [`ensure_argo_writes`] says.
+fn argo_writes_text(what: &str, server: &str) -> String {
+    format!(
+        "Recouvrance is read-only. Turning writes on lets you {what} on {server}, through Argo CD's API with your \
+         Argo CD login: Argo CD applies it with its own access, not your kubeconfig. Write mode is the app's: until \
+         you turn it off, the clusters' write actions (scale, delete, edit, shells, plugins) are on too. Every \
+         action still asks for confirmation."
+    )
 }
 
 /// Whether the window may write to `context`: not when it is read-only (Settings →
@@ -1465,6 +1498,16 @@ impl Drop for DetailPanel {
 mod tests {
     use super::{DetailTab, LinksRead, links_due, new_uid, own_pod_logs, stale_read, tab_named, version_of};
     use serde_json::json;
+
+    /// The prompt for an Argo CD action says what it is, on which server, and that it goes with
+    /// the Argo CD login, not the kubeconfig; and that write mode is the whole app's.
+    #[test]
+    fn the_argo_cd_prompt_says_what_it_allows() {
+        let t = super::argo_writes_text("sync 17 Applications", "argocd.example.com");
+        assert!(t.contains("sync 17 Applications on argocd.example.com"), "{t}");
+        assert!(t.contains("Argo CD login") && t.contains("not your kubeconfig"), "{t}");
+        assert!(t.contains("Write mode is the app's"), "{t}");
+    }
 
     /// What a page links to is read again when the object or its pods changed, and otherwise
     /// once in a while (a new Service changes neither): never at every turn for nothing.

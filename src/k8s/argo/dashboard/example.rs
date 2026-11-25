@@ -2,7 +2,8 @@
 //! developer tools' snapshots show its dashboard (`RECOUVRANCE_ACT=page:argo,argo-example`),
 //! and the tests read its cards.
 //!
-//! - `example-staging`: synced and healthy, deployed by auto-sync;
+//! - `example-staging`: synced and healthy, deployed by auto-sync; ten images, most of them
+//!   tagged by branch and commit (`main-<sha>`), as CI often tags them;
 //! - `example-prod`: out of sync (auto-sync off), Degraded: a worker crash-loops, another's
 //!   pod is Pending, an autoscaler has no metric; the last deployment bumped two images;
 //! - `example-sandbox`: its last sync failed (an invalid Deployment).
@@ -22,6 +23,16 @@ const REGISTRY: &str = "registry.example.com/shop";
 /// The tag of `api` and `worker` running; `worker-mail` stays on its own.
 const TAG: &str = "1.5.0";
 const MAIL_TAG: &str = "1.4.1";
+/// The images staging runs besides those three, tagged by branch and commit.
+const STAGING_EXTRA: [(&str, &str); 7] = [
+    ("admin", "main-eab9300daf858b46f4c0e5a983b5474428e9096c"),
+    ("cart", "main-3f1c2b9a8d7e6f5a4b3c2d1e0f9a8b7c6d5e4f3a"),
+    ("checkout", "release-2024-11-7c6d5e4f3a2b1c0d9e8f7a6b5c4d3e2f1a0b9c8d"),
+    ("search-indexer", "main-0a1b2c3d4e5f60718293a4b5c6d7e8f9a0b1c2d3"),
+    ("notifications", "2.14.3"),
+    ("payments-gateway", "main-9e8d7c6b5a4f3e2d1c0b9a8f7e6d5c4b3a291807"),
+    ("frontend", "feature-new-basket-1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c"),
+];
 
 fn at(now: Timestamp, secs_ago: i64) -> String {
     Timestamp::from_second(now.as_second() - secs_ago).unwrap_or(now).to_string()
@@ -127,7 +138,10 @@ pub fn app(env: &str, now: Timestamp) -> Value {
         })
     };
     let policy = if prod { json!({}) } else { json!({"automated": {"prune": true}}) };
-    let images = [image("api", TAG), image("worker", TAG), image("worker-mail", MAIL_TAG)];
+    let mut images = vec![image("api", TAG), image("worker", TAG), image("worker-mail", MAIL_TAG)];
+    if env == "example-staging" {
+        images.extend(STAGING_EXTRA.iter().map(|(c, t)| image(c, t)));
+    }
     json!({
         "metadata": {"name": env, "namespace": "argocd", "resourceVersion": "4242",
             "labels": {"app.kubernetes.io/part-of": "shop"}},

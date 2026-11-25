@@ -8,6 +8,7 @@
 
 use std::collections::HashSet;
 use std::fmt::Write as _;
+use std::sync::Arc;
 use std::time::Duration;
 
 use futures::StreamExt as _;
@@ -21,7 +22,7 @@ use serde_json::Value;
 use crate::history::{self, DiffLine};
 use crate::json::{arr_at, nonempty_at, str_at};
 use crate::k8s::argo::ops::SyncRequest;
-use crate::k8s::argo::{self, diagnosis};
+use crate::k8s::argo::{self, api, diagnosis};
 use crate::k8s::{self, Cascade, Kind, ObjectRef, rollouts};
 use crate::plural;
 
@@ -173,7 +174,8 @@ pub(crate) enum Plan {
     Apply { client: Client, objects: Vec<Object> },
     /// `gitops` `sync` of an Argo CD Application, with its options; `app` when it was read
     /// already (to bind what a prune deletes to what is shown), so it isn't read twice.
-    Sync { client: Client, kind: Kind, ns: String, name: String, req: SyncRequest, app: Option<Value> },
+    /// It is read through Argo CD's API, from its server.
+    Sync { endpoint: Arc<api::Endpoint>, ns: String, name: String, req: SyncRequest, app: Option<Value> },
     /// `delete_resource`: the object, and what goes with it (or stays, with `cascade`).
     Delete { client: Client, kind: Kind, ns: Option<String>, name: String, cascade: Option<Cascade> },
     /// `evict_pod`: not a plain delete, a budget may refuse it.
@@ -225,10 +227,10 @@ async fn work_out(plan: &Plan) -> Preview {
         }
         Plan::Apply { client, objects } => Preview::of(applied(client, objects).await),
         Plan::Sync { app: Some(app), req, .. } => Preview::of(vec![sync_section(app, req)]),
-        Plan::Sync { client, kind, ns, name, req, app: None } => {
-            match super::server::get_named(client, kind, Some(ns.as_str()), name, false).await {
+        Plan::Sync { endpoint, ns, name, req, app: None } => {
+            match api::read_app(endpoint.clone(), ns.clone(), name.clone()).await {
                 Ok(app) => Preview::of(vec![sync_section(&app, req)]),
-                Err(e) => unread(&object_label(kind, Some(ns.as_str()), name), &e),
+                Err(e) => Preview::unavailable(format!("reading Application {ns}/{name} failed: {e}")),
             }
         }
         Plan::Delete { client, kind, ns, name, cascade } => deleted(client, kind, ns.as_deref(), name, *cascade).await,
@@ -851,7 +853,7 @@ mod tests {
         assert_eq!(
             s.lines,
             [
-                "revision: aaaaaaaa deployed → bbbbbbbb",
+                "revision: aaaaaaa deployed → bbbbbbb",
                 "target revision: main (read again when the sync starts)",
                 "auto-sync: off",
                 "out of sync: 3 resources",

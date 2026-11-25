@@ -182,6 +182,10 @@ impl AppView {
             this.show_detail_on(ev.context.clone(), ev.client.clone(), ev.obj.clone(), window, cx);
         })
         .detach();
+        cx.subscribe_in(&panel, window, |this, _, ev: &crate::ui::argo::OpenArgoApp, window, cx| {
+            this.show_argo_app(ev, window, cx);
+        })
+        .detach();
         cx.subscribe_in(&panel, window, move |this, asker, ev: &crate::details::OpenOn, window, cx| {
             this.open_on(ev.context.clone(), ev.res.clone(), Some(own.clone()), asker.entity_id(), window, cx);
         })
@@ -245,8 +249,9 @@ impl AppView {
         });
     }
 
-    /// Open an Argo CD Application on its hub from the Problems page: with the client the hub
-    /// was found with, else connected anew (released with the page).
+    /// Open an Argo CD Application from the Problems page: one read by Argo CD's API on the
+    /// Argo CD page's dashboard; one read on its hub there, with the client the hub was found
+    /// with, else connected anew (released with the page).
     pub(super) fn follow_hub_links(
         &mut self,
         page: &Entity<crate::ui::problems_view::ProblemsView>,
@@ -258,10 +263,21 @@ impl AppView {
             this.open_on(ev.context.clone(), ev.res.clone(), own, page.entity_id(), window, cx);
         })
         .detach();
+        cx.subscribe_in(page, window, |this, _, ev: &crate::ui::argo::OpenArgoApp, window, cx| {
+            this.show_argo_app(ev, window, cx);
+        })
+        .detach();
     }
 
-    /// Open an Application (on Argo CD's cluster) or where it deploys, from the Argo CD page
-    /// (also after F5).
+    /// Open the Argo CD page on an Application's dashboard (one read by Argo CD's API).
+    fn show_argo_app(&mut self, ev: &crate::ui::argo::OpenArgoApp, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_argo(window, cx);
+        if let Route::Argo(argo) = self.route().clone() {
+            argo.update(cx, |argo, cx| argo.show_app(ev, cx));
+        }
+    }
+
+    /// Open where an Application deploys, from the Argo CD page (also after F5).
     pub(super) fn subscribe_argo(
         &mut self,
         page: &Entity<crate::ui::argo::ArgoView>,
@@ -269,10 +285,6 @@ impl AppView {
         cx: &mut Context<Self>,
     ) {
         // Released with the page.
-        cx.subscribe_in(page, window, |this, _, ev: &crate::details::OpenOnContext, window, cx| {
-            this.show_detail_on(ev.context.clone(), ev.client.clone(), ev.obj.clone(), window, cx);
-        })
-        .detach();
         cx.subscribe_in(page, window, |this, page, ev: &crate::details::OpenOn, window, cx| {
             this.open_on(ev.context.clone(), ev.res.clone(), None, page.entity_id(), window, cx);
         })

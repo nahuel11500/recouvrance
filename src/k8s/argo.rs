@@ -24,12 +24,15 @@ pub mod api;
 pub mod connect;
 pub mod dashboard;
 pub mod diagnosis;
+pub mod environments;
 pub mod grouped_diff;
 pub mod grouped_sync;
 pub mod grouping;
 pub mod journal;
 pub mod ops;
+mod revision;
 pub mod server;
+pub mod steps;
 pub mod sync_diff;
 pub mod windows;
 
@@ -314,6 +317,11 @@ pub struct Summary {
     pub operation: Option<(String, Option<String>, Option<String>)>,
     /// An operation is running or waiting to start (`operation` is set): it can be terminated.
     pub in_progress: bool,
+    /// The last operation: when it started, who started it (`dashboard::who`), the revision(s) it
+    /// synced to (short).
+    pub operation_started: Option<String>,
+    pub operation_by: Option<String>,
+    pub operation_revision: Option<String>,
     /// The last deployments, newest first.
     pub history: Vec<Deployment>,
     /// Conditions as (type, message): errors and warnings Argo CD reports.
@@ -325,16 +333,15 @@ pub struct Summary {
     pub own: Option<(String, String, Option<String>)>,
     /// Its labels, sorted by key.
     pub labels: Vec<(String, String)>,
+    /// The images it runs, as Argo CD sums them up (`status.summary.images`).
+    pub images: Vec<String>,
     /// Its destination as written: the server URL, the cluster name, the namespace.
     pub dest_server: String,
     pub dest_name: String,
     pub dest_namespace: String,
 }
 
-/// A revision as shown: a git sha cut to 8 characters, anything else (a chart version) whole.
-pub fn short_revision(rev: &str) -> String {
-    if rev.len() == 40 && rev.chars().all(|c| c.is_ascii_hexdigit()) { rev[..8].to_string() } else { rev.to_string() }
-}
+pub use revision::short_revision;
 
 /// `status.sync.revision`, or each of `status.sync.revisions` (several sources).
 pub(crate) fn revisions(v: &Value) -> Option<String> {
@@ -420,6 +427,12 @@ impl Summary {
             revision: app.pointer("/status/sync").and_then(revisions),
             operation,
             in_progress: ops::in_progress(app),
+            operation_started: s("/status/operationState/startedAt"),
+            operation_by: app.pointer("/status/operationState/operation/initiatedBy").and_then(dashboard::who),
+            operation_revision: app
+                .pointer("/status/operationState/syncResult")
+                .and_then(revisions)
+                .or_else(|| app.pointer("/status/operationState/operation/sync").and_then(revisions)),
             history,
             conditions,
             urls,
@@ -431,6 +444,14 @@ impl Summary {
                 .into_iter()
                 .flatten()
                 .filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_string())))
+                .collect(),
+            images: app
+                .pointer("/status/summary/images")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(String::from)
                 .collect(),
             dest_server: s("/spec/destination/server").unwrap_or_default(),
             dest_name: s("/spec/destination/name").unwrap_or_default(),
@@ -716,57 +737,6 @@ pub async fn hubs(connected: Vec<(String, Client)>) -> Hubs {
     .unwrap_or_default()
 }
 
-/// The contexts found serving Applications this session (by a page that looked for them),
-/// sorted. No request.
-pub fn known_hubs() -> Vec<String> {
-    let probes = PROBES.lock().unwrap_or_else(PoisonError::into_inner);
-    let mut hubs: Vec<String> =
-        probes.iter().filter(|(_, p)| matches!(p, Probe::Serves(_))).map(|(c, _)| c.clone()).collect();
-    hubs.sort();
-    hubs
-}
-
-/// The contexts an agent's read failed to reach, why, and when: left alone `RETRY`, as the
-/// probes are, so a hub that is down doesn't make every agent call wait for it again.
-static UNREACHED: LazyLock<Mutex<HashMap<String, (String, Instant)>>> = LazyLock::new(Default::default);
-
-/// Say an agent's read could not reach `context`.
-pub fn note_unreached(context: &str, why: String) {
-    UNREACHED.lock().unwrap_or_else(PoisonError::into_inner).insert(context.to_string(), (why, Instant::now()));
-}
-
-/// Say an agent's read reached `context`.
-pub fn note_reached(context: &str) {
-    UNREACHED.lock().unwrap_or_else(PoisonError::into_inner).remove(context);
-}
-
-/// Why `context` is not asked again yet: an agent's read failed to reach it less than
-/// `RETRY` before `now`, or (with `probes`) so did a probe of the window's pages.
-pub fn recent_failure(context: &str, probes: bool, now: Instant) -> Option<String> {
-    let fresh = |at: &Instant| now.saturating_duration_since(*at) < RETRY;
-    if probes
-        && let Some(Probe::Failed(why, at)) = PROBES.lock().unwrap_or_else(PoisonError::into_inner).get(context)
-        && fresh(at)
-    {
-        return Some(why.clone());
-    }
-    let unreached = UNREACHED.lock().unwrap_or_else(PoisonError::into_inner);
-    unreached.get(context).filter(|(_, at)| fresh(at)).map(|(why, _)| why.clone())
-}
-
-/// Ask one context whether it serves Applications, now (its login may run): Ok(true) when it
-/// does. What it answered is kept, as for the contexts asked on their own.
-pub async fn check_hub(context: String) -> Result<bool, String> {
-    let (context, answer) =
-        super::run(async move { Ok(probe(context, None).await) }).await.map_err(|e| format!("{e:#}"))?;
-    PROBES.lock().unwrap_or_else(PoisonError::into_inner).insert(context, answer.clone());
-    match answer {
-        Probe::Serves(_) => Ok(true),
-        Probe::No => Ok(false),
-        Probe::Failed(why, _) => Err(why),
-    }
-}
-
 // MARK: Reading Applications
 
 type Lists = HashMap<String, (Instant, Arc<Vec<Value>>)>;
@@ -1023,10 +993,10 @@ async fn get_application(hub: &Hub, ns: &str, name: &str) -> Result<Value> {
     super::get_object(hub.client.clone(), obj).await
 }
 
-/// An Application found, with the hub it was read on.
+/// An Application found, with where it was read: Argo CD's API, or a hub.
 #[derive(Clone)]
 pub struct Found {
-    pub hub: Hub,
+    pub source: Source,
     pub app: Summary,
 }
 
@@ -1054,7 +1024,155 @@ pub async fn for_object(
     obj: Value,
 ) -> Lookup {
     // Off the UI thread: a hub's Applications can be many and big.
-    super::run(async move { Ok(object_lookup(connected, here, group, kind, obj).await) }).await.unwrap_or_default()
+    let read = async move {
+        let Some(by) = tracked_by(&group, &kind, &obj) else { return Ok(Lookup::default()) };
+        let api = api_object_lookup(&here, &by, &group, &kind, &obj).await;
+        if let Some(found) = api.as_ref().filter(|l| !l.apps.is_empty()) {
+            return Ok(found.clone());
+        }
+        // Hubs stay a second source until the Argo CD page reads only Argo CD's API (#1054).
+        let hub = object_lookup(connected, here, group, kind, obj).await;
+        Ok(match api {
+            Some(api) if hub.apps.is_empty() => api,
+            _ => hub,
+        })
+    };
+    super::run(read).await.unwrap_or_default()
+}
+
+/// The longest wait for an Argo CD server's first list in a lookup (one that failed answers
+/// at once: see `api::held_apps`), and for an Application read whole.
+const API_WAIT: Duration = PROBE_TIMEOUT;
+
+/// Whether the Application `app`, read by Argo CD's API, is the one `by` names: a tracking id
+/// names it by name, and by namespace when it gives one; an instance label by name.
+pub fn names_app(by: &TrackedBy, app: &Summary) -> bool {
+    match by {
+        TrackedBy::Id(t) => app.name == t.app && t.app_ns.as_ref().is_none_or(|ns| *ns == app.namespace),
+        TrackedBy::Label(l) => app.name == *l,
+    }
+}
+
+/// Whether an Application `by` names deployed the object: by a tracking id, when it deploys to
+/// the object's cluster (`here`) or tracks the object; by a label (Helm sets it too), when it
+/// does both.
+pub fn fits(by: &TrackedBy, here: Option<bool>, tracks: bool) -> bool {
+    match by {
+        TrackedBy::Id(_) => here == Some(true) || tracks,
+        TrackedBy::Label(_) => here == Some(true) && tracks,
+    }
+}
+
+/// An Application named for an object, read by Argo CD's API.
+pub struct ApiCandidate {
+    pub endpoint: Arc<api::Endpoint>,
+    /// The Application whole, or what the feed holds of it when it couldn't be read whole.
+    pub app: Value,
+    /// It deploys to the object's cluster; None when that can't be told (`app_deploys_to`).
+    pub here: Option<bool>,
+    /// Its `status.resources` lists the object.
+    pub tracks: bool,
+}
+
+/// What the Argo CD servers say of the object `obj` (of `group`/`kind`, on the context `here`)
+/// that `by` names an Application for: the Applications of that name found in the feeds
+/// (`api::held_apps`, no list of their own), each read whole (its resources say whether it
+/// tracks the object), and why some servers said nothing. A label (Helm sets it too) leaves
+/// out at once those that deploy elsewhere. Only the servers `use_server` accepts are read,
+/// with `start` (a feed started when none runs), and the Applications `may_read` lets through
+/// (their server, the Application): the others are said.
+/// None when no server is set, logged in to or turned on.
+pub async fn api_candidates(
+    here: &str,
+    by: &TrackedBy,
+    obj: (&str, &str, &Value),
+    use_server: impl Fn(&str) -> bool,
+    start: bool,
+    may_read: impl Fn(&api::Endpoint, &Summary) -> bool,
+) -> Option<(Vec<ApiCandidate>, Vec<String>, Vec<String>)> {
+    let (group, kind, obj) = obj;
+    let ns = obj.pointer("/metadata/namespace").and_then(Value::as_str).unwrap_or_default();
+    let name = obj.pointer("/metadata/name").and_then(Value::as_str).unwrap_or_default();
+    let targets = targets();
+    let here = target(&targets, here);
+    let servers = crate::settings::with(|s| s.argocd_servers.clone());
+    let at = |e: &api::Endpoint| server_home(&servers, &e.server.base, &targets);
+    let held = api::held_apps(use_server, start, API_WAIT, |e, a| {
+        names_app(by, &a.summary)
+            && (matches!(by, TrackedBy::Id(_)) || app_deploys_to(&a.value, &at(e), &here) != Some(false))
+    })
+    .await;
+    if held.is_empty() {
+        return None;
+    }
+    let (mut notes, mut read, mut wanted) = (Vec::new(), Vec::new(), Vec::new());
+    for h in held {
+        let server = h.endpoint.name();
+        match h.apps {
+            Err(e) => notes.push(format!("{server}: {e}")),
+            Ok(apps) => {
+                for a in apps {
+                    if may_read(&h.endpoint, &a.summary) {
+                        wanted.push((h.endpoint.clone(), a));
+                    } else {
+                        let (ns, name) = (&a.summary.namespace, &a.summary.name);
+                        notes.push(format!("{server}: your rules don't let you read Application {ns}/{name}"));
+                    }
+                }
+                read.push(server);
+            }
+        }
+    }
+    // Each read whole, all at once, each bounded: one slow server holds no other.
+    let whole = futures::future::join_all(wanted.iter().map(|(e, a)| {
+        let get = api::read_app(e.clone(), a.summary.namespace.clone(), a.summary.name.clone());
+        async move { tokio::time::timeout(API_WAIT, get).await.unwrap_or_else(|_| Err("did not answer".into())) }
+    }))
+    .await;
+    let mut found = Vec::new();
+    for ((endpoint, held), whole) in wanted.into_iter().zip(whole) {
+        let app = match whole {
+            Ok(app) => app,
+            // A label is only a hint: without the Application's resources, it says nothing.
+            Err(_) if matches!(by, TrackedBy::Label(_)) => continue,
+            Err(e) => {
+                let (ns, name) = (&held.summary.namespace, &held.summary.name);
+                notes.push(format!("{}: Application {ns}/{name} could not be read whole: {e}", endpoint.name()));
+                held.value.clone()
+            }
+        };
+        let here = app_deploys_to(&app, &at(&endpoint), &here);
+        let tracks = resource_of(&app, group, kind, ns, name).is_some();
+        found.push(ApiCandidate { endpoint, app, here, tracks });
+    }
+    Some((found, notes, read))
+}
+
+/// [`for_object`] on Argo CD's API servers; None when there is none to read.
+async fn api_object_lookup(here: &str, by: &TrackedBy, group: &str, kind: &str, obj: &Value) -> Option<Lookup> {
+    let (found, errors, read) = api_candidates(here, by, (group, kind, obj), |_| true, true, |_, _| true).await?;
+    let ns = obj.pointer("/metadata/namespace").and_then(Value::as_str).unwrap_or_default();
+    let name = obj.pointer("/metadata/name").and_then(Value::as_str).unwrap_or_default();
+    let summary = |c: &ApiCandidate| {
+        let mut s = Summary::of(&c.app).with_own(&c.app, group, kind, ns, name);
+        if s.namespace.is_empty() {
+            s.namespace = DEFAULT_NAMESPACE.into();
+        }
+        Found { source: Source::Api(c.endpoint.clone()), app: s }
+    };
+    let mut apps: Vec<Found> = found.iter().filter(|c| fits(by, c.here, c.tracks)).map(summary).collect();
+    // The only one of that name, whose destination can't be told: it can only be it.
+    if apps.is_empty() && matches!(by, TrackedBy::Id(_)) && found.len() == 1 && found[0].here.is_none() {
+        apps = found.iter().map(summary).collect();
+    }
+    let note = match (by, apps.is_empty(), errors.is_empty()) {
+        (_, _, false) => Some(format!("Argo CD could not be read: {}", errors.join("; "))),
+        (TrackedBy::Id(t), true, true) => {
+            Some(format!("Deployed by Argo CD Application {}, which is not on {}", t.app, read.join(", ")))
+        }
+        _ => None,
+    };
+    Some(Lookup { apps, note })
 }
 
 async fn object_lookup(
@@ -1131,7 +1249,7 @@ async fn object_lookup(
         };
         for app in apps {
             let here_too = targets_cluster(&app, &hub_target, &here);
-            found.push((here_too, Found { hub: hub.clone(), app: own(Summary::of(&app), &app) }));
+            found.push((here_too, Found { source: Source::Hub(hub.clone()), app: own(Summary::of(&app), &app) }));
         }
     }
     // Several hubs may hold an Application of that name: keep those deploying here, else
@@ -1154,7 +1272,55 @@ async fn object_lookup(
 /// The Applications that deploy into this namespace of the context `here`. Quiet when no
 /// context serves Argo CD.
 pub async fn for_namespace(connected: Vec<(String, Client)>, here: String, ns: String) -> Lookup {
-    super::run(async move { Ok(namespace_lookup(connected, here, ns).await) }).await.unwrap_or_default()
+    let read = async move {
+        let api = api_namespace_lookup(&here, &ns).await;
+        if let Some(found) = api.as_ref().filter(|l| !l.apps.is_empty()) {
+            return Ok(found.clone());
+        }
+        // Hubs stay a second source until the Argo CD page reads only Argo CD's API (#1054).
+        let hub = namespace_lookup(connected, here, ns).await;
+        Ok(match api {
+            Some(api) if hub.apps.is_empty() => api,
+            _ => hub,
+        })
+    };
+    super::run(read).await.unwrap_or_default()
+}
+
+/// [`for_namespace`] on Argo CD's API servers, from what their feeds hold: those whose
+/// destination is this namespace of this cluster. None when there is no server to read.
+async fn api_namespace_lookup(here: &str, ns: &str) -> Option<Lookup> {
+    let targets = targets();
+    let here = target(&targets, here);
+    let servers = crate::settings::with(|s| s.argocd_servers.clone());
+    let held = api::held_apps(
+        |_| true,
+        true,
+        API_WAIT,
+        |e, a| {
+            targets_namespace(&a.value, ns)
+                && targets_cluster(&a.value, &server_home(&servers, &e.server.base, &targets), &here)
+        },
+    )
+    .await;
+    if held.is_empty() {
+        return None;
+    }
+    let mut lookup = Lookup::default();
+    let mut errors = Vec::new();
+    for h in held {
+        match h.apps {
+            Ok(apps) => lookup
+                .apps
+                .extend(apps.iter().map(|a| Found { source: Source::Api(h.endpoint.clone()), app: a.summary.clone() })),
+            Err(e) => errors.push(format!("{}: {e}", h.endpoint.name())),
+        }
+    }
+    lookup.apps.sort_by(|a, b| (&a.app.name, a.source.label()).cmp(&(&b.app.name, b.source.label())));
+    if !errors.is_empty() {
+        lookup.note = Some(format!("Argo CD could not be read: {}", errors.join("; ")));
+    }
+    Some(lookup)
 }
 
 async fn namespace_lookup(connected: Vec<(String, Client)>, here: String, ns: String) -> Lookup {
@@ -1169,12 +1335,12 @@ async fn namespace_lookup(connected: Vec<(String, Client)>, here: String, ns: St
             Ok(list) => lookup.apps.extend(
                 list.iter()
                     .filter(|a| targets_cluster(a, &hub_target, &here) && targets_namespace(a, &ns))
-                    .map(|a| Found { hub: hub.clone(), app: Summary::of(a) }),
+                    .map(|a| Found { source: Source::Hub(hub.clone()), app: Summary::of(a) }),
             ),
             Err(e) => errors.push(format!("{}: {}", hub.context, super::lists::load_error(&e))),
         }
     }
-    lookup.apps.sort_by(|a, b| (&a.app.name, &a.hub.context).cmp(&(&b.app.name, &b.hub.context)));
+    lookup.apps.sort_by(|a, b| (&a.app.name, a.source.label()).cmp(&(&b.app.name, b.source.label())));
     if !errors.is_empty() {
         lookup.note = Some(format!("Argo CD could not be read: {}", errors.join("; ")));
     }
@@ -1275,7 +1441,8 @@ pub fn parents<V: Borrow<Value>>(apps: &[V]) -> Vec<Option<usize>> {
         .collect()
 }
 
-/// Where an Application of the page was read: on a hub's Kubernetes API, or Argo CD's own.
+/// Where an object's Application was read (`Found`): on a hub's Kubernetes API, or Argo CD's
+/// own. The Applications page reads only the API (`FleetApp::server`).
 #[derive(Clone)]
 pub enum Source {
     Hub(Hub),
@@ -1298,11 +1465,14 @@ pub type ProjectWindows = Arc<std::collections::BTreeMap<String, Vec<windows::Sy
 /// One Application of the Applications page.
 #[derive(Clone)]
 pub struct FleetApp {
-    pub source: Source,
-    /// Its Argo CD, the same whichever way it is read (see `grouping::hub_instance`).
+    /// The Argo CD API server it is read from.
+    pub server: Arc<api::Endpoint>,
+    /// Its Argo CD (`api::Endpoint::instance`).
     pub instance: String,
     pub app: Summary,
     pub dest: Destination,
+    /// Its destination cluster as Argo CD names it (see `cluster_name`).
+    pub cluster: String,
     /// The context its destination is shown on (a connected one first), if any reaches it.
     pub on: Option<String>,
     /// The Application that made it (an app of apps), as an index in the fleet.
@@ -1320,14 +1490,12 @@ fn resource_version(app: &Value) -> String {
 #[derive(Clone, Default)]
 pub struct Fleet {
     pub apps: Vec<FleetApp>,
-    /// "context: why", for each hub not read and each context that could not be checked.
+    /// "server: why", for each Argo CD server that could not be read.
     pub errors: Vec<String>,
-    /// The hubs found, read or not.
-    pub hubs: Vec<String>,
-    /// With no hub: the contexts not asked because their login may prompt, likeliest first.
-    pub not_asked: Vec<String>,
     /// The Argo CD API servers read (see `api`), by name.
     pub servers: Vec<String>,
+    /// Those of `servers` whose first list is still being read (none failed yet), by name.
+    pub reading: Vec<String>,
     /// Each Argo CD's projects' sync windows (by `instance`), or why they couldn't be read.
     pub projects: HashMap<String, Result<ProjectWindows, String>>,
     /// The API servers whose login is missing, expired or refused: their address, and whether
@@ -1359,110 +1527,24 @@ impl Fleet {
     }
 }
 
-/// Every Application, read with one list per hub (kept `LIST_TTL`, shared with the pages'
-/// Argo CD sections). One hub that can't be read is reported; the others are shown.
-pub async fn fleet(connected: Vec<(String, Client)>) -> Fleet {
-    super::run(async move { Ok(read_fleet(connected).await) })
-        .await
-        .unwrap_or_else(|e| Fleet { errors: vec![format!("Argo CD could not be read: {e:#}")], ..Default::default() })
+/// The cluster an Argo CD API server at `base` runs on, which its Applications' `in-cluster`
+/// destination is: the hub context whose Argo CD server it is (`servers`), if one is set;
+/// else none, which no context matches.
+pub fn server_home(
+    servers: &std::collections::BTreeMap<String, String>,
+    base: &str,
+    targets: &[ContextTarget],
+) -> ContextTarget {
+    server::contexts_of(servers, base).next().map_or_else(ContextTarget::default, |c| target(targets, c))
 }
 
-async fn read_fleet(connected: Vec<(String, Client)>) -> Fleet {
-    let names: Vec<String> = connected.iter().map(|(n, _)| n.clone()).collect();
-    let hubs = hubs(connected).await;
-    let targets = targets();
+/// The contexts among `targets` that reach the destination of `app`, read from `endpoint`:
+/// its `in-cluster` is the cluster that server runs on, when known (`server_home`).
+pub fn api_contexts(endpoint: &api::Endpoint, app: &Summary, targets: &[ContextTarget]) -> Vec<String> {
     let servers = crate::settings::with(|s| s.argocd_servers.clone());
-    let lists = futures::future::join_all(
-        hubs.found.iter().map(|hub| async move { (hub, futures::join!(applications(hub), projects(hub))) }),
-    )
-    .await;
-    let mut fleet = Fleet {
-        errors: hubs.failed.iter().map(|(c, e)| format!("{c}: {e}")).collect(),
-        hubs: hubs.found.iter().map(|h| h.context.clone()).collect(),
-        not_asked: hubs.not_asked.clone(),
-        ..Default::default()
-    };
-    let mut instances = std::collections::HashSet::new();
-    for (hub, (list, project_windows)) in lists {
-        let instance = grouping::hub_instance(&hub.context, &servers);
-        // Two contexts of one Argo CD (the same server set for both): read once.
-        if !instances.insert(instance.clone()) {
-            continue;
-        }
-        let list = match list {
-            Ok(list) => list,
-            Err(e) => {
-                fleet.errors.push(format!("{}: {}", hub.context, super::lists::load_error(&e)));
-                continue;
-            }
-        };
-        let hub_target = target(&targets, &hub.context);
-        fleet.projects.insert(instance.clone(), project_windows);
-        let base = fleet.apps.len();
-        for (app, parent) in list.iter().zip(parents(list.as_slice())) {
-            journal::observe(&instance, app);
-            let dest = destination(app, &hub_target, &targets);
-            let on = dest.context(&names).map(String::from);
-            fleet.apps.push(FleetApp {
-                source: Source::Hub(hub.clone()),
-                instance: instance.clone(),
-                app: Summary::of(app),
-                dest,
-                on,
-                parent: parent.map(|p| base + p),
-                version: resource_version(app),
-            });
-        }
-    }
-    fleet
-}
-
-/// Argo CD's projects kind.
-fn project_kind() -> ApiResource {
-    ApiResource {
-        group: "argoproj.io".into(),
-        version: "v1alpha1".into(),
-        api_version: "argoproj.io/v1alpha1".into(),
-        kind: "AppProject".into(),
-        plural: "appprojects".into(),
-    }
-}
-
-/// How long a hub's projects (their sync windows) are kept before being listed again.
-const PROJECTS_TTL: Duration = Duration::from_secs(300);
-
-/// A hub's projects' sync windows: one list, kept `PROJECTS_TTL`. When this login may not
-/// list them across namespaces, those of Argo CD's own namespace (where projects live).
-async fn projects(hub: &Hub) -> Result<ProjectWindows, String> {
-    type Kept = HashMap<String, (Instant, Result<ProjectWindows, String>)>;
-    static KEPT: LazyLock<Mutex<Kept>> = LazyLock::new(Default::default);
-    let kept = KEPT
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .get(&hub.context)
-        .filter(|(at, _)| at.elapsed() < PROJECTS_TTL)
-        .map(|(_, kept)| kept.clone());
-    if let Some(kept) = kept {
-        return kept;
-    }
-    let all = super::list_values(hub.client.clone(), project_kind(), None, None).await;
-    let listed = match all {
-        Err(e) if super::api_status(&e) == Some(403) => {
-            super::list_values(hub.client.clone(), project_kind(), Some(DEFAULT_NAMESPACE.into()), None).await
-        }
-        other => other,
-    };
-    let read = listed
-        .map(|list| {
-            let by_name: std::collections::BTreeMap<String, Vec<windows::SyncWindow>> = list
-                .iter()
-                .filter_map(|p| Some((p.pointer("/metadata/name")?.as_str()?.to_string(), windows::windows_of(p))))
-                .collect();
-            Arc::new(by_name)
-        })
-        .map_err(|e| format!("its projects can't be read: {}", super::lists::load_error(&e)));
-    KEPT.lock().unwrap_or_else(PoisonError::into_inner).insert(hub.context.clone(), (Instant::now(), read.clone()));
-    read
+    let home = server_home(&servers, &endpoint.server.base, targets);
+    let (server, name) = (Some(app.dest_server.as_str()), Some(app.dest_name.as_str()));
+    targets.iter().filter(|t| deploys_to(server, name, &home, t)).map(|t| t.name.clone()).collect()
 }
 
 /// What a page has read of one Argo CD API server.
@@ -1471,70 +1553,95 @@ pub struct ApiRead {
     pub state: api::FeedState,
 }
 
-/// Add the Applications read by Argo CD's API to `fleet` (its hubs' already in). One already
-/// there (the same Argo CD, namespace and name: `grouping::merge_plan`) is shown once, as
-/// read on its hub. `targets` are the kubeconfig's contexts, `connected` those connected,
-/// `servers` each hub context's Argo CD server (`argocd_servers`).
-pub fn add_api(
-    fleet: &mut Fleet,
+/// A destination cluster as Argo CD names it: the name the Application gives, else the one
+/// Argo CD's cluster list gives its server URL (`names`, by `server_key`), else `in-cluster`
+/// for Argo CD's own, else the URL's host.
+pub fn cluster_name(name: &str, server: &str, names: &std::collections::BTreeMap<String, String>) -> String {
+    if !name.is_empty() {
+        return name.to_string();
+    }
+    if server.is_empty() {
+        return String::new();
+    }
+    let key = server_key(server);
+    if let Some(n) = names.get(&key) {
+        return n.clone();
+    }
+    if key == server_key(IN_CLUSTER) {
+        return "in-cluster".into();
+    }
+    let host = key.split_once("://").map_or(key.as_str(), |(_, h)| h);
+    host.split(['/', ':']).next().unwrap_or(host).to_string()
+}
+
+/// The contexts that reach a destination given by its `server` URL when no kubeconfig
+/// `server:` is that URL (a context reaching the cluster by its IP address or another host
+/// name): those named as Argo CD's cluster list names that server, or whose kubeconfig
+/// cluster is, as `destination_is` matches a destination given by name.
+fn named_contexts(
+    server: &str,
+    names: &std::collections::BTreeMap<String, String>,
+    targets: &[ContextTarget],
+) -> Vec<String> {
+    if server.is_empty() {
+        return Vec::new();
+    }
+    let Some(name) = names.get(&server_key(server)) else { return Vec::new() };
+    targets.iter().filter(|t| t.name == *name || t.cluster == *name).map(|t| t.name.clone()).collect()
+}
+
+/// Every Application read by Argo CD's API, each server's under the app of apps that made it.
+/// `targets` are the kubeconfig's contexts, `connected` those connected, `servers` each hub
+/// context's Argo CD server (`argocd_servers`), which says the cluster `in-cluster` is.
+pub fn from_api(
     reads: Vec<ApiRead>,
     targets: &[ContextTarget],
     connected: &[String],
     servers: &std::collections::BTreeMap<String, String>,
-) {
+) -> Fleet {
+    let mut fleet = Fleet::default();
     for read in reads {
         let endpoint = read.endpoint;
         let instance = endpoint.instance();
         let name = endpoint.name();
         fleet.servers.push(name.clone());
+        if !read.state.listed && read.state.error.is_none() {
+            fleet.reading.push(name.clone());
+        }
         if let Some(e) = read.state.error.as_ref().filter(|_| !read.state.live) {
             fleet.errors.push(format!("{name}: {e}"));
         }
         if read.state.refused && !fleet.relogin.iter().any(|(b, _)| *b == endpoint.server.base) {
             fleet.relogin.push((endpoint.server.base.clone(), endpoint.insecure));
         }
-        // The hub's windows, when read, stay: the API's failing doesn't hide them.
-        match (read.state.projects, fleet.projects.get(&instance)) {
-            (Some(Err(_)), Some(Ok(_))) | (None, _) => {}
-            (Some(p), _) => {
-                fleet.projects.insert(instance.clone(), p);
-            }
+        if let Some(p) = read.state.projects {
+            fleet.projects.insert(instance.clone(), p);
         }
-        // Its own cluster (`in-cluster`) is that of the hub whose Argo CD server it is, if set.
-        let hub = server::contexts_of(servers, &endpoint.server.base)
-            .next()
-            .map_or_else(ContextTarget::default, |c| target(targets, c));
+        let hub = server_home(servers, &endpoint.server.base, targets);
         let mut apps: Vec<&Arc<api::ApiApp>> = read.state.apps.values().collect();
         apps.sort_by(|a, b| (&a.summary.namespace, &a.summary.name).cmp(&(&b.summary.namespace, &b.summary.name)));
         let values: Vec<&Value> = apps.iter().map(|a| &a.value).collect();
-        let parents = parents(values.as_slice());
-        let present: Vec<grouping::AppKey> =
-            fleet.apps.iter().map(|a| (a.instance.clone(), a.app.namespace.clone(), a.app.name.clone())).collect();
-        let keys: Vec<grouping::AppKey> =
-            apps.iter().map(|a| (instance.clone(), a.summary.namespace.clone(), a.summary.name.clone())).collect();
-        let plan = grouping::merge_plan(&present, &keys);
         let base = fleet.apps.len();
-        let index = |r: Result<usize, usize>| match r {
-            Ok(i) => base + i,
-            Err(j) => j,
-        };
-        for ((a, parent), placed) in apps.iter().zip(&parents).zip(&plan) {
-            if placed.is_err() {
-                continue;
+        for (a, parent) in apps.iter().zip(parents(values.as_slice())) {
+            let mut dest = destination(&a.value, &hub, targets);
+            let cluster = cluster_name(&a.summary.dest_name, &a.summary.dest_server, &read.state.clusters);
+            if dest.contexts.is_empty() {
+                dest.contexts = named_contexts(&a.summary.dest_server, &read.state.clusters, targets);
             }
-            let dest = destination(&a.value, &hub, targets);
             let on = dest.context(connected).map(String::from);
             fleet.apps.push(FleetApp {
-                source: Source::Api(endpoint.clone()),
+                server: endpoint.clone(),
                 instance: instance.clone(),
                 app: a.summary.clone(),
                 dest,
+                cluster,
                 on,
-                parent: parent.map(|p| index(plan[p])),
+                parent: parent.map(|p| base + p),
                 version: resource_version(&a.value),
             });
         }
     }
+    fleet
 }
 
 #[cfg(test)]
@@ -1599,10 +1706,11 @@ mod tests {
 
     fn fleet_app(source: &Arc<api::Endpoint>, app: &api::ApiApp) -> FleetApp {
         FleetApp {
-            source: Source::Api(source.clone()),
+            server: source.clone(),
             instance: source.instance(),
             app: app.summary.clone(),
             dest: Destination::default(),
+            cluster: String::new(),
             on: None,
             parent: None,
             version: String::new(),
@@ -1610,31 +1718,98 @@ mod tests {
     }
 
     #[test]
-    fn applications_read_twice_show_once_under_the_right_parent() {
-        let server = endpoint("https://argocd.example.com");
-        let instance = server.instance();
-        // Already there (as read on its hub): root, with its windows read.
-        let mut fleet = Fleet::default();
-        fleet.apps.push(fleet_app(&server, &api_app("argocd", "root", None)));
-        fleet.projects.insert(instance.clone(), Ok(Arc::new(std::collections::BTreeMap::new())));
-        let mut state = api::FeedState::default();
+    fn each_server_s_applications_are_under_their_own_parents() {
+        let feed = |apps: Vec<Arc<api::ApiApp>>, projects| {
+            let mut state = api::FeedState { projects, ..Default::default() };
+            for a in apps {
+                state.apps.insert((a.summary.namespace.clone(), a.summary.name.clone()), a);
+            }
+            state
+        };
+        let (one, two) = (endpoint("https://argocd.example.com"), endpoint("https://argocd.example.org"));
+        let reads = vec![
+            ApiRead {
+                endpoint: one.clone(),
+                state: feed(
+                    vec![
+                        api_app("argocd", "root", None),
+                        api_app("argocd", "child", Some("root")),
+                        api_app("argocd", "leaf", Some("child")),
+                    ],
+                    Some(Ok(Arc::new(std::collections::BTreeMap::new()))),
+                ),
+            },
+            // The other server has a root of the same name: its child is under its own.
+            ApiRead {
+                endpoint: two.clone(),
+                state: feed(vec![api_app("argocd", "root", None), api_app("argocd", "zchild", Some("root"))], None),
+            },
+        ];
+        let fleet = from_api(reads, &[], &[], &Default::default());
+        let names: Vec<(&str, Option<usize>)> = fleet.apps.iter().map(|a| (a.app.name.as_str(), a.parent)).collect();
+        assert_eq!(names, [("child", Some(2)), ("leaf", Some(0)), ("root", None), ("root", None), ("zchild", Some(3))]);
+        assert_eq!(fleet.servers.len(), 2);
+        assert!(fleet.projects[&one.instance()].is_ok());
+        assert!(!fleet.projects.contains_key(&two.instance()), "not read yet");
+    }
+
+    /// #1072: a destination is named by Argo CD's cluster list, and reaches the context named
+    /// so even when the context's `server:` is another address of the cluster.
+    #[test]
+    fn a_destination_is_named_as_argo_cd_names_its_cluster() {
+        let source = endpoint("https://argocd.example.com");
+        let app = |name: &str, dest: Value| {
+            let v = json!({"metadata": {"name": name, "namespace": "argocd"},
+                "spec": {"project": "shop", "destination": dest}});
+            Arc::new(api::ApiApp { summary: Summary::of(&v), value: v })
+        };
+        let clusters = std::iter::once(("https://apiserver-prod.example".to_string(), "prod".to_string()));
+        let mut state = api::FeedState { clusters: Arc::new(clusters.collect()), ..Default::default() };
         for a in [
-            api_app("argocd", "root", None),
-            api_app("argocd", "child", Some("root")),
-            api_app("argocd", "leaf", Some("child")),
+            app("a", json!({"server": "https://apiserver-prod.example", "namespace": "web"})),
+            app("b", json!({"server": "https://kubernetes.default.svc", "namespace": "argocd"})),
+            app("c", json!({"server": "https://other.example:6443", "namespace": "web"})),
         ] {
             state.apps.insert((a.summary.namespace.clone(), a.summary.name.clone()), a);
         }
-        // The API's windows failed: the hub's stay.
-        state.projects = Some(Err("forbidden".into()));
-        let read = ApiRead { endpoint: server, state };
-        add_api(&mut fleet, vec![read], &[], &[], &Default::default());
-        let names: Vec<&str> = fleet.apps.iter().map(|a| a.app.name.as_str()).collect();
-        assert_eq!(names, ["root", "child", "leaf"]);
-        // child's parent is the root already there; leaf's is child, added.
-        assert_eq!(fleet.apps[1].parent, Some(0));
-        assert_eq!(fleet.apps[2].parent, Some(1));
-        assert!(fleet.projects[&instance].is_ok());
+        let targets = [
+            ContextTarget {
+                name: "prod".into(),
+                cluster: "prod".into(),
+                server: Some("https://10.0.0.1".into()),
+                exec: None,
+            },
+            ContextTarget {
+                name: "else".into(),
+                cluster: "else".into(),
+                server: Some("https://10.0.0.2".into()),
+                exec: None,
+            },
+        ];
+        let fleet = from_api(vec![ApiRead { endpoint: source, state }], &targets, &[], &Default::default());
+        let rows: Vec<(&str, &str, Option<&str>)> =
+            fleet.apps.iter().map(|a| (a.app.name.as_str(), a.cluster.as_str(), a.on.as_deref())).collect();
+        assert_eq!(rows, [("a", "prod", Some("prod")), ("b", "in-cluster", None), ("c", "other.example", None)]);
+    }
+
+    /// #1076: while a server's first list is being read, the page says so, never `0 Applications`.
+    #[test]
+    fn a_server_whose_first_list_is_not_in_yet_is_said_to_be_read() {
+        let (one, two) = (endpoint("https://argocd.example.com"), endpoint("https://argocd.example.org"));
+        let pending = ApiRead { endpoint: one.clone(), state: api::FeedState::default() };
+        let failed = api::FeedState { error: Some("HTTP 401".into()), ..Default::default() };
+        let fleet =
+            from_api(vec![pending, ApiRead { endpoint: two.clone(), state: failed }], &[], &[], &Default::default());
+        // The one that failed says why instead.
+        assert_eq!(fleet.reading, [one.name()]);
+
+        // One listed, the other still read: both said.
+        let mut listed = api::FeedState { listed: true, ..Default::default() };
+        let a = api_app("argocd", "web", None);
+        listed.apps.insert((a.summary.namespace.clone(), a.summary.name.clone()), a);
+        let pending = ApiRead { endpoint: one.clone(), state: api::FeedState::default() };
+        let fleet = from_api(vec![ApiRead { endpoint: two, state: listed }, pending], &[], &[], &Default::default());
+        assert_eq!((fleet.apps.len(), fleet.reading), (1, vec![one.name()]));
     }
 
     #[test]
@@ -1702,26 +1877,6 @@ mod tests {
         assert!(tracking_of("apps", "Deployment", &json!({"metadata": {"name": "web"}})).is_none());
     }
 
-    /// A context an agent's read could not reach is not asked again for `RETRY`, then is.
-    #[test]
-    fn a_hub_that_failed_recently_is_not_asked_again() {
-        let hub = "unreached-test-hub";
-        assert_eq!(recent_failure(hub, true, Instant::now()), None);
-        note_unreached(hub, "did not answer".into());
-        assert_eq!(recent_failure(hub, false, Instant::now()).as_deref(), Some("did not answer"));
-        assert_eq!(recent_failure(hub, true, Instant::now() + RETRY), None, "asked again once RETRY is over");
-        note_reached(hub);
-        assert_eq!(recent_failure(hub, true, Instant::now()), None);
-        // A probe of the window's that failed counts too, when asked for.
-        let probed = "probe-failed-test-hub";
-        PROBES
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(probed.into(), Probe::Failed("timed out".into(), Instant::now()));
-        assert_eq!(recent_failure(probed, true, Instant::now()).as_deref(), Some("timed out"));
-        assert_eq!(recent_failure(probed, false, Instant::now()), None);
-    }
-
     #[test]
     fn an_object_names_its_application_by_tracking_id_else_by_label() {
         let obj = |annotation: Option<&str>, label: Option<&str>| {
@@ -1739,6 +1894,39 @@ mod tests {
         assert_eq!(tracked_by("apps", "Deployment", &obj(None, None)), None);
         // A pod carries its workload's label; its workload is what Argo CD deployed.
         assert_eq!(tracked_by("", "Pod", &obj(None, Some("shop"))), None);
+    }
+
+    /// In Argo CD's API feeds, a tracking id names an Application by name, and by namespace
+    /// when it gives one (`<ns>_<app>`); a label by name, in any namespace.
+    #[test]
+    fn a_tracking_id_or_a_label_names_an_application_read_by_the_api() {
+        let app = |ns: &str, name: &str| Summary::of(&json!({"metadata": {"name": name, "namespace": ns}}));
+        let id = |text: &str| TrackedBy::Id(parse_tracking(text).unwrap());
+        let plain = id("shop:apps/Deployment:prod/web");
+        assert!(names_app(&plain, &app("argocd", "shop")));
+        assert!(names_app(&plain, &app("gitops", "shop")), "Argo CD's own namespace may not be argocd");
+        assert!(!names_app(&plain, &app("argocd", "shop-2")));
+        let in_ns = id("team-a_shop:apps/Deployment:prod/web");
+        assert!(names_app(&in_ns, &app("team-a", "shop")));
+        assert!(!names_app(&in_ns, &app("team-b", "shop")));
+        assert!(!names_app(&in_ns, &app("argocd", "shop")));
+        let label = TrackedBy::Label("shop".into());
+        assert!(names_app(&label, &app("team-b", "shop")));
+        assert!(!names_app(&label, &app("argocd", "web")));
+    }
+
+    /// A tracking id's Application deployed the object when it deploys here or tracks it; a
+    /// label's (Helm sets the same label) only when it does both.
+    #[test]
+    fn a_label_needs_both_the_destination_and_the_resource() {
+        let id = TrackedBy::Id(parse_tracking("shop:apps/Deployment:prod/web").unwrap());
+        let label = TrackedBy::Label("shop".into());
+        for here in [Some(true), Some(false), None] {
+            for tracks in [true, false] {
+                assert_eq!(fits(&id, here, tracks), here == Some(true) || tracks, "{here:?} {tracks}");
+                assert_eq!(fits(&label, here, tracks), here == Some(true) && tracks, "{here:?} {tracks}");
+            }
+        }
     }
 
     #[test]
@@ -1845,8 +2033,8 @@ mod tests {
         });
         let s = Summary::of(&app).with_own(&app, "apps", "Deployment", "shop", "web");
         assert_eq!((s.sync.as_str(), s.health.as_str(), s.automated), ("OutOfSync", "Degraded", true));
-        assert_eq!(s.revision.as_deref(), Some("01234567"));
-        assert_eq!(s.history[0].revision, "01234567, 2.0.0");
+        assert_eq!(s.revision.as_deref(), Some("0123456"));
+        assert_eq!(s.history[0].revision, "0123456, 2.0.0");
         assert_eq!(s.history[0].by.as_deref(), Some("ana"));
         assert_eq!(s.history[1].by.as_deref(), Some("auto-sync"));
         assert_eq!(s.operation.as_ref().map(|o| o.0.as_str()), Some("Failed"));

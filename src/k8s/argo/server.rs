@@ -269,6 +269,18 @@ pub(super) fn exp_of(token: &str) -> Option<i64> {
     serde_json::from_slice::<Value>(&bytes).ok().and_then(|v| v.get("exp")?.as_i64())
 }
 
+/// Who a JWT is for, as a login: its `preferred_username`, else its `email`'s local part. None
+/// when it isn't a JWT or names no one.
+pub(super) fn token_user(token: &str) -> Option<String> {
+    let payload = token.split('.').nth(1)?;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(payload.trim_end_matches('=')).ok()?;
+    let claims = serde_json::from_slice::<Value>(&bytes).ok()?;
+    let text = |k: &str| claims.get(k).and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty());
+    text("preferred_username")
+        .or_else(|| text("email").and_then(|e| e.split('@').next()).filter(|s| !s.is_empty()))
+        .map(String::from)
+}
+
 /// The token to send for `context`'s `server`, and where it comes from: Settings first, then
 /// the argocd CLI's login. What to do when there is none, or it has expired.
 fn login(context: &str, server: &Server) -> Result<(String, Login), String> {
@@ -288,34 +300,6 @@ fn login(context: &str, server: &Server) -> Result<(String, Login), String> {
         Some(token) => Ok((token, Login::Cli)),
         None => Err(format!("No login to {name} ({} has none): {relogin}", path.display())),
     }
-}
-
-/// The Argo CD server set for the hub `context`, the token to send it and where that comes
-/// from; or why there is none to ask. Reads files: call it off the UI thread.
-pub(super) fn login_for(context: &str) -> Result<(Server, String, Login), String> {
-    let server = match server_of(context) {
-        Some(Ok(server)) => server,
-        Some(Err(e)) => return Err(e),
-        None => return Err(format!("No Argo CD server is set for {context} in Settings")),
-    };
-    let (token, how) = login(context, &server)?;
-    Ok((server, token, how))
-}
-
-/// GET `path` (of Argo CD's API) on `server` with `token`; errors never hold the token.
-pub(super) async fn get_path(server: &Server, token: &str, path: &str) -> Result<Value, String> {
-    get_path_within(server, token, path, TIMEOUT).await
-}
-
-/// The same, waiting up to `timeout` for the answer.
-pub(super) async fn get_path_within(
-    server: &Server,
-    token: &str,
-    path: &str,
-    timeout: std::time::Duration,
-) -> Result<Value, String> {
-    let url = format!("{}{path}", server.base);
-    super::api::send_within(http::Method::GET, url, token, None, false, server, timeout).await.map_err(|f| f.text)
 }
 
 /// `text` with every copy of `token` replaced: an error never shows it, whatever echoed it.

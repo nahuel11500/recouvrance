@@ -415,18 +415,33 @@ impl AppView {
             .into_any_element()
     }
 
+    /// A page made of what the contexts of the set hold (Problems, the overviews, Timeline,
+    /// Helm), as the list is shown: each context that isn't connected said over it, so its
+    /// silence doesn't read as nothing there; the connect panel in its place while none is.
+    fn over_set(&self, page: AnyElement, cx: &mut Context<Self>) -> AnyElement {
+        if self.nothing_connected() {
+            return self.render_connect(cx);
+        }
+        match self.render_conn_banner(cx) {
+            None => page,
+            Some(banner) => {
+                v_flex().size_full().child(banner).child(div().flex_1().min_h_0().child(page)).into_any_element()
+            }
+        }
+    }
+
     fn render_content(&self, cx: &mut Context<Self>) -> AnyElement {
         match self.route() {
             Route::Resources(_) => self.render_list(cx),
             Route::Detail(d) => d.clone().into_any_element(),
-            Route::Workloads(d) => d.clone().into_any_element(),
-            Route::Cluster(d) => d.clone().into_any_element(),
-            Route::Problems(d) => d.clone().into_any_element(),
-            Route::Timeline(d) => d.clone().into_any_element(),
+            Route::Workloads(d) => self.over_set(d.clone().into_any_element(), cx),
+            Route::Cluster(d) => self.over_set(d.clone().into_any_element(), cx),
+            Route::Problems(d) => self.over_set(d.clone().into_any_element(), cx),
+            Route::Timeline(d) => self.over_set(d.clone().into_any_element(), cx),
             Route::Access(d) => d.clone().into_any_element(),
             Route::HelmInstall(d) => d.clone().into_any_element(),
             Route::Assistant(d) => d.clone().into_any_element(),
-            Route::Helm(d) => d.clone().into_any_element(),
+            Route::Helm(d) => self.over_set(d.clone().into_any_element(), cx),
             Route::HelmRelease(d) => d.clone().into_any_element(),
             Route::Argo(d) => d.clone().into_any_element(),
             Route::Contexts => self.render_contexts(cx).into_any_element(),

@@ -9,7 +9,7 @@ use gpui_kit::*;
 
 use super::{AgentsView, RuleInputs, rule_with};
 use crate::k8s;
-use crate::mcp::{Access, Agent, Mode, PROTECTED, Rule, Verb, is_protected_selector};
+use crate::mcp::{Access, Agent, Mode, PROTECTED, Rule, Verb, argo_home_patterns, is_protected_selector};
 
 impl AgentsView {
     pub(super) fn render_rule(
@@ -29,6 +29,7 @@ impl AgentsView {
         let names_protected = rule.contexts.iter().any(|c| is_protected_selector(c));
         // A rule that names `@protected` is meant for them: no warning.
         let any_protected = !names_protected && matched.iter().any(|c| self.protected.contains(c));
+        let argo_homes = argo_home_patterns(rule, &self.argo_homes);
         let label = |text: &'static str| {
             div().w(px(96.)).flex_shrink_0().text_xs().text_color(theme.muted_foreground).child(text)
         };
@@ -199,6 +200,13 @@ impl AgentsView {
                             }))
                             .when(any_protected && rule.effect != Mode::Deny, |d| {
                                 d.child(div().text_color(theme.warning).child("· includes protected contexts"))
+                            })
+                            .when(!argo_homes.is_empty(), |d| {
+                                d.child(div().text_color(theme.warning).child(format!(
+                                    "· {} is where Argo CD runs: Argo CD actions are judged where each Application \
+                                     deploys (its destination's context and namespace), so this rule decides none",
+                                    argo_homes.join(", ")
+                                )))
                             })
                             .when(names_protected && rule.effect == Mode::Allow, |d| {
                                 d.child(

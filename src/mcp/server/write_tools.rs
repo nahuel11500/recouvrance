@@ -8,17 +8,19 @@ use serde_json::json;
 
 use super::{
     ApplyParams, DENIED_BY_RULE, DeleteParams, DrainParams, EvictParams, ExecParams, GitOpsParams, KubeMcp,
-    PatchParams, RefreshExternalSecretParams, RestartParams, ScaleParams, access_for, denied_namespaces,
-    denies_eviction, manifest_objects, manifest_summary, require_ns,
+    PatchParams, READ_ONLY_SERVER, RefreshExternalSecretParams, RestartParams, ScaleParams, access_for, argo_tools,
+    denied_namespaces, denies_eviction, manifest_objects, manifest_summary, require_ns,
 };
 use std::sync::Arc;
 
 use crate::k8s;
 use crate::k8s::Kind;
+use crate::k8s::argo::FleetApp;
+use crate::k8s::argo::api::{self, AgentAction};
 use crate::k8s::argo::diagnosis::{self, Diagnosis, DriftRead, MayRead, Res};
 use crate::k8s::argo::ops::{self, Op, SyncRequest};
 use crate::mcp::preview::Plan;
-use crate::mcp::{Mode, Policy, Verb};
+use crate::mcp::{ArgoPlace, Mode, Policy, Verb};
 
 #[tool_router(router = write_tools, vis = "pub(super)")]
 impl KubeMcp {
@@ -261,7 +263,7 @@ impl KubeMcp {
     }
 
     #[tool(
-        description = "GitOps actions: Flux `reconcile` (like `flux reconcile`), `suspend`, `resume`; Argo CD Application `refresh`, `hard_refresh` (renders its manifests again, without Argo CD's cache), `sync` (optionally of some `resources` only, with `prune`, without hooks (`hooks: false`), or a `dry_run` whose result is returned; to sync several Applications, call it once for each: each is decided by your rules and approved on its own), `terminate` (stops the operation running, like `argocd app terminate-op`) or `rollback` (to a deployment of its history, like `argocd app rollback`; refused while auto-sync is on), each authorized by its own verb on the object, not `patch`: `refresh` (refresh, hard_refresh), `sync` (Argo CD sync, terminate and rollback, Flux reconcile) or `suspend` (Flux suspend and resume). Like argocd-server, nothing starts while another operation runs. Argo CD `diagnose` changes nothing (authorized as `get`): why the Application drifts, keeps syncing (a sync loop, with the `ignoreDifferences` that would stop it), failed (hook, admission, missing CRD...) or is stuck (a long sync, a finalizer holding its deletion), and for each out-of-sync resource the fields that differ between what was last applied and the live object on its destination, with who wrote them since the last sync. The destination's objects are read only where your rules allow `get`.",
+        description = "GitOps actions: Flux `reconcile` (like `flux reconcile`), `suspend`, `resume`, on the object in `context`; Argo CD Application `refresh`, `hard_refresh` (renders its manifests again, without Argo CD's cache), `sync` (optionally of some `resources` only, with `prune`, without hooks (`hooks: false`), or a `dry_run` whose result is returned; to sync several Applications, call it once for each: each is decided by your rules and approved on its own), `terminate` (stops the operation running, like `argocd app terminate-op`) or `rollback` (to a deployment of its history, like `argocd app rollback`; refused while auto-sync is on), through Argo CD's API: name the Application (and its `server` when several hold one of that name), no context. Each is authorized by its own verb, not `patch`: `refresh` (refresh, hard_refresh), `sync` (Argo CD sync, terminate and rollback, Flux reconcile) or `suspend` (Flux suspend and resume); for an Argo CD Application, on applications.argoproj.io where it deploys (each context reaching its destination, and its destination namespace), and refused on an Argo CD server the user set read-only. Like argocd-server, nothing starts while another operation runs. Argo CD `diagnose` changes nothing (authorized as `get`): why the Application drifts, keeps syncing (a sync loop, with the `ignoreDifferences` that would stop it), failed (hook, admission, missing CRD...) or is stuck (a long sync, a finalizer holding its deletion), and for each out-of-sync resource the fields that differ between what was last applied and the live object on its destination, with who wrote them since the last sync. The destination's objects are read only where your rules allow `get`.",
         annotations(read_only_hint = false)
     )]
     async fn gitops(
@@ -274,15 +276,32 @@ impl KubeMcp {
                 .map(|r| json!({"group": r.group, "kind": r.kind, "namespace": r.namespace, "name": r.name}))
                 .collect()
         });
-        let args = json!({"context": p.context, "kind": p.kind, "namespace": p.namespace, "name": p.name,
-            "action": p.action, "resources": resources, "prune": p.prune, "dry_run": p.dry_run,
+        // An Argo CD Application is found through Argo CD's API: no context is asked. A
+        // `context` naming an Argo CD server is taken for `server` (the name agents were
+        // given before); one naming anything else is refused below, never asked.
+        let argo = argo_tools::is_argo_kind(&p.kind);
+        let mut server = p.server.clone();
+        let mut stray = None;
+        if argo && let Some(c) = &p.context {
+            if server.is_none() && names_server(c).await {
+                server = Some(c.clone());
+            } else {
+                stray = Some(c.clone());
+            }
+        }
+        let context = if argo { None } else { p.context.clone() };
+        let args = json!({"context": context, "server": server, "kind": p.kind, "namespace": p.namespace,
+            "name": p.name, "action": p.action, "resources": resources, "prune": p.prune, "dry_run": p.dry_run,
             "deployment_id": p.deployment_id, "hooks": p.hooks});
         let mut call = self.begin(&parts, "gitops", args)?;
-        let (client, kind) = self.kind(&call, &p.context, &p.kind).await?;
-        let flux = kind.ar.group.ends_with(".toolkit.fluxcd.io");
-        let argo = kind.is("argoproj.io", "Application");
+        if let Some(c) = stray {
+            return Err(call.fail(format!(
+                "an Argo CD Application is found through Argo CD's API, not on a context: omit `context` ({c}), \
+                 or pass `server` with the Argo CD server's name (argocd_apps names them)"
+            )));
+        }
         let ok = match p.action.as_str() {
-            "reconcile" | "suspend" | "resume" => flux,
+            "reconcile" | "suspend" | "resume" => !argo,
             "refresh" | "hard_refresh" | "sync" | "terminate" | "rollback" | "diagnose" => argo,
             _ => false,
         };
@@ -290,57 +309,36 @@ impl KubeMcp {
             return call.finish(Err(anyhow::anyhow!(
                 "`{}` does not apply to {} (Flux: reconcile/suspend/resume; Argo CD applications: refresh/hard_refresh/sync/terminate/rollback/diagnose)",
                 p.action,
-                kind.ar.kind
+                p.kind
             )));
         }
         if let Some(why) = gitops_option_misuse(&p) {
             return Err(call.fail(why));
         }
-        if p.action == "diagnose" {
-            return self.argo_diagnose(call, client, kind, &p.context, &p.namespace, &p.name).await;
+        if argo {
+            return self.argo_gitops(call, &p, server.as_deref()).await;
+        }
+        let Some(context) = context else {
+            return Err(call.fail("`context` is needed for a Flux object"));
+        };
+        let (client, kind) = self.kind(&call, &context, &p.kind).await?;
+        if !kind.ar.group.ends_with(".toolkit.fluxcd.io") {
+            return call.finish(Err(anyhow::anyhow!(
+                "`{}` does not apply to {} (Flux: reconcile/suspend/resume; Argo CD applications: refresh/hard_refresh/sync/terminate/rollback/diagnose)",
+                p.action,
+                kind.ar.kind
+            )));
         }
         let verb =
             gitops_verb(&p.action).ok_or_else(|| call.fail(format!("`{}` has no verb in the rules", p.action)))?;
-        let mut op = argo_op(&p);
-        let access = access_for(&kind, &p.context, verb, Some(p.namespace.clone()), Some(p.name.clone()));
-        // What a prune deletes, and the deployment a rollback goes to, are part of what is
-        // approved: read before asking, and what is sent is held to what was shown. Never
-        // shown to the agent before its rules allow the call (a failed read says nothing).
-        // A prune is read only when the user will be asked; a rollback is pinned unless denied.
-        self.reload_rules(&mut call);
-        let mode = call.policy().decide(&access).mode;
-        let asks = mode == Mode::Ask && !self.hub.headless();
-        let prunes = matches!(&op, Some(Op::Sync(req)) if req.prune && asks);
-        let rollback = matches!(op, Some(Op::Rollback { id: None, .. })) && mode != Mode::Deny;
-        let mut read = None;
-        if (prunes || rollback)
-            && let Ok(app) = super::get_named(&client, &kind, Some(p.namespace.as_str()), &p.name, false).await
-            && let Some(o) = op.as_mut()
-        {
-            call.approval_detail = approval_detail(&app, o);
-            read = Some(app);
-        }
-        // The banner's preview of a sync: of the Application just read, when it was.
-        if let Some(Op::Sync(req)) = &op {
-            call.plan = Some(Plan::Sync {
-                client: client.clone(),
-                kind: kind.clone(),
-                ns: p.namespace.clone(),
-                name: p.name.clone(),
-                req: req.clone(),
-                app: read,
-            });
-        }
+        let access = access_for(&kind, &context, verb, Some(p.namespace.clone()), Some(p.name.clone()));
         self.authorize(&mut call, &access).await?;
         self.recheck(&mut call, &access)?;
         let (ns, name) = (Some(p.namespace), p.name);
-        call.finish(match (p.action.as_str(), op) {
-            (_, Some(op)) => k8s::argo_operation(client, kind, ns, name, op).await,
-            ("reconcile", _) => k8s::flux_reconcile(client, kind, ns, name).await,
-            ("suspend", _) => k8s::merge_patch(client, kind, ns, name, json!({"spec": {"suspend": true}}), false).await,
-            ("resume", _) => k8s::merge_patch(client, kind, ns, name, json!({"spec": {"suspend": false}}), false).await,
-            ("hard_refresh", _) => k8s::argo_refresh(client, kind, ns, name, true).await,
-            _ => k8s::argo_refresh(client, kind, ns, name, false).await,
+        call.finish(match p.action.as_str() {
+            "reconcile" => k8s::flux_reconcile(client, kind, ns, name).await,
+            "suspend" => k8s::merge_patch(client, kind, ns, name, json!({"spec": {"suspend": true}}), false).await,
+            _ => k8s::merge_patch(client, kind, ns, name, json!({"spec": {"suspend": false}}), false).await,
         })
     }
 
@@ -419,6 +417,14 @@ impl KubeMcp {
         let dry_run = p.dry_run.unwrap_or(false);
         call.finish(k8s::force_sync_external_secret(client, kind, Some(p.namespace), p.name, dry_run).await)
     }
+}
+
+/// Whether `name` is an Argo CD server's (set or logged in to), as agents named one in
+/// `context` before `server` was asked for.
+async fn names_server(name: &str) -> bool {
+    let name = name.to_string();
+    let found = k8s::run(async move { Ok(api::endpoints().list.iter().any(|e| e.name().eq_ignore_ascii_case(&name))) });
+    found.await.unwrap_or(false)
 }
 
 /// The rules' verb for a GitOps action: a refresh deploys nothing, a sync (or a Flux
@@ -522,38 +528,102 @@ fn argo_op(p: &GitOpsParams) -> Option<Op> {
 pub(super) type Planned = (Kind, Option<String>, String, serde_json::Value);
 
 impl KubeMcp {
-    /// `gitops` `diagnose`: what is wrong with an Argo CD Application, read only. The
-    /// Application needs `get`; each object of its destination is read only where the rules
-    /// allow `get` on it without asking (the others are named as not read).
-    async fn argo_diagnose(
+    /// `gitops` on an Argo CD Application, through Argo CD's API. The rules decide where it
+    /// deploys (`argo_tools::place_of`); a server set read-only refuses a write before they
+    /// do. What a prune deletes, and the deployment a rollback goes to, are part of what is
+    /// approved: read before asking, and what is sent is held to what was shown. Never shown
+    /// to the agent before its rules allow the call (a failed read says nothing). A prune is
+    /// read only when the user will be asked; a rollback is pinned unless denied.
+    async fn argo_gitops(
         &self,
         mut call: super::Call,
-        client: kube::Client,
-        kind: Kind,
-        context: &str,
-        namespace: &str,
-        name: &str,
+        p: &GitOpsParams,
+        server: Option<&str>,
     ) -> Result<String, String> {
-        let access = access_for(&kind, context, Verb::Get, Some(namespace.to_string()), Some(name.to_string()));
-        self.authorize(&mut call, &access).await?;
-        let app = match super::get_named(&client, &kind, Some(namespace), name, false).await {
-            Ok(v) => v,
-            Err(e) => return call.finish(Err(e)),
+        let verb = if p.action == "diagnose" {
+            Verb::Get
+        } else {
+            gitops_verb(&p.action).ok_or_else(|| call.fail(format!("`{}` has no verb in the rules", p.action)))?
         };
-        let d = Diagnosis::of(&app, jiff::Timestamp::now());
-        let (dest, _) = k8s::argo::destination_of(app.clone(), context.to_string(), Vec::new()).await;
-        let s = k8s::argo::Summary::of(&app);
+        if !call.policy().may_reach_argo(&[verb]) {
+            return Err(call.deny(argo_tools::no_argo_rule(verb)));
+        }
+        let app = self.argo_app(&call, server, Some(p.namespace.as_str()), &p.name).await?;
+        let place = argo_tools::place_of(&app);
+        if p.action == "diagnose" {
+            return self.argo_diagnose(call, &app, &place).await;
+        }
+        let refused = |call: &super::Call, why: String| {
+            let what = format!("{verb} Application {}/{} on Argo CD server {}", p.namespace, p.name, app.server.name());
+            call.deny_hinted(format!("{what} — {why}"), READ_ONLY_SERVER)
+        };
+        if let Some(why) = argo_tools::server_read_only(&app.server) {
+            return Err(refused(&call, why));
+        }
+        let mut op = argo_op(p);
+        self.reload_rules(&mut call);
+        let mode = call.policy().decide_all(&place.accesses(verb)).mode;
+        let asks = mode == Mode::Ask && !self.hub.headless();
+        let prunes = matches!(&op, Some(Op::Sync(req)) if req.prune && asks);
+        let rollback = matches!(op, Some(Op::Rollback { id: None, .. })) && mode != Mode::Deny;
+        let (ns, name) = (p.namespace.clone(), p.name.clone());
+        let mut read = None;
+        if (prunes || rollback)
+            && let Ok(v) = api::read_app(app.server.clone(), ns.clone(), name.clone()).await
+            && let Some(o) = op.as_mut()
+        {
+            call.approval_detail = approval_detail(&v, o);
+            read = Some(v);
+        }
+        // The banner's preview of a sync: of the Application just read, when it was.
+        if let Some(Op::Sync(req)) = &op {
+            call.plan = Some(Plan::Sync {
+                endpoint: app.server.clone(),
+                ns: ns.clone(),
+                name: name.clone(),
+                req: req.clone(),
+                app: read,
+            });
+        }
+        self.authorize_argo(&mut call, &place, verb).await?;
+        // Made read-only while the approval waited.
+        if let Some(why) = argo_tools::server_read_only(&app.server) {
+            return Err(refused(&call, why));
+        }
+        self.recheck_argo(&mut call, &place, verb)?;
+        let action = match op {
+            Some(op) => AgentAction::Op(op),
+            None => AgentAction::Refresh { hard: p.action == "hard_refresh" },
+        };
+        let stop = self.argo_still_allowed(&call, &place, verb);
+        let done = api::act_for_agent(app.server.clone(), ns, name, action, stop).await;
+        call.finish(done.map_err(|e| anyhow::anyhow!(e)))
+    }
+
+    /// `gitops` `diagnose`: what is wrong with an Argo CD Application, read only. The
+    /// Application needs `get` where it deploys; each object of its destination is read only
+    /// where the rules allow `get` on it without asking (the others are named as not read).
+    async fn argo_diagnose(&self, mut call: super::Call, app: &FleetApp, place: &ArgoPlace) -> Result<String, String> {
+        self.authorize_argo(&mut call, place, Verb::Get).await?;
+        let (ns, name) = (app.app.namespace.clone(), app.app.name.clone());
+        let value = match api::read_app(app.server.clone(), ns.clone(), name.clone()).await {
+            Ok(v) => v,
+            Err(e) => return call.finish(Err(anyhow::anyhow!(e))),
+        };
+        let d = Diagnosis::of(&value, jiff::Timestamp::now());
+        let s = k8s::argo::Summary::of(&value);
         let head = format!(
-            "Application {namespace}/{name} on {context}: {}, {}, auto-sync {}; deploys to {}",
+            "Application {ns}/{name} on Argo CD server {}: {}, {}, auto-sync {}; deploys to {}",
+            app.server.name(),
             s.sync,
             s.health,
             if s.automated { "on" } else { "off" },
-            k8s::argo::destination_text(&dest.cluster, &dest.namespace)
+            k8s::argo::destination_text(&app.cluster, &app.dest.namespace)
         );
         let (policy, approved) = (call.policy().clone(), call.approved_rules().to_vec());
-        let read = self.argo_drift(policy, approved, &dest.contexts, &d).await;
+        let read = self.argo_drift(policy, approved, &app.dest.contexts, &d).await;
         // Told again with what was read live: whether an object is there.
-        let d = Diagnosis::of_live(&app, jiff::Timestamp::now(), &read.drifts);
+        let d = Diagnosis::of_live(&value, jiff::Timestamp::now(), &read.drifts);
         call.finish(Ok(diagnosis::report(&head, &d, &read)))
     }
 
@@ -723,7 +793,7 @@ mod tests {
     }
 
     fn gitops(args: serde_json::Value) -> super::GitOpsParams {
-        let mut all = json!({"context": "hub", "kind": "applications", "namespace": "argocd", "name": "web"});
+        let mut all = json!({"kind": "applications", "namespace": "argocd", "name": "web"});
         for (k, v) in args.as_object().into_iter().flatten() {
             all[k] = v.clone();
         }
@@ -789,7 +859,7 @@ mod tests {
     fn the_rollback_approved_is_the_one_sent() {
         let mut op = Op::Rollback { id: None, dry_run: false };
         let detail = approval_detail(&app(), &mut op).unwrap();
-        assert_eq!(detail, format!("rollback to deployment 1 ({})", "a".repeat(8)));
+        assert_eq!(detail, format!("rollback to deployment 1 ({})", "a".repeat(7)));
         // Sent by its id: a deployment landing after the approval changes nothing.
         assert_eq!(op, Op::Rollback { id: Some(1), dry_run: false });
         let mut later = app();

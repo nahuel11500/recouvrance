@@ -34,6 +34,7 @@ mod login;
 pub(crate) mod meter;
 mod metrics;
 pub(crate) mod names;
+pub(crate) mod namespace_feed;
 mod node_specs;
 pub(crate) mod pod_copy;
 mod pod_requests;
@@ -227,11 +228,6 @@ pub fn error_chain(e: &anyhow::Error) -> String {
         return doing.chain([said]).collect::<Vec<_>>().join(": ");
     }
     format!("{e:#}")
-}
-
-/// Whether `e`, or an error behind it, is a context's login command that failed.
-pub fn login_failed(e: &anyhow::Error) -> bool {
-    login::login_failure(e.as_ref()).is_some()
 }
 
 /// The HTTP status of an API error (403 forbidden, 404 not found…), if it is one.

@@ -2,8 +2,8 @@
 //! environment, and the cards of the one shown (see `k8s::argo::dashboard`).
 //!
 //! Only the tab shown is read: the Application whole, its resource tree, its diff and its
-//! commits, by Argo CD's API (or on its hub). It is read again when its row changes (the
-//! stream, the hubs' next read), every few seconds while a sync runs, and on Refresh; a
+//! commits, by Argo CD's API. It is read again when its row changes (the stream), every few
+//! seconds while a sync runs, and on Refresh; a
 //! newer read replaces the one running, and leaving the tab or the page drops it.
 
 use std::collections::HashSet;
@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::tab::{Tab, TabBar};
+use gpui_kit::component::input::Input;
 use gpui_kit::component::{ActiveTheme as _, Disableable as _, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -24,17 +24,25 @@ use crate::k8s;
 use crate::k8s::argo::dashboard::{self, Cards, Commit, Problem};
 use crate::k8s::argo::diagnosis::{Res, span_text};
 use crate::k8s::argo::sync_diff::{self, Entry};
-use crate::k8s::argo::{self, Source, api, short_revision};
+use crate::k8s::argo::{self, api, short_revision};
 use crate::smartdiff::{self, ObjectKey, ResourceChange, SmartDiff};
 use crate::status::Tone;
 use crate::ui::selectable::selectable;
 
-/// A card's width: three or four side by side on a wide window.
-const CARD: f32 = 380.;
+/// A status tile's width, before it grows to share its row: four side by side on a wide
+/// window, two pairs on a narrow one.
+const TILE: f32 = 230.;
+/// A tile's width, at least.
+const TILE_MIN: f32 = 190.;
+/// The Versions and History panels' widths, before they grow to share their row.
+const VERSIONS: f32 = 520.;
+const HISTORY: f32 = 360.;
+/// An environment's entry, at most.
+const ENV_MAX: f32 = 360.;
 /// How often the tab shown is read while a sync runs.
 const RUNNING_EVERY: Duration = Duration::from_secs(3);
-/// Problems listed before "+N more".
-const PROBLEMS_SHOWN: usize = 5;
+/// Problems listed in their tile before "+N more".
+const PROBLEMS_IN_TILE: usize = 3;
 /// Names listed per kind of change in the Sync diff card.
 const NAMES_SHOWN: usize = 4;
 /// Lines of one resource's diff shown, at most.
@@ -65,12 +73,18 @@ struct Compare {
 
 /// The dashboard open on the page.
 pub(super) struct Dashboard {
-    service: String,
-    /// The service's Applications, one tab each.
+    /// The environment: its name, type and Argo CD server's name.
+    title: String,
+    kind: String,
+    server: String,
+    /// Its Applications, one section each: its workload first, its root last.
     members: Vec<Key>,
     tab: usize,
     /// The cards last read, and of which Application.
     cards: Option<(Key, Result<Arc<Cards>, String>)>,
+    /// Why the last read failed, or gave only the list's copy, while older cards of the same
+    /// Application read whole stay shown: one line over them.
+    failed: Option<String>,
     /// The Application's row when it was read: a change of it reads it again.
     read_for: Option<(Key, argo::Summary)>,
     loading: bool,
@@ -96,12 +110,15 @@ pub(super) struct Dashboard {
 }
 
 impl Dashboard {
-    fn new(service: String, members: Vec<Key>, tab: usize) -> Self {
+    fn new(title: String, members: Vec<Key>, tab: usize) -> Self {
         Self {
-            service,
+            title,
+            kind: String::new(),
+            server: String::new(),
             members,
             tab,
             cards: None,
+            failed: None,
             read_for: None,
             loading: false,
             dirty: false,
@@ -158,8 +175,19 @@ impl Dashboard {
         let running =
             cards.as_ref().is_ok_and(|c| c.summary.in_progress || c.last_sync.as_ref().is_some_and(|s| s.running));
         self.loading = false;
-        self.updated = Some(now);
-        self.cards = Some((k, cards));
+        // A failed read, or one of the list's copy only, keeps the cards of this Application
+        // read whole before: what's held stays, with why in one line.
+        let whole = |c: &Result<Arc<Cards>, String>| c.as_ref().is_ok_and(|c| c.note.is_none());
+        let kept = self.cards.as_ref().is_some_and(|(kk, c)| *kk == k && whole(c));
+        match &cards {
+            Err(e) if kept => self.failed = Some(kept_line(e)),
+            Ok(c) if kept && c.note.is_some() => self.failed = c.note.as_deref().map(kept_line),
+            _ => {
+                self.failed = None;
+                self.updated = Some(now);
+                self.cards = Some((k, cards));
+            }
+        }
         if std::mem::take(&mut self.dirty) {
             Next::Reload
         } else if running {
@@ -168,6 +196,11 @@ impl Dashboard {
             Next::Rest
         }
     }
+}
+
+/// The line over cards kept from an older read, when the last one failed with `why`.
+fn kept_line(why: &str) -> String {
+    format!("Not read now ({}): shown as last read.", dashboard::first_line(why))
 }
 
 /// What follows a read of the dashboard (see `Dashboard::take_read`).
@@ -197,28 +230,38 @@ fn when_shown<V: 'static>(
 }
 
 impl ArgoView {
-    /// Open the dashboard of the service of the Application `k`, on its tab.
+    /// Open the dashboard of the environment of the Application `k`, on its section.
     pub(super) fn open_dashboard(&mut self, k: &Key, cx: &mut Context<Self>) {
         let Some(rows) = &self.rows else { return };
         let apps = &rows.fleet.apps;
         let Some(ix) = apps.iter().position(|a| key(a) == *k) else { return };
-        let (service, members) = rows
-            .services
-            .iter()
-            .find(|(_, m)| m.contains(&ix))
-            .map_or_else(|| (apps[ix].app.name.clone(), vec![ix]), |(s, m)| (s.clone(), m.clone()));
+        let Some(env) = rows.env_of.get(ix).and_then(|&e| rows.envs.get(e)) else { return };
+        let members = super::envs::section_order(env);
         let tab = members.iter().position(|&m| m == ix).unwrap_or(0);
-        let members = members.iter().map(|&m| key(&apps[m])).collect();
-        self.dashboard = Some(Dashboard::new(service, members, tab));
+        let mut d = Dashboard::new(env.name.clone(), members.iter().map(|&m| key(&apps[m])).collect(), tab);
+        d.kind = rows.types.name(env.kind).to_string();
+        d.server = apps[env.root()].server.name();
+        self.dashboard = Some(d);
         self.load_dashboard(cx);
     }
 
-    /// Open the dashboard of the service at `g` of the services, on its first Application.
-    pub(super) fn open_service(&mut self, g: usize, cx: &mut Context<Self>) {
-        let first = self.rows.as_ref().and_then(|r| r.services.get(g)?.1.first().map(|&m| key(&r.fleet.apps[m])));
-        if let Some(k) = first {
-            self.open_dashboard(&k, cx);
-        }
+    /// Where the environment shown is among those the list keeps (from 0), and how many.
+    fn env_position(&self) -> Option<(usize, usize)> {
+        let rows = self.rows.as_ref()?;
+        let k = self.dashboard.as_ref()?.members.first()?;
+        let ix = rows.fleet.apps.iter().position(|a| key(a) == *k)?;
+        let e = *rows.env_of.get(ix)?;
+        Some((self.env_order.iter().position(|&o| o == e)?, self.env_order.len()))
+    }
+
+    /// Open the environment before (`-1`) or after (`1`) the one shown, in the list's order.
+    fn step_env(&mut self, by: isize, cx: &mut Context<Self>) {
+        let Some((at, n)) = self.env_position() else { return };
+        let Some(to) = at.checked_add_signed(by).filter(|&t| t < n) else { return };
+        let Some(rows) = &self.rows else { return };
+        let Some(env) = rows.envs.get(self.env_order[to]) else { return };
+        let k = key(&rows.fleet.apps[env.main]);
+        self.open_dashboard(&k, cx);
     }
 
     pub(super) fn close_dashboard(&mut self, cx: &mut Context<Self>) {
@@ -233,6 +276,7 @@ impl ArgoView {
             return;
         }
         d.tab = tab;
+        d.failed = None;
         d.open.clear();
         d.close_compare();
         d.tick = None;
@@ -250,7 +294,7 @@ impl ArgoView {
         cx.notify();
     }
 
-    /// Read the tab shown, off the UI thread: by Argo CD's API, or on its hub. Its cards are
+    /// Read the tab shown, off the UI thread, by Argo CD's API. Its cards are
     /// worked out there too. A result for another tab than the one shown by then is left.
     pub(super) fn load_dashboard(&mut self, cx: &mut Context<Self>) {
         let Some(k) = self.dashboard.as_ref().filter(|d| d.example.is_none()).and_then(|d| d.current().cloned()) else {
@@ -267,10 +311,7 @@ impl ArgoView {
             return;
         };
         let (ns, name) = (a.app.namespace.clone(), a.app.name.clone());
-        let read: std::pin::Pin<Box<dyn Future<Output = Result<dashboard::Read, String>>>> = match &a.source {
-            Source::Hub(hub) => Box::pin(dashboard::read_hub(hub.clone(), ns, name)),
-            Source::Api(endpoint) => Box::pin(api::dashboard(endpoint.clone(), ns, name)),
-        };
+        let read = api::dashboard(a.server.clone(), ns, name);
         let exec = cx.background_executor().clone();
         let seen_key = k.clone();
         let work = async move {
@@ -336,7 +377,7 @@ impl ArgoView {
     }
 
     /// The read of the manifests rendered at the deployments `from` and `to` of the tab shown:
-    /// by Argo CD's API, or from the Argo CD server set for its hub.
+    /// by Argo CD's API.
     fn manifests_read(&self, spec: u64, from: &Entry, to: &Entry) -> DiffRead {
         let fail = |why: &str| -> DiffRead {
             let why = why.to_string();
@@ -353,10 +394,7 @@ impl ArgoView {
             return fail("This Application is no longer listed.");
         };
         let (ns, name) = (a.app.namespace.clone(), a.app.name.clone());
-        match &a.source {
-            Source::Hub(hub) => Box::pin(sync_diff::read_hub(hub.context.clone(), ns, name, spec, rf, rt)),
-            Source::Api(endpoint) => Box::pin(api::manifests_diff(endpoint.clone(), ns, name, spec, rf, rt)),
-        }
+        Box::pin(api::manifests_diff(a.server.clone(), ns, name, spec, rf, rt))
     }
 
     /// Compare the deployments `from` and `to` (ids, the older first) of the tab shown: their
@@ -431,20 +469,41 @@ impl ArgoView {
     pub fn demo_dashboard(&mut self, cx: &mut Context<Self>) {
         use dashboard::example;
         let now = Timestamp::now();
-        let tabs = example::ENVIRONMENTS
+        // An environment's three Applications, each shown with one of the example's reads.
+        let sections = ["workload", "managed-namespace", "shop-prod-acme (app of apps)"];
+        let tabs = sections
             .iter()
-            .map(|env| (env.to_string(), Arc::new(Cards::of(example::read(env, now), None, now))))
+            .zip([example::ENVIRONMENTS[1], example::ENVIRONMENTS[0], example::ENVIRONMENTS[2]])
+            .map(|(name, env)| (name.to_string(), Arc::new(Cards::of(example::read(env, now), None, now))))
             .collect();
-        let mut d = Dashboard::new("shop (example, no real data)".into(), Vec::new(), 1);
+        let mut d = Dashboard::new("shop-prod-acme (example, no real data)".into(), Vec::new(), 0);
+        d.kind = "prod".into();
+        d.server = "argocd.example.com".into();
         d.example = Some(tabs);
         d.updated = Some(now);
         self.dashboard = Some(d);
         cx.notify();
     }
 
+    /// The made-up example after a login expired: the tab shown keeps its last read with why in
+    /// one line, and the next one is shown as the Applications list has it.
+    #[cfg(feature = "dev")]
+    pub fn demo_dashboard_expired(&mut self, cx: &mut Context<Self>) {
+        self.demo_dashboard(cx);
+        let Some(d) = &mut self.dashboard else { return };
+        let why = "Argo CD at argocd.example.com doesn't take this token as a login: expired or revoked?";
+        d.failed = Some(kept_line(why));
+        let now = Timestamp::now();
+        if let Some((_, cards)) = d.example.as_mut().and_then(|t| t.get_mut(1)) {
+            let app = api::lean(&dashboard::example::read(dashboard::example::ENVIRONMENTS[0], now).app);
+            *cards = Arc::new(Cards::of(dashboard::Read::held(app, why), None, now));
+        }
+        cx.notify();
+    }
+
     // MARK: Rendering
 
-    /// The dashboard: its header, a tab per environment, and the cards of the one shown.
+    /// The dashboard: its header, an entry per environment, and the cards of the one shown.
     pub(super) fn dashboard_view(&self, cx: &mut Context<Self>) -> AnyElement {
         let Some(d) = &self.dashboard else { return div().into_any_element() };
         let theme = cx.theme().clone();
@@ -454,7 +513,6 @@ impl ArgoView {
             format!("Updated at {at}")
         });
         let current = d.current().and_then(|k| self.find(k));
-        let by_api = current.is_some_and(|a| matches!(a.source, Source::Api(_)));
         let header = h_flex()
             .gap_2()
             .child(
@@ -462,12 +520,51 @@ impl ArgoView {
                     .small()
                     .ghost()
                     .icon(Lucide::ArrowLeft)
-                    .label("Applications")
+                    .label("Environments")
                     .on_click(cx.listener(|this, _, _, cx| this.close_dashboard(cx))),
             )
-            .child(div().text_lg().font_weight(FontWeight::SEMIBOLD).child(format!("Argo CD · {}", d.service)))
+            .child(div().min_w_0().truncate().text_lg().font_weight(FontWeight::SEMIBOLD).child(d.title.clone()))
+            .when(!d.kind.is_empty(), |h| {
+                h.child(
+                    div()
+                        .flex_none()
+                        .px_1p5()
+                        .rounded(px(4.))
+                        .border_1()
+                        .border_color(theme.border)
+                        .text_xs()
+                        .child(d.kind.clone()),
+                )
+            })
+            .when(!d.server.is_empty(), |h| {
+                h.child(div().flex_none().text_xs().text_color(muted).child(d.server.clone()))
+            })
             .child(div().flex_1())
-            .children(updated.map(|u| div().text_xs().text_color(muted).child(u)))
+            .children(self.env_position().map(|(at, n)| {
+                h_flex()
+                    .flex_none()
+                    .gap_1()
+                    .child(
+                        Button::new("argo-dash-prev")
+                            .small()
+                            .ghost()
+                            .icon(Lucide::ChevronLeft)
+                            .accessibility_label("Previous environment")
+                            .disabled(at == 0)
+                            .on_click(cx.listener(|this, _, _, cx| this.step_env(-1, cx))),
+                    )
+                    .child(div().text_xs().text_color(muted).child(format!("{} / {n}", at + 1)))
+                    .child(
+                        Button::new("argo-dash-next")
+                            .small()
+                            .ghost()
+                            .icon(Lucide::ChevronRight)
+                            .accessibility_label("Next environment")
+                            .disabled(at + 1 >= n)
+                            .on_click(cx.listener(|this, _, _, cx| this.step_env(1, cx))),
+                    )
+            }))
+            .children(updated.map(|u| div().flex_none().text_xs().text_color(muted).child(u)))
             .child(
                 Button::new("argo-dash-refresh")
                     .small()
@@ -483,13 +580,36 @@ impl ArgoView {
                     Button::new("argo-dash-open")
                         .small()
                         .ghost()
-                        .icon(if by_api { Lucide::ExternalLink } else { Lucide::PanelRightOpen })
-                        .label(if by_api { "Open in Argo CD" } else { "Open" })
+                        .icon(Lucide::ExternalLink)
+                        .label("Open in Argo CD")
                         .on_click(cx.listener(move |this, _, _, cx| this.open(&k, cx))),
                 )
             });
-        let tabs: Vec<(String, Tone)> = if let Some(tabs) = &d.example {
-            tabs.iter().map(|(n, c)| (n.clone(), c.state.tone)).collect()
+        let environments = self.environments(d, cx);
+        let body = match d.shown() {
+            None => div().p_4().text_color(muted).child("Reading the Application…").into_any_element(),
+            Some(Err(e)) => div().p_4().text_color(theme.danger).child(selectable(e)).into_any_element(),
+            Some(Ok(cards)) => self.cards(d, &cards, cx),
+        };
+        let failed = d.failed.clone().filter(|_| d.shown().is_some_and(|c| c.is_ok()));
+        v_flex()
+            .size_full()
+            .gap_2()
+            .child(header)
+            .child(environments)
+            .children(failed.map(|f| div().text_xs().text_color(theme.warning).child(selectable(f))))
+            .child(div().id("argo-dash-body").flex_1().min_h_0().overflow_y_scroll().child(body))
+            .into_any_element()
+    }
+
+    /// An entry per Application of the environment (its sections: the workload first, the root
+    /// last), on more lines when the window is narrow: its state's dot, its name under the
+    /// environment's, its sync and health, and where it is read when two would read the same
+    /// otherwise. A click shows its cards.
+    fn environments(&self, d: &Dashboard, cx: &mut Context<Self>) -> Div {
+        let theme = cx.theme().clone();
+        let entries: Vec<(String, Option<String>, Tone)> = if let Some(tabs) = &d.example {
+            tabs.iter().map(|(n, c)| (n.clone(), None, c.state.tone)).collect()
         } else {
             // Two of the same name (another namespace or Argo CD), or several sources: each
             // says where it is read.
@@ -500,58 +620,80 @@ impl ArgoView {
                 .map(|k| {
                     let found = self.find(k);
                     let tone = found.map_or(Tone::Done, |a| argo::attention(&a.app));
-                    let label = if let Some(a) = found.filter(|_| sourced) {
-                        format!("{} · {}", k.2, a.source.label())
+                    // Named under the environment (`workload`); its root (named as it) as such.
+                    let root = k.2 == d.title && d.members.len() > 1;
+                    let label = if root {
+                        format!("{} (app of apps)", k.2)
                     } else {
-                        k.2.clone()
+                        super::envs::member_label(&d.title, &k.2).to_string()
                     };
-                    (label, tone)
+                    let state = found.map(|a| format!("{} · {}", a.app.sync, a.app.health));
+                    let detail = match (state, found.filter(|_| sourced).map(|a| a.server.name())) {
+                        (Some(s), Some(server)) => Some(format!("{s} · {server}")),
+                        (s, server) => s.or(server),
+                    };
+                    (label, detail, tone)
                 })
                 .collect()
         };
-        let view = cx.entity().downgrade();
-        let tab_bar = TabBar::new(SharedString::from(format!("argo-dash-tabs-{}-{}", tabs.len(), d.tab)))
-            .underline()
-            .selected_index(d.tab)
-            .children(tabs.iter().map(|(name, tone)| {
-                Tab::new().prefix(div().mr_1p5().size(px(8.)).rounded_full().bg(tone.color(cx))).label(name.clone())
-            }))
-            .on_click(move |ix: &usize, _, cx| {
-                let ix = *ix;
-                let _ = view.update(cx, |this, cx| this.select_dashboard_tab(ix, cx));
-            });
-        let body = match d.shown() {
-            None => div().p_4().text_color(muted).child("Reading the Application…").into_any_element(),
-            Some(Err(e)) => div().p_4().text_color(theme.danger).child(selectable(e)).into_any_element(),
-            Some(Ok(cards)) => self.cards(d, &cards, cx),
-        };
-        v_flex()
-            .size_full()
-            .gap_2()
-            .child(header)
-            .child(tab_bar)
-            .child(div().id("argo-dash-body").flex_1().min_h_0().overflow_y_scroll().child(body))
-            .into_any_element()
+        h_flex().flex_wrap().gap_1().children(entries.into_iter().enumerate().map(|(i, (name, source, tone))| {
+            let selected = i == d.tab;
+            h_flex()
+                .id(("argo-dash-env", i))
+                .max_w(px(ENV_MAX))
+                .min_w_0()
+                .gap_1p5()
+                .px_2()
+                .py_0p5()
+                .rounded_md()
+                .border_1()
+                .text_sm()
+                .cursor_pointer()
+                .border_color(if selected { theme.foreground.opacity(0.45) } else { theme.border })
+                .when(selected, |h| h.bg(theme.secondary).font_weight(FontWeight::MEDIUM))
+                .when(!selected, |h| h.text_color(theme.muted_foreground).hover(|s| s.bg(theme.secondary)))
+                .child(div().flex_none().size(px(8.)).rounded_full().bg(tone.color(cx)))
+                .child(div().min_w_0().truncate().child(name))
+                .children(
+                    source.map(|s| div().min_w_0().truncate().text_xs().text_color(theme.muted_foreground).child(s)),
+                )
+                .on_click(cx.listener(move |this, _, _, cx| this.select_dashboard_tab(i, cx)))
+        }))
     }
 
+    /// The four status tiles (two pairs that stack on a narrow window), the parts unfolded
+    /// from them full width, then the Versions and History panels.
     fn cards(&self, d: &Dashboard, c: &Cards, cx: &mut Context<Self>) -> AnyElement {
-        let muted = cx.theme().muted_foreground;
+        let pair = |a: Div, b: Div| {
+            h_flex()
+                .flex_wrap()
+                .items_stretch()
+                .gap_3()
+                .flex_grow(1.)
+                .flex_basis(px(2. * TILE + 12.))
+                .min_w_0()
+                .child(a)
+                .child(b)
+        };
+        let status = pair(self.state_card(d, c, cx), self.last_sync_card(d, c, cx));
+        let changes = pair(self.diff_card(d, c, cx), self.problems_card(d, c, cx));
+        let unfolded = self.unfolded(d, c, cx);
         v_flex()
-            .gap_2()
+            .gap_3()
             .pb_4()
-            .when_some(c.note.clone(), |v, note| v.child(div().text_xs().text_color(muted).child(selectable(note))))
+            .when_some(c.note.as_ref(), |v, why| {
+                let line = format!("Not read now ({why}): shown as the Applications list has it.");
+                v.child(div().text_xs().text_color(cx.theme().warning).child(selectable(line)))
+            })
+            .child(h_flex().flex_wrap().items_stretch().gap_3().child(status).child(changes))
+            .children(unfolded)
             .child(
                 h_flex()
                     .flex_wrap()
                     .items_start()
                     .gap_3()
-                    .child(self.state_card(d, c, cx))
-                    .child(self.versions_card(d, c, cx))
-                    .child(in_cluster_card(c, cx))
-                    .child(self.problems_card(d, c, cx))
-                    .child(self.last_sync_card(d, c, cx))
-                    .child(self.diff_card(d, c, cx))
-                    .child(self.history_card(d, c, cx)),
+                    .child(self.versions_card(d, c, cx).flex_grow(3.).flex_basis(px(VERSIONS)))
+                    .child(self.history_card(d, c, cx).flex_grow(2.).flex_basis(px(HISTORY))),
             )
             .when_some(d.compare.as_ref(), |v, cmp| v.child(self.compare_view(cmp, cx)))
             .into_any_element()
@@ -576,132 +718,134 @@ impl ArgoView {
             1 => format!("{first} Degraded"),
             n => format!("{first} Degraded +{}", n - 1),
         });
-        let why = self.toggle_link("why", "why", "Why?", d, cx);
+        let why = (!c.findings.is_empty()).then(|| self.toggle_link("why", "why", "why?", d, cx));
         let theme = cx.theme().clone();
-        card("State", Some(s.tone), cx)
-            .child(div().text_2xl().font_weight(FontWeight::BOLD).text_color(sync_tone.color(cx)).child(s.sync.clone()))
-            .child(
-                div()
-                    .text_sm()
-                    .text_color(argo::listed_health_tone(&s.health, c.summary.automated).color(cx))
-                    .child(selectable(s.health.clone())),
-            )
-            .when_some(s.health_message.clone(), |v, m| {
-                v.child(div().text_xs().text_color(theme.muted_foreground).child(selectable(m)))
-            })
+        tile("State", Some(s.tone), cx)
+            .child(figure(s.sync.clone(), sync_tone.color(cx)))
             .child(
                 h_flex()
-                    .gap_2()
+                    .gap_1p5()
+                    .min_w_0()
                     .text_sm()
-                    .children(degraded.map(|t| div().text_color(theme.danger).child(selectable(t))))
-                    .when(!c.findings.is_empty(), |h| h.child(why)),
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_color(argo::listed_health_tone(&s.health, c.summary.automated).color(cx))
+                            .child(selectable(s.health.clone())),
+                    )
+                    .children(
+                        degraded.map(|t| div().min_w_0().truncate().text_color(theme.danger).child(selectable(t))),
+                    ),
             )
-            .when(d.is_open("why"), |v| {
-                v.children(c.findings.iter().map(|f| {
-                    v_flex()
-                        .gap_0p5()
-                        .pt_1()
-                        .child(
-                            h_flex()
-                                .gap_1p5()
-                                .child(div().size(px(7.)).flex_none().rounded_full().bg(f.tone.color(cx)))
-                                .child(
-                                    div().text_sm().font_weight(FontWeight::MEDIUM).child(selectable(f.title.clone())),
-                                ),
-                        )
-                        .when_some(f.message.clone(), |v, m| v.child(div().text_xs().child(selectable(m))))
-                        .children(f.objects.iter().take(4).map(|(r, what)| {
-                            div()
-                                .text_xs()
-                                .text_color(theme.muted_foreground)
-                                .child(selectable(format!("{}: {what}", r.label())))
-                        }))
-                        .child(div().text_xs().text_color(theme.muted_foreground).child(selectable(f.hint.clone())))
-                }))
+            .when_some(s.health_message.clone(), |v, m| {
+                v.child(div().text_xs().text_color(theme.muted_foreground).line_clamp(2).child(selectable(m)))
             })
+            .children(why.map(|w| h_flex().child(w)))
     }
 
-    fn versions_card(&self, d: &Dashboard, c: &Cards, cx: &mut Context<Self>) -> Div {
-        let v = &c.versions;
+    fn last_sync_card(&self, d: &Dashboard, c: &Cards, cx: &mut Context<Self>) -> Div {
         let theme = cx.theme().clone();
-        let chips = h_flex().flex_wrap().gap_1p5().children(v.images.iter().map(|i| {
-            let changed = i.from.is_some();
-            let text = match &i.from {
-                Some(from) => format!("{from} → {}", i.tag),
-                None => i.tag.clone(),
-            };
-            h_flex()
-                .gap_1()
-                .px_2()
-                .py_0p5()
-                .rounded_md()
-                .border_1()
-                .text_sm()
-                .border_color(if changed { theme.danger } else { theme.border })
-                .when(changed, |h| h.bg(theme.danger.opacity(0.1)))
-                .child(div().text_color(theme.muted_foreground).child(selectable(i.component.clone())))
-                .child(
-                    div()
-                        .font_weight(FontWeight::BOLD)
-                        .text_color(if changed { theme.danger } else { theme.foreground })
-                        .child(selectable(text)),
-                )
-        }));
-        let mut released = Vec::new();
-        if let Some(t) = v.released {
-            released.push(format!("Released {} ago", k8s::age(t)));
-        }
-        if let Some(by) = &v.by {
-            released.push(format!("by {by}"));
-        }
-        let released = released.join(" ");
-        let line = match &v.previous {
-            Some(p) if released.is_empty() => format!("previous: {p}"),
-            Some(p) => format!("{released} · previous: {p}"),
-            None => released,
+        let muted = theme.muted_foreground;
+        let Some(s) = &c.last_sync else {
+            return tile("Last sync", None, cx).child(figure("Never".into(), muted));
         };
-        let rollback = match (v.auto_sync, v.rollback_to) {
-            (true, _) => div()
-                .text_xs()
-                .text_color(theme.muted_foreground)
-                .child("Auto-sync is on: Argo CD allows no rollback.")
-                .into_any_element(),
-            (false, None) => div()
-                .text_xs()
-                .text_color(theme.muted_foreground)
-                .child("No deployment before this one to roll back to.")
-                .into_any_element(),
-            (false, Some(id)) => {
-                let k = d.current().cloned();
-                Button::new("argo-dash-rollback")
-                    .small()
-                    .outline()
-                    .icon(Lucide::Undo2)
-                    .label(format!("Roll back to deployment {id}…"))
-                    .disabled(k.is_none())
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        if let Some(k) = &k {
-                            this.act(k, ArgoAction::Rollback(Some(id)), window, cx);
-                        }
-                    }))
-                    .into_any_element()
-            }
-        };
-        card("Versions", None, cx)
-            .child(if v.images.is_empty() {
-                div().text_sm().text_color(theme.muted_foreground).child("Argo CD lists no image.").into_any_element()
+        let now = Timestamp::now();
+        let mut facts = Vec::new();
+        if let Some(t) = s.finished.or(s.started) {
+            facts.push(format!("{} ago", k8s::age(t)));
+        }
+        if let Some(by) = &s.by {
+            facts.push(format!("by {by}"));
+        }
+        if let Some(secs) = s.seconds(now) {
+            facts.push(if s.running {
+                format!("running for {}", span_text(secs))
             } else {
-                chips.into_any_element()
+                format!("took {}", span_text(secs))
+            });
+        }
+        if let Some(r) = &s.revision {
+            facts.push(short_revision(r));
+        }
+        let progress = (s.running && !s.steps.is_empty()).then(|| {
+            let share = s.done as f32 / s.steps.len() as f32;
+            v_flex().gap_0p5().child(div().text_xs().child(format!("{} of {} steps", s.done, s.steps.len()))).child(
+                div()
+                    .h(px(4.))
+                    .w_full()
+                    .rounded_full()
+                    .bg(theme.muted)
+                    .child(div().h_full().w(relative(share)).rounded_full().bg(theme.warning)),
+            )
+        });
+        // Argo CD says the same of every sync that went well: only another message is shown.
+        let message = s.message.clone().filter(|_| s.tone != Tone::Good);
+        let steps = (!s.steps.is_empty()).then(|| self.toggle_link("steps", "steps", "steps", d, cx));
+        let journal = self.journal_link("argo-dash-journal-sync", d, cx);
+        tile("Last sync", Some(s.tone), cx)
+            .child(figure(s.phase.clone(), s.tone.color(cx)))
+            .child(div().text_xs().text_color(muted).child(selectable(facts.join(" · "))))
+            .when_some(message, |v, m| v.child(div().text_xs().line_clamp(3).child(selectable(m))))
+            .children(progress)
+            .child(h_flex().gap_2().children(steps).children(journal))
+    }
+
+    fn diff_card(&self, d: &Dashboard, c: &Cards, cx: &mut Context<Self>) -> Div {
+        let theme = cx.theme().clone();
+        let muted = theme.muted_foreground;
+        let diff = &c.diff;
+        let total = diff.total();
+        // Read from the Application's status, not Argo CD's diff: said on hover, with why.
+        let tip = match &c.git_diff {
+            Some(Err(e)) => Some(format!("Argo CD's diff couldn't be read ({e}): from the Application's status.")),
+            _ if !diff.from_argo && total > 0 => Some("From the Application's status.".to_string()),
+            _ => None,
+        };
+        let from_status = tip.map(|tip| hint("argo-dash-diff-source", "from status", tip, cx));
+        // A list's copy holds no resources: what differs isn't known, only that something does.
+        if total == 0 && c.note.is_some() && c.summary.sync != "Synced" {
+            return tile("Sync diff", None, cx)
+                .child(figure(c.summary.sync.clone(), muted))
+                .child(div().text_xs().text_color(muted).child("What differs wasn't read."));
+        }
+        if total == 0 {
+            return tile("Sync diff", Some(Tone::Good), cx)
+                .child(figure("In sync".into(), theme.success))
+                .child(div().text_xs().text_color(muted).child("The cluster matches git."))
+                .children(from_status.map(|h| h_flex().child(h)));
+        }
+        let names = |sign: &str, list: &[Res]| {
+            (!list.is_empty()).then(|| {
+                let mut shown: Vec<String> = list.iter().take(NAMES_SHOWN).map(|r| r.name.clone()).collect();
+                if list.len() > NAMES_SHOWN {
+                    shown.push(format!("+{}", list.len() - NAMES_SHOWN));
+                }
+                format!("{sign} {}", shown.join(", "))
             })
-            .when(!line.is_empty(), |c| {
-                c.child(div().text_xs().text_color(theme.muted_foreground).child(selectable(line)))
-            })
-            .child(div().child(rollback))
+        };
+        let changed: Vec<Res> = diff.changed.iter().chain(&diff.unknown).cloned().collect();
+        let lines: Vec<String> = [names("~", &changed[..]), names("+", &diff.added[..]), names("–", &diff.pruned[..])]
+            .into_iter()
+            .flatten()
+            .collect();
+        let tone = if c.summary.automated { Tone::Busy } else { Tone::Done };
+        let show = self.toggle_link("diff", "diff", "show", d, cx);
+        tile("Sync diff", Some(tone), cx)
+            .child(figure(
+                format!("{total} {}", crate::plural::pick(total, "differs", "differ")),
+                if tone == Tone::Done { theme.foreground } else { tone.color(cx) },
+            ))
+            .child(div().text_xs().text_color(muted).child(diff.text()))
+            .children(lines.into_iter().map(|l| {
+                div().min_w_0().truncate().text_xs().font_family(theme.mono_font_family.clone()).child(selectable(l))
+            }))
+            .child(h_flex().gap_2().child(show).children(from_status))
     }
 
     fn problems_card(&self, d: &Dashboard, c: &Cards, cx: &mut Context<Self>) -> Div {
         let p = &c.problems;
         let theme = cx.theme().clone();
+        let muted = theme.muted_foreground;
         // Nothing found is only good news when the tree was read or the Application is
         // Healthy: from a status without health, nothing found says nothing.
         let known_clean = c.clean_is_known();
@@ -714,62 +858,167 @@ impl ArgoView {
         } else {
             Tone::Busy
         };
-        let no_detail = (p.rows.is_empty() && !known_clean).then(|| {
-            let why = c.tree_error.clone().or_else(|| c.note.clone()).unwrap_or_else(|| {
-                "Argo CD keeps no health per resource in the Application, and its resource tree wasn't read".into()
-            });
-            format!("No detail: {why}.")
+        let (figure_text, color) = match p.rows.len() {
+            0 if known_clean => ("None".to_string(), theme.success),
+            0 => ("Unknown".to_string(), muted),
+            n => (n.to_string(), tone.color(cx)),
+        };
+        // Why nothing can be said, or why the pods aren't listed: on hover.
+        let unknown = (p.rows.is_empty() && !known_clean).then(|| {
+            let why = c
+                .tree_error
+                .clone()
+                .or_else(|| c.note.as_ref().map(|n| format!("Not read now ({n})")))
+                .unwrap_or_else(|| {
+                    "Argo CD keeps no health per resource in the Application, and its resource tree wasn't read".into()
+                });
+            hint("argo-dash-problems-why", "no detail", format!("{why}."), cx)
         });
-        let all = d.is_open("problems");
-        let shown = if all { p.rows.len() } else { p.rows.len().min(PROBLEMS_SHOWN) };
-        let rows: Vec<Div> = p.rows.iter().take(shown).map(|r| self.problem_row(d, r, cx)).collect();
-        let more = p.rows.len() - shown;
+        let tree_unread = c
+            .tree_error
+            .clone()
+            .filter(|_| !p.from_tree && unknown.is_none())
+            .map(|e| hint("argo-dash-tree-error", "pods unread", e, cx));
+        let rows: Vec<Div> = p
+            .rows
+            .iter()
+            .take(PROBLEMS_IN_TILE)
+            .map(|r| {
+                h_flex()
+                    .gap_1p5()
+                    .min_w_0()
+                    .text_xs()
+                    .child(chip(&r.status, r.tone, cx))
+                    .child(div().min_w_0().truncate().child(selectable(r.res.name.clone())))
+            })
+            .collect();
+        let list = (!p.rows.is_empty()).then(|| {
+            let more = p.rows.len().saturating_sub(PROBLEMS_IN_TILE);
+            let label = if more > 0 { format!("+{more} more") } else { "details".to_string() };
+            self.toggle_link("problems", "problems", &label, d, cx)
+        });
         let k = d.current().cloned();
         let reaches =
             k.as_ref().and_then(|k| self.find(k)).is_some_and(|a| a.on.is_some() && !a.dest.namespace.is_empty());
-        let all_pods = if reaches {
-            link("argo-dash-all-pods", "all pods", cx).on_click(cx.listener(move |this, _, _, cx| {
-                if let Some(k) = &k {
-                    this.open_destination(k, cx);
-                }
-            }))
-        } else {
-            self.toggle_link("pods", "pods", "all pods", d, cx)
-        };
-        card("Problems", Some(tone), cx)
-            .when(p.rows.is_empty() && known_clean, |v| {
-                v.child(div().text_sm().text_color(theme.success).child("Nothing wrong."))
-            })
-            .when_some(no_detail.clone(), |v, text| {
-                v.child(div().text_sm().text_color(theme.muted_foreground).child(selectable(text)))
+        let all_pods = (p.from_tree && !p.pods.is_empty()).then(|| {
+            if reaches {
+                link("argo-dash-all-pods", "pods", cx).on_click(cx.listener(move |this, _, _, cx| {
+                    if let Some(k) = &k {
+                        this.open_destination(k, cx);
+                    }
+                }))
+            } else {
+                self.toggle_link("pods", "pods", "pods", d, cx)
+            }
+        });
+        tile("Problems", Some(tone), cx)
+            .child(figure(figure_text, color))
+            .when(p.from_tree, |v| {
+                v.child(div().text_xs().text_color(muted).child(format!(
+                    "{} · {} in trouble",
+                    crate::plural::count(p.pods.len(), "pod"),
+                    p.troubled
+                )))
             })
             .children(rows)
-            .when(more > 0, |v| v.child(self.toggle_link("more", "problems", &format!("+{more} more"), d, cx)))
-            .when(p.from_tree, |v| {
-                v.child(
+            .child(h_flex().gap_2().children(list).children(all_pods).children(unknown).children(tree_unread))
+    }
+
+    /// The parts unfolded from the tiles, full width under them: each has room for its lines.
+    fn unfolded(&self, d: &Dashboard, c: &Cards, cx: &mut Context<Self>) -> Vec<Div> {
+        let theme = cx.theme().clone();
+        let muted = theme.muted_foreground;
+        let mut out = Vec::new();
+        if d.is_open("why") && !c.findings.is_empty() {
+            out.push(self.panel("Why", "why", d, cx).children(c.findings.iter().map(|f| {
+                v_flex()
+                    .gap_0p5()
+                    .child(
+                        h_flex()
+                            .gap_1p5()
+                            .child(div().size(px(7.)).flex_none().rounded_full().bg(f.tone.color(cx)))
+                            .child(div().text_sm().font_weight(FontWeight::MEDIUM).child(selectable(f.title.clone()))),
+                    )
+                    .when_some(f.message.clone(), |v, m| v.child(div().text_xs().child(selectable(m))))
+                    .children(f.objects.iter().take(4).map(|(r, what)| {
+                        div().text_xs().text_color(muted).child(selectable(format!("{}: {what}", r.label())))
+                    }))
+                    .child(div().text_xs().text_color(muted).child(selectable(f.hint.clone())))
+            })));
+        }
+        if let Some(s) = c.last_sync.as_ref().filter(|s| d.is_open("steps") && !s.steps.is_empty()) {
+            let is_open = |key: &str| d.is_open(&format!("steps-{key}"));
+            let toggle: super::journal::StepsToggle =
+                std::rc::Rc::new(|this, key, cx| this.toggle_part(format!("steps-{key}"), cx));
+            let of = super::journal::StepsOf {
+                id: "argo-dash-steps".into(),
+                steps: &s.steps,
+                summary: &s.summary,
+                seen: &[],
+                running: s.running,
+                ended: s.finished.map(Timestamp::as_second),
+                query: &self.steps_query,
+                is_open: &is_open,
+            };
+            out.push(
+                self.panel("Sync steps", "steps", d, cx)
+                    .child(div().w(px(260.)).child(Input::new(&self.steps_search).small().cleanable(true)))
+                    .child(self.steps_view(&of, toggle, Timestamp::now(), cx)),
+            );
+        }
+        if d.is_open("diff") && c.diff.total() > 0 {
+            let diff = &c.diff;
+            let panel = self.panel("Sync diff", "diff", d, cx);
+            out.push(match &c.git_diff {
+                Some(Ok(g)) => panel.children(g.changed.iter().map(|r| {
+                    v_flex()
+                        .gap_0p5()
+                        .child(div().text_xs().font_weight(FontWeight::MEDIUM).child(selectable(format!(
+                            "{} ({})",
+                            r.res.label(),
+                            r.change.text()
+                        ))))
+                        .child(crate::details::diff_block(&r.lines, cx))
+                })),
+                _ => panel.children(
+                    diff.changed
+                        .iter()
+                        .chain(&diff.unknown)
+                        .map(|r| (r, "differs"))
+                        .chain(diff.added.iter().map(|r| (r, "to create")))
+                        .chain(diff.pruned.iter().map(|r| (r, "to prune")))
+                        .map(|(r, what)| div().text_xs().child(selectable(format!("{}: {what}", r.label())))),
+                ),
+            });
+        }
+        if d.is_open("problems") && !c.problems.rows.is_empty() {
+            let rows: Vec<Div> = c.problems.rows.iter().map(|r| self.problem_row(d, r, cx)).collect();
+            out.push(self.panel("Problems", "problems", d, cx).children(rows));
+        }
+        if d.is_open("pods") && !c.problems.pods.is_empty() {
+            out.push(self.panel("Pods", "pods", d, cx).child(h_flex().flex_wrap().gap_x_4().gap_y_1().children(
+                c.problems.pods.iter().map(|pod| {
                     h_flex()
-                        .gap_2()
-                        .text_xs()
-                        .text_color(theme.muted_foreground)
-                        .child(format!("{} · {} in trouble", crate::plural::count(p.pods.len(), "pod"), p.troubled))
-                        .when(!p.pods.is_empty(), |h| h.child(all_pods)),
-                )
-            })
-            .when(!p.from_tree && no_detail.is_none(), |v| {
-                let why = c.tree_error.clone().unwrap_or_else(|| {
-                    "From the Application's status: its pods are in Argo CD's resource tree.".into()
-                });
-                v.child(div().text_xs().text_color(theme.muted_foreground).child(selectable(why)))
-            })
-            .when(d.is_open("pods") && !reaches, |v| {
-                v.children(p.pods.iter().map(|pod| {
-                    h_flex()
-                        .gap_2()
+                        .gap_1p5()
                         .text_xs()
                         .child(chip(&pod.status, pod.tone, cx))
                         .child(selectable(pod.res.name.clone()))
-                }))
-            })
+                }),
+            )));
+        }
+        out
+    }
+
+    /// A part unfolded, full width, with its title and a link to fold it.
+    fn panel(&self, title: &str, part: &str, d: &Dashboard, cx: &mut Context<Self>) -> Div {
+        let hide = self.toggle_link(&format!("{part}-fold"), part, "hide", d, cx);
+        let muted = cx.theme().muted_foreground;
+        frame(cx).w_full().child(
+            h_flex()
+                .gap_2()
+                .child(div().text_xs().font_weight(FontWeight::SEMIBOLD).text_color(muted).child(title.to_uppercase()))
+                .child(hide),
+        )
     }
 
     fn problem_row(&self, d: &Dashboard, r: &Problem, cx: &mut Context<Self>) -> Div {
@@ -790,17 +1039,23 @@ impl ArgoView {
             .child(
                 h_flex()
                     .gap_2()
+                    .min_w_0()
                     .text_sm()
                     .child(chip(&r.status, r.tone, cx))
                     .child(
                         div()
                             .font_weight(FontWeight::MEDIUM)
                             .min_w_0()
-                            .overflow_hidden()
-                            .text_ellipsis()
+                            .truncate()
                             .child(selectable(r.res.name.clone())),
                     )
-                    .child(div().text_xs().text_color(theme.muted_foreground).child(selectable(facts.join(" · "))))
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child(selectable(facts.join(" · "))),
+                    )
                     .children(why),
             )
             .when(open, |v| {
@@ -824,149 +1079,68 @@ impl ArgoView {
         )
     }
 
-    fn last_sync_card(&self, d: &Dashboard, c: &Cards, cx: &mut Context<Self>) -> Div {
+    /// The images running, the commit each source deploys, and who released it.
+    fn versions_card(&self, d: &Dashboard, c: &Cards, cx: &mut Context<Self>) -> Div {
+        let v = &c.versions;
         let theme = cx.theme().clone();
         let muted = theme.muted_foreground;
-        let Some(s) = &c.last_sync else {
-            return card("Last sync", None, cx).child(div().text_sm().text_color(muted).child("Never synced."));
-        };
-        let now = Timestamp::now();
-        let mut facts = Vec::new();
-        if let Some(secs) = s.seconds(now) {
-            facts.push(if s.running {
-                format!("running for {}", span_text(secs))
-            } else {
-                format!("took {}", span_text(secs))
-            });
+        let chips =
+            h_flex().flex_wrap().gap_1p5().children(v.images.iter().enumerate().map(|(i, img)| image_chip(i, img, cx)));
+        let mut released = Vec::new();
+        if let Some(t) = v.released {
+            released.push(format!("Released {} ago", k8s::age(t)));
         }
-        if let Some(by) = &s.by {
-            facts.push(format!("by {by}"));
+        if let Some(by) = &v.by {
+            released.push(format!("by {by}"));
         }
-        if let Some(t) = s.finished.or(s.started) {
-            facts.push(format!("{} ago", k8s::age(t)));
-        }
-        if let Some(r) = &s.revision {
-            facts.push(format!("revision {r}"));
-        }
-        let progress = (s.running && !s.steps.is_empty()).then(|| {
-            let share = s.done as f32 / s.steps.len() as f32;
-            v_flex().gap_0p5().child(div().text_xs().child(format!("{} of {} steps", s.done, s.steps.len()))).child(
-                div()
-                    .h(px(4.))
-                    .w_full()
-                    .rounded_full()
-                    .bg(theme.muted)
-                    .child(div().h_full().w(relative(share)).rounded_full().bg(theme.warning)),
-            )
-        });
-        let steps = (!s.steps.is_empty()).then(|| self.toggle_link("steps", "steps", "steps", d, cx));
-        let journal = self.journal_link("argo-dash-journal-sync", d, cx);
-        card("Last sync", Some(s.tone), cx)
-            .child(div().text_xl().font_weight(FontWeight::BOLD).text_color(s.tone.color(cx)).child(s.phase.clone()))
-            .when_some(s.message.clone(), |v, m| v.child(div().text_xs().child(selectable(m))))
-            .children(progress)
-            .child(
-                h_flex()
-                    .gap_2()
-                    .text_xs()
-                    .text_color(muted)
-                    .child(selectable(facts.join(" · ")))
-                    .children(steps)
-                    .children(journal),
-            )
-            .when(d.is_open("steps"), |v| {
-                v.children(s.steps.iter().map(|st| {
-                    v_flex()
-                        .child(
-                            h_flex()
-                                .gap_2()
-                                .text_xs()
-                                .child(chip(
-                                    if st.status.is_empty() { "Waiting" } else { st.status.as_str() },
-                                    st.tone,
-                                    cx,
-                                ))
-                                .child(selectable(st.res.label()))
-                                .when(st.hook, |h| h.child(div().text_color(muted).child("hook"))),
-                        )
-                        .when_some(st.message.clone(), |v, m| {
-                            v.child(div().pl_2().text_xs().text_color(muted).child(selectable(m)))
-                        })
-                }))
-            })
-    }
-
-    fn diff_card(&self, d: &Dashboard, c: &Cards, cx: &mut Context<Self>) -> Div {
-        let theme = cx.theme().clone();
-        let muted = theme.muted_foreground;
-        let diff = &c.diff;
-        let total = diff.total();
-        if total == 0 {
-            let error = match &c.git_diff {
-                Some(Err(e)) => Some(format!("Argo CD's diff couldn't be read ({e}): from the Application's status.")),
-                _ => None,
-            };
-            return card("Sync diff", Some(Tone::Good), cx)
-                .child(div().text_sm().child("Nothing to sync: the cluster matches git."))
-                .children(error.map(|e| div().text_xs().text_color(muted).child(selectable(e))));
-        }
-        let names = |sign: &str, list: &[Res]| {
-            (!list.is_empty()).then(|| {
-                let mut shown: Vec<String> = list.iter().take(NAMES_SHOWN).map(|r| r.name.clone()).collect();
-                if list.len() > NAMES_SHOWN {
-                    shown.push(format!("+{}", list.len() - NAMES_SHOWN));
-                }
-                format!("{sign} {}", shown.join(", "))
-            })
-        };
-        let changed: Vec<Res> = diff.changed.iter().chain(&diff.unknown).cloned().collect();
-        let lines: Vec<String> = [names("~", &changed[..]), names("+", &diff.added[..]), names("–", &diff.pruned[..])]
-            .into_iter()
-            .flatten()
-            .collect();
-        let tone = if c.summary.automated { Tone::Busy } else { Tone::Done };
-        let source = if diff.from_argo {
-            "From Argo CD's diff.".to_string()
-        } else {
-            match &c.git_diff {
-                Some(Err(e)) => format!("From the Application's status: Argo CD's diff couldn't be read ({e})."),
-                _ => "From the Application's status.".to_string(),
+        let rollback = match (v.auto_sync, v.rollback_to) {
+            (true, _) => Some(
+                hint("argo-dash-no-rollback", "no rollback", "Auto-sync is on: Argo CD allows no rollback.".into(), cx)
+                    .into_any_element(),
+            ),
+            (false, None) => None,
+            (false, Some(id)) => {
+                let k = d.current().cloned();
+                Some(
+                    Button::new("argo-dash-rollback")
+                        .small()
+                        .outline()
+                        .icon(Lucide::Undo2)
+                        .label(format!("Roll back to #{id}…"))
+                        .disabled(k.is_none())
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            if let Some(k) = &k {
+                                this.act(k, ArgoAction::Rollback(Some(id)), window, cx);
+                            }
+                        }))
+                        .into_any_element(),
+                )
             }
         };
-        let show = self.toggle_link("diff", "diff", "show", d, cx);
-        card("Sync diff", Some(tone), cx)
-            .child(
-                div()
-                    .text_xl()
-                    .font_weight(FontWeight::BOLD)
-                    .child(format!("{total} {}", crate::plural::pick(total, "resource differs", "resources differ"))),
-            )
-            .child(div().text_sm().child(diff.text()))
-            .children(
-                lines
-                    .into_iter()
-                    .map(|l| div().text_xs().font_family(theme.mono_font_family.clone()).child(selectable(l))),
-            )
-            .child(h_flex().gap_2().text_xs().text_color(muted).child(source).child(show))
-            .when(d.is_open("diff"), |v| match &c.git_diff {
-                Some(Ok(g)) => v.children(g.changed.iter().map(|r| {
-                    v_flex()
-                        .gap_0p5()
-                        .child(div().text_xs().font_weight(FontWeight::MEDIUM).child(selectable(format!(
-                            "{} ({})",
-                            r.res.label(),
-                            r.change.text()
-                        ))))
-                        .child(crate::details::diff_block(&r.lines, cx))
-                })),
-                _ => v.children(
-                    changed
-                        .iter()
-                        .map(|r| (r, "differs"))
-                        .chain(diff.added.iter().map(|r| (r, "to create")))
-                        .chain(diff.pruned.iter().map(|r| (r, "to prune")))
-                        .map(|(r, what)| div().text_xs().child(selectable(format!("{}: {what}", r.label())))),
-                ),
+        let title = match v.images.len() {
+            0 => "Versions".to_string(),
+            n => format!("Versions · {}", crate::plural::count(n, "image")),
+        };
+        card(&title, None, cx)
+            .child(if v.images.is_empty() {
+                div().text_sm().text_color(muted).child("Argo CD lists no image.").into_any_element()
+            } else {
+                chips.into_any_element()
+            })
+            .when_some(v.previous.clone(), |c, p| {
+                c.child(div().text_xs().text_color(muted).child(selectable(format!("Before: {}", short_revision(&p)))))
+            })
+            .children(c.deployed.iter().enumerate().map(|(i, (dep, commit))| deployed_row(i, dep, commit.as_ref(), cx)))
+            .when(!released.is_empty() || rollback.is_some(), |c| {
+                c.child(
+                    h_flex()
+                        .gap_2()
+                        .pt_1()
+                        .child(
+                            div().flex_1().min_w_0().text_xs().text_color(muted).child(selectable(released.join(" "))),
+                        )
+                        .children(rollback),
+                )
             })
     }
 
@@ -975,11 +1149,11 @@ impl ArgoView {
         let muted = theme.muted_foreground;
         let h = &c.history;
         let tone = if h.dots.last().is_some_and(|dot| !dot.ok) { Some(Tone::Bad) } else { None };
-        let open = self.toggle_link("history", "history", "open", d, cx);
+        let open = self.toggle_link("history", "history", "list", d, cx);
         let journal = self.journal_link("argo-dash-journal-history", d, cx);
         card("History", tone, cx)
             .when(h.dots.is_empty(), |v| v.child(div().text_sm().text_color(muted).child("No deployment yet.")))
-            .child(h_flex().gap_1().children(
+            .child(h_flex().flex_wrap().gap_1().children(
                 h.dots.iter().map(|dot| {
                     div().size(px(12.)).rounded_full().bg(if dot.ok { theme.success } else { theme.danger })
                 }),
@@ -994,12 +1168,7 @@ impl ArgoView {
                     .children(journal),
             )
             .when(d.is_open("history") && h.entries.len() > 1, |v| {
-                v.child(
-                    div()
-                        .text_xs()
-                        .text_color(muted)
-                        .child("diff: what changed since the deployment before; pick two to compare them."),
-                )
+                v.child(div().text_xs().text_color(muted).child("Pick two to compare them."))
             })
             .when(d.is_open("history"), |v| {
                 v.children(h.dots.iter().rev().map(|dot| {
@@ -1014,7 +1183,7 @@ impl ArgoView {
                         None => "failed sync".to_string(),
                     }];
                     if !dot.revision.is_empty() {
-                        parts.push(dot.revision.clone());
+                        parts.push(short_revision(&dot.revision));
                     }
                     if let Some(t) = dot.at {
                         parts.push(format!("{} ago", k8s::age(t)));
@@ -1026,8 +1195,12 @@ impl ArgoView {
                     h_flex()
                         .gap_1p5()
                         .text_xs()
-                        .child(div().size(px(7.)).rounded_full().bg(if dot.ok { theme.success } else { theme.danger }))
-                        .child(div().flex_1().min_w_0().child(selectable(parts.join(" · "))))
+                        .child(div().size(px(7.)).flex_none().rounded_full().bg(if dot.ok {
+                            theme.success
+                        } else {
+                            theme.danger
+                        }))
+                        .child(div().flex_1().min_w_0().truncate().child(selectable(parts.join(" · "))))
                         .when_some(before, |row, (from, to)| {
                             let label = if shown(from, to) { "hide diff" } else { "diff" };
                             row.child(
@@ -1228,41 +1401,75 @@ pub(super) fn lines_block(lines: &[crate::history::DiffLine], cx: &App) -> Div {
         })
 }
 
-/// The In cluster card: the commit each source deploys.
-fn in_cluster_card(c: &Cards, cx: &App) -> Div {
+/// An image running: its component, and its tag made short (`main-eab9300`), the old tag before
+/// it when it changed. The whole reference on hover, copied by a click.
+fn image_chip(i: usize, img: &dashboard::Image, cx: &App) -> Stateful<Div> {
     let theme = cx.theme();
-    let muted = theme.muted_foreground;
-    let several = c.deployed.len() > 1;
-    card("In cluster", None, cx)
-        .when(c.deployed.is_empty(), |v| v.child(div().text_sm().text_color(muted).child("Nothing deployed yet.")))
-        .children(c.deployed.iter().map(|(dep, commit)| {
-            let repo = dep.repo.trim_end_matches(".git").rsplit('/').next().unwrap_or_default().to_string();
-            let head = match &dep.chart {
-                Some(chart) => format!("chart {chart} {}", dep.revision),
-                None => short_revision(&dep.revision),
-            };
-            v_flex()
-                .gap_0p5()
-                .child(
-                    h_flex()
-                        .gap_2()
-                        .text_sm()
-                        .child(div().font_family(theme.mono_font_family.clone()).child(selectable(head)))
-                        .when(several || !repo.is_empty(), |h| {
-                            h.child(div().text_xs().text_color(muted).child(selectable(repo)))
-                        }),
-                )
-                .child(commit_lines(commit.as_ref(), dep.chart.is_some(), c.note.is_some(), cx))
-        }))
+    let changed = img.from.is_some();
+    let (text, whole) = match &img.from {
+        Some(from) => (
+            format!("{} → {}", short_revision(from), short_revision(&img.tag)),
+            format!("{}:{from} → {}:{}", img.repo, img.repo, img.tag),
+        ),
+        None => (short_revision(&img.tag), format!("{}:{}", img.repo, img.tag)),
+    };
+    let copied = whole.clone();
+    with_tip(("argo-dash-image", i), format!("{whole}\nClick to copy"))
+        .flex()
+        .flex_row()
+        .items_center()
+        .max_w_full()
+        .min_w_0()
+        .gap_1()
+        .px_1p5()
+        .rounded_md()
+        .border_1()
+        .text_xs()
+        .cursor_pointer()
+        .border_color(if changed { theme.danger } else { theme.border })
+        .when(changed, |h| h.bg(theme.danger.opacity(0.1)))
+        .child(div().flex_none().text_color(theme.muted_foreground).child(img.component.clone()))
+        .child(
+            div()
+                .min_w_0()
+                .truncate()
+                .font_family(theme.mono_font_family.clone())
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(if changed { theme.danger } else { theme.foreground })
+                .child(text),
+        )
+        .on_click(move |_, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(copied.clone())))
 }
 
-fn commit_lines(commit: Option<&Result<Commit, String>>, chart: bool, noted: bool, cx: &App) -> Div {
-    let muted = cx.theme().muted_foreground;
+/// A source of the deployment running: its revision made short (the whole on hover, copied by
+/// a click), its repository, and its commit.
+fn deployed_row(i: usize, dep: &dashboard::Deployed, commit: Option<&Result<Commit, String>>, cx: &App) -> Div {
+    let theme = cx.theme();
+    let muted = theme.muted_foreground;
+    let repo = dep.repo.trim_end_matches(".git").rsplit('/').next().unwrap_or_default().to_string();
+    let (head, whole) = match &dep.chart {
+        Some(chart) => (format!("{chart} {}", dep.revision), format!("chart {chart} {}", dep.revision)),
+        None => (short_revision(&dep.revision), dep.revision.clone()),
+    };
+    let copied = whole.clone();
+    let revision = with_tip(("argo-dash-revision", i), format!("{whole}\nClick to copy"))
+        .flex_none()
+        .cursor_pointer()
+        .font_family(theme.mono_font_family.clone())
+        .child(head)
+        .on_click(move |_, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(copied.clone())));
+    let row = h_flex()
+        .gap_2()
+        .min_w_0()
+        .text_xs()
+        .child(revision)
+        .when(!repo.is_empty(), |h| h.child(div().flex_none().text_color(muted).child(selectable(repo))));
     match commit {
         Some(Ok(c)) => {
             let mut by = Vec::new();
+            // The author's name, without the address.
             if let Some(a) = &c.author {
-                by.push(a.clone());
+                by.push(a.split('<').next().unwrap_or(a).trim().to_string());
             }
             if let Some(t) = c.date {
                 by.push(format!("{} ago", k8s::age(t)));
@@ -1270,45 +1477,73 @@ fn commit_lines(commit: Option<&Result<Commit, String>>, chart: bool, noted: boo
             if !c.tags.is_empty() {
                 by.push(c.tags.join(", "));
             }
-            v_flex()
-                .child(
-                    div()
-                        .text_sm()
-                        .font_weight(FontWeight::MEDIUM)
-                        .child(selectable(c.message.lines().next().unwrap_or_default().to_string())),
-                )
-                .child(div().text_xs().text_color(muted).child(selectable(by.join(" · "))))
+            row.child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .font_weight(FontWeight::MEDIUM)
+                    .child(selectable(c.message.lines().next().unwrap_or_default().to_string())),
+            )
+            .child(div().flex_none().text_color(muted).child(selectable(by.join(" · "))))
         }
-        Some(Err(e)) => v_flex()
-            .child(div().text_xs().text_color(muted).child(selectable(format!("Its commit couldn't be read: {e}")))),
-        None if chart => v_flex().child(div().text_xs().text_color(muted).child("A chart's version: no commit.")),
-        None if noted => v_flex()
-            .child(div().text_xs().text_color(muted).child("Its commit is read from Argo CD's API (see above).")),
-        None => v_flex(),
+        Some(Err(e)) => row.child(hint(("argo-dash-commit-error", i), "commit unread", e.clone(), cx)),
+        None => row,
     }
 }
 
-/// A card: its title, and its background tinted by `tone` when it says something is right
-/// or wrong.
-fn card(title: &str, tone: Option<Tone>, cx: &App) -> Div {
-    let theme = cx.theme();
-    let tint = tone.filter(|t| *t != Tone::Done).map(|t| t.color(cx).opacity(0.08));
-    v_flex()
-        .w(px(CARD))
+/// Something with `tip` shown on hover.
+fn with_tip(id: impl Into<ElementId>, tip: String) -> Stateful<Div> {
+    let tip = SharedString::from(tip);
+    div().id(id).tooltip(move |w, cx| component::tooltip::Tooltip::new(tip.clone()).build(w, cx))
+}
+
+/// A few muted words that say more on hover.
+fn hint(id: impl Into<ElementId>, text: &str, tip: String, cx: &App) -> Stateful<Div> {
+    with_tip(id, tip)
         .flex_none()
+        .text_xs()
+        .text_color(cx.theme().muted_foreground)
+        .underline()
+        .text_decoration_color(cx.theme().muted_foreground.opacity(0.5))
+        .child(text.to_string())
+}
+
+/// A card's box, its background tinted by `tone` when it says something is right or wrong.
+fn frame_toned(tone: Option<Tone>, cx: &App) -> Div {
+    let theme = cx.theme();
+    let tone = tone.filter(|t| *t != Tone::Done);
+    v_flex()
+        .min_w_0()
         .gap_1p5()
         .p_3()
         .rounded_lg()
         .border_1()
-        .border_color(tone.filter(|t| *t != Tone::Done).map_or(theme.border, |t| t.color(cx).opacity(0.5)))
-        .bg(tint.unwrap_or(theme.background))
-        .child(
-            div()
-                .text_xs()
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(theme.muted_foreground)
-                .child(title.to_uppercase()),
-        )
+        .border_color(tone.map_or(theme.border, |t| t.color(cx).opacity(0.5)))
+        .bg(tone.map_or(theme.background, |t| t.color(cx).opacity(0.08)))
+}
+
+/// A card's box, untinted.
+fn frame(cx: &App) -> Div {
+    frame_toned(None, cx)
+}
+
+/// A card: its title, its background tinted by `tone`.
+fn card(title: &str, tone: Option<Tone>, cx: &App) -> Div {
+    let muted = cx.theme().muted_foreground;
+    frame_toned(tone, cx).child(
+        div().truncate().text_xs().font_weight(FontWeight::SEMIBOLD).text_color(muted).child(title.to_uppercase()),
+    )
+}
+
+/// One of the four status tiles: a card that shares its row with the others.
+fn tile(title: &str, tone: Option<Tone>, cx: &App) -> Div {
+    card(title, tone, cx).flex_grow(1.).flex_basis(px(TILE)).min_w(px(TILE_MIN))
+}
+
+/// A tile's headline, in its tone.
+fn figure(text: String, color: Hsla) -> Div {
+    div().truncate().text_xl().font_weight(FontWeight::BOLD).text_color(color).child(text)
 }
 
 /// A status in its tone, boxed.
@@ -1373,6 +1608,36 @@ mod tests {
         running.summary.in_progress = true;
         assert_eq!(d.take_read(key("example-staging"), Ok(Arc::new(running)), Timestamp::now()), Next::Tick);
         assert_eq!(d.take_read(key("example-staging"), Err("down".into()), Timestamp::now()), Next::Rest);
+    }
+
+    /// A read that fails, or gives only the list's copy, keeps the cards read whole before,
+    /// with why in one line; the next read whole replaces them. With nothing read whole before,
+    /// the list's copy is shown, and an error is the error.
+    #[test]
+    fn a_failed_read_keeps_what_was_read() {
+        let k = key("example-prod");
+        let mut d = Dashboard::new("shop".into(), vec![k.clone()], 0);
+        let held = || {
+            let app = example::read("example-prod", Timestamp::now()).app;
+            let read = crate::k8s::argo::dashboard::Read::held(app, "401 Unauthorized\nmore detail");
+            Arc::new(Cards::of(read, None, Timestamp::now()))
+        };
+        d.take_read(k.clone(), Ok(held()), Timestamp::now());
+        assert!(d.shown().is_some_and(|c| c.is_ok_and(|c| c.note.as_deref() == Some("401 Unauthorized"))));
+        assert!(d.failed.is_none(), "the list's copy says why itself");
+        d.take_read(k.clone(), Ok(cards("example-prod")), Timestamp::now());
+        assert!(d.shown().is_some_and(|c| c.is_ok_and(|c| c.note.is_none())) && d.failed.is_none());
+        d.take_read(k.clone(), Err("token expired\nat …".into()), Timestamp::now());
+        assert!(d.shown().is_some_and(|c| c.is_ok_and(|c| c.note.is_none())), "kept");
+        assert_eq!(d.failed.as_deref(), Some("Not read now (token expired): shown as last read."));
+        d.take_read(k.clone(), Ok(held()), Timestamp::now());
+        assert!(d.shown().is_some_and(|c| c.is_ok_and(|c| c.note.is_none())), "kept over the list's copy");
+        assert_eq!(d.failed.as_deref(), Some("Not read now (401 Unauthorized): shown as last read."));
+        d.take_read(k.clone(), Ok(cards("example-prod")), Timestamp::now());
+        assert!(d.failed.is_none());
+        let mut other = Dashboard::new("shop".into(), vec![k.clone()], 0);
+        other.take_read(k, Err("down".into()), Timestamp::now());
+        assert!(other.shown().is_some_and(|c| c.is_err()) && other.failed.is_none());
     }
 
     #[derive(Default)]

@@ -2,9 +2,12 @@
 
 ## Building
 
-- **Don't build unless you have to.** CI is free and runs the tests on every PR, so it is the
-  check for them: read the code instead of compiling to find out, and build locally only when
-  CI's log is not enough, with the narrowest command (one test).
+- **Don't build unless you have to.** CI is free. A pull request gets the quick checks (format,
+  spelling, licenses, clippy) in about two minutes; the tests, the end-to-end run on kind and the
+  Windows check run on `main` after the merge (a merge queue needs an organization-owned
+  repository). Read the code instead of compiling to find out; when you change logic, run its
+  module's tests locally with the narrowest command (`cargo test <module>::`) before merging.
+  When a run on `main` fails, fixing it comes before anything else.
 - **Push through the pre-push hook.** Once per checkout: `git config core.hooksPath scripts/hooks`.
   Before each push it runs what CI fails on most: `cargo fmt --check`, `typos`, `cargo deny`,
   then clippy (with and without `dev`) in the main checkout's target dir, one at a time across
@@ -44,10 +47,11 @@
 - Review the change, not the codebase: each PR's diff is reviewed as it lands, fixes
   included. Whole-codebase audits are not repeated; bug reports from users set the
   priorities for the long tail.
-- Merge without asking: once the diff has been reviewed, squash merge it as soon as
-  `CI result` passes (`gh pr checks <n> --watch`, then `gh pr merge <n> --squash`). A failing
-  CI is fixed on the branch, never merged around. Dependabot's PRs merge the same way once
-  their CI passes on the current `main`.
+- Merge without asking: once the diff has been reviewed, squash merge it as soon as `CI result`
+  passes (`gh pr checks <n> --watch`, then `gh pr merge <n> --squash`; check with
+  `gh pr view <n> --json state`). A failing CI is fixed on the branch, never merged around.
+  Then watch the run on `main`: if it fails, fix it right away in a new PR. Dependabot's PRs
+  merge the same way once their CI passes on the current `main`.
 - Nothing is tried in the running app before merging; the test before a release is (see
   below).
 - `gh pr edit` fails on this repository (Projects classic); change a PR's title or body with
@@ -70,26 +74,24 @@ an agent has used the app end to end and found nothing blocking:
   Problems, Apply, Settings, the agents' MCP server.
 - Against real clusters, only read. Writes, shells and deletes are tried on a kind cluster (or
   on another cluster only when the user says so).
-- Measure speed against the last release, once per release rather than per PR: build the last
-  tag the same way, then run both builds alternately on the same cluster, read-only (pods list
-  with `RECOUVRANCE_SMOKE`, the Problems scan with `RECOUVRANCE_PROBLEMS=1`, the Workloads
-  overview with `RECOUVRANCE_DASH=1`, going back to a list with
-  `RECOUVRANCE_BACKTIME=pods,deployments`, the whole app's memory with `--snapshot` and RSS
-  sampling; see [docs/development.md](docs/development.md)). Also, for the first rows after a
-  connect, `RECOUVRANCE_FIRSTROWS=1` with one context, then the same plus a context that can't be
-  reached (on a tag without it, cherry-pick the commit that added it onto the tag). For the
-  shared Problems scan:
-  - `RECOUVRANCE_PROBLEMS=twice` prints two scans in a row with their time, requests and MB (the
-    second shows what the kept Service verdicts save); on a tag without `twice`, run `=1` twice;
-  - requests per minute in Settings → API requests after 10 minutes with the Problems page on
-    screen, with one window, then with a second window on the same context;
-  - two `find_problems` calls within 2 minutes: the second answers from the first's scan and
-    sends no list.
+- Measure speed against the last release, once per release rather than per PR, with
+  `scripts/release-bench.sh <last tag> <context> [scratch folder]` on the release PR's branch
+  (read-only; a cluster the user named for measurements, else kind). It builds the last tag
+  once and keeps each release's dev build in `~/.cache/recouvrance-bench/<tag>` (the release
+  PR's own as its new version, the next check's "before"), runs both builds alternately for
+  the timings (pods list, the Problems scan twice, the Workloads overview, going back to a
+  list, the first rows after a connect with one context and with one that can't be reached,
+  the app's memory), two `find_problems` calls 60 s apart (the second answers from the first's
+  scan), and the Problems page on screen for 10 minutes with one window and with two, every
+  build at once since each counts its own requests. It prints the before/after table: post it
+  on the release PR with what the numbers mean. `--help` says how to run some parts only.
 
-  A hook the last tag doesn't have yet has no "before" build that once: cherry-pick the commit
-  that added it onto the tag, or post the new numbers alone as the baseline. Post the
-  before/after numbers on the release PR. A clear regression is a bug like any other: file it,
-  and say whether it blocks.
+  A hook the last tag doesn't have yet has no "before" number that once (`n/a`): cherry-pick
+  the commit that added it onto the tag and pass that build as `BENCH_BEFORE`, or post the new
+  numbers alone as the baseline. A measurement the script doesn't make yet goes into the
+  script, not into a one-off. The end-to-end pass can use the script's build of the release PR
+  (`~/.cache/recouvrance-bench/v<version>/recouvrance`). A clear regression is a bug like any
+  other: file it, and say whether it blocks.
 - File an issue for each bug found, with what was done and a snapshot; don't fix them in the
   same pass. Then say whether the release can go, and which issues block it.
 
@@ -139,7 +141,7 @@ copy; if one doesn't fit, extend it.
   `#[cfg(all(test, feature = "dev"))]`.
 - The write guards are tested against a real cluster in `src/e2e.rs` (write mode, an agent's
   rules through the MCP server, the kill switch during a drain); CI's kind job runs them on
-  every PR. Extend them when you add a write path. Locally, against a kind cluster:
+  every push to `main`. Extend them when you add a write path. Locally, against a kind cluster:
   `RECOUVRANCE_E2E_CONTEXT=kind-x XDG_CONFIG_HOME=$(mktemp -d) cargo test --features dev -- --ignored --test-threads 1 e2e::`.
 - Rules that must hold for every input get a `proptest!`. The subsystems that broke again and
   again have them; extend them when you change those, and add a case before fixing a bug there:

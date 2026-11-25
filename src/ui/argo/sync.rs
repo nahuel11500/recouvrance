@@ -1,11 +1,13 @@
-//! Sync selected: the Applications picked (those the filter keeps) synced together, with or
-//! without hooks, with prune and dry run (see `k8s::argo::grouped_sync`).
+//! Sync selected: the Applications picked (those the filter keeps) synced together, in full
+//! with hooks or their resources out of sync only without hooks, with prune and dry run (see
+//! `k8s::argo::grouped_sync`).
 //!
 //! The page reads each Application first, a few at a time: one already syncing, being
 //! deleted, or held by a sync window now is left out, saying why; with prune on, what it
-//! deletes on each is listed. Sync… asks for a confirmation (their count typed, or the wait
-//! set in Settings), then sends the syncs at most four at a time, write mode checked as each
-//! is sent, and follows each Application until its operation ends: its phase, message and
+//! deletes on each is listed, and so are the resources out of sync and the hooks the sync
+//! skips or runs. Sync… asks a second click when production environments are among them,
+//! then a confirmation (their count typed, or the wait set in Settings), then sends the
+//! syncs at most four at a time, write mode checked as each is sent, and follows each Application until its operation ends: its phase, message and
 //! resources done, with Terminate while it runs, then how many succeeded and failed.
 //!
 //! Leaving the page while a sync runs only hides it: the syncs go on, and the selection bar
@@ -33,7 +35,7 @@ use crate::k8s::argo::grouped_sync::{self, Checked, Options, PARALLEL, Progress,
 use crate::k8s::argo::operation_tone;
 use crate::k8s::argo::ops::{Op, SyncRequest};
 use crate::k8s::argo::windows::{NextSync, Planner};
-use crate::k8s::argo::{FleetApp, Source, short_revision};
+use crate::k8s::argo::{FleetApp, short_revision};
 use crate::status::Tone;
 use crate::ui::selectable::selectable;
 
@@ -46,6 +48,8 @@ const MANY: usize = 50;
 const FOLLOW_FOR: Duration = Duration::from_secs(30 * 60);
 /// Applications named in the confirmation, at most.
 const NAMED: usize = 10;
+/// Resources out of sync, and hooks, named under an Application, at most (the others counted).
+const RES_NAMED: usize = 8;
 const TERMINATE_NOTE: &str =
     "Argo CD stops the operation running, hooks included. What it applied so far stays as it is.";
 
@@ -54,19 +58,30 @@ fn all_named(res: &[Res]) -> String {
     res.iter().map(Res::label).collect::<Vec<_>>().join(", ")
 }
 
+/// The first `RES_NAMED` of `names`, the others counted.
+fn some_named(names: impl IntoIterator<Item = String>) -> String {
+    let names: Vec<String> = names.into_iter().collect();
+    let mut s = names.iter().take(RES_NAMED).cloned().collect::<Vec<_>>().join(", ");
+    if names.len() > RES_NAMED {
+        s.push_str(&format!(" and {} more", names.len() - RES_NAMED));
+    }
+    s
+}
+
 /// One Application of the sync.
 struct Row {
     key: Key,
     label: String,
-    /// Its hub context or API server: what a terminate's confirmation names.
+    /// Its Argo CD API server: what a terminate's confirmation names.
     source: String,
-    /// Read on a hub (not by Argo CD's API).
-    hub: bool,
     target: Target,
     /// When a manual sync of it can start, under its project's sync windows.
     window: NextSync,
     /// What its read before the sync found.
     checked: Option<Result<Checked, String>>,
+    /// Its environment's type, when it is a production one (see
+    /// `environments::is_production`): the sync then asks a second click.
+    production: Option<String>,
     /// Part of the sync sent.
     in_sync: bool,
     /// The answer to its sync's request; None while it is sent.
@@ -86,6 +101,11 @@ impl Row {
             Some(Ok(c)) if c.refused.is_none() => Some(c),
             _ => None,
         }
+    }
+
+    /// Its sync with `opts`, when it is ready and has something to sync.
+    fn request(&self, opts: Options) -> Option<SyncRequest> {
+        opts.request(self.ready()?)
     }
 
     /// Its operation ended (or it couldn't be sent).
@@ -108,6 +128,8 @@ pub(super) struct GroupedSync {
     opts: Options,
     /// The options it was sent with; None before.
     sent_with: Option<Options>,
+    /// Sync… was clicked once with production environments among them: the next click goes on.
+    armed: bool,
     /// Shown instead of the list (hidden while it runs, when left).
     pub(super) shown: bool,
     /// Followed too long: no longer read.
@@ -142,6 +164,31 @@ impl GroupedSync {
         self.rows.iter().any(|r| r.checked.is_none())
     }
 
+    /// The rows the sync with `opts` goes to, with their request.
+    fn jobs(&self, opts: Options) -> Vec<(usize, SyncRequest)> {
+        self.rows.iter().enumerate().filter_map(|(i, r)| Some((i, r.request(opts)?))).collect()
+    }
+
+    /// The production environments the sync goes to, each named once (`prod: shop-prod-acme`).
+    fn production(&self) -> Vec<String> {
+        let mut named: Vec<String> = self
+            .jobs(self.opts)
+            .iter()
+            .filter_map(|(i, _)| {
+                let r = &self.rows[*i];
+                r.production.as_ref().map(|t| format!("{t}: {}", r.label))
+            })
+            .collect();
+        named.dedup();
+        named
+    }
+
+    /// Change the options: a second click is asked again.
+    fn set_opts(&mut self, f: impl FnOnce(&mut Options)) {
+        f(&mut self.opts);
+        self.armed = false;
+    }
+
     /// The Applications to follow now (sent, not ended), whether some are still sent, and
     /// whether the page is shown.
     fn to_follow(&self) -> (Vec<Follow>, bool, bool) {
@@ -170,9 +217,9 @@ impl ArgoView {
     /// sync still running is shown again instead.
     pub(super) fn sync_apps(
         &mut self,
-        mut apps: Vec<FleetApp>,
+        apps: Vec<FleetApp>,
         hidden: usize,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if let Some(g) = self.sync.as_mut().filter(|g| g.running()) {
@@ -180,9 +227,13 @@ impl ArgoView {
             cx.notify();
             return;
         }
-        if !crate::details::ensure_writes(window, cx) {
-            return;
-        }
+        // Opened in read-only mode too: what would be synced, left out, pruned and which hooks
+        // run shows; only Sync… asks to turn writes on.
+        self.open_sync(apps, hidden, cx);
+    }
+
+    /// Open the sync of `apps` (`hidden`: picks the filter hides, counted), and read each.
+    fn open_sync(&mut self, mut apps: Vec<FleetApp>, hidden: usize, cx: &mut Context<Self>) {
         let Some(listed) = &self.rows else { return };
         if apps.is_empty() {
             return;
@@ -190,23 +241,25 @@ impl ArgoView {
         let left_out = apps.len().saturating_sub(MAX_APPS);
         apps.truncate(MAX_APPS);
         let names = labels(&apps);
+        let production: Vec<Option<String>> = apps.iter().map(|a| listed.production_type(&key(a))).collect();
         let mut plan = Planner::new(jiff::Timestamp::now());
         let rows = apps
             .iter()
             .zip(names)
-            .map(|(a, label)| Row {
+            .zip(production)
+            .map(|((a, label), production)| Row {
                 key: key(a),
                 label,
-                source: a.source.label(),
-                hub: matches!(a.source, Source::Hub(_)),
+                source: a.server.name(),
                 target: Target {
-                    source: a.source.clone(),
+                    server: a.server.clone(),
                     instance: a.instance.clone(),
                     namespace: a.app.namespace.clone(),
                     name: a.app.name.clone(),
                 },
                 window: listed.fleet.sync_window(a, &mut plan, true),
                 checked: None,
+                production,
                 in_sync: false,
                 sent: None,
                 before: None,
@@ -220,6 +273,7 @@ impl ArgoView {
             left_out,
             opts: Options::default(),
             sent_with: None,
+            armed: false,
             shown: true,
             gave_up: false,
             checks: Default::default(),
@@ -230,12 +284,56 @@ impl ArgoView {
         cx.notify();
     }
 
+    /// The sync of the made-up example's Applications (`demo_list`), as their reads would
+    /// find them: nothing is read or sent. `how`: `oos` for the resources out of sync only,
+    /// `armed` for the second click asked with production environments among them.
+    #[cfg(feature = "dev")]
+    pub fn demo_sync(&mut self, how: &str, cx: &mut Context<Self>) {
+        self.demo_list(true, cx);
+        let Some(listed) = &self.rows else { return };
+        let apps: Vec<FleetApp> = listed
+            .fleet
+            .apps
+            .iter()
+            .filter(|a| a.app.name.starts_with("shop-") && a.app.name.ends_with("-workload"))
+            .cloned()
+            .collect();
+        let dest: Vec<(String, bool)> =
+            apps.iter().map(|a| (a.dest.namespace.clone(), a.app.sync == "OutOfSync")).collect();
+        self.open_sync(apps, 0, cx);
+        let Some(g) = &mut self.sync else { return };
+        g.checks.cancel();
+        g.opts.hooks = !how.contains("oos");
+        for (r, (ns, oos)) in g.rows.iter_mut().zip(dest) {
+            let res = |kind: &str, name: &str| Res {
+                group: if kind == "Deployment" { "apps".into() } else { String::new() },
+                kind: kind.into(),
+                namespace: ns.clone(),
+                name: name.into(),
+                ..Default::default()
+            };
+            r.checked = Some(Ok(Checked {
+                out_of_sync: if oos {
+                    vec![res("Deployment", "web"), res("ConfigMap", "web-config")]
+                } else {
+                    Vec::new()
+                },
+                hooks: vec![format!("PreSync Job {ns}/db-migrate"), format!("PostSync Job {ns}/cache-warmup")],
+                revision: Some("77b324b4a0c4f1e2d3b4a5968778695a4b3c2d1e".into()),
+                ..Default::default()
+            }));
+        }
+        g.armed = how.contains("armed");
+        cx.notify();
+    }
+
     /// Read each Application of the sync, at most a few at a time, and check it.
     fn check_grouped(&mut self, cx: &mut Context<Self>) {
         let Some(g) = &mut self.sync else { return };
         if g.sent_with.is_some() {
             return;
         }
+        g.armed = false;
         for r in &mut g.rows {
             r.checked = None;
         }
@@ -310,20 +408,44 @@ impl ArgoView {
 
     /// Confirm the sync of the Applications ready (their count typed, or a wait), then send it.
     fn confirm_grouped_sync(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !crate::details::ensure_writes(window, cx) {
-            return;
-        }
         self.recheck_windows();
         let Some(g) = &self.sync else { return };
         if g.sent_with.is_some() || g.checking() {
             return;
         }
         let opts = g.opts;
-        let jobs: Vec<(usize, SyncRequest)> =
-            g.rows.iter().enumerate().filter_map(|(i, r)| Some((i, opts.request(r.ready()?)))).collect();
+        let jobs = g.jobs(opts);
         if jobs.is_empty() {
             return;
         }
+        // Production environments among them: a first click only says so.
+        if !g.armed && !g.production().is_empty() {
+            self.update_sync(cx, |g| g.armed = true);
+            return;
+        }
+        let mut servers: Vec<String> = jobs.iter().map(|(i, _)| g.rows[*i].source.clone()).collect();
+        servers.sort();
+        servers.dedup();
+        let asked = format!(
+            "{} {}",
+            if g.opts.dry_run { "dry-run a sync of" } else { "sync" },
+            crate::plural::count(jobs.len(), "Application")
+        );
+        if !crate::details::ensure_argo_writes(&asked, &servers.join(", "), window, cx) {
+            return;
+        }
+        let resources: usize = jobs.iter().map(|(_, req)| req.resources.len()).sum();
+        let skipped: Vec<String> = if opts.hooks {
+            Vec::new()
+        } else {
+            jobs.iter()
+                .filter_map(|(i, _)| {
+                    let r = &g.rows[*i];
+                    let c = r.ready()?;
+                    (!c.hooks.is_empty()).then(|| format!("{}: {}", r.label, some_named(c.hooks.iter().cloned())))
+                })
+                .collect()
+        };
         let n = jobs.len();
         let what = crate::plural::count(n, "Application");
         let names = some(jobs.iter().map(|(i, _)| g.rows[*i].label.clone()), NAMED);
@@ -340,22 +462,8 @@ impl ArgoView {
         } else {
             Vec::new()
         };
-        let unknown_windows: Vec<String> = jobs
-            .iter()
-            .filter(|(i, _)| grouped_sync::window_warning(&g.rows[*i].window, g.rows[*i].hub).is_some())
-            .map(|(i, _)| g.rows[*i].label.clone())
-            .collect();
-        let windows_note = (!unknown_windows.is_empty()).then(|| {
-            format!(
-                "Sync windows not known for {}: if one denies a sync now, Argo CD's controller holds the sync until \
-                 it opens (Terminate takes it back).",
-                some(unknown_windows.into_iter(), NAMED)
-            )
-        });
         let danger = opts.prune && !opts.dry_run && !deletes.is_empty();
-        let mut sources: Vec<String> = jobs.iter().map(|(i, _)| g.rows[*i].source.clone()).collect();
-        sources.sort();
-        sources.dedup();
+        let sources = servers;
         let guard = Guard::typed_text(&n.to_string(), format!("Type {n} to sync {what}:"), window, cx);
         let view = cx.entity().downgrade();
         let title = if opts.dry_run { format!("Dry run of a sync of {what}?") } else { format!("Sync {what}?") };
@@ -364,14 +472,19 @@ impl ArgoView {
              several sources), {}. {}",
             opts.text(),
             if opts.hooks {
-                "Its PreSync, Sync and PostSync hooks run."
+                "The whole Application is applied, and its PreSync, Sync and PostSync hooks run.".to_string()
             } else {
-                "Its hooks are skipped (the apply strategy): only the manifests are applied."
+                format!(
+                    "Only the {} out of sync are applied (the apply strategy), named in the sync: what is in sync \
+                     is left as it is, and no hook runs.",
+                    crate::plural::count(resources, "resource")
+                )
             }
         );
         let ok = if opts.dry_run { "Dry run" } else { "Sync" };
         window.open_alert_dialog(cx, move |alert, _, cx| {
             let (guard, view, jobs) = (guard.clone(), view.clone(), jobs.clone());
+            let skipped = skipped.clone();
             let theme = cx.theme();
             let (muted, warning) = (theme.muted_foreground, theme.warning);
             let prune_text = match (opts.prune, deletes.is_empty()) {
@@ -395,7 +508,17 @@ impl ArgoView {
                                 crate::plural::count(left, "Application")
                             )))
                         })
-                        .children(windows_note.clone().map(|t| div().text_xs().text_color(warning).child(t)))
+                        .when(!skipped.is_empty(), |v| {
+                            v.child(div().text_xs().text_color(warning).child("Hooks skipped:")).child(
+                                v_flex()
+                                    .id("argo-sync-skipped")
+                                    .max_h(px(160.))
+                                    .overflow_y_scroll()
+                                    .text_xs()
+                                    .text_color(muted)
+                                    .children(skipped.iter().map(|d| div().child(selectable(d.clone())))),
+                            )
+                        })
                         .children(prune_text.map(|t| div().text_xs().text_color(warning).child(t)))
                         .when(!deletes.is_empty(), |v| {
                             v.child(
@@ -526,7 +649,7 @@ impl ArgoView {
     fn terminate_grouped(&mut self, i: usize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(r) = self.sync.as_ref().and_then(|g| g.rows.get(i)) else { return };
         let (target, label, source) = (r.target.clone(), r.label.clone(), r.source.clone());
-        if !crate::details::ensure_writes(window, cx) {
+        if !crate::details::ensure_argo_writes(&format!("terminate the sync of {label}"), &source, window, cx) {
             return;
         }
         let guard = Guard::protected(&source, window, cx);
@@ -572,7 +695,8 @@ impl ArgoView {
         let sent = g.sent_with.is_some();
         let opts = g.sent_with.unwrap_or(g.opts);
         let checking = g.checking();
-        let ready = g.rows.iter().filter(|r| r.ready().is_some()).count();
+        let ready = g.jobs(opts).len();
+        let production = if sent { Vec::new() } else { g.production() };
         let n = g.rows.len();
         let title = if sent {
             format!(
@@ -613,9 +737,16 @@ impl ArgoView {
                 .child(
                     Button::new("argo-sync-go")
                         .small()
-                        .primary()
+                        .when(!g.armed, ButtonVariants::primary)
+                        .when(g.armed, ButtonVariants::danger)
                         .icon(Lucide::GitBranch)
-                        .label(if opts.dry_run { "Dry run…" } else { "Sync…" })
+                        .label(if g.armed {
+                            format!("Confirm: {}…", crate::plural::count(production.len(), "production Application"))
+                        } else if opts.dry_run {
+                            "Dry run…".to_string()
+                        } else {
+                            "Sync…".to_string()
+                        })
                         .disabled(checking || ready == 0)
                         .on_click(cx.listener(|this, _, window, cx| this.confirm_grouped_sync(window, cx))),
                 )
@@ -636,7 +767,7 @@ impl ArgoView {
                 let view = view.clone();
                 move |v: &bool, _: &mut Window, cx: &mut App| {
                     let v = *v;
-                    let _ = view.update(cx, |this, cx| this.update_sync(cx, |g| f(&mut g.opts, v)));
+                    let _ = view.update(cx, |this, cx| this.update_sync(cx, |g| g.set_opts(|o| f(o, v))));
                 }
             };
             let hooks = |id: &'static str, label: &'static str, on: bool| {
@@ -645,19 +776,21 @@ impl ArgoView {
                     .when(opts.hooks == on, ButtonVariants::primary)
                     .when(opts.hooks != on, Button::outline)
                     .label(label)
-                    .on_click(cx.listener(move |this, _, _, cx| this.update_sync(cx, |g| g.opts.hooks = on)))
+                    .on_click(cx.listener(move |this, _, _, cx| this.update_sync(cx, |g| g.set_opts(|o| o.hooks = on))))
             };
             v_flex()
                 .gap_1()
                 .child(
                     h_flex()
                         .gap_2()
-                        .child(hooks("argo-sync-hooks", "With hooks", true))
-                        .child(hooks("argo-sync-no-hooks", "Without hooks", false))
+                        .child(hooks("argo-sync-hooks", "Full, with hooks", true))
+                        .child(hooks("argo-sync-no-hooks", "Out of sync only, without hooks", false))
                         .child(div().text_xs().text_color(muted).child(if opts.hooks {
-                            "Argo CD's own Sync: PreSync, Sync and PostSync hooks run (a migration, a secret refresh…)."
+                            "Argo CD's own Sync: the whole Application, and its PreSync, Sync and PostSync hooks run \
+                             (a migration, a secret refresh…)."
                         } else {
-                            "The apply strategy: only the manifests are applied, hooks are skipped. For a simple change."
+                            "Only the resources out of sync, named one by one, with the apply strategy: what is in \
+                             sync is not applied again and no hook runs (those skipped are listed). For a simple change."
                         })),
                 )
                 .child(
@@ -732,6 +865,24 @@ impl ArgoView {
                      is left out, saying why. The syncs are sent four at a time, write mode checked as each is sent.",
                 ))
             })
+            .when(!sent && !crate::details::writes_enabled(cx), |v| {
+                v.child(div().text_xs().text_color(theme.warning).child(
+                    "Read-only: this shows what the sync would do (and the link below, what it would change). \
+                     Sync… asks to turn writes on for it.",
+                ))
+            })
+            .when(!production.is_empty(), |v| {
+                v.child(div().text_xs().text_color(theme.danger).child(selectable(format!(
+                    "Includes {} of production environments: {}{}",
+                    crate::plural::count(production.len(), "Application"),
+                    production.iter().take(NAMED).cloned().collect::<Vec<_>>().join(", "),
+                    if production.len() > NAMED {
+                        format!(" and {} more", production.len() - NAMED)
+                    } else {
+                        String::new()
+                    },
+                ))))
+            })
             .when(g.hidden > 0, |v| {
                 v.child(div().text_xs().text_color(theme.warning).child(format!(
                     "{} more picked are hidden by the filter: not synced.",
@@ -747,6 +898,20 @@ impl ArgoView {
                 )
             })
             .children(options)
+            .when(!sent && !checking && !opts.hooks, |v| {
+                let jobs = g.jobs(opts);
+                let resources: usize = jobs.iter().map(|(_, req)| req.resources.len()).sum();
+                let idle = g.rows.iter().filter(|r| r.ready().is_some()).count() - jobs.len();
+                let mut text = format!(
+                    "{} out of sync on {}, without hooks",
+                    crate::plural::count(resources, "resource"),
+                    crate::plural::count(jobs.len(), "Application")
+                );
+                if idle > 0 {
+                    text.push_str(&format!("; {idle} with nothing out of sync left as they are"));
+                }
+                v.child(div().text_sm().child(text))
+            })
             .when(!sent, |v| v.child(diff))
             .children(summary)
             .when(g.gave_up, |v| {
@@ -785,16 +950,35 @@ impl ArgoView {
             return out.child(line(format!("Left out: {why}"), theme.warning));
         }
         if !sent || !r.in_sync {
-            let mut facts = vec!["Ready".to_string()];
+            let mut facts = vec![if r.request(opts).is_some() { "Ready" } else { "Nothing to sync" }.to_string()];
             if checked.auto_sync {
                 facts.push("auto-sync on".into());
             }
             if let Some(rev) = &checked.revision {
                 facts.push(format!("revision {}", short_revision(rev)));
             }
+            if let Some(t) = &r.production {
+                facts.push(format!("{t} environment"));
+            }
             out = out.child(line(facts.join(" · "), muted));
-            if let Some(warn) = grouped_sync::window_warning(&r.window, r.hub) {
-                out = out.child(line(warn, theme.warning));
+            if !opts.hooks {
+                let text = if r.request(opts).is_none() {
+                    "Nothing out of sync: not synced.".to_string()
+                } else if checked.out_of_sync.is_empty() {
+                    "Nothing out of sync but what prune deletes.".to_string()
+                } else {
+                    format!(
+                        "{} out of sync: {}",
+                        crate::plural::count(checked.out_of_sync.len(), "resource"),
+                        some_named(checked.out_of_sync.iter().map(Res::label))
+                    )
+                };
+                out = out.child(line(text, muted));
+            }
+            if !checked.hooks.is_empty() {
+                let (what, color) =
+                    if opts.hooks { ("Hooks that run", muted) } else { ("Hooks skipped", theme.warning) };
+                out = out.child(line(format!("{what}: {}", some_named(checked.hooks.iter().cloned())), color));
             }
             if opts.prune {
                 let text = if checked.pruned.is_empty() {

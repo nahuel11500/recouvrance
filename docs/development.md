@@ -41,10 +41,14 @@ RECOUVRANCE_TAB=logs cargo run --features dev -- --snapshot out.png 8
 Useful variables: `RECOUVRANCE_PAGE` (`apply`, `settings`, `cluster`, `access`, `assistant-dock`…),
 `RECOUVRANCE_FILTER`, `RECOUVRANCE_ACT` (comma-separated hooks, see `src/app/demo.rs` and
 `src/details/demo.rs`; `timeline:all` shows every event on the Timeline, `page:argo,argo-example`
-shows the Argo CD dashboard on a made-up example, no real data), `RECOUVRANCE_INPUT`
+shows the Argo CD dashboard on a made-up example, no real data (`argo-example-expired`: after its
+login expired), `page:argo,argo-journal-example`
+its sync journal, `page:argo,argo-example-list` its list of environments,
+`page:argo,argo-example-overview` its overview, and `page:argo,argo-sync-example-oos` (or
+`-example`, `-example-oos-armed`) its grouped sync), `RECOUVRANCE_INPUT`
 (`click:x,y;key:enter;wait:2`; `shot:name.png` saves a frame next to the snapshot, for
-recordings), `RECOUVRANCE_WRITES=1`, `RECOUVRANCE_DARK=1`, `RECOUVRANCE_ZOOM`, and
-`RECOUVRANCE_METER=1`, which prints at the end what the run cost: each cluster's API requests and
+recordings), `RECOUVRANCE_WRITES=1`, `RECOUVRANCE_DARK=1`, `RECOUVRANCE_ZOOM`,
+`RECOUVRANCE_SIZE=1000x800` (the window's size, 1500x920 by default), and `RECOUVRANCE_METER=1`, which prints at the end what the run cost: each cluster's API requests and
 bytes by kind, the heaviest requests, and the peak memory. Point `XDG_CONFIG_HOME` at a scratch
 folder to keep your settings untouched. Give it another MCP port too
 (`{"port": 47199, "version": 1}` in `$XDG_CONFIG_HOME/recouvrance/agents.json`), so it doesn't
@@ -58,6 +62,9 @@ process's resident memory (Linux):
 ```sh
 RECOUVRANCE_CONTEXT=kind-dev RECOUVRANCE_BACKTIME=pods,deployments,3 cargo run --features dev -- --snapshot out.png 8
 ```
+
+`RECOUVRANCE_WINDOWS=2` opens a second window on the same contexts, drawn like the first and put
+on the same `RECOUVRANCE_PAGE`: what a second window costs, its scans shared with the first.
 
 `RECOUVRANCE_FIRSTROWS=1` prints to stderr, from the moment a connect starts, when each cluster's
 first rows reach the table and when its list is complete. With a context that can't be reached

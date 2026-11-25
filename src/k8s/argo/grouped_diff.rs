@@ -171,23 +171,6 @@ pub(super) async fn of_managed(body: Value) -> Result<Arc<AppDiff>, String> {
         .map_err(|e| format!("Comparing the managed resources failed: {e}"))
 }
 
-/// What a sync of the Application `namespace/name` read on its hub `context` would change,
-/// from the Argo CD server set for that context in Settings (else says why not).
-pub async fn read_hub(context: String, namespace: String, name: String) -> Result<Arc<AppDiff>, String> {
-    let read = crate::k8s::run_abortable(async move {
-        let (server, token, _) = match super::server::login_for(&context) {
-            Ok(login) => login,
-            Err(why) => return Ok(Err(format!("{why}: what a sync would change is read from it"))),
-        };
-        let path = super::dashboard::managed_path(&namespace, &name);
-        Ok(match super::server::get_path(&server, &token, &path).await {
-            Ok(body) => of_managed(body).await,
-            Err(e) => Err(e),
-        })
-    });
-    read.await.unwrap_or_else(|e| Err(format!("{e:#}")))
-}
-
 // MARK: Kept
 
 /// Which diff: the Argo CD instance, the Application's namespace and name, and its

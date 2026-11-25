@@ -69,6 +69,22 @@ impl ConnStates {
     pub fn any_connecting(&self) -> bool {
         self.0.iter().any(|(_, s)| *s == Conn::Connecting)
     }
+
+    /// What a count over the connected contexts leaves out, each context by `name` (its short
+    /// name): "Not counted: gone (can't connect), slow (connecting)". None when all answered.
+    pub fn left_out(&self, what: &str, name: &dyn Fn(&str) -> String) -> Option<String> {
+        if self.0.is_empty() {
+            return None;
+        }
+        let each = |(c, s): &(String, Conn)| {
+            let state = match s {
+                Conn::Connecting => "connecting",
+                Conn::Failed(_) => "can't connect",
+            };
+            format!("{} ({state})", name(c))
+        };
+        Some(format!("{what}: {}", self.0.iter().map(each).collect::<Vec<_>>().join(", ")))
+    }
 }
 
 /// `error` without the `ctx: ` its connect put in front of it.
@@ -114,6 +130,22 @@ mod tests {
 
     fn set(names: &[&str]) -> Vec<String> {
         names.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    /// #1045: a count over the set names the contexts it leaves out, and why.
+    #[test]
+    fn what_a_count_leaves_out_is_named() {
+        let mut states = ConnStates::connecting(&set(&["a", "b", "c"]));
+        states.settle("a", None);
+        states.settle("b", Some("Connection refused"));
+        let short = |c: &str| c.to_uppercase();
+        assert_eq!(
+            states.left_out("Not counted", &short).as_deref(),
+            Some("Not counted: B (can't connect), C (connecting)")
+        );
+        states.settle("b", None);
+        states.settle("c", None);
+        assert_eq!(states.left_out("Not counted", &short), None);
     }
 
     #[test]

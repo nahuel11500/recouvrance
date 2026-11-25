@@ -1,9 +1,7 @@
 //! An Application's dashboard: its cards (state, versions, what runs in the cluster,
 //! problems, last sync, sync diff, history), worked out from what Argo CD says of it. The
 //! Application itself, its resource tree, its diff (managed resources) and the commits it
-//! deploys are read by Argo CD's API ([`super::api::dashboard`]) or, for an Application read
-//! on its hub, from the hub and the Argo CD server set for it ([`read_hub`]). The cards are
-//! pure functions of what was read, worked out off the UI thread.
+//! deploys are read by Argo CD's API ([`super::api::dashboard`]). The cards are pure functions of what was read, worked out off the UI thread.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{LazyLock, Mutex, PoisonError};
@@ -201,12 +199,14 @@ pub fn source_images(source: &Value) -> Vec<String> {
     out
 }
 
-/// The sources of a deployment of the history (`source`, or each of `sources`).
+/// The sources of a deployment of the history, or of a spec: each of `sources`, else `source`.
+/// `sources` wins: with several, Argo CD's API still sends `source` as `{"repoURL": ""}`.
 fn sources_of(entry: &Value) -> Vec<&Value> {
-    match entry.get("source").filter(|v| v.is_object()) {
-        Some(one) => vec![one],
-        None => arr(entry, "/sources").iter().collect(),
+    let many = arr(entry, "/sources");
+    if !many.is_empty() {
+        return many.iter().collect();
     }
+    entry.get("source").filter(|v| v.is_object()).into_iter().collect()
 }
 
 /// Who started an operation: its user, or `autosync`.
@@ -325,10 +325,7 @@ pub fn deployed(app: &Value) -> (Vec<Deployed>, Option<i64>) {
     let (holder, sources): (&Value, Vec<&Value>) = if let Some(h) = last {
         (h, sources_of(h))
     } else {
-        let spec = match app.pointer("/spec/source").filter(|v| v.is_object()) {
-            Some(one) => vec![one],
-            None => arr(app, "/spec/sources").iter().collect(),
-        };
+        let spec = app.pointer("/spec").map_or_default(sources_of);
         (app.pointer("/status/sync").unwrap_or(&Value::Null), spec)
     };
     let one = |source: Option<&Value>, revision: &str, index: Option<usize>| Deployed {
@@ -588,17 +585,6 @@ pub fn problems_from_status(app: &Value) -> Problems {
 
 // MARK: Last sync
 
-/// One resource of a sync's result.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Step {
-    pub res: Res,
-    /// `Synced`, `SyncFailed`, `Pruned`...; a hook's phase for a hook.
-    pub status: String,
-    pub message: Option<String>,
-    pub hook: bool,
-    pub tone: Tone,
-}
-
 /// The Last sync card.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LastSync {
@@ -610,7 +596,11 @@ pub struct LastSync {
     pub finished: Option<Timestamp>,
     pub by: Option<String>,
     pub revision: Option<String>,
-    pub steps: Vec<Step>,
+    /// Its resources' results, as the sync journal keeps them (those without a kind or a
+    /// name left out).
+    pub steps: Vec<super::journal::Step>,
+    /// Them summed up, the cause first: worked out once per read.
+    pub summary: super::steps::Summary,
     /// Steps done so far (a hook still running isn't).
     pub done: usize,
     pub running: bool,
@@ -628,21 +618,13 @@ impl LastSync {
 pub fn last_sync(app: &Value) -> Option<LastSync> {
     let op = app.pointer("/status/operationState")?;
     let phase = s(op, "/phase")?.to_string();
-    let steps: Vec<Step> = arr(op, "/syncResult/resources")
+    let steps: Vec<super::journal::Step> = arr(op, "/syncResult/resources")
         .iter()
-        .filter_map(|r| {
-            let hook = s(r, "/hookPhase").is_some() || r.get("hookType").is_some_and(|h| !h.is_null());
-            let status = if hook { s(r, "/hookPhase").or(s(r, "/status")) } else { s(r, "/status") };
-            let status = status.unwrap_or_default().to_string();
-            // A hook's phase: Running is on its way, not good yet.
-            let tone = match status.as_str() {
-                "Running" | "Pending" | "" => Tone::Busy,
-                _ => crate::status::tone(&status).unwrap_or(Tone::Done),
-            };
-            Some(Step { res: Res::of(r)?, message: s(r, "/message").map(String::from), hook, tone, status })
-        })
+        .map(super::journal::Step::of)
+        .filter(|st| !st.kind.is_empty() && !st.name.is_empty())
         .collect();
-    let done = steps.iter().filter(|st| !st.status.is_empty() && st.tone != Tone::Busy).count();
+    let summary = super::steps::Summary::of(&steps);
+    let done = summary.done;
     let message = s(op, "/message").map(|m| {
         let line = m.lines().next().unwrap_or_default();
         let cut: String = line.chars().take(MESSAGE_CHARS).collect();
@@ -662,6 +644,7 @@ pub fn last_sync(app: &Value) -> Option<LastSync> {
         by: op.pointer("/operation/initiatedBy").and_then(who),
         revision,
         steps,
+        summary,
         done,
     })
 }
@@ -806,14 +789,28 @@ pub fn history(app: &Value, n: usize) -> History {
 pub struct Read {
     /// The Application, whole.
     pub app: Value,
-    /// Its resource tree; None when it can't be asked (a hub with no Argo CD server set).
+    /// Its resource tree; None when it can't be asked (the Application is a list's copy).
     pub tree: Option<Result<Value, String>>,
     /// Argo CD's diff; None when it can't be asked.
     pub diff: Option<Result<GitDiff, String>>,
     /// The commit of each source deployed (see [`deployed`]); None when it can't be asked.
     pub commits: Vec<Option<Result<Commit, String>>>,
-    /// Why the tree, the diff and the commits can't be asked, when they can't.
+    /// Why the Application couldn't be read now (one line), when it is a list's copy: its
+    /// tree, diff and commits then aren't asked.
     pub note: Option<String>,
+}
+
+/// The first line of an error with text, to say it in one line.
+pub fn first_line(e: &str) -> String {
+    e.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("it failed").to_string()
+}
+
+impl Read {
+    /// The Application as a feed holds it (its list's copy), when reading it failed with `why`:
+    /// its tree, diff and commits aren't asked, and the note says why in one line.
+    pub fn held(app: Value, why: &str) -> Self {
+        Self { app, tree: None, diff: None, commits: Vec::new(), note: Some(first_line(why)) }
+    }
 }
 
 /// Every card of one Application's dashboard.
@@ -874,7 +871,6 @@ impl Cards {
 
 mod read;
 pub(in crate::k8s::argo) use read::extras;
-pub use read::read_hub;
 
 /// A made-up example, for the developer tools' snapshots and the tests.
 #[cfg(any(test, feature = "dev"))]

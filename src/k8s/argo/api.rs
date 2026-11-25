@@ -10,7 +10,9 @@
 //! so only what the page shows comes back), then kept live from Argo CD's application stream
 //! (`/api/v1/stream/applications`, server-sent events). A stream that ends or fails is opened
 //! again after a backoff (1 s, doubling to 60 s), listing again first: nothing is polled. A
-//! server's feed runs while a window shows the Argo CD page ([`watch`]), shared by them all.
+//! server's feed runs while a window shows the Argo CD page ([`watch`]), shared by them all,
+//! and a while after a lookup asked for it: an object's Application, on its page or for an
+//! agent, is found in what the feeds hold ([`held_apps`]).
 //!
 //! The actions of the Argo CD page on an Application read this way (refresh, sync,
 //! terminate, roll back) go through the same API ([`act`]), refused while write mode is off.
@@ -27,6 +29,12 @@ use serde_json::{Map, Value, json};
 use super::server::{self, Login, Server, encode, scrub};
 use super::windows::{self, SyncWindow};
 use super::{DEFAULT_NAMESPACE, Summary, TRACKING_ID};
+
+/// For the end-to-end tests (`e2e`).
+#[cfg(all(test, feature = "dev"))]
+pub(crate) mod fake;
+mod held;
+pub use held::{held_apps, held_states};
 
 /// Where the tokens set in Settings → Argo CD are kept, by server address (mode 0600).
 const TOKENS_FILE: &str = "argocd-api-tokens.json";
@@ -49,9 +57,10 @@ const MAX_PROJECTS: usize = 50;
 const PROJECTS_EVERY: Duration = Duration::from_secs(5 * 60);
 
 /// The fields of an Application the page reads; the rest is not sent (`fields`).
-const APP_FIELDS: [&str; 26] = [
+const APP_FIELDS: [&str; 27] = [
     "metadata.name",
     "metadata.namespace",
+    "metadata.creationTimestamp",
     "metadata.labels",
     "metadata.annotations",
     "metadata.deletionTimestamp",
@@ -117,6 +126,11 @@ impl Endpoint {
         self.server.name()
     }
 
+    /// Who it is logged in as (see `server::token_user`), when its token says.
+    pub fn user(&self) -> Option<String> {
+        self.login.as_ref().ok().and_then(|(t, _)| server::token_user(&t.0))
+    }
+
     /// The same Argo CD as a hub whose server is this one (see `grouping::hub_instance`).
     pub fn instance(&self) -> String {
         super::grouping::server_instance(&self.server.base)
@@ -154,6 +168,9 @@ impl Endpoint {
 pub struct Endpoints {
     pub list: Vec<Endpoint>,
     pub errors: Vec<String>,
+    /// CLI contexts that can't be used here, and how to connect instead: said quietly in
+    /// Settings → Argo CD, not as an error on the Argo CD page.
+    pub notes: Vec<String>,
 }
 
 /// A server of the argocd CLI's config, as read (not `Debug`: it holds the token).
@@ -165,9 +182,14 @@ struct CliEntry {
     token: Option<String>,
 }
 
+/// The server name `argocd login --port-forward` saves: the CLI port-forwards to argocd-server
+/// itself each time, through the kubeconfig. There is no address to ask.
+const CLI_PORT_FORWARD: &str = "port-forward";
+
 /// The API servers of the argocd CLI's config `text`, one entry per context (`--core`
-/// contexts have none). A config that doesn't read gives nothing, and says why.
-fn cli_entries(text: &str) -> Result<Vec<CliEntry>, String> {
+/// contexts have none; a `--port-forward` one has none either, and a line in `notes` says
+/// so). A config that doesn't read gives nothing, and says why.
+fn cli_entries(text: &str, notes: &mut Vec<String>) -> Result<Vec<CliEntry>, String> {
     if text.trim().is_empty() {
         return Ok(Vec::new());
     }
@@ -177,6 +199,15 @@ fn cli_entries(text: &str) -> Result<Vec<CliEntry>, String> {
     for c in &config.contexts {
         let Some(s) = config.servers.iter().find(|s| s.server == c.server) else { continue };
         if s.core || s.server.trim().is_empty() {
+            continue;
+        }
+        if s.server.trim() == CLI_PORT_FORWARD {
+            notes.push(format!(
+                "argocd CLI context {} uses the CLI's port-forward mode, which can't be used here: log in to the \
+                 server's address instead (`argocd login <address>`), or port-forward to argocd-server yourself \
+                 and add http://localhost:<port> here",
+                c.name
+            ));
             continue;
         }
         let scheme = if s.plain_text { "http" } else { "https" };
@@ -244,7 +275,7 @@ fn endpoints_from(
     }
     let mut cli_tokens: HashMap<String, Option<String>> = HashMap::new();
     let mut entries = match cli {
-        Some(Ok(text)) => cli_entries(&text).unwrap_or_else(|e| {
+        Some(Ok(text)) => cli_entries(&text, &mut out.notes).unwrap_or_else(|e| {
             out.errors.push(e);
             Vec::new()
         }),
@@ -657,9 +688,10 @@ fn put(out: &mut Value, path: &[&str], v: Value) {
 /// ignore `fields`). Memory stays small however many there are: no resources, no
 /// manifests, the history's last deployments without their sources.
 pub fn lean(app: &Value) -> Value {
-    const KEPT: [&str; 17] = [
+    const KEPT: [&str; 19] = [
         "/metadata/name",
         "/metadata/namespace",
+        "/metadata/creationTimestamp",
         "/metadata/labels",
         "/metadata/deletionTimestamp",
         "/metadata/resourceVersion",
@@ -673,6 +705,7 @@ pub fn lean(app: &Value) -> Value {
         "/status/health/message",
         "/status/operationState/phase",
         "/status/operationState/message",
+        "/status/operationState/startedAt",
         "/status/operationState/finishedAt",
         "/status/resourceHealthSource",
     ];
@@ -884,6 +917,9 @@ pub struct FeedState {
     pub apps: Apps,
     /// Each project's sync windows, once read; or why they couldn't be.
     pub projects: Option<Result<super::ProjectWindows, String>>,
+    /// The name Argo CD gives each cluster, by its server URL (`server_key`); empty until
+    /// read, or when this login may not list them.
+    pub clusters: Arc<BTreeMap<String, String>>,
     /// Why the last read or stream failed (never the token).
     pub error: Option<String>,
     /// Listed at least once.
@@ -970,7 +1006,7 @@ impl Drop for Watch {
 /// Hold the feed of `endpoint`, starting it if none runs. Feeds are kept by server, login
 /// and config generation: a new login or a change in Settings starts a new one.
 pub fn watch(endpoint: &Endpoint) -> Watch {
-    let key = format!("{}#{}", endpoint.feed_key(), generation());
+    let key = watch_key(endpoint);
     let mut feeds = FEEDS.lock().unwrap_or_else(PoisonError::into_inner);
     let token = endpoint.login.as_ref().ok().map(|(t, _)| t.clone());
     let feed = feeds.entry(key.clone()).or_insert_with(|| {
@@ -988,6 +1024,17 @@ pub fn watch(endpoint: &Endpoint) -> Watch {
     }
     feed.users += 1;
     Watch { endpoint: Arc::new(endpoint.clone()), state: feed.state.clone(), key }
+}
+
+/// What a feed of `endpoint` is kept under: its server, login and the config's generation.
+pub(crate) fn watch_key(endpoint: &Endpoint) -> String {
+    format!("{}#{}", endpoint.feed_key(), generation())
+}
+
+/// The feed of `endpoint` when a page holds one now, without holding it: a reader that
+/// shouldn't open a stream of its own (a Problems scan) reads it while it runs.
+pub fn running(endpoint: &Endpoint) -> Option<Arc<Mutex<FeedState>>> {
+    FEEDS.lock().unwrap_or_else(PoisonError::into_inner).get(&watch_key(endpoint)).map(|f| f.state.clone())
 }
 
 /// Keep the login to `base` renewed while its feed runs: shortly before the token in `cell`
@@ -1186,15 +1233,7 @@ async fn follow(conn: &Conn, state: &Arc<Mutex<FeedState>>, cell: &TokenCell) ->
     };
     // Not kept in the sync journal from here: the list leaves out each resource's result, and
     // the stream, open first, sends every Application whole with it.
-    let listed: Apps = list
-        .get("items")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .map(ApiApp::of)
-        .filter(|a| !a.summary.name.is_empty())
-        .map(|a| (a.key(), Arc::new(a)))
-        .collect();
+    let listed: Apps = listed(&list).map(|a| (a.key(), Arc::new(a))).collect();
     drop(list);
     let mut sent = Vec::new();
     while let Ok(batch) = rx.try_recv() {
@@ -1228,12 +1267,27 @@ async fn follow(conn: &Conn, state: &Arc<Mutex<FeedState>>, cell: &TokenCell) ->
     }
 }
 
-/// Read the projects' sync windows now and every `PROJECTS_EVERY` while the feed follows.
+/// The Applications of a list's answer, as kept.
+fn listed(list: &Value) -> impl Iterator<Item = ApiApp> + '_ {
+    list.get("items")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .map(ApiApp::of)
+        .filter(|a| !a.summary.name.is_empty())
+}
+
+/// Read the projects' sync windows and the clusters' names now and every `PROJECTS_EVERY`
+/// while the feed follows.
 async fn keep_windows(mut conn: Conn, state: Arc<Mutex<FeedState>>, cell: TokenCell) {
     loop {
         // The token renewed since the round started.
         if let Some(t) = token_in(&cell) {
             conn.token = t;
+        }
+        // Names only: a login that may not list the clusters keeps their URLs.
+        if let Ok(listed) = conn.get("/api/v1/clusters").await {
+            lock(&state).clusters = Arc::new(cluster_names(&listed));
         }
         let projects: Vec<String> = {
             let s = lock(&state);
@@ -1247,6 +1301,20 @@ async fn keep_windows(mut conn: Conn, state: Arc<Mutex<FeedState>>, cell: TokenC
         changed();
         tokio::time::sleep(PROJECTS_EVERY).await;
     }
+}
+
+/// The name of each cluster of Argo CD's cluster list, by its server URL (`server_key`).
+pub(super) fn cluster_names(listed: &Value) -> BTreeMap<String, String> {
+    listed
+        .get("items")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|c| {
+            let name = c.get("name")?.as_str().filter(|n| !n.is_empty())?;
+            Some((super::server_key(c.get("server")?.as_str()?), name.to_string()))
+        })
+        .collect()
 }
 
 /// Each project's sync windows: one list of the projects, else (when this login may not
@@ -1321,6 +1389,20 @@ async fn check(conn: &Conn) -> Result<String, Failure> {
     Ok(format!("Logged in as {who}, Argo CD {version}: {} readable", crate::plural::count(n, "Application")))
 }
 
+/// Every Application of `endpoint` its login may read: one list, no stream, each kept as
+/// the feeds keep them, within `timeout`. For a reader with no feed running (`running`).
+pub async fn list_once(endpoint: Endpoint, timeout: Duration) -> Result<Vec<Arc<ApiApp>>, String> {
+    let read = crate::k8s::run_abortable(async move {
+        let conn = match endpoint.conn() {
+            Ok(c) => c,
+            Err(e) => return Ok(Err(e)),
+        };
+        let list = conn.get_within(&list_path(), timeout).await;
+        Ok(list.map(|list| listed(&list).map(Arc::new).collect()).map_err(|f| f.text))
+    });
+    read.await.unwrap_or_else(|e| Err(format!("{e:#}")))
+}
+
 /// The server at `base` as the config says now: a write goes with the login set now, and not
 /// at all to a server removed or turned off since the page was drawn.
 fn current(base: &str) -> Result<Endpoint, String> {
@@ -1348,9 +1430,31 @@ pub async fn read_app(endpoint: Arc<Endpoint>, namespace: String, name: String) 
     read.await.unwrap_or_else(|e| Err(format!("{e:#}")))
 }
 
+/// [`read_app`], None when Argo CD has no such Application (it was deleted).
+pub async fn read_app_opt(endpoint: Arc<Endpoint>, namespace: String, name: String) -> Result<Option<Value>, String> {
+    let read = crate::k8s::run_abortable(async move {
+        let conn = match current(&endpoint.server.base).and_then(|e| e.conn()) {
+            Ok(c) => c,
+            Err(e) => return Ok(Err(e)),
+        };
+        Ok(match conn.get(&app_path(&namespace, &name)).await {
+            Ok(app) => Ok(Some(app)),
+            Err(f) if f.status == Some(404) => Ok(None),
+            // argocd-server says an Application it can't find with permission denied, too.
+            Err(f) if f.status == Some(403) && f.text.contains("not found") => Ok(None),
+            Err(f) => Err(f.text),
+        })
+    });
+    read.await.unwrap_or_else(|e| Err(format!("{e:#}")))
+}
+
 /// The dashboard of the Application `namespace/name`, read by the API with the server's login
 /// as the config has it now: the Application whole, then its resource tree and managed
 /// resources together, then the commits it deploys (each kept once read). Read-only.
+///
+/// When the Application can't be read (no login, an expired one, the server down), it is
+/// shown as the feed of `endpoint` holds it, with why in one line (`Read::note`); an error
+/// only when no feed holds it either.
 pub async fn dashboard(
     endpoint: Arc<Endpoint>,
     namespace: String,
@@ -1360,11 +1464,11 @@ pub async fn dashboard(
         let found = current(&endpoint.server.base).and_then(|e| Ok((e.conn()?, e.login?.1)));
         let (conn, how) = match found {
             Ok(found) => found,
-            Err(e) => return Ok(Err(e)),
+            Err(e) => return Ok(held_read(&endpoint, &namespace, &name, e)),
         };
         let app = match conn.get(&app_path(&namespace, &name)).await {
             Ok(app) => app,
-            Err(f) => return Ok(Err(f.text)),
+            Err(f) => return Ok(held_read(&endpoint, &namespace, &name, f.text)),
         };
         super::journal::observe(&super::grouping::server_instance(&conn.server.base), &app);
         let shown = conn.server.name();
@@ -1377,6 +1481,15 @@ pub async fn dashboard(
         Ok(Ok(super::dashboard::extras(&base, &namespace, &name, app, get, diff_of).await))
     });
     read.await.unwrap_or_else(|e| Err(format!("{e:#}")))
+}
+
+/// The dashboard of `namespace/name` as the running feed of `endpoint` holds it, when reading
+/// it failed with `why`: its status without its tree, diff and commits, and why in one line.
+/// `why` alone when no feed holds it.
+fn held_read(endpoint: &Endpoint, namespace: &str, name: &str, why: String) -> Result<super::dashboard::Read, String> {
+    let held = running(endpoint).and_then(|s| lock(&s).apps.get(&(namespace.to_string(), name.to_string())).cloned());
+    let Some(app) = held else { return Err(why) };
+    Ok(super::dashboard::Read::held(app.value.clone(), &why))
 }
 
 /// The smart diff of the manifests Argo CD renders for the Application `namespace/name` at
@@ -1436,9 +1549,11 @@ pub enum Action {
     /// A sync with the options asked for (the whole Application, hooks included, with none).
     Sync(super::ops::SyncRequest),
     Terminate,
-    /// Back to the deployment of its history with this id.
+    /// Back to the deployment of its history with this id; with `dry_run`, Argo CD applies
+    /// nothing and says what it would do.
     Rollback {
         id: i64,
+        dry_run: bool,
     },
 }
 
@@ -1455,9 +1570,12 @@ pub(super) fn request(action: &Action, namespace: &str, name: &str) -> (http::Me
         }
         Action::Sync(req) => (http::Method::POST, format!("{app}/sync"), Some(sync_body(body, req))),
         Action::Terminate => (http::Method::DELETE, format!("{app}/operation?appNamespace={ns}"), None),
-        Action::Rollback { id } => {
+        Action::Rollback { id, dry_run } => {
             let mut body = body;
             body["id"] = json!(id);
+            if *dry_run {
+                body["dryRun"] = json!(true);
+            }
             (http::Method::POST, format!("{app}/rollback"), Some(body))
         }
     }
@@ -1478,6 +1596,15 @@ fn sync_body(mut body: Value, req: &super::ops::SyncRequest) -> Value {
         body["resources"] = Value::Array(req.resources.iter().map(super::ops::resource_entry).collect());
     }
     body
+}
+
+/// The context whose read-only setting refuses a write to `endpoint`, if one does: a hub
+/// context tied to this server (Settings → Per cluster) is the same Argo CD, so its setting
+/// counts though the write goes through the API; else the server's name, as its protection
+/// is keyed.
+pub fn read_only(endpoint: &Endpoint) -> Option<String> {
+    let servers = crate::settings::with(|s| s.argocd_servers.clone());
+    server::read_only_context(&servers, &endpoint.server.base, &endpoint.name(), crate::settings::is_read_only)
 }
 
 /// Ask Argo CD for `action` on the Application `namespace/name`, by its API, with the
@@ -1516,14 +1643,8 @@ pub async fn act_read(
             }
             read = Some((app, op));
         }
-        // A hub context tied to this server (Settings → Per cluster) is the same Argo CD:
-        // its read-only setting counts, though the write goes through the API. Else the
-        // server's name, as its protection is keyed.
         let server_name = endpoint.name();
-        let servers = crate::settings::with(|s| s.argocd_servers.clone());
-        let read_only =
-            server::read_only_context(&servers, &endpoint.server.base, &server_name, crate::settings::is_read_only);
-        if let Some(why) = read_only
+        if let Some(why) = read_only(&endpoint)
             .map_or_else(|| crate::k8s::gate::refusal(&server_name), |c| Some(crate::k8s::gate::read_only_refusal(&c)))
         {
             return Ok(Err(why));
@@ -1540,10 +1661,121 @@ pub async fn act_read(
                     None => format!("Sync of {name} started"),
                 },
                 Action::Terminate => format!("The operation of {name} is terminating"),
-                Action::Rollback { id } => format!("Rollback of {name} to deployment {id} started"),
+                Action::Rollback { id, .. } => format!("Rollback of {name} to deployment {id} started"),
             })
             .map(|said| (said, before))
             .map_err(|f| f.text))
+    });
+    write.await.unwrap_or_else(|e| Err(format!("{e:#}")))
+}
+
+/// What an agent asks of an Application by the API.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AgentAction {
+    Refresh {
+        hard: bool,
+    },
+    /// A sync, a rollback (its deployment named already, see `ops::pinned`) or a terminate.
+    Op(super::ops::Op),
+}
+
+/// How long an agent's dry run's result is waited for.
+const DRY_RUN_WAIT: Duration = Duration::from_secs(30);
+
+/// Why a write by an agent to `endpoint` is refused whatever its rules say: the server (or a
+/// hub context tied to it) is set read-only. Write mode is the window's: it doesn't gate
+/// agents, whose rules decide.
+pub fn agent_refusal(endpoint: &Endpoint) -> Option<String> {
+    let name = endpoint.name();
+    match read_only(endpoint) {
+        Some(c) => Some(crate::k8s::gate::read_only_refusal(&c)),
+        None if crate::settings::is_read_only(&name) => Some(crate::k8s::gate::read_only_refusal(&name)),
+        None => None,
+    }
+}
+
+/// An agent's `action` on the Application `namespace/name`, by Argo CD's API with the
+/// server's login as the config has it now. The Application is read first and the operation
+/// refused as argocd-server would refuse it (one running, a rollback with auto-sync on, a
+/// prune deleting more than was shown); a read-only server refuses it as it is sent. A dry
+/// run's result is waited for, a while. `stop` decides the agent's rules again right before
+/// the request is sent: what it says stops it.
+pub async fn act_for_agent(
+    endpoint: Arc<Endpoint>,
+    namespace: String,
+    name: String,
+    action: AgentAction,
+    stop: impl Fn() -> Option<String> + Send + 'static,
+) -> Result<String, String> {
+    use super::ops::{self, Op};
+    let write = crate::k8s::run_abortable(async move {
+        let conn = match current(&endpoint.server.base).and_then(|e| e.conn()) {
+            Ok(c) => c,
+            Err(e) => return Ok(Err(e)),
+        };
+        let path = app_path(&namespace, &name);
+        let (sent, op, app) = match action {
+            AgentAction::Refresh { hard } => (Action::Refresh { hard }, None, None),
+            AgentAction::Op(op) => {
+                let app = match conn.get(&path).await {
+                    Ok(app) => app,
+                    Err(f) => return Ok(Err(format!("the Application could not be read: {}", f.text))),
+                };
+                if let Some(why) = ops::refusal(&app, &op) {
+                    return Ok(Err(format!("Argo CD would refuse it: {why}")));
+                }
+                let sent = match &op {
+                    Op::Sync(req) => Action::Sync(req.clone()),
+                    Op::Terminate => Action::Terminate,
+                    Op::Rollback { id, dry_run } => {
+                        let entry = match ops::rollback_target(&app, *id) {
+                            Ok(e) => e,
+                            Err(why) => return Ok(Err(format!("Argo CD would refuse it: {why}"))),
+                        };
+                        let Some(id) = entry["id"].as_i64() else {
+                            return Ok(Err("that deployment has no id".to_string()));
+                        };
+                        Action::Rollback { id, dry_run: *dry_run }
+                    }
+                };
+                (sent, Some(op), Some(app))
+            }
+        };
+        if let Some(why) = agent_refusal(&endpoint).or_else(&stop) {
+            return Ok(Err(why));
+        }
+        let (method, at, body) = request(&sent, &namespace, &name);
+        if let Err(f) = conn.call(method, &at, body.as_ref()).await {
+            return Ok(Err(f.text));
+        }
+        let (Some(op), Some(app)) = (op, app) else {
+            let hard = matches!(sent, Action::Refresh { hard: true });
+            return Ok(Ok(format!("Argo CD {} Application {name}", if hard { "hard-refreshes" } else { "refreshes" })));
+        };
+        let mut out = ops::started(&app, &op, &name);
+        if op.dry_run() {
+            let before = super::grouped_sync::started_at(&app);
+            let deadline = Instant::now() + DRY_RUN_WAIT;
+            loop {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                if let Ok(now) = conn.get(&path).await
+                    && super::grouped_sync::started_at(&now) != before
+                    && let Some(result) = ops::dry_run_result(&now)
+                {
+                    out.push('\n');
+                    out.push_str(&result);
+                    break;
+                }
+                if Instant::now() >= deadline {
+                    out.push_str(&format!(
+                        "\nStill running after {} s: its result will show as the last sync (status.operationState).",
+                        DRY_RUN_WAIT.as_secs()
+                    ));
+                    break;
+                }
+            }
+        }
+        Ok(Ok(out))
     });
     write.await.unwrap_or_else(|e| Err(format!("{e:#}")))
 }
@@ -1580,6 +1812,9 @@ contexts:
 - name: remote-plain
   server: plain.example.com
   user: dev
+- name: port-forward
+  server: port-forward
+  user: port-forward
 current-context: prod-again
 servers:
 - server: argocd-dev.example.com
@@ -1592,6 +1827,8 @@ servers:
 - server: kubernetes
   core: true
 - server: plain.example.com
+  plain-text: true
+- server: port-forward
   plain-text: true
 users:
 - name: dev
@@ -1626,6 +1863,9 @@ users:
         // Plain http to another machine would send the token in clear: not used, said why.
         assert_eq!(e.errors.len(), 1, "{:?}", e.errors);
         assert!(e.errors[0].contains("remote-plain"));
+        // `argocd login --port-forward` (#1075): no address to ask, said quietly, not an error.
+        assert_eq!(e.notes.len(), 1, "{:?}", e.notes);
+        assert!(e.notes[0].starts_with("argocd CLI context port-forward uses the CLI's port-forward mode"));
     }
 
     #[test]
@@ -1700,7 +1940,7 @@ users:
         );
         let body = json!({"name": "web", "appNamespace": "team a", "id": 7});
         assert_eq!(
-            req(Action::Rollback { id: 7 }),
+            req(Action::Rollback { id: 7, dry_run: false }),
             ("POST".into(), "/api/v1/applications/web/rollback".into(), Some(body))
         );
     }

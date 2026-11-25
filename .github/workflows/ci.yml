@@ -1,18 +1,23 @@
 name: CI
 
-# Pull requests get the quick checks and the end-to-end run on a kind cluster (the write
-# guards). Pushes to main, release tags and manual runs get everything: macOS, Windows, the
-# minimum Rust version, docs and release builds.
+# Pull requests get the quick checks, in about two minutes: format, spelling, licenses and
+# clippy (with and without the developer tools). Pushes to main, release tags and manual runs
+# get everything: the tests, the end-to-end run on a kind cluster (the write guards), Windows,
+# macOS, the minimum Rust version, docs and release builds. A failure on main is fixed first.
+# (merge_group stays for a merge queue, which needs an organization-owned repository.)
 on:
   pull_request:
+  merge_group:
   push:
     branches: [main]
     tags: ["v*"]
   workflow_dispatch:
 
+# A pull request's new push cancels its older run. On main a run is never cancelled: the tests
+# only run there, so each must finish; a newer push waits, and only the newest waiting run is kept.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
@@ -26,7 +31,6 @@ env:
   LINUX_DEPS: >-
     pkg-config clang cmake libfontconfig-dev libfreetype-dev libxkbcommon-dev libxkbcommon-x11-dev
     libwayland-dev libvulkan-dev libx11-xcb-dev libxcb1-dev
-  FULL: ${{ github.event_name != 'pull_request' }}
   # When many jobs start at once the Ubuntu mirror can stall for minutes: time out and retry.
   APT_GET: sudo apt-get -qq -o Acquire::Retries=5 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20
 
@@ -48,8 +52,10 @@ jobs:
       - uses: crate-ci/typos@276087d9a4f06398b3e04825487805e2d7375888 # v1.52.2
       - uses: EmbarkStudios/cargo-deny-action@17aeb3c839e42274e2b8adf721c8c65edfdc74dd # v2.1.3
 
-  check:
-    name: Clippy and tests
+  # Clippy twice, in parallel: with the developer tools and without. Each keeps its own cache,
+  # saved by main, so a pull request starts warm.
+  clippy:
+    name: Clippy
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -61,20 +67,51 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
+          shared-key: clippy
+          cache-on-failure: true
+      - run: cargo clippy --locked --profile ci --all-targets --features dev -- -D warnings
+
+  clippy-lean:
+    name: Clippy without developer tools
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: System libraries
+        run: $APT_GET update && $APT_GET install -y --no-install-recommends $LINUX_DEPS
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+          components: clippy
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: clippy-lean
+          cache-on-failure: true
+      - run: cargo clippy --locked --profile ci --all-targets -- -D warnings
+
+  # ---- Merge queue and full run ----
+
+  test:
+    name: Tests
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: System libraries
+        run: $APT_GET update && $APT_GET install -y --no-install-recommends $LINUX_DEPS
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
           shared-key: ci
           cache-on-failure: true
-      - name: Clippy
-        run: cargo clippy --locked --profile ci --all-targets --features dev -- -D warnings
-      - name: Clippy without developer tools
-        run: cargo clippy --locked --profile ci --all-targets -- -D warnings
-      - name: Tests
-        run: cargo test --locked --profile ci --features dev
+      - run: cargo test --locked --profile ci --features dev
 
-  # Windows on every pull request, compiled only (tests and all targets, no linking): code
-  # that builds on Unix alone shows here rather than on main. Its own cache, also saved by
-  # main, so a pull request starts warm.
+  # Windows in the merge queue, compiled only (tests and all targets, no linking): code that
+  # builds on Unix alone is stopped before main. Its own cache, also saved by main.
   check-windows:
     name: Check (Windows)
+    if: github.event_name != 'pull_request'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -86,11 +123,11 @@ jobs:
           shared-key: check
       - run: cargo check --locked --profile ci --all-targets --features dev
 
-  # ---- Full run (main, tags, manual) ----
+  # ---- Full run only (main, tags, manual) ----
 
   test-macos:
     name: Tests (macOS)
-    if: github.event_name != 'pull_request'
+    if: github.event_name != 'pull_request' && github.event_name != 'merge_group'
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -104,7 +141,7 @@ jobs:
 
   test-windows:
     name: Tests (Windows)
-    if: github.event_name != 'pull_request'
+    if: github.event_name != 'pull_request' && github.event_name != 'merge_group'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -118,7 +155,7 @@ jobs:
 
   msrv:
     name: Minimum Rust version
-    if: github.event_name != 'pull_request'
+    if: github.event_name != 'pull_request' && github.event_name != 'merge_group'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -136,7 +173,7 @@ jobs:
 
   docs:
     name: Docs
-    if: github.event_name != 'pull_request'
+    if: github.event_name != 'pull_request' && github.event_name != 'merge_group'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -153,6 +190,7 @@ jobs:
 
   e2e:
     name: End to end (kind)
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -209,8 +247,8 @@ jobs:
 
   build:
     name: Release build (${{ matrix.target }})
-    if: github.event_name != 'pull_request'
-    needs: [quick, check]
+    if: github.event_name != 'pull_request' && github.event_name != 'merge_group'
+    needs: [quick, clippy, test]
     strategy:
       fail-fast: false
       matrix:
@@ -246,7 +284,7 @@ jobs:
   ci-ok:
     name: CI result
     if: always()
-    needs: [quick, check, check-windows, test-macos, test-windows, msrv, docs, e2e, build]
+    needs: [quick, clippy, clippy-lean, test, check-windows, test-macos, test-windows, msrv, docs, e2e, build]
     runs-on: ubuntu-latest
     steps:
       - name: All required jobs passed or were skipped

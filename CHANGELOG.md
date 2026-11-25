@@ -5,6 +5,26 @@ and versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.12.0](https://github.com/nahuel11500/recouvrance/compare/v0.11.0...v0.12.0) - 2026-11-25
+
+### Added
+
+- Build, test and release for Windows (#1017)
+
+### Documentation
+
+- *(readme)* Windows is experimental; report in #1021 (#1038)
+- *(readme)* Only the Windows end-to-end pass is left (#1036)
+
+### Fixed
+
+- No console window opens with the app on Windows (#1030)
+- *(plugins)* On Windows, find Git's sh.exe and say so when there is none (#1031)
+- *(agents)* An approval's text is never markup in a notify-send notification (#1035)
+- *(errors)* A connection that failed is said by its reason, not hyper's chain (#1032)
+- *(status)* The status line names contexts by their short name, the full one on hover (#1029)
+- *(agents)* Approval notifications as native toasts on Windows (#1028)
+
 ## [0.11.0](https://github.com/nahuel11500/recouvrance/compare/v0.10.0...v0.11.0) - 2026-11-24
 
 ### Added

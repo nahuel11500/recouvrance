@@ -1759,6 +1759,73 @@ async fn followed_until(
     tokio::time::timeout(std::time::Duration::from_secs(60), wait).await.context("never sent")?
 }
 
+/// The namespaces a connect listed follow the cluster: one created afterwards shows in the
+/// context's namespace watch, and goes once deleted, for every holder of that one watch.
+#[test]
+#[ignore = "needs a kind cluster: RECOUVRANCE_E2E_CONTEXT"]
+fn the_namespace_list_follows_namespaces_created_and_deleted() {
+    use k8s_openapi::api::core::v1::Namespace;
+    const NAME: &str = "recouvrance-ns-test";
+
+    async fn until(
+        feed: &mut k8s::namespace_feed::NamespaceHold,
+        what: &str,
+        holds: impl Fn(&[String]) -> bool,
+    ) -> Result<()> {
+        for _ in 0..120 {
+            if holds(&feed.now().names) {
+                return Ok(());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+        bail!("{what}: {:?}", feed.now())
+    }
+
+    /// Once `NAME` is deleted: it is terminating until what it holds is gone.
+    async fn gone(namespaces: &Api<Namespace>) -> Result<()> {
+        for _ in 0..180 {
+            if namespaces.get_opt(NAME).await?.is_none() {
+                return Ok(());
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+        let left = namespaces.get_opt(NAME).await?.and_then(|ns| ns.status);
+        bail!("{NAME} still terminating after 3 minutes: {left:?}")
+    }
+
+    run(async {
+        let ctx = context();
+        let truth = k8s::connect_for_agents(ctx.clone()).await?;
+        let namespaces: Api<Namespace> = Api::all(truth.clone());
+        let _ = namespaces.delete(NAME, &DeleteParams::default()).await;
+        gone(&namespaces).await?;
+
+        let ui = k8s::connect(ctx.clone()).await?;
+        let mut feed = k8s::namespace_feed::hold(&ctx, &ui);
+        let first = feed.answer().await;
+        let listed = first.result().map_err(anyhow::Error::msg)?;
+        assert!(listed.iter().any(|n| n == "default"), "{listed:?}");
+        assert!(!listed.iter().any(|n| n == NAME), "{listed:?}");
+        // A second window shares the watch: answered at once, from the same list.
+        let mut other = k8s::namespace_feed::hold(&ctx, &ui);
+        assert_eq!(other.answer().await.names, first.names);
+
+        let ns = serde_json::from_value(json!({"metadata": {"name": NAME}}))?;
+        namespaces.create(&PostParams::default(), &ns).await?;
+        until(&mut feed, "created", |n| n.iter().any(|n| n == NAME)).await?;
+        until(&mut other, "created, in the other window", |n| n.iter().any(|n| n == NAME)).await?;
+        assert!(k8s::namespace_feed::listed(&ctx).is_some_and(|n| n.iter().any(|n| n == NAME)));
+
+        namespaces.delete(NAME, &DeleteParams::default()).await?;
+        // Terminating until its contents are gone: listed until then, as the API lists it.
+        gone(&namespaces).await?;
+        until(&mut feed, "deleted", |n| !n.iter().any(|n| n == NAME)).await?;
+        drop((feed, other));
+        assert!(k8s::namespace_feed::listed(&ctx).is_none(), "the last hold stops the watch");
+        Ok(())
+    });
+}
+
 /// A detail page follows its object with a watch on its name, and its pods with a watch on
 /// their labels, as a real API server serves them (field and label selectors, bookmarks,
 /// deletions): a change shows with no read asked, a deletion says so, and the object created
@@ -2262,63 +2329,48 @@ fn the_timeline_s_events_come_through_their_watch() {
     });
 }
 
-/// Argo CD's Application kind as its CRD serves it (no status subresource), for the gitops
-/// test: kind runs no Argo CD. True when this test installed it (and removes it after).
-async fn application_crd(client: kube::Client) -> Result<bool> {
-    use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition;
-    let crds: Api<CustomResourceDefinition> = Api::all(client);
-    let name = "applications.argoproj.io";
-    let installed = crds.get_opt(name).await?.is_none();
-    if installed {
-        let crd = serde_json::from_value(json!({
-            "metadata": {"name": name},
-            "spec": {
-                "group": "argoproj.io",
-                "names": {"kind": "Application", "listKind": "ApplicationList", "plural": "applications", "singular": "application"},
-                "scope": "Namespaced",
-                "versions": [{"name": "v1alpha1", "served": true, "storage": true,
-                    "schema": {"openAPIV3Schema": {"type": "object", "x-kubernetes-preserve-unknown-fields": true}}}],
-            },
-        }))?;
-        crds.create(&PostParams::default(), &crd).await?;
-    }
-    for _ in 0..60 {
-        let crd = crds.get(name).await?;
-        let conditions = crd.status.and_then(|s| s.conditions).unwrap_or_default();
-        if conditions.iter().any(|c| c.type_ == "Established" && c.status == "True") {
-            return Ok(installed);
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    }
-    bail!("the Application CRD was not established")
+/// A fake Argo CD API server set in Settings → Argo CD, with a token, serving `apps`: the
+/// server's address and name, and its task. kind runs no Argo CD; the agents' Argo CD tools
+/// read and write only through its API.
+async fn fake_argo(
+    apps: Vec<serde_json::Value>,
+) -> Result<(Arc<k8s::argo::api::fake::Fake>, String, String, k8s::TaskGuard)> {
+    use k8s::argo::api;
+    let (fake, base, task) = api::fake::Fake::start(apps).await?;
+    crate::settings::update(|s| s.argocd_api_servers.push(base.clone()));
+    api::save_token(&base, "e2e-token")?;
+    api::reload();
+    let name = base.trim_start_matches("http://").to_string();
+    Ok((fake, base, name, task))
+}
+
+/// The server URL of the kind context, as an Application's destination.
+fn kind_server(ctx: &str) -> Result<String> {
+    let targets = k8s::argo::targets();
+    targets.iter().find(|t| t.name == ctx).and_then(|t| t.server.clone()).context("the kind context has no server")
 }
 
 /// An agent syncs an Argo CD Application with options, terminates the operation and rolls
-/// back, under its rules; what each writes to the Application is what argocd-server would
-/// (the test plays Argo CD's controller). Nothing starts while an operation runs, a rollback
-/// is refused while auto-sync is on, and the window's client refuses it all with write mode off.
+/// back through Argo CD's API, under its rules judged where the Application deploys (the
+/// kind context and its destination namespace), never on the Argo CD server; what each asks
+/// Argo CD is what argocd-server takes (the test plays Argo CD's controller). Nothing starts
+/// while an operation runs, a rollback is refused while auto-sync is on, a server set
+/// read-only refuses before the rules decide, and the window's writes need write mode.
 #[test]
 #[ignore = "needs a kind cluster: RECOUVRANCE_E2E_CONTEXT"]
 fn an_agent_syncs_terminates_and_rolls_back_an_argo_cd_application() {
-    use kube::api::DynamicObject;
-
     run(async {
         let ctx = context();
-        let admin = k8s::connect_for_agents(ctx.clone()).await?;
-        let installed = application_crd(admin.clone()).await?;
-        let kind = k8s::argo::application_kind();
-        let apps: Api<DynamicObject> = Api::namespaced_with(admin.clone(), NS, &kind.ar);
         let name = "e2e-argo";
-        let _ = apps.delete(name, &DeleteParams::default()).await;
         let source = json!({"repoURL": "https://git.example/apps", "path": "web", "targetRevision": "HEAD"});
         let (first, second) = ("1".repeat(40), "2".repeat(40));
         let app = json!({
-            "apiVersion": "argoproj.io/v1alpha1", "kind": "Application",
-            "metadata": {"name": name, "namespace": NS},
+            "metadata": {"name": name, "namespace": "argocd", "resourceVersion": "1"},
             "spec": {"project": "default", "source": source,
-                "destination": {"server": "https://kubernetes.default.svc", "namespace": NS}},
+                "destination": {"server": kind_server(&ctx)?, "namespace": NS}},
             "status": {
                 "sync": {"status": "OutOfSync"},
+                "health": {"status": "Healthy"},
                 "resources": [
                     {"group": "apps", "version": "v1", "kind": "Deployment", "namespace": NS, "name": "web", "status": "OutOfSync"},
                     {"version": "v1", "kind": "ConfigMap", "namespace": NS, "name": "old", "status": "OutOfSync", "requiresPruning": true},
@@ -2330,339 +2382,169 @@ fn an_agent_syncs_terminates_and_rolls_back_an_argo_cd_application() {
                 ],
             },
         });
-        apps.create(&PostParams::default(), &serde_json::from_value(app)?).await?;
-        // The Application as stored, and a merge patch of it: what Argo CD's controller does.
-        let api = &apps;
-        let read = move || async move { anyhow::Ok(serde_json::to_value(api.get(name).await?)?) };
-        let set = move |patch: serde_json::Value| async move {
-            api.patch(name, &PatchParams::default(), &Patch::Merge(patch)).await?;
-            anyhow::Ok(())
+        let (fake, base, server, _argo) = fake_argo(vec![app]).await?;
+        let (hub, agent, token, _server) = agent(&["get,list *"], &[]).await?;
+        let client = crate::assistant::Mcp::connect(hub.port(), token).await?;
+        let target = json!({"server": server, "kind": "applications", "namespace": "argocd", "name": name});
+        let with = |extra: serde_json::Value| {
+            let mut args = target.clone();
+            for (k, v) in extra.as_object().into_iter().flatten() {
+                args[k] = v.clone();
+            }
+            args
         };
-        let checked = async {
-            let (hub, agent, token, _server) = agent(&["get,list *"], &[]).await?;
-            let client = crate::assistant::Mcp::connect(hub.port(), token).await?;
-            let target = json!({"context": ctx, "kind": "applications", "namespace": NS, "name": name});
-            let with = |extra: serde_json::Value| {
-                let mut args = target.clone();
-                for (k, v) in extra.as_object().into_iter().flatten() {
-                    args[k] = v.clone();
-                }
-                args
-            };
+        let op = || fake.get(name).and_then(|a| a.get("operation").cloned()).filter(|o| !o.is_null());
 
-            // Without a sync rule, nothing is written (a sync is not a patch).
-            let out = client.call("gitops", with(json!({"action": "sync"}))).await;
-            assert!(out.contains("Denied"), "{out}");
-            assert!(read().await?.get("operation").is_none());
-            let allow = rules_file::parse_rule(Mode::Allow, "sync applications/e2e-* -n default")?;
-            hub.update_agent(&agent.id, |a| a.policy.rules.push(allow))?;
-
-            // A sync of two resources with prune: it names what prune deletes.
-            let picked = json!([
-                {"group": "apps", "kind": "Deployment", "namespace": NS, "name": "web"},
-                {"kind": "ConfigMap", "namespace": NS, "name": "old"},
-            ]);
-            let out = client.call("gitops", with(json!({"action": "sync", "resources": picked, "prune": true}))).await;
-            assert!(out.contains("prune deletes ConfigMap default/old"), "{out}");
-            let op = read().await?["operation"].clone();
-            assert_eq!(op["initiatedBy"]["username"], "recouvrance", "{op}");
-            assert_eq!(op["sync"]["prune"], true, "{op}");
-            assert_eq!(op["sync"]["syncStrategy"], json!({"hook": {}}), "{op}");
-            assert_eq!(op["sync"]["resources"], picked, "{op}");
-
-            // Nothing else starts while it runs; it can be terminated.
-            let out = client.call("gitops", with(json!({"action": "sync"}))).await;
-            assert!(out.contains("in progress"), "{out}");
-            assert_eq!(read().await?["operation"], op);
-            set(json!({"status": {"operationState": {"phase": "Running", "operation": op}}})).await?;
-            let out = client.call("gitops", with(json!({"action": "terminate"}))).await;
-            assert!(out.contains("Terminating"), "{out}");
-            assert_eq!(read().await?.pointer("/status/operationState/phase"), Some(&json!("Terminating")));
-
-            // Argo CD ends it; a rollback goes to the deployment before the newest.
-            set(json!({"operation": null, "status": {"operationState": {"phase": "Failed"}}})).await?;
-            let out = client.call("gitops", with(json!({"action": "rollback"}))).await;
-            assert!(out.contains("Rollback to deployment 1"), "{out}");
-            let sync = read().await?["operation"]["sync"].clone();
-            assert_eq!(sync["revision"], first, "{sync}");
-            assert_eq!(sync["source"], source, "{sync}");
-            assert_eq!(sync["syncStrategy"], json!({"apply": {}}), "{sync}");
-            assert!(sync.get("prune").is_none(), "{sync}");
-
-            // With auto-sync on, Argo CD refuses a rollback: so is it here.
-            set(json!({"operation": null, "spec": {"syncPolicy": {"automated": {}}}})).await?;
-            let out = client.call("gitops", with(json!({"action": "rollback", "deployment_id": 1}))).await;
-            assert!(out.contains("auto-sync is on"), "{out}");
-            assert!(read().await?.get("operation").is_none());
-            set(json!({"spec": {"syncPolicy": null}})).await?;
-
-            // A dry run: its result comes back once Argo CD (here, the test) is done.
-            let call = client.call("gitops", with(json!({"action": "sync", "dry_run": true})));
-            let controller = async {
-                for _ in 0..50 {
-                    let app = read().await?;
-                    if app.pointer("/operation/sync/dryRun") == Some(&json!(true)) {
-                        return set(json!({"operation": null, "status": {"operationState": {
-                            "phase": "Succeeded", "message": "successfully synced (all tasks run)",
-                            "operation": app["operation"],
-                            "syncResult": {"resources": [{"kind": "ConfigMap", "namespace": NS, "name": "old",
-                                "status": "Pruned", "message": "pruned (dry run)"}]},
-                        }}}))
-                        .await;
-                    }
-                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                }
-                bail!("no dry run was written")
-            };
-            let (out, simulated) = futures::join!(call, controller);
-            simulated?;
-            assert!(out.contains("Dry run Succeeded") && out.contains("Pruned: pruned (dry run)"), "{out}");
-            assert!(read().await?.get("operation").is_none());
-
-            // The window's client: write mode off refuses it when it is sent.
-            gate::set_ui_writes(false);
-            let ui = k8s::connect(ctx.clone()).await?;
-            let refused = k8s::argo_operation(
-                ui,
-                k8s::argo::application_kind(),
-                Some(NS.into()),
-                name.into(),
-                k8s::argo::ops::Op::Sync(k8s::argo::ops::SyncRequest::default()),
+        // Without a sync rule, nothing is sent (a sync is not a patch).
+        let out = client.call("gitops", with(json!({"action": "sync"}))).await;
+        assert!(out.contains("Denied"), "{out}");
+        assert!(fake.writes().is_empty(), "{:?}", fake.writes());
+        // A rule naming the Argo CD server opens nothing: the destination decides.
+        let on_server =
+            rules_file::parse_rule(Mode::Allow, &format!("sync applications.argoproj.io --context {server}"))?;
+        hub.update_agent(&agent.id, |a| a.policy.rules.push(on_server))?;
+        let out = client.call("gitops", with(json!({"action": "sync"}))).await;
+        assert!(out.contains("Denied") && out.contains(&format!("--context {ctx}")), "{out}");
+        assert!(fake.writes().is_empty());
+        let allow = rules_file::parse_rule(Mode::Allow, &format!("sync applications/e2e-* -n {NS} --context {ctx}"))?;
+        hub.update_agent(&agent.id, |a| a.policy.rules.push(allow))?;
+        // The old way, a hub context, is refused with what to pass instead.
+        let out = client
+            .call(
+                "gitops",
+                json!({"context": ctx, "kind": "applications", "namespace": "argocd",
+            "name": name, "action": "sync"}),
             )
             .await;
-            let err = format!("{:#}", refused.expect_err("write mode is off"));
-            assert!(err.contains(gate::WRITES_OFF), "{err}");
-            assert!(read().await?.get("operation").is_none(), "the refused sync reached the cluster");
-            Ok(())
+        assert!(out.contains("not on a context"), "{out}");
+
+        // A sync of two resources with prune: it names what prune deletes.
+        let picked = json!([
+            {"group": "apps", "kind": "Deployment", "namespace": NS, "name": "web"},
+            {"kind": "ConfigMap", "namespace": NS, "name": "old"},
+        ]);
+        let out = client.call("gitops", with(json!({"action": "sync", "resources": picked, "prune": true}))).await;
+        assert!(out.contains("prune deletes ConfigMap default/old"), "{out}");
+        let sent = op().context("no sync was sent")?;
+        assert_eq!(sent["sync"]["prune"], true, "{sent}");
+        assert_eq!(sent["sync"]["syncStrategy"], json!({"hook": {}}), "{sent}");
+        assert_eq!(sent["sync"]["resources"], picked, "{sent}");
+
+        // Nothing else starts while it runs; it can be terminated.
+        let out = client.call("gitops", with(json!({"action": "sync"}))).await;
+        assert!(out.contains("in progress"), "{out}");
+        fake.set(name, &json!({"status": {"operationState": {"phase": "Running", "operation": sent}}}));
+        let out = client.call("gitops", with(json!({"action": "terminate"}))).await;
+        assert!(out.contains("Terminating"), "{out}");
+        assert_eq!(fake.get(name).unwrap().pointer("/status/operationState/phase"), Some(&json!("Terminating")));
+
+        // Argo CD ends it; a rollback goes to the deployment before the newest.
+        fake.set(name, &json!({"operation": null, "status": {"operationState": {"phase": "Failed"}}}));
+        let out = client.call("gitops", with(json!({"action": "rollback"}))).await;
+        assert!(out.contains("Rollback to deployment 1"), "{out}");
+        let sync = op().context("no rollback was sent")?["sync"].clone();
+        assert_eq!(sync["revision"], first, "{sync}");
+        assert_eq!(sync["source"], source, "{sync}");
+
+        // With auto-sync on, Argo CD refuses a rollback: so is it here, before anything is sent.
+        fake.set(name, &json!({"operation": null, "spec": {"syncPolicy": {"automated": {}}}}));
+        let before = fake.writes().len();
+        let out = client.call("gitops", with(json!({"action": "rollback", "deployment_id": 1}))).await;
+        assert!(out.contains("auto-sync is on"), "{out}");
+        assert_eq!(fake.writes().len(), before);
+        fake.set(name, &json!({"spec": {"syncPolicy": null}}));
+
+        // A dry run: its result comes back once Argo CD (here, the test) is done.
+        let call = client.call("gitops", with(json!({"action": "sync", "dry_run": true})));
+        let controller = async {
+            for _ in 0..50 {
+                if let Some(o) = op().filter(|o| o.pointer("/sync/dryRun") == Some(&json!(true))) {
+                    fake.set(
+                        name,
+                        &json!({"operation": null, "status": {"operationState": {
+                            "phase": "Succeeded", "message": "successfully synced (all tasks run)",
+                            "startedAt": "2030-01-01T00:00:00Z", "operation": o,
+                            "syncResult": {"resources": [{"kind": "ConfigMap", "namespace": NS, "name": "old",
+                                "status": "Pruned", "message": "pruned (dry run)"}]},
+                        }}}),
+                    );
+                    return Ok(());
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+            bail!("no dry run was sent")
         };
-        let result: Result<()> = checked.await;
-        let _ = apps.delete(name, &DeleteParams::default()).await;
-        if installed {
-            use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition;
-            let crds: Api<CustomResourceDefinition> = Api::all(admin);
-            let _ = crds.delete("applications.argoproj.io", &DeleteParams::default()).await;
-        }
-        result
-    });
-}
+        let (out, simulated) = futures::join!(call, controller);
+        simulated?;
+        assert!(out.contains("Dry run Succeeded") && out.contains("Pruned: pruned (dry run)"), "{out}");
 
-/// A grouped sync, as the Argo CD page sends it with the window's client: each Application is
-/// read and checked, a dry run writes to each an operation that asks Argo CD to apply nothing
-/// (and changes nothing else), a sync without hooks with prune writes each one's operation,
-/// one already syncing is refused, and with write mode off none is written. The test plays
-/// Argo CD's controller.
-#[test]
-#[ignore = "needs a kind cluster: RECOUVRANCE_E2E_CONTEXT"]
-fn a_grouped_sync_writes_each_application_s_operation() {
-    use futures::StreamExt as _;
-    use k8s::argo::grouped_sync::{self, Options, Target};
-    use kube::api::DynamicObject;
+        // The window's grouped sync, out of sync only: the Application's resources out of sync
+        // named, the one in sync and the one to prune (prune off) left out, no hooks.
+        let endpoint =
+            Arc::new(k8s::argo::api::endpoints().list.into_iter().find(|e| e.server.base == base).context("set")?);
+        let checked = k8s::argo::grouped_sync::check(
+            &fake.get(name).context("the Application")?,
+            &k8s::argo::windows::NextSync::NoWindow,
+            jiff::Timestamp::now(),
+        );
+        let opts = k8s::argo::grouped_sync::Options { hooks: false, prune: false, dry_run: false };
+        let req = opts.request(&checked).expect("a resource is out of sync");
+        gate::set_ui_writes(true);
+        k8s::argo::api::act(endpoint.clone(), "argocd".into(), name.into(), k8s::argo::api::Action::Sync(req))
+            .await
+            .map_err(anyhow::Error::msg)?;
+        let sync = op().context("no grouped sync was sent")?["sync"].clone();
+        assert_eq!(
+            sync["resources"],
+            json!([{"group": "apps", "kind": "Deployment", "namespace": NS, "name": "web"}]),
+            "{sync}"
+        );
+        assert_eq!(sync["syncStrategy"], json!({"apply": {}}), "{sync}");
+        fake.set(name, &json!({"operation": null}));
 
-    run(async {
-        let ctx = context();
-        let admin = k8s::connect_for_agents(ctx.clone()).await?;
-        let installed = application_crd(admin.clone()).await?;
-        let kind = k8s::argo::application_kind();
-        let apps: Api<DynamicObject> = Api::namespaced_with(admin.clone(), NS, &kind.ar);
-        let names = ["e2e-group-a", "e2e-group-b", "e2e-group-c"];
-        let before = "2026-01-01T00:00:00Z";
-        let shown = "a".repeat(40);
-        for name in names {
-            let _ = apps.delete(name, &DeleteParams::default()).await;
-        }
-        for name in names {
-            let app = json!({
-                "apiVersion": "argoproj.io/v1alpha1", "kind": "Application",
-                "metadata": {"name": name, "namespace": NS},
-                "spec": {"project": "default",
-                    "source": {"repoURL": "https://git.example/apps", "path": name, "targetRevision": "HEAD"},
-                    "destination": {"server": "https://kubernetes.default.svc", "namespace": NS},
-                    "syncPolicy": {"syncOptions": ["CreateNamespace=true"], "retry": {"limit": 2}}},
-                "status": {
-                    "sync": {"status": "OutOfSync", "revision": shown},
-                    "resources": [
-                        {"group": "apps", "version": "v1", "kind": "Deployment", "namespace": NS, "name": name, "status": "OutOfSync"},
-                        {"version": "v1", "kind": "ConfigMap", "namespace": NS, "name": format!("{name}-old"), "status": "OutOfSync", "requiresPruning": true},
-                    ],
-                    "operationState": {"phase": "Succeeded", "startedAt": before},
-                },
-            });
-            apps.create(&PostParams::default(), &serde_json::from_value(app)?).await?;
-        }
-        let api = &apps;
-        let read = move |name: &'static str| async move { anyhow::Ok(serde_json::to_value(api.get(name).await?)?) };
-        let set = move |name: &'static str, patch: serde_json::Value| async move {
-            api.patch(name, &PatchParams::default(), &Patch::Merge(patch)).await?;
-            anyhow::Ok(())
-        };
-        let hub = k8s::argo::Hub { context: ctx.clone(), client: k8s::connect(ctx.clone()).await? };
-        let target = |name: &str| Target {
-            source: k8s::argo::Source::Hub(hub.clone()),
-            instance: ctx.clone(),
-            namespace: NS.into(),
-            name: name.into(),
-        };
-        let checked = async {
-            gate::set_ui_writes(true);
-            // Each is read and checked as the page does: what prune would delete is listed.
-            let mut checks = Vec::new();
-            for name in names {
-                let app = target(name).read().await.map_err(anyhow::Error::msg)?;
-                let c = grouped_sync::check(&app, &k8s::argo::windows::NextSync::NoWindow, jiff::Timestamp::now());
-                assert_eq!(c.refused, None, "{name}");
-                assert_eq!(c.before.as_deref(), Some(before));
-                assert_eq!(c.revision.as_deref(), Some(shown.as_str()), "auto-sync off, one source: pinned");
-                assert_eq!(c.pruned.iter().map(|r| r.name.clone()).collect::<Vec<_>>(), [format!("{name}-old")]);
-                checks.push(c);
-            }
-            let jobs = |opts: Options| -> Vec<(Target, k8s::argo::ops::SyncRequest)> {
-                names.iter().zip(&checks).map(|(n, c)| (target(n), opts.request(c))).collect()
-            };
-            let send = |opts: Options| grouped_sync::send_all(jobs(opts)).collect::<Vec<_>>();
-            let by_name = |sent: &[(usize, grouped_sync::Sent)], name: &str| {
-                let i = names.iter().position(|n| *n == name).unwrap();
-                sent.iter().find(|(k, _)| *k == i).map(|(_, r)| r.clone()).unwrap()
-            };
+        // A server set read-only refuses before the rules decide.
+        crate::settings::set_read_only(&server, true);
+        let before = fake.writes().len();
+        let out = client.call("gitops", with(json!({"action": "refresh"}))).await;
+        assert!(out.contains("Denied") && out.contains("read-only"), "{out}");
+        assert_eq!(fake.writes().len(), before);
+        crate::settings::set_read_only(&server, false);
 
-            // A dry run: each Application's operation asks Argo CD to apply nothing; nothing else
-            // is written. Like argocd-server, it carries the Application's sync options and retry,
-            // and the revision shown.
-            let sent = send(Options { dry_run: true, ..Default::default() }).await;
-            assert_eq!(sent.len(), names.len());
-            assert!(sent.iter().all(|(_, r)| r.is_ok()), "{sent:?}");
-            for name in names {
-                let app = read(name).await?;
-                let op = &app["operation"];
-                assert_eq!(op["sync"]["dryRun"], true, "{op}");
-                assert_eq!(op["sync"]["syncStrategy"], json!({"hook": {}}), "{op}");
-                assert_eq!(op["sync"]["syncOptions"], json!(["CreateNamespace=true"]), "{op}");
-                assert_eq!(op["retry"], json!({"limit": 2}), "{op}");
-                assert_eq!(op["sync"]["revision"], shown, "{op}");
-                assert!(op["sync"].get("prune").is_none(), "{op}");
-                assert_eq!(app["status"]["sync"]["status"], "OutOfSync", "a dry run changes nothing else");
-                assert_eq!(app["spec"]["source"]["path"], name, "a dry run changes nothing else");
-                // Argo CD ends the dry run.
-                set(name, json!({"operation": null, "status": {"operationState": {"phase": "Succeeded", "startedAt": before}}}))
-                    .await?;
-            }
-
-            // Between the page's check and the sync: an auto-sync runs on the second, and git
-            // drops one more resource of the third (Argo CD's comparison now prunes it too).
-            let auto = "2026-01-01T06:00:00Z";
-            set(
-                names[1],
-                json!({"status": {"operationState": {"phase": "Succeeded", "startedAt": auto,
-                "operation": {"initiatedBy": {"automated": true}}}}}),
-            )
-            .await?;
-            let third = names[2];
-            set(third, json!({"status": {"resources": [
-                {"group": "apps", "version": "v1", "kind": "Deployment", "namespace": NS, "name": third, "status": "OutOfSync"},
-                {"version": "v1", "kind": "ConfigMap", "namespace": NS, "name": format!("{third}-old"), "status": "OutOfSync", "requiresPruning": true},
-                {"version": "v1", "kind": "Secret", "namespace": NS, "name": format!("{third}-unshown"), "status": "OutOfSync", "requiresPruning": true},
-            ]}}))
-            .await?;
-
-            // Without hooks, with prune: each one's operation says so, started by Recouvrance; the
-            // third, which would now delete more than was shown, is refused and left alone.
-            let opts = Options { hooks: false, prune: true, dry_run: false };
-            let sent = send(opts).await;
-            for &name in &names[..2] {
-                let (said, _) = by_name(&sent, name).map_err(anyhow::Error::msg)?;
-                assert!(said.contains("without hooks"), "{said}");
-                let op = read(name).await?["operation"].clone();
-                assert_eq!(op["sync"]["syncStrategy"], json!({"apply": {}}), "{op}");
-                assert_eq!(op["sync"]["prune"], true, "{op}");
-                assert_eq!(op["sync"]["syncOptions"], json!(["CreateNamespace=true"]), "{op}");
-                assert!(op["sync"].get("dryRun").is_none(), "{op}");
-                assert_eq!(op["initiatedBy"]["username"], "recouvrance", "{op}");
-            }
-            let why = by_name(&sent, third).expect_err("prune would delete more than was shown");
-            assert!(why.contains(&format!("Secret {NS}/{third}-unshown")) && why.contains("confirm"), "{why}");
-            assert!(read(third).await?.get("operation").is_none(), "the refused sync reached {third}");
-            // What is followed is the operation after the one read right before the write: the
-            // auto-sync, not the page's stale read.
-            let (_, followed) = by_name(&sent, names[1]).map_err(anyhow::Error::msg)?;
-            assert_eq!(followed.as_deref(), Some(auto));
-            assert_eq!(grouped_sync::progress(&read(names[1]).await?, followed.as_deref()).phase, "Waiting");
-
-            // While they run, a second sync of them is refused, and nothing is overwritten.
-            let again = send(opts).await;
-            for &name in &names[..2] {
-                let e = by_name(&again, name).expect_err("in progress");
-                assert!(e.contains("in progress"), "{e}");
-            }
-            let app = target(names[0]).read().await.map_err(anyhow::Error::msg)?;
-            let c = grouped_sync::check(&app, &k8s::argo::windows::NextSync::NoWindow, jiff::Timestamp::now());
-            assert!(c.refused.is_some_and(|why| why.contains("already running")));
-
-            // Argo CD starts the first: its progress is read from its operation state.
-            set(
-                names[0],
-                json!({"status": {"operationState": {"phase": "Running", "startedAt": "2026-01-02T00:00:00Z",
-                    "syncResult": {"resources": [{"kind": "ConfigMap", "namespace": NS, "name": "x", "status": "Synced"},
-                        {"group": "apps", "kind": "Deployment", "namespace": NS, "name": names[0]}]}}}}),
-            )
-            .await?;
-            let p = grouped_sync::progress(&read(names[0]).await?, Some(before));
-            assert_eq!((p.phase.as_str(), p.done, p.total, p.ended), ("Running", 1, 2, false));
-
-            // Write mode off: none is written.
-            for name in names {
-                set(name, json!({"operation": null})).await?;
-            }
-            gate::set_ui_writes(false);
-            let refused = send(opts).await;
-            for &name in &names[..2] {
-                let e = by_name(&refused, name).expect_err("write mode is off");
-                assert!(e.contains(gate::WRITES_OFF), "{e}");
-            }
-            assert!(by_name(&refused, third).is_err());
-            for name in names {
-                assert!(read(name).await?.get("operation").is_none(), "the refused sync reached {name}");
-            }
-            Ok(())
-        };
-        let result: Result<()> = checked.await;
+        // The window's writes: write mode off refuses them when they are sent.
         gate::set_ui_writes(false);
-        for name in names {
-            let _ = apps.delete(name, &DeleteParams::default()).await;
-        }
-        if installed {
-            use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition;
-            let crds: Api<CustomResourceDefinition> = Api::all(admin);
-            let _ = crds.delete("applications.argoproj.io", &DeleteParams::default()).await;
-        }
-        result
+        let refused = k8s::argo::api::act(
+            endpoint,
+            "argocd".into(),
+            name.into(),
+            k8s::argo::api::Action::Refresh { hard: false },
+        )
+        .await;
+        let err = refused.expect_err("write mode is off");
+        assert!(err.contains(gate::WRITES_OFF), "{err}");
+        assert_eq!(fake.writes().len(), before, "the refused refresh reached Argo CD");
+        Ok(())
     });
 }
 
-/// An agent follows an Argo CD Application from its hub to its destination: `argocd_apps`
-/// lists it with the context it deploys to, `describe_resource` and `get_changes` on an object
-/// it deployed name it (by its tracking id), and `wait_for` waits for its sync and returns at
-/// once when its sync failed. Rows the rules don't allow stay out. Only reads.
+/// An agent follows an Argo CD Application read through Argo CD's API to its destination:
+/// `argocd_apps` lists it with the context it deploys to, `argocd_diff` says what a sync
+/// would change, `describe_resource` and `get_changes` on an object it deployed name it (by
+/// its tracking id), and `wait_for` waits for its sync and returns at once when its sync
+/// failed. Rows the rules don't allow where they deploy stay out. Only reads.
 #[test]
 #[ignore = "needs a kind cluster: RECOUVRANCE_E2E_CONTEXT"]
 fn an_agent_follows_an_argo_cd_application_to_what_it_deployed() {
-    use kube::api::DynamicObject;
-
     run(async {
         let ctx = context();
         let admin = k8s::connect_for_agents(ctx.clone()).await?;
-        let installed = application_crd(admin.clone()).await?;
-        let kind = k8s::argo::application_kind();
-        let apps: Api<DynamicObject> = Api::namespaced_with(admin.clone(), NS, &kind.ar);
         let maps: Api<ConfigMap> = Api::namespaced(admin.clone(), NS);
         let (name, hidden, cm) = ("e2e-argo-read", "e2e-argo-hidden", "e2e-argo-read-cm");
-        for app in [name, hidden] {
-            let _ = apps.delete(app, &DeleteParams::default()).await;
-        }
         let _ = maps.delete(cm, &DeleteParams::default()).await;
+        let dest = kind_server(&ctx)?;
         let app = |app: &str| {
             json!({
-                "apiVersion": "argoproj.io/v1alpha1", "kind": "Application",
-                "metadata": {"name": app, "namespace": NS},
-                "spec": {"project": "e2e", "destination": {"server": "https://kubernetes.default.svc", "namespace": NS}},
+                "metadata": {"name": app, "namespace": "argocd", "resourceVersion": "1"},
+                "spec": {"project": "e2e", "destination": {"server": dest, "namespace": NS}},
                 "status": {
                     "sync": {"status": "OutOfSync", "revision": "3".repeat(40)},
                     "health": {"status": "Healthy"},
@@ -2671,54 +2553,59 @@ fn an_agent_follows_an_argo_cd_application_to_what_it_deployed() {
                 },
             })
         };
-        for a in [name, hidden] {
-            apps.create(&PostParams::default(), &serde_json::from_value(app(a))?).await?;
-        }
+        let (fake, _base, server, _argo) = fake_argo(vec![app(name), app(hidden)]).await?;
+        let live = json!({"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": cm, "namespace": NS}, "data": {"a": "1"}});
+        let mut want = live.clone();
+        want["data"]["a"] = json!("2");
+        fake.set_managed(
+            name,
+            json!({"items": [{"kind": "ConfigMap", "namespace": NS, "name": cm, "modified": true,
+            "liveState": live.to_string(), "targetState": want.to_string()}]}),
+        );
         let mut map = config_map(cm);
         map.metadata.annotations =
-            Some([(k8s::argo::TRACKING_ID.to_string(), format!("{NS}_{name}:/ConfigMap:{NS}/{cm}"))].into());
+            Some([(k8s::argo::TRACKING_ID.to_string(), format!("argocd_{name}:/ConfigMap:{NS}/{cm}"))].into());
         maps.create(&PostParams::default(), &map).await?;
-        let set = |patch: serde_json::Value| {
-            let apps = apps.clone();
-            async move {
-                apps.patch(name, &PatchParams::default(), &Patch::Merge(patch)).await?;
-                anyhow::Ok(())
-            }
-        };
         let checked = async {
             let deny = format!("get,list applications.argoproj.io/{hidden} -n {NS}");
             let (hub, _agent, token, _server) = agent(&["get,list *"], &[deny.as_str()]).await?;
             let client = crate::assistant::Mcp::connect(hub.port(), token).await?;
 
-            // The hub's Applications, with where each deploys; the one denied stays out.
-            let out = client.call("argocd_apps", json!({"context": ctx})).await;
-            assert!(out.contains(&format!("{NS}/{name}")), "{out}");
+            // The server's Applications, with where each deploys; the one denied there stays out.
+            let out = client.call("argocd_apps", json!({"server": server})).await;
+            assert!(out.contains(&format!("argocd/{name}")), "{out}");
             assert!(out.contains(&format!("{ctx} / {NS}")), "{out}");
             assert!(!out.contains(hidden), "{out}");
-            assert!(out.contains("1 Application your rules don't let you list left out"), "{out}");
-            // Out of sync with auto-sync off is not a problem; without `context`, the hub found is read.
-            let out = client.call("argocd_apps", json!({"problems_only": true})).await;
+            assert!(out.contains("1 Application your rules don't let you list"), "{out}");
+            // Out of sync with auto-sync off is not a problem.
+            let out = client.call("argocd_apps", json!({"server": server, "problems_only": true})).await;
             assert!(out.contains("No Applications found."), "{out}");
+
+            // What a sync would change.
+            let out = client.call("argocd_diff", json!({"server": server, "applications": [name]})).await;
+            assert!(out.contains("a sync would change 1 resource") && out.contains(cm), "{out}");
 
             // The object it deployed names it, with its state, and its deployments.
             let target = json!({"context": ctx, "kind": "configmaps", "namespace": NS, "name": cm});
             let out = client.call("describe_resource", target.clone()).await;
-            assert!(out.contains(&format!("managed by Application {NS}/{name} on hub {ctx}")), "{out}");
+            assert!(out.contains(&format!("managed by Application argocd/{name} on Argo CD server {server}")), "{out}");
             assert!(out.contains("This object in it: OutOfSync"), "{out}");
             let out = client.call("get_changes", target).await;
             assert!(out.contains(&format!("Deployment 1 · Application {name}")), "{out}");
 
             // Its sync, once no operation runs; a failed sync ends the wait at once.
             let wait = |condition: &str| {
-                json!({"context": ctx, "kind": "applications", "namespace": NS, "name": name,
+                json!({"server": server, "kind": "applications", "namespace": "argocd", "name": name,
                     "condition": condition, "timeout_seconds": 20})
             };
-            set(json!({"status": {"sync": {"status": "Synced"}}})).await?;
+            fake.set(name, &json!({"status": {"sync": {"status": "Synced"}}}));
             let out = client.call("wait_for", wait("sync=Synced")).await;
             assert!(out.contains("sync=Synced") && !out.contains("timed out"), "{out}");
-            set(json!({"status": {"sync": {"status": "OutOfSync"},
-                "operationState": {"phase": "Failed", "message": "e2e: one or more objects failed to apply"}}}))
-            .await?;
+            fake.set(
+                name,
+                &json!({"status": {"sync": {"status": "OutOfSync"},
+                "operationState": {"phase": "Failed", "message": "e2e: one or more objects failed to apply"}}}),
+            );
             let started = std::time::Instant::now();
             let out = client.call("wait_for", wait("sync=Synced")).await;
             assert!(out.contains("ended Failed: e2e: one or more objects failed to apply"), "{out}");
@@ -2730,15 +2617,7 @@ fn an_agent_follows_an_argo_cd_application_to_what_it_deployed() {
             Ok(())
         };
         let result: Result<()> = checked.await;
-        for app in [name, hidden] {
-            let _ = apps.delete(app, &DeleteParams::default()).await;
-        }
         let _ = maps.delete(cm, &DeleteParams::default()).await;
-        if installed {
-            use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition;
-            let crds: Api<CustomResourceDefinition> = Api::all(admin);
-            let _ = crds.delete("applications.argoproj.io", &DeleteParams::default()).await;
-        }
         result
     });
 }

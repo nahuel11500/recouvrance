@@ -37,6 +37,9 @@ pub struct AgentsView {
     contexts: Vec<String>,
     protected: Vec<String>,
     contexts_error: Option<String>,
+    /// Where Argo CD itself is: its servers' names and the contexts it was read on (hubs).
+    /// A rule on Argo CD's Applications naming one decides nothing now: it is flagged.
+    argo_homes: Vec<String>,
     selected: Option<String>,
     /// The last token made (a new agent, or "New token") and its agent's id. Tokens are kept
     /// hashed, so besides the main agent's (saved for the assistant) it is the only one a
@@ -189,6 +192,7 @@ impl AgentsView {
             contexts: Vec::new(),
             protected: Vec::new(),
             contexts_error: None,
+            argo_homes: Vec::new(),
             selected: None,
             fresh_token: None,
             connect_client: None,
@@ -390,6 +394,7 @@ impl AgentsView {
             }
             Err(e) => self.contexts_error = Some(format!("{e:#}")),
         }
+        self.argo_homes = argo_homes();
     }
 
     /// Contexts in kubeconfig a rule covers: those its patterns match, and the protected ones
@@ -741,4 +746,15 @@ impl Render for AgentsView {
                     }),
             )
     }
+}
+
+/// Where Argo CD itself is, for the rule editor's flag: the servers set or logged in to, and
+/// the hub contexts named in Settings (Argo CD contexts, each context's Argo CD server).
+fn argo_homes() -> Vec<String> {
+    let mut homes: Vec<String> =
+        crate::settings::with(|s| s.argocd_contexts.iter().cloned().chain(s.argocd_servers.keys().cloned()).collect());
+    homes.extend(k8s::argo::api::endpoints().list.iter().map(k8s::argo::api::Endpoint::name));
+    homes.sort();
+    homes.dedup();
+    homes
 }

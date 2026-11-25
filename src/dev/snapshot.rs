@@ -29,21 +29,46 @@ pub fn run(path: &str, wait: Duration) -> Result<()> {
         crate::app::apply_theme(mode, None, cx);
     });
     let mut app_view = None;
-    let window = cx.open_window(size(px(1500.), px(920.)), |window, cx| {
+    // RECOUVRANCE_SIZE=1000x800: the window's size, to see a page on a narrow window.
+    let (w, h) = std::env::var("RECOUVRANCE_SIZE")
+        .ok()
+        .and_then(|v| {
+            let (w, h) = v.split_once('x')?;
+            Some((w.parse().ok()?, h.parse().ok()?))
+        })
+        .unwrap_or((1500., 920.));
+    let window = cx.open_window(size(px(w), px(h)), |window, cx| {
         let view = cx.new(|cx| crate::app::AppView::new(window, cx));
         app_view = Some(view.clone());
         cx.new(|cx| base::Root::new(view, window, cx))
     })?;
     let app_view = app_view.expect("view");
+    // RECOUVRANCE_WINDOWS=2: a second window on the same contexts, drawn as the first is and
+    // put on the same RECOUVRANCE_PAGE: what two windows cost (their scans are shared).
+    let second = if std::env::var("RECOUVRANCE_WINDOWS").as_deref() == Ok("2") {
+        let mut view = None;
+        let handle = cx.open_window(size(px(w), px(h)), |window, cx| {
+            let v = cx.new(|cx| crate::app::AppView::new(window, cx));
+            view = Some(v.clone());
+            cx.new(|cx| base::Root::new(v, window, cx))
+        })?;
+        Some((handle, view.expect("view")))
+    } else {
+        None
+    };
 
     // Kubernetes work runs on real threads; keep pumping until it settles.
     // Draw a frame each step, like a real window, so animations progress.
     let win = window;
+    let win2 = second.as_ref().map(|(handle, _)| *handle);
     let pump = move |cx: &mut HeadlessAppContext, wait: Duration| {
         let deadline = Instant::now() + wait;
         while Instant::now() < deadline {
             cx.run_until_parked();
             let _ = cx.update_window(win.into(), |_, window, cx| window.draw(cx).clear(cx));
+            if let Some(w2) = win2 {
+                let _ = cx.update_window(w2.into(), |_, window, cx| window.draw(cx).clear(cx));
+            }
             std::thread::sleep(Duration::from_millis(50));
             cx.advance_clock(Duration::from_millis(50));
         }
@@ -126,6 +151,9 @@ pub fn run(path: &str, wait: Duration) -> Result<()> {
     // RECOUVRANCE_PAGE=<page>: open a page (problems, cluster, helm…) first.
     if let Ok(page) = std::env::var("RECOUVRANCE_PAGE") {
         cx.update_window(window.into(), |_, window, cx| app_view.update(cx, |a, cx| a.qa_page(&page, window, cx)))?;
+        if let Some((w2, view2)) = &second {
+            cx.update_window((*w2).into(), |_, window, cx| view2.update(cx, |a, cx| a.qa_page(&page, window, cx)))?;
+        }
         pump(&mut cx, Duration::from_secs(25));
     }
     // RECOUVRANCE_FRAMES=<n>: time n full redraws of the window (render + layout + paint).

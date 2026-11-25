@@ -26,9 +26,9 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use super::dashboard::{lines_block, link};
-use super::{ArgoView, GroupBy, Key, ancestors, key};
+use super::{ArgoView, Key, key};
 use crate::k8s::argo::grouped_diff::{self, AppDiff, Cross, CrossKey, MAX_APPS};
-use crate::k8s::argo::{FleetApp, Source, api};
+use crate::k8s::argo::{FleetApp, api};
 use crate::smartdiff::SmartDiff;
 use crate::ui::selectable::selectable;
 
@@ -119,7 +119,7 @@ pub(super) fn labels(apps: &[FleetApp]) -> Vec<String> {
     apps.iter()
         .map(|a| {
             if count[a.app.name.as_str()] > 1 {
-                format!("{} · {} {}", a.app.name, a.source.label(), a.app.namespace)
+                format!("{} · {} {}", a.app.name, a.server.name(), a.app.namespace)
             } else {
                 a.app.name.clone()
             }
@@ -138,22 +138,6 @@ pub(super) fn some(names: impl Iterator<Item = String>, at_most: usize) -> Strin
 }
 
 // MARK: Picking, pure
-
-/// The Applications (indexes) of a group the filter keeps (`keeps`): the service at `ix` of
-/// `services`, or the app of apps at `ix` and every one under it (by `parents`).
-pub(super) fn members(
-    services: &[(String, Vec<usize>)],
-    parents: &[Option<usize>],
-    keeps: &[bool],
-    ix: usize,
-    service: bool,
-) -> Vec<usize> {
-    let kept = |i: usize| keeps.get(i).copied().unwrap_or(false);
-    if service {
-        return services.get(ix).map_or_else(Vec::new, |(_, m)| m.iter().copied().filter(|&i| kept(i)).collect());
-    }
-    (0..parents.len()).filter(|&i| kept(i) && (i == ix || ancestors(parents, i).contains(&ix))).collect()
-}
 
 /// Pick every one of `keys`; when all are picked already, unpick them.
 pub(super) fn flip(selected: &mut HashSet<Key>, keys: Vec<Key>) {
@@ -211,24 +195,25 @@ impl ArgoView {
         cx.notify();
     }
 
-    fn group_members(&self, ix: usize, service: bool) -> Vec<usize> {
-        let Some(rows) = &self.rows else { return Vec::new() };
-        members(&rows.services, &rows.parents, &self.keeps, ix, service)
+    /// The Applications of the environment `e` the filter keeps.
+    fn env_members(&self, e: usize) -> Vec<usize> {
+        let Some(env) = self.rows.as_ref().and_then(|r| r.envs.get(e)) else { return Vec::new() };
+        env.members.iter().map(|(i, _)| *i).filter(|&i| self.keeps.get(i).copied().unwrap_or(false)).collect()
     }
 
-    /// Pick the group (or unpick it when all of it is picked).
-    pub(super) fn pick_group(&mut self, ix: usize, service: bool, cx: &mut Context<Self>) {
+    /// Pick the environment's Applications (or unpick them when all are picked).
+    pub(super) fn pick_env(&mut self, e: usize, cx: &mut Context<Self>) {
         let Some(rows) = &self.rows else { return };
-        let keys = self.group_members(ix, service).into_iter().map(|i| key(&rows.fleet.apps[i])).collect();
+        let keys = self.env_members(e).into_iter().map(|i| key(&rows.fleet.apps[i])).collect();
         flip(&mut self.selected, keys);
         self.recount_picked();
         cx.notify();
     }
 
-    /// Whether every Application the filter keeps of the group is picked.
-    pub(super) fn group_picked(&self, ix: usize, service: bool) -> bool {
+    /// Whether every Application the filter keeps of the environment is picked.
+    pub(super) fn env_picked(&self, e: usize) -> bool {
         let Some(rows) = &self.rows else { return false };
-        let members = self.group_members(ix, service);
+        let members = self.env_members(e);
         !members.is_empty() && members.iter().all(|&i| self.selected.contains(&key(&rows.fleet.apps[i])))
     }
 
@@ -256,11 +241,7 @@ impl ArgoView {
     pub(super) fn selection_bar(&self, cx: &mut Context<Self>) -> Div {
         let (n, hidden) = (self.picked, self.picked_hidden);
         let muted = cx.theme().muted_foreground;
-        let pick_group_hint = match self.group_by {
-            GroupBy::Parent => "Tick an Application, or its menu's Pick the group.",
-            GroupBy::Service => "Tick an Application, or a service's heading for all of it.",
-            GroupBy::None => "Tick the Applications to diff or sync together.",
-        };
+        let pick_group_hint = "Tick an environment for all its Applications, or unfold it to tick some.";
         let picked = if hidden > 0 {
             format!("{} picked ({hidden} hidden by the filter)", crate::plural::count(n, "Application"))
         } else {
@@ -338,9 +319,7 @@ impl ArgoView {
     // MARK: Diff
 
     /// Read what a sync of each Application picked would change, at most a few at a time; the
-    /// changes are regrouped as reads end. One Argo CD couldn't compare is not read. A hub's
-    /// Applications are read from the Argo CD server set for the hub in Settings (else each
-    /// says why not). `fresh` (Read again): none is taken from those kept.
+    /// changes are regrouped as reads end. One Argo CD couldn't compare is not read. `fresh` (Read again): none is taken from those kept.
     pub(super) fn diff_selected(&mut self, fresh: bool, cx: &mut Context<Self>) {
         let mut apps = self.selected_apps();
         if apps.is_empty() {
@@ -350,23 +329,20 @@ impl ArgoView {
         apps.truncate(MAX_APPS);
         let names = labels(&apps);
         let mut results: Vec<Option<Outcome>> = vec![None; apps.len()];
-        let mut targets: Vec<(usize, Source, grouped_diff::CacheKey)> = Vec::new();
+        let mut targets: Vec<(usize, Arc<api::Endpoint>, grouped_diff::CacheKey)> = Vec::new();
         for (i, a) in apps.iter().enumerate() {
             if let Some(why) = grouped_diff::not_compared(&a.app) {
                 results[i] = Some(Outcome::NotCompared(why));
                 continue;
             }
             let kept = (a.instance.clone(), a.app.namespace.clone(), a.app.name.clone(), a.version.clone());
-            targets.push((i, a.source.clone(), kept));
+            targets.push((i, a.server.clone(), kept));
         }
         let done = apps.len() - targets.len();
         let reads = grouped_diff::read_all(targets.len(), move |t| {
-            let (i, source, kept) = targets[t].clone();
+            let (i, server, kept) = targets[t].clone();
             let (ns, name) = (kept.1.clone(), kept.2.clone());
-            let read: Pin<Box<dyn Future<Output = Read>>> = match source {
-                Source::Hub(hub) => Box::pin(grouped_diff::read_hub(hub.context, ns, name)),
-                Source::Api(endpoint) => Box::pin(api::sync_preview(endpoint, ns, name)),
-            };
+            let read: Pin<Box<dyn Future<Output = Read>>> = Box::pin(api::sync_preview(server, ns, name));
             let read = grouped_diff::cached(kept, fresh, read);
             async move { (i, read.await) }
         });
@@ -765,7 +741,7 @@ impl ArgoView {
 mod tests {
     use std::collections::HashSet;
 
-    use super::{flip, members, some, split_picks};
+    use super::{flip, some, split_picks};
 
     #[test]
     fn a_long_list_of_names_says_how_many_more() {
@@ -780,22 +756,6 @@ mod tests {
 
     /// A group is what the filter keeps of it: a service's Applications, or an app of apps
     /// with every one under it (however deep).
-    #[test]
-    fn a_group_is_what_the_filter_keeps_of_it() {
-        // 0 made 1 and 2; 2 made 3; 4 alone.
-        let parents = [None, Some(0), Some(0), Some(2), None];
-        let services = vec![("web".to_string(), vec![1, 3]), ("api".to_string(), vec![0, 2, 4])];
-        let all = [true; 5];
-        assert_eq!(members(&services, &parents, &all, 0, false), [0, 1, 2, 3]);
-        assert_eq!(members(&services, &parents, &all, 2, false), [2, 3]);
-        assert_eq!(members(&services, &parents, &all, 4, false), [4]);
-        assert_eq!(members(&services, &parents, &all, 1, true), [0, 2, 4]);
-        let some_kept = [true, false, true, true, false];
-        assert_eq!(members(&services, &parents, &some_kept, 0, false), [0, 2, 3]);
-        assert_eq!(members(&services, &parents, &some_kept, 0, true), [3]);
-        assert!(members(&services, &parents, &all, 9, true).is_empty());
-    }
-
     #[test]
     fn picking_a_group_twice_unpicks_it_and_a_partial_group_is_picked_whole() {
         let mut picked: HashSet<super::Key> = HashSet::new();

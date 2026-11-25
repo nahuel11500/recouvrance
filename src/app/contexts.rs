@@ -59,6 +59,8 @@ impl AppView {
         self.kept.clear();
         self.metrics = None;
         self.recording = Vec::new();
+        // The old clusters' namespace watches (another window's hold keeps them running).
+        self.namespace_feeds.clear();
         // Watch errors name the old clusters, and would hide "Connecting…" and new failures.
         self.list = super::live_list::LiveList::default();
         // The problem badge counted the old clusters.
@@ -125,6 +127,7 @@ impl AppView {
             let mut clusters = Vec::new();
             let mut discovered = Vec::new();
             let mut listed = Vec::new();
+            let mut feeds = Vec::new();
             let mut early_lists = HashMap::new();
             let mut errors = Vec::new();
             // The add-on groups each cluster skipped (by cluster, only those that skipped some).
@@ -141,6 +144,7 @@ impl AppView {
                         clusters.push((r.ctx, r.client));
                         discovered.push(r.kinds);
                         listed.push(r.namespaces);
+                        feeds.push(r.feed);
                     }
                     Err(e) => errors.push(e),
                 }
@@ -162,6 +166,7 @@ impl AppView {
                 let mut namespaces: Vec<String> = Vec::new();
                 for (ix, listed) in listed.into_iter().enumerate() {
                     if !reached.contains(&ix) {
+                        feeds[ix] = None;
                         continue;
                     }
                     match listed {
@@ -171,7 +176,8 @@ impl AppView {
                 }
                 namespaces.sort();
                 namespaces.dedup();
-                anyhow::Ok((client, kinds, kind_clusters, namespaces, skipped))
+                let feeds: Vec<_> = feeds.into_iter().flatten().collect();
+                anyhow::Ok((client, kinds, kind_clusters, namespaces, skipped, feeds))
             }
             .await;
             let applied = this.update_in(cx, |this, window, cx| {
@@ -183,7 +189,7 @@ impl AppView {
                     this.conn.settle(ctx, failure.as_deref());
                 }
                 let connected = match result {
-                    Ok((client, kinds, kind_clusters, namespaces, skipped)) => {
+                    Ok((client, kinds, kind_clusters, namespaces, skipped, feeds)) => {
                         // Who saved this set before: what this connect does below is no change
                         // of the user's (see `session::SessionOwners`).
                         let owner_before =
@@ -248,6 +254,7 @@ impl AppView {
                         this.recording =
                             crate::timeline::start_watches(&this.clusters, &this.kinds, &this.kind_clusters);
                         this.set_namespaces(namespaces, window, cx);
+                        this.follow_namespaces(feeds, cx);
                         // The first window's first set reopens where it was left, again until a
                         // connect reaches every cluster: its namespaces before the list starts,
                         // so the list starts once.
@@ -405,6 +412,45 @@ impl AppView {
         self.update_assistant_scope(cx);
     }
 
+    /// Keep the picker's namespaces live from `feeds` (added to the ones followed): a
+    /// namespace created on a connected cluster shows, a deleted one goes.
+    pub(super) fn follow_namespaces(&mut self, feeds: Vec<k8s::namespace_feed::NamespaceHold>, cx: &mut Context<Self>) {
+        self.namespace_feeds.extend(feeds);
+        // Changes since the connect's answer, before the follow below started.
+        self.namespaces_moved(cx);
+        if self._namespaces_follow.is_some() {
+            return;
+        }
+        let mut changes = k8s::namespace_feed::changes();
+        self._namespaces_follow = Some(cx.spawn(async move |this, cx| {
+            while changes.changed().await.is_ok() {
+                if this.update(cx, Self::namespaces_moved).is_err() {
+                    break;
+                }
+            }
+        }));
+    }
+
+    /// The picker offers the connected clusters' namespaces as their watches see them now.
+    fn namespaces_moved(&mut self, cx: &mut Context<Self>) {
+        if self.namespace_feeds.is_empty() {
+            return;
+        }
+        let watched: Vec<Vec<String>> =
+            self.namespace_feeds.iter().map(|f| f.now().result().unwrap_or_default()).collect();
+        let all = offered_namespaces(&watched, &self.clusters_without_feed(), &self.namespaces);
+        self.ns_picker.update(cx, |p, cx| p.set_namespaces(all, cx));
+    }
+
+    /// The connected clusters that have no namespace watch (accessible namespaces set), with
+    /// those namespaces.
+    fn clusters_without_feed(&self) -> Vec<Vec<String>> {
+        (self.clusters.iter())
+            .filter(|(c, _)| !self.namespace_feeds.iter().any(|f| f.context() == c))
+            .map(|(c, _)| crate::settings::cluster(c).namespaces)
+            .collect()
+    }
+
     /// Reload the contexts when a kubeconfig file (or a watched folder) changes.
     pub(super) fn watch_kubeconfigs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self._kubeconfig_watch = Some(cx.spawn_in(window, async move |this, cx| {
@@ -528,16 +574,25 @@ fn served_by<'a>(
     kinds.iter().filter(move |k| kind_clusters.get(&k.key()).is_some_and(|c| c.contains(&ix)))
 }
 
-/// A cluster's namespaces as its listing answered, or what failed, to report. Not being
-/// allowed to list them is an answer: they are picked by hand there. A timeout or a server
-/// error is not: the namespaces picked there may still exist, and the connect counts as
-/// partial (a session is not saved over, see `session`).
-pub(super) fn listed_namespaces(ctx: &str, listed: Result<Vec<String>>) -> Result<Vec<String>, String> {
-    match listed {
-        Ok(names) => Ok(names),
-        Err(e) if k8s::api_status(&e) == Some(403) => Ok(Vec::new()),
-        Err(e) => Err(format!("{ctx}: listing namespaces: {}", k8s::error_chain(&e))),
-    }
+/// The namespaces the picker offers once a watch moved: each watched cluster's as its watch
+/// sees them (none while it never listed them, as at the connect), the accessible ones of the
+/// clusters without a watch, and the ones picked: a picked namespace that was deleted stays
+/// until it is unpicked, so the list doesn't switch to every namespace by itself. Sorted,
+/// each once; the picker adds the ones added by hand.
+pub(super) fn offered_namespaces(watched: &[Vec<String>], unwatched: &[Vec<String>], picked: &[String]) -> Vec<String> {
+    let mut all: Vec<String> = watched.iter().chain(unwatched).flatten().chain(picked).cloned().collect();
+    all.sort();
+    all.dedup();
+    all
+}
+
+/// A cluster's namespaces as its watch answered (`namespace_feed::Namespaces::result`), or
+/// what failed, to report. Not being allowed to list them is an answer (an empty list): they
+/// are picked by hand there. A timeout or a server error is not: the namespaces picked there
+/// may still exist, and the connect counts as partial (a session is not saved over, see
+/// `session`).
+pub(super) fn listed_namespaces(ctx: &str, listed: Result<Vec<String>, String>) -> Result<Vec<String>, String> {
+    listed.map_err(|e| format!("{ctx}: listing namespaces: {e}"))
 }
 
 /// Union of every cluster's kinds, with where each one exists. A cluster whose
@@ -693,8 +748,8 @@ fn one_namespace(wanted: &[String], previous: &[String], accessible: &[String]) 
 mod tests {
     use super::{
         Kind, Route, TabState, all_restricted, cluster_namespace, cluster_namespaces, kinds_per_cluster,
-        listed_namespaces, merge_kinds, one_namespace, served_by, served_lists, served_or_kept, served_tab,
-        skipped_notice,
+        listed_namespaces, merge_kinds, offered_namespaces, one_namespace, served_by, served_lists, served_or_kept,
+        served_tab, skipped_notice,
     };
     use std::collections::HashSet;
 
@@ -808,18 +863,31 @@ mod tests {
 
     #[test]
     fn a_namespace_listing_that_failed_is_reported_but_a_refusal_is_not() {
-        let api = |code| -> anyhow::Error {
-            kube::Error::Api(kube::core::Status::failure("x", "x").with_code(code).boxed()).into()
+        use crate::k8s::TableMsg;
+        use crate::k8s::namespace_feed::Namespaces;
+        let answered = |msg: TableMsg| {
+            let mut n = Namespaces::default();
+            n.apply(msg);
+            n.result()
         };
         let listed = listed_namespaces("a", Ok(vec!["team-a".into()]));
         assert_eq!(listed, Ok(vec!["team-a".to_string()]));
         // Not allowed to list them: picked by hand, nothing failed.
-        assert_eq!(listed_namespaces("a", Err(api(403))), Ok(Vec::new()));
+        assert_eq!(listed_namespaces("a", answered(TableMsg::Forbidden("forbidden".into()))), Ok(Vec::new()));
         // A timeout or a server error: the namespaces picked there may still exist.
-        for failed in [api(500), api(401), anyhow::anyhow!("timed out")] {
-            let e = listed_namespaces("hub", Err(failed)).unwrap_err();
-            assert!(e.starts_with("hub: listing namespaces: "), "{e}");
-        }
+        let e = listed_namespaces("hub", answered(TableMsg::Error("timed out".into()))).unwrap_err();
+        assert_eq!(e, "hub: listing namespaces: timed out");
+    }
+
+    #[test]
+    fn the_picker_follows_each_watch_and_keeps_what_is_picked() {
+        let v = |names: &[&str]| names.iter().map(ToString::to_string).collect::<Vec<_>>();
+        // Two clusters watched, one with accessible namespaces set; a picked namespace
+        // deleted since stays offered.
+        let all = offered_namespaces(&[v(&["b", "new"]), v(&["a", "b"])], &[v(&["team-x"])], &v(&["gone"]));
+        assert_eq!(all, v(&["a", "b", "gone", "new", "team-x"]));
+        // A namespace deleted on every cluster and not picked goes.
+        assert_eq!(offered_namespaces(&[v(&["a"]), v(&[])], &[], &[]), v(&["a"]));
     }
 
     #[test]

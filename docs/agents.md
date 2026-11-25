@@ -180,7 +180,7 @@ Tools, by what they do:
   `top_nodes`, `usage_history`, `get_logs`, `workload_logs`, `get_changes`, `recent_changes`,
   `rollout_history`, `rollout_status`, `list_helm_releases`, `helm_history`, `helm_get_values`,
   `diff_manifest`, `explain_resource`, `can_i`, `cluster_version`, `upgrade_check`, `wait_for`,
-  `list_port_forwards`, `browse_files`, `get_metrics`, `argocd_apps`.
+  `list_port_forwards`, `browse_files`, `get_metrics`, `argocd_apps`, `argocd_diff`.
 - **Change:** `scale`, `rollout_restart`, `rollout_undo`, `rollout_pause`, `rollout_resume`,
   `set_image`, `patch_resource`, `apply_manifest`, `delete_resource`, `evict_pod`, `trigger_cronjob`,
   `cordon_node`, `uncordon_node`, `drain_node`, `gitops`, `refresh_external_secret`, `exec_command`, `debug_pod`,
@@ -191,8 +191,9 @@ the Problems page) while that scan is recent, 2 minutes or more on a big cluster
 it is; otherwise it runs one, which the windows then show too. `max_age_seconds` sets the oldest
 answer it takes: 0 scans again, to check a fix. Its findings still go through the agent's rules;
 an Argo CD Application that needs attention, listed under the cluster it deploys to with its own
-namespace and hub in the PROBLEM text, is shown when the rules let the agent list Applications on
-its hub, and a hub that could not be read is named only when the rules open that context.
+namespace and Argo CD server in the PROBLEM text, is shown when the rules let the agent list
+Applications in that context and its destination namespace, and an Argo CD server that could not
+be read is named only when they may.
 
 Each tool tells the agent's client whether it only reads (`readOnlyHint`): the tools under **Read**
 say so, except `browse_files`, which may add a debug container; the changes don't. Of those that may
@@ -204,8 +205,8 @@ Every change supports `dry_run` except `exec_command`, `drain_node` and the port
 (`gitops` takes it for an Argo CD `sync` or `rollback` only); `my_permissions` names them, from the
 tools' definitions. What some of them need beyond the obvious verb:
 
-- **Argo CD sync, terminate and rollback:** `gitops` on an Application, authorized as `sync` on
-  it. `sync` takes `resources` (sync those alone; hooks run only when the whole Application
+- **Argo CD sync, terminate and rollback:** `gitops` on an Application, through Argo CD's API,
+  authorized as `sync` where it deploys (see below). `sync` takes `resources` (sync those alone; hooks run only when the whole Application
   syncs), `prune` (delete what is no longer in git; the approval banner and the reply name what
   it deletes, and a sync that would delete more than the banner listed is refused) and `dry_run`
   (Argo CD's own dry run: nothing is applied, and the reply waits up to 30 s for what Argo CD
@@ -215,9 +216,8 @@ tools' definitions. What some of them need beyond the obvious verb:
   approval banner names and which is the one sent), like `argocd app rollback`: the deployment's
   revision and source applied again, without hooks and without prune. As argocd-server does,
   nothing starts while another operation runs or the Application is being deleted, and a
-  rollback is refused while auto-sync is on. The Application is read right before the write,
-  which carries the version read: a change meanwhile refuses it (a terminate is tried again, as
-  argocd-server does).
+  rollback is refused while auto-sync is on. The Application is read right before the request
+  is sent, and the rules are decided again just before it goes.
 
 - **Custom and external metrics:** `get_metrics` reads `custom.metrics.k8s.io` and
   `external.metrics.k8s.io`, what an HPA or KEDA gets from prometheus-adapter, like
@@ -230,44 +230,56 @@ tools' definitions. What some of them need beyond the obvious verb:
 - **Logs of a workload:** `workload_logs` merges the logs of a workload's or Service's pods (the
   newest 20) in time order, each line prefixed with its pod. It needs `get` on the workload; pods
   whose logs the rules don't allow are left out and counted.
-- **Argo CD, from the hub to the destination:** `argocd_apps` lists Applications like the Argo CD
-  page: for each, its hub (the context Argo CD runs in), project, sync, health, auto-sync, last
-  operation, revision, where it deploys (the kubeconfig context that reaches its destination,
-  marked when the agent's rules don't open it) and the app of apps that made it, those needing a
-  look first with Argo CD's message. Filters: `problems_only` (a failed sync, an error, Degraded
-  or Missing, a sync running, or out of sync with auto-sync on; out of sync with auto-sync off is
-  how an Application synced by hand waits, not a problem), `out_of_sync`, `project`,
-  `destination` (a context) and `dest_namespace`. It reads the hub in `context`, else the hubs
-  ticked in Settings → Contexts, else those the window or an agent's calls found serving
-  Applications, and only among the contexts the rules name: no other context is asked whether it
-  runs Argo CD. It needs `list` on `applications.argoproj.io` on the hub and shows the rows the
-  rules allow; without `context` it never asks for approval and names the hubs only an Ask rule
-  covers. The list is the one the Argo CD page reads (kept 30 s, one per hub).
+- **Argo CD, through its API:** the agents' Argo CD tools read and act only through Argo CD's
+  API, on the servers the argocd CLI is logged in to and those set in Settings → Argo CD (see
+  [features](features.md)); no cluster Argo CD runs in is asked through the kubeconfig. The
+  rules judge an action on an Application where it deploys: `list`, `get`, `refresh` or `sync`
+  on `applications.argoproj.io` in each context that reaches its destination cluster, with its
+  `destination.namespace` as the namespace and its name as the name (`sync
+  applications.argoproj.io -n *-staging` decides the same whichever Argo CD holds them). An
+  Application whose destination no context reaches is judged on its cluster as it names it
+  (`in-cluster`, a cluster name, the server's host), which `*` covers. A rule naming an Argo CD
+  server or the context Argo CD runs in decides none of them: the Agents page flags it. A server
+  set read-only refuses every write before the rules decide.
+  `argocd_apps` lists Applications like the Argo CD page: for each, its server, project, sync,
+  health, auto-sync, last operation, revision, where it deploys (the kubeconfig context that
+  reaches its destination, marked when the agent's rules don't open it), when its next sync can
+  start under its project's sync windows, and the app of apps that made it, those needing a look
+  first with Argo CD's message. Filters: `server`, `search` (name, namespace, project,
+  destination), `problems_only` (a failed sync, an error, Degraded or Missing, a sync running, or
+  out of sync with auto-sync on; out of sync with auto-sync off is how an Application synced by
+  hand waits, not a problem), `out_of_sync`, `project`, `destination` (a context) and
+  `dest_namespace`; `limit` and `offset` page through a big Argo CD. It shows the rows an Allow
+  rule gives `list` on where they deploy, never asks for approval, and counts the others. It
+  reads what the servers' feeds hold (no list of its own while a feed runs; one started for an
+  agent stays 5 minutes). `argocd_diff` says what syncing one or several Applications now would
+  change, from their managed resources as the Argo CD page's diff reads them (Secret values
+  masked, noise folded and counted); several are one grouped diff, each change once with the
+  Applications it is in. It needs `get` where each deploys: one Application may ask, several
+  show only those an Allow rule opens.
   `describe_resource` and `get_changes` name the Application that deployed an object, from its
   tracking id (`argocd.argoproj.io/tracking-id`, Argo CD's annotation tracking) or else its
   `app.kubernetes.io/instance` label (label tracking; Helm sets it too, so it counts only when
-  the Application is found tracking the object), with its hub, sync, health and the object's own
-  state in it; `get_changes` adds the Application's deployments. That Application is read on the
-  same hubs, only where an Allow rule gives `get` on it (or `list`, to find it in another
-  namespace or by label), and nothing is read for an object that names none. A label alone
-  reads only hubs already connected for agents: it never connects to one. The hubs are read
-  together, each bounded in time (10 s to connect, 30 s to read). A hub that can't be reached,
-  whose credentials are refused or whose login command fails is left alone 5 minutes (said for
-  a tracking id, quiet for a label): a connected hub whose token expired runs its login once,
-  then not again until then. A hub that is only slow, or that refuses the read, is asked again
-  on the next call. An Application of the same name on another hub counts only if it deploys to
+  the Application is found tracking the object), with its server, sync, health and the object's
+  own state in it; `get_changes` adds the Application's deployments. It is found in what the
+  servers' feeds hold, among the Applications an Allow rule gives `get` or `list` on where they
+  deploy; a label alone reads only feeds running already, and nothing is read for an object that
+  names none. An Application of the same name on another server counts only if it deploys to
   the object's cluster or tracks the object; several that fit as well are named as unclear. One
   whose destination is an Argo CD cluster name matching no context is taken, said unsure, when
-  it is the only one of that name; the hubs not read are said whenever the one named is not
-  sure. `wait_for` waits for an Application's `sync=Synced`, `health=Healthy` or
-  `operation=Succeeded`, met only once no operation runs (until then they are from before it);
-  a `sync=` or `operation=` wait returns at once with Argo CD's message when the last operation
-  failed on the revision the Application targets now (or auto-sync is off). A failure on an
-  older revision with auto-sync on waits for the next sync. After a push to git, refresh the
-  Application (`gitops` `refresh`) before waiting: until Argo CD has seen the new commit, the
-  revision it targets is still the one that failed, and the wait ends at once.
+  it is the only one of that name; the servers not read are said whenever the one named is not
+  sure. `gitops` and `wait_for` take the Application by `kind: applications`, its `namespace`
+  (where the Application is kept) and `name`, with `server` when several servers hold one of
+  that name, and no `context`. `wait_for` waits for an Application's `sync=Synced`,
+  `health=Healthy` or `operation=Succeeded`, met only once no operation runs (until then they
+  are from before it); a `sync=` or `operation=` wait returns at once with Argo CD's message
+  when the last operation failed on the revision the Application targets now (or auto-sync is
+  off). A failure on an older revision with auto-sync on waits for the next sync. After a push
+  to git, refresh the Application (`gitops` `refresh`) before waiting: until Argo CD has seen
+  the new commit, the revision it targets is still the one that failed, and the wait ends at
+  once.
 - **Argo CD diagnosis:** `gitops` with `action: diagnose` on an Application changes nothing and
-  needs `get` on it (not `refresh` or `sync`; the activity log doesn't count it as a change). It returns the
+  needs `get` where it deploys (not `refresh` or `sync`; the activity log doesn't count it as a change). It returns the
   diagnosis of the Application's page: a deletion held by a finalizer, a sync running for long,
   a failed sync (each object and why), a sync loop with the `ignoreDifferences` that would stop
   it, what is out of sync, and the fields that differ between what was last applied and the

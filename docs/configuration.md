@@ -111,7 +111,8 @@ context already shown as `name@file` keeps that name when `name` is freed.
 | `argocd_servers` | `{}` | `{ "argocd-hub": "https://argocd.example.com" }`: the Argo CD API server of a hub context, to read Argo CD's own diff from (see below). None: off. An entry that doesn't read is dropped. Settings → Per cluster |
 | `argocd_api_servers` | `[]` | `["https://argocd.example.com"]`: Argo CD API servers read on the Argo CD page, besides the argocd CLI's (see below). Settings → Argo CD |
 | `argocd_api_off` | `[]` | Argo CD API servers (their address) not read, whether set here or the argocd CLI's. Settings → Argo CD, the switch of each |
-| `argocd_group_label` | `""` | `"app.kubernetes.io/part-of"`: the label whose value names an Application's service on the Argo CD page grouped by service. Empty: its name without the environment in it. Settings → Argo CD |
+| `argocd_env_types` | `[]` | `["prod = -prod(-\|$)", "staging = -staging(-\|$)"]`: the Argo CD page's environment types, in the order shown, each `type = pattern` (a regular expression of the environment's root Application's name; the match that starts first wins, ties go to the earlier line) or `type = tag:other` (an environment of type `other` whose product images all carry a version tag). A line that doesn't read is named on the page and types nothing; no match is `other`. Empty: prod, preprod, acc on a tag, acc, staging, review, platform. Settings → Argo CD |
+| `argocd_page` | `{}` | How the Argo CD page was last left, restored when it opens: `filter` (`needs_look`, `out_of_sync`, `degraded`, `running`, `favorites`, `project`, `kind`, `on_tag`, `query`), `group_by` (`Type`, `Project` or `None`), `folded` (headings, `project / type`) and `expanded` (environments, by their root). Set by the page; one that doesn't read opens the page as new |
 | `argocd_contexts` | `[]` | `["argocd-hub"]`: the contexts Argo CD's Applications are read from (see below). Empty: found on their own. A value that doesn't read is empty. Settings → Contexts, *Argo CD* |
 | `extra_namespaces` | | Namespaces added by hand, per context |
 | `metrics_enabled` | true | Read metrics-server and Prometheus at all |
@@ -225,9 +226,8 @@ on and it is asked (its login may run); if it serves Applications, it is kept he
 ```
 
 Only the named contexts are asked then (their login may run). Connecting the hub as well works too.
-Agents read Argo CD (`argocd_apps`, and the Application named by `describe_resource` and
-`get_changes`) on these contexts too, else on the hubs already found, among the contexts their
-rules name (see [agents](agents.md)).
+Agents never read Argo CD on these contexts: their Argo CD tools go through Argo CD's API only
+(see [agents](agents.md)).
 
 ### Argo CD's diff (`argocd_servers`)
 
