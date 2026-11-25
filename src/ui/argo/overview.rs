@@ -30,6 +30,8 @@ const LOOKS_SHOWN: usize = 12;
 const RECENT_SHOWN: usize = 8;
 /// Tags shown for one component in one type, at most.
 const TAGS_SHOWN: usize = 5;
+/// Commits read from git hosts in one go, before the page is drawn again.
+const COMMITS_AT_ONCE: usize = 8;
 
 /// How many environments are in each state. One can be in several.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -70,6 +72,8 @@ pub struct TypeTags {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Component {
     pub name: String,
+    /// Its image's repository (the first one's, of components on one line).
+    pub repo: String,
     pub types: Vec<TypeTags>,
 }
 
@@ -233,9 +237,11 @@ pub fn versions(all: &[Env], shown: &[usize]) -> Vec<ProjectVersions> {
     // project → component → type → tag → environments
     type Tags = BTreeMap<String, Vec<usize>>;
     let mut tree: BTreeMap<&str, BTreeMap<&str, BTreeMap<usize, Tags>>> = BTreeMap::new();
+    let mut repos: HashMap<(&str, &str), &str> = HashMap::new();
     for &e in shown {
         let env = &all[e];
         for (_, image) in env.images.iter().filter(|(own, _)| *own) {
+            repos.entry((&env.project, &image.component)).or_insert(&image.repo);
             let tag = image.tags.join(", ");
             tree.entry(&env.project)
                 .or_default()
@@ -254,6 +260,7 @@ pub fn versions(all: &[Env], shown: &[usize]) -> Vec<ProjectVersions> {
                 .into_iter()
                 .map(|(name, by_type)| Component {
                     name: name.to_string(),
+                    repo: repos.get(&(project, name)).map_or_default(ToString::to_string),
                     types: by_type
                         .into_iter()
                         .map(|(kind, tags)| {
@@ -428,7 +435,18 @@ impl ArgoView {
                                         format!("{} · {}", envs::short_tag(tag), names.join(", "))
                                     };
                                     let color = if n == 0 { theme.foreground } else { theme.warning };
-                                    div()
+                                    // The commit the tag was built from, once its git host said.
+                                    let last = tag.rsplit(", ").next().unwrap_or(tag);
+                                    let commit = match crate::git_host::known(&c.repo, last) {
+                                        Some(crate::git_host::Lookup::Found(commit)) => Some(commit),
+                                        _ => None,
+                                    };
+                                    let id = SharedString::from(format!(
+                                        "argo-ov-tag-{}-{}-{}-{n}",
+                                        p.project, c.name, t.kind
+                                    ));
+                                    let chip = div()
+                                        .id(id)
                                         .flex_none()
                                         .px_1p5()
                                         .rounded_md()
@@ -436,7 +454,30 @@ impl ArgoView {
                                         .font_family(mono.clone())
                                         .text_color(color)
                                         .bg(if n == 0 { theme.secondary } else { theme.warning.opacity(0.12) })
-                                        .child(text)
+                                        .child(text);
+                                    let Some(commit) = commit else { return h_flex().child(chip) };
+                                    let tip = commit_text(&commit);
+                                    let url = commit.url.clone();
+                                    h_flex()
+                                        .gap_1()
+                                        .child(
+                                            chip.tooltip(move |w, cx| {
+                                                component::tooltip::Tooltip::new(tip.clone()).build(w, cx)
+                                            })
+                                            .when(!url.is_empty(), |d| {
+                                                d.cursor_pointer().on_click(move |_, _, cx| cx.open_url(&url))
+                                            }),
+                                        )
+                                        .when(n == 0, |d| {
+                                            d.child(
+                                                div()
+                                                    .max_w(px(320.))
+                                                    .truncate()
+                                                    .text_xs()
+                                                    .text_color(muted)
+                                                    .child(commit.title.clone()),
+                                            )
+                                        })
                                 }))
                                 .when(t.tags.len() > TAGS_SHOWN, |d| {
                                     d.child(
@@ -539,11 +580,62 @@ impl ArgoView {
             .into_any_element()
     }
 
+    /// Read from their git host the commits of the tags the overview shows (see `wanted`),
+    /// unless those are being read already; the page is drawn again as they come.
+    pub(super) fn ask_commits(&mut self, cx: &mut Context<Self>) {
+        let Some(o) = self.overview.as_ref().filter(|_| !self.list_shown) else { return };
+        let mut wanted = wanted(o);
+        if wanted.is_empty() || wanted.iter().all(|w| self.commits_asked.contains(w)) {
+            return;
+        }
+        // A few at a time, the page drawn again after each few.
+        wanted.truncate(COMMITS_AT_ONCE);
+        self.commits_asked.clone_from(&wanted);
+        self.commits_load.spawn(cx, crate::git_host::read(wanted), |this, _, cx| {
+            this.commits_asked.clear();
+            cx.notify();
+            this.ask_commits(cx);
+        });
+    }
+
     /// Show the list, with `change` made to its filter.
     fn show_list_with(&mut self, change: impl FnOnce(&mut envs::Filter), cx: &mut Context<Self>) {
         self.list_shown = true;
         self.change_filter(change, cx);
     }
+}
+
+/// A commit on hover: its title, author, when, and its sha.
+pub fn commit_text(c: &crate::git_host::Commit) -> String {
+    let mut by = vec![c.author.clone()];
+    if let Some(t) = c.date {
+        by.push(format!("{} ago", k8s::age(t)));
+    }
+    let short: String = c.sha.chars().take(8).collect();
+    format!("{}\n{} · {short}", c.title, by.join(", "))
+}
+
+/// The commits of the product's tags the overview shows (each type's, each component's), to
+/// read from their git host: those with a sha not known yet.
+pub fn wanted(o: &Overview) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    for p in &o.versions {
+        for c in &p.components {
+            for t in &c.types {
+                for (tag, _) in t.tags.iter().take(TAGS_SHOWN) {
+                    let last = tag.rsplit(", ").next().unwrap_or(tag);
+                    let key = (c.repo.clone(), last.to_string());
+                    if crate::git_host::sha_of(last).is_some()
+                        && crate::git_host::known(&key.0, &key.1).is_none()
+                        && !out.contains(&key)
+                    {
+                        out.push(key);
+                    }
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Who each environment's Argo CD is logged in as, read once per server.

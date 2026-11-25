@@ -200,7 +200,8 @@ fn config_file(var: &str, dir: &str, file: &str) -> PathBuf {
 pub fn hosts() -> Vec<Host> {
     let env = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty());
     let read = |p: PathBuf| std::fs::read_to_string(p).unwrap_or_default();
-    let mut out = glab_hosts(&read(config_file("GLAB_CONFIG_DIR", "glab-cli", "config.yml")), env("GITLAB_TOKEN").as_deref());
+    let mut out =
+        glab_hosts(&read(config_file("GLAB_CONFIG_DIR", "glab-cli", "config.yml")), env("GITLAB_TOKEN").as_deref());
     out.extend(gh_hosts(
         &read(config_file("GH_CONFIG_DIR", "gh", "hosts.yml")),
         env("GH_TOKEN").or_else(|| env("GITHUB_TOKEN")).as_deref(),
@@ -240,10 +241,10 @@ pub fn candidates(repo: &str, hosts: &[Host]) -> Vec<(usize, String)> {
             || registry == h.name
             || registry.strip_prefix("registry.").is_some_and(|r| r == h.name)
     };
-    for (i, h) in hosts.iter().enumerate().filter(|(_, h)| h.forge == Forge::GitLab && owns(h)) {
+    for (i, _) in hosts.iter().enumerate().filter(|(_, h)| h.forge == Forge::GitLab && owns(h)) {
         gitlab(i, &mut out);
     }
-    for (i, h) in hosts.iter().enumerate().filter(|(_, h)| h.forge == Forge::GitLab && !owns(h)) {
+    for (i, _) in hosts.iter().enumerate().filter(|(_, h)| h.forge == Forge::GitLab && !owns(h)) {
         gitlab(i, &mut out);
     }
     let github = registry == "ghcr.io" || registry.starts_with("docker.pkg.");
@@ -263,13 +264,7 @@ pub fn candidates(repo: &str, hosts: &[Host]) -> Vec<(usize, String)> {
 fn parse_commit(forge: Forge, v: &Value) -> Option<Commit> {
     let text = |p: &str| v.pointer(p).and_then(Value::as_str).unwrap_or_default().to_string();
     let (sha, message, author, date, url) = match forge {
-        Forge::GitLab => (
-            text("/id"),
-            text("/title"),
-            text("/author_name"),
-            text("/committed_date"),
-            text("/web_url"),
-        ),
+        Forge::GitLab => (text("/id"), text("/title"), text("/author_name"), text("/committed_date"), text("/web_url")),
         Forge::GitHub => (
             text("/sha"),
             text("/commit/message"),

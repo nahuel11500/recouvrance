@@ -327,6 +327,9 @@ pub struct ArgoView {
     show_reviews: bool,
     /// The overview of what the filter keeps, worked out with the lines.
     overview: Option<overview::Overview>,
+    /// Reads the commits of the overview's tags from their git host, and which it reads.
+    commits_load: crate::latest::Latest,
+    commits_asked: Vec<(String, String)>,
     _subs: Vec<Subscription>,
 }
 
@@ -471,6 +474,8 @@ impl ArgoView {
             list_shown: page.list,
             show_reviews: false,
             overview: None,
+            commits_load: Default::default(),
+            commits_asked: Vec::new(),
             _subs: subs,
         }
     }
@@ -536,6 +541,7 @@ impl ArgoView {
         self.build.spawn(cx, work, |this, rows, cx| {
             this.rows = Some(rows);
             this.refilter(cx);
+            this.ask_commits(cx);
             this.dashboard_changed(cx);
             this.open_asked(cx);
             cx.notify();
@@ -669,6 +675,7 @@ impl ArgoView {
     /// The filter, grouping or a fold changed: show it, and remember it.
     fn changed(&mut self, cx: &mut Context<Self>) {
         self.refilter(cx);
+        self.ask_commits(cx);
         self.remember();
         cx.notify();
     }
@@ -1498,6 +1505,7 @@ impl ArgoView {
     fn show_list(&mut self, list: bool, cx: &mut Context<Self>) {
         self.list_shown = list;
         self.remember();
+        self.ask_commits(cx);
         cx.notify();
     }
 
