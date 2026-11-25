@@ -80,17 +80,35 @@ fn attach_windowless() -> std::io::Result<()> {
     let (tx, rx) = std::sync::mpsc::channel();
     if let Some(stdout) = stdout {
         let _ = std::thread::Builder::new().name("console".into()).spawn(move || {
-            let ready = std::io::BufReader::new(stdout).lines().any(|l| l.is_ok_and(|l| l.trim() == "ready"));
-            let _ = tx.send(ready);
+            for line in std::io::BufReader::new(stdout).lines() {
+                if tx.send(line.map(|l| l.trim().to_string())).is_err() {
+                    break;
+                }
+            }
         });
     }
-    let asked = stdin.as_mut().is_some_and(|i| i.write_all(b"echo ready\r\n").and_then(|()| i.flush()).is_ok());
-    let ready = asked && rx.recv_timeout(std::time::Duration::from_secs(3)).unwrap_or(false);
+    let asked = stdin.as_mut().map(|i| i.write_all(b"echo ready\r\n").and_then(|()| i.flush()));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    let mut seen = Vec::new();
+    let ready = loop {
+        match rx.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now())) {
+            Ok(Ok(line)) if line == "ready" => break true,
+            Ok(line) => seen.push(format!("{line:?}")),
+            Err(e) => {
+                seen.push(e.to_string());
+                break false;
+            }
+        }
+    };
     let attached = if ready {
         winsafe::AttachConsole(winsafe::PidParent::Pid(host.id())).map_err(std::io::Error::other)
     } else {
+        let status = host.try_wait();
         let _ = host.kill();
-        Err(std::io::Error::other("cmd did not answer"))
+        Err(std::io::Error::other(format!(
+            "cmd did not answer (asked: {asked:?}, read: {}, cmd: {status:?})",
+            seen.join(", ")
+        )))
     };
     // Closing its stdin ends cmd; the console stays while the app is attached to it.
     drop(stdin);
