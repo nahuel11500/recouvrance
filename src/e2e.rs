@@ -2502,13 +2502,19 @@ fn an_agent_syncs_terminates_and_rolls_back_an_argo_cd_application() {
         assert_eq!(sync["syncStrategy"], json!({"apply": {}}), "{sync}");
         fake.set(name, &json!({"operation": null}));
 
-        // A server set read-only refuses before the rules decide.
+        // A server set read-only refuses before the rules decide: even with a rule that allows it.
+        let refresh =
+            rules_file::parse_rule(Mode::Allow, &format!("refresh applications/e2e-* -n {NS} --context {ctx}"))?;
+        hub.update_agent(&agent.id, |a| a.policy.rules.push(refresh))?;
         crate::settings::set_read_only(&server, true);
         let before = fake.writes().len();
         let out = client.call("gitops", with(json!({"action": "refresh"}))).await;
         assert!(out.contains("Denied") && out.contains("read-only"), "{out}");
         assert_eq!(fake.writes().len(), before);
         crate::settings::set_read_only(&server, false);
+        let out = client.call("gitops", with(json!({"action": "refresh"}))).await;
+        assert!(out.contains("refreshes"), "{out}");
+        let before = fake.writes().len();
 
         // The window's writes: write mode off refuses them when they are sent.
         gate::set_ui_writes(false);
