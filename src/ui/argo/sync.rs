@@ -33,7 +33,7 @@ use crate::k8s::argo::grouped_sync::{self, Checked, Options, PARALLEL, Progress,
 use crate::k8s::argo::operation_tone;
 use crate::k8s::argo::ops::{Op, SyncRequest};
 use crate::k8s::argo::windows::{NextSync, Planner};
-use crate::k8s::argo::{FleetApp, Source, short_revision};
+use crate::k8s::argo::{FleetApp, short_revision};
 use crate::status::Tone;
 use crate::ui::selectable::selectable;
 
@@ -58,10 +58,8 @@ fn all_named(res: &[Res]) -> String {
 struct Row {
     key: Key,
     label: String,
-    /// Its hub context or API server: what a terminate's confirmation names.
+    /// Its Argo CD API server: what a terminate's confirmation names.
     source: String,
-    /// Read on a hub (not by Argo CD's API).
-    hub: bool,
     target: Target,
     /// When a manual sync of it can start, under its project's sync windows.
     window: NextSync,
@@ -197,10 +195,9 @@ impl ArgoView {
             .map(|(a, label)| Row {
                 key: key(a),
                 label,
-                source: a.source.label(),
-                hub: matches!(a.source, Source::Hub(_)),
+                source: a.server.name(),
                 target: Target {
-                    source: a.source.clone(),
+                    server: a.server.clone(),
                     instance: a.instance.clone(),
                     namespace: a.app.namespace.clone(),
                     name: a.app.name.clone(),
@@ -340,18 +337,6 @@ impl ArgoView {
         } else {
             Vec::new()
         };
-        let unknown_windows: Vec<String> = jobs
-            .iter()
-            .filter(|(i, _)| grouped_sync::window_warning(&g.rows[*i].window, g.rows[*i].hub).is_some())
-            .map(|(i, _)| g.rows[*i].label.clone())
-            .collect();
-        let windows_note = (!unknown_windows.is_empty()).then(|| {
-            format!(
-                "Sync windows not known for {}: if one denies a sync now, Argo CD's controller holds the sync until \
-                 it opens (Terminate takes it back).",
-                some(unknown_windows.into_iter(), NAMED)
-            )
-        });
         let danger = opts.prune && !opts.dry_run && !deletes.is_empty();
         let mut sources: Vec<String> = jobs.iter().map(|(i, _)| g.rows[*i].source.clone()).collect();
         sources.sort();
@@ -395,7 +380,6 @@ impl ArgoView {
                                 crate::plural::count(left, "Application")
                             )))
                         })
-                        .children(windows_note.clone().map(|t| div().text_xs().text_color(warning).child(t)))
                         .children(prune_text.map(|t| div().text_xs().text_color(warning).child(t)))
                         .when(!deletes.is_empty(), |v| {
                             v.child(
@@ -793,9 +777,6 @@ impl ArgoView {
                 facts.push(format!("revision {}", short_revision(rev)));
             }
             out = out.child(line(facts.join(" · "), muted));
-            if let Some(warn) = grouped_sync::window_warning(&r.window, r.hub) {
-                out = out.child(line(warn, theme.warning));
-            }
             if opts.prune {
                 let text = if checked.pruned.is_empty() {
                     "Nothing to prune.".to_string()

@@ -337,31 +337,6 @@ where
     Ok(Arc::new(diff))
 }
 
-/// The same, for an Application read on its hub `context`: from the Argo CD server set for
-/// that context in Settings (else says why not).
-pub async fn read_hub(
-    context: String,
-    namespace: String,
-    name: String,
-    spec: u64,
-    from: Revision,
-    to: Revision,
-) -> Result<Arc<SmartDiff>, String> {
-    let read = crate::k8s::run_abortable(async move {
-        let (server, token, _) = match super::server::login_for(&context) {
-            Ok(login) => login,
-            Err(why) => return Ok(Err(format!("{why}: the rendered manifests are read from it"))),
-        };
-        let get = |path: String| {
-            let (server, token) = (server.clone(), token.clone());
-            async move { super::server::get_path_within(&server, &token, &path, RENDER_TIMEOUT).await }
-        };
-        let target = Target { server: server.base.clone(), namespace, name, spec };
-        Ok(manifests_diff(target, from, to, get).await)
-    });
-    read.await.unwrap_or_else(|e| Err(format!("{e:#}")))
-}
-
 #[cfg(test)]
 mod tests {
     use serde_json::json;

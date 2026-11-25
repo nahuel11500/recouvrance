@@ -28,7 +28,7 @@ use gpui_kit::*;
 use super::dashboard::{lines_block, link};
 use super::{ArgoView, GroupBy, Key, ancestors, key};
 use crate::k8s::argo::grouped_diff::{self, AppDiff, Cross, CrossKey, MAX_APPS};
-use crate::k8s::argo::{FleetApp, Source, api};
+use crate::k8s::argo::{FleetApp, api};
 use crate::smartdiff::SmartDiff;
 use crate::ui::selectable::selectable;
 
@@ -119,7 +119,7 @@ pub(super) fn labels(apps: &[FleetApp]) -> Vec<String> {
     apps.iter()
         .map(|a| {
             if count[a.app.name.as_str()] > 1 {
-                format!("{} · {} {}", a.app.name, a.source.label(), a.app.namespace)
+                format!("{} · {} {}", a.app.name, a.server.name(), a.app.namespace)
             } else {
                 a.app.name.clone()
             }
@@ -338,9 +338,7 @@ impl ArgoView {
     // MARK: Diff
 
     /// Read what a sync of each Application picked would change, at most a few at a time; the
-    /// changes are regrouped as reads end. One Argo CD couldn't compare is not read. A hub's
-    /// Applications are read from the Argo CD server set for the hub in Settings (else each
-    /// says why not). `fresh` (Read again): none is taken from those kept.
+    /// changes are regrouped as reads end. One Argo CD couldn't compare is not read. `fresh` (Read again): none is taken from those kept.
     pub(super) fn diff_selected(&mut self, fresh: bool, cx: &mut Context<Self>) {
         let mut apps = self.selected_apps();
         if apps.is_empty() {
@@ -350,23 +348,20 @@ impl ArgoView {
         apps.truncate(MAX_APPS);
         let names = labels(&apps);
         let mut results: Vec<Option<Outcome>> = vec![None; apps.len()];
-        let mut targets: Vec<(usize, Source, grouped_diff::CacheKey)> = Vec::new();
+        let mut targets: Vec<(usize, Arc<api::Endpoint>, grouped_diff::CacheKey)> = Vec::new();
         for (i, a) in apps.iter().enumerate() {
             if let Some(why) = grouped_diff::not_compared(&a.app) {
                 results[i] = Some(Outcome::NotCompared(why));
                 continue;
             }
             let kept = (a.instance.clone(), a.app.namespace.clone(), a.app.name.clone(), a.version.clone());
-            targets.push((i, a.source.clone(), kept));
+            targets.push((i, a.server.clone(), kept));
         }
         let done = apps.len() - targets.len();
         let reads = grouped_diff::read_all(targets.len(), move |t| {
-            let (i, source, kept) = targets[t].clone();
+            let (i, server, kept) = targets[t].clone();
             let (ns, name) = (kept.1.clone(), kept.2.clone());
-            let read: Pin<Box<dyn Future<Output = Read>>> = match source {
-                Source::Hub(hub) => Box::pin(grouped_diff::read_hub(hub.context, ns, name)),
-                Source::Api(endpoint) => Box::pin(api::sync_preview(endpoint, ns, name)),
-            };
+            let read: Pin<Box<dyn Future<Output = Read>>> = Box::pin(api::sync_preview(server, ns, name));
             let read = grouped_diff::cached(kept, fresh, read);
             async move { (i, read.await) }
         });

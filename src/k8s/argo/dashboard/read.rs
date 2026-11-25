@@ -6,7 +6,6 @@ use std::sync::{LazyLock, Mutex, PoisonError};
 
 use serde_json::Value;
 
-use super::super::Hub;
 use super::super::server::GitDiff;
 use super::{Commit, Deployed, MAX_COMMITS, Read, commit_of, deployed, managed_path, revision_path, tree_path};
 
@@ -68,32 +67,4 @@ where
         all.insert(key, c.clone());
     }
     Some(read)
-}
-
-/// The dashboard of the Application `namespace/name` read on its hub: the Application from
-/// the hub; its tree, diff and commits from the Argo CD server set for the hub's context in
-/// Settings, when one is (else said why not).
-pub async fn read_hub(hub: Hub, namespace: String, name: String) -> Result<Read, String> {
-    let read = crate::k8s::run_abortable(async move {
-        let app = match super::super::get_application(&hub, &namespace, &name).await {
-            Ok(app) => app,
-            Err(e) => return Ok(Err(crate::k8s::short_error(&e))),
-        };
-        let login = match super::super::server::login_for(&hub.context) {
-            Ok(login) => login,
-            Err(why) => {
-                let note = format!("{why}: the resource tree, Argo CD's diff and the commits are read from it");
-                return Ok(Ok(Read { app, tree: None, diff: None, commits: Vec::new(), note: Some(note) }));
-            }
-        };
-        let (server, token, how) = login;
-        let shown = server.name();
-        let get = |path: String| {
-            let (server, token) = (server.clone(), token.clone());
-            async move { super::super::server::get_path(&server, &token, &path).await }
-        };
-        let diff_of = |v: &Value| super::super::server::diffs(v, shown.clone(), how);
-        Ok(Ok(extras(&server.base, &namespace, &name, app, get, diff_of).await))
-    });
-    read.await.unwrap_or_else(|e| Err(format!("{e:#}")))
 }

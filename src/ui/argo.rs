@@ -1,15 +1,14 @@
-//! The Argo CD page: every Application of the contexts that serve Argo CD and of the Argo CD
-//! API servers (the argocd CLI's, and those set in Settings → Argo CD), each under the app of
-//! apps that made it or with the other environments of its service, with where it deploys
-//! mapped to a kubeconfig context and when it can sync next. Opening one, or a service, shows
-//! the dashboard of its service, a tab per environment (see `dashboard`); its menu opens its
-//! page on Argo CD's cluster (or in Argo CD's web UI, when read by the API), refreshes or
-//! syncs it. Applications picked together (`grouped`) are diffed at once, the same change in
+//! The Argo CD page: every Application of the Argo CD API servers (the argocd CLI's, and those
+//! set in Settings → Argo CD), each under the app of apps that made it or with the other
+//! environments of its service, with where it deploys mapped to a kubeconfig context and when
+//! it can sync next. Opening one, or a service, shows the dashboard of its service, a tab per
+//! environment (see `dashboard`); its menu opens it in Argo CD's web UI, refreshes or syncs
+//! it. Applications picked together (`grouped`) are diffed at once, the same change in
 //! several of them shown once, or synced at once (`sync`). Every operation seen is kept in a
 //! local journal (`journal`).
 //!
-//! A hub's Applications are read again at the refresh rate; an API server's are kept live
-//! from Argo CD's stream (see `k8s::argo::api`). Both stop while no window shows the page.
+//! Argo CD is read only by its API: each server's Applications are kept live from Argo CD's
+//! stream (see `k8s::argo::api`), which stops while no window shows the page.
 
 use std::cmp::Ordering;
 use std::collections::HashSet;
@@ -26,12 +25,12 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use kube::Client;
 
-use crate::details::{ArgoAction, OpenOn, OpenOnContext, confirm_api_action, confirm_argo_action};
+use crate::details::{ArgoAction, OpenOn, confirm_api_action};
+use crate::k8s;
 use crate::k8s::argo::diagnosis::Res;
 use crate::k8s::argo::grouping::{self, AppKey};
 use crate::k8s::argo::windows::{NextSync, Planner};
-use crate::k8s::argo::{self, ApiRead, Fleet, FleetApp, Source, Summary, api};
-use crate::k8s::{self, ObjectRef};
+use crate::k8s::argo::{self, ApiRead, Fleet, FleetApp, Summary, api};
 use crate::overview::column_cell as column;
 use crate::status::Tone;
 
@@ -270,7 +269,7 @@ fn destination_key(a: &FleetApp) -> &str {
 /// What the search looks in, in lowercase.
 fn searchable(a: &FleetApp) -> String {
     let app = &a.app;
-    let source = a.source.label();
+    let source = a.server.name();
     let parts = [
         app.name.as_str(),
         &app.namespace,
@@ -283,27 +282,20 @@ fn searchable(a: &FleetApp) -> String {
     parts.join(" ").to_lowercase()
 }
 
-/// An Application, the same across reads and sources: its Argo CD, namespace and name.
+/// An Application, the same across reads: its Argo CD, namespace and name.
 type Key = AppKey;
 
 fn key(a: &FleetApp) -> Key {
     (a.instance.clone(), a.app.namespace.clone(), a.app.name.clone())
 }
 
-/// `a` as a favorite: by its Argo CD instance (`FleetApp::instance`, the same whichever way
-/// it is read), namespace and name; read on a hub, also by the hub's own name for its Argo CD
-/// (`context:<hub>`), which a star put before the hub's server was set used. Read by the API,
-/// by the server alone.
+/// `a` as a favorite: by its Argo CD instance (`FleetApp::instance`), namespace and name.
 fn favorite(a: &FleetApp) -> crate::favorites::Favorite {
-    let context = match &a.source {
-        Source::Hub(hub) => Some(hub.context.clone()),
-        Source::Api(_) => None,
-    };
     crate::favorites::Favorite::Application(crate::favorites::FavApp {
         argocd: a.instance.clone(),
         namespace: a.app.namespace.clone(),
         name: a.app.name.clone(),
-        context,
+        context: None,
     })
 }
 
@@ -343,7 +335,7 @@ impl Rows {
         let now = plan.now();
         let apps = &fleet.apps;
         let parents: Vec<Option<usize>> = apps.iter().map(|a| a.parent).collect();
-        let labels_of: Vec<String> = apps.iter().map(|a| a.source.label()).collect();
+        let labels_of: Vec<String> = apps.iter().map(|a| a.server.name()).collect();
         let sort_key = |i: usize| (&apps[i].app.name, &labels_of[i], &apps[i].app.namespace);
         let cmp = |a: usize, b: usize| sort_key(a).cmp(&sort_key(b));
         let order = tree_order(&parents, cmp);
@@ -438,12 +430,8 @@ const RECOMPUTE: Duration = Duration::from_secs(60);
 
 pub struct ArgoView {
     clusters: Vec<(String, Client)>,
-    /// The hubs' Applications, as last read; None before the first read ends.
-    hub: Option<Arc<Fleet>>,
     /// When each Application can sync next, kept for a minute (see `rebuild`).
     plan: Arc<Mutex<Planner>>,
-    /// When the hubs' read shown started: an older one finishing later never replaces it.
-    hub_started: Option<Instant>,
     /// The API servers' feeds this page holds while it is shown.
     watches: Vec<api::Watch>,
     /// What could not be used of the API servers' config.
@@ -465,17 +453,8 @@ pub struct ArgoView {
     /// Which Applications (by index in the rows shown) are favorites, and how many.
     starred: Vec<bool>,
     starred_count: usize,
-    /// Reads the hubs while the page is shown.
-    _poll: Task<()>,
     /// Holds the API servers' feeds while the page is shown.
     _feeds: Task<()>,
-    /// A read right after a write.
-    after_write: crate::latest::Latest,
-    /// With no hub found: the context being asked whether it serves Applications, and what
-    /// the last one asked answered.
-    checking: Option<String>,
-    check_note: Option<String>,
-    check: crate::latest::Latest,
     /// The dashboard of a service, shown instead of the list while it is open.
     dashboard: Option<dashboard::Dashboard>,
     /// The Applications picked, by Argo CD, namespace and name (see `grouped`); how many of
@@ -512,7 +491,6 @@ pub struct OpenArgoApp {
     pub name: String,
 }
 
-impl EventEmitter<OpenOnContext> for ArgoView {}
 impl EventEmitter<OpenOn> for ArgoView {}
 
 impl ArgoView {
@@ -551,23 +529,6 @@ impl ArgoView {
                 cx.notify();
             }),
         ];
-        let poll = {
-            let clusters = clusters.clone();
-            cx.spawn(async move |this, cx| {
-                loop {
-                    let exec = cx.background_executor().clone();
-                    if !crate::app::wait_visible(&this, cx, &exec).await {
-                        break;
-                    }
-                    let started = Instant::now();
-                    let fleet = argo::fleet(clusters.clone()).await;
-                    if this.update(cx, |this, cx| this.set_hub(fleet, started, cx)).is_err() {
-                        break;
-                    }
-                    exec.timer(crate::settings::secs(crate::settings::get().metrics_refresh)).await;
-                }
-            })
-        };
         let feeds = cx.spawn(async move |this, cx| {
             loop {
                 let exec = cx.background_executor().clone();
@@ -613,9 +574,7 @@ impl ArgoView {
         });
         Self {
             clusters,
-            hub: None,
             plan: Arc::new(Mutex::new(Planner::new(jiff::Timestamp::UNIX_EPOCH))),
-            hub_started: None,
             watches: Vec::new(),
             config_errors: Vec::new(),
             rows: None,
@@ -630,12 +589,7 @@ impl ArgoView {
             favorites,
             starred: Vec::new(),
             starred_count: 0,
-            _poll: poll,
             _feeds: feeds,
-            after_write: Default::default(),
-            checking: None,
-            check_note: None,
-            check: Default::default(),
             dashboard: None,
             selected: HashSet::new(),
             picked: 0,
@@ -676,25 +630,10 @@ impl ArgoView {
         self.open_dashboard(&k, cx);
     }
 
-    /// Show a read of the hubs, unless one that started later is shown already.
-    fn set_hub(&mut self, fleet: Fleet, started: Instant, cx: &mut Context<Self>) {
-        if self.hub_started.is_some_and(|shown| shown > started) {
-            return;
-        }
-        self.hub_started = Some(started);
-        self.hub = Some(Arc::new(fleet));
-        self.rebuild(cx);
-    }
-
-    /// Work out the rows again from the hubs' last read and the API servers' feeds, off the
-    /// UI thread. Nothing to show before the hubs are read, unless a server is.
+    /// Work out the rows again from the API servers' feeds, off the UI thread.
     fn rebuild(&mut self, cx: &mut Context<Self>) {
         let feeds: Vec<(Arc<api::Endpoint>, Arc<Mutex<api::FeedState>>)> =
             self.watches.iter().map(|w| (w.endpoint.clone(), w.state.clone())).collect();
-        if self.hub.is_none() && feeds.is_empty() {
-            return;
-        }
-        let hub = self.hub.clone();
         let connected: Vec<String> = self.clusters.iter().map(|(n, _)| n.clone()).collect();
         let config_errors = self.config_errors.clone();
         let (label_key, servers) = crate::settings::with(|s| (s.argocd_group_label.clone(), s.argocd_servers.clone()));
@@ -702,7 +641,6 @@ impl ArgoView {
         let exec = cx.background_executor().clone();
         let work = async move {
             exec.spawn(async move {
-                let mut fleet = hub.map_or_default(|h| (*h).clone());
                 let reads = feeds
                     .into_iter()
                     .map(|(endpoint, state)| ApiRead {
@@ -710,7 +648,7 @@ impl ArgoView {
                         state: state.lock().unwrap_or_else(PoisonError::into_inner).clone(),
                     })
                     .collect();
-                argo::add_api(&mut fleet, reads, &argo::targets(), &connected, &servers);
+                let mut fleet = argo::from_api(reads, &argo::targets(), &connected, &servers);
                 fleet.errors.extend(config_errors);
                 // When each can sync next is worked out anew each minute; in between, the
                 // answers kept are reused (the same windows give the same answer).
@@ -732,100 +670,20 @@ impl ArgoView {
         });
     }
 
-    /// Read the hubs again now (after a write).
-    fn reload(&mut self, cx: &mut Context<Self>) {
-        let (clusters, started) = (self.clusters.clone(), Instant::now());
-        self.after_write.spawn(cx, argo::fleet(clusters), move |this, fleet, cx| {
-            this.set_hub(fleet, started, cx);
-        });
-    }
-
-    /// Ask a context left out of the search (its login may prompt) whether Argo CD runs
-    /// there; if it does, keep it in Settings as the Argo CD cluster and read it.
-    fn check_hub(&mut self, context: String, cx: &mut Context<Self>) {
-        self.checking = Some(context.clone());
-        self.check_note = None;
-        cx.notify();
-        let ctx = context.clone();
-        self.check.spawn(cx, argo::check_hub(context), move |this, answer, cx| {
-            this.checking = None;
-            match answer {
-                Ok(true) => {
-                    crate::settings::update(|s| {
-                        if !s.argocd_contexts.contains(&ctx) {
-                            s.argocd_contexts.push(ctx.clone());
-                        }
-                    });
-                    this.reload(cx);
-                }
-                Ok(false) => this.check_note = Some(format!("{ctx} does not serve Argo CD's Applications.")),
-                Err(why) => this.check_note = Some(format!("{ctx}: {why}")),
-            }
-            cx.notify();
-        });
-    }
-
-    /// What the page shows when no context serves Applications and no Argo CD API server is
-    /// set: why, and the contexts that were not asked because their login may prompt, each
-    /// with a button to ask it.
-    fn no_hub(&self, fleet: &Fleet, cx: &mut Context<Self>) -> AnyElement {
-        /// The most offered: the likeliest first, the rest are in Settings → Contexts.
-        const OFFERED: usize = 12;
-        let theme = cx.theme().clone();
-        let chosen = crate::settings::with(|s| s.argocd_contexts.clone());
-        let intro = if chosen.is_empty() {
-            "No context serves Argo CD's Applications, and no Argo CD server is logged in to. The connected \
-             clusters were asked, and the other contexts that need no login of their own."
-                .to_string()
-        } else {
-            format!(
-                "None of the Argo CD clusters set in Settings → Contexts ({}) serves Argo CD's Applications.",
-                chosen.join(", ")
-            )
-        };
-        let busy = self.checking.is_some();
+    /// What the page shows when no Argo CD server is logged in to or set: how to add one.
+    fn no_server(&self, fleet: &Fleet, cx: &App) -> AnyElement {
+        let theme = cx.theme();
         v_flex()
             .p_4()
             .gap_3()
             .text_sm()
             .text_color(theme.muted_foreground)
-            .child(intro)
+            .child("No Argo CD server is logged in to or set. Argo CD is read only through its API.")
             .child(
-                "Without access to Argo CD's cluster, read Argo CD by its API: log in with `argocd login <server>`, \
-                 or add its address and a token in Settings → Argo CD.",
+                "Log in with `argocd login <server>` (the argocd CLI's servers are read), or add the server's \
+                 address and a token in Settings → Argo CD.",
             )
             .children(fleet.errors.iter().map(|e| div().text_color(theme.danger).child(e.clone())))
-            .when(!fleet.not_asked.is_empty(), |d| {
-                d.child(
-                    "Not asked, because their login may open a browser or ask for something. Pick the one Argo CD \
-                     runs on: once it answers, it is kept as the Argo CD cluster (Settings → Contexts).",
-                )
-                .child(h_flex().flex_wrap().gap_2().children(fleet.not_asked.iter().take(OFFERED).enumerate().map(
-                    |(i, c)| {
-                        let context = c.clone();
-                        Button::new(("argo-hub", i))
-                            .small()
-                            .outline()
-                            .label(c.clone())
-                            .loading(self.checking.as_deref() == Some(c.as_str()))
-                            .disabled(busy)
-                            .on_click(cx.listener(move |this, _, _, cx| this.check_hub(context.clone(), cx)))
-                    },
-                )))
-                .when(fleet.not_asked.len() > OFFERED, |d| {
-                    d.child(format!(
-                        "{} more: tick Argo CD on the one it runs on in Settings → Contexts.",
-                        fleet.not_asked.len() - OFFERED
-                    ))
-                })
-            })
-            .when(fleet.not_asked.is_empty() && chosen.is_empty(), |d| {
-                d.child(
-                    "If Argo CD runs on a cluster not in your kubeconfig, add its kubeconfig in Settings → Kubeconfig.",
-                )
-            })
-            .children(self.checking.as_ref().map(|c| format!("Asking {c}… its login may open in your browser.")))
-            .children(self.check_note.clone().map(|n| div().text_color(theme.warning).child(n)))
             .into_any_element()
     }
 
@@ -941,25 +799,10 @@ impl ArgoView {
         self.rows.as_ref()?.fleet.apps.iter().find(|a| key(a) == *k)
     }
 
-    /// Open the Application's page, on Argo CD's cluster; one read by the API, in Argo CD's
-    /// web UI.
+    /// Open the Application in Argo CD's web UI.
     fn open(&mut self, k: &Key, cx: &mut Context<Self>) {
         let Some(a) = self.find(k) else { return };
-        match &a.source {
-            Source::Hub(hub) => {
-                let obj = ObjectRef {
-                    kind: argo::application_kind(),
-                    name: a.app.name.clone(),
-                    namespace: Some(a.app.namespace.clone()),
-                    uid: String::new(),
-                };
-                let ev = OpenOnContext { context: hub.context.clone(), client: hub.client.clone(), obj };
-                cx.emit(ev);
-            }
-            Source::Api(endpoint) => {
-                crate::forwards::open_web_link(&endpoint.web_url(&a.app.namespace, &a.app.name), cx);
-            }
-        }
+        crate::forwards::open_web_link(&a.server.web_url(&a.app.namespace, &a.app.name), cx);
     }
 
     /// Open the namespace it deploys into, on the context that reaches its cluster.
@@ -970,26 +813,16 @@ impl ArgoView {
         cx.emit(ev);
     }
 
-    /// Confirm, then refresh or sync it, by the way it was read: the hub's Kubernetes API
-    /// (write mode and the hub's protection apply), or Argo CD's API (write mode applies,
-    /// confirmed as a protected context's).
+    /// Confirm, then refresh or sync it by Argo CD's API (write mode applies, confirmed as a
+    /// protected context's).
     fn act(&mut self, k: &Key, action: ArgoAction, window: &mut Window, cx: &mut Context<Self>) {
         let Some(a) = self.find(k).cloned() else { return };
-        match &a.source {
-            Source::Hub(hub) => {
-                let view = cx.entity().downgrade();
-                let done = move |_: &mut Window, cx: &mut App| {
-                    let _ = view.update(cx, Self::reload);
-                };
-                confirm_argo_action(hub, &a.app.namespace, &a.app.name, action, done, window, cx);
-            }
-            Source::Api(endpoint) => confirm_api_action(endpoint, &a.app.namespace, &a.app.name, action, window, cx),
-        }
+        confirm_api_action(&a.server, &a.app.namespace, &a.app.name, action, window, cx);
     }
 
-    /// Several hubs or servers are read: each row says which.
+    /// Several servers are read: each row says which.
     fn several_sources(&self) -> bool {
-        self.rows.as_ref().is_some_and(|r| r.fleet.hubs.len() + r.fleet.servers.len() > 1)
+        self.rows.as_ref().is_some_and(|r| r.fleet.servers.len() > 1)
     }
 
     fn row(&self, i: usize, s: Shown, cx: &Context<Self>) -> AnyElement {
@@ -1117,7 +950,7 @@ impl ArgoView {
             .child(column(70., false).text_color(muted).child(if app.automated { "On" } else { "Off" }))
             .child(column(110., true).text_color(next_color).child(next.text(rows.now)))
             .child(column(190., true).children(last_sync))
-            .when(self.several_sources(), |d| d.child(column(150., true).text_color(muted).child(a.source.label())));
+            .when(self.several_sources(), |d| d.child(column(150., true).text_color(muted).child(a.server.name())));
         h_flex()
             .id(("argo-row", i))
             .group(SharedString::from(format!("argo-row-{i}")))
@@ -1136,7 +969,6 @@ impl ArgoView {
             .child(opener)
             .child(div().w(px(MENU)).flex_none().child(row_menu(
                 &k,
-                matches!(a.source, Source::Api(_)),
                 a.on.is_some() && !a.dest.namespace.is_empty(),
                 Offers::of(app),
                 grouped.then_some(s.ix),
@@ -1425,13 +1257,12 @@ impl Offers {
     }
 }
 
-/// A row's menu: open it (in Argo CD's web UI when read by its API) or where it deploys,
+/// A row's menu: open it in Argo CD's web UI or where it deploys,
 /// pick it with the Applications under it (`group`: its index, when it made some), refresh,
 /// hard refresh, sync, terminate, roll back. Its actions find the Application again by its
 /// key: the list may have been read again since it was drawn.
 fn row_menu(
     k: &Key,
-    by_api: bool,
     has_destination: bool,
     offers: Offers,
     group: Option<usize>,
@@ -1473,11 +1304,7 @@ fn row_menu(
                     let _ = view.update(cx, |this, cx| this.act(&k, action, window, cx));
                 }
             };
-            let open_item = if by_api {
-                PopupMenuItem::new("Open in Argo CD").icon(Lucide::ExternalLink)
-            } else {
-                PopupMenuItem::new("Open").icon(Lucide::PanelRightOpen)
-            };
+            let open_item = PopupMenuItem::new("Open in Argo CD").icon(Lucide::ExternalLink);
             let menu = menu
                 .item(PopupMenuItem::new("Dashboard").icon(Lucide::LayoutDashboard).on_click(board))
                 .item(open_item.on_click(open))
@@ -1533,7 +1360,7 @@ impl Render for ArgoView {
         let theme = cx.theme().clone();
         let body: AnyElement = match &self.rows {
             None => div().p_4().text_color(theme.muted_foreground).child("Reading Argo CD…").into_any_element(),
-            Some(rows) if rows.fleet.hubs.is_empty() && rows.fleet.servers.is_empty() => self.no_hub(&rows.fleet, cx),
+            Some(rows) if rows.fleet.servers.is_empty() => self.no_server(&rows.fleet, cx),
             Some(rows) => {
                 let count = self.lines.len();
                 let summary = rows.fleet.summary((self.filter != Filter::default()).then_some(self.kept));
@@ -1543,7 +1370,7 @@ impl Render for ArgoView {
                     .child(div().pb_1().child(self.selection_bar(cx)))
                     .child(self.header(cx))
                     .child(
-                        // Only the rows on screen are laid out: a hub can hold hundreds of Applications.
+                        // Only the rows on screen are laid out: an Argo CD can hold hundreds of Applications.
                         uniform_list(
                             "argo-apps",
                             count,
@@ -1576,7 +1403,7 @@ impl Render for ArgoView {
                         .px_2()
                         .text_xs()
                         .text_color(theme.danger)
-                        .child("Some Argo CD clusters or servers could not be read:")
+                        .child("Some Argo CD servers could not be read:")
                         .children(errors.into_iter().map(|e| div().child(e))),
                 )
             })
