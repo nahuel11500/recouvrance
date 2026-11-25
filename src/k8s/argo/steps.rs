@@ -352,7 +352,7 @@ mod tests {
         }
     }
 
-    /// A timed-out sync: its PreSync hook still running leads, the succeeded steps fold by
+    /// A timed-out sync: its `PreSync` hook still running leads, the succeeded steps fold by
     /// kind, the most first.
     #[test]
     fn the_cause_comes_first_and_the_rest_folds_by_kind() {

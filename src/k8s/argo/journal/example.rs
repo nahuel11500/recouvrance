@@ -2,8 +2,8 @@
 //! (`RECOUVRANCE_ACT=page:argo,argo-journal-example`).
 //!
 //! - `shop-prod`: a sync that timed out after 30 min, 440 steps: 437 applied, then the
-//!   PostSync wave never came;
-//! - `shop-staging`: a sync running, its PreSync migration still running;
+//!   `PostSync` phase never came;
+//! - `shop-staging`: a sync running, its `PreSync` migration still running;
 //! - `shop-sandbox`: a sync that failed on an invalid Deployment.
 
 use super::{Loaded, Operation, Record, Seen, Step};
