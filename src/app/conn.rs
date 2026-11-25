@@ -92,6 +92,9 @@ pub(super) fn notes(errors: &[String], states: &ConnStates) -> Vec<String> {
 /// fits: a name can start another) named by `name`: its short name on screen, as the other
 /// per-context lines say it, the full one in the hover.
 pub(super) fn notes_line(notes: &[String], contexts: &[&str], name: &dyn Fn(&str) -> String) -> Option<String> {
+    if notes.is_empty() {
+        return None;
+    }
     let mut contexts = contexts.to_vec();
     contexts.sort_by_key(|c| std::cmp::Reverse(c.len()));
     let named = |note: &String| {
@@ -101,7 +104,7 @@ pub(super) fn notes_line(notes: &[String], contexts: &[&str], name: &dyn Fn(&str
             None => note.clone(),
         }
     };
-    (!notes.is_empty()).then(|| notes.iter().map(named).collect::<Vec<_>>().join("; "))
+    Some(notes.iter().map(named).collect::<Vec<_>>().join("; "))
 }
 
 #[cfg(test)]
