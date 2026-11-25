@@ -87,12 +87,13 @@ fn attach_windowless() -> std::io::Result<()> {
             }
         });
     }
-    let asked = stdin.as_mut().map(|i| i.write_all(b"echo ready\r\n").and_then(|()| i.flush()));
+    let asked = stdin.as_mut().map(|i| i.write_all(b"echo recouvrance-ready\r\n").and_then(|()| i.flush()));
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
     let mut seen = Vec::new();
     let ready = loop {
         match rx.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now())) {
-            Ok(Ok(line)) if line == "ready" => break true,
+            // After cmd's prompt, which `/q` doesn't hide.
+            Ok(Ok(line)) if line.ends_with("recouvrance-ready") => break true,
             Ok(line) => seen.push(format!("{line:?}")),
             Err(e) => {
                 seen.push(e.to_string());
