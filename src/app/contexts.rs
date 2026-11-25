@@ -424,7 +424,7 @@ impl AppView {
         let mut changes = k8s::namespace_feed::changes();
         self._namespaces_follow = Some(cx.spawn(async move |this, cx| {
             while changes.changed().await.is_ok() {
-                if this.update(cx, |this, cx| this.namespaces_moved(cx)).is_err() {
+                if this.update(cx, Self::namespaces_moved).is_err() {
                     break;
                 }
             }
@@ -881,7 +881,7 @@ mod tests {
 
     #[test]
     fn the_picker_follows_each_watch_and_keeps_what_is_picked() {
-        let v = |names: &[&str]| names.iter().map(|n| n.to_string()).collect::<Vec<_>>();
+        let v = |names: &[&str]| names.iter().map(ToString::to_string).collect::<Vec<_>>();
         // Two clusters watched, one with accessible namespaces set; a picked namespace
         // deleted since stays offered.
         let all = offered_namespaces(&[v(&["b", "new"]), v(&["a", "b"])], &[v(&["team-x"])], &v(&["gone"]));
