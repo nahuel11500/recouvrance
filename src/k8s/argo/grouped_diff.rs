@@ -330,6 +330,9 @@ pub enum CrossKey {
     OnKind(Fact, String, String),
     /// Noise folded by this rule.
     Noise(&'static str),
+    /// The fields of one resource changed, in one Application (`by_resource`): its group,
+    /// kind and name.
+    Resource(String, String, String),
 }
 
 /// Whether a fact is the resource's own (the same only in a resource of the same name).
@@ -469,7 +472,7 @@ pub fn regroup(diffs: &[Option<&SmartDiff>], names: &[Names], noise: bool) -> Ve
     }
     let rank = |k: &CrossKey| match k {
         CrossKey::Fact(f) | CrossKey::OnKind(f, ..) => f.rank(),
-        CrossKey::Noise(_) => u8::MAX,
+        CrossKey::Noise(_) | CrossKey::Resource(..) => u8::MAX,
     };
     let mut out: Vec<(u8, usize, Cross)> = by
         .into_iter()
@@ -485,6 +488,7 @@ pub fn regroup(diffs: &[Option<&SmartDiff>], names: &[Names], noise: bool) -> Ve
                 }
                 CrossKey::OnKind(shaped, group, kind) => own_line(shaped, &kind_text(group, kind), &places),
                 CrossKey::Noise(rule) => (format!("noise: {rule}"), Vec::new()),
+                CrossKey::Resource(_, kind, name) => (format!("{kind} {name}"), Vec::new()),
             };
             let apps = places.into_iter().map(|(a, (r, _))| (a, r)).collect();
             (rank(&k), resources, Cross { key: k, text, apps, differs })
@@ -494,6 +498,130 @@ pub fn regroup(diffs: &[Option<&SmartDiff>], names: &[Names], noise: bool) -> Ve
         ra.cmp(rb).then(b.apps.len().cmp(&a.apps.len())).then(nb.cmp(na)).then(a.text.cmp(&b.text))
     });
     out.into_iter().map(|(_, _, c)| c).collect()
+}
+
+/// One Application's changes (`regroup` of it alone), with the fields changed on only one
+/// resource said in one line for that resource instead of one line each: a PrometheusRule
+/// with 4 rules edited is `PrometheusRule alerts: spec.groups[app].rules[13, 14, 15, 16]
+/// changed: annotations, expr (16 fields)`; its fields are in its row's diff. A field changed
+/// alike on several resources stays one line on their kind, an image or replicas one line.
+pub fn by_resource(diff: &SmartDiff) -> Vec<Cross> {
+    let groups = regroup(&[Some(diff)], &[], false);
+    // The fields on one resource only, by resource.
+    let mut fields: BTreeMap<usize, Vec<(String, smartdiff::Edit)>> = BTreeMap::new();
+    let one = |c: &Cross| match (&c.key, c.apps.as_slice()) {
+        (CrossKey::OnKind(Fact::Field { path, edit, .. }, ..), [(_, at)]) if at.len() == 1 => {
+            Some((at[0], path.clone(), *edit))
+        }
+        _ => None,
+    };
+    for c in &groups {
+        if let Some((r, path, edit)) = one(c) {
+            fields.entry(r).or_default().push((path, edit));
+        }
+    }
+    let mut out = Vec::with_capacity(groups.len());
+    let mut said: BTreeSet<usize> = BTreeSet::new();
+    for c in groups {
+        let Some((r, _, _)) = one(&c).filter(|(r, _, _)| fields[r].len() > 1) else {
+            out.push(c);
+            continue;
+        };
+        // In the place of its first field's line.
+        if !said.insert(r) {
+            continue;
+        }
+        let key = &diff.resources[r].key;
+        let kind = kind_text(&key.group, &key.kind);
+        out.push(Cross {
+            key: CrossKey::Resource(key.group.clone(), key.kind.clone(), key.name.clone()),
+            text: format!("{kind} {}: {}", key.name, fields_text(&fields[&r])),
+            apps: c.apps,
+            differs: Vec::new(),
+        });
+    }
+    out
+}
+
+/// Fields shown by name in a resource's line, at most; the others counted.
+const FIELDS_NAMED: usize = 4;
+
+/// A path's segments: `spec.groups[app].rules[3].expr` is `spec`, `groups[app]`, `rules[3]`,
+/// `expr` (a dot in brackets doesn't cut); an annotation's or a label's key is one.
+fn segments(path: &str) -> Vec<String> {
+    for meta in ["metadata.annotations.", "metadata.labels."] {
+        if let Some(key) = path.strip_prefix(meta) {
+            return vec!["metadata".into(), meta["metadata.".len()..meta.len() - 1].into(), key.into()];
+        }
+    }
+    let mut out = vec![String::new()];
+    let mut depth = 0usize;
+    for c in path.chars() {
+        match c {
+            '[' => depth += 1,
+            ']' => depth = depth.saturating_sub(1),
+            '.' if depth == 0 => {
+                out.push(String::new());
+                continue;
+            }
+            _ => {}
+        }
+        out.last_mut().expect("never empty").push(c);
+    }
+    out
+}
+
+/// Names, the first `FIELDS_NAMED` of them, then how many more.
+fn some(names: &[String]) -> String {
+    let mut shown: Vec<String> = names.iter().take(FIELDS_NAMED).cloned().collect();
+    if names.len() > FIELDS_NAMED {
+        shown.push(format!("+{} more", names.len() - FIELDS_NAMED));
+    }
+    shown.join(", ")
+}
+
+/// Several fields of one resource in a few words: where they are (the path they share, and
+/// the items of a list they are in), how they changed, the fields under it, and how many.
+fn fields_text(fields: &[(String, smartdiff::Edit)]) -> String {
+    let edit = match fields.first() {
+        Some((_, e)) if fields.iter().all(|(_, f)| f == e) => e.word(),
+        _ => "changed",
+    };
+    let paths: Vec<Vec<String>> = fields.iter().map(|(p, _)| segments(p)).collect();
+    let common = (0..).take_while(|&i| paths.iter().all(|p| p.len() > i + 1 && p.get(i) == paths[0].get(i))).count();
+    let distinct = |at: usize| {
+        let mut seen: Vec<String> = Vec::new();
+        for p in &paths {
+            if let Some(s) = p.get(at).filter(|s| !seen.contains(s)) {
+                seen.push(s.clone());
+            }
+        }
+        seen
+    };
+    let mut place: Vec<String> = paths[0][..common].to_vec();
+    // Items of one list: `rules[13, 14]`, and the fields under them.
+    let list = paths.iter().map(|p| p.get(common).and_then(|s| s.split_once('['))).collect::<Option<Vec<_>>>();
+    let under = match list {
+        Some(items) if items.iter().all(|(name, _)| *name == items[0].0) => {
+            let mut at: Vec<String> = Vec::new();
+            for (_, i) in &items {
+                let i = i.trim_end_matches(']').to_string();
+                if !at.contains(&i) {
+                    at.push(i);
+                }
+            }
+            place.push(format!("{}[{}]", items[0].0, some(&at)));
+            distinct(common + 1)
+        }
+        _ => distinct(common),
+    };
+    let place = place.join(".");
+    let count = crate::plural::count(fields.len(), "field");
+    match (place.is_empty(), under.is_empty()) {
+        (true, _) => format!("{count} {edit}: {}", some(&under)),
+        (false, true) => format!("{place} {edit} ({count})"),
+        (false, false) => format!("{place} {edit}: {} ({count})", some(&under)),
+    }
 }
 
 /// Where a change is in one Application and what it says there (see [`Seen`]).

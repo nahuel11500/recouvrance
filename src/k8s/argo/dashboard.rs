@@ -938,7 +938,8 @@ pub struct Cards {
     /// values masked), from the managed resources; None when they weren't read.
     pub smart: Option<Arc<super::grouped_diff::AppDiff>>,
     /// What it changes, each change once with where, grouped as the grouped diff groups them
-    /// (a field added on 36 Deployments is one): images first.
+    /// (a field added on 36 Deployments is one), the fields of one resource in one line
+    /// (`grouped_diff::by_resource`): images first.
     pub changes: Vec<super::grouped_diff::Cross>,
     pub history: History,
     pub note: Option<String>,
@@ -967,8 +968,7 @@ impl Cards {
         let commits = read.commits.into_iter().chain(std::iter::repeat(None));
         // Worked out here, off the UI thread, with every line.
         let smart = read.managed.as_ref().map(|m| Arc::new(super::grouped_diff::AppDiff::of(m)));
-        let changes =
-            smart.as_ref().map_or_else(Vec::new, |s| super::grouped_diff::regroup(&[Some(&s.diff)], &[], false));
+        let changes = smart.as_ref().map_or_else(Vec::new, |s| super::grouped_diff::by_resource(&s.diff));
         Self {
             summary: Summary::of(app),
             state: state(app, tree),

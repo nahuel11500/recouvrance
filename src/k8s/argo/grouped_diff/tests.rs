@@ -8,8 +8,8 @@ use futures::StreamExt as _;
 use serde_json::{Value, json};
 
 use super::{
-    AppDiff, Names, PARALLEL, cached, errors_by_text, kind_text, not_compared, read_all, regroup, sides, summary,
-    summary_lines,
+    AppDiff, Names, PARALLEL, by_resource, cached, errors_by_text, kind_text, not_compared, read_all, regroup, sides,
+    summary, summary_lines,
 };
 use crate::k8s::argo::Summary;
 use crate::smartdiff::SmartDiff;
@@ -396,4 +396,77 @@ proptest::proptest! {
         }
         proptest::prop_assert_eq!(n.apply(&once), once);
     }
+}
+
+fn rules(ns: &str, edited: &[usize]) -> Value {
+    let rule = |i: usize| {
+        let to = if edited.contains(&i) { "2" } else { "1" };
+        json!({"alert": format!("A{i}"), "expr": format!("up > {to}"),
+            "annotations": {"summary": format!("down {to}"), "runbook": "r"}})
+    };
+    json!({"apiVersion": "monitoring.coreos.com/v1", "kind": "PrometheusRule",
+        "metadata": {"name": "alerts", "namespace": ns},
+        "spec": {"groups": [{"name": "app", "rules": (0..4).map(rule).collect::<Vec<_>>()}]}})
+}
+
+fn labeled(ns: &str, name: &str, team: Option<&str>) -> Value {
+    let mut d = deploy(ns, "1.15", 3);
+    d["metadata"]["name"] = json!(name);
+    if let Some(team) = team {
+        d["metadata"]["labels"] = json!({"team": team});
+    }
+    d
+}
+
+/// One Application's diff says a resource's fields in one line for it (they show unfolded,
+/// in its row): a PrometheusRule with two rules edited is one line, not one per field. A
+/// field alike on several resources stays one line on their kind; a lone field its own line.
+#[test]
+fn one_application_says_a_resource_once_whatever_its_fields() {
+    let ns = "shop";
+    let d = AppDiff::of(&json!({"items": [
+        res("monitoring.coreos.com", "PrometheusRule", ns, "alerts", Some(rules(ns, &[])), Some(rules(ns, &[2, 3]))),
+        res("apps", "Deployment", ns, "web", Some(labeled(ns, "web", None)), Some(labeled(ns, "web", Some("a")))),
+        res("apps", "Deployment", ns, "api", Some(labeled(ns, "api", None)), Some(labeled(ns, "api", Some("a")))),
+        res("", "ConfigMap", ns, "app-config", Some(config(ns, "app-config", "info")),
+            Some(config(ns, "app-config", "debug"))),
+    ]}));
+    let fields = regroup(&[Some(&d.diff)], &[], false);
+    assert!(fields.len() > 5, "one line per field before: {:?}", texts(&fields));
+    let groups = by_resource(&d.diff);
+    assert_eq!(
+        texts(&groups),
+        [
+            "ConfigMap app-config key LOG_LEVEL changed",
+            "2 Deployments: label team added: a",
+            "PrometheusRule alerts: spec.groups[app].rules[2, 3] changed: annotations, expr (4 fields)",
+        ],
+        "{:?}",
+        texts(&fields)
+    );
+    let rule = groups.iter().find(|g| g.text.starts_with("PrometheusRule")).unwrap();
+    assert_eq!(rule.apps.len(), 1);
+    assert_eq!(d.diff.resources[rule.apps[0].1[0]].key.name, "alerts");
+}
+
+/// A resource's fields in a few words: the list items they are in and the fields under them,
+/// a shared place, or only how many.
+#[test]
+fn a_resource_s_fields_in_a_few_words() {
+    use crate::smartdiff::Edit::{Added, Changed};
+    let f = |paths: &[&str], edit| -> String {
+        super::fields_text(&paths.iter().map(|p| ((*p).to_string(), edit)).collect::<Vec<_>>())
+    };
+    assert_eq!(
+        f(&["spec.template.spec.containers[web].image", "spec.template.spec.containers[web].args"], Changed),
+        "spec.template.spec.containers[web] changed: image, args (2 fields)"
+    );
+    assert_eq!(f(&["spec.a", "data.b"], Added), "2 fields added: spec, data");
+    assert_eq!(
+        f(&["metadata.annotations.x.io/a", "metadata.annotations.x.io/b"], Changed),
+        "metadata.annotations changed: x.io/a, x.io/b (2 fields)"
+    );
+    let many: Vec<String> = (0..6).map(|i| format!("spec.rules[{i}].expr")).collect();
+    let many: Vec<&str> = many.iter().map(String::as_str).collect();
+    assert_eq!(f(&many, Changed), "spec.rules[0, 1, 2, 3, +2 more] changed: expr (6 fields)");
 }
