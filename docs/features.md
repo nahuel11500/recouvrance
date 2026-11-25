@@ -569,14 +569,14 @@
   applied (`configmap/web serverside-applied`) is left out. *Steps: status, kind, name…*
   filters them. The dashboard's Last sync → steps shows the same. A line that doesn't read is skipped and counted (*2 lines of the journal
   could not be read and were skipped*), never breaking the rest.
-- **Argo CD sync, terminate and roll back**: *Sync* (the Application's page, its row menu, the
+- **Argo CD sync, terminate and roll back**: *Sync* (the dashboard, its row menu, the
   Argo CD panel) reads the Application first and lists its resources out of sync, all ticked:
   untick some to sync only the others (hooks run only when all are synced; past 200 the whole
   Application syncs). *Prune*, off by default, names exactly what it deletes (out of sync and no
   longer in git, of the resources ticked), and a sync that would now delete more is refused;
   *Dry run* applies nothing, and what Argo CD would do is shown when it ends (waited for up to
   30 s). *Terminate* stops the operation running, as `argocd app terminate-op` does, also when it
-  holds the Application's deletion. *Roll back…* on a past deployment (the Application's page, the
+  holds the Application's deletion. *Roll back…* on a past deployment (the dashboard, the
   Argo CD panel, the row menu for the previous one) applies that deployment's revision and
   sources again, without hooks or prune, as `argocd app rollback` does: the deployment the dialog
   names is the one sent, even if another lands meanwhile. With auto-sync on it is disabled, since
@@ -622,14 +622,11 @@
   Secret's values never are. The field managers that wrote the object since the last sync are
   named too (with server-side apply that is all there is). A destination that isn't connected
   is said; open it to connect.
-- **Argo CD's own diff** (off until set up): with the hub context's Argo CD server set in
-  Settings → Per cluster, an Application's page offers *Show Argo CD's diff*: what a sync would
-  change, as Argo CD renders it from git (Helm and Kustomize applied), against the live objects.
-  Each resource that differs (changed, created by the sync, or no longer in git) is shown as a
-  diff from live to git, the first ones open and the others a click away; hooks are left out and
-  Secret values are hidden. It is one read-only request to that server, sent on the click, with
-  the argocd CLI's login to it or a read-only token set in Settings (see
-  [configuration](configuration.md#argo-cds-diff-argocd_servers)).
+- **An Application opened as a Kubernetes object** (its page on a cluster that holds Argo CD's
+  Applications) is read only: its status, deployments, resources and diagnosis, and *Open in
+  Argo CD* when a connected Argo CD server holds it (the same `metadata.uid`, from what the
+  servers' feeds hold), which opens its dashboard on the Argo CD page, where it is acted on and
+  its diff read through Argo CD's API. Otherwise the page says no connected Argo CD has it.
 - **Assistant beside any page** (Ctrl+J, ⌘J on macOS, or the sparkles button in the top bar): the
   window's assistant chat opens on the right of the page shown, the same chat as on its own page (the
   expand button opens it there). It is told what is on screen, as its header shows: the

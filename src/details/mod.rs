@@ -238,9 +238,6 @@ pub struct DetailPanel {
     schema_rows: Vec<crate::overview::SchemaRow>,
     /// An Application's resources table, worked out when it is read rather than on every frame.
     argo_resources: crate::overview::ArgoResources,
-    /// An Application's diff as Argo CD renders it from git (read on a click), and its read.
-    argo_git: crate::overview::ArgoGitDiff,
-    argo_git_load: crate::latest::Latest,
     /// The alert whose rule is shown on the overview (read on a click), and its read.
     alert_rule: crate::overview::AlertRule,
     alert_rule_load: crate::latest::Latest,
@@ -514,8 +511,6 @@ impl DetailPanel {
             argo_load: Default::default(),
             schema_rows: Vec::new(),
             argo_resources: Default::default(),
-            argo_git: Default::default(),
-            argo_git_load: Default::default(),
             alert_rule: Default::default(),
             alert_rule_load: Default::default(),
             data_editor: None,
@@ -1418,9 +1413,7 @@ impl DetailPanel {
             pod_order: self.pod_order,
             argo: &self.argo,
             argo_resources: &self.argo_resources,
-            argo_git: &self.argo_git,
             alert_rule: &self.alert_rule,
-            context: &self.context,
         }
     }
 

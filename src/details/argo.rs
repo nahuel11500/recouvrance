@@ -3,7 +3,8 @@
 //! only when no server has it, until it goes, #1054), opening one, and its actions (Refresh,
 //! Sync, Terminate, Roll back): by Argo CD's API (`confirm_api_action`) for one read there,
 //! with the hub's client (`confirm_argo_action`, Sync with its options) for one read on a hub.
-//! The Argo CD page asks the same of its rows.
+//! The Argo CD page asks the same of its rows. An Application opened as a Kubernetes object
+//! is not acted on from its page: it opens on the Argo CD page, found by its uid.
 
 use std::rc::Rc;
 use std::sync::Arc;
@@ -590,6 +591,15 @@ impl DetailPanel {
         let (context, kind) = (self.context.clone(), &self.obj.kind);
         let work: std::pin::Pin<Box<dyn Future<Output = Lookup>>> = if kind.is("", "Namespace") {
             Box::pin(k8s::argo::for_namespace(connected, context, self.obj.name.clone()))
+        } else if kind.is("argoproj.io", "Application") {
+            // Its own Application: the Argo CD server that holds it (by uid), and its parent.
+            let uid = obj.pointer("/metadata/uid").and_then(Value::as_str).unwrap_or_default().to_string();
+            let parent = k8s::argo::for_object(connected, context, kind.ar.group.clone(), kind.ar.kind.clone(), obj);
+            Box::pin(async move {
+                let (mut lookup, own) = futures::join!(parent, k8s::argo::api_by_uid(uid));
+                lookup.own = Some(own);
+                lookup
+            })
         } else {
             Box::pin(k8s::argo::for_object(connected, context, kind.ar.group.clone(), kind.ar.kind.clone(), obj))
         };
@@ -679,18 +689,12 @@ impl DetailPanel {
         }
     }
 
-    /// Confirm, then run `action` on the Application of this page (its cluster is Argo CD's).
-    pub fn confirm_own_argo(&mut self, action: ArgoAction, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(ns) = self.obj.namespace.clone() else { return };
-        let hub = Hub { context: self.context.clone(), client: self.client.clone() };
-        let panel = cx.entity().downgrade();
-        let done = move |window: &mut Window, cx: &mut App| {
-            let _ = panel.update(cx, |this, cx| {
-                this.refresh_object(false, window, cx);
-                this.load_events(cx);
-            });
-        };
-        confirm_argo_action(&hub, &ns, &self.obj.name, action, done, window, cx);
+    /// Open the Application of this page on the Argo CD page's dashboard, on the Argo CD
+    /// server found holding it (the same `metadata.uid`).
+    pub fn open_own_in_argo(&mut self, cx: &mut Context<Self>) {
+        let Some(Ok(endpoint)) = &self.argo.own else { return };
+        let namespace = self.obj.namespace.clone().unwrap_or_else(|| k8s::argo::DEFAULT_NAMESPACE.into());
+        cx.emit(OpenArgoApp { instance: endpoint.instance(), namespace, name: self.obj.name.clone() });
     }
 
     /// Open the namespace this Application deploys into, on the context that reaches it.
@@ -704,27 +708,6 @@ impl DetailPanel {
     /// Show the Application's resources out of sync or unhealthy alone, or all of them again.
     pub fn toggle_argo_attention(&mut self, cx: &mut Context<Self>) {
         self.argo_resources.alone = !self.argo_resources.alone;
-        cx.notify();
-    }
-
-    /// Read this Application's diff from its Argo CD's API server: one GET, read-only, sent
-    /// only on this click. A click again replaces the read running.
-    pub fn load_argo_git_diff(&mut self, cx: &mut Context<Self>) {
-        let Some(ns) = self.obj.namespace.clone() else { return };
-        self.argo_git.loading = true;
-        let read = k8s::argo::server::git_diff(self.context.clone(), ns, self.obj.name.clone());
-        self.argo_git_load.spawn(cx, read, |this, read, cx| {
-            this.argo_git.set(read);
-            cx.notify();
-        });
-        cx.notify();
-    }
-
-    /// Show or hide the diff of the resource at `i` in Argo CD's diff.
-    pub fn toggle_argo_git(&mut self, i: usize, cx: &mut Context<Self>) {
-        if !self.argo_git.open.remove(&i) {
-            self.argo_git.open.insert(i);
-        }
         cx.notify();
     }
 }

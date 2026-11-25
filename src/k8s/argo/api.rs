@@ -34,7 +34,7 @@ use super::{DEFAULT_NAMESPACE, Summary, TRACKING_ID};
 #[cfg(all(test, feature = "dev"))]
 pub(crate) mod fake;
 mod held;
-pub use held::{held_apps, held_states};
+pub use held::{Held, held_apps, held_states};
 
 /// Where the tokens set in Settings → Argo CD are kept, by server address (mode 0600).
 const TOKENS_FILE: &str = "argocd-api-tokens.json";
@@ -57,8 +57,10 @@ const MAX_PROJECTS: usize = 50;
 const PROJECTS_EVERY: Duration = Duration::from_secs(5 * 60);
 
 /// The fields of an Application the page reads; the rest is not sent (`fields`).
-const APP_FIELDS: [&str; 27] = [
+const APP_FIELDS: [&str; 28] = [
     "metadata.name",
+    // To find the Application opened as a Kubernetes object.
+    "metadata.uid",
     "metadata.namespace",
     "metadata.creationTimestamp",
     "metadata.labels",
@@ -688,8 +690,9 @@ fn put(out: &mut Value, path: &[&str], v: Value) {
 /// ignore `fields`). Memory stays small however many there are: no resources, no
 /// manifests, the history's last deployments without their sources.
 pub fn lean(app: &Value) -> Value {
-    const KEPT: [&str; 19] = [
+    const KEPT: [&str; 20] = [
         "/metadata/name",
+        "/metadata/uid",
         "/metadata/namespace",
         "/metadata/creationTimestamp",
         "/metadata/labels",
