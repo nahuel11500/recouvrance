@@ -42,7 +42,8 @@ Useful variables: `RECOUVRANCE_PAGE` (`apply`, `settings`, `cluster`, `access`, 
 `RECOUVRANCE_FILTER`, `RECOUVRANCE_ACT` (comma-separated hooks, see `src/app/demo.rs` and
 `src/details/demo.rs`; `timeline:all` shows every event on the Timeline, `page:argo,argo-example`
 shows the Argo CD dashboard on a made-up example, no real data, `page:argo,argo-journal-example`
-its sync journal, `page:argo,argo-example-list` its list of environments, and `page:argo,argo-sync-example-oos` (or
+its sync journal, `page:argo,argo-example-list` its list of environments,
+`page:argo,argo-example-overview` its overview, and `page:argo,argo-sync-example-oos` (or
 `-example`, `-example-oos-armed`) its grouped sync), `RECOUVRANCE_INPUT`
 (`click:x,y;key:enter;wait:2`; `shot:name.png` saves a frame next to the snapshot, for
 recordings), `RECOUVRANCE_WRITES=1`, `RECOUVRANCE_DARK=1`, `RECOUVRANCE_ZOOM`,

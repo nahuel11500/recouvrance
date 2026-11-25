@@ -37,7 +37,7 @@ impl KubeMcp {
     }
 
     #[tool(
-        description = "Check calls you plan against your rules without making them: for each request (context, verb, kind, namespace, name), whether it is allowed, needs the user's approval or is denied, the rule that decides, and for a denial whether it is final (a Deny rule) or the rule the user could add. Use it before a task that needs several calls, to tell the user up front what to approve or grant. The verb is the rules' verb, not the tool: set_image, rollout_undo, rollout_pause, rollout_resume and patch_resource need patch; rollout_restart restart; apply_manifest apply on each object; trigger_cronjob get on the CronJob and apply on its Job; cordon_node, uncordon_node and drain_node drain on the node; evict_pod delete on the pod; refresh_external_secret refresh on the ExternalSecret; exec_command, debug_pod and browse_files exec on the pod; port_forward forward; get_logs logs; gitops refresh (refresh, hard_refresh), sync (sync, reconcile, terminate, rollback) or suspend (suspend, resume) on the object, and get for diagnose; argocd_apps list on applications.argoproj.io on the hub.",
+        description = "Check calls you plan against your rules without making them: for each request (context, verb, kind, namespace, name), whether it is allowed, needs the user's approval or is denied, the rule that decides, and for a denial whether it is final (a Deny rule) or the rule the user could add. Use it before a task that needs several calls, to tell the user up front what to approve or grant. The verb is the rules' verb, not the tool: set_image, rollout_undo, rollout_pause, rollout_resume and patch_resource need patch; rollout_restart restart; apply_manifest apply on each object; trigger_cronjob get on the CronJob and apply on its Job; cordon_node, uncordon_node and drain_node drain on the node; evict_pod delete on the pod; refresh_external_secret refresh on the ExternalSecret; exec_command, debug_pod and browse_files exec on the pod; port_forward forward; get_logs logs; gitops refresh (refresh, hard_refresh), sync (sync, reconcile, terminate, rollback) or suspend (suspend, resume) on the object, and get for diagnose; gitops, wait_for, argocd_apps and argocd_diff on an Argo CD Application: its verb on applications.argoproj.io where it deploys (each context reaching its destination, its destination namespace), never the Argo CD server.",
         annotations(read_only_hint = true)
     )]
     async fn check_access(
@@ -287,7 +287,7 @@ impl KubeMcp {
     }
 
     #[tool(
-        description = "Describe one object like `kubectl describe`: key fields, conditions, recent events, for workloads/services the pods behind it with their status and restarts, and the Argo CD Application that deployed it (by its tracking id or instance label; its sync and health read on its hub where your Allow rules let you). Start here when investigating a problem.",
+        description = "Describe one object like `kubectl describe`: key fields, conditions, recent events, for workloads/services the pods behind it with their status and restarts, and the Argo CD Application that deployed it (by its tracking id or instance label; its sync and health read through Argo CD's API where your Allow rules let you get or list it where it deploys). Start here when investigating a problem.",
         annotations(read_only_hint = true)
     )]
     async fn describe_resource(
@@ -695,7 +695,7 @@ impl KubeMcp {
     }
 
     #[tool(
-        description = "What is broken: crash-looping or pending pods, unavailable Deployments/StatefulSets/DaemonSets, NotReady nodes and nodes a taint keeps pods off because something is wrong (an agent not ready, being removed), failed Jobs, CronJobs that stopped running or whose runs keep failing, pending PVCs, PVCs over 90% of their space or inodes (from the cluster's Prometheus), ExternalSecrets and secret stores that fail to sync, cert-manager Certificates not Ready or not renewed and TLS Secrets whose certificate expired or ends soon, Services that select no pod or no ready one, references to objects that don't exist (a pod's ConfigMaps, Secrets and PVCs, a workload's ServiceAccount, a pending PVC's StorageClass, an Ingress's Services, ports and TLS Secrets, an HTTPRoute's Services), objects stuck deleting (Namespaces, PVs, Argo CD Applications too) with the finalizers holding them, Argo CD Applications deploying to the cluster that need attention (Degraded, a failed sync, an *Error condition, a sync running for more than 10 minutes, Missing with auto-sync on; listed under the namespace they deploy to, the PROBLEM naming the Application's own namespace and hub to read it with, and shown when your rules let you list Applications there), and alerts firing in the cluster's Prometheus (not silenced). Worst first. Start here when asked to troubleshoot. Answers from the app's latest scan of the cluster while it is recent, and says how old it is; after a fix, pass max_age_seconds: 0 to check it on a new scan.",
+        description = "What is broken: crash-looping or pending pods, unavailable Deployments/StatefulSets/DaemonSets, NotReady nodes and nodes a taint keeps pods off because something is wrong (an agent not ready, being removed), failed Jobs, CronJobs that stopped running or whose runs keep failing, pending PVCs, PVCs over 90% of their space or inodes (from the cluster's Prometheus), ExternalSecrets and secret stores that fail to sync, cert-manager Certificates not Ready or not renewed and TLS Secrets whose certificate expired or ends soon, Services that select no pod or no ready one, references to objects that don't exist (a pod's ConfigMaps, Secrets and PVCs, a workload's ServiceAccount, a pending PVC's StorageClass, an Ingress's Services, ports and TLS Secrets, an HTTPRoute's Services), objects stuck deleting (Namespaces, PVs, Argo CD Applications too) with the finalizers holding them, Argo CD Applications deploying to the cluster that need attention (Degraded, a failed sync, an *Error condition, a sync running for more than 10 minutes, Missing with auto-sync on; listed under the namespace they deploy to, the PROBLEM naming the Application's own namespace and Argo CD server to act on it with, and shown when your rules let you list Applications there), and alerts firing in the cluster's Prometheus (not silenced). Worst first. Start here when asked to troubleshoot. Answers from the app's latest scan of the cluster while it is recent, and says how old it is; after a fix, pass max_age_seconds: 0 to check it on a new scan.",
         annotations(read_only_hint = true)
     )]
     async fn find_problems(
@@ -724,9 +724,11 @@ impl KubeMcp {
         };
         let ask = || shared::Ask { client: client.clone(), kinds: kinds.to_vec(), record: false };
         let found = shared::fresh(&scope, fresh, Lane::Foreground, ask).await.unwrap_or_default();
-        // A hub or an Argo CD server the agent's rules don't open is not named to it.
+        // An Argo CD server not read is named to an agent whose rules may show it Applications
+        // deploying here; to no other.
+        let argo_open = super::argo_tools::argo_open_on(call.policy(), &p.context);
         let skipped = found
-            .skipped_where(|s| argo_apps::skipped_hub(s).is_none_or(|hub| call.policy().context_allowed(hub)))
+            .skipped_where(|s| argo_apps::skipped_hub(s).is_none() || argo_open)
             .map(|s| format!("Not checked, could not read {s}."));
         let scanned = found.done.map(|d| {
             let ago = i64::try_from(d.started.elapsed().as_secs()).unwrap_or(i64::MAX);
@@ -739,14 +741,10 @@ impl KubeMcp {
             .filter(|x| minor || x.severity != crate::problems::Severity::Info)
             .filter(|x| {
                 // Only what this agent may see. An Argo CD Application: the rules for
-                // Applications where it was read decide.
-                if let Some(on) = &x.on_hub {
-                    return problem_visible(
-                        call.policy(),
-                        call.approved_rules(),
-                        false,
-                        &argo_problem_access(on, &x.name),
-                    );
+                // Applications where it deploys (here) decide, in its destination namespace.
+                if x.on_hub.is_some() {
+                    let a = super::argo_tools::problem_access(&p.context, x.namespace.as_deref(), &x.name);
+                    return problem_visible(call.policy(), call.approved_rules(), false, &a);
                 }
                 k8s::find_kind(&kinds, &x.kind).is_some_and(|k| {
                     let a = access_for(k, &p.context, Verb::List, x.namespace.clone(), Some(x.name.clone()));
@@ -1110,44 +1108,14 @@ fn container_lines(pod: &serde_json::Value) -> String {
     out
 }
 
-/// What an agent's rules decide on to see an Argo CD Application a scan found: listing
-/// Applications, in its own namespace, where it was read: on its hub context, or on the Argo
-/// CD server it was read from by Argo CD's API, which rules name by the server's name.
-fn argo_problem_access(on: &crate::problems::OnHub, name: &str) -> crate::mcp::Access {
-    let app = k8s::argo::application_kind();
-    access_for(&app, &on.context, Verb::List, Some(on.namespace.clone()), Some(name.to_string()))
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
 
     use serde_json::json;
 
-    use super::{KubeMcp, Measured, Mode, NEVER_ASKS, Policy, container_lines, dry_run_tools, measured, permissions};
+    use super::{KubeMcp, Measured, NEVER_ASKS, Policy, container_lines, dry_run_tools, measured, permissions};
     use crate::k8s::Kind;
-
-    /// An Application read from an Argo CD server is shown to an agent by its rules for that
-    /// server (by its name, as its protection is), not those of the cluster it deploys to.
-    #[test]
-    fn an_application_read_from_a_server_is_seen_by_its_rules() {
-        let allow = |r: &str| Policy {
-            rules: vec![crate::mcp::rules_file::parse_rule(Mode::Allow, r).unwrap()],
-            ..Policy::default()
-        };
-        let on = crate::problems::OnHub {
-            context: "argocd.example.com".into(),
-            namespace: "argocd".into(),
-            server: Some("https://argocd.example.com".into()),
-        };
-        let a = super::argo_problem_access(&on, "web");
-        let seen = |r: &str| super::problem_visible(&allow(r), &[], false, &a);
-        assert!(seen("list applications.argoproj.io --context argocd.example.com"));
-        assert!(seen("list applications.argoproj.io -n argocd --context argocd.example.com"));
-        assert!(!seen("list applications.argoproj.io -n other --context argocd.example.com"));
-        assert!(!seen("list applications.argoproj.io --context prod"));
-        assert!(!seen("list pods --context argocd.example.com"));
-    }
 
     /// `my_permissions` names every tool whose input takes `dry_run`, and no other: a list kept
     /// by hand named 5 of 13 (#843).

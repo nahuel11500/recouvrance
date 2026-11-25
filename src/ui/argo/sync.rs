@@ -290,7 +290,7 @@ impl ArgoView {
     /// `armed` for the second click asked with production environments among them.
     #[cfg(feature = "dev")]
     pub fn demo_sync(&mut self, how: &str, cx: &mut Context<Self>) {
-        self.demo_list(cx);
+        self.demo_list(true, cx);
         let Some(listed) = &self.rows else { return };
         let apps: Vec<FleetApp> = listed
             .fleet

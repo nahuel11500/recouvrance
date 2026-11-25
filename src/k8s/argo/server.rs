@@ -266,6 +266,18 @@ pub(super) fn expired(token: &str, now: i64) -> bool {
     serde_json::from_slice::<Value>(&bytes).ok().and_then(|v| v.get("exp")?.as_i64()).is_some_and(|exp| exp <= now)
 }
 
+/// Who a JWT is for, as a login: its `preferred_username`, else its `email`'s local part. None
+/// when it isn't a JWT or names no one.
+pub(super) fn token_user(token: &str) -> Option<String> {
+    let payload = token.split('.').nth(1)?;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(payload.trim_end_matches('=')).ok()?;
+    let claims = serde_json::from_slice::<Value>(&bytes).ok()?;
+    let text = |k: &str| claims.get(k).and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty());
+    text("preferred_username")
+        .or_else(|| text("email").and_then(|e| e.split('@').next()).filter(|s| !s.is_empty()))
+        .map(String::from)
+}
+
 /// The token to send for `context`'s `server`, and where it comes from: Settings first, then
 /// the argocd CLI's login. What to do when there is none, or it has expired.
 fn login(context: &str, server: &Server) -> Result<(String, Login), String> {

@@ -124,6 +124,52 @@ pub async fn held_apps(
     gather(sources, wait, keep).await
 }
 
+/// What each Argo CD server turned on whose name `use_server` accepts holds, whole (its
+/// Applications, projects and clusters as its feed has them), for a reader that shows them
+/// all (an agent's `argocd_apps`): its feed is started when none runs, and held `LINGER`.
+/// Waits at most `wait` for a feed's first list; a server whose feed failed, or that has no
+/// login, answers with why at once. Reads the servers' config (files): call it off the UI
+/// thread.
+pub async fn held_states(
+    use_server: impl Fn(&str) -> bool,
+    wait: Duration,
+) -> Vec<(Arc<Endpoint>, Result<FeedState, String>)> {
+    let sources: Vec<Source> = endpoints()
+        .list
+        .into_iter()
+        .filter(|e| e.on && use_server(&e.name()))
+        .map(|e| {
+            let feed = match &e.login {
+                Err(why) => Err(why.clone()),
+                Ok(_) => Ok(linger(&e)),
+            };
+            (Arc::new(e), feed)
+        })
+        .collect();
+    let deadline = Instant::now() + wait;
+    loop {
+        let now: Vec<Option<Result<FeedState, String>>> = sources
+            .iter()
+            .map(|(_, feed)| match feed {
+                Ok(state) => {
+                    let s = lock(state);
+                    if s.listed { Some(Ok(s.clone())) } else { s.error.clone().map(Err) }
+                }
+                Err(why) => Some(Err(why.clone())),
+            })
+            .collect();
+        if now.iter().all(Option::is_some) || Instant::now() >= deadline {
+            let late = format!("did not answer within {} s", wait.as_secs());
+            return sources
+                .into_iter()
+                .zip(now)
+                .map(|((e, _), s)| (e, s.unwrap_or_else(|| Err(late.clone()))))
+                .collect();
+        }
+        tokio::time::sleep(POLL).await;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, Mutex};
