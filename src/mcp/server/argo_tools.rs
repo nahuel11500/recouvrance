@@ -883,7 +883,7 @@ mod tests {
         let one = Pick::One { hub: "hub".into(), app: found, fit: Fit::Both };
         let text = managed_text(&by, &one, &key(), &["hub".into()], &[]).unwrap();
         assert!(text.starts_with("Argo CD: managed by Application argocd/web-workload on hub hub"), "{text}");
-        assert!(text.contains("OutOfSync, Healthy, auto-sync off, revision aaaaaaaa."), "{text}");
+        assert!(text.contains("OutOfSync, Healthy, auto-sync off, revision aaaaaaa."), "{text}");
         assert!(text.contains("This object in it: OutOfSync, Healthy."), "{text}");
         assert!(text.contains("context hub, kind applications, namespace argocd, name web-workload"), "{text}");
         // Not read: why, and what the agent can do.

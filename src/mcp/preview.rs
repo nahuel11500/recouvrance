@@ -851,7 +851,7 @@ mod tests {
         assert_eq!(
             s.lines,
             [
-                "revision: aaaaaaaa deployed → bbbbbbbb",
+                "revision: aaaaaaa deployed → bbbbbbb",
                 "target revision: main (read again when the sync starts)",
                 "auto-sync: off",
                 "out of sync: 3 resources",
