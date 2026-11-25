@@ -424,3 +424,18 @@ proptest! {
         prop_assert_eq!(counted, in_trouble);
     }
 }
+
+/// An Application as the list holds it (no resources, no tree): its cards say what the list
+/// knows, and why it wasn't read in one line, never a page of error.
+#[test]
+fn a_list_copy_gives_cards_with_one_line_why() {
+    let full = app("example-prod");
+    let lean = crate::k8s::argo::api::lean(&full);
+    let read = Read::held(lean, "\n  rpc error: code = Unauthenticated desc = token is expired\nstack…");
+    assert_eq!(read.note.as_deref(), Some("rpc error: code = Unauthenticated desc = token is expired"));
+    assert!(read.tree.is_none() && read.diff.is_none() && read.commits.is_empty());
+    let cards = Cards::of(read, None, now());
+    assert_eq!(cards.summary.name, "example-prod");
+    assert_eq!(cards.summary.sync, full["status"]["sync"]["status"].as_str().unwrap());
+    assert!(!cards.clean_is_known() || cards.summary.health == "Healthy");
+}

@@ -41,7 +41,8 @@ RECOUVRANCE_TAB=logs cargo run --features dev -- --snapshot out.png 8
 Useful variables: `RECOUVRANCE_PAGE` (`apply`, `settings`, `cluster`, `access`, `assistant-dock`…),
 `RECOUVRANCE_FILTER`, `RECOUVRANCE_ACT` (comma-separated hooks, see `src/app/demo.rs` and
 `src/details/demo.rs`; `timeline:all` shows every event on the Timeline, `page:argo,argo-example`
-shows the Argo CD dashboard on a made-up example, no real data, `page:argo,argo-journal-example`
+shows the Argo CD dashboard on a made-up example, no real data (`argo-example-expired`: after its
+login expired), `page:argo,argo-journal-example`
 its sync journal, `page:argo,argo-example-list` its list of environments,
 `page:argo,argo-example-overview` its overview, and `page:argo,argo-sync-example-oos` (or
 `-example`, `-example-oos-armed`) its grouped sync), `RECOUVRANCE_INPUT`

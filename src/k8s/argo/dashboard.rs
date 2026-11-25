@@ -789,14 +789,28 @@ pub fn history(app: &Value, n: usize) -> History {
 pub struct Read {
     /// The Application, whole.
     pub app: Value,
-    /// Its resource tree; None when it can't be asked (a hub with no Argo CD server set).
+    /// Its resource tree; None when it can't be asked (the Application is a list's copy).
     pub tree: Option<Result<Value, String>>,
     /// Argo CD's diff; None when it can't be asked.
     pub diff: Option<Result<GitDiff, String>>,
     /// The commit of each source deployed (see [`deployed`]); None when it can't be asked.
     pub commits: Vec<Option<Result<Commit, String>>>,
-    /// Why the tree, the diff and the commits can't be asked, when they can't.
+    /// Why the Application couldn't be read now (one line), when it is a list's copy: its
+    /// tree, diff and commits then aren't asked.
     pub note: Option<String>,
+}
+
+/// The first line of an error with text, to say it in one line.
+pub fn first_line(e: &str) -> String {
+    e.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("it failed").to_string()
+}
+
+impl Read {
+    /// The Application as a feed holds it (its list's copy), when reading it failed with `why`:
+    /// its tree, diff and commits aren't asked, and the note says why in one line.
+    pub fn held(app: Value, why: &str) -> Self {
+        Self { app, tree: None, diff: None, commits: Vec::new(), note: Some(first_line(why)) }
+    }
 }
 
 /// Every card of one Application's dashboard.
