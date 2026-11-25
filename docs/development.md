@@ -44,8 +44,8 @@ Useful variables: `RECOUVRANCE_PAGE` (`apply`, `settings`, `cluster`, `access`, 
 shows the Argo CD dashboard on a made-up example, no real data (`argo-example-expired`: after its
 login expired), `page:argo,argo-journal-example`
 its sync journal, `page:argo,argo-example-list` its list of environments,
-`page:argo,argo-example-overview` its overview, and `page:argo,argo-sync-example-oos` (or
-`-example`, `-example-oos-armed`) its grouped sync), `RECOUVRANCE_INPUT`
+`page:argo,argo-example-overview` its overview, `page:argo,argo-example-diff` a grouped diff, and
+`page:argo,argo-sync-example-oos` (or `-example`, `-example-oos-armed`) its grouped sync), `RECOUVRANCE_INPUT`
 (`click:x,y;key:enter;wait:2`; `shot:name.png` saves a frame next to the snapshot, for
 recordings), `RECOUVRANCE_WRITES=1`, `RECOUVRANCE_DARK=1`, `RECOUVRANCE_ZOOM`,
 `RECOUVRANCE_SIZE=1000x800` (the window's size, 1500x920 by default), and `RECOUVRANCE_METER=1`, which prints at the end what the run cost: each cluster's API requests and

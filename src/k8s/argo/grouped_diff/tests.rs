@@ -7,7 +7,10 @@ use std::task::{Context, Poll};
 use futures::StreamExt as _;
 use serde_json::{Value, json};
 
-use super::{AppDiff, PARALLEL, cached, errors_by_text, kind_text, not_compared, read_all, regroup, sides, summary};
+use super::{
+    AppDiff, Names, PARALLEL, cached, errors_by_text, kind_text, not_compared, read_all, regroup, sides, summary,
+    summary_lines,
+};
 use crate::k8s::argo::Summary;
 use crate::smartdiff::SmartDiff;
 
@@ -96,7 +99,7 @@ fn a_secrets_values_never_show() {
     let d = AppDiff::of(&body);
     let lines = format!("{:?}", d.diff.resources.iter().map(|r| r.lines(true)).collect::<Vec<_>>());
     assert!(!lines.contains("czNjcjN0") && !lines.contains("bjN3"), "{lines}");
-    let groups = regroup(&[Some(&d.diff)], false);
+    let groups = regroup(&[Some(&d.diff)], &[], false);
     assert_eq!(texts(&groups), ["Secret db key password changed"]);
 }
 
@@ -107,7 +110,7 @@ fn the_same_change_across_applications_is_shown_once() {
     let diffs = [env("dev", "1.16", 3), env("staging", "1.16", 5), env("prod", "1.16", 5), env("canary", "1.17", 3)];
     let mut read: Vec<Option<&SmartDiff>> = diffs.iter().map(|d| Some(&d.diff)).collect();
     read.insert(1, None);
-    let groups = regroup(&read, false);
+    let groups = regroup(&read, &[], false);
     assert_eq!(
         texts(&groups),
         [
@@ -137,13 +140,15 @@ fn the_same_change_across_applications_is_shown_once() {
     );
     assert_eq!(summary(&[], 0), None);
     // The noise, by rule: the checksum annotation and the status, in every one of them.
-    let noise = regroup(&read, true);
+    let noise = regroup(&read, &[], true);
     assert!(texts(&noise).contains(&"noise: checksum annotation"), "{:?}", texts(&noise));
     assert_eq!(apps(&noise, "noise: checksum annotation"), [0, 2, 3, 4]);
 }
 
+/// The same field with the same edit on resources of one kind is one line, whatever their
+/// names.
 #[test]
-fn a_change_of_a_resources_own_is_the_same_only_in_a_resource_of_that_name() {
+fn a_change_of_a_resources_own_is_one_per_kind() {
     let one = AppDiff::of(&json!({"items": [
         res("", "ConfigMap", "a", "app-config", Some(config("a", "app-config", "info")),
             Some(config("a", "app-config", "debug"))),
@@ -152,11 +157,9 @@ fn a_change_of_a_resources_own_is_the_same_only_in_a_resource_of_that_name() {
         res("", "ConfigMap", "b", "worker-config", Some(config("b", "worker-config", "info")),
             Some(config("b", "worker-config", "debug"))),
     ]}));
-    let groups = regroup(&[Some(&one.diff), Some(&other.diff)], false);
-    assert_eq!(
-        texts(&groups),
-        ["ConfigMap app-config key LOG_LEVEL changed", "ConfigMap worker-config key LOG_LEVEL changed"]
-    );
+    let groups = regroup(&[Some(&one.diff), Some(&other.diff)], &[], false);
+    assert_eq!(texts(&groups), ["2 ConfigMaps: key LOG_LEVEL changed"]);
+    assert_eq!(apps(&groups, "2 ConfigMaps: key LOG_LEVEL changed"), [0, 1]);
 }
 
 #[test]
@@ -169,7 +172,7 @@ fn a_configmap_regenerated_in_each_environment_is_one_change() {
     };
     let a = regenerated("a", "app-config-bbbbbbbbbb", "app-config-cccccccccc");
     let b = regenerated("b", "app-config-dddddddddd", "app-config-ffffffffff");
-    let groups = regroup(&[Some(&a.diff), Some(&b.diff)], false);
+    let groups = regroup(&[Some(&a.diff), Some(&b.diff)], &[], false);
     assert_eq!(apps(&groups, "ConfigMap app-config regenerated under a new name"), [0, 1], "{:?}", texts(&groups));
     assert_eq!(apps(&groups, "ConfigMap app-config key LOG_LEVEL changed"), [0, 1]);
 }
@@ -190,7 +193,7 @@ fn nothing_to_sync_and_noise_only_are_told_apart() {
         res("apps", "Deployment", "a", "web", Some(stamped("web-1.1.0")), Some(stamped("web-1.2.0")))
     ]}));
     assert!(noise.noise_only() && !noise.in_sync());
-    assert!(regroup(&[Some(&noise.diff)], false).is_empty());
+    assert!(regroup(&[Some(&noise.diff)], &[], false).is_empty());
 }
 
 /// A future that waits once before it is ready.
@@ -274,7 +277,7 @@ fn an_answer_with_or_without_modified() {
     // One says it differs: another without it is in sync, whatever its states.
     let other = res("", "ConfigMap", "a", "d", Some(config("a", "d", "info")), Some(config("a", "d", "warn")));
     let d = AppDiff::of(&json!({"items": [modified(changed), other]}));
-    assert_eq!(regroup(&[Some(&d.diff)], false).len(), 1, "only c");
+    assert_eq!(regroup(&[Some(&d.diff)], &[], false).len(), 1, "only c");
     assert_eq!(d.same, 1);
     // Said modified, but the same once normalized: not in sync, not noise only, said.
     let same = config("a", "e", "info");
@@ -303,24 +306,19 @@ fn an_application_argo_cd_could_not_compare_is_said() {
     assert_eq!(not_compared(&summary_of("Synced", &[])), None);
 }
 
-/// The same key changed to other values in other Applications is a line each, said.
+/// The same key changed to other values in other Applications is one line, the environments
+/// that differ said.
 #[test]
-fn the_same_key_to_different_values_is_not_one_change() {
+fn the_same_key_to_different_values_says_where_it_differs() {
     let level = |ns: &str, to: &str| {
         AppDiff::of(&json!({"items": [res("", "ConfigMap", ns, "app-config",
             Some(config(ns, "app-config", "info")), Some(config(ns, "app-config", to)))]}))
     };
     let (a, b, c) = (level("a", "debug"), level("b", "warn"), level("c", "debug"));
-    let groups = regroup(&[Some(&a.diff), Some(&b.diff), Some(&c.diff)], false);
-    assert_eq!(
-        texts(&groups),
-        [
-            "ConfigMap app-config key LOG_LEVEL changed (one of 2 different values)",
-            "ConfigMap app-config key LOG_LEVEL changed (one of 2 different values)"
-        ]
-    );
-    assert_eq!(groups[0].apps.iter().map(|(a, _)| *a).collect::<Vec<_>>(), [0, 2], "the one in the most first");
-    assert_ne!(groups[0].key, groups[1].key);
+    let groups = regroup(&[Some(&a.diff), Some(&b.diff), Some(&c.diff)], &[], false);
+    assert_eq!(texts(&groups), ["ConfigMap app-config key LOG_LEVEL changed (2 values) (differs in 1 environment)"]);
+    assert_eq!(groups[0].apps.iter().map(|(a, _)| *a).collect::<Vec<_>>(), [0, 1, 2]);
+    assert_eq!(groups[0].differs, [1], "the one unlike the most");
 }
 
 /// Only a core ConfigMap is named by its stem; another group's kind of the same name is not,
@@ -334,7 +332,7 @@ fn a_configmap_of_another_group_is_not_folded_by_its_stem() {
     let name = "app-config-bbbbbbbbbb";
     let d = AppDiff::of(&json!({"items": [res("example.com", "ConfigMap", "a", name, Some(cm(name, "info")),
         Some(cm(name, "debug")))]}));
-    let groups = regroup(&[Some(&d.diff)], false);
+    let groups = regroup(&[Some(&d.diff)], &[], false);
     assert_eq!(texts(&groups), ["ConfigMap.example.com app-config-bbbbbbbbbb: data.LOG_LEVEL: info → debug"]);
     assert_eq!(kind_text("", "Service"), "Service");
     assert_eq!(kind_text("serving.knative.dev", "Service"), "Service.serving.knative.dev");
@@ -345,4 +343,57 @@ fn a_configmap_of_another_group_is_not_folded_by_its_stem() {
 fn the_same_error_is_said_once_with_its_applications() {
     let errors = [(0, "forbidden"), (1, "timeout"), (2, "forbidden"), (3, "forbidden")];
     assert_eq!(errors_by_text(errors), [("forbidden".to_string(), vec![0, 2, 3]), ("timeout".to_string(), vec![1])]);
+}
+
+/// One annotation added on 36 Deployments of different names, in 3 environments, is one line;
+/// the same rule edit naming each environment and its client is one line once the names are
+/// replaced, the environment whose rule differs otherwise said; images first.
+#[test]
+fn one_change_on_many_resources_and_environments_is_one_line() {
+    let example = super::example::diffs();
+    let read: Vec<Option<&SmartDiff>> = example.iter().map(|(_, _, d)| Some(&d.diff)).collect();
+    let names: Vec<Names> = example.iter().map(|(_, n, _)| n.clone()).collect();
+    let groups = regroup(&read, &names, false);
+    assert_eq!(
+        texts(&groups),
+        [
+            "image web 1.15.0 → 1.16.0",
+            "36 Deployments: annotation example.io/role added (36 values)",
+            "PrometheusRule shop-rules: spec.groups[shop].rules[0] added (differs in 1 environment)",
+        ]
+    );
+    assert_eq!(groups[1].apps.len(), 3);
+    assert_eq!(groups[1].apps[0].1.len(), 36, "each environment's 36 resources");
+    assert!(groups[1].differs.is_empty());
+    assert_eq!(groups[2].differs, [2], "the third's threshold differs; the names alone don't");
+    // Without the names, every environment's rule is its own.
+    let groups = regroup(&read, &[], false);
+    assert_eq!(groups[2].differs.len(), 2, "{:?}", texts(&groups));
+    let (heading, lines) = summary_lines(&groups, 3).unwrap();
+    assert_eq!(heading, "3 changes in 3 environments");
+    assert_eq!(lines.len(), 3);
+}
+
+#[test]
+fn an_environments_names_become_placeholders() {
+    let n = Names::new(["shop-prod-acme".into(), "shop-prod-acme-workload".into(), "ab".into()], Some("acme".into()));
+    assert_eq!(n.apply("ns shop-prod-acme-workload in shop-prod-acme"), "ns ‹env› in ‹env›");
+    assert_eq!(n.apply("client=acme, acmeco, acme-eu, xacme"), "client=‹client›, acmeco, ‹client›-eu, xacme");
+    assert_eq!(n.apply("ab stays"), "ab stays", "too short to replace");
+    assert_eq!(Names::default().apply("anything"), "anything");
+}
+
+proptest::proptest! {
+    /// A text without an environment's names is left as it is, and replacing twice is
+    /// replacing once.
+    #[test]
+    fn names_change_only_what_they_name(text in "[a-z0-9 =,./-]{0,40}", env in "[a-z]{3,8}-prod-[a-z]{3,6}") {
+        let client = env.rsplit('-').next().map(String::from);
+        let n = Names::new([env.clone()], client.clone());
+        let once = n.apply(&text);
+        if !text.contains(&env) && !client.as_ref().is_some_and(|c| text.contains(c.as_str())) {
+            proptest::prop_assert_eq!(&once, &text);
+        }
+        proptest::prop_assert_eq!(n.apply(&once), once);
+    }
 }

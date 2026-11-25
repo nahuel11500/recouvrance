@@ -293,6 +293,16 @@ fn from_to(edit: Edit, from: Option<&String>, to: Option<&String>) -> String {
     }
 }
 
+/// A field as said: `annotation example.io/role` for `metadata.annotations.example.io/role`,
+/// `label app` for a label; any other path as it is.
+fn field_name(path: &str) -> String {
+    match (path.strip_prefix("metadata.annotations."), path.strip_prefix("metadata.labels.")) {
+        (Some(k), _) => format!("annotation {k}"),
+        (_, Some(k)) => format!("label {k}"),
+        _ => path.to_string(),
+    }
+}
+
 impl Fact {
     /// The fact in a line: `image web 1.15.0 → 1.16.0`, `replicas 3 → 5`, `env FOO added`.
     pub fn text(&self) -> String {
@@ -313,7 +323,9 @@ impl Fact {
             Self::Renamed { from, to } => format!("renamed {from} → {to} (regenerated)"),
             Self::Added => "added".into(),
             Self::Pruned => "pruned".into(),
-            Self::Field { path, edit, from, to } => format!("{path}{}", from_to(*edit, from.as_ref(), to.as_ref())),
+            Self::Field { path, edit, from, to } => {
+                format!("{}{}", field_name(path), from_to(*edit, from.as_ref(), to.as_ref()))
+            }
         }
     }
 
@@ -532,6 +544,8 @@ pub struct ResourceChange {
     /// Secret's masked): two facts without their values (a long value, a ConfigMap's key) are
     /// the same change only when these are equal.
     digests: Vec<u64>,
+    /// For each fact, where the values it was read from are (see `digest_by`).
+    paths: Vec<Vec<Vec<Seg>>>,
     /// Both sides, a Secret's values masked.
     before: Value,
     after: Value,
@@ -543,19 +557,35 @@ impl ResourceChange {
     /// Facts read from no value (each digest 0).
     #[cfg(test)]
     fn new(key: ObjectKey, facts: Vec<Fact>, noise: Vec<Noise>, before: Value, after: Value) -> Self {
-        let digests = vec![0; facts.len()];
-        Self { key, facts, noise, digests, before, after, lines: Default::default() }
+        let (digests, paths) = (vec![0; facts.len()], vec![Vec::new(); facts.len()]);
+        Self { key, facts, noise, digests, paths, before, after, lines: Default::default() }
     }
 
     fn of_found(key: ObjectKey, found: Found, noise: Vec<Noise>, before: Value, after: Value) -> Self {
-        let Found { facts, digests, .. } = found;
-        Self { key, facts, noise, digests, before, after, lines: Default::default() }
+        let Found { facts, digests, paths, .. } = found;
+        Self { key, facts, noise, digests, paths, before, after, lines: Default::default() }
     }
 
     /// The hash of the values the fact at `i` (of `facts`) was read from; 0 for one read from
     /// none (a resource added, pruned or renamed).
     pub fn digest(&self, i: usize) -> u64 {
         self.digests.get(i).copied().unwrap_or_default()
+    }
+
+    /// The same hash, each string of the values read through `text` first (an environment's
+    /// own names replaced by placeholders, so the same edit in two environments hashes the
+    /// same); 0 for a fact read from no value.
+    pub fn digest_by(&self, i: usize, text: &dyn Fn(&str) -> String) -> u64 {
+        use std::hash::Hasher as _;
+        let Some(paths) = self.paths.get(i).filter(|p| !p.is_empty()) else { return 0 };
+        let mut out = 0u64;
+        for p in paths {
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            hash_value_by(value_at(&self.before, p), &mut h, text);
+            hash_value_by(value_at(&self.after, p), &mut h, text);
+            out = if out == 0 { h.finish() } else { out.rotate_left(5) ^ h.finish() };
+        }
+        out
     }
 
     /// How many bytes its lines take, about (once worked out).
@@ -702,6 +732,8 @@ fn classify(key: &ObjectKey, b: &Value, a: &Value, renames: &Renames) -> (Found,
 struct Found {
     facts: Vec<Fact>,
     digests: Vec<u64>,
+    /// Where each fact's leaves are.
+    paths: Vec<Vec<Vec<Seg>>>,
     seen: BTreeMap<Fact, usize>,
 }
 
@@ -721,29 +753,44 @@ impl Found {
             hash_value(l.after.as_ref(), &mut h);
         }
         let leaf_hash = if leaf.is_some() { h.finish() } else { 0 };
+        let path = leaf.map(|l| l.path.clone());
         if let Some(&i) = self.seen.get(&fact) {
             self.digests[i] = self.digests[i].rotate_left(5) ^ leaf_hash;
+            self.paths[i].extend(path);
         } else {
             self.seen.insert(fact.clone(), self.facts.len());
             self.facts.push(fact);
             self.digests.push(leaf_hash);
+            self.paths.push(path.into_iter().collect());
         }
     }
 }
 
 /// Hash a value whatever the order of its keys (an object's are hashed sorted).
 fn hash_value(v: Option<&Value>, h: &mut impl std::hash::Hasher) {
+    hash_with(v, h, None);
+}
+
+/// [`hash_value`], each string (not key) read through `text` first.
+fn hash_value_by(v: Option<&Value>, h: &mut impl std::hash::Hasher, text: &dyn Fn(&str) -> String) {
+    hash_with(v, h, Some(text));
+}
+
+fn hash_with(v: Option<&Value>, h: &mut impl std::hash::Hasher, text: Option<&dyn Fn(&str) -> String>) {
     use std::hash::Hash as _;
     match v {
         None => 0u8.hash(h),
         Some(Value::Null) => 1u8.hash(h),
         Some(Value::Bool(b)) => (2u8, b).hash(h),
         Some(Value::Number(n)) => (3u8, n.to_string()).hash(h),
-        Some(Value::String(s)) => (4u8, s).hash(h),
+        Some(Value::String(s)) => match text {
+            Some(t) => (4u8, t(s)).hash(h),
+            None => (4u8, s).hash(h),
+        },
         Some(Value::Array(items)) => {
             (5u8, items.len()).hash(h);
             for i in items {
-                hash_value(Some(i), h);
+                hash_with(Some(i), h, text);
             }
         }
         Some(Value::Object(m)) => {
@@ -752,7 +799,7 @@ fn hash_value(v: Option<&Value>, h: &mut impl std::hash::Hasher) {
             keys.sort();
             for k in keys {
                 k.hash(h);
-                hash_value(m.get(k), h);
+                hash_with(m.get(k), h, text);
             }
         }
     }
@@ -913,6 +960,7 @@ pub fn compare(before: &Objects, after: &Objects) -> SmartDiff {
             (Some(mut r), Some(o)) => {
                 r.facts.insert(0, Fact::Renamed { from: o.name.clone(), to: k.name.clone() });
                 r.digests.insert(0, 0);
+                r.paths.insert(0, Vec::new());
                 resources.push(r);
             }
             (Some(r), None) => resources.push(r),

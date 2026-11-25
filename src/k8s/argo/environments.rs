@@ -187,6 +187,20 @@ impl EnvTypes {
         self.names.get(t).map_or(OTHER, String::as_str)
     }
 
+    /// The client of an environment whose root is named `name`: what follows its type's match
+    /// (`acme` in `shop-prod-acme`), when something does.
+    pub fn client<'a>(&self, name: &'a str) -> Option<&'a str> {
+        let m = self
+            .rules
+            .iter()
+            .filter_map(|r| match r {
+                Rule::Name(re) => re.find(name),
+                Rule::Tagged(_) => None,
+            })
+            .min_by_key(|m| m.start())?;
+        Some(name[m.end()..].trim_matches('-')).filter(|c| !c.is_empty())
+    }
+
     /// The type of an environment whose root is named `name`, `on_tag` when its product
     /// images all carry a version tag: an index of the types, the last (`other`) when no
     /// pattern matches.
@@ -430,6 +444,15 @@ mod tests {
         assert_eq!(name("platform-prod-monitoring", false), "platform");
         assert_eq!(name("production-line", false), OTHER);
         assert_eq!(t.name(t.of("x", false)), OTHER);
+    }
+
+    #[test]
+    fn the_client_follows_the_type_in_the_name() {
+        let t = types();
+        assert_eq!(t.client("shop-prod-acme"), Some("acme"));
+        assert_eq!(t.client("shop-acc2-globex-eu"), Some("globex-eu"));
+        assert_eq!(t.client("shop-staging"), None);
+        assert_eq!(t.client("production-line"), None);
     }
 
     #[test]
