@@ -10,10 +10,8 @@
   end-to-end run on kind and the Windows check run on `main` after the merge; when a run on
   `main` fails, fixing it comes before anything else.
 - **Push through the pre-push hook.** Once per checkout: `git config core.hooksPath scripts/hooks`.
-  Before each push it runs what CI fails on most: `cargo fmt --check`, `typos`, `cargo deny`,
-  then clippy (with and without `dev`) in the main checkout's target dir, one at a time across
-  worktrees and on half the cores. Fix what it reports before pushing; `--no-verify` is only for
-  a push that changes no Rust code.
+  Before each push it runs the quick checks CI fails on most, in seconds: `cargo fmt --check`,
+  `typos`, `cargo deny`. Clippy and the tests run on the PR in CI.
 - **Use at most half the machine's cores.** Set the job count on every cargo command
   that compiles (build, run, test, clippy, check, doc):
 
@@ -50,7 +48,9 @@
   priorities for the long tail.
 - Merge without asking: once the diff has been reviewed, squash merge it as soon as `CI result`
   passes (`gh pr checks <n> --watch`, then `gh pr merge <n> --squash`; check with
-  `gh pr view <n> --json state`). A failing CI is fixed on the branch, never merged around.
+  `gh pr view <n> --json state`). Don't bring the branch up to date first unless GitHub says it
+  conflicts: main's full run checks the combination, and updating every PR after each merge
+  only queues CI runs. A failing CI is fixed on the branch, never merged around.
   Then watch the run on `main`: if it fails, fix it right away in a new PR. Dependabot's PRs
   merge the same way once their CI passes on the current `main`.
 - Nothing is tried in the running app before merging; the test before a release is (see
