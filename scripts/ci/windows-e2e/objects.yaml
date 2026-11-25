@@ -1,5 +1,6 @@
 # What the Windows end-to-end job's kwok cluster holds: a fake node (kwok runs its pods without
-# containers) and a deployment whose pods it reports Running.
+# containers), a deployment, and two pods placed on the node by hand, which kwok reports Running
+# (kube-controller-manager doesn't create the deployment's pods on Windows).
 apiVersion: v1
 kind: Node
 metadata:
@@ -30,6 +31,26 @@ spec:
         - name: web
           image: busybox:1.37
           resources: {requests: {cpu: 100m, memory: 64Mi}}
+---
+apiVersion: v1
+kind: Pod
+metadata: {name: web-0, namespace: default, labels: {app: web}}
+spec:
+  nodeName: kwok-node-0
+  containers:
+    - name: web
+      image: busybox:1.37
+      resources: {requests: {cpu: 100m, memory: 64Mi}}
+---
+apiVersion: v1
+kind: Pod
+metadata: {name: web-1, namespace: default, labels: {app: web}}
+spec:
+  nodeName: kwok-node-0
+  containers:
+    - name: web
+      image: busybox:1.37
+      resources: {requests: {cpu: 100m, memory: 64Mi}}
 ---
 apiVersion: v1
 kind: ConfigMap

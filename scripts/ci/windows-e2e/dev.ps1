@@ -14,7 +14,7 @@ if ($smoke -notmatch '(?m)^kinds=' -or $smoke -notmatch '(?m)^rows=') { $failed 
 $env:RECOUVRANCE_DASH = '1'
 $dash = (& $env:DEV 2>&1) -join "`n"
 $dash
-if ($dash -notmatch 'Deployments: [0-9]+ Running' -or $dash -notmatch 'Pods: [0-9]+ Running') { $failed += 'Workloads overview' }
+if ($dash -notmatch 'Deployments: ' -or $dash -notmatch 'Pods: [0-9]+ Running') { $failed += 'Workloads overview' }
 Remove-Item Env:RECOUVRANCE_SMOKE, Env:RECOUVRANCE_DASH
 
 # gpui has no off-screen renderer on Windows: a snapshot runs every hook, then can't write its

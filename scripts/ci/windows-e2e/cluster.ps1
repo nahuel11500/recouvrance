@@ -11,8 +11,9 @@ if ($sum -ne $env:KWOKCTL_SHA256) { throw "kwokctl: sha256 $sum" }
 & $kwokctl create cluster --name recouvrance --runtime binary --kubeconfig "$env:E2E\kwok.kubeconfig" --wait 5m
 if ($LASTEXITCODE) { exit 1 }
 & $kwokctl --name recouvrance kubectl apply -f "$PSScriptRoot\objects.yaml"
-& $kwokctl --name recouvrance kubectl rollout status deployment/web --timeout=180s
+& $kwokctl --name recouvrance kubectl wait --for=condition=Ready pod -l app=web --timeout=180s
 if ($LASTEXITCODE) { exit 1 }
+& $kwokctl --name recouvrance logs kube-controller-manager 2>&1 | Select-Object -Last 20
 & $kwokctl --name recouvrance kubectl get nodes,pods -A -o wide
 
 $cluster = "$env:USERPROFILE\.kwok\clusters\recouvrance"
