@@ -37,7 +37,7 @@ use crate::status::Tone;
 use envs::{Env, Filter, GroupBy, Heading, Line};
 
 mod dashboard;
-mod envs;
+pub(crate) mod envs;
 mod grouped;
 mod journal;
 mod sync;
@@ -99,6 +99,21 @@ fn favorite(a: &FleetApp) -> crate::favorites::Favorite {
         name: a.app.name.clone(),
         context: None,
     })
+}
+
+/// The page's state as Settings keeps it: folds and unfolded environments sorted, so the
+/// same state is always saved the same.
+fn page_state(
+    filter: &Filter,
+    group_by: GroupBy,
+    folded: &HashSet<String>,
+    expanded: &HashSet<Key>,
+) -> crate::settings::ArgoPage {
+    let mut folded: Vec<String> = folded.iter().cloned().collect();
+    folded.sort();
+    let mut expanded: Vec<Key> = expanded.iter().cloned().collect();
+    expanded.sort();
+    crate::settings::ArgoPage { filter: filter.clone(), group_by, folded, expanded }
 }
 
 // MARK: Rows
@@ -249,6 +264,8 @@ pub struct ArgoView {
     /// root).
     folded: HashSet<String>,
     expanded: HashSet<Key>,
+    /// Saves the page's state once typing in the search pauses.
+    remember: Option<Task<()>>,
     /// The lines on screen and their headings, worked out when the data, the filter or a
     /// fold changes.
     lines: Vec<Line>,
@@ -309,8 +326,14 @@ impl ArgoView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let search =
-            cx.new(|cx| InputState::new(window, cx).placeholder("Search environments, image tags, or key=value…"));
+        // The page as it was last left (Settings' `argocd_page`).
+        let page = crate::settings::with(|s| s.argocd_page.clone());
+        let query = page.filter.query.clone();
+        let search = cx.new(|cx| {
+            let mut st = InputState::new(window, cx).placeholder("Search environments, image tags, or key=value…");
+            st.set_value(query, window, cx);
+            st
+        });
         let journal_search = cx.new(|cx| InputState::new(window, cx).placeholder("Application…"));
         let steps_search = cx.new(|cx| InputState::new(window, cx).placeholder("Steps: status, kind, name…"));
         let subs = vec![
@@ -328,9 +351,13 @@ impl ArgoView {
             }),
             cx.subscribe(&search, |this, state, ev: &InputEvent, cx| {
                 if matches!(ev, InputEvent::Change) {
-                    this.filter.query = state.read(cx).value().to_lowercase();
-                    this.refilter(cx);
-                    cx.notify();
+                    let query = state.read(cx).value().to_lowercase();
+                    if query != this.filter.query {
+                        this.filter.query = query;
+                        this.refilter(cx);
+                        this.remember_soon(cx);
+                        cx.notify();
+                    }
                 }
             }),
             // A star put here, on an Application's page or in the sidebar.
@@ -389,11 +416,12 @@ impl ArgoView {
             config_errors: Vec::new(),
             rows: None,
             build: Default::default(),
-            filter: Filter::default(),
-            group_by: GroupBy::default(),
+            filter: page.filter,
+            group_by: page.group_by,
             search,
-            folded: HashSet::new(),
-            expanded: HashSet::new(),
+            folded: page.folded.into_iter().collect(),
+            expanded: page.expanded.into_iter().collect(),
+            remember: None,
             lines: Vec::new(),
             headings: Vec::new(),
             kept: 0,
@@ -578,14 +606,37 @@ impl ArgoView {
 
     fn change_filter(&mut self, change: impl FnOnce(&mut Filter), cx: &mut Context<Self>) {
         change(&mut self.filter);
-        self.refilter(cx);
-        cx.notify();
+        self.changed(cx);
     }
 
     fn set_group_by(&mut self, by: GroupBy, cx: &mut Context<Self>) {
         self.group_by = by;
+        self.changed(cx);
+    }
+
+    /// The filter, grouping or a fold changed: show it, and remember it.
+    fn changed(&mut self, cx: &mut Context<Self>) {
         self.refilter(cx);
+        self.remember();
         cx.notify();
+    }
+
+    /// Keep how the page is now (Settings' `argocd_page`), to open it so next time.
+    fn remember(&mut self) {
+        if self.example {
+            return;
+        }
+        self.remember = None;
+        let page = page_state(&self.filter, self.group_by, &self.folded, &self.expanded);
+        crate::settings::update(|s| s.argocd_page = page);
+    }
+
+    /// `remember`, once the search has not changed for a second (not a write per key).
+    fn remember_soon(&mut self, cx: &mut Context<Self>) {
+        self.remember = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(Duration::from_secs(1)).await;
+            let _ = this.update(cx, |this, _| this.remember());
+        }));
     }
 
     /// Star or unstar the Application (kept in favorites.json; the page sorts again when the
@@ -600,8 +651,7 @@ impl ArgoView {
         if !self.folded.remove(&heading) {
             self.folded.insert(heading);
         }
-        self.refilter(cx);
-        cx.notify();
+        self.changed(cx);
     }
 
     /// Show or hide an environment's Applications (`k`: its root).
@@ -609,8 +659,7 @@ impl ArgoView {
         if !self.expanded.remove(&k) {
             self.expanded.insert(k);
         }
-        self.refilter(cx);
-        cx.notify();
+        self.changed(cx);
     }
 
     /// Fold every heading, or unfold them all (and the environments).
@@ -621,8 +670,7 @@ impl ArgoView {
             self.folded.clear();
             self.expanded.clear();
         }
-        self.refilter(cx);
-        cx.notify();
+        self.changed(cx);
     }
 
     fn find(&self, k: &Key) -> Option<&FleetApp> {

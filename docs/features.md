@@ -364,7 +364,9 @@
   and a search, each word in turn, in the names, namespaces, clusters, project, server and image
   tags (find every environment on a tag), where `key=value` is a label of one of its
   Applications (`key=` any value of it). The star on a row makes the Application a favorite;
-  environments with one come first in their group. The groups are worked out once per change of
+  environments with one come first in their group. The filters, the search, the grouping, the
+  folded headings and the unfolded environments are remembered (settings.json's `argocd_page`)
+  and the page opens on them again, after a restart too. The groups are worked out once per change of
   the feeds, off the UI thread, and only the rows on screen are drawn.
   Red is for a failed sync, an error Argo CD reports or Degraded health: an Application with
   auto-sync off that is out of sync (a `*-workload` one synced by hand) is not red. A click opens
