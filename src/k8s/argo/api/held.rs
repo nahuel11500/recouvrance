@@ -192,6 +192,8 @@ mod tests {
             on: true,
             settings_token: true,
             renewable: false,
+            cli: None,
+            cli_renews: false,
         })
     }
 

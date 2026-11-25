@@ -527,6 +527,8 @@ mod tests {
             on,
             settings_token: false,
             renewable: false,
+            cli: None,
+            cli_renews: false,
         };
         assert!(api_servers(vec![]).is_none());
         assert!(api_servers(vec![endpoint("https://a.example", true), endpoint("https://b.example", false)]).is_none());
