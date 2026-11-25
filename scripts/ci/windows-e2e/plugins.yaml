@@ -1,0 +1,8 @@
+# A plugin for the Windows end-to-end job: it runs through Git for Windows' sh, and writes what
+# it was given to $PLUGIN_OUT.
+plugins:
+  - name: CI marker
+    kinds: [pods]
+    command: printf '%s %s %s\n' $KIND $NAME $NAMESPACE > "$PLUGIN_OUT" && test -s "$KUBECONFIG" && echo kubeconfig >> "$PLUGIN_OUT"
+    mode: background
+    read_only: true
