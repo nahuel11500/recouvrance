@@ -225,9 +225,8 @@ on and it is asked (its login may run); if it serves Applications, it is kept he
 ```
 
 Only the named contexts are asked then (their login may run). Connecting the hub as well works too.
-Agents read Argo CD (`argocd_apps`, and the Application named by `describe_resource` and
-`get_changes`) on these contexts too, else on the hubs already found, among the contexts their
-rules name (see [agents](agents.md)).
+Agents never read Argo CD on these contexts: their Argo CD tools go through Argo CD's API only
+(see [agents](agents.md)).
 
 ### Argo CD's diff (`argocd_servers`)
 

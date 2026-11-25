@@ -36,7 +36,14 @@ pub struct CanIParams {
 
 #[derive(Deserialize, schemars::JsonSchema)]
 pub struct WaitParams {
-    pub context: String,
+    #[schemars(
+        description = "the kubeconfig context; omit it for an Argo CD Application, found through Argo CD's API"
+    )]
+    pub context: Option<String>,
+    #[schemars(
+        description = "Argo CD only: the server holding the Application, by its name; needed only when several hold one of that name"
+    )]
+    pub server: Option<String>,
     pub kind: String,
     pub namespace: Option<String>,
     pub name: String,
@@ -175,7 +182,7 @@ impl KubeMcp {
     }
 
     #[tool(
-        description = "Wait until an object meets a condition (Ready, Available, Complete, `phase=Running`) or is deleted, like `kubectl wait`. For an Argo CD Application (on its hub): `sync=Synced`, `health=Healthy` or `operation=Succeeded`, met only once no operation runs; a sync or operation wait returns at once with Argo CD's message when its last operation failed on the revision it targets now (or auto-sync is off). After a push to git, refresh the Application (gitops `refresh`) first: until Argo CD has seen the new commit, it still targets the revision that failed.",
+        description = "Wait until an object meets a condition (Ready, Available, Complete, `phase=Running`) or is deleted, like `kubectl wait`. For an Argo CD Application (through Argo CD's API: no context, and `server` when several hold one of that name; authorized as get where it deploys): `sync=Synced`, `health=Healthy` or `operation=Succeeded`, met only once no operation runs; a sync or operation wait returns at once with Argo CD's message when its last operation failed on the revision it targets now (or auto-sync is off). After a push to git, refresh the Application (gitops `refresh`) first: until Argo CD has seen the new commit, it still targets the revision that failed.",
         annotations(read_only_hint = true)
     )]
     async fn wait_for(
@@ -183,25 +190,67 @@ impl KubeMcp {
         Extension(parts): Extension<Parts>,
         Parameters(p): Parameters<WaitParams>,
     ) -> Result<String, String> {
-        let args = json!({"context": p.context, "kind": p.kind, "namespace": p.namespace, "name": p.name, "condition": p.condition, "timeout_seconds": p.timeout_seconds});
+        let argo = super::argo_tools::is_argo_kind(&p.kind);
+        let context = if argo { None } else { p.context.clone() };
+        let args = json!({"context": context, "server": p.server, "kind": p.kind, "namespace": p.namespace,
+            "name": p.name, "condition": p.condition, "timeout_seconds": p.timeout_seconds});
         let mut call = self.begin(&parts, "wait_for", args)?;
-        let (client, kind) = self.kind(&call, &p.context, &p.kind).await?;
-        require_ns(&call, &kind, p.namespace.as_deref())?;
-        if argo_condition(&p.condition).is_some() && !kind.is("argoproj.io", "Application") {
-            return Err(call.fail(format!("{} is a condition of Argo CD Applications", p.condition)));
-        }
-        let access = access_for(&kind, &p.context, Verb::Get, p.namespace.clone(), Some(p.name.clone()));
-        self.authorize(&mut call, &access).await?;
-        let ns = if kind.namespaced { p.namespace.clone() } else { None };
         let secs = u64::from(p.timeout_seconds.unwrap_or(60).min(300));
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(secs);
         let deleted = p.condition == "deleted";
+        if argo {
+            if let Some(c) = &p.context
+                && p.server.is_none()
+            {
+                return Err(call.fail(format!(
+                    "an Argo CD Application is found through Argo CD's API, not on a context: omit `context` ({c}), \
+                     or pass `server` with the Argo CD server's name (argocd_apps names them)"
+                )));
+            }
+            if !call.policy().may_reach_argo(&[Verb::Get]) {
+                return Err(call.deny(super::argo_tools::no_argo_rule(Verb::Get)));
+            }
+            let app = self.argo_app(&call, p.server.as_deref(), p.namespace.as_deref(), &p.name).await?;
+            let place = super::argo_tools::place_of(&app);
+            self.authorize_argo(&mut call, &place, Verb::Get).await?;
+            let (ns, name) = (app.app.namespace.clone(), app.app.name.clone());
+            loop {
+                let state = match k8s::argo::api::read_app_opt(app.server.clone(), ns.clone(), name.clone()).await {
+                    Ok(None) => deleted.then_some(true),
+                    Ok(Some(_)) if deleted => None,
+                    Ok(Some(v)) => match condition_met(&v, &p.condition) {
+                        Ok(state) => state,
+                        Err(why) => return call.finish(Err(anyhow::anyhow!("Application {name}: {why}"))),
+                    },
+                    Err(e) => return call.finish(Err(anyhow::anyhow!(e))),
+                };
+                if state == Some(true) {
+                    return call.finish(Ok(format!("Application {name}: {}", p.condition)));
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    return call.finish(Err(anyhow::anyhow!("timed out after {secs}s waiting for {}", p.condition)));
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                // Switched off, or the rules changed, while waiting: stop.
+                self.recheck_argo(&mut call, &place, Verb::Get)?;
+            }
+        }
+        let Some(context) = context else {
+            return Err(call.fail("`context` is needed, but for an Argo CD Application"));
+        };
+        let (client, kind) = self.kind(&call, &context, &p.kind).await?;
+        require_ns(&call, &kind, p.namespace.as_deref())?;
+        if argo_condition(&p.condition).is_some() {
+            return Err(call.fail(format!("{} is a condition of Argo CD Applications", p.condition)));
+        }
+        let access = access_for(&kind, &context, Verb::Get, p.namespace.clone(), Some(p.name.clone()));
+        self.authorize(&mut call, &access).await?;
+        let ns = if kind.namespaced { p.namespace.clone() } else { None };
         loop {
             let state = match get_named(&client, &kind, ns.as_deref(), &p.name, false).await {
                 Ok(_) if deleted => None,
                 Ok(v) => match condition_met(&v, &p.condition) {
                     Ok(state) => state,
-                    // Argo CD won't get there on its own: say why now rather than at the timeout.
                     Err(why) => return call.finish(Err(anyhow::anyhow!("{} {}: {why}", kind.ar.kind, p.name))),
                 },
                 Err(e) if k8s::is_not_found(&e) => deleted.then_some(true),

@@ -340,7 +340,9 @@ fn confirm_api(
         (ArgoAction::HardRefresh, _) => api::Action::Refresh { hard: true },
         (ArgoAction::Sync, _) => api::Action::Sync(SyncRequest::default()),
         (ArgoAction::Terminate, _) => api::Action::Terminate,
-        (ArgoAction::Rollback(_), Some(Ok(Op::Rollback { id: Some(id), .. }))) => api::Action::Rollback { id },
+        (ArgoAction::Rollback(_), Some(Ok(Op::Rollback { id: Some(id), .. }))) => {
+            api::Action::Rollback { id, dry_run: false }
+        }
         (ArgoAction::Rollback(_), _) => return refused("that deployment has no id".into(), window, cx),
     };
     let label = action.label();
@@ -352,7 +354,7 @@ fn confirm_api(
         ArgoAction::Rollback(_) => ROLLBACK_NOTE,
     };
     let title = match &call {
-        api::Action::Rollback { id } => {
+        api::Action::Rollback { id, .. } => {
             let to = ops::rollback_target(app, Some(*id)).map_or_default(ops::deployment_label);
             format!("Roll back Application {name} to {to}?")
         }
@@ -366,7 +368,7 @@ fn confirm_api(
         api::Action::Refresh { hard: true } => format!("get {target} --hard-refresh"),
         api::Action::Sync(_) => format!("sync {target}"),
         api::Action::Terminate => format!("terminate-op {target}"),
-        api::Action::Rollback { id } => format!("rollback {target} {id}"),
+        api::Action::Rollback { id, .. } => format!("rollback {target} {id}"),
     };
     let cmd = format!("argocd app {args} --server {}", shell_word(&server_name));
     let guard = Guard::protected(&server_name, window, cx);

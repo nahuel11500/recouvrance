@@ -42,7 +42,8 @@ Useful variables: `RECOUVRANCE_PAGE` (`apply`, `settings`, `cluster`, `access`, 
 `RECOUVRANCE_FILTER`, `RECOUVRANCE_ACT` (comma-separated hooks, see `src/app/demo.rs` and
 `src/details/demo.rs`; `timeline:all` shows every event on the Timeline, `page:argo,argo-example`
 shows the Argo CD dashboard on a made-up example, no real data, `page:argo,argo-journal-example`
-its sync journal, `page:argo,argo-example-list` its list of environments, and `page:argo,argo-sync-example-oos` (or
+its sync journal, `page:argo,argo-example-list` its list of environments,
+`page:argo,argo-example-overview` its overview, and `page:argo,argo-sync-example-oos` (or
 `-example`, `-example-oos-armed`) its grouped sync), `RECOUVRANCE_INPUT`
 (`click:x,y;key:enter;wait:2`; `shot:name.png` saves a frame next to the snapshot, for
 recordings), `RECOUVRANCE_WRITES=1`, `RECOUVRANCE_DARK=1`, `RECOUVRANCE_ZOOM`,
@@ -60,6 +61,9 @@ process's resident memory (Linux):
 ```sh
 RECOUVRANCE_CONTEXT=kind-dev RECOUVRANCE_BACKTIME=pods,deployments,3 cargo run --features dev -- --snapshot out.png 8
 ```
+
+`RECOUVRANCE_WINDOWS=2` opens a second window on the same contexts, drawn like the first and put
+on the same `RECOUVRANCE_PAGE`: what a second window costs, its scans shared with the first.
 
 `RECOUVRANCE_FIRSTROWS=1` prints to stderr, from the moment a connect starts, when each cluster's
 first rows reach the table and when its list is complete. With a context that can't be reached
