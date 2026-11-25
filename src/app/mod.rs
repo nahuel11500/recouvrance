@@ -563,7 +563,7 @@ impl AppView {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let (contexts, current, status) = match k8s::load_contexts() {
             Ok(c) => (c.names, dev_var("RECOUVRANCE_CONTEXT").or(c.current), None),
-            Err(e) => (Vec::new(), None, Some(format!("{e:#}").into())),
+            Err(e) => (Vec::new(), None, Some(SharedString::from(format!("{e:#}")))),
         };
         // One store for every window: a window never saves over the stars of another.
         let favorites = crate::favorites::shared(cx);
@@ -807,7 +807,7 @@ impl AppView {
             forwards_open: false,
             table,
             // A kubeconfig that can't be read shows where connect errors do.
-            connect_notes: status.iter().map(|s| s.to_string()).collect(),
+            connect_notes: status.iter().map(SharedString::to_string).collect(),
             connect_errors: status,
             conn: conn::ConnStates::default(),
             skipped_groups: HashSet::new(),
