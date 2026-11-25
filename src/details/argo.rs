@@ -1,6 +1,9 @@
-//! A page's Argo CD section: reading the Applications on Argo CD's cluster, opening one,
-//! and its actions (Refresh, Sync with its options, Terminate, Roll back), sent with that
-//! cluster's client. The Argo CD page asks the same of its rows through `confirm_argo_action`.
+//! A page's Argo CD section: the Application that deployed the object (or those deploying
+//! into a namespace), found in what Argo CD's API feeds hold (a hub's Kubernetes API is read
+//! only when no server has it, until it goes, #1054), opening one, and its actions (Refresh,
+//! Sync, Terminate, Roll back): by Argo CD's API (`confirm_api_action`) for one read there,
+//! with the hub's client (`confirm_argo_action`, Sync with its options) for one read on a hub.
+//! The Argo CD page asks the same of its rows.
 
 use std::rc::Rc;
 use std::sync::Arc;
@@ -17,8 +20,9 @@ use super::{ConfirmButtons as _, DetailPanel, Guard, RunAs, WriteFuture, confirm
 use crate::k8s::argo::api;
 use crate::k8s::argo::diagnosis::Res;
 use crate::k8s::argo::ops::{self, Op, SyncRequest};
-use crate::k8s::argo::{Hub, Lookup};
+use crate::k8s::argo::{Hub, Lookup, Source};
 use crate::k8s::{self, ObjectRef};
+use crate::ui::argo::OpenArgoApp;
 
 /// What Refresh, Hard refresh, Sync, Terminate and Roll back do, in their confirmations.
 pub(super) const REFRESH_NOTE: &str = "Argo CD compares it with git again. Nothing is deployed.";
@@ -274,11 +278,12 @@ fn confirm_operation(t: Target, action: ArgoAction, app: &Value, done: Done, win
 }
 
 /// Confirm, then run `action` on the Application `ns/name` read from the Argo CD API server
-/// `endpoint`, through that API: write mode applies when it is sent, as to any write, and
+/// `endpoint`, through that API: a server set read-only (or the hub context tied to it) is
+/// refused before anything is asked, write mode applies when it is sent, as to any write, and
 /// the confirmation is a protected context's (the name typed, or a wait), named after the
 /// server. A sync, a terminate or a rollback reads the Application first, and what Argo CD
 /// would refuse is said instead. A sync here is of the whole Application, with its own sync
-/// options. What it changes comes back on the page's stream.
+/// options. What it changes comes back on the feed's stream.
 pub(crate) fn confirm_api_action(
     endpoint: &Arc<api::Endpoint>,
     ns: &str,
@@ -287,7 +292,8 @@ pub(crate) fn confirm_api_action(
     window: &mut Window,
     cx: &mut App,
 ) {
-    if !super::ensure_writes(window, cx) {
+    let protected = api::read_only(endpoint).unwrap_or_else(|| endpoint.name());
+    if !super::not_read_only(&protected, window, cx) || !super::ensure_writes(window, cx) {
         return;
     }
     let (endpoint, ns, name) = (endpoint.clone(), ns.to_string(), name.to_string());
@@ -566,6 +572,8 @@ pub struct OpenOn {
 
 impl EventEmitter<OpenOn> for DetailPanel {}
 
+impl EventEmitter<OpenArgoApp> for DetailPanel {}
+
 impl DetailPanel {
     /// The read of the Argo CD section for the object as last read; None while it is deleted.
     fn argo_work(&self) -> Option<std::pin::Pin<Box<dyn Future<Output = Lookup>>>> {
@@ -626,27 +634,45 @@ impl DetailPanel {
         self.argo_load.spawn(cx, work, move |this, lookup, cx| this.set_argo(lookup, started, cx));
     }
 
-    /// Open the Application shown at `ix`, on Argo CD's cluster.
+    /// Open the Application shown at `ix`: on the Argo CD page's dashboard when read by Argo
+    /// CD's API, else on Argo CD's cluster.
     pub fn open_argo_app(&mut self, ix: usize, cx: &mut Context<Self>) {
         let Some(found) = self.argo.apps.get(ix) else { return };
+        let hub = match &found.source {
+            Source::Api(endpoint) => {
+                let (namespace, name) = (found.app.namespace.clone(), found.app.name.clone());
+                cx.emit(OpenArgoApp { instance: endpoint.instance(), namespace, name });
+                return;
+            }
+            Source::Hub(hub) => hub,
+        };
         let obj = ObjectRef {
             kind: k8s::argo::application_kind(),
             name: found.app.name.clone(),
             namespace: Some(found.app.namespace.clone()),
             uid: String::new(),
         };
-        cx.emit(OpenOnContext { context: found.hub.context.clone(), client: found.hub.client.clone(), obj });
+        cx.emit(OpenOnContext { context: hub.context.clone(), client: hub.client.clone(), obj });
     }
 
-    /// Confirm, then run `action` on the Application shown at `ix`, with the client of Argo
-    /// CD's cluster: write mode, its protection and the write gate apply as to any write.
+    /// Confirm, then run `action` on the Application shown at `ix`: by Argo CD's API when read
+    /// there (the server's protection and the write gate apply, see `confirm_api_action`),
+    /// else with the client of Argo CD's cluster (write mode, its protection and the write
+    /// gate apply as to any write).
     pub fn confirm_argo(&mut self, ix: usize, action: ArgoAction, window: &mut Window, cx: &mut Context<Self>) {
         let Some(found) = self.argo.apps.get(ix).cloned() else { return };
-        let panel = cx.entity().downgrade();
-        let done = move |_: &mut Window, cx: &mut App| {
-            let _ = panel.update(cx, Self::reload_argo);
-        };
-        confirm_argo_action(&found.hub, &found.app.namespace, &found.app.name, action, done, window, cx);
+        let (ns, name) = (&found.app.namespace, &found.app.name);
+        match &found.source {
+            // What it changes comes back on the feed, read again on the page's next round.
+            Source::Api(endpoint) => confirm_api_action(endpoint, ns, name, action, window, cx),
+            Source::Hub(hub) => {
+                let panel = cx.entity().downgrade();
+                let done = move |_: &mut Window, cx: &mut App| {
+                    let _ = panel.update(cx, Self::reload_argo);
+                };
+                confirm_argo_action(hub, ns, name, action, done, window, cx);
+            }
+        }
     }
 
     /// Confirm, then run `action` on the Application of this page (its cluster is Argo CD's).

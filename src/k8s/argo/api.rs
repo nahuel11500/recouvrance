@@ -10,7 +10,9 @@
 //! so only what the page shows comes back), then kept live from Argo CD's application stream
 //! (`/api/v1/stream/applications`, server-sent events). A stream that ends or fails is opened
 //! again after a backoff (1 s, doubling to 60 s), listing again first: nothing is polled. A
-//! server's feed runs while a window shows the Argo CD page ([`watch`]), shared by them all.
+//! server's feed runs while a window shows the Argo CD page ([`watch`]), shared by them all,
+//! and a while after a lookup asked for it: an object's Application, on its page or for an
+//! agent, is found in what the feeds hold ([`held_apps`]).
 //!
 //! The actions of the Argo CD page on an Application read this way (refresh, sync,
 //! terminate, roll back) go through the same API ([`act`]), refused while write mode is off.
@@ -27,6 +29,9 @@ use serde_json::{Map, Value, json};
 use super::server::{self, Login, Server, encode, scrub};
 use super::windows::{self, SyncWindow};
 use super::{DEFAULT_NAMESPACE, Summary, TRACKING_ID};
+
+mod held;
+pub use held::held_apps;
 
 /// Where the tokens set in Settings → Argo CD are kept, by server address (mode 0600).
 const TOKENS_FILE: &str = "argocd-api-tokens.json";
@@ -1373,6 +1378,15 @@ fn sync_body(mut body: Value, req: &super::ops::SyncRequest) -> Value {
     body
 }
 
+/// The context whose read-only setting refuses a write to `endpoint`, if one does: a hub
+/// context tied to this server (Settings → Per cluster) is the same Argo CD, so its setting
+/// counts though the write goes through the API; else the server's name, as its protection
+/// is keyed.
+pub fn read_only(endpoint: &Endpoint) -> Option<String> {
+    let servers = crate::settings::with(|s| s.argocd_servers.clone());
+    server::read_only_context(&servers, &endpoint.server.base, &endpoint.name(), crate::settings::is_read_only)
+}
+
 /// Ask Argo CD for `action` on the Application `namespace/name`, by its API, with the
 /// server's login as the config has it now (`current`). Refused while write mode is off, or
 /// the server (or a hub context tied to it) is set read-only, checked as it is sent, as the
@@ -1409,14 +1423,8 @@ pub async fn act_read(
             }
             read = Some((app, op));
         }
-        // A hub context tied to this server (Settings → Per cluster) is the same Argo CD:
-        // its read-only setting counts, though the write goes through the API. Else the
-        // server's name, as its protection is keyed.
         let server_name = endpoint.name();
-        let servers = crate::settings::with(|s| s.argocd_servers.clone());
-        let read_only =
-            server::read_only_context(&servers, &endpoint.server.base, &server_name, crate::settings::is_read_only);
-        if let Some(why) = read_only
+        if let Some(why) = read_only(&endpoint)
             .map_or_else(|| crate::k8s::gate::refusal(&server_name), |c| Some(crate::k8s::gate::read_only_refusal(&c)))
         {
             return Ok(Err(why));

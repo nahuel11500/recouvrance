@@ -1021,10 +1021,10 @@ async fn get_application(hub: &Hub, ns: &str, name: &str) -> Result<Value> {
     super::get_object(hub.client.clone(), obj).await
 }
 
-/// An Application found, with the hub it was read on.
+/// An Application found, with where it was read: Argo CD's API, or a hub.
 #[derive(Clone)]
 pub struct Found {
-    pub hub: Hub,
+    pub source: Source,
     pub app: Summary,
 }
 
@@ -1052,7 +1052,155 @@ pub async fn for_object(
     obj: Value,
 ) -> Lookup {
     // Off the UI thread: a hub's Applications can be many and big.
-    super::run(async move { Ok(object_lookup(connected, here, group, kind, obj).await) }).await.unwrap_or_default()
+    let read = async move {
+        let Some(by) = tracked_by(&group, &kind, &obj) else { return Ok(Lookup::default()) };
+        let api = api_object_lookup(&here, &by, &group, &kind, &obj).await;
+        if let Some(found) = api.as_ref().filter(|l| !l.apps.is_empty()) {
+            return Ok(found.clone());
+        }
+        // Hubs stay a second source until the Argo CD page reads only Argo CD's API (#1054).
+        let hub = object_lookup(connected, here, group, kind, obj).await;
+        Ok(match api {
+            Some(api) if hub.apps.is_empty() => api,
+            _ => hub,
+        })
+    };
+    super::run(read).await.unwrap_or_default()
+}
+
+/// The longest wait for an Argo CD server's first list in a lookup (one that failed answers
+/// at once: see `api::held_apps`), and for an Application read whole.
+const API_WAIT: Duration = PROBE_TIMEOUT;
+
+/// Whether the Application `app`, read by Argo CD's API, is the one `by` names: a tracking id
+/// names it by name, and by namespace when it gives one; an instance label by name.
+pub fn names_app(by: &TrackedBy, app: &Summary) -> bool {
+    match by {
+        TrackedBy::Id(t) => app.name == t.app && t.app_ns.as_ref().is_none_or(|ns| *ns == app.namespace),
+        TrackedBy::Label(l) => app.name == *l,
+    }
+}
+
+/// Whether an Application `by` names deployed the object: by a tracking id, when it deploys to
+/// the object's cluster (`here`) or tracks the object; by a label (Helm sets it too), when it
+/// does both.
+pub fn fits(by: &TrackedBy, here: Option<bool>, tracks: bool) -> bool {
+    match by {
+        TrackedBy::Id(_) => here == Some(true) || tracks,
+        TrackedBy::Label(_) => here == Some(true) && tracks,
+    }
+}
+
+/// An Application named for an object, read by Argo CD's API.
+pub struct ApiCandidate {
+    pub endpoint: Arc<api::Endpoint>,
+    /// The Application whole, or what the feed holds of it when it couldn't be read whole.
+    pub app: Value,
+    /// It deploys to the object's cluster; None when that can't be told (`app_deploys_to`).
+    pub here: Option<bool>,
+    /// Its `status.resources` lists the object.
+    pub tracks: bool,
+}
+
+/// What the Argo CD servers say of the object `obj` (of `group`/`kind`, on the context `here`)
+/// that `by` names an Application for: the Applications of that name found in the feeds
+/// (`api::held_apps`, no list of their own), each read whole (its resources say whether it
+/// tracks the object), and why some servers said nothing. A label (Helm sets it too) leaves
+/// out at once those that deploy elsewhere. Only the servers `use_server` accepts are read,
+/// with `start` (a feed started when none runs), and the Applications `may_read` lets through
+/// (server name, Application): the others are said.
+/// None when no server is set, logged in to or turned on.
+pub async fn api_candidates(
+    here: &str,
+    by: &TrackedBy,
+    obj: (&str, &str, &Value),
+    use_server: impl Fn(&str) -> bool,
+    start: bool,
+    may_read: impl Fn(&str, &Summary) -> bool,
+) -> Option<(Vec<ApiCandidate>, Vec<String>, Vec<String>)> {
+    let (group, kind, obj) = obj;
+    let ns = obj.pointer("/metadata/namespace").and_then(Value::as_str).unwrap_or_default();
+    let name = obj.pointer("/metadata/name").and_then(Value::as_str).unwrap_or_default();
+    let targets = targets();
+    let here = target(&targets, here);
+    let servers = crate::settings::with(|s| s.argocd_servers.clone());
+    let at = |e: &api::Endpoint| server_home(&servers, &e.server.base, &targets);
+    let held = api::held_apps(use_server, start, API_WAIT, |e, a| {
+        names_app(by, &a.summary)
+            && (matches!(by, TrackedBy::Id(_)) || app_deploys_to(&a.value, &at(e), &here) != Some(false))
+    })
+    .await;
+    if held.is_empty() {
+        return None;
+    }
+    let (mut notes, mut read, mut wanted) = (Vec::new(), Vec::new(), Vec::new());
+    for h in held {
+        let server = h.endpoint.name();
+        match h.apps {
+            Err(e) => notes.push(format!("{server}: {e}")),
+            Ok(apps) => {
+                for a in apps {
+                    if may_read(&server, &a.summary) {
+                        wanted.push((h.endpoint.clone(), a));
+                    } else {
+                        let (ns, name) = (&a.summary.namespace, &a.summary.name);
+                        notes.push(format!("{server}: your rules don't let you read Application {ns}/{name}"));
+                    }
+                }
+                read.push(server);
+            }
+        }
+    }
+    // Each read whole, all at once, each bounded: one slow server holds no other.
+    let whole = futures::future::join_all(wanted.iter().map(|(e, a)| {
+        let get = api::read_app(e.clone(), a.summary.namespace.clone(), a.summary.name.clone());
+        async move { tokio::time::timeout(API_WAIT, get).await.unwrap_or_else(|_| Err("did not answer".into())) }
+    }))
+    .await;
+    let mut found = Vec::new();
+    for ((endpoint, held), whole) in wanted.into_iter().zip(whole) {
+        let app = match whole {
+            Ok(app) => app,
+            // A label is only a hint: without the Application's resources, it says nothing.
+            Err(_) if matches!(by, TrackedBy::Label(_)) => continue,
+            Err(e) => {
+                let (ns, name) = (&held.summary.namespace, &held.summary.name);
+                notes.push(format!("{}: Application {ns}/{name} could not be read whole: {e}", endpoint.name()));
+                held.value.clone()
+            }
+        };
+        let here = app_deploys_to(&app, &at(&endpoint), &here);
+        let tracks = resource_of(&app, group, kind, ns, name).is_some();
+        found.push(ApiCandidate { endpoint, app, here, tracks });
+    }
+    Some((found, notes, read))
+}
+
+/// [`for_object`] on Argo CD's API servers; None when there is none to read.
+async fn api_object_lookup(here: &str, by: &TrackedBy, group: &str, kind: &str, obj: &Value) -> Option<Lookup> {
+    let (found, errors, read) = api_candidates(here, by, (group, kind, obj), |_| true, true, |_, _| true).await?;
+    let ns = obj.pointer("/metadata/namespace").and_then(Value::as_str).unwrap_or_default();
+    let name = obj.pointer("/metadata/name").and_then(Value::as_str).unwrap_or_default();
+    let summary = |c: &ApiCandidate| {
+        let mut s = Summary::of(&c.app).with_own(&c.app, group, kind, ns, name);
+        if s.namespace.is_empty() {
+            s.namespace = DEFAULT_NAMESPACE.into();
+        }
+        Found { source: Source::Api(c.endpoint.clone()), app: s }
+    };
+    let mut apps: Vec<Found> = found.iter().filter(|c| fits(by, c.here, c.tracks)).map(summary).collect();
+    // The only one of that name, whose destination can't be told: it can only be it.
+    if apps.is_empty() && matches!(by, TrackedBy::Id(_)) && found.len() == 1 && found[0].here.is_none() {
+        apps = found.iter().map(summary).collect();
+    }
+    let note = match (by, apps.is_empty(), errors.is_empty()) {
+        (_, _, false) => Some(format!("Argo CD could not be read: {}", errors.join("; "))),
+        (TrackedBy::Id(t), true, true) => {
+            Some(format!("Deployed by Argo CD Application {}, which is not on {}", t.app, read.join(", ")))
+        }
+        _ => None,
+    };
+    Some(Lookup { apps, note })
 }
 
 async fn object_lookup(
@@ -1129,7 +1277,7 @@ async fn object_lookup(
         };
         for app in apps {
             let here_too = targets_cluster(&app, &hub_target, &here);
-            found.push((here_too, Found { hub: hub.clone(), app: own(Summary::of(&app), &app) }));
+            found.push((here_too, Found { source: Source::Hub(hub.clone()), app: own(Summary::of(&app), &app) }));
         }
     }
     // Several hubs may hold an Application of that name: keep those deploying here, else
@@ -1152,7 +1300,55 @@ async fn object_lookup(
 /// The Applications that deploy into this namespace of the context `here`. Quiet when no
 /// context serves Argo CD.
 pub async fn for_namespace(connected: Vec<(String, Client)>, here: String, ns: String) -> Lookup {
-    super::run(async move { Ok(namespace_lookup(connected, here, ns).await) }).await.unwrap_or_default()
+    let read = async move {
+        let api = api_namespace_lookup(&here, &ns).await;
+        if let Some(found) = api.as_ref().filter(|l| !l.apps.is_empty()) {
+            return Ok(found.clone());
+        }
+        // Hubs stay a second source until the Argo CD page reads only Argo CD's API (#1054).
+        let hub = namespace_lookup(connected, here, ns).await;
+        Ok(match api {
+            Some(api) if hub.apps.is_empty() => api,
+            _ => hub,
+        })
+    };
+    super::run(read).await.unwrap_or_default()
+}
+
+/// [`for_namespace`] on Argo CD's API servers, from what their feeds hold: those whose
+/// destination is this namespace of this cluster. None when there is no server to read.
+async fn api_namespace_lookup(here: &str, ns: &str) -> Option<Lookup> {
+    let targets = targets();
+    let here = target(&targets, here);
+    let servers = crate::settings::with(|s| s.argocd_servers.clone());
+    let held = api::held_apps(
+        |_| true,
+        true,
+        API_WAIT,
+        |e, a| {
+            targets_namespace(&a.value, ns)
+                && targets_cluster(&a.value, &server_home(&servers, &e.server.base, &targets), &here)
+        },
+    )
+    .await;
+    if held.is_empty() {
+        return None;
+    }
+    let mut lookup = Lookup::default();
+    let mut errors = Vec::new();
+    for h in held {
+        match h.apps {
+            Ok(apps) => lookup
+                .apps
+                .extend(apps.iter().map(|a| Found { source: Source::Api(h.endpoint.clone()), app: a.summary.clone() })),
+            Err(e) => errors.push(format!("{}: {e}", h.endpoint.name())),
+        }
+    }
+    lookup.apps.sort_by(|a, b| (&a.app.name, a.source.label()).cmp(&(&b.app.name, b.source.label())));
+    if !errors.is_empty() {
+        lookup.note = Some(format!("Argo CD could not be read: {}", errors.join("; ")));
+    }
+    Some(lookup)
 }
 
 async fn namespace_lookup(connected: Vec<(String, Client)>, here: String, ns: String) -> Lookup {
@@ -1167,12 +1363,12 @@ async fn namespace_lookup(connected: Vec<(String, Client)>, here: String, ns: St
             Ok(list) => lookup.apps.extend(
                 list.iter()
                     .filter(|a| targets_cluster(a, &hub_target, &here) && targets_namespace(a, &ns))
-                    .map(|a| Found { hub: hub.clone(), app: Summary::of(a) }),
+                    .map(|a| Found { source: Source::Hub(hub.clone()), app: Summary::of(a) }),
             ),
             Err(e) => errors.push(format!("{}: {}", hub.context, super::lists::load_error(&e))),
         }
     }
-    lookup.apps.sort_by(|a, b| (&a.app.name, &a.hub.context).cmp(&(&b.app.name, &b.hub.context)));
+    lookup.apps.sort_by(|a, b| (&a.app.name, a.source.label()).cmp(&(&b.app.name, b.source.label())));
     if !errors.is_empty() {
         lookup.note = Some(format!("Argo CD could not be read: {}", errors.join("; ")));
     }
@@ -1793,6 +1989,39 @@ mod tests {
         assert_eq!(tracked_by("apps", "Deployment", &obj(None, None)), None);
         // A pod carries its workload's label; its workload is what Argo CD deployed.
         assert_eq!(tracked_by("", "Pod", &obj(None, Some("shop"))), None);
+    }
+
+    /// In Argo CD's API feeds, a tracking id names an Application by name, and by namespace
+    /// when it gives one (`<ns>_<app>`); a label by name, in any namespace.
+    #[test]
+    fn a_tracking_id_or_a_label_names_an_application_read_by_the_api() {
+        let app = |ns: &str, name: &str| Summary::of(&json!({"metadata": {"name": name, "namespace": ns}}));
+        let id = |text: &str| TrackedBy::Id(parse_tracking(text).unwrap());
+        let plain = id("shop:apps/Deployment:prod/web");
+        assert!(names_app(&plain, &app("argocd", "shop")));
+        assert!(names_app(&plain, &app("gitops", "shop")), "Argo CD's own namespace may not be argocd");
+        assert!(!names_app(&plain, &app("argocd", "shop-2")));
+        let in_ns = id("team-a_shop:apps/Deployment:prod/web");
+        assert!(names_app(&in_ns, &app("team-a", "shop")));
+        assert!(!names_app(&in_ns, &app("team-b", "shop")));
+        assert!(!names_app(&in_ns, &app("argocd", "shop")));
+        let label = TrackedBy::Label("shop".into());
+        assert!(names_app(&label, &app("team-b", "shop")));
+        assert!(!names_app(&label, &app("argocd", "web")));
+    }
+
+    /// A tracking id's Application deployed the object when it deploys here or tracks it; a
+    /// label's (Helm sets the same label) only when it does both.
+    #[test]
+    fn a_label_needs_both_the_destination_and_the_resource() {
+        let id = TrackedBy::Id(parse_tracking("shop:apps/Deployment:prod/web").unwrap());
+        let label = TrackedBy::Label("shop".into());
+        for here in [Some(true), Some(false), None] {
+            for tracks in [true, false] {
+                assert_eq!(fits(&id, here, tracks), here == Some(true) || tracks, "{here:?} {tracks}");
+                assert_eq!(fits(&label, here, tracks), here == Some(true) && tracks, "{here:?} {tracks}");
+            }
+        }
     }
 
     #[test]

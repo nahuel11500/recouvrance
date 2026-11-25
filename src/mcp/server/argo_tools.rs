@@ -1,7 +1,8 @@
 //! Argo CD for agents, from the hub to the destination: `argocd_apps` lists the Applications
 //! of the hubs an agent may read, each with the kubeconfig context it deploys to, and
 //! `describe_resource` and `get_changes` name the Application that deployed an object
-//! (`KubeMcp::managed_by`).
+//! (`KubeMcp::managed_by`), found first in what Argo CD's API feeds hold, on the servers the
+//! agent's rules name (a server is a rule's context, by its name), then on hubs.
 //!
 //! The hubs are those the user picked in Settings, else those the app or the agents' calls
 //! found serving Applications, and only those the agent's rules name: no other context is
@@ -41,6 +42,11 @@ pub struct ArgoAppsParams {
     #[schemars(description = "only those deploying to this namespace")]
     pub dest_namespace: Option<String>,
 }
+
+/// Said when no Argo CD server nor hub can be read for an object's Application.
+const NO_ARGO: &str = "No Argo CD is known that your rules name: no server set in Recouvrance (Settings → Argo CD) \
+     or logged in to with the argocd CLI, and no hub. Pass `context` with the context Argo CD runs in \
+     (list_contexts), or the user can pick it in Recouvrance (Settings → Contexts).";
 
 /// Said when no hub can be read.
 const NO_HUB: &str = "No Argo CD hub is known that your rules name. Pass `context` with the context Argo CD runs \
@@ -143,25 +149,81 @@ impl KubeMcp {
     }
 
     /// The Application that deployed `obj` (read on the context `here`), as `describe_resource`
-    /// and `get_changes` say it: by the object's tracking id or instance label, read on the
-    /// agent's hubs where an Allow rule lets it. None for an object that names no Application:
-    /// nothing is asked of any hub then.
+    /// and `get_changes` say it: by the object's tracking id or instance label. Found first in
+    /// what Argo CD's API feeds hold, on the servers the agent's rules name, among the
+    /// Applications an Allow rule lets it get or list there (`argo::api_candidates`: no list
+    /// of its own, a server down answers at once); a label alone reads only feeds running
+    /// already. Then, when no server has one of that name, on the agent's hubs where an Allow
+    /// rule lets it (hubs go with #1054). None for an object that names no Application:
+    /// nothing is asked of any server or hub then.
     pub(super) async fn managed_by(&self, call: &Call, here: &str, kind: &Kind, obj: &Value) -> Option<Managed> {
         let by = argo::tracked_by(&kind.ar.group, &kind.ar.kind, obj)?;
         let key = ObjectKey::of(kind, obj);
-        let hubs = self.agent_hubs(call.policy());
+        let policy = call.policy();
+        let app_kind = argo::application_kind();
+        let may_read = |server: &str, app: &Summary| {
+            let allowed = |verb: Verb| {
+                let a = access_for(&app_kind, server, verb, Some(app.namespace.clone()), Some(app.name.clone()));
+                policy.decide(&a).mode == Mode::Allow
+            };
+            allowed(Verb::Get) || allowed(Verb::List)
+        };
+        let start = matches!(by, TrackedBy::Id(_));
+        let api = argo::api_candidates(
+            here,
+            &by,
+            (key.group.as_str(), key.kind.as_str(), obj),
+            |server| policy.context_allowed(server),
+            start,
+            may_read,
+        )
+        .await;
+        let (mut read, mut notes, mut found) = (Vec::new(), Vec::new(), Vec::new());
+        if let Some((candidates, said, servers)) = api {
+            let tied = crate::settings::with(|s| s.argocd_servers.clone());
+            found.extend(candidates.into_iter().map(|c| {
+                // gitops and wait_for act on a hub context: the one tied to this server, if open to it.
+                let hub = argo::server::contexts_of(&tied, &c.endpoint.server.base)
+                    .find(|h| policy.context_allowed(h))
+                    .map(String::from);
+                Candidate { hub: c.endpoint.name(), app: c.app, here: c.here, tracks: c.tracks, via: Via::Server(hub) }
+            }));
+            notes.extend(said);
+            read.extend(servers);
+        }
+        if found.is_empty() {
+            let (hubs, said, on_hubs) = self.managed_on_hubs(policy, here, &by, &key).await;
+            read.extend(hubs);
+            notes.extend(said);
+            found = on_hubs;
+        }
+        let picked = pick(&by, found);
+        let text = managed_text(&by, &picked, &key, &read, &notes)?;
+        let app = match picked {
+            Pick::One { app, .. } => Some(app),
+            _ => None,
+        };
+        Some(Managed { text, app })
+    }
+
+    /// The Applications `by` names on the agent's hubs: the hubs, why some said nothing, and
+    /// what the others named.
+    async fn managed_on_hubs(
+        &self,
+        policy: &Policy,
+        here: &str,
+        by: &TrackedBy,
+        key: &ObjectKey,
+    ) -> (Vec<String>, Vec<String>, Vec<Candidate>) {
+        let hubs = self.agent_hubs(policy);
         let targets = argo::targets();
         let here = argo::target(&targets, here);
-        let policy = call.policy();
         let reads = read_hubs(
             &hubs,
-            &by,
+            by,
             |hub| self.hub.ready(hub),
             HUB_BOUND,
-            |hub: String| {
-                let by = &by;
-                async move { self.manager_on(policy, &hub, by).await }
-            },
+            |hub: String| async move { self.manager_on(policy, &hub, by).await },
         )
         .await;
         let mut notes = Vec::new();
@@ -179,16 +241,10 @@ impl KubeMcp {
             for app in apps {
                 let here = argo::app_deploys_to(&app, &hub_target, &here);
                 let tracks = argo::resource_of(&app, &key.group, &key.kind, &key.namespace, &key.name).is_some();
-                found.push(Candidate { hub: hub.clone(), app, here, tracks });
+                found.push(Candidate { hub: hub.clone(), app, here, tracks, via: Via::Hub });
             }
         }
-        let picked = pick(&by, found);
-        let text = managed_text(&by, &picked, &key, &hubs, &notes)?;
-        let app = match picked {
-            Pick::One { app, .. } => Some(app),
-            _ => None,
-        };
-        Some(Managed { text, app })
+        (hubs, notes, found)
     }
 
     /// The Applications on `hub` that `by` may name, as far as the agent's Allow rules let it
@@ -394,9 +450,21 @@ fn plan(by: &TrackedBy, ready: bool, failed: Option<String>) -> Plan {
     }
 }
 
-/// An Application a hub named for the object.
+/// Where an Application named for the object was read.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Via {
+    /// On a hub context's Kubernetes API (the candidate's `hub`).
+    Hub,
+    /// By Argo CD's API (the candidate's `hub` is the server's name), with the hub context tied
+    /// to that server in Settings that the agent's rules name, for `gitops` and `wait_for`.
+    Server(Option<String>),
+}
+
+/// An Application a hub or an Argo CD server named for the object.
 struct Candidate {
+    /// The hub context, or the server's name.
     hub: String,
+    via: Via,
     app: Value,
     /// It deploys to the object's cluster; None when that can't be told (a destination named
     /// as an Argo CD cluster Secret is, see `argo::app_deploys_to`).
@@ -421,6 +489,7 @@ enum Fit {
 enum Pick {
     One {
         hub: String,
+        via: Via,
         app: Value,
         fit: Fit,
     },
@@ -443,10 +512,7 @@ fn pick(by: &TrackedBy, found: Vec<Candidate>) -> Pick {
         format!("{} {}/{}", c.hub, field("/metadata/namespace"), field("/metadata/name"))
     };
     let here = |c: &Candidate| c.here == Some(true);
-    let fits = |c: &Candidate| match by {
-        TrackedBy::Id(_) => here(c) || c.tracks,
-        TrackedBy::Label(_) => here(c) && c.tracks,
-    };
+    let fits = |c: &Candidate| argo::fits(by, c.here, c.tracks);
     let (mut fit, rest): (Vec<Candidate>, Vec<Candidate>) = found.into_iter().partition(fits);
     let rank = |c: &Candidate| u8::from(here(c)) + u8::from(c.tracks);
     let Some(best) = fit.iter().map(rank).max() else {
@@ -455,7 +521,7 @@ fn pick(by: &TrackedBy, found: Vec<Candidate>) -> Pick {
         return match (by, unsure.len()) {
             (TrackedBy::Id(_), 1) => {
                 let c = unsure.remove(0);
-                Pick::One { hub: c.hub, app: c.app, fit: Fit::Unsure }
+                Pick::One { hub: c.hub, via: c.via, app: c.app, fit: Fit::Unsure }
             }
             (TrackedBy::Id(_), 2..) => Pick::Several(unsure.iter().map(name).collect()),
             _ if unsure.is_empty() && elsewhere.is_empty() => Pick::NotFound,
@@ -466,7 +532,7 @@ fn pick(by: &TrackedBy, found: Vec<Candidate>) -> Pick {
     if fit.len() == 1 {
         let c = fit.remove(0);
         let fit = if best == 2 { Fit::Both } else { Fit::One };
-        return Pick::One { hub: c.hub, app: c.app, fit };
+        return Pick::One { hub: c.hub, via: c.via, app: c.app, fit };
     }
     Pick::Several(fit.iter().map(name).collect())
 }
@@ -683,8 +749,8 @@ fn managed_text(by: &TrackedBy, found: &Pick, key: &ObjectKey, hubs: &[String], 
     };
     let lead = format!("Argo CD: managed by Application {named} ({how})");
     let not_read = if notes.is_empty() { String::new() } else { format!(" Not read: {}.", notes.join("; ")) };
-    let (hub, app, fit) = match (found, by) {
-        (Pick::One { hub, app, fit }, _) => (hub, app, *fit),
+    let (hub, via, app, fit) = match (found, by) {
+        (Pick::One { hub, via, app, fit }, _) => (hub, via, app, *fit),
         (Pick::Several(apps), _) => {
             return Some(format!(
                 "{lead}: several fit, which one is unclear: {}.{not_read} Read them with argocd_apps.\n",
@@ -698,15 +764,19 @@ fn managed_text(by: &TrackedBy, found: &Pick, key: &ObjectKey, hubs: &[String], 
                 apps.join(", ")
             ));
         }
-        (Pick::NotFound, _) if hubs.is_empty() => return Some(format!("{lead}. {NO_HUB}\n")),
+        (Pick::NotFound, _) if hubs.is_empty() => return Some(format!("{lead}. {NO_ARGO}\n")),
         (Pick::NotFound, _) if notes.is_empty() => {
             return Some(format!("{lead}, not found on {}.\n", hubs.join(", ")));
         }
-        (Pick::NotFound, _) => return Some(format!("{lead}, not found on the hubs read.{not_read}\n")),
+        (Pick::NotFound, _) => return Some(format!("{lead}, not found on the Argo CDs read.{not_read}\n")),
     };
     let s = Summary::of(app).with_own(app, &key.group, &key.kind, &key.namespace, &key.name);
+    let on = match via {
+        Via::Hub => format!("hub {hub}"),
+        Via::Server(_) => format!("Argo CD server {hub}"),
+    };
     let mut out = format!(
-        "Argo CD: managed by Application {}/{} on hub {hub} ({how}): {}, {}, auto-sync {}",
+        "Argo CD: managed by Application {}/{} on {on} ({how}): {}, {}, auto-sync {}",
         s.namespace,
         s.name,
         s.sync,
@@ -738,10 +808,19 @@ fn managed_text(by: &TrackedBy, found: &Pick, key: &ObjectKey, hubs: &[String], 
     if fit != Fit::Both && !not_read.is_empty() {
         out.push_str(&not_read);
     }
-    out.push_str(&format!(
-        " Act on it with gitops or wait_for: context {hub}, kind applications, namespace {}, name {}.\n",
-        s.namespace, s.name
-    ));
+    let act = match via {
+        Via::Hub => Some(hub),
+        Via::Server(tied) => tied.as_ref(),
+    };
+    match act {
+        Some(context) => out.push_str(&format!(
+            " Act on it with gitops or wait_for: context {context}, kind applications, namespace {}, name {}.\n",
+            s.namespace, s.name
+        )),
+        None => out.push_str(
+            " gitops and wait_for act on it through a hub context: none tied to this server is open to you.\n",
+        ),
+    }
     Some(out)
 }
 
@@ -880,7 +959,7 @@ mod tests {
         let by = TrackedBy::Id(argo::parse_tracking("web-workload:apps/Deployment:web/web").unwrap());
         let mut found = app("web-workload", "OutOfSync", "Healthy", false, json!({"server": "https://prod.example"}));
         found["status"]["resources"] = json!([{"group": "apps", "kind": "Deployment", "namespace": "web", "name": "web", "status": "OutOfSync", "health": {"status": "Healthy"}}]);
-        let one = Pick::One { hub: "hub".into(), app: found, fit: Fit::Both };
+        let one = Pick::One { hub: "hub".into(), via: Via::Hub, app: found.clone(), fit: Fit::Both };
         let text = managed_text(&by, &one, &key(), &["hub".into()], &[]).unwrap();
         assert!(text.starts_with("Argo CD: managed by Application argocd/web-workload on hub hub"), "{text}");
         assert!(text.contains("OutOfSync, Healthy, auto-sync off, revision aaaaaaa."), "{text}");
@@ -909,6 +988,24 @@ mod tests {
         assert_eq!(managed_text(&label, &elsewhere, &key(), &["other".into()], &[]), None);
         let text = managed_text(&label, &one, &key(), &["hub".into()], &[]).unwrap();
         assert!(text.contains("argocd/web-workload on hub hub (its app.kubernetes.io/instance label"), "{text}");
+        // Read by Argo CD's API: named by its server, acted on through the hub tied to it, if any.
+        let server = "argocd.example.com".to_string();
+        let on = |via: Via| Pick::One { hub: server.clone(), via, app: found.clone(), fit: Fit::Both };
+        let text = managed_text(&by, &on(Via::Server(None)), &key(), std::slice::from_ref(&server), &[]).unwrap();
+        assert!(
+            text.starts_with(
+                "Argo CD: managed by Application argocd/web-workload on Argo CD server argocd.example.com"
+            ),
+            "{text}"
+        );
+        assert!(text.contains("This object in it: OutOfSync, Healthy."), "{text}");
+        assert!(text.contains("none tied to this server is open to you"), "{text}");
+        assert!(!text.contains("context argocd.example.com"), "{text}");
+        let text = managed_text(&by, &on(Via::Server(Some("hub".into()))), &key(), std::slice::from_ref(&server), &[])
+            .unwrap();
+        assert!(text.contains("context hub, kind applications, namespace argocd, name web-workload"), "{text}");
+        let text = managed_text(&by, &Pick::NotFound, &key(), &[server], &[]).unwrap();
+        assert!(text.contains("not found on argocd.example.com."), "{text}");
     }
 
     /// A hub left alone since it failed, and an Application found on another: the reply names
@@ -921,7 +1018,7 @@ mod tests {
         let found = || app("web-workload", "Synced", "Healthy", true, json!({"server": "https://prod.example"}));
         let hubs = ["hub-a".to_string(), "hub-b".to_string()];
         for (fit, said) in [(Fit::One, true), (Fit::Unsure, true), (Fit::Both, false)] {
-            let one = Pick::One { hub: "hub-a".into(), app: found(), fit };
+            let one = Pick::One { hub: "hub-a".into(), via: Via::Hub, app: found(), fit };
             let text = managed_text(&by, &one, &key(), &hubs, &skipped).unwrap();
             assert!(text.starts_with("Argo CD: managed by Application argocd/web-workload on hub hub-a"), "{text}");
             let note = "Not read: hub-b: not asked again yet, it failed less than 5 minutes ago: did not answer.";
@@ -930,6 +1027,7 @@ mod tests {
         }
         let unsure = Pick::One {
             hub: "hub-a".into(),
+            via: Via::Hub,
             app: app("web-workload", "Synced", "Healthy", true, json!({"name": "prod-eu"})),
             fit: Fit::Unsure,
         };
@@ -947,7 +1045,13 @@ mod tests {
     }
 
     fn candidate(hub: &str, here: bool, tracks: bool) -> Candidate {
-        Candidate { hub: hub.into(), app: app("web", "Synced", "Healthy", true, json!({})), here: Some(here), tracks }
+        Candidate {
+            hub: hub.into(),
+            via: Via::Hub,
+            app: app("web", "Synced", "Healthy", true, json!({})),
+            here: Some(here),
+            tracks,
+        }
     }
 
     /// A candidate whose destination can't be told (named as an Argo CD cluster Secret).
@@ -1043,7 +1147,10 @@ mod tests {
         // What reaches the reply: the hub left alone for a tracking id, nothing for a label.
         let notes = [skipped_note("read-hubs-down", "did not answer")];
         let text = managed_text(&id, &Pick::NotFound, &key(), &hubs, &notes).unwrap();
-        assert!(text.contains("not found on the hubs read. Not read: read-hubs-down: not asked again yet"), "{text}");
+        assert!(
+            text.contains("not found on the Argo CDs read. Not read: read-hubs-down: not asked again yet"),
+            "{text}"
+        );
         assert_eq!(managed_text(&label, &Pick::NotFound, &key(), &hubs, &[]), None);
     }
 
