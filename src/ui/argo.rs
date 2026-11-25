@@ -1419,7 +1419,7 @@ impl Render for ArgoView {
                     Button::new(id)
                         .small()
                         .when(self.list_shown == list, ButtonVariants::primary)
-                        .when(self.list_shown != list, |b| b.ghost())
+                        .when(self.list_shown != list, ButtonVariants::ghost)
                         .label(label)
                         .on_click(cx.listener(move |this, _, _, cx| this.show_list(list, cx)))
                 };
