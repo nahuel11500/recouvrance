@@ -17,6 +17,7 @@ use crate::k8s;
 use crate::k8s::Kind;
 use crate::k8s::argo::FleetApp;
 use crate::k8s::argo::api::{self, AgentAction};
+use crate::k8s::argo::dashboard::rollback_undoes;
 use crate::k8s::argo::diagnosis::{self, Diagnosis, DriftRead, MayRead, Res};
 use crate::k8s::argo::ops::{self, Op, SyncRequest};
 use crate::mcp::preview::Plan;
@@ -486,7 +487,8 @@ fn approval_detail(app: &serde_json::Value, op: &mut Op) -> Option<String> {
             *op = ops::pinned(app, op).ok()?;
             let Op::Rollback { id, .. } = op else { return None };
             let entry = ops::rollback_target(app, *id).ok()?;
-            Some(format!("rollback to {}", ops::deployment_label(entry)))
+            let undoes = rollback_undoes(app).map(|u| format!(". {u}")).unwrap_or_default();
+            Some(format!("rollback to {}{undoes}", ops::deployment_label(entry)))
         }
         _ => None,
     }

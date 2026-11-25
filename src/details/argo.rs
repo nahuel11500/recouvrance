@@ -19,6 +19,7 @@ use serde_json::Value;
 
 use super::{ConfirmButtons as _, DetailPanel, Guard, RunAs, WriteFuture, confirm_with, guard_ok, kubectl, shell_word};
 use crate::k8s::argo::api;
+use crate::k8s::argo::dashboard::rollback_undoes;
 use crate::k8s::argo::diagnosis::Res;
 use crate::k8s::argo::ops::{self, Op, SyncRequest};
 use crate::k8s::argo::{Hub, Lookup, Source};
@@ -354,6 +355,11 @@ fn confirm_api(
         ArgoAction::Terminate => TERMINATE_NOTE,
         ArgoAction::Rollback(_) => ROLLBACK_NOTE,
     };
+    // A selective sync after the newest deployment is undone too: say so.
+    let note: SharedString = match (&call, rollback_undoes(app)) {
+        (api::Action::Rollback { .. }, Some(undoes)) => format!("{note} {undoes}").into(),
+        _ => note.into(),
+    };
     let title = match &call {
         api::Action::Rollback { id, .. } => {
             let to = ops::rollback_target(app, Some(*id)).map_or_default(ops::deployment_label);
@@ -378,7 +384,7 @@ fn confirm_api(
             (endpoint.clone(), ns.clone(), name.clone(), call.clone(), guard.clone());
         alert
             .title(title.clone())
-            .description(note)
+            .description(note.clone())
             .child(confirm_with(&cmd, guard.as_ref(), &RunAs::default(), cx))
             .confirm_buttons(label, false, guard.as_ref())
             .on_ok(move |_, window, cx| {

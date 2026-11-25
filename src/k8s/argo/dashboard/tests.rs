@@ -439,3 +439,81 @@ fn a_list_copy_gives_cards_with_one_line_why() {
     assert_eq!(cards.summary.sync, full["status"]["sync"]["status"].as_str().unwrap());
     assert!(!cards.clean_is_known() || cards.summary.health == "Healthy");
 }
+
+/// An Application whose newest deployment is #14 at `e599d6d8` (6 days ago), and whose last
+/// operation is `op` started `mins` minutes ago.
+fn after_deployment(op: Value, mins: i64) -> Value {
+    let at = |m: i64| Timestamp::from_second(now().as_second() - m * 60).unwrap().to_string();
+    let mut state = op;
+    state["startedAt"] = json!(at(mins + 1));
+    state["finishedAt"] = json!(at(mins));
+    json!({
+        "metadata": {"name": "shop-prod-a-workload", "namespace": "argocd"},
+        "spec": {"source": {"repoURL": "https://git.example.com/deploy.git"}},
+        "status": {
+            "sync": {"status": "OutOfSync", "revision": "cd3e16f6aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+            "history": [
+                {"id": 13, "revision": "1cca9ca6aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "deployedAt": at(8 * 1440)},
+                {"id": 14, "revision": "e599d6d8aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "deployedAt": at(6 * 1440)},
+            ],
+            "resources": [
+                {"kind": "Deployment", "name": "api", "status": "Synced"},
+                {"kind": "Deployment", "name": "web", "status": "OutOfSync"},
+                {"kind": "ConfigMap", "name": "api", "status": "Synced"},
+                {"kind": "Job", "name": "migrate", "hook": true},
+            ],
+            "operationState": state,
+        },
+    })
+}
+
+fn selective(phase: &str) -> Value {
+    json!({
+        "phase": phase,
+        "operation": {
+            "initiatedBy": {"username": "jdoe"},
+            "sync": {"revision": "ebf7503baaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "resources": [
+                {"kind": "Deployment", "name": "api"}, {"kind": "ConfigMap", "name": "api"}
+            ]},
+        },
+        "syncResult": {"revision": "ebf7503baaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+    })
+}
+
+/// A selective sync after the newest deployment is said where the deployment is: in the
+/// Why, the Last sync and the roll back's confirmation (#1067).
+#[test]
+fn a_selective_sync_after_the_newest_deployment_is_said() {
+    let app = after_deployment(selective("Succeeded"), 5 * 1440);
+    let p = super::partial(&app).expect("a selective sync");
+    assert_eq!((p.resources, p.total, p.revision.as_str(), p.after), (2, 3, "ebf7503", Some(14)));
+    assert_eq!(p.by.as_deref(), Some("jdoe"));
+    assert!(p.text().starts_with("2 of 3 resources at ebf7503 (selective sync, "), "{}", p.text());
+    let last = last_sync(&app).unwrap();
+    assert_eq!(last.selective, Some((2, 3)));
+    let why = crate::k8s::argo::diagnosis::Diagnosis::of(&app, now());
+    let said: Vec<String> = why.findings.iter().filter_map(|f| f.message.clone()).collect();
+    assert!(
+        said.iter()
+            .any(|m| m.contains("2 of 3 resources at ebf7503") && m.contains("(e599d6d)") && m.contains("cd3e16f")),
+        "{said:?}"
+    );
+    let undoes = super::rollback_undoes(&app).unwrap();
+    assert!(undoes.contains("after deployment #14") && undoes.contains("Deployment/api, ConfigMap/api"), "{undoes}");
+}
+
+/// A whole sync, a dry run, one still running, or one older than the newest deployment is
+/// not a selective sync to say.
+#[test]
+fn only_a_finished_selective_sync_newer_than_the_history_counts() {
+    let mut whole = selective("Succeeded");
+    whole["operation"]["sync"].as_object_mut().unwrap().remove("resources");
+    assert_eq!(super::partial(&after_deployment(whole, 60)), None);
+    let mut dry = selective("Succeeded");
+    dry["operation"]["sync"]["dryRun"] = json!(true);
+    assert_eq!(super::partial(&after_deployment(dry, 60)), None);
+    assert_eq!(super::partial(&after_deployment(selective("Running"), 60)), None);
+    assert_eq!(super::partial(&after_deployment(selective("Succeeded"), 7 * 1440)), None, "older than #14");
+    assert!(super::partial(&after_deployment(selective("Failed"), 60)).is_some(), "a failed one may have applied some");
+    assert_eq!(last_sync(&after_deployment(selective("Running"), 60)).unwrap().selective, Some((2, 3)));
+}
