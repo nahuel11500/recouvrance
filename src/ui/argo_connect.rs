@@ -29,19 +29,25 @@ pub struct ConnectArgo {
     done: Option<SharedString>,
     /// One step at a time: a new one replaces (and stops) the one running.
     work: Latest,
+    /// Reconnect: the server's address, and whether its certificate is not checked (the
+    /// argocd CLI's `--insecure` for it), which holds for that server only.
+    reconnect: Option<(String, bool)>,
+    /// The address `server` was read for: typing another one drops it.
+    read_for: Option<String>,
     _subs: Vec<Subscription>,
 }
 
-/// Open the dialog; with `address`, read that server at once (Reconnect).
-pub fn open(address: Option<String>, window: &mut Window, cx: &mut App) {
-    let view = cx.new(|cx| ConnectArgo::new(address, window, cx));
+/// Open the dialog; with `reconnect` (a server's address, and whether its certificate is not
+/// checked), read that server at once.
+pub fn open(reconnect: Option<(String, bool)>, window: &mut Window, cx: &mut App) {
+    let view = cx.new(|cx| ConnectArgo::new(reconnect, window, cx));
     let focus = view.read(cx).address.focus_handle(cx);
     focus.focus(window, cx);
     window.open_dialog(cx, move |dialog, _, _| dialog.title("Connect to Argo CD").w(px(600.)).child(view.clone()));
 }
 
 impl ConnectArgo {
-    fn new(address: Option<String>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    fn new(reconnect: Option<(String, bool)>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let input = |hint: &'static str, masked: bool, window: &mut Window, cx: &mut Context<Self>| {
             cx.new(|cx| InputState::new(window, cx).masked(masked).placeholder(hint))
         };
@@ -51,10 +57,13 @@ impl ConnectArgo {
         let password = input("password", true, window, cx);
         let token = input("token (argocd account generate-token)", true, window, cx);
         let subs = vec![
-            cx.subscribe_in(&address_input, window, |this, _, ev: &InputEvent, window, cx| {
-                if let InputEvent::PressEnter { .. } = ev {
-                    this.read_server(window, cx);
+            cx.subscribe_in(&address_input, window, |this, state, ev: &InputEvent, window, cx| match ev {
+                InputEvent::PressEnter { .. } => this.read_server(window, cx),
+                // Another address: what was read of the one before goes.
+                InputEvent::Change if this.read_for.as_deref() != Some(&*state.read(cx).value()) => {
+                    this.address_changed(cx);
                 }
+                _ => {}
             }),
             cx.subscribe_in(&password, window, |this, _, ev: &InputEvent, window, cx| {
                 if let InputEvent::PressEnter { .. } = ev {
@@ -77,13 +86,32 @@ impl ConnectArgo {
             error: None,
             done: None,
             work: Latest::default(),
+            reconnect: reconnect.clone(),
+            read_for: None,
             _subs: subs,
         };
-        if let Some(address) = address {
+        if let Some((address, _)) = reconnect {
             this.address.update(cx, |s, cx| s.set_value(address, window, cx));
             this.read_server(window, cx);
         }
         this
+    }
+
+    /// The address was edited: the server read before, and what runs for it, go.
+    fn address_changed(&mut self, cx: &mut Context<Self>) {
+        self.work.cancel();
+        self.read_for = None;
+        self.server = None;
+        self.busy = None;
+        self.error = None;
+        self.done = None;
+        cx.notify();
+    }
+
+    /// Whether `server`'s certificate is not checked: only the server reconnected to, as the
+    /// argocd CLI's config says for it.
+    fn insecure(&self, server: &Server) -> bool {
+        self.reconnect.as_ref().is_some_and(|(base, insecure)| *insecure && *base == server.base)
     }
 
     fn failed(&mut self, why: String, cx: &mut Context<Self>) {
@@ -103,13 +131,15 @@ impl ConnectArgo {
         let typed = self.address.read(cx).value().to_string();
         self.server = None;
         self.done = None;
+        self.read_for = Some(typed.clone());
         let server = match connect::normalize(&typed) {
             Ok(s) => s,
             Err(e) => return self.failed(e, cx),
         };
         self.working(format!("Reading how {} signs in…", server.name()), cx);
         let s = server.clone();
-        self.work.spawn(cx, connect::sign_in(s), move |this, found, cx| match found {
+        let insecure = self.insecure(&server);
+        self.work.spawn(cx, connect::sign_in(s, insecure), move |this, found, cx| match found {
             Ok(sign_in) => {
                 this.busy = None;
                 this.server = Some((server, sign_in));
@@ -125,9 +155,11 @@ impl ConnectArgo {
         let Some((server, SignIn { sso: Some(sso), .. })) = self.server.clone() else { return };
         self.working(format!("Opening {} in the browser…", sso.name), cx);
         let issuer = sso.issuer.clone();
+        // Dex under a server whose certificate isn't checked: neither is Dex's.
+        let insecure = self.insecure(&server) && issuer.starts_with(&server.base);
         let ready = async move {
             let listener = connect::listen().await?;
-            let provider = connect::discover(issuer).await?;
+            let provider = connect::discover(issuer, insecure).await?;
             Ok::<_, String>((listener, provider))
         };
         self.work.spawn(cx, ready, move |this, ready, cx| {
@@ -144,7 +176,7 @@ impl ConnectArgo {
                 cx,
             );
             let client_id = sso.client_id.clone();
-            let token_endpoint = provider.token.clone();
+            let (token_endpoint, insecure) = (provider.token.clone(), provider.insecure);
             let got = async move {
                 let code = connect::wait_for_code(listener, pkce.state, connect::SSO_TIMEOUT).await?;
                 connect::exchange(provider, client_id, code, pkce.verifier).await
@@ -156,6 +188,7 @@ impl ConnectArgo {
                         token_endpoint,
                         client_id: sso.client_id.clone(),
                         refresh_token,
+                        insecure,
                     });
                     this.check_and_save(server, t.id_token, refresh, cx);
                 }
@@ -177,7 +210,8 @@ impl ConnectArgo {
         self.password.update(cx, |s, cx| s.set_value("", window, cx));
         self.working(format!("Signing in to {} as {user}…", server.name()), cx);
         let s = server.clone();
-        self.work.spawn(cx, connect::log_in(s, user, password), move |this, token, cx| match token {
+        let insecure = self.insecure(&server);
+        self.work.spawn(cx, connect::log_in(s, user, password, insecure), move |this, token, cx| match token {
             Ok(token) => this.check_and_save(server, token, None, cx),
             Err(e) => this.failed(e, cx),
         });
@@ -202,8 +236,8 @@ impl ConnectArgo {
         cx: &mut Context<Self>,
     ) {
         self.working(format!("Checking the login to {}…", server.name()), cx);
-        let (s, t) = (server.clone(), token.clone());
-        self.work.spawn(cx, crate::k8s::argo::api::check_token(s, t), move |this, checked, cx| {
+        let (s, t, insecure) = (server.clone(), token.clone(), self.insecure(&server));
+        self.work.spawn(cx, crate::k8s::argo::api::check_token(s, t, insecure), move |this, checked, cx| {
             let who = match checked {
                 Ok(who) => who,
                 Err(e) => return this.failed(e, cx),

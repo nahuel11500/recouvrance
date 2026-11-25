@@ -1547,7 +1547,7 @@ impl Render for ArgoView {
                         .children(errors.into_iter().map(|e| div().child(e)))
                         .when(!relogin.is_empty(), |d| {
                             d.child(h_flex().gap_1().pt_1().children(relogin.into_iter().enumerate().map(
-                                |(i, base)| {
+                                |(i, (base, insecure))| {
                                     let name =
                                         argo::server::Server::parse(&base).map_or_else(|_| base.clone(), |s| s.name());
                                     Button::new(("argo-reconnect", i))
@@ -1555,7 +1555,7 @@ impl Render for ArgoView {
                                         .outline()
                                         .label(format!("Reconnect {name}"))
                                         .on_click(move |_, window, cx| {
-                                            crate::ui::argo_connect::open(Some(base.clone()), window, cx);
+                                            crate::ui::argo_connect::open(Some((base.clone(), insecure)), window, cx);
                                         })
                                 },
                             )))

@@ -286,11 +286,18 @@ server is read, and *Reconnect* where a login expired or was refused) does it fr
    is picked up as above.
 
 An SSO sign-in made here keeps its own refresh token (`argocd-api-refresh.json`, mode 0600; the
-argocd CLI's is never used, as a provider that rotates them would leave the CLI's invalid). While
-a page reads that server, its login is renewed 30 s before it expires and when it is refused (at
-most every 20 s, every minute after a failure), the rotated refresh token kept first. A renewal
-keeps the feed: the stream stays open and nothing is listed again, the next request sends the
-new token. It says it has expired only once renewing failed, and why. *Forget token* forgets both.
+argocd CLI's is never used, as a provider that rotates them would leave the CLI's invalid);
+`offline_access` is asked for when the provider lists it (Dex, Okta, Auth0 give no refresh token
+without it). While a page reads that server, its login is renewed 30 s before it expires and when
+it is refused (at most every 20 s). A renewal keeps the feed: the stream stays open, nothing is
+listed again, the next request sends the new token. Once sent, a renewal runs to its end and
+keeps the rotated refresh token, but only if the login is still the one it started from: a
+Reconnect, a token set or forgotten by hand, or another Recouvrance that renewed first, wins. A
+refresh token the provider refuses ends the renewals until *Reconnect*; a network error is
+tried again from 5 s, doubling to 5 minutes. It says it is renewing only while it is, and it
+has expired only once renewing failed, with why. Setting or forgetting a token by hand forgets
+the refresh token too. An expired token set here gives way to a valid `argocd login` of the
+same server. *Reconnect* keeps the argocd CLI's `--insecure` for that server.
 
 A config that can't be read fails closed: a CLI config that doesn't parse gives no server, and a
 tokens file that doesn't read gives no token at all (not even the CLI's), each said in Settings →

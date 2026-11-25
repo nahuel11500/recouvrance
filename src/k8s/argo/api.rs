@@ -209,8 +209,12 @@ fn cli_entries(text: &str) -> Result<Vec<CliEntry>, String> {
 fn login_of(settings: Option<&str>, cli: Option<&str>, name: &str, now: i64) -> Result<(Token, Login), String> {
     let relogin = format!("run `argocd login {name}` (with `--sso` for SSO) or set a token in Settings → Argo CD");
     match (settings.filter(|t| !t.trim().is_empty()), cli.filter(|t| !t.trim().is_empty())) {
+        // Expired: a newer `argocd login` is used instead.
+        (Some(t), Some(c)) if server::expired(t, now) && !server::expired(c, now) => {
+            Ok((Token(c.trim().to_string()), Login::Cli))
+        }
         (Some(t), _) if server::expired(t, now) => {
-            Err(format!("The token set in Settings for {name} has expired: set a new one"))
+            Err(format!("The token set in Settings for {name} has expired: set a new one, or Reconnect"))
         }
         (Some(t), _) => Ok((Token(t.trim().to_string()), Login::Settings)),
         (None, Some(t)) if server::expired(t, now) => {
@@ -325,17 +329,25 @@ fn settings_token(base: &str) -> Option<Token> {
     read_tokens().ok()?.remove(base).map(|t| t.trim().to_string()).filter(|t| !t.is_empty()).map(Token)
 }
 
-/// Keep `token` for the server at `base` (empty: forget it), readable only by the user. A
-/// tokens file that doesn't read is kept aside first, as other config is.
+/// Keep `token` for the server at `base` as set by the user (empty: forget it), readable
+/// only by the user. What renewed the login before goes: a renewal never replaces a token
+/// set or forgotten by hand.
 pub fn save_token(base: &str, token: &str) -> std::io::Result<()> {
+    let _held = super::connect::credentials();
+    super::connect::save_refresh_locked(base, None)?;
+    write_token(base, token)
+}
+
+/// Write `token` for `base` in the tokens file (empty: remove it), under
+/// `connect::credentials()`. A tokens file that doesn't read is kept aside first, as other
+/// config is.
+pub(super) fn write_token(base: &str, token: &str) -> std::io::Result<()> {
     let mut tokens = read_tokens().unwrap_or_else(|_| {
         crate::settings::keep_aside(&tokens_path());
         BTreeMap::new()
     });
     let token = token.trim();
     if token.is_empty() {
-        // What renewed it goes too.
-        super::connect::save_refresh(base, None)?;
         tokens.remove(base);
     } else {
         tokens.insert(base.to_string(), token.to_string());
@@ -365,13 +377,12 @@ pub fn endpoints() -> Endpoints {
         endpoints_from(cli, &settings, read_tokens(), &off, settings_ok, jiff::Timestamp::now().as_second());
     for x in &mut found.list {
         x.renewable = x.settings_token && super::connect::renewable(&x.server.base);
-        // A login renewed here says it has expired only once renewing it failed, and why.
+        // A login renewed here says it is being renewed only while it is, else why it failed.
         if x.renewable && x.login.is_err() {
             let name = x.name();
-            x.login = Err(match super::connect::renewal_failure(&x.server.base) {
-                Some(why) => format!("The login to {name} has expired, and renewing it failed: {why}"),
-                None => format!("Renewing the login to {name}…"),
-            });
+            x.login = Err(super::connect::renewal_note(&name, &x.server.base).unwrap_or_else(|| {
+                format!("The login to {name} has expired: it is renewed while the Argo CD page reads it, or Reconnect")
+            }));
         }
     }
     found
@@ -983,6 +994,8 @@ pub fn watch(endpoint: &Endpoint) -> Watch {
 /// expires (at once when there is none), again after a while when that fails. The new token
 /// goes in `cell`: the feed goes on with it.
 async fn keep_renewed(base: String, cell: TokenCell) {
+    // After a failure that may pass (the network), tried again from 5 s, doubling to 5 min.
+    let mut retry = Duration::from_secs(5);
     loop {
         let before = token_in(&cell);
         let now = jiff::Timestamp::now().as_second();
@@ -1004,8 +1017,15 @@ async fn keep_renewed(base: String, cell: TokenCell) {
                 if same {
                     tokio::time::sleep(Duration::from_secs(20)).await;
                 }
+                retry = Duration::from_secs(5);
             }
-            Err(_) => tokio::time::sleep(Duration::from_secs(60)).await,
+            // The refresh token is refused, or there is none: dead until Reconnect (the feed
+            // says why once its token is refused).
+            Err(f) if f.fatal => return,
+            Err(_) => {
+                tokio::time::sleep(retry).await;
+                retry = (retry * 2).min(Duration::from_secs(300));
+            }
         }
     }
 }
@@ -1029,14 +1049,18 @@ async fn feed(endpoint: Endpoint, state: Arc<Mutex<FeedState>>, cell: TokenCell)
     let mut backoff = BACKOFF;
     loop {
         let Some(token) = token_in(&cell) else {
-            let why = endpoint.login.clone().err().unwrap_or_else(|| format!("No login to {}", endpoint.name()));
+            let name = endpoint.name();
+            let why = super::connect::renewal_note(&name, &endpoint.server.base)
+                .filter(|_| endpoint.renewable)
+                .or_else(|| endpoint.login.clone().err())
+                .unwrap_or_else(|| format!("No login to {name}"));
             {
                 let mut s = lock(&state);
                 s.error = Some(why);
                 s.refused = true;
             }
             changed();
-            if !endpoint.renewable {
+            if !endpoint.renewable || super::connect::renewal_dead(&endpoint.server.base) {
                 return;
             }
             tokio::time::sleep(Duration::from_secs(1)).await;
@@ -1065,11 +1089,20 @@ async fn feed(endpoint: Endpoint, state: Arc<Mutex<FeedState>>, cell: TokenCell)
             if !endpoint.renewable {
                 return;
             }
-            // Refused before its time (revoked?): renewing may help, then the feed goes on.
-            if super::connect::renew(endpoint.server.base.clone()).await.is_ok()
-                && let Some(t) = settings_token(&endpoint.server.base)
-            {
-                set_token(&cell, Some(t));
+            // Refused (expired, revoked?): renewing may help, then the feed goes on.
+            match super::connect::renew(endpoint.server.base.clone()).await {
+                Ok(()) => {
+                    if let Some(t) = settings_token(&endpoint.server.base) {
+                        set_token(&cell, Some(t));
+                    }
+                }
+                Err(f) if f.fatal => {
+                    let note = super::connect::renewal_note(&endpoint.name(), &endpoint.server.base);
+                    lock(&state).error = Some(note.unwrap_or(f.why));
+                    changed();
+                    return;
+                }
+                Err(_) => {}
             }
         }
         if started.elapsed() >= STEADY {
@@ -1262,9 +1295,9 @@ pub async fn test(endpoint: Endpoint) -> Result<String, String> {
 }
 
 /// Check a token for `server` before keeping it (Connect to Argo CD…): as [`test`] does.
-pub async fn check_token(server: Server, token: String) -> Result<String, String> {
+pub async fn check_token(server: Server, token: String, insecure: bool) -> Result<String, String> {
     let read = crate::k8s::run_abortable(async move {
-        let conn = Conn { server, token: Token(token), insecure: false };
+        let conn = Conn { server, token: Token(token), insecure };
         Ok(check(&conn).await.map_err(|f| f.text))
     });
     read.await.unwrap_or_else(|e| Err(format!("{e:#}")))
@@ -1873,5 +1906,24 @@ users:
         assert_eq!(sent, Some(Token("renewed".into())), "the feed goes on with the new token");
         let pasted = watch(&endpoint("pasted", false));
         assert!(!std::sync::Arc::ptr_eq(&first.state, &pasted.state), "a new login keeps the old feed");
+    }
+
+    /// A token set in Settings that expired gives way to a valid `argocd login` (one made
+    /// after a password Reconnect, say); with none, it says it expired.
+    #[test]
+    fn an_expired_settings_token_gives_way_to_a_valid_cli_login() {
+        use base64::Engine as _;
+        let jwt = |exp: i64| {
+            let b = |v: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(v);
+            format!("{}.{}.sig", b(b"{}"), b(format!("{{\"exp\":{exp}}}").as_bytes()))
+        };
+        let (old, fresh) = (jwt(100), jwt(10_000));
+        let login = |settings: &str, cli: Option<&str>| super::login_of(Some(settings), cli, "argocd", 1000);
+        let (token, how) = login(&old, Some(&fresh)).unwrap();
+        assert_eq!((token.0.as_str(), how), (fresh.as_str(), Login::Cli));
+        assert!(login(&old, Some(&old)).unwrap_err().contains("expired"));
+        assert!(login(&old, None).unwrap_err().contains("expired"));
+        // A valid one set in Settings still wins.
+        assert_eq!(login(&fresh, Some(&old)).unwrap().1, Login::Settings);
     }
 }

@@ -38,6 +38,8 @@ const DEFAULT_SCOPES: [&str; 4] = ["openid", "profile", "email", "groups"];
 /// Dex's client for the argocd CLI, and the scope Argo CD's Dex adds.
 const DEX_CLI_CLIENT: &str = "argo-cd-cli";
 const DEX_FEDERATED: &str = "federated:id";
+/// The scope that asks for a refresh token.
+const OFFLINE_ACCESS: &str = "offline_access";
 /// The paths of Argo CD's web UI: an address copied from the browser ends with one of these
 /// after the server's own path (`--rootpath`).
 const UI_ROUTES: [&str; 11] = [
@@ -239,6 +241,7 @@ async fn plain(
     url: &str,
     body: Option<(&str, String)>,
     secrets: &[&str],
+    insecure: bool,
 ) -> Result<Answer, String> {
     let scrub = |text: String| secrets.iter().fold(text, |t, s| super::server::scrub(&t, s));
     allowed(url)?;
@@ -247,7 +250,7 @@ async fn plain(
     let body = body.map(|(kind, text)| (kind.to_string(), text));
     let run = crate::k8s::run_abortable(async move {
         let fetch = async {
-            let client = super::api::http_client(false).map_err(|e| format!("{e:#}"))?;
+            let client = super::api::http_client(insecure).map_err(|e| format!("{e:#}"))?;
             let mut req = http::Request::builder()
                 .method(method)
                 .uri(&url)
@@ -280,10 +283,11 @@ async fn plain(
     run.await.unwrap_or_else(|e| Err(format!("{e:#}"))).map_err(scrub)
 }
 
-/// How the server signs in: its `/api/v1/settings`, read with no login.
-pub async fn sign_in(server: Server) -> Result<SignIn, String> {
+/// How the server signs in: its `/api/v1/settings`, read with no login (`insecure`: its
+/// certificate not checked, as the argocd CLI's `--insecure` for it says).
+pub async fn sign_in(server: Server, insecure: bool) -> Result<SignIn, String> {
     let url = format!("{}/api/v1/settings", server.base);
-    let a = plain(http::Method::GET, &url, None, &[]).await?;
+    let a = plain(http::Method::GET, &url, None, &[], insecure).await?;
     let settings =
         settings_answer(&server.name(), a.status, a.location.as_deref(), a.content_type.as_deref(), &a.body)?;
     Ok(sign_in_of(&settings, &server.base))
@@ -308,11 +312,17 @@ fn session_token(name: &str, status: u16, body: &[u8]) -> Result<String, String>
 
 /// Sign in to a local account: the token of a new session. The password goes in the
 /// request's body to that server only, and never in what fails.
-pub async fn log_in(server: Server, username: String, password: String) -> Result<String, String> {
+pub async fn log_in(server: Server, username: String, password: String, insecure: bool) -> Result<String, String> {
     let url = format!("{}/api/v1/session", server.base);
     let body = json!({"username": username, "password": password}).to_string();
-    let a = plain(http::Method::POST, &url, Some(("application/json", body)), &[&password]).await?;
-    session_token(&server.name(), a.status, &a.body).map_err(|e| super::server::scrub(&e, &password))
+    let a = plain(http::Method::POST, &url, Some(("application/json", body)), &[&password], insecure).await?;
+    session_answer(&server.name(), a.status, &a.body, &password)
+}
+
+/// The token of a session answer to a sign-in with `password`, or why there is none (never
+/// with the password in it, whatever the server echoed).
+fn session_answer(name: &str, status: u16, body: &[u8], password: &str) -> Result<String, String> {
+    session_token(name, status, body).map_err(|e| super::server::scrub(&e, password))
 }
 
 // MARK: SSO
@@ -322,6 +332,10 @@ pub async fn log_in(server: Server, username: String, password: String) -> Resul
 pub struct Provider {
     pub authorization: String,
     pub token: String,
+    /// It lists `offline_access`: asked for, so it gives a refresh token (Dex, Okta, Auth0).
+    pub offline: bool,
+    /// Its certificate is not checked (Dex under an Argo CD reached with `--insecure`).
+    pub insecure: bool,
 }
 
 /// The endpoints of the provider `issuer` from its discovery document `doc`: its issuer must
@@ -344,19 +358,28 @@ pub(crate) fn provider_of(doc: &Value, issuer: &str) -> Result<Provider, String>
         allowed(url)?;
         Ok(url.to_string())
     };
-    Ok(Provider { authorization: endpoint("authorization_endpoint")?, token: endpoint("token_endpoint")? })
+    let offline = doc
+        .get("scopes_supported")
+        .and_then(Value::as_array)
+        .is_some_and(|s| s.iter().any(|s| s.as_str() == Some(OFFLINE_ACCESS)));
+    Ok(Provider {
+        authorization: endpoint("authorization_endpoint")?,
+        token: endpoint("token_endpoint")?,
+        offline,
+        insecure: false,
+    })
 }
 
-/// Read the discovery document of `issuer`.
-pub async fn discover(issuer: String) -> Result<Provider, String> {
+/// Read the discovery document of `issuer` (`insecure`: its certificate not checked).
+pub async fn discover(issuer: String, insecure: bool) -> Result<Provider, String> {
     let url = format!("{}/.well-known/openid-configuration", issuer.trim_end_matches('/'));
-    let a = plain(http::Method::GET, &url, None, &[]).await?;
+    let a = plain(http::Method::GET, &url, None, &[], insecure).await?;
     if !(200..300).contains(&a.status) {
         return Err(format!("The identity provider at {} answered HTTP {} to its discovery", shown(&issuer), a.status));
     }
     let doc: Value = serde_json::from_slice(&a.body)
         .map_err(|_| format!("The identity provider at {} sent no discovery document", shown(&issuer)))?;
-    provider_of(&doc, &issuer)
+    provider_of(&doc, &issuer).map(|p| Provider { insecure, ..p })
 }
 
 /// A PKCE pair (S256) and the `state` of one sign-in, random each time.
@@ -381,7 +404,12 @@ fn challenge_of(verifier: &str) -> String {
 
 /// Where to send the browser: the provider's authorization endpoint, asking for a code.
 pub fn authorize_url(provider: &Provider, sso: &Sso, pkce: &Pkce) -> String {
-    let scope = sso.scopes.join(" ");
+    let mut scopes = sso.scopes.clone();
+    // As the argocd CLI asks, when the provider has it: else Dex gives no refresh token.
+    if provider.offline && !scopes.iter().any(|s| s == OFFLINE_ACCESS) {
+        scopes.push(OFFLINE_ACCESS.into());
+    }
+    let scope = scopes.join(" ");
     let claims = sso.id_token_claims.as_ref().map(|c| json!({"id_token": c}).to_string());
     let mut pairs = vec![
         ("response_type", "code"),
@@ -406,6 +434,12 @@ pub fn authorize_url(provider: &Provider, sso: &Sso, pkce: &Pkce) -> String {
 pub struct Tokens {
     pub id_token: String,
     pub refresh_token: Option<String>,
+}
+
+impl std::fmt::Debug for Tokens {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Tokens([token], [refresh token])")
+    }
 }
 
 /// The tokens of the token endpoint's answer, or why there are none.
@@ -440,6 +474,7 @@ pub async fn exchange(provider: Provider, client_id: String, code: String, verif
         &provider.token,
         Some(("application/x-www-form-urlencoded", form)),
         &[&code, &verifier],
+        provider.insecure,
     )
     .await?;
     if (300..400).contains(&a.status) {
@@ -631,9 +666,12 @@ pub(crate) fn connect_in(s: &mut crate::settings::Settings, base: &str) {
 /// (else none: a password's or a pasted token isn't renewed), and its settings
 /// (`connect_in`). The pages read the servers again.
 pub fn save(server: &Server, token: &str, refresh: Option<Refresh>) -> Result<(), String> {
-    save_refresh(&server.base, refresh).map_err(|e| format!("Could not save the refresh token: {e}"))?;
+    {
+        let _held = credentials();
+        super::api::write_token(&server.base, token).map_err(|e| format!("Could not save the token: {e}"))?;
+        save_refresh_locked(&server.base, refresh).map_err(|e| format!("Could not save the refresh token: {e}"))?;
+    }
     forget_renewal(&server.base);
-    super::api::save_token(&server.base, token).map_err(|e| format!("Could not save the token: {e}"))?;
     crate::settings::update(|s| connect_in(s, &server.base));
     super::api::reload();
     Ok(())
@@ -647,9 +685,8 @@ pub fn save(server: &Server, token: &str, refresh: Option<Refresh>) -> Result<()
 const REFRESH_FILE: &str = "argocd-api-refresh.json";
 /// A login is renewed this long before it expires.
 const RENEW_BEFORE: i64 = 30;
-/// Renewals of one server are at least this far apart, and this far after one that failed.
+/// Renewals of one server are at least this far apart.
 const RENEW_EVERY: Duration = Duration::from_secs(20);
-const RENEW_AFTER_FAILURE: Duration = Duration::from_secs(60);
 
 /// What renews a server's login: the provider's token endpoint, the client and the refresh
 /// token (never printed).
@@ -658,6 +695,9 @@ pub struct Refresh {
     pub token_endpoint: String,
     pub client_id: String,
     pub refresh_token: String,
+    /// The token endpoint's certificate is not checked (Dex under an `--insecure` server).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub insecure: bool,
 }
 
 impl std::fmt::Debug for Refresh {
@@ -680,9 +720,17 @@ fn read_refresh() -> Result<std::collections::BTreeMap<String, Refresh>, String>
     }
 }
 
-/// Keep what renews the login to `base` (None: forget it), readable only by the user. A
-/// file that doesn't read is kept aside first.
-pub(super) fn save_refresh(base: &str, refresh: Option<Refresh>) -> std::io::Result<()> {
+/// One lock for the files of tokens and refresh tokens, each read, changed and written whole:
+/// two saves never lose one another's change (a rotated refresh token above all).
+static CREDENTIALS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+pub(super) fn credentials() -> std::sync::MutexGuard<'static, ()> {
+    CREDENTIALS.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Keep what renews the login to `base` (None: forget it), readable only by the user, under
+/// the credentials lock (`credentials`). A file that doesn't read is kept aside first.
+pub(super) fn save_refresh_locked(base: &str, refresh: Option<Refresh>) -> std::io::Result<()> {
     let mut all = read_refresh().unwrap_or_else(|_| {
         crate::settings::keep_aside(&refresh_path());
         Default::default()
@@ -709,8 +757,33 @@ pub fn renewable(base: &str) -> bool {
     read_refresh().is_ok_and(|all| all.contains_key(base))
 }
 
-/// Each server's last renewal: when, and why it failed if it did.
-type Renewals = std::collections::HashMap<String, (std::time::Instant, Option<String>)>;
+/// A renewal that failed: why, and whether the login is dead (the provider refused the
+/// refresh token, or none is kept) or the renewal may work later (a network error).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Failed {
+    pub why: String,
+    pub fatal: bool,
+}
+
+impl Failed {
+    fn fatal(why: impl Into<String>) -> Self {
+        Self { why: why.into(), fatal: true }
+    }
+
+    fn later(why: impl Into<String>) -> Self {
+        Self { why: why.into(), fatal: false }
+    }
+}
+
+/// Each server's last renewal: when it started, whether it still runs, how it failed.
+#[derive(Clone)]
+struct Renewal {
+    at: std::time::Instant,
+    running: bool,
+    failed: Option<Failed>,
+}
+
+type Renewals = std::collections::HashMap<String, Renewal>;
 static RENEWALS: std::sync::LazyLock<std::sync::Mutex<Renewals>> = std::sync::LazyLock::new(Default::default);
 
 fn renewals() -> std::sync::MutexGuard<'static, Renewals> {
@@ -721,9 +794,23 @@ fn forget_renewal(base: &str) {
     renewals().remove(base);
 }
 
-/// Why the last renewal of `base` failed, if it did.
-pub fn renewal_failure(base: &str) -> Option<String> {
-    renewals().get(base).and_then(|(_, why)| why.clone())
+/// What to say of the login to `base` (named `name`) renewed here, when its token isn't
+/// usable: renewing it now, or why renewing failed. None when neither (it is renewed while
+/// a page reads that server).
+pub fn renewal_note(name: &str, base: &str) -> Option<String> {
+    let r = renewals().get(base).cloned()?;
+    if r.running {
+        return Some(format!("Renewing the login to {name}…"));
+    }
+    r.failed.map(|f| {
+        let then = if f.fatal { "Reconnect" } else { "it is tried again" };
+        format!("The login to {name} has expired, and renewing it failed ({}): {then}", f.why)
+    })
+}
+
+/// Whether renewing the login to `base` failed for good (until Reconnect).
+pub fn renewal_dead(base: &str) -> bool {
+    renewals().get(base).is_some_and(|r| r.failed.as_ref().is_some_and(|f| f.fatal))
 }
 
 /// Seconds to wait before renewing a token expiring at `exp` (now: `now`): `RENEW_BEFORE`
@@ -732,56 +819,99 @@ pub(super) fn renew_in(exp: Option<i64>, now: i64) -> Option<u64> {
     exp.map(|exp| u64::try_from(exp - RENEW_BEFORE - now).unwrap_or(0))
 }
 
-/// The tokens of a refresh answer: the id token and the refresh token, rotated or not.
-fn renewed(status: u16, body: &[u8], kept: &str) -> Result<Tokens, String> {
-    let mut t = tokens_of(status, body).map_err(|e| e.replace("refused the sign-in", "refused to renew the login"))?;
-    if t.refresh_token.is_none() {
-        t.refresh_token = Some(kept.to_string());
+/// The tokens of a refresh answer: the id token and the refresh token, rotated or not. A
+/// refresh token refused (`invalid_grant`...) is fatal; a server error may pass.
+fn renewal_answer(status: u16, body: &[u8], kept: &str) -> Result<Tokens, Failed> {
+    match tokens_of(status, body) {
+        Ok(mut t) => {
+            if t.refresh_token.is_none() {
+                t.refresh_token = Some(kept.to_string());
+            }
+            Ok(t)
+        }
+        Err(e) => {
+            let why = super::server::scrub(&e.replace("refused the sign-in", "refused to renew the login"), kept);
+            let v: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
+            let dead = matches!(text_at(&v, "error"), Some("invalid_grant" | "invalid_client" | "unauthorized_client"))
+                || (400..500).contains(&status);
+            Err(if dead { Failed::fatal(why) } else { Failed::later(why) })
+        }
     }
-    Ok(t)
 }
 
-/// Renew the login to `base` with the refresh token kept for it, unless one was tried too
-/// recently: the new token and the rotated refresh token are kept (the refresh token
-/// first: the old one may no longer work). The pages read the servers again.
-pub async fn renew(base: String) -> Result<(), String> {
+/// Renew the login to `base` with the refresh token kept for it, unless one runs, ran just
+/// now, or failed for good. Once started it runs to its end, even when nothing waits for it
+/// any more: the provider may have rotated the refresh token, which must then be kept. The
+/// pages read the servers again (without listing anything again).
+pub async fn renew(base: String) -> Result<(), Failed> {
     {
         let mut all = renewals();
-        let wait = |why: &Option<String>| if why.is_some() { RENEW_AFTER_FAILURE } else { RENEW_EVERY };
-        if let Some((at, why)) = all.get(&base)
-            && at.elapsed() < wait(why)
-        {
-            return why.clone().map_or(Ok(()), Err);
+        match all.get(&base) {
+            Some(r) if r.running => return Ok(()),
+            Some(Renewal { failed: Some(f), .. }) if f.fatal => return Err(f.clone()),
+            Some(Renewal { at, failed: None, .. }) if at.elapsed() < RENEW_EVERY => return Ok(()),
+            _ => {}
         }
-        all.insert(base.clone(), (std::time::Instant::now(), None));
+        all.insert(base.clone(), Renewal { at: std::time::Instant::now(), running: true, failed: None });
     }
-    let result = renew_now(&base).await;
-    renewals().insert(base, (std::time::Instant::now(), result.clone().err()));
-    // Renewed: the token alone changed, and the feeds go on with it. Failed: the pages read
-    // the servers again, to say why.
-    if result.is_ok() {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    crate::k8s::spawn_detached(async move {
+        let result = renew_now(&base).await;
+        let mut all = renewals();
+        // Reconnected meanwhile: its own state stands.
+        if all.get(&base).is_some_and(|r| r.running) {
+            all.insert(base, Renewal { at: std::time::Instant::now(), running: false, failed: result.clone().err() });
+        }
+        drop(all);
         super::api::renewed();
-    } else {
-        super::api::reload();
-    }
-    result
+        let _ = tx.send(result);
+    });
+    rx.await.unwrap_or_else(|_| Err(Failed::later("the renewal stopped")))
 }
 
-async fn renew_now(base: &str) -> Result<(), String> {
-    let kept = read_refresh()?.remove(base).ok_or("no refresh token is kept for it: connect again")?;
+/// Whether a renewal started with `started` may keep what it got: only while the entry
+/// kept is still that one. Else the login changed meanwhile (Reconnect, a token set or
+/// forgotten, another Recouvrance that renewed first and rotated it): that one wins, and a
+/// refusal of the old refresh token is no failure.
+fn still_used(started: &Refresh, now: Option<&Refresh>) -> bool {
+    now == Some(started)
+}
+
+/// The entry kept for `base` now, under the credentials lock.
+fn kept_refresh(base: &str) -> Result<Option<Refresh>, Failed> {
+    let _held = credentials();
+    read_refresh().map(|mut all| all.remove(base)).map_err(Failed::fatal)
+}
+
+async fn renew_now(base: &str) -> Result<(), Failed> {
+    let kept = kept_refresh(base)?.ok_or_else(|| Failed::fatal("no refresh token is kept for it"))?;
     let form = crate::prom::form_urlencoded(&[
         ("grant_type", "refresh_token"),
         ("refresh_token", &kept.refresh_token),
         ("client_id", &kept.client_id),
     ]);
     let secret = kept.refresh_token.clone();
-    let a =
-        plain(http::Method::POST, &kept.token_endpoint, Some(("application/x-www-form-urlencoded", form)), &[&secret])
-            .await?;
-    let t = renewed(a.status, &a.body, &kept.refresh_token).map_err(|e| super::server::scrub(&e, &secret))?;
+    let body = Some(("application/x-www-form-urlencoded", form));
+    let a = plain(http::Method::POST, &kept.token_endpoint, body, &[&secret], kept.insecure)
+        .await
+        .map_err(Failed::later)?;
+    let renewed = if (300..400).contains(&a.status) {
+        Err(Failed::fatal("the token endpoint answered with a redirect: not followed"))
+    } else {
+        renewal_answer(a.status, &a.body, &secret)
+    };
+    // Saved only if what renewed is still the one used: a Reconnect, a token set or forgot,
+    // or another Recouvrance that renewed it first while this one waited, wins.
+    let _held = credentials();
+    let now = read_refresh().map_err(Failed::fatal)?.remove(base);
+    if !still_used(&kept, now.as_ref()) {
+        return Ok(());
+    }
+    let t = renewed?;
     let rotated = Refresh { refresh_token: t.refresh_token.unwrap_or(secret), ..kept };
-    save_refresh(base, Some(rotated)).map_err(|e| format!("Could not keep the new refresh token: {e}"))?;
-    super::api::save_token(base, &t.id_token).map_err(|e| format!("Could not keep the new token: {e}"))
+    save_refresh_locked(base, Some(rotated))
+        .map_err(|e| Failed::later(format!("could not keep the new refresh token: {e}")))?;
+    super::api::write_token(base, &t.id_token).map_err(|e| Failed::later(format!("could not keep the new token: {e}")))
 }
 
 #[cfg(test)]
@@ -851,7 +981,9 @@ mod tests {
                 let b = s.base;
                 let local = ["http://localhost", "http://127.", "http://[::1]"].iter().any(|p| b.starts_with(p));
                 prop_assert!(b.starts_with("https://") || local, "{}", b);
-                prop_assert!(!b.contains(['?', '#', '@', ' ']) && !b.ends_with('/'), "{}", b);
+                let authority = b.split_once("://").map_or("", |(_, r)| r.split('/').next().unwrap_or_default());
+                prop_assert!(!authority.contains('@'), "{}", b);
+                prop_assert!(!b.contains(['?', '#', ' ']) && !b.ends_with('/'), "{}", b);
                 prop_assert_eq!(normalize(&b).map(|s| s.base), Ok(b));
             }
         }
@@ -868,8 +1000,10 @@ mod tests {
         #[test]
         fn a_secret_never_shows_in_an_error(secret in "[A-Za-z0-9._-]{12,40}", before in "[a-z ]{0,10}") {
             let body = json!({"error": format!("{before}{secret}"), "message": format!("{before}{secret}")}).to_string();
-            let said = session_token("argocd", 401, body.as_bytes()).unwrap_err();
-            prop_assert!(!super::super::server::scrub(&said, &secret).contains(&secret));
+            let said = super::session_answer("argocd", 401, body.as_bytes(), &secret).unwrap_err();
+            prop_assert!(!said.contains(&secret), "{}", said);
+            let renewal = super::renewal_answer(400, body.as_bytes(), &secret).unwrap_err();
+            prop_assert!(!renewal.why.contains(&secret), "{}", renewal.why);
         }
     }
 
@@ -956,7 +1090,12 @@ mod tests {
 
     #[test]
     fn the_browser_is_sent_with_a_s256_challenge_and_the_state() {
-        let p = Provider { authorization: "https://a/api/dex/auth".into(), token: "https://a/api/dex/token".into() };
+        let p = Provider {
+            authorization: "https://a/api/dex/auth".into(),
+            token: "https://a/api/dex/token".into(),
+            offline: false,
+            insecure: false,
+        };
         let pkce = Pkce::new();
         let url = authorize_url(&p, &sso(), &pkce);
         assert!(url.starts_with("https://a/api/dex/auth?response_type=code&"), "{url}");
@@ -1034,7 +1173,7 @@ mod tests {
 
     #[test]
     fn a_login_is_renewed_before_it_expires() {
-        use super::{renew_in, renewed};
+        use super::{renew_in, renewal_answer as renewed};
         // A 2-minute token: renewed 30 s before its end; one past or nearly so, at once.
         assert_eq!(renew_in(Some(1120), 1000), Some(90));
         assert_eq!(renew_in(Some(1010), 1000), Some(0));
@@ -1045,8 +1184,44 @@ mod tests {
         assert_eq!((t.id_token.as_str(), t.refresh_token.as_deref()), ("new", Some("rotated")));
         let t = renewed(200, br#"{"id_token": "new"}"#, "old").unwrap();
         assert_eq!(t.refresh_token.as_deref(), Some("old"));
-        let e = renewed(400, br#"{"error": "invalid_grant"}"#, "old").err().unwrap();
-        assert!(e.contains("refused to renew") && !e.contains("old"), "{e}");
+        // A refused refresh token is dead (until Reconnect); a server error may pass.
+        let e = renewed(400, br#"{"error": "invalid_grant", "error_description": "token old revoked"}"#, "old")
+            .err()
+            .unwrap();
+        assert!(e.fatal && e.why.contains("refused to renew") && !e.why.contains("old"), "{e:?}");
+        assert!(renewed(401, br#"{"error": "invalid_client"}"#, "old").err().unwrap().fatal);
+        assert!(!renewed(503, b"busy", "old").err().unwrap().fatal);
+    }
+
+    #[test]
+    fn a_renewal_keeps_what_it_got_only_while_its_login_is_still_used() {
+        use super::{Refresh, still_used};
+        let r = |t: &str| Refresh {
+            token_endpoint: "https://idp/token".into(),
+            client_id: "cli".into(),
+            refresh_token: t.into(),
+            insecure: false,
+        };
+        assert!(still_used(&r("a"), Some(&r("a"))));
+        // Forgotten, a token set by hand (no entry), Reconnect or another instance (another one).
+        assert!(!still_used(&r("a"), None));
+        assert!(!still_used(&r("a"), Some(&r("b"))));
+    }
+
+    #[test]
+    fn offline_access_is_asked_when_the_provider_lists_it() {
+        let dex = json!({"issuer": "https://a/api/dex", "authorization_endpoint": "https://a/api/dex/auth",
+            "token_endpoint": "https://a/api/dex/token", "scopes_supported": ["openid", "groups", "offline_access"]});
+        let p = provider_of(&dex, "https://a/api/dex").unwrap();
+        assert!(p.offline);
+        let url = authorize_url(&p, &sso(), &Pkce::new());
+        assert!(url.contains("scope=openid%20groups%20offline_access"), "{url}");
+        // GitLab doesn't list it, and gives a refresh token anyway: not asked.
+        let gitlab = json!({"issuer": "https://gitlab.example.com", "authorization_endpoint": "https://gitlab.example.com/oauth/authorize",
+            "token_endpoint": "https://gitlab.example.com/oauth/token", "scopes_supported": ["openid", "profile", "read_user"]});
+        let p = provider_of(&gitlab, "https://gitlab.example.com").unwrap();
+        assert!(!p.offline);
+        assert!(authorize_url(&p, &sso(), &Pkce::new()).contains("scope=openid%20groups&"));
     }
 
     #[test]
@@ -1055,6 +1230,7 @@ mod tests {
             token_endpoint: "https://idp/token".into(),
             client_id: "cli".into(),
             refresh_token: "s3cret".into(),
+            insecure: false,
         };
         assert!(!format!("{r:?}").contains("s3cret"));
     }

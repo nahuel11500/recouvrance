@@ -1330,8 +1330,9 @@ pub struct Fleet {
     pub servers: Vec<String>,
     /// Each Argo CD's projects' sync windows (by `instance`), or why they couldn't be read.
     pub projects: HashMap<String, Result<ProjectWindows, String>>,
-    /// The API servers (their address) whose login is missing, expired or refused.
-    pub relogin: Vec<String>,
+    /// The API servers whose login is missing, expired or refused: their address, and whether
+    /// their certificate is not checked (to Reconnect as the argocd CLI's config says).
+    pub relogin: Vec<(String, bool)>,
 }
 
 impl Fleet {
@@ -1489,8 +1490,8 @@ pub fn add_api(
         if let Some(e) = read.state.error.as_ref().filter(|_| !read.state.live) {
             fleet.errors.push(format!("{name}: {e}"));
         }
-        if read.state.refused && !fleet.relogin.contains(&endpoint.server.base) {
-            fleet.relogin.push(endpoint.server.base.clone());
+        if read.state.refused && !fleet.relogin.iter().any(|(b, _)| *b == endpoint.server.base) {
+            fleet.relogin.push((endpoint.server.base.clone(), endpoint.insecure));
         }
         // The hub's windows, when read, stay: the API's failing doesn't hide them.
         match (read.state.projects, fleet.projects.get(&instance)) {

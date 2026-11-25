@@ -1149,7 +1149,7 @@ impl SettingsView {
                     // A login missing, expired or refused: sign in again from here.
                     let relogin = e.login.is_err()
                         || matches!(self.argo_api_tests.get(&base), Some(Some(Err(why))) if why.contains("refused") || why.contains("expired"));
-                    let b_reconnect = base.clone();
+                    let b_reconnect = (base.clone(), e.insecure);
                     // A token set here, expired or not, can be forgotten (the CLI's is used then).
                     let settings_token = e.settings_token;
                     let b_forget = base.clone();
