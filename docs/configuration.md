@@ -231,7 +231,8 @@ Agents never read Argo CD on these contexts: their Argo CD tools go through Argo
 
 ### Argo CD's diff (`argocd_servers`)
 
-An Application's page can show what a sync would change, as Argo CD renders it from git: set the
+No longer used by an Application's page, which opens on the Argo CD page instead (see
+[features](features.md)). Before, it could show what a sync would change, as Argo CD renders it from git: set the
 Argo CD API server of the hub context in Settings → Per cluster (`https://argocd.example.com`,
 with a path when Argo CD is served under one). Plain `http://` is only taken for this machine (a
 port-forward to argocd-server), so a token never crosses the network in clear.

@@ -1006,6 +1006,9 @@ pub struct Found {
 pub struct Lookup {
     pub apps: Vec<Found>,
     pub note: Option<String>,
+    /// On an Application's own page: the Argo CD server holding it (same `metadata.uid`), or
+    /// why none does. None until read, and on other pages.
+    pub own: Option<Result<Arc<api::Endpoint>, String>>,
 }
 
 fn failed_note(hubs: &Hubs) -> String {
@@ -1039,6 +1042,53 @@ pub async fn for_object(
     };
     super::run(read).await.unwrap_or_default()
 }
+
+/// The Argo CD server holding the Application whose `metadata.uid` is `uid` (one opened as a
+/// Kubernetes object), from what the servers' feeds hold (a feed is started when none runs),
+/// or why none does: no server connected, or none has it (and those that could not be read).
+pub async fn api_by_uid(uid: String) -> Result<Arc<api::Endpoint>, String> {
+    let read = async move {
+        if uid.is_empty() {
+            return Ok(Err("it has no uid".to_string()));
+        }
+        let held = api::held_apps(
+            |_| true,
+            true,
+            API_WAIT,
+            |_, a| a.value.pointer("/metadata/uid").and_then(Value::as_str) == Some(uid.as_str()),
+        )
+        .await;
+        Ok(own_in(held))
+    };
+    super::run(read).await.unwrap_or_else(|e| Err(format!("{e:#}")))
+}
+
+/// Which server's feed holds the Application looked for (`held`: each server's part), or
+/// why none does.
+fn own_in(held: Vec<api::Held>) -> Result<Arc<api::Endpoint>, String> {
+    if held.is_empty() {
+        return Err(NO_SERVER.into());
+    }
+    if let Some(h) = held.iter().find(|h| h.apps.as_ref().is_ok_and(|a| !a.is_empty())) {
+        return Ok(h.endpoint.clone());
+    }
+    let read: Vec<String> = held.iter().filter(|h| h.apps.is_ok()).map(|h| h.endpoint.name()).collect();
+    let failed: Vec<String> =
+        held.iter().filter_map(|h| h.apps.as_ref().err().map(|e| format!("{}: {e}", h.endpoint.name()))).collect();
+    let mut why = if read.is_empty() {
+        "No Argo CD server could be read".to_string()
+    } else {
+        format!("Not on the Argo CD servers connected ({})", read.join(", "))
+    };
+    if !failed.is_empty() {
+        why.push_str(&format!("; not read: {}", failed.join("; ")));
+    }
+    Err(why)
+}
+
+/// Said on an Application's page when no Argo CD server is set or logged in to.
+const NO_SERVER: &str =
+    "No Argo CD server is connected: connect one (Settings → Argo CD) to open this Application there";
 
 /// The longest wait for an Argo CD server's first list in a lookup (one that failed answers
 /// at once: see `api::held_apps`), and for an Application read whole.
@@ -1172,7 +1222,7 @@ async fn api_object_lookup(here: &str, by: &TrackedBy, group: &str, kind: &str, 
         }
         _ => None,
     };
-    Some(Lookup { apps, note })
+    Some(Lookup { apps, note, own: None })
 }
 
 async fn object_lookup(
@@ -1198,7 +1248,7 @@ async fn object_lookup(
                 failed_note(&hubs)
             )
         });
-        return Lookup { apps: Vec::new(), note };
+        return Lookup { apps: Vec::new(), note, own: None };
     }
     let targets = targets();
     let here = target(&targets, &here);
@@ -1266,7 +1316,7 @@ async fn object_lookup(
         }
         _ => None,
     };
-    Lookup { apps, note }
+    Lookup { apps, note, own: None }
 }
 
 /// The Applications that deploy into this namespace of the context `here`. Quiet when no
@@ -1680,6 +1730,24 @@ mod tests {
         });
         let e = lean_error(&(None, "did not answer".into()));
         assert_eq!(crate::k8s::lists::load_error(&e), "failed: did not answer");
+    }
+
+    /// An Application opened as a Kubernetes object opens on the server whose feed holds one
+    /// of its uid; none connected, none holding it, and those not read are each said.
+    #[test]
+    fn an_application_page_finds_its_argo_cd_by_uid() {
+        let held = |url: &str, apps: Result<usize, &str>| api::Held {
+            endpoint: endpoint(url),
+            apps: apps.map(|n| (0..n).map(|_| api_app("argocd", "web", None)).collect()).map_err(String::from),
+        };
+        assert_eq!(own_in(Vec::new()).unwrap_err(), NO_SERVER);
+        let found = own_in(vec![held("https://a.example", Ok(0)), held("https://b.example", Ok(1))]).unwrap();
+        assert_eq!(found.name(), "b.example");
+        let why = own_in(vec![held("https://a.example", Ok(0)), held("https://b.example", Err("did not answer"))])
+            .unwrap_err();
+        assert_eq!(why, "Not on the Argo CD servers connected (a.example); not read: b.example: did not answer");
+        let why = own_in(vec![held("https://b.example", Err("expired"))]).unwrap_err();
+        assert!(why.starts_with("No Argo CD server could be read; not read: b.example: expired"), "{why}");
     }
 
     fn endpoint(url: &str) -> Arc<api::Endpoint> {

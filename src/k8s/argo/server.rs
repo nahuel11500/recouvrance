@@ -12,7 +12,6 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use anyhow::{Result, anyhow};
 use base64::Engine as _;
 use serde::Deserialize;
 use serde_json::Value;
@@ -98,12 +97,6 @@ pub(super) fn host_port(authority: &str, https: bool) -> Option<(String, u16)> {
 pub(super) fn loopback(host: &str) -> bool {
     let bare = host.trim_start_matches('[').trim_end_matches(']');
     host == "localhost" || bare.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
-}
-
-/// The Argo CD server set for `context`, if any (and whether it reads).
-pub fn server_of(context: &str) -> Option<Result<Server, String>> {
-    let text = crate::settings::with(|s| s.argocd_servers.get(context).cloned())?;
-    (!text.trim().is_empty()).then(|| Server::parse(&text))
 }
 
 /// The hub contexts whose Argo CD server (`servers`: `argocd_servers`) is the one at `base`.
@@ -236,26 +229,6 @@ pub(super) struct CliUser {
     pub auth_token: String,
 }
 
-/// The token the argocd CLI saved for `server` in its config `text`: the current context's
-/// when it is that server, else the first context that is.
-fn cli_token(text: &str, server: &Server) -> Option<String> {
-    let config: CliConfig = crate::yaml::from_str(text).ok()?;
-    let matches = |c: &CliContext| {
-        config.servers.iter().any(|s| {
-            s.server == c.server
-                && !s.core
-                && host_port(&s.server, !s.plain_text).is_some_and(|(h, p)| h == server.host && p == server.port)
-        })
-    };
-    let mut contexts: Vec<&CliContext> = config.contexts.iter().filter(|c| matches(c)).collect();
-    contexts.sort_by_key(|c| c.name != config.current_context);
-    contexts.iter().find_map(|c| {
-        let user = config.users.iter().find(|u| u.name == c.user)?;
-        let token = user.auth_token.trim();
-        (!token.is_empty()).then(|| token.to_string())
-    })
-}
-
 /// Whether a JWT's `exp` is past at `now` (seconds). A token that isn't a JWT, or has no
 /// `exp`, is left for the server to judge.
 pub(super) fn expired(token: &str, now: i64) -> bool {
@@ -281,27 +254,6 @@ pub(super) fn token_user(token: &str) -> Option<String> {
         .map(String::from)
 }
 
-/// The token to send for `context`'s `server`, and where it comes from: Settings first, then
-/// the argocd CLI's login. What to do when there is none, or it has expired.
-fn login(context: &str, server: &Server) -> Result<(String, Login), String> {
-    let name = server.name();
-    let relogin = format!("run `argocd login {name}` (with `--sso` for SSO) or set a read-only token in Settings");
-    let now = jiff::Timestamp::now().as_second();
-    if let Some(token) = read_tokens().remove(context).filter(|t| !t.trim().is_empty()) {
-        if expired(&token, now) {
-            return Err(format!("The token set in Settings for {context} has expired: set a new one"));
-        }
-        return Ok((token, Login::Settings));
-    }
-    let path = cli_config_path();
-    let text = std::fs::read_to_string(&path).unwrap_or_default();
-    match cli_token(&text, server) {
-        Some(token) if expired(&token, now) => Err(format!("The argocd CLI's login to {name} has expired: {relogin}")),
-        Some(token) => Ok((token, Login::Cli)),
-        None => Err(format!("No login to {name} ({} has none): {relogin}", path.display())),
-    }
-}
-
 /// `text` with every copy of `token` replaced: an error never shows it, whatever echoed it.
 pub(super) fn scrub(text: &str, token: &str) -> String {
     if token.is_empty() { text.to_string() } else { text.replace(token, "[token]") }
@@ -323,11 +275,6 @@ pub(super) fn encode(s: &str) -> String {
     out
 }
 
-/// The URL of the Application `namespace/name`'s managed resources on `server`.
-fn managed_resources_url(server: &Server, namespace: &str, name: &str) -> String {
-    format!("{}/api/v1/applications/{}/managed-resources?appNamespace={}", server.base, encode(name), encode(namespace))
-}
-
 /// What Argo CD answered when it wasn't a success, said plainly.
 pub(super) fn refusal(status: http::StatusCode, body: &str, server: &Server) -> String {
     let said = serde_json::from_str::<Value>(body)
@@ -346,12 +293,6 @@ pub(super) fn refusal(status: http::StatusCode, body: &str, server: &Server) -> 
         }
         _ => format!("Argo CD at {name} answered HTTP {status}: {said}"),
     }
-}
-
-/// GET `url` with the token, at most `MAX_BYTES`; redirects are not followed, so the token
-/// never goes to another address (see `api::send`).
-async fn get(url: String, token: String, server: Server) -> Result<Value> {
-    super::api::send(http::Method::GET, url, &token, None, false, &server).await.map_err(|f| anyhow!(f.text))
 }
 
 // MARK: Diff
@@ -509,34 +450,9 @@ pub(super) fn diffs(body: &Value, server: String, login: Login) -> GitDiff {
     out
 }
 
-/// Argo CD's diff of the Application `namespace/name`, read from the Argo CD server set for
-/// its hub `context`. One GET; errors never hold the token.
-pub async fn git_diff(context: String, namespace: String, name: String) -> Result<GitDiff, String> {
-    // Off the UI thread: the config files are read here too.
-    let read = crate::k8s::run_abortable(async move {
-        let server = match server_of(&context) {
-            Some(Ok(server)) => server,
-            Some(Err(e)) => return Ok(Err(e)),
-            None => return Ok(Err(format!("No Argo CD server is set for {context}"))),
-        };
-        let (token, login) = match login(&context, &server) {
-            Ok(found) => found,
-            Err(e) => return Ok(Err(e)),
-        };
-        let url = managed_resources_url(&server, &namespace, &name);
-        let shown = server.name();
-        Ok(match get(url, token.clone(), server).await {
-            // A big answer is worked out here too, not on the UI thread.
-            Ok(body) => Ok(diffs(&body, shown, login)),
-            Err(e) => Err(scrub(&format!("{e:#}"), &token)),
-        })
-    });
-    read.await.unwrap_or_else(|e| Err(format!("{e:#}")))
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{Change, Login, Server, cli_token, diffs, expired, managed_resources_url, read_only_context, scrub};
+    use super::{Change, Login, Server, diffs, expired, read_only_context, scrub};
     use crate::history::DiffLine;
     use base64::Engine as _;
     use proptest::prelude::*;
@@ -583,51 +499,7 @@ mod tests {
         assert!(Server::parse("https://argocd.example.com/?x=1").is_err());
         assert!(Server::parse("ftp://argocd.example.com").is_err());
         assert!(Server::parse("").is_err());
-        let s = Server::parse("argocd.example.com/argo").unwrap();
-        assert_eq!(
-            managed_resources_url(&s, "argocd", "web app"),
-            "https://argocd.example.com/argo/api/v1/applications/web%20app/managed-resources?appNamespace=argocd"
-        );
-    }
-
-    const CLI_CONFIG: &str = "
-contexts:
-- name: other
-  server: other.example.com
-  user: other
-- name: argocd.example.com
-  server: argocd.example.com:443
-  user: argocd.example.com
-- name: core
-  server: kubernetes
-  user: core
-current-context: other
-servers:
-- server: other.example.com
-  grpc-web: true
-- server: argocd.example.com:443
-  insecure: false
-- server: kubernetes
-  core: true
-users:
-- name: other
-  auth-token: other-token
-- name: argocd.example.com
-  auth-token: the-token
-  refresh-token: refresh
-";
-
-    #[test]
-    fn the_cli_token_is_the_one_of_that_server() {
-        let server = Server::parse("https://argocd.example.com").unwrap();
-        assert_eq!(cli_token(CLI_CONFIG, &server).as_deref(), Some("the-token"));
-        let other = Server::parse("other.example.com").unwrap();
-        assert_eq!(cli_token(CLI_CONFIG, &other).as_deref(), Some("other-token"));
-        // Another port is another server; core mode has no API server.
-        assert_eq!(cli_token(CLI_CONFIG, &Server::parse("argocd.example.com:8443").unwrap()), None);
-        assert_eq!(cli_token(CLI_CONFIG, &Server::parse("kubernetes").unwrap()), None);
-        assert_eq!(cli_token("not: [yaml", &server), None);
-        assert_eq!(cli_token("", &server), None);
+        assert_eq!(Server::parse("argocd.example.com/argo").unwrap().base, "https://argocd.example.com/argo");
     }
 
     fn jwt(payload: &Value) -> String {
