@@ -525,6 +525,12 @@
   With Applications of production environments among them (the types `prod`, `preprod`, `acc
   on a tag`, `platform`, or one named with `prod`), they are named above the list and *Sync…*
   asks a second click (*Confirm: 3 production Applications…*) before the confirmation.
+  The page opens in read-only mode too, saying so: everything above shows, and *Read what a sync
+  of each would change* reads the diff, without turning writes on. Only *Sync…* (or *Terminate*)
+  asks to, with a prompt of its own: what turning writes on allows here (*sync 17 Applications
+  on argocd.example.com*, through Argo CD's API with your Argo CD login, not your kubeconfig) and
+  that write mode is the whole app's. A single Application's Sync, Refresh, Terminate or Roll
+  back by Argo CD's API asks the same way.
   *Sync…* asks for the count of Applications typed (or the wait set in Settings → General),
   names them, and lists everything prune deletes; the syncs are then sent 4 at a time, write mode
   and the server's protection checked as each is sent. Each Application is read every 2 s (every 10 s while the page is
