@@ -697,7 +697,7 @@ pub async fn run_command(
     run(async move {
         let sh = crate::plugins::shell().map_err(anyhow::Error::msg)?;
         let kubeconfig = private_kubeconfig(&context, namespace.as_deref(), "plugin")?;
-        let out = tokio::process::Command::new(sh)
+        let out = crate::process::tokio_command(sh)
             .args(["-c", &command])
             .envs(env)
             .env("KUBECONFIG", kubeconfig.path())
@@ -737,7 +737,7 @@ pub async fn helm(context: String, args: Vec<String>) -> Result<String> {
     }
     run(async move {
         let kubeconfig = private_kubeconfig(&context, None, "helm")?;
-        let out = tokio::process::Command::new("helm").args(&args).env("KUBECONFIG", kubeconfig.path()).output().await;
+        let out = crate::process::tokio_command("helm").args(&args).env("KUBECONFIG", kubeconfig.path()).output().await;
         drop(kubeconfig);
         let out = out.context("running helm (is it installed?)")?;
         let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr))

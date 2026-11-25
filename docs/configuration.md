@@ -14,6 +14,16 @@ administrators), and new files take their folder's access list. `~` is `HOME` wh
 your profile folder (`USERPROFILE`): the default kubeconfig is `~\.kube\config` and saved logs and
 files go to `~\Downloads`.
 
+The Windows app is a GUI program, so no console window opens with it. Its commands (`serve`,
+`agent-create`, `--help`, `--version`) print in the terminal they are typed in, but `cmd` and
+PowerShell don't wait for a GUI program: the prompt comes back at once and the output follows it.
+To wait for one, as scripts do, run it with `start /wait recouvrance serve` in `cmd` or
+`Start-Process -Wait -NoNewWindow recouvrance serve` in PowerShell, or redirect its output
+(`recouvrance agent-create ci > token.txt`); output that is redirected or piped is kept as it is.
+When only stdout is redirected, stderr goes nowhere: `serve` logs to stderr, so redirect both
+(`recouvrance serve > serve.log 2>&1`). Programs the app starts (helm, plugins, `claude`, a
+kubeconfig's login command such as `kubelogin` or `aws eks get-token`) open no console window.
+
 ## Files
 
 | Path | What |

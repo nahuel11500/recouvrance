@@ -1008,13 +1008,13 @@ fn notify_desktop(title: &str, body: &str) {
     }
     #[cfg(target_os = "macos")]
     let mut cmd = {
-        let mut cmd = std::process::Command::new("osascript");
+        let mut cmd = crate::process::command("osascript");
         cmd.args(osascript_args(title, &body));
         cmd
     };
     #[cfg(not(any(target_os = "macos", windows)))]
     let mut cmd = {
-        let mut cmd = std::process::Command::new("notify-send");
+        let mut cmd = crate::process::command("notify-send");
         // `--`: a title or body starting with '-' (an agent's text) is never read as an option.
         // The body may be read as markup: the agent's text is escaped (no links, no formatting).
         cmd.args([
