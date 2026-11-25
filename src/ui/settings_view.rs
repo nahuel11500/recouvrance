@@ -94,8 +94,8 @@ pub struct SettingsView {
     argo_api_token: Entity<InputState>,
     /// Why the server typed could not be added.
     argo_api_error: Option<SharedString>,
-    /// The label naming an Application's service on the Argo CD page.
-    argo_group_label: Entity<InputState>,
+    /// The environment types of the Argo CD page, a `type = pattern` per line.
+    argo_env_types: Entity<TextareaState>,
     /// A kind to give its own delete confirmation (Enter adds it).
     delete_kind: Entity<InputState>,
     /// The connected clusters' kinds, to check a kind typed in `delete_kind`.
@@ -153,7 +153,7 @@ impl SettingsView {
         let argo_api_url = field(String::new(), "https://argocd.example.com", window, cx);
         let argo_api_token =
             cx.new(|cx| InputState::new(window, cx).masked(true).placeholder("token (argocd account generate-token)"));
-        let argo_group_label = field(s.argocd_group_label, "none: the name without its environment", window, cx);
+        let argo_env_types = textarea(env_types_text(&s.argocd_env_types), "prod = -prod(-|$)", window, cx);
 
         let mut subs = Vec::new();
         let number = |input: &Entity<InputState>, apply: fn(&mut settings::Settings, u64), cx: &mut Context<Self>| {
@@ -182,8 +182,8 @@ impl SettingsView {
             }
         }));
         subs.push(Self::save_typed(&notes, textarea_text, cx, |v| settings::update(|s| s.assistant_notes = v)));
-        subs.push(Self::save_typed(&argo_group_label, input_text, cx, |v| {
-            settings::update(|s| s.argocd_group_label = v.trim().to_string());
+        subs.push(Self::save_typed(&argo_env_types, textarea_text, cx, |v| {
+            settings::update(|s| s.argocd_env_types = env_type_lines(&v));
         }));
         subs.push(cx.subscribe_in(&argo_api_token, window, |this, _, ev: &InputEvent, window, cx| {
             if let InputEvent::PressEnter { .. } = ev {
@@ -256,7 +256,7 @@ impl SettingsView {
             argo_api_url,
             argo_api_token,
             argo_api_error: None,
-            argo_group_label,
+            argo_env_types,
             delete_kind,
             kinds: Vec::new(),
             hub,
@@ -584,7 +584,6 @@ impl SettingsView {
         for (ctx, server, _) in &self.argo_inputs {
             fields.push((server.clone(), s.argocd_servers.get(ctx).cloned().unwrap_or_default()));
         }
-        fields.push((self.argo_group_label.clone(), s.argocd_group_label.clone()));
         for (ctx, user, groups) in &self.run_as_inputs {
             let saved = s.clusters.get(ctx).and_then(|c| c.run_as.clone()).unwrap_or_default();
             fields.push((user.clone(), saved.user));
@@ -596,12 +595,20 @@ impl SettingsView {
                 input.update(cx, |state, cx| state.set_value(saved, window, cx));
             }
         }
-        for (input, saved) in
-            [(self.notes.clone(), s.assistant_notes.clone()), (self.repos.clone(), s.assistant_repos.join("\n"))]
-        {
+        for (input, saved) in [
+            (self.notes.clone(), s.assistant_notes.clone()),
+            (self.repos.clone(), s.assistant_repos.join("\n")),
+            (self.argo_env_types.clone(), env_types_text(&s.argocd_env_types)),
+        ] {
             let state = input.read(cx);
             let current = state.value().to_string();
-            let same = if input == self.repos { repo_lines(&current) == s.assistant_repos } else { current == saved };
+            let same = if input == self.repos {
+                repo_lines(&current) == s.assistant_repos
+            } else if input == self.argo_env_types {
+                env_type_lines(&current) == s.argocd_env_types
+            } else {
+                current == saved
+            };
             if !state.focus_handle(cx).is_focused(window) && !same {
                 input.update(cx, |state, cx| state.set_value(saved, window, cx));
             }
@@ -1113,6 +1120,8 @@ impl SettingsView {
     fn argo_section(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme().clone();
         let muted = theme.muted_foreground;
+        let env_type_errors =
+            settings::with(|s| crate::k8s::argo::environments::EnvTypes::parse(&s.argocd_env_types).errors);
         let label = |t: &str| div().w(px(170.)).flex_shrink_0().text_sm().text_color(muted).child(t.to_string());
         let rows: Vec<AnyElement> =
             self.argo_api
@@ -1233,11 +1242,16 @@ impl SettingsView {
             )
             .children(self.argo_api_error.clone().map(|e| div().pt_1().text_xs().text_color(theme.danger).child(e)))
             .child(Self::row(
-                "Group environments by label",
-                "On the Argo CD page grouped by service: Applications with the same value of this label are one \
-                 service (app.kubernetes.io/part-of, say). Without it, or for one without the label, its name \
-                 without the environment in it (shop-prod and shop-staging are shop).",
-                div().w(px(260.)).child(Input::new(&self.argo_group_label).small()),
+                "Environment types",
+                "On the Argo CD page, an environment's type comes from its root Application's name: one \
+                 `type = pattern` (a regular expression) per line, in the order the page shows them. The match \
+                 that starts first in the name wins, ties go to the earlier line. `type = tag:other` is an \
+                 environment of type `other` whose product images all carry a version tag. No match: other.",
+                v_flex()
+                    .w(px(420.))
+                    .gap_1()
+                    .child(Textarea::new(&self.argo_env_types).small())
+                    .children(env_type_errors.into_iter().map(|e| div().text_xs().text_color(theme.warning).child(e))),
                 cx,
             ))
             .into_any_element()
@@ -1830,6 +1844,18 @@ fn input_text(state: &InputState) -> String {
 
 fn textarea_text(state: &TextareaState) -> String {
     state.value().to_string()
+}
+
+/// The environment types as shown: those saved, else the defaults.
+fn env_types_text(saved: &[String]) -> String {
+    if saved.is_empty() { crate::k8s::argo::environments::DEFAULT_TYPES.join("\n") } else { saved.join("\n") }
+}
+
+/// The environment types typed, one a line, as saved: none when they are the defaults (a
+/// later version's defaults then apply).
+fn env_type_lines(text: &str) -> Vec<String> {
+    let lines = repo_lines(text);
+    if lines.iter().map(String::as_str).eq(crate::k8s::argo::environments::DEFAULT_TYPES) { Vec::new() } else { lines }
 }
 
 /// The code folders typed one a line.

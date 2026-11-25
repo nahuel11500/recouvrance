@@ -441,10 +441,10 @@ pub struct Settings {
     /// Argo CD API servers not read (their address), whether set here or the argocd CLI's.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub argocd_api_off: Vec<String>,
-    /// The label whose value names an Application's service on the Argo CD page, to group
-    /// its environments. Empty: its name without the environment in it.
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub argocd_group_label: String,
+    /// The Argo CD page's environment types, in the order shown: `type = pattern` lines (see
+    /// `k8s::argo::environments`). Empty: the defaults.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub argocd_env_types: Vec<String>,
     /// Which kubeconfig file keeps a context name that several files have: the first one
     /// seen. The others' contexts are `name@file`, whatever order the files are read in.
     #[serde(deserialize_with = "string_entries")]
@@ -684,7 +684,7 @@ impl Default for Settings {
             argocd_servers: Default::default(),
             argocd_api_servers: Vec::new(),
             argocd_api_off: Vec::new(),
-            argocd_group_label: String::new(),
+            argocd_env_types: Vec::new(),
             context_files: Default::default(),
             open_browser_on_forward: true,
             recent_forwards: Vec::new(),

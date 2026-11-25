@@ -23,6 +23,7 @@ use crate::status::Tone;
 pub mod api;
 pub mod dashboard;
 pub mod diagnosis;
+pub mod environments;
 pub mod grouped_diff;
 pub mod grouped_sync;
 pub mod grouping;
@@ -326,6 +327,8 @@ pub struct Summary {
     pub own: Option<(String, String, Option<String>)>,
     /// Its labels, sorted by key.
     pub labels: Vec<(String, String)>,
+    /// The images it runs, as Argo CD sums them up (`status.summary.images`).
+    pub images: Vec<String>,
     /// Its destination as written: the server URL, the cluster name, the namespace.
     pub dest_server: String,
     pub dest_name: String,
@@ -429,6 +432,14 @@ impl Summary {
                 .into_iter()
                 .flatten()
                 .filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_string())))
+                .collect(),
+            images: app
+                .pointer("/status/summary/images")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(String::from)
                 .collect(),
             dest_server: s("/spec/destination/server").unwrap_or_default(),
             dest_name: s("/spec/destination/name").unwrap_or_default(),
@@ -1486,6 +1497,8 @@ pub struct FleetApp {
     pub instance: String,
     pub app: Summary,
     pub dest: Destination,
+    /// Its destination cluster as Argo CD names it (see `cluster_name`).
+    pub cluster: String,
     /// The context its destination is shown on (a connected one first), if any reaches it.
     pub on: Option<String>,
     /// The Application that made it (an app of apps), as an index in the fleet.
@@ -1568,6 +1581,27 @@ pub struct ApiRead {
     pub state: api::FeedState,
 }
 
+/// A destination cluster as Argo CD names it: the name the Application gives, else the one
+/// Argo CD's cluster list gives its server URL (`names`, by `server_key`), else `in-cluster`
+/// for Argo CD's own, else the URL's host.
+pub fn cluster_name(name: &str, server: &str, names: &std::collections::BTreeMap<String, String>) -> String {
+    if !name.is_empty() {
+        return name.to_string();
+    }
+    if server.is_empty() {
+        return String::new();
+    }
+    let key = server_key(server);
+    if let Some(n) = names.get(&key) {
+        return n.clone();
+    }
+    if key == server_key(IN_CLUSTER) {
+        return "in-cluster".into();
+    }
+    let host = key.split_once("://").map_or(key.as_str(), |(_, h)| h);
+    host.split(['/', ':']).next().unwrap_or(host).to_string()
+}
+
 /// Every Application read by Argo CD's API, each server's under the app of apps that made it.
 /// `targets` are the kubeconfig's contexts, `connected` those connected, `servers` each hub
 /// context's Argo CD server (`argocd_servers`), which says the cluster `in-cluster` is.
@@ -1600,11 +1634,13 @@ pub fn from_api(
         for (a, parent) in apps.iter().zip(parents(values.as_slice())) {
             let dest = destination(&a.value, &hub, targets);
             let on = dest.context(connected).map(String::from);
+            let cluster = cluster_name(&a.summary.dest_name, &a.summary.dest_server, &read.state.clusters);
             fleet.apps.push(FleetApp {
                 server: endpoint.clone(),
                 instance: instance.clone(),
                 app: a.summary.clone(),
                 dest,
+                cluster,
                 on,
                 parent: parent.map(|p| base + p),
                 version: resource_version(&a.value),
@@ -1679,6 +1715,7 @@ mod tests {
             instance: source.instance(),
             app: app.summary.clone(),
             dest: Destination::default(),
+            cluster: String::new(),
             on: None,
             parent: None,
             version: String::new(),
