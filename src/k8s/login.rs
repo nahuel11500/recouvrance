@@ -174,7 +174,7 @@ fn port_is_number(authority: &http::uri::Authority) -> Option<bool> {
 
 /// `text` without the user and password of any URL in it: after each `://`, everything up to
 /// [`userinfo_end`]. A text without them comes back as it is.
-fn without_userinfo(text: &str) -> Cow<'_, str> {
+pub(super) fn without_userinfo(text: &str) -> Cow<'_, str> {
     let mut said = String::new();
     // How much of `text` is in `said` or left out.
     let mut done = 0;
