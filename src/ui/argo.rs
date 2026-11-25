@@ -84,20 +84,6 @@ pub fn tree_order(parents: &[Option<usize>], cmp: impl Fn(usize, usize) -> Order
     out
 }
 
-/// The Applications above `i`, nearest first, stopping where parents loop.
-fn ancestors(parents: &[Option<usize>], i: usize) -> Vec<usize> {
-    let mut out = Vec::new();
-    let mut at = i;
-    while let Some(p) = parents.get(at).copied().flatten() {
-        if p >= parents.len() || p == i || out.contains(&p) {
-            break;
-        }
-        out.push(p);
-        at = p;
-    }
-    out
-}
-
 /// An Application, the same across reads: its Argo CD, namespace and name.
 type Key = AppKey;
 
@@ -220,18 +206,15 @@ impl Rows {
     /// `by`, those with a favorite (`favorite`) first in their group.
     fn listed(&self, by: GroupBy, favorite: impl Fn(usize) -> bool) -> Vec<(Vec<String>, usize)> {
         let order = if by == GroupBy::None { &self.by_name } else { &self.by_group };
-        let mut listed: Vec<(usize, bool, Vec<String>, usize)> = Vec::with_capacity(order.len());
-        let mut group = 0;
+        let mut groups: Vec<Vec<(Vec<String>, usize)>> = Vec::new();
         for &e in order {
             let path = by.path(&self.envs[e], &self.types);
-            if listed.last().is_some_and(|(_, _, p, _)| *p != path) {
-                group += 1;
+            match groups.last_mut() {
+                Some(g) if g[0].0 == path => g.push((path, e)),
+                _ => groups.push(vec![(path, e)]),
             }
-            listed.push((group, !favorite(e), path, e));
         }
-        // Stable: the order within a group stays.
-        listed.sort_by_key(|(group, not_favorite, _, _)| (*group, *not_favorite));
-        listed.into_iter().map(|(_, _, path, e)| (path, e)).collect()
+        groups.into_iter().flat_map(|g| crate::favorites::favorites_first(g, |(_, e)| favorite(*e))).collect()
     }
 }
 
@@ -793,11 +776,12 @@ impl ArgoView {
                 d.tooltip(move |w, cx| component::tooltip::Tooltip::new(tip.clone()).build(w, cx))
             });
         let last_sync = env.last_sync.map(|t| format!("{} ago", k8s::age(t)));
-        let destination = match (rows.show_cluster, rows.show_namespace) {
-            (true, true) => argo::destination_text(&env.cluster, &env.namespace),
-            (true, false) => env.cluster.clone(),
-            (false, true) => env.namespace.clone(),
-            (false, false) => String::new(),
+        // The namespace only where it isn't the environment's own name.
+        let namespace = if rows.show_namespace && env.namespace != env.name { env.namespace.as_str() } else { "" };
+        let destination = match (rows.show_cluster, namespace.is_empty()) {
+            (true, false) => argo::destination_text(&env.cluster, namespace),
+            (true, true) => env.cluster.clone(),
+            (false, _) => namespace.to_string(),
         };
         let opener = h_flex()
             .id(("argo-open", i))
@@ -1410,7 +1394,7 @@ impl Render for ArgoView {
 #[cfg(test)]
 mod tests {
     // Not `super::*`: gpui's own `test` attribute would shadow the standard one.
-    use super::{ancestors, tree_order};
+    use super::tree_order;
 
     fn by_index(a: usize, b: usize) -> std::cmp::Ordering {
         a.cmp(&b)
@@ -1434,9 +1418,6 @@ mod tests {
         let mut seen: Vec<usize> = order.iter().map(|(i, _)| *i).collect();
         seen.sort_unstable();
         assert_eq!(seen, [0, 1, 2, 3]);
-        assert_eq!(ancestors(&parents, 0), [1]);
-        assert!(ancestors(&parents, 2).is_empty());
-        assert!(ancestors(&parents, 3).is_empty());
     }
 }
 

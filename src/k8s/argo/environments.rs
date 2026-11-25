@@ -173,19 +173,9 @@ impl EnvTypes {
         Self { names, rules, errors }
     }
 
-    /// How many types there are, `other` (the last) included.
-    pub fn len(&self) -> usize {
-        self.names.len() + 1
-    }
-
     /// The name of type `t` (an index `of` gives): `other` past the types.
     pub fn name(&self, t: usize) -> &str {
         self.names.get(t).map_or(OTHER, String::as_str)
-    }
-
-    /// Whether type `t` is told by its images being on a version tag (`tag:`).
-    pub fn tagged(&self, t: usize) -> bool {
-        matches!(self.rules.get(t), Some(Rule::Tagged(_)))
     }
 
     /// The type of an environment whose root is named `name`, `on_tag` when its product
@@ -246,7 +236,7 @@ pub fn images<'a>(all: impl Iterator<Item = &'a str>) -> Vec<EnvImage> {
 pub fn differing(envs: &[&[EnvImage]]) -> HashSet<String> {
     let mut tags: BTreeMap<&str, BTreeSet<&[String]>> = BTreeMap::new();
     for env in envs {
-        for i in env.iter() {
+        for i in *env {
             tags.entry(&i.repo).or_default().insert(&i.tags);
         }
     }
@@ -403,19 +393,20 @@ mod tests {
         // `platform-` starts the name: before `-prod`.
         assert_eq!(name("platform-prod-monitoring", false), "platform");
         assert_eq!(name("production-line", false), OTHER);
-        assert_eq!(t.of("x", false), t.len() - 1);
+        assert_eq!(t.name(t.of("x", false)), OTHER);
     }
 
     #[test]
     fn a_line_that_does_not_read_types_nothing() {
-        let lines = |l: &[&str]| EnvTypes::parse(&l.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        let lines = |l: &[&str]| EnvTypes::parse(&l.iter().map(ToString::to_string).collect::<Vec<_>>());
         let t = lines(&["live = -live$", "broken = (", "no pattern", "onTag = tag:missing", "other = x", "live = y"]);
         assert_eq!(t.errors.len(), 5, "{:?}", t.errors);
-        assert_eq!(t.len(), 2);
+        assert_eq!((t.name(0), t.name(1)), ("live", OTHER));
         assert_eq!(t.name(t.of("shop-live", true)), "live");
         assert_eq!(t.name(t.of("shop-prod", true)), OTHER);
         // No line: the defaults.
-        assert_eq!(lines(&["", "# nothing"]).len(), DEFAULT_TYPES.len() + 1);
+        let defaults = lines(&["", "# nothing"]);
+        assert_eq!((defaults.name(DEFAULT_TYPES.len() - 1), defaults.name(DEFAULT_TYPES.len())), ("platform", OTHER));
     }
 
     #[test]
