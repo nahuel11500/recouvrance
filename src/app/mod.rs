@@ -529,6 +529,10 @@ pub struct AppView {
     metrics: Option<Vec<(TaskGuard, Task<()>)>>,
     /// The timeline's own watches (`timeline.kinds`), while connected.
     recording: Vec<TaskGuard>,
+    /// Each connected cluster's namespace watch, shared with the other windows: the picker
+    /// follows namespaces created and deleted after the connect (`namespaces_moved`).
+    namespace_feeds: Vec<k8s::namespace_feed::NamespaceHold>,
+    _namespaces_follow: Option<Task<()>>,
     /// A connect is in flight (`_connect` stays set once it is done).
     connecting: bool,
     _connect: Option<Task<()>>,
@@ -790,6 +794,8 @@ impl AppView {
             clusters: Vec::new(),
             kind_clusters: HashMap::new(),
             recording: Vec::new(),
+            namespace_feeds: Vec::new(),
+            _namespaces_follow: None,
             views: Default::default(),
             list: live_list::LiveList::default(),
             list_pause: k8s::Pause::default(),
