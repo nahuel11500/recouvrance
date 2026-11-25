@@ -33,6 +33,11 @@ try {
     Start-Sleep 1
   }
   "window: '$($app.MainWindowTitle)'"
+  # The console the app borrowed, which the login command shares.
+  Start-Process powershell.exe -Wait -WindowStyle Hidden -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', `
+    '-File', "$PSScriptRoot\has-console.ps1", '-Id', $app.Id, '-Out', "$env:E2E\app-console.txt"
+  "the app's console: $(Get-Content "$env:E2E\app-console.txt" -ErrorAction SilentlyContinue)"
+  Get-CimInstance Win32_Process -Filter "ParentProcessId=$($app.Id)" | ForEach-Object { "child: $($_.Name) $($_.ProcessId)" }
   Wait-Port $app
   $pods = Invoke-Tool list_resources context=kwok-exec kind=pods namespace=default
   $pods
