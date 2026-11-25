@@ -988,13 +988,30 @@ fn notify_desktop(title: &str, body: &str) {
     if body.chars().count() > 200 {
         body = body.chars().take(200).collect::<String>() + "…";
     }
+    #[cfg(windows)]
+    {
+        // A native toast. Recouvrance has no registered AppUserModelID (it is not installed
+        // through an MSIX package), so the toast is shown under PowerShell's, which Windows
+        // always knows; PowerShell itself is not started. The text is set through the XML DOM,
+        // so an agent's text cannot change the toast's markup. Showing it is a blocking WinRT
+        // call: it runs off the UI thread.
+        let title = title.to_string();
+        std::thread::spawn(move || {
+            use tauri_winrt_notification::{Duration, Toast};
+            if let Err(e) =
+                Toast::new(Toast::POWERSHELL_APP_ID).title(&title).text1(&body).duration(Duration::Long).show()
+            {
+                eprintln!("recouvrance: desktop notification failed: {e}");
+            }
+        });
+    }
     #[cfg(target_os = "macos")]
     let mut cmd = {
         let mut cmd = std::process::Command::new("osascript");
         cmd.args(osascript_args(title, &body));
         cmd
     };
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", windows)))]
     let mut cmd = {
         let mut cmd = std::process::Command::new("notify-send");
         // `--`: a title or body starting with '-' (an agent's text) is never read as an option.
@@ -1009,6 +1026,7 @@ fn notify_desktop(title: &str, body: &str) {
         ]);
         cmd
     };
+    #[cfg(not(windows))]
     crate::forwards::spawn_reaped(cmd.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()));
 }
 
