@@ -789,7 +789,7 @@ mod tests {
     fn the_rollback_approved_is_the_one_sent() {
         let mut op = Op::Rollback { id: None, dry_run: false };
         let detail = approval_detail(&app(), &mut op).unwrap();
-        assert_eq!(detail, format!("rollback to deployment 1 ({})", "a".repeat(8)));
+        assert_eq!(detail, format!("rollback to deployment 1 ({})", "a".repeat(7)));
         // Sent by its id: a deployment landing after the approval changes nothing.
         assert_eq!(op, Op::Rollback { id: Some(1), dry_run: false });
         let mut later = app();

@@ -28,6 +28,7 @@ pub mod grouped_sync;
 pub mod grouping;
 pub mod journal;
 pub mod ops;
+mod revision;
 pub mod server;
 pub mod sync_diff;
 pub mod windows;
@@ -330,10 +331,7 @@ pub struct Summary {
     pub dest_namespace: String,
 }
 
-/// A revision as shown: a git sha cut to 8 characters, anything else (a chart version) whole.
-pub fn short_revision(rev: &str) -> String {
-    if rev.len() == 40 && rev.chars().all(|c| c.is_ascii_hexdigit()) { rev[..8].to_string() } else { rev.to_string() }
-}
+pub use revision::short_revision;
 
 /// `status.sync.revision`, or each of `status.sync.revisions` (several sources).
 pub(crate) fn revisions(v: &Value) -> Option<String> {
@@ -1845,8 +1843,8 @@ mod tests {
         });
         let s = Summary::of(&app).with_own(&app, "apps", "Deployment", "shop", "web");
         assert_eq!((s.sync.as_str(), s.health.as_str(), s.automated), ("OutOfSync", "Degraded", true));
-        assert_eq!(s.revision.as_deref(), Some("01234567"));
-        assert_eq!(s.history[0].revision, "01234567, 2.0.0");
+        assert_eq!(s.revision.as_deref(), Some("0123456"));
+        assert_eq!(s.history[0].revision, "0123456, 2.0.0");
         assert_eq!(s.history[0].by.as_deref(), Some("ana"));
         assert_eq!(s.history[1].by.as_deref(), Some("auto-sync"));
         assert_eq!(s.operation.as_ref().map(|o| o.0.as_str()), Some("Failed"));

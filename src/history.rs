@@ -1118,8 +1118,8 @@ mod tests {
             summaries,
             [
                 "sync Failed: one or more objects failed",
-                "deployed bbbbbbbb from github.com/acme/deploy shop @ main by auto-sync",
-                "deployed aaaaaaaa from github.com/acme/deploy shop @ main by ana",
+                "deployed bbbbbbb from github.com/acme/deploy shop @ main by auto-sync",
+                "deployed aaaaaaa from github.com/acme/deploy shop @ main by ana",
             ]
         );
         assert!(changes[0].warning);
