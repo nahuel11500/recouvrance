@@ -67,7 +67,7 @@ pub fn adopted(apps: &mut Vec<FavApp>, found: impl Fn(&str, &str) -> Vec<String>
         on.sort();
         on.dedup();
         if let [one] = on.as_slice() {
-            a.argocd = one.clone();
+            a.argocd.clone_from(one);
             a.context = None;
             changed = true;
         }
@@ -858,7 +858,9 @@ mod tests {
             Favorite::for_object("hub", &crate::k8s::argo::application_kind(), Some("argocd".into()), "shop".into());
         let Favorite::Application(fav) = &a else { panic!("{a:?}") };
         assert!(fav.is(&["context:hub"], "argocd", "shop"));
-        assert_eq!(a.context(), Some("hub"));
+        // It opens on the Argo CD page, once a server lists it.
+        assert_eq!(a.context(), None);
+        assert!(fav.unresolved());
     }
 }
 

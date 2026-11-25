@@ -1139,7 +1139,7 @@ pub async fn api_candidates(
     let at = |_: &api::Endpoint| &*API_HOME;
     let held = api::held_apps(use_server, start, API_WAIT, |e, a| {
         names_app(by, &a.summary)
-            && (matches!(by, TrackedBy::Id(_)) || app_deploys_to(&a.value, &at(e), &here) != Some(false))
+            && (matches!(by, TrackedBy::Id(_)) || app_deploys_to(&a.value, at(e), &here) != Some(false))
     })
     .await;
     if held.is_empty() {
@@ -1181,7 +1181,7 @@ pub async fn api_candidates(
                 held.value.clone()
             }
         };
-        let here = app_deploys_to(&app, &at(&endpoint), &here);
+        let here = app_deploys_to(&app, at(&endpoint), &here);
         let tracks = resource_of(&app, group, kind, ns, name).is_some();
         found.push(ApiCandidate { endpoint, app, here, tracks });
     }
@@ -1644,7 +1644,7 @@ pub fn from_api(reads: Vec<ApiRead>, targets: &[ContextTarget], connected: &[Str
         let values: Vec<&Value> = apps.iter().map(|a| &a.value).collect();
         let base = fleet.apps.len();
         for (a, parent) in apps.iter().zip(parents(values.as_slice())) {
-            let mut dest = destination(&a.value, &hub, targets);
+            let mut dest = destination(&a.value, hub, targets);
             let cluster = cluster_name(&a.summary.dest_name, &a.summary.dest_server, &read.state.clusters);
             if dest.contexts.is_empty() {
                 dest.contexts = named_contexts(&a.summary.dest_server, &read.state.clusters, targets);
