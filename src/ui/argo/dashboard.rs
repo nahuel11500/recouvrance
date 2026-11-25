@@ -82,6 +82,9 @@ pub(super) struct Dashboard {
     tab: usize,
     /// The cards last read, and of which Application.
     cards: Option<(Key, Result<Arc<Cards>, String>)>,
+    /// Why the last read failed, or gave only the list's copy, while older cards of the same
+    /// Application read whole stay shown: one line over them.
+    failed: Option<String>,
     /// The Application's row when it was read: a change of it reads it again.
     read_for: Option<(Key, argo::Summary)>,
     loading: bool,
@@ -115,6 +118,7 @@ impl Dashboard {
             members,
             tab,
             cards: None,
+            failed: None,
             read_for: None,
             loading: false,
             dirty: false,
@@ -171,8 +175,19 @@ impl Dashboard {
         let running =
             cards.as_ref().is_ok_and(|c| c.summary.in_progress || c.last_sync.as_ref().is_some_and(|s| s.running));
         self.loading = false;
-        self.updated = Some(now);
-        self.cards = Some((k, cards));
+        // A failed read, or one of the list's copy only, keeps the cards of this Application
+        // read whole before: what's held stays, with why in one line.
+        let whole = |c: &Result<Arc<Cards>, String>| c.as_ref().is_ok_and(|c| c.note.is_none());
+        let kept = self.cards.as_ref().is_some_and(|(kk, c)| *kk == k && whole(c));
+        match &cards {
+            Err(e) if kept => self.failed = Some(kept_line(e)),
+            Ok(c) if kept && c.note.is_some() => self.failed = c.note.as_deref().map(kept_line),
+            _ => {
+                self.failed = None;
+                self.updated = Some(now);
+                self.cards = Some((k, cards));
+            }
+        }
         if std::mem::take(&mut self.dirty) {
             Next::Reload
         } else if running {
@@ -181,6 +196,11 @@ impl Dashboard {
             Next::Rest
         }
     }
+}
+
+/// The line over cards kept from an older read, when the last one failed with `why`.
+fn kept_line(why: &str) -> String {
+    format!("Not read now ({}): shown as last read.", dashboard::first_line(why))
 }
 
 /// What follows a read of the dashboard (see `Dashboard::take_read`).
@@ -256,6 +276,7 @@ impl ArgoView {
             return;
         }
         d.tab = tab;
+        d.failed = None;
         d.open.clear();
         d.close_compare();
         d.tick = None;
@@ -464,6 +485,22 @@ impl ArgoView {
         cx.notify();
     }
 
+    /// The made-up example after a login expired: the tab shown keeps its last read with why in
+    /// one line, and the next one is shown as the Applications list has it.
+    #[cfg(feature = "dev")]
+    pub fn demo_dashboard_expired(&mut self, cx: &mut Context<Self>) {
+        self.demo_dashboard(cx);
+        let Some(d) = &mut self.dashboard else { return };
+        let why = "Argo CD at argocd.example.com doesn't take this token as a login: expired or revoked?";
+        d.failed = Some(kept_line(why));
+        let now = Timestamp::now();
+        if let Some((_, cards)) = d.example.as_mut().and_then(|t| t.get_mut(1)) {
+            let app = api::lean(&dashboard::example::read(dashboard::example::ENVIRONMENTS[0], now).app);
+            *cards = Arc::new(Cards::of(dashboard::Read::held(app, why), None, now));
+        }
+        cx.notify();
+    }
+
     // MARK: Rendering
 
     /// The dashboard: its header, an entry per environment, and the cards of the one shown.
@@ -554,11 +591,13 @@ impl ArgoView {
             Some(Err(e)) => div().p_4().text_color(theme.danger).child(selectable(e)).into_any_element(),
             Some(Ok(cards)) => self.cards(d, &cards, cx),
         };
+        let failed = d.failed.clone().filter(|_| d.shown().is_some_and(|c| c.is_ok()));
         v_flex()
             .size_full()
             .gap_2()
             .child(header)
             .child(environments)
+            .children(failed.map(|f| div().text_xs().text_color(theme.warning).child(selectable(f))))
             .child(div().id("argo-dash-body").flex_1().min_h_0().overflow_y_scroll().child(body))
             .into_any_element()
     }
@@ -625,7 +664,6 @@ impl ArgoView {
     /// The four status tiles (two pairs that stack on a narrow window), the parts unfolded
     /// from them full width, then the Versions and History panels.
     fn cards(&self, d: &Dashboard, c: &Cards, cx: &mut Context<Self>) -> AnyElement {
-        let muted = cx.theme().muted_foreground;
         let pair = |a: Div, b: Div| {
             h_flex()
                 .flex_wrap()
@@ -643,7 +681,10 @@ impl ArgoView {
         v_flex()
             .gap_3()
             .pb_4()
-            .when_some(c.note.clone(), |v, note| v.child(div().text_xs().text_color(muted).child(selectable(note))))
+            .when_some(c.note.as_ref(), |v, why| {
+                let line = format!("Not read now ({why}): shown as the Applications list has it.");
+                v.child(div().text_xs().text_color(cx.theme().warning).child(selectable(line)))
+            })
             .child(h_flex().flex_wrap().items_stretch().gap_3().child(status).child(changes))
             .children(unfolded)
             .child(
@@ -761,6 +802,12 @@ impl ArgoView {
             _ => None,
         };
         let from_status = tip.map(|tip| hint("argo-dash-diff-source", "from status", tip, cx));
+        // A list's copy holds no resources: what differs isn't known, only that something does.
+        if total == 0 && c.note.is_some() && c.summary.sync != "Synced" {
+            return tile("Sync diff", None, cx)
+                .child(figure(c.summary.sync.clone(), muted))
+                .child(div().text_xs().text_color(muted).child("What differs wasn't read."));
+        }
         if total == 0 {
             return tile("Sync diff", Some(Tone::Good), cx)
                 .child(figure("In sync".into(), theme.success))
@@ -818,9 +865,13 @@ impl ArgoView {
         };
         // Why nothing can be said, or why the pods aren't listed: on hover.
         let unknown = (p.rows.is_empty() && !known_clean).then(|| {
-            let why = c.tree_error.clone().or_else(|| c.note.clone()).unwrap_or_else(|| {
-                "Argo CD keeps no health per resource in the Application, and its resource tree wasn't read".into()
-            });
+            let why = c
+                .tree_error
+                .clone()
+                .or_else(|| c.note.as_ref().map(|n| format!("Not read now ({n})")))
+                .unwrap_or_else(|| {
+                    "Argo CD keeps no health per resource in the Application, and its resource tree wasn't read".into()
+                });
             hint("argo-dash-problems-why", "no detail", format!("{why}."), cx)
         });
         let tree_unread = c
@@ -1557,6 +1608,36 @@ mod tests {
         running.summary.in_progress = true;
         assert_eq!(d.take_read(key("example-staging"), Ok(Arc::new(running)), Timestamp::now()), Next::Tick);
         assert_eq!(d.take_read(key("example-staging"), Err("down".into()), Timestamp::now()), Next::Rest);
+    }
+
+    /// A read that fails, or gives only the list's copy, keeps the cards read whole before,
+    /// with why in one line; the next read whole replaces them. With nothing read whole before,
+    /// the list's copy is shown, and an error is the error.
+    #[test]
+    fn a_failed_read_keeps_what_was_read() {
+        let k = key("example-prod");
+        let mut d = Dashboard::new("shop".into(), vec![k.clone()], 0);
+        let held = || {
+            let app = example::read("example-prod", Timestamp::now()).app;
+            let read = crate::k8s::argo::dashboard::Read::held(app, "401 Unauthorized\nmore detail");
+            Arc::new(Cards::of(read, None, Timestamp::now()))
+        };
+        d.take_read(k.clone(), Ok(held()), Timestamp::now());
+        assert!(d.shown().is_some_and(|c| c.is_ok_and(|c| c.note.as_deref() == Some("401 Unauthorized"))));
+        assert!(d.failed.is_none(), "the list's copy says why itself");
+        d.take_read(k.clone(), Ok(cards("example-prod")), Timestamp::now());
+        assert!(d.shown().is_some_and(|c| c.is_ok_and(|c| c.note.is_none())) && d.failed.is_none());
+        d.take_read(k.clone(), Err("token expired\nat …".into()), Timestamp::now());
+        assert!(d.shown().is_some_and(|c| c.is_ok_and(|c| c.note.is_none())), "kept");
+        assert_eq!(d.failed.as_deref(), Some("Not read now (token expired): shown as last read."));
+        d.take_read(k.clone(), Ok(held()), Timestamp::now());
+        assert!(d.shown().is_some_and(|c| c.is_ok_and(|c| c.note.is_none())), "kept over the list's copy");
+        assert_eq!(d.failed.as_deref(), Some("Not read now (401 Unauthorized): shown as last read."));
+        d.take_read(k.clone(), Ok(cards("example-prod")), Timestamp::now());
+        assert!(d.failed.is_none());
+        let mut other = Dashboard::new("shop".into(), vec![k.clone()], 0);
+        other.take_read(k, Err("down".into()), Timestamp::now());
+        assert!(other.shown().is_some_and(|c| c.is_err()) && other.failed.is_none());
     }
 
     #[derive(Default)]

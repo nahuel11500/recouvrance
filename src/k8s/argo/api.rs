@@ -1297,6 +1297,10 @@ pub async fn read_app_opt(endpoint: Arc<Endpoint>, namespace: String, name: Stri
 /// The dashboard of the Application `namespace/name`, read by the API with the server's login
 /// as the config has it now: the Application whole, then its resource tree and managed
 /// resources together, then the commits it deploys (each kept once read). Read-only.
+///
+/// When the Application can't be read (no login, an expired one, the server down), it is
+/// shown as the feed of `endpoint` holds it, with why in one line (`Read::note`); an error
+/// only when no feed holds it either.
 pub async fn dashboard(
     endpoint: Arc<Endpoint>,
     namespace: String,
@@ -1306,11 +1310,11 @@ pub async fn dashboard(
         let found = current(&endpoint.server.base).and_then(|e| Ok((e.conn()?, e.login?.1)));
         let (conn, how) = match found {
             Ok(found) => found,
-            Err(e) => return Ok(Err(e)),
+            Err(e) => return Ok(held_read(&endpoint, &namespace, &name, e)),
         };
         let app = match conn.get(&app_path(&namespace, &name)).await {
             Ok(app) => app,
-            Err(f) => return Ok(Err(f.text)),
+            Err(f) => return Ok(held_read(&endpoint, &namespace, &name, f.text)),
         };
         super::journal::observe(&super::grouping::server_instance(&conn.server.base), &app);
         let shown = conn.server.name();
@@ -1323,6 +1327,15 @@ pub async fn dashboard(
         Ok(Ok(super::dashboard::extras(&base, &namespace, &name, app, get, diff_of).await))
     });
     read.await.unwrap_or_else(|e| Err(format!("{e:#}")))
+}
+
+/// The dashboard of `namespace/name` as the running feed of `endpoint` holds it, when reading
+/// it failed with `why`: its status without its tree, diff and commits, and why in one line.
+/// `why` alone when no feed holds it.
+fn held_read(endpoint: &Endpoint, namespace: &str, name: &str, why: String) -> Result<super::dashboard::Read, String> {
+    let held = running(endpoint).and_then(|s| lock(&s).apps.get(&(namespace.to_string(), name.to_string())).cloned());
+    let Some(app) = held else { return Err(why) };
+    Ok(super::dashboard::Read::held(app.value.clone(), &why))
 }
 
 /// The smart diff of the manifests Argo CD renders for the Application `namespace/name` at
