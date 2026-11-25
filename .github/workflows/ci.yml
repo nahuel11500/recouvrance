@@ -207,6 +207,73 @@ jobs:
           path: snapshot.png
           if-no-files-found: ignore
 
+  # The Windows app end to end, as far as a runner goes (#1039): nobody has a Windows machine.
+  # On a kwok cluster (Windows programs: the runner has no Linux containers for kind), the app's
+  # own build answers its command line, serves MCP, opens its window, runs a kubeconfig login
+  # command without a console window and keeps its files in %LOCALAPPDATA%\recouvrance; the dev
+  # build drives the UI headless and runs a plugin through Git for Windows' sh. The steps are in
+  # scripts/ci/windows-e2e.
+  e2e-windows:
+    name: End to end (Windows)
+    if: github.event_name != 'pull_request'
+    runs-on: windows-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      # The MCP port of every Recouvrance started here.
+      PORT: 47199
+      KWOK_VERSION: v0.8.0
+      KWOKCTL_SHA256: 13a5b782aaa2c8413dca8903b1e3deaeacfa5da1da66cd565a1842ecf010bf09
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: ci
+      - name: Build the app and the dev build
+        run: scripts/ci/windows-e2e/build.ps1
+      - name: Start a kwok cluster, with a context that has a login command
+        run: scripts/ci/windows-e2e/cluster.ps1
+      - name: Command line (--version, --help, agent-create)
+        env:
+          LOCALAPPDATA: ${{ runner.temp }}\e2e\local
+          APPDATA: ${{ runner.temp }}\e2e\roaming
+        run: scripts/ci/windows-e2e/cli.ps1
+      - name: MCP server without a window (serve)
+        env:
+          LOCALAPPDATA: ${{ runner.temp }}\e2e\local
+          APPDATA: ${{ runner.temp }}\e2e\roaming
+        run: scripts/ci/windows-e2e/serve.ps1
+      - name: The app's window, its MCP server, a login command, its files
+        env:
+          LOCALAPPDATA: ${{ runner.temp }}\e2e\local
+          APPDATA: ${{ runner.temp }}\e2e\roaming
+        run: scripts/ci/windows-e2e/window.ps1
+      - name: Developer tools (smoke checks, headless UI, a plugin through sh)
+        env:
+          XDG_CONFIG_HOME: ${{ runner.temp }}\e2e\dev-config
+          XDG_DATA_HOME: ${{ runner.temp }}\e2e\dev-data
+          # Where exports go (~\Downloads).
+          HOME: ${{ runner.temp }}\e2e\home
+        run: scripts/ci/windows-e2e/dev.ps1
+      - name: Stop the kwok cluster
+        if: always()
+        run: if ($env:KWOKCTL) { & $env:KWOKCTL delete cluster --name recouvrance }
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: e2e-windows
+          path: |
+            ${{ runner.temp }}/e2e/*.png
+            ${{ runner.temp }}/e2e/*.log
+            ${{ runner.temp }}/e2e/*.out
+            ${{ runner.temp }}/e2e/plugin.txt
+          if-no-files-found: ignore
+
   build:
     name: Release build (${{ matrix.target }})
     if: github.event_name != 'pull_request'
@@ -246,7 +313,7 @@ jobs:
   ci-ok:
     name: CI result
     if: always()
-    needs: [quick, check, check-windows, test-macos, test-windows, msrv, docs, e2e, build]
+    needs: [quick, check, check-windows, test-macos, test-windows, msrv, docs, e2e, e2e-windows, build]
     runs-on: ubuntu-latest
     steps:
       - name: All required jobs passed or were skipped

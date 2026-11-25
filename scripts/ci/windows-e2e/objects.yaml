@@ -1,0 +1,37 @@
+# What the Windows end-to-end job's kwok cluster holds: a fake node (kwok runs its pods without
+# containers) and a deployment whose pods it reports Running.
+apiVersion: v1
+kind: Node
+metadata:
+  name: kwok-node-0
+  annotations:
+    node.alpha.kubernetes.io/ttl: "0"
+    kwok.x-k8s.io/node: fake
+  labels:
+    kubernetes.io/hostname: kwok-node-0
+    kubernetes.io/os: linux
+    kubernetes.io/arch: amd64
+    type: kwok
+status:
+  allocatable: {cpu: "32", memory: 256Gi, pods: "110"}
+  capacity: {cpu: "32", memory: 256Gi, pods: "110"}
+  nodeInfo: {architecture: amd64, kubeProxyVersion: fake, kubeletVersion: fake, operatingSystem: linux}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: web, namespace: default}
+spec:
+  replicas: 2
+  selector: {matchLabels: {app: web}}
+  template:
+    metadata: {labels: {app: web}}
+    spec:
+      containers:
+        - name: web
+          image: busybox:1.37
+          resources: {requests: {cpu: 100m, memory: 64Mi}}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata: {name: settings, namespace: default}
+data: {mode: ci}
