@@ -458,7 +458,7 @@ mod tests {
     }
 
     #[test]
-    fn the_registrys_gitlab_is_asked_first_then_the_project_above() {
+    fn the_gitlab_of_the_registry_is_asked_first_then_the_project_above() {
         let hosts = [gitlab("gitlab.other.com", &[]), gitlab("gitlab.example.com", &["registry.example.com"])];
         assert_eq!(
             candidates("registry.example.com/shop/back/api", &hosts),
