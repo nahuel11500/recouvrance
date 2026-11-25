@@ -34,7 +34,8 @@ where
     for d in &deployed {
         commits.push(commit(server, namespace, name, d, version, &get).await);
     }
-    Read { app, tree: Some(tree), diff: Some(managed.map(|m| diff_of(&m))), commits, note: None }
+    let diff = Some(managed.as_ref().map(&diff_of).map_err(Clone::clone));
+    Read { app, tree: Some(tree), diff, managed: managed.ok(), commits, note: None }
 }
 
 /// The commit `d` deploys, kept once read; None for a chart's version (no commit).

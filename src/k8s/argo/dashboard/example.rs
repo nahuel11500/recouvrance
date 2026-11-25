@@ -12,9 +12,7 @@ use jiff::Timestamp;
 use serde_json::{Value, json};
 
 use super::{Commit, Read};
-use crate::history::DiffLine;
-use crate::k8s::argo::diagnosis::Res;
-use crate::k8s::argo::server::{Change, GitDiff, Login, ResourceDiff};
+use crate::k8s::argo::server::{GitDiff, Login};
 
 /// The environments, as Application names.
 pub const ENVIRONMENTS: [&str; 3] = ["example-staging", "example-prod", "example-sandbox"];
@@ -250,45 +248,88 @@ pub fn tree(env: &str, now: Timestamp) -> Value {
 /// Argo CD's diff of `env`: in `example-prod`, a ConfigMap changed, a Service to create and a
 /// ConfigMap to prune.
 pub fn diff(env: &str) -> GitDiff {
-    let res = |kind: &str, name: &str| Res {
-        kind: kind.into(),
-        namespace: "shop".into(),
-        name: name.into(),
-        version: "v1".into(),
-        ..Default::default()
+    crate::k8s::argo::server::diffs(&managed(env), "argocd.example.com".into(), Login::Cli)
+}
+
+/// Argo CD's managed resources of `env` (its answer): in prod, two images bumped, an
+/// annotation added to three Deployments, a ConfigMap's and a Secret's key changed, a Service
+/// to create and a ConfigMap to prune; nine resources in sync. Staging is all in sync.
+pub fn managed(env: &str) -> Value {
+    let item = |group: &str, kind: &str, name: &str, live: Value, target: Value| {
+        let text = |v: &Value| if v.is_null() { String::new() } else { v.to_string() };
+        let modified = live != target;
+        json!({"group": group, "version": "v1", "kind": kind, "namespace": "shop", "name": name,
+            "liveState": text(&live), "targetState": text(&target), "modified": modified})
     };
-    let changed = if env == "example-prod" {
-        vec![
-            ResourceDiff {
-                res: res("ConfigMap", "shop-config"),
-                change: Change::Modified,
-                lines: vec![
-                    DiffLine::Same("data:".into()),
-                    DiffLine::Removed("  CRAWL_BATCH: \"50\"".into()),
-                    DiffLine::Added("  CRAWL_BATCH: \"100\"".into()),
-                ],
-                more_lines: 0,
-            },
-            ResourceDiff {
-                res: res("Service", "metrics"),
-                change: Change::Created,
-                lines: vec![
-                    DiffLine::Added("kind: Service".into()),
-                    DiffLine::Added("metadata: {name: metrics}".into()),
-                ],
-                more_lines: 0,
-            },
-            ResourceDiff {
-                res: res("ConfigMap", "legacy-flags"),
-                change: Change::Pruned,
-                lines: vec![DiffLine::Removed("kind: ConfigMap".into())],
-                more_lines: 0,
-            },
-        ]
-    } else {
-        Vec::new()
+    let deploy = |name: &str, image: &str, owner: Option<&str>| {
+        let mut annotations = json!({"deployment.kubernetes.io/revision": "7"});
+        if let Some(o) = owner {
+            annotations["example.io/owner"] = json!(o);
+        }
+        json!({"apiVersion": "apps/v1", "kind": "Deployment",
+            "metadata": {"name": name, "namespace": "shop", "annotations": annotations},
+            "spec": {"replicas": 2, "template": {"spec": {"containers": [{"name": name, "image": image}]}}}})
     };
-    GitDiff { server: "argocd.example.com".into(), login: Login::Cli, changed, more: 0, same: 9, hooks: 0 }
+    let config = |name: &str, batch: &str| {
+        json!({"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": name, "namespace": "shop"},
+            "data": {"CRAWL_BATCH": batch, "LOG_LEVEL": "info"}})
+    };
+    // A Secret as Argo CD sends it: each value hidden by a run of `+`, its length the value's.
+    let secret = |host: &str| {
+        json!({"apiVersion": "v1", "kind": "Secret", "metadata": {"name": "shop-secrets", "namespace": "shop"},
+            "type": "Opaque", "data": {"SMTP_HOST": host, "SMTP_PORT": "++++++++"}})
+    };
+    let service = json!({"apiVersion": "v1", "kind": "Service", "metadata": {"name": "metrics", "namespace": "shop"},
+        "spec": {"ports": [{"port": 9090}]}});
+    let prod = env == "example-prod";
+    let (old, new) = if prod { ("1.4.1", TAG) } else { (TAG, TAG) };
+    let owner = |o: &'static str| prod.then_some(o);
+    let mut items = vec![
+        item(
+            "apps",
+            "Deployment",
+            "api",
+            deploy("api", &image("api", old), None),
+            deploy("api", &image("api", new), owner("team-api")),
+        ),
+        item(
+            "apps",
+            "Deployment",
+            "worker",
+            deploy("worker", &image("worker", old), None),
+            deploy("worker", &image("worker", new), owner("team-crawl")),
+        ),
+        item(
+            "apps",
+            "Deployment",
+            "worker-mail",
+            deploy("worker-mail", &image("worker-mail", MAIL_TAG), None),
+            deploy("worker-mail", &image("worker-mail", MAIL_TAG), owner("team-mail")),
+        ),
+        item(
+            "",
+            "ConfigMap",
+            "shop-config",
+            config("shop-config", "50"),
+            config("shop-config", if prod { "100" } else { "50" }),
+        ),
+        item(
+            "",
+            "Secret",
+            "shop-secrets",
+            secret("++++++++++"),
+            secret(if prod { "++++++++++++" } else { "++++++++++" }),
+        ),
+    ];
+    if prod {
+        items.push(item("", "Service", "metrics", Value::Null, service));
+        items.push(item("", "ConfigMap", "legacy-flags", config("legacy-flags", "1"), Value::Null));
+    }
+    for i in 0..9 {
+        let same = config(&format!("static-{i}"), "1");
+        items.push(item("", "ConfigMap", &format!("static-{i}"), same.clone(), same));
+    }
+    json!({"items": items})
 }
 
 /// Everything read for `env`, as the dashboard reads it.
@@ -303,6 +344,7 @@ pub fn read(env: &str, now: Timestamp) -> Read {
         app: app(env, now),
         tree: Some(Ok(tree(env, now))),
         diff: Some(Ok(diff(env))),
+        managed: Some(managed(env)),
         commits: vec![Some(Ok(commit))],
         note: None,
     }
