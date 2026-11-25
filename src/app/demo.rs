@@ -204,10 +204,12 @@ impl AppView {
                     page.update(cx, |p, cx| p.demo_sync(&how, cx));
                 }
             }
-            // The Argo CD page's list of environments, on a made-up example (no real data).
-            "argo-example-list" => {
+            // The Argo CD page's list of environments, or its overview, on a made-up example
+            // (no real data).
+            "argo-example-list" | "argo-example-overview" => {
+                let list = name == "argo-example-list";
                 if let Route::Argo(page) = self.route().clone() {
-                    page.update(cx, crate::ui::argo::ArgoView::demo_list);
+                    page.update(cx, |p, cx| p.demo_list(list, cx));
                 }
             }
             // What's new: this version's notes, or those shown after an update from a version.

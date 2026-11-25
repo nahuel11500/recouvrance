@@ -316,6 +316,11 @@ pub struct Summary {
     pub operation: Option<(String, Option<String>, Option<String>)>,
     /// An operation is running or waiting to start (`operation` is set): it can be terminated.
     pub in_progress: bool,
+    /// The last operation: when it started, who started it (`dashboard::who`), the revision(s) it
+    /// synced to (short).
+    pub operation_started: Option<String>,
+    pub operation_by: Option<String>,
+    pub operation_revision: Option<String>,
     /// The last deployments, newest first.
     pub history: Vec<Deployment>,
     /// Conditions as (type, message): errors and warnings Argo CD reports.
@@ -421,6 +426,12 @@ impl Summary {
             revision: app.pointer("/status/sync").and_then(revisions),
             operation,
             in_progress: ops::in_progress(app),
+            operation_started: s("/status/operationState/startedAt"),
+            operation_by: app.pointer("/status/operationState/operation/initiatedBy").and_then(dashboard::who),
+            operation_revision: app
+                .pointer("/status/operationState/syncResult")
+                .and_then(revisions)
+                .or_else(|| app.pointer("/status/operationState/operation/sync").and_then(revisions)),
             history,
             conditions,
             urls,
