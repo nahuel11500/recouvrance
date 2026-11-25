@@ -427,7 +427,12 @@ Fields: `name` and `command` (required); `kinds`, kubectl names such as `pods` o
 `description`, shown as the button's tooltip instead of the command; `confirm: true` to ask before
 running; `read_only: true` for plugins that only read.
 
-The command runs with `sh -c`. The object is passed in environment variables, never pasted into
+The command runs with `sh -c`, on every system, so a plugins.yaml works everywhere. Windows has no
+`sh`: plugins need [Git for Windows](https://git-scm.com/download/win), whose `sh.exe` is found on
+`PATH` or where Git installs (`Program Files\Git\bin`, or `AppData\Local\Programs\Git\bin` when
+installed for one user); without it a plugin doesn't start and says so. Its commands are POSIX
+shell, as elsewhere: `kubectl`, `stern` and the like are found on `PATH`, and a Windows program is
+named as is (`start` is a `cmd` command: use `explorer "https://..."` to open a page). The object is passed in environment variables, never pasted into
 the command: `RECOUVRANCE_CONTEXT`, `RECOUVRANCE_NAMESPACE`, `RECOUVRANCE_NAME` and `RECOUVRANCE_KIND`.
 The shorthands `$CONTEXT`, `$NAMESPACE`, `$NAME` and `$KIND` still work: each becomes a reference
 to its variable, quoted for where it stands (bare, in double quotes or in single quotes). `KUBECONFIG` points at a private copy with the context selected, so `kubectl` just works. Plugins run in a

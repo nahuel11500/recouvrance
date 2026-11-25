@@ -695,8 +695,9 @@ pub async fn run_command(
     env: Vec<(String, String)>,
 ) -> Result<String> {
     run(async move {
+        let sh = crate::plugins::shell().map_err(anyhow::Error::msg)?;
         let kubeconfig = private_kubeconfig(&context, namespace.as_deref(), "plugin")?;
-        let out = tokio::process::Command::new("sh")
+        let out = tokio::process::Command::new(sh)
             .args(["-c", &command])
             .envs(env)
             .env("KUBECONFIG", kubeconfig.path())
@@ -782,7 +783,10 @@ pub fn local_shell(
         // A plugin runs its command, then waits so its output stays readable.
         let mut cmd = match &command {
             Some(c) => {
-                let mut b = CommandBuilder::new("sh");
+                let mut b = match crate::plugins::shell() {
+                    Ok(sh) => CommandBuilder::new(sh),
+                    Err(e) => return fail(e),
+                };
                 b.args([
                     "-c",
                     &format!("{c}\nstatus=$?\nprintf '\\n[exited with %s — press Enter to close]' \"$status\"\nread _"),
