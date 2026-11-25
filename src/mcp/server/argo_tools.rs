@@ -137,8 +137,7 @@ async fn fleet(server: Option<&str>) -> Option<Fleet> {
         .collect();
     let read = k8s::run(async move {
         let targets = argo::targets();
-        let servers = crate::settings::with(|s| s.argocd_servers.clone());
-        Ok(argo::from_api(reads, &targets, &[], &servers))
+        Ok(argo::from_api(reads, &targets, &[]))
     });
     read.await.ok()
 }
@@ -314,7 +313,7 @@ impl KubeMcp {
         let targets = argo::targets();
         let may_read = |endpoint: &api::Endpoint, app: &Summary| {
             let place = ArgoPlace {
-                contexts: argo::api_contexts(endpoint, app, &targets),
+                contexts: argo::api_contexts(app, &targets),
                 cluster: written_cluster(app),
                 namespace: app.dest_namespace.clone(),
                 name: app.name.clone(),
@@ -925,7 +924,7 @@ mod tests {
             .collect();
         let state = api::FeedState { apps, listed: true, live: true, ..Default::default() };
         let reads = vec![argo::ApiRead { endpoint: endpoint("https://argocd.example.com"), state }];
-        argo::from_api(reads, &targets, &[], &BTreeMap::new())
+        argo::from_api(reads, &targets, &[])
     }
 
     fn fleet() -> Fleet {

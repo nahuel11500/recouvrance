@@ -35,11 +35,13 @@ pub struct FavNamespace {
 /// An Argo CD Application, by its Argo CD instance, namespace and name: the same favorite
 /// whichever way the Application is read.
 ///
-/// `argocd` is the instance as the Argo CD page keys it (`k8s::argo::grouping::hub_instance`):
-/// the API server's key (`https://host`) when the hub context has its server set, or Argo CD
-/// is read through its API; else `context:<hub context>`. `context` is the hub context the star
-/// was put on, when it was read from one: `context:<context>` is another name of the same
-/// instance, and the page opens there. Two entries naming one instance are one favorite.
+/// `argocd` is the instance as the Argo CD page keys it (`api::Endpoint::instance`, the API
+/// server's `https://host`). One starred before Argo CD was read only through its API, or on
+/// an Application's own page, names its hub context instead (`context:<hub context>`): it is
+/// rewritten to the server's instance once exactly one server's feed lists an Application of
+/// that namespace and name ([`adopted`]), and never dropped meanwhile. `context` is the hub
+/// context the star was put on: `context:<context>` is another name of the same instance. Two
+/// entries naming one instance are one favorite.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
 pub struct FavApp {
     pub argocd: String,
@@ -54,11 +56,32 @@ pub fn hub_alias(context: &str) -> String {
     format!("context:{context}")
 }
 
-/// The Argo CD instance of hub context `context`, as the Argo CD page keys it: its Argo CD
-/// server's when one is set for it (Settings → Per cluster), else its alias.
-pub fn hub_instance(context: &str) -> String {
-    let servers = crate::settings::with(|s| s.argocd_servers.clone());
-    crate::k8s::argo::grouping::hub_instance(context, &servers)
+/// The `context:` entries of `apps` that exactly one Argo CD server lists (`found`: the
+/// instances whose feeds hold an Application of that namespace and name), rewritten to that
+/// server's instance. None is ever dropped: one no server lists, or several do, stays as it
+/// is. Entries that end up the same are kept once. Whether anything changed.
+pub fn adopted(apps: &mut Vec<FavApp>, found: impl Fn(&str, &str) -> Vec<String>) -> bool {
+    let mut changed = false;
+    for a in apps.iter_mut().filter(|a| a.unresolved()) {
+        let mut on = found(&a.namespace, &a.name);
+        on.sort();
+        on.dedup();
+        if let [one] = on.as_slice() {
+            a.argocd = one.clone();
+            a.context = None;
+            changed = true;
+        }
+    }
+    if changed {
+        let mut kept: Vec<FavApp> = Vec::with_capacity(apps.len());
+        for a in apps.drain(..) {
+            if !kept.contains(&a) {
+                kept.push(a);
+            }
+        }
+        *apps = kept;
+    }
+    changed
 }
 
 impl FavApp {
@@ -87,10 +110,10 @@ impl FavApp {
         self.is(&names, &other.namespace, &other.name)
     }
 
-    /// The hub context its page opens on: the one it was starred on, else the one its
-    /// instance names; none for an Argo CD known only by its API server.
-    pub fn hub(&self) -> Option<&str> {
-        self.context.as_deref().or_else(|| self.argocd.strip_prefix("context:"))
+    /// Named by the hub context it was starred on, not yet by an Argo CD server (see
+    /// [`adopted`]).
+    pub fn unresolved(&self) -> bool {
+        self.argocd.starts_with("context:")
     }
 }
 
@@ -118,7 +141,7 @@ impl Favorite {
     pub fn for_object(context: &str, kind: &crate::k8s::Kind, namespace: Option<String>, name: String) -> Self {
         if kind.is("argoproj.io", "Application") {
             Self::Application(FavApp {
-                argocd: hub_instance(context),
+                argocd: hub_alias(context),
                 namespace: namespace.unwrap_or_default(),
                 name,
                 context: Some(context.to_string()),
@@ -128,13 +151,13 @@ impl Favorite {
         }
     }
 
-    /// The kubeconfig context it is on (for an Application, Argo CD's hub); none for an
-    /// Application known only by its Argo CD API server.
+    /// The kubeconfig context it is on; none for an Application, which opens on the Argo CD
+    /// page.
     pub fn context(&self) -> Option<&str> {
         match self {
             Self::Context(c) => Some(c),
             Self::Namespace(n) => Some(&n.context),
-            Self::Application(a) => a.hub(),
+            Self::Application(_) => None,
             Self::Object(o) => Some(&o.context),
         }
     }
@@ -155,7 +178,7 @@ impl Favorite {
             Self::Context(_) => "context".into(),
             Self::Namespace(n) => format!("namespace · {}", n.context),
             Self::Application(a) => {
-                let on = a.hub().unwrap_or(&a.argocd);
+                let on = a.argocd.strip_prefix("context:").unwrap_or(&a.argocd);
                 format!("Argo CD Application · {} · {on}", a.namespace)
             }
             Self::Object(o) => {
@@ -477,6 +500,15 @@ impl Favorites {
         }
     }
 
+    /// Rewrite the Applications starred by their hub context to the one Argo CD server that
+    /// lists them (see [`adopted`]), saved when anything changed.
+    pub fn adopt_apps(&mut self, found: impl Fn(&str, &str) -> Vec<String>, cx: &mut Context<Self>) {
+        if adopted(&mut self.stored.applications, found) {
+            self.save();
+            cx.notify();
+        }
+    }
+
     /// Star or unstar `f`, saved at once.
     pub fn toggle(&mut self, f: Favorite, cx: &mut Context<Self>) {
         let on = !self.has(&f);
@@ -636,7 +668,7 @@ mod tests {
         assert_eq!(s.views.len(), 1);
         let apps: Vec<(&str, &str)> = s.applications.iter().map(|a| (a.argocd.as_str(), a.name.as_str())).collect();
         assert_eq!(apps, [("context:hub", "web"), ("context:hub", "shop")]);
-        assert_eq!(s.applications[1].hub(), Some("hub"));
+        assert!(s.applications[1].unresolved());
         assert!(s.contexts.is_empty() && s.namespaces.is_empty() && s.extra.is_empty());
     }
 
@@ -760,10 +792,33 @@ mod tests {
         assert!(a.is(&["context:hub"], "argocd", "shop"));
         assert!(!a.is(&["context:other"], "argocd", "shop"));
         assert!(!a.is(&[server], "other", "shop"));
-        // Known only by its API server: no hub to open it on.
-        assert_eq!(app(server, None).hub(), None);
-        assert_eq!(app("context:hub", None).hub(), Some("hub"));
-        assert_eq!(a.hub(), Some("hub"));
+        // Named by a hub context until a server lists it.
+        assert!(!a.unresolved());
+        assert!(app("context:hub", None).unresolved());
+    }
+
+    /// A favorite starred by its hub context is rewritten to the one Argo CD server that
+    /// lists an Application of that namespace and name; with none or several, it stays as
+    /// it is, never dropped.
+    #[test]
+    fn a_hub_favorite_is_rewritten_to_the_one_server_that_lists_it() {
+        let server = "https://argocd.example.com";
+        let found = |ns: &str, name: &str| match (ns, name) {
+            ("argocd", "shop") => vec![server.to_string()],
+            ("argocd", "twice") => vec![server.to_string(), "https://other.example.com".into()],
+            _ => Vec::new(),
+        };
+        let mut apps = vec![
+            app("context:hub", Some("hub")),
+            FavApp { name: "twice".into(), ..app("context:hub", None) },
+            FavApp { name: "gone".into(), ..app("context:hub", None) },
+            app(server, None),
+        ];
+        assert!(adopted(&mut apps, found));
+        let shown: Vec<(&str, &str)> = apps.iter().map(|a| (a.argocd.as_str(), a.name.as_str())).collect();
+        assert_eq!(shown, [(server, "shop"), ("context:hub", "twice"), ("context:hub", "gone")]);
+        assert_eq!(apps[0].context, None);
+        assert!(!adopted(&mut apps, found));
     }
 
     /// Starred through one name, unstarred through another: every entry naming it goes.

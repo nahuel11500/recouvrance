@@ -76,12 +76,6 @@ pub struct SettingsView {
     cluster_inputs: Vec<(String, Entity<InputState>, Entity<InputState>)>,
     /// Per context: the user and groups writes may run as (`kubectl --as`).
     run_as_inputs: Vec<(String, Entity<InputState>, Entity<InputState>)>,
-    /// Per context: its Argo CD API server, and a token to log in with (never shown back).
-    argo_inputs: Vec<(String, Entity<InputState>, Entity<InputState>)>,
-    /// The contexts with an Argo CD token saved, read when the rows are made.
-    argo_tokens: std::collections::BTreeSet<String>,
-    /// Why the token typed for a context could not be saved.
-    argo_token_error: Option<(String, SharedString)>,
     /// Settings → Argo CD: the API servers, as last read (the argocd CLI's and those set here).
     argo_api: crate::k8s::argo::api::Endpoints,
     /// Each server's connection test, by address: running (None), or what it found.
@@ -120,8 +114,6 @@ fn argo_api_seen() -> (u64, u64) {
 }
 
 /// The Argo CD token field, empty: one is saved, or the argocd CLI's login is used.
-const TOKEN_SAVED: &str = "token saved (type to replace)";
-const TOKEN_NONE: &str = "token: none, the argocd CLI's login";
 
 /// What Check for updates found.
 enum UpdateCheck {
@@ -254,9 +246,6 @@ impl SettingsView {
             prometheus: Vec::new(),
             cluster_inputs: Vec::new(),
             run_as_inputs: Vec::new(),
-            argo_inputs: Vec::new(),
-            argo_tokens: Default::default(),
-            argo_token_error: None,
             argo_api: Default::default(),
             argo_api_tests: Default::default(),
             _argo_api_test_tasks: Default::default(),
@@ -447,8 +436,6 @@ impl SettingsView {
         self.cluster_inputs.retain(|(ctx, ..)| names.contains(ctx));
         self.prometheus.retain(|(ctx, _)| names.contains(ctx));
         self.run_as_inputs.retain(|(ctx, ..)| names.contains(ctx));
-        self.argo_inputs.retain(|(ctx, ..)| names.contains(ctx));
-        self.argo_tokens = crate::k8s::argo::server::token_contexts();
         for ctx in &names {
             if !self.cluster_inputs.iter().any(|(c, ..)| c == ctx) {
                 self.add_cluster(ctx.clone(), window, cx);
@@ -509,68 +496,7 @@ impl SettingsView {
                 v.split(',').map(str::trim).filter(|g| !g.is_empty()).map(String::from).collect();
             settings::set_run_as(&c, Some(typed.borrow().clone()));
         }));
-        self.run_as_inputs.push((ctx.clone(), user, groups));
-        self.add_argo_server(ctx, window, cx);
-    }
-
-    /// The Argo CD server of `ctx` (saved as typed), and its token: saved on Enter or when
-    /// the field is left, then cleared, so it is never shown again.
-    fn add_argo_server(&mut self, ctx: String, window: &mut Window, cx: &mut Context<Self>) {
-        let saved = settings::with(|s| s.argocd_servers.get(&ctx).cloned()).unwrap_or_default();
-        let server = Self::field(saved, "Argo CD server: none, its diff is off", window, cx);
-        let c = ctx.clone();
-        self._subs.push(Self::save_typed(&server, input_text, cx, move |v| {
-            let v = v.trim().to_string();
-            settings::update(|s| {
-                if v.is_empty() {
-                    s.argocd_servers.remove(&c);
-                } else {
-                    s.argocd_servers.insert(c.clone(), v);
-                }
-            });
-        }));
-        let placeholder = if self.argo_tokens.contains(&ctx) { TOKEN_SAVED } else { TOKEN_NONE };
-        let token = cx.new(|cx| InputState::new(window, cx).masked(true).placeholder(placeholder));
-        let c = ctx.clone();
-        self._subs.push(cx.subscribe_in(&token, window, move |this, state, ev: &InputEvent, window, cx| {
-            if !matches!(ev, InputEvent::PressEnter { .. } | InputEvent::Blur) {
-                return;
-            }
-            let typed = state.read(cx).value().trim().to_string();
-            if typed.is_empty() {
-                return;
-            }
-            match crate::k8s::argo::server::save_token(&c, &typed) {
-                Ok(()) => {
-                    this.argo_tokens.insert(c.clone());
-                    this.argo_token_error = None;
-                    state.update(cx, |s, cx| {
-                        s.set_value("", window, cx);
-                        s.set_placeholder(TOKEN_SAVED, window, cx);
-                    });
-                }
-                Err(e) => this.argo_token_error = Some((c.clone(), format!("Could not save the token: {e}").into())),
-            }
-            cx.notify();
-        }));
-        self.argo_inputs.push((ctx, server, token));
-    }
-
-    /// Forget the Argo CD token saved for `ctx`: the argocd CLI's login is used again.
-    fn forget_argo_token(&mut self, ctx: &str, window: &mut Window, cx: &mut Context<Self>) {
-        match crate::k8s::argo::server::save_token(ctx, "") {
-            Ok(()) => {
-                self.argo_tokens.remove(ctx);
-                self.argo_token_error = None;
-                if let Some((_, _, token)) = self.argo_inputs.iter().find(|(c, ..)| c == ctx) {
-                    token.update(cx, |s, cx| s.set_placeholder(TOKEN_NONE, window, cx));
-                }
-            }
-            Err(e) => {
-                self.argo_token_error = Some((ctx.to_string(), format!("Could not forget the token: {e}").into()));
-            }
-        }
-        cx.notify();
+        self.run_as_inputs.push((ctx, user, groups));
     }
 
     /// Show the saved values in the fields not being edited: each window has its own fields,
@@ -594,9 +520,6 @@ impl SettingsView {
             let cs = s.clusters.get(ctx).cloned().unwrap_or_default();
             fields.push((image.clone(), cs.node_shell_image.unwrap_or_default()));
             fields.push((namespaces.clone(), cs.namespaces.join(", ")));
-        }
-        for (ctx, server, _) in &self.argo_inputs {
-            fields.push((server.clone(), s.argocd_servers.get(ctx).cloned().unwrap_or_default()));
         }
         for (ctx, user, groups) in &self.run_as_inputs {
             let saved = s.clusters.get(ctx).and_then(|c| c.run_as.clone()).unwrap_or_default();
@@ -977,9 +900,7 @@ impl SettingsView {
                         })
                 }));
                 let c2 = ctx.clone();
-                let c3 = ctx.clone();
                 let c4 = ctx.clone();
-                let argo_hub = s.argocd_contexts.contains(&ctx);
                 let run_as = self.run_as_inputs.iter().find(|(c, ..)| *c == ctx).map(|(_, u, g)| (u.clone(), g.clone()));
                 v_flex()
                     .gap_1()
@@ -991,22 +912,6 @@ impl SettingsView {
                             .gap_4()
                             .child(div().flex_1().min_w_0().text_sm().child(ctx))
                             .child(swatches)
-                            .child(
-                                Checkbox::new(("argo-hub", i))
-                                    .label("Argo CD")
-                                    .checked(argo_hub)
-                                    .tooltip("Read Argo CD's Applications from this context")
-                                    .on_click(move |v: &bool, _, cx| {
-                                        let v = *v;
-                                        settings::update(|s| {
-                                            s.argocd_contexts.retain(|c| *c != c3);
-                                            if v {
-                                                s.argocd_contexts.push(c3.clone());
-                                            }
-                                        });
-                                        cx.refresh_windows();
-                                    }),
-                            )
                             .child(
                                 Checkbox::new(("protect", i)).label("Protected").checked(protected).on_click(move |v: &bool, _, cx| {
                                     settings::set_protected(&c2, *v);
@@ -1044,10 +949,6 @@ impl SettingsView {
             .enumerate()
             .map(|(i, (ctx, image, namespaces))| {
                 let prom = self.prometheus.iter().find(|(c, _)| c == ctx).map(|(_, i)| i.clone());
-                let argo = self.argo_inputs.iter().find(|(c, ..)| c == ctx).map(|(_, s, t)| (s.clone(), t.clone()));
-                let has_token = self.argo_tokens.contains(ctx);
-                let token_error = self.argo_token_error.as_ref().filter(|(c, _)| c == ctx).map(|(_, e)| e.clone());
-                let forget = ctx.clone();
                 let off = settings::cluster(ctx).metrics_disabled;
                 let c = ctx.clone();
                 let label =
@@ -1093,37 +994,16 @@ impl SettingsView {
                             .child(label("Accessible namespaces"))
                             .child(div().flex_1().child(Input::new(namespaces).small())),
                     )
-                    .children(argo.map(|(server, token)| {
-                        h_flex()
-                            .gap_2()
-                            .child(label("Argo CD server, token"))
-                            .child(div().flex_1().child(Input::new(&server).small()))
-                            .child(div().flex_1().child(Input::new(&token).small()))
-                            .when(has_token, |d| {
-                                d.child(
-                                    Button::new(("argo-token-forget", i)).xsmall().ghost().label("Forget").on_click(
-                                        cx.listener(move |this, _, window, cx| {
-                                            this.forget_argo_token(&forget, window, cx);
-                                        }),
-                                    ),
-                                )
-                            })
-                    }))
-                    .children(token_error.map(|e| div().text_xs().text_color(theme.danger).child(e)))
                     .into_any_element()
             })
             .collect();
         v_flex()
-            .child(div().pb_2().text_sm().text_color(muted).child(format!(
+            .child(div().pb_2().text_sm().text_color(muted).child(
                 "Metrics endpoint: found automatically; or namespace/service:port, with a path for VictoriaMetrics \
                  (vmselect: monitoring/vmselect:8481/select/0/prometheus; single: monitoring/victoria-metrics:8428), or a full http(s) URL. \
                  Accessible namespaces are used when you may not list namespaces: they fill the picker, and the list shows one of them at a time. \
-                 Argo CD server: on a context Argo CD runs in, its API server (https://argocd.example.com), to show Argo CD's own \
-                 diff on an Application's page. It logs in with the argocd CLI's login to that server, or with a read-only token \
-                 (`applications, get`) kept in {}, readable only by you. Nothing is sent \
-                 until you ask for the diff.",
-                crate::paths::shown_config("argocd-tokens.json")
-            )))
+                 Argo CD is read through its API only: Settings → Argo CD.",
+            ))
             .children(rows)
             .into_any_element()
     }

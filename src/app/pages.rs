@@ -270,7 +270,12 @@ impl AppView {
     }
 
     /// Open the Argo CD page on an Application's dashboard (one read by Argo CD's API).
-    fn show_argo_app(&mut self, ev: &crate::ui::argo::OpenArgoApp, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn show_argo_app(
+        &mut self,
+        ev: &crate::ui::argo::OpenArgoApp,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.open_argo(window, cx);
         if let Route::Argo(argo) = self.route().clone() {
             argo.update(cx, |argo, cx| argo.show_app(ev, cx));

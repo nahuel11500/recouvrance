@@ -655,7 +655,7 @@ mod tests {
             let a = Arc::new(api::ApiApp { summary: Summary::of(&v), value: v });
             state.apps.insert((a.summary.namespace.clone(), a.summary.name.clone()), a);
         }
-        let fleet = argo::from_api(vec![ApiRead { endpoint, state }], &[], &[], &Default::default());
+        let fleet = argo::from_api(vec![ApiRead { endpoint, state }], &[], &[]);
         let mut plan = argo::windows::Planner::new(now);
         super::super::Rows::new(fleet, Arc::new(EnvTypes::default()), &mut plan)
     }

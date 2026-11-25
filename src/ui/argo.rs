@@ -508,7 +508,7 @@ impl ArgoView {
             self.watches.iter().map(|w| (w.endpoint.clone(), w.state.clone())).collect();
         let connected: Vec<String> = self.clusters.iter().map(|(n, _)| n.clone()).collect();
         let config_errors = self.config_errors.clone();
-        let (types, servers) = crate::settings::with(|s| (s.argocd_env_types.clone(), s.argocd_servers.clone()));
+        let types = crate::settings::with(|s| s.argocd_env_types.clone());
         let plan = self.plan.clone();
         let exec = cx.background_executor().clone();
         let work = async move {
@@ -520,7 +520,7 @@ impl ArgoView {
                         state: state.lock().unwrap_or_else(PoisonError::into_inner).clone(),
                     })
                     .collect();
-                let mut fleet = argo::from_api(reads, &argo::targets(), &connected, &servers);
+                let mut fleet = argo::from_api(reads, &argo::targets(), &connected);
                 fleet.errors.extend(config_errors);
                 // When each can sync next is worked out anew each minute; in between, the
                 // answers kept are reused (the same windows give the same answer).
@@ -534,6 +534,19 @@ impl ArgoView {
             .await
         };
         self.build.spawn(cx, work, |this, rows, cx| {
+            // A favorite starred by its hub context takes the one server that lists it.
+            let listed: HashSet<Key> = rows.fleet.apps.iter().map(key).collect();
+            crate::favorites::shared(cx).update(cx, |f, cx| {
+                f.adopt_apps(
+                    |ns, name| {
+                        let mut on: Vec<String> =
+                            listed.iter().filter(|(_, n, a)| n == ns && a == name).map(|(i, _, _)| i.clone()).collect();
+                        on.sort();
+                        on
+                    },
+                    cx,
+                );
+            });
             this.rows = Some(rows);
             this.refilter(cx);
             this.dashboard_changed(cx);
@@ -561,7 +574,7 @@ impl ArgoView {
             let a = Arc::new(api::ApiApp { summary: Summary::of(&v), value: v });
             state.apps.insert((a.summary.namespace.clone(), a.summary.name.clone()), a);
         }
-        let fleet = argo::from_api(vec![ApiRead { endpoint, state }], &[], &[], &Default::default());
+        let fleet = argo::from_api(vec![ApiRead { endpoint, state }], &[], &[]);
         let types = crate::settings::with(|s| s.argocd_env_types.clone());
         self.example = true;
         self.list_shown = list;

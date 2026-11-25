@@ -331,8 +331,7 @@
   of this cluster. One read by the API opens on the Argo CD page's dashboard, and its actions
   go through Argo CD's API (a sync of the whole Application). Only when no server has it are
   they read from the hub, found among the connected clusters, else among other kubeconfig contexts that
-  need no separate login. The hub can be ticked in Settings → Contexts (*Argo CD*; see
-  [configuration](configuration.md#argo-cd-hub-argocd_contexts)).
+  need no separate login.
 - **Argo CD page** (sidebar → *Argo CD*): the environments of every Argo CD API server the
   argocd CLI is logged in to or set in Settings → Argo CD, read only through Argo CD's API (no
   kubeconfig for Argo CD's cluster needed, and none is asked: see

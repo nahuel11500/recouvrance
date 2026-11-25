@@ -1343,8 +1343,6 @@ mod tests {
         assert!(s.argocd_api_off.is_empty());
         connect_in(&mut s, "https://other.example.com");
         assert_eq!(s.argocd_api_servers.len(), 2);
-        // The hubs' setting is left alone.
-        assert!(s.argocd_servers.is_empty());
     }
 
     #[test]

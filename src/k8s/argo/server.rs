@@ -1,15 +1,9 @@
-//! Argo CD's own diff, read from its API server: what the next sync would change, as Argo CD
-//! renders it from git, against the live objects. The Kubernetes API can't give it: git's
-//! manifests are only behind Argo CD's own API and login.
-//!
-//! Off until a hub context's Argo CD server is set in Settings. It logs in with the token the
-//! argocd CLI saved for that server (its config file), or with a read-only token saved in
-//! Settings (0600, like the other secrets). It sends one GET, to that server only, when the
-//! diff is asked for. The token is never shown: errors are scrubbed of it. A Secret's values
-//! are masked here, whatever Argo CD sent (its own masking leaked predicted Secret states
-//! before 3.2.12, 3.3.10 and 3.4.2).
+//! An Argo CD API server's address, the argocd CLI's config, and Argo CD's own diff of an
+//! Application's managed resources (what the next sync would change, as Argo CD renders it
+//! from git, against the live objects), read through `api`. The token is never shown: errors
+//! are scrubbed of it. A Secret's values are masked here, whatever Argo CD sent (its own
+//! masking leaked predicted Secret states before 3.2.12, 3.3.10 and 3.4.2).
 
-use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use base64::Engine as _;
@@ -19,8 +13,6 @@ use serde_json::Value;
 use super::diagnosis::Res;
 use crate::history::DiffLine;
 
-/// Where the tokens set in Settings are kept, by context (mode 0600).
-const TOKENS_FILE: &str = "argocd-tokens.json";
 /// The largest answer read: an Application with thousands of resources sends three states each.
 pub(super) const MAX_BYTES: usize = 64 * 1024 * 1024;
 pub(super) const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
@@ -99,30 +91,12 @@ pub(super) fn loopback(host: &str) -> bool {
     host == "localhost" || bare.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
 }
 
-/// The hub contexts whose Argo CD server (`servers`: `argocd_servers`) is the one at `base`.
-pub fn contexts_of<'a>(servers: &'a BTreeMap<String, String>, base: &'a str) -> impl Iterator<Item = &'a str> {
-    servers.iter().filter(move |(_, text)| Server::parse(text).is_ok_and(|s| s.base == base)).map(|(c, _)| c.as_str())
-}
-
-/// The context whose read-only setting refuses a write sent to the Argo CD server at `base`
-/// (named `name`), if one does: a hub context tied to that server in `servers`, else the
-/// server's name, as its protection is keyed. The hub's setting counts, not the
-/// Application's destination cluster's.
-pub fn read_only_context(
-    servers: &BTreeMap<String, String>,
-    base: &str,
-    name: &str,
-    is_read_only: impl Fn(&str) -> bool,
-) -> Option<String> {
-    contexts_of(servers, base).chain(std::iter::once(name)).find(|c| is_read_only(c)).map(str::to_string)
-}
-
 // MARK: Login
 
 /// What the request logs in with.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Login {
-    /// The token set in Settings for the context.
+    /// The token set in Settings → Argo CD for the server.
     Settings,
     /// The argocd CLI's login to that server.
     Cli,
@@ -135,42 +109,6 @@ impl Login {
             Self::Cli => "the argocd CLI's login",
         }
     }
-}
-
-fn tokens_path() -> PathBuf {
-    crate::paths::config_dir().join(TOKENS_FILE)
-}
-
-/// The tokens set in Settings, by context. An unreadable file holds none: the CLI's login is
-/// tried instead, and nothing else depends on it.
-fn read_tokens() -> BTreeMap<String, String> {
-    std::fs::read(tokens_path()).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
-}
-
-/// The contexts with a token set in Settings (one read of the file for them all).
-pub fn token_contexts() -> std::collections::BTreeSet<String> {
-    read_tokens().into_iter().filter(|(_, t)| !t.trim().is_empty()).map(|(c, _)| c).collect()
-}
-
-/// Keep `token` for `context` (empty: forget it), in a file only the user can read.
-pub fn save_token(context: &str, token: &str) -> std::io::Result<()> {
-    let mut tokens = read_tokens();
-    let token = token.trim();
-    if token.is_empty() {
-        if tokens.remove(context).is_none() {
-            return Ok(());
-        }
-    } else {
-        tokens.insert(context.to_string(), token.to_string());
-    }
-    if tokens.is_empty() {
-        return match std::fs::remove_file(tokens_path()) {
-            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
-            _ => Ok(()),
-        };
-    }
-    let text = serde_json::to_vec_pretty(&tokens).map_err(std::io::Error::other)?;
-    crate::private_files::write_atomic(&tokens_path(), &text)
 }
 
 /// The argocd CLI's config file: `$ARGOCD_CONFIG_DIR/config`, else `~/.argocd/config` when
@@ -452,35 +390,11 @@ pub(super) fn diffs(body: &Value, server: String, login: Login) -> GitDiff {
 
 #[cfg(test)]
 mod tests {
-    use super::{Change, Login, Server, diffs, expired, read_only_context, scrub};
+    use super::{Change, Login, Server, diffs, expired, scrub};
     use crate::history::DiffLine;
     use base64::Engine as _;
     use proptest::prelude::*;
     use serde_json::{Value, json};
-
-    /// A write sent by Argo CD's API is refused when a hub context tied to that server is
-    /// read-only, though the server's name isn't a context: the API is the hub's Argo CD.
-    #[test]
-    fn a_read_only_hub_refuses_its_servers_writes() {
-        let servers: std::collections::BTreeMap<String, String> = [
-            ("hub".to_string(), "https://ArgoCD.example.com/".to_string()),
-            ("other-hub".to_string(), "other.example.com".to_string()),
-            ("broken".to_string(), "ftp://x".to_string()),
-        ]
-        .into();
-        let base = Server::parse("argocd.example.com").unwrap().base;
-        let check =
-            |base: &str, name: &str, set: &[&str]| read_only_context(&servers, base, name, |c| set.contains(&c));
-        let name = "argocd.example.com";
-        assert_eq!(check(&base, name, &["hub"]), Some("hub".to_string()));
-        // Another hub's setting, or none: writable.
-        assert_eq!(check(&base, name, &["other-hub"]), None);
-        assert_eq!(check(&base, name, &[]), None);
-        // A server tied to no hub: its own name decides.
-        assert_eq!(check(&base, name, &[name]), Some(name.to_string()));
-        let unmapped = Server::parse("third.example.com").unwrap().base;
-        assert_eq!(check(&unmapped, "third.example.com", &["hub"]), None);
-    }
 
     #[test]
     fn a_server_reads_as_its_https_base() {
