@@ -270,6 +270,12 @@ fn short(rev: &str) -> String {
     rev.split(',').map(super::short_revision).collect::<Vec<_>>().join(", ")
 }
 
+/// `s` with its first letter upper case.
+fn capitalize(s: &str) -> String {
+    let mut c = s.chars();
+    c.next().map_or_default(|f| f.to_uppercase().chain(c).collect())
+}
+
 /// Keep the first `SHOWN_OBJECTS` objects, and count the others.
 fn clip(mut objects: Vec<(Res, String)>) -> (Vec<(Res, String)>, usize) {
     let more = objects.len().saturating_sub(SHOWN_OBJECTS);
@@ -309,7 +315,8 @@ impl Diagnosis {
             d.looping = looping(app, &differing);
             d.findings.push(loop_finding(&lp, &d.looping));
         }
-        if let Some(f) = out_of_sync_finding(sync_effects(app, live), automated, d.moved.as_ref()) {
+        let partial = super::dashboard::partial(app);
+        if let Some(f) = out_of_sync_finding(sync_effects(app, live), automated, d.moved.as_ref(), partial.as_ref()) {
             d.findings.push(f);
         }
         let mut seen = BTreeSet::new();
@@ -772,6 +779,7 @@ fn out_of_sync_finding(
     effects: Vec<(Res, SyncEffect)>,
     automated: bool,
     moved: Option<&(String, String)>,
+    partial: Option<&super::dashboard::Partial>,
 ) -> Option<Finding> {
     if effects.is_empty() {
         return None;
@@ -793,6 +801,19 @@ fn out_of_sync_finding(
     let message = moved.map(|(deployed, target)| {
         format!("Git moved since the last sync: {deployed} deployed, {target} now. What changed in git is part of the difference.")
     });
+    let message = match (partial, message) {
+        // A selective sync since: the newest deployment isn't all that runs.
+        (Some(p), m) => Some(format!(
+            "{} since the newest deployment{}; the rest is as that deployment left it.{}",
+            capitalize(&p.text()),
+            moved.map_or_default(|(d, _)| format!(" ({d})")),
+            moved
+                .filter(|(_, target)| *target != p.revision)
+                .map_or_default(|(_, target)| format!(" Git is at {target} now.")),
+        ))
+        .or(m),
+        (None, m) => m,
+    };
     let hint = if automated {
         "Auto-sync is on: Argo CD should sync them. If they stay out of sync, a sync failed or something rewrites \
          them (see above)."

@@ -583,6 +583,103 @@ pub fn problems_from_status(app: &Value) -> Problems {
     Problems { rows, ..Default::default() }
 }
 
+// MARK: Selective sync
+
+/// A sync of some of the Application's resources only (a selective sync), newer than its
+/// newest deployment. Argo CD doesn't add one to `status.history`, so the history's newest
+/// deployment is not all that runs: these resources run at `revision`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Partial {
+    /// The revision(s) it synced to, short.
+    pub revision: String,
+    /// How many resources it synced, of how many the Application has.
+    pub resources: usize,
+    pub total: usize,
+    /// Some of them (`Kind/name`), for a message.
+    pub names: Vec<String>,
+    pub phase: String,
+    /// When it ended, else when it started.
+    pub at: Option<Timestamp>,
+    pub by: Option<String>,
+    /// The deployment it came after (the history's newest), if any.
+    pub after: Option<i64>,
+}
+
+impl Partial {
+    /// `9 of 31 resources at ebf7503 (selective sync, 5d ago by jdoe)`.
+    pub fn text(&self) -> String {
+        let mut how = vec!["selective sync".to_string()];
+        if let Some(t) = self.at {
+            how.push(format!("{} ago", crate::k8s::age(t)));
+        }
+        let by = self.by.as_ref().map_or_default(|b| format!(" by {b}"));
+        format!(
+            "{} of {} at {} ({}{by})",
+            self.resources,
+            crate::plural::count(self.total.max(self.resources), "resource"),
+            self.revision,
+            how.join(", ")
+        )
+    }
+}
+
+/// Names shown of a selective sync's resources, at most.
+const PARTIAL_NAMES: usize = 5;
+
+/// The selective sync of `app` newer than its newest deployment, if its last operation is one
+/// that ended (see `Partial`).
+pub fn partial(app: &Value) -> Option<Partial> {
+    let op = app.pointer("/status/operationState")?;
+    let picked = arr(op, "/operation/sync/resources");
+    if picked.is_empty() || op.pointer("/operation/sync/dryRun").and_then(Value::as_bool) == Some(true) {
+        return None;
+    }
+    let phase = s(op, "/phase")?.to_string();
+    if matches!(phase.as_str(), "Running" | "Terminating") {
+        return None;
+    }
+    let started = time(op, "/startedAt")?;
+    let newest = arr(app, "/status/history").iter().max_by_key(|h| h["id"].as_i64().unwrap_or(0));
+    if newest.and_then(|h| time(h, "/deployedAt")).is_some_and(|d| d >= started) {
+        return None;
+    }
+    let revision = op
+        .pointer("/syncResult")
+        .and_then(super::revisions)
+        .or_else(|| op.pointer("/operation/sync").and_then(super::revisions))?;
+    let total = arr(app, "/status/resources").iter().filter(|r| r["hook"] != true).count();
+    let names = picked
+        .iter()
+        .take(PARTIAL_NAMES)
+        .filter_map(|r| Some(format!("{}/{}", s(r, "/kind")?, s(r, "/name")?)))
+        .collect();
+    Some(Partial {
+        revision,
+        resources: picked.len(),
+        total,
+        names,
+        phase,
+        at: time(op, "/finishedAt").or(Some(started)),
+        by: op.pointer("/operation/initiatedBy").and_then(who),
+        after: newest.and_then(|h| h["id"].as_i64()),
+    })
+}
+
+/// What rolling back `app` also undoes: its selective sync after the newest deployment, said.
+pub fn rollback_undoes(app: &Value) -> Option<String> {
+    let p = partial(app)?;
+    let mut names = p.names.join(", ");
+    if p.resources > p.names.len() {
+        names.push_str(&format!(" and {} more", p.resources - p.names.len()));
+    }
+    Some(format!(
+        "Its last sync was selective: {}, after deployment {}. Rolling back also takes those resources ({names}) \
+         back.",
+        p.text(),
+        p.after.map_or_else(|| "none".to_string(), |id| format!("#{id}"))
+    ))
+}
+
 // MARK: Last sync
 
 /// The Last sync card.
@@ -604,6 +701,8 @@ pub struct LastSync {
     /// Steps done so far (a hook still running isn't).
     pub done: usize,
     pub running: bool,
+    /// A selective sync: the resources picked, of the Application's.
+    pub selective: Option<(usize, usize)>,
 }
 
 impl LastSync {
@@ -646,6 +745,10 @@ pub fn last_sync(app: &Value) -> Option<LastSync> {
         steps,
         summary,
         done,
+        selective: Some(arr(op, "/operation/sync/resources").len()).filter(|&n| n > 0).map(|n| {
+            let total = arr(app, "/status/resources").iter().filter(|r| r["hook"] != true).count();
+            (n, total.max(n))
+        }),
     })
 }
 
@@ -831,6 +934,8 @@ pub struct Cards {
     pub git_diff: Option<Result<GitDiff, String>>,
     pub history: History,
     pub note: Option<String>,
+    /// A selective sync newer than the newest deployment.
+    pub partial: Option<Partial>,
 }
 
 impl Cards {
@@ -865,6 +970,7 @@ impl Cards {
             git_diff: read.diff,
             history: history(app, HISTORY_DOTS),
             note: read.note,
+            partial: partial(app),
         }
     }
 }

@@ -190,6 +190,12 @@ impl AppView {
                     page.update(cx, crate::ui::argo::ArgoView::demo_dashboard);
                 }
             }
+            // The same after a selective sync of the workload, newer than its newest deployment.
+            "argo-example-selective" => {
+                if let Route::Argo(page) = self.route().clone() {
+                    page.update(cx, crate::ui::argo::ArgoView::demo_dashboard_selective);
+                }
+            }
             // The same after its login expired: the last read kept, a list's copy for the next tab.
             "argo-example-expired" => {
                 if let Route::Argo(page) = self.route().clone() {
