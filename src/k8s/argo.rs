@@ -560,7 +560,7 @@ impl Look {
                 .as_deref()
                 .filter(|_| running)
                 .and_then(|t| t.parse::<jiff::Timestamp>().ok())
-                .map(|t| t.as_second()),
+                .map(jiff::Timestamp::as_second),
             auto_out_of_sync: app.automated && app.sync == "OutOfSync",
         }
     }
