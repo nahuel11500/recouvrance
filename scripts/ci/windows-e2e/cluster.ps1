@@ -8,15 +8,17 @@ Invoke-WebRequest "https://github.com/kubernetes-sigs/kwok/releases/download/$en
 $sum = (Get-FileHash $kwokctl -Algorithm SHA256).Hash
 if ($sum -ne $env:KWOKCTL_SHA256) { throw "kwokctl: sha256 $sum" }
 "KWOKCTL=$kwokctl" >> $env:GITHUB_ENV
-& $kwokctl create cluster --name recouvrance --runtime binary --kube-apiserver-port 32766 `
-  --kubeconfig "$env:E2E\kwok.kubeconfig" --wait 5m
+& $kwokctl create cluster --name recouvrance --runtime binary --kubeconfig "$env:E2E\kwok.kubeconfig" --wait 5m
 if ($LASTEXITCODE) { exit 1 }
 & $kwokctl --name recouvrance kubectl apply -f "$PSScriptRoot\objects.yaml"
 & $kwokctl --name recouvrance kubectl rollout status deployment/web --timeout=180s
 if ($LASTEXITCODE) { exit 1 }
 & $kwokctl --name recouvrance kubectl get nodes,pods -A -o wide
 
-$pki = "$env:USERPROFILE\.kwok\clusters\recouvrance\pki"
+$cluster = "$env:USERPROFILE\.kwok\clusters\recouvrance"
+$pki = "$cluster\pki"
+$server = (Select-String -Path "$cluster\kubeconfig.yaml" -Pattern 'server: (\S+)').Matches[0].Groups[1].Value
+"API server: $server"
 @{
   apiVersion = 'client.authentication.k8s.io/v1'; kind = 'ExecCredential'
   status = @{ clientCertificateData = (Get-Content -Raw "$pki\admin.crt"); clientKeyData = (Get-Content -Raw "$pki\admin.key") }
@@ -28,7 +30,7 @@ $login = @{
 }
 [ordered]@{
   apiVersion = 'v1'; kind = 'Config'; 'current-context' = 'kwok-exec'
-  clusters = @(@{ name = 'kwok'; cluster = @{ server = 'https://127.0.0.1:32766'; 'certificate-authority' = "$pki\ca.crt" } })
+  clusters = @(@{ name = 'kwok'; cluster = @{ server = $server; 'certificate-authority' = "$pki\ca.crt" } })
   users = @(
     @{ name = 'admin'; user = @{ 'client-certificate' = "$pki\admin.crt"; 'client-key' = "$pki\admin.key" } },
     @{ name = 'login'; user = @{ exec = $login } }
@@ -40,6 +42,5 @@ $login = @{
 } | ConvertTo-Json -Depth 10 | Set-Content $env:KUBECONFIG
 
 # The login command works on its own.
-$kubectl = Get-ChildItem -Recurse "$env:USERPROFILE\.kwok" -Filter kubectl.exe | Select-Object -First 1
-& $kubectl.FullName --kubeconfig $env:KUBECONFIG --context kwok-exec get pods
+kubectl --kubeconfig $env:KUBECONFIG --context kwok-exec get pods
 if ($LASTEXITCODE) { exit 1 }

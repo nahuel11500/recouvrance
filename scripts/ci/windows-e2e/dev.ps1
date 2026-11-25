@@ -31,7 +31,7 @@ function Snapshot($name) {
 # Each kind's list, its first object and every tab, then every page.
 $env:RECOUVRANCE_CONTEXT = 'kwok-recouvrance'
 $env:RECOUVRANCE_QA = '1'
-$env:RECOUVRANCE_QA_KINDS = 'pods,deployments,replicasets,configmaps,nodes,namespaces,events'
+$env:RECOUVRANCE_QA_KINDS = 'pods,deployments.apps,replicasets.apps,configmaps,nodes,namespaces,events'
 $qa = Snapshot qa
 if ($qa -notmatch 'QA done: 0 problem') { $failed += 'QA found problems' }
 if ($qa -notmatch 'QA pods: rows=[1-9]') { $failed += 'QA listed no pods' }
