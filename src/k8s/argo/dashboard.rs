@@ -201,12 +201,14 @@ pub fn source_images(source: &Value) -> Vec<String> {
     out
 }
 
-/// The sources of a deployment of the history (`source`, or each of `sources`).
+/// The sources of a deployment of the history, or of a spec: each of `sources`, else `source`.
+/// `sources` wins: with several, Argo CD's API still sends `source` as `{"repoURL": ""}`.
 fn sources_of(entry: &Value) -> Vec<&Value> {
-    match entry.get("source").filter(|v| v.is_object()) {
-        Some(one) => vec![one],
-        None => arr(entry, "/sources").iter().collect(),
+    let many = arr(entry, "/sources");
+    if !many.is_empty() {
+        return many.iter().collect();
     }
+    entry.get("source").filter(|v| v.is_object()).into_iter().collect()
 }
 
 /// Who started an operation: its user, or `autosync`.
@@ -325,10 +327,7 @@ pub fn deployed(app: &Value) -> (Vec<Deployed>, Option<i64>) {
     let (holder, sources): (&Value, Vec<&Value>) = if let Some(h) = last {
         (h, sources_of(h))
     } else {
-        let spec = match app.pointer("/spec/source").filter(|v| v.is_object()) {
-            Some(one) => vec![one],
-            None => arr(app, "/spec/sources").iter().collect(),
-        };
+        let spec = app.pointer("/spec").map(sources_of).unwrap_or_default();
         (app.pointer("/status/sync").unwrap_or(&Value::Null), spec)
     };
     let one = |source: Option<&Value>, revision: &str, index: Option<usize>| Deployed {
