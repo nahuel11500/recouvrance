@@ -48,3 +48,9 @@ reason = "zvariant_derive is unmaintained (not a vulnerability); Linux D-Bus sup
 id = "RUSTSEC-2026-0543"
 ignoreUntil = 2027-05-24
 reason = "chrono is unmaintained (not a vulnerability); we use jiff, chrono comes in through gpui (the UI toolkit), rmcp and schemars, waiting on upstream"
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0600"
+ignoreUntil = 2026-12-15
+reason = "kube-client's openssl-tls connector only; kube is built with rustls-tls and no openssl crate is in Cargo.lock. Fixed in kube 5.2.0, taken after the 3-day wait for new releases"
+
