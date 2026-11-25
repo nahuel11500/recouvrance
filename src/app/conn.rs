@@ -79,14 +79,32 @@ pub(super) fn without_name<'a>(ctx: &str, error: &'a str) -> &'a str {
 /// What the bar above the list still says about the connect once each context's state is
 /// shown on its own (`states`): the errors that are not a failed context's own (a namespace
 /// list that failed on a cluster that answered).
-pub(super) fn notes(errors: &[String], states: &ConnStates) -> Option<SharedString> {
+pub(super) fn notes(errors: &[String], states: &ConnStates) -> Vec<String> {
     let own = |e: &String| {
         states.iter().any(|(c, s)| {
             matches!(s, Conn::Failed(_)) && e.strip_prefix(c.as_str()).is_some_and(|r| r.starts_with(": "))
         })
     };
-    let parts: Vec<&str> = errors.iter().filter(|e| !own(e)).map(String::as_str).collect();
-    (!parts.is_empty()).then(|| parts.join("; ").into())
+    errors.iter().filter(|e| !own(e)).cloned().collect()
+}
+
+/// `notes` as one line, each one's context (`ctx: ` in front, the longest of `contexts` that
+/// fits: a name can start another) named by `name`: its short name on screen, as the other
+/// per-context lines say it, the full one in the hover.
+pub(super) fn notes_line(notes: &[String], contexts: &[&str], name: &dyn Fn(&str) -> String) -> Option<String> {
+    if notes.is_empty() {
+        return None;
+    }
+    let mut contexts = contexts.to_vec();
+    contexts.sort_by_key(|c| std::cmp::Reverse(c.len()));
+    let named = |note: &String| {
+        let ctx = contexts.iter().find(|c| note.strip_prefix(**c).is_some_and(|r| r.starts_with(": ")));
+        match ctx {
+            Some(c) => format!("{}{}", name(c), &note[c.len()..]),
+            None => note.clone(),
+        }
+    };
+    Some(notes.iter().map(named).collect::<Vec<_>>().join("; "))
 }
 
 #[cfg(test)]
@@ -152,8 +170,23 @@ mod tests {
         states.settle("a", Some("refused"));
         states.settle("ab", None);
         let errors = set(&["a: refused", "ab: listing namespaces: timeout"]);
-        assert_eq!(notes(&errors, &states).as_deref(), Some("ab: listing namespaces: timeout"));
-        assert_eq!(notes(&errors[..1], &states), None);
+        assert_eq!(notes(&errors, &states), ["ab: listing namespaces: timeout"]);
+        assert!(notes(&errors[..1], &states).is_empty());
+    }
+
+    /// The bar names a context as the other per-context lines do (its short name), and only
+    /// in front of its own note: the longest name that fits, never one inside the text.
+    #[test]
+    fn the_bar_names_contexts_by_their_short_name() {
+        let eks = "arn:aws:eks:eu-west-1:1:cluster/shop";
+        let short = |c: &str| if c == eks { "shop".to_string() } else { c.to_uppercase() };
+        let notes =
+            set(&[format!("{eks}: listing namespaces: timeout").as_str(), "ab: x: a: y", "kubeconfig unreadable"]);
+        let line = notes_line(&notes, &["a", "ab", eks], &short);
+        assert_eq!(line.as_deref(), Some("shop: listing namespaces: timeout; AB: x: a: y; kubeconfig unreadable"));
+        let full = notes_line(&notes, &["a", "ab", eks], &|c| c.to_string());
+        assert_eq!(full, Some(notes.join("; ")));
+        assert_eq!(notes_line(&[], &["a"], &short), None);
     }
 
     proptest! {
