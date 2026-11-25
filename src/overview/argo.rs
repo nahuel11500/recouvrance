@@ -41,7 +41,12 @@ pub(super) fn section(ctx: &Ctx, cx: &App) -> Option<Div> {
     let muted = cx.theme().muted_foreground;
     // A namespace can hold many Applications: one line each. An object has its one in full.
     let full = !ctx.kind.is("", "Namespace");
-    let title = if full { "Argo CD".to_string() } else { format!("Argo CD Applications ({})", lookup.apps.len()) };
+    // No server read: how many is unknown, not 0.
+    let title = match (full, lookup.unknown) {
+        (true, _) => "Argo CD".to_string(),
+        (false, true) => "Argo CD Applications".to_string(),
+        (false, false) => format!("Argo CD Applications ({})", lookup.apps.len()),
+    };
     let deployed_by = own.is_some() && !lookup.apps.is_empty();
     Some(
         v_flex()

@@ -150,6 +150,20 @@ fn fleet_notes(fleet: &Fleet) -> Vec<String> {
     notes
 }
 
+/// When no server's list is in: an error when none could be read, else that they are still
+/// read. Never "no Applications": they are unknown, not none.
+fn none_listed(fleet: &Fleet) -> Option<anyhow::Result<String>> {
+    if !fleet.apps.is_empty() || !fleet.read().is_empty() {
+        return None;
+    }
+    let notes = fleet_notes(fleet).join("\n");
+    Some(if fleet.reading.is_empty() {
+        Err(anyhow::anyhow!("Could not read any Argo CD server, so its Applications are unknown:\n{notes}"))
+    } else {
+        Ok(format!("No Argo CD server's Applications are read yet:\n{notes}\n"))
+    })
+}
+
 /// The Application `name` (in the Argo CD namespace `namespace`, on `server`, when given):
 /// the only one that fits, or why there is none or several.
 pub(super) fn find<'a>(
@@ -169,7 +183,15 @@ pub(super) fn find<'a>(
         [one] => Ok(one),
         [] => {
             let at = namespace.map_or_default(|ns| format!("{ns}/"));
-            let mut why = format!("Argo CD Application {at}{name} not found on {}", fleet.servers.join(", "));
+            // Not found only where a list was read: elsewhere it could not be looked for.
+            let read = fleet.read();
+            let mut why = if read.is_empty() {
+                format!(
+                    "Argo CD Application {at}{name} could not be looked for: no Argo CD server's list could be read"
+                )
+            } else {
+                format!("Argo CD Application {at}{name} not found on {}", read.join(", "))
+            };
             for note in fleet_notes(fleet) {
                 why.push_str(&format!("; {note}"));
             }
@@ -207,6 +229,9 @@ impl KubeMcp {
         let Some(fleet) = fleet(p.server.as_deref()).await else {
             return call.finish(Ok(NO_ARGO.into()));
         };
+        if let Some(unread) = none_listed(&fleet) {
+            return call.finish(unread);
+        }
         let (mut rows, mut hidden) = (Vec::new(), 0);
         for a in fleet.apps.iter().filter(|a| keeps(&p, a)) {
             if place_of(a).accesses(Verb::List).iter().all(|x| call.may_see(x)) {
@@ -585,8 +610,11 @@ fn apps_text(
     if shown.is_empty() {
         if total > 0 {
             out.push_str(&format!("No Applications past offset {} ({total} in all).\n", page.offset));
-        } else {
+        } else if fleet.unread.is_empty() && fleet.reading.is_empty() {
             out.push_str("No Applications found.\n");
+        } else {
+            // Not on the servers read; those not read are said below.
+            out.push_str(&format!("No Applications found on {}.\n", fleet.read().join(", ")));
         }
     } else {
         let table: Vec<Vec<String>> = shown
@@ -1077,6 +1105,34 @@ mod tests {
         let several = find(&twice, None, None, "root").map(|_| ()).unwrap_err();
         assert!(several.contains("several Applications are named root"), "{several}");
         assert!(find(&twice, Some("argocd.other.example"), None, "root").is_ok());
+    }
+
+    /// A server that could not be read is unknown, not empty: `argocd_apps` fails when none
+    /// was read, and no Application is said not found on a server whose list isn't in.
+    #[test]
+    fn a_server_not_read_has_unknown_applications_not_none() {
+        let failed = api::FeedState { error: Some("HTTP 403".into()), ..Default::default() };
+        let bad = argo::ApiRead { endpoint: endpoint("https://argocd.example.org"), state: failed };
+        let none = argo::from_api(vec![bad], &[], &[]);
+        let err = none_listed(&none).unwrap().unwrap_err().to_string();
+        assert!(err.starts_with("Could not read any Argo CD server") && err.contains("HTTP 403"), "{err}");
+        let why = find(&none, None, None, "web").map(|_| ()).unwrap_err();
+        assert!(why.contains("web could not be looked for") && !why.contains("not found"), "{why}");
+        // Still reading: said, not an error.
+        let pending = argo::ApiRead { endpoint: endpoint("https://argocd.example.org"), state: Default::default() };
+        let reading = argo::from_api(vec![pending], &[], &[]);
+        assert!(none_listed(&reading).unwrap().unwrap().contains("still reading"));
+        // One read, one not: not found only on the one read; the list says so too.
+        let mut some = fleet();
+        assert!(none_listed(&some).is_none());
+        some.servers.push("argocd.example.org".into());
+        some.unread.push("argocd.example.org".into());
+        let why = find(&some, None, None, "web").map(|_| ()).unwrap_err();
+        assert_eq!(why, "Argo CD Application web not found on argocd.example.com");
+        let next = |_: &FleetApp| "now".to_string();
+        let page = Page { offset: 0, limit: 4 };
+        let text = apps_text(&some, Vec::new(), next, |_| true, 0, &[], page);
+        assert_eq!(text, "No Applications found on argocd.example.com.\n");
     }
 
     #[test]
