@@ -89,8 +89,8 @@ pub struct SettingsView {
     _argo_api_test_tasks: std::collections::HashMap<String, Task<()>>,
     /// Reads the servers off the UI thread.
     argo_api_read: crate::latest::Latest,
-    /// The servers' config generation last read (see `api::generation`).
-    argo_api_generation: u64,
+    /// The servers' config generation and renewals last read (see `argo_api_seen`).
+    argo_api_generation: (u64, u64),
     /// A server to add: its address, and a token (never shown back).
     argo_api_url: Entity<InputState>,
     argo_api_token: Entity<InputState>,
@@ -111,6 +111,12 @@ pub struct SettingsView {
     /// What About's Check for updates found, and its request (sent only on a click).
     update_check: Option<UpdateCheck>,
     update_task: crate::latest::Latest,
+}
+
+/// What Settings → Argo CD reads the servers again for: the config changed, or a login was
+/// renewed (or failed to be).
+fn argo_api_seen() -> (u64, u64) {
+    (crate::k8s::argo::api::generation(), crate::k8s::argo::api::renewals())
 }
 
 /// The Argo CD token field, empty: one is saved, or the argocd CLI's login is used.
@@ -255,7 +261,7 @@ impl SettingsView {
             argo_api_tests: Default::default(),
             _argo_api_test_tasks: Default::default(),
             argo_api_read: Default::default(),
-            argo_api_generation: 0,
+            argo_api_generation: (0, 0),
             argo_api_url,
             argo_api_token,
             argo_api_error: None,
@@ -273,9 +279,7 @@ impl SettingsView {
                             cx.notify();
                         }
                         // Connect to Argo CD… saved a server: list it.
-                        if this.section == Section::ArgoCd
-                            && this.argo_api_generation != crate::k8s::argo::api::generation()
-                        {
+                        if this.section == Section::ArgoCd && this.argo_api_generation != argo_api_seen() {
                             this.reload_argo_api(cx);
                         }
                     });
@@ -303,7 +307,7 @@ impl SettingsView {
     /// Read the Argo CD API servers again (the argocd CLI's config, the tokens file), off the
     /// UI thread; a read again replaces the one running.
     fn reload_argo_api(&mut self, cx: &mut Context<Self>) {
-        self.argo_api_generation = crate::k8s::argo::api::generation();
+        self.argo_api_generation = argo_api_seen();
         let read = cx.background_executor().spawn(async { crate::k8s::argo::api::endpoints() });
         self.argo_api_read.spawn(cx, read, |this, found, cx| {
             this.argo_api = found;

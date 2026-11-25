@@ -156,7 +156,7 @@ impl ConnectArgo {
         self.working(format!("Opening {} in the browser…", sso.name), cx);
         let issuer = sso.issuer.clone();
         // Dex under a server whose certificate isn't checked: neither is Dex's.
-        let insecure = self.insecure(&server) && issuer.starts_with(&server.base);
+        let insecure = self.insecure(&server) && connect::under(&issuer, &server.base);
         let ready = async move {
             let listener = connect::listen().await?;
             let provider = connect::discover(issuer, insecure).await?;

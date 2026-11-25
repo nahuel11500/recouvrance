@@ -93,6 +93,28 @@ fn shown(text: &str) -> String {
     if cut.len() < text.len() { format!("{cut}…") } else { cut }
 }
 
+/// `scheme://host:port` of `url` (lowercase, the port said even when it is the default), or
+/// None when it doesn't read.
+pub(crate) fn origin(url: &str) -> Option<String> {
+    let uri = http::Uri::try_from(url.trim()).ok()?;
+    let scheme = uri.scheme_str()?.to_ascii_lowercase();
+    let host = uri.host()?.to_ascii_lowercase();
+    let port = uri.port_u16().unwrap_or(if scheme == "https" { 443 } else { 80 });
+    Some(format!("{scheme}://{host}:{port}"))
+}
+
+/// Whether `url` is the server at `base` or under it: the same origin, and its path `base`'s
+/// or under it at a `/` (not `https://argocd.example.com.evil` nor `/argo-other` under `/argo`).
+pub(crate) fn under(url: &str, base: &str) -> bool {
+    let path = |u: &str| http::Uri::try_from(u.trim()).map(|u| u.path().trim_end_matches('/').to_string()).ok();
+    match (origin(url), origin(base), path(url), path(base)) {
+        (Some(a), Some(b), Some(p), Some(root)) => {
+            a == b && (p == root || p.strip_prefix(&root).is_some_and(|rest| rest.starts_with('/')))
+        }
+        _ => false,
+    }
+}
+
 /// Whether a request may go to `url`: https, or plain http to this machine.
 fn allowed(url: &str) -> Result<(), String> {
     let uri = http::Uri::try_from(url).map_err(|_| format!("Not an address: {}", shown(url)))?;
@@ -379,7 +401,8 @@ pub async fn discover(issuer: String, insecure: bool) -> Result<Provider, String
     }
     let doc: Value = serde_json::from_slice(&a.body)
         .map_err(|_| format!("The identity provider at {} sent no discovery document", shown(&issuer)))?;
-    provider_of(&doc, &issuer).map(|p| Provider { insecure, ..p })
+    // The token endpoint's certificate is left unchecked only on the issuer's own origin.
+    provider_of(&doc, &issuer).map(|p| Provider { insecure: insecure && origin(&p.token) == origin(&issuer), ..p })
 }
 
 /// A PKCE pair (S256) and the `state` of one sign-in, random each time.
@@ -683,8 +706,9 @@ pub fn save(server: &Server, token: &str, refresh: Option<Refresh>) -> Result<()
 /// The argocd CLI's refresh token is never used: a provider that rotates them on use would
 /// leave the CLI's own one invalid.
 const REFRESH_FILE: &str = "argocd-api-refresh.json";
-/// A login is renewed this long before it expires.
+/// A login is renewed this long before it expires, and up to `JITTER` seconds more.
 const RENEW_BEFORE: i64 = 30;
+const JITTER: i64 = 10;
 /// Renewals of one server are at least this far apart.
 const RENEW_EVERY: Duration = Duration::from_secs(20);
 
@@ -721,11 +745,35 @@ fn read_refresh() -> Result<std::collections::BTreeMap<String, Refresh>, String>
 }
 
 /// One lock for the files of tokens and refresh tokens, each read, changed and written whole:
-/// two saves never lose one another's change (a rotated refresh token above all).
+/// two saves never lose one another's change (a rotated refresh token above all). In this
+/// process, then across the app's instances, with a lock on a file beside them.
 static CREDENTIALS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+const LOCK_FILE: &str = ".argocd-credentials.lock";
 
-pub(super) fn credentials() -> std::sync::MutexGuard<'static, ()> {
-    CREDENTIALS.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+/// The credentials lock held (see `credentials`): the file's lock goes when its file closes.
+pub(super) struct Credentials {
+    _process: std::sync::MutexGuard<'static, ()>,
+    _file: Option<std::fs::File>,
+}
+
+pub(super) fn credentials() -> Credentials {
+    let process = CREDENTIALS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    // An instance that can't take the file's lock still has this process's.
+    let file = lock_file(&crate::paths::config_dir().join(LOCK_FILE));
+    Credentials { _process: process, _file: file }
+}
+
+/// `path` opened (made, readable only by the user) and locked whole, waiting for another
+/// process's lock; None when it can't be.
+fn lock_file(path: &std::path::Path) -> Option<std::fs::File> {
+    if let Some(dir) = path.parent() {
+        crate::private_files::create_dir(dir).ok()?;
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    let file = crate::private_files::private_file(&mut options).open(path).ok()?;
+    file.lock().ok()?;
+    Some(file)
 }
 
 /// Keep what renews the login to `base` (None: forget it), readable only by the user, under
@@ -790,6 +838,17 @@ fn renewals() -> std::sync::MutexGuard<'static, Renewals> {
     RENEWALS.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+/// Whether a renewal of `base` runs now.
+pub fn renewal_running(base: &str) -> bool {
+    renewals().get(base).is_some_and(|r| r.running)
+}
+
+/// Why the last renewal of `base` failed, said for a page: None while one runs, after one
+/// that worked, or before any.
+pub fn renewal_failure_note(name: &str, base: &str) -> Option<String> {
+    renewal_note(name, base).filter(|_| !renewal_running(base))
+}
+
 fn forget_renewal(base: &str) {
     renewals().remove(base);
 }
@@ -814,9 +873,29 @@ pub fn renewal_dead(base: &str) -> bool {
 }
 
 /// Seconds to wait before renewing a token expiring at `exp` (now: `now`): `RENEW_BEFORE`
-/// before it, at once when that is past. None for a token with no `exp`.
-pub(super) fn renew_in(exp: Option<i64>, now: i64) -> Option<u64> {
-    exp.map(|exp| u64::try_from(exp - RENEW_BEFORE - now).unwrap_or(0))
+/// before it, and `jitter` more (up to `JITTER`), at once when that is past. None for a
+/// token with no `exp`. Two instances of the app jitter apart, so they don't send the same
+/// refresh token together.
+pub(super) fn renew_in(exp: Option<i64>, now: i64, jitter: u8) -> Option<u64> {
+    let jitter = i64::from(jitter) % (JITTER + 1);
+    exp.map(|exp| u64::try_from(exp - RENEW_BEFORE - jitter - now).unwrap_or(0))
+}
+
+/// A jitter for `renew_in`, random.
+pub(super) fn jitter() -> u8 {
+    uuid::Uuid::new_v4().as_bytes()[0]
+}
+
+/// Whether a refresh refused with `status` and the OAuth `error` code is dead for good: the
+/// refresh token or the client refused, or a 400/401 that names no error that passes. A
+/// timeout, too many requests or a server error passes (backed off).
+fn refresh_dead(status: u16, error: Option<&str>) -> bool {
+    const PASSES: [&str; 2] = ["temporarily_unavailable", "slow_down"];
+    match error {
+        Some("invalid_grant" | "invalid_client" | "unauthorized_client") => true,
+        Some(e) if PASSES.contains(&e) => false,
+        _ => matches!(status, 400 | 401),
+    }
 }
 
 /// The tokens of a refresh answer: the id token and the refresh token, rotated or not. A
@@ -832,9 +911,7 @@ fn renewal_answer(status: u16, body: &[u8], kept: &str) -> Result<Tokens, Failed
         Err(e) => {
             let why = super::server::scrub(&e.replace("refused the sign-in", "refused to renew the login"), kept);
             let v: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
-            let dead = matches!(text_at(&v, "error"), Some("invalid_grant" | "invalid_client" | "unauthorized_client"))
-                || (400..500).contains(&status);
-            Err(if dead { Failed::fatal(why) } else { Failed::later(why) })
+            Err(if refresh_dead(status, text_at(&v, "error")) { Failed::fatal(why) } else { Failed::later(why) })
         }
     }
 }
@@ -1175,10 +1252,16 @@ mod tests {
     fn a_login_is_renewed_before_it_expires() {
         use super::{renew_in, renewal_answer as renewed};
         // A 2-minute token: renewed 30 s before its end; one past or nearly so, at once.
-        assert_eq!(renew_in(Some(1120), 1000), Some(90));
-        assert_eq!(renew_in(Some(1010), 1000), Some(0));
-        assert_eq!(renew_in(Some(900), 1000), Some(0));
-        assert_eq!(renew_in(None, 1000), None);
+        assert_eq!(renew_in(Some(1120), 1000, 0), Some(90));
+        assert_eq!(renew_in(Some(1010), 1000, 0), Some(0));
+        assert_eq!(renew_in(Some(900), 1000, 0), Some(0));
+        assert_eq!(renew_in(None, 1000, 0), None);
+        // Jittered up to 10 s earlier, whatever the random byte.
+        assert_eq!(renew_in(Some(1120), 1000, 10), Some(80));
+        for j in 0..=u8::MAX {
+            let wait = renew_in(Some(1120), 1000, j).unwrap();
+            assert!((80..=90).contains(&wait), "{j}: {wait}");
+        }
         // A rotated refresh token replaces the kept one; none sent keeps it.
         let t = renewed(200, br#"{"id_token": "new", "refresh_token": "rotated"}"#, "old").unwrap();
         assert_eq!((t.id_token.as_str(), t.refresh_token.as_deref()), ("new", Some("rotated")));
@@ -1262,5 +1345,44 @@ mod tests {
         assert_eq!(s.argocd_api_servers.len(), 2);
         // The hubs' setting is left alone.
         assert!(s.argocd_servers.is_empty());
+    }
+
+    #[test]
+    fn only_a_refused_refresh_token_is_dead() {
+        use super::refresh_dead;
+        assert!(refresh_dead(400, Some("invalid_grant")));
+        assert!(refresh_dead(401, Some("invalid_client")));
+        assert!(refresh_dead(400, Some("unauthorized_client")));
+        assert!(refresh_dead(400, None) && refresh_dead(401, Some("whatever")));
+        // A timeout, too many requests, a server error or a provider asking to wait: backed off.
+        assert!(!refresh_dead(408, None) && !refresh_dead(429, None) && !refresh_dead(503, None));
+        assert!(!refresh_dead(400, Some("temporarily_unavailable")));
+        assert!(!refresh_dead(403, None));
+    }
+
+    #[test]
+    fn dex_is_under_its_server_only_at_a_path_boundary_on_the_same_origin() {
+        use super::{origin, under};
+        assert!(under("https://argocd.example.com/api/dex", "https://argocd.example.com"));
+        assert!(under("https://ArgoCD.example.com:443/argo/api/dex", "https://argocd.example.com/argo"));
+        assert!(under("https://argocd.example.com/argo", "https://argocd.example.com/argo"));
+        assert!(!under("https://argocd.example.com.evil/api/dex", "https://argocd.example.com"));
+        assert!(!under("https://argocd.example.com/argo-other/api/dex", "https://argocd.example.com/argo"));
+        assert!(!under("https://argocd.example.com:8443/api/dex", "https://argocd.example.com"));
+        assert!(!under("http://argocd.example.com/api/dex", "https://argocd.example.com"));
+        assert_eq!(origin("https://A.example.com/x"), origin("https://a.example.com:443/y"));
+        assert_ne!(origin("https://a.example.com/x"), origin("https://idp.example.com/x"));
+    }
+
+    #[test]
+    fn the_credentials_file_lock_keeps_another_holder_out() {
+        let path = std::env::temp_dir().join(format!("recouvrance-test-{}.lock", uuid::Uuid::new_v4().simple()));
+        let held = super::lock_file(&path).expect("locked");
+        let other = std::fs::OpenOptions::new().read(true).write(true).open(&path).unwrap();
+        assert!(other.try_lock().is_err(), "another holder got in");
+        drop(held);
+        assert!(other.try_lock().is_ok(), "the lock went with its file");
+        drop(other);
+        let _ = std::fs::remove_file(&path);
     }
 }
