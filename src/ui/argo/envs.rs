@@ -207,18 +207,27 @@ pub fn destination_tip(env: &Env) -> String {
 }
 
 /// The line above the list: how many environments (`kept` of them, when filtered) and
-/// Applications, and which servers' first list is still read (`reading`): never "0
-/// environments" while one is (#1076).
-pub fn summary(envs: usize, kept: Option<usize>, apps: usize, reading: &[String]) -> String {
+/// Applications (`apps`), which servers' first list is still read: never "0
+/// environments" while one is (#1076), nor when none could be read (#1124); and which
+/// servers the counts leave out, not read.
+pub fn summary(envs: usize, kept: Option<usize>, apps: usize, fleet: &crate::k8s::argo::Fleet) -> String {
     let apps_text = crate::plural::count(apps, "Application");
-    let counted = match kept {
+    let mut counted = match kept {
         None => format!("{} · {apps_text}", crate::plural::count(envs, "environment")),
         Some(kept) => format!("{kept} of {} · {apps_text}", crate::plural::count(envs, "environment")),
     };
-    if reading.is_empty() {
+    let none_listed = fleet.read().is_empty() && apps == 0;
+    if !fleet.unread.is_empty() {
+        let unread = fleet.unread.join(", ");
+        if none_listed && fleet.reading.is_empty() {
+            return format!("Applications unknown: {unread} could not be read");
+        }
+        counted.push_str(&format!(" · not counted: {unread}, not read"));
+    }
+    if fleet.reading.is_empty() {
         return counted;
     }
-    let reading = format!("Reading Applications from {}…", reading.join(", "));
+    let reading = format!("Reading Applications from {}…", fleet.reading.join(", "));
     if apps == 0 { reading } else { format!("{counted} · {reading}") }
 }
 
@@ -510,14 +519,43 @@ mod tests {
     #[test]
     fn the_count_never_says_none_while_a_server_is_read() {
         let one = ["argocd.example.com".to_string()];
-        assert_eq!(summary(0, None, 0, &one), "Reading Applications from argocd.example.com…");
-        assert_eq!(summary(0, Some(0), 0, &one), "Reading Applications from argocd.example.com…");
+        let fleet = |listed: bool, reading: &[String]| {
+            let mut f = crate::k8s::argo::Fleet { reading: reading.to_vec(), ..Default::default() };
+            f.servers = reading.to_vec();
+            if listed {
+                f.servers.push("argocd.example.org".into());
+            }
+            f
+        };
+        assert_eq!(summary(0, None, 0, &fleet(false, &one)), "Reading Applications from argocd.example.com…");
+        assert_eq!(summary(0, Some(0), 0, &fleet(false, &one)), "Reading Applications from argocd.example.com…");
         assert_eq!(
-            summary(1, Some(0), 3, &one),
+            summary(1, Some(0), 3, &fleet(true, &one)),
             "0 of 1 environment · 3 Applications · Reading Applications from argocd.example.com…"
         );
-        assert_eq!(summary(2, None, 3, &[]), "2 environments · 3 Applications");
-        assert_eq!(summary(2, Some(1), 3, &[]), "1 of 2 environments · 3 Applications");
+        assert_eq!(summary(2, None, 3, &fleet(true, &[])), "2 environments · 3 Applications");
+        assert_eq!(summary(2, Some(1), 3, &fleet(true, &[])), "1 of 2 environments · 3 Applications");
+    }
+
+    /// A server that could not be read is unknown, not empty: no count when none was read,
+    /// and the counts say they leave it out when another was.
+    #[test]
+    fn the_count_never_says_none_when_no_server_could_be_read() {
+        let bad = "argocd.example.com".to_string();
+        let mut f =
+            crate::k8s::argo::Fleet { servers: vec![bad.clone()], unread: vec![bad.clone()], ..Default::default() };
+        assert_eq!(summary(0, None, 0, &f), "Applications unknown: argocd.example.com could not be read");
+        // Another read, even with no Application: counted, the unread one said left out.
+        f.servers.push("argocd.example.org".into());
+        assert_eq!(
+            summary(0, None, 0, &f),
+            "0 environments · 0 Applications · not counted: argocd.example.com, not read"
+        );
+        // Another still reading its first list: that is said, no count.
+        f.servers.pop();
+        f.servers.push("argocd.example.org".into());
+        f.reading = vec!["argocd.example.org".into()];
+        assert_eq!(summary(0, None, 0, &f), "Reading Applications from argocd.example.org…");
     }
 
     #[test]

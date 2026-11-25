@@ -664,6 +664,8 @@ pub struct Found {
 pub struct Lookup {
     pub apps: Vec<Found>,
     pub note: Option<String>,
+    /// No Argo CD server could be read: how many Applications there are is unknown, not 0.
+    pub unknown: bool,
     /// On an Application's own page: the Argo CD server holding it (same `metadata.uid`), or
     /// why none does. None until read, and on other pages.
     pub own: Option<Result<Arc<api::Endpoint>, String>>,
@@ -871,7 +873,7 @@ async fn api_object_lookup(here: &str, by: &TrackedBy, group: &str, kind: &str, 
         }
         _ => None,
     };
-    Some(Lookup { apps, note, own: None })
+    Some(Lookup { apps, note, ..Lookup::default() })
 }
 
 /// The Applications that deploy into this namespace of the context `here`, from what Argo
@@ -896,11 +898,19 @@ async fn api_namespace_lookup(here: &str, ns: &str) -> Option<Lookup> {
     if held.is_empty() {
         return None;
     }
+    Some(namespace_lookup(held))
+}
+
+/// What the servers' feeds (`held`) say of a namespace: their Applications, and those that
+/// could not be read. None read: how many there are is unknown; some: the count leaves the
+/// others out, and says so.
+fn namespace_lookup(held: Vec<api::Held>) -> Lookup {
     let mut lookup = Lookup::default();
-    let mut errors = Vec::new();
+    let (mut errors, mut read) = (Vec::new(), 0);
     for h in held {
         match h.apps {
             Ok(apps) => {
+                read += 1;
                 lookup.apps.extend(apps.iter().map(|a| Found { server: h.endpoint.clone(), app: a.summary.clone() }));
             }
             Err(e) => errors.push(format!("{}: {e}", h.endpoint.name())),
@@ -908,9 +918,11 @@ async fn api_namespace_lookup(here: &str, ns: &str) -> Option<Lookup> {
     }
     lookup.apps.sort_by_cached_key(|a| (a.app.name.clone(), a.server.name()));
     if !errors.is_empty() {
-        lookup.note = Some(format!("Argo CD could not be read: {}", errors.join("; ")));
+        lookup.unknown = read == 0;
+        let lead = if read == 0 { "Argo CD could not be read" } else { "Not counted, Argo CD could not be read" };
+        lookup.note = Some(format!("{lead}: {}", errors.join("; ")));
     }
-    Some(lookup)
+    lookup
 }
 
 // MARK: Every Application
@@ -1044,6 +1056,9 @@ pub struct Fleet {
     pub servers: Vec<String>,
     /// Those of `servers` whose first list is still being read (none failed yet), by name.
     pub reading: Vec<String>,
+    /// Those of `servers` that could not be read (and hold no list from before), by name:
+    /// their Applications are unknown, not none.
+    pub unread: Vec<String>,
     /// Each Argo CD's projects' sync windows (by `instance`), or why they couldn't be read.
     pub projects: HashMap<String, Result<ProjectWindows, String>>,
     /// The API servers whose login is missing, expired or refused: their address, and whether
@@ -1052,6 +1067,17 @@ pub struct Fleet {
 }
 
 impl Fleet {
+    /// The servers whose list is in: what the counts and "not found" cover.
+    pub fn read(&self) -> Vec<String> {
+        let out = |s: &String| self.reading.contains(s) || self.unread.contains(s);
+        self.servers.iter().filter(|s| !out(s)).cloned().collect()
+    }
+
+    /// No server's list is in, and some could not be read: its Applications are unknown.
+    pub fn none_read(&self) -> bool {
+        !self.unread.is_empty() && self.read().is_empty()
+    }
+
     /// When the next sync of `a` can start, from `now`, under its project's sync windows.
     pub fn next_sync(&self, a: &FleetApp, plan: &mut windows::Planner) -> windows::NextSync {
         // Auto-sync is held by every window; a manual sync goes through those that allow it.
@@ -1143,6 +1169,9 @@ pub fn from_api(reads: Vec<ApiRead>, targets: &[ContextTarget], connected: &[Str
         }
         if let Some(e) = read.state.error.as_ref().filter(|_| !read.state.live) {
             fleet.errors.push(format!("{name}: {e}"));
+            if !read.state.listed {
+                fleet.unread.push(name.clone());
+            }
         }
         if read.state.refused && !fleet.relogin.iter().any(|(b, _)| *b == endpoint.server.base) {
             fleet.relogin.push((endpoint.server.base.clone(), endpoint.insecure));
@@ -1198,6 +1227,25 @@ mod tests {
         assert_eq!(why, "Not on the Argo CD servers connected (a.example); not read: b.example: did not answer");
         let why = own_in(vec![held("https://b.example", Err("expired"))]).unwrap_err();
         assert!(why.starts_with("No Argo CD server could be read; not read: b.example: expired"), "{why}");
+    }
+
+    /// A namespace's count says nothing when no server could be read, and leaves out, saying
+    /// so, those not read when another was.
+    #[test]
+    fn a_namespace_s_applications_are_unknown_when_no_server_could_be_read() {
+        let held = |url: &str, apps: Result<usize, &str>| api::Held {
+            endpoint: endpoint(url),
+            apps: apps.map(|n| (0..n).map(|_| api_app("argocd", "web", None)).collect()).map_err(String::from),
+        };
+        let none = namespace_lookup(vec![held("https://b.example", Err("HTTP 403"))]);
+        assert!(none.unknown && none.apps.is_empty());
+        assert_eq!(none.note.as_deref(), Some("Argo CD could not be read: b.example: HTTP 403"));
+        let some = namespace_lookup(vec![held("https://a.example", Ok(1)), held("https://b.example", Err("HTTP 403"))]);
+        assert!(!some.unknown);
+        assert_eq!(some.apps.len(), 1);
+        assert_eq!(some.note.as_deref(), Some("Not counted, Argo CD could not be read: b.example: HTTP 403"));
+        let all = namespace_lookup(vec![held("https://a.example", Ok(0))]);
+        assert!(!all.unknown && all.note.is_none());
     }
 
     fn endpoint(url: &str) -> Arc<api::Endpoint> {

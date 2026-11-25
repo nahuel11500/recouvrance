@@ -1468,10 +1468,21 @@ impl Render for ArgoView {
         let body: AnyElement = match &self.rows {
             None => div().p_4().text_color(theme.muted_foreground).child("Reading Argo CD…").into_any_element(),
             Some(rows) if rows.fleet.servers.is_empty() => self.no_server(&rows.fleet, cx),
+            // No list in yet: no count, no tile, no filter at 0 (unknown is not none, #1124).
+            Some(rows) if rows.fleet.apps.is_empty() && rows.fleet.read().is_empty() => div()
+                .p_4()
+                .text_sm()
+                .text_color(theme.muted_foreground)
+                .child(if rows.fleet.reading.is_empty() {
+                    "No Argo CD server could be read, so its Applications are unknown: why is said above.".to_string()
+                } else {
+                    envs::summary(0, None, 0, &rows.fleet)
+                })
+                .into_any_element(),
             Some(rows) => {
                 let count = self.lines.len();
                 let kept = (self.filter != Filter::default()).then_some(self.kept);
-                let summary = envs::summary(rows.envs.len(), kept, rows.fleet.apps.len(), &rows.fleet.reading);
+                let summary = envs::summary(rows.envs.len(), kept, rows.fleet.apps.len(), &rows.fleet);
                 let type_errors = rows.types.errors.clone();
                 let tab = |id: &'static str, label: &'static str, list: bool, cx: &mut Context<Self>| {
                     Button::new(id)
@@ -1552,6 +1563,7 @@ impl ArgoView {
         let theme = cx.theme().clone();
         let errors = self.rows.as_ref().map_or_else(Vec::new, |r| r.fleet.errors.clone());
         let relogin = self.rows.as_ref().map_or_else(Vec::new, |r| r.fleet.relogin.clone());
+        let none_read = self.rows.as_ref().is_some_and(|r| r.fleet.none_read());
         v_flex()
             .size_full()
             .p_2()
@@ -1563,7 +1575,11 @@ impl ArgoView {
                         .px_2()
                         .text_xs()
                         .text_color(theme.danger)
-                        .child("Some Argo CD servers could not be read:")
+                        .child(if none_read {
+                            "No Argo CD server could be read:"
+                        } else {
+                            "Some Argo CD servers could not be read:"
+                        })
                         .children(errors.into_iter().map(|e| div().child(e)))
                         .when(!relogin.is_empty(), |d| {
                             d.child(h_flex().gap_1().pt_1().children(relogin.into_iter().enumerate().map(
