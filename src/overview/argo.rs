@@ -48,15 +48,16 @@ pub(super) fn section(ctx: &Ctx, cx: &App) -> Option<Div> {
         (false, false) => format!("Argo CD Applications ({})", lookup.apps.len()),
     };
     let deployed_by = own.is_some() && !lookup.apps.is_empty();
+    // On an Application's page, its own card says already which servers could not be read.
+    let own_unread = matches!(lookup.own, Some(Err(_)));
+    let note = lookup.note.as_ref().filter(|_| !(own_unread && lookup.note_unread && lookup.apps.is_empty()));
     Some(
         v_flex()
             .gap_2()
             .child(heading(&title))
             .when_some(own.as_ref(), |d, app| d.child(own_card(ctx, app, cx)))
             .when(deployed_by, |d| d.child(div().text_xs().text_color(muted).child(selectable("Deployed by"))))
-            .when_some(lookup.note.as_ref(), |d, note| {
-                d.child(div().text_xs().text_color(muted).child(selectable(note.clone())))
-            })
+            .when_some(note, |d, note| d.child(div().text_xs().text_color(muted).child(selectable(note.clone()))))
             .children(lookup.apps.iter().enumerate().map(|(ix, f)| app_card(ctx, ix, f, full, cx))),
     )
 }
@@ -100,7 +101,10 @@ fn own_card(ctx: &Ctx, app: &Summary, cx: &App) -> Div {
                     }),
             ),
         ),
-        Some(Err(why)) => Some(h_flex().child(div().text_xs().text_color(muted).child(selectable(why.clone())))),
+        // Wrapped to the panel's width.
+        Some(Err(why)) => {
+            Some(h_flex().child(div().flex_1().min_w_0().text_xs().text_color(muted).child(selectable(why.clone()))))
+        }
     };
     v_flex()
         .p_2()

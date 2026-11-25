@@ -242,10 +242,10 @@ impl ProblemsView {
         // From when the scan started: its first checks read the cluster then.
         self.scanned = done.iter().map(|d| d.started).min();
         self.updating = latest.iter().flatten().any(|f| f.running.is_some());
-        let results: Vec<(String, Vec<Problem>, Option<String>)> = (self.watched.iter().zip(&latest))
+        let results: Vec<(String, Vec<Problem>, Vec<String>)> = (self.watched.iter().zip(&latest))
             .filter_map(|(s, f)| {
                 let f = f.as_ref()?;
-                Some((s.context.clone(), f.problems(&s.namespaces), f.skipped()))
+                Some((s.context.clone(), f.problems(&s.namespaces), f.skipped_list(|_| true)))
             })
             .collect();
         // Nothing yet: the page says it is checking.
@@ -421,19 +421,36 @@ fn status_text(complete: bool, scanned: Option<Duration>, updating: bool) -> Opt
     }
 }
 
-/// Every cluster's problems, worst first, and a line for each cluster with kinds it could
-/// not read (context, problems, what it could not read): a kind refused is noted, and the
-/// others are still shown.
-fn merge(results: Vec<(String, Vec<Problem>, Option<String>)>) -> (Vec<(String, Problem)>, Vec<String>) {
+/// Every cluster's problems, worst first, and a line for what clusters could not read
+/// (context, problems, what it could not read): a kind refused is noted, and the others are
+/// still shown. What several clusters could not read alike (one Argo CD server down, read for
+/// each) is said once, naming them.
+fn merge(results: Vec<(String, Vec<Problem>, Vec<String>)>) -> (Vec<(String, Problem)>, Vec<String>) {
     let mut found = Vec::new();
-    let mut errors = Vec::new();
+    // Each entry skipped, with the clusters that skipped it, in the order first seen.
+    let mut by_entry: Vec<(String, Vec<String>)> = Vec::new();
     for (ctx, problems, skipped) in results {
-        if let Some(skipped) = skipped {
-            errors.push(format!("{ctx}: could not read {skipped}"));
+        for entry in skipped {
+            match by_entry.iter_mut().find(|(e, _)| *e == entry) {
+                Some((_, contexts)) => contexts.push(ctx.clone()),
+                None => by_entry.push((entry, vec![ctx.clone()])),
+            }
         }
         found.extend(problems.into_iter().map(|p| (ctx.clone(), p)));
     }
     found.sort_by_key(|a| a.1.severity);
+    // The entries of the same clusters on one line.
+    let mut lines: Vec<(Vec<String>, Vec<String>)> = Vec::new();
+    for (entry, contexts) in by_entry {
+        match lines.iter_mut().find(|(c, _)| *c == contexts) {
+            Some((_, entries)) => entries.push(entry),
+            None => lines.push((contexts, vec![entry])),
+        }
+    }
+    let errors = lines
+        .into_iter()
+        .map(|(contexts, entries)| format!("{}: could not read {}", contexts.join(", "), entries.join(", ")))
+        .collect();
     (found, errors)
 }
 
@@ -641,12 +658,31 @@ mod tests {
             on_argo: None,
         };
         let (found, errors) = super::merge(vec![
-            ("one".into(), vec![problem(Severity::Warning, "w")], Some("Nodes (forbidden)".into())),
-            ("two".into(), vec![problem(Severity::Critical, "c")], None),
+            ("one".into(), vec![problem(Severity::Warning, "w")], vec!["Nodes (forbidden)".into()]),
+            ("two".into(), vec![problem(Severity::Critical, "c")], Vec::new()),
         ]);
         let names: Vec<(&str, &str)> = found.iter().map(|(ctx, p)| (ctx.as_str(), p.name.as_str())).collect();
         assert_eq!(names, [("two", "c"), ("one", "w")]);
         assert_eq!(errors, ["one: could not read Nodes (forbidden)"]);
+    }
+
+    /// One Argo CD server that could not be read, scanned for each cluster, is said once,
+    /// naming the clusters it leaves unchecked; what one cluster alone skipped stays its own.
+    #[test]
+    fn what_several_clusters_could_not_read_alike_is_said_once() {
+        let argo = "Argo CD Applications on argocd.example.com (failed: refused)".to_string();
+        let (_, errors) = super::merge(vec![
+            ("one".into(), Vec::new(), vec!["Nodes (forbidden)".into(), argo.clone()]),
+            ("two".into(), Vec::new(), vec![argo.clone()]),
+            ("three".into(), Vec::new(), vec![argo]),
+        ]);
+        assert_eq!(
+            errors,
+            [
+                "one: could not read Nodes (forbidden)",
+                "one, two, three: could not read Argo CD Applications on argocd.example.com (failed: refused)"
+            ]
+        );
     }
 }
 

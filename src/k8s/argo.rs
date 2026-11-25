@@ -666,6 +666,8 @@ pub struct Lookup {
     pub note: Option<String>,
     /// No Argo CD server could be read: how many Applications there are is unknown, not 0.
     pub unknown: bool,
+    /// `note` says which servers could not be read (not what was found).
+    pub note_unread: bool,
     /// On an Application's own page: the Argo CD server holding it (same `metadata.uid`), or
     /// why none does. None until read, and on other pages.
     pub own: Option<Result<Arc<api::Endpoint>, String>>,
@@ -866,6 +868,7 @@ async fn api_object_lookup(here: &str, by: &TrackedBy, group: &str, kind: &str, 
     if apps.is_empty() && matches!(by, TrackedBy::Id(_)) && found.len() == 1 && found[0].here.is_none() {
         apps = found.iter().map(summary).collect();
     }
+    let note_unread = !errors.is_empty();
     let note = match (by, apps.is_empty(), errors.is_empty()) {
         (_, _, false) => Some(format!("Argo CD could not be read: {}", errors.join("; "))),
         (TrackedBy::Id(t), true, true) => {
@@ -873,7 +876,7 @@ async fn api_object_lookup(here: &str, by: &TrackedBy, group: &str, kind: &str, 
         }
         _ => None,
     };
-    Some(Lookup { apps, note, ..Lookup::default() })
+    Some(Lookup { apps, note, note_unread, ..Lookup::default() })
 }
 
 /// The Applications that deploy into this namespace of the context `here`, from what Argo

@@ -811,15 +811,18 @@ pub fn renewable(base: &str) -> bool {
 pub struct Failed {
     pub why: String,
     pub fatal: bool,
+    /// The server refused this machine (HTTP 403 from a proxy or an allow-list): no login
+    /// would help, and it is tried again.
+    pub forbidden: bool,
 }
 
 impl Failed {
     fn fatal(why: impl Into<String>) -> Self {
-        Self { why: why.into(), fatal: true }
+        Self { why: why.into(), fatal: true, forbidden: false }
     }
 
     fn later(why: impl Into<String>) -> Self {
-        Self { why: why.into(), fatal: false }
+        Self { why: why.into(), fatal: false, forbidden: false }
     }
 }
 
@@ -861,10 +864,26 @@ pub fn renewal_note(name: &str, base: &str) -> Option<String> {
     if r.running {
         return Some(format!("Renewing the login to {name}…"));
     }
-    r.failed.map(|f| {
-        let then = if f.fatal { "Reconnect" } else { "it is tried again" };
-        format!("The login to {name} has expired, and renewing it failed ({}): {then}", f.why)
-    })
+    r.failed.map(|f| failure_text(name, &f))
+}
+
+/// What a failed renewal of the login to `name` says on a page: a server that refuses this
+/// machine is said so (no login would help), else that the login expired and why renewing it
+/// failed.
+fn failure_text(name: &str, f: &Failed) -> String {
+    if f.forbidden {
+        return format!(
+            "Argo CD at {name} refuses this machine (HTTP 403): check the VPN or network access; it is tried again"
+        );
+    }
+    let then = if f.fatal { "Reconnect" } else { "it is tried again" };
+    format!("The login to {name} has expired, and renewing it failed: {}; {then}", f.why)
+}
+
+/// Whether the last renewal of `base` found the server refusing this machine: Reconnect
+/// would not help then.
+pub fn renewal_forbidden(base: &str) -> bool {
+    renewals().get(base).is_some_and(|r| !r.running && r.failed.as_ref().is_some_and(|f| f.forbidden))
 }
 
 /// Whether renewing the login to `base` failed for good (until Reconnect).
@@ -990,24 +1009,50 @@ async fn run_cli(args: &super::api::CliArgs) -> Result<(), Failed> {
     Err(cli_failure(&String::from_utf8_lossy(&out.stderr), &relogin))
 }
 
-/// What the argocd CLI's failure to renew says: its own words (cut short), and whether its
-/// session is dead (refused: sign in again) or the failure may pass (the network).
+/// What the argocd CLI's failure to renew says: its own message (cut short), and whether its
+/// session is dead (refused: sign in again), the server refuses this machine (HTTP 403: a
+/// proxy or a network rule, tried again), or the failure may pass (the network).
 fn cli_failure(stderr: &str, relogin: &str) -> Failed {
-    let said: String = stderr
-        .lines()
-        .map(str::trim)
-        .find(|l| !l.is_empty())
-        .unwrap_or("no reason given")
-        .chars()
-        .filter(|c| !c.is_control())
-        .take(200)
-        .collect();
+    let said = cli_message(stderr);
+    if said.contains("status code 403") || said.contains("403 Forbidden") {
+        return Failed { why: format!("the argocd CLI was refused: {said}"), fatal: false, forbidden: true };
+    }
     const DEAD: [&str; 5] = ["Unauthenticated", "invalid_grant", "token is expired", "invalid session", "login"];
-    if DEAD.iter().any(|w| said.contains(w)) {
-        Failed::fatal(format!("the argocd CLI couldn't renew it ({said}): {relogin}"))
+    // gRPC's code too (`code = Unauthenticated`), which the message leaves out.
+    let first = stderr.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or_default();
+    if DEAD.iter().any(|w| first.contains(w)) {
+        Failed::fatal(format!("the argocd CLI couldn't renew it ({said}), {relogin}"))
     } else {
         Failed::later(format!("the argocd CLI couldn't renew it ({said})"))
     }
+}
+
+/// The argocd CLI's message in its first line of error output: the `msg` of a JSON log line
+/// (`{"level":"fatal","msg":...,"time":...}`) or of a text one (`level=fatal msg="..."`),
+/// without gRPC's `rpc error: code = ... desc = ` lead, on one line and cut short.
+fn cli_message(stderr: &str) -> String {
+    let line = stderr.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("no reason given");
+    let json = serde_json::from_str::<Value>(line).ok();
+    let msg = json.as_ref().and_then(|v| v.get("msg")).and_then(Value::as_str).map(String::from);
+    let text_msg = || {
+        let rest = line.split_once("msg=\"")?.1;
+        let mut out = String::new();
+        let mut chars = rest.chars();
+        while let Some(c) = chars.next() {
+            match c {
+                '\\' => out.extend(chars.next()),
+                '"' => return Some(out),
+                c => out.push(c),
+            }
+        }
+        Some(out)
+    };
+    let msg = msg.or_else(text_msg).unwrap_or_else(|| line.to_string());
+    let msg = match msg.strip_prefix("rpc error: code = ").and_then(|r| r.split_once(" desc = ")) {
+        Some((_, desc)) => desc.to_string(),
+        None => msg,
+    };
+    msg.chars().filter(|c| !c.is_control()).take(200).collect()
 }
 
 /// Renew the login to `base` (`how`), unless one runs, ran just now, or failed for good. Once
@@ -1505,5 +1550,46 @@ mod tests {
         let later = cli_failure("dial tcp: lookup a: no such host", "run `argocd login a --sso` again");
         assert!(!later.fatal && later.why.contains("no such host"), "{later:?}");
         assert!(!cli_failure("", "x").fatal);
+    }
+
+    /// A 403 from the server's front (a proxy, an allow-list) is said as this machine being
+    /// refused, from the CLI's message alone (no JSON, no timestamp), and never as a login
+    /// to renew.
+    #[test]
+    fn a_server_refusing_this_machine_is_said_plainly() {
+        use super::{cli_failure, cli_message, failure_text};
+        let line = r#"{"level":"fatal","msg":"rpc error: code = Unknown desc = POST https://argocd.example.com/cluster.SettingsService/Get failed with status code 403","time":"2026-11-25T20:21:17+01:00"}"#;
+        assert_eq!(
+            cli_message(line),
+            "POST https://argocd.example.com/cluster.SettingsService/Get failed with status code 403"
+        );
+        let f = cli_failure(line, "run `argocd login argocd.example.com --sso` again");
+        assert!(f.forbidden && !f.fatal, "{f:?}");
+        let text = failure_text("argocd.example.com", &f);
+        assert_eq!(
+            text,
+            "Argo CD at argocd.example.com refuses this machine (HTTP 403): check the VPN or network access; it is \
+             tried again"
+        );
+        assert!(!text.contains("expired") && !text.contains('{'), "{text}");
+        // A text log line: its msg, unescaped, without gRPC's lead.
+        assert_eq!(
+            cli_message(
+                "time=\"x\" level=fatal msg=\"rpc error: code = Unauthenticated desc = invalid \\\"session\\\"\"\n"
+            ),
+            "invalid \"session\""
+        );
+        // An expired session: the login, Reconnect.
+        let dead = cli_failure(
+            r#"{"level":"fatal","msg":"rpc error: code = Unauthenticated desc = invalid session: token is expired"}"#,
+            "x",
+        );
+        let text = failure_text("a", &dead);
+        assert!(dead.fatal && !dead.forbidden, "{dead:?}");
+        assert_eq!(
+            text,
+            "The login to a has expired, and renewing it failed: the argocd CLI couldn't renew it (invalid session: \
+             token is expired), x; Reconnect"
+        );
     }
 }

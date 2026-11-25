@@ -154,6 +154,12 @@ impl Found {
     /// `skipped` of the entries `keep` keeps ("Pods (forbidden)"): an agent is told only of
     /// what its rules let it see.
     pub fn skipped_where(&self, keep: impl Fn(&str) -> bool) -> Option<String> {
+        let all = self.skipped_list(keep);
+        (!all.is_empty()).then(|| all.join(", "))
+    }
+
+    /// Each entry of `skipped_where`, apart.
+    pub fn skipped_list(&self, keep: impl Fn(&str) -> bool) -> Vec<String> {
         let mut parts: Vec<&Part> = self.parts.values().map(AsRef::as_ref).collect();
         parts.sort_by_key(|p| p.order);
         let mut all: Vec<String> = parts.iter().flat_map(|p| p.skipped.iter().cloned()).collect();
@@ -164,7 +170,7 @@ impl Found {
             all.push(format!("Volume usage ({e})"));
         }
         all.retain(|s| keep(s));
-        (!all.is_empty()).then(|| all.join(", "))
+        all
     }
 
     /// Whether every check read all it lists, the alerts aside (a narrower scan reads them
